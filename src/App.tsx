@@ -5,6 +5,7 @@ import SessionList from './components/SessionList';
 import ChatArea from './components/ChatArea';
 import BiReport from './components/BiReport';
 import NewSessionModal from './components/NewSessionModal';
+import { analyze } from './api';
 
 export default function App() {
   const [sessions, setSessions] = useState<Session[]>(() => {
@@ -52,25 +53,15 @@ export default function App() {
     setIsAnalyzing(true);
 
     try {
-      const response = await fetch('/api/analyze', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          messages: updatedMessages,
-          brand: activeSession.brand,
-          campaignName: activeSession.campaignName,
-          platform: activeSession.platform,
-          mcn: activeSession.mcn,
-          kols: activeSession.kols,
-          currentReportData: activeSession.reportData
-        })
+      const result = await analyze({
+        messages: updatedMessages,
+        brand: activeSession.brand,
+        campaignName: activeSession.campaignName,
+        platform: activeSession.platform,
+        mcn: activeSession.mcn,
+        kols: activeSession.kols,
+        currentReportData: activeSession.reportData
       });
-
-      if (!response.ok) {
-        throw new Error(`Server returned code ${response.status}`);
-      }
-
-      const result = await response.json();
 
       const aiMessage: Message = {
         id: `m-ai-${Date.now()}`,
@@ -150,22 +141,15 @@ export default function App() {
 
     try {
       // Fetch initial structured report from AI for this specific custom campaign
-      const response = await fetch('/api/analyze', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          messages: newSession.messages,
-          brand: data.brand,
-          campaignName: data.campaignName,
-          platform: data.platform,
-          mcn: data.mcn,
-          kols: data.kols,
-          currentReportData: null
-        })
+      const result = await analyze({
+        messages: newSession.messages,
+        brand: data.brand,
+        campaignName: data.campaignName,
+        platform: data.platform,
+        mcn: data.mcn,
+        kols: data.kols,
+        currentReportData: null
       });
-
-      if (!response.ok) throw new Error("API init call failed");
-      const result = await response.json();
 
       const aiResponseMsg: Message = {
         id: `ai-init-${Date.now()}`,
