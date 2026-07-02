@@ -1,0 +1,6 @@
+{
+  "name": "网红KOL与MCN营销效果分析平台",
+  "description": "基于 AI 代理会话的网红KOL及MCN营销投放效果深度分析报告与 BI 数据可视化大盘",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
