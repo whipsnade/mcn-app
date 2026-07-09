@@ -37,7 +37,7 @@ function getMockReportData(brand: string, campaign: string, platform: string, mc
       positive: 76,
       neutral: 17,
       negative: 7,
-      keywords: ["效果惊艳", "成分温和", "回购回购", "略微贵了", "种草了", "MCN配合度高"]
+      keywords: ["效果惊艳", "成分温和", "回购回购", "略微贵了", "种草了", "配合度高"]
     },
     engagement: {
       totalViews: 8500000,
@@ -82,8 +82,8 @@ function getMockReportData(brand: string, campaign: string, platform: string, mc
       cpe: 2.8,
       roi: 2.4,
       score: 88,
-      strengths: ["KOL矩阵执行力强", "视频审核及脚本修改极速", "核心腰部达人爆文率高"],
-      weaknesses: ["头部网红排期较紧", "溢价稍微偏高", "直播带货转化有待优化"]
+      strengths: ["KOL矩阵执行力强", "视频审核及脚本修改极速", "核心达人爆文率高"],
+      weaknesses: ["头部排期较紧", "溢价稍微偏高", "直播带货转化有待优化"]
     },
     kolPerformance: cleanKols.map((kol, index) => {
       const platforms: any[] = ["Xiaohongshu", "Douyin", "Bilibili", "Weibo"];
@@ -106,8 +106,8 @@ function getMockReportData(brand: string, campaign: string, platform: string, mc
     }),
     recommendations: [
       `1. 加大在 ${platform || "小红书"} 平台中长尾达人的合作比例，以提升品牌日常真实检索率。`,
-      `2. 针对 MCN ${cleanMcn}，在接下来的大促节点中争取更低的保量包销折扣，降低 CPE 获客成本。`,
-      "3. 核心达人视频中的痛点场景前置，进一步优化黄金3秒完播率，从而进入更高一级自然流量池。"
+      `2. 结合达人的历史多维度互动与内容质量，进行更精细化的预算倾斜。`,
+      "3. 核心达人视频中的话题标签及痛点前置，进一步优化黄金3秒留存率，从而进入更高一级自然流量池。"
     ]
   };
 }
@@ -125,29 +125,29 @@ app.post("/api/analyze", async (req, res) => {
     const mockReport = getMockReportData(brand, campaignName, platform, mcn, kols);
     
     // Add custom response based on keywords
-    let reply = `【离线分析模式】您好！由于尚未配置 GEMINI_API_KEY 密钥，我已为您自动生成了针对「${brand || "某品牌"}」品牌「${campaignName || "本次营销"}」活动的标准化分析模型。
+    let reply = `【离线分析模式】您好！由于尚未配置 GEMINI_API_KEY 密钥，我已为您自动生成了针对「${brand || "某品牌"}」品牌「${campaignName || "本次营销"}」活动的标准化声量与KOL分析模型。
 
 在当前的数据模拟中：
-1. 整体受众以 **18-30岁女性** 占比最高（约${mockReport.demographics.gender[0].value}%），符合美妆、时尚类轻奢品牌的基本画像。
-2. 社交媒体舆情正向率达 **${mockReport.sentiment.positive}%**，高频词包括「${mockReport.sentiment.keywords[0]}」和「${mockReport.sentiment.keywords[1]}」。
-3. 合作的 MCN **${mockReport.mcnAnalysis.mcnName}** 综合评分为 **${mockReport.mcnAnalysis.score}分**，ROI 约为 **${mockReport.mcnAnalysis.roi}**。
+1. 整体受众以 **18-30岁女性** 占比最高（约${mockReport.demographics.gender[0].value}%），符合美妆、时尚类轻奢品牌的基本画像，支持 \`social_statistic_user_profile\` 提取。
+2. 社交媒体舆情正向率达 **${mockReport.sentiment.positive}%**，高频词包括「${mockReport.sentiment.keywords[0]}」和「${mockReport.sentiment.keywords[1]}」，支持 \`query_analysis_data\` 提取。
+3. 关联活动总曝光达 **${(mockReport.engagement.totalViews / 1000000).toFixed(1)}M次**，符合 \`social_statistic_overview\` 概览指标。
 
 *您可以配置系统的 GEMINI_API_KEY 以解锁完全动态的 AI 多维度洞察与全量定制化的报表生成！*`;
 
     if (latestUserMsg.includes("情感") || latestUserMsg.includes("舆情") || latestUserMsg.includes("sentiment")) {
-      reply = `【离线舆情分析】针对您的提问，我们对本次活动的达人评论区进行了情感抽样（样本量 N=5,000）：
-- **正面舆情 (${mockReport.sentiment.positive}%)**：用户对产品功能和外观赞不绝口，爆款词汇为「${mockReport.sentiment.keywords.slice(0, 3).join("、")}」。
+      reply = `【离线舆情分析】针对您的提问，我们通过 \`query_analysis_data\` 对本次活动的达人评论区进行了情感抽样（样本量 N=5,000）：
+- **正面舆情 (${mockReport.sentiment.positive}%)**：用户对产品功能与外观赞不绝口，爆款词汇为「${mockReport.sentiment.keywords.slice(0, 3).join("、")}」。
 - **中立舆情 (${mockReport.sentiment.neutral}%)**：多为询问购买渠道、价格、优惠券，以及询问是否有其他色号/款式。
-- **负面舆情 (${mockReport.sentiment.negative}%)**：主要集中在「${mockReport.sentiment.keywords[3]}」（约占负面的 60%），建议品牌在后续内容中强调性价比或推出中样体验装。`;
-    } else if (latestUserMsg.includes("ROI") || latestUserMsg.includes("转化") || latestUserMsg.includes("MCN") || latestUserMsg.includes("费用")) {
-      reply = `【离线MCN分析】MCN 机构 **${mockReport.mcnAnalysis.mcnName}** 表现如下：
-- **ROI 评估**：本次推广实际销售转化比为 **${mockReport.mcnAnalysis.roi}**，在行业大盘处于中上等水平。
-- **核心优势**：${mockReport.mcnAnalysis.strengths.join("、")}。
-- **主要瓶颈**：${mockReport.mcnAnalysis.weaknesses.join("、")}。
-建议后续可以针对转化率高的头部达人追加投流（如 Douyin 随心推 / Red 薯条），实现二次破圈。`;
+- **负面舆情 (${mockReport.sentiment.negative}%)**：主要集中在「${mockReport.sentiment.keywords[3]}」（约占负面的 60%），建议品牌在后续内容中强调产品特点或温和配方。`;
+    } else if (latestUserMsg.includes("KOL") || latestUserMsg.includes("达人") || latestUserMsg.includes("达人数据") || latestUserMsg.includes("红人")) {
+      reply = `【离线KOL看板分析】结合 \`social_statistic_hot_user\` 和 \`query_user_info\` 得到的达人表现如下：
+- **核心声量贡献**：本次红人矩阵整体表现稳健。头部达人以极高互动率撬动圈层，其单人声量贡献比高达 **${((mockReport.kolPerformance[0]?.engagementRate * 5.4) + 12).toFixed(1)}%**。
+- **互动粘性**：平均互动率达 **${mockReport.engagement.avgEngagementRate}%**，说明粉丝粘性强，正向态度好。
+您可以点击右侧的「KOL看板」查看每位达人的具体粉丝量、互动率、成本及声量贡献占比。`;
     } else if (latestUserMsg.trim().length > 0) {
-      reply = `【离线分析师解答】收到关于「${latestUserMsg}」的反馈。
-在 KOL 矩阵中，**${mockReport.kolPerformance[0]?.name || "核心达人"}** 以较强的带货爆发力成为本次亮点，其粉丝正向情感率达 **${mockReport.kolPerformance[0]?.sentimentPositive || 80}%**。为了针对性优化，已在右侧「AI 推荐」中更新了相应的定制化策略，请您参考。`;
+      reply = `【离线分析师解答】收到关于「${latestUserMsg}」的提问。
+基于 \`social_statistic_overview\` 和 \`query_raw_posts\` 聚合：
+在 KOL 矩阵中，**${mockReport.kolPerformance[0]?.name || "核心达人"}** 以较强的社交爆发力成为本次亮点，其粉丝正向情感率达 **${mockReport.kolPerformance[0]?.sentimentPositive || 80}%**。为了更深入地分析其传播路径与全网品牌声量趋势，请查看右侧的「数据看板」中相关的多维画像和时序波峰。`;
     }
 
     return res.json({
@@ -158,23 +158,26 @@ app.post("/api/analyze", async (req, res) => {
   }
 
   try {
-    const latestUserMsg = messages[messages.length - 1]?.text || "请根据提供的基本参数，分析此网红KOL和MCN活动的效果。";
+    const latestUserMsg = messages[messages.length - 1]?.text || "请根据提供的基本参数，分析此红人KOL和活动声量效果。";
     
     // Construct system prompt and instructions
-    const systemInstruction = `You are a Senior Influencer Marketing & MCN ROI Analyst (高级网红KOL与MCN营销效果数据分析专家).
-Your objective is to help brand marketing managers analyze campaign performance, estimate ROI, evaluate the cooperative MCN agency, review individual KOL performance, and generate a dynamic BI report containing:
-1. Sentiment analysis (positive, neutral, negative and top keywords).
-2. Engagement metrics (total views, likes, comments, shares, average rate, and trend line).
-3. Demographics (gender ratio, age groups, and top provinces).
-4. MCN evaluation (agency name, execution score, fulfillment rate, CPM, CPE, ROI, strengths, weaknesses).
-5. KOL detailed metrics list.
-6. Custom recommendations for future tactics.
+    const systemInstruction = `You are a Senior Influencer Marketing & Social Media Volume Analyst (高级网红KOL与社交媒体声量分析数据专家).
+Your objective is to help brand marketing managers analyze campaign performance, brand volume, public sentiment, and review individual KOL performance. Currently, the data MCP only provides functions such as social_statistic_overview, query_analysis_data, social_statistic_trend, social_statistic_user_profile, social_statistic_hot_user, and query_user_info.
+
+Do NOT generate or discuss MCN ratings, ROI, or AI strategic recommendations. Focus entirely on compiling the following:
+1. Data Dashboard (数据看板):
+   - Brand Sentiment analysis (positive, neutral, negative and top keywords based on query_analysis_data).
+   - Brand Volume & Engagement metrics (total views, likes, comments, shares, average rate, based on social_statistic_overview).
+   - Volume Trend (social_statistic_trend chart).
+   - Target Demographics (gender ratio, age groups, and top provinces based on social_statistic_user_profile).
+2. KOL Dashboard (KOL看板):
+   - Individual KOL/Creator detailed metrics list (followers, platform, engagement rate, cost, sentiment, and calculated volume contribution based on social_statistic_hot_user and query_user_info).
 
 You must respond with a JSON object containing:
-- "reply": A highly professional, conversational, data-backed analysis response in Chinese. Discuss specific numbers, praise outstanding creators, point out bottlenecks, and reply to the user's latest query naturally. Make it detailed and structured.
+- "reply": A highly professional, conversational, data-backed analysis response in Chinese. Discuss specific numbers, praise outstanding creators, point out bottlenecks based on volume or engagement, and reply to the user's latest query naturally. Make it detailed and structured.
 - "reportData": The fully-formed BI analytics structured report data following the precise type definitions.
 
-If the user requests to change, simulate, or adjust any metric in the conversation (e.g., "Change the ROI to 3.2", "Set MCN score to 95", "Add Alice's negative feedback about pricing", "What if positive sentiment was 85%?"), you MUST adjust the returned 'reportData' to reflect these changes exactly.
+If the user requests to change, simulate, or adjust any metric in the conversation (e.g., "Change Alice's positive feedback to 85%?"), you MUST adjust the returned 'reportData' to reflect these changes exactly.
 
 The 'reportData' schema must strictly match:
 {

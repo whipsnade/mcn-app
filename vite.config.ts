@@ -3,11 +3,8 @@ import react from '@vitejs/plugin-react';
 import path from 'path';
 import {defineConfig} from 'vite';
 
-export default defineConfig(({command}) => {
+export default defineConfig(() => {
   return {
-    // On GitHub Pages the app is served from https://<user>.github.io/mcn-app/,
-    // so production builds need the repo name as the base path. Dev stays at '/'.
-    base: command === 'build' ? '/mcn-app/' : '/',
     plugins: [react(), tailwindcss()],
     resolve: {
       alias: {
