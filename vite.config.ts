@@ -3,8 +3,11 @@ import react from '@vitejs/plugin-react';
 import path from 'path';
 import {defineConfig} from 'vite';
 
-export default defineConfig(() => {
+export default defineConfig(({command}) => {
   return {
+    // GitHub Pages 部署在 https://<user>.github.io/mcn-app/ 子路径下，
+    // 生产构建需要以仓库名作为 base，开发环境保持 '/'。
+    base: command === 'build' ? '/mcn-app/' : '/',
     plugins: [react(), tailwindcss()],
     resolve: {
       alias: {
