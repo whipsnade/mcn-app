@@ -62,7 +62,7 @@ class TaskCandidate(Base):
     snapshot_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("kol_snapshots.id"), nullable=False
     )
-    candidate_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    candidate_version: Mapped[int] = mapped_column(Integer, nullable=False)
     total_score: Mapped[Decimal] = mapped_column(Numeric(6, 3), nullable=False)
     score_breakdown_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     rank: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -87,8 +87,8 @@ class BiReport(Base):
     session_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False
     )
-    candidate_version: Mapped[str] = mapped_column(String(32), nullable=False)
-    report_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    candidate_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    report_version: Mapped[int] = mapped_column(Integer, nullable=False)
     chart_data_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     conclusion_text: Mapped[str | None] = mapped_column(Text)
     evidence_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
