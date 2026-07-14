@@ -10,6 +10,7 @@ requires-python = ">=3.11,<3.13"
 dependencies = [
   "alembic>=1.14,<2",
   "asyncmy>=0.2,<1",
+  "cryptography>=44,<47",
   "fastapi>=0.115,<1",
   "greenlet>=3.1,<4",
   "pydantic-settings>=2.7,<3",
