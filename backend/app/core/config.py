@@ -1,8 +1,11 @@
 from functools import lru_cache
+from typing import Literal
 from urllib.parse import quote_plus
 
-from pydantic import SecretStr, model_validator
+from pydantic import AnyHttpUrl, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from app.mcp_gateway.contracts import DataTapService
 
 
 class Settings(BaseSettings):
@@ -23,6 +26,19 @@ class Settings(BaseSettings):
     access_token_minutes: int = 30
     refresh_token_days: int = 30
     frontend_origin: str = "http://localhost:5173"
+    model_provider: Literal["tencent_plan", "fake"] = "fake"
+    tencent_plan_base_url: AnyHttpUrl = AnyHttpUrl(
+        "https://api.lkeap.cloud.tencent.com/plan/v3"
+    )
+    tencent_plan_api_key: SecretStr | None = None
+    tencent_plan_model: str = "deepseek-v4-pro-202606"
+    model_timeout_seconds: float = Field(default=60.0, gt=0)
+    mcp_provider: Literal["datatap", "fake"] = "fake"
+    datatap_mcp_token: SecretStr | None = None
+    mcp_call_points: int = 10
+    mcp_max_calls_per_task: int = 10
+    mcp_unknown_reconcile_seconds: int = Field(default=300, gt=0)
+    task_lease_seconds: int = Field(default=60, gt=0)
 
     @property
     def database_url(self) -> str:
@@ -32,10 +48,40 @@ class Settings(BaseSettings):
             f"{self.mysql_host}:{self.mysql_port}/{self.mysql_database}?charset=utf8mb4"
         )
 
+    def datatap_endpoint(self, service: DataTapService) -> AnyHttpUrl:
+        if not isinstance(service, DataTapService):
+            raise TypeError("service must be a DataTapService")
+        return AnyHttpUrl(
+            f"https://datatap.deepminer.com.cn/api/gateway/{service.value}/mcp"
+        )
+
     @model_validator(mode="after")
-    def reject_mock_auth_in_production(self) -> "Settings":
-        if self.app_env == "production" and self.auth_mode == "mock":
-            raise ValueError("AUTH_MODE=mock is forbidden in production")
+    def validate_runtime_contracts(self) -> "Settings":
+        if self.tencent_plan_base_url.unicode_string() != (
+            "https://api.lkeap.cloud.tencent.com/plan/v3"
+        ):
+            raise ValueError("TENCENT_PLAN_BASE_URL must use the confirmed provider endpoint")
+        if self.tencent_plan_model != "deepseek-v4-pro-202606":
+            raise ValueError("TENCENT_PLAN_MODEL must use the confirmed model")
+        if self.mcp_call_points != 10:
+            raise ValueError("MCP_CALL_POINTS must be 10")
+        if self.mcp_max_calls_per_task != 10:
+            raise ValueError("MCP_MAX_CALLS_PER_TASK must be 10")
+
+        if self.app_env == "production":
+            if self.auth_mode == "mock":
+                raise ValueError("AUTH_MODE=mock is forbidden in production")
+            if self.model_provider == "fake":
+                raise ValueError("MODEL_PROVIDER=fake is forbidden in production")
+            if self.mcp_provider == "fake":
+                raise ValueError("MCP_PROVIDER=fake is forbidden in production")
+            if (
+                self.tencent_plan_api_key is None
+                or not self.tencent_plan_api_key.get_secret_value()
+            ):
+                raise ValueError("TENCENT_PLAN_API_KEY is required in production")
+            if self.datatap_mcp_token is None or not self.datatap_mcp_token.get_secret_value():
+                raise ValueError("DATATAP_MCP_TOKEN is required in production")
         return self
 
 
