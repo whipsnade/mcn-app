@@ -24,6 +24,18 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    oversized_count = op.get_bind().execute(
+        sa.text(
+            "SELECT COUNT(*) FROM messages "
+            "WHERE OCTET_LENGTH(content) > 65535"
+        )
+    ).scalar_one()
+    if oversized_count:
+        raise RuntimeError(
+            "message_content_exceeds_text_limit: "
+            f"{oversized_count} messages exceed the 65535-byte TEXT limit"
+        )
+
     op.alter_column(
         "messages",
         "content",
