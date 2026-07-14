@@ -28,6 +28,11 @@ CONFIRMED_BASE_URL = "https://api.lkeap.cloud.tencent.com/plan/v3"
 CONFIRMED_MODEL = "deepseek-v4-pro-202606"
 _SCHEMA_SUPPORT_CACHE: dict[tuple[str, str, str], bool] = {}
 _RETRYABLE_STATUS_CODES = {429, 502, 503, 504}
+_MAX_VALIDATION_ERRORS = 20
+_MAX_VALIDATION_LOC_SEGMENTS = 8
+_MAX_VALIDATION_LOC_SEGMENT_LENGTH = 64
+_MAX_VALIDATION_TYPE_LENGTH = 64
+_MAX_REPAIR_DETAILS_LENGTH = 1500
 _STATUS_ERROR_CODES = {
     400: "MODEL_BAD_REQUEST",
     401: "MODEL_AUTHENTICATION_FAILED",
@@ -325,8 +330,32 @@ class TencentPlanAdapter:
         return content if isinstance(content, str) else ""
 
     def _repair_message(self, exc: ValidationError) -> dict[str, str]:
-        errors = exc.errors(include_url=False, include_input=False)
-        compact = json.dumps(errors, ensure_ascii=False, separators=(",", ":"))[:1500]
+        safe_errors: list[dict[str, Any]] = []
+        for error in exc.errors(include_url=False, include_input=False)[
+            :_MAX_VALIDATION_ERRORS
+        ]:
+            error_type = error.get("type")
+            safe_type = (
+                error_type[:_MAX_VALIDATION_TYPE_LENGTH]
+                if isinstance(error_type, str)
+                else "validation_error"
+            )
+            safe_loc: list[str | int] = []
+            loc = error.get("loc")
+            if isinstance(loc, (list, tuple)):
+                for segment in loc[:_MAX_VALIDATION_LOC_SEGMENTS]:
+                    if isinstance(segment, str):
+                        safe_loc.append(segment[:_MAX_VALIDATION_LOC_SEGMENT_LENGTH])
+                    elif isinstance(segment, int):
+                        safe_loc.append(segment)
+                    else:
+                        safe_loc.append("<unsupported>")
+            safe_errors.append({"type": safe_type, "loc": safe_loc})
+        compact = json.dumps(
+            safe_errors,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )[:_MAX_REPAIR_DETAILS_LENGTH]
         return {
             "role": "user",
             "content": (

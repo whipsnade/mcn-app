@@ -2,7 +2,7 @@ import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 
 from app.model.contracts import (
     ChatMessage,
@@ -25,6 +25,22 @@ class MinimalPlan(BaseModel):
 
     objective: str
     steps: list[str]
+
+
+SENSITIVE_MARKER = "SENSITIVE_VALIDATOR_MARKER_DO_NOT_LEAK"
+VALIDATOR_MESSAGE = "validator-rejected-sensitive-input"
+
+
+class SensitiveValidatorPlan(BaseModel):
+    objective: str
+    steps: list[str]
+
+    @field_validator("objective")
+    @classmethod
+    def reject_sensitive_marker(cls, value: str) -> str:
+        if SENSITIVE_MARKER in value:
+            raise ValueError(f"{VALIDATOR_MESSAGE}: {value!r}")
+        return value
 
 
 def planner_request() -> StructuredModelRequest[MinimalPlan]:
@@ -117,6 +133,38 @@ async def test_invalid_structure_is_regenerated_only_once() -> None:
     assert caught.value.code == "MODEL_PLAN_INVALID"
     assert len(client.calls) == 2
     assert "validation" in client.calls[1]["messages"][-1]["content"].lower()
+
+
+@pytest.mark.asyncio
+async def test_repair_message_excludes_sensitive_validator_error_details() -> None:
+    client = FakeChatCompletions(
+        [
+            completion(
+                '{"objective":"'
+                + SENSITIVE_MARKER
+                + '","steps":[]}'
+            ),
+            completion('{"objective":"安全结果","steps":[]}'),
+        ]
+    )
+    request = StructuredModelRequest(
+        purpose="planner",
+        template_name="planner_v1",
+        messages=(ChatMessage(role="user", content="选人"),),
+        output_model=SensitiveValidatorPlan,
+    )
+    adapter = TencentPlanAdapter(client=client, schema_support_cache={})
+
+    result = await adapter.complete_json(request)
+
+    assert result.value.objective == "安全结果"
+    assert len(client.calls) == 2
+    repair_content = client.calls[1]["messages"][-1]["content"]
+    assert SENSITIVE_MARKER not in repair_content
+    assert VALIDATOR_MESSAGE not in repair_content
+    assert "ValueError" not in repair_content
+    assert '"type":"value_error"' in repair_content
+    assert '"loc":["objective"]' in repair_content
 
 
 @pytest.mark.asyncio
