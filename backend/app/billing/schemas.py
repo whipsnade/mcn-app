@@ -6,7 +6,4 @@ class WalletRead(BaseModel):
 
     balance: int
     reserved: int
-
-    @property
-    def available(self) -> int:
-        return self.balance
+    available: int

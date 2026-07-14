@@ -5,6 +5,7 @@ from typing import Any
 from uuid import uuid4
 
 import pytest_asyncio
+from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -18,7 +19,9 @@ os.environ.setdefault("MYSQL_PASSWORD", "test-only-password")
 os.environ.setdefault("JWT_SECRET", "test-only-jwt-secret-at-least-32-characters")
 
 from app.db.session import engine  # noqa: E402
+from app.db.session import get_db  # noqa: E402
 from app.identity.models import User  # noqa: E402
+from app.main import create_app  # noqa: E402
 
 
 @pytest_asyncio.fixture
@@ -56,3 +59,16 @@ async def user_factory(
         return user
 
     return create_user
+
+
+@pytest_asyncio.fixture
+async def client(db_session: AsyncSession) -> AsyncIterator[AsyncClient]:
+    app = create_app()
+
+    async def override_get_db() -> AsyncIterator[AsyncSession]:
+        yield db_session
+
+    app.dependency_overrides[get_db] = override_get_db
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as test_client:
+        yield test_client
