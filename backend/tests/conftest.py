@@ -72,3 +72,28 @@ async def client(db_session: AsyncSession) -> AsyncIterator[AsyncClient]:
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as test_client:
         yield test_client
+
+
+@pytest_asyncio.fixture
+async def auth_client_factory(db_session: AsyncSession):
+    clients: list[AsyncClient] = []
+
+    async def create_client(phone: str) -> AsyncClient:
+        app = create_app()
+
+        async def override_get_db() -> AsyncIterator[AsyncSession]:
+            yield db_session
+
+        app.dependency_overrides[get_db] = override_get_db
+        test_client = AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
+        login = await test_client.post(
+            "/api/v1/auth/mock/sms/login",
+            json={"phone": phone, "code": "000000"},
+        )
+        test_client.headers["Authorization"] = f"Bearer {login.json()['access_token']}"
+        clients.append(test_client)
+        return test_client
+
+    yield create_client
+    for test_client in clients:
+        await test_client.aclose()
