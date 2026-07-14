@@ -1,0 +1,1 @@
+"""KOL selection workspace domain."""
