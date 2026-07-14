@@ -167,7 +167,42 @@ export default function ChatArea({
       </div>
 
       {/* Input panel container */}
-      <div className="p-4 bg-white border-t border-slate-100">
+      <div className="p-4 bg-white border-t border-slate-100 space-y-2.5">
+        
+        {/* Quick Commands Tags */}
+        <div className="flex items-center gap-2 overflow-x-auto pb-1 scrollbar-none">
+          <span className="text-[10px] font-bold text-slate-400 shrink-0 uppercase tracking-wider flex items-center gap-1">
+            <Sparkles className="h-3 w-3 text-indigo-500 animate-pulse" />
+            常用指令:
+          </span>
+          <div className="flex gap-1.5 min-w-max">
+            {[
+              { label: "📊 分析转化率", text: "请帮我分析本次营销活动中各个KOL的销售转化率与性价比。" },
+              { label: "👥 对比各KOL表现", text: "对比分析本次合作达人的具体粉丝、互动率与情感极性表现。" },
+              { label: "💰 查看MCN预算分配", text: "重点分析本次MCN机构的执行成本、ROI及性价比瓶颈分析。" },
+              { label: "📈 分析舆情情感", text: "深度剖析受众的情感偏好、舆情关键词分布及潜在负面规避建议。" }
+            ].map((cmd, idx) => (
+              <button
+                key={idx}
+                type="button"
+                disabled={isAnalyzing}
+                onClick={() => {
+                  if (!isAnalyzing) {
+                    onSendMessage(cmd.text);
+                  }
+                }}
+                className={`text-[10px] font-medium px-2.5 py-1 rounded-full border transition duration-150 active:scale-95 ${
+                  isAnalyzing
+                    ? 'bg-slate-50 text-slate-300 border-slate-100 cursor-not-allowed'
+                    : 'bg-indigo-50/50 hover:bg-indigo-50 text-indigo-600 border-indigo-100/60 hover:border-indigo-200'
+                }`}
+              >
+                {cmd.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
         <form onSubmit={handleSend} className="bg-slate-50 rounded-xl p-1 flex items-center border border-slate-200 focus-within:ring-2 focus-within:ring-indigo-500/20 transition duration-150">
           
           <textarea
@@ -192,7 +227,7 @@ export default function ChatArea({
             发送
           </button>
         </form>
-        <p className="text-[10px] text-slate-400 mt-2 text-center">
+        <p className="text-[10px] text-slate-400 text-center">
           💡 提示：你可以要求 AI 调整、模拟特定达人的销售转化、提升正向舆情占比，右侧 BI 报表将自适应重计算。
         </p>
       </div>

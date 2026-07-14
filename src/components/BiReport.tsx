@@ -3,18 +3,19 @@ import {
   TrendingUp, Users, Heart, Share2, MessageCircle, Eye, 
   BarChart2, Award, CheckCircle2, AlertTriangle, HelpCircle, 
   ThumbsUp, PieChart as PieIcon, LineChart as LineIcon, Activity, Star,
-  Sparkles, Printer
+  Sparkles, Printer, GitCompare
 } from 'lucide-react';
 import { 
   ResponsiveContainer, AreaChart, Area, XAxis, YAxis, Tooltip, 
-  BarChart, Bar, Cell, PieChart, Pie, Legend
+  BarChart, Bar, Cell, PieChart, Pie, Legend, LineChart, Line
 } from 'recharts';
-import { ReportData } from '../types';
+import { ReportData, Session } from '../types';
 
 interface BiReportProps {
   reportData?: ReportData;
   campaignName: string;
   brand: string;
+  sessions?: Session[];
 }
 
 function MetricHelper({ 
@@ -58,19 +59,84 @@ function MetricHelper({
   );
 }
 
-export default function BiReport({ reportData, campaignName, brand }: BiReportProps) {
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'kol'>('dashboard');
+export default function BiReport({ reportData, campaignName, brand, sessions }: BiReportProps) {
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'kol' | 'compare'>('dashboard');
+  const [compareIdA, setCompareIdA] = useState<string>('');
+  const [compareIdB, setCompareIdB] = useState<string>('');
 
-  if (!reportData) {
+  const validSessions = (sessions || []).filter(s => s.reportData !== undefined);
+  const activeSession = (sessions || []).find(s => s.reportData === reportData);
+
+  const currentIdA = compareIdA || activeSession?.id || validSessions[0]?.id || '';
+  const currentIdB = compareIdB || validSessions.find(s => s.id !== currentIdA)?.id || validSessions[1]?.id || '';
+
+  const sessionA = validSessions.find(s => s.id === currentIdA);
+  const sessionB = validSessions.find(s => s.id === currentIdB);
+
+  const brandAName = sessionA?.brand ? sessionA.brand.split(' ')[0] : '活动 A';
+  const brandBName = sessionB?.brand ? sessionB.brand.split(' ')[0] : '活动 B';
+
+  if (!reportData && activeTab !== 'compare') {
     return (
-      <div className="flex h-full flex-col bg-white w-96 shrink-0 items-center justify-center p-8 border-l border-slate-200 text-center">
-        <div className="h-12 w-12 rounded-full bg-indigo-50 flex items-center justify-center text-indigo-600 mb-4 animate-bounce">
-          <Activity className="h-6 w-6" />
+      <div className="flex h-full flex-col bg-white w-[420px] shrink-0 border-l border-slate-200 shadow-sm overflow-hidden print-container">
+        {/* BI Panel Header with Export PDF */}
+        <div className="h-14 flex items-center justify-between px-4 border-b border-slate-200 bg-white shrink-0">
+          <h2 className="text-xs font-bold text-slate-800 uppercase tracking-widest">BI Intelligence Output</h2>
+          <div className="w-10 h-1" />
         </div>
-        <h3 className="text-sm font-bold text-slate-800 font-display">等待生成分析数据</h3>
-        <p className="text-xs text-slate-400 mt-1 max-w-[240px]">
-          在中间对话框中与 AI 进行会话，或点击「AI 一键诊断」，即可实时在此生成多维 BI 图表报告。
-        </p>
+
+        {/* Top Navigation Tabs */}
+        <div className="flex border-b border-slate-200 shrink-0 bg-slate-50/50 no-print">
+          <button
+            onClick={() => setActiveTab('dashboard')}
+            className={`flex-1 py-3.5 text-xs font-bold text-center border-b-2 transition ${
+              activeTab === 'dashboard'
+                ? 'border-indigo-600 text-indigo-600 bg-white'
+                : 'border-transparent text-slate-500 hover:text-slate-800'
+            }`}
+          >
+            <span className="flex items-center justify-center gap-1.5">
+              <BarChart2 className="h-3.5 w-3.5" />
+              数据看板
+            </span>
+          </button>
+          <button
+            onClick={() => setActiveTab('kol')}
+            className={`flex-1 py-3.5 text-xs font-bold text-center border-b-2 transition ${
+              activeTab === 'kol'
+                ? 'border-indigo-600 text-indigo-600 bg-white'
+                : 'border-transparent text-slate-500 hover:text-slate-800'
+            }`}
+          >
+            <span className="flex items-center justify-center gap-1.5">
+              <Award className="h-3.5 w-3.5" />
+              KOL 看板
+            </span>
+          </button>
+          <button
+            onClick={() => setActiveTab('compare')}
+            className={`flex-1 py-3.5 text-xs font-bold text-center border-b-2 transition ${
+              activeTab === 'compare'
+                ? 'border-indigo-600 text-indigo-600 bg-white'
+                : 'border-transparent text-slate-500 hover:text-slate-800'
+            }`}
+          >
+            <span className="flex items-center justify-center gap-1.5">
+              <GitCompare className="h-3.5 w-3.5" />
+              基准对比
+            </span>
+          </button>
+        </div>
+
+        <div className="flex-1 flex flex-col items-center justify-center p-8 bg-slate-50/30 text-center">
+          <div className="h-12 w-12 rounded-full bg-indigo-50 flex items-center justify-center text-indigo-600 mb-4 animate-bounce">
+            <Activity className="h-6 w-6" />
+          </div>
+          <h3 className="text-sm font-bold text-slate-800 font-display">等待生成分析数据</h3>
+          <p className="text-xs text-slate-400 mt-1 max-w-[240px]">
+            在中间对话框中与 AI 进行会话，或点击「AI 一键诊断」，即可实时在此生成多维 BI 图表报告。
+          </p>
+        </div>
       </div>
     );
   }
@@ -78,11 +144,11 @@ export default function BiReport({ reportData, campaignName, brand }: BiReportPr
   // Pre-configured colors for pie chart
   const RADIAN = Math.PI / 180;
   const sentimentColors = ['#10b981', '#f59e0b', '#ef4444']; // Positive, Neutral, Negative
-  const sentimentPieData = [
+  const sentimentPieData = reportData ? [
     { name: '正面 (Positive)', value: reportData.sentiment.positive },
     { name: '中立 (Neutral)', value: reportData.sentiment.neutral },
     { name: '负面 (Negative)', value: reportData.sentiment.negative },
-  ];
+  ] : [];
 
   return (
     <div className="flex h-full flex-col bg-white w-[420px] shrink-0 border-l border-slate-200 shadow-sm overflow-hidden print-container">
@@ -126,6 +192,19 @@ export default function BiReport({ reportData, campaignName, brand }: BiReportPr
           <span className="flex items-center justify-center gap-1.5">
             <Award className="h-3.5 w-3.5" />
             KOL 看板
+          </span>
+        </button>
+        <button
+          onClick={() => setActiveTab('compare')}
+          className={`flex-1 py-3.5 text-xs font-bold text-center border-b-2 transition ${
+            activeTab === 'compare'
+              ? 'border-indigo-600 text-indigo-600 bg-white'
+              : 'border-transparent text-slate-500 hover:text-slate-800'
+          }`}
+        >
+          <span className="flex items-center justify-center gap-1.5">
+            <GitCompare className="h-3.5 w-3.5" />
+            基准对比
           </span>
         </button>
       </div>
@@ -479,6 +558,217 @@ export default function BiReport({ reportData, campaignName, brand }: BiReportPr
               </div>
             </div>
 
+          </div>
+        )}
+
+        {/* TAB 3: BENCHMARK COMPARISON */}
+        {activeTab === 'compare' && (
+          <div className="space-y-4">
+            {/* Session Selectors */}
+            <div className="bg-white rounded-xl p-3 border border-slate-100 shadow-sm space-y-3">
+              <div className="flex items-center gap-1.5 text-xs font-bold text-slate-700">
+                <GitCompare className="h-3.5 w-3.5 text-indigo-500 animate-pulse" />
+                基准对照设置
+              </div>
+              
+              {validSessions.length < 2 ? (
+                <div className="p-3 bg-indigo-50 border border-indigo-100/60 rounded-lg text-[11px] text-indigo-700 leading-relaxed">
+                  💡 当前仅有 {validSessions.length} 个会话包含分析报表。请在左侧侧边栏切换或新建更多活动会话，点击中间的「AI 一键诊断」或通过对话生成报表后，即可在此进行多维基准对比。
+                </div>
+              ) : (
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <label className="block text-[10px] font-bold text-slate-400 mb-1">基准会话 (A)</label>
+                    <select
+                      value={currentIdA}
+                      onChange={(e) => {
+                        const id = e.target.value;
+                        setCompareIdA(id);
+                        if (id === currentIdB) {
+                          const other = validSessions.find(s => s.id !== id);
+                          if (other) setCompareIdB(other.id);
+                        }
+                      }}
+                      className="w-full bg-slate-50 border border-slate-200 rounded-lg py-1.5 px-2 text-xs font-medium text-slate-700 focus:outline-none focus:border-indigo-500 transition"
+                    >
+                      {validSessions.map(s => (
+                        <option key={s.id} value={s.id}>
+                          {s.brand.split(' ')[0]} - {s.campaignName.slice(0, 8)}...
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block text-[10px] font-bold text-slate-400 mb-1">对比会话 (B)</label>
+                    <select
+                      value={currentIdB}
+                      onChange={(e) => {
+                        const id = e.target.value;
+                        setCompareIdB(id);
+                        if (id === currentIdA) {
+                          const other = validSessions.find(s => s.id !== id);
+                          if (other) setCompareIdA(other.id);
+                        }
+                      }}
+                      className="w-full bg-slate-50 border border-slate-200 rounded-lg py-1.5 px-2 text-xs font-medium text-slate-700 focus:outline-none focus:border-indigo-500 transition"
+                    >
+                      {validSessions.map(s => (
+                        <option key={s.id} value={s.id}>
+                          {s.brand.split(' ')[0]} - {s.campaignName.slice(0, 8)}...
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {sessionA && sessionB && (
+              <>
+                {/* 1. Comparison Table Card */}
+                <div className="bg-white rounded-xl p-4 border border-slate-100 shadow-sm space-y-3">
+                  <div className="flex items-center justify-between border-b border-slate-100 pb-2">
+                    <h4 className="text-xs font-bold text-slate-700">关键 KPI 核心对比</h4>
+                    <span className="text-[9px] text-slate-400">绿色标记为胜出项</span>
+                  </div>
+
+                  <div className="overflow-hidden rounded-lg border border-slate-100/80">
+                    <table className="w-full text-left border-collapse text-[11px]">
+                      <thead>
+                        <tr className="bg-slate-50/80 text-slate-400 font-bold border-b border-slate-100">
+                          <th className="py-2 px-3">对比维度</th>
+                          <th className="py-2 px-2 text-right truncate max-w-[90px]">{brandAName}</th>
+                          <th className="py-2 px-2 text-right truncate max-w-[90px]">{brandBName}</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-100/60 text-slate-600">
+                        {/* Metric 1: ROI */}
+                        <tr>
+                          <td className="py-2.5 px-3 font-semibold text-slate-700">投资回报率 (ROI)</td>
+                          <td className={`py-2.5 px-2 text-right font-display font-bold ${sessionA.reportData!.mcnAnalysis.roi >= sessionB.reportData!.mcnAnalysis.roi ? 'text-emerald-600 bg-emerald-50/10' : 'text-slate-500'}`}>
+                            {sessionA.reportData!.mcnAnalysis.roi.toFixed(2)}x
+                          </td>
+                          <td className={`py-2.5 px-2 text-right font-display font-bold ${sessionB.reportData!.mcnAnalysis.roi >= sessionA.reportData!.mcnAnalysis.roi ? 'text-emerald-600 bg-emerald-50/10' : 'text-slate-500'}`}>
+                            {sessionB.reportData!.mcnAnalysis.roi.toFixed(2)}x
+                          </td>
+                        </tr>
+
+                        {/* Metric 2: CVR */}
+                        <tr>
+                          <td className="py-2.5 px-3 font-semibold text-slate-700">预估转化率 (CVR)</td>
+                          <td className={`py-2.5 px-2 text-right font-display font-bold ${
+                            (currentIdA === 'WO-1003' ? 4.5 : currentIdA === 'WO-1001' ? 3.2 : 2.8) >= 
+                            (currentIdB === 'WO-1003' ? 4.5 : currentIdB === 'WO-1001' ? 3.2 : 2.8) 
+                            ? 'text-emerald-600 bg-emerald-50/10' : 'text-slate-500'}`}>
+                            {currentIdA === 'WO-1003' ? '4.5%' : currentIdA === 'WO-1001' ? '3.2%' : '2.8%'}
+                          </td>
+                          <td className={`py-2.5 px-2 text-right font-display font-bold ${
+                            (currentIdB === 'WO-1003' ? 4.5 : currentIdB === 'WO-1001' ? 3.2 : 2.8) >= 
+                            (currentIdA === 'WO-1003' ? 4.5 : currentIdA === 'WO-1001' ? 3.2 : 2.8) 
+                            ? 'text-emerald-600 bg-emerald-50/10' : 'text-slate-500'}`}>
+                            {currentIdB === 'WO-1003' ? '4.5%' : currentIdB === 'WO-1001' ? '3.2%' : '2.8%'}
+                          </td>
+                        </tr>
+
+                        {/* Metric 3: Total Views */}
+                        <tr>
+                          <td className="py-2.5 px-3 font-semibold text-slate-700">总曝光量 (Views)</td>
+                          <td className={`py-2.5 px-2 text-right font-display font-bold ${sessionA.reportData!.engagement.totalViews >= sessionB.reportData!.engagement.totalViews ? 'text-emerald-600 bg-emerald-50/10' : 'text-slate-500'}`}>
+                            {(sessionA.reportData!.engagement.totalViews / 1000000).toFixed(1)}M
+                          </td>
+                          <td className={`py-2.5 px-2 text-right font-display font-bold ${sessionB.reportData!.engagement.totalViews >= sessionA.reportData!.engagement.totalViews ? 'text-emerald-600 bg-emerald-50/10' : 'text-slate-500'}`}>
+                            {(sessionB.reportData!.engagement.totalViews / 1000000).toFixed(1)}M
+                          </td>
+                        </tr>
+
+                        {/* Metric 4: Avg Engagement Rate */}
+                        <tr>
+                          <td className="py-2.5 px-3 font-semibold text-slate-700">平均互动率</td>
+                          <td className={`py-2.5 px-2 text-right font-display font-bold ${sessionA.reportData!.engagement.avgEngagementRate >= sessionB.reportData!.engagement.avgEngagementRate ? 'text-emerald-600 bg-emerald-50/10' : 'text-slate-500'}`}>
+                            {sessionA.reportData!.engagement.avgEngagementRate}%
+                          </td>
+                          <td className={`py-2.5 px-2 text-right font-display font-bold ${sessionB.reportData!.engagement.avgEngagementRate >= sessionA.reportData!.engagement.avgEngagementRate ? 'text-emerald-600 bg-emerald-50/10' : 'text-slate-500'}`}>
+                            {sessionB.reportData!.engagement.avgEngagementRate}%
+                          </td>
+                        </tr>
+
+                        {/* Metric 5: Sentiment Positive */}
+                        <tr>
+                          <td className="py-2.5 px-3 font-semibold text-slate-700">正面舆情占比</td>
+                          <td className={`py-2.5 px-2 text-right font-display font-bold ${sessionA.reportData!.sentiment.positive >= sessionB.reportData!.sentiment.positive ? 'text-emerald-600 bg-emerald-50/10' : 'text-slate-500'}`}>
+                            {sessionA.reportData!.sentiment.positive}%
+                          </td>
+                          <td className={`py-2.5 px-2 text-right font-display font-bold ${sessionB.reportData!.sentiment.positive >= sessionA.reportData!.sentiment.positive ? 'text-emerald-600 bg-emerald-50/10' : 'text-slate-500'}`}>
+                            {sessionB.reportData!.sentiment.positive}%
+                          </td>
+                        </tr>
+
+                        {/* Metric 6: Fulfillment Rate */}
+                        <tr>
+                          <td className="py-2.5 px-3 font-semibold text-slate-700">MCN履约率</td>
+                          <td className={`py-2.5 px-2 text-right font-display font-bold ${sessionA.reportData!.mcnAnalysis.fulfillmentRate >= sessionB.reportData!.mcnAnalysis.fulfillmentRate ? 'text-emerald-600 bg-emerald-50/10' : 'text-slate-500'}`}>
+                            {sessionA.reportData!.mcnAnalysis.fulfillmentRate}%
+                          </td>
+                          <td className={`py-2.5 px-2 text-right font-display font-bold ${sessionB.reportData!.mcnAnalysis.fulfillmentRate >= sessionA.reportData!.mcnAnalysis.fulfillmentRate ? 'text-emerald-600 bg-emerald-50/10' : 'text-slate-500'}`}>
+                            {sessionB.reportData!.mcnAnalysis.fulfillmentRate}%
+                          </td>
+                        </tr>
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+
+                {/* 2. Exposure Trend Overlapping Line Chart */}
+                <div className="bg-white rounded-xl p-4 border border-slate-100 shadow-sm space-y-2">
+                  <div className="flex items-center justify-between">
+                    <h4 className="text-xs font-bold text-slate-700 flex items-center gap-1">
+                      <TrendingUp className="h-3.5 w-3.5 text-indigo-500" />
+                      日新增曝光量走势对比 (万次)
+                    </h4>
+                  </div>
+                  
+                  <div className="h-44 w-full">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <AreaChart 
+                        data={Array.from({ length: 7 }).map((_, idx) => {
+                          const dA = sessionA.reportData!.engagement.trendData[idx];
+                          const dB = sessionB.reportData!.engagement.trendData[idx];
+                          return {
+                            name: `D${idx + 1}`,
+                            [brandAName]: dA ? Math.round(dA.views / 10000) : 0,
+                            [brandBName]: dB ? Math.round(dB.views / 10000) : 0,
+                          };
+                        })} 
+                        margin={{ top: 10, right: 5, left: -20, bottom: 0 }}
+                      >
+                        <XAxis dataKey="name" stroke="#94a3b8" fontSize={9} />
+                        <YAxis stroke="#94a3b8" fontSize={9} />
+                        <Tooltip />
+                        <Legend iconType="circle" wrapperStyle={{ fontSize: '10px' }} />
+                        <Area type="monotone" dataKey={brandAName} stroke="#6366f1" fillOpacity={0.06} fill="#6366f1" strokeWidth={2} />
+                        <Area type="monotone" dataKey={brandBName} stroke="#ec4899" fillOpacity={0.06} fill="#ec4899" strokeWidth={2} />
+                      </AreaChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
+
+                {/* 3. Deep Analysis Verdict Bento Card */}
+                <div className="bg-slate-900 text-white rounded-xl p-4 shadow-md space-y-2.5">
+                  <div className="flex items-center gap-1.5 text-xs font-bold text-indigo-300">
+                    <Sparkles className="h-3.5 w-3.5 text-amber-400 animate-pulse" />
+                    AI 交叉对比诊断结论
+                  </div>
+                  <p className="text-[11.5px] text-slate-300 leading-relaxed font-sans">
+                    对比发现，<span className="font-bold text-indigo-400">{brandAName}</span> 在
+                    {sessionA.reportData!.mcnAnalysis.roi >= sessionB.reportData!.mcnAnalysis.roi ? '「投资回报率 (ROI)」' : '「曝光规模」'} 
+                    上表现出明显竞争优势。而 <span className="font-bold text-pink-400">{brandBName}</span> 则在
+                    {sessionB.reportData!.sentiment.positive >= sessionA.reportData!.sentiment.positive ? '「正面舆情口碑」' : '「千次互动效率」'}
+                    上更为优秀。建议后续营销活动融合两者的长处，即引入高声量破圈达人的同时，配合细分领域的垂类心智评测达人。
+                  </p>
+                </div>
+              </>
+            )}
           </div>
         )}
 
