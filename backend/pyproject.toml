@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kol-insight-api"
+version = "0.1.0"
+description = "KOL Insight modular monolith API"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+  "alembic>=1.14,<2",
+  "asyncmy>=0.2,<1",
+  "fastapi>=0.115,<1",
+  "pydantic-settings>=2.7,<3",
+  "PyJWT>=2.10,<3",
+  "sqlalchemy>=2.0,<3",
+  "uvicorn[standard]>=0.34,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "httpx>=0.28,<1",
+  "pytest>=8.3,<10",
+  "pytest-asyncio>=0.25,<2",
+  "ruff>=0.9,<1",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.setuptools.packages.find]
+include = ["app*"]

@@ -8,3 +8,8 @@ coverage/
 !.env.example
 .superpowers/
 .worktrees/
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.py[cod]

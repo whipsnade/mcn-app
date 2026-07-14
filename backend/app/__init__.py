@@ -1,0 +1,1 @@
+"""KOL Insight backend application."""
