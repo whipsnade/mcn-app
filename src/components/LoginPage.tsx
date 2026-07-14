@@ -13,12 +13,11 @@ import {
   User,
   AlertCircle
 } from 'lucide-react';
+import { requestSmsCode } from '../api/auth';
+import { useAuth } from '../auth/AuthProvider';
 
-interface LoginPageProps {
-  onLoginSuccess: (userInfo: { phone?: string; loginMethod: 'sms' | 'wechat'; nickname: string }) => void;
-}
-
-export default function LoginPage({ onLoginSuccess }: LoginPageProps) {
+export default function LoginPage() {
+  const auth = useAuth();
   const [loginMethod, setLoginMethod] = useState<'sms' | 'wechat'>('sms');
   
   // SMS States
@@ -71,10 +70,7 @@ export default function LoginPage({ onLoginSuccess }: LoginPageProps) {
           
           const successTimeout = setTimeout(() => {
             setWechatStatus('success');
-            onLoginSuccess({
-              loginMethod: 'wechat',
-              nickname: '微信用户_Anker'
-            });
+            void auth.loginWithWechat();
           }, 1500);
 
           return () => clearTimeout(successTimeout);
@@ -93,7 +89,7 @@ export default function LoginPage({ onLoginSuccess }: LoginPageProps) {
   }, [loginMethod]);
 
   // Handle Send Verification Code
-  const handleSendCode = () => {
+  const handleSendCode = async () => {
     setSmsError('');
     // China mobile phone verification
     const phoneRegex = /^1[3-9]\d{9}$/;
@@ -102,21 +98,18 @@ export default function LoginPage({ onLoginSuccess }: LoginPageProps) {
       return;
     }
 
-    // Generate random 6-digit verification code
-    const generatedCode = Math.floor(100000 + Math.random() * 900000).toString();
-    setCountdown(60);
-    
-    // Simulate real SMS gateway receipt by placing a tactile toast notice!
-    setSmsSentNotice(generatedCode);
-    
-    // Auto fill for convenience or let the user enter it
-    setTimeout(() => {
-      setCode(generatedCode);
-    }, 1500);
+    try {
+      const result = await requestSmsCode(phone);
+      setCountdown(60);
+      setSmsSentNotice(result.mock_code);
+      setCode(result.mock_code);
+    } catch (error) {
+      setSmsError(error instanceof Error ? error.message : '验证码发送失败');
+    }
   };
 
   // Handle SMS Login Submit
-  const handleSmsLogin = (e: React.FormEvent) => {
+  const handleSmsLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setSmsError('');
 
@@ -136,24 +129,24 @@ export default function LoginPage({ onLoginSuccess }: LoginPageProps) {
 
     setIsSmsSubmitting(true);
     
-    // Simulate API delay
-    setTimeout(() => {
+    try {
+      await auth.loginWithSms(phone, code);
+    } catch (error) {
+      setSmsError(error instanceof Error ? error.message : '登录失败');
+    } finally {
       setIsSmsSubmitting(false);
-      onLoginSuccess({
-        phone: phone,
-        loginMethod: 'sms',
-        nickname: `手机用户_${phone.slice(-4)}`
-      });
-    }, 1200);
+    }
   };
 
   // Instant simulation login helper
-  const handleInstantWechatLogin = () => {
+  const handleInstantWechatLogin = async () => {
     setWechatStatus('success');
-    onLoginSuccess({
-      loginMethod: 'wechat',
-      nickname: '微信快捷登录用户'
-    });
+    try {
+      await auth.loginWithWechat();
+    } catch (error) {
+      setWechatStatus('idle');
+      setWechatNotice(error instanceof Error ? error.message : '微信模拟登录失败');
+    }
   };
 
   return (

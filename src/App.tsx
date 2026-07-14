@@ -8,12 +8,10 @@ import NewSessionModal from './components/NewSessionModal';
 import LoginPage from './components/LoginPage';
 import RechargeModal from './components/RechargeModal';
 import AdminPanel from './components/AdminPanel';
+import { useAuth } from './auth/AuthProvider';
 
 export default function App() {
-  const [user, setUser] = useState<{ phone?: string; loginMethod: 'sms' | 'wechat'; nickname: string } | null>(() => {
-    const saved = localStorage.getItem('kol_mcn_analyst_user');
-    return saved ? JSON.parse(saved) : null;
-  });
+  const { user, status: authStatus, logout } = useAuth();
 
   const [sessions, setSessions] = useState<Session[]>(() => {
     const saved = localStorage.getItem('kol_mcn_analyst_sessions');
@@ -71,15 +69,6 @@ export default function App() {
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [isMockMode, setIsMockMode] = useState(false);
 
-  // Sync user state to localStorage
-  useEffect(() => {
-    if (user) {
-      localStorage.setItem('kol_mcn_analyst_user', JSON.stringify(user));
-    } else {
-      localStorage.removeItem('kol_mcn_analyst_user');
-    }
-  }, [user]);
-
   // Sync accounts to localStorage
   useEffect(() => {
     localStorage.setItem('kol_mcn_analyst_accounts', JSON.stringify(accounts));
@@ -88,10 +77,8 @@ export default function App() {
   // Sync points from current user account changes to local points state
   useEffect(() => {
     if (user) {
-      const matchPhone = user.phone || '';
       const matchNick = user.nickname || '';
       const matched = accounts.find(a => 
-        (matchPhone && a.phone === matchPhone) || 
         (matchNick && a.username === matchNick)
       );
       if (matched && matched.points !== points) {
@@ -103,10 +90,8 @@ export default function App() {
   // Sync local points changes back to matching account
   useEffect(() => {
     if (user) {
-      const matchPhone = user.phone || '';
       const matchNick = user.nickname || '';
       const matched = accounts.find(a => 
-        (matchPhone && a.phone === matchPhone) || 
         (matchNick && a.username === matchNick)
       );
       if (matched && matched.points !== points) {
@@ -132,7 +117,7 @@ export default function App() {
   }, [points]);
 
   const handleLogout = () => {
-    setUser(null);
+    void logout();
   };
 
   // Find currently active session
@@ -328,42 +313,12 @@ export default function App() {
     ));
   };
 
-  const handleLoginSuccess = (userInfo: { phone?: string; loginMethod: 'sms' | 'wechat'; nickname: string }) => {
-    const matched = accounts.find(a => 
-      (userInfo.phone && a.phone === userInfo.phone) || 
-      (userInfo.nickname && a.username === userInfo.nickname)
-    );
-
-    if (matched) {
-      setUser({
-        phone: matched.phone,
-        loginMethod: userInfo.loginMethod,
-        nickname: matched.username
-      });
-      setPoints(matched.points);
-    } else {
-      const newPhone = userInfo.phone || `135${Math.floor(10000000 + Math.random() * 90000000)}`;
-      const newAcc: Account = {
-        id: `acc-${Date.now()}`,
-        username: userInfo.nickname,
-        phone: newPhone,
-        channels: ["小红书", "抖音", "B站"],
-        points: 2000,
-        role: 'user',
-        createdAt: new Date().toLocaleDateString('zh-CN')
-      };
-      setAccounts(prev => [...prev, newAcc]);
-      setUser({
-        phone: newAcc.phone,
-        loginMethod: userInfo.loginMethod,
-        nickname: newAcc.username
-      });
-      setPoints(newAcc.points);
-    }
-  };
+  if (authStatus === 'loading') {
+    return <div className="flex h-screen items-center justify-center bg-slate-50 text-xs font-medium text-slate-500">正在恢复登录状态…</div>;
+  }
 
   if (!user) {
-    return <LoginPage onLoginSuccess={handleLoginSuccess} />;
+    return <LoginPage />;
   }
 
   return (
@@ -431,7 +386,6 @@ export default function App() {
         onClose={() => setIsAdminOpen(false)}
         accounts={accounts}
         onUpdateAccounts={setAccounts}
-        currentUserPhone={user?.phone}
         currentUserNickname={user?.nickname}
       />
 

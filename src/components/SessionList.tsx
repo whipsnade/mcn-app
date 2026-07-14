@@ -9,7 +9,7 @@ interface SessionListProps {
   onOpenNewModal: () => void;
   onToggleStar?: (id: string) => void;
   onRenameSession?: (id: string, brand: string, campaignName: string) => void;
-  user?: { phone?: string; loginMethod: 'sms' | 'wechat'; nickname: string } | null;
+  user?: { nickname: string; role?: 'admin' | 'user' } | null;
   onLogout?: () => void;
   points: number;
   onOpenRecharge: () => void;
@@ -290,7 +290,7 @@ export default function SessionList({
                   {user.nickname}
                 </p>
                 <span className="text-[9px] text-slate-400 font-medium flex items-center gap-1">
-                  {user.loginMethod === 'sms' ? '📱 手机验证登录' : '💬 微信扫码登录'}
+                  {user.role === 'admin' ? '🛡️ 系统管理员' : '🧪 开发模拟登录'}
                 </span>
                 <button
                   onClick={onOpenAdmin}
