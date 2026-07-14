@@ -3,6 +3,7 @@ import { Plus, Search, MessageSquare, Layers, Sparkles, SlidersHorizontal, BarCh
 import { Session } from '../types';
 
 interface SessionListProps {
+  className?: string;
   sessions: Session[];
   activeSessionId: string;
   onSelectSession: (id: string) => void;
@@ -17,6 +18,7 @@ interface SessionListProps {
 }
 
 export default function SessionList({
+  className,
   sessions,
   activeSessionId,
   onSelectSession,
@@ -73,7 +75,7 @@ export default function SessionList({
   });
 
   return (
-    <div className="flex h-full flex-col bg-white border-r border-slate-200 w-80 shrink-0 no-print">
+    <div className={`flex h-full w-full flex-col bg-white border-r border-slate-200 md:w-80 shrink-0 no-print ${className ?? ''}`}>
       
       {/* List Header */}
       <div className="p-4 border-b border-slate-100 bg-white">

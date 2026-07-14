@@ -14,3 +14,7 @@ __pycache__/
 .ruff_cache/
 *.py[cod]
 *.egg-info/
+.playwright-cli/
+test-results/
+playwright-report/
+output/playwright/

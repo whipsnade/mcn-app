@@ -1,20 +1,114 @@
-<div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://ai.google.dev/static/site-assets/images/share-ais-513315318.png" />
-</div>
+# KOL Insight AI
 
-# Run and deploy your AI Studio app
+面向品牌用户的 KOL 智能筛选与分析平台。当前第一阶段已经形成 React + FastAPI + MySQL 的可运行纵向切片，支持模拟登录、新用户 1000 积分、用户数据隔离、历史会话与消息恢复，并保留原型的三栏界面、Indigo/Slate 配色、Lucide 图标和右侧固定 BI 区域。
 
-This contains everything you need to run your app locally.
+## 当前能力
 
-View your app in AI Studio: https://ai.studio/apps/1a7d15bc-dd43-4ef5-a014-05659ef58e39
+- 模拟手机短信与微信登录，访问令牌保存在内存，刷新会话使用 HttpOnly Cookie。
+- 新用户只获得一次 1000 积分，钱包变更写入不可变账本。
+- KOL 会话按用户隔离，支持新建、标星、重命名、追加消息和刷新恢复。
+- 渠道、品类、目标人群和预算作为 KOL 筛选条件持久化。
+- 积分预留、结算和失败释放状态机；每次成功 MCP 工具调用的后续计费单位固定为 10 积分。
+- 充值与真实支付暂未开放，当前入口只显示说明，不能修改积分。
 
-## Run Locally
+真实大模型、DataTap MCP、流式任务、KOL 候选清单和 BI 数据生成将在后续阶段接入。
 
-**Prerequisites:**  Node.js
+## 技术架构
 
+- 前端：React 19、TypeScript、Vite、Tailwind CSS、Motion、Recharts。
+- 后端：Python 3.11/3.12、FastAPI、SQLAlchemy Async、Alembic。
+- 数据库：MySQL 8，字符集 `utf8mb4`。
+- 测试：Vitest、pytest、Playwright。
 
-1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
+## 本地启动
+
+准备 Node.js、npm、Python 3.11 或 3.12，以及正在运行的 MySQL 8。
+
+1. 创建开发库和测试库：
+
+```bash
+mysql -u root -p -e "CREATE DATABASE IF NOT EXISTS kol_insight CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci; CREATE DATABASE IF NOT EXISTS kol_insight_test CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+```
+
+2. 创建本地配置，并填写本机数据库密码与随机 JWT 密钥：
+
+```bash
+cp .env.example .env
+```
+
+3. 创建 Python 虚拟环境并安装后端依赖：
+
+```bash
+cd backend
+python -m venv .venv
+.venv/bin/pip install -e '.[dev]'
+cd ..
+```
+
+4. 执行数据库迁移：
+
+```bash
+cd backend
+.venv/bin/alembic upgrade head
+cd ..
+```
+
+5. 启动后端 API：
+
+```bash
+cd backend
+.venv/bin/uvicorn app.main:app --reload --port 8000
+```
+
+6. 新开终端，安装并启动前端：
+
+```bash
+npm install
+npm run dev
+```
+
+访问 `http://127.0.0.1:5173`。开发环境短信验证码固定为 `000000`，点击“获取验证码”后界面会自动填充。
+
+## 验证命令
+
+后端静态检查与测试：
+
+```bash
+cd backend
+.venv/bin/ruff check app tests
+.venv/bin/pytest -q
+```
+
+前端单测、类型检查与生产构建：
+
+```bash
+npm run test
+npm run lint
+npm run build
+```
+
+首次运行 E2E 前安装 Chromium，之后执行完整浏览器流程：
+
+```bash
+npx playwright install chromium
+npm run test:e2e
+```
+
+Playwright 会自动启动 8000 端口的 FastAPI 和 5173 端口的 Vite；E2E 使用 `.env` 指向的本地数据库。
+
+## 安全约束
+
+- `.env` 中的 MySQL 密码、JWT 密钥、未来的大模型密钥和 DataTap Token 均不得提交到 Git。
+- `.env.example` 只能保留占位符，不能出现真实凭证。
+- `AUTH_MODE=mock` 只允许用于 `development` 和 `test`。后端在 `production` 环境检测到 mock 认证会拒绝启动。
+- 测试账户只能访问独立测试库，禁止赋予生产或开发库权限。
+- 普通用户的会话、消息和钱包查询必须始终带当前认证用户条件。
+
+## 项目目录
+
+```text
+backend/        FastAPI 模块化单体、迁移与 pytest
+src/            React 前端、API Client 与工作区状态
+e2e/            Playwright 端到端测试
+docs/           架构设计与分阶段实施计划
+```

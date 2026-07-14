@@ -62,7 +62,7 @@ export const getPointsHistoryForAccount = (accId: string): PointsHistoryEntry[] 
   return [
     { id: `${accId}-1`, sessionTitle: 'AI智能对话-常规诊断分析', date: '2026-07-13', points: 200 + (numId % 200), platform: '小红书' },
     { id: `${accId}-2`, sessionTitle: '渠道声量-交叉基准比对', date: '2026-07-08', points: 150 + (numId % 150), platform: '抖音' },
-    { id: `${accId}-3`, sessionTitle: 'MCN履约与舆情口碑评测', date: '2026-06-15', points: 300 + (numId % 300), platform: 'B站' },
+    { id: `${accId}-3`, sessionTitle: 'KOL匹配与舆情口碑评测', date: '2026-06-15', points: 300 + (numId % 300), platform: 'B站' },
   ];
 };
 

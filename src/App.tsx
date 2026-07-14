@@ -6,6 +6,7 @@ import AdminPanel from './components/AdminPanel';
 import BiReport from './components/BiReport';
 import ChatArea from './components/ChatArea';
 import LoginPage from './components/LoginPage';
+import MobileWorkspaceNav, { type WorkspacePane } from './components/MobileWorkspaceNav';
 import NewSessionModal, { type NewSessionData } from './components/NewSessionModal';
 import RechargeModal from './components/RechargeModal';
 import SessionList from './components/SessionList';
@@ -21,6 +22,7 @@ export default function App() {
   const [isNewModalOpen, setIsNewModalOpen] = useState(false);
   const [isRechargeOpen, setIsRechargeOpen] = useState(false);
   const [isAdminOpen, setIsAdminOpen] = useState(false);
+  const [mobilePane, setMobilePane] = useState<WorkspacePane>('sessions');
 
   useEffect(() => {
     if (authStatus !== 'authenticated') {
@@ -52,6 +54,7 @@ export default function App() {
       budget_max: data.budgetMax,
       initial_query: data.initialQuery,
     });
+    setMobilePane('chat');
   };
 
   const handleToggleStar = async (id: string) => {
@@ -85,52 +88,65 @@ export default function App() {
   }
 
   return (
-    <div className="relative flex h-screen w-screen overflow-hidden bg-slate-100 antialiased text-slate-900 font-sans">
-      <SessionList
-        sessions={workspace.sessions}
-        activeSessionId={workspace.activeSessionId ?? ''}
-        onSelectSession={id => void workspace.selectSession(id)}
-        onOpenNewModal={() => setIsNewModalOpen(true)}
-        onToggleStar={id => void handleToggleStar(id)}
-        onRenameSession={(id, brand, campaignName) => void handleRenameSession(id, brand, campaignName)}
-        user={user}
-        onLogout={() => void logout()}
-        points={points}
-        onOpenRecharge={() => setIsRechargeOpen(true)}
-        onOpenAdmin={user.role === 'admin' ? () => setIsAdminOpen(true) : undefined}
-      />
+    <div className="relative flex h-screen w-screen flex-col overflow-hidden bg-slate-100 antialiased text-slate-900 font-sans">
+      <MobileWorkspaceNav active={mobilePane} onChange={setMobilePane} />
 
-      {workspace.activeSession ? (
-        <ChatArea
-          session={workspace.activeSession}
-          onSendMessage={text => void workspace.appendMessage(text)}
-          isAnalyzing={workspace.busy}
-          isMockMode
-        />
-      ) : (
-        <div className="flex flex-1 items-center justify-center bg-slate-50">
-          <div className="text-center">
-            <p className="text-xs font-medium text-slate-500">
-              {workspace.loading ? '正在加载历史会话…' : '请选择或新建一个 KOL 筛选会话'}
-            </p>
-            {!workspace.loading && (
-              <button
-                onClick={() => setIsNewModalOpen(true)}
-                className="mt-3 rounded-lg bg-indigo-600 px-3 py-1.5 text-[11px] font-semibold text-white shadow-sm transition hover:bg-indigo-700"
-              >
-                新建分析会话
-              </button>
-            )}
-          </div>
+      <div className="flex min-h-0 flex-1 overflow-hidden">
+        <div className={`${mobilePane === 'sessions' ? 'block' : 'hidden'} h-full w-full shrink-0 md:block md:w-auto`}>
+          <SessionList
+            sessions={workspace.sessions}
+            activeSessionId={workspace.activeSessionId ?? ''}
+            onSelectSession={id => {
+              void workspace.selectSession(id);
+              setMobilePane('chat');
+            }}
+            onOpenNewModal={() => setIsNewModalOpen(true)}
+            onToggleStar={id => void handleToggleStar(id)}
+            onRenameSession={(id, brand, campaignName) => void handleRenameSession(id, brand, campaignName)}
+            user={user}
+            onLogout={() => void logout()}
+            points={points}
+            onOpenRecharge={() => setIsRechargeOpen(true)}
+            onOpenAdmin={user.role === 'admin' ? () => setIsAdminOpen(true) : undefined}
+          />
         </div>
-      )}
 
-      <BiReport
-        reportData={workspace.activeSession?.reportData}
-        campaignName={workspace.activeSession?.campaignName ?? ''}
-        brand={workspace.activeSession?.brand ?? ''}
-        sessions={workspace.sessions}
-      />
+        <div className={`${mobilePane === 'chat' ? 'flex' : 'hidden'} h-full min-w-0 flex-1 md:flex`}>
+          {workspace.activeSession ? (
+            <ChatArea
+              session={workspace.activeSession}
+              onSendMessage={text => void workspace.appendMessage(text)}
+              isAnalyzing={workspace.busy}
+              isMockMode
+            />
+          ) : (
+            <div className="flex flex-1 items-center justify-center bg-slate-50">
+              <div className="text-center">
+                <p className="text-xs font-medium text-slate-500">
+                  {workspace.loading ? '正在加载历史会话…' : '请选择或新建一个 KOL 筛选会话'}
+                </p>
+                {!workspace.loading && (
+                  <button
+                    onClick={() => setIsNewModalOpen(true)}
+                    className="mt-3 rounded-lg bg-indigo-600 px-3 py-1.5 text-[11px] font-semibold text-white shadow-sm transition hover:bg-indigo-700"
+                  >
+                    新建分析会话
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div className={`${mobilePane === 'bi' ? 'block' : 'hidden'} h-full w-full shrink-0 md:block md:w-auto`}>
+          <BiReport
+            reportData={workspace.activeSession?.reportData}
+            campaignName={workspace.activeSession?.campaignName ?? ''}
+            brand={workspace.activeSession?.brand ?? ''}
+            sessions={workspace.sessions}
+          />
+        </div>
+      </div>
 
       {workspace.error && (
         <div className="absolute bottom-5 left-1/2 z-40 -translate-x-1/2 rounded-xl border border-rose-100 bg-white px-4 py-2 text-xs font-medium text-rose-600 shadow-lg">
@@ -150,6 +166,7 @@ export default function App() {
         onRechargeSuccess={() => setIsRechargeOpen(false)}
         currentPoints={points}
         maxPoints={5000}
+        isAvailable={false}
       />
 
       {user.role === 'admin' && (

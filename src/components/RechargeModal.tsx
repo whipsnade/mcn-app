@@ -18,6 +18,7 @@ interface RechargeModalProps {
   onRechargeSuccess: (pointsToAdd: number) => void;
   currentPoints: number;
   maxPoints: number;
+  isAvailable?: boolean;
 }
 
 interface PricingPackage {
@@ -64,7 +65,8 @@ export default function RechargeModal({
   onClose,
   onRechargeSuccess,
   currentPoints,
-  maxPoints
+  maxPoints,
+  isAvailable = false,
 }: RechargeModalProps) {
   const [selectedPkg, setSelectedPkg] = useState<PricingPackage>(PACKAGES[1]);
   const [payMethod, setPayMethod] = useState<'wechat' | 'alipay'>('wechat');
@@ -75,7 +77,7 @@ export default function RechargeModal({
 
   // QR code validity countdown
   useEffect(() => {
-    if (!isOpen) return;
+    if (!isOpen || !isAvailable) return;
     setSecondsRemaining(120);
     const timer = setInterval(() => {
       setSecondsRemaining(prev => {
@@ -87,11 +89,11 @@ export default function RechargeModal({
       });
     }, 1000);
     return () => clearInterval(timer);
-  }, [isOpen, selectedPkg, payMethod, customAmountActive, customPointsInput]);
+  }, [isOpen, isAvailable, selectedPkg, payMethod, customAmountActive, customPointsInput]);
 
   // Handle simulated auto-scanning transitions on package/payment change
   useEffect(() => {
-    if (!isOpen) return;
+    if (!isOpen || !isAvailable) return;
     setPayStatus('idle');
     
     // Simulate payment state progression:
@@ -121,9 +123,41 @@ export default function RechargeModal({
     return () => {
       clearTimeout(scanTimeout);
     };
-  }, [isOpen, selectedPkg, payMethod, customAmountActive, customPointsInput]);
+  }, [isOpen, isAvailable, selectedPkg, payMethod, customAmountActive, customPointsInput]);
 
   if (!isOpen) return null;
+
+  if (!isAvailable) {
+    return (
+      <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/40 backdrop-blur-xs font-sans">
+        <div className="relative w-full max-w-md overflow-hidden rounded-2xl border border-slate-100 bg-white p-8 text-center shadow-2xl">
+          <button
+            onClick={onClose}
+            className="absolute right-4 top-4 rounded-lg p-1.5 text-slate-400 transition hover:bg-slate-50 hover:text-slate-600"
+            aria-label="关闭"
+          >
+            <X className="h-4 w-4" />
+          </button>
+          <div className="mx-auto flex h-12 w-12 items-center justify-center rounded-2xl bg-indigo-50 text-indigo-600">
+            <Sparkles className="h-6 w-6" />
+          </div>
+          <h3 className="mt-4 text-base font-bold text-slate-800 font-display">充值功能暂未开放</h3>
+          <p className="mt-2 text-xs leading-relaxed text-slate-400">
+            当前开发账号已自动获得 1,000 初始积分。支付与充值将在核心分析功能完成后接入。
+          </p>
+          <div className="mt-5 rounded-xl border border-slate-100 bg-slate-50 px-4 py-3 text-xs text-slate-500">
+            当前可用积分：<strong className="text-indigo-600">{currentPoints.toLocaleString()} 点</strong>
+          </div>
+          <button
+            onClick={onClose}
+            className="mt-5 w-full rounded-xl bg-indigo-600 py-2.5 text-xs font-bold text-white shadow-md transition hover:bg-indigo-700 active:scale-[0.98]"
+          >
+            我知道了
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   // Custom calculations
   const customPointsVal = Math.max(100, parseInt(customPointsInput, 10) || 0);

@@ -184,7 +184,7 @@ export default function ChatArea({
             {[
               { label: "📊 分析转化率", text: "请帮我分析本次营销活动中各个KOL的销售转化率与性价比。" },
               { label: "👥 对比各KOL表现", text: "对比分析本次合作达人的具体粉丝、互动率与情感极性表现。" },
-              { label: "💰 查看MCN预算分配", text: "重点分析本次MCN机构的执行成本、ROI及性价比瓶颈分析。" },
+              { label: "💰 查看预算匹配", text: "重点分析候选达人的报价区间、预算匹配度及组合性价比。" },
               { label: "📈 分析舆情情感", text: "深度剖析受众的情感偏好、舆情关键词分布及潜在负面规避建议。" }
             ].map((cmd, idx) => (
               <button
@@ -215,7 +215,7 @@ export default function ChatArea({
             value={inputText}
             onChange={(e) => setInputText(e.target.value)}
             onKeyDown={handleKeyDown}
-            placeholder={isAnalyzing ? "正在进行深度多维数据分析中..." : "输入消息并向 AI 分析师提问（例如：调大MCN评分为95，重新计算大盘ROI）..."}
+            placeholder={isAnalyzing ? "正在进行深度多维数据分析中..." : "输入消息并向 AI 分析师提问（例如：按互动率和预算匹配度重新排序）..."}
             disabled={isAnalyzing}
             className="flex-1 bg-transparent border-none focus:ring-0 px-3 text-xs md:text-sm text-slate-700 placeholder-slate-400 py-2 font-normal outline-none resize-none max-h-20"
           />
