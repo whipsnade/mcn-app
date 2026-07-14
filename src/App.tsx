@@ -1,12 +1,20 @@
 import React, { useState, useEffect } from 'react';
 import { initialSessions } from './initialData';
-import { Session, Message, ReportData } from './types';
+import { Session, Message, ReportData, Account } from './types';
 import SessionList from './components/SessionList';
 import ChatArea from './components/ChatArea';
 import BiReport from './components/BiReport';
 import NewSessionModal from './components/NewSessionModal';
+import LoginPage from './components/LoginPage';
+import RechargeModal from './components/RechargeModal';
+import AdminPanel from './components/AdminPanel';
 
 export default function App() {
+  const [user, setUser] = useState<{ phone?: string; loginMethod: 'sms' | 'wechat'; nickname: string } | null>(() => {
+    const saved = localStorage.getItem('kol_mcn_analyst_user');
+    return saved ? JSON.parse(saved) : null;
+  });
+
   const [sessions, setSessions] = useState<Session[]>(() => {
     const saved = localStorage.getItem('kol_mcn_analyst_sessions');
     return saved ? JSON.parse(saved) : initialSessions;
@@ -17,10 +25,99 @@ export default function App() {
     return savedActive || 'WO-1001';
   });
 
+  const [points, setPoints] = useState<number>(() => {
+    const saved = localStorage.getItem('kol_analyst_points');
+    return saved ? parseInt(saved, 10) : 3450;
+  });
+
+  const [accounts, setAccounts] = useState<Account[]>(() => {
+    const saved = localStorage.getItem('kol_mcn_analyst_accounts');
+    if (saved) return JSON.parse(saved);
+    return [
+      {
+        id: 'acc-1',
+        username: '系统超级管理员',
+        phone: '18888888888',
+        channels: ["小红书", "抖音", "B站", "微博", "YouTube", "Instagram"],
+        points: 5000,
+        role: 'admin',
+        createdAt: '2026-01-01'
+      },
+      {
+        id: 'acc-2',
+        username: '手机用户_Anker',
+        phone: '13812345678',
+        channels: ["小红书", "抖音", "B站"],
+        points: 3450,
+        role: 'user',
+        createdAt: '2026-06-15'
+      },
+      {
+        id: 'acc-3',
+        username: '微信快捷登录用户',
+        phone: '13900001111',
+        channels: ["小红书", "微博"],
+        points: 1200,
+        role: 'user',
+        createdAt: '2026-07-01'
+      }
+    ];
+  });
+
+  const [isRechargeOpen, setIsRechargeOpen] = useState(false);
+  const [isAdminOpen, setIsAdminOpen] = useState(false);
+
   const [isNewModalOpen, setIsNewModalOpen] = useState(false);
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [isMockMode, setIsMockMode] = useState(false);
 
+  // Sync user state to localStorage
+  useEffect(() => {
+    if (user) {
+      localStorage.setItem('kol_mcn_analyst_user', JSON.stringify(user));
+    } else {
+      localStorage.removeItem('kol_mcn_analyst_user');
+    }
+  }, [user]);
+
+  // Sync accounts to localStorage
+  useEffect(() => {
+    localStorage.setItem('kol_mcn_analyst_accounts', JSON.stringify(accounts));
+  }, [accounts]);
+
+  // Sync points from current user account changes to local points state
+  useEffect(() => {
+    if (user) {
+      const matchPhone = user.phone || '';
+      const matchNick = user.nickname || '';
+      const matched = accounts.find(a => 
+        (matchPhone && a.phone === matchPhone) || 
+        (matchNick && a.username === matchNick)
+      );
+      if (matched && matched.points !== points) {
+        setPoints(matched.points);
+      }
+    }
+  }, [accounts, user]);
+
+  // Sync local points changes back to matching account
+  useEffect(() => {
+    if (user) {
+      const matchPhone = user.phone || '';
+      const matchNick = user.nickname || '';
+      const matched = accounts.find(a => 
+        (matchPhone && a.phone === matchPhone) || 
+        (matchNick && a.username === matchNick)
+      );
+      if (matched && matched.points !== points) {
+        setAccounts(prev => prev.map(a => 
+          a.id === matched.id ? { ...a, points } : a
+        ));
+      }
+    }
+  }, [points]);
+
+  
   // Sync to local storage on changes
   useEffect(() => {
     localStorage.setItem('kol_mcn_analyst_sessions', JSON.stringify(sessions));
@@ -29,6 +126,14 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem('kol_mcn_analyst_active_id', activeSessionId);
   }, [activeSessionId]);
+
+  useEffect(() => {
+    localStorage.setItem('kol_analyst_points', points.toString());
+  }, [points]);
+
+  const handleLogout = () => {
+    setUser(null);
+  };
 
   // Find currently active session
   const activeSession = sessions.find(s => s.id === activeSessionId) || sessions[0];
@@ -206,6 +311,61 @@ export default function App() {
     }
   };
 
+  const handleToggleStar = (id: string) => {
+    setSessions(prev => prev.map(s => 
+      s.id === id ? { ...s, isStarred: !s.isStarred } : s
+    ));
+  };
+
+  const handleRenameSession = (id: string, newBrand: string, newCampaignName: string) => {
+    setSessions(prev => prev.map(s => 
+      s.id === id ? { 
+        ...s, 
+        brand: newBrand, 
+        campaignName: newCampaignName,
+        title: `${newBrand}-${newCampaignName}`
+      } : s
+    ));
+  };
+
+  const handleLoginSuccess = (userInfo: { phone?: string; loginMethod: 'sms' | 'wechat'; nickname: string }) => {
+    const matched = accounts.find(a => 
+      (userInfo.phone && a.phone === userInfo.phone) || 
+      (userInfo.nickname && a.username === userInfo.nickname)
+    );
+
+    if (matched) {
+      setUser({
+        phone: matched.phone,
+        loginMethod: userInfo.loginMethod,
+        nickname: matched.username
+      });
+      setPoints(matched.points);
+    } else {
+      const newPhone = userInfo.phone || `135${Math.floor(10000000 + Math.random() * 90000000)}`;
+      const newAcc: Account = {
+        id: `acc-${Date.now()}`,
+        username: userInfo.nickname,
+        phone: newPhone,
+        channels: ["小红书", "抖音", "B站"],
+        points: 2000,
+        role: 'user',
+        createdAt: new Date().toLocaleDateString('zh-CN')
+      };
+      setAccounts(prev => [...prev, newAcc]);
+      setUser({
+        phone: newAcc.phone,
+        loginMethod: userInfo.loginMethod,
+        nickname: newAcc.username
+      });
+      setPoints(newAcc.points);
+    }
+  };
+
+  if (!user) {
+    return <LoginPage onLoginSuccess={handleLoginSuccess} />;
+  }
+
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-slate-100 antialiased text-slate-900 font-sans">
       
@@ -215,6 +375,13 @@ export default function App() {
         activeSessionId={activeSessionId}
         onSelectSession={setActiveSessionId}
         onOpenNewModal={() => setIsNewModalOpen(true)}
+        onToggleStar={handleToggleStar}
+        onRenameSession={handleRenameSession}
+        user={user}
+        onLogout={handleLogout}
+        points={points}
+        onOpenRecharge={() => setIsRechargeOpen(true)}
+        onOpenAdmin={() => setIsAdminOpen(true)}
       />
 
       {/* 2. Middle panel: Live AI Analyst Conversation */}
@@ -236,6 +403,7 @@ export default function App() {
         reportData={activeSession?.reportData}
         campaignName={activeSession?.campaignName || ''}
         brand={activeSession?.brand || ''}
+        sessions={sessions}
       />
 
       {/* New Session Creation Popup Modal */}
@@ -243,6 +411,28 @@ export default function App() {
         isOpen={isNewModalOpen}
         onClose={() => setIsNewModalOpen(false)}
         onCreate={handleCreateSession}
+      />
+
+      {/* Recharge Modal */}
+      <RechargeModal
+        isOpen={isRechargeOpen}
+        onClose={() => setIsRechargeOpen(false)}
+        onRechargeSuccess={(added) => {
+          setPoints(prev => Math.min(prev + added, 5000));
+          setIsRechargeOpen(false);
+        }}
+        currentPoints={points}
+        maxPoints={5000}
+      />
+
+      {/* Admin Panel Console */}
+      <AdminPanel
+        isOpen={isAdminOpen}
+        onClose={() => setIsAdminOpen(false)}
+        accounts={accounts}
+        onUpdateAccounts={setAccounts}
+        currentUserPhone={user?.phone}
+        currentUserNickname={user?.nickname}
       />
 
     </div>

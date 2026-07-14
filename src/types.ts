@@ -82,4 +82,16 @@ export interface Session {
   summary: string;
   messages: Message[];
   reportData?: ReportData;
+  isStarred?: boolean;
 }
+
+export interface Account {
+  id: string;
+  username: string;
+  phone: string;
+  channels: string[];
+  points: number;
+  role: 'admin' | 'user';
+  createdAt: string;
+}
+
