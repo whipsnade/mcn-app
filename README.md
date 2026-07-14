@@ -30,6 +30,12 @@
 mysql -u root -p -e "CREATE DATABASE IF NOT EXISTS kol_insight CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci; CREATE DATABASE IF NOT EXISTS kol_insight_test CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
 ```
 
+为自动化测试创建仅能访问测试库的本地账号（密码是仓库内公开的测试专用值，不得复用于其他环境）：
+
+```bash
+mysql -u root -p -e "CREATE USER IF NOT EXISTS 'kol_test'@'%' IDENTIFIED BY 'test-only-password'; GRANT ALL PRIVILEGES ON kol_insight_test.* TO 'kol_test'@'%';"
+```
+
 2. 创建本地配置，并填写本机数据库密码与随机 JWT 密钥：
 
 ```bash
@@ -50,6 +56,7 @@ cd ..
 ```bash
 cd backend
 .venv/bin/alembic upgrade head
+APP_ENV=test AUTH_MODE=mock MYSQL_DATABASE=kol_insight_test MYSQL_USER=kol_test MYSQL_PASSWORD=test-only-password JWT_SECRET=test-only-jwt-secret-at-least-32-characters .venv/bin/alembic upgrade head
 cd ..
 ```
 
@@ -94,7 +101,7 @@ npx playwright install chromium
 npm run test:e2e
 ```
 
-Playwright 会自动启动 8000 端口的 FastAPI 和 5173 端口的 Vite；E2E 使用 `.env` 指向的本地数据库。
+Playwright 会自动启动 8000 端口的 FastAPI 和 5173 端口的 Vite，并固定使用隔离的 `kol_insight_test` 与测试专用账号，不写入开发库。测试会依次覆盖 1440×900、1024×768 和 390×844 三种视口；如果端口已被占用会直接失败，避免误测其他版本的服务。
 
 ## 安全约束
 

@@ -16,7 +16,7 @@ interface RechargeModalProps {
   isOpen: boolean;
   onClose: () => void;
   onRechargeSuccess: (pointsToAdd: number) => void;
-  currentPoints: number;
+  currentPoints: number | null;
   maxPoints: number;
   isAvailable?: boolean;
 }
@@ -68,6 +68,10 @@ export default function RechargeModal({
   maxPoints,
   isAvailable = false,
 }: RechargeModalProps) {
+  const availablePoints = currentPoints ?? 0;
+  const currentPointsLabel = currentPoints === null
+    ? '暂不可用'
+    : `${currentPoints.toLocaleString()} 点`;
   const [selectedPkg, setSelectedPkg] = useState<PricingPackage>(PACKAGES[1]);
   const [payMethod, setPayMethod] = useState<'wechat' | 'alipay'>('wechat');
   const [payStatus, setPayStatus] = useState<'idle' | 'scanning' | 'scanned' | 'success'>('idle');
@@ -146,7 +150,7 @@ export default function RechargeModal({
             当前开发账号已自动获得 1,000 初始积分。支付与充值将在核心分析功能完成后接入。
           </p>
           <div className="mt-5 rounded-xl border border-slate-100 bg-slate-50 px-4 py-3 text-xs text-slate-500">
-            当前可用积分：<strong className="text-indigo-600">{currentPoints.toLocaleString()} 点</strong>
+            当前可用积分：<strong className="text-indigo-600">{currentPointsLabel}</strong>
           </div>
           <button
             onClick={onClose}
@@ -209,10 +213,10 @@ export default function RechargeModal({
           <div className="p-3 bg-slate-50 border border-slate-100 rounded-xl flex items-center justify-between text-xs">
             <div className="space-y-0.5">
               <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wide">当前可用额度</span>
-              <p className="font-bold text-slate-700 font-display">{currentPoints.toLocaleString()} / {maxPoints.toLocaleString()} 点</p>
+              <p className="font-bold text-slate-700 font-display">{currentPointsLabel} / {maxPoints.toLocaleString()} 点</p>
             </div>
             <span className="text-[10px] bg-indigo-50 text-indigo-600 font-bold px-2 py-0.5 rounded-md">
-              已用 {(((maxPoints - currentPoints) / maxPoints) * 100).toFixed(0)}%
+              已用 {(((maxPoints - availablePoints) / maxPoints) * 100).toFixed(0)}%
             </span>
           </div>
 

@@ -17,7 +17,7 @@ const items = [
 
 export default function MobileWorkspaceNav({ active, onChange }: MobileWorkspaceNavProps) {
   return (
-    <nav className="flex h-12 shrink-0 items-center gap-1 border-b border-slate-200 bg-white p-1.5 md:hidden" aria-label="移动工作区导航">
+    <nav className="flex h-12 shrink-0 items-center gap-1 border-b border-slate-200 bg-white p-1.5 xl:hidden" aria-label="移动工作区导航">
       {items.map(item => {
         const Icon = item.icon;
         const isActive = active === item.value;

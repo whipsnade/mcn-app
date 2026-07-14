@@ -22,7 +22,7 @@ test('mock user receives points and restores a complete session after reload', a
   await page.getByPlaceholder('例如：25-35 岁一线城市女性').fill('18-30 岁通勤女性');
   await page.getByRole('button', { name: '立即创建' }).click();
 
-  await expect(page.getByText(campaignName, { exact: false }).first()).toBeVisible();
+  await expect(page.getByRole('heading', { name: `示例品牌 - ${campaignName}` })).toBeVisible();
   await page.getByPlaceholder(/输入消息并向 AI 分析师提问/).fill(followUp);
   await page.getByRole('button', { name: '发送', exact: true }).click();
   await expect(page.getByText(followUp, { exact: true }).last()).toBeVisible();
@@ -30,6 +30,13 @@ test('mock user receives points and restores a complete session after reload', a
   await page.reload();
 
   await expect(page.getByText(campaignName, { exact: false }).first()).toBeVisible();
+  const mobileNavigation = page.getByRole('navigation', { name: '移动工作区导航' });
+  if (await mobileNavigation.isVisible()) {
+    await expect(page.getByText('1,000 / 5,000 点')).toBeVisible();
+    await page.getByRole('button', { name: '分析对话' }).click();
+  }
   await expect(page.getByText(followUp, { exact: true }).last()).toBeVisible();
-  await expect(page.getByText('1,000 / 5,000 点')).toBeVisible();
+  if (!await mobileNavigation.isVisible()) {
+    await expect(page.getByText('1,000 / 5,000 点')).toBeVisible();
+  }
 });

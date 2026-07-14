@@ -1,0 +1,52 @@
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { beforeAll, describe, expect, it, vi } from 'vitest';
+
+import type { Session } from '../types';
+import ChatArea from './ChatArea';
+
+
+const session: Session = {
+  id: 'session-1',
+  title: '测试品牌-新品筛选',
+  brand: '测试品牌',
+  campaignName: '新品筛选',
+  status: 'draft',
+  platform: 'Xiaohongshu',
+  category: '美妆',
+  targetAudience: '18-30 岁女性',
+  summary: '寻找达人',
+  messages: [],
+  isStarred: false,
+  createdAt: '2026-07-14T10:00:00Z',
+  updatedAt: '2026-07-14T10:00:00Z',
+};
+
+
+describe('ChatArea', () => {
+  beforeAll(() => {
+    Element.prototype.scrollIntoView = vi.fn();
+  });
+
+  it('keeps the draft until the message is persisted successfully', async () => {
+    let resolveSend: () => void = () => undefined;
+    const onSendMessage = vi.fn(() => new Promise<void>(resolve => {
+      resolveSend = resolve;
+    }));
+    render(
+      <ChatArea
+        session={session}
+        onSendMessage={onSendMessage}
+        isAnalyzing={false}
+        isMockMode
+      />,
+    );
+
+    const input = screen.getByPlaceholderText(/输入消息并向 AI 分析师提问/) as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: '请保存这条消息' } });
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+
+    expect(input.value).toBe('请保存这条消息');
+    await act(async () => resolveSend());
+    await waitFor(() => expect(input.value).toBe(''));
+  });
+});

@@ -28,10 +28,14 @@ class WalletService:
             raise LookupError("wallet_not_found")
         return wallet
 
-    async def _already_applied(self, idempotency_key: str) -> bool:
+    async def _already_applied(
+        self, idempotency_key: str, *, for_update: bool = False
+    ) -> bool:
         statement = select(WalletTransaction.id).where(
             WalletTransaction.idempotency_key == idempotency_key
         )
+        if for_update:
+            statement = statement.with_for_update()
         return await self.db.scalar(statement) is not None
 
     async def _record(
@@ -83,6 +87,8 @@ class WalletService:
         if await self._already_applied(idempotency_key):
             return wallet
         wallet = await self.get_wallet(user_id, for_update=True)
+        if await self._already_applied(idempotency_key, for_update=True):
+            return wallet
         return await self._record(
             wallet,
             kind="welcome_grant",
@@ -105,6 +111,8 @@ class WalletService:
         if await self._already_applied(idempotency_key):
             return await self.get_wallet(user_id)
         wallet = await self.get_wallet(user_id, for_update=True)
+        if await self._already_applied(idempotency_key, for_update=True):
+            return wallet
         if wallet.balance < amount:
             raise InsufficientPointsError()
         return await self._record(
@@ -129,6 +137,8 @@ class WalletService:
         if await self._already_applied(idempotency_key):
             return await self.get_wallet(user_id)
         wallet = await self.get_wallet(user_id, for_update=True)
+        if await self._already_applied(idempotency_key, for_update=True):
+            return wallet
         if wallet.reserved < amount:
             raise ValueError("invalid_reserved_amount")
         return await self._record(
@@ -153,6 +163,8 @@ class WalletService:
         if await self._already_applied(idempotency_key):
             return await self.get_wallet(user_id)
         wallet = await self.get_wallet(user_id, for_update=True)
+        if await self._already_applied(idempotency_key, for_update=True):
+            return wallet
         if wallet.reserved < amount:
             raise ValueError("invalid_reserved_amount")
         return await self._record(

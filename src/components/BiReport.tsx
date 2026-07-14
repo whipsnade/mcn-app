@@ -78,7 +78,7 @@ export default function BiReport({ reportData, campaignName, brand, sessions }: 
 
   if (!reportData && activeTab !== 'compare') {
     return (
-      <div className="flex h-full w-full flex-col bg-white md:w-[420px] shrink-0 border-l border-slate-200 shadow-sm overflow-hidden print-container">
+      <div className="flex h-full w-full flex-col bg-white xl:w-[420px] shrink-0 border-l border-slate-200 shadow-sm overflow-hidden print-container">
         {/* BI Panel Header with Export PDF */}
         <div className="h-14 flex items-center justify-between px-4 border-b border-slate-200 bg-white shrink-0">
           <h2 className="text-xs font-bold text-slate-800 uppercase tracking-widest">BI Intelligence Output</h2>
@@ -151,7 +151,7 @@ export default function BiReport({ reportData, campaignName, brand, sessions }: 
   ] : [];
 
   return (
-    <div className="flex h-full w-full flex-col bg-white md:w-[420px] shrink-0 border-l border-slate-200 shadow-sm overflow-hidden print-container">
+    <div className="flex h-full w-full flex-col bg-white xl:w-[420px] shrink-0 border-l border-slate-200 shadow-sm overflow-hidden print-container">
       
       {/* BI Panel Header with Export PDF */}
       <div className="h-14 flex items-center justify-between px-4 border-b border-slate-200 bg-white shrink-0">

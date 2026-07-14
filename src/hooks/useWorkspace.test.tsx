@@ -53,7 +53,7 @@ describe('useWorkspace', () => {
   });
 
   it('loads persisted sessions and selects the first one after login', async () => {
-    const { result } = renderHook(() => useWorkspace(true));
+    const { result } = renderHook(() => useWorkspace('user-a'));
 
     await waitFor(() => expect(result.current.loading).toBe(false));
 
@@ -64,12 +64,32 @@ describe('useWorkspace', () => {
 
   it('clears the workspace when the user logs out', async () => {
     const { result, rerender } = renderHook(
-      ({ enabled }) => useWorkspace(enabled),
-      { initialProps: { enabled: true } },
+      ({ userId }) => useWorkspace(userId),
+      { initialProps: { userId: 'user-a' as string | undefined } },
     );
 
     await waitFor(() => expect(result.current.sessions).toHaveLength(1));
-    await act(async () => rerender({ enabled: false }));
+    await act(async () => rerender({ userId: undefined }));
+
+    expect(result.current.sessions).toEqual([]);
+    expect(result.current.activeSession).toBeUndefined();
+  });
+
+  it('ignores a previous user response that arrives after logout', async () => {
+    let resolveList: (sessions: Session[]) => void = () => undefined;
+    vi.mocked(listSessions).mockReturnValue(new Promise(resolve => {
+      resolveList = resolve;
+    }));
+
+    const { result, rerender } = renderHook(
+      ({ userId }) => useWorkspace(userId),
+      { initialProps: { userId: 'user-a' as string | undefined } },
+    );
+    await waitFor(() => expect(listSessions).toHaveBeenCalledOnce());
+
+    rerender({ userId: undefined });
+    await act(async () => resolveList([session]));
+    await waitFor(() => expect(result.current.loading).toBe(false));
 
     expect(result.current.sessions).toEqual([]);
     expect(result.current.activeSession).toBeUndefined();

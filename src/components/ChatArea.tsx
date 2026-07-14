@@ -4,7 +4,7 @@ import { Session, Message } from '../types';
 
 interface ChatAreaProps {
   session: Session;
-  onSendMessage: (text: string) => void;
+  onSendMessage: (text: string) => Promise<unknown>;
   isAnalyzing: boolean;
   isMockMode: boolean;
 }
@@ -23,17 +23,22 @@ export default function ChatArea({
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [session.messages, isAnalyzing]);
 
-  const handleSend = (e: React.FormEvent) => {
+  const handleSend = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!inputText.trim() || isAnalyzing) return;
-    onSendMessage(inputText.trim());
-    setInputText('');
+    const draft = inputText.trim();
+    try {
+      await onSendMessage(draft);
+      setInputText(current => current.trim() === draft ? '' : current);
+    } catch {
+      // The workspace error banner explains the persistence failure; keep the draft for retry.
+    }
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
-      handleSend(e);
+      void handleSend(e);
     }
   };
 
@@ -193,7 +198,7 @@ export default function ChatArea({
                 disabled={isAnalyzing}
                 onClick={() => {
                   if (!isAnalyzing) {
-                    onSendMessage(cmd.text);
+                    void onSendMessage(cmd.text).catch(() => undefined);
                   }
                 }}
                 className={`text-[10px] font-medium px-2.5 py-1 rounded-full border transition duration-150 active:scale-95 ${
@@ -208,7 +213,7 @@ export default function ChatArea({
           </div>
         </div>
 
-        <form onSubmit={handleSend} className="bg-slate-50 rounded-xl p-1 flex items-center border border-slate-200 focus-within:ring-2 focus-within:ring-indigo-500/20 transition duration-150">
+        <form onSubmit={event => void handleSend(event)} className="bg-slate-50 rounded-xl p-1 flex items-center border border-slate-200 focus-within:ring-2 focus-within:ring-indigo-500/20 transition duration-150">
           
           <textarea
             rows={1}

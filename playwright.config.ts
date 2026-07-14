@@ -1,9 +1,21 @@
 import { defineConfig, devices } from '@playwright/test';
 
+const backendTestEnv = {
+  APP_ENV: 'test',
+  AUTH_MODE: 'mock',
+  MYSQL_HOST: '127.0.0.1',
+  MYSQL_PORT: '3306',
+  MYSQL_DATABASE: 'kol_insight_test',
+  MYSQL_USER: 'kol_test',
+  MYSQL_PASSWORD: 'test-only-password',
+  JWT_SECRET: 'test-only-jwt-secret-at-least-32-characters',
+};
+
 
 export default defineConfig({
   testDir: './e2e',
   fullyParallel: false,
+  workers: 1,
   retries: 0,
   reporter: 'list',
   use: {
@@ -13,21 +25,30 @@ export default defineConfig({
   },
   projects: [
     {
-      name: 'chromium',
-      use: { ...devices['Desktop Chrome'] },
+      name: 'desktop-1440',
+      use: { ...devices['Desktop Chrome'], viewport: { width: 1440, height: 900 } },
+    },
+    {
+      name: 'tablet-1024',
+      use: { ...devices['Desktop Chrome'], viewport: { width: 1024, height: 768 } },
+    },
+    {
+      name: 'mobile-390',
+      use: { ...devices['Desktop Chrome'], viewport: { width: 390, height: 844 } },
     },
   ],
   webServer: [
     {
       command: 'backend/.venv/bin/uvicorn app.main:app --app-dir backend --host 127.0.0.1 --port 8000',
       url: 'http://127.0.0.1:8000/healthz',
-      reuseExistingServer: true,
+      env: backendTestEnv,
+      reuseExistingServer: false,
       timeout: 120_000,
     },
     {
       command: 'npm run dev -- --host 127.0.0.1 --port 5173',
       url: 'http://127.0.0.1:5173',
-      reuseExistingServer: true,
+      reuseExistingServer: false,
       timeout: 120_000,
     },
   ],

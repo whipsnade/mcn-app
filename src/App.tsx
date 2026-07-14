@@ -11,14 +11,12 @@ import NewSessionModal, { type NewSessionData } from './components/NewSessionMod
 import RechargeModal from './components/RechargeModal';
 import SessionList from './components/SessionList';
 import { useWorkspace } from './hooks/useWorkspace';
-import type { Account } from './types';
 
 
 export default function App() {
   const { user, status: authStatus, logout } = useAuth();
-  const workspace = useWorkspace(authStatus === 'authenticated');
-  const [points, setPoints] = useState(0);
-  const [accounts, setAccounts] = useState<Account[]>([]);
+  const workspace = useWorkspace(authStatus === 'authenticated' ? user?.id : undefined);
+  const [points, setPoints] = useState<number | null>(null);
   const [isNewModalOpen, setIsNewModalOpen] = useState(false);
   const [isRechargeOpen, setIsRechargeOpen] = useState(false);
   const [isAdminOpen, setIsAdminOpen] = useState(false);
@@ -26,7 +24,7 @@ export default function App() {
 
   useEffect(() => {
     if (authStatus !== 'authenticated') {
-      setPoints(0);
+      setPoints(null);
       return;
     }
 
@@ -36,7 +34,7 @@ export default function App() {
         if (active) setPoints(wallet.available);
       })
       .catch(() => {
-        if (active) setPoints(0);
+        if (active) setPoints(null);
       });
     return () => {
       active = false;
@@ -92,7 +90,7 @@ export default function App() {
       <MobileWorkspaceNav active={mobilePane} onChange={setMobilePane} />
 
       <div className="flex min-h-0 flex-1 overflow-hidden">
-        <div className={`${mobilePane === 'sessions' ? 'block' : 'hidden'} h-full w-full shrink-0 md:block md:w-auto`}>
+        <div className={`${mobilePane === 'sessions' ? 'block' : 'hidden'} h-full w-full shrink-0 xl:block xl:w-auto`}>
           <SessionList
             sessions={workspace.sessions}
             activeSessionId={workspace.activeSessionId ?? ''}
@@ -101,8 +99,8 @@ export default function App() {
               setMobilePane('chat');
             }}
             onOpenNewModal={() => setIsNewModalOpen(true)}
-            onToggleStar={id => void handleToggleStar(id)}
-            onRenameSession={(id, brand, campaignName) => void handleRenameSession(id, brand, campaignName)}
+            onToggleStar={id => void handleToggleStar(id).catch(() => undefined)}
+            onRenameSession={(id, brand, campaignName) => void handleRenameSession(id, brand, campaignName).catch(() => undefined)}
             user={user}
             onLogout={() => void logout()}
             points={points}
@@ -111,11 +109,13 @@ export default function App() {
           />
         </div>
 
-        <div className={`${mobilePane === 'chat' ? 'flex' : 'hidden'} h-full min-w-0 flex-1 md:flex`}>
+        <div className={`${mobilePane === 'chat' ? 'flex' : 'hidden'} h-full min-w-0 flex-1 xl:flex`}>
           {workspace.activeSession ? (
             <ChatArea
               session={workspace.activeSession}
-              onSendMessage={text => void workspace.appendMessage(text)}
+              onSendMessage={async text => {
+                await workspace.appendMessage(text);
+              }}
               isAnalyzing={workspace.busy}
               isMockMode
             />
@@ -138,7 +138,7 @@ export default function App() {
           )}
         </div>
 
-        <div className={`${mobilePane === 'bi' ? 'block' : 'hidden'} h-full w-full shrink-0 md:block md:w-auto`}>
+        <div className={`${mobilePane === 'bi' ? 'block' : 'hidden'} h-full w-full shrink-0 xl:block xl:w-auto`}>
           <BiReport
             reportData={workspace.activeSession?.reportData}
             campaignName={workspace.activeSession?.campaignName ?? ''}
@@ -172,9 +172,10 @@ export default function App() {
       {user.role === 'admin' && (
         <AdminPanel
           isOpen={isAdminOpen}
+          readOnly
           onClose={() => setIsAdminOpen(false)}
-          accounts={accounts}
-          onUpdateAccounts={setAccounts}
+          accounts={[]}
+          onUpdateAccounts={() => undefined}
           currentUserNickname={user.nickname}
         />
       )}

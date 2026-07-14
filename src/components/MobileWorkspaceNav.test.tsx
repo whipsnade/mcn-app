@@ -5,7 +5,7 @@ import MobileWorkspaceNav from './MobileWorkspaceNav';
 
 
 describe('MobileWorkspaceNav', () => {
-  it('switches between sessions, chat, and BI without changing desktop content', () => {
+  it('emits the selected mobile workspace pane', () => {
     const onChange = vi.fn();
     render(<MobileWorkspaceNav active="sessions" onChange={onChange} />);
 

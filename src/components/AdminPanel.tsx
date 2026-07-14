@@ -12,6 +12,7 @@ import { Account } from '../types';
 
 interface AdminPanelProps {
   isOpen: boolean;
+  readOnly?: boolean;
   onClose: () => void;
   accounts: Account[];
   onUpdateAccounts: (accounts: Account[]) => void;
@@ -108,6 +109,7 @@ const AVAILABLE_CHANNELS = ["小红书", "抖音", "B站", "微博", "YouTube", 
 
 export default function AdminPanel({
   isOpen,
+  readOnly = false,
   onClose,
   accounts,
   onUpdateAccounts,
@@ -132,6 +134,55 @@ export default function AdminPanel({
   const [successMsg, setSuccessMsg] = useState('');
 
   if (!isOpen) return null;
+
+  if (readOnly) {
+    return (
+      <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-xs p-4">
+        <div className="w-full max-w-lg overflow-hidden rounded-2xl border border-slate-100 bg-white shadow-2xl animate-in fade-in zoom-in-95 duration-200">
+          <div className="flex items-center justify-between border-b border-slate-100 bg-slate-50/50 px-6 py-4">
+            <div className="flex items-center gap-2.5">
+              <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-indigo-50 text-indigo-600 shadow-inner">
+                <Shield className="h-5 w-5" />
+              </div>
+              <div>
+                <h2 className="text-base font-bold text-slate-800 font-display">系统管理员控制台</h2>
+                <p className="text-[10px] font-medium text-slate-400">当前基础阶段仅开放安全预览</p>
+              </div>
+            </div>
+            <button
+              onClick={onClose}
+              className="flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 transition hover:bg-slate-100 hover:text-slate-600"
+              aria-label="关闭"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+
+          <div className="flex flex-col items-center px-8 py-12 text-center">
+            <div className="flex h-14 w-14 items-center justify-center rounded-full bg-slate-100 text-slate-400">
+              <Users className="h-7 w-7 stroke-[1.5]" />
+            </div>
+            <h3 className="mt-4 text-sm font-bold text-slate-800">系统管理暂为只读</h3>
+            <p className="mt-2 max-w-sm text-xs leading-relaxed text-slate-400">
+              用户、渠道权限与积分审计将在管理 API 完成后接入。当前页面不加载模拟账户，也不能修改用户或积分。
+            </p>
+            <span className="mt-4 rounded-lg border border-indigo-100 bg-indigo-50 px-2.5 py-1 text-[10px] font-bold text-indigo-600">
+              当前身份：{currentUserNickname || '系统管理员'}
+            </span>
+          </div>
+
+          <div className="flex justify-end border-t border-slate-100 bg-slate-50 px-6 py-3.5">
+            <button
+              onClick={onClose}
+              className="rounded-lg bg-indigo-600 px-4 py-2 text-xs font-bold text-white shadow-sm transition hover:bg-indigo-700 active:scale-[0.98]"
+            >
+              返回工作区
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   const handleOpenAdd = () => {
     setFormUsername('');

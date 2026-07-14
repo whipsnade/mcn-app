@@ -12,9 +12,20 @@ interface SessionListProps {
   onRenameSession?: (id: string, brand: string, campaignName: string) => void;
   user?: { nickname: string; role?: 'admin' | 'user' } | null;
   onLogout?: () => void;
-  points: number;
+  points: number | null;
   onOpenRecharge: () => void;
   onOpenAdmin?: () => void;
+}
+
+function formatUpdatedAt(value: string): string {
+  const timestamp = new Date(value).getTime();
+  if (Number.isNaN(timestamp)) return '刚刚';
+  const minutes = Math.max(0, Math.floor((Date.now() - timestamp) / 60_000));
+  if (minutes < 1) return '刚刚';
+  if (minutes < 60) return `${minutes}分钟前`;
+  if (minutes < 1_440) return `${Math.floor(minutes / 60)}小时前`;
+  if (minutes < 10_080) return `${Math.floor(minutes / 1_440)}天前`;
+  return new Date(timestamp).toLocaleDateString('zh-CN', { month: 'numeric', day: 'numeric' });
 }
 
 export default function SessionList({
@@ -75,7 +86,7 @@ export default function SessionList({
   });
 
   return (
-    <div className={`flex h-full w-full flex-col bg-white border-r border-slate-200 md:w-80 shrink-0 no-print ${className ?? ''}`}>
+    <div className={`flex h-full w-full flex-col bg-white border-r border-slate-200 xl:w-80 shrink-0 no-print ${className ?? ''}`}>
       
       {/* List Header */}
       <div className="p-4 border-b border-slate-100 bg-white">
@@ -149,8 +160,6 @@ export default function SessionList({
           filteredSessions.map(session => {
             const isActive = session.id === activeSessionId;
             const lastMessage = session.messages[session.messages.length - 1];
-            const unreadCount = session.id === "WO-1001" ? 2 : 0; 
-
             // Get platform logo colors and initials
             const getPlatformStyle = (pf: string) => {
               switch (pf) {
@@ -252,7 +261,7 @@ export default function SessionList({
                         <Star className={`h-3.5 w-3.5 ${session.isStarred ? 'fill-amber-400' : ''}`} />
                       </button>
                       <span className="text-[10px] opacity-70 ml-0.5">
-                        {session.id === "WO-1001" ? "2分钟前" : session.id === "WO-1002" ? "4小时前" : "1天前"}
+                        {formatUpdatedAt(session.updatedAt)}
                       </span>
                     </div>
                   </div>
@@ -324,7 +333,9 @@ export default function SessionList({
           <div className="flex flex-col">
             <span className="text-[10px] font-bold text-slate-400">积分额度</span>
             <span className="text-xs font-bold text-slate-700 font-display">
-              {points.toLocaleString()} / {maxPoints.toLocaleString()} 点
+              {points === null
+                ? '积分暂不可用'
+                : `${points.toLocaleString()} / ${maxPoints.toLocaleString()} 点`}
             </span>
           </div>
           <button
@@ -339,12 +350,12 @@ export default function SessionList({
           <div className="h-1.5 w-full bg-slate-100 rounded-full overflow-hidden">
             <div 
               className="h-full bg-indigo-600 rounded-full transition-all duration-500 ease-out" 
-              style={{ width: `${(points / maxPoints) * 100}%` }}
+              style={{ width: `${points === null ? 0 : (points / maxPoints) * 100}%` }}
             />
           </div>
           <div className="flex justify-between text-[9px] font-medium text-slate-400">
-            <span>已用 {(((maxPoints - points) / maxPoints) * 100).toFixed(0)}%</span>
-            <span>PRO PLAN 额度充足</span>
+            <span>{points === null ? '钱包服务暂不可用' : `已用 ${(((maxPoints - points) / maxPoints) * 100).toFixed(0)}%`}</span>
+            <span>{points === null ? '请稍后重试' : 'PRO PLAN 额度充足'}</span>
           </div>
         </div>
       </div>
