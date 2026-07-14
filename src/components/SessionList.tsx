@@ -13,7 +13,7 @@ interface SessionListProps {
   onLogout?: () => void;
   points: number;
   onOpenRecharge: () => void;
-  onOpenAdmin: () => void;
+  onOpenAdmin?: () => void;
 }
 
 export default function SessionList({
@@ -51,10 +51,9 @@ export default function SessionList({
   const handleCancelEdit = () => {
     setEditingSessionId(null);
   };
-  const [showRechargeToast, setShowRechargeToast] = useState(false);
   const maxPoints = 5000;
 
-  // Filter sessions by Brand, Campaign, MCN, or message content, and optionally Starred status
+  // Filter sessions by project metadata or message content, and optionally Starred status
   const filteredSessions = sessions.filter(s => {
     if (showOnlyStarred && !s.isStarred) {
       return false;
@@ -65,7 +64,8 @@ export default function SessionList({
       s.brand.toLowerCase().includes(query) ||
       s.campaignName.toLowerCase().includes(query) ||
       s.title.toLowerCase().includes(query) ||
-      s.mcn.toLowerCase().includes(query);
+      s.category.toLowerCase().includes(query) ||
+      s.targetAudience.toLowerCase().includes(query);
     
     const matchMessages = s.messages.some(m => m.text.toLowerCase().includes(query));
     
@@ -84,13 +84,15 @@ export default function SessionList({
           </div>
           
           <div className="flex items-center gap-1">
-            <button 
-              onClick={onOpenAdmin}
-              className="flex h-7 w-7 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 hover:text-indigo-600 transition"
-              title="管理员控制台"
-            >
-              <Shield className="h-3.5 w-3.5" />
-            </button>
+            {user?.role === 'admin' && onOpenAdmin && (
+              <button
+                onClick={onOpenAdmin}
+                className="flex h-7 w-7 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-100 hover:text-indigo-600 transition"
+                title="管理员控制台"
+              >
+                <Shield className="h-3.5 w-3.5" />
+              </button>
+            )}
             <button 
               onClick={onOpenNewModal}
               className="flex h-7 w-7 items-center justify-center rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white shadow-sm transition active:scale-95"
@@ -154,6 +156,7 @@ export default function SessionList({
                 case 'Douyin': return { bg: 'bg-slate-900 text-white', label: '抖音' };
                 case 'Bilibili': return { bg: 'bg-pink-50 text-pink-500 border border-pink-200/40', label: 'B站' };
                 case 'Weibo': return { bg: 'bg-amber-50 text-amber-600 border border-amber-200/40', label: '微博' };
+                case 'Wechat': return { bg: 'bg-emerald-50 text-emerald-600 border border-emerald-200/40', label: '微信' };
                 case 'YouTube': return { bg: 'bg-red-50 text-red-600 border border-red-200/40', label: 'YouTube' };
                 case 'Instagram': return { bg: 'bg-indigo-50 text-indigo-700 border border-indigo-200/40', label: 'Instagram' };
                 default: return { bg: 'bg-indigo-50 text-indigo-700 border border-indigo-100', label: pf || '推广' };
@@ -292,13 +295,15 @@ export default function SessionList({
                 <span className="text-[9px] text-slate-400 font-medium flex items-center gap-1">
                   {user.role === 'admin' ? '🛡️ 系统管理员' : '🧪 开发模拟登录'}
                 </span>
-                <button
-                  onClick={onOpenAdmin}
-                  className="text-[9px] text-indigo-600 font-bold bg-indigo-50 border border-indigo-100/50 px-1.5 py-0.5 rounded flex items-center gap-0.5 mt-1 hover:bg-indigo-100 transition active:scale-95"
-                >
-                  <Shield className="h-2 w-2" />
-                  系统管理后台
-                </button>
+                {user.role === 'admin' && onOpenAdmin && (
+                  <button
+                    onClick={onOpenAdmin}
+                    className="text-[9px] text-indigo-600 font-bold bg-indigo-50 border border-indigo-100/50 px-1.5 py-0.5 rounded flex items-center gap-0.5 mt-1 hover:bg-indigo-100 transition active:scale-95"
+                  >
+                    <Shield className="h-2 w-2" />
+                    系统管理后台
+                  </button>
+                )}
               </div>
             </div>
             {onLogout && (

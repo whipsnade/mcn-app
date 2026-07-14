@@ -75,14 +75,20 @@ export interface Session {
   title: string;
   brand: string;
   campaignName: string;
-  status: 'completed' | 'analyzing' | 'draft';
+  status: 'completed' | 'analyzing' | 'draft' | 'archived';
   platform: string;
-  mcn: string;
-  kols: string[];
+  category: string;
+  targetAudience: string;
+  budgetMin?: string;
+  budgetMax?: string;
   summary: string;
   messages: Message[];
   reportData?: ReportData;
-  isStarred?: boolean;
+  isStarred: boolean;
+  createdAt: string;
+  updatedAt: string;
+  mcn?: string;
+  kols?: string[];
 }
 
 export interface Account {
@@ -94,4 +100,3 @@ export interface Account {
   role: 'admin' | 'user';
   createdAt: string;
 }
-

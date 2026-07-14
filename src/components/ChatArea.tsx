@@ -37,6 +37,20 @@ export default function ChatArea({
     }
   };
 
+  const platformLabel = session.platform.split(',').map(platform => {
+    const trimmed = platform.trim();
+    if (trimmed === 'Xiaohongshu') return '小红书';
+    if (trimmed === 'Douyin') return '抖音';
+    if (trimmed === 'Bilibili') return '哔哩哔哩';
+    if (trimmed === 'Weibo') return '微博';
+    if (trimmed === 'Wechat') return '微信';
+    return trimmed;
+  }).join(' / ');
+
+  const budgetLabel = session.budgetMin || session.budgetMax
+    ? `${session.budgetMin ?? '0'}–${session.budgetMax ?? '不限'} 元`
+    : '待确认';
+
   return (
     <div className="flex flex-1 flex-col bg-white border-r border-slate-200 h-full no-print">
       
@@ -53,16 +67,7 @@ export default function ChatArea({
           </div>
           <p className="mt-0.5 text-[10px] text-slate-400 flex items-center gap-1">
             <span className="h-1.5 w-1.5 rounded-full bg-indigo-500 animate-pulse" />
-            进行中 • 合作平台: {session.platform.split(',').map(p => {
-              const trimmed = p.trim();
-              if (trimmed === 'Xiaohongshu') return '小红书';
-              if (trimmed === 'Douyin') return '抖音';
-              if (trimmed === 'Bilibili') return '哔哩哔哩';
-              if (trimmed === 'Weibo') return '微博';
-              if (trimmed === 'YouTube') return 'YouTube';
-              if (trimmed === 'Instagram') return 'Instagram';
-              return trimmed;
-            }).join(' / ')} • MCN: {session.mcn}
+            进行中 • 渠道: {platformLabel} • 品类: {session.category} • 预算: {budgetLabel}
           </p>
         </div>
 
@@ -156,7 +161,7 @@ export default function ChatArea({
                   <span className="h-2 w-2 rounded-full bg-indigo-500 animate-bounce" />
                   <span className="h-2 w-2 rounded-full bg-indigo-500 animate-bounce [animation-delay:0.2s]" />
                   <span className="h-2 w-2 rounded-full bg-indigo-500 animate-bounce [animation-delay:0.4s]" />
-                  <span className="text-xs text-slate-400 font-medium ml-1">正在清洗博主粉丝舆情、核算MCN转化ROI、编制图表数据...</span>
+                  <span className="text-xs text-slate-400 font-medium ml-1">正在分析达人受众、匹配预算并编制图表数据...</span>
                 </div>
               </div>
             </div>
