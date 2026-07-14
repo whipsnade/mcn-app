@@ -1,14 +1,28 @@
 from app.billing.models import Wallet, WalletTransaction
 from app.identity.models import AuthIdentity, LoginSession, User, UserChannelPermission
+from app.mcp_gateway.models import McpCall, McpToolCatalog
+from app.model.models import ModelRun
+from app.reporting.models import BiReport, Kol, KolSnapshot, TaskCandidate, UserKolFavorite
+from app.tasks.models import AnalysisTask, TaskEvent
 from app.workspace.models import Message, WorkspaceSession
 
 
 __all__ = [
     "AuthIdentity",
+    "AnalysisTask",
+    "BiReport",
+    "Kol",
+    "KolSnapshot",
     "LoginSession",
+    "McpCall",
+    "McpToolCatalog",
     "Message",
+    "ModelRun",
+    "TaskCandidate",
+    "TaskEvent",
     "User",
     "UserChannelPermission",
+    "UserKolFavorite",
     "Wallet",
     "WalletTransaction",
     "WorkspaceSession",

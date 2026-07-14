@@ -3,7 +3,7 @@ import app.db.models  # noqa: F401
 
 
 def test_phase_one_tables_are_registered() -> None:
-    assert set(Base.metadata.tables) == {
+    assert {
         "users",
         "auth_identities",
         "user_sessions",
@@ -12,4 +12,19 @@ def test_phase_one_tables_are_registered() -> None:
         "wallet_transactions",
         "sessions",
         "messages",
-    }
+    }.issubset(Base.metadata.tables)
+
+
+def test_phase_two_tables_are_registered() -> None:
+    assert {
+        "analysis_tasks",
+        "task_events",
+        "model_runs",
+        "mcp_tool_catalog",
+        "mcp_calls",
+        "kols",
+        "kol_snapshots",
+        "task_candidates",
+        "bi_reports",
+        "user_kol_favorites",
+    }.issubset(Base.metadata.tables)
