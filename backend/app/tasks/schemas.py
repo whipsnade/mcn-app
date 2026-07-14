@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.tasks.state import TaskEventType, TaskStatus
 
@@ -18,6 +18,13 @@ ScoringProfile = Literal[
 class TaskCreate(BaseModel):
     content: str = Field(min_length=1, max_length=20_000)
     scoring_profile: ScoringProfile = "balanced"
+
+    @field_validator("content")
+    @classmethod
+    def reject_blank_content(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("content_must_not_be_blank")
+        return value
 
 
 class TaskRead(BaseModel):

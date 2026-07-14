@@ -17,6 +17,19 @@ async def get_current_user(
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> User:
+    return await resolve_current_user(credentials, db)
+
+
+async def get_function_scoped_current_user(
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)],
+    db: Annotated[AsyncSession, Depends(get_db, scope="function")],
+) -> User:
+    return await resolve_current_user(credentials, db)
+
+
+async def resolve_current_user(
+    credentials: HTTPAuthorizationCredentials | None, db: AsyncSession
+) -> User:
     if credentials is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="AUTH_EXPIRED")
     try:
@@ -39,3 +52,6 @@ async def get_current_user(
 
 
 CurrentUser = Annotated[User, Depends(get_current_user)]
+FunctionScopedCurrentUser = Annotated[
+    User, Depends(get_function_scoped_current_user, scope="function")
+]

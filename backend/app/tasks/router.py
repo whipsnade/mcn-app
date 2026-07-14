@@ -9,7 +9,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import SessionFactory, get_db
-from app.identity.dependencies import CurrentUser
+from app.identity.dependencies import FunctionScopedCurrentUser
 from app.tasks.models import AnalysisTask, TaskEvent
 from app.tasks.events import TaskEventBroker, TaskEventStream
 from app.tasks.repository import TaskRepository
@@ -30,11 +30,12 @@ def encode_sse_event(event: TaskEvent) -> str:
     return f"id: {event.id}\nevent: {event.event_type}\ndata: {data}\n\n"
 
 
-def resolve_last_event_id(header_value: str | None, query_value: int) -> int:
-    if header_value is None:
-        return query_value
+def resolve_last_event_id(header_value: str | None, query_value: str | None) -> int:
+    raw_value = header_value if header_value is not None else query_value
+    if raw_value is None:
+        return 0
     try:
-        value = int(header_value)
+        value = int(raw_value)
     except ValueError as error:
         raise HTTPException(status_code=422, detail="invalid_last_event_id") from error
     if value < 0:
@@ -88,21 +89,22 @@ def task_not_found(error: LookupError) -> HTTPException:
 async def create_task(
     session_id: str,
     payload: TaskCreate,
-    user: CurrentUser,
-    db: Annotated[AsyncSession, Depends(get_db)],
+    user: FunctionScopedCurrentUser,
+    db: Annotated[AsyncSession, Depends(get_db, scope="function")],
 ) -> TaskRead:
     try:
         task = await TaskService(db).create(user.id, session_id, payload)
     except LookupError as error:
         raise task_not_found(error) from error
+    await db.commit()
     return task_read(task)
 
 
 @router.get("/tasks/{task_id}", response_model=TaskRead)
 async def get_task(
     task_id: str,
-    user: CurrentUser,
-    db: Annotated[AsyncSession, Depends(get_db)],
+    user: FunctionScopedCurrentUser,
+    db: Annotated[AsyncSession, Depends(get_db, scope="function")],
 ) -> TaskRead:
     try:
         task = await TaskRepository(db).get_owned(task_id, user.id)
@@ -114,23 +116,24 @@ async def get_task(
 @router.post("/tasks/{task_id}/cancel", response_model=TaskRead)
 async def cancel_task(
     task_id: str,
-    user: CurrentUser,
-    db: Annotated[AsyncSession, Depends(get_db)],
+    user: FunctionScopedCurrentUser,
+    db: Annotated[AsyncSession, Depends(get_db, scope="function")],
 ) -> TaskRead:
     try:
         task = await TaskService(db).cancel(user.id, task_id)
     except LookupError as error:
         raise task_not_found(error) from error
+    await db.commit()
     return task_read(task)
 
 
 @router.get("/tasks/{task_id}/events")
 async def stream_task_events(
     task_id: str,
-    user: CurrentUser,
-    db: Annotated[AsyncSession, Depends(get_db)],
+    user: FunctionScopedCurrentUser,
+    db: Annotated[AsyncSession, Depends(get_db, scope="function")],
     event_stream: Annotated[TaskEventStream, Depends(get_task_event_stream)],
-    last_event_id: Annotated[int, Query(ge=0)] = 0,
+    last_event_id: Annotated[str | None, Query()] = None,
     last_event_id_header: Annotated[
         str | None, Header(alias="Last-Event-ID")
     ] = None,

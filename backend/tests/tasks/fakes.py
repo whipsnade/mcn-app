@@ -87,6 +87,25 @@ class NoOpSessionFactory:
         return _NoOpSessionContext()
 
 
+class CommitFailingSession:
+    """Delegate real database work, but fail exactly at the commit boundary."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self.session = session
+        self.commit_calls = 0
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.session, name)
+
+    async def commit(self) -> None:
+        self.commit_calls += 1
+        await self.session.rollback()
+        raise RuntimeError("injected_commit_failure")
+
+    async def rollback(self) -> None:
+        await self.session.rollback()
+
+
 @pytest_asyncio.fixture(name="workspace_factory")
 async def workspace_factory_fixture(
     db_session: AsyncSession,

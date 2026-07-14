@@ -61,7 +61,8 @@ class TaskService:
 
     async def cancel(self, user_id: str, task_id: str) -> AnalysisTask:
         task = await self.repository.get_owned(task_id, user_id)
-        task.cancel_requested_at = utc_now()
-        task.updated_at = task.cancel_requested_at
-        await self.db.flush()
+        if task.cancel_requested_at is None:
+            task.cancel_requested_at = utc_now()
+            task.updated_at = task.cancel_requested_at
+            await self.db.flush()
         return task
