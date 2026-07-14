@@ -68,3 +68,17 @@ def test_allowed_task_transitions(source: TaskStatus, target: TaskStatus) -> Non
 def test_terminal_task_cannot_return_to_running(terminal: TaskStatus) -> None:
     with pytest.raises(InvalidTaskTransition):
         ensure_transition(terminal, TaskStatus.RUNNING)
+
+
+@pytest.mark.parametrize(
+    ("source", "target"),
+    [
+        ("pending", TaskStatus.PLANNING),
+        ("not-a-status", TaskStatus.PLANNING),
+        (TaskStatus.PENDING, "planning"),
+        (TaskStatus.PENDING, "not-a-status"),
+    ],
+)
+def test_transition_rejects_non_task_status_values(source: object, target: object) -> None:
+    with pytest.raises(InvalidTaskTransition):
+        ensure_transition(source, target)  # type: ignore[arg-type]

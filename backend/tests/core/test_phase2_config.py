@@ -111,6 +111,27 @@ def test_production_accepts_confirmed_providers_with_both_credentials() -> None:
     assert config.mcp_provider == "datatap"
 
 
+@pytest.mark.parametrize("secret_value", [" ", "\t", "\n", " \t\n"])
+@pytest.mark.parametrize("secret_field", ["tencent_plan_api_key", "datatap_mcp_token"])
+def test_production_rejects_whitespace_only_credentials(
+    secret_field: str, secret_value: str
+) -> None:
+    credentials = {
+        "tencent_plan_api_key": SecretStr("unit-test-model-key"),
+        "datatap_mcp_token": SecretStr("unit-test-mcp-key"),
+    }
+    credentials[secret_field] = SecretStr(secret_value)
+
+    with pytest.raises(ValidationError):
+        settings(
+            app_env="production",
+            auth_mode="jwt",
+            model_provider="tencent_plan",
+            mcp_provider="datatap",
+            **credentials,
+        )
+
+
 @pytest.mark.parametrize(
     "changes",
     [

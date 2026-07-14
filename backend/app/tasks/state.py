@@ -68,5 +68,7 @@ class InvalidTaskTransition(ValueError):
 
 
 def ensure_transition(source: TaskStatus, target: TaskStatus) -> None:
+    if not isinstance(source, TaskStatus) or not isinstance(target, TaskStatus):
+        raise InvalidTaskTransition(f"{source!r}->{target!r}")
     if target not in ALLOWED_TRANSITIONS.get(source, set()):
         raise InvalidTaskTransition(f"{source.value}->{target.value}")

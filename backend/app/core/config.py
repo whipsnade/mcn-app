@@ -77,10 +77,13 @@ class Settings(BaseSettings):
                 raise ValueError("MCP_PROVIDER=fake is forbidden in production")
             if (
                 self.tencent_plan_api_key is None
-                or not self.tencent_plan_api_key.get_secret_value()
+                or not self.tencent_plan_api_key.get_secret_value().strip()
             ):
                 raise ValueError("TENCENT_PLAN_API_KEY is required in production")
-            if self.datatap_mcp_token is None or not self.datatap_mcp_token.get_secret_value():
+            if (
+                self.datatap_mcp_token is None
+                or not self.datatap_mcp_token.get_secret_value().strip()
+            ):
                 raise ValueError("DATATAP_MCP_TOKEN is required in production")
         return self
 
