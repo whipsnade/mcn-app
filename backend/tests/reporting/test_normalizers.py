@@ -31,6 +31,26 @@ def test_currency_quote_is_normalized_to_cny_before_persistence() -> None:
     assert row.quoted_price_cny == 12_000
 
 
+def test_risk_flag_evidence_is_recursively_redacted() -> None:
+    row = normalize_tool_evidence(
+        [
+            evidence(
+                risk_flags=[
+                    {
+                        "token": "should-not-persist",
+                        "nested": {
+                            "endpoint": "https://datatap.deepminer.com.cn/api",
+                            "reason": "内容重复",
+                        },
+                    }
+                ]
+            )
+        ]
+    )[0]
+
+    assert row.risk_flags == ({"nested": {"reason": "内容重复"}},)
+
+
 def test_unknown_internal_tool_is_rejected_without_guessing_fields() -> None:
     item = evidence()
     item = item.__class__(

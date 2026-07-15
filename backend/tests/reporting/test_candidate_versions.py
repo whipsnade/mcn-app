@@ -63,3 +63,47 @@ async def test_candidate_order_is_stable_across_input_order(
         ("200", 1),
         ("100", 2),
     ]
+
+
+async def test_sensitive_evidence_is_redacted_before_snapshot_and_candidate_storage(
+    db_session: AsyncSession, user_factory
+) -> None:
+    user = await user_factory()
+    task = await completed_task_factory(
+        db_session,
+        user.id,
+        evidence_rows=[
+            candidate_fixture(
+                profile_url="https://datatap.deepminer.com.cn/creator/100",
+                risk_flags=[
+                    {
+                        "authorization": "Bearer should-not-persist",
+                        "endpoint": "https://api.lkeap.cloud.tencent.com/plan/v3",
+                        "service": "google-trends-mcp",
+                        "nested": {"api_key": "secret", "reason": "内容重复"},
+                    }
+                ],
+            )
+        ],
+    )
+
+    result = await ReportingService(db_session).build_candidate_version(task.id, "balanced")
+    snapshot = await db_session.scalar(
+        select(KolSnapshot).where(KolSnapshot.id == result.candidates[0].snapshot_id)
+    )
+    candidate = await db_session.scalar(
+        select(TaskCandidate).where(TaskCandidate.snapshot_id == snapshot.id)
+    )
+    stored = f"{snapshot.normalized_json!r}{candidate.evidence_json!r}".lower()
+
+    for forbidden in (
+        "authorization",
+        "api_key",
+        "endpoint",
+        "https://",
+        "datatap.deepminer.com.cn",
+        "google-trends-mcp",
+        "api.lkeap.cloud.tencent.com",
+    ):
+        assert forbidden not in stored
+    assert snapshot.normalized_json["risk_flags"] == [{"nested": {"reason": "内容重复"}}]

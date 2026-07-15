@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 from app.reporting.schemas import CandidateScore, DimensionInputs, DimensionScore
 
 
@@ -53,13 +55,26 @@ def score_candidate(dimensions: DimensionInputs, profile: str) -> CandidateScore
         weights = WEIGHT_PROFILES[profile]
     except KeyError as exc:
         raise ValueError("unknown_scoring_profile") from exc
+    values = dimensions.as_mapping()
+    for value in values.values():
+        if (
+            value is not None
+            and (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                or value < 0
+                or value > 100
+            )
+        ):
+            raise ValueError("dimension_score_out_of_range")
     details = {
         name: DimensionScore(
             raw_score=value,
             weight=weights[name],
             weighted_score=0 if value is None else round(value * weights[name] / 100, 2),
         )
-        for name, value in dimensions.as_mapping().items()
+        for name, value in values.items()
     }
     completeness = sum(item.weight for item in details.values() if item.raw_score is not None)
     return CandidateScore(

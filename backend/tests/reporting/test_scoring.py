@@ -33,3 +33,9 @@ def test_missing_dimension_is_not_fabricated_as_observed_zero() -> None:
 def test_unknown_profile_is_rejected() -> None:
     with pytest.raises(ValueError, match="unknown_scoring_profile"):
         score_candidate(all_dimensions(80), profile="unsupported")
+
+
+@pytest.mark.parametrize("invalid", [101, -0.01, float("nan")])
+def test_dimension_scores_must_be_finite_percentages(invalid: float) -> None:
+    with pytest.raises(ValueError, match="dimension_score_out_of_range"):
+        score_candidate(all_dimensions(80, audience=invalid), profile="balanced")

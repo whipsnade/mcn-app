@@ -12,6 +12,25 @@ class UnknownEvidenceToolError(ValueError):
 
 
 Adapter = Callable[[ToolEvidence], tuple[NormalizedKolEvidence, ...]]
+_DROP = object()
+_SENSITIVE_KEY_TERMS = (
+    "authorization",
+    "token",
+    "api_key",
+    "apikey",
+    "credential",
+    "url",
+    "endpoint",
+    "host",
+)
+_FORBIDDEN_VALUE_TERMS = (
+    "datatap.deepminer.com.cn",
+    "api.lkeap.cloud.tencent.com",
+    "google-trends-mcp",
+    "zhihu-mcp",
+    "toutiao-mcp",
+    "baidu-index-mcp",
+)
 
 
 def normalize_tool_evidence(evidence: Iterable[ToolEvidence]) -> tuple[NormalizedKolEvidence, ...]:
@@ -26,6 +45,34 @@ def normalize_tool_evidence(evidence: Iterable[ToolEvidence]) -> tuple[Normalize
             previous = merged.get(key)
             merged[key] = normalized if previous is None else _merge(previous, normalized)
     return tuple(merged[key] for key in sorted(merged))
+
+
+def redact_evidence_for_storage(value: Any) -> Any:
+    """递归移除密钥、连接端点和已禁用服务的证据内容。"""
+    cleaned = _redact(value)
+    return {} if cleaned is _DROP else cleaned
+
+
+def _redact(value: Any) -> Any:
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for key, item in value.items():
+            if not isinstance(key, str) or any(term in key.lower() for term in _SENSITIVE_KEY_TERMS):
+                continue
+            cleaned = _redact(item)
+            if cleaned is not _DROP:
+                result[key] = cleaned
+        return result
+    if isinstance(value, (list, tuple)):
+        return [cleaned for item in value if (cleaned := _redact(item)) is not _DROP]
+    if isinstance(value, str):
+        lowered = value.lower()
+        if (
+            lowered.startswith(("http://", "https://", "bearer ", "sk-"))
+            or any(term in lowered for term in _FORBIDDEN_VALUE_TERMS)
+        ):
+            return _DROP
+    return value
 
 
 def _creator_search_adapter(item: ToolEvidence) -> tuple[NormalizedKolEvidence, ...]:
@@ -57,11 +104,12 @@ def _normalize_candidate(item: ToolEvidence, candidate: Any) -> NormalizedKolEvi
     flags = candidate.get("risk_flags", [])
     if not isinstance(flags, list) or not all(isinstance(flag, dict) for flag in flags):
         raise ValueError("invalid_risk_flags")
+    redacted_flags = redact_evidence_for_storage(flags)
     missing = tuple(name for name, value in fields.items() if value is None)
     return NormalizedKolEvidence(
         platform=platform,
         platform_account_id=account_id,
-        risk_flags=tuple(flags),
+        risk_flags=tuple(redacted_flags),
         collected_at=item.collected_at,
         evidence_references=(item.source_call_id,) if item.source_call_id else (),
         missing_fields=missing,

@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.mcp_gateway.contracts import McpCallStatus
 from app.mcp_gateway.models import McpCall
 from app.reporting.models import Kol, KolSnapshot, TaskCandidate
-from app.reporting.normalizers import normalize_tool_evidence
+from app.reporting.normalizers import normalize_tool_evidence, redact_evidence_for_storage
 from app.reporting.schemas import CandidateVersion, CandidateVersionItem, ToolEvidence
 from app.reporting.scoring import SCORE_VERSION, score_candidate
 from app.tasks.models import AnalysisTask
@@ -64,13 +64,14 @@ class ReportingService:
             draft: list[tuple[Kol, KolSnapshot, Any, Any]] = []
             for row in normalized:
                 kol = await self._upsert_kol(row.platform, row.platform_account_id, row.normalized_profile_url)
+                normalized_json = redact_evidence_for_storage(row.as_dict())
                 snapshot = KolSnapshot(
                     id=str(uuid4()),
                     kol_id=kol.id,
                     source_mcp_call_id=row.evidence_references[0]
                     if row.evidence_references
                     else None,
-                    normalized_json=row.as_dict(),
+                    normalized_json=normalized_json,
                     collected_at=row.collected_at,
                     created_at=_now(),
                 )
@@ -99,12 +100,12 @@ class ReportingService:
                         score_breakdown_json=score.as_dict(),
                         rank=rank,
                         matched_conditions_json=["normalized_evidence"],
-                        risk_flags_json=list(row.risk_flags),
+                        risk_flags_json=redact_evidence_for_storage(list(row.risk_flags)),
                         recommendation_text="",
                         evidence_json={
                             "candidate_set_digest": evidence_digest,
                             "source_call_ids": list(row.evidence_references),
-                            "normalized": row.as_dict(),
+                            "normalized": normalized_json,
                         },
                         created_at=created_at,
                     )
