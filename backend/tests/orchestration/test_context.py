@@ -57,7 +57,19 @@ class FakePermissions:
 class FakeReporting:
     async def context_summary(self, session_id: str):
         assert session_id == "session-1"
-        return {"candidate_count": 0}
+        return {
+            "candidate_count": 0,
+            "endpoint": "https://datatap.deepminer.com.cn/hidden",
+            "nested": {
+                "token": "hidden-token",
+                "AuthorizationHeader": "hidden-authorization",
+                "hostname": "internal.invalid",
+                "credential_id": "hidden-credential",
+                "safe_metric": 10,
+                "disabled_service": "google-trends-mcp",
+            },
+            "items": [{"api_key": "hidden-key", "name": "安全候选"}],
+        }
 
 
 @pytest.mark.asyncio
@@ -76,4 +88,10 @@ async def test_model_context_contains_reviewed_tools_but_no_supplier_details() -
     assert "datatap.deepminer.com.cn" not in serialized
     assert "authorization" not in serialized.lower()
     assert "google-trends-mcp" not in serialized
+    assert "hidden-token" not in serialized
+    assert "hidden-key" not in serialized
+    assert "hidden-authorization" not in serialized
+    assert "hidden-credential" not in serialized
+    assert "internal.invalid" not in serialized
+    assert "安全候选" in serialized
     assert context.allowed_channels == ("bilibili",)

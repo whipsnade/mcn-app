@@ -31,13 +31,17 @@ def _tool() -> PlannerTool:
     )
 
 
-def context_fixture(*, allowed_channels: tuple[str, ...] = ("bilibili",)) -> PlannerContext:
+def context_fixture(
+    *,
+    allowed_channels: tuple[str, ...] = ("bilibili",),
+    platforms: tuple[str, ...] = ("bilibili",),
+) -> PlannerContext:
     return PlannerContext(
         brief=SessionBrief(
             session_id="session-1",
             brand="测试品牌",
             campaign_name="新品推广",
-            platforms=("bilibili",),
+            platforms=platforms,
             category="美妆",
             target_audience="学生",
             budget_min=None,
@@ -142,3 +146,18 @@ async def test_plan_rejects_session_channel_without_user_permission() -> None:
         await planner.plan(context_fixture(allowed_channels=()))
 
     assert caught.value.code == "CHANNEL_NOT_ALLOWED"
+
+
+@pytest.mark.asyncio
+async def test_plan_rejects_tool_service_outside_user_channels() -> None:
+    planner, _ = _planner(plan_with_tool("kol.search"))
+
+    with pytest.raises(PlanValidationError) as caught:
+        await planner.plan(
+            context_fixture(
+                allowed_channels=("xiaohongshu",),
+                platforms=("xiaohongshu",),
+            )
+        )
+
+    assert caught.value.code == "SERVICE_CHANNEL_NOT_ALLOWED"

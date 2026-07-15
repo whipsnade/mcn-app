@@ -2,11 +2,27 @@ from __future__ import annotations
 
 import json
 
+from app.mcp_gateway.contracts import DataTapService
 from app.mcp_gateway.validation import McpValidationError, validate_input
 from app.model.contracts import ChatMessage, ModelAdapter, StructuredModelRequest
 from app.model.prompts import PLANNER_PROMPT
 from app.orchestration.batching import build_execution_batches
 from app.orchestration.schemas import PlanValidationError, PlannerContext, ToolPlan
+
+
+_SERVICE_CHANNELS: dict[DataTapService, frozenset[str]] = {
+    DataTapService.INSIGHT_CUBE: frozenset(
+        {"xiaohongshu", "douyin", "bilibili", "weibo", "wechat"}
+    ),
+    DataTapService.SOCIAL_GROW: frozenset({"xiaohongshu", "douyin", "weibo", "wechat"}),
+    DataTapService.SOCIAL_GROW_CONTENT: frozenset(
+        {"xiaohongshu", "douyin", "weibo", "wechat"}
+    ),
+    DataTapService.AKTOOLS: frozenset(
+        {"xiaohongshu", "douyin", "bilibili", "weibo", "wechat"}
+    ),
+    DataTapService.BILIBILI: frozenset({"bilibili"}),
+}
 
 
 class Planner:
@@ -49,6 +65,9 @@ class Planner:
             tool = tools.get(step.internal_tool_name)
             if tool is None:
                 raise PlanValidationError("TOOL_NOT_ALLOWED")
+            supported_channels = _SERVICE_CHANNELS.get(tool.service, frozenset())
+            if not supported_channels.intersection(context.allowed_channels):
+                raise PlanValidationError("SERVICE_CHANNEL_NOT_ALLOWED")
             try:
                 validate_input(step.arguments, tool.input_schema)
             except McpValidationError as exc:

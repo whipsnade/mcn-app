@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+import re
 from typing import Any, Protocol
 
 from app.orchestration.schemas import (
@@ -9,6 +10,34 @@ from app.orchestration.schemas import (
     PlannerTool,
     SessionBrief,
 )
+
+
+_OMIT = object()
+_SENSITIVE_REPORT_KEYS = {
+    "api_key",
+    "authorization",
+    "credential",
+    "endpoint",
+    "host",
+    "token",
+    "url",
+}
+_SENSITIVE_REPORT_KEY_PARTS = {
+    "api_key",
+    "authorization",
+    "credential",
+    "endpoint",
+    "host",
+    "token",
+    "url",
+}
+_DISABLED_SERVICE_NAMES = {
+    "zhihu-mcp",
+    "toutiao-mcp",
+    "baidu-index-mcp",
+    "google-trends-mcp",
+}
+_SUPPLIER_HOST_NAMES = {"datatap.deepminer.com.cn"}
 
 
 class WorkspaceReader(Protocol):
@@ -53,6 +82,53 @@ def compress_messages(messages: Sequence[Any], *, max_chars: int) -> tuple[Plann
     return tuple(reversed(selected))
 
 
+def _normalized_key(key: str) -> str:
+    snake_case = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", key)
+    return re.sub(r"[^a-z0-9]+", "_", snake_case.casefold()).strip("_")
+
+
+def _is_sensitive_report_key(key: str) -> bool:
+    normalized = _normalized_key(key)
+    return normalized in _SENSITIVE_REPORT_KEYS or any(
+        part in normalized for part in _SENSITIVE_REPORT_KEY_PARTS
+    )
+
+
+def _project_reporting_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        projected = {
+            key: child
+            for key, item in value.items()
+            if isinstance(key, str)
+            and not _is_sensitive_report_key(key)
+            and (child := _project_reporting_value(item)) is not _OMIT
+        }
+        return projected
+    if isinstance(value, list):
+        return [
+            child
+            for item in value
+            if (child := _project_reporting_value(item)) is not _OMIT
+        ]
+    if isinstance(value, str):
+        value_lower = value.casefold()
+        if (
+            any(service_name in value_lower for service_name in _DISABLED_SERVICE_NAMES)
+            or any(host_name in value_lower for host_name in _SUPPLIER_HOST_NAMES)
+            or "http://" in value_lower
+            or "https://" in value_lower
+        ):
+            return _OMIT
+    return value
+
+
+def project_reporting_summary(summary: dict[str, Any]) -> dict[str, Any]:
+    projected = _project_reporting_value(summary)
+    if not isinstance(projected, dict):
+        raise TypeError("reporting context summary must be an object")
+    return projected
+
+
 class ContextBuilder:
     def __init__(
         self,
@@ -75,7 +151,9 @@ class ContextBuilder:
         return PlannerContext(
             brief=SessionBrief.from_workspace(workspace),
             recent_messages=compress_messages(messages, max_chars=24_000),
-            existing_results=await self.reporting.context_summary(session_id),
+            existing_results=project_reporting_summary(
+                await self.reporting.context_summary(session_id)
+            ),
             tools=tuple(PlannerTool.from_approved(item) for item in tools),
             allowed_channels=tuple(
                 platform for platform in workspace.platforms if platform in approved_channels
