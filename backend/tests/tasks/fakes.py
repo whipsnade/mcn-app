@@ -37,6 +37,7 @@ class MemoryExecutionRepository:
         self.cancel_count = 0
         self.renew_count = 0
         self.allow_renew = True
+        self.renew_error: Exception | None = None
 
     async def claim_lease(self, task_id: str, worker_id: str, lease_seconds: int):
         if task_id != self.task.id or self.task.status in {TaskStatus.COMPLETED, TaskStatus.CANCELLED}:
@@ -71,6 +72,8 @@ class MemoryExecutionRepository:
 
     async def renew_lease(self, task_id: str, worker_id: str, lease_seconds: int) -> bool:
         assert task_id == self.task.id
+        if self.renew_error is not None:
+            raise self.renew_error
         if not self.allow_renew or self.task.lease_owner != worker_id:
             return False
         self.renew_count += 1
@@ -118,6 +121,8 @@ class FakeExecutionGateway:
         self._release.set()
         self.outcome_status = "settled"
         self.error: Exception | None = None
+        self.repository: MemoryExecutionRepository | None = None
+        self.before_lease_guard = None
 
     def block(self) -> None:
         self._release.clear()
@@ -128,6 +133,11 @@ class FakeExecutionGateway:
     async def execute_batch(self, commands):
         self.started.set()
         await self._release.wait()
+        if self.before_lease_guard is not None:
+            await self.before_lease_guard()
+        owner = getattr(commands[0], "lease_owner", None)
+        if owner is not None and self.repository is not None and self.repository.task.lease_owner != owner:
+            raise RuntimeError("task_lease_lost")
         if self.error is not None:
             raise self.error
         rows = []
@@ -174,6 +184,7 @@ class FakeExecutionScenario:
             heartbeat_seconds=0.005,
             checkpoint=self.checkpoint,
         )
+        self.gateway.repository = self.repository
 
     @property
     def task(self) -> MemoryExecutionTask:
@@ -189,6 +200,12 @@ class FakeExecutionScenario:
 
     def release_context(self) -> None:
         self.context_release.set()
+
+    async def steal_lease_before_gateway(self) -> None:
+        self.repository.task.lease_owner = "new-worker"
+        self.repository.task.lease_expires_at = datetime.now(UTC).replace(tzinfo=None) + timedelta(
+            seconds=1
+        )
 
     async def plan_for(self, context):
         return self.plan

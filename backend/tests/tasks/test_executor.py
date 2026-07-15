@@ -89,6 +89,30 @@ async def test_lost_lease_during_slow_planning_never_enters_mcp_gateway() -> Non
     assert scenario.gateway.successful_logical_calls == 0
 
 
+@pytest.mark.asyncio
+async def test_lease_stolen_between_executor_check_and_gateway_never_calls_outbound() -> None:
+    scenario = FakeExecutionScenario()
+    scenario.gateway.before_lease_guard = scenario.steal_lease_before_gateway
+
+    await scenario.executor.run(scenario.task.id)
+
+    assert scenario.gateway.successful_logical_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_renew_error_fails_closed_before_gateway() -> None:
+    scenario = FakeExecutionScenario()
+    scenario.repository.renew_error = RuntimeError("renew unavailable")
+    scenario.block_context()
+    execution = asyncio.create_task(scenario.executor.run(scenario.task.id))
+    await scenario.context_started.wait()
+    await asyncio.sleep(0.01)
+    scenario.release_context()
+    await execution
+
+    assert scenario.gateway.successful_logical_calls == 0
+
+
 def test_default_heartbeat_is_strictly_shorter_than_one_second_lease() -> None:
     scenario = FakeExecutionScenario()
     executor = TaskExecutor(

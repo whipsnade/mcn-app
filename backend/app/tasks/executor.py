@@ -107,6 +107,7 @@ class TaskExecutor:
                         plan_step_id=step.id,
                         internal_tool_name=step.internal_tool_name,
                         arguments=step.arguments,
+                        lease_owner=self.worker_id,
                     )
                     for step in batch.steps
                 )
@@ -159,9 +160,14 @@ class TaskExecutor:
             try:
                 await asyncio.wait_for(stop.wait(), timeout=self.heartbeat_seconds)
             except TimeoutError:
-                if not await self.repository.renew_lease(
-                    task_id, self.worker_id, self.lease_seconds
-                ):
+                try:
+                    renewed = await self.repository.renew_lease(
+                        task_id, self.worker_id, self.lease_seconds
+                    )
+                except Exception:
+                    lease_lost.set()
+                    return
+                if not renewed:
                     lease_lost.set()
                     return
 

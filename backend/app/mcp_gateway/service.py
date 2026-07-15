@@ -45,6 +45,11 @@ class ExecuteMcpCall:
     plan_step_id: str
     internal_tool_name: str
     arguments: dict[str, JsonValue]
+    lease_owner: str | None = None
+
+
+class TaskLeaseLostError(RuntimeError):
+    """The task worker no longer owns an active lease before MCP reservation."""
 
 
 @dataclass(frozen=True)
@@ -417,9 +422,18 @@ class McpGatewayService:
         user_ids = {command.user_id for command in commands}
         if len(user_ids) != 1:
             raise ValueError("mcp_batch_must_have_one_user")
+        lease_owners = {command.lease_owner for command in commands}
+        if len(lease_owners) != 1:
+            raise ValueError("mcp_batch_must_have_one_lease_owner")
+        lease_owner = lease_owners.pop()
+        task_ids = {command.task_id for command in commands}
+        if lease_owner is not None and len(task_ids) != 1:
+            raise ValueError("leased_mcp_batch_must_have_one_task")
 
         # A: creation and every reservation atomically commit before a call can run.
         async with self._transaction():
+            if lease_owner is not None:
+                await self._require_active_task_lease(commands[0].task_id, lease_owner)
             rows = tuple([
                 await self._calls.prepare(
                     logical_call_id=command.logical_call_id,
@@ -481,3 +495,18 @@ class McpGatewayService:
         if self._db.in_transaction():
             return self._db.begin_nested()
         return self._db.begin()
+
+    async def _require_active_task_lease(self, task_id: str, lease_owner: str) -> None:
+        now = datetime.now(UTC).replace(tzinfo=None)
+        task = await self._db.scalar(
+            select(AnalysisTask)
+            .where(AnalysisTask.id == task_id)
+            .with_for_update()
+        )
+        if (
+            task is None
+            or task.lease_owner != lease_owner
+            or task.lease_expires_at is None
+            or task.lease_expires_at <= now
+        ):
+            raise TaskLeaseLostError("task lease is no longer active")

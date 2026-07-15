@@ -1,3 +1,5 @@
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
@@ -8,7 +10,7 @@ from app.billing.service import InsufficientPointsError, WalletService
 from app.mcp_gateway.contracts import DataTapService, McpCallStatus
 from app.mcp_gateway.fake import FakeMcpTransport
 from app.mcp_gateway.registry import ApprovedTool
-from app.mcp_gateway.service import ExecuteMcpCall, McpGatewayService
+from app.mcp_gateway.service import ExecuteMcpCall, McpGatewayService, TaskLeaseLostError
 from app.mcp_gateway.transport import PossiblySentTimeout, RemoteToolResult
 from tests.mcp_gateway.fakes import create_analysis_task, strict_object_schema
 
@@ -141,3 +143,26 @@ async def test_insufficient_batch_never_calls_upstream(db_session, user_factory)
     assert transport.call_count == 0
     assert (wallet.balance, wallet.reserved) == (20, 0)
     assert reserve_count == 0
+
+
+@pytest.mark.asyncio
+async def test_stale_task_lease_is_rejected_before_mcp_reservation_or_transport(
+    db_session, user_factory
+) -> None:
+    task = await create_analysis_task(db_session, user_factory)
+    task.lease_owner = "current-worker"
+    task.lease_expires_at = datetime.now(UTC).replace(tzinfo=None) + timedelta(seconds=30)
+    await WalletService(db_session).ensure_welcome_grant(task.user_id)
+    transport = FakeMcpTransport(
+        call_result=RemoteToolResult({"items": []}, False, "should-not-be-called")
+    )
+    gateway = McpGatewayService(
+        db_session, transport, arguments_loader=MemoryArgumentsLoader(), registry=StaticRegistry()
+    )
+
+    with pytest.raises(TaskLeaseLostError):
+        await gateway.execute(replace(command(task.user_id, task.id), lease_owner="stale-worker"))
+
+    wallet = await db_session.get(Wallet, task.user_id)
+    assert wallet is not None and (wallet.balance, wallet.reserved) == (1000, 0)
+    assert transport.call_count == 0
