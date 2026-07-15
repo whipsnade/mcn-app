@@ -68,15 +68,7 @@ export function useWorkspace(userId?: string) {
         recommendation: candidate.recommendation,
         metrics: candidate.metrics,
       })),
-      biReport: matchingReport ? {
-        id: matchingReport.id,
-        taskId: matchingReport.task_id,
-        reportVersion: matchingReport.report_version,
-        candidateVersion: matchingReport.candidate_version,
-        overview: matchingReport.overview,
-        conclusion: matchingReport.conclusion,
-        generatedAt: matchingReport.generated_at,
-      } : undefined,
+      biReport: matchingReport,
     };
   }, []);
 
@@ -282,15 +274,7 @@ export function useWorkspace(userId?: string) {
             && session.analysis.reportId === requestedReportId
             && report.candidate_version === requestedCandidateVersion ? {
             ...session,
-            biReport: {
-              id: report.id,
-              taskId: report.task_id,
-              reportVersion: report.report_version,
-              candidateVersion: report.candidate_version,
-              overview: report.overview,
-              conclusion: report.conclusion,
-              generatedAt: report.generated_at,
-            },
+            biReport: report,
           } : session));
         })
         .catch(() => undefined);

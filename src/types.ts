@@ -124,12 +124,19 @@ export interface KolCandidate {
 
 export interface AnalysisBiReport {
   id: string;
-  taskId: string;
-  reportVersion: number;
-  candidateVersion: number;
+  task_id: string;
+  report_version: number;
+  candidate_version: number;
   overview: Record<string, unknown>;
+  score_composition: Array<Record<string, unknown>>;
+  audience_content_fit: Record<string, unknown>;
+  platform_distribution: Array<Record<string, unknown>>;
+  budget_analysis: Record<string, unknown>;
+  comparison: Array<Record<string, unknown>>;
+  risks: Array<Record<string, unknown>>;
   conclusion: string;
-  generatedAt: string;
+  sources: Array<Record<string, unknown>>;
+  generated_at: string;
 }
 
 export interface Account {

@@ -230,10 +230,9 @@ export default function App() {
 
         <div className={`${mobilePane === 'bi' ? 'block' : 'hidden'} h-full w-full shrink-0 xl:block xl:w-auto`}>
           <BiReport
-            reportData={workspace.activeSession?.reportData}
-            campaignName={workspace.activeSession?.campaignName ?? ''}
-            brand={workspace.activeSession?.brand ?? ''}
-            sessions={workspace.sessions}
+            report={workspace.activeSession?.biReport}
+            candidateVersion={workspace.activeSession?.analysis?.candidateVersion}
+            selectedCandidates={candidatePage?.items}
           />
         </div>
       </div>
