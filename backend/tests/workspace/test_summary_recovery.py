@@ -7,3 +7,7 @@ def test_summary_recovery_skips_already_persisted_deltas_before_resuming() -> No
 
 def test_completed_summary_does_not_replay_any_delta() -> None:
     assert summary_deltas_to_persist("完整总结", ("完整", "总结"), completed=True) == ()
+
+
+def test_summary_recovery_rejects_stream_with_a_different_prefix() -> None:
+    assert summary_deltas_to_persist("原有草稿", ("全新开头",)) is None

@@ -36,7 +36,7 @@ from app.workspace.service import WorkspaceService
 
 def summary_deltas_to_persist(
     persisted_content: str, deltas: tuple[str, ...], *, completed: bool = False
-) -> tuple[str, ...]:
+) -> tuple[str, ...] | None:
     """流恢复从头重放时，只返回尚未提交的后缀。"""
     if completed:
         return ()
@@ -53,9 +53,8 @@ def summary_deltas_to_persist(
                 result.append(suffix)
                 persisted = generated
             continue
-        # 模型无法按同一前缀重放时，保留新的片段而不覆盖已有草稿。
-        result.append(delta)
-        persisted += delta
+        # 无法证明新流是旧草稿的同一前缀：保留草稿并拒绝混拼。
+        return None
     return tuple(result)
 
 
@@ -202,6 +201,8 @@ class _TaskArtifacts:
                 continue
             generated_deltas.append(event.text)
             pending = summary_deltas_to_persist(content, tuple(generated_deltas))
+            if pending is None:
+                return
             if not pending:
                 continue
             delta = pending[-1]
@@ -210,11 +211,10 @@ class _TaskArtifacts:
         if message_id is None:
             raise ValueError("summary_stream_empty")
         async with SessionFactory.begin() as db:
+            task = await self._locked_active_task(db, task_id)
             message = await db.get(Message, message_id)
-            task = await db.get(AnalysisTask, task_id)
-            if message is None or task is None:
+            if message is None:
                 raise LookupError("summary_message_not_found")
-            self._require_active_lease(task)
             message.metadata_json = {**message.metadata_json, "status": "completed"}
             await TaskRepository(db).append_event(
                 task.id,
@@ -227,10 +227,7 @@ class _TaskArtifacts:
         self, task_id: str, message_id: str | None, content: str, delta: str
     ) -> str:
         async with SessionFactory.begin() as db:
-            task = await db.get(AnalysisTask, task_id)
-            if task is None:
-                raise LookupError("task_not_found")
-            self._require_active_lease(task)
+            task = await self._locked_active_task(db, task_id)
             if message_id is None:
                 sequence = (
                     await db.scalar(select(func.max(Message.sequence)).where(Message.session_id == task.session_id))
@@ -260,6 +257,15 @@ class _TaskArtifacts:
                 {"message_id": message.id, "delta": delta},
             )
             return message.id
+
+    async def _locked_active_task(self, db, task_id: str) -> AnalysisTask:
+        task = await db.scalar(
+            select(AnalysisTask).where(AnalysisTask.id == task_id).with_for_update()
+        )
+        if task is None:
+            raise LookupError("task_not_found")
+        self._require_active_lease(task)
+        return task
 
     async def _existing_summary_message(self, db, task: AnalysisTask) -> Message | None:
         messages = list(

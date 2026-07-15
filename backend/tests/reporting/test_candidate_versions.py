@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.reporting.models import KolSnapshot, TaskCandidate
 from app.reporting.service import ReportingService
+from app.tasks.dependencies import _TaskArtifacts
 from tests.reporting.fakes import candidate_fixture, completed_task_factory
 
 
@@ -146,3 +147,17 @@ async def test_lost_lease_rejects_bi_artifact_write(
 
     with pytest.raises(RuntimeError, match="task_lease_lost"):
         await service.build_bi_report(task.id, lease_owner="old-worker")
+
+
+async def test_summary_write_locks_task_before_checking_competing_lease(
+    db_session: AsyncSession, user_factory
+) -> None:
+    user = await user_factory()
+    task = await completed_task_factory(
+        db_session, user.id, evidence_rows=[candidate_fixture(account_id="locked-summary")]
+    )
+    task.lease_owner = "replacement-worker"
+    task.lease_expires_at = task.created_at + timedelta(minutes=5)
+
+    with pytest.raises(RuntimeError, match="task_lease_lost"):
+        await _TaskArtifacts("old-worker", None)._locked_active_task(db_session, task.id)
