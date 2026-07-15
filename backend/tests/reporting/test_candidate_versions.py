@@ -1,0 +1,65 @@
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.reporting.models import KolSnapshot, TaskCandidate
+from app.reporting.service import ReportingService
+from tests.reporting.fakes import candidate_fixture, completed_task_factory
+
+
+async def test_same_evidence_reuses_candidate_version(
+    db_session: AsyncSession, user_factory
+) -> None:
+    user = await user_factory()
+    task = await completed_task_factory(
+        db_session,
+        user.id,
+        evidence_rows=[candidate_fixture(account_id="100", engagement_rate="8%")],
+    )
+    service = ReportingService(db_session)
+
+    first = await service.build_candidate_version(task.id, "balanced")
+    second = await service.build_candidate_version(task.id, "balanced")
+
+    candidate_count = await db_session.scalar(
+        select(func.count()).select_from(TaskCandidate).where(TaskCandidate.task_id == task.id)
+    )
+    snapshot_count = await db_session.scalar(
+        select(func.count())
+        .select_from(KolSnapshot)
+        .join(TaskCandidate, TaskCandidate.snapshot_id == KolSnapshot.id)
+        .where(TaskCandidate.task_id == task.id)
+    )
+    assert first.candidate_version == second.candidate_version == 1
+    assert candidate_count == 1
+    assert snapshot_count == 1
+
+
+async def test_candidate_order_is_stable_across_input_order(
+    db_session: AsyncSession, user_factory
+) -> None:
+    user = await user_factory()
+    task = await completed_task_factory(
+        db_session,
+        user.id,
+        evidence_rows=[
+            candidate_fixture(
+                account_id="100",
+                engagement_rate="8%",
+                audience_score=80,
+                content_score=80,
+            ),
+            candidate_fixture(
+                account_id="200",
+                engagement_rate="8%",
+                audience_score=90,
+                content_score=67.5,
+            ),
+        ],
+    )
+
+    result = await ReportingService(db_session).build_candidate_version(task.id, "balanced")
+
+    assert [(item.platform_account_id, item.rank) for item in result.candidates] == [
+        ("200", 1),
+        ("100", 2),
+    ]
