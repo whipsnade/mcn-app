@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from decimal import Decimal, InvalidOperation
+import re
 from typing import Any
+import unicodedata
 
 from app.reporting.schemas import NormalizedKolEvidence, ToolEvidence
 
@@ -13,16 +15,17 @@ class UnknownEvidenceToolError(ValueError):
 
 Adapter = Callable[[ToolEvidence], tuple[NormalizedKolEvidence, ...]]
 _DROP = object()
-_SENSITIVE_KEY_TERMS = (
+_SENSITIVE_STORAGE_KEYS = {
     "authorization",
     "token",
     "api_key",
-    "apikey",
     "credential",
+    "secret",
     "url",
     "endpoint",
     "host",
-)
+}
+_SENSITIVE_STORAGE_KEY_PARTS = set(_SENSITIVE_STORAGE_KEYS)
 _FORBIDDEN_VALUE_TERMS = (
     "datatap.deepminer.com.cn",
     "api.lkeap.cloud.tencent.com",
@@ -30,6 +33,11 @@ _FORBIDDEN_VALUE_TERMS = (
     "zhihu-mcp",
     "toutiao-mcp",
     "baidu-index-mcp",
+)
+_TEXT_SECRET_PATTERN = re.compile(
+    r"(?<![a-z0-9_])(?:authorization|bearer|api[ _-]?key|token|credentials?|secret)"
+    r"(?![a-z0-9_])",
+    re.IGNORECASE,
 )
 
 
@@ -53,11 +61,28 @@ def redact_evidence_for_storage(value: Any) -> Any:
     return {} if cleaned is _DROP else cleaned
 
 
+def _normalized_storage_key(key: str) -> str:
+    normalized = unicodedata.normalize("NFKC", key)
+    snake_case = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", normalized)
+    return re.sub(r"[^a-z0-9]+", "_", snake_case.casefold()).strip("_")
+
+
+def _is_sensitive_storage_key(key: str) -> bool:
+    normalized = _normalized_storage_key(key)
+    return normalized in _SENSITIVE_STORAGE_KEYS or any(
+        part in normalized for part in _SENSITIVE_STORAGE_KEY_PARTS
+    )
+
+
+def _contains_text_secret(value: str) -> bool:
+    return _TEXT_SECRET_PATTERN.search(unicodedata.normalize("NFKC", value)) is not None
+
+
 def _redact(value: Any) -> Any:
     if isinstance(value, dict):
         result: dict[str, Any] = {}
         for key, item in value.items():
-            if not isinstance(key, str) or any(term in key.lower() for term in _SENSITIVE_KEY_TERMS):
+            if not isinstance(key, str) or _is_sensitive_storage_key(key):
                 continue
             cleaned = _redact(item)
             if cleaned is not _DROP:
@@ -66,10 +91,12 @@ def _redact(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [cleaned for item in value if (cleaned := _redact(item)) is not _DROP]
     if isinstance(value, str):
-        lowered = value.lower()
+        lowered = unicodedata.normalize("NFKC", value).casefold()
         if (
-            lowered.startswith(("http://", "https://", "bearer ", "sk-"))
+            "http://" in lowered
+            or "https://" in lowered
             or any(term in lowered for term in _FORBIDDEN_VALUE_TERMS)
+            or _contains_text_secret(value)
         ):
             return _DROP
     return value

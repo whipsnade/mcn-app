@@ -51,6 +51,33 @@ def test_risk_flag_evidence_is_recursively_redacted() -> None:
     assert row.risk_flags == ({"nested": {"reason": "内容重复"}},)
 
 
+def test_risk_flags_redact_normalized_key_variants_and_secret_text() -> None:
+    row = normalize_tool_evidence(
+        [
+            evidence(
+                risk_flags=[
+                    {
+                        "api-key": "secret-api-key",
+                        "API＿Key": "unicode-secret-key",
+                        "secret": "secret-value",
+                        "AuthorizationHeader": "secret-auth",
+                        "safe": "内容稳定",
+                        "note": "  Bearer private-value",
+                    },
+                    {
+                        "note": "api　key： private-value",
+                        "token_note": "token private-value",
+                        "credentialNote": "credential private-value",
+                        "safe": "互动正常",
+                    },
+                ]
+            )
+        ]
+    )[0]
+
+    assert row.risk_flags == ({"safe": "内容稳定"}, {"safe": "互动正常"})
+
+
 def test_unknown_internal_tool_is_rejected_without_guessing_fields() -> None:
     item = evidence()
     item = item.__class__(
