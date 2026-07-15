@@ -37,6 +37,26 @@ async def test_session_history_is_owned_and_restorable(auth_client_factory) -> N
 
 
 @pytest.mark.asyncio
+async def test_session_can_be_created_without_a_campaign_name(auth_client_factory) -> None:
+    client = await auth_client_factory("13800000005")
+
+    created = await client.post(
+        "/api/v1/sessions",
+        json={
+            "brand": "示例品牌",
+            "campaign_name": None,
+            "platforms": ["xiaohongshu"],
+            "category": "美妆护肤",
+            "target_audience": "18-30 岁女性",
+            "initial_query": "寻找高互动达人",
+        },
+    )
+
+    assert created.status_code == 201
+    assert created.json()["campaign_name"] is None
+
+
+@pytest.mark.asyncio
 async def test_list_patch_and_star_only_affect_owner(auth_client_factory) -> None:
     owner = await auth_client_factory("13700000003")
     outsider = await auth_client_factory("13700000004")

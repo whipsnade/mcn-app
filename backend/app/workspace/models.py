@@ -21,7 +21,7 @@ class WorkspaceSession(Base):
     )
     title: Mapped[str] = mapped_column(String(160), nullable=False)
     brand: Mapped[str] = mapped_column(String(100), nullable=False)
-    campaign_name: Mapped[str] = mapped_column(String(120), nullable=False)
+    campaign_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
     status: Mapped[str] = mapped_column(String(24), nullable=False, default="draft")
     platforms: Mapped[list[str]] = mapped_column(JSON, nullable=False)
     category: Mapped[str] = mapped_column(String(100), nullable=False)

@@ -37,7 +37,7 @@ class SessionBrief(BaseModel):
 
     session_id: str = Field(min_length=1)
     brand: str = Field(min_length=1, max_length=100)
-    campaign_name: str = Field(min_length=1, max_length=120)
+    campaign_name: str | None = Field(default=None, min_length=1, max_length=120)
     platforms: tuple[str, ...] = Field(min_length=1, max_length=5)
     category: str = Field(min_length=1, max_length=100)
     target_audience: str = Field(min_length=1, max_length=500)

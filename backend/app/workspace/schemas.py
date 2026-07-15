@@ -12,7 +12,7 @@ Platform = Literal["xiaohongshu", "douyin", "bilibili", "weibo", "wechat"]
 
 class SessionCreate(BaseModel):
     brand: str = Field(min_length=1, max_length=100)
-    campaign_name: str = Field(min_length=1, max_length=120)
+    campaign_name: str | None = Field(default=None, min_length=1, max_length=120)
     platforms: list[Platform] = Field(min_length=1)
     category: str = Field(min_length=1, max_length=100)
     target_audience: str = Field(min_length=1, max_length=500)
@@ -62,7 +62,7 @@ class SessionRead(BaseModel):
     id: str
     title: str
     brand: str
-    campaign_name: str
+    campaign_name: str | None
     status: str
     platforms: list[str]
     category: str

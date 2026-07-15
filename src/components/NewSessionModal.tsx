@@ -54,22 +54,24 @@ export default function NewSessionModal({ isOpen, onClose, onCreate }: NewSessio
 
   const handleSubmit = async (event: React.FormEvent) => {
     event.preventDefault();
-    if (!brand.trim() || !campaignName.trim() || !category.trim() || !targetAudience.trim()) {
+    if (!brand.trim() || !category.trim() || !targetAudience.trim()) {
       return;
     }
 
+    const trimmedBrand = brand.trim();
+    const trimmedCampaignName = campaignName.trim();
     setIsSubmitting(true);
     try {
       await onCreate({
-        brand: brand.trim(),
-        campaignName: campaignName.trim(),
+        brand: trimmedBrand,
+        campaignName: trimmedCampaignName,
         platforms: selectedPlatforms,
         category: category.trim(),
         targetAudience: targetAudience.trim(),
         budgetMin: budgetMin || undefined,
         budgetMax: budgetMax || undefined,
         initialQuery: initialQuery.trim()
-          || `请为「${brand.trim()}」的「${campaignName.trim()}」筛选匹配的 KOL，并说明推荐依据。`,
+          || `请为「${trimmedBrand}」${trimmedCampaignName ? `的「${trimmedCampaignName}」` : ''}筛选匹配的 KOL，并说明推荐依据。`,
       });
       reset();
       onClose();
@@ -120,9 +122,8 @@ export default function NewSessionModal({ isOpen, onClose, onCreate }: NewSessio
               />
             </div>
             <div>
-              <label className="block text-xs font-semibold text-slate-600 uppercase tracking-wider mb-1">活动/项目名称 *</label>
+              <label className="block text-xs font-semibold text-slate-600 uppercase tracking-wider mb-1">活动/项目名称</label>
               <input
-                required
                 placeholder="例如：双11抗老宣发"
                 value={campaignName}
                 onChange={event => setCampaignName(event.target.value)}
