@@ -47,7 +47,7 @@ def test_tencent_client_disables_sdk_retries_and_uses_fixed_settings(monkeypatch
 
     assert captured == {
         "api_key": "unit-test-key",
-        "base_url": "https://api.lkeap.cloud.tencent.com/plan/v3",
+        "base_url": "https://tokenhub.tencentmaas.com/plan/v3",
         "max_retries": 0,
         "timeout": 60.0,
     }

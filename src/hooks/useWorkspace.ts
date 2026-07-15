@@ -140,7 +140,7 @@ export function useWorkspace(userId?: string) {
       if (generationRef.current !== generation) throw new Error('STALE_WORKSPACE_REQUEST');
       setSessions(current => replaceSession(current, created));
       setActiveSessionId(created.id);
-      setActiveTaskId(undefined);
+      setActiveTaskId(created.analysis?.taskId);
       return created;
     } catch (reason) {
       if (generationRef.current === generation) {

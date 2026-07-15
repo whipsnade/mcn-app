@@ -28,7 +28,7 @@
 模型通过 OpenAI Chat Completions 兼容协议接入腾讯 Token Plan：
 
 - API 形态：`openai-completions`
-- Base URL：`https://api.lkeap.cloud.tencent.com/plan/v3`
+- Base URL：`https://tokenhub.tencentmaas.com/plan/v3`
 - 模型标识：`deepseek-v4-pro-202606`
 - 密钥仅由后端运行环境中的 `TENCENT_PLAN_API_KEY` 注入。
 - Base URL 和模型分别由 `TENCENT_PLAN_BASE_URL`、`TENCENT_PLAN_MODEL` 配置。

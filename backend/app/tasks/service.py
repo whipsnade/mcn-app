@@ -9,6 +9,7 @@ from app.tasks.repository import TaskRepository
 from app.tasks.schemas import TaskCreate
 from app.tasks.state import TaskEventType, TaskStatus
 from app.workspace.schemas import MessageCreate
+from app.workspace.models import Message
 from app.workspace.service import WorkspaceService
 
 
@@ -26,7 +27,12 @@ class TaskService:
         self.repository = TaskRepository(db)
 
     async def create(
-        self, user_id: str, session_id: str, payload: TaskCreate
+        self,
+        user_id: str,
+        session_id: str,
+        payload: TaskCreate,
+        *,
+        trigger_message_id: str | None = None,
     ) -> AnalysisTask:
         workspace_service = WorkspaceService(self.db)
         await workspace_service.get_owned_session(user_id, session_id, for_update=True)
@@ -47,9 +53,20 @@ class TaskService:
         )
         if active_task_id is not None:
             raise TaskConflictError("task_in_progress")
-        message = await workspace_service.append_message(
-            user_id, session_id, MessageCreate(content=payload.content)
-        )
+        if trigger_message_id is None:
+            message = await workspace_service.append_message(
+                user_id, session_id, MessageCreate(content=payload.content)
+            )
+        else:
+            message = await self.db.scalar(
+                select(Message).where(
+                    Message.id == trigger_message_id,
+                    Message.session_id == session_id,
+                    Message.user_id == user_id,
+                )
+            )
+            if message is None:
+                raise LookupError("trigger_message_not_found")
         message.metadata_json = {"scoring_profile": payload.scoring_profile}
         now = utc_now()
         task = AnalysisTask(

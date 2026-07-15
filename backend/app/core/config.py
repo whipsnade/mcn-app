@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     frontend_origin: str = "http://localhost:5173"
     model_provider: Literal["tencent_plan", "fake"] = "fake"
     tencent_plan_base_url: AnyHttpUrl = AnyHttpUrl(
-        "https://api.lkeap.cloud.tencent.com/plan/v3"
+        "https://tokenhub.tencentmaas.com/plan/v3"
     )
     tencent_plan_api_key: SecretStr | None = None
     tencent_plan_model: str = "deepseek-v4-pro-202606"
@@ -58,7 +58,7 @@ class Settings(BaseSettings):
     @model_validator(mode="after")
     def validate_runtime_contracts(self) -> "Settings":
         if self.tencent_plan_base_url.unicode_string() != (
-            "https://api.lkeap.cloud.tencent.com/plan/v3"
+            "https://tokenhub.tencentmaas.com/plan/v3"
         ):
             raise ValueError("TENCENT_PLAN_BASE_URL must use the confirmed provider endpoint")
         if self.tencent_plan_model != "deepseek-v4-pro-202606":

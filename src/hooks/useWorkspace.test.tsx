@@ -2,7 +2,7 @@ import { act, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Session } from '../types';
-import { getSession, listSessions } from '../api/sessions';
+import { createSession, getSession, listSessions } from '../api/sessions';
 import { createTask, getCandidates, getReport } from '../api/tasks';
 import { useTaskStream } from './useTaskStream';
 import { useWorkspace } from './useWorkspace';
@@ -113,6 +113,38 @@ describe('useWorkspace', () => {
 
     expect(result.current.sessions).toEqual([]);
     expect(result.current.activeSession).toBeUndefined();
+  });
+
+  it('subscribes to the initial analysis task returned after creating a session', async () => {
+    vi.mocked(createSession).mockResolvedValue({
+      ...session,
+      id: 'session-2',
+      title: '测试品牌',
+      campaignName: null,
+      messages: [{
+        id: 'message-2',
+        sender: 'user',
+        text: '新建会话后立即分析',
+        timestamp: '18:01',
+      }],
+      analysis: { taskId: 'task-2', status: 'pending' },
+    });
+
+    const { result } = renderHook(() => useWorkspace('user-a'));
+    await waitFor(() => expect(result.current.activeSession?.id).toBe('session-1'));
+
+    await act(async () => {
+      await result.current.createSession({
+        brand: '测试品牌',
+        campaign_name: null,
+        platforms: ['xiaohongshu'],
+        category: '美妆',
+        target_audience: '一线城市女性',
+        initial_query: '新建会话后立即分析',
+      });
+    });
+
+    expect(result.current.activeTaskId).toBe('task-2');
   });
 
   it('ignores a previous user response that arrives after logout', async () => {
