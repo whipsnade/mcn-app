@@ -35,12 +35,19 @@ export function toSession(source: ApiSession): Session {
       }),
     })),
     isStarred: source.is_starred,
-    analysis: source.latest_task ? {
-      taskId: source.latest_task.id,
-      status: source.latest_task.status,
-      candidateVersion: source.latest_candidates?.version,
-      reportId: source.latest_report?.id,
-    } : undefined,
+    analysis: source.latest_task ? (() => {
+      const candidateVersion = source.latest_candidates?.version;
+      const reportId = candidateVersion !== undefined
+        && source.latest_report?.candidate_version === candidateVersion
+        ? source.latest_report.id
+        : undefined;
+      return {
+        taskId: source.latest_task.id,
+        status: source.latest_task.status,
+        candidateVersion,
+        reportId,
+      };
+    })() : undefined,
     createdAt: source.created_at,
     updatedAt: source.updated_at,
   };

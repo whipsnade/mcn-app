@@ -60,6 +60,11 @@ export function installFetchSse() {
     lastRequestHeaders() {
       return new Headers(connections.at(-1)?.request.headers);
     },
+    lastRequestSignal() {
+      const signal = connections.at(-1)?.request.signal;
+      if (!signal) throw new Error('SSE_SIGNAL_NOT_FOUND');
+      return signal;
+    },
     connectionCount() {
       return connections.length;
     },
