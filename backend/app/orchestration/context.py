@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 import re
 from typing import Any, Protocol
+import unicodedata
 
 from app.orchestration.schemas import (
     PlannerContext,
@@ -99,7 +100,8 @@ def _is_sensitive_report_key(key: str) -> bool:
 
 
 def _contains_text_secret(value: str) -> bool:
-    return _TEXT_SECRET_PATTERN.search(value) is not None
+    normalized = unicodedata.normalize("NFKC", value)
+    return _TEXT_SECRET_PATTERN.search(normalized) is not None
 
 
 def _project_reporting_value(value: Any) -> Any:
