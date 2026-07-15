@@ -436,6 +436,9 @@ class McpGatewayService:
             await self._accounting.reserve_batch(commands[0].user_id, rows)
 
         # B: each successful claim becomes visible before any external request.
+        claimable_ids = {
+            row.id for row in rows if row.status == McpCallStatus.RESERVED.value
+        }
         async with self._transaction():
             claimed = tuple([await self._calls.claim(row.logical_call_id) for row in rows])
 
@@ -443,7 +446,7 @@ class McpGatewayService:
         outcomes: dict[str, ToolInvocationOutcome] = {}
         async with self._transaction():
             for row in claimed:
-                if row.status != McpCallStatus.RUNNING.value:
+                if row.id not in claimable_ids or row.status != McpCallStatus.RUNNING.value:
                     continue
                 ready = await self._calls.prepare_external(row)
                 if isinstance(ready, ToolInvocationOutcome):
@@ -456,7 +459,7 @@ class McpGatewayService:
         )
         outcomes.update(dict(zip(prepared, external, strict=True)))
 
-        # C: known terminal state and its ledger record share one transaction per call.
+        # C1: durable success evidence commits before settlement can begin.
         finalized: dict[str, McpCall] = {row.id: row for row in claimed}
         for row in claimed:
             outcome = outcomes.get(row.id)
@@ -467,6 +470,14 @@ class McpGatewayService:
                 if row.id in prepared:
                     current.protocol_session_digest = prepared[row.id].protocol_session_digest
                 finalized[row.id] = current
+
+        # C2: a prior successful outcome may be settled on retry without replaying MCP.
+        for row in rows:
+            current = finalized.get(row.id, row)
+            if current.status != McpCallStatus.SUCCEEDED.value:
+                continue
+            async with self._transaction():
+                finalized[row.id] = await self._accounting.settle_success(current)
         return tuple(finalized[row.id] for row in rows)
 
     def _transaction(self):

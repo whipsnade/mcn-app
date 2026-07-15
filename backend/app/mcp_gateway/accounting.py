@@ -49,6 +49,8 @@ class McpAccounting:
         await self._db.flush()
 
     async def finalize(self, call: McpCall, outcome: ToolInvocationOutcome) -> McpCall:
+        if outcome.status == "succeeded":
+            return await self.persist_success(call, outcome)
         row = await self._db.scalar(
             select(McpCall)
             .where(McpCall.id == call.id)
@@ -72,43 +74,71 @@ class McpAccounting:
             await self._db.flush()
             return row
 
-        if outcome.status == "succeeded":
-            await self._wallets.settle(
-                await self._user_id(row),
-                MCP_COST,
-                f"mcp:{row.logical_call_id}:settle",
-                row.id,
-            )
-            transaction = await self._transaction(f"mcp:{row.logical_call_id}:settle")
-            if transaction is None:
-                raise RuntimeError("mcp_settlement_ledger_missing")
-            row.status = McpCallStatus.SETTLED.value
-            row.settlement_transaction_id = transaction.id
-            row.response_hash = outcome.response_hash
-            row.evidence_json = {
-                "outcome": "succeeded",
-                "structured_content": outcome.validated_output,
-                "upstream_request_id": outcome.upstream_request_id,
-            }
-            row.error_type = None
-            row.error_message = None
-            await self._event(row, "mcp_call_settled")
-        else:
-            await self._wallets.release(
-                await self._user_id(row),
-                MCP_COST,
-                f"mcp:{row.logical_call_id}:release",
-                row.id,
-            )
-            transaction = await self._transaction(f"mcp:{row.logical_call_id}:release")
-            if transaction is None:
-                raise RuntimeError("mcp_release_ledger_missing")
-            row.status = McpCallStatus.RELEASED.value
-            row.settlement_transaction_id = transaction.id
-            row.evidence_json = {"outcome": "failed"}
-            row.error_type = outcome.error_type or "upstream_error"
-            row.error_message = "MCP call failed"
-            await self._event(row, "mcp_call_released")
+        await self._wallets.release(
+            await self._user_id(row),
+            MCP_COST,
+            f"mcp:{row.logical_call_id}:release",
+            row.id,
+        )
+        transaction = await self._transaction(f"mcp:{row.logical_call_id}:release")
+        if transaction is None:
+            raise RuntimeError("mcp_release_ledger_missing")
+        row.status = McpCallStatus.RELEASED.value
+        row.settlement_transaction_id = transaction.id
+        row.evidence_json = {"outcome": "failed"}
+        row.error_type = outcome.error_type or "upstream_error"
+        row.error_message = "MCP call failed"
+        await self._event(row, "mcp_call_released")
+        await self._db.flush()
+        return row
+
+    async def persist_success(
+        self, call: McpCall, outcome: ToolInvocationOutcome
+    ) -> McpCall:
+        row = await self._db.scalar(
+            select(McpCall).where(McpCall.id == call.id).with_for_update()
+        )
+        if row is None:
+            raise LookupError("mcp_call_not_found")
+        if row.status != McpCallStatus.RUNNING.value:
+            return row
+        now = _now()
+        row.status = McpCallStatus.SUCCEEDED.value
+        row.upstream_request_id = outcome.upstream_request_id
+        row.response_hash = outcome.response_hash
+        row.evidence_json = {
+            "outcome": "succeeded",
+            "structured_content": outcome.validated_output,
+            "upstream_request_id": outcome.upstream_request_id,
+        }
+        row.error_type = None
+        row.error_message = None
+        row.completed_at = now
+        row.updated_at = now
+        await self._db.flush()
+        return row
+
+    async def settle_success(self, call: McpCall) -> McpCall:
+        row = await self._db.scalar(
+            select(McpCall).where(McpCall.id == call.id).with_for_update()
+        )
+        if row is None:
+            raise LookupError("mcp_call_not_found")
+        if row.status != McpCallStatus.SUCCEEDED.value:
+            return row
+        await self._wallets.settle(
+            await self._user_id(row),
+            MCP_COST,
+            f"mcp:{row.logical_call_id}:settle",
+            row.id,
+        )
+        transaction = await self._transaction(f"mcp:{row.logical_call_id}:settle")
+        if transaction is None:
+            raise RuntimeError("mcp_settlement_ledger_missing")
+        row.status = McpCallStatus.SETTLED.value
+        row.settlement_transaction_id = transaction.id
+        row.updated_at = _now()
+        await self._event(row, "mcp_call_settled")
         await self._db.flush()
         return row
 
