@@ -69,6 +69,11 @@ class FakeReporting:
                 "disabled_service": "google-trends-mcp",
             },
             "items": [{"api_key": "hidden-key", "name": "安全候选"}],
+            "evidence": "Authorization: Bearer secret-token",
+            "notes": [
+                {"note": "api key=secret-key"},
+                {"note": "候选内容互动稳定"},
+            ],
         }
 
 
@@ -93,5 +98,8 @@ async def test_model_context_contains_reviewed_tools_but_no_supplier_details() -
     assert "hidden-authorization" not in serialized
     assert "hidden-credential" not in serialized
     assert "internal.invalid" not in serialized
+    assert "secret-token" not in serialized
+    assert "secret-key" not in serialized
     assert "安全候选" in serialized
+    assert "候选内容互动稳定" in serialized
     assert context.allowed_channels == ("bilibili",)

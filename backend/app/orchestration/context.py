@@ -38,6 +38,13 @@ _DISABLED_SERVICE_NAMES = {
     "google-trends-mcp",
 }
 _SUPPLIER_HOST_NAMES = {"datatap.deepminer.com.cn"}
+_TEXT_SECRET_PATTERNS = (
+    re.compile(r"\bauthorization\s*[:=]\s*(?:bearer\s+)?\S+", re.IGNORECASE),
+    re.compile(r"\bbearer\s+\S+", re.IGNORECASE),
+    re.compile(r"\bapi[_\s-]?key\s*[:=]\s*\S+", re.IGNORECASE),
+    re.compile(r"\btoken\s*[:=]\s*\S+", re.IGNORECASE),
+    re.compile(r"\bcredentials?\s*[:=]\s*\S+", re.IGNORECASE),
+)
 
 
 class WorkspaceReader(Protocol):
@@ -94,6 +101,10 @@ def _is_sensitive_report_key(key: str) -> bool:
     )
 
 
+def _contains_text_secret(value: str) -> bool:
+    return any(pattern.search(value) is not None for pattern in _TEXT_SECRET_PATTERNS)
+
+
 def _project_reporting_value(value: Any) -> Any:
     if isinstance(value, dict):
         projected = {
@@ -117,6 +128,7 @@ def _project_reporting_value(value: Any) -> Any:
             or any(host_name in value_lower for host_name in _SUPPLIER_HOST_NAMES)
             or "http://" in value_lower
             or "https://" in value_lower
+            or _contains_text_secret(value)
         ):
             return _OMIT
     return value
