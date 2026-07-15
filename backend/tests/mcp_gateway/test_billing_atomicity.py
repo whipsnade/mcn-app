@@ -1,5 +1,9 @@
+import asyncio
+from datetime import UTC, datetime
+from uuid import uuid4
+
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 
 from app.billing.models import Wallet, WalletTransaction
 from app.billing.service import WalletService
@@ -8,12 +12,31 @@ from app.mcp_gateway.fake import FakeMcpTransport
 from app.mcp_gateway.models import McpCall
 from app.mcp_gateway.service import McpGatewayService
 from app.mcp_gateway.transport import RemoteToolResult
+from app.tasks.models import AnalysisTask
+from app.db.session import SessionFactory
+from app.identity.models import User
 from tests.mcp_gateway.fakes import create_analysis_task
 from tests.mcp_gateway.test_billing_lifecycle import MemoryArgumentsLoader, StaticRegistry, command
 
 
 class SettleWriteFailure(RuntimeError):
     pass
+
+
+class BlockingFirstTransport(FakeMcpTransport):
+    def __init__(self) -> None:
+        super().__init__(
+            call_result=RemoteToolResult({"items": []}, False, "request-concurrent")
+        )
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def call_tool(self, service, remote_name, arguments):
+        self.call_count += 1
+        if self.call_count == 1:
+            self.entered.set()
+            await self.release.wait()
+        return self.call_result
 
 
 @pytest.mark.asyncio
@@ -108,3 +131,66 @@ async def test_existing_running_call_is_not_replayed(db_session, user_factory) -
 
     assert repeated.status == McpCallStatus.RUNNING.value
     assert transport.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_concurrent_same_logical_call_only_winner_calls_transport() -> None:
+    now = datetime.now(UTC).replace(tzinfo=None)
+    async with SessionFactory.begin() as setup:
+        user = User(
+            id=str(uuid4()),
+            nickname="并发 MCP 计费",
+            role="user",
+            status="active",
+            created_at=now,
+            updated_at=now,
+        )
+        setup.add(user)
+        await setup.flush()
+
+        async def same_user() -> User:
+            return user
+
+        task = await create_analysis_task(setup, same_user)
+        await WalletService(setup).ensure_welcome_grant(user.id)
+        command_to_run = command(user.id, task.id)
+
+    transport = BlockingFirstTransport()
+
+    async def execute_in_own_session():
+        async with SessionFactory() as session:
+            return await McpGatewayService(
+                session,
+                transport,
+                arguments_loader=MemoryArgumentsLoader(),
+                registry=StaticRegistry(),
+            ).execute(command_to_run)
+
+    try:
+        first = asyncio.create_task(execute_in_own_session())
+        await transport.entered.wait()
+        second = await asyncio.wait_for(execute_in_own_session(), timeout=2)
+        transport.release.set()
+        winner = await first
+
+        async with SessionFactory() as verify:
+            settled_count = await verify.scalar(
+                select(func.count(WalletTransaction.id)).where(
+                    WalletTransaction.user_id == user.id,
+                    WalletTransaction.kind == "settle",
+                )
+            )
+
+        assert second.status == McpCallStatus.RUNNING.value
+        assert winner.status == McpCallStatus.SETTLED.value
+        assert transport.call_count == 1
+        assert settled_count == 1
+    finally:
+        transport.release.set()
+        async with SessionFactory.begin() as cleanup:
+            await cleanup.execute(delete(McpCall).where(McpCall.task_id == task.id))
+            await cleanup.execute(
+                delete(WalletTransaction).where(WalletTransaction.user_id == user.id)
+            )
+            await cleanup.execute(delete(AnalysisTask).where(AnalysisTask.id == task.id))
+            await cleanup.execute(delete(User).where(User.id == user.id))

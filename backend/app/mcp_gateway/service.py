@@ -238,7 +238,7 @@ class McpCallService:
         await self._db.commit()
         return row
 
-    async def claim(self, logical_call_id: str) -> McpCall:
+    async def claim(self, logical_call_id: str) -> tuple[McpCall, bool]:
         """Durably claim a reserved call; the caller owns the surrounding transaction."""
         now = datetime.now(UTC).replace(tzinfo=None)
         claimed = await self._db.execute(
@@ -257,9 +257,7 @@ class McpCallService:
         row = await self._by_logical_id(logical_call_id, refresh=True)
         if row is None:
             raise LookupError("MCP logical call does not exist")
-        if claimed.rowcount != 1:
-            return row
-        return row
+        return row, claimed.rowcount == 1
 
     async def prepare_external(
         self, row: McpCall
@@ -436,17 +434,16 @@ class McpGatewayService:
             await self._accounting.reserve_batch(commands[0].user_id, rows)
 
         # B: each successful claim becomes visible before any external request.
-        claimable_ids = {
-            row.id for row in rows if row.status == McpCallStatus.RESERVED.value
-        }
         async with self._transaction():
-            claimed = tuple([await self._calls.claim(row.logical_call_id) for row in rows])
+            claim_results = tuple([await self._calls.claim(row.logical_call_id) for row in rows])
+        claimed = tuple(row for row, _ in claim_results)
+        claimed_ids = {row.id for row, did_claim in claim_results if did_claim}
 
         prepared: dict[str, PreparedMcpInvocation] = {}
         outcomes: dict[str, ToolInvocationOutcome] = {}
         async with self._transaction():
             for row in claimed:
-                if row.id not in claimable_ids or row.status != McpCallStatus.RUNNING.value:
+                if row.id not in claimed_ids or row.status != McpCallStatus.RUNNING.value:
                     continue
                 ready = await self._calls.prepare_external(row)
                 if isinstance(ready, ToolInvocationOutcome):
