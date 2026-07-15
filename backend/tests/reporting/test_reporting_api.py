@@ -44,6 +44,10 @@ async def test_candidates_are_sortable_and_report_matches_candidate_version(
     }
     assert report_response.status_code == 200
     assert report_response.json()["candidate_version"] == body["version"]
+    source = report_response.json()["sources"][0]
+    assert source["tool_name_cn"] == "B站数据采集"
+    assert source["collected_at"]
+    assert source["evidence_id"]
 
 
 async def test_candidates_and_reports_are_hidden_from_other_users(

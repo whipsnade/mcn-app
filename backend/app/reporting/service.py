@@ -169,7 +169,7 @@ class ReportingService:
             candidates = await self._candidate_rows(task.id, candidate_version)
             if not candidates:
                 raise ValueError("candidate_version_empty")
-            chart_data, conclusion, evidence = self._build_bi_payload(candidates, candidate_version)
+            chart_data, conclusion, evidence = await self._build_bi_payload(candidates, candidate_version)
             if analyst_conclusion is not None:
                 conclusion = analyst_conclusion.conclusion
                 evidence["analyst"] = analyst_conclusion.model_dump(mode="json")
@@ -213,7 +213,7 @@ class ReportingService:
         candidates = await self._candidate_rows(task_id, version)
         if not candidates:
             raise ValueError("candidate_version_empty")
-        chart_data, _conclusion, _evidence = self._build_bi_payload(candidates, version)
+        chart_data, _conclusion, _evidence = await self._build_bi_payload(candidates, version)
         return {"task_id": task_id, "candidate_version": version, "bi": chart_data}
 
     async def list_candidates(
@@ -485,9 +485,8 @@ class ReportingService:
         )
         await self._db.flush()
 
-    @staticmethod
-    def _build_bi_payload(
-        candidates: list[tuple[TaskCandidate, Kol, KolSnapshot]], candidate_version: int
+    async def _build_bi_payload(
+        self, candidates: list[tuple[TaskCandidate, Kol, KolSnapshot]], candidate_version: int
     ) -> tuple[dict[str, Any], str, dict[str, Any]]:
         dimensions = ("audience", "content", "engagement", "budget", "growth", "brand_safety")
         score_composition = []
@@ -520,6 +519,12 @@ class ReportingService:
                 source_ids.append(snapshot.source_mcp_call_id)
         top, top_kol, _ = candidates[0]
         top_nickname = top_kol.platform_account_id
+        source_rows = {
+            row.id: row
+            for row in (
+                await self._db.scalars(select(McpCall).where(McpCall.id.in_(set(source_ids))))
+            ).all()
+        } if source_ids else {}
         chart_data = {
             "overview": {
                 "candidate_count": len(candidates),
@@ -541,10 +546,28 @@ class ReportingService:
             },
             "comparison": comparison,
             "risks": risks,
-            "sources": [{"mcp_call_id": source_id} for source_id in sorted(set(source_ids))],
+            "sources": [
+                {
+                    "tool_name_cn": self._source_tool_name(source_rows[source_id]),
+                    "collected_at": (source_rows[source_id].completed_at or source_rows[source_id].updated_at).isoformat(),
+                    "evidence_id": source_id,
+                }
+                for source_id in sorted(source_rows)
+            ],
         }
         conclusion = f"已基于候选版本 {candidate_version} 生成 {len(candidates)} 位达人对比，当前首选为 {top_nickname}。"
         return chart_data, conclusion, {"candidate_version": candidate_version, "source_call_ids": sorted(set(source_ids))}
+
+    @staticmethod
+    def _source_tool_name(call: McpCall) -> str:
+        names = {
+            "insight-cube-mcp": "聆媒洞察",
+            "social-grow-mcp": "达人精选",
+            "social-grow-content-mcp": "内容选题",
+            "aktools-mcp": "AkTools金融数据",
+            "bilibili-mcp": "B站数据采集",
+        }
+        return names.get(call.service_slug, "已授权数据服务")
 
     async def _next_candidate_version(self, task_id: str) -> int:
         rows = list(

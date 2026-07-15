@@ -230,7 +230,7 @@ export function useWorkspace(userId?: string) {
         ),
       },
       biReport: taskRuntime.candidateVersion !== undefined
-        && session.biReport?.candidateVersion !== taskRuntime.candidateVersion
+        && session.biReport?.candidate_version !== taskRuntime.candidateVersion
         ? undefined
         : session.biReport,
     } : session));

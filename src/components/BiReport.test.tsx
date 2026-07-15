@@ -29,4 +29,31 @@ describe('BiReport', () => {
     expect(screen.getByText('受众数据不足')).toBeVisible();
     expect(screen.queryByText('0%')).not.toBeInTheDocument();
   });
+
+  it('uses the report average score, platform count, and same-version candidates', () => {
+    const report = reportFixture({
+      score_composition: [{ dimension: 'audience', average: 82 }],
+      platform_distribution: [{ platform: 'bilibili', count: 2 }],
+      comparison: [{ platform_account_id: '报告达人', total_score: 91 }],
+    });
+
+    const { rerender } = render(
+      <BiReport report={report} candidateVersion={2} selectedCandidates={candidatePage.items} selectedCandidateVersion={1} />,
+    );
+
+    expect(screen.getByText('报告达人')).toBeVisible();
+    expect(screen.getByText('2 位')).toBeVisible();
+    expect(screen.getByLabelText('评分构成图表：audience 82')).toBeVisible();
+
+    rerender(<BiReport report={report} candidateVersion={2} selectedCandidates={candidatePage.items} selectedCandidateVersion={2} />);
+    expect(screen.getByText('#1 达人甲')).toBeVisible();
+  });
+
+  it('shows only source display fields delivered by the report DTO', () => {
+    render(<BiReport report={reportFixture({ sources: [{ tool_name_cn: 'B站数据采集', collected_at: '2026-07-15T10:00:00Z', evidence_id: 'evidence-1', internal_endpoint: '/secret' }] })} candidateVersion={2} />);
+
+    expect(screen.getByText('B站数据采集')).toBeVisible();
+    expect(screen.getByText(/证据编号：evidence-1/)).toBeVisible();
+    expect(screen.queryByText('/secret')).not.toBeInTheDocument();
+  });
 });

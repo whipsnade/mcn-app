@@ -233,6 +233,7 @@ export default function App() {
             report={workspace.activeSession?.biReport}
             candidateVersion={workspace.activeSession?.analysis?.candidateVersion}
             selectedCandidates={candidatePage?.items}
+            selectedCandidateVersion={candidatePage?.version}
           />
         </div>
       </div>

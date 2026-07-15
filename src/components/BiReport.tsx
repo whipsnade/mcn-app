@@ -11,6 +11,7 @@ interface BiReportProps {
   report?: ApiBiReport;
   candidateVersion?: number;
   selectedCandidates?: readonly ApiCandidate[];
+  selectedCandidateVersion?: number;
 }
 
 const indigo = '#4f46e5';
@@ -133,13 +134,13 @@ function OverviewCard({ overview }: { overview: Record<string, unknown> }) {
 function ScoreCard({ data }: { data: Array<Record<string, unknown>> }) {
   const chartData = data.flatMap(item => {
     const name = firstText(item, ['name', 'dimension', 'label', 'metric']);
-    const value = firstNumber(item, ['value', 'score', 'weight', 'percentage']);
+    const value = firstNumber(item, ['value', 'score', 'average', 'weight', 'percentage']);
     return name && value !== undefined ? [{ name, value }] : [];
   });
   return (
     <Card title="评分构成" icon={<Award className="h-3.5 w-3.5" />}>
       {chartData.length === 0 ? <EmptyData /> : (
-        <div className="h-40" aria-label="评分构成图表">
+        <div className="h-40" aria-label={`评分构成图表：${chartData.map(item => `${item.name} ${item.value}`).join('，')}`}>
           <ResponsiveContainer width="100%" height="100%">
             <BarChart data={chartData} layout="vertical" margin={{ left: 6, right: 12 }}>
               <XAxis type="number" hide />
@@ -175,13 +176,14 @@ function AudienceCard({ data }: { data: Record<string, unknown> }) {
 function PlatformCard({ data }: { data: Array<Record<string, unknown>> }) {
   const chartData = data.flatMap(item => {
     const name = firstText(item, ['platform', 'name', 'label']);
-    const value = firstNumber(item, ['value', 'count', 'percentage', 'score']);
-    return name && value !== undefined ? [{ name, value }] : [];
+    const count = firstNumber(item, ['count']);
+    const value = count ?? firstNumber(item, ['value', 'percentage', 'score']);
+    return name && value !== undefined ? [{ name, value, isCount: count !== undefined }] : [];
   });
   return (
     <Card title="平台分布" icon={<PieChartIcon className="h-3.5 w-3.5" />}>
       {chartData.length === 0 ? <EmptyData /> : (
-        <div className="flex items-center gap-2"><div className="h-32 w-32 shrink-0"><ResponsiveContainer width="100%" height="100%"><PieChart><Pie data={chartData} dataKey="value" nameKey="name" innerRadius={28} outerRadius={46} paddingAngle={3}>{chartData.map((item, index) => <Cell key={item.name} fill={chartColors[index % chartColors.length]} />)}</Pie><Tooltip formatter={(value) => [value, '占比']} /></PieChart></ResponsiveContainer></div><div className="min-w-0 flex-1 space-y-1.5">{chartData.map((item, index) => <div key={item.name} className="flex items-center justify-between gap-2 text-[10px] text-slate-500"><span className="flex min-w-0 items-center gap-1.5 truncate"><i className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ backgroundColor: chartColors[index % chartColors.length] }} />{item.name}</span><b className="text-slate-700">{formatMetric(item.value, '%')}</b></div>)}</div></div>
+        <div className="flex items-center gap-2"><div className="h-32 w-32 shrink-0"><ResponsiveContainer width="100%" height="100%"><PieChart><Pie data={chartData} dataKey="value" nameKey="name" innerRadius={28} outerRadius={46} paddingAngle={3}>{chartData.map((item, index) => <Cell key={item.name} fill={chartColors[index % chartColors.length]} />)}</Pie><Tooltip formatter={(value, _name, item) => [value, item?.payload?.isCount ? '达人数量' : '占比']} /></PieChart></ResponsiveContainer></div><div className="min-w-0 flex-1 space-y-1.5">{chartData.map((item, index) => <div key={item.name} className="flex items-center justify-between gap-2 text-[10px] text-slate-500"><span className="flex min-w-0 items-center gap-1.5 truncate"><i className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ backgroundColor: chartColors[index % chartColors.length] }} />{item.name}</span><b className="text-slate-700">{item.isCount ? `${formatMetric(item.value)} 位` : formatMetric(item.value, '%')}</b></div>)}</div></div>
       )}
     </Card>
   );
@@ -196,13 +198,13 @@ function BudgetCard({ data }: { data: Record<string, unknown> }) {
   );
 }
 
-function ComparisonCard({ comparison, selectedCandidates }: { comparison: Array<Record<string, unknown>>; selectedCandidates: readonly ApiCandidate[] }) {
+function ComparisonCard({ comparison, selectedCandidates, selectedCandidateVersion, reportCandidateVersion }: { comparison: Array<Record<string, unknown>>; selectedCandidates: readonly ApiCandidate[]; selectedCandidateVersion?: number; reportCandidateVersion: number }) {
   const rows = comparison.flatMap(item => {
-    const name = firstText(item, ['nickname', 'name', 'kol_name', 'label']);
+    const name = firstText(item, ['nickname', 'name', 'kol_name', 'platform_account_id', 'label']);
     const score = firstNumber(item, ['total_score', 'score', 'value']);
     return name ? [{ name, score }] : [];
   });
-  const candidates = selectedCandidates.slice(0, 4);
+  const candidates = selectedCandidateVersion === reportCandidateVersion ? selectedCandidates.slice(0, 4) : [];
   return (
     <Card title="候选对比" icon={<CheckCircle2 className="h-3.5 w-3.5" />}>
       {candidates.length > 0 ? <div className="space-y-1.5">{candidates.map(candidate => <div key={candidate.id} className="flex items-center justify-between rounded-lg bg-slate-50 px-2.5 py-2 text-[11px]"><span className="truncate font-medium text-slate-700">#{candidate.rank} {candidate.nickname ?? candidate.kol_id}</span><span className="font-bold text-indigo-600">{formatMetric(candidate.total_score)}</span></div>)}</div> : rows.length > 0 ? <div className="space-y-1.5">{rows.map(row => <div key={row.name} className="flex justify-between rounded-lg bg-slate-50 px-2.5 py-2 text-[11px]"><span>{row.name}</span><b className="text-indigo-600">{formatMetric(row.score)}</b></div>)}</div> : <EmptyData label="尚未选择候选进行对比" />}
@@ -222,7 +224,7 @@ function PanelState({ children }: { children: ReactNode }) {
   return <aside className="flex h-full w-full shrink-0 flex-col overflow-hidden border-l border-slate-200 bg-white shadow-sm xl:w-[420px]"><header className="flex h-14 items-center border-b border-slate-200 px-4"><h2 className="text-xs font-bold uppercase tracking-widest text-slate-800">BI Intelligence Output</h2></header><div className="flex flex-1 items-center justify-center bg-slate-50/40 p-8 text-center text-xs text-slate-500">{children}</div></aside>;
 }
 
-export default function BiReport({ report, candidateVersion, selectedCandidates = [] }: BiReportProps) {
+export default function BiReport({ report, candidateVersion, selectedCandidates = [], selectedCandidateVersion }: BiReportProps) {
   if (!report) return <PanelState>等待生成 KOL 决策报告</PanelState>;
   if (candidateVersion === undefined || report.candidate_version !== candidateVersion) return <PanelState>正在同步最新候选与 BI 报告</PanelState>;
 
@@ -238,7 +240,7 @@ export default function BiReport({ report, candidateVersion, selectedCandidates 
         <AudienceCard data={report.audience_content_fit} />
         <PlatformCard data={report.platform_distribution} />
         <BudgetCard data={report.budget_analysis} />
-        <ComparisonCard comparison={report.comparison} selectedCandidates={selectedCandidates} />
+        <ComparisonCard comparison={report.comparison} selectedCandidates={selectedCandidates} selectedCandidateVersion={selectedCandidateVersion} reportCandidateVersion={report.candidate_version} />
         <RiskCard risks={report.risks} />
         <Card title="AI 结论" icon={<Sparkles className="h-3.5 w-3.5" />}><p className="whitespace-pre-wrap text-[11px] leading-5 text-slate-600">{report.conclusion || '暂未生成 AI 结论'}</p></Card>
         <SourceCard sources={report.sources} />
