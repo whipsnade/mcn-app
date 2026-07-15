@@ -4,7 +4,7 @@ from contextlib import suppress
 from collections.abc import AsyncIterator
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -15,6 +15,7 @@ from app.tasks.events import TaskEventBroker, TaskEventStream
 from app.tasks.repository import TaskRepository
 from app.tasks.schemas import TaskCreate, TaskRead
 from app.tasks.service import TaskService
+from app.tasks.executor import TaskRunner
 
 
 router = APIRouter()
@@ -23,6 +24,10 @@ task_event_broker = TaskEventBroker()
 
 def get_task_event_stream() -> TaskEventStream:
     return TaskEventStream(SessionFactory, TaskRepository, task_event_broker)
+
+
+def get_task_runner(request: Request) -> TaskRunner:
+    return request.app.state.task_runner
 
 
 def encode_sse_event(event: TaskEvent) -> str:
@@ -91,12 +96,14 @@ async def create_task(
     payload: TaskCreate,
     user: FunctionScopedCurrentUser,
     db: Annotated[AsyncSession, Depends(get_db, scope="function")],
+    task_runner: Annotated[TaskRunner, Depends(get_task_runner)],
 ) -> TaskRead:
     try:
         task = await TaskService(db).create(user.id, session_id, payload)
     except LookupError as error:
         raise task_not_found(error) from error
     await db.commit()
+    task_runner.submit(task.id)
     return task_read(task)
 
 
