@@ -16,4 +16,13 @@ describe('CandidateCompare', () => {
     expect(screen.getByText('平台')).toBeVisible();
     expect(screen.getByText('报价波动')).toBeVisible();
   });
+
+  it('extracts readable text from nested risk evidence', () => {
+    render(<CandidateCompare candidates={[{
+      ...candidatePage.items[0],
+      risks: [{ nested: { reason: '内容重复' } }],
+    }]} />);
+
+    expect(screen.getByText('内容重复')).toBeVisible();
+  });
 });

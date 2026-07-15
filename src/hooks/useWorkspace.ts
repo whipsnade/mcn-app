@@ -33,6 +33,7 @@ export function useWorkspace(userId?: string) {
   const [error, setError] = useState<string>();
   const [activeTaskId, setActiveTaskId] = useState<string>();
   const generationRef = useRef(0);
+  const taskCreateInFlightRef = useRef(false);
   const taskRuntime = useTaskStream(activeTaskId);
 
   const hydrateAnalysis = useCallback(async (session: Session, generation: number): Promise<Session> => {
@@ -107,6 +108,7 @@ export function useWorkspace(userId?: string) {
     setLoading(false);
     setBusy(false);
     setActiveTaskId(undefined);
+    taskCreateInFlightRef.current = false;
     if (userId) void load(generation);
     return () => {
       if (generationRef.current === generation) generationRef.current += 1;
@@ -181,11 +183,13 @@ export function useWorkspace(userId?: string) {
   const appendMessage = useCallback(async (content: string) => {
     if (!userId) throw new Error('AUTH_EXPIRED');
     if (!activeSessionId) return;
+    if (taskCreateInFlightRef.current) throw new Error('TASK_IN_PROGRESS');
     const activeSession = sessions.find(session => session.id === activeSessionId);
     if (activeSession?.analysis && taskIsInProgress(activeSession.analysis.status)) {
       throw new Error('TASK_IN_PROGRESS');
     }
     const generation = generationRef.current;
+    taskCreateInFlightRef.current = true;
     setBusy(true);
     setError(undefined);
     try {
@@ -211,6 +215,7 @@ export function useWorkspace(userId?: string) {
       }
       throw reason;
     } finally {
+      taskCreateInFlightRef.current = false;
       if (generationRef.current === generation) setBusy(false);
     }
   }, [activeSessionId, sessions, userId]);

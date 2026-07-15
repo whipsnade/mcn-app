@@ -178,6 +178,31 @@ describe('useWorkspace', () => {
     expect(createTask).toHaveBeenCalledTimes(1);
   });
 
+  it('rejects a second submission while the first task request is still pending', async () => {
+    const pendingTask = deferred<{
+      id: string; session_id: string; status: 'pending'; estimated_points: number; error_code: null; latest_report_id: null;
+    }>();
+    vi.mocked(createTask).mockReturnValueOnce(pendingTask.promise);
+    const { result } = renderHook(() => useWorkspace('user-a'));
+    await waitFor(() => expect(result.current.activeSession?.id).toBe('session-1'));
+
+    let firstSubmission!: Promise<unknown>;
+    act(() => {
+      firstSubmission = result.current.appendMessage('首次提交');
+    });
+    await waitFor(() => expect(createTask).toHaveBeenCalledOnce());
+
+    await expect(result.current.appendMessage('并发重复提交')).rejects.toThrow('TASK_IN_PROGRESS');
+    expect(createTask).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      pendingTask.resolve({
+        id: 'task-1', session_id: 'session-1', status: 'pending', estimated_points: 0, error_code: null, latest_report_id: null,
+      });
+      await firstSubmission;
+    });
+  });
+
   it('restores the matching candidate version and BI report for a historical task', async () => {
     vi.mocked(getSession).mockResolvedValue({
       ...restoredSession,

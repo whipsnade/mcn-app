@@ -14,7 +14,7 @@ from app.tasks.models import AnalysisTask, TaskEvent
 from app.tasks.events import TaskEventBroker, TaskEventStream
 from app.tasks.repository import TaskRepository
 from app.tasks.schemas import TaskCreate, TaskRead
-from app.tasks.service import TaskService
+from app.tasks.service import TaskConflictError, TaskService
 from app.tasks.executor import TaskRunner
 
 
@@ -100,6 +100,8 @@ async def create_task(
 ) -> TaskRead:
     try:
         task = await TaskService(db).create(user.id, session_id, payload)
+    except TaskConflictError as error:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="task_in_progress") from error
     except LookupError as error:
         raise task_not_found(error) from error
     await db.commit()

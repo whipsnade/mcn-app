@@ -14,10 +14,18 @@ function scoreLabel(value: number | null | undefined) {
 }
 
 function riskLabel(candidate: ApiCandidate) {
-  const labels = candidate.risks
-    .map(risk => typeof risk.label === 'string' ? risk.label : null)
-    .filter((label): label is string => label !== null);
-  return labels.length ? labels.join('、') : '暂无';
+  const texts = candidate.risks.flatMap(riskText).filter((value, index, values) => values.indexOf(value) === index);
+  return texts.length ? texts.join('、') : '暂无';
+}
+
+function riskText(value: unknown): string[] {
+  if (typeof value === 'string') return value.trim() ? [value] : [];
+  if (Array.isArray(value)) return value.flatMap(riskText);
+  if (!value || typeof value !== 'object') return [];
+
+  const record = value as Record<string, unknown>;
+  const prioritized = ['label', 'reason', 'message'].flatMap(key => riskText(record[key]));
+  return prioritized.length ? prioritized : Object.values(record).flatMap(riskText);
 }
 
 export default function CandidateCompare({ candidates }: { candidates: ApiCandidate[] }) {

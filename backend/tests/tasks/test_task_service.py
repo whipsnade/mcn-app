@@ -13,7 +13,7 @@ from app.main import create_app
 from app.tasks.models import AnalysisTask, TaskEvent
 from app.tasks.repository import TaskRepository
 from app.tasks.schemas import TaskCreate
-from app.tasks.service import TaskService
+from app.tasks.service import TaskConflictError, TaskService
 from app.tasks.state import TaskStatus
 from app.workspace.models import Message
 from fakes import (
@@ -46,6 +46,21 @@ async def test_create_task_persists_message_task_and_pending_event(
         ("寻找预算内的 B 站科技达人", {"scoring_profile": "balanced"})
     ]
     assert [event.event_type for event in events] == ["task.pending"]
+
+
+@pytest.mark.asyncio
+async def test_create_task_rejects_a_concurrent_active_task_for_the_same_session(
+    db_session, user_factory, workspace_factory
+) -> None:
+    user = await user_factory()
+    workspace = await workspace_factory(user.id)
+    first = TaskService(db_session)
+    await first.create(user.id, workspace.id, TaskCreate(content="第一个任务"))
+
+    with pytest.raises(TaskConflictError, match="task_in_progress"):
+        await TaskService(db_session).create(
+            user.id, workspace.id, TaskCreate(content="重复任务")
+        )
 
 
 @pytest.mark.asyncio
@@ -159,6 +174,12 @@ async def test_task_rest_api_is_owner_scoped_and_cancel_is_request_only(
 
     assert created.status_code == 202
     task_id = created.json()["id"]
+    duplicate = await owner.post(
+        f"/api/v1/sessions/{session_id}/tasks",
+        json={"content": "重复提交"},
+    )
+    assert duplicate.status_code == 409
+    assert duplicate.json()["detail"] == "task_in_progress"
     assert (await owner.get(f"/api/v1/tasks/{task_id}")).status_code == 200
     assert (await outsider.get(f"/api/v1/tasks/{task_id}")).status_code == 404
     assert (await outsider.post(f"/api/v1/tasks/{task_id}/cancel")).status_code == 404

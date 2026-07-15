@@ -1,6 +1,7 @@
 from datetime import UTC, datetime
 from uuid import uuid4
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.tasks.models import AnalysisTask
@@ -15,6 +16,10 @@ def utc_now() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
 
 
+class TaskConflictError(RuntimeError):
+    pass
+
+
 class TaskService:
     def __init__(self, db: AsyncSession) -> None:
         self.db = db
@@ -24,6 +29,24 @@ class TaskService:
         self, user_id: str, session_id: str, payload: TaskCreate
     ) -> AnalysisTask:
         workspace_service = WorkspaceService(self.db)
+        await workspace_service.get_owned_session(user_id, session_id, for_update=True)
+        active_task_id = await self.db.scalar(
+            select(AnalysisTask.id)
+            .where(
+                AnalysisTask.session_id == session_id,
+                AnalysisTask.status.notin_(
+                    [
+                        TaskStatus.COMPLETED,
+                        TaskStatus.FAILED,
+                        TaskStatus.INSUFFICIENT_BALANCE,
+                        TaskStatus.CANCELLED,
+                    ]
+                ),
+            )
+            .limit(1)
+        )
+        if active_task_id is not None:
+            raise TaskConflictError("task_in_progress")
         message = await workspace_service.append_message(
             user_id, session_id, MessageCreate(content=payload.content)
         )
