@@ -71,6 +71,25 @@ async def test_success_charges_ten_exactly_once(db_session, user_factory) -> Non
 
 
 @pytest.mark.asyncio
+async def test_batch_success_charges_each_call_once(db_session, user_factory) -> None:
+    task = await create_analysis_task(db_session, user_factory)
+    await WalletService(db_session).ensure_welcome_grant(task.user_id)
+    transport = FakeMcpTransport(
+        call_result=RemoteToolResult({"items": []}, False, "request-batch-success")
+    )
+    gateway = McpGatewayService(
+        db_session, transport, arguments_loader=MemoryArgumentsLoader(), registry=StaticRegistry()
+    )
+
+    calls = await gateway.execute_batch(tuple(command(task.user_id, task.id) for _ in range(2)))
+    wallet = await db_session.get(Wallet, task.user_id)
+
+    assert tuple(call.status for call in calls) == (McpCallStatus.SETTLED.value,) * 2
+    assert wallet is not None and (wallet.balance, wallet.reserved) == (980, 0)
+    assert transport.call_count == 2
+
+
+@pytest.mark.asyncio
 async def test_failure_releases_and_unknown_retains_reservation(db_session, user_factory) -> None:
     task = await create_analysis_task(db_session, user_factory)
     await WalletService(db_session).ensure_welcome_grant(task.user_id)

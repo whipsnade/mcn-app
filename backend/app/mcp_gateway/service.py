@@ -422,7 +422,7 @@ class McpGatewayService:
 
         # A: creation and every reservation atomically commit before a call can run.
         async with self._transaction():
-            rows = tuple(
+            rows = tuple([
                 await self._calls.prepare(
                     logical_call_id=command.logical_call_id,
                     user_id=command.user_id,
@@ -432,12 +432,12 @@ class McpGatewayService:
                     arguments=command.arguments,
                 )
                 for command in commands
-            )
+            ])
             await self._accounting.reserve_batch(commands[0].user_id, rows)
 
         # B: each successful claim becomes visible before any external request.
         async with self._transaction():
-            claimed = tuple(await self._calls.claim(row.logical_call_id) for row in rows)
+            claimed = tuple([await self._calls.claim(row.logical_call_id) for row in rows])
 
         prepared: dict[str, PreparedMcpInvocation] = {}
         outcomes: dict[str, ToolInvocationOutcome] = {}
