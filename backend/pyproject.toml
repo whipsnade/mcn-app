@@ -13,6 +13,11 @@ dependencies = [
   "cryptography>=44,<47",
   "fastapi>=0.115,<1",
   "greenlet>=3.1,<4",
+  "httpx>=0.28,<1",
+  "jsonschema>=4.23,<5",
+  "mcp>=1.27,<2",
+  "openai>=1,<2",
+  "prometheus-client>=0.21,<1",
   "pydantic-settings>=2.7,<3",
   "PyJWT>=2.10,<3",
   "sqlalchemy>=2.0,<3",
@@ -21,7 +26,6 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-  "httpx>=0.28,<1",
   "pytest>=8.3,<10",
   "pytest-asyncio>=0.25,<2",
   "ruff>=0.9,<1",

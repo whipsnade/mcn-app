@@ -2,7 +2,8 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Index, Numeric, String, Text, UniqueConstraint
+from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Index, Numeric, String, UniqueConstraint
+from sqlalchemy.dialects.mysql import MEDIUMTEXT
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -50,7 +51,7 @@ class Message(Base):
         String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
     )
     role: Mapped[str] = mapped_column(String(16), nullable=False)
-    content: Mapped[str] = mapped_column(Text, nullable=False)
+    content: Mapped[str] = mapped_column(MEDIUMTEXT, nullable=False)
     sequence: Mapped[int] = mapped_column(nullable=False)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)

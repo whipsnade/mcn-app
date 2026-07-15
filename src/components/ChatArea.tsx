@@ -7,13 +7,15 @@ interface ChatAreaProps {
   onSendMessage: (text: string) => Promise<unknown>;
   isAnalyzing: boolean;
   isMockMode: boolean;
+  taskActivity?: string;
 }
 
 export default function ChatArea({
   session,
   onSendMessage,
   isAnalyzing,
-  isMockMode
+  isMockMode,
+  taskActivity,
 }: ChatAreaProps) {
   const [inputText, setInputText] = useState('');
   const chatEndRef = useRef<HTMLDivElement>(null);
@@ -95,6 +97,14 @@ export default function ChatArea({
             AI 投流与 KOL 决策会话 {session.id} 已载入
           </div>
         </div>
+
+        {taskActivity && (
+          <div className="flex justify-center" role="status">
+            <div className="rounded-full border border-indigo-100 bg-indigo-50 px-3.5 py-1 text-[10px] font-medium text-indigo-500">
+              {taskActivity}
+            </div>
+          </div>
+        )}
 
         {session.messages.map((msg) => {
           const isAI = msg.sender === 'ai';
@@ -221,7 +231,6 @@ export default function ChatArea({
             onChange={(e) => setInputText(e.target.value)}
             onKeyDown={handleKeyDown}
             placeholder={isAnalyzing ? "正在进行深度多维数据分析中..." : "输入消息并向 AI 分析师提问（例如：按互动率和预算匹配度重新排序）..."}
-            disabled={isAnalyzing}
             className="flex-1 bg-transparent border-none focus:ring-0 px-3 text-xs md:text-sm text-slate-700 placeholder-slate-400 py-2 font-normal outline-none resize-none max-h-20"
           />
 

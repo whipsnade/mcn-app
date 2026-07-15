@@ -34,4 +34,22 @@ describe('toSession', () => {
     expect(session.messages[0].text).toBe('寻找达人');
     expect('mcn' in session).toBe(false);
   });
+
+  it('does not expose a historical BI report for a different candidate version', () => {
+    const session = toSession({
+      id: 's-2', title: '示例品牌-夏季选人', brand: '示例品牌', campaign_name: '夏季选人',
+      status: 'completed', platforms: ['bilibili'], category: '美妆护肤', target_audience: '18-30 岁女性',
+      budget_min: null, budget_max: null, filters: {}, is_starred: false, messages: [],
+      latest_task: { id: 'task-2', status: 'completed', completed_at: '2026-07-15T10:00:00Z' },
+      latest_candidates: { task_id: 'task-2', version: 2, total: 3 },
+      latest_report: {
+        id: 'report-1', task_id: 'task-2', report_version: 1, candidate_version: 1,
+        status: 'completed', generated_at: '2026-07-15T09:00:00Z',
+      },
+      created_at: '2026-07-14T10:00:00Z', updated_at: '2026-07-15T10:00:00Z',
+    });
+
+    expect(session.analysis?.candidateVersion).toBe(2);
+    expect(session.analysis?.reportId).toBeUndefined();
+  });
 });

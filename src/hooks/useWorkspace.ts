@@ -1,14 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import {
-  appendMessage as appendSessionMessage,
   createSession as createSessionRequest,
   getSession,
   listSessions,
   updateSession as updateSessionRequest,
 } from '../api/sessions';
+import { createTask, getCandidates, getReport } from '../api/tasks';
 import type { CreateSessionInput } from '../api/contracts';
-import type { Session } from '../types';
+import { useTaskStream } from './useTaskStream';
+import type { Message, Session } from '../types';
 
 
 function replaceSession(sessions: Session[], nextSession: Session): Session[] {
@@ -19,6 +20,10 @@ function replaceSession(sessions: Session[], nextSession: Session): Session[] {
   return sessions.map(session => session.id === nextSession.id ? nextSession : session);
 }
 
+function taskIsInProgress(status: string | undefined): boolean {
+  return !['completed', 'failed', 'insufficient_balance', 'cancelled'].includes(status ?? 'running');
+}
+
 
 export function useWorkspace(userId?: string) {
   const [sessions, setSessions] = useState<Session[]>([]);
@@ -26,17 +31,58 @@ export function useWorkspace(userId?: string) {
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
+  const [activeTaskId, setActiveTaskId] = useState<string>();
   const generationRef = useRef(0);
+  const taskCreateInFlightRef = useRef(false);
+  const taskRuntime = useTaskStream(activeTaskId);
+
+  const hydrateAnalysis = useCallback(async (session: Session, generation: number): Promise<Session> => {
+    const analysis = session.analysis;
+    if (!analysis || generationRef.current !== generation) return session;
+    const [candidatePage, report] = await Promise.all([
+      analysis.candidateVersion === undefined ? Promise.resolve(undefined) : getCandidates(analysis.taskId),
+      analysis.reportId === undefined ? Promise.resolve(undefined) : getReport(analysis.reportId),
+    ]);
+    if (generationRef.current !== generation) return session;
+    const resolvedCandidateVersion = candidatePage?.version ?? analysis.candidateVersion;
+    const matchingReport = report?.candidate_version === resolvedCandidateVersion ? report : undefined;
+    return {
+      ...session,
+      analysis: {
+        ...analysis,
+        candidateVersion: resolvedCandidateVersion,
+        reportId: matchingReport?.id,
+      },
+      candidates: candidatePage?.items.map(candidate => ({
+        id: candidate.id,
+        kolId: candidate.kol_id,
+        platform: candidate.platform,
+        platformAccountId: candidate.platform_account_id,
+        nickname: candidate.nickname ?? undefined,
+        profileUrl: candidate.profile_url ?? undefined,
+        rank: candidate.rank,
+        totalScore: candidate.total_score,
+        scores: candidate.scores,
+        matchedConditions: candidate.matched_conditions,
+        risks: candidate.risks,
+        recommendation: candidate.recommendation,
+        metrics: candidate.metrics,
+      })),
+      biReport: matchingReport,
+    };
+  }, []);
 
   const load = useCallback(async (generation: number) => {
     setLoading(true);
     setError(undefined);
     try {
       const loaded = await listSessions();
-      const first = loaded[0] ? await getSession(loaded[0].id) : undefined;
+      const rawFirst = loaded[0] ? await getSession(loaded[0].id) : undefined;
+      const first = rawFirst ? await hydrateAnalysis(rawFirst, generation) : undefined;
       if (generationRef.current !== generation) return;
       setSessions(first ? replaceSession(loaded, first) : loaded);
       setActiveSessionId(first?.id);
+      setActiveTaskId(first?.analysis?.taskId);
     } catch (reason) {
       if (generationRef.current === generation) {
         setError(reason instanceof Error ? reason.message : '加载会话失败');
@@ -44,7 +90,7 @@ export function useWorkspace(userId?: string) {
     } finally {
       if (generationRef.current === generation) setLoading(false);
     }
-  }, []);
+  }, [hydrateAnalysis]);
 
   useEffect(() => {
     const generation = ++generationRef.current;
@@ -53,6 +99,8 @@ export function useWorkspace(userId?: string) {
     setError(undefined);
     setLoading(false);
     setBusy(false);
+    setActiveTaskId(undefined);
+    taskCreateInFlightRef.current = false;
     if (userId) void load(generation);
     return () => {
       if (generationRef.current === generation) generationRef.current += 1;
@@ -70,16 +118,17 @@ export function useWorkspace(userId?: string) {
     setActiveSessionId(id);
     setError(undefined);
     try {
-      const loaded = await getSession(id);
+      const loaded = await hydrateAnalysis(await getSession(id), generation);
       if (generationRef.current === generation) {
         setSessions(current => replaceSession(current, loaded));
+        setActiveTaskId(loaded.analysis?.taskId);
       }
     } catch (reason) {
       if (generationRef.current === generation) {
         setError(reason instanceof Error ? reason.message : '恢复会话失败');
       }
     }
-  }, [userId]);
+  }, [hydrateAnalysis, userId]);
 
   const createSession = useCallback(async (input: CreateSessionInput) => {
     if (!userId) throw new Error('AUTH_EXPIRED');
@@ -91,6 +140,7 @@ export function useWorkspace(userId?: string) {
       if (generationRef.current !== generation) throw new Error('STALE_WORKSPACE_REQUEST');
       setSessions(current => replaceSession(current, created));
       setActiveSessionId(created.id);
+      setActiveTaskId(undefined);
       return created;
     } catch (reason) {
       if (generationRef.current === generation) {
@@ -125,35 +175,133 @@ export function useWorkspace(userId?: string) {
   const appendMessage = useCallback(async (content: string) => {
     if (!userId) throw new Error('AUTH_EXPIRED');
     if (!activeSessionId) return;
+    if (taskCreateInFlightRef.current) throw new Error('TASK_IN_PROGRESS');
+    const activeSession = sessions.find(session => session.id === activeSessionId);
+    if (activeSession?.analysis && taskIsInProgress(activeSession.analysis.status)) {
+      throw new Error('TASK_IN_PROGRESS');
+    }
     const generation = generationRef.current;
+    taskCreateInFlightRef.current = true;
     setBusy(true);
     setError(undefined);
     try {
-      const updated = await appendSessionMessage(activeSessionId, content);
+      const task = await createTask(activeSessionId, { content });
       if (generationRef.current !== generation) throw new Error('STALE_WORKSPACE_REQUEST');
-      setSessions(current => replaceSession(current, updated));
-      return updated;
+      const pendingMessage: Message = {
+        id: `pending-${task.id}`,
+        sender: 'user',
+        text: content,
+        timestamp: new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }),
+      };
+      setSessions(current => current.map(session => session.id === activeSessionId ? {
+        ...session,
+        status: 'analyzing',
+        messages: [...session.messages, pendingMessage],
+        analysis: { taskId: task.id, status: task.status },
+      } : session));
+      setActiveTaskId(task.id);
+      return task;
     } catch (reason) {
       if (generationRef.current === generation) {
         setError(reason instanceof Error ? reason.message : '保存消息失败');
       }
       throw reason;
     } finally {
+      taskCreateInFlightRef.current = false;
       if (generationRef.current === generation) setBusy(false);
     }
-  }, [activeSessionId, userId]);
+  }, [activeSessionId, sessions, userId]);
+
+  useEffect(() => {
+    if (!taskRuntime || !activeTaskId) return;
+    const generation = generationRef.current;
+    setSessions(current => current.map(session => session.analysis?.taskId === activeTaskId ? {
+      ...session,
+      status: taskRuntime.status === 'completed' ? 'completed' : session.status,
+      analysis: {
+        ...session.analysis,
+        status: taskRuntime.status ?? session.analysis.status,
+        candidateVersion: taskRuntime.candidateVersion ?? session.analysis.candidateVersion,
+        reportId: taskRuntime.visibleReportId ?? (
+          taskRuntime.candidateVersion !== undefined
+            && taskRuntime.candidateVersion !== session.analysis.candidateVersion
+            ? undefined
+            : session.analysis.reportId
+        ),
+      },
+      biReport: taskRuntime.candidateVersion !== undefined
+        && session.biReport?.candidate_version !== taskRuntime.candidateVersion
+        ? undefined
+        : session.biReport,
+      candidates: taskRuntime.candidateVersion !== undefined
+        && session.analysis.candidateVersion !== taskRuntime.candidateVersion
+        ? undefined
+        : session.candidates,
+    } : session));
+    if (taskRuntime.candidateVersion !== undefined) {
+      const requestedTaskId = activeTaskId;
+      const requestedCandidateVersion = taskRuntime.candidateVersion;
+      void getCandidates(requestedTaskId)
+        .then(page => {
+          if (generationRef.current !== generation) return;
+          setSessions(current => current.map(session => session.analysis?.taskId === requestedTaskId
+            && session.analysis.candidateVersion === requestedCandidateVersion ? {
+            ...session,
+            candidates: page.items.map(candidate => ({
+              id: candidate.id,
+              kolId: candidate.kol_id,
+              platform: candidate.platform,
+              platformAccountId: candidate.platform_account_id,
+              nickname: candidate.nickname ?? undefined,
+              profileUrl: candidate.profile_url ?? undefined,
+              rank: candidate.rank,
+              totalScore: candidate.total_score,
+              scores: candidate.scores,
+              matchedConditions: candidate.matched_conditions,
+              risks: candidate.risks,
+              recommendation: candidate.recommendation,
+              metrics: candidate.metrics,
+            })),
+          } : session));
+        })
+        .catch(() => undefined);
+    }
+    if (taskRuntime.visibleReportId) {
+      const requestedTaskId = activeTaskId;
+      const requestedCandidateVersion = taskRuntime.candidateVersion;
+      const requestedReportId = taskRuntime.visibleReportId;
+      void getReport(requestedReportId)
+        .then(report => {
+          if (generationRef.current !== generation) return;
+          setSessions(current => current.map(session => session.analysis?.taskId === requestedTaskId
+            && session.analysis.candidateVersion === requestedCandidateVersion
+            && session.analysis.reportId === requestedReportId
+            && report.candidate_version === requestedCandidateVersion ? {
+            ...session,
+            biReport: report,
+          } : session));
+        })
+        .catch(() => undefined);
+    }
+  }, [activeTaskId, taskRuntime]);
 
   const activeSession = useMemo(
     () => sessions.find(session => session.id === activeSessionId),
     [activeSessionId, sessions],
+  );
+  const isAnalyzing = busy || Boolean(
+    activeSession?.analysis && taskIsInProgress(taskRuntime?.status ?? activeSession.analysis.status),
   );
 
   return {
     sessions,
     activeSession,
     activeSessionId,
+    activeTaskId,
+    taskRuntime,
     loading,
     busy,
+    isAnalyzing,
     error,
     reload,
     selectSession,

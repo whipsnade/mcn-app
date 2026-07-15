@@ -4,6 +4,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from app.reporting.schemas import BiReportSummary, CandidateVersionSummary, TaskAnalysisSummary
+
 
 Platform = Literal["xiaohongshu", "douyin", "bilibili", "weibo", "wechat"]
 
@@ -70,5 +72,8 @@ class SessionRead(BaseModel):
     filters: dict[str, Any]
     is_starred: bool
     messages: list[MessageRead]
+    latest_task: TaskAnalysisSummary | None = None
+    latest_candidates: CandidateVersionSummary | None = None
+    latest_report: BiReportSummary | None = None
     created_at: datetime
     updated_at: datetime
