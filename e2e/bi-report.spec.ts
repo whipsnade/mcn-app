@@ -36,6 +36,10 @@ test('restored matching candidate and report versions render the KOL decision BI
   } }));
 
   await page.reload();
+  const mobileNavigation = page.getByRole('navigation', { name: '移动工作区导航' });
+  if (await mobileNavigation.isVisible()) {
+    await mobileNavigation.getByRole('button', { name: 'BI 报告' }).click();
+  }
   for (const title of ['任务概览', '评分构成', '受众与内容匹配', '平台分布', '预算与性价比', '候选对比', '风险与数据质量', 'AI 结论', '数据来源']) {
     await expect(page.getByText(title, { exact: true })).toBeVisible();
   }

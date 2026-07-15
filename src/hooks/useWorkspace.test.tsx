@@ -294,12 +294,20 @@ describe('useWorkspace', () => {
     rerender();
     await waitFor(() => expect(getCandidates).toHaveBeenCalledTimes(1));
 
+    await act(async () => {
+      oldCandidates.resolve(candidatePage(1, 'kol-old'));
+      oldReport.resolve(report(1));
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(result.current.activeSession?.candidates?.[0]?.kolId).toBe('kol-old'));
+
     vi.mocked(useTaskStream).mockReturnValue({
       taskId: 'task-1', lastEventId: 2, assistantDraft: '', candidateVersion: 2,
       visibleReportId: 'report-2', connection: 'connected',
     });
     rerender();
     await waitFor(() => expect(getCandidates).toHaveBeenCalledTimes(2));
+    expect(result.current.activeSession?.candidates).toBeUndefined();
 
     await act(async () => {
       newCandidates.resolve(candidatePage(2, 'kol-new'));
@@ -307,12 +315,6 @@ describe('useWorkspace', () => {
       await Promise.resolve();
     });
     await waitFor(() => expect(result.current.activeSession?.biReport?.id).toBe('report-2'));
-
-    await act(async () => {
-      oldCandidates.resolve(candidatePage(1, 'kol-old'));
-      oldReport.resolve(report(1));
-      await Promise.resolve();
-    });
 
     expect(result.current.activeSession?.candidates?.[0]?.kolId).toBe('kol-new');
     expect(result.current.activeSession?.biReport?.id).toBe('report-2');

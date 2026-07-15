@@ -233,6 +233,10 @@ export function useWorkspace(userId?: string) {
         && session.biReport?.candidate_version !== taskRuntime.candidateVersion
         ? undefined
         : session.biReport,
+      candidates: taskRuntime.candidateVersion !== undefined
+        && session.analysis.candidateVersion !== taskRuntime.candidateVersion
+        ? undefined
+        : session.candidates,
     } : session));
     if (taskRuntime.candidateVersion !== undefined) {
       const requestedTaskId = activeTaskId;
