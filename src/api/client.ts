@@ -29,6 +29,20 @@ export async function refreshAccessToken(): Promise<string | null> {
   return refreshPromise;
 }
 
+export async function authorizedFetch(
+  path: string,
+  init: RequestInit = {},
+  retry = true,
+): Promise<Response> {
+  const headers = new Headers(init.headers);
+  if (accessToken) headers.set('Authorization', `Bearer ${accessToken}`);
+  const response = await fetch(path, { ...init, headers, credentials: 'include' });
+  if (response.status === 401 && retry && await refreshAccessToken()) {
+    return authorizedFetch(path, init, false);
+  }
+  return response;
+}
+
 export async function request<T>(
   path: string,
   init: RequestInit = {},
@@ -36,11 +50,7 @@ export async function request<T>(
 ): Promise<T> {
   const headers = new Headers(init.headers);
   if (init.body !== undefined) headers.set('Content-Type', 'application/json');
-  if (accessToken) headers.set('Authorization', `Bearer ${accessToken}`);
-  const response = await fetch(path, { ...init, headers, credentials: 'include' });
-  if (response.status === 401 && retry && await refreshAccessToken()) {
-    return request<T>(path, init, false);
-  }
+  const response = await authorizedFetch(path, { ...init, headers }, retry);
   if (!response.ok) {
     const body = await response.json().catch(() => ({ detail: `HTTP_${response.status}` }));
     throw new Error(body.detail ?? `HTTP_${response.status}`);

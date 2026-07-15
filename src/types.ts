@@ -89,6 +89,41 @@ export interface Session {
   updatedAt: string;
   mcn?: string;
   kols?: string[];
+  analysis?: SessionAnalysis;
+  candidates?: KolCandidate[];
+  biReport?: AnalysisBiReport;
+}
+
+export interface SessionAnalysis {
+  taskId: string;
+  status: string;
+  candidateVersion?: number;
+  reportId?: string;
+}
+
+export interface KolCandidate {
+  id: string;
+  kolId: string;
+  platform: string;
+  platformAccountId: string;
+  nickname?: string;
+  profileUrl?: string;
+  rank: number;
+  totalScore: number;
+  scores: Record<string, number | null>;
+  matchedConditions: string[];
+  risks: Array<Record<string, unknown>>;
+  recommendation: string;
+}
+
+export interface AnalysisBiReport {
+  id: string;
+  taskId: string;
+  reportVersion: number;
+  candidateVersion: number;
+  overview: Record<string, unknown>;
+  conclusion: string;
+  generatedAt: string;
 }
 
 export interface Account {

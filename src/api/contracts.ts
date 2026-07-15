@@ -39,8 +39,100 @@ export interface ApiSession {
   filters: Record<string, unknown>;
   is_starred: boolean;
   messages: ApiMessage[];
+  latest_task?: ApiTaskSummary | null;
+  latest_candidates?: ApiCandidateVersionSummary | null;
+  latest_report?: ApiBiReportSummary | null;
   created_at: string;
   updated_at: string;
+}
+
+export type ApiTaskStatus =
+  | 'pending'
+  | 'planning'
+  | 'running'
+  | 'completed'
+  | 'failed'
+  | 'insufficient_balance'
+  | 'interrupted'
+  | 'cancelled';
+
+export interface ApiTask {
+  id: string;
+  session_id: string;
+  status: ApiTaskStatus;
+  estimated_points: number;
+  error_code: string | null;
+  latest_report_id: string | null;
+}
+
+export interface ApiTaskSummary {
+  id: string;
+  status: ApiTaskStatus;
+  completed_at: string | null;
+}
+
+export interface ApiCandidateVersionSummary {
+  task_id: string;
+  version: number;
+  total: number;
+}
+
+export interface ApiBiReportSummary {
+  id: string;
+  task_id: string;
+  report_version: number;
+  candidate_version: number;
+  status: string;
+  generated_at: string;
+}
+
+export interface ApiCandidate {
+  id: string;
+  kol_id: string;
+  platform: string;
+  platform_account_id: string;
+  nickname: string | null;
+  profile_url: string | null;
+  rank: number;
+  total_score: number;
+  scores: Record<string, number | null>;
+  matched_conditions: string[];
+  risks: Array<Record<string, unknown>>;
+  recommendation: string;
+}
+
+export interface ApiCandidatePage {
+  task_id: string;
+  version: number;
+  total: number;
+  items: ApiCandidate[];
+}
+
+export interface ApiBiReport {
+  id: string;
+  task_id: string;
+  report_version: number;
+  candidate_version: number;
+  overview: Record<string, unknown>;
+  score_composition: Array<Record<string, unknown>>;
+  audience_content_fit: Record<string, unknown>;
+  platform_distribution: Array<Record<string, unknown>>;
+  budget_analysis: Record<string, unknown>;
+  comparison: Array<Record<string, unknown>>;
+  risks: Array<Record<string, unknown>>;
+  conclusion: string;
+  sources: Array<Record<string, unknown>>;
+  generated_at: string;
+}
+
+export interface ApiFavorite {
+  kol_id: string;
+  platform: string;
+  platform_account_id: string;
+  profile_url: string | null;
+  note: string | null;
+  source_task_id: string | null;
+  created_at: string;
 }
 
 export interface CreateSessionInput {
