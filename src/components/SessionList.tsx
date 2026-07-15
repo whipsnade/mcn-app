@@ -51,7 +51,7 @@ export default function SessionList({
   const handleStartEdit = (session: Session) => {
     setEditingSessionId(session.id);
     setEditBrand(session.brand);
-    setEditCampaignName(session.campaignName);
+    setEditCampaignName(session.campaignName ?? '');
   };
 
   const handleSaveEdit = (id: string) => {
@@ -75,7 +75,7 @@ export default function SessionList({
     const query = searchQuery.toLowerCase();
     const matchMeta = 
       s.brand.toLowerCase().includes(query) ||
-      s.campaignName.toLowerCase().includes(query) ||
+      (s.campaignName ?? '').toLowerCase().includes(query) ||
       s.title.toLowerCase().includes(query) ||
       s.category.toLowerCase().includes(query) ||
       s.targetAudience.toLowerCase().includes(query);
@@ -233,7 +233,7 @@ export default function SessionList({
                 ) : (
                   <div className="flex items-center justify-between w-full">
                     <span className={`font-semibold text-xs truncate max-w-[140px] ${isActive ? 'text-indigo-800' : 'text-slate-800'}`}>
-                      {session.brand.split(' ')[0]} - {session.campaignName}
+                      {session.brand.split(' ')[0]}{session.campaignName ? ` - ${session.campaignName}` : ''}
                     </span>
                     <div className="flex items-center gap-1 shrink-0">
                       <button

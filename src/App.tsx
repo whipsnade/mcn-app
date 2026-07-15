@@ -70,7 +70,7 @@ export default function App() {
   const handleCreateSession = async (data: NewSessionData) => {
     await workspace.createSession({
       brand: data.brand,
-      campaign_name: data.campaignName,
+      campaign_name: data.campaignName.trim() || null,
       platforms: data.platforms,
       category: data.category,
       target_audience: data.targetAudience,
@@ -95,7 +95,7 @@ export default function App() {
     await workspace.updateSession(id, {
       brand,
       campaign_name: campaignName,
-      title: `${brand}-${campaignName}`,
+      title: campaignName ? `${brand}-${campaignName}` : brand,
     });
   };
 

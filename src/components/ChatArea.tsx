@@ -66,7 +66,7 @@ export default function ChatArea({
         <div>
           <div className="flex items-center gap-2">
             <h1 className="text-xs font-bold text-slate-800 tracking-tight font-display">
-              {session.brand.split(' ')[0]} - {session.campaignName}
+              {session.brand.split(' ')[0]}{session.campaignName ? ` - ${session.campaignName}` : ''}
             </h1>
             <span className="text-[9px] bg-slate-100 text-slate-500 font-mono px-1.5 py-0.5 rounded border border-slate-200/40">
               {session.id}

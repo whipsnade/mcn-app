@@ -29,7 +29,7 @@ export interface ApiSession {
   id: string;
   title: string;
   brand: string;
-  campaign_name: string;
+  campaign_name: string | null;
   status: 'draft' | 'analyzing' | 'completed' | 'archived';
   platforms: string[];
   category: string;
@@ -143,7 +143,7 @@ export interface ApiFavorite {
 
 export interface CreateSessionInput {
   brand: string;
-  campaign_name: string;
+  campaign_name: string | null;
   platforms: string[];
   category: string;
   target_audience: string;

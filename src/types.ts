@@ -74,7 +74,7 @@ export interface Session {
   id: string;
   title: string;
   brand: string;
-  campaignName: string;
+  campaignName: string | null;
   status: 'completed' | 'analyzing' | 'draft' | 'archived';
   platform: string;
   category: string;
