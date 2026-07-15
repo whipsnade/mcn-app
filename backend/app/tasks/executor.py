@@ -13,13 +13,13 @@ from app.orchestration.schemas import ToolPlan
 class TaskStore(Protocol):
     async def claim_lease(self, task_id: str, worker_id: str, lease_seconds: int) -> Any: ...
 
-    async def save_plan(self, task_id: str, worker_id: str, plan_json: dict[str, Any]) -> None: ...
+    async def save_plan(self, task_id: str, worker_id: str, plan_json: dict[str, Any]) -> bool: ...
 
     async def cancel_requested(self, task_id: str) -> bool: ...
 
     async def mark_cancelled(self, task_id: str, worker_id: str) -> None: ...
 
-    async def renew_lease(self, task_id: str, worker_id: str, lease_seconds: int) -> None: ...
+    async def renew_lease(self, task_id: str, worker_id: str, lease_seconds: int) -> bool: ...
 
     async def mark_completed(self, task_id: str, worker_id: str) -> None: ...
 
@@ -70,16 +70,29 @@ class TaskExecutor:
         self.gateway = gateway
         self.worker_id = worker_id
         self.lease_seconds = lease_seconds
-        self.heartbeat_seconds = heartbeat_seconds or max(1.0, lease_seconds / 3)
+        self.heartbeat_seconds = (
+            heartbeat_seconds if heartbeat_seconds is not None else lease_seconds / 3
+        )
+        if self.heartbeat_seconds <= 0 or self.heartbeat_seconds >= lease_seconds:
+            raise ValueError("heartbeat_seconds_must_be_less_than_lease_seconds")
         self.checkpoint = checkpoint
 
     async def run(self, task_id: str) -> None:
         task = await self.repository.claim_lease(task_id, self.worker_id, self.lease_seconds)
         if task is None:
             return
+        stop_heartbeat = asyncio.Event()
+        lease_lost = asyncio.Event()
+        heartbeat = asyncio.create_task(
+            self._renew_lease_until_stopped(task.id, stop_heartbeat, lease_lost)
+        )
         try:
             plan = await self._load_or_create_plan(task)
+            if plan is None or lease_lost.is_set():
+                return
             for batch in build_execution_batches(plan):
+                if lease_lost.is_set():
+                    return
                 if await self.repository.cancel_requested(task.id):
                     await self.repository.mark_cancelled(task.id, self.worker_id)
                     return
@@ -97,7 +110,7 @@ class TaskExecutor:
                     )
                     for step in batch.steps
                 )
-                rows = await self._execute_batch_with_heartbeat(task.id, commands)
+                rows = await self.gateway.execute_batch(commands)
                 await self.checkpoint("after_mcp_result")
                 statuses = {getattr(row, "status", None) for row in rows}
                 if statuses & {"unknown", "planned", "reserved", "running", "succeeded"}:
@@ -107,7 +120,10 @@ class TaskExecutor:
                     await self.repository.mark_failed(task.id, self.worker_id, "mcp_call_failed")
                     return
                 await self.checkpoint("after_settle")
-                await self.repository.renew_lease(task.id, self.worker_id, self.lease_seconds)
+                if not await self.repository.renew_lease(
+                    task.id, self.worker_id, self.lease_seconds
+                ):
+                    return
             # Task 9 supplies durable candidate/BI artifacts. Checkpoints make
             # their future persistence boundaries recoverable now.
             await self.checkpoint("after_candidates")
@@ -119,35 +135,35 @@ class TaskExecutor:
         except Exception as error:
             await self.repository.mark_failed(task.id, self.worker_id, type(error).__name__)
         finally:
+            stop_heartbeat.set()
+            heartbeat.cancel()
+            await asyncio.gather(heartbeat, return_exceptions=True)
             await self.repository.release_lease(task.id, self.worker_id)
 
-    async def _load_or_create_plan(self, task: Any) -> ToolPlan:
+    async def _load_or_create_plan(self, task: Any) -> ToolPlan | None:
         if task.plan_json is not None:
             return ToolPlan.model_validate(task.plan_json)
         context = await self.context_builder.build(task.user_id, task.session_id)
         plan_for = getattr(self.planner, "plan_for", None)
         plan = await plan_for(context) if plan_for is not None else await self.planner.plan(context)
-        await self.repository.save_plan(task.id, self.worker_id, plan.model_dump(mode="json"))
+        if not await self.repository.save_plan(
+            task.id, self.worker_id, plan.model_dump(mode="json")
+        ):
+            return None
         return plan
 
-    async def _execute_batch_with_heartbeat(
-        self, task_id: str, commands: tuple[ExecuteMcpCall, ...]
-    ) -> tuple[Any, ...]:
-        stop = asyncio.Event()
-        heartbeat = asyncio.create_task(self._renew_lease_until_stopped(task_id, stop))
-        try:
-            return await self.gateway.execute_batch(commands)
-        finally:
-            stop.set()
-            heartbeat.cancel()
-            await asyncio.gather(heartbeat, return_exceptions=True)
-
-    async def _renew_lease_until_stopped(self, task_id: str, stop: asyncio.Event) -> None:
+    async def _renew_lease_until_stopped(
+        self, task_id: str, stop: asyncio.Event, lease_lost: asyncio.Event
+    ) -> None:
         while not stop.is_set():
             try:
                 await asyncio.wait_for(stop.wait(), timeout=self.heartbeat_seconds)
             except TimeoutError:
-                await self.repository.renew_lease(task_id, self.worker_id, self.lease_seconds)
+                if not await self.repository.renew_lease(
+                    task_id, self.worker_id, self.lease_seconds
+                ):
+                    lease_lost.set()
+                    return
 
 
 class TaskRunner:

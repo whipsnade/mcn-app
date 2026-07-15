@@ -87,16 +87,17 @@ class TaskRepository:
         await self.db.flush()
         return task
 
-    async def save_plan(self, task_id: str, worker_id: str, plan_json: dict[str, Any]) -> None:
+    async def save_plan(self, task_id: str, worker_id: str, plan_json: dict[str, Any]) -> bool:
         task = await self._locked(task_id)
         if not self._owns_active_lease(task, worker_id):
-            return
+            return False
         task.plan_json = plan_json
         task.plan_version = "planner_v1"
         task.status = TaskStatus.RUNNING
         task.updated_at = utc_now()
         await self.append_event(task.id, task.user_id, TaskEventType.PLAN_READY, {"version": "planner_v1"})
         await self.db.flush()
+        return True
 
     async def cancel_requested(self, task_id: str) -> bool:
         return bool(
@@ -105,14 +106,15 @@ class TaskRepository:
             )
         )
 
-    async def renew_lease(self, task_id: str, worker_id: str, lease_seconds: int) -> None:
+    async def renew_lease(self, task_id: str, worker_id: str, lease_seconds: int) -> bool:
         task = await self._locked(task_id)
         if not self._owns_active_lease(task, worker_id):
-            return
+            return False
         now = utc_now()
         task.lease_expires_at = now + timedelta(seconds=lease_seconds)
         task.updated_at = now
         await self.db.flush()
+        return True
 
     async def mark_completed(self, task_id: str, worker_id: str) -> None:
         await self._mark_terminal(task_id, worker_id, TaskStatus.COMPLETED, TaskEventType.TASK_COMPLETED)

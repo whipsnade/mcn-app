@@ -2,7 +2,7 @@ import asyncio
 from collections import defaultdict
 from collections.abc import AsyncIterator, Callable, Coroutine
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
@@ -36,24 +36,28 @@ class MemoryExecutionRepository:
         self.events: list[str] = []
         self.cancel_count = 0
         self.renew_count = 0
+        self.allow_renew = True
 
     async def claim_lease(self, task_id: str, worker_id: str, lease_seconds: int):
         if task_id != self.task.id or self.task.status in {TaskStatus.COMPLETED, TaskStatus.CANCELLED}:
             return None
-        if self.task.lease_owner is not None:
+        now = datetime.now(UTC).replace(tzinfo=None)
+        if self.task.lease_owner is not None and self.task.lease_expires_at is not None and self.task.lease_expires_at > now:
             return None
         self.task.lease_owner = worker_id
-        self.task.lease_expires_at = datetime.now(UTC).replace(tzinfo=None)
+        self.task.lease_expires_at = now + timedelta(seconds=lease_seconds)
         if self.task.status == TaskStatus.PENDING:
             self.task.status = TaskStatus.PLANNING
         return self.task
 
-    async def save_plan(self, task_id: str, worker_id: str, plan_json: dict[str, Any]) -> None:
+    async def save_plan(self, task_id: str, worker_id: str, plan_json: dict[str, Any]) -> bool:
         assert task_id == self.task.id
-        assert self.task.lease_owner == worker_id
+        if self.task.lease_owner != worker_id or self.task.lease_expires_at <= datetime.now(UTC).replace(tzinfo=None):
+            return False
         self.task.plan_json = plan_json
         self.task.status = TaskStatus.RUNNING
         self.events.append("plan.ready")
+        return True
 
     async def cancel_requested(self, task_id: str) -> bool:
         assert task_id == self.task.id
@@ -65,10 +69,15 @@ class MemoryExecutionRepository:
         self.task.status = TaskStatus.CANCELLED
         self.events.append("task.cancelled")
 
-    async def renew_lease(self, task_id: str, worker_id: str, lease_seconds: int) -> None:
+    async def renew_lease(self, task_id: str, worker_id: str, lease_seconds: int) -> bool:
         assert task_id == self.task.id
-        assert self.task.lease_owner == worker_id
+        if not self.allow_renew or self.task.lease_owner != worker_id:
+            return False
         self.renew_count += 1
+        self.task.lease_expires_at = datetime.now(UTC).replace(tzinfo=None) + timedelta(
+            seconds=lease_seconds
+        )
+        return True
 
     async def mark_completed(self, task_id: str, worker_id: str) -> None:
         assert task_id == self.task.id
@@ -152,6 +161,9 @@ class FakeExecutionScenario:
                 ),
             ),
         )
+        self.context_started = asyncio.Event()
+        self.context_release = asyncio.Event()
+        self.context_release.set()
         self.executor = TaskExecutor(
             repository=self.repository,
             context_builder=self,
@@ -168,7 +180,15 @@ class FakeExecutionScenario:
         return self.repository.task
 
     async def build(self, user_id: str, session_id: str):
+        self.context_started.set()
+        await self.context_release.wait()
         return {"user_id": user_id, "session_id": session_id}
+
+    def block_context(self) -> None:
+        self.context_release.clear()
+
+    def release_context(self) -> None:
+        self.context_release.set()
 
     async def plan_for(self, context):
         return self.plan

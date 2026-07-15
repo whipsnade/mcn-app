@@ -73,6 +73,37 @@ async def test_executor_renews_lease_while_mcp_batch_is_running() -> None:
 
 
 @pytest.mark.asyncio
+async def test_lost_lease_during_slow_planning_never_enters_mcp_gateway() -> None:
+    scenario = FakeExecutionScenario()
+    scenario.repository.allow_renew = False
+    scenario.block_context()
+    old_execution = asyncio.create_task(scenario.executor.run(scenario.task.id))
+    await scenario.context_started.wait()
+
+    await asyncio.sleep(0.04)
+    claimed = await scenario.repository.claim_lease(scenario.task.id, "new-worker", 1)
+    assert claimed is not None
+    scenario.release_context()
+    await old_execution
+
+    assert scenario.gateway.successful_logical_calls == 0
+
+
+def test_default_heartbeat_is_strictly_shorter_than_one_second_lease() -> None:
+    scenario = FakeExecutionScenario()
+    executor = TaskExecutor(
+        repository=scenario.repository,
+        context_builder=scenario,
+        planner=scenario,
+        gateway=scenario.gateway,
+        worker_id="one-second-worker",
+        lease_seconds=1,
+    )
+
+    assert 0 < executor.heartbeat_seconds < 1
+
+
+@pytest.mark.asyncio
 async def test_non_terminal_mcp_call_never_marks_task_completed() -> None:
     scenario = FakeExecutionScenario()
     scenario.gateway.outcome_status = "running"
