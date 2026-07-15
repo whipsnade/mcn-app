@@ -24,7 +24,7 @@ from app.model.contracts import (
 )
 
 
-CONFIRMED_BASE_URL = "https://api.lkeap.cloud.tencent.com/plan/v3"
+CONFIRMED_BASE_URL = "https://tokenhub.tencentmaas.com/plan/v3"
 CONFIRMED_MODEL = "deepseek-v4-pro-202606"
 _SCHEMA_SUPPORT_CACHE: dict[tuple[str, str, str], bool] = {}
 _RETRYABLE_STATUS_CODES = {429, 502, 503, 504}

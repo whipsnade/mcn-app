@@ -1,6 +1,7 @@
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_db
@@ -8,6 +9,10 @@ from app.identity.dependencies import CurrentUser
 from app.reporting.router import bi_report_summary
 from app.reporting.schemas import CandidateVersionSummary, TaskAnalysisSummary
 from app.reporting.service import ReportingService
+from app.tasks.router import get_task_runner
+from app.tasks.schemas import TaskCreate
+from app.tasks.service import TaskService
+from app.tasks.executor import TaskRunner
 from app.workspace.models import Message, WorkspaceSession
 from app.workspace.schemas import MessageCreate, MessageRead, SessionCreate, SessionRead, SessionUpdate
 from app.workspace.service import WorkspaceService
@@ -85,10 +90,28 @@ async def create_session(
     payload: SessionCreate,
     user: CurrentUser,
     db: Annotated[AsyncSession, Depends(get_db)],
+    task_runner: Annotated[TaskRunner, Depends(get_task_runner)],
 ) -> SessionRead:
     service = WorkspaceService(db)
     workspace = await service.create_session(user.id, payload)
-    return await session_read(service, workspace, include_messages=True)
+    initial_message = await db.scalar(
+        select(Message).where(
+            Message.session_id == workspace.id,
+            Message.user_id == user.id,
+            Message.sequence == 1,
+        )
+    )
+    if initial_message is None:
+        raise HTTPException(status_code=500, detail="initial_message_not_found")
+    task = await TaskService(db).create(
+        user.id,
+        workspace.id,
+        TaskCreate(content=payload.initial_query),
+        trigger_message_id=initial_message.id,
+    )
+    await db.commit()
+    task_runner.submit(task.id)
+    return await session_read(service, workspace, include_messages=True, include_analysis=True)
 
 
 @router.get("", response_model=list[SessionRead])

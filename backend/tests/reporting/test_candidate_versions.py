@@ -82,7 +82,7 @@ async def test_sensitive_evidence_is_redacted_before_snapshot_and_candidate_stor
                 risk_flags=[
                     {
                         "authorization": "Bearer should-not-persist",
-                        "endpoint": "https://api.lkeap.cloud.tencent.com/plan/v3",
+                        "endpoint": "https://tokenhub.tencentmaas.com/plan/v3",
                         "service": "google-trends-mcp",
                         "nested": {"api_key": "secret", "reason": "内容重复"},
                     }

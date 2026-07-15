@@ -57,6 +57,30 @@ async def test_session_can_be_created_without_a_campaign_name(auth_client_factor
 
 
 @pytest.mark.asyncio
+async def test_session_creation_starts_analysis_for_the_initial_query(auth_client_factory) -> None:
+    client = await auth_client_factory("13800000006")
+
+    created = await client.post(
+        "/api/v1/sessions",
+        json={
+            "brand": "分析品牌",
+            "campaign_name": None,
+            "platforms": ["xiaohongshu"],
+            "category": "护肤",
+            "target_audience": "25~30 岁女性",
+            "initial_query": "筛选最近 30 天互动最高的达人",
+        },
+    )
+
+    assert created.status_code == 201
+    body = created.json()
+    assert body["latest_task"]["status"] == "pending"
+    assert [message["content"] for message in body["messages"]] == [
+        "筛选最近 30 天互动最高的达人"
+    ]
+
+
+@pytest.mark.asyncio
 async def test_list_patch_and_star_only_affect_owner(auth_client_factory) -> None:
     owner = await auth_client_factory("13700000003")
     outsider = await auth_client_factory("13700000004")
