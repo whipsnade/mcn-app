@@ -114,6 +114,12 @@ export interface KolCandidate {
   matchedConditions: string[];
   risks: Array<Record<string, unknown>>;
   recommendation: string;
+  metrics?: {
+    followers: number | null;
+    quoted_price_cny: number | null;
+    collected_at: string | null;
+    data_completeness: number | null;
+  };
 }
 
 export interface AnalysisBiReport {

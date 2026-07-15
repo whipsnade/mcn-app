@@ -42,6 +42,12 @@ def candidate_read(candidate: TaskCandidate, kol: Kol, snapshot: KolSnapshot) ->
         matched_conditions=list(candidate.matched_conditions_json),
         risks=list(candidate.risk_flags_json),
         recommendation=candidate.recommendation_text,
+        metrics={
+            "followers": normalized.get("followers"),
+            "quoted_price_cny": normalized.get("quoted_price_cny"),
+            "collected_at": snapshot.collected_at.isoformat(),
+            "data_completeness": candidate.score_breakdown_json.get("data_completeness"),
+        },
     )
 
 

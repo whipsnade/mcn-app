@@ -155,6 +155,27 @@ describe('useWorkspace', () => {
     expect(result.current.activeTaskId).toBe('task-1');
     expect(result.current.activeSession?.status).toBe('analyzing');
     expect(result.current.activeSession?.messages.at(-1)?.text).toBe('帮我筛选美妆达人');
+    expect(result.current.isAnalyzing).toBe(true);
+  });
+
+  it('does not create a second task while the active task is still running', async () => {
+    vi.mocked(createTask).mockResolvedValue({
+      id: 'task-1',
+      session_id: 'session-1',
+      status: 'pending',
+      estimated_points: 0,
+      error_code: null,
+      latest_report_id: null,
+    });
+    const { result } = renderHook(() => useWorkspace('user-a'));
+    await waitFor(() => expect(result.current.activeSession?.id).toBe('session-1'));
+
+    await act(async () => {
+      await result.current.appendMessage('先筛选美妆达人');
+    });
+
+    await expect(result.current.appendMessage('重复提交')).rejects.toThrow('TASK_IN_PROGRESS');
+    expect(createTask).toHaveBeenCalledTimes(1);
   });
 
   it('restores the matching candidate version and BI report for a historical task', async () => {

@@ -20,6 +20,10 @@ function replaceSession(sessions: Session[], nextSession: Session): Session[] {
   return sessions.map(session => session.id === nextSession.id ? nextSession : session);
 }
 
+function taskIsInProgress(status: string | undefined): boolean {
+  return !['completed', 'failed', 'insufficient_balance', 'interrupted', 'cancelled'].includes(status ?? 'running');
+}
+
 
 export function useWorkspace(userId?: string) {
   const [sessions, setSessions] = useState<Session[]>([]);
@@ -61,6 +65,7 @@ export function useWorkspace(userId?: string) {
         matchedConditions: candidate.matched_conditions,
         risks: candidate.risks,
         recommendation: candidate.recommendation,
+        metrics: candidate.metrics,
       })),
       biReport: matchingReport ? {
         id: matchingReport.id,
@@ -176,6 +181,10 @@ export function useWorkspace(userId?: string) {
   const appendMessage = useCallback(async (content: string) => {
     if (!userId) throw new Error('AUTH_EXPIRED');
     if (!activeSessionId) return;
+    const activeSession = sessions.find(session => session.id === activeSessionId);
+    if (activeSession?.analysis && taskIsInProgress(activeSession.analysis.status)) {
+      throw new Error('TASK_IN_PROGRESS');
+    }
     const generation = generationRef.current;
     setBusy(true);
     setError(undefined);
@@ -204,7 +213,7 @@ export function useWorkspace(userId?: string) {
     } finally {
       if (generationRef.current === generation) setBusy(false);
     }
-  }, [activeSessionId, userId]);
+  }, [activeSessionId, sessions, userId]);
 
   useEffect(() => {
     if (!taskRuntime || !activeTaskId) return;
@@ -250,6 +259,7 @@ export function useWorkspace(userId?: string) {
               matchedConditions: candidate.matched_conditions,
               risks: candidate.risks,
               recommendation: candidate.recommendation,
+              metrics: candidate.metrics,
             })),
           } : session));
         })
@@ -286,6 +296,9 @@ export function useWorkspace(userId?: string) {
     () => sessions.find(session => session.id === activeSessionId),
     [activeSessionId, sessions],
   );
+  const isAnalyzing = busy || Boolean(
+    activeSession?.analysis && taskIsInProgress(taskRuntime?.status ?? activeSession.analysis.status),
+  );
 
   return {
     sessions,
@@ -295,6 +308,7 @@ export function useWorkspace(userId?: string) {
     taskRuntime,
     loading,
     busy,
+    isAnalyzing,
     error,
     reload,
     selectSession,

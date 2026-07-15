@@ -36,4 +36,33 @@ describe('CandidateList', () => {
 
     expect(screen.getAllByTestId('candidate-name').map(node => node.textContent)).toEqual(['达人乙']);
   });
+
+  it('exposes sortable follower and price columns plus data freshness and completeness', () => {
+    render(<CandidateList page={candidatePage} onFavorite={vi.fn()} />);
+
+    expect(screen.getByRole('button', { name: '粉丝' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: '价格' })).toBeEnabled();
+    expect(screen.getByText(/数据完整度/)).toBeVisible();
+    expect(screen.getByText(/更新于/)).toBeVisible();
+  });
+
+  it('sorts follower and price metrics with rank as a stable tie breaker', () => {
+    render(<CandidateList page={candidatePage} onFavorite={vi.fn()} />);
+
+    fireEvent.click(screen.getByRole('button', { name: '粉丝' }));
+    expect(screen.getAllByTestId('candidate-name').map(node => node.textContent)).toEqual(['达人乙', '达人甲']);
+
+    fireEvent.click(screen.getByRole('button', { name: '价格' }));
+    expect(screen.getAllByTestId('candidate-name').map(node => node.textContent)).toEqual(['达人乙', '达人甲']);
+  });
+
+  it('keeps favorite state unchanged and reports an action failure', async () => {
+    const onFavorite = vi.fn().mockRejectedValue(new Error('network'));
+    render(<CandidateList page={candidatePage} onFavorite={onFavorite} />);
+
+    fireEvent.click(screen.getByRole('button', { name: '收藏 达人甲' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('收藏操作失败');
+    expect(onFavorite).toHaveBeenCalledTimes(1);
+  });
 });

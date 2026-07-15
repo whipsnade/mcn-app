@@ -151,6 +151,7 @@ class CandidateRead(BaseModel):
     matched_conditions: list[str]
     risks: list[dict[str, Any]]
     recommendation: str
+    metrics: dict[str, int | float | str | None]
 
 
 class CandidatePage(BaseModel):

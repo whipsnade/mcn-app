@@ -119,6 +119,7 @@ export default function App() {
         matched_conditions: candidate.matchedConditions,
         risks: candidate.risks,
         recommendation: candidate.recommendation,
+        metrics: candidate.metrics,
       })),
     };
   }, [workspace.activeSession]);
@@ -189,7 +190,7 @@ export default function App() {
                   onSendMessage={async text => {
                     await workspace.appendMessage(text);
                   }}
-                  isAnalyzing={workspace.busy}
+                  isAnalyzing={workspace.isAnalyzing}
                   isMockMode
                   taskActivity={workspace.taskRuntime?.activity}
                 />

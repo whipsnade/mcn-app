@@ -39,6 +39,9 @@ async def test_candidates_are_sortable_and_report_matches_candidate_version(
     assert candidates.status_code == 200
     body = candidates.json()
     assert body["items"][0]["scores"]["engagement"] >= body["items"][1]["scores"]["engagement"]
+    assert body["items"][0]["metrics"].keys() == {
+        "followers", "quoted_price_cny", "collected_at", "data_completeness"
+    }
     assert report_response.status_code == 200
     assert report_response.json()["candidate_version"] == body["version"]
 

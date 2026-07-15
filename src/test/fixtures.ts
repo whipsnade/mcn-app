@@ -10,12 +10,14 @@ export const candidatePage: ApiCandidatePage = {
       nickname: '达人甲', profile_url: 'https://example.test/a', rank: 1, total_score: 88,
       scores: { audience: 92, engagement: 76, budget: 81, content: 89, platform: 85, risk: 90 },
       matched_conditions: ['美妆垂类', '一线城市受众'], risks: [], recommendation: '优先联系',
+      metrics: { followers: 120_000, quoted_price_cny: 6_000, collected_at: '2026-07-15T10:00:00Z', data_completeness: 92 },
     },
     {
       id: 'candidate-b', kol_id: 'kol-b', platform: 'douyin', platform_account_id: 'dy-b',
       nickname: '达人乙', profile_url: 'https://example.test/b', rank: 2, total_score: 84,
       scores: { audience: 80, engagement: 94, budget: 76, content: 88, platform: 79, risk: 83 },
       matched_conditions: ['短视频种草', '高互动率'], risks: [{ level: 'low', label: '报价波动' }], recommendation: '建议沟通档期',
+      metrics: { followers: 900_000, quoted_price_cny: 19_000, collected_at: '2026-07-14T10:00:00Z', data_completeness: 84 },
     },
   ],
 };

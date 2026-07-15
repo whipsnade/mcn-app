@@ -11,5 +11,9 @@ describe('CandidateCompare', () => {
     expect(screen.getByText('达人甲')).toBeVisible();
     expect(screen.getByText('受众匹配')).toBeVisible();
     expect(screen.getByText('风险控制')).toBeVisible();
+    expect(screen.getByText('总分')).toBeVisible();
+    expect(screen.getByText('排名')).toBeVisible();
+    expect(screen.getByText('平台')).toBeVisible();
+    expect(screen.getByText('报价波动')).toBeVisible();
   });
 });

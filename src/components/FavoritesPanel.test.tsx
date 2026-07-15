@@ -26,4 +26,19 @@ describe('FavoritesPanel', () => {
     await waitFor(() => expect(deleteFavorite).toHaveBeenCalledWith('kol-a'));
     expect(screen.queryByText('kol-a')).not.toBeInTheDocument();
   });
+
+  it('keeps loaded favorites and shows a retry-safe error when refresh or removal fails', async () => {
+    const { rerender } = render(<FavoritesPanel refreshKey={1} />);
+    expect(await screen.findByText('kol-a')).toBeVisible();
+
+    vi.mocked(listFavorites).mockRejectedValueOnce(new Error('network'));
+    rerender(<FavoritesPanel refreshKey={2} />);
+    expect(await screen.findByRole('alert')).toHaveTextContent('收藏加载失败');
+    expect(screen.getByText('kol-a')).toBeVisible();
+
+    vi.mocked(deleteFavorite).mockRejectedValueOnce(new Error('network'));
+    fireEvent.click(screen.getByRole('button', { name: '取消收藏 kol-a' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('取消收藏失败');
+    expect(screen.getByText('kol-a')).toBeVisible();
+  });
 });
