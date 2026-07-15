@@ -79,10 +79,18 @@ export function reduceTaskEvent(state: TaskRuntimeState, event: TaskEvent): Task
     case 'message.completed':
       return { ...next, assistantDraft: String(event.payload.text ?? next.assistantDraft) };
     case 'candidates.updated':
-      return exposeMatchingReport({
-        ...next,
-        candidateVersion: Number(valueOf(event.payload, 'version', 'candidate_version')),
-      });
+      {
+        const candidateVersion = Number(valueOf(event.payload, 'version', 'candidate_version'));
+        const pendingReport = next.pendingReport?.candidateVersion === candidateVersion
+          ? next.pendingReport
+          : undefined;
+        return exposeMatchingReport({
+          ...next,
+          candidateVersion,
+          pendingReport,
+          visibleReportId: undefined,
+        });
+      }
     case 'bi.updated':
       return exposeMatchingReport({
         ...next,

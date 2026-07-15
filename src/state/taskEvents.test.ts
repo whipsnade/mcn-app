@@ -61,4 +61,23 @@ describe('task event reducer', () => {
 
     expect(state.assistantDraft).toBe('可优先联系');
   });
+
+  it('hides the previous BI when candidates advance to a newer version', () => {
+    const withReport = reduceTaskEvent(
+      reduceTaskEvent(initialTaskRuntime('task-1'), {
+        id: 1, taskId: 'task-1', type: 'candidates.updated', payload: { version: 1 },
+      }),
+      {
+        id: 2, taskId: 'task-1', type: 'bi.updated',
+        payload: { reportId: 'report-1', candidateVersion: 1 },
+      },
+    );
+    const nextCandidates = reduceTaskEvent(withReport, {
+      id: 3, taskId: 'task-1', type: 'candidates.updated', payload: { version: 2 },
+    });
+
+    expect(withReport.visibleReportId).toBe('report-1');
+    expect(nextCandidates.visibleReportId).toBeUndefined();
+    expect(nextCandidates.pendingReport).toBeUndefined();
+  });
 });

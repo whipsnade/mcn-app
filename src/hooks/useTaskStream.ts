@@ -12,9 +12,24 @@ import {
 const RECONNECT_DELAY_MS = 25;
 const MAX_RECONNECT_DELAY_MS = 500;
 
-export function useTaskStream(taskId: string | undefined): TaskRuntimeState | undefined {
+export interface TaskStreamOptions {
+  random?: () => number;
+}
+
+export function calculateReconnectDelay(attempt: number, random: () => number = Math.random): number {
+  const cap = Math.min(RECONNECT_DELAY_MS * 2 ** Math.max(0, attempt - 1), MAX_RECONNECT_DELAY_MS);
+  const jitter = Math.min(1, Math.max(0, random()));
+  return Math.round(cap * (0.5 + jitter * 0.5));
+}
+
+export function useTaskStream(
+  taskId: string | undefined,
+  options: TaskStreamOptions = {},
+): TaskRuntimeState | undefined {
   const [runtime, setRuntime] = useState<TaskRuntimeState | undefined>();
   const latestState = useRef<TaskRuntimeState | undefined>();
+  const randomRef = useRef(options.random ?? Math.random);
+  randomRef.current = options.random ?? Math.random;
 
   useEffect(() => {
     if (!taskId) {
@@ -53,7 +68,7 @@ export function useTaskStream(taskId: string | undefined): TaskRuntimeState | un
         const currentState = latestState.current ?? initial;
         if (stopped || controller.signal.aborted || isTerminalTaskStatus(currentState.status)) break;
         attempts += 1;
-        await waitForReconnect(Math.min(RECONNECT_DELAY_MS * 2 ** (attempts - 1), MAX_RECONNECT_DELAY_MS));
+        await waitForReconnect(calculateReconnectDelay(attempts, randomRef.current));
       }
     };
     void connect();

@@ -39,8 +39,15 @@ export function useWorkspace(userId?: string) {
       analysis.reportId === undefined ? Promise.resolve(undefined) : getReport(analysis.reportId),
     ]);
     if (generationRef.current !== generation) return session;
+    const resolvedCandidateVersion = candidatePage?.version ?? analysis.candidateVersion;
+    const matchingReport = report?.candidate_version === resolvedCandidateVersion ? report : undefined;
     return {
       ...session,
+      analysis: {
+        ...analysis,
+        candidateVersion: resolvedCandidateVersion,
+        reportId: matchingReport?.id,
+      },
       candidates: candidatePage?.items.map(candidate => ({
         id: candidate.id,
         kolId: candidate.kol_id,
@@ -55,14 +62,14 @@ export function useWorkspace(userId?: string) {
         risks: candidate.risks,
         recommendation: candidate.recommendation,
       })),
-      biReport: report ? {
-        id: report.id,
-        taskId: report.task_id,
-        reportVersion: report.report_version,
-        candidateVersion: report.candidate_version,
-        overview: report.overview,
-        conclusion: report.conclusion,
-        generatedAt: report.generated_at,
+      biReport: matchingReport ? {
+        id: matchingReport.id,
+        taskId: matchingReport.task_id,
+        reportVersion: matchingReport.report_version,
+        candidateVersion: matchingReport.candidate_version,
+        overview: matchingReport.overview,
+        conclusion: matchingReport.conclusion,
+        generatedAt: matchingReport.generated_at,
       } : undefined,
     };
   }, []);
@@ -209,8 +216,17 @@ export function useWorkspace(userId?: string) {
         ...session.analysis,
         status: taskRuntime.status ?? session.analysis.status,
         candidateVersion: taskRuntime.candidateVersion ?? session.analysis.candidateVersion,
-        reportId: taskRuntime.visibleReportId ?? session.analysis.reportId,
+        reportId: taskRuntime.visibleReportId ?? (
+          taskRuntime.candidateVersion !== undefined
+            && taskRuntime.candidateVersion !== session.analysis.candidateVersion
+            ? undefined
+            : session.analysis.reportId
+        ),
       },
+      biReport: taskRuntime.candidateVersion !== undefined
+        && session.biReport?.candidateVersion !== taskRuntime.candidateVersion
+        ? undefined
+        : session.biReport,
     } : session));
     if (taskRuntime.candidateVersion !== undefined) {
       void getCandidates(activeTaskId)

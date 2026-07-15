@@ -161,4 +161,24 @@ describe('useWorkspace', () => {
     expect(getCandidates).toHaveBeenCalledWith('task-1');
     expect(getReport).toHaveBeenCalledWith('report-2');
   });
+
+  it('does not restore a BI report when the fetched candidate version has advanced', async () => {
+    vi.mocked(getSession).mockResolvedValue({
+      ...restoredSession,
+      analysis: { taskId: 'task-1', status: 'completed', candidateVersion: 2, reportId: 'report-2' },
+    });
+    vi.mocked(getCandidates).mockResolvedValue({ task_id: 'task-1', version: 3, total: 0, items: [] });
+    vi.mocked(getReport).mockResolvedValue({
+      id: 'report-2', task_id: 'task-1', report_version: 1, candidate_version: 2,
+      overview: {}, score_composition: [], audience_content_fit: {}, platform_distribution: [],
+      budget_analysis: {}, comparison: [], risks: [], conclusion: '旧结论', sources: [],
+      generated_at: '2026-07-15T10:00:00Z',
+    });
+
+    const { result } = renderHook(() => useWorkspace('user-a'));
+    await waitFor(() => expect(result.current.activeSession?.candidates).toEqual([]));
+
+    expect(result.current.activeSession?.analysis?.candidateVersion).toBe(3);
+    expect(result.current.activeSession?.biReport).toBeUndefined();
+  });
 });

@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import * as tasksApi from '../api/tasks';
 import { installFetchSse } from '../test/fakeSse';
-import { useTaskStream } from './useTaskStream';
+import { calculateReconnectDelay, useTaskStream } from './useTaskStream';
 
 
 describe('useTaskStream', () => {
@@ -35,6 +35,25 @@ describe('useTaskStream', () => {
     fake.disconnect();
 
     await waitFor(() => expect(fake.connectionCount()).toBe(1));
+    fake.restore();
+  });
+
+  it('uses an injected bounded jitter for exponential reconnect delays', () => {
+    expect(calculateReconnectDelay(1, () => 0)).toBe(13);
+    expect(calculateReconnectDelay(1, () => 1)).toBe(25);
+    expect(calculateReconnectDelay(99, () => 0)).toBe(250);
+    expect(calculateReconnectDelay(99, () => 1)).toBe(500);
+  });
+
+  it('aborts only the active fetch on unmount', async () => {
+    const fake = installFetchSse();
+    const { unmount } = renderHook(() => useTaskStream('task-1'));
+    await fake.waitForConnection();
+
+    const signal = fake.lastRequestSignal();
+    unmount();
+
+    expect(signal.aborted).toBe(true);
     fake.restore();
   });
 });
