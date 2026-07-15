@@ -34,6 +34,31 @@ from app.tasks.state import TaskEventType
 from app.workspace.service import WorkspaceService
 
 
+def summary_deltas_to_persist(
+    persisted_content: str, deltas: tuple[str, ...], *, completed: bool = False
+) -> tuple[str, ...]:
+    """流恢复从头重放时，只返回尚未提交的后缀。"""
+    if completed:
+        return ()
+    generated = ""
+    persisted = persisted_content
+    result: list[str] = []
+    for delta in deltas:
+        generated += delta
+        if persisted.startswith(generated):
+            continue
+        if generated.startswith(persisted):
+            suffix = generated[len(persisted) :]
+            if suffix:
+                result.append(suffix)
+                persisted = generated
+            continue
+        # 模型无法按同一前缀重放时，保留新的片段而不覆盖已有草稿。
+        result.append(delta)
+        persisted += delta
+    return tuple(result)
+
+
 class DatabaseTaskStore:
     """每个状态变更都以短事务提交，网络调用不持有数据库事务。"""
 
@@ -93,7 +118,8 @@ class _PlanArguments:
 class _TaskArtifacts:
     """将执行器的短边界映射为独立数据库事务，恢复时可安全重入。"""
 
-    def __init__(self, model) -> None:
+    def __init__(self, worker_id: str, model) -> None:
+        self._worker_id = worker_id
         self._model = model
 
     async def _profile(self, task_id: str) -> str:
@@ -108,7 +134,9 @@ class _TaskArtifacts:
     async def build_candidates(self, task_id: str):
         profile = await self._profile(task_id)
         async with SessionFactory.begin() as db:
-            return await ReportingService(db).build_candidate_version(task_id, profile)
+            return await ReportingService(db).build_candidate_version(
+                task_id, profile, lease_owner=self._worker_id
+            )
 
     async def build_bi_report(self, task_id: str):
         async with SessionFactory() as db:
@@ -134,7 +162,7 @@ class _TaskArtifacts:
         )
         async with SessionFactory.begin() as db:
             return await ReportingService(db).build_bi_report(
-                task_id, analyst_conclusion=result.value
+                task_id, analyst_conclusion=result.value, lease_owner=self._worker_id
             )
 
     async def stream_summary(self, task_id: str) -> None:
@@ -153,8 +181,12 @@ class _TaskArtifacts:
                 "overview": report.chart_data_json.get("overview", {}),
                 "conclusion": report.conclusion_text or "",
             }
-        content = ""
-        message_id: str | None = None
+            existing = await self._existing_summary_message(db, task)
+            if existing is not None and existing.metadata_json.get("status") == "completed":
+                return
+        content = existing.content if existing is not None else ""
+        message_id = existing.id if existing is not None else None
+        generated_deltas: list[str] = []
         async for event in self._model.stream_text(
             StreamingModelRequest(
                 messages=(
@@ -168,8 +200,13 @@ class _TaskArtifacts:
         ):
             if event.type != "text.delta" or not event.text:
                 continue
-            content += event.text
-            message_id = await self._save_summary_delta(task_id, message_id, content, event.text)
+            generated_deltas.append(event.text)
+            pending = summary_deltas_to_persist(content, tuple(generated_deltas))
+            if not pending:
+                continue
+            delta = pending[-1]
+            content += delta
+            message_id = await self._save_summary_delta(task_id, message_id, content, delta)
         if message_id is None:
             raise ValueError("summary_stream_empty")
         async with SessionFactory.begin() as db:
@@ -177,6 +214,7 @@ class _TaskArtifacts:
             task = await db.get(AnalysisTask, task_id)
             if message is None or task is None:
                 raise LookupError("summary_message_not_found")
+            self._require_active_lease(task)
             message.metadata_json = {**message.metadata_json, "status": "completed"}
             await TaskRepository(db).append_event(
                 task.id,
@@ -192,6 +230,7 @@ class _TaskArtifacts:
             task = await db.get(AnalysisTask, task_id)
             if task is None:
                 raise LookupError("task_not_found")
+            self._require_active_lease(task)
             if message_id is None:
                 sequence = (
                     await db.scalar(select(func.max(Message.sequence)).where(Message.session_id == task.session_id))
@@ -222,6 +261,32 @@ class _TaskArtifacts:
             )
             return message.id
 
+    async def _existing_summary_message(self, db, task: AnalysisTask) -> Message | None:
+        messages = list(
+            (
+                await db.scalars(
+                    select(Message)
+                    .where(
+                        Message.session_id == task.session_id,
+                        Message.user_id == task.user_id,
+                        Message.role == "assistant",
+                    )
+                    .order_by(Message.sequence.desc())
+                )
+            ).all()
+        )
+        return next(
+            (message for message in messages if message.metadata_json.get("task_id") == task.id), None
+        )
+
+    def _require_active_lease(self, task: AnalysisTask) -> None:
+        if (
+            task.lease_owner != self._worker_id
+            or task.lease_expires_at is None
+            or task.lease_expires_at <= datetime.now(UTC).replace(tzinfo=None)
+        ):
+            raise RuntimeError("task_lease_lost")
+
 
 @lru_cache
 def get_mcp_transport():
@@ -241,7 +306,6 @@ class TaskExecutionDependencies:
         self._planner = Planner(model=get_model_adapter())
         self._transport = get_mcp_transport()
         self._arguments = _PlanArguments()
-        self._artifacts = _TaskArtifacts(get_model_adapter())
 
     async def build(self, user_id: str, session_id: str):
         async with SessionFactory() as db:
@@ -265,13 +329,14 @@ class TaskExecutionDependencies:
         return await self._planner.plan(context)
 
     def create_executor(self) -> TaskExecutor:
+        worker_id = f"{self.worker_id_prefix}-{uuid4()}"
         return TaskExecutor(
             repository=self.store,
             context_builder=self,
             planner=self,
             gateway=self,
-            artifacts=self._artifacts,
-            worker_id=f"{self.worker_id_prefix}-{uuid4()}",
+            artifacts=_TaskArtifacts(worker_id, get_model_adapter()),
+            worker_id=worker_id,
             lease_seconds=get_settings().task_lease_seconds,
         )
 

@@ -1,3 +1,6 @@
+from datetime import timedelta
+
+import pytest
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -107,3 +110,39 @@ async def test_sensitive_evidence_is_redacted_before_snapshot_and_candidate_stor
     ):
         assert forbidden not in stored
     assert snapshot.normalized_json["risk_flags"] == [{"nested": {"reason": "内容重复"}}]
+
+
+async def test_lost_lease_rejects_candidate_artifact_write(
+    db_session: AsyncSession, user_factory
+) -> None:
+    user = await user_factory()
+    task = await completed_task_factory(
+        db_session, user.id, evidence_rows=[candidate_fixture(account_id="lost-lease")]
+    )
+    task.lease_owner = "new-worker"
+    task.lease_expires_at = task.created_at + timedelta(minutes=5)
+
+    with pytest.raises(RuntimeError, match="task_lease_lost"):
+        await ReportingService(db_session).build_candidate_version(
+            task.id, "balanced", lease_owner="old-worker"
+        )
+
+    assert await db_session.scalar(
+        select(func.count()).select_from(TaskCandidate).where(TaskCandidate.task_id == task.id)
+    ) == 0
+
+
+async def test_lost_lease_rejects_bi_artifact_write(
+    db_session: AsyncSession, user_factory
+) -> None:
+    user = await user_factory()
+    task = await completed_task_factory(
+        db_session, user.id, evidence_rows=[candidate_fixture(account_id="lost-bi")]
+    )
+    service = ReportingService(db_session)
+    await service.build_candidate_version(task.id, "balanced")
+    task.lease_owner = "new-worker"
+    task.lease_expires_at = task.created_at + timedelta(minutes=5)
+
+    with pytest.raises(RuntimeError, match="task_lease_lost"):
+        await service.build_bi_report(task.id, lease_owner="old-worker")

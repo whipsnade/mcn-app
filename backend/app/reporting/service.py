@@ -9,6 +9,7 @@ from typing import Any
 from uuid import uuid4
 
 from sqlalchemy import func, select
+from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.mcp_gateway.contracts import McpCallStatus
@@ -36,13 +37,16 @@ class ReportingService:
     def __init__(self, db_session: AsyncSession) -> None:
         self._db = db_session
 
-    async def build_candidate_version(self, task_id: str, profile: str) -> CandidateVersion:
+    async def build_candidate_version(
+        self, task_id: str, profile: str, *, lease_owner: str | None = None
+    ) -> CandidateVersion:
         async with self._transaction():
             task = await self._db.scalar(
                 select(AnalysisTask).where(AnalysisTask.id == task_id).with_for_update()
             )
             if task is None:
                 raise LookupError("analysis_task_not_found")
+            self._require_active_lease(task, lease_owner)
             if task.plan_json is None:
                 raise ValueError("analysis_task_not_ready_for_reporting")
 
@@ -134,7 +138,11 @@ class ReportingService:
             )
 
     async def build_bi_report(
-        self, task_id: str, *, analyst_conclusion: AnalystConclusion | None = None
+        self,
+        task_id: str,
+        *,
+        analyst_conclusion: AnalystConclusion | None = None,
+        lease_owner: str | None = None,
     ) -> BiReport:
         """从最新的不可变候选版本派生确定性 BI；模型结论不会参与评分或版本选择。"""
         async with self._transaction():
@@ -143,6 +151,7 @@ class ReportingService:
             )
             if task is None:
                 raise LookupError("analysis_task_not_found")
+            self._require_active_lease(task, lease_owner)
             candidate_version = await self._latest_candidate_version(task.id)
             if candidate_version is None:
                 raise ValueError("candidate_version_not_found")
@@ -229,7 +238,11 @@ class ReportingService:
             return float(value) if value is not None else -1.0
 
         # rank 的默认升序符合用户看到的候选序，其他字段可由 direction 决定。
-        rows.sort(key=lambda row: (numeric_score(row[0]), row[0].rank), reverse=reverse)
+        if reverse:
+            rows.sort(key=lambda row: row[0].rank)
+            rows.sort(key=lambda row: numeric_score(row[0]), reverse=True)
+        else:
+            rows.sort(key=lambda row: (numeric_score(row[0]), row[0].rank))
         return version, rows
 
     async def get_owned_report(self, user_id: str, report_id: str) -> BiReport:
@@ -270,30 +283,33 @@ class ReportingService:
                 )
                 if candidate is None:
                     raise LookupError("candidate_not_found")
-            favorite = await self._db.scalar(
-                select(UserKolFavorite)
-                .where(UserKolFavorite.user_id == user_id, UserKolFavorite.kol_id == kol_id)
-                .with_for_update()
-            )
             now = _now()
-            if favorite is None:
-                favorite = UserKolFavorite(
-                    id=str(uuid4()),
-                    user_id=user_id,
-                    kol_id=kol_id,
-                    note=note,
-                    source_task_id=source_task_id,
-                    created_at=now,
+            statement = mysql_insert(UserKolFavorite).values(
+                id=str(uuid4()),
+                user_id=user_id,
+                kol_id=kol_id,
+                note=note,
+                source_task_id=source_task_id,
+                created_at=now,
+                updated_at=now,
+            )
+            await self._db.execute(
+                statement.on_duplicate_key_update(
+                    note=func.coalesce(statement.inserted.note, UserKolFavorite.note),
+                    source_task_id=func.coalesce(
+                        statement.inserted.source_task_id, UserKolFavorite.source_task_id
+                    ),
                     updated_at=now,
                 )
-                self._db.add(favorite)
-            else:
-                if note is not None:
-                    favorite.note = note
-                if source_task_id is not None:
-                    favorite.source_task_id = source_task_id
-                favorite.updated_at = now
+            )
             await self._db.flush()
+            favorite = await self._db.scalar(
+                select(UserKolFavorite).where(
+                    UserKolFavorite.user_id == user_id, UserKolFavorite.kol_id == kol_id
+                )
+            )
+            if favorite is None:
+                raise RuntimeError("favorite_upsert_failed")
             return favorite, kol
 
     async def delete_favorite(self, user_id: str, kol_id: str) -> None:
@@ -332,7 +348,7 @@ class ReportingService:
             )
         report = await self._db.scalar(
             select(BiReport)
-            .where(BiReport.task_id == task.id)
+            .where(BiReport.task_id == task.id, BiReport.candidate_version == version)
             .order_by(BiReport.report_version.desc())
         )
         return task, version, total, report
@@ -443,6 +459,17 @@ class ReportingService:
         if task is None:
             raise LookupError("task_not_found")
         return task
+
+    @staticmethod
+    def _require_active_lease(task: AnalysisTask, lease_owner: str | None) -> None:
+        if lease_owner is None:
+            return
+        if (
+            task.lease_owner != lease_owner
+            or task.lease_expires_at is None
+            or task.lease_expires_at <= _now()
+        ):
+            raise RuntimeError("task_lease_lost")
 
     async def _append_event(
         self, task: AnalysisTask, event_type: TaskEventType, payload: dict[str, Any]

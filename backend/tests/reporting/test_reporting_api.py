@@ -59,3 +59,26 @@ async def test_candidates_and_reports_are_hidden_from_other_users(
     assert (await bob.get(f"/api/v1/tasks/{task.id}/candidates")).status_code == 404
     assert (await bob.get(f"/api/v1/reports/{report.id}")).status_code == 404
     assert (await alice.get(f"/api/v1/reports/{report.id}")).status_code == 200
+
+
+async def test_descending_score_ties_keep_candidate_rank_order(
+    auth_client_factory, db_session
+) -> None:
+    client = await auth_client_factory("13800000113")
+    user_id = await _user_id(db_session, "13800000113")
+    task = await completed_task_factory(
+        db_session,
+        user_id,
+        evidence_rows=[
+            candidate_fixture(account_id="100", engagement_score=80),
+            candidate_fixture(account_id="200", engagement_score=80),
+        ],
+    )
+    await ReportingService(db_session).build_candidate_version(task.id, "balanced")
+
+    response = await client.get(
+        f"/api/v1/tasks/{task.id}/candidates",
+        params={"sort": "engagement", "direction": "desc"},
+    )
+
+    assert [item["rank"] for item in response.json()["items"]] == [1, 2]

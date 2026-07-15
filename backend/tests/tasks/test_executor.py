@@ -168,3 +168,29 @@ async def test_executor_uses_persisted_plan_without_replanning() -> None:
 
     assert scenario.task.status == TaskStatus.COMPLETED
     assert scenario.gateway.successful_logical_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_lost_lease_after_mcp_never_starts_artifact_writes() -> None:
+    scenario = FakeExecutionScenario()
+    calls: list[str] = []
+
+    class Artifacts:
+        async def build_candidates(self, task_id: str) -> None:
+            calls.append("candidates")
+
+        async def build_bi_report(self, task_id: str) -> None:
+            calls.append("bi")
+
+        async def stream_summary(self, task_id: str) -> None:
+            calls.append("summary")
+
+    async def lose_lease(name: str) -> None:
+        if name == "after_mcp_result":
+            scenario.repository.task.lease_owner = "replacement-worker"
+
+    scenario.executor.artifacts = Artifacts()
+    scenario.executor.checkpoint = lose_lease
+    await scenario.executor.run(scenario.task.id)
+
+    assert calls == []
