@@ -80,4 +80,16 @@ describe('task event reducer', () => {
     expect(nextCandidates.visibleReportId).toBeUndefined();
     expect(nextCandidates.pendingReport).toBeUndefined();
   });
+
+  it('exposes a reviewed Chinese progress label without retaining tool payloads', () => {
+    const toolStarted = reduceTaskEvent(initialTaskRuntime('task-1'), {
+      id: 1, taskId: 'task-1', type: 'tool.started', payload: { tool_name: 'get_kol_list', endpoint: '/secret' },
+    });
+    const settled = reduceTaskEvent(toolStarted, {
+      id: 2, taskId: 'task-1', type: 'points.settled', payload: { raw_response: 'do-not-show' },
+    });
+
+    expect(toolStarted.activity).toBe('正在获取达人数据');
+    expect(settled.activity).toBe('本次调用积分已结算');
+  });
 });

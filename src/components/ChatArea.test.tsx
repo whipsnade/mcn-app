@@ -49,4 +49,39 @@ describe('ChatArea', () => {
     await act(async () => resolveSend());
     await waitFor(() => expect(input.value).toBe(''));
   });
+
+  it('keeps the input available while a task is running but prevents a duplicate submit', () => {
+    const onSendMessage = vi.fn().mockResolvedValue(undefined);
+    render(
+      <ChatArea
+        session={session}
+        onSendMessage={onSendMessage}
+        isAnalyzing
+        isMockMode
+      />,
+    );
+
+    const input = screen.getByPlaceholderText(/正在进行深度多维数据分析中/) as HTMLTextAreaElement;
+    expect(input).toBeEnabled();
+    fireEvent.change(input, { target: { value: '稍后继续分析' } });
+    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+
+    expect(input.value).toBe('稍后继续分析');
+    expect(onSendMessage).not.toHaveBeenCalled();
+  });
+
+  it('shows the reviewed task activity without exposing transport details', () => {
+    render(
+      <ChatArea
+        session={session}
+        onSendMessage={vi.fn()}
+        isAnalyzing
+        isMockMode={false}
+        taskActivity="本次调用积分已结算"
+      />,
+    );
+
+    expect(screen.getByText('本次调用积分已结算')).toBeVisible();
+    expect(screen.queryByText('/api/v1/mcp')).not.toBeInTheDocument();
+  });
 });

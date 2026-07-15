@@ -18,6 +18,7 @@ export interface TaskRuntimeState {
   visibleReportId?: string;
   status?: string;
   errorCode?: string;
+  activity?: string;
   connection: TaskConnection;
 }
 
@@ -46,9 +47,23 @@ function applyStatusAndPointEvent(state: TaskRuntimeState, event: TaskEvent): Ta
     case 'task.pending':
       return { ...state, status: String(event.payload.status ?? 'pending') };
     case 'plan.ready':
-      return { ...state, status: String(event.payload.status ?? 'running') };
+      return { ...state, status: String(event.payload.status ?? 'running'), activity: '分析计划已确认，正在执行' };
+    case 'tool.started':
+      return { ...state, activity: '正在获取达人数据' };
+    case 'tool.succeeded':
+      return { ...state, activity: '达人数据获取完成，正在整理结果' };
+    case 'tool.failed':
+      return { ...state, activity: '部分数据暂不可用，正在继续分析' };
+    case 'tool.unknown':
+      return { ...state, activity: '正在确认数据调用结果' };
+    case 'points.reserved':
+      return { ...state, activity: '已预留本次分析积分' };
+    case 'points.settled':
+      return { ...state, activity: '本次调用积分已结算' };
+    case 'points.released':
+      return { ...state, activity: '未使用积分已释放' };
     case 'task.completed':
-      return { ...state, status: 'completed', connection: 'closed' };
+      return { ...state, status: 'completed', connection: 'closed', activity: '分析完成' };
     case 'task.cancelled':
       return { ...state, status: 'cancelled', connection: 'closed' };
     case 'task.failed':
@@ -57,6 +72,7 @@ function applyStatusAndPointEvent(state: TaskRuntimeState, event: TaskEvent): Ta
         status: 'failed',
         errorCode: String(event.payload.code ?? event.payload.errorCode ?? 'task_failed'),
         connection: 'closed',
+        activity: '分析未完成，请稍后重试',
       };
     default:
       return state;
@@ -89,6 +105,7 @@ export function reduceTaskEvent(state: TaskRuntimeState, event: TaskEvent): Task
           candidateVersion,
           pendingReport,
           visibleReportId: undefined,
+          activity: '候选清单已更新',
         });
       }
     case 'bi.updated':
@@ -98,6 +115,7 @@ export function reduceTaskEvent(state: TaskRuntimeState, event: TaskEvent): Task
           id: String(valueOf(event.payload, 'reportId', 'report_id')),
           candidateVersion: Number(valueOf(event.payload, 'candidateVersion', 'candidate_version')),
         },
+        activity: 'BI 报告已更新',
       });
     default:
       return applyStatusAndPointEvent(next, event);
