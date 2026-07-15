@@ -8,16 +8,17 @@ from decimal import Decimal
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.mcp_gateway.contracts import McpCallStatus
 from app.mcp_gateway.models import McpCall
-from app.reporting.models import Kol, KolSnapshot, TaskCandidate
+from app.reporting.models import BiReport, Kol, KolSnapshot, TaskCandidate, UserKolFavorite
 from app.reporting.normalizers import normalize_tool_evidence, redact_evidence_for_storage
-from app.reporting.schemas import CandidateVersion, CandidateVersionItem, ToolEvidence
+from app.reporting.schemas import AnalystConclusion, CandidateVersion, CandidateVersionItem, ToolEvidence
 from app.reporting.scoring import SCORE_VERSION, score_candidate
-from app.tasks.models import AnalysisTask
+from app.tasks.models import AnalysisTask, TaskEvent
+from app.tasks.state import TaskEventType
 
 
 def _now() -> datetime:
@@ -111,6 +112,11 @@ class ReportingService:
                     )
                 )
             await self._db.flush()
+            await self._append_event(
+                task,
+                TaskEventType.CANDIDATES_UPDATED,
+                {"candidate_version": candidate_version, "total": len(draft)},
+            )
             return CandidateVersion(
                 candidate_version=candidate_version,
                 evidence_digest=evidence_digest,
@@ -126,6 +132,210 @@ class ReportingService:
                     for rank, (kol, snapshot, _row, score) in enumerate(draft, start=1)
                 ),
             )
+
+    async def build_bi_report(
+        self, task_id: str, *, analyst_conclusion: AnalystConclusion | None = None
+    ) -> BiReport:
+        """从最新的不可变候选版本派生确定性 BI；模型结论不会参与评分或版本选择。"""
+        async with self._transaction():
+            task = await self._db.scalar(
+                select(AnalysisTask).where(AnalysisTask.id == task_id).with_for_update()
+            )
+            if task is None:
+                raise LookupError("analysis_task_not_found")
+            candidate_version = await self._latest_candidate_version(task.id)
+            if candidate_version is None:
+                raise ValueError("candidate_version_not_found")
+            existing = await self._db.scalar(
+                select(BiReport)
+                .where(
+                    BiReport.task_id == task.id,
+                    BiReport.candidate_version == candidate_version,
+                    BiReport.status == "completed",
+                )
+                .order_by(BiReport.report_version.desc())
+            )
+            if existing is not None:
+                return existing
+            candidates = await self._candidate_rows(task.id, candidate_version)
+            if not candidates:
+                raise ValueError("candidate_version_empty")
+            chart_data, conclusion, evidence = self._build_bi_payload(candidates, candidate_version)
+            if analyst_conclusion is not None:
+                conclusion = analyst_conclusion.conclusion
+                evidence["analyst"] = analyst_conclusion.model_dump(mode="json")
+            next_version = await self._next_report_version(task.id)
+            now = _now()
+            report = BiReport(
+                id=str(uuid4()),
+                task_id=task.id,
+                session_id=task.session_id,
+                candidate_version=candidate_version,
+                report_version=next_version,
+                chart_data_json=chart_data,
+                conclusion_text=conclusion,
+                evidence_json=evidence,
+                status="completed",
+                completed_at=now,
+                created_at=now,
+                updated_at=now,
+            )
+            self._db.add(report)
+            await self._db.flush()
+            await self._append_event(
+                task,
+                TaskEventType.BI_UPDATED,
+                {
+                    "report_id": report.id,
+                    "report_version": report.report_version,
+                    "candidate_version": candidate_version,
+                },
+            )
+            return report
+
+    async def analyst_input(self, task_id: str) -> dict[str, Any]:
+        """提供已脱敏的确定性 BI 输入；不暴露原始 MCP 载荷。"""
+        task = await self._db.scalar(select(AnalysisTask).where(AnalysisTask.id == task_id))
+        if task is None:
+            raise LookupError("analysis_task_not_found")
+        version = await self._latest_candidate_version(task_id)
+        if version is None:
+            raise ValueError("candidate_version_not_found")
+        candidates = await self._candidate_rows(task_id, version)
+        if not candidates:
+            raise ValueError("candidate_version_empty")
+        chart_data, _conclusion, _evidence = self._build_bi_payload(candidates, version)
+        return {"task_id": task_id, "candidate_version": version, "bi": chart_data}
+
+    async def list_candidates(
+        self, user_id: str, task_id: str, *, sort: str, direction: str
+    ) -> tuple[int, list[tuple[TaskCandidate, Kol, KolSnapshot]]]:
+        await self._owned_task(user_id, task_id)
+        version = await self._latest_candidate_version(task_id)
+        if version is None:
+            return 0, []
+        rows = await self._candidate_rows(task_id, version)
+        reverse = direction == "desc"
+        valid_sorts = {"rank", "total", "audience", "content", "engagement", "budget", "growth", "brand_safety"}
+        selected_sort = sort if sort in valid_sorts else "rank"
+
+        def numeric_score(candidate: TaskCandidate) -> float:
+            if selected_sort == "rank":
+                return float(candidate.rank)
+            if selected_sort == "total":
+                return float(candidate.total_score)
+            dimensions = candidate.score_breakdown_json.get("dimensions", {})
+            value = dimensions.get(selected_sort, {}).get("raw_score")
+            return float(value) if value is not None else -1.0
+
+        # rank 的默认升序符合用户看到的候选序，其他字段可由 direction 决定。
+        rows.sort(key=lambda row: (numeric_score(row[0]), row[0].rank), reverse=reverse)
+        return version, rows
+
+    async def get_owned_report(self, user_id: str, report_id: str) -> BiReport:
+        report = await self._db.scalar(
+            select(BiReport)
+            .join(AnalysisTask, AnalysisTask.id == BiReport.task_id)
+            .where(BiReport.id == report_id, AnalysisTask.user_id == user_id)
+        )
+        if report is None:
+            raise LookupError("report_not_found")
+        return report
+
+    async def list_favorites(self, user_id: str) -> list[tuple[UserKolFavorite, Kol]]:
+        return list(
+            (
+                await self._db.execute(
+                    select(UserKolFavorite, Kol)
+                    .join(Kol, Kol.id == UserKolFavorite.kol_id)
+                    .where(UserKolFavorite.user_id == user_id)
+                    .order_by(UserKolFavorite.created_at.desc())
+                )
+            ).all()
+        )
+
+    async def create_favorite(
+        self, user_id: str, *, kol_id: str, note: str | None, source_task_id: str | None
+    ) -> tuple[UserKolFavorite, Kol]:
+        async with self._transaction():
+            kol = await self._db.get(Kol, kol_id)
+            if kol is None:
+                raise LookupError("kol_not_found")
+            if source_task_id is not None:
+                await self._owned_task(user_id, source_task_id)
+                candidate = await self._db.scalar(
+                    select(TaskCandidate.id).where(
+                        TaskCandidate.task_id == source_task_id, TaskCandidate.kol_id == kol_id
+                    )
+                )
+                if candidate is None:
+                    raise LookupError("candidate_not_found")
+            favorite = await self._db.scalar(
+                select(UserKolFavorite)
+                .where(UserKolFavorite.user_id == user_id, UserKolFavorite.kol_id == kol_id)
+                .with_for_update()
+            )
+            now = _now()
+            if favorite is None:
+                favorite = UserKolFavorite(
+                    id=str(uuid4()),
+                    user_id=user_id,
+                    kol_id=kol_id,
+                    note=note,
+                    source_task_id=source_task_id,
+                    created_at=now,
+                    updated_at=now,
+                )
+                self._db.add(favorite)
+            else:
+                if note is not None:
+                    favorite.note = note
+                if source_task_id is not None:
+                    favorite.source_task_id = source_task_id
+                favorite.updated_at = now
+            await self._db.flush()
+            return favorite, kol
+
+    async def delete_favorite(self, user_id: str, kol_id: str) -> None:
+        async with self._transaction():
+            favorite = await self._db.scalar(
+                select(UserKolFavorite)
+                .where(UserKolFavorite.user_id == user_id, UserKolFavorite.kol_id == kol_id)
+                .with_for_update()
+            )
+            if favorite is None:
+                raise LookupError("favorite_not_found")
+            await self._db.delete(favorite)
+            await self._db.flush()
+
+    async def latest_session_analysis(
+        self, user_id: str, session_id: str
+    ) -> tuple[AnalysisTask | None, int | None, int, BiReport | None]:
+        task = await self._db.scalar(
+            select(AnalysisTask)
+            .where(AnalysisTask.user_id == user_id, AnalysisTask.session_id == session_id)
+            .order_by(AnalysisTask.created_at.desc())
+        )
+        if task is None:
+            return None, None, 0, None
+        version = await self._latest_candidate_version(task.id)
+        total = 0
+        if version is not None:
+            total = int(
+                await self._db.scalar(
+                    select(func.count()).select_from(TaskCandidate).where(
+                        TaskCandidate.task_id == task.id,
+                        TaskCandidate.candidate_version == version,
+                    )
+                )
+                or 0
+            )
+        report = await self._db.scalar(
+            select(BiReport)
+            .where(BiReport.task_id == task.id)
+            .order_by(BiReport.report_version.desc())
+        )
+        return task, version, total, report
 
     async def _successful_evidence(self, task_id: str) -> tuple[ToolEvidence, ...]:
         calls = list(
@@ -196,6 +406,118 @@ class ReportingService:
                     ),
                 )
         return None
+
+    async def _latest_candidate_version(self, task_id: str) -> int | None:
+        return await self._db.scalar(
+            select(func.max(TaskCandidate.candidate_version)).where(TaskCandidate.task_id == task_id)
+        )
+
+    async def _candidate_rows(
+        self, task_id: str, candidate_version: int
+    ) -> list[tuple[TaskCandidate, Kol, KolSnapshot]]:
+        return list(
+            (
+                await self._db.execute(
+                    select(TaskCandidate, Kol, KolSnapshot)
+                    .join(Kol, Kol.id == TaskCandidate.kol_id)
+                    .join(KolSnapshot, KolSnapshot.id == TaskCandidate.snapshot_id)
+                    .where(
+                        TaskCandidate.task_id == task_id,
+                        TaskCandidate.candidate_version == candidate_version,
+                    )
+                    .order_by(TaskCandidate.rank.asc())
+                )
+            ).all()
+        )
+
+    async def _next_report_version(self, task_id: str) -> int:
+        latest = await self._db.scalar(
+            select(func.max(BiReport.report_version)).where(BiReport.task_id == task_id)
+        )
+        return int(latest or 0) + 1
+
+    async def _owned_task(self, user_id: str, task_id: str) -> AnalysisTask:
+        task = await self._db.scalar(
+            select(AnalysisTask).where(AnalysisTask.id == task_id, AnalysisTask.user_id == user_id)
+        )
+        if task is None:
+            raise LookupError("task_not_found")
+        return task
+
+    async def _append_event(
+        self, task: AnalysisTask, event_type: TaskEventType, payload: dict[str, Any]
+    ) -> None:
+        self._db.add(
+            TaskEvent(
+                task_id=task.id,
+                user_id=task.user_id,
+                event_type=event_type,
+                payload_json=payload,
+                created_at=_now(),
+            )
+        )
+        await self._db.flush()
+
+    @staticmethod
+    def _build_bi_payload(
+        candidates: list[tuple[TaskCandidate, Kol, KolSnapshot]], candidate_version: int
+    ) -> tuple[dict[str, Any], str, dict[str, Any]]:
+        dimensions = ("audience", "content", "engagement", "budget", "growth", "brand_safety")
+        score_composition = []
+        for dimension in dimensions:
+            values = [
+                row.score_breakdown_json.get("dimensions", {}).get(dimension, {}).get("raw_score")
+                for row, _kol, _snapshot in candidates
+            ]
+            usable = [float(value) for value in values if value is not None]
+            score_composition.append(
+                {"dimension": dimension, "average": round(sum(usable) / len(usable), 2) if usable else None}
+            )
+        platform_counts: dict[str, int] = {}
+        risks: list[dict[str, Any]] = []
+        comparison: list[dict[str, Any]] = []
+        source_ids: list[str] = []
+        for candidate, kol, snapshot in candidates:
+            platform_counts[kol.platform] = platform_counts.get(kol.platform, 0) + 1
+            risks.extend(candidate.risk_flags_json)
+            comparison.append(
+                {
+                    "kol_id": kol.id,
+                    "platform": kol.platform,
+                    "platform_account_id": kol.platform_account_id,
+                    "rank": candidate.rank,
+                    "total_score": float(candidate.total_score),
+                }
+            )
+            if snapshot.source_mcp_call_id is not None:
+                source_ids.append(snapshot.source_mcp_call_id)
+        top, top_kol, _ = candidates[0]
+        top_nickname = top_kol.platform_account_id
+        chart_data = {
+            "overview": {
+                "candidate_count": len(candidates),
+                "candidate_version": candidate_version,
+                "top_kol_id": top.kol_id,
+                "top_score": float(top.total_score),
+            },
+            "score_composition": score_composition,
+            "audience_content_fit": {
+                "audience": next(item["average"] for item in score_composition if item["dimension"] == "audience"),
+                "content": next(item["average"] for item in score_composition if item["dimension"] == "content"),
+            },
+            "platform_distribution": [
+                {"platform": platform, "count": count}
+                for platform, count in sorted(platform_counts.items())
+            ],
+            "budget_analysis": {
+                "average_budget_score": next(item["average"] for item in score_composition if item["dimension"] == "budget")
+            },
+            "comparison": comparison,
+            "risks": risks,
+            "sources": [{"mcp_call_id": source_id} for source_id in sorted(set(source_ids))],
+        }
+        conclusion = f"已基于候选版本 {candidate_version} 生成 {len(candidates)} 位达人对比，当前首选为 {top_nickname}。"
+        return chart_data, conclusion, {"candidate_version": candidate_version, "source_call_ids": sorted(set(source_ids))}
 
     async def _next_candidate_version(self, task_id: str) -> int:
         rows = list(

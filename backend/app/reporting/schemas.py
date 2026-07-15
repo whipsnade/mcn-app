@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+from pydantic import BaseModel, Field
+
 
 @dataclass(frozen=True)
 class ToolEvidence:
@@ -134,3 +136,86 @@ class CandidateVersion:
     candidate_version: int
     evidence_digest: str
     candidates: tuple[CandidateVersionItem, ...]
+
+
+class CandidateRead(BaseModel):
+    id: str
+    kol_id: str
+    platform: str
+    platform_account_id: str
+    nickname: str | None = None
+    profile_url: str | None = None
+    rank: int
+    total_score: float
+    scores: dict[str, float | None]
+    matched_conditions: list[str]
+    risks: list[dict[str, Any]]
+    recommendation: str
+
+
+class CandidatePage(BaseModel):
+    task_id: str
+    version: int
+    total: int
+    items: list[CandidateRead]
+
+
+class CandidateVersionSummary(BaseModel):
+    task_id: str
+    version: int
+    total: int
+
+
+class TaskAnalysisSummary(BaseModel):
+    id: str
+    status: str
+    completed_at: datetime | None = None
+
+
+class BiReportRead(BaseModel):
+    id: str
+    task_id: str
+    report_version: int
+    candidate_version: int
+    overview: dict[str, Any]
+    score_composition: list[dict[str, Any]]
+    audience_content_fit: dict[str, Any]
+    platform_distribution: list[dict[str, Any]]
+    budget_analysis: dict[str, Any]
+    comparison: list[dict[str, Any]]
+    risks: list[dict[str, Any]]
+    conclusion: str
+    sources: list[dict[str, Any]]
+    generated_at: datetime
+
+
+class BiReportSummary(BaseModel):
+    id: str
+    task_id: str
+    report_version: int
+    candidate_version: int
+    status: str
+    generated_at: datetime
+
+
+class FavoriteCreate(BaseModel):
+    kol_id: str = Field(min_length=1, max_length=36)
+    note: str | None = Field(default=None, max_length=500)
+    source_task_id: str | None = Field(default=None, min_length=1, max_length=36)
+
+
+class FavoriteRead(BaseModel):
+    kol_id: str
+    platform: str
+    platform_account_id: str
+    profile_url: str | None = None
+    note: str | None = None
+    source_task_id: str | None = None
+    created_at: datetime
+
+
+class AnalystConclusion(BaseModel):
+    """模型仅可补充可追溯的结论，不能修改候选集合、评分或版本。"""
+
+    conclusion: str = Field(min_length=1, max_length=2_000)
+    caveats: list[str] = Field(default_factory=list, max_length=10)

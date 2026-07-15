@@ -42,6 +42,14 @@ class McpBatchGateway(Protocol):
     async def execute_batch(self, commands: tuple[ExecuteMcpCall, ...]) -> tuple[Any, ...]: ...
 
 
+class TaskArtifacts(Protocol):
+    async def build_candidates(self, task_id: str) -> Any: ...
+
+    async def build_bi_report(self, task_id: str) -> Any: ...
+
+    async def stream_summary(self, task_id: str) -> Any: ...
+
+
 Checkpoint = Callable[[str], Awaitable[None]]
 
 
@@ -59,6 +67,7 @@ class TaskExecutor:
         context_builder: ContextBuilder,
         planner: TaskPlanner,
         gateway: McpBatchGateway,
+        artifacts: TaskArtifacts | None = None,
         worker_id: str,
         lease_seconds: int = 60,
         heartbeat_seconds: float | None = None,
@@ -68,6 +77,7 @@ class TaskExecutor:
         self.context_builder = context_builder
         self.planner = planner
         self.gateway = gateway
+        self.artifacts = artifacts
         self.worker_id = worker_id
         self.lease_seconds = lease_seconds
         self.heartbeat_seconds = (
@@ -125,10 +135,14 @@ class TaskExecutor:
                     task.id, self.worker_id, self.lease_seconds
                 ):
                     return
-            # Task 9 supplies durable candidate/BI artifacts. Checkpoints make
-            # their future persistence boundaries recoverable now.
+            if self.artifacts is not None:
+                await self.artifacts.build_candidates(task.id)
             await self.checkpoint("after_candidates")
+            if self.artifacts is not None:
+                await self.artifacts.build_bi_report(task.id)
             await self.checkpoint("after_bi")
+            if self.artifacts is not None:
+                await self.artifacts.stream_summary(task.id)
             await self.repository.mark_completed(task.id, self.worker_id)
         except asyncio.CancelledError:
             await self.repository.mark_interrupted(task.id, self.worker_id)

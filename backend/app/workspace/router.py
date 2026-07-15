@@ -5,6 +5,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_db
 from app.identity.dependencies import CurrentUser
+from app.reporting.router import bi_report_summary
+from app.reporting.schemas import CandidateVersionSummary, TaskAnalysisSummary
+from app.reporting.service import ReportingService
 from app.workspace.models import Message, WorkspaceSession
 from app.workspace.schemas import MessageCreate, MessageRead, SessionCreate, SessionRead, SessionUpdate
 from app.workspace.service import WorkspaceService
@@ -25,11 +28,32 @@ def message_read(message: Message) -> MessageRead:
 
 
 async def session_read(
-    service: WorkspaceService, workspace: WorkspaceSession, *, include_messages: bool
+    service: WorkspaceService,
+    workspace: WorkspaceSession,
+    *,
+    include_messages: bool,
+    include_analysis: bool = False,
 ) -> SessionRead:
     messages = (
         await service.list_messages(workspace.user_id, workspace.id) if include_messages else []
     )
+    latest_task = None
+    latest_candidates = None
+    latest_report = None
+    if include_analysis:
+        task, version, total, report = await ReportingService(service.db).latest_session_analysis(
+            workspace.user_id, workspace.id
+        )
+        if task is not None:
+            latest_task = TaskAnalysisSummary(
+                id=task.id, status=task.status, completed_at=task.completed_at
+            )
+        if version is not None:
+            latest_candidates = CandidateVersionSummary(
+                task_id=task.id, version=version, total=total
+            )
+        if report is not None:
+            latest_report = bi_report_summary(report)
     return SessionRead(
         id=workspace.id,
         title=workspace.title,
@@ -44,6 +68,9 @@ async def session_read(
         filters=workspace.filters_snapshot,
         is_starred=workspace.is_starred,
         messages=[message_read(message) for message in messages],
+        latest_task=latest_task,
+        latest_candidates=latest_candidates,
+        latest_report=latest_report,
         created_at=workspace.created_at,
         updated_at=workspace.updated_at,
     )
@@ -85,7 +112,7 @@ async def get_session(
         workspace = await service.get_owned_session(user.id, session_id)
     except LookupError as error:
         raise not_found(error) from error
-    return await session_read(service, workspace, include_messages=True)
+    return await session_read(service, workspace, include_messages=True, include_analysis=True)
 
 
 @router.patch("/{session_id}", response_model=SessionRead)

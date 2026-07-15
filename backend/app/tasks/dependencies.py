@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import json
 import os
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from functools import lru_cache
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.core.config import get_settings
 from app.db.session import SessionFactory
@@ -16,12 +18,19 @@ from app.mcp_gateway.fake import FakeMcpTransport
 from app.mcp_gateway.registry import ToolRegistryService
 from app.mcp_gateway.service import McpGatewayService
 from app.model.dependencies import get_model_adapter
+from app.model.contracts import ChatMessage, StreamingModelRequest, StructuredModelRequest
+from app.model.prompts import ANALYST_PROMPT, SUMMARY_PROMPT
 from app.orchestration.context import ContextBuilder
 from app.orchestration.planner import Planner
 from app.tasks.executor import TaskExecutor, TaskRunner
 from app.tasks.models import AnalysisTask
 from app.tasks.recovery import TaskRecovery
 from app.tasks.repository import TaskRepository
+from app.workspace.models import Message
+from app.reporting.models import BiReport
+from app.reporting.schemas import AnalystConclusion
+from app.reporting.service import ReportingService
+from app.tasks.state import TaskEventType
 from app.workspace.service import WorkspaceService
 
 
@@ -81,6 +90,139 @@ class _PlanArguments:
         raise LookupError("task_plan_step_not_found")
 
 
+class _TaskArtifacts:
+    """将执行器的短边界映射为独立数据库事务，恢复时可安全重入。"""
+
+    def __init__(self, model) -> None:
+        self._model = model
+
+    async def _profile(self, task_id: str) -> str:
+        async with SessionFactory() as db:
+            task = await db.get(AnalysisTask, task_id)
+            if task is None:
+                raise LookupError("task_not_found")
+            message = await db.get(Message, task.trigger_message_id)
+            value = (message.metadata_json if message is not None else {}).get("scoring_profile")
+            return value if value in {"balanced", "audience_first", "performance_first", "budget_first", "risk_first"} else "balanced"
+
+    async def build_candidates(self, task_id: str):
+        profile = await self._profile(task_id)
+        async with SessionFactory.begin() as db:
+            return await ReportingService(db).build_candidate_version(task_id, profile)
+
+    async def build_bi_report(self, task_id: str):
+        async with SessionFactory() as db:
+            analyst_input = await ReportingService(db).analyst_input(task_id)
+        result = await self._model.complete_json(
+            StructuredModelRequest(
+                purpose="analyst",
+                template_name=ANALYST_PROMPT.name,
+                messages=(
+                    ChatMessage(role="system", content=ANALYST_PROMPT.system),
+                    ChatMessage(
+                        role="user",
+                        content=json.dumps(
+                            analyst_input,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    ),
+                ),
+                output_model=AnalystConclusion,
+            )
+        )
+        async with SessionFactory.begin() as db:
+            return await ReportingService(db).build_bi_report(
+                task_id, analyst_conclusion=result.value
+            )
+
+    async def stream_summary(self, task_id: str) -> None:
+        """逐段提交草稿与事件；客户端断开后执行器仍会完成该过程。"""
+        async with SessionFactory() as db:
+            report = await db.scalar(
+                select(BiReport).where(BiReport.task_id == task_id).order_by(BiReport.report_version.desc())
+            )
+            task = await db.get(AnalysisTask, task_id)
+            if report is None or task is None:
+                raise LookupError("report_not_found")
+            summary_input = {
+                "task_id": task.id,
+                "report_id": report.id,
+                "candidate_version": report.candidate_version,
+                "overview": report.chart_data_json.get("overview", {}),
+                "conclusion": report.conclusion_text or "",
+            }
+        content = ""
+        message_id: str | None = None
+        async for event in self._model.stream_text(
+            StreamingModelRequest(
+                messages=(
+                    ChatMessage(role="system", content=SUMMARY_PROMPT.system),
+                    ChatMessage(
+                        role="user",
+                        content=json.dumps(summary_input, ensure_ascii=False, sort_keys=True),
+                    ),
+                )
+            )
+        ):
+            if event.type != "text.delta" or not event.text:
+                continue
+            content += event.text
+            message_id = await self._save_summary_delta(task_id, message_id, content, event.text)
+        if message_id is None:
+            raise ValueError("summary_stream_empty")
+        async with SessionFactory.begin() as db:
+            message = await db.get(Message, message_id)
+            task = await db.get(AnalysisTask, task_id)
+            if message is None or task is None:
+                raise LookupError("summary_message_not_found")
+            message.metadata_json = {**message.metadata_json, "status": "completed"}
+            await TaskRepository(db).append_event(
+                task.id,
+                task.user_id,
+                TaskEventType.MESSAGE_COMPLETED,
+                {"message_id": message.id},
+            )
+
+    async def _save_summary_delta(
+        self, task_id: str, message_id: str | None, content: str, delta: str
+    ) -> str:
+        async with SessionFactory.begin() as db:
+            task = await db.get(AnalysisTask, task_id)
+            if task is None:
+                raise LookupError("task_not_found")
+            if message_id is None:
+                sequence = (
+                    await db.scalar(select(func.max(Message.sequence)).where(Message.session_id == task.session_id))
+                    or 0
+                ) + 1
+                message = Message(
+                    id=str(uuid4()),
+                    session_id=task.session_id,
+                    user_id=task.user_id,
+                    role="assistant",
+                    content=content,
+                    sequence=sequence,
+                    metadata_json={"task_id": task.id, "status": "streaming"},
+                    created_at=datetime.now(UTC).replace(tzinfo=None),
+                )
+                db.add(message)
+                await db.flush()
+            else:
+                message = await db.get(Message, message_id)
+                if message is None:
+                    raise LookupError("summary_message_not_found")
+                message.content = content
+            await TaskRepository(db).append_event(
+                task.id,
+                task.user_id,
+                TaskEventType.MESSAGE_DELTA,
+                {"message_id": message.id, "delta": delta},
+            )
+            return message.id
+
+
 @lru_cache
 def get_mcp_transport():
     settings = get_settings()
@@ -99,6 +241,7 @@ class TaskExecutionDependencies:
         self._planner = Planner(model=get_model_adapter())
         self._transport = get_mcp_transport()
         self._arguments = _PlanArguments()
+        self._artifacts = _TaskArtifacts(get_model_adapter())
 
     async def build(self, user_id: str, session_id: str):
         async with SessionFactory() as db:
@@ -127,6 +270,7 @@ class TaskExecutionDependencies:
             context_builder=self,
             planner=self,
             gateway=self,
+            artifacts=self._artifacts,
             worker_id=f"{self.worker_id_prefix}-{uuid4()}",
             lease_seconds=get_settings().task_lease_seconds,
         )
