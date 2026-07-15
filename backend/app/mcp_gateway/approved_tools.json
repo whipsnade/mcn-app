@@ -1,4 +1,60 @@
 {
   "manifest_version": 1,
-  "tools": []
+  "tools": [
+    {
+      "internal_name": "datatap.xiaohongshu.kol.search.v1",
+      "service": "social-grow-mcp",
+      "remote_name": "kol_xiaohongshu_search",
+      "description": "小红书 KOL 候选检索。arguments 必须为 {request:{...}}；优先按用户条件设置 page=1、size（最多100）、followercountMin、sumpostMin（近30天活跃）、sexListFan/sexListFanMin、ageListFan/ageListFanMin、kwProvinceList、品牌或品类提及标签，无法确定标签时才用 textContentWord。此工具仅能筛选达人所在地浙江省，不能验证粉丝城市为湖州/浙江或粉丝消费力金额，结果分析必须明确这些数据限制。",
+      "input_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "request": {
+            "default": null,
+            "anyOf": [
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "page": {"type": "integer", "minimum": 1},
+                  "size": {"type": "integer", "minimum": 1, "maximum": 100},
+                  "followercountMin": {"type": "integer", "minimum": 0},
+                  "followercountMax": {"type": "integer", "minimum": 0},
+                  "kwProvinceList": {"type": "array", "items": {"type": "string"}, "maxItems": 34},
+                  "sexListFan": {"type": "array", "items": {"type": "string", "enum": ["malePercentFan", "femalePercentFan"]}, "maxItems": 2},
+                  "sexListFanMin": {"type": "number", "minimum": 0, "maximum": 1},
+                  "ageListFan": {"type": "array", "items": {"type": "string", "enum": ["age1PercentFan", "age2PercentFan", "age3PercentFan", "age4PercentFan", "age5PercentFan"]}, "maxItems": 5},
+                  "ageListFanMin": {"type": "number", "minimum": 0, "maximum": 1},
+                  "sumpostMin": {"type": "integer", "minimum": 0},
+                  "sumpostMax": {"type": "integer", "minimum": 0},
+                  "avginteractMin": {"type": "integer", "minimum": 0},
+                  "avginteractMax": {"type": "integer", "minimum": 0},
+                  "indexMin": {"type": "integer", "minimum": 0, "maximum": 100},
+                  "indexMax": {"type": "integer", "minimum": 0, "maximum": 100},
+                  "realityfollowerrateMin": {"type": "number", "minimum": 0, "maximum": 1},
+                  "realityfollowerrateMax": {"type": "number", "minimum": 0, "maximum": 1},
+                  "explosiveRateMin": {"type": "number", "minimum": 0, "maximum": 1},
+                  "explosiveRateMax": {"type": "number", "minimum": 0, "maximum": 1},
+                  "brandMentionsTag": {"type": "array", "items": {"type": "string"}, "maxItems": 20},
+                  "categoryMentionsTag": {"type": "array", "items": {"type": "string"}, "maxItems": 20},
+                  "textContentWord": {"type": "string", "minLength": 1, "maxLength": 100}
+                }
+              },
+              {"type": "null"}
+            ]
+          }
+        },
+        "required": ["request"]
+      },
+      "output_schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {"result": {"type": "string"}},
+        "required": ["result"]
+      },
+      "discovery_digest": "51ab3428315fb597b54c37a06bf47e4bda8933e676b6c5f6c121b606e5a096d5",
+      "enabled": true
+    }
+  ]
 }

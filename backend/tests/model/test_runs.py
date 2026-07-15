@@ -23,7 +23,7 @@ def metadata() -> ModelRequestMetadata:
     return ModelRequestMetadata(
         purpose="planner",
         provider="tencent_plan",
-        model="deepseek-v4-pro-202606",
+        model="deepseek-v4-pro",
         prompt_template="planner_v1",
         prompt_version="1",
     )
@@ -69,7 +69,7 @@ def test_model_run_metadata_rejects_prompt_body_and_secret() -> None:
         ModelRequestMetadata(
             purpose="planner",
             provider="tencent_plan",
-            model="deepseek-v4-pro-202606",
+            model="deepseek-v4-pro",
             prompt_template="planner_v1",
             prompt_version="1",
             content="sensitive body",

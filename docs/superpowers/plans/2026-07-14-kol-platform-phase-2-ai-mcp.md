@@ -12,7 +12,7 @@
 
 - API 前缀固定为 `/api/v1`；预期注册用户约 100 人，同时在线和同时执行任务不超过 10。
 - 第二阶段运行单个 FastAPI/Uvicorn worker；在引入跨进程事件总线前不能横向启动多个 API worker。
-- 模型协议固定为 `openai-completions`，Base URL 固定为 `https://tokenhub.tencentmaas.com/plan/v3`，模型固定为 `deepseek-v4-pro-202606`。
+- 模型协议固定为 `openai-completions`，Base URL 固定为 `https://tokenhub.tencentmaas.com/plan/v3`，模型固定为 `deepseek-v4-pro`。
 - 模型和 DataTap 凭据只能由未提交的运行环境注入，禁止进入源码、数据库、事件、日志、测试夹具和前端构建产物。
 - DataTap 只允许 `insight-cube-mcp`、`social-grow-mcp`、`social-grow-content-mcp`、`aktools-mcp`、`bilibili-mcp`。
 - `zhihu-mcp`、`toutiao-mcp`、`baidu-index-mcp`、`google-trends-mcp` 在配置、发现、注册表、路由和测试中都必须拒绝。
@@ -348,7 +348,7 @@ def ensure_transition(source: TaskStatus, target: TaskStatus) -> None:
 model_provider: Literal["tencent_plan", "fake"] = "fake"
 tencent_plan_base_url: AnyHttpUrl = AnyHttpUrl("https://tokenhub.tencentmaas.com/plan/v3")
 tencent_plan_api_key: SecretStr | None = None
-tencent_plan_model: str = "deepseek-v4-pro-202606"
+tencent_plan_model: str = "deepseek-v4-pro"
 model_timeout_seconds: float = 60.0
 mcp_provider: Literal["datatap", "fake"] = "fake"
 datatap_mcp_token: SecretStr | None = None
@@ -371,7 +371,7 @@ def datatap_endpoint(self, service: DataTapService) -> AnyHttpUrl:
 # .env.example 第二阶段配置
 MODEL_PROVIDER=fake
 TENCENT_PLAN_BASE_URL=https://tokenhub.tencentmaas.com/plan/v3
-TENCENT_PLAN_MODEL=deepseek-v4-pro-202606
+TENCENT_PLAN_MODEL=deepseek-v4-pro
 TENCENT_PLAN_API_KEY=
 MODEL_TIMEOUT_SECONDS=60
 MCP_PROVIDER=fake

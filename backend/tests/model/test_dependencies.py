@@ -51,4 +51,4 @@ def test_tencent_client_disables_sdk_retries_and_uses_fixed_settings(monkeypatch
         "max_retries": 0,
         "timeout": 60.0,
     }
-    assert adapter.model == "deepseek-v4-pro-202606"
+    assert adapter.model == "deepseek-v4-pro"

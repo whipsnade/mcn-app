@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from decimal import Decimal, InvalidOperation
+import json
 import re
 from typing import Any
 import unicodedata
@@ -107,6 +108,78 @@ def _creator_search_adapter(item: ToolEvidence) -> tuple[NormalizedKolEvidence, 
     if not isinstance(candidates, list):
         raise ValueError("invalid_creator_search_evidence")
     return tuple(_normalize_candidate(item, candidate) for candidate in candidates)
+
+
+def _datatap_xiaohongshu_search_adapter(
+    item: ToolEvidence,
+) -> tuple[NormalizedKolEvidence, ...]:
+    """将评审过的小红书 KOL 列表结果映射为内部统一证据。
+
+    DataTap 将列表序列化在 ``result`` 字符串中；只提取用于候选比对的
+    公开指标，避免把达人简介、联系方式或头像等原始字段写入候选快照。
+    """
+    raw_result = item.payload.get("result")
+    if not isinstance(raw_result, str):
+        raise ValueError("invalid_datatap_xiaohongshu_result")
+    try:
+        payload = json.loads(raw_result)
+    except json.JSONDecodeError as exc:
+        raise ValueError("invalid_datatap_xiaohongshu_result") from exc
+    candidates = payload.get("KOL 列表") if isinstance(payload, dict) else None
+    if not isinstance(candidates, list):
+        raise ValueError("invalid_datatap_xiaohongshu_candidates")
+    return tuple(_normalize_datatap_xiaohongshu_candidate(item, candidate) for candidate in candidates)
+
+
+def _normalize_datatap_xiaohongshu_candidate(
+    item: ToolEvidence, candidate: Any
+) -> NormalizedKolEvidence:
+    if not isinstance(candidate, dict):
+        raise ValueError("invalid_datatap_xiaohongshu_candidate")
+    account_id = _required_string(candidate, "账号ID (kwUid)")
+    platform = _optional_string(candidate.get("平台")) or "xiaohongshu"
+    if platform != "xiaohongshu":
+        raise ValueError("invalid_datatap_xiaohongshu_platform")
+    engagement_rate = _first_percentage(
+        candidate,
+        "互动率-图文笔记",
+        "互动率-视频笔记",
+    )
+    quoted_price = _first_currency(
+        candidate,
+        "预估报价-视频",
+        "预估报价-图文",
+        "官方报价-视频",
+        "官方报价-图文",
+    )
+    risk_flags: list[dict[str, Any]] = []
+    if candidate.get("近30天是否有发文") is False:
+        risk_flags.append({"type": "inactive_last_30_days"})
+    if candidate.get("是否活跃") is False:
+        risk_flags.append({"type": "activity_flag_false"})
+    fields = {
+        "nickname": _optional_string(candidate.get("昵称")),
+        "normalized_profile_url": _optional_string(candidate.get("主页")),
+        "followers": _unit_integer(candidate.get("粉丝数")),
+        "engagement_rate": engagement_rate,
+        "quoted_price_cny": quoted_price,
+        "content_score": _score(candidate.get("综合评分")),
+        "audience_score": _percentage(candidate.get("有效粉丝率")),
+        "engagement_score": engagement_rate,
+        "budget_score": None,
+        "growth_score": None,
+        "brand_safety_score": None,
+    }
+    missing = tuple(name for name, value in fields.items() if value is None)
+    return NormalizedKolEvidence(
+        platform=platform,
+        platform_account_id=account_id,
+        risk_flags=tuple(redact_evidence_for_storage(risk_flags)),
+        collected_at=item.collected_at,
+        evidence_references=(item.source_call_id,) if item.source_call_id else (),
+        missing_fields=missing,
+        **fields,
+    )
 
 
 def _normalize_candidate(item: ToolEvidence, candidate: Any) -> NormalizedKolEvidence:
@@ -219,6 +292,12 @@ def _percentage(value: Any) -> float | None:
     return float(normalized)
 
 
+def _first_percentage(candidate: dict[str, Any], *names: str) -> float | None:
+    values = [_percentage(candidate.get(name)) for name in names]
+    present = [value for value in values if value is not None]
+    return max(present) if present else None
+
+
 def _currency_cny(value: Any) -> float | None:
     if value is None:
         return None
@@ -232,6 +311,14 @@ def _currency_cny(value: Any) -> float | None:
     if number is None or number < 0:
         raise ValueError("invalid_currency_value")
     return float(number * multiplier)
+
+
+def _first_currency(candidate: dict[str, Any], *names: str) -> float | None:
+    for name in names:
+        value = _currency_cny(candidate.get(name))
+        if value is not None:
+            return value
+    return None
 
 
 def _score(value: Any) -> float | None:
@@ -262,4 +349,5 @@ _ADAPTERS: dict[str, Adapter] = {
     "creator.profile.v1": _creator_search_adapter,
     "bilibili.creator.search.v1": _creator_search_adapter,
     "bilibili.creator.profile.v1": _creator_search_adapter,
+    "datatap.xiaohongshu.kol.search.v1": _datatap_xiaohongshu_search_adapter,
 }

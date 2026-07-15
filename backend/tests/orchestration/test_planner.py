@@ -10,6 +10,7 @@ from app.model.fake import FakeModelAdapter
 from app.orchestration.planner import PlanValidationError, Planner
 from app.orchestration.schemas import (
     PlannerContext,
+    PlannerMessage,
     PlannerTool,
     SessionBrief,
     ToolPlan,
@@ -27,6 +28,33 @@ def _tool() -> PlannerTool:
             "properties": {"keyword": {"type": "string", "minLength": 1}},
             "required": ["keyword"],
             "additionalProperties": False,
+        },
+    )
+
+
+def _xiaohongshu_tool() -> PlannerTool:
+    return PlannerTool(
+        catalog_id="catalog-xhs-1",
+        internal_name="datatap.xiaohongshu.kol.search.v1",
+        service=DataTapService.SOCIAL_GROW,
+        input_schema={
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "request": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "page": {"type": "integer"},
+                        "size": {"type": "integer"},
+                        "followercountMin": {"type": "integer"},
+                        "kwProvinceList": {"type": "array", "items": {"type": "string"}},
+                        "sumpostMin": {"type": "integer"},
+                        "textContentWord": {"type": "string"},
+                    },
+                }
+            },
+            "required": ["request"],
         },
     )
 
@@ -161,3 +189,52 @@ async def test_plan_rejects_tool_service_outside_user_channels() -> None:
         )
 
     assert caught.value.code == "SERVICE_CHANNEL_NOT_ALLOWED"
+
+
+@pytest.mark.asyncio
+async def test_plan_compiles_supported_defaults_for_datatap_xiaohongshu_search() -> None:
+    context = context_fixture(allowed_channels=("xiaohongshu",), platforms=("xiaohongshu",))
+    context = context.model_copy(
+        update={
+            "brief": context.brief.model_copy(
+                update={
+                    "brand": "科颜氏",
+                    "filters": {"target_fan_locations": ["湖州", "浙江"]},
+                }
+            ),
+            "recent_messages": (
+                PlannerMessage(role="user", content="找最近30天活跃 top10 达人", sequence=1),
+            ),
+            "tools": (_xiaohongshu_tool(),),
+        }
+    )
+    plan = ToolPlan(
+        objective="找达人",
+        steps=(
+            ToolPlanStep(
+                id="step_1",
+                internal_tool_name="datatap.xiaohongshu.kol.search.v1",
+                arguments={
+                    "request": {
+                        "followercountMin": 20_000,
+                        "kwProvinceList": ["湖州", "浙江"],
+                    }
+                },
+                evidence_goal="候选达人列表",
+            ),
+        ),
+    )
+    planner, _ = _planner(plan)
+
+    result = await planner.plan(context)
+
+    assert result.steps[0].arguments == {
+        "request": {
+            "page": 1,
+            "size": 10,
+            "followercountMin": 20_000,
+            "kwProvinceList": ["浙江省"],
+            "sumpostMin": 1,
+            "textContentWord": "科颜氏",
+        }
+    }

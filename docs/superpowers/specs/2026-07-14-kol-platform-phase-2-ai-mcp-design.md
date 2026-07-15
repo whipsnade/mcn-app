@@ -29,7 +29,7 @@
 
 - API 形态：`openai-completions`
 - Base URL：`https://tokenhub.tencentmaas.com/plan/v3`
-- 模型标识：`deepseek-v4-pro-202606`
+- 模型标识：`deepseek-v4-pro`
 - 密钥仅由后端运行环境中的 `TENCENT_PLAN_API_KEY` 注入。
 - Base URL 和模型分别由 `TENCENT_PLAN_BASE_URL`、`TENCENT_PLAN_MODEL` 配置。
 - 规划调用使用非流式响应；最终分析使用流式响应。

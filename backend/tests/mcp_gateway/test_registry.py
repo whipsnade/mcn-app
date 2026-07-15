@@ -262,9 +262,14 @@ async def test_remote_rename_quarantines_and_disables_stale_approved_row(
     assert row.is_enabled is False
 
 
-def test_committed_manifest_is_deny_by_default() -> None:
+def test_committed_manifest_contains_only_reviewed_datatap_tool() -> None:
     path = Path(__file__).parents[2] / "app" / "mcp_gateway" / "approved_tools.json"
-    assert json.loads(path.read_text()) == {"manifest_version": 1, "tools": []}
+    manifest = json.loads(path.read_text())
+
+    assert manifest["manifest_version"] == 1
+    assert [tool["internal_name"] for tool in manifest["tools"]] == [
+        "datatap.xiaohongshu.kol.search.v1"
+    ]
 
 
 async def test_manifest_disabled_tool_is_rejected_even_if_database_enabled(

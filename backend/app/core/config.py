@@ -31,7 +31,7 @@ class Settings(BaseSettings):
         "https://tokenhub.tencentmaas.com/plan/v3"
     )
     tencent_plan_api_key: SecretStr | None = None
-    tencent_plan_model: str = "deepseek-v4-pro-202606"
+    tencent_plan_model: str = "deepseek-v4-pro"
     model_timeout_seconds: float = Field(default=60.0, gt=0)
     mcp_provider: Literal["datatap", "fake"] = "fake"
     datatap_mcp_token: SecretStr | None = None
@@ -61,7 +61,7 @@ class Settings(BaseSettings):
             "https://tokenhub.tencentmaas.com/plan/v3"
         ):
             raise ValueError("TENCENT_PLAN_BASE_URL must use the confirmed provider endpoint")
-        if self.tencent_plan_model != "deepseek-v4-pro-202606":
+        if self.tencent_plan_model != "deepseek-v4-pro":
             raise ValueError("TENCENT_PLAN_MODEL must use the confirmed model")
         if self.mcp_call_points != 10:
             raise ValueError("MCP_CALL_POINTS must be 10")

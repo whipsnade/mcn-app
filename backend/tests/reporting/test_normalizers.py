@@ -1,6 +1,8 @@
 import pytest
+from datetime import UTC, datetime
 
 from app.reporting.normalizers import UnknownEvidenceToolError, normalize_tool_evidence
+from app.reporting.schemas import ToolEvidence
 from tests.reporting.fakes import evidence
 
 
@@ -89,3 +91,31 @@ def test_unknown_internal_tool_is_rejected_without_guessing_fields() -> None:
 
     with pytest.raises(UnknownEvidenceToolError):
         normalize_tool_evidence([item])
+
+
+def test_datatap_xiaohongshu_result_is_normalized_from_reviewed_chinese_fields() -> None:
+    item = ToolEvidence(
+        internal_tool_name="datatap.xiaohongshu.kol.search.v1",
+        payload={
+            "result": (
+                '{"KOL 列表":[{"账号ID (kwUid)":"kol-1","平台":"xiaohongshu",'
+                '"昵称":"护肤达人","主页":"https://example.test/kol-1","粉丝数":831811,'
+                '"有效粉丝率":0.618,"综合评分":94.48,"互动率-视频笔记":0.0723,'
+                '"预估报价-视频":57277,"近30天是否有发文":true,"是否活跃":true}]}'
+            )
+        },
+        source_call_id="call-1",
+        collected_at=datetime.now(UTC).replace(tzinfo=None),
+    )
+
+    row = normalize_tool_evidence([item])[0]
+
+    assert row.platform == "xiaohongshu"
+    assert row.platform_account_id == "kol-1"
+    assert row.followers == 831811
+    assert row.engagement_rate == 7.23
+    assert row.quoted_price_cny == 57277
+    assert row.content_score == 94.48
+    assert row.audience_score == 61.8
+    assert row.engagement_score == 7.23
+    assert row.risk_flags == ()
