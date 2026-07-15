@@ -3,6 +3,7 @@ import asyncio
 import pytest
 
 from fakes import FakeExecutionScenario
+from app.tasks.dependencies import SummaryRecoveryMismatch
 from app.tasks.executor import TaskExecutor, TaskRunner
 from app.tasks.state import TaskStatus
 
@@ -194,3 +195,25 @@ async def test_lost_lease_after_mcp_never_starts_artifact_writes() -> None:
     await scenario.executor.run(scenario.task.id)
 
     assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_summary_recovery_mismatch_fails_task_without_task_completed_event() -> None:
+    scenario = FakeExecutionScenario()
+
+    class Artifacts:
+        async def build_candidates(self, task_id: str) -> None:
+            return None
+
+        async def build_bi_report(self, task_id: str) -> None:
+            return None
+
+        async def stream_summary(self, task_id: str) -> None:
+            raise SummaryRecoveryMismatch("summary_recovery_prefix_mismatch")
+
+    scenario.executor.artifacts = Artifacts()
+    await scenario.executor.run(scenario.task.id)
+
+    assert scenario.task.status == TaskStatus.FAILED
+    assert "task.completed" not in scenario.repository.events
+    assert scenario.task.error_code == "SummaryRecoveryMismatch"

@@ -34,6 +34,10 @@ from app.tasks.state import TaskEventType
 from app.workspace.service import WorkspaceService
 
 
+class SummaryRecoveryMismatch(RuntimeError):
+    """恢复流无法证明与已持久化草稿属于同一输出。"""
+
+
 def summary_deltas_to_persist(
     persisted_content: str, deltas: tuple[str, ...], *, completed: bool = False
 ) -> tuple[str, ...] | None:
@@ -202,7 +206,7 @@ class _TaskArtifacts:
             generated_deltas.append(event.text)
             pending = summary_deltas_to_persist(content, tuple(generated_deltas))
             if pending is None:
-                return
+                raise SummaryRecoveryMismatch("summary_recovery_prefix_mismatch")
             if not pending:
                 continue
             delta = pending[-1]
