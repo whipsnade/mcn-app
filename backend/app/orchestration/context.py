@@ -39,11 +39,14 @@ _DISABLED_SERVICE_NAMES = {
 }
 _SUPPLIER_HOST_NAMES = {"datatap.deepminer.com.cn"}
 _TEXT_SECRET_PATTERNS = (
-    re.compile(r"\bauthorization\s*[:=]\s*(?:bearer\s+)?\S+", re.IGNORECASE),
-    re.compile(r"\bbearer\s+\S+", re.IGNORECASE),
-    re.compile(r"\bapi[_\s-]?key\s*[:=]\s*\S+", re.IGNORECASE),
-    re.compile(r"\btoken\s*[:=]\s*\S+", re.IGNORECASE),
-    re.compile(r"\bcredentials?\s*[:=]\s*\S+", re.IGNORECASE),
+    re.compile(
+        r"\bauthorization(?:\s*[:=]\s*|\s+)(?:bearer(?:\s*[:=]\s*|\s+))?\S+",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bbearer(?:\s*[:=]\s*|\s+)\S+", re.IGNORECASE),
+    re.compile(r"\bapi[_\s-]?key(?:\s*[:=]\s*|\s+)\S+", re.IGNORECASE),
+    re.compile(r"\btoken(?:\s*[:=]\s*|\s+)\S+", re.IGNORECASE),
+    re.compile(r"\bcredentials?(?:\s*[:=]\s*|\s+)\S+", re.IGNORECASE),
 )
 
 
