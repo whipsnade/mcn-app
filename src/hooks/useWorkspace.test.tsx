@@ -178,6 +178,19 @@ describe('useWorkspace', () => {
     expect(createTask).toHaveBeenCalledTimes(1);
   });
 
+  it('keeps an interrupted task recoverable and blocks a new task request', async () => {
+    vi.mocked(getSession).mockResolvedValue({
+      ...restoredSession,
+      analysis: { taskId: 'task-interrupted', status: 'interrupted' },
+    });
+    const { result } = renderHook(() => useWorkspace('user-a'));
+    await waitFor(() => expect(result.current.activeSession?.analysis?.status).toBe('interrupted'));
+
+    expect(result.current.isAnalyzing).toBe(true);
+    await expect(result.current.appendMessage('不要新建')).rejects.toThrow('TASK_IN_PROGRESS');
+    expect(createTask).not.toHaveBeenCalled();
+  });
+
   it('rejects a second submission while the first task request is still pending', async () => {
     const pendingTask = deferred<{
       id: string; session_id: string; status: 'pending'; estimated_points: number; error_code: null; latest_report_id: null;

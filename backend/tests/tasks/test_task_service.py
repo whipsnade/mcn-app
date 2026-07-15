@@ -1,21 +1,26 @@
 import asyncio
+from datetime import UTC, datetime
+from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 from pydantic import ValidationError
-from sqlalchemy import func, select, text
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.dialects.mysql import MEDIUMTEXT
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.session import get_db
+from app.db.session import SessionFactory, get_db
 from app.identity.dependencies import get_function_scoped_current_user
+from app.identity.models import User
 from app.main import create_app
 from app.tasks.models import AnalysisTask, TaskEvent
 from app.tasks.repository import TaskRepository
 from app.tasks.schemas import TaskCreate
 from app.tasks.service import TaskConflictError, TaskService
 from app.tasks.state import TaskStatus
-from app.workspace.models import Message
+from app.tasks.router import get_task_runner
+from app.workspace.models import Message, WorkspaceSession
 from fakes import (
     CommitFailingSession,
     workspace_factory_fixture as _workspace_factory_fixture,  # noqa: F401
@@ -61,6 +66,67 @@ async def test_create_task_rejects_a_concurrent_active_task_for_the_same_session
         await TaskService(db_session).create(
             user.id, workspace.id, TaskCreate(content="重复任务")
         )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_task_requests_use_independent_sessions_and_allow_only_one(
+    monkeypatch,
+) -> None:
+    now = datetime.now(UTC).replace(tzinfo=None)
+    user_id = str(uuid4())
+    session_id = str(uuid4())
+    async with SessionFactory() as seed:
+        seed.add(User(
+            id=user_id, nickname="并发测试用户", role="user", status="active",
+            created_at=now, updated_at=now,
+        ))
+        seed.add(WorkspaceSession(
+            id=session_id, user_id=user_id, title="并发任务", brand="测试品牌",
+            campaign_name="并发创建", status="draft", platforms=["bilibili"],
+            category="科技", target_audience="测试用户", budget_min=None, budget_max=None,
+            filters_snapshot={}, is_starred=False, last_accessed_at=now,
+            created_at=now, updated_at=now,
+        ))
+        await seed.commit()
+
+    app = create_app()
+
+    async def independent_db():
+        async with SessionFactory() as db:
+            try:
+                yield db
+                await db.commit()
+            except Exception:
+                await db.rollback()
+                raise
+
+    class NoopRunner:
+        def submit(self, task_id: str) -> None:
+            return None
+
+    async def current_user():
+        return SimpleNamespace(id=user_id)
+
+    app.dependency_overrides[get_db] = independent_db
+    app.dependency_overrides[get_function_scoped_current_user] = current_user
+    app.dependency_overrides[get_task_runner] = lambda: NoopRunner()
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            first, second = await asyncio.gather(
+                client.post(f"/api/v1/sessions/{session_id}/tasks", json={"content": "并发一"}),
+                client.post(f"/api/v1/sessions/{session_id}/tasks", json={"content": "并发二"}),
+            )
+        assert sorted([first.status_code, second.status_code]) == [202, 409]
+        assert next(response for response in (first, second) if response.status_code == 409).json()["detail"] == "task_in_progress"
+    finally:
+        async with SessionFactory() as cleanup:
+            test_user_ids = select(User.id).where(User.nickname == "并发测试用户")
+            await cleanup.execute(delete(TaskEvent).where(TaskEvent.user_id.in_(test_user_ids)))
+            await cleanup.execute(delete(AnalysisTask).where(AnalysisTask.user_id.in_(test_user_ids)))
+            await cleanup.execute(delete(Message).where(Message.user_id.in_(test_user_ids)))
+            await cleanup.execute(delete(WorkspaceSession).where(WorkspaceSession.user_id.in_(test_user_ids)))
+            await cleanup.execute(delete(User).where(User.nickname == "并发测试用户"))
+            await cleanup.commit()
 
 
 @pytest.mark.asyncio

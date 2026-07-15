@@ -21,7 +21,7 @@ function replaceSession(sessions: Session[], nextSession: Session): Session[] {
 }
 
 function taskIsInProgress(status: string | undefined): boolean {
-  return !['completed', 'failed', 'insufficient_balance', 'interrupted', 'cancelled'].includes(status ?? 'running');
+  return !['completed', 'failed', 'insufficient_balance', 'cancelled'].includes(status ?? 'running');
 }
 
 
