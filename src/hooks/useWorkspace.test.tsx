@@ -34,6 +34,33 @@ const restoredSession: Session = {
   }],
 };
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  return {
+    promise: new Promise<T>(next => { resolve = next; }),
+    resolve,
+  };
+}
+
+function candidatePage(version: number, kolId: string) {
+  return {
+    task_id: 'task-1', version, total: 1, items: [{
+      id: `candidate-${version}`, kol_id: kolId, platform: 'bilibili', platform_account_id: `up-${version}`,
+      nickname: `达人${version}`, profile_url: null, rank: 1, total_score: 80 + version,
+      scores: {}, matched_conditions: [], risks: [], recommendation: '优先联系',
+    }],
+  };
+}
+
+function report(version: number) {
+  return {
+    id: `report-${version}`, task_id: 'task-1', report_version: version, candidate_version: version,
+    overview: {}, score_composition: [], audience_content_fit: {}, platform_distribution: [],
+    budget_analysis: {}, comparison: [], risks: [], conclusion: `结论${version}`, sources: [],
+    generated_at: '2026-07-15T10:00:00Z',
+  };
+}
+
 
 vi.mock('../api/sessions', () => ({
   appendMessage: vi.fn(),
@@ -180,5 +207,55 @@ describe('useWorkspace', () => {
 
     expect(result.current.activeSession?.analysis?.candidateVersion).toBe(3);
     expect(result.current.activeSession?.biReport).toBeUndefined();
+  });
+
+  it('drops late candidate and BI responses from a previous candidate version', async () => {
+    const oldCandidates = deferred<ReturnType<typeof candidatePage>>();
+    const newCandidates = deferred<ReturnType<typeof candidatePage>>();
+    const oldReport = deferred<ReturnType<typeof report>>();
+    const newReport = deferred<ReturnType<typeof report>>();
+    vi.mocked(getSession).mockResolvedValue({
+      ...restoredSession,
+      analysis: { taskId: 'task-1', status: 'running' },
+    });
+    vi.mocked(getCandidates)
+      .mockReturnValueOnce(oldCandidates.promise)
+      .mockReturnValueOnce(newCandidates.promise);
+    vi.mocked(getReport)
+      .mockReturnValueOnce(oldReport.promise)
+      .mockReturnValueOnce(newReport.promise);
+
+    const { result, rerender } = renderHook(() => useWorkspace('user-a'));
+    await waitFor(() => expect(result.current.activeTaskId).toBe('task-1'));
+
+    vi.mocked(useTaskStream).mockReturnValue({
+      taskId: 'task-1', lastEventId: 1, assistantDraft: '', candidateVersion: 1,
+      visibleReportId: 'report-1', connection: 'connected',
+    });
+    rerender();
+    await waitFor(() => expect(getCandidates).toHaveBeenCalledTimes(1));
+
+    vi.mocked(useTaskStream).mockReturnValue({
+      taskId: 'task-1', lastEventId: 2, assistantDraft: '', candidateVersion: 2,
+      visibleReportId: 'report-2', connection: 'connected',
+    });
+    rerender();
+    await waitFor(() => expect(getCandidates).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      newCandidates.resolve(candidatePage(2, 'kol-new'));
+      newReport.resolve(report(2));
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(result.current.activeSession?.biReport?.id).toBe('report-2'));
+
+    await act(async () => {
+      oldCandidates.resolve(candidatePage(1, 'kol-old'));
+      oldReport.resolve(report(1));
+      await Promise.resolve();
+    });
+
+    expect(result.current.activeSession?.candidates?.[0]?.kolId).toBe('kol-new');
+    expect(result.current.activeSession?.biReport?.id).toBe('report-2');
   });
 });

@@ -229,10 +229,13 @@ export function useWorkspace(userId?: string) {
         : session.biReport,
     } : session));
     if (taskRuntime.candidateVersion !== undefined) {
-      void getCandidates(activeTaskId)
+      const requestedTaskId = activeTaskId;
+      const requestedCandidateVersion = taskRuntime.candidateVersion;
+      void getCandidates(requestedTaskId)
         .then(page => {
           if (generationRef.current !== generation) return;
-          setSessions(current => current.map(session => session.analysis?.taskId === activeTaskId ? {
+          setSessions(current => current.map(session => session.analysis?.taskId === requestedTaskId
+            && session.analysis.candidateVersion === requestedCandidateVersion ? {
             ...session,
             candidates: page.items.map(candidate => ({
               id: candidate.id,
@@ -253,10 +256,16 @@ export function useWorkspace(userId?: string) {
         .catch(() => undefined);
     }
     if (taskRuntime.visibleReportId) {
-      void getReport(taskRuntime.visibleReportId)
+      const requestedTaskId = activeTaskId;
+      const requestedCandidateVersion = taskRuntime.candidateVersion;
+      const requestedReportId = taskRuntime.visibleReportId;
+      void getReport(requestedReportId)
         .then(report => {
           if (generationRef.current !== generation) return;
-          setSessions(current => current.map(session => session.analysis?.taskId === activeTaskId ? {
+          setSessions(current => current.map(session => session.analysis?.taskId === requestedTaskId
+            && session.analysis.candidateVersion === requestedCandidateVersion
+            && session.analysis.reportId === requestedReportId
+            && report.candidate_version === requestedCandidateVersion ? {
             ...session,
             biReport: {
               id: report.id,
