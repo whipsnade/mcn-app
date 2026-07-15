@@ -4,6 +4,7 @@ import os
 from collections.abc import Sequence
 from functools import lru_cache
 from typing import Any
+from uuid import uuid4
 
 from sqlalchemy import select
 
@@ -94,7 +95,7 @@ def get_mcp_transport():
 class TaskExecutionDependencies:
     def __init__(self) -> None:
         self.store = DatabaseTaskStore()
-        self.worker_id = f"inproc-{os.getpid()}"
+        self.worker_id_prefix = f"inproc-{os.getpid()}"
         self._planner = Planner(model=get_model_adapter())
         self._transport = get_mcp_transport()
         self._arguments = _PlanArguments()
@@ -126,21 +127,22 @@ class TaskExecutionDependencies:
             context_builder=self,
             planner=self,
             gateway=self,
-            worker_id=self.worker_id,
+            worker_id=f"{self.worker_id_prefix}-{uuid4()}",
             lease_seconds=get_settings().task_lease_seconds,
         )
 
     def create_runner(self) -> TaskRunner:
         return TaskRunner(self.create_executor)
 
-    def create_recovery(self) -> TaskRecovery:
+    def create_recovery(self, runner: TaskRunner) -> TaskRecovery:
         return TaskRecovery(
             repository=self.store,
-            executor_factory=self.create_executor,
+            runner=runner,
             observation_seconds=int(get_settings().mcp_unknown_reconcile_seconds),
         )
 
 
 def create_task_runtime() -> tuple[TaskRunner, TaskRecovery]:
     dependencies = TaskExecutionDependencies()
-    return dependencies.create_runner(), dependencies.create_recovery()
+    runner = dependencies.create_runner()
+    return runner, dependencies.create_recovery(runner)

@@ -35,9 +35,12 @@ class MemoryExecutionRepository:
         self.task = task or MemoryExecutionTask()
         self.events: list[str] = []
         self.cancel_count = 0
+        self.renew_count = 0
 
     async def claim_lease(self, task_id: str, worker_id: str, lease_seconds: int):
         if task_id != self.task.id or self.task.status in {TaskStatus.COMPLETED, TaskStatus.CANCELLED}:
+            return None
+        if self.task.lease_owner is not None:
             return None
         self.task.lease_owner = worker_id
         self.task.lease_expires_at = datetime.now(UTC).replace(tzinfo=None)
@@ -45,8 +48,9 @@ class MemoryExecutionRepository:
             self.task.status = TaskStatus.PLANNING
         return self.task
 
-    async def save_plan(self, task_id: str, plan_json: dict[str, Any]) -> None:
+    async def save_plan(self, task_id: str, worker_id: str, plan_json: dict[str, Any]) -> None:
         assert task_id == self.task.id
+        assert self.task.lease_owner == worker_id
         self.task.plan_json = plan_json
         self.task.status = TaskStatus.RUNNING
         self.events.append("plan.ready")
@@ -63,6 +67,8 @@ class MemoryExecutionRepository:
 
     async def renew_lease(self, task_id: str, worker_id: str, lease_seconds: int) -> None:
         assert task_id == self.task.id
+        assert self.task.lease_owner == worker_id
+        self.renew_count += 1
 
     async def mark_completed(self, task_id: str, worker_id: str) -> None:
         assert task_id == self.task.id
@@ -101,6 +107,8 @@ class FakeExecutionGateway:
         self.started = asyncio.Event()
         self._release = asyncio.Event()
         self._release.set()
+        self.outcome_status = "settled"
+        self.error: Exception | None = None
 
     def block(self) -> None:
         self._release.clear()
@@ -111,13 +119,15 @@ class FakeExecutionGateway:
     async def execute_batch(self, commands):
         self.started.set()
         await self._release.wait()
+        if self.error is not None:
+            raise self.error
         rows = []
         for command in commands:
             if command.logical_call_id not in self._settled:
                 self._settled.add(command.logical_call_id)
                 self.successful_logical_calls += 1
                 self.wallet[0] -= 10
-            rows.append(type("Result", (), {"status": "settled"})())
+            rows.append(type("Result", (), {"status": self.outcome_status})())
         return tuple(rows)
 
 
@@ -148,6 +158,8 @@ class FakeExecutionScenario:
             planner=self,
             gateway=self.gateway,
             worker_id="test-worker",
+            lease_seconds=0.03,
+            heartbeat_seconds=0.005,
             checkpoint=self.checkpoint,
         )
 
@@ -174,14 +186,25 @@ class FakeExecutionScenario:
     def new_recovery(self):
         from app.tasks.recovery import TaskRecovery
 
+        self.recovery_runner = ImmediateRunner(lambda: self.executor)
         return TaskRecovery(
             repository=self.repository,
-            executor_factory=lambda: self.executor,
+            runner=self.recovery_runner,
             observation_seconds=0,
         )
 
 
-class InjectedProcessCrash(RuntimeError):
+class ImmediateRunner:
+    def __init__(self, executor_factory) -> None:
+        self.executor_factory = executor_factory
+        self.submitted: list[str] = []
+
+    def submit(self, task_id: str) -> None:
+        self.submitted.append(task_id)
+        asyncio.create_task(self.executor_factory().run(task_id))
+
+
+class InjectedProcessCrash(BaseException):
     pass
 
 

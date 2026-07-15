@@ -16,22 +16,30 @@ def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.task_runner = runner
-        await recovery.recover_expired()
         stop_recovery = asyncio.Event()
+
+        async def recover_once() -> None:
+            try:
+                await recovery.recover_expired()
+            except Exception:
+                # A later fixed-interval pass retries transient database faults.
+                return
 
         async def recover_periodically() -> None:
             while not stop_recovery.is_set():
                 try:
                     await asyncio.wait_for(stop_recovery.wait(), timeout=30)
                 except TimeoutError:
-                    await recovery.recover_expired()
+                    await recover_once()
 
+        startup_recovery = asyncio.create_task(recover_once())
         coordinator = asyncio.create_task(recover_periodically())
         try:
             yield
         finally:
             stop_recovery.set()
             await coordinator
+            await startup_recovery
             await runner.shutdown()
 
     app = FastAPI(title="KOL Insight API", version="0.1.0", lifespan=lifespan)

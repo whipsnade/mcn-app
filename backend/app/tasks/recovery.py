@@ -1,15 +1,16 @@
 from __future__ import annotations
 
-from collections.abc import Callable
 from typing import Protocol
-
-from app.tasks.executor import TaskExecutor
 
 
 class RecoveryStore(Protocol):
     async def recoverable_task_ids(self) -> tuple[str, ...]: ...
 
     async def release_expired_unknown(self, task_id: str, observation_seconds: int) -> bool: ...
+
+
+class RecoveryRunner(Protocol):
+    def submit(self, task_id: str) -> None: ...
 
 
 class TaskRecovery:
@@ -19,11 +20,11 @@ class TaskRecovery:
         self,
         *,
         repository: RecoveryStore,
-        executor_factory: Callable[[], TaskExecutor],
+        runner: RecoveryRunner,
         observation_seconds: int = 300,
     ) -> None:
         self.repository = repository
-        self.executor_factory = executor_factory
+        self.runner = runner
         self.observation_seconds = observation_seconds
 
     async def recover_expired(self) -> tuple[str, ...]:
@@ -31,6 +32,6 @@ class TaskRecovery:
         for task_id in await self.repository.recoverable_task_ids():
             if await self.repository.release_expired_unknown(task_id, self.observation_seconds):
                 continue
-            await self.executor_factory().run(task_id)
+            self.runner.submit(task_id)
             recovered.append(task_id)
         return tuple(recovered)

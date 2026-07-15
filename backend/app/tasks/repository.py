@@ -68,11 +68,8 @@ class TaskRepository:
         )
         if task is None or task.status in TERMINAL_TASK_STATUSES:
             return None
-        if (
-            task.lease_owner is not None
-            and task.lease_owner != worker_id
-            and task.lease_expires_at is not None
-            and task.lease_expires_at > now
+        if task.lease_owner is not None and (
+            task.lease_expires_at is None or task.lease_expires_at > now
         ):
             return None
         if task.cancel_requested_at is not None:
@@ -90,8 +87,10 @@ class TaskRepository:
         await self.db.flush()
         return task
 
-    async def save_plan(self, task_id: str, plan_json: dict[str, Any]) -> None:
+    async def save_plan(self, task_id: str, worker_id: str, plan_json: dict[str, Any]) -> None:
         task = await self._locked(task_id)
+        if not self._owns_active_lease(task, worker_id):
+            return
         task.plan_json = plan_json
         task.plan_version = "planner_v1"
         task.status = TaskStatus.RUNNING
@@ -108,7 +107,7 @@ class TaskRepository:
 
     async def renew_lease(self, task_id: str, worker_id: str, lease_seconds: int) -> None:
         task = await self._locked(task_id)
-        if task.lease_owner != worker_id:
+        if not self._owns_active_lease(task, worker_id):
             return
         now = utc_now()
         task.lease_expires_at = now + timedelta(seconds=lease_seconds)
@@ -123,14 +122,14 @@ class TaskRepository:
 
     async def mark_interrupted(self, task_id: str, worker_id: str) -> None:
         task = await self._locked(task_id)
-        if task.lease_owner == worker_id and task.status not in TERMINAL_TASK_STATUSES:
+        if self._owns_active_lease(task, worker_id) and task.status not in TERMINAL_TASK_STATUSES:
             task.status = TaskStatus.INTERRUPTED
             task.updated_at = utc_now()
             await self.db.flush()
 
     async def mark_failed(self, task_id: str, worker_id: str, code: str) -> None:
         task = await self._locked(task_id)
-        if task.lease_owner == worker_id and task.status not in TERMINAL_TASK_STATUSES:
+        if self._owns_active_lease(task, worker_id) and task.status not in TERMINAL_TASK_STATUSES:
             task.status = TaskStatus.FAILED
             task.error_code = code
             task.completed_at = utc_now()
@@ -229,7 +228,7 @@ class TaskRepository:
         self, task_id: str, worker_id: str, status: TaskStatus, event: TaskEventType
     ) -> None:
         task = await self._locked(task_id)
-        if task.lease_owner != worker_id or task.status in TERMINAL_TASK_STATUSES:
+        if not self._owns_active_lease(task, worker_id) or task.status in TERMINAL_TASK_STATUSES:
             return
         now = utc_now()
         task.status = status
@@ -237,3 +236,11 @@ class TaskRepository:
         task.updated_at = now
         await self.append_event(task.id, task.user_id, event, {"status": status})
         await self.db.flush()
+
+    @staticmethod
+    def _owns_active_lease(task: AnalysisTask, worker_id: str) -> bool:
+        return (
+            task.lease_owner == worker_id
+            and task.lease_expires_at is not None
+            and task.lease_expires_at > utc_now()
+        )

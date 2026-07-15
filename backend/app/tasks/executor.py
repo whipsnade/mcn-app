@@ -13,7 +13,7 @@ from app.orchestration.schemas import ToolPlan
 class TaskStore(Protocol):
     async def claim_lease(self, task_id: str, worker_id: str, lease_seconds: int) -> Any: ...
 
-    async def save_plan(self, task_id: str, plan_json: dict[str, Any]) -> None: ...
+    async def save_plan(self, task_id: str, worker_id: str, plan_json: dict[str, Any]) -> None: ...
 
     async def cancel_requested(self, task_id: str) -> bool: ...
 
@@ -61,6 +61,7 @@ class TaskExecutor:
         gateway: McpBatchGateway,
         worker_id: str,
         lease_seconds: int = 60,
+        heartbeat_seconds: float | None = None,
         checkpoint: Checkpoint = _noop_checkpoint,
     ) -> None:
         self.repository = repository
@@ -69,6 +70,7 @@ class TaskExecutor:
         self.gateway = gateway
         self.worker_id = worker_id
         self.lease_seconds = lease_seconds
+        self.heartbeat_seconds = heartbeat_seconds or max(1.0, lease_seconds / 3)
         self.checkpoint = checkpoint
 
     async def run(self, task_id: str) -> None:
@@ -95,10 +97,14 @@ class TaskExecutor:
                     )
                     for step in batch.steps
                 )
-                rows = await self.gateway.execute_batch(commands)
+                rows = await self._execute_batch_with_heartbeat(task.id, commands)
                 await self.checkpoint("after_mcp_result")
-                if any(getattr(row, "status", None) == "unknown" for row in rows):
+                statuses = {getattr(row, "status", None) for row in rows}
+                if statuses & {"unknown", "planned", "reserved", "running", "succeeded"}:
                     await self.repository.mark_interrupted(task.id, self.worker_id)
+                    return
+                if statuses - {"settled"}:
+                    await self.repository.mark_failed(task.id, self.worker_id, "mcp_call_failed")
                     return
                 await self.checkpoint("after_settle")
                 await self.repository.renew_lease(task.id, self.worker_id, self.lease_seconds)
@@ -110,10 +116,8 @@ class TaskExecutor:
         except asyncio.CancelledError:
             await self.repository.mark_interrupted(task.id, self.worker_id)
             raise
-        except Exception:
-            # Process-like failures deliberately remain recoverable. A transport
-            # call is never replayed unless its durable logical call is reserved.
-            raise
+        except Exception as error:
+            await self.repository.mark_failed(task.id, self.worker_id, type(error).__name__)
         finally:
             await self.repository.release_lease(task.id, self.worker_id)
 
@@ -123,8 +127,27 @@ class TaskExecutor:
         context = await self.context_builder.build(task.user_id, task.session_id)
         plan_for = getattr(self.planner, "plan_for", None)
         plan = await plan_for(context) if plan_for is not None else await self.planner.plan(context)
-        await self.repository.save_plan(task.id, plan.model_dump(mode="json"))
+        await self.repository.save_plan(task.id, self.worker_id, plan.model_dump(mode="json"))
         return plan
+
+    async def _execute_batch_with_heartbeat(
+        self, task_id: str, commands: tuple[ExecuteMcpCall, ...]
+    ) -> tuple[Any, ...]:
+        stop = asyncio.Event()
+        heartbeat = asyncio.create_task(self._renew_lease_until_stopped(task_id, stop))
+        try:
+            return await self.gateway.execute_batch(commands)
+        finally:
+            stop.set()
+            heartbeat.cancel()
+            await asyncio.gather(heartbeat, return_exceptions=True)
+
+    async def _renew_lease_until_stopped(self, task_id: str, stop: asyncio.Event) -> None:
+        while not stop.is_set():
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=self.heartbeat_seconds)
+            except TimeoutError:
+                await self.repository.renew_lease(task_id, self.worker_id, self.lease_seconds)
 
 
 class TaskRunner:
@@ -133,14 +156,21 @@ class TaskRunner:
     def __init__(self, executor_factory: Callable[[], TaskExecutor]) -> None:
         self._executor_factory = executor_factory
         self._tasks: set[asyncio.Task[None]] = set()
+        self._active_task_ids: set[str] = set()
         self._accepting = True
 
     def submit(self, task_id: str) -> None:
-        if not self._accepting:
+        if not self._accepting or task_id in self._active_task_ids:
             return
         running = asyncio.create_task(self._executor_factory().run(task_id))
         self._tasks.add(running)
-        running.add_done_callback(self._tasks.discard)
+        self._active_task_ids.add(task_id)
+
+        def discard(completed: asyncio.Task[None]) -> None:
+            self._tasks.discard(completed)
+            self._active_task_ids.discard(task_id)
+
+        running.add_done_callback(discard)
 
     async def shutdown(self, *, timeout_seconds: float = 5) -> None:
         self._accepting = False
