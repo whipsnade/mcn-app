@@ -136,7 +136,7 @@ async def test_0004_downgrade_preflights_oversized_message_without_truncation() 
         assert return_code == 0, output
         version, data_type, stored_content, stored_bytes = await migration_state(message_id)
         assert (version, data_type, stored_content, stored_bytes) == (
-            "0004",
+            "0005",
             "mediumtext",
             "已缩短",
             9,

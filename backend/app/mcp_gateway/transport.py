@@ -25,6 +25,8 @@ class RemoteToolResult:
 
 
 class McpTransport(Protocol):
+    def protocol_session_digest(self, service: DataTapService) -> str | None: ...
+
     async def list_tools(self, service: DataTapService) -> tuple[DiscoveredTool, ...]: ...
 
     async def call_tool(

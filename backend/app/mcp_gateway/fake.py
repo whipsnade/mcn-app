@@ -22,6 +22,11 @@ class FakeMcpTransport:
     call_error: Exception | None = None
     call_count: int = 0
 
+    def protocol_session_digest(self, service: DataTapService) -> str | None:
+        if not isinstance(service, DataTapService):
+            raise TypeError("service must be a DataTapService")
+        return None
+
     @classmethod
     def with_discovered_tool(
         cls,

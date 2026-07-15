@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import hashlib
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import httpx
 import pytest
+from mcp.shared.exceptions import McpError
+from mcp.types import ErrorData
 from pydantic import SecretStr
 
 from app.mcp_gateway.contracts import DataTapService
@@ -51,6 +54,14 @@ class ReadTimeoutSession(FakeProtocolSession):
     async def call_tool(self, _name, _arguments):
         type(self).call_count += 1
         raise httpx.ReadTimeout("fake read timeout")
+
+
+class SdkReadTimeoutSession(FakeProtocolSession):
+    call_count = 0
+
+    async def call_tool(self, _name, _arguments):
+        type(self).call_count += 1
+        raise McpError(ErrorData(code=408, message="SDK read timeout"))
 
 
 @pytest.mark.parametrize(
@@ -151,3 +162,41 @@ async def test_read_timeout_after_call_tool_entry_is_possibly_sent_without_retry
         await transport.call_tool(DataTapService.BILIBILI, "search", {"keyword": "美妆"})
 
     assert ReadTimeoutSession.call_count == 1
+
+
+async def test_sdk_mcp_408_after_call_tool_entry_is_possibly_sent_without_retry() -> None:
+    @asynccontextmanager
+    async def opener(url: str, **_kwargs):
+        service = next(item for item in DataTapService if item.value in url)
+        yield service, object(), lambda: "session-1"
+
+    SdkReadTimeoutSession.call_count = 0
+    transport = DataTapTransport(
+        token=SecretStr("unit-test-token"),
+        session_opener=opener,
+        session_factory=SdkReadTimeoutSession,
+    )
+
+    with pytest.raises(PossiblySentTimeout):
+        await transport.call_tool(DataTapService.BILIBILI, "search", {"keyword": "美妆"})
+
+    assert SdkReadTimeoutSession.call_count == 1
+
+
+def test_protocol_session_digest_is_scoped_and_contains_no_raw_identifiers() -> None:
+    transport = DataTapTransport(
+        token=SecretStr("unit-test-token"),
+        gateway_session_id="gateway-session-secret",
+        credential_version="credential-v7",
+    )
+
+    digest = transport.protocol_session_digest(DataTapService.BILIBILI)
+    same = transport.protocol_session_digest(DataTapService.BILIBILI)
+    other_service = transport.protocol_session_digest(DataTapService.AKTOOLS)
+
+    assert digest == same
+    assert digest != other_service
+    assert len(digest) == hashlib.sha256().digest_size * 2
+    assert "gateway-session-secret" not in digest
+    assert "credential-v7" not in digest
+    assert "unit-test-token" not in digest

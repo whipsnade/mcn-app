@@ -37,11 +37,20 @@ MCP_CALL_STATUSES = (
     "released",
 )
 
+MCP_DISCOVERY_REVIEW_STATUSES = (
+    "quarantined",
+    "approved",
+    "rejected",
+)
+
 _SERVICE_SLUG_CHECK = "service_slug IN ({})".format(
     ", ".join(f"'{service}'" for service in ALLOWED_SERVICE_SLUGS)
 )
 _CALL_STATUS_CHECK = "status IN ({})".format(
     ", ".join(f"'{status}'" for status in MCP_CALL_STATUSES)
+)
+_DISCOVERY_REVIEW_STATUS_CHECK = "review_status IN ({})".format(
+    ", ".join(f"'{status}'" for status in MCP_DISCOVERY_REVIEW_STATUSES)
 )
 
 
@@ -66,6 +75,41 @@ class McpToolCatalog(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 
 
+class McpToolDiscovery(Base):
+    __tablename__ = "mcp_tool_discoveries"
+    __table_args__ = (
+        CheckConstraint(
+            _SERVICE_SLUG_CHECK,
+            name="ck_mcp_tool_discoveries_service_slug",
+        ),
+        CheckConstraint(
+            _DISCOVERY_REVIEW_STATUS_CHECK,
+            name="ck_mcp_tool_discoveries_review_status",
+        ),
+        UniqueConstraint(
+            "service_slug",
+            "remote_name",
+            name="uq_mcp_tool_discoveries_service_remote",
+        ),
+        Index(
+            "ix_mcp_tool_discoveries_service_status",
+            "service_slug",
+            "review_status",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    service_slug: Mapped[str] = mapped_column(String(64), nullable=False)
+    remote_name: Mapped[str] = mapped_column(String(128), nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    input_schema_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    output_schema_json: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    discovery_digest: Mapped[str] = mapped_column(String(64), nullable=False)
+    review_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    discovered_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
 class McpCall(Base):
     __tablename__ = "mcp_calls"
     __table_args__ = (
@@ -75,9 +119,7 @@ class McpCall(Base):
         UniqueConstraint(
             "task_id", "plan_step_id", "attempt", name="uq_mcp_calls_task_step_attempt"
         ),
-        UniqueConstraint(
-            "settlement_transaction_id", name="uq_mcp_calls_settlement_transaction"
-        ),
+        UniqueConstraint("settlement_transaction_id", name="uq_mcp_calls_settlement_transaction"),
         Index("ix_mcp_calls_status_updated", "status", "updated_at"),
     )
 

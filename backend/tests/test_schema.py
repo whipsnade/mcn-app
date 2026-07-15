@@ -21,6 +21,7 @@ def test_phase_two_tables_are_registered() -> None:
         "task_events",
         "model_runs",
         "mcp_tool_catalog",
+        "mcp_tool_discoveries",
         "mcp_calls",
         "kols",
         "kol_snapshots",

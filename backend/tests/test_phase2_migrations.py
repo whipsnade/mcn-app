@@ -33,9 +33,13 @@ async def test_mcp_database_check_constraints_enforce_allowlists() -> None:
         call_constraints = await connection.run_sync(
             lambda sync: inspect(sync).get_check_constraints("mcp_calls")
         )
+        discovery_constraints = await connection.run_sync(
+            lambda sync: inspect(sync).get_check_constraints("mcp_tool_discoveries")
+        )
 
     catalog_checks = {item["name"]: item["sqltext"] for item in catalog_constraints}
     call_checks = {item["name"]: item["sqltext"] for item in call_constraints}
+    discovery_checks = {item["name"]: item["sqltext"] for item in discovery_constraints}
     service_check = catalog_checks["ck_mcp_tool_catalog_service_slug"]
     for service in {
         "insight-cube-mcp",
@@ -65,6 +69,27 @@ async def test_mcp_database_check_constraints_enforce_allowlists() -> None:
         "released",
     }:
         assert status in status_check
+
+    discovery_service_check = discovery_checks["ck_mcp_tool_discoveries_service_slug"]
+    for service in {
+        "insight-cube-mcp",
+        "social-grow-mcp",
+        "social-grow-content-mcp",
+        "aktools-mcp",
+        "bilibili-mcp",
+    }:
+        assert service in discovery_service_check
+    discovery_status_check = discovery_checks["ck_mcp_tool_discoveries_review_status"]
+    for status in {"quarantined", "approved", "rejected"}:
+        assert status in discovery_status_check
+
+
+async def test_mcp_discovery_service_remote_is_unique() -> None:
+    async with engine.connect() as connection:
+        constraints = await connection.run_sync(
+            lambda sync: inspect(sync).get_unique_constraints("mcp_tool_discoveries")
+        )
+    assert "uq_mcp_tool_discoveries_service_remote" in {item["name"] for item in constraints}
 
 
 async def test_mcp_billing_foreign_keys_and_recovery_indexes() -> None:
@@ -115,9 +140,7 @@ async def test_reporting_version_columns_are_integer_in_mysql() -> None:
             lambda sync: inspect(sync).get_columns("bi_reports")
         )
 
-    columns = {
-        ("task_candidates", item["name"]): item for item in task_candidate_columns
-    }
+    columns = {("task_candidates", item["name"]): item for item in task_candidate_columns}
     columns.update((("bi_reports", item["name"]), item) for item in report_columns)
     for key in {
         ("task_candidates", "candidate_version"),
@@ -287,8 +310,7 @@ async def test_reporting_constraints_and_snapshot_contract() -> None:
         item["name"] for item in snapshot_columns
     )
     snapshot_targets = {
-        tuple(item["constrained_columns"]): item["referred_table"]
-        for item in snapshot_foreign_keys
+        tuple(item["constrained_columns"]): item["referred_table"] for item in snapshot_foreign_keys
     }
     assert snapshot_targets[("kol_id",)] == "kols"
     assert snapshot_targets[("source_mcp_call_id",)] == "mcp_calls"
@@ -306,6 +328,30 @@ def _run_alembic(*args: str) -> None:
         capture_output=True,
         text=True,
     )
+
+
+@pytest.mark.skipif(
+    "PYTEST_XDIST_WORKER" in os.environ,
+    reason="schema migration boundary test is intentionally serial",
+)
+async def test_0005_mcp_tool_discoveries_migration_is_reversible() -> None:
+    async def has_discovery_table() -> bool:
+        async with engine.connect() as connection:
+            return "mcp_tool_discoveries" in await connection.run_sync(
+                lambda sync: inspect(sync).get_table_names()
+            )
+
+    try:
+        _run_alembic("upgrade", "head")
+        assert await has_discovery_table()
+
+        _run_alembic("downgrade", "0004")
+        assert not await has_discovery_table()
+
+        _run_alembic("upgrade", "head")
+        assert await has_discovery_table()
+    finally:
+        _run_alembic("upgrade", "head")
 
 
 @pytest.mark.skipif(
@@ -330,6 +376,7 @@ async def test_phase_two_migration_table_boundaries_restore_head() -> None:
         "mcp_tool_catalog",
         "mcp_calls",
     }
+    late_runtime_tables = {"mcp_tool_discoveries"}
     reporting_tables = {
         "kols",
         "kol_snapshots",
@@ -337,13 +384,11 @@ async def test_phase_two_migration_table_boundaries_restore_head() -> None:
         "bi_reports",
         "user_kol_favorites",
     }
-    phase_two_tables = runtime_tables | reporting_tables
+    phase_two_tables = runtime_tables | late_runtime_tables | reporting_tables
 
     async def table_names() -> set[str]:
         async with engine.connect() as connection:
-            return set(
-                await connection.run_sync(lambda sync: inspect(sync).get_table_names())
-            )
+            return set(await connection.run_sync(lambda sync: inspect(sync).get_table_names()))
 
     try:
         _run_alembic("downgrade", "0001")
@@ -355,6 +400,7 @@ async def test_phase_two_migration_table_boundaries_restore_head() -> None:
         tables_at_0002 = await table_names()
         assert phase_one_tables.issubset(tables_at_0002)
         assert runtime_tables.issubset(tables_at_0002)
+        assert late_runtime_tables.isdisjoint(tables_at_0002)
         assert reporting_tables.isdisjoint(tables_at_0002)
 
         _run_alembic("upgrade", "head")

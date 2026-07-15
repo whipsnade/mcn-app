@@ -131,3 +131,60 @@ async def test_busy_service_semaphore_does_not_delay_another_service() -> None:
     await blocked
 
     assert bilibili
+
+
+async def test_late_success_from_previous_epoch_cannot_close_open_circuit() -> None:
+    clock = Clock()
+    transport = isolated_transport(clock)
+    transport.failure_threshold = 1
+    old_started = asyncio.Event()
+    release_old = asyncio.Event()
+
+    async def old_success():
+        old_started.set()
+        await release_old.wait()
+        return "old-success"
+
+    async def fail_now():
+        raise McpUpstreamError("new failure")
+
+    old_task = asyncio.create_task(transport._run_isolated(DataTapService.AKTOOLS, old_success))
+    await old_started.wait()
+    with pytest.raises(McpUpstreamError):
+        await transport._run_isolated(DataTapService.AKTOOLS, fail_now)
+
+    release_old.set()
+    assert await old_task == "old-success"
+    with pytest.raises(McpUpstreamError, match="circuit"):
+        await transport._run_isolated(DataTapService.AKTOOLS, old_success)
+
+
+async def test_late_failure_from_previous_epoch_cannot_reopen_reset_circuit() -> None:
+    clock = Clock()
+    transport = isolated_transport(clock)
+    transport.failure_threshold = 1
+    old_started = asyncio.Event()
+    release_old = asyncio.Event()
+
+    async def old_failure():
+        old_started.set()
+        await release_old.wait()
+        raise McpUpstreamError("old failure")
+
+    async def fail_now():
+        raise McpUpstreamError("new failure")
+
+    async def succeed_now():
+        return "new-success"
+
+    old_task = asyncio.create_task(transport._run_isolated(DataTapService.AKTOOLS, old_failure))
+    await old_started.wait()
+    with pytest.raises(McpUpstreamError):
+        await transport._run_isolated(DataTapService.AKTOOLS, fail_now)
+    clock.advance(10)
+    assert await transport._run_isolated(DataTapService.AKTOOLS, succeed_now) == "new-success"
+
+    release_old.set()
+    with pytest.raises(McpUpstreamError, match="old failure"):
+        await old_task
+    assert await transport._run_isolated(DataTapService.AKTOOLS, succeed_now) == "new-success"

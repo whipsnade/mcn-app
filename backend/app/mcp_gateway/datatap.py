@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
 from collections.abc import Callable, Mapping
 from contextlib import AbstractAsyncContextManager
@@ -12,6 +13,7 @@ from uuid import uuid4
 import httpx
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
+from mcp.shared.exceptions import McpError
 from pydantic import SecretStr
 
 from app.mcp_gateway.contracts import DataTapService
@@ -40,6 +42,7 @@ class _ServiceState:
     failures: int = 0
     opened_at: float | None = None
     half_open_in_flight: bool = False
+    epoch: int = 0
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
@@ -74,6 +77,8 @@ class DataTapTransport:
             raise ValueError("timeouts must be positive")
 
         self.gateway_session_id = gateway_session_id or str(uuid4())
+        if not self.gateway_session_id.strip() or not credential_version.strip():
+            raise ValueError("session and credential identifiers must not be empty")
         self.credential_version = credential_version
         self.failure_threshold = failure_threshold
         self._circuit_reset_seconds = circuit_reset_seconds
@@ -102,6 +107,13 @@ class DataTapTransport:
 
     async def aclose(self) -> None:
         await self._client.aclose()
+
+    def protocol_session_digest(self, service: DataTapService) -> str:
+        checked = self._require_service(service)
+        scoped_identity = "\x00".join(
+            (self.gateway_session_id, checked.value, self.credential_version)
+        )
+        return hashlib.sha256(scoped_identity.encode("utf-8")).hexdigest()
 
     async def list_tools(self, service: DataTapService) -> tuple[DiscoveredTool, ...]:
         checked = self._require_service(service)
@@ -147,6 +159,10 @@ class DataTapTransport:
                     await session.initialize()
                     try:
                         result = await session.call_tool(remote_name, dict(arguments))
+                    except McpError as exc:
+                        if exc.error.code == httpx.codes.REQUEST_TIMEOUT:
+                            raise PossiblySentTimeout("MCP result was not confirmed") from exc
+                        raise
                     except (httpx.ReadTimeout, TimeoutError) as exc:
                         raise PossiblySentTimeout("MCP result was not confirmed") from exc
                     structured_content = getattr(result, "structuredContent", None)
@@ -177,11 +193,11 @@ class DataTapTransport:
             raise McpUpstreamError("MCP service concurrency queue timed out") from exc
 
         try:
-            await self._enter_circuit(state)
+            epoch = await self._enter_circuit(state)
             try:
                 result = await operation()
             except Exception as exc:
-                await self._record_failure(state)
+                await self._record_failure(state, epoch)
                 if isinstance(exc, PossiblySentTimeout):
                     raise
                 if isinstance(exc, McpUpstreamError):
@@ -189,33 +205,42 @@ class DataTapTransport:
                 if isinstance(exc, (httpx.HTTPError, TimeoutError, OSError)):
                     raise McpUpstreamError("MCP upstream request failed") from exc
                 raise McpUpstreamError("MCP protocol operation failed") from exc
-            await self._record_success(state)
+            await self._record_success(state, epoch)
             return result
         finally:
             state.semaphore.release()
 
-    async def _enter_circuit(self, state: _ServiceState) -> None:
+    async def _enter_circuit(self, state: _ServiceState) -> int:
         async with state.lock:
             if state.opened_at is None:
-                return
+                return state.epoch
             if self._clock() - state.opened_at < self._circuit_reset_seconds:
                 raise McpUpstreamError("MCP service circuit is open")
             if state.half_open_in_flight:
                 raise McpUpstreamError("MCP service circuit half-open probe is busy")
             state.half_open_in_flight = True
+            return state.epoch
 
-    async def _record_failure(self, state: _ServiceState) -> None:
+    async def _record_failure(self, state: _ServiceState, epoch: int) -> None:
         async with state.lock:
+            if epoch != state.epoch:
+                return
             state.failures += 1
             if state.half_open_in_flight or state.failures >= self.failure_threshold:
                 state.opened_at = self._clock()
+                state.epoch += 1
             state.half_open_in_flight = False
 
-    async def _record_success(self, state: _ServiceState) -> None:
+    async def _record_success(self, state: _ServiceState, epoch: int) -> None:
         async with state.lock:
+            if epoch != state.epoch:
+                return
+            was_half_open = state.half_open_in_flight
             state.failures = 0
             state.opened_at = None
             state.half_open_in_flight = False
+            if was_half_open:
+                state.epoch += 1
 
     @staticmethod
     def _convert_tool(tool: Any) -> DiscoveredTool:

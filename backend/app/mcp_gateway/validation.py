@@ -6,6 +6,9 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import SchemaError, ValidationError
+
 from app.mcp_gateway.transport import JsonValue
 
 
@@ -20,6 +23,8 @@ class ValidationLimits:
     max_string_length: int = 16_384
     max_array_items: int = 1_000
     max_object_properties: int = 1_000
+    max_nodes: int = 10_000
+    max_total_string_length: int = 262_144
     max_abs_number: float = 1_000_000_000_000_000
 
 
@@ -56,7 +61,7 @@ def canonical_json_bytes(value: JsonValue | dict[str, Any]) -> bytes:
             separators=(",", ":"),
             allow_nan=False,
         )
-    except (TypeError, ValueError) as exc:
+    except (RecursionError, TypeError, ValueError) as exc:
         raise McpValidationError("value must be canonical JSON") from exc
     return encoded.encode("utf-8")
 
@@ -64,31 +69,42 @@ def canonical_json_bytes(value: JsonValue | dict[str, Any]) -> bytes:
 def validate_schema_policy(schema: dict[str, Any], *, reject_routing_fields: bool = True) -> None:
     if not isinstance(schema, dict):
         raise McpValidationError("schema must be an object")
+    stack: list[tuple[str, Any]] = [("enter", schema)]
+    active_containers: set[int] = set()
+    while stack:
+        action, node = stack.pop()
+        if action == "leave":
+            active_containers.remove(id(node))
+            continue
+        if not isinstance(node, (dict, list)):
+            continue
+        identity = id(node)
+        if identity in active_containers:
+            raise McpValidationError("schema must not contain a cycle")
+        active_containers.add(identity)
+        stack.append(("leave", node))
+        if isinstance(node, list):
+            stack.extend(("enter", child) for child in reversed(node))
+            continue
 
-    def visit(node: Any) -> None:
-        if isinstance(node, dict):
-            is_object = node.get("type") == "object" or "properties" in node
-            if is_object and node.get("additionalProperties") is not False:
-                raise McpValidationError("object schemas must reject additional properties")
-            properties = node.get("properties")
-            if isinstance(properties, dict):
-                for key, child in properties.items():
-                    if reject_routing_fields and _normalized_key(key) in _ROUTING_FIELDS:
-                        raise McpValidationError("routing fields are forbidden by schema")
-                    visit(child)
-            for keyword in ("items", "additionalProperties", "not", "if", "then", "else"):
-                child = node.get(keyword)
-                if isinstance(child, (dict, list)):
-                    visit(child)
-            for keyword in ("allOf", "anyOf", "oneOf", "prefixItems"):
-                children = node.get(keyword)
-                if isinstance(children, list):
-                    visit(children)
-        elif isinstance(node, list):
-            for child in node:
-                visit(child)
+        is_object = node.get("type") == "object" or "properties" in node
+        if is_object and node.get("additionalProperties") is not False:
+            raise McpValidationError("object schemas must reject additional properties")
+        for keyword in ("$ref", "$dynamicRef"):
+            reference = node.get(keyword)
+            if isinstance(reference, str) and not reference.startswith("#"):
+                raise McpValidationError("external schema references are forbidden")
+        properties = node.get("properties")
+        if isinstance(properties, dict) and reject_routing_fields:
+            for key in properties:
+                if _normalized_key(key) in _ROUTING_FIELDS:
+                    raise McpValidationError("routing fields are forbidden by schema")
+        stack.extend(("enter", child) for child in reversed(tuple(node.values())))
 
-    visit(schema)
+    try:
+        Draft202012Validator.check_schema(schema)
+    except SchemaError as exc:
+        raise McpValidationError("schema is not valid Draft 2020-12 JSON Schema") from exc
 
 
 def validate_input(
@@ -99,9 +115,9 @@ def validate_input(
 ) -> dict[str, JsonValue]:
     if not isinstance(value, dict):
         raise McpValidationError("tool arguments must be an object")
-    _reject_routing_fields(value)
     validate_schema_policy(schema, reject_routing_fields=True)
-    _validate_value(value, limits=limits, depth=1)
+    _validate_value(value, limits=limits)
+    _reject_routing_fields(value)
     _validate_size(value, limits)
     _validate_against_schema(value, schema, path="$")
     return value
@@ -114,25 +130,28 @@ def validate_output(
     limits: ValidationLimits = DEFAULT_OUTPUT_LIMITS,
 ) -> JsonValue:
     validate_schema_policy(schema, reject_routing_fields=False)
-    _validate_value(value, limits=limits, depth=1)
+    _validate_value(value, limits=limits)
     _validate_size(value, limits)
     _validate_against_schema(value, schema, path="$")
     return value
 
 
 def _normalized_key(key: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "_", key.casefold()).strip("_")
+    snake_case = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", key)
+    return re.sub(r"[^a-z0-9]+", "_", snake_case.casefold()).strip("_")
 
 
 def _reject_routing_fields(value: JsonValue) -> None:
-    if isinstance(value, dict):
-        for key, child in value.items():
-            if _normalized_key(key) in _ROUTING_FIELDS:
-                raise McpValidationError("routing fields are forbidden")
-            _reject_routing_fields(child)
-    elif isinstance(value, list):
-        for child in value:
-            _reject_routing_fields(child)
+    stack = [value]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            for key, child in node.items():
+                if _normalized_key(key) in _ROUTING_FIELDS:
+                    raise McpValidationError("routing fields are forbidden")
+                stack.append(child)
+        elif isinstance(node, list):
+            stack.extend(node)
 
 
 def _validate_size(value: JsonValue | dict[str, Any], limits: ValidationLimits) -> None:
@@ -140,130 +159,69 @@ def _validate_size(value: JsonValue | dict[str, Any], limits: ValidationLimits) 
         raise McpValidationError("JSON payload exceeds byte limit")
 
 
-def _validate_value(value: Any, *, limits: ValidationLimits, depth: int) -> None:
-    if depth > limits.max_depth:
-        raise McpValidationError("JSON payload exceeds nesting limit")
-    if value is None or isinstance(value, bool):
-        return
-    if isinstance(value, str):
-        if len(value) > limits.max_string_length:
-            raise McpValidationError("string exceeds length limit")
-        return
-    if isinstance(value, (int, float)):
-        if isinstance(value, float) and not math.isfinite(value):
-            raise McpValidationError("number must be finite")
-        if abs(value) > limits.max_abs_number:
-            raise McpValidationError("number exceeds range limit")
-        return
-    if isinstance(value, list):
-        if len(value) > limits.max_array_items:
-            raise McpValidationError("array exceeds item limit")
-        for child in value:
-            _validate_value(child, limits=limits, depth=depth + 1)
-        return
-    if isinstance(value, dict):
-        if len(value) > limits.max_object_properties:
-            raise McpValidationError("object exceeds property limit")
-        for key, child in value.items():
-            if not isinstance(key, str):
-                raise McpValidationError("JSON object keys must be strings")
-            if len(key) > limits.max_string_length:
-                raise McpValidationError("object key exceeds length limit")
-            _validate_value(child, limits=limits, depth=depth + 1)
-        return
-    raise McpValidationError("value is not valid JSON")
+def _validate_value(value: Any, *, limits: ValidationLimits) -> None:
+    stack: list[tuple[str, Any, int]] = [("enter", value, 1)]
+    active_containers: set[int] = set()
+    node_count = 0
+    total_string_length = 0
+    while stack:
+        action, node, depth = stack.pop()
+        if action == "leave":
+            active_containers.remove(id(node))
+            continue
+        if depth > limits.max_depth:
+            raise McpValidationError("JSON payload exceeds nesting limit")
+        node_count += 1
+        if node_count > limits.max_nodes:
+            raise McpValidationError("JSON payload exceeds node limit")
+        if node is None or isinstance(node, bool):
+            continue
+        if isinstance(node, str):
+            if len(node) > limits.max_string_length:
+                raise McpValidationError("string exceeds length limit")
+            total_string_length += len(node)
+        elif isinstance(node, (int, float)):
+            if isinstance(node, float) and not math.isfinite(node):
+                raise McpValidationError("number must be finite")
+            if abs(node) > limits.max_abs_number:
+                raise McpValidationError("number exceeds range limit")
+        elif isinstance(node, (dict, list)):
+            identity = id(node)
+            if identity in active_containers:
+                raise McpValidationError("JSON payload must not contain a cycle")
+            active_containers.add(identity)
+            stack.append(("leave", node, depth))
+            if isinstance(node, list):
+                if len(node) > limits.max_array_items:
+                    raise McpValidationError("array exceeds item limit")
+                stack.extend(("enter", child, depth + 1) for child in reversed(node))
+            else:
+                if len(node) > limits.max_object_properties:
+                    raise McpValidationError("object exceeds property limit")
+                for key in node:
+                    if not isinstance(key, str):
+                        raise McpValidationError("JSON object keys must be strings")
+                    if len(key) > limits.max_string_length:
+                        raise McpValidationError("object key exceeds length limit")
+                    total_string_length += len(key)
+                stack.extend(
+                    ("enter", child, depth + 1) for child in reversed(tuple(node.values()))
+                )
+        else:
+            raise McpValidationError("value is not valid JSON")
+        if total_string_length > limits.max_total_string_length:
+            raise McpValidationError("JSON payload exceeds aggregate string limit")
 
 
 def _validate_against_schema(value: Any, schema: dict[str, Any], *, path: str) -> None:
-    if not schema:
-        return
-    if "const" in schema and value != schema["const"]:
-        raise McpValidationError(f"{path} does not match const")
-    if "enum" in schema and value not in schema["enum"]:
-        raise McpValidationError(f"{path} is not an allowed enum value")
-
-    schema_type = schema.get("type")
-    if isinstance(schema_type, list):
-        if not any(_matches_type(value, item) for item in schema_type):
-            raise McpValidationError(f"{path} has an invalid type")
-    elif isinstance(schema_type, str) and not _matches_type(value, schema_type):
-        raise McpValidationError(f"{path} has an invalid type")
-
-    if isinstance(value, dict):
-        properties = schema.get("properties", {})
-        required = schema.get("required", [])
-        for name in required:
-            if name not in value:
-                raise McpValidationError(f"{path}.{name} is required")
-        unknown = set(value) - set(properties)
-        if unknown and schema.get("additionalProperties") is False:
-            raise McpValidationError(f"{path} has unknown properties")
-        for name, child in value.items():
-            child_schema = properties.get(name)
-            if isinstance(child_schema, dict):
-                _validate_against_schema(child, child_schema, path=f"{path}.{name}")
-        min_properties = schema.get("minProperties")
-        max_properties = schema.get("maxProperties")
-        if min_properties is not None and len(value) < min_properties:
-            raise McpValidationError(f"{path} has too few properties")
-        if max_properties is not None and len(value) > max_properties:
-            raise McpValidationError(f"{path} has too many properties")
-
-    if isinstance(value, list):
-        item_schema = schema.get("items")
-        if isinstance(item_schema, dict):
-            for index, child in enumerate(value):
-                _validate_against_schema(child, item_schema, path=f"{path}[{index}]")
-        if schema.get("minItems") is not None and len(value) < schema["minItems"]:
-            raise McpValidationError(f"{path} has too few items")
-        if schema.get("maxItems") is not None and len(value) > schema["maxItems"]:
-            raise McpValidationError(f"{path} has too many items")
-
-    if isinstance(value, str):
-        if schema.get("minLength") is not None and len(value) < schema["minLength"]:
-            raise McpValidationError(f"{path} is too short")
-        if schema.get("maxLength") is not None and len(value) > schema["maxLength"]:
-            raise McpValidationError(f"{path} is too long")
-        pattern = schema.get("pattern")
-        if pattern is not None and re.search(pattern, value) is None:
-            raise McpValidationError(f"{path} does not match pattern")
-
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        if schema.get("minimum") is not None and value < schema["minimum"]:
-            raise McpValidationError(f"{path} is below minimum")
-        if schema.get("maximum") is not None and value > schema["maximum"]:
-            raise McpValidationError(f"{path} is above maximum")
-        if schema.get("exclusiveMinimum") is not None and value <= schema["exclusiveMinimum"]:
-            raise McpValidationError(f"{path} is below exclusive minimum")
-        if schema.get("exclusiveMaximum") is not None and value >= schema["exclusiveMaximum"]:
-            raise McpValidationError(f"{path} is above exclusive maximum")
-
-    for keyword, require_all in (("allOf", True), ("anyOf", False), ("oneOf", False)):
-        alternatives = schema.get(keyword)
-        if not isinstance(alternatives, list):
-            continue
-        matches = 0
-        for alternative in alternatives:
-            try:
-                _validate_against_schema(value, alternative, path=path)
-            except McpValidationError:
-                continue
-            matches += 1
-        if require_all and matches != len(alternatives):
-            raise McpValidationError(f"{path} does not match all schemas")
-        if keyword == "anyOf" and matches == 0:
-            raise McpValidationError(f"{path} does not match any schema")
-        if keyword == "oneOf" and matches != 1:
-            raise McpValidationError(f"{path} does not match exactly one schema")
-
-
-def _matches_type(value: Any, schema_type: str) -> bool:
-    return {
-        "null": value is None,
-        "boolean": isinstance(value, bool),
-        "integer": isinstance(value, int) and not isinstance(value, bool),
-        "number": isinstance(value, (int, float)) and not isinstance(value, bool),
-        "string": isinstance(value, str),
-        "array": isinstance(value, list),
-        "object": isinstance(value, dict),
-    }.get(schema_type, False)
+    try:
+        Draft202012Validator(
+            schema,
+            format_checker=Draft202012Validator.FORMAT_CHECKER,
+        ).validate(value)
+    except ValidationError as exc:
+        raise McpValidationError("value does not match approved schema") from exc
+    except Exception as exc:
+        # External references have already been rejected; remaining resolver and
+        # implementation failures must still fail closed without exposing values.
+        raise McpValidationError("schema validation could not be completed") from exc

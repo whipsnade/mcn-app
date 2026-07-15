@@ -12,7 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.mcp_gateway.contracts import DataTapService
-from app.mcp_gateway.models import McpToolCatalog
+from app.mcp_gateway.models import McpToolCatalog, McpToolDiscovery
 from app.mcp_gateway.transport import DiscoveredTool, McpTransport
 from app.mcp_gateway.validation import canonical_json_bytes, validate_schema_policy
 
@@ -87,11 +87,13 @@ class ToolRegistryService:
             seen_remote_names.add(tool.name)
             entry = self._by_remote.get((service, tool.name))
             if entry is None:
+                await self._upsert_discovery(service, tool, review_status="quarantined", now=now)
                 quarantined.append(tool.name)
                 continue
             row = await self._row_by_internal(entry.internal_name)
             observed_digest = discovery_digest(tool)
             if observed_digest != entry.digest:
+                await self._upsert_discovery(service, tool, review_status="quarantined", now=now)
                 quarantined.append(tool.name)
                 if row is not None:
                     row.review_status = "quarantined"
@@ -123,7 +125,12 @@ class ToolRegistryService:
                 row.is_enabled = False
                 row.updated_at = now
                 quarantined.append(tool.name)
+                await self._upsert_discovery(service, tool, review_status="quarantined", now=now)
                 continue
+            if not entry.enabled and row.is_enabled:
+                row.is_enabled = False
+                row.updated_at = now
+            await self._upsert_discovery(service, tool, review_status="approved", now=now)
             approved.append(tool.name)
 
         for entry in self._entries:
@@ -149,7 +156,8 @@ class ToolRegistryService:
             raise ToolNotEnabledError("tool is not present in the approved manifest")
         row = await self._row_by_internal(internal_name)
         if (
-            row is None
+            not entry.enabled
+            or row is None
             or not row.is_enabled
             or row.review_status != "approved"
             or row.service_slug != entry.service.value
@@ -175,6 +183,7 @@ class ToolRegistryService:
             entry = self._by_internal.get(row.internal_tool_name)
             if (
                 entry is not None
+                and entry.enabled
                 and row.service_slug == entry.service.value
                 and row.input_schema_json == entry.input_schema
                 and row.discovery_digest == entry.digest
@@ -186,6 +195,43 @@ class ToolRegistryService:
         return await self._db.scalar(
             select(McpToolCatalog).where(McpToolCatalog.internal_tool_name == internal_name)
         )
+
+    async def _upsert_discovery(
+        self,
+        service: DataTapService,
+        tool: DiscoveredTool,
+        *,
+        review_status: str,
+        now: datetime,
+    ) -> McpToolDiscovery:
+        row = await self._db.scalar(
+            select(McpToolDiscovery).where(
+                McpToolDiscovery.service_slug == service.value,
+                McpToolDiscovery.remote_name == tool.name,
+            )
+        )
+        if row is None:
+            row = McpToolDiscovery(
+                id=str(uuid4()),
+                service_slug=service.value,
+                remote_name=tool.name,
+                description=tool.description,
+                input_schema_json=tool.input_schema,
+                output_schema_json=tool.output_schema,
+                discovery_digest=discovery_digest(tool),
+                review_status=review_status,
+                discovered_at=now,
+                updated_at=now,
+            )
+            self._db.add(row)
+            return row
+        row.description = tool.description
+        row.input_schema_json = tool.input_schema
+        row.output_schema_json = tool.output_schema
+        row.discovery_digest = discovery_digest(tool)
+        row.review_status = review_status
+        row.updated_at = now
+        return row
 
     @staticmethod
     def _approved_tool(row: McpToolCatalog, entry: _ManifestEntry) -> ApprovedTool:
