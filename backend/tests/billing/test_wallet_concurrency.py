@@ -44,7 +44,7 @@ async def test_concurrent_reservations_cannot_overdraw_wallet() -> None:
             async with session.begin():
                 async with ready_lock:
                     ready_count += 1
-                    if ready_count == 2:
+                    if ready_count == 10:
                         start.set()
                 await start.wait()
                 return await WalletService(session).reserve(
@@ -56,12 +56,11 @@ async def test_concurrent_reservations_cannot_overdraw_wallet() -> None:
 
     try:
         results = await asyncio.gather(
-            reserve("call-a"),
-            reserve("call-b"),
+            *(reserve(f"call-{index}") for index in range(10)),
             return_exceptions=True,
         )
 
-        assert sum(isinstance(result, InsufficientPointsError) for result in results) == 1
+        assert sum(isinstance(result, InsufficientPointsError) for result in results) == 9
         assert sum(not isinstance(result, BaseException) for result in results) == 1
 
         async with SessionFactory() as verify:

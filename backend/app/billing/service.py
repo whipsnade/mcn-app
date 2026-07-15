@@ -1,4 +1,6 @@
 from datetime import UTC, datetime
+from dataclasses import dataclass
+from collections.abc import Sequence
 from uuid import uuid4
 
 from sqlalchemy import select
@@ -9,6 +11,13 @@ from app.billing.models import Wallet, WalletTransaction
 
 class InsufficientPointsError(Exception):
     """Raised when available points cannot cover a reservation."""
+
+
+@dataclass(frozen=True)
+class ReservationRequest:
+    reference_id: str
+    idempotency_key: str
+    amount: int = 10
 
 
 def utc_now() -> datetime:
@@ -124,6 +133,30 @@ class WalletService:
             reference_type="mcp_call",
             reference_id=reference_id,
         )
+
+    async def reserve_batch(
+        self, user_id: str, requests: Sequence[ReservationRequest]
+    ) -> Wallet:
+        if not requests or any(request.amount != 10 for request in requests):
+            raise ValueError("invalid_mcp_reservation_batch")
+        wallet = await self.get_wallet(user_id, for_update=True)
+        unapplied = [
+            request for request in requests if not await self._already_applied(request.idempotency_key)
+        ]
+        required = sum(request.amount for request in unapplied)
+        if wallet.balance < required:
+            raise InsufficientPointsError()
+        for request in unapplied:
+            await self._record(
+                wallet,
+                kind="reserve",
+                balance_delta=-request.amount,
+                reserved_delta=request.amount,
+                idempotency_key=request.idempotency_key,
+                reference_type="mcp_call",
+                reference_id=request.reference_id,
+            )
+        return wallet
 
     async def settle(
         self,

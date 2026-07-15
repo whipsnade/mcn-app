@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import asyncio
+from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Protocol
 from uuid import uuid4
@@ -11,12 +14,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.mcp_gateway.contracts import McpCallStatus
 from app.mcp_gateway.models import McpCall
+from app.mcp_gateway.accounting import McpAccounting
 from app.mcp_gateway.registry import ToolNotEnabledError, ToolRegistryService
 from app.mcp_gateway.transport import (
     JsonValue,
     LogicalCallConflictError,
     McpTransport,
     PossiblySentTimeout,
+    RemoteToolResult,
+    ToolInvocationOutcome,
 )
 from app.mcp_gateway.validation import (
     McpValidationError,
@@ -29,6 +35,25 @@ from app.tasks.models import AnalysisTask
 
 class McpArgumentsLoader(Protocol):
     async def load_arguments(self, *, task_id: str, plan_step_id: str) -> dict[str, JsonValue]: ...
+
+
+@dataclass(frozen=True)
+class ExecuteMcpCall:
+    logical_call_id: str
+    user_id: str
+    task_id: str
+    plan_step_id: str
+    internal_tool_name: str
+    arguments: dict[str, JsonValue]
+
+
+@dataclass(frozen=True)
+class PreparedMcpInvocation:
+    service: object
+    remote_name: str
+    arguments: dict[str, JsonValue]
+    output_schema: dict
+    protocol_session_digest: str | None
 
 
 class McpCallService:
@@ -213,6 +238,99 @@ class McpCallService:
         await self._db.commit()
         return row
 
+    async def claim(self, logical_call_id: str) -> McpCall:
+        """Durably claim a reserved call; the caller owns the surrounding transaction."""
+        now = datetime.now(UTC).replace(tzinfo=None)
+        claimed = await self._db.execute(
+            update(McpCall)
+            .where(
+                McpCall.logical_call_id == logical_call_id,
+                McpCall.status == McpCallStatus.RESERVED.value,
+            )
+            .values(
+                status=McpCallStatus.RUNNING.value,
+                started_at=now,
+                updated_at=now,
+            )
+        )
+        await self._db.flush()
+        row = await self._by_logical_id(logical_call_id, refresh=True)
+        if row is None:
+            raise LookupError("MCP logical call does not exist")
+        if claimed.rowcount != 1:
+            return row
+        return row
+
+    async def prepare_external(
+        self, row: McpCall
+    ) -> PreparedMcpInvocation | ToolInvocationOutcome:
+        try:
+            approved = await self._registry.require_enabled(row.internal_tool_name)
+        except ToolNotEnabledError:
+            return ToolInvocationOutcome("failed", None, None, None, "tool_not_enabled")
+        if (
+            approved.internal_name != row.internal_tool_name
+            or approved.service.value != row.service_slug
+            or not approved.remote_name
+        ):
+            return ToolInvocationOutcome("failed", None, None, None, "tool_binding_mismatch")
+        try:
+            arguments = await self._arguments_loader.load_arguments(
+                task_id=row.task_id, plan_step_id=row.plan_step_id
+            )
+            validated_arguments = validate_input(arguments, approved.input_schema)
+        except McpValidationError:
+            return ToolInvocationOutcome("failed", None, None, None, "input_validation_error")
+        except Exception:
+            return ToolInvocationOutcome("failed", None, None, None, "arguments_unavailable")
+        digest = hashlib.sha256(canonical_json_bytes(validated_arguments)).hexdigest()
+        if digest != row.arguments_digest:
+            return ToolInvocationOutcome("failed", None, None, None, "arguments_digest_mismatch")
+        try:
+            protocol_digest = self._transport.protocol_session_digest(approved.service)
+        except Exception:
+            return ToolInvocationOutcome("failed", None, None, None, "protocol_session_audit_error")
+        if protocol_digest is not None and (
+            not isinstance(protocol_digest, str)
+            or len(protocol_digest) != 64
+            or any(character not in "0123456789abcdef" for character in protocol_digest)
+        ):
+            return ToolInvocationOutcome("failed", None, None, None, "protocol_session_audit_error")
+        return PreparedMcpInvocation(
+            approved.service,
+            approved.remote_name,
+            validated_arguments,
+            approved.output_schema,
+            protocol_digest,
+        )
+
+    async def invoke_prepared(self, invocation: PreparedMcpInvocation) -> ToolInvocationOutcome:
+        try:
+            result: RemoteToolResult = await self._transport.call_tool(
+                invocation.service, invocation.remote_name, invocation.arguments
+            )
+        except PossiblySentTimeout:
+            return ToolInvocationOutcome("unknown", None, None, None, "possibly_sent_timeout")
+        except Exception:
+            return ToolInvocationOutcome("failed", None, None, None, "upstream_error")
+        if result.is_error:
+            return ToolInvocationOutcome(
+                "failed", None, None, result.upstream_request_id, "upstream_tool_error"
+            )
+        try:
+            output = validate_output(result.structured_content, invocation.output_schema)
+        except McpValidationError:
+            return ToolInvocationOutcome(
+                "failed", None, None, result.upstream_request_id, "output_validation_error"
+            )
+        return ToolInvocationOutcome(
+            "succeeded",
+            output,
+            hashlib.sha256(canonical_json_bytes(output)).hexdigest(),
+            result.upstream_request_id,
+            None,
+        )
+
     async def _finish_unknown(self, row: McpCall) -> McpCall:
         row.status = McpCallStatus.UNKNOWN.value
         row.evidence_json = {"outcome": "unknown"}
@@ -268,3 +386,90 @@ class McpCallService:
             and row.arguments_digest == arguments_digest
             and task_user_id == user_id
         )
+
+
+class McpGatewayService:
+    """Three-transaction gateway: reserve, claim, then terminal accounting."""
+
+    def __init__(
+        self,
+        db_session: AsyncSession,
+        transport: McpTransport,
+        *,
+        arguments_loader: McpArgumentsLoader,
+        registry: ToolRegistryService | None = None,
+    ) -> None:
+        self._db = db_session
+        self._calls = McpCallService(
+            db_session,
+            transport,
+            arguments_loader=arguments_loader,
+            registry=registry,
+        )
+        self._accounting = McpAccounting(db_session)
+
+    async def execute(self, command: ExecuteMcpCall) -> McpCall:
+        return (await self.execute_batch((command,)))[0]
+
+    async def execute_batch(
+        self, commands: Sequence[ExecuteMcpCall]
+    ) -> tuple[McpCall, ...]:
+        if not commands:
+            return ()
+        user_ids = {command.user_id for command in commands}
+        if len(user_ids) != 1:
+            raise ValueError("mcp_batch_must_have_one_user")
+
+        # A: creation and every reservation atomically commit before a call can run.
+        async with self._transaction():
+            rows = tuple(
+                await self._calls.prepare(
+                    logical_call_id=command.logical_call_id,
+                    user_id=command.user_id,
+                    task_id=command.task_id,
+                    plan_step_id=command.plan_step_id,
+                    internal_tool_name=command.internal_tool_name,
+                    arguments=command.arguments,
+                )
+                for command in commands
+            )
+            await self._accounting.reserve_batch(commands[0].user_id, rows)
+
+        # B: each successful claim becomes visible before any external request.
+        async with self._transaction():
+            claimed = tuple(await self._calls.claim(row.logical_call_id) for row in rows)
+
+        prepared: dict[str, PreparedMcpInvocation] = {}
+        outcomes: dict[str, ToolInvocationOutcome] = {}
+        async with self._transaction():
+            for row in claimed:
+                if row.status != McpCallStatus.RUNNING.value:
+                    continue
+                ready = await self._calls.prepare_external(row)
+                if isinstance(ready, ToolInvocationOutcome):
+                    outcomes[row.id] = ready
+                else:
+                    prepared[row.id] = ready
+        # Argument and registry reads are complete; no database transaction spans the network.
+        external = await asyncio.gather(
+            *(self._calls.invoke_prepared(item) for item in prepared.values())
+        )
+        outcomes.update(dict(zip(prepared, external, strict=True)))
+
+        # C: known terminal state and its ledger record share one transaction per call.
+        finalized: dict[str, McpCall] = {row.id: row for row in claimed}
+        for row in claimed:
+            outcome = outcomes.get(row.id)
+            if outcome is None:
+                continue
+            async with self._transaction():
+                current = await self._accounting.finalize(row, outcome)
+                if row.id in prepared:
+                    current.protocol_session_digest = prepared[row.id].protocol_session_digest
+                finalized[row.id] = current
+        return tuple(finalized[row.id] for row in rows)
+
+    def _transaction(self):
+        if self._db.in_transaction():
+            return self._db.begin_nested()
+        return self._db.begin()
