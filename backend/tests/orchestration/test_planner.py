@@ -49,6 +49,10 @@ def _xiaohongshu_tool() -> PlannerTool:
                         "size": {"type": "integer"},
                         "followercountMin": {"type": "integer"},
                         "kwProvinceList": {"type": "array", "items": {"type": "string"}},
+                        "sexListFan": {"type": "array", "items": {"type": "string"}},
+                        "sexListFanMin": {"type": "number"},
+                        "ageListFan": {"type": "array", "items": {"type": "string"}},
+                        "ageListFanMin": {"type": "number"},
                         "sumpostMin": {"type": "integer"},
                         "textContentWord": {"type": "string"},
                     },
@@ -199,6 +203,7 @@ async def test_plan_compiles_supported_defaults_for_datatap_xiaohongshu_search()
             "brief": context.brief.model_copy(
                 update={
                     "brand": "科颜氏",
+                    "target_audience": "20～30女性",
                     "filters": {"target_fan_locations": ["湖州", "浙江"]},
                 }
             ),
@@ -218,6 +223,7 @@ async def test_plan_compiles_supported_defaults_for_datatap_xiaohongshu_search()
                     "request": {
                         "followercountMin": 20_000,
                         "kwProvinceList": ["湖州", "浙江"],
+                        "ageListFan": ["age1PercentFan", "age2PercentFan"],
                     }
                 },
                 evidence_goal="候选达人列表",
@@ -234,6 +240,10 @@ async def test_plan_compiles_supported_defaults_for_datatap_xiaohongshu_search()
             "size": 10,
             "followercountMin": 20_000,
             "kwProvinceList": ["浙江省"],
+            "sexListFan": ["femalePercentFan"],
+            "sexListFanMin": 0.5,
+            "ageListFan": ["age2PercentFan", "age3PercentFan"],
+            "ageListFanMin": 0.2,
             "sumpostMin": 1,
             "textContentWord": "科颜氏",
         }
