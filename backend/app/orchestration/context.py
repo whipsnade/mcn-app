@@ -38,15 +38,9 @@ _DISABLED_SERVICE_NAMES = {
     "google-trends-mcp",
 }
 _SUPPLIER_HOST_NAMES = {"datatap.deepminer.com.cn"}
-_TEXT_SECRET_PATTERNS = (
-    re.compile(
-        r"\bauthorization(?:\s*[:=]\s*|\s+)(?:bearer(?:\s*[:=]\s*|\s+))?\S+",
-        re.IGNORECASE,
-    ),
-    re.compile(r"\bbearer(?:\s*[:=]\s*|\s+)\S+", re.IGNORECASE),
-    re.compile(r"\bapi[_\s-]?key(?:\s*[:=]\s*|\s+)\S+", re.IGNORECASE),
-    re.compile(r"\btoken(?:\s*[:=]\s*|\s+)\S+", re.IGNORECASE),
-    re.compile(r"\bcredentials?(?:\s*[:=]\s*|\s+)\S+", re.IGNORECASE),
+_TEXT_SECRET_PATTERN = re.compile(
+    r"(?<![a-z0-9_])(?:authorization|bearer|api[ _-]?key|token|credentials?)(?![a-z0-9_])",
+    re.IGNORECASE,
 )
 
 
@@ -105,7 +99,7 @@ def _is_sensitive_report_key(key: str) -> bool:
 
 
 def _contains_text_secret(value: str) -> bool:
-    return any(pattern.search(value) is not None for pattern in _TEXT_SECRET_PATTERNS)
+    return _TEXT_SECRET_PATTERN.search(value) is not None
 
 
 def _project_reporting_value(value: Any) -> Any:

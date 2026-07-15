@@ -80,6 +80,11 @@ class FakeReporting:
                 "api key secret-api-eight",
                 "token secret-token-nine",
                 "credential secret-credential-ten",
+                "Authorization： secret-auth-eleven",
+                "Bearer： secret-bearer-twelve",
+                "api key： secret-api-thirteen",
+                "token： secret-token-fourteen",
+                "credentials： secret-credential-fifteen",
             ],
         }
 
@@ -112,6 +117,11 @@ async def test_model_context_contains_reviewed_tools_but_no_supplier_details() -
     assert "secret-api-eight" not in serialized
     assert "secret-token-nine" not in serialized
     assert "secret-credential-ten" not in serialized
+    assert "secret-auth-eleven" not in serialized
+    assert "secret-bearer-twelve" not in serialized
+    assert "secret-api-thirteen" not in serialized
+    assert "secret-token-fourteen" not in serialized
+    assert "secret-credential-fifteen" not in serialized
     assert "安全候选" in serialized
     assert "候选内容互动稳定" in serialized
     assert context.allowed_channels == ("bilibili",)
