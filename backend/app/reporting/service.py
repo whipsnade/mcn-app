@@ -22,6 +22,9 @@ from app.tasks.models import AnalysisTask, TaskEvent
 from app.tasks.state import TaskEventType
 
 
+_FINAL_CANDIDATE_LIMIT = 10
+
+
 def _now() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
 
@@ -36,6 +39,20 @@ class ReportingService:
 
     def __init__(self, db_session: AsyncSession) -> None:
         self._db = db_session
+
+    @staticmethod
+    def _select_top_candidates(
+        draft: list[tuple[Kol, KolSnapshot, Any, Any]],
+    ) -> list[tuple[Kol, KolSnapshot, Any, Any]]:
+        return sorted(
+            draft,
+            key=lambda item: (
+                -item[3].total,
+                -(item[3].dimensions["audience"].raw_score or 0),
+                -(item[3].dimensions["engagement"].raw_score or 0),
+                item[0].platform_account_id,
+            ),
+        )[:_FINAL_CANDIDATE_LIMIT]
 
     async def build_candidate_version(
         self, task_id: str, profile: str, *, lease_owner: str | None = None
@@ -83,14 +100,7 @@ class ReportingService:
                 score = score_candidate(row.dimensions(), profile)
                 draft.append((kol, snapshot, row, score))
 
-            draft.sort(
-                key=lambda item: (
-                    -item[3].total,
-                    -(item[3].dimensions["audience"].raw_score or 0),
-                    -(item[3].dimensions["engagement"].raw_score or 0),
-                    item[0].platform_account_id,
-                )
-            )
+            draft = self._select_top_candidates(draft)
             created_at = _now()
             for rank, (kol, snapshot, row, score) in enumerate(draft, start=1):
                 self._db.add(snapshot)

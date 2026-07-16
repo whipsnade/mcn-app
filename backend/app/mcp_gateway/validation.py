@@ -33,7 +33,10 @@ class ValidationLimits:
 
 
 DEFAULT_INPUT_LIMITS = ValidationLimits()
-DEFAULT_OUTPUT_LIMITS = ValidationLimits(max_bytes=1_048_576)
+DEFAULT_OUTPUT_LIMITS = ValidationLimits(
+    max_bytes=1_048_576,
+    max_string_length=262_144,
+)
 
 _ROUTING_FIELDS = {
     "api_key",
