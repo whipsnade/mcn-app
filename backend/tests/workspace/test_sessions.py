@@ -57,6 +57,27 @@ async def test_session_can_be_created_without_a_campaign_name(auth_client_factor
 
 
 @pytest.mark.asyncio
+async def test_session_requires_only_industry_and_initial_query(auth_client_factory) -> None:
+    client = await auth_client_factory("13800000007")
+
+    created = await client.post(
+        "/api/v1/sessions",
+        json={
+            "brand": "",
+            "campaign_name": None,
+            "platforms": [],
+            "category": "美妆",
+            "target_audience": "",
+            "initial_query": "筛选最近活跃的达人",
+            "filters": {"kol_name": "达人A"},
+        },
+    )
+
+    assert created.status_code == 201
+    assert created.json()["filters"]["kol_name"] == "达人A"
+
+
+@pytest.mark.asyncio
 async def test_session_creation_starts_analysis_for_the_initial_query(auth_client_factory) -> None:
     client = await auth_client_factory("13800000006")
 

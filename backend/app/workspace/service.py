@@ -49,7 +49,11 @@ class WorkspaceService:
 
     async def create_session(self, user_id: str, payload: SessionCreate) -> WorkspaceSession:
         now = utc_now()
-        title = payload.brand if not payload.campaign_name else f"{payload.brand}-{payload.campaign_name}"
+        title = (
+            f"{payload.brand}-{payload.campaign_name}"
+            if payload.brand and payload.campaign_name
+            else payload.brand or payload.campaign_name or f"{payload.category} KOL 筛选"
+        )
         workspace = WorkspaceSession(
             id=str(uuid4()),
             user_id=user_id,

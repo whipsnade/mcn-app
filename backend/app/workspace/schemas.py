@@ -11,11 +11,11 @@ Platform = Literal["xiaohongshu", "douyin", "bilibili", "weibo", "wechat"]
 
 
 class SessionCreate(BaseModel):
-    brand: str = Field(min_length=1, max_length=100)
+    brand: str = Field(default="", max_length=100)
     campaign_name: str | None = Field(default=None, min_length=1, max_length=120)
-    platforms: list[Platform] = Field(min_length=1)
+    platforms: list[Platform] = Field(default_factory=list)
     category: str = Field(min_length=1, max_length=100)
-    target_audience: str = Field(min_length=1, max_length=500)
+    target_audience: str = Field(default="", max_length=500)
     budget_min: Decimal | None = Field(default=None, ge=0)
     budget_max: Decimal | None = Field(default=None, ge=0)
     initial_query: str = Field(min_length=1, max_length=5000)
