@@ -8,7 +8,7 @@ from decimal import Decimal
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -416,7 +416,7 @@ class ReportingService:
                 AnalysisTask.session_id == session_id,
                 WorkspaceSession.deleted_at.is_(None),
             )
-            .order_by(AnalysisTask.created_at.desc())
+            .order_by(*self._latest_task_order())
         )
         if task is None:
             return None, None, 0, None
@@ -461,7 +461,7 @@ class ReportingService:
                 AnalysisTask.session_id == session_id,
                 WorkspaceSession.deleted_at.is_(None),
             )
-            .order_by(AnalysisTask.created_at.desc())
+            .order_by(*self._latest_task_order())
         )
         if task is None:
             return None, None, []
@@ -606,10 +606,19 @@ class ReportingService:
         latest_id = await self._db.scalar(
             select(AnalysisTask.id)
             .where(AnalysisTask.session_id == task.session_id)
-            .order_by(AnalysisTask.created_at.desc(), AnalysisTask.id.desc())
+            .order_by(*self._latest_task_order())
             .limit(1)
         )
         return latest_id == task.id
+
+    @staticmethod
+    def _latest_task_order() -> tuple[Any, ...]:
+        return (
+            case((AnalysisTask.creation_order.is_(None), 1), else_=0),
+            AnalysisTask.creation_order.desc(),
+            AnalysisTask.created_at.desc(),
+            AnalysisTask.id.desc(),
+        )
 
     @staticmethod
     def _require_active_lease(task: AnalysisTask, lease_owner: str | None) -> None:

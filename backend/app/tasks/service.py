@@ -1,7 +1,7 @@
 from datetime import UTC, datetime
 from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -74,6 +74,11 @@ class TaskService:
                 raise LookupError("trigger_message_not_found")
         message.metadata_json = {"scoring_profile": payload.scoring_profile}
         now = utc_now()
+        latest_creation_order = await self.db.scalar(
+            select(func.max(AnalysisTask.creation_order)).where(
+                AnalysisTask.session_id == session_id
+            )
+        )
         task = AnalysisTask(
             id=str(uuid4()),
             user_id=user_id,
@@ -93,6 +98,7 @@ class TaskService:
             lease_expires_at=None,
             started_at=None,
             completed_at=None,
+            creation_order=int(latest_creation_order or 0) + 1,
             created_at=now,
             updated_at=now,
         )

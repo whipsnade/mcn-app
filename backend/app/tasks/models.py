@@ -16,6 +16,7 @@ class AnalysisTask(Base):
             "session_id",
             "created_at",
         ),
+        Index("ix_analysis_tasks_session_creation_order", "session_id", "creation_order"),
         Index("ix_analysis_tasks_status_lease", "status", "lease_expires_at"),
     )
 
@@ -45,6 +46,9 @@ class AnalysisTask(Base):
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime)
     started_at: Mapped[datetime | None] = mapped_column(DateTime)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    # Per-session monotonic sequence. Nullable for legacy rows created before
+    # migration 0012; every new task is assigned under the session row lock.
+    creation_order: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 

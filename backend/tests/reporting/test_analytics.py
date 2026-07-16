@@ -1,4 +1,4 @@
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from decimal import Decimal
 from uuid import uuid4
 
@@ -235,7 +235,12 @@ async def test_latest_session_analysis_hides_old_report_when_latest_task_is_runn
     )
     latest = await db_session.get(AnalysisTask, new_task.id)
     assert latest is not None
-    latest.created_at = now + timedelta(seconds=1)
+    assert latest.creation_order > (old_task.creation_order or 0)
+    # DATETIME(0) has only second precision; force a same-second tie so the
+    # random UUID must not decide which task is latest.
+    same_second = now.replace(microsecond=0)
+    old_task.created_at = same_second
+    latest.created_at = same_second
     latest.status = TaskStatus.RUNNING.value
     await db_session.flush()
 
