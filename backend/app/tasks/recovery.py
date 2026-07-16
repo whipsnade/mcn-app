@@ -26,11 +26,13 @@ class TaskRecovery:
         runner: RecoveryRunner,
         observation_seconds: int = 300,
         followup_generator: Callable[[str], Awaitable[bool]] | None = None,
+        followup_preparer: Callable[[str], Awaitable[bool]] | None = None,
     ) -> None:
         self.repository = repository
         self.runner = runner
         self.observation_seconds = observation_seconds
         self.followup_generator = followup_generator
+        self.followup_preparer = followup_preparer
 
     async def recover_expired(self) -> tuple[str, ...]:
         recovered: list[str] = []
@@ -47,6 +49,8 @@ class TaskRecovery:
         generated: list[str] = []
         for task_id in await self.repository.pending_followup_task_ids():
             try:
+                if self.followup_preparer is not None and not await self.followup_preparer(task_id):
+                    continue
                 if await self.followup_generator(task_id):
                     generated.append(task_id)
             except Exception:

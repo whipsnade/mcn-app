@@ -6,6 +6,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import SessionFactory, get_db
@@ -93,6 +94,31 @@ def task_read(task: AnalysisTask, metadata: dict | None = None) -> TaskRead:
     )
 
 
+async def task_followup_metadata(db: AsyncSession, task: AnalysisTask) -> dict:
+    """Read persisted suggestions from the assistant summary, never the user trigger."""
+    messages = list(
+        (
+            await db.scalars(
+                select(Message)
+                .where(
+                    Message.session_id == task.session_id,
+                    Message.user_id == task.user_id,
+                    Message.role == "assistant",
+                )
+                .order_by(Message.sequence.desc())
+            )
+        ).all()
+    )
+    return next(
+        (
+            message.metadata_json
+            for message in messages
+            if message.metadata_json.get("task_id") == task.id
+        ),
+        {},
+    )
+
+
 def task_not_found(error: LookupError) -> HTTPException:
     return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="task_not_found")
 
@@ -144,8 +170,7 @@ async def get_task(
         task = await TaskRepository(db).get_owned(task_id, user.id)
     except LookupError as error:
         raise task_not_found(error) from error
-    message = await db.get(Message, task.trigger_message_id)
-    return task_read(task, message.metadata_json if message is not None else None)
+    return task_read(task, await task_followup_metadata(db, task))
 
 
 @router.post("/tasks/{task_id}/cancel", response_model=TaskRead)

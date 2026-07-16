@@ -191,6 +191,9 @@ class TaskAnalysisSummary(BaseModel):
     id: str
     status: str
     completed_at: datetime | None = None
+    followup_suggestions_status: str | None = None
+    followup_suggestions: list[dict[str, Any]] = Field(default_factory=list)
+    followup_error: dict[str, Any] | None = None
 
 
 class BiReportRead(BaseModel):

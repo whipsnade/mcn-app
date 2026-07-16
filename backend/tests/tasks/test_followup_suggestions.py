@@ -22,11 +22,15 @@ def _suggestion(index: int = 1, **overrides):
     return value
 
 
-def test_followup_schema_requires_exactly_five_unique_chinese_suggestions() -> None:
-    result = FollowupSuggestions(suggestions=tuple(_suggestion(i) for i in range(1, 6)))
-    assert len(result.suggestions) == 5
+@pytest.mark.parametrize("count", [0, 1, 2, 3, 4, 5])
+def test_followup_schema_accepts_zero_to_five_unique_chinese_suggestions(count: int) -> None:
+    result = FollowupSuggestions(suggestions=tuple(_suggestion(i) for i in range(1, count + 1)))
+    assert len(result.suggestions) == count
+
+
+def test_followup_schema_rejects_more_than_five_or_duplicates() -> None:
     with pytest.raises(ValidationError):
-        FollowupSuggestions(suggestions=tuple(_suggestion(i) for i in range(1, 5)))
+        FollowupSuggestions(suggestions=tuple(_suggestion(i) for i in range(1, 7)))
     with pytest.raises(ValidationError):
         FollowupSuggestions(
             suggestions=tuple(_suggestion(1) for _ in range(5))
@@ -50,6 +54,31 @@ def test_internal_references_are_rejected_without_echoing_value(value: str) -> N
     assert contains_internal_reference(value)
     error = safe_followup_error(ValueError(value), stage="validate")
     assert value not in str(error)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "ftp://secret.example/file",
+        "file:///tmp/secret.json",
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature",
+        "get_audience_basic_profile",
+        '{"structured_content":{"raw":"secret"}}',
+    ],
+)
+def test_input_safety_redacts_sensitive_values_from_followup_prompt(value: str) -> None:
+    request = build_followup_request(
+        user_query=value,
+        session_filters={"brand": value, "raw_payload": value},
+        tool_summary={"抖音": {"succeeded": 1}},
+        candidate_count=1,
+        bi_summary={},
+        conclusion=value,
+    )
+    content = request.messages[-1].content
+    assert value not in content
+    assert "raw_payload" not in content
+    assert "structured_content" not in content
 
 
 def test_request_contains_only_safe_summary_fields() -> None:
@@ -82,3 +111,9 @@ def test_followup_lock_is_reentrant_safe_for_same_task() -> None:
         await lock.release("task-1")
 
     asyncio.run(run())
+
+
+def test_safe_followup_error_uses_whitelisted_code_and_safe_diagnostics() -> None:
+    error = safe_followup_error(ValueError("sk-secret"), stage="model")
+    assert error["error_code"] == "FOLLOWUP_GENERATION_FAILED"
+    assert "sk-secret" not in str(error)

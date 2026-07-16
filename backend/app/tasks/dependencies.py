@@ -325,6 +325,7 @@ class TaskExecutionDependencies:
         self.worker_id_prefix = f"inproc-{os.getpid()}"
         self._model = get_model_adapter()
         self._planner = Planner(model=self._model)
+        self._followups = FollowupSuggestionService(self._model)
         self._transport = get_mcp_transport()
         self._arguments = _PlanArguments()
 
@@ -369,7 +370,8 @@ class TaskExecutionDependencies:
             repository=self.store,
             runner=runner,
             observation_seconds=int(get_settings().mcp_unknown_reconcile_seconds),
-            followup_generator=FollowupSuggestionService(self._model).generate,
+            followup_generator=self._followups.generate,
+            followup_preparer=self._followups.prepare,
         )
 
 

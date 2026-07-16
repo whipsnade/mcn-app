@@ -68,6 +68,10 @@ class TaskEventStream:
             "task.failed",
             "task.cancelled",
         }
+        followup_terminal_events = {
+            "followup.suggestions_updated",
+            "followup.suggestions_failed",
+        }
         queue = await self.broker.subscribe(task_id)
         seen = last_event_id
         try:
@@ -80,8 +84,10 @@ class TaskEventStream:
                     seen = row.id
                     yield row
                     if row.event_type in terminal_events:
-                        if not await self._followup_pending(task_id):
+                        if not await self._wait_for_followup(task_id):
                             return
+                    elif row.event_type in followup_terminal_events:
+                        return
             while True:
                 try:
                     row = await asyncio.wait_for(queue.get(), timeout=0.5)
@@ -89,8 +95,10 @@ class TaskEventStream:
                         seen = row.id
                         yield row
                         if row.event_type in terminal_events:
-                            if not await self._followup_pending(task_id):
+                            if not await self._wait_for_followup(task_id):
                                 return
+                        elif row.event_type in followup_terminal_events:
+                            return
                 except TimeoutError:
                     # Most task boundaries are written through repositories that
                     # do not share this process' broker. The database is the
@@ -104,22 +112,30 @@ class TaskEventStream:
                             seen = row.id
                             yield row
                             if row.event_type in terminal_events:
-                                if not await self._followup_pending(task_id):
+                                if not await self._wait_for_followup(task_id):
                                     return
+                            elif row.event_type in followup_terminal_events:
+                                return
         finally:
             await self.broker.unsubscribe(task_id, queue)
 
-    async def _followup_pending(self, task_id: str) -> bool:
-        """Keep a newly completed stream open until follow-up generation settles."""
+    async def _followup_state(self, task_id: str) -> str | None:
         async with self.session_factory() as db:
             rows = list(
-                (
-                    await db.scalars(select(Message).where(Message.role == "assistant"))
-                ).all()
+                (await db.scalars(select(Message).where(Message.role == "assistant"))).all()
             )
-            return any(
-                message.metadata_json.get("task_id") == task_id
-                and
-                message.metadata_json.get("followup_suggestions_status") == "pending"
-                for message in rows
-            )
+            for message in rows:
+                if message.metadata_json.get("task_id") == task_id:
+                    return message.metadata_json.get("followup_suggestions_status")
+        return None
+
+    async def _wait_for_followup(self, task_id: str) -> bool:
+        """Return whether stream should stay open after terminal task event."""
+        for _ in range(20):
+            state = await self._followup_state(task_id)
+            if state == "pending":
+                return True
+            if state in {"completed", "failed"}:
+                return False
+            await asyncio.sleep(0.05)
+        return False

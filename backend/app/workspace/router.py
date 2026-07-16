@@ -67,8 +67,22 @@ async def session_read(
             workspace.user_id, workspace.id
         )
         if task is not None:
+            followup_metadata = next(
+                (
+                    message.metadata_json
+                    for message in messages
+                    if message.role == "assistant"
+                    and message.metadata_json.get("task_id") == task.id
+                ),
+                {},
+            )
             latest_task = TaskAnalysisSummary(
-                id=task.id, status=task.status, completed_at=task.completed_at
+                id=task.id,
+                status=task.status,
+                completed_at=task.completed_at,
+                followup_suggestions_status=followup_metadata.get("followup_suggestions_status"),
+                followup_suggestions=list(followup_metadata.get("followup_suggestions", [])),
+                followup_error=followup_metadata.get("followup_error"),
             )
         if version is not None:
             latest_candidates = CandidateVersionSummary(

@@ -259,6 +259,11 @@ class TaskRepository:
                 message.metadata_json.get("task_id") == task.id
                 and message.metadata_json.get("followup_suggestions_status") == "pending"
                 for message in messages
+            ) or any(
+                message.metadata_json.get("task_id") == task.id
+                and message.metadata_json.get("followup_suggestions_status") == "failed"
+                and int(message.metadata_json.get("followup_attempts", 0)) < 3
+                for message in messages
             ):
                 result.append(task.id)
         return tuple(result)

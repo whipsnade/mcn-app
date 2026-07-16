@@ -21,17 +21,63 @@ from app.workspace.models import Message, WorkspaceSession
 
 
 _INTERNAL_REFERENCE_RE = re.compile(
-    r"(?:https?://|wss?://|/api/|\bbearer\b|\bsk-[a-z0-9_-]+\b|"
+    r"(?:https?://|wss?://|ftp://|file://|/api/|\bbearer\b|\bsk-[a-z0-9_-]+\b|"
     r"\bdatatap\b|\bmcp\b|\bstep_[a-z0-9_-]+\b|"
     r"\b(?:get|list|search|fetch|query|analyze)_[a-z0-9_]+\b|"
     r"\b[a-z][a-z0-9_-]*\.[a-z][a-z0-9_.-]+\b|"
     r"\b[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}\b)",
     re.IGNORECASE,
 )
+_JWT_RE = re.compile(r"\b[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b")
+_RAW_FIELD_RE = re.compile(
+    r"\b(?:structured_content|raw_payload|evidence_json|payload|secret|api_key|token)\b",
+    re.IGNORECASE,
+)
+_RAW_OBJECT_RE = re.compile(
+    r"[\"']?(?:structured_content|raw_payload|evidence_json|payload|tool_name|arguments|response)[\"']?\s*:",
+    re.IGNORECASE,
+)
+_SAFE_ERROR_CODES = {
+    "MODEL_TIMEOUT",
+    "MODEL_NETWORK_ERROR",
+    "MODEL_UPSTREAM_ERROR",
+    "MODEL_UPSTREAM_UNAVAILABLE",
+    "MODEL_RATE_LIMITED",
+    "MODEL_QUOTA_EXCEEDED",
+    "MODEL_AUTHENTICATION_FAILED",
+    "MODEL_CONTENT_BLOCKED",
+    "MODEL_CANCELLED",
+    "FOLLOWUP_SCHEMA_INVALID",
+    "FOLLOWUP_GENERATION_FAILED",
+}
 
 
 def contains_internal_reference(value: str) -> bool:
-    return bool(_INTERNAL_REFERENCE_RE.search(value))
+    return bool(_INTERNAL_REFERENCE_RE.search(value) or _JWT_RE.search(value))
+
+
+def _sanitize_text(value: Any, *, max_length: int) -> str:
+    text_value = str(value or "")[:max_length]
+    if _RAW_OBJECT_RE.search(text_value):
+        return "已省略不可信原始内容"
+    text_value = _RAW_FIELD_RE.sub("已省略字段", text_value)
+    text_value = _INTERNAL_REFERENCE_RE.sub("已脱敏内容", text_value)
+    text_value = _JWT_RE.sub("已脱敏内容", text_value)
+    return text_value
+
+
+def _sanitize_scalar(value: Any, *, max_length: int = 500) -> Any:
+    if value is None or isinstance(value, (int, float, bool)):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_scalar(item, max_length=max_length) for item in value[:20]]
+    if isinstance(value, Mapping):
+        return {
+            str(key)[:64]: _sanitize_scalar(item, max_length=max_length)
+            for key, item in list(value.items())[:20]
+            if str(key).lower() not in {"raw_payload", "structured_content", "evidence_json", "payload"}
+        }
+    return _sanitize_text(value, max_length=max_length)
 
 
 def _require_chinese(value: str) -> str:
@@ -59,7 +105,7 @@ class FollowupSuggestion(BaseModel):
 class FollowupSuggestions(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    suggestions: tuple[FollowupSuggestion, ...] = Field(min_length=5, max_length=5)
+    suggestions: tuple[FollowupSuggestion, ...] = Field(min_length=0, max_length=5)
 
     @model_validator(mode="after")
     def unique_suggestions(self) -> "FollowupSuggestions":
@@ -85,16 +131,16 @@ def build_followup_request(
     conclusion: str,
 ) -> StructuredModelRequest[FollowupSuggestions]:
     safe_input = {
-        "用户问题": user_query[:5_000],
+        "用户问题": _sanitize_text(user_query, max_length=5_000),
         "会话筛选条件": {
-            key: session_filters.get(key)
+            key: _sanitize_scalar(session_filters.get(key))
             for key in ("brand", "campaign_name", "category", "target_audience", "platforms", "budget_min", "budget_max")
             if session_filters.get(key) is not None
         },
         "渠道响应概况": dict(tool_summary),
         "候选数量": max(0, min(int(candidate_count), 10_000)),
         "BI指标摘要": dict(bi_summary),
-        "本轮结论": conclusion[:2_000],
+        "本轮结论": _sanitize_text(conclusion, max_length=2_000),
     }
     return StructuredModelRequest(
         purpose="followup",
@@ -117,10 +163,13 @@ def safe_followup_error(error: BaseException, *, stage: str) -> dict[str, Any]:
             fields.append({
                 "field": ".".join(str(part)[:64] for part in loc[:8]),
                 "type": str(item.get("type", "validation_error"))[:64],
+                "length": len(str(item.get("msg", ""))),
+                "schema_path": list(loc[:8]),
             })
         code = "FOLLOWUP_SCHEMA_INVALID"
     else:
-        code = str(getattr(error, "code", "FOLLOWUP_GENERATION_FAILED"))[:64]
+        candidate = str(getattr(error, "code", "FOLLOWUP_GENERATION_FAILED"))[:64]
+        code = candidate if candidate in _SAFE_ERROR_CODES else "FOLLOWUP_GENERATION_FAILED"
         fields = []
     return {
         "error_code": code,
@@ -238,14 +287,19 @@ class FollowupSuggestionService:
                 return False
             metadata = dict(message.metadata_json or {})
             status = metadata.get("followup_suggestions_status")
-            if status in {"pending", "completed", "failed"}:
-                return status == "pending"
+            if status == "completed":
+                return False
+            if status == "pending":
+                return True
+            if status == "failed" and int(metadata.get("followup_attempts", 0)) >= 3:
+                return False
             message.metadata_json = {
                 **metadata,
                 "task_id": task.id,
                 "followup_suggestions_status": "pending",
                 "followup_suggestions": [],
                 "followup_suggestions_started_at": _now().isoformat(),
+                "followup_error": None,
             }
             await TaskRepository(db).append_event(
                 task.id,
@@ -348,6 +402,7 @@ class FollowupSuggestionService:
                 "followup_suggestions_status": "completed",
                 "followup_suggestions": suggestions[:5],
                 "followup_suggestions_generated_at": _now().isoformat(),
+                "followup_error": None,
             }
             await TaskRepository(db).append_event(
                 task.id,
@@ -369,6 +424,7 @@ class FollowupSuggestionService:
                 "followup_suggestions_status": "failed",
                 "followup_suggestions": [],
                 "followup_error": error,
+                "followup_attempts": int(message.metadata_json.get("followup_attempts", 0)) + 1,
             }
             await TaskRepository(db).append_event(
                 task.id,
