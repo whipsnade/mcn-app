@@ -2,12 +2,16 @@ from __future__ import annotations
 
 from typing import Annotated, Literal
 
+from urllib.parse import quote
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_db
 from app.identity.dependencies import CurrentUser
+from app.reporting.exporter import CONTENT_TYPE, export_latest_task_xlsx
 from app.reporting.models import BiReport, Kol, KolSnapshot, TaskCandidate, UserKolFavorite
 from app.reporting.schemas import (
     BiReportRead,
@@ -18,6 +22,7 @@ from app.reporting.schemas import (
     FavoriteRead,
 )
 from app.reporting.service import ReportingService
+from app.tasks.state import TERMINAL_TASK_STATUSES, TaskStatus
 
 
 router = APIRouter()
@@ -98,6 +103,38 @@ def favorite_read(favorite: UserKolFavorite, kol: Kol, nickname: str | None = No
 
 def not_found(detail: str) -> HTTPException:
     return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=detail)
+
+
+def content_disposition(filename: str) -> str:
+    return f"attachment; filename*=UTF-8''{quote(filename)}"
+
+
+@router.get("/sessions/{session_id}/exports/latest.xlsx")
+async def export_latest_session(
+    session_id: str,
+    user: CurrentUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> StreamingResponse:
+    service = ReportingService(db)
+    task, pool, rows = await service.latest_candidate_pool(user.id, session_id)
+    if task is None:
+        raise not_found("session_not_found")
+    if task.status not in {item.value for item in TERMINAL_TASK_STATUSES}:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="latest_task_in_progress")
+    if task.status not in {
+        TaskStatus.COMPLETED.value,
+        TaskStatus.COMPLETED_WITH_WARNINGS.value,
+    } or pool is None or not rows:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="no_candidate_pool")
+    exported = await export_latest_task_xlsx(db, user.id, session_id)
+    return StreamingResponse(
+        iter((exported.content,)),
+        media_type=CONTENT_TYPE,
+        headers={
+            "Content-Disposition": content_disposition(exported.filename),
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 @router.get("/tasks/{task_id}/candidates", response_model=CandidatePage)
