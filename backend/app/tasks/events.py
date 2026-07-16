@@ -79,12 +79,17 @@ class TaskEventStream:
                 rows = await self.repository_factory(db).list_owned_events_after(
                     task_id, user_id, seen
                 )
-            for row in rows:
+            for index, row in enumerate(rows):
                 if row.id > seen:
                     seen = row.id
                     yield row
                     if row.event_type in terminal_events:
-                        if not await self._wait_for_followup(task_id):
+                        if any(
+                            later.event_type in followup_terminal_events
+                            for later in rows[index + 1 :]
+                        ):
+                            continue
+                        if not await self._wait_for_followup(task_id, seen):
                             return
                     elif row.event_type in followup_terminal_events:
                         return
@@ -95,7 +100,7 @@ class TaskEventStream:
                         seen = row.id
                         yield row
                         if row.event_type in terminal_events:
-                            if not await self._wait_for_followup(task_id):
+                            if not await self._wait_for_followup(task_id, seen):
                                 return
                         elif row.event_type in followup_terminal_events:
                             return
@@ -107,12 +112,17 @@ class TaskEventStream:
                         rows = await self.repository_factory(db).list_owned_events_after(
                             task_id, user_id, seen
                         )
-                    for row in rows:
+                    for index, row in enumerate(rows):
                         if row.id > seen:
                             seen = row.id
                             yield row
                             if row.event_type in terminal_events:
-                                if not await self._wait_for_followup(task_id):
+                                if any(
+                                    later.event_type in followup_terminal_events
+                                    for later in rows[index + 1 :]
+                                ):
+                                    continue
+                                if not await self._wait_for_followup(task_id, seen):
                                     return
                             elif row.event_type in followup_terminal_events:
                                 return
@@ -129,13 +139,23 @@ class TaskEventStream:
                     return message.metadata_json.get("followup_suggestions_status")
         return None
 
-    async def _wait_for_followup(self, task_id: str) -> bool:
+    async def _wait_for_followup(self, task_id: str, seen: int) -> bool:
         """Return whether stream should stay open after terminal task event."""
         for _ in range(20):
             state = await self._followup_state(task_id)
             if state == "pending":
                 return True
             if state in {"completed", "failed"}:
-                return False
+                async with self.session_factory() as db:
+                    event = await db.scalar(
+                        select(TaskEvent).where(
+                            TaskEvent.task_id == task_id,
+                            TaskEvent.event_type.in_(
+                                ("followup.suggestions_updated", "followup.suggestions_failed")
+                            ),
+                        ).limit(1)
+                    )
+                if event is not None:
+                    return event.id > seen
             await asyncio.sleep(0.05)
         return False
