@@ -108,4 +108,23 @@ describe('authorizedFetch', () => {
     const headers = new Headers(fetchMock.mock.calls[0]?.[1]?.headers);
     expect(headers.get('Idempotency-Key')).toBe('test-idempotency-key');
   });
+
+  it('reuses the same idempotency key when the protected create request refreshes auth', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(null, { status: 401 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ access_token: 'fresh-token' }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        id: 'task-1', session_id: 'session-1', status: 'pending', estimated_points: 0,
+        error_code: null, error_message: null, latest_report_id: null,
+      }), { status: 202 }));
+    vi.stubGlobal('fetch', fetchMock);
+    setAccessToken('expired-token');
+
+    await createTask('session-1', { content: '找达人' }, 'same-key');
+
+    const firstHeaders = new Headers(fetchMock.mock.calls[0]?.[1]?.headers);
+    const retriedHeaders = new Headers(fetchMock.mock.calls[2]?.[1]?.headers);
+    expect(firstHeaders.get('Idempotency-Key')).toBe('same-key');
+    expect(retriedHeaders.get('Idempotency-Key')).toBe('same-key');
+  });
 });

@@ -40,3 +40,15 @@ def test_sessions_register_soft_delete_column_and_visibility_index() -> None:
     assert ("user_id", "deleted_at", "last_accessed_at") in {
         tuple(column.name for column in index.columns) for index in sessions.indexes
     }
+
+
+def test_analysis_tasks_register_persistent_creation_idempotency_index() -> None:
+    tasks = Base.metadata.tables["analysis_tasks"]
+    assert tasks.c.idempotency_key_hash.type.length == 64
+    assert tasks.c.idempotency_payload_hash.type.length == 64
+    assert any(
+        index.unique
+        and tuple(column.name for column in index.columns)
+        == ("user_id", "session_id", "idempotency_key_hash")
+        for index in tasks.indexes
+    )

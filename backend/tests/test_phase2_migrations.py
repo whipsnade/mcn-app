@@ -7,11 +7,21 @@ import sys
 from uuid import uuid4
 
 import pytest
+from alembic.config import Config
+from alembic.script import ScriptDirectory
 from sqlalchemy import Integer, func, inspect, select
 
 from app.db.base import Base
 import app.db.models  # noqa: F401
 from app.db.session import engine
+
+
+def test_migration_chain_has_single_task_idempotency_head() -> None:
+    backend_dir = Path(__file__).resolve().parents[1]
+    config = Config(str(backend_dir / "alembic.ini"))
+    config.set_main_option("script_location", str(backend_dir / "migrations"))
+    heads = ScriptDirectory.from_config(config).get_heads()
+    assert heads == ["0013_task_create_idempotency"]
 
 
 async def test_phase_two_unique_constraints() -> None:

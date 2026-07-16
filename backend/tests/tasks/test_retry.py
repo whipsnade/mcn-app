@@ -126,3 +126,31 @@ async def test_create_task_reuses_idempotent_task_without_resubmitting(monkeypat
 
     assert result.id == "task-existing"
     runner.submit.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_create_task_returns_409_for_same_key_with_different_payload(monkeypatch) -> None:
+    class StubTaskService:
+        def __init__(self, db):
+            self.db = db
+
+        async def create_idempotent(self, user_id, session_id, payload, idempotency_key):
+            raise TaskConflictError("idempotency_payload_mismatch")
+
+    monkeypatch.setattr(tasks_router, "TaskService", StubTaskService)
+    db = AsyncMock()
+    runner = SimpleNamespace(submit=AsyncMock())
+
+    with pytest.raises(tasks_router.HTTPException) as error:
+        await tasks_router.create_task(
+            "session-1",
+            tasks_router.TaskCreate(content="另一条问题"),
+            SimpleNamespace(id="user-1"),
+            db,
+            runner,
+            "same-key",
+        )
+
+    assert error.value.status_code == 409
+    assert error.value.detail == "幂等键对应的请求参数不一致"
+    runner.submit.assert_not_called()
