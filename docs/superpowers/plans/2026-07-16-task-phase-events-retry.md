@@ -38,7 +38,7 @@
 - Test: `backend/tests/tasks/test_executor.py`
 - Test: `backend/tests/mcp_gateway/test_billing_lifecycle.py`
 
-- [ ] **Step 1: 写失败测试**：覆盖 plan/replan/tool/candidate/BI/summary 事件顺序、success/failed/unknown、多平台实际 `step_total`、错误 assistant 消息幂等。
+- [ ] **Step 1: 写失败测试**：覆盖 plan/replan/tool/candidate/BI/summary 事件顺序、success/failed/unknown、多平台实际 `step_total`、错误 assistant 消息幂等；模拟两个并发终态/恢复调用，断言只生成同一个错误 assistant `message_id` 并验证 `0010_message_error_idempotency` 唯一索引。
 - [ ] **Step 2: 运行测试确认失败**。
 - [ ] **Step 3: 实现事件写入**：所有状态事件统一先由 `TaskRepository.append_event` 落库；`TaskEventStream` 以数据库轮询作为权威可靠路径（broker 仅作低延迟通知），在事务提交后按 task/user、单调 ID 顺序向 SSE 推送，支持 `Last-Event-ID` 重放且不会重复发布。ReportingService 的 `candidates.updated`/`bi.updated` 和总结流 `message.*` 也走同一条事件路径。
 - [ ] **Step 4: 实现 MCP 账务事实到 canonical 事件映射**，移除 `accounting.py` 向对外 `task_events` 写入 `mcp_call_*` 内部事件；不暴露内部 ID、工具名或原始诊断。所有模型、账务、unknown、余额不足、取消等失败路径统一经过错误码白名单映射，只把安全 code/中文文案写入 TaskRead、终态事件和 assistant 消息。
@@ -64,7 +64,7 @@
 
 - [ ] **Step 1: 写失败测试**：覆盖 `completed`、`completed_with_warnings`、`failed`、`insufficient_balance`、`cancelled` 可重跑，`pending`、`planning`、`running`、`interrupted` 冲突；归属校验、并发 retry 返回同一任务、`analysis_task_ids` 追加且保留 `scoring_profile`。
 - [ ] **Step 2: 运行测试确认失败**。
-- [ ] **Step 3: 增加 retry 幂等键/唯一约束和事务逻辑**，新增 `POST /api/v1/tasks/{task_id}/retry`。
+- [ ] **Step 3: 增加 retry 幂等键/唯一约束和事务逻辑**，新增 `POST /api/v1/tasks/{task_id}/retry`；实现和测试直接使用共享的 `TERMINAL_TASK_STATUSES` 判定允许重跑，其他状态统一冲突。
 - [ ] **Step 4: 运行 retry 与 migration 测试确认通过**。
 - [ ] **Step 5: 提交**：`git commit -m "feat: add idempotent task retry endpoint"`。
 
