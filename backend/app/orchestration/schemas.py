@@ -58,11 +58,11 @@ class SessionBrief(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     session_id: str = Field(min_length=1)
-    brand: str = Field(min_length=1, max_length=100)
+    brand: str = Field(default="", max_length=100)
     campaign_name: str | None = Field(default=None, min_length=1, max_length=120)
-    platforms: tuple[str, ...] = Field(min_length=1, max_length=5)
+    platforms: tuple[str, ...] = Field(default_factory=tuple, max_length=5)
     category: str = Field(min_length=1, max_length=100)
-    target_audience: str = Field(min_length=1, max_length=500)
+    target_audience: str = Field(default="", max_length=500)
     budget_min: Decimal | None
     budget_max: Decimal | None
     filters: dict[str, Any] = Field(default_factory=dict)
