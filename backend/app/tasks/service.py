@@ -1,4 +1,6 @@
 from datetime import UTC, datetime
+import hashlib
+import json
 from uuid import uuid4
 
 from sqlalchemy import func, select
@@ -22,6 +24,23 @@ class TaskConflictError(RuntimeError):
     pass
 
 
+def idempotency_key_digest(key: str) -> str:
+    """Hash a normalized key so the raw client token is never persisted/logged."""
+    normalized = key.strip()
+    if not normalized or len(normalized) > 128:
+        raise ValueError("invalid_idempotency_key")
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def idempotency_payload_digest(content: str, scoring_profile: str) -> str:
+    normalized = {
+        "content": content.strip(),
+        "scoring_profile": scoring_profile,
+    }
+    encoded = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 def can_retry_status(status: str | TaskStatus) -> bool:
     try:
         return TaskStatus(status) in TERMINAL_TASK_STATUSES
@@ -43,6 +62,8 @@ class TaskService:
         trigger_message_id: str | None = None,
         retry_of_task_id: str | None = None,
         retry_key: str | None = None,
+        idempotency_key_hash: str | None = None,
+        idempotency_payload_hash: str | None = None,
     ) -> AnalysisTask:
         workspace_service = WorkspaceService(self.db)
         await workspace_service.get_owned_session(user_id, session_id, for_update=True)
@@ -86,6 +107,8 @@ class TaskService:
             trigger_message_id=message.id,
             retry_of_task_id=retry_of_task_id,
             retry_key=retry_key,
+            idempotency_key_hash=idempotency_key_hash,
+            idempotency_payload_hash=idempotency_payload_hash,
             status=TaskStatus.PENDING,
             plan_json=None,
             plan_version=None,
@@ -116,6 +139,55 @@ class TaskService:
             {"status": TaskStatus.PENDING, "phase": "accepting_data", "label": "接受数据"},
         )
         return task
+
+    async def create_idempotent(
+        self,
+        user_id: str,
+        session_id: str,
+        payload: TaskCreate,
+        idempotency_key: str,
+    ) -> tuple[AnalysisTask, bool]:
+        """Create once per user/session/key, atomically across processes."""
+        key_hash = idempotency_key_digest(idempotency_key)
+        payload_hash = idempotency_payload_digest(payload.content, payload.scoring_profile)
+        workspace_service = WorkspaceService(self.db)
+        await workspace_service.get_owned_session(user_id, session_id, for_update=True)
+        existing = await self.db.scalar(
+            select(AnalysisTask).where(
+                AnalysisTask.user_id == user_id,
+                AnalysisTask.session_id == session_id,
+                AnalysisTask.idempotency_key_hash == key_hash,
+            )
+        )
+        if existing is not None:
+            if existing.idempotency_payload_hash != payload_hash:
+                raise TaskConflictError("idempotency_payload_mismatch")
+            return existing, True
+        try:
+            async with self.db.begin_nested():
+                task = await self.create(
+                    user_id,
+                    session_id,
+                    payload,
+                    idempotency_key_hash=key_hash,
+                    idempotency_payload_hash=payload_hash,
+                )
+        except IntegrityError:
+            # Another process won the unique index race. The savepoint keeps
+            # its message/task changes intact and lets us read the winner.
+            existing = await self.db.scalar(
+                select(AnalysisTask).where(
+                    AnalysisTask.user_id == user_id,
+                    AnalysisTask.session_id == session_id,
+                    AnalysisTask.idempotency_key_hash == key_hash,
+                )
+            )
+            if existing is None:
+                raise
+            if existing.idempotency_payload_hash != payload_hash:
+                raise TaskConflictError("idempotency_payload_mismatch")
+            return existing, True
+        return task, False
 
     async def retry(self, user_id: str, task_id: str) -> AnalysisTask:
         source = await self.repository.get_owned(task_id, user_id)

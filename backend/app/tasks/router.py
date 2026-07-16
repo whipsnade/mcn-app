@@ -130,15 +130,30 @@ async def create_task(
     user: FunctionScopedCurrentUser,
     db: Annotated[AsyncSession, Depends(get_db, scope="function")],
     task_runner: Annotated[TaskRunner, Depends(get_task_runner)],
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> TaskRead:
     try:
-        task = await TaskService(db).create(user.id, session_id, payload)
+        if idempotency_key is None:
+            task = await TaskService(db).create(user.id, session_id, payload)
+            reused = False
+        else:
+            task, reused = await TaskService(db).create_idempotent(
+                user.id, session_id, payload, idempotency_key
+            )
     except TaskConflictError as error:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="task_in_progress") from error
+        detail = (
+            "幂等键对应的请求参数不一致"
+            if str(error) == "idempotency_payload_mismatch"
+            else str(error)
+        )
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail) from error
+    except ValueError as error:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="invalid_idempotency_key") from error
     except LookupError as error:
         raise task_not_found(error) from error
     await db.commit()
-    task_runner.submit(task.id)
+    if not reused:
+        task_runner.submit(task.id)
     return task_read(task)
 
 

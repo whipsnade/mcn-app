@@ -4,7 +4,13 @@ from unittest.mock import AsyncMock
 import pytest
 
 from app.tasks import router as tasks_router
-from app.tasks.service import can_retry_status
+from app.tasks.service import (
+    can_retry_status,
+    idempotency_key_digest,
+    idempotency_payload_digest,
+    TaskService,
+    TaskConflictError,
+)
 from app.tasks.state import TERMINAL_TASK_STATUSES, TaskStatus
 
 
@@ -48,3 +54,75 @@ async def test_followup_retry_commits_snapshot_before_refreshing_pending_metadat
     db.commit.assert_awaited_once()
     db.refresh.assert_awaited_once_with(task)
     assert result.followup_suggestions_status == "pending"
+
+
+def test_idempotency_digest_is_stable_and_does_not_expose_raw_key_or_payload() -> None:
+    key = "  browser-retry-42  "
+    assert idempotency_key_digest(key) == idempotency_key_digest(key.strip())
+    assert len(idempotency_key_digest(key)) == 64
+    digest = idempotency_payload_digest("  找达人  ", "balanced")
+    assert digest == idempotency_payload_digest("找达人", "balanced")
+    assert len(digest) == 64
+    assert key.strip() not in digest
+
+
+@pytest.mark.asyncio
+async def test_create_idempotent_reuses_same_payload_and_rejects_mismatch(monkeypatch) -> None:
+    existing = SimpleNamespace(
+        id="task-existing",
+        idempotency_payload_hash=idempotency_payload_digest("找达人", "balanced"),
+    )
+    monkeypatch.setattr(
+        "app.tasks.service.WorkspaceService.get_owned_session",
+        AsyncMock(return_value=SimpleNamespace(id="session-1")),
+    )
+    db = AsyncMock()
+    db.scalar = AsyncMock(return_value=existing)
+    service = TaskService(db)
+
+    task, reused = await service.create_idempotent(
+        "user-1", "session-1", tasks_router.TaskCreate(content="  找达人 "), "same-key",
+    )
+    assert (task.id, reused) == ("task-existing", True)
+
+    with pytest.raises(TaskConflictError, match="idempotency_payload_mismatch"):
+        await service.create_idempotent(
+            "user-1", "session-1", tasks_router.TaskCreate(content="换一个问题"), "same-key",
+        )
+
+
+@pytest.mark.asyncio
+async def test_create_task_reuses_idempotent_task_without_resubmitting(monkeypatch) -> None:
+    task = SimpleNamespace(
+        id="task-existing",
+        session_id="session-1",
+        trigger_message_id="message-existing",
+        status="pending",
+        estimated_points=0,
+        error_code=None,
+        error_message=None,
+    )
+
+    class StubTaskService:
+        def __init__(self, db):
+            self.db = db
+
+        async def create_idempotent(self, user_id, session_id, payload, idempotency_key):
+            assert (user_id, session_id, idempotency_key) == ("user-1", "session-1", "browser-key")
+            return task, True
+
+    monkeypatch.setattr(tasks_router, "TaskService", StubTaskService)
+    db = AsyncMock()
+    runner = SimpleNamespace(submit=AsyncMock())
+
+    result = await tasks_router.create_task(
+        "session-1",
+        tasks_router.TaskCreate(content="找达人"),
+        SimpleNamespace(id="user-1"),
+        db,
+        runner,
+        "browser-key",
+    )
+
+    assert result.id == "task-existing"
+    runner.submit.assert_not_called()

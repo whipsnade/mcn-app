@@ -18,6 +18,13 @@ class AnalysisTask(Base):
         ),
         Index("ix_analysis_tasks_session_creation_order", "session_id", "creation_order"),
         Index("ix_analysis_tasks_status_lease", "status", "lease_expires_at"),
+        Index(
+            "uq_analysis_tasks_user_session_idempotency",
+            "user_id",
+            "session_id",
+            "idempotency_key_hash",
+            unique=True,
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
@@ -32,6 +39,8 @@ class AnalysisTask(Base):
     )
     retry_of_task_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     retry_key: Mapped[str | None] = mapped_column(String(128), unique=True, nullable=True)
+    idempotency_key_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    idempotency_payload_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     plan_json: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     plan_version: Mapped[str | None] = mapped_column(String(32))
