@@ -32,6 +32,20 @@ test('restored matching candidate and report versions render the KOL decision BI
     overview: { candidate_count: 1, top_score: 91 }, score_composition: [{ dimension: 'audience', average: 82 }],
     audience_content_fit: { audience: 82 }, platform_distribution: [{ platform: 'bilibili', count: 1 }],
     budget_analysis: { average_budget_score: 80 }, comparison: [{ platform_account_id: '报告达人', total_score: 91 }], risks: [],
+    analytics: {
+      overview: {
+        brand_volume: { value: 15745, unit: '条', available: true, coverage: 1, source_fields: ['brand_mentions'], platforms: ['bilibili'] },
+        total_exposure: { value: 12500000, unit: '次', available: true, coverage: 1, source_fields: ['exposure'], platforms: ['bilibili'] },
+        average_engagement_rate: { value: 6.2, unit: '%', available: true, coverage: 1, source_fields: ['interactions', 'exposure'], platforms: ['bilibili'] },
+      },
+      sentiment: { available: true, coverage: 1, source_fields: ['sentiment_counts'], platforms: ['bilibili'], items: [{ key: 'positive', label: '正向', value: 78, percentage: 78 }, { key: 'neutral', label: '中立', value: 15, percentage: 15 }, { key: 'negative', label: '负向', value: 7, percentage: 7 }], hot_words: [{ term: '感感高级', count: 10 }] },
+      exposure_trend: [{ date: '2026-06-20', value: 100000, unit: '次', platforms: ['bilibili'] }, { date: '2026-06-22', value: 4200000, unit: '次', platforms: ['bilibili'] }, { date: '2026-06-26', value: 700000, unit: '次', platforms: ['bilibili'] }],
+      audience: {
+        age: { value: null, unit: '%', available: true, coverage: 1, source_fields: ['audience_age'], platforms: ['bilibili'], items: [{ label: '18-24', value: 52, unit: '%' }, { label: '25-30', value: 34, unit: '%' }] },
+        gender: { value: null, unit: '%', available: true, coverage: 1, source_fields: ['audience_gender'], platforms: ['bilibili'], items: [{ label: '女性', value: 85, unit: '%' }, { label: '男性', value: 15, unit: '%' }] },
+        regions: { value: null, unit: '%', available: true, coverage: 1, source_fields: ['audience_regions'], platforms: ['bilibili'], items: [{ label: '广东', value: 22, unit: '%' }, { label: '上海', value: 19, unit: '%' }, { label: '北京', value: 16, unit: '%' }, { label: '浙江', value: 14, unit: '%' }, { label: '江苏', value: 11, unit: '%' }] },
+      },
+    },
     conclusion: '优先联系报告达人。', sources: [{ tool_name_cn: 'B站数据采集', collected_at: '2026-07-15T10:00:00Z', evidence_id: 'evidence-bi' }], generated_at: '2026-07-15T10:00:00Z',
   } }));
 
@@ -46,4 +60,9 @@ test('restored matching candidate and report versions render the KOL decision BI
   const comparison = page.locator('section').filter({ has: page.getByRole('heading', { name: '候选对比' }) });
   await expect(comparison.getByText(/报告达人/)).toBeVisible();
   await expect(page.getByText('B站数据采集', { exact: true })).toBeVisible();
+
+  await page.getByRole('tab', { name: '数据分析' }).click();
+  await expect(page.getByText('舆情情感极性分析', { exact: true })).toBeVisible();
+  await expect(page.getByText('全网品牌声量', { exact: true })).toBeVisible();
+  await page.screenshot({ path: 'output/playwright/bi-analytics.png', fullPage: true });
 });

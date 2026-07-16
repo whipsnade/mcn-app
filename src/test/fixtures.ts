@@ -1,4 +1,4 @@
-import type { ApiBiReport, ApiCandidatePage } from '../api/contracts';
+import type { ApiBiReport, ApiCandidatePage, BiAnalyticsData } from '../api/contracts';
 
 export const candidatePage: ApiCandidatePage = {
   task_id: 'task-1',
@@ -24,11 +24,26 @@ export const candidatePage: ApiCandidatePage = {
 
 export const candidate = candidatePage.items[0];
 
+export const emptyAnalytics: BiAnalyticsData = {
+  overview: {
+    brand_volume: { value: null, unit: '条', available: false, coverage: 0, source_fields: [], platforms: [] },
+    total_exposure: { value: null, unit: '次', available: false, coverage: 0, source_fields: [], platforms: [] },
+    average_engagement_rate: { value: null, unit: '%', available: false, coverage: 0, source_fields: [], platforms: [] },
+  },
+  sentiment: { available: false, coverage: 0, source_fields: [], platforms: [], items: [], hot_words: [] },
+  exposure_trend: [],
+  audience: {
+    age: { value: null, unit: '%', available: false, coverage: 0, source_fields: [], platforms: [], items: [] },
+    gender: { value: null, unit: '%', available: false, coverage: 0, source_fields: [], platforms: [], items: [] },
+    regions: { value: null, unit: '%', available: false, coverage: 0, source_fields: [], platforms: [], items: [] },
+  },
+};
+
 export function reportFixture(overrides: Partial<ApiBiReport> = {}): ApiBiReport {
   return {
     id: 'report-2', task_id: 'task-1', report_version: 1, candidate_version: 2,
     overview: { total_candidates: 2 }, score_composition: [], audience_content_fit: {},
-    platform_distribution: [], budget_analysis: {}, comparison: [], risks: [], analytics: {},
+    platform_distribution: [], budget_analysis: {}, comparison: [], risks: [], analytics: emptyAnalytics,
     conclusion: '优先联系达人甲。', sources: [], generated_at: '2026-07-15T10:00:00Z',
     ...overrides,
   };

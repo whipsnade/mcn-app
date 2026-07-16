@@ -31,6 +31,18 @@ describe('BiReport', () => {
     expect(screen.queryByText('0%')).not.toBeInTheDocument();
   });
 
+  it('switches the right BI panel to the latest-round data analysis tab', () => {
+    render(<BiReport report={reportFixture({ candidate_version: 2 })} candidateVersion={2} taskStatus="completed" />);
+
+    const analyticsTab = screen.getByRole('tab', { name: '数据分析' });
+    expect(analyticsTab).toHaveAttribute('aria-selected', 'false');
+    fireEvent.click(analyticsTab);
+    expect(analyticsTab).toHaveAttribute('aria-selected', 'true');
+    expect(screen.getByRole('region', { name: '数据分析' })).toBeVisible();
+    expect(screen.getByText('舆情情感极性分析')).toBeVisible();
+    expect(screen.queryByText('任务概览')).not.toBeInTheDocument();
+  });
+
   it('uses the report average score, platform count, and same-version candidates', () => {
     const report = reportFixture({
       score_composition: [{ dimension: 'audience', average: 82 }],

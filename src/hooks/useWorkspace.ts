@@ -348,6 +348,8 @@ export function useWorkspace(userId?: string) {
         status: 'analyzing',
         messages: [...session.messages, pendingMessage],
         analysis: { taskId: task.id, status: task.status },
+        candidates: undefined,
+        biReport: undefined,
       } : session));
       if (activeSessionIdRef.current === requestedSessionId) {
         setActiveTaskId(task.id);
@@ -435,12 +437,12 @@ export function useWorkspace(userId?: string) {
             : session.analysis.reportId
         ),
       },
-      biReport: currentTaskRuntime.candidateVersion !== undefined
-        && session.biReport?.candidate_version !== currentTaskRuntime.candidateVersion
+      biReport: currentTaskRuntime.candidateVersion === undefined
+        || session.biReport?.candidate_version !== currentTaskRuntime.candidateVersion
         ? undefined
         : session.biReport,
-      candidates: currentTaskRuntime.candidateVersion !== undefined
-        && session.analysis.candidateVersion !== currentTaskRuntime.candidateVersion
+      candidates: currentTaskRuntime.candidateVersion === undefined
+        || session.analysis.candidateVersion !== currentTaskRuntime.candidateVersion
         ? undefined
         : session.candidates,
     } : session));

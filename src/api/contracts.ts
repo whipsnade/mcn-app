@@ -117,6 +117,69 @@ export interface ApiCandidatePage {
   items: ApiCandidate[];
 }
 
+export interface BiMetric {
+  value: number | null;
+  unit: string;
+  available: boolean;
+  coverage: number;
+  source_fields: string[];
+  platforms: string[];
+}
+
+export interface BiDistributionItem {
+  label: string;
+  value: number;
+  unit: string;
+}
+
+export interface BiDistribution {
+  value: number | null;
+  unit: string;
+  available: boolean;
+  coverage: number;
+  source_fields: string[];
+  platforms: string[];
+  items: BiDistributionItem[];
+}
+
+export interface BiSentimentItem {
+  key: string;
+  label: string;
+  value: number;
+  percentage: number;
+}
+
+export interface BiSentiment {
+  available: boolean;
+  coverage: number;
+  source_fields: string[];
+  platforms: string[];
+  items: BiSentimentItem[];
+  hot_words: Array<{ term: string; count: number }>;
+}
+
+export interface BiExposureTrendItem {
+  date: string;
+  value: number;
+  unit: string;
+  platforms: string[];
+}
+
+export interface BiAnalyticsData {
+  overview: {
+    brand_volume: BiMetric;
+    total_exposure: BiMetric;
+    average_engagement_rate: BiMetric;
+  };
+  sentiment: BiSentiment;
+  exposure_trend: BiExposureTrendItem[];
+  audience: {
+    age: BiDistribution;
+    gender: BiDistribution;
+    regions: BiDistribution;
+  };
+}
+
 export interface ApiBiReport {
   id: string;
   task_id: string;
@@ -129,7 +192,7 @@ export interface ApiBiReport {
   budget_analysis: Record<string, unknown>;
   comparison: Array<Record<string, unknown>>;
   risks: Array<Record<string, unknown>>;
-  analytics?: Record<string, unknown>;
+  analytics?: BiAnalyticsData;
   conclusion: string;
   sources: Array<Record<string, unknown>>;
   generated_at: string;

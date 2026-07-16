@@ -3,11 +3,12 @@ import {
   Download, HelpCircle, PieChart as PieChartIcon, ShieldCheck, Sparkles, Users,
 } from 'lucide-react';
 import { Bar, BarChart, Cell, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
-import { useState, type ReactNode } from 'react';
+import { useEffect, useState, type ReactNode } from 'react';
 
 import type { ApiBiReport, ApiCandidate } from '../api/contracts';
 import { downloadLatestSessionExport } from '../api/tasks';
 import type { ApiTaskStatus } from '../api/contracts';
+import BiAnalytics from './BiAnalytics';
 
 interface BiReportProps {
   report?: ApiBiReport;
@@ -242,6 +243,11 @@ function PanelState({ children }: { children: ReactNode }) {
 export default function BiReport({ report, candidateVersion, selectedCandidates = [], selectedCandidateVersion, sessionId, taskStatus, hasCandidateData = false }: BiReportProps) {
   const [isExporting, setIsExporting] = useState(false);
   const [exportError, setExportError] = useState<string>();
+  const [activeTab, setActiveTab] = useState<'overview' | 'analytics'>('overview');
+
+  useEffect(() => {
+    setActiveTab('overview');
+  }, [sessionId]);
   const canExport = Boolean(sessionId && hasCandidateData && (taskStatus === 'completed' || taskStatus === 'completed_with_warnings'));
   const handleExport = async () => {
     if (!sessionId || !canExport || isExporting) return;
@@ -275,16 +281,46 @@ export default function BiReport({ report, candidateVersion, selectedCandidates 
           <button onClick={() => void handleExport()} disabled={!canExport || isExporting} className="no-print flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3 py-1.5 text-[10px] font-bold text-white shadow-sm transition hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50" title={canExport ? '导出 Excel KOL 匹配度分析报告' : '分析完成后可导出'}><Download className="h-3.5 w-3.5" />{isExporting ? '导出中…' : '导出 Excel'}</button>
         </div>
       </header>
-      <div className="flex-1 space-y-3 overflow-y-auto bg-slate-50/40 p-3 print-scrollable">
-        <OverviewCard overview={report.overview} />
-        <ScoreCard data={report.score_composition} />
-        <AudienceCard data={report.audience_content_fit} />
-        <PlatformCard data={report.platform_distribution} />
-        <BudgetCard data={report.budget_analysis} />
-        <ComparisonCard comparison={report.comparison} selectedCandidates={selectedCandidates} selectedCandidateVersion={selectedCandidateVersion} reportCandidateVersion={report.candidate_version} />
-        <RiskCard risks={report.risks} />
-        <Card title="AI 结论" icon={<Sparkles className="h-3.5 w-3.5" />}><p className="whitespace-pre-wrap text-[11px] leading-5 text-slate-600">{report.conclusion || '暂未生成 AI 结论'}</p></Card>
-        <SourceCard sources={report.sources} />
+      <div role="tablist" aria-label="BI 报告视图" className="flex h-10 shrink-0 border-b border-slate-200 bg-white px-3">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={activeTab === 'overview'}
+          onClick={() => setActiveTab('overview')}
+          className={activeTab === 'overview'
+            ? 'border-b-2 border-indigo-600 px-3 text-[11px] font-semibold text-indigo-600'
+            : 'px-3 text-[11px] font-medium text-slate-500 transition hover:text-slate-800'}
+        >
+          报告概览
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={activeTab === 'analytics'}
+          onClick={() => setActiveTab('analytics')}
+          className={activeTab === 'analytics'
+            ? 'border-b-2 border-indigo-600 px-3 text-[11px] font-semibold text-indigo-600'
+            : 'px-3 text-[11px] font-medium text-slate-500 transition hover:text-slate-800'}
+        >
+          数据分析
+        </button>
+      </div>
+      <div className="flex-1 overflow-y-auto bg-slate-50/40 p-3 print-scrollable">
+        {activeTab === 'analytics' ? (
+          <BiAnalytics analytics={report.analytics} taskStatus={taskStatus} />
+        ) : (
+          <div className="space-y-3">
+            <OverviewCard overview={report.overview} />
+            <ScoreCard data={report.score_composition} />
+            <AudienceCard data={report.audience_content_fit} />
+            <PlatformCard data={report.platform_distribution} />
+            <BudgetCard data={report.budget_analysis} />
+            <ComparisonCard comparison={report.comparison} selectedCandidates={selectedCandidates} selectedCandidateVersion={selectedCandidateVersion} reportCandidateVersion={report.candidate_version} />
+            <RiskCard risks={report.risks} />
+            <Card title="AI 结论" icon={<Sparkles className="h-3.5 w-3.5" />}><p className="whitespace-pre-wrap text-[11px] leading-5 text-slate-600">{report.conclusion || '暂未生成 AI 结论'}</p></Card>
+            <SourceCard sources={report.sources} />
+          </div>
+        )}
       </div>
     </aside>
   );
