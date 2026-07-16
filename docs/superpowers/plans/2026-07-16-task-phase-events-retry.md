@@ -20,7 +20,7 @@
 
 - [ ] **Step 1: 写失败测试**：覆盖 canonical 阶段名称、平台白名单、错误码到中文文案映射、错误文案长度和敏感文本剔除。
 - [ ] **Step 2: 运行测试确认失败**：`./.venv/bin/pytest tests/tasks/test_task_events.py -q`。
-- [ ] **Step 3: 实现最小契约**：新增 `phase.changed`（如需要）、安全平台转换和中心化错误 sanitizer；扩展 `TaskRead` 的 `error_message`。
+- [ ] **Step 3: 实现最小契约**：固定 `task.pending`、`plan.ready`、`replan.ready`、`tool.started`、`tool.succeeded`、`tool.failed`、`tool.unknown`、`candidates.updated`、`bi.updated` 和终态事件的安全 payload；实现安全平台转换和中心化错误 sanitizer；扩展 `TaskRead` 的 `error_message`。
 - [ ] **Step 4: 运行测试确认通过**。
 - [ ] **Step 5: 提交**：`git commit -m "feat: define safe task phase event contract"`。
 
@@ -31,6 +31,8 @@
 - Modify: `backend/app/tasks/repository.py`
 - Modify: `backend/app/tasks/dependencies.py`
 - Modify: `backend/app/tasks/events.py`
+- Modify: `backend/app/reporting/service.py`
+- Modify: `backend/app/tasks/dependencies.py`
 - Modify: `backend/app/mcp_gateway/service.py`
 - Modify: `backend/app/mcp_gateway/accounting.py`
 - Test: `backend/tests/tasks/test_executor.py`
@@ -38,10 +40,11 @@
 
 - [ ] **Step 1: 写失败测试**：覆盖 plan/replan/tool/candidate/BI/summary 事件顺序、success/failed/unknown、多平台实际 `step_total`、错误 assistant 消息幂等。
 - [ ] **Step 2: 运行测试确认失败**。
-- [ ] **Step 3: 实现事件写入**：执行器在真实批次边界写入安全 canonical 事件；repository 以短事务追加事件；`TaskEventStream` 增加 broker 通知与数据库轮询兜底，保证落库后实时 SSE 到达并支持 `Last-Event-ID` 重放。
-- [ ] **Step 4: 实现 MCP 账务事实到 canonical 事件映射**，移除 `accounting.py` 向对外 `task_events` 写入 `mcp_call_*` 内部事件；不暴露内部 ID、工具名或原始诊断。
-- [ ] **Step 5: 运行任务/MCP 测试确认通过**。
-- [ ] **Step 6: 提交**：`git commit -m "feat: emit real task phase events and safe errors"`。
+- [ ] **Step 3: 实现事件写入**：所有状态事件统一先由 `TaskRepository.append_event` 落库；`TaskEventStream` 以数据库轮询作为权威可靠路径（broker 仅作低延迟通知），在事务提交后按 task/user、单调 ID 顺序向 SSE 推送，支持 `Last-Event-ID` 重放且不会重复发布。ReportingService 的 `candidates.updated`/`bi.updated` 和总结流 `message.*` 也走同一条事件路径。
+- [ ] **Step 4: 实现 MCP 账务事实到 canonical 事件映射**，移除 `accounting.py` 向对外 `task_events` 写入 `mcp_call_*` 内部事件；不暴露内部 ID、工具名或原始诊断。所有模型、账务、unknown、余额不足、取消等失败路径统一经过错误码白名单映射，只把安全 code/中文文案写入 TaskRead、终态事件和 assistant 消息。
+- [ ] **Step 5: 为错误 assistant 消息增加 `error_idempotency_key` 唯一索引（`task_id:error_code`）并在并发/恢复时查重或捕获唯一冲突，确保终态事件复用同一 `message_id`；保留原消息 metadata 和 `scoring_profile`。
+- [ ] **Step 6: 运行任务/MCP 测试确认通过**。
+- [ ] **Step 7: 提交**：`git commit -m "feat: emit real task phase events and safe errors"`。
 
 ### Task 3: 实现重跑 API 与数据库幂等
 
@@ -53,11 +56,13 @@
 - Modify: `backend/app/workspace/service.py`
 - Modify: `backend/app/workspace/router.py`
 - Modify: `backend/app/workspace/schemas.py`
+- Modify: `backend/app/workspace/models.py`
 - Create: `backend/migrations/versions/0009_task_retry_idempotency.py`
+- Create: `backend/migrations/versions/0010_message_error_idempotency.py`
 - Test: `backend/tests/tasks/test_retry.py`
 - Test: `backend/tests/test_phase2_migrations.py`
 
-- [ ] **Step 1: 写失败测试**：覆盖终态允许列表、归属校验、运行中冲突、并发 retry 返回同一任务、`analysis_task_ids` 追加且保留 `scoring_profile`。
+- [ ] **Step 1: 写失败测试**：覆盖 `completed`、`completed_with_warnings`、`failed`、`insufficient_balance`、`cancelled` 可重跑，`pending`、`planning`、`running`、`interrupted` 冲突；归属校验、并发 retry 返回同一任务、`analysis_task_ids` 追加且保留 `scoring_profile`。
 - [ ] **Step 2: 运行测试确认失败**。
 - [ ] **Step 3: 增加 retry 幂等键/唯一约束和事务逻辑**，新增 `POST /api/v1/tasks/{task_id}/retry`。
 - [ ] **Step 4: 运行 retry 与 migration 测试确认通过**。
