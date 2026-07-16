@@ -14,7 +14,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.mcp_gateway.contracts import McpCallStatus
 from app.mcp_gateway.models import McpCall
-from app.reporting.models import BiReport, Kol, KolSnapshot, TaskCandidate, UserKolFavorite
+from app.orchestration.export_contract import EXPORT_FIELD_CONTRACT_VERSION
+from app.reporting.models import (
+    BiReport,
+    Kol,
+    KolSnapshot,
+    TaskCandidate,
+    TaskCandidatePool,
+    TaskCandidatePoolItem,
+    UserKolFavorite,
+)
 from app.reporting.normalizers import normalize_tool_evidence, redact_evidence_for_storage
 from app.reporting.schemas import AnalystConclusion, CandidateVersion, CandidateVersionItem, ToolEvidence
 from app.reporting.scoring import SCORE_VERSION, score_candidate
@@ -44,6 +53,12 @@ class ReportingService:
     def _select_top_candidates(
         draft: list[tuple[Kol, KolSnapshot, Any, Any]],
     ) -> list[tuple[Kol, KolSnapshot, Any, Any]]:
+        return ReportingService._rank_candidates(draft)[:_FINAL_CANDIDATE_LIMIT]
+
+    @staticmethod
+    def _rank_candidates(
+        draft: list[tuple[Kol, KolSnapshot, Any, Any]],
+    ) -> list[tuple[Kol, KolSnapshot, Any, Any]]:
         return sorted(
             draft,
             key=lambda item: (
@@ -52,7 +67,7 @@ class ReportingService:
                 -(item[3].dimensions["engagement"].raw_score or 0),
                 item[0].platform_account_id,
             ),
-        )[:_FINAL_CANDIDATE_LIMIT]
+        )
 
     async def build_candidate_version(
         self, task_id: str, profile: str, *, lease_owner: str | None = None
@@ -100,10 +115,43 @@ class ReportingService:
                 score = score_candidate(row.dimensions(), profile)
                 draft.append((kol, snapshot, row, score))
 
-            draft = self._select_top_candidates(draft)
+            ranked_draft = self._rank_candidates(draft)
+            selected_draft = ranked_draft[:_FINAL_CANDIDATE_LIMIT]
             created_at = _now()
-            for rank, (kol, snapshot, row, score) in enumerate(draft, start=1):
+            pool = TaskCandidatePool(
+                id=str(uuid4()),
+                task_id=task.id,
+                pool_version=candidate_version,
+                field_contract_version=EXPORT_FIELD_CONTRACT_VERSION,
+                candidate_count=len(ranked_draft),
+                evidence_digest=evidence_digest,
+                created_at=created_at,
+            )
+            self._db.add(pool)
+            await self._db.flush()
+            selected_ids = {id(snapshot) for _kol, snapshot, _row, _score in selected_draft}
+            for full_rank, (kol, snapshot, row, score) in enumerate(ranked_draft, start=1):
                 self._db.add(snapshot)
+                self._db.add(
+                    TaskCandidatePoolItem(
+                        id=str(uuid4()),
+                        pool_id=pool.id,
+                        kol_id=kol.id,
+                        snapshot_id=snapshot.id,
+                        full_rank=full_rank,
+                        is_shortlisted=id(snapshot) in selected_ids,
+                        total_score=Decimal(str(score.total)),
+                        score_breakdown_json=score.as_dict(),
+                        risk_flags_json=redact_evidence_for_storage(list(row.risk_flags)),
+                        evidence_json={
+                            "candidate_set_digest": evidence_digest,
+                            "source_call_ids": list(row.evidence_references),
+                            "normalized": redact_evidence_for_storage(row.as_dict()),
+                        },
+                        created_at=created_at,
+                    )
+                )
+            for rank, (kol, snapshot, row, score) in enumerate(selected_draft, start=1):
                 self._db.add(
                     TaskCandidate(
                         id=str(uuid4()),
@@ -129,7 +177,11 @@ class ReportingService:
             await self._append_event(
                 task,
                 TaskEventType.CANDIDATES_UPDATED,
-                {"candidate_version": candidate_version, "total": len(draft)},
+                {
+                    "candidate_version": candidate_version,
+                    "total": len(selected_draft),
+                    "pool_total": len(ranked_draft),
+                },
             )
             return CandidateVersion(
                 candidate_version=candidate_version,
@@ -143,7 +195,7 @@ class ReportingService:
                         snapshot_id=snapshot.id,
                         kol_id=kol.id,
                     )
-                    for rank, (kol, snapshot, _row, score) in enumerate(draft, start=1)
+                    for rank, (kol, snapshot, _row, score) in enumerate(selected_draft, start=1)
                 ),
             )
 

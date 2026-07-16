@@ -26,6 +26,8 @@ def test_phase_two_tables_are_registered() -> None:
         "kols",
         "kol_snapshots",
         "task_candidates",
+        "task_candidate_pools",
+        "task_candidate_pool_items",
         "bi_reports",
         "user_kol_favorites",
     }.issubset(Base.metadata.tables)
