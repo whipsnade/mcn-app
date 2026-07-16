@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { authorizedFetch, setAccessToken } from './client';
-import { downloadLatestSessionExport, retryFollowups, retryTask } from './tasks';
+import { createTask, downloadLatestSessionExport, retryFollowups, retryTask } from './tasks';
 
 
 describe('authorizedFetch', () => {
@@ -93,5 +93,19 @@ describe('authorizedFetch', () => {
     expect(fetchMock).toHaveBeenCalledWith('/api/v1/tasks/task-1/followups/retry', expect.objectContaining({
       method: 'POST', credentials: 'include',
     }));
+  });
+
+  it('sends one idempotency key for a task creation request', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      id: 'task-1', session_id: 'session-1', status: 'pending', estimated_points: 0,
+      error_code: null, error_message: null, latest_report_id: null,
+    }), { status: 202 }));
+    vi.stubGlobal('fetch', fetchMock);
+    setAccessToken('token');
+
+    await createTask('session-1', { content: '找达人' }, 'test-idempotency-key');
+
+    const headers = new Headers(fetchMock.mock.calls[0]?.[1]?.headers);
+    expect(headers.get('Idempotency-Key')).toBe('test-idempotency-key');
   });
 });

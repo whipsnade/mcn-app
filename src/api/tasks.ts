@@ -7,9 +7,20 @@ export interface CreateTaskInput {
   scoring_profile?: 'balanced' | 'audience_first' | 'performance_first' | 'budget_first' | 'risk_first';
 }
 
-export function createTask(sessionId: string, input: CreateTaskInput): Promise<ApiTask> {
+export function createIdempotencyKey(): string {
+  const randomUUID = globalThis.crypto?.randomUUID;
+  if (typeof randomUUID === 'function') return randomUUID.call(globalThis.crypto);
+  return `task-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
+export function createTask(
+  sessionId: string,
+  input: CreateTaskInput,
+  idempotencyKey = createIdempotencyKey(),
+): Promise<ApiTask> {
   return request<ApiTask>(`/api/v1/sessions/${sessionId}/tasks`, {
     method: 'POST',
+    headers: { 'Idempotency-Key': idempotencyKey },
     body: JSON.stringify(input),
   });
 }
