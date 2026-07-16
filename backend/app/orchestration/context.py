@@ -159,6 +159,9 @@ class ContextBuilder:
         messages = await self.workspace.list_messages(user_id, session_id)
         approved_channels = set(await self.permissions.list_enabled_channels(user_id))
         tools = await self.registry.list_enabled()
+        selected_channels = tuple(
+            platform for platform in workspace.platforms if platform in approved_channels
+        )
         return PlannerContext(
             brief=SessionBrief.from_workspace(workspace),
             recent_messages=compress_messages(messages, max_chars=24_000),
@@ -166,7 +169,7 @@ class ContextBuilder:
                 await self.reporting.context_summary(session_id)
             ),
             tools=tuple(PlannerTool.from_approved(item) for item in tools),
-            allowed_channels=tuple(
-                platform for platform in workspace.platforms if platform in approved_channels
-            ),
+            # 渠道在新建会话中是可选条件。未显式选择时应在用户已授权的
+            # 全部渠道内规划；只有显式选择时才收窄到用户的选择。
+            allowed_channels=selected_channels or tuple(sorted(approved_channels)),
         )

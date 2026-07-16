@@ -30,6 +30,7 @@ _DATATAP_SEARCH_BY_PLATFORM = {
     "douyin": _DATATAP_DOUYIN_SEARCH,
 }
 _ZHEJIANG_LOCATION_TERMS = ("浙江", "湖州")
+_MAX_CANDIDATES_PER_PLATFORM = 10
 
 
 class Planner:
@@ -130,7 +131,14 @@ class Planner:
                 continue
             request = dict(raw_request or {})
             request.setdefault("page", 1)
-            request.setdefault("size", 10)
+            requested_size = request.get("size")
+            # 单个平台最多保留 10 位候选：这与产品的 Top10 交付一致，且
+            # 避免外部工具返回过大的原始结果而触发安全输出上限。
+            request["size"] = (
+                min(requested_size, _MAX_CANDIDATES_PER_PLATFORM)
+                if isinstance(requested_size, int) and requested_size >= 1
+                else _MAX_CANDIDATES_PER_PLATFORM
+            )
             if requires_female_audience:
                 request["sexListFan"] = ["femalePercentFan"]
             if requires_20_to_30_audience:

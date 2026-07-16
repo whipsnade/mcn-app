@@ -8,7 +8,7 @@ from uuid import NAMESPACE_URL, uuid5
 from app.mcp_gateway.service import ExecuteMcpCall
 from app.model.contracts import ModelAdapterError
 from app.orchestration.batching import build_execution_batches
-from app.orchestration.schemas import ReplanContext, ReplanFailure, ToolPlan
+from app.orchestration.schemas import PlanValidationError, ReplanContext, ReplanFailure, ToolPlan
 
 
 class TaskStore(Protocol):
@@ -179,7 +179,11 @@ class TaskExecutor:
             await self.repository.mark_interrupted(task.id, self.worker_id)
             raise
         except Exception as error:
-            code = error.code if isinstance(error, ModelAdapterError) else type(error).__name__
+            code = (
+                error.code
+                if isinstance(error, (ModelAdapterError, PlanValidationError))
+                else type(error).__name__
+            )
             await self.repository.mark_failed(task.id, self.worker_id, code)
         finally:
             stop_heartbeat.set()
