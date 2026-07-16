@@ -9,6 +9,7 @@ import {
 import { createTask, getCandidates, getReport } from '../api/tasks';
 import type { CreateSessionInput } from '../api/contracts';
 import { useTaskStream } from './useTaskStream';
+import { isTerminalTaskStatus } from '../state/taskEvents';
 import type { Message, Session } from '../types';
 
 
@@ -21,7 +22,7 @@ function replaceSession(sessions: Session[], nextSession: Session): Session[] {
 }
 
 function taskIsInProgress(status: string | undefined): boolean {
-  return !['completed', 'failed', 'insufficient_balance', 'cancelled'].includes(status ?? 'running');
+  return !isTerminalTaskStatus(status);
 }
 
 
@@ -217,7 +218,9 @@ export function useWorkspace(userId?: string) {
     const generation = generationRef.current;
     setSessions(current => current.map(session => session.analysis?.taskId === activeTaskId ? {
       ...session,
-      status: taskRuntime.status === 'completed' ? 'completed' : session.status,
+      status: taskRuntime.status === 'completed' || taskRuntime.status === 'completed_with_warnings'
+        ? 'completed'
+        : session.status,
       analysis: {
         ...session.analysis,
         status: taskRuntime.status ?? session.analysis.status,

@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
 
-import { initialTaskRuntime, reduceTaskEvent, type TaskEvent } from './taskEvents';
+import {
+  initialTaskRuntime,
+  isTerminalTaskStatus,
+  reduceTaskEvent,
+  type TaskEvent,
+} from './taskEvents';
 
 
 describe('task event reducer', () => {
@@ -91,5 +96,19 @@ describe('task event reducer', () => {
 
     expect(toolStarted.activity).toBe('正在获取达人数据');
     expect(settled.activity).toBe('本次调用积分已结算');
+  });
+
+  it('treats partial MCP success as a completed terminal task', () => {
+    const state = reduceTaskEvent(initialTaskRuntime('task-1'), {
+      id: 3,
+      taskId: 'task-1',
+      type: 'task.completed_with_warnings',
+      payload: { code: 'mcp_partial_failure' },
+    });
+
+    expect(state.status).toBe('completed_with_warnings');
+    expect(state.connection).toBe('closed');
+    expect(state.activity).toBe('分析完成，部分渠道数据暂不可用');
+    expect(isTerminalTaskStatus(state.status)).toBe(true);
   });
 });

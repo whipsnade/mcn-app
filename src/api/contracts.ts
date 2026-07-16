@@ -51,6 +51,7 @@ export type ApiTaskStatus =
   | 'planning'
   | 'running'
   | 'completed'
+  | 'completed_with_warnings'
   | 'failed'
   | 'insufficient_balance'
   | 'interrupted'

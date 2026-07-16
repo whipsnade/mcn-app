@@ -64,6 +64,13 @@ function applyStatusAndPointEvent(state: TaskRuntimeState, event: TaskEvent): Ta
       return { ...state, activity: '未使用积分已释放' };
     case 'task.completed':
       return { ...state, status: 'completed', connection: 'closed', activity: '分析完成' };
+    case 'task.completed_with_warnings':
+      return {
+        ...state,
+        status: 'completed_with_warnings',
+        connection: 'closed',
+        activity: '分析完成，部分渠道数据暂不可用',
+      };
     case 'task.cancelled':
       return { ...state, status: 'cancelled', connection: 'closed' };
     case 'task.failed':
@@ -81,6 +88,7 @@ function applyStatusAndPointEvent(state: TaskRuntimeState, event: TaskEvent): Ta
 
 export function isTerminalTaskStatus(status: string | undefined): boolean {
   return status === 'completed'
+    || status === 'completed_with_warnings'
     || status === 'failed'
     || status === 'insufficient_balance'
     || status === 'cancelled';

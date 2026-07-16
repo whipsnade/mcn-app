@@ -16,6 +16,7 @@ import RechargeModal from './components/RechargeModal';
 import SessionList from './components/SessionList';
 import { WorkspaceTabs, type WorkspaceTab } from './components/WorkspaceTabs';
 import { useWorkspace } from './hooks/useWorkspace';
+import { isTerminalTaskStatus } from './state/taskEvents';
 
 
 export default function App() {
@@ -70,7 +71,7 @@ export default function App() {
     if (authStatus !== 'authenticated') return;
     const status = workspace.taskRuntime?.status;
     const settled = workspace.taskRuntime?.activity === '本次调用积分已结算';
-    if (!settled && !['completed', 'failed', 'insufficient_balance', 'cancelled'].includes(status ?? '')) return;
+    if (!settled && !isTerminalTaskStatus(status)) return;
     void refreshWallet();
   }, [authStatus, refreshWallet, workspace.taskRuntime?.activity, workspace.taskRuntime?.status]);
 
