@@ -257,12 +257,14 @@ class TaskRepository:
             )
             if any(
                 message.metadata_json.get("task_id") == task.id
-                and message.metadata_json.get("followup_suggestions_status") == "pending"
-                for message in messages
-            ) or any(
-                message.metadata_json.get("task_id") == task.id
-                and message.metadata_json.get("followup_suggestions_status") == "failed"
-                and int(message.metadata_json.get("followup_attempts", 0)) < 3
+                and message.metadata_json.get("followup_suggestions_status") != "completed"
+                and (
+                    message.metadata_json.get("followup_suggestions_status") in {None, "pending"}
+                    or (
+                        message.metadata_json.get("followup_suggestions_status") == "failed"
+                        and int(message.metadata_json.get("followup_attempts", 0)) < 3
+                    )
+                )
                 for message in messages
             ):
                 result.append(task.id)

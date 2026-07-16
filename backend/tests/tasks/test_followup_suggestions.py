@@ -9,6 +9,7 @@ from app.tasks.followups import (
     contains_internal_reference,
     build_followup_request,
     safe_followup_error,
+    followup_recovery_needed,
 )
 
 
@@ -165,3 +166,17 @@ def test_task_read_prefers_persisted_assistant_metadata_fields() -> None:
     )
     assert result.followup_suggestions_status == "completed"
     assert result.followup_suggestions[0]["title"].startswith("受众地域")
+
+
+@pytest.mark.parametrize(
+    "metadata, expected",
+    [
+        ({"task_id": "task-1"}, True),
+        ({"task_id": "task-1", "followup_suggestions_status": "pending"}, True),
+        ({"task_id": "task-1", "followup_suggestions_status": "failed", "followup_attempts": 2}, True),
+        ({"task_id": "task-1", "followup_suggestions_status": "failed", "followup_attempts": 3}, False),
+        ({"task_id": "task-1", "followup_suggestions_status": "completed"}, False),
+    ],
+)
+def test_completed_task_recovery_includes_missing_followup_status(metadata, expected: bool) -> None:
+    assert followup_recovery_needed(metadata, task_id="task-1") is expected

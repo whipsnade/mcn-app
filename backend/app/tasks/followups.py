@@ -62,6 +62,18 @@ def contains_internal_reference(value: str) -> bool:
     return bool(_INTERNAL_REFERENCE_RE.search(value) or _JWT_RE.search(value))
 
 
+def followup_recovery_needed(metadata: Mapping[str, Any], *, task_id: str) -> bool:
+    """Whether a terminal task's assistant summary still needs one bounded attempt."""
+    if metadata.get("task_id") != task_id:
+        return False
+    status = metadata.get("followup_suggestions_status")
+    if status == "completed":
+        return False
+    if status == "failed":
+        return int(metadata.get("followup_attempts", 0)) < 3
+    return status in {None, "pending"}
+
+
 def _sanitize_text(value: Any, *, max_length: int) -> str:
     text_value = str(value or "")[:max_length]
     if _RAW_OBJECT_RE.search(text_value):
