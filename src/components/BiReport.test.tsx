@@ -1,6 +1,7 @@
-import { render, screen } from '@testing-library/react';
-import { describe, expect, it } from 'vitest';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { describe, expect, it, vi } from 'vitest';
 
+import * as tasksApi from '../api/tasks';
 import { candidatePage, missingDataReport, reportFixture } from '../test/fixtures';
 import BiReport from './BiReport';
 
@@ -55,5 +56,25 @@ describe('BiReport', () => {
     expect(screen.getByText('B站数据采集')).toBeVisible();
     expect(screen.getByText(/证据编号：evidence-1/)).toBeVisible();
     expect(screen.queryByText('/secret')).not.toBeInTheDocument();
+  });
+
+  it('disables Excel export while the latest task is running', () => {
+    render(<BiReport report={reportFixture({ candidate_version: 2 })} candidateVersion={2} sessionId="session-1" taskStatus="running" />);
+
+    expect(screen.getByRole('button', { name: '导出 Excel' })).toBeDisabled();
+  });
+
+  it('downloads the latest session workbook after completion', async () => {
+    const download = vi.spyOn(tasksApi, 'downloadLatestSessionExport').mockResolvedValue({ blob: new Blob(['xlsx']), filename: '测试.xlsx' });
+    const createObjectURL = vi.fn(() => 'blob:test');
+    const revokeObjectURL = vi.fn();
+    vi.stubGlobal('URL', { ...URL, createObjectURL, revokeObjectURL });
+
+    render(<BiReport report={reportFixture({ candidate_version: 2 })} candidateVersion={2} sessionId="session-1" taskStatus="completed" hasCandidateData />);
+    fireEvent.click(screen.getByRole('button', { name: '导出 Excel' }));
+
+    await waitFor(() => expect(download).toHaveBeenCalledWith('session-1'));
+    expect(createObjectURL).toHaveBeenCalledTimes(1);
+    vi.unstubAllGlobals();
   });
 });

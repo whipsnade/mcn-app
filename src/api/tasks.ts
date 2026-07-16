@@ -1,4 +1,4 @@
-import { request } from './client';
+import { authorizedFetch, request } from './client';
 import type { ApiBiReport, ApiCandidatePage, ApiTask } from './contracts';
 
 
@@ -28,4 +28,21 @@ export function getCandidates(taskId: string): Promise<ApiCandidatePage> {
 
 export function getReport(reportId: string): Promise<ApiBiReport> {
   return request<ApiBiReport>(`/api/v1/reports/${reportId}`);
+}
+
+export interface DownloadedExport {
+  blob: Blob;
+  filename: string;
+}
+
+export async function downloadLatestSessionExport(sessionId: string): Promise<DownloadedExport> {
+  const response = await authorizedFetch(`/api/v1/sessions/${sessionId}/exports/latest.xlsx`);
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({ detail: `HTTP_${response.status}` }));
+    throw new Error(body.detail ?? `HTTP_${response.status}`);
+  }
+  const disposition = response.headers.get('content-disposition') ?? '';
+  const encodedName = disposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
+  const filename = encodedName ? decodeURIComponent(encodedName) : 'KOL匹配度分析报告.xlsx';
+  return { blob: await response.blob(), filename };
 }

@@ -243,6 +243,9 @@ export default function App() {
             candidateVersion={workspace.activeSession?.analysis?.candidateVersion}
             selectedCandidates={candidatePage?.items}
             selectedCandidateVersion={candidatePage?.version}
+            sessionId={workspace.activeSession?.id}
+            taskStatus={(workspace.taskRuntime?.status ?? workspace.activeSession?.analysis?.status) as import('./api/contracts').ApiTaskStatus | undefined}
+            hasCandidateData={Boolean(candidatePage?.total)}
           />
         </div>
       </div>

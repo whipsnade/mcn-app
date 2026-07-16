@@ -1,17 +1,22 @@
 import {
   AlertTriangle, Award, BarChart2, CheckCircle2, CircleDollarSign, Database,
-  HelpCircle, PieChart as PieChartIcon, Printer, ShieldCheck, Sparkles, Users,
+  Download, HelpCircle, PieChart as PieChartIcon, ShieldCheck, Sparkles, Users,
 } from 'lucide-react';
 import { Bar, BarChart, Cell, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
-import type { ReactNode } from 'react';
+import { useState, type ReactNode } from 'react';
 
 import type { ApiBiReport, ApiCandidate } from '../api/contracts';
+import { downloadLatestSessionExport } from '../api/tasks';
+import type { ApiTaskStatus } from '../api/contracts';
 
 interface BiReportProps {
   report?: ApiBiReport;
   candidateVersion?: number;
   selectedCandidates?: readonly ApiCandidate[];
   selectedCandidateVersion?: number;
+  sessionId?: string;
+  taskStatus?: ApiTaskStatus;
+  hasCandidateData?: boolean;
 }
 
 const indigo = '#4f46e5';
@@ -234,7 +239,30 @@ function PanelState({ children }: { children: ReactNode }) {
   return <aside className="flex h-full w-full shrink-0 flex-col overflow-hidden border-l border-slate-200 bg-white shadow-sm xl:w-[420px]"><header className="flex h-14 items-center border-b border-slate-200 px-4"><h2 className="text-xs font-bold uppercase tracking-widest text-slate-800">BI 智能分析报告</h2></header><div className="flex flex-1 items-center justify-center bg-slate-50/40 p-8 text-center text-xs text-slate-500">{children}</div></aside>;
 }
 
-export default function BiReport({ report, candidateVersion, selectedCandidates = [], selectedCandidateVersion }: BiReportProps) {
+export default function BiReport({ report, candidateVersion, selectedCandidates = [], selectedCandidateVersion, sessionId, taskStatus, hasCandidateData = false }: BiReportProps) {
+  const [isExporting, setIsExporting] = useState(false);
+  const [exportError, setExportError] = useState<string>();
+  const canExport = Boolean(sessionId && hasCandidateData && (taskStatus === 'completed' || taskStatus === 'completed_with_warnings'));
+  const handleExport = async () => {
+    if (!sessionId || !canExport || isExporting) return;
+    setIsExporting(true);
+    setExportError(undefined);
+    try {
+      const exported = await downloadLatestSessionExport(sessionId);
+      const url = URL.createObjectURL(exported.blob);
+      const anchor = document.createElement('a');
+      anchor.href = url;
+      anchor.download = exported.filename;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(url);
+    } catch {
+      setExportError('导出失败，请稍后重试');
+    } finally {
+      setIsExporting(false);
+    }
+  };
   if (!report) return <PanelState>等待生成 KOL 决策报告</PanelState>;
   if (candidateVersion === undefined || report.candidate_version !== candidateVersion) return <PanelState>正在同步最新候选与 BI 报告</PanelState>;
 
@@ -242,7 +270,10 @@ export default function BiReport({ report, candidateVersion, selectedCandidates 
     <aside className="flex h-full w-full shrink-0 flex-col overflow-hidden border-l border-slate-200 bg-white shadow-sm print-container xl:w-[420px]">
       <header className="flex h-14 items-center justify-between border-b border-slate-200 bg-white px-4 shrink-0">
         <div><h2 className="text-xs font-bold uppercase tracking-widest text-slate-800">BI 智能分析报告</h2><p className="mt-0.5 text-[9px] text-slate-400">报告 v{report.report_version} · {new Date(report.generated_at).toLocaleString('zh-CN')}</p></div>
-        <button onClick={() => window.print()} className="no-print flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3 py-1.5 text-[10px] font-bold text-white shadow-sm transition hover:bg-indigo-700" title="导出 PDF KOL 决策报告"><Printer className="h-3.5 w-3.5" />导出 PDF</button>
+        <div className="flex items-center gap-2">
+          {exportError && <span role="alert" className="text-[10px] text-rose-500">{exportError}</span>}
+          <button onClick={() => void handleExport()} disabled={!canExport || isExporting} className="no-print flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3 py-1.5 text-[10px] font-bold text-white shadow-sm transition hover:bg-indigo-700 disabled:cursor-not-allowed disabled:opacity-50" title={canExport ? '导出 Excel KOL 匹配度分析报告' : '分析完成后可导出'}><Download className="h-3.5 w-3.5" />{isExporting ? '导出中…' : '导出 Excel'}</button>
+        </div>
       </header>
       <div className="flex-1 space-y-3 overflow-y-auto bg-slate-50/40 p-3 print-scrollable">
         <OverviewCard overview={report.overview} />
