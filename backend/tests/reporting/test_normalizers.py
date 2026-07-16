@@ -1,7 +1,18 @@
 from datetime import datetime, timezone
+from decimal import Decimal
+from itertools import permutations
 import json
+import time
 
-from app.reporting.normalizers import normalize_tool_evidence
+import pytest
+
+from app.reporting.normalizers import (
+    _decimal,
+    _merge,
+    _non_negative_number,
+    _safe_term,
+    normalize_tool_evidence,
+)
 from app.reporting.schemas import ToolEvidence
 
 
@@ -195,6 +206,10 @@ def test_creator_candidate_normalizes_english_aliases_and_persists_as_dict() -> 
     assert candidate.analytics_fields["brand_mentions"] == 4
     assert candidate.analytics_fields["hot_words"] == [{"term": "开箱", "count": 3}]
     assert candidate.as_dict()["analytics_fields"] == candidate.analytics_fields
+    assert "evidence_priority" not in candidate.as_dict()
+    assert "field_provenance" not in candidate.as_dict()
+    assert "evidence_priority" not in repr(candidate)
+    assert "field_provenance" not in repr(candidate)
     serialized = json.dumps(candidate.as_dict(), ensure_ascii=False)
     assert "raw_comments" not in serialized
     assert "do not persist" not in serialized
@@ -302,3 +317,190 @@ def test_merge_same_timestamp_and_call_id_uses_content_digest_stably() -> None:
 
     assert forward == reverse
     assert forward.analytics_fields["interactions"] == 50
+
+
+def test_merge_is_associative_for_every_three_evidence_permutation() -> None:
+    payloads = (
+        (
+            "creator.search.v1",
+            "call-a",
+            {
+                "platform": "bilibili",
+                "account_id": "creator-associative",
+                "nickname": "A",
+                "impressions": 100,
+                "keywords": ["A词"],
+                "risk_flags": [{"type": "c-risk"}],
+            },
+        ),
+        (
+            "creator.profile.v1",
+            "call-b",
+            {
+                "platform": "bilibili",
+                "account_id": "creator-associative",
+                "nickname": "B",
+                "impressions": 200,
+                "total_interactions": 20,
+                "risk_flags": [{"type": "b-risk"}],
+            },
+        ),
+        (
+            "creator.search.v1",
+            "call-c",
+            {
+                "platform": "bilibili",
+                "account_id": "creator-associative",
+                "nickname": "C",
+                "impressions": 300,
+                "risk_flags": [{"type": "a-risk"}],
+            },
+        ),
+    )
+    records = tuple(
+        normalize_tool_evidence([evidence(tool, payload, call_id)])[0]
+        for tool, call_id, payload in payloads
+    )
+
+    results = []
+    for first, second, third in permutations(records):
+        results.append(_merge(_merge(first, second), third))
+        results.append(_merge(first, _merge(second, third)))
+
+    assert all(result == results[0] for result in results)
+    assert all(result.evidence_priority == results[0].evidence_priority for result in results)
+    assert all(result.field_provenance == results[0].field_provenance for result in results)
+    assert results[0].nickname == "C"
+    assert results[0].analytics_fields == {
+        "exposure": 300,
+        "interactions": 20,
+        "hot_words": ["A词"],
+    }
+    assert results[0].risk_flags == (
+        {"type": "a-risk"},
+        {"type": "b-risk"},
+        {"type": "c-risk"},
+    )
+    assert results[0].evidence_references == ("call-a", "call-b", "call-c")
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param("1e999999", id="huge_exponent_text"),
+        pytest.param(Decimal("1e999999"), id="huge_exponent_decimal"),
+        pytest.param("9" * 100, id="oversized_numeric_text"),
+        pytest.param(float("inf"), id="positive_infinity"),
+        pytest.param(float("-inf"), id="negative_infinity"),
+        pytest.param(float("nan"), id="not_a_number"),
+        pytest.param(Decimal("NaN"), id="decimal_not_a_number"),
+    ],
+)
+def test_decimal_rejects_resource_exhausting_or_non_finite_values_quickly(value) -> None:
+    started_at = time.monotonic()
+
+    with pytest.raises(ValueError, match="invalid_numeric_value"):
+        _decimal(value)
+
+    assert time.monotonic() - started_at < 1
+
+
+def test_analytics_number_rejects_values_above_business_limit() -> None:
+    with pytest.raises(ValueError, match="invalid_analytics_number"):
+        _non_negative_number(1_000_000_000_000_001)
+
+
+def test_extreme_optional_analytics_number_is_quickly_left_missing() -> None:
+    item = evidence(
+        "creator.search.v1",
+        {
+            "platform": "bilibili",
+            "account_id": "creator-extreme-number",
+            "brand_mention_count": "1e999999",
+            "impressions": 10,
+        },
+        "call-extreme-number",
+    )
+    started_at = time.monotonic()
+
+    [candidate] = normalize_tool_evidence([item])
+
+    assert time.monotonic() - started_at < 1
+    assert candidate.analytics_fields == {"exposure": 10}
+
+
+def test_audience_distributions_normalize_percentages_without_changing_sentiment_counts() -> None:
+    item = evidence(
+        "creator.search.v1",
+        {
+            "platform": "bilibili",
+            "account_id": "creator-percentages",
+            "sentiment": {"positive": 1, "neutral": 2, "negative": 3},
+            "age_distribution": {
+                "under-18": 0,
+                "18-24": 0.4,
+                "25-34": 1,
+                "35-44": "40%",
+                "45+": 40,
+            },
+            "gender_distribution": {"female": 101},
+            "region_distribution": {"浙江": 1.2, "上海": "0.4"},
+        },
+        "call-percentages",
+    )
+
+    [candidate] = normalize_tool_evidence([item])
+
+    assert candidate.analytics_fields["sentiment_counts"] == {
+        "positive": 1,
+        "neutral": 2,
+        "negative": 3,
+    }
+    assert candidate.analytics_fields["audience_age"] == {
+        "under-18": 0,
+        "18-24": 40,
+        "25-34": 100,
+        "35-44": 40,
+        "45+": 40,
+    }
+    assert "audience_gender" not in candidate.analytics_fields
+    assert candidate.analytics_fields["audience_regions"] == {"浙江": 1.2, "上海": 40}
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param("sk-" + "x" * 32, id="sk_credential_shape"),
+        pytest.param("e30.e30." + "x" * 32, id="jwt_shape"),
+        pytest.param("abc.def.ghi", id="jwt_three_short_segments"),
+        pytest.param("Bearer " + "x" * 24, id="bearer_shape"),
+        pytest.param("/api/internal/metrics", id="internal_api_path"),
+        pytest.param("https://public.example.test/path", id="url"),
+        pytest.param("api.lkeap.cloud.tencent.com/v1", id="known_api_host"),
+    ],
+)
+def test_safe_term_rejects_credential_and_internal_path_shapes(value: str) -> None:
+    with pytest.raises(ValueError, match="invalid_hot_word"):
+        _safe_term(value)
+
+
+def test_hot_words_filter_credentials_and_distribution_rejects_secret_label() -> None:
+    credential_like = "sk-" + "x" * 32
+    jwt_like = "e30.e30." + "x" * 32
+    item = evidence(
+        "creator.search.v1",
+        {
+            "platform": "bilibili",
+            "account_id": "creator-sensitive-labels",
+            "keywords": [credential_like, "安全热词"],
+            "age_distribution": {jwt_like: 40},
+            "region_distribution": {"浙江": 20},
+        },
+        "call-sensitive-labels",
+    )
+
+    [candidate] = normalize_tool_evidence([item])
+
+    assert candidate.analytics_fields["hot_words"] == ["安全热词"]
+    assert "audience_age" not in candidate.analytics_fields
+    assert candidate.analytics_fields["audience_regions"] == {"浙江": 20}

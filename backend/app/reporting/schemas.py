@@ -7,6 +7,9 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 
+EvidencePriority = tuple[float, str, str]
+
+
 @dataclass(frozen=True)
 class ToolEvidence:
     """一条已经由 MCP 网关校验成功的结构化证据。"""
@@ -92,6 +95,17 @@ class NormalizedKolEvidence:
     export_fields: dict[str, Any] = field(default_factory=dict)
     # 仅保存 BI 契约白名单内、经过形状校验和脱敏的规范字段。
     analytics_fields: dict[str, Any] = field(default_factory=dict)
+    # 仅在本轮内存合并使用，不进入持久化字典，也不参与领域对象相等比较。
+    evidence_priority: EvidencePriority | None = field(
+        default=None,
+        compare=False,
+        repr=False,
+    )
+    field_provenance: tuple[tuple[str, EvidencePriority], ...] = field(
+        default_factory=tuple,
+        compare=False,
+        repr=False,
+    )
 
     def dimensions(self) -> DimensionInputs:
         return DimensionInputs(

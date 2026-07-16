@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
+from dataclasses import replace
 from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
+from functools import reduce
 import hashlib
 import json
 import re
 from typing import Any
 import unicodedata
 
-from app.reporting.schemas import NormalizedKolEvidence, ToolEvidence
+from app.reporting.schemas import EvidencePriority, NormalizedKolEvidence, ToolEvidence
 
 
 class UnknownEvidenceToolError(ValueError):
@@ -42,6 +44,18 @@ _TEXT_SECRET_PATTERN = re.compile(
     r"(?![a-z0-9_])",
     re.IGNORECASE,
 )
+_CREDENTIAL_VALUE_PATTERN = re.compile(
+    r"^(?:sk-[a-z0-9_-]{16,}|[a-z0-9_-]+\.[a-z0-9_-]+\.[a-z0-9_-]+)$",
+    re.IGNORECASE,
+)
+_INTERNAL_PATH_PATTERN = re.compile(
+    r"(?:^|[/\\])(?:api|internal)(?:[/\\]|$)",
+    re.IGNORECASE,
+)
+_MAX_NUMERIC_TEXT_LENGTH = 64
+_MAX_DECIMAL_ADJUSTED_EXPONENT = 18
+_MAX_GENERAL_NUMBER = Decimal("1000000000000000")
+_MAX_ANALYTICS_NUMBER = Decimal("1000000000000000")
 
 
 def normalize_tool_evidence(evidence: Iterable[ToolEvidence]) -> tuple[NormalizedKolEvidence, ...]:
@@ -172,16 +186,18 @@ def _normalize_datatap_xiaohongshu_candidate(
         "brand_safety_score": None,
     }
     missing = tuple(name for name, value in fields.items() if value is None)
-    return NormalizedKolEvidence(
-        platform=platform,
-        platform_account_id=account_id,
-        risk_flags=tuple(redact_evidence_for_storage(risk_flags)),
-        collected_at=item.collected_at,
-        evidence_references=(item.source_call_id,) if item.source_call_id else (),
-        missing_fields=missing,
-        export_fields=_extract_export_fields(candidate),
-        analytics_fields=_extract_analytics_fields(candidate),
-        **fields,
+    return _with_provenance(
+        NormalizedKolEvidence(
+            platform=platform,
+            platform_account_id=account_id,
+            risk_flags=tuple(redact_evidence_for_storage(risk_flags)),
+            collected_at=item.collected_at,
+            evidence_references=(item.source_call_id,) if item.source_call_id else (),
+            missing_fields=missing,
+            export_fields=_extract_export_fields(candidate),
+            analytics_fields=_extract_analytics_fields(candidate),
+            **fields,
+        )
     )
 
 
@@ -231,16 +247,18 @@ def _normalize_datatap_douyin_candidate(
         "brand_safety_score": None,
     }
     missing = tuple(name for name, value in fields.items() if value is None)
-    return NormalizedKolEvidence(
-        platform=platform,
-        platform_account_id=account_id,
-        risk_flags=tuple(redact_evidence_for_storage(risk_flags)),
-        collected_at=item.collected_at,
-        evidence_references=(item.source_call_id,) if item.source_call_id else (),
-        missing_fields=missing,
-        export_fields=_extract_export_fields(candidate),
-        analytics_fields=_extract_analytics_fields(candidate),
-        **fields,
+    return _with_provenance(
+        NormalizedKolEvidence(
+            platform=platform,
+            platform_account_id=account_id,
+            risk_flags=tuple(redact_evidence_for_storage(risk_flags)),
+            collected_at=item.collected_at,
+            evidence_references=(item.source_call_id,) if item.source_call_id else (),
+            missing_fields=missing,
+            export_fields=_extract_export_fields(candidate),
+            analytics_fields=_extract_analytics_fields(candidate),
+            **fields,
+        )
     )
 
 
@@ -268,54 +286,89 @@ def _normalize_candidate(item: ToolEvidence, candidate: Any) -> NormalizedKolEvi
         raise ValueError("invalid_risk_flags")
     redacted_flags = redact_evidence_for_storage(flags)
     missing = tuple(name for name, value in fields.items() if value is None)
-    return NormalizedKolEvidence(
-        platform=platform,
-        platform_account_id=account_id,
-        risk_flags=tuple(redacted_flags),
-        collected_at=item.collected_at,
-        evidence_references=(item.source_call_id,) if item.source_call_id else (),
-        missing_fields=missing,
-        export_fields=_extract_export_fields(candidate),
-        analytics_fields=_extract_analytics_fields(candidate),
-        **fields,
+    return _with_provenance(
+        NormalizedKolEvidence(
+            platform=platform,
+            platform_account_id=account_id,
+            risk_flags=tuple(redacted_flags),
+            collected_at=item.collected_at,
+            evidence_references=(item.source_call_id,) if item.source_call_id else (),
+            missing_fields=missing,
+            export_fields=_extract_export_fields(candidate),
+            analytics_fields=_extract_analytics_fields(candidate),
+            **fields,
+        )
     )
 
 
 def _merge(
     previous: NormalizedKolEvidence, current: NormalizedKolEvidence
 ) -> NormalizedKolEvidence:
-    return _merge_many((previous, current))
-
-
-def _merge_many(records: Iterable[NormalizedKolEvidence]) -> NormalizedKolEvidence:
-    prioritized = tuple(sorted(records, key=_evidence_priority, reverse=True))
-    if not prioritized:
-        raise ValueError("cannot_merge_empty_evidence")
-    primary = prioritized[0]
-    if any(
-        (item.platform, item.platform_account_id)
-        != (primary.platform, primary.platform_account_id)
-        for item in prioritized[1:]
+    previous = _with_provenance(previous)
+    current = _with_provenance(current)
+    if (previous.platform, previous.platform_account_id) != (
+        current.platform,
+        current.platform_account_id,
     ):
         raise ValueError("cannot_merge_different_creators")
+
+    previous_provenance = dict(previous.field_provenance)
+    current_provenance = dict(current.field_provenance)
+    merged_provenance: dict[str, EvidencePriority] = {}
+
+    def select(
+        scope: str,
+        name: str,
+        previous_value: Any,
+        current_value: Any,
+        *,
+        present: Callable[[Any], bool],
+    ) -> Any:
+        key = f"{scope}.{name}"
+        candidates: list[tuple[EvidencePriority, str, Any]] = []
+        if present(previous_value):
+            candidates.append(
+                (
+                    previous_provenance.get(key, _evidence_priority(previous)),
+                    _stable_json(previous_value),
+                    previous_value,
+                )
+            )
+        if present(current_value):
+            candidates.append(
+                (
+                    current_provenance.get(key, _evidence_priority(current)),
+                    _stable_json(current_value),
+                    current_value,
+                )
+            )
+        if not candidates:
+            return None
+        priority, _, value = max(candidates, key=lambda candidate: candidate[:2])
+        merged_provenance[key] = priority
+        return value
+
     values = {
-        name: next(
-            (value for item in prioritized if (value := getattr(item, name)) is not None),
-            None,
+        name: select(
+            "scalar",
+            name,
+            getattr(previous, name),
+            getattr(current, name),
+            present=lambda value: value is not None,
         )
         for name in _MERGEABLE_FIELDS
     }
+    export_names = sorted(set(previous.export_fields) | set(current.export_fields))
     export_fields = {
         name: value
-        for name in sorted({name for item in prioritized for name in item.export_fields})
+        for name in export_names
         if (
-            value := next(
-                (
-                    candidate
-                    for item in prioritized
-                    if _has_value(candidate := item.export_fields.get(name))
-                ),
-                None,
+            value := select(
+                "export",
+                name,
+                previous.export_fields.get(name),
+                current.export_fields.get(name),
+                present=_has_value,
             )
         )
         is not None
@@ -324,19 +377,22 @@ def _merge_many(records: Iterable[NormalizedKolEvidence]) -> NormalizedKolEviden
         name: value
         for name in _ANALYTICS_FIELD_ORDER
         if (
-            value := next(
-                (
-                    candidate
-                    for item in prioritized
-                    if _has_value(candidate := item.analytics_fields.get(name))
-                ),
-                None,
+            value := select(
+                "analytics",
+                name,
+                previous.analytics_fields.get(name),
+                current.analytics_fields.get(name),
+                present=_has_value,
             )
         )
         is not None
     }
+    previous_priority = _evidence_priority(previous)
+    current_priority = _evidence_priority(current)
+    primary = previous if previous_priority >= current_priority else current
     flags_by_digest = {
-        _stable_json(flag): flag for item in prioritized for flag in item.risk_flags
+        _stable_json(flag): flag
+        for flag in previous.risk_flags + current.risk_flags
     }
     missing = tuple(name for name, value in values.items() if value is None)
     return NormalizedKolEvidence(
@@ -345,23 +401,64 @@ def _merge_many(records: Iterable[NormalizedKolEvidence]) -> NormalizedKolEviden
         risk_flags=tuple(flags_by_digest[key] for key in sorted(flags_by_digest)),
         collected_at=primary.collected_at,
         evidence_references=tuple(
-            sorted({reference for item in prioritized for reference in item.evidence_references})
+            sorted(set(previous.evidence_references + current.evidence_references))
         ),
         missing_fields=missing,
         export_fields=export_fields,
         analytics_fields=analytics_fields,
+        evidence_priority=max(previous_priority, current_priority),
+        field_provenance=tuple(sorted(merged_provenance.items())),
         **values,
     )
 
 
-def _evidence_priority(item: NormalizedKolEvidence) -> tuple[float, tuple[str, ...], str]:
+def _merge_many(records: Iterable[NormalizedKolEvidence]) -> NormalizedKolEvidence:
+    records = tuple(records)
+    if not records:
+        raise ValueError("cannot_merge_empty_evidence")
+    return reduce(_merge, records[1:], _with_provenance(records[0]))
+
+
+def _evidence_priority(item: NormalizedKolEvidence) -> EvidencePriority:
+    if item.evidence_priority is not None:
+        return item.evidence_priority
     collected_at = item.collected_at
     if collected_at.tzinfo is None:
         collected_at = collected_at.replace(tzinfo=timezone.utc)
     return (
         collected_at.timestamp(),
-        tuple(sorted(item.evidence_references)),
+        max(item.evidence_references, default=""),
         hashlib.sha256(_stable_json(item.as_dict()).encode("utf-8")).hexdigest(),
+    )
+
+
+def _with_provenance(item: NormalizedKolEvidence) -> NormalizedKolEvidence:
+    if item.evidence_priority is not None and item.field_provenance:
+        return item
+    priority = _evidence_priority(item)
+    provenance = {
+        f"scalar.{name}": priority
+        for name in _MERGEABLE_FIELDS
+        if getattr(item, name) is not None
+    }
+    provenance.update(
+        {
+            f"export.{name}": priority
+            for name, value in item.export_fields.items()
+            if _has_value(value)
+        }
+    )
+    provenance.update(
+        {
+            f"analytics.{name}": priority
+            for name, value in item.analytics_fields.items()
+            if name in _ANALYTICS_FIELD_ORDER and _has_value(value)
+        }
+    )
+    return replace(
+        item,
+        evidence_priority=priority,
+        field_provenance=tuple(sorted(provenance.items())),
     )
 
 
@@ -548,21 +645,38 @@ def _has_value(value: Any) -> bool:
     return value is not None and value != "" and value != [] and value != {}
 
 
-def _non_negative_number(value: Any, *, allow_percent: bool = False) -> int | float:
+def _non_negative_number(value: Any) -> int | float:
     if isinstance(value, bool):
         raise ValueError("invalid_analytics_number")
     text = str(value).strip().replace(",", "")
-    if allow_percent and text.endswith("%"):
-        text = text[:-1]
     multiplier = Decimal(1)
     if text.endswith("万"):
         text, multiplier = text[:-1], Decimal(10_000)
     elif text.casefold().endswith("k"):
         text, multiplier = text[:-1], Decimal(1_000)
     number = _decimal(text)
-    if number is None or not number.is_finite() or number < 0:
+    if (
+        number is None
+        or number < 0
+        or number > _MAX_ANALYTICS_NUMBER / multiplier
+    ):
         raise ValueError("invalid_analytics_number")
     number *= multiplier
+    return int(number) if number == number.to_integral_value() else float(number)
+
+
+def _distribution_percentage(value: Any) -> int | float:
+    if isinstance(value, bool):
+        raise ValueError("invalid_distribution_percentage")
+    text = str(value).strip()
+    has_percent_suffix = text.endswith("%")
+    number = _decimal(text[:-1] if has_percent_suffix else text)
+    if number is None:
+        raise ValueError("invalid_distribution_percentage")
+    if not has_percent_suffix and number <= 1:
+        number *= 100
+    if number < 0 or number > 100:
+        raise ValueError("invalid_distribution_percentage")
     return int(number) if number == number.to_integral_value() else float(number)
 
 
@@ -621,7 +735,13 @@ def _safe_term(value: Any) -> str:
     if not isinstance(value, str):
         raise ValueError("invalid_hot_word")
     term = value.strip()
-    if not term or len(term) > 100 or redact_evidence_for_storage(term) in ({}, _DROP):
+    if (
+        not term
+        or len(term) > 100
+        or _CREDENTIAL_VALUE_PATTERN.fullmatch(term)
+        or _INTERNAL_PATH_PATTERN.search(term)
+        or redact_evidence_for_storage(term) in ({}, _DROP)
+    ):
         raise ValueError("invalid_hot_word")
     return term
 
@@ -668,7 +788,7 @@ def _hot_words(value: Any) -> list[str] | list[dict[str, Any]]:
 def _distribution(value: Any) -> dict[str, int | float]:
     if isinstance(value, dict):
         result = {
-            _safe_term(name): _non_negative_number(number, allow_percent=True)
+            _safe_term(name): _distribution_percentage(number)
             for name, number in value.items()
         }
     elif isinstance(value, (list, tuple)):
@@ -692,7 +812,7 @@ def _distribution(value: Any) -> dict[str, int | float]:
                 ),
                 None,
             )
-            result[_safe_term(name)] = _non_negative_number(number, allow_percent=True)
+            result[_safe_term(name)] = _distribution_percentage(number)
     else:
         raise ValueError("invalid_distribution")
     if not result:
@@ -721,10 +841,19 @@ def _decimal(value: Any) -> Decimal | None:
         return None
     if isinstance(value, bool):
         raise ValueError("invalid_numeric_value")
+    text = str(value).strip()
+    if not text or len(text) > _MAX_NUMERIC_TEXT_LENGTH:
+        raise ValueError("invalid_numeric_value")
     try:
-        return Decimal(str(value).strip())
+        number = Decimal(text)
     except (InvalidOperation, AttributeError) as exc:
         raise ValueError("invalid_numeric_value") from exc
+    if (
+        not number.is_finite()
+        or abs(number.adjusted()) > _MAX_DECIMAL_ADJUSTED_EXPONENT
+    ):
+        raise ValueError("invalid_numeric_value")
+    return number
 
 
 def _unit_integer(value: Any) -> int | None:
@@ -737,7 +866,11 @@ def _unit_integer(value: Any) -> int | None:
     elif text.lower().endswith("k"):
         text, multiplier = text[:-1], Decimal(1_000)
     number = _decimal(text)
-    return int(number * multiplier) if number is not None else None
+    if number is None:
+        return None
+    if number < 0 or number > _MAX_GENERAL_NUMBER / multiplier:
+        raise ValueError("invalid_numeric_value")
+    return int(number * multiplier)
 
 
 def _percentage(value: Any) -> float | None:
@@ -769,7 +902,11 @@ def _currency_cny(value: Any) -> float | None:
     if text.endswith("万"):
         text, multiplier = text[:-1], Decimal(10_000)
     number = _decimal(text)
-    if number is None or number < 0:
+    if (
+        number is None
+        or number < 0
+        or number > _MAX_GENERAL_NUMBER / multiplier
+    ):
         raise ValueError("invalid_currency_value")
     return float(number * multiplier)
 
