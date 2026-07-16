@@ -358,6 +358,48 @@ async def test_0005_mcp_tool_discoveries_migration_is_reversible() -> None:
     "PYTEST_XDIST_WORKER" in os.environ,
     reason="schema migration boundary test is intentionally serial",
 )
+async def test_0012_task_creation_order_migration_is_reversible() -> None:
+    async def table_indexes() -> set[str]:
+        async with engine.connect() as connection:
+            return {
+                item["name"]
+                for item in await connection.run_sync(
+                    lambda sync: inspect(sync).get_indexes("analysis_tasks")
+                )
+            }
+
+    async def column_names() -> set[str]:
+        async with engine.connect() as connection:
+            return {
+                item["name"]
+                for item in await connection.run_sync(
+                    lambda sync: inspect(sync).get_columns("analysis_tasks")
+                )
+            }
+
+    try:
+        _run_alembic("upgrade", "0011_session_soft_delete")
+        _run_alembic("upgrade", "0012_task_creation_order")
+        assert "creation_order" in await column_names()
+        assert "ix_analysis_tasks_session_creation_order" in await table_indexes()
+
+        _run_alembic("downgrade", "0011_session_soft_delete")
+        assert "creation_order" not in await column_names()
+        assert "ix_analysis_tasks_session_id" in await table_indexes()
+
+        _run_alembic("upgrade", "0012_task_creation_order")
+        assert "creation_order" in await column_names()
+        indexes = await table_indexes()
+        assert "ix_analysis_tasks_session_creation_order" in indexes
+        assert "ix_analysis_tasks_session_id" not in indexes
+    finally:
+        _run_alembic("upgrade", "head")
+
+
+@pytest.mark.skipif(
+    "PYTEST_XDIST_WORKER" in os.environ,
+    reason="schema migration boundary test is intentionally serial",
+)
 async def test_phase_two_migration_table_boundaries_restore_head() -> None:
     phase_one_tables = {
         "users",
