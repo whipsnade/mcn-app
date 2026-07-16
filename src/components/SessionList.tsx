@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Plus, Search, MessageSquare, Layers, Sparkles, SlidersHorizontal, BarChart3, LogOut, Star, Edit2, Check, X, Shield } from 'lucide-react';
+import { Plus, Search, MessageSquare, Layers, Sparkles, SlidersHorizontal, BarChart3, LogOut, Star, Edit2, Check, X, Shield, Trash2, LoaderCircle } from 'lucide-react';
 import { Session } from '../types';
 
 interface SessionListProps {
@@ -10,11 +10,23 @@ interface SessionListProps {
   onOpenNewModal: () => void;
   onToggleStar?: (id: string) => void;
   onRenameSession?: (id: string, brand: string, campaignName: string) => void;
+  onDeleteSession?: (id: string) => Promise<void>;
   user?: { nickname: string; role?: 'admin' | 'user' } | null;
   onLogout?: () => void;
   points: number | null;
   onOpenRecharge: () => void;
   onOpenAdmin?: () => void;
+}
+
+function sessionDisplayName(session: Session): string {
+  const title = session.title.trim();
+  if (title) return title;
+  const metadataName = [session.brand.trim(), session.campaignName?.trim() ?? '']
+    .filter(Boolean)
+    .join(' - ');
+  if (metadataName) return metadataName;
+  const category = session.category.trim();
+  return category ? `${category} KOL 分析` : '未命名会话';
 }
 
 function formatUpdatedAt(value: string): string {
@@ -36,6 +48,7 @@ export default function SessionList({
   onOpenNewModal,
   onToggleStar,
   onRenameSession,
+  onDeleteSession,
   user,
   onLogout,
   points,
@@ -47,6 +60,9 @@ export default function SessionList({
   const [editingSessionId, setEditingSessionId] = useState<string | null>(null);
   const [editBrand, setEditBrand] = useState('');
   const [editCampaignName, setEditCampaignName] = useState('');
+  const [confirmingDeleteId, setConfirmingDeleteId] = useState<string | null>(null);
+  const [deletingSessionId, setDeletingSessionId] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
   const handleStartEdit = (session: Session) => {
     setEditingSessionId(session.id);
@@ -55,7 +71,7 @@ export default function SessionList({
   };
 
   const handleSaveEdit = (id: string) => {
-    if (onRenameSession && editBrand.trim() && editCampaignName.trim()) {
+    if (onRenameSession) {
       onRenameSession(id, editBrand.trim(), editCampaignName.trim());
     }
     setEditingSessionId(null);
@@ -63,6 +79,20 @@ export default function SessionList({
 
   const handleCancelEdit = () => {
     setEditingSessionId(null);
+  };
+
+  const handleConfirmDelete = async (id: string) => {
+    if (!onDeleteSession || deletingSessionId) return;
+    setDeletingSessionId(id);
+    setDeleteError(null);
+    try {
+      await onDeleteSession(id);
+      setConfirmingDeleteId(null);
+    } catch {
+      setDeleteError('删除会话失败，请稍后重试。');
+    } finally {
+      setDeletingSessionId(null);
+    }
   };
   const maxPoints = 5000;
 
@@ -159,6 +189,7 @@ export default function SessionList({
         ) : (
           filteredSessions.map(session => {
             const isActive = session.id === activeSessionId;
+            const displayName = sessionDisplayName(session);
             const lastMessage = session.messages[session.messages.length - 1];
             // Get platform logo colors and initials
             const getPlatformStyle = (pf: string) => {
@@ -179,7 +210,7 @@ export default function SessionList({
               <div
                 key={session.id}
                 onClick={() => onSelectSession(session.id)}
-                className={`p-3 rounded-lg flex flex-col gap-1 cursor-pointer transition border duration-150 ${
+                className={`group p-3 rounded-lg flex flex-col gap-1 cursor-pointer transition border duration-150 ${
                   isActive 
                     ? 'bg-indigo-50 text-indigo-700 border-indigo-100/50' 
                     : 'hover:bg-slate-50 text-slate-600 border-transparent'
@@ -233,7 +264,7 @@ export default function SessionList({
                 ) : (
                   <div className="flex items-center justify-between w-full">
                     <span className={`font-semibold text-xs truncate max-w-[140px] ${isActive ? 'text-indigo-800' : 'text-slate-800'}`}>
-                      {session.brand.split(' ')[0]}{session.campaignName ? ` - ${session.campaignName}` : ''}
+                      {displayName}
                     </span>
                     <div className="flex items-center gap-1 shrink-0">
                       <button
@@ -246,6 +277,20 @@ export default function SessionList({
                       >
                         <Edit2 className="h-3.5 w-3.5" />
                       </button>
+                      {onDeleteSession && (
+                        <button
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            setDeleteError(null);
+                            setConfirmingDeleteId(session.id);
+                          }}
+                          className="p-1 rounded text-slate-300 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus:opacity-100 hover:text-rose-600 hover:bg-rose-50 transition duration-150"
+                          aria-label={`删除会话 ${displayName}`}
+                          title="删除会话"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
+                      )}
                       <button
                         onClick={(e) => {
                           e.stopPropagation();
@@ -263,6 +308,43 @@ export default function SessionList({
                       <span className="text-[10px] opacity-70 ml-0.5">
                         {formatUpdatedAt(session.updatedAt)}
                       </span>
+                    </div>
+                  </div>
+                )}
+
+                {confirmingDeleteId === session.id && (
+                  <div
+                    onClick={event => event.stopPropagation()}
+                    className="rounded-lg border border-rose-100 bg-rose-50/70 p-2"
+                  >
+                    <p className="text-[11px] font-semibold text-rose-700">确定删除这个会话吗？</p>
+                    <p className="mt-0.5 text-[10px] text-rose-500">删除后无法恢复。</p>
+                    {deleteError && (
+                      <p role="alert" className="mt-1 text-[10px] font-medium text-rose-700">{deleteError}</p>
+                    )}
+                    <div className="mt-2 flex justify-end gap-1.5">
+                      <button
+                        type="button"
+                        disabled={deletingSessionId === session.id}
+                        onClick={() => {
+                          setConfirmingDeleteId(null);
+                          setDeleteError(null);
+                        }}
+                        className="rounded-md border border-slate-200 bg-white px-2 py-0.5 text-[10px] font-bold text-slate-500 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-50"
+                        aria-label="取消删除"
+                      >
+                        取消
+                      </button>
+                      <button
+                        type="button"
+                        disabled={deletingSessionId === session.id}
+                        onClick={() => void handleConfirmDelete(session.id)}
+                        className="flex items-center gap-1 rounded-md bg-rose-600 px-2 py-0.5 text-[10px] font-bold text-white transition hover:bg-rose-700 disabled:cursor-not-allowed disabled:opacity-70"
+                        aria-label={deletingSessionId === session.id ? '删除中' : '确认删除'}
+                      >
+                        {deletingSessionId === session.id && <LoaderCircle className="h-2.5 w-2.5 animate-spin" />}
+                        {deletingSessionId === session.id ? '删除中' : '删除'}
+                      </button>
                     </div>
                   </div>
                 )}

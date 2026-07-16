@@ -1,9 +1,17 @@
-import { describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { toSession } from './sessions';
+import { request } from './client';
+import { deleteSession, toSession } from './sessions';
+
+
+vi.mock('./client', () => ({ request: vi.fn() }));
 
 
 describe('toSession', () => {
+  beforeEach(() => {
+    vi.mocked(request).mockReset();
+  });
+
   it('maps server history without MCN fields', () => {
     const session = toSession({
       id: 's-1',
@@ -51,5 +59,15 @@ describe('toSession', () => {
 
     expect(session.analysis?.candidateVersion).toBe(2);
     expect(session.analysis?.reportId).toBeUndefined();
+  });
+
+  it('deletes a session through the session endpoint', async () => {
+    vi.mocked(request).mockResolvedValue(undefined);
+
+    await deleteSession('session/with space');
+
+    expect(request).toHaveBeenCalledWith('/api/v1/sessions/session%2Fwith%20space', {
+      method: 'DELETE',
+    });
   });
 });

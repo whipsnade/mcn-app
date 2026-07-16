@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import {
   createSession as createSessionRequest,
+  deleteSession as deleteSessionRequest,
   getSession,
   listSessions,
   updateSession as updateSessionRequest,
@@ -34,8 +35,15 @@ export function useWorkspace(userId?: string) {
   const [error, setError] = useState<string>();
   const [activeTaskId, setActiveTaskId] = useState<string>();
   const generationRef = useRef(0);
+  const selectionRequestRef = useRef(0);
+  const sessionsRef = useRef<Session[]>([]);
+  const activeSessionIdRef = useRef<string>();
   const taskCreateInFlightRef = useRef(false);
   const taskRuntime = useTaskStream(activeTaskId);
+
+  useEffect(() => {
+    sessionsRef.current = sessions;
+  }, [sessions]);
 
   const hydrateAnalysis = useCallback(async (session: Session, generation: number): Promise<Session> => {
     const analysis = session.analysis;
@@ -81,7 +89,10 @@ export function useWorkspace(userId?: string) {
       const rawFirst = loaded[0] ? await getSession(loaded[0].id) : undefined;
       const first = rawFirst ? await hydrateAnalysis(rawFirst, generation) : undefined;
       if (generationRef.current !== generation) return;
-      setSessions(first ? replaceSession(loaded, first) : loaded);
+      const nextSessions = first ? replaceSession(loaded, first) : loaded;
+      sessionsRef.current = nextSessions;
+      activeSessionIdRef.current = first?.id;
+      setSessions(nextSessions);
       setActiveSessionId(first?.id);
       setActiveTaskId(first?.analysis?.taskId);
     } catch (reason) {
@@ -95,6 +106,9 @@ export function useWorkspace(userId?: string) {
 
   useEffect(() => {
     const generation = ++generationRef.current;
+    selectionRequestRef.current += 1;
+    sessionsRef.current = [];
+    activeSessionIdRef.current = undefined;
     setSessions([]);
     setActiveSessionId(undefined);
     setError(undefined);
@@ -116,16 +130,31 @@ export function useWorkspace(userId?: string) {
   const selectSession = useCallback(async (id: string) => {
     if (!userId) return;
     const generation = generationRef.current;
+    const selectionRequest = ++selectionRequestRef.current;
+    activeSessionIdRef.current = id;
     setActiveSessionId(id);
+    setActiveTaskId(undefined);
     setError(undefined);
     try {
       const loaded = await hydrateAnalysis(await getSession(id), generation);
-      if (generationRef.current === generation) {
-        setSessions(current => replaceSession(current, loaded));
+      if (
+        generationRef.current === generation
+        && selectionRequestRef.current === selectionRequest
+        && activeSessionIdRef.current === id
+      ) {
+        setSessions(current => {
+          const nextSessions = replaceSession(current, loaded);
+          sessionsRef.current = nextSessions;
+          return nextSessions;
+        });
         setActiveTaskId(loaded.analysis?.taskId);
       }
     } catch (reason) {
-      if (generationRef.current === generation) {
+      if (
+        generationRef.current === generation
+        && selectionRequestRef.current === selectionRequest
+        && activeSessionIdRef.current === id
+      ) {
         setError(reason instanceof Error ? reason.message : '恢复会话失败');
       }
     }
@@ -139,7 +168,13 @@ export function useWorkspace(userId?: string) {
     try {
       const created = await createSessionRequest(input);
       if (generationRef.current !== generation) throw new Error('STALE_WORKSPACE_REQUEST');
-      setSessions(current => replaceSession(current, created));
+      setSessions(current => {
+        const nextSessions = replaceSession(current, created);
+        sessionsRef.current = nextSessions;
+        return nextSessions;
+      });
+      selectionRequestRef.current += 1;
+      activeSessionIdRef.current = created.id;
       setActiveSessionId(created.id);
       setActiveTaskId(created.analysis?.taskId);
       return created;
@@ -161,7 +196,11 @@ export function useWorkspace(userId?: string) {
     try {
       const updated = await updateSessionRequest(id, changes);
       if (generationRef.current !== generation) throw new Error('STALE_WORKSPACE_REQUEST');
-      setSessions(current => replaceSession(current, updated));
+      setSessions(current => {
+        const nextSessions = replaceSession(current, updated);
+        sessionsRef.current = nextSessions;
+        return nextSessions;
+      });
       return updated;
     } catch (reason) {
       if (generationRef.current === generation) {
@@ -172,6 +211,42 @@ export function useWorkspace(userId?: string) {
       if (generationRef.current === generation) setBusy(false);
     }
   }, [userId]);
+
+  const deleteSession = useCallback(async (id: string) => {
+    if (!userId) throw new Error('AUTH_EXPIRED');
+    const generation = generationRef.current;
+    setBusy(true);
+    setError(undefined);
+    try {
+      await deleteSessionRequest(id);
+      if (generationRef.current !== generation) throw new Error('STALE_WORKSPACE_REQUEST');
+
+      const remainingSessions = sessionsRef.current.filter(session => session.id !== id);
+      sessionsRef.current = remainingSessions;
+      setSessions(remainingSessions);
+
+      if (activeSessionIdRef.current !== id) return;
+
+      selectionRequestRef.current += 1;
+      taskCreateInFlightRef.current = false;
+      setActiveTaskId(undefined);
+      const nextSession = remainingSessions[0];
+      if (!nextSession) {
+        activeSessionIdRef.current = undefined;
+        setActiveSessionId(undefined);
+        return;
+      }
+
+      await selectSession(nextSession.id);
+    } catch (reason) {
+      if (generationRef.current === generation) {
+        setError(reason instanceof Error ? reason.message : '删除会话失败');
+      }
+      throw reason;
+    } finally {
+      if (generationRef.current === generation) setBusy(false);
+    }
+  }, [selectSession, userId]);
 
   const appendMessage = useCallback(async (content: string) => {
     if (!userId) throw new Error('AUTH_EXPIRED');
@@ -362,6 +437,7 @@ export function useWorkspace(userId?: string) {
     selectSession,
     createSession,
     updateSession,
+    deleteSession,
     appendMessage,
     retryMessage,
   };

@@ -86,6 +86,13 @@ export async function updateSession(
 }
 
 
+export async function deleteSession(id: string): Promise<void> {
+  await request(`/api/v1/sessions/${encodeURIComponent(id)}`, {
+    method: 'DELETE',
+  });
+}
+
+
 export async function appendMessage(id: string, content: string): Promise<Session> {
   await request(`/api/v1/sessions/${id}/messages`, {
     method: 'POST',

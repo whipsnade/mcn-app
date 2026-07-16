@@ -2,7 +2,7 @@ import { act, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Session } from '../types';
-import { createSession, getSession, listSessions } from '../api/sessions';
+import { createSession, deleteSession, getSession, listSessions } from '../api/sessions';
 import { createTask, getCandidates, getReport, retryTask } from '../api/tasks';
 import { useTaskStream } from './useTaskStream';
 import { useWorkspace } from './useWorkspace';
@@ -66,6 +66,7 @@ function report(version: number) {
 vi.mock('../api/sessions', () => ({
   appendMessage: vi.fn(),
   createSession: vi.fn(),
+  deleteSession: vi.fn(),
   getSession: vi.fn(),
   listSessions: vi.fn(),
   updateSession: vi.fn(),
@@ -115,6 +116,137 @@ describe('useWorkspace', () => {
 
     expect(result.current.sessions).toEqual([]);
     expect(result.current.activeSession).toBeUndefined();
+  });
+
+  it('deletes a non-active session without changing the current view', async () => {
+    const otherSession = { ...session, id: 'session-2', title: '另一个会话' };
+    vi.mocked(listSessions).mockResolvedValue([session, otherSession]);
+    vi.mocked(deleteSession).mockResolvedValue(undefined);
+    const { result } = renderHook(() => useWorkspace('user-a'));
+    await waitFor(() => expect(result.current.activeSession?.id).toBe('session-1'));
+
+    await act(async () => {
+      await result.current.deleteSession('session-2');
+    });
+
+    expect(result.current.sessions.map(item => item.id)).toEqual(['session-1']);
+    expect(result.current.activeSession?.id).toBe('session-1');
+    expect(getSession).toHaveBeenCalledTimes(1);
+  });
+
+  it('preserves live active-session updates when deleting a non-active session', async () => {
+    const otherSession = { ...session, id: 'session-2', title: '另一个会话' };
+    vi.mocked(listSessions).mockResolvedValue([session, otherSession]);
+    vi.mocked(getSession).mockResolvedValue({
+      ...restoredSession,
+      status: 'analyzing',
+      analysis: { taskId: 'task-live', status: 'running' },
+    });
+    vi.mocked(useTaskStream).mockReturnValue({
+      taskId: 'task-live',
+      lastEventId: 1,
+      assistantDraft: '',
+      connection: 'connected',
+      status: 'completed',
+    });
+    vi.mocked(deleteSession).mockResolvedValue(undefined);
+    const { result } = renderHook(() => useWorkspace('user-a'));
+    await waitFor(() => expect(result.current.activeSession?.status).toBe('completed'));
+
+    await act(async () => {
+      await result.current.deleteSession('session-2');
+    });
+
+    expect(result.current.activeSession?.status).toBe('completed');
+    expect(result.current.activeSession?.analysis?.status).toBe('completed');
+  });
+
+  it('selects and hydrates the most recent remaining session after deleting the active one', async () => {
+    const otherSession = {
+      ...session,
+      id: 'session-2',
+      title: '最近访问的剩余会话',
+      analysis: { taskId: 'task-2', status: 'completed' },
+    };
+    vi.mocked(listSessions).mockResolvedValue([session, otherSession]);
+    vi.mocked(getSession).mockImplementation(async id => id === 'session-1' ? restoredSession : otherSession);
+    vi.mocked(deleteSession).mockResolvedValue(undefined);
+    const { result } = renderHook(() => useWorkspace('user-a'));
+    await waitFor(() => expect(result.current.activeSession?.id).toBe('session-1'));
+
+    await act(async () => {
+      await result.current.deleteSession('session-1');
+    });
+
+    await waitFor(() => expect(result.current.activeSession?.id).toBe('session-2'));
+    expect(result.current.sessions.map(item => item.id)).toEqual(['session-2']);
+    expect(result.current.activeTaskId).toBe('task-2');
+    expect(getSession).toHaveBeenCalledWith('session-2');
+  });
+
+  it('clears all active state after deleting the last session', async () => {
+    vi.mocked(getSession).mockResolvedValue({
+      ...restoredSession,
+      analysis: { taskId: 'task-1', status: 'completed', candidateVersion: 1, reportId: 'report-1' },
+      candidates: [{
+        id: 'candidate-1', kolId: 'kol-1', platform: 'douyin', platformAccountId: 'account-1', rank: 1,
+        totalScore: 90, scores: {}, matchedConditions: [], risks: [], recommendation: '推荐',
+      }],
+      biReport: report(1),
+    });
+    vi.mocked(getCandidates).mockResolvedValue(candidatePage(1, 'kol-1'));
+    vi.mocked(getReport).mockResolvedValue(report(1));
+    vi.mocked(deleteSession).mockResolvedValue(undefined);
+    const { result } = renderHook(() => useWorkspace('user-a'));
+    await waitFor(() => expect(result.current.activeTaskId).toBe('task-1'));
+
+    await act(async () => {
+      await result.current.deleteSession('session-1');
+    });
+
+    expect(result.current.sessions).toEqual([]);
+    expect(result.current.activeSession).toBeUndefined();
+    expect(result.current.activeSessionId).toBeUndefined();
+    expect(result.current.activeTaskId).toBeUndefined();
+    expect(result.current.taskRuntime).toBeUndefined();
+  });
+
+  it('keeps the session list unchanged and rethrows when deletion fails', async () => {
+    vi.mocked(deleteSession).mockRejectedValue(new Error('DELETE_FAILED'));
+    const { result } = renderHook(() => useWorkspace('user-a'));
+    await waitFor(() => expect(result.current.activeSession?.id).toBe('session-1'));
+
+    await expect(act(async () => {
+      await result.current.deleteSession('session-1');
+    })).rejects.toThrow('DELETE_FAILED');
+
+    expect(result.current.sessions).toEqual([restoredSession]);
+    expect(result.current.activeSession?.id).toBe('session-1');
+  });
+
+  it('does not let an older detail response overwrite a newer selection', async () => {
+    const second = { ...session, id: 'session-2', title: '第二个', analysis: { taskId: 'task-2', status: 'completed' } };
+    const third = { ...session, id: 'session-3', title: '第三个', analysis: { taskId: 'task-3', status: 'completed' } };
+    const oldDetail = deferred<Session>();
+    vi.mocked(listSessions).mockResolvedValue([session, second, third]);
+    vi.mocked(getSession).mockImplementation(id => {
+      if (id === 'session-1') return Promise.resolve(restoredSession);
+      if (id === 'session-2') return oldDetail.promise;
+      return Promise.resolve(third);
+    });
+    const { result } = renderHook(() => useWorkspace('user-a'));
+    await waitFor(() => expect(result.current.activeSession?.id).toBe('session-1'));
+
+    act(() => { void result.current.selectSession('session-2'); });
+    await waitFor(() => expect(getSession).toHaveBeenCalledWith('session-2'));
+    await act(async () => { await result.current.selectSession('session-3'); });
+    expect(result.current.activeSession?.id).toBe('session-3');
+    expect(result.current.activeTaskId).toBe('task-3');
+
+    await act(async () => { oldDetail.resolve(second); await oldDetail.promise; });
+
+    expect(result.current.activeSession?.id).toBe('session-3');
+    expect(result.current.activeTaskId).toBe('task-3');
   });
 
   it('subscribes to the initial analysis task returned after creating a session', async () => {

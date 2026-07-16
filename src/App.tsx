@@ -176,6 +176,7 @@ export default function App() {
             onOpenNewModal={() => setIsNewModalOpen(true)}
             onToggleStar={id => void handleToggleStar(id).catch(() => undefined)}
             onRenameSession={(id, brand, campaignName) => void handleRenameSession(id, brand, campaignName).catch(() => undefined)}
+            onDeleteSession={id => workspace.deleteSession(id)}
             user={user}
             onLogout={() => void logout()}
             points={points}
