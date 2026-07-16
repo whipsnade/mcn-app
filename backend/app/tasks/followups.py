@@ -29,6 +29,9 @@ _INTERNAL_REFERENCE_RE = re.compile(
     re.IGNORECASE,
 )
 _JWT_RE = re.compile(r"\b[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b")
+_URI_RE = re.compile(r"(?:(?:https?|ftp|file|ws|wss):/{2,}|//)[^\s<>\"']+", re.IGNORECASE)
+_BEARER_RE = re.compile(r"\bBearer\s+[^\s,;]+", re.IGNORECASE)
+_SECRET_TOKEN_RE = re.compile(r"\bsk-[A-Za-z0-9][A-Za-z0-9._-]*", re.IGNORECASE)
 _RAW_FIELD_RE = re.compile(
     r"\b(?:structured_content|raw_payload|evidence_json|payload|secret|api_key|token)\b",
     re.IGNORECASE,
@@ -59,7 +62,7 @@ _SAFE_SCHEMA_SEGMENTS = {
 
 
 def contains_internal_reference(value: str) -> bool:
-    return bool(_INTERNAL_REFERENCE_RE.search(value) or _JWT_RE.search(value))
+    return bool(_INTERNAL_REFERENCE_RE.search(value) or _URI_RE.search(value) or _JWT_RE.search(value))
 
 
 def followup_recovery_needed(metadata: Mapping[str, Any], *, task_id: str) -> bool:
@@ -78,6 +81,11 @@ def _sanitize_text(value: Any, *, max_length: int) -> str:
     text_value = str(value or "")[:max_length]
     if _RAW_OBJECT_RE.search(text_value):
         return "已省略不可信原始内容"
+    # Replace complete sensitive spans before the broad internal-reference
+    # pattern; otherwise only the scheme/prefix would be removed.
+    text_value = _URI_RE.sub("已脱敏内容", text_value)
+    text_value = _BEARER_RE.sub("已脱敏内容", text_value)
+    text_value = _SECRET_TOKEN_RE.sub("已脱敏内容", text_value)
     text_value = _RAW_FIELD_RE.sub("已省略字段", text_value)
     text_value = _INTERNAL_REFERENCE_RE.sub("已脱敏内容", text_value)
     text_value = _JWT_RE.sub("已脱敏内容", text_value)

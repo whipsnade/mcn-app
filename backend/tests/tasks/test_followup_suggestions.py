@@ -82,6 +82,51 @@ def test_input_safety_redacts_sensitive_values_from_followup_prompt(value: str) 
     assert "structured_content" not in content
 
 
+@pytest.mark.parametrize(
+    "credential",
+    [
+        "Bearer verysecretcredential",
+        "https://example.com/api/private?token=secret",
+        "ftp://example.com/private.csv?token=secret",
+        "file:///tmp/private.json",
+        "ws://example.com/internal?key=secret",
+        "//example.com/api/private?token=secret",
+        "sk-tp-secret",
+        "sk-proj-abc123.xyz-secret",
+    ],
+)
+def test_prompt_replaces_complete_credentials_and_uris(credential: str) -> None:
+    request = build_followup_request(
+        user_query=f"请分析这段内容：{credential}",
+        session_filters={"brand": credential},
+        tool_summary={"抖音": {"succeeded": 1}},
+        candidate_count=1,
+        bi_summary={},
+        conclusion=f"结论中不应包含 {credential}",
+    )
+    content = request.messages[-1].content
+    assert credential not in content
+    assert "verysecretcredential" not in content
+    assert "example.com" not in content
+    assert "token=secret" not in content
+    assert "sk-tp-secret" not in content
+    assert "sk-proj-abc123" not in content
+
+
+def test_prompt_sanitization_keeps_normal_chinese_roi_copy() -> None:
+    request = build_followup_request(
+        user_query="请比较内容匹配度与预估投放回报率，给出下一轮分析建议。",
+        session_filters={"brand": "科颜氏", "category": "美妆"},
+        tool_summary={"小红书": {"succeeded": 1}},
+        candidate_count=10,
+        bi_summary={"overview": {"average_score": 82.5}},
+        conclusion="当前候选内容匹配度较高，建议进一步验证地域覆盖。",
+    )
+    content = request.messages[-1].content
+    assert "投放回报率" in content
+    assert "科颜氏" in content
+
+
 def test_request_contains_only_safe_summary_fields() -> None:
     request = build_followup_request(
         user_query="找出最近30天活跃达人",
