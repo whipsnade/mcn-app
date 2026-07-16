@@ -1,9 +1,8 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import select
 
 from app.reporting.analytics import aggregate_analytics, empty_analytics
 from app.reporting.models import BiReport, Kol, KolSnapshot, TaskCandidate
@@ -125,6 +124,14 @@ def test_aggregate_analytics_deduplicates_same_evidence_and_sorts_ties_stably() 
     ]
 
 
+def test_exposure_trend_skips_multiple_dates_without_daily_exposure_pairs() -> None:
+    result = aggregate_analytics(
+        [_record("douyin", "dy-1", {"exposure": 100, "published_at": ["2026-07-15", "2026-07-16"]})]
+    )
+
+    assert result["exposure_trend"] == []
+
+
 def test_old_report_is_exposed_with_explicit_empty_analytics() -> None:
     now = datetime(2026, 7, 16, tzinfo=UTC).replace(tzinfo=None)
     report = BiReport(
@@ -202,7 +209,7 @@ async def test_latest_session_analysis_hides_old_report_when_latest_task_is_runn
                 created_at=now,
             ),
             BiReport(
-                id=str(uuid4()),
+                id=(report_id := str(uuid4())),
                 task_id=old_task_id,
                 session_id=session_id,
                 candidate_version=1,
@@ -221,17 +228,14 @@ async def test_latest_session_analysis_hides_old_report_when_latest_task_is_runn
 
     workspace = await db_session.get(WorkspaceSession, session_id)
     assert workspace is not None
-    await TaskService(db_session).create(
+    new_task = await TaskService(db_session).create(
         workspace.user_id,
         session_id,
         TaskCreate(content="第二轮分析"),
     )
-    latest = await db_session.scalar(
-        select(AnalysisTask)
-        .where(AnalysisTask.session_id == session_id)
-        .order_by(AnalysisTask.created_at.desc())
-    )
+    latest = await db_session.get(AnalysisTask, new_task.id)
     assert latest is not None
+    latest.created_at = now + timedelta(seconds=1)
     latest.status = TaskStatus.RUNNING.value
     await db_session.flush()
 
@@ -246,6 +250,108 @@ async def test_latest_session_analysis_hides_old_report_when_latest_task_is_runn
     assert session.json()["latest_task"]["status"] == "running"
     assert session.json()["latest_candidates"] is None
     assert session.json()["latest_report"] is None
+
+    service = ReportingService(db_session)
+    assert await service._latest_candidate_version(old_task_id) == 1
+    for status in (
+        TaskStatus.RUNNING.value,
+        TaskStatus.FAILED.value,
+        TaskStatus.CANCELLED.value,
+        TaskStatus.INTERRUPTED.value,
+    ):
+        latest.status = status
+        await db_session.flush()
+        version, rows = await service.list_candidates(
+            workspace.user_id, old_task_id, sort="rank", direction="asc"
+        )
+        assert (version, rows) == (0, [])
+        with pytest.raises(LookupError, match="report_not_found"):
+            await service.get_owned_report(workspace.user_id, report_id)
+
+
+@pytest.mark.asyncio
+async def test_latest_completed_with_warnings_task_keeps_its_own_report_readable(
+    auth_client_factory,
+    db_session,
+) -> None:
+    client = await auth_client_factory("13100000003")
+    created = await client.post(
+        "/api/v1/sessions",
+        json={
+            "brand": "警告报告",
+            "platforms": ["douyin"],
+            "category": "餐饮",
+            "initial_query": "带警告完成",
+        },
+    )
+    session_id = created.json()["id"]
+    task_id = created.json()["latest_task"]["id"]
+    workspace = await db_session.get(WorkspaceSession, session_id)
+    assert workspace is not None
+    now = datetime.now(UTC).replace(tzinfo=None)
+    kol_id, snapshot_id, report_id = str(uuid4()), str(uuid4()), str(uuid4())
+    db_session.add_all(
+        [
+            Kol(
+                id=kol_id,
+                platform="douyin",
+                platform_account_id="warning-1",
+                normalized_profile_url=None,
+                created_at=now,
+                updated_at=now,
+            ),
+            KolSnapshot(
+                id=snapshot_id,
+                kol_id=kol_id,
+                source_mcp_call_id=None,
+                normalized_json={"nickname": "带警告达人"},
+                collected_at=now,
+                created_at=now,
+            ),
+            TaskCandidate(
+                id=str(uuid4()),
+                task_id=task_id,
+                kol_id=kol_id,
+                snapshot_id=snapshot_id,
+                candidate_version=1,
+                total_score=Decimal("70.000"),
+                score_breakdown_json={"dimensions": {}},
+                rank=1,
+                matched_conditions_json=[],
+                risk_flags_json=[],
+                recommendation_text="推荐",
+                evidence_json={},
+                created_at=now,
+            ),
+            BiReport(
+                id=report_id,
+                task_id=task_id,
+                session_id=session_id,
+                candidate_version=1,
+                report_version=1,
+                chart_data_json={},
+                conclusion_text="部分渠道失败",
+                evidence_json={},
+                status="completed",
+                completed_at=now,
+                created_at=now,
+                updated_at=now,
+            ),
+        ]
+    )
+    task = await db_session.get(AnalysisTask, task_id)
+    assert task is not None
+    task.status = TaskStatus.COMPLETED_WITH_WARNINGS.value
+    task.completed_at = now
+    await db_session.flush()
+
+    version, rows = await ReportingService(db_session).list_candidates(
+        workspace.user_id, task_id, sort="rank", direction="asc"
+    )
+    assert version == 1 and len(rows) == 1
+    assert (
+        await ReportingService(db_session).get_owned_report(workspace.user_id, report_id)
+    ).id == report_id
 
 
 @pytest.mark.asyncio

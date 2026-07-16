@@ -290,6 +290,8 @@ class ReportingService:
         task = await self._owned_task(user_id, task_id)
         if task.status not in {"completed", "completed_with_warnings"}:
             return 0, []
+        if not await self._is_latest_task(task):
+            return 0, []
         version = await self._latest_candidate_version(task_id)
         if version is None:
             return 0, []
@@ -328,6 +330,9 @@ class ReportingService:
             )
         )
         if report is None:
+            raise LookupError("report_not_found")
+        task = await self._db.scalar(select(AnalysisTask).where(AnalysisTask.id == report.task_id))
+        if task is None or not await self._is_latest_task(task):
             raise LookupError("report_not_found")
         return report
 
@@ -596,6 +601,15 @@ class ReportingService:
         if task is None:
             raise LookupError("task_not_found")
         return task
+
+    async def _is_latest_task(self, task: AnalysisTask) -> bool:
+        latest_id = await self._db.scalar(
+            select(AnalysisTask.id)
+            .where(AnalysisTask.session_id == task.session_id)
+            .order_by(AnalysisTask.created_at.desc(), AnalysisTask.id.desc())
+            .limit(1)
+        )
+        return latest_id == task.id
 
     @staticmethod
     def _require_active_lease(task: AnalysisTask, lease_owner: str | None) -> None:

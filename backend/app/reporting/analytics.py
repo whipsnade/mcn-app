@@ -23,6 +23,8 @@ _SENTIMENT_LABELS = {
 _SENTIMENT_ORDER = ("positive", "neutral", "negative")
 _TOP_HOT_WORDS = 10
 _TOP_REGIONS = 5
+
+
 def _number(value: Any) -> float | None:
     if isinstance(value, bool):
         return None
@@ -81,8 +83,12 @@ def empty_analytics() -> dict[str, Any]:
 
     return {
         "overview": {
-            "brand_volume": _metric(None, unit="条", covered=0, total=0, source_fields=(), platforms=()),
-            "total_exposure": _metric(None, unit="次", covered=0, total=0, source_fields=(), platforms=()),
+            "brand_volume": _metric(
+                None, unit="条", covered=0, total=0, source_fields=(), platforms=()
+            ),
+            "total_exposure": _metric(
+                None, unit="次", covered=0, total=0, source_fields=(), platforms=()
+            ),
             "average_engagement_rate": _metric(
                 None, unit="%", covered=0, total=0, source_fields=(), platforms=()
             ),
@@ -121,7 +127,9 @@ def _record_parts(record: Any) -> tuple[str, str, Mapping[str, Any]]:
 def _record_key(platform: str, identity: str, fields: Mapping[str, Any]) -> str:
     # Exact duplicate MCP evidence must not double-count.  The digest contains
     # only safe projected fields; no source IDs or raw payload enter it.
-    encoded = json.dumps(dict(fields), ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    encoded = json.dumps(
+        dict(fields), ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str
+    )
     return f"{platform}\x00{identity}\x00{hashlib.sha256(encoded.encode('utf-8')).hexdigest()}"
 
 
@@ -185,7 +193,9 @@ def _distribution(
     }
 
 
-def _hot_words(records: list[tuple[str, Mapping[str, Any]]]) -> tuple[list[dict[str, Any]], set[str]]:
+def _hot_words(
+    records: list[tuple[str, Mapping[str, Any]]],
+) -> tuple[list[dict[str, Any]], set[str]]:
     values = _field_values(records, "hot_words")
     counts: defaultdict[str, float] = defaultdict(float)
     platforms: set[str] = set()
@@ -207,10 +217,7 @@ def _hot_words(records: list[tuple[str, Mapping[str, Any]]]) -> tuple[list[dict[
             if number is not None and term:
                 counts[term] += number
                 platforms.add(platform)
-    items = [
-        {"term": term, "count": _rounded(count)}
-        for term, count in counts.items()
-    ]
+    items = [{"term": term, "count": _rounded(count)} for term, count in counts.items()]
     items.sort(key=lambda item: (-float(item["count"]), item["term"]))
     return items[:_TOP_HOT_WORDS], platforms
 
@@ -262,18 +269,26 @@ def _exposure_trend(records: list[tuple[str, Mapping[str, Any]]]) -> list[dict[s
     totals: defaultdict[str, float] = defaultdict(float)
     platforms: defaultdict[str, set[str]] = defaultdict(set)
     for platform, fields in records:
-        exposure = _number(fields.get("exposure"))
+        exposure = fields.get("exposure")
         published = fields.get("published_at")
-        if exposure is None or published in (None, "", []):
-            continue
-        dates = published if isinstance(published, list) else [published]
-        dates = [str(item)[:10] for item in dates if str(item)[:10]]
-        if not dates:
-            continue
-        share = exposure / len(dates)
-        for date in dates:
-            totals[date] += share
-            platforms[date].add(platform)
+        pairs: list[tuple[Any, Any]] = []
+        if isinstance(exposure, Mapping):
+            # Explicit date -> exposure pairs are self-describing and safe to
+            # aggregate even when no separate publication field is supplied.
+            pairs = list(exposure.items())
+        elif isinstance(published, str):
+            value = _number(exposure)
+            if value is not None:
+                pairs = [(published, value)]
+        elif isinstance(published, list) and isinstance(exposure, list):
+            if len(published) == len(exposure):
+                pairs = list(zip(published, exposure, strict=True))
+        for raw_date, raw_exposure in pairs:
+            date = str(raw_date)[:10]
+            value = _number(raw_exposure)
+            if date and value is not None:
+                totals[date] += value
+                platforms[date].add(platform)
     return [
         {
             "date": date,
