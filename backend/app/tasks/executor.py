@@ -311,12 +311,30 @@ class TaskExecutor:
             await self.checkpoint("after_bi")
             if self.artifacts is not None:
                 await self.artifacts.stream_summary(task.id)
+            # Follow-up suggestions are deliberately prepared before the task
+            # enters a terminal state, but the model call itself happens only
+            # after the terminal transition has been committed.
+            prepare_followups = getattr(self.artifacts, "prepare_followups", None)
+            if prepare_followups is not None:
+                try:
+                    await prepare_followups(task.id)
+                except Exception:
+                    # A suggestion metadata write is optional and must never
+                    # turn an otherwise successful analysis into a failure.
+                    pass
             if partial_failure:
                 await self.repository.mark_completed_with_warnings(
                     task.id, self.worker_id, "mcp_partial_failure", "部分社媒渠道查询失败，已保留可用结果。"
                 )
             else:
                 await self.repository.mark_completed(task.id, self.worker_id)
+            generate_followups = getattr(self.artifacts, "generate_followups", None)
+            if generate_followups is not None:
+                try:
+                    await generate_followups(task.id)
+                except Exception:
+                    # Follow-up generation is non-fatal by design.
+                    pass
         except asyncio.CancelledError:
             await self.repository.mark_interrupted(task.id, self.worker_id)
             raise

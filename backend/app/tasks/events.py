@@ -7,6 +7,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.tasks.models import AnalysisTask, TaskEvent
 from app.tasks.repository import TaskRepository
+from app.workspace.models import Message
+from sqlalchemy import select
 
 
 class TaskEventBroker:
@@ -78,7 +80,8 @@ class TaskEventStream:
                     seen = row.id
                     yield row
                     if row.event_type in terminal_events:
-                        return
+                        if not await self._followup_pending(task_id):
+                            return
             while True:
                 try:
                     row = await asyncio.wait_for(queue.get(), timeout=0.5)
@@ -86,7 +89,8 @@ class TaskEventStream:
                         seen = row.id
                         yield row
                         if row.event_type in terminal_events:
-                            return
+                            if not await self._followup_pending(task_id):
+                                return
                 except TimeoutError:
                     # Most task boundaries are written through repositories that
                     # do not share this process' broker. The database is the
@@ -100,6 +104,22 @@ class TaskEventStream:
                             seen = row.id
                             yield row
                             if row.event_type in terminal_events:
-                                return
+                                if not await self._followup_pending(task_id):
+                                    return
         finally:
             await self.broker.unsubscribe(task_id, queue)
+
+    async def _followup_pending(self, task_id: str) -> bool:
+        """Keep a newly completed stream open until follow-up generation settles."""
+        async with self.session_factory() as db:
+            rows = list(
+                (
+                    await db.scalars(select(Message).where(Message.role == "assistant"))
+                ).all()
+            )
+            return any(
+                message.metadata_json.get("task_id") == task_id
+                and
+                message.metadata_json.get("followup_suggestions_status") == "pending"
+                for message in rows
+            )

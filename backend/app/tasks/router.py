@@ -16,6 +16,7 @@ from app.tasks.repository import TaskRepository
 from app.tasks.schemas import TaskCreate, TaskRead
 from app.tasks.service import TaskConflictError, TaskService
 from app.tasks.executor import TaskRunner
+from app.workspace.models import Message
 
 
 router = APIRouter()
@@ -75,7 +76,8 @@ async def sse_event_chunks(
             await aclose()
 
 
-def task_read(task: AnalysisTask) -> TaskRead:
+def task_read(task: AnalysisTask, metadata: dict | None = None) -> TaskRead:
+    metadata = metadata or {}
     return TaskRead(
         id=task.id,
         session_id=task.session_id,
@@ -85,6 +87,9 @@ def task_read(task: AnalysisTask) -> TaskRead:
         error_code=task.error_code,
         error_message=task.error_message,
         latest_report_id=None,
+        followup_suggestions_status=metadata.get("followup_suggestions_status"),
+        followup_suggestions=list(metadata.get("followup_suggestions", [])),
+        followup_error=metadata.get("followup_error"),
     )
 
 
@@ -139,7 +144,8 @@ async def get_task(
         task = await TaskRepository(db).get_owned(task_id, user.id)
     except LookupError as error:
         raise task_not_found(error) from error
-    return task_read(task)
+    message = await db.get(Message, task.trigger_message_id)
+    return task_read(task, message.metadata_json if message is not None else None)
 
 
 @router.post("/tasks/{task_id}/cancel", response_model=TaskRead)

@@ -22,6 +22,7 @@ def create_app() -> FastAPI:
         async def recover_once() -> None:
             try:
                 await recovery.recover_expired()
+                await recovery.recover_pending_followups()
             except Exception:
                 # A later fixed-interval pass retries transient database faults.
                 return

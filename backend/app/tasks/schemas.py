@@ -36,6 +36,9 @@ class TaskRead(BaseModel):
     error_code: str | None
     error_message: str | None = None
     latest_report_id: str | None = None
+    followup_suggestions_status: Literal["pending", "completed", "failed"] | None = None
+    followup_suggestions: list[dict[str, str]] = Field(default_factory=list)
+    followup_error: dict[str, Any] | None = None
 
 
 class TaskEventRead(BaseModel):

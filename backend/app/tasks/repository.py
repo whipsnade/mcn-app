@@ -226,6 +226,43 @@ class TaskRepository:
         ).all()
         return tuple(rows)
 
+    async def pending_followup_task_ids(self) -> tuple[str, ...]:
+        """Find completed rounds whose post-processing model call was interrupted."""
+        tasks = list(
+            (
+                await self.db.scalars(
+                    select(AnalysisTask)
+                    .join(WorkspaceSession, WorkspaceSession.id == AnalysisTask.session_id)
+                    .where(
+                        WorkspaceSession.deleted_at.is_(None),
+                        AnalysisTask.status.in_(
+                            (TaskStatus.COMPLETED, TaskStatus.COMPLETED_WITH_WARNINGS)
+                        ),
+                    )
+                )
+            ).all()
+        )
+        result: list[str] = []
+        for task in tasks:
+            messages = list(
+                (
+                    await self.db.scalars(
+                        select(Message).where(
+                            Message.session_id == task.session_id,
+                            Message.user_id == task.user_id,
+                            Message.role == "assistant",
+                        )
+                    )
+                ).all()
+            )
+            if any(
+                message.metadata_json.get("task_id") == task.id
+                and message.metadata_json.get("followup_suggestions_status") == "pending"
+                for message in messages
+            ):
+                result.append(task.id)
+        return tuple(result)
+
     async def release_expired_unknown(self, task_id: str, observation_seconds: int) -> bool:
         """观察期过后只释放 unknown 预留，绝不重发远端调用。"""
         from app.billing.models import WalletTransaction

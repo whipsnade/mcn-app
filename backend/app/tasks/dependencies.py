@@ -23,6 +23,7 @@ from app.model.prompts import ANALYST_PROMPT, SUMMARY_PROMPT
 from app.orchestration.context import ContextBuilder
 from app.orchestration.planner import Planner
 from app.tasks.executor import TaskExecutor, TaskRunner
+from app.tasks.followups import FollowupSuggestionService
 from app.tasks.models import AnalysisTask
 from app.tasks.recovery import TaskRecovery
 from app.tasks.repository import TaskRepository
@@ -86,6 +87,7 @@ class DatabaseTaskStore:
     async def mark_failed(self, *args: Any): return await self._write("mark_failed", *args)
     async def release_lease(self, *args: Any): return await self._write("release_lease", *args)
     async def recoverable_task_ids(self): return await self._read("recoverable_task_ids")
+    async def pending_followup_task_ids(self): return await self._read("pending_followup_task_ids")
     async def release_expired_unknown(self, *args: Any):
         return await self._write("release_expired_unknown", *args)
     async def append_event(self, *args: Any): return await self._write("append_event", *args)
@@ -131,6 +133,13 @@ class _TaskArtifacts:
     def __init__(self, worker_id: str, model) -> None:
         self._worker_id = worker_id
         self._model = model
+        self._followups = FollowupSuggestionService(model)
+
+    async def prepare_followups(self, task_id: str) -> bool:
+        return await self._followups.prepare(task_id)
+
+    async def generate_followups(self, task_id: str) -> bool:
+        return await self._followups.generate(task_id)
 
     async def _profile(self, task_id: str) -> str:
         async with SessionFactory() as db:
@@ -314,7 +323,8 @@ class TaskExecutionDependencies:
     def __init__(self) -> None:
         self.store = DatabaseTaskStore()
         self.worker_id_prefix = f"inproc-{os.getpid()}"
-        self._planner = Planner(model=get_model_adapter())
+        self._model = get_model_adapter()
+        self._planner = Planner(model=self._model)
         self._transport = get_mcp_transport()
         self._arguments = _PlanArguments()
 
@@ -359,6 +369,7 @@ class TaskExecutionDependencies:
             repository=self.store,
             runner=runner,
             observation_seconds=int(get_settings().mcp_unknown_reconcile_seconds),
+            followup_generator=FollowupSuggestionService(self._model).generate,
         )
 
 
