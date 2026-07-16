@@ -26,15 +26,13 @@ class Settings(BaseSettings):
     access_token_minutes: int = 30
     refresh_token_days: int = 30
     frontend_origin: str = "http://localhost:5173"
-    model_provider: Literal["tencent_plan", "fake"] = "fake"
     tencent_plan_base_url: AnyHttpUrl = AnyHttpUrl(
         "https://tokenhub.tencentmaas.com/plan/v3"
     )
-    tencent_plan_api_key: SecretStr | None = None
-    tencent_plan_model: str = "deepseek-v4-pro"
+    tencent_plan_api_key: SecretStr
+    tencent_plan_model: Literal["deepseek-v4-pro"] = "deepseek-v4-pro"
     model_timeout_seconds: float = Field(default=60.0, gt=0)
-    mcp_provider: Literal["datatap", "fake"] = "fake"
-    datatap_mcp_token: SecretStr | None = None
+    datatap_mcp_token: SecretStr
     mcp_call_points: int = 10
     mcp_max_calls_per_task: int = 10
     mcp_unknown_reconcile_seconds: int = Field(default=300, gt=0)
@@ -61,30 +59,17 @@ class Settings(BaseSettings):
             "https://tokenhub.tencentmaas.com/plan/v3"
         ):
             raise ValueError("TENCENT_PLAN_BASE_URL must use the confirmed provider endpoint")
-        if self.tencent_plan_model != "deepseek-v4-pro":
-            raise ValueError("TENCENT_PLAN_MODEL must use the confirmed model")
         if self.mcp_call_points != 10:
             raise ValueError("MCP_CALL_POINTS must be 10")
         if self.mcp_max_calls_per_task != 10:
             raise ValueError("MCP_MAX_CALLS_PER_TASK must be 10")
 
-        if self.app_env == "production":
-            if self.auth_mode == "mock":
-                raise ValueError("AUTH_MODE=mock is forbidden in production")
-            if self.model_provider == "fake":
-                raise ValueError("MODEL_PROVIDER=fake is forbidden in production")
-            if self.mcp_provider == "fake":
-                raise ValueError("MCP_PROVIDER=fake is forbidden in production")
-            if (
-                self.tencent_plan_api_key is None
-                or not self.tencent_plan_api_key.get_secret_value().strip()
-            ):
-                raise ValueError("TENCENT_PLAN_API_KEY is required in production")
-            if (
-                self.datatap_mcp_token is None
-                or not self.datatap_mcp_token.get_secret_value().strip()
-            ):
-                raise ValueError("DATATAP_MCP_TOKEN is required in production")
+        if not self.tencent_plan_api_key.get_secret_value().strip():
+            raise ValueError("TENCENT_PLAN_API_KEY must not be blank")
+        if not self.datatap_mcp_token.get_secret_value().strip():
+            raise ValueError("DATATAP_MCP_TOKEN must not be blank")
+        if self.app_env == "production" and self.auth_mode == "mock":
+            raise ValueError("AUTH_MODE=mock is forbidden in production")
         return self
 
 
