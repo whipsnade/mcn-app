@@ -14,7 +14,6 @@ from app.core.config import get_settings
 from app.db.session import SessionFactory
 from app.identity.models import UserChannelPermission
 from app.mcp_gateway.datatap import DataTapTransport
-from app.mcp_gateway.fake import FakeMcpTransport
 from app.mcp_gateway.contracts import DataTapService
 from app.mcp_gateway.registry import ToolRegistryService
 from app.mcp_gateway.service import McpGatewayService
@@ -307,13 +306,7 @@ class _TaskArtifacts:
 
 @lru_cache
 def get_mcp_transport():
-    settings = get_settings()
-    if settings.mcp_provider == "fake":
-        return FakeMcpTransport()
-    token = settings.datatap_mcp_token
-    if token is None:
-        raise RuntimeError("DATATAP_MCP_TOKEN is required")
-    return DataTapTransport(token=token)
+    return DataTapTransport(token=get_settings().datatap_mcp_token)
 
 
 class TaskExecutionDependencies:
