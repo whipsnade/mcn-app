@@ -281,6 +281,59 @@ describe('useWorkspace', () => {
     expect(result.current.activeTaskId).toBeUndefined();
   });
 
+  it('releases only the deleted session task lock and keeps a newer session lock owned', async () => {
+    const otherSession = { ...session, id: 'session-2', title: '会话 B' };
+    const firstTask = deferred<{
+      id: string; session_id: string; status: 'pending'; estimated_points: number; error_code: null; latest_report_id: null;
+    }>();
+    const secondTask = deferred<{
+      id: string; session_id: string; status: 'pending'; estimated_points: number; error_code: null; latest_report_id: null;
+    }>();
+    vi.mocked(listSessions).mockResolvedValue([session, otherSession]);
+    vi.mocked(getSession).mockImplementation(async id => id === 'session-1' ? restoredSession : otherSession);
+    vi.mocked(createTask)
+      .mockReturnValueOnce(firstTask.promise)
+      .mockReturnValueOnce(secondTask.promise);
+    vi.mocked(deleteSession).mockResolvedValue(undefined);
+    const { result } = renderHook(() => useWorkspace('user-a'));
+    await waitFor(() => expect(result.current.activeSession?.id).toBe('session-1'));
+
+    let firstPromise!: Promise<unknown>;
+    act(() => {
+      firstPromise = result.current.appendMessage('会话 A 的在途任务');
+    });
+    await waitFor(() => expect(createTask).toHaveBeenCalledOnce());
+    await act(async () => {
+      await result.current.selectSession('session-2');
+      await result.current.deleteSession('session-1');
+    });
+
+    let secondPromise!: Promise<unknown>;
+    act(() => {
+      secondPromise = result.current.appendMessage('会话 B 的在途任务');
+      void secondPromise.catch(() => undefined);
+    });
+    await waitFor(() => expect(createTask).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      firstTask.resolve({
+        id: 'task-a', session_id: 'session-1', status: 'pending', estimated_points: 0,
+        error_code: null, latest_report_id: null,
+      });
+      await firstPromise;
+    });
+    await expect(result.current.appendMessage('会话 B 的重复任务')).rejects.toThrow('TASK_IN_PROGRESS');
+
+    await act(async () => {
+      secondTask.resolve({
+        id: 'task-b', session_id: 'session-2', status: 'pending', estimated_points: 0,
+        error_code: null, latest_report_id: null,
+      });
+      await secondPromise;
+    });
+    expect(result.current.activeTaskId).toBe('task-b');
+  });
+
   it('ignores a late retry response after its session is deleted', async () => {
     const pendingRetry = deferred<{
       id: string; session_id: string; status: 'pending'; estimated_points: number; error_code: null;
@@ -316,6 +369,54 @@ describe('useWorkspace', () => {
     expect(result.current.sessions).toEqual([]);
     expect(result.current.activeSession).toBeUndefined();
     expect(result.current.activeTaskId).toBeUndefined();
+  });
+
+  it('releases a deleted session retry lock so the selected session can submit', async () => {
+    const otherSession = { ...session, id: 'session-2', title: '会话 B' };
+    const pendingRetry = deferred<{
+      id: string; session_id: string; status: 'pending'; estimated_points: number; error_code: null;
+      error_message: null; latest_report_id: null;
+    }>();
+    vi.mocked(listSessions).mockResolvedValue([session, otherSession]);
+    vi.mocked(getSession).mockImplementation(async id => id === 'session-1' ? {
+      ...restoredSession,
+      analysis: { taskId: 'task-old', status: 'failed' },
+      messages: restoredSession.messages.map(message => ({ ...message, taskId: 'task-old' })),
+    } : otherSession);
+    vi.mocked(retryTask).mockReturnValue(pendingRetry.promise);
+    vi.mocked(createTask).mockResolvedValue({
+      id: 'task-b', session_id: 'session-2', status: 'pending', estimated_points: 0,
+      error_code: null, latest_report_id: null,
+    });
+    vi.mocked(deleteSession).mockResolvedValue(undefined);
+    const { result } = renderHook(() => useWorkspace('user-a'));
+    await waitFor(() => expect(result.current.activeTaskId).toBe('task-old'));
+
+    let retryPromise!: Promise<unknown>;
+    act(() => {
+      retryPromise = result.current.retryMessage('message-1');
+    });
+    await waitFor(() => expect(retryTask).toHaveBeenCalledOnce());
+    await act(async () => {
+      await result.current.selectSession('session-2');
+    });
+    await waitFor(() => expect(result.current.activeSession?.id).toBe('session-2'));
+    await act(async () => {
+      await result.current.deleteSession('session-1');
+      await result.current.appendMessage('会话 B 可以提交');
+    });
+
+    expect(createTask).toHaveBeenCalledWith('session-2', { content: '会话 B 可以提交' });
+    expect(result.current.activeTaskId).toBe('task-b');
+
+    await act(async () => {
+      pendingRetry.resolve({
+        id: 'task-retry-late', session_id: 'session-1', status: 'pending', estimated_points: 0,
+        error_code: null, error_message: null, latest_report_id: null,
+      });
+      await retryPromise;
+    });
+    expect(result.current.activeTaskId).toBe('task-b');
   });
 
   it('allows an older update to apply when deletion fails', async () => {

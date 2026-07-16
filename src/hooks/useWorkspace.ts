@@ -26,6 +26,11 @@ function taskIsInProgress(status: string | undefined): boolean {
   return !isTerminalTaskStatus(status);
 }
 
+interface TaskCreateLock {
+  sessionId: string;
+  token: symbol;
+}
+
 
 export function useWorkspace(userId?: string) {
   const [sessions, setSessions] = useState<Session[]>([]);
@@ -40,7 +45,7 @@ export function useWorkspace(userId?: string) {
   const activeSessionIdRef = useRef<string>();
   const deletedSessionIdsRef = useRef(new Set<string>());
   const sessionOperationEpochsRef = useRef(new Map<string, number>());
-  const taskCreateInFlightRef = useRef(false);
+  const taskCreateInFlightRef = useRef<TaskCreateLock | null>(null);
   const taskRuntime = useTaskStream(activeTaskId);
 
   const getSessionOperationEpoch = useCallback(
@@ -149,7 +154,7 @@ export function useWorkspace(userId?: string) {
     setLoading(false);
     setBusy(false);
     setActiveTaskId(undefined);
-    taskCreateInFlightRef.current = false;
+    taskCreateInFlightRef.current = null;
     if (userId) void load(generation);
     return () => {
       if (generationRef.current === generation) generationRef.current += 1;
@@ -274,10 +279,13 @@ export function useWorkspace(userId?: string) {
       sessionsRef.current = remainingSessions;
       setSessions(remainingSessions);
 
+      if (taskCreateInFlightRef.current?.sessionId === id) {
+        taskCreateInFlightRef.current = null;
+      }
+
       if (activeSessionIdRef.current !== id) return;
 
       selectionRequestRef.current += 1;
-      taskCreateInFlightRef.current = false;
       setActiveTaskId(undefined);
       const nextSession = remainingSessions[0];
       if (!nextSession) {
@@ -308,7 +316,11 @@ export function useWorkspace(userId?: string) {
     const generation = generationRef.current;
     const requestedSessionId = activeSessionId;
     const operationEpoch = getSessionOperationEpoch(requestedSessionId);
-    taskCreateInFlightRef.current = true;
+    const taskCreateLock: TaskCreateLock = {
+      sessionId: requestedSessionId,
+      token: Symbol(requestedSessionId),
+    };
+    taskCreateInFlightRef.current = taskCreateLock;
     setBusy(true);
     setError(undefined);
     try {
@@ -339,8 +351,8 @@ export function useWorkspace(userId?: string) {
       }
       throw reason;
     } finally {
-      if (sessionOperationIsCurrent(requestedSessionId, operationEpoch)) {
-        taskCreateInFlightRef.current = false;
+      if (taskCreateInFlightRef.current?.token === taskCreateLock.token) {
+        taskCreateInFlightRef.current = null;
         if (generationRef.current === generation) setBusy(false);
       }
     }
@@ -354,7 +366,11 @@ export function useWorkspace(userId?: string) {
     if (!activeSession || !message?.taskId) throw new Error('RETRY_TASK_NOT_FOUND');
     const generation = generationRef.current;
     const operationEpoch = getSessionOperationEpoch(activeSession.id);
-    taskCreateInFlightRef.current = true;
+    const taskCreateLock: TaskCreateLock = {
+      sessionId: activeSession.id,
+      token: Symbol(activeSession.id),
+    };
+    taskCreateInFlightRef.current = taskCreateLock;
     setBusy(true);
     setError(undefined);
     try {
@@ -380,8 +396,8 @@ export function useWorkspace(userId?: string) {
       }
       throw reason;
     } finally {
-      if (sessionOperationIsCurrent(activeSession.id, operationEpoch)) {
-        taskCreateInFlightRef.current = false;
+      if (taskCreateInFlightRef.current?.token === taskCreateLock.token) {
+        taskCreateInFlightRef.current = null;
         if (generationRef.current === generation) setBusy(false);
       }
     }
