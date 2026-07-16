@@ -1,5 +1,27 @@
 import pytest
 
+from app.workspace import service as workspace_service
+
+
+def _session_payload(**overrides):
+    payload = {
+        "brand": "示例品牌",
+        "campaign_name": "夏季项目",
+        "platforms": ["xiaohongshu"],
+        "category": "美妆",
+        "target_audience": "年轻女性",
+        "initial_query": "寻找高互动达人",
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_default_session_title_has_unnamed_fallback() -> None:
+    title_builder = getattr(workspace_service, "default_session_title", None)
+
+    assert callable(title_builder)
+    assert title_builder("", None, "") == "未命名会话"
+
 
 @pytest.mark.asyncio
 async def test_session_history_is_owned_and_restorable(auth_client_factory) -> None:
@@ -133,3 +155,57 @@ async def test_list_patch_and_star_only_affect_owner(auth_client_factory) -> Non
             f"/api/v1/sessions/{session_id}", json={"title": "越权修改"}
         )
     ).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_delete_session_is_idempotent_and_hides_all_workspace_routes(
+    auth_client_factory,
+) -> None:
+    owner = await auth_client_factory("13700000011")
+    outsider = await auth_client_factory("13700000012")
+    created = await owner.post("/api/v1/sessions", json=_session_payload())
+    session_id = created.json()["id"]
+
+    assert (await outsider.delete(f"/api/v1/sessions/{session_id}")).status_code == 404
+    assert (await owner.delete(f"/api/v1/sessions/{session_id}")).status_code == 204
+    assert (await owner.delete(f"/api/v1/sessions/{session_id}")).status_code == 204
+
+    assert (await owner.get("/api/v1/sessions")).json() == []
+    assert (await owner.get(f"/api/v1/sessions/{session_id}")).status_code == 404
+    assert (
+        await owner.patch(f"/api/v1/sessions/{session_id}", json={"title": "不可见"})
+    ).status_code == 404
+    assert (
+        await owner.post(
+            f"/api/v1/sessions/{session_id}/messages",
+            json={"content": "删除后不可追加"},
+        )
+    ).status_code == 404
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("phone", "brand", "campaign_name", "category", "expected_title"),
+    [
+        ("13600000051", "品牌甲", "项目乙", "美妆", "品牌甲-项目乙"),
+        ("13600000052", "品牌甲", None, "美妆", "品牌甲"),
+        ("13600000053", "", "项目乙", "美妆", "项目乙"),
+        ("13600000054", "", None, "美妆", "美妆 KOL 分析"),
+    ],
+)
+async def test_default_session_title_is_stable_and_not_derived_from_query(
+    auth_client_factory, phone, brand, campaign_name, category, expected_title
+) -> None:
+    client = await auth_client_factory(phone)
+
+    first = await client.post(
+        "/api/v1/sessions",
+        json=_session_payload(
+            brand=brand,
+            campaign_name=campaign_name,
+            category=category,
+            initial_query="第一条完全不同的任务内容",
+        ),
+    )
+    assert first.status_code == 201
+    assert first.json()["title"] == expected_title

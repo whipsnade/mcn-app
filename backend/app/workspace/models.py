@@ -13,6 +13,12 @@ class WorkspaceSession(Base):
     __tablename__ = "sessions"
     __table_args__ = (
         Index("ix_sessions_user_last_accessed", "user_id", "last_accessed_at"),
+        Index(
+            "ix_sessions_user_deleted_last_accessed",
+            "user_id",
+            "deleted_at",
+            "last_accessed_at",
+        ),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
@@ -31,6 +37,7 @@ class WorkspaceSession(Base):
     filters_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     is_starred: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     last_accessed_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 

@@ -1,6 +1,6 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -151,6 +151,21 @@ async def update_session(
     except LookupError as error:
         raise not_found(error) from error
     return await session_read(service, workspace, include_messages=True)
+
+
+@router.delete("/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_session(
+    session_id: str,
+    user: CurrentUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> Response:
+    service = WorkspaceService(db)
+    try:
+        await service.delete_session(user.id, session_id)
+    except LookupError as error:
+        raise not_found(error) from error
+    await db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.post("/{session_id}/messages", response_model=MessageRead, status_code=201)

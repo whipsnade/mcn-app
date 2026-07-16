@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.tasks.models import AnalysisTask, TaskEvent
 from app.tasks.errors import SafeTaskError, safe_error
 from app.tasks.state import TERMINAL_TASK_STATUSES, TaskEventType, TaskStatus
-from app.workspace.models import Message
+from app.workspace.models import Message, WorkspaceSession
 
 
 def utc_now() -> datetime:
@@ -22,9 +22,12 @@ class TaskRepository:
 
     async def get_owned(self, task_id: str, user_id: str) -> AnalysisTask:
         task = await self.db.scalar(
-            select(AnalysisTask).where(
+            select(AnalysisTask)
+            .join(WorkspaceSession, WorkspaceSession.id == AnalysisTask.session_id)
+            .where(
                 AnalysisTask.id == task_id,
                 AnalysisTask.user_id == user_id,
+                WorkspaceSession.deleted_at.is_(None),
             )
         )
         if task is None:

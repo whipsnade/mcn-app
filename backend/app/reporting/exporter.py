@@ -57,7 +57,13 @@ async def export_latest_task_xlsx(
         raise LookupError("session_not_found")
     if not rows:
         raise LookupError("no_candidate_pool")
-    session = await db.scalar(select(WorkspaceSession).where(WorkspaceSession.id == session_id))
+    session = await db.scalar(
+        select(WorkspaceSession).where(
+            WorkspaceSession.id == session_id,
+            WorkspaceSession.user_id == user_id,
+            WorkspaceSession.deleted_at.is_(None),
+        )
+    )
     if session is None:
         raise LookupError("session_not_found")
     candidates = [_export_candidate(item, kol, snapshot) for item, kol, snapshot in rows]

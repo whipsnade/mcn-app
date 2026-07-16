@@ -31,3 +31,12 @@ def test_phase_two_tables_are_registered() -> None:
         "bi_reports",
         "user_kol_favorites",
     }.issubset(Base.metadata.tables)
+
+
+def test_sessions_register_soft_delete_column_and_visibility_index() -> None:
+    sessions = Base.metadata.tables["sessions"]
+
+    assert sessions.c.deleted_at.nullable is True
+    assert ("user_id", "deleted_at", "last_accessed_at") in {
+        tuple(column.name for column in index.columns) for index in sessions.indexes
+    }

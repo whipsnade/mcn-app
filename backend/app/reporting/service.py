@@ -29,6 +29,7 @@ from app.reporting.schemas import AnalystConclusion, CandidateVersion, Candidate
 from app.reporting.scoring import SCORE_VERSION, score_candidate
 from app.tasks.models import AnalysisTask, TaskEvent
 from app.tasks.state import TaskEventType
+from app.workspace.models import WorkspaceSession
 
 
 _FINAL_CANDIDATE_LIMIT = 10
@@ -315,7 +316,12 @@ class ReportingService:
         report = await self._db.scalar(
             select(BiReport)
             .join(AnalysisTask, AnalysisTask.id == BiReport.task_id)
-            .where(BiReport.id == report_id, AnalysisTask.user_id == user_id)
+            .join(WorkspaceSession, WorkspaceSession.id == AnalysisTask.session_id)
+            .where(
+                BiReport.id == report_id,
+                AnalysisTask.user_id == user_id,
+                WorkspaceSession.deleted_at.is_(None),
+            )
         )
         if report is None:
             raise LookupError("report_not_found")
@@ -395,7 +401,12 @@ class ReportingService:
     ) -> tuple[AnalysisTask | None, int | None, int, BiReport | None]:
         task = await self._db.scalar(
             select(AnalysisTask)
-            .where(AnalysisTask.user_id == user_id, AnalysisTask.session_id == session_id)
+            .join(WorkspaceSession, WorkspaceSession.id == AnalysisTask.session_id)
+            .where(
+                AnalysisTask.user_id == user_id,
+                AnalysisTask.session_id == session_id,
+                WorkspaceSession.deleted_at.is_(None),
+            )
             .order_by(AnalysisTask.created_at.desc())
         )
         if task is None:
@@ -428,7 +439,12 @@ class ReportingService:
     ]:
         task = await self._db.scalar(
             select(AnalysisTask)
-            .where(AnalysisTask.user_id == user_id, AnalysisTask.session_id == session_id)
+            .join(WorkspaceSession, WorkspaceSession.id == AnalysisTask.session_id)
+            .where(
+                AnalysisTask.user_id == user_id,
+                AnalysisTask.session_id == session_id,
+                WorkspaceSession.deleted_at.is_(None),
+            )
             .order_by(AnalysisTask.created_at.desc())
         )
         if task is None:
@@ -558,7 +574,13 @@ class ReportingService:
 
     async def _owned_task(self, user_id: str, task_id: str) -> AnalysisTask:
         task = await self._db.scalar(
-            select(AnalysisTask).where(AnalysisTask.id == task_id, AnalysisTask.user_id == user_id)
+            select(AnalysisTask)
+            .join(WorkspaceSession, WorkspaceSession.id == AnalysisTask.session_id)
+            .where(
+                AnalysisTask.id == task_id,
+                AnalysisTask.user_id == user_id,
+                WorkspaceSession.deleted_at.is_(None),
+            )
         )
         if task is None:
             raise LookupError("task_not_found")

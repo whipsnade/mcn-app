@@ -1,9 +1,15 @@
 from types import SimpleNamespace
 
+from datetime import UTC, datetime
+from decimal import Decimal
+from uuid import uuid4
+
 import pytest
 from fastapi import HTTPException
 
 from app.reporting import router as reporting_router
+from app.reporting.models import Kol, KolSnapshot, TaskCandidate
+from app.tasks.models import AnalysisTask
 
 
 def test_content_disposition_quotes_utf8_filename() -> None:
@@ -85,3 +91,67 @@ async def test_latest_export_accepts_legacy_candidate_rows_without_pool(monkeypa
     )
 
     assert response.media_type == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+@pytest.mark.asyncio
+async def test_latest_export_hides_deleted_session(auth_client_factory, db_session) -> None:
+    client = await auth_client_factory("13300000041")
+    created = await client.post(
+        "/api/v1/sessions",
+        json={
+            "brand": "导出隔离品牌",
+            "campaign_name": "软删除",
+            "platforms": ["xiaohongshu"],
+            "category": "美妆",
+            "target_audience": "年轻女性",
+            "initial_query": "创建导出任务",
+        },
+    )
+    session_id = created.json()["id"]
+    task_id = created.json()["latest_task"]["id"]
+    now = datetime.now(UTC).replace(tzinfo=None)
+    kol_id = str(uuid4())
+    snapshot_id = str(uuid4())
+    db_session.add_all(
+        [
+            Kol(
+                id=kol_id,
+                platform="xiaohongshu",
+                platform_account_id=f"export-{kol_id}",
+                normalized_profile_url=None,
+                created_at=now,
+                updated_at=now,
+            ),
+            KolSnapshot(
+                id=snapshot_id,
+                kol_id=kol_id,
+                source_mcp_call_id=None,
+                normalized_json={"nickname": "导出达人", "followers": 1000},
+                collected_at=now,
+                created_at=now,
+            ),
+            TaskCandidate(
+                id=str(uuid4()),
+                task_id=task_id,
+                kol_id=kol_id,
+                snapshot_id=snapshot_id,
+                candidate_version=1,
+                total_score=Decimal("80.000"),
+                score_breakdown_json={"dimensions": {}},
+                rank=1,
+                matched_conditions_json=[],
+                risk_flags_json=[],
+                recommendation_text="推荐",
+                evidence_json={},
+                created_at=now,
+            ),
+        ]
+    )
+    task = await db_session.get(AnalysisTask, task_id)
+    task.status = "completed"
+    task.completed_at = now
+    await db_session.flush()
+
+    assert (await client.delete(f"/api/v1/sessions/{session_id}")).status_code == 204
+    response = await client.get(f"/api/v1/sessions/{session_id}/exports/latest.xlsx")
+    assert response.status_code == 404

@@ -12,6 +12,21 @@ def utc_now() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
 
 
+def default_session_title(brand: str, campaign_name: str | None, category: str) -> str:
+    normalized_brand = brand.strip()
+    normalized_campaign = campaign_name.strip() if campaign_name else ""
+    normalized_category = category.strip()
+    if normalized_brand and normalized_campaign:
+        return f"{normalized_brand}-{normalized_campaign}"
+    if normalized_brand:
+        return normalized_brand
+    if normalized_campaign:
+        return normalized_campaign
+    if normalized_category:
+        return f"{normalized_category} KOL 分析"
+    return "未命名会话"
+
+
 class WorkspaceService:
     def __init__(self, db: AsyncSession) -> None:
         self.db = db
@@ -22,6 +37,7 @@ class WorkspaceService:
         statement = select(WorkspaceSession).where(
             WorkspaceSession.id == session_id,
             WorkspaceSession.user_id == user_id,
+            WorkspaceSession.deleted_at.is_(None),
         )
         if for_update:
             statement = statement.with_for_update()
@@ -33,7 +49,10 @@ class WorkspaceService:
     async def list_sessions(self, user_id: str) -> list[WorkspaceSession]:
         statement = (
             select(WorkspaceSession)
-            .where(WorkspaceSession.user_id == user_id)
+            .where(
+                WorkspaceSession.user_id == user_id,
+                WorkspaceSession.deleted_at.is_(None),
+            )
             .order_by(WorkspaceSession.last_accessed_at.desc())
         )
         return list((await self.db.scalars(statement)).all())
@@ -49,11 +68,7 @@ class WorkspaceService:
 
     async def create_session(self, user_id: str, payload: SessionCreate) -> WorkspaceSession:
         now = utc_now()
-        title = (
-            f"{payload.brand}-{payload.campaign_name}"
-            if payload.brand and payload.campaign_name
-            else payload.brand or payload.campaign_name or f"{payload.category} KOL 筛选"
-        )
+        title = default_session_title(payload.brand, payload.campaign_name, payload.category)
         workspace = WorkspaceSession(
             id=str(uuid4()),
             user_id=user_id,
@@ -88,6 +103,23 @@ class WorkspaceService:
         )
         await self.db.flush()
         return workspace
+
+    async def delete_session(self, user_id: str, session_id: str) -> None:
+        workspace = await self.db.scalar(
+            select(WorkspaceSession)
+            .where(
+                WorkspaceSession.id == session_id,
+                WorkspaceSession.user_id == user_id,
+            )
+            .with_for_update()
+        )
+        if workspace is None:
+            raise LookupError("session_not_found")
+        if workspace.deleted_at is None:
+            now = utc_now()
+            workspace.deleted_at = now
+            workspace.updated_at = now
+            await self.db.flush()
 
     async def append_message(
         self, user_id: str, session_id: str, payload: MessageCreate
