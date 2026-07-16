@@ -52,6 +52,11 @@ _INTERNAL_PATH_PATTERN = re.compile(
     r"(?:^|[/\\])(?:api|internal)(?:[/\\]|$)",
     re.IGNORECASE,
 )
+_URI_SCHEME_PATTERN = re.compile(r"^[a-z][a-z0-9+.-]*:", re.IGNORECASE)
+_ABSOLUTE_PATH_PATTERN = re.compile(
+    r"^(?:/|\\\\|[a-z]:[/\\])",
+    re.IGNORECASE,
+)
 _MAX_NUMERIC_TEXT_LENGTH = 64
 _MAX_DECIMAL_ADJUSTED_EXPONENT = 18
 _MAX_GENERAL_NUMBER = Decimal("1000000000000000")
@@ -740,6 +745,8 @@ def _safe_term(value: Any) -> str:
         or len(term) > 100
         or _CREDENTIAL_VALUE_PATTERN.fullmatch(term)
         or _INTERNAL_PATH_PATTERN.search(term)
+        or _URI_SCHEME_PATTERN.match(term)
+        or _ABSOLUTE_PATH_PATTERN.match(term)
         or redact_evidence_for_storage(term) in ({}, _DROP)
     ):
         raise ValueError("invalid_hot_word")

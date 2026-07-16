@@ -504,3 +504,39 @@ def test_hot_words_filter_credentials_and_distribution_rejects_secret_label() ->
     assert candidate.analytics_fields["hot_words"] == ["安全热词"]
     assert "audience_age" not in candidate.analytics_fields
     assert candidate.analytics_fields["audience_regions"] == {"浙江": 20}
+
+
+@pytest.mark.parametrize(
+    "unsafe_term",
+    [
+        pytest.param("ftp://files.example.test/archive", id="ftp_uri"),
+        pytest.param("file:///tmp/private.txt", id="file_uri"),
+        pytest.param("ws://socket.example.test/events", id="websocket_uri"),
+        pytest.param("//cdn.example.test/path", id="protocol_relative_url"),
+        pytest.param("/etc/passwd", id="absolute_file_path"),
+        pytest.param("C:\\Windows\\private.ini", id="windows_absolute_file_path"),
+        pytest.param("\\\\server\\share\\private.txt", id="windows_unc_path"),
+    ],
+)
+def test_uri_and_absolute_paths_never_enter_hot_words_or_audience_labels(
+    unsafe_term: str,
+) -> None:
+    item = evidence(
+        "creator.search.v1",
+        {
+            "platform": "bilibili",
+            "account_id": "creator-uri-labels",
+            "profile_url": "https://public.example.test/creator-uri-labels",
+            "keywords": [unsafe_term, "安全热词"],
+            "age_distribution": {unsafe_term: 40},
+            "region_distribution": {"浙江": 20},
+        },
+        "call-uri-labels",
+    )
+
+    [candidate] = normalize_tool_evidence([item])
+
+    assert candidate.normalized_profile_url == "https://public.example.test/creator-uri-labels"
+    assert candidate.analytics_fields["hot_words"] == ["安全热词"]
+    assert "audience_age" not in candidate.analytics_fields
+    assert candidate.analytics_fields["audience_regions"] == {"浙江": 20}
