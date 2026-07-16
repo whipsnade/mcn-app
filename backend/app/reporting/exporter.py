@@ -299,8 +299,9 @@ def _render_detail_standard_blocks(sheet: Any, metadata: dict[str, Any], candida
         start = 1 + index * block_size
         for offset in range(block_size):
             row = start + offset
-            if base_heights[offset] is not None:
-                sheet.row_dimensions[row].height = base_heights[offset]
+            # Assign even ``None`` so historical explicit heights on the
+            # attachment's later blocks cannot leak into the standard block.
+            sheet.row_dimensions[row].height = base_heights[offset]
             for column in range(1, 7):
                 sheet.cell(row, column)._style = copy(base_styles[(offset, column)])
 

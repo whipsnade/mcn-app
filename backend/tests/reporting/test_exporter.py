@@ -139,6 +139,19 @@ def test_detail_blocks_rebuild_standard_merges_at_late_and_dynamic_rows() -> Non
         assert detail.cell(start + 29, 2).value is None
 
 
+def test_detail_blocks_copy_complete_standard_row_height_matrix() -> None:
+    content = render_workbook(
+        metadata={"brand": "详情行高测试", "category": "餐饮", "generated_at": "2026-07-16"},
+        candidates=[_candidate(index) for index in range(1, 81)],
+    )
+    workbook = load_workbook(BytesIO(content), read_only=False, data_only=False)
+    detail = workbook["达人详细画像"]
+    base_heights = [detail.row_dimensions[1 + offset].height for offset in range(31)]
+    for start in (1, 218, 249, 2450):
+        actual = [detail.row_dimensions[start + offset].height for offset in range(31)]
+        assert actual == base_heights
+
+
 def test_export_candidate_keeps_public_profile_url_and_platform() -> None:
     candidate = _candidate(1)
     candidate = ExportCandidate(**{**candidate.__dict__, "profile_url": "https://example.com/达人1"})
