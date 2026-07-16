@@ -117,3 +117,29 @@ def test_safe_followup_error_uses_whitelisted_code_and_safe_diagnostics() -> Non
     error = safe_followup_error(ValueError("sk-secret"), stage="model")
     assert error["error_code"] == "FOLLOWUP_GENERATION_FAILED"
     assert "sk-secret" not in str(error)
+
+
+def test_task_read_prefers_persisted_assistant_metadata_fields() -> None:
+    from types import SimpleNamespace
+
+    from app.tasks.router import task_read
+
+    task = SimpleNamespace(
+        id="task-1",
+        session_id="session-1",
+        trigger_message_id="user-message",
+        status="completed",
+        estimated_points=10,
+        error_code=None,
+        error_message=None,
+    )
+    result = task_read(
+        task,
+        {
+            "task_id": "task-1",
+            "followup_suggestions_status": "completed",
+            "followup_suggestions": [_suggestion(1)],
+        },
+    )
+    assert result.followup_suggestions_status == "completed"
+    assert result.followup_suggestions[0]["title"].startswith("受众地域")
