@@ -439,7 +439,11 @@ class ReportingService:
             .order_by(TaskCandidatePool.pool_version.desc())
         )
         if pool is None:
-            return task, None, []
+            # 兼容导出候选池上线前已完成的任务：候选版本仍是同一任务的数据源。
+            version = await self._latest_candidate_version(task.id)
+            if version is None:
+                return task, None, []
+            return task, None, await self._candidate_rows(task.id, version)
         rows = list(
             (
                 await self._db.execute(

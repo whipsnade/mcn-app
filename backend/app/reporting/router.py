@@ -124,7 +124,7 @@ async def export_latest_session(
     if task.status not in {
         TaskStatus.COMPLETED.value,
         TaskStatus.COMPLETED_WITH_WARNINGS.value,
-    } or pool is None or not rows:
+    } or not rows:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="no_candidate_pool")
     exported = await export_latest_task_xlsx(db, user.id, session_id)
     return StreamingResponse(

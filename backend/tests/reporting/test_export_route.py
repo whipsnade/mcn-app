@@ -60,3 +60,28 @@ async def test_latest_export_rejects_running_task(monkeypatch) -> None:
             "session-1", SimpleNamespace(id="user-1"), object()
         )
     assert error.value.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_latest_export_accepts_legacy_candidate_rows_without_pool(monkeypatch) -> None:
+    task = SimpleNamespace(status="completed")
+    rows = [(object(), object(), object())]
+
+    class FakeService:
+        def __init__(self, db):
+            self.db = db
+
+        async def latest_candidate_pool(self, user_id, session_id):
+            return task, None, rows
+
+    async def fake_export(db, user_id, session_id):
+        return SimpleNamespace(content=b"xlsx", filename="品牌_KOL匹配度分析.xlsx")
+
+    monkeypatch.setattr(reporting_router, "ReportingService", FakeService)
+    monkeypatch.setattr(reporting_router, "export_latest_task_xlsx", fake_export)
+
+    response = await reporting_router.export_latest_session(
+        "session-1", SimpleNamespace(id="user-1"), object()
+    )
+
+    assert response.media_type == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"

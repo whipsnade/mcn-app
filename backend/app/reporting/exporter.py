@@ -14,6 +14,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.orchestration.export_contract import EXPORT_FIELD_CONTRACT_VERSION
 from app.reporting.models import Kol, KolSnapshot, TaskCandidatePoolItem
 from app.reporting.service import ReportingService
 from app.workspace.models import WorkspaceSession
@@ -54,7 +55,7 @@ async def export_latest_task_xlsx(
     task, pool, rows = await service.latest_candidate_pool(user_id, session_id)
     if task is None:
         raise LookupError("session_not_found")
-    if pool is None or not rows:
+    if not rows:
         raise LookupError("no_candidate_pool")
     session = await db.scalar(select(WorkspaceSession).where(WorkspaceSession.id == session_id))
     if session is None:
@@ -66,7 +67,9 @@ async def export_latest_task_xlsx(
         "target_audience": session.target_audience,
         "locations": session.filters_snapshot.get("target_fan_locations", []),
         "generated_at": task.completed_at or task.updated_at,
-        "field_contract_version": pool.field_contract_version,
+        "field_contract_version": (
+            pool.field_contract_version if pool is not None else EXPORT_FIELD_CONTRACT_VERSION
+        ),
     }
     generated_at = metadata["generated_at"]
     stamp = generated_at.strftime("%Y%m%d_%H%M") if isinstance(generated_at, datetime) else "latest"
@@ -96,7 +99,7 @@ def _export_candidate(item: TaskCandidatePoolItem, kol: Kol, snapshot: KolSnapsh
     values.setdefault("content_tags", "数据缺失")
     rating, stars = _rating(float(item.total_score))
     return ExportCandidate(
-        rank=item.full_rank,
+        rank=getattr(item, "full_rank", None) or getattr(item, "rank", 0),
         platform=kol.platform,
         nickname=str(normalized.get("nickname") or "未命名达人"),
         followers=normalized.get("followers"),
