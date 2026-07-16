@@ -38,21 +38,43 @@ export function useWorkspace(userId?: string) {
   const selectionRequestRef = useRef(0);
   const sessionsRef = useRef<Session[]>([]);
   const activeSessionIdRef = useRef<string>();
+  const deletedSessionIdsRef = useRef(new Set<string>());
+  const sessionOperationEpochsRef = useRef(new Map<string, number>());
   const taskCreateInFlightRef = useRef(false);
   const taskRuntime = useTaskStream(activeTaskId);
+
+  const getSessionOperationEpoch = useCallback(
+    (id: string) => sessionOperationEpochsRef.current.get(id) ?? 0,
+    [],
+  );
+  const sessionOperationIsCurrent = useCallback((id: string, epoch: number) => (
+    !deletedSessionIdsRef.current.has(id)
+    && (sessionOperationEpochsRef.current.get(id) ?? 0) === epoch
+  ), []);
 
   useEffect(() => {
     sessionsRef.current = sessions;
   }, [sessions]);
 
-  const hydrateAnalysis = useCallback(async (session: Session, generation: number): Promise<Session> => {
+  const hydrateAnalysis = useCallback(async (
+    session: Session,
+    generation: number,
+    operationEpoch = getSessionOperationEpoch(session.id),
+  ): Promise<Session> => {
     const analysis = session.analysis;
-    if (!analysis || generationRef.current !== generation) return session;
+    if (
+      !analysis
+      || generationRef.current !== generation
+      || !sessionOperationIsCurrent(session.id, operationEpoch)
+    ) return session;
     const [candidatePage, report] = await Promise.all([
       analysis.candidateVersion === undefined ? Promise.resolve(undefined) : getCandidates(analysis.taskId),
       analysis.reportId === undefined ? Promise.resolve(undefined) : getReport(analysis.reportId),
     ]);
-    if (generationRef.current !== generation) return session;
+    if (
+      generationRef.current !== generation
+      || !sessionOperationIsCurrent(session.id, operationEpoch)
+    ) return session;
     const resolvedCandidateVersion = candidatePage?.version ?? analysis.candidateVersion;
     const matchingReport = report?.candidate_version === resolvedCandidateVersion ? report : undefined;
     return {
@@ -79,22 +101,32 @@ export function useWorkspace(userId?: string) {
       })),
       biReport: matchingReport,
     };
-  }, []);
+  }, [getSessionOperationEpoch, sessionOperationIsCurrent]);
 
   const load = useCallback(async (generation: number) => {
     setLoading(true);
     setError(undefined);
     try {
-      const loaded = await listSessions();
-      const rawFirst = loaded[0] ? await getSession(loaded[0].id) : undefined;
-      const first = rawFirst ? await hydrateAnalysis(rawFirst, generation) : undefined;
+      const loaded = (await listSessions()).filter(session => !deletedSessionIdsRef.current.has(session.id));
+      const firstSummary = loaded[0];
+      const firstEpoch = firstSummary ? getSessionOperationEpoch(firstSummary.id) : undefined;
+      const rawFirst = firstSummary ? await getSession(firstSummary.id) : undefined;
+      const hydratedFirst = rawFirst && firstEpoch !== undefined
+        ? await hydrateAnalysis(rawFirst, generation, firstEpoch)
+        : undefined;
       if (generationRef.current !== generation) return;
-      const nextSessions = first ? replaceSession(loaded, first) : loaded;
+      const availableSessions = loaded.filter(session => !deletedSessionIdsRef.current.has(session.id));
+      const first = hydratedFirst && firstEpoch !== undefined
+        && sessionOperationIsCurrent(hydratedFirst.id, firstEpoch)
+        ? hydratedFirst
+        : undefined;
+      const nextSessions = first ? replaceSession(availableSessions, first) : availableSessions;
+      const nextActiveSession = first ?? nextSessions[0];
       sessionsRef.current = nextSessions;
-      activeSessionIdRef.current = first?.id;
+      activeSessionIdRef.current = nextActiveSession?.id;
       setSessions(nextSessions);
-      setActiveSessionId(first?.id);
-      setActiveTaskId(first?.analysis?.taskId);
+      setActiveSessionId(nextActiveSession?.id);
+      setActiveTaskId(nextActiveSession?.analysis?.taskId);
     } catch (reason) {
       if (generationRef.current === generation) {
         setError(reason instanceof Error ? reason.message : '加载会话失败');
@@ -102,13 +134,15 @@ export function useWorkspace(userId?: string) {
     } finally {
       if (generationRef.current === generation) setLoading(false);
     }
-  }, [hydrateAnalysis]);
+  }, [getSessionOperationEpoch, hydrateAnalysis, sessionOperationIsCurrent]);
 
   useEffect(() => {
     const generation = ++generationRef.current;
     selectionRequestRef.current += 1;
     sessionsRef.current = [];
     activeSessionIdRef.current = undefined;
+    deletedSessionIdsRef.current.clear();
+    sessionOperationEpochsRef.current.clear();
     setSessions([]);
     setActiveSessionId(undefined);
     setError(undefined);
@@ -130,17 +164,20 @@ export function useWorkspace(userId?: string) {
   const selectSession = useCallback(async (id: string) => {
     if (!userId) return;
     const generation = generationRef.current;
+    const operationEpoch = getSessionOperationEpoch(id);
+    if (!sessionOperationIsCurrent(id, operationEpoch)) return;
     const selectionRequest = ++selectionRequestRef.current;
     activeSessionIdRef.current = id;
     setActiveSessionId(id);
     setActiveTaskId(undefined);
     setError(undefined);
     try {
-      const loaded = await hydrateAnalysis(await getSession(id), generation);
+      const loaded = await hydrateAnalysis(await getSession(id), generation, operationEpoch);
       if (
         generationRef.current === generation
         && selectionRequestRef.current === selectionRequest
         && activeSessionIdRef.current === id
+        && sessionOperationIsCurrent(id, operationEpoch)
       ) {
         setSessions(current => {
           const nextSessions = replaceSession(current, loaded);
@@ -154,11 +191,12 @@ export function useWorkspace(userId?: string) {
         generationRef.current === generation
         && selectionRequestRef.current === selectionRequest
         && activeSessionIdRef.current === id
+        && sessionOperationIsCurrent(id, operationEpoch)
       ) {
         setError(reason instanceof Error ? reason.message : '恢复会话失败');
       }
     }
-  }, [hydrateAnalysis, userId]);
+  }, [getSessionOperationEpoch, hydrateAnalysis, sessionOperationIsCurrent, userId]);
 
   const createSession = useCallback(async (input: CreateSessionInput) => {
     if (!userId) throw new Error('AUTH_EXPIRED');
@@ -191,11 +229,13 @@ export function useWorkspace(userId?: string) {
   const updateSession = useCallback(async (id: string, changes: Record<string, unknown>) => {
     if (!userId) throw new Error('AUTH_EXPIRED');
     const generation = generationRef.current;
+    const operationEpoch = getSessionOperationEpoch(id);
     setBusy(true);
     setError(undefined);
     try {
       const updated = await updateSessionRequest(id, changes);
       if (generationRef.current !== generation) throw new Error('STALE_WORKSPACE_REQUEST');
+      if (!sessionOperationIsCurrent(id, operationEpoch)) return updated;
       setSessions(current => {
         const nextSessions = replaceSession(current, updated);
         sessionsRef.current = nextSessions;
@@ -203,14 +243,20 @@ export function useWorkspace(userId?: string) {
       });
       return updated;
     } catch (reason) {
-      if (generationRef.current === generation) {
+      if (
+        generationRef.current === generation
+        && sessionOperationIsCurrent(id, operationEpoch)
+      ) {
         setError(reason instanceof Error ? reason.message : '更新会话失败');
       }
       throw reason;
     } finally {
-      if (generationRef.current === generation) setBusy(false);
+      if (
+        generationRef.current === generation
+        && sessionOperationIsCurrent(id, operationEpoch)
+      ) setBusy(false);
     }
-  }, [userId]);
+  }, [getSessionOperationEpoch, sessionOperationIsCurrent, userId]);
 
   const deleteSession = useCallback(async (id: string) => {
     if (!userId) throw new Error('AUTH_EXPIRED');
@@ -220,6 +266,9 @@ export function useWorkspace(userId?: string) {
     try {
       await deleteSessionRequest(id);
       if (generationRef.current !== generation) throw new Error('STALE_WORKSPACE_REQUEST');
+
+      deletedSessionIdsRef.current.add(id);
+      sessionOperationEpochsRef.current.set(id, getSessionOperationEpoch(id) + 1);
 
       const remainingSessions = sessionsRef.current.filter(session => session.id !== id);
       sessionsRef.current = remainingSessions;
@@ -246,7 +295,7 @@ export function useWorkspace(userId?: string) {
     } finally {
       if (generationRef.current === generation) setBusy(false);
     }
-  }, [selectSession, userId]);
+  }, [getSessionOperationEpoch, selectSession, userId]);
 
   const appendMessage = useCallback(async (content: string) => {
     if (!userId) throw new Error('AUTH_EXPIRED');
@@ -257,12 +306,15 @@ export function useWorkspace(userId?: string) {
       throw new Error('TASK_IN_PROGRESS');
     }
     const generation = generationRef.current;
+    const requestedSessionId = activeSessionId;
+    const operationEpoch = getSessionOperationEpoch(requestedSessionId);
     taskCreateInFlightRef.current = true;
     setBusy(true);
     setError(undefined);
     try {
-      const task = await createTask(activeSessionId, { content });
+      const task = await createTask(requestedSessionId, { content });
       if (generationRef.current !== generation) throw new Error('STALE_WORKSPACE_REQUEST');
+      if (!sessionOperationIsCurrent(requestedSessionId, operationEpoch)) return task;
       const pendingMessage: Message = {
         id: task.trigger_message_id ?? `pending-${task.id}`,
         sender: 'user',
@@ -270,7 +322,7 @@ export function useWorkspace(userId?: string) {
         timestamp: new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }),
         taskId: task.id,
       };
-      setSessions(current => current.map(session => session.id === activeSessionId ? {
+      setSessions(current => current.map(session => session.id === requestedSessionId ? {
         ...session,
         status: 'analyzing',
         messages: [...session.messages, pendingMessage],
@@ -279,15 +331,20 @@ export function useWorkspace(userId?: string) {
       setActiveTaskId(task.id);
       return task;
     } catch (reason) {
-      if (generationRef.current === generation) {
+      if (
+        generationRef.current === generation
+        && sessionOperationIsCurrent(requestedSessionId, operationEpoch)
+      ) {
         setError(reason instanceof Error ? reason.message : '保存消息失败');
       }
       throw reason;
     } finally {
-      taskCreateInFlightRef.current = false;
-      if (generationRef.current === generation) setBusy(false);
+      if (sessionOperationIsCurrent(requestedSessionId, operationEpoch)) {
+        taskCreateInFlightRef.current = false;
+        if (generationRef.current === generation) setBusy(false);
+      }
     }
-  }, [activeSessionId, sessions, userId]);
+  }, [activeSessionId, getSessionOperationEpoch, sessionOperationIsCurrent, sessions, userId]);
 
   const retryMessage = useCallback(async (messageId: string) => {
     if (!userId) throw new Error('AUTH_EXPIRED');
@@ -296,12 +353,14 @@ export function useWorkspace(userId?: string) {
     const message = activeSession?.messages.find(item => item.id === messageId);
     if (!activeSession || !message?.taskId) throw new Error('RETRY_TASK_NOT_FOUND');
     const generation = generationRef.current;
+    const operationEpoch = getSessionOperationEpoch(activeSession.id);
     taskCreateInFlightRef.current = true;
     setBusy(true);
     setError(undefined);
     try {
       const task = await retryTask(message.taskId);
       if (generationRef.current !== generation) throw new Error('STALE_WORKSPACE_REQUEST');
+      if (!sessionOperationIsCurrent(activeSession.id, operationEpoch)) return task;
       setSessions(current => current.map(session => session.id === activeSession.id ? {
         ...session,
         status: 'analyzing',
@@ -313,15 +372,20 @@ export function useWorkspace(userId?: string) {
       setActiveTaskId(task.id);
       return task;
     } catch (reason) {
-      if (generationRef.current === generation) {
+      if (
+        generationRef.current === generation
+        && sessionOperationIsCurrent(activeSession.id, operationEpoch)
+      ) {
         setError(reason instanceof Error ? reason.message : '再次执行失败');
       }
       throw reason;
     } finally {
-      taskCreateInFlightRef.current = false;
-      if (generationRef.current === generation) setBusy(false);
+      if (sessionOperationIsCurrent(activeSession.id, operationEpoch)) {
+        taskCreateInFlightRef.current = false;
+        if (generationRef.current === generation) setBusy(false);
+      }
     }
-  }, [activeSessionId, sessions, userId]);
+  }, [activeSessionId, getSessionOperationEpoch, sessionOperationIsCurrent, sessions, userId]);
 
   useEffect(() => {
     if (!taskRuntime || !activeTaskId) return;

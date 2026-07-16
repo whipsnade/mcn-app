@@ -2,7 +2,7 @@ import { act, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Session } from '../types';
-import { createSession, deleteSession, getSession, listSessions } from '../api/sessions';
+import { createSession, deleteSession, getSession, listSessions, updateSession } from '../api/sessions';
 import { createTask, getCandidates, getReport, retryTask } from '../api/tasks';
 import { useTaskStream } from './useTaskStream';
 import { useWorkspace } from './useWorkspace';
@@ -222,6 +222,125 @@ describe('useWorkspace', () => {
 
     expect(result.current.sessions).toEqual([restoredSession]);
     expect(result.current.activeSession?.id).toBe('session-1');
+  });
+
+  it('does not reinsert a deleted session when an older update response arrives', async () => {
+    const pendingUpdate = deferred<Session>();
+    vi.mocked(updateSession).mockReturnValue(pendingUpdate.promise);
+    vi.mocked(deleteSession).mockResolvedValue(undefined);
+    const { result } = renderHook(() => useWorkspace('user-a'));
+    await waitFor(() => expect(result.current.activeSession?.id).toBe('session-1'));
+
+    let updatePromise!: Promise<Session>;
+    act(() => {
+      updatePromise = result.current.updateSession('session-1', { title: '晚到的名称' });
+    });
+    await waitFor(() => expect(updateSession).toHaveBeenCalledOnce());
+    await act(async () => {
+      await result.current.deleteSession('session-1');
+    });
+
+    await act(async () => {
+      pendingUpdate.resolve({ ...restoredSession, title: '晚到的名称' });
+      await updatePromise;
+    });
+
+    expect(result.current.sessions).toEqual([]);
+    expect(result.current.activeSession).toBeUndefined();
+    expect(result.current.activeTaskId).toBeUndefined();
+  });
+
+  it('ignores a late task creation response after its session is deleted', async () => {
+    const pendingTask = deferred<{
+      id: string; session_id: string; status: 'pending'; estimated_points: number; error_code: null; latest_report_id: null;
+    }>();
+    vi.mocked(createTask).mockReturnValue(pendingTask.promise);
+    vi.mocked(deleteSession).mockResolvedValue(undefined);
+    const { result } = renderHook(() => useWorkspace('user-a'));
+    await waitFor(() => expect(result.current.activeSession?.id).toBe('session-1'));
+
+    let appendPromise!: Promise<unknown>;
+    act(() => {
+      appendPromise = result.current.appendMessage('删除前发起的任务');
+    });
+    await waitFor(() => expect(createTask).toHaveBeenCalledOnce());
+    await act(async () => {
+      await result.current.deleteSession('session-1');
+    });
+
+    await act(async () => {
+      pendingTask.resolve({
+        id: 'task-late', session_id: 'session-1', status: 'pending', estimated_points: 0,
+        error_code: null, latest_report_id: null,
+      });
+      await appendPromise;
+    });
+
+    expect(result.current.sessions).toEqual([]);
+    expect(result.current.activeSession).toBeUndefined();
+    expect(result.current.activeTaskId).toBeUndefined();
+  });
+
+  it('ignores a late retry response after its session is deleted', async () => {
+    const pendingRetry = deferred<{
+      id: string; session_id: string; status: 'pending'; estimated_points: number; error_code: null;
+      error_message: null; latest_report_id: null;
+    }>();
+    vi.mocked(getSession).mockResolvedValue({
+      ...restoredSession,
+      analysis: { taskId: 'task-old', status: 'failed' },
+      messages: restoredSession.messages.map(message => ({ ...message, taskId: 'task-old' })),
+    });
+    vi.mocked(retryTask).mockReturnValue(pendingRetry.promise);
+    vi.mocked(deleteSession).mockResolvedValue(undefined);
+    const { result } = renderHook(() => useWorkspace('user-a'));
+    await waitFor(() => expect(result.current.activeTaskId).toBe('task-old'));
+
+    let retryPromise!: Promise<unknown>;
+    act(() => {
+      retryPromise = result.current.retryMessage('message-1');
+    });
+    await waitFor(() => expect(retryTask).toHaveBeenCalledOnce());
+    await act(async () => {
+      await result.current.deleteSession('session-1');
+    });
+
+    await act(async () => {
+      pendingRetry.resolve({
+        id: 'task-retry-late', session_id: 'session-1', status: 'pending', estimated_points: 0,
+        error_code: null, error_message: null, latest_report_id: null,
+      });
+      await retryPromise;
+    });
+
+    expect(result.current.sessions).toEqual([]);
+    expect(result.current.activeSession).toBeUndefined();
+    expect(result.current.activeTaskId).toBeUndefined();
+  });
+
+  it('allows an older update to apply when deletion fails', async () => {
+    const pendingUpdate = deferred<Session>();
+    vi.mocked(updateSession).mockReturnValue(pendingUpdate.promise);
+    vi.mocked(deleteSession).mockRejectedValue(new Error('DELETE_FAILED'));
+    const { result } = renderHook(() => useWorkspace('user-a'));
+    await waitFor(() => expect(result.current.activeSession?.id).toBe('session-1'));
+
+    let updatePromise!: Promise<Session>;
+    act(() => {
+      updatePromise = result.current.updateSession('session-1', { title: '删除失败后保留' });
+    });
+    await waitFor(() => expect(updateSession).toHaveBeenCalledOnce());
+    await expect(act(async () => {
+      await result.current.deleteSession('session-1');
+    })).rejects.toThrow('DELETE_FAILED');
+
+    await act(async () => {
+      pendingUpdate.resolve({ ...restoredSession, title: '删除失败后保留' });
+      await updatePromise;
+    });
+
+    expect(result.current.activeSession?.title).toBe('删除失败后保留');
+    expect(result.current.sessions).toHaveLength(1);
   });
 
   it('does not let an older detail response overwrite a newer selection', async () => {
