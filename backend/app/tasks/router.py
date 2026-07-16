@@ -180,6 +180,9 @@ async def retry_followups(
     started = await task_runner.retry_followup(task_id)
     if not started:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="followup_retry_unavailable")
+    # End the read transaction before refreshing: MySQL's repeatable-read
+    # snapshot otherwise keeps returning the pre-retry `failed` metadata.
+    await db.commit()
     await db.refresh(task)
     return task_read(task, await task_followup_metadata(db, task))
 

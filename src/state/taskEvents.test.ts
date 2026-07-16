@@ -9,6 +9,10 @@ import {
 
 
 describe('task event reducer', () => {
+  it('does not claim an empty follow-up result before any follow-up event arrives', () => {
+    expect(initialTaskRuntime('task-1').followupSuggestions).toBeUndefined();
+  });
+
   it('applies a duplicate event id exactly once', () => {
     const event: TaskEvent = {
       id: 41,

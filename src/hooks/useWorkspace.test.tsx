@@ -3,7 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Session } from '../types';
 import { createSession, deleteSession, getSession, listSessions, updateSession } from '../api/sessions';
-import { createTask, getCandidates, getReport, retryFollowups, retryTask } from '../api/tasks';
+import { createTask, getCandidates, getReport, getTask, retryFollowups, retryTask } from '../api/tasks';
+import { initialTaskRuntime } from '../state/taskEvents';
 import { useTaskStream } from './useTaskStream';
 import { useWorkspace } from './useWorkspace';
 
@@ -122,6 +123,41 @@ describe('useWorkspace', () => {
 
     await waitFor(() => expect(result.current.activeSession?.analysis?.followupSuggestions?.[0]?.prompt).toBe('请分析浙江粉丝'));
     expect(result.current.activeSession?.analysis?.taskId).toBe('task-follow');
+  });
+
+  it('polls persisted follow-up metadata after an SSE event that contains only a count', async () => {
+    vi.mocked(getSession).mockResolvedValue({
+      ...restoredSession,
+      analysis: { taskId: 'task-poll', status: 'completed', followupStatus: 'pending', followupSuggestions: [] },
+    });
+    vi.mocked(getTask).mockResolvedValue({
+      id: 'task-poll', session_id: 'session-1', status: 'completed', estimated_points: 0,
+      error_code: null, error_message: null, latest_report_id: null,
+      followup_suggestions_status: 'completed',
+      followup_suggestions: [{ title: '分析平台', prompt: '请比较平台表现', rationale: '确认渠道差异' }],
+      followup_error: null,
+    });
+    const { result } = renderHook(() => useWorkspace('user-a'));
+
+    await waitFor(() => expect(result.current.activeSession?.analysis?.followupSuggestions?.[0]?.title).toBe('分析平台'));
+    expect(getTask).toHaveBeenCalledWith('task-poll');
+  });
+
+  it('keeps restored suggestions when the initial SSE runtime has no follow-up event', async () => {
+    vi.mocked(getSession).mockResolvedValue({
+      ...restoredSession,
+      analysis: {
+        taskId: 'task-restored', status: 'completed', followupStatus: 'completed',
+        followupSuggestions: [{ title: '恢复建议', prompt: '请恢复分析', rationale: '保留历史结果' }],
+      },
+    });
+    const runtime = initialTaskRuntime('task-restored');
+    runtime.status = 'completed';
+    runtime.connection = 'closed';
+    vi.mocked(useTaskStream).mockReturnValue(runtime);
+    const { result } = renderHook(() => useWorkspace('user-a'));
+
+    await waitFor(() => expect(result.current.activeSession?.analysis?.followupSuggestions?.[0]?.title).toBe('恢复建议'));
   });
 
   it('clears the workspace when the user logs out', async () => {
@@ -987,7 +1023,8 @@ describe('useWorkspace', () => {
     vi.mocked(retryFollowups).mockResolvedValue({
       id: 'task-failed-followup', session_id: 'session-1', status: 'completed', estimated_points: 0,
       error_code: null, error_message: null, latest_report_id: null,
-      followup_suggestions_status: 'pending', followup_suggestions: [], followup_error: null,
+      // A stale read must not make the UI terminal again; 202 means retry started.
+      followup_suggestions_status: 'failed', followup_suggestions: [], followup_error: null,
     });
     const { result } = renderHook(() => useWorkspace('user-a'));
     await waitFor(() => expect(result.current.activeSession?.analysis?.followupStatus).toBe('failed'));

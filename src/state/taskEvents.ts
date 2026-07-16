@@ -44,7 +44,6 @@ export function initialTaskRuntime(taskId: string): TaskRuntimeState {
     lastEventId: 0,
     assistantDraft: '',
     connection: 'idle',
-    followupSuggestions: [],
   };
 }
 

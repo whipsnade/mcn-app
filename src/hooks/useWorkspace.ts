@@ -437,9 +437,11 @@ export function useWorkspace(userId?: string) {
         ...item,
         analysis: {
           ...item.analysis,
-          followupStatus: task.followup_suggestions_status ?? 'pending',
-          followupSuggestions: task.followup_suggestions ?? [],
-          followupError: task.followup_error ?? undefined,
+          // The retry endpoint is asynchronous; a 202 must enter pending
+          // even if its response was read from a stale failed snapshot.
+          followupStatus: 'pending',
+          followupSuggestions: [],
+          followupError: undefined,
         },
       } : item));
       return task;
