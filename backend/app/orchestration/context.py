@@ -11,6 +11,7 @@ from app.orchestration.schemas import (
     PlannerTool,
     SessionBrief,
 )
+from app.orchestration.export_contract import build_export_field_contract
 
 
 _OMIT = object()
@@ -172,4 +173,5 @@ class ContextBuilder:
             # 渠道在新建会话中是可选条件。未显式选择时应在用户已授权的
             # 全部渠道内规划；只有显式选择时才收窄到用户的选择。
             allowed_channels=selected_channels or tuple(sorted(approved_channels)),
+            export_contract=build_export_field_contract(SessionBrief.from_workspace(workspace)),
         )
