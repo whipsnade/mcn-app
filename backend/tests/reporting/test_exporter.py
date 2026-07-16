@@ -80,6 +80,8 @@ def test_render_workbook_writes_only_merged_range_anchors_when_rows_expand() -> 
     assert summary[84][0].value == 80
     assert any(str(merged) == "A1:Q1" for merged in summary.merged_cells.ranges)
     assert any(str(merged) == "A2:Q2" for merged in summary.merged_cells.ranges)
+    # The dynamically moved rating table keeps the template's row styles.
+    assert summary.cell(88, 1)._style == summary.cell(22, 1)._style
 
 
 def test_export_candidate_keeps_public_profile_url_and_platform() -> None:

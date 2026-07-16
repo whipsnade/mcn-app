@@ -246,10 +246,13 @@ def _render_rating_summary(sheet: Any, candidates: Sequence[ExportCandidate], *,
     _write_styled_row(sheet, start_row, ["评级", "星级", "分数区间", "达人数量", "占比"], source_row=21)
     buckets = (("强烈推荐", "★★★★★", "≥78", 78, 101), ("推荐", "★★★★", "62-77", 62, 78), ("谨慎推荐", "★★★", "48-61", 48, 62), ("可考虑", "★★", "35-47", 35, 48), ("不推荐", "★", "<35", -1, 35))
     total = len(candidates)
-    for row, (label, stars, interval, lower, upper) in enumerate(buckets, start=start_row + 1):
+    for bucket_index, (label, stars, interval, lower, upper) in enumerate(buckets):
+        row = start_row + 1 + bucket_index
         count = sum(1 for item in candidates if item.total_score is not None and lower <= item.total_score < upper)
         ratio = count / total if total else 0
-        _write_styled_row(sheet, row, [label, stars, interval, count, ratio], source_row=row)
+        # Rows 22:26 are the template's five rating styles. Reuse them even
+        # when the rating table is moved below an oversized candidate pool.
+        _write_styled_row(sheet, row, [label, stars, interval, count, ratio], source_row=22 + bucket_index)
         sheet.cell(row, 5).number_format = "0.0%"
         _apply_rating_fill(sheet.cell(row, 1), label)
     sheet.cell(start_row, 18).value = "评级"
