@@ -506,11 +506,11 @@ class ReportingService:
         for candidate, kol, snapshot in candidates:
             platform_counts[kol.platform] = platform_counts.get(kol.platform, 0) + 1
             risks.extend(candidate.risk_flags_json)
+            nickname = str(snapshot.normalized_json.get("nickname") or "未命名达人")
             comparison.append(
                 {
-                    "kol_id": kol.id,
+                    "nickname": nickname,
                     "platform": kol.platform,
-                    "platform_account_id": kol.platform_account_id,
                     "rank": candidate.rank,
                     "total_score": float(candidate.total_score),
                 }
@@ -518,7 +518,8 @@ class ReportingService:
             if snapshot.source_mcp_call_id is not None:
                 source_ids.append(snapshot.source_mcp_call_id)
         top, top_kol, _ = candidates[0]
-        top_nickname = top_kol.platform_account_id
+        top_snapshot = candidates[0][2]
+        top_nickname = str(top_snapshot.normalized_json.get("nickname") or "未命名达人")
         source_rows = {
             row.id: row
             for row in (
@@ -529,7 +530,7 @@ class ReportingService:
             "overview": {
                 "candidate_count": len(candidates),
                 "candidate_version": candidate_version,
-                "top_kol_id": top.kol_id,
+                "top_nickname": top_nickname,
                 "top_score": float(top.total_score),
             },
             "score_composition": score_composition,

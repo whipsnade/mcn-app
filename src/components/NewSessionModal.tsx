@@ -7,6 +7,7 @@ export interface NewSessionData {
   campaignName: string;
   platforms: string[];
   category: string;
+  kolName: string;
   targetAudience: string;
   budgetMin?: string;
   budgetMax?: string;
@@ -31,8 +32,9 @@ const PLATFORMS = [
 export default function NewSessionModal({ isOpen, onClose, onCreate }: NewSessionModalProps) {
   const [brand, setBrand] = useState('');
   const [campaignName, setCampaignName] = useState('');
-  const [selectedPlatforms, setSelectedPlatforms] = useState<string[]>(['xiaohongshu']);
+  const [selectedPlatforms, setSelectedPlatforms] = useState<string[]>([]);
   const [category, setCategory] = useState('');
+  const [kolName, setKolName] = useState('');
   const [targetAudience, setTargetAudience] = useState('');
   const [budgetMin, setBudgetMin] = useState('');
   const [budgetMax, setBudgetMax] = useState('');
@@ -44,8 +46,9 @@ export default function NewSessionModal({ isOpen, onClose, onCreate }: NewSessio
   const reset = () => {
     setBrand('');
     setCampaignName('');
-    setSelectedPlatforms(['xiaohongshu']);
+    setSelectedPlatforms([]);
     setCategory('');
+    setKolName('');
     setTargetAudience('');
     setBudgetMin('');
     setBudgetMax('');
@@ -54,7 +57,7 @@ export default function NewSessionModal({ isOpen, onClose, onCreate }: NewSessio
 
   const handleSubmit = async (event: React.FormEvent) => {
     event.preventDefault();
-    if (!brand.trim() || !category.trim() || !targetAudience.trim()) {
+    if (!category.trim() || !initialQuery.trim()) {
       return;
     }
 
@@ -67,11 +70,11 @@ export default function NewSessionModal({ isOpen, onClose, onCreate }: NewSessio
         campaignName: trimmedCampaignName,
         platforms: selectedPlatforms,
         category: category.trim(),
+        kolName: kolName.trim(),
         targetAudience: targetAudience.trim(),
         budgetMin: budgetMin || undefined,
         budgetMax: budgetMax || undefined,
-        initialQuery: initialQuery.trim()
-          || `请为「${trimmedBrand}」${trimmedCampaignName ? `的「${trimmedCampaignName}」` : ''}筛选匹配的 KOL，并说明推荐依据。`,
+        initialQuery: initialQuery.trim(),
       });
       reset();
       onClose();
@@ -112,9 +115,8 @@ export default function NewSessionModal({ isOpen, onClose, onCreate }: NewSessio
         <form onSubmit={handleSubmit} className="p-6 space-y-4 max-h-[75vh] overflow-y-auto">
           <div className="grid grid-cols-2 gap-4">
             <div>
-              <label className="block text-xs font-semibold text-slate-600 uppercase tracking-wider mb-1">品牌名称 *</label>
+              <label className="block text-xs font-semibold text-slate-600 uppercase tracking-wider mb-1">品牌名称</label>
               <input
-                required
                 placeholder="例如：雅诗兰黛"
                 value={brand}
                 onChange={event => setBrand(event.target.value)}
@@ -133,7 +135,7 @@ export default function NewSessionModal({ isOpen, onClose, onCreate }: NewSessio
           </div>
 
           <div>
-            <label className="block text-xs font-semibold text-slate-600 uppercase tracking-wider mb-2">筛选渠道（可多选）*</label>
+            <label className="block text-xs font-semibold text-slate-600 uppercase tracking-wider mb-2">筛选渠道（可多选）</label>
             <div className="flex flex-wrap gap-1.5">
               {PLATFORMS.map(option => {
                 const isSelected = selectedPlatforms.includes(option.value);
@@ -142,7 +144,7 @@ export default function NewSessionModal({ isOpen, onClose, onCreate }: NewSessio
                     key={option.value}
                     type="button"
                     onClick={() => {
-                      if (isSelected && selectedPlatforms.length > 1) {
+                      if (isSelected) {
                         setSelectedPlatforms(selectedPlatforms.filter(platform => platform !== option.value));
                       } else if (!isSelected) {
                         setSelectedPlatforms([...selectedPlatforms, option.value]);
@@ -166,25 +168,32 @@ export default function NewSessionModal({ isOpen, onClose, onCreate }: NewSessio
 
           <div className="grid grid-cols-2 gap-4">
             <div>
-              <label className="block text-xs font-semibold text-slate-600 uppercase tracking-wider mb-1">内容品类 *</label>
-              <input
+              <label htmlFor="session-industry" className="block text-xs font-semibold text-slate-600 uppercase tracking-wider mb-1">行业筛选 *</label>
+              <select
+                id="session-industry"
                 required
-                placeholder="例如：美妆护肤"
                 value={category}
                 onChange={event => setCategory(event.target.value)}
                 className="w-full rounded-xl border border-slate-200 px-3.5 py-2 text-sm focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 outline-none transition"
-              />
+              >
+                <option value="" disabled>请选择行业</option>
+                {['餐饮', '茶饮', '美妆', '护肤'].map(industry => <option key={industry} value={industry}>{industry}</option>)}
+              </select>
             </div>
             <div>
-              <label className="block text-xs font-semibold text-slate-600 uppercase tracking-wider mb-1">目标人群 *</label>
+              <label className="block text-xs font-semibold text-slate-600 uppercase tracking-wider mb-1">目标人群</label>
               <input
-                required
                 placeholder="例如：25-35 岁一线城市女性"
                 value={targetAudience}
                 onChange={event => setTargetAudience(event.target.value)}
                 className="w-full rounded-xl border border-slate-200 px-3.5 py-2 text-sm focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 outline-none transition"
               />
             </div>
+          </div>
+
+          <div>
+            <label className="block text-xs font-semibold text-slate-600 uppercase tracking-wider mb-1">KOL 名称搜索</label>
+            <input placeholder="例如：李佳琦" value={kolName} onChange={event => setKolName(event.target.value)} className="w-full rounded-xl border border-slate-200 px-3.5 py-2 text-sm focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 outline-none transition" />
           </div>
 
           <div className="grid grid-cols-2 gap-4">
@@ -215,8 +224,9 @@ export default function NewSessionModal({ isOpen, onClose, onCreate }: NewSessio
           </div>
 
           <div>
-            <label className="block text-xs font-semibold text-slate-600 uppercase tracking-wider mb-1">初始分析指令 / 提问</label>
+            <label className="block text-xs font-semibold text-slate-600 uppercase tracking-wider mb-1">初始分析指令 / 提问 *</label>
             <textarea
+              required
               placeholder="例如：筛选 20 位近 30 天互动稳定、女性粉丝占比高的达人，并按预算匹配度排序。"
               value={initialQuery}
               onChange={event => setInitialQuery(event.target.value)}

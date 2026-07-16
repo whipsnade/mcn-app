@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_db
@@ -82,9 +83,10 @@ def bi_report_summary(report: BiReport) -> BiReportSummary:
     )
 
 
-def favorite_read(favorite: UserKolFavorite, kol: Kol) -> FavoriteRead:
+def favorite_read(favorite: UserKolFavorite, kol: Kol, nickname: str | None = None) -> FavoriteRead:
     return FavoriteRead(
         kol_id=kol.id,
+        nickname=nickname,
         platform=kol.platform,
         platform_account_id=kol.platform_account_id,
         profile_url=kol.normalized_profile_url,
@@ -142,7 +144,17 @@ async def list_favorites(
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> list[FavoriteRead]:
     rows = await ReportingService(db).list_favorites(user.id)
-    return [favorite_read(favorite, kol) for favorite, kol in rows]
+    result: list[FavoriteRead] = []
+    for favorite, kol in rows:
+        snapshot = await db.scalar(
+            select(KolSnapshot)
+            .where(KolSnapshot.kol_id == kol.id)
+            .order_by(desc(KolSnapshot.collected_at))
+            .limit(1)
+        )
+        nickname = snapshot.normalized_json.get("nickname") if snapshot else None
+        result.append(favorite_read(favorite, kol, nickname if isinstance(nickname, str) else None))
+    return result
 
 
 @router.post("/favorites", response_model=FavoriteRead, status_code=status.HTTP_201_CREATED)
@@ -164,7 +176,14 @@ async def create_favorite(
     await db.commit()
     # 统一返回 200，使幂等的重复收藏和首次创建具有一致的客户端处理方式。
     response.status_code = status.HTTP_200_OK
-    return favorite_read(favorite, kol)
+    snapshot = await db.scalar(
+        select(KolSnapshot)
+        .where(KolSnapshot.kol_id == kol.id)
+        .order_by(desc(KolSnapshot.collected_at))
+        .limit(1)
+    )
+    nickname = snapshot.normalized_json.get("nickname") if snapshot else None
+    return favorite_read(favorite, kol, nickname if isinstance(nickname, str) else None)
 
 
 @router.delete("/favorites/{kol_id}", status_code=status.HTTP_204_NO_CONTENT)

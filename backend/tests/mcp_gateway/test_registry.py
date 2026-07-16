@@ -268,7 +268,8 @@ def test_committed_manifest_contains_only_reviewed_datatap_tool() -> None:
 
     assert manifest["manifest_version"] == 1
     assert [tool["internal_name"] for tool in manifest["tools"]] == [
-        "datatap.xiaohongshu.kol.search.v1"
+        "datatap.xiaohongshu.kol.search.v1",
+        "datatap.douyin.kol.search.v1",
     ]
 
 

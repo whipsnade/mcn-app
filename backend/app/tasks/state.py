@@ -6,6 +6,7 @@ class TaskStatus(StrEnum):
     PLANNING = "planning"
     RUNNING = "running"
     COMPLETED = "completed"
+    COMPLETED_WITH_WARNINGS = "completed_with_warnings"
     FAILED = "failed"
     INSUFFICIENT_BALANCE = "insufficient_balance"
     INTERRUPTED = "interrupted"
@@ -27,12 +28,15 @@ class TaskEventType(StrEnum):
     MESSAGE_DELTA = "message.delta"
     MESSAGE_COMPLETED = "message.completed"
     TASK_COMPLETED = "task.completed"
+    TASK_COMPLETED_WITH_WARNINGS = "task.completed_with_warnings"
+    REPLAN_READY = "replan.ready"
     TASK_FAILED = "task.failed"
     TASK_CANCELLED = "task.cancelled"
 
 
 TERMINAL_TASK_STATUSES = {
     TaskStatus.COMPLETED,
+    TaskStatus.COMPLETED_WITH_WARNINGS,
     TaskStatus.FAILED,
     TaskStatus.INSUFFICIENT_BALANCE,
     TaskStatus.CANCELLED,
@@ -49,6 +53,7 @@ ALLOWED_TRANSITIONS = {
     },
     TaskStatus.RUNNING: {
         TaskStatus.COMPLETED,
+        TaskStatus.COMPLETED_WITH_WARNINGS,
         TaskStatus.FAILED,
         TaskStatus.INSUFFICIENT_BALANCE,
         TaskStatus.INTERRUPTED,

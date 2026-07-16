@@ -5,7 +5,7 @@ import NewSessionModal from './NewSessionModal';
 
 
 describe('NewSessionModal', () => {
-  it('allows creating a session without a campaign name', async () => {
+  it('creates with only industry and initial query, including optional KOL name', async () => {
     const onCreate = vi.fn().mockResolvedValue(undefined);
 
     render(
@@ -16,24 +16,21 @@ describe('NewSessionModal', () => {
       />,
     );
 
-    expect(screen.getByText('活动/项目名称')).toBeTruthy();
-    expect(screen.queryByText('活动/项目名称 *')).toBeNull();
-
-    fireEvent.change(screen.getByPlaceholderText('例如：雅诗兰黛'), {
-      target: { value: '科颜氏' },
-    });
-    fireEvent.change(screen.getByPlaceholderText('例如：美妆护肤'), {
-      target: { value: '护肤' },
-    });
-    fireEvent.change(screen.getByPlaceholderText('例如：25-35 岁一线城市女性'), {
-      target: { value: '25~30' },
+    fireEvent.change(screen.getByLabelText('行业筛选 *'), { target: { value: '美妆' } });
+    fireEvent.change(screen.getByPlaceholderText('例如：李佳琦'), { target: { value: '达人A' } });
+    fireEvent.change(screen.getByPlaceholderText('例如：筛选 20 位近 30 天互动稳定、女性粉丝占比高的达人，并按预算匹配度排序。'), {
+      target: { value: '请筛选近 30 天活跃达人' },
     });
     fireEvent.click(screen.getByRole('button', { name: '立即创建' }));
 
     await waitFor(() => expect(onCreate).toHaveBeenCalledTimes(1));
     expect(onCreate).toHaveBeenCalledWith(expect.objectContaining({
-      brand: '科颜氏',
+      brand: '',
       campaignName: '',
+      platforms: [],
+      category: '美妆',
+      kolName: '达人A',
+      initialQuery: '请筛选近 30 天活跃达人',
     }));
   });
 });

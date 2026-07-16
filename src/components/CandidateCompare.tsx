@@ -13,6 +13,14 @@ function scoreLabel(value: number | null | undefined) {
   return value === null || value === undefined ? '—' : `${value}`;
 }
 
+function candidateName(candidate: ApiCandidate): string {
+  return candidate.nickname?.trim() || '未命名达人';
+}
+
+function platformName(platform: string): string {
+  return ({ xiaohongshu: '小红书', douyin: '抖音', bilibili: '哔哩哔哩', weibo: '微博', wechat: '微信' } as Record<string, string>)[platform] ?? platform;
+}
+
 function riskLabel(candidate: ApiCandidate) {
   const texts = candidate.risks.flatMap(riskText).filter((value, index, values) => values.indexOf(value) === index);
   return texts.length ? texts.join('、') : '暂无';
@@ -36,12 +44,12 @@ export default function CandidateCompare({ candidates }: { candidates: ApiCandid
       <div className="min-w-[620px]">
         <div className="grid grid-cols-[120px_repeat(4,minmax(120px,1fr))] border-b border-indigo-100 bg-white text-[10px] font-semibold text-slate-500">
           <div className="px-3 py-2.5">对比维度</div>
-          {candidates.map(candidate => <div key={candidate.id} className="px-3 py-2.5 text-slate-800">{candidate.nickname ?? candidate.kol_id}</div>)}
+          {candidates.map(candidate => <div key={candidate.id} className="px-3 py-2.5 text-slate-800">{candidateName(candidate)}</div>)}
         </div>
         {[
           ['总分', (candidate: ApiCandidate) => scoreLabel(candidate.total_score)],
           ['排名', (candidate: ApiCandidate) => `#${candidate.rank}`],
-          ['平台', (candidate: ApiCandidate) => candidate.platform],
+          ['平台', (candidate: ApiCandidate) => platformName(candidate.platform)],
           ['粉丝', (candidate: ApiCandidate) => scoreLabel(candidate.metrics?.followers)],
           ['价格', (candidate: ApiCandidate) => candidate.metrics?.quoted_price_cny === null || candidate.metrics?.quoted_price_cny === undefined ? '—' : `¥${candidate.metrics.quoted_price_cny.toLocaleString('zh-CN')}`],
         ].map(([label, value]) => (

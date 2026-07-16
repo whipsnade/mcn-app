@@ -2,6 +2,7 @@ import pytest
 
 from app.tasks.state import (
     InvalidTaskTransition,
+    TERMINAL_TASK_STATUSES,
     TaskEventType,
     TaskStatus,
     ensure_transition,
@@ -14,6 +15,7 @@ def test_task_status_values_are_frozen() -> None:
         "planning",
         "running",
         "completed",
+        "completed_with_warnings",
         "failed",
         "insufficient_balance",
         "interrupted",
@@ -37,6 +39,8 @@ def test_task_event_type_values_are_frozen() -> None:
         "message.delta",
         "message.completed",
         "task.completed",
+        "task.completed_with_warnings",
+        "replan.ready",
         "task.failed",
         "task.cancelled",
     }
@@ -68,6 +72,11 @@ def test_allowed_task_transitions(source: TaskStatus, target: TaskStatus) -> Non
 def test_terminal_task_cannot_return_to_running(terminal: TaskStatus) -> None:
     with pytest.raises(InvalidTaskTransition):
         ensure_transition(terminal, TaskStatus.RUNNING)
+
+
+def test_running_task_may_complete_with_warnings() -> None:
+    ensure_transition(TaskStatus.RUNNING, TaskStatus.COMPLETED_WITH_WARNINGS)
+    assert TaskStatus.COMPLETED_WITH_WARNINGS in TERMINAL_TASK_STATUSES
 
 
 @pytest.mark.parametrize(

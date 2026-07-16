@@ -119,3 +119,31 @@ def test_datatap_xiaohongshu_result_is_normalized_from_reviewed_chinese_fields()
     assert row.audience_score == 61.8
     assert row.engagement_score == 7.23
     assert row.risk_flags == ()
+
+
+def test_datatap_douyin_result_is_normalized_from_reviewed_chinese_fields() -> None:
+    item = ToolEvidence(
+        internal_tool_name="datatap.douyin.kol.search.v1",
+        payload={
+            "result": (
+                '{"KOL 列表":[{"账号ID (kwUid)":"douyin-1","平台":"douyin",'
+                '"昵称":"抖音护肤达人","达人主页":"https://example.test/douyin-1",'
+                '"抖音粉丝数":768413,"有效粉丝率":0.5918,"综合评分":92.63,'
+                '"互动率-日常作品":0.0261,"互动率-商单作品":0.0251,'
+                '"预估报价":[{"键":"[预估] 1-20S视频报价","值":"11265.0"}],'
+                '"近30天有发文":true}]}'
+            )
+        },
+        source_call_id="call-douyin-1",
+        collected_at=datetime.now(UTC).replace(tzinfo=None),
+    )
+
+    row = normalize_tool_evidence([item])[0]
+
+    assert row.platform == "douyin"
+    assert row.platform_account_id == "douyin-1"
+    assert row.followers == 768413
+    assert row.engagement_rate == 2.61
+    assert row.quoted_price_cny == 11265
+    assert row.content_score == 92.63
+    assert row.audience_score == 59.18

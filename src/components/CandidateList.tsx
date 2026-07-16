@@ -56,6 +56,14 @@ function completenessLabel(items: readonly ApiCandidate[]) {
   return values.length ? `${Math.round(values.reduce((sum, value) => sum + value, 0) / values.length)}%` : '待补充';
 }
 
+function candidateName(candidate: ApiCandidate): string {
+  return candidate.nickname?.trim() || '未命名达人';
+}
+
+function platformName(platform: string): string {
+  return ({ xiaohongshu: '小红书', douyin: '抖音', bilibili: '哔哩哔哩', weibo: '微博', wechat: '微信' } as Record<string, string>)[platform] ?? platform;
+}
+
 export default function CandidateList({ page, favoriteKolIds = new Set(), onFavorite }: CandidateListProps) {
   const [sort, setSort] = useState<{ key: SortKey; direction: 'asc' | 'desc' }>({ key: 'rank', direction: 'asc' });
   const [platformFilter, setPlatformFilter] = useState('');
@@ -119,7 +127,7 @@ export default function CandidateList({ page, favoriteKolIds = new Set(), onFavo
             className="rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-[11px] font-medium text-slate-600 outline-none transition focus:border-indigo-300"
           >
             <option value="">全部平台</option>
-            {platforms.map(platform => <option key={platform} value={platform}>{platform}</option>)}
+            {platforms.map(platform => <option key={platform} value={platform}>{platformName(platform)}</option>)}
           </select>
           <button
             type="button"
@@ -154,13 +162,13 @@ export default function CandidateList({ page, favoriteKolIds = new Set(), onFavo
                 const isSelected = selectedIds.includes(candidate.id);
                 const isFavorite = favoriteKolIds.has(candidate.kol_id);
                 return <tr key={candidate.id} className={isSelected ? 'bg-indigo-50/50' : 'hover:bg-slate-50/70'}>
-                  <td className="px-3 py-3"><input type="checkbox" aria-label={`选择${candidate.nickname ?? candidate.kol_id}`} checked={isSelected} onChange={() => toggleSelected(candidate)} className="h-3.5 w-3.5 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500" /></td>
+                  <td className="px-3 py-3"><input type="checkbox" aria-label={`选择${candidateName(candidate)}`} checked={isSelected} onChange={() => toggleSelected(candidate)} className="h-3.5 w-3.5 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500" /></td>
                   <td className="px-3 py-3 font-mono text-slate-400">#{candidate.rank}</td>
-                  <td className="px-3 py-3"><div className="flex items-center gap-2"><div><div data-testid="candidate-name" className="font-semibold text-slate-800">{candidate.nickname ?? candidate.kol_id}</div><div className="mt-0.5 flex items-center gap-1 text-[10px] text-slate-400"><span>{candidate.platform}</span>{candidate.profile_url && <a href={candidate.profile_url} target="_blank" rel="noreferrer" aria-label={`查看${candidate.nickname ?? candidate.kol_id}证据`}><ExternalLink className="h-3 w-3" /></a>}</div></div></div></td>
+                  <td className="px-3 py-3"><div className="flex items-center gap-2"><div><div data-testid="candidate-name" className="font-semibold text-slate-800">{candidateName(candidate)}</div><div className="mt-0.5 flex items-center gap-1 text-[10px] text-slate-400"><span>{platformName(candidate.platform)}</span>{candidate.profile_url && <a href={candidate.profile_url} target="_blank" rel="noreferrer" aria-label={`查看${candidateName(candidate)}证据`}><ExternalLink className="h-3 w-3" /></a>}</div></div></div></td>
                   {columns.map(column => <td key={column.key} className="px-2 py-3 text-center font-medium text-slate-600">{formatScore(metric(candidate, column.key) as number | null)}</td>)}
                   <td className="px-3 py-3 text-center text-slate-500">{formatMetric(candidate.metrics?.followers)}</td>
                   <td className="px-3 py-3 text-center text-slate-500">{formatMetric(candidate.metrics?.quoted_price_cny, '¥')}</td>
-                  <td className="px-3 py-3 text-center"><button type="button" aria-label={isFavorite ? `取消收藏 ${candidate.nickname ?? candidate.kol_id}` : `收藏 ${candidate.nickname ?? candidate.kol_id}`} onClick={() => void toggleFavorite(candidate)} className={isFavorite ? 'rounded p-1 text-amber-500 transition hover:bg-amber-50' : 'rounded p-1 text-slate-300 transition hover:bg-slate-100 hover:text-amber-500'}><Star className={isFavorite ? 'h-3.5 w-3.5 fill-amber-400' : 'h-3.5 w-3.5'} /></button></td>
+                  <td className="px-3 py-3 text-center"><button type="button" aria-label={isFavorite ? `取消收藏 ${candidateName(candidate)}` : `收藏 ${candidateName(candidate)}`} onClick={() => void toggleFavorite(candidate)} className={isFavorite ? 'rounded p-1 text-amber-500 transition hover:bg-amber-50' : 'rounded p-1 text-slate-300 transition hover:bg-slate-100 hover:text-amber-500'}><Star className={isFavorite ? 'h-3.5 w-3.5 fill-amber-400' : 'h-3.5 w-3.5'} /></button></td>
                 </tr>;
               })}
             </tbody>

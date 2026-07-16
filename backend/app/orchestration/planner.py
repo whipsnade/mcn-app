@@ -5,9 +5,9 @@ import json
 from app.mcp_gateway.contracts import DataTapService
 from app.mcp_gateway.validation import McpValidationError, validate_input
 from app.model.contracts import ChatMessage, ModelAdapter, StructuredModelRequest
-from app.model.prompts import PLANNER_PROMPT
+from app.model.prompts import PLANNER_PROMPT, REPLANNER_PROMPT
 from app.orchestration.batching import build_execution_batches
-from app.orchestration.schemas import PlanValidationError, PlannerContext, ToolPlan
+from app.orchestration.schemas import PlanValidationError, PlannerContext, ReplanContext, ToolPlan
 
 
 _SERVICE_CHANNELS: dict[DataTapService, frozenset[str]] = {
@@ -24,6 +24,11 @@ _SERVICE_CHANNELS: dict[DataTapService, frozenset[str]] = {
     DataTapService.BILIBILI: frozenset({"bilibili"}),
 }
 _DATATAP_XIAOHONGSHU_SEARCH = "datatap.xiaohongshu.kol.search.v1"
+_DATATAP_DOUYIN_SEARCH = "datatap.douyin.kol.search.v1"
+_DATATAP_SEARCH_BY_PLATFORM = {
+    "xiaohongshu": _DATATAP_XIAOHONGSHU_SEARCH,
+    "douyin": _DATATAP_DOUYIN_SEARCH,
+}
 _ZHEJIANG_LOCATION_TERMS = ("浙江", "湖州")
 
 
@@ -55,6 +60,42 @@ class Planner:
         self._validate(plan, context)
         return plan
 
+    async def replan(self, context: PlannerContext, recovery: ReplanContext) -> ToolPlan:
+        if recovery.remaining_calls <= 0:
+            raise PlanValidationError("REPLAN_CALL_BUDGET_EXHAUSTED")
+        result = await self._model.complete_json(
+            StructuredModelRequest(
+                purpose="replanner",
+                template_name=REPLANNER_PROMPT.name,
+                messages=(
+                    ChatMessage(role="system", content=REPLANNER_PROMPT.system),
+                    ChatMessage(
+                        role="user",
+                        content=json.dumps(
+                            {
+                                "planner_context": context.model_dump(mode="json"),
+                                "recovery": recovery.model_dump(mode="json"),
+                            },
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    ),
+                ),
+                output_model=ToolPlan,
+            )
+        )
+        plan = result.value
+        if len(plan.steps) > recovery.remaining_calls:
+            raise PlanValidationError("REPLAN_CALL_BUDGET_EXCEEDED")
+        prohibited_ids = set(recovery.completed_step_ids) | {
+            failure.step_id for failure in recovery.failed_steps
+        }
+        if any(step.id in prohibited_ids for step in plan.steps):
+            raise PlanValidationError("REPLAN_REUSES_COMPLETED_STEP")
+        self._validate(plan, context)
+        return plan
+
     @staticmethod
     def _compile_supported_search_defaults(plan: ToolPlan, context: PlannerContext) -> ToolPlan:
         """补齐已审核工具能稳定表达、且来自用户输入的筛选条件。
@@ -79,7 +120,7 @@ class Planner:
         compiled_steps: list = []
         changed = False
         for step in plan.steps:
-            if step.internal_tool_name != _DATATAP_XIAOHONGSHU_SEARCH:
+            if step.internal_tool_name not in _DATATAP_SEARCH_BY_PLATFORM.values():
                 compiled_steps.append(step)
                 continue
             arguments = dict(step.arguments)
@@ -109,6 +150,37 @@ class Planner:
             compiled = {**arguments, "request": request}
             compiled_steps.append(step.model_copy(update={"arguments": compiled}))
             changed = changed or compiled != step.arguments
+        available_tools = {tool.internal_name for tool in context.tools}
+        existing_tools = {step.internal_tool_name for step in compiled_steps}
+        template_arguments = next(
+            (
+                step.arguments
+                for step in compiled_steps
+                if step.internal_tool_name in _DATATAP_SEARCH_BY_PLATFORM.values()
+            ),
+            {"request": {}},
+        )
+        next_step_number = len(compiled_steps) + 1
+        for platform in context.brief.platforms:
+            internal_name = _DATATAP_SEARCH_BY_PLATFORM.get(platform)
+            if internal_name is None or internal_name not in available_tools or internal_name in existing_tools:
+                continue
+            while any(step.id == f"step_{next_step_number}" for step in compiled_steps):
+                next_step_number += 1
+            compiled_steps.append(
+                plan.steps[0].model_copy(
+                    update={
+                        "id": f"step_{next_step_number}",
+                        "internal_tool_name": internal_name,
+                        "arguments": dict(template_arguments),
+                        "depends_on": (),
+                        "evidence_goal": f"{platform} 候选达人",
+                    }
+                )
+            )
+            existing_tools.add(internal_name)
+            next_step_number += 1
+            changed = True
         return plan.model_copy(update={"steps": tuple(compiled_steps)}) if changed else plan
 
     @staticmethod

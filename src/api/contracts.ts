@@ -133,6 +133,7 @@ export interface ApiBiReport {
 
 export interface ApiFavorite {
   kol_id: string;
+  nickname?: string | null;
   platform: string;
   platform_account_id: string;
   profile_url: string | null;

@@ -34,7 +34,7 @@ describe('BiReport', () => {
     const report = reportFixture({
       score_composition: [{ dimension: 'audience', average: 82 }],
       platform_distribution: [{ platform: 'bilibili', count: 2 }],
-      comparison: [{ platform_account_id: '报告达人', total_score: 91 }],
+      comparison: [{ nickname: '报告达人', total_score: 91 }],
     });
 
     const { rerender } = render(
@@ -43,7 +43,7 @@ describe('BiReport', () => {
 
     expect(screen.getByText('报告达人')).toBeVisible();
     expect(screen.getByText('2 位')).toBeVisible();
-    expect(screen.getByLabelText('评分构成图表：audience 82')).toBeVisible();
+    expect(screen.getByLabelText('评分构成图表：受众匹配 82')).toBeVisible();
 
     rerender(<BiReport report={report} candidateVersion={2} selectedCandidates={candidatePage.items} selectedCandidateVersion={2} />);
     expect(screen.getByText('#1 达人甲')).toBeVisible();

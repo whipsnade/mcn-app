@@ -207,6 +207,7 @@ class FavoriteCreate(BaseModel):
 
 class FavoriteRead(BaseModel):
     kol_id: str
+    nickname: str | None = None
     platform: str
     platform_account_id: str
     profile_url: str | None = None

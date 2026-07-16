@@ -32,6 +32,28 @@ class ToolPlan(BaseModel):
     stop_conditions: tuple[str, ...] = Field(default_factory=tuple, max_length=10)
 
 
+class ReplanFailure(BaseModel):
+    """仅允许进入模型的 MCP 失败安全摘要，不包含原始响应。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    step_id: str = Field(pattern=r"^step_[0-9]+$")
+    internal_tool_name: str = Field(min_length=1, max_length=128)
+    error_code: str = Field(min_length=1, max_length=64)
+    diagnostic: dict[str, Any] | None = None
+
+
+class ReplanContext(BaseModel):
+    """补充计划的剩余预算和安全执行状态。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    completed_step_ids: tuple[str, ...] = Field(default_factory=tuple, max_length=10)
+    failed_steps: tuple[ReplanFailure, ...] = Field(min_length=1, max_length=10)
+    remaining_calls: int = Field(ge=0, le=10)
+    remaining_points: int = Field(ge=0)
+
+
 class SessionBrief(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

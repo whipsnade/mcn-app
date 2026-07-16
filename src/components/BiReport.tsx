@@ -92,15 +92,25 @@ function formatMetric(value: unknown, suffix = ''): string {
 
 function labelFor(key: string): string {
   const labels: Record<string, string> = {
-    total_candidates: '候选人数', top_score: '最高总分', average_score: '平均总分',
-    expected_reach: '预估触达', expected_engagement: '预估互动', budget: '预算',
-    cpe: '互动成本', cpm: '千次曝光成本', audience_match: '受众匹配',
+    total_candidates: '候选达人数量', candidate_count: '候选数量', candidate_version: '候选版本',
+    top_score: '最高综合得分', average_score: '平均综合得分', average: '平均得分',
+    expected_reach: '预估触达人数', expected_engagement: '预估互动量', budget: '预算',
+    cpe: '单次互动成本', cpm: '千次曝光成本', audience_match: '受众匹配度',
+    content_match: '内容匹配度', engagement: '互动表现', growth: '增长潜力',
+    brand_safety: '品牌安全', average_budget_score: '平均预算评分',
+    audience: '受众匹配', content: '内容匹配', platform: '平台表现', risk: '风险控制',
+    xiaohongshu: '小红书', douyin: '抖音', bilibili: '哔哩哔哩', weibo: '微博', wechat: '微信',
+    instagram: 'Instagram', youtube: 'YouTube',
   };
-  return labels[key] ?? key.replaceAll('_', ' ');
+  return labels[key] ?? key;
 }
 
 function displayRisk(value: unknown): string {
-  if (typeof value === 'string') return value;
+  const riskLabels: Record<string, string> = {
+    activity_flag_false: '近30天活跃标记异常', inactive_last_30_days: '最近30天无发文',
+    no_successful_tool_evidence: '未获得有效工具数据', missing: '数据缺失',
+  };
+  if (typeof value === 'string') return riskLabels[value] ?? value;
   if (!isRecord(value)) return '风险数据不足';
   return firstText(value, ['label', 'reason', 'message', 'name', 'risk']) ?? '风险数据不足';
 }
@@ -135,7 +145,7 @@ function ScoreCard({ data }: { data: Array<Record<string, unknown>> }) {
   const chartData = data.flatMap(item => {
     const name = firstText(item, ['name', 'dimension', 'label', 'metric']);
     const value = firstNumber(item, ['value', 'score', 'average', 'weight', 'percentage']);
-    return name && value !== undefined ? [{ name, value }] : [];
+    return name && value !== undefined ? [{ name: labelFor(name), value }] : [];
   });
   return (
     <Card title="评分构成" icon={<Award className="h-3.5 w-3.5" />}>
@@ -178,7 +188,7 @@ function PlatformCard({ data }: { data: Array<Record<string, unknown>> }) {
     const name = firstText(item, ['platform', 'name', 'label']);
     const count = firstNumber(item, ['count']);
     const value = count ?? firstNumber(item, ['value', 'percentage', 'score']);
-    return name && value !== undefined ? [{ name, value, isCount: count !== undefined }] : [];
+    return name && value !== undefined ? [{ name: labelFor(name), value, isCount: count !== undefined }] : [];
   });
   return (
     <Card title="平台分布" icon={<PieChartIcon className="h-3.5 w-3.5" />}>
@@ -200,14 +210,14 @@ function BudgetCard({ data }: { data: Record<string, unknown> }) {
 
 function ComparisonCard({ comparison, selectedCandidates, selectedCandidateVersion, reportCandidateVersion }: { comparison: Array<Record<string, unknown>>; selectedCandidates: readonly ApiCandidate[]; selectedCandidateVersion?: number; reportCandidateVersion: number }) {
   const rows = comparison.flatMap(item => {
-    const name = firstText(item, ['nickname', 'name', 'kol_name', 'platform_account_id', 'label']);
+    const name = firstText(item, ['nickname', 'name', 'kol_name', 'label']);
     const score = firstNumber(item, ['total_score', 'score', 'value']);
     return name ? [{ name, score }] : [];
   });
   const candidates = selectedCandidateVersion === reportCandidateVersion ? selectedCandidates.slice(0, 4) : [];
   return (
     <Card title="候选对比" icon={<CheckCircle2 className="h-3.5 w-3.5" />}>
-      {candidates.length > 0 ? <div className="space-y-1.5">{candidates.map(candidate => <div key={candidate.id} className="flex items-center justify-between rounded-lg bg-slate-50 px-2.5 py-2 text-[11px]"><span className="truncate font-medium text-slate-700">#{candidate.rank} {candidate.nickname ?? candidate.kol_id}</span><span className="font-bold text-indigo-600">{formatMetric(candidate.total_score)}</span></div>)}</div> : rows.length > 0 ? <div className="space-y-1.5">{rows.map(row => <div key={row.name} className="flex justify-between rounded-lg bg-slate-50 px-2.5 py-2 text-[11px]"><span>{row.name}</span><b className="text-indigo-600">{formatMetric(row.score)}</b></div>)}</div> : <EmptyData label="尚未选择候选进行对比" />}
+      {candidates.length > 0 ? <div className="space-y-1.5">{candidates.map(candidate => <div key={candidate.id} className="flex items-center justify-between rounded-lg bg-slate-50 px-2.5 py-2 text-[11px]"><span className="truncate font-medium text-slate-700">#{candidate.rank} {candidate.nickname?.trim() || '未命名达人'}</span><span className="font-bold text-indigo-600">{formatMetric(candidate.total_score)}</span></div>)}</div> : rows.length > 0 ? <div className="space-y-1.5">{rows.map(row => <div key={row.name} className="flex justify-between rounded-lg bg-slate-50 px-2.5 py-2 text-[11px]"><span>{row.name}</span><b className="text-indigo-600">{formatMetric(row.score)}</b></div>)}</div> : <EmptyData label="尚未选择候选进行对比" />}
     </Card>
   );
 }
@@ -221,7 +231,7 @@ function SourceCard({ sources }: { sources: Array<Record<string, unknown>> }) {
 }
 
 function PanelState({ children }: { children: ReactNode }) {
-  return <aside className="flex h-full w-full shrink-0 flex-col overflow-hidden border-l border-slate-200 bg-white shadow-sm xl:w-[420px]"><header className="flex h-14 items-center border-b border-slate-200 px-4"><h2 className="text-xs font-bold uppercase tracking-widest text-slate-800">BI Intelligence Output</h2></header><div className="flex flex-1 items-center justify-center bg-slate-50/40 p-8 text-center text-xs text-slate-500">{children}</div></aside>;
+  return <aside className="flex h-full w-full shrink-0 flex-col overflow-hidden border-l border-slate-200 bg-white shadow-sm xl:w-[420px]"><header className="flex h-14 items-center border-b border-slate-200 px-4"><h2 className="text-xs font-bold uppercase tracking-widest text-slate-800">BI 智能分析报告</h2></header><div className="flex flex-1 items-center justify-center bg-slate-50/40 p-8 text-center text-xs text-slate-500">{children}</div></aside>;
 }
 
 export default function BiReport({ report, candidateVersion, selectedCandidates = [], selectedCandidateVersion }: BiReportProps) {
@@ -231,7 +241,7 @@ export default function BiReport({ report, candidateVersion, selectedCandidates 
   return (
     <aside className="flex h-full w-full shrink-0 flex-col overflow-hidden border-l border-slate-200 bg-white shadow-sm print-container xl:w-[420px]">
       <header className="flex h-14 items-center justify-between border-b border-slate-200 bg-white px-4 shrink-0">
-        <div><h2 className="text-xs font-bold uppercase tracking-widest text-slate-800">BI Intelligence Output</h2><p className="mt-0.5 text-[9px] text-slate-400">报告 v{report.report_version} · {new Date(report.generated_at).toLocaleString('zh-CN')}</p></div>
+        <div><h2 className="text-xs font-bold uppercase tracking-widest text-slate-800">BI 智能分析报告</h2><p className="mt-0.5 text-[9px] text-slate-400">报告 v{report.report_version} · {new Date(report.generated_at).toLocaleString('zh-CN')}</p></div>
         <button onClick={() => window.print()} className="no-print flex items-center gap-1.5 rounded-lg bg-indigo-600 px-3 py-1.5 text-[10px] font-bold text-white shadow-sm transition hover:bg-indigo-700" title="导出 PDF KOL 决策报告"><Printer className="h-3.5 w-3.5" />导出 PDF</button>
       </header>
       <div className="flex-1 space-y-3 overflow-y-auto bg-slate-50/40 p-3 print-scrollable">

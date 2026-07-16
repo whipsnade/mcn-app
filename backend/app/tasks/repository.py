@@ -99,6 +99,17 @@ class TaskRepository:
         await self.db.flush()
         return True
 
+    async def save_replan(self, task_id: str, worker_id: str, replan_json: dict[str, Any]) -> bool:
+        task = await self._locked(task_id)
+        if not self._owns_active_lease(task, worker_id) or task.replan_count >= 1:
+            return False
+        task.replan_json = replan_json
+        task.replan_count += 1
+        task.updated_at = utc_now()
+        await self.append_event(task.id, task.user_id, TaskEventType.REPLAN_READY, {"attempt": task.replan_count})
+        await self.db.flush()
+        return True
+
     async def cancel_requested(self, task_id: str) -> bool:
         return bool(
             await self.db.scalar(
@@ -118,6 +129,25 @@ class TaskRepository:
 
     async def mark_completed(self, task_id: str, worker_id: str) -> None:
         await self._mark_terminal(task_id, worker_id, TaskStatus.COMPLETED, TaskEventType.TASK_COMPLETED)
+
+    async def mark_completed_with_warnings(
+        self, task_id: str, worker_id: str, warning_code: str
+    ) -> None:
+        task = await self._locked(task_id)
+        if not self._owns_active_lease(task, worker_id) or task.status in TERMINAL_TASK_STATUSES:
+            return
+        now = utc_now()
+        task.status = TaskStatus.COMPLETED_WITH_WARNINGS
+        task.error_code = warning_code
+        task.completed_at = now
+        task.updated_at = now
+        await self.append_event(
+            task.id,
+            task.user_id,
+            TaskEventType.TASK_COMPLETED_WITH_WARNINGS,
+            {"code": warning_code},
+        )
+        await self.db.flush()
 
     async def mark_cancelled(self, task_id: str, worker_id: str) -> None:
         await self._mark_terminal(task_id, worker_id, TaskStatus.CANCELLED, TaskEventType.TASK_CANCELLED)

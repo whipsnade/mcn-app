@@ -182,6 +182,63 @@ def _normalize_datatap_xiaohongshu_candidate(
     )
 
 
+def _datatap_douyin_search_adapter(item: ToolEvidence) -> tuple[NormalizedKolEvidence, ...]:
+    raw_result = item.payload.get("result")
+    if not isinstance(raw_result, str):
+        raise ValueError("invalid_datatap_douyin_result")
+    try:
+        payload = json.loads(raw_result)
+    except json.JSONDecodeError as exc:
+        raise ValueError("invalid_datatap_douyin_result") from exc
+    candidates = payload.get("KOL 列表") if isinstance(payload, dict) else None
+    if not isinstance(candidates, list):
+        raise ValueError("invalid_datatap_douyin_candidates")
+    return tuple(_normalize_datatap_douyin_candidate(item, candidate) for candidate in candidates)
+
+
+def _normalize_datatap_douyin_candidate(
+    item: ToolEvidence, candidate: Any
+) -> NormalizedKolEvidence:
+    if not isinstance(candidate, dict):
+        raise ValueError("invalid_datatap_douyin_candidate")
+    account_id = _required_string(candidate, "账号ID (kwUid)")
+    platform = _optional_string(candidate.get("平台")) or "douyin"
+    if platform != "douyin":
+        raise ValueError("invalid_datatap_douyin_platform")
+    quoted_price = _first_price_list_value(candidate.get("预估报价"))
+    engagement_rate = _first_percentage(
+        candidate,
+        "互动率-日常作品",
+        "互动率-商单作品",
+    )
+    risk_flags: list[dict[str, Any]] = []
+    if candidate.get("近30天有发文") is False:
+        risk_flags.append({"type": "inactive_last_30_days"})
+    fields = {
+        "nickname": _optional_string(candidate.get("昵称")),
+        "normalized_profile_url": _optional_string(candidate.get("达人主页")),
+        "followers": _unit_integer(candidate.get("抖音粉丝数")),
+        "engagement_rate": engagement_rate,
+        "quoted_price_cny": quoted_price,
+        "content_score": _score(candidate.get("综合评分")),
+        "audience_score": _percentage(candidate.get("有效粉丝率")),
+        "engagement_score": engagement_rate,
+        "budget_score": None,
+        "growth_score": None,
+        "brand_safety_score": None,
+    }
+    missing = tuple(name for name, value in fields.items() if value is None)
+    return NormalizedKolEvidence(
+        platform=platform,
+        platform_account_id=account_id,
+        risk_flags=tuple(redact_evidence_for_storage(risk_flags)),
+        collected_at=item.collected_at,
+        evidence_references=(item.source_call_id,) if item.source_call_id else (),
+        missing_fields=missing,
+        **fields,
+    )
+
+
 def _normalize_candidate(item: ToolEvidence, candidate: Any) -> NormalizedKolEvidence:
     if not isinstance(candidate, dict):
         raise ValueError("invalid_creator_candidate")
@@ -321,6 +378,18 @@ def _first_currency(candidate: dict[str, Any], *names: str) -> float | None:
     return None
 
 
+def _first_price_list_value(value: Any) -> float | None:
+    if not isinstance(value, list):
+        return None
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        parsed = _currency_cny(item.get("值"))
+        if parsed is not None:
+            return parsed
+    return None
+
+
 def _score(value: Any) -> float | None:
     number = _decimal(value)
     if number is None:
@@ -350,4 +419,5 @@ _ADAPTERS: dict[str, Adapter] = {
     "bilibili.creator.search.v1": _creator_search_adapter,
     "bilibili.creator.profile.v1": _creator_search_adapter,
     "datatap.xiaohongshu.kol.search.v1": _datatap_xiaohongshu_search_adapter,
+    "datatap.douyin.kol.search.v1": _datatap_douyin_search_adapter,
 }

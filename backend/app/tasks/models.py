@@ -32,6 +32,8 @@ class AnalysisTask(Base):
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     plan_json: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     plan_version: Mapped[str | None] = mapped_column(String(32))
+    replan_json: Mapped[dict[str, Any] | None] = mapped_column(JSON)
+    replan_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     max_calls: Mapped[int] = mapped_column(Integer, nullable=False, default=10)
     estimated_points: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     error_code: Mapped[str | None] = mapped_column(String(64))

@@ -7,13 +7,15 @@ from uuid import NAMESPACE_URL, uuid5
 
 from app.mcp_gateway.service import ExecuteMcpCall
 from app.orchestration.batching import build_execution_batches
-from app.orchestration.schemas import ToolPlan
+from app.orchestration.schemas import ReplanContext, ReplanFailure, ToolPlan
 
 
 class TaskStore(Protocol):
     async def claim_lease(self, task_id: str, worker_id: str, lease_seconds: int) -> Any: ...
 
     async def save_plan(self, task_id: str, worker_id: str, plan_json: dict[str, Any]) -> bool: ...
+
+    async def save_replan(self, task_id: str, worker_id: str, replan_json: dict[str, Any]) -> bool: ...
 
     async def cancel_requested(self, task_id: str) -> bool: ...
 
@@ -22,6 +24,10 @@ class TaskStore(Protocol):
     async def renew_lease(self, task_id: str, worker_id: str, lease_seconds: int) -> bool: ...
 
     async def mark_completed(self, task_id: str, worker_id: str) -> None: ...
+
+    async def mark_completed_with_warnings(
+        self, task_id: str, worker_id: str, warning_code: str
+    ) -> None: ...
 
     async def mark_interrupted(self, task_id: str, worker_id: str) -> None: ...
 
@@ -100,6 +106,8 @@ class TaskExecutor:
             plan = await self._load_or_create_plan(task)
             if plan is None or lease_lost.is_set():
                 return
+            has_settled = False
+            partial_failure = False
             for batch in build_execution_batches(plan):
                 if lease_lost.is_set():
                     return
@@ -128,13 +136,30 @@ class TaskExecutor:
                     await self.repository.mark_interrupted(task.id, self.worker_id)
                     return
                 if statuses - {"settled"}:
-                    await self.repository.mark_failed(task.id, self.worker_id, "mcp_call_failed")
-                    return
+                    has_settled = has_settled or "settled" in statuses
+                    supplement = await self._load_or_create_replan(task, plan, rows)
+                    if supplement is not None:
+                        supplement_rows = await self.gateway.execute_batch(
+                            self._commands(task, supplement, revision="replan")
+                        )
+                        supplement_statuses = {getattr(row, "status", None) for row in supplement_rows}
+                        if supplement_statuses & {"unknown", "planned", "reserved", "running", "succeeded"}:
+                            await self.repository.mark_interrupted(task.id, self.worker_id)
+                            return
+                        has_settled = has_settled or "settled" in supplement_statuses
+                        partial_failure = bool(supplement_statuses - {"settled"})
+                    else:
+                        partial_failure = True
+                    break
+                has_settled = True
                 await self.checkpoint("after_settle")
                 if not await self.repository.renew_lease(
                     task.id, self.worker_id, self.lease_seconds
                 ):
                     return
+            if partial_failure and not has_settled:
+                await self.repository.mark_failed(task.id, self.worker_id, "mcp_call_failed")
+                return
             if self.artifacts is not None:
                 await self.artifacts.build_candidates(task.id)
             await self.checkpoint("after_candidates")
@@ -143,7 +168,12 @@ class TaskExecutor:
             await self.checkpoint("after_bi")
             if self.artifacts is not None:
                 await self.artifacts.stream_summary(task.id)
-            await self.repository.mark_completed(task.id, self.worker_id)
+            if partial_failure:
+                await self.repository.mark_completed_with_warnings(
+                    task.id, self.worker_id, "mcp_partial_failure"
+                )
+            else:
+                await self.repository.mark_completed(task.id, self.worker_id)
         except asyncio.CancelledError:
             await self.repository.mark_interrupted(task.id, self.worker_id)
             raise
@@ -166,6 +196,64 @@ class TaskExecutor:
         ):
             return None
         return plan
+
+    async def _load_or_create_replan(
+        self, task: Any, plan: ToolPlan, rows: tuple[Any, ...]
+    ) -> ToolPlan | None:
+        saved = getattr(task, "replan_json", None)
+        if saved is not None:
+            return ToolPlan.model_validate(saved)
+        replan_for = getattr(self.planner, "replan", None)
+        if replan_for is None:
+            return None
+        remaining_calls = max(0, int(getattr(task, "max_calls", 10)) - len(plan.steps))
+        if remaining_calls == 0:
+            return None
+        failures = tuple(
+            ReplanFailure(
+                step_id=str(getattr(row, "plan_step_id", "step_0")),
+                internal_tool_name=str(getattr(row, "internal_tool_name", "unknown")),
+                error_code=str(getattr(row, "error_type", "mcp_call_failed")),
+                diagnostic=(getattr(row, "evidence_json", {}) or {}).get("output_validation_diagnostic"),
+            )
+            for row in rows
+            if getattr(row, "status", None) != "settled"
+        )
+        if not failures:
+            return None
+        context = await self.context_builder.build(task.user_id, task.session_id)
+        supplement = await replan_for(
+            context,
+            ReplanContext(
+                completed_step_ids=tuple(
+                    str(getattr(row, "plan_step_id", ""))
+                    for row in rows
+                    if getattr(row, "status", None) == "settled"
+                ),
+                failed_steps=failures,
+                remaining_calls=remaining_calls,
+                remaining_points=remaining_calls * 10,
+            ),
+        )
+        if not await self.repository.save_replan(
+            task.id, self.worker_id, supplement.model_dump(mode="json")
+        ):
+            return None
+        return supplement
+
+    def _commands(self, task: Any, plan: ToolPlan, *, revision: str = "plan") -> tuple[ExecuteMcpCall, ...]:
+        return tuple(
+            ExecuteMcpCall(
+                logical_call_id=str(uuid5(NAMESPACE_URL, f"{task.id}:{revision}:{step.id}")),
+                user_id=task.user_id,
+                task_id=task.id,
+                plan_step_id=step.id,
+                internal_tool_name=step.internal_tool_name,
+                arguments=step.arguments,
+                lease_owner=self.worker_id,
+            )
+            for step in plan.steps
+        )
 
     async def _renew_lease_until_stopped(
         self, task_id: str, stop: asyncio.Event, lease_lost: asyncio.Event

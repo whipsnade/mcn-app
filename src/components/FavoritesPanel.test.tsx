@@ -12,7 +12,7 @@ vi.mock('../api/favorites', () => ({
 describe('FavoritesPanel', () => {
   beforeEach(() => {
     vi.mocked(listFavorites).mockResolvedValue([{
-      kol_id: 'kol-a', platform: 'xiaohongshu', platform_account_id: 'xhs-a', profile_url: null,
+      kol_id: 'kol-a', nickname: '达人甲', platform: 'xiaohongshu', platform_account_id: 'xhs-a', profile_url: null,
       note: null, source_task_id: 'task-1', created_at: '2026-07-15T10:00:00Z',
     }]);
     vi.mocked(deleteFavorite).mockResolvedValue();
@@ -20,25 +20,25 @@ describe('FavoritesPanel', () => {
 
   it('loads cross-session favorites and removes one through the star action', async () => {
     render(<FavoritesPanel refreshKey={1} />);
-    expect(await screen.findByText('kol-a')).toBeVisible();
+    expect(await screen.findByText('达人甲')).toBeVisible();
 
-    fireEvent.click(screen.getByRole('button', { name: '取消收藏 kol-a' }));
+    fireEvent.click(screen.getByRole('button', { name: '取消收藏 达人甲' }));
     await waitFor(() => expect(deleteFavorite).toHaveBeenCalledWith('kol-a'));
-    expect(screen.queryByText('kol-a')).not.toBeInTheDocument();
+    expect(screen.queryByText('达人甲')).not.toBeInTheDocument();
   });
 
   it('keeps loaded favorites and shows a retry-safe error when refresh or removal fails', async () => {
     const { rerender } = render(<FavoritesPanel refreshKey={1} />);
-    expect(await screen.findByText('kol-a')).toBeVisible();
+    expect(await screen.findByText('达人甲')).toBeVisible();
 
     vi.mocked(listFavorites).mockRejectedValueOnce(new Error('network'));
     rerender(<FavoritesPanel refreshKey={2} />);
     expect(await screen.findByRole('alert')).toHaveTextContent('收藏加载失败');
-    expect(screen.getByText('kol-a')).toBeVisible();
+    expect(screen.getByText('达人甲')).toBeVisible();
 
     vi.mocked(deleteFavorite).mockRejectedValueOnce(new Error('network'));
-    fireEvent.click(screen.getByRole('button', { name: '取消收藏 kol-a' }));
+    fireEvent.click(screen.getByRole('button', { name: '取消收藏 达人甲' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('取消收藏失败');
-    expect(screen.getByText('kol-a')).toBeVisible();
+    expect(screen.getByText('达人甲')).toBeVisible();
   });
 });

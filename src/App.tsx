@@ -30,6 +30,15 @@ export default function App() {
   const [favorites, setFavorites] = useState<readonly ApiFavorite[]>([]);
   const [favoriteRefreshKey, setFavoriteRefreshKey] = useState(0);
 
+  const refreshWallet = useCallback(async () => {
+    try {
+      const wallet = await getWallet();
+      setPoints(wallet.available);
+    } catch {
+      setPoints(null);
+    }
+  }, []);
+
   const syncFavorites = useCallback((items: readonly ApiFavorite[]) => {
     setFavorites(items);
   }, []);
@@ -54,18 +63,16 @@ export default function App() {
       return;
     }
 
-    let active = true;
-    getWallet()
-      .then(wallet => {
-        if (active) setPoints(wallet.available);
-      })
-      .catch(() => {
-        if (active) setPoints(null);
-      });
-    return () => {
-      active = false;
-    };
-  }, [authStatus]);
+    void refreshWallet();
+  }, [authStatus, refreshWallet]);
+
+  useEffect(() => {
+    if (authStatus !== 'authenticated') return;
+    const status = workspace.taskRuntime?.status;
+    const settled = workspace.taskRuntime?.activity === '本次调用积分已结算';
+    if (!settled && !['completed', 'failed', 'insufficient_balance', 'cancelled'].includes(status ?? '')) return;
+    void refreshWallet();
+  }, [authStatus, refreshWallet, workspace.taskRuntime?.activity, workspace.taskRuntime?.status]);
 
   const handleCreateSession = async (data: NewSessionData) => {
     await workspace.createSession({
@@ -77,6 +84,7 @@ export default function App() {
       budget_min: data.budgetMin,
       budget_max: data.budgetMax,
       initial_query: data.initialQuery,
+      filters: data.kolName ? { kol_name: data.kolName } : {},
     });
     setMobilePane('chat');
   };

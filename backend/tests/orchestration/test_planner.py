@@ -12,6 +12,8 @@ from app.orchestration.schemas import (
     PlannerContext,
     PlannerMessage,
     PlannerTool,
+    ReplanContext,
+    ReplanFailure,
     SessionBrief,
     ToolPlan,
     ToolPlanStep,
@@ -60,6 +62,15 @@ def _xiaohongshu_tool() -> PlannerTool:
             },
             "required": ["request"],
         },
+    )
+
+
+def _douyin_tool() -> PlannerTool:
+    return _xiaohongshu_tool().model_copy(
+        update={
+            "catalog_id": "catalog-douyin-1",
+            "internal_name": "datatap.douyin.kol.search.v1",
+        }
     )
 
 
@@ -248,3 +259,102 @@ async def test_plan_compiles_supported_defaults_for_datatap_xiaohongshu_search()
             "textContentWord": "科颜氏",
         }
     }
+
+
+@pytest.mark.asyncio
+async def test_plan_adds_a_search_step_for_each_selected_social_channel() -> None:
+    context = context_fixture(allowed_channels=("xiaohongshu", "douyin"), platforms=("xiaohongshu", "douyin"))
+    context = context.model_copy(
+        update={
+            "brief": context.brief.model_copy(
+                update={"brand": "科颜氏", "target_audience": "20～30女性"}
+            ),
+            "recent_messages": (
+                PlannerMessage(role="user", content="找最近30天活跃达人", sequence=1),
+            ),
+            "tools": (_xiaohongshu_tool(), _douyin_tool()),
+        }
+    )
+    plan = ToolPlan(
+        objective="双渠道找达人",
+        steps=(
+            ToolPlanStep(
+                id="step_1",
+                internal_tool_name="datatap.xiaohongshu.kol.search.v1",
+                arguments={"request": {}},
+                evidence_goal="小红书候选达人",
+            ),
+        ),
+    )
+    planner, _ = _planner(plan)
+
+    result = await planner.plan(context)
+
+    assert [step.internal_tool_name for step in result.steps] == [
+        "datatap.xiaohongshu.kol.search.v1",
+        "datatap.douyin.kol.search.v1",
+    ]
+    assert result.steps[1].id == "step_2"
+    assert result.steps[1].arguments["request"]["textContentWord"] == "科颜氏"
+
+
+@pytest.mark.asyncio
+async def test_replan_rejects_completed_steps_and_uses_remaining_call_budget() -> None:
+    planner, _ = _planner(plan_with_tool("kol.search"))
+    recovery = ReplanContext(
+        completed_step_ids=("step_1",),
+        failed_steps=(
+            ReplanFailure(
+                step_id="step_2",
+                internal_tool_name="kol.search",
+                error_code="output_validation_error",
+            ),
+        ),
+        remaining_calls=1,
+        remaining_points=10,
+    )
+
+    with pytest.raises(PlanValidationError) as caught:
+        await planner.replan(context_fixture(), recovery)
+
+    assert caught.value.code == "REPLAN_REUSES_COMPLETED_STEP"
+
+
+@pytest.mark.asyncio
+async def test_replan_request_contains_safe_diagnostic_but_no_raw_tool_output() -> None:
+    replan = ToolPlan(
+        objective="补充候选数据",
+        steps=(
+            ToolPlanStep(
+                id="step_3",
+                internal_tool_name="kol.search",
+                arguments={"keyword": "美妆"},
+                evidence_goal="补充候选达人",
+            ),
+        ),
+    )
+    planner, model = _planner(replan)
+    recovery = ReplanContext(
+        completed_step_ids=("step_1",),
+        failed_steps=(
+            ReplanFailure(
+                step_id="step_2",
+                internal_tool_name="kol.search",
+                error_code="output_validation_error",
+                diagnostic={
+                    "error_code": "schema_validation_error",
+                    "shape": {"type": "object", "object_field_count": 2},
+                },
+            ),
+        ),
+        remaining_calls=1,
+        remaining_points=10,
+    )
+
+    result = await planner.replan(context_fixture(), recovery)
+
+    assert result.steps[0].id == "step_3"
+    serialized = model.structured_requests[0].messages[-1].content
+    assert "schema_validation_error" in serialized
+    assert "达人原始昵称" not in serialized
+    assert "https://datatap" not in serialized

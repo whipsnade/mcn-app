@@ -76,9 +76,12 @@ class DatabaseTaskStore:
 
     async def claim_lease(self, *args: Any): return await self._write("claim_lease", *args)
     async def save_plan(self, *args: Any): return await self._write("save_plan", *args)
+    async def save_replan(self, *args: Any): return await self._write("save_replan", *args)
     async def cancel_requested(self, *args: Any): return await self._read("cancel_requested", *args)
     async def renew_lease(self, *args: Any): return await self._write("renew_lease", *args)
     async def mark_completed(self, *args: Any): return await self._write("mark_completed", *args)
+    async def mark_completed_with_warnings(self, *args: Any):
+        return await self._write("mark_completed_with_warnings", *args)
     async def mark_cancelled(self, *args: Any): return await self._write("mark_cancelled", *args)
     async def mark_interrupted(self, *args: Any): return await self._write("mark_interrupted", *args)
     async def mark_failed(self, *args: Any): return await self._write("mark_failed", *args)
@@ -114,6 +117,9 @@ class _PlanArguments:
             if task is None or task.plan_json is None:
                 raise LookupError("task_plan_not_found")
             for step in task.plan_json.get("steps", []):
+                if step.get("id") == plan_step_id:
+                    return step["arguments"]
+            for step in (task.replan_json or {}).get("steps", []):
                 if step.get("id") == plan_step_id:
                     return step["arguments"]
         raise LookupError("task_plan_step_not_found")

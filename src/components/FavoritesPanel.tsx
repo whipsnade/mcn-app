@@ -10,6 +10,10 @@ interface FavoritesPanelProps {
   onFavoritesChange?: (favorites: readonly ApiFavorite[]) => void;
 }
 
+function platformName(platform: string): string {
+  return ({ xiaohongshu: '小红书', douyin: '抖音', bilibili: '哔哩哔哩', weibo: '微博', wechat: '微信' } as Record<string, string>)[platform] ?? platform;
+}
+
 export default function FavoritesPanel({ refreshKey, onCountChange, onFavoritesChange }: FavoritesPanelProps) {
   const [favorites, setFavorites] = useState<ApiFavorite[]>([]);
   const [loading, setLoading] = useState(true);
@@ -52,5 +56,5 @@ export default function FavoritesPanel({ refreshKey, onCountChange, onFavoritesC
   if (loading && !favorites.length) return <div className="flex flex-1 items-center justify-center bg-slate-50 text-xs font-medium text-slate-400">正在加载收藏…</div>;
   if (!favorites.length) return <div className="flex flex-1 flex-col items-center justify-center gap-2 bg-slate-50 text-xs font-medium text-slate-400">{error && <span role="alert" className="text-rose-500">{error}</span>}还没有收藏的达人</div>;
 
-  return <div className="min-h-0 flex-1 overflow-y-auto bg-slate-50 p-4"><div className="space-y-2">{error && <p role="alert" className="rounded-lg border border-rose-100 bg-rose-50 px-3 py-2 text-[11px] font-medium text-rose-600">{error}</p>}{favorites.map(favorite => <div key={favorite.kol_id} className="flex items-center justify-between rounded-xl border border-slate-200 bg-white px-4 py-3 shadow-sm"><div><div className="text-xs font-semibold text-slate-800">{favorite.kol_id}</div><div className="mt-1 text-[10px] text-slate-400">{favorite.platform} · 跨会话收藏</div></div><button type="button" aria-label={`取消收藏 ${favorite.kol_id}`} onClick={() => void remove(favorite.kol_id)} className="rounded-lg p-1.5 text-amber-500 transition hover:bg-amber-50"><Star className="h-3.5 w-3.5 fill-amber-400" /></button></div>)}</div></div>;
+  return <div className="min-h-0 flex-1 overflow-y-auto bg-slate-50 p-4"><div className="space-y-2">{error && <p role="alert" className="rounded-lg border border-rose-100 bg-rose-50 px-3 py-2 text-[11px] font-medium text-rose-600">{error}</p>}{favorites.map(favorite => { const name = favorite.nickname?.trim() || '未命名达人'; return <div key={favorite.kol_id} className="flex items-center justify-between rounded-xl border border-slate-200 bg-white px-4 py-3 shadow-sm"><div><div className="text-xs font-semibold text-slate-800">{name}</div><div className="mt-1 text-[10px] text-slate-400">{platformName(favorite.platform)} · 跨会话收藏</div></div><button type="button" aria-label={`取消收藏 ${name}`} onClick={() => void remove(favorite.kol_id)} className="rounded-lg p-1.5 text-amber-500 transition hover:bg-amber-50"><Star className="h-3.5 w-3.5 fill-amber-400" /></button></div>; })}</div></div>;
 }
