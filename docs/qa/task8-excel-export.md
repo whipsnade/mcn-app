@@ -14,16 +14,18 @@
 - 80 条候选（超过模板预留行）成功导出，候选按任务候选池 `full_rank` 顺序稳定写入，平台可同时包含小红书和抖音。
 - 动态移动评级汇总和图表锚点，写入过程不向 `MergedCell` 赋值。
 - 超出预留行时，评级汇总五种行样式仍复用模板对应样式行。
+- 详情页先解除附件中不等长的历史达人块合并，再以首个 31 行块的样式/行高为标准重建每个达人块；第 8 位从 `A218:F248`、第 9 位从 `A249:F279`、第 80 位从 `A2450:F2480` 独立布局，块间无残留合并影响字段写入。
+- 详情页交界检查确认第 8 位 `A247:F247`、第 9 位 `A278:F278`、第 80 位 `A2479:F2479` 均为 `A:F` 摘要合并，且标题/分节样式与首块一致。
 - artifact-tool 紧凑检查：4 个工作表可导入，首表范围 `A1:S93`，达人详情、粉丝画像和方法论工作表均可导入。
 - 80 条候选的动态评级区已检查并渲染 `A87:S120`（实际数据至 `S93`，其余区域保持模板空白）。
-- 详情工作表保留附件模板 `B:F` 内容合并和 `A:F` 分节合并；方法论工作表保留 `A1:D1`、`A3:D3`、`A15:D15`、`A24:D24` 及整段来源说明合并，并恢复完整评级映射。
+- 详情工作表按标准块重建 `B:F` 内容合并和 `A:F` 分节/摘要合并，并渲染交界区域 `A218:F279` 与第 80 位区域 `A2450:F2480`；方法论工作表保留 `A1:D1`、`A3:D3`、`A15:D15`、`A24:D24` 及整段来源说明合并，并恢复完整评级映射。
 - artifact-tool 公式错误扫描：匹配 `#REF!|#DIV/0!|#VALUE!|#NAME?|#N/A`，命中 0 项。
 - artifact-tool 已渲染四张工作表关键区域用于视觉检查：首表 `A1:S30`、达人详情 `A1:F30`、粉丝画像 `A1:M20`、方法论 `A1:D31`。
 
 ## 自动化测试
 
-- `backend/.venv/bin/pytest -q tests/reporting/test_exporter.py tests/reporting/test_export_route.py -k 'not hides_deleted_session'`：9 passed。
-- `backend/.venv/bin/ruff check ...`：通过。
+- `backend/.venv/bin/pytest -q tests/reporting/test_exporter.py tests/reporting/test_export_route.py -k 'not hides_deleted_session'`：11 passed，1 deselected；包含详情第 8/9/80 位合并与摘要位置断言。
+- `backend/.venv/bin/ruff check app/reporting/exporter.py`：通过。
 - `npm run test`：153 passed。
 - `npm run build`：通过（仅有 Vite chunk size 提示）。
 - reporting 全量测试：49 passed，5 项需要 MySQL；当前沙箱禁止连接 `127.0.0.1:3306`，因此未能执行数据库集成路径。

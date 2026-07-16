@@ -164,7 +164,7 @@ def render_workbook(*, metadata: dict[str, Any], candidates: Sequence[ExportCand
     summary = workbook["小红书KOL匹配度筛选"]
     summary.title = "KOL匹配度筛选"
     _render_summary(summary, metadata, candidates)
-    _render_detail_template(workbook["达人详细画像"], metadata, candidates)
+    _render_detail_standard_blocks(workbook["达人详细画像"], metadata, candidates)
     _render_fan_profile(workbook["粉丝画像详情"], metadata, candidates)
     _render_methodology_preserving_template(workbook["评分方法论与数据来源"], metadata, candidates)
     output = BytesIO()
@@ -270,81 +270,73 @@ def _render_rating_summary(sheet: Any, candidates: Sequence[ExportCandidate], *,
                 series.val.numRef.f = f"'{sheet.title}'!$S${start_row}:$S${start_row + 4}"
 
 
-def _render_detail(sheet: Any, metadata: dict[str, Any], candidates: Sequence[ExportCandidate]) -> None:
-    _clear_sheet(sheet)
-    _set_widths(sheet, {"A": 24, "B": 36, "C": 22, "D": 22, "E": 22, "F": 22})
-    row = 1
-    for candidate in candidates:
-        title = f"#{candidate.rank} {candidate.nickname} — {candidate.rating} {candidate.stars} (综合评分: {_display(candidate.total_score)})"
-        _write_detail_header(sheet, row, title)
-        row += 1
-        sections = [
-            ("【达人概况】", (("平台", _platform_label(candidate.platform)), ("城市", candidate.city or "数据缺失"), ("粉丝数", _display(candidate.followers)), ("主页链接", candidate.profile_url or "数据缺失"))),
-            ("【内容与帖子表现】", (("内容标签", candidate.values.get("content_tags", "数据缺失")), ("平均阅读/播放", candidate.values.get("average_reads", "数据缺失")), ("平均互动", candidate.values.get("average_interactions", "数据缺失")), ("互动率", candidate.values.get("engagement_rate", "数据缺失")))),
-            ("【粉丝画像】", (("目标地区粉丝占比", candidate.values.get("target_region_rate", "数据缺失")), ("目标年龄段占比", candidate.values.get("target_age_rate", "数据缺失")), ("活跃粉丝率", candidate.values.get("active_follower_rate", "数据缺失")), ("行业兴趣占比", candidate.values.get("industry_interest_rate", "数据缺失")))),
-            ("【综合评估】", (("综合评分", _display(candidate.total_score)), ("星级", candidate.stars), ("评级", candidate.rating), ("评分明细", _score_detail(candidate.dimension_scores)))),
-            ("【评估理由】", (("评分理由", candidate.score_reason or "数据缺失"), ("数据来源", "、".join(candidate.source_names) or "数据来源未标注"), ("采集时间", candidate.collected_at or "数据缺失"),)),
-        ]
-        for section, entries in sections:
-            _merge_range_if_missing(sheet, row, 1, 6)
-            sheet.cell(row, 1).value = section
-            sheet.cell(row, 1).font = Font(name="微软雅黑", bold=True, color="1F4E79", size=12)
-            row += 1
-            for label, value in entries:
-                _merge_range_if_missing(sheet, row, 2, 6)
-                rendered = _cell_value(_present(value))
-                sheet.cell(row, 1).value = label
-                if isinstance(sheet.cell(row, 2), MergedCell):
-                    # The template's summary row is merged A:F, so its
-                    # anchor is A rather than B.
-                    sheet.cell(row, 1).value = f"{label}：{rendered}"
-                else:
-                    sheet.cell(row, 2).value = rendered
-                sheet.cell(row, 1).font = Font(name="微软雅黑", bold=True, size=10)
-                if not isinstance(sheet.cell(row, 2), MergedCell):
-                    sheet.cell(row, 2).alignment = Alignment(wrap_text=True, vertical="top")
-                row += 1
-        row += 1
+def _render_detail_standard_blocks(sheet: Any, metadata: dict[str, Any], candidates: Sequence[ExportCandidate]) -> None:
+    """Render every detail page as an independent copy of the first 31-row block.
 
+    The attachment contains legacy blocks whose starting rows are not uniform.
+    Keeping those merges while appending fixed-size blocks lets a merge from a
+    later legacy block swallow cells in the current block.  We therefore take
+    the first block's styles as the canonical template, remove every existing
+    merge on this sheet, and then rebuild the same merge topology for each
+    candidate (including dynamically appended candidates).
+    """
+    block_size = 31
+    base_styles = {
+        (offset, column): copy(sheet.cell(1 + offset, column)._style)
+        for offset in range(block_size)
+        for column in range(1, 7)
+    }
+    base_heights = {offset: sheet.row_dimensions[1 + offset].height for offset in range(block_size)}
 
-def _render_detail_template(sheet: Any, metadata: dict[str, Any], candidates: Sequence[ExportCandidate]) -> None:
-    """Render detail blocks using the attachment's original merged row layout."""
-    _clear_sheet(sheet)
+    for merged in list(sheet.merged_cells.ranges):
+        sheet.unmerge_cells(str(merged))
+    for row in sheet.iter_rows():
+        for cell in row:
+            cell.value = None
+
     _set_widths(sheet, {"A": 24, "B": 36, "C": 22, "D": 22, "E": 22, "F": 22})
-    row = 1
-    for candidate in candidates:
+    for index, candidate in enumerate(candidates):
+        start = 1 + index * block_size
+        for offset in range(block_size):
+            row = start + offset
+            if base_heights[offset] is not None:
+                sheet.row_dimensions[row].height = base_heights[offset]
+            for column in range(1, 7):
+                sheet.cell(row, column)._style = copy(base_styles[(offset, column)])
+
         title = (
             f"#{candidate.rank} {_platform_label(candidate.platform)} {candidate.nickname} — "
             f"{candidate.rating} {candidate.stars} (综合评分: {_display(candidate.total_score)}；"
             f"公开主页：{candidate.profile_url or '数据缺失'})"
         )
-        _write_detail_header(sheet, row, title)
-        row += 1
+        _merge_range_if_missing(sheet, start, 1, 6)
+        _write_detail_header(sheet, start, title)
         sections = [
-            ("【达人概况】", (("城市", candidate.city), ("粉丝数", candidate.followers), ("总赞藏", candidate.values.get("total_likes")), ("赞藏/粉丝比", candidate.values.get("likes_followers_ratio")), ("内容标签", candidate.values.get("content_tags")), ("性别", candidate.values.get("gender")))),
-            ("【帖子表现】", (("平均阅读", candidate.values.get("average_reads")), ("平均互动", candidate.values.get("average_interactions")), ("互动率", candidate.values.get("engagement_rate")))),
-            ("【粉丝画像】", (("<18岁", candidate.values.get("age_under_18")), ("18-24岁", candidate.values.get("age_18_24")), ("25-34岁", candidate.values.get("age_25_34")), ("35-44岁", candidate.values.get("age_35_44")), (">44岁", candidate.values.get("age_over_44")), ("浙江粉丝占比", candidate.values.get("target_region_rate")), ("活跃粉丝率", candidate.values.get("active_follower_rate")), ("兴趣Top标签", candidate.values.get("content_tags")), ("省份", candidate.values.get("province")))),
-            ("【综合评估】", (("综合评分", candidate.total_score), ("星级", candidate.stars), ("评级", candidate.rating), ("评分明细", _score_detail(candidate.dimension_scores)), ("评估理由", candidate.score_reason))),
-            ("【综合概述】", (("报告摘要", candidate.values.get("summary")),)),
+            (1, "【达人概况】", (("城市", candidate.city), ("粉丝数", candidate.followers), ("总赞藏", candidate.values.get("total_likes")), ("赞藏/粉丝比", candidate.values.get("likes_followers_ratio")), ("内容标签", candidate.values.get("content_tags")), ("性别", candidate.values.get("gender")))),
+            (8, "【帖子表现】", (("平均阅读", candidate.values.get("average_reads")), ("平均互动", candidate.values.get("average_interactions")), ("互动率", candidate.values.get("engagement_rate")))),
+            (12, "【粉丝画像】", (("<18岁", candidate.values.get("age_under_18")), ("18-24岁", candidate.values.get("age_18_24")), ("25-34岁", candidate.values.get("age_25_34")), ("35-44岁", candidate.values.get("age_35_44")), (">44岁", candidate.values.get("age_over_44")), ("浙江粉丝占比", candidate.values.get("target_region_rate")), ("活跃粉丝率", candidate.values.get("active_follower_rate")), ("兴趣Top标签", candidate.values.get("content_tags")), ("省份", candidate.values.get("province")))),
+            (22, "【综合评估】", (("综合评分", candidate.total_score), ("星级", candidate.stars), ("评级", candidate.rating), ("评分明细", _score_detail(candidate.dimension_scores)), ("评估理由", candidate.score_reason))),
+            (28, "【综合概述】", (("报告摘要", candidate.values.get("summary")),)),
         ]
-        for section, entries in sections:
-            _merge_range_if_missing(sheet, row, 1, 6)
-            sheet.cell(row, 1).value = section
-            sheet.cell(row, 1).font = Font(name="微软雅黑", bold=True, color="1F4E79", size=12)
-            row += 1
-            for label, value in entries:
-                _merge_range_if_missing(sheet, row, 2, 6)
+        for section_offset, section, entries in sections:
+            section_row = start + section_offset
+            _merge_range_if_missing(sheet, section_row, 1, 6)
+            section_cell = sheet.cell(section_row, 1)
+            section_cell.value = section
+            section_cell.font = Font(name="微软雅黑", bold=True, color="1F4E79", size=12)
+            for entry_offset, (label, value) in enumerate(entries, start=section_offset + 1):
+                row = start + entry_offset
                 rendered = _cell_value(_present(value))
-                sheet.cell(row, 1).value = label
-                if isinstance(sheet.cell(row, 2), MergedCell):
+                if section == "【综合概述】":
+                    _merge_range_if_missing(sheet, row, 1, 6)
                     sheet.cell(row, 1).value = f"{label}：{rendered}"
                 else:
+                    _merge_range_if_missing(sheet, row, 2, 6)
+                    sheet.cell(row, 1).value = label
                     sheet.cell(row, 2).value = rendered
-                sheet.cell(row, 1).font = Font(name="微软雅黑", bold=True, size=10)
-                if not isinstance(sheet.cell(row, 2), MergedCell):
                     sheet.cell(row, 2).alignment = Alignment(wrap_text=True, vertical="top")
-                row += 1
-        row += 1
+                sheet.cell(row, 1).font = Font(name="微软雅黑", bold=True, size=10)
+        # Offset 30 is intentionally left blank between independent blocks.
 
 
 def _render_fan_profile(sheet: Any, metadata: dict[str, Any], candidates: Sequence[ExportCandidate]) -> None:

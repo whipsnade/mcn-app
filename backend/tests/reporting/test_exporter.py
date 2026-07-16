@@ -122,6 +122,23 @@ def test_render_workbook_writes_only_merged_range_anchors_when_rows_expand() -> 
     assert summary.cell(88, 1)._style == summary.cell(22, 1)._style
 
 
+def test_detail_blocks_rebuild_standard_merges_at_late_and_dynamic_rows() -> None:
+    content = render_workbook(
+        metadata={"brand": "详情块测试", "category": "餐饮", "generated_at": "2026-07-16"},
+        candidates=[_candidate(index) for index in range(1, 81)],
+    )
+    workbook = load_workbook(BytesIO(content), read_only=False, data_only=False)
+    detail = workbook["达人详细画像"]
+    merged = {str(item) for item in detail.merged_cells.ranges}
+    for start in (218, 249, 2450):
+        assert f"A{start}:F{start}" in merged
+        assert f"A{start + 1}:F{start + 1}" in merged
+        assert f"B{start + 2}:F{start + 2}" in merged
+        assert f"A{start + 29}:F{start + 29}" in merged
+        assert str(detail.cell(start + 29, 1).value).startswith("报告摘要：")
+        assert detail.cell(start + 29, 2).value is None
+
+
 def test_export_candidate_keeps_public_profile_url_and_platform() -> None:
     candidate = _candidate(1)
     candidate = ExportCandidate(**{**candidate.__dict__, "profile_url": "https://example.com/达人1"})
