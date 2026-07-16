@@ -119,6 +119,28 @@ def test_safe_followup_error_uses_whitelisted_code_and_safe_diagnostics() -> Non
     assert "sk-secret" not in str(error)
 
 
+def test_safe_validation_error_path_does_not_echo_untrusted_schema_keys() -> None:
+    payload = {
+        "suggestions": [
+            {
+                **_suggestion(1),
+                "sk-secret": "https://internal.example/api/token",
+            }
+        ]
+    }
+    try:
+        FollowupSuggestions.model_validate(payload)
+    except ValidationError as error:
+        safe = safe_followup_error(error, stage="parse")
+    else:  # pragma: no cover - assertion guard
+        raise AssertionError("expected schema failure")
+    encoded = str(safe)
+    assert "sk-secret" not in encoded
+    assert "https://" not in encoded
+    assert "internal" not in encoded
+    assert "<field>" in encoded
+
+
 def test_task_read_prefers_persisted_assistant_metadata_fields() -> None:
     from types import SimpleNamespace
 

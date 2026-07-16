@@ -50,6 +50,12 @@ _SAFE_ERROR_CODES = {
     "FOLLOWUP_SCHEMA_INVALID",
     "FOLLOWUP_GENERATION_FAILED",
 }
+_SAFE_SCHEMA_SEGMENTS = {
+    "suggestions",
+    "title",
+    "prompt",
+    "rationale",
+}
 
 
 def contains_internal_reference(value: str) -> bool:
@@ -160,11 +166,19 @@ def safe_followup_error(error: BaseException, *, stage: str) -> dict[str, Any]:
         fields = []
         for item in error.errors(include_url=False, include_input=False)[:20]:
             loc = item.get("loc", ())
+            safe_path: list[str | int] = []
+            for segment in loc[:8]:
+                if isinstance(segment, int) and 0 <= segment <= 10_000:
+                    safe_path.append(segment)
+                elif isinstance(segment, str) and segment in _SAFE_SCHEMA_SEGMENTS:
+                    safe_path.append(segment)
+                else:
+                    safe_path.append("<field>")
             fields.append({
-                "field": ".".join(str(part)[:64] for part in loc[:8]),
+                "field": ".".join(str(part) for part in safe_path),
                 "type": str(item.get("type", "validation_error"))[:64],
                 "length": len(str(item.get("msg", ""))),
-                "schema_path": list(loc[:8]),
+                "schema_path": safe_path,
             })
         code = "FOLLOWUP_SCHEMA_INVALID"
     else:
