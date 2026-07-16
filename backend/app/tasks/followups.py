@@ -273,7 +273,10 @@ class FollowupExecutionLock:
             return True
         except Exception:
             if self._db is not None:
-                await self._db.close()
+                try:
+                    await self._db.close()
+                except Exception:
+                    pass
                 self._db = None
             self.lock_error = True
             await self._memory.release(self.task_id)
