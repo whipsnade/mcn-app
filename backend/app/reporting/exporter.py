@@ -10,6 +10,7 @@ from typing import Any, Sequence
 from openpyxl import load_workbook
 from openpyxl.cell.cell import MergedCell
 from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -163,9 +164,9 @@ def render_workbook(*, metadata: dict[str, Any], candidates: Sequence[ExportCand
     summary = workbook["小红书KOL匹配度筛选"]
     summary.title = "KOL匹配度筛选"
     _render_summary(summary, metadata, candidates)
-    _render_detail(workbook["达人详细画像"], metadata, candidates)
+    _render_detail_template(workbook["达人详细画像"], metadata, candidates)
     _render_fan_profile(workbook["粉丝画像详情"], metadata, candidates)
-    _render_methodology(workbook["评分方法论与数据来源"], metadata, candidates)
+    _render_methodology_preserving_template(workbook["评分方法论与数据来源"], metadata, candidates)
     output = BytesIO()
     workbook.save(output)
     return output.getvalue()
@@ -221,24 +222,25 @@ def _summary_headers(metadata: dict[str, Any]) -> list[str]:
 
 def _summary_values(candidate: ExportCandidate) -> list[Any]:
     scores = candidate.dimension_scores
+    present = _present
     return [
         candidate.rank,
         _platform_label(candidate.platform),
         candidate.nickname,
         candidate.stars,
-        candidate.followers,
-        candidate.city or "数据缺失",
-        scores.get("industry_interest"),
-        scores.get("target_region"),
-        scores.get("target_age"),
-        scores.get("engagement"),
-        scores.get("active_follower"),
-        scores.get("content"),
-        scores.get("followers"),
-        scores.get("engagement_follower_ratio"),
-        candidate.total_score,
-        candidate.rating,
-        candidate.score_reason,
+        present(candidate.followers),
+        present(candidate.city),
+        present(scores.get("industry_interest")),
+        present(scores.get("target_region")),
+        present(scores.get("target_age")),
+        present(scores.get("engagement")),
+        present(scores.get("active_follower")),
+        present(scores.get("content")),
+        present(scores.get("followers")),
+        present(scores.get("engagement_follower_ratio")),
+        present(candidate.total_score),
+        present(candidate.rating),
+        present(candidate.score_reason),
     ]
 
 
@@ -284,14 +286,63 @@ def _render_detail(sheet: Any, metadata: dict[str, Any], candidates: Sequence[Ex
             ("【评估理由】", (("评分理由", candidate.score_reason or "数据缺失"), ("数据来源", "、".join(candidate.source_names) or "数据来源未标注"), ("采集时间", candidate.collected_at or "数据缺失"),)),
         ]
         for section, entries in sections:
+            _merge_range_if_missing(sheet, row, 1, 6)
             sheet.cell(row, 1).value = section
             sheet.cell(row, 1).font = Font(name="微软雅黑", bold=True, color="1F4E79", size=12)
             row += 1
             for label, value in entries:
+                _merge_range_if_missing(sheet, row, 2, 6)
+                rendered = _cell_value(_present(value))
                 sheet.cell(row, 1).value = label
-                sheet.cell(row, 2).value = _cell_value(value)
+                if isinstance(sheet.cell(row, 2), MergedCell):
+                    # The template's summary row is merged A:F, so its
+                    # anchor is A rather than B.
+                    sheet.cell(row, 1).value = f"{label}：{rendered}"
+                else:
+                    sheet.cell(row, 2).value = rendered
                 sheet.cell(row, 1).font = Font(name="微软雅黑", bold=True, size=10)
-                sheet.cell(row, 2).alignment = Alignment(wrap_text=True, vertical="top")
+                if not isinstance(sheet.cell(row, 2), MergedCell):
+                    sheet.cell(row, 2).alignment = Alignment(wrap_text=True, vertical="top")
+                row += 1
+        row += 1
+
+
+def _render_detail_template(sheet: Any, metadata: dict[str, Any], candidates: Sequence[ExportCandidate]) -> None:
+    """Render detail blocks using the attachment's original merged row layout."""
+    _clear_sheet(sheet)
+    _set_widths(sheet, {"A": 24, "B": 36, "C": 22, "D": 22, "E": 22, "F": 22})
+    row = 1
+    for candidate in candidates:
+        title = (
+            f"#{candidate.rank} {_platform_label(candidate.platform)} {candidate.nickname} — "
+            f"{candidate.rating} {candidate.stars} (综合评分: {_display(candidate.total_score)}；"
+            f"公开主页：{candidate.profile_url or '数据缺失'})"
+        )
+        _write_detail_header(sheet, row, title)
+        row += 1
+        sections = [
+            ("【达人概况】", (("城市", candidate.city), ("粉丝数", candidate.followers), ("总赞藏", candidate.values.get("total_likes")), ("赞藏/粉丝比", candidate.values.get("likes_followers_ratio")), ("内容标签", candidate.values.get("content_tags")), ("性别", candidate.values.get("gender")))),
+            ("【帖子表现】", (("平均阅读", candidate.values.get("average_reads")), ("平均互动", candidate.values.get("average_interactions")), ("互动率", candidate.values.get("engagement_rate")))),
+            ("【粉丝画像】", (("<18岁", candidate.values.get("age_under_18")), ("18-24岁", candidate.values.get("age_18_24")), ("25-34岁", candidate.values.get("age_25_34")), ("35-44岁", candidate.values.get("age_35_44")), (">44岁", candidate.values.get("age_over_44")), ("浙江粉丝占比", candidate.values.get("target_region_rate")), ("活跃粉丝率", candidate.values.get("active_follower_rate")), ("兴趣Top标签", candidate.values.get("content_tags")), ("省份", candidate.values.get("province")))),
+            ("【综合评估】", (("综合评分", candidate.total_score), ("星级", candidate.stars), ("评级", candidate.rating), ("评分明细", _score_detail(candidate.dimension_scores)), ("评估理由", candidate.score_reason))),
+            ("【综合概述】", (("报告摘要", candidate.values.get("summary")),)),
+        ]
+        for section, entries in sections:
+            _merge_range_if_missing(sheet, row, 1, 6)
+            sheet.cell(row, 1).value = section
+            sheet.cell(row, 1).font = Font(name="微软雅黑", bold=True, color="1F4E79", size=12)
+            row += 1
+            for label, value in entries:
+                _merge_range_if_missing(sheet, row, 2, 6)
+                rendered = _cell_value(_present(value))
+                sheet.cell(row, 1).value = label
+                if isinstance(sheet.cell(row, 2), MergedCell):
+                    sheet.cell(row, 1).value = f"{label}：{rendered}"
+                else:
+                    sheet.cell(row, 2).value = rendered
+                sheet.cell(row, 1).font = Font(name="微软雅黑", bold=True, size=10)
+                if not isinstance(sheet.cell(row, 2), MergedCell):
+                    sheet.cell(row, 2).alignment = Alignment(wrap_text=True, vertical="top")
                 row += 1
         row += 1
 
@@ -301,9 +352,9 @@ def _render_fan_profile(sheet: Any, metadata: dict[str, Any], candidates: Sequen
     headers = ["序号", "平台", "昵称", "粉丝数", "<18岁%", "18-24岁%", "25-34岁%", "35-44岁%", ">44岁%", "目标地区粉丝%", "活跃粉丝%", f"{metadata.get('category') or '行业'}兴趣%", "综合评分"]
     _write_styled_row(sheet, 1, headers, source_row=1)
     for row, candidate in enumerate(candidates, start=2):
-        values = [candidate.rank, _platform_label(candidate.platform), candidate.nickname, candidate.followers]
-        values.extend(candidate.values.get(key, "数据缺失") for key in ("age_under_18", "age_18_24", "age_25_34", "age_35_44", "age_over_44", "target_region_rate", "active_follower_rate", "industry_interest_rate"))
-        values.append(candidate.total_score)
+        values = [candidate.rank, _platform_label(candidate.platform), candidate.nickname, _present(candidate.followers)]
+        values.extend(_present(candidate.values.get(key, "数据缺失")) for key in ("age_under_18", "age_18_24", "age_25_34", "age_35_44", "age_over_44", "target_region_rate", "active_follower_rate", "industry_interest_rate"))
+        values.append(_present(candidate.total_score))
         _write_styled_row(sheet, row, values, source_row=2)
         _apply_score_fill(sheet.cell(row, 13), candidate.total_score)
     _set_widths(sheet, {"A": 7, "B": 12, "C": 18, "D": 12, "E": 11, "F": 11, "G": 11, "H": 11, "I": 11, "J": 14, "K": 14, "L": 14, "M": 12})
@@ -335,6 +386,62 @@ def _render_methodology(sheet: Any, metadata: dict[str, Any], candidates: Sequen
         _write_styled_row(sheet, row, list(values), source_row=4 if row == 4 else 5)
         for cell in sheet[row]:
             cell.alignment = Alignment(wrap_text=True, vertical="top")
+    _set_widths(sheet, {"A": 24, "B": 18, "C": 48, "D": 48})
+
+
+def _render_methodology_preserving_template(
+    sheet: Any, metadata: dict[str, Any], candidates: Sequence[ExportCandidate]
+) -> None:
+    """Populate the original methodology layout without destroying its merges."""
+    _clear_sheet(sheet)
+    _merge_range_if_missing(sheet, 1, 1, 4)
+    sheet["A1"] = "评分方法论与数据来源"
+    sheet["A1"].font = Font(name="微软雅黑", bold=True, size=16, color="1F4E79")
+    dimensions = [
+        (f"{metadata.get('category') or '行业'}兴趣占比", 20, "按 MCP 返回的行业兴趣占比评分，上限20", "行业兴趣是本轮投放匹配的核心指标"),
+        ("目标地区粉丝占比", 15, "按用户指定地区占比评分，上限15", "地区由本轮会话筛选条件确定"),
+        ("目标年龄段占比", 15, "按 MCP 返回的年龄分布评分，上限15", "年龄分桶按 MCP 实际返回口径聚合"),
+        ("互动率", 15, "按平台规范化互动率评分，上限15", "平台口径在采集结果中保留"),
+        ("活跃粉丝率", 10, "按活跃粉丝比例评分，上限10", "缺失时标记数据缺失"),
+        ("内容标签匹配", 10, "按行业和提问中的内容要求评估，上限10", "不得编造未返回标签"),
+        ("粉丝规模", 10, "按粉丝规模评分，上限10", "粉丝数为规范化数值"),
+        ("互动沉淀与粉丝比", 5, "按各平台可获得的赞、藏、评等指标计算，上限5", "抖音和小红书采用各自平台口径"),
+    ]
+    _merge_range_if_missing(sheet, 3, 1, 4)
+    sheet["A3"] = "一、评分维度与计算方式"
+    _write_styled_row(sheet, 4, ["维度", "满分", "计算方式", "说明"], source_row=4)
+    for row, values in enumerate(dimensions, start=5):
+        _write_styled_row(sheet, row, values, source_row=row)
+
+    _merge_range_if_missing(sheet, 15, 1, 4)
+    sheet["A15"] = "二、评级映射"
+    _write_styled_row(sheet, 16, ["评级", "星级", "分数区间", "建议"], source_row=16)
+    ratings = [
+        ("强烈推荐", "★★★★★", "≥78", "优先合作，匹配度极高"),
+        ("推荐", "★★★★", "62-77", "建议合作，匹配度良好"),
+        ("谨慎推荐", "★★★", "48-61", "可考虑合作，需关注短板"),
+        ("可考虑", "★★", "35-47", "匹配度一般，需评估性价比"),
+        ("不推荐", "★", "<35", "匹配度低，不建议合作"),
+    ]
+    for row, values in enumerate(ratings, start=17):
+        _write_styled_row(sheet, row, values, source_row=row)
+        _apply_rating_fill(sheet.cell(row, 1), values[0])
+
+    _merge_range_if_missing(sheet, 24, 1, 4)
+    sheet["A24"] = "三、数据来源说明"
+    source_rows = [
+        f"1. 本轮候选总数：{len(candidates)}。",
+        "2. 来源服务：{}。".format("、".join(sorted({name for item in candidates for name in item.source_names})) or "数据来源未标注"),
+        "3. 缺失字段统一显示“数据缺失”，评分理由会标注按规则处理的字段。",
+        "4. 本工作簿不包含内部 ID、MCP 调用 ID、密钥、接口地址或原始响应。",
+        "5. 多平台候选按最新任务候选池的综合评分排序稳定导出。",
+        "6. 主页链接仅保留达人公开主页，字段缺失时显示“数据缺失”。",
+        f"7. 报告生成日期：{str(metadata.get('generated_at') or '')[:10]}。",
+    ]
+    for row, text in enumerate(source_rows, start=25):
+        _merge_range_if_missing(sheet, row, 1, 4)
+        sheet.cell(row, 1).value = text
+        sheet.cell(row, 1).alignment = Alignment(wrap_text=True, vertical="top")
     _set_widths(sheet, {"A": 24, "B": 18, "C": 48, "D": 48})
 
 
@@ -374,11 +481,17 @@ def _clear_rows(sheet: Any, start: int, end: int, columns: int) -> None:
 
 
 def _clear_sheet(sheet: Any) -> None:
-    for merged in list(sheet.merged_cells.ranges):
-        sheet.unmerge_cells(str(merged))
+    """Clear values while preserving the template's merged-cell topology."""
     for row in sheet.iter_rows():
         for cell in row:
-            cell.value = None
+            if not isinstance(cell, MergedCell):
+                cell.value = None
+
+
+def _merge_range_if_missing(sheet: Any, row: int, start_column: int, end_column: int) -> None:
+    reference = f"{get_column_letter(start_column)}{row}:{get_column_letter(end_column)}{row}"
+    if not any(str(item) == reference for item in sheet.merged_cells.ranges):
+        sheet.merge_cells(reference)
 
 
 def _ensure_summary_merge(sheet: Any, reference: str) -> None:
@@ -443,6 +556,11 @@ def _display(value: Any) -> str:
 def _cell_value(value: Any) -> Any:
     """将结构化 MCP 字段转换为 Excel 可写的标量，同时保留数字类型。"""
     return _display(value) if isinstance(value, (list, tuple, set, dict)) else value
+
+
+def _present(value: Any) -> Any:
+    """将缺失业务字段显式标记，避免 Excel 中出现难以区分的空白。"""
+    return "数据缺失" if value is None else value
 
 
 def _platform_label(platform: str) -> str:

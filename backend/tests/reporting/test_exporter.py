@@ -51,7 +51,7 @@ def test_render_workbook_contains_all_candidates_and_template_sheets() -> None:
         candidates=[_candidate(index) for index in range(1, 13)],
     )
 
-    workbook = load_workbook(BytesIO(content), read_only=True, data_only=False)
+    workbook = load_workbook(BytesIO(content), read_only=False, data_only=False)
 
     assert workbook.sheetnames == [
         "KOL匹配度筛选",
@@ -66,6 +66,44 @@ def test_render_workbook_contains_all_candidates_and_template_sheets() -> None:
     assert summary[5][1].value in {"小红书", "抖音"}
     assert "平台: 小红书、抖音" in (summary[2][0].value or "")
     assert workbook["粉丝画像详情"].max_row >= 1 + 12
+    detail = workbook["达人详细画像"]
+    methodology = workbook["评分方法论与数据来源"]
+    assert "B3:F3" in {str(item) for item in detail.merged_cells.ranges}
+    assert "A13:F13" in {str(item) for item in detail.merged_cells.ranges}
+    assert "A15:D15" in {str(item) for item in methodology.merged_cells.ranges}
+    assert "A24:D24" in {str(item) for item in methodology.merged_cells.ranges}
+    assert "A31:D31" in {str(item) for item in methodology.merged_cells.ranges}
+
+
+def test_render_workbook_uses_chinese_placeholder_for_missing_candidate_fields() -> None:
+    candidate = ExportCandidate(
+        rank=1,
+        platform="xiaohongshu",
+        nickname="缺失达人",
+        followers=None,
+        city=None,
+        total_score=None,
+        rating="数据缺失",
+        stars="数据缺失",
+        dimension_scores={key: None for key in (
+            "industry_interest", "target_region", "target_age", "engagement",
+            "active_follower", "content", "followers", "engagement_follower_ratio",
+        )},
+    )
+    content = render_workbook(
+        metadata={"brand": "缺失字段", "category": "美妆", "generated_at": "2026-07-16"},
+        candidates=[candidate],
+    )
+    workbook = load_workbook(BytesIO(content), read_only=False, data_only=False)
+    summary = workbook["KOL匹配度筛选"]
+    assert summary[5][4].value == "数据缺失"  # 粉丝数
+    assert summary[5][5].value == "数据缺失"  # 城市
+    assert summary[5][6].value == "数据缺失"  # 首个维度分
+    assert summary[5][14].value == "数据缺失"  # 综合评分
+    fan_profile = workbook["粉丝画像详情"]
+    assert fan_profile[2][3].value == "数据缺失"
+    detail = workbook["达人详细画像"]
+    assert detail["B5"].value == "数据缺失"
 
 
 def test_render_workbook_writes_only_merged_range_anchors_when_rows_expand() -> None:
@@ -93,6 +131,6 @@ def test_export_candidate_keeps_public_profile_url_and_platform() -> None:
     )
     workbook = load_workbook(BytesIO(content), read_only=True, data_only=False)
     detail = workbook["达人详细画像"]
-    values = [row[1].value for row in detail.iter_rows(min_col=1, max_col=2) if row[0].value]
-    assert "小红书" in values
-    assert "https://example.com/达人1" in values
+    values = [cell.value for row in detail.iter_rows() for cell in row if cell.value]
+    assert any("小红书" in str(value) for value in values)
+    assert any("https://example.com/达人1" in str(value) for value in values)
