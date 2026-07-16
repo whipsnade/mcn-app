@@ -877,6 +877,8 @@ describe('useWorkspace', () => {
 
     expect(result.current.activeSession?.status).toBe('analyzing');
     expect(result.current.activeSession?.analysis?.status).toBe('running');
+    expect(result.current.isAnalyzing).toBe(true);
+    expect(result.current.taskRuntime).toBeUndefined();
   });
 
   it.each([

@@ -47,6 +47,7 @@ export function useWorkspace(userId?: string) {
   const sessionOperationEpochsRef = useRef(new Map<string, number>());
   const taskCreateInFlightRef = useRef<TaskCreateLock | null>(null);
   const taskRuntime = useTaskStream(activeTaskId);
+  const currentTaskRuntime = taskRuntime?.taskId === activeTaskId ? taskRuntime : undefined;
 
   const getSessionOperationEpoch = useCallback(
     (id: string) => sessionOperationEpochsRef.current.get(id) ?? 0,
@@ -416,36 +417,36 @@ export function useWorkspace(userId?: string) {
   }, [activeSessionId, getSessionOperationEpoch, sessionOperationIsCurrent, sessions, userId]);
 
   useEffect(() => {
-    if (!taskRuntime || !activeTaskId || taskRuntime.taskId !== activeTaskId) return;
+    if (!currentTaskRuntime || !activeTaskId) return;
     const generation = generationRef.current;
     setSessions(current => current.map(session => session.analysis?.taskId === activeTaskId ? {
       ...session,
-      status: taskRuntime.status === 'completed' || taskRuntime.status === 'completed_with_warnings'
+      status: currentTaskRuntime.status === 'completed' || currentTaskRuntime.status === 'completed_with_warnings'
         ? 'completed'
         : session.status,
       analysis: {
         ...session.analysis,
-        status: taskRuntime.status ?? session.analysis.status,
-        candidateVersion: taskRuntime.candidateVersion ?? session.analysis.candidateVersion,
-        reportId: taskRuntime.visibleReportId ?? (
-          taskRuntime.candidateVersion !== undefined
-            && taskRuntime.candidateVersion !== session.analysis.candidateVersion
+        status: currentTaskRuntime.status ?? session.analysis.status,
+        candidateVersion: currentTaskRuntime.candidateVersion ?? session.analysis.candidateVersion,
+        reportId: currentTaskRuntime.visibleReportId ?? (
+          currentTaskRuntime.candidateVersion !== undefined
+            && currentTaskRuntime.candidateVersion !== session.analysis.candidateVersion
             ? undefined
             : session.analysis.reportId
         ),
       },
-      biReport: taskRuntime.candidateVersion !== undefined
-        && session.biReport?.candidate_version !== taskRuntime.candidateVersion
+      biReport: currentTaskRuntime.candidateVersion !== undefined
+        && session.biReport?.candidate_version !== currentTaskRuntime.candidateVersion
         ? undefined
         : session.biReport,
-      candidates: taskRuntime.candidateVersion !== undefined
-        && session.analysis.candidateVersion !== taskRuntime.candidateVersion
+      candidates: currentTaskRuntime.candidateVersion !== undefined
+        && session.analysis.candidateVersion !== currentTaskRuntime.candidateVersion
         ? undefined
         : session.candidates,
     } : session));
-    if (taskRuntime.candidateVersion !== undefined) {
+    if (currentTaskRuntime.candidateVersion !== undefined) {
       const requestedTaskId = activeTaskId;
-      const requestedCandidateVersion = taskRuntime.candidateVersion;
+      const requestedCandidateVersion = currentTaskRuntime.candidateVersion;
       void getCandidates(requestedTaskId)
         .then(page => {
           if (
@@ -475,8 +476,8 @@ export function useWorkspace(userId?: string) {
         })
         .catch(() => undefined);
     }
-    if (taskRuntime.errorMessage && taskRuntime.errorMessageId) {
-      const errorMessageId = taskRuntime.errorMessageId;
+    if (currentTaskRuntime.errorMessage && currentTaskRuntime.errorMessageId) {
+      const errorMessageId = currentTaskRuntime.errorMessageId;
       setSessions(current => current.map(session => {
         if (session.analysis?.taskId !== activeTaskId || session.messages.some(message => message.id === errorMessageId)) {
           return session;
@@ -486,16 +487,16 @@ export function useWorkspace(userId?: string) {
           messages: [...session.messages, {
             id: errorMessageId,
             sender: 'ai' as const,
-            text: taskRuntime.errorMessage ?? '分析任务执行失败，请稍后重试。',
+            text: currentTaskRuntime.errorMessage ?? '分析任务执行失败，请稍后重试。',
             timestamp: new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }),
           }],
         };
       }));
     }
-    if (taskRuntime.visibleReportId) {
+    if (currentTaskRuntime.visibleReportId) {
       const requestedTaskId = activeTaskId;
-      const requestedCandidateVersion = taskRuntime.candidateVersion;
-      const requestedReportId = taskRuntime.visibleReportId;
+      const requestedCandidateVersion = currentTaskRuntime.candidateVersion;
+      const requestedReportId = currentTaskRuntime.visibleReportId;
       void getReport(requestedReportId)
         .then(report => {
           if (
@@ -513,14 +514,14 @@ export function useWorkspace(userId?: string) {
         })
         .catch(() => undefined);
     }
-  }, [activeTaskId, taskRuntime]);
+  }, [activeTaskId, currentTaskRuntime]);
 
   const activeSession = useMemo(
     () => sessions.find(session => session.id === activeSessionId),
     [activeSessionId, sessions],
   );
   const isAnalyzing = busy || Boolean(
-    activeSession?.analysis && taskIsInProgress(taskRuntime?.status ?? activeSession.analysis.status),
+    activeSession?.analysis && taskIsInProgress(currentTaskRuntime?.status ?? activeSession.analysis.status),
   );
 
   return {
@@ -528,7 +529,7 @@ export function useWorkspace(userId?: string) {
     activeSession,
     activeSessionId,
     activeTaskId,
-    taskRuntime,
+    taskRuntime: currentTaskRuntime,
     loading,
     busy,
     isAnalyzing,

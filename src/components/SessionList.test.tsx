@@ -1,5 +1,5 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
-import type { ComponentProps } from 'react';
+import { useState, type ComponentProps } from 'react';
 import { describe, expect, it, vi } from 'vitest';
 
 import type { Session } from '../types';
@@ -42,6 +42,21 @@ function deferred<T>() {
     promise: new Promise<T>(next => { resolve = next; }),
     resolve,
   };
+}
+
+function DeletionHarness({ initialSessions }: { initialSessions: Session[] }) {
+  const [sessions, setSessions] = useState(initialSessions);
+  return (
+    <SessionList
+      sessions={sessions}
+      activeSessionId={sessions[0]?.id ?? ''}
+      onSelectSession={vi.fn()}
+      onOpenNewModal={vi.fn()}
+      onDeleteSession={async id => setSessions(current => current.filter(session => session.id !== id))}
+      points={null}
+      onOpenRecharge={vi.fn()}
+    />
+  );
 }
 
 
@@ -135,11 +150,34 @@ describe('SessionList', () => {
 
     const dialog = screen.getByRole('alertdialog', { name: '确定删除这个会话吗？' });
     expect(dialog).toHaveAccessibleDescription('删除后无法恢复。');
+    expect(dialog).not.toHaveAttribute('aria-modal');
     expect(screen.getByRole('button', { name: '确认删除' })).toHaveFocus();
 
     fireEvent.keyDown(dialog, { key: 'Escape' });
     expect(screen.queryByRole('alertdialog')).toBeNull();
     expect(trigger).toHaveFocus();
+  });
+
+  it('focuses the first remaining session selector after successful deletion', async () => {
+    const secondSession = { ...baseSession, id: 'session-2', title: '第二个会话' };
+    render(<DeletionHarness initialSessions={[baseSession, secondSession]} />);
+
+    fireEvent.click(screen.getByRole('button', { name: '删除会话 自定义会话名' }));
+    fireEvent.click(screen.getByRole('button', { name: '确认删除' }));
+
+    await waitFor(() => expect(screen.queryByRole('alertdialog')).toBeNull());
+    const remainingSelector = screen.getByRole('button', { name: '选择会话 第二个会话' });
+    await waitFor(() => expect(remainingSelector).toHaveFocus());
+  });
+
+  it('focuses the new-session trigger after deleting the last session', async () => {
+    render(<DeletionHarness initialSessions={[baseSession]} />);
+
+    fireEvent.click(screen.getByRole('button', { name: '删除会话 自定义会话名' }));
+    fireEvent.click(screen.getByRole('button', { name: '确认删除' }));
+
+    await waitFor(() => expect(screen.queryByRole('alertdialog')).toBeNull());
+    await waitFor(() => expect(screen.getByRole('button', { name: '新建分析会话' })).toHaveFocus());
   });
 
   it('shows a Chinese inline error and allows retry after deletion fails', async () => {

@@ -63,6 +63,8 @@ export default function SessionList({
   const [confirmingDeleteId, setConfirmingDeleteId] = useState<string | null>(null);
   const [deletingSessionId, setDeletingSessionId] = useState<string | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const newSessionButtonRef = useRef<HTMLButtonElement | null>(null);
   const deleteTriggerRefs = useRef(new Map<string, HTMLButtonElement>());
   const confirmDeleteButtonRef = useRef<HTMLButtonElement | null>(null);
   const returnFocusSessionIdRef = useRef<string | null>(null);
@@ -96,8 +98,21 @@ export default function SessionList({
     }
     const returnFocusSessionId = returnFocusSessionIdRef.current;
     if (!returnFocusSessionId) return;
-    deleteTriggerRefs.current.get(returnFocusSessionId)?.focus();
-    returnFocusSessionIdRef.current = null;
+    const deleteTrigger = deleteTriggerRefs.current.get(returnFocusSessionId);
+    if (deleteTrigger) {
+      deleteTrigger.focus();
+      returnFocusSessionIdRef.current = null;
+      return;
+    }
+    const frameId = window.requestAnimationFrame(() => {
+      const nextFocusTarget =
+        rootRef.current?.querySelector<HTMLButtonElement>('[data-session-select]')
+        ?? newSessionButtonRef.current;
+      nextFocusTarget?.focus();
+      returnFocusSessionIdRef.current = null;
+    });
+
+    return () => window.cancelAnimationFrame(frameId);
   }, [confirmingDeleteId]);
 
   useEffect(() => {
@@ -148,7 +163,7 @@ export default function SessionList({
   });
 
   return (
-    <div className={`flex h-full w-full flex-col bg-white border-r border-slate-200 xl:w-80 shrink-0 no-print ${className ?? ''}`}>
+    <div ref={rootRef} className={`flex h-full w-full flex-col bg-white border-r border-slate-200 xl:w-80 shrink-0 no-print ${className ?? ''}`}>
       
       {/* List Header */}
       <div className="p-4 border-b border-slate-100 bg-white">
@@ -169,6 +184,8 @@ export default function SessionList({
               </button>
             )}
             <button 
+              ref={newSessionButtonRef}
+              data-new-session-trigger
               onClick={onOpenNewModal}
               className="flex h-7 w-7 items-center justify-center rounded-lg bg-indigo-600 hover:bg-indigo-700 text-white shadow-sm transition active:scale-95"
               title="新建分析会话"
@@ -295,9 +312,18 @@ export default function SessionList({
                   </div>
                 ) : (
                   <div className="flex items-center justify-between w-full">
-                    <span className={`font-semibold text-xs truncate max-w-[140px] ${isActive ? 'text-indigo-800' : 'text-slate-800'}`}>
+                    <button
+                      type="button"
+                      data-session-select={session.id}
+                      aria-label={`选择会话 ${displayName}`}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        onSelectSession(session.id);
+                      }}
+                      className={`max-w-[140px] truncate bg-transparent p-0 text-left text-xs font-semibold ${isActive ? 'text-indigo-800' : 'text-slate-800'}`}
+                    >
                       {displayName}
-                    </span>
+                    </button>
                     <div className="flex items-center gap-1 shrink-0">
                       <button
                         onClick={(e) => {
@@ -356,7 +382,6 @@ export default function SessionList({
                     onClick={event => event.stopPropagation()}
                     className="rounded-lg border border-rose-100 bg-rose-50/70 p-2"
                     role="alertdialog"
-                    aria-modal="true"
                     aria-labelledby={`delete-dialog-title-${session.id}`}
                     aria-describedby={`delete-dialog-description-${session.id}`}
                   >
