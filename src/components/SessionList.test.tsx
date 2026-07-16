@@ -107,6 +107,41 @@ describe('SessionList', () => {
     await waitFor(() => expect(screen.queryByText('确定删除这个会话吗？')).toBeNull());
   });
 
+  it('does not allow another session confirmation while deletion is in flight', async () => {
+    const pending = deferred<void>();
+    const secondSession = { ...baseSession, id: 'session-2', title: '第二个会话' };
+    const onDeleteSession = vi.fn(() => pending.promise);
+    renderList({ sessions: [baseSession, secondSession], onDeleteSession });
+
+    fireEvent.click(screen.getByRole('button', { name: '删除会话 自定义会话名' }));
+    fireEvent.click(screen.getByRole('button', { name: '确认删除' }));
+
+    const secondTrigger = screen.getByRole('button', { name: '删除会话 第二个会话' });
+    expect(secondTrigger).toBeDisabled();
+    fireEvent.click(secondTrigger);
+    expect(screen.getAllByRole('alertdialog')).toHaveLength(1);
+    expect(onDeleteSession).toHaveBeenCalledWith('session-1');
+    expect(onDeleteSession).toHaveBeenCalledTimes(1);
+
+    pending.resolve();
+    await waitFor(() => expect(screen.queryByRole('alertdialog')).toBeNull());
+  });
+
+  it('provides alert dialog semantics, focus management, and Escape cancellation', () => {
+    renderList({ onDeleteSession: vi.fn() });
+    const trigger = screen.getByRole('button', { name: '删除会话 自定义会话名' });
+
+    fireEvent.click(trigger);
+
+    const dialog = screen.getByRole('alertdialog', { name: '确定删除这个会话吗？' });
+    expect(dialog).toHaveAccessibleDescription('删除后无法恢复。');
+    expect(screen.getByRole('button', { name: '确认删除' })).toHaveFocus();
+
+    fireEvent.keyDown(dialog, { key: 'Escape' });
+    expect(screen.queryByRole('alertdialog')).toBeNull();
+    expect(trigger).toHaveFocus();
+  });
+
   it('shows a Chinese inline error and allows retry after deletion fails', async () => {
     const onDeleteSession = vi.fn().mockRejectedValue(new Error('network failed'));
     renderList({ onDeleteSession });

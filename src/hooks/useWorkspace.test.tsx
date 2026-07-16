@@ -334,6 +334,45 @@ describe('useWorkspace', () => {
     expect(result.current.activeTaskId).toBe('task-b');
   });
 
+  it('does not bind a late task creation response to a different active session', async () => {
+    const otherSession = {
+      ...session,
+      id: 'session-2',
+      title: '会话 B',
+      analysis: { taskId: 'task-b', status: 'completed' },
+    };
+    const pendingTask = deferred<{
+      id: string; session_id: string; status: 'pending'; estimated_points: number; error_code: null; latest_report_id: null;
+    }>();
+    vi.mocked(listSessions).mockResolvedValue([session, otherSession]);
+    vi.mocked(getSession).mockImplementation(async id => id === 'session-1' ? restoredSession : otherSession);
+    vi.mocked(createTask).mockReturnValue(pendingTask.promise);
+    const { result } = renderHook(() => useWorkspace('user-a'));
+    await waitFor(() => expect(result.current.activeSession?.id).toBe('session-1'));
+
+    let appendPromise!: Promise<unknown>;
+    act(() => {
+      appendPromise = result.current.appendMessage('会话 A 的任务');
+    });
+    await waitFor(() => expect(createTask).toHaveBeenCalledOnce());
+    await act(async () => {
+      await result.current.selectSession('session-2');
+    });
+    await waitFor(() => expect(result.current.activeTaskId).toBe('task-b'));
+
+    await act(async () => {
+      pendingTask.resolve({
+        id: 'task-a-late', session_id: 'session-1', status: 'pending', estimated_points: 0,
+        error_code: null, latest_report_id: null,
+      });
+      await appendPromise;
+    });
+
+    expect(result.current.activeSession?.id).toBe('session-2');
+    expect(result.current.activeTaskId).toBe('task-b');
+    expect(result.current.sessions.find(item => item.id === 'session-1')?.analysis?.taskId).toBe('task-a-late');
+  });
+
   it('ignores a late retry response after its session is deleted', async () => {
     const pendingRetry = deferred<{
       id: string; session_id: string; status: 'pending'; estimated_points: number; error_code: null;
@@ -416,6 +455,49 @@ describe('useWorkspace', () => {
       });
       await retryPromise;
     });
+    expect(result.current.activeTaskId).toBe('task-b');
+  });
+
+  it('does not bind a late retry response to a different active session', async () => {
+    const otherSession = {
+      ...session,
+      id: 'session-2',
+      title: '会话 B',
+      analysis: { taskId: 'task-b', status: 'completed' },
+    };
+    const pendingRetry = deferred<{
+      id: string; session_id: string; status: 'pending'; estimated_points: number; error_code: null;
+      error_message: null; latest_report_id: null;
+    }>();
+    vi.mocked(listSessions).mockResolvedValue([session, otherSession]);
+    vi.mocked(getSession).mockImplementation(async id => id === 'session-1' ? {
+      ...restoredSession,
+      analysis: { taskId: 'task-old', status: 'failed' },
+      messages: restoredSession.messages.map(message => ({ ...message, taskId: 'task-old' })),
+    } : otherSession);
+    vi.mocked(retryTask).mockReturnValue(pendingRetry.promise);
+    const { result } = renderHook(() => useWorkspace('user-a'));
+    await waitFor(() => expect(result.current.activeTaskId).toBe('task-old'));
+
+    let retryPromise!: Promise<unknown>;
+    act(() => {
+      retryPromise = result.current.retryMessage('message-1');
+    });
+    await waitFor(() => expect(retryTask).toHaveBeenCalledOnce());
+    await act(async () => {
+      await result.current.selectSession('session-2');
+    });
+    await waitFor(() => expect(result.current.activeTaskId).toBe('task-b'));
+
+    await act(async () => {
+      pendingRetry.resolve({
+        id: 'task-retry-late', session_id: 'session-1', status: 'pending', estimated_points: 0,
+        error_code: null, error_message: null, latest_report_id: null,
+      });
+      await retryPromise;
+    });
+
+    expect(result.current.activeSession?.id).toBe('session-2');
     expect(result.current.activeTaskId).toBe('task-b');
   });
 
@@ -634,7 +716,7 @@ describe('useWorkspace', () => {
     expect(getReport).toHaveBeenCalledWith('report-2');
   });
 
-  it('does not restore a BI report when the fetched candidate version has advanced', async () => {
+  it('drops an advanced candidate response and does not restore its older BI report', async () => {
     vi.mocked(getSession).mockResolvedValue({
       ...restoredSession,
       analysis: { taskId: 'task-1', status: 'completed', candidateVersion: 2, reportId: 'report-2' },
@@ -648,9 +730,42 @@ describe('useWorkspace', () => {
     });
 
     const { result } = renderHook(() => useWorkspace('user-a'));
-    await waitFor(() => expect(result.current.activeSession?.candidates).toEqual([]));
+    await waitFor(() => expect(result.current.loading).toBe(false));
 
-    expect(result.current.activeSession?.analysis?.candidateVersion).toBe(3);
+    expect(result.current.activeSession?.analysis?.candidateVersion).toBe(2);
+    expect(result.current.activeSession?.candidates).toBeUndefined();
+    expect(result.current.activeSession?.biReport).toBeUndefined();
+  });
+
+  it('drops historical candidates returned for another task', async () => {
+    vi.mocked(getSession).mockResolvedValue({
+      ...restoredSession,
+      analysis: { taskId: 'task-1', status: 'completed', candidateVersion: 2 },
+    });
+    vi.mocked(getCandidates).mockResolvedValue({
+      ...candidatePage(2, 'kol-wrong-task'),
+      task_id: 'task-other',
+    });
+
+    const { result } = renderHook(() => useWorkspace('user-a'));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    expect(result.current.activeSession?.analysis?.candidateVersion).toBe(2);
+    expect(result.current.activeSession?.candidates).toBeUndefined();
+  });
+
+  it('drops a historical report returned for another task', async () => {
+    vi.mocked(getSession).mockResolvedValue({
+      ...restoredSession,
+      analysis: { taskId: 'task-1', status: 'completed', candidateVersion: 2, reportId: 'report-2' },
+    });
+    vi.mocked(getCandidates).mockResolvedValue(candidatePage(2, 'kol-2'));
+    vi.mocked(getReport).mockResolvedValue({ ...report(2), task_id: 'task-other' });
+
+    const { result } = renderHook(() => useWorkspace('user-a'));
+    await waitFor(() => expect(result.current.loading).toBe(false));
+
+    expect(result.current.activeSession?.candidates?.[0]?.kolId).toBe('kol-2');
     expect(result.current.activeSession?.biReport).toBeUndefined();
   });
 
@@ -704,6 +819,114 @@ describe('useWorkspace', () => {
 
     expect(result.current.activeSession?.candidates?.[0]?.kolId).toBe('kol-new');
     expect(result.current.activeSession?.biReport?.id).toBe('report-2');
+  });
+
+  it('keeps v2 candidates when the older v1 request returns last', async () => {
+    const v1Candidates = deferred<ReturnType<typeof candidatePage>>();
+    const v2Candidates = deferred<ReturnType<typeof candidatePage>>();
+    vi.mocked(getSession).mockResolvedValue({
+      ...restoredSession,
+      status: 'analyzing',
+      analysis: { taskId: 'task-1', status: 'running' },
+    });
+    vi.mocked(getCandidates)
+      .mockReturnValueOnce(v1Candidates.promise)
+      .mockReturnValueOnce(v2Candidates.promise);
+    const { result, rerender } = renderHook(() => useWorkspace('user-a'));
+    await waitFor(() => expect(result.current.activeTaskId).toBe('task-1'));
+
+    vi.mocked(useTaskStream).mockReturnValue({
+      taskId: 'task-1', lastEventId: 1, assistantDraft: '', connection: 'connected', candidateVersion: 1,
+    });
+    rerender();
+    await waitFor(() => expect(getCandidates).toHaveBeenCalledTimes(1));
+
+    vi.mocked(useTaskStream).mockReturnValue({
+      taskId: 'task-1', lastEventId: 2, assistantDraft: '', connection: 'connected', candidateVersion: 2,
+    });
+    rerender();
+    await waitFor(() => expect(getCandidates).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      v2Candidates.resolve(candidatePage(2, 'kol-v2'));
+      await v2Candidates.promise;
+    });
+    await waitFor(() => expect(result.current.activeSession?.candidates?.[0]?.kolId).toBe('kol-v2'));
+
+    await act(async () => {
+      v1Candidates.resolve(candidatePage(2, 'kol-v1-late'));
+      await v1Candidates.promise;
+    });
+
+    expect(result.current.activeSession?.analysis?.candidateVersion).toBe(2);
+    expect(result.current.activeSession?.candidates?.[0]?.kolId).toBe('kol-v2');
+  });
+
+  it('ignores a task runtime that does not belong to the active task', async () => {
+    vi.mocked(getSession).mockResolvedValue({
+      ...restoredSession,
+      status: 'analyzing',
+      analysis: { taskId: 'task-current', status: 'running' },
+    });
+    vi.mocked(useTaskStream).mockReturnValue({
+      taskId: 'task-stale', lastEventId: 1, assistantDraft: '', connection: 'connected', status: 'completed',
+    });
+
+    const { result } = renderHook(() => useWorkspace('user-a'));
+    await waitFor(() => expect(result.current.activeTaskId).toBe('task-current'));
+
+    expect(result.current.activeSession?.status).toBe('analyzing');
+    expect(result.current.activeSession?.analysis?.status).toBe('running');
+  });
+
+  it.each([
+    ['wrong task', { ...candidatePage(1, 'kol-wrong-task'), task_id: 'task-other' }],
+    ['wrong version', { ...candidatePage(2, 'kol-wrong-version'), task_id: 'task-1' }],
+  ])('ignores a candidate response with %s metadata', async (_label, response) => {
+    const pendingCandidates = deferred<ReturnType<typeof candidatePage>>();
+    vi.mocked(getSession).mockResolvedValue({
+      ...restoredSession,
+      status: 'analyzing',
+      analysis: { taskId: 'task-1', status: 'running' },
+    });
+    vi.mocked(getCandidates).mockReturnValue(pendingCandidates.promise);
+    vi.mocked(useTaskStream).mockReturnValue({
+      taskId: 'task-1', lastEventId: 1, assistantDraft: '', connection: 'connected', candidateVersion: 1,
+    });
+    const { result } = renderHook(() => useWorkspace('user-a'));
+    await waitFor(() => expect(getCandidates).toHaveBeenCalledWith('task-1'));
+
+    await act(async () => {
+      pendingCandidates.resolve(response);
+      await pendingCandidates.promise;
+    });
+
+    expect(result.current.activeSession?.analysis?.candidateVersion).toBe(1);
+    expect(result.current.activeSession?.candidates).toBeUndefined();
+  });
+
+  it('ignores a report response for another task', async () => {
+    const pendingReport = deferred<ReturnType<typeof report>>();
+    vi.mocked(getSession).mockResolvedValue({
+      ...restoredSession,
+      status: 'analyzing',
+      analysis: { taskId: 'task-1', status: 'running' },
+    });
+    vi.mocked(getCandidates).mockResolvedValue(candidatePage(1, 'kol-1'));
+    vi.mocked(getReport).mockReturnValue(pendingReport.promise);
+    vi.mocked(useTaskStream).mockReturnValue({
+      taskId: 'task-1', lastEventId: 1, assistantDraft: '', connection: 'connected',
+      candidateVersion: 1, visibleReportId: 'report-1',
+    });
+    const { result } = renderHook(() => useWorkspace('user-a'));
+    await waitFor(() => expect(getReport).toHaveBeenCalledWith('report-1'));
+
+    await act(async () => {
+      pendingReport.resolve({ ...report(1), task_id: 'task-other' });
+      await pendingReport.promise;
+    });
+
+    expect(result.current.activeSession?.biReport).toBeUndefined();
   });
 
   it('retries a terminal message in the same session and clears old artifacts', async () => {

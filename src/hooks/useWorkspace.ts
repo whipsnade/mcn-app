@@ -72,7 +72,7 @@ export function useWorkspace(userId?: string) {
       || generationRef.current !== generation
       || !sessionOperationIsCurrent(session.id, operationEpoch)
     ) return session;
-    const [candidatePage, report] = await Promise.all([
+    const [candidateResponse, reportResponse] = await Promise.all([
       analysis.candidateVersion === undefined ? Promise.resolve(undefined) : getCandidates(analysis.taskId),
       analysis.reportId === undefined ? Promise.resolve(undefined) : getReport(analysis.reportId),
     ]);
@@ -80,13 +80,21 @@ export function useWorkspace(userId?: string) {
       generationRef.current !== generation
       || !sessionOperationIsCurrent(session.id, operationEpoch)
     ) return session;
-    const resolvedCandidateVersion = candidatePage?.version ?? analysis.candidateVersion;
-    const matchingReport = report?.candidate_version === resolvedCandidateVersion ? report : undefined;
+    const candidatePage = candidateResponse?.task_id === analysis.taskId
+      && candidateResponse.version === analysis.candidateVersion
+      ? candidateResponse
+      : undefined;
+    const candidateResponseIsValid = candidateResponse === undefined || candidatePage !== undefined;
+    const matchingReport = candidateResponseIsValid
+      && reportResponse?.task_id === analysis.taskId
+      && reportResponse.candidate_version === analysis.candidateVersion
+      ? reportResponse
+      : undefined;
     return {
       ...session,
       analysis: {
         ...analysis,
-        candidateVersion: resolvedCandidateVersion,
+        candidateVersion: analysis.candidateVersion,
         reportId: matchingReport?.id,
       },
       candidates: candidatePage?.items.map(candidate => ({
@@ -340,7 +348,9 @@ export function useWorkspace(userId?: string) {
         messages: [...session.messages, pendingMessage],
         analysis: { taskId: task.id, status: task.status },
       } : session));
-      setActiveTaskId(task.id);
+      if (activeSessionIdRef.current === requestedSessionId) {
+        setActiveTaskId(task.id);
+      }
       return task;
     } catch (reason) {
       if (
@@ -385,7 +395,9 @@ export function useWorkspace(userId?: string) {
         candidates: undefined,
         biReport: undefined,
       } : session));
-      setActiveTaskId(task.id);
+      if (activeSessionIdRef.current === activeSession.id) {
+        setActiveTaskId(task.id);
+      }
       return task;
     } catch (reason) {
       if (
@@ -404,7 +416,7 @@ export function useWorkspace(userId?: string) {
   }, [activeSessionId, getSessionOperationEpoch, sessionOperationIsCurrent, sessions, userId]);
 
   useEffect(() => {
-    if (!taskRuntime || !activeTaskId) return;
+    if (!taskRuntime || !activeTaskId || taskRuntime.taskId !== activeTaskId) return;
     const generation = generationRef.current;
     setSessions(current => current.map(session => session.analysis?.taskId === activeTaskId ? {
       ...session,
@@ -436,7 +448,11 @@ export function useWorkspace(userId?: string) {
       const requestedCandidateVersion = taskRuntime.candidateVersion;
       void getCandidates(requestedTaskId)
         .then(page => {
-          if (generationRef.current !== generation) return;
+          if (
+            generationRef.current !== generation
+            || page.task_id !== requestedTaskId
+            || page.version !== requestedCandidateVersion
+          ) return;
           setSessions(current => current.map(session => session.analysis?.taskId === requestedTaskId
             && session.analysis.candidateVersion === requestedCandidateVersion ? {
             ...session,
@@ -482,7 +498,11 @@ export function useWorkspace(userId?: string) {
       const requestedReportId = taskRuntime.visibleReportId;
       void getReport(requestedReportId)
         .then(report => {
-          if (generationRef.current !== generation) return;
+          if (
+            generationRef.current !== generation
+            || report.task_id !== requestedTaskId
+            || report.candidate_version !== requestedCandidateVersion
+          ) return;
           setSessions(current => current.map(session => session.analysis?.taskId === requestedTaskId
             && session.analysis.candidateVersion === requestedCandidateVersion
             && session.analysis.reportId === requestedReportId

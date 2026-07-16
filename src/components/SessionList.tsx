@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Plus, Search, MessageSquare, Layers, Sparkles, SlidersHorizontal, BarChart3, LogOut, Star, Edit2, Check, X, Shield, Trash2, LoaderCircle } from 'lucide-react';
 import { Session } from '../types';
 
@@ -63,6 +63,9 @@ export default function SessionList({
   const [confirmingDeleteId, setConfirmingDeleteId] = useState<string | null>(null);
   const [deletingSessionId, setDeletingSessionId] = useState<string | null>(null);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const deleteTriggerRefs = useRef(new Map<string, HTMLButtonElement>());
+  const confirmDeleteButtonRef = useRef<HTMLButtonElement | null>(null);
+  const returnFocusSessionIdRef = useRef<string | null>(null);
 
   const handleStartEdit = (session: Session) => {
     setEditingSessionId(session.id);
@@ -81,17 +84,46 @@ export default function SessionList({
     setEditingSessionId(null);
   };
 
+  const closeDeleteConfirmation = (id: string) => {
+    setConfirmingDeleteId(current => current === id ? null : current);
+    setDeleteError(null);
+  };
+
+  useEffect(() => {
+    if (confirmingDeleteId) {
+      confirmDeleteButtonRef.current?.focus();
+      return;
+    }
+    const returnFocusSessionId = returnFocusSessionIdRef.current;
+    if (!returnFocusSessionId) return;
+    deleteTriggerRefs.current.get(returnFocusSessionId)?.focus();
+    returnFocusSessionIdRef.current = null;
+  }, [confirmingDeleteId]);
+
+  useEffect(() => {
+    if (!confirmingDeleteId) return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape' || deletingSessionId) return;
+      event.preventDefault();
+      closeDeleteConfirmation(confirmingDeleteId);
+    };
+    document.addEventListener('keydown', handleKeyDown);
+    return () => document.removeEventListener('keydown', handleKeyDown);
+  }, [confirmingDeleteId, deletingSessionId]);
+
   const handleConfirmDelete = async (id: string) => {
-    if (!onDeleteSession || deletingSessionId) return;
+    if (!onDeleteSession || deletingSessionId || confirmingDeleteId !== id) return;
     setDeletingSessionId(id);
     setDeleteError(null);
     try {
       await onDeleteSession(id);
-      setConfirmingDeleteId(null);
+      setConfirmingDeleteId(current => current === id ? null : current);
     } catch {
-      setDeleteError('删除会话失败，请稍后重试。');
+      if (confirmingDeleteId === id) {
+        setDeleteError('删除会话失败，请稍后重试。');
+      }
     } finally {
-      setDeletingSessionId(null);
+      setDeletingSessionId(current => current === id ? null : current);
     }
   };
   const maxPoints = 5000;
@@ -279,12 +311,19 @@ export default function SessionList({
                       </button>
                       {onDeleteSession && (
                         <button
+                          ref={element => {
+                            if (element) deleteTriggerRefs.current.set(session.id, element);
+                            else deleteTriggerRefs.current.delete(session.id);
+                          }}
+                          disabled={deletingSessionId !== null}
                           onClick={(event) => {
                             event.stopPropagation();
+                            if (deletingSessionId) return;
+                            returnFocusSessionIdRef.current = session.id;
                             setDeleteError(null);
                             setConfirmingDeleteId(session.id);
                           }}
-                          className="p-1 rounded text-slate-300 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus:opacity-100 hover:text-rose-600 hover:bg-rose-50 transition duration-150"
+                          className="p-1 rounded text-slate-300 opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus:opacity-100 hover:text-rose-600 hover:bg-rose-50 transition duration-150 disabled:cursor-not-allowed disabled:opacity-30"
                           aria-label={`删除会话 ${displayName}`}
                           title="删除会话"
                         >
@@ -316,9 +355,13 @@ export default function SessionList({
                   <div
                     onClick={event => event.stopPropagation()}
                     className="rounded-lg border border-rose-100 bg-rose-50/70 p-2"
+                    role="alertdialog"
+                    aria-modal="true"
+                    aria-labelledby={`delete-dialog-title-${session.id}`}
+                    aria-describedby={`delete-dialog-description-${session.id}`}
                   >
-                    <p className="text-[11px] font-semibold text-rose-700">确定删除这个会话吗？</p>
-                    <p className="mt-0.5 text-[10px] text-rose-500">删除后无法恢复。</p>
+                    <p id={`delete-dialog-title-${session.id}`} className="text-[11px] font-semibold text-rose-700">确定删除这个会话吗？</p>
+                    <p id={`delete-dialog-description-${session.id}`} className="mt-0.5 text-[10px] text-rose-500">删除后无法恢复。</p>
                     {deleteError && (
                       <p role="alert" className="mt-1 text-[10px] font-medium text-rose-700">{deleteError}</p>
                     )}
@@ -327,8 +370,7 @@ export default function SessionList({
                         type="button"
                         disabled={deletingSessionId === session.id}
                         onClick={() => {
-                          setConfirmingDeleteId(null);
-                          setDeleteError(null);
+                          closeDeleteConfirmation(session.id);
                         }}
                         className="rounded-md border border-slate-200 bg-white px-2 py-0.5 text-[10px] font-bold text-slate-500 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-50"
                         aria-label="取消删除"
@@ -336,6 +378,7 @@ export default function SessionList({
                         取消
                       </button>
                       <button
+                        ref={confirmDeleteButtonRef}
                         type="button"
                         disabled={deletingSessionId === session.id}
                         onClick={() => void handleConfirmDelete(session.id)}
