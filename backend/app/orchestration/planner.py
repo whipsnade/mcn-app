@@ -145,8 +145,12 @@ class Planner:
                 request.setdefault("sumpostMin", 1)
             if has_zhejiang_requirement:
                 request["kwProvinceList"] = ["浙江省"]
-            if context.brief.brand and not request.get("brandMentionsTag"):
-                request.setdefault("textContentWord", context.brief.brand)
+            if not request.get("textContentWord"):
+                if context.brief.brand and not request.get("brandMentionsTag"):
+                    request["textContentWord"] = context.brief.brand
+                elif context.brief.category:
+                    request.pop("categoryMentionsTag", None)
+                    request["textContentWord"] = context.brief.category
             compiled = {**arguments, "request": request}
             compiled_steps.append(step.model_copy(update={"arguments": compiled}))
             changed = changed or compiled != step.arguments

@@ -129,8 +129,20 @@ class TencentPlanAdapter:
             json.dumps(schema, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
         cache_key = (self.base_url, self.model, digest)
-        use_schema = self._schema_support_cache.get(cache_key) is not False
+        # 腾讯 Token Plan 的 DeepSeek-V4-Pro 仅支持 OpenAI 兼容的 json_object；
+        # 预先探测 json_schema 会直接造成 400，且会使任务规划产生不必要的失败点。
+        use_schema = False
         messages = [message.model_dump() for message in request.messages]
+        if not use_schema:
+            schema_instruction = {
+                "role": "system",
+                "content": (
+                    "仅输出一个满足以下 JSON Schema 的 JSON 对象；不得输出解释、Markdown 或额外字段。"
+                    "\nJSON Schema:\n"
+                    + json.dumps(schema, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                ),
+            }
+            messages = [messages[0], schema_instruction, *messages[1:]]
 
         for regeneration_count in range(2):
             response_format = self._response_format(request, schema, use_schema=use_schema)
@@ -316,10 +328,12 @@ class TencentPlanAdapter:
         message = str(error.get("message") or "").lower()
         if code in {"unsupported_response_format", "response_format_unsupported"}:
             return True
-        explicitly_unsupported = "unsupported" in code or (
-            "not supported" in message or "unsupported" in message
+        explicitly_unsupported = "unsupported" in code or any(
+            phrase in message
+            for phrase in ("not supported", "does not support", "unsupported")
         )
-        return param == "response_format" and explicitly_unsupported
+        response_format_referenced = param == "response_format" or "json_schema" in message
+        return response_format_referenced and explicitly_unsupported
 
     def _completion_content(self, response: Any) -> str:
         choices = _value(response, "choices") or ()

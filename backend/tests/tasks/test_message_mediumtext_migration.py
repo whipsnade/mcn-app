@@ -6,6 +6,8 @@ from datetime import UTC, datetime
 from uuid import uuid4
 
 import pytest
+from alembic.config import Config
+from alembic.script import ScriptDirectory
 from sqlalchemy import delete, func, select, text, update
 
 from app.db.session import SessionFactory
@@ -14,6 +16,13 @@ from app.workspace.models import Message, WorkspaceSession
 
 
 BACKEND_ROOT = Path(__file__).resolve().parents[2]
+
+
+def head_revision() -> str:
+    config = Config(str(BACKEND_ROOT / "alembic.ini"))
+    revision = ScriptDirectory.from_config(config).get_current_head()
+    assert revision is not None
+    return revision
 
 
 async def run_alembic(*arguments: str) -> tuple[int, str]:
@@ -136,7 +145,7 @@ async def test_0004_downgrade_preflights_oversized_message_without_truncation() 
         assert return_code == 0, output
         version, data_type, stored_content, stored_bytes = await migration_state(message_id)
         assert (version, data_type, stored_content, stored_bytes) == (
-            "0005",
+            head_revision(),
             "mediumtext",
             "已缩短",
             9,
