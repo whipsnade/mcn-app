@@ -18,6 +18,21 @@
 
 后端在任务实际边界产生并持久化 canonical 事件，前端仅根据事件 reducer 更新状态。当前 `McpAccounting`/`McpGatewayService` 已有 `mcp_call_settled`、`mcp_call_released`、`mcp_call_unknown` 等内部账务事件；这些事件不能直接暴露给前端。执行器需要在 MCP 调用开始、成功、失败、unknown 的边界追加安全的 `tool.started`、`tool.succeeded`、`tool.failed`、`tool.unknown` canonical 事件，并将账务事件映射为阶段进度。所有 SSE 事件都必须经过同一个持久化事件仓库，支持 `Last-Event-ID` 重放。
 
+确定性映射规则如下：
+
+| 内部事实 | canonical 事件 | 阶段 | 对外字段 |
+| --- | --- | --- | --- |
+| 任务创建 | `task.pending` | `accepting_data` | `label`、`status` |
+| 计划保存 | `plan.ready` | `ai_analysis` | `label`、`status` |
+| MCP 调用开始 | `tool.started` | `mcp_query` | `platform`、`step_index`、`step_total` |
+| MCP 成功并结算 | `tool.succeeded` | `mcp_query` | `platform`、进度 |
+| MCP 失败并结算 | `tool.failed` | `mcp_query` | `platform`、allowlist 错误码/文案 |
+| MCP 结果不确定 | `tool.unknown` | `mcp_query` | `platform`、安全错误码/文案 |
+| 账务释放 | 不单独改变阶段，仅更新当前事件的 `billing_status` | 当前阶段 | `billing_status` |
+| 候选/BI 持久化 | `candidates.updated` / `bi.updated` | `ai_summary` | 版本、进度 |
+
+平台只能来自 `xiaohongshu`、`douyin`、`bilibili`、`weibo`、`wechat` 白名单，并转换为中文展示名；canonical payload 不出现内部工具完整名、logical call ID、MCP call ID 或服务 slug。并行 MCP 批次的 `step_total` 是该批次实际命令数，`step_index` 按已收到的 success/failed/unknown 结果累计，前端按平台聚合状态。
+
 后端在任务实际边界产生并持久化事件，前端仅根据事件 reducer 更新状态：
 
 | 事件 | 真实发生位置 | 前端用途 |
@@ -46,10 +61,15 @@
 
 前端在带有关联任务 ID 且任务已结束的用户消息上显示“再次执行”。点击后切换到新任务流，立即清空当前任务的临时 BI/候选引用，直到新任务发出匹配的新版本事件；不显示旧 task 的 BI/候选结果，不删除历史消息或旧报告。过期 SSE、重复终态事件和重连重放由 reducer 按 task ID、事件 ID、message ID 幂等处理。
 
+候选和 BI 查询接口必须显式按 `task_id` 及候选/报告版本查询，禁止在新任务未产出版本时回退到会话最新旧版本；前端缓存键包含 task ID 与版本。SSE 的 `Last-Event-ID` 只在同一 user + task 作用域内使用，服务端按单调自增事件 ID 排序回放；跨用户或跨 task 的事件访问返回 404，终态事件也必须可被重放一次。
+
+重跑使用 `retry_key = source_message_id + retry_generation`，在任务表增加唯一约束或独立幂等表，以原子插入确保并发请求最多创建一个 active retry；重复请求返回已经存在的任务 ID。错误 assistant 消息使用 `task_id + error_code` 唯一幂等键，runner 恢复或重复终态事件只能复用同一 message ID。
+
 ## 文件边界
 
 - 后端任务状态/事件：`backend/app/tasks/state.py`、`repository.py`、`executor.py`、`service.py`、`router.py`、`schemas.py`
 - MCP 事件映射：`backend/app/mcp_gateway/accounting.py`、`backend/app/mcp_gateway/service.py`，必要时补充事件契约迁移
+- 查询隔离与 retry 幂等：`backend/app/reporting/router.py`、`backend/app/reporting/service.py`、`backend/app/tasks/models.py` 及对应 Alembic migration
 - 后端会话消息关联：`backend/app/workspace/router.py`、`workspace/service.py`、`workspace/schemas.py`
 - 前端事件状态：`src/state/taskEvents.ts`、`src/hooks/useTaskStream.ts`、`src/hooks/useWorkspace.ts`
 - 前端消息与阶段 UI：`src/types.ts`、`src/components/ChatArea.tsx`、`src/App.tsx`
@@ -57,6 +77,6 @@
 
 ## 验证
 
-- 后端单测覆盖事件顺序与 `Last-Event-ID` 重放、MCP success/failure/unknown 阶段映射、终态错误消息持久化、敏感数据不泄漏、重跑权限/并发限制和 metadata 保留、多平台进度。
+- 后端单测覆盖事件顺序与 `Last-Event-ID` 重放/跨 task 拒绝、MCP success/failure/unknown 阶段映射、终态错误消息持久化幂等、敏感数据不泄漏、重跑权限/并发/数据库幂等和 metadata 保留、查询按 task/version 隔离、多平台并行进度（实际 step_total 与各平台 success/failed/unknown）。
 - 前端单测覆盖真实事件到阶段标签的映射、错误消息显示及 message_id 幂等、重跑按钮仅对终态任务可用，以及重跑后旧结果隔离、过期事件和重复终态事件。
 - 运行完整后端 pytest、前端 Vitest、TypeScript 检查和生产构建。
