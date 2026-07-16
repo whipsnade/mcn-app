@@ -370,11 +370,9 @@ def create_task_runtime() -> tuple[TaskRunner, TaskRecovery]:
 async def refresh_approved_datatap_tools() -> None:
     """服务启动时将已审核工具的最新签名写入本地目录。
 
-    仅在真实 DataTap 模式执行；目录读取不触发 MCP 工具函数调用，也不计费。
+    目录读取不触发 MCP 工具函数调用，也不计费。
     签名发生变化时注册中心会自动隔离工具，避免任务继续使用未复核的参数契约。
     """
-    if get_settings().mcp_provider != "datatap":
-        return
     async with SessionFactory.begin() as db:
         await ToolRegistryService(db, get_mcp_transport()).refresh_service(
             DataTapService.SOCIAL_GROW

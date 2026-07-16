@@ -10,8 +10,8 @@ def settings() -> Settings:
         _env_file=None,
         mysql_password=SecretStr("test-only-password"),
         jwt_secret=SecretStr("test-only-jwt-secret-at-least-32-characters"),
-        model_provider="fake",
-        mcp_provider="fake",
+        tencent_plan_api_key=SecretStr("unit-test-model-key"),
+        datatap_mcp_token=SecretStr("unit-test-mcp-token"),
     )
 
 
