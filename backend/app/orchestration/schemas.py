@@ -119,6 +119,15 @@ class ExportFieldContract(BaseModel):
     notes: tuple[str, ...] = Field(default_factory=tuple, max_length=20)
 
 
+class AnalyticsFieldContract(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: str = Field(min_length=1, max_length=32)
+    field_names: tuple[str, ...] = Field(min_length=1, max_length=32)
+    labels: dict[str, str] = Field(default_factory=dict)
+    notes: tuple[str, ...] = Field(default_factory=tuple, max_length=20)
+
+
 class PlannerContext(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -128,3 +137,4 @@ class PlannerContext(BaseModel):
     tools: tuple[PlannerTool, ...]
     allowed_channels: tuple[str, ...]
     export_contract: ExportFieldContract
+    analytics_contract: AnalyticsFieldContract

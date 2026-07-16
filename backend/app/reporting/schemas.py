@@ -90,6 +90,8 @@ class NormalizedKolEvidence:
     missing_fields: tuple[str, ...]
     # 仅保存导出模板需要的、经过脱敏的字段；不保留 MCP 原始响应。
     export_fields: dict[str, Any] = field(default_factory=dict)
+    # 仅保存 BI 契约白名单内、经过形状校验和脱敏的规范字段。
+    analytics_fields: dict[str, Any] = field(default_factory=dict)
 
     def dimensions(self) -> DimensionInputs:
         return DimensionInputs(
@@ -121,6 +123,7 @@ class NormalizedKolEvidence:
             "evidence_references": list(self.evidence_references),
             "missing_fields": list(self.missing_fields),
             "export_fields": self.export_fields,
+            "analytics_fields": self.analytics_fields,
         }
 
 

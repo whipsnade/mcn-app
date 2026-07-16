@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 import json
 import re
@@ -179,6 +180,7 @@ def _normalize_datatap_xiaohongshu_candidate(
         evidence_references=(item.source_call_id,) if item.source_call_id else (),
         missing_fields=missing,
         export_fields=_extract_export_fields(candidate),
+        analytics_fields=_extract_analytics_fields(candidate),
         **fields,
     )
 
@@ -237,6 +239,7 @@ def _normalize_datatap_douyin_candidate(
         evidence_references=(item.source_call_id,) if item.source_call_id else (),
         missing_fields=missing,
         export_fields=_extract_export_fields(candidate),
+        analytics_fields=_extract_analytics_fields(candidate),
         **fields,
     )
 
@@ -273,6 +276,7 @@ def _normalize_candidate(item: ToolEvidence, candidate: Any) -> NormalizedKolEvi
         evidence_references=(item.source_call_id,) if item.source_call_id else (),
         missing_fields=missing,
         export_fields=_extract_export_fields(candidate),
+        analytics_fields=_extract_analytics_fields(candidate),
         **fields,
     )
 
@@ -286,6 +290,19 @@ def _merge(
     }
     export_fields = dict(previous.export_fields)
     export_fields.update({key: value for key, value in current.export_fields.items() if value is not None})
+    analytics_fields = {
+        name: value
+        for name in _ANALYTICS_FIELD_ORDER
+        if (
+            value := (
+                previous.analytics_fields.get(name)
+                if _has_value(previous.analytics_fields.get(name))
+                else current.analytics_fields.get(name)
+            )
+        )
+        is not None
+        and _has_value(value)
+    }
     flags = tuple({repr(flag): flag for flag in previous.risk_flags + current.risk_flags}.values())
     missing = tuple(name for name, value in values.items() if value is None)
     return NormalizedKolEvidence(
@@ -298,6 +315,7 @@ def _merge(
         ),
         missing_fields=missing,
         export_fields=export_fields,
+        analytics_fields=analytics_fields,
         **values,
     )
 
@@ -329,6 +347,302 @@ def _extract_export_fields(candidate: dict[str, Any]) -> dict[str, Any]:
                     fields[target] = cleaned
                     break
     return fields
+
+
+_ANALYTICS_FIELD_ORDER = (
+    "brand_mentions",
+    "exposure",
+    "interactions",
+    "published_at",
+    "sentiment_counts",
+    "hot_words",
+    "audience_age",
+    "audience_gender",
+    "audience_regions",
+)
+_ANALYTICS_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
+    "brand_mentions": (
+        "brand_mentions",
+        "brand_mention_count",
+        "brand_mentions_count",
+        "品牌提及数",
+        "品牌提及次数",
+        "品牌提及量",
+        "品牌声量",
+    ),
+    "exposure": (
+        "exposure",
+        "exposure_count",
+        "impressions",
+        "impression_count",
+        "views",
+        "view_count",
+        "total_views",
+        "曝光量",
+        "曝光数",
+        "总曝光",
+        "阅读量",
+        "播放量",
+        "总播放量",
+    ),
+    "interactions": (
+        "interactions",
+        "interaction_count",
+        "total_interactions",
+        "互动量",
+        "互动数",
+        "总互动量",
+        "总互动数",
+    ),
+    "published_at": (
+        "published_at",
+        "publish_date",
+        "publish_dates",
+        "publication_date",
+        "发布时间",
+        "发布日期",
+        "发布日",
+    ),
+    "sentiment_counts": (
+        "sentiment_counts",
+        "sentiment",
+        "sentiment_distribution",
+        "舆情分布",
+        "情感统计",
+        "情感分布",
+    ),
+    "hot_words": ("hot_words", "keywords", "keyword_counts", "热词", "热点词"),
+    "audience_age": (
+        "audience_age",
+        "age_distribution",
+        "audience_age_distribution",
+        "粉丝年龄分布",
+        "受众年龄分布",
+        "年龄分布",
+    ),
+    "audience_gender": (
+        "audience_gender",
+        "gender_distribution",
+        "audience_gender_distribution",
+        "粉丝性别分布",
+        "受众性别分布",
+        "性别分布",
+    ),
+    "audience_regions": (
+        "audience_regions",
+        "region_distribution",
+        "audience_region_distribution",
+        "粉丝地域分布",
+        "受众地域分布",
+        "地域分布",
+    ),
+}
+_SENTIMENT_ALIASES: dict[str, tuple[str, ...]] = {
+    "positive": ("positive", "pos", "正向", "正面", "积极"),
+    "neutral": ("neutral", "neu", "中立", "中性"),
+    "negative": ("negative", "neg", "负向", "负面", "消极"),
+}
+
+
+def _extract_analytics_fields(candidate: dict[str, Any]) -> dict[str, Any]:
+    """只投影 BI 白名单字段；单个可选字段无效时保留达人并跳过该字段。"""
+    parsers: dict[str, Callable[[Any], Any]] = {
+        "brand_mentions": _non_negative_number,
+        "exposure": _non_negative_number,
+        "interactions": _non_negative_number,
+        "published_at": _published_at,
+        "sentiment_counts": _sentiment_counts,
+        "hot_words": _hot_words,
+        "audience_age": _distribution,
+        "audience_gender": _distribution,
+        "audience_regions": _distribution,
+    }
+    fields: dict[str, Any] = {}
+    for target in _ANALYTICS_FIELD_ORDER:
+        value = _first_analytics_value(candidate, _ANALYTICS_FIELD_ALIASES[target])
+        if not _has_value(value):
+            continue
+        try:
+            normalized = parsers[target](value)
+        except (InvalidOperation, TypeError, ValueError):
+            continue
+        if _has_value(normalized):
+            fields[target] = normalized
+    return fields
+
+
+def _analytics_sources(candidate: dict[str, Any]) -> tuple[dict[str, Any], ...]:
+    nested = tuple(
+        value
+        for key in ("analytics_fields", "analytics", "bi_fields", "BI字段")
+        if isinstance((value := candidate.get(key)), dict)
+    )
+    return (candidate, *nested)
+
+
+def _first_analytics_value(candidate: dict[str, Any], aliases: tuple[str, ...]) -> Any:
+    for source in _analytics_sources(candidate):
+        for alias in aliases:
+            value = source.get(alias)
+            if _has_value(value):
+                return value
+    return None
+
+
+def _has_value(value: Any) -> bool:
+    return value is not None and value != "" and value != [] and value != {}
+
+
+def _non_negative_number(value: Any, *, allow_percent: bool = False) -> int | float:
+    if isinstance(value, bool):
+        raise ValueError("invalid_analytics_number")
+    text = str(value).strip().replace(",", "")
+    if allow_percent and text.endswith("%"):
+        text = text[:-1]
+    multiplier = Decimal(1)
+    if text.endswith("万"):
+        text, multiplier = text[:-1], Decimal(10_000)
+    elif text.casefold().endswith("k"):
+        text, multiplier = text[:-1], Decimal(1_000)
+    number = _decimal(text)
+    if number is None or not number.is_finite() or number < 0:
+        raise ValueError("invalid_analytics_number")
+    number *= multiplier
+    return int(number) if number == number.to_integral_value() else float(number)
+
+
+def _non_negative_count(value: Any) -> int:
+    number = _non_negative_number(value)
+    if not isinstance(number, int):
+        raise ValueError("invalid_analytics_count")
+    return number
+
+
+def _published_at(value: Any) -> str | list[str]:
+    if isinstance(value, (list, tuple)):
+        if not value:
+            raise ValueError("invalid_published_at")
+        return [_parsed_date(item) for item in value]
+    return _parsed_date(value)
+
+
+def _parsed_date(value: Any) -> str:
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if not isinstance(value, str):
+        raise ValueError("invalid_published_at")
+    text = value.strip()
+    if not text or redact_evidence_for_storage(text) in ({}, _DROP):
+        raise ValueError("invalid_published_at")
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        return date.fromisoformat(text).isoformat()
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            return date.fromisoformat(text).isoformat()
+        except ValueError as exc:
+            raise ValueError("invalid_published_at") from exc
+    return parsed.isoformat()
+
+
+def _sentiment_counts(value: Any) -> dict[str, int]:
+    if not isinstance(value, dict):
+        raise ValueError("invalid_sentiment_counts")
+    result: dict[str, int] = {}
+    for target, aliases in _SENTIMENT_ALIASES.items():
+        for alias in aliases:
+            if alias in value and value[alias] is not None:
+                result[target] = _non_negative_count(value[alias])
+                break
+    if not result:
+        raise ValueError("invalid_sentiment_counts")
+    return result
+
+
+def _safe_term(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValueError("invalid_hot_word")
+    term = value.strip()
+    if not term or len(term) > 100 or redact_evidence_for_storage(term) in ({}, _DROP):
+        raise ValueError("invalid_hot_word")
+    return term
+
+
+def _hot_words(value: Any) -> list[str] | list[dict[str, Any]]:
+    if isinstance(value, dict):
+        result = []
+        for term in sorted(value):
+            result.append({"term": _safe_term(term), "count": _non_negative_count(value[term])})
+        if not result:
+            raise ValueError("invalid_hot_words")
+        return result
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("invalid_hot_words")
+    strings: list[str] = []
+    counted: list[dict[str, Any]] = []
+    for item in value:
+        try:
+            if isinstance(item, str):
+                strings.append(_safe_term(item))
+                continue
+            if not isinstance(item, dict):
+                continue
+            term = next(
+                (item[key] for key in ("term", "word", "keyword", "词", "热词") if key in item),
+                None,
+            )
+            count = next(
+                (item[key] for key in ("count", "frequency", "freq", "次数", "频次") if key in item),
+                None,
+            )
+            counted.append({"term": _safe_term(term), "count": _non_negative_count(count)})
+        except (TypeError, ValueError):
+            continue
+    if counted and not strings:
+        return list({(item["term"], item["count"]): item for item in counted}.values())
+    if strings and not counted:
+        return list(dict.fromkeys(strings))
+    if not strings and not counted:
+        raise ValueError("invalid_hot_words")
+    raise ValueError("mixed_hot_word_shapes")
+
+
+def _distribution(value: Any) -> dict[str, int | float]:
+    if isinstance(value, dict):
+        result = {
+            _safe_term(name): _non_negative_number(number, allow_percent=True)
+            for name, number in value.items()
+        }
+    elif isinstance(value, (list, tuple)):
+        result = {}
+        for item in value:
+            if not isinstance(item, dict):
+                raise ValueError("invalid_distribution")
+            name = next(
+                (
+                    item[key]
+                    for key in ("name", "label", "range", "region", "gender", "名称", "标签", "区间", "地区", "性别", "年龄")
+                    if key in item
+                ),
+                None,
+            )
+            number = next(
+                (
+                    item[key]
+                    for key in ("value", "count", "rate", "percent", "占比", "数值", "人数")
+                    if key in item
+                ),
+                None,
+            )
+            result[_safe_term(name)] = _non_negative_number(number, allow_percent=True)
+    else:
+        raise ValueError("invalid_distribution")
+    if not result:
+        raise ValueError("invalid_distribution")
+    return result
 
 
 def _required_string(payload: dict[str, Any], field: str) -> str:
