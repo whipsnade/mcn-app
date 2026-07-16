@@ -415,6 +415,40 @@ class ReportingService:
         )
         return task, version, total, report
 
+    async def latest_candidate_pool(
+        self, user_id: str, session_id: str
+    ) -> tuple[
+        AnalysisTask | None,
+        TaskCandidatePool | None,
+        list[tuple[TaskCandidatePoolItem, Kol, KolSnapshot]],
+    ]:
+        task = await self._db.scalar(
+            select(AnalysisTask)
+            .where(AnalysisTask.user_id == user_id, AnalysisTask.session_id == session_id)
+            .order_by(AnalysisTask.created_at.desc())
+        )
+        if task is None:
+            return None, None, []
+        pool = await self._db.scalar(
+            select(TaskCandidatePool)
+            .where(TaskCandidatePool.task_id == task.id)
+            .order_by(TaskCandidatePool.pool_version.desc())
+        )
+        if pool is None:
+            return task, None, []
+        rows = list(
+            (
+                await self._db.execute(
+                    select(TaskCandidatePoolItem, Kol, KolSnapshot)
+                    .join(Kol, Kol.id == TaskCandidatePoolItem.kol_id)
+                    .join(KolSnapshot, KolSnapshot.id == TaskCandidatePoolItem.snapshot_id)
+                    .where(TaskCandidatePoolItem.pool_id == pool.id)
+                    .order_by(TaskCandidatePoolItem.full_rank.asc())
+                )
+            ).all()
+        )
+        return task, pool, rows
+
     async def _successful_evidence(self, task_id: str) -> tuple[ToolEvidence, ...]:
         calls = list(
             (
