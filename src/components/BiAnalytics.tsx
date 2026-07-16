@@ -2,7 +2,6 @@ import {
   Activity,
   HelpCircle,
   MessageCircleHeart,
-  PieChart as PieChartIcon,
   Users,
 } from 'lucide-react';
 import {
@@ -23,7 +22,6 @@ import type { ReactNode } from 'react';
 import type {
   ApiTaskStatus,
   BiAnalyticsData,
-  BiDistribution,
   BiMetric,
 } from '../api/contracts';
 
@@ -180,26 +178,6 @@ function TrendCard({ analytics }: { analytics?: BiAnalyticsData }) {
   );
 }
 
-function AudienceDistribution({ distribution, label }: { distribution?: BiDistribution; label: string }) {
-  const items = distribution?.available ? distribution.items.filter(item => Number.isFinite(item.value)) : [];
-  return (
-    <div className="min-w-0">
-      <p className="mb-2 text-[11px] font-semibold text-slate-400">{label}</p>
-      {items.length === 0 ? <Missing /> : (
-        <div className="space-y-2">
-          {items.slice(0, 5).map(item => (
-            <div key={item.label} className="flex items-center gap-2 text-[11px]">
-              <span className="w-[58px] shrink-0 truncate text-slate-500">{item.label}</span>
-              <div className="h-2 min-w-0 flex-1 overflow-hidden rounded-full bg-slate-100"><div className="h-full rounded-full bg-indigo-500" style={{ width: `${Math.min(100, Math.max(0, item.value))}%` }} /></div>
-              <b className="w-8 text-right text-slate-600">{item.value}%</b>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
-}
-
 function AudienceCard({ analytics }: { analytics?: BiAnalyticsData }) {
   const audience = analytics?.audience;
   const ageItems = audience?.age?.available ? audience.age.items.filter(item => Number.isFinite(item.value)) : [];
@@ -271,4 +249,4 @@ export default function BiAnalytics({ analytics, taskStatus }: BiAnalyticsProps)
   );
 }
 
-export { AudienceDistribution, BiAnalytics };
+export { BiAnalytics };
