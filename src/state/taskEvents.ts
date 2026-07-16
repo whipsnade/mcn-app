@@ -1,4 +1,11 @@
 export type TaskEventType = string;
+export type TaskPhase = 'accepting_data' | 'ai_analysis' | 'replanning' | 'mcp_query' | 'ai_summary' | 'completed' | 'completed_with_warnings' | 'failed' | 'cancelled';
+
+export interface PlatformProgress {
+  succeeded: number;
+  failed: number;
+  unknown: number;
+}
 
 export interface TaskEvent {
   id: number;
@@ -17,7 +24,13 @@ export interface TaskRuntimeState {
   pendingReport?: { id: string; candidateVersion: number };
   visibleReportId?: string;
   status?: string;
+  phase?: TaskPhase;
+  phaseLabel?: string;
+  phaseProgress?: { current: number; total: number };
+  platformProgress?: Record<string, PlatformProgress>;
   errorCode?: string;
+  errorMessage?: string;
+  errorMessageId?: string;
   activity?: string;
   connection: TaskConnection;
 }
@@ -43,19 +56,29 @@ function exposeMatchingReport(state: TaskRuntimeState): TaskRuntimeState {
 }
 
 function applyStatusAndPointEvent(state: TaskRuntimeState, event: TaskEvent): TaskRuntimeState {
+  const progressFrom = () => {
+    const current = Number(valueOf(event.payload, 'stepIndex', 'step_index'));
+    const total = Number(valueOf(event.payload, 'stepTotal', 'step_total'));
+    return Number.isFinite(current) && Number.isFinite(total)
+      ? { current, total }
+      : state.phaseProgress;
+  };
+  const platformProgress = event.payload.platform_progress;
   switch (event.type) {
     case 'task.pending':
-      return { ...state, status: String(event.payload.status ?? 'pending') };
+      return { ...state, status: String(event.payload.status ?? 'pending'), phase: 'accepting_data', phaseLabel: String(event.payload.label ?? '接受数据'), activity: String(event.payload.label ?? '接受数据') };
     case 'plan.ready':
-      return { ...state, status: String(event.payload.status ?? 'running'), activity: '分析计划已确认，正在执行' };
+      return { ...state, status: String(event.payload.status ?? 'running'), phase: 'ai_analysis', phaseLabel: String(event.payload.label ?? 'AI 分析'), activity: String(event.payload.label ?? 'AI 分析') };
+    case 'replan.ready':
+      return { ...state, phase: 'replanning', phaseLabel: String(event.payload.label ?? '重新规划'), activity: String(event.payload.label ?? '重新规划') };
     case 'tool.started':
-      return { ...state, activity: '正在获取达人数据' };
+      return { ...state, phase: 'mcp_query', phaseLabel: '社媒数据 MCP 查询', phaseProgress: progressFrom(), activity: `正在查询${String(event.payload.platform ?? '社媒')}数据` };
     case 'tool.succeeded':
-      return { ...state, activity: '达人数据获取完成，正在整理结果' };
+      return { ...state, phase: 'mcp_query', phaseLabel: '社媒数据 MCP 查询', phaseProgress: progressFrom(), platformProgress: typeof platformProgress === 'object' && platformProgress !== null ? platformProgress as Record<string, PlatformProgress> : state.platformProgress, activity: `${String(event.payload.platform ?? '社媒')}数据查询完成` };
     case 'tool.failed':
-      return { ...state, activity: '部分数据暂不可用，正在继续分析' };
+      return { ...state, phase: 'mcp_query', phaseLabel: '社媒数据 MCP 查询', phaseProgress: progressFrom(), platformProgress: typeof platformProgress === 'object' && platformProgress !== null ? platformProgress as Record<string, PlatformProgress> : state.platformProgress, errorCode: String(event.payload.code ?? event.payload.errorCode ?? event.payload.error_code ?? 'mcp_call_failed'), errorMessage: String(event.payload.message ?? '社媒数据查询失败，请稍后重试。'), errorMessageId: String(event.payload.messageId ?? event.payload.message_id ?? ''), activity: `${String(event.payload.platform ?? '社媒')}数据查询失败` };
     case 'tool.unknown':
-      return { ...state, activity: '正在确认数据调用结果' };
+      return { ...state, phase: 'mcp_query', phaseLabel: '社媒数据 MCP 查询', phaseProgress: progressFrom(), platformProgress: typeof platformProgress === 'object' && platformProgress !== null ? platformProgress as Record<string, PlatformProgress> : state.platformProgress, errorCode: String(event.payload.code ?? event.payload.errorCode ?? event.payload.error_code ?? 'mcp_unknown_outcome'), errorMessage: String(event.payload.message ?? '社媒数据服务响应未确认，请稍后重试。'), errorMessageId: String(event.payload.messageId ?? event.payload.message_id ?? ''), activity: `${String(event.payload.platform ?? '社媒')}数据响应未确认` };
     case 'points.reserved':
       return { ...state, activity: '已预留本次分析积分' };
     case 'points.settled':
@@ -63,11 +86,16 @@ function applyStatusAndPointEvent(state: TaskRuntimeState, event: TaskEvent): Ta
     case 'points.released':
       return { ...state, activity: '未使用积分已释放' };
     case 'task.completed':
-      return { ...state, status: 'completed', connection: 'closed', activity: '分析完成' };
+      return { ...state, status: 'completed', phase: 'completed', phaseLabel: '分析完成', connection: 'closed', activity: '分析完成' };
     case 'task.completed_with_warnings':
       return {
         ...state,
         status: 'completed_with_warnings',
+        phase: 'completed_with_warnings',
+        phaseLabel: '分析完成（部分渠道不可用）',
+        errorCode: String(event.payload.code ?? 'mcp_partial_failure'),
+        errorMessage: String(event.payload.message ?? '部分社媒渠道查询失败，已保留可用结果。'),
+        errorMessageId: String(event.payload.messageId ?? event.payload.message_id ?? ''),
         connection: 'closed',
         activity: '分析完成，部分渠道数据暂不可用',
       };
@@ -77,7 +105,11 @@ function applyStatusAndPointEvent(state: TaskRuntimeState, event: TaskEvent): Ta
       return {
         ...state,
         status: 'failed',
+        phase: 'failed',
+        phaseLabel: '分析失败',
         errorCode: String(event.payload.code ?? event.payload.errorCode ?? 'task_failed'),
+        errorMessage: String(event.payload.message ?? '分析任务执行失败，请稍后重试。'),
+        errorMessageId: String(event.payload.messageId ?? event.payload.message_id ?? ''),
         connection: 'closed',
         activity: '分析未完成，请稍后重试',
       };
@@ -113,6 +145,8 @@ export function reduceTaskEvent(state: TaskRuntimeState, event: TaskEvent): Task
           candidateVersion,
           pendingReport,
           visibleReportId: undefined,
+          phase: 'ai_summary',
+          phaseLabel: String(event.payload.label ?? 'AI 汇总'),
           activity: '候选清单已更新',
         });
       }
@@ -123,6 +157,8 @@ export function reduceTaskEvent(state: TaskRuntimeState, event: TaskEvent): Task
           id: String(valueOf(event.payload, 'reportId', 'report_id')),
           candidateVersion: Number(valueOf(event.payload, 'candidateVersion', 'candidate_version')),
         },
+        phase: 'ai_summary',
+        phaseLabel: String(event.payload.label ?? 'BI 报告已生成'),
         activity: 'BI 报告已更新',
       });
     default:

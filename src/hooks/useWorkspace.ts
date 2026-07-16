@@ -6,7 +6,7 @@ import {
   listSessions,
   updateSession as updateSessionRequest,
 } from '../api/sessions';
-import { createTask, getCandidates, getReport } from '../api/tasks';
+import { createTask, getCandidates, getReport, retryTask } from '../api/tasks';
 import type { CreateSessionInput } from '../api/contracts';
 import { useTaskStream } from './useTaskStream';
 import { isTerminalTaskStatus } from '../state/taskEvents';
@@ -189,10 +189,11 @@ export function useWorkspace(userId?: string) {
       const task = await createTask(activeSessionId, { content });
       if (generationRef.current !== generation) throw new Error('STALE_WORKSPACE_REQUEST');
       const pendingMessage: Message = {
-        id: `pending-${task.id}`,
+        id: task.trigger_message_id ?? `pending-${task.id}`,
         sender: 'user',
         text: content,
         timestamp: new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }),
+        taskId: task.id,
       };
       setSessions(current => current.map(session => session.id === activeSessionId ? {
         ...session,
@@ -205,6 +206,40 @@ export function useWorkspace(userId?: string) {
     } catch (reason) {
       if (generationRef.current === generation) {
         setError(reason instanceof Error ? reason.message : '保存消息失败');
+      }
+      throw reason;
+    } finally {
+      taskCreateInFlightRef.current = false;
+      if (generationRef.current === generation) setBusy(false);
+    }
+  }, [activeSessionId, sessions, userId]);
+
+  const retryMessage = useCallback(async (messageId: string) => {
+    if (!userId) throw new Error('AUTH_EXPIRED');
+    if (taskCreateInFlightRef.current) throw new Error('TASK_IN_PROGRESS');
+    const activeSession = sessions.find(session => session.id === activeSessionId);
+    const message = activeSession?.messages.find(item => item.id === messageId);
+    if (!activeSession || !message?.taskId) throw new Error('RETRY_TASK_NOT_FOUND');
+    const generation = generationRef.current;
+    taskCreateInFlightRef.current = true;
+    setBusy(true);
+    setError(undefined);
+    try {
+      const task = await retryTask(message.taskId);
+      if (generationRef.current !== generation) throw new Error('STALE_WORKSPACE_REQUEST');
+      setSessions(current => current.map(session => session.id === activeSession.id ? {
+        ...session,
+        status: 'analyzing',
+        messages: session.messages.map(item => item.id === messageId ? { ...item, taskId: task.id } : item),
+        analysis: { taskId: task.id, status: task.status },
+        candidates: undefined,
+        biReport: undefined,
+      } : session));
+      setActiveTaskId(task.id);
+      return task;
+    } catch (reason) {
+      if (generationRef.current === generation) {
+        setError(reason instanceof Error ? reason.message : '再次执行失败');
       }
       throw reason;
     } finally {
@@ -269,6 +304,23 @@ export function useWorkspace(userId?: string) {
         })
         .catch(() => undefined);
     }
+    if (taskRuntime.errorMessage && taskRuntime.errorMessageId) {
+      const errorMessageId = taskRuntime.errorMessageId;
+      setSessions(current => current.map(session => {
+        if (session.analysis?.taskId !== activeTaskId || session.messages.some(message => message.id === errorMessageId)) {
+          return session;
+        }
+        return {
+          ...session,
+          messages: [...session.messages, {
+            id: errorMessageId,
+            sender: 'ai' as const,
+            text: taskRuntime.errorMessage ?? '分析任务执行失败，请稍后重试。',
+            timestamp: new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }),
+          }],
+        };
+      }));
+    }
     if (taskRuntime.visibleReportId) {
       const requestedTaskId = activeTaskId;
       const requestedCandidateVersion = taskRuntime.candidateVersion;
@@ -311,5 +363,6 @@ export function useWorkspace(userId?: string) {
     createSession,
     updateSession,
     appendMessage,
+    retryMessage,
   };
 }

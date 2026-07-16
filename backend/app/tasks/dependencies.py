@@ -88,6 +88,7 @@ class DatabaseTaskStore:
     async def recoverable_task_ids(self): return await self._read("recoverable_task_ids")
     async def release_expired_unknown(self, *args: Any):
         return await self._write("release_expired_unknown", *args)
+    async def append_event(self, *args: Any): return await self._write("append_event", *args)
 
 
 class _Permissions:

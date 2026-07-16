@@ -60,9 +60,11 @@ export type ApiTaskStatus =
 export interface ApiTask {
   id: string;
   session_id: string;
+  trigger_message_id?: string | null;
   status: ApiTaskStatus;
   estimated_points: number;
   error_code: string | null;
+  error_message?: string | null;
   latest_report_id: string | null;
 }
 

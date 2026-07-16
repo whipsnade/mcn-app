@@ -9,6 +9,8 @@ from app.mcp_gateway.service import ExecuteMcpCall
 from app.model.contracts import ModelAdapterError
 from app.orchestration.batching import build_execution_batches
 from app.orchestration.schemas import PlanValidationError, ReplanContext, ReplanFailure, ToolPlan
+from app.tasks.errors import canonical_platform, safe_error
+from app.tasks.state import TaskEventType
 
 
 class TaskStore(Protocol):
@@ -27,12 +29,18 @@ class TaskStore(Protocol):
     async def mark_completed(self, task_id: str, worker_id: str) -> None: ...
 
     async def mark_completed_with_warnings(
-        self, task_id: str, worker_id: str, warning_code: str
+        self, task_id: str, worker_id: str, warning_code: str, warning_message: str | None = None
     ) -> None: ...
 
     async def mark_interrupted(self, task_id: str, worker_id: str) -> None: ...
 
-    async def mark_failed(self, task_id: str, worker_id: str, code: str) -> None: ...
+    async def mark_failed(
+        self, task_id: str, worker_id: str, code: str, message: str | None = None
+    ) -> None: ...
+
+    async def append_event(
+        self, task_id: str, user_id: str, event_type: str, payload: dict[str, Any]
+    ) -> Any: ...
 
     async def release_lease(self, task_id: str, worker_id: str) -> None: ...
 
@@ -62,6 +70,43 @@ Checkpoint = Callable[[str], Awaitable[None]]
 
 async def _noop_checkpoint(_: str) -> None:
     return None
+
+
+def build_tool_event_payload(
+    internal_tool_name: str,
+    *,
+    status: str,
+    step_index: int,
+    step_total: int,
+    error_code: str | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "platform": canonical_platform(internal_tool_name),
+        "step_index": step_index,
+        "step_total": step_total,
+    }
+    if status in {"failed", "unknown"}:
+        failure = safe_error(error_code)
+        payload.update({"error_code": failure.code, "message": failure.message})
+    return payload
+
+
+def aggregate_mcp_progress(commands: tuple[Any, ...], rows: tuple[Any, ...]) -> dict[str, object]:
+    platforms: dict[str, dict[str, int]] = {}
+    for command in commands:
+        label = canonical_platform(getattr(command, "internal_tool_name", None))
+        platforms.setdefault(label, {"succeeded": 0, "failed": 0, "unknown": 0})
+    for row in rows:
+        label = canonical_platform(getattr(row, "internal_tool_name", None))
+        counts = platforms.setdefault(label, {"succeeded": 0, "failed": 0, "unknown": 0})
+        status = getattr(row, "status", None)
+        if status in {"settled", "succeeded"}:
+            counts["succeeded"] += 1
+        elif status in {"unknown"}:
+            counts["unknown"] += 1
+        else:
+            counts["failed"] += 1
+    return {"step_total": len(commands), "step_index": len(rows), "platforms": platforms}
 
 
 class TaskExecutor:
@@ -130,7 +175,54 @@ class TaskExecutor:
                     )
                     for step in batch.steps
                 )
+                for index, command in enumerate(commands, start=1):
+                    await self.repository.append_event(
+                        task.id,
+                        task.user_id,
+                        TaskEventType.TOOL_STARTED,
+                        build_tool_event_payload(
+                            command.internal_tool_name,
+                            status="started",
+                            step_index=index,
+                            step_total=len(commands),
+                        ),
+                    )
                 rows = await self.gateway.execute_batch(commands)
+                progress = aggregate_mcp_progress(commands, rows)
+                for index, row in enumerate(rows, start=1):
+                    row_status = getattr(row, "status", None)
+                    event_type = (
+                        TaskEventType.TOOL_SUCCEEDED
+                        if row_status in {"settled", "succeeded"}
+                        else TaskEventType.TOOL_UNKNOWN
+                        if row_status == "unknown"
+                        else TaskEventType.TOOL_FAILED
+                    )
+                    command_name = (
+                        getattr(row, "internal_tool_name", None)
+                        or commands[min(index - 1, len(commands) - 1)].internal_tool_name
+                    )
+                    await self.repository.append_event(
+                        task.id,
+                        task.user_id,
+                        event_type,
+                        {
+                            **build_tool_event_payload(
+                                command_name,
+                                status=(
+                                    "succeeded"
+                                    if event_type == TaskEventType.TOOL_SUCCEEDED
+                                    else "unknown"
+                                    if event_type == TaskEventType.TOOL_UNKNOWN
+                                    else "failed"
+                                ),
+                                step_index=index,
+                                step_total=len(commands),
+                                error_code=getattr(row, "error_type", None),
+                            ),
+                            "platform_progress": progress["platforms"],
+                        },
+                    )
                 await self.checkpoint("after_mcp_result")
                 statuses = {getattr(row, "status", None) for row in rows}
                 if statuses & {"unknown", "planned", "reserved", "running", "succeeded"}:
@@ -140,9 +232,59 @@ class TaskExecutor:
                     has_settled = has_settled or "settled" in statuses
                     supplement = await self._load_or_create_replan(task, plan, rows)
                     if supplement is not None:
-                        supplement_rows = await self.gateway.execute_batch(
-                            self._commands(task, supplement, revision="replan")
+                        supplement_commands = self._commands(task, supplement, revision="replan")
+                        for index, command in enumerate(supplement_commands, start=1):
+                            await self.repository.append_event(
+                                task.id,
+                                task.user_id,
+                                TaskEventType.TOOL_STARTED,
+                                build_tool_event_payload(
+                                    command.internal_tool_name,
+                                    status="started",
+                                    step_index=index,
+                                    step_total=len(supplement_commands),
+                                ),
+                            )
+                        supplement_rows = await self.gateway.execute_batch(supplement_commands)
+                        supplement_progress = aggregate_mcp_progress(
+                            supplement_commands, supplement_rows
                         )
+                        for index, row in enumerate(supplement_rows, start=1):
+                            row_status = getattr(row, "status", None)
+                            event_type = (
+                                TaskEventType.TOOL_SUCCEEDED
+                                if row_status in {"settled", "succeeded"}
+                                else TaskEventType.TOOL_UNKNOWN
+                                if row_status == "unknown"
+                                else TaskEventType.TOOL_FAILED
+                            )
+                            command_name = (
+                                getattr(row, "internal_tool_name", None)
+                                or supplement_commands[
+                                    min(index - 1, len(supplement_commands) - 1)
+                                ].internal_tool_name
+                            )
+                            await self.repository.append_event(
+                                task.id,
+                                task.user_id,
+                                event_type,
+                                {
+                                    **build_tool_event_payload(
+                                        command_name,
+                                        status=(
+                                            "succeeded"
+                                            if event_type == TaskEventType.TOOL_SUCCEEDED
+                                            else "unknown"
+                                            if event_type == TaskEventType.TOOL_UNKNOWN
+                                            else "failed"
+                                        ),
+                                        step_index=index,
+                                        step_total=len(supplement_commands),
+                                        error_code=getattr(row, "error_type", None),
+                                    ),
+                                    "platform_progress": supplement_progress["platforms"],
+                                },
+                            )
                         supplement_statuses = {getattr(row, "status", None) for row in supplement_rows}
                         if supplement_statuses & {"unknown", "planned", "reserved", "running", "succeeded"}:
                             await self.repository.mark_interrupted(task.id, self.worker_id)
@@ -171,7 +313,7 @@ class TaskExecutor:
                 await self.artifacts.stream_summary(task.id)
             if partial_failure:
                 await self.repository.mark_completed_with_warnings(
-                    task.id, self.worker_id, "mcp_partial_failure"
+                    task.id, self.worker_id, "mcp_partial_failure", "部分社媒渠道查询失败，已保留可用结果。"
                 )
             else:
                 await self.repository.mark_completed(task.id, self.worker_id)

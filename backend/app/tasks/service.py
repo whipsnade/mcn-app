@@ -2,12 +2,13 @@ from datetime import UTC, datetime
 from uuid import uuid4
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.tasks.models import AnalysisTask
 from app.tasks.repository import TaskRepository
 from app.tasks.schemas import TaskCreate
-from app.tasks.state import TaskEventType, TaskStatus
+from app.tasks.state import TERMINAL_TASK_STATUSES, TaskEventType, TaskStatus
 from app.workspace.schemas import MessageCreate
 from app.workspace.models import Message
 from app.workspace.service import WorkspaceService
@@ -19,6 +20,13 @@ def utc_now() -> datetime:
 
 class TaskConflictError(RuntimeError):
     pass
+
+
+def can_retry_status(status: str | TaskStatus) -> bool:
+    try:
+        return TaskStatus(status) in TERMINAL_TASK_STATUSES
+    except ValueError:
+        return False
 
 
 class TaskService:
@@ -33,6 +41,8 @@ class TaskService:
         payload: TaskCreate,
         *,
         trigger_message_id: str | None = None,
+        retry_of_task_id: str | None = None,
+        retry_key: str | None = None,
     ) -> AnalysisTask:
         workspace_service = WorkspaceService(self.db)
         await workspace_service.get_owned_session(user_id, session_id, for_update=True)
@@ -41,12 +51,7 @@ class TaskService:
             .where(
                 AnalysisTask.session_id == session_id,
                 AnalysisTask.status.notin_(
-                    [
-                        TaskStatus.COMPLETED,
-                        TaskStatus.FAILED,
-                        TaskStatus.INSUFFICIENT_BALANCE,
-                        TaskStatus.CANCELLED,
-                    ]
+                    tuple(item.value for item in TERMINAL_TASK_STATUSES)
                 ),
             )
             .limit(1)
@@ -74,6 +79,8 @@ class TaskService:
             user_id=user_id,
             session_id=session_id,
             trigger_message_id=message.id,
+            retry_of_task_id=retry_of_task_id,
+            retry_key=retry_key,
             status=TaskStatus.PENDING,
             plan_json=None,
             plan_version=None,
@@ -89,15 +96,67 @@ class TaskService:
             created_at=now,
             updated_at=now,
         )
+        message.metadata_json = {
+            **message.metadata_json,
+            "analysis_task_ids": [*(message.metadata_json.get("analysis_task_ids", [])), task.id],
+            "latest_analysis_task_id": task.id,
+        }
         self.db.add(task)
         await self.db.flush()
         await self.repository.append_event(
             task.id,
             task.user_id,
             TaskEventType.TASK_PENDING,
-            {"status": TaskStatus.PENDING},
+            {"status": TaskStatus.PENDING, "phase": "accepting_data", "label": "接受数据"},
         )
         return task
+
+    async def retry(self, user_id: str, task_id: str) -> AnalysisTask:
+        source = await self.repository.get_owned(task_id, user_id)
+        if not can_retry_status(source.status):
+            raise TaskConflictError("task_not_retryable")
+        await WorkspaceService(self.db).get_owned_session(user_id, source.session_id, for_update=True)
+        active_session_task = await self.db.scalar(
+            select(AnalysisTask).where(
+                AnalysisTask.session_id == source.session_id,
+                AnalysisTask.status.notin_(tuple(item.value for item in TERMINAL_TASK_STATUSES)),
+            ).limit(1)
+        )
+        if active_session_task is not None:
+            if active_session_task.retry_of_task_id == source.id:
+                return active_session_task
+            raise TaskConflictError("task_in_progress")
+        message = await self.db.scalar(
+            select(Message).where(
+                Message.id == source.trigger_message_id,
+                Message.session_id == source.session_id,
+                Message.user_id == user_id,
+            )
+        )
+        if message is None:
+            raise LookupError("trigger_message_not_found")
+        retry_key = f"retry:{source.id}"
+        active = await self.db.scalar(
+            select(AnalysisTask).where(AnalysisTask.retry_key == retry_key)
+        )
+        if active is not None and not can_retry_status(active.status):
+            return active
+        try:
+            return await self.create(
+                user_id,
+                source.session_id,
+                TaskCreate(content=message.content),
+                trigger_message_id=message.id,
+                retry_of_task_id=source.id,
+                retry_key=retry_key,
+            )
+        except IntegrityError:
+            existing = await self.db.scalar(
+                select(AnalysisTask).where(AnalysisTask.retry_key == retry_key)
+            )
+            if existing is None:
+                raise
+            return existing
 
     async def cancel(self, user_id: str, task_id: str) -> AnalysisTask:
         task = await self.repository.get_owned(task_id, user_id)

@@ -84,4 +84,26 @@ describe('ChatArea', () => {
     expect(screen.getByText('本次调用积分已结算')).toBeVisible();
     expect(screen.queryByText('/api/v1/mcp')).not.toBeInTheDocument();
   });
+
+  it('shows the current backend phase and allows retrying a terminal user message', async () => {
+    const onRetryMessage = vi.fn().mockResolvedValue(undefined);
+    render(
+      <ChatArea
+        session={{ ...session, messages: [{ id: 'message-1', sender: 'user', text: '重跑这条', timestamp: '10:00', taskId: 'task-1' }] }}
+        onSendMessage={vi.fn()}
+        isAnalyzing={false}
+        isMockMode={false}
+        taskPhaseLabel="社媒数据 MCP 查询"
+        taskProgress={{ current: 2, total: 3 }}
+        onRetryMessage={onRetryMessage}
+      />,
+    );
+
+    expect(screen.getByRole('status', { name: '任务阶段' })).toHaveTextContent('社媒数据 MCP 查询');
+    expect(screen.getByText('2 / 3')).toBeVisible();
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '再次执行' }));
+    });
+    expect(onRetryMessage).toHaveBeenCalledWith('message-1');
+  });
 });

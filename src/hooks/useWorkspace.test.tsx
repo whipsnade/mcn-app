@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Session } from '../types';
 import { createSession, getSession, listSessions } from '../api/sessions';
-import { createTask, getCandidates, getReport } from '../api/tasks';
+import { createTask, getCandidates, getReport, retryTask } from '../api/tasks';
 import { useTaskStream } from './useTaskStream';
 import { useWorkspace } from './useWorkspace';
 
@@ -31,6 +31,7 @@ const restoredSession: Session = {
     sender: 'user',
     text: '恢复这条历史提问',
     timestamp: '18:00',
+    taskId: 'task-1',
   }],
 };
 
@@ -74,6 +75,7 @@ vi.mock('../api/tasks', () => ({
   createTask: vi.fn(),
   getCandidates: vi.fn(),
   getReport: vi.fn(),
+  retryTask: vi.fn(),
 }));
 
 vi.mock('./useTaskStream', () => ({
@@ -350,5 +352,50 @@ describe('useWorkspace', () => {
 
     expect(result.current.activeSession?.candidates?.[0]?.kolId).toBe('kol-new');
     expect(result.current.activeSession?.biReport?.id).toBe('report-2');
+  });
+
+  it('retries a terminal message in the same session and clears old artifacts', async () => {
+    vi.mocked(getSession).mockResolvedValue({
+      ...restoredSession,
+      messages: restoredSession.messages.map(message => ({ ...message, taskId: 'task-old' })),
+      analysis: { taskId: 'task-old', status: 'failed', candidateVersion: 2, reportId: 'report-old' },
+      candidates: [{
+        id: 'candidate-old', kolId: 'kol-old', platform: 'douyin', platformAccountId: 'old', rank: 1,
+        totalScore: 70, scores: {}, matchedConditions: [], risks: [], recommendation: '可考虑',
+      }],
+    });
+    vi.mocked(retryTask).mockResolvedValue({
+      id: 'task-new', session_id: 'session-1', status: 'pending', estimated_points: 0,
+      error_code: null, error_message: null, latest_report_id: null,
+    });
+
+    const { result } = renderHook(() => useWorkspace('user-a'));
+    await waitFor(() => expect(result.current.activeTaskId).toBe('task-old'));
+
+    await act(async () => {
+      await result.current.retryMessage('message-1');
+    });
+
+    expect(retryTask).toHaveBeenCalledWith('task-old');
+    expect(result.current.activeTaskId).toBe('task-new');
+    expect(result.current.activeSession?.analysis?.candidateVersion).toBeUndefined();
+    expect(result.current.activeSession?.biReport).toBeUndefined();
+    expect(result.current.activeSession?.messages[0]?.taskId).toBe('task-new');
+  });
+
+  it('adds a persisted task error message once when the terminal event arrives', async () => {
+    vi.mocked(getSession).mockResolvedValue({
+      ...restoredSession,
+      analysis: { taskId: 'task-1', status: 'running' },
+    });
+    vi.mocked(useTaskStream).mockReturnValue({
+      taskId: 'task-1', lastEventId: 2, assistantDraft: '', connection: 'closed',
+      status: 'failed', phase: 'failed', phaseLabel: '分析失败',
+      errorMessage: '分析任务执行失败，请稍后重试。', errorMessageId: 'error-1',
+    });
+    const { result, rerender } = renderHook(() => useWorkspace('user-a'));
+    await waitFor(() => expect(result.current.activeSession?.messages).toHaveLength(2));
+    rerender();
+    expect(result.current.activeSession?.messages.filter(message => message.id === 'error-1')).toHaveLength(1);
   });
 });

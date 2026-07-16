@@ -29,6 +29,8 @@ class AnalysisTask(Base):
     trigger_message_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("messages.id"), nullable=False
     )
+    retry_of_task_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    retry_key: Mapped[str | None] = mapped_column(String(128), unique=True, nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     plan_json: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     plan_version: Mapped[str | None] = mapped_column(String(32))

@@ -181,6 +181,8 @@ class ReportingService:
                     "candidate_version": candidate_version,
                     "total": len(selected_draft),
                     "pool_total": len(ranked_draft),
+                    "phase": "ai_summary",
+                    "label": "AI 汇总",
                 },
             )
             return CandidateVersion(
@@ -260,6 +262,8 @@ class ReportingService:
                     "report_id": report.id,
                     "report_version": report.report_version,
                     "candidate_version": candidate_version,
+                    "phase": "ai_summary",
+                    "label": "BI 报告已生成",
                 },
             )
             return report

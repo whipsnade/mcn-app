@@ -54,4 +54,5 @@ class Message(Base):
     content: Mapped[str] = mapped_column(MEDIUMTEXT, nullable=False)
     sequence: Mapped[int] = mapped_column(nullable=False)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    error_idempotency_key: Mapped[str | None] = mapped_column(String(128), unique=True, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)

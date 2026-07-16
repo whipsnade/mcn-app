@@ -30,9 +30,11 @@ class TaskCreate(BaseModel):
 class TaskRead(BaseModel):
     id: str
     session_id: str
+    trigger_message_id: str | None = None
     status: TaskStatus
     estimated_points: int
     error_code: str | None
+    error_message: str | None = None
     latest_report_id: str | None = None
 
 

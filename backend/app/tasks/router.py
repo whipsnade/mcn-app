@@ -79,9 +79,11 @@ def task_read(task: AnalysisTask) -> TaskRead:
     return TaskRead(
         id=task.id,
         session_id=task.session_id,
+        trigger_message_id=task.trigger_message_id,
         status=task.status,
         estimated_points=task.estimated_points,
         error_code=task.error_code,
+        error_message=task.error_message,
         latest_report_id=None,
     )
 
@@ -102,6 +104,24 @@ async def create_task(
         task = await TaskService(db).create(user.id, session_id, payload)
     except TaskConflictError as error:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="task_in_progress") from error
+    except LookupError as error:
+        raise task_not_found(error) from error
+    await db.commit()
+    task_runner.submit(task.id)
+    return task_read(task)
+
+
+@router.post("/tasks/{task_id}/retry", response_model=TaskRead, status_code=202)
+async def retry_task(
+    task_id: str,
+    user: FunctionScopedCurrentUser,
+    db: Annotated[AsyncSession, Depends(get_db, scope="function")],
+    task_runner: Annotated[TaskRunner, Depends(get_task_runner)],
+) -> TaskRead:
+    try:
+        task = await TaskService(db).retry(user.id, task_id)
+    except TaskConflictError as error:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
     except LookupError as error:
         raise task_not_found(error) from error
     await db.commit()

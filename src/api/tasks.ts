@@ -22,6 +22,10 @@ export function cancelTask(taskId: string): Promise<ApiTask> {
   return request<ApiTask>(`/api/v1/tasks/${taskId}/cancel`, { method: 'POST' });
 }
 
+export function retryTask(taskId: string): Promise<ApiTask> {
+  return request<ApiTask>(`/api/v1/tasks/${taskId}/retry`, { method: 'POST' });
+}
+
 export function getCandidates(taskId: string): Promise<ApiCandidatePage> {
   return request<ApiCandidatePage>(`/api/v1/tasks/${taskId}/candidates`);
 }

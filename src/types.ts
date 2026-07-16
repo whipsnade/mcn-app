@@ -3,6 +3,7 @@ export interface Message {
   sender: 'user' | 'ai' | 'system';
   text: string;
   timestamp: string;
+  taskId?: string;
 }
 
 export interface SentimentData {

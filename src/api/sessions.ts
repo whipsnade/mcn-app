@@ -29,6 +29,9 @@ export function toSession(source: ApiSession): Session {
       id: message.id,
       sender: message.role === 'assistant' ? 'ai' : message.role,
       text: message.content,
+      taskId: typeof message.metadata.latest_analysis_task_id === 'string'
+        ? message.metadata.latest_analysis_task_id
+        : typeof message.metadata.task_id === 'string' ? message.metadata.task_id : undefined,
       timestamp: new Date(message.created_at).toLocaleTimeString('zh-CN', {
         hour: '2-digit',
         minute: '2-digit',

@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { authorizedFetch, setAccessToken } from './client';
-import { downloadLatestSessionExport } from './tasks';
+import { downloadLatestSessionExport, retryTask } from './tasks';
 
 
 describe('authorizedFetch', () => {
@@ -53,5 +53,28 @@ describe('authorizedFetch', () => {
     expect(result.filename).toBe('科颜氏.xlsx');
     expect(await result.blob.text()).toBe('xlsx');
     expect(fetchMock).toHaveBeenCalledWith('/api/v1/sessions/session-1/exports/latest.xlsx', expect.objectContaining({ credentials: 'include' }));
+  });
+
+  it('retries a terminal task through the dedicated endpoint', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      id: 'task-2',
+      session_id: 'session-1',
+      trigger_message_id: 'message-1',
+      status: 'pending',
+      estimated_points: 0,
+      error_code: null,
+      error_message: null,
+      latest_report_id: null,
+    }), { status: 202 }));
+    vi.stubGlobal('fetch', fetchMock);
+    setAccessToken('token');
+
+    const result = await retryTask('task-1');
+
+    expect(result.id).toBe('task-2');
+    expect(fetchMock).toHaveBeenCalledWith('/api/v1/tasks/task-1/retry', expect.objectContaining({
+      method: 'POST',
+      credentials: 'include',
+    }));
   });
 });

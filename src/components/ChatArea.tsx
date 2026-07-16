@@ -8,6 +8,9 @@ interface ChatAreaProps {
   isAnalyzing: boolean;
   isMockMode: boolean;
   taskActivity?: string;
+  taskPhaseLabel?: string;
+  taskProgress?: { current: number; total: number };
+  onRetryMessage?: (messageId: string) => Promise<unknown>;
 }
 
 export default function ChatArea({
@@ -16,6 +19,9 @@ export default function ChatArea({
   isAnalyzing,
   isMockMode,
   taskActivity,
+  taskPhaseLabel,
+  taskProgress,
+  onRetryMessage,
 }: ChatAreaProps) {
   const [inputText, setInputText] = useState('');
   const chatEndRef = useRef<HTMLDivElement>(null);
@@ -74,7 +80,7 @@ export default function ChatArea({
           </div>
           <p className="mt-0.5 text-[10px] text-slate-400 flex items-center gap-1">
             <span className="h-1.5 w-1.5 rounded-full bg-indigo-500 animate-pulse" />
-            进行中 • 渠道: {platformLabel} • 品类: {session.category} • 预算: {budgetLabel}
+            {taskPhaseLabel ?? (isAnalyzing ? '分析中' : '已完成')} • 渠道: {platformLabel} • 品类: {session.category} • 预算: {budgetLabel}
           </p>
         </div>
 
@@ -102,6 +108,25 @@ export default function ChatArea({
           <div className="flex justify-center" role="status">
             <div className="rounded-full border border-indigo-100 bg-indigo-50 px-3.5 py-1 text-[10px] font-medium text-indigo-500">
               {taskActivity}
+            </div>
+          </div>
+        )}
+
+        {taskPhaseLabel && (
+          <div className="flex justify-center" role="status" aria-label="任务阶段">
+            <div className="w-full max-w-[85%] rounded-2xl border border-indigo-100 bg-indigo-50/60 px-4 py-3 text-[11px] text-indigo-600 shadow-sm">
+              <div className="flex items-center justify-between gap-3 font-semibold">
+                <span>当前阶段：{taskPhaseLabel}</span>
+                {taskProgress && <span>{taskProgress.current} / {taskProgress.total}</span>}
+              </div>
+              {taskProgress && (
+                <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-indigo-100">
+                  <div
+                    className="h-full rounded-full bg-indigo-500 transition-all duration-300"
+                    style={{ width: `${Math.min(100, Math.max(0, taskProgress.total ? taskProgress.current / taskProgress.total * 100 : 0))}%` }}
+                  />
+                </div>
+              )}
             </div>
           </div>
         )}
@@ -155,6 +180,15 @@ export default function ChatArea({
                   <div className="whitespace-pre-line font-normal">
                     {msg.text}
                   </div>
+                  {!isAI && msg.taskId && onRetryMessage && !isAnalyzing && (
+                    <button
+                      type="button"
+                      onClick={() => void onRetryMessage(msg.id).catch(() => undefined)}
+                      className="mt-2 rounded-lg border border-indigo-200 bg-white px-2.5 py-1 text-[10px] font-semibold text-indigo-600 transition hover:bg-indigo-50"
+                    >
+                      再次执行
+                    </button>
+                  )}
                 </div>
               </div>
             </div>

@@ -1,11 +1,15 @@
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.tasks.models import AnalysisTask, TaskEvent
+from app.tasks.errors import SafeTaskError, safe_error
 from app.tasks.state import TERMINAL_TASK_STATUSES, TaskEventType, TaskStatus
+from app.workspace.models import Message
 
 
 def utc_now() -> datetime:
@@ -95,7 +99,12 @@ class TaskRepository:
         task.plan_version = "planner_v1"
         task.status = TaskStatus.RUNNING
         task.updated_at = utc_now()
-        await self.append_event(task.id, task.user_id, TaskEventType.PLAN_READY, {"version": "planner_v1"})
+        await self.append_event(
+            task.id,
+            task.user_id,
+            TaskEventType.PLAN_READY,
+            {"version": "planner_v1", "phase": "ai_analysis", "label": "AI 分析"},
+        )
         await self.db.flush()
         return True
 
@@ -106,7 +115,12 @@ class TaskRepository:
         task.replan_json = replan_json
         task.replan_count += 1
         task.updated_at = utc_now()
-        await self.append_event(task.id, task.user_id, TaskEventType.REPLAN_READY, {"attempt": task.replan_count})
+        await self.append_event(
+            task.id,
+            task.user_id,
+            TaskEventType.REPLAN_READY,
+            {"attempt": task.replan_count, "phase": "replanning", "label": "重新规划"},
+        )
         await self.db.flush()
         return True
 
@@ -131,21 +145,25 @@ class TaskRepository:
         await self._mark_terminal(task_id, worker_id, TaskStatus.COMPLETED, TaskEventType.TASK_COMPLETED)
 
     async def mark_completed_with_warnings(
-        self, task_id: str, worker_id: str, warning_code: str
+        self, task_id: str, worker_id: str, warning_code: str, warning_message: str | None = None
     ) -> None:
         task = await self._locked(task_id)
         if not self._owns_active_lease(task, worker_id) or task.status in TERMINAL_TASK_STATUSES:
             return
         now = utc_now()
         task.status = TaskStatus.COMPLETED_WITH_WARNINGS
-        task.error_code = warning_code
+        task.retry_key = None
+        failure = safe_error(warning_code, warning_message)
+        task.error_code = failure.code
+        task.error_message = failure.message
         task.completed_at = now
         task.updated_at = now
+        message = await self._append_error_message(task, failure)
         await self.append_event(
             task.id,
             task.user_id,
             TaskEventType.TASK_COMPLETED_WITH_WARNINGS,
-            {"code": warning_code},
+            {"code": failure.code, "message": failure.message, "message_id": message.id},
         )
         await self.db.flush()
 
@@ -159,14 +177,25 @@ class TaskRepository:
             task.updated_at = utc_now()
             await self.db.flush()
 
-    async def mark_failed(self, task_id: str, worker_id: str, code: str) -> None:
+    async def mark_failed(
+        self, task_id: str, worker_id: str, code: str, message: str | None = None
+    ) -> None:
         task = await self._locked(task_id)
         if self._owns_active_lease(task, worker_id) and task.status not in TERMINAL_TASK_STATUSES:
+            failure = safe_error(code, message)
             task.status = TaskStatus.FAILED
-            task.error_code = code
+            task.retry_key = None
+            task.error_code = failure.code
+            task.error_message = failure.message
             task.completed_at = utc_now()
             task.updated_at = task.completed_at
-            await self.append_event(task.id, task.user_id, TaskEventType.TASK_FAILED, {"code": code})
+            error_message = await self._append_error_message(task, failure)
+            await self.append_event(
+                task.id,
+                task.user_id,
+                TaskEventType.TASK_FAILED,
+                {"code": failure.code, "message": failure.message, "message_id": error_message.id},
+            )
             await self.db.flush()
 
     async def release_lease(self, task_id: str, worker_id: str) -> None:
@@ -240,11 +269,20 @@ class TaskRepository:
                 TaskEventType.POINTS_RELEASED,
                 {"logical_call_id": call.logical_call_id, "points": 10},
             )
+        failure = safe_error("mcp_unknown_outcome")
         task.status = TaskStatus.FAILED
-        task.error_code = "mcp_unknown_outcome"
+        task.retry_key = None
+        task.error_code = failure.code
+        task.error_message = failure.message
         task.completed_at = utc_now()
         task.updated_at = task.completed_at
-        await self.append_event(task.id, task.user_id, TaskEventType.TASK_FAILED, {"code": task.error_code})
+        error_message = await self._append_error_message(task, failure)
+        await self.append_event(
+            task.id,
+            task.user_id,
+            TaskEventType.TASK_FAILED,
+            {"code": failure.code, "message": failure.message, "message_id": error_message.id},
+        )
         await self.db.flush()
         return True
 
@@ -256,6 +294,43 @@ class TaskRepository:
             raise LookupError("task_not_found")
         return task
 
+    async def _append_error_message(self, task: AnalysisTask, failure: SafeTaskError) -> Message:
+        key = f"{task.id}:{failure.code}"
+        existing = await self.db.scalar(
+            select(Message).where(Message.error_idempotency_key == key)
+        )
+        if existing is not None:
+            return existing
+        sequence = (
+            await self.db.scalar(
+                select(func.max(Message.sequence)).where(Message.session_id == task.session_id)
+            )
+            or 0
+        ) + 1
+        message = Message(
+            id=str(uuid4()),
+            session_id=task.session_id,
+            user_id=task.user_id,
+            role="assistant",
+            content=failure.message,
+            sequence=sequence,
+            metadata_json={"task_id": task.id, "message_type": "error", "error_code": failure.code},
+            error_idempotency_key=key,
+            created_at=utc_now(),
+        )
+        try:
+            async with self.db.begin_nested():
+                self.db.add(message)
+                await self.db.flush()
+        except IntegrityError:
+            existing = await self.db.scalar(
+                select(Message).where(Message.error_idempotency_key == key)
+            )
+            if existing is None:
+                raise
+            return existing
+        return message
+
     async def _mark_terminal(
         self, task_id: str, worker_id: str, status: TaskStatus, event: TaskEventType
     ) -> None:
@@ -264,6 +339,7 @@ class TaskRepository:
             return
         now = utc_now()
         task.status = status
+        task.retry_key = None
         task.completed_at = now
         task.updated_at = now
         await self.append_event(task.id, task.user_id, event, {"status": status})

@@ -9,7 +9,6 @@ from app.billing.service import ReservationRequest, WalletService
 from app.mcp_gateway.contracts import McpCallStatus
 from app.mcp_gateway.models import McpCall
 from app.mcp_gateway.transport import ToolInvocationOutcome
-from app.tasks.models import TaskEvent
 
 
 MCP_COST = 10
@@ -70,7 +69,6 @@ class McpAccounting:
             row.evidence_json = {"outcome": "unknown"}
             row.error_type = outcome.error_type or "possibly_sent_timeout"
             row.error_message = "MCP outcome could not be confirmed"
-            await self._event(row, "mcp_call_unknown")
             await self._db.flush()
             return row
 
@@ -90,7 +88,6 @@ class McpAccounting:
             row.evidence_json["output_validation_diagnostic"] = outcome.safe_diagnostic
         row.error_type = outcome.error_type or "upstream_error"
         row.error_message = "MCP call failed"
-        await self._event(row, "mcp_call_released")
         await self._db.flush()
         return row
 
@@ -140,7 +137,6 @@ class McpAccounting:
         row.status = McpCallStatus.SETTLED.value
         row.settlement_transaction_id = transaction.id
         row.updated_at = _now()
-        await self._event(row, "mcp_call_settled")
         await self._db.flush()
         return row
 
@@ -158,14 +154,3 @@ class McpAccounting:
         if user_id is None:
             raise LookupError("analysis_task_not_found")
         return user_id
-
-    async def _event(self, call: McpCall, event_type: str) -> None:
-        self._db.add(
-            TaskEvent(
-                task_id=call.task_id,
-                user_id=await self._user_id(call),
-                event_type=event_type,
-                payload_json={"logical_call_id": call.logical_call_id},
-                created_at=_now(),
-            )
-        )

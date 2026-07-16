@@ -200,8 +200,11 @@ export default function App() {
                     await workspace.appendMessage(text);
                   }}
                   isAnalyzing={workspace.isAnalyzing}
-                  isMockMode
+                  isMockMode={false}
                   taskActivity={workspace.taskRuntime?.activity}
+                  taskPhaseLabel={workspace.taskRuntime?.phaseLabel}
+                  taskProgress={workspace.taskRuntime?.phaseProgress}
+                  onRetryMessage={messageId => workspace.retryMessage(messageId)}
                 />
               )}
               {workspaceTab === 'candidates' && (

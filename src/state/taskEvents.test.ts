@@ -94,7 +94,7 @@ describe('task event reducer', () => {
       id: 2, taskId: 'task-1', type: 'points.settled', payload: { raw_response: 'do-not-show' },
     });
 
-    expect(toolStarted.activity).toBe('正在获取达人数据');
+    expect(toolStarted.activity).toBe('正在查询社媒数据');
     expect(settled.activity).toBe('本次调用积分已结算');
   });
 
@@ -110,5 +110,43 @@ describe('task event reducer', () => {
     expect(state.connection).toBe('closed');
     expect(state.activity).toBe('分析完成，部分渠道数据暂不可用');
     expect(isTerminalTaskStatus(state.status)).toBe(true);
+  });
+
+  it('derives the visible phase from the actual backend event type and progress', () => {
+    const state = reduceTaskEvent(initialTaskRuntime('task-1'), {
+      id: 1,
+      taskId: 'task-1',
+      type: 'tool.succeeded',
+      payload: {
+        platform: '抖音',
+        step_index: 2,
+        step_total: 3,
+        platform_progress: { 抖音: { succeeded: 2, failed: 0, unknown: 0 } },
+      },
+    });
+
+    expect(state.phase).toBe('mcp_query');
+    expect(state.phaseLabel).toBe('社媒数据 MCP 查询');
+    expect(state.phaseProgress).toEqual({ current: 2, total: 3 });
+    expect(state.platformProgress?.['抖音']?.succeeded).toBe(2);
+  });
+
+  it('keeps a safe task error and message id idempotently', () => {
+    const state = reduceTaskEvent(initialTaskRuntime('task-1'), {
+      id: 2,
+      taskId: 'task-1',
+      type: 'task.failed',
+      payload: { code: 'upstream_error', message: '社媒数据服务暂时不可用，请稍后重试。', message_id: 'error-1' },
+    });
+    const duplicate = reduceTaskEvent(state, {
+      id: 1,
+      taskId: 'task-1',
+      type: 'task.failed',
+      payload: { code: 'upstream_error', message: '重复错误', message_id: 'error-1' },
+    });
+
+    expect(state.errorMessage).toBe('社媒数据服务暂时不可用，请稍后重试。');
+    expect(state.errorMessageId).toBe('error-1');
+    expect(duplicate.errorMessage).toBe(state.errorMessage);
   });
 });
