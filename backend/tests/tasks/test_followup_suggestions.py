@@ -179,6 +179,92 @@ async def test_followup_lock_connection_error_fails_closed(monkeypatch) -> None:
         assert acquired is False
 
 
+@pytest.mark.asyncio
+async def test_generate_lock_contention_does_not_call_model_and_records_safe_error(monkeypatch) -> None:
+    from app.tasks.followups import FollowupSuggestionService
+
+    class ContendedLock:
+        lock_error = True
+
+        async def __aenter__(self):
+            return False
+
+        async def __aexit__(self, *_):
+            return None
+
+    class Model:
+        calls = 0
+
+        async def complete_json(self, _request):
+            self.calls += 1
+            raise AssertionError("model must not be called when lock is unavailable")
+
+    model = Model()
+    service = FollowupSuggestionService(model, lock_factory=lambda _task_id: ContendedLock())
+    failures = []
+
+    async def persist_failure(_task_id, error):
+        failures.append(error)
+
+    monkeypatch.setattr(service, "_persist_failure", persist_failure)
+    assert await service.generate("task-lock-failure") is False
+    assert model.calls == 0
+    assert failures == [{"error_code": "FOLLOWUP_LOCK_UNAVAILABLE", "stage": "lock", "fields": []}]
+
+
+@pytest.mark.asyncio
+async def test_generate_schema_parse_failure_does_not_mark_completed(monkeypatch) -> None:
+    from app.tasks.followups import FollowupSuggestionService
+
+    class AcquiredLock:
+        lock_error = False
+
+        async def __aenter__(self):
+            return True
+
+        async def __aexit__(self, *_):
+            return None
+
+    class Model:
+        async def complete_json(self, _request):
+            try:
+                FollowupSuggestions(
+                    suggestions=tuple(_suggestion(i) for i in range(1, 5))
+                )
+            except ValidationError as error:
+                raise error
+            raise AssertionError("expected strict five-item schema failure")
+
+    service = FollowupSuggestionService(Model(), lock_factory=lambda _task_id: AcquiredLock())
+    monkeypatch.setattr(
+        service,
+        "_input_snapshot",
+        lambda _task_id: _async_value(
+            {
+                "user_query": "请分析候选达人",
+                "session_filters": {"category": "美妆"},
+                "tool_summary": {},
+                "candidate_count": 0,
+                "bi_summary": {},
+                "conclusion": "数据不足",
+            }
+        ),
+    )
+    failures = []
+
+    async def persist_failure(_task_id, error):
+        failures.append(error)
+
+    monkeypatch.setattr(service, "_persist_failure", persist_failure)
+    monkeypatch.setattr(service, "_persist_success", lambda *_args: _async_value(None))
+    assert await service.generate("task-schema-failure") is False
+    assert failures and failures[0]["error_code"] == "FOLLOWUP_SCHEMA_INVALID"
+
+
+async def _async_value(value):
+    return value
+
+
 def test_safe_followup_error_uses_whitelisted_code_and_safe_diagnostics() -> None:
     error = safe_followup_error(ValueError("sk-secret"), stage="model")
     assert error["error_code"] == "FOLLOWUP_GENERATION_FAILED"
