@@ -178,6 +178,7 @@ def _normalize_datatap_xiaohongshu_candidate(
         collected_at=item.collected_at,
         evidence_references=(item.source_call_id,) if item.source_call_id else (),
         missing_fields=missing,
+        export_fields=_extract_export_fields(candidate),
         **fields,
     )
 
@@ -235,6 +236,7 @@ def _normalize_datatap_douyin_candidate(
         collected_at=item.collected_at,
         evidence_references=(item.source_call_id,) if item.source_call_id else (),
         missing_fields=missing,
+        export_fields=_extract_export_fields(candidate),
         **fields,
     )
 
@@ -270,6 +272,7 @@ def _normalize_candidate(item: ToolEvidence, candidate: Any) -> NormalizedKolEvi
         collected_at=item.collected_at,
         evidence_references=(item.source_call_id,) if item.source_call_id else (),
         missing_fields=missing,
+        export_fields=_extract_export_fields(candidate),
         **fields,
     )
 
@@ -281,6 +284,8 @@ def _merge(
         name: getattr(previous, name) if getattr(previous, name) is not None else getattr(current, name)
         for name in _MERGEABLE_FIELDS
     }
+    export_fields = dict(previous.export_fields)
+    export_fields.update({key: value for key, value in current.export_fields.items() if value is not None})
     flags = tuple({repr(flag): flag for flag in previous.risk_flags + current.risk_flags}.values())
     missing = tuple(name for name, value in values.items() if value is None)
     return NormalizedKolEvidence(
@@ -292,8 +297,38 @@ def _merge(
             sorted(set(previous.evidence_references + current.evidence_references))
         ),
         missing_fields=missing,
+        export_fields=export_fields,
         **values,
     )
+
+
+_EXPORT_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
+    "city": ("城市", "所在城市", "城市标签", "达人城市", "粉丝主要城市"),
+    "total_likes": ("总获赞", "获赞数", "总点赞数", "点赞数", "累计获赞"),
+    "total_favorites": ("总收藏", "收藏数", "总收藏数", "累计收藏"),
+    "average_reads": ("平均阅读", "平均阅读量", "平均播放", "平均播放量"),
+    "average_interactions": ("平均互动", "平均互动量", "平均互动数"),
+    "active_follower_rate": ("活跃粉丝率", "活跃粉丝比例", "粉丝活跃率"),
+    "content_tags": ("内容标签", "内容标签分布", "兴趣标签", "内容兴趣"),
+    "gender": ("性别", "粉丝性别"),
+    "target_region_rate": ("目标地区粉丝占比", "浙江粉丝占比", "湖州粉丝占比", "地域占比"),
+    "target_age_rate": ("目标年龄段占比", "年龄段占比", "粉丝年龄占比"),
+    "industry_interest_rate": ("行业兴趣占比", "类目兴趣占比", "品类兴趣占比"),
+}
+
+
+def _extract_export_fields(candidate: dict[str, Any]) -> dict[str, Any]:
+    """从 MCP 候选中提取模板字段并脱敏，不把未知原始字段写入快照。"""
+    fields: dict[str, Any] = {}
+    for target, aliases in _EXPORT_FIELD_ALIASES.items():
+        for alias in aliases:
+            value = candidate.get(alias)
+            if value not in (None, "", [], {}):
+                cleaned = redact_evidence_for_storage(value)
+                if cleaned not in (None, "", [], {}):
+                    fields[target] = cleaned
+                    break
+    return fields
 
 
 def _required_string(payload: dict[str, Any], field: str) -> str:

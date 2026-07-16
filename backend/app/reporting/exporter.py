@@ -253,7 +253,7 @@ def _render_detail(sheet: Any, metadata: dict[str, Any], candidates: Sequence[Ex
             row += 1
             for label, value in entries:
                 sheet.cell(row, 1).value = label
-                sheet.cell(row, 2).value = value
+                sheet.cell(row, 2).value = _cell_value(value)
                 sheet.cell(row, 1).font = Font(name="微软雅黑", bold=True, size=10)
                 sheet.cell(row, 2).alignment = Alignment(wrap_text=True, vertical="top")
                 row += 1
@@ -316,7 +316,7 @@ def _write_styled_row(sheet: Any, row: int, values: Sequence[Any], *, source_row
         source = sheet.cell(source_row, min(index, max(1, sheet.max_column)))
         if source.has_style:
             target._style = copy(source._style)
-        target.value = value
+        target.value = _cell_value(value)
         target.alignment = copy(source.alignment) if source.has_style else Alignment(vertical="top")
         if isinstance(value, float) and (0 <= value <= 1):
             target.number_format = "0.0%"
@@ -373,7 +373,16 @@ def _display(value: Any) -> str:
         return "数据缺失"
     if isinstance(value, float):
         return f"{value:.1f}"
+    if isinstance(value, (list, tuple, set)):
+        return "、".join(_display(item) for item in value) if value else "数据缺失"
+    if isinstance(value, dict):
+        return "；".join(f"{key}: {_display(item)}" for key, item in value.items()) or "数据缺失"
     return f"{value:,}" if isinstance(value, int) else str(value)
+
+
+def _cell_value(value: Any) -> Any:
+    """将结构化 MCP 字段转换为 Excel 可写的标量，同时保留数字类型。"""
+    return _display(value) if isinstance(value, (list, tuple, set, dict)) else value
 
 
 def _platform_label(platform: str) -> str:

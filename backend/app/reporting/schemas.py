@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
@@ -88,6 +88,8 @@ class NormalizedKolEvidence:
     collected_at: datetime
     evidence_references: tuple[str, ...]
     missing_fields: tuple[str, ...]
+    # 仅保存导出模板需要的、经过脱敏的字段；不保留 MCP 原始响应。
+    export_fields: dict[str, Any] = field(default_factory=dict)
 
     def dimensions(self) -> DimensionInputs:
         return DimensionInputs(
@@ -118,6 +120,7 @@ class NormalizedKolEvidence:
             "collected_at": self.collected_at.isoformat(),
             "evidence_references": list(self.evidence_references),
             "missing_fields": list(self.missing_fields),
+            "export_fields": self.export_fields,
         }
 
 
