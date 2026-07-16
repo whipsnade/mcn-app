@@ -23,10 +23,13 @@ def _suggestion(index: int = 1, **overrides):
     return value
 
 
-@pytest.mark.parametrize("count", [0, 1, 2, 3, 4, 5])
-def test_followup_schema_accepts_zero_to_five_unique_chinese_suggestions(count: int) -> None:
+def test_followup_schema_requires_exactly_five_unique_chinese_suggestions() -> None:
+    count = 5
     result = FollowupSuggestions(suggestions=tuple(_suggestion(i) for i in range(1, count + 1)))
     assert len(result.suggestions) == count
+    for count in (0, 1, 2, 3, 4, 6):
+        with pytest.raises(ValidationError):
+            FollowupSuggestions(suggestions=tuple(_suggestion(i) for i in range(1, count + 1)))
 
 
 def test_followup_schema_rejects_more_than_five_or_duplicates() -> None:
@@ -157,6 +160,23 @@ def test_followup_lock_is_reentrant_safe_for_same_task() -> None:
         await lock.release("task-1")
 
     asyncio.run(run())
+
+
+@pytest.mark.asyncio
+async def test_followup_lock_connection_error_fails_closed(monkeypatch) -> None:
+    from app.tasks.followups import FollowupExecutionLock
+
+    class BrokenSession:
+        @property
+        def bind(self):
+            raise ConnectionError("database unavailable")
+
+        async def close(self):
+            return None
+
+    monkeypatch.setattr("app.tasks.followups.SessionFactory", lambda: BrokenSession())
+    async with FollowupExecutionLock("lock-error") as acquired:
+        assert acquired is False
 
 
 def test_safe_followup_error_uses_whitelisted_code_and_safe_diagnostics() -> None:

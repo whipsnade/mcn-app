@@ -52,6 +52,7 @@ _SAFE_ERROR_CODES = {
     "MODEL_CANCELLED",
     "FOLLOWUP_SCHEMA_INVALID",
     "FOLLOWUP_GENERATION_FAILED",
+    "FOLLOWUP_LOCK_UNAVAILABLE",
 }
 _SAFE_SCHEMA_SEGMENTS = {
     "suggestions",
@@ -131,7 +132,7 @@ class FollowupSuggestion(BaseModel):
 class FollowupSuggestions(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    suggestions: tuple[FollowupSuggestion, ...] = Field(min_length=0, max_length=5)
+    suggestions: tuple[FollowupSuggestion, ...] = Field(min_length=5, max_length=5)
 
     @model_validator(mode="after")
     def unique_suggestions(self) -> "FollowupSuggestions":
@@ -224,6 +225,10 @@ class InMemoryFollowupLock:
         try:
             if timeout is None:
                 await lock.acquire()
+            elif timeout == 0:
+                # A non-blocking acquire must still succeed when the lock is
+                # currently free; wait_for(..., timeout=0) always times out.
+                await lock.acquire()
             else:
                 await asyncio.wait_for(lock.acquire(), timeout=timeout)
         except TimeoutError:
@@ -245,6 +250,7 @@ class FollowupExecutionLock:
         self.task_id = task_id
         self._db = None
         self._held = False
+        self.lock_error = False
 
     async def __aenter__(self) -> bool:
         if not await self._memory.acquire(self.task_id, timeout=0):
@@ -269,8 +275,9 @@ class FollowupExecutionLock:
             if self._db is not None:
                 await self._db.close()
                 self._db = None
-            self._held = True
-            return True
+            self.lock_error = True
+            await self._memory.release(self.task_id)
+            return False
 
     async def __aexit__(self, *_: Any) -> None:
         try:
@@ -344,8 +351,14 @@ class FollowupSuggestionService:
             return True
 
     async def generate(self, task_id: str) -> bool:
-        async with self.lock_factory(task_id) as acquired:
+        lock_context = self.lock_factory(task_id)
+        async with lock_context as acquired:
             if not acquired:
+                if getattr(lock_context, "lock_error", False):
+                    await self._persist_failure(
+                        task_id,
+                        {"error_code": "FOLLOWUP_LOCK_UNAVAILABLE", "stage": "lock", "fields": []},
+                    )
                 return False
             try:
                 snapshot = await self._input_snapshot(task_id)
