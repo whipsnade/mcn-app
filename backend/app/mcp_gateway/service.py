@@ -322,9 +322,14 @@ class McpCallService:
             )
         try:
             output = validate_output(result.structured_content, invocation.output_schema)
-        except McpValidationError:
+        except McpValidationError as error:
             return ToolInvocationOutcome(
-                "failed", None, None, result.upstream_request_id, "output_validation_error"
+                "failed",
+                None,
+                None,
+                result.upstream_request_id,
+                "output_validation_error",
+                error.diagnostic,
             )
         return ToolInvocationOutcome(
             "succeeded",

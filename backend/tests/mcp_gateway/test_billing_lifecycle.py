@@ -1,3 +1,4 @@
+import json
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
@@ -115,6 +116,33 @@ async def test_failure_releases_and_unknown_retains_reservation(db_session, user
     wallet = await db_session.get(Wallet, task.user_id)
     assert unknown.status == McpCallStatus.UNKNOWN.value
     assert wallet is not None and (wallet.balance, wallet.reserved) == (990, 10)
+
+
+@pytest.mark.asyncio
+async def test_invalid_output_persists_only_safe_diagnostic(db_session, user_factory) -> None:
+    task = await create_analysis_task(db_session, user_factory)
+    await WalletService(db_session).ensure_welcome_grant(task.user_id)
+    gateway = McpGatewayService(
+        db_session,
+        FakeMcpTransport(
+            call_result=RemoteToolResult(
+                {"items": {"nickname": "达人A", "url": "https://example.invalid"}},
+                False,
+                "request-invalid-output",
+            )
+        ),
+        arguments_loader=MemoryArgumentsLoader(),
+        registry=StaticRegistry(),
+    )
+
+    row = await gateway.execute(command(task.user_id, task.id))
+
+    assert row.status == McpCallStatus.RELEASED.value
+    assert row.evidence_json is not None
+    serialized = json.dumps(row.evidence_json, ensure_ascii=False)
+    assert "output_validation_diagnostic" in serialized
+    assert "达人A" not in serialized
+    assert "https://example.invalid" not in serialized
 
 
 @pytest.mark.asyncio

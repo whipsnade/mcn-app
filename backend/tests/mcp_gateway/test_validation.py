@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from app.mcp_gateway.validation import (
@@ -54,6 +56,25 @@ def test_input_and_output_reject_unknown_fields_and_wrong_types() -> None:
         validate_input({"count": 1, "extra": True}, schema)
     with pytest.raises(McpValidationError):
         validate_output({"count": "1"}, schema)
+
+
+def test_output_schema_failure_exposes_paths_types_and_lengths_without_values() -> None:
+    schema = strict_object_schema({"result": {"type": "string"}}, "result")
+    raw = {"result": {"nickname": "不应持久化", "token": "secret"}}
+
+    with pytest.raises(McpValidationError) as raised:
+        validate_output(raw, schema)
+
+    diagnostic = raised.value.diagnostic
+    assert diagnostic is not None
+    assert diagnostic["error_code"] == "schema_validation_error"
+    assert diagnostic["instance_path"] == "/result"
+    assert diagnostic["schema_path"]
+    assert diagnostic["shape"]["type"] == "object"
+    serialized = json.dumps(diagnostic, ensure_ascii=False)
+    assert "不应持久化" not in serialized
+    assert "secret" not in serialized
+    assert "token" not in serialized
 
 
 def test_valid_input_and_output_are_returned_unchanged() -> None:

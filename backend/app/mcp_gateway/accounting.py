@@ -86,6 +86,8 @@ class McpAccounting:
         row.status = McpCallStatus.RELEASED.value
         row.settlement_transaction_id = transaction.id
         row.evidence_json = {"outcome": "failed"}
+        if outcome.safe_diagnostic is not None:
+            row.evidence_json["output_validation_diagnostic"] = outcome.safe_diagnostic
         row.error_type = outcome.error_type or "upstream_error"
         row.error_message = "MCP call failed"
         await self._event(row, "mcp_call_released")

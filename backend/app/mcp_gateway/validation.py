@@ -13,7 +13,11 @@ from app.mcp_gateway.transport import JsonValue
 
 
 class McpValidationError(ValueError):
-    pass
+    def __init__(
+        self, message: str, *, diagnostic: dict[str, JsonValue] | None = None
+    ) -> None:
+        super().__init__(message)
+        self.diagnostic = diagnostic
 
 
 @dataclass(frozen=True)
@@ -49,6 +53,15 @@ _ROUTING_FIELDS = {
     "token",
     "uri",
     "url",
+}
+
+_SENSITIVE_DIAGNOSTIC_FIELDS = _ROUTING_FIELDS | {
+    "cookie",
+    "password",
+    "private_key",
+    "secret",
+    "session",
+    "signature",
 }
 
 
@@ -220,8 +233,74 @@ def _validate_against_schema(value: Any, schema: dict[str, Any], *, path: str) -
             format_checker=Draft202012Validator.FORMAT_CHECKER,
         ).validate(value)
     except ValidationError as exc:
-        raise McpValidationError("value does not match approved schema") from exc
+        raise McpValidationError(
+            "value does not match approved schema",
+            diagnostic=_schema_failure_diagnostic(value, exc),
+        ) from exc
     except Exception as exc:
         # External references have already been rejected; remaining resolver and
         # implementation failures must still fail closed without exposing values.
         raise McpValidationError("schema validation could not be completed") from exc
+
+
+def _schema_failure_diagnostic(value: Any, error: ValidationError) -> dict[str, JsonValue]:
+    node = _value_at_path(value, error.absolute_path)
+    return {
+        "version": 1,
+        "error_code": "schema_validation_error",
+        "instance_path": _json_pointer(error.absolute_path),
+        "schema_path": _json_pointer(error.absolute_schema_path),
+        "validator": str(error.validator),
+        "shape": _safe_shape(node),
+    }
+
+
+def _value_at_path(value: Any, path: Any) -> Any:
+    node = value
+    for segment in path:
+        if isinstance(node, dict) and isinstance(segment, str):
+            node = node.get(segment)
+        elif isinstance(node, list) and isinstance(segment, int) and 0 <= segment < len(node):
+            node = node[segment]
+        else:
+            return None
+    return node
+
+
+def _json_pointer(path: Any) -> str:
+    parts = [str(segment).replace("~", "~0").replace("/", "~1") for segment in path]
+    return "/" + "/".join(parts) if parts else "/"
+
+
+def _safe_shape(value: Any) -> dict[str, JsonValue]:
+    if value is None:
+        return {"type": "null"}
+    if isinstance(value, bool):
+        return {"type": "boolean"}
+    if isinstance(value, str):
+        return {"type": "string", "string_length": len(value)}
+    if isinstance(value, (int, float)):
+        return {"type": "number"}
+    if isinstance(value, list):
+        return {"type": "array", "array_length": len(value)}
+    if isinstance(value, dict):
+        fields: list[dict[str, JsonValue]] = []
+        for key, child in list(value.items())[:20]:
+            if not isinstance(key, str) or _normalized_key(key) in _SENSITIVE_DIAGNOSTIC_FIELDS:
+                continue
+            fields.append({"name": key, **_shape_metadata(child)})
+        return {
+            "type": "object",
+            "object_field_count": len(value),
+            "fields": fields,
+        }
+    return {"type": type(value).__name__}
+
+
+def _shape_metadata(value: Any) -> dict[str, JsonValue]:
+    shape = _safe_shape(value)
+    return {
+        key: item
+        for key, item in shape.items()
+        if key in {"type", "string_length", "array_length", "object_field_count"}
+    }

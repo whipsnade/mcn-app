@@ -44,6 +44,7 @@ class ToolInvocationOutcome:
     response_hash: str | None
     upstream_request_id: str | None
     error_type: str | None
+    safe_diagnostic: dict[str, JsonValue] | None = None
 
 
 class ServiceNotAllowedError(ValueError):
