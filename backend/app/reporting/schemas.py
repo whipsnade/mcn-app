@@ -205,6 +205,7 @@ class BiReportRead(BaseModel):
     budget_analysis: dict[str, Any]
     comparison: list[dict[str, Any]]
     risks: list[dict[str, Any]]
+    analytics: dict[str, Any]
     conclusion: str
     sources: list[dict[str, Any]]
     generated_at: datetime

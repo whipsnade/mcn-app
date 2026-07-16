@@ -24,6 +24,7 @@ from app.reporting.models import (
     TaskCandidatePoolItem,
     UserKolFavorite,
 )
+from app.reporting.analytics import aggregate_analytics
 from app.reporting.normalizers import normalize_tool_evidence, redact_evidence_for_storage
 from app.reporting.schemas import AnalystConclusion, CandidateVersion, CandidateVersionItem, ToolEvidence
 from app.reporting.scoring import SCORE_VERSION, score_candidate
@@ -286,7 +287,9 @@ class ReportingService:
     async def list_candidates(
         self, user_id: str, task_id: str, *, sort: str, direction: str
     ) -> tuple[int, list[tuple[TaskCandidate, Kol, KolSnapshot]]]:
-        await self._owned_task(user_id, task_id)
+        task = await self._owned_task(user_id, task_id)
+        if task.status not in {"completed", "completed_with_warnings"}:
+            return 0, []
         version = await self._latest_candidate_version(task_id)
         if version is None:
             return 0, []
@@ -321,6 +324,7 @@ class ReportingService:
                 BiReport.id == report_id,
                 AnalysisTask.user_id == user_id,
                 WorkspaceSession.deleted_at.is_(None),
+                AnalysisTask.status.in_(("completed", "completed_with_warnings")),
             )
         )
         if report is None:
@@ -411,6 +415,9 @@ class ReportingService:
         )
         if task is None:
             return None, None, 0, None
+        if task.status not in {"completed", "completed_with_warnings"}:
+            # 最新一轮尚未成功结束时，绝不回退到更早任务的候选或报告。
+            return task, None, 0, None
         version = await self._latest_candidate_version(task.id)
         total = 0
         if version is not None:
@@ -425,7 +432,11 @@ class ReportingService:
             )
         report = await self._db.scalar(
             select(BiReport)
-            .where(BiReport.task_id == task.id, BiReport.candidate_version == version)
+            .where(
+                BiReport.task_id == task.id,
+                BiReport.candidate_version == version,
+                BiReport.status == "completed",
+            )
             .order_by(BiReport.report_version.desc())
         )
         return task, version, total, report
@@ -682,6 +693,17 @@ class ReportingService:
                 for source_id in sorted(source_rows)
             ],
         }
+        analytics_records = []
+        for _candidate, candidate_kol, candidate_snapshot in candidates:
+            normalized = candidate_snapshot.normalized_json or {}
+            analytics_records.append(
+                {
+                    "platform": candidate_kol.platform,
+                    "platform_account_id": candidate_kol.platform_account_id,
+                    "analytics_fields": normalized.get("analytics_fields", {}),
+                }
+            )
+        chart_data["analytics"] = aggregate_analytics(analytics_records)
         conclusion = f"已基于候选版本 {candidate_version} 生成 {len(candidates)} 位达人对比，当前首选为 {top_nickname}。"
         return chart_data, conclusion, {"candidate_version": candidate_version, "source_call_ids": sorted(set(source_ids))}
 

@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.session import get_db
 from app.identity.dependencies import CurrentUser
 from app.reporting.exporter import CONTENT_TYPE, export_latest_task_xlsx
+from app.reporting.analytics import empty_analytics
 from app.reporting.models import BiReport, Kol, KolSnapshot, TaskCandidate, UserKolFavorite
 from app.reporting.schemas import (
     BiReportRead,
@@ -71,6 +72,7 @@ def bi_report_read(report: BiReport) -> BiReportRead:
         budget_analysis=chart.get("budget_analysis", {}),
         comparison=chart.get("comparison", []),
         risks=chart.get("risks", []),
+        analytics=chart.get("analytics", empty_analytics()),
         conclusion=report.conclusion_text or "",
         sources=chart.get("sources", []),
         generated_at=report.completed_at or report.created_at,

@@ -28,7 +28,7 @@ export function reportFixture(overrides: Partial<ApiBiReport> = {}): ApiBiReport
   return {
     id: 'report-2', task_id: 'task-1', report_version: 1, candidate_version: 2,
     overview: { total_candidates: 2 }, score_composition: [], audience_content_fit: {},
-    platform_distribution: [], budget_analysis: {}, comparison: [], risks: [],
+    platform_distribution: [], budget_analysis: {}, comparison: [], risks: [], analytics: {},
     conclusion: '优先联系达人甲。', sources: [], generated_at: '2026-07-15T10:00:00Z',
     ...overrides,
   };

@@ -135,6 +135,7 @@ export interface AnalysisBiReport {
   budget_analysis: Record<string, unknown>;
   comparison: Array<Record<string, unknown>>;
   risks: Array<Record<string, unknown>>;
+  analytics?: Record<string, unknown>;
   conclusion: string;
   sources: Array<Record<string, unknown>>;
   generated_at: string;
