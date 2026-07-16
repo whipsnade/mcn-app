@@ -7,6 +7,7 @@ from uuid import uuid4
 import pytest
 from fastapi import HTTPException
 
+from app.reporting import exporter as reporting_exporter
 from app.reporting import router as reporting_router
 from app.reporting.models import Kol, KolSnapshot, TaskCandidate
 from app.tasks.models import AnalysisTask
@@ -69,6 +70,21 @@ async def test_latest_export_rejects_running_task(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_direct_latest_export_rejects_non_terminal_task(monkeypatch) -> None:
+    class FakeService:
+        def __init__(self, db):
+            self.db = db
+
+        async def latest_candidate_pool(self, user_id, session_id):
+            return SimpleNamespace(status="running"), SimpleNamespace(id="pool-1"), [(object(), object(), object())]
+
+    monkeypatch.setattr(reporting_exporter, "ReportingService", FakeService)
+
+    with pytest.raises(LookupError, match="latest_task_in_progress"):
+        await reporting_exporter.export_latest_task_xlsx(object(), "user-1", "session-1")
+
+
+@pytest.mark.asyncio
 async def test_latest_export_accepts_legacy_candidate_rows_without_pool(monkeypatch) -> None:
     task = SimpleNamespace(status="completed")
     rows = [(object(), object(), object())]
@@ -91,6 +107,28 @@ async def test_latest_export_accepts_legacy_candidate_rows_without_pool(monkeypa
     )
 
     assert response.media_type == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+
+@pytest.mark.asyncio
+async def test_latest_export_maps_race_error_to_readable_chinese_detail(monkeypatch) -> None:
+    class FakeService:
+        def __init__(self, db):
+            self.db = db
+
+        async def latest_candidate_pool(self, user_id, session_id):
+            return SimpleNamespace(status="completed"), SimpleNamespace(id="pool-1"), [(object(), object(), object())]
+
+    async def fake_export(db, user_id, session_id):
+        raise LookupError("latest_task_in_progress")
+
+    monkeypatch.setattr(reporting_router, "ReportingService", FakeService)
+    monkeypatch.setattr(reporting_router, "export_latest_task_xlsx", fake_export)
+
+    with pytest.raises(HTTPException, match="最新任务仍在执行") as error:
+        await reporting_router.export_latest_session(
+            "session-1", SimpleNamespace(id="user-1"), object()
+        )
+    assert error.value.status_code == 409
 
 
 @pytest.mark.asyncio

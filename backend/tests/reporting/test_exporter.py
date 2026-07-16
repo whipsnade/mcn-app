@@ -64,4 +64,33 @@ def test_render_workbook_contains_all_candidates_and_template_sheets() -> None:
     assert "平台" in headers
     assert summary.max_row >= 4 + 12
     assert summary[5][1].value in {"小红书", "抖音"}
+    assert "平台: 小红书、抖音" in (summary[2][0].value or "")
     assert workbook["粉丝画像详情"].max_row >= 1 + 12
+
+
+def test_render_workbook_writes_only_merged_range_anchors_when_rows_expand() -> None:
+    """Rows beyond the template reservation must not assign to MergedCell objects."""
+    content = render_workbook(
+        metadata={"brand": "合并单元格测试", "category": "餐饮", "generated_at": "2026-07-16"},
+        candidates=[_candidate(index) for index in range(1, 81)],
+    )
+
+    workbook = load_workbook(BytesIO(content), read_only=False, data_only=False)
+    summary = workbook["KOL匹配度筛选"]
+    assert summary[84][0].value == 80
+    assert any(str(merged) == "A1:Q1" for merged in summary.merged_cells.ranges)
+    assert any(str(merged) == "A2:Q2" for merged in summary.merged_cells.ranges)
+
+
+def test_export_candidate_keeps_public_profile_url_and_platform() -> None:
+    candidate = _candidate(1)
+    candidate = ExportCandidate(**{**candidate.__dict__, "profile_url": "https://example.com/达人1"})
+    content = render_workbook(
+        metadata={"brand": "链接测试", "category": "美妆", "generated_at": "2026-07-16"},
+        candidates=[candidate],
+    )
+    workbook = load_workbook(BytesIO(content), read_only=True, data_only=False)
+    detail = workbook["达人详细画像"]
+    values = [row[1].value for row in detail.iter_rows(min_col=1, max_col=2) if row[0].value]
+    assert "小红书" in values
+    assert "https://example.com/达人1" in values

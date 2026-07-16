@@ -128,7 +128,16 @@ async def export_latest_session(
         TaskStatus.COMPLETED_WITH_WARNINGS.value,
     } or not rows:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="no_candidate_pool")
-    exported = await export_latest_task_xlsx(db, user.id, session_id)
+    try:
+        exported = await export_latest_task_xlsx(db, user.id, session_id)
+    except LookupError as error:
+        detail = {
+            "session_not_found": "会话不存在或已删除",
+            "latest_task_in_progress": "最新任务仍在执行，请完成后再导出",
+            "no_candidate_pool": "最新任务暂无可导出的候选数据",
+        }.get(str(error), "导出数据不可用")
+        code = status.HTTP_409_CONFLICT if str(error) == "latest_task_in_progress" else status.HTTP_422_UNPROCESSABLE_ENTITY
+        raise HTTPException(status_code=code, detail=detail) from error
     return StreamingResponse(
         iter((exported.content,)),
         media_type=CONTENT_TYPE,

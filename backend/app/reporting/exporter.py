@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.orchestration.export_contract import EXPORT_FIELD_CONTRACT_VERSION
 from app.reporting.models import Kol, KolSnapshot, TaskCandidatePoolItem
 from app.reporting.service import ReportingService
+from app.tasks.state import TERMINAL_TASK_STATUSES, TaskStatus
 from app.workspace.models import WorkspaceSession
 
 
@@ -34,6 +35,7 @@ class ExportCandidate:
     total_score: float | None
     rating: str
     stars: str
+    profile_url: str | None = None
     dimension_scores: dict[str, float | None] = field(default_factory=dict)
     values: dict[str, Any] = field(default_factory=dict)
     score_reason: str = ""
@@ -55,6 +57,13 @@ async def export_latest_task_xlsx(
     task, pool, rows = await service.latest_candidate_pool(user_id, session_id)
     if task is None:
         raise LookupError("session_not_found")
+    if task.status not in {
+        TaskStatus.COMPLETED.value,
+        TaskStatus.COMPLETED_WITH_WARNINGS.value,
+    }:
+        if task.status in {item.value for item in TERMINAL_TASK_STATUSES}:
+            raise LookupError("no_candidate_pool")
+        raise LookupError("latest_task_in_progress")
     if not rows:
         raise LookupError("no_candidate_pool")
     session = await db.scalar(
@@ -108,6 +117,7 @@ def _export_candidate(item: TaskCandidatePoolItem, kol: Kol, snapshot: KolSnapsh
         rank=getattr(item, "full_rank", None) or getattr(item, "rank", 0),
         platform=kol.platform,
         nickname=str(normalized.get("nickname") or "未命名达人"),
+        profile_url=kol.normalized_profile_url,
         followers=normalized.get("followers"),
         city=values.get("city"),
         total_score=float(item.total_score),
@@ -164,17 +174,23 @@ def render_workbook(*, metadata: dict[str, Any], candidates: Sequence[ExportCand
 def _render_summary(sheet: Any, metadata: dict[str, Any], candidates: Sequence[ExportCandidate]) -> None:
     _ensure_summary_merge(sheet, "A1:Q1")
     _ensure_summary_merge(sheet, "A2:Q2")
-    _ensure_summary_merge(sheet, "A20:Q20")
+    # Candidate rows are unbounded. Move the rating block below them so that a
+    # large latest pool never writes into the template's A20:Q20 merge.
+    rating_title_row = max(20, 5 + len(candidates) + 2)
+    for merged in list(sheet.merged_cells.ranges):
+        if str(merged) in {"A20:P20", "A20:Q20"}:
+            sheet.unmerge_cells(str(merged))
+    sheet.merge_cells(f"A{rating_title_row}:Q{rating_title_row}")
     sheet["A1"] = f"{metadata.get('brand') or 'KOL'}{metadata.get('category') or ''}达人 — KOL匹配度筛选分析报告"
     locations = "、".join(str(item) for item in metadata.get("locations", [])) or "未指定"
+    platforms = list(dict.fromkeys(_platform_label(item.platform) for item in candidates))
     sheet["A2"] = (
         f"客户: {locations} | 报告日期: {str(metadata.get('generated_at') or '')[:10]} | "
-        f"达人总数: {len(candidates)} | 平台: {'、'.join(_platform_label(item.platform) for item in candidates) or '未指定'}"
+        f"达人总数: {len(candidates)} | 平台: {'、'.join(platforms) or '未指定'}"
     )
-    sheet["A20"] = "评级分布汇总"
-
     headers = _summary_headers(metadata)
-    _clear_rows(sheet, 4, max(sheet.max_row, 40), len(headers))
+    clear_end = max(sheet.max_row, rating_title_row + 7, 40)
+    _clear_rows(sheet, 4, clear_end, 19)
     _write_styled_row(sheet, 4, headers, source_row=4)
     for row_index, candidate in enumerate(candidates, start=5):
         values = _summary_values(candidate)
@@ -184,7 +200,9 @@ def _render_summary(sheet: Any, metadata: dict[str, Any], candidates: Sequence[E
         sheet.cell(row_index, 17).alignment = Alignment(wrap_text=True, vertical="top")
         sheet.row_dimensions[row_index].height = 42
 
-    _render_rating_summary(sheet, candidates)
+    sheet.cell(rating_title_row, 1).value = "评级分布汇总"
+    _render_rating_summary(sheet, candidates, start_row=rating_title_row + 1)
+    _move_summary_charts(sheet, rating_title_row + 7)
     _set_widths(sheet, {"A": 7, "B": 12, "C": 18, "D": 11, "E": 12, "F": 12, "G": 14, "H": 14, "I": 14, "J": 14, "K": 14, "L": 14, "M": 14, "N": 14, "O": 12, "P": 13, "Q": 48})
 
 
@@ -224,21 +242,27 @@ def _summary_values(candidate: ExportCandidate) -> list[Any]:
     ]
 
 
-def _render_rating_summary(sheet: Any, candidates: Sequence[ExportCandidate]) -> None:
-    _write_styled_row(sheet, 21, ["评级", "星级", "分数区间", "达人数量", "占比"], source_row=21)
+def _render_rating_summary(sheet: Any, candidates: Sequence[ExportCandidate], *, start_row: int = 21) -> None:
+    _write_styled_row(sheet, start_row, ["评级", "星级", "分数区间", "达人数量", "占比"], source_row=21)
     buckets = (("强烈推荐", "★★★★★", "≥78", 78, 101), ("推荐", "★★★★", "62-77", 62, 78), ("谨慎推荐", "★★★", "48-61", 48, 62), ("可考虑", "★★", "35-47", 35, 48), ("不推荐", "★", "<35", -1, 35))
     total = len(candidates)
-    for row, (label, stars, interval, lower, upper) in enumerate(buckets, start=22):
+    for row, (label, stars, interval, lower, upper) in enumerate(buckets, start=start_row + 1):
         count = sum(1 for item in candidates if item.total_score is not None and lower <= item.total_score < upper)
         ratio = count / total if total else 0
         _write_styled_row(sheet, row, [label, stars, interval, count, ratio], source_row=row)
         sheet.cell(row, 5).number_format = "0.0%"
         _apply_rating_fill(sheet.cell(row, 1), label)
-    sheet["R20"] = "评级"
-    sheet["S20"] = "数量"
-    for row, (label, _stars, _interval, _lower, _upper) in enumerate(buckets, start=21):
+    sheet.cell(start_row, 18).value = "评级"
+    sheet.cell(start_row, 19).value = "数量"
+    for row, (label, _stars, _interval, _lower, _upper) in enumerate(buckets, start=start_row):
         sheet.cell(row, 18).value = label
         sheet.cell(row, 19).value = sum(1 for item in candidates if item.rating == label)
+    for chart in getattr(sheet, "_charts", ()):
+        for series in getattr(chart, "ser", ()):
+            if getattr(getattr(series, "cat", None), "numRef", None) is not None:
+                series.cat.numRef.f = f"'{sheet.title}'!$R${start_row}:$R${start_row + 4}"
+            if getattr(getattr(series, "val", None), "numRef", None) is not None:
+                series.val.numRef.f = f"'{sheet.title}'!$S${start_row}:$S${start_row + 4}"
 
 
 def _render_detail(sheet: Any, metadata: dict[str, Any], candidates: Sequence[ExportCandidate]) -> None:
@@ -250,7 +274,7 @@ def _render_detail(sheet: Any, metadata: dict[str, Any], candidates: Sequence[Ex
         _write_detail_header(sheet, row, title)
         row += 1
         sections = [
-            ("【达人概况】", (("平台", _platform_label(candidate.platform)), ("城市", candidate.city or "数据缺失"), ("粉丝数", _display(candidate.followers)), ("主页", "已脱敏公开主页"))),
+            ("【达人概况】", (("平台", _platform_label(candidate.platform)), ("城市", candidate.city or "数据缺失"), ("粉丝数", _display(candidate.followers)), ("主页链接", candidate.profile_url or "数据缺失"))),
             ("【内容与帖子表现】", (("内容标签", candidate.values.get("content_tags", "数据缺失")), ("平均阅读/播放", candidate.values.get("average_reads", "数据缺失")), ("平均互动", candidate.values.get("average_interactions", "数据缺失")), ("互动率", candidate.values.get("engagement_rate", "数据缺失")))),
             ("【粉丝画像】", (("目标地区粉丝占比", candidate.values.get("target_region_rate", "数据缺失")), ("目标年龄段占比", candidate.values.get("target_age_rate", "数据缺失")), ("活跃粉丝率", candidate.values.get("active_follower_rate", "数据缺失")), ("行业兴趣占比", candidate.values.get("industry_interest_rate", "数据缺失")))),
             ("【综合评估】", (("综合评分", _display(candidate.total_score)), ("星级", candidate.stars), ("评级", candidate.rating), ("评分明细", _score_detail(candidate.dimension_scores)))),
@@ -322,6 +346,11 @@ def _write_detail_header(sheet: Any, row: int, title: str) -> None:
 def _write_styled_row(sheet: Any, row: int, values: Sequence[Any], *, source_row: int) -> None:
     for index, value in enumerate(values, start=1):
         target = sheet.cell(row, index)
+        # openpyxl represents every non-anchor cell of a merged range as a
+        # read-only MergedCell. Dynamic rows can overlap template merges, so
+        # leave those cells untouched rather than assigning to them.
+        if isinstance(target, MergedCell):
+            continue
         source = sheet.cell(source_row, min(index, max(1, sheet.max_column)))
         if source.has_style:
             target._style = copy(source._style)
@@ -356,6 +385,15 @@ def _ensure_summary_merge(sheet: Any, reference: str) -> None:
     sheet.merge_cells(reference)
 
 
+def _move_summary_charts(sheet: Any, row: int) -> None:
+    """Keep the template's rating chart below dynamically-sized candidate rows."""
+    for chart in getattr(sheet, "_charts", ()):
+        anchor = getattr(chart, "anchor", None)
+        source = getattr(anchor, "_from", None)
+        if source is not None:
+            source.row = max(0, row - 1)
+
+
 def _set_widths(sheet: Any, widths: dict[str, float]) -> None:
     for column, width in widths.items():
         sheet.column_dimensions[column].width = width
@@ -374,7 +412,17 @@ def _apply_rating_fill(cell: Any, rating: str) -> None:
 
 
 def _score_detail(scores: dict[str, float | None]) -> str:
-    return " + ".join(f"{key}:{_display(value)}" for key, value in scores.items()) or "数据缺失"
+    labels = {
+        "industry_interest": "行业兴趣",
+        "target_region": "目标地区",
+        "target_age": "目标年龄",
+        "engagement": "互动表现",
+        "active_follower": "活跃粉丝",
+        "content": "内容匹配",
+        "followers": "粉丝规模",
+        "engagement_follower_ratio": "互动沉淀与粉丝比",
+    }
+    return " + ".join(f"{labels.get(key, key)}:{_display(value)}" for key, value in scores.items()) or "数据缺失"
 
 
 def _display(value: Any) -> str:
