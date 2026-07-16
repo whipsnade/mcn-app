@@ -560,7 +560,9 @@ def _cell_value(value: Any) -> Any:
 
 def _present(value: Any) -> Any:
     """将缺失业务字段显式标记，避免 Excel 中出现难以区分的空白。"""
-    return "数据缺失" if value is None else value
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return "数据缺失"
+    return value
 
 
 def _platform_label(platform: str) -> str:
