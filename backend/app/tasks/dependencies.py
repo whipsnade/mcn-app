@@ -363,7 +363,11 @@ class TaskExecutionDependencies:
         )
 
     def create_runner(self) -> TaskRunner:
-        return TaskRunner(self.create_executor)
+        return TaskRunner(
+            self.create_executor,
+            followup_preparer=self._followups.prepare,
+            followup_generator=self._followups.generate,
+        )
 
     def create_recovery(self, runner: TaskRunner) -> TaskRecovery:
         return TaskRecovery(

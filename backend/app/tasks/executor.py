@@ -440,10 +440,19 @@ class TaskExecutor:
 class TaskRunner:
     """持有强引用的进程内 runner，避免 create_task 被垃圾回收。"""
 
-    def __init__(self, executor_factory: Callable[[], TaskExecutor]) -> None:
+    def __init__(
+        self,
+        executor_factory: Callable[[], TaskExecutor],
+        *,
+        followup_preparer: Callable[[str], Awaitable[bool]] | None = None,
+        followup_generator: Callable[[str], Awaitable[bool]] | None = None,
+    ) -> None:
         self._executor_factory = executor_factory
+        self._followup_preparer = followup_preparer
+        self._followup_generator = followup_generator
         self._tasks: set[asyncio.Task[None]] = set()
         self._active_task_ids: set[str] = set()
+        self._active_followup_ids: set[str] = set()
         self._accepting = True
 
     def submit(self, task_id: str) -> None:
@@ -458,6 +467,28 @@ class TaskRunner:
             self._active_task_ids.discard(task_id)
 
         running.add_done_callback(discard)
+
+    async def retry_followup(self, task_id: str) -> bool:
+        """Requeue only the suggestion generation for an existing terminal task."""
+        if not self._accepting or self._followup_preparer is None or self._followup_generator is None:
+            return False
+        if task_id in self._active_followup_ids:
+            return False
+        prepared = await self._followup_preparer(task_id)
+        if not prepared:
+            return False
+        self._active_followup_ids.add(task_id)
+
+        async def generate() -> None:
+            try:
+                await self._followup_generator(task_id)
+            finally:
+                self._active_followup_ids.discard(task_id)
+
+        running = asyncio.create_task(generate())
+        self._tasks.add(running)
+        running.add_done_callback(self._tasks.discard)
+        return True
 
     async def shutdown(self, *, timeout_seconds: float = 5) -> None:
         self._accepting = False

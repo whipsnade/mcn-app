@@ -7,7 +7,7 @@ import {
   listSessions,
   updateSession as updateSessionRequest,
 } from '../api/sessions';
-import { createTask, getCandidates, getReport, retryTask } from '../api/tasks';
+import { createTask, getCandidates, getReport, getTask, retryFollowups as retryFollowupsRequest, retryTask } from '../api/tasks';
 import type { CreateSessionInput } from '../api/contracts';
 import { useTaskStream } from './useTaskStream';
 import { isTerminalTaskStatus } from '../state/taskEvents';
@@ -418,6 +418,41 @@ export function useWorkspace(userId?: string) {
     }
   }, [activeSessionId, getSessionOperationEpoch, sessionOperationIsCurrent, sessions, userId]);
 
+  const retryFollowups = useCallback(async () => {
+    if (!userId || !activeSessionId) throw new Error('AUTH_EXPIRED');
+    const session = sessions.find(item => item.id === activeSessionId);
+    const taskId = session?.analysis?.taskId;
+    if (!taskId || session.analysis?.followupStatus !== 'failed') throw new Error('FOLLOWUP_RETRY_NOT_AVAILABLE');
+    const generation = generationRef.current;
+    const operationEpoch = getSessionOperationEpoch(activeSessionId);
+    setBusy(true);
+    setError(undefined);
+    try {
+      const task = await retryFollowupsRequest(taskId);
+      if (
+        generationRef.current !== generation
+        || !sessionOperationIsCurrent(activeSessionId, operationEpoch)
+      ) return task;
+      setSessions(current => current.map(item => item.id === activeSessionId && item.analysis?.taskId === taskId ? {
+        ...item,
+        analysis: {
+          ...item.analysis,
+          followupStatus: task.followup_suggestions_status ?? 'pending',
+          followupSuggestions: task.followup_suggestions ?? [],
+          followupError: task.followup_error ?? undefined,
+        },
+      } : item));
+      return task;
+    } catch (reason) {
+      if (generationRef.current === generation && sessionOperationIsCurrent(activeSessionId, operationEpoch)) {
+        setError(reason instanceof Error ? reason.message : '重试建议生成失败');
+      }
+      throw reason;
+    } finally {
+      if (generationRef.current === generation) setBusy(false);
+    }
+  }, [activeSessionId, getSessionOperationEpoch, sessionOperationIsCurrent, sessions, userId]);
+
   useEffect(() => {
     if (!currentTaskRuntime || !activeTaskId) return;
     const generation = generationRef.current;
@@ -436,6 +471,13 @@ export function useWorkspace(userId?: string) {
             ? undefined
             : session.analysis.reportId
         ),
+        followupStatus: currentTaskRuntime.followupStatus ?? session.analysis.followupStatus,
+        followupSuggestions: currentTaskRuntime.followupSuggestions ?? session.analysis.followupSuggestions,
+        followupError: currentTaskRuntime.followupError
+          ? { message: currentTaskRuntime.followupError }
+          : currentTaskRuntime.followupStatus === 'completed'
+            ? undefined
+            : session.analysis.followupError,
       },
       biReport: currentTaskRuntime.candidateVersion === undefined
         || session.biReport?.candidate_version !== currentTaskRuntime.candidateVersion
@@ -522,6 +564,45 @@ export function useWorkspace(userId?: string) {
     () => sessions.find(session => session.id === activeSessionId),
     [activeSessionId, sessions],
   );
+
+  useEffect(() => {
+    const taskId = activeTaskId;
+    const sessionId = activeSessionId;
+    if (!taskId || !sessionId || activeSession?.analysis?.followupStatus !== 'pending') return;
+    let stopped = false;
+    const generation = generationRef.current;
+    const operationEpoch = getSessionOperationEpoch(sessionId);
+    const poll = async () => {
+      try {
+        const task = await getTask(taskId);
+        if (
+          stopped
+          || generationRef.current !== generation
+          || !sessionOperationIsCurrent(sessionId, operationEpoch)
+          || task.id !== taskId
+        ) return;
+        if (task.followup_suggestions_status) {
+          setSessions(current => current.map(item => item.id === sessionId && item.analysis?.taskId === taskId ? {
+            ...item,
+            analysis: {
+              ...item.analysis,
+              followupStatus: task.followup_suggestions_status ?? undefined,
+              followupSuggestions: task.followup_suggestions ?? [],
+              followupError: task.followup_error ?? undefined,
+            },
+          } : item));
+        }
+      } catch {
+        // SSE remains the primary path; transient polling failures are retried.
+      }
+    };
+    void poll();
+    const timer = window.setInterval(() => void poll(), 1500);
+    return () => {
+      stopped = true;
+      window.clearInterval(timer);
+    };
+  }, [activeSession?.analysis?.followupStatus, activeSessionId, activeTaskId, getSessionOperationEpoch, sessionOperationIsCurrent]);
   const isAnalyzing = busy || Boolean(
     activeSession?.analysis && taskIsInProgress(currentTaskRuntime?.status ?? activeSession.analysis.status),
   );
@@ -543,5 +624,6 @@ export function useWorkspace(userId?: string) {
     deleteSession,
     appendMessage,
     retryMessage,
+    retryFollowups,
   };
 }

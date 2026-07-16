@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { Paperclip, Image, Send, Sparkles, MoreVertical, ShieldAlert, Cpu } from 'lucide-react';
 import { Session, Message } from '../types';
+import type { FollowupSuggestion } from '../api/contracts';
 
 interface ChatAreaProps {
   session: Session;
@@ -11,6 +12,10 @@ interface ChatAreaProps {
   taskPhaseLabel?: string;
   taskProgress?: { current: number; total: number };
   onRetryMessage?: (messageId: string) => Promise<unknown>;
+  followupStatus?: 'pending' | 'completed' | 'failed';
+  followupSuggestions?: FollowupSuggestion[];
+  followupError?: string;
+  onRetryFollowups?: () => Promise<unknown>;
 }
 
 export default function ChatArea({
@@ -22,6 +27,10 @@ export default function ChatArea({
   taskPhaseLabel,
   taskProgress,
   onRetryMessage,
+  followupStatus,
+  followupSuggestions = [],
+  followupError,
+  onRetryFollowups,
 }: ChatAreaProps) {
   const [inputText, setInputText] = useState('');
   const chatEndRef = useRef<HTMLDivElement>(null);
@@ -223,39 +232,57 @@ export default function ChatArea({
       {/* Input panel container */}
       <div className="p-4 bg-white border-t border-slate-100 space-y-2.5">
         
-        {/* Quick Commands Tags */}
-        <div className="flex items-center gap-2 overflow-x-auto pb-1 scrollbar-none">
-          <span className="text-[10px] font-bold text-slate-400 shrink-0 uppercase tracking-wider flex items-center gap-1">
-            <Sparkles className="h-3 w-3 text-indigo-500 animate-pulse" />
-            常用指令:
-          </span>
-          <div className="flex gap-1.5 min-w-max">
-            {[
-              { label: "📊 分析转化率", text: "请帮我分析本次营销活动中各个KOL的销售转化率与性价比。" },
-              { label: "👥 对比各KOL表现", text: "对比分析本次合作达人的具体粉丝、互动率与情感极性表现。" },
-              { label: "💰 查看预算匹配", text: "重点分析候选达人的报价区间、预算匹配度及组合性价比。" },
-              { label: "📈 分析舆情情感", text: "深度剖析受众的情感偏好、舆情关键词分布及潜在负面规避建议。" }
-            ].map((cmd, idx) => (
-              <button
-                key={idx}
-                type="button"
-                disabled={isAnalyzing}
-                onClick={() => {
-                  if (!isAnalyzing) {
-                    void onSendMessage(cmd.text).catch(() => undefined);
-                  }
-                }}
-                className={`text-[10px] font-medium px-2.5 py-1 rounded-full border transition duration-150 active:scale-95 ${
-                  isAnalyzing
-                    ? 'bg-slate-50 text-slate-300 border-slate-100 cursor-not-allowed'
-                    : 'bg-indigo-50/50 hover:bg-indigo-50 text-indigo-600 border-indigo-100/60 hover:border-indigo-200'
-                }`}
-              >
-                {cmd.label}
-              </button>
-            ))}
-          </div>
-        </div>
+        {followupStatus && (
+          <section aria-label="进一步分析建议" className="rounded-xl border border-indigo-100 bg-indigo-50/40 px-3 py-2.5">
+            <div className="flex items-center gap-1.5 text-[10px] font-bold text-indigo-600">
+              <Sparkles className="h-3 w-3" />
+              进一步分析建议
+            </div>
+            {followupStatus === 'pending' && (
+              <p className="mt-2 text-[10px] text-slate-500" role="status">正在生成进一步分析建议…</p>
+            )}
+            {followupStatus === 'failed' && (
+              <div className="mt-2 flex items-center justify-between gap-2 text-[10px] text-rose-600">
+                <span>{followupError ?? '进一步分析建议暂时生成失败，请稍后重试。'}</span>
+                {onRetryFollowups && (
+                  <button
+                    type="button"
+                    className="shrink-0 rounded-lg border border-indigo-200 bg-white px-2 py-1 font-semibold text-indigo-600 hover:bg-indigo-50"
+                    disabled={isAnalyzing}
+                    onClick={() => void onRetryFollowups().catch(() => undefined)}
+                  >
+                    重试建议生成
+                  </button>
+                )}
+              </div>
+            )}
+            {followupStatus === 'completed' && followupSuggestions.length === 0 && (
+              <p className="mt-2 text-[10px] text-slate-500">本轮暂无可执行的进一步分析建议。</p>
+            )}
+            {followupStatus === 'completed' && followupSuggestions.length > 0 && (
+              <div className="mt-2 flex gap-1.5 overflow-x-auto pb-0.5 scrollbar-none">
+                {followupSuggestions.slice(0, 5).map((suggestion, index) => (
+                  <button
+                    key={`${suggestion.title}-${index}`}
+                    type="button"
+                    title={suggestion.rationale}
+                    disabled={isAnalyzing}
+                    onClick={() => {
+                      if (!isAnalyzing) void onSendMessage(suggestion.prompt).catch(() => undefined);
+                    }}
+                    className={`min-w-[150px] rounded-lg border px-2.5 py-2 text-left transition active:scale-95 ${isAnalyzing
+                      ? 'cursor-not-allowed border-slate-100 bg-slate-50 text-slate-300'
+                      : 'border-indigo-100 bg-white text-indigo-700 hover:border-indigo-300 hover:bg-indigo-50'
+                    }`}
+                  >
+                    <span className="block text-[10px] font-semibold">{suggestion.title}</span>
+                    <span className="mt-1 block text-[9px] font-normal text-slate-500">{suggestion.rationale}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </section>
+        )}
 
         <form onSubmit={event => void handleSend(event)} className="bg-slate-50 rounded-xl p-1 flex items-center border border-slate-200 focus-within:ring-2 focus-within:ring-indigo-500/20 transition duration-150">
           

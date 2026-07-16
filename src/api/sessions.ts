@@ -49,6 +49,9 @@ export function toSession(source: ApiSession): Session {
         status: source.latest_task.status,
         candidateVersion,
         reportId,
+        followupStatus: source.latest_task.followup_suggestions_status ?? undefined,
+        followupSuggestions: source.latest_task.followup_suggestions ?? [],
+        followupError: source.latest_task.followup_error ?? undefined,
       };
     })() : undefined,
     createdAt: source.created_at,

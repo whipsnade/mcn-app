@@ -106,4 +106,48 @@ describe('ChatArea', () => {
     });
     expect(onRetryMessage).toHaveBeenCalledWith('message-1');
   });
+
+  it('shows ready follow-up suggestions and starts the next round from a clicked prompt', async () => {
+    const onSendMessage = vi.fn().mockResolvedValue(undefined);
+    render(
+      <ChatArea
+        session={session}
+        onSendMessage={onSendMessage}
+        isAnalyzing={false}
+        isMockMode={false}
+        followupStatus="completed"
+        followupSuggestions={[{ title: '分析地域', prompt: '请进一步分析粉丝地域分布', rationale: '识别重点投放区域' }]}
+      />,
+    );
+
+    expect(screen.getByText('进一步分析建议')).toBeVisible();
+    expect(screen.getByText('识别重点投放区域')).toBeVisible();
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /分析地域/ }));
+    });
+    expect(onSendMessage).toHaveBeenCalledWith('请进一步分析粉丝地域分布');
+  });
+
+  it('renders loading and retryable error states for follow-up suggestions', async () => {
+    const onRetryFollowups = vi.fn().mockResolvedValue(undefined);
+    const { rerender } = render(
+      <ChatArea session={session} onSendMessage={vi.fn()} isAnalyzing={false} isMockMode={false} followupStatus="pending" />,
+    );
+    expect(screen.getByText('正在生成进一步分析建议…')).toBeVisible();
+
+    rerender(
+      <ChatArea
+        session={session}
+        onSendMessage={vi.fn()}
+        isAnalyzing={false}
+        isMockMode={false}
+        followupStatus="failed"
+        followupError="进一步分析建议暂时生成失败，请稍后重试。"
+        onRetryFollowups={onRetryFollowups}
+      />,
+    );
+    expect(screen.getByText('进一步分析建议暂时生成失败，请稍后重试。')).toBeVisible();
+    await act(async () => fireEvent.click(screen.getByRole('button', { name: '重试建议生成' })));
+    expect(onRetryFollowups).toHaveBeenCalledOnce();
+  });
 });

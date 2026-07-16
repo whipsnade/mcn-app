@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { authorizedFetch, setAccessToken } from './client';
-import { downloadLatestSessionExport, retryTask } from './tasks';
+import { downloadLatestSessionExport, retryFollowups, retryTask } from './tasks';
 
 
 describe('authorizedFetch', () => {
@@ -75,6 +75,23 @@ describe('authorizedFetch', () => {
     expect(fetchMock).toHaveBeenCalledWith('/api/v1/tasks/task-1/retry', expect.objectContaining({
       method: 'POST',
       credentials: 'include',
+    }));
+  });
+
+  it('retries follow-up suggestions for the existing task', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      id: 'task-1', session_id: 'session-1', status: 'completed', estimated_points: 0,
+      error_code: null, error_message: null, latest_report_id: null,
+      followup_suggestions_status: 'pending', followup_suggestions: [], followup_error: null,
+    }), { status: 202 }));
+    vi.stubGlobal('fetch', fetchMock);
+    setAccessToken('token');
+
+    const result = await retryFollowups('task-1');
+
+    expect(result.followup_suggestions_status).toBe('pending');
+    expect(fetchMock).toHaveBeenCalledWith('/api/v1/tasks/task-1/followups/retry', expect.objectContaining({
+      method: 'POST', credentials: 'include',
     }));
   });
 });

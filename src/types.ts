@@ -100,6 +100,9 @@ export interface SessionAnalysis {
   status: string;
   candidateVersion?: number;
   reportId?: string;
+  followupStatus?: 'pending' | 'completed' | 'failed';
+  followupSuggestions?: import('./api/contracts').FollowupSuggestion[];
+  followupError?: Record<string, unknown>;
 }
 
 export interface KolCandidate {

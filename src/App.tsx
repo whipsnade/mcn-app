@@ -206,6 +206,12 @@ export default function App() {
                   taskPhaseLabel={workspace.taskRuntime?.phaseLabel}
                   taskProgress={workspace.taskRuntime?.phaseProgress}
                   onRetryMessage={messageId => workspace.retryMessage(messageId)}
+                  followupStatus={workspace.activeSession.analysis?.followupStatus}
+                  followupSuggestions={workspace.activeSession.analysis?.followupSuggestions}
+                  followupError={typeof workspace.activeSession.analysis?.followupError?.message === 'string'
+                    ? workspace.activeSession.analysis.followupError.message
+                    : undefined}
+                  onRetryFollowups={() => workspace.retryFollowups()}
                 />
               )}
               {workspaceTab === 'candidates' && (

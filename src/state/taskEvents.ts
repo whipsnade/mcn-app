@@ -33,6 +33,9 @@ export interface TaskRuntimeState {
   errorMessageId?: string;
   activity?: string;
   connection: TaskConnection;
+  followupStatus?: 'pending' | 'completed' | 'failed';
+  followupSuggestions?: Array<{ title: string; prompt: string; rationale: string }>;
+  followupError?: string;
 }
 
 export function initialTaskRuntime(taskId: string): TaskRuntimeState {
@@ -41,6 +44,7 @@ export function initialTaskRuntime(taskId: string): TaskRuntimeState {
     lastEventId: 0,
     assistantDraft: '',
     connection: 'idle',
+    followupSuggestions: [],
   };
 }
 
@@ -112,6 +116,45 @@ function applyStatusAndPointEvent(state: TaskRuntimeState, event: TaskEvent): Ta
         errorMessageId: String(event.payload.messageId ?? event.payload.message_id ?? ''),
         connection: 'closed',
         activity: '分析未完成，请稍后重试',
+      };
+    case 'followup.suggestions_started':
+      return {
+        ...state,
+        followupStatus: 'pending',
+        followupSuggestions: [],
+        followupError: undefined,
+        activity: '正在生成进一步分析建议',
+      };
+    case 'followup.suggestions_updated':
+      {
+        const hasSuggestionsPayload = Array.isArray(event.payload.suggestions);
+        const suggestionsPayload = hasSuggestionsPayload ? event.payload.suggestions as unknown[] : [];
+        return {
+          ...state,
+          // Production SSE carries only a count; keep polling until the
+          // persisted task metadata with the actual suggestions is recovered.
+          followupStatus: hasSuggestionsPayload ? 'completed' : state.followupStatus ?? 'pending',
+          followupSuggestions: hasSuggestionsPayload
+            ? suggestionsPayload.filter(item => typeof item === 'object' && item !== null).map(item => {
+              const value = item as Record<string, unknown>;
+              return {
+                title: String(value.title ?? ''),
+                prompt: String(value.prompt ?? ''),
+                rationale: String(value.rationale ?? ''),
+              };
+            }).filter(item => item.title && item.prompt)
+            : state.followupSuggestions ?? [],
+          followupError: undefined,
+          activity: '进一步分析建议已生成',
+        };
+      }
+    case 'followup.suggestions_failed':
+      return {
+        ...state,
+        followupStatus: 'failed',
+        followupSuggestions: [],
+        followupError: '进一步分析建议暂时生成失败，请稍后重试。',
+        activity: '进一步分析建议生成失败',
       };
     default:
       return state;

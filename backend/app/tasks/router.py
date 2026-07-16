@@ -160,6 +160,30 @@ async def retry_task(
     return task_read(task)
 
 
+@router.post("/tasks/{task_id}/followups/retry", response_model=TaskRead, status_code=202)
+async def retry_followups(
+    task_id: str,
+    user: FunctionScopedCurrentUser,
+    db: Annotated[AsyncSession, Depends(get_db, scope="function")],
+    task_runner: Annotated[TaskRunner, Depends(get_task_runner)],
+) -> TaskRead:
+    """Retry only the non-fatal follow-up model call for the same task."""
+    try:
+        task = await TaskRepository(db).get_owned(task_id, user.id)
+    except LookupError as error:
+        raise task_not_found(error) from error
+    if task.status not in {"completed", "completed_with_warnings"}:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="task_not_terminal")
+    metadata = await task_followup_metadata(db, task)
+    if metadata.get("followup_suggestions_status") != "failed":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="followup_retry_not_failed")
+    started = await task_runner.retry_followup(task_id)
+    if not started:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="followup_retry_unavailable")
+    await db.refresh(task)
+    return task_read(task, await task_followup_metadata(db, task))
+
+
 @router.get("/tasks/{task_id}", response_model=TaskRead)
 async def get_task(
     task_id: str,

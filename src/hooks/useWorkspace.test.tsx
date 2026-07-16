@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Session } from '../types';
 import { createSession, deleteSession, getSession, listSessions, updateSession } from '../api/sessions';
-import { createTask, getCandidates, getReport, retryTask } from '../api/tasks';
+import { createTask, getCandidates, getReport, retryFollowups, retryTask } from '../api/tasks';
 import { useTaskStream } from './useTaskStream';
 import { useWorkspace } from './useWorkspace';
 
@@ -74,8 +74,10 @@ vi.mock('../api/sessions', () => ({
 
 vi.mock('../api/tasks', () => ({
   createTask: vi.fn(),
+  getTask: vi.fn(),
   getCandidates: vi.fn(),
   getReport: vi.fn(),
+  retryFollowups: vi.fn(),
   retryTask: vi.fn(),
 }));
 
@@ -103,6 +105,23 @@ describe('useWorkspace', () => {
     expect(result.current.sessions).toEqual([restoredSession]);
     expect(result.current.activeSession?.id).toBe('session-1');
     expect(result.current.activeSession?.messages[0]?.text).toBe('恢复这条历史提问');
+  });
+
+  it('accepts follow-up events only for the active task and exposes the latest suggestions', async () => {
+    const withTask = {
+      ...restoredSession,
+      analysis: { taskId: 'task-follow', status: 'completed', followupStatus: 'pending' as const, followupSuggestions: [] },
+    };
+    vi.mocked(getSession).mockResolvedValue(withTask);
+    vi.mocked(useTaskStream).mockReturnValue({
+      taskId: 'task-follow', lastEventId: 2, assistantDraft: '', connection: 'closed', status: 'completed',
+      followupStatus: 'completed',
+      followupSuggestions: [{ title: '分析地域', prompt: '请分析浙江粉丝', rationale: '优化投放区域' }],
+    });
+    const { result } = renderHook(() => useWorkspace('user-a'));
+
+    await waitFor(() => expect(result.current.activeSession?.analysis?.followupSuggestions?.[0]?.prompt).toBe('请分析浙江粉丝'));
+    expect(result.current.activeSession?.analysis?.taskId).toBe('task-follow');
   });
 
   it('clears the workspace when the user logs out', async () => {
@@ -958,6 +977,27 @@ describe('useWorkspace', () => {
     expect(result.current.activeSession?.analysis?.candidateVersion).toBeUndefined();
     expect(result.current.activeSession?.biReport).toBeUndefined();
     expect(result.current.activeSession?.messages[0]?.taskId).toBe('task-new');
+  });
+
+  it('retries suggestions for the same completed task without creating a new task', async () => {
+    vi.mocked(getSession).mockResolvedValue({
+      ...restoredSession,
+      analysis: { taskId: 'task-failed-followup', status: 'completed', followupStatus: 'failed', followupSuggestions: [] },
+    });
+    vi.mocked(retryFollowups).mockResolvedValue({
+      id: 'task-failed-followup', session_id: 'session-1', status: 'completed', estimated_points: 0,
+      error_code: null, error_message: null, latest_report_id: null,
+      followup_suggestions_status: 'pending', followup_suggestions: [], followup_error: null,
+    });
+    const { result } = renderHook(() => useWorkspace('user-a'));
+    await waitFor(() => expect(result.current.activeSession?.analysis?.followupStatus).toBe('failed'));
+
+    await act(async () => await result.current.retryFollowups());
+
+    expect(retryFollowups).toHaveBeenCalledWith('task-failed-followup');
+    expect(createTask).not.toHaveBeenCalled();
+    expect(result.current.activeSession?.analysis?.taskId).toBe('task-failed-followup');
+    expect(result.current.activeSession?.analysis?.followupStatus).toBe('pending');
   });
 
   it('adds a persisted task error message once when the terminal event arrives', async () => {

@@ -149,4 +149,43 @@ describe('task event reducer', () => {
     expect(state.errorMessageId).toBe('error-1');
     expect(duplicate.errorMessage).toBe(state.errorMessage);
   });
+
+  it('tracks follow-up suggestion lifecycle without exposing event internals', () => {
+    const pending = reduceTaskEvent(initialTaskRuntime('task-1'), {
+      id: 1,
+      taskId: 'task-1',
+      type: 'followup.suggestions_started',
+      payload: { session_id: 'session-1', task_id: 'task-1' },
+    });
+    expect(pending.followupStatus).toBe('pending');
+    expect(pending.followupSuggestions).toEqual([]);
+
+    const ready = reduceTaskEvent(pending, {
+      id: 2,
+      taskId: 'task-1',
+      type: 'followup.suggestions_updated',
+      payload: {
+        suggestions: [{ title: '受众拆解', prompt: '请继续分析受众地域', rationale: '定位重点区域' }],
+      },
+    });
+    expect(ready.followupStatus).toBe('completed');
+    expect(ready.followupSuggestions).toEqual([{ title: '受众拆解', prompt: '请继续分析受众地域', rationale: '定位重点区域' }]);
+
+    const persistedOnly = reduceTaskEvent(pending, {
+      id: 4,
+      taskId: 'task-1',
+      type: 'followup.suggestions_updated',
+      payload: { count: 1 },
+    });
+    expect(persistedOnly.followupStatus).toBe('pending');
+
+    const failed = reduceTaskEvent(pending, {
+      id: 3,
+      taskId: 'task-1',
+      type: 'followup.suggestions_failed',
+      payload: { error_code: 'FOLLOWUP_GENERATION_FAILED' },
+    });
+    expect(failed.followupStatus).toBe('failed');
+    expect(failed.followupError).toBe('进一步分析建议暂时生成失败，请稍后重试。');
+  });
 });

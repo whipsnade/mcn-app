@@ -66,12 +66,24 @@ export interface ApiTask {
   error_code: string | null;
   error_message?: string | null;
   latest_report_id: string | null;
+  followup_suggestions_status?: 'pending' | 'completed' | 'failed' | null;
+  followup_suggestions?: FollowupSuggestion[];
+  followup_error?: Record<string, unknown> | null;
 }
 
 export interface ApiTaskSummary {
   id: string;
   status: ApiTaskStatus;
   completed_at: string | null;
+  followup_suggestions_status?: 'pending' | 'completed' | 'failed' | null;
+  followup_suggestions?: FollowupSuggestion[];
+  followup_error?: Record<string, unknown> | null;
+}
+
+export interface FollowupSuggestion {
+  title: string;
+  prompt: string;
+  rationale: string;
 }
 
 export interface ApiCandidateVersionSummary {

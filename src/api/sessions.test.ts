@@ -61,6 +61,24 @@ describe('toSession', () => {
     expect(session.analysis?.reportId).toBeUndefined();
   });
 
+  it('restores follow-up suggestions from the latest task metadata', () => {
+    const session = toSession({
+      id: 's-follow', title: '建议', brand: '品牌', campaign_name: null, status: 'completed',
+      platforms: ['douyin'], category: '餐饮', target_audience: '', budget_min: null, budget_max: null,
+      filters: {}, is_starred: false, messages: [],
+      latest_task: {
+        id: 'task-follow', status: 'completed', completed_at: null,
+        followup_suggestions_status: 'completed',
+        followup_suggestions: [{ title: '分析地域', prompt: '请分析浙江粉丝', rationale: '优化投放区域' }],
+        followup_error: null,
+      },
+      created_at: '2026-07-14T10:00:00Z', updated_at: '2026-07-15T10:00:00Z',
+    });
+
+    expect(session.analysis?.followupStatus).toBe('completed');
+    expect(session.analysis?.followupSuggestions?.[0]?.prompt).toBe('请分析浙江粉丝');
+  });
+
   it('deletes a session through the session endpoint', async () => {
     vi.mocked(request).mockResolvedValue(undefined);
 
