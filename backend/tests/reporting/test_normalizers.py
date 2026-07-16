@@ -8,11 +8,17 @@ from app.reporting.schemas import ToolEvidence
 NOW = datetime(2026, 7, 16, tzinfo=timezone.utc)
 
 
-def evidence(tool: str, payload: dict, call_id: str) -> ToolEvidence:
+def evidence(
+    tool: str,
+    payload: dict,
+    call_id: str,
+    *,
+    collected_at: datetime = NOW,
+) -> ToolEvidence:
     return ToolEvidence(
         internal_tool_name=tool,
         source_call_id=call_id,
-        collected_at=NOW,
+        collected_at=collected_at,
         payload=payload,
     )
 
@@ -32,8 +38,11 @@ def test_datatap_candidate_exports_template_fields_without_raw_urls() -> None:
                             "粉丝数": "2.5万",
                             "城市": "浙江",
                             "总获赞": 12345,
+                            "曝光量": 100,
                             "内容标签": ["护肤", "测评"],
                             "主页": "https://example.test/profile/uid-1",
+                            "endpoint": "https://api.example.test/private",
+                            "原始评论": ["不要持久化这条评论"],
                         }
                     ]
                 },
@@ -51,6 +60,13 @@ def test_datatap_candidate_exports_template_fields_without_raw_urls() -> None:
     }
     assert "主页" not in candidate.export_fields
     assert "export_fields" in candidate.as_dict()
+    assert candidate.normalized_profile_url == "https://example.test/profile/uid-1"
+    assert candidate.analytics_fields == {"exposure": 100}
+    serialized_analytics = json.dumps(candidate.as_dict()["analytics_fields"], ensure_ascii=False)
+    assert "example.test" not in serialized_analytics
+    assert "endpoint" not in serialized_analytics
+    assert "原始评论" not in serialized_analytics
+    assert "不要持久化这条评论" not in serialized_analytics
 
 
 def test_xiaohongshu_candidate_normalizes_safe_analytics_aliases() -> None:
@@ -185,34 +201,104 @@ def test_creator_candidate_normalizes_english_aliases_and_persists_as_dict() -> 
     assert "unsafe.example" not in serialized
 
 
-def test_merge_fills_only_missing_analytics_fields_deterministically() -> None:
-    first = evidence(
+def test_merge_is_order_independent_and_prefers_newer_evidence() -> None:
+    older = evidence(
         "creator.search.v1",
         {
             "platform": "bilibili",
             "account_id": "creator-merge",
+            "nickname": "旧昵称",
             "impressions": 100,
             "keywords": ["首发"],
+            "risk_flags": [{"type": "z-risk"}],
         },
-        "call-2",
+        "call-old",
+        collected_at=datetime(2026, 7, 15, tzinfo=timezone.utc),
+    )
+    newer = evidence(
+        "creator.profile.v1",
+        {
+            "platform": "bilibili",
+            "account_id": "creator-merge",
+            "nickname": "新昵称",
+            "impressions": 200,
+            "total_interactions": 50,
+            "keywords": [],
+            "risk_flags": [{"type": "a-risk"}],
+        },
+        "call-new",
+        collected_at=NOW,
+    )
+
+    [forward] = normalize_tool_evidence([older, newer])
+    [reverse] = normalize_tool_evidence([newer, older])
+
+    assert forward == reverse
+    assert forward.nickname == "新昵称"
+    assert forward.analytics_fields == {
+        "exposure": 200,
+        "interactions": 50,
+        "hot_words": ["首发"],
+    }
+    assert forward.risk_flags == ({"type": "a-risk"}, {"type": "z-risk"})
+    assert forward.evidence_references == ("call-new", "call-old")
+
+
+def test_merge_same_timestamp_uses_source_call_id_as_stable_tie_break() -> None:
+    call_a = evidence(
+        "creator.search.v1",
+        {
+            "platform": "bilibili",
+            "account_id": "creator-tie",
+            "nickname": "A",
+            "impressions": 100,
+        },
+        "call-a",
+    )
+    call_b = evidence(
+        "creator.profile.v1",
+        {
+            "platform": "bilibili",
+            "account_id": "creator-tie",
+            "nickname": "B",
+            "impressions": 200,
+        },
+        "call-b",
+    )
+
+    [forward] = normalize_tool_evidence([call_a, call_b])
+    [reverse] = normalize_tool_evidence([call_b, call_a])
+
+    assert forward == reverse
+    assert forward.nickname == "B"
+    assert forward.analytics_fields["exposure"] == 200
+
+
+def test_merge_same_timestamp_and_call_id_uses_content_digest_stably() -> None:
+    first = evidence(
+        "creator.search.v1",
+        {
+            "platform": "bilibili",
+            "account_id": "creator-digest-tie",
+            "nickname": "摘要候选一",
+            "impressions": 100,
+        },
+        "call-same",
     )
     second = evidence(
         "creator.profile.v1",
         {
             "platform": "bilibili",
-            "account_id": "creator-merge",
+            "account_id": "creator-digest-tie",
+            "nickname": "摘要候选二",
             "impressions": 200,
             "total_interactions": 50,
-            "keywords": [],
         },
-        "call-1",
+        "call-same",
     )
 
-    [candidate] = normalize_tool_evidence([first, second])
+    [forward] = normalize_tool_evidence([first, second])
+    [reverse] = normalize_tool_evidence([second, first])
 
-    assert candidate.analytics_fields == {
-        "exposure": 100,
-        "hot_words": ["首发"],
-        "interactions": 50,
-    }
-    assert candidate.evidence_references == ("call-1", "call-2")
+    assert forward == reverse
+    assert forward.analytics_fields["interactions"] == 50

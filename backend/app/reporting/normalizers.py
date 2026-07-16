@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
+import hashlib
 import json
 import re
 from typing import Any
@@ -45,16 +46,15 @@ _TEXT_SECRET_PATTERN = re.compile(
 
 def normalize_tool_evidence(evidence: Iterable[ToolEvidence]) -> tuple[NormalizedKolEvidence, ...]:
     """只接受评审过的内部工具名，按稳定平台身份合并同一达人。"""
-    merged: dict[tuple[str, str], NormalizedKolEvidence] = {}
+    grouped: dict[tuple[str, str], list[NormalizedKolEvidence]] = {}
     for item in evidence:
         adapter = _ADAPTERS.get(item.internal_tool_name)
         if adapter is None:
             raise UnknownEvidenceToolError(f"unknown_evidence_tool:{item.internal_tool_name}")
         for normalized in adapter(item):
             key = (normalized.platform, normalized.platform_account_id)
-            previous = merged.get(key)
-            merged[key] = normalized if previous is None else _merge(previous, normalized)
-    return tuple(merged[key] for key in sorted(merged))
+            grouped.setdefault(key, []).append(normalized)
+    return tuple(_merge_many(grouped[key]) for key in sorted(grouped))
 
 
 def redact_evidence_for_storage(value: Any) -> Any:
@@ -284,39 +284,94 @@ def _normalize_candidate(item: ToolEvidence, candidate: Any) -> NormalizedKolEvi
 def _merge(
     previous: NormalizedKolEvidence, current: NormalizedKolEvidence
 ) -> NormalizedKolEvidence:
+    return _merge_many((previous, current))
+
+
+def _merge_many(records: Iterable[NormalizedKolEvidence]) -> NormalizedKolEvidence:
+    prioritized = tuple(sorted(records, key=_evidence_priority, reverse=True))
+    if not prioritized:
+        raise ValueError("cannot_merge_empty_evidence")
+    primary = prioritized[0]
+    if any(
+        (item.platform, item.platform_account_id)
+        != (primary.platform, primary.platform_account_id)
+        for item in prioritized[1:]
+    ):
+        raise ValueError("cannot_merge_different_creators")
     values = {
-        name: getattr(previous, name) if getattr(previous, name) is not None else getattr(current, name)
+        name: next(
+            (value for item in prioritized if (value := getattr(item, name)) is not None),
+            None,
+        )
         for name in _MERGEABLE_FIELDS
     }
-    export_fields = dict(previous.export_fields)
-    export_fields.update({key: value for key, value in current.export_fields.items() if value is not None})
+    export_fields = {
+        name: value
+        for name in sorted({name for item in prioritized for name in item.export_fields})
+        if (
+            value := next(
+                (
+                    candidate
+                    for item in prioritized
+                    if _has_value(candidate := item.export_fields.get(name))
+                ),
+                None,
+            )
+        )
+        is not None
+    }
     analytics_fields = {
         name: value
         for name in _ANALYTICS_FIELD_ORDER
         if (
-            value := (
-                previous.analytics_fields.get(name)
-                if _has_value(previous.analytics_fields.get(name))
-                else current.analytics_fields.get(name)
+            value := next(
+                (
+                    candidate
+                    for item in prioritized
+                    if _has_value(candidate := item.analytics_fields.get(name))
+                ),
+                None,
             )
         )
         is not None
-        and _has_value(value)
     }
-    flags = tuple({repr(flag): flag for flag in previous.risk_flags + current.risk_flags}.values())
+    flags_by_digest = {
+        _stable_json(flag): flag for item in prioritized for flag in item.risk_flags
+    }
     missing = tuple(name for name, value in values.items() if value is None)
     return NormalizedKolEvidence(
-        platform=previous.platform,
-        platform_account_id=previous.platform_account_id,
-        risk_flags=flags,
-        collected_at=max(previous.collected_at, current.collected_at),
+        platform=primary.platform,
+        platform_account_id=primary.platform_account_id,
+        risk_flags=tuple(flags_by_digest[key] for key in sorted(flags_by_digest)),
+        collected_at=primary.collected_at,
         evidence_references=tuple(
-            sorted(set(previous.evidence_references + current.evidence_references))
+            sorted({reference for item in prioritized for reference in item.evidence_references})
         ),
         missing_fields=missing,
         export_fields=export_fields,
         analytics_fields=analytics_fields,
         **values,
+    )
+
+
+def _evidence_priority(item: NormalizedKolEvidence) -> tuple[float, tuple[str, ...], str]:
+    collected_at = item.collected_at
+    if collected_at.tzinfo is None:
+        collected_at = collected_at.replace(tzinfo=timezone.utc)
+    return (
+        collected_at.timestamp(),
+        tuple(sorted(item.evidence_references)),
+        hashlib.sha256(_stable_json(item.as_dict()).encode("utf-8")).hexdigest(),
+    )
+
+
+def _stable_json(value: Any) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
     )
 
 
