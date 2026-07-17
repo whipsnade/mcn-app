@@ -1,6 +1,9 @@
 import pytest
 
 
+ALL_MOCK_CHANNELS = {"xiaohongshu", "douyin", "bilibili", "weibo", "wechat"}
+
+
 @pytest.mark.asyncio
 async def test_new_sms_user_can_refresh_and_receives_1000_points(client) -> None:
     code_response = await client.post(
@@ -22,6 +25,7 @@ async def test_new_sms_user_can_refresh_and_receives_1000_points(client) -> None
     wallet = await client.get("/api/v1/wallet", headers=headers)
     assert me.status_code == 200
     assert me.json()["nickname"] == "手机用户_5678"
+    assert set(me.json()["channels"]) == ALL_MOCK_CHANNELS
     assert wallet.json() == {"balance": 1000, "reserved": 0, "available": 1000}
 
     refreshed = await client.post("/api/v1/auth/refresh")
@@ -41,6 +45,11 @@ async def test_repeat_login_does_not_repeat_welcome_grant(client) -> None:
     )
     assert first.status_code == second.status_code == 200
     assert wallet.json()["balance"] == 1000
+
+    me = await client.get(
+        "/api/v1/users/me", headers={"Authorization": f"Bearer {token}"}
+    )
+    assert set(me.json()["channels"]) == ALL_MOCK_CHANNELS
 
 
 @pytest.mark.asyncio

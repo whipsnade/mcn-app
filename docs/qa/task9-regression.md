@@ -1,17 +1,17 @@
 # Task9 回归检查记录
 
 检查日期：2026-07-17  
-检查提交：`97b6cd5`（`main`，检查前工作区干净）
+检查提交：渠道授权与数据库结构修复（`main`）
 
 ## 检查范围
 
-本轮覆盖数据库迁移、后端单元/集成测试、前端测试与构建、腾讯模型与 DataTap MCP 实际连通性、浏览器关键流程，以及日志和敏感信息安全检查。Task9 期间没有发现需要修改业务代码的真实缺陷。
+本轮覆盖数据库迁移、后端单元/集成测试、前端测试与构建、腾讯模型与 DataTap MCP 实际连通性、浏览器关键流程，以及日志和敏感信息安全检查。后续排查发现并修复了历史会话残留未授权渠道导致的规划失败，以及本机数据库未应用 0013 迁移的问题。
 
 ## 数据库迁移
 
-- Alembic 当前 head：`0012_task_creation_order`。
-- 在独立临时 MySQL 数据库 `kol_insight_task9_test` 中执行：`upgrade head → downgrade base → upgrade head`，三次操作均成功，最终回到 `0012_task_creation_order`。
-- 临时数据库在检查结束后已删除，未对开发数据库执行降级操作。
+- 本机开发数据库 Alembic 当前 head：`0013_task_create_idempotency`。
+- 已执行 `0012_task_creation_order → 0013_task_create_idempotency`，确认 `analysis_tasks` 存在两个幂等字段及唯一索引。
+- 之前的独立临时 MySQL 数据库迁移边界检查仍保持通过。
 
 ## 后端检查
 
@@ -19,7 +19,7 @@
 
 ```text
 pytest -q --ignore=tests/integration/test_real_providers.py
-227 passed in 21.14s
+232 passed
 ```
 
 完整测试结果为 `228 passed, 2 failed`。失败均来自 `tests/integration/test_real_providers.py`，原因是使用测试占位配置时：
@@ -62,6 +62,8 @@ npm run build  → 通过（仅有 JS chunk 大于 500 kB 的性能提示）
 - 切换到“BI 报告”页签后显示“等待生成 KOL 决策报告”空状态，未复用其他会话的旧 BI 数据；
 - 会话导航和“新建分析会话”入口可见。
 
+新增专项验证：历史会话保存 `小红书/抖音/微博`、用户授权仅 `小红书/抖音` 时，规划上下文自动清洗为两项有效渠道，并成功生成双平台计划；没有向微博 MCP 发起调用。
+
 为避免无意触发真实 MCP 扣费，本轮没有在浏览器提交新的实时任务；新建会话、SSE 阶段事件、MCP 调用与导出链路由自动化测试和真实提供方探针覆盖。正式验收时需使用有效积分完成一轮任务，再检查阶段流转、BI 两个页签、建议指令、重试和最新一轮 Excel 导出。
 
 ## 日志与敏感信息检查
@@ -74,4 +76,3 @@ npm run build  → 通过（仅有 JS chunk 大于 500 kB 的性能提示）
 
 - Excel 导出记录：`docs/qa/task8-excel-export.md`（公式扫描结果为 0）。
 - BI 视觉验收记录：`design-qa.md`（最终结果 `passed`）。
-

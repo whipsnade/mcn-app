@@ -164,8 +164,12 @@ class ContextBuilder:
         selected_channels = tuple(
             platform for platform in workspace.platforms if platform in approved_channels
         )
+        effective_channels = selected_channels or tuple(sorted(approved_channels))
+        brief = SessionBrief.from_workspace(workspace).model_copy(
+            update={"platforms": effective_channels}
+        )
         return PlannerContext(
-            brief=SessionBrief.from_workspace(workspace),
+            brief=brief,
             recent_messages=compress_messages(messages, max_chars=24_000),
             existing_results=project_reporting_summary(
                 await self.reporting.context_summary(session_id)
@@ -173,7 +177,7 @@ class ContextBuilder:
             tools=tuple(PlannerTool.from_approved(item) for item in tools),
             # 渠道在新建会话中是可选条件。未显式选择时应在用户已授权的
             # 全部渠道内规划；只有显式选择时才收窄到用户的选择。
-            allowed_channels=selected_channels or tuple(sorted(approved_channels)),
-            export_contract=build_export_field_contract(SessionBrief.from_workspace(workspace)),
+            allowed_channels=effective_channels,
+            export_contract=build_export_field_contract(brief),
             analytics_contract=build_analytics_field_contract(),
         )

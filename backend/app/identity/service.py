@@ -23,7 +23,7 @@ class LoginResult:
 
 
 class IdentityService:
-    default_channels = ("xiaohongshu", "douyin", "bilibili")
+    default_channels = ("xiaohongshu", "douyin", "bilibili", "weibo", "wechat")
 
     def __init__(self, db: AsyncSession) -> None:
         self.db = db
@@ -41,8 +41,34 @@ class IdentityService:
             if user is None or user.status != "active":
                 raise PermissionError("user_inactive")
 
+        await self._ensure_default_channels(user.id)
         await WalletService(self.db).ensure_welcome_grant(user.id)
         return await self._create_login_session(user)
+
+    async def _ensure_default_channels(self, user_id: str) -> None:
+        existing = set(
+            (
+                await self.db.scalars(
+                    select(UserChannelPermission.channel).where(
+                        UserChannelPermission.user_id == user_id
+                    )
+                )
+            ).all()
+        )
+        now = utc_now()
+        for channel in self.default_channels:
+            if channel not in existing:
+                self.db.add(
+                    UserChannelPermission(
+                        id=str(uuid4()),
+                        user_id=user_id,
+                        channel=channel,
+                        is_enabled=True,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+        await self.db.flush()
 
     async def _create_user(self, provider: str, subject: str, nickname: str) -> User:
         now = utc_now()

@@ -199,9 +199,6 @@ class Planner:
     def _validate(plan: ToolPlan, context: PlannerContext) -> None:
         if len(plan.steps) > 10:
             raise PlanValidationError("TOO_MANY_TOOL_CALLS")
-        if any(platform not in context.allowed_channels for platform in context.brief.platforms):
-            raise PlanValidationError("CHANNEL_NOT_ALLOWED")
-
         tools = {tool.internal_name: tool for tool in context.tools}
         for step in plan.steps:
             tool = tools.get(step.internal_tool_name)

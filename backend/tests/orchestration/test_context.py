@@ -54,6 +54,19 @@ class FakePermissions:
         return ("bilibili",)
 
 
+class LegacyChannelWorkspace(FakeWorkspace):
+    async def get_owned_session(self, user_id: str, session_id: str):
+        workspace = await super().get_owned_session(user_id, session_id)
+        workspace.platforms = ["xiaohongshu", "douyin", "weibo"]
+        return workspace
+
+
+class LimitedPermissions:
+    async def list_enabled_channels(self, user_id: str):
+        assert user_id == "user-1"
+        return ("xiaohongshu", "douyin")
+
+
 class FakeReporting:
     async def context_summary(self, session_id: str):
         assert session_id == "session-1"
@@ -133,3 +146,18 @@ async def test_model_context_contains_reviewed_tools_but_no_supplier_details() -
     assert "安全候选" in serialized
     assert "候选内容互动稳定" in serialized
     assert context.allowed_channels == ("bilibili",)
+
+
+@pytest.mark.asyncio
+async def test_context_ignores_legacy_unapproved_platforms() -> None:
+    builder = ContextBuilder(
+        workspace=LegacyChannelWorkspace(),
+        registry=FakeRegistry(),
+        permissions=LimitedPermissions(),
+        reporting=FakeReporting(),
+    )
+
+    context = await builder.build(user_id="user-1", session_id="session-1")
+
+    assert context.allowed_channels == ("xiaohongshu", "douyin")
+    assert context.brief.platforms == ("xiaohongshu", "douyin")
