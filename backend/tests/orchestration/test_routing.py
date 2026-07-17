@@ -20,15 +20,21 @@ def _brief(brand: str = "科颜氏") -> SessionBrief:
     )
 
 
-def test_brand_volume_question_routes_to_brand() -> None:
+def test_brand_volume_question_routes_to_hybrid_for_kol_context() -> None:
     result = classify_analysis_request(
         "分析科颜氏最近3个月在各平台的声量变化和用户情感趋势", _brief()
     )
 
-    assert result.scope == "brand"
-    assert set(result.objectives) >= {"volume_trend", "sentiment_trend"}
+    assert result.scope == "hybrid"
+    assert set(result.objectives) >= {"volume_trend", "sentiment_trend", "kol_discovery"}
     assert result.requested_period["unit"] == "month"
     assert result.requested_period["value"] == 3
+
+
+def test_explicit_brand_only_question_routes_to_brand() -> None:
+    result = classify_analysis_request("仅分析品牌声量和情感趋势，不需要达人", _brief())
+
+    assert result.scope == "brand"
 
 
 def test_brand_question_that_requests_active_creators_routes_to_hybrid() -> None:

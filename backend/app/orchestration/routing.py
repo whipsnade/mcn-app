@@ -32,6 +32,7 @@ _KOL_TERMS = (
     "博主",
     "账号",
 )
+_BRAND_ONLY_TERMS = ("仅分析品牌", "只分析品牌", "仅品牌维度", "不需要达人", "不找达人")
 _PERIOD_PATTERN = re.compile(r"(?:最近|近)(?P<value>\d+)\s*(?P<unit>天|日|个月|月|季度|年)")
 
 
@@ -69,7 +70,12 @@ def classify_analysis_request(text: str, brief: SessionBrief) -> AnalysisRouting
     content = f"{brief.brand}\n{brief.category}\n{text}".casefold()
     has_brand = any(term.casefold() in content for term in _BRAND_TERMS)
     has_kol = any(term.casefold() in content for term in _KOL_TERMS)
-    if has_brand and has_kol:
+    explicit_brand_only = any(term in content for term in _BRAND_ONLY_TERMS)
+    if explicit_brand_only:
+        # “不需要达人” contains the KOL keyword itself but is a negative
+        # instruction, not a request for creator discovery.
+        has_kol = False
+    if has_brand and (has_kol or not explicit_brand_only):
         scope: AnalysisScope = "hybrid"
     elif has_brand:
         scope = "brand"
@@ -87,7 +93,7 @@ def classify_analysis_request(text: str, brief: SessionBrief) -> AnalysisRouting
         objectives.append("hot_topics")
     if any(term in content for term in ("画像", "人群", "地域", "性别", "年龄")):
         objectives.append("audience_profile")
-    if has_kol:
+    if has_kol or scope == "hybrid":
         objectives.append("kol_discovery")
     if any(term in content for term in ("对比", "比较", "各平台")):
         objectives.append("platform_comparison")
