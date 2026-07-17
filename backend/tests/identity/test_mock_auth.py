@@ -1,4 +1,8 @@
 import pytest
+from sqlalchemy import select
+
+from app.identity.models import UserChannelPermission
+from app.identity.service import IdentityService
 
 
 ALL_MOCK_CHANNELS = {"xiaohongshu", "douyin", "bilibili", "weibo", "wechat"}
@@ -50,6 +54,36 @@ async def test_repeat_login_does_not_repeat_welcome_grant(client) -> None:
         "/api/v1/users/me", headers={"Authorization": f"Bearer {token}"}
     )
     assert set(me.json()["channels"]) == ALL_MOCK_CHANNELS
+
+
+@pytest.mark.asyncio
+async def test_mock_default_channels_reenable_existing_permission(db_session, user_factory) -> None:
+    user = await user_factory()
+    db_session.add(
+        UserChannelPermission(
+            id="disabled-xhs-permission",
+            user_id=user.id,
+            channel="xiaohongshu",
+            is_enabled=False,
+            created_at=user.created_at,
+            updated_at=user.updated_at,
+        )
+    )
+    await db_session.flush()
+
+    await IdentityService(db_session)._ensure_default_channels(user.id)
+
+    rows = list(
+        (
+            await db_session.scalars(
+                select(UserChannelPermission).where(
+                    UserChannelPermission.user_id == user.id
+                )
+            )
+        ).all()
+    )
+    assert {row.channel for row in rows} == ALL_MOCK_CHANNELS
+    assert all(row.is_enabled for row in rows)
 
 
 @pytest.mark.asyncio

@@ -46,15 +46,16 @@ class IdentityService:
         return await self._create_login_session(user)
 
     async def _ensure_default_channels(self, user_id: str) -> None:
-        existing = set(
+        existing_rows = list(
             (
                 await self.db.scalars(
-                    select(UserChannelPermission.channel).where(
+                    select(UserChannelPermission).where(
                         UserChannelPermission.user_id == user_id
                     )
                 )
             ).all()
         )
+        existing = {row.channel: row for row in existing_rows}
         now = utc_now()
         for channel in self.default_channels:
             if channel not in existing:
@@ -68,6 +69,9 @@ class IdentityService:
                         updated_at=now,
                     )
                 )
+            elif not existing[channel].is_enabled:
+                existing[channel].is_enabled = True
+                existing[channel].updated_at = now
         await self.db.flush()
 
     async def _create_user(self, provider: str, subject: str, nickname: str) -> User:
