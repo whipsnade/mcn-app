@@ -25,9 +25,15 @@ _SERVICE_CHANNELS: dict[DataTapService, frozenset[str]] = {
 }
 _DATATAP_XIAOHONGSHU_SEARCH = "datatap.xiaohongshu.kol.search.v1"
 _DATATAP_DOUYIN_SEARCH = "datatap.douyin.kol.search.v1"
+_DATATAP_BILIBILI_SEARCH = "datatap.social.grow.kol.bilibili.search.v1"
+_DATATAP_WEIBO_SEARCH = "datatap.social.grow.kol.weibo.search.v1"
+_DATATAP_WECHAT_SEARCH = "datatap.social.grow.kol.wechat.search.v1"
 _DATATAP_SEARCH_BY_PLATFORM = {
     "xiaohongshu": _DATATAP_XIAOHONGSHU_SEARCH,
     "douyin": _DATATAP_DOUYIN_SEARCH,
+    "bilibili": _DATATAP_BILIBILI_SEARCH,
+    "weibo": _DATATAP_WEIBO_SEARCH,
+    "wechat": _DATATAP_WECHAT_SEARCH,
 }
 _ZHEJIANG_LOCATION_TERMS = ("浙江", "湖州")
 _MAX_CANDIDATES_PER_PLATFORM = 10
@@ -104,6 +110,8 @@ class Planner:
         这不是替模型补造数据：它只将会话中明确出现的品牌、近 30 天活跃
         和湖州/浙江地区诉求，规范化为 DataTap 小红书工具实际支持的字段。
         """
+        if context.analysis_scope == "brand":
+            return plan
         source_text = "\n".join(message.content for message in context.recent_messages)
         filters = context.brief.filters
         location_values = filters.get("target_fan_locations", [])
@@ -187,6 +195,7 @@ class Planner:
                         "arguments": dict(template_arguments),
                         "depends_on": (),
                         "evidence_goal": f"{platform} 候选达人",
+                        "evidence_kind": "kol",
                     }
                 )
             )
@@ -211,6 +220,13 @@ class Planner:
                 validate_input(step.arguments, tool.input_schema)
             except McpValidationError as exc:
                 raise PlanValidationError("INVALID_TOOL_ARGUMENTS") from exc
+        evidence_kinds = {step.evidence_kind for step in plan.steps}
+        required_kinds = {
+            "brand",
+            "kol",
+        } if context.analysis_scope == "hybrid" else {context.analysis_scope}
+        if not required_kinds.issubset(evidence_kinds):
+            raise PlanValidationError("EVIDENCE_SCOPE_NOT_COVERED")
         build_execution_batches(plan)
 
 
