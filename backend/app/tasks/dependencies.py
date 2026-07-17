@@ -392,6 +392,16 @@ async def refresh_approved_datatap_tools() -> None:
     签名发生变化时注册中心会自动隔离工具，避免任务继续使用未复核的参数契约。
     """
     async with SessionFactory.begin() as db:
-        await ToolRegistryService(db, get_mcp_transport()).refresh_service(
-            DataTapService.SOCIAL_GROW
-        )
+        registry = ToolRegistryService(db, get_mcp_transport())
+        # Brand insight and all-channel KOL capabilities are independently
+        # refreshed. A temporary outage in one service must not hide tools
+        # already approved for the remaining channels.
+        for service in (
+            DataTapService.INSIGHT_CUBE,
+            DataTapService.SOCIAL_GROW,
+            DataTapService.BILIBILI,
+        ):
+            try:
+                await registry.refresh_service(service)
+            except Exception:
+                continue

@@ -50,6 +50,40 @@ class _ManifestEntry:
     enabled: bool
 
 
+# These names are reviewed product capabilities, not an open-ended remote
+# discovery list. Their live input schemas are still checked and quarantined
+# when the provider changes, while the stable descriptions keep untrusted
+# provider text out of the model prompt.
+DYNAMIC_TOOL_ALLOWLIST: dict[DataTapService, dict[str, tuple[str, str]]] = {
+    DataTapService.INSIGHT_CUBE: {
+        "match_best_tag": ("datatap.insight.match.best.tag.v1", "品牌与品类标准标签匹配"),
+        "query_analysis_data": ("datatap.insight.query.analysis.v1", "品牌声量、互动、情感和平台维度统计"),
+        "social_statistic_trend": ("datatap.insight.social.statistic.trend.v1", "品牌或关键词跨平台声量趋势"),
+        "social_statistic_user_profile": ("datatap.insight.social.statistic.user.profile.v1", "品牌受众年龄、性别和地域画像"),
+        "social_statistic_hot_user": ("datatap.insight.social.statistic.hot.user.v1", "品牌相关热门用户和传播达人"),
+        "social_statistic_overview": ("datatap.insight.social.statistic.overview.v1", "品牌或关键词社交搜索整体概览"),
+        "social_statistic_hot_topic": ("datatap.insight.social.statistic.hot.topic.v1", "品牌相关热门话题和声量聚类"),
+    },
+    DataTapService.SOCIAL_GROW: {
+        "kol_match_mentions_tag": ("datatap.social.grow.kol.match.mentions.tag.v1", "品牌提及标签匹配"),
+        "kol_detail": ("datatap.social.grow.kol.detail.v1", "指定平台达人详情与趋势画像"),
+        # The legacy internal names remain stable for existing saved plans.
+        "kol_xiaohongshu_search": ("datatap.xiaohongshu.kol.search.v1", "小红书 KOL 候选检索"),
+        "kol_douyin_search": ("datatap.douyin.kol.search.v1", "抖音 KOL 候选检索"),
+        "kol_bilibili_search": ("datatap.social.grow.kol.bilibili.search.v1", "B站 KOL 候选检索"),
+        "kol_weibo_search": ("datatap.social.grow.kol.weibo.search.v1", "微博 KOL 候选检索"),
+        "kol_wechat_search": ("datatap.social.grow.kol.wechat.search.v1", "微信 KOL 候选检索"),
+    },
+}
+
+_DATATAP_RESULT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {"result": {"type": "string"}},
+    "required": ["result"],
+}
+
+
 def discovery_digest(tool: DiscoveredTool) -> str:
     payload = {
         "name": tool.name,
@@ -73,6 +107,15 @@ class ToolRegistryService:
         self._entries = self._parse_manifest(raw_manifest)
         self._by_internal = {entry.internal_name: entry for entry in self._entries}
         self._by_remote = {(entry.service, entry.remote_name): entry for entry in self._entries}
+        self._dynamic_by_remote = {
+            (service, remote): (internal_name, description)
+            for service, tools in DYNAMIC_TOOL_ALLOWLIST.items()
+            for remote, (internal_name, description) in tools.items()
+        }
+        self._dynamic_by_internal = {
+            internal_name: (service, remote, description)
+            for (service, remote), (internal_name, description) in self._dynamic_by_remote.items()
+        }
 
     async def refresh_service(self, service: DataTapService) -> DiscoveryReport:
         if not isinstance(service, DataTapService):
@@ -86,6 +129,9 @@ class ToolRegistryService:
         for tool in discovered:
             seen_remote_names.add(tool.name)
             entry = self._by_remote.get((service, tool.name))
+            if entry is None and (service, tool.name) in self._dynamic_by_remote:
+                await self._refresh_dynamic_tool(service, tool, now=now, approved=approved, quarantined=quarantined)
+                continue
             if entry is None:
                 await self._upsert_discovery(service, tool, review_status="quarantined", now=now)
                 quarantined.append(tool.name)
@@ -143,6 +189,19 @@ class ToolRegistryService:
                 row.updated_at = now
             quarantined.append(entry.remote_name)
 
+        for dynamic_service, dynamic_tools in DYNAMIC_TOOL_ALLOWLIST.items():
+            if dynamic_service != service:
+                continue
+            for remote_name, (internal_name, _description) in dynamic_tools.items():
+                if remote_name in seen_remote_names:
+                    continue
+                row = await self._row_by_internal(internal_name)
+                if row is not None:
+                    row.review_status = "quarantined"
+                    row.is_enabled = False
+                    row.updated_at = now
+                quarantined.append(remote_name)
+
         await self._db.flush()
         return DiscoveryReport(
             service=service,
@@ -153,7 +212,26 @@ class ToolRegistryService:
     async def require_enabled(self, internal_name: str) -> ApprovedTool:
         entry = self._by_internal.get(internal_name)
         if entry is None:
-            raise ToolNotEnabledError("tool is not present in the approved manifest")
+            dynamic = self._dynamic_by_internal.get(internal_name)
+            if dynamic is None:
+                raise ToolNotEnabledError("tool is not present in the approved manifest")
+            service, remote_name, description = dynamic
+            row = await self._row_by_internal(internal_name)
+            if (
+                row is None
+                or not row.is_enabled
+                or row.review_status != "approved"
+                or row.service_slug != service.value
+            ):
+                raise ToolNotEnabledError("tool is not enabled")
+            return ApprovedTool(
+                catalog_id=row.id,
+                internal_name=internal_name,
+                service=service,
+                remote_name=remote_name,
+                input_schema=row.input_schema_json,
+                output_schema=_DATATAP_RESULT_SCHEMA,
+            )
         row = await self._row_by_internal(internal_name)
         if (
             not entry.enabled
@@ -181,6 +259,20 @@ class ToolRegistryService:
         result: list[ApprovedTool] = []
         for row in rows:
             entry = self._by_internal.get(row.internal_tool_name)
+            if entry is None:
+                dynamic = self._dynamic_by_internal.get(row.internal_tool_name)
+                if dynamic is not None and row.service_slug == dynamic[0].value:
+                    result.append(
+                        ApprovedTool(
+                            catalog_id=row.id,
+                            internal_name=row.internal_tool_name,
+                            service=dynamic[0],
+                            remote_name=dynamic[1],
+                            input_schema=row.input_schema_json,
+                            output_schema=_DATATAP_RESULT_SCHEMA,
+                        )
+                    )
+                continue
             if (
                 entry is not None
                 and entry.enabled
@@ -190,6 +282,43 @@ class ToolRegistryService:
             ):
                 result.append(self._approved_tool(row, entry))
         return tuple(result)
+
+    async def _refresh_dynamic_tool(
+        self,
+        service: DataTapService,
+        tool: DiscoveredTool,
+        *,
+        now: datetime,
+        approved: list[str],
+        quarantined: list[str],
+    ) -> None:
+        internal_name, description = self._dynamic_by_remote[(service, tool.name)]
+        observed_digest = discovery_digest(tool)
+        row = await self._row_by_internal(internal_name)
+        if row is not None and row.discovery_digest != observed_digest:
+            row.review_status = "quarantined"
+            row.is_enabled = False
+            row.updated_at = now
+            await self._upsert_discovery(service, tool, review_status="quarantined", now=now)
+            quarantined.append(tool.name)
+            return
+        if row is None:
+            row = McpToolCatalog(
+                id=str(uuid4()),
+                service_slug=service.value,
+                internal_tool_name=internal_name,
+                reviewed_description=description,
+                input_schema_json=tool.input_schema,
+                output_validator_version="datatap_result_v1",
+                discovery_digest=observed_digest,
+                review_status="approved",
+                is_enabled=True,
+                created_at=now,
+                updated_at=now,
+            )
+            self._db.add(row)
+        await self._upsert_discovery(service, tool, review_status="approved", now=now)
+        approved.append(tool.name)
 
     async def _row_by_internal(self, internal_name: str) -> McpToolCatalog | None:
         return await self._db.scalar(
