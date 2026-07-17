@@ -13,6 +13,7 @@ from app.orchestration.schemas import (
 )
 from app.orchestration.analytics_contract import build_analytics_field_contract
 from app.orchestration.export_contract import build_export_field_contract
+from app.orchestration.routing import classify_analysis_request
 
 
 _OMIT = object()
@@ -168,9 +169,13 @@ class ContextBuilder:
         brief = SessionBrief.from_workspace(workspace).model_copy(
             update={"platforms": effective_channels}
         )
+        recent_messages = compress_messages(messages, max_chars=24_000)
+        routing = classify_analysis_request(
+            "\n".join(message.content for message in recent_messages), brief
+        )
         return PlannerContext(
             brief=brief,
-            recent_messages=compress_messages(messages, max_chars=24_000),
+            recent_messages=recent_messages,
             existing_results=project_reporting_summary(
                 await self.reporting.context_summary(session_id)
             ),
@@ -180,4 +185,7 @@ class ContextBuilder:
             allowed_channels=effective_channels,
             export_contract=build_export_field_contract(brief),
             analytics_contract=build_analytics_field_contract(),
+            analysis_scope=routing.scope,
+            analysis_objectives=routing.objectives,
+            requested_period=routing.requested_period,
         )

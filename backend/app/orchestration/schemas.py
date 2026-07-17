@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -14,6 +14,10 @@ class PlanValidationError(ValueError):
         self.code = code
 
 
+AnalysisScope = Literal["brand", "kol", "hybrid"]
+EvidenceKind = Literal["brand", "kol"]
+
+
 class ToolPlanStep(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -22,6 +26,8 @@ class ToolPlanStep(BaseModel):
     arguments: dict[str, Any]
     depends_on: tuple[str, ...] = Field(default_factory=tuple, max_length=10)
     evidence_goal: str = Field(min_length=1, max_length=300)
+    # Legacy plans created before brand analysis was introduced are KOL plans.
+    evidence_kind: EvidenceKind = "kol"
 
 
 class ToolPlan(BaseModel):
@@ -138,3 +144,6 @@ class PlannerContext(BaseModel):
     allowed_channels: tuple[str, ...]
     export_contract: ExportFieldContract
     analytics_contract: AnalyticsFieldContract
+    analysis_scope: AnalysisScope = "kol"
+    analysis_objectives: tuple[str, ...] = Field(default_factory=tuple, max_length=12)
+    requested_period: dict[str, Any] = Field(default_factory=dict)
