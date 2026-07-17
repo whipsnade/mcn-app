@@ -306,14 +306,27 @@ class TaskExecutor:
             if self.artifacts is not None:
                 await self.artifacts.build_candidates(task.id)
             await self.checkpoint("after_candidates")
+            report_warnings: list[str] = []
             if self.artifacts is not None:
-                await self.artifacts.build_bi_report(task.id)
+                report = await self.artifacts.build_bi_report(task.id)
+                chart_data = getattr(report, "chart_data_json", {}) or {}
+                report_warnings = [
+                    str(item) for item in chart_data.get("warnings", []) if str(item).strip()
+                ]
             await self.checkpoint("after_bi")
             if self.artifacts is not None:
                 await self.artifacts.stream_summary(task.id)
-            if partial_failure:
+            if partial_failure or report_warnings:
+                warning_message = (
+                    "；".join(report_warnings)
+                    if report_warnings
+                    else "部分社媒渠道查询失败，已保留可用结果。"
+                )
                 await self.repository.mark_completed_with_warnings(
-                    task.id, self.worker_id, "mcp_partial_failure", "部分社媒渠道查询失败，已保留可用结果。"
+                    task.id,
+                    self.worker_id,
+                    "mcp_partial_failure" if partial_failure else "report_data_unavailable",
+                    warning_message,
                 )
             else:
                 await self.repository.mark_completed(task.id, self.worker_id)

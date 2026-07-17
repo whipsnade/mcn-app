@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -18,6 +18,28 @@ class ToolEvidence:
     payload: dict[str, Any]
     source_call_id: str | None
     collected_at: datetime
+
+
+@dataclass(frozen=True)
+class NormalizedBrandEvidence:
+    """仅保存品牌 BI 白名单字段，不保存 DataTap 原始载荷。"""
+
+    tool_name: str
+    platform: str
+    period: str | None
+    analytics_fields: dict[str, Any]
+    evidence_references: tuple[str, ...]
+    collected_at: datetime
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "tool_name": self.tool_name,
+            "platform": self.platform,
+            "period": self.period,
+            "analytics_fields": self.analytics_fields,
+            "evidence_references": list(self.evidence_references),
+            "collected_at": self.collected_at.isoformat(),
+        }
 
 
 @dataclass(frozen=True)
@@ -209,6 +231,11 @@ class BiReportRead(BaseModel):
     comparison: list[dict[str, Any]]
     risks: list[dict[str, Any]]
     analytics: dict[str, Any]
+    analysis_scope: Literal["brand", "kol", "hybrid"] = "kol"
+    brand_analytics: dict[str, Any] = Field(default_factory=dict)
+    kol_analytics: dict[str, Any] = Field(default_factory=dict)
+    data_availability: dict[str, Any] = Field(default_factory=dict)
+    warnings: list[str] = Field(default_factory=list)
     conclusion: str
     sources: list[dict[str, Any]]
     generated_at: datetime

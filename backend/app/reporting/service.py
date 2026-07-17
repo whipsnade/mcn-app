@@ -24,8 +24,13 @@ from app.reporting.models import (
     TaskCandidatePoolItem,
     UserKolFavorite,
 )
-from app.reporting.analytics import aggregate_analytics
-from app.reporting.normalizers import normalize_tool_evidence, redact_evidence_for_storage
+from app.reporting.analytics import aggregate_analytics, empty_analytics
+from app.reporting.brand_analytics import aggregate_brand_analytics
+from app.reporting.normalizers import (
+    normalize_brand_evidence,
+    normalize_tool_evidence,
+    redact_evidence_for_storage,
+)
 from app.reporting.schemas import AnalystConclusion, CandidateVersion, CandidateVersionItem, ToolEvidence
 from app.reporting.scoring import SCORE_VERSION, score_candidate
 from app.tasks.models import AnalysisTask, TaskEvent
@@ -85,8 +90,34 @@ class ReportingService:
                 raise ValueError("analysis_task_not_ready_for_reporting")
 
             evidence = await self._successful_evidence(task_id)
+            scope = self._analysis_scope(task)
+            if scope == "brand":
+                normalized_brand = normalize_brand_evidence(evidence)
+                evidence_digest = _digest(
+                    {
+                        "scope": scope,
+                        "evidence": [row.as_dict() for row in normalized_brand],
+                    }
+                )
+                return CandidateVersion(
+                    candidate_version=0,
+                    evidence_digest=evidence_digest,
+                    candidates=(),
+                )
             normalized = normalize_tool_evidence(evidence)
             if not normalized:
+                if scope == "hybrid":
+                    normalized_brand = normalize_brand_evidence(evidence)
+                    return CandidateVersion(
+                        candidate_version=0,
+                        evidence_digest=_digest(
+                            {
+                                "scope": scope,
+                                "evidence": [row.as_dict() for row in normalized_brand],
+                            }
+                        ),
+                        candidates=(),
+                    )
                 raise ValueError("no_successful_tool_evidence")
             evidence_digest = _digest(
                 {
@@ -218,7 +249,10 @@ class ReportingService:
             if task is None:
                 raise LookupError("analysis_task_not_found")
             self._require_active_lease(task, lease_owner)
+            scope = self._analysis_scope(task)
             candidate_version = await self._latest_candidate_version(task.id)
+            if candidate_version is None and scope in {"brand", "hybrid"}:
+                candidate_version = 0
             if candidate_version is None:
                 raise ValueError("candidate_version_not_found")
             existing = await self._db.scalar(
@@ -233,9 +267,17 @@ class ReportingService:
             if existing is not None:
                 return existing
             candidates = await self._candidate_rows(task.id, candidate_version)
-            if not candidates:
+            if not candidates and scope == "kol":
                 raise ValueError("candidate_version_empty")
-            chart_data, conclusion, evidence = await self._build_bi_payload(candidates, candidate_version)
+            if scope in {"brand", "hybrid"}:
+                chart_data, conclusion, evidence = await self._build_brand_bi_payload(
+                    task_id=task.id,
+                    candidates=candidates,
+                    candidate_version=candidate_version,
+                    scope=scope,
+                )
+            else:
+                chart_data, conclusion, evidence = await self._build_bi_payload(candidates, candidate_version)
             if analyst_conclusion is not None:
                 conclusion = analyst_conclusion.conclusion
                 evidence["analyst"] = analyst_conclusion.model_dump(mode="json")
@@ -275,14 +317,30 @@ class ReportingService:
         task = await self._db.scalar(select(AnalysisTask).where(AnalysisTask.id == task_id))
         if task is None:
             raise LookupError("analysis_task_not_found")
+        scope = self._analysis_scope(task)
         version = await self._latest_candidate_version(task_id)
+        if version is None and scope in {"brand", "hybrid"}:
+            version = 0
         if version is None:
             raise ValueError("candidate_version_not_found")
         candidates = await self._candidate_rows(task_id, version)
-        if not candidates:
+        if not candidates and scope == "kol":
             raise ValueError("candidate_version_empty")
-        chart_data, _conclusion, _evidence = await self._build_bi_payload(candidates, version)
-        return {"task_id": task_id, "candidate_version": version, "bi": chart_data}
+        if scope in {"brand", "hybrid"}:
+            chart_data, _conclusion, _evidence = await self._build_brand_bi_payload(
+                task_id=task_id,
+                candidates=candidates,
+                candidate_version=version,
+                scope=scope,
+            )
+        else:
+            chart_data, _conclusion, _evidence = await self._build_bi_payload(candidates, version)
+        return {
+            "task_id": task_id,
+            "candidate_version": version,
+            "analysis_scope": scope,
+            "bi": chart_data,
+        }
 
     async def list_candidates(
         self, user_id: str, task_id: str, *, sort: str, direction: str
@@ -518,6 +576,11 @@ class ReportingService:
             )
         return tuple(result)
 
+    @staticmethod
+    def _analysis_scope(task: AnalysisTask) -> str:
+        value = (task.plan_json or {}).get("analysis_scope", "kol")
+        return value if value in {"brand", "kol", "hybrid"} else "kol"
+
     async def _existing_version(
         self, task_id: str, evidence_digest: str
     ) -> CandidateVersion | None:
@@ -729,6 +792,102 @@ class ReportingService:
         chart_data["analytics"] = aggregate_analytics(analytics_records)
         conclusion = f"已基于候选版本 {candidate_version} 生成 {len(candidates)} 位达人对比，当前首选为 {top_nickname}。"
         return chart_data, conclusion, {"candidate_version": candidate_version, "source_call_ids": sorted(set(source_ids))}
+
+    async def _build_brand_bi_payload(
+        self,
+        *,
+        task_id: str,
+        candidates: list[tuple[TaskCandidate, Kol, KolSnapshot]],
+        candidate_version: int,
+        scope: str,
+    ) -> tuple[dict[str, Any], str, dict[str, Any]]:
+        """Build a BI report from real brand evidence, with optional KOL context."""
+        evidence = await self._successful_evidence(task_id)
+        brand_records = normalize_brand_evidence(evidence)
+        brand_analytics = aggregate_brand_analytics(brand_records)
+        kol_analytics = empty_analytics()
+        chart_data: dict[str, Any]
+        if candidates:
+            chart_data, _kol_conclusion, _kol_evidence = await self._build_bi_payload(
+                candidates, candidate_version
+            )
+            kol_records = [
+                {
+                    "platform": kol.platform,
+                    "platform_account_id": kol.platform_account_id,
+                    "analytics_fields": (snapshot.normalized_json or {}).get("analytics_fields", {}),
+                }
+                for _candidate, kol, snapshot in candidates
+            ]
+            kol_analytics = aggregate_analytics(kol_records)
+        else:
+            chart_data = {
+                "overview": {
+                    "candidate_count": 0,
+                    "candidate_version": candidate_version,
+                    "top_nickname": None,
+                    "top_score": None,
+                },
+                "score_composition": [],
+                "audience_content_fit": {"audience": None, "content": None},
+                "platform_distribution": [],
+                "budget_analysis": {"average_budget_score": None},
+                "comparison": [],
+                "risks": [],
+            }
+        source_ids = sorted(
+            {
+                source_id
+                for row in brand_records
+                for source_id in row.evidence_references
+            }
+        )
+        source_rows = {
+            row.id: row
+            for row in (
+                await self._db.scalars(select(McpCall).where(McpCall.id.in_(set(source_ids))))
+            ).all()
+        } if source_ids else {}
+        chart_data.update(
+            {
+                "analysis_scope": scope,
+                "analytics": brand_analytics,
+                "brand_analytics": brand_analytics,
+                "kol_analytics": kol_analytics,
+                "data_availability": {
+                    "brand": brand_analytics.get("data_availability", {}),
+                    "kol": {
+                        "available": bool(candidates),
+                        "record_count": len(candidates),
+                    },
+                },
+                "warnings": list(brand_analytics.get("warnings", []))
+                + (["暂无真实 MCP 达人数据"] if scope == "hybrid" and not candidates else []),
+                "sources": [
+                    {
+                        "tool_name_cn": self._source_tool_name(source_rows[source_id]),
+                        "collected_at": (
+                            source_rows[source_id].completed_at or source_rows[source_id].updated_at
+                        ).isoformat(),
+                        "evidence_id": source_id,
+                    }
+                    for source_id in sorted(source_rows)
+                ],
+            }
+        )
+        if brand_analytics.get("data_availability", {}).get("available"):
+            conclusion = "已基于真实 MCP 品牌数据生成跨平台声量与用户情感趋势分析。"
+        else:
+            conclusion = "MCP 未返回可用于品牌分析的真实数据，已生成空 BI 报告并标记数据不可用。"
+        return (
+            chart_data,
+            conclusion,
+            {
+                "candidate_version": candidate_version,
+                "analysis_scope": scope,
+                "source_call_ids": source_ids,
+            },
+        )
 
     @staticmethod
     def _source_tool_name(call: McpCall) -> str:

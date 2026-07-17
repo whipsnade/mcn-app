@@ -36,6 +36,9 @@ class ToolPlan(BaseModel):
     objective: str = Field(min_length=1, max_length=1000)
     steps: tuple[ToolPlanStep, ...] = Field(min_length=1, max_length=10)
     stop_conditions: tuple[str, ...] = Field(default_factory=tuple, max_length=10)
+    # Persist the router decision with the task so reporting never has to
+    # infer a brand/KOL scope from MCP output after execution.
+    analysis_scope: AnalysisScope = "kol"
 
 
 class ReplanFailure(BaseModel):

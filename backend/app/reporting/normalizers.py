@@ -11,7 +11,12 @@ import re
 from typing import Any
 import unicodedata
 
-from app.reporting.schemas import EvidencePriority, NormalizedKolEvidence, ToolEvidence
+from app.reporting.schemas import (
+    EvidencePriority,
+    NormalizedBrandEvidence,
+    NormalizedKolEvidence,
+    ToolEvidence,
+)
 
 
 class UnknownEvidenceToolError(ValueError):
@@ -74,6 +79,146 @@ def normalize_tool_evidence(evidence: Iterable[ToolEvidence]) -> tuple[Normalize
             key = (normalized.platform, normalized.platform_account_id)
             grouped.setdefault(key, []).append(normalized)
     return tuple(_merge_many(grouped[key]) for key in sorted(grouped))
+
+
+_BRAND_EVIDENCE_TOOLS = {
+    "datatap.insight.query.analysis.v1",
+    "datatap.insight.social.statistic.trend.v1",
+    "datatap.insight.social.statistic.user.profile.v1",
+    "datatap.insight.social.statistic.hot.user.v1",
+    "datatap.insight.social.statistic.overview.v1",
+    "datatap.insight.social.statistic.hot.topic.v1",
+}
+_BRAND_PLATFORM_ALIASES = {
+    "小红书": "xiaohongshu",
+    "xiaohongshu": "xiaohongshu",
+    "抖音": "douyin",
+    "douyin": "douyin",
+    "微博": "weibo",
+    "weibo": "weibo",
+    "微信": "wechat",
+    "wechat": "wechat",
+    "b站": "bilibili",
+    "哔哩哔哩": "bilibili",
+    "bilibili": "bilibili",
+}
+_BRAND_PLATFORM_KEYS = ("平台", "platform", "media", "媒介", "datasource", "数据源")
+_BRAND_PERIOD_KEYS = (
+    "日期",
+    "时间",
+    "月份",
+    "月份",
+    "月",
+    "周期",
+    "date",
+    "period",
+    "published_at",
+)
+_BRAND_FIELD_ALIASES = {
+    "brand_mentions": ("品牌声量", "声量", "品牌提及量", "品牌提及数", "brand_mentions", "volume", "发帖数", "帖子数"),
+    "exposure": ("曝光量", "曝光数", "曝光", "exposure", "阅读数", "播放量"),
+    "interactions": ("互动数", "互动量", "互动", "interactions", "点赞数", "评论数"),
+    "sentiment_index": ("情感指数", "情感得分", "sentiment_index", "sentiment_score"),
+    "sentiment_counts": ("情感统计", "情感分布", "舆情分布", "sentiment_counts", "sentiment"),
+    "hot_words": ("热词", "热点词", "hot_words", "keywords"),
+    "audience_age": ("年龄分布", "受众年龄分布", "audience_age"),
+    "audience_gender": ("性别分布", "受众性别分布", "audience_gender"),
+    "audience_regions": ("地域分布", "受众地域分布", "audience_regions"),
+}
+
+
+def normalize_brand_evidence(
+    evidence: Iterable[ToolEvidence],
+) -> tuple[NormalizedBrandEvidence, ...]:
+    """将品牌统计工具的 JSON 字符串结果投影为 BI 白名单字段。"""
+    result: list[NormalizedBrandEvidence] = []
+    for item in evidence:
+        if item.internal_tool_name not in _BRAND_EVIDENCE_TOOLS:
+            continue
+        raw = item.payload.get("result")
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+        for row in _brand_rows(raw):
+            normalized = _normalize_brand_row(item, row)
+            if normalized is not None:
+                result.append(normalized)
+    return tuple(result)
+
+
+def _brand_rows(value: Any) -> tuple[dict[str, Any], ...]:
+    rows: list[dict[str, Any]] = []
+
+    def visit(node: Any) -> None:
+        if isinstance(node, list):
+            for item in node:
+                visit(item)
+            return
+        if not isinstance(node, dict):
+            return
+        if any(alias in node for aliases in _BRAND_FIELD_ALIASES.values() for alias in aliases):
+            rows.append(node)
+        for key in ("data", "items", "rows", "list", "records", "trend", "result"):
+            child = node.get(key)
+            if child is not node:
+                visit(child)
+
+    visit(value)
+    return tuple(rows)
+
+
+def _brand_first(row: dict[str, Any], aliases: tuple[str, ...]) -> Any:
+    for alias in aliases:
+        if alias in row and _has_value(row[alias]):
+            return row[alias]
+    return None
+
+
+def _brand_platform(row: dict[str, Any]) -> str:
+    value = _brand_first(row, _BRAND_PLATFORM_KEYS)
+    text = str(value or "全平台").strip().casefold()
+    for alias, platform in _BRAND_PLATFORM_ALIASES.items():
+        if alias in text:
+            return platform
+    return "all"
+
+
+def _normalize_brand_row(item: ToolEvidence, row: dict[str, Any]) -> NormalizedBrandEvidence | None:
+    fields: dict[str, Any] = {}
+    period = _brand_first(row, _BRAND_PERIOD_KEYS)
+    if period not in (None, ""):
+        fields["published_at"] = str(period)
+    for name, aliases in _BRAND_FIELD_ALIASES.items():
+        value = _brand_first(row, aliases)
+        if value in (None, ""):
+            continue
+        try:
+            if name in {"brand_mentions", "exposure", "interactions"}:
+                fields[name] = _non_negative_number(value)
+            elif name == "sentiment_index":
+                parsed = float(value)
+                if -100 <= parsed <= 100:
+                    fields[name] = parsed
+            elif name == "sentiment_counts":
+                fields[name] = _sentiment_counts(value)
+            elif name == "hot_words":
+                fields[name] = _hot_words(value)
+            elif name.startswith("audience_"):
+                fields[name] = _distribution(value)
+        except (TypeError, ValueError, InvalidOperation):
+            continue
+    if not fields:
+        return None
+    return NormalizedBrandEvidence(
+        tool_name=item.internal_tool_name,
+        platform=_brand_platform(row),
+        period=str(period) if period not in (None, "") else None,
+        analytics_fields=fields,
+        evidence_references=(item.source_call_id,) if item.source_call_id else (),
+        collected_at=item.collected_at,
+    )
 
 
 def redact_evidence_for_storage(value: Any) -> Any:

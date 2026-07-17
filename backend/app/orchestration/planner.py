@@ -63,7 +63,9 @@ class Planner:
                 output_model=ToolPlan,
             )
         )
-        plan = self._compile_supported_search_defaults(result.value, context)
+        plan = self._compile_supported_search_defaults(result.value, context).model_copy(
+            update={"analysis_scope": context.analysis_scope}
+        )
         self._validate(plan, context)
         return plan
 
@@ -92,7 +94,7 @@ class Planner:
                 output_model=ToolPlan,
             )
         )
-        plan = result.value
+        plan = result.value.model_copy(update={"analysis_scope": context.analysis_scope})
         if len(plan.steps) > recovery.remaining_calls:
             raise PlanValidationError("REPLAN_CALL_BUDGET_EXCEEDED")
         prohibited_ids = set(recovery.completed_step_ids) | {
