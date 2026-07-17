@@ -139,6 +139,11 @@ export interface AnalysisBiReport {
   comparison: Array<Record<string, unknown>>;
   risks: Array<Record<string, unknown>>;
   analytics?: Record<string, unknown>;
+  analysis_scope?: 'brand' | 'kol' | 'hybrid';
+  brand_analytics?: Record<string, unknown>;
+  kol_analytics?: Record<string, unknown>;
+  data_availability?: Record<string, unknown>;
+  warnings?: string[];
   conclusion: string;
   sources: Array<Record<string, unknown>>;
   generated_at: string;

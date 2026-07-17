@@ -177,6 +177,13 @@ export interface BiExposureTrendItem {
   platforms: string[];
 }
 
+export interface BiPeriodTrendItem {
+  period: string;
+  value: number;
+  unit: string;
+  platforms: string[];
+}
+
 export interface BiAnalyticsData {
   overview: {
     brand_volume: BiMetric;
@@ -185,6 +192,8 @@ export interface BiAnalyticsData {
   };
   sentiment: BiSentiment;
   exposure_trend: BiExposureTrendItem[];
+  volume_trend?: BiPeriodTrendItem[];
+  sentiment_trend?: BiPeriodTrendItem[];
   audience: {
     age: BiDistribution;
     gender: BiDistribution;
@@ -205,6 +214,11 @@ export interface ApiBiReport {
   comparison: Array<Record<string, unknown>>;
   risks: Array<Record<string, unknown>>;
   analytics?: BiAnalyticsData;
+  analysis_scope?: 'brand' | 'kol' | 'hybrid';
+  brand_analytics?: BiAnalyticsData;
+  kol_analytics?: BiAnalyticsData;
+  data_availability?: Record<string, unknown>;
+  warnings?: string[];
   conclusion: string;
   sources: Array<Record<string, unknown>>;
   generated_at: string;

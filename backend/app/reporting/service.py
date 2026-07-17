@@ -482,6 +482,10 @@ class ReportingService:
             # 最新一轮尚未成功结束时，绝不回退到更早任务的候选或报告。
             return task, None, 0, None
         version = await self._latest_candidate_version(task.id)
+        if version is None and self._analysis_scope(task) in {"brand", "hybrid"}:
+            # Brand-only reports intentionally have no TaskCandidate rows; BI
+            # still uses candidate_version=0 as its stable report key.
+            version = 0
         total = 0
         if version is not None:
             total = int(

@@ -269,8 +269,12 @@ export default function BiReport({ report, candidateVersion, selectedCandidates 
       setIsExporting(false);
     }
   };
-  if (!report) return <PanelState>等待生成 KOL 决策报告</PanelState>;
-  if (candidateVersion === undefined || report.candidate_version !== candidateVersion) return <PanelState>正在同步最新候选与 BI 报告</PanelState>;
+  if (!report) return <PanelState>等待生成 BI 分析报告</PanelState>;
+  const isBrandAnalysis = report.analysis_scope === 'brand' || report.analysis_scope === 'hybrid';
+  if ((!isBrandAnalysis && candidateVersion === undefined) || (candidateVersion !== undefined && report.candidate_version !== candidateVersion)) {
+    return <PanelState>正在同步最新候选与 BI 报告</PanelState>;
+  }
+  const analytics = isBrandAnalysis ? (report.brand_analytics ?? report.analytics) : report.analytics;
 
   return (
     <aside className="flex h-full w-full shrink-0 flex-col overflow-hidden border-l border-slate-200 bg-white shadow-sm print-container xl:w-[420px]">
@@ -307,7 +311,7 @@ export default function BiReport({ report, candidateVersion, selectedCandidates 
       </div>
       <div className="flex-1 overflow-y-auto bg-slate-50/40 p-3 print-scrollable">
         {activeTab === 'analytics' ? (
-          <BiAnalytics analytics={report.analytics} taskStatus={taskStatus} />
+          <BiAnalytics analytics={analytics} taskStatus={taskStatus} />
         ) : (
           <div className="space-y-3">
             <OverviewCard overview={report.overview} />

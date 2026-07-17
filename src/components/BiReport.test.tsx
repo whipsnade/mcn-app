@@ -2,8 +2,10 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 
 import * as tasksApi from '../api/tasks';
-import { candidatePage, missingDataReport, reportFixture } from '../test/fixtures';
+import { candidatePage, emptyAnalytics, missingDataReport, reportFixture } from '../test/fixtures';
 import BiReport from './BiReport';
+
+const emptyBrandAnalytics = { ...emptyAnalytics };
 
 describe('BiReport', () => {
   it('renders the nine KOL decision sections from a matching report', () => {
@@ -41,6 +43,33 @@ describe('BiReport', () => {
     expect(screen.getByRole('region', { name: '数据分析' })).toBeVisible();
     expect(screen.getByText('舆情情感极性分析')).toBeVisible();
     expect(screen.queryByText('任务概览')).not.toBeInTheDocument();
+  });
+
+  it('renders a brand-only report without requiring a candidate list', () => {
+    render(
+      <BiReport
+        report={reportFixture({
+          candidate_version: 0,
+          analysis_scope: 'brand',
+          brand_analytics: {
+            ...emptyBrandAnalytics,
+            volume_trend: [
+              { period: '2026-05', value: 10, unit: '条', platforms: ['xiaohongshu'] },
+              { period: '2026-06', value: 20, unit: '条', platforms: ['douyin'] },
+            ],
+            sentiment_trend: [
+              { period: '2026-05', value: 0.7, unit: '指数', platforms: ['xiaohongshu'] },
+              { period: '2026-06', value: 0.8, unit: '指数', platforms: ['douyin'] },
+            ],
+          },
+        })}
+        taskStatus="completed"
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('tab', { name: '数据分析' }));
+    expect(screen.getByText('品牌声量变化趋势')).toBeVisible();
+    expect(screen.getByText('用户情感趋势')).toBeVisible();
   });
 
   it('uses the report average score, platform count, and same-version candidates', () => {

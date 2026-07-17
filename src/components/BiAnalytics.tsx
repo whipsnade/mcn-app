@@ -158,18 +158,41 @@ function SentimentCard({ analytics }: { analytics?: BiAnalyticsData }) {
 }
 
 function TrendCard({ analytics }: { analytics?: BiAnalyticsData }) {
-  const trend = analytics?.exposure_trend ?? [];
-  const chartData = trend.map(item => ({ ...item, dateLabel: item.date.slice(5) }));
+  const brandTrend = analytics?.volume_trend ?? [];
+  const chartData = brandTrend.length > 0
+    ? brandTrend.map(item => ({ value: item.value, unit: item.unit, platforms: item.platforms, dateLabel: item.period.slice(5) }))
+    : (analytics?.exposure_trend ?? []).map(item => ({ ...item, dateLabel: item.date.slice(5) }));
   return (
-    <Card title="活动传播周期与曝光走势" icon={<Activity className="h-4 w-4" />} hint="7天核心数据监测">
+    <Card title={brandTrend.length > 0 ? '品牌声量变化趋势' : '活动传播周期与曝光走势'} icon={<Activity className="h-4 w-4" />} hint="跨平台真实数据">
       {chartData.length < 2 ? <div className="h-[175px]"><Missing /></div> : (
         <div className="h-[175px]" aria-label="活动传播周期与曝光走势折线图">
           <ResponsiveContainer width="100%" height="100%">
             <LineChart data={chartData} margin={{ top: 8, right: 8, bottom: 4, left: -12 }}>
               <XAxis dataKey="dateLabel" tick={{ fontSize: 10, fill: '#94a3b8' }} tickLine={false} axisLine={{ stroke: '#cbd5e1' }} />
               <YAxis tick={{ fontSize: 10, fill: '#94a3b8' }} tickLine={false} axisLine={{ stroke: '#94a3b8' }} tickFormatter={formatExposure} width={48} />
-              <Tooltip formatter={(value) => [formatExposure(Number(value)), '曝光量']} labelFormatter={label => `日期：${label}`} />
+              <Tooltip formatter={(value) => [formatExposure(Number(value)), brandTrend.length > 0 ? '品牌声量' : '曝光量']} labelFormatter={label => `周期：${label}`} />
               <Line type="monotone" dataKey="value" stroke={chartIndigo} strokeWidth={2} dot={{ r: 3, fill: chartIndigo, strokeWidth: 0 }} activeDot={{ r: 5 }} />
+            </LineChart>
+          </ResponsiveContainer>
+        </div>
+      )}
+    </Card>
+  );
+}
+
+function SentimentTrendCard({ analytics }: { analytics?: BiAnalyticsData }) {
+  const trend = analytics?.sentiment_trend ?? [];
+  const chartData = trend.map(item => ({ period: item.period.slice(5), value: item.value }));
+  return (
+    <Card title="用户情感趋势" icon={<MessageCircleHeart className="h-4 w-4" />} hint="情感指数">
+      {chartData.length < 2 ? <div className="h-[145px]"><Missing label="暂无情感趋势数据" /></div> : (
+        <div className="h-[145px]" aria-label="用户情感趋势折线图">
+          <ResponsiveContainer width="100%" height="100%">
+            <LineChart data={chartData} margin={{ top: 8, right: 8, bottom: 4, left: -12 }}>
+              <XAxis dataKey="period" tick={{ fontSize: 10, fill: '#94a3b8' }} tickLine={false} axisLine={{ stroke: '#cbd5e1' }} />
+              <YAxis tick={{ fontSize: 10, fill: '#94a3b8' }} tickLine={false} axisLine={{ stroke: '#94a3b8' }} width={42} />
+              <Tooltip formatter={(value) => [Number(value).toLocaleString('zh-CN', { maximumFractionDigits: 2 }), '情感指数']} labelFormatter={label => `周期：${label}`} />
+              <Line type="monotone" dataKey="value" stroke="#14b887" strokeWidth={2} dot={{ r: 3, fill: '#14b887', strokeWidth: 0 }} activeDot={{ r: 5 }} />
             </LineChart>
           </ResponsiveContainer>
         </div>
@@ -243,6 +266,7 @@ export default function BiAnalytics({ analytics, taskStatus }: BiAnalyticsProps)
       </div>
       <SentimentCard analytics={usableAnalytics} />
       <TrendCard analytics={usableAnalytics} />
+      <SentimentTrendCard analytics={usableAnalytics} />
       <AudienceCard analytics={usableAnalytics} />
       {!usableAnalytics && <p className="px-1 text-[10px] text-slate-400">任务完成后将展示本轮可追溯的社媒数据分析。</p>}
     </div>
