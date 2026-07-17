@@ -61,7 +61,7 @@ Expected: FAIL because routing types and `evidence_kind` do not exist.
 
 - [ ] **Step 3: Implement the minimal routing and context projection**
 
-Use normalized Chinese text and explicit keyword groups. `brand` keywords include `声量、舆情、情感、趋势、热词、品牌提及、曝光`; `kol` keywords include `达人、KOL、网红、粉丝、候选、活跃达人`; both groups produce `hybrid`. Extract `最近N天/月/季度` into a safe `requested_period` object with `start` and `end` ISO dates; use current date only for period calculation, never for metrics. Extend `PlannerContext` and set `evidence_kind` as a required plan field.
+Use normalized Chinese text and explicit keyword groups. `brand` keywords include `声量、舆情、情感、趋势、热词、品牌提及、曝光`; `kol` keywords include `达人、KOL、网红、粉丝、候选、活跃达人`; brand questions default to `hybrid` so brand trends also return active KOL context, while explicit “仅分析品牌/不需要达人” remains `brand`; both groups produce `hybrid`. Extract `最近N天/月/季度` into a safe `requested_period` object with `start` and `end` ISO dates; use current date only for period calculation, never for metrics. Extend `PlannerContext` and set `evidence_kind` as a required plan field.
 
 - [ ] **Step 4: Run focused tests to verify GREEN**
 
