@@ -89,8 +89,8 @@ class ReportingService:
             if task.plan_json is None:
                 raise ValueError("analysis_task_not_ready_for_reporting")
 
-            evidence = await self._successful_evidence(task_id)
             scope = self._analysis_scope(task)
+            evidence = await self._successful_evidence(task_id)
             if scope == "brand":
                 normalized_brand = normalize_brand_evidence(evidence)
                 evidence_digest = _digest(
@@ -104,7 +104,9 @@ class ReportingService:
                     evidence_digest=evidence_digest,
                     candidates=(),
                 )
-            normalized = normalize_tool_evidence(evidence)
+            normalized = normalize_tool_evidence(
+                await self._successful_evidence(task_id, evidence_kind="kol")
+            )
             if not normalized:
                 if scope == "hybrid":
                     normalized_brand = normalize_brand_evidence(evidence)
@@ -551,7 +553,24 @@ class ReportingService:
         )
         return task, pool, rows
 
-    async def _successful_evidence(self, task_id: str) -> tuple[ToolEvidence, ...]:
+    async def _successful_evidence(
+        self, task_id: str, *, evidence_kind: str | None = None
+    ) -> tuple[ToolEvidence, ...]:
+        task = await self._db.scalar(select(AnalysisTask).where(AnalysisTask.id == task_id))
+        task_plan = task.plan_json if task is not None else {}
+        replan_json = task.replan_json if task is not None else {}
+        step_kinds = {
+            str(step.get("id")): str(step.get("evidence_kind", "kol"))
+            for step in (task_plan or {}).get("steps", [])
+            if isinstance(step, dict) and step.get("id")
+        }
+        step_kinds.update(
+            {
+                str(step.get("id")): str(step.get("evidence_kind", "kol"))
+                for step in (replan_json or {}).get("steps", [])
+                if isinstance(step, dict) and step.get("id")
+            }
+        )
         calls = list(
             (
                 await self._db.scalars(
@@ -566,6 +585,8 @@ class ReportingService:
         )
         result: list[ToolEvidence] = []
         for call in calls:
+            if evidence_kind is not None and step_kinds.get(call.plan_step_id, "kol") != evidence_kind:
+                continue
             evidence = call.evidence_json or {}
             payload = evidence.get("structured_content")
             if evidence.get("outcome") != "succeeded" or not isinstance(payload, dict):
