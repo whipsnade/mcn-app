@@ -108,19 +108,32 @@ class ReportingService:
                 await self._successful_evidence(task_id, evidence_kind="kol")
             )
             if not normalized:
-                if scope == "hybrid":
-                    normalized_brand = normalize_brand_evidence(evidence)
-                    return CandidateVersion(
-                        candidate_version=0,
-                        evidence_digest=_digest(
-                            {
-                                "scope": scope,
-                                "evidence": [row.as_dict() for row in normalized_brand],
-                            }
-                        ),
-                        candidates=(),
-                    )
-                raise ValueError("no_successful_tool_evidence")
+                # A successful MCP response may legitimately contain an empty
+                # result set after applying the user's filters. Keep the task
+                # recoverable and let BI render an explicit empty state rather
+                # than converting real "0 results" into a task failure.
+                evidence_digest = _digest(
+                    {
+                        "scope": scope,
+                        "evidence": [row.as_dict() for row in evidence],
+                    }
+                )
+                await self._append_event(
+                    task,
+                    TaskEventType.CANDIDATES_UPDATED,
+                    {
+                        "candidate_version": 0,
+                        "total": 0,
+                        "pool_total": 0,
+                        "phase": "ai_summary",
+                        "label": "AI 汇总",
+                    },
+                )
+                return CandidateVersion(
+                    candidate_version=0,
+                    evidence_digest=evidence_digest,
+                    candidates=(),
+                )
             evidence_digest = _digest(
                 {
                     "profile": profile,
@@ -256,7 +269,9 @@ class ReportingService:
             if candidate_version is None and scope in {"brand", "hybrid"}:
                 candidate_version = 0
             if candidate_version is None:
-                raise ValueError("candidate_version_not_found")
+                # No candidate rows can still be a valid result when MCP
+                # returned an empty, successful search response.
+                candidate_version = 0
             existing = await self._db.scalar(
                 select(BiReport)
                 .where(
@@ -269,8 +284,6 @@ class ReportingService:
             if existing is not None:
                 return existing
             candidates = await self._candidate_rows(task.id, candidate_version)
-            if not candidates and scope == "kol":
-                raise ValueError("candidate_version_empty")
             if scope in {"brand", "hybrid"}:
                 chart_data, conclusion, evidence = await self._build_brand_bi_payload(
                     task_id=task.id,
@@ -308,6 +321,7 @@ class ReportingService:
                     "report_id": report.id,
                     "report_version": report.report_version,
                     "candidate_version": candidate_version,
+                    "analysis_scope": scope,
                     "phase": "ai_summary",
                     "label": "BI 报告已生成",
                 },
@@ -324,10 +338,8 @@ class ReportingService:
         if version is None and scope in {"brand", "hybrid"}:
             version = 0
         if version is None:
-            raise ValueError("candidate_version_not_found")
+            version = 0
         candidates = await self._candidate_rows(task_id, version)
-        if not candidates and scope == "kol":
-            raise ValueError("candidate_version_empty")
         if scope in {"brand", "hybrid"}:
             chart_data, _conclusion, _evidence = await self._build_brand_bi_payload(
                 task_id=task_id,
@@ -603,7 +615,21 @@ class ReportingService:
 
     @staticmethod
     def _analysis_scope(task: AnalysisTask) -> str:
-        value = (task.plan_json or {}).get("analysis_scope", "kol")
+        plan = task.plan_json or {}
+        replan = task.replan_json or {}
+        evidence_kinds = {
+            str(step.get("evidence_kind"))
+            for source in (plan, replan)
+            for step in (source.get("steps", []) if isinstance(source, dict) else [])
+            if isinstance(step, dict) and step.get("evidence_kind") in {"brand", "kol"}
+        }
+        if evidence_kinds == {"brand"}:
+            return "brand"
+        if evidence_kinds == {"brand", "kol"}:
+            return "hybrid"
+        if evidence_kinds == {"kol"}:
+            return "kol"
+        value = plan.get("analysis_scope", "kol")
         return value if value in {"brand", "kol", "hybrid"} else "kol"
 
     async def _existing_version(
@@ -737,6 +763,27 @@ class ReportingService:
         self, candidates: list[tuple[TaskCandidate, Kol, KolSnapshot]], candidate_version: int
     ) -> tuple[dict[str, Any], str, dict[str, Any]]:
         dimensions = ("audience", "content", "engagement", "budget", "growth", "brand_safety")
+        if not candidates:
+            return (
+                {
+                    "overview": {
+                        "candidate_count": 0,
+                        "candidate_version": candidate_version,
+                        "top_nickname": None,
+                        "top_score": None,
+                    },
+                    "score_composition": [],
+                    "audience_content_fit": {"audience": None, "content": None},
+                    "platform_distribution": [],
+                    "budget_analysis": {"average_budget_score": None},
+                    "comparison": [],
+                    "risks": [],
+                    "analytics": empty_analytics(),
+                    "warnings": ["当前筛选条件下暂无真实 MCP 达人数据"],
+                },
+                f"MCP 已返回真实结果，但当前筛选条件下暂无符合条件的达人（候选版本 {candidate_version}）。",
+                {"candidate_version": candidate_version, "source_call_ids": []},
+            )
         score_composition = []
         for dimension in dimensions:
             values = [

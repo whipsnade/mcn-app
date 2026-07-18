@@ -32,6 +32,7 @@ class TaskRead(BaseModel):
     session_id: str
     trigger_message_id: str | None = None
     status: TaskStatus
+    kind: Literal["pipeline", "agent"] = "pipeline"
     estimated_points: int
     error_code: str | None
     error_message: str | None = None

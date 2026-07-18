@@ -44,11 +44,16 @@ export function toSession(source: ApiSession): Session {
         && source.latest_report?.candidate_version === candidateVersion
         ? source.latest_report.id
         : undefined;
+      const analysisReportId = source.latest_analysis_report?.task_id === source.latest_task.id
+        ? source.latest_analysis_report.id
+        : undefined;
       return {
         taskId: source.latest_task.id,
         status: source.latest_task.status,
+        kind: source.latest_task.kind,
         candidateVersion,
         reportId,
+        analysisReportId,
         followupStatus: source.latest_task.followup_suggestions_status ?? undefined,
         followupSuggestions: source.latest_task.followup_suggestions ?? [],
         followupError: source.latest_task.followup_error ?? undefined,

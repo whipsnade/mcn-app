@@ -22,6 +22,8 @@ class RemoteToolResult:
     structured_content: JsonValue
     is_error: bool
     upstream_request_id: str | None
+    # 上游业务错误的原文（截断、脱敏前的原始文本），用于回喂模型自我纠正。
+    error_text: str | None = None
 
 
 class McpTransport(Protocol):
@@ -45,6 +47,8 @@ class ToolInvocationOutcome:
     upstream_request_id: str | None
     error_type: str | None
     safe_diagnostic: dict[str, JsonValue] | None = None
+    # 上游业务错误原文（已脱敏截断），供记账持久化并回喂模型。
+    error_message: str | None = None
 
 
 class ServiceNotAllowedError(ValueError):
@@ -57,6 +61,34 @@ class PossiblySentTimeout(TimeoutError):
 
 class McpUpstreamError(RuntimeError):
     pass
+
+
+class McpConnectionTimeout(McpUpstreamError):
+    """The MCP endpoint could not be connected before a request was sent."""
+
+
+class McpConnectionError(McpUpstreamError):
+    """The MCP endpoint connection failed before a request was sent."""
+
+
+class McpProtocolError(McpUpstreamError):
+    """The MCP transport or protocol response was malformed."""
+
+
+class McpGatewayTimeout(McpUpstreamError):
+    """The MCP gateway returned an HTTP timeout such as 504."""
+
+
+class McpUpstreamHttpError(McpUpstreamError):
+    """The MCP gateway returned an unexpected HTTP error response."""
+
+
+class McpQueueTimeout(McpUpstreamError):
+    """The per-service concurrency queue could not admit the call in time."""
+
+
+class McpCircuitOpen(McpUpstreamError):
+    """The per-service circuit breaker is open or its probe is busy."""
 
 
 class LogicalCallConflictError(ValueError):

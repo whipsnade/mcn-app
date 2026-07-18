@@ -31,8 +31,15 @@ class Settings(BaseSettings):
     )
     tencent_plan_api_key: SecretStr
     tencent_plan_model: Literal["deepseek-v4-pro"] = "deepseek-v4-pro"
-    model_timeout_seconds: float = Field(default=60.0, gt=0)
+    # Full-tool planning sends the reviewed MCP schemas in one request. The
+    # provider can take longer than the default HTTP timeout to produce a
+    # valid structured plan, so keep this configurable but use a safe default.
+    model_timeout_seconds: float = Field(default=180.0, gt=0)
     datatap_mcp_token: SecretStr
+    # DataTap may need several minutes to finish a social-data query. A read
+    # timeout is deliberately long, while connection and pool timeouts remain
+    # short in the transport.
+    datatap_read_timeout_seconds: float = Field(default=300.0, gt=0)
     mcp_call_points: int = 10
     mcp_max_calls_per_task: int = 10
     mcp_unknown_reconcile_seconds: int = Field(default=300, gt=0)

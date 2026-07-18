@@ -74,6 +74,8 @@ def normalize_tool_evidence(evidence: Iterable[ToolEvidence]) -> tuple[Normalize
     for item in evidence:
         adapter = _ADAPTERS.get(item.internal_tool_name)
         if adapter is None:
+            if item.internal_tool_name in _NON_KOL_EVIDENCE_TOOLS:
+                continue
             raise UnknownEvidenceToolError(f"unknown_evidence_tool:{item.internal_tool_name}")
         for normalized in adapter(item):
             key = (normalized.platform, normalized.platform_account_id)
@@ -88,6 +90,10 @@ _BRAND_EVIDENCE_TOOLS = {
     "datatap.insight.social.statistic.hot.user.v1",
     "datatap.insight.social.statistic.overview.v1",
     "datatap.insight.social.statistic.hot.topic.v1",
+}
+_NON_KOL_EVIDENCE_TOOLS = _BRAND_EVIDENCE_TOOLS | {
+    "datatap.insight.match.best.tag.v1",
+    "datatap.social.grow.kol.match.mentions.tag.v1",
 }
 _BRAND_PLATFORM_ALIASES = {
     "小红书": "xiaohongshu",
@@ -363,6 +369,200 @@ def _datatap_douyin_search_adapter(item: ToolEvidence) -> tuple[NormalizedKolEvi
     if not isinstance(candidates, list):
         raise ValueError("invalid_datatap_douyin_candidates")
     return tuple(_normalize_datatap_douyin_candidate(item, candidate) for candidate in candidates)
+
+
+_DATATAP_PLATFORM_BY_TOOL = {
+    "datatap.social.grow.kol.bilibili.search.v1": "bilibili",
+    "datatap.social.grow.kol.weibo.search.v1": "weibo",
+    "datatap.social.grow.kol.wechat.search.v1": "wechat",
+    "datatap.social.grow.kol.detail.v1": None,
+}
+_GENERIC_ACCOUNT_ID_KEYS = (
+    "账号ID (kwUid)",
+    "账号ID",
+    "达人ID",
+    "account_id",
+    "user_id",
+    "author_id",
+    "sec_uid",
+    "mid",
+    "uid",
+    "账号",
+    "id",
+)
+_GENERIC_NICKNAME_KEYS = ("昵称", "达人昵称", "达人名称", "name", "nickname")
+_GENERIC_PROFILE_KEYS = ("主页", "达人主页", "主页链接", "profile_url")
+_GENERIC_FOLLOWER_KEYS = ("粉丝数", "粉丝数量", "粉丝", "followers")
+_GENERIC_PLATFORM_ALIASES = {
+    "小红书": "xiaohongshu",
+    "xiaohongshu": "xiaohongshu",
+    "抖音": "douyin",
+    "douyin": "douyin",
+    "b站": "bilibili",
+    "哔哩哔哩": "bilibili",
+    "bilibili": "bilibili",
+    "微博": "weibo",
+    "weibo": "weibo",
+    "微信": "wechat",
+    "wechat": "wechat",
+}
+
+
+def _datatap_generic_kol_search_adapter(item: ToolEvidence) -> tuple[NormalizedKolEvidence, ...]:
+    """解析 DataTap 其它平台的统一达人列表响应。
+
+    当前 DataTap 的 B 站、微博和微信工具使用与平台专用工具相同的
+    ``result`` JSON 包装，但字段会随平台略有差异。这里仅提取统一身份和
+    白名单指标，避免把平台原始响应写入报告快照。
+    """
+    raw_result = item.payload.get("result")
+    if not isinstance(raw_result, str):
+        raise ValueError("invalid_datatap_generic_result")
+    try:
+        payload = json.loads(raw_result)
+    except json.JSONDecodeError as exc:
+        raise ValueError("invalid_datatap_generic_result") from exc
+    candidates = _datatap_candidate_rows(payload)
+    platform_hint = _DATATAP_PLATFORM_BY_TOOL[item.internal_tool_name]
+    normalized: list[NormalizedKolEvidence] = []
+    for candidate in candidates:
+        try:
+            normalized.append(_normalize_datatap_generic_candidate(item, candidate, platform_hint))
+        except (TypeError, ValueError):
+            # Summary rows without a stable creator identity must not fail the
+            # entire cross-platform task.
+            continue
+    return tuple(normalized)
+
+
+def _datatap_candidate_rows(payload: Any) -> list[dict[str, Any]]:
+    preferred = (
+        "KOL 列表",
+        "达人信息列表",
+        "达人列表",
+        "达人详情列表",
+        "详情列表",
+        "kol_list",
+        "creators",
+        "authors",
+        "items",
+        "rows",
+        "list",
+    )
+
+    def visit(node: Any) -> list[dict[str, Any]] | None:
+        if isinstance(node, dict):
+            if any(key in node for key in _GENERIC_ACCOUNT_ID_KEYS):
+                return [node]
+            for key in preferred:
+                value = node.get(key)
+                # 空列表是合法的“无匹配结果”，不是格式错误。
+                if isinstance(value, list) and (
+                    not value or all(isinstance(item, dict) for item in value)
+                ):
+                    return value
+            for value in node.values():
+                found = visit(value)
+                if found:
+                    return found
+        elif isinstance(node, list) and all(isinstance(item, dict) for item in node):
+            if any(any(key in item for key in _GENERIC_ACCOUNT_ID_KEYS) for item in node):
+                return node
+            for item in node:
+                found = visit(item)
+                if found:
+                    return found
+        return None
+
+    rows = visit(payload)
+    if rows is not None:
+        return rows
+    raise ValueError("invalid_datatap_generic_candidates")
+
+
+def _first_present_string(candidate: dict[str, Any], keys: tuple[str, ...]) -> str | None:
+    for key in keys:
+        value = _optional_string(candidate.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _normalize_datatap_generic_candidate(
+    item: ToolEvidence, candidate: dict[str, Any], platform: str | None
+) -> NormalizedKolEvidence:
+    account_id = _first_present_string(candidate, _GENERIC_ACCOUNT_ID_KEYS)
+    nickname = _first_present_string(candidate, _GENERIC_NICKNAME_KEYS)
+    if account_id is None:
+        if nickname is None:
+            raise ValueError("missing_required_identity:account_id")
+        # Some platforms intentionally omit a stable account id from search
+        # results. Use a deterministic in-memory identity so the named KOL can
+        # still enter the report and be merged across repeated calls without
+        # storing the provider's raw payload.
+        identity_material = _stable_json(
+            {"platform": platform, "nickname": nickname, "profile": _first_present_string(candidate, _GENERIC_PROFILE_KEYS)}
+        ).encode("utf-8")
+        account_id = f"{platform}:{hashlib.sha256(identity_material).hexdigest()[:24]}"
+    reported_platform = _first_present_string(candidate, ("平台", "platform"))
+    if platform is None and reported_platform:
+        platform = _GENERIC_PLATFORM_ALIASES.get(reported_platform.casefold())
+    if platform is None:
+        raise ValueError("missing_required_identity:platform")
+    if reported_platform:
+        reported_platform = reported_platform.casefold()
+        if platform not in reported_platform and reported_platform not in {platform, "b站"}:
+            raise ValueError("invalid_datatap_generic_platform")
+    engagement_rate = _first_percentage(
+        candidate,
+        "互动率",
+        "互动率-日常作品",
+        "互动率-商单作品",
+        "互动率-图文笔记",
+        "互动率-视频笔记",
+        "engagement_rate",
+    )
+    fields = {
+        "nickname": nickname,
+        "normalized_profile_url": _first_present_string(candidate, _GENERIC_PROFILE_KEYS),
+        "followers": _first_value(candidate, _GENERIC_FOLLOWER_KEYS, _unit_integer),
+        "engagement_rate": engagement_rate,
+        "quoted_price_cny": _first_currency(candidate, "预估报价", "报价", "quoted_price_cny"),
+        "content_score": _first_value(candidate, ("综合评分", "content_score"), _score),
+        "audience_score": _first_value(candidate, ("有效粉丝率", "audience_score"), _percentage),
+        "engagement_score": engagement_rate,
+        "budget_score": _first_value(candidate, ("预算匹配度", "budget_score"), _score),
+        "growth_score": _first_value(candidate, ("增长评分", "growth_score"), _score),
+        "brand_safety_score": _first_value(candidate, ("品牌安全评分", "brand_safety_score"), _score),
+    }
+    missing = tuple(name for name, value in fields.items() if value is None)
+    return _with_provenance(
+        NormalizedKolEvidence(
+            platform=platform,
+            platform_account_id=account_id,
+            risk_flags=(),
+            collected_at=item.collected_at,
+            evidence_references=(item.source_call_id,) if item.source_call_id else (),
+            missing_fields=missing,
+            export_fields=_extract_export_fields(candidate),
+            analytics_fields=_extract_analytics_fields(candidate),
+            **fields,
+        )
+    )
+
+
+def _first_value(candidate: dict[str, Any], keys: tuple[str, ...], parser: Callable[[Any], Any]) -> Any:
+    for key in keys:
+        value = candidate.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            parsed = parser(value)
+        except (InvalidOperation, TypeError, ValueError):
+            continue
+        if parsed is not None:
+            return parsed
+    return None
 
 
 def _normalize_datatap_douyin_candidate(
@@ -1113,4 +1313,8 @@ _ADAPTERS: dict[str, Adapter] = {
     "bilibili.creator.profile.v1": _creator_search_adapter,
     "datatap.xiaohongshu.kol.search.v1": _datatap_xiaohongshu_search_adapter,
     "datatap.douyin.kol.search.v1": _datatap_douyin_search_adapter,
+    "datatap.social.grow.kol.bilibili.search.v1": _datatap_generic_kol_search_adapter,
+    "datatap.social.grow.kol.weibo.search.v1": _datatap_generic_kol_search_adapter,
+    "datatap.social.grow.kol.wechat.search.v1": _datatap_generic_kol_search_adapter,
+    "datatap.social.grow.kol.detail.v1": _datatap_generic_kol_search_adapter,
 }

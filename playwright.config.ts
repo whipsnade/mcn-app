@@ -9,6 +9,10 @@ const backendTestEnv = {
   MYSQL_USER: 'kol_test',
   MYSQL_PASSWORD: 'test-only-password',
   JWT_SECRET: 'test-only-jwt-secret-at-least-32-characters',
+  // 仅为通过启动校验的占位值；E2E 数据由 page.route 注入，后台任务的真实
+  // 供应商调用会异步失败，不影响断言。
+  TENCENT_PLAN_API_KEY: 'test-only-tencent-key',
+  DATATAP_MCP_TOKEN: 'test-only-datatap-token',
 };
 
 

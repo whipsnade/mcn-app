@@ -14,6 +14,7 @@ import MobileWorkspaceNav, { type WorkspacePane } from './components/MobileWorks
 import NewSessionModal, { type NewSessionData } from './components/NewSessionModal';
 import RechargeModal from './components/RechargeModal';
 import SessionList from './components/SessionList';
+import UniversalReport from './components/UniversalReport';
 import { WorkspaceTabs, type WorkspaceTab } from './components/WorkspaceTabs';
 import { useWorkspace } from './hooks/useWorkspace';
 import { isTerminalTaskStatus } from './state/taskEvents';
@@ -165,7 +166,7 @@ export default function App() {
       <MobileWorkspaceNav active={mobilePane} onChange={setMobilePane} />
 
       <div className="flex min-h-0 flex-1 overflow-hidden">
-        <div className={`${mobilePane === 'sessions' ? 'block' : 'hidden'} h-full w-full shrink-0 xl:block xl:w-auto`}>
+        <div className={`${mobilePane === 'sessions' ? 'block' : 'hidden'} h-full min-h-0 w-full shrink-0 xl:block xl:w-auto`}>
           <SessionList
             sessions={workspace.sessions}
             activeSessionId={workspace.activeSessionId ?? ''}
@@ -185,7 +186,7 @@ export default function App() {
           />
         </div>
 
-        <div className={`${mobilePane === 'chat' ? 'flex' : 'hidden'} h-full min-w-0 flex-1 flex-col xl:flex`}>
+        <div className={`${mobilePane === 'chat' ? 'flex' : 'hidden'} h-full min-h-0 min-w-0 flex-1 flex-col xl:flex`}>
           {workspace.activeSession ? (
             <>
               <WorkspaceTabs
@@ -202,9 +203,10 @@ export default function App() {
                   }}
                   isAnalyzing={workspace.isAnalyzing}
                   isMockMode={false}
-                  taskActivity={workspace.taskRuntime?.activity}
-                  taskPhaseLabel={workspace.taskRuntime?.phaseLabel}
-                  taskProgress={workspace.taskRuntime?.phaseProgress}
+                  flowNodes={workspace.taskRuntime?.nodes ?? []}
+                  flowTerminal={isTerminalTaskStatus(workspace.taskRuntime?.status)}
+                  flowTerminalLabel={workspace.taskRuntime?.phaseLabel}
+                  assistantDraft={workspace.taskRuntime?.assistantDraft ?? ''}
                   onRetryMessage={messageId => workspace.retryMessage(messageId)}
                   followupStatus={workspace.activeSession.analysis?.followupStatus}
                   followupSuggestions={workspace.activeSession.analysis?.followupSuggestions}
@@ -247,16 +249,23 @@ export default function App() {
           )}
         </div>
 
-        <div className={`${mobilePane === 'bi' ? 'block' : 'hidden'} h-full w-full shrink-0 xl:block xl:w-auto`}>
-          <BiReport
-            report={workspace.activeSession?.biReport}
-            candidateVersion={workspace.activeSession?.analysis?.candidateVersion}
-            selectedCandidates={candidatePage?.items}
-            selectedCandidateVersion={candidatePage?.version}
-            sessionId={workspace.activeSession?.id}
-            taskStatus={(workspace.taskRuntime?.status ?? workspace.activeSession?.analysis?.status) as import('./api/contracts').ApiTaskStatus | undefined}
-            hasCandidateData={Boolean(candidatePage?.total)}
-          />
+        <div className={`${mobilePane === 'bi' ? 'block' : 'hidden'} h-full min-h-0 w-full shrink-0 xl:block xl:w-auto`}>
+          {workspace.activeSession?.analysis?.kind === 'agent' ? (
+            <UniversalReport
+              report={workspace.activeSession?.analysisReport}
+              taskStatus={(workspace.taskRuntime?.status ?? workspace.activeSession?.analysis?.status) as import('./api/contracts').ApiTaskStatus | undefined}
+            />
+          ) : (
+            <BiReport
+              report={workspace.activeSession?.biReport}
+              candidateVersion={workspace.activeSession?.analysis?.candidateVersion}
+              selectedCandidates={candidatePage?.items}
+              selectedCandidateVersion={candidatePage?.version}
+              sessionId={workspace.activeSession?.id}
+              taskStatus={(workspace.taskRuntime?.status ?? workspace.activeSession?.analysis?.status) as import('./api/contracts').ApiTaskStatus | undefined}
+              hasCandidateData={Boolean(candidatePage?.total)}
+            />
+          )}
         </div>
       </div>
 

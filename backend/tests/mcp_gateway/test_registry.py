@@ -1,5 +1,5 @@
 from app.mcp_gateway.contracts import DataTapService
-from app.mcp_gateway.registry import DYNAMIC_TOOL_ALLOWLIST
+from app.mcp_gateway.registry import DYNAMIC_TOOL_ALLOWLIST, close_input_schema
 
 
 def test_real_brand_and_all_channel_kol_tools_are_explicitly_allowlisted() -> None:
@@ -18,3 +18,32 @@ def test_real_brand_and_all_channel_kol_tools_are_explicitly_allowlisted() -> No
 
 def test_unrelated_remote_tools_are_not_allowlisted() -> None:
     assert "stock_prices" not in DYNAMIC_TOOL_ALLOWLIST.get(DataTapService.AKTOOLS, {})
+
+
+def test_close_input_schema_closes_nested_provider_objects() -> None:
+    schema = {
+        "type": "object",
+        "properties": {
+            "filters": {
+                "type": "object",
+                "properties": {
+                    "regions": {
+                        "type": "array",
+                        "items": {"type": "object", "properties": {"name": {"type": "string"}}},
+                    }
+                },
+            }
+        },
+        "additionalProperties": {"type": "string"},
+    }
+
+    normalized = close_input_schema(schema)
+
+    assert normalized["additionalProperties"] is False
+    assert normalized["properties"]["filters"]["additionalProperties"] is False
+    assert (
+        normalized["properties"]["filters"]["properties"]["regions"]["items"]["additionalProperties"]
+        is False
+    )
+    # Normalization must not mutate the live discovery object.
+    assert schema["additionalProperties"] is not False

@@ -163,7 +163,7 @@ export default function SessionList({
   });
 
   return (
-    <div ref={rootRef} className={`flex h-full w-full flex-col bg-white border-r border-slate-200 xl:w-80 shrink-0 no-print ${className ?? ''}`}>
+    <div ref={rootRef} className={`flex h-full min-h-0 w-full flex-col bg-white border-r border-slate-200 xl:w-80 shrink-0 no-print ${className ?? ''}`}>
       
       {/* List Header */}
       <div className="p-4 border-b border-slate-100 bg-white">

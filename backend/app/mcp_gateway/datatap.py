@@ -20,6 +20,13 @@ from app.mcp_gateway.contracts import DataTapService
 from app.mcp_gateway.transport import (
     DiscoveredTool,
     JsonValue,
+    McpCircuitOpen,
+    McpConnectionError,
+    McpConnectionTimeout,
+    McpGatewayTimeout,
+    McpProtocolError,
+    McpQueueTimeout,
+    McpUpstreamHttpError,
     McpUpstreamError,
     PossiblySentTimeout,
     RemoteToolResult,
@@ -56,12 +63,18 @@ class DataTapTransport:
         session_opener: Callable[..., AbstractAsyncContextManager[Any]] = (streamable_http_client),
         session_factory: Callable[..., AbstractAsyncContextManager[Any]] = ClientSession,
         http_transport: httpx.AsyncBaseTransport | None = None,
-        max_concurrency_per_service: int = 4,
+        # DataTap streamable HTTP gateways are service-scoped and may return
+        # 504 when several long-running calls share one service endpoint.
+        # Keep cross-service parallelism, but serialize calls per service.
+        max_concurrency_per_service: int = 1,
         failure_threshold: int = 3,
         circuit_reset_seconds: float = 30.0,
-        queue_timeout_seconds: float = 5.0,
+        # Calls for one service are serialized; wait long enough for the
+        # preceding long-running MCP request to finish instead of failing the
+        # queued call after the old 5-second window.
+        queue_timeout_seconds: float = 300.0,
         connect_timeout_seconds: float = 5.0,
-        read_timeout_seconds: float = 30.0,
+        read_timeout_seconds: float = 300.0,
         write_timeout_seconds: float = 10.0,
         pool_timeout_seconds: float = 5.0,
         clock: Callable[[], float] = time.monotonic,
@@ -146,31 +159,57 @@ class DataTapTransport:
             raise TypeError("remote_name must be a non-empty string")
 
         async def operation() -> RemoteToolResult:
-            async with self._session_opener(
-                self._endpoint(checked),
-                http_client=self._client,
-                terminate_on_close=True,
-            ) as (read_stream, write_stream, _get_session_id):
-                async with self._session_factory(
-                    read_stream,
-                    write_stream,
-                    read_timeout_seconds=timedelta(seconds=self._read_timeout_seconds),
-                ) as session:
-                    await session.initialize()
-                    try:
-                        result = await session.call_tool(remote_name, dict(arguments))
-                    except McpError as exc:
-                        if exc.error.code == httpx.codes.REQUEST_TIMEOUT:
+            try:
+                async with self._session_opener(
+                    self._endpoint(checked),
+                    http_client=self._client,
+                    terminate_on_close=True,
+                ) as (read_stream, write_stream, _get_session_id):
+                    async with self._session_factory(
+                        read_stream,
+                        write_stream,
+                        read_timeout_seconds=timedelta(seconds=self._read_timeout_seconds),
+                    ) as session:
+                        await session.initialize()
+                        try:
+                            result = await session.call_tool(remote_name, dict(arguments))
+                        except McpError as exc:
+                            if exc.error.code == httpx.codes.REQUEST_TIMEOUT:
+                                raise PossiblySentTimeout("MCP result was not confirmed") from exc
+                            raise McpProtocolError("MCP tool protocol error") from exc
+                        except (httpx.ReadTimeout, TimeoutError) as exc:
                             raise PossiblySentTimeout("MCP result was not confirmed") from exc
-                        raise
-                    except (httpx.ReadTimeout, TimeoutError) as exc:
-                        raise PossiblySentTimeout("MCP result was not confirmed") from exc
-                    structured_content = getattr(result, "structuredContent", None)
-                    return RemoteToolResult(
-                        structured_content=structured_content,
-                        is_error=bool(getattr(result, "isError", False)),
-                        upstream_request_id=self._request_id(result),
-                    )
+                        structured_content = getattr(result, "structuredContent", None)
+                        error_text = None
+                        if getattr(result, "isError", False):
+                            error_text = self._error_text(result)
+                        return RemoteToolResult(
+                            structured_content=structured_content,
+                            is_error=bool(getattr(result, "isError", False)),
+                            upstream_request_id=self._request_id(result),
+                            error_text=error_text,
+                        )
+            except PossiblySentTimeout:
+                raise
+            except BaseException as exc:
+                if self._contains_exception(exc, httpx.ConnectTimeout):
+                    raise McpConnectionTimeout("MCP endpoint connection timed out") from exc
+                if self._contains_exception(exc, httpx.ConnectError):
+                    raise McpConnectionError("MCP endpoint connection failed") from exc
+                if self._contains_exception(exc, (httpx.ReadTimeout, TimeoutError)):
+                    raise PossiblySentTimeout("MCP result was not confirmed") from exc
+                status_error = self._find_exception(exc, httpx.HTTPStatusError)
+                if status_error is not None:
+                    status_code = status_error.response.status_code
+                    if status_code in {408, 504}:
+                        raise McpGatewayTimeout("MCP gateway timed out") from exc
+                    if status_code >= 500:
+                        raise McpUpstreamHttpError("MCP gateway returned an upstream error") from exc
+                if isinstance(exc, McpUpstreamError):
+                    raise
+                if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                    raise
+                raise McpProtocolError("MCP protocol operation failed") from exc
 
         return await self._run_isolated(checked, operation)
 
@@ -190,7 +229,7 @@ class DataTapTransport:
         try:
             await asyncio.wait_for(state.semaphore.acquire(), timeout=self._queue_timeout_seconds)
         except TimeoutError as exc:
-            raise McpUpstreamError("MCP service concurrency queue timed out") from exc
+            raise McpQueueTimeout("MCP service concurrency queue timed out") from exc
 
         try:
             epoch = await self._enter_circuit(state)
@@ -202,6 +241,12 @@ class DataTapTransport:
                     raise
                 if isinstance(exc, McpUpstreamError):
                     raise
+                if isinstance(exc, httpx.ConnectTimeout):
+                    raise McpConnectionTimeout("MCP endpoint connection timed out") from exc
+                if isinstance(exc, httpx.ConnectError):
+                    raise McpConnectionError("MCP endpoint connection failed") from exc
+                if isinstance(exc, (httpx.ReadTimeout, TimeoutError)):
+                    raise PossiblySentTimeout("MCP result was not confirmed") from exc
                 if isinstance(exc, (httpx.HTTPError, TimeoutError, OSError)):
                     raise McpUpstreamError("MCP upstream request failed") from exc
                 raise McpUpstreamError("MCP protocol operation failed") from exc
@@ -215,9 +260,9 @@ class DataTapTransport:
             if state.opened_at is None:
                 return state.epoch
             if self._clock() - state.opened_at < self._circuit_reset_seconds:
-                raise McpUpstreamError("MCP service circuit is open")
+                raise McpCircuitOpen("MCP service circuit is open")
             if state.half_open_in_flight:
-                raise McpUpstreamError("MCP service circuit half-open probe is busy")
+                raise McpCircuitOpen("MCP service circuit half-open probe is busy")
             state.half_open_in_flight = True
             return state.epoch
 
@@ -258,9 +303,46 @@ class DataTapTransport:
         )
 
     @staticmethod
+    def _error_text(result: Any) -> str | None:
+        """拼接 MCP 错误结果的文本内容并截断，供回喂模型自我纠正。"""
+        parts: list[str] = []
+        for item in getattr(result, "content", None) or []:
+            text = getattr(item, "text", None)
+            if isinstance(text, str) and text.strip():
+                parts.append(text.strip())
+        if not parts:
+            return None
+        return " ".join(parts)[:500]
+
+    @staticmethod
     def _request_id(result: Any) -> str | None:
         metadata = getattr(result, "meta", None) or getattr(result, "_meta", None)
         if isinstance(metadata, dict):
             value = metadata.get("requestId") or metadata.get("request_id")
             return value if isinstance(value, str) else None
+        return None
+
+    @staticmethod
+    def _contains_exception(exc: BaseException, expected: type[BaseException] | tuple[type[BaseException], ...]) -> bool:
+        if isinstance(exc, expected):
+            return True
+        if isinstance(exc, BaseExceptionGroup):
+            return any(
+                DataTapTransport._contains_exception(child, expected)
+                for child in exc.exceptions
+            )
+        return False
+
+    @staticmethod
+    def _find_exception(
+        exc: BaseException,
+        expected: type[BaseException] | tuple[type[BaseException], ...],
+    ) -> BaseException | None:
+        if isinstance(exc, expected):
+            return exc
+        if isinstance(exc, BaseExceptionGroup):
+            for child in exc.exceptions:
+                found = DataTapTransport._find_exception(child, expected)
+                if found is not None:
+                    return found
         return None

@@ -6,9 +6,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_db
 from app.identity.dependencies import CurrentUser
-from app.reporting.router import bi_report_summary
+from app.reporting.router import analysis_report_summary, bi_report_summary
 from app.reporting.schemas import CandidateVersionSummary, TaskAnalysisSummary
 from app.reporting.service import ReportingService
+from app.reporting.analysis_reports import AnalysisReportService
 from app.tasks.router import get_task_runner
 from app.tasks.schemas import TaskCreate
 from app.tasks.service import TaskService
@@ -62,6 +63,7 @@ async def session_read(
     latest_task = None
     latest_candidates = None
     latest_report = None
+    latest_analysis_report = None
     if include_analysis:
         task, version, total, report = await ReportingService(service.db).latest_session_analysis(
             workspace.user_id, workspace.id
@@ -76,9 +78,11 @@ async def session_read(
                 ),
                 {},
             )
+            task_kind = getattr(task, "kind", "pipeline")
             latest_task = TaskAnalysisSummary(
                 id=task.id,
                 status=task.status,
+                kind=task_kind if task_kind in {"pipeline", "agent"} else "pipeline",
                 completed_at=task.completed_at,
                 followup_suggestions_status=followup_metadata.get("followup_suggestions_status"),
                 followup_suggestions=list(followup_metadata.get("followup_suggestions", [])),
@@ -90,6 +94,11 @@ async def session_read(
             )
         if report is not None:
             latest_report = bi_report_summary(report)
+        analysis_report = await AnalysisReportService(service.db).latest_session_report(
+            workspace.id
+        )
+        if analysis_report is not None:
+            latest_analysis_report = analysis_report_summary(analysis_report)
     return SessionRead(
         id=workspace.id,
         title=workspace.title,
@@ -107,6 +116,7 @@ async def session_read(
         latest_task=latest_task,
         latest_candidates=latest_candidates,
         latest_report=latest_report,
+        latest_analysis_report=latest_analysis_report,
         created_at=workspace.created_at,
         updated_at=workspace.updated_at,
     )

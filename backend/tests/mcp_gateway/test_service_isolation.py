@@ -65,6 +65,9 @@ def isolated_transport(clock: Clock) -> DataTapTransport:
         token=SecretStr("unit-test-token"),
         session_opener=opener,
         session_factory=IsolatedSession,
+        # 纪元测试需要同一服务两个并发调用（旧纪元迟到结果 vs 新调用）；
+        # 生产默认 per-service 串行（=1），这里放宽到 2 以保留测试语义。
+        max_concurrency_per_service=2,
         failure_threshold=2,
         circuit_reset_seconds=10,
         clock=clock,

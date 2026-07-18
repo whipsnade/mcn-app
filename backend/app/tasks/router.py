@@ -79,11 +79,13 @@ async def sse_event_chunks(
 
 def task_read(task: AnalysisTask, metadata: dict | None = None) -> TaskRead:
     metadata = metadata or {}
+    kind = getattr(task, "kind", "pipeline")
     return TaskRead(
         id=task.id,
         session_id=task.session_id,
         trigger_message_id=task.trigger_message_id,
         status=task.status,
+        kind=kind if kind in {"pipeline", "agent"} else "pipeline",
         estimated_points=task.estimated_points,
         error_code=task.error_code,
         error_message=task.error_message,

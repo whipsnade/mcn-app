@@ -52,3 +52,22 @@ def test_analysis_tasks_register_persistent_creation_idempotency_index() -> None
         == ("user_id", "session_id", "idempotency_key_hash")
         for index in tasks.indexes
     )
+
+
+def test_agent_mode_columns_and_analysis_reports_table() -> None:
+    tasks = Base.metadata.tables["analysis_tasks"]
+    assert tasks.c.kind.nullable is False
+    assert tasks.c.kind.type.length == 16
+
+    sessions = Base.metadata.tables["sessions"]
+    assert sessions.c.category.nullable is True
+
+    reports = Base.metadata.tables["analysis_reports"]
+    assert {"id", "task_id", "session_id", "version", "title", "blocks_json", "status"}.issubset(
+        reports.c.keys()
+    )
+    assert any(
+        tuple(column.name for column in constraint.columns) == ("task_id", "version")
+        for constraint in reports.constraints
+        if hasattr(constraint, "columns")
+    )

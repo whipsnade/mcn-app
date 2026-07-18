@@ -16,13 +16,26 @@ export interface TaskEvent {
 
 export type TaskConnection = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'closed' | 'error';
 
+export type TaskFlowNodeStatus = 'running' | 'succeeded' | 'failed' | 'unknown';
+
+export interface TaskFlowNode {
+  id: string;
+  label: string;
+  status: TaskFlowNodeStatus;
+  /** 失败/未确认节点的用户可读原因（报错信息）。 */
+  detail?: string;
+}
+
 export interface TaskRuntimeState {
   taskId: string;
   lastEventId: number;
   assistantDraft: string;
+  /** 执行流程节点；测试夹具可省略，reducer 按空数组处理。 */
+  nodes?: TaskFlowNode[];
   candidateVersion?: number;
   pendingReport?: { id: string; candidateVersion: number };
   visibleReportId?: string;
+  visibleAnalysisReportId?: string;
   status?: string;
   phase?: TaskPhase;
   phaseLabel?: string;
@@ -43,6 +56,7 @@ export function initialTaskRuntime(taskId: string): TaskRuntimeState {
     taskId,
     lastEventId: 0,
     assistantDraft: '',
+    nodes: [],
     connection: 'idle',
   };
 }
@@ -58,6 +72,88 @@ function exposeMatchingReport(state: TaskRuntimeState): TaskRuntimeState {
   return state;
 }
 
+function pushNode(nodes: TaskFlowNode[], node: TaskFlowNode): TaskFlowNode[] {
+  return [...nodes, node];
+}
+
+function updateNode(
+  nodes: TaskFlowNode[],
+  index: number,
+  patch: Partial<TaskFlowNode>,
+): TaskFlowNode[] {
+  if (index < 0) return nodes;
+  const copy = [...nodes];
+  copy[index] = { ...copy[index], ...patch };
+  return copy;
+}
+
+function latestRunningToolNode(nodes: TaskFlowNode[], stepIndex: number): number {
+  // pipeline 分批执行时 step_index 每批从 1 重新计数：优先匹配最近一个
+  // 仍处于 running 的同类节点，避免误更新到上一批的同名节点。
+  for (let index = nodes.length - 1; index >= 0; index -= 1) {
+    const node = nodes[index];
+    if (
+      node.status === 'running'
+      && (node.id === `tool-${stepIndex}` || node.id.startsWith(`tool-${stepIndex}-`))
+    ) {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function withFlowNode(state: TaskRuntimeState, event: TaskEvent): TaskRuntimeState {
+  const nodes = state.nodes ?? [];
+  const stepIndex = Number(valueOf(event.payload, 'stepIndex', 'step_index'));
+  const platform = String(event.payload.platform ?? '社媒');
+  switch (event.type) {
+    case 'task.pending':
+      return { ...state, nodes: [{ id: 'accepted', label: '任务已受理', status: 'succeeded' }] };
+    case 'plan.ready':
+      return { ...state, nodes: pushNode(nodes, { id: 'plan', label: '分析规划完成', status: 'succeeded' }) };
+    case 'replan.ready':
+      return { ...state, nodes: pushNode(nodes, { id: `replan-${event.id}`, label: '自动重新规划', status: 'succeeded' }) };
+    case 'tool.started':
+      {
+        const base = `tool-${stepIndex}`;
+        const id = nodes.some(node => node.id === base) ? `${base}-${event.id}` : base;
+        return { ...state, nodes: pushNode(nodes, { id, label: `查询${platform}数据`, status: 'running' }) };
+      }
+    case 'tool.succeeded':
+    case 'tool.failed':
+    case 'tool.unknown':
+      {
+        const status: TaskFlowNodeStatus = event.type === 'tool.succeeded'
+          ? 'succeeded'
+          : event.type === 'tool.failed'
+            ? 'failed'
+            : 'unknown';
+        const detail = status === 'succeeded' ? undefined : String(event.payload.message ?? '') || undefined;
+        const index = latestRunningToolNode(nodes, stepIndex);
+        if (index === -1) {
+          return { ...state, nodes: pushNode(nodes, { id: `tool-${stepIndex}-late-${event.id}`, label: `查询${platform}数据`, status, detail }) };
+        }
+        return { ...state, nodes: updateNode(nodes, index, { status, detail }) };
+      }
+    case 'candidates.updated':
+      return { ...state, nodes: pushNode(nodes, { id: 'candidates', label: '候选清单已生成', status: 'succeeded' }) };
+    case 'bi.updated':
+      return { ...state, nodes: pushNode(nodes, { id: 'bi', label: 'BI 报告已生成', status: 'succeeded' }) };
+    case 'report.updated':
+      return { ...state, nodes: pushNode(nodes, { id: 'report', label: '分析报告已生成', status: 'succeeded' }) };
+    case 'task.completed':
+      return { ...state, nodes: pushNode(nodes, { id: 'terminal', label: '分析完成', status: 'succeeded' }) };
+    case 'task.completed_with_warnings':
+      return { ...state, nodes: pushNode(nodes, { id: 'terminal', label: '分析完成（部分渠道失败）', status: 'unknown', detail: String(event.payload.message ?? '') || undefined }) };
+    case 'task.failed':
+      return { ...state, nodes: pushNode(nodes, { id: 'terminal', label: '任务失败', status: 'failed', detail: String(event.payload.message ?? '') || undefined }) };
+    case 'task.cancelled':
+      return { ...state, nodes: pushNode(nodes, { id: 'terminal', label: '任务已取消', status: 'unknown' }) };
+    default:
+      return state;
+  }
+}
+
 function applyStatusAndPointEvent(state: TaskRuntimeState, event: TaskEvent): TaskRuntimeState {
   const progressFrom = () => {
     const current = Number(valueOf(event.payload, 'stepIndex', 'step_index'));
@@ -69,7 +165,7 @@ function applyStatusAndPointEvent(state: TaskRuntimeState, event: TaskEvent): Ta
   const platformProgress = event.payload.platform_progress;
   switch (event.type) {
     case 'task.pending':
-      return { ...state, status: String(event.payload.status ?? 'pending'), phase: 'accepting_data', phaseLabel: String(event.payload.label ?? '接受数据'), activity: String(event.payload.label ?? '接受数据') };
+      return { ...state, status: String(event.payload.status ?? 'pending'), phase: 'accepting_data', phaseLabel: String(event.payload.label ?? '接受数据'), activity: String(event.payload.label ?? '接受数据'), visibleAnalysisReportId: undefined };
     case 'plan.ready':
       return { ...state, status: String(event.payload.status ?? 'running'), phase: 'ai_analysis', phaseLabel: String(event.payload.label ?? 'AI 分析'), activity: String(event.payload.label ?? 'AI 分析') };
     case 'replan.ready':
@@ -182,7 +278,7 @@ export function reduceTaskEvent(state: TaskRuntimeState, event: TaskEvent): Task
         const pendingReport = next.pendingReport?.candidateVersion === candidateVersion
           ? next.pendingReport
           : undefined;
-        return exposeMatchingReport({
+        return withFlowNode(exposeMatchingReport({
           ...next,
           candidateVersion,
           pendingReport,
@@ -190,20 +286,39 @@ export function reduceTaskEvent(state: TaskRuntimeState, event: TaskEvent): Task
           phase: 'ai_summary',
           phaseLabel: String(event.payload.label ?? 'AI 汇总'),
           activity: '候选清单已更新',
-        });
+        }), event);
       }
     case 'bi.updated':
-      return exposeMatchingReport({
-        ...next,
-        pendingReport: {
-          id: String(valueOf(event.payload, 'reportId', 'report_id')),
-          candidateVersion: Number(valueOf(event.payload, 'candidateVersion', 'candidate_version')),
-        },
-        phase: 'ai_summary',
-        phaseLabel: String(event.payload.label ?? 'BI 报告已生成'),
-        activity: 'BI 报告已更新',
-      });
+      {
+        const candidateVersion = Number(valueOf(event.payload, 'candidateVersion', 'candidate_version'));
+        const scope = String(event.payload.analysis_scope ?? '');
+        const isEmptyBrandReport = candidateVersion === 0 && (scope === 'brand' || scope === 'hybrid');
+        return withFlowNode(exposeMatchingReport({
+          ...next,
+          candidateVersion: isEmptyBrandReport ? candidateVersion : next.candidateVersion,
+          pendingReport: {
+            id: String(valueOf(event.payload, 'reportId', 'report_id')),
+            candidateVersion,
+          },
+          phase: 'ai_summary',
+          phaseLabel: String(event.payload.label ?? 'BI 报告已生成'),
+          activity: 'BI 报告已更新',
+        }), event);
+      }
+    case 'report.updated':
+      {
+        // agent 任务没有候选版本概念，报告 id 直接对外可见，无需版本匹配。
+        const reportId = valueOf(event.payload, 'reportId', 'report_id');
+        if (reportId === undefined || reportId === null) return next;
+        return withFlowNode({
+          ...next,
+          visibleAnalysisReportId: String(reportId),
+          phase: 'ai_summary',
+          phaseLabel: String(event.payload.label ?? '分析报告已生成'),
+          activity: '分析报告已更新',
+        }, event);
+      }
     default:
-      return applyStatusAndPointEvent(next, event);
+      return withFlowNode(applyStatusAndPointEvent(next, event), event);
   }
 }

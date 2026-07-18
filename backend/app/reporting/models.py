@@ -142,6 +142,35 @@ class BiReport(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 
 
+class AnalysisReport(Base):
+    """Free-form report produced by iterative agent tasks (kind="agent").
+
+    Unlike BiReport there is no candidate version: blocks_json holds the
+    validated ReportDocument block list rendered by the universal report UI.
+    """
+
+    __tablename__ = "analysis_reports"
+    __table_args__ = (
+        UniqueConstraint("task_id", "version", name="uq_analysis_reports_task_version"),
+        Index("ix_analysis_reports_session_created", "session_id", "created_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    task_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("analysis_tasks.id", ondelete="CASCADE"), nullable=False
+    )
+    session_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False
+    )
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    title: Mapped[str] = mapped_column(String(200), nullable=False, default="")
+    blocks_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False)
+    conclusion_text: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
 class UserKolFavorite(Base):
     __tablename__ = "user_kol_favorites"
     __table_args__ = (

@@ -30,6 +30,25 @@ def test_safe_error_maps_known_codes_and_drops_sensitive_detail() -> None:
     assert TaskEventType.TOOL_FAILED.value == "tool.failed"
 
 
+@pytest.mark.parametrize(
+    ("code", "message"),
+    [
+        ("connection_timeout", "社媒数据服务连接超时，请稍后重试。"),
+        ("connection_error", "社媒数据服务连接失败，请稍后重试。"),
+        ("upstream_timeout", "社媒数据服务处理超时，请稍后重试。"),
+        ("upstream_http_error", "社媒数据服务返回异常，请稍后重试。"),
+        ("protocol_error", "社媒数据服务协议异常，请稍后重试。"),
+        ("mcp_queue_timeout", "社媒数据服务当前繁忙，请稍后重试。"),
+        ("mcp_service_unavailable", "社媒数据服务暂时不可用，请稍后重试。"),
+    ],
+)
+def test_safe_error_exposes_fine_grained_mcp_categories(code: str, message: str) -> None:
+    error = safe_error(code)
+
+    assert error.code == code
+    assert error.message == message
+
+
 def test_safe_error_falls_back_to_generic_message_for_unknown_code() -> None:
     error = safe_error("Exception", "raw traceback with authorization token")
 

@@ -25,6 +25,7 @@ class TaskEventType(StrEnum):
     POINTS_RELEASED = "points.released"
     CANDIDATES_UPDATED = "candidates.updated"
     BI_UPDATED = "bi.updated"
+    REPORT_UPDATED = "report.updated"
     MESSAGE_DELTA = "message.delta"
     MESSAGE_COMPLETED = "message.completed"
     FOLLOWUP_SUGGESTIONS_STARTED = "followup.suggestions_started"

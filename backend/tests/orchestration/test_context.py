@@ -44,6 +44,11 @@ class FakeRegistry:
                     "required": ["keyword"],
                     "additionalProperties": False,
                 },
+                output_schema={
+                    "type": "object",
+                    "properties": {"result": {"type": "string"}},
+                    "required": ["result"],
+                },
             ),
         )
 
@@ -119,6 +124,7 @@ async def test_model_context_contains_reviewed_tools_but_no_supplier_details() -
 
     serialized = context.model_dump_json()
     assert "达人搜索" in serialized
+    assert context.tools[0].output_schema["properties"]["result"]["type"] == "string"
     assert "datatap.deepminer.com.cn" not in serialized
     assert "authorization" not in serialized.lower()
     assert "google-trends-mcp" not in serialized
@@ -161,3 +167,30 @@ async def test_context_ignores_legacy_unapproved_platforms() -> None:
 
     assert context.allowed_channels == ("xiaohongshu", "douyin")
     assert context.brief.platforms == ("xiaohongshu", "douyin")
+
+
+@pytest.mark.asyncio
+async def test_context_does_not_use_keyword_router_as_analysis_scope(monkeypatch) -> None:
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("keyword router must not decide planner scope")
+
+    monkeypatch.setattr(
+        "app.orchestration.context.classify_analysis_request",
+        fail_if_called,
+        raising=False,
+    )
+
+    builder = ContextBuilder(
+        workspace=FakeWorkspace(),
+        registry=FakeRegistry(),
+        permissions=FakePermissions(),
+        reporting=FakeReporting(),
+    )
+
+    context = await builder.build(user_id="user-1", session_id="session-1")
+
+    assert context.analysis_scope is None
+    assert context.analysis_objectives == ()
+    # 未明确时间范围时默认最近三个月。
+    assert context.requested_period["unit"] == "month"
+    assert context.requested_period["value"] == 3

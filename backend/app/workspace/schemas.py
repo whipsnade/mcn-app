@@ -4,7 +4,12 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
-from app.reporting.schemas import BiReportSummary, CandidateVersionSummary, TaskAnalysisSummary
+from app.reporting.schemas import (
+    AnalysisReportSummary,
+    BiReportSummary,
+    CandidateVersionSummary,
+    TaskAnalysisSummary,
+)
 
 
 Platform = Literal["xiaohongshu", "douyin", "bilibili", "weibo", "wechat"]
@@ -14,7 +19,8 @@ class SessionCreate(BaseModel):
     brand: str = Field(default="", max_length=100)
     campaign_name: str | None = Field(default=None, min_length=1, max_length=120)
     platforms: list[Platform] = Field(default_factory=list)
-    category: str = Field(min_length=1, max_length=100)
+    # Optional since agent tasks: free-form questions may not name a category.
+    category: str | None = Field(default=None, max_length=100)
     target_audience: str = Field(default="", max_length=500)
     budget_min: Decimal | None = Field(default=None, ge=0)
     budget_max: Decimal | None = Field(default=None, ge=0)
@@ -65,7 +71,7 @@ class SessionRead(BaseModel):
     campaign_name: str | None
     status: str
     platforms: list[str]
-    category: str
+    category: str | None
     target_audience: str
     budget_min: Decimal | None
     budget_max: Decimal | None
@@ -75,5 +81,6 @@ class SessionRead(BaseModel):
     latest_task: TaskAnalysisSummary | None = None
     latest_candidates: CandidateVersionSummary | None = None
     latest_report: BiReportSummary | None = None
+    latest_analysis_report: AnalysisReportSummary | None = None
     created_at: datetime
     updated_at: datetime

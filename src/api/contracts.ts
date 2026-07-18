@@ -42,6 +42,7 @@ export interface ApiSession {
   latest_task?: ApiTaskSummary | null;
   latest_candidates?: ApiCandidateVersionSummary | null;
   latest_report?: ApiBiReportSummary | null;
+  latest_analysis_report?: ApiAnalysisReportSummary | null;
   created_at: string;
   updated_at: string;
 }
@@ -57,11 +58,14 @@ export type ApiTaskStatus =
   | 'interrupted'
   | 'cancelled';
 
+export type ApiTaskKind = 'pipeline' | 'agent';
+
 export interface ApiTask {
   id: string;
   session_id: string;
   trigger_message_id?: string | null;
   status: ApiTaskStatus;
+  kind?: ApiTaskKind;
   estimated_points: number;
   error_code: string | null;
   error_message?: string | null;
@@ -74,6 +78,7 @@ export interface ApiTask {
 export interface ApiTaskSummary {
   id: string;
   status: ApiTaskStatus;
+  kind?: ApiTaskKind;
   completed_at: string | null;
   followup_suggestions_status?: 'pending' | 'completed' | 'failed' | null;
   followup_suggestions?: FollowupSuggestion[];
@@ -221,6 +226,49 @@ export interface ApiBiReport {
   warnings?: string[];
   conclusion: string;
   sources: Array<Record<string, unknown>>;
+  generated_at: string;
+}
+
+export interface ApiAnalysisReportMetricItem {
+  label: string;
+  value: string | number;
+  unit?: string;
+  delta?: string;
+}
+
+export interface ApiAnalysisReportChartSeries {
+  name: string;
+  values: (number | null)[];
+}
+
+export type ReportBlock =
+  | { type: 'heading'; text: string }
+  | { type: 'markdown'; text: string }
+  | { type: 'metric_grid'; title?: string; items: ApiAnalysisReportMetricItem[] }
+  | { type: 'table'; title?: string; columns: string[]; rows: (string | number | null)[][] }
+  | { type: 'bar_chart'; title?: string; categories: string[]; series: ApiAnalysisReportChartSeries[] }
+  | { type: 'line_chart'; title?: string; categories: string[]; series: ApiAnalysisReportChartSeries[] }
+  | { type: 'pie_chart'; title?: string; categories: string[]; series: ApiAnalysisReportChartSeries[] }
+  | { type: 'tag_list'; title?: string; items: string[] }
+  | { type: 'sources'; items: Array<{ name: string; collected_at?: string; evidence?: string }> };
+
+export interface ApiAnalysisReport {
+  id: string;
+  task_id: string;
+  version: number;
+  title: string;
+  blocks: ReportBlock[];
+  conclusion: string | null;
+  status: string;
+  generated_at: string;
+}
+
+export interface ApiAnalysisReportSummary {
+  id: string;
+  task_id: string;
+  version: number;
+  title: string;
+  status: string;
   generated_at: string;
 }
 

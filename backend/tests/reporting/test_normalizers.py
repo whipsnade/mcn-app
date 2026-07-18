@@ -34,6 +34,73 @@ def evidence(
     )
 
 
+def test_new_datatap_platform_tool_names_use_generic_kol_adapter() -> None:
+    item = evidence(
+        "datatap.social.grow.kol.bilibili.search.v1",
+        {
+            "result": json.dumps(
+                {
+                    "达人列表": [
+                        {
+                            "账号ID": "bili-1",
+                            "昵称": "测试B站达人",
+                            "粉丝数": "2.5万",
+                            "互动率": "6.2%",
+                            "平台": "bilibili",
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            )
+        },
+        "call-bili",
+    )
+
+    [candidate] = normalize_tool_evidence([item])
+
+    assert candidate.platform == "bilibili"
+    assert candidate.platform_account_id == "bili-1"
+    assert candidate.nickname == "测试B站达人"
+    assert candidate.followers == 25000
+    assert candidate.engagement_rate == 6.2
+
+
+def test_generic_adapter_accepts_datatap_detailed_list_without_account_id() -> None:
+    item = evidence(
+        "datatap.social.grow.kol.weibo.search.v1",
+        {
+            "result": json.dumps(
+                {"达人信息列表": [{"昵称": "微博达人", "粉丝数": "1.2万", "互动率": "3%"}]},
+                ensure_ascii=False,
+            )
+        },
+        "call-weibo",
+    )
+
+    [candidate] = normalize_tool_evidence([item])
+
+    assert candidate.platform == "weibo"
+    assert candidate.nickname == "微博达人"
+    assert candidate.platform_account_id.startswith("weibo:")
+
+
+def test_generic_adapter_treats_empty_detail_list_as_no_candidates() -> None:
+    """kol.detail 空结果（筛选无匹配）必须归一化为空候选，而不是任务失败。"""
+    empty_zh = evidence(
+        "datatap.social.grow.kol.detail.v1",
+        {"result": json.dumps({"达人详情列表": []}, ensure_ascii=False)},
+        "call-detail-empty",
+    )
+    empty_alt = evidence(
+        "datatap.social.grow.kol.detail.v1",
+        {"result": json.dumps({"详情列表": []}, ensure_ascii=False)},
+        "call-detail-empty-2",
+    )
+
+    assert normalize_tool_evidence([empty_zh]) == ()
+    assert normalize_tool_evidence([empty_alt]) == ()
+
+
 def test_datatap_candidate_exports_template_fields_without_raw_urls() -> None:
     evidence = ToolEvidence(
         internal_tool_name="datatap.xiaohongshu.kol.search.v1",

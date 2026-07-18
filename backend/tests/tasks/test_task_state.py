@@ -36,6 +36,7 @@ def test_task_event_type_values_are_frozen() -> None:
         "points.released",
         "candidates.updated",
         "bi.updated",
+        "report.updated",
         "message.delta",
         "message.completed",
         "followup.suggestions_started",

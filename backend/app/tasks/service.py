@@ -11,6 +11,7 @@ from app.tasks.models import AnalysisTask
 from app.tasks.repository import TaskRepository
 from app.tasks.schemas import TaskCreate
 from app.tasks.state import TERMINAL_TASK_STATUSES, TaskEventType, TaskStatus
+from app.orchestration.routing import classify_task_kind
 from app.workspace.schemas import MessageCreate
 from app.workspace.models import Message
 from app.workspace.service import WorkspaceService
@@ -66,7 +67,7 @@ class TaskService:
         idempotency_payload_hash: str | None = None,
     ) -> AnalysisTask:
         workspace_service = WorkspaceService(self.db)
-        await workspace_service.get_owned_session(user_id, session_id, for_update=True)
+        workspace = await workspace_service.get_owned_session(user_id, session_id, for_update=True)
         active_task_id = await self.db.scalar(
             select(AnalysisTask.id)
             .where(
@@ -110,6 +111,7 @@ class TaskService:
             idempotency_key_hash=idempotency_key_hash,
             idempotency_payload_hash=idempotency_payload_hash,
             status=TaskStatus.PENDING,
+            kind=classify_task_kind(payload.content, category=workspace.category),
             plan_json=None,
             plan_version=None,
             max_calls=10,

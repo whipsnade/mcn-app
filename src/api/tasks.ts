@@ -1,5 +1,5 @@
 import { authorizedFetch, request } from './client';
-import type { ApiBiReport, ApiCandidatePage, ApiTask } from './contracts';
+import type { ApiAnalysisReport, ApiBiReport, ApiCandidatePage, ApiTask } from './contracts';
 
 
 export interface CreateTaskInput {
@@ -47,6 +47,10 @@ export function getCandidates(taskId: string): Promise<ApiCandidatePage> {
 
 export function getReport(reportId: string): Promise<ApiBiReport> {
   return request<ApiBiReport>(`/api/v1/reports/${reportId}`);
+}
+
+export function getAnalysisReport(reportId: string): Promise<ApiAnalysisReport> {
+  return request<ApiAnalysisReport>(`/api/v1/analysis-reports/${reportId}`);
 }
 
 export interface DownloadedExport {

@@ -20,6 +20,8 @@ def test_process_dependency_always_builds_datatap_transport(monkeypatch) -> None
     dependencies.get_mcp_transport.cache_clear()
     monkeypatch.setattr(dependencies, "get_settings", lambda: settings())
 
-    assert isinstance(dependencies.get_mcp_transport(), DataTapTransport)
+    transport = dependencies.get_mcp_transport()
+    assert isinstance(transport, DataTapTransport)
+    assert transport._read_timeout_seconds == 300.0
 
     dependencies.get_mcp_transport.cache_clear()

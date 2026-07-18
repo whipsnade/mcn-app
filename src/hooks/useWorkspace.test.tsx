@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Session } from '../types';
 import { createSession, deleteSession, getSession, listSessions, updateSession } from '../api/sessions';
-import { createTask, getCandidates, getReport, getTask, retryFollowups, retryTask } from '../api/tasks';
+import { createTask, getAnalysisReport, getCandidates, getReport, getTask, retryFollowups, retryTask } from '../api/tasks';
 import { initialTaskRuntime } from '../state/taskEvents';
 import { useTaskStream } from './useTaskStream';
 import { useWorkspace } from './useWorkspace';
@@ -78,6 +78,7 @@ vi.mock('../api/tasks', () => ({
   getTask: vi.fn(),
   getCandidates: vi.fn(),
   getReport: vi.fn(),
+  getAnalysisReport: vi.fn(),
   retryFollowups: vi.fn(),
   retryTask: vi.fn(),
 }));
@@ -1035,6 +1036,64 @@ describe('useWorkspace', () => {
     expect(createTask).not.toHaveBeenCalled();
     expect(result.current.activeSession?.analysis?.taskId).toBe('task-failed-followup');
     expect(result.current.activeSession?.analysis?.followupStatus).toBe('pending');
+  });
+
+  it('fetches the analysis report announced by report.updated for an agent task', async () => {
+    vi.mocked(getSession).mockResolvedValue({
+      ...restoredSession,
+      status: 'analyzing',
+      analysis: { taskId: 'task-1', status: 'running', kind: 'agent' },
+    });
+    vi.mocked(useTaskStream).mockReturnValue({
+      taskId: 'task-1', lastEventId: 1, assistantDraft: '', connection: 'connected',
+      status: 'running', visibleAnalysisReportId: 'analysis-report-1',
+    });
+    vi.mocked(getAnalysisReport).mockResolvedValue({
+      id: 'analysis-report-1', task_id: 'task-1', version: 1, title: '自由分析报告',
+      blocks: [], conclusion: null, status: 'completed', generated_at: '2026-07-15T10:00:00Z',
+    });
+    const { result } = renderHook(() => useWorkspace('user-a'));
+
+    await waitFor(() => expect(result.current.activeSession?.analysisReport?.id).toBe('analysis-report-1'));
+    expect(getAnalysisReport).toHaveBeenCalledWith('analysis-report-1');
+    expect(result.current.activeSession?.analysis?.analysisReportId).toBe('analysis-report-1');
+  });
+
+  it('ignores an analysis report response that belongs to another task', async () => {
+    vi.mocked(getSession).mockResolvedValue({
+      ...restoredSession,
+      status: 'analyzing',
+      analysis: { taskId: 'task-1', status: 'running', kind: 'agent' },
+    });
+    vi.mocked(useTaskStream).mockReturnValue({
+      taskId: 'task-1', lastEventId: 1, assistantDraft: '', connection: 'connected',
+      status: 'running', visibleAnalysisReportId: 'analysis-report-1',
+    });
+    vi.mocked(getAnalysisReport).mockResolvedValue({
+      id: 'analysis-report-1', task_id: 'task-other', version: 1, title: '自由分析报告',
+      blocks: [], conclusion: null, status: 'completed', generated_at: '2026-07-15T10:00:00Z',
+    });
+    const { result } = renderHook(() => useWorkspace('user-a'));
+
+    await waitFor(() => expect(getAnalysisReport).toHaveBeenCalledWith('analysis-report-1'));
+    expect(result.current.activeSession?.analysisReport).toBeUndefined();
+  });
+
+  it('restores the persisted analysis report for an agent session', async () => {
+    vi.mocked(getSession).mockResolvedValue({
+      ...restoredSession,
+      analysis: { taskId: 'task-1', status: 'completed', kind: 'agent', analysisReportId: 'analysis-report-1' },
+    });
+    vi.mocked(getAnalysisReport).mockResolvedValue({
+      id: 'analysis-report-1', task_id: 'task-1', version: 1, title: '自由分析报告',
+      blocks: [{ type: 'heading', text: '一、结论' }], conclusion: null, status: 'completed',
+      generated_at: '2026-07-15T10:00:00Z',
+    });
+    const { result } = renderHook(() => useWorkspace('user-a'));
+
+    await waitFor(() => expect(result.current.activeSession?.analysisReport?.id).toBe('analysis-report-1'));
+    expect(getAnalysisReport).toHaveBeenCalledWith('analysis-report-1');
+    expect(result.current.activeSession?.analysis?.kind).toBe('agent');
   });
 
   it('adds a persisted task error message once when the terminal event arrives', async () => {

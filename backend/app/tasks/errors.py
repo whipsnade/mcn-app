@@ -14,6 +14,13 @@ _PLATFORM_LABELS = {
 _ERROR_MESSAGES = {
     "upstream_error": "社媒数据服务暂时不可用，请稍后重试。",
     "upstream_tool_error": "社媒数据服务返回错误，请稍后重试。",
+    "connection_timeout": "社媒数据服务连接超时，请稍后重试。",
+    "connection_error": "社媒数据服务连接失败，请稍后重试。",
+    "upstream_timeout": "社媒数据服务处理超时，请稍后重试。",
+    "upstream_http_error": "社媒数据服务返回异常，请稍后重试。",
+    "protocol_error": "社媒数据服务协议异常，请稍后重试。",
+    "mcp_queue_timeout": "社媒数据服务当前繁忙，请稍后重试。",
+    "mcp_service_unavailable": "社媒数据服务暂时不可用，请稍后重试。",
     "output_validation_error": "社媒数据格式异常，暂时无法完成本轮分析。",
     "input_validation_error": "分析条件暂时无法提交，请检查筛选条件后重试。",
     "possibly_sent_timeout": "社媒数据服务响应超时，结果暂时无法确认。",

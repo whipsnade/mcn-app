@@ -12,10 +12,10 @@ def utc_now() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
 
 
-def default_session_title(brand: str, campaign_name: str | None, category: str) -> str:
+def default_session_title(brand: str, campaign_name: str | None, category: str | None) -> str:
     normalized_brand = brand.strip()
     normalized_campaign = campaign_name.strip() if campaign_name else ""
-    normalized_category = category.strip()
+    normalized_category = category.strip() if category else ""
     if normalized_brand and normalized_campaign:
         return f"{normalized_brand}-{normalized_campaign}"
     if normalized_brand:

@@ -1,16 +1,23 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Paperclip, Image, Send, Sparkles, MoreVertical, ShieldAlert, Cpu } from 'lucide-react';
+import { Send, Sparkles, ShieldAlert } from 'lucide-react';
 import { Session, Message } from '../types';
 import type { FollowupSuggestion } from '../api/contracts';
+import TaskFlowNodes from './TaskFlowNodes';
+import type { TaskFlowNode } from '../state/taskEvents';
 
 interface ChatAreaProps {
   session: Session;
   onSendMessage: (text: string) => Promise<unknown>;
   isAnalyzing: boolean;
   isMockMode: boolean;
-  taskActivity?: string;
-  taskPhaseLabel?: string;
-  taskProgress?: { current: number; total: number };
+  /** 当前任务的执行流程节点（竖状节点图）。 */
+  flowNodes?: TaskFlowNode[];
+  /** 任务是否已到终态（节点图自动收缩）。 */
+  flowTerminal?: boolean;
+  /** 终态摘要文案（如 分析完成 / 任务失败）。 */
+  flowTerminalLabel?: string;
+  /** AI 摘要的流式草稿，实时渲染在节点图下方。 */
+  assistantDraft?: string;
   onRetryMessage?: (messageId: string) => Promise<unknown>;
   followupStatus?: 'pending' | 'completed' | 'failed';
   followupSuggestions?: FollowupSuggestion[];
@@ -23,9 +30,10 @@ export default function ChatArea({
   onSendMessage,
   isAnalyzing,
   isMockMode,
-  taskActivity,
-  taskPhaseLabel,
-  taskProgress,
+  flowNodes = [],
+  flowTerminal = false,
+  flowTerminalLabel,
+  assistantDraft = '',
   onRetryMessage,
   followupStatus,
   followupSuggestions = [],
@@ -74,7 +82,7 @@ export default function ChatArea({
     : '待确认';
 
   return (
-    <div className="flex flex-1 flex-col bg-white border-r border-slate-200 h-full no-print">
+    <div className="flex min-h-0 flex-1 flex-col bg-white border-r border-slate-200 h-full no-print">
       
       {/* Chat Header */}
       <div className="flex h-14 items-center justify-between border-b border-slate-100 bg-white px-6 shrink-0">
@@ -89,7 +97,7 @@ export default function ChatArea({
           </div>
           <p className="mt-0.5 text-[10px] text-slate-400 flex items-center gap-1">
             <span className="h-1.5 w-1.5 rounded-full bg-indigo-500 animate-pulse" />
-            {taskPhaseLabel ?? (isAnalyzing ? '分析中' : '已完成')} • 渠道: {platformLabel} • 品类: {session.category} • 预算: {budgetLabel}
+            {isAnalyzing ? '分析中' : '已完成'} • 渠道: {platformLabel} • 品类: {session.category} • 预算: {budgetLabel}
           </p>
         </div>
 
@@ -104,7 +112,7 @@ export default function ChatArea({
       </div>
 
       {/* Messages Feed */}
-      <div className="flex-1 overflow-y-auto p-6 space-y-5 bg-white">
+      <div role="log" aria-label="会话消息" className="min-h-0 flex-1 overflow-y-auto p-6 space-y-5 bg-white">
         
         {/* System welcome event banner */}
         <div className="flex justify-center">
@@ -112,33 +120,6 @@ export default function ChatArea({
             AI 投流与 KOL 决策会话 {session.id} 已载入
           </div>
         </div>
-
-        {taskActivity && (
-          <div className="flex justify-center" role="status">
-            <div className="rounded-full border border-indigo-100 bg-indigo-50 px-3.5 py-1 text-[10px] font-medium text-indigo-500">
-              {taskActivity}
-            </div>
-          </div>
-        )}
-
-        {taskPhaseLabel && (
-          <div className="flex justify-center" role="status" aria-label="任务阶段">
-            <div className="w-full max-w-[85%] rounded-2xl border border-indigo-100 bg-indigo-50/60 px-4 py-3 text-[11px] text-indigo-600 shadow-sm">
-              <div className="flex items-center justify-between gap-3 font-semibold">
-                <span>当前阶段：{taskPhaseLabel}</span>
-                {taskProgress && <span>{taskProgress.current} / {taskProgress.total}</span>}
-              </div>
-              {taskProgress && (
-                <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-indigo-100">
-                  <div
-                    className="h-full rounded-full bg-indigo-500 transition-all duration-300"
-                    style={{ width: `${Math.min(100, Math.max(0, taskProgress.total ? taskProgress.current / taskProgress.total * 100 : 0))}%` }}
-                  />
-                </div>
-              )}
-            </div>
-          </div>
-        )}
 
         {session.messages.map((msg) => {
           const isAI = msg.sender === 'ai';
@@ -204,24 +185,43 @@ export default function ChatArea({
           );
         })}
 
-        {/* Gemini Analysing state */}
-        {isAnalyzing && (
-          <div className="flex items-start gap-3.5 mr-auto max-w-[80%]">
-            <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-slate-100 text-slate-400 animate-pulse border border-dashed border-indigo-300">
-              <Cpu className="h-4 w-4 animate-spin text-indigo-500" />
+        {/* 执行流程节点图 + AI 流式结果：终态后节点图自动收缩，只留最终回复 */}
+        {(isAnalyzing || flowNodes.length > 0 || assistantDraft) && (
+          <div className="flex items-start gap-3 mr-auto max-w-[85%]">
+            <div className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-full font-bold text-[10px] shadow-sm ${isAnalyzing ? 'bg-indigo-500 text-white animate-pulse' : 'bg-indigo-600 text-white'}`}>
+              AI
             </div>
-            <div className="space-y-1">
+            <div className="space-y-2 flex-1 min-w-0">
               <div className="flex items-center gap-2 text-[10px] text-slate-400">
-                <span className="font-semibold text-indigo-600 animate-pulse">AI 分析师正在重构BI大盘中...</span>
+                <span className="font-semibold text-slate-500">AI 分析师</span>
+                {isAnalyzing && <span className="text-indigo-500">分析中…</span>}
               </div>
-              <div className="rounded-2xl rounded-tl-none bg-white border border-slate-100 px-4 py-3.5 shadow-sm">
-                <div className="flex items-center gap-1.5">
-                  <span className="h-2 w-2 rounded-full bg-indigo-500 animate-bounce" />
-                  <span className="h-2 w-2 rounded-full bg-indigo-500 animate-bounce [animation-delay:0.2s]" />
-                  <span className="h-2 w-2 rounded-full bg-indigo-500 animate-bounce [animation-delay:0.4s]" />
-                  <span className="text-xs text-slate-400 font-medium ml-1">正在分析达人受众、匹配预算并编制图表数据...</span>
+              {flowNodes.length > 0 && (
+                <TaskFlowNodes
+                  nodes={flowNodes}
+                  terminal={flowTerminal}
+                  terminalLabel={flowTerminalLabel}
+                />
+              )}
+              {assistantDraft ? (
+                <div className="rounded-2xl rounded-tl-none bg-indigo-600 px-4 py-3 text-xs md:text-sm leading-relaxed text-white shadow-md">
+                  <div className="whitespace-pre-line font-normal">
+                    {assistantDraft}
+                    {isAnalyzing && <span className="ml-0.5 inline-block h-3.5 w-1.5 animate-pulse rounded-sm bg-white/70 align-middle" />}
+                  </div>
                 </div>
-              </div>
+              ) : (
+                isAnalyzing && (
+                  <div className="rounded-2xl rounded-tl-none bg-white border border-slate-100 px-4 py-3.5 shadow-sm">
+                    <div className="flex items-center gap-1.5" role="status">
+                      <span className="h-2 w-2 rounded-full bg-indigo-500 animate-bounce" />
+                      <span className="h-2 w-2 rounded-full bg-indigo-500 animate-bounce [animation-delay:0.2s]" />
+                      <span className="h-2 w-2 rounded-full bg-indigo-500 animate-bounce [animation-delay:0.4s]" />
+                      <span className="text-xs text-slate-400 font-medium ml-1">正在分析数据并编制图表...</span>
+                    </div>
+                  </div>
+                )
+              )}
             </div>
           </div>
         )}
@@ -230,7 +230,7 @@ export default function ChatArea({
       </div>
 
       {/* Input panel container */}
-      <div className="p-4 bg-white border-t border-slate-100 space-y-2.5">
+      <div className="shrink-0 p-4 bg-white border-t border-slate-100 space-y-2.5">
         
         {followupStatus && (
           <section aria-label="进一步分析建议" className="rounded-xl border border-indigo-100 bg-indigo-50/40 px-3 py-2.5">
@@ -284,7 +284,11 @@ export default function ChatArea({
           </section>
         )}
 
-        <form onSubmit={event => void handleSend(event)} className="bg-slate-50 rounded-xl p-1 flex items-center border border-slate-200 focus-within:ring-2 focus-within:ring-indigo-500/20 transition duration-150">
+        <form
+          aria-label="发送消息"
+          onSubmit={event => void handleSend(event)}
+          className="bg-slate-50 rounded-xl p-1 flex items-center border border-slate-200 focus-within:ring-2 focus-within:ring-indigo-500/20 transition duration-150"
+        >
           
           <textarea
             rows={1}

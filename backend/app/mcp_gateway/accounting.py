@@ -86,8 +86,10 @@ class McpAccounting:
         row.evidence_json = {"outcome": "failed"}
         if outcome.safe_diagnostic is not None:
             row.evidence_json["output_validation_diagnostic"] = outcome.safe_diagnostic
+        if outcome.error_message is not None:
+            row.evidence_json["upstream_error_message"] = outcome.error_message
         row.error_type = outcome.error_type or "upstream_error"
-        row.error_message = "MCP call failed"
+        row.error_message = outcome.error_message or "MCP call failed"
         await self._db.flush()
         return row
 

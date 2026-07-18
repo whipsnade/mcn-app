@@ -93,13 +93,16 @@ export interface Session {
   analysis?: SessionAnalysis;
   candidates?: KolCandidate[];
   biReport?: AnalysisBiReport;
+  analysisReport?: import('./api/contracts').ApiAnalysisReport;
 }
 
 export interface SessionAnalysis {
   taskId: string;
   status: string;
+  kind?: 'pipeline' | 'agent';
   candidateVersion?: number;
   reportId?: string;
+  analysisReportId?: string;
   followupStatus?: 'pending' | 'completed' | 'failed';
   followupSuggestions?: import('./api/contracts').FollowupSuggestion[];
   followupError?: Record<string, unknown>;

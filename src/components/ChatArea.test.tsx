@@ -70,22 +70,54 @@ describe('ChatArea', () => {
     expect(onSendMessage).not.toHaveBeenCalled();
   });
 
-  it('shows the reviewed task activity without exposing transport details', () => {
+  it('shows the flow nodes with failure detail without exposing transport details', () => {
     render(
       <ChatArea
         session={session}
         onSendMessage={vi.fn()}
         isAnalyzing
         isMockMode={false}
-        taskActivity="本次调用积分已结算"
+        flowNodes={[
+          { id: 'accepted', label: '任务已受理', status: 'succeeded' },
+          { id: 'tool-1', label: '查询小红书数据', status: 'failed', detail: '社媒数据服务返回错误，请稍后重试。' },
+        ]}
       />,
     );
 
-    expect(screen.getByText('本次调用积分已结算')).toBeVisible();
+    expect(screen.getByText('查询小红书数据')).toBeVisible();
+    expect(screen.getByText('社媒数据服务返回错误，请稍后重试。')).toBeVisible();
     expect(screen.queryByText('/api/v1/mcp')).not.toBeInTheDocument();
   });
 
-  it('shows the current backend phase and allows retrying a terminal user message', async () => {
+  it('collapses the flow nodes after the terminal event and keeps the final reply', async () => {
+    render(
+      <ChatArea
+        session={session}
+        onSendMessage={vi.fn()}
+        isAnalyzing={false}
+        isMockMode={false}
+        flowTerminal
+        flowTerminalLabel="分析完成"
+        assistantDraft="本轮共找到 3 位候选达人。"
+        flowNodes={[
+          { id: 'accepted', label: '任务已受理', status: 'succeeded' },
+          { id: 'tool-1', label: '查询小红书数据', status: 'failed', detail: '社媒数据服务返回错误，请稍后重试。' },
+          { id: 'terminal', label: '分析完成', status: 'succeeded' },
+        ]}
+      />,
+    );
+
+    // 终态后自动收缩：节点明细默认不可见，摘要行可见，最终回复保留。
+    expect(screen.queryByText('查询小红书数据')).not.toBeInTheDocument();
+    expect(screen.getByText('本轮共找到 3 位候选达人。')).toBeVisible();
+    const toggle = screen.getByRole('button', { name: /执行流程/ });
+    expect(toggle).toHaveTextContent('1 步失败');
+    fireEvent.click(toggle);
+    expect(await screen.findByText('查询小红书数据')).toBeVisible();
+    expect(screen.getByText('社媒数据服务返回错误，请稍后重试。')).toBeVisible();
+  });
+
+  it('allows retrying a terminal user message', async () => {
     const onRetryMessage = vi.fn().mockResolvedValue(undefined);
     render(
       <ChatArea
@@ -93,14 +125,10 @@ describe('ChatArea', () => {
         onSendMessage={vi.fn()}
         isAnalyzing={false}
         isMockMode={false}
-        taskPhaseLabel="社媒数据 MCP 查询"
-        taskProgress={{ current: 2, total: 3 }}
         onRetryMessage={onRetryMessage}
       />,
     );
 
-    expect(screen.getByRole('status', { name: '任务阶段' })).toHaveTextContent('社媒数据 MCP 查询');
-    expect(screen.getByText('2 / 3')).toBeVisible();
     await act(async () => {
       fireEvent.click(screen.getByRole('button', { name: '再次执行' }));
     });
@@ -126,6 +154,27 @@ describe('ChatArea', () => {
       fireEvent.click(screen.getByRole('button', { name: /分析地域/ }));
     });
     expect(onSendMessage).toHaveBeenCalledWith('请进一步分析粉丝地域分布');
+  });
+
+  it('keeps a long message history inside the fixed workspace column', () => {
+    const messages = Array.from({ length: 30 }, (_, index) => ({
+      id: `message-${index}`,
+      sender: index % 2 === 0 ? 'user' as const : 'ai' as const,
+      text: `第 ${index + 1} 轮分析结果：${'较长的分析内容。'.repeat(20)}`,
+      timestamp: '10:00',
+    }));
+    const { container } = render(
+      <ChatArea
+        session={{ ...session, messages }}
+        onSendMessage={vi.fn()}
+        isAnalyzing={false}
+        isMockMode={false}
+      />,
+    );
+
+    expect(container.firstElementChild).toHaveClass('min-h-0');
+    expect(screen.getByRole('log', { name: '会话消息' })).toHaveClass('min-h-0', 'overflow-y-auto');
+    expect(screen.getByRole('form', { name: '发送消息' }).parentElement).toHaveClass('shrink-0');
   });
 
   it('renders loading and retryable error states for follow-up suggestions', async () => {

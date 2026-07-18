@@ -111,6 +111,20 @@ class TaskRepository:
         await self.db.flush()
         return True
 
+    async def save_trajectory(
+        self, task_id: str, worker_id: str, trajectory_json: dict[str, Any]
+    ) -> bool:
+        """Persist the agent loop trajectory without re-emitting plan.ready."""
+        task = await self._locked(task_id)
+        if not self._owns_active_lease(task, worker_id):
+            return False
+        task.plan_json = trajectory_json
+        task.plan_version = "agent_trajectory_v1"
+        task.status = TaskStatus.RUNNING
+        task.updated_at = utc_now()
+        await self.db.flush()
+        return True
+
     async def save_replan(self, task_id: str, worker_id: str, replan_json: dict[str, Any]) -> bool:
         task = await self._locked(task_id)
         if not self._owns_active_lease(task, worker_id) or task.replan_count >= 1:

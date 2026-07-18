@@ -1,5 +1,6 @@
 from datetime import UTC, datetime
 from decimal import Decimal
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -111,6 +112,29 @@ def test_aggregate_analytics_never_invents_missing_values() -> None:
     assert result["audience"]["age"]["available"] is False
 
 
+def test_reporting_scope_uses_brand_evidence_added_by_replan() -> None:
+    service = ReportingService(None)
+    task = SimpleNamespace(
+        plan_json={
+            "analysis_scope": "kol",
+            "steps": [{"evidence_kind": "kol"}],
+        },
+        replan_json={"steps": [{"evidence_kind": "brand"}]},
+    )
+
+    assert service._analysis_scope(task) == "hybrid"
+
+
+def test_reporting_scope_keeps_legacy_brand_plan_compatible() -> None:
+    service = ReportingService(None)
+    task = SimpleNamespace(
+        plan_json={"analysis_scope": "brand", "steps": [{"evidence_kind": "brand"}]},
+        replan_json=None,
+    )
+
+    assert service._analysis_scope(task) == "brand"
+
+
 def test_aggregate_analytics_deduplicates_same_evidence_and_sorts_ties_stably() -> None:
     one = _record("douyin", "dy-1", {"exposure": 100, "hot_words": {"乙": 2, "甲": 2}})
     duplicate = _record("douyin", "dy-1", {"exposure": 100, "hot_words": {"乙": 2, "甲": 2}})
@@ -122,6 +146,19 @@ def test_aggregate_analytics_deduplicates_same_evidence_and_sorts_ties_stably() 
         {"term": "乙", "count": 2},
         {"term": "甲", "count": 2},
     ]
+
+
+@pytest.mark.asyncio
+async def test_empty_kol_bi_payload_is_an_explicit_real_data_state() -> None:
+    service = ReportingService(None)
+
+    chart_data, conclusion, evidence = await service._build_bi_payload([], 0)
+
+    assert chart_data["overview"]["candidate_count"] == 0
+    assert chart_data["analytics"] == empty_analytics()
+    assert chart_data["warnings"] == ["当前筛选条件下暂无真实 MCP 达人数据"]
+    assert "暂无符合条件的达人" in conclusion
+    assert evidence == {"candidate_version": 0, "source_call_ids": []}
 
 
 def test_exposure_trend_skips_multiple_dates_without_daily_exposure_pairs() -> None:

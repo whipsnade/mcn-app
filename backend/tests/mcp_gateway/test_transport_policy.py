@@ -13,7 +13,11 @@ from pydantic import SecretStr
 
 from app.mcp_gateway.contracts import DataTapService
 from app.mcp_gateway.datatap import DataTapTransport
+from app.mcp_gateway.service import McpCallService, PreparedMcpInvocation
 from app.mcp_gateway.transport import (
+    McpConnectionTimeout,
+    McpGatewayTimeout,
+    McpProtocolError,
     McpUpstreamError,
     PossiblySentTimeout,
     ServiceNotAllowedError,
@@ -62,6 +66,38 @@ class SdkReadTimeoutSession(FakeProtocolSession):
     async def call_tool(self, _name, _arguments):
         type(self).call_count += 1
         raise McpError(ErrorData(code=408, message="SDK read timeout"))
+
+
+class ExitReadTimeoutOpener:
+    def __init__(self, service):
+        self.service = service
+
+    async def __aenter__(self):
+        return self.service, object(), lambda: "session-1"
+
+    async def __aexit__(self, *_args):
+        raise httpx.ReadTimeout("stream cleanup read timeout")
+
+
+class ConnectTimeoutOpener:
+    async def __aenter__(self):
+        raise httpx.ConnectTimeout("connect timeout")
+
+    async def __aexit__(self, *_args):
+        return None
+
+
+class GatewayTimeoutOpener:
+    def __init__(self, service):
+        self.service = service
+
+    async def __aenter__(self):
+        return self.service, object(), lambda: "session-1"
+
+    async def __aexit__(self, *_args):
+        request = httpx.Request("POST", "https://datatap.example/mcp")
+        response = httpx.Response(504, request=request)
+        raise httpx.HTTPStatusError("gateway timeout", request=request, response=response)
 
 
 @pytest.mark.parametrize(
@@ -115,9 +151,11 @@ async def test_all_five_services_use_fixed_https_endpoint_and_bearer_auth() -> N
         assert request.headers["authorization"] == "Bearer unit-test-token"
         assert client.follow_redirects is False
         assert client.timeout.connect is not None
-        assert client.timeout.read is not None
+        assert client.timeout.read == 300.0
         assert client.timeout.write is not None
         assert client.timeout.pool is not None
+
+    assert transport._queue_timeout_seconds == 300.0
 
 
 async def test_redirect_response_is_not_followed() -> None:
@@ -181,6 +219,86 @@ async def test_sdk_mcp_408_after_call_tool_entry_is_possibly_sent_without_retry(
         await transport.call_tool(DataTapService.BILIBILI, "search", {"keyword": "美妆"})
 
     assert SdkReadTimeoutSession.call_count == 1
+
+
+async def test_read_timeout_during_stream_cleanup_is_possibly_sent_without_retry() -> None:
+    def opener(url: str, **_kwargs):
+        service = next(item for item in DataTapService if item.value in url)
+        return ExitReadTimeoutOpener(service)
+
+    transport = DataTapTransport(
+        token=SecretStr("unit-test-token"),
+        session_opener=opener,
+        session_factory=FakeProtocolSession,
+    )
+
+    with pytest.raises(PossiblySentTimeout):
+        await transport.call_tool(DataTapService.BILIBILI, "search", {"keyword": "美妆"})
+
+
+async def test_connect_timeout_is_classified_before_request_is_sent() -> None:
+    transport = DataTapTransport(
+        token=SecretStr("unit-test-token"),
+        session_opener=lambda *_args, **_kwargs: ConnectTimeoutOpener(),
+    )
+
+    with pytest.raises(McpConnectionTimeout):
+        await transport.list_tools(DataTapService.BILIBILI)
+
+
+async def test_gateway_504_is_classified_as_upstream_timeout() -> None:
+    def opener(url: str, **_kwargs):
+        service = next(item for item in DataTapService if item.value in url)
+        return GatewayTimeoutOpener(service)
+
+    transport = DataTapTransport(
+        token=SecretStr("unit-test-token"),
+        session_opener=opener,
+        session_factory=FakeProtocolSession,
+    )
+
+    with pytest.raises(McpGatewayTimeout):
+        await transport.call_tool(DataTapService.BILIBILI, "search", {"keyword": "美妆"})
+
+
+@pytest.mark.parametrize(
+    ("exception", "error_type", "status"),
+    [
+        (McpConnectionTimeout("timeout"), "connection_timeout", "failed"),
+        (McpGatewayTimeout("gateway timeout"), "upstream_timeout", "failed"),
+        (McpProtocolError("protocol"), "protocol_error", "failed"),
+    ],
+)
+async def test_service_preserves_fine_grained_transport_error(
+    exception, error_type: str, status: str
+) -> None:
+    class FailingTransport:
+        def protocol_session_digest(self, _service):
+            return None
+
+        async def list_tools(self, _service):
+            return ()
+
+        async def call_tool(self, *_args, **_kwargs):
+            raise exception
+
+    service = McpCallService(
+        None,  # invoke_prepared does not access the database
+        FailingTransport(),
+        arguments_loader=object(),
+    )
+    outcome = await service.invoke_prepared(
+        PreparedMcpInvocation(
+            DataTapService.BILIBILI,
+            "search",
+            {"keyword": "美妆"},
+            {"type": "object"},
+            None,
+        )
+    )
+
+    assert outcome.status == status
+    assert outcome.error_type == error_type
 
 
 def test_protocol_session_digest_is_scoped_and_contains_no_raw_identifiers() -> None:

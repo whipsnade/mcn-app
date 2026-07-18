@@ -30,7 +30,9 @@ class WorkspaceSession(Base):
     campaign_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
     status: Mapped[str] = mapped_column(String(24), nullable=False, default="draft")
     platforms: Mapped[list[str]] = mapped_column(JSON, nullable=False)
-    category: Mapped[str] = mapped_column(String(100), nullable=False)
+    # Nullable since migration 0016: free-form agent conversations may have
+    # no category at all.
+    category: Mapped[str | None] = mapped_column(String(100), nullable=True)
     target_audience: Mapped[str] = mapped_column(String(500), nullable=False)
     budget_min: Mapped[Decimal | None] = mapped_column(Numeric(12, 2))
     budget_max: Mapped[Decimal | None] = mapped_column(Numeric(12, 2))

@@ -16,6 +16,7 @@ class PlanValidationError(ValueError):
 
 AnalysisScope = Literal["brand", "kol", "hybrid"]
 EvidenceKind = Literal["brand", "kol"]
+AnalysisIntent = Literal["brand", "kol", "hybrid"]
 
 
 class ToolPlanStep(BaseModel):
@@ -35,10 +36,23 @@ class ToolPlan(BaseModel):
 
     objective: str = Field(min_length=1, max_length=1000)
     steps: tuple[ToolPlanStep, ...] = Field(min_length=1, max_length=10)
+    # These fields explain the model's decision.  The executor never trusts
+    # analysis_scope from the model; it derives scope from the validated steps.
+    primary_intent: AnalysisIntent = "kol"
+    objectives: tuple[str, ...] = Field(default_factory=tuple, max_length=12)
     stop_conditions: tuple[str, ...] = Field(default_factory=tuple, max_length=10)
-    # Persist the router decision with the task so reporting never has to
-    # infer a brand/KOL scope from MCP output after execution.
+    # Persist the server-derived scope for backwards-compatible task recovery.
     analysis_scope: AnalysisScope = "kol"
+
+
+def derive_analysis_scope(plan: ToolPlan) -> AnalysisScope:
+    """Derive scope from evidence kinds, never from model text alone."""
+    evidence_kinds = {step.evidence_kind for step in plan.steps}
+    if evidence_kinds == {"brand"}:
+        return "brand"
+    if "brand" in evidence_kinds and "kol" in evidence_kinds:
+        return "hybrid"
+    return "kol"
 
 
 class ReplanFailure(BaseModel):
@@ -58,6 +72,7 @@ class ReplanContext(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     completed_step_ids: tuple[str, ...] = Field(default_factory=tuple, max_length=10)
+    completed_evidence_kinds: tuple[EvidenceKind, ...] = Field(default_factory=tuple, max_length=2)
     failed_steps: tuple[ReplanFailure, ...] = Field(min_length=1, max_length=10)
     remaining_calls: int = Field(ge=0, le=10)
     remaining_points: int = Field(ge=0)
@@ -107,6 +122,7 @@ class PlannerTool(BaseModel):
     service: DataTapService
     description: str = Field(default="已审核工具", min_length=1, max_length=500)
     input_schema: dict[str, Any]
+    output_schema: dict[str, Any] = Field(default_factory=dict)
 
     @classmethod
     def from_approved(cls, item: Any) -> "PlannerTool":
@@ -116,6 +132,7 @@ class PlannerTool(BaseModel):
             service=item.service,
             description=getattr(item, "reviewed_description", item.internal_name),
             input_schema=item.input_schema,
+            output_schema=getattr(item, "output_schema", {}),
         )
 
 
@@ -147,6 +164,6 @@ class PlannerContext(BaseModel):
     allowed_channels: tuple[str, ...]
     export_contract: ExportFieldContract
     analytics_contract: AnalyticsFieldContract
-    analysis_scope: AnalysisScope = "kol"
+    analysis_scope: AnalysisScope | None = None
     analysis_objectives: tuple[str, ...] = Field(default_factory=tuple, max_length=12)
     requested_period: dict[str, Any] = Field(default_factory=dict)

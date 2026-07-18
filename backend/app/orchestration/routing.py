@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 import re
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -33,6 +33,40 @@ _KOL_TERMS = (
     "账号",
 )
 _BRAND_ONLY_TERMS = ("仅分析品牌", "只分析品牌", "仅品牌维度", "不需要达人", "不找达人")
+
+TaskKind = Literal["pipeline", "agent"]
+
+# Intent terms that route a task to the fixed KOL pipeline (Top10 candidates,
+# versioned BI report, xlsx export). Anything else goes to the iterative
+# agent loop producing a free-form analysis report.
+_KOL_INTENT_TERMS = (
+    "达人",
+    "kol",
+    "网红",
+    "博主",
+    "候选",
+    "带货",
+    "种草",
+    "up主",
+    "主播",
+    "投放",
+    "选人",
+)
+
+
+def classify_task_kind(text: str, *, category: str | None) -> TaskKind:
+    """Route a user request to an execution mode.
+
+    Deterministic by design: only explicit KOL intent on a categorized
+    session uses the fixed pipeline; free-form questions (industry, brand,
+    trend analysis, or sessions without a category) run the agent loop.
+    """
+    if not category:
+        return "agent"
+    content = text.casefold()
+    if any(term.casefold() in content for term in _KOL_INTENT_TERMS):
+        return "pipeline"
+    return "agent"
 _PERIOD_PATTERN = re.compile(r"(?:最近|近)(?P<value>\d+)\s*(?P<unit>天|日|个月|月|季度|年)")
 
 
@@ -47,7 +81,8 @@ class AnalysisRouting(BaseModel):
 def _period_from_text(text: str) -> dict[str, Any]:
     match = _PERIOD_PATTERN.search(text)
     if match is None:
-        value, unit = 30, "day"
+        # 未明确时间范围时默认最近三个月。
+        value, unit = 3, "month"
     else:
         value = int(match.group("value"))
         raw_unit = match.group("unit")
@@ -64,6 +99,11 @@ def _period_from_text(text: str) -> dict[str, Any]:
         "start": start.isoformat(),
         "end": end.isoformat(),
     }
+
+
+def extract_requested_period(text: str) -> dict[str, Any]:
+    """Normalize only the requested time window; never classify the task scope."""
+    return _period_from_text(text)
 
 
 def classify_analysis_request(text: str, brief: SessionBrief) -> AnalysisRouting:
@@ -106,4 +146,10 @@ def classify_analysis_request(text: str, brief: SessionBrief) -> AnalysisRouting
     )
 
 
-__all__ = ["AnalysisRouting", "classify_analysis_request"]
+__all__ = [
+    "AnalysisRouting",
+    "TaskKind",
+    "classify_analysis_request",
+    "classify_task_kind",
+    "extract_requested_period",
+]

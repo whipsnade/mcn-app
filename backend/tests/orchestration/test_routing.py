@@ -1,8 +1,6 @@
 from decimal import Decimal
 
-import pytest
-
-from app.orchestration.routing import classify_analysis_request
+from app.orchestration.routing import classify_analysis_request, classify_task_kind
 from app.orchestration.schemas import SessionBrief, ToolPlanStep
 
 
@@ -62,3 +60,20 @@ def test_legacy_tool_plan_step_defaults_to_kol_evidence() -> None:
     )
 
     assert step.evidence_kind == "kol"
+
+
+def test_kol_intent_on_categorized_session_routes_to_pipeline() -> None:
+    assert classify_task_kind("帮我找最近30天活跃的美妆达人", category="美妆") == "pipeline"
+    assert classify_task_kind("推荐几位小红书博主做种草投放", category="美妆") == "pipeline"
+
+
+def test_open_analysis_question_routes_to_agent() -> None:
+    assert (
+        classify_task_kind("分析美妆行业在社交媒体的讨论热度和发展趋势", category="美妆")
+        == "agent"
+    )
+
+
+def test_session_without_category_always_routes_to_agent() -> None:
+    assert classify_task_kind("帮我找美妆达人", category=None) == "agent"
+    assert classify_task_kind("帮我找美妆达人", category="") == "agent"

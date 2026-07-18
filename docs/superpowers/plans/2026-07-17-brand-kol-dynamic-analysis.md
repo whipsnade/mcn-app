@@ -1,5 +1,9 @@
 # 品牌与 KOL 动态分析 Implementation Plan
 
+> 本文的早期任务清单已由模型主导联合分析方案修订：新任务必须至少包含 KOL
+> 证据，品牌指标问题使用 `hybrid`；请以
+> `docs/superpowers/specs/2026-07-17-model-led-mcp-planning-design.md` 和当前代码为准。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 让品牌、KOL 和联合问题根据用户输入选择真实 DataTap MCP 工具，并生成不依赖候选清单的品牌 BI 或联合 BI。

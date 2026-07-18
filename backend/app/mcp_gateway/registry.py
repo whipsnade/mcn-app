@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -82,6 +83,33 @@ _DATATAP_RESULT_SCHEMA: dict[str, Any] = {
     "properties": {"result": {"type": "string"}},
     "required": ["result"],
 }
+
+
+def close_input_schema(schema: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a safe copy of a provider schema with closed object nodes.
+
+    DataTap's live discovery schemas are not guaranteed to include
+    ``additionalProperties: false`` on every nested object.  The execution
+    gateway deliberately rejects open object schemas so that model-generated
+    arguments cannot contain undeclared fields.  Normalize the discovered
+    schema at the registry boundary while keeping the original discovery
+    payload/digest intact for change detection and quarantine decisions.
+    """
+
+    def visit(value: Any) -> Any:
+        if isinstance(value, dict):
+            result = {key: visit(item) for key, item in value.items()}
+            if result.get("type") == "object" or "properties" in result:
+                result["additionalProperties"] = False
+            return result
+        if isinstance(value, list):
+            return [visit(item) for item in value]
+        return value
+
+    normalized = visit(deepcopy(dict(schema)))
+    if not isinstance(normalized, dict):  # pragma: no cover - mapping input
+        raise TypeError("schema must be an object")
+    return normalized
 
 
 def discovery_digest(tool: DiscoveredTool) -> str:
@@ -229,7 +257,7 @@ class ToolRegistryService:
                 internal_name=internal_name,
                 service=service,
                 remote_name=remote_name,
-                input_schema=row.input_schema_json,
+                input_schema=close_input_schema(row.input_schema_json),
                 output_schema=_DATATAP_RESULT_SCHEMA,
             )
         row = await self._row_by_internal(internal_name)
@@ -268,7 +296,7 @@ class ToolRegistryService:
                             internal_name=row.internal_tool_name,
                             service=dynamic[0],
                             remote_name=dynamic[1],
-                            input_schema=row.input_schema_json,
+                            input_schema=close_input_schema(row.input_schema_json),
                             output_schema=_DATATAP_RESULT_SCHEMA,
                         )
                     )
@@ -369,7 +397,7 @@ class ToolRegistryService:
             internal_name=row.internal_tool_name,
             service=entry.service,
             remote_name=entry.remote_name,
-            input_schema=entry.input_schema,
+            input_schema=close_input_schema(entry.input_schema),
             output_schema=entry.output_schema,
         )
 

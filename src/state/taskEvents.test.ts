@@ -48,6 +48,18 @@ describe('task event reducer', () => {
     expect(ready.visibleReportId).toBe('report-2');
   });
 
+  it('exposes a brand BI report when the candidate version is zero and no candidates event exists', () => {
+    const state = reduceTaskEvent(initialTaskRuntime('task-brand'), {
+      id: 1,
+      taskId: 'task-brand',
+      type: 'bi.updated',
+      payload: { reportId: 'report-empty', candidateVersion: 0, analysis_scope: 'hybrid' },
+    });
+
+    expect(state.candidateVersion).toBe(0);
+    expect(state.visibleReportId).toBe('report-empty');
+  });
+
   it('ignores a late event from a previously selected task', () => {
     const state = reduceTaskEvent(initialTaskRuntime('task-current'), {
       id: 9,
@@ -154,6 +166,50 @@ describe('task event reducer', () => {
     expect(duplicate.errorMessage).toBe(state.errorMessage);
   });
 
+  it('exposes an agent analysis report without candidate version matching', () => {
+    const state = reduceTaskEvent(initialTaskRuntime('task-agent'), {
+      id: 1,
+      taskId: 'task-agent',
+      type: 'report.updated',
+      payload: { report_id: 'analysis-report-1', phase: 'ai_summary', label: '分析报告已生成' },
+    });
+
+    expect(state.visibleAnalysisReportId).toBe('analysis-report-1');
+    expect(state.phase).toBe('ai_summary');
+    expect(state.phaseLabel).toBe('分析报告已生成');
+    expect(state.candidateVersion).toBeUndefined();
+    expect(state.visibleReportId).toBeUndefined();
+  });
+
+  it('accepts the camelCase report id on report.updated', () => {
+    const state = reduceTaskEvent(initialTaskRuntime('task-agent'), {
+      id: 1,
+      taskId: 'task-agent',
+      type: 'report.updated',
+      payload: { reportId: 'analysis-report-2' },
+    });
+
+    expect(state.visibleAnalysisReportId).toBe('analysis-report-2');
+  });
+
+  it('clears the visible analysis report when a new task starts', () => {
+    const withReport = reduceTaskEvent(initialTaskRuntime('task-agent'), {
+      id: 1,
+      taskId: 'task-agent',
+      type: 'report.updated',
+      payload: { report_id: 'analysis-report-1' },
+    });
+    const restarted = reduceTaskEvent(withReport, {
+      id: 2,
+      taskId: 'task-agent',
+      type: 'task.pending',
+      payload: { status: 'pending' },
+    });
+
+    expect(withReport.visibleAnalysisReportId).toBe('analysis-report-1');
+    expect(restarted.visibleAnalysisReportId).toBeUndefined();
+  });
+
   it('tracks follow-up suggestion lifecycle without exposing event internals', () => {
     const pending = reduceTaskEvent(initialTaskRuntime('task-1'), {
       id: 1,
@@ -191,5 +247,46 @@ describe('task event reducer', () => {
     });
     expect(failed.followupStatus).toBe('failed');
     expect(failed.followupError).toBe('进一步分析建议暂时生成失败，请稍后重试。');
+  });
+});
+
+describe('task flow nodes', () => {
+  it('builds a live node list from the task lifecycle and resets per task', () => {
+    let state = initialTaskRuntime('task-1');
+    state = reduceTaskEvent(state, { id: 1, taskId: 'task-1', type: 'task.pending', payload: { status: 'pending' } });
+    state = reduceTaskEvent(state, { id: 2, taskId: 'task-1', type: 'plan.ready', payload: {} });
+    state = reduceTaskEvent(state, { id: 3, taskId: 'task-1', type: 'tool.started', payload: { platform: '小红书', step_index: 1, step_total: 10 } });
+    state = reduceTaskEvent(state, { id: 4, taskId: 'task-1', type: 'tool.failed', payload: { platform: '小红书', step_index: 1, message: '社媒数据服务返回错误，请稍后重试。' } });
+    state = reduceTaskEvent(state, { id: 5, taskId: 'task-1', type: 'report.updated', payload: { report_id: 'r-1' } });
+    state = reduceTaskEvent(state, { id: 6, taskId: 'task-1', type: 'task.completed', payload: {} });
+
+    expect(state.nodes?.map(node => [node.label, node.status])).toEqual([
+      ['任务已受理', 'succeeded'],
+      ['分析规划完成', 'succeeded'],
+      ['查询小红书数据', 'failed'],
+      ['分析报告已生成', 'succeeded'],
+      ['分析完成', 'succeeded'],
+    ]);
+    expect(state.nodes?.[2].detail).toBe('社媒数据服务返回错误，请稍后重试。');
+
+    // 新任务（新的 runtime）从空节点重新开始。
+    const next = reduceTaskEvent(initialTaskRuntime('task-2'), { id: 1, taskId: 'task-2', type: 'task.pending', payload: {} });
+    expect(next.nodes).toHaveLength(1);
+  });
+
+  it('matches batch-restarted step indexes to the latest running tool node', () => {
+    let state = initialTaskRuntime('task-1');
+    state = reduceTaskEvent(state, { id: 1, taskId: 'task-1', type: 'tool.started', payload: { platform: '小红书', step_index: 1 } });
+    state = reduceTaskEvent(state, { id: 2, taskId: 'task-1', type: 'tool.succeeded', payload: { platform: '小红书', step_index: 1 } });
+    // 第二批 step_index 又从 1 开始。
+    state = reduceTaskEvent(state, { id: 3, taskId: 'task-1', type: 'tool.started', payload: { platform: '抖音', step_index: 1 } });
+    state = reduceTaskEvent(state, { id: 4, taskId: 'task-1', type: 'tool.unknown', payload: { platform: '抖音', step_index: 1, message: '响应未确认' } });
+
+    const tools = state.nodes?.filter(node => node.id.startsWith('tool-'));
+    expect(tools?.map(node => [node.label, node.status])).toEqual([
+      ['查询小红书数据', 'succeeded'],
+      ['查询抖音数据', 'unknown'],
+    ]);
+    expect(tools?.[1].detail).toBe('响应未确认');
   });
 });

@@ -16,12 +16,12 @@ import app.db.models  # noqa: F401
 from app.db.session import engine
 
 
-def test_migration_chain_has_single_task_idempotency_head() -> None:
+def test_migration_chain_has_single_head() -> None:
     backend_dir = Path(__file__).resolve().parents[1]
     config = Config(str(backend_dir / "alembic.ini"))
     config.set_main_option("script_location", str(backend_dir / "migrations"))
     heads = ScriptDirectory.from_config(config).get_heads()
-    assert heads == ["0013_task_create_idempotency"]
+    assert heads == ["0016_session_category_nullable"]
 
 
 async def test_phase_two_unique_constraints() -> None:

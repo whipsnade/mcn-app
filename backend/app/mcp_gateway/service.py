@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import asyncio
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -19,9 +20,16 @@ from app.mcp_gateway.registry import ToolNotEnabledError, ToolRegistryService
 from app.mcp_gateway.transport import (
     JsonValue,
     LogicalCallConflictError,
+    McpCircuitOpen,
+    McpConnectionError,
+    McpConnectionTimeout,
+    McpGatewayTimeout,
     McpTransport,
+    McpProtocolError,
+    McpQueueTimeout,
     PossiblySentTimeout,
     RemoteToolResult,
+    McpUpstreamHttpError,
     ToolInvocationOutcome,
 )
 from app.mcp_gateway.validation import (
@@ -31,6 +39,42 @@ from app.mcp_gateway.validation import (
     validate_output,
 )
 from app.tasks.models import AnalysisTask
+
+
+logger = logging.getLogger(__name__)
+
+
+_UNSAFE_TEXT_MARKERS = ("http://", "https://", "bearer", "token", "api_key", "apikey")
+
+
+def safe_upstream_text(text: str | None, *, limit: int = 300) -> str | None:
+    """上游业务错误文本的脱敏与截断：剔除疑似 URL/凭证内容后再回喂模型。"""
+    if not text:
+        return None
+    normalized = " ".join(text.split())
+    if not normalized:
+        return None
+    lowered = normalized.casefold()
+    if any(marker in lowered for marker in _UNSAFE_TEXT_MARKERS):
+        return None
+    return normalized[:limit]
+
+
+def log_mcp_call_failure(row: McpCall) -> None:
+    """Write one safe server log entry for every non-successful MCP call."""
+    if row.status not in {
+        McpCallStatus.FAILED.value,
+        McpCallStatus.UNKNOWN.value,
+        McpCallStatus.RELEASED.value,
+    }:
+        return
+    logger.warning(
+        "mcp call failed task_id=%s plan_step_id=%s status=%s error_type=%s",
+        row.task_id,
+        row.plan_step_id,
+        row.status,
+        row.error_type or "mcp_unknown_outcome",
+    )
 
 
 class McpArgumentsLoader(Protocol):
@@ -216,17 +260,39 @@ class McpCallService:
             )
         except PossiblySentTimeout:
             return await self._finish_unknown(row)
+        except McpConnectionTimeout:
+            return await self._finish_failed(row, "connection_timeout")
+        except McpConnectionError:
+            return await self._finish_failed(row, "connection_error")
+        except McpGatewayTimeout:
+            return await self._finish_failed(row, "upstream_timeout")
+        except McpUpstreamHttpError:
+            return await self._finish_failed(row, "upstream_http_error")
+        except McpQueueTimeout:
+            return await self._finish_failed(row, "mcp_queue_timeout")
+        except McpCircuitOpen:
+            return await self._finish_failed(row, "mcp_service_unavailable")
+        except McpProtocolError:
+            return await self._finish_failed(row, "protocol_error")
         except Exception:
             return await self._finish_failed(row, "upstream_error")
 
         if result.is_error:
             row.upstream_request_id = result.upstream_request_id
-            return await self._finish_failed(row, "upstream_tool_error")
-        try:
-            validated_output = validate_output(result.structured_content, approved.output_schema)
-        except McpValidationError:
-            row.upstream_request_id = result.upstream_request_id
-            return await self._finish_failed(row, "output_validation_error")
+            return await self._finish_failed(
+                row, "upstream_tool_error", upstream_message=result.error_text
+            )
+        # DataTap 对“查询成功但无数据”返回 is_error=False + null content（上游
+        # 同样按成功计费）。这不是格式错误：按空结果结算，避免模型对确定性
+        # 空响应反复重试而烧光调用预算。
+        if result.structured_content is None:
+            validated_output = None
+        else:
+            try:
+                validated_output = validate_output(result.structured_content, approved.output_schema)
+            except McpValidationError:
+                row.upstream_request_id = result.upstream_request_id
+                return await self._finish_failed(row, "output_validation_error")
 
         row.status = McpCallStatus.SUCCEEDED.value
         row.upstream_request_id = result.upstream_request_id
@@ -314,23 +380,46 @@ class McpCallService:
             )
         except PossiblySentTimeout:
             return ToolInvocationOutcome("unknown", None, None, None, "possibly_sent_timeout")
+        except McpConnectionTimeout:
+            return ToolInvocationOutcome("failed", None, None, None, "connection_timeout")
+        except McpConnectionError:
+            return ToolInvocationOutcome("failed", None, None, None, "connection_error")
+        except McpGatewayTimeout:
+            return ToolInvocationOutcome("failed", None, None, None, "upstream_timeout")
+        except McpUpstreamHttpError:
+            return ToolInvocationOutcome("failed", None, None, None, "upstream_http_error")
+        except McpQueueTimeout:
+            return ToolInvocationOutcome("failed", None, None, None, "mcp_queue_timeout")
+        except McpCircuitOpen:
+            return ToolInvocationOutcome("failed", None, None, None, "mcp_service_unavailable")
+        except McpProtocolError:
+            return ToolInvocationOutcome("failed", None, None, None, "protocol_error")
         except Exception:
             return ToolInvocationOutcome("failed", None, None, None, "upstream_error")
         if result.is_error:
-            return ToolInvocationOutcome(
-                "failed", None, None, result.upstream_request_id, "upstream_tool_error"
-            )
-        try:
-            output = validate_output(result.structured_content, invocation.output_schema)
-        except McpValidationError as error:
             return ToolInvocationOutcome(
                 "failed",
                 None,
                 None,
                 result.upstream_request_id,
-                "output_validation_error",
-                error.diagnostic,
+                "upstream_tool_error",
+                error_message=safe_upstream_text(result.error_text),
             )
+        # 与 invoke 路径一致：is_error=False 的 null content 是合法空结果。
+        if result.structured_content is None:
+            output = None
+        else:
+            try:
+                output = validate_output(result.structured_content, invocation.output_schema)
+            except McpValidationError as error:
+                return ToolInvocationOutcome(
+                    "failed",
+                    None,
+                    None,
+                    result.upstream_request_id,
+                    "output_validation_error",
+                    error.diagnostic,
+                )
         return ToolInvocationOutcome(
             "succeeded",
             output,
@@ -347,16 +436,23 @@ class McpCallService:
         row.completed_at = datetime.now(UTC).replace(tzinfo=None)
         row.updated_at = row.completed_at
         await self._db.commit()
+        log_mcp_call_failure(row)
         return row
 
-    async def _finish_failed(self, row: McpCall, error_type: str) -> McpCall:
+    async def _finish_failed(
+        self, row: McpCall, error_type: str, *, upstream_message: str | None = None
+    ) -> McpCall:
+        safe_message = safe_upstream_text(upstream_message)
         row.status = McpCallStatus.FAILED.value
         row.evidence_json = {"outcome": "failed"}
+        if safe_message is not None:
+            row.evidence_json["upstream_error_message"] = safe_message
         row.error_type = error_type
-        row.error_message = "MCP call failed"
+        row.error_message = safe_message or "MCP call failed"
         row.completed_at = datetime.now(UTC).replace(tzinfo=None)
         row.updated_at = row.completed_at
         await self._db.commit()
+        log_mcp_call_failure(row)
         return row
 
     async def _by_logical_id(
@@ -494,6 +590,8 @@ class McpGatewayService:
                 continue
             async with self._transaction():
                 finalized[row.id] = await self._accounting.settle_success(current)
+        for row in rows:
+            log_mcp_call_failure(finalized.get(row.id, row))
         return tuple(finalized[row.id] for row in rows)
 
     def _transaction(self):

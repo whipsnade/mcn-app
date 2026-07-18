@@ -13,8 +13,18 @@ from app.db.session import get_db
 from app.identity.dependencies import CurrentUser
 from app.reporting.exporter import CONTENT_TYPE, export_latest_task_xlsx
 from app.reporting.analytics import empty_analytics
-from app.reporting.models import BiReport, Kol, KolSnapshot, TaskCandidate, UserKolFavorite
+from app.reporting.analysis_reports import AnalysisReportService
+from app.reporting.models import (
+    AnalysisReport,
+    BiReport,
+    Kol,
+    KolSnapshot,
+    TaskCandidate,
+    UserKolFavorite,
+)
 from app.reporting.schemas import (
+    AnalysisReportRead,
+    AnalysisReportSummary,
     BiReportRead,
     BiReportSummary,
     CandidatePage,
@@ -92,6 +102,30 @@ def bi_report_summary(report: BiReport) -> BiReportSummary:
         candidate_version=report.candidate_version,
         status=report.status,
         generated_at=report.completed_at or report.created_at,
+    )
+
+
+def analysis_report_read(report: AnalysisReport) -> AnalysisReportRead:
+    return AnalysisReportRead(
+        id=report.id,
+        task_id=report.task_id,
+        version=report.version,
+        title=report.title,
+        blocks=list(report.blocks_json),
+        conclusion=report.conclusion_text,
+        status=report.status,
+        generated_at=report.created_at,
+    )
+
+
+def analysis_report_summary(report: AnalysisReport) -> AnalysisReportSummary:
+    return AnalysisReportSummary(
+        id=report.id,
+        task_id=report.task_id,
+        version=report.version,
+        title=report.title,
+        status=report.status,
+        generated_at=report.created_at,
     )
 
 
@@ -189,6 +223,19 @@ async def get_report(
     except LookupError as error:
         raise not_found("report_not_found") from error
     return bi_report_read(report)
+
+
+@router.get("/analysis-reports/{report_id}", response_model=AnalysisReportRead)
+async def get_analysis_report(
+    report_id: str,
+    user: CurrentUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> AnalysisReportRead:
+    try:
+        report = await AnalysisReportService(db).get_owned_report(user.id, report_id)
+    except LookupError as error:
+        raise not_found("report_not_found") from error
+    return analysis_report_read(report)
 
 
 @router.get("/favorites", response_model=list[FavoriteRead])

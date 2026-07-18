@@ -7,7 +7,7 @@ import {
   listSessions,
   updateSession as updateSessionRequest,
 } from '../api/sessions';
-import { createTask, getCandidates, getReport, getTask, retryFollowups as retryFollowupsRequest, retryTask } from '../api/tasks';
+import { createTask, getAnalysisReport, getCandidates, getReport, getTask, retryFollowups as retryFollowupsRequest, retryTask } from '../api/tasks';
 import type { CreateSessionInput } from '../api/contracts';
 import { useTaskStream } from './useTaskStream';
 import { isTerminalTaskStatus } from '../state/taskEvents';
@@ -73,9 +73,10 @@ export function useWorkspace(userId?: string) {
       || generationRef.current !== generation
       || !sessionOperationIsCurrent(session.id, operationEpoch)
     ) return session;
-    const [candidateResponse, reportResponse] = await Promise.all([
+    const [candidateResponse, reportResponse, analysisReportResponse] = await Promise.all([
       analysis.candidateVersion === undefined ? Promise.resolve(undefined) : getCandidates(analysis.taskId),
       analysis.reportId === undefined ? Promise.resolve(undefined) : getReport(analysis.reportId),
+      analysis.analysisReportId === undefined ? Promise.resolve(undefined) : getAnalysisReport(analysis.analysisReportId),
     ]);
     if (
       generationRef.current !== generation
@@ -91,12 +92,16 @@ export function useWorkspace(userId?: string) {
       && reportResponse.candidate_version === analysis.candidateVersion
       ? reportResponse
       : undefined;
+    const matchingAnalysisReport = analysisReportResponse?.task_id === analysis.taskId
+      ? analysisReportResponse
+      : undefined;
     return {
       ...session,
       analysis: {
         ...analysis,
         candidateVersion: analysis.candidateVersion,
         reportId: matchingReport?.id,
+        analysisReportId: matchingAnalysisReport?.id,
       },
       candidates: candidatePage?.items.map(candidate => ({
         id: candidate.id,
@@ -114,6 +119,7 @@ export function useWorkspace(userId?: string) {
         metrics: candidate.metrics,
       })),
       biReport: matchingReport,
+      analysisReport: matchingAnalysisReport,
     };
   }, [getSessionOperationEpoch, sessionOperationIsCurrent]);
 
@@ -347,9 +353,10 @@ export function useWorkspace(userId?: string) {
         ...session,
         status: 'analyzing',
         messages: [...session.messages, pendingMessage],
-        analysis: { taskId: task.id, status: task.status },
+        analysis: { taskId: task.id, status: task.status, kind: task.kind },
         candidates: undefined,
         biReport: undefined,
+        analysisReport: undefined,
       } : session));
       if (activeSessionIdRef.current === requestedSessionId) {
         setActiveTaskId(task.id);
@@ -394,9 +401,10 @@ export function useWorkspace(userId?: string) {
         ...session,
         status: 'analyzing',
         messages: session.messages.map(item => item.id === messageId ? { ...item, taskId: task.id } : item),
-        analysis: { taskId: task.id, status: task.status },
+        analysis: { taskId: task.id, status: task.status, kind: task.kind },
         candidates: undefined,
         biReport: undefined,
+        analysisReport: undefined,
       } : session));
       if (activeSessionIdRef.current === activeSession.id) {
         setActiveTaskId(task.id);
@@ -473,6 +481,7 @@ export function useWorkspace(userId?: string) {
             ? undefined
             : session.analysis.reportId
         ),
+        analysisReportId: currentTaskRuntime.visibleAnalysisReportId ?? session.analysis.analysisReportId,
         followupStatus: currentTaskRuntime.followupStatus ?? session.analysis.followupStatus,
         followupSuggestions: currentTaskRuntime.followupSuggestions ?? session.analysis.followupSuggestions,
         followupError: currentTaskRuntime.followupError
@@ -489,6 +498,8 @@ export function useWorkspace(userId?: string) {
         || session.analysis.candidateVersion !== currentTaskRuntime.candidateVersion
         ? undefined
         : session.candidates,
+      // 新任务开始后清空属于旧任务的分析报告，等待 report.updated 事件回填。
+      analysisReport: session.analysisReport?.task_id === activeTaskId ? session.analysisReport : undefined,
     } : session));
     if (currentTaskRuntime.candidateVersion !== undefined) {
       const requestedTaskId = activeTaskId;
@@ -556,6 +567,23 @@ export function useWorkspace(userId?: string) {
             && report.candidate_version === requestedCandidateVersion ? {
             ...session,
             biReport: report,
+          } : session));
+        })
+        .catch(() => undefined);
+    }
+    if (currentTaskRuntime.visibleAnalysisReportId) {
+      const requestedTaskId = activeTaskId;
+      const requestedReportId = currentTaskRuntime.visibleAnalysisReportId;
+      void getAnalysisReport(requestedReportId)
+        .then(report => {
+          if (
+            generationRef.current !== generation
+            || report.task_id !== requestedTaskId
+          ) return;
+          setSessions(current => current.map(session => session.analysis?.taskId === requestedTaskId
+            && session.analysis.analysisReportId === requestedReportId ? {
+            ...session,
+            analysisReport: report,
           } : session));
         })
         .catch(() => undefined);

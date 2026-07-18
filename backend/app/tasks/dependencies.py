@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from functools import lru_cache
 from typing import Any
 from uuid import uuid4
@@ -19,16 +19,26 @@ from app.mcp_gateway.registry import ToolRegistryService
 from app.mcp_gateway.service import McpGatewayService
 from app.model.dependencies import get_model_adapter
 from app.model.contracts import ChatMessage, StreamingModelRequest, StructuredModelRequest
-from app.model.prompts import ANALYST_PROMPT, SUMMARY_PROMPT
-from app.orchestration.context import ContextBuilder
+from app.model.prompts import (
+    AGENT_LOOP_PROMPT,
+    ANALYST_PROMPT,
+    REPORT_WRITER_PROMPT,
+    SUMMARY_PROMPT,
+)
+from app.orchestration.context import ContextBuilder, compress_messages
+from app.orchestration.loop import AgentDecision, AgentLoopContext
 from app.orchestration.planner import Planner
+from app.orchestration.routing import extract_requested_period
+from app.orchestration.schemas import PlannerTool
 from app.tasks.executor import TaskExecutor, TaskRunner
 from app.tasks.followups import FollowupSuggestionService
 from app.tasks.models import AnalysisTask
 from app.tasks.recovery import TaskRecovery
 from app.tasks.repository import TaskRepository
 from app.workspace.models import Message
-from app.reporting.models import BiReport
+from app.reporting.analysis_reports import AnalysisReportService
+from app.reporting.blocks import ReportDocument
+from app.reporting.models import AnalysisReport, BiReport
 from app.reporting.schemas import AnalystConclusion
 from app.reporting.service import ReportingService
 from app.tasks.state import TaskEventType
@@ -76,6 +86,7 @@ class DatabaseTaskStore:
 
     async def claim_lease(self, *args: Any): return await self._write("claim_lease", *args)
     async def save_plan(self, *args: Any): return await self._write("save_plan", *args)
+    async def save_trajectory(self, *args: Any): return await self._write("save_trajectory", *args)
     async def save_replan(self, *args: Any): return await self._write("save_replan", *args)
     async def cancel_requested(self, *args: Any): return await self._read("cancel_requested", *args)
     async def renew_lease(self, *args: Any): return await self._write("renew_lease", *args)
@@ -184,8 +195,36 @@ class _TaskArtifacts:
                 task_id, analyst_conclusion=result.value, lease_owner=self._worker_id
             )
 
+    async def build_analysis_report(self, task_id: str):
+        """agent 任务产物：report_writer 基于已结算证据撰写版本化自由报告。"""
+        async with SessionFactory() as db:
+            writer_input = await AnalysisReportService(db).writer_input(task_id)
+        result = await self._model.complete_json(
+            StructuredModelRequest(
+                purpose="report_writer",
+                template_name=REPORT_WRITER_PROMPT.name,
+                messages=(
+                    ChatMessage(role="system", content=REPORT_WRITER_PROMPT.system),
+                    ChatMessage(
+                        role="user",
+                        content=json.dumps(
+                            writer_input,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    ),
+                ),
+                output_model=ReportDocument,
+                max_tokens=8192,
+            )
+        )
+        async with SessionFactory.begin() as db:
+            return await AnalysisReportService(db).build(
+                task_id, document=result.value, lease_owner=self._worker_id
+            )
+
     async def stream_summary(self, task_id: str) -> None:
-        """逐段提交草稿与事件；客户端断开后执行器仍会完成该过程。"""
         async with SessionFactory() as db:
             report = await db.scalar(
                 select(BiReport).where(BiReport.task_id == task_id).order_by(BiReport.report_version.desc())
@@ -201,8 +240,35 @@ class _TaskArtifacts:
                 "conclusion": report.conclusion_text or "",
             }
             existing = await self._existing_summary_message(db, task)
-            if existing is not None and existing.metadata_json.get("status") == "completed":
-                return
+        await self._stream_summary(task_id, summary_input, existing)
+
+    async def stream_analysis_summary(self, task_id: str) -> None:
+        """agent 任务的摘要：输入为已持久化的自由报告，而非 BI 报告。"""
+        async with SessionFactory() as db:
+            report = await db.scalar(
+                select(AnalysisReport)
+                .where(AnalysisReport.task_id == task_id)
+                .order_by(AnalysisReport.version.desc())
+            )
+            task = await db.get(AnalysisTask, task_id)
+            if report is None or task is None:
+                raise LookupError("report_not_found")
+            summary_input = {
+                "task_id": task.id,
+                "report_id": report.id,
+                "report_version": report.version,
+                "title": report.title,
+                "conclusion": report.conclusion_text or "",
+            }
+            existing = await self._existing_summary_message(db, task)
+        await self._stream_summary(task_id, summary_input, existing)
+
+    async def _stream_summary(
+        self, task_id: str, summary_input: dict, existing: Message | None
+    ) -> None:
+        """逐段提交草稿与事件；客户端断开后执行器仍会完成该过程。"""
+        if existing is not None and existing.metadata_json.get("status") == "completed":
+            return
         content = existing.content if existing is not None else ""
         message_id = existing.id if existing is not None else None
         generated_deltas: list[str] = []
@@ -316,7 +382,11 @@ class _TaskArtifacts:
 
 @lru_cache
 def get_mcp_transport():
-    return DataTapTransport(token=get_settings().datatap_mcp_token)
+    settings = get_settings()
+    return DataTapTransport(
+        token=settings.datatap_mcp_token,
+        read_timeout_seconds=settings.datatap_read_timeout_seconds,
+    )
 
 
 class TaskExecutionDependencies:
@@ -337,6 +407,52 @@ class TaskExecutionDependencies:
                 permissions=_Permissions(),
                 reporting=_ReportingContext(),
             ).build(user_id, session_id)
+
+    async def build_agent_context(self, user_id: str, session_id: str) -> AgentLoopContext:
+        """迭代循环的轻量上下文：消息 + 已审核工具 + 渠道权限，无会话表单约束。"""
+        async with SessionFactory() as db:
+            workspace_service = WorkspaceService(db)
+            workspace = await workspace_service.get_owned_session(user_id, session_id)
+            messages = await workspace_service.list_messages(user_id, session_id)
+            tools = await ToolRegistryService(db, self._transport).list_enabled()
+        approved_channels = set(await _Permissions().list_enabled_channels(user_id))
+        selected_channels = tuple(
+            platform for platform in workspace.platforms if platform in approved_channels
+        )
+        effective_channels = selected_channels or tuple(sorted(approved_channels))
+        recent_messages = compress_messages(messages, max_chars=24_000)
+        return AgentLoopContext(
+            recent_messages=recent_messages,
+            tools=tuple(PlannerTool.from_approved(item) for item in tools),
+            allowed_channels=effective_channels,
+            current_date=date.today().isoformat(),
+            requested_period=extract_requested_period(
+                "\n".join(message.content for message in recent_messages)
+            ),
+        )
+
+    async def agent_decide(self, context: AgentLoopContext) -> AgentDecision:
+        result = await self._model.complete_json(
+            StructuredModelRequest(
+                purpose="agent_loop",
+                template_name=AGENT_LOOP_PROMPT.name,
+                messages=(
+                    ChatMessage(role="system", content=AGENT_LOOP_PROMPT.system),
+                    ChatMessage(
+                        role="user",
+                        content=json.dumps(
+                            context.model_dump(mode="json"),
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                    ),
+                ),
+                output_model=AgentDecision,
+                max_tokens=4096,
+            )
+        )
+        return result.value
 
     async def execute_batch(self, commands):
         async with SessionFactory() as db:

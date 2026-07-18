@@ -42,6 +42,9 @@ class AnalysisTask(Base):
     idempotency_key_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     idempotency_payload_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
+    # "pipeline" = fixed KOL plan/report flow; "agent" = iterative tool loop
+    # producing a free-form analysis report. Existing rows stay "pipeline".
+    kind: Mapped[str] = mapped_column(String(16), nullable=False, default="pipeline")
     plan_json: Mapped[dict[str, Any] | None] = mapped_column(JSON)
     plan_version: Mapped[str | None] = mapped_column(String(32))
     replan_json: Mapped[dict[str, Any] | None] = mapped_column(JSON)

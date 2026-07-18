@@ -19,6 +19,8 @@ def test_prompts_treat_external_content_as_untrusted_and_limit_capabilities() ->
     assert "brand" in PLANNER_PROMPT.system
     assert "hybrid" in PLANNER_PROMPT.system
     assert "evidence_kind" in PLANNER_PROMPT.system
+    assert "每轮任务都必须" in PLANNER_PROMPT.system
+    assert "匹配相关 KOL" in PLANNER_PROMPT.system
 
 
 def test_prompts_do_not_contain_provider_endpoints_or_environment_values(monkeypatch) -> None:
