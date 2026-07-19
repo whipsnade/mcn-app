@@ -11,7 +11,7 @@ interface MobileWorkspaceNavProps {
 const items = [
   { value: 'sessions' as const, label: '会话', icon: MessageSquare },
   { value: 'chat' as const, label: '分析对话', icon: Sparkles },
-  { value: 'bi' as const, label: 'BI 报告', icon: BarChart3 },
+  { value: 'bi' as const, label: '分析报告', icon: BarChart3 },
 ];
 
 

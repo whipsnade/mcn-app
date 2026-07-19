@@ -99,14 +99,14 @@ class TaskRepository:
         if not self._owns_active_lease(task, worker_id):
             return False
         task.plan_json = plan_json
-        task.plan_version = "planner_v1"
+        task.plan_version = "agent_trajectory_v1"
         task.status = TaskStatus.RUNNING
         task.updated_at = utc_now()
         await self.append_event(
             task.id,
             task.user_id,
             TaskEventType.PLAN_READY,
-            {"version": "planner_v1", "phase": "ai_analysis", "label": "AI 分析"},
+            {"version": "agent_trajectory_v1", "phase": "ai_analysis", "label": "AI 分析"},
         )
         await self.db.flush()
         return True
@@ -122,41 +122,6 @@ class TaskRepository:
         task.plan_version = "agent_trajectory_v1"
         task.status = TaskStatus.RUNNING
         task.updated_at = utc_now()
-        await self.db.flush()
-        return True
-
-    async def save_plan_revision(
-        self,
-        task_id: str,
-        worker_id: str,
-        plan_json: dict[str, Any] | None = None,
-        replan_json: dict[str, Any] | None = None,
-    ) -> bool:
-        """Silently update a pipeline plan (e.g. detail uid backfill)."""
-        task = await self._locked(task_id)
-        if not self._owns_active_lease(task, worker_id):
-            return False
-        if plan_json is not None:
-            task.plan_json = plan_json
-        if replan_json is not None:
-            task.replan_json = replan_json
-        task.updated_at = utc_now()
-        await self.db.flush()
-        return True
-
-    async def save_replan(self, task_id: str, worker_id: str, replan_json: dict[str, Any]) -> bool:
-        task = await self._locked(task_id)
-        if not self._owns_active_lease(task, worker_id) or task.replan_count >= 1:
-            return False
-        task.replan_json = replan_json
-        task.replan_count += 1
-        task.updated_at = utc_now()
-        await self.append_event(
-            task.id,
-            task.user_id,
-            TaskEventType.REPLAN_READY,
-            {"attempt": task.replan_count, "phase": "replanning", "label": "重新规划"},
-        )
         await self.db.flush()
         return True
 
@@ -220,6 +185,26 @@ class TaskRepository:
         if self._owns_active_lease(task, worker_id) and task.status not in TERMINAL_TASK_STATUSES:
             failure = safe_error(code, message)
             task.status = TaskStatus.FAILED
+            task.retry_key = None
+            task.error_code = failure.code
+            task.error_message = failure.message
+            task.completed_at = utc_now()
+            task.updated_at = task.completed_at
+            error_message = await self._append_error_message(task, failure)
+            await self.append_event(
+                task.id,
+                task.user_id,
+                TaskEventType.TASK_FAILED,
+                {"code": failure.code, "message": failure.message, "message_id": error_message.id},
+            )
+            await self.db.flush()
+
+    async def mark_insufficient_balance(self, task_id: str, worker_id: str) -> None:
+        """余额不足终态：与 mark_failed 同构，状态为 INSUFFICIENT_BALANCE。"""
+        task = await self._locked(task_id)
+        if self._owns_active_lease(task, worker_id) and task.status not in TERMINAL_TASK_STATUSES:
+            failure = safe_error("insufficient_balance")
+            task.status = TaskStatus.INSUFFICIENT_BALANCE
             task.retry_key = None
             task.error_code = failure.code
             task.error_message = failure.message

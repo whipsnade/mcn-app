@@ -11,7 +11,6 @@ from app.tasks.models import AnalysisTask
 from app.tasks.repository import TaskRepository
 from app.tasks.schemas import TaskCreate
 from app.tasks.state import TERMINAL_TASK_STATUSES, TaskEventType, TaskStatus
-from app.orchestration.routing import classify_task_kind
 from app.workspace.schemas import MessageCreate
 from app.workspace.models import Message
 from app.workspace.service import WorkspaceService
@@ -33,11 +32,8 @@ def idempotency_key_digest(key: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
-def idempotency_payload_digest(content: str, scoring_profile: str) -> str:
-    normalized = {
-        "content": content.strip(),
-        "scoring_profile": scoring_profile,
-    }
+def idempotency_payload_digest(content: str) -> str:
+    normalized = {"content": content.strip()}
     encoded = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
@@ -67,7 +63,7 @@ class TaskService:
         idempotency_payload_hash: str | None = None,
     ) -> AnalysisTask:
         workspace_service = WorkspaceService(self.db)
-        workspace = await workspace_service.get_owned_session(user_id, session_id, for_update=True)
+        await workspace_service.get_owned_session(user_id, session_id, for_update=True)
         active_task_id = await self.db.scalar(
             select(AnalysisTask.id)
             .where(
@@ -94,7 +90,6 @@ class TaskService:
             )
             if message is None:
                 raise LookupError("trigger_message_not_found")
-        message.metadata_json = {"scoring_profile": payload.scoring_profile}
         now = utc_now()
         latest_creation_order = await self.db.scalar(
             select(func.max(AnalysisTask.creation_order)).where(
@@ -111,7 +106,8 @@ class TaskService:
             idempotency_key_hash=idempotency_key_hash,
             idempotency_payload_hash=idempotency_payload_hash,
             status=TaskStatus.PENDING,
-            kind=classify_task_kind(payload.content, category=workspace.category),
+            # 所有任务统一走 agent 迭代循环；历史 kind="pipeline" 行保留在库。
+            kind="agent",
             plan_json=None,
             plan_version=None,
             max_calls=10,
@@ -127,9 +123,10 @@ class TaskService:
             created_at=now,
             updated_at=now,
         )
+        existing_metadata = dict(message.metadata_json or {})
         message.metadata_json = {
-            **message.metadata_json,
-            "analysis_task_ids": [*(message.metadata_json.get("analysis_task_ids", [])), task.id],
+            **existing_metadata,
+            "analysis_task_ids": [*existing_metadata.get("analysis_task_ids", []), task.id],
             "latest_analysis_task_id": task.id,
         }
         self.db.add(task)
@@ -151,7 +148,7 @@ class TaskService:
     ) -> tuple[AnalysisTask, bool]:
         """Create once per user/session/key, atomically across processes."""
         key_hash = idempotency_key_digest(idempotency_key)
-        payload_hash = idempotency_payload_digest(payload.content, payload.scoring_profile)
+        payload_hash = idempotency_payload_digest(payload.content)
         workspace_service = WorkspaceService(self.db)
         await workspace_service.get_owned_session(user_id, session_id, for_update=True)
         existing = await self.db.scalar(

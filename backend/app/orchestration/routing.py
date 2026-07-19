@@ -2,80 +2,10 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 import re
-from typing import Any, Literal
-
-from pydantic import BaseModel, ConfigDict, Field
-
-from app.orchestration.schemas import AnalysisScope, SessionBrief
+from typing import Any
 
 
-_BRAND_TERMS = (
-    "声量",
-    "舆情",
-    "情感",
-    "情绪",
-    "趋势",
-    "热词",
-    "品牌提及",
-    "曝光",
-    "口碑",
-    "讨论",
-    "品牌分析",
-)
-_KOL_TERMS = (
-    "达人",
-    "kol",
-    "网红",
-    "粉丝",
-    "候选",
-    "活跃达人",
-    "博主",
-    "账号",
-)
-_BRAND_ONLY_TERMS = ("仅分析品牌", "只分析品牌", "仅品牌维度", "不需要达人", "不找达人")
-
-TaskKind = Literal["pipeline", "agent"]
-
-# Intent terms that route a task to the fixed KOL pipeline (Top10 candidates,
-# versioned BI report, xlsx export). Anything else goes to the iterative
-# agent loop producing a free-form analysis report.
-_KOL_INTENT_TERMS = (
-    "达人",
-    "kol",
-    "网红",
-    "博主",
-    "候选",
-    "带货",
-    "种草",
-    "up主",
-    "主播",
-    "投放",
-    "选人",
-)
-
-
-def classify_task_kind(text: str, *, category: str | None) -> TaskKind:
-    """Route a user request to an execution mode.
-
-    Deterministic by design: only explicit KOL intent on a categorized
-    session uses the fixed pipeline; free-form questions (industry, brand,
-    trend analysis, or sessions without a category) run the agent loop.
-    """
-    if not category:
-        return "agent"
-    content = text.casefold()
-    if any(term.casefold() in content for term in _KOL_INTENT_TERMS):
-        return "pipeline"
-    return "agent"
 _PERIOD_PATTERN = re.compile(r"(?:最近|近)(?P<value>\d+)\s*(?P<unit>天|日|个月|月|季度|年)")
-
-
-class AnalysisRouting(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    scope: AnalysisScope
-    objectives: tuple[str, ...] = Field(default_factory=tuple, max_length=12)
-    requested_period: dict[str, Any] = Field(default_factory=dict)
 
 
 def _period_from_text(text: str) -> dict[str, Any]:
@@ -106,50 +36,6 @@ def extract_requested_period(text: str) -> dict[str, Any]:
     return _period_from_text(text)
 
 
-def classify_analysis_request(text: str, brief: SessionBrief) -> AnalysisRouting:
-    content = f"{brief.brand}\n{brief.category}\n{text}".casefold()
-    has_brand = any(term.casefold() in content for term in _BRAND_TERMS)
-    has_kol = any(term.casefold() in content for term in _KOL_TERMS)
-    explicit_brand_only = any(term in content for term in _BRAND_ONLY_TERMS)
-    if explicit_brand_only:
-        # “不需要达人” contains the KOL keyword itself but is a negative
-        # instruction, not a request for creator discovery.
-        has_kol = False
-    if has_brand and (has_kol or not explicit_brand_only):
-        scope: AnalysisScope = "hybrid"
-    elif has_brand:
-        scope = "brand"
-    else:
-        scope = "kol"
-
-    objectives: list[str] = []
-    if has_brand:
-        objectives.append("brand_analysis")
-    if any(term in content for term in ("声量", "提及", "讨论", "曝光")):
-        objectives.append("volume_trend")
-    if any(term in content for term in ("情感", "情绪", "舆情", "口碑")):
-        objectives.append("sentiment_trend")
-    if any(term in content for term in ("热词", "话题")):
-        objectives.append("hot_topics")
-    if any(term in content for term in ("画像", "人群", "地域", "性别", "年龄")):
-        objectives.append("audience_profile")
-    if has_kol or scope == "hybrid":
-        objectives.append("kol_discovery")
-    if any(term in content for term in ("对比", "比较", "各平台")):
-        objectives.append("platform_comparison")
-    if not objectives:
-        objectives.append("kol_discovery")
-    return AnalysisRouting(
-        scope=scope,
-        objectives=tuple(dict.fromkeys(objectives)),
-        requested_period=_period_from_text(text),
-    )
-
-
 __all__ = [
-    "AnalysisRouting",
-    "TaskKind",
-    "classify_analysis_request",
-    "classify_task_kind",
     "extract_requested_period",
 ]

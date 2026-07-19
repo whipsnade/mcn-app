@@ -1,79 +1,26 @@
-from decimal import Decimal
+from datetime import date
 
-from app.orchestration.routing import classify_analysis_request, classify_task_kind
-from app.orchestration.schemas import SessionBrief, ToolPlanStep
-
-
-def _brief(brand: str = "科颜氏") -> SessionBrief:
-    return SessionBrief(
-        session_id="session-1",
-        brand=brand,
-        campaign_name=None,
-        platforms=("xiaohongshu", "douyin"),
-        category="美妆",
-        target_audience="",
-        budget_min=Decimal("0"),
-        budget_max=None,
-        filters={},
-    )
+from app.orchestration.routing import extract_requested_period
 
 
-def test_brand_volume_question_routes_to_hybrid_for_kol_context() -> None:
-    result = classify_analysis_request(
-        "分析科颜氏最近3个月在各平台的声量变化和用户情感趋势", _brief()
-    )
+def test_requested_period_defaults_to_last_three_months() -> None:
+    period = extract_requested_period("分析美妆行业在社交媒体的讨论热度")
 
-    assert result.scope == "hybrid"
-    assert set(result.objectives) >= {"volume_trend", "sentiment_trend", "kol_discovery"}
-    assert result.requested_period["unit"] == "month"
-    assert result.requested_period["value"] == 3
+    assert period["unit"] == "month"
+    assert period["value"] == 3
+    assert period["end"] == date.today().isoformat()
 
 
-def test_explicit_brand_only_question_routes_to_brand() -> None:
-    result = classify_analysis_request("仅分析品牌声量和情感趋势，不需要达人", _brief())
+def test_requested_period_parses_explicit_day_window() -> None:
+    period = extract_requested_period("找最近30天活跃的达人")
 
-    assert result.scope == "brand"
-
-
-def test_brand_question_that_requests_active_creators_routes_to_hybrid() -> None:
-    result = classify_analysis_request("分析科颜氏声量并找出相关活跃达人", _brief())
-
-    assert result.scope == "hybrid"
-    assert set(result.objectives) >= {"brand_analysis", "kol_discovery"}
+    assert period["unit"] == "day"
+    assert period["value"] == 30
 
 
-def test_plain_creator_query_routes_to_kol() -> None:
-    result = classify_analysis_request("找最近30天活跃top10达人", _brief())
+def test_requested_period_converts_quarters_and_years_to_months() -> None:
+    quarter = extract_requested_period("最近1季度的声量变化")
+    year = extract_requested_period("近2年的趋势")
 
-    assert result.scope == "kol"
-    assert "kol_discovery" in result.objectives
-
-
-def test_legacy_tool_plan_step_defaults_to_kol_evidence() -> None:
-    step = ToolPlanStep.model_validate(
-        {
-            "id": "step_1",
-            "internal_tool_name": "x",
-            "arguments": {},
-            "evidence_goal": "x",
-        }
-    )
-
-    assert step.evidence_kind == "kol"
-
-
-def test_kol_intent_on_categorized_session_routes_to_pipeline() -> None:
-    assert classify_task_kind("帮我找最近30天活跃的美妆达人", category="美妆") == "pipeline"
-    assert classify_task_kind("推荐几位小红书博主做种草投放", category="美妆") == "pipeline"
-
-
-def test_open_analysis_question_routes_to_agent() -> None:
-    assert (
-        classify_task_kind("分析美妆行业在社交媒体的讨论热度和发展趋势", category="美妆")
-        == "agent"
-    )
-
-
-def test_session_without_category_always_routes_to_agent() -> None:
-    assert classify_task_kind("帮我找美妆达人", category=None) == "agent"
-    assert classify_task_kind("帮我找美妆达人", category="") == "agent"
+    assert (quarter["unit"], quarter["value"]) == ("month", 3)
+    assert (year["unit"], year["value"]) == ("month", 24)

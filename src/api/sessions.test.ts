@@ -43,22 +43,21 @@ describe('toSession', () => {
     expect('mcn' in session).toBe(false);
   });
 
-  it('does not expose a historical BI report for a different candidate version', () => {
-    const session = toSession({
+  it('exposes the latest analysis report only when it belongs to the latest task', () => {
+    const base = {
       id: 's-2', title: '示例品牌-夏季选人', brand: '示例品牌', campaign_name: '夏季选人',
-      status: 'completed', platforms: ['bilibili'], category: '美妆护肤', target_audience: '18-30 岁女性',
+      status: 'completed' as const, platforms: ['bilibili'], category: '美妆护肤', target_audience: '18-30 岁女性',
       budget_min: null, budget_max: null, filters: {}, is_starred: false, messages: [],
-      latest_task: { id: 'task-2', status: 'completed', completed_at: '2026-07-15T10:00:00Z' },
-      latest_candidates: { task_id: 'task-2', version: 2, total: 3 },
-      latest_report: {
-        id: 'report-1', task_id: 'task-2', report_version: 1, candidate_version: 1,
-        status: 'completed', generated_at: '2026-07-15T09:00:00Z',
-      },
+      latest_task: { id: 'task-2', status: 'completed' as const, completed_at: '2026-07-15T10:00:00Z' },
       created_at: '2026-07-14T10:00:00Z', updated_at: '2026-07-15T10:00:00Z',
-    });
+    };
+    const summary = {
+      id: 'analysis-report-1', task_id: 'task-2', version: 1, title: '自由分析报告',
+      status: 'completed', generated_at: '2026-07-15T09:00:00Z',
+    };
 
-    expect(session.analysis?.candidateVersion).toBe(2);
-    expect(session.analysis?.reportId).toBeUndefined();
+    expect(toSession({ ...base, latest_analysis_report: summary }).analysis?.analysisReportId).toBe('analysis-report-1');
+    expect(toSession({ ...base, latest_analysis_report: { ...summary, task_id: 'task-other' } }).analysis?.analysisReportId).toBeUndefined();
   });
 
   it('restores follow-up suggestions from the latest task metadata', () => {

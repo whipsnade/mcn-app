@@ -1,18 +1,16 @@
-import { MessageSquare, Star, Users } from 'lucide-react';
+import { MessageSquare, Star } from 'lucide-react';
 
-export type WorkspaceTab = 'chat' | 'candidates' | 'favorites';
+export type WorkspaceTab = 'chat' | 'favorites';
 
 interface WorkspaceTabsProps {
   active: WorkspaceTab;
   onChange: (tab: WorkspaceTab) => void;
-  candidateCount: number;
   favoriteCount: number;
 }
 
-export function WorkspaceTabs({ active, onChange, candidateCount, favoriteCount }: WorkspaceTabsProps) {
+export function WorkspaceTabs({ active, onChange, favoriteCount }: WorkspaceTabsProps) {
   const tabs = [
     { id: 'chat' as const, label: '智能会话', icon: MessageSquare },
-    { id: 'candidates' as const, label: `候选清单 ${candidateCount}`, icon: Users },
     { id: 'favorites' as const, label: `已收藏 ${favoriteCount}`, icon: Star },
   ];
 

@@ -1,1 +1,1 @@
-"""KOL candidate and BI reporting persistence package."""
+"""分析报告（agent 任务产物）与收藏的持久化包。"""

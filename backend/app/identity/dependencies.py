@@ -5,6 +5,7 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.errors import ErrorCode
 from app.core.security import decode_access_token
 from app.db.session import get_db
 from app.identity.models import LoginSession, User
@@ -55,3 +56,12 @@ CurrentUser = Annotated[User, Depends(get_current_user)]
 FunctionScopedCurrentUser = Annotated[
     User, Depends(get_function_scoped_current_user, scope="function")
 ]
+
+
+async def require_admin(user: CurrentUser) -> User:
+    if user.role != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=ErrorCode.FORBIDDEN)
+    return user
+
+
+AdminUser = Annotated[User, Depends(require_admin)]

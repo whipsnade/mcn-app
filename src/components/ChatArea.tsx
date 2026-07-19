@@ -312,7 +312,7 @@ export default function ChatArea({
           </button>
         </form>
         <p className="text-[10px] text-slate-400 text-center">
-          💡 提示：你可以要求 AI 调整、模拟特定达人的销售转化、提升正向舆情占比，右侧 BI 报表将自适应重计算。
+          💡 提示：你可以要求 AI 调整、模拟特定达人的销售转化、提升正向舆情占比，右侧分析报告将同步更新。
         </p>
       </div>
 

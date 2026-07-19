@@ -32,14 +32,12 @@ export interface TaskRuntimeState {
   assistantDraft: string;
   /** 执行流程节点；测试夹具可省略，reducer 按空数组处理。 */
   nodes?: TaskFlowNode[];
-  candidateVersion?: number;
-  pendingReport?: { id: string; candidateVersion: number };
-  visibleReportId?: string;
   visibleAnalysisReportId?: string;
   status?: string;
   phase?: TaskPhase;
   phaseLabel?: string;
-  phaseProgress?: { current: number; total: number };
+  /** 工具调用进度（无分母：agent 循环没有固定调用上限）。 */
+  phaseProgress?: { current: number };
   platformProgress?: Record<string, PlatformProgress>;
   errorCode?: string;
   errorMessage?: string;
@@ -65,11 +63,9 @@ function valueOf(payload: Record<string, unknown>, camelName: string, snakeName:
   return payload[camelName] ?? payload[snakeName];
 }
 
-function exposeMatchingReport(state: TaskRuntimeState): TaskRuntimeState {
-  if (state.pendingReport?.candidateVersion === state.candidateVersion) {
-    return { ...state, visibleReportId: state.pendingReport.id };
-  }
-  return state;
+function isInsufficientBalance(event: TaskEvent): boolean {
+  return event.type === 'task.insufficient_balance'
+    || String(event.payload.code ?? event.payload.errorCode ?? event.payload.error_code ?? '') === 'insufficient_balance';
 }
 
 function pushNode(nodes: TaskFlowNode[], node: TaskFlowNode): TaskFlowNode[] {
@@ -88,7 +84,7 @@ function updateNode(
 }
 
 function latestRunningToolNode(nodes: TaskFlowNode[], stepIndex: number): number {
-  // pipeline 分批执行时 step_index 每批从 1 重新计数：优先匹配最近一个
+  // step_index 可能每批从 1 重新计数：优先匹配最近一个
   // 仍处于 running 的同类节点，避免误更新到上一批的同名节点。
   for (let index = nodes.length - 1; index >= 0; index -= 1) {
     const node = nodes[index];
@@ -135,18 +131,15 @@ function withFlowNode(state: TaskRuntimeState, event: TaskEvent): TaskRuntimeSta
         }
         return { ...state, nodes: updateNode(nodes, index, { status, detail }) };
       }
-    case 'candidates.updated':
-      return { ...state, nodes: pushNode(nodes, { id: 'candidates', label: '候选清单已生成', status: 'succeeded' }) };
-    case 'bi.updated':
-      return { ...state, nodes: pushNode(nodes, { id: 'bi', label: 'BI 报告已生成', status: 'succeeded' }) };
     case 'report.updated':
       return { ...state, nodes: pushNode(nodes, { id: 'report', label: '分析报告已生成', status: 'succeeded' }) };
     case 'task.completed':
       return { ...state, nodes: pushNode(nodes, { id: 'terminal', label: '分析完成', status: 'succeeded' }) };
     case 'task.completed_with_warnings':
       return { ...state, nodes: pushNode(nodes, { id: 'terminal', label: '分析完成（部分渠道失败）', status: 'unknown', detail: String(event.payload.message ?? '') || undefined }) };
+    case 'task.insufficient_balance':
     case 'task.failed':
-      return { ...state, nodes: pushNode(nodes, { id: 'terminal', label: '任务失败', status: 'failed', detail: String(event.payload.message ?? '') || undefined }) };
+      return { ...state, nodes: pushNode(nodes, { id: 'terminal', label: isInsufficientBalance(event) ? '积分不足' : '任务失败', status: 'failed', detail: String(event.payload.message ?? '') || undefined }) };
     case 'task.cancelled':
       return { ...state, nodes: pushNode(nodes, { id: 'terminal', label: '任务已取消', status: 'unknown' }) };
     default:
@@ -156,11 +149,9 @@ function withFlowNode(state: TaskRuntimeState, event: TaskEvent): TaskRuntimeSta
 
 function applyStatusAndPointEvent(state: TaskRuntimeState, event: TaskEvent): TaskRuntimeState {
   const progressFrom = () => {
+    // agent 循环没有固定分母：step_total 可能为 null 或缺失，只记录已执行次数。
     const current = Number(valueOf(event.payload, 'stepIndex', 'step_index'));
-    const total = Number(valueOf(event.payload, 'stepTotal', 'step_total'));
-    return Number.isFinite(current) && Number.isFinite(total)
-      ? { current, total }
-      : state.phaseProgress;
+    return Number.isFinite(current) ? { current } : state.phaseProgress;
   };
   const platformProgress = event.payload.platform_progress;
   switch (event.type) {
@@ -200,18 +191,29 @@ function applyStatusAndPointEvent(state: TaskRuntimeState, event: TaskEvent): Ta
       };
     case 'task.cancelled':
       return { ...state, status: 'cancelled', connection: 'closed' };
+    case 'task.insufficient_balance':
     case 'task.failed':
-      return {
-        ...state,
-        status: 'failed',
-        phase: 'failed',
-        phaseLabel: '分析失败',
-        errorCode: String(event.payload.code ?? event.payload.errorCode ?? 'task_failed'),
-        errorMessage: String(event.payload.message ?? '分析任务执行失败，请稍后重试。'),
-        errorMessageId: String(event.payload.messageId ?? event.payload.message_id ?? ''),
-        connection: 'closed',
-        activity: '分析未完成，请稍后重试',
-      };
+      {
+        const insufficient = isInsufficientBalance(event);
+        const insufficientMessage = state.visibleAnalysisReportId
+          ? '积分不足，已基于已采集数据生成报告。'
+          : '积分不足，任务未产生报告。';
+        return {
+          ...state,
+          status: insufficient ? 'insufficient_balance' : 'failed',
+          phase: 'failed',
+          phaseLabel: insufficient ? '积分不足' : '分析失败',
+          errorCode: insufficient ? 'insufficient_balance' : String(event.payload.code ?? event.payload.errorCode ?? 'task_failed'),
+          errorMessage: insufficient
+            ? insufficientMessage
+            : String(event.payload.message ?? '分析任务执行失败，请稍后重试。'),
+          errorMessageId: String(event.payload.messageId ?? event.payload.message_id ?? ''),
+          connection: 'closed',
+          activity: insufficient
+            ? insufficientMessage.replace(/。$/, '')
+            : '分析未完成，请稍后重试',
+        };
+      }
     case 'followup.suggestions_started':
       return {
         ...state,
@@ -272,42 +274,8 @@ export function reduceTaskEvent(state: TaskRuntimeState, event: TaskEvent): Task
       return { ...next, assistantDraft: next.assistantDraft + String(event.payload.text ?? event.payload.delta ?? '') };
     case 'message.completed':
       return { ...next, assistantDraft: String(event.payload.text ?? next.assistantDraft) };
-    case 'candidates.updated':
-      {
-        const candidateVersion = Number(valueOf(event.payload, 'version', 'candidate_version'));
-        const pendingReport = next.pendingReport?.candidateVersion === candidateVersion
-          ? next.pendingReport
-          : undefined;
-        return withFlowNode(exposeMatchingReport({
-          ...next,
-          candidateVersion,
-          pendingReport,
-          visibleReportId: undefined,
-          phase: 'ai_summary',
-          phaseLabel: String(event.payload.label ?? 'AI 汇总'),
-          activity: '候选清单已更新',
-        }), event);
-      }
-    case 'bi.updated':
-      {
-        const candidateVersion = Number(valueOf(event.payload, 'candidateVersion', 'candidate_version'));
-        const scope = String(event.payload.analysis_scope ?? '');
-        const isEmptyBrandReport = candidateVersion === 0 && (scope === 'brand' || scope === 'hybrid');
-        return withFlowNode(exposeMatchingReport({
-          ...next,
-          candidateVersion: isEmptyBrandReport ? candidateVersion : next.candidateVersion,
-          pendingReport: {
-            id: String(valueOf(event.payload, 'reportId', 'report_id')),
-            candidateVersion,
-          },
-          phase: 'ai_summary',
-          phaseLabel: String(event.payload.label ?? 'BI 报告已生成'),
-          activity: 'BI 报告已更新',
-        }), event);
-      }
     case 'report.updated':
       {
-        // agent 任务没有候选版本概念，报告 id 直接对外可见，无需版本匹配。
         const reportId = valueOf(event.payload, 'reportId', 'report_id');
         if (reportId === undefined || reportId === null) return next;
         return withFlowNode({

@@ -100,7 +100,7 @@ export default function NewSessionModal({ isOpen, onClose, onCreate }: NewSessio
             </div>
             <div>
               <h3 className="text-lg font-semibold text-slate-800 font-display">新建 KOL 智能筛选会话</h3>
-              <p className="text-xs text-slate-400">设定筛选条件，由 AI 生成候选清单与 BI 报告</p>
+              <p className="text-xs text-slate-400">设定筛选条件，由 AI 生成智能分析报告</p>
             </div>
           </div>
           <button

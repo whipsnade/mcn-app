@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { authorizedFetch, setAccessToken } from './client';
-import { createTask, downloadLatestSessionExport, retryFollowups, retryTask } from './tasks';
+import { createTask, retryFollowups, retryTask } from './tasks';
 
 
 describe('authorizedFetch', () => {
@@ -35,24 +35,6 @@ describe('authorizedFetch', () => {
 
     expect(response.status).toBe(401);
     expect(fetchMock).toHaveBeenCalledTimes(2);
-  });
-
-  it('downloads the latest session export as a blob with the server filename', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(new Response('xlsx', {
-      status: 200,
-      headers: {
-        'Content-Disposition': "attachment; filename*=UTF-8''%E7%A7%91%E9%A2%9C%E6%B0%8F.xlsx",
-        'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-      },
-    }));
-    vi.stubGlobal('fetch', fetchMock);
-    setAccessToken('token');
-
-    const result = await downloadLatestSessionExport('session-1');
-
-    expect(result.filename).toBe('科颜氏.xlsx');
-    expect(await result.blob.text()).toBe('xlsx');
-    expect(fetchMock).toHaveBeenCalledWith('/api/v1/sessions/session-1/exports/latest.xlsx', expect.objectContaining({ credentials: 'include' }));
   });
 
   it('retries a terminal task through the dedicated endpoint', async () => {

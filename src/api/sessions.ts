@@ -39,11 +39,6 @@ export function toSession(source: ApiSession): Session {
     })),
     isStarred: source.is_starred,
     analysis: source.latest_task ? (() => {
-      const candidateVersion = source.latest_candidates?.version;
-      const reportId = candidateVersion !== undefined
-        && source.latest_report?.candidate_version === candidateVersion
-        ? source.latest_report.id
-        : undefined;
       const analysisReportId = source.latest_analysis_report?.task_id === source.latest_task.id
         ? source.latest_analysis_report.id
         : undefined;
@@ -51,8 +46,6 @@ export function toSession(source: ApiSession): Session {
         taskId: source.latest_task.id,
         status: source.latest_task.status,
         kind: source.latest_task.kind,
-        candidateVersion,
-        reportId,
         analysisReportId,
         followupStatus: source.latest_task.followup_suggestions_status ?? undefined,
         followupSuggestions: source.latest_task.followup_suggestions ?? [],

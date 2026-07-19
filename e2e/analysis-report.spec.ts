@@ -57,7 +57,7 @@ test('agent task session restores and renders the universal analysis report', as
   await page.reload();
   const mobileNavigation = page.getByRole('navigation', { name: '移动工作区导航' });
   if (await mobileNavigation.isVisible()) {
-    await mobileNavigation.getByRole('button', { name: 'BI 报告' }).click();
+    await mobileNavigation.getByRole('button', { name: '分析报告' }).click();
   }
   await expect(page.getByText('美妆行业社交媒体分析报告', { exact: true }).first()).toBeVisible();
   await expect(page.getByText('整体热度', { exact: true })).toBeVisible();

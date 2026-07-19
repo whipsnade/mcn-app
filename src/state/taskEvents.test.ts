@@ -28,38 +28,6 @@ describe('task event reducer', () => {
     expect(twice.lastEventId).toBe(41);
   });
 
-  it('shows BI only after its candidate version is present', () => {
-    const early = reduceTaskEvent(initialTaskRuntime('task-1'), {
-      id: 1,
-      taskId: 'task-1',
-      type: 'bi.updated',
-      payload: { reportId: 'report-2', candidateVersion: 2 },
-    });
-
-    expect(early.visibleReportId).toBeUndefined();
-
-    const ready = reduceTaskEvent(early, {
-      id: 2,
-      taskId: 'task-1',
-      type: 'candidates.updated',
-      payload: { version: 2 },
-    });
-
-    expect(ready.visibleReportId).toBe('report-2');
-  });
-
-  it('exposes a brand BI report when the candidate version is zero and no candidates event exists', () => {
-    const state = reduceTaskEvent(initialTaskRuntime('task-brand'), {
-      id: 1,
-      taskId: 'task-brand',
-      type: 'bi.updated',
-      payload: { reportId: 'report-empty', candidateVersion: 0, analysis_scope: 'hybrid' },
-    });
-
-    expect(state.candidateVersion).toBe(0);
-    expect(state.visibleReportId).toBe('report-empty');
-  });
-
   it('ignores a late event from a previously selected task', () => {
     const state = reduceTaskEvent(initialTaskRuntime('task-current'), {
       id: 9,
@@ -81,25 +49,6 @@ describe('task event reducer', () => {
     });
 
     expect(state.assistantDraft).toBe('可优先联系');
-  });
-
-  it('hides the previous BI when candidates advance to a newer version', () => {
-    const withReport = reduceTaskEvent(
-      reduceTaskEvent(initialTaskRuntime('task-1'), {
-        id: 1, taskId: 'task-1', type: 'candidates.updated', payload: { version: 1 },
-      }),
-      {
-        id: 2, taskId: 'task-1', type: 'bi.updated',
-        payload: { reportId: 'report-1', candidateVersion: 1 },
-      },
-    );
-    const nextCandidates = reduceTaskEvent(withReport, {
-      id: 3, taskId: 'task-1', type: 'candidates.updated', payload: { version: 2 },
-    });
-
-    expect(withReport.visibleReportId).toBe('report-1');
-    expect(nextCandidates.visibleReportId).toBeUndefined();
-    expect(nextCandidates.pendingReport).toBeUndefined();
   });
 
   it('exposes a reviewed Chinese progress label without retaining tool payloads', () => {
@@ -136,15 +85,51 @@ describe('task event reducer', () => {
       payload: {
         platform: '抖音',
         step_index: 2,
-        step_total: 3,
+        step_total: null,
         platform_progress: { 抖音: { succeeded: 2, failed: 0, unknown: 0 } },
       },
     });
 
     expect(state.phase).toBe('mcp_query');
     expect(state.phaseLabel).toBe('社媒数据 MCP 查询');
-    expect(state.phaseProgress).toEqual({ current: 2, total: 3 });
+    expect(state.phaseProgress).toEqual({ current: 2 });
     expect(state.platformProgress?.['抖音']?.succeeded).toBe(2);
+  });
+
+  it('marks an insufficient balance terminal event with friendly copy', () => {
+    const state = reduceTaskEvent(initialTaskRuntime('task-1'), {
+      id: 2,
+      taskId: 'task-1',
+      type: 'task.failed',
+      payload: { code: 'insufficient_balance', message_id: 'error-balance-1' },
+    });
+
+    expect(state.status).toBe('insufficient_balance');
+    expect(state.phaseLabel).toBe('积分不足');
+    expect(state.errorMessage).toBe('积分不足，任务未产生报告。');
+    expect(state.errorMessageId).toBe('error-balance-1');
+    expect(state.connection).toBe('closed');
+    expect(isTerminalTaskStatus(state.status)).toBe(true);
+    expect(state.nodes?.at(-1)?.label).toBe('积分不足');
+  });
+
+  it('notes the generated report when balance runs out after report.updated', () => {
+    const withReport = reduceTaskEvent(initialTaskRuntime('task-1'), {
+      id: 1,
+      taskId: 'task-1',
+      type: 'report.updated',
+      payload: { report_id: 'analysis-report-1' },
+    });
+    const state = reduceTaskEvent(withReport, {
+      id: 2,
+      taskId: 'task-1',
+      type: 'task.failed',
+      payload: { code: 'insufficient_balance' },
+    });
+
+    expect(state.status).toBe('insufficient_balance');
+    expect(state.errorMessage).toBe('积分不足，已基于已采集数据生成报告。');
+    expect(state.activity).toBe('积分不足，已基于已采集数据生成报告');
   });
 
   it('keeps a safe task error and message id idempotently', () => {
@@ -166,7 +151,7 @@ describe('task event reducer', () => {
     expect(duplicate.errorMessage).toBe(state.errorMessage);
   });
 
-  it('exposes an agent analysis report without candidate version matching', () => {
+  it('exposes an agent analysis report directly', () => {
     const state = reduceTaskEvent(initialTaskRuntime('task-agent'), {
       id: 1,
       taskId: 'task-agent',
@@ -177,8 +162,6 @@ describe('task event reducer', () => {
     expect(state.visibleAnalysisReportId).toBe('analysis-report-1');
     expect(state.phase).toBe('ai_summary');
     expect(state.phaseLabel).toBe('分析报告已生成');
-    expect(state.candidateVersion).toBeUndefined();
-    expect(state.visibleReportId).toBeUndefined();
   });
 
   it('accepts the camelCase report id on report.updated', () => {
@@ -255,7 +238,7 @@ describe('task flow nodes', () => {
     let state = initialTaskRuntime('task-1');
     state = reduceTaskEvent(state, { id: 1, taskId: 'task-1', type: 'task.pending', payload: { status: 'pending' } });
     state = reduceTaskEvent(state, { id: 2, taskId: 'task-1', type: 'plan.ready', payload: {} });
-    state = reduceTaskEvent(state, { id: 3, taskId: 'task-1', type: 'tool.started', payload: { platform: '小红书', step_index: 1, step_total: 10 } });
+    state = reduceTaskEvent(state, { id: 3, taskId: 'task-1', type: 'tool.started', payload: { platform: '小红书', step_index: 1 } });
     state = reduceTaskEvent(state, { id: 4, taskId: 'task-1', type: 'tool.failed', payload: { platform: '小红书', step_index: 1, message: '社媒数据服务返回错误，请稍后重试。' } });
     state = reduceTaskEvent(state, { id: 5, taskId: 'task-1', type: 'report.updated', payload: { report_id: 'r-1' } });
     state = reduceTaskEvent(state, { id: 6, taskId: 'task-1', type: 'task.completed', payload: {} });

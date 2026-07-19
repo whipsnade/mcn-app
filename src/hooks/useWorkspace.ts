@@ -7,7 +7,7 @@ import {
   listSessions,
   updateSession as updateSessionRequest,
 } from '../api/sessions';
-import { createTask, getAnalysisReport, getCandidates, getReport, getTask, retryFollowups as retryFollowupsRequest, retryTask } from '../api/tasks';
+import { createTask, getAnalysisReport, getTask, retryFollowups as retryFollowupsRequest, retryTask } from '../api/tasks';
 import type { CreateSessionInput } from '../api/contracts';
 import { useTaskStream } from './useTaskStream';
 import { isTerminalTaskStatus } from '../state/taskEvents';
@@ -73,25 +73,13 @@ export function useWorkspace(userId?: string) {
       || generationRef.current !== generation
       || !sessionOperationIsCurrent(session.id, operationEpoch)
     ) return session;
-    const [candidateResponse, reportResponse, analysisReportResponse] = await Promise.all([
-      analysis.candidateVersion === undefined ? Promise.resolve(undefined) : getCandidates(analysis.taskId),
-      analysis.reportId === undefined ? Promise.resolve(undefined) : getReport(analysis.reportId),
-      analysis.analysisReportId === undefined ? Promise.resolve(undefined) : getAnalysisReport(analysis.analysisReportId),
-    ]);
+    const analysisReportResponse = analysis.analysisReportId === undefined
+      ? undefined
+      : await getAnalysisReport(analysis.analysisReportId);
     if (
       generationRef.current !== generation
       || !sessionOperationIsCurrent(session.id, operationEpoch)
     ) return session;
-    const candidatePage = candidateResponse?.task_id === analysis.taskId
-      && candidateResponse.version === analysis.candidateVersion
-      ? candidateResponse
-      : undefined;
-    const candidateResponseIsValid = candidateResponse === undefined || candidatePage !== undefined;
-    const matchingReport = candidateResponseIsValid
-      && reportResponse?.task_id === analysis.taskId
-      && reportResponse.candidate_version === analysis.candidateVersion
-      ? reportResponse
-      : undefined;
     const matchingAnalysisReport = analysisReportResponse?.task_id === analysis.taskId
       ? analysisReportResponse
       : undefined;
@@ -99,26 +87,8 @@ export function useWorkspace(userId?: string) {
       ...session,
       analysis: {
         ...analysis,
-        candidateVersion: analysis.candidateVersion,
-        reportId: matchingReport?.id,
         analysisReportId: matchingAnalysisReport?.id,
       },
-      candidates: candidatePage?.items.map(candidate => ({
-        id: candidate.id,
-        kolId: candidate.kol_id,
-        platform: candidate.platform,
-        platformAccountId: candidate.platform_account_id,
-        nickname: candidate.nickname ?? undefined,
-        profileUrl: candidate.profile_url ?? undefined,
-        rank: candidate.rank,
-        totalScore: candidate.total_score,
-        scores: candidate.scores,
-        matchedConditions: candidate.matched_conditions,
-        risks: candidate.risks,
-        recommendation: candidate.recommendation,
-        metrics: candidate.metrics,
-      })),
-      biReport: matchingReport,
       analysisReport: matchingAnalysisReport,
     };
   }, [getSessionOperationEpoch, sessionOperationIsCurrent]);
@@ -354,8 +324,6 @@ export function useWorkspace(userId?: string) {
         status: 'analyzing',
         messages: [...session.messages, pendingMessage],
         analysis: { taskId: task.id, status: task.status, kind: task.kind },
-        candidates: undefined,
-        biReport: undefined,
         analysisReport: undefined,
       } : session));
       if (activeSessionIdRef.current === requestedSessionId) {
@@ -402,8 +370,6 @@ export function useWorkspace(userId?: string) {
         status: 'analyzing',
         messages: session.messages.map(item => item.id === messageId ? { ...item, taskId: task.id } : item),
         analysis: { taskId: task.id, status: task.status, kind: task.kind },
-        candidates: undefined,
-        biReport: undefined,
         analysisReport: undefined,
       } : session));
       if (activeSessionIdRef.current === activeSession.id) {
@@ -474,13 +440,6 @@ export function useWorkspace(userId?: string) {
       analysis: {
         ...session.analysis,
         status: currentTaskRuntime.status ?? session.analysis.status,
-        candidateVersion: currentTaskRuntime.candidateVersion ?? session.analysis.candidateVersion,
-        reportId: currentTaskRuntime.visibleReportId ?? (
-          currentTaskRuntime.candidateVersion !== undefined
-            && currentTaskRuntime.candidateVersion !== session.analysis.candidateVersion
-            ? undefined
-            : session.analysis.reportId
-        ),
         analysisReportId: currentTaskRuntime.visibleAnalysisReportId ?? session.analysis.analysisReportId,
         followupStatus: currentTaskRuntime.followupStatus ?? session.analysis.followupStatus,
         followupSuggestions: currentTaskRuntime.followupSuggestions ?? session.analysis.followupSuggestions,
@@ -490,49 +449,9 @@ export function useWorkspace(userId?: string) {
             ? undefined
             : session.analysis.followupError,
       },
-      biReport: currentTaskRuntime.candidateVersion === undefined
-        || session.biReport?.candidate_version !== currentTaskRuntime.candidateVersion
-        ? undefined
-        : session.biReport,
-      candidates: currentTaskRuntime.candidateVersion === undefined
-        || session.analysis.candidateVersion !== currentTaskRuntime.candidateVersion
-        ? undefined
-        : session.candidates,
       // 新任务开始后清空属于旧任务的分析报告，等待 report.updated 事件回填。
       analysisReport: session.analysisReport?.task_id === activeTaskId ? session.analysisReport : undefined,
     } : session));
-    if (currentTaskRuntime.candidateVersion !== undefined) {
-      const requestedTaskId = activeTaskId;
-      const requestedCandidateVersion = currentTaskRuntime.candidateVersion;
-      void getCandidates(requestedTaskId)
-        .then(page => {
-          if (
-            generationRef.current !== generation
-            || page.task_id !== requestedTaskId
-            || page.version !== requestedCandidateVersion
-          ) return;
-          setSessions(current => current.map(session => session.analysis?.taskId === requestedTaskId
-            && session.analysis.candidateVersion === requestedCandidateVersion ? {
-            ...session,
-            candidates: page.items.map(candidate => ({
-              id: candidate.id,
-              kolId: candidate.kol_id,
-              platform: candidate.platform,
-              platformAccountId: candidate.platform_account_id,
-              nickname: candidate.nickname ?? undefined,
-              profileUrl: candidate.profile_url ?? undefined,
-              rank: candidate.rank,
-              totalScore: candidate.total_score,
-              scores: candidate.scores,
-              matchedConditions: candidate.matched_conditions,
-              risks: candidate.risks,
-              recommendation: candidate.recommendation,
-              metrics: candidate.metrics,
-            })),
-          } : session));
-        })
-        .catch(() => undefined);
-    }
     if (currentTaskRuntime.errorMessage && currentTaskRuntime.errorMessageId) {
       const errorMessageId = currentTaskRuntime.errorMessageId;
       setSessions(current => current.map(session => {
@@ -549,27 +468,6 @@ export function useWorkspace(userId?: string) {
           }],
         };
       }));
-    }
-    if (currentTaskRuntime.visibleReportId) {
-      const requestedTaskId = activeTaskId;
-      const requestedCandidateVersion = currentTaskRuntime.candidateVersion;
-      const requestedReportId = currentTaskRuntime.visibleReportId;
-      void getReport(requestedReportId)
-        .then(report => {
-          if (
-            generationRef.current !== generation
-            || report.task_id !== requestedTaskId
-            || report.candidate_version !== requestedCandidateVersion
-          ) return;
-          setSessions(current => current.map(session => session.analysis?.taskId === requestedTaskId
-            && session.analysis.candidateVersion === requestedCandidateVersion
-            && session.analysis.reportId === requestedReportId
-            && report.candidate_version === requestedCandidateVersion ? {
-            ...session,
-            biReport: report,
-          } : session));
-        })
-        .catch(() => undefined);
     }
     if (currentTaskRuntime.visibleAnalysisReportId) {
       const requestedTaskId = activeTaskId;

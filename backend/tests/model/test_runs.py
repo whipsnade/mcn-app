@@ -21,10 +21,10 @@ class FakeSession:
 
 def metadata() -> ModelRequestMetadata:
     return ModelRequestMetadata(
-        purpose="planner",
+        purpose="agent_loop",
         provider="tencent_plan",
         model="deepseek-v4-pro",
-        prompt_template="planner_v1",
+        prompt_template="agent_loop_v1",
         prompt_version="1",
     )
 
@@ -67,10 +67,10 @@ async def test_model_run_records_structured_and_stream_failures(error_type: str)
 def test_model_run_metadata_rejects_prompt_body_and_secret() -> None:
     with pytest.raises(ValidationError):
         ModelRequestMetadata(
-            purpose="planner",
+            purpose="agent_loop",
             provider="tencent_plan",
             model="deepseek-v4-pro",
-            prompt_template="planner_v1",
+            prompt_template="agent_loop_v1",
             prompt_version="1",
             content="sensitive body",
             api_key="secret",

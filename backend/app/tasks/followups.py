@@ -13,7 +13,7 @@ from sqlalchemy import select, text
 from app.db.session import SessionFactory
 from app.model.contracts import ChatMessage, ModelAdapter, StructuredModelRequest
 from app.model.prompts import FOLLOWUP_PROMPT
-from app.reporting.models import BiReport
+from app.reporting.models import AnalysisReport
 from app.tasks.models import AnalysisTask, TaskEvent
 from app.tasks.state import TaskEventType, TaskStatus
 from app.tasks.repository import TaskRepository
@@ -393,9 +393,9 @@ class FollowupSuggestionService:
             user_message = await db.get(Message, task.trigger_message_id)
             session = await db.get(WorkspaceSession, task.session_id)
             report = await db.scalar(
-                select(BiReport)
-                .where(BiReport.task_id == task.id)
-                .order_by(BiReport.report_version.desc())
+                select(AnalysisReport)
+                .where(AnalysisReport.task_id == task.id)
+                .order_by(AnalysisReport.version.desc())
             )
             events = list((await db.scalars(select(TaskEvent).where(TaskEvent.task_id == task.id))).all())
             tool_summary: dict[str, dict[str, int]] = {}
@@ -410,18 +410,9 @@ class FollowupSuggestionService:
                 counts = tool_summary.setdefault(platform, {"succeeded": 0, "failed": 0, "unknown": 0})
                 key = "succeeded" if event.event_type == TaskEventType.TOOL_SUCCEEDED else "failed" if event.event_type == TaskEventType.TOOL_FAILED else "unknown"
                 counts[key] += 1
-            chart = (report.chart_data_json if report is not None else {}) or {}
-            overview = chart.get("overview", {}) if isinstance(chart, dict) else {}
-            analytics = chart.get("analytics", {}) if isinstance(chart, dict) else {}
-            bi_summary = {
-                "overview": {
-                    key: overview.get(key)
-                    for key in ("candidate_count", "highest_score", "average_score", "platform_count")
-                    if isinstance(overview, dict) and isinstance(overview.get(key), (int, float, str))
-                },
-                "analytics_available": sorted(analytics.keys()) if isinstance(analytics, dict) else [],
-            }
-            candidate_count = int((overview or {}).get("candidate_count") or 0) if isinstance(overview, dict) else 0
+            # 自由分析报告没有候选/BI 图表数据：摘要字段保持为空，结论来自报告正文。
+            bi_summary: dict[str, Any] = {"overview": {}, "analytics_available": []}
+            candidate_count = 0
             return {
                 "user_query": (user_message.content if user_message else "")[:5_000],
                 "session_filters": {
@@ -436,7 +427,7 @@ class FollowupSuggestionService:
                 "tool_summary": tool_summary,
                 "candidate_count": candidate_count,
                 "bi_summary": bi_summary,
-                "conclusion": (report.conclusion_text if report else "")[:2_000],
+                "conclusion": ((report.conclusion_text or "") if report else "")[:2_000],
             }
 
     async def _persist_success(self, task_id: str, suggestions: list[dict[str, Any]]) -> None:

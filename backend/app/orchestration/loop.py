@@ -13,12 +13,59 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.mcp_gateway.contracts import DataTapService
 from app.mcp_gateway.validation import McpValidationError, validate_input
-from app.orchestration.planner import _SERVICE_CHANNELS, _prune_arguments
 from app.orchestration.schemas import PlanValidationError, PlannerMessage, PlannerTool
 
 
 TRAJECTORY_SCHEMA = "agent_trajectory_v1"
+
+# 各 DataTap 服务实际覆盖的社媒渠道，用于渠道权限校验。
+_SERVICE_CHANNELS: dict[DataTapService, frozenset[str]] = {
+    DataTapService.INSIGHT_CUBE: frozenset(
+        {"xiaohongshu", "douyin", "bilibili", "weibo", "wechat"}
+    ),
+    DataTapService.SOCIAL_GROW: frozenset({"xiaohongshu", "douyin", "weibo", "wechat"}),
+    DataTapService.SOCIAL_GROW_CONTENT: frozenset(
+        {"xiaohongshu", "douyin", "weibo", "wechat"}
+    ),
+    DataTapService.AKTOOLS: frozenset(
+        {"xiaohongshu", "douyin", "bilibili", "weibo", "wechat"}
+    ),
+    DataTapService.BILIBILI: frozenset({"bilibili"}),
+}
+
+
+def _prune_arguments(value: object, schema: dict) -> object:
+    """Recursively remove fields rejected by closed object schemas."""
+    if isinstance(value, list):
+        item_schema = schema.get("items") if isinstance(schema, dict) else None
+        return [_prune_arguments(item, item_schema if isinstance(item_schema, dict) else {}) for item in value]
+    if not isinstance(value, dict) or not isinstance(schema, dict):
+        return value
+
+    variants = [schema]
+    for key in ("anyOf", "oneOf", "allOf"):
+        if isinstance(schema.get(key), list):
+            variants.extend(item for item in schema[key] if isinstance(item, dict))
+    properties: dict[str, dict] = {}
+    for variant in variants:
+        raw_properties = variant.get("properties")
+        if isinstance(raw_properties, dict):
+            properties.update(
+                {name: child for name, child in raw_properties.items() if isinstance(child, dict)}
+            )
+    additional = schema.get("additionalProperties")
+    if additional is False or properties:
+        result: dict[str, object] = {}
+        for key, item in value.items():
+            child_schema = properties.get(key)
+            if child_schema is not None:
+                result[key] = _prune_arguments(item, child_schema)
+            elif additional is not False:
+                result[key] = _prune_arguments(item, additional if isinstance(additional, dict) else {})
+        return result
+    return {key: _prune_arguments(item, {}) for key, item in value.items()}
 
 # DataTap insight 统计工具的 datasource 规范取值（platform__source 格式）。
 # 已向上游核实：平台集合为 小红书/短视频/微博/微信/视频/电商/博客/问答/新闻/论坛，
@@ -132,7 +179,9 @@ class AgentLoopContext(BaseModel):
     tools: tuple[PlannerTool, ...]
     allowed_channels: tuple[str, ...]
     notes: tuple[EvidenceNote, ...] = ()
-    remaining_calls: int = Field(default=10, ge=0, le=10)
+    # BI 报表必需数据项清单（key/label/description/source_tools），模型必须
+    # 逐项用工具覆盖后才允许 finish；空结果视为已满足。
+    required_metrics: tuple[dict[str, Any], ...] = ()
     # 服务端注入的真实日期与解析出的时间窗：模型自身的时间感知不可靠，
     # 曾因此把统计查询落到一年上限之外而拿到空数据。
     current_date: str = ""
@@ -166,8 +215,8 @@ class AgentTrajectory(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     schema_: str = Field(default=TRAJECTORY_SCHEMA, alias="schema")
-    steps: list[TrajectoryStep] = Field(default_factory=list, max_length=10)
-    results: list[EvidenceNote] = Field(default_factory=list, max_length=10)
+    steps: list[TrajectoryStep] = Field(default_factory=list)
+    results: list[EvidenceNote] = Field(default_factory=list)
 
     def as_plan_json(self) -> dict[str, Any]:
         return self.model_dump(mode="json", by_alias=True)
@@ -199,8 +248,8 @@ def resolve_agent_call(
     arguments = normalize_agent_arguments(
         decision.arguments, tool=tool, default_period=context.requested_period
     )
-    # 与 pipeline 一致：模型附加的未声明字段（如 metrics）先剔除，
-    # 不能让一个无害的多余字段毁掉整个可用的调用。
+    # 模型附加的未声明字段（如 metrics）先剔除，不能让一个无害的多余字段
+    # 毁掉整个可用的调用。
     arguments = _prune_arguments(arguments, tool.input_schema)
     if not isinstance(arguments, dict):
         raise PlanValidationError("INVALID_TOOL_ARGUMENTS")
@@ -212,7 +261,7 @@ def resolve_agent_call(
 
 
 def validate_agent_decision(decision: AgentDecision, context: AgentLoopContext) -> PlannerTool:
-    """与 Planner._validate 同款的工具/渠道/参数校验（单步版本）。"""
+    """工具/渠道/参数校验（单步版本），返回匹配到的已审核工具。"""
     tool, _arguments = resolve_agent_call(decision, context)
     return tool
 

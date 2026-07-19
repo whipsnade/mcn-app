@@ -1,10 +1,9 @@
-import { authorizedFetch, request } from './client';
-import type { ApiAnalysisReport, ApiBiReport, ApiCandidatePage, ApiTask } from './contracts';
+import { request } from './client';
+import type { ApiAnalysisReport, ApiTask } from './contracts';
 
 
 export interface CreateTaskInput {
   content: string;
-  scoring_profile?: 'balanced' | 'audience_first' | 'performance_first' | 'budget_first' | 'risk_first';
 }
 
 export function createIdempotencyKey(): string {
@@ -41,31 +40,6 @@ export function retryFollowups(taskId: string): Promise<ApiTask> {
   return request<ApiTask>(`/api/v1/tasks/${taskId}/followups/retry`, { method: 'POST' });
 }
 
-export function getCandidates(taskId: string): Promise<ApiCandidatePage> {
-  return request<ApiCandidatePage>(`/api/v1/tasks/${taskId}/candidates`);
-}
-
-export function getReport(reportId: string): Promise<ApiBiReport> {
-  return request<ApiBiReport>(`/api/v1/reports/${reportId}`);
-}
-
 export function getAnalysisReport(reportId: string): Promise<ApiAnalysisReport> {
   return request<ApiAnalysisReport>(`/api/v1/analysis-reports/${reportId}`);
-}
-
-export interface DownloadedExport {
-  blob: Blob;
-  filename: string;
-}
-
-export async function downloadLatestSessionExport(sessionId: string): Promise<DownloadedExport> {
-  const response = await authorizedFetch(`/api/v1/sessions/${sessionId}/exports/latest.xlsx`);
-  if (!response.ok) {
-    const body = await response.json().catch(() => ({ detail: `HTTP_${response.status}` }));
-    throw new Error(body.detail ?? `HTTP_${response.status}`);
-  }
-  const disposition = response.headers.get('content-disposition') ?? '';
-  const encodedName = disposition.match(/filename\*=UTF-8''([^;]+)/i)?.[1];
-  const filename = encodedName ? decodeURIComponent(encodedName) : 'KOL匹配度分析报告.xlsx';
-  return { blob: await response.blob(), filename };
 }

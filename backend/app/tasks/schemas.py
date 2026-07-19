@@ -6,18 +6,8 @@ from pydantic import BaseModel, Field, field_validator
 from app.tasks.state import TaskEventType, TaskStatus
 
 
-ScoringProfile = Literal[
-    "balanced",
-    "audience_first",
-    "performance_first",
-    "budget_first",
-    "risk_first",
-]
-
-
 class TaskCreate(BaseModel):
     content: str = Field(min_length=1, max_length=20_000)
-    scoring_profile: ScoringProfile = "balanced"
 
     @field_validator("content")
     @classmethod

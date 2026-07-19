@@ -6,8 +6,6 @@ from pydantic import BaseModel, Field, model_validator
 
 from app.reporting.schemas import (
     AnalysisReportSummary,
-    BiReportSummary,
-    CandidateVersionSummary,
     TaskAnalysisSummary,
 )
 
@@ -79,8 +77,6 @@ class SessionRead(BaseModel):
     is_starred: bool
     messages: list[MessageRead]
     latest_task: TaskAnalysisSummary | None = None
-    latest_candidates: CandidateVersionSummary | None = None
-    latest_report: BiReportSummary | None = None
     latest_analysis_report: AnalysisReportSummary | None = None
     created_at: datetime
     updated_at: datetime

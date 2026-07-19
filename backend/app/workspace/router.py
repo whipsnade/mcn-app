@@ -6,8 +6,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_db
 from app.identity.dependencies import CurrentUser
-from app.reporting.router import analysis_report_summary, bi_report_summary
-from app.reporting.schemas import CandidateVersionSummary, TaskAnalysisSummary
+from app.reporting.router import analysis_report_summary
+from app.reporting.schemas import TaskAnalysisSummary
 from app.reporting.service import ReportingService
 from app.reporting.analysis_reports import AnalysisReportService
 from app.tasks.router import get_task_runner
@@ -38,7 +38,6 @@ def public_message_metadata(metadata: dict) -> dict:
     allowed = {
         "task_id",
         "status",
-        "scoring_profile",
         "analysis_task_ids",
         "latest_analysis_task_id",
         "followup_suggestions_status",
@@ -61,11 +60,9 @@ async def session_read(
         await service.list_messages(workspace.user_id, workspace.id) if include_messages else []
     )
     latest_task = None
-    latest_candidates = None
-    latest_report = None
     latest_analysis_report = None
     if include_analysis:
-        task, version, total, report = await ReportingService(service.db).latest_session_analysis(
+        task = await ReportingService(service.db).latest_session_analysis(
             workspace.user_id, workspace.id
         )
         if task is not None:
@@ -78,6 +75,7 @@ async def session_read(
                 ),
                 {},
             )
+            # 历史 kind="pipeline" 行仍可序列化；新任务一律为 agent。
             task_kind = getattr(task, "kind", "pipeline")
             latest_task = TaskAnalysisSummary(
                 id=task.id,
@@ -88,12 +86,6 @@ async def session_read(
                 followup_suggestions=list(followup_metadata.get("followup_suggestions", [])),
                 followup_error=followup_metadata.get("followup_error"),
             )
-        if version is not None:
-            latest_candidates = CandidateVersionSummary(
-                task_id=task.id, version=version, total=total
-            )
-        if report is not None:
-            latest_report = bi_report_summary(report)
         analysis_report = await AnalysisReportService(service.db).latest_session_report(
             workspace.id
         )
@@ -114,8 +106,6 @@ async def session_read(
         is_starred=workspace.is_starred,
         messages=[message_read(message) for message in messages],
         latest_task=latest_task,
-        latest_candidates=latest_candidates,
-        latest_report=latest_report,
         latest_analysis_report=latest_analysis_report,
         created_at=workspace.created_at,
         updated_at=workspace.updated_at,

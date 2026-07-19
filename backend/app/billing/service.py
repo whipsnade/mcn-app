@@ -209,3 +209,52 @@ class WalletService:
             reference_type="mcp_call",
             reference_id=reference_id,
         )
+
+    async def admin_adjust(
+        self,
+        user_id: str,
+        *,
+        delta: int,
+        reason: str,
+        idempotency_key: str,
+        reference_id: str,
+    ) -> tuple[Wallet, WalletTransaction]:
+        """Adjust balance by an administrator. The human-readable reason lives in
+        the admin audit log referenced by reference_id, not on the ledger row."""
+        if delta == 0:
+            raise ValueError("delta_must_be_nonzero")
+        statement = select(WalletTransaction).where(
+            WalletTransaction.idempotency_key == idempotency_key
+        )
+        applied = await self.db.scalar(statement)
+        if applied is not None:
+            return await self.get_wallet(user_id), applied
+        wallet = await self.db.get(Wallet, user_id, with_for_update=True)
+        if wallet is None:
+            wallet = Wallet(
+                user_id=user_id,
+                balance=0,
+                reserved=0,
+                version=0,
+                updated_at=utc_now(),
+            )
+            self.db.add(wallet)
+            await self.db.flush()
+        applied = await self.db.scalar(statement.with_for_update())
+        if applied is not None:
+            return wallet, applied
+        if delta < 0 and wallet.balance + delta < 0:
+            raise InsufficientPointsError()
+        await self._record(
+            wallet,
+            kind="admin_adjust",
+            balance_delta=delta,
+            reserved_delta=0,
+            idempotency_key=idempotency_key,
+            reference_type="admin_adjust",
+            reference_id=reference_id,
+        )
+        transaction = await self.db.scalar(statement)
+        if transaction is None:  # pragma: no cover - _record just flushed it
+            raise LookupError("admin_adjust_transaction_missing")
+        return wallet, transaction

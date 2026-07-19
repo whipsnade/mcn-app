@@ -44,7 +44,6 @@ def test_secret_values_are_not_exposed_by_settings_repr() -> None:
     "changes",
     [
         {"mcp_call_points": 9},
-        {"mcp_max_calls_per_task": 11},
         {"tencent_plan_model": "another-model"},
         {"tencent_plan_base_url": "https://untrusted.example/v1"},
     ],

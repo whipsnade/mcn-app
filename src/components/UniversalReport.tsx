@@ -19,7 +19,7 @@ interface UniversalReportProps {
 const chartColors = ['#4f46e5', '#818cf8', '#14b8a6', '#f59b00', '#0ea5e9', '#f43f4f'];
 
 function isTerminal(status?: string): boolean {
-  return status === 'completed' || status === 'completed_with_warnings';
+  return status === 'completed' || status === 'completed_with_warnings' || status === 'insufficient_balance';
 }
 
 function PanelState({ children }: { children: ReactNode }) {
@@ -58,7 +58,7 @@ function metricValueText(value: string | number): string {
   return String(value);
 }
 
-// 字符串取值无法走 BiMetric 结构时，使用与 MetricCard 一致的卡片样式渲染。
+// 字符串取值无法走 MetricCard 的指标结构时，使用与 MetricCard 一致的卡片样式渲染。
 function StringMetricCard({ item }: { item: ApiAnalysisReportMetricItem }) {
   const delta = textOf(item.delta);
   return (
@@ -318,7 +318,11 @@ function ReportBlockView({ block }: { block: ReportBlock }) {
 export default function UniversalReport({ report, taskStatus }: UniversalReportProps) {
   if (!report) {
     return (
-      <PanelState>{taskStatus && !isTerminal(taskStatus) ? '正在生成分析报告…' : '等待生成分析报告'}</PanelState>
+      <PanelState>
+        {taskStatus === 'insufficient_balance'
+          ? '积分不足，任务未产生报告'
+          : taskStatus && !isTerminal(taskStatus) ? '正在生成分析报告…' : '等待生成分析报告'}
+      </PanelState>
     );
   }
   const blocks = (report.blocks ?? [])

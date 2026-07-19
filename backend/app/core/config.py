@@ -41,7 +41,6 @@ class Settings(BaseSettings):
     # short in the transport.
     datatap_read_timeout_seconds: float = Field(default=300.0, gt=0)
     mcp_call_points: int = 10
-    mcp_max_calls_per_task: int = 10
     mcp_unknown_reconcile_seconds: int = Field(default=300, gt=0)
     task_lease_seconds: int = Field(default=60, gt=0)
 
@@ -68,8 +67,6 @@ class Settings(BaseSettings):
             raise ValueError("TENCENT_PLAN_BASE_URL must use the confirmed provider endpoint")
         if self.mcp_call_points != 10:
             raise ValueError("MCP_CALL_POINTS must be 10")
-        if self.mcp_max_calls_per_task != 10:
-            raise ValueError("MCP_MAX_CALLS_PER_TASK must be 10")
 
         if not self.tencent_plan_api_key.get_secret_value().strip():
             raise ValueError("TENCENT_PLAN_API_KEY must not be blank")

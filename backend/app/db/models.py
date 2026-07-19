@@ -1,3 +1,4 @@
+from app.admin.models import AdminAuditLog
 from app.billing.models import Wallet, WalletTransaction
 from app.identity.models import AuthIdentity, LoginSession, User, UserChannelPermission
 from app.mcp_gateway.models import McpCall, McpToolCatalog, McpToolDiscovery
@@ -16,6 +17,7 @@ from app.workspace.models import Message, WorkspaceSession
 
 
 __all__ = [
+    "AdminAuditLog",
     "AuthIdentity",
     "AnalysisTask",
     "BiReport",

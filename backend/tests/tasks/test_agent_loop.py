@@ -3,6 +3,7 @@ from uuid import NAMESPACE_URL, uuid5
 
 import pytest
 
+from app.billing.service import InsufficientPointsError
 from app.mcp_gateway.contracts import DataTapService
 from app.orchestration.loop import (
     AgentDecision,
@@ -112,9 +113,6 @@ class _FakeStore:
         self.trajectories.append(trajectory_json)
         return True
 
-    async def save_replan(self, task_id, worker_id, replan_json):
-        return True
-
     async def cancel_requested(self, task_id):
         return False
 
@@ -136,6 +134,9 @@ class _FakeStore:
     async def mark_failed(self, task_id, worker_id, code, message=None):
         self.terminal = f"failed:{code}"
 
+    async def mark_insufficient_balance(self, task_id, worker_id):
+        self.terminal = "insufficient_balance"
+
     async def append_event(self, task_id, user_id, event_type, payload):
         self.events.append((str(event_type), payload))
 
@@ -144,14 +145,15 @@ class _FakeStore:
 
 
 class _FakeContextBuilder:
-    async def build(self, user_id, session_id):  # pragma: no cover - pipeline 路径
-        raise AssertionError("pipeline context must not be built for agent tasks")
+    def __init__(self, required_metrics: tuple[dict, ...] = ()) -> None:
+        self._required_metrics = required_metrics
 
     async def build_agent_context(self, user_id, session_id):
         return AgentLoopContext(
             recent_messages=(),
             tools=(_tool(), _stat_tool()),
             allowed_channels=("xiaohongshu", "douyin"),
+            required_metrics=self._required_metrics,
         )
 
 
@@ -159,20 +161,25 @@ class _ScriptedDecider:
     def __init__(self, decisions: list[AgentDecision]) -> None:
         self._decisions = list(decisions)
         self.calls = 0
+        self.contexts: list[AgentLoopContext] = []
 
     async def agent_decide(self, context):
         self.calls += 1
+        self.contexts.append(context)
         return self._decisions.pop(0)
 
 
 class _FakeGateway:
-    def __init__(self, rows: list[tuple]) -> None:
+    def __init__(self, rows: list) -> None:
         self._rows = list(rows)
         self.commands: list[tuple] = []
 
     async def execute_batch(self, commands):
         self.commands.append(commands)
-        return self._rows.pop(0)
+        item = self._rows.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return item
 
 
 class _FakeArtifacts:
@@ -187,21 +194,20 @@ class _FakeArtifacts:
         self.streamed.append(task_id)
 
 
-def _task(max_calls: int = 10, plan_json: dict | None = None) -> SimpleNamespace:
+def _task(plan_json: dict | None = None) -> SimpleNamespace:
     return SimpleNamespace(
         id="task-1",
         user_id="user-1",
         session_id="session-1",
         kind="agent",
         plan_json=plan_json,
-        max_calls=max_calls,
     )
 
 
-def _executor(store, decider, gateway, artifacts) -> TaskExecutor:
+def _executor(store, decider, gateway, artifacts, context_builder=None) -> TaskExecutor:
     return TaskExecutor(
         repository=store,
-        context_builder=_FakeContextBuilder(),
+        context_builder=context_builder or _FakeContextBuilder(),
         planner=decider,
         gateway=gateway,
         artifacts=artifacts,
@@ -236,18 +242,35 @@ async def test_agent_loop_calls_tools_until_finish_then_builds_report() -> None:
 
 
 @pytest.mark.asyncio
-async def test_agent_loop_stops_at_call_budget_without_finish() -> None:
-    task = _task(max_calls=2)
+async def test_agent_loop_insufficient_balance_with_evidence_builds_report() -> None:
+    task = _task()
     store = _FakeStore(task)
     decider = _ScriptedDecider([_call(), _call()])
-    gateway = _FakeGateway([(_settled(),), (_settled(),)])
+    gateway = _FakeGateway([(_settled(),), InsufficientPointsError()])
     artifacts = _FakeArtifacts()
 
     await _executor(store, decider, gateway, artifacts).run(task.id)
 
-    assert store.terminal == "completed"
+    # 已有 settled 证据：仍产出报告与摘要，然后进入余额不足终态。
+    assert store.terminal == "insufficient_balance"
+    assert artifacts.built == [task.id]
+    assert artifacts.streamed == [task.id]
     assert len(gateway.commands) == 2
-    assert decider.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_insufficient_balance_without_evidence_has_no_report() -> None:
+    task = _task()
+    store = _FakeStore(task)
+    decider = _ScriptedDecider([_call()])
+    gateway = _FakeGateway([InsufficientPointsError()])
+    artifacts = _FakeArtifacts()
+
+    await _executor(store, decider, gateway, artifacts).run(task.id)
+
+    assert store.terminal == "insufficient_balance"
+    assert artifacts.built == []
+    assert artifacts.streamed == []
 
 
 @pytest.mark.asyncio
@@ -313,9 +336,9 @@ async def test_agent_loop_unknown_call_interrupts_without_report() -> None:
 
 @pytest.mark.asyncio
 async def test_agent_loop_without_any_evidence_fails() -> None:
-    task = _task(max_calls=2)
+    task = _task()
     store = _FakeStore(task)
-    decider = _ScriptedDecider([_call(), _call()])
+    decider = _ScriptedDecider([_call(), _call(), _finish()])
     gateway = _FakeGateway([(_released(),), (_released(),)])
     artifacts = _FakeArtifacts()
 
@@ -414,3 +437,78 @@ async def test_agent_loop_normalizes_model_arguments_before_invoking() -> None:
     assert arguments["start_time"] == "2025-07-18 23:59:59"
     # 持久化轨迹与网关实参一致（恢复重放依赖这一点）
     assert store.trajectories[-1]["steps"][0]["arguments"] == arguments
+
+
+_VOICE_METRIC = {
+    "key": "brand_voice",
+    "label": "全网品牌声量",
+    "description": "统计周期内全网总声量。",
+    "source_tools": [_TOOL_NAME],
+}
+_UNCOVERABLE_METRIC = {
+    "key": "voice_trend",
+    "label": "声量走势",
+    "description": "按天声量走势。",
+    "source_tools": ["datatap.nonexistent.tool"],
+}
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_finish_rejected_until_required_metric_covered() -> None:
+    task = _task()
+    store = _FakeStore(task)
+    decider = _ScriptedDecider([_finish(), _call(), _finish()])
+    gateway = _FakeGateway([(_settled(),)])
+    artifacts = _FakeArtifacts()
+    context_builder = _FakeContextBuilder(required_metrics=(_VOICE_METRIC,))
+
+    await _executor(store, decider, gateway, artifacts, context_builder).run(task.id)
+
+    assert store.terminal == "completed"
+    assert decider.calls == 3
+    # 第一次 finish 被拒，缺失项清单作为 feedback 回喂进下一轮上下文。
+    gate_note = next(
+        note for note in decider.contexts[1].notes if note.tool == "metric_coverage_gate"
+    )
+    assert "全网品牌声量" in gate_note.summary
+    assert _TOOL_NAME in gate_note.summary
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_finish_allowed_when_metric_call_returned_empty() -> None:
+    task = _task()
+    store = _FakeStore(task)
+    decider = _ScriptedDecider([_call(), _finish()])
+    # 工具调用成功但返回空数据：视为该项已满足，finish 直接放行。
+    gateway = _FakeGateway([(_settled(data={}),)])
+    artifacts = _FakeArtifacts()
+    context_builder = _FakeContextBuilder(required_metrics=(_VOICE_METRIC,))
+
+    await _executor(store, decider, gateway, artifacts, context_builder).run(task.id)
+
+    assert store.terminal == "completed"
+    assert decider.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_finish_allowed_after_reject_streak_limit() -> None:
+    task = _task()
+    store = _FakeStore(task)
+    # 数据项无可用工具：连续 3 次拒绝后第 4 次 finish 放行，防止死循环。
+    decider = _ScriptedDecider([_call(), _finish(), _finish(), _finish(), _finish()])
+    gateway = _FakeGateway([(_settled(),)])
+    artifacts = _FakeArtifacts()
+    context_builder = _FakeContextBuilder(required_metrics=(_UNCOVERABLE_METRIC,))
+
+    await _executor(store, decider, gateway, artifacts, context_builder).run(task.id)
+
+    assert store.terminal == "completed"
+    assert decider.calls == 5
+    # feedback 跨轮累积：按 step_id 去重后应恰好是 3 次拒绝。
+    gate_step_ids = {
+        note.step_id
+        for context in decider.contexts
+        for note in context.notes
+        if note.tool == "metric_coverage_gate"
+    }
+    assert gate_step_ids == {"finish_reject_1", "finish_reject_2", "finish_reject_3"}

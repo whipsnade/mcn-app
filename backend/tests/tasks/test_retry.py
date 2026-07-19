@@ -60,8 +60,8 @@ def test_idempotency_digest_is_stable_and_does_not_expose_raw_key_or_payload() -
     key = "  browser-retry-42  "
     assert idempotency_key_digest(key) == idempotency_key_digest(key.strip())
     assert len(idempotency_key_digest(key)) == 64
-    digest = idempotency_payload_digest("  找达人  ", "balanced")
-    assert digest == idempotency_payload_digest("找达人", "balanced")
+    digest = idempotency_payload_digest("  找达人  ")
+    assert digest == idempotency_payload_digest("找达人")
     assert len(digest) == 64
     assert key.strip() not in digest
 
@@ -70,7 +70,7 @@ def test_idempotency_digest_is_stable_and_does_not_expose_raw_key_or_payload() -
 async def test_create_idempotent_reuses_same_payload_and_rejects_mismatch(monkeypatch) -> None:
     existing = SimpleNamespace(
         id="task-existing",
-        idempotency_payload_hash=idempotency_payload_digest("找达人", "balanced"),
+        idempotency_payload_hash=idempotency_payload_digest("找达人"),
     )
     monkeypatch.setattr(
         "app.tasks.service.WorkspaceService.get_owned_session",

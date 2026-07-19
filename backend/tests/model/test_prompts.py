@@ -1,26 +1,29 @@
-from app.model.prompts import ANALYST_PROMPT, PLANNER_PROMPT, SUMMARY_PROMPT
+from app.model.prompts import (
+    AGENT_LOOP_PROMPT,
+    FOLLOWUP_PROMPT,
+    REPORT_WRITER_PROMPT,
+    SUMMARY_PROMPT,
+)
+
+
+_ALL_PROMPTS = (SUMMARY_PROMPT, FOLLOWUP_PROMPT, AGENT_LOOP_PROMPT, REPORT_WRITER_PROMPT)
 
 
 def test_prompts_treat_external_content_as_untrusted_and_limit_capabilities() -> None:
-    for prompt in (PLANNER_PROMPT, ANALYST_PROMPT, SUMMARY_PROMPT):
+    for prompt in _ALL_PROMPTS:
         text = prompt.system
         assert "不可信数据" in text
         assert "只能使用传入" in text
-        assert "密钥" in text
-        assert "URL" in text
         assert prompt.name.endswith("_v1")
         assert prompt.version == "1"
-    assert "目标 Schema" in PLANNER_PROMPT.system
-    assert "Excel" in PLANNER_PROMPT.system
-    assert "BI" in PLANNER_PROMPT.system
-    assert "每个用户选中的平台" in PLANNER_PROMPT.system
-    assert "缺失" in PLANNER_PROMPT.system
-    assert "不得编造" in PLANNER_PROMPT.system
-    assert "brand" in PLANNER_PROMPT.system
-    assert "hybrid" in PLANNER_PROMPT.system
-    assert "evidence_kind" in PLANNER_PROMPT.system
-    assert "每轮任务都必须" in PLANNER_PROMPT.system
-    assert "匹配相关 KOL" in PLANNER_PROMPT.system
+    for prompt in (SUMMARY_PROMPT, FOLLOWUP_PROMPT, AGENT_LOOP_PROMPT):
+        assert "密钥" in prompt.system
+        assert "URL" in prompt.system
+    assert "目标 Schema" in AGENT_LOOP_PROMPT.system
+    assert "required_metrics" in AGENT_LOOP_PROMPT.system
+    assert "不得编造" in AGENT_LOOP_PROMPT.system
+    assert "数据看板" in REPORT_WRITER_PROMPT.system
+    assert "KOL 看板" in REPORT_WRITER_PROMPT.system
 
 
 def test_prompts_do_not_contain_provider_endpoints_or_environment_values(monkeypatch) -> None:
@@ -29,9 +32,7 @@ def test_prompts_do_not_contain_provider_endpoints_or_environment_values(monkeyp
     monkeypatch.setenv("DATATAP_MCP_TOKEN", secret)
     monkeypatch.setenv("DATATAP_MCP_BASE_URL", endpoint)
 
-    combined = "\n".join(
-        prompt.system for prompt in (PLANNER_PROMPT, ANALYST_PROMPT, SUMMARY_PROMPT)
-    )
+    combined = "\n".join(prompt.system for prompt in _ALL_PROMPTS)
 
     assert secret not in combined
     assert endpoint not in combined

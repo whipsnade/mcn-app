@@ -109,6 +109,52 @@ def test_restore_ignores_missing_or_foreign_plan_json() -> None:
     assert restore_agent_trajectory({"steps": []}).steps == []
 
 
+def test_trajectory_has_no_call_count_cap() -> None:
+    # 调用次数上限已取消：轨迹不再限制 steps/results 长度。
+    trajectory = AgentTrajectory(
+        steps=[
+            TrajectoryStep(
+                id=f"step_{index}",
+                internal_tool_name=_TOOL_NAME,
+                arguments={"keyword": "美妆"},
+            )
+            for index in range(1, 13)
+        ],
+        results=[
+            EvidenceNote(
+                step_id=f"step_{index}",
+                tool=_TOOL_NAME,
+                status="settled",
+                summary={"total": index},
+            )
+            for index in range(1, 13)
+        ],
+    )
+
+    restored = restore_agent_trajectory(trajectory.as_plan_json())
+    assert len(restored.steps) == 12
+    assert len(restored.results) == 12
+
+
+def test_context_carries_required_metrics_without_remaining_calls() -> None:
+    context = AgentLoopContext(
+        recent_messages=(),
+        tools=(_tool(),),
+        allowed_channels=("xiaohongshu",),
+        required_metrics=(
+            {
+                "key": "brand_voice",
+                "label": "全网品牌声量",
+                "description": "声量",
+                "source_tools": [_TOOL_NAME],
+            },
+        ),
+    )
+
+    assert context.required_metrics[0]["key"] == "brand_voice"
+    assert not hasattr(context, "remaining_calls")
+
+
 def test_normalize_maps_platform_aliases_and_dedupes() -> None:
     result = normalize_agent_arguments(
         {"datasource": ["douyin", "bilibili", "B站", "小红书", "短视频__抖音", "weibo"]}

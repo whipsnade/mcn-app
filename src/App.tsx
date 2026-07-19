@@ -1,12 +1,10 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 
-import type { ApiCandidate, ApiCandidatePage, ApiFavorite } from './api/contracts';
-import { createFavorite, deleteFavorite, listFavorites } from './api/favorites';
+import type { ApiFavorite } from './api/contracts';
+import { listFavorites } from './api/favorites';
 import { getWallet } from './api/wallet';
 import { useAuth } from './auth/AuthProvider';
 import AdminPanel from './components/AdminPanel';
-import BiReport from './components/BiReport';
-import CandidateList from './components/CandidateList';
 import ChatArea from './components/ChatArea';
 import FavoritesPanel from './components/FavoritesPanel';
 import LoginPage from './components/LoginPage';
@@ -30,7 +28,6 @@ export default function App() {
   const [mobilePane, setMobilePane] = useState<WorkspacePane>('sessions');
   const [workspaceTab, setWorkspaceTab] = useState<WorkspaceTab>('chat');
   const [favorites, setFavorites] = useState<readonly ApiFavorite[]>([]);
-  const [favoriteRefreshKey, setFavoriteRefreshKey] = useState(0);
 
   const refreshWallet = useCallback(async () => {
     try {
@@ -109,46 +106,6 @@ export default function App() {
     });
   };
 
-  const candidatePage = useMemo<ApiCandidatePage | undefined>(() => {
-    const session = workspace.activeSession;
-    if (!session?.candidates || session.analysis?.candidateVersion === undefined) return undefined;
-    return {
-      task_id: session.analysis.taskId,
-      version: session.analysis.candidateVersion,
-      total: session.candidates.length,
-      items: session.candidates.map(candidate => ({
-        id: candidate.id,
-        kol_id: candidate.kolId,
-        platform: candidate.platform,
-        platform_account_id: candidate.platformAccountId,
-        nickname: candidate.nickname ?? null,
-        profile_url: candidate.profileUrl ?? null,
-        rank: candidate.rank,
-        total_score: candidate.totalScore,
-        scores: candidate.scores,
-        matched_conditions: candidate.matchedConditions,
-        risks: candidate.risks,
-        recommendation: candidate.recommendation,
-        metrics: candidate.metrics,
-      })),
-    };
-  }, [workspace.activeSession]);
-  const favoriteKolIds = useMemo(() => new Set(favorites.map(favorite => favorite.kol_id)), [favorites]);
-
-  const handleFavorite = async (candidate: ApiCandidate) => {
-    if (favoriteKolIds.has(candidate.kol_id)) {
-      await deleteFavorite(candidate.kol_id);
-      syncFavorites(favorites.filter(favorite => favorite.kol_id !== candidate.kol_id));
-    } else {
-      const favorite = await createFavorite({
-        kol_id: candidate.kol_id,
-        source_task_id: workspace.activeSession?.analysis?.taskId,
-      });
-      syncFavorites([...favorites, favorite]);
-    }
-    setFavoriteRefreshKey(current => current + 1);
-  };
-
   if (authStatus === 'loading') {
     return (
       <div className="flex h-screen items-center justify-center bg-slate-50 text-xs font-medium text-slate-500">
@@ -192,7 +149,6 @@ export default function App() {
               <WorkspaceTabs
                 active={workspaceTab}
                 onChange={setWorkspaceTab}
-                candidateCount={candidatePage?.total ?? 0}
                 favoriteCount={favorites.length}
               />
               {workspaceTab === 'chat' && (
@@ -216,16 +172,9 @@ export default function App() {
                   onRetryFollowups={() => workspace.retryFollowups()}
                 />
               )}
-              {workspaceTab === 'candidates' && (
-                <CandidateList
-                  page={candidatePage}
-                  favoriteKolIds={favoriteKolIds}
-                  onFavorite={handleFavorite}
-                />
-              )}
               {workspaceTab === 'favorites' && (
                 <FavoritesPanel
-                  refreshKey={favoriteRefreshKey}
+                  refreshKey={0}
                   onFavoritesChange={syncFavorites}
                 />
               )}
@@ -250,22 +199,10 @@ export default function App() {
         </div>
 
         <div className={`${mobilePane === 'bi' ? 'block' : 'hidden'} h-full min-h-0 w-full shrink-0 xl:block xl:w-auto`}>
-          {workspace.activeSession?.analysis?.kind === 'agent' ? (
-            <UniversalReport
-              report={workspace.activeSession?.analysisReport}
-              taskStatus={(workspace.taskRuntime?.status ?? workspace.activeSession?.analysis?.status) as import('./api/contracts').ApiTaskStatus | undefined}
-            />
-          ) : (
-            <BiReport
-              report={workspace.activeSession?.biReport}
-              candidateVersion={workspace.activeSession?.analysis?.candidateVersion}
-              selectedCandidates={candidatePage?.items}
-              selectedCandidateVersion={candidatePage?.version}
-              sessionId={workspace.activeSession?.id}
-              taskStatus={(workspace.taskRuntime?.status ?? workspace.activeSession?.analysis?.status) as import('./api/contracts').ApiTaskStatus | undefined}
-              hasCandidateData={Boolean(candidatePage?.total)}
-            />
-          )}
+          <UniversalReport
+            report={workspace.activeSession?.analysisReport}
+            taskStatus={(workspace.taskRuntime?.status ?? workspace.activeSession?.analysis?.status) as import('./api/contracts').ApiTaskStatus | undefined}
+          />
         </div>
       </div>
 
@@ -293,10 +230,8 @@ export default function App() {
       {user.role === 'admin' && (
         <AdminPanel
           isOpen={isAdminOpen}
-          readOnly
           onClose={() => setIsAdminOpen(false)}
-          accounts={[]}
-          onUpdateAccounts={() => undefined}
+          currentUserId={user.id}
           currentUserNickname={user.nickname}
         />
       )}

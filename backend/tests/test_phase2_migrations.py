@@ -21,7 +21,7 @@ def test_migration_chain_has_single_head() -> None:
     config = Config(str(backend_dir / "alembic.ini"))
     config.set_main_option("script_location", str(backend_dir / "migrations"))
     heads = ScriptDirectory.from_config(config).get_heads()
-    assert heads == ["0016_session_category_nullable"]
+    assert heads == ["0017_admin_audit_logs"]
 
 
 async def test_phase_two_unique_constraints() -> None:

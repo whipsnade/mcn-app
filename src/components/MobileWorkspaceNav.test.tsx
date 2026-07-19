@@ -11,7 +11,7 @@ describe('MobileWorkspaceNav', () => {
 
     expect(screen.getByRole('button', { name: '会话' }).getAttribute('aria-pressed')).toBe('true');
     fireEvent.click(screen.getByRole('button', { name: '分析对话' }));
-    fireEvent.click(screen.getByRole('button', { name: 'BI 报告' }));
+    fireEvent.click(screen.getByRole('button', { name: '分析报告' }));
 
     expect(onChange).toHaveBeenNthCalledWith(1, 'chat');
     expect(onChange).toHaveBeenNthCalledWith(2, 'bi');

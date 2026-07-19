@@ -16,6 +16,59 @@ export interface ApiWallet {
   available: number;
 }
 
+export interface ApiAdminUser {
+  id: string;
+  nickname: string;
+  role: 'user' | 'admin';
+  status: 'active' | 'disabled';
+  phone: string | null;
+  points: number;
+  reserved_points: number;
+  channels: string[];
+  created_at: string;
+}
+
+export interface ApiAdminUserList {
+  items: ApiAdminUser[];
+  total: number;
+}
+
+export interface ApiAdminUserCreateInput {
+  nickname: string;
+  phone: string;
+  role: 'user' | 'admin';
+  points?: number;
+  channels?: string[];
+}
+
+export interface ApiAdminUserUpdateInput {
+  nickname?: string;
+  phone?: string;
+  role?: 'user' | 'admin';
+  status?: 'active' | 'disabled';
+  channels?: string[];
+}
+
+export interface ApiAdminPointsAdjustResult {
+  points: number;
+  reserved_points: number;
+  transaction_id: string;
+}
+
+export interface ApiPointsHistoryEntry {
+  id: string;
+  kind: string;
+  points: number;
+  session_title: string | null;
+  platform: string | null;
+  created_at: string;
+}
+
+export interface ApiPointsHistory {
+  items: ApiPointsHistoryEntry[];
+  total: number;
+}
+
 export interface ApiMessage {
   id: string;
   role: 'user' | 'assistant' | 'system';
@@ -40,8 +93,6 @@ export interface ApiSession {
   is_starred: boolean;
   messages: ApiMessage[];
   latest_task?: ApiTaskSummary | null;
-  latest_candidates?: ApiCandidateVersionSummary | null;
-  latest_report?: ApiBiReportSummary | null;
   latest_analysis_report?: ApiAnalysisReportSummary | null;
   created_at: string;
   updated_at: string;
@@ -89,144 +140,6 @@ export interface FollowupSuggestion {
   title: string;
   prompt: string;
   rationale: string;
-}
-
-export interface ApiCandidateVersionSummary {
-  task_id: string;
-  version: number;
-  total: number;
-}
-
-export interface ApiBiReportSummary {
-  id: string;
-  task_id: string;
-  report_version: number;
-  candidate_version: number;
-  status: string;
-  generated_at: string;
-}
-
-export interface ApiCandidate {
-  id: string;
-  kol_id: string;
-  platform: string;
-  platform_account_id: string;
-  nickname: string | null;
-  profile_url: string | null;
-  rank: number;
-  total_score: number;
-  scores: Record<string, number | null>;
-  matched_conditions: string[];
-  risks: Array<Record<string, unknown>>;
-  recommendation: string;
-  metrics?: {
-    followers: number | null;
-    quoted_price_cny: number | null;
-    collected_at: string | null;
-    data_completeness: number | null;
-  };
-}
-
-export interface ApiCandidatePage {
-  task_id: string;
-  version: number;
-  total: number;
-  items: ApiCandidate[];
-}
-
-export interface BiMetric {
-  value: number | null;
-  unit: string;
-  available: boolean;
-  coverage: number;
-  source_fields: string[];
-  platforms: string[];
-}
-
-export interface BiDistributionItem {
-  label: string;
-  value: number;
-  unit: string;
-}
-
-export interface BiDistribution {
-  value: number | null;
-  unit: string;
-  available: boolean;
-  coverage: number;
-  source_fields: string[];
-  platforms: string[];
-  items: BiDistributionItem[];
-}
-
-export interface BiSentimentItem {
-  key: string;
-  label: string;
-  value: number;
-  percentage: number;
-}
-
-export interface BiSentiment {
-  available: boolean;
-  coverage: number;
-  source_fields: string[];
-  platforms: string[];
-  items: BiSentimentItem[];
-  hot_words: Array<{ term: string; count: number }>;
-}
-
-export interface BiExposureTrendItem {
-  date: string;
-  value: number;
-  unit: string;
-  platforms: string[];
-}
-
-export interface BiPeriodTrendItem {
-  period: string;
-  value: number;
-  unit: string;
-  platforms: string[];
-}
-
-export interface BiAnalyticsData {
-  overview: {
-    brand_volume: BiMetric;
-    total_exposure: BiMetric;
-    average_engagement_rate: BiMetric;
-  };
-  sentiment: BiSentiment;
-  exposure_trend: BiExposureTrendItem[];
-  volume_trend?: BiPeriodTrendItem[];
-  sentiment_trend?: BiPeriodTrendItem[];
-  audience: {
-    age: BiDistribution;
-    gender: BiDistribution;
-    regions: BiDistribution;
-  };
-}
-
-export interface ApiBiReport {
-  id: string;
-  task_id: string;
-  report_version: number;
-  candidate_version: number;
-  overview: Record<string, unknown>;
-  score_composition: Array<Record<string, unknown>>;
-  audience_content_fit: Record<string, unknown>;
-  platform_distribution: Array<Record<string, unknown>>;
-  budget_analysis: Record<string, unknown>;
-  comparison: Array<Record<string, unknown>>;
-  risks: Array<Record<string, unknown>>;
-  analytics?: BiAnalyticsData;
-  analysis_scope?: 'brand' | 'kol' | 'hybrid';
-  brand_analytics?: BiAnalyticsData;
-  kol_analytics?: BiAnalyticsData;
-  data_availability?: Record<string, unknown>;
-  warnings?: string[];
-  conclusion: string;
-  sources: Array<Record<string, unknown>>;
-  generated_at: string;
 }
 
 export interface ApiAnalysisReportMetricItem {

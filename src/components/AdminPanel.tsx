@@ -1,75 +1,74 @@
-import React, { useState } from 'react';
-import { 
-  Users, UserPlus, Shield, Smartphone, Coins, Check, X, Edit, Trash2, 
-  Search, CheckCircle2, AlertCircle, Sparkles, Filter, RefreshCw,
-  BarChart3, History, Calendar, TrendingUp
+import React, { useCallback, useEffect, useState } from 'react';
+import {
+  Users, UserPlus, Shield, Smartphone, Coins, Check, X, Edit, Trash2,
+  Search, CheckCircle2, AlertCircle, Sparkles, Filter,
+  BarChart3, History, Calendar
 } from 'lucide-react';
-import { 
-  ResponsiveContainer, AreaChart, Area, XAxis, YAxis, Tooltip, 
-  BarChart, Bar, Cell, PieChart, Pie, Legend
+import {
+  ResponsiveContainer, XAxis, YAxis, Tooltip,
+  BarChart, Bar, Cell
 } from 'recharts';
-import { Account } from '../types';
+import type { ApiAdminUser, ApiPointsHistoryEntry } from '../api/contracts';
+import {
+  adjustAdminUserPoints,
+  createAdminUser,
+  deleteAdminUser,
+  getAdminUserPointsHistory,
+  listAdminUsers,
+  updateAdminUser,
+} from '../api/admin';
 
 interface AdminPanelProps {
   isOpen: boolean;
-  readOnly?: boolean;
   onClose: () => void;
-  accounts: Account[];
-  onUpdateAccounts: (accounts: Account[]) => void;
-  currentUserPhone?: string;
+  currentUserId: string;
   currentUserNickname?: string;
 }
 
-export interface PointsHistoryEntry {
+const CHANNEL_OPTIONS = [
+  { slug: 'xiaohongshu', label: '小红书' },
+  { slug: 'douyin', label: '抖音' },
+  { slug: 'bilibili', label: 'B站' },
+  { slug: 'weibo', label: '微博' },
+  { slug: 'wechat', label: '微信' },
+];
+
+const channelLabel = (slug: string): string =>
+  CHANNEL_OPTIONS.find(c => c.slug === slug)?.label ?? slug;
+
+interface HistoryDisplayEntry {
   id: string;
-  sessionTitle: string;
+  kind: string;
+  title: string;
+  platformLabel: string | null;
   date: string;       // "YYYY-MM-DD"
-  points: number;     // points consumed
-  platform: string;   // e.g. "小红书", "抖音"
+  points: number;
 }
 
-export const getPointsHistoryForAccount = (accId: string): PointsHistoryEntry[] => {
-  if (accId === 'acc-1') {
-    return [
-      { id: 'h1', sessionTitle: '完美日记-丝绒雾面系列发布', date: '2026-07-12', points: 450, platform: '小红书' },
-      { id: 'h2', sessionTitle: '雅诗兰黛-双胶原晚霜推广', date: '2026-07-10', points: 300, platform: '抖音' },
-      { id: 'h3', sessionTitle: '安克创新-数码出海社媒监控', date: '2026-07-05', points: 500, platform: 'YouTube' },
-      { id: 'h4', sessionTitle: '花西子-东方彩妆海外众筹', date: '2026-06-20', points: 600, platform: 'Instagram' },
-      { id: 'h5', sessionTitle: '三只松鼠-中秋礼盒爆款打造', date: '2026-06-12', points: 200, platform: '微博' },
-      { id: 'h6', sessionTitle: '李宁-潮流国风卫衣矩阵', date: '2026-05-18', points: 400, platform: 'B站' },
-      { id: 'h7', sessionTitle: '完美日记-心愿眼影盘种草', date: '2025-12-15', points: 350, platform: '小红书' },
-      { id: 'h8', sessionTitle: '蔚来汽车-新车型KOL声量会话', date: '2025-10-08', points: 800, platform: '微信' },
-    ];
-  }
-  if (accId === 'acc-2') {
-    return [
-      { id: 'h21', sessionTitle: '安克创新-无线充电桩首发', date: '2026-07-11', points: 300, platform: '抖音' },
-      { id: 'h22', sessionTitle: 'Anker-氮化镓充电器大促', date: '2026-07-09', points: 250, platform: 'B站' },
-      { id: 'h23', sessionTitle: '安克创新-户外电源野营场景', date: '2026-06-25', points: 400, platform: '小红书' },
-      { id: 'h24', sessionTitle: 'Anker-降噪耳机运动博主投放', date: '2026-05-10', points: 500, platform: '抖音' },
-      { id: 'h25', sessionTitle: 'Anker-车载快充极客评测', date: '2025-11-20', points: 150, platform: 'B站' },
-    ];
-  }
-  if (accId === 'acc-3') {
-    return [
-      { id: 'h31', sessionTitle: '花西子-玉容散气垫推广', date: '2026-07-13', points: 450, platform: '小红书' },
-      { id: 'h32', sessionTitle: '花西子-雕花口红七夕限定', date: '2026-07-08', points: 300, platform: '微博' },
-      { id: 'h33', sessionTitle: '花西子-空气蜜粉周年庆', date: '2026-06-18', points: 250, platform: '小红书' },
-    ];
-  }
-  
-  // For other users, generate a deterministic history based on their id string
-  const numId = parseInt(accId.replace(/\D/g, '')) || 999;
-  return [
-    { id: `${accId}-1`, sessionTitle: 'AI智能对话-常规诊断分析', date: '2026-07-13', points: 200 + (numId % 200), platform: '小红书' },
-    { id: `${accId}-2`, sessionTitle: '渠道声量-交叉基准比对', date: '2026-07-08', points: 150 + (numId % 150), platform: '抖音' },
-    { id: `${accId}-3`, sessionTitle: 'KOL匹配与舆情口碑评测', date: '2026-06-15', points: 300 + (numId % 300), platform: 'B站' },
-  ];
+const KIND_BADGES: Record<string, { label: string; className: string }> = {
+  settle: { label: '消费', className: 'bg-rose-50 text-rose-600 border-rose-100' },
+  welcome_grant: { label: '赠送', className: 'bg-emerald-50 text-emerald-600 border-emerald-100' },
+  admin_adjust: { label: '调整', className: 'bg-amber-50 text-amber-600 border-amber-100' },
 };
 
-const getChartData = (entries: PointsHistoryEntry[], filterType: 'day' | 'month' | 'year') => {
+const mapHistoryEntry = (entry: ApiPointsHistoryEntry): HistoryDisplayEntry => {
+  let title = entry.session_title ?? entry.kind;
+  if (entry.kind === 'settle') title = entry.session_title ?? '未知会话';
+  else if (entry.kind === 'welcome_grant') title = '新人积分赠送';
+  else if (entry.kind === 'admin_adjust') title = '管理员积分调整';
+  return {
+    id: entry.id,
+    kind: entry.kind,
+    title,
+    platformLabel: entry.platform ? channelLabel(entry.platform) : null,
+    date: entry.created_at.slice(0, 10),
+    points: entry.points,
+  };
+};
+
+const getChartData = (entries: HistoryDisplayEntry[], filterType: 'day' | 'month' | 'year') => {
   const groups: { [key: string]: number } = {};
-  
+
   entries.forEach(entry => {
     let key = '';
     const dateParts = entry.date.split('-'); // ["2026", "07", "12"]
@@ -80,7 +79,7 @@ const getChartData = (entries: PointsHistoryEntry[], filterType: 'day' | 'month'
     } else if (filterType === 'year') {
       key = dateParts[0]; // "YYYY"
     }
-    
+
     groups[key] = (groups[key] || 0) + entry.points;
   });
 
@@ -105,24 +104,28 @@ const getChartData = (entries: PointsHistoryEntry[], filterType: 'day' | 'month'
     });
 };
 
-const AVAILABLE_CHANNELS = ["小红书", "抖音", "B站", "微博", "YouTube", "Instagram"];
+const getErrorMessage = (err: unknown, fallback: string): string =>
+  err instanceof Error && err.message ? err.message : fallback;
 
 export default function AdminPanel({
   isOpen,
-  readOnly = false,
   onClose,
-  accounts,
-  onUpdateAccounts,
-  currentUserPhone,
+  currentUserId,
   currentUserNickname
 }: AdminPanelProps) {
+  const [users, setUsers] = useState<ApiAdminUser[]>([]);
+  const [isListLoading, setIsListLoading] = useState(false);
+  const [listError, setListError] = useState('');
   const [searchQuery, setSearchQuery] = useState('');
-  const [selectedFilterChannels, setSelectedFilterChannels] = useState<string[]>([]);
+  const [selectedFilterChannel, setSelectedFilterChannel] = useState('');
   const [isFilterDropdownOpen, setIsFilterDropdownOpen] = useState(false);
   const [isAdding, setIsAdding] = useState(false);
-  const [editingAccount, setEditingAccount] = useState<Account | null>(null);
-  const [selectedHistoryUser, setSelectedHistoryUser] = useState<Account | null>(null);
+  const [editingAccount, setEditingAccount] = useState<ApiAdminUser | null>(null);
+  const [selectedHistoryUser, setSelectedHistoryUser] = useState<ApiAdminUser | null>(null);
   const [historyFilterType, setHistoryFilterType] = useState<'day' | 'month' | 'year'>('day');
+  const [historyEntries, setHistoryEntries] = useState<HistoryDisplayEntry[]>([]);
+  const [isHistoryLoading, setIsHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState('');
 
   // Form states for Add/Edit
   const [formUsername, setFormUsername] = useState('');
@@ -130,66 +133,44 @@ export default function AdminPanel({
   const [formChannels, setFormChannels] = useState<string[]>([]);
   const [formPoints, setFormPoints] = useState(2000);
   const [formRole, setFormRole] = useState<'admin' | 'user'>('user');
+  const [formStatus, setFormStatus] = useState<'active' | 'disabled'>('active');
+  const [isSaving, setIsSaving] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
   const [successMsg, setSuccessMsg] = useState('');
 
-  if (!isOpen) return null;
+  const loadUsers = useCallback(async (keyword: string, channel: string) => {
+    setIsListLoading(true);
+    setListError('');
+    try {
+      const result = await listAdminUsers({
+        keyword: keyword || undefined,
+        channel: channel || undefined,
+        limit: 100,
+      });
+      setUsers(result.items);
+    } catch (err) {
+      setListError(getErrorMessage(err, '加载账号列表失败'));
+    } finally {
+      setIsListLoading(false);
+    }
+  }, []);
 
-  if (readOnly) {
-    return (
-      <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-xs p-4">
-        <div className="w-full max-w-lg overflow-hidden rounded-2xl border border-slate-100 bg-white shadow-2xl animate-in fade-in zoom-in-95 duration-200">
-          <div className="flex items-center justify-between border-b border-slate-100 bg-slate-50/50 px-6 py-4">
-            <div className="flex items-center gap-2.5">
-              <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-indigo-50 text-indigo-600 shadow-inner">
-                <Shield className="h-5 w-5" />
-              </div>
-              <div>
-                <h2 className="text-base font-bold text-slate-800 font-display">系统管理员控制台</h2>
-                <p className="text-[10px] font-medium text-slate-400">当前基础阶段仅开放安全预览</p>
-              </div>
-            </div>
-            <button
-              onClick={onClose}
-              className="flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 transition hover:bg-slate-100 hover:text-slate-600"
-              aria-label="关闭"
-            >
-              <X className="h-4 w-4" />
-            </button>
-          </div>
-
-          <div className="flex flex-col items-center px-8 py-12 text-center">
-            <div className="flex h-14 w-14 items-center justify-center rounded-full bg-slate-100 text-slate-400">
-              <Users className="h-7 w-7 stroke-[1.5]" />
-            </div>
-            <h3 className="mt-4 text-sm font-bold text-slate-800">系统管理暂为只读</h3>
-            <p className="mt-2 max-w-sm text-xs leading-relaxed text-slate-400">
-              用户、渠道权限与积分审计将在管理 API 完成后接入。当前页面不加载模拟账户，也不能修改用户或积分。
-            </p>
-            <span className="mt-4 rounded-lg border border-indigo-100 bg-indigo-50 px-2.5 py-1 text-[10px] font-bold text-indigo-600">
-              当前身份：{currentUserNickname || '系统管理员'}
-            </span>
-          </div>
-
-          <div className="flex justify-end border-t border-slate-100 bg-slate-50 px-6 py-3.5">
-            <button
-              onClick={onClose}
-              className="rounded-lg bg-indigo-600 px-4 py-2 text-xs font-bold text-white shadow-sm transition hover:bg-indigo-700 active:scale-[0.98]"
-            >
-              返回工作区
-            </button>
-          </div>
-        </div>
-      </div>
-    );
-  }
+  // 打开面板 / 搜索词（300ms 防抖）/ 渠道筛选变化时重新拉取列表
+  useEffect(() => {
+    if (!isOpen) return;
+    const timer = setTimeout(() => {
+      void loadUsers(searchQuery.trim(), selectedFilterChannel);
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [isOpen, searchQuery, selectedFilterChannel, loadUsers]);
 
   const handleOpenAdd = () => {
     setFormUsername('');
     setFormPhone('');
-    setFormChannels(["小红书", "抖音"]);
+    setFormChannels(['xiaohongshu', 'douyin']);
     setFormPoints(2000);
     setFormRole('user');
+    setFormStatus('active');
     setErrorMsg('');
     setSuccessMsg('');
     setIsAdding(true);
@@ -197,35 +178,47 @@ export default function AdminPanel({
     setSelectedHistoryUser(null);
   };
 
-  const handleOpenEdit = (acc: Account) => {
+  const handleOpenEdit = (acc: ApiAdminUser) => {
     setEditingAccount(acc);
-    setFormUsername(acc.username);
-    setFormPhone(acc.phone);
+    setFormUsername(acc.nickname);
+    setFormPhone(acc.phone ?? '');
     setFormChannels(acc.channels);
     setFormPoints(acc.points);
     setFormRole(acc.role);
+    setFormStatus(acc.status);
     setErrorMsg('');
     setSuccessMsg('');
     setIsAdding(false);
     setSelectedHistoryUser(null);
   };
 
-  const handleOpenHistory = (acc: Account) => {
+  const handleOpenHistory = async (acc: ApiAdminUser) => {
     setSelectedHistoryUser(acc);
     setHistoryFilterType('day');
     setIsAdding(false);
     setEditingAccount(null);
+    setIsHistoryLoading(true);
+    setHistoryError('');
+    setHistoryEntries([]);
+    try {
+      const result = await getAdminUserPointsHistory(acc.id, { limit: 200 });
+      setHistoryEntries(result.items.map(mapHistoryEntry));
+    } catch (err) {
+      setHistoryError(getErrorMessage(err, '加载积分流水失败'));
+    } finally {
+      setIsHistoryLoading(false);
+    }
   };
 
   const handleToggleChannel = (channel: string) => {
-    setFormChannels(prev => 
-      prev.includes(channel) 
-        ? prev.filter(c => c !== channel) 
+    setFormChannels(prev =>
+      prev.includes(channel)
+        ? prev.filter(c => c !== channel)
         : [...prev, channel]
     );
   };
 
-  const handleSave = (e: React.FormEvent) => {
+  const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMsg('');
     setSuccessMsg('');
@@ -251,119 +244,71 @@ export default function AdminPanel({
       return;
     }
 
-    if (isAdding) {
-      // Check if phone already exists
-      if (accounts.some(a => a.phone === formPhone)) {
-        setErrorMsg('该手机号已注册过账号');
-        return;
+    setIsSaving(true);
+    try {
+      if (isAdding) {
+        await createAdminUser({
+          nickname: formUsername.trim(),
+          phone: formPhone,
+          role: formRole,
+          points: formPoints,
+          channels: formChannels,
+        });
+        setSuccessMsg(`账号「${formUsername.trim()}」创建成功！`);
+      } else if (editingAccount) {
+        await updateAdminUser(editingAccount.id, {
+          nickname: formUsername.trim(),
+          phone: formPhone,
+          role: formRole,
+          channels: formChannels,
+          status: formStatus,
+        });
+        if (formPoints !== editingAccount.points) {
+          await adjustAdminUserPoints(
+            editingAccount.id,
+            formPoints - editingAccount.points,
+            '管理后台积分调整',
+            crypto.randomUUID(),
+          );
+        }
+        setSuccessMsg(`账号「${formUsername.trim()}」修改成功！`);
       }
 
-      const newAcc: Account = {
-        id: `acc-${Date.now()}`,
-        username: formUsername.trim(),
-        phone: formPhone,
-        channels: formChannels,
-        points: formPoints,
-        role: formRole,
-        createdAt: new Date().toLocaleDateString('zh-CN')
-      };
-
-      onUpdateAccounts([...accounts, newAcc]);
-      setSuccessMsg(`账号「${formUsername}」创建成功！`);
+      await loadUsers(searchQuery.trim(), selectedFilterChannel);
       setTimeout(() => {
         setIsAdding(false);
-        setSuccessMsg('');
-      }, 1500);
-
-    } else if (editingAccount) {
-      // Edit mode
-      // Check duplicate phone except self
-      if (accounts.some(a => a.phone === formPhone && a.id !== editingAccount.id)) {
-        setErrorMsg('该手机号已被其他账号使用');
-        return;
-      }
-
-      const updated = accounts.map(a => 
-        a.id === editingAccount.id 
-          ? { 
-              ...a, 
-              username: formUsername.trim(), 
-              phone: formPhone, 
-              channels: formChannels, 
-              points: formPoints,
-              role: formRole
-            }
-          : a
-      );
-
-      onUpdateAccounts(updated);
-      setSuccessMsg(`账号「${formUsername}」修改成功！`);
-      setTimeout(() => {
         setEditingAccount(null);
         setSuccessMsg('');
       }, 1500);
+    } catch (err) {
+      setErrorMsg(getErrorMessage(err, '保存失败，请稍后重试'));
+    } finally {
+      setIsSaving(false);
     }
   };
 
-  const handleDelete = (id: string, name: string) => {
-    if (confirm(`确认要删除账号「${name}」吗？`)) {
-      onUpdateAccounts(accounts.filter(a => a.id !== id));
+  const handleDelete = async (id: string, name: string) => {
+    if (!confirm(`确认要删除账号「${name}」吗？`)) return;
+    try {
+      await deleteAdminUser(id);
+      await loadUsers(searchQuery.trim(), selectedFilterChannel);
+    } catch (err) {
+      setListError(getErrorMessage(err, '删除账号失败'));
     }
   };
 
-  const handleResetData = () => {
-    if (confirm('确认要重置账号列表为系统默认演示数据吗？')) {
-      const defaultAccounts: Account[] = [
-        {
-          id: 'acc-1',
-          username: '系统超级管理员',
-          phone: '18888888888',
-          channels: ["小红书", "抖音", "B站", "微博", "YouTube", "Instagram"],
-          points: 5000,
-          role: 'admin',
-          createdAt: '2026-01-01'
-        },
-        {
-          id: 'acc-2',
-          username: '手机用户_Anker',
-          phone: '13812345678',
-          channels: ["小红书", "抖音", "B站"],
-          points: 3450,
-          role: 'user',
-          createdAt: '2026-06-15'
-        },
-        {
-          id: 'acc-3',
-          username: '微信快捷登录用户',
-          phone: '13900001111',
-          channels: ["小红书", "微博"],
-          points: 1200,
-          role: 'user',
-          createdAt: '2026-07-01'
-        }
-      ];
-      onUpdateAccounts(defaultAccounts);
-    }
-  };
+  if (!isOpen) return null;
 
-  const filteredAccounts = accounts.filter(acc => {
-    const matchesSearch = 
-      acc.username.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      acc.phone.includes(searchQuery);
-    
-    const matchesChannel = 
-      selectedFilterChannels.length === 0 || 
-      acc.channels.some(ch => selectedFilterChannels.includes(ch));
-
-    return matchesSearch && matchesChannel;
-  });
+  const settleEntries = historyEntries.filter(entry => entry.kind === 'settle');
+  const totalConsumed = settleEntries.reduce((sum, item) => sum + item.points, 0);
+  const chartData = getChartData(settleEntries, historyFilterType);
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-xs p-4 overflow-y-auto">
       <div className={`bg-white rounded-2xl border border-slate-100 shadow-2xl w-full max-h-[90vh] flex flex-col overflow-hidden animate-in fade-in zoom-in-95 duration-200 transition-all ${
         selectedHistoryUser ? 'max-w-5xl' : 'max-w-4xl'
       }`}>
-        
+
         {/* Header */}
         <div className="px-6 py-4 border-b border-slate-100 bg-slate-50/50 flex items-center justify-between">
           <div className="flex items-center gap-2.5">
@@ -375,7 +320,7 @@ export default function AdminPanel({
               <p className="text-[10px] text-slate-400 font-medium">配置多用户渠道权限、增删账号、自由调配账号积分余额</p>
             </div>
           </div>
-          <button 
+          <button
             onClick={onClose}
             className="h-8 w-8 rounded-lg flex items-center justify-center text-slate-400 hover:text-slate-600 hover:bg-slate-100 transition"
           >
@@ -385,10 +330,10 @@ export default function AdminPanel({
 
         {/* Content Area */}
         <div className="flex-1 overflow-y-auto flex flex-col md:flex-row min-h-0">
-          
+
           {/* Left panel: List of accounts */}
           <div className="flex-1 p-6 border-r border-slate-100 flex flex-col min-h-0 space-y-4">
-            
+
             {/* Filter & Add Actions */}
             <div className="flex flex-col sm:flex-row gap-2 justify-between">
               <div className="flex items-center gap-2 flex-1 max-w-md">
@@ -410,52 +355,38 @@ export default function AdminPanel({
                   >
                     <Filter className="h-3.5 w-3.5 text-slate-400" />
                     <span>
-                      {selectedFilterChannels.length === 0 
-                        ? '所有渠道权限' 
-                        : `已选渠道 (${selectedFilterChannels.length})`
+                      {selectedFilterChannel === ''
+                        ? '所有渠道'
+                        : channelLabel(selectedFilterChannel)
                       }
                     </span>
                   </button>
 
                   {isFilterDropdownOpen && (
                     <>
-                      <div 
-                        className="fixed inset-0 z-10" 
-                        onClick={() => setIsFilterDropdownOpen(false)} 
+                      <div
+                        className="fixed inset-0 z-10"
+                        onClick={() => setIsFilterDropdownOpen(false)}
                       />
                       <div className="absolute right-0 mt-1.5 w-44 bg-white rounded-xl border border-slate-100 shadow-xl p-1.5 z-20 space-y-0.5 animate-in fade-in slide-in-from-top-1 duration-150 text-[11px] max-h-60 overflow-y-auto">
-                        <div className="px-2 py-1 border-b border-slate-100 flex items-center justify-between text-[9px] font-bold text-slate-400">
-                          <span>渠道多选筛选</span>
-                          {selectedFilterChannels.length > 0 && (
-                            <button 
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                setSelectedFilterChannels([]);
-                              }}
-                              className="text-indigo-600 hover:text-indigo-800"
-                            >
-                              重置
-                            </button>
-                          )}
+                        <div className="px-2 py-1 border-b border-slate-100 text-[9px] font-bold text-slate-400">
+                          渠道筛选（单选）
                         </div>
-                        {AVAILABLE_CHANNELS.map(ch => {
-                          const isSelected = selectedFilterChannels.includes(ch);
+                        {[{ slug: '', label: '所有渠道' }, ...CHANNEL_OPTIONS].map(ch => {
+                          const isSelected = selectedFilterChannel === ch.slug;
                           return (
                             <button
-                              key={ch}
+                              key={ch.slug || 'all'}
                               type="button"
                               onClick={() => {
-                                setSelectedFilterChannels(prev => 
-                                  isSelected 
-                                    ? prev.filter(c => c !== ch) 
-                                    : [...prev, ch]
-                                );
+                                setSelectedFilterChannel(ch.slug);
+                                setIsFilterDropdownOpen(false);
                               }}
                               className={`w-full py-1 px-2 rounded-md text-left font-medium transition flex items-center justify-between hover:bg-slate-50 ${
                                 isSelected ? 'bg-indigo-50/50 text-indigo-600 font-semibold' : 'text-slate-600'
                               }`}
                             >
-                              <span>{ch}</span>
+                              <span>{ch.label}</span>
                               {isSelected && <Check className="h-3.5 w-3.5 text-indigo-600 shrink-0" />}
                             </button>
                           );
@@ -468,14 +399,6 @@ export default function AdminPanel({
 
               <div className="flex gap-1.5 shrink-0">
                 <button
-                  onClick={handleResetData}
-                  className="px-3 py-1.5 text-xs font-bold text-slate-500 hover:text-indigo-600 bg-white hover:bg-indigo-50 border border-slate-200 hover:border-indigo-100 rounded-lg transition flex items-center gap-1 active:scale-95"
-                  title="重置测试数据"
-                >
-                  <RefreshCw className="h-3.5 w-3.5" />
-                  <span>重置</span>
-                </button>
-                <button
                   onClick={handleOpenAdd}
                   className="px-3.5 py-1.5 text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-700 rounded-lg shadow-sm transition flex items-center gap-1.5 active:scale-95"
                 >
@@ -485,28 +408,40 @@ export default function AdminPanel({
               </div>
             </div>
 
+            {listError && (
+              <div className="flex items-center gap-1.5 bg-rose-50 border border-rose-100 p-2.5 rounded-lg text-rose-600 text-xs font-medium">
+                <AlertCircle className="h-3.5 w-3.5 shrink-0" />
+                <span>{listError}</span>
+              </div>
+            )}
+
             {/* Account List Grid */}
             <div className="flex-1 overflow-y-auto border border-slate-100 rounded-xl bg-slate-50/20 max-h-[50vh] md:max-h-none">
-              {filteredAccounts.length === 0 ? (
+              {isListLoading ? (
+                <div className="flex flex-col items-center justify-center py-16 text-slate-400">
+                  <Users className="h-10 w-10 text-slate-300 mb-2 stroke-[1.5] animate-pulse" />
+                  <p className="text-xs">账号列表加载中...</p>
+                </div>
+              ) : users.length === 0 ? (
                 <div className="flex flex-col items-center justify-center py-16 text-slate-400">
                   <Users className="h-10 w-10 text-slate-300 mb-2 stroke-[1.5]" />
                   <p className="text-xs">未找到符合条件的账号记录</p>
                 </div>
               ) : (
                 <div className="divide-y divide-slate-100">
-                  {filteredAccounts.map(acc => {
-                    const isSelf = currentUserPhone === acc.phone;
+                  {users.map(acc => {
+                    const isSelf = acc.id === currentUserId;
                     return (
-                      <div 
-                        key={acc.id} 
+                      <div
+                        key={acc.id}
                         className={`p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 hover:bg-indigo-50/10 transition duration-150 ${
-                          editingAccount?.id === acc.id ? 'bg-indigo-50/25 border-l-2 border-indigo-500' : 
+                          editingAccount?.id === acc.id ? 'bg-indigo-50/25 border-l-2 border-indigo-500' :
                           selectedHistoryUser?.id === acc.id ? 'bg-amber-50/25 border-l-2 border-amber-500' : ''
                         }`}
                       >
                         <div className="space-y-1">
                           <div className="flex items-center gap-2">
-                            <span className="font-bold text-xs text-slate-800">{acc.username}</span>
+                            <span className="font-bold text-xs text-slate-800">{acc.nickname}</span>
                             {acc.role === 'admin' ? (
                               <span className="text-[9px] font-extrabold px-1.5 py-0.2 rounded bg-amber-50 text-amber-600 border border-amber-200/50 flex items-center gap-0.5">
                                 <Shield className="h-2 w-2" />
@@ -515,6 +450,11 @@ export default function AdminPanel({
                             ) : (
                               <span className="text-[9px] font-bold px-1.5 py-0.2 rounded bg-slate-100 text-slate-500 border border-slate-200/50">
                                 渠道分析师
+                              </span>
+                            )}
+                            {acc.status === 'disabled' && (
+                              <span className="text-[9px] font-bold px-1.5 py-0.2 rounded bg-rose-50 text-rose-600 border border-rose-200/50">
+                                已禁用
                               </span>
                             )}
                             {isSelf && (
@@ -526,22 +466,22 @@ export default function AdminPanel({
                           <div className="flex items-center gap-3 text-[10.5px] text-slate-500">
                             <span className="flex items-center gap-1 font-mono">
                               <Smartphone className="h-3 w-3 text-slate-400" />
-                              {acc.phone}
+                              {acc.phone ?? '未绑定手机'}
                             </span>
                             <span className="flex items-center gap-1 font-semibold text-slate-700">
                               <Coins className="h-3 w-3 text-amber-500" />
                               积分: {acc.points.toLocaleString()}
                             </span>
                           </div>
-                          
+
                           {/* Channel Permits */}
                           <div className="flex flex-wrap gap-1 pt-1.5">
                             {acc.channels.map(ch => (
-                              <span 
-                                key={ch} 
+                              <span
+                                key={ch}
                                 className="text-[9px] font-semibold px-1.5 py-0.2 bg-indigo-50 text-indigo-600 rounded border border-indigo-100/40"
                               >
-                                {ch}
+                                {channelLabel(ch)}
                               </span>
                             ))}
                           </div>
@@ -550,7 +490,7 @@ export default function AdminPanel({
                         {/* Actions */}
                         <div className="flex items-center gap-1.5 self-end sm:self-center">
                           <button
-                            onClick={() => handleOpenHistory(acc)}
+                            onClick={() => void handleOpenHistory(acc)}
                             className={`p-1.5 rounded-lg transition ${
                               selectedHistoryUser?.id === acc.id
                                 ? 'text-amber-600 bg-amber-50'
@@ -568,11 +508,11 @@ export default function AdminPanel({
                             <Edit className="h-3.5 w-3.5" />
                           </button>
                           <button
-                            onClick={() => handleDelete(acc.id, acc.username)}
+                            onClick={() => void handleDelete(acc.id, acc.nickname)}
                             disabled={isSelf}
                             className={`p-1.5 rounded-lg transition ${
-                              isSelf 
-                                ? 'text-slate-200 cursor-not-allowed' 
+                              isSelf
+                                ? 'text-slate-200 cursor-not-allowed'
                                 : 'text-slate-400 hover:text-rose-600 hover:bg-rose-50'
                             }`}
                             title={isSelf ? "无法删除当前登录的主管理员账号" : "删除账号"}
@@ -596,7 +536,7 @@ export default function AdminPanel({
                   <Sparkles className="h-3.5 w-3.5 text-indigo-500" />
                   {isAdding ? '新增成员账号' : '修改/设置账号信息'}
                 </h3>
-                <button 
+                <button
                   onClick={() => { setIsAdding(false); setEditingAccount(null); }}
                   className="text-slate-400 hover:text-slate-600 text-xs font-bold"
                 >
@@ -604,7 +544,7 @@ export default function AdminPanel({
                 </button>
               </div>
 
-              <form onSubmit={handleSave} className="space-y-4 text-xs">
+              <form onSubmit={e => void handleSave(e)} className="space-y-4 text-xs">
                 {errorMsg && (
                   <div className="flex items-center gap-1.5 bg-rose-50 border border-rose-100 p-2.5 rounded-lg text-rose-600 font-medium">
                     <AlertCircle className="h-3.5 w-3.5 shrink-0" />
@@ -648,7 +588,9 @@ export default function AdminPanel({
 
                 {/* Points */}
                 <div className="space-y-1">
-                  <label className="block text-[10px] font-bold text-slate-400 uppercase">设置积分余额</label>
+                  <label className="block text-[10px] font-bold text-slate-400 uppercase">
+                    {isAdding ? '初始积分余额' : '调整积分余额'}
+                  </label>
                   <div className="flex gap-1.5 items-center">
                     <input
                       type="number"
@@ -715,24 +657,53 @@ export default function AdminPanel({
                   </div>
                 </div>
 
+                {/* Status (edit only, hidden for self) */}
+                {!isAdding && editingAccount && editingAccount.id !== currentUserId && (
+                  <div className="space-y-1">
+                    <label className="block text-[10px] font-bold text-slate-400 uppercase">账号状态</label>
+                    <div className="flex gap-2">
+                      <label className="flex-1 flex items-center gap-1.5 p-2 bg-white border border-slate-200 rounded-lg cursor-pointer hover:bg-indigo-50/10 transition">
+                        <input
+                          type="radio"
+                          name="formStatus"
+                          checked={formStatus === 'active'}
+                          onChange={() => setFormStatus('active')}
+                          className="text-indigo-600 focus:ring-indigo-500 h-3.5 w-3.5"
+                        />
+                        <span>正常</span>
+                      </label>
+                      <label className="flex-1 flex items-center gap-1.5 p-2 bg-white border border-slate-200 rounded-lg cursor-pointer hover:bg-rose-50/30 transition">
+                        <input
+                          type="radio"
+                          name="formStatus"
+                          checked={formStatus === 'disabled'}
+                          onChange={() => setFormStatus('disabled')}
+                          className="text-rose-600 focus:ring-rose-500 h-3.5 w-3.5"
+                        />
+                        <span>禁用</span>
+                      </label>
+                    </div>
+                  </div>
+                )}
+
                 {/* Channel Permissions checkboxes */}
                 <div className="space-y-1.5">
                   <label className="block text-[10px] font-bold text-slate-400 uppercase">渠道分析权限</label>
                   <div className="grid grid-cols-2 gap-1.5">
-                    {AVAILABLE_CHANNELS.map(ch => {
-                      const isSelected = formChannels.includes(ch);
+                    {CHANNEL_OPTIONS.map(ch => {
+                      const isSelected = formChannels.includes(ch.slug);
                       return (
                         <button
-                          key={ch}
+                          key={ch.slug}
                           type="button"
-                          onClick={() => handleToggleChannel(ch)}
+                          onClick={() => handleToggleChannel(ch.slug)}
                           className={`py-1.5 px-2 rounded-lg border text-left font-medium transition flex items-center justify-between ${
-                            isSelected 
-                              ? 'bg-indigo-50 border-indigo-200 text-indigo-700 font-semibold' 
+                            isSelected
+                              ? 'bg-indigo-50 border-indigo-200 text-indigo-700 font-semibold'
                               : 'bg-white border-slate-200 text-slate-500 hover:bg-slate-50'
                           }`}
                         >
-                          <span>{ch}</span>
+                          <span>{ch.label}</span>
                           {isSelected && <Check className="h-3 w-3 text-indigo-600 shrink-0" />}
                         </button>
                       );
@@ -751,9 +722,12 @@ export default function AdminPanel({
                   </button>
                   <button
                     type="submit"
-                    className="flex-1 py-2 bg-indigo-600 hover:bg-indigo-700 text-white font-bold rounded-lg shadow-sm transition text-center"
+                    disabled={isSaving}
+                    className={`flex-1 py-2 text-white font-bold rounded-lg shadow-sm transition text-center ${
+                      isSaving ? 'bg-indigo-300 cursor-not-allowed' : 'bg-indigo-600 hover:bg-indigo-700'
+                    }`}
                   >
-                    {isAdding ? '立即添加' : '保存修改'}
+                    {isSaving ? '保存中...' : isAdding ? '立即添加' : '保存修改'}
                   </button>
                 </div>
               </form>
@@ -764,10 +738,10 @@ export default function AdminPanel({
                 <div className="flex items-center gap-1.5">
                   <History className="h-4 w-4 text-amber-500 shrink-0" />
                   <span className="text-xs font-bold text-slate-800 font-display">
-                    「{selectedHistoryUser.username}」积分消耗分析
+                    「{selectedHistoryUser.nickname}」积分消耗分析
                   </span>
                 </div>
-                <button 
+                <button
                   onClick={() => setSelectedHistoryUser(null)}
                   className="text-slate-400 hover:text-slate-600 text-xs font-bold"
                 >
@@ -775,128 +749,164 @@ export default function AdminPanel({
                 </button>
               </div>
 
-              {/* Day/Month/Year Switcher */}
-              <div className="mb-4 bg-slate-100 p-0.5 rounded-lg flex text-xs">
-                {(['day', 'month', 'year'] as const).map(type => (
-                  <button
-                    key={type}
-                    type="button"
-                    onClick={() => setHistoryFilterType(type)}
-                    className={`flex-1 py-1.5 text-center font-bold rounded-md transition ${
-                      historyFilterType === type 
-                        ? 'bg-white text-slate-800 shadow-xs' 
-                        : 'text-slate-400 hover:text-slate-600'
-                    }`}
-                  >
-                    {type === 'day' ? '按天' : type === 'month' ? '按月' : '按年'}
-                  </button>
-                ))}
-              </div>
-
-              {/* Chart Section */}
-              <div className="bg-white border border-slate-100 rounded-xl p-4 shadow-xs space-y-3 mb-4">
-                <div className="flex items-center justify-between">
-                  <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">
-                    消耗趋势 ({historyFilterType === 'day' ? '日趋势' : historyFilterType === 'month' ? '月趋势' : '年趋势'})
-                  </span>
-                  <div className="flex items-center gap-1 text-[11px] font-semibold text-amber-600 bg-amber-50 px-2 py-0.5 rounded-md">
-                    <Coins className="h-3 w-3" />
-                    <span>总消耗: {getPointsHistoryForAccount(selectedHistoryUser.id).reduce((sum, item) => sum + item.points, 0).toLocaleString()} 积分</span>
-                  </div>
+              {isHistoryLoading ? (
+                <div className="flex-1 flex flex-col items-center justify-center text-slate-400 py-16">
+                  <History className="h-8 w-8 text-slate-300 stroke-[1.5] mb-1.5 animate-pulse" />
+                  <p className="text-[10.5px]">积分流水加载中...</p>
                 </div>
-
-                <div className="h-44 w-full text-xs">
-                  {getPointsHistoryForAccount(selectedHistoryUser.id).length === 0 ? (
-                    <div className="h-full flex flex-col items-center justify-center text-slate-400">
-                      <BarChart3 className="h-8 w-8 text-slate-300 stroke-[1.5] mb-1.5" />
-                      <p className="text-[10.5px]">暂无历史消耗数据</p>
-                    </div>
-                  ) : (
-                    <ResponsiveContainer width="100%" height="100%">
-                      <BarChart 
-                        data={getChartData(getPointsHistoryForAccount(selectedHistoryUser.id), historyFilterType)}
-                        margin={{ top: 10, right: 10, left: -25, bottom: 0 }}
+              ) : historyError ? (
+                <div className="flex items-center gap-1.5 bg-rose-50 border border-rose-100 p-2.5 rounded-lg text-rose-600 text-xs font-medium">
+                  <AlertCircle className="h-3.5 w-3.5 shrink-0" />
+                  <span>{historyError}</span>
+                </div>
+              ) : (
+                <>
+                  {/* Day/Month/Year Switcher */}
+                  <div className="mb-4 bg-slate-100 p-0.5 rounded-lg flex text-xs">
+                    {(['day', 'month', 'year'] as const).map(type => (
+                      <button
+                        key={type}
+                        type="button"
+                        onClick={() => setHistoryFilterType(type)}
+                        className={`flex-1 py-1.5 text-center font-bold rounded-md transition ${
+                          historyFilterType === type
+                            ? 'bg-white text-slate-800 shadow-xs'
+                            : 'text-slate-400 hover:text-slate-600'
+                        }`}
                       >
-                        <XAxis 
-                          dataKey="name" 
-                          stroke="#94a3b8" 
-                          fontSize={9} 
-                          tickLine={false} 
-                          axisLine={false}
-                        />
-                        <YAxis 
-                          stroke="#94a3b8" 
-                          fontSize={9} 
-                          tickLine={false} 
-                          axisLine={false}
-                        />
-                        <Tooltip 
-                          content={({ active, payload }) => {
-                            if (active && payload && payload.length) {
-                              return (
-                                <div className="bg-slate-900 text-white text-[10px] p-2 rounded-lg shadow-md font-sans border border-slate-800">
-                                  <p className="font-bold border-b border-slate-800 pb-1 mb-1">
-                                    {payload[0].payload.rawKey || payload[0].payload.name}
-                                  </p>
-                                  <p className="flex items-center gap-1 font-medium text-amber-400">
-                                    <Coins className="h-3 w-3 text-amber-400" />
-                                    <span>消耗: {payload[0].value} 积分</span>
-                                  </p>
-                                </div>
-                              );
-                            }
-                            return null;
-                          }}
-                        />
-                        <Bar 
-                          dataKey="points" 
-                          fill="#4f46e5" 
-                          radius={[4, 4, 0, 0]}
-                        >
-                          {getChartData(getPointsHistoryForAccount(selectedHistoryUser.id), historyFilterType).map((entry, idx) => (
-                            <Cell 
-                              key={`cell-${idx}`} 
-                              fill={idx % 2 === 0 ? '#4f46e5' : '#818cf8'} 
-                            />
-                          ))}
-                        </Bar>
-                      </BarChart>
-                    </ResponsiveContainer>
-                  )}
-                </div>
-              </div>
+                        {type === 'day' ? '按天' : type === 'month' ? '按月' : '按年'}
+                      </button>
+                    ))}
+                  </div>
 
-              {/* Ledger List */}
-              <div className="flex-1 min-h-0 flex flex-col space-y-2">
-                <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">
-                  消费明细流水 (历史营销会话)
-                </span>
-                <div className="flex-1 overflow-y-auto border border-slate-100 rounded-xl bg-white divide-y divide-slate-50 p-1">
-                  {getPointsHistoryForAccount(selectedHistoryUser.id).map(entry => (
-                    <div key={entry.id} className="p-2.5 flex items-center justify-between text-xs hover:bg-slate-50 rounded-lg transition duration-150">
-                      <div className="space-y-1 min-w-0 pr-2">
-                        <p className="font-bold text-slate-700 truncate text-[11px]" title={entry.sessionTitle}>
-                          {entry.sessionTitle}
-                        </p>
-                        <div className="flex items-center gap-2 text-[10px] text-slate-400 font-medium">
-                          <span className="flex items-center gap-0.5 bg-indigo-50/50 text-indigo-600 px-1 py-0.2 rounded border border-indigo-100/20 shrink-0">
-                            {entry.platform}
-                          </span>
-                          <span className="flex items-center gap-0.5">
-                            <Calendar className="h-2.5 w-2.5" />
-                            {entry.date}
-                          </span>
-                        </div>
-                      </div>
-                      <div className="text-right shrink-0">
-                        <span className="text-[11px] font-extrabold text-rose-600 bg-rose-50 border border-rose-100 px-1.5 py-0.5 rounded font-mono">
-                          -{entry.points}
-                        </span>
+                  {/* Chart Section */}
+                  <div className="bg-white border border-slate-100 rounded-xl p-4 shadow-xs space-y-3 mb-4">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">
+                        消耗趋势 ({historyFilterType === 'day' ? '日趋势' : historyFilterType === 'month' ? '月趋势' : '年趋势'})
+                      </span>
+                      <div className="flex items-center gap-1 text-[11px] font-semibold text-amber-600 bg-amber-50 px-2 py-0.5 rounded-md">
+                        <Coins className="h-3 w-3" />
+                        <span>总消耗: {totalConsumed.toLocaleString()} 积分</span>
                       </div>
                     </div>
-                  ))}
-                </div>
-              </div>
+
+                    <div className="h-44 w-full text-xs">
+                      {settleEntries.length === 0 ? (
+                        <div className="h-full flex flex-col items-center justify-center text-slate-400">
+                          <BarChart3 className="h-8 w-8 text-slate-300 stroke-[1.5] mb-1.5" />
+                          <p className="text-[10.5px]">暂无历史消耗数据</p>
+                        </div>
+                      ) : (
+                        <ResponsiveContainer width="100%" height="100%">
+                          <BarChart
+                            data={chartData}
+                            margin={{ top: 10, right: 10, left: -25, bottom: 0 }}
+                          >
+                            <XAxis
+                              dataKey="name"
+                              stroke="#94a3b8"
+                              fontSize={9}
+                              tickLine={false}
+                              axisLine={false}
+                            />
+                            <YAxis
+                              stroke="#94a3b8"
+                              fontSize={9}
+                              tickLine={false}
+                              axisLine={false}
+                            />
+                            <Tooltip
+                              content={({ active, payload }) => {
+                                if (active && payload && payload.length) {
+                                  return (
+                                    <div className="bg-slate-900 text-white text-[10px] p-2 rounded-lg shadow-md font-sans border border-slate-800">
+                                      <p className="font-bold border-b border-slate-800 pb-1 mb-1">
+                                        {payload[0].payload.rawKey || payload[0].payload.name}
+                                      </p>
+                                      <p className="flex items-center gap-1 font-medium text-amber-400">
+                                        <Coins className="h-3 w-3 text-amber-400" />
+                                        <span>消耗: {payload[0].value} 积分</span>
+                                      </p>
+                                    </div>
+                                  );
+                                }
+                                return null;
+                              }}
+                            />
+                            <Bar
+                              dataKey="points"
+                              fill="#4f46e5"
+                              radius={[4, 4, 0, 0]}
+                            >
+                              {chartData.map((entry, idx) => (
+                                <Cell
+                                  key={`cell-${idx}`}
+                                  fill={idx % 2 === 0 ? '#4f46e5' : '#818cf8'}
+                                />
+                              ))}
+                            </Bar>
+                          </BarChart>
+                        </ResponsiveContainer>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Ledger List */}
+                  <div className="flex-1 min-h-0 flex flex-col space-y-2">
+                    <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">
+                      积分流水明细
+                    </span>
+                    <div className="flex-1 overflow-y-auto border border-slate-100 rounded-xl bg-white divide-y divide-slate-50 p-1">
+                      {historyEntries.length === 0 ? (
+                        <div className="p-6 text-center text-[10.5px] text-slate-400">暂无积分流水记录</div>
+                      ) : historyEntries.map(entry => {
+                        const badge = KIND_BADGES[entry.kind] ?? {
+                          label: entry.kind,
+                          className: 'bg-slate-100 text-slate-500 border-slate-200',
+                        };
+                        const amountText = entry.kind === 'settle'
+                          ? `-${entry.points}`
+                          : `${entry.points >= 0 ? '+' : ''}${entry.points}`;
+                        return (
+                          <div key={entry.id} className="p-2.5 flex items-center justify-between text-xs hover:bg-slate-50 rounded-lg transition duration-150">
+                            <div className="space-y-1 min-w-0 pr-2">
+                              <p className="font-bold text-slate-700 truncate text-[11px]" title={entry.title}>
+                                {entry.title}
+                              </p>
+                              <div className="flex items-center gap-2 text-[10px] text-slate-400 font-medium">
+                                <span className={`px-1 py-0.2 rounded border shrink-0 ${badge.className}`}>
+                                  {badge.label}
+                                </span>
+                                {entry.platformLabel && (
+                                  <span className="flex items-center gap-0.5 bg-indigo-50/50 text-indigo-600 px-1 py-0.2 rounded border border-indigo-100/20 shrink-0">
+                                    {entry.platformLabel}
+                                  </span>
+                                )}
+                                <span className="flex items-center gap-0.5">
+                                  <Calendar className="h-2.5 w-2.5" />
+                                  {entry.date}
+                                </span>
+                              </div>
+                            </div>
+                            <div className="text-right shrink-0">
+                              <span className={`text-[11px] font-extrabold px-1.5 py-0.5 rounded font-mono border ${
+                                entry.kind === 'settle'
+                                  ? 'text-rose-600 bg-rose-50 border-rose-100'
+                                  : entry.points >= 0
+                                    ? 'text-emerald-600 bg-emerald-50 border-emerald-100'
+                                    : 'text-amber-600 bg-amber-50 border-amber-100'
+                              }`}>
+                                {amountText}
+                              </span>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </>
+              )}
             </div>
           ) : (
             <div className="hidden md:flex w-80 p-6 bg-slate-50/50 flex-col items-center justify-center text-center shrink-0 border-l border-slate-100">
@@ -918,7 +928,7 @@ export default function AdminPanel({
             <CheckCircle2 className="h-3.5 w-3.5 text-indigo-500" />
             系统管理员模式已安全挂载：您正在以 <strong>{currentUserNickname || '超级管理员'}</strong> 身份管理节点
           </span>
-          <button 
+          <button
             onClick={onClose}
             className="text-xs font-bold text-indigo-600 hover:text-indigo-800 transition"
           >

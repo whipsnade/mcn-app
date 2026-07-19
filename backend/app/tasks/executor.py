@@ -6,9 +6,10 @@ from collections.abc import Awaitable, Callable
 from typing import Any, Protocol
 from uuid import NAMESPACE_URL, uuid5
 
+from app.billing.service import InsufficientPointsError
 from app.mcp_gateway.service import ExecuteMcpCall
 from app.model.contracts import ModelAdapterError
-from app.orchestration.batching import build_execution_batches
+from app.orchestration.bi_requirements import MetricDef, metric_coverage, missing_metrics
 from app.orchestration.loop import (
     AgentLoopContext,
     EvidenceNote,
@@ -16,9 +17,8 @@ from app.orchestration.loop import (
     resolve_agent_call,
     restore_agent_trajectory,
 )
-from app.orchestration.schemas import PlanValidationError, ReplanContext, ReplanFailure, ToolPlan
+from app.orchestration.schemas import PlanValidationError
 from app.reporting.analysis_reports import sanitize_evidence
-from app.reporting.normalizers import extract_kol_uids
 from app.tasks.errors import canonical_platform, safe_error
 from app.tasks.state import TaskEventType
 
@@ -31,16 +31,6 @@ class TaskStore(Protocol):
     async def save_trajectory(
         self, task_id: str, worker_id: str, trajectory_json: dict[str, Any]
     ) -> bool: ...
-
-    async def save_plan_revision(
-        self,
-        task_id: str,
-        worker_id: str,
-        plan_json: dict[str, Any] | None = None,
-        replan_json: dict[str, Any] | None = None,
-    ) -> bool: ...
-
-    async def save_replan(self, task_id: str, worker_id: str, replan_json: dict[str, Any]) -> bool: ...
 
     async def cancel_requested(self, task_id: str) -> bool: ...
 
@@ -60,6 +50,8 @@ class TaskStore(Protocol):
         self, task_id: str, worker_id: str, code: str, message: str | None = None
     ) -> None: ...
 
+    async def mark_insufficient_balance(self, task_id: str, worker_id: str) -> None: ...
+
     async def append_event(
         self, task_id: str, user_id: str, event_type: str, payload: dict[str, Any]
     ) -> Any: ...
@@ -68,14 +60,10 @@ class TaskStore(Protocol):
 
 
 class ContextBuilder(Protocol):
-    async def build(self, user_id: str, session_id: str) -> Any: ...
-
     async def build_agent_context(self, user_id: str, session_id: str) -> AgentLoopContext: ...
 
 
 class TaskPlanner(Protocol):
-    async def plan(self, context: Any) -> ToolPlan: ...
-
     async def agent_decide(self, context: AgentLoopContext) -> Any: ...
 
 
@@ -84,13 +72,7 @@ class McpBatchGateway(Protocol):
 
 
 class TaskArtifacts(Protocol):
-    async def build_candidates(self, task_id: str) -> Any: ...
-
-    async def build_bi_report(self, task_id: str) -> Any: ...
-
     async def build_analysis_report(self, task_id: str) -> Any: ...
-
-    async def stream_summary(self, task_id: str) -> Any: ...
 
     async def stream_analysis_summary(self, task_id: str) -> Any: ...
 
@@ -98,76 +80,8 @@ class TaskArtifacts(Protocol):
 Checkpoint = Callable[[str], Awaitable[None]]
 logger = logging.getLogger(__name__)
 
-# A failed/released MCP call did not produce a billable successful response,
-# so it may be replaced by one recovery step.  An ``unknown`` outcome is
-# deliberately excluded: replaying a possibly-sent request could duplicate a
-# non-idempotent upstream operation.
-_REPLAN_RETRYABLE_STATUSES = frozenset({"failed", "released"})
-
-_KOL_DETAIL_TOOL = "datatap.social.grow.kol.detail.v1"
-_MAX_DETAIL_UIDS = 10
-
-# kol.detail 的 scope 平台词表（来自 DataTap 工具文档）。模型常自造取值，
-# 上游不会报错而是静默只回 uid，因此调用前必须确定性归一化。
-_COMMON_DETAIL_SCOPES = frozenset({
-    "accountTrend",
-    "priceTrend",
-    "postSummaryStatistics",
-    "postDailyStatistics",
-    "hotWord",
-    "fansAudience",
-    "businessBrand",
-})
-_DETAIL_SCOPES_BY_PLATFORM = {
-    "douyin": _COMMON_DETAIL_SCOPES | {"businessXT", "businessCar"},
-    "xiaohongshu": _COMMON_DETAIL_SCOPES | {"businessPGY"},
-    "weibo": _COMMON_DETAIL_SCOPES,
-}
-_DEFAULT_DETAIL_SCOPES = ["accountTrend", "fansAudience", "postSummaryStatistics"]
-
-
-def _normalize_detail_scope(arguments: dict[str, Any]) -> dict[str, Any]:
-    """把详情调用的 scope 归一化为平台有效取值；全部无效时用默认集合。"""
-    platform = str(arguments.get("platform") or "").strip()
-    allowed = _DETAIL_SCOPES_BY_PLATFORM.get(platform, _COMMON_DETAIL_SCOPES)
-    raw_scope = arguments.get("scope")
-    requested = (
-        [str(item) for item in raw_scope if isinstance(item, str) and item.strip()]
-        if isinstance(raw_scope, list)
-        else []
-    )
-    valid = [item for item in requested if item in allowed]
-    return {**arguments, "scope": valid or list(_DEFAULT_DETAIL_SCOPES)}
-
-
-def _step_has_uids(step: Any) -> bool:
-    uids = step.arguments.get("kwUidList")
-    return isinstance(uids, list) and any(str(uid).strip() for uid in uids)
-
-
-_DETAIL_PLATFORM_BY_TOOL_TOKEN = (
-    ("xiaohongshu", "xiaohongshu"),
-    ("douyin", "douyin"),
-    ("bilibili", "bilibili"),
-    ("weibo", "weibo"),
-    ("wechat", "wechat"),
-)
-
-
-def _detail_uids_from_rows(rows: list[Any], platform: str) -> list[str]:
-    """按详情调用的平台过滤 uid：跨平台 uid 混入会被上游拒绝。"""
-    uids: list[str] = []
-    for row in rows:
-        tool_name = str(getattr(row, "internal_tool_name", None) or "")
-        row_platform = next(
-            (value for token, value in _DETAIL_PLATFORM_BY_TOOL_TOKEN if token in tool_name),
-            None,
-        )
-        if row_platform is not None and row_platform != platform:
-            continue
-        content = (getattr(row, "evidence_json", None) or {}).get("structured_content")
-        uids.extend(extract_kol_uids(content, limit=_MAX_DETAIL_UIDS))
-    return list(dict.fromkeys(uids))[:_MAX_DETAIL_UIDS]
+# finish 覆盖门禁连续拒绝上限：达到后放行，避免模型无法补齐时死循环。
+_MAX_FINISH_REJECT_STREAK = 3
 
 
 async def _noop_checkpoint(_: str) -> None:
@@ -179,78 +93,18 @@ def build_tool_event_payload(
     *,
     status: str,
     step_index: int,
-    step_total: int,
+    step_total: int | None,
     error_code: str | None = None,
-    evidence_kind: str | None = None,
 ) -> dict[str, object]:
     payload: dict[str, object] = {
         "platform": canonical_platform(internal_tool_name),
         "step_index": step_index,
         "step_total": step_total,
     }
-    if evidence_kind in {"brand", "kol"}:
-        payload["evidence_kind"] = evidence_kind
     if status in {"failed", "unknown"}:
         failure = safe_error(error_code)
         payload.update({"error_code": failure.code, "message": failure.message})
     return payload
-
-
-def aggregate_mcp_progress(commands: tuple[Any, ...], rows: tuple[Any, ...]) -> dict[str, object]:
-    platforms: dict[str, dict[str, int]] = {}
-    for command in commands:
-        label = canonical_platform(getattr(command, "internal_tool_name", None))
-        platforms.setdefault(label, {"succeeded": 0, "failed": 0, "unknown": 0})
-    for row in rows:
-        label = canonical_platform(getattr(row, "internal_tool_name", None))
-        counts = platforms.setdefault(label, {"succeeded": 0, "failed": 0, "unknown": 0})
-        status = getattr(row, "status", None)
-        if status in {"settled", "succeeded"}:
-            counts["succeeded"] += 1
-        elif status in {"unknown"}:
-            counts["unknown"] += 1
-        else:
-            counts["failed"] += 1
-    return {"step_total": len(commands), "step_index": len(rows), "platforms": platforms}
-
-
-def replan_retry_budget(rows: tuple[Any, ...], max_calls: int = 10) -> int:
-    """Return the number of safe replacement calls available for a batch.
-
-    The old implementation used ``max_calls - len(plan.steps)``.  That made a
-    ten-step plan unrecoverable even when several upstream calls failed and
-    therefore did not consume points.  A replacement is allowed only for a
-    terminal failed/released row; unknown outcomes remain non-replayable.
-    """
-    if max_calls <= 0:
-        return 0
-    failed_count = sum(
-        1 for row in rows if getattr(row, "status", None) in _REPLAN_RETRYABLE_STATUSES
-    )
-    return min(max_calls, failed_count)
-
-
-def summarize_mcp_failures(rows: tuple[Any, ...], *, limit: int = 5) -> str:
-    """Build a user-safe failure summary without tool names or raw payloads."""
-    summaries: list[str] = []
-    seen: set[tuple[str, str]] = set()
-    for row in rows:
-        status = getattr(row, "status", None)
-        if status in {"settled", "succeeded"}:
-            continue
-        platform = canonical_platform(getattr(row, "internal_tool_name", None))
-        code = getattr(row, "error_type", None)
-        if status == "unknown":
-            code = "mcp_unknown_outcome"
-        failure = safe_error(code or "mcp_call_failed")
-        key = (platform, failure.code)
-        if key in seen:
-            continue
-        seen.add(key)
-        summaries.append(f"{platform}：{failure.message}")
-        if len(summaries) >= limit:
-            break
-    return "；".join(summaries)
 
 
 class TaskExecutor:
@@ -293,310 +147,9 @@ class TaskExecutor:
             self._renew_lease_until_stopped(task.id, stop_heartbeat, lease_lost)
         )
         try:
-            if getattr(task, "kind", "pipeline") == "agent":
-                await self._run_agent_loop(task)
-                return
-            plan = await self._load_or_create_plan(task)
-            if plan is None or lease_lost.is_set():
-                return
-            has_settled = False
-            partial_failure = False
-            unresolved_failures: tuple[Any, ...] = ()
-            completed_step_ids: set[str] = set()
-            replan_failed = False
-            failed_rows: list[Any] = []
-            non_retryable_failures: list[Any] = []
-            settled_evidence_rows: list[Any] = []
-            for batch in build_execution_batches(plan):
-                if lease_lost.is_set():
-                    return
-                if await self.repository.cancel_requested(task.id):
-                    await self.repository.mark_cancelled(task.id, self.worker_id)
-                    return
-                resolved = await self._resolve_detail_steps(
-                    task, plan, batch.steps, settled_evidence_rows
-                )
-                if resolved is None:
-                    return
-                resolved_steps, plan = resolved
-                if not resolved_steps:
-                    # 详情步骤的搜索前置无结果：整批跳过，不发起、不计费。
-                    continue
-                # The actual gateway reserves and commits before transport; this
-                # deterministic checkpoint models a process loss at that boundary.
-                await self.checkpoint("after_reserve")
-                commands = tuple(
-                    ExecuteMcpCall(
-                        logical_call_id=str(uuid5(NAMESPACE_URL, f"{task.id}:{step.id}")),
-                        user_id=task.user_id,
-                        task_id=task.id,
-                        plan_step_id=step.id,
-                        internal_tool_name=step.internal_tool_name,
-                        arguments=step.arguments,
-                        lease_owner=self.worker_id,
-                    )
-                    for step in resolved_steps
-                )
-                step_kinds = {step.id: step.evidence_kind for step in resolved_steps}
-                for index, command in enumerate(commands, start=1):
-                    await self.repository.append_event(
-                        task.id,
-                        task.user_id,
-                        TaskEventType.TOOL_STARTED,
-                        build_tool_event_payload(
-                            command.internal_tool_name,
-                            status="started",
-                            step_index=index,
-                            step_total=len(commands),
-                            evidence_kind=step_kinds.get(command.plan_step_id),
-                        ),
-                    )
-                rows = await self.gateway.execute_batch(commands)
-                settled_evidence_rows.extend(
-                    row for row in rows if getattr(row, "status", None) in {"settled", "succeeded"}
-                )
-                progress = aggregate_mcp_progress(commands, rows)
-                for index, row in enumerate(rows, start=1):
-                    row_status = getattr(row, "status", None)
-                    event_type = (
-                        TaskEventType.TOOL_SUCCEEDED
-                        if row_status in {"settled", "succeeded"}
-                        else TaskEventType.TOOL_UNKNOWN
-                        if row_status == "unknown"
-                        else TaskEventType.TOOL_FAILED
-                    )
-                    command_name = (
-                        getattr(row, "internal_tool_name", None)
-                        or commands[min(index - 1, len(commands) - 1)].internal_tool_name
-                    )
-                    await self.repository.append_event(
-                        task.id,
-                        task.user_id,
-                        event_type,
-                        {
-                            **build_tool_event_payload(
-                                command_name,
-                                status=(
-                                    "succeeded"
-                                    if event_type == TaskEventType.TOOL_SUCCEEDED
-                                    else "unknown"
-                                    if event_type == TaskEventType.TOOL_UNKNOWN
-                                    else "failed"
-                                ),
-                                step_index=index,
-                                step_total=len(commands),
-                                error_code=getattr(row, "error_type", None),
-                                evidence_kind=step_kinds.get(
-                                    getattr(row, "plan_step_id", None)
-                                    or commands[min(index - 1, len(commands) - 1)].plan_step_id
-                                ),
-                            ),
-                            "platform_progress": progress["platforms"],
-                        },
-                    )
-                await self.checkpoint("after_mcp_result")
-                statuses = {getattr(row, "status", None) for row in rows}
-                if statuses & {"unknown", "planned", "reserved", "running", "succeeded"}:
-                    await self.repository.mark_interrupted(task.id, self.worker_id)
-                    return
-                # 可重试的失败不再中止后续批次：DAG 中无依赖的步骤继续执行，
-                # 全部批次结束后才对失败步骤统一 replan 一次。标签匹配等辅助
-                # 步骤的上游抖动不再拖垮整个任务。
-                has_settled = has_settled or "settled" in statuses
-                completed_step_ids.update(
-                    str(getattr(row, "plan_step_id", ""))
-                    for row in rows
-                    if getattr(row, "status", None) in {"settled", "succeeded"}
-                )
-                failed_rows.extend(
-                    row
-                    for row in rows
-                    if getattr(row, "status", None) in _REPLAN_RETRYABLE_STATUSES
-                )
-                non_retryable_failures.extend(
-                    row
-                    for row in rows
-                    if getattr(row, "status", None) not in {"settled", "succeeded"}
-                    and getattr(row, "status", None) not in _REPLAN_RETRYABLE_STATUSES
-                )
-                await self.checkpoint("after_settle")
-                if not await self.repository.renew_lease(
-                    task.id, self.worker_id, self.lease_seconds
-                ):
-                    return
-            if failed_rows:
-                try:
-                    supplement = await self._load_or_create_replan(
-                        task,
-                        plan,
-                        tuple(failed_rows),
-                        completed_step_ids=tuple(sorted(completed_step_ids)),
-                    )
-                except Exception:
-                    # A failed recovery plan must not discard already-settled
-                    # evidence.  The outer task status decides whether a
-                    # partial BI report can still be produced.
-                    replan_failed = True
-                    logger.exception(
-                        "task replanning failed task_id=%s", task.id
-                    )
-                    supplement = None
-                if supplement is not None:
-                    resolved_supplement = await self._resolve_detail_steps(
-                        task, supplement, supplement.steps, settled_evidence_rows,
-                        revision="replan",
-                    )
-                    if resolved_supplement is None:
-                        return
-                    supplement_steps, supplement = resolved_supplement
-                else:
-                    supplement_steps = ()
-                if supplement is not None and supplement_steps:
-                    supplement_commands = tuple(
-                        ExecuteMcpCall(
-                            logical_call_id=str(uuid5(NAMESPACE_URL, f"{task.id}:replan:{step.id}")),
-                            user_id=task.user_id,
-                            task_id=task.id,
-                            plan_step_id=step.id,
-                            internal_tool_name=step.internal_tool_name,
-                            arguments=step.arguments,
-                            lease_owner=self.worker_id,
-                        )
-                        for step in supplement_steps
-                    )
-                    supplement_step_kinds = {
-                        step.id: step.evidence_kind for step in supplement_steps
-                    }
-                    for index, command in enumerate(supplement_commands, start=1):
-                        await self.repository.append_event(
-                            task.id,
-                            task.user_id,
-                            TaskEventType.TOOL_STARTED,
-                            build_tool_event_payload(
-                                command.internal_tool_name,
-                                status="started",
-                                step_index=index,
-                                step_total=len(supplement_commands),
-                                evidence_kind=supplement_step_kinds.get(command.plan_step_id),
-                            ),
-                        )
-                    supplement_rows = await self.gateway.execute_batch(supplement_commands)
-                    settled_evidence_rows.extend(
-                        row
-                        for row in supplement_rows
-                        if getattr(row, "status", None) in {"settled", "succeeded"}
-                    )
-                    supplement_progress = aggregate_mcp_progress(
-                        supplement_commands, supplement_rows
-                    )
-                    for index, row in enumerate(supplement_rows, start=1):
-                        row_status = getattr(row, "status", None)
-                        event_type = (
-                            TaskEventType.TOOL_SUCCEEDED
-                            if row_status in {"settled", "succeeded"}
-                            else TaskEventType.TOOL_UNKNOWN
-                            if row_status == "unknown"
-                            else TaskEventType.TOOL_FAILED
-                        )
-                        command_name = (
-                            getattr(row, "internal_tool_name", None)
-                            or supplement_commands[
-                                min(index - 1, len(supplement_commands) - 1)
-                            ].internal_tool_name
-                        )
-                        await self.repository.append_event(
-                            task.id,
-                            task.user_id,
-                            event_type,
-                            {
-                                **build_tool_event_payload(
-                                    command_name,
-                                    status=(
-                                        "succeeded"
-                                        if event_type == TaskEventType.TOOL_SUCCEEDED
-                                        else "unknown"
-                                        if event_type == TaskEventType.TOOL_UNKNOWN
-                                        else "failed"
-                                    ),
-                                    step_index=index,
-                                    step_total=len(supplement_commands),
-                                    error_code=getattr(row, "error_type", None),
-                                    evidence_kind=supplement_step_kinds.get(
-                                        getattr(row, "plan_step_id", None)
-                                        or supplement_commands[
-                                            min(index - 1, len(supplement_commands) - 1)
-                                        ].plan_step_id
-                                    ),
-                                ),
-                                "platform_progress": supplement_progress["platforms"],
-                            },
-                        )
-                    supplement_statuses = {getattr(row, "status", None) for row in supplement_rows}
-                    if supplement_statuses & {"unknown", "planned", "reserved", "running", "succeeded"}:
-                        await self.repository.mark_interrupted(task.id, self.worker_id)
-                        return
-                    has_settled = has_settled or "settled" in supplement_statuses
-                    unresolved_failures = tuple(non_retryable_failures) + tuple(
-                        row
-                        for row in supplement_rows
-                        if getattr(row, "status", None) not in {"settled", "succeeded"}
-                    )
-                else:
-                    unresolved_failures = tuple(non_retryable_failures) + tuple(failed_rows)
-            else:
-                unresolved_failures = tuple(non_retryable_failures)
-            partial_failure = bool(unresolved_failures)
-            if partial_failure and not has_settled:
-                await self.repository.mark_failed(task.id, self.worker_id, "mcp_call_failed")
-                return
-            if self.artifacts is not None:
-                await self.artifacts.build_candidates(task.id)
-            await self.checkpoint("after_candidates")
-            report_warnings: list[str] = []
-            if self.artifacts is not None:
-                report = await self.artifacts.build_bi_report(task.id)
-                chart_data = getattr(report, "chart_data_json", {}) or {}
-                report_warnings = [
-                    str(item) for item in chart_data.get("warnings", []) if str(item).strip()
-                ]
-            await self.checkpoint("after_bi")
-            if self.artifacts is not None:
-                await self.artifacts.stream_summary(task.id)
-            if partial_failure or report_warnings:
-                failure_summary = summarize_mcp_failures(unresolved_failures)
-                warning_parts = list(report_warnings)
-                if replan_failed:
-                    warning_parts.append("自动重新规划未完成，已保留可用结果。")
-                if failure_summary:
-                    warning_parts.append(failure_summary)
-                warning_message = (
-                    "；".join(warning_parts)
-                    if warning_parts
-                    else "部分社媒渠道查询失败，已保留可用结果。"
-                )
-                await self.repository.mark_completed_with_warnings(
-                    task.id,
-                    self.worker_id,
-                    "mcp_partial_failure" if partial_failure else "report_data_unavailable",
-                    warning_message,
-                )
-            else:
-                await self.repository.mark_completed(task.id, self.worker_id)
-            # The task terminal event is durable before suggestion generation
-            # starts; suggestion failures can therefore never roll it back.
-            prepare_followups = getattr(self.artifacts, "prepare_followups", None)
-            if prepare_followups is not None:
-                try:
-                    await prepare_followups(task.id)
-                except Exception:
-                    pass
-            generate_followups = getattr(self.artifacts, "generate_followups", None)
-            if generate_followups is not None:
-                try:
-                    await generate_followups(task.id)
-                except Exception:
-                    # Follow-up generation is non-fatal by design.
-                    pass
+            # 所有任务统一走 agent 迭代循环（历史 kind="pipeline" 行的固定
+            # DAG 路径已移除，恢复时按空轨迹重新进入迭代循环）。
+            await self._run_agent_loop(task)
         except asyncio.CancelledError:
             await self.repository.mark_interrupted(task.id, self.worker_id)
             raise
@@ -621,25 +174,16 @@ class TaskExecutor:
             await asyncio.gather(heartbeat, return_exceptions=True)
             await self.repository.release_lease(task.id, self.worker_id)
 
-    async def _load_or_create_plan(self, task: Any) -> ToolPlan | None:
-        if task.plan_json is not None:
-            return ToolPlan.model_validate(task.plan_json)
-        context = await self.context_builder.build(task.user_id, task.session_id)
-        plan_for = getattr(self.planner, "plan_for", None)
-        plan = await plan_for(context) if plan_for is not None else await self.planner.plan(context)
-        if not await self.repository.save_plan(
-            task.id, self.worker_id, plan.model_dump(mode="json")
-        ):
-            return None
-        return plan
-
     async def _run_agent_loop(self, task: Any) -> None:
-        """迭代式工具调用循环：每轮由模型决定下一步，产出版本化自由报告。"""
+        """迭代式工具调用循环：每轮由模型决定下一步，产出版本化自由报告。
+
+        循环没有调用次数上限：退出条件只有模型 finish（且通过必需数据项
+        覆盖门禁）、取消、积分余额不足或异常。
+        """
         build_agent_context = getattr(self.context_builder, "build_agent_context", None)
         decide = getattr(self.planner, "agent_decide", None)
         if build_agent_context is None or decide is None:
             raise PlanValidationError("AGENT_RUNTIME_UNAVAILABLE")
-        max_calls = max(1, int(getattr(task, "max_calls", 10) or 10))
         context = await build_agent_context(task.user_id, task.session_id)
         trajectory = restore_agent_trajectory(getattr(task, "plan_json", None))
         if getattr(task, "plan_json", None) is None:
@@ -650,7 +194,21 @@ class TaskExecutor:
                 return
         feedback: list[EvidenceNote] = []
         invalid_streak = 0
-        while len(trajectory.results) < max_calls:
+        finish_reject_streak = 0
+        balance_exhausted = False
+        # finish 门禁以注入上下文的必需数据项清单为准（生产环境由
+        # build_agent_context 填入全局 BI_REQUIRED_METRICS）。
+        required_metrics = tuple(
+            MetricDef(
+                key=str(item.get("key", "")),
+                label=str(item.get("label", item.get("key", ""))),
+                description=str(item.get("description", "")),
+                source_tools=tuple(str(tool) for tool in item.get("source_tools", ())),
+            )
+            for item in context.required_metrics
+            if isinstance(item, dict) and item.get("key")
+        )
+        while True:
             if await self.repository.cancel_requested(task.id):
                 await self.repository.mark_cancelled(task.id, self.worker_id)
                 return
@@ -664,13 +222,35 @@ class TaskExecutor:
             )
             if pending is None:
                 round_context = context.model_copy(
-                    update={
-                        "notes": (*trajectory.results, *feedback),
-                        "remaining_calls": max_calls - len(trajectory.results),
-                    }
+                    update={"notes": (*trajectory.results, *feedback)}
                 )
                 decision = await decide(round_context)
                 if decision.action == "finish":
+                    # 必需数据项覆盖门禁：未覆盖的项回喂给模型补齐（不占
+                    # invalid_streak）；连续被拒达到上限后放行，防止模型
+                    # 始终无法补齐时死循环。
+                    missing = missing_metrics(
+                        metric_coverage(trajectory, required_metrics), required_metrics
+                    )
+                    if missing and finish_reject_streak < _MAX_FINISH_REJECT_STREAK:
+                        finish_reject_streak += 1
+                        missing_text = "、".join(
+                            f"{metric.label}（可尝试：{' / '.join(metric.source_tools[:2])}）"
+                            for metric in missing
+                        )
+                        feedback.append(
+                            EvidenceNote(
+                                step_id=f"finish_reject_{finish_reject_streak}",
+                                tool="metric_coverage_gate",
+                                status="failed",
+                                summary=(
+                                    f"报告必需数据项尚未覆盖，暂不能结束：{missing_text}。"
+                                    "请调用对应工具补齐后再 finish；"
+                                    "工具调用成功但返回空数据视为该项已满足。"
+                                ),
+                            )
+                        )
+                        continue
                     break
                 # 工具/渠道校验、参数归一化（平台别名、默认三个月时间窗回填、
                 # 时间窗钳制、keyword 必填 name）与 Schema 校验一次完成；
@@ -716,7 +296,7 @@ class TaskExecutor:
                     pending.internal_tool_name,
                     status="started",
                     step_index=step_index,
-                    step_total=max_calls,
+                    step_total=None,
                 ),
             )
             command = ExecuteMcpCall(
@@ -729,7 +309,13 @@ class TaskExecutor:
                 lease_owner=self.worker_id,
             )
             await self.checkpoint("after_reserve")
-            rows = await self.gateway.execute_batch((command,))
+            try:
+                rows = await self.gateway.execute_batch((command,))
+            except InsufficientPointsError:
+                # 余额不足以再发起一次调用（预留阶段抛出，未产生计费）：
+                # 停止循环，按余额不足收尾。
+                balance_exhausted = True
+                break
             row = rows[0] if rows else None
             row_status = getattr(row, "status", None)
             event_type = (
@@ -753,14 +339,14 @@ class TaskExecutor:
                         else "failed"
                     ),
                     step_index=step_index,
-                    step_total=max_calls,
+                    step_total=None,
                     error_code=getattr(row, "error_type", None),
                 ),
             )
             await self.checkpoint("after_mcp_result")
             if row_status in {"unknown", "planned", "reserved", "running", "succeeded"}:
-                # Same semantics as the pipeline: possibly-sent calls are never
-                # replayed in this run; recovery reconciles them later.
+                # Possibly-sent calls are never replayed in this run; recovery
+                # reconciles them later.
                 await self.repository.mark_interrupted(task.id, self.worker_id)
                 return
             if row_status == "settled":
@@ -798,6 +384,19 @@ class TaskExecutor:
                 return
         has_settled = any(note.status == "settled" for note in trajectory.results)
         has_failures = any(note.status == "failed" for note in trajectory.results)
+        if balance_exhausted:
+            # 余额不足：已采集的 settled 证据仍产出报告与摘要，再进入
+            # insufficient_balance 终态；无任何证据则直接收尾。
+            if has_settled and self.artifacts is not None:
+                build_report = getattr(self.artifacts, "build_analysis_report", None)
+                if build_report is not None:
+                    await build_report(task.id)
+                await self.checkpoint("after_bi")
+                stream = getattr(self.artifacts, "stream_analysis_summary", None)
+                if stream is not None:
+                    await stream(task.id)
+            await self.repository.mark_insufficient_balance(task.id, self.worker_id)
+            return
         if not has_settled:
             await self.repository.mark_failed(task.id, self.worker_id, "mcp_call_failed")
             return
@@ -822,6 +421,8 @@ class TaskExecutor:
         await self._finish_followups(task.id)
 
     async def _finish_followups(self, task_id: str) -> None:
+        # The task terminal event is durable before suggestion generation
+        # starts; suggestion failures can therefore never roll it back.
         prepare_followups = getattr(self.artifacts, "prepare_followups", None)
         if prepare_followups is not None:
             try:
@@ -835,147 +436,6 @@ class TaskExecutor:
             except Exception:
                 # Follow-up generation is non-fatal by design.
                 pass
-
-    async def _resolve_detail_steps(
-        self,
-        task: Any,
-        plan: ToolPlan,
-        steps: tuple[Any, ...],
-        settled_rows: list[Any],
-        *,
-        revision: str = "plan",
-    ) -> tuple[list[Any], ToolPlan] | None:
-        """回填达人详情步骤的 uid 列表；搜索无结果则跳过（不计费）。
-
-        规划阶段搜索结果未知，详情步骤只带空 ``kwUidList`` 占位。批次执行前
-        用已结算的搜索证据回填真实 uid 并静默持久化（保证网关按 digest 复核
-        参数一致）；没有可用候选时剔除该步骤，避免无意义的空调用。
-        """
-        resolved: list[Any] = []
-        dirty = False
-        for step in steps:
-            if step.internal_tool_name != _KOL_DETAIL_TOOL:
-                resolved.append(step)
-                continue
-            # scope 归一化对所有详情步骤生效（自造取值会被上游静默吞掉）。
-            normalized = _normalize_detail_scope(step.arguments)
-            if _step_has_uids(step):
-                resolved.append(step)
-                dirty = dirty or normalized != step.arguments
-                if normalized != step.arguments:
-                    resolved[-1] = step.model_copy(update={"arguments": normalized})
-                continue
-            uids = _detail_uids_from_rows(
-                settled_rows, str(step.arguments.get("platform") or "").strip()
-            )
-            if not uids:
-                continue
-            resolved.append(
-                step.model_copy(update={"arguments": {**normalized, "kwUidList": uids}})
-            )
-            dirty = True
-        if not dirty:
-            return resolved, plan
-        by_id = {step.id: step for step in resolved}
-        updated = plan.model_copy(
-            update={"steps": tuple(by_id.get(step.id, step) for step in plan.steps)}
-        )
-        dumped = updated.model_dump(mode="json")
-        persisted = (
-            await self.repository.save_plan_revision(task.id, self.worker_id, None, dumped)
-            if revision == "replan"
-            else await self.repository.save_plan_revision(task.id, self.worker_id, dumped, None)
-        )
-        if not persisted:
-            return None
-        return resolved, updated
-
-    async def _load_or_create_replan(
-        self,
-        task: Any,
-        plan: ToolPlan,
-        rows: tuple[Any, ...],
-        *,
-        completed_step_ids: tuple[str, ...] = (),
-    ) -> ToolPlan | None:
-        saved = getattr(task, "replan_json", None)
-        if saved is not None:
-            return ToolPlan.model_validate(saved)
-        replan_for = getattr(self.planner, "replan", None)
-        if replan_for is None:
-            return None
-        remaining_calls = replan_retry_budget(
-            rows, max_calls=int(getattr(task, "max_calls", 10))
-        )
-        if remaining_calls == 0:
-            return None
-        failures = tuple(
-            ReplanFailure(
-                step_id=str(getattr(row, "plan_step_id", "step_0")),
-                internal_tool_name=str(getattr(row, "internal_tool_name", "unknown")),
-                error_code=str(getattr(row, "error_type", "mcp_call_failed")),
-                diagnostic=(getattr(row, "evidence_json", {}) or {}).get("output_validation_diagnostic"),
-            )
-            for row in rows
-            if getattr(row, "status", None) in _REPLAN_RETRYABLE_STATUSES
-        )
-        if not failures:
-            return None
-        plan_step_kinds = {
-            step.id: step.evidence_kind
-            for step in plan.steps
-        }
-        completed_evidence_kinds = tuple(
-            sorted(
-                {
-                    kind
-                    for step_id in completed_step_ids
-                    for kind in (plan_step_kinds.get(str(step_id)),)
-                    if kind is not None
-                }
-            )
-        )
-        context = await self.context_builder.build(task.user_id, task.session_id)
-        supplement = await replan_for(
-            context,
-            ReplanContext(
-                completed_step_ids=tuple(
-                    sorted(
-                        {
-                            *completed_step_ids,
-                            *(
-                                str(getattr(row, "plan_step_id", ""))
-                                for row in rows
-                                if getattr(row, "status", None) in {"settled", "succeeded"}
-                            ),
-                        }
-                    )
-                ),
-                completed_evidence_kinds=completed_evidence_kinds,
-                failed_steps=failures,
-                remaining_calls=remaining_calls,
-                remaining_points=remaining_calls * 10,
-            ),
-        )
-        if not await self.repository.save_replan(
-            task.id, self.worker_id, supplement.model_dump(mode="json")
-        ):
-            return None
-        return supplement
-
-    def _commands(self, task: Any, plan: ToolPlan, *, revision: str = "plan") -> tuple[ExecuteMcpCall, ...]:
-        return tuple(
-            ExecuteMcpCall(
-                logical_call_id=str(uuid5(NAMESPACE_URL, f"{task.id}:{revision}:{step.id}")),
-                user_id=task.user_id,
-                task_id=task.id,
-                plan_step_id=step.id,
-                internal_tool_name=step.internal_tool_name,
-                arguments=step.arguments,
-                lease_owner=self.worker_id,
-            )
-            for step in plan.steps
-        )
 
     async def _renew_lease_until_stopped(
         self, task_id: str, stop: asyncio.Event, lease_lost: asyncio.Event
@@ -1022,7 +482,7 @@ class TaskRunner:
         self._active_task_ids.add(task_id)
 
         def discard(completed: asyncio.Task[None]) -> None:
-            self._tasks.discard(completed)
+            self._tasks.discard(running)
             self._active_task_ids.discard(task_id)
 
         running.add_done_callback(discard)

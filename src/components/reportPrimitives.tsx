@@ -1,9 +1,17 @@
 import { HelpCircle } from 'lucide-react';
 import type { ReactNode } from 'react';
 
-import type { BiMetric } from '../api/contracts';
+// 报告类面板共用的展示基元，供 UniversalReport 复用。
 
-// 报告类面板共用的展示基元，供 BiAnalytics 与 UniversalReport 复用。
+/** 指标卡数据形状；由 UniversalReport 按报告块数据内联构造。 */
+export interface PrimitiveMetric {
+  value: number | null;
+  unit: string;
+  available: boolean;
+  coverage: number;
+  source_fields: string[];
+  platforms: string[];
+}
 
 export function Card({
   title,
@@ -41,7 +49,7 @@ export function Missing({ label = '数据不足' }: { label?: string }) {
   );
 }
 
-export function metricAvailable(metric: BiMetric | undefined): metric is BiMetric {
+export function metricAvailable(metric: PrimitiveMetric | undefined): metric is PrimitiveMetric {
   return Boolean(metric?.available && metric.value !== null && Number.isFinite(metric.value));
 }
 
@@ -55,7 +63,7 @@ export function formatExposure(value: number): string {
   return formatNumber(value);
 }
 
-export function MetricCard({ label, metric, format = 'number', accent = 'text-slate-800' }: { label: string; metric?: BiMetric; format?: 'number' | 'exposure' | 'percent'; accent?: string }) {
+export function MetricCard({ label, metric, format = 'number', accent = 'text-slate-800' }: { label: string; metric?: PrimitiveMetric; format?: 'number' | 'exposure' | 'percent'; accent?: string }) {
   const value = metricAvailable(metric)
     ? format === 'percent'
       ? `${metric.value}%`

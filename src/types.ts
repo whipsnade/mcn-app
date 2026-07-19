@@ -91,8 +91,6 @@ export interface Session {
   mcn?: string;
   kols?: string[];
   analysis?: SessionAnalysis;
-  candidates?: KolCandidate[];
-  biReport?: AnalysisBiReport;
   analysisReport?: import('./api/contracts').ApiAnalysisReport;
 }
 
@@ -100,64 +98,9 @@ export interface SessionAnalysis {
   taskId: string;
   status: string;
   kind?: 'pipeline' | 'agent';
-  candidateVersion?: number;
-  reportId?: string;
   analysisReportId?: string;
   followupStatus?: 'pending' | 'completed' | 'failed';
   followupSuggestions?: import('./api/contracts').FollowupSuggestion[];
   followupError?: Record<string, unknown>;
 }
 
-export interface KolCandidate {
-  id: string;
-  kolId: string;
-  platform: string;
-  platformAccountId: string;
-  nickname?: string;
-  profileUrl?: string;
-  rank: number;
-  totalScore: number;
-  scores: Record<string, number | null>;
-  matchedConditions: string[];
-  risks: Array<Record<string, unknown>>;
-  recommendation: string;
-  metrics?: {
-    followers: number | null;
-    quoted_price_cny: number | null;
-    collected_at: string | null;
-    data_completeness: number | null;
-  };
-}
-
-export interface AnalysisBiReport {
-  id: string;
-  task_id: string;
-  report_version: number;
-  candidate_version: number;
-  overview: Record<string, unknown>;
-  score_composition: Array<Record<string, unknown>>;
-  audience_content_fit: Record<string, unknown>;
-  platform_distribution: Array<Record<string, unknown>>;
-  budget_analysis: Record<string, unknown>;
-  comparison: Array<Record<string, unknown>>;
-  risks: Array<Record<string, unknown>>;
-  analytics?: Record<string, unknown>;
-  analysis_scope?: 'brand' | 'kol' | 'hybrid';
-  brand_analytics?: Record<string, unknown>;
-  kol_analytics?: Record<string, unknown>;
-  data_availability?: Record<string, unknown>;
-  warnings?: string[];
-  conclusion: string;
-  sources: Array<Record<string, unknown>>;
-  generated_at: string;
-}
-
-export interface Account {
-  id: string;
-  username: string;
-  phone: string;
-  channels: string[];
-  points: number;
-  role: 'admin' | 'user';
-  createdAt: string;
-}

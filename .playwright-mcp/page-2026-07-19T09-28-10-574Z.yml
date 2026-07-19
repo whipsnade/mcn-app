@@ -1,0 +1,48 @@
+- generic [ref=e4]:
+  - generic [ref=e5]:
+    - generic [ref=e6]:
+      - generic [ref=e7]: A
+      - generic [ref=e8]:
+        - heading "KOL Insight AI" [level=1] [ref=e9]
+        - paragraph [ref=e10]: 品牌声量与红人决策中心
+    - generic [ref=e11]:
+      - heading "数据驱动的 红人与社交传播 分析大盘" [level=2] [ref=e12]
+      - paragraph [ref=e13]: 专为品牌主量身定制，提供舆情正向率、各平台达人传播周期、日度曝光波峰及多维受众统计画像分析，辅助精准投放决策。
+    - generic [ref=e14]:
+      - generic [ref=e20]:
+        - paragraph [ref=e21]: 全网声量监控与情感趋势
+        - paragraph [ref=e22]: 一键洞悉全渠道正向/负面舆论分布特征。
+      - generic [ref=e28]:
+        - paragraph [ref=e29]: 去重受众统计画像
+        - paragraph [ref=e30]: 聚合多平台红人粉丝客群，展示年龄与地域占比。
+      - generic [ref=e36]:
+        - paragraph [ref=e37]: KOL 精细化贡献模型
+        - paragraph [ref=e38]: 摆脱低效的ROI或硬性转化评定，精准提炼声量贡献。
+    - generic [ref=e39]: "系统当前状态: 安全连接部署已就绪"
+  - generic [ref=e43]:
+    - generic [ref=e44]:
+      - heading "欢迎登录系统" [level=3] [ref=e45]
+      - paragraph [ref=e46]: 请选择下方安全快捷的登录方式访问管理后台
+    - generic [ref=e47]:
+      - button "手机快捷登录" [ref=e48]
+      - button "微信扫码登录" [ref=e51]
+    - generic [ref=e58]:
+      - generic [ref=e77]:
+        - generic [ref=e78]: 【模拟网关】短信发送成功
+        - paragraph [ref=e83]:
+          - text: "为了方便您测试，系统已自动填充接收到的验证码:"
+          - strong [ref=e84]: "000000"
+      - generic [ref=e59]:
+        - text: 手机号码
+        - generic [ref=e60]:
+          - generic [ref=e61]: "+86"
+          - textbox "请输入11位中国手机号码" [ref=e62]: "18680807961"
+      - generic [ref=e63]:
+        - text: 验证码
+        - generic [ref=e64]:
+          - textbox "请输入短信验证码" [ref=e66]: "000000"
+          - button "59s 后重新发送" [disabled] [ref=e85]
+      - button "立即安全登录" [ref=e68]
+    - generic [ref=e71]:
+      - generic [ref=e72]: 国家等级保护安全系统、SSL链路级别加密支持
+      - paragraph [ref=e76]: 登录即代表您已同意《KOL Insight AI 用户服务协议》与《隐私保护指引》
