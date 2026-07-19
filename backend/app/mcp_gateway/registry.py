@@ -51,37 +51,60 @@ class _ManifestEntry:
     enabled: bool
 
 
-# These names are reviewed product capabilities, not an open-ended remote
-# discovery list. Their live input schemas are still checked and quarantined
-# when the provider changes, while the stable descriptions keep untrusted
-# provider text out of the model prompt.
-DYNAMIC_TOOL_ALLOWLIST: dict[DataTapService, dict[str, tuple[str, str]]] = {
-    DataTapService.INSIGHT_CUBE: {
-        "match_best_tag": ("datatap.insight.match.best.tag.v1", "品牌与品类标准标签匹配"),
-        "query_analysis_data": ("datatap.insight.query.analysis.v1", "品牌声量、互动、情感和平台维度统计"),
-        "social_statistic_trend": ("datatap.insight.social.statistic.trend.v1", "品牌或关键词跨平台声量趋势"),
-        "social_statistic_user_profile": ("datatap.insight.social.statistic.user.profile.v1", "品牌受众年龄、性别和地域画像"),
-        "social_statistic_hot_user": ("datatap.insight.social.statistic.hot.user.v1", "品牌相关热门用户和传播达人"),
-        "social_statistic_overview": ("datatap.insight.social.statistic.overview.v1", "品牌或关键词社交搜索整体概览"),
-        "social_statistic_hot_topic": ("datatap.insight.social.statistic.hot.topic.v1", "品牌相关热门话题和声量聚类"),
-    },
-    DataTapService.SOCIAL_GROW: {
-        "kol_match_mentions_tag": ("datatap.social.grow.kol.match.mentions.tag.v1", "品牌提及标签匹配"),
-        "kol_detail": ("datatap.social.grow.kol.detail.v1", "指定平台达人详情与趋势画像"),
-        # The legacy internal names remain stable for existing saved plans.
-        "kol_xiaohongshu_search": ("datatap.xiaohongshu.kol.search.v1", "小红书 KOL 候选检索"),
-        "kol_douyin_search": ("datatap.douyin.kol.search.v1", "抖音 KOL 候选检索"),
-        "kol_bilibili_search": ("datatap.social.grow.kol.bilibili.search.v1", "B站 KOL 候选检索"),
-        "kol_weibo_search": ("datatap.social.grow.kol.weibo.search.v1", "微博 KOL 候选检索"),
-        "kol_wechat_search": ("datatap.social.grow.kol.wechat.search.v1", "微信 KOL 候选检索"),
-    },
-}
-
 _DATATAP_RESULT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "properties": {"result": {"type": "string"}},
     "required": ["result"],
+}
+
+# B站等不遵循 DataTap {result: string} 包装的服务使用宽松输出契约。
+_PERMISSIVE_OUTPUT_SCHEMA: dict[str, Any] = {}
+
+# These names are reviewed product capabilities, not an open-ended remote
+# discovery list. Their live input schemas are still checked and quarantined
+# when the provider changes, while the stable descriptions keep untrusted
+# provider text out of the model prompt.
+# 值为 (内部工具名, 审核描述, 输出 Schema)。
+DYNAMIC_TOOL_ALLOWLIST: dict[DataTapService, dict[str, tuple[str, str, dict[str, Any]]]] = {
+    DataTapService.INSIGHT_CUBE: {
+        "match_best_tag": ("datatap.insight.match.best.tag.v1", "品牌与品类标准标签匹配", _DATATAP_RESULT_SCHEMA),
+        "query_analysis_data": ("datatap.insight.query.analysis.v1", "品牌声量、互动、情感和平台维度统计", _DATATAP_RESULT_SCHEMA),
+        "social_statistic_trend": ("datatap.insight.social.statistic.trend.v1", "品牌或关键词跨平台声量趋势", _DATATAP_RESULT_SCHEMA),
+        "social_statistic_user_profile": ("datatap.insight.social.statistic.user.profile.v1", "品牌受众年龄、性别和地域画像", _DATATAP_RESULT_SCHEMA),
+        "social_statistic_hot_user": ("datatap.insight.social.statistic.hot.user.v1", "品牌相关热门用户和传播达人", _DATATAP_RESULT_SCHEMA),
+        "social_statistic_overview": ("datatap.insight.social.statistic.overview.v1", "品牌或关键词社交搜索整体概览", _DATATAP_RESULT_SCHEMA),
+        "social_statistic_hot_topic": ("datatap.insight.social.statistic.hot.topic.v1", "品牌相关热门话题和声量聚类", _DATATAP_RESULT_SCHEMA),
+        "social_statistic_category_rank": ("datatap.insight.social.statistic.category.rank.v1", "品类及子品类市场表现与声量排行", _DATATAP_RESULT_SCHEMA),
+        "query_raw_posts": ("datatap.insight.query.raw.posts.v1", "社媒原帖明细检索", _DATATAP_RESULT_SCHEMA),
+        "social_statistic_brand_activity": ("datatap.insight.social.statistic.brand.activity.v1", "品牌相关活动列表与互动数据", _DATATAP_RESULT_SCHEMA),
+        "query_rank_list": ("datatap.insight.query.rank.list.v1", "社媒榜单数据查询", _DATATAP_RESULT_SCHEMA),
+        "analysis_target_search": ("datatap.insight.analysis.target.search.v1", "分析对象规则检索", _DATATAP_RESULT_SCHEMA),
+    },
+    DataTapService.SOCIAL_GROW: {
+        "kol_match_mentions_tag": ("datatap.social.grow.kol.match.mentions.tag.v1", "品牌提及标签匹配", _DATATAP_RESULT_SCHEMA),
+        "kol_detail": (
+            "datatap.social.grow.kol.detail.v1",
+            "指定平台达人详情与趋势画像。scope 有效取值：accountTrend(账号趋势)、"
+            "priceTrend(价格趋势)、postSummaryStatistics(发帖汇总)、postDailyStatistics(发帖分天)、"
+            "hotWord(品牌热词)、fansAudience(受众画像)；抖音另有 businessXT/businessCar，"
+            "小红书另有 businessPGY，各平台均有 businessBrand。不要自造 scope 取值。",
+            _DATATAP_RESULT_SCHEMA,
+        ),
+        "kol_get_class_tag_dictionary": ("datatap.social.grow.kol.class.tag.dictionary.v1", "KOL 分类标签字典", _DATATAP_RESULT_SCHEMA),
+        # The legacy internal names remain stable for existing saved plans.
+        "kol_xiaohongshu_search": ("datatap.xiaohongshu.kol.search.v1", "小红书 KOL 候选检索", _DATATAP_RESULT_SCHEMA),
+        "kol_douyin_search": ("datatap.douyin.kol.search.v1", "抖音 KOL 候选检索", _DATATAP_RESULT_SCHEMA),
+        "kol_bilibili_search": ("datatap.social.grow.kol.bilibili.search.v1", "B站 KOL 候选检索", _DATATAP_RESULT_SCHEMA),
+        "kol_weibo_search": ("datatap.social.grow.kol.weibo.search.v1", "微博 KOL 候选检索", _DATATAP_RESULT_SCHEMA),
+        "kol_wechat_search": ("datatap.social.grow.kol.wechat.search.v1", "微信 KOL 候选检索", _DATATAP_RESULT_SCHEMA),
+    },
+    DataTapService.BILIBILI: {
+        "general_search": ("datatap.bilibili.general.search.v1", "B站内容关键词搜索", _PERMISSIVE_OUTPUT_SCHEMA),
+        "search_user": ("datatap.bilibili.search.user.v1", "B站用户搜索", _PERMISSIVE_OUTPUT_SCHEMA),
+        "get_video_danmaku": ("datatap.bilibili.video.danmaku.v1", "B站视频弹幕数据", _PERMISSIVE_OUTPUT_SCHEMA),
+        "get_precise_results": ("datatap.bilibili.precise.results.v1", "B站精确搜索结果", _PERMISSIVE_OUTPUT_SCHEMA),
+    },
 }
 
 
@@ -136,13 +159,13 @@ class ToolRegistryService:
         self._by_internal = {entry.internal_name: entry for entry in self._entries}
         self._by_remote = {(entry.service, entry.remote_name): entry for entry in self._entries}
         self._dynamic_by_remote = {
-            (service, remote): (internal_name, description)
+            (service, remote): (internal_name, description, output_schema)
             for service, tools in DYNAMIC_TOOL_ALLOWLIST.items()
-            for remote, (internal_name, description) in tools.items()
+            for remote, (internal_name, description, output_schema) in tools.items()
         }
         self._dynamic_by_internal = {
-            internal_name: (service, remote, description)
-            for (service, remote), (internal_name, description) in self._dynamic_by_remote.items()
+            internal_name: (service, remote, description, output_schema)
+            for (service, remote), (internal_name, description, output_schema) in self._dynamic_by_remote.items()
         }
 
     async def refresh_service(self, service: DataTapService) -> DiscoveryReport:
@@ -220,7 +243,7 @@ class ToolRegistryService:
         for dynamic_service, dynamic_tools in DYNAMIC_TOOL_ALLOWLIST.items():
             if dynamic_service != service:
                 continue
-            for remote_name, (internal_name, _description) in dynamic_tools.items():
+            for remote_name, (internal_name, _description, _output_schema) in dynamic_tools.items():
                 if remote_name in seen_remote_names:
                     continue
                 row = await self._row_by_internal(internal_name)
@@ -243,7 +266,7 @@ class ToolRegistryService:
             dynamic = self._dynamic_by_internal.get(internal_name)
             if dynamic is None:
                 raise ToolNotEnabledError("tool is not present in the approved manifest")
-            service, remote_name, description = dynamic
+            service, remote_name, description, output_schema = dynamic
             row = await self._row_by_internal(internal_name)
             if (
                 row is None
@@ -258,7 +281,7 @@ class ToolRegistryService:
                 service=service,
                 remote_name=remote_name,
                 input_schema=close_input_schema(row.input_schema_json),
-                output_schema=_DATATAP_RESULT_SCHEMA,
+                output_schema=output_schema,
             )
         row = await self._row_by_internal(internal_name)
         if (
@@ -297,7 +320,7 @@ class ToolRegistryService:
                             service=dynamic[0],
                             remote_name=dynamic[1],
                             input_schema=close_input_schema(row.input_schema_json),
-                            output_schema=_DATATAP_RESULT_SCHEMA,
+                            output_schema=dynamic[3],
                         )
                     )
                 continue
@@ -320,7 +343,7 @@ class ToolRegistryService:
         approved: list[str],
         quarantined: list[str],
     ) -> None:
-        internal_name, description = self._dynamic_by_remote[(service, tool.name)]
+        internal_name, description, _output_schema = self._dynamic_by_remote[(service, tool.name)]
         observed_digest = discovery_digest(tool)
         row = await self._row_by_internal(internal_name)
         if row is not None and row.discovery_digest != observed_digest:

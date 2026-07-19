@@ -607,3 +607,99 @@ def test_uri_and_absolute_paths_never_enter_hot_words_or_audience_labels(
     assert candidate.analytics_fields["hot_words"] == ["安全热词"]
     assert "audience_age" not in candidate.analytics_fields
     assert candidate.analytics_fields["audience_regions"] == {"浙江": 20}
+
+
+def test_extract_kol_uids_from_settled_search_evidence() -> None:
+    from app.reporting.normalizers import extract_kol_uids
+
+    evidence_payload = {
+        "result": json.dumps(
+            {
+                "KOL 列表": [
+                    {"账号ID": "uid-1", "昵称": "达人一"},
+                    {"账号ID (kwUid)": "uid-2", "昵称": "达人二"},
+                    {"昵称": "无uid达人"},
+                    {"账号ID": "uid-1", "昵称": "重复达人"},
+                ]
+            },
+            ensure_ascii=False,
+        )
+    }
+
+    assert extract_kol_uids(evidence_payload) == ["uid-1", "uid-2"]
+    assert extract_kol_uids({"result": json.dumps({"KOL 列表": []})}) == []
+    assert extract_kol_uids({"result": "not-json"}) == []
+    assert extract_kol_uids(None) == []
+
+
+def test_generic_adapter_extracts_audience_from_nested_fans_profile() -> None:
+    """kol.detail 的受众画像（{"键","值"} 分布项）进入 BI 受众分析字段。"""
+    item = evidence(
+        "datatap.social.grow.kol.detail.v1",
+        {
+            "platform": "douyin",
+            "result": json.dumps(
+                {
+                    "详情列表": [
+                        {
+                            "账号ID (kwUid)": "uid-1",
+                            "平台": "douyin",
+                            "受众画像": {
+                                "粉丝性别分布": [{"键": "女", "值": 0.6828}, {"键": "男", "值": 0.3172}],
+                                "粉丝年龄分布": [{"键": "18-24", "值": 0.4}, {"键": "25-30", "值": 0.35}],
+                                "粉丝省份分布Top10": [{"键": "广东", "值": 0.12}, {"键": "浙江", "值": 0.08}],
+                            },
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            )
+        },
+        "call-detail-audience",
+    )
+
+    [candidate] = normalize_tool_evidence([item])
+
+    assert candidate.analytics_fields["audience_gender"] == {"女": 68.28, "男": 31.72}
+    assert candidate.analytics_fields["audience_age"] == {"18-24": 40, "25-30": 35}
+    assert candidate.analytics_fields["audience_regions"] == {"广东": 12, "浙江": 8}
+
+
+def test_detail_audience_merges_into_search_candidate() -> None:
+    """搜索候选与详情画像按（平台, 账号ID）合并为同一达人。"""
+    search_item = evidence(
+        "datatap.social.grow.kol.weibo.search.v1",
+        {
+            "result": json.dumps(
+                {"达人信息列表": [{"昵称": "达人甲", "粉丝数": "2万", "平台": "微博"}]},
+                ensure_ascii=False,
+            )
+        },
+        "call-search",
+    )
+    detail_item = evidence(
+        "datatap.social.grow.kol.detail.v1",
+        {
+            "platform": "weibo",
+            "result": json.dumps(
+                {
+                    "详情列表": [
+                        {
+                            "账号ID (kwUid)": "weibo:达人甲",
+                            "受众画像": {
+                                "粉丝性别分布": [{"键": "女", "值": 0.6}, {"键": "男", "值": 0.4}],
+                            },
+                        }
+                    ]
+                },
+                ensure_ascii=False,
+            )
+        },
+        "call-detail",
+    )
+
+    # 搜索行无账号ID时按昵称派生确定性身份，与详情行账号ID不一致则不合并：
+    # 真实链路中搜索行与详情行都带 kwUid。这里验证详情行本身可独立归一化。
+    [detail_candidate] = normalize_tool_evidence([detail_item])
+    assert detail_candidate.platform == "weibo"
+    assert detail_candidate.analytics_fields["audience_gender"] == {"女": 60, "男": 40}

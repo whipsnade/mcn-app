@@ -583,6 +583,16 @@ class ReportingService:
                 if isinstance(step, dict) and step.get("id")
             }
         )
+        # kol.detail 响应行不带平台字段；归一化合并候选时按步骤参数回填。
+        step_platforms: dict[str, str] = {}
+        for source in (task_plan or {}, replan_json or {}):
+            for step in (source.get("steps", []) if isinstance(source, dict) else []):
+                if not isinstance(step, dict) or not step.get("id"):
+                    continue
+                arguments = step.get("arguments")
+                platform = arguments.get("platform") if isinstance(arguments, dict) else None
+                if isinstance(platform, str) and platform.strip():
+                    step_platforms[str(step["id"])] = platform.strip()
         calls = list(
             (
                 await self._db.scalars(
@@ -603,6 +613,9 @@ class ReportingService:
             payload = evidence.get("structured_content")
             if evidence.get("outcome") != "succeeded" or not isinstance(payload, dict):
                 continue
+            step_platform = step_platforms.get(call.plan_step_id)
+            if step_platform and "platform" not in payload:
+                payload = {**payload, "platform": step_platform}
             result.append(
                 ToolEvidence(
                     internal_tool_name=call.internal_tool_name,

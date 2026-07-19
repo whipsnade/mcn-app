@@ -90,10 +90,21 @@ _BRAND_EVIDENCE_TOOLS = {
     "datatap.insight.social.statistic.hot.user.v1",
     "datatap.insight.social.statistic.overview.v1",
     "datatap.insight.social.statistic.hot.topic.v1",
+    "datatap.insight.social.statistic.category.rank.v1",
+    "datatap.insight.social.statistic.brand.activity.v1",
+    "datatap.insight.query.raw.posts.v1",
+    "datatap.insight.query.rank.list.v1",
+    "datatap.insight.analysis.target.search.v1",
 }
 _NON_KOL_EVIDENCE_TOOLS = _BRAND_EVIDENCE_TOOLS | {
     "datatap.insight.match.best.tag.v1",
     "datatap.social.grow.kol.match.mentions.tag.v1",
+    "datatap.social.grow.kol.class.tag.dictionary.v1",
+    # B站服务工具暂无候选归一化适配器：pipeline 忽略其证据，避免整任务失败。
+    "datatap.bilibili.general.search.v1",
+    "datatap.bilibili.search.user.v1",
+    "datatap.bilibili.video.danmaku.v1",
+    "datatap.bilibili.precise.results.v1",
 }
 _BRAND_PLATFORM_ALIASES = {
     "小红书": "xiaohongshu",
@@ -423,7 +434,11 @@ def _datatap_generic_kol_search_adapter(item: ToolEvidence) -> tuple[NormalizedK
     except json.JSONDecodeError as exc:
         raise ValueError("invalid_datatap_generic_result") from exc
     candidates = _datatap_candidate_rows(payload)
+    # kol.detail 是多平台工具：平台不在行内时回退到证据构建时注入的
+    # payload 级 platform 提示（来自计划步骤参数）。
     platform_hint = _DATATAP_PLATFORM_BY_TOOL[item.internal_tool_name]
+    if platform_hint is None and isinstance(item.payload.get("platform"), str):
+        platform_hint = item.payload["platform"]
     normalized: list[NormalizedKolEvidence] = []
     for candidate in candidates:
         try:
@@ -478,6 +493,33 @@ def _datatap_candidate_rows(payload: Any) -> list[dict[str, Any]]:
     if rows is not None:
         return rows
     raise ValueError("invalid_datatap_generic_candidates")
+
+
+def extract_kol_uids(structured_content: Any, *, limit: int = 10) -> list[str]:
+    """从已结算的 KOL 搜索证据中提取达人 uid，供详情调用回填。
+
+    搜索类工具的证据是 ``{"result": "<json string>"}`` 包装；解析失败或
+    无候选时返回空列表，调用方据此跳过详情调用（不发起、不计费）。
+    """
+    if not isinstance(structured_content, dict):
+        return []
+    raw_result = structured_content.get("result")
+    if not isinstance(raw_result, str):
+        return []
+    try:
+        payload = json.loads(raw_result)
+    except json.JSONDecodeError:
+        return []
+    try:
+        rows = _datatap_candidate_rows(payload)
+    except ValueError:
+        return []
+    uids: list[str] = []
+    for row in rows:
+        uid = _first_present_string(row, _GENERIC_ACCOUNT_ID_KEYS)
+        if uid:
+            uids.append(uid)
+    return list(dict.fromkeys(uids))[:limit]
 
 
 def _first_present_string(candidate: dict[str, Any], keys: tuple[str, ...]) -> str | None:
@@ -935,6 +977,8 @@ _ANALYTICS_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
         "region_distribution",
         "audience_region_distribution",
         "粉丝地域分布",
+        "粉丝省份分布Top10",
+        "粉丝省份分布",
         "受众地域分布",
         "地域分布",
     ),
@@ -976,7 +1020,7 @@ def _extract_analytics_fields(candidate: dict[str, Any]) -> dict[str, Any]:
 def _analytics_sources(candidate: dict[str, Any]) -> tuple[dict[str, Any], ...]:
     nested = tuple(
         value
-        for key in ("analytics_fields", "analytics", "bi_fields", "BI字段")
+        for key in ("analytics_fields", "analytics", "bi_fields", "BI字段", "受众画像", "粉丝画像")
         if isinstance((value := candidate.get(key)), dict)
     )
     return (candidate, *nested)
@@ -1151,7 +1195,7 @@ def _distribution(value: Any) -> dict[str, int | float]:
             name = next(
                 (
                     item[key]
-                    for key in ("name", "label", "range", "region", "gender", "名称", "标签", "区间", "地区", "性别", "年龄")
+                    for key in ("name", "label", "range", "region", "gender", "名称", "标签", "区间", "地区", "性别", "年龄", "键")
                     if key in item
                 ),
                 None,
@@ -1159,7 +1203,7 @@ def _distribution(value: Any) -> dict[str, int | float]:
             number = next(
                 (
                     item[key]
-                    for key in ("value", "count", "rate", "percent", "占比", "数值", "人数")
+                    for key in ("value", "count", "rate", "percent", "占比", "数值", "人数", "值")
                     if key in item
                 ),
                 None,

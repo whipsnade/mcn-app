@@ -87,6 +87,7 @@ class DatabaseTaskStore:
     async def claim_lease(self, *args: Any): return await self._write("claim_lease", *args)
     async def save_plan(self, *args: Any): return await self._write("save_plan", *args)
     async def save_trajectory(self, *args: Any): return await self._write("save_trajectory", *args)
+    async def save_plan_revision(self, *args: Any): return await self._write("save_plan_revision", *args)
     async def save_replan(self, *args: Any): return await self._write("save_replan", *args)
     async def cancel_requested(self, *args: Any): return await self._read("cancel_requested", *args)
     async def renew_lease(self, *args: Any): return await self._write("renew_lease", *args)

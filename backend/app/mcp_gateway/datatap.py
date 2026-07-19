@@ -179,7 +179,7 @@ class DataTapTransport:
                             raise McpProtocolError("MCP tool protocol error") from exc
                         except (httpx.ReadTimeout, TimeoutError) as exc:
                             raise PossiblySentTimeout("MCP result was not confirmed") from exc
-                        structured_content = getattr(result, "structuredContent", None)
+                        structured_content = self._structured_content(result)
                         error_text = None
                         if getattr(result, "isError", False):
                             error_text = self._error_text(result)
@@ -303,8 +303,29 @@ class DataTapTransport:
         )
 
     @staticmethod
+    def _structured_content(result: Any) -> Any:
+        """提取结构化结果；文本内容中的数据按 {result: string} 包装补齐。
+
+        DataTap 的统计/榜单类工具常把数据 JSON 放在 MCP 文本内容里而不填
+        ``structuredContent``。KOL 搜索类工具则按 ``{result: string}`` 填充。
+        这里把前者统一成后者，保证下游校验、证据与归一化共用同一契约。
+        """
+        structured = getattr(result, "structuredContent", None)
+        if structured is not None or getattr(result, "isError", False):
+            return structured
+        # 与 validate_output 的字符串上限对齐。
+        text = DataTapTransport._content_text(result, limit=262_000)
+        if text is None:
+            return None
+        return {"result": text}
+
+    @staticmethod
     def _error_text(result: Any) -> str | None:
         """拼接 MCP 错误结果的文本内容并截断，供回喂模型自我纠正。"""
+        return DataTapTransport._content_text(result, limit=500)
+
+    @staticmethod
+    def _content_text(result: Any, *, limit: int) -> str | None:
         parts: list[str] = []
         for item in getattr(result, "content", None) or []:
             text = getattr(item, "text", None)
@@ -312,7 +333,7 @@ class DataTapTransport:
                 parts.append(text.strip())
         if not parts:
             return None
-        return " ".join(parts)[:500]
+        return " ".join(parts)[:limit]
 
     @staticmethod
     def _request_id(result: Any) -> str | None:

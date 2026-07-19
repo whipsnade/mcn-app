@@ -99,6 +99,7 @@ npm run test:e2e
 - `app/core/config.py` 在启动时做硬性校验：`TENCENT_PLAN_BASE_URL` 必须为已确认的腾讯端点、`MCP_CALL_POINTS` 与 `MCP_MAX_CALLS_PER_TASK` 必须为 10、密钥不得为空。
 - `AUTH_MODE=mock` 仅允许 `development` 与 `test`；`production` 下检测到 mock 认证会拒绝启动。
 - 测试账号 `kol_test` 只能访问 `kol_insight_test`，禁止授予开发库或生产库权限。
+- 工具启用流程：远程发现的工具默认 quarantined；启用 = 在 `mcp_gateway/registry.py` 的 `DYNAMIC_TOOL_ALLOWLIST` 登记（内部名、审核描述、输出 Schema）并将 `review_status` 置 approved，启动时按实时签名复核，digest 变化会重新隔离。
 - 普通用户的会话、消息、钱包查询必须始终带当前认证用户条件（用户数据隔离），新增查询时不得遗漏。
 
 ## 运行手册

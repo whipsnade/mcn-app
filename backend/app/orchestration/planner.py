@@ -88,8 +88,7 @@ class Planner:
                 )
             )
             sanitized = self._sanitize_plan_arguments(result.value, context)
-            executable = self._drop_unexecutable_detail_steps(sanitized)
-            compiled = self._compile_supported_search_defaults(executable, context)
+            compiled = self._compile_supported_search_defaults(sanitized, context)
             plan = compiled.model_copy(update={"analysis_scope": derive_analysis_scope(compiled)})
             self._validate(plan, context)
             return plan
@@ -213,8 +212,7 @@ class Planner:
         sanitized = _expand_user_profile_media(
             self._sanitize_plan_arguments(result.value, context), context
         )
-        executable = self._drop_unexecutable_detail_steps(sanitized)
-        plan = executable.model_copy(update={"analysis_scope": derive_analysis_scope(executable)})
+        plan = sanitized.model_copy(update={"analysis_scope": derive_analysis_scope(sanitized)})
         if len(plan.steps) > recovery.remaining_calls:
             raise PlanValidationError("REPLAN_CALL_BUDGET_EXCEEDED")
         prohibited_ids = set(recovery.completed_step_ids) | {
@@ -224,32 +222,6 @@ class Planner:
             raise PlanValidationError("REPLAN_REUSES_COMPLETED_STEP")
         self._validate(plan, context, completed_evidence_kinds=recovery.completed_evidence_kinds)
         return plan
-
-    @staticmethod
-    def _drop_unexecutable_detail_steps(plan: ToolPlan) -> ToolPlan:
-        """剔除携带空达人 uid 列表的详情调用。
-
-        达人详情工具必须携带真实 uid；规划阶段搜索结果未知，模型只能写下
-        空占位列表，执行时必然是一次无意义的空调用（且每次 10 积分）。
-        搜索步骤本身已满足 kol 证据要求，因此直接剔除这些步骤；如果剔除
-        后计划为空，交给上层回退到搜索型计划。
-        """
-        steps = tuple(
-            step
-            for step in plan.steps
-            if not (
-                step.internal_tool_name == _DATATAP_KOL_DETAIL
-                and not (
-                    isinstance(step.arguments.get("kwUidList"), list)
-                    and any(str(uid).strip() for uid in step.arguments["kwUidList"])
-                )
-            )
-        )
-        if len(steps) == len(plan.steps):
-            return plan
-        if not steps:
-            raise PlanValidationError("PLAN_ONLY_EMPTY_DETAIL_CALLS")
-        return plan.model_copy(update={"steps": steps})
 
     @staticmethod
     def _sanitize_plan_arguments(plan: ToolPlan, context: PlannerContext) -> ToolPlan:
@@ -374,6 +346,40 @@ class Planner:
             )
             existing_tools.add(internal_name)
             next_step_number += 1
+            changed = True
+        # 有搜索步骤但没有详情步骤时自动补一个（空 uid 占位，执行器回填；
+        # 搜索无结果时执行器跳过不计费），保证候选达人能拿到详情与受众画像。
+        search_step_ids = tuple(
+            step.id
+            for step in compiled_steps
+            if step.internal_tool_name in _DATATAP_SEARCH_BY_PLATFORM.values()
+        )
+        has_detail_step = any(
+            step.internal_tool_name == _DATATAP_KOL_DETAIL for step in compiled_steps
+        )
+        detail_tool_available = _DATATAP_KOL_DETAIL in available_tools
+        if search_step_ids and not has_detail_step and detail_tool_available and len(compiled_steps) < 10:
+            while any(step.id == f"step_{next_step_number}" for step in compiled_steps):
+                next_step_number += 1
+            detail_platform = (
+                context.brief.platforms[0] if context.brief.platforms else "douyin"
+            )
+            compiled_steps.append(
+                plan.steps[0].model_copy(
+                    update={
+                        "id": f"step_{next_step_number}",
+                        "internal_tool_name": _DATATAP_KOL_DETAIL,
+                        "arguments": {
+                            "platform": detail_platform,
+                            "kwUidList": [],
+                            "scope": ["accountTrend", "fansAudience", "postSummaryStatistics"],
+                        },
+                        "depends_on": search_step_ids,
+                        "evidence_goal": "候选达人详情与受众画像",
+                        "evidence_kind": "kol",
+                    }
+                )
+            )
             changed = True
         return plan.model_copy(update={"steps": tuple(compiled_steps)}) if changed else plan
 

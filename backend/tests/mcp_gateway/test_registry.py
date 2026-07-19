@@ -47,3 +47,12 @@ def test_close_input_schema_closes_nested_provider_objects() -> None:
     )
     # Normalization must not mutate the live discovery object.
     assert schema["additionalProperties"] is not False
+
+
+def test_kol_detail_description_documents_valid_scope_values() -> None:
+    """模型只能靠审核描述了解 scope 词表，缺失会导致详情调用空转。"""
+    description = DYNAMIC_TOOL_ALLOWLIST[DataTapService.SOCIAL_GROW]["kol_detail"][1]
+
+    assert "fansAudience" in description
+    assert "accountTrend" in description
+    assert "businessBrand" in description

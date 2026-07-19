@@ -20,6 +20,7 @@ import {
 import type {
   ApiTaskStatus,
   BiAnalyticsData,
+  BiMetric,
 } from '../api/contracts';
 import { Card, formatExposure, MetricCard, Missing } from './reportPrimitives';
 
@@ -33,6 +34,59 @@ const sentimentColors = ['#14b887', '#f59b00', '#f43f4f'];
 
 function isTerminal(status?: string): boolean {
   return status === 'completed' || status === 'completed_with_warnings';
+}
+
+function metricUsable(metric?: BiMetric): boolean {
+  return Boolean(metric?.available && metric.value !== null && Number.isFinite(metric.value));
+}
+
+function distributionUsable(distribution?: { available?: boolean; items?: unknown[] }): boolean {
+  return Boolean(distribution?.available && (distribution.items?.length ?? 0) > 0);
+}
+
+/**
+ * 品牌与 KOL 双通道受众分析按字段合并：hybrid 任务中品牌证据失败时，
+ * 数据分析页回退展示候选达人的受众画像，而不是整页“数据不足”。
+ */
+export function mergeAnalyticsChannels(
+  primary?: BiAnalyticsData,
+  fallback?: BiAnalyticsData,
+): BiAnalyticsData | undefined {
+  // 旧报告可能只有 {} 形状的空通道，按缺失处理。
+  if (!primary?.overview || !primary?.audience) return fallback;
+  if (!fallback?.overview || !fallback?.audience) return primary;
+  return {
+    overview: {
+      brand_volume: metricUsable(primary.overview.brand_volume)
+        ? primary.overview.brand_volume
+        : fallback.overview.brand_volume,
+      total_exposure: metricUsable(primary.overview.total_exposure)
+        ? primary.overview.total_exposure
+        : fallback.overview.total_exposure,
+      average_engagement_rate: metricUsable(primary.overview.average_engagement_rate)
+        ? primary.overview.average_engagement_rate
+        : fallback.overview.average_engagement_rate,
+    },
+    sentiment: primary.sentiment?.available ? primary.sentiment : fallback.sentiment,
+    exposure_trend: primary.exposure_trend?.length
+      ? primary.exposure_trend
+      : fallback.exposure_trend,
+    volume_trend: primary.volume_trend?.length ? primary.volume_trend : fallback.volume_trend,
+    sentiment_trend: primary.sentiment_trend?.length
+      ? primary.sentiment_trend
+      : fallback.sentiment_trend,
+    audience: {
+      age: distributionUsable(primary.audience.age)
+        ? primary.audience.age
+        : fallback.audience.age,
+      gender: distributionUsable(primary.audience.gender)
+        ? primary.audience.gender
+        : fallback.audience.gender,
+      regions: distributionUsable(primary.audience.regions)
+        ? primary.audience.regions
+        : fallback.audience.regions,
+    },
+  };
 }
 
 function SentimentCard({ analytics }: { analytics?: BiAnalyticsData }) {
@@ -186,9 +240,9 @@ export default function BiAnalytics({ analytics, taskStatus }: BiAnalyticsProps)
   return (
     <div role="region" aria-label="数据分析" className="space-y-3">
       <div className="grid grid-cols-3 gap-2.5">
-        <MetricCard label="全网品牌声量" metric={usableAnalytics?.overview.brand_volume} />
-        <MetricCard label="总曝光量" metric={usableAnalytics?.overview.total_exposure} format="exposure" />
-        <MetricCard label="平均互动率" metric={usableAnalytics?.overview.average_engagement_rate} format="percent" accent="text-slate-800" />
+        <MetricCard label="全网品牌声量" metric={usableAnalytics?.overview?.brand_volume} />
+        <MetricCard label="总曝光量" metric={usableAnalytics?.overview?.total_exposure} format="exposure" />
+        <MetricCard label="平均互动率" metric={usableAnalytics?.overview?.average_engagement_rate} format="percent" accent="text-slate-800" />
       </div>
       <SentimentCard analytics={usableAnalytics} />
       <TrendCard analytics={usableAnalytics} />

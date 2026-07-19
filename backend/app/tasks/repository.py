@@ -125,6 +125,25 @@ class TaskRepository:
         await self.db.flush()
         return True
 
+    async def save_plan_revision(
+        self,
+        task_id: str,
+        worker_id: str,
+        plan_json: dict[str, Any] | None = None,
+        replan_json: dict[str, Any] | None = None,
+    ) -> bool:
+        """Silently update a pipeline plan (e.g. detail uid backfill)."""
+        task = await self._locked(task_id)
+        if not self._owns_active_lease(task, worker_id):
+            return False
+        if plan_json is not None:
+            task.plan_json = plan_json
+        if replan_json is not None:
+            task.replan_json = replan_json
+        task.updated_at = utc_now()
+        await self.db.flush()
+        return True
+
     async def save_replan(self, task_id: str, worker_id: str, replan_json: dict[str, Any]) -> bool:
         task = await self._locked(task_id)
         if not self._owns_active_lease(task, worker_id) or task.replan_count >= 1:

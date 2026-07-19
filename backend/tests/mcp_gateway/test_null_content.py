@@ -91,3 +91,32 @@ def test_safe_upstream_text_redacts_urls_and_truncates() -> None:
     assert safe_upstream_text("token=abc123 的配置错误") is None
     long_text = "错误" * 400
     assert len(safe_upstream_text(long_text)) == 300
+
+
+def test_structured_content_falls_back_to_text_payload() -> None:
+    from app.mcp_gateway.datatap import DataTapTransport
+
+    class _R:
+        isError = False
+        structuredContent = None
+        content = [type("C", (), {"text": '[{"声量": 14404383}]'})()]
+
+    assert DataTapTransport._structured_content(_R()) == {"result": '[{"声量": 14404383}]'}
+
+
+def test_structured_content_prefers_native_field_and_ignores_error_results() -> None:
+    from app.mcp_gateway.datatap import DataTapTransport
+
+    class _R:
+        isError = False
+        structuredContent = {"result": "ok"}
+        content = [type("C", (), {"text": "ignored"})()]
+
+    assert DataTapTransport._structured_content(_R()) == {"result": "ok"}
+
+    class _E:
+        isError = True
+        structuredContent = None
+        content = [type("C", (), {"text": "some error"})()]
+
+    assert DataTapTransport._structured_content(_E()) is None

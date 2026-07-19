@@ -2,6 +2,7 @@ import { fireEvent, render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 
 import type { BiAnalyticsData } from '../api/contracts';
+import { emptyAnalytics } from '../test/fixtures';
 import BiAnalytics from './BiAnalytics';
 
 const analytics: BiAnalyticsData = {
@@ -61,5 +62,42 @@ describe('BiAnalytics', () => {
     expect(panel).toBeVisible();
     expect(onChange).not.toHaveBeenCalled();
     fireEvent.keyDown(panel, { key: 'Tab' });
+  });
+});
+
+describe('mergeAnalyticsChannels', () => {
+  it('falls back to kol analytics sections when brand sections are unavailable', async () => {
+    const { mergeAnalyticsChannels } = await import('./BiAnalytics');
+    const kolAnalytics = {
+      overview: {
+        brand_volume: { value: null, unit: '条', available: false, coverage: 0, source_fields: [], platforms: [] },
+        total_exposure: { value: null, unit: '次', available: false, coverage: 0, source_fields: [], platforms: [] },
+        average_engagement_rate: { value: null, unit: '%', available: false, coverage: 0, source_fields: [], platforms: [] },
+      },
+      sentiment: { available: false, coverage: 0, source_fields: [], platforms: [], items: [], hot_words: [] },
+      exposure_trend: [],
+      audience: {
+        age: { value: null, unit: '%', available: true, coverage: 0.9, source_fields: ['audience_age'], platforms: ['douyin'], items: [{ label: '18-23', value: 57.85, unit: '%' }] },
+        gender: { value: null, unit: '%', available: true, coverage: 0.9, source_fields: ['audience_gender'], platforms: ['douyin'], items: [{ label: '女', value: 68, unit: '%' }] },
+        regions: { value: null, unit: '%', available: true, coverage: 0.9, source_fields: ['audience_regions'], platforms: ['douyin'], items: [{ label: '广东', value: 9, unit: '%' }] },
+      },
+    } as const;
+
+    const merged = mergeAnalyticsChannels(emptyAnalytics, kolAnalytics as never);
+
+    expect(merged?.audience.gender.items[0]).toEqual({ label: '女', value: 68, unit: '%' });
+    expect(merged?.audience.age.items[0]?.label).toBe('18-23');
+    // 品牌指标在双通道都不可用时保持不可用。
+    expect(merged?.overview.brand_volume.available).toBe(false);
+  });
+});
+
+describe('mergeAnalyticsChannels malformed channels', () => {
+  it('treats {}-shaped channels as missing instead of crashing', async () => {
+    const { mergeAnalyticsChannels } = await import('./BiAnalytics');
+
+    expect(mergeAnalyticsChannels({} as never, emptyAnalytics)).toBe(emptyAnalytics);
+    expect(mergeAnalyticsChannels(emptyAnalytics, {} as never)).toBe(emptyAnalytics);
+    expect(mergeAnalyticsChannels(undefined, undefined)).toBeUndefined();
   });
 });

@@ -8,7 +8,7 @@ import { useEffect, useState, type ReactNode } from 'react';
 import type { ApiBiReport, ApiCandidate } from '../api/contracts';
 import { downloadLatestSessionExport } from '../api/tasks';
 import type { ApiTaskStatus } from '../api/contracts';
-import BiAnalytics from './BiAnalytics';
+import BiAnalytics, { mergeAnalyticsChannels } from './BiAnalytics';
 
 interface BiReportProps {
   report?: ApiBiReport;
@@ -274,7 +274,9 @@ export default function BiReport({ report, candidateVersion, selectedCandidates 
   if ((!isBrandAnalysis && candidateVersion === undefined) || (candidateVersion !== undefined && report.candidate_version !== candidateVersion)) {
     return <PanelState>正在同步最新候选与 BI 报告</PanelState>;
   }
-  const analytics = isBrandAnalysis ? (report.brand_analytics ?? report.analytics) : report.analytics;
+  const analytics = isBrandAnalysis
+    ? mergeAnalyticsChannels(report.brand_analytics ?? report.analytics, report.kol_analytics)
+    : mergeAnalyticsChannels(report.analytics, report.kol_analytics);
 
   return (
     <aside className="flex h-full w-full shrink-0 flex-col overflow-hidden border-l border-slate-200 bg-white shadow-sm print-container xl:w-[420px]">

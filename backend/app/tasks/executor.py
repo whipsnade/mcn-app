@@ -18,6 +18,7 @@ from app.orchestration.loop import (
 )
 from app.orchestration.schemas import PlanValidationError, ReplanContext, ReplanFailure, ToolPlan
 from app.reporting.analysis_reports import sanitize_evidence
+from app.reporting.normalizers import extract_kol_uids
 from app.tasks.errors import canonical_platform, safe_error
 from app.tasks.state import TaskEventType
 
@@ -29,6 +30,14 @@ class TaskStore(Protocol):
 
     async def save_trajectory(
         self, task_id: str, worker_id: str, trajectory_json: dict[str, Any]
+    ) -> bool: ...
+
+    async def save_plan_revision(
+        self,
+        task_id: str,
+        worker_id: str,
+        plan_json: dict[str, Any] | None = None,
+        replan_json: dict[str, Any] | None = None,
     ) -> bool: ...
 
     async def save_replan(self, task_id: str, worker_id: str, replan_json: dict[str, Any]) -> bool: ...
@@ -94,6 +103,71 @@ logger = logging.getLogger(__name__)
 # deliberately excluded: replaying a possibly-sent request could duplicate a
 # non-idempotent upstream operation.
 _REPLAN_RETRYABLE_STATUSES = frozenset({"failed", "released"})
+
+_KOL_DETAIL_TOOL = "datatap.social.grow.kol.detail.v1"
+_MAX_DETAIL_UIDS = 10
+
+# kol.detail 的 scope 平台词表（来自 DataTap 工具文档）。模型常自造取值，
+# 上游不会报错而是静默只回 uid，因此调用前必须确定性归一化。
+_COMMON_DETAIL_SCOPES = frozenset({
+    "accountTrend",
+    "priceTrend",
+    "postSummaryStatistics",
+    "postDailyStatistics",
+    "hotWord",
+    "fansAudience",
+    "businessBrand",
+})
+_DETAIL_SCOPES_BY_PLATFORM = {
+    "douyin": _COMMON_DETAIL_SCOPES | {"businessXT", "businessCar"},
+    "xiaohongshu": _COMMON_DETAIL_SCOPES | {"businessPGY"},
+    "weibo": _COMMON_DETAIL_SCOPES,
+}
+_DEFAULT_DETAIL_SCOPES = ["accountTrend", "fansAudience", "postSummaryStatistics"]
+
+
+def _normalize_detail_scope(arguments: dict[str, Any]) -> dict[str, Any]:
+    """把详情调用的 scope 归一化为平台有效取值；全部无效时用默认集合。"""
+    platform = str(arguments.get("platform") or "").strip()
+    allowed = _DETAIL_SCOPES_BY_PLATFORM.get(platform, _COMMON_DETAIL_SCOPES)
+    raw_scope = arguments.get("scope")
+    requested = (
+        [str(item) for item in raw_scope if isinstance(item, str) and item.strip()]
+        if isinstance(raw_scope, list)
+        else []
+    )
+    valid = [item for item in requested if item in allowed]
+    return {**arguments, "scope": valid or list(_DEFAULT_DETAIL_SCOPES)}
+
+
+def _step_has_uids(step: Any) -> bool:
+    uids = step.arguments.get("kwUidList")
+    return isinstance(uids, list) and any(str(uid).strip() for uid in uids)
+
+
+_DETAIL_PLATFORM_BY_TOOL_TOKEN = (
+    ("xiaohongshu", "xiaohongshu"),
+    ("douyin", "douyin"),
+    ("bilibili", "bilibili"),
+    ("weibo", "weibo"),
+    ("wechat", "wechat"),
+)
+
+
+def _detail_uids_from_rows(rows: list[Any], platform: str) -> list[str]:
+    """按详情调用的平台过滤 uid：跨平台 uid 混入会被上游拒绝。"""
+    uids: list[str] = []
+    for row in rows:
+        tool_name = str(getattr(row, "internal_tool_name", None) or "")
+        row_platform = next(
+            (value for token, value in _DETAIL_PLATFORM_BY_TOOL_TOKEN if token in tool_name),
+            None,
+        )
+        if row_platform is not None and row_platform != platform:
+            continue
+        content = (getattr(row, "evidence_json", None) or {}).get("structured_content")
+        uids.extend(extract_kol_uids(content, limit=_MAX_DETAIL_UIDS))
+    return list(dict.fromkeys(uids))[:_MAX_DETAIL_UIDS]
 
 
 async def _noop_checkpoint(_: str) -> None:
@@ -230,12 +304,24 @@ class TaskExecutor:
             unresolved_failures: tuple[Any, ...] = ()
             completed_step_ids: set[str] = set()
             replan_failed = False
+            failed_rows: list[Any] = []
+            non_retryable_failures: list[Any] = []
+            settled_evidence_rows: list[Any] = []
             for batch in build_execution_batches(plan):
                 if lease_lost.is_set():
                     return
                 if await self.repository.cancel_requested(task.id):
                     await self.repository.mark_cancelled(task.id, self.worker_id)
                     return
+                resolved = await self._resolve_detail_steps(
+                    task, plan, batch.steps, settled_evidence_rows
+                )
+                if resolved is None:
+                    return
+                resolved_steps, plan = resolved
+                if not resolved_steps:
+                    # 详情步骤的搜索前置无结果：整批跳过，不发起、不计费。
+                    continue
                 # The actual gateway reserves and commits before transport; this
                 # deterministic checkpoint models a process loss at that boundary.
                 await self.checkpoint("after_reserve")
@@ -249,9 +335,9 @@ class TaskExecutor:
                         arguments=step.arguments,
                         lease_owner=self.worker_id,
                     )
-                    for step in batch.steps
+                    for step in resolved_steps
                 )
-                step_kinds = {step.id: step.evidence_kind for step in batch.steps}
+                step_kinds = {step.id: step.evidence_kind for step in resolved_steps}
                 for index, command in enumerate(commands, start=1):
                     await self.repository.append_event(
                         task.id,
@@ -266,6 +352,9 @@ class TaskExecutor:
                         ),
                     )
                 rows = await self.gateway.execute_batch(commands)
+                settled_evidence_rows.extend(
+                    row for row in rows if getattr(row, "status", None) in {"settled", "succeeded"}
+                )
                 progress = aggregate_mcp_progress(commands, rows)
                 for index, row in enumerate(rows, start=1):
                     row_status = getattr(row, "status", None)
@@ -310,125 +399,153 @@ class TaskExecutor:
                 if statuses & {"unknown", "planned", "reserved", "running", "succeeded"}:
                     await self.repository.mark_interrupted(task.id, self.worker_id)
                     return
-                if statuses - {"settled"}:
-                    has_settled = has_settled or "settled" in statuses
-                    completed_step_ids.update(
-                        str(getattr(row, "plan_step_id", ""))
-                        for row in rows
-                        if getattr(row, "status", None) in {"settled", "succeeded"}
-                    )
-                    non_retryable_failures = tuple(
-                        row
-                        for row in rows
-                        if getattr(row, "status", None) not in {"settled", "succeeded"}
-                        and getattr(row, "status", None) not in _REPLAN_RETRYABLE_STATUSES
-                    )
-                    try:
-                        supplement = await self._load_or_create_replan(
-                            task,
-                            plan,
-                            rows,
-                            completed_step_ids=tuple(sorted(completed_step_ids)),
-                        )
-                    except Exception:
-                        # A failed recovery plan must not discard already-settled
-                        # evidence.  The outer task status decides whether a
-                        # partial BI report can still be produced.
-                        replan_failed = True
-                        logger.exception(
-                            "task replanning failed task_id=%s", task.id
-                        )
-                        supplement = None
-                    if supplement is not None:
-                        supplement_commands = self._commands(task, supplement, revision="replan")
-                        supplement_step_kinds = {
-                            step.id: step.evidence_kind for step in supplement.steps
-                        }
-                        for index, command in enumerate(supplement_commands, start=1):
-                            await self.repository.append_event(
-                                task.id,
-                                task.user_id,
-                                TaskEventType.TOOL_STARTED,
-                                build_tool_event_payload(
-                                    command.internal_tool_name,
-                                    status="started",
-                                    step_index=index,
-                                    step_total=len(supplement_commands),
-                                    evidence_kind=supplement_step_kinds.get(command.plan_step_id),
-                                ),
-                            )
-                        supplement_rows = await self.gateway.execute_batch(supplement_commands)
-                        supplement_progress = aggregate_mcp_progress(
-                            supplement_commands, supplement_rows
-                        )
-                        for index, row in enumerate(supplement_rows, start=1):
-                            row_status = getattr(row, "status", None)
-                            event_type = (
-                                TaskEventType.TOOL_SUCCEEDED
-                                if row_status in {"settled", "succeeded"}
-                                else TaskEventType.TOOL_UNKNOWN
-                                if row_status == "unknown"
-                                else TaskEventType.TOOL_FAILED
-                            )
-                            command_name = (
-                                getattr(row, "internal_tool_name", None)
-                                or supplement_commands[
-                                    min(index - 1, len(supplement_commands) - 1)
-                                ].internal_tool_name
-                            )
-                            await self.repository.append_event(
-                                task.id,
-                                task.user_id,
-                                event_type,
-                                {
-                                    **build_tool_event_payload(
-                                        command_name,
-                                        status=(
-                                            "succeeded"
-                                            if event_type == TaskEventType.TOOL_SUCCEEDED
-                                            else "unknown"
-                                            if event_type == TaskEventType.TOOL_UNKNOWN
-                                            else "failed"
-                                        ),
-                                        step_index=index,
-                                        step_total=len(supplement_commands),
-                                        error_code=getattr(row, "error_type", None),
-                                        evidence_kind=supplement_step_kinds.get(
-                                            getattr(row, "plan_step_id", None)
-                                            or supplement_commands[
-                                                min(index - 1, len(supplement_commands) - 1)
-                                            ].plan_step_id
-                                        ),
-                                    ),
-                                    "platform_progress": supplement_progress["platforms"],
-                                },
-                            )
-                        supplement_statuses = {getattr(row, "status", None) for row in supplement_rows}
-                        if supplement_statuses & {"unknown", "planned", "reserved", "running", "succeeded"}:
-                            await self.repository.mark_interrupted(task.id, self.worker_id)
-                            return
-                        has_settled = has_settled or "settled" in supplement_statuses
-                        partial_failure = bool(supplement_statuses - {"settled"})
-                        unresolved_failures = non_retryable_failures + tuple(
-                            row
-                            for row in supplement_rows
-                            if getattr(row, "status", None) not in {"settled", "succeeded"}
-                        )
-                    else:
-                        partial_failure = True
-                        unresolved_failures = tuple(
-                            row
-                            for row in rows
-                            if getattr(row, "status", None) not in {"settled", "succeeded"}
-                        )
-                    break
-                has_settled = True
-                completed_step_ids.update(step.id for step in batch.steps)
+                # 可重试的失败不再中止后续批次：DAG 中无依赖的步骤继续执行，
+                # 全部批次结束后才对失败步骤统一 replan 一次。标签匹配等辅助
+                # 步骤的上游抖动不再拖垮整个任务。
+                has_settled = has_settled or "settled" in statuses
+                completed_step_ids.update(
+                    str(getattr(row, "plan_step_id", ""))
+                    for row in rows
+                    if getattr(row, "status", None) in {"settled", "succeeded"}
+                )
+                failed_rows.extend(
+                    row
+                    for row in rows
+                    if getattr(row, "status", None) in _REPLAN_RETRYABLE_STATUSES
+                )
+                non_retryable_failures.extend(
+                    row
+                    for row in rows
+                    if getattr(row, "status", None) not in {"settled", "succeeded"}
+                    and getattr(row, "status", None) not in _REPLAN_RETRYABLE_STATUSES
+                )
                 await self.checkpoint("after_settle")
                 if not await self.repository.renew_lease(
                     task.id, self.worker_id, self.lease_seconds
                 ):
                     return
+            if failed_rows:
+                try:
+                    supplement = await self._load_or_create_replan(
+                        task,
+                        plan,
+                        tuple(failed_rows),
+                        completed_step_ids=tuple(sorted(completed_step_ids)),
+                    )
+                except Exception:
+                    # A failed recovery plan must not discard already-settled
+                    # evidence.  The outer task status decides whether a
+                    # partial BI report can still be produced.
+                    replan_failed = True
+                    logger.exception(
+                        "task replanning failed task_id=%s", task.id
+                    )
+                    supplement = None
+                if supplement is not None:
+                    resolved_supplement = await self._resolve_detail_steps(
+                        task, supplement, supplement.steps, settled_evidence_rows,
+                        revision="replan",
+                    )
+                    if resolved_supplement is None:
+                        return
+                    supplement_steps, supplement = resolved_supplement
+                else:
+                    supplement_steps = ()
+                if supplement is not None and supplement_steps:
+                    supplement_commands = tuple(
+                        ExecuteMcpCall(
+                            logical_call_id=str(uuid5(NAMESPACE_URL, f"{task.id}:replan:{step.id}")),
+                            user_id=task.user_id,
+                            task_id=task.id,
+                            plan_step_id=step.id,
+                            internal_tool_name=step.internal_tool_name,
+                            arguments=step.arguments,
+                            lease_owner=self.worker_id,
+                        )
+                        for step in supplement_steps
+                    )
+                    supplement_step_kinds = {
+                        step.id: step.evidence_kind for step in supplement_steps
+                    }
+                    for index, command in enumerate(supplement_commands, start=1):
+                        await self.repository.append_event(
+                            task.id,
+                            task.user_id,
+                            TaskEventType.TOOL_STARTED,
+                            build_tool_event_payload(
+                                command.internal_tool_name,
+                                status="started",
+                                step_index=index,
+                                step_total=len(supplement_commands),
+                                evidence_kind=supplement_step_kinds.get(command.plan_step_id),
+                            ),
+                        )
+                    supplement_rows = await self.gateway.execute_batch(supplement_commands)
+                    settled_evidence_rows.extend(
+                        row
+                        for row in supplement_rows
+                        if getattr(row, "status", None) in {"settled", "succeeded"}
+                    )
+                    supplement_progress = aggregate_mcp_progress(
+                        supplement_commands, supplement_rows
+                    )
+                    for index, row in enumerate(supplement_rows, start=1):
+                        row_status = getattr(row, "status", None)
+                        event_type = (
+                            TaskEventType.TOOL_SUCCEEDED
+                            if row_status in {"settled", "succeeded"}
+                            else TaskEventType.TOOL_UNKNOWN
+                            if row_status == "unknown"
+                            else TaskEventType.TOOL_FAILED
+                        )
+                        command_name = (
+                            getattr(row, "internal_tool_name", None)
+                            or supplement_commands[
+                                min(index - 1, len(supplement_commands) - 1)
+                            ].internal_tool_name
+                        )
+                        await self.repository.append_event(
+                            task.id,
+                            task.user_id,
+                            event_type,
+                            {
+                                **build_tool_event_payload(
+                                    command_name,
+                                    status=(
+                                        "succeeded"
+                                        if event_type == TaskEventType.TOOL_SUCCEEDED
+                                        else "unknown"
+                                        if event_type == TaskEventType.TOOL_UNKNOWN
+                                        else "failed"
+                                    ),
+                                    step_index=index,
+                                    step_total=len(supplement_commands),
+                                    error_code=getattr(row, "error_type", None),
+                                    evidence_kind=supplement_step_kinds.get(
+                                        getattr(row, "plan_step_id", None)
+                                        or supplement_commands[
+                                            min(index - 1, len(supplement_commands) - 1)
+                                        ].plan_step_id
+                                    ),
+                                ),
+                                "platform_progress": supplement_progress["platforms"],
+                            },
+                        )
+                    supplement_statuses = {getattr(row, "status", None) for row in supplement_rows}
+                    if supplement_statuses & {"unknown", "planned", "reserved", "running", "succeeded"}:
+                        await self.repository.mark_interrupted(task.id, self.worker_id)
+                        return
+                    has_settled = has_settled or "settled" in supplement_statuses
+                    unresolved_failures = tuple(non_retryable_failures) + tuple(
+                        row
+                        for row in supplement_rows
+                        if getattr(row, "status", None) not in {"settled", "succeeded"}
+                    )
+                else:
+                    unresolved_failures = tuple(non_retryable_failures) + tuple(failed_rows)
+            else:
+                unresolved_failures = tuple(non_retryable_failures)
+            partial_failure = bool(unresolved_failures)
             if partial_failure and not has_settled:
                 await self.repository.mark_failed(task.id, self.worker_id, "mcp_call_failed")
                 return
@@ -718,6 +835,60 @@ class TaskExecutor:
             except Exception:
                 # Follow-up generation is non-fatal by design.
                 pass
+
+    async def _resolve_detail_steps(
+        self,
+        task: Any,
+        plan: ToolPlan,
+        steps: tuple[Any, ...],
+        settled_rows: list[Any],
+        *,
+        revision: str = "plan",
+    ) -> tuple[list[Any], ToolPlan] | None:
+        """回填达人详情步骤的 uid 列表；搜索无结果则跳过（不计费）。
+
+        规划阶段搜索结果未知，详情步骤只带空 ``kwUidList`` 占位。批次执行前
+        用已结算的搜索证据回填真实 uid 并静默持久化（保证网关按 digest 复核
+        参数一致）；没有可用候选时剔除该步骤，避免无意义的空调用。
+        """
+        resolved: list[Any] = []
+        dirty = False
+        for step in steps:
+            if step.internal_tool_name != _KOL_DETAIL_TOOL:
+                resolved.append(step)
+                continue
+            # scope 归一化对所有详情步骤生效（自造取值会被上游静默吞掉）。
+            normalized = _normalize_detail_scope(step.arguments)
+            if _step_has_uids(step):
+                resolved.append(step)
+                dirty = dirty or normalized != step.arguments
+                if normalized != step.arguments:
+                    resolved[-1] = step.model_copy(update={"arguments": normalized})
+                continue
+            uids = _detail_uids_from_rows(
+                settled_rows, str(step.arguments.get("platform") or "").strip()
+            )
+            if not uids:
+                continue
+            resolved.append(
+                step.model_copy(update={"arguments": {**normalized, "kwUidList": uids}})
+            )
+            dirty = True
+        if not dirty:
+            return resolved, plan
+        by_id = {step.id: step for step in resolved}
+        updated = plan.model_copy(
+            update={"steps": tuple(by_id.get(step.id, step) for step in plan.steps)}
+        )
+        dumped = updated.model_dump(mode="json")
+        persisted = (
+            await self.repository.save_plan_revision(task.id, self.worker_id, None, dumped)
+            if revision == "replan"
+            else await self.repository.save_plan_revision(task.id, self.worker_id, dumped, None)
+        )
+        if not persisted:
+            return None
+        return resolved, updated
 
     async def _load_or_create_replan(
         self,

@@ -279,7 +279,12 @@ async def test_planner_expands_profile_media_to_selected_platforms() -> None:
 _DETAIL_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
-    "properties": {"kwUidList": {"type": "array", "items": {"type": "string"}}},
+    "properties": {
+        "platform": {"type": "string"},
+        "kwUidList": {"type": "array", "items": {"type": "string"}},
+        "scope": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["platform", "kwUidList", "scope"],
 }
 
 
@@ -299,14 +304,19 @@ def _detail_step(uids: list[str]) -> ToolPlanStep:
     return ToolPlanStep(
         id="step_2",
         internal_tool_name="datatap.social.grow.kol.detail.v1",
-        arguments={"kwUidList": uids},
+        arguments={
+            "platform": "douyin",
+            "kwUidList": uids,
+            "scope": ["fansAudience"],
+        },
         evidence_kind="kol",
         evidence_goal="达人详情",
     )
 
 
 @pytest.mark.asyncio
-async def test_empty_uid_detail_steps_are_dropped_from_plan() -> None:
+async def test_empty_uid_detail_steps_are_kept_for_executor_backfill() -> None:
+    """空 uid 详情步骤保留在计划中：执行器会用搜索结果回填或跳过。"""
     plan = ToolPlan(
         objective="达人分析",
         steps=(
@@ -324,7 +334,7 @@ async def test_empty_uid_detail_steps_are_dropped_from_plan() -> None:
     result = await Planner(model=StubModel(plan)).plan(_detail_context())
 
     names = [step.internal_tool_name for step in result.steps]
-    assert "datatap.social.grow.kol.detail.v1" not in names
+    assert "datatap.social.grow.kol.detail.v1" in names
     assert "datatap.xiaohongshu.kol.search.v1" in names
 
 
@@ -351,12 +361,63 @@ async def test_detail_steps_with_real_uids_are_kept() -> None:
 
 
 @pytest.mark.asyncio
-async def test_plan_with_only_empty_detail_calls_falls_back_to_search_plan() -> None:
+async def test_plan_with_only_empty_detail_calls_stays_valid() -> None:
     plan = ToolPlan(objective="达人分析", steps=(_detail_step([]),))
 
     result = await Planner(model=StubModel(plan)).plan(_detail_context())
 
     names = [step.internal_tool_name for step in result.steps]
-    assert names
-    assert "datatap.social.grow.kol.detail.v1" not in names
-    assert any("search" in name for name in names)
+    assert "datatap.social.grow.kol.detail.v1" in names
+
+
+@pytest.mark.asyncio
+async def test_search_only_plan_gets_detail_step_appended() -> None:
+    """只有搜索步骤的计划自动补一个空 uid 详情步骤（执行器回填）。"""
+    plan = ToolPlan(
+        objective="达人分析",
+        steps=(
+            ToolPlanStep(
+                id="step_1",
+                internal_tool_name="datatap.xiaohongshu.kol.search.v1",
+                arguments={"name": "科颜氏"},
+                evidence_kind="kol",
+                evidence_goal="匹配达人",
+            ),
+        ),
+    )
+
+    result = await Planner(model=StubModel(plan)).plan(_detail_context())
+
+    detail_steps = [
+        step for step in result.steps
+        if step.internal_tool_name == "datatap.social.grow.kol.detail.v1"
+    ]
+    assert len(detail_steps) == 1
+    assert detail_steps[0].arguments["kwUidList"] == []
+    assert detail_steps[0].arguments["scope"]
+    assert detail_steps[0].depends_on
+
+
+@pytest.mark.asyncio
+async def test_plan_with_existing_detail_step_is_not_duplicated() -> None:
+    plan = ToolPlan(
+        objective="达人分析",
+        steps=(
+            ToolPlanStep(
+                id="step_1",
+                internal_tool_name="datatap.xiaohongshu.kol.search.v1",
+                arguments={"name": "科颜氏"},
+                evidence_kind="kol",
+                evidence_goal="匹配达人",
+            ),
+            _detail_step(["uid-1"]),
+        ),
+    )
+
+    result = await Planner(model=StubModel(plan)).plan(_detail_context())
+
+    detail_steps = [
+        step for step in result.steps
+        if step.internal_tool_name == "datatap.social.grow.kol.detail.v1"
+    ]
+    assert len(detail_steps) == 1
