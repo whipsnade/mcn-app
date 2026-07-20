@@ -512,3 +512,84 @@ async def test_agent_loop_finish_allowed_after_reject_streak_limit() -> None:
         if note.tool == "metric_coverage_gate"
     }
     assert gate_step_ids == {"finish_reject_1", "finish_reject_2", "finish_reject_3"}
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_throttles_same_tool_after_repeated_empty_results() -> None:
+    task = _task()
+    store = _FakeStore(task)
+    # 前 3 次空结果正常执行；第 4 次同名调用被熔断（不发起调用、不扣费），
+    # 模型随后 finish，任务正常完成。
+    decider = _ScriptedDecider([_call(), _call(), _call(), _call(), _finish()])
+    gateway = _FakeGateway([(_settled(data={}),), (_settled(data={}),), (_settled(data={}),)])
+    artifacts = _FakeArtifacts()
+
+    await _executor(store, decider, gateway, artifacts).run(task.id)
+
+    assert store.terminal == "completed"
+    assert len(gateway.commands) == 3
+    assert decider.calls == 5
+    # 熔断原因回喂进下一轮上下文，且不占 invalid_streak。
+    throttle_note = next(
+        note for note in decider.contexts[-1].notes if note.step_id == "throttle_1"
+    )
+    assert "返回空数据" in throttle_note.summary
+    assert _TOOL_NAME in throttle_note.summary
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_throttle_streak_breaks_loop_with_existing_evidence() -> None:
+    task = _task()
+    store = _FakeStore(task)
+    # 模型执迷于已被熔断的工具：连续 3 次熔断后按现有证据收尾，防止零成本死循环。
+    decider = _ScriptedDecider([_call(), _call(), _call(), _call(), _call(), _call()])
+    gateway = _FakeGateway([(_settled(data={}),), (_settled(data={}),), (_settled(data={}),)])
+    artifacts = _FakeArtifacts()
+
+    await _executor(store, decider, gateway, artifacts).run(task.id)
+
+    assert store.terminal == "completed"
+    assert len(gateway.commands) == 3
+    # 3 次执行 + 3 次被熔断（第 3 次熔断后直接收尾，不再询问模型）。
+    assert decider.calls == 6
+    assert artifacts.built == [task.id]
+    # 前 2 次熔断原因已回喂进后续轮次上下文。
+    throttle_ids = {
+        note.step_id
+        for context in decider.contexts
+        for note in context.notes
+        if note.step_id.startswith("throttle_")
+    }
+    assert throttle_ids == {"throttle_1", "throttle_2"}
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_throttle_does_not_block_other_tools() -> None:
+    task = _task()
+    store = _FakeStore(task)
+    stat_call = AgentDecision(
+        action="call_tool",
+        internal_tool_name=_STAT_TOOL_NAME,
+        arguments={
+            "name": "格力",
+            "datasource": ["douyin"],
+            "start_time": "2026-06-01",
+            "end_time": "2026-07-01",
+            "target_type": "keyword",
+        },
+        evidence_goal="声量",
+    )
+    decider = _ScriptedDecider([_call(), _call(), _call(), stat_call, _finish()])
+    gateway = _FakeGateway([
+        (_settled(data={}),),
+        (_settled(data={}),),
+        (_settled(data={}),),
+        (_settled(),),
+    ])
+    artifacts = _FakeArtifacts()
+
+    await _executor(store, decider, gateway, artifacts).run(task.id)
+
+    assert store.terminal == "completed"
+    # 熔断只针对累计空结果的同名工具，其他工具不受影响。
+    assert len(gateway.commands) == 4

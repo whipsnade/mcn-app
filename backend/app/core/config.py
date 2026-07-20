@@ -1,5 +1,4 @@
 from functools import lru_cache
-from typing import Literal
 from urllib.parse import quote_plus
 
 from pydantic import AnyHttpUrl, Field, SecretStr, model_validator
@@ -30,7 +29,8 @@ class Settings(BaseSettings):
         "https://tokenhub.tencentmaas.com/plan/v3"
     )
     tencent_plan_api_key: SecretStr
-    tencent_plan_model: Literal["deepseek-v4-pro"] = "deepseek-v4-pro"
+    # OpenAI 兼容端点与模型名均可自由配置（腾讯 Token Plan、月之暗面 Kimi 等）。
+    tencent_plan_model: str = "deepseek-v4-pro"
     # Full-tool planning sends the reviewed MCP schemas in one request. The
     # provider can take longer than the default HTTP timeout to produce a
     # valid structured plan, so keep this configurable but use a safe default.
@@ -61,10 +61,6 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_runtime_contracts(self) -> "Settings":
-        if self.tencent_plan_base_url.unicode_string() != (
-            "https://tokenhub.tencentmaas.com/plan/v3"
-        ):
-            raise ValueError("TENCENT_PLAN_BASE_URL must use the confirmed provider endpoint")
         if self.mcp_call_points != 10:
             raise ValueError("MCP_CALL_POINTS must be 10")
 

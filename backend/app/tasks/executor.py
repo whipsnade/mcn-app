@@ -9,7 +9,12 @@ from uuid import NAMESPACE_URL, uuid5
 from app.billing.service import InsufficientPointsError
 from app.mcp_gateway.service import ExecuteMcpCall
 from app.model.contracts import ModelAdapterError
-from app.orchestration.bi_requirements import MetricDef, metric_coverage, missing_metrics
+from app.orchestration.bi_requirements import (
+    MetricDef,
+    _is_empty_summary,
+    metric_coverage,
+    missing_metrics,
+)
 from app.orchestration.loop import (
     AgentLoopContext,
     EvidenceNote,
@@ -82,6 +87,10 @@ logger = logging.getLogger(__name__)
 
 # finish 覆盖门禁连续拒绝上限：达到后放行，避免模型无法补齐时死循环。
 _MAX_FINISH_REJECT_STREAK = 3
+# 同一工具累计返回空数据达到上限后禁止再调（继续调只会白烧积分）；
+# 连续被熔断达到上限则按现有证据收尾，防止零成本死循环。
+_MAX_EMPTY_CALLS_PER_TOOL = 3
+_MAX_THROTTLE_STREAK = 3
 
 
 async def _noop_checkpoint(_: str) -> None:
@@ -195,6 +204,7 @@ class TaskExecutor:
         feedback: list[EvidenceNote] = []
         invalid_streak = 0
         finish_reject_streak = 0
+        throttle_streak = 0
         balance_exhausted = False
         # finish 门禁以注入上下文的必需数据项清单为准（生产环境由
         # build_agent_context 填入全局 BI_REQUIRED_METRICS）。
@@ -204,6 +214,7 @@ class TaskExecutor:
                 label=str(item.get("label", item.get("key", ""))),
                 description=str(item.get("description", "")),
                 source_tools=tuple(str(tool) for tool in item.get("source_tools", ())),
+                content_signal=item.get("content_signal"),
             )
             for item in context.required_metrics
             if isinstance(item, dict) and item.get("key")
@@ -274,6 +285,34 @@ class TaskExecutor:
                     )
                     continue
                 invalid_streak = 0
+                empty_calls = sum(
+                    1
+                    for note in trajectory.results
+                    if note.tool == decision.internal_tool_name
+                    and note.status == "settled"
+                    and _is_empty_summary(note.summary)
+                )
+                if empty_calls >= _MAX_EMPTY_CALLS_PER_TOOL:
+                    # 同一工具累计多次返回空数据：继续调用只会白烧积分，
+                    # 拒绝并回喂（不占 invalid_streak）；连续被熔断达到
+                    # 上限则按现有证据收尾，防止零成本死循环。
+                    throttle_streak += 1
+                    feedback.append(
+                        EvidenceNote(
+                            step_id=f"throttle_{throttle_streak}",
+                            tool=decision.internal_tool_name or "unknown",
+                            status="failed",
+                            summary=(
+                                f"工具 {decision.internal_tool_name} 已 {empty_calls} 次"
+                                "调用成功但返回空数据，禁止重复调用；"
+                                "请改用其他工具补齐缺失数据项，或在数据项已满足时 finish。"
+                            ),
+                        )
+                    )
+                    if throttle_streak >= _MAX_THROTTLE_STREAK:
+                        break
+                    continue
+                throttle_streak = 0
                 pending = TrajectoryStep(
                     id=f"step_{len(trajectory.results) + 1}",
                     internal_tool_name=decision.internal_tool_name or "",

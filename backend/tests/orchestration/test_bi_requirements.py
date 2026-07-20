@@ -44,9 +44,12 @@ def test_required_metrics_payload_is_serializable_shape() -> None:
     payload = required_metrics_payload()
     assert len(payload) == 8
     first = payload[0]
-    assert set(first) == {"key", "label", "description", "source_tools"}
+    assert set(first) == {"key", "label", "description", "source_tools", "content_signal"}
     assert first["key"] == "brand_voice"
+    assert first["content_signal"] is None
     assert isinstance(first["source_tools"], list)
+    trend = next(item for item in payload if item["key"] == "voice_trend")
+    assert trend["content_signal"] == "daily_series"
 
 
 def test_settled_call_covers_mapped_metrics() -> None:
@@ -122,3 +125,47 @@ def test_missing_metrics_returns_defs_in_checklist_order() -> None:
         "audience_profile",
         "kol_leaderboard",
     ]
+
+
+_DAILY_SERIES = {
+    "result": [
+        {"日": "2026-06-20", "声量": 83576, "曝光量": 0},
+        {"日": "2026-06-21", "声量": 91000, "曝光量": 0},
+        {"日": "2026-06-22", "声量": 88000, "曝光量": 0},
+    ]
+}
+
+
+def test_daily_series_from_other_insight_tool_covers_voice_trend() -> None:
+    # trend 工具上游超时时，模型用 query.analysis 拿到的逐日数据同样算覆盖。
+    coverage = metric_coverage(_trajectory(_note(_ANALYSIS_TOOL, summary=_DAILY_SERIES)))
+
+    assert "voice_trend" in coverage.covered
+    assert "voice_trend" not in [metric.key for metric in missing_metrics(coverage)]
+
+
+def test_daily_series_requires_min_distinct_dates() -> None:
+    two_days = {"result": [{"日": "2026-06-20"}, {"日": "2026-06-21"}]}
+    coverage = metric_coverage(_trajectory(_note(_ANALYSIS_TOOL, summary=two_days)))
+
+    assert "voice_trend" not in coverage.covered
+
+
+def test_daily_series_ignores_non_insight_tools() -> None:
+    # KOL 搜索结果里的发布日期不能被误判为声量走势。
+    coverage = metric_coverage(
+        _trajectory(_note("datatap.xiaohongshu.kol.search.v1", summary=_DAILY_SERIES))
+    )
+
+    assert "voice_trend" not in coverage.covered
+
+
+def test_daily_series_ignores_empty_and_failed_notes() -> None:
+    coverage = metric_coverage(
+        _trajectory(
+            _note(_ANALYSIS_TOOL, status="failed", summary=_DAILY_SERIES),
+            _note(_ANALYSIS_TOOL, summary={}),
+        )
+    )
+
+    assert "voice_trend" not in coverage.covered

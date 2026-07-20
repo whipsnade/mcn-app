@@ -40,17 +40,18 @@ def test_secret_values_are_not_exposed_by_settings_repr() -> None:
     assert "unit-test-mcp-key" not in rendered
 
 
-@pytest.mark.parametrize(
-    "changes",
-    [
-        {"mcp_call_points": 9},
-        {"tencent_plan_model": "another-model"},
-        {"tencent_plan_base_url": "https://untrusted.example/v1"},
-    ],
-)
-def test_confirmed_provider_and_billing_constants_cannot_drift(changes) -> None:
+def test_billing_constant_cannot_drift() -> None:
     with pytest.raises(ValidationError):
-        settings(**changes)
+        settings(mcp_call_points=9)
+
+
+def test_model_provider_endpoint_and_name_are_configurable() -> None:
+    config = settings(
+        tencent_plan_base_url="https://api.moonshot.cn/v1",
+        tencent_plan_model="kimi-k2-0905-preview",
+    )
+    assert config.tencent_plan_base_url.unicode_string() == "https://api.moonshot.cn/v1"
+    assert config.tencent_plan_model == "kimi-k2-0905-preview"
 
 
 @pytest.mark.parametrize(
