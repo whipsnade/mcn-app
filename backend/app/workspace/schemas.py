@@ -22,7 +22,7 @@ class SessionCreate(BaseModel):
     target_audience: str = Field(default="", max_length=500)
     budget_min: Decimal | None = Field(default=None, ge=0)
     budget_max: Decimal | None = Field(default=None, ge=0)
-    initial_query: str = Field(min_length=1, max_length=5000)
+    initial_query: str | None = Field(default=None, min_length=1, max_length=5000)
     filters: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -45,6 +45,7 @@ class SessionUpdate(BaseModel):
     target_audience: str | None = Field(default=None, min_length=1, max_length=500)
     budget_min: Decimal | None = Field(default=None, ge=0)
     budget_max: Decimal | None = Field(default=None, ge=0)
+    filters: dict[str, Any] | None = None
     is_starred: bool | None = None
     status: Literal["draft", "analyzing", "completed", "archived"] | None = None
 

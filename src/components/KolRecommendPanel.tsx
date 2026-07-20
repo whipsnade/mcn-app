@@ -1,0 +1,157 @@
+import { ArrowLeft } from 'lucide-react';
+import { useEffect, useState } from 'react';
+
+import type { ApiQuickKolItem } from '../api/contracts';
+import { getKolRecommendations, quickErrorMessage } from '../api/quick';
+import type { QuickKolSelection } from '../types';
+
+interface KolRecommendPanelProps {
+  onBack: () => void;
+  onSelectKol: (kol: QuickKolSelection) => void;
+}
+
+const MIN_BUDGET = 10_000;
+const MAX_BUDGET = 500_000;
+const BUDGET_STEP = 10_000;
+const DEBOUNCE_MS = 800;
+
+function formatBudget(budget: number): string {
+  return `¥${(budget / 10_000).toFixed(1)}万`;
+}
+
+function formatCount(value: number | null): string {
+  if (value === null || !Number.isFinite(value)) return '—';
+  if (value >= 10_000) return `${(value / 10_000).toFixed(1)}万`;
+  return value.toLocaleString('zh-CN');
+}
+
+export function quickPlatformLabel(platform: string): string {
+  return ({ xiaohongshu: '小红书', douyin: '抖音' } as Record<string, string>)[platform] ?? platform;
+}
+
+function platformBadgeClass(platform: string): string {
+  if (platform === 'xiaohongshu') return 'bg-rose-50 text-rose-600 border border-rose-200/40';
+  if (platform === 'douyin') return 'bg-slate-900 text-white border border-slate-900';
+  return 'bg-indigo-50 text-indigo-700 border border-indigo-100';
+}
+
+export default function KolRecommendPanel({ onBack, onSelectKol }: KolRecommendPanelProps) {
+  const [budget, setBudget] = useState(50_000);
+  const [items, setItems] = useState<ApiQuickKolItem[]>([]);
+  const [pointsCost, setPointsCost] = useState<number | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string>();
+
+  // 预算滑动条 800ms 防抖刷新；过期响应经 current 标记丢弃
+  useEffect(() => {
+    let current = true;
+    setLoading(true);
+    const timer = window.setTimeout(() => {
+      getKolRecommendations({ budget })
+        .then(result => {
+          if (!current) return;
+          setItems(result.items ?? []);
+          setPointsCost(typeof result.points_cost === 'number' ? result.points_cost : null);
+          setError(undefined);
+        })
+        .catch((err: unknown) => {
+          if (!current) return;
+          setError(quickErrorMessage(err));
+        })
+        .finally(() => {
+          if (current) setLoading(false);
+        });
+    }, DEBOUNCE_MS);
+    return () => {
+      current = false;
+      window.clearTimeout(timer);
+    };
+  }, [budget]);
+
+  return (
+    <div className="flex min-h-0 flex-1 flex-col bg-slate-50">
+      <div className="flex h-12 shrink-0 items-center justify-between border-b border-slate-200 bg-white px-4">
+        <h2 className="text-xs font-bold text-slate-800">预算内达人推荐</h2>
+        <button
+          type="button"
+          onClick={onBack}
+          className="flex items-center gap-1 rounded-lg px-2 py-1 text-[11px] font-bold text-indigo-600 transition hover:bg-indigo-50 active:scale-95"
+        >
+          <ArrowLeft className="h-3.5 w-3.5" />
+          返回会话
+        </button>
+      </div>
+
+      <div className="shrink-0 border-b border-slate-100 bg-white px-4 py-3">
+        <div className="flex items-center justify-between text-[11px]">
+          <span className="font-bold text-slate-500">单达人报价预算</span>
+          <span className="font-bold text-indigo-600">{formatBudget(budget)}</span>
+        </div>
+        <input
+          type="range"
+          min={MIN_BUDGET}
+          max={MAX_BUDGET}
+          step={BUDGET_STEP}
+          value={budget}
+          onChange={event => setBudget(Number(event.target.value))}
+          className="mt-2 w-full accent-indigo-600"
+          aria-label="单达人报价预算"
+        />
+        <div className="mt-1 flex items-center justify-between text-[9px] font-medium text-slate-400">
+          <span>¥1.0万</span>
+          <span>每次刷新约 20 积分{pointsCost !== null ? ` · 上次消耗 ${pointsCost} 积分` : ''}</span>
+          <span>¥50.0万</span>
+        </div>
+      </div>
+
+      {loading && items.length === 0 ? (
+        <div className="flex flex-1 items-center justify-center bg-slate-50 text-xs font-medium text-slate-400">
+          正在加载达人推荐…
+        </div>
+      ) : !loading && error && items.length === 0 ? (
+        <div className="flex flex-1 flex-col items-center justify-center gap-2 bg-slate-50 text-xs font-medium text-slate-400">
+          <span role="alert" className="text-rose-500">{error}</span>
+          暂未获取到达人推荐
+        </div>
+      ) : (
+        <div className="min-h-0 flex-1 overflow-y-auto bg-slate-50 p-4">
+          <div className="space-y-2">
+            {error && (
+              <p role="alert" className="rounded-lg border border-rose-100 bg-rose-50 px-3 py-2 text-[11px] font-medium text-rose-600">{error}</p>
+            )}
+            {items.length === 0 ? (
+              <p className="py-8 text-center text-xs font-medium text-slate-400">当前预算下暂无符合条件的达人</p>
+            ) : (
+              items.map(item => (
+                <button
+                  key={`${item.platform}-${item.kw_uid}`}
+                  type="button"
+                  onClick={() => onSelectKol({ platform: item.platform, kw_uid: item.kw_uid, nickname: item.nickname })}
+                  className="w-full rounded-xl border border-slate-200 bg-white px-4 py-3 text-left shadow-sm transition hover:border-indigo-200 hover:bg-indigo-50/20"
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="flex min-w-0 items-center gap-2">
+                      <span className="truncate text-xs font-semibold text-slate-800">{item.nickname || '未命名达人'}</span>
+                      <span className={`shrink-0 rounded px-1 py-0.2 text-[9px] font-semibold ${platformBadgeClass(item.platform)}`}>
+                        {quickPlatformLabel(item.platform)}
+                      </span>
+                    </div>
+                    <span className="shrink-0 text-[11px] font-bold text-indigo-600">
+                      {item.price !== null ? `¥${item.price.toLocaleString('zh-CN')}` : '无报价'}
+                    </span>
+                  </div>
+                  <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[10px] text-slate-400">
+                    <span>粉丝 {formatCount(item.fans)}</span>
+                    <span>互动率 {item.engagement_rate !== null ? `${item.engagement_rate}%` : '—'}</span>
+                    {item.city && <span>{item.city}</span>}
+                    {item.tags?.slice(0, 3).map(tag => <span key={tag}>#{tag}</span>)}
+                  </div>
+                </button>
+              ))
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

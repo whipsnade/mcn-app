@@ -16,11 +16,43 @@ def _session_payload(**overrides):
     return payload
 
 
-def test_default_session_title_has_unnamed_fallback() -> None:
+def test_default_session_title_returns_none_when_form_is_empty() -> None:
     title_builder = getattr(workspace_service, "default_session_title", None)
 
     assert callable(title_builder)
-    assert title_builder("", None, "") == "未命名会话"
+    assert title_builder("", None, "") is None
+
+
+@pytest.mark.asyncio
+async def test_blank_session_has_numbered_default_title_and_no_task(auth_client_factory) -> None:
+    client = await auth_client_factory("13600000071")
+
+    first = await client.post("/api/v1/sessions", json={})
+    second = await client.post("/api/v1/sessions", json={})
+
+    assert first.status_code == 201
+    assert second.status_code == 201
+    assert first.json()["title"] == "新会话1"
+    assert second.json()["title"] == "新会话2"
+    assert first.json()["messages"] == []
+    assert first.json()["latest_task"] is None
+    assert first.json()["brand"] == ""
+    assert first.json()["category"] is None
+
+
+@pytest.mark.asyncio
+async def test_session_update_accepts_filters(auth_client_factory) -> None:
+    client = await auth_client_factory("13600000072")
+    created = await client.post("/api/v1/sessions", json={})
+    session_id = created.json()["id"]
+
+    patched = await client.patch(
+        f"/api/v1/sessions/{session_id}",
+        json={"filters": {"brainstorm_profile": {"brand": "欧诗漫"}}},
+    )
+
+    assert patched.status_code == 200
+    assert patched.json()["filters"]["brainstorm_profile"]["brand"] == "欧诗漫"
 
 
 @pytest.mark.asyncio

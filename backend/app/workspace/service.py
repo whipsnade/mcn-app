@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+import re
 from uuid import uuid4
 
 from sqlalchemy import func, select
@@ -12,7 +13,18 @@ def utc_now() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
 
 
-def default_session_title(brand: str, campaign_name: str | None, category: str | None) -> str:
+BLANK_SESSION_TITLE_PREFIX = "新会话"
+
+_DEFAULT_TITLE_PATTERN = re.compile(r"^新会话\d+$")
+
+
+def is_default_session_title(title: str) -> bool:
+    """判断标题是否仍是空白会话的「新会话N」默认名。"""
+    return bool(_DEFAULT_TITLE_PATTERN.fullmatch(title.strip()))
+
+
+def default_session_title(brand: str, campaign_name: str | None, category: str | None) -> str | None:
+    """从表单字段推导标题；全部为空时返回 None，由创建流程以「新会话N」兜底。"""
     normalized_brand = brand.strip()
     normalized_campaign = campaign_name.strip() if campaign_name else ""
     normalized_category = category.strip() if category else ""
@@ -24,7 +36,7 @@ def default_session_title(brand: str, campaign_name: str | None, category: str |
         return normalized_campaign
     if normalized_category:
         return f"{normalized_category} KOL 分析"
-    return "未命名会话"
+    return None
 
 
 class WorkspaceService:
@@ -69,6 +81,8 @@ class WorkspaceService:
     async def create_session(self, user_id: str, payload: SessionCreate) -> WorkspaceSession:
         now = utc_now()
         title = default_session_title(payload.brand, payload.campaign_name, payload.category)
+        if title is None:
+            title = await self._next_blank_session_title(user_id)
         workspace = WorkspaceSession(
             id=str(uuid4()),
             user_id=user_id,
@@ -89,20 +103,33 @@ class WorkspaceService:
         )
         self.db.add(workspace)
         await self.db.flush()
-        self.db.add(
-            Message(
-                id=str(uuid4()),
-                session_id=workspace.id,
-                user_id=user_id,
-                role="user",
-                content=payload.initial_query,
-                sequence=1,
-                metadata_json={},
-                created_at=now,
+        if payload.initial_query is not None:
+            self.db.add(
+                Message(
+                    id=str(uuid4()),
+                    session_id=workspace.id,
+                    user_id=user_id,
+                    role="user",
+                    content=payload.initial_query,
+                    sequence=1,
+                    metadata_json={},
+                    created_at=now,
+                )
+            )
+            await self.db.flush()
+        return workspace
+
+    async def _next_blank_session_title(self, user_id: str) -> str:
+        """空白会话默认名「新会话N」：N = 该用户「新会话」开头标题的会话数 + 1。"""
+        count = await self.db.scalar(
+            select(func.count())
+            .select_from(WorkspaceSession)
+            .where(
+                WorkspaceSession.user_id == user_id,
+                WorkspaceSession.title.like(f"{BLANK_SESSION_TITLE_PREFIX}%"),
             )
         )
-        await self.db.flush()
-        return workspace
+        return f"{BLANK_SESSION_TITLE_PREFIX}{(count or 0) + 1}"
 
     async def delete_session(self, user_id: str, session_id: str) -> None:
         workspace = await self.db.scalar(
@@ -151,7 +178,12 @@ class WorkspaceService:
         workspace = await self.get_owned_session(user_id, session_id, for_update=True)
         changes = payload.model_dump(exclude_unset=True)
         for field, value in changes.items():
-            if value is not None:
+            if value is None:
+                continue
+            # DTO 的 filters 对应 ORM 列 filters_snapshot。
+            if field == "filters":
+                workspace.filters_snapshot = value
+            else:
                 setattr(workspace, field, value)
         workspace.updated_at = utc_now()
         workspace.last_accessed_at = workspace.updated_at

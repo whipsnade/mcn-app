@@ -29,7 +29,7 @@ class TokenUsage(BaseModel):
 
 @dataclass(frozen=True)
 class StructuredModelRequest(Generic[T]):
-    purpose: Literal["followup", "agent_loop", "report_writer"]
+    purpose: Literal["followup", "agent_loop", "report_writer", "brainstorm", "quick_evaluate"]
     template_name: str
     messages: tuple[ChatMessage, ...]
     output_model: type[T]
@@ -66,7 +66,9 @@ class StructuredResult(BaseModel, Generic[T]):
 class ModelRequestMetadata(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    purpose: Literal["summary", "followup", "agent_loop", "report_writer"]
+    purpose: Literal[
+        "summary", "followup", "agent_loop", "report_writer", "brainstorm", "quick_evaluate"
+    ]
     provider: str
     model: str
     prompt_template: str

@@ -78,6 +78,45 @@ describe('toSession', () => {
     expect(session.analysis?.followupSuggestions?.[0]?.prompt).toBe('请分析浙江粉丝');
   });
 
+  it('maps brainstorm metadata onto messages', () => {
+    const session = toSession({
+      id: 's-brainstorm',
+      title: '新会话1',
+      brand: '',
+      campaign_name: null,
+      status: 'draft',
+      platforms: [],
+      category: '',
+      target_audience: '',
+      budget_min: null,
+      budget_max: null,
+      filters: {},
+      is_starred: false,
+      messages: [{
+        id: 'm-1',
+        role: 'assistant',
+        content: '想分析哪个平台？',
+        sequence: 1,
+        metadata: {
+          brainstorm: {
+            ready: false,
+            options: ['小红书', '抖音'],
+            profile_summary: null,
+          },
+        },
+        created_at: '2026-07-20T10:00:00Z',
+      }],
+      created_at: '2026-07-20T10:00:00Z',
+      updated_at: '2026-07-20T10:00:00Z',
+    });
+
+    expect(session.messages[0].brainstorm).toEqual({
+      ready: false,
+      options: ['小红书', '抖音'],
+      profile_summary: null,
+    });
+  });
+
   it('deletes a session through the session endpoint', async () => {
     vi.mocked(request).mockResolvedValue(undefined);
 

@@ -1,12 +1,21 @@
 from app.model.prompts import (
     AGENT_LOOP_PROMPT,
+    BRAINSTORM_PROMPT,
+    EVALUATE_PROMPT,
     FOLLOWUP_PROMPT,
     REPORT_WRITER_PROMPT,
     SUMMARY_PROMPT,
 )
 
 
-_ALL_PROMPTS = (SUMMARY_PROMPT, FOLLOWUP_PROMPT, AGENT_LOOP_PROMPT, REPORT_WRITER_PROMPT)
+_ALL_PROMPTS = (
+    SUMMARY_PROMPT,
+    FOLLOWUP_PROMPT,
+    AGENT_LOOP_PROMPT,
+    REPORT_WRITER_PROMPT,
+    BRAINSTORM_PROMPT,
+    EVALUATE_PROMPT,
+)
 
 
 def test_prompts_treat_external_content_as_untrusted_and_limit_capabilities() -> None:

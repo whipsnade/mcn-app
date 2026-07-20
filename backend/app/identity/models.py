@@ -1,6 +1,7 @@
 from datetime import datetime
+from typing import Any
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, String, UniqueConstraint
+from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Index, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -13,6 +14,10 @@ class User(Base):
     nickname: Mapped[str] = mapped_column(String(80), nullable=False)
     role: Mapped[str] = mapped_column(String(16), nullable=False, default="user")
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="active")
+    # 行业属性（多值）；存量用户由迁移 0018 回填 ["美食"]。
+    industries: Mapped[list[Any]] = mapped_column(
+        JSON, nullable=False, default=lambda: ["美食"]
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 

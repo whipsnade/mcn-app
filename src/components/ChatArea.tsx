@@ -9,6 +9,8 @@ interface ChatAreaProps {
   session: Session;
   onSendMessage: (text: string) => Promise<unknown>;
   isAnalyzing: boolean;
+  /** 是否处于 brainstorm 澄清等待中（loading 文案区分于任务分析）。 */
+  isClarifying?: boolean;
   isMockMode: boolean;
   /** 当前任务的执行流程节点（竖状节点图）。 */
   flowNodes?: TaskFlowNode[];
@@ -29,6 +31,7 @@ export default function ChatArea({
   session,
   onSendMessage,
   isAnalyzing,
+  isClarifying = false,
   isMockMode,
   flowNodes = [],
   flowTerminal = false,
@@ -81,24 +84,40 @@ export default function ChatArea({
     ? `${session.budgetMin ?? '0'}–${session.budgetMax ?? '不限'} 元`
     : '待确认';
 
+  // 空白会话（brand/category 均空）头部只显示会话标题。
+  const hasSessionMetadata = Boolean(session.brand.trim() || session.category.trim());
+  const titleLabel = session.brand.trim()
+    ? `${session.brand.split(' ')[0]}${session.campaignName ? ` - ${session.campaignName}` : ''}`
+    : session.title;
+
+  let latestAssistantMessageId: string | undefined;
+  for (let index = session.messages.length - 1; index >= 0; index -= 1) {
+    if (session.messages[index].sender === 'ai') {
+      latestAssistantMessageId = session.messages[index].id;
+      break;
+    }
+  }
+
   return (
     <div className="flex min-h-0 flex-1 flex-col bg-white border-r border-slate-200 h-full no-print">
-      
+
       {/* Chat Header */}
       <div className="flex h-14 items-center justify-between border-b border-slate-100 bg-white px-6 shrink-0">
         <div>
           <div className="flex items-center gap-2">
             <h1 className="text-xs font-bold text-slate-800 tracking-tight font-display">
-              {session.brand.split(' ')[0]}{session.campaignName ? ` - ${session.campaignName}` : ''}
+              {titleLabel}
             </h1>
             <span className="text-[9px] bg-slate-100 text-slate-500 font-mono px-1.5 py-0.5 rounded border border-slate-200/40">
               {session.id}
             </span>
           </div>
-          <p className="mt-0.5 text-[10px] text-slate-400 flex items-center gap-1">
-            <span className="h-1.5 w-1.5 rounded-full bg-indigo-500 animate-pulse" />
-            {isAnalyzing ? '分析中' : '已完成'} • 渠道: {platformLabel} • 品类: {session.category} • 预算: {budgetLabel}
-          </p>
+          {hasSessionMetadata && (
+            <p className="mt-0.5 text-[10px] text-slate-400 flex items-center gap-1">
+              <span className="h-1.5 w-1.5 rounded-full bg-indigo-500 animate-pulse" />
+              {isAnalyzing ? '分析中' : '已完成'} • 渠道: {platformLabel} • 品类: {session.category} • 预算: {budgetLabel}
+            </p>
+          )}
         </div>
 
         <div className="flex items-center gap-2">
@@ -134,6 +153,11 @@ export default function ChatArea({
               </div>
             );
           }
+
+          // 仅最新一条 assistant 消息的 brainstorm 选项渲染为可点 chips。
+          const brainstormOptions = isAI && msg.id === latestAssistantMessageId
+            ? msg.brainstorm?.options ?? []
+            : [];
 
           return (
             <div 
@@ -180,6 +204,28 @@ export default function ChatArea({
                     </button>
                   )}
                 </div>
+
+                {/* Brainstorm 澄清选项 chips（样式复用进一步分析建议 chips） */}
+                {brainstormOptions.length > 0 && (
+                  <div className="mt-2 flex flex-wrap gap-1.5" aria-label="澄清选项">
+                    {brainstormOptions.map(option => (
+                      <button
+                        key={option}
+                        type="button"
+                        disabled={isAnalyzing}
+                        onClick={() => {
+                          if (!isAnalyzing) void onSendMessage(option).catch(() => undefined);
+                        }}
+                        className={`rounded-lg border px-2.5 py-1.5 text-[10px] font-semibold transition active:scale-95 ${isAnalyzing
+                          ? 'cursor-not-allowed border-slate-100 bg-slate-50 text-slate-300'
+                          : 'border-indigo-100 bg-white text-indigo-700 hover:border-indigo-300 hover:bg-indigo-50'
+                        }`}
+                      >
+                        {option}
+                      </button>
+                    ))}
+                  </div>
+                )}
               </div>
             </div>
           );
@@ -217,7 +263,7 @@ export default function ChatArea({
                       <span className="h-2 w-2 rounded-full bg-indigo-500 animate-bounce" />
                       <span className="h-2 w-2 rounded-full bg-indigo-500 animate-bounce [animation-delay:0.2s]" />
                       <span className="h-2 w-2 rounded-full bg-indigo-500 animate-bounce [animation-delay:0.4s]" />
-                      <span className="text-xs text-slate-400 font-medium ml-1">正在分析数据并编制图表...</span>
+                      <span className="text-xs text-slate-400 font-medium ml-1">{isClarifying ? '正在澄清需求…' : '正在分析数据并编制图表...'}</span>
                     </div>
                   </div>
                 )

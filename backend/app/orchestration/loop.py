@@ -186,6 +186,9 @@ class AgentLoopContext(BaseModel):
     # 曾因此把统计查询落到一年上限之外而拿到空数据。
     current_date: str = ""
     requested_period: dict[str, Any] = Field(default_factory=dict)
+    # brainstorm 澄清确认的参数画像（brand/category/platforms/goal 等），
+    # 优先级高于从消息文本推断；空 dict 表示会话未经过澄清。
+    param_profile: dict[str, Any] = Field(default_factory=dict)
 
 
 class AgentDecision(BaseModel):

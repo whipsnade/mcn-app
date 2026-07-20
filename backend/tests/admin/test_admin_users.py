@@ -1,6 +1,7 @@
 import pytest
 from sqlalchemy import select
 
+from app.admin.models import AdminAuditLog
 from app.billing.models import WalletTransaction
 from app.identity.models import AuthIdentity, User
 
@@ -158,6 +159,51 @@ async def test_admin_cannot_demote_disable_or_delete_self(authed_client_factory)
     for response in (demote, disable, delete):
         assert response.status_code == 400
         assert response.json()["detail"] == "VALIDATION_ERROR"
+
+
+@pytest.mark.asyncio
+async def test_patch_user_industries(authed_client_factory, db_session) -> None:
+    admin_client, _ = await authed_client_factory()
+    created = await admin_client.post(
+        "/api/v1/admin/users",
+        json={"nickname": "行业账号", "phone": "13800000011", "role": "user"},
+    )
+    assert created.status_code == 201
+    user_id = created.json()["id"]
+    assert created.json()["industries"] == ["美食"]  # 默认行业
+
+    updated = await admin_client.patch(
+        f"/api/v1/admin/users/{user_id}",
+        json={"industries": ["美妆", "母婴"]},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["industries"] == ["美妆", "母婴"]
+
+    # 审计 detail 同步 before/after 行业。
+    audit = await db_session.scalar(
+        select(AdminAuditLog).where(
+            AdminAuditLog.action == "user.update",
+            AdminAuditLog.target_id == user_id,
+        )
+    )
+    assert audit is not None
+    assert audit.detail_json["before"]["industries"] == ["美食"]
+    assert audit.detail_json["after"]["industries"] == ["美妆", "母婴"]
+
+    # 校验：单项超 20 字 / 超过 5 项均 422。
+    too_long = await admin_client.patch(
+        f"/api/v1/admin/users/{user_id}", json={"industries": ["x" * 21]}
+    )
+    too_many = await admin_client.patch(
+        f"/api/v1/admin/users/{user_id}",
+        json={"industries": ["a", "b", "c", "d", "e", "f"]},
+    )
+    assert too_long.status_code == 422
+    assert too_many.status_code == 422
+
+    listed = await admin_client.get("/api/v1/admin/users", params={"keyword": "行业账号"})
+    [item] = listed.json()["items"]
+    assert item["industries"] == ["美妆", "母婴"]
 
 
 @pytest.mark.asyncio

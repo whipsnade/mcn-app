@@ -1,0 +1,19 @@
+- generic [ref=e3]:
+  - navigation "移动工作区导航" [ref=e4]:
+    - button "会话" [ref=e5]
+    - button "分析对话" [pressed] [ref=e8]
+    - button "分析报告" [ref=e12]
+  - generic [ref=e126]:
+    - generic [ref=e127]:
+      - heading "预算内达人推荐" [level=2] [ref=e128]
+      - button "返回会话" [ref=e129]
+    - generic [ref=e132]:
+      - generic [ref=e133]:
+        - generic [ref=e134]: 单达人报价预算
+        - generic [ref=e135]: ¥5.0万
+      - slider "单达人报价预算" [ref=e136]: "50000"
+      - generic [ref=e137]:
+        - generic [ref=e138]: ¥1.0万
+        - generic [ref=e139]: 每次刷新约 20 积分
+        - generic [ref=e140]: ¥50.0万
+    - generic [ref=e141]: 正在加载达人推荐…

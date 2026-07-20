@@ -57,6 +57,23 @@ async def test_repeat_login_does_not_repeat_welcome_grant(client) -> None:
 
 
 @pytest.mark.asyncio
+async def test_users_me_returns_default_industries(client) -> None:
+    login = await client.post(
+        "/api/v1/auth/mock/sms/login",
+        json={"phone": "13700009999", "code": "000000"},
+    )
+    assert login.status_code == 200
+
+    me = await client.get(
+        "/api/v1/users/me",
+        headers={"Authorization": f"Bearer {login.json()['access_token']}"},
+    )
+
+    assert me.status_code == 200
+    assert me.json()["industries"] == ["美食"]
+
+
+@pytest.mark.asyncio
 async def test_mock_default_channels_reenable_existing_permission(db_session, user_factory) -> None:
     user = await user_factory()
     db_session.add(

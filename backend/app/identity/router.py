@@ -124,4 +124,10 @@ async def get_me(user: CurrentUser, db: Annotated[AsyncSession, Depends(get_db)]
             )
         ).all()
     )
-    return UserRead(id=user.id, nickname=user.nickname, role=user.role, channels=channels)
+    return UserRead(
+        id=user.id,
+        nickname=user.nickname,
+        role=user.role,
+        channels=channels,
+        industries=[str(item) for item in (user.industries or ["美食"])],
+    )

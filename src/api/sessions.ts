@@ -1,6 +1,6 @@
-import type { Session } from '../types';
+import type { Message, Session } from '../types';
 import { request } from './client';
-import type { ApiSession, CreateSessionInput } from './contracts';
+import type { ApiMessage, ApiSession, CreateSessionInput } from './contracts';
 
 
 const platformNames: Record<string, string> = {
@@ -10,6 +10,23 @@ const platformNames: Record<string, string> = {
   weibo: 'Weibo',
   wechat: 'Wechat',
 };
+
+
+export function toMessage(message: ApiMessage): Message {
+  return {
+    id: message.id,
+    sender: message.role === 'assistant' ? 'ai' : message.role,
+    text: message.content,
+    taskId: typeof message.metadata.latest_analysis_task_id === 'string'
+      ? message.metadata.latest_analysis_task_id
+      : typeof message.metadata.task_id === 'string' ? message.metadata.task_id : undefined,
+    brainstorm: message.metadata.brainstorm,
+    timestamp: new Date(message.created_at).toLocaleTimeString('zh-CN', {
+      hour: '2-digit',
+      minute: '2-digit',
+    }),
+  };
+}
 
 
 export function toSession(source: ApiSession): Session {
@@ -25,18 +42,7 @@ export function toSession(source: ApiSession): Session {
     budgetMin: source.budget_min ?? undefined,
     budgetMax: source.budget_max ?? undefined,
     summary: source.messages.find(message => message.role === 'user')?.content ?? '',
-    messages: source.messages.map(message => ({
-      id: message.id,
-      sender: message.role === 'assistant' ? 'ai' : message.role,
-      text: message.content,
-      taskId: typeof message.metadata.latest_analysis_task_id === 'string'
-        ? message.metadata.latest_analysis_task_id
-        : typeof message.metadata.task_id === 'string' ? message.metadata.task_id : undefined,
-      timestamp: new Date(message.created_at).toLocaleTimeString('zh-CN', {
-        hour: '2-digit',
-        minute: '2-digit',
-      }),
-    })),
+    messages: source.messages.map(toMessage),
     isStarred: source.is_starred,
     analysis: source.latest_task ? (() => {
       const analysisReportId = source.latest_analysis_report?.task_id === source.latest_task.id

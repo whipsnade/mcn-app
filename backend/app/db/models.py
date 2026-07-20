@@ -3,6 +3,7 @@ from app.billing.models import Wallet, WalletTransaction
 from app.identity.models import AuthIdentity, LoginSession, User, UserChannelPermission
 from app.mcp_gateway.models import McpCall, McpToolCatalog, McpToolDiscovery
 from app.model.models import ModelRun
+from app.quick.models import QuickMcpCall
 from app.reporting.models import (
     BiReport,
     Kol,
@@ -29,6 +30,7 @@ __all__ = [
     "McpToolDiscovery",
     "Message",
     "ModelRun",
+    "QuickMcpCall",
     "TaskCandidate",
     "TaskCandidatePool",
     "TaskCandidatePoolItem",

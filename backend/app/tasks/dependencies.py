@@ -46,6 +46,26 @@ class SummaryRecoveryMismatch(RuntimeError):
     """恢复流无法证明与已持久化草稿属于同一输出。"""
 
 
+def param_profile_period_override(profile: dict[str, Any]) -> dict[str, Any] | None:
+    """澄清画像含合法 period（start/end，YYYY-MM-DD）时生成覆写时间窗。"""
+    period = profile.get("period")
+    if not isinstance(period, dict):
+        return None
+    try:
+        start = date.fromisoformat(str(period.get("start") or ""))
+        end = date.fromisoformat(str(period.get("end") or ""))
+    except ValueError:
+        return None
+    if end < start:
+        return None
+    return {
+        "unit": "day",
+        "value": (end - start).days,
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+    }
+
+
 def summary_deltas_to_persist(
     persisted_content: str, deltas: tuple[str, ...], *, completed: bool = False
 ) -> tuple[str, ...] | None:
@@ -339,15 +359,23 @@ class TaskExecutionDependencies:
         )
         effective_channels = selected_channels or tuple(sorted(approved_channels))
         recent_messages = compress_messages(messages, max_chars=24_000)
+        param_profile = (workspace.filters_snapshot or {}).get("brainstorm_profile") or {}
+        if not isinstance(param_profile, dict):
+            param_profile = {}
+        requested_period = extract_requested_period(
+            "\n".join(message.content for message in recent_messages)
+        )
+        period_override = param_profile_period_override(param_profile)
+        if period_override is not None:
+            requested_period = period_override
         return AgentLoopContext(
             recent_messages=recent_messages,
             tools=tuple(PlannerTool.from_approved(item) for item in tools),
             allowed_channels=effective_channels,
             required_metrics=required_metrics_payload(),
             current_date=date.today().isoformat(),
-            requested_period=extract_requested_period(
-                "\n".join(message.content for message in recent_messages)
-            ),
+            requested_period=requested_period,
+            param_profile=param_profile,
         )
 
     async def agent_decide(self, context: AgentLoopContext) -> AgentDecision:

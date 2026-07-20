@@ -45,6 +45,7 @@ def public_message_metadata(metadata: dict) -> dict:
         "followup_suggestions_generated_at",
         "followup_suggestions_started_at",
         "followup_error",
+        "brainstorm",
     }
     return {key: value for key, value in metadata.items() if key in allowed}
 
@@ -125,23 +126,25 @@ async def create_session(
 ) -> SessionRead:
     service = WorkspaceService(db)
     workspace = await service.create_session(user.id, payload)
-    initial_message = await db.scalar(
-        select(Message).where(
-            Message.session_id == workspace.id,
-            Message.user_id == user.id,
-            Message.sequence == 1,
+    if payload.initial_query is not None:
+        # 兼容旧链路：带 initial_query 时仍为「建会话 + 首条消息 + 立即建任务」。
+        initial_message = await db.scalar(
+            select(Message).where(
+                Message.session_id == workspace.id,
+                Message.user_id == user.id,
+                Message.sequence == 1,
+            )
         )
-    )
-    if initial_message is None:
-        raise HTTPException(status_code=500, detail="initial_message_not_found")
-    task = await TaskService(db).create(
-        user.id,
-        workspace.id,
-        TaskCreate(content=payload.initial_query),
-        trigger_message_id=initial_message.id,
-    )
-    await db.commit()
-    task_runner.submit(task.id)
+        if initial_message is None:
+            raise HTTPException(status_code=500, detail="initial_message_not_found")
+        task = await TaskService(db).create(
+            user.id,
+            workspace.id,
+            TaskCreate(content=payload.initial_query),
+            trigger_message_id=initial_message.id,
+        )
+        await db.commit()
+        task_runner.submit(task.id)
     return await session_read(service, workspace, include_messages=True, include_analysis=True)
 
 

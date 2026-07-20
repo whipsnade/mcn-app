@@ -17,11 +17,19 @@ from app.billing.service import WalletService
 from app.core.redaction import redact_for_log
 from app.identity.models import AuthIdentity, LoginSession, User, UserChannelPermission
 from app.mcp_gateway.models import McpCall
+from app.quick.models import QuickMcpCall
 from app.tasks.models import AnalysisTask
 from app.workspace.models import WorkspaceSession
 
 
 HISTORY_KINDS = ("settle", "admin_adjust", "welcome_grant")
+
+# 快捷功能 feature → 积分流水展示用中文名。
+QUICK_FEATURE_TITLES = {
+    "kol_recommend": "达人推荐",
+    "kol_detail": "达人详情",
+    "top_posts": "爆贴查询",
+}
 
 
 def utc_now() -> datetime:
@@ -73,6 +81,7 @@ class AdminService:
             points=wallet.balance if wallet is not None else 0,
             reserved_points=wallet.reserved if wallet is not None else 0,
             channels=await self._channels_of(user.id),
+            industries=[str(item) for item in (user.industries or ["美食"])],
             created_at=user.created_at,
         )
 
@@ -218,6 +227,7 @@ class AdminService:
             "role": user.role,
             "status": user.status,
             "channels": await self._channels_of(user.id),
+            "industries": [str(item) for item in (user.industries or [])],
         }
         if payload.phone is not None and payload.phone != before["phone"]:
             conflict_id = await self.db.scalar(
@@ -256,6 +266,8 @@ class AdminService:
             user.role = payload.role
         if payload.status is not None:
             user.status = payload.status
+        if payload.industries is not None:
+            user.industries = list(payload.industries)
         user.updated_at = utc_now()
         if payload.channels is not None:
             existing = list(
@@ -291,6 +303,11 @@ class AdminService:
             "status": user.status,
             "channels": (
                 payload.channels if payload.channels is not None else before["channels"]
+            ),
+            "industries": (
+                list(payload.industries)
+                if payload.industries is not None
+                else before["industries"]
             ),
         }
         self._audit(
@@ -424,6 +441,30 @@ class AdminService:
             ).all()
             for tx_id, service_slug, title, platforms in rows:
                 platform = platforms[0] if platforms else service_slug
+                context[tx_id] = (title, platform)
+        quick_settle_ids = [
+            tx.id
+            for tx in transactions
+            if tx.kind == "settle" and tx.reference_type == "quick_mcp_call"
+        ]
+        if quick_settle_ids:
+            quick_rows = (
+                await self.db.execute(
+                    select(
+                        QuickMcpCall.settlement_transaction_id,
+                        QuickMcpCall.feature,
+                        QuickMcpCall.arguments_json,
+                    ).where(QuickMcpCall.settlement_transaction_id.in_(quick_settle_ids))
+                )
+            ).all()
+            for tx_id, feature, arguments in quick_rows:
+                title = QUICK_FEATURE_TITLES.get(feature, feature)
+                datasource = (arguments or {}).get("datasource")
+                platform = (
+                    str(datasource[0])
+                    if isinstance(datasource, list) and datasource
+                    else None
+                )
                 context[tx_id] = (title, platform)
         items = [
             PointsHistoryEntry(

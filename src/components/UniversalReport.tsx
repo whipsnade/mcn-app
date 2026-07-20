@@ -43,7 +43,7 @@ function HeadingBlock({ block }: { block: Extract<ReportBlock, { type: 'heading'
   return <h2 className="px-1 pt-1 text-[13px] font-bold text-slate-800">{text}</h2>;
 }
 
-function MarkdownBlock({ block }: { block: Extract<ReportBlock, { type: 'markdown' }> }) {
+export function MarkdownBlock({ block }: { block: Extract<ReportBlock, { type: 'markdown' }> }) {
   const text = typeof block.text === 'string' ? block.text : '';
   if (!text.trim()) return null;
   return (

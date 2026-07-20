@@ -33,6 +33,9 @@ const CHANNEL_OPTIONS = [
   { slug: 'wechat', label: '微信' },
 ];
 
+const INDUSTRY_PRESETS = ['美食', '美妆', '母婴', '3C数码', '汽车', '服饰', '家居', '医疗健康'];
+const MAX_INDUSTRIES = 5;
+
 const channelLabel = (slug: string): string =>
   CHANNEL_OPTIONS.find(c => c.slug === slug)?.label ?? slug;
 
@@ -131,6 +134,8 @@ export default function AdminPanel({
   const [formUsername, setFormUsername] = useState('');
   const [formPhone, setFormPhone] = useState('');
   const [formChannels, setFormChannels] = useState<string[]>([]);
+  const [formIndustries, setFormIndustries] = useState<string[]>([]);
+  const [formCustomIndustry, setFormCustomIndustry] = useState('');
   const [formPoints, setFormPoints] = useState(2000);
   const [formRole, setFormRole] = useState<'admin' | 'user'>('user');
   const [formStatus, setFormStatus] = useState<'active' | 'disabled'>('active');
@@ -168,6 +173,8 @@ export default function AdminPanel({
     setFormUsername('');
     setFormPhone('');
     setFormChannels(['xiaohongshu', 'douyin']);
+    setFormIndustries(['美食']);
+    setFormCustomIndustry('');
     setFormPoints(2000);
     setFormRole('user');
     setFormStatus('active');
@@ -183,6 +190,8 @@ export default function AdminPanel({
     setFormUsername(acc.nickname);
     setFormPhone(acc.phone ?? '');
     setFormChannels(acc.channels);
+    setFormIndustries(acc.industries ?? []);
+    setFormCustomIndustry('');
     setFormPoints(acc.points);
     setFormRole(acc.role);
     setFormStatus(acc.status);
@@ -218,6 +227,39 @@ export default function AdminPanel({
     );
   };
 
+  const handleToggleIndustry = (industry: string) => {
+    setErrorMsg('');
+    if (formIndustries.includes(industry)) {
+      setFormIndustries(prev => prev.filter(item => item !== industry));
+      return;
+    }
+    if (formIndustries.length >= MAX_INDUSTRIES) {
+      setErrorMsg(`行业属性最多 ${MAX_INDUSTRIES} 项`);
+      return;
+    }
+    setFormIndustries(prev => [...prev, industry]);
+  };
+
+  const handleAddCustomIndustry = () => {
+    const value = formCustomIndustry.trim();
+    if (!value) return;
+    if (value.length > 20) {
+      setErrorMsg('行业属性每项不超过 20 字');
+      return;
+    }
+    if (formIndustries.includes(value)) {
+      setFormCustomIndustry('');
+      return;
+    }
+    if (formIndustries.length >= MAX_INDUSTRIES) {
+      setErrorMsg(`行业属性最多 ${MAX_INDUSTRIES} 项`);
+      return;
+    }
+    setErrorMsg('');
+    setFormIndustries(prev => [...prev, value]);
+    setFormCustomIndustry('');
+  };
+
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
     setErrorMsg('');
@@ -239,6 +281,11 @@ export default function AdminPanel({
       return;
     }
 
+    if (formIndustries.length > MAX_INDUSTRIES) {
+      setErrorMsg(`行业属性最多 ${MAX_INDUSTRIES} 项`);
+      return;
+    }
+
     if (formPoints < 0 || formPoints > 50000) {
       setErrorMsg('积分余额须在 0 到 50,000 之间');
       return;
@@ -253,6 +300,7 @@ export default function AdminPanel({
           role: formRole,
           points: formPoints,
           channels: formChannels,
+          industries: formIndustries,
         });
         setSuccessMsg(`账号「${formUsername.trim()}」创建成功！`);
       } else if (editingAccount) {
@@ -261,6 +309,7 @@ export default function AdminPanel({
           phone: formPhone,
           role: formRole,
           channels: formChannels,
+          industries: formIndustries,
           status: formStatus,
         });
         if (formPoints !== editingAccount.points) {
@@ -440,7 +489,7 @@ export default function AdminPanel({
                         }`}
                       >
                         <div className="space-y-1">
-                          <div className="flex items-center gap-2">
+                          <div className="flex flex-wrap items-center gap-2">
                             <span className="font-bold text-xs text-slate-800">{acc.nickname}</span>
                             {acc.role === 'admin' ? (
                               <span className="text-[9px] font-extrabold px-1.5 py-0.2 rounded bg-amber-50 text-amber-600 border border-amber-200/50 flex items-center gap-0.5">
@@ -462,6 +511,14 @@ export default function AdminPanel({
                                 当前登录
                               </span>
                             )}
+                            {(acc.industries ?? []).map(industry => (
+                              <span
+                                key={industry}
+                                className="text-[9px] font-semibold px-1.5 py-0.2 rounded bg-emerald-50 text-emerald-600 border border-emerald-100/60"
+                              >
+                                {industry}
+                              </span>
+                            ))}
                           </div>
                           <div className="flex items-center gap-3 text-[10.5px] text-slate-500">
                             <span className="flex items-center gap-1 font-mono">
@@ -709,6 +766,76 @@ export default function AdminPanel({
                       );
                     })}
                   </div>
+                </div>
+
+                {/* Industry tags */}
+                <div className="space-y-1.5">
+                  <label className="block text-[10px] font-bold text-slate-400 uppercase">
+                    行业属性（最多 {MAX_INDUSTRIES} 项）
+                  </label>
+                  <div className="flex flex-wrap gap-1.5">
+                    {INDUSTRY_PRESETS.map(industry => {
+                      const isSelected = formIndustries.includes(industry);
+                      return (
+                        <button
+                          key={industry}
+                          type="button"
+                          onClick={() => handleToggleIndustry(industry)}
+                          className={`py-1 px-2 rounded-lg border text-[11px] font-medium transition flex items-center gap-1 ${
+                            isSelected
+                              ? 'bg-emerald-50 border-emerald-200 text-emerald-700 font-semibold'
+                              : 'bg-white border-slate-200 text-slate-500 hover:bg-slate-50'
+                          }`}
+                        >
+                          <span>{industry}</span>
+                          {isSelected && <Check className="h-3 w-3 text-emerald-600 shrink-0" />}
+                        </button>
+                      );
+                    })}
+                  </div>
+                  <div className="flex gap-1.5">
+                    <input
+                      type="text"
+                      value={formCustomIndustry}
+                      maxLength={20}
+                      placeholder="自定义行业（20 字内）"
+                      onChange={e => setFormCustomIndustry(e.target.value)}
+                      onKeyDown={e => {
+                        if (e.key === 'Enter') {
+                          e.preventDefault();
+                          handleAddCustomIndustry();
+                        }
+                      }}
+                      className="flex-1 min-w-0 bg-white border border-slate-200 rounded-lg py-1.5 px-2.5 text-slate-700 outline-none focus:border-indigo-500 transition"
+                    />
+                    <button
+                      type="button"
+                      onClick={handleAddCustomIndustry}
+                      className="shrink-0 px-2.5 py-1.5 bg-slate-100 hover:bg-slate-200 border border-slate-200 text-[11px] font-bold text-slate-600 rounded-lg transition active:scale-95"
+                    >
+                      添加
+                    </button>
+                  </div>
+                  {formIndustries.length > 0 && (
+                    <div className="flex flex-wrap gap-1 pt-0.5">
+                      {formIndustries.map(industry => (
+                        <span
+                          key={industry}
+                          className="flex items-center gap-0.5 text-[10px] font-semibold px-1.5 py-0.5 bg-emerald-50 text-emerald-700 rounded-md border border-emerald-100/60"
+                        >
+                          {industry}
+                          <button
+                            type="button"
+                            aria-label={`移除行业 ${industry}`}
+                            onClick={() => setFormIndustries(prev => prev.filter(item => item !== industry))}
+                            className="text-emerald-400 hover:text-emerald-700 transition"
+                          >
+                            <X className="h-2.5 w-2.5" />
+                          </button>
+                        </span>
+                      ))}
+                    </div>
+                  )}
                 </div>
 
                 {/* Submit buttons */}

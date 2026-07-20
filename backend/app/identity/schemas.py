@@ -31,3 +31,4 @@ class UserRead(BaseModel):
     nickname: str
     role: Literal["user", "admin"]
     channels: list[str]
+    industries: list[str]

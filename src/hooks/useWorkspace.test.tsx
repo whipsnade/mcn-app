@@ -2,6 +2,8 @@ import { act, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Session } from '../types';
+import type { ApiBrainstormResponse } from '../api/contracts';
+import { postBrainstorm } from '../api/brainstorm';
 import { createSession, deleteSession, getSession, listSessions, updateSession } from '../api/sessions';
 import { createTask, getAnalysisReport, getTask, retryFollowups, retryTask } from '../api/tasks';
 import { initialTaskRuntime } from '../state/taskEvents';
@@ -25,6 +27,14 @@ const session: Session = {
   updatedAt: '2026-07-14T10:00:00Z',
 };
 
+const readyBrainstormMessage: Session['messages'][number] = {
+  id: 'message-brainstorm-ready',
+  sender: 'ai',
+  text: '信息已齐，开始分析',
+  timestamp: '18:01',
+  brainstorm: { ready: true, options: [] },
+};
+
 const restoredSession: Session = {
   ...session,
   messages: [{
@@ -33,7 +43,27 @@ const restoredSession: Session = {
     text: '恢复这条历史提问',
     timestamp: '18:00',
     taskId: 'task-1',
-  }],
+  }, readyBrainstormMessage],
+};
+
+const blankSession: Session = {
+  ...session,
+  title: '新会话1',
+  brand: '',
+  campaignName: null,
+  category: '',
+  targetAudience: '',
+  messages: [],
+};
+
+const emptyProfile: ApiBrainstormResponse['profile'] = {
+  brand: null,
+  category: null,
+  platforms: [],
+  audience: null,
+  period: null,
+  kol_filters: null,
+  goal: null,
 };
 
 function deferred<T>() {
@@ -45,14 +75,23 @@ function deferred<T>() {
 }
 
 
-vi.mock('../api/sessions', () => ({
-  appendMessage: vi.fn(),
-  createSession: vi.fn(),
-  deleteSession: vi.fn(),
-  getSession: vi.fn(),
-  listSessions: vi.fn(),
-  updateSession: vi.fn(),
-}));
+vi.mock('../api/sessions', async importOriginal => {
+  const actual = await importOriginal<typeof import('../api/sessions')>();
+  return {
+    ...actual,
+    appendMessage: vi.fn(),
+    createSession: vi.fn(),
+    deleteSession: vi.fn(),
+    getSession: vi.fn(),
+    listSessions: vi.fn(),
+    updateSession: vi.fn(),
+  };
+});
+
+vi.mock('../api/brainstorm', async importOriginal => {
+  const actual = await importOriginal<typeof import('../api/brainstorm')>();
+  return { ...actual, postBrainstorm: vi.fn() };
+});
 
 vi.mock('../api/tasks', () => ({
   createTask: vi.fn(),
@@ -310,7 +349,7 @@ describe('useWorkspace', () => {
   });
 
   it('releases only the deleted session task lock and keeps a newer session lock owned', async () => {
-    const otherSession = { ...session, id: 'session-2', title: '会话 B' };
+    const otherSession = { ...session, id: 'session-2', title: '会话 B', messages: [readyBrainstormMessage] };
     const firstTask = deferred<{
       id: string; session_id: string; status: 'pending'; estimated_points: number; error_code: null; latest_report_id: null;
     }>();
@@ -439,7 +478,7 @@ describe('useWorkspace', () => {
   });
 
   it('releases a deleted session retry lock so the selected session can submit', async () => {
-    const otherSession = { ...session, id: 'session-2', title: '会话 B' };
+    const otherSession = { ...session, id: 'session-2', title: '会话 B', messages: [readyBrainstormMessage] };
     const pendingRetry = deferred<{
       id: string; session_id: string; status: 'pending'; estimated_points: number; error_code: null;
       error_message: null; latest_report_id: null;
@@ -654,6 +693,95 @@ describe('useWorkspace', () => {
     expect(result.current.isAnalyzing).toBe(true);
   });
 
+  it('clarifies an unready blank session through brainstorm instead of creating a task', async () => {
+    vi.mocked(getSession).mockResolvedValue(blankSession);
+    const pending = deferred<ApiBrainstormResponse>();
+    vi.mocked(postBrainstorm).mockReturnValue(pending.promise);
+    const { result } = renderHook(() => useWorkspace('user-a'));
+    await waitFor(() => expect(result.current.activeSession?.id).toBe('session-1'));
+
+    let appendPromise!: Promise<unknown>;
+    act(() => {
+      appendPromise = result.current.appendMessage('想分析新品防晒');
+    });
+    await waitFor(() => expect(postBrainstorm).toHaveBeenCalledWith('session-1', '想分析新品防晒'));
+    // 澄清进行中：本地已追加 user 消息并暴露 clarifying 状态，不创建任务。
+    expect(result.current.isClarifying).toBe(true);
+    expect(result.current.activeSession?.messages.at(-1)?.text).toBe('想分析新品防晒');
+    expect(createTask).not.toHaveBeenCalled();
+
+    await act(async () => {
+      pending.resolve({
+        ready: false,
+        task_id: null,
+        message: {
+          id: 'm-assistant-1', role: 'assistant', content: '想分析哪个平台？', sequence: 2,
+          metadata: { brainstorm: { ready: false, options: ['小红书', '抖音'], profile_summary: null } },
+          created_at: '2026-07-20T10:01:00Z',
+        },
+        profile: emptyProfile,
+      });
+      await appendPromise;
+    });
+
+    expect(result.current.isClarifying).toBe(false);
+    expect(result.current.activeSession?.status).toBe('draft');
+    expect(result.current.activeTaskId).toBeUndefined();
+    const messages = result.current.activeSession?.messages ?? [];
+    expect(messages).toHaveLength(2);
+    expect(messages[0]?.sender).toBe('user');
+    expect(messages[1]?.text).toBe('想分析哪个平台？');
+    expect(messages[1]?.brainstorm?.options).toEqual(['小红书', '抖音']);
+    expect(createTask).not.toHaveBeenCalled();
+  });
+
+  it('binds the created task when brainstorm reports ready', async () => {
+    vi.mocked(getSession).mockResolvedValue(blankSession);
+    vi.mocked(postBrainstorm).mockResolvedValue({
+      ready: true,
+      task_id: 'task-bs',
+      message: {
+        id: 'm-assistant-ready', role: 'assistant', content: '信息已齐，开始分析', sequence: 2,
+        metadata: { brainstorm: { ready: true, options: [], profile_summary: null } },
+        created_at: '2026-07-20T10:02:00Z',
+      },
+      profile: { ...emptyProfile, brand: '新品防晒' },
+    });
+    const { result } = renderHook(() => useWorkspace('user-a'));
+    await waitFor(() => expect(result.current.activeSession?.id).toBe('session-1'));
+
+    await act(async () => {
+      await result.current.appendMessage('分析小红书上新品防晒的声量');
+    });
+
+    expect(createTask).not.toHaveBeenCalled();
+    expect(result.current.activeTaskId).toBe('task-bs');
+    expect(result.current.activeSession?.status).toBe('analyzing');
+    expect(result.current.activeSession?.analysis).toEqual({ taskId: 'task-bs', status: 'pending', kind: 'agent' });
+    const messages = result.current.activeSession?.messages ?? [];
+    expect(messages[0]?.taskId).toBe('task-bs');
+    expect(messages[1]?.brainstorm?.ready).toBe(true);
+    expect(result.current.isAnalyzing).toBe(true);
+  });
+
+  it('rolls back the optimistic message when brainstorm fails', async () => {
+    vi.mocked(getSession).mockResolvedValue(blankSession);
+    vi.mocked(postBrainstorm).mockRejectedValue(new Error('BRAINSTORM_FAILED'));
+    const { result } = renderHook(() => useWorkspace('user-a'));
+    await waitFor(() => expect(result.current.activeSession?.id).toBe('session-1'));
+
+    let caught: unknown;
+    await act(async () => {
+      await result.current.appendMessage('想分析新品防晒').catch(reason => { caught = reason; });
+    });
+
+    expect((caught as Error)?.message).toBe('BRAINSTORM_FAILED');
+    expect(result.current.activeSession?.messages).toHaveLength(0);
+    expect(result.current.error).toBe('BRAINSTORM_FAILED');
+    expect(result.current.isClarifying).toBe(false);
+    expect(createTask).not.toHaveBeenCalled();
+  });
+
   it('does not create a second task while the active task is still running', async () => {
     vi.mocked(createTask).mockResolvedValue({
       id: 'task-1',
@@ -851,7 +979,7 @@ describe('useWorkspace', () => {
       errorMessage: '分析任务执行失败，请稍后重试。', errorMessageId: 'error-1',
     });
     const { result, rerender } = renderHook(() => useWorkspace('user-a'));
-    await waitFor(() => expect(result.current.activeSession?.messages).toHaveLength(2));
+    await waitFor(() => expect(result.current.activeSession?.messages).toHaveLength(3));
     rerender();
     expect(result.current.activeSession?.messages.filter(message => message.id === 'error-1')).toHaveLength(1);
   });

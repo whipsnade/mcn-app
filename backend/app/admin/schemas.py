@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Annotated
 
 from pydantic import BaseModel, Field
 
@@ -12,6 +13,7 @@ class AdminUserItem(BaseModel):
     points: int
     reserved_points: int
     channels: list[str]
+    industries: list[str]
     created_at: datetime
 
 
@@ -34,6 +36,9 @@ class AdminUserUpdate(BaseModel):
     role: str | None = Field(default=None, pattern="^(user|admin)$")
     status: str | None = Field(default=None, pattern="^(active|disabled)$")
     channels: list[str] | None = None
+    industries: list[Annotated[str, Field(min_length=1, max_length=20)]] | None = Field(
+        default=None, max_length=5
+    )
 
 
 class PointsAdjustRequest(BaseModel):

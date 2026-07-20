@@ -5,8 +5,10 @@ import {
   deleteSession as deleteSessionRequest,
   getSession,
   listSessions,
+  toMessage,
   updateSession as updateSessionRequest,
 } from '../api/sessions';
+import { isBrainstormProfileReady, postBrainstorm } from '../api/brainstorm';
 import { createTask, getAnalysisReport, getTask, retryFollowups as retryFollowupsRequest, retryTask } from '../api/tasks';
 import type { CreateSessionInput } from '../api/contracts';
 import { useTaskStream } from './useTaskStream';
@@ -39,6 +41,7 @@ export function useWorkspace(userId?: string) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
   const [activeTaskId, setActiveTaskId] = useState<string>();
+  const [isClarifying, setIsClarifying] = useState(false);
   const generationRef = useRef(0);
   const selectionRequestRef = useRef(0);
   const sessionsRef = useRef<Session[]>([]);
@@ -309,6 +312,60 @@ export function useWorkspace(userId?: string) {
     setBusy(true);
     setError(undefined);
     try {
+      if (activeSession && !isBrainstormProfileReady(activeSession)) {
+        // 画像未 ready：走 brainstorm 澄清，同步请求-响应，ready 后直接绑定已创建的任务。
+        const optimisticMessage: Message = {
+          id: `pending-brainstorm-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`,
+          sender: 'user',
+          text: content,
+          timestamp: new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }),
+        };
+        setIsClarifying(true);
+        setSessions(current => current.map(session => session.id === requestedSessionId ? {
+          ...session,
+          messages: [...session.messages, optimisticMessage],
+        } : session));
+        let response;
+        try {
+          response = await postBrainstorm(requestedSessionId, content);
+        } catch (reason) {
+          // 失败时回滚乐观消息，输入框草稿由 ChatArea 保留（与 createTask 失败处理一致）。
+          if (
+            generationRef.current === generation
+            && sessionOperationIsCurrent(requestedSessionId, operationEpoch)
+          ) {
+            setSessions(current => current.map(session => session.id === requestedSessionId ? {
+              ...session,
+              messages: session.messages.filter(message => message.id !== optimisticMessage.id),
+            } : session));
+          }
+          throw reason;
+        } finally {
+          setIsClarifying(false);
+        }
+        if (generationRef.current !== generation) throw new Error('STALE_WORKSPACE_REQUEST');
+        if (!sessionOperationIsCurrent(requestedSessionId, operationEpoch)) return response;
+        const taskId = response.ready ? response.task_id : null;
+        const assistantMessage = toMessage(response.message);
+        setSessions(current => current.map(session => session.id === requestedSessionId ? {
+          ...session,
+          status: taskId ? 'analyzing' : session.status,
+          messages: [
+            ...session.messages.map(message => message.id === optimisticMessage.id && taskId
+              ? { ...message, taskId }
+              : message),
+            assistantMessage,
+          ],
+          analysis: taskId
+            ? { taskId, status: 'pending', kind: 'agent' as const }
+            : session.analysis,
+          analysisReport: taskId ? undefined : session.analysisReport,
+        } : session));
+        if (taskId && activeSessionIdRef.current === requestedSessionId) {
+          setActiveTaskId(taskId);
+        }
+        return response;
+      }
       const task = await createTask(requestedSessionId, { content });
       if (generationRef.current !== generation) throw new Error('STALE_WORKSPACE_REQUEST');
       if (!sessionOperationIsCurrent(requestedSessionId, operationEpoch)) return task;
@@ -544,6 +601,7 @@ export function useWorkspace(userId?: string) {
     loading,
     busy,
     isAnalyzing,
+    isClarifying,
     error,
     reload,
     selectSession,

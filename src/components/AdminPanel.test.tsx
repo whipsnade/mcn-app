@@ -31,6 +31,7 @@ const ADMIN_USER: ApiAdminUser = {
   points: 5000,
   reserved_points: 0,
   channels: ['xiaohongshu', 'douyin'],
+  industries: ['美食'],
   created_at: '2026-01-01T00:00:00Z',
 };
 
@@ -43,6 +44,7 @@ const NORMAL_USER: ApiAdminUser = {
   points: 3450,
   reserved_points: 0,
   channels: ['xiaohongshu', 'bilibili'],
+  industries: ['美食', '母婴'],
   created_at: '2026-06-15T00:00:00Z',
 };
 
@@ -208,5 +210,64 @@ describe('AdminPanel', () => {
     expect(screen.getByText('+1000')).toBeTruthy();
     expect(screen.getByText('-200')).toBeTruthy();
     expect(getAdminUserPointsHistory).toHaveBeenCalledWith('u-2', { limit: 200 });
+  });
+
+  it('列表行展示行业属性 chips', async () => {
+    renderPanel();
+
+    await screen.findByText('运营小王');
+    expect(screen.getAllByText('美食').length).toBeGreaterThan(0);
+    expect(screen.getAllByText('母婴').length).toBeGreaterThan(0);
+  });
+
+  it('编辑表单回显行业，保存时随 PATCH 提交 industries', async () => {
+    vi.mocked(updateAdminUser).mockResolvedValue({ ...NORMAL_USER, industries: ['美食', '汽车'] });
+    renderPanel();
+
+    await screen.findByText('运营小王');
+    fireEvent.click(screen.getAllByTitle('管理/修改此账号信息')[1]);
+
+    // 回显已有行业 chips（可移除）
+    expect(screen.getByRole('button', { name: '移除行业 美食' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: '移除行业 母婴' })).toBeTruthy();
+
+    // 切换预设行业 + 自定义行业
+    fireEvent.click(screen.getByRole('button', { name: /汽车/ }));
+    fireEvent.change(screen.getByPlaceholderText('自定义行业（20 字内）'), {
+      target: { value: '宠物' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '添加' }));
+    expect(screen.getByRole('button', { name: '移除行业 宠物' })).toBeTruthy();
+
+    fireEvent.click(screen.getByText('保存修改'));
+
+    await waitFor(() => {
+      expect(updateAdminUser).toHaveBeenCalledWith('u-2', expect.objectContaining({
+        industries: ['美食', '母婴', '汽车', '宠物'],
+      }));
+    });
+  });
+
+  it('自定义行业去重且最多 5 项', async () => {
+    renderPanel();
+
+    await screen.findByText('运营小王');
+    fireEvent.click(screen.getAllByTitle('管理/修改此账号信息')[1]);
+
+    // 重复添加已选行业不生效
+    fireEvent.change(screen.getByPlaceholderText('自定义行业（20 字内）'), {
+      target: { value: '美食' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '添加' }));
+    expect(screen.getAllByRole('button', { name: '移除行业 美食' })).toHaveLength(1);
+
+    // 已有 2 项，再选 3 项预设后达到上限，第 6 项被拒绝
+    fireEvent.click(screen.getByRole('button', { name: /美妆/ }));
+    fireEvent.click(screen.getByRole('button', { name: /汽车/ }));
+    fireEvent.click(screen.getByRole('button', { name: /服饰/ }));
+    fireEvent.click(screen.getByRole('button', { name: /家居/ }));
+
+    expect(await screen.findByText('行业属性最多 5 项')).toBeTruthy();
+    expect(screen.queryByRole('button', { name: '移除行业 家居' })).toBeNull();
   });
 });

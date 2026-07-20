@@ -91,8 +91,13 @@ BI_REQUIRED_METRICS: tuple[MetricDef, ...] = (
         key="kol_leaderboard",
         label="达人绩效明细",
         description=(
-            "达人名称、层级、粉丝量、渠道、互动率、声量贡献与正向舆情"
-            "（不含投放成本）。"
+            "达人名称、层级、粉丝量、渠道、互动率、声量贡献、正向舆情与报价"
+            "（投放成本：取搜索结果中的官方/预估报价字段，报价为 0 或缺失"
+            "视为无报价）。调用链：先用 match_best_tag 匹配用户问题中"
+            "品牌的标准标签（匹配失败则改用 target_type=keyword 按用户原词"
+            "查询），再调用达人统计或搜索工具；name 必须与用户问题中的品牌/"
+            "对象一致，禁止猜测或替换品牌名；泛指话题表述不是分析对象名，"
+            "不要用分析对象检索工具反复检索。"
         ),
         source_tools=(
             "datatap.insight.social.statistic.hot.user.v1",

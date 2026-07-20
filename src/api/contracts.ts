@@ -8,6 +8,7 @@ export interface ApiUser {
   nickname: string;
   role: 'user' | 'admin';
   channels: string[];
+  industries: string[];
 }
 
 export interface ApiWallet {
@@ -25,6 +26,7 @@ export interface ApiAdminUser {
   points: number;
   reserved_points: number;
   channels: string[];
+  industries: string[];
   created_at: string;
 }
 
@@ -39,6 +41,7 @@ export interface ApiAdminUserCreateInput {
   role: 'user' | 'admin';
   points?: number;
   channels?: string[];
+  industries?: string[];
 }
 
 export interface ApiAdminUserUpdateInput {
@@ -47,6 +50,7 @@ export interface ApiAdminUserUpdateInput {
   role?: 'user' | 'admin';
   status?: 'active' | 'disabled';
   channels?: string[];
+  industries?: string[];
 }
 
 export interface ApiAdminPointsAdjustResult {
@@ -69,13 +73,45 @@ export interface ApiPointsHistory {
   total: number;
 }
 
+export interface ApiBrainstormPeriod {
+  start: string;
+  end: string;
+}
+
+export interface ApiBrainstormProfile {
+  brand: string | null;
+  category: string | null;
+  platforms: string[];
+  audience: string | null;
+  period: ApiBrainstormPeriod | null;
+  kol_filters: string | null;
+  goal: string | null;
+}
+
+export interface BrainstormMetadata {
+  ready: boolean;
+  options: string[];
+  profile_summary?: ApiBrainstormProfile | null;
+}
+
+export interface ApiMessageMetadata extends Record<string, unknown> {
+  brainstorm?: BrainstormMetadata;
+}
+
 export interface ApiMessage {
   id: string;
   role: 'user' | 'assistant' | 'system';
   content: string;
   sequence: number;
-  metadata: Record<string, unknown>;
+  metadata: ApiMessageMetadata;
   created_at: string;
+}
+
+export interface ApiBrainstormResponse {
+  ready: boolean;
+  task_id: string | null;
+  message: ApiMessage;
+  profile: ApiBrainstormProfile;
 }
 
 export interface ApiSession {
@@ -197,13 +233,60 @@ export interface ApiFavorite {
 }
 
 export interface CreateSessionInput {
-  brand: string;
-  campaign_name: string | null;
-  platforms: string[];
-  category: string;
-  target_audience: string;
+  brand?: string;
+  campaign_name?: string | null;
+  platforms?: string[];
+  category?: string;
+  target_audience?: string;
   budget_min?: string;
   budget_max?: string;
-  initial_query: string;
+  initial_query?: string;
   filters?: Record<string, unknown>;
+}
+
+export type ApiQuickPlatform = 'xiaohongshu' | 'douyin';
+
+export interface ApiQuickKolItem {
+  platform: ApiQuickPlatform | string;
+  kw_uid: string;
+  nickname: string;
+  fans: number | null;
+  price: number | null;
+  engagement_rate: number | null;
+  score: number | null;
+  city: string | null;
+  tags: string[];
+}
+
+export interface ApiQuickKolRecommendations {
+  items: ApiQuickKolItem[];
+  points_cost: number;
+}
+
+export interface ApiQuickKolDetail {
+  detail: Record<string, unknown>;
+  posts: Array<Record<string, unknown>>;
+  points_cost: number;
+}
+
+export interface ApiQuickTopPost {
+  title: string;
+  nickname: string;
+  interact: number | null;
+  like: number | null;
+  comment: number | null;
+  collect: number | null;
+  publish_time: string | null;
+  url: string | null;
+  platform: string;
+}
+
+export interface ApiQuickTopPosts {
+  items: ApiQuickTopPost[];
+  points_cost: number;
+}
+
+export interface ApiQuickEvaluateResult {
+  title: string;
+  analysis_markdown: string;
 }

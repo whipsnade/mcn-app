@@ -27,7 +27,7 @@ function renderList(overrides: Partial<ComponentProps<typeof SessionList>> = {})
     sessions: [baseSession],
     activeSessionId: baseSession.id,
     onSelectSession: vi.fn(),
-    onOpenNewModal: vi.fn(),
+    onCreateSession: vi.fn(),
     user: { nickname: '测试用户', role: 'user' },
     points: null,
     onOpenRecharge: vi.fn(),
@@ -51,7 +51,7 @@ function DeletionHarness({ initialSessions }: { initialSessions: Session[] }) {
       sessions={sessions}
       activeSessionId={sessions[0]?.id ?? ''}
       onSelectSession={vi.fn()}
-      onOpenNewModal={vi.fn()}
+      onCreateSession={vi.fn()}
       onDeleteSession={async id => setSessions(current => current.filter(session => session.id !== id))}
       points={null}
       onOpenRecharge={vi.fn()}
@@ -189,6 +189,36 @@ describe('SessionList', () => {
 
     await waitFor(() => expect(screen.getByText('删除会话失败，请稍后重试。')).toBeTruthy());
     expect(screen.getByRole('button', { name: '确认删除' })).not.toBeDisabled();
+  });
+
+  it('creates a blank session directly from the new-session trigger', () => {
+    const onCreateSession = vi.fn();
+    renderList({ onCreateSession });
+
+    fireEvent.click(screen.getByRole('button', { name: '新建分析会话' }));
+
+    expect(onCreateSession).toHaveBeenCalledTimes(1);
+  });
+
+  it('renders the 2x2 quick actions and routes each to its quick view', () => {
+    const onOpenQuickView = vi.fn();
+    renderList({ onOpenQuickView });
+
+    fireEvent.click(screen.getByRole('button', { name: '达人推荐' }));
+    expect(onOpenQuickView).toHaveBeenLastCalledWith('kol');
+
+    fireEvent.click(screen.getByRole('button', { name: '活动评估' }));
+    expect(onOpenQuickView).toHaveBeenLastCalledWith('evaluate');
+
+    fireEvent.click(screen.getByRole('button', { name: '小红书爆贴' }));
+    expect(onOpenQuickView).toHaveBeenLastCalledWith('posts-xhs');
+
+    fireEvent.click(screen.getByRole('button', { name: '抖音爆贴' }));
+    expect(onOpenQuickView).toHaveBeenLastCalledWith('posts-dy');
+
+    expect(onOpenQuickView).toHaveBeenCalledTimes(4);
+    // 旧的「大盘层级」占位按钮已移除
+    expect(screen.queryByTitle('大盘层级')).toBeNull();
   });
 
   it('allows saving an empty project or campaign name', () => {

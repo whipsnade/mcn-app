@@ -114,6 +114,7 @@ class WalletService:
         amount: int,
         idempotency_key: str,
         reference_id: str,
+        reference_type: str = "mcp_call",
     ) -> Wallet:
         if amount <= 0:
             raise ValueError("amount_must_be_positive")
@@ -130,12 +131,15 @@ class WalletService:
             balance_delta=-amount,
             reserved_delta=amount,
             idempotency_key=idempotency_key,
-            reference_type="mcp_call",
+            reference_type=reference_type,
             reference_id=reference_id,
         )
 
     async def reserve_batch(
-        self, user_id: str, requests: Sequence[ReservationRequest]
+        self,
+        user_id: str,
+        requests: Sequence[ReservationRequest],
+        reference_type: str = "mcp_call",
     ) -> Wallet:
         if not requests or any(request.amount != 10 for request in requests):
             raise ValueError("invalid_mcp_reservation_batch")
@@ -153,7 +157,7 @@ class WalletService:
                 balance_delta=-request.amount,
                 reserved_delta=request.amount,
                 idempotency_key=request.idempotency_key,
-                reference_type="mcp_call",
+                reference_type=reference_type,
                 reference_id=request.reference_id,
             )
         return wallet
@@ -164,6 +168,7 @@ class WalletService:
         amount: int,
         idempotency_key: str,
         reference_id: str,
+        reference_type: str = "mcp_call",
     ) -> Wallet:
         if amount <= 0:
             raise ValueError("amount_must_be_positive")
@@ -180,7 +185,7 @@ class WalletService:
             balance_delta=0,
             reserved_delta=-amount,
             idempotency_key=idempotency_key,
-            reference_type="mcp_call",
+            reference_type=reference_type,
             reference_id=reference_id,
         )
 
@@ -190,6 +195,7 @@ class WalletService:
         amount: int,
         idempotency_key: str,
         reference_id: str,
+        reference_type: str = "mcp_call",
     ) -> Wallet:
         if amount <= 0:
             raise ValueError("amount_must_be_positive")
@@ -206,7 +212,7 @@ class WalletService:
             balance_delta=amount,
             reserved_delta=-amount,
             idempotency_key=idempotency_key,
-            reference_type="mcp_call",
+            reference_type=reference_type,
             reference_id=reference_id,
         )
 

@@ -5,6 +5,7 @@ import pytest
 
 from app.billing.models import WalletTransaction
 from app.mcp_gateway.models import McpCall
+from app.quick.models import QuickMcpCall
 from app.tasks.models import AnalysisTask
 from app.workspace.models import Message, WorkspaceSession
 
@@ -115,6 +116,52 @@ async def test_points_history_resolves_session_context(
     assert entry["points"] == 10
     assert entry["session_title"] == "双11 投放分析"
     assert entry["platform"] == "bilibili"
+
+
+@pytest.mark.asyncio
+async def test_points_history_resolves_quick_call_context(
+    authed_client_factory, user_factory, db_session
+) -> None:
+    admin_client, _ = await authed_client_factory()
+    user = await user_factory()
+    now = utc_now()
+    transaction = WalletTransaction(
+        id=str(uuid4()),
+        user_id=user.id,
+        kind="settle",
+        balance_delta=0,
+        reserved_delta=-10,
+        balance_after=990,
+        reserved_after=0,
+        idempotency_key=f"quick:{uuid4()}:settle",
+        reference_type="quick_mcp_call",
+        reference_id="quick-call-1",
+        created_at=now,
+    )
+    db_session.add(transaction)
+    await db_session.flush()
+    db_session.add(
+        QuickMcpCall(
+            id="quick-call-1",
+            user_id=user.id,
+            feature="top_posts",
+            internal_tool_name="datatap.insight.query.raw.posts.v1",
+            arguments_json={"datasource": ["小红书"], "target_type": "tag"},
+            status="succeeded",
+            points_cost=10,
+            settlement_transaction_id=transaction.id,
+            created_at=now,
+            completed_at=now,
+        )
+    )
+    await db_session.flush()
+
+    response = await admin_client.get(f"/api/v1/admin/users/{user.id}/points-history")
+
+    assert response.status_code == 200
+    [entry] = response.json()["items"]
+    assert entry["session_title"] == "爆贴查询"
+    assert entry["platform"] == "小红书"
 
 
 @pytest.mark.asyncio

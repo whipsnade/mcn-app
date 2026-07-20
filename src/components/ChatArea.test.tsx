@@ -177,6 +177,112 @@ describe('ChatArea', () => {
     expect(screen.getByRole('form', { name: '发送消息' }).parentElement).toHaveClass('shrink-0');
   });
 
+  it('renders brainstorm option chips under the latest assistant message and sends the clicked option', async () => {
+    const onSendMessage = vi.fn().mockResolvedValue(undefined);
+    const clarifyingSession: Session = {
+      ...session,
+      messages: [
+        { id: 'message-u1', sender: 'user', text: '想分析新品防晒', timestamp: '10:00' },
+        {
+          id: 'message-a1',
+          sender: 'ai',
+          text: '想分析哪个平台？',
+          timestamp: '10:01',
+          brainstorm: { ready: false, options: ['小红书', '抖音'] },
+        },
+      ],
+    };
+    render(
+      <ChatArea
+        session={clarifyingSession}
+        onSendMessage={onSendMessage}
+        isAnalyzing={false}
+        isMockMode={false}
+      />,
+    );
+
+    const chip = screen.getByRole('button', { name: '小红书' });
+    expect(chip).toBeVisible();
+    expect(screen.getByRole('button', { name: '抖音' })).toBeVisible();
+    await act(async () => {
+      fireEvent.click(chip);
+    });
+    expect(onSendMessage).toHaveBeenCalledWith('小红书');
+  });
+
+  it('hides brainstorm options of older assistant messages once a newer one arrives', () => {
+    const clarifyingSession: Session = {
+      ...session,
+      messages: [
+        {
+          id: 'message-a1',
+          sender: 'ai',
+          text: '想分析哪个平台？',
+          timestamp: '10:01',
+          brainstorm: { ready: false, options: ['小红书', '抖音'] },
+        },
+        { id: 'message-u2', sender: 'user', text: '小红书', timestamp: '10:02' },
+        {
+          id: 'message-a2',
+          sender: 'ai',
+          text: '分析目标是什么？',
+          timestamp: '10:03',
+          brainstorm: { ready: false, options: ['声量口碑', '达人投放'] },
+        },
+      ],
+    };
+    render(
+      <ChatArea
+        session={clarifyingSession}
+        onSendMessage={vi.fn()}
+        isAnalyzing={false}
+        isMockMode={false}
+      />,
+    );
+
+    expect(screen.queryByRole('button', { name: '小红书' })).toBeNull();
+    expect(screen.getByRole('button', { name: '声量口碑' })).toBeVisible();
+    expect(screen.getByRole('button', { name: '达人投放' })).toBeVisible();
+  });
+
+  it('shows only the session title for a blank session without brand or category', () => {
+    const blank: Session = {
+      ...session,
+      title: '新会话1',
+      brand: '',
+      campaignName: null,
+      category: '',
+      messages: [],
+    };
+    render(
+      <ChatArea
+        session={blank}
+        onSendMessage={vi.fn()}
+        isAnalyzing={false}
+        isMockMode={false}
+      />,
+    );
+
+    expect(screen.getByRole('heading', { name: '新会话1' })).toBeVisible();
+    expect(screen.queryByText(/渠道:/)).toBeNull();
+    expect(screen.queryByText(/预算:/)).toBeNull();
+  });
+
+  it('shows the clarifying hint while a brainstorm request is in flight', () => {
+    render(
+      <ChatArea
+        session={session}
+        onSendMessage={vi.fn()}
+        isAnalyzing
+        isClarifying
+        isMockMode={false}
+      />,
+    );
+
+    expect(screen.getByText('正在澄清需求…')).toBeVisible();
+    expect(screen.queryByText('正在分析数据并编制图表...')).toBeNull();
+  });
+
   it('renders loading and retryable error states for follow-up suggestions', async () => {
     const onRetryFollowups = vi.fn().mockResolvedValue(undefined);
     const { rerender } = render(

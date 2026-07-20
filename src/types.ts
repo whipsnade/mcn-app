@@ -4,6 +4,7 @@ export interface Message {
   text: string;
   timestamp: string;
   taskId?: string;
+  brainstorm?: import('./api/contracts').BrainstormMetadata;
 }
 
 export interface SentimentData {
@@ -102,5 +103,13 @@ export interface SessionAnalysis {
   followupStatus?: 'pending' | 'completed' | 'failed';
   followupSuggestions?: import('./api/contracts').FollowupSuggestion[];
   followupError?: Record<string, unknown>;
+}
+
+export type QuickView = 'kol' | 'posts-xhs' | 'posts-dy' | 'evaluate';
+
+export interface QuickKolSelection {
+  platform: string;
+  kw_uid: string;
+  nickname: string;
 }
 

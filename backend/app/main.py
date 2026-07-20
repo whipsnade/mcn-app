@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.router import api_router
 from app.core.config import get_settings
+from app.quick.service import release_stale_quick_calls
 from app.tasks.dependencies import create_task_runtime, refresh_approved_datatap_tools
 
 
@@ -23,6 +24,7 @@ def create_app() -> FastAPI:
             try:
                 await recovery.recover_expired()
                 await recovery.recover_pending_followups()
+                await release_stale_quick_calls(older_than_seconds=300)
             except Exception:
                 # A later fixed-interval pass retries transient database faults.
                 return
