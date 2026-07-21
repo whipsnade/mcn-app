@@ -1,4 +1,5 @@
 from functools import lru_cache
+from typing import Literal
 from urllib.parse import quote_plus
 
 from pydantic import AnyHttpUrl, Field, SecretStr, model_validator
@@ -31,6 +32,9 @@ class Settings(BaseSettings):
     tencent_plan_api_key: SecretStr
     # OpenAI 兼容端点与模型名均可自由配置（腾讯 Token Plan、月之暗面 Kimi 等）。
     tencent_plan_model: str = "deepseek-v4-pro"
+    # 思考深度（仅 Kimi k3 等推理模型支持，请求顶层 reasoning_effort）；
+    # 为 None 时不发送该参数，避免不支持它的端点报 400。
+    tencent_plan_reasoning_effort: Literal["low", "high", "max"] | None = None
     # Full-tool planning sends the reviewed MCP schemas in one request. The
     # provider can take longer than the default HTTP timeout to produce a
     # valid structured plan, so keep this configurable but use a safe default.

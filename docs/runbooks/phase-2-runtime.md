@@ -4,7 +4,7 @@
 
 ## 启动与迁移
 
-在项目根目录准备未提交的 `.env`，必须设置 `MYSQL_*`、随机 `JWT_SECRET`、`APP_ENV`、`AUTH_MODE`、`TENCENT_PLAN_API_KEY` 与 `DATATAP_MCP_TOKEN`。模型固定使用腾讯 Token Plan 的 `DeepSeek-V4-Pro`，MCP 固定使用 DataTap；不存在 Provider 切换或模拟回退。
+在项目根目录准备未提交的 `.env`，必须设置 `MYSQL_*`、随机 `JWT_SECRET`、`APP_ENV`、`AUTH_MODE`、`TENCENT_PLAN_API_KEY` 与 `DATATAP_MCP_TOKEN`。模型为任意 OpenAI 兼容端点（`TENCENT_PLAN_BASE_URL` / `TENCENT_PLAN_MODEL`，当前生产使用 Kimi `k3`）；`TENCENT_PLAN_REASONING_EFFORT`（low/high/max）为可选思考深度，仅 k3 等推理模型生效。MCP 固定使用 DataTap；不存在 Provider 切换或模拟回退。
 
 ```bash
 cd backend
@@ -34,6 +34,16 @@ cd backend
 ## 回滚
 
 先关闭新任务并等待当前请求进入终态，再回滚应用版本。数据库迁移只按 Alembic 的可逆 downgrade 执行；不要手工删除账本、调用记录或会话历史。回滚后运行一次只读健康检查和 focused 回归，确认租约、积分和版本门控一致后再开放新任务。
+
+## UAT 部署
+
+- 连接：`ssh root@111.10.192.19`（密钥用 `~/.ssh` 下默认 id_ed25519/id_rsa，免密已配好；服务器主机名显示为 localhost）。
+- 布局：项目根 `/home/kol_insight/`（`backend/` 为 FastAPI 后端、`dist/` 为前端构建产物）；后端 `.env` 在 `/home/kol_insight/backend/.env`；虚拟环境 `/home/kol_insight/.venv`。
+- 服务：systemd `kol-insight.service`（WorkingDirectory=`/home/kol_insight/backend`，uvicorn 监听 `127.0.0.1:8100`）；重启 `systemctl restart kol-insight.service`。
+- 公网入口：nginx `http://111.10.192.19:40099`（`/api/` 反代到 8100，`/` 静态托管 dist；站点配置在 `/etc/nginx/sites-available/kol-insight`）。
+- 同步方式：从本地工作区 `rsync`/`scp` 改动文件到 `/home/kol_insight/backend/`（不覆盖远端 `.env`），有迁移时先 `alembic upgrade head`，再重启服务。
+- 验证：本机 `curl http://127.0.0.1:8100/healthz` 应返回 `{"status":"ok"}`；公网用 `curl http://111.10.192.19:40099/api/v1/sessions` 期望 401（证明 nginx→后端链路通，`/healthz` 不在 `/api/` 下、不公网暴露）。
+- 注意：远端无 --reload，改代码必须重启服务；云安全组与 ufw 是两层，曾误开 ufw 导致 SSH 断连，端口变更需同时确认两侧放行。
 
 ## 凭据与日志
 

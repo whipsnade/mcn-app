@@ -115,10 +115,12 @@ class TencentPlanAdapter:
         schema_support_cache: MutableMapping[tuple[str, str, str], bool] | None = None,
         owned_client: AsyncOpenAI | None = None,
         log_writer: PromptLogWriter | None = None,
+        reasoning_effort: str | None = None,
     ) -> None:
         self._client = client
         self.base_url = base_url
         self.model = model
+        self._reasoning_effort = reasoning_effort
         self._sleep = sleep
         self._jitter = jitter
         self._max_attempts = max_attempts
@@ -144,6 +146,7 @@ class TencentPlanAdapter:
             base_url=settings.tencent_plan_base_url.unicode_string(),
             model=settings.tencent_plan_model,
             owned_client=client,
+            reasoning_effort=settings.tencent_plan_reasoning_effort,
         )
 
     async def complete_json(
@@ -268,6 +271,7 @@ class TencentPlanAdapter:
                     max_tokens=request.max_tokens,
                     stream=True,
                     stream_options={"include_usage": True},
+                    **self._create_kwargs(),
                 )
                 async for chunk in stream:
                     request_id = _request_id(chunk) or request_id
@@ -357,6 +361,12 @@ class TencentPlanAdapter:
         if self._owned_client is not None:
             await self._owned_client.close()
 
+    def _create_kwargs(self) -> dict[str, Any]:
+        """按配置附加的可选请求参数（未配置则不发送，避免端点 400）。"""
+        if self._reasoning_effort is None:
+            return {}
+        return {"reasoning_effort": self._reasoning_effort}
+
     def _response_format(
         self,
         request: StructuredModelRequest[Any],
@@ -391,6 +401,7 @@ class TencentPlanAdapter:
                     max_tokens=max_tokens,
                     response_format=response_format,
                     stream=False,
+                    **self._create_kwargs(),
                 )
             except asyncio.CancelledError:
                 raise

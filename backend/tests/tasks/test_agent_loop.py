@@ -518,17 +518,17 @@ async def test_agent_loop_finish_allowed_after_reject_streak_limit() -> None:
 async def test_agent_loop_throttles_same_tool_after_repeated_empty_results() -> None:
     task = _task()
     store = _FakeStore(task)
-    # 前 3 次空结果正常执行；第 4 次同名调用被熔断（不发起调用、不扣费），
+    # 前 2 次空结果正常执行；第 3 次同名调用被熔断（不发起调用、不扣费），
     # 模型随后 finish，任务正常完成。
-    decider = _ScriptedDecider([_call(), _call(), _call(), _call(), _finish()])
-    gateway = _FakeGateway([(_settled(data={}),), (_settled(data={}),), (_settled(data={}),)])
+    decider = _ScriptedDecider([_call(), _call(), _call(), _finish()])
+    gateway = _FakeGateway([(_settled(data={}),), (_settled(data={}),)])
     artifacts = _FakeArtifacts()
 
     await _executor(store, decider, gateway, artifacts).run(task.id)
 
     assert store.terminal == "completed"
-    assert len(gateway.commands) == 3
-    assert decider.calls == 5
+    assert len(gateway.commands) == 2
+    assert decider.calls == 4
     # 熔断原因回喂进下一轮上下文，且不占 invalid_streak。
     throttle_note = next(
         note for note in decider.contexts[-1].notes if note.step_id == "throttle_1"
@@ -542,16 +542,16 @@ async def test_agent_loop_throttle_streak_breaks_loop_with_existing_evidence() -
     task = _task()
     store = _FakeStore(task)
     # 模型执迷于已被熔断的工具：连续 3 次熔断后按现有证据收尾，防止零成本死循环。
-    decider = _ScriptedDecider([_call(), _call(), _call(), _call(), _call(), _call()])
-    gateway = _FakeGateway([(_settled(data={}),), (_settled(data={}),), (_settled(data={}),)])
+    decider = _ScriptedDecider([_call(), _call(), _call(), _call(), _call()])
+    gateway = _FakeGateway([(_settled(data={}),), (_settled(data={}),)])
     artifacts = _FakeArtifacts()
 
     await _executor(store, decider, gateway, artifacts).run(task.id)
 
     assert store.terminal == "completed"
-    assert len(gateway.commands) == 3
-    # 3 次执行 + 3 次被熔断（第 3 次熔断后直接收尾，不再询问模型）。
-    assert decider.calls == 6
+    assert len(gateway.commands) == 2
+    # 2 次执行 + 3 次被熔断（第 3 次熔断后直接收尾，不再询问模型）。
+    assert decider.calls == 5
     assert artifacts.built == [task.id]
     # 前 2 次熔断原因已回喂进后续轮次上下文。
     throttle_ids = {
@@ -583,7 +583,6 @@ async def test_agent_loop_throttle_does_not_block_other_tools() -> None:
     gateway = _FakeGateway([
         (_settled(data={}),),
         (_settled(data={}),),
-        (_settled(data={}),),
         (_settled(),),
     ])
     artifacts = _FakeArtifacts()
@@ -591,5 +590,6 @@ async def test_agent_loop_throttle_does_not_block_other_tools() -> None:
     await _executor(store, decider, gateway, artifacts).run(task.id)
 
     assert store.terminal == "completed"
-    # 熔断只针对累计空结果的同名工具，其他工具不受影响。
-    assert len(gateway.commands) == 4
+    # 熔断只针对累计空结果的同名工具，其他工具不受影响：
+    # 2 次空结果执行 + 第 3 次同名调用被熔断 + 1 次统计工具执行。
+    assert len(gateway.commands) == 3

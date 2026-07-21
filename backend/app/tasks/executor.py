@@ -89,7 +89,7 @@ logger = logging.getLogger(__name__)
 _MAX_FINISH_REJECT_STREAK = 3
 # 同一工具累计返回空数据达到上限后禁止再调（继续调只会白烧积分）；
 # 连续被熔断达到上限则按现有证据收尾，防止零成本死循环。
-_MAX_EMPTY_CALLS_PER_TOOL = 3
+_MAX_EMPTY_CALLS_PER_TOOL = 2
 _MAX_THROTTLE_STREAK = 3
 
 
