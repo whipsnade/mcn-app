@@ -47,8 +47,13 @@ describe('TopPostsPanel', () => {
     mockGetTopPosts.mockResolvedValue(RESULT);
   });
 
-  it('requests the platform leaderboard and renders the table rows', async () => {
-    render(<TopPostsPanel platform="xiaohongshu" onBack={vi.fn()} />);
+  it('does not fetch on mount; fetches after clicking the query button', async () => {
+    render(<TopPostsPanel platform="xiaohongshu" />);
+
+    expect(screen.getByText(/点击右上角「查询\/刷新」/)).toBeTruthy();
+    expect(mockGetTopPosts).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('button', { name: /查询\/刷新/ }));
 
     expect(await screen.findByText('年度必吃榜第一名')).toBeTruthy();
     expect(mockGetTopPosts).toHaveBeenCalledWith('xiaohongshu');
@@ -67,26 +72,21 @@ describe('TopPostsPanel', () => {
   });
 
   it('shows the douyin title for the douyin platform', async () => {
-    render(<TopPostsPanel platform="douyin" onBack={vi.fn()} />);
+    render(<TopPostsPanel platform="douyin" />);
 
-    expect(await screen.findByText('抖音前十爆贴')).toBeTruthy();
+    expect(screen.getByText('抖音前十爆贴')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: /查询\/刷新/ }));
+    expect(await screen.findByText('年度必吃榜第一名')).toBeTruthy();
     expect(mockGetTopPosts).toHaveBeenCalledWith('douyin');
   });
 
   it('shows the insufficient-points hint on 409', async () => {
     mockGetTopPosts.mockRejectedValue(new Error('INSUFFICIENT_POINTS'));
-    render(<TopPostsPanel platform="xiaohongshu" onBack={vi.fn()} />);
+    render(<TopPostsPanel platform="xiaohongshu" />);
+
+    fireEvent.click(screen.getByRole('button', { name: /查询\/刷新/ }));
 
     expect(await screen.findByText('积分不足，请充值')).toBeTruthy();
-  });
-
-  it('goes back to the session view', async () => {
-    const onBack = vi.fn();
-    render(<TopPostsPanel platform="xiaohongshu" onBack={onBack} />);
-
-    fireEvent.click(screen.getByRole('button', { name: /返回会话/ }));
-
-    expect(onBack).toHaveBeenCalledTimes(1);
   });
 
   it('renders the degraded hot-kol fallback when posts are unavailable', async () => {
@@ -108,7 +108,9 @@ describe('TopPostsPanel', () => {
         },
       ],
     });
-    render(<TopPostsPanel platform="xiaohongshu" onBack={vi.fn()} />);
+    render(<TopPostsPanel platform="xiaohongshu" />);
+
+    fireEvent.click(screen.getByRole('button', { name: /查询\/刷新/ }));
 
     expect(await screen.findByText(/爆贴数据服务暂不可用/)).toBeTruthy();
     expect(screen.getByText('美食小达人')).toBeTruthy();

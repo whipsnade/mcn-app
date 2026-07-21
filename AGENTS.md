@@ -2,6 +2,8 @@
 
 本文件面向 AI 编码代理，概述项目结构、开发命令与必须遵守的约定。详细信息以仓库内的 `README.md`、`docs/runbooks/phase-2-runtime.md` 和各模块源码为准。
 
+> **新会话预热**：开始工作前先读 `changelog/` 目录最新 2-3 篇按日期的变更日志（改了什么、为什么、遗留事项），可快速建立上下文；约定见 `changelog/README.md`。
+
 ## 项目概述
 
 KOL Insight AI：面向品牌用户的网红 KOL 与 MCN 营销效果智能筛选、分析与 BI 报告平台。

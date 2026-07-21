@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Plus, Search, MessageSquare, FileSpreadsheet, Flame, Users, Zap, Sparkles, SlidersHorizontal, BarChart3, LogOut, Star, Edit2, Check, X, Shield, Trash2, LoaderCircle } from 'lucide-react';
-import { QuickView, Session } from '../types';
+import { Plus, Search, MessageSquare, Sparkles, SlidersHorizontal, BarChart3, LogOut, Star, Edit2, Check, X, Shield, Trash2, LoaderCircle } from 'lucide-react';
+import { Session } from '../types';
 
 interface SessionListProps {
   className?: string;
@@ -11,7 +11,6 @@ interface SessionListProps {
   onToggleStar?: (id: string) => void;
   onRenameSession?: (id: string, brand: string, campaignName: string) => void;
   onDeleteSession?: (id: string) => Promise<void>;
-  onOpenQuickView?: (view: QuickView) => void;
   user?: { nickname: string; role?: 'admin' | 'user' } | null;
   onLogout?: () => void;
   points: number | null;
@@ -50,7 +49,6 @@ export default function SessionList({
   onToggleStar,
   onRenameSession,
   onDeleteSession,
-  onOpenQuickView,
   user,
   onLogout,
   points,
@@ -222,48 +220,6 @@ export default function SessionList({
             <span>重点</span>
           </button>
         </div>
-
-        {/* Quick Actions 2x2 */}
-        {onOpenQuickView && (
-          <div className="grid grid-cols-2 gap-1.5 mt-2.5">
-            <button
-              type="button"
-              onClick={() => onOpenQuickView('kol')}
-              className="flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-[11px] font-semibold text-slate-600 transition hover:border-indigo-200 hover:bg-indigo-50/40 hover:text-indigo-700 active:scale-95"
-              title="预算内达人推荐（每次刷新约 20 积分）"
-            >
-              <Users className="h-3.5 w-3.5 shrink-0 text-indigo-500" />
-              <span>达人推荐</span>
-            </button>
-            <button
-              type="button"
-              onClick={() => onOpenQuickView('evaluate')}
-              className="flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-[11px] font-semibold text-slate-600 transition hover:border-indigo-200 hover:bg-indigo-50/40 hover:text-indigo-700 active:scale-95"
-              title="达人/活动评估：上传 xlsx/csv 表格生成热度分析（免费）"
-            >
-              <FileSpreadsheet className="h-3.5 w-3.5 shrink-0 text-emerald-500" />
-              <span>活动评估</span>
-            </button>
-            <button
-              type="button"
-              onClick={() => onOpenQuickView('posts-xhs')}
-              className="flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-[11px] font-semibold text-slate-600 transition hover:border-indigo-200 hover:bg-indigo-50/40 hover:text-indigo-700 active:scale-95"
-              title="小红书前十爆贴（近 30 天，约 10~20 积分）"
-            >
-              <Flame className="h-3.5 w-3.5 shrink-0 text-rose-500" />
-              <span>小红书爆贴</span>
-            </button>
-            <button
-              type="button"
-              onClick={() => onOpenQuickView('posts-dy')}
-              className="flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-[11px] font-semibold text-slate-600 transition hover:border-indigo-200 hover:bg-indigo-50/40 hover:text-indigo-700 active:scale-95"
-              title="抖音前十爆贴（近 30 天，约 10~20 积分）"
-            >
-              <Zap className="h-3.5 w-3.5 shrink-0 text-slate-700" />
-              <span>抖音爆贴</span>
-            </button>
-          </div>
-        )}
       </div>
 
       {/* Sessions Cards Container */}

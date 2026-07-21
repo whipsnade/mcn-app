@@ -315,10 +315,47 @@ async def run_quick_feature(
                 step_id=step_id,
                 tool=tool.internal_name,
                 status="settled",
-                summary=sanitize_evidence(payload),
+                summary=sanitize_evidence(slim_quick_evidence(payload)),
             )
         )
     raise QuickCallFailedError("round_limit")
+
+
+# 列表类载荷（帖子/达人清单）逐行保留的字段：模型要把这些行整理进 finish
+# result，必须先拿到完整可解析的行；长文本字段（内容正文）对结果呈现无用，
+# 直接剔除以控制 prompt 体积。
+_SLIM_ROW_KEYS = frozenset({
+    "唯一ID", "内容ID", "平台", "站点", "标题", "发布时间", "帖子链接",
+    "互动数", "阅读数", "评论数", "收藏数", "点赞数", "转发数", "用户昵称", "用户ID",
+    "账号ID (kwUid)", "昵称", "粉丝数", "抖音粉丝数", "平均互动", "综合评分",
+    "互动率-图文笔记", "互动率-日常作品", "有效粉丝率", "爆文率",
+    "城市", "IP属地", "官方报价", "预估报价",
+    "Grow-博主类目标签", "Grow-达人类型标签",
+})
+
+
+def _slim_row(item: Any) -> Any:
+    if not isinstance(item, dict):
+        return item
+    slimmed = {key: value for key, value in item.items() if key in _SLIM_ROW_KEYS}
+    return slimmed or item
+
+
+def slim_quick_evidence(payload: Any) -> Any:
+    """把清单类载荷裁剪为结构完整的小 JSON。
+
+    sanitize_evidence 超过 6000 字符会硬截断，产出的是半个 JSON——
+    模型无法解析就只能 finish 出空结果（真实案例）。先按字段白名单
+    瘦身，再交给 sanitize_evidence 兜底脱敏。
+    """
+    if isinstance(payload, list):
+        return [_slim_row(item) for item in payload[:30]]
+    if isinstance(payload, dict):
+        return {
+            key: ([_slim_row(item) for item in value[:30]] if isinstance(value, list) else value)
+            for key, value in payload.items()
+        }
+    return payload
 
 
 __all__ = [
@@ -329,5 +366,6 @@ __all__ = [
     "QuickDecision",
     "quick_feature_tool_names",
     "run_quick_feature",
+    "slim_quick_evidence",
     "validate_feature_result",
 ]

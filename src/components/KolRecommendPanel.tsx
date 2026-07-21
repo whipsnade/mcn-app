@@ -1,4 +1,4 @@
-import { ArrowLeft } from 'lucide-react';
+import { RefreshCw } from 'lucide-react';
 import { useEffect, useState } from 'react';
 
 import type { ApiQuickKolItem } from '../api/contracts';
@@ -7,7 +7,6 @@ import { useLoadingMessage } from '../hooks/useLoadingMessage';
 import type { QuickKolSelection } from '../types';
 
 interface KolRecommendPanelProps {
-  onBack: () => void;
   onSelectKol: (kol: QuickKolSelection) => void;
 }
 
@@ -36,20 +35,29 @@ function platformBadgeClass(platform: string): string {
   return 'bg-indigo-50 text-indigo-700 border border-indigo-100';
 }
 
-export default function KolRecommendPanel({ onBack, onSelectKol }: KolRecommendPanelProps) {
+export default function KolRecommendPanel({ onSelectKol }: KolRecommendPanelProps) {
   const [budget, setBudget] = useState(50_000);
   const [items, setItems] = useState<ApiQuickKolItem[]>([]);
   const [pointsCost, setPointsCost] = useState<number | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string>();
+  // 打开 tab 不自动查询：首次查询由「查询/刷新」按钮触发，之后拖动预算条继续防抖刷新
+  const [hasQueried, setHasQueried] = useState(false);
+  const [queryNonce, setQueryNonce] = useState(0);
   const loadingMessage = useLoadingMessage(loading, [
     [0, '正在加载达人推荐…'],
     [8000, '数据服务响应较慢，请稍候…'],
     [25000, '仍在等待上游返回，请耐心稍候…'],
   ]);
 
+  const handleQuery = () => {
+    setHasQueried(true);
+    setQueryNonce(nonce => nonce + 1);
+  };
+
   // 预算滑动条 800ms 防抖刷新；过期响应经 current 标记丢弃
   useEffect(() => {
+    if (!hasQueried) return;
     let current = true;
     setLoading(true);
     const timer = window.setTimeout(() => {
@@ -72,7 +80,7 @@ export default function KolRecommendPanel({ onBack, onSelectKol }: KolRecommendP
       current = false;
       window.clearTimeout(timer);
     };
-  }, [budget]);
+  }, [budget, queryNonce, hasQueried]);
 
   return (
     <div className="flex min-h-0 flex-1 flex-col bg-slate-50">
@@ -80,11 +88,12 @@ export default function KolRecommendPanel({ onBack, onSelectKol }: KolRecommendP
         <h2 className="text-xs font-bold text-slate-800">预算内达人推荐</h2>
         <button
           type="button"
-          onClick={onBack}
-          className="flex items-center gap-1 rounded-lg px-2 py-1 text-[11px] font-bold text-indigo-600 transition hover:bg-indigo-50 active:scale-95"
+          onClick={handleQuery}
+          disabled={loading}
+          className="flex items-center gap-1 rounded-lg px-2 py-1 text-[11px] font-bold text-indigo-600 transition hover:bg-indigo-50 active:scale-95 disabled:opacity-50"
         >
-          <ArrowLeft className="h-3.5 w-3.5" />
-          返回会话
+          <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />
+          查询/刷新
         </button>
       </div>
 
@@ -110,7 +119,12 @@ export default function KolRecommendPanel({ onBack, onSelectKol }: KolRecommendP
         </div>
       </div>
 
-      {loading && items.length === 0 ? (
+      {!hasQueried ? (
+        <div className="flex flex-1 flex-col items-center justify-center gap-2 bg-slate-50 text-xs font-medium text-slate-400">
+          <RefreshCw className="h-8 w-8 text-slate-300 stroke-[1.5]" />
+          拖动设置预算后，点击右上角「查询/刷新」获取达人推荐
+        </div>
+      ) : loading && items.length === 0 ? (
         <div className="flex flex-1 items-center justify-center bg-slate-50 text-xs font-medium text-slate-400">
           {loadingMessage}
         </div>

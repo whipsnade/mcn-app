@@ -23,7 +23,7 @@ describe('EvaluatePanel', () => {
   });
 
   it('opens the upload modal on entry and rejects files over 5MB', () => {
-    render(<EvaluatePanel onBack={vi.fn()} />);
+    render(<EvaluatePanel />);
 
     expect(screen.getByText('上传数据表格')).toBeTruthy();
     const bigFile = new File([new Uint8Array(6 * 1024 * 1024)], 'big.xlsx');
@@ -34,7 +34,7 @@ describe('EvaluatePanel', () => {
   });
 
   it('rejects unsupported file extensions', () => {
-    render(<EvaluatePanel onBack={vi.fn()} />);
+    render(<EvaluatePanel />);
 
     selectFile(new File(['plain'], 'notes.txt', { type: 'text/plain' }));
 
@@ -43,7 +43,7 @@ describe('EvaluatePanel', () => {
   });
 
   it('uploads the selected file and renders the markdown analysis', async () => {
-    render(<EvaluatePanel onBack={vi.fn()} />);
+    render(<EvaluatePanel />);
 
     const file = new File(['nick,interact\n达人甲,1000'], 'campaign.csv', { type: 'text/csv' });
     selectFile(file);
@@ -60,7 +60,7 @@ describe('EvaluatePanel', () => {
 
   it('keeps the modal open and shows the error when the upload fails', async () => {
     mockPostEvaluate.mockRejectedValue(new Error('QUICK_CALL_FAILED'));
-    render(<EvaluatePanel onBack={vi.fn()} />);
+    render(<EvaluatePanel />);
 
     selectFile(new File(['a,b\n1,2'], 'campaign.csv', { type: 'text/csv' }));
     fireEvent.click(screen.getByRole('button', { name: '开始评估' }));
@@ -71,12 +71,4 @@ describe('EvaluatePanel', () => {
     expect(screen.getByText('上传数据表格')).toBeTruthy();
   });
 
-  it('goes back to the session view', () => {
-    const onBack = vi.fn();
-    render(<EvaluatePanel onBack={onBack} />);
-
-    fireEvent.click(screen.getByRole('button', { name: /返回会话/ }));
-
-    expect(onBack).toHaveBeenCalledTimes(1);
-  });
 });

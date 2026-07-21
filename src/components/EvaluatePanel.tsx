@@ -1,13 +1,9 @@
-import { ArrowLeft, FileSpreadsheet, Upload, X } from 'lucide-react';
+import { FileSpreadsheet, Upload, X } from 'lucide-react';
 import { useState } from 'react';
 
 import type { ApiQuickEvaluateResult } from '../api/contracts';
 import { postEvaluate, quickErrorMessage } from '../api/quick';
 import { MarkdownBlock } from './UniversalReport';
-
-interface EvaluatePanelProps {
-  onBack: () => void;
-}
 
 const MAX_FILE_BYTES = 5 * 1024 * 1024;
 
@@ -18,7 +14,7 @@ function validateFile(file: File): string | null {
   return null;
 }
 
-export default function EvaluatePanel({ onBack }: EvaluatePanelProps) {
+export default function EvaluatePanel() {
   const [isModalOpen, setIsModalOpen] = useState(true);
   const [file, setFile] = useState<File | null>(null);
   const [fileError, setFileError] = useState<string>();
@@ -53,16 +49,8 @@ export default function EvaluatePanel({ onBack }: EvaluatePanelProps) {
 
   return (
     <div className="flex min-h-0 flex-1 flex-col bg-slate-50">
-      <div className="flex h-12 shrink-0 items-center justify-between border-b border-slate-200 bg-white px-4">
+      <div className="flex h-12 shrink-0 items-center border-b border-slate-200 bg-white px-4">
         <h2 className="text-xs font-bold text-slate-800">达人/活动评估</h2>
-        <button
-          type="button"
-          onClick={onBack}
-          className="flex items-center gap-1 rounded-lg px-2 py-1 text-[11px] font-bold text-indigo-600 transition hover:bg-indigo-50 active:scale-95"
-        >
-          <ArrowLeft className="h-3.5 w-3.5" />
-          返回会话
-        </button>
       </div>
 
       {submitting && !result ? (

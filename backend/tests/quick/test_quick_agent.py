@@ -276,3 +276,35 @@ async def test_quick_feature_tool_names_subsets() -> None:
         "datatap.social.grow.kol.detail.v1",
         "datatap.insight.query.raw.posts.v1",
     }
+
+
+def test_slim_quick_evidence_keeps_parseable_small_rows() -> None:
+    import json
+
+    from app.quick.agent import slim_quick_evidence
+
+    payload = [
+        {
+            "唯一ID": "id-1",
+            "标题": "爆贴",
+            "内容": "很长的正文" * 500,
+            "互动数": 1000,
+            "用户昵称": "作者",
+            "发布时间": "2026-07-20",
+            "帖子链接": "https://example.com/p/1",
+        }
+    ]
+    slimmed = slim_quick_evidence(payload)
+
+    row = slimmed[0]
+    assert "内容" not in row
+    assert row["标题"] == "爆贴"
+    assert row["互动数"] == 1000
+    assert len(json.dumps(slimmed, ensure_ascii=False)) < 500
+
+
+def test_slim_quick_evidence_passes_through_non_list_payload() -> None:
+    from app.quick.agent import slim_quick_evidence
+
+    assert slim_quick_evidence({"result": "文本"}) == {"result": "文本"}
+    assert slim_quick_evidence("plain") == "plain"

@@ -58,10 +58,14 @@ describe('KolRecommendPanel', () => {
     vi.useRealTimers();
   });
 
-  it('fetches recommendations after the initial debounce and renders the list', async () => {
-    render(<KolRecommendPanel onBack={vi.fn()} onSelectKol={vi.fn()} />);
+  it('does not fetch on mount; fetches after clicking the query button', async () => {
+    render(<KolRecommendPanel onSelectKol={vi.fn()} />);
 
+    expect(screen.getByText(/点击右上角「查询\/刷新」/)).toBeTruthy();
+    await advanceDebounce();
     expect(mockGetKolRecommendations).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('button', { name: /查询\/刷新/ }));
     await advanceDebounce();
 
     expect(mockGetKolRecommendations).toHaveBeenCalledTimes(1);
@@ -75,8 +79,15 @@ describe('KolRecommendPanel', () => {
     expect(screen.getByText('上次消耗 20 积分', { exact: false })).toBeTruthy();
   });
 
-  it('debounces slider changes and refetches with the new budget', async () => {
-    render(<KolRecommendPanel onBack={vi.fn()} onSelectKol={vi.fn()} />);
+  it('debounces slider changes only after the first manual query', async () => {
+    render(<KolRecommendPanel onSelectKol={vi.fn()} />);
+
+    // 未手动查询前拖动滑动条不触发请求
+    fireEvent.change(screen.getByLabelText('单达人报价预算'), { target: { value: '200000' } });
+    await advanceDebounce();
+    expect(mockGetKolRecommendations).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('button', { name: /查询\/刷新/ }));
     await advanceDebounce();
     mockGetKolRecommendations.mockClear();
 
@@ -98,7 +109,8 @@ describe('KolRecommendPanel', () => {
 
   it('reports the selected kol when a row is clicked', async () => {
     const onSelectKol = vi.fn();
-    render(<KolRecommendPanel onBack={vi.fn()} onSelectKol={onSelectKol} />);
+    render(<KolRecommendPanel onSelectKol={onSelectKol} />);
+    fireEvent.click(screen.getByRole('button', { name: /查询\/刷新/ }));
     await advanceDebounce();
 
     fireEvent.click(screen.getByText('美食达人甲'));
@@ -112,18 +124,10 @@ describe('KolRecommendPanel', () => {
 
   it('shows a recharge hint when points are insufficient', async () => {
     mockGetKolRecommendations.mockRejectedValue(new Error('INSUFFICIENT_POINTS'));
-    render(<KolRecommendPanel onBack={vi.fn()} onSelectKol={vi.fn()} />);
+    render(<KolRecommendPanel onSelectKol={vi.fn()} />);
+    fireEvent.click(screen.getByRole('button', { name: /查询\/刷新/ }));
     await advanceDebounce();
 
     expect(screen.getByText('积分不足，请充值')).toBeTruthy();
-  });
-
-  it('goes back to the session view', async () => {
-    const onBack = vi.fn();
-    render(<KolRecommendPanel onBack={onBack} onSelectKol={vi.fn()} />);
-
-    fireEvent.click(screen.getByRole('button', { name: /返回会话/ }));
-
-    expect(onBack).toHaveBeenCalledTimes(1);
   });
 });

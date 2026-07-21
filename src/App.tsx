@@ -31,7 +31,6 @@ export default function App() {
   const [mobilePane, setMobilePane] = useState<WorkspacePane>('sessions');
   const [workspaceTab, setWorkspaceTab] = useState<WorkspaceTab>('chat');
   const [favorites, setFavorites] = useState<readonly ApiFavorite[]>([]);
-  const [quickView, setQuickView] = useState<QuickView | null>(null);
   const [selectedKol, setSelectedKol] = useState<QuickKolSelection | null>(null);
 
   const refreshWallet = useCallback(async () => {
@@ -153,18 +152,17 @@ export default function App() {
               />
               {workspaceTab === 'kol' && (
                 <KolRecommendPanel
-                  onBack={() => setWorkspaceTab('chat')}
                   onSelectKol={kol => setSelectedKol(kol)}
                 />
               )}
               {workspaceTab === 'posts-xhs' && (
-                <TopPostsPanel platform="xiaohongshu" onBack={() => setWorkspaceTab('chat')} />
+                <TopPostsPanel platform="xiaohongshu" />
               )}
               {workspaceTab === 'posts-dy' && (
-                <TopPostsPanel platform="douyin" onBack={() => setWorkspaceTab('chat')} />
+                <TopPostsPanel platform="douyin" />
               )}
               {workspaceTab === 'evaluate' && (
-                <EvaluatePanel onBack={() => setWorkspaceTab('chat')} />
+                <EvaluatePanel />
               )}
               {workspace.activeSession && workspaceTab === 'chat' && (
                 <ChatArea

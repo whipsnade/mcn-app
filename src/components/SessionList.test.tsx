@@ -200,23 +200,13 @@ describe('SessionList', () => {
     expect(onCreateSession).toHaveBeenCalledTimes(1);
   });
 
-  it('renders the 2x2 quick actions and routes each to its quick view', () => {
-    const onOpenQuickView = vi.fn();
-    renderList({ onOpenQuickView });
+  it('quick actions moved to the workspace tabs (no 2x2 grid in the list header)', () => {
+    renderList();
 
-    fireEvent.click(screen.getByRole('button', { name: '达人推荐' }));
-    expect(onOpenQuickView).toHaveBeenLastCalledWith('kol');
-
-    fireEvent.click(screen.getByRole('button', { name: '活动评估' }));
-    expect(onOpenQuickView).toHaveBeenLastCalledWith('evaluate');
-
-    fireEvent.click(screen.getByRole('button', { name: '小红书爆贴' }));
-    expect(onOpenQuickView).toHaveBeenLastCalledWith('posts-xhs');
-
-    fireEvent.click(screen.getByRole('button', { name: '抖音爆贴' }));
-    expect(onOpenQuickView).toHaveBeenLastCalledWith('posts-dy');
-
-    expect(onOpenQuickView).toHaveBeenCalledTimes(4);
+    expect(screen.queryByRole('button', { name: '达人推荐' })).toBeNull();
+    expect(screen.queryByRole('button', { name: '活动评估' })).toBeNull();
+    expect(screen.queryByRole('button', { name: '小红书爆贴' })).toBeNull();
+    expect(screen.queryByRole('button', { name: '抖音爆贴' })).toBeNull();
     // 旧的「大盘层级」占位按钮已移除
     expect(screen.queryByTitle('大盘层级')).toBeNull();
   });

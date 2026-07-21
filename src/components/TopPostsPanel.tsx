@@ -1,4 +1,4 @@
-import { ArrowLeft, TriangleAlert } from 'lucide-react';
+import { RefreshCw, TriangleAlert } from 'lucide-react';
 import { useEffect, useState } from 'react';
 
 import type { ApiQuickKolItem, ApiQuickPlatform, ApiQuickTopPost } from '../api/contracts';
@@ -8,7 +8,6 @@ import { quickPlatformLabel } from './KolRecommendPanel';
 
 interface TopPostsPanelProps {
   platform: ApiQuickPlatform;
-  onBack: () => void;
 }
 
 function formatCount(value: number | null): string {
@@ -24,20 +23,29 @@ function formatPublishTime(value: string | null): string {
   return new Date(timestamp).toLocaleDateString('zh-CN', { year: 'numeric', month: '2-digit', day: '2-digit' });
 }
 
-export default function TopPostsPanel({ platform, onBack }: TopPostsPanelProps) {
+export default function TopPostsPanel({ platform }: TopPostsPanelProps) {
   const [items, setItems] = useState<ApiQuickTopPost[]>([]);
   const [fallbackKols, setFallbackKols] = useState<ApiQuickKolItem[]>([]);
   const [degraded, setDegraded] = useState(false);
   const [pointsCost, setPointsCost] = useState<number | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string>();
+  // 打开 tab 不自动查询：由「查询/刷新」按钮触发
+  const [hasQueried, setHasQueried] = useState(false);
+  const [queryNonce, setQueryNonce] = useState(0);
   const loadingMessage = useLoadingMessage(loading, [
     [0, '正在加载爆贴榜单…'],
     [8000, '数据服务响应较慢，请稍候…'],
     [25000, '仍在等待上游返回，请耐心稍候…'],
   ]);
 
+  const handleQuery = () => {
+    setHasQueried(true);
+    setQueryNonce(nonce => nonce + 1);
+  };
+
   useEffect(() => {
+    if (!hasQueried) return;
     let current = true;
     setLoading(true);
     setError(undefined);
@@ -57,7 +65,7 @@ export default function TopPostsPanel({ platform, onBack }: TopPostsPanelProps) 
         if (current) setLoading(false);
       });
     return () => { current = false; };
-  }, [platform]);
+  }, [platform, queryNonce, hasQueried]);
 
   const title = platform === 'xiaohongshu' ? '小红书前十爆贴' : '抖音前十爆贴';
 
@@ -72,15 +80,21 @@ export default function TopPostsPanel({ platform, onBack }: TopPostsPanelProps) 
         </h2>
         <button
           type="button"
-          onClick={onBack}
-          className="flex items-center gap-1 rounded-lg px-2 py-1 text-[11px] font-bold text-indigo-600 transition hover:bg-indigo-50 active:scale-95"
+          onClick={handleQuery}
+          disabled={loading}
+          className="flex items-center gap-1 rounded-lg px-2 py-1 text-[11px] font-bold text-indigo-600 transition hover:bg-indigo-50 active:scale-95 disabled:opacity-50"
         >
-          <ArrowLeft className="h-3.5 w-3.5" />
-          返回会话
+          <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />
+          查询/刷新
         </button>
       </div>
 
-      {loading ? (
+      {!hasQueried ? (
+        <div className="flex flex-1 flex-col items-center justify-center gap-2 bg-slate-50 text-xs font-medium text-slate-400">
+          <RefreshCw className="h-8 w-8 text-slate-300 stroke-[1.5]" />
+          点击右上角「查询/刷新」获取近 7 日爆贴榜单
+        </div>
+      ) : loading ? (
         <div className="flex flex-1 items-center justify-center bg-slate-50 text-xs font-medium text-slate-400">
           {loadingMessage}
         </div>
@@ -131,7 +145,7 @@ export default function TopPostsPanel({ platform, onBack }: TopPostsPanelProps) 
         </div>
       ) : items.length === 0 ? (
         <div className="flex flex-1 items-center justify-center bg-slate-50 text-xs font-medium text-slate-400">
-          近 30 天暂无{quickPlatformLabel(platform)}爆贴数据
+          近 7 日暂无{quickPlatformLabel(platform)}爆贴数据
         </div>
       ) : (
         <div className="min-h-0 flex-1 overflow-y-auto bg-slate-50 p-4">

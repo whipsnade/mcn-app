@@ -1,0 +1,84 @@
+- generic [ref=e4]:
+  - generic [ref=e6]:
+    - generic [ref=e7]:
+      - generic [ref=e8]:
+        - generic [ref=e9]:
+          - generic [ref=e10]: A
+          - heading "KOL Insight AI" [level=1] [ref=e11]
+        - generic [ref=e12]:
+          - button "管理员控制台" [ref=e13]
+          - button "新建分析会话" [ref=e16]
+      - generic [ref=e18]:
+        - textbox "搜索会话、品牌..." [ref=e23]
+        - button "重点" [ref=e24]
+    - generic [ref=e28]:
+      - generic [ref=e29] [cursor=pointer]:
+        - generic [ref=e30]:
+          - button "选择会话 小红书博主提及咏发排档" [ref=e31]: 小红书博主提及咏发排档
+          - generic [ref=e32]:
+            - button "重命名会话" [ref=e33]
+            - button "删除会话 小红书博主提及咏发排档" [ref=e36]
+            - button "标星为重点营销项目" [ref=e40]
+            - generic [ref=e43]: 9小时前
+        - generic [ref=e44]:
+          - paragraph [ref=e45]: 社媒数据服务响应未确认，请稍后重试。
+          - generic [ref=e46]: 小红书
+      - generic [ref=e48] [cursor=pointer]:
+        - generic [ref=e49]:
+          - button "选择会话 海底捞抖音小红书口碑" [ref=e50]: 海底捞抖音小红书口碑
+          - generic [ref=e51]:
+            - button "重命名会话" [ref=e52]
+            - button "删除会话 海底捞抖音小红书口碑" [ref=e55]
+            - button "标星为重点营销项目" [ref=e59]
+            - generic [ref=e62]: 1天前
+        - generic [ref=e63]:
+          - paragraph
+          - generic [ref=e64]:
+            - generic [ref=e65]: 抖音
+            - generic [ref=e66]: 小红书
+      - generic [ref=e67] [cursor=pointer]:
+        - generic [ref=e68]:
+          - button "选择会话 海底捞" [ref=e69]: 海底捞
+          - generic [ref=e70]:
+            - button "重命名会话" [ref=e71]
+            - button "删除会话 海底捞" [ref=e74]
+            - button "标星为重点营销项目" [ref=e78]
+            - generic [ref=e81]: 2天前
+        - generic [ref=e82]:
+          - paragraph
+          - generic [ref=e83]:
+            - generic [ref=e84]: 小红书
+            - generic [ref=e85]: 抖音
+    - generic [ref=e86]:
+      - generic [ref=e87]:
+        - generic [ref=e88]:
+          - generic [ref=e89]: 手
+          - generic [ref=e90]:
+            - paragraph [ref=e91]: 手机用户_7961
+            - generic [ref=e92]: 🛡️ 系统管理员
+            - button "系统管理后台" [ref=e93]
+        - button "退出登录" [ref=e96]
+      - generic [ref=e100]:
+        - generic [ref=e101]:
+          - generic [ref=e102]: 积分额度
+          - generic [ref=e103]: 300 / 5,000 点
+        - button "充值" [ref=e104]
+      - generic [ref=e108]:
+        - generic [ref=e109]: 已用 94%
+        - generic [ref=e110]: PRO PLAN 额度充足
+  - generic [ref=e111]:
+    - tablist "会话工作区" [ref=e112]:
+      - tab "智能会话" [ref=e113]
+      - tab "已收藏 0" [ref=e116]
+      - tab "达人推荐" [ref=e119]
+      - tab "活动评估" [ref=e125]
+      - tab "小红书爆贴" [selected] [ref=e129]
+      - tab "抖音爆贴" [ref=e132]
+    - generic [ref=e155]:
+      - generic [ref=e156]:
+        - heading "小红书前十爆贴近 7 日 · 按互动数排序" [level=2] [ref=e157]
+        - button "查询/刷新" [disabled] [ref=e158]
+      - generic [ref=e164]: 仍在等待上游返回，请耐心稍候…
+  - complementary [ref=e151]:
+    - heading "智能分析报告" [level=2] [ref=e153]
+    - generic [ref=e154]: 正在生成分析报告…

@@ -105,8 +105,6 @@ export interface SessionAnalysis {
   followupError?: Record<string, unknown>;
 }
 
-export type QuickView = 'kol' | 'posts-xhs' | 'posts-dy' | 'evaluate';
-
 export interface QuickKolSelection {
   platform: string;
   kw_uid: string;
