@@ -87,3 +87,52 @@ async def test_top_posts_rejects_unsupported_platform(quick_client_factory) -> N
     client, _user, _transport = await quick_client_factory()
     response = await client.get("/api/v1/quick/top-posts", params={"platform": "weibo"})
     assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_top_posts_degrades_to_hot_kols_when_raw_posts_fails(quick_client_factory) -> None:
+    from app.mcp_gateway.transport import McpConnectionError
+
+    client, _user, transport = await quick_client_factory(balance=1000)
+    transport.results["match_best_tag"] = BEST_TAG_RESULT
+    transport.results["query_raw_posts"] = McpConnectionError("boom")
+    transport.results["kol_xiaohongshu_search"] = {
+        "KOL 列表": [
+            {
+                "账号ID (kwUid)": "xhs-1",
+                "平台": "xiaohongshu",
+                "昵称": "热门达人",
+                "粉丝数": 120000,
+                "平均互动": 3000.0,
+            }
+        ]
+    }
+
+    response = await client.get(
+        "/api/v1/quick/top-posts", params={"platform": "xiaohongshu"}
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["degraded"] is True
+    assert body["items"] == []
+    assert body["fallback_kols"][0]["nickname"] == "热门达人"
+    # 降级路径走 KOL 搜索工具的 textContentWord。
+    [search_args] = transport.called_arguments("kol_xiaohongshu_search")
+    assert search_args["request"]["textContentWord"] == "美食"
+
+
+@pytest.mark.asyncio
+async def test_top_posts_502_when_fallback_also_fails(quick_client_factory) -> None:
+    from app.mcp_gateway.transport import McpConnectionError
+
+    client, _user, transport = await quick_client_factory(balance=1000)
+    transport.results["match_best_tag"] = BEST_TAG_RESULT
+    transport.results["query_raw_posts"] = McpConnectionError("boom")
+    transport.results["kol_xiaohongshu_search"] = McpConnectionError("boom2")
+
+    response = await client.get(
+        "/api/v1/quick/top-posts", params={"platform": "xiaohongshu"}
+    )
+
+    assert response.status_code == 502

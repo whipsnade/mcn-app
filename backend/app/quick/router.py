@@ -124,14 +124,16 @@ async def kol_detail(
         )
     service = QuickService(db, transport=transport)
     try:
-        detail, posts, points = await service.kol_detail(
+        detail, posts, posts_degraded, points = await service.kol_detail(
             user, platform=platform, kw_uid=kw_uid, nickname=nickname
         )
     except InsufficientPointsError as error:
         raise insufficient(error) from error
     except QuickCallFailedError as error:
         raise call_failed(error) from error
-    return KolDetailResponse(detail=detail, posts=posts, points_cost=points)
+    return KolDetailResponse(
+        detail=detail, posts=posts, points_cost=points, posts_degraded=posts_degraded
+    )
 
 
 @router.get("/top-posts", response_model=TopPostsResponse)
@@ -148,12 +150,16 @@ async def top_posts(
         )
     service = QuickService(db, transport=transport)
     try:
-        items, points = await service.top_posts(user, platform=platform)
+        items, fallback_kols, degraded, points = await service.top_posts(
+            user, platform=platform
+        )
     except InsufficientPointsError as error:
         raise insufficient(error) from error
     except QuickCallFailedError as error:
         raise call_failed(error) from error
-    return TopPostsResponse(items=items, points_cost=points)
+    return TopPostsResponse(
+        items=items, points_cost=points, degraded=degraded, fallback_kols=fallback_kols
+    )
 
 
 @router.post("/evaluate", response_model=EvaluateResponse)

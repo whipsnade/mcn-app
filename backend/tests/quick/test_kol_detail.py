@@ -109,3 +109,23 @@ async def test_kol_detail_rejects_unknown_platform(quick_client_factory) -> None
         params={"platform": "tiktok", "kw_uid": "x", "nickname": "y"},
     )
     assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_kol_detail_posts_failure_degrades_to_detail_only(quick_client_factory) -> None:
+    from app.mcp_gateway.transport import McpConnectionError
+
+    client, _user, transport = await quick_client_factory(balance=1000)
+    transport.results["kol_detail"] = DETAIL_RESULT
+    transport.results["query_raw_posts"] = McpConnectionError("boom")
+
+    response = await client.get(
+        "/api/v1/quick/kol-detail",
+        params={"platform": "xiaohongshu", "kw_uid": "xhs-1", "nickname": "美食小达人"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["detail"]
+    assert body["posts"] == []
+    assert body["posts_degraded"] is True

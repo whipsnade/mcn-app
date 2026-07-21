@@ -19,6 +19,7 @@ from app.mcp_gateway.transport import (
     McpGatewayTimeout,
     McpProtocolError,
     McpUpstreamError,
+    McpUpstreamHttpError,
     PossiblySentTimeout,
     ServiceNotAllowedError,
 )
@@ -87,6 +88,32 @@ class ConnectTimeoutOpener:
         return None
 
 
+def _upstream_error_response(status: int) -> httpx.HTTPStatusError:
+    request = httpx.Request("POST", "https://datatap.example/mcp")
+    response = httpx.Response(status, request=request)
+    return httpx.HTTPStatusError("upstream error", request=request, response=response)
+
+
+class FlakyUpstreamSession(FakeProtocolSession):
+    """第一次调用 502、第二次成功：用于瞬时错误自动重试。"""
+
+    call_count = 0
+
+    async def call_tool(self, _name, _arguments):
+        type(self).call_count += 1
+        if type(self).call_count == 1:
+            raise _upstream_error_response(502)
+        return SimpleNamespace(structuredContent={"result": "{}"}, isError=False, content=[])
+
+
+class AlwaysUpstreamErrorSession(FakeProtocolSession):
+    call_count = 0
+
+    async def call_tool(self, _name, _arguments):
+        type(self).call_count += 1
+        raise _upstream_error_response(502)
+
+
 class GatewayTimeoutOpener:
     def __init__(self, service):
         self.service = service
@@ -151,7 +178,7 @@ async def test_all_five_services_use_fixed_https_endpoint_and_bearer_auth() -> N
         assert request.headers["authorization"] == "Bearer unit-test-token"
         assert client.follow_redirects is False
         assert client.timeout.connect is not None
-        assert client.timeout.read == 300.0
+        assert client.timeout.read == 60.0
         assert client.timeout.write is not None
         assert client.timeout.pool is not None
 
@@ -259,6 +286,45 @@ async def test_gateway_504_is_classified_as_upstream_timeout() -> None:
 
     with pytest.raises(McpGatewayTimeout):
         await transport.call_tool(DataTapService.BILIBILI, "search", {"keyword": "美妆"})
+
+
+async def test_transient_upstream_error_is_retried_once_and_succeeds() -> None:
+    @asynccontextmanager
+    async def opener(url: str, **_kwargs):
+        service = next(item for item in DataTapService if item.value in url)
+        yield service, object(), lambda: "session-1"
+
+    FlakyUpstreamSession.call_count = 0
+    transport = DataTapTransport(
+        token=SecretStr("unit-test-token"),
+        session_opener=opener,
+        session_factory=FlakyUpstreamSession,
+    )
+
+    result = await transport.call_tool(DataTapService.BILIBILI, "search", {"keyword": "美妆"})
+
+    assert FlakyUpstreamSession.call_count == 2
+    assert result.is_error is False
+    assert result.structured_content == {"result": "{}"}
+
+
+async def test_transient_upstream_error_gives_up_after_one_retry() -> None:
+    @asynccontextmanager
+    async def opener(url: str, **_kwargs):
+        service = next(item for item in DataTapService if item.value in url)
+        yield service, object(), lambda: "session-1"
+
+    AlwaysUpstreamErrorSession.call_count = 0
+    transport = DataTapTransport(
+        token=SecretStr("unit-test-token"),
+        session_opener=opener,
+        session_factory=AlwaysUpstreamErrorSession,
+    )
+
+    with pytest.raises(McpUpstreamHttpError):
+        await transport.call_tool(DataTapService.BILIBILI, "search", {"keyword": "美妆"})
+
+    assert AlwaysUpstreamErrorSession.call_count == 2
 
 
 @pytest.mark.parametrize(

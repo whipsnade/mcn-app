@@ -85,6 +85,7 @@ export default function KolDetailView({ selection, onClose }: KolDetailViewProps
 
   const detail = data?.detail ?? {};
   const posts = Array.isArray(data?.posts) ? data.posts : [];
+  const postsDegraded = data?.posts_degraded === true;
   const fans = pickNumber(detail, ['fans', 'fans_count', 'followers', 'follower_count']);
   const price = pickNumber(detail, ['price', 'quote', 'unit_price']);
   const engagementRate = pickNumber(detail, ['engagement_rate', 'interaction_rate']);
@@ -149,7 +150,11 @@ export default function KolDetailView({ selection, onClose }: KolDetailViewProps
 
             <section className="space-y-2">
               <h3 className="px-1 text-[11px] font-bold text-slate-500">最近 10 条热帖</h3>
-              {posts.length === 0 ? (
+              {postsDegraded ? (
+                <p className="rounded-lg border border-amber-200 bg-amber-50 px-2.5 py-2 text-[11px] text-amber-700">
+                  热帖数据服务暂不可用，仅展示达人详情
+                </p>
+              ) : posts.length === 0 ? (
                 <p className="rounded-lg bg-slate-50 px-2.5 py-2 text-[11px] text-slate-400">暂无热帖数据</p>
               ) : (
                 posts.map((post, index) => {

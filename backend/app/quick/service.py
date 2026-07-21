@@ -58,6 +58,10 @@ KOL_SEARCH_TOOLS = {
     "wechat": "datatap.social.grow.kol.wechat.search.v1",
 }
 
+# 五个平台的 KOL 搜索都要求 {"request": {...}} 包装；仅小红书/抖音支持
+# categoryMentionsTag，B站/微博/微信的行业过滤走 request 内的 textContentWord。
+_CATEGORY_TAG_PLATFORMS = frozenset({"xiaohongshu", "douyin"})
+
 # 社媒统计/原帖工具的 datasource 规范取值（与 AGENT_LOOP 提示词一致）。
 DATASOURCE_BY_PLATFORM = {
     "xiaohongshu": "小红书",
@@ -506,25 +510,39 @@ class QuickService:
         industries = user_industries(user)[:2]
         resolver = self._tag_resolver(user.id, "kol_recommend")
         merged: list[_KolCandidate] = []
+        failures: list[QuickCallFailedError] = []
         for platform in platforms:
-            tags: list[str] = []
-            for industry in industries:
-                tag = await resolver.resolve_mentions_tag(industry, platform)
-                if tag is not None and tag not in tags:
-                    tags.append(tag)
             request: dict[str, Any] = {"page": 1, "size": 50}
-            if tags:
-                request["categoryMentionsTag"] = tags
+            if platform in _CATEGORY_TAG_PLATFORMS:
+                tags: list[str] = []
+                for industry in industries:
+                    tag = await resolver.resolve_mentions_tag(industry, platform)
+                    if tag is not None and tag not in tags:
+                        tags.append(tag)
+                if tags:
+                    request["categoryMentionsTag"] = tags
+                else:
+                    # 标签匹配失败兜底 textContentWord（首行业词）。
+                    request["textContentWord"] = industries[0]
             else:
-                # 标签匹配失败兜底 textContentWord（首行业词）。
+                # B站/微博/微信：request 内无 categoryMentionsTag，
+                # 行业过滤直接走 textContentWord，不烧标签匹配调用。
                 request["textContentWord"] = industries[0]
-            payload = await self._call_tool(
-                user.id,
-                feature="kol_recommend",
-                internal_tool_name=KOL_SEARCH_TOOLS[platform],
-                arguments={"request": request},
-            )
+            try:
+                payload = await self._call_tool(
+                    user.id,
+                    feature="kol_recommend",
+                    internal_tool_name=KOL_SEARCH_TOOLS[platform],
+                    arguments={"request": request},
+                )
+            except QuickCallFailedError as error:
+                # 单平台失败不拖垮整体：跳过该平台，用其余平台结果出榜。
+                failures.append(error)
+                continue
             merged.extend(_normalize_kol(payload, platform))
+        if not merged and failures:
+            # 所有平台都失败（区别于"查询成功但无结果"）：按最后一次失败报错。
+            raise failures[-1]
         # 预算过滤：无报价排最后（price=null），超预算丢弃；按互动量降序取 top50。
         priced = sorted(
             (
@@ -544,7 +562,7 @@ class QuickService:
 
     async def kol_detail(
         self, user: User, *, platform: str, kw_uid: str, nickname: str
-    ) -> tuple[dict[str, Any], list[TopPostItem], int]:
+    ) -> tuple[dict[str, Any], list[TopPostItem], bool, int]:
         detail_payload = await self._call_tool(
             user.id,
             feature="kol_detail",
@@ -555,27 +573,34 @@ class QuickService:
                 "scope": ["fansAudience", "postSummaryStatistics", "priceTrend"],
             },
         )
-        posts_payload = await self._call_tool(
-            user.id,
-            feature="kol_detail",
-            internal_tool_name=RAW_POSTS_TOOL,
-            arguments={
-                "target_type": "field",
-                "field_name": "用户昵称",
-                "field_value": [nickname],
-                "datasource": [DATASOURCE_BY_PLATFORM[platform]],
-                **_last_30_days(),
-                "order_by": "互动数",
-                "size": 10,
-            },
-        )
+        try:
+            posts_payload = await self._call_tool(
+                user.id,
+                feature="kol_detail",
+                internal_tool_name=RAW_POSTS_TOOL,
+                arguments={
+                    "target_type": "field",
+                    "field_name": "用户昵称",
+                    "field_value": [nickname],
+                    "datasource": [DATASOURCE_BY_PLATFORM[platform]],
+                    **_last_30_days(),
+                    "order_by": "互动数",
+                    "size": 10,
+                },
+            )
+        except QuickCallFailedError:
+            # 热帖部分失败不拖垮详情：仅返回详情并标记降级。
+            return _extract_detail(detail_payload), [], True, self.points
         return (
             _extract_detail(detail_payload),
             _normalize_posts(posts_payload, platform)[:10],
+            False,
             self.points,
         )
 
-    async def top_posts(self, user: User, *, platform: str) -> tuple[list[TopPostItem], int]:
+    async def top_posts(
+        self, user: User, *, platform: str
+    ) -> tuple[list[TopPostItem], list[KolRecommendationItem], bool, int]:
         industries = user_industries(user)[:2]
         resolver = self._tag_resolver(user.id, "top_posts")
         tags: list[str] = []
@@ -602,13 +627,30 @@ class QuickService:
                     "anys": [industries],
                 }
             )
+        try:
+            payload = await self._call_tool(
+                user.id,
+                feature="top_posts",
+                internal_tool_name=RAW_POSTS_TOOL,
+                arguments=arguments,
+            )
+        except QuickCallFailedError:
+            # 跨网关容灾：insight-cube 原帖查询失败时，降级为 social-grow
+            # 的同行业热门达人（独立网关，故障域不同），不让用户面对 502。
+            fallback = await self._fallback_hot_kols(user, platform, industries[0])
+            return [], fallback, True, self.points
+        return _normalize_posts(payload, platform)[:10], [], False, self.points
+
+    async def _fallback_hot_kols(
+        self, user: User, platform: str, industry: str
+    ) -> list[KolRecommendationItem]:
         payload = await self._call_tool(
             user.id,
             feature="top_posts",
-            internal_tool_name=RAW_POSTS_TOOL,
-            arguments=arguments,
+            internal_tool_name=KOL_SEARCH_TOOLS[platform],
+            arguments={"request": {"page": 1, "size": 10, "textContentWord": industry}},
         )
-        return _normalize_posts(payload, platform)[:10], self.points
+        return [candidate.item for candidate in _normalize_kol(payload, platform)[:10]]
 
     async def evaluate(
         self, user: User, *, filename: str, content: bytes

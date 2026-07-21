@@ -1,7 +1,7 @@
-import { ArrowLeft } from 'lucide-react';
+import { ArrowLeft, TriangleAlert } from 'lucide-react';
 import { useEffect, useState } from 'react';
 
-import type { ApiQuickPlatform, ApiQuickTopPost } from '../api/contracts';
+import type { ApiQuickKolItem, ApiQuickPlatform, ApiQuickTopPost } from '../api/contracts';
 import { getTopPosts, quickErrorMessage } from '../api/quick';
 import { quickPlatformLabel } from './KolRecommendPanel';
 
@@ -25,6 +25,8 @@ function formatPublishTime(value: string | null): string {
 
 export default function TopPostsPanel({ platform, onBack }: TopPostsPanelProps) {
   const [items, setItems] = useState<ApiQuickTopPost[]>([]);
+  const [fallbackKols, setFallbackKols] = useState<ApiQuickKolItem[]>([]);
+  const [degraded, setDegraded] = useState(false);
   const [pointsCost, setPointsCost] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
@@ -37,6 +39,8 @@ export default function TopPostsPanel({ platform, onBack }: TopPostsPanelProps) 
       .then(result => {
         if (!current) return;
         setItems(result.items ?? []);
+        setFallbackKols(result.fallback_kols ?? []);
+        setDegraded(result.degraded === true);
         setPointsCost(typeof result.points_cost === 'number' ? result.points_cost : null);
       })
       .catch((err: unknown) => {
@@ -74,10 +78,50 @@ export default function TopPostsPanel({ platform, onBack }: TopPostsPanelProps) 
         <div className="flex flex-1 items-center justify-center bg-slate-50 text-xs font-medium text-slate-400">
           正在加载爆贴榜单…
         </div>
-      ) : error && items.length === 0 ? (
+      ) : error && items.length === 0 && fallbackKols.length === 0 ? (
         <div className="flex flex-1 flex-col items-center justify-center gap-2 bg-slate-50 text-xs font-medium text-slate-400">
           <span role="alert" className="text-rose-500">{error}</span>
           暂未获取到爆贴数据
+        </div>
+      ) : degraded && fallbackKols.length > 0 ? (
+        <div className="min-h-0 flex-1 overflow-y-auto bg-slate-50 p-4">
+          <div className="mb-3 flex items-center gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] font-medium text-amber-700">
+            <TriangleAlert className="h-3.5 w-3.5 shrink-0" />
+            爆贴数据服务暂不可用，为你展示{quickPlatformLabel(platform)}同行业热门达人
+          </div>
+          <div className="overflow-x-auto rounded-xl border border-slate-200 bg-white shadow-sm">
+            <table className="w-full border-collapse text-[11px] text-slate-600">
+              <thead>
+                <tr className="bg-slate-50/80">
+                  <th className="border-b border-slate-100 px-3 py-2 text-left font-semibold text-slate-500">达人</th>
+                  <th className="border-b border-slate-100 px-2 py-2 text-right font-semibold text-slate-500">粉丝数</th>
+                  <th className="border-b border-slate-100 px-2 py-2 text-right font-semibold text-slate-500">报价</th>
+                  <th className="border-b border-slate-100 px-2 py-2 text-right font-semibold text-slate-500">互动率</th>
+                  <th className="border-b border-slate-100 px-2 py-2 text-left font-semibold text-slate-500">城市</th>
+                </tr>
+              </thead>
+              <tbody>
+                {fallbackKols.map((kol, index) => (
+                  <tr key={`${kol.kw_uid}-${index}`} className="odd:bg-slate-50/60">
+                    <td className="max-w-[180px] truncate px-3 py-2 align-top font-medium text-slate-700">
+                      {kol.nickname || '—'}
+                      <span className="ml-1.5 rounded bg-indigo-50 px-1 py-0.2 text-[9px] font-semibold text-indigo-600">
+                        {quickPlatformLabel(kol.platform)}
+                      </span>
+                    </td>
+                    <td className="px-2 py-2 text-right align-top">{formatCount(kol.fans)}</td>
+                    <td className="px-2 py-2 text-right align-top">
+                      {kol.price !== null ? `¥${formatCount(kol.price)}` : '无报价'}
+                    </td>
+                    <td className="px-2 py-2 text-right align-top">
+                      {kol.engagement_rate !== null ? `${(kol.engagement_rate * 100).toFixed(1)}%` : '—'}
+                    </td>
+                    <td className="px-2 py-2 align-top">{kol.city || '—'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         </div>
       ) : items.length === 0 ? (
         <div className="flex flex-1 items-center justify-center bg-slate-50 text-xs font-medium text-slate-400">

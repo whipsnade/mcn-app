@@ -38,6 +38,44 @@ def test_parse_mentions_tag_accepts_json_string_and_rejects_empty() -> None:
     assert parse_mentions_tag(None) is None
 
 
+def test_parse_mentions_tag_prefers_industry_related_candidate() -> None:
+    # 真实案例：美食的首候选是啤酒，应跳到含"食品"的候选。
+    payload = {
+        "标签匹配结果列表": [
+            {
+                "关键词": "美食",
+                "标签集合": [
+                    "品类提及--酒类--酒类--啤酒",
+                    "品类提及--医疗保健--传统滋补营养品--燕窝滋补品",
+                    "品类提及--食品饮料--肉类零食--水产小食",
+                ],
+            }
+        ]
+    }
+    assert parse_mentions_tag(payload, "美食") == "品类提及--食品饮料--肉类零食--水产小食"
+
+
+def test_parse_mentions_tag_prefers_broader_tag_on_tie() -> None:
+    payload = {
+        "标签匹配结果列表": [
+            {
+                "标签集合": [
+                    "品类提及--食品饮料--肉类零食--水产小食",
+                    "品类提及--食品饮料--其他",
+                ]
+            }
+        ]
+    }
+    assert parse_mentions_tag(payload, "美食") == "品类提及--食品饮料--其他"
+
+
+def test_parse_mentions_tag_falls_back_to_first_when_no_word_hits() -> None:
+    payload = {"标签匹配结果列表": [{"标签集合": ["品类提及--酒类--酒类--啤酒"]}]}
+    assert parse_mentions_tag(payload, "美食") == "品类提及--酒类--酒类--啤酒"
+    # 未提供行业词时保持旧行为：取首个候选。
+    assert parse_mentions_tag(payload) == "品类提及--酒类--酒类--啤酒"
+
+
 class _ScriptedCaller:
     def __init__(self, payloads: list) -> None:
         self.payloads = list(payloads)

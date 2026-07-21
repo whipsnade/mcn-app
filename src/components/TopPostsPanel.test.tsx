@@ -88,4 +88,31 @@ describe('TopPostsPanel', () => {
 
     expect(onBack).toHaveBeenCalledTimes(1);
   });
+
+  it('renders the degraded hot-kol fallback when posts are unavailable', async () => {
+    mockGetTopPosts.mockResolvedValue({
+      items: [],
+      points_cost: 20,
+      degraded: true,
+      fallback_kols: [
+        {
+          platform: 'xiaohongshu',
+          kw_uid: 'xhs-1',
+          nickname: '美食小达人',
+          fans: 120000,
+          price: 8000,
+          engagement_rate: 0.05,
+          score: 88.5,
+          city: '上海市',
+          tags: [],
+        },
+      ],
+    });
+    render(<TopPostsPanel platform="xiaohongshu" onBack={vi.fn()} />);
+
+    expect(await screen.findByText(/爆贴数据服务暂不可用/)).toBeTruthy();
+    expect(screen.getByText('美食小达人')).toBeTruthy();
+    expect(screen.getByText('12.0万')).toBeTruthy();
+    expect(screen.getByText('¥8,000')).toBeTruthy();
+  });
 });

@@ -81,7 +81,7 @@ def test_real_runtime_accepts_both_credentials() -> None:
     )
     assert config.tencent_plan_model == "deepseek-v4-pro"
     assert config.datatap_mcp_token.get_secret_value() == "unit-test-mcp-key"
-    assert config.datatap_read_timeout_seconds == 300.0
+    assert config.datatap_read_timeout_seconds == 60.0
 
 
 @pytest.mark.parametrize("secret_value", [" ", "\t", "\n", " \t\n"])

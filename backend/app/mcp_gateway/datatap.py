@@ -74,7 +74,7 @@ class DataTapTransport:
         # queued call after the old 5-second window.
         queue_timeout_seconds: float = 300.0,
         connect_timeout_seconds: float = 5.0,
-        read_timeout_seconds: float = 300.0,
+        read_timeout_seconds: float = 60.0,
         write_timeout_seconds: float = 10.0,
         pool_timeout_seconds: float = 5.0,
         clock: Callable[[], float] = time.monotonic,
@@ -211,7 +211,26 @@ class DataTapTransport:
                     raise
                 raise McpProtocolError("MCP protocol operation failed") from exc
 
-        return await self._run_isolated(checked, operation)
+        return await self._run_isolated_with_retry(checked, operation)
+
+    async def _run_isolated_with_retry(
+        self, service: DataTapService, operation: Callable[[], Any]
+    ):
+        """瞬时上游错误（5xx/网关超时/连接失败）自动重试一次。
+
+        PossiblySentTimeout 不在重试之列（结果未确认，重试可能重复执行上游
+        查询）；熔断器/队列类错误立即抛出（立即重试同样会被拒绝）。
+        """
+        try:
+            return await self._run_isolated(service, operation)
+        except (
+            McpUpstreamHttpError,
+            McpGatewayTimeout,
+            McpConnectionTimeout,
+            McpConnectionError,
+        ):
+            await asyncio.sleep(0.3)
+            return await self._run_isolated(service, operation)
 
     def _require_service(self, service: DataTapService) -> DataTapService:
         if isinstance(service, str) and service in _DISABLED_SERVICES:

@@ -36,10 +36,8 @@ class Settings(BaseSettings):
     # valid structured plan, so keep this configurable but use a safe default.
     model_timeout_seconds: float = Field(default=180.0, gt=0)
     datatap_mcp_token: SecretStr
-    # DataTap may need several minutes to finish a social-data query. A read
-    # timeout is deliberately long, while connection and pool timeouts remain
-    # short in the transport.
-    datatap_read_timeout_seconds: float = Field(default=300.0, gt=0)
+    # DataTap 查询级读取超时：统计类查询通常一分钟内返回，超时按失败释放积分。
+    datatap_read_timeout_seconds: float = Field(default=60.0, gt=0)
     mcp_call_points: int = 10
     mcp_unknown_reconcile_seconds: int = Field(default=300, gt=0)
     task_lease_seconds: int = Field(default=60, gt=0)

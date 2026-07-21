@@ -69,8 +69,27 @@ def parse_best_tag(payload: JsonValue) -> str | None:
     return None
 
 
-def parse_mentions_tag(payload: JsonValue) -> str | None:
-    """从 kol_match_mentions_tag 载荷中抽取首个提及标签。"""
+# 行业词近义词表：在上游候选标签中挑选最相关者。上游首候选可能跑偏
+# （真实案例："美食"的首候选是"品类提及--酒类--酒类--啤酒"）。
+_INDUSTRY_SYNONYMS: dict[str, tuple[str, ...]] = {
+    "美食": ("美食", "食品", "餐饮", "食品饮料"),
+}
+
+
+def _tag_preference_key(tag: str, words: tuple[str, ...]) -> tuple[int, int, int]:
+    """越小越优：命中近义词的词序、标签层级（"--" 段数越少越宽）。"""
+    for index, word in enumerate(words):
+        if word and word in tag:
+            return (0, index, tag.count("--"))
+    return (1, len(words), tag.count("--"))
+
+
+def parse_mentions_tag(payload: JsonValue, industry: str = "") -> str | None:
+    """从 kol_match_mentions_tag 载荷中挑选最合适的提及标签。
+
+    优先选包含行业词或其近义词的候选（词序优先、层级宽者优先）；
+    全部不命中时退回首个候选（保持旧行为）。
+    """
     data: JsonValue = payload
     if isinstance(data, str):
         try:
@@ -82,13 +101,27 @@ def parse_mentions_tag(payload: JsonValue) -> str | None:
     rows = data.get("标签匹配结果列表")
     if not isinstance(rows, list):
         return None
+    candidates: list[str] = []
     for row in rows:
         if not isinstance(row, dict):
             continue
         tags = row.get("标签集合")
-        if isinstance(tags, list) and tags and isinstance(tags[0], str) and tags[0].strip():
-            return tags[0].strip()
-    return None
+        if not isinstance(tags, list):
+            continue
+        for tag in tags:
+            if isinstance(tag, str) and tag.strip():
+                candidates.append(tag.strip())
+    if not candidates:
+        return None
+    words = tuple(
+        dict.fromkeys((industry, *_INDUSTRY_SYNONYMS.get(industry, ())))
+    ) if industry else ()
+    if not words:
+        return candidates[0]
+    best = min(candidates, key=lambda tag: _tag_preference_key(tag, words))
+    if _tag_preference_key(best, words)[0] != 0:
+        return candidates[0]
+    return best
 
 
 class IndustryTagResolver:
@@ -134,6 +167,6 @@ class IndustryTagResolver:
             )
         except QuickCallFailedError:
             return None
-        tag = parse_mentions_tag(payload)
+        tag = parse_mentions_tag(payload, industry)
         _cache[key] = (time.monotonic() + CACHE_TTL_SECONDS, tag)
         return tag

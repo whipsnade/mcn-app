@@ -267,6 +267,7 @@ export interface ApiQuickKolDetail {
   detail: Record<string, unknown>;
   posts: Array<Record<string, unknown>>;
   points_cost: number;
+  posts_degraded?: boolean;
 }
 
 export interface ApiQuickTopPost {
@@ -284,6 +285,8 @@ export interface ApiQuickTopPost {
 export interface ApiQuickTopPosts {
   items: ApiQuickTopPost[];
   points_cost: number;
+  degraded?: boolean;
+  fallback_kols?: ApiQuickKolItem[];
 }
 
 export interface ApiQuickEvaluateResult {

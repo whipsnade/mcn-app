@@ -36,11 +36,15 @@ class KolDetailResponse(BaseModel):
     detail: dict[str, Any]
     posts: list[TopPostItem]
     points_cost: int
+    posts_degraded: bool = False
 
 
 class TopPostsResponse(BaseModel):
     items: list[TopPostItem]
     points_cost: int
+    # insight-cube 原帖查询失败时的跨网关降级：返回同行业热门达人代替。
+    degraded: bool = False
+    fallback_kols: list[KolRecommendationItem] = Field(default_factory=list)
 
 
 class EvaluateResponse(BaseModel):

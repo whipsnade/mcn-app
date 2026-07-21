@@ -185,6 +185,46 @@ async def test_kol_recommendations_defaults_to_enabled_channels(quick_client_fac
     assert response.status_code == 200
     assert transport.call_count("kol_weibo_search") == 1
     assert transport.call_count("kol_xiaohongshu_search") == 0
+    # B站/微博/微信：request 包装但无 categoryMentionsTag，行业走 textContentWord，
+    # 不做标签匹配调用。
+    [weibo_args] = transport.called_arguments("kol_weibo_search")
+    assert weibo_args == {"request": {"page": 1, "size": 50, "textContentWord": "美食"}}
+    assert transport.call_count("kol_match_mentions_tag") == 0
+
+
+@pytest.mark.asyncio
+async def test_kol_recommendations_tolerates_single_platform_failure(quick_client_factory) -> None:
+    client, _user, transport = await quick_client_factory(balance=1000)
+    transport.results["kol_match_mentions_tag"] = MENTIONS_TAG_RESULT
+    transport.results["kol_xiaohongshu_search"] = XHS_RESULT
+    transport.results["kol_douyin_search"] = McpConnectionError("boom")
+
+    response = await client.get(
+        "/api/v1/quick/kol-recommendations",
+        params={"budget": 10000, "platforms": "xiaohongshu,douyin"},
+    )
+
+    # 抖音失败不拖垮整体：仍返回小红书的达人。
+    assert response.status_code == 200
+    body = response.json()
+    assert body["items"]
+    assert {item["platform"] for item in body["items"]} == {"xiaohongshu"}
+
+
+@pytest.mark.asyncio
+async def test_kol_recommendations_all_platforms_failed_returns_502(quick_client_factory) -> None:
+    client, _user, transport = await quick_client_factory(balance=1000)
+    transport.results["kol_match_mentions_tag"] = MENTIONS_TAG_RESULT
+    transport.results["kol_xiaohongshu_search"] = McpConnectionError("boom")
+    transport.results["kol_douyin_search"] = McpConnectionError("boom")
+
+    response = await client.get(
+        "/api/v1/quick/kol-recommendations",
+        params={"budget": 10000, "platforms": "xiaohongshu,douyin"},
+    )
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "QUICK_CALL_FAILED"
 
 
 @pytest.mark.asyncio
