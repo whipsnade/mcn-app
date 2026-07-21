@@ -21,7 +21,7 @@ def test_migration_chain_has_single_head() -> None:
     config = Config(str(backend_dir / "alembic.ini"))
     config.set_main_option("script_location", str(backend_dir / "migrations"))
     heads = ScriptDirectory.from_config(config).get_heads()
-    assert heads == ["0018_user_industries_quick_calls"]
+    assert heads == ["0019_model_prompt_logs"]
 
 
 async def test_phase_two_unique_constraints() -> None:

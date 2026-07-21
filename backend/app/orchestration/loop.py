@@ -189,6 +189,12 @@ class AgentLoopContext(BaseModel):
     # brainstorm 澄清确认的参数画像（brand/category/platforms/goal 等），
     # 优先级高于从消息文本推断；空 dict 表示会话未经过澄清。
     param_profile: dict[str, Any] = Field(default_factory=dict)
+    # 用户行业画像描述（来自 users.industries 的业务视角翻译），供模型理解
+    # "用户是谁"并自主选择贴合的工具路径；空字符串表示无画像。
+    user_persona: str = ""
+    # prompt 学习日志上下文（user_id/session_id/task_id/tags）；仅用于落库，
+    # exclude=True 保证不进入发给模型的 prompt JSON。
+    log_context: dict[str, Any] = Field(default_factory=dict, exclude=True)
 
 
 class AgentDecision(BaseModel):

@@ -1,8 +1,12 @@
-"""快捷功能（2x2 按钮）的同步 MCP 调用链与评估服务。
+"""快捷功能（2x2 按钮）的同步执行护栏与业务编排。
 
 QuickCallService 串联：require_enabled → validate_input → transport.call_tool →
 validate_output → 记账（reserve→成功 settle/失败 release，reference_type=
 "quick_mcp_call"）→ 写 quick_mcp_calls 留痕 → 响应归一化（{result: str} 解析）。
+
+爆贴/达人推荐/达人详情的工具选择与参数填充由 quick/agent.py 的模型小循环
+决策；本模块只做：执行护栏、结果归一化清洗（模型 result 可能不完整）、
+预算过滤/top50 截断（纯代码排序过滤）与评估上传。
 """
 
 from __future__ import annotations
@@ -11,7 +15,7 @@ import csv
 import io
 import json
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
@@ -41,35 +45,29 @@ from app.mcp_gateway.transport import (
 from app.mcp_gateway.validation import McpValidationError, validate_input, validate_output
 from app.model.contracts import ChatMessage, ModelAdapter, StructuredModelRequest
 from app.model.prompts import EVALUATE_PROMPT
+from app.orchestration.schemas import PlannerTool
+from app.quick.agent import (
+    DATASOURCE_BY_PLATFORM,
+    KOL_SEARCH_TOOLS,
+    KolDetailFeatureResult,
+    QuickToolCaller,
+    quick_feature_tool_names,
+    run_quick_feature,
+)
+from app.quick.errors import QuickCallFailedError
 from app.quick.models import QuickMcpCall
 from app.quick.schemas import KolRecommendationItem, TopPostItem
-from app.quick.tags import IndustryTagResolver, QuickCallFailedError
 
 
-MATCH_BEST_TAG_TOOL = "datatap.insight.match.best.tag.v1"
-RAW_POSTS_TOOL = "datatap.insight.query.raw.posts.v1"
-KOL_DETAIL_TOOL = "datatap.social.grow.kol.detail.v1"
+__all__ = [
+    "DATASOURCE_BY_PLATFORM",
+    "KOL_SEARCH_TOOLS",
+    "MAX_UPLOAD_BYTES",
+    "QuickCallFailedError",
+    "QuickCallService",
+    "QuickService",
+]
 
-KOL_SEARCH_TOOLS = {
-    "xiaohongshu": "datatap.xiaohongshu.kol.search.v1",
-    "douyin": "datatap.douyin.kol.search.v1",
-    "bilibili": "datatap.social.grow.kol.bilibili.search.v1",
-    "weibo": "datatap.social.grow.kol.weibo.search.v1",
-    "wechat": "datatap.social.grow.kol.wechat.search.v1",
-}
-
-# 五个平台的 KOL 搜索都要求 {"request": {...}} 包装；仅小红书/抖音支持
-# categoryMentionsTag，B站/微博/微信的行业过滤走 request 内的 textContentWord。
-_CATEGORY_TAG_PLATFORMS = frozenset({"xiaohongshu", "douyin"})
-
-# 社媒统计/原帖工具的 datasource 规范取值（与 AGENT_LOOP 提示词一致）。
-DATASOURCE_BY_PLATFORM = {
-    "xiaohongshu": "小红书",
-    "douyin": "短视频__抖音",
-    "weibo": "微博",
-    "wechat": "微信",
-    "bilibili": "视频__哔哩哔哩",
-}
 
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024
 MAX_TABLE_CHARS = 8000
@@ -359,6 +357,7 @@ class _KolCandidate:
 
 
 def _normalize_kol(payload: JsonValue, platform: str) -> list[_KolCandidate]:
+    """KOL 原始行 → 推荐条目；platform 为缺省值，行内 平台/platform 字段优先。"""
     candidates: list[_KolCandidate] = []
     for entry in _find_rows(payload, ("KOL 列表", "达人列表", "list", "items")):
         kw_uid = _text(_first(entry, "账号ID (kwUid)", "kwUid", "kw_uid"))
@@ -379,7 +378,7 @@ def _normalize_kol(payload: JsonValue, platform: str) -> list[_KolCandidate]:
         candidates.append(
             _KolCandidate(
                 item=KolRecommendationItem(
-                    platform=platform,
+                    platform=_text(_first(entry, "平台", "platform")) or platform,
                     kw_uid=kw_uid,
                     nickname=_text(_first(entry, "昵称", "nickname")),
                     fans=int(fans) if fans is not None else None,
@@ -415,9 +414,49 @@ def _normalize_posts(payload: JsonValue, platform: str) -> list[TopPostItem]:
 
 
 def _extract_detail(payload: JsonValue) -> dict[str, Any]:
-    for entry in _find_rows(payload, ("详情列表", "达人详情列表")):
-        return entry
-    return payload if isinstance(payload, dict) else {}
+    """达人详情提取：模型可能给包装载荷（{"详情列表": [...]}）或裸详情对象。
+
+    裸详情对象本身也含 dict 列表字段（如价格趋势），防御性展开仅当载荷的
+    所有值都是 dict 列表（整体呈"包装"形态）时才启用，避免误拆裸对象。
+    """
+    if isinstance(payload, list):
+        return payload[0] if payload and isinstance(payload[0], dict) else {}
+    if not isinstance(payload, dict):
+        return {}
+    for key in ("详情列表", "达人详情列表"):
+        value = payload.get(key)
+        if isinstance(value, list) and value and isinstance(value[0], dict):
+            return value[0]
+    if payload and all(
+        isinstance(value, list)
+        and value
+        and all(isinstance(entry, dict) for entry in value)
+        for value in payload.values()
+    ):
+        return next(iter(payload.values()))[0]
+    return payload
+
+
+def apply_budget_filter(
+    candidates: list[_KolCandidate], budget: int
+) -> list[KolRecommendationItem]:
+    """预算过滤与排序（端点层纯代码）：超预算丢弃，无报价排最后，按互动量
+    降序取 top50。不做任何工具决策。"""
+    priced = sorted(
+        (
+            candidate
+            for candidate in candidates
+            if candidate.item.price is not None and candidate.item.price <= budget
+        ),
+        key=lambda candidate: candidate.interact,
+        reverse=True,
+    )
+    unpriced = sorted(
+        (candidate for candidate in candidates if candidate.item.price is None),
+        key=lambda candidate: candidate.interact,
+        reverse=True,
+    )
+    return [candidate.item for candidate in (priced + unpriced)[:50]]
 
 
 class EvaluateDocument(BaseModel):
@@ -476,6 +515,11 @@ class QuickService:
             self._calls_service = QuickCallService(self.db, self.transport)
         return self._calls_service
 
+    def _require_model(self) -> ModelAdapter:
+        if self.model is None:
+            raise QuickCallFailedError("model_unavailable")
+        return self.model
+
     async def _call_tool(
         self,
         user_id: str,
@@ -493,7 +537,7 @@ class QuickService:
         self.points += MCP_COST
         return payload
 
-    def _tag_resolver(self, user_id: str, feature: str) -> IndustryTagResolver:
+    def _caller(self, user_id: str, feature: str) -> QuickToolCaller:
         async def call(internal_tool_name: str, arguments: dict[str, Any]) -> JsonValue:
             return await self._call_tool(
                 user_id,
@@ -502,163 +546,118 @@ class QuickService:
                 arguments=arguments,
             )
 
-        return IndustryTagResolver(call)
+        return call
+
+    async def _feature_tools(
+        self, feature: str, platforms: tuple[str, ...]
+    ) -> tuple[PlannerTool, ...]:
+        if self.transport is None:
+            raise QuickCallFailedError("transport_unavailable")
+        registry = ToolRegistryService(self.db, self.transport)
+        enabled = await registry.list_enabled()
+        wanted = set(quick_feature_tool_names(feature, platforms))
+        return tuple(
+            PlannerTool.from_approved(item) for item in enabled if item.internal_name in wanted
+        )
+
+    async def _run_feature(
+        self,
+        user: User,
+        *,
+        feature: str,
+        goal: str,
+        scenario: dict[str, Any],
+        platforms: tuple[str, ...],
+        tags: list[str],
+        period_days: int = 29,
+    ) -> Any:
+        industries = user_industries(user)
+        tools = await self._feature_tools(feature, platforms)
+        return await run_quick_feature(
+            db=self.db,
+            model=self._require_model(),
+            call=self._caller(user.id, feature),
+            tools=tools,
+            user_id=user.id,
+            feature=feature,
+            goal=goal,
+            scenario=scenario,
+            industries=industries,
+            tags=tags,
+            period_days=period_days,
+        )
+
+    async def top_posts(self, user: User, *, platform: str) -> tuple[list[TopPostItem], int]:
+        industries = user_industries(user)
+        rows = await self._run_feature(
+            user,
+            feature="top_posts",
+            goal=(
+                f"获取最近7日（7日热榜）「{platform}」平台「{industries[0]}」行业"
+                "互动数最高的10条帖子（按互动数倒序）"
+            ),
+            scenario={"platform": platform, "datasource": DATASOURCE_BY_PLATFORM[platform]},
+            platforms=(platform,),
+            tags=["quick:top_posts", f"industry:{industries[0]}", f"platform:{platform}"],
+            period_days=6,
+        )
+        return _normalize_posts(rows, platform)[:10], self.points
 
     async def kol_recommendations(
         self, user: User, *, budget: int, platforms: list[str]
     ) -> tuple[list[KolRecommendationItem], int]:
-        industries = user_industries(user)[:2]
-        resolver = self._tag_resolver(user.id, "kol_recommend")
-        merged: list[_KolCandidate] = []
-        failures: list[QuickCallFailedError] = []
-        for platform in platforms:
-            request: dict[str, Any] = {"page": 1, "size": 50}
-            if platform in _CATEGORY_TAG_PLATFORMS:
-                tags: list[str] = []
-                for industry in industries:
-                    tag = await resolver.resolve_mentions_tag(industry, platform)
-                    if tag is not None and tag not in tags:
-                        tags.append(tag)
-                if tags:
-                    request["categoryMentionsTag"] = tags
-                else:
-                    # 标签匹配失败兜底 textContentWord（首行业词）。
-                    request["textContentWord"] = industries[0]
-            else:
-                # B站/微博/微信：request 内无 categoryMentionsTag，
-                # 行业过滤直接走 textContentWord，不烧标签匹配调用。
-                request["textContentWord"] = industries[0]
-            try:
-                payload = await self._call_tool(
-                    user.id,
-                    feature="kol_recommend",
-                    internal_tool_name=KOL_SEARCH_TOOLS[platform],
-                    arguments={"request": request},
-                )
-            except QuickCallFailedError as error:
-                # 单平台失败不拖垮整体：跳过该平台，用其余平台结果出榜。
-                failures.append(error)
-                continue
-            merged.extend(_normalize_kol(payload, platform))
-        if not merged and failures:
-            # 所有平台都失败（区别于"查询成功但无结果"）：按最后一次失败报错。
-            raise failures[-1]
-        # 预算过滤：无报价排最后（price=null），超预算丢弃；按互动量降序取 top50。
-        priced = sorted(
-            (
-                candidate
-                for candidate in merged
-                if candidate.item.price is not None and candidate.item.price <= budget
+        industries = user_industries(user)
+        rows = await self._run_feature(
+            user,
+            feature="kol_recommend",
+            goal=(
+                f"检索「{'、'.join(platforms)}」平台「{industries[0]}」行业的"
+                "达人候选（每平台至多50条，保留报价与平台字段）"
             ),
-            key=lambda candidate: candidate.interact,
-            reverse=True,
+            scenario={"platforms": platforms, "budget": budget},
+            platforms=tuple(platforms),
+            tags=(
+                ["quick:kol_recommend", f"industry:{industries[0]}"]
+                + [f"platform:{platform}" for platform in platforms]
+            ),
         )
-        unpriced = sorted(
-            (candidate for candidate in merged if candidate.item.price is None),
-            key=lambda candidate: candidate.interact,
-            reverse=True,
-        )
-        return [candidate.item for candidate in (priced + unpriced)[:50]], self.points
+        merged = _normalize_kol(rows, platforms[0] if platforms else "")
+        return apply_budget_filter(merged, budget), self.points
 
     async def kol_detail(
         self, user: User, *, platform: str, kw_uid: str, nickname: str
     ) -> tuple[dict[str, Any], list[TopPostItem], bool, int]:
-        detail_payload = await self._call_tool(
-            user.id,
+        industries = user_industries(user)
+        result: KolDetailFeatureResult = await self._run_feature(
+            user,
             feature="kol_detail",
-            internal_tool_name=KOL_DETAIL_TOOL,
-            arguments={
+            goal=(
+                f"获取「{platform}」平台达人「{nickname}」（kw_uid={kw_uid}）的详情"
+                "（fansAudience/postSummaryStatistics/priceTrend）"
+                "与其近30天互动最高的10条帖子"
+            ),
+            scenario={
                 "platform": platform,
-                "kwUidList": [kw_uid],
-                "scope": ["fansAudience", "postSummaryStatistics", "priceTrend"],
+                "kw_uid": kw_uid,
+                "nickname": nickname,
+                "datasource": DATASOURCE_BY_PLATFORM[platform],
             },
+            platforms=(platform,),
+            tags=["quick:kol_detail", f"industry:{industries[0]}", f"platform:{platform}"],
         )
-        try:
-            posts_payload = await self._call_tool(
-                user.id,
-                feature="kol_detail",
-                internal_tool_name=RAW_POSTS_TOOL,
-                arguments={
-                    "target_type": "field",
-                    "field_name": "用户昵称",
-                    "field_value": [nickname],
-                    "datasource": [DATASOURCE_BY_PLATFORM[platform]],
-                    **_last_30_days(),
-                    "order_by": "互动数",
-                    "size": 10,
-                },
-            )
-        except QuickCallFailedError:
-            # 热帖部分失败不拖垮详情：仅返回详情并标记降级。
-            return _extract_detail(detail_payload), [], True, self.points
         return (
-            _extract_detail(detail_payload),
-            _normalize_posts(posts_payload, platform)[:10],
-            False,
+            _extract_detail(result.detail),
+            _normalize_posts(result.posts, platform)[:10],
+            result.posts_degraded,
             self.points,
         )
-
-    async def top_posts(
-        self, user: User, *, platform: str
-    ) -> tuple[list[TopPostItem], list[KolRecommendationItem], bool, int]:
-        industries = user_industries(user)[:2]
-        resolver = self._tag_resolver(user.id, "top_posts")
-        tags: list[str] = []
-        for industry in industries:
-            tag = await resolver.resolve_category_tag(industry)
-            if tag is not None and tag not in tags:
-                tags.append(tag)
-        arguments: dict[str, Any] = {
-            "datasource": [DATASOURCE_BY_PLATFORM[platform]],
-            **_last_30_days(),
-            "order_by": "互动数",
-            "size": 10,
-        }
-        if tags:
-            arguments.update(
-                {"target_type": "tag", "tag_type": "品类标签", "name": tags[0]}
-            )
-        else:
-            # 标签匹配失败兜底 keyword：首值+次值组内 OR。
-            arguments.update(
-                {
-                    "target_type": "keyword",
-                    "name": industries[0],
-                    "anys": [industries],
-                }
-            )
-        try:
-            payload = await self._call_tool(
-                user.id,
-                feature="top_posts",
-                internal_tool_name=RAW_POSTS_TOOL,
-                arguments=arguments,
-            )
-        except QuickCallFailedError:
-            # 跨网关容灾：insight-cube 原帖查询失败时，降级为 social-grow
-            # 的同行业热门达人（独立网关，故障域不同），不让用户面对 502。
-            fallback = await self._fallback_hot_kols(user, platform, industries[0])
-            return [], fallback, True, self.points
-        return _normalize_posts(payload, platform)[:10], [], False, self.points
-
-    async def _fallback_hot_kols(
-        self, user: User, platform: str, industry: str
-    ) -> list[KolRecommendationItem]:
-        payload = await self._call_tool(
-            user.id,
-            feature="top_posts",
-            internal_tool_name=KOL_SEARCH_TOOLS[platform],
-            arguments={"request": {"page": 1, "size": 10, "textContentWord": industry}},
-        )
-        return [candidate.item for candidate in _normalize_kol(payload, platform)[:10]]
 
     async def evaluate(
         self, user: User, *, filename: str, content: bytes
     ) -> EvaluateDocument:
-        if self.model is None:
-            raise QuickCallFailedError("model_unavailable")
+        industries = user_industries(user)
         table_text = render_upload_table(filename, content)
-        result = await self.model.complete_json(
+        result = await self._require_model().complete_json(
             StructuredModelRequest(
                 purpose="quick_evaluate",
                 template_name=EVALUATE_PROMPT.name,
@@ -668,7 +667,7 @@ class QuickService:
                         role="user",
                         content=json.dumps(
                             {
-                                "industries": user_industries(user),
+                                "industries": industries,
                                 "uploaded_table": table_text,
                             },
                             ensure_ascii=False,
@@ -677,12 +676,10 @@ class QuickService:
                 ),
                 output_model=EvaluateDocument,
                 max_tokens=4096,
+                log_context={
+                    "user_id": user.id,
+                    "tags": ["quick:evaluate", f"industry:{industries[0]}"],
+                },
             )
         )
         return result.value
-
-
-def _last_30_days() -> dict[str, str]:
-    today = date.today()
-    start = today - timedelta(days=29)
-    return {"start_time": start.isoformat(), "end_time": today.isoformat()}

@@ -117,11 +117,11 @@ export interface ApiBrainstormResponse {
 export interface ApiSession {
   id: string;
   title: string;
-  brand: string;
+  brand: string | null;
   campaign_name: string | null;
   status: 'draft' | 'analyzing' | 'completed' | 'archived';
   platforms: string[];
-  category: string;
+  category: string | null;
   target_audience: string;
   budget_min: string | null;
   budget_max: string | null;

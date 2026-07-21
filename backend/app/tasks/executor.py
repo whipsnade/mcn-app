@@ -233,7 +233,10 @@ class TaskExecutor:
             )
             if pending is None:
                 round_context = context.model_copy(
-                    update={"notes": (*trajectory.results, *feedback)}
+                    update={
+                        "notes": (*trajectory.results, *feedback),
+                        "log_context": {**context.log_context, "task_id": task.id},
+                    }
                 )
                 decision = await decide(round_context)
                 if decision.action == "finish":

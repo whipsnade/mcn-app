@@ -5,8 +5,6 @@ from app.billing.models import Wallet, WalletTransaction
 from app.mcp_gateway.transport import McpConnectionError
 from app.quick.models import QuickMcpCall
 
-from .conftest import MENTIONS_TAG_RESULT
-
 
 XHS_RESULT = {
     "KOL 列表": [
@@ -67,19 +65,40 @@ DY_RESULT = {
     ]
 }
 
+ALL_ROWS = XHS_RESULT["KOL 列表"] + DY_RESULT["KOL 列表"]
 
-def _prime_search(transport) -> None:
-    transport.results["kol_match_mentions_tag"] = MENTIONS_TAG_RESULT
-    transport.results["kol_xiaohongshu_search"] = XHS_RESULT
-    transport.results["kol_douyin_search"] = DY_RESULT
+
+def _search_decision(tool: str, **request_overrides) -> dict:
+    request = {"page": 1, "size": 50, "textContentWord": "美食"}
+    request.update(request_overrides)
+    return {
+        "action": "call_tool",
+        "internal_tool_name": tool,
+        "arguments": {"request": request},
+    }
+
+
+_XHS_SEARCH = "datatap.xiaohongshu.kol.search.v1"
+_DY_SEARCH = "datatap.douyin.kol.search.v1"
+
+
+def _two_platform_decisions() -> list:
+    return [
+        _search_decision(_XHS_SEARCH),
+        _search_decision(_DY_SEARCH),
+        {"action": "finish", "result": ALL_ROWS},
+    ]
 
 
 @pytest.mark.asyncio
-async def test_kol_recommendations_arguments_budget_filter_and_accounting(
+async def test_kol_recommendations_budget_filter_and_accounting(
     quick_client_factory, db_session
 ) -> None:
-    client, user, transport = await quick_client_factory(balance=1000)
-    _prime_search(transport)
+    client, user, transport, _model = await quick_client_factory(
+        balance=1000, decisions=_two_platform_decisions()
+    )
+    transport.results["kol_xiaohongshu_search"] = XHS_RESULT
+    transport.results["kol_douyin_search"] = DY_RESULT
 
     response = await client.get(
         "/api/v1/quick/kol-recommendations",
@@ -88,18 +107,7 @@ async def test_kol_recommendations_arguments_budget_filter_and_accounting(
 
     assert response.status_code == 200
     body = response.json()
-    # 标签匹配：每平台一次，mentionsTagType=2002（品类提及）。
-    mentions_args = transport.called_arguments("kol_match_mentions_tag")
-    assert len(mentions_args) == 2
-    assert {args["platform"] for args in mentions_args} == {"xiaohongshu", "douyin"}
-    assert all(args["mentionsTagType"] == 2002 for args in mentions_args)
-    assert all(args["keywords"] == ["美食"] for args in mentions_args)
-    # 搜索：categoryMentionsTag + size=50。
-    for remote in ("kol_xiaohongshu_search", "kol_douyin_search"):
-        [search_args] = transport.called_arguments(remote)
-        assert search_args["request"]["size"] == 50
-        assert search_args["request"]["categoryMentionsTag"] == ["品类提及--美食--美食其他"]
-    # 预算过滤：超预算 xhs-3 丢弃；无报价 xhs-2 排最后；其余按互动量降序。
+    # 预算过滤（端点层）：超预算 xhs-3 丢弃；无报价 xhs-2 排最后；其余按互动量降序。
     assert [item["kw_uid"] for item in body["items"]] == ["dy-1", "xhs-1", "xhs-2"]
     dy, xhs1, xhs2 = body["items"]
     assert dy["price"] == 9000.0  # 官方 45000 与预估 9000 取最低有效价
@@ -110,15 +118,15 @@ async def test_kol_recommendations_arguments_budget_filter_and_accounting(
     assert xhs1["engagement_rate"] == 0.05
     assert xhs1["score"] == 88.5
     assert xhs2["price"] is None
-    # 记账：4 次调用 × 10 积分。
-    assert body["points_cost"] == 40
+    # 记账：2 次模型选择的调用 × 10 积分。
+    assert body["points_cost"] == 20
     wallet = await db_session.get(Wallet, user.id)
-    assert wallet.balance == 960
+    assert wallet.balance == 980
     assert wallet.reserved == 0
     rows = list(
         (await db_session.scalars(select(QuickMcpCall).where(QuickMcpCall.user_id == user.id))).all()
     )
-    assert len(rows) == 4
+    assert len(rows) == 2
     assert {row.status for row in rows} == {"succeeded"}
     assert {row.feature for row in rows} == {"kol_recommend"}
     assert all(row.reserve_transaction_id and row.settlement_transaction_id for row in rows)
@@ -129,36 +137,30 @@ async def test_kol_recommendations_arguments_budget_filter_and_accounting(
             )
         ).all()
     )
-    assert len(ledger) == 8
+    assert len(ledger) == 4
     assert {tx.reference_type for tx in ledger} == {"quick_mcp_call"}
 
 
 @pytest.mark.asyncio
-async def test_kol_recommendations_reuses_cached_tags(quick_client_factory) -> None:
-    client, _user, transport = await quick_client_factory(balance=1000)
-    _prime_search(transport)
+async def test_kol_recommendations_model_may_use_mentions_tag(quick_client_factory) -> None:
+    from .conftest import MENTIONS_TAG_RESULT
 
-    first = await client.get(
-        "/api/v1/quick/kol-recommendations",
-        params={"budget": 10000, "platforms": "xiaohongshu,douyin"},
+    client, _user, transport, _model = await quick_client_factory(
+        decisions=[
+            {
+                "action": "call_tool",
+                "internal_tool_name": "datatap.social.grow.kol.match.mentions.tag.v1",
+                "arguments": {
+                    "platform": "xiaohongshu",
+                    "mentionsTagType": 2002,
+                    "keywords": ["美食"],
+                },
+            },
+            _search_decision(_XHS_SEARCH, categoryMentionsTag=["品类提及--美食--美食其他"]),
+            {"action": "finish", "result": XHS_RESULT["KOL 列表"]},
+        ]
     )
-    second = await client.get(
-        "/api/v1/quick/kol-recommendations",
-        params={"budget": 10000, "platforms": "xiaohongshu"},
-    )
-
-    assert first.status_code == 200
-    assert second.status_code == 200
-    assert transport.call_count("kol_match_mentions_tag") == 2  # 缓存生效，未重复计费
-    assert second.json()["points_cost"] == 10
-
-
-@pytest.mark.asyncio
-async def test_kol_recommendations_falls_back_to_text_content_word(
-    quick_client_factory,
-) -> None:
-    client, _user, transport = await quick_client_factory(industries=("美食", "美妆"))
-    transport.results["kol_match_mentions_tag"] = {"标签匹配结果列表": [{"标签集合": []}]}
+    transport.results["kol_match_mentions_tag"] = MENTIONS_TAG_RESULT
     transport.results["kol_xiaohongshu_search"] = XHS_RESULT
 
     response = await client.get(
@@ -167,15 +169,22 @@ async def test_kol_recommendations_falls_back_to_text_content_word(
     )
 
     assert response.status_code == 200
+    [mentions_args] = transport.called_arguments("kol_match_mentions_tag")
+    assert mentions_args["mentionsTagType"] == 2002
     [search_args] = transport.called_arguments("kol_xiaohongshu_search")
-    assert search_args["request"]["textContentWord"] == "美食"
-    assert "categoryMentionsTag" not in search_args["request"]
+    assert search_args["request"]["categoryMentionsTag"] == ["品类提及--美食--美食其他"]
+    assert response.json()["points_cost"] == 20
 
 
 @pytest.mark.asyncio
 async def test_kol_recommendations_defaults_to_enabled_channels(quick_client_factory) -> None:
-    client, _user, transport = await quick_client_factory(channels=("weibo",))
-    _prime_search(transport)
+    client, _user, transport, _model = await quick_client_factory(
+        channels=("weibo",),
+        decisions=[
+            _search_decision("datatap.social.grow.kol.weibo.search.v1"),
+            {"action": "finish", "result": []},
+        ],
+    )
     transport.results["kol_weibo_search"] = {"KOL 列表": []}
 
     response = await client.get(
@@ -185,54 +194,40 @@ async def test_kol_recommendations_defaults_to_enabled_channels(quick_client_fac
     assert response.status_code == 200
     assert transport.call_count("kol_weibo_search") == 1
     assert transport.call_count("kol_xiaohongshu_search") == 0
-    # B站/微博/微信：request 包装但无 categoryMentionsTag，行业走 textContentWord，
-    # 不做标签匹配调用。
-    [weibo_args] = transport.called_arguments("kol_weibo_search")
-    assert weibo_args == {"request": {"page": 1, "size": 50, "textContentWord": "美食"}}
-    assert transport.call_count("kol_match_mentions_tag") == 0
 
 
 @pytest.mark.asyncio
-async def test_kol_recommendations_tolerates_single_platform_failure(quick_client_factory) -> None:
-    client, _user, transport = await quick_client_factory(balance=1000)
-    transport.results["kol_match_mentions_tag"] = MENTIONS_TAG_RESULT
-    transport.results["kol_xiaohongshu_search"] = XHS_RESULT
-    transport.results["kol_douyin_search"] = McpConnectionError("boom")
+async def test_kol_recommendations_tool_failure_fed_back(quick_client_factory) -> None:
+    client, _user, transport, _model = await quick_client_factory(
+        balance=1000,
+        decisions=[
+            _search_decision(_XHS_SEARCH),
+            # 小红书失败后模型换抖音搜索，再 finish。
+            _search_decision(_DY_SEARCH),
+            {"action": "finish", "result": DY_RESULT["KOL 列表"]},
+        ],
+    )
+    transport.results["kol_xiaohongshu_search"] = McpConnectionError("boom")
+    transport.results["kol_douyin_search"] = DY_RESULT
 
     response = await client.get(
         "/api/v1/quick/kol-recommendations",
         params={"budget": 10000, "platforms": "xiaohongshu,douyin"},
     )
 
-    # 抖音失败不拖垮整体：仍返回小红书的达人。
     assert response.status_code == 200
     body = response.json()
-    assert body["items"]
-    assert {item["platform"] for item in body["items"]} == {"xiaohongshu"}
-
-
-@pytest.mark.asyncio
-async def test_kol_recommendations_all_platforms_failed_returns_502(quick_client_factory) -> None:
-    client, _user, transport = await quick_client_factory(balance=1000)
-    transport.results["kol_match_mentions_tag"] = MENTIONS_TAG_RESULT
-    transport.results["kol_xiaohongshu_search"] = McpConnectionError("boom")
-    transport.results["kol_douyin_search"] = McpConnectionError("boom")
-
-    response = await client.get(
-        "/api/v1/quick/kol-recommendations",
-        params={"budget": 10000, "platforms": "xiaohongshu,douyin"},
-    )
-
-    assert response.status_code == 502
-    assert response.json()["detail"] == "QUICK_CALL_FAILED"
+    assert {item["platform"] for item in body["items"]} == {"douyin"}
 
 
 @pytest.mark.asyncio
 async def test_kol_recommendations_insufficient_balance_returns_409(
     quick_client_factory, db_session
 ) -> None:
-    client, user, transport = await quick_client_factory(balance=5)
-    _prime_search(transport)
+    client, user, transport, _model = await quick_client_factory(
+        balance=5, decisions=[_search_decision(_XHS_SEARCH)]
+    )
+    transport.results["kol_xiaohongshu_search"] = XHS_RESULT
 
     response = await client.get(
         "/api/v1/quick/kol-recommendations",
@@ -251,11 +246,16 @@ async def test_kol_recommendations_insufficient_balance_returns_409(
 
 
 @pytest.mark.asyncio
-async def test_kol_recommendations_upstream_failure_returns_502_and_releases(
+async def test_kol_recommendations_upstream_failure_releases_reservation(
     quick_client_factory, db_session
 ) -> None:
-    client, user, transport = await quick_client_factory(balance=1000)
-    transport.results["kol_match_mentions_tag"] = MENTIONS_TAG_RESULT
+    client, user, transport, _model = await quick_client_factory(
+        balance=1000,
+        decisions=[
+            _search_decision(_XHS_SEARCH),
+            {"action": "finish", "result": []},
+        ],
+    )
     transport.results["kol_xiaohongshu_search"] = McpConnectionError("boom")
 
     response = await client.get(
@@ -263,21 +263,20 @@ async def test_kol_recommendations_upstream_failure_returns_502_and_releases(
         params={"budget": 10000, "platforms": "xiaohongshu"},
     )
 
-    assert response.status_code == 502
-    assert response.json()["detail"] == "QUICK_CALL_FAILED"
+    assert response.status_code == 200
+    assert response.json()["items"] == []
     wallet = await db_session.get(Wallet, user.id)
-    # 标签匹配已结算（10），搜索预留已释放。
-    assert wallet.balance == 990
+    # 失败调用预留已释放，余额不变。
+    assert wallet.balance == 1000
     assert wallet.reserved == 0
     rows = list(
         (await db_session.scalars(select(QuickMcpCall).where(QuickMcpCall.user_id == user.id))).all()
     )
-    by_tool = {row.internal_tool_name: row for row in rows}
-    search_row = by_tool["datatap.xiaohongshu.kol.search.v1"]
+    [search_row] = rows
+    assert search_row.internal_tool_name == _XHS_SEARCH
     assert search_row.status == "failed"
     assert search_row.error_type == "connection_error"
     assert search_row.settlement_transaction_id is not None
-    assert by_tool["datatap.social.grow.kol.match.mentions.tag.v1"].status == "succeeded"
 
 
 @pytest.mark.asyncio
@@ -290,7 +289,7 @@ async def test_kol_recommendations_requires_auth(client) -> None:
 
 @pytest.mark.asyncio
 async def test_kol_recommendations_rejects_invalid_platform(quick_client_factory) -> None:
-    client, _user, _transport = await quick_client_factory()
+    client, _user, _transport, _model = await quick_client_factory()
     response = await client.get(
         "/api/v1/quick/kol-recommendations",
         params={"budget": 10000, "platforms": "xiaohongshu,nope"},

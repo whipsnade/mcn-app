@@ -143,6 +143,12 @@ export default function AdminPanel({
   const [errorMsg, setErrorMsg] = useState('');
   const [successMsg, setSuccessMsg] = useState('');
 
+  // 行内积分快捷编辑
+  const [editingPointsUserId, setEditingPointsUserId] = useState<string | null>(null);
+  const [pointsInput, setPointsInput] = useState('');
+  const [isPointsSaving, setIsPointsSaving] = useState(false);
+  const [pointsError, setPointsError] = useState('');
+
   const loadUsers = useCallback(async (keyword: string, channel: string) => {
     setIsListLoading(true);
     setListError('');
@@ -159,6 +165,36 @@ export default function AdminPanel({
       setIsListLoading(false);
     }
   }, []);
+
+  const handleOpenPointsEdit = (acc: ApiAdminUser) => {
+    setEditingPointsUserId(acc.id);
+    setPointsInput(String(acc.points));
+    setPointsError('');
+  };
+
+  const handleSavePoints = async (acc: ApiAdminUser) => {
+    const target = parseInt(pointsInput, 10);
+    if (!Number.isFinite(target) || target < 0 || target > 50000) {
+      setPointsError('积分须在 0 到 50,000 之间');
+      return;
+    }
+    const delta = target - acc.points;
+    if (delta === 0) {
+      setEditingPointsUserId(null);
+      return;
+    }
+    setIsPointsSaving(true);
+    setPointsError('');
+    try {
+      await adjustAdminUserPoints(acc.id, delta, '管理后台快捷调整', crypto.randomUUID());
+      setEditingPointsUserId(null);
+      await loadUsers(searchQuery.trim(), selectedFilterChannel);
+    } catch (err) {
+      setPointsError(getErrorMessage(err, '积分调整失败'));
+    } finally {
+      setIsPointsSaving(false);
+    }
+  };
 
   // 打开面板 / 搜索词（300ms 防抖）/ 渠道筛选变化时重新拉取列表
   useEffect(() => {
@@ -525,10 +561,69 @@ export default function AdminPanel({
                               <Smartphone className="h-3 w-3 text-slate-400" />
                               {acc.phone ?? '未绑定手机'}
                             </span>
-                            <span className="flex items-center gap-1 font-semibold text-slate-700">
-                              <Coins className="h-3 w-3 text-amber-500" />
-                              积分: {acc.points.toLocaleString()}
-                            </span>
+                            {editingPointsUserId === acc.id ? (
+                              <span className="flex flex-wrap items-center gap-1">
+                                <Coins className="h-3 w-3 text-amber-500" />
+                                <input
+                                  type="number"
+                                  min={0}
+                                  max={50000}
+                                  value={pointsInput}
+                                  autoFocus
+                                  onChange={e => setPointsInput(e.target.value)}
+                                  onKeyDown={e => {
+                                    if (e.key === 'Enter') void handleSavePoints(acc);
+                                    if (e.key === 'Escape') setEditingPointsUserId(null);
+                                  }}
+                                  className="w-20 rounded border border-indigo-300 bg-white px-1.5 py-0.5 font-mono text-[10.5px] font-bold text-slate-700 outline-none focus:border-indigo-500"
+                                  aria-label="新的积分余额"
+                                />
+                                {[100, 500, 1000].map(step => (
+                                  <button
+                                    key={step}
+                                    type="button"
+                                    onClick={() =>
+                                      setPointsInput(prev =>
+                                        String(Math.max(0, (parseInt(prev, 10) || 0) + step))
+                                      )
+                                    }
+                                    className="rounded border border-slate-200 bg-white px-1 py-0.5 text-[9px] font-bold text-slate-500 transition hover:bg-slate-50"
+                                  >
+                                    +{step}
+                                  </button>
+                                ))}
+                                <button
+                                  type="button"
+                                  disabled={isPointsSaving}
+                                  onClick={() => void handleSavePoints(acc)}
+                                  title="确认调整"
+                                  className="rounded p-0.5 text-emerald-600 transition hover:bg-emerald-50 disabled:opacity-40"
+                                >
+                                  <Check className="h-3.5 w-3.5" />
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => setEditingPointsUserId(null)}
+                                  title="取消"
+                                  className="rounded p-0.5 text-slate-400 transition hover:bg-slate-100 hover:text-slate-600"
+                                >
+                                  <X className="h-3.5 w-3.5" />
+                                </button>
+                                {pointsError && (
+                                  <span className="w-full text-[9px] font-medium text-rose-500">{pointsError}</span>
+                                )}
+                              </span>
+                            ) : (
+                              <button
+                                type="button"
+                                onClick={() => handleOpenPointsEdit(acc)}
+                                title="点击修改积分"
+                                className="-mx-1 flex items-center gap-1 rounded px-1 font-semibold text-slate-700 transition hover:bg-amber-50 hover:text-amber-700"
+                              >
+                                <Coins className="h-3 w-3 text-amber-500" />
+                                积分: {acc.points.toLocaleString()}
+                              </button>
+                            )}
                           </div>
 
                           {/* Channel Permits */}

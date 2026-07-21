@@ -12,13 +12,15 @@ from sqlalchemy import func, select
 
 from app.core.config import get_settings
 from app.db.session import SessionFactory
-from app.identity.models import UserChannelPermission
+from app.identity.models import User, UserChannelPermission
 from app.mcp_gateway.datatap import DataTapTransport
 from app.mcp_gateway.contracts import DataTapService
 from app.mcp_gateway.registry import ToolRegistryService
 from app.mcp_gateway.service import McpGatewayService
 from app.model.dependencies import get_model_adapter
 from app.model.contracts import ChatMessage, StreamingModelRequest, StructuredModelRequest
+from app.model.exemplars import find_success_exemplars
+from app.model.persona import describe_user_persona
 from app.model.prompts import (
     AGENT_LOOP_PROMPT,
     REPORT_WRITER_PROMPT,
@@ -44,6 +46,15 @@ from app.workspace.service import WorkspaceService
 
 class SummaryRecoveryMismatch(RuntimeError):
     """恢复流无法证明与已持久化草稿属于同一输出。"""
+
+
+def agent_loop_tags(context: AgentLoopContext) -> list[str]:
+    """agent_loop 日志/案例标签：平台 + 澄清画像行业。"""
+    tags = [f"platform:{channel}" for channel in context.allowed_channels]
+    category = context.param_profile.get("category")
+    if isinstance(category, str) and category.strip():
+        tags.append(f"industry:{category.strip()}")
+    return tags
 
 
 def param_profile_period_override(profile: dict[str, Any]) -> dict[str, Any] | None:
@@ -165,6 +176,7 @@ class _TaskArtifacts:
         """agent 任务产物：report_writer 基于已结算证据撰写版本化自由报告。"""
         async with SessionFactory() as db:
             writer_input = await AnalysisReportService(db).writer_input(task_id)
+            task = await db.get(AnalysisTask, task_id)
         result = await self._model.complete_json(
             StructuredModelRequest(
                 purpose="report_writer",
@@ -183,6 +195,12 @@ class _TaskArtifacts:
                 ),
                 output_model=ReportDocument,
                 max_tokens=8192,
+                log_context={
+                    "user_id": task.user_id if task is not None else None,
+                    "session_id": task.session_id if task is not None else None,
+                    "task_id": task_id,
+                    "tags": ["report_writer"],
+                },
             )
         )
         async with SessionFactory.begin() as db:
@@ -209,10 +227,20 @@ class _TaskArtifacts:
                 "conclusion": report.conclusion_text or "",
             }
             existing = await self._existing_summary_message(db, task)
-        await self._stream_summary(task_id, summary_input, existing)
+            log_context = {
+                "user_id": task.user_id,
+                "session_id": task.session_id,
+                "task_id": task_id,
+                "tags": ["summary"],
+            }
+        await self._stream_summary(task_id, summary_input, existing, log_context)
 
     async def _stream_summary(
-        self, task_id: str, summary_input: dict, existing: Message | None
+        self,
+        task_id: str,
+        summary_input: dict,
+        existing: Message | None,
+        log_context: dict[str, Any],
     ) -> None:
         """逐段提交草稿与事件；客户端断开后执行器仍会完成该过程。"""
         if existing is not None and existing.metadata_json.get("status") == "completed":
@@ -228,7 +256,8 @@ class _TaskArtifacts:
                         role="user",
                         content=json.dumps(summary_input, ensure_ascii=False, sort_keys=True),
                     ),
-                )
+                ),
+                log_context=log_context,
             )
         ):
             if event.type != "text.delta" or not event.text:
@@ -353,6 +382,7 @@ class TaskExecutionDependencies:
             workspace = await workspace_service.get_owned_session(user_id, session_id)
             messages = await workspace_service.list_messages(user_id, session_id)
             tools = await ToolRegistryService(db, self._transport).list_enabled()
+            user = await db.get(User, user_id)
         approved_channels = set(await _Permissions().list_enabled_channels(user_id))
         selected_channels = tuple(
             platform for platform in workspace.platforms if platform in approved_channels
@@ -368,7 +398,7 @@ class TaskExecutionDependencies:
         period_override = param_profile_period_override(param_profile)
         if period_override is not None:
             requested_period = period_override
-        return AgentLoopContext(
+        context = AgentLoopContext(
             recent_messages=recent_messages,
             tools=tuple(PlannerTool.from_approved(item) for item in tools),
             allowed_channels=effective_channels,
@@ -376,9 +406,23 @@ class TaskExecutionDependencies:
             current_date=date.today().isoformat(),
             requested_period=requested_period,
             param_profile=param_profile,
+            user_persona=describe_user_persona(
+                list(user.industries) if user is not None and user.industries else []
+            ),
         )
+        context.log_context = {
+            "user_id": user_id,
+            "session_id": session_id,
+            "tags": agent_loop_tags(context),
+        }
+        return context
 
     async def agent_decide(self, context: AgentLoopContext) -> AgentDecision:
+        tags = [str(tag) for tag in context.log_context.get("tags") or ()]
+        async with SessionFactory() as db:
+            exemplars = await find_success_exemplars(db, purpose="agent_loop", tags=tags)
+        payload = context.model_dump(mode="json")
+        payload["exemplars"] = exemplars
         result = await self._model.complete_json(
             StructuredModelRequest(
                 purpose="agent_loop",
@@ -388,7 +432,7 @@ class TaskExecutionDependencies:
                     ChatMessage(
                         role="user",
                         content=json.dumps(
-                            context.model_dump(mode="json"),
+                            payload,
                             ensure_ascii=False,
                             sort_keys=True,
                             separators=(",", ":"),
@@ -397,6 +441,7 @@ class TaskExecutionDependencies:
                 ),
                 output_model=AgentDecision,
                 max_tokens=4096,
+                log_context=context.log_context or None,
             )
         )
         return result.value
@@ -459,6 +504,7 @@ async def refresh_approved_datatap_tools() -> None:
         for service in (
             DataTapService.INSIGHT_CUBE,
             DataTapService.SOCIAL_GROW,
+            DataTapService.SOCIAL_GROW_CONTENT,
             DataTapService.BILIBILI,
         ):
             try:

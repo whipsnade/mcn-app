@@ -43,6 +43,30 @@ describe('toSession', () => {
     expect('mcn' in session).toBe(false);
   });
 
+  it('tolerates null brand/category from blank sessions', () => {
+    const session = toSession({
+      id: 's-blank',
+      title: '新会话1',
+      brand: null,
+      campaign_name: null,
+      status: 'draft',
+      platforms: [],
+      category: null,
+      target_audience: '',
+      budget_min: null,
+      budget_max: null,
+      filters: {},
+      is_starred: false,
+      messages: [],
+      created_at: '2026-07-21T10:00:00Z',
+      updated_at: '2026-07-21T10:00:00Z',
+    });
+
+    expect(session.brand).toBe('');
+    expect(session.category).toBe('');
+    expect(session.platform).toBe('');
+  });
+
   it('exposes the latest analysis report only when it belongs to the latest task', () => {
     const base = {
       id: 's-2', title: '示例品牌-夏季选人', brand: '示例品牌', campaign_name: '夏季选人',

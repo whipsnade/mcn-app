@@ -1,14 +1,19 @@
 from typing import Annotated
 
+from functools import lru_cache
+
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.billing.service import InsufficientPointsError
+from app.core.config import get_settings
 from app.core.errors import ErrorCode
 from app.db.session import get_db
 from app.identity.dependencies import CurrentUser
 from app.identity.models import User, UserChannelPermission
+from app.mcp_gateway.datatap import DataTapTransport
+from app.mcp_gateway.transport import McpTransport
 from app.model.contracts import ModelAdapter, ModelAdapterError
 from app.model.dependencies import get_model_adapter
 from app.quick.schemas import (
@@ -24,16 +29,25 @@ from app.quick.service import (
     QuickCallFailedError,
     QuickService,
 )
-from app.tasks.dependencies import get_mcp_transport
-from app.mcp_gateway.transport import McpTransport
 
 
 router = APIRouter()
 
 
+@lru_cache
+def _quick_mcp_transport() -> McpTransport:
+    """快捷功能专用传输层：30s 读取超时（快速失败），独立的熔断器与并发
+    状态，与任务运行时的 60s 传输层互不污染。"""
+    settings = get_settings()
+    return DataTapTransport(
+        token=settings.datatap_mcp_token,
+        read_timeout_seconds=30.0,
+    )
+
+
 def quick_transport() -> McpTransport:
-    """间接引用便于测试替换传输层；真实传输沿用进程级缓存。"""
-    return get_mcp_transport()
+    """间接引用便于测试替换传输层；真实传输为快捷专用实例。"""
+    return _quick_mcp_transport()
 
 
 def quick_model() -> ModelAdapter:
@@ -92,11 +106,12 @@ async def kol_recommendations(
     user: CurrentUser,
     db: Annotated[AsyncSession, Depends(get_db)],
     transport: Annotated[McpTransport, Depends(quick_transport)],
+    model: Annotated[ModelAdapter, Depends(quick_model)],
     budget: Annotated[int, Query(ge=10000, le=500000)],
     platforms: Annotated[str | None, Query()] = None,
 ) -> KolRecommendationsResponse:
     selected = _parse_platforms(platforms) or await _default_platforms(db, user)
-    service = QuickService(db, transport=transport)
+    service = QuickService(db, transport=transport, model=model)
     try:
         items, points = await service.kol_recommendations(
             user, budget=budget, platforms=selected
@@ -113,6 +128,7 @@ async def kol_detail(
     user: CurrentUser,
     db: Annotated[AsyncSession, Depends(get_db)],
     transport: Annotated[McpTransport, Depends(quick_transport)],
+    model: Annotated[ModelAdapter, Depends(quick_model)],
     platform: Annotated[str, Query()],
     kw_uid: Annotated[str, Query(min_length=1, max_length=128)],
     nickname: Annotated[str, Query(min_length=1, max_length=200)],
@@ -122,7 +138,7 @@ async def kol_detail(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=ErrorCode.VALIDATION_ERROR,
         )
-    service = QuickService(db, transport=transport)
+    service = QuickService(db, transport=transport, model=model)
     try:
         detail, posts, posts_degraded, points = await service.kol_detail(
             user, platform=platform, kw_uid=kw_uid, nickname=nickname
@@ -141,6 +157,7 @@ async def top_posts(
     user: CurrentUser,
     db: Annotated[AsyncSession, Depends(get_db)],
     transport: Annotated[McpTransport, Depends(quick_transport)],
+    model: Annotated[ModelAdapter, Depends(quick_model)],
     platform: Annotated[str, Query()],
 ) -> TopPostsResponse:
     if platform not in ("xiaohongshu", "douyin"):
@@ -148,18 +165,15 @@ async def top_posts(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=ErrorCode.VALIDATION_ERROR,
         )
-    service = QuickService(db, transport=transport)
+    service = QuickService(db, transport=transport, model=model)
     try:
-        items, fallback_kols, degraded, points = await service.top_posts(
-            user, platform=platform
-        )
+        items, points = await service.top_posts(user, platform=platform)
     except InsufficientPointsError as error:
         raise insufficient(error) from error
     except QuickCallFailedError as error:
         raise call_failed(error) from error
-    return TopPostsResponse(
-        items=items, points_cost=points, degraded=degraded, fallback_kols=fallback_kols
-    )
+    # degraded/fallback_kols 字段保留契约：模型小循环下不再做跨网关降级，恒为空。
+    return TopPostsResponse(items=items, points_cost=points, degraded=False, fallback_kols=[])
 
 
 @router.post("/evaluate", response_model=EvaluateResponse)

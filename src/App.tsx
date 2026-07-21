@@ -16,10 +16,10 @@ import RechargeModal from './components/RechargeModal';
 import SessionList from './components/SessionList';
 import TopPostsPanel from './components/TopPostsPanel';
 import UniversalReport from './components/UniversalReport';
-import { WorkspaceTabs, type WorkspaceTab } from './components/WorkspaceTabs';
+import { QUICK_TAB_IDS, WorkspaceTabs, type WorkspaceTab } from './components/WorkspaceTabs';
 import { useWorkspace } from './hooks/useWorkspace';
 import { isTerminalTaskStatus } from './state/taskEvents';
-import type { QuickKolSelection, QuickView } from './types';
+import type { QuickKolSelection } from './types';
 
 
 export default function App() {
@@ -79,7 +79,7 @@ export default function App() {
   }, [authStatus, refreshWallet, workspace.taskRuntime?.activity, workspace.taskRuntime?.status]);
 
   const handleCreateSession = async () => {
-    setQuickView(null);
+    setWorkspaceTab('chat');
     await workspace.createSession({});
     setMobilePane('chat');
   };
@@ -127,7 +127,7 @@ export default function App() {
             sessions={workspace.sessions}
             activeSessionId={workspace.activeSessionId ?? ''}
             onSelectSession={id => {
-              setQuickView(null);
+              setWorkspaceTab('chat');
               void workspace.selectSession(id);
               setMobilePane('chat');
             }}
@@ -135,10 +135,6 @@ export default function App() {
             onToggleStar={id => void handleToggleStar(id).catch(() => undefined)}
             onRenameSession={(id, brand, campaignName) => void handleRenameSession(id, brand, campaignName).catch(() => undefined)}
             onDeleteSession={id => workspace.deleteSession(id)}
-            onOpenQuickView={view => {
-              setQuickView(view);
-              setMobilePane('chat');
-            }}
             user={user}
             onLogout={() => void logout()}
             points={points}
@@ -148,25 +144,29 @@ export default function App() {
         </div>
 
         <div className={`${mobilePane === 'chat' ? 'flex' : 'hidden'} h-full min-h-0 min-w-0 flex-1 flex-col xl:flex`}>
-          {quickView === 'kol' ? (
-            <KolRecommendPanel
-              onBack={() => setQuickView(null)}
-              onSelectKol={kol => setSelectedKol(kol)}
-            />
-          ) : quickView === 'posts-xhs' ? (
-            <TopPostsPanel platform="xiaohongshu" onBack={() => setQuickView(null)} />
-          ) : quickView === 'posts-dy' ? (
-            <TopPostsPanel platform="douyin" onBack={() => setQuickView(null)} />
-          ) : quickView === 'evaluate' ? (
-            <EvaluatePanel onBack={() => setQuickView(null)} />
-          ) : workspace.activeSession ? (
+          {workspace.activeSession || QUICK_TAB_IDS.includes(workspaceTab) ? (
             <>
               <WorkspaceTabs
                 active={workspaceTab}
                 onChange={setWorkspaceTab}
                 favoriteCount={favorites.length}
               />
-              {workspaceTab === 'chat' && (
+              {workspaceTab === 'kol' && (
+                <KolRecommendPanel
+                  onBack={() => setWorkspaceTab('chat')}
+                  onSelectKol={kol => setSelectedKol(kol)}
+                />
+              )}
+              {workspaceTab === 'posts-xhs' && (
+                <TopPostsPanel platform="xiaohongshu" onBack={() => setWorkspaceTab('chat')} />
+              )}
+              {workspaceTab === 'posts-dy' && (
+                <TopPostsPanel platform="douyin" onBack={() => setWorkspaceTab('chat')} />
+              )}
+              {workspaceTab === 'evaluate' && (
+                <EvaluatePanel onBack={() => setWorkspaceTab('chat')} />
+              )}
+              {workspace.activeSession && workspaceTab === 'chat' && (
                 <ChatArea
                   session={workspace.activeSession}
                   onSendMessage={async text => {

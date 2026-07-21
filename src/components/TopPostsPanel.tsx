@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react';
 
 import type { ApiQuickKolItem, ApiQuickPlatform, ApiQuickTopPost } from '../api/contracts';
 import { getTopPosts, quickErrorMessage } from '../api/quick';
+import { useLoadingMessage } from '../hooks/useLoadingMessage';
 import { quickPlatformLabel } from './KolRecommendPanel';
 
 interface TopPostsPanelProps {
@@ -30,6 +31,11 @@ export default function TopPostsPanel({ platform, onBack }: TopPostsPanelProps) 
   const [pointsCost, setPointsCost] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
+  const loadingMessage = useLoadingMessage(loading, [
+    [0, '正在加载爆贴榜单…'],
+    [8000, '数据服务响应较慢，请稍候…'],
+    [25000, '仍在等待上游返回，请耐心稍候…'],
+  ]);
 
   useEffect(() => {
     let current = true;
@@ -61,7 +67,7 @@ export default function TopPostsPanel({ platform, onBack }: TopPostsPanelProps) 
         <h2 className="text-xs font-bold text-slate-800">
           {title}
           <span className="ml-2 text-[9px] font-medium text-slate-400">
-            近 30 天 · 按互动数排序{pointsCost !== null ? ` · 消耗 ${pointsCost} 积分` : ''}
+            近 7 日 · 按互动数排序{pointsCost !== null ? ` · 消耗 ${pointsCost} 积分` : ''}
           </span>
         </h2>
         <button
@@ -76,7 +82,7 @@ export default function TopPostsPanel({ platform, onBack }: TopPostsPanelProps) 
 
       {loading ? (
         <div className="flex flex-1 items-center justify-center bg-slate-50 text-xs font-medium text-slate-400">
-          正在加载爆贴榜单…
+          {loadingMessage}
         </div>
       ) : error && items.length === 0 && fallbackKols.length === 0 ? (
         <div className="flex flex-1 flex-col items-center justify-center gap-2 bg-slate-50 text-xs font-medium text-slate-400">

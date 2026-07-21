@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react';
 
 import type { ApiQuickKolDetail } from '../api/contracts';
 import { getKolDetail, quickErrorMessage } from '../api/quick';
+import { useLoadingMessage } from '../hooks/useLoadingMessage';
 import type { QuickKolSelection } from '../types';
 import { quickPlatformLabel } from './KolRecommendPanel';
 
@@ -61,6 +62,11 @@ function postNumber(post: Record<string, unknown>, keys: string[]): number | nul
 export default function KolDetailView({ selection, onClose }: KolDetailViewProps) {
   const [data, setData] = useState<ApiQuickKolDetail | null>(null);
   const [loading, setLoading] = useState(true);
+  const loadingMessage = useLoadingMessage(loading, [
+    [0, '正在加载达人详情…'],
+    [8000, '数据服务响应较慢，请稍候…'],
+    [25000, '仍在等待上游返回，请耐心稍候…'],
+  ]);
   const [error, setError] = useState<string>();
 
   useEffect(() => {
@@ -113,7 +119,7 @@ export default function KolDetailView({ selection, onClose }: KolDetailViewProps
 
       {loading ? (
         <div className="flex flex-1 items-center justify-center bg-slate-50/40 p-8 text-center text-xs text-slate-500">
-          正在加载达人详情…
+          {loadingMessage}
         </div>
       ) : error ? (
         <div className="flex flex-1 items-center justify-center bg-slate-50/40 p-8 text-center text-xs">

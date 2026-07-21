@@ -33,11 +33,11 @@ export function toSession(source: ApiSession): Session {
   return {
     id: source.id,
     title: source.title,
-    brand: source.brand,
+    brand: source.brand ?? '',
     campaignName: source.campaign_name,
     status: source.status,
     platform: source.platforms.map(item => platformNames[item] ?? item).join(','),
-    category: source.category,
+    category: source.category ?? '',
     targetAudience: source.target_audience,
     budgetMin: source.budget_min ?? undefined,
     budgetMax: source.budget_max ?? undefined,

@@ -14,6 +14,7 @@ from app.brainstorm.schemas import (
     merge_profile,
 )
 from app.model.contracts import ChatMessage, ModelAdapter, StructuredModelRequest
+from app.model.exemplars import find_success_exemplars
 from app.model.prompts import BRAINSTORM_PROMPT
 from app.orchestration.context import compress_messages
 from app.orchestration.schemas import PlannerMessage
@@ -49,7 +50,7 @@ class BrainstormService:
         )
         messages = await workspace_service.list_messages(user_id, session_id)
         recent_messages = compress_messages(messages, max_chars=24_000)
-        output = await self._complete(profile, recent_messages)
+        output = await self._complete(profile, recent_messages, user_id, session_id)
 
         merged = merge_profile(profile, output.extracted)
         ready = bool(output.ready)
@@ -114,13 +115,24 @@ class BrainstormService:
         )
 
     async def _complete(
-        self, profile: BrainstormProfile, recent_messages: tuple[PlannerMessage, ...]
+        self,
+        profile: BrainstormProfile,
+        recent_messages: tuple[PlannerMessage, ...],
+        user_id: str,
+        session_id: str,
     ) -> BrainstormModelOutput:
+        tags = (
+            [f"industry:{profile.category.strip()}"]
+            if profile.category and profile.category.strip()
+            else []
+        )
+        exemplars = await find_success_exemplars(self.db, purpose="brainstorm", tags=tags)
         user_content = json.dumps(
             {
                 "messages": [message.model_dump(mode="json") for message in recent_messages],
                 "current_profile": profile.model_dump(mode="json"),
                 "parameter_checklist": list(BRAINSTORM_PARAMETERS),
+                "exemplars": exemplars,
             },
             ensure_ascii=False,
             sort_keys=True,
@@ -136,6 +148,11 @@ class BrainstormService:
                 ),
                 output_model=BrainstormModelOutput,
                 max_tokens=2048,
+                log_context={
+                    "user_id": user_id,
+                    "session_id": session_id,
+                    "tags": tags,
+                },
             )
         )
         return result.value

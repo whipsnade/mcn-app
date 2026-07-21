@@ -105,6 +105,33 @@ DYNAMIC_TOOL_ALLOWLIST: dict[DataTapService, dict[str, tuple[str, str, dict[str,
         "get_video_danmaku": ("datatap.bilibili.video.danmaku.v1", "B站视频弹幕数据", _PERMISSIVE_OUTPUT_SCHEMA),
         "get_precise_results": ("datatap.bilibili.precise.results.v1", "B站精确搜索结果", _PERMISSIVE_OUTPUT_SCHEMA),
     },
+    DataTapService.SOCIAL_GROW_CONTENT: {
+        "hotwords_xiaohongshu_dictionary": (
+            "datatap.content.hotwords.xiaohongshu.dictionary.v1",
+            "小红书热词参数字典：行业、可选品类与可查询日期范围。查询热词榜单前必须先查字典确定行业/品类编码与可用日期。",
+            _PERMISSIVE_OUTPUT_SCHEMA,
+        ),
+        "hotwords_xiaohongshu_list": (
+            "datatap.content.hotwords.xiaohongshu.list.v1",
+            "小红书消费热词榜单：按榜单周期（7日榜/月榜）、日期、数据范围（全部热词/品牌相关热词）查询；日期需在字典给出的范围内。",
+            _PERMISSIVE_OUTPUT_SCHEMA,
+        ),
+        "hotwords_xiaohongshu_posts": (
+            "datatap.content.hotwords.xiaohongshu.posts.v1",
+            "小红书热词关联帖子：查询热词榜单后，按热词下钻相关帖子；cycleType/date/contentBoardType/industry 等参数必须与对应热词榜查询保持一致。",
+            _PERMISSIVE_OUTPUT_SCHEMA,
+        ),
+        "topic_xiaohongshu_list": (
+            "datatap.content.topic.xiaohongshu.list.v1",
+            "小红书内容选题榜单：按内容主题（美食/母婴/旅游出行等）与内容类型查询选题列表。",
+            _PERMISSIVE_OUTPUT_SCHEMA,
+        ),
+        "topic_xiaohongshu_posts": (
+            "datatap.content.topic.xiaohongshu.posts.v1",
+            "小红书选题帖子列表：按选题ID或内容主题查询帖子明细。",
+            _PERMISSIVE_OUTPUT_SCHEMA,
+        ),
+    },
 }
 
 

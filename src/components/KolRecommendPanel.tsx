@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react';
 
 import type { ApiQuickKolItem } from '../api/contracts';
 import { getKolRecommendations, quickErrorMessage } from '../api/quick';
+import { useLoadingMessage } from '../hooks/useLoadingMessage';
 import type { QuickKolSelection } from '../types';
 
 interface KolRecommendPanelProps {
@@ -41,6 +42,11 @@ export default function KolRecommendPanel({ onBack, onSelectKol }: KolRecommendP
   const [pointsCost, setPointsCost] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string>();
+  const loadingMessage = useLoadingMessage(loading, [
+    [0, '正在加载达人推荐…'],
+    [8000, '数据服务响应较慢，请稍候…'],
+    [25000, '仍在等待上游返回，请耐心稍候…'],
+  ]);
 
   // 预算滑动条 800ms 防抖刷新；过期响应经 current 标记丢弃
   useEffect(() => {
@@ -106,7 +112,7 @@ export default function KolRecommendPanel({ onBack, onSelectKol }: KolRecommendP
 
       {loading && items.length === 0 ? (
         <div className="flex flex-1 items-center justify-center bg-slate-50 text-xs font-medium text-slate-400">
-          正在加载达人推荐…
+          {loadingMessage}
         </div>
       ) : !loading && error && items.length === 0 ? (
         <div className="flex flex-1 flex-col items-center justify-center gap-2 bg-slate-50 text-xs font-medium text-slate-400">

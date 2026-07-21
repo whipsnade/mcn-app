@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import random
+import time
 from collections.abc import Awaitable, Callable, MutableMapping
 from typing import Any
 
@@ -22,11 +24,13 @@ from app.model.contracts import (
     T,
     TokenUsage,
 )
+from app.model.prompt_logs import PromptLogEntry, PromptLogWriter
 
 
 CONFIRMED_BASE_URL = "https://tokenhub.tencentmaas.com/plan/v3"
 CONFIRMED_MODEL = "deepseek-v4-pro"
 _SCHEMA_SUPPORT_CACHE: dict[tuple[str, str, str], bool] = {}
+logger = logging.getLogger(__name__)
 _RETRYABLE_STATUS_CODES = {429, 502, 503, 504}
 _MAX_VALIDATION_ERRORS = 20
 _MAX_VALIDATION_LOC_SEGMENTS = 8
@@ -80,6 +84,24 @@ def _usage(source: Any) -> TokenUsage | None:
     )
 
 
+class _PromptLogState:
+    """单次模型调用的日志累积状态（实际发送的消息、响应文本、用量）。"""
+
+    __slots__ = ("purpose", "log_context", "started", "messages", "parts", "usage")
+
+    def __init__(self, purpose: str, log_context: dict[str, Any] | None) -> None:
+        self.purpose = purpose
+        self.log_context = log_context or {}
+        self.started = time.monotonic()
+        self.messages: list[dict[str, str]] = []
+        self.parts: list[str] = []
+        self.usage: TokenUsage | None = None
+
+    @property
+    def response_text(self) -> str:
+        return "".join(self.parts)
+
+
 class TencentPlanAdapter:
     def __init__(
         self,
@@ -92,6 +114,7 @@ class TencentPlanAdapter:
         max_attempts: int = 3,
         schema_support_cache: MutableMapping[tuple[str, str, str], bool] | None = None,
         owned_client: AsyncOpenAI | None = None,
+        log_writer: PromptLogWriter | None = None,
     ) -> None:
         self._client = client
         self.base_url = base_url
@@ -103,6 +126,8 @@ class TencentPlanAdapter:
             schema_support_cache if schema_support_cache is not None else _SCHEMA_SUPPORT_CACHE
         )
         self._owned_client = owned_client
+        # None = 使用默认写库实现（惰性导入，避免模块 import 期触碰数据库配置）。
+        self._log_writer = log_writer
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "TencentPlanAdapter":
@@ -124,6 +149,26 @@ class TencentPlanAdapter:
     async def complete_json(
         self, request: StructuredModelRequest[T]
     ) -> StructuredResult[T]:
+        log = _PromptLogState(request.purpose, request.log_context)
+        try:
+            result = await self._complete_json(request, log)
+        except ModelPlanInvalidError as exc:
+            await self._emit_log(log, status="invalid", error_code=exc.code)
+            raise
+        except ModelAdapterError as exc:
+            await self._emit_log(log, status="failed", error_code=exc.code)
+            raise
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self._emit_log(log, status="failed", error_code=type(exc).__name__)
+            raise
+        await self._emit_log(log, status="success", error_code=None, usage=result.usage)
+        return result
+
+    async def _complete_json(
+        self, request: StructuredModelRequest[T], log: _PromptLogState
+    ) -> StructuredResult[T]:
         schema = request.output_model.model_json_schema()
         digest = hashlib.sha256(
             json.dumps(schema, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
@@ -143,6 +188,7 @@ class TencentPlanAdapter:
                 ),
             }
             messages = [messages[0], schema_instruction, *messages[1:]]
+        log.messages = list(messages)
 
         for regeneration_count in range(2):
             response_format = self._response_format(request, schema, use_schema=use_schema)
@@ -164,6 +210,8 @@ class TencentPlanAdapter:
                 )
 
             content = self._completion_content(response)
+            log.parts = [content]
+            log.usage = _usage(response)
             try:
                 value = request.output_model.model_validate_json(content, strict=True)
             except ValidationError as exc:
@@ -174,6 +222,7 @@ class TencentPlanAdapter:
                         request_id=_request_id(response),
                     ) from exc
                 messages = [*messages, self._repair_message(exc)]
+                log.messages = list(messages)
                 continue
 
             return StructuredResult[T](
@@ -186,6 +235,27 @@ class TencentPlanAdapter:
         raise AssertionError("unreachable")
 
     async def stream_text(self, request: StreamingModelRequest):
+        log = _PromptLogState(request.purpose, request.log_context)
+        log.messages = [message.model_dump() for message in request.messages]
+        status, error_code = "success", None
+        cancelled = False
+        try:
+            async for event in self._stream_text(request, log):
+                yield event
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        except ModelAdapterError as exc:
+            status, error_code = "failed", exc.code
+            raise
+        except Exception as exc:
+            status, error_code = "failed", type(exc).__name__
+            raise
+        finally:
+            if not cancelled:
+                await self._emit_log(log, status=status, error_code=error_code)
+
+    async def _stream_text(self, request: StreamingModelRequest, log: _PromptLogState):
         create_attempt = 0
         while True:
             partial_output_received = False
@@ -203,6 +273,7 @@ class TencentPlanAdapter:
                     request_id = _request_id(chunk) or request_id
                     usage = _usage(chunk)
                     if usage is not None:
+                        log.usage = usage
                         yield ModelEvent(type="usage.updated", usage=usage)
                     choices = _value(chunk, "choices") or ()
                     for choice in choices:
@@ -213,6 +284,7 @@ class TencentPlanAdapter:
                         content = _value(delta, "content")
                         if content:
                             partial_output_received = True
+                            log.parts.append(str(content))
                             yield ModelEvent(type="text.delta", text=str(content))
                 if finish_reason is None:
                     raise ModelStreamInterrupted(
@@ -241,6 +313,45 @@ class TencentPlanAdapter:
                         request_id=mapped.request_id or request_id,
                     ) from exc
                 raise mapped from exc
+
+    async def _emit_log(
+        self,
+        log: _PromptLogState,
+        *,
+        status: str,
+        error_code: str | None,
+        usage: TokenUsage | None = None,
+    ) -> None:
+        """写 prompt 学习日志；任何失败只记 warning，绝不阻塞主流程。"""
+        writer = self._log_writer
+        if writer is None:
+            from app.model.prompt_logs import record_prompt_log
+
+            writer = record_prompt_log
+        effective_usage = usage or log.usage
+        context = log.log_context
+        tags = context.get("tags") or ()
+        entry = PromptLogEntry(
+            purpose=log.purpose,
+            model=self.model,
+            messages=json.dumps(log.messages, ensure_ascii=False),
+            response=log.response_text or None,
+            status=status,
+            error_code=error_code,
+            user_id=context.get("user_id"),
+            session_id=context.get("session_id"),
+            task_id=context.get("task_id"),
+            tags=tuple(str(tag) for tag in tags),
+            prompt_tokens=effective_usage.prompt_tokens if effective_usage else None,
+            completion_tokens=effective_usage.completion_tokens if effective_usage else None,
+            duration_ms=int((time.monotonic() - log.started) * 1000),
+        )
+        try:
+            await writer(entry)
+        except Exception:
+            logger.warning(
+                "model prompt log writer failed purpose=%s", log.purpose, exc_info=True
+            )
 
     async def aclose(self) -> None:
         if self._owned_client is not None:

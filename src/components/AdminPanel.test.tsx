@@ -81,6 +81,46 @@ describe('AdminPanel', () => {
     expect(mockListAdminUsers).toHaveBeenCalledWith({ keyword: undefined, channel: undefined, limit: 100 });
   });
 
+  it('点击积分打开行内编辑并按差额调用调整接口', async () => {
+    const mockAdjust = vi.mocked(adjustAdminUserPoints);
+    mockAdjust.mockResolvedValue({ points: 4450, reserved_points: 0, transaction_id: 'tx-1' });
+    renderPanel();
+
+    const pointsButton = await screen.findByText('积分: 3,450');
+    fireEvent.click(pointsButton);
+
+    fireEvent.change(screen.getByLabelText('新的积分余额'), { target: { value: '4450' } });
+    fireEvent.click(screen.getByTitle('确认调整'));
+
+    await waitFor(() => {
+      expect(mockAdjust).toHaveBeenCalledWith(
+        NORMAL_USER.id,
+        1000,
+        '管理后台快捷调整',
+        expect.any(String),
+      );
+    });
+    // 保存成功后刷新列表
+    await waitFor(() => {
+      expect(mockListAdminUsers.mock.calls.length).toBeGreaterThanOrEqual(2);
+    });
+  });
+
+  it('积分差额为 0 或非法输入时不调用调整接口', async () => {
+    const mockAdjust = vi.mocked(adjustAdminUserPoints);
+    renderPanel();
+
+    fireEvent.click(await screen.findByText('积分: 3,450'));
+    fireEvent.click(screen.getByTitle('确认调整'));
+    expect(mockAdjust).not.toHaveBeenCalled();
+
+    fireEvent.click(await screen.findByText('积分: 3,450'));
+    fireEvent.change(screen.getByLabelText('新的积分余额'), { target: { value: '-5' } });
+    fireEvent.click(screen.getByTitle('确认调整'));
+    expect(mockAdjust).not.toHaveBeenCalled();
+    expect(await screen.findByText('积分须在 0 到 50,000 之间')).toBeTruthy();
+  });
+
   it('keyword 输入防抖后触发带 keyword 的重新请求', async () => {
     renderPanel();
 

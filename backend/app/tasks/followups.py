@@ -4,6 +4,7 @@ import asyncio
 import json
 import re
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -371,7 +372,12 @@ class FollowupSuggestionService:
             if snapshot is None:
                 return False
             try:
-                result = await self.model.complete_json(build_followup_request(**snapshot))
+                request = build_followup_request(**snapshot)
+                request = replace(
+                    request,
+                    log_context={"task_id": task_id, "tags": ["followup"]},
+                )
+                result = await self.model.complete_json(request)
                 suggestions = result.value.model_dump(mode="json")["suggestions"]
             except Exception as error:
                 await self._persist_failure(task_id, safe_followup_error(error, stage="model"))

@@ -5,7 +5,6 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,15 +16,8 @@ from app.identity.models import LoginSession, User, UserChannelPermission
 from app.main import create_app
 from app.mcp_gateway.models import McpToolCatalog
 from app.mcp_gateway.transport import RemoteToolResult
-from app.quick.router import quick_transport
-from app.quick.tags import clear_tag_cache
-
-
-@pytest.fixture(autouse=True)
-def _isolate_tag_cache() -> AsyncIterator[None]:
-    clear_tag_cache()
-    yield
-    clear_tag_cache()
+from app.model.contracts import StructuredResult
+from app.quick.router import quick_model, quick_transport
 
 
 def _schema(properties: dict, required: list[str] | None = None) -> dict:
@@ -136,6 +128,35 @@ MENTIONS_TAG_RESULT = {
 BEST_TAG_RESULT = "已找到合适的标签: 美食"
 
 
+class FakeQuickModel:
+    """脚本化模型：decisions 依次消费（dict 原样校验，callable 见请求再定）。
+
+    脚本耗尽后兜底 finish 空结果，避免测试因脚本长度差错而死循环。
+    """
+
+    def __init__(self, decisions: list[Any] | None = None) -> None:
+        self.decisions = list(decisions or [])
+        self.requests: list[Any] = []
+
+    async def complete_json(self, request: Any) -> StructuredResult[Any]:
+        self.requests.append(request)
+        payload = self.decisions.pop(0) if self.decisions else {"action": "finish", "result": []}
+        if callable(payload):
+            payload = payload(request)
+        return StructuredResult(
+            value=request.output_model.model_validate(payload),
+            usage=None,
+            request_id="req-quick-test",
+            regeneration_count=0,
+        )
+
+    def stream_text(self, request: Any):  # pragma: no cover - 快捷功能不走流式
+        raise NotImplementedError
+
+    async def aclose(self) -> None:
+        return None
+
+
 @pytest_asyncio.fixture
 async def quick_catalog(db_session: AsyncSession) -> None:
     now = datetime.now(UTC).replace(tzinfo=None)
@@ -219,9 +240,9 @@ class FakeTransport:
 async def quick_client_factory(
     db_session: AsyncSession, quick_catalog: None
 ) -> AsyncIterator[
-    Callable[..., Coroutine[Any, Any, tuple[AsyncClient, User, FakeTransport]]]
+    Callable[..., Coroutine[Any, Any, tuple[AsyncClient, User, FakeTransport, FakeQuickModel]]]
 ]:
-    """带行业属性与钱包的认证客户端；传输层为 FakeTransport。"""
+    """带行业属性与钱包的认证客户端；传输层 FakeTransport + 脚本化模型。"""
     clients: list[AsyncClient] = []
 
     async def create(
@@ -229,15 +250,18 @@ async def quick_client_factory(
         industries: tuple[str, ...] = ("美食",),
         balance: int = 1000,
         channels: tuple[str, ...] = (),
-    ) -> tuple[AsyncClient, User, FakeTransport]:
+        decisions: list[Any] | None = None,
+    ) -> tuple[AsyncClient, User, FakeTransport, FakeQuickModel]:
         app = create_app()
 
         async def override_get_db() -> AsyncIterator[AsyncSession]:
             yield db_session
 
         transport = FakeTransport()
+        model = FakeQuickModel(decisions)
         app.dependency_overrides[get_db] = override_get_db
         app.dependency_overrides[quick_transport] = lambda: transport
+        app.dependency_overrides[quick_model] = lambda: model
         now = datetime.now(UTC).replace(tzinfo=None)
         user = User(
             id=str(uuid4()),
@@ -279,7 +303,7 @@ async def quick_client_factory(
         test_client = AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
         test_client.headers["Authorization"] = f"Bearer {token}"
         clients.append(test_client)
-        return test_client, user, transport
+        return test_client, user, transport, model
 
     yield create
     for test_client in clients:
