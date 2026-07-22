@@ -4,8 +4,9 @@ import {
 import {
   Bar, BarChart, Cell, Legend, Line, LineChart, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from 'recharts';
-import { Fragment, type ReactNode } from 'react';
+import { Fragment, useState } from 'react';
 
+import { downloadKolSelection, runKolAnalysis } from '../api/kolSelection';
 import type {
   ApiAnalysisReport, ApiAnalysisReportChartSeries, ApiAnalysisReportMetricItem, ApiTaskStatus, ReportBlock,
 } from '../api/contracts';
@@ -14,23 +15,15 @@ import { Card, formatNumber, MetricCard } from './reportPrimitives';
 interface UniversalReportProps {
   report?: ApiAnalysisReport;
   taskStatus?: ApiTaskStatus | string;
+  sessionId?: string;
+  selectionCount?: number;
+  onReportReady?: (report: ApiAnalysisReport) => void;
 }
 
 const chartColors = ['#4f46e5', '#818cf8', '#14b8a6', '#f59b00', '#0ea5e9', '#f43f4f'];
 
 function isTerminal(status?: string): boolean {
   return status === 'completed' || status === 'completed_with_warnings' || status === 'insufficient_balance';
-}
-
-function PanelState({ children }: { children: ReactNode }) {
-  return (
-    <aside className="flex h-full w-full shrink-0 flex-col overflow-hidden border-l border-slate-200 bg-white shadow-sm xl:w-[420px]">
-      <header className="flex h-14 items-center border-b border-slate-200 px-4">
-        <h2 className="text-xs font-bold uppercase tracking-widest text-slate-800">智能分析报告</h2>
-      </header>
-      <div className="flex flex-1 items-center justify-center bg-slate-50/40 p-8 text-center text-xs text-slate-500">{children}</div>
-    </aside>
-  );
 }
 
 function textOf(value: unknown): string {
@@ -315,44 +308,113 @@ function ReportBlockView({ block }: { block: ReportBlock }) {
   }
 }
 
-export default function UniversalReport({ report, taskStatus }: UniversalReportProps) {
-  if (!report) {
-    return (
-      <PanelState>
-        {taskStatus === 'insufficient_balance'
-          ? '积分不足，任务已停止'
-          : taskStatus && !isTerminal(taskStatus) ? '正在生成分析报告…' : '等待生成分析报告'}
-      </PanelState>
-    );
-  }
-  const blocks = (report.blocks ?? [])
+export default function UniversalReport({ report, taskStatus, sessionId, selectionCount, onReportReady }: UniversalReportProps) {
+  const [analyzing, setAnalyzing] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  const [actionError, setActionError] = useState<string>();
+
+  const handleAnalyze = async () => {
+    if (!sessionId || analyzing) return;
+    setAnalyzing(true);
+    setActionError(undefined);
+    try {
+      const nextReport = await runKolAnalysis(sessionId);
+      onReportReady?.(nextReport);
+    } catch (reason) {
+      setActionError(reason instanceof Error && reason.message === 'NO_KOL_SELECTION'
+        ? '暂无圈选达人，请先在会话中完成圈选'
+        : '分析失败，请稍后重试');
+    } finally {
+      setAnalyzing(false);
+    }
+  };
+
+  const handleExport = async () => {
+    if (!sessionId || exporting) return;
+    setExporting(true);
+    setActionError(undefined);
+    try {
+      await downloadKolSelection(sessionId);
+    } catch (reason) {
+      setActionError(reason instanceof Error && reason.message === 'NO_KOL_SELECTION'
+        ? '暂无圈选达人，请先在会话中完成圈选'
+        : '导出失败，请稍后重试');
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  const blocks = (report?.blocks ?? [])
     .filter(block => block && typeof block === 'object')
     .filter(blockHasContent);
+  const selectedCount = selectionCount ?? 0;
+  const emptyText = taskStatus === 'insufficient_balance'
+    ? '积分不足，任务已停止'
+    : selectedCount > 0
+      ? `已圈选 ${selectedCount} 位达人，点击「分析」生成 KOL 分析报告`
+      : '尚未圈选达人，请先在会话中发起圈选';
+
   return (
     <aside className="flex h-full w-full shrink-0 flex-col overflow-hidden border-l border-slate-200 bg-white shadow-sm xl:w-[420px]">
-      <header className="flex h-14 shrink-0 items-center justify-between border-b border-slate-200 bg-white px-4">
+      <header className="flex h-14 shrink-0 items-center justify-between gap-2 border-b border-slate-200 bg-white px-4">
         <div className="min-w-0">
-          <h2 className="truncate text-xs font-bold uppercase tracking-widest text-slate-800">{report.title || '智能分析报告'}</h2>
-          <p className="mt-0.5 text-[9px] text-slate-400">报告 v{report.version} · {new Date(report.generated_at).toLocaleString('zh-CN')}</p>
+          <h2 className="truncate text-xs font-bold uppercase tracking-widest text-slate-800">{report?.title || '智能分析报告'}</h2>
+          {report && (
+            <p className="mt-0.5 text-[9px] text-slate-400">报告 v{report.version} · {new Date(report.generated_at).toLocaleString('zh-CN')}</p>
+          )}
         </div>
+        {sessionId && (
+          <div className="flex shrink-0 items-center gap-1.5">
+            <button
+              type="button"
+              onClick={() => void handleAnalyze()}
+              disabled={analyzing}
+              className="rounded-lg bg-indigo-600 px-3 py-1.5 text-[11px] font-semibold text-white shadow-sm transition hover:bg-indigo-700 active:scale-95 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {analyzing ? '分析中…' : '分析'}
+            </button>
+            <button
+              type="button"
+              onClick={() => void handleExport()}
+              disabled={exporting}
+              className="rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-[11px] font-semibold text-slate-600 shadow-sm transition hover:bg-slate-50 active:scale-95 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {exporting ? '导出中…' : '导出 Excel'}
+            </button>
+          </div>
+        )}
       </header>
       <div className="flex-1 overflow-y-auto bg-slate-50/40 p-3">
-        {taskStatus && !isTerminal(taskStatus) && (
-          <p role="status" className="mb-3 rounded-lg bg-indigo-50 px-2.5 py-2 text-[11px] text-indigo-600">任务进行中，报告内容可能继续更新…</p>
+        {actionError && (
+          <p role="alert" className="mb-3 rounded-lg bg-rose-50 px-2.5 py-2 text-[11px] text-rose-600">{actionError}</p>
         )}
-        <div className="space-y-3">
-          {blocks.map((block, index) => (
-            <Fragment key={`${block.type}-${index}`}>{ReportBlockView({ block })}</Fragment>
-          ))}
-          {textOf(report.conclusion) && (
-            <Card title="AI 结论" icon={<Sparkles className="h-4 w-4" />}>
-              <p className="whitespace-pre-wrap text-[11px] leading-5 text-slate-600">{report.conclusion}</p>
-            </Card>
-          )}
-          {blocks.length === 0 && !textOf(report.conclusion) && (
-            <p className="rounded-lg bg-slate-50 px-2.5 py-2 text-[11px] text-slate-400">报告内容为空</p>
-          )}
-        </div>
+        {report ? (
+          <>
+            {taskStatus && !isTerminal(taskStatus) && (
+              <p role="status" className="mb-3 rounded-lg bg-indigo-50 px-2.5 py-2 text-[11px] text-indigo-600">任务进行中，报告内容可能继续更新…</p>
+            )}
+            <div className="space-y-3">
+              {blocks.map((block, index) => (
+                <Fragment key={`${block.type}-${index}`}>{ReportBlockView({ block })}</Fragment>
+              ))}
+              {textOf(report.conclusion) && (
+                <Card title="AI 结论" icon={<Sparkles className="h-4 w-4" />}>
+                  <p className="whitespace-pre-wrap text-[11px] leading-5 text-slate-600">{report.conclusion}</p>
+                </Card>
+              )}
+              {blocks.length === 0 && !textOf(report.conclusion) && (
+                <p className="rounded-lg bg-slate-50 px-2.5 py-2 text-[11px] text-slate-400">报告内容为空</p>
+              )}
+            </div>
+          </>
+        ) : (
+          <div className="flex min-h-[120px] items-center justify-center p-6 text-center text-xs leading-5 text-slate-500">
+            {emptyText}
+          </div>
+        )}
+        <Card title="品牌/活动分析（即将上线）" icon={<PieChartIcon className="h-4 w-4" />} className="mt-3">
+          <p className="text-[11px] text-slate-400">品牌与活动维度分析即将上线，敬请期待。</p>
+        </Card>
       </div>
     </aside>
   );

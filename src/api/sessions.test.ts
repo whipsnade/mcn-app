@@ -25,7 +25,7 @@ describe('toSession', () => {
       budget_min: '30000.00',
       budget_max: '80000.00',
       filters: {},
-      is_starred: false,
+      is_starred: false, kol_selection_count: 0,
       messages: [{
         id: 'm-1',
         role: 'user',
@@ -56,7 +56,7 @@ describe('toSession', () => {
       budget_min: null,
       budget_max: null,
       filters: {},
-      is_starred: false,
+      is_starred: false, kol_selection_count: 0,
       messages: [],
       created_at: '2026-07-21T10:00:00Z',
       updated_at: '2026-07-21T10:00:00Z',
@@ -71,7 +71,7 @@ describe('toSession', () => {
     const base = {
       id: 's-2', title: '示例品牌-夏季选人', brand: '示例品牌', campaign_name: '夏季选人',
       status: 'completed' as const, platforms: ['bilibili'], category: '美妆护肤', target_audience: '18-30 岁女性',
-      budget_min: null, budget_max: null, filters: {}, is_starred: false, messages: [],
+      budget_min: null, budget_max: null, filters: {}, is_starred: false, kol_selection_count: 0, messages: [],
       latest_task: { id: 'task-2', status: 'completed' as const, completed_at: '2026-07-15T10:00:00Z' },
       created_at: '2026-07-14T10:00:00Z', updated_at: '2026-07-15T10:00:00Z',
     };
@@ -84,11 +84,28 @@ describe('toSession', () => {
     expect(toSession({ ...base, latest_analysis_report: { ...summary, task_id: 'task-other' } }).analysis?.analysisReportId).toBeUndefined();
   });
 
+  it('accepts session-level analysis reports whose task_id is null', () => {
+    const session = toSession({
+      id: 's-kol', title: '圈选会话', brand: '示例品牌', campaign_name: null, status: 'completed',
+      platforms: ['xiaohongshu'], category: '美妆护肤', target_audience: '', budget_min: null, budget_max: null,
+      filters: {}, is_starred: false, kol_selection_count: 7, messages: [],
+      latest_task: { id: 'task-9', status: 'completed' as const, completed_at: '2026-07-21T10:00:00Z' },
+      latest_analysis_report: {
+        id: 'analysis-report-kol', task_id: null, version: 1, title: 'KOL 匹配度分析',
+        status: 'completed', generated_at: '2026-07-21T10:00:00Z',
+      },
+      created_at: '2026-07-21T09:00:00Z', updated_at: '2026-07-21T10:00:00Z',
+    });
+
+    expect(session.analysis?.analysisReportId).toBe('analysis-report-kol');
+    expect(session.kolSelectionCount).toBe(7);
+  });
+
   it('restores follow-up suggestions from the latest task metadata', () => {
     const session = toSession({
       id: 's-follow', title: '建议', brand: '品牌', campaign_name: null, status: 'completed',
       platforms: ['douyin'], category: '餐饮', target_audience: '', budget_min: null, budget_max: null,
-      filters: {}, is_starred: false, messages: [],
+      filters: {}, is_starred: false, kol_selection_count: 0, messages: [],
       latest_task: {
         id: 'task-follow', status: 'completed', completed_at: null,
         followup_suggestions_status: 'completed',
@@ -115,7 +132,7 @@ describe('toSession', () => {
       budget_min: null,
       budget_max: null,
       filters: {},
-      is_starred: false,
+      is_starred: false, kol_selection_count: 0,
       messages: [{
         id: 'm-1',
         role: 'assistant',

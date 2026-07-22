@@ -219,6 +219,13 @@ export default function App() {
             <UniversalReport
               report={workspace.activeSession?.analysisReport}
               taskStatus={(workspace.taskRuntime?.status ?? workspace.activeSession?.analysis?.status) as import('./api/contracts').ApiTaskStatus | undefined}
+              sessionId={workspace.activeSession?.id}
+              selectionCount={workspace.activeSession?.kolSelectionCount}
+              onReportReady={(nextReport) => {
+                if (workspace.activeSession) {
+                  workspace.setAnalysisReport(workspace.activeSession.id, nextReport);
+                }
+              }}
             />
           )}
         </div>

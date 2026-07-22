@@ -30,6 +30,8 @@ export function toMessage(message: ApiMessage): Message {
 
 
 export function toSession(source: ApiSession): Session {
+  const latestTask = source.latest_task;
+  const report = source.latest_analysis_report;
   return {
     id: source.id,
     title: source.title,
@@ -44,20 +46,19 @@ export function toSession(source: ApiSession): Session {
     summary: source.messages.find(message => message.role === 'user')?.content ?? '',
     messages: source.messages.map(toMessage),
     isStarred: source.is_starred,
-    analysis: source.latest_task ? (() => {
-      const analysisReportId = source.latest_analysis_report?.task_id === source.latest_task.id
-        ? source.latest_analysis_report.id
-        : undefined;
-      return {
-        taskId: source.latest_task.id,
-        status: source.latest_task.status,
-        kind: source.latest_task.kind,
-        analysisReportId,
-        followupStatus: source.latest_task.followup_suggestions_status ?? undefined,
-        followupSuggestions: source.latest_task.followup_suggestions ?? [],
-        followupError: source.latest_task.followup_error ?? undefined,
-      };
-    })() : undefined,
+    kolSelectionCount: source.kol_selection_count,
+    analysis: latestTask ? {
+      taskId: latestTask.id,
+      status: latestTask.status,
+      kind: latestTask.kind,
+      // 会话级报告 task_id 为 null（KOL 圈选手动分析），同样视为归属当前会话。
+      analysisReportId: report && (report.task_id === null || report.task_id === latestTask.id)
+        ? report.id
+        : undefined,
+      followupStatus: latestTask.followup_suggestions_status ?? undefined,
+      followupSuggestions: latestTask.followup_suggestions ?? [],
+      followupError: latestTask.followup_error ?? undefined,
+    } : undefined,
     createdAt: source.created_at,
     updatedAt: source.updated_at,
   };

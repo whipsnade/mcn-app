@@ -10,7 +10,7 @@ import {
 } from '../api/sessions';
 import { isBrainstormProfileReady, postBrainstorm } from '../api/brainstorm';
 import { createTask, getAnalysisReport, getTask, retryFollowups as retryFollowupsRequest, retryTask } from '../api/tasks';
-import type { CreateSessionInput } from '../api/contracts';
+import type { ApiAnalysisReport, CreateSessionInput } from '../api/contracts';
 import { useTaskStream } from './useTaskStream';
 import { isTerminalTaskStatus } from '../state/taskEvents';
 import type { Message, Session } from '../types';
@@ -83,7 +83,8 @@ export function useWorkspace(userId?: string) {
       generationRef.current !== generation
       || !sessionOperationIsCurrent(session.id, operationEpoch)
     ) return session;
-    const matchingAnalysisReport = analysisReportResponse?.task_id === analysis.taskId
+    const matchingAnalysisReport = analysisReportResponse
+      && (analysisReportResponse.task_id === null || analysisReportResponse.task_id === analysis.taskId)
       ? analysisReportResponse
       : undefined;
     return {
@@ -550,6 +551,21 @@ export function useWorkspace(userId?: string) {
     [activeSessionId, sessions],
   );
 
+  // 手动 KOL 分析（会话级报告，task_id 为 null）成功后，由面板回调写回会话状态。
+  const setAnalysisReport = useCallback((sessionId: string, report: ApiAnalysisReport) => {
+    setSessions(current => {
+      const nextSessions = current.map(session => session.id === sessionId ? {
+        ...session,
+        analysis: session.analysis
+          ? { ...session.analysis, analysisReportId: report.id }
+          : session.analysis,
+        analysisReport: report,
+      } : session);
+      sessionsRef.current = nextSessions;
+      return nextSessions;
+    });
+  }, []);
+
   useEffect(() => {
     const taskId = activeTaskId;
     const sessionId = activeSessionId;
@@ -611,5 +627,6 @@ export function useWorkspace(userId?: string) {
     appendMessage,
     retryMessage,
     retryFollowups,
+    setAnalysisReport,
   };
 }

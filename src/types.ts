@@ -93,6 +93,7 @@ export interface Session {
   kols?: string[];
   analysis?: SessionAnalysis;
   analysisReport?: import('./api/contracts').ApiAnalysisReport;
+  kolSelectionCount?: number;
 }
 
 export interface SessionAnalysis {

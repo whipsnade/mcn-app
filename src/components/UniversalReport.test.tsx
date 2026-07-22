@@ -1,10 +1,21 @@
-import { render, screen } from '@testing-library/react';
-import { describe, expect, it } from 'vitest';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+import { downloadKolSelection, runKolAnalysis } from '../api/kolSelection';
 import { analysisReportFixture } from '../test/fixtures';
 import UniversalReport from './UniversalReport';
 
+vi.mock('../api/kolSelection', () => ({
+  runKolAnalysis: vi.fn(),
+  downloadKolSelection: vi.fn(),
+}));
+
 describe('UniversalReport', () => {
+  beforeEach(() => {
+    vi.mocked(runKolAnalysis).mockReset();
+    vi.mocked(downloadKolSelection).mockReset();
+  });
+
   it('renders every supported block type from the analysis report DTO', () => {
     render(<UniversalReport report={analysisReportFixture()} taskStatus="completed" />);
 
@@ -61,23 +72,72 @@ describe('UniversalReport', () => {
     expect(screen.getByText('报告内容为空')).toBeVisible();
   });
 
-  it('shows a placeholder while no analysis report exists', () => {
-    render(<UniversalReport taskStatus="running" />);
-
-    expect(screen.getByText('智能分析报告')).toBeVisible();
-    expect(screen.getByText('正在生成分析报告…')).toBeVisible();
-  });
-
-  it('falls back to the idle placeholder without a task status', () => {
-    render(<UniversalReport />);
-
-    expect(screen.getByText('等待生成分析报告')).toBeVisible();
-  });
-
   it('announces that report content may still change while the task runs', () => {
     render(<UniversalReport report={analysisReportFixture()} taskStatus="running" />);
 
     expect(screen.getByRole('status')).toHaveTextContent('任务进行中，报告内容可能继续更新');
     expect(screen.getByText('一、核心结论')).toBeVisible();
+  });
+
+  it('shows the selection count prompt in the empty state', () => {
+    render(<UniversalReport sessionId="session-1" selectionCount={12} />);
+
+    expect(screen.getByText('已圈选 12 位达人，点击「分析」生成 KOL 分析报告')).toBeVisible();
+  });
+
+  it('asks for a selection first when nothing has been selected', () => {
+    render(<UniversalReport sessionId="session-1" selectionCount={0} />);
+
+    expect(screen.getByText(/尚未圈选达人/)).toBeVisible();
+  });
+
+  it('renders the analyze and export buttons when a session is bound', () => {
+    render(<UniversalReport sessionId="session-1" selectionCount={3} />);
+
+    expect(screen.getByRole('button', { name: '分析' })).toBeVisible();
+    expect(screen.getByRole('button', { name: '导出 Excel' })).toBeVisible();
+  });
+
+  it('hides the action buttons without a session id', () => {
+    render(<UniversalReport report={analysisReportFixture()} taskStatus="completed" />);
+
+    expect(screen.queryByRole('button', { name: '分析' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '导出 Excel' })).not.toBeInTheDocument();
+  });
+
+  it('runs the manual analysis and forwards the report to the callback', async () => {
+    const report = analysisReportFixture({ id: 'analysis-report-kol', task_id: null, title: 'KOL 匹配度分析' });
+    vi.mocked(runKolAnalysis).mockResolvedValue(report);
+    const onReportReady = vi.fn();
+    render(<UniversalReport sessionId="session-1" selectionCount={3} onReportReady={onReportReady} />);
+
+    fireEvent.click(screen.getByRole('button', { name: '分析' }));
+
+    expect(runKolAnalysis).toHaveBeenCalledWith('session-1');
+    await waitFor(() => expect(onReportReady).toHaveBeenCalledWith(report));
+  });
+
+  it('shows an inline error when there is no KOL selection', async () => {
+    vi.mocked(runKolAnalysis).mockRejectedValue(new Error('NO_KOL_SELECTION'));
+    render(<UniversalReport sessionId="session-1" selectionCount={0} />);
+
+    fireEvent.click(screen.getByRole('button', { name: '分析' }));
+
+    expect(await screen.findByText(/暂无圈选达人/)).toBeVisible();
+  });
+
+  it('downloads the KOL selection sheet on export', async () => {
+    vi.mocked(downloadKolSelection).mockResolvedValue(undefined);
+    render(<UniversalReport sessionId="session-1" selectionCount={3} />);
+
+    fireEvent.click(screen.getByRole('button', { name: '导出 Excel' }));
+
+    await waitFor(() => expect(downloadKolSelection).toHaveBeenCalledWith('session-1'));
+  });
+
+  it('keeps a placeholder card for the upcoming brand/campaign analysis', () => {
+    render(<UniversalReport sessionId="session-1" selectionCount={3} />);
+
+    expect(screen.getByText(/品牌\/活动分析（即将上线）/)).toBeVisible();
   });
 });

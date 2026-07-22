@@ -128,6 +128,7 @@ export interface ApiSession {
   filters: Record<string, unknown>;
   is_starred: boolean;
   messages: ApiMessage[];
+  kol_selection_count: number;
   latest_task?: ApiTaskSummary | null;
   latest_analysis_report?: ApiAnalysisReportSummary | null;
   created_at: string;
@@ -203,7 +204,8 @@ export type ReportBlock =
 
 export interface ApiAnalysisReport {
   id: string;
-  task_id: string;
+  // 会话级 KOL 分析报告不绑定任务，task_id 为 null。
+  task_id: string | null;
   version: number;
   title: string;
   blocks: ReportBlock[];
@@ -214,7 +216,8 @@ export interface ApiAnalysisReport {
 
 export interface ApiAnalysisReportSummary {
   id: string;
-  task_id: string;
+  // 会话级 KOL 分析报告不绑定任务，task_id 为 null。
+  task_id: string | null;
   version: number;
   title: string;
   status: string;
