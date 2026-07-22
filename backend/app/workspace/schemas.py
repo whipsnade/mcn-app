@@ -79,5 +79,6 @@ class SessionRead(BaseModel):
     messages: list[MessageRead]
     latest_task: TaskAnalysisSummary | None = None
     latest_analysis_report: AnalysisReportSummary | None = None
+    kol_selection_count: int = 0
     created_at: datetime
     updated_at: datetime

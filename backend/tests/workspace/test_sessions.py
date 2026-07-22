@@ -1,6 +1,11 @@
+from datetime import UTC, datetime
+from uuid import uuid4
+
 import pytest
 
+from app.selection.models import SessionKolSelection
 from app.workspace import service as workspace_service
+from app.workspace.models import WorkspaceSession
 
 
 def _session_payload(**overrides):
@@ -241,3 +246,45 @@ async def test_default_session_title_is_stable_and_not_derived_from_query(
     )
     assert first.status_code == 201
     assert first.json()["title"] == expected_title
+
+
+def _selection_row(user_id: str, session_id: str, uid: str, total: float) -> SessionKolSelection:
+    now = datetime.now(UTC).replace(tzinfo=None)
+    return SessionKolSelection(
+        id=str(uuid4()),
+        user_id=user_id,
+        session_id=session_id,
+        platform="xiaohongshu",
+        kol_uid=uid,
+        nickname=f"达人{uid}",
+        followers=1000,
+        city=None,
+        profile_url=None,
+        fields_json={"export_fields": {}},
+        score_json={"total": total, "rating": "推荐", "stars": "★★★★", "dimensions": {}},
+        source_tool="tool",
+        first_task_id="t1",
+        last_task_id="t1",
+        created_at=now,
+        updated_at=now,
+    )
+
+
+@pytest.mark.asyncio
+async def test_session_read_includes_kol_selection_count(auth_client_factory, db_session) -> None:
+    client = await auth_client_factory("13600000082")
+    created = await client.post("/api/v1/sessions", json={})
+    session_id = created.json()["id"]
+    assert created.json()["kol_selection_count"] == 0
+
+    session = await db_session.get(WorkspaceSession, session_id)
+    db_session.add(_selection_row(session.user_id, session_id, "a", 80.0))
+    db_session.add(_selection_row(session.user_id, session_id, "b", 60.0))
+    await db_session.flush()
+
+    detail = await client.get(f"/api/v1/sessions/{session_id}")
+    listed = await client.get("/api/v1/sessions")
+
+    assert detail.status_code == 200
+    assert detail.json()["kol_selection_count"] == 2
+    assert listed.json()[0]["kol_selection_count"] == 2

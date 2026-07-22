@@ -10,6 +10,7 @@ from app.reporting.router import analysis_report_summary
 from app.reporting.schemas import TaskAnalysisSummary
 from app.reporting.service import ReportingService
 from app.reporting.analysis_reports import AnalysisReportService
+from app.selection.service import KolSelectionService
 from app.tasks.router import get_task_runner
 from app.tasks.schemas import TaskCreate
 from app.tasks.service import TaskService
@@ -92,6 +93,9 @@ async def session_read(
         )
         if analysis_report is not None:
             latest_analysis_report = analysis_report_summary(analysis_report)
+    kol_selection_count = await KolSelectionService(service.db).count_selection(
+        session_id=workspace.id
+    )
     return SessionRead(
         id=workspace.id,
         title=workspace.title,
@@ -108,6 +112,7 @@ async def session_read(
         messages=[message_read(message) for message in messages],
         latest_task=latest_task,
         latest_analysis_report=latest_analysis_report,
+        kol_selection_count=kol_selection_count,
         created_at=workspace.created_at,
         updated_at=workspace.updated_at,
     )
