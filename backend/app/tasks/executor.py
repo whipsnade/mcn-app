@@ -406,14 +406,15 @@ class TaskExecutor:
                 await self.repository.mark_interrupted(task.id, self.worker_id)
                 return
             if row_status == "settled":
+                structured_content = (getattr(row, "evidence_json", None) or {}).get(
+                    "structured_content"
+                )
                 trajectory.results.append(
                     EvidenceNote(
                         step_id=pending.id,
                         tool=pending.internal_tool_name,
                         status="settled",
-                        summary=sanitize_evidence(
-                            (getattr(row, "evidence_json", None) or {}).get("structured_content")
-                        ),
+                        summary=sanitize_evidence(structured_content),
                     )
                 )
                 if self.selection is not None:
@@ -423,9 +424,7 @@ class TaskExecutor:
                             session_id=task.session_id,
                             task_id=task.id,
                             internal_tool_name=row.internal_tool_name,
-                            structured_content=(getattr(row, "evidence_json", None) or {}).get(
-                                "structured_content"
-                            ),
+                            structured_content=structured_content,
                         )
                     except Exception:
                         # 圈选沉淀失败绝不阻塞任务循环。

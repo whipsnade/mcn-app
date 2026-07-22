@@ -40,12 +40,11 @@ def test_out_of_range_dimension_score_is_rejected() -> None:
         score_candidate(all_dimensions(101), profile="balanced")
 
 
-def test_rating_boundaries_match_legacy_export_template() -> None:
+def test_rating_boundaries_match_four_tier_spec() -> None:
     from app.selection.scoring import rating
 
-    assert rating(78) == ("强烈推荐", "★★★★★")
+    assert rating(78) == ("重点推荐", "★★★★★")
     assert rating(62) == ("推荐", "★★★★")
-    assert rating(48) == ("谨慎推荐", "★★★")
-    assert rating(35) == ("可考虑", "★★")
-    assert rating(34.9) == ("不推荐", "★")
-    assert rating(0) == ("不推荐", "★")
+    assert rating(48) == ("可考虑", "★★★")
+    assert rating(47.9) == ("观察", "★★")
+    assert rating(0) == ("观察", "★★")

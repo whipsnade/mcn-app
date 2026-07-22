@@ -310,7 +310,14 @@ def _datatap_xiaohongshu_search_adapter(
     candidates = payload.get("KOL 列表") if isinstance(payload, dict) else None
     if not isinstance(candidates, list):
         raise ValueError("invalid_datatap_xiaohongshu_candidates")
-    return tuple(_normalize_datatap_xiaohongshu_candidate(item, candidate) for candidate in candidates)
+    normalized: list[NormalizedKolEvidence] = []
+    for candidate in candidates:
+        try:
+            normalized.append(_normalize_datatap_xiaohongshu_candidate(item, candidate))
+        except (TypeError, ValueError):
+            # 单行坏数据（缺身份、评分越界等）不应拖垮整页达人。
+            continue
+    return tuple(normalized)
 
 
 def _normalize_datatap_xiaohongshu_candidate(
@@ -379,7 +386,14 @@ def _datatap_douyin_search_adapter(item: ToolEvidence) -> tuple[NormalizedKolEvi
     candidates = payload.get("KOL 列表") if isinstance(payload, dict) else None
     if not isinstance(candidates, list):
         raise ValueError("invalid_datatap_douyin_candidates")
-    return tuple(_normalize_datatap_douyin_candidate(item, candidate) for candidate in candidates)
+    normalized: list[NormalizedKolEvidence] = []
+    for candidate in candidates:
+        try:
+            normalized.append(_normalize_datatap_douyin_candidate(item, candidate))
+        except (TypeError, ValueError):
+            # 单行坏数据（缺身份、评分越界等）不应拖垮整页达人。
+            continue
+    return tuple(normalized)
 
 
 _DATATAP_PLATFORM_BY_TOOL = {

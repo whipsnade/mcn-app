@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from collections.abc import Sequence
 from datetime import UTC, date, datetime
@@ -9,6 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 
 from app.core.config import get_settings
 from app.db.session import SessionFactory
@@ -47,6 +49,9 @@ from app.workspace.service import WorkspaceService
 
 class SummaryRecoveryMismatch(RuntimeError):
     """恢复流无法证明与已持久化草稿属于同一输出。"""
+
+
+logger = logging.getLogger(__name__)
 
 
 def agent_loop_tags(context: AgentLoopContext) -> list[str]:
@@ -382,19 +387,27 @@ class DatabaseSelectionIngest:
         internal_tool_name: str,
         structured_content: Any,
     ) -> None:
-        async with SessionFactory.begin() as db:
-            mapping = await self._tool_mapping(db)
-            if internal_tool_name not in mapping:
+        for attempt in (1, 2):
+            try:
+                async with SessionFactory.begin() as db:
+                    mapping = await self._tool_mapping(db)
+                    if internal_tool_name not in mapping:
+                        return
+                    # normalizers 适配器按内部工具名匹配；remote 映射仅作为
+                    # “该工具仍为已审核启用”的护栏。
+                    await KolSelectionService(db).ingest_tool_evidence(
+                        user_id=user_id,
+                        session_id=session_id,
+                        task_id=task_id,
+                        tool_name=internal_tool_name,
+                        structured_content=structured_content,
+                    )
                 return
-            # normalizers 适配器按内部工具名匹配；remote 映射仅作为
-            # “该工具仍为已审核启用”的护栏。
-            await KolSelectionService(db).ingest_tool_evidence(
-                user_id=user_id,
-                session_id=session_id,
-                task_id=task_id,
-                tool_name=internal_tool_name,
-                structured_content=structured_content,
-            )
+            except IntegrityError:
+                # 并发 upsert 撞唯一约束：整批回滚后用新事务重试一次，
+                # 第二次 select 会命中已有行走 merge；再失败只记 warning。
+                if attempt == 2:
+                    logger.warning("kol_selection_ingest_conflict", exc_info=True)
 
     async def _tool_mapping(self, db) -> dict[str, str]:
         if self._remote_by_internal is None:

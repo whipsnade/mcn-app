@@ -9,27 +9,19 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.selection.models import SessionKolSelection
-from app.selection.normalizers import UnknownEvidenceToolError, normalize_tool_evidence
+from app.selection.normalizers import (
+    _MERGEABLE_FIELDS,
+    UnknownEvidenceToolError,
+    normalize_tool_evidence,
+)
 from app.selection.schemas import DimensionInputs, NormalizedKolEvidence, ToolEvidence
 from app.selection.scoring import rating, score_candidate
 from app.workspace.models import WorkspaceSession
 
 
 _NESTED_DICT_FIELDS = ("export_fields", "analytics_fields")
-# as_dict() 中与评分缺失判定相关的标量字段（与 normalizers 的 fields 构造一致）。
-_MISSING_FIELD_NAMES = (
-    "nickname",
-    "normalized_profile_url",
-    "followers",
-    "engagement_rate",
-    "quoted_price_cny",
-    "content_score",
-    "audience_score",
-    "engagement_score",
-    "budget_score",
-    "growth_score",
-    "brand_safety_score",
-)
+# as_dict() 中与评分缺失判定相关的标量字段，复用 normalizers 的合并字段清单。
+_MISSING_FIELD_NAMES = _MERGEABLE_FIELDS
 
 
 def _utcnow() -> datetime:
@@ -181,11 +173,13 @@ class KolSelectionService:
         tool_name: str,
         item: NormalizedKolEvidence,
     ) -> None:
+        platform = item.platform[:32]
+        kol_uid = item.platform_account_id[:128]
         existing = await self._db.scalar(
             select(SessionKolSelection).where(
                 SessionKolSelection.session_id == session_id,
-                SessionKolSelection.platform == item.platform,
-                SessionKolSelection.kol_uid == item.platform_account_id,
+                SessionKolSelection.platform == platform,
+                SessionKolSelection.kol_uid == kol_uid,
             )
         )
         now = _utcnow()
@@ -195,8 +189,8 @@ class KolSelectionService:
                 id=str(uuid4()),
                 user_id=user_id,
                 session_id=session_id,
-                platform=item.platform,
-                kol_uid=item.platform_account_id[:128],
+                platform=platform,
+                kol_uid=kol_uid,
                 source_tool=tool_name,
                 first_task_id=task_id,
                 last_task_id=task_id,
