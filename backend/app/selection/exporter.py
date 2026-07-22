@@ -194,7 +194,9 @@ def _render_summary(sheet: Any, metadata: dict[str, Any], candidates: Sequence[E
         if str(merged) in {"A20:P20", "A20:Q20"}:
             sheet.unmerge_cells(str(merged))
     sheet.merge_cells(f"A{rating_title_row}:Q{rating_title_row}")
-    sheet["A1"] = f"{metadata.get('brand') or 'KOL'}{metadata.get('category') or ''}达人 — KOL匹配度筛选分析报告"
+    sheet["A1"] = _cell_value(
+        f"{metadata.get('brand') or 'KOL'}{metadata.get('category') or ''}达人 — KOL匹配度筛选分析报告"
+    )
     locations = "、".join(str(item) for item in metadata.get("locations", [])) or "未指定"
     platforms = list(dict.fromkeys(_platform_label(item.platform) for item in candidates))
     sheet["A2"] = (

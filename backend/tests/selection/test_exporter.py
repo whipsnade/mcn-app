@@ -157,12 +157,15 @@ def test_render_workbook_escapes_formula_injection_in_third_party_strings() -> N
         values={"content_tags": "+cmd", "engagement_rate": "@evil", "summary": "-1+1"},
     )
     content = render_workbook(
-        metadata={"brand": "注入测试", "category": "美食", "generated_at": "2026-07-22"},
+        metadata={"brand": "=cmd", "category": "美食", "generated_at": "2026-07-22"},
         candidates=[candidate],
     )
 
     workbook = load_workbook(BytesIO(content))
     summary = workbook["KOL匹配度筛选"]
+    title_cell = summary.cell(1, 1)
+    assert title_cell.data_type != "f"
+    assert str(title_cell.value).startswith("'=cmd")
     nickname_cell = summary.cell(5, 3)
     assert nickname_cell.data_type != "f"
     assert nickname_cell.value == "'=HYPERLINK(\"http://evil.example\",\"click\")"
