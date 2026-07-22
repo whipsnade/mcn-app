@@ -4,7 +4,7 @@ import {
 import {
   Bar, BarChart, Cell, Legend, Line, LineChart, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from 'recharts';
-import { Fragment, useEffect, useState } from 'react';
+import { Fragment, useEffect, useRef, useState } from 'react';
 
 import { downloadKolSelection, getKolSelection, runKolAnalysis } from '../api/kolSelection';
 import type { KolSelectionItem } from '../api/kolSelection';
@@ -336,13 +336,9 @@ function stringValue(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
 }
 
-// 互动率/报价优先取嵌套 export_fields，缺失时回退 fields 顶层（归一化后的合并字段）。
+// 互动率/报价是归一化后的合并字段（_MERGEABLE_FIELDS），落在 fields_json 顶层；防御性取数。
 function selectionMetric(item: KolSelectionItem, key: string): number | null {
-  const exportFields = item.fields?.export_fields;
-  const nested = exportFields && typeof exportFields === 'object'
-    ? finiteNumber((exportFields as Record<string, unknown>)[key])
-    : null;
-  return nested ?? finiteNumber(item.fields?.[key]);
+  return finiteNumber(item.fields?.[key]);
 }
 
 function KolSelectionCard({ item }: { item: KolSelectionItem }) {
@@ -419,7 +415,7 @@ export default function UniversalReport({ report, taskStatus, sessionId, selecti
     setSelectionError(false);
   }, [sessionId]);
 
-  // 圈选达人 tab 激活时拉取名单；任务状态推进（到达终态）时若正在该 tab 则自动刷新。
+  // 圈选达人 tab 激活时拉取名单（切 tab / 换会话 / 手动刷新计数）。
   useEffect(() => {
     if (activeTab !== 'selection' || !sessionId) return;
     let cancelled = false;
@@ -439,7 +435,18 @@ export default function UniversalReport({ report, taskStatus, sessionId, selecti
     return () => {
       cancelled = true;
     };
-  }, [activeTab, sessionId, taskStatus, selectionRefresh]);
+  }, [activeTab, sessionId, selectionRefresh]);
+
+  // 任务状态仅在「变为终态」的跃迁时刷新名单（正在达人 tab 才刷），避免中间态每次变化重复拉取。
+  const taskSettled = isTerminal(taskStatus);
+  const prevSettledRef = useRef(taskSettled);
+  useEffect(() => {
+    const wasSettled = prevSettledRef.current;
+    prevSettledRef.current = taskSettled;
+    if (taskSettled && !wasSettled && activeTab === 'selection') {
+      setSelectionRefresh(tick => tick + 1);
+    }
+  }, [taskSettled, activeTab]);
 
   const handleAnalyze = async () => {
     if (!sessionId || analyzing) return;

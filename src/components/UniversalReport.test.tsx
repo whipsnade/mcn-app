@@ -19,7 +19,7 @@ function kolSelectionItem(overrides: Record<string, unknown> = {}) {
     followers: 120000,
     city: '上海',
     profile_url: 'https://www.xiaohongshu.com/user/profile/uid-1',
-    fields: { export_fields: { engagement_rate: 5.2, quoted_price_cny: 12000 } },
+    fields: { engagement_rate: 5.2, quoted_price_cny: 12000 },
     score: { total: 82, rating: '重点推荐', stars: '★★★★★', dimensions: {}, data_completeness: 0.9 },
     ...overrides,
   };
@@ -221,17 +221,20 @@ describe('UniversalReport', () => {
     expect(screen.queryByText(/综合评分/)).not.toBeInTheDocument();
   });
 
-  it('falls back to top-level engagement/price fields when export_fields is absent', async () => {
-    vi.mocked(getKolSelection).mockResolvedValue({
-      total: 1,
-      items: [kolSelectionItem({ fields: { engagement_rate: 3.8, quoted_price_cny: 8000 } })],
-    });
-    render(<UniversalReport sessionId="session-1" selectionCount={1} />);
+  it('refreshes the selection list when the task transitions to a terminal status', async () => {
+    vi.mocked(getKolSelection).mockResolvedValue({ total: 1, items: [kolSelectionItem()] });
+    const { rerender } = render(<UniversalReport sessionId="session-1" selectionCount={1} taskStatus="running" />);
 
     fireEvent.click(screen.getByRole('tab', { name: '圈选达人 (1)' }));
+    await waitFor(() => expect(getKolSelection).toHaveBeenCalledTimes(1));
 
-    expect(await screen.findByText(/互动率 3\.8%/)).toBeVisible();
-    expect(screen.getByText(/预估报价 ¥8,000/)).toBeVisible();
+    // 中间态变化不重复拉取
+    rerender(<UniversalReport sessionId="session-1" selectionCount={1} taskStatus="writing" />);
+    expect(getKolSelection).toHaveBeenCalledTimes(1);
+
+    // 到达终态才刷新
+    rerender(<UniversalReport sessionId="session-1" selectionCount={1} taskStatus="completed" />);
+    await waitFor(() => expect(getKolSelection).toHaveBeenCalledTimes(2));
   });
 
   it('shows the empty hint when the selection list is empty', async () => {
