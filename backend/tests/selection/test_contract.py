@@ -74,3 +74,63 @@ def test_notes_keep_no_fabrication_rules() -> None:
     assert "缺失字段显示数据缺失" in contract.notes
     assert "每个选中平台必须执行检索" in contract.notes
     assert "抖音平台口径按可获得的获赞、评论、收藏等指标计算" in contract.notes
+
+
+def test_brainstorm_profile_region_wins_over_legacy_locations() -> None:
+    contract = build_export_field_contract(
+        _workspace(
+            filters_snapshot={
+                "brainstorm_profile": {"region": "上海"},
+                "target_fan_locations": ["杭州"],
+            }
+        )
+    )
+
+    assert contract.labels["target_region"] == "上海粉丝"
+    assert "上海粉丝占比" in contract.required_field_names
+
+
+def test_blank_region_falls_back_to_legacy_locations_list() -> None:
+    contract = build_export_field_contract(
+        _workspace(
+            filters_snapshot={
+                "brainstorm_profile": {"region": "  "},
+                "target_fan_locations": ["杭州", "上海"],
+            }
+        )
+    )
+
+    assert contract.labels["target_region"] == "杭州,上海粉丝"
+
+
+def test_none_filters_snapshot_uses_generic_fallbacks() -> None:
+    contract = build_export_field_contract(
+        _workspace(filters_snapshot=None, category=None, target_audience="")
+    )
+
+    assert contract.labels["target_region"] == "目标地区粉丝"
+    assert contract.labels["industry_interest"] == "行业兴趣"
+    assert contract.labels["target_age"] == "目标年龄段"
+
+
+def test_bare_string_locations_is_not_a_list_and_falls_back() -> None:
+    contract = build_export_field_contract(
+        _workspace(filters_snapshot={"target_fan_locations": "杭州"})
+    )
+
+    assert contract.labels["target_region"] == "目标地区粉丝"
+
+
+def test_blank_audience_and_category_fall_back() -> None:
+    contract = build_export_field_contract(_workspace(target_audience="   ", category="  "))
+
+    assert contract.labels["target_age"] == "目标年龄段"
+    assert contract.labels["industry_interest"] == "行业兴趣"
+
+
+def test_long_audience_is_truncated_to_twenty_chars() -> None:
+    audience = "25-34岁女性，一二线城市，白领人群，精致妈妈"
+    contract = build_export_field_contract(_workspace(target_audience=audience))
+
+    assert contract.labels["target_age"] == audience[:20]
+    assert len(contract.labels["target_age"]) == 20

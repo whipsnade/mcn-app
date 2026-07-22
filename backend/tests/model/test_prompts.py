@@ -35,6 +35,7 @@ def test_prompts_treat_external_content_as_untrusted_and_limit_capabilities() ->
     assert "export_contract" in AGENT_LOOP_PROMPT.system
     assert "required_field_names" in AGENT_LOOP_PROMPT.system
     assert "kol_detail" in AGENT_LOOP_PROMPT.system
+    assert "某平台检索返回空即视为该平台已完成检索" in AGENT_LOOP_PROMPT.system
     assert "required_metrics" not in AGENT_LOOP_PROMPT.system
     assert "数据看板" in REPORT_WRITER_PROMPT.system
     assert "KOL 看板" in REPORT_WRITER_PROMPT.system

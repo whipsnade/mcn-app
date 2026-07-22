@@ -24,6 +24,7 @@ class BrainstormProfile(BaseModel):
     period: BrainstormPeriod | None = None
     kol_filters: str | None = Field(default=None, max_length=500)
     goal: str | None = Field(default=None, max_length=500)
+    region: str | None = Field(default=None, max_length=200)
 
 
 class BrainstormQuestion(BaseModel):

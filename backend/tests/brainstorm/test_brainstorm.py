@@ -102,6 +102,7 @@ async def test_first_round_incomplete_profile_asks_one_question_with_options(
         "period",
         "kol_filters",
         "goal",
+        "region",
     ]
 
     # 画像与问答消息已持久化，metadata 经白名单后仍带 brainstorm 键。
@@ -140,6 +141,7 @@ async def test_second_round_ready_creates_task_with_trigger_message(
                     audience="18-30 岁女性",
                     period=BrainstormPeriod(start="2026-04-01", end="2026-06-30"),
                     goal="达人投放",
+                    region="杭州",
                 ),
             ),
         ]
@@ -170,6 +172,7 @@ async def test_second_round_ready_creates_task_with_trigger_message(
         "period": {"start": "2026-04-01", "end": "2026-06-30"},
         "kol_filters": None,
         "goal": "达人投放",
+        "region": "杭州",
     }
 
     task = await client.get(f"/api/v1/tasks/{body['task_id']}")
@@ -184,6 +187,7 @@ async def test_second_round_ready_creates_task_with_trigger_message(
     assert task.json()["trigger_message_id"] == messages[2]["id"]
     # ready 后画像写回 filters_snapshot 与标量列。
     assert restored.json()["filters"]["brainstorm_profile"]["goal"] == "达人投放"
+    assert restored.json()["filters"]["brainstorm_profile"]["region"] == "杭州"
     assert restored.json()["brand"] == "欧诗漫"
     assert restored.json()["category"] == "美妆护肤"
     assert restored.json()["platforms"] == ["xiaohongshu"]
@@ -381,6 +385,17 @@ async def test_build_agent_context_without_profile_keeps_text_period(
     # 无画像时沿用消息文本解析出的默认时间窗（近 3 个月）。
     assert context.requested_period["unit"] == "month"
     assert context.requested_period["value"] == 3
+
+
+def test_parameter_checklist_includes_region_and_prompt_mentions_it() -> None:
+    from app.brainstorm.parameters import BRAINSTORM_PARAMETERS
+    from app.model.prompts import BRAINSTORM_PROMPT
+
+    keys = [item["key"] for item in BRAINSTORM_PARAMETERS]
+    assert "region" in keys
+    entry = next(item for item in BRAINSTORM_PARAMETERS if item["key"] == "region")
+    assert entry["label"] == "目标地区"
+    assert "region" in BRAINSTORM_PROMPT.system
 
 
 def test_param_profile_period_override_validation() -> None:

@@ -20,11 +20,20 @@ class ExportFieldContract(BaseModel):
 
 def build_export_field_contract(workspace: WorkspaceSession) -> ExportFieldContract:
     filters = workspace.filters_snapshot or {}
-    locations = filters.get("target_fan_locations", [])
-    location_label = ",".join(str(value) for value in locations) if isinstance(locations, list) else ""
-    location_label = location_label or "目标地区"
-    age_label = workspace.target_audience or "目标年龄段"
-    industry_label = workspace.category or "行业"
+    # 地区标签读取顺序：brainstorm 画像 region → 旧键 target_fan_locations（list join）→ 兜底。
+    profile = filters.get("brainstorm_profile") or {}
+    region = ""
+    if isinstance(profile, dict):
+        region = str(profile.get("region") or "").strip()
+    if not region:
+        locations = filters.get("target_fan_locations", [])
+        if isinstance(locations, list):
+            region = ",".join(str(value) for value in locations)
+    location_label = region or "目标地区"
+    # target_audience/category 是自由文本：strip 后空串走兜底；年龄段截断 20 字符，
+    # 避免整段受众描述被当成导出字段名。
+    age_label = (workspace.target_audience or "").strip()[:20] or "目标年龄段"
+    industry_label = (workspace.category or "").strip() or "行业"
     return ExportFieldContract(
         version=EXPORT_FIELD_CONTRACT_VERSION,
         required_field_names=(

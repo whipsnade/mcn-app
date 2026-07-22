@@ -54,6 +54,13 @@ BRAINSTORM_PARAMETERS: tuple[dict[str, str], ...] = (
         "required": "必填",
         "mcp_mapping": "指导工具选择与报告侧重",
     },
+    {
+        "key": "region",
+        "label": "目标地区",
+        "description": "目标地区（达人粉丝地域口径，如杭州/上海）",
+        "required": "可选",
+        "mcp_mapping": "受众地域过滤",
+    },
 )
 
 __all__ = ["BRAINSTORM_PARAMETERS"]
