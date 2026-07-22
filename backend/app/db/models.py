@@ -13,6 +13,7 @@ from app.reporting.models import (
     TaskCandidatePoolItem,
     UserKolFavorite,
 )
+from app.selection.models import SessionKolSelection
 from app.tasks.models import AnalysisTask, TaskEvent
 from app.workspace.models import Message, WorkspaceSession
 
@@ -32,6 +33,7 @@ __all__ = [
     "ModelPromptLog",
     "ModelRun",
     "QuickMcpCall",
+    "SessionKolSelection",
     "TaskCandidate",
     "TaskCandidatePool",
     "TaskCandidatePoolItem",

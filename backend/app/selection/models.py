@@ -10,6 +10,12 @@ from app.db.base import Base
 
 
 class SessionKolSelection(Base):
+    """Session-scoped KOL shortlist, deduplicated by (session_id, platform, kol_uid).
+
+    Replaces the old pipeline's task_candidates system: selections accumulate
+    across agent tasks within a session instead of being recomputed per task.
+    """
+
     __tablename__ = "session_kol_selections"
     __table_args__ = (
         UniqueConstraint(
