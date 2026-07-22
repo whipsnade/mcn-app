@@ -252,13 +252,13 @@ def _summary_values(candidate: ExportCandidate) -> list[Any]:
 
 def _render_rating_summary(sheet: Any, candidates: Sequence[ExportCandidate], *, start_row: int = 21) -> None:
     _write_styled_row(sheet, start_row, ["评级", "星级", "分数区间", "达人数量", "占比"], source_row=21)
-    buckets = (("强烈推荐", "★★★★★", "≥78", 78, 101), ("推荐", "★★★★", "62-77", 62, 78), ("谨慎推荐", "★★★", "48-61", 48, 62), ("可考虑", "★★", "35-47", 35, 48), ("不推荐", "★", "<35", -1, 35))
+    buckets = (("重点推荐", "★★★★★", "≥78", 78, 101), ("推荐", "★★★★", "62-77", 62, 78), ("可考虑", "★★★", "48-61", 48, 62), ("观察", "★★", "<48", -1, 48))
     total = len(candidates)
     for bucket_index, (label, stars, interval, lower, upper) in enumerate(buckets):
         row = start_row + 1 + bucket_index
         count = sum(1 for item in candidates if item.total_score is not None and lower <= item.total_score < upper)
         ratio = count / total if total else 0
-        # Rows 22:26 are the template's five rating styles. Reuse them even
+        # Rows 22:26 are the template's rating styles. Reuse them even
         # when the rating table is moved below an oversized candidate pool.
         _write_styled_row(sheet, row, [label, stars, interval, count, ratio], source_row=22 + bucket_index)
         sheet.cell(row, 5).number_format = "0.0%"
@@ -271,9 +271,9 @@ def _render_rating_summary(sheet: Any, candidates: Sequence[ExportCandidate], *,
     for chart in getattr(sheet, "_charts", ()):
         for series in getattr(chart, "ser", ()):
             if getattr(getattr(series, "cat", None), "numRef", None) is not None:
-                series.cat.numRef.f = f"'{sheet.title}'!$R${start_row}:$R${start_row + 4}"
+                series.cat.numRef.f = f"'{sheet.title}'!$R${start_row}:$R${start_row + 3}"
             if getattr(getattr(series, "val", None), "numRef", None) is not None:
-                series.val.numRef.f = f"'{sheet.title}'!$S${start_row}:$S${start_row + 4}"
+                series.val.numRef.f = f"'{sheet.title}'!$S${start_row}:$S${start_row + 3}"
 
 
 def _render_detail_standard_blocks(sheet: Any, metadata: dict[str, Any], candidates: Sequence[ExportCandidate]) -> None:
@@ -416,11 +416,10 @@ def _render_methodology_preserving_template(
     sheet["A15"] = "二、评级映射"
     _write_styled_row(sheet, 16, ["评级", "星级", "分数区间", "建议"], source_row=16)
     ratings = [
-        ("强烈推荐", "★★★★★", "≥78", "优先合作，匹配度极高"),
+        ("重点推荐", "★★★★★", "≥78", "优先合作，匹配度极高"),
         ("推荐", "★★★★", "62-77", "建议合作，匹配度良好"),
-        ("谨慎推荐", "★★★", "48-61", "可考虑合作，需关注短板"),
-        ("可考虑", "★★", "35-47", "匹配度一般，需评估性价比"),
-        ("不推荐", "★", "<35", "匹配度低，不建议合作"),
+        ("可考虑", "★★★", "48-61", "可考虑合作，需关注短板"),
+        ("观察", "★★", "<48", "匹配度偏低，保持观察"),
     ]
     for row, values in enumerate(ratings, start=17):
         _write_styled_row(sheet, row, values, source_row=row)
@@ -522,7 +521,7 @@ def _apply_score_fill(cell: Any, score: float | None) -> None:
 
 
 def _apply_rating_fill(cell: Any, rating: str) -> None:
-    colors = {"强烈推荐": "318B32", "推荐": "63BE7B", "谨慎推荐": "FFDD35", "可考虑": "FF9900", "不推荐": "F03434"}
+    colors = {"重点推荐": "318B32", "推荐": "63BE7B", "可考虑": "FFDD35", "观察": "FFEB84"}
     cell.fill = PatternFill("solid", fgColor=colors.get(rating, "FFFFFF"))
 
 

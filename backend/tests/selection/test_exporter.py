@@ -61,6 +61,88 @@ def _candidate(index: int) -> ExportCandidate:
     )
 
 
+def _tier_candidate(rank: int, total: float, rating: str, stars: str) -> ExportCandidate:
+    return ExportCandidate(
+        rank=rank,
+        platform="xiaohongshu",
+        nickname=f"{rating}达人",
+        followers=10_000,
+        city="杭州市",
+        total_score=total,
+        rating=rating,
+        stars=stars,
+    )
+
+
+def _four_tier_candidates() -> list[ExportCandidate]:
+    return [
+        _tier_candidate(1, 90.0, "重点推荐", "★★★★★"),
+        _tier_candidate(2, 70.0, "推荐", "★★★★"),
+        _tier_candidate(3, 55.0, "可考虑", "★★★"),
+        _tier_candidate(4, 30.0, "观察", "★★"),
+    ]
+
+
+def test_rating_summary_counts_all_candidates_across_four_tiers() -> None:
+    """汇总表与图表辅助列必须覆盖新四档评级的全部候选人。"""
+    candidates = _four_tier_candidates()
+    content = render_workbook(
+        metadata={"brand": "评级测试", "category": "美食", "generated_at": "2026-07-22"},
+        candidates=candidates,
+    )
+
+    summary = load_workbook(BytesIO(content))["KOL匹配度筛选"]
+    # _render_summary: rating_title_row = max(20, 5 + n + 2)，评级表头在其下一行。
+    start_row = max(20, 5 + len(candidates) + 2) + 1
+
+    labels = [summary.cell(start_row + 1 + index, 1).value for index in range(4)]
+    assert labels == ["重点推荐", "推荐", "可考虑", "观察"]
+    counts = [summary.cell(start_row + 1 + index, 4).value for index in range(4)]
+    assert counts == [1, 1, 1, 1]
+    assert summary.cell(start_row + 5, 1).value is None  # 旧第五档不再写入
+
+    # 图表辅助列（R=评级, S=数量）：按 rating 文本匹配计数，四档都要统计到。
+    aux_labels = [summary.cell(start_row + index, 18).value for index in range(4)]
+    assert aux_labels == ["重点推荐", "推荐", "可考虑", "观察"]
+    aux_counts = [summary.cell(start_row + index, 19).value for index in range(4)]
+    assert sum(aux_counts) == len(candidates)
+    assert summary.cell(start_row + 4, 18).value is None
+
+
+def test_rating_fill_colors_cover_four_tiers() -> None:
+    candidates = _four_tier_candidates()
+    content = render_workbook(
+        metadata={"brand": "填充测试", "category": "美食", "generated_at": "2026-07-22"},
+        candidates=candidates,
+    )
+
+    summary = load_workbook(BytesIO(content))["KOL匹配度筛选"]
+    fills = [str(summary.cell(5 + index, 16).fill.fgColor.rgb) for index in range(4)]
+
+    assert fills[0].endswith("318B32")  # 重点推荐：最深强调色
+    assert fills[1].endswith("63BE7B")  # 推荐
+    assert fills[2].endswith("FFDD35")  # 可考虑
+    assert fills[3].endswith("FFEB84")  # 观察：最浅
+
+
+def test_methodology_rating_table_uses_four_tiers() -> None:
+    content = render_workbook(
+        metadata={"brand": "方法论测试", "category": "美食", "generated_at": "2026-07-22"},
+        candidates=[_candidate(1)],
+    )
+
+    sheet = load_workbook(BytesIO(content))["评分方法论与数据来源"]
+    rows = [(sheet.cell(17 + index, 1).value, sheet.cell(17 + index, 2).value,
+             sheet.cell(17 + index, 3).value) for index in range(4)]
+    assert rows == [
+        ("重点推荐", "★★★★★", "≥78"),
+        ("推荐", "★★★★", "62-77"),
+        ("可考虑", "★★★", "48-61"),
+        ("观察", "★★", "<48"),
+    ]
+    assert sheet.cell(21, 1).value is None  # 旧「不推荐」行不再写入
+
+
 def test_render_workbook_contains_all_candidates_and_template_sheets() -> None:
     content = render_workbook(
         metadata={
