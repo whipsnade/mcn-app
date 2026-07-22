@@ -189,6 +189,10 @@ class AgentLoopContext(BaseModel):
     # 用户行业画像描述（来自 users.industries 的业务视角翻译），供模型理解
     # "用户是谁"并自主选择贴合的工具路径；空字符串表示无画像。
     user_persona: str = ""
+    # KOL 圈选 Excel 导出字段契约（selection/contract.py 的 ExportFieldContract
+    # 序列化结果）：required_field_names/labels/notes 随会话画像动态生成，
+    # 告诉模型需要为每位达人采齐哪些导出字段；空 dict 表示无契约。
+    export_contract: dict[str, Any] = Field(default_factory=dict)
     # prompt 学习日志上下文（user_id/session_id/task_id/tags）；仅用于落库，
     # exclude=True 保证不进入发给模型的 prompt JSON。
     log_context: dict[str, Any] = Field(default_factory=dict, exclude=True)

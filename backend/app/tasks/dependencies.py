@@ -28,6 +28,7 @@ from app.orchestration.context import compress_messages
 from app.orchestration.loop import AgentDecision, AgentLoopContext
 from app.orchestration.routing import extract_requested_period
 from app.orchestration.schemas import PlannerTool
+from app.selection.contract import build_export_field_contract
 from app.selection.service import KolSelectionService
 from app.tasks.executor import TaskExecutor, TaskRunner
 from app.tasks.followups import FollowupSuggestionService
@@ -314,6 +315,7 @@ class TaskExecutionDependencies:
             user_persona=describe_user_persona(
                 list(user.industries) if user is not None and user.industries else []
             ),
+            export_contract=build_export_field_contract(workspace).model_dump(mode="json"),
         )
         context.log_context = {
             "user_id": user_id,
