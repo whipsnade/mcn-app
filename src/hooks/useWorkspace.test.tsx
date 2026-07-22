@@ -954,6 +954,27 @@ describe('useWorkspace', () => {
     expect(result.current.activeSession?.analysis?.analysisReportId).toBe('analysis-report-1');
   });
 
+  it('fetches a session-level analysis report (task_id null) announced by report.updated', async () => {
+    vi.mocked(getSession).mockResolvedValue({
+      ...restoredSession,
+      status: 'analyzing',
+      analysis: { taskId: 'task-1', status: 'running', kind: 'agent' },
+    });
+    vi.mocked(useTaskStream).mockReturnValue({
+      taskId: 'task-1', lastEventId: 1, assistantDraft: '', connection: 'connected',
+      status: 'running', visibleAnalysisReportId: 'analysis-report-kol',
+    });
+    vi.mocked(getAnalysisReport).mockResolvedValue({
+      id: 'analysis-report-kol', task_id: null, version: 1, title: 'KOL 圈选分析',
+      blocks: [], conclusion: null, status: 'completed', generated_at: '2026-07-22T10:00:00Z',
+    });
+    const { result } = renderHook(() => useWorkspace('user-a'));
+
+    await waitFor(() => expect(result.current.activeSession?.analysisReport?.id).toBe('analysis-report-kol'));
+    expect(getAnalysisReport).toHaveBeenCalledWith('analysis-report-kol');
+    expect(result.current.activeSession?.analysis?.analysisReportId).toBe('analysis-report-kol');
+  });
+
   it('ignores an analysis report response that belongs to another task', async () => {
     vi.mocked(getSession).mockResolvedValue({
       ...restoredSession,

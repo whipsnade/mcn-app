@@ -9,6 +9,9 @@ from app.billing.service import InsufficientPointsError
 from app.db.session import SessionFactory
 from app.identity.models import User
 from app.mcp_gateway.contracts import DataTapService
+from app.model.contracts import ModelPlanInvalidError, StructuredResult
+from app.reporting.blocks import MetricGridBlock, MetricItem, ReportDocument
+from app.reporting.models import AnalysisReport
 from app.orchestration.loop import (
     AgentDecision,
     AgentLoopContext,
@@ -189,9 +192,14 @@ class _FakeGateway:
 class _FakeArtifacts:
     def __init__(self) -> None:
         self.conclusions: list[tuple[str, str]] = []
+        self.calls: list[str] = []
 
     async def write_conclusion_message(self, task_id, conclusion):
+        self.calls.append("conclusion")
         self.conclusions.append((task_id, conclusion))
+
+    async def auto_kol_analysis(self, task_id):
+        self.calls.append("auto_analysis")
 
 
 def _task(plan_json: dict | None = None) -> SimpleNamespace:
@@ -269,6 +277,50 @@ async def test_agent_loop_insufficient_balance_without_evidence_has_no_message()
 
     assert store.terminal == "insufficient_balance"
     assert artifacts.conclusions == []
+    assert artifacts.calls == []
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_completed_runs_auto_kol_analysis_after_conclusion() -> None:
+    task = _task()
+    store = _FakeStore(task)
+    decider = _ScriptedDecider([_call(), _finish("已圈选 3 位达人。")])
+    gateway = _FakeGateway([(_settled(),)])
+    artifacts = _FakeArtifacts()
+
+    await _executor(store, decider, gateway, artifacts).run(task.id)
+
+    assert store.terminal == "completed"
+    # 顺序契约：先结论消息、后自动分析，保证 report.updated 先于终态事件发出。
+    assert artifacts.calls == ["conclusion", "auto_analysis"]
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_completed_with_warnings_runs_auto_kol_analysis_after_conclusion() -> None:
+    task = _task()
+    store = _FakeStore(task)
+    decider = _ScriptedDecider([_call(), _call(), _finish()])
+    gateway = _FakeGateway([(_released(),), (_settled(),)])
+    artifacts = _FakeArtifacts()
+
+    await _executor(store, decider, gateway, artifacts).run(task.id)
+
+    assert store.terminal == "completed_with_warnings:mcp_partial_failure"
+    assert artifacts.calls == ["conclusion", "auto_analysis"]
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_insufficient_balance_with_evidence_runs_auto_kol_analysis() -> None:
+    task = _task()
+    store = _FakeStore(task)
+    decider = _ScriptedDecider([_call(), _call()])
+    gateway = _FakeGateway([(_settled(),), InsufficientPointsError()])
+    artifacts = _FakeArtifacts()
+
+    await _executor(store, decider, gateway, artifacts).run(task.id)
+
+    assert store.terminal == "insufficient_balance"
+    assert artifacts.calls == ["conclusion", "auto_analysis"]
 
 
 @pytest.mark.asyncio
@@ -675,6 +727,9 @@ async def _cleanup_leased_task(ids: dict[str, str]) -> None:
         await db.execute(delete(TaskEvent).where(TaskEvent.task_id == ids["task_id"]))
         await db.execute(delete(AnalysisTask).where(AnalysisTask.id == ids["task_id"]))
         await db.execute(
+            delete(AnalysisReport).where(AnalysisReport.session_id == ids["session_id"])
+        )
+        await db.execute(
             delete(SessionKolSelection).where(
                 SessionKolSelection.session_id == ids["session_id"]
             )
@@ -773,5 +828,176 @@ async def test_write_conclusion_message_empty_conclusion_falls_back_to_selection
             )
             assert event is not None
             assert event.payload_json["text"] == message.content
+    finally:
+        await _cleanup_leased_task(ids)
+
+
+def _analysis_document() -> ReportDocument:
+    return ReportDocument(
+        title="KOL 圈选分析",
+        conclusion="名单质量良好。",
+        blocks=[MetricGridBlock(items=[MetricItem(label="圈选总数", value=2)])],
+    )
+
+
+class _FakeAnalysisModel:
+    """kol_analysis 专用模型 stub：document 为 None 时模拟模型输出校验失败。"""
+
+    def __init__(self, document: ReportDocument | None) -> None:
+        self.document = document
+
+    async def complete_json(self, request):
+        if self.document is None:
+            raise ModelPlanInvalidError("MODEL_PLAN_INVALID", retryable=False)
+        return StructuredResult(
+            value=self.document,
+            usage=None,
+            request_id="req-test",
+            regeneration_count=0,
+        )
+
+
+async def _seed_selection_rows(ids: dict[str, str], count: int) -> None:
+    now = datetime.now(UTC).replace(tzinfo=None)
+    async with SessionFactory.begin() as db:
+        for index in range(count):
+            db.add(
+                SessionKolSelection(
+                    id=str(uuid4()),
+                    user_id=ids["user_id"],
+                    session_id=ids["session_id"],
+                    platform="xiaohongshu",
+                    kol_uid=f"uid-{index}",
+                    nickname=f"达人{index}",
+                    fields_json={},
+                    score_json={"total": 80.0, "rating": "重点推荐"},
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+
+
+@pytest.mark.asyncio
+async def test_auto_kol_analysis_builds_session_report_and_emits_event() -> None:
+    worker_id = f"test-worker-{uuid4()}"
+    ids = await _create_leased_task(worker_id)
+    try:
+        await _seed_selection_rows(ids, 2)
+        artifacts = _TaskArtifacts(worker_id, model=_FakeAnalysisModel(_analysis_document()))
+
+        await artifacts.auto_kol_analysis(ids["task_id"])
+
+        async with SessionFactory() as db:
+            report = await db.scalar(
+                select(AnalysisReport).where(
+                    AnalysisReport.session_id == ids["session_id"]
+                )
+            )
+            assert report is not None
+            # 自动分析与手动 kol-analysis 同契约：会话级报告（task_id 为 NULL）。
+            assert report.task_id is None
+            assert report.version == 1
+            assert report.title == "KOL 圈选分析"
+            event = await db.scalar(
+                select(TaskEvent).where(
+                    TaskEvent.task_id == ids["task_id"],
+                    TaskEvent.event_type == "report.updated",
+                )
+            )
+            assert event is not None
+            # payload 格式与任务级 build() 一致，前端 reducer 按 report_id 拉取展示。
+            assert event.payload_json == {
+                "report_id": report.id,
+                "version": 1,
+                "phase": "ai_summary",
+                "label": "KOL 分析报告已生成",
+            }
+    finally:
+        await _cleanup_leased_task(ids)
+
+
+@pytest.mark.asyncio
+async def test_auto_kol_analysis_skips_empty_selection() -> None:
+    worker_id = f"test-worker-{uuid4()}"
+    ids = await _create_leased_task(worker_id)
+    try:
+        artifacts = _TaskArtifacts(worker_id, model=_FakeAnalysisModel(_analysis_document()))
+
+        await artifacts.auto_kol_analysis(ids["task_id"])
+
+        async with SessionFactory() as db:
+            assert (
+                await db.scalar(
+                    select(AnalysisReport).where(
+                        AnalysisReport.session_id == ids["session_id"]
+                    )
+                )
+                is None
+            )
+            assert (
+                await db.scalar(
+                    select(TaskEvent).where(
+                        TaskEvent.task_id == ids["task_id"],
+                        TaskEvent.event_type == "report.updated",
+                    )
+                )
+                is None
+            )
+    finally:
+        await _cleanup_leased_task(ids)
+
+
+@pytest.mark.asyncio
+async def test_auto_kol_analysis_without_model_is_noop() -> None:
+    worker_id = f"test-worker-{uuid4()}"
+    ids = await _create_leased_task(worker_id)
+    try:
+        await _seed_selection_rows(ids, 2)
+        artifacts = _TaskArtifacts(worker_id, model=None)
+
+        await artifacts.auto_kol_analysis(ids["task_id"])
+
+        async with SessionFactory() as db:
+            assert (
+                await db.scalar(
+                    select(AnalysisReport).where(
+                        AnalysisReport.session_id == ids["session_id"]
+                    )
+                )
+                is None
+            )
+    finally:
+        await _cleanup_leased_task(ids)
+
+
+@pytest.mark.asyncio
+async def test_auto_kol_analysis_model_error_does_not_propagate() -> None:
+    worker_id = f"test-worker-{uuid4()}"
+    ids = await _create_leased_task(worker_id)
+    try:
+        await _seed_selection_rows(ids, 2)
+        artifacts = _TaskArtifacts(worker_id, model=_FakeAnalysisModel(None))
+
+        # 模型错误只记 warning，绝不向执行器传播阻塞任务收尾。
+        await artifacts.auto_kol_analysis(ids["task_id"])
+
+        async with SessionFactory() as db:
+            assert (
+                await db.scalar(
+                    select(AnalysisReport).where(
+                        AnalysisReport.session_id == ids["session_id"]
+                    )
+                )
+                is None
+            )
+            assert (
+                await db.scalar(
+                    select(TaskEvent).where(
+                        TaskEvent.task_id == ids["task_id"],
+                        TaskEvent.event_type == "report.updated",
+                    )
+                )
+                is None
+            )
     finally:
         await _cleanup_leased_task(ids)

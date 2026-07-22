@@ -28,6 +28,7 @@ from app.orchestration.context import compress_messages
 from app.orchestration.loop import AgentDecision, AgentLoopContext
 from app.orchestration.routing import extract_requested_period
 from app.orchestration.schemas import PlannerTool
+from app.selection.analysis import run_kol_analysis
 from app.selection.contract import build_export_field_contract
 from app.selection.service import KolSelectionService
 from app.tasks.executor import TaskExecutor, TaskRunner
@@ -134,6 +135,7 @@ class _TaskArtifacts:
 
     def __init__(self, worker_id: str, model) -> None:
         self._worker_id = worker_id
+        self._model = model
         self._followups = FollowupSuggestionService(model)
 
     async def prepare_followups(self, task_id: str) -> bool:
@@ -141,6 +143,48 @@ class _TaskArtifacts:
 
     async def generate_followups(self, task_id: str) -> bool:
         return await self._followups.generate(task_id)
+
+    async def auto_kol_analysis(self, task_id: str) -> None:
+        """任务收尾时自动生成会话级 KOL 分析报告（尽力而为，绝不阻塞终态）。
+
+        名单为空或模型不可用时静默跳过；任何异常只记 warning。成功时向任务
+        事件流 append report.updated（payload 与任务级 build() 同格式），
+        调用方保证它在终态事件之前发出。
+        """
+        if self._model is None:
+            return
+        try:
+            async with SessionFactory.begin() as db:
+                task = await db.get(AnalysisTask, task_id)
+                if task is None:
+                    return
+                count = await KolSelectionService(db).count_selection(
+                    session_id=task.session_id
+                )
+                if count == 0:
+                    logger.debug(
+                        "auto_kol_analysis skipped: empty selection task_id=%s", task_id
+                    )
+                    return
+                report = await run_kol_analysis(
+                    db,
+                    self._model,
+                    user_id=task.user_id,
+                    session_id=task.session_id,
+                )
+                await TaskRepository(db).append_event(
+                    task.id,
+                    task.user_id,
+                    TaskEventType.REPORT_UPDATED,
+                    {
+                        "report_id": report.id,
+                        "version": report.version,
+                        "phase": "ai_summary",
+                        "label": "KOL 分析报告已生成",
+                    },
+                )
+        except Exception:
+            logger.warning("auto_kol_analysis_failed task_id=%s", task_id, exc_info=True)
 
     async def write_conclusion_message(self, task_id: str, conclusion: str) -> None:
         """任务收尾：把 finish 结论写成一条 assistant 消息（幂等，重试安全）。"""

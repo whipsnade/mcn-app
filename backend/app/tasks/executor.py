@@ -74,6 +74,8 @@ class McpBatchGateway(Protocol):
 class TaskArtifacts(Protocol):
     async def write_conclusion_message(self, task_id: str, conclusion: str) -> Any: ...
 
+    async def auto_kol_analysis(self, task_id: str) -> Any: ...
+
     async def prepare_followups(self, task_id: str) -> bool: ...
 
     async def generate_followups(self, task_id: str) -> bool: ...
@@ -438,6 +440,7 @@ class TaskExecutor:
             # insufficient_balance 终态；无任何证据则直接收尾。
             if has_settled and self.artifacts is not None:
                 await self.artifacts.write_conclusion_message(task.id, finish_conclusion)
+                await self.artifacts.auto_kol_analysis(task.id)
             await self.repository.mark_insufficient_balance(task.id, self.worker_id)
             return
         if not has_settled:
@@ -447,6 +450,9 @@ class TaskExecutor:
             return
         if self.artifacts is not None:
             await self.artifacts.write_conclusion_message(task.id, finish_conclusion)
+            # 结论消息之后、终态标记之前触发自动 KOL 分析：report.updated
+            # 事件先于任务终态事件发出（SSE 流尚未关闭）。
+            await self.artifacts.auto_kol_analysis(task.id)
         if has_failures:
             await self.repository.mark_completed_with_warnings(
                 task.id,

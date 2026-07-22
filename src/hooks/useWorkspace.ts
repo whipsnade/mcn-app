@@ -541,9 +541,11 @@ export function useWorkspace(userId?: string) {
       const requestedReportId = currentTaskRuntime.visibleAnalysisReportId;
       void getAnalysisReport(requestedReportId)
         .then(report => {
+          // 任务级报告必须属于当前任务；会话级报告（task_id 为 null，自动/手动
+          // KOL 分析）始终接受，与 hydrateAnalysis/toSession 的口径一致。
           if (
             generationRef.current !== generation
-            || report.task_id !== requestedTaskId
+            || (report.task_id !== null && report.task_id !== requestedTaskId)
           ) return;
           setSessions(current => current.map(session => session.analysis?.taskId === requestedTaskId
             && session.analysis.analysisReportId === requestedReportId ? {
