@@ -19,6 +19,9 @@ export async function downloadKolSelection(sessionId: string): Promise<void> {
   const anchor = document.createElement('a');
   anchor.href = url;
   anchor.download = filename;
+  // Safari/Firefox 对未挂载的 <a> 及同步 revoke 会取消下载，挂到 DOM 并延迟回收。
+  document.body.appendChild(anchor);
   anchor.click();
-  URL.revokeObjectURL(url);
+  anchor.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
 }

@@ -4,7 +4,7 @@ import {
 import {
   Bar, BarChart, Cell, Legend, Line, LineChart, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis,
 } from 'recharts';
-import { Fragment, useState } from 'react';
+import { Fragment, useEffect, useState } from 'react';
 
 import { downloadKolSelection, runKolAnalysis } from '../api/kolSelection';
 import type {
@@ -24,6 +24,15 @@ const chartColors = ['#4f46e5', '#818cf8', '#14b8a6', '#f59b00', '#0ea5e9', '#f4
 
 function isTerminal(status?: string): boolean {
   return status === 'completed' || status === 'completed_with_warnings' || status === 'insufficient_balance';
+}
+
+// 手动分析的失败文案：409 无圈选 / 同 tick 双击引发的版本冲突单独提示。
+function analyzeErrorMessage(reason: unknown): string {
+  if (reason instanceof Error) {
+    if (reason.message === 'NO_KOL_SELECTION') return '暂无圈选达人，请先在会话中完成圈选';
+    if (reason.message === 'REPORT_VERSION_CONFLICT') return '报告生成中，请稍后刷新查看';
+  }
+  return '分析失败，请稍后重试';
 }
 
 function textOf(value: unknown): string {
@@ -313,6 +322,13 @@ export default function UniversalReport({ report, taskStatus, sessionId, selecti
   const [exporting, setExporting] = useState(false);
   const [actionError, setActionError] = useState<string>();
 
+  // 面板实例跨会话复用：切换会话时重置本地操作状态，避免把上一个会话的 loading/错误带过来。
+  useEffect(() => {
+    setAnalyzing(false);
+    setExporting(false);
+    setActionError(undefined);
+  }, [sessionId]);
+
   const handleAnalyze = async () => {
     if (!sessionId || analyzing) return;
     setAnalyzing(true);
@@ -321,9 +337,7 @@ export default function UniversalReport({ report, taskStatus, sessionId, selecti
       const nextReport = await runKolAnalysis(sessionId);
       onReportReady?.(nextReport);
     } catch (reason) {
-      setActionError(reason instanceof Error && reason.message === 'NO_KOL_SELECTION'
-        ? '暂无圈选达人，请先在会话中完成圈选'
-        : '分析失败，请稍后重试');
+      setActionError(analyzeErrorMessage(reason));
     } finally {
       setAnalyzing(false);
     }

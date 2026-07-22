@@ -693,6 +693,29 @@ describe('useWorkspace', () => {
     expect(result.current.isAnalyzing).toBe(true);
   });
 
+  it('keeps a session-level analysis report when starting a new task', async () => {
+    vi.mocked(getSession).mockResolvedValue({
+      ...restoredSession,
+      analysisReport: {
+        id: 'analysis-report-kol', task_id: null, version: 1, title: 'KOL 匹配度分析',
+        blocks: [], conclusion: null, status: 'completed', generated_at: '2026-07-21T10:00:00Z',
+      },
+    });
+    vi.mocked(createTask).mockResolvedValue({
+      id: 'task-new', session_id: 'session-1', status: 'pending', estimated_points: 0,
+      error_code: null, latest_report_id: null,
+    });
+    const { result } = renderHook(() => useWorkspace('user-a'));
+    await waitFor(() => expect(result.current.activeSession?.analysisReport?.id).toBe('analysis-report-kol'));
+
+    await act(async () => {
+      await result.current.appendMessage('再跑一轮分析');
+    });
+
+    expect(result.current.activeTaskId).toBe('task-new');
+    expect(result.current.activeSession?.analysisReport?.id).toBe('analysis-report-kol');
+  });
+
   it('clarifies an unready blank session through brainstorm instead of creating a task', async () => {
     vi.mocked(getSession).mockResolvedValue(blankSession);
     const pending = deferred<ApiBrainstormResponse>();

@@ -135,6 +135,24 @@ describe('UniversalReport', () => {
     await waitFor(() => expect(downloadKolSelection).toHaveBeenCalledWith('session-1'));
   });
 
+  it('shows an inline error when the export fails', async () => {
+    vi.mocked(downloadKolSelection).mockRejectedValue(new Error('HTTP_500'));
+    render(<UniversalReport sessionId="session-1" selectionCount={3} />);
+
+    fireEvent.click(screen.getByRole('button', { name: '导出 Excel' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('导出失败，请稍后重试');
+  });
+
+  it('maps a report version conflict to a friendly message', async () => {
+    vi.mocked(runKolAnalysis).mockRejectedValue(new Error('REPORT_VERSION_CONFLICT'));
+    render(<UniversalReport sessionId="session-1" selectionCount={3} />);
+
+    fireEvent.click(screen.getByRole('button', { name: '分析' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('报告生成中，请稍后刷新查看');
+  });
+
   it('keeps a placeholder card for the upcoming brand/campaign analysis', () => {
     render(<UniversalReport sessionId="session-1" selectionCount={3} />);
 

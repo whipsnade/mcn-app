@@ -28,6 +28,11 @@ function taskIsInProgress(status: string | undefined): boolean {
   return !isTerminalTaskStatus(status);
 }
 
+// 发起新任务时清空旧任务的分析报告；会话级报告（task_id 为 null，手动 KOL 分析）不随任务失效。
+function reportAfterNewTask(session: Session): Session['analysisReport'] {
+  return session.analysisReport?.task_id === null ? session.analysisReport : undefined;
+}
+
 interface TaskCreateLock {
   sessionId: string;
   token: symbol;
@@ -360,7 +365,7 @@ export function useWorkspace(userId?: string) {
           analysis: taskId
             ? { taskId, status: 'pending', kind: 'agent' as const }
             : session.analysis,
-          analysisReport: taskId ? undefined : session.analysisReport,
+          analysisReport: taskId ? reportAfterNewTask(session) : session.analysisReport,
         } : session));
         if (taskId && activeSessionIdRef.current === requestedSessionId) {
           setActiveTaskId(taskId);
@@ -382,7 +387,7 @@ export function useWorkspace(userId?: string) {
         status: 'analyzing',
         messages: [...session.messages, pendingMessage],
         analysis: { taskId: task.id, status: task.status, kind: task.kind },
-        analysisReport: undefined,
+        analysisReport: reportAfterNewTask(session),
       } : session));
       if (activeSessionIdRef.current === requestedSessionId) {
         setActiveTaskId(task.id);
@@ -428,7 +433,7 @@ export function useWorkspace(userId?: string) {
         status: 'analyzing',
         messages: session.messages.map(item => item.id === messageId ? { ...item, taskId: task.id } : item),
         analysis: { taskId: task.id, status: task.status, kind: task.kind },
-        analysisReport: undefined,
+        analysisReport: reportAfterNewTask(session),
       } : session));
       if (activeSessionIdRef.current === activeSession.id) {
         setActiveTaskId(task.id);
