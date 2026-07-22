@@ -36,8 +36,8 @@
 
 - 删除 `backend/app/orchestration/bi_requirements.py`；`AgentLoopContext.required_metrics` 字段移除；`build_agent_context` 不再注入。
 - `tasks/executor.py`：移除 finish 覆盖门禁（`missing_metrics` 回喂、`finish_reject_N`、streak 常量与放行逻辑）；**保留**工具级空结果熔断（`_MAX_EMPTY_CALLS_PER_TOOL=2`，与 BI 无关的省积分护栏）及其回喂。
-- 任务结束不再自动 `build_analysis_report`、不再自动发 `report.updated`；任务 finish 时把模型 finish 的结论文本写为 assistant 消息（替代报告摘要流 `stream_analysis_summary`）。
-- `reporting` 模块整体保留：收藏只读、`GET /api/v1/analysis-reports/{id}`、会话 DTO `latest_analysis_report` 均不动——品牌/活动 BI 区块只是留空。
+- 任务结束不再自动 `build_analysis_report`、不再自动发 `report.updated`；任务 finish 时把模型面向用户的结论文本写为 assistant 消息（替代报告摘要流 `stream_analysis_summary`）。为此给 `AgentDecision`（`orchestration/loop.py`）的 finish 动作新增 `conclusion` 字段（面向用户、≤2000 字符，可选），prompt 同步要求；缺失时回退为固定文案「圈选完成，共圈选 N 位达人，可在右侧面板导出 Excel 或生成分析」。
+- `reporting` 模块整体保留：收藏只读不动——品牌/活动 BI 区块只是留空；`GET /api/v1/analysis-reports/{id}` 保留但鉴权改为按会话归属（`task_id` 可空后的必要调整，见 §5）。
 
 ### 2. 会话 prompt 改为圈选导向
 
@@ -57,7 +57,7 @@
   - `normalize.py`：两族平台响应解析（从 `ff3b652` 恢复改造），产出统一字段字典。
   - `scoring.py`：8 维度确定性评分（权重同模板），输出维度分、综合分、评级（重点推荐/推荐/可考虑/观察）；缺失字段按规则处理不编造。
   - `service.py`：upsert（去重合并，新数据覆盖空值不覆盖已有值）、列表查询。
-- executor 挂钩：KOL 搜索/榜单类工具 settled 后调用沉淀；解析/写库失败只记 warning，不阻塞循环。
+- executor 挂钩：KOL 搜索/榜单类工具 settled 后调用沉淀（具体工具名清单在规划时从 `mcp_gateway/registry.py` 的 `DYNAMIC_TOOL_ALLOWLIST` 枚举）；解析/写库失败只记 warning，不阻塞循环。
 - 会话 DTO 增加 `kol_selection_count`。
 
 ### 4. Excel 导出（恢复旧管线）
@@ -69,12 +69,16 @@
 
 ### 5. 手动 KOL 分析
 
-`POST /api/v1/sessions/{id}/kol-analysis`（需认证、校验会话归属）：
+`POST /api/v1/sessions/{id}/kol-analysis`（需认证、校验会话归属，同步返回完整报告 JSON）：
 
 1. 代码聚合名单数据为摘要（平台分布、评级分布、粉丝量级分桶、城市 TOP10、互动率分桶、TOP10 达人）+ 会话画像（brand/category/audience/period）。
 2. 提交模型（新 `KOL_ANALYSIS_PROMPT`，走 `complete_json`，log_context purpose="kol_analysis"）输出标准 `ReportDocument`。
-3. 复用 `AnalysisReportService.build` 版本化落库 + 发 `report.updated` 事件。
-4. 零 MCP 调用、零积分（仅模型 tokens）；名单为空返回 409。
+3. **报告落库改为会话级**（评审定案）：`AnalysisReportService.build` 现有契约要求 `task_id` NOT NULL 且按任务幂等，与"可重复点击、名单增长后再分析"冲突。迁移 0020 同步改造 `analysis_reports`：`task_id` 改可空（`session_id` 列自迁移 0015 起已存在，NOT NULL + FK，无需新建）、新增唯一约束 `(session_id, version)`（原 `(task_id, version)` 保留）；`build` 增加会话级路径——每次点击生成新版本（version = 该会话 max+1），不做幂等返回。**迁移数据检查**：存量任务级报告 version 按任务编号，同一会话两个任务可能各有一行 version=1，与新唯一约束冲突——迁移需先按 `(session_id, created_at)` 重编号存量 version（或明确清空开发库后迁移；优先选重编号——按 `(session_id, created_at)` 排序重排 version，迁移可在含数据开发库上重复验证）。
+4. **不走 SSE**：`report.updated` 事件依赖任务事件流，同步端点没有任务；前端直接用 POST 响应刷新面板。刷新页面后的恢复展示需同步改三个点（评审核实）：
+   - `AnalysisReportService.get_owned_report`（`analysis_reports.py:124-137`）现经 `AnalysisTask` join 鉴权，`task_id` 为 NULL 时查不到——改为直接按 `AnalysisReport.session_id` join `WorkspaceSession` 鉴权（任务级与会话级报告统一走 session 归属判断）；
+   - `AnalysisReportRead.task_id` / `AnalysisReportSummary.task_id`（`reporting/schemas.py:21,32`）改为 `str | None`；
+   - 前端 `toSession`（`src/api/sessions.ts:47-50`）现要求 `latest_analysis_report.task_id === latest_task.id` 且 `latest_task` 为空时无 analysis 块——改为：会话级报告（task_id 为 null）直接使用其 id，不再依赖 latest_task 匹配。
+5. 零 MCP 调用、零积分（仅模型 tokens）；名单为空返回 409 `NO_KOL_SELECTION`（与导出端点统一错误码）。
 
 重新设计的 7 个分析项（块类型）：
 
@@ -89,23 +93,23 @@
 ### 6. 前端改造
 
 - `UniversalReport.tsx`：右上角加「分析」「导出 Excel」按钮；空态显示「已圈 N 人，点击分析生成 KOL 分析报告」；品牌/活动区块留空占位。
-- 分析按钮调 `POST /sessions/{id}/kol-analysis`，复用 SSE `report.updated` 链路刷新；导出按钮直接触发浏览器下载。
-- `contracts.ts`：`ApiSession` 增加 `kol_selection_count`。
+- 分析按钮调 `POST /sessions/{id}/kol-analysis`，**直接用同步响应渲染报告**，并同步更新会话状态中的 `analysisReportId`（与刷新恢复路径收敛到同一数据源）；导出按钮直接触发浏览器下载。
+- `contracts.ts`：`ApiSession` 增加 `kol_selection_count`；`ApiAnalysisReportSummary.task_id` / `ApiAnalysisReport.task_id` 镜像后端改为 `string | null`。
 
 ## 错误处理
 
 - 沉淀解析失败：记 warning 跳过该条，不影响任务循环。
-- 导出/分析时名单为空：409 带明确错误码，前端 toast 提示。
+- 导出/分析时名单为空：统一 409 `NO_KOL_SELECTION`，前端 toast 提示。
 - 分析模型输出非法 JSON：按现有 `complete_json` invalid 路径处理，返回 502 并允许重试；prompt 日志照常记录。
 - 评分缺字段：按模板规则「数据缺失字段按评分规则处理」，不编造。
 
 ## 测试
 
 - 后端 pytest：
-  - 删除/改造 `tests/orchestration/test_bi_requirements.py`、`test_loop.py` 与 `test_agent_loop.py` 中 BI 门禁相关用例；空结果熔断用例保留。
+  - 删除/改造 `tests/orchestration/test_bi_requirements.py`、`tests/orchestration/test_loop.py` 与 `tests/tasks/test_agent_loop.py` 中 BI 门禁相关用例；空结果熔断用例保留。
   - 新增 `tests/selection/`：normalize（两族平台样例）、scoring（权重/缺失字段/评级边界）、upsert 去重合并。
-  - 恢复改造旧 `test_exporter.py`（模板 4 sheet、空名单 409）、export/列表/kol-analysis 端点测试。
-- 前端 Vitest：`UniversalReport` 按钮渲染、空态、分析触发与 report.updated 刷新。
+  - 恢复改造旧 `test_exporter.py`（模板 4 sheet、空名单 409）、export/列表/kol-analysis 端点测试（含会话级报告版本递增）。
+- 前端 Vitest：`UniversalReport` 按钮渲染、空态、分析触发后按同步响应刷新。
 - 全量验证：ruff、pytest、`npm run test`、`npm run lint`、`npm run build`。
 
 ## 不做的事（YAGNI）
