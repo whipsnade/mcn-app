@@ -29,7 +29,6 @@ from app.model.prompts import (
     SUMMARY_PROMPT,
 )
 from app.orchestration.context import compress_messages
-from app.orchestration.bi_requirements import required_metrics_payload
 from app.orchestration.loop import AgentDecision, AgentLoopContext
 from app.orchestration.routing import extract_requested_period
 from app.orchestration.schemas import PlannerTool
@@ -455,7 +454,6 @@ class TaskExecutionDependencies:
             recent_messages=recent_messages,
             tools=tuple(PlannerTool.from_approved(item) for item in tools),
             allowed_channels=effective_channels,
-            required_metrics=required_metrics_payload(),
             current_date=date.today().isoformat(),
             requested_period=requested_period,
             param_profile=param_profile,

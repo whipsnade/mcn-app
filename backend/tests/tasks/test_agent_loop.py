@@ -145,15 +145,11 @@ class _FakeStore:
 
 
 class _FakeContextBuilder:
-    def __init__(self, required_metrics: tuple[dict, ...] = ()) -> None:
-        self._required_metrics = required_metrics
-
     async def build_agent_context(self, user_id, session_id):
         return AgentLoopContext(
             recent_messages=(),
             tools=(_tool(), _stat_tool()),
             allowed_channels=("xiaohongshu", "douyin"),
-            required_metrics=self._required_metrics,
         )
 
 
@@ -437,81 +433,6 @@ async def test_agent_loop_normalizes_model_arguments_before_invoking() -> None:
     assert arguments["start_time"] == "2025-07-18 23:59:59"
     # 持久化轨迹与网关实参一致（恢复重放依赖这一点）
     assert store.trajectories[-1]["steps"][0]["arguments"] == arguments
-
-
-_VOICE_METRIC = {
-    "key": "brand_voice",
-    "label": "全网品牌声量",
-    "description": "统计周期内全网总声量。",
-    "source_tools": [_TOOL_NAME],
-}
-_UNCOVERABLE_METRIC = {
-    "key": "voice_trend",
-    "label": "声量走势",
-    "description": "按天声量走势。",
-    "source_tools": ["datatap.nonexistent.tool"],
-}
-
-
-@pytest.mark.asyncio
-async def test_agent_loop_finish_rejected_until_required_metric_covered() -> None:
-    task = _task()
-    store = _FakeStore(task)
-    decider = _ScriptedDecider([_finish(), _call(), _finish()])
-    gateway = _FakeGateway([(_settled(),)])
-    artifacts = _FakeArtifacts()
-    context_builder = _FakeContextBuilder(required_metrics=(_VOICE_METRIC,))
-
-    await _executor(store, decider, gateway, artifacts, context_builder).run(task.id)
-
-    assert store.terminal == "completed"
-    assert decider.calls == 3
-    # 第一次 finish 被拒，缺失项清单作为 feedback 回喂进下一轮上下文。
-    gate_note = next(
-        note for note in decider.contexts[1].notes if note.tool == "metric_coverage_gate"
-    )
-    assert "全网品牌声量" in gate_note.summary
-    assert _TOOL_NAME in gate_note.summary
-
-
-@pytest.mark.asyncio
-async def test_agent_loop_finish_allowed_when_metric_call_returned_empty() -> None:
-    task = _task()
-    store = _FakeStore(task)
-    decider = _ScriptedDecider([_call(), _finish()])
-    # 工具调用成功但返回空数据：视为该项已满足，finish 直接放行。
-    gateway = _FakeGateway([(_settled(data={}),)])
-    artifacts = _FakeArtifacts()
-    context_builder = _FakeContextBuilder(required_metrics=(_VOICE_METRIC,))
-
-    await _executor(store, decider, gateway, artifacts, context_builder).run(task.id)
-
-    assert store.terminal == "completed"
-    assert decider.calls == 2
-
-
-@pytest.mark.asyncio
-async def test_agent_loop_finish_allowed_after_reject_streak_limit() -> None:
-    task = _task()
-    store = _FakeStore(task)
-    # 数据项无可用工具：连续 3 次拒绝后第 4 次 finish 放行，防止死循环。
-    decider = _ScriptedDecider([_call(), _finish(), _finish(), _finish(), _finish()])
-    gateway = _FakeGateway([(_settled(),)])
-    artifacts = _FakeArtifacts()
-    context_builder = _FakeContextBuilder(required_metrics=(_UNCOVERABLE_METRIC,))
-
-    await _executor(store, decider, gateway, artifacts, context_builder).run(task.id)
-
-    assert store.terminal == "completed"
-    assert decider.calls == 5
-    # feedback 跨轮累积：按 step_id 去重后应恰好是 3 次拒绝。
-    gate_step_ids = {
-        note.step_id
-        for context in decider.contexts
-        for note in context.notes
-        if note.tool == "metric_coverage_gate"
-    }
-    assert gate_step_ids == {"finish_reject_1", "finish_reject_2", "finish_reject_3"}
 
 
 @pytest.mark.asyncio

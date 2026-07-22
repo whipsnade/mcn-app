@@ -136,25 +136,6 @@ def test_trajectory_has_no_call_count_cap() -> None:
     assert len(restored.results) == 12
 
 
-def test_context_carries_required_metrics_without_remaining_calls() -> None:
-    context = AgentLoopContext(
-        recent_messages=(),
-        tools=(_tool(),),
-        allowed_channels=("xiaohongshu",),
-        required_metrics=(
-            {
-                "key": "brand_voice",
-                "label": "全网品牌声量",
-                "description": "声量",
-                "source_tools": [_TOOL_NAME],
-            },
-        ),
-    )
-
-    assert context.required_metrics[0]["key"] == "brand_voice"
-    assert not hasattr(context, "remaining_calls")
-
-
 def test_normalize_maps_platform_aliases_and_dedupes() -> None:
     result = normalize_agent_arguments(
         {"datasource": ["douyin", "bilibili", "B站", "小红书", "短视频__抖音", "weibo"]}

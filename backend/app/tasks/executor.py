@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import Awaitable, Callable
 from typing import Any, Protocol
@@ -9,12 +10,6 @@ from uuid import NAMESPACE_URL, uuid5
 from app.billing.service import InsufficientPointsError
 from app.mcp_gateway.service import ExecuteMcpCall
 from app.model.contracts import ModelAdapterError
-from app.orchestration.bi_requirements import (
-    MetricDef,
-    _is_empty_summary,
-    metric_coverage,
-    missing_metrics,
-)
 from app.orchestration.loop import (
     AgentLoopContext,
     EvidenceNote,
@@ -97,12 +92,28 @@ class SelectionIngest(Protocol):
 Checkpoint = Callable[[str], Awaitable[None]]
 logger = logging.getLogger(__name__)
 
-# finish 覆盖门禁连续拒绝上限：达到后放行，避免模型无法补齐时死循环。
-_MAX_FINISH_REJECT_STREAK = 3
 # 同一工具累计返回空数据达到上限后禁止再调（继续调只会白烧积分）；
 # 连续被熔断达到上限则按现有证据收尾，防止零成本死循环。
 _MAX_EMPTY_CALLS_PER_TOOL = 2
 _MAX_THROTTLE_STREAK = 3
+
+
+def _is_empty_summary(summary: Any) -> bool:
+    """空值判定：None、空 dict/list，或 JSON 编码后为 null/{}/[] 的字符串。"""
+    if summary is None:
+        return True
+    if isinstance(summary, (dict, list)) and not summary:
+        return True
+    if isinstance(summary, str):
+        text = summary.strip()
+        if not text:
+            return True
+        try:
+            decoded = json.loads(text)
+        except ValueError:
+            return False
+        return decoded is None or decoded == {} or decoded == []
+    return False
 
 
 async def _noop_checkpoint(_: str) -> None:
@@ -200,8 +211,8 @@ class TaskExecutor:
     async def _run_agent_loop(self, task: Any) -> None:
         """迭代式工具调用循环：每轮由模型决定下一步，产出版本化自由报告。
 
-        循环没有调用次数上限：退出条件只有模型 finish（且通过必需数据项
-        覆盖门禁）、取消、积分余额不足或异常。
+        循环没有调用次数上限：退出条件只有模型 finish、取消、积分余额不足
+        或异常。
         """
         build_agent_context = getattr(self.context_builder, "build_agent_context", None)
         decide = getattr(self.planner, "agent_decide", None)
@@ -217,22 +228,8 @@ class TaskExecutor:
                 return
         feedback: list[EvidenceNote] = []
         invalid_streak = 0
-        finish_reject_streak = 0
         throttle_streak = 0
         balance_exhausted = False
-        # finish 门禁以注入上下文的必需数据项清单为准（生产环境由
-        # build_agent_context 填入全局 BI_REQUIRED_METRICS）。
-        required_metrics = tuple(
-            MetricDef(
-                key=str(item.get("key", "")),
-                label=str(item.get("label", item.get("key", ""))),
-                description=str(item.get("description", "")),
-                source_tools=tuple(str(tool) for tool in item.get("source_tools", ())),
-                content_signal=item.get("content_signal"),
-            )
-            for item in context.required_metrics
-            if isinstance(item, dict) and item.get("key")
-        )
         while True:
             if await self.repository.cancel_requested(task.id):
                 await self.repository.mark_cancelled(task.id, self.worker_id)
@@ -254,31 +251,6 @@ class TaskExecutor:
                 )
                 decision = await decide(round_context)
                 if decision.action == "finish":
-                    # 必需数据项覆盖门禁：未覆盖的项回喂给模型补齐（不占
-                    # invalid_streak）；连续被拒达到上限后放行，防止模型
-                    # 始终无法补齐时死循环。
-                    missing = missing_metrics(
-                        metric_coverage(trajectory, required_metrics), required_metrics
-                    )
-                    if missing and finish_reject_streak < _MAX_FINISH_REJECT_STREAK:
-                        finish_reject_streak += 1
-                        missing_text = "、".join(
-                            f"{metric.label}（可尝试：{' / '.join(metric.source_tools[:2])}）"
-                            for metric in missing
-                        )
-                        feedback.append(
-                            EvidenceNote(
-                                step_id=f"finish_reject_{finish_reject_streak}",
-                                tool="metric_coverage_gate",
-                                status="failed",
-                                summary=(
-                                    f"报告必需数据项尚未覆盖，暂不能结束：{missing_text}。"
-                                    "请调用对应工具补齐后再 finish；"
-                                    "工具调用成功但返回空数据视为该项已满足。"
-                                ),
-                            )
-                        )
-                        continue
                     break
                 # 工具/渠道校验、参数归一化（平台别名、默认三个月时间窗回填、
                 # 时间窗钳制、keyword 必填 name）与 Schema 校验一次完成；
@@ -322,7 +294,7 @@ class TaskExecutor:
                             summary=(
                                 f"工具 {decision.internal_tool_name} 已 {empty_calls} 次"
                                 "调用成功但返回空数据，禁止重复调用；"
-                                "请改用其他工具补齐缺失数据项，或在数据项已满足时 finish。"
+                                "请改用其他工具继续采集圈选数据，或在数据足够时 finish。"
                             ),
                         )
                     )

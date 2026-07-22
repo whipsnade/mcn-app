@@ -179,9 +179,6 @@ class AgentLoopContext(BaseModel):
     tools: tuple[PlannerTool, ...]
     allowed_channels: tuple[str, ...]
     notes: tuple[EvidenceNote, ...] = ()
-    # BI 报表必需数据项清单（key/label/description/source_tools），模型必须
-    # 逐项用工具覆盖后才允许 finish；空结果视为已满足。
-    required_metrics: tuple[dict[str, Any], ...] = ()
     # 服务端注入的真实日期与解析出的时间窗：模型自身的时间感知不可靠，
     # 曾因此把统计查询落到一年上限之外而拿到空数据。
     current_date: str = ""

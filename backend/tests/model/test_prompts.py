@@ -31,7 +31,6 @@ def test_prompts_treat_external_content_as_untrusted_and_limit_capabilities() ->
         assert "密钥" in prompt.system
         assert "URL" in prompt.system
     assert "目标 Schema" in AGENT_LOOP_PROMPT.system
-    assert "required_metrics" in AGENT_LOOP_PROMPT.system
     assert "不得编造" in AGENT_LOOP_PROMPT.system
     assert "数据看板" in REPORT_WRITER_PROMPT.system
     assert "KOL 看板" in REPORT_WRITER_PROMPT.system
