@@ -6,11 +6,12 @@ import {
 } from 'recharts';
 import { Fragment, useEffect, useState } from 'react';
 
-import { downloadKolSelection, runKolAnalysis } from '../api/kolSelection';
+import { downloadKolSelection, getKolSelection, runKolAnalysis } from '../api/kolSelection';
+import type { KolSelectionItem } from '../api/kolSelection';
 import type {
   ApiAnalysisReport, ApiAnalysisReportChartSeries, ApiAnalysisReportMetricItem, ApiTaskStatus, ReportBlock,
 } from '../api/contracts';
-import { Card, formatNumber, MetricCard } from './reportPrimitives';
+import { Card, formatExposure, formatNumber, MetricCard } from './reportPrimitives';
 
 interface UniversalReportProps {
   report?: ApiAnalysisReport;
@@ -317,17 +318,128 @@ function ReportBlockView({ block }: { block: ReportBlock }) {
   }
 }
 
+// ---- 圈选达人列表 ----
+
+const kolPlatformNames: Record<string, string> = {
+  xiaohongshu: '小红书',
+  douyin: '抖音',
+  bilibili: 'B站',
+  kuaishou: '快手',
+  weibo: '微博',
+};
+
+function finiteNumber(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function stringValue(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+// 互动率/报价优先取嵌套 export_fields，缺失时回退 fields 顶层（归一化后的合并字段）。
+function selectionMetric(item: KolSelectionItem, key: string): number | null {
+  const exportFields = item.fields?.export_fields;
+  const nested = exportFields && typeof exportFields === 'object'
+    ? finiteNumber((exportFields as Record<string, unknown>)[key])
+    : null;
+  return nested ?? finiteNumber(item.fields?.[key]);
+}
+
+function KolSelectionCard({ item }: { item: KolSelectionItem }) {
+  const nickname = item.nickname || '未知达人';
+  const stars = stringValue(item.score?.stars);
+  const rating = stringValue(item.score?.rating);
+  const total = finiteNumber(item.score?.total);
+  const engagementRate = selectionMetric(item, 'engagement_rate');
+  const quotedPrice = selectionMetric(item, 'quoted_price_cny');
+  const metaParts = [
+    kolPlatformNames[item.platform] ?? item.platform,
+    item.city,
+    item.followers != null ? `粉丝 ${formatExposure(item.followers)}` : null,
+  ].filter(Boolean);
+
+  return (
+    <section className="rounded-xl border border-slate-100 bg-white p-3.5 shadow-sm">
+      <div className="flex items-center gap-2.5">
+        <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-indigo-100 text-[13px] font-bold text-indigo-600">
+          {nickname.slice(0, 1)}
+        </span>
+        <div className="min-w-0 flex-1">
+          <p className="flex items-center gap-1.5">
+            <span className="truncate text-[12px] font-semibold text-slate-800">{nickname}</span>
+            {stars && <span className="shrink-0 text-[10px] text-amber-500">{stars}</span>}
+          </p>
+          <p className="mt-0.5 truncate text-[10px] text-slate-400">{metaParts.join(' · ')}</p>
+        </div>
+        {(total != null || rating) && (
+          <div className="shrink-0 text-right">
+            {total != null && (
+              <p className="text-[12px] font-bold text-slate-800">
+                <span className="mr-1 text-[10px] font-normal text-slate-400">综合评分</span>{total}
+              </p>
+            )}
+            {rating && (
+              <span className="mt-1 inline-block rounded-full bg-indigo-50 px-2 py-0.5 text-[10px] font-semibold text-indigo-600">{rating}</span>
+            )}
+          </div>
+        )}
+      </div>
+      {(engagementRate != null || quotedPrice != null) && (
+        <div className="mt-2.5 flex flex-wrap gap-1.5">
+          {engagementRate != null && (
+            <span className="rounded-lg bg-emerald-50 px-2 py-1 text-[10px] font-semibold text-emerald-600">互动率 {engagementRate}%</span>
+          )}
+          {quotedPrice != null && (
+            <span className="rounded-lg bg-slate-100 px-2 py-1 text-[10px] font-semibold text-slate-600">预估报价 ¥{formatNumber(quotedPrice)}</span>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
 export default function UniversalReport({ report, taskStatus, sessionId, selectionCount, onReportReady }: UniversalReportProps) {
   const [analyzing, setAnalyzing] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [actionError, setActionError] = useState<string>();
+  const [activeTab, setActiveTab] = useState<'report' | 'selection'>('report');
+  const [selectionItems, setSelectionItems] = useState<KolSelectionItem[]>([]);
+  const [selectionLoading, setSelectionLoading] = useState(false);
+  const [selectionError, setSelectionError] = useState(false);
+  const [selectionRefresh, setSelectionRefresh] = useState(0);
 
   // 面板实例跨会话复用：切换会话时重置本地操作状态，避免把上一个会话的 loading/错误带过来。
   useEffect(() => {
     setAnalyzing(false);
     setExporting(false);
     setActionError(undefined);
+    setActiveTab('report');
+    setSelectionItems([]);
+    setSelectionLoading(false);
+    setSelectionError(false);
   }, [sessionId]);
+
+  // 圈选达人 tab 激活时拉取名单；任务状态推进（到达终态）时若正在该 tab 则自动刷新。
+  useEffect(() => {
+    if (activeTab !== 'selection' || !sessionId) return;
+    let cancelled = false;
+    setSelectionLoading(true);
+    setSelectionError(false);
+    getKolSelection(sessionId)
+      .then((data) => {
+        if (cancelled) return;
+        setSelectionItems(Array.isArray(data.items) ? data.items : []);
+        setSelectionLoading(false);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setSelectionError(true);
+        setSelectionLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTab, sessionId, taskStatus, selectionRefresh]);
 
   const handleAnalyze = async () => {
     if (!sessionId || analyzing) return;
@@ -336,6 +448,8 @@ export default function UniversalReport({ report, taskStatus, sessionId, selecti
     try {
       const nextReport = await runKolAnalysis(sessionId);
       onReportReady?.(nextReport);
+      // 分析成功说明圈选名单已有内容，正在达人 tab 时同步刷新列表。
+      setSelectionRefresh(tick => tick + 1);
     } catch (reason) {
       setActionError(analyzeErrorMessage(reason));
     } finally {
@@ -398,37 +512,73 @@ export default function UniversalReport({ report, taskStatus, sessionId, selecti
           </div>
         )}
       </header>
+      <div role="tablist" aria-label="报告面板" className="flex h-11 shrink-0 border-b border-slate-200 bg-white px-4">
+        {([
+          { id: 'report' as const, label: 'KOL 分析' },
+          { id: 'selection' as const, label: `圈选达人 (${selectedCount})` },
+        ]).map(({ id, label }) => (
+          <button
+            key={id}
+            type="button"
+            role="tab"
+            aria-selected={activeTab === id}
+            onClick={() => setActiveTab(id)}
+            className={activeTab === id
+              ? 'flex shrink-0 items-center gap-1.5 border-b-2 border-indigo-600 px-3 text-[11px] font-semibold text-indigo-600'
+              : 'flex shrink-0 items-center gap-1.5 px-3 text-[11px] font-medium text-slate-500 transition hover:text-slate-800'}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
       <div className="flex-1 overflow-y-auto bg-slate-50/40 p-3">
-        {actionError && (
-          <p role="alert" className="mb-3 rounded-lg bg-rose-50 px-2.5 py-2 text-[11px] text-rose-600">{actionError}</p>
-        )}
-        {report ? (
-          <>
-            {taskStatus && !isTerminal(taskStatus) && (
-              <p role="status" className="mb-3 rounded-lg bg-indigo-50 px-2.5 py-2 text-[11px] text-indigo-600">任务进行中，报告内容可能继续更新…</p>
-            )}
-            <div className="space-y-3">
-              {blocks.map((block, index) => (
-                <Fragment key={`${block.type}-${index}`}>{ReportBlockView({ block })}</Fragment>
-              ))}
-              {textOf(report.conclusion) && (
-                <Card title="AI 结论" icon={<Sparkles className="h-4 w-4" />}>
-                  <p className="whitespace-pre-wrap text-[11px] leading-5 text-slate-600">{report.conclusion}</p>
-                </Card>
-              )}
-              {blocks.length === 0 && !textOf(report.conclusion) && (
-                <p className="rounded-lg bg-slate-50 px-2.5 py-2 text-[11px] text-slate-400">报告内容为空</p>
-              )}
+        {activeTab === 'selection' ? (
+          selectionLoading ? (
+            <p role="status" className="p-6 text-center text-xs text-slate-400">加载中…</p>
+          ) : selectionError ? (
+            <p role="alert" className="rounded-lg bg-rose-50 px-2.5 py-2 text-[11px] text-rose-600">达人名单加载失败，请稍后重试</p>
+          ) : selectionItems.length === 0 ? (
+            <div className="flex min-h-[120px] items-center justify-center p-6 text-center text-xs leading-5 text-slate-500">
+              暂无圈选达人，发起会话后自动圈选
             </div>
-          </>
+          ) : (
+            <div className="space-y-2.5">
+              {selectionItems.map(item => (
+                <Fragment key={`${item.platform}-${item.kol_uid}`}>{KolSelectionCard({ item })}</Fragment>
+              ))}
+            </div>
+          )
         ) : (
-          <div className="flex min-h-[120px] items-center justify-center p-6 text-center text-xs leading-5 text-slate-500">
-            {emptyText}
-          </div>
+          <>
+            {actionError && (
+              <p role="alert" className="mb-3 rounded-lg bg-rose-50 px-2.5 py-2 text-[11px] text-rose-600">{actionError}</p>
+            )}
+            {report ? (
+              <>
+                {taskStatus && !isTerminal(taskStatus) && (
+                  <p role="status" className="mb-3 rounded-lg bg-indigo-50 px-2.5 py-2 text-[11px] text-indigo-600">任务进行中，报告内容可能继续更新…</p>
+                )}
+                <div className="space-y-3">
+                  {blocks.map((block, index) => (
+                    <Fragment key={`${block.type}-${index}`}>{ReportBlockView({ block })}</Fragment>
+                  ))}
+                  {textOf(report.conclusion) && (
+                    <Card title="AI 结论" icon={<Sparkles className="h-4 w-4" />}>
+                      <p className="whitespace-pre-wrap text-[11px] leading-5 text-slate-600">{report.conclusion}</p>
+                    </Card>
+                  )}
+                  {blocks.length === 0 && !textOf(report.conclusion) && (
+                    <p className="rounded-lg bg-slate-50 px-2.5 py-2 text-[11px] text-slate-400">报告内容为空</p>
+                  )}
+                </div>
+              </>
+            ) : (
+              <div className="flex min-h-[120px] items-center justify-center p-6 text-center text-xs leading-5 text-slate-500">
+                {emptyText}
+              </div>
+            )}
+          </>
         )}
-        <Card title="品牌/活动分析（即将上线）" icon={<PieChartIcon className="h-4 w-4" />} className="mt-3">
-          <p className="text-[11px] text-slate-400">品牌与活动维度分析即将上线，敬请期待。</p>
-        </Card>
       </div>
     </aside>
   );

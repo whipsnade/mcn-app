@@ -1,19 +1,35 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { downloadKolSelection, runKolAnalysis } from '../api/kolSelection';
+import { downloadKolSelection, getKolSelection, runKolAnalysis } from '../api/kolSelection';
 import { analysisReportFixture } from '../test/fixtures';
 import UniversalReport from './UniversalReport';
 
 vi.mock('../api/kolSelection', () => ({
   runKolAnalysis: vi.fn(),
   downloadKolSelection: vi.fn(),
+  getKolSelection: vi.fn(),
 }));
+
+function kolSelectionItem(overrides: Record<string, unknown> = {}) {
+  return {
+    platform: 'xiaohongshu',
+    kol_uid: 'uid-1',
+    nickname: '达人小A',
+    followers: 120000,
+    city: '上海',
+    profile_url: 'https://www.xiaohongshu.com/user/profile/uid-1',
+    fields: { export_fields: { engagement_rate: 5.2, quoted_price_cny: 12000 } },
+    score: { total: 82, rating: '重点推荐', stars: '★★★★★', dimensions: {}, data_completeness: 0.9 },
+    ...overrides,
+  };
+}
 
 describe('UniversalReport', () => {
   beforeEach(() => {
     vi.mocked(runKolAnalysis).mockReset();
     vi.mocked(downloadKolSelection).mockReset();
+    vi.mocked(getKolSelection).mockReset();
   });
 
   it('renders every supported block type from the analysis report DTO', () => {
@@ -153,9 +169,106 @@ describe('UniversalReport', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('报告生成中，请稍后刷新查看');
   });
 
-  it('keeps a placeholder card for the upcoming brand/campaign analysis', () => {
+  it('no longer renders the brand/campaign placeholder card', () => {
     render(<UniversalReport sessionId="session-1" selectionCount={3} />);
 
-    expect(screen.getByText(/品牌\/活动分析（即将上线）/)).toBeVisible();
+    expect(screen.queryByText(/品牌\/活动分析/)).not.toBeInTheDocument();
+  });
+
+  it('renders the report and selection tabs with the selection count', () => {
+    render(<UniversalReport sessionId="session-1" selectionCount={12} />);
+
+    expect(screen.getByRole('tab', { name: 'KOL 分析' })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.getByRole('tab', { name: '圈选达人 (12)' })).toHaveAttribute('aria-selected', 'false');
+  });
+
+  it('keeps the report view as the default tab content', () => {
+    render(<UniversalReport sessionId="session-1" selectionCount={3} />);
+
+    expect(screen.getByText(/已圈选 3 位达人/)).toBeVisible();
+    expect(getKolSelection).not.toHaveBeenCalled();
+  });
+
+  it('loads and renders KOL cards when switching to the selection tab', async () => {
+    vi.mocked(getKolSelection).mockResolvedValue({ total: 1, items: [kolSelectionItem()] });
+    render(<UniversalReport sessionId="session-1" selectionCount={1} />);
+
+    fireEvent.click(screen.getByRole('tab', { name: '圈选达人 (1)' }));
+
+    await waitFor(() => expect(getKolSelection).toHaveBeenCalledWith('session-1'));
+    expect(await screen.findByText('达人小A')).toBeVisible();
+    expect(screen.getByText('★★★★★')).toBeVisible();
+    expect(screen.getByText(/小红书/)).toBeVisible();
+    expect(screen.getByText(/粉丝 12万/)).toBeVisible();
+    expect(screen.getByText('82')).toBeVisible();
+    expect(screen.getByText('重点推荐')).toBeVisible();
+    expect(screen.getByText(/互动率 5\.2%/)).toBeVisible();
+    expect(screen.getByText(/预估报价 ¥12,000/)).toBeVisible();
+  });
+
+  it('omits optional metric chips when the item has no export fields', async () => {
+    vi.mocked(getKolSelection).mockResolvedValue({
+      total: 1,
+      items: [kolSelectionItem({ nickname: '达人小B', fields: {}, score: {} })],
+    });
+    render(<UniversalReport sessionId="session-1" selectionCount={1} />);
+
+    fireEvent.click(screen.getByRole('tab', { name: '圈选达人 (1)' }));
+
+    expect(await screen.findByText('达人小B')).toBeVisible();
+    expect(screen.queryByText(/互动率/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/预估报价/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/综合评分/)).not.toBeInTheDocument();
+  });
+
+  it('falls back to top-level engagement/price fields when export_fields is absent', async () => {
+    vi.mocked(getKolSelection).mockResolvedValue({
+      total: 1,
+      items: [kolSelectionItem({ fields: { engagement_rate: 3.8, quoted_price_cny: 8000 } })],
+    });
+    render(<UniversalReport sessionId="session-1" selectionCount={1} />);
+
+    fireEvent.click(screen.getByRole('tab', { name: '圈选达人 (1)' }));
+
+    expect(await screen.findByText(/互动率 3\.8%/)).toBeVisible();
+    expect(screen.getByText(/预估报价 ¥8,000/)).toBeVisible();
+  });
+
+  it('shows the empty hint when the selection list is empty', async () => {
+    vi.mocked(getKolSelection).mockResolvedValue({ total: 0, items: [] });
+    render(<UniversalReport sessionId="session-1" selectionCount={0} />);
+
+    fireEvent.click(screen.getByRole('tab', { name: '圈选达人 (0)' }));
+
+    expect(await screen.findByText('暂无圈选达人，发起会话后自动圈选')).toBeVisible();
+  });
+
+  it('shows an inline error when the selection fetch fails', async () => {
+    vi.mocked(getKolSelection).mockRejectedValue(new Error('HTTP_500'));
+    render(<UniversalReport sessionId="session-1" selectionCount={1} />);
+
+    fireEvent.click(screen.getByRole('tab', { name: '圈选达人 (1)' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('达人名单加载失败，请稍后重试');
+  });
+
+  it('does not fetch the selection list without a session id', async () => {
+    render(<UniversalReport selectionCount={2} />);
+
+    fireEvent.click(screen.getByRole('tab', { name: '圈选达人 (2)' }));
+
+    expect(getKolSelection).not.toHaveBeenCalled();
+    expect(await screen.findByText('暂无圈选达人，发起会话后自动圈选')).toBeVisible();
+  });
+
+  it('switches back to the report tab content', async () => {
+    vi.mocked(getKolSelection).mockResolvedValue({ total: 1, items: [kolSelectionItem()] });
+    render(<UniversalReport sessionId="session-1" selectionCount={1} />);
+
+    fireEvent.click(screen.getByRole('tab', { name: '圈选达人 (1)' }));
+    expect(await screen.findByText('达人小A')).toBeVisible();
+
+    fireEvent.click(screen.getByRole('tab', { name: 'KOL 分析' }));
+    expect(screen.getByText(/已圈选 1 位达人/)).toBeVisible();
   });
 });

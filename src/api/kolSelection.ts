@@ -1,6 +1,21 @@
 import { authorizedFetch, request } from './client';
 import type { ApiAnalysisReport } from './contracts';
 
+export interface KolSelectionItem {
+  platform: string;
+  kol_uid: string;
+  nickname: string;
+  followers: number | null;
+  city: string | null;
+  profile_url: string | null;
+  fields: Record<string, unknown>;
+  score: Record<string, unknown>;
+}
+
+export function getKolSelection(sessionId: string): Promise<{ total: number; items: KolSelectionItem[] }> {
+  return request(`/api/v1/sessions/${sessionId}/kol-selection?limit=200`);
+}
+
 export function runKolAnalysis(sessionId: string): Promise<ApiAnalysisReport> {
   return request<ApiAnalysisReport>(`/api/v1/sessions/${sessionId}/kol-analysis`, { method: 'POST' });
 }
