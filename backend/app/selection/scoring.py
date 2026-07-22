@@ -84,3 +84,16 @@ def score_candidate(dimensions: DimensionInputs, profile: str) -> CandidateScore
         dimensions=details,
         data_completeness=completeness,
     )
+
+
+def rating(total: float) -> tuple[str, str]:
+    """总分对应的评级文字与星级（沿用旧 Excel 导出模板的区间划分）。"""
+    if total >= 78:
+        return "强烈推荐", "★★★★★"
+    if total >= 62:
+        return "推荐", "★★★★"
+    if total >= 48:
+        return "谨慎推荐", "★★★"
+    if total >= 35:
+        return "可考虑", "★★"
+    return "不推荐", "★"

@@ -593,3 +593,68 @@ async def test_agent_loop_throttle_does_not_block_other_tools() -> None:
     # 熔断只针对累计空结果的同名工具，其他工具不受影响：
     # 2 次空结果执行 + 第 3 次同名调用被熔断 + 1 次统计工具执行。
     assert len(gateway.commands) == 3
+
+
+class _FakeSelectionIngest:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail = fail
+        self.calls: list[dict] = []
+
+    async def ingest(self, **kwargs):
+        if self.fail:
+            raise RuntimeError("selection_store_down")
+        self.calls.append(kwargs)
+
+
+def _executor_with_selection(store, decider, gateway, artifacts, selection) -> TaskExecutor:
+    return TaskExecutor(
+        repository=store,
+        context_builder=_FakeContextBuilder(),
+        planner=decider,
+        gateway=gateway,
+        artifacts=artifacts,
+        selection=selection,
+        worker_id="worker-1",
+        lease_seconds=60,
+        heartbeat_seconds=0.05,
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_ingests_settled_evidence_into_selection() -> None:
+    task = _task()
+    store = _FakeStore(task)
+    decider = _ScriptedDecider([_call(), _finish()])
+    structured = {"result": "{}"}
+    gateway = _FakeGateway([(_settled(data=structured),)])
+    artifacts = _FakeArtifacts()
+    selection = _FakeSelectionIngest()
+
+    await _executor_with_selection(store, decider, gateway, artifacts, selection).run(task.id)
+
+    assert store.terminal == "completed"
+    assert selection.calls == [
+        {
+            "user_id": "user-1",
+            "session_id": "session-1",
+            "task_id": "task-1",
+            "internal_tool_name": _TOOL_NAME,
+            "structured_content": structured,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_selection_ingest_failure_does_not_block() -> None:
+    task = _task()
+    store = _FakeStore(task)
+    decider = _ScriptedDecider([_call(), _finish()])
+    gateway = _FakeGateway([(_settled(),)])
+    artifacts = _FakeArtifacts()
+    selection = _FakeSelectionIngest(fail=True)
+
+    await _executor_with_selection(store, decider, gateway, artifacts, selection).run(task.id)
+
+    # 沉淀失败只记 warning：任务仍正常完成并产出报告。
+    assert store.terminal == "completed"
+    assert artifacts.built == [task.id]

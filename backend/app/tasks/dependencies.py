@@ -31,6 +31,7 @@ from app.orchestration.bi_requirements import required_metrics_payload
 from app.orchestration.loop import AgentDecision, AgentLoopContext
 from app.orchestration.routing import extract_requested_period
 from app.orchestration.schemas import PlannerTool
+from app.selection.service import KolSelectionService
 from app.tasks.executor import TaskExecutor, TaskRunner
 from app.tasks.followups import FollowupSuggestionService
 from app.tasks.models import AnalysisTask
@@ -366,6 +367,44 @@ def get_mcp_transport():
     )
 
 
+class DatabaseSelectionIngest:
+    """settled 工具证据 → 圈选名单沉淀；独立短事务，不持有任务循环的连接。"""
+
+    def __init__(self) -> None:
+        self._remote_by_internal: dict[str, str] | None = None
+
+    async def ingest(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        task_id: str,
+        internal_tool_name: str,
+        structured_content: Any,
+    ) -> None:
+        async with SessionFactory.begin() as db:
+            mapping = await self._tool_mapping(db)
+            if internal_tool_name not in mapping:
+                return
+            # normalizers 适配器按内部工具名匹配；remote 映射仅作为
+            # “该工具仍为已审核启用”的护栏。
+            await KolSelectionService(db).ingest_tool_evidence(
+                user_id=user_id,
+                session_id=session_id,
+                task_id=task_id,
+                tool_name=internal_tool_name,
+                structured_content=structured_content,
+            )
+
+    async def _tool_mapping(self, db) -> dict[str, str]:
+        if self._remote_by_internal is None:
+            tools = await ToolRegistryService(db, get_mcp_transport()).list_enabled()
+            self._remote_by_internal = {
+                tool.internal_name: tool.remote_name for tool in tools
+            }
+        return self._remote_by_internal
+
+
 class TaskExecutionDependencies:
     def __init__(self) -> None:
         self.store = DatabaseTaskStore()
@@ -374,6 +413,7 @@ class TaskExecutionDependencies:
         self._followups = FollowupSuggestionService(self._model)
         self._transport = get_mcp_transport()
         self._arguments = _PlanArguments()
+        self._selection = DatabaseSelectionIngest()
 
     async def build_agent_context(self, user_id: str, session_id: str) -> AgentLoopContext:
         """迭代循环的轻量上下文：消息 + 已审核工具 + 渠道权限，无会话表单约束。"""
@@ -463,6 +503,7 @@ class TaskExecutionDependencies:
             planner=self,
             gateway=self,
             artifacts=_TaskArtifacts(worker_id, get_model_adapter()),
+            selection=self._selection,
             worker_id=worker_id,
             lease_seconds=get_settings().task_lease_seconds,
         )

@@ -82,6 +82,18 @@ class TaskArtifacts(Protocol):
     async def stream_analysis_summary(self, task_id: str) -> Any: ...
 
 
+class SelectionIngest(Protocol):
+    async def ingest(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        task_id: str,
+        internal_tool_name: str,
+        structured_content: Any,
+    ) -> None: ...
+
+
 Checkpoint = Callable[[str], Awaitable[None]]
 logger = logging.getLogger(__name__)
 
@@ -127,6 +139,7 @@ class TaskExecutor:
         planner: TaskPlanner,
         gateway: McpBatchGateway,
         artifacts: TaskArtifacts | None = None,
+        selection: SelectionIngest | None = None,
         worker_id: str,
         lease_seconds: int = 60,
         heartbeat_seconds: float | None = None,
@@ -137,6 +150,7 @@ class TaskExecutor:
         self.planner = planner
         self.gateway = gateway
         self.artifacts = artifacts
+        self.selection = selection
         self.worker_id = worker_id
         self.lease_seconds = lease_seconds
         self.heartbeat_seconds = (
@@ -402,6 +416,20 @@ class TaskExecutor:
                         ),
                     )
                 )
+                if self.selection is not None:
+                    try:
+                        await self.selection.ingest(
+                            user_id=task.user_id,
+                            session_id=task.session_id,
+                            task_id=task.id,
+                            internal_tool_name=row.internal_tool_name,
+                            structured_content=(getattr(row, "evidence_json", None) or {}).get(
+                                "structured_content"
+                            ),
+                        )
+                    except Exception:
+                        # 圈选沉淀失败绝不阻塞任务循环。
+                        logger.warning("kol_selection_ingest_failed", exc_info=True)
             else:
                 failure = safe_error(getattr(row, "error_type", None) or "mcp_call_failed")
                 # 上游业务错误原文（如“标签不在列表中，建议先用 match_best_tag”）

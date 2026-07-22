@@ -38,3 +38,14 @@ def test_unknown_profile_is_rejected() -> None:
 def test_out_of_range_dimension_score_is_rejected() -> None:
     with pytest.raises(ValueError, match="dimension_score_out_of_range"):
         score_candidate(all_dimensions(101), profile="balanced")
+
+
+def test_rating_boundaries_match_legacy_export_template() -> None:
+    from app.selection.scoring import rating
+
+    assert rating(78) == ("强烈推荐", "★★★★★")
+    assert rating(62) == ("推荐", "★★★★")
+    assert rating(48) == ("谨慎推荐", "★★★")
+    assert rating(35) == ("可考虑", "★★")
+    assert rating(34.9) == ("不推荐", "★")
+    assert rating(0) == ("不推荐", "★")
