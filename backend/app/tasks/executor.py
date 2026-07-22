@@ -88,6 +88,7 @@ class SelectionIngest(Protocol):
         task_id: str,
         internal_tool_name: str,
         structured_content: Any,
+        arguments: dict | None = None,
     ) -> None: ...
 
 
@@ -401,6 +402,9 @@ class TaskExecutor:
                             task_id=task.id,
                             internal_tool_name=row.internal_tool_name,
                             structured_content=structured_content,
+                            # kol.detail/insight 工具的平台身份藏在调用参数里
+                            # （platform / datasource），沉淀时必须一并透传。
+                            arguments=command.arguments,
                         )
                     except Exception:
                         # 圈选沉淀失败绝不阻塞任务循环。

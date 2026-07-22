@@ -17,7 +17,40 @@ from app.selection.normalizers import (
 )
 from app.selection.schemas import DimensionInputs, NormalizedKolEvidence, ToolEvidence
 from app.selection.scoring import rating, score_candidate
+from app.tasks.errors import _PLATFORM_LABELS
 from app.workspace.models import WorkspaceSession
+
+
+# datasource 中文标签 → 平台码（_PLATFORM_LABELS 反转）；同时容忍参数里
+# 直接写平台码（如 ["douyin"]）的形态。
+_DATASOURCE_PLATFORM_CODES = {
+    **{label: code for code, label in _PLATFORM_LABELS.items()},
+    **{code: code for code in _PLATFORM_LABELS},
+}
+
+
+def _payload_with_platform_hint(
+    structured_content: dict[str, Any], arguments: dict | None
+) -> dict[str, Any]:
+    """kol.detail/insight 工具的平台不在行内，从调用参数注入 payload 级提示。
+
+    - arguments.platform（如 kol.detail 的 "xiaohongshu"）直接注入；
+    - arguments.datasource（insight 工具，形如 ["小红书"]）取首个可映射标签，
+      经中文→平台码映射注入；无匹配则不注入。
+    payload 已有 platform 键时不覆盖。
+    """
+    if not isinstance(arguments, dict) or not arguments or "platform" in structured_content:
+        return structured_content
+    platform = arguments.get("platform")
+    if isinstance(platform, str) and platform.strip():
+        return {**structured_content, "platform": platform.strip()}
+    datasource = arguments.get("datasource")
+    if isinstance(datasource, (list, tuple)):
+        for label in datasource:
+            code = _DATASOURCE_PLATFORM_CODES.get(str(label).strip())
+            if code:
+                return {**structured_content, "platform": code}
+    return structured_content
 
 
 _NESTED_DICT_FIELDS = ("export_fields", "analytics_fields")
@@ -92,17 +125,20 @@ class KolSelectionService:
         task_id: str,
         tool_name: str,
         structured_content: Any,
+        arguments: dict | None = None,
     ) -> int:
         """解析一条 settled 工具证据并 upsert 圈选名单，返回写入行数。
 
         ``tool_name`` 为内部工具名（normalizers 适配器按内部名匹配）。
+        ``arguments`` 为本次工具调用参数：kol.detail/insight 等工具的平台
+        身份只在参数里（platform / datasource），构建证据时注入 payload。
         非 KOL 工具（UnknownEvidenceToolError）与无法解析的载荷返回 0。
         """
         if not isinstance(structured_content, dict) or not structured_content:
             return 0
         evidence = ToolEvidence(
             internal_tool_name=tool_name,
-            payload=structured_content,
+            payload=_payload_with_platform_hint(structured_content, arguments),
             source_call_id=task_id,
             collected_at=_utcnow(),
         )

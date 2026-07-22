@@ -85,3 +85,29 @@ async def test_ingest_skips_unapproved_tool_without_touching_db(monkeypatch) -> 
     )
 
     assert called is False
+
+
+@pytest.mark.asyncio
+async def test_ingest_passes_arguments_through_to_service(monkeypatch) -> None:
+    async def fake_tool_mapping(self, db):
+        return {"tool.x": "remote_x"}
+
+    captured: list[dict] = []
+
+    async def fake_ingest(self, **kwargs):
+        captured.append(kwargs)
+
+    monkeypatch.setattr(DatabaseSelectionIngest, "_tool_mapping", fake_tool_mapping)
+    monkeypatch.setattr(KolSelectionService, "ingest_tool_evidence", fake_ingest)
+
+    await DatabaseSelectionIngest().ingest(
+        user_id="u",
+        session_id="s",
+        task_id="t",
+        internal_tool_name="tool.x",
+        structured_content={"result": "{}"},
+        arguments={"platform": "xiaohongshu", "kwUidList": ["uid-1"]},
+    )
+
+    assert len(captured) == 1
+    assert captured[0]["arguments"] == {"platform": "xiaohongshu", "kwUidList": ["uid-1"]}

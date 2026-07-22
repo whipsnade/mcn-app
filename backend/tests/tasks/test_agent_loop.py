@@ -579,6 +579,9 @@ async def test_agent_loop_ingests_settled_evidence_into_selection() -> None:
             "task_id": "task-1",
             "internal_tool_name": _TOOL_NAME,
             "structured_content": structured,
+            # 调用参数必须透传给沉淀钩子：kol.detail/insight 工具的平台
+            # 身份靠 arguments 里的 platform/datasource 注入。
+            "arguments": {"keyword": "美妆"},
         }
     ]
 

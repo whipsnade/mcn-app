@@ -240,6 +240,7 @@ class DatabaseSelectionIngest:
         task_id: str,
         internal_tool_name: str,
         structured_content: Any,
+        arguments: dict | None = None,
     ) -> None:
         for attempt in (1, 2):
             try:
@@ -255,6 +256,7 @@ class DatabaseSelectionIngest:
                         task_id=task_id,
                         tool_name=internal_tool_name,
                         structured_content=structured_content,
+                        arguments=arguments,
                     )
                 return
             except IntegrityError:

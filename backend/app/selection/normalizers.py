@@ -96,7 +96,13 @@ _BRAND_EVIDENCE_TOOLS = {
     "datatap.insight.query.rank.list.v1",
     "datatap.insight.analysis.target.search.v1",
 }
-_NON_KOL_EVIDENCE_TOOLS = _BRAND_EVIDENCE_TOOLS | {
+# insight 侧按用户维度返回 per-user 行的工具：行即达人证据，注册 KOL 适配器
+# （query.analysis / hot.user 的大盘形态行无 用户昵称，适配器返回空）。
+_INSIGHT_USER_STATS_TOOLS = {
+    "datatap.insight.query.analysis.v1",
+    "datatap.insight.social.statistic.hot.user.v1",
+}
+_NON_KOL_EVIDENCE_TOOLS = (_BRAND_EVIDENCE_TOOLS - _INSIGHT_USER_STATS_TOOLS) | {
     "datatap.insight.match.best.tag.v1",
     "datatap.social.grow.kol.match.mentions.tag.v1",
     "datatap.social.grow.kol.class.tag.dictionary.v1",
@@ -544,6 +550,135 @@ def _first_present_string(candidate: dict[str, Any], keys: tuple[str, ...]) -> s
     return None
 
 
+def _loose_string(value: Any) -> str | None:
+    """容错版字符串提取：非字符串先 str()，空串归一为 None。"""
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+_INSIGHT_USER_NICKNAME_KEYS = ("用户昵称", "昵称", "达人昵称")
+_INSIGHT_USER_ID_KEYS = ("用户ID", "用户id", "uid", "user_id")
+_INSIGHT_USER_FOLLOWER_KEYS = ("用户粉丝数", "粉丝数", "粉丝数量")
+_INSIGHT_USER_EXPORT_KEYS = {
+    "volume": "声量",
+    "total_interactions": "互动数",
+    "total_likes": "点赞数",
+    "total_comments": "评论数",
+    "total_favorites": "收藏数",
+}
+
+
+def _datatap_insight_user_stats_adapter(item: ToolEvidence) -> tuple[NormalizedKolEvidence, ...]:
+    """解析 insight 按用户维度统计的 per-user 行（query.analysis / hot.user）。
+
+    result 是 JSON 数组字符串，行形如
+    ``{"用户ID": ..., "用户昵称": ..., "声量": ..., "用户粉丝数": ...}``。
+    无 用户昵称 的行是大盘统计形态（该工具多数调用不是 per-user 形态），
+    跳过不报错；缺 用户ID 时按 platform+nickname 派生稳定身份。平台来自
+    证据构建时从 arguments.datasource 注入的 payload 级 platform 提示。
+    """
+    raw_result = item.payload.get("result")
+    if isinstance(raw_result, str):
+        try:
+            raw_result = json.loads(raw_result)
+        except json.JSONDecodeError:
+            return ()
+    platform_hint = item.payload.get("platform")
+    platform = (
+        _GENERIC_PLATFORM_ALIASES.get(platform_hint.strip().casefold())
+        if isinstance(platform_hint, str)
+        else None
+    )
+    if platform is None:
+        return ()
+    normalized: list[NormalizedKolEvidence] = []
+    for row in _insight_user_rows(raw_result):
+        parsed = _normalize_insight_user_row(item, row, platform)
+        if parsed is not None:
+            normalized.append(parsed)
+    return tuple(normalized)
+
+
+def _insight_user_rows(value: Any) -> tuple[dict[str, Any], ...]:
+    candidates: Any = value
+    if isinstance(value, dict):
+        candidates = []
+        for key in ("data", "items", "rows", "list", "records", "result"):
+            child = value.get(key)
+            if isinstance(child, list):
+                candidates = child
+                break
+    if not isinstance(candidates, list):
+        return ()
+    return tuple(row for row in candidates if isinstance(row, dict))
+
+
+def _normalize_insight_user_row(
+    item: ToolEvidence, row: dict[str, Any], platform: str
+) -> NormalizedKolEvidence | None:
+    nickname = next(
+        (text for key in _INSIGHT_USER_NICKNAME_KEYS if (text := _loose_string(row.get(key)))),
+        None,
+    )
+    if nickname is None:
+        # 大盘统计形态（如 [{"日期": ..., "声量": ...}]）：不是达人证据。
+        return None
+    account_id = next(
+        (text for key in _INSIGHT_USER_ID_KEYS if (text := _loose_string(row.get(key)))),
+        None,
+    )
+    if account_id is None:
+        identity_material = _stable_json(
+            {"platform": platform, "nickname": nickname, "profile": None}
+        ).encode("utf-8")
+        account_id = f"{platform}:{hashlib.sha256(identity_material).hexdigest()[:24]}"
+    followers = next(
+        (
+            parsed
+            for key in _INSIGHT_USER_FOLLOWER_KEYS
+            if (parsed := _unit_integer(row.get(key))) is not None
+        ),
+        None,
+    )
+    export_fields: dict[str, Any] = {}
+    for target, source_key in _INSIGHT_USER_EXPORT_KEYS.items():
+        try:
+            value = _non_negative_number(row.get(source_key))
+        except (InvalidOperation, TypeError, ValueError):
+            continue
+        if _has_value(value):
+            export_fields[target] = value
+    fields = {
+        "nickname": nickname,
+        "normalized_profile_url": None,
+        "followers": followers,
+        "engagement_rate": None,
+        "quoted_price_cny": None,
+        "content_score": None,
+        "audience_score": None,
+        "engagement_score": None,
+        "budget_score": None,
+        "growth_score": None,
+        "brand_safety_score": None,
+    }
+    missing = tuple(name for name, value in fields.items() if value is None)
+    return _with_provenance(
+        NormalizedKolEvidence(
+            platform=platform,
+            platform_account_id=account_id,
+            risk_flags=(),
+            collected_at=item.collected_at,
+            evidence_references=(item.source_call_id,) if item.source_call_id else (),
+            missing_fields=missing,
+            export_fields=redact_evidence_for_storage(export_fields),
+            analytics_fields={},
+            **fields,
+        )
+    )
+
+
 def _normalize_datatap_generic_candidate(
     item: ToolEvidence, candidate: dict[str, Any], platform: str | None
 ) -> NormalizedKolEvidence:
@@ -578,6 +713,23 @@ def _normalize_datatap_generic_candidate(
         "互动率-视频笔记",
         "engagement_rate",
     )
+    # kol.detail 行的指标藏在嵌套 section 里：发帖汇总/受众画像/商业表现。
+    detail_stats = candidate.get("发帖数据-汇总统计")
+    works_count = average_interactions = average_reads = None
+    if isinstance(detail_stats, dict):
+        works_count = _first_value(
+            detail_stats, ("作品数", "笔记数", "视频数"), _non_negative_number
+        )
+        average_interactions = _first_value(
+            detail_stats, ("平均互动", "平均互动量", "平均互动数"), _non_negative_number
+        )
+        average_reads = _first_value(
+            detail_stats, ("平均阅读", "平均阅读量", "平均播放", "平均播放量"),
+            _non_negative_number,
+        )
+    if engagement_rate is None and average_interactions is not None and average_reads:
+        # 详情行无互动率字段时用 平均互动/平均阅读 估算（与搜索适配器同一 0-100 口径）。
+        engagement_rate = min(round(average_interactions / average_reads * 100, 2), 100.0)
     fields = {
         "nickname": nickname,
         "normalized_profile_url": _first_present_string(candidate, _GENERIC_PROFILE_KEYS),
@@ -600,11 +752,88 @@ def _normalize_datatap_generic_candidate(
             collected_at=item.collected_at,
             evidence_references=(item.source_call_id,) if item.source_call_id else (),
             missing_fields=missing,
-            export_fields=_extract_export_fields(candidate),
+            export_fields=_detail_export_fields(
+                candidate,
+                works_count=works_count,
+                average_interactions=average_interactions,
+                average_reads=average_reads,
+            ),
             analytics_fields=_extract_analytics_fields(candidate),
             **fields,
         )
     )
+
+
+def _detail_export_fields(
+    candidate: dict[str, Any],
+    *,
+    works_count: int | float | None,
+    average_interactions: int | float | None,
+    average_reads: int | float | None,
+) -> dict[str, Any]:
+    """kol.detail 嵌套 section → 导出字段；缺失/空 section 容忍，不写空值。"""
+    export_fields = _extract_export_fields(candidate)
+    if works_count is not None:
+        export_fields.setdefault("works_count", works_count)
+    if average_interactions is not None:
+        export_fields.setdefault("average_interactions", average_interactions)
+    if average_reads is not None:
+        export_fields.setdefault("average_reads", average_reads)
+    audience = candidate.get("受众画像")
+    if isinstance(audience, dict):
+        for label, rate in _safe_distribution(audience.get("粉丝年龄分布")).items():
+            bucket = _age_bucket(label)
+            if bucket is not None:
+                export_fields.setdefault(bucket, rate)
+        regions = _safe_distribution(
+            audience.get("粉丝省份分布Top10") or audience.get("粉丝省份分布")
+        )
+        if regions:
+            export_fields.setdefault("province", max(regions, key=lambda key: regions[key]))
+        interests = _safe_distribution(audience.get("粉丝兴趣分布"))
+        if interests:
+            top = sorted(interests, key=lambda key: interests[key], reverse=True)[:5]
+            export_fields.setdefault("content_tags", "、".join(top))
+    for section_key, export_key in (
+        ("商业表现-蒲公英商单", "business_order_stats"),
+        ("商业表现-品牌提及", "brand_mention_stats"),
+    ):
+        section = candidate.get(section_key)
+        summary = section.get("汇总统计") if isinstance(section, dict) else None
+        if isinstance(summary, dict) and summary:
+            cleaned = redact_evidence_for_storage(summary)
+            if _has_value(cleaned):
+                export_fields.setdefault(export_key, cleaned)
+    return export_fields
+
+
+def _safe_distribution(value: Any) -> dict[str, int | float]:
+    try:
+        return _distribution(value)
+    except (InvalidOperation, TypeError, ValueError):
+        return {}
+
+
+def _age_bucket(label: str) -> str | None:
+    """受众年龄分布标签 → 导出模板五档年龄桶；无法识别返回 None。"""
+    text = label.strip()
+    numbers = [int(part) for part in re.findall(r"\d+", text)]
+    if not numbers:
+        return None
+    if text.startswith("<") or "以下" in text:
+        return "age_under_18"
+    if text.startswith(">") or "以上" in text:
+        return "age_over_44"
+    low = numbers[0]
+    if low < 18:
+        return "age_under_18"
+    if low < 25:
+        return "age_18_24"
+    if low < 35:
+        return "age_25_34"
+    if low < 45:
+        return "age_35_44"
+    return "age_over_44"
 
 
 def _first_value(candidate: dict[str, Any], keys: tuple[str, ...], parser: Callable[[Any], Any]) -> Any:
@@ -1375,4 +1604,6 @@ _ADAPTERS: dict[str, Adapter] = {
     "datatap.social.grow.kol.weibo.search.v1": _datatap_generic_kol_search_adapter,
     "datatap.social.grow.kol.wechat.search.v1": _datatap_generic_kol_search_adapter,
     "datatap.social.grow.kol.detail.v1": _datatap_generic_kol_search_adapter,
+    "datatap.insight.query.analysis.v1": _datatap_insight_user_stats_adapter,
+    "datatap.insight.social.statistic.hot.user.v1": _datatap_insight_user_stats_adapter,
 }
