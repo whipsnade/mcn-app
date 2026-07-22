@@ -135,7 +135,11 @@ class AnalysisReportService:
 
         同步端点直接返回报告，不发 report.updated 事件。同会话并发点击可能
         撞 (session_id, version) 唯一约束：SAVEPOINT 回滚后重算 version 重试
-        一次，再失败向上抛。
+        一次，再失败抛领域错误由端点层映射。
+
+        错误契约：
+        - ``LookupError("session_not_found")``：会话不存在/不属于该用户/已软删 → 404；
+        - ``LookupError("report_version_conflict")``：两次写入均撞唯一约束 → 409。
         """
         session = await self._db.scalar(
             select(WorkspaceSession).where(
@@ -174,8 +178,10 @@ class AnalysisReportService:
                     await self._db.flush()
                 return report
             except IntegrityError:
+                # 宽捕获是有意的：FK 违规等其他冲突重试一次无害；第二次仍失败
+                # 说明并发写入持续竞争，抛领域错误交给端点层映射 409。
                 if attempt == 2:
-                    raise
+                    raise LookupError("report_version_conflict") from None
         raise RuntimeError("unreachable")  # pragma: no cover
 
     async def get_owned_report(self, user_id: str, report_id: str) -> AnalysisReport:

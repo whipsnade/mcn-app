@@ -3,11 +3,14 @@ from datetime import UTC, datetime
 from uuid import uuid4
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.reporting.analysis_reports import AnalysisReportService
 from app.reporting.blocks import HeadingBlock, MarkdownBlock, MetricGridBlock, MetricItem, ReportDocument
+from app.reporting.models import AnalysisReport
 from app.tasks.models import AnalysisTask, TaskEvent
-from app.workspace.models import Message
+from app.workspace.models import Message, WorkspaceSession
 
 
 def _document() -> ReportDocument:
@@ -226,4 +229,99 @@ async def test_session_report_read_and_session_dto(auth_client_factory, db_sessi
     assert summary is not None
     assert summary["id"] == report.id
     assert summary["task_id"] is None
+
+
+def _patch_flaky_flush(monkeypatch, *, failures: int) -> list[int]:
+    """把 AsyncSession.flush 包成前 failures 次带报告 flush 抛 IntegrityError。
+
+    只统计 session.new 里带 AnalysisReport 的 flush（version 查询的 autoflush
+    不计入），返回计数列表供断言。
+    """
+    real_flush = AsyncSession.flush
+    report_flushes: list[int] = []
+
+    async def flaky_flush(self: AsyncSession) -> None:
+        if any(isinstance(obj, AnalysisReport) for obj in self.new):
+            report_flushes.append(1)
+            if len(report_flushes) <= failures:
+                raise IntegrityError("INSERT INTO analysis_reports", {}, Exception("duplicate"))
+        await real_flush(self)
+
+    monkeypatch.setattr(AsyncSession, "flush", flaky_flush)
+    return report_flushes
+
+
+@pytest.mark.asyncio
+async def test_build_session_report_retries_after_version_conflict(
+    auth_client_factory, db_session, monkeypatch
+) -> None:
+    """首次 flush 撞 (session_id, version) 约束后，重算 version 重试成功。"""
+    client = await auth_client_factory("13400000050")
+    session_id, task_id = await _create_agent_session(client, "retry")
+    source = await db_session.get(AnalysisTask, task_id)
+    assert source is not None
+
+    report_flushes = _patch_flaky_flush(monkeypatch, failures=1)
+
+    service = AnalysisReportService(db_session)
+    report = await service.build_session_report(
+        user_id=source.user_id, session_id=session_id, document=_document()
+    )
+
+    assert len(report_flushes) == 2
+    assert report.version == 1
+    assert report.task_id is None
+    persisted = await db_session.scalar(
+        select(func.count(AnalysisReport.id)).where(AnalysisReport.session_id == session_id)
+    )
+    assert persisted == 1
+
+
+@pytest.mark.asyncio
+async def test_build_session_report_double_conflict_raises_domain_error(
+    auth_client_factory, db_session, monkeypatch
+) -> None:
+    """两次写入均撞唯一约束：抛 LookupError("report_version_conflict")（端点映射 409）。"""
+    client = await auth_client_factory("13400000051")
+    session_id, task_id = await _create_agent_session(client, "double-conflict")
+    source = await db_session.get(AnalysisTask, task_id)
+    assert source is not None
+
+    report_flushes = _patch_flaky_flush(monkeypatch, failures=2)
+
+    service = AnalysisReportService(db_session)
+    with pytest.raises(LookupError, match="report_version_conflict"):
+        await service.build_session_report(
+            user_id=source.user_id, session_id=session_id, document=_document()
+        )
+    assert len(report_flushes) == 2
+
+
+@pytest.mark.asyncio
+async def test_session_report_rejects_soft_deleted_session(
+    auth_client_factory, db_session
+) -> None:
+    """软删会话：build_session_report 抛 session_not_found，既有报告读取 404。"""
+    owner = await auth_client_factory("13400000052")
+    session_id, task_id = await _create_agent_session(owner, "soft-delete")
+    source = await db_session.get(AnalysisTask, task_id)
+    assert source is not None
+
+    service = AnalysisReportService(db_session)
+    report = await service.build_session_report(
+        user_id=source.user_id, session_id=session_id, document=_document()
+    )
+
+    session = await db_session.get(WorkspaceSession, session_id)
+    assert session is not None
+    session.deleted_at = datetime.now(UTC).replace(tzinfo=None)
+    await db_session.flush()
+
+    with pytest.raises(LookupError, match="session_not_found"):
+        await service.build_session_report(
+            user_id=source.user_id, session_id=session_id, document=_document()
+        )
+
+    response = await owner.get(f"/api/v1/analysis-reports/{report.id}")
+    assert response.status_code == 404
 
