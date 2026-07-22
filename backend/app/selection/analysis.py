@@ -50,7 +50,8 @@ def _score_reason(row: SessionKolSelection) -> str:
     for key in _SCORE_REASON_KEYS:
         value = export_fields.get(key)
         if value:
-            return str(value)
+            # 防御性截断：评分理由进模型上下文，异常长文本按 200 字符截断。
+            return str(value)[:200]
     return ""
 
 

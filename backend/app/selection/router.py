@@ -43,9 +43,11 @@ async def create_kol_analysis(
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT, detail="NO_KOL_SELECTION"
             ) from error
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT, detail="REPORT_VERSION_CONFLICT"
-        ) from error
+        if code == "report_version_conflict":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail="REPORT_VERSION_CONFLICT"
+            ) from error
+        raise
     except ModelAdapterError as error:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,

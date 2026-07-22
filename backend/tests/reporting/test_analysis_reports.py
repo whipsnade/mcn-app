@@ -2,10 +2,11 @@ import pytest
 from datetime import UTC, datetime
 from uuid import uuid4
 
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.db.session import engine
 from app.reporting.analysis_reports import AnalysisReportService
 from app.reporting.blocks import HeadingBlock, MarkdownBlock, MetricGridBlock, MetricItem, ReportDocument
 from app.reporting.models import AnalysisReport
@@ -229,6 +230,39 @@ async def test_session_report_read_and_session_dto(auth_client_factory, db_sessi
     assert summary is not None
     assert summary["id"] == report.id
     assert summary["task_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_build_session_report_version_query_uses_locking_read(
+    auth_client_factory, db_session
+) -> None:
+    """version 计算必须是锁定读（FOR UPDATE）：并发双击在 DB 层串行化而非失败。"""
+    client = await auth_client_factory("13400000053")
+    session_id, task_id = await _create_agent_session(client, "locking-read")
+    source = await db_session.get(AnalysisTask, task_id)
+    assert source is not None
+
+    statements: list[str] = []
+
+    def capture(conn, cursor, statement, parameters, context, executemany) -> None:
+        statements.append(statement)
+
+    event.listen(engine.sync_engine, "before_cursor_execute", capture)
+    try:
+        service = AnalysisReportService(db_session)
+        await service.build_session_report(
+            user_id=source.user_id, session_id=session_id, document=_document()
+        )
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", capture)
+
+    version_queries = [
+        statement
+        for statement in statements
+        if "max(" in statement.lower() and "analysis_reports" in statement
+    ]
+    assert version_queries, "未捕获到 version 计算查询"
+    assert all("for update" in statement.lower() for statement in version_queries)
 
 
 def _patch_flaky_flush(monkeypatch, *, failures: int) -> list[int]:

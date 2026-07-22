@@ -151,11 +151,14 @@ class AnalysisReportService:
         if session is None:
             raise LookupError("session_not_found")
         for attempt in (1, 2):
+            # 锁定读（FOR UPDATE 走 current read）：并发请求在 DB 层串行化，
+            # 后到的事务等先到的事务提交后读到最新 max(version)，避免
+            # REPEATABLE READ 快照下两次算出同一 version 稳定撞唯一约束。
             version = (
                 await self._db.scalar(
-                    select(func.max(AnalysisReport.version)).where(
-                        AnalysisReport.session_id == session_id
-                    )
+                    select(func.max(AnalysisReport.version))
+                    .where(AnalysisReport.session_id == session_id)
+                    .with_for_update()
                 )
                 or 0
             ) + 1

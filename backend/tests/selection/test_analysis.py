@@ -17,6 +17,7 @@ from app.db.session import get_db
 from app.identity.models import LoginSession, User
 from app.main import create_app
 from app.model.contracts import ModelPlanInvalidError, StructuredResult
+from app.reporting.analysis_reports import AnalysisReportService
 from app.reporting.blocks import ChartBlock, ChartSeries, MetricGridBlock, MetricItem, ReportDocument
 from app.reporting.models import AnalysisReport
 from app.selection.analysis import build_kol_analysis_summary
@@ -36,8 +37,9 @@ def _row(
     total: float = 80.0,
     rating: str = "重点推荐",
     score_reason: str | None = None,
+    extra_export_fields: dict[str, Any] | None = None,
 ) -> SessionKolSelection:
-    export_fields: dict[str, Any] = {}
+    export_fields: dict[str, Any] = dict(extra_export_fields or {})
     if score_reason is not None:
         export_fields["score_reason"] = score_reason
     now = datetime.now(UTC).replace(tzinfo=None)
@@ -153,6 +155,38 @@ class TestBuildKolAnalysisSummary:
 
         assert summary["platform_counts"] == {"kuaishou": 1}
         assert summary["top10"][0]["platform"] == "kuaishou"
+
+    def test_followers_bucket_boundaries_belong_to_upper_bucket(self) -> None:
+        rows = [
+            _row("a", followers=99_999),
+            _row("b", followers=100_000),
+            _row("c", followers=499_999),
+            _row("d", followers=500_000),
+            _row("e", followers=999_999),
+            _row("f", followers=1_000_000),
+            _row("g", followers=4_999_999),
+            _row("h", followers=5_000_000),
+        ]
+
+        summary = build_kol_analysis_summary(rows, brand="", category=None, target_audience="")
+
+        assert summary["followers_buckets"] == {
+            "<10万": 1, "10-50万": 2, "50-100万": 2, "100-500万": 2, ">500万": 1,
+        }
+
+    def test_score_reason_falls_back_to_chinese_key(self) -> None:
+        rows = [_row("a", extra_export_fields={"评分理由": "受众高度契合"})]
+
+        summary = build_kol_analysis_summary(rows, brand="", category=None, target_audience="")
+
+        assert summary["top10"][0]["score_reason"] == "受众高度契合"
+
+    def test_score_reason_truncated_to_200_chars(self) -> None:
+        rows = [_row("a", score_reason="长" * 300)]
+
+        summary = build_kol_analysis_summary(rows, brand="", category=None, target_audience="")
+
+        assert summary["top10"][0]["score_reason"] == "长" * 200
 
 
 _XHS_TOOL = "datatap.xiaohongshu.kol.search.v1"
@@ -363,8 +397,25 @@ async def test_kol_analysis_invalid_model_output_returns_502(
 
 
 @pytest.mark.asyncio
-async def test_kol_analysis_other_users_session_returns_404(
-    analysis_client_factory, db_session: AsyncSession
+async def test_kol_analysis_version_conflict_returns_409(
+    analysis_client_factory, db_session: AsyncSession, monkeypatch
+) -> None:
+    client, user, session_id, _model = await analysis_client_factory()
+    await _seed_selection(db_session, user.id, session_id)
+
+    async def conflict(self, **kwargs):
+        raise LookupError("report_version_conflict")
+
+    monkeypatch.setattr(AnalysisReportService, "build_session_report", conflict)
+
+    response = await client.post(f"/api/v1/sessions/{session_id}/kol-analysis")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "REPORT_VERSION_CONFLICT"
+
+
+@pytest.mark.asyncio
+async def test_kol_analysis_other_users_session_returns_404(    analysis_client_factory, db_session: AsyncSession
 ) -> None:
     _client, user, session_id, _model = await analysis_client_factory()
     await _seed_selection(db_session, user.id, session_id)
