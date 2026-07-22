@@ -1,9 +1,13 @@
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from uuid import NAMESPACE_URL, uuid5
+from uuid import NAMESPACE_URL, uuid4, uuid5
 
 import pytest
+from sqlalchemy import delete, select
 
 from app.billing.service import InsufficientPointsError
+from app.db.session import SessionFactory
+from app.identity.models import User
 from app.mcp_gateway.contracts import DataTapService
 from app.orchestration.loop import (
     AgentDecision,
@@ -13,7 +17,11 @@ from app.orchestration.loop import (
     TrajectoryStep,
 )
 from app.orchestration.schemas import PlannerTool
+from app.selection.models import SessionKolSelection
+from app.tasks.dependencies import _TaskArtifacts
 from app.tasks.executor import TaskExecutor
+from app.tasks.models import AnalysisTask, TaskEvent
+from app.workspace.models import Message, WorkspaceSession
 
 
 _TOOL_NAME = "datatap.insight.social.statistic.overview.v1"
@@ -69,8 +77,8 @@ def _call(arguments: dict | None = None, tool: str = _TOOL_NAME) -> AgentDecisio
     )
 
 
-def _finish() -> AgentDecision:
-    return AgentDecision(action="finish")
+def _finish(conclusion: str = "") -> AgentDecision:
+    return AgentDecision(action="finish", conclusion=conclusion)
 
 
 def _settled(data: dict | None = None) -> SimpleNamespace:
@@ -180,14 +188,10 @@ class _FakeGateway:
 
 class _FakeArtifacts:
     def __init__(self) -> None:
-        self.built: list[str] = []
-        self.streamed: list[str] = []
+        self.conclusions: list[tuple[str, str]] = []
 
-    async def build_analysis_report(self, task_id):
-        self.built.append(task_id)
-
-    async def stream_analysis_summary(self, task_id):
-        self.streamed.append(task_id)
+    async def write_conclusion_message(self, task_id, conclusion):
+        self.conclusions.append((task_id, conclusion))
 
 
 def _task(plan_json: dict | None = None) -> SimpleNamespace:
@@ -214,18 +218,18 @@ def _executor(store, decider, gateway, artifacts, context_builder=None) -> TaskE
 
 
 @pytest.mark.asyncio
-async def test_agent_loop_calls_tools_until_finish_then_builds_report() -> None:
+async def test_agent_loop_calls_tools_until_finish_then_writes_conclusion() -> None:
     task = _task()
     store = _FakeStore(task)
-    decider = _ScriptedDecider([_call(), _call(), _finish()])
+    decider = _ScriptedDecider([_call(), _call(), _finish("已圈选 12 位达人，覆盖小红书与抖音。")])
     gateway = _FakeGateway([(_settled(),), (_settled(),)])
     artifacts = _FakeArtifacts()
 
     await _executor(store, decider, gateway, artifacts).run(task.id)
 
     assert store.terminal == "completed"
-    assert artifacts.built == [task.id]
-    assert artifacts.streamed == [task.id]
+    # finish 的结论原样写入 assistant 消息，不再生成分析报告与流式摘要。
+    assert artifacts.conclusions == [(task.id, "已圈选 12 位达人，覆盖小红书与抖音。")]
     assert len(gateway.commands) == 2
     assert gateway.commands[0][0].logical_call_id == str(uuid5(NAMESPACE_URL, "task-1:step_1"))
     assert gateway.commands[1][0].logical_call_id == str(uuid5(NAMESPACE_URL, "task-1:step_2"))
@@ -238,7 +242,7 @@ async def test_agent_loop_calls_tools_until_finish_then_builds_report() -> None:
 
 
 @pytest.mark.asyncio
-async def test_agent_loop_insufficient_balance_with_evidence_builds_report() -> None:
+async def test_agent_loop_insufficient_balance_with_evidence_writes_conclusion() -> None:
     task = _task()
     store = _FakeStore(task)
     decider = _ScriptedDecider([_call(), _call()])
@@ -247,15 +251,14 @@ async def test_agent_loop_insufficient_balance_with_evidence_builds_report() -> 
 
     await _executor(store, decider, gateway, artifacts).run(task.id)
 
-    # 已有 settled 证据：仍产出报告与摘要，然后进入余额不足终态。
+    # 已有 settled 证据：仍写结论消息（空结论走服务端回退文案），再进入余额不足终态。
     assert store.terminal == "insufficient_balance"
-    assert artifacts.built == [task.id]
-    assert artifacts.streamed == [task.id]
+    assert artifacts.conclusions == [(task.id, "")]
     assert len(gateway.commands) == 2
 
 
 @pytest.mark.asyncio
-async def test_agent_loop_insufficient_balance_without_evidence_has_no_report() -> None:
+async def test_agent_loop_insufficient_balance_without_evidence_has_no_message() -> None:
     task = _task()
     store = _FakeStore(task)
     decider = _ScriptedDecider([_call()])
@@ -265,8 +268,7 @@ async def test_agent_loop_insufficient_balance_without_evidence_has_no_report() 
     await _executor(store, decider, gateway, artifacts).run(task.id)
 
     assert store.terminal == "insufficient_balance"
-    assert artifacts.built == []
-    assert artifacts.streamed == []
+    assert artifacts.conclusions == []
 
 
 @pytest.mark.asyncio
@@ -327,7 +329,7 @@ async def test_agent_loop_unknown_call_interrupts_without_report() -> None:
     await _executor(store, decider, gateway, artifacts).run(task.id)
 
     assert store.terminal == "interrupted"
-    assert artifacts.built == []
+    assert artifacts.conclusions == []
 
 
 @pytest.mark.asyncio
@@ -340,8 +342,24 @@ async def test_agent_loop_without_any_evidence_fails() -> None:
 
     await _executor(store, decider, gateway, artifacts).run(task.id)
 
-    assert store.terminal == "failed:mcp_call_failed"
-    assert artifacts.built == []
+    assert store.terminal == "failed:no_evidence_collected"
+    assert artifacts.conclusions == []
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_first_round_finish_without_evidence_fails() -> None:
+    # 门禁拆除后模型首轮即可 finish：零证据直接失败，语义化错误码，不写结论消息。
+    task = _task()
+    store = _FakeStore(task)
+    decider = _ScriptedDecider([_finish("没有数据也要结论")])
+    gateway = _FakeGateway([])
+    artifacts = _FakeArtifacts()
+
+    await _executor(store, decider, gateway, artifacts).run(task.id)
+
+    assert store.terminal == "failed:no_evidence_collected"
+    assert gateway.commands == []
+    assert artifacts.conclusions == []
 
 
 @pytest.mark.asyncio
@@ -473,7 +491,7 @@ async def test_agent_loop_throttle_streak_breaks_loop_with_existing_evidence() -
     assert len(gateway.commands) == 2
     # 2 次执行 + 3 次被熔断（第 3 次熔断后直接收尾，不再询问模型）。
     assert decider.calls == 5
-    assert artifacts.built == [task.id]
+    assert artifacts.conclusions == [(task.id, "")]
     # 前 2 次熔断原因已回喂进后续轮次上下文。
     throttle_ids = {
         note.step_id
@@ -576,6 +594,167 @@ async def test_agent_loop_selection_ingest_failure_does_not_block() -> None:
 
     await _executor_with_selection(store, decider, gateway, artifacts, selection).run(task.id)
 
-    # 沉淀失败只记 warning：任务仍正常完成并产出报告。
+    # 沉淀失败只记 warning：任务仍正常完成并写结论消息。
     assert store.terminal == "completed"
-    assert artifacts.built == [task.id]
+    assert artifacts.conclusions == [(task.id, "")]
+
+
+async def _create_leased_task(worker_id: str) -> dict[str, str]:
+    """在测试库写入持有有效租约的任务及其外键链，返回各实体 id。"""
+    now = datetime.now(UTC).replace(tzinfo=None)
+    ids = {
+        "user_id": str(uuid4()),
+        "session_id": str(uuid4()),
+        "message_id": str(uuid4()),
+        "task_id": str(uuid4()),
+    }
+    async with SessionFactory.begin() as db:
+        db.add(
+            User(
+                id=ids["user_id"],
+                nickname="结论消息测试",
+                role="user",
+                status="active",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        db.add(
+            WorkspaceSession(
+                id=ids["session_id"],
+                user_id=ids["user_id"],
+                title="结论消息测试",
+                brand="测试品牌",
+                status="draft",
+                platforms=["xiaohongshu"],
+                target_audience="测试受众",
+                last_accessed_at=now,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        # 模型间无 ORM relationship，需逐级显式 flush 保证外键父行先落库
+        #（messages.session_id → sessions、analysis_tasks.trigger_message_id → messages）。
+        await db.flush()
+        db.add(
+            Message(
+                id=ids["message_id"],
+                session_id=ids["session_id"],
+                user_id=ids["user_id"],
+                role="user",
+                content="帮我圈选达人",
+                sequence=1,
+                metadata_json={},
+                created_at=now,
+            )
+        )
+        await db.flush()
+        db.add(
+            AnalysisTask(
+                id=ids["task_id"],
+                user_id=ids["user_id"],
+                session_id=ids["session_id"],
+                trigger_message_id=ids["message_id"],
+                status="running",
+                kind="agent",
+                lease_owner=worker_id,
+                lease_expires_at=now + timedelta(minutes=5),
+                started_at=now,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+    return ids
+
+
+async def _cleanup_leased_task(ids: dict[str, str]) -> None:
+    async with SessionFactory.begin() as db:
+        await db.execute(delete(TaskEvent).where(TaskEvent.task_id == ids["task_id"]))
+        await db.execute(delete(AnalysisTask).where(AnalysisTask.id == ids["task_id"]))
+        await db.execute(
+            delete(SessionKolSelection).where(
+                SessionKolSelection.session_id == ids["session_id"]
+            )
+        )
+        await db.execute(delete(Message).where(Message.session_id == ids["session_id"]))
+        await db.execute(delete(WorkspaceSession).where(WorkspaceSession.id == ids["session_id"]))
+        await db.execute(delete(User).where(User.id == ids["user_id"]))
+
+
+@pytest.mark.asyncio
+async def test_write_conclusion_message_persists_assistant_message_idempotently() -> None:
+    worker_id = f"test-worker-{uuid4()}"
+    ids = await _create_leased_task(worker_id)
+    try:
+        artifacts = _TaskArtifacts(worker_id, model=None)
+        await artifacts.write_conclusion_message(ids["task_id"], "已圈选 12 位达人，覆盖小红书。")
+        # 重试安全：相同 task_id 的结论消息已存在时直接返回，不重复写入。
+        await artifacts.write_conclusion_message(ids["task_id"], "重试不应重复写入")
+
+        async with SessionFactory() as db:
+            messages = list(
+                (
+                    await db.scalars(
+                        select(Message).where(
+                            Message.session_id == ids["session_id"],
+                            Message.role == "assistant",
+                        )
+                    )
+                ).all()
+            )
+            assert len(messages) == 1
+            message = messages[0]
+            assert message.content == "已圈选 12 位达人，覆盖小红书。"
+            assert message.metadata_json == {
+                "task_id": ids["task_id"],
+                "kind": "conclusion",
+                "status": "completed",
+            }
+            event = await db.scalar(
+                select(TaskEvent).where(
+                    TaskEvent.task_id == ids["task_id"],
+                    TaskEvent.event_type == "message.completed",
+                )
+            )
+            assert event is not None
+            assert event.payload_json == {"message_id": message.id}
+    finally:
+        await _cleanup_leased_task(ids)
+
+
+@pytest.mark.asyncio
+async def test_write_conclusion_message_empty_conclusion_falls_back_to_selection_count() -> None:
+    worker_id = f"test-worker-{uuid4()}"
+    ids = await _create_leased_task(worker_id)
+    try:
+        now = datetime.now(UTC).replace(tzinfo=None)
+        async with SessionFactory.begin() as db:
+            for index in range(3):
+                db.add(
+                    SessionKolSelection(
+                        id=str(uuid4()),
+                        user_id=ids["user_id"],
+                        session_id=ids["session_id"],
+                        platform="xiaohongshu",
+                        kol_uid=f"uid-{index}",
+                        fields_json={},
+                        score_json={},
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+        artifacts = _TaskArtifacts(worker_id, model=None)
+        await artifacts.write_conclusion_message(ids["task_id"], "")
+
+        async with SessionFactory() as db:
+            message = await db.scalar(
+                select(Message).where(
+                    Message.session_id == ids["session_id"],
+                    Message.role == "assistant",
+                )
+            )
+            assert message is not None
+            assert "共圈选 3 位达人" in message.content
+            assert message.metadata_json["kind"] == "conclusion"
+    finally:
+        await _cleanup_leased_task(ids)

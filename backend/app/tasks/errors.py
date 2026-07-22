@@ -25,6 +25,7 @@ _ERROR_MESSAGES = {
     "input_validation_error": "分析条件暂时无法提交，请检查筛选条件后重试。",
     "possibly_sent_timeout": "社媒数据服务响应超时，结果暂时无法确认。",
     "mcp_unknown_outcome": "社媒数据服务响应未确认，请稍后重试。",
+    "no_evidence_collected": "未采集到有效数据，请调整分析条件后重试。",
     "mcp_call_failed": "社媒数据查询失败，请稍后重试。",
     "mcp_partial_failure": "部分社媒渠道查询失败，已保留可用结果。",
     "insufficient_balance": "积分余额不足，请充值后重试。",

@@ -20,14 +20,10 @@ from app.mcp_gateway.contracts import DataTapService
 from app.mcp_gateway.registry import ToolRegistryService
 from app.mcp_gateway.service import McpGatewayService
 from app.model.dependencies import get_model_adapter
-from app.model.contracts import ChatMessage, StreamingModelRequest, StructuredModelRequest
+from app.model.contracts import ChatMessage, StructuredModelRequest
 from app.model.exemplars import find_success_exemplars
 from app.model.persona import describe_user_persona
-from app.model.prompts import (
-    AGENT_LOOP_PROMPT,
-    REPORT_WRITER_PROMPT,
-    SUMMARY_PROMPT,
-)
+from app.model.prompts import AGENT_LOOP_PROMPT
 from app.orchestration.context import compress_messages
 from app.orchestration.loop import AgentDecision, AgentLoopContext
 from app.orchestration.routing import extract_requested_period
@@ -39,15 +35,8 @@ from app.tasks.models import AnalysisTask
 from app.tasks.recovery import TaskRecovery
 from app.tasks.repository import TaskRepository
 from app.workspace.models import Message
-from app.reporting.analysis_reports import AnalysisReportService
-from app.reporting.blocks import ReportDocument
-from app.reporting.models import AnalysisReport
 from app.tasks.state import TaskEventType
 from app.workspace.service import WorkspaceService
-
-
-class SummaryRecoveryMismatch(RuntimeError):
-    """恢复流无法证明与已持久化草稿属于同一输出。"""
 
 
 logger = logging.getLogger(__name__)
@@ -80,30 +69,6 @@ def param_profile_period_override(profile: dict[str, Any]) -> dict[str, Any] | N
         "start": start.isoformat(),
         "end": end.isoformat(),
     }
-
-
-def summary_deltas_to_persist(
-    persisted_content: str, deltas: tuple[str, ...], *, completed: bool = False
-) -> tuple[str, ...] | None:
-    """流恢复从头重放时，只返回尚未提交的后缀。"""
-    if completed:
-        return ()
-    generated = ""
-    persisted = persisted_content
-    result: list[str] = []
-    for delta in deltas:
-        generated += delta
-        if persisted.startswith(generated):
-            continue
-        if generated.startswith(persisted):
-            suffix = generated[len(persisted) :]
-            if suffix:
-                result.append(suffix)
-                persisted = generated
-            continue
-        # 无法证明新流是旧草稿的同一前缀：保留草稿并拒绝混拼。
-        return None
-    return tuple(result)
 
 
 class DatabaseTaskStore:
@@ -168,7 +133,6 @@ class _TaskArtifacts:
 
     def __init__(self, worker_id: str, model) -> None:
         self._worker_id = worker_id
-        self._model = model
         self._followups = FollowupSuggestionService(model)
 
     async def prepare_followups(self, task_id: str) -> bool:
@@ -177,154 +141,60 @@ class _TaskArtifacts:
     async def generate_followups(self, task_id: str) -> bool:
         return await self._followups.generate(task_id)
 
-    async def build_analysis_report(self, task_id: str):
-        """agent 任务产物：report_writer 基于已结算证据撰写版本化自由报告。"""
-        async with SessionFactory() as db:
-            writer_input = await AnalysisReportService(db).writer_input(task_id)
-            task = await db.get(AnalysisTask, task_id)
-        result = await self._model.complete_json(
-            StructuredModelRequest(
-                purpose="report_writer",
-                template_name=REPORT_WRITER_PROMPT.name,
-                messages=(
-                    ChatMessage(role="system", content=REPORT_WRITER_PROMPT.system),
-                    ChatMessage(
-                        role="user",
-                        content=json.dumps(
-                            writer_input,
-                            ensure_ascii=False,
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        ),
-                    ),
-                ),
-                output_model=ReportDocument,
-                max_tokens=8192,
-                log_context={
-                    "user_id": task.user_id if task is not None else None,
-                    "session_id": task.session_id if task is not None else None,
-                    "task_id": task_id,
-                    "tags": ["report_writer"],
-                },
-            )
-        )
-        async with SessionFactory.begin() as db:
-            return await AnalysisReportService(db).build(
-                task_id, document=result.value, lease_owner=self._worker_id
-            )
-
-    async def stream_analysis_summary(self, task_id: str) -> None:
-        """agent 任务的摘要：输入为已持久化的自由报告，而非 BI 报告。"""
-        async with SessionFactory() as db:
-            report = await db.scalar(
-                select(AnalysisReport)
-                .where(AnalysisReport.task_id == task_id)
-                .order_by(AnalysisReport.version.desc())
-            )
-            task = await db.get(AnalysisTask, task_id)
-            if report is None or task is None:
-                raise LookupError("report_not_found")
-            summary_input = {
-                "task_id": task.id,
-                "report_id": report.id,
-                "report_version": report.version,
-                "title": report.title,
-                "conclusion": report.conclusion_text or "",
-            }
-            existing = await self._existing_summary_message(db, task)
-            log_context = {
-                "user_id": task.user_id,
-                "session_id": task.session_id,
-                "task_id": task_id,
-                "tags": ["summary"],
-            }
-        await self._stream_summary(task_id, summary_input, existing, log_context)
-
-    async def _stream_summary(
-        self,
-        task_id: str,
-        summary_input: dict,
-        existing: Message | None,
-        log_context: dict[str, Any],
-    ) -> None:
-        """逐段提交草稿与事件；客户端断开后执行器仍会完成该过程。"""
-        if existing is not None and existing.metadata_json.get("status") == "completed":
-            return
-        content = existing.content if existing is not None else ""
-        message_id = existing.id if existing is not None else None
-        generated_deltas: list[str] = []
-        async for event in self._model.stream_text(
-            StreamingModelRequest(
-                messages=(
-                    ChatMessage(role="system", content=SUMMARY_PROMPT.system),
-                    ChatMessage(
-                        role="user",
-                        content=json.dumps(summary_input, ensure_ascii=False, sort_keys=True),
-                    ),
-                ),
-                log_context=log_context,
-            )
-        ):
-            if event.type != "text.delta" or not event.text:
-                continue
-            generated_deltas.append(event.text)
-            pending = summary_deltas_to_persist(content, tuple(generated_deltas))
-            if pending is None:
-                raise SummaryRecoveryMismatch("summary_recovery_prefix_mismatch")
-            if not pending:
-                continue
-            delta = pending[-1]
-            content += delta
-            message_id = await self._save_summary_delta(task_id, message_id, content, delta)
-        if message_id is None:
-            raise ValueError("summary_stream_empty")
+    async def write_conclusion_message(self, task_id: str, conclusion: str) -> None:
+        """任务收尾：把 finish 结论写成一条 assistant 消息（幂等，重试安全）。"""
         async with SessionFactory.begin() as db:
             task = await self._locked_active_task(db, task_id)
-            message = await db.get(Message, message_id)
-            if message is None:
-                raise LookupError("summary_message_not_found")
-            message.metadata_json = {**message.metadata_json, "status": "completed"}
+            existing = await db.scalar(
+                select(Message).where(
+                    Message.session_id == task.session_id,
+                    Message.user_id == task.user_id,
+                    Message.role == "assistant",
+                    Message.metadata_json["task_id"].as_string() == task.id,
+                    Message.metadata_json["kind"].as_string() == "conclusion",
+                )
+            )
+            if existing is not None:
+                return
+            text = conclusion.strip()
+            if not text:
+                count = await KolSelectionService(db).count_selection(
+                    session_id=task.session_id
+                )
+                text = (
+                    f"圈选完成，共圈选 {count} 位达人。"
+                    "可在右侧「KOL 分析」面板导出 Excel 或点击「分析」生成投放建议。"
+                )
+            sequence = (
+                await db.scalar(
+                    select(func.max(Message.sequence)).where(
+                        Message.session_id == task.session_id
+                    )
+                )
+                or 0
+            ) + 1
+            message = Message(
+                id=str(uuid4()),
+                session_id=task.session_id,
+                user_id=task.user_id,
+                role="assistant",
+                content=text,
+                sequence=sequence,
+                metadata_json={
+                    "task_id": task.id,
+                    "kind": "conclusion",
+                    "status": "completed",
+                },
+                created_at=datetime.now(UTC).replace(tzinfo=None),
+            )
+            db.add(message)
+            await db.flush()
             await TaskRepository(db).append_event(
                 task.id,
                 task.user_id,
                 TaskEventType.MESSAGE_COMPLETED,
                 {"message_id": message.id},
             )
-
-    async def _save_summary_delta(
-        self, task_id: str, message_id: str | None, content: str, delta: str
-    ) -> str:
-        async with SessionFactory.begin() as db:
-            task = await self._locked_active_task(db, task_id)
-            if message_id is None:
-                sequence = (
-                    await db.scalar(select(func.max(Message.sequence)).where(Message.session_id == task.session_id))
-                    or 0
-                ) + 1
-                message = Message(
-                    id=str(uuid4()),
-                    session_id=task.session_id,
-                    user_id=task.user_id,
-                    role="assistant",
-                    content=content,
-                    sequence=sequence,
-                    metadata_json={"task_id": task.id, "status": "streaming"},
-                    created_at=datetime.now(UTC).replace(tzinfo=None),
-                )
-                db.add(message)
-                await db.flush()
-            else:
-                message = await db.get(Message, message_id)
-                if message is None:
-                    raise LookupError("summary_message_not_found")
-                message.content = content
-            await TaskRepository(db).append_event(
-                task.id,
-                task.user_id,
-                TaskEventType.MESSAGE_DELTA,
-                {"message_id": message.id, "delta": delta},
-            )
-            return message.id
 
     async def _locked_active_task(self, db, task_id: str) -> AnalysisTask:
         task = await db.scalar(
@@ -334,24 +204,6 @@ class _TaskArtifacts:
             raise LookupError("task_not_found")
         self._require_active_lease(task)
         return task
-
-    async def _existing_summary_message(self, db, task: AnalysisTask) -> Message | None:
-        messages = list(
-            (
-                await db.scalars(
-                    select(Message)
-                    .where(
-                        Message.session_id == task.session_id,
-                        Message.user_id == task.user_id,
-                        Message.role == "assistant",
-                    )
-                    .order_by(Message.sequence.desc())
-                )
-            ).all()
-        )
-        return next(
-            (message for message in messages if message.metadata_json.get("task_id") == task.id), None
-        )
 
     def _require_active_lease(self, task: AnalysisTask) -> None:
         if (

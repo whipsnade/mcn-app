@@ -204,6 +204,8 @@ class AgentDecision(BaseModel):
     arguments: dict[str, Any] = Field(default_factory=dict)
     evidence_goal: str = Field(default="", max_length=300)
     rationale: str = Field(default="", max_length=500)
+    # finish 时面向用户的圈选结论，直接写入 assistant 消息；为空时服务端回退固定文案。
+    conclusion: str = Field(default="", max_length=2000)
 
 
 class TrajectoryStep(BaseModel):

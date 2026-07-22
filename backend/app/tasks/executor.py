@@ -72,9 +72,7 @@ class McpBatchGateway(Protocol):
 
 
 class TaskArtifacts(Protocol):
-    async def build_analysis_report(self, task_id: str) -> Any: ...
-
-    async def stream_analysis_summary(self, task_id: str) -> Any: ...
+    async def write_conclusion_message(self, task_id: str, conclusion: str) -> Any: ...
 
 
 class SelectionIngest(Protocol):
@@ -209,7 +207,7 @@ class TaskExecutor:
             await self.repository.release_lease(task.id, self.worker_id)
 
     async def _run_agent_loop(self, task: Any) -> None:
-        """迭代式工具调用循环：每轮由模型决定下一步，产出版本化自由报告。
+        """迭代式工具调用循环：每轮由模型决定下一步，finish 结论写成 assistant 消息。
 
         循环没有调用次数上限：退出条件只有模型 finish、取消、积分余额不足
         或异常。
@@ -230,6 +228,7 @@ class TaskExecutor:
         invalid_streak = 0
         throttle_streak = 0
         balance_exhausted = False
+        finish_conclusion = ""
         while True:
             if await self.repository.cancel_requested(task.id):
                 await self.repository.mark_cancelled(task.id, self.worker_id)
@@ -251,6 +250,7 @@ class TaskExecutor:
                 )
                 decision = await decide(round_context)
                 if decision.action == "finish":
+                    finish_conclusion = decision.conclusion
                     break
                 # 工具/渠道校验、参数归一化（平台别名、默认三个月时间窗回填、
                 # 时间窗钳制、keyword 必填 name）与 Schema 校验一次完成；
@@ -426,36 +426,25 @@ class TaskExecutor:
         has_settled = any(note.status == "settled" for note in trajectory.results)
         has_failures = any(note.status == "failed" for note in trajectory.results)
         if balance_exhausted:
-            # 余额不足：已采集的 settled 证据仍产出报告与摘要，再进入
+            # 余额不足：已采集的 settled 证据仍写结论消息，再进入
             # insufficient_balance 终态；无任何证据则直接收尾。
             if has_settled and self.artifacts is not None:
-                build_report = getattr(self.artifacts, "build_analysis_report", None)
-                if build_report is not None:
-                    await build_report(task.id)
-                await self.checkpoint("after_bi")
-                stream = getattr(self.artifacts, "stream_analysis_summary", None)
-                if stream is not None:
-                    await stream(task.id)
+                await self.artifacts.write_conclusion_message(task.id, finish_conclusion)
             await self.repository.mark_insufficient_balance(task.id, self.worker_id)
             return
         if not has_settled:
-            await self.repository.mark_failed(task.id, self.worker_id, "mcp_call_failed")
+            # 门禁拆除后模型首轮即可 finish，此时可能从未发起过 MCP 调用，
+            # 错误码只描述事实：没有采集到任何证据。
+            await self.repository.mark_failed(task.id, self.worker_id, "no_evidence_collected")
             return
         if self.artifacts is not None:
-            build_report = getattr(self.artifacts, "build_analysis_report", None)
-            if build_report is not None:
-                await build_report(task.id)
-        await self.checkpoint("after_bi")
-        if self.artifacts is not None:
-            stream = getattr(self.artifacts, "stream_analysis_summary", None)
-            if stream is not None:
-                await stream(task.id)
+            await self.artifacts.write_conclusion_message(task.id, finish_conclusion)
         if has_failures:
             await self.repository.mark_completed_with_warnings(
                 task.id,
                 self.worker_id,
                 "mcp_partial_failure",
-                "部分社媒渠道查询失败，报告已基于可用数据生成。",
+                "部分社媒渠道查询失败，结论已基于可用数据生成。",
             )
         else:
             await self.repository.mark_completed(task.id, self.worker_id)
