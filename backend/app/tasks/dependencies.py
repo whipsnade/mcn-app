@@ -33,7 +33,7 @@ from app.selection.contract import build_export_field_contract
 from app.selection.service import KolSelectionService
 from app.tasks.executor import TaskExecutor, TaskRunner
 from app.tasks.followups import FollowupSuggestionService
-from app.tasks.models import AnalysisTask
+from app.tasks.models import AnalysisTask, TaskEvent
 from app.tasks.recovery import TaskRecovery
 from app.tasks.repository import TaskRepository
 from app.workspace.models import Message
@@ -157,6 +157,20 @@ class _TaskArtifacts:
             async with SessionFactory.begin() as db:
                 task = await db.get(AnalysisTask, task_id)
                 if task is None:
+                    return
+                # 幂等护栏（与 write_conclusion_message 的 existing-check 同模式）：
+                # 崩溃恢复重放收尾段时，事件与报告在同一事务已提交，任务事件流
+                # 里存在 report.updated 即说明已生成过，直接跳过。
+                already_reported = await db.scalar(
+                    select(TaskEvent.id).where(
+                        TaskEvent.task_id == task.id,
+                        TaskEvent.event_type == TaskEventType.REPORT_UPDATED,
+                    )
+                )
+                if already_reported is not None:
+                    logger.debug(
+                        "auto_kol_analysis skipped: already reported task_id=%s", task_id
+                    )
                     return
                 count = await KolSelectionService(db).count_selection(
                     session_id=task.session_id

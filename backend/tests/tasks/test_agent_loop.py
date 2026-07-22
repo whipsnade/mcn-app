@@ -971,6 +971,44 @@ async def test_auto_kol_analysis_without_model_is_noop() -> None:
 
 
 @pytest.mark.asyncio
+async def test_auto_kol_analysis_replay_is_idempotent() -> None:
+    worker_id = f"test-worker-{uuid4()}"
+    ids = await _create_leased_task(worker_id)
+    try:
+        await _seed_selection_rows(ids, 2)
+        artifacts = _TaskArtifacts(worker_id, model=_FakeAnalysisModel(_analysis_document()))
+
+        await artifacts.auto_kol_analysis(ids["task_id"])
+        # 崩溃恢复重放收尾段：已发过 report.updated 的任务不得重复生成报告与事件。
+        await artifacts.auto_kol_analysis(ids["task_id"])
+
+        async with SessionFactory() as db:
+            reports = list(
+                (
+                    await db.scalars(
+                        select(AnalysisReport).where(
+                            AnalysisReport.session_id == ids["session_id"]
+                        )
+                    )
+                ).all()
+            )
+            assert [report.version for report in reports] == [1]
+            events = list(
+                (
+                    await db.scalars(
+                        select(TaskEvent).where(
+                            TaskEvent.task_id == ids["task_id"],
+                            TaskEvent.event_type == "report.updated",
+                        )
+                    )
+                ).all()
+            )
+            assert len(events) == 1
+    finally:
+        await _cleanup_leased_task(ids)
+
+
+@pytest.mark.asyncio
 async def test_auto_kol_analysis_model_error_does_not_propagate() -> None:
     worker_id = f"test-worker-{uuid4()}"
     ids = await _create_leased_task(worker_id)
