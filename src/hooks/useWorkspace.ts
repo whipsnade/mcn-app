@@ -507,8 +507,12 @@ export function useWorkspace(userId?: string) {
             ? undefined
             : session.analysis.followupError,
       },
-      // 新任务开始后清空属于旧任务的分析报告，等待 report.updated 事件回填。
-      analysisReport: session.analysisReport?.task_id === activeTaskId ? session.analysisReport : undefined,
+      // 任务级报告仅保留属于当前任务的（其余清空等待 report.updated 回填）；
+      // 会话级报告（task_id 为 null，手动 KOL 分析）不随任务失效，始终保留。
+      analysisReport: session.analysisReport
+        && (session.analysisReport.task_id === null || session.analysisReport.task_id === activeTaskId)
+        ? session.analysisReport
+        : undefined,
     } : session));
     if (currentTaskRuntime.errorMessage && currentTaskRuntime.errorMessageId) {
       const errorMessageId = currentTaskRuntime.errorMessageId;
