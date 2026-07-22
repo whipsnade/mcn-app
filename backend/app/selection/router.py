@@ -3,6 +3,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.errors import ErrorCode
 from app.db.session import get_db
 from app.identity.dependencies import CurrentUser
 from app.model.contracts import ModelAdapter, ModelAdapterError
@@ -47,7 +48,8 @@ async def create_kol_analysis(
         ) from error
     except ModelAdapterError as error:
         raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY, detail="KOL_ANALYSIS_MODEL_ERROR"
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=ErrorCode.KOL_ANALYSIS_MODEL_ERROR,
         ) from error
     await db.commit()
     return analysis_report_read(report)

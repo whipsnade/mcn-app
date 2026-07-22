@@ -79,7 +79,7 @@ class TestBuildKolAnalysisSummary:
         )
 
         assert summary["total"] == 4
-        assert summary["platform_counts"] == {"xiaohongshu": 1, "douyin": 2, "weibo": 1}
+        assert summary["platform_counts"] == {"小红书": 1, "抖音": 2, "微博": 1}
         assert summary["rating_counts"] == {
             "重点推荐": 1, "推荐": 1, "可考虑": 1, "观察": 1,
         }
@@ -97,7 +97,7 @@ class TestBuildKolAnalysisSummary:
         first = summary["top10"][0]
         assert first == {
             "nickname": "达人",
-            "platform": "xiaohongshu",
+            "platform": "小红书",
             "followers": 6_000_000,
             "total_score": 90.0,
             "rating": "重点推荐",
@@ -145,6 +145,14 @@ class TestBuildKolAnalysisSummary:
         assert len(summary["top10"]) == 10
         assert summary["top10"][0]["total_score"] == 100.0
         assert summary["top10"][-1]["total_score"] == 91.0
+
+    def test_unknown_platform_code_kept_as_is(self) -> None:
+        rows = [_row("a", platform="kuaishou")]
+
+        summary = build_kol_analysis_summary(rows, brand="", category=None, target_audience="")
+
+        assert summary["platform_counts"] == {"kuaishou": 1}
+        assert summary["top10"][0]["platform"] == "kuaishou"
 
 
 _XHS_TOOL = "datatap.xiaohongshu.kol.search.v1"

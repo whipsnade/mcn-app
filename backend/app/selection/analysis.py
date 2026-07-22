@@ -18,7 +18,13 @@ from app.reporting.blocks import ReportDocument
 from app.reporting.models import AnalysisReport
 from app.selection.models import SessionKolSelection
 from app.selection.service import KolSelectionService
+from app.tasks.errors import _PLATFORM_LABELS
 from app.workspace.models import WorkspaceSession
+
+
+def _platform_label(platform: str) -> str:
+    """平台码 → 中文展示名（复用 tasks.errors 的映射）；未识别的码原样保留。"""
+    return _PLATFORM_LABELS.get(platform, platform)
 
 
 _RATING_KEYS = ("重点推荐", "推荐", "可考虑", "观察")
@@ -62,7 +68,8 @@ def build_kol_analysis_summary(
     city_counts: dict[str, int] = {}
     scores: list[float] = []
     for row in rows:
-        platform_counts[row.platform] = platform_counts.get(row.platform, 0) + 1
+        label = _platform_label(row.platform)
+        platform_counts[label] = platform_counts.get(label, 0) + 1
         score_json = row.score_json or {}
         rating = score_json.get("rating")
         if rating in rating_counts:
@@ -83,7 +90,7 @@ def build_kol_analysis_summary(
     top10 = [
         {
             "nickname": row.nickname,
-            "platform": row.platform,
+            "platform": _platform_label(row.platform),
             "followers": row.followers,
             "total_score": float((row.score_json or {}).get("total") or 0.0),
             "rating": (row.score_json or {}).get("rating") or "",
