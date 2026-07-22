@@ -193,7 +193,9 @@ class _TaskArtifacts:
                 task.id,
                 task.user_id,
                 TaskEventType.MESSAGE_COMPLETED,
-                {"message_id": message.id},
+                # 前端 reducer 靠 payload.text 直接渲染气泡（无 message.delta
+                # 前置时 draft 为空），结论全文必须随事件下发。
+                {"message_id": message.id, "text": text},
             )
 
     async def _locked_active_task(self, db, task_id: str) -> AnalysisTask:

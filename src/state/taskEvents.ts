@@ -197,7 +197,7 @@ function applyStatusAndPointEvent(state: TaskRuntimeState, event: TaskEvent): Ta
         const insufficient = isInsufficientBalance(event);
         const insufficientMessage = state.visibleAnalysisReportId
           ? '积分不足，已基于已采集数据生成报告。'
-          : '积分不足，任务未产生报告。';
+          : '积分不足，任务已停止。';
         return {
           ...state,
           status: insufficient ? 'insufficient_balance' : 'failed',

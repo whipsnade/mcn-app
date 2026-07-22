@@ -106,7 +106,7 @@ describe('task event reducer', () => {
 
     expect(state.status).toBe('insufficient_balance');
     expect(state.phaseLabel).toBe('积分不足');
-    expect(state.errorMessage).toBe('积分不足，任务未产生报告。');
+    expect(state.errorMessage).toBe('积分不足，任务已停止。');
     expect(state.errorMessageId).toBe('error-balance-1');
     expect(state.connection).toBe('closed');
     expect(isTerminalTaskStatus(state.status)).toBe(true);

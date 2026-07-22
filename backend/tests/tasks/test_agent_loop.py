@@ -717,7 +717,12 @@ async def test_write_conclusion_message_persists_assistant_message_idempotently(
                 )
             )
             assert event is not None
-            assert event.payload_json == {"message_id": message.id}
+            # 事件契约与前端 reducer（taskEvents.ts message.completed 读
+            # payload.text 渲染气泡）耦合：结论全文必须随事件下发。
+            assert event.payload_json == {
+                "message_id": message.id,
+                "text": "已圈选 12 位达人，覆盖小红书。",
+            }
     finally:
         await _cleanup_leased_task(ids)
 
@@ -756,5 +761,14 @@ async def test_write_conclusion_message_empty_conclusion_falls_back_to_selection
             assert message is not None
             assert "共圈选 3 位达人" in message.content
             assert message.metadata_json["kind"] == "conclusion"
+            # 回退文案同样必须随 message.completed 事件下发（payload.text）。
+            event = await db.scalar(
+                select(TaskEvent).where(
+                    TaskEvent.task_id == ids["task_id"],
+                    TaskEvent.event_type == "message.completed",
+                )
+            )
+            assert event is not None
+            assert event.payload_json["text"] == message.content
     finally:
         await _cleanup_leased_task(ids)

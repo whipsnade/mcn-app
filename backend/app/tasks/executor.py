@@ -74,6 +74,10 @@ class McpBatchGateway(Protocol):
 class TaskArtifacts(Protocol):
     async def write_conclusion_message(self, task_id: str, conclusion: str) -> Any: ...
 
+    async def prepare_followups(self, task_id: str) -> bool: ...
+
+    async def generate_followups(self, task_id: str) -> bool: ...
+
 
 class SelectionIngest(Protocol):
     async def ingest(

@@ -320,7 +320,7 @@ export default function UniversalReport({ report, taskStatus }: UniversalReportP
     return (
       <PanelState>
         {taskStatus === 'insufficient_balance'
-          ? '积分不足，任务未产生报告'
+          ? '积分不足，任务已停止'
           : taskStatus && !isTerminal(taskStatus) ? '正在生成分析报告…' : '等待生成分析报告'}
       </PanelState>
     );
