@@ -1,9 +1,13 @@
 import pytest
-from sqlalchemy import select
+from datetime import UTC, datetime
+from uuid import uuid4
+
+from sqlalchemy import func, select
 
 from app.reporting.analysis_reports import AnalysisReportService
 from app.reporting.blocks import HeadingBlock, MarkdownBlock, MetricGridBlock, MetricItem, ReportDocument
-from app.tasks.models import TaskEvent
+from app.tasks.models import AnalysisTask, TaskEvent
+from app.workspace.models import Message
 
 
 def _document() -> ReportDocument:
@@ -93,3 +97,56 @@ async def test_analysis_report_read_and_session_summary(auth_client_factory, db_
     assert summary is not None
     assert summary["id"] == report.id
     assert summary["version"] == 1
+
+
+@pytest.mark.asyncio
+async def test_build_versions_increment_per_session(auth_client_factory, db_session) -> None:
+    """迁移 0020 后 version 按会话编号：同一会话第二个任务的报告 version=2。"""
+    client = await auth_client_factory("13400000045")
+    session_id, task_id = await _create_agent_session(client, "version")
+
+    service = AnalysisReportService(db_session)
+    first = await service.build(task_id, document=_document())
+    assert first.version == 1
+
+    source = await db_session.get(AnalysisTask, task_id)
+    assert source is not None
+    now = datetime.now(UTC).replace(tzinfo=None)
+    next_sequence = (
+        await db_session.scalar(
+            select(func.max(Message.sequence)).where(Message.session_id == session_id)
+        )
+        or 0
+    ) + 1
+    message = Message(
+        id=str(uuid4()),
+        session_id=session_id,
+        user_id=source.user_id,
+        role="user",
+        content="继续分析",
+        sequence=next_sequence,
+        metadata_json={},
+        created_at=now,
+    )
+    second_task = AnalysisTask(
+        id=str(uuid4()),
+        user_id=source.user_id,
+        session_id=session_id,
+        trigger_message_id=message.id,
+        kind="agent",
+        status="queued",
+        max_calls=10,
+        estimated_points=0,
+        creation_order=2,
+        created_at=now,
+        updated_at=now,
+    )
+    db_session.add(message)
+    await db_session.flush()
+    db_session.add(second_task)
+    await db_session.flush()
+
+    second = await service.build(second_task.id, document=_document())
+    assert second.version == 2
+    assert second.session_id == session_id
+    assert second.task_id == second_task.id

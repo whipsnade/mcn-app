@@ -85,10 +85,12 @@ class AnalysisReportService:
         )
         if existing is not None:
             return existing
+        # version 按会话编号（迁移 0020 起 (session_id, version) 唯一），
+        # 同一会话多个任务的报告依次递增。
         version = (
             await self._db.scalar(
                 select(func.max(AnalysisReport.version)).where(
-                    AnalysisReport.task_id == task.id
+                    AnalysisReport.session_id == task.session_id
                 )
             )
             or 0

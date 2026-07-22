@@ -327,6 +327,37 @@ async def test_reporting_constraints_and_snapshot_contract() -> None:
     assert "ix_kol_snapshots_kol_collected" in {item["name"] for item in snapshot_indexes}
 
 
+async def test_0020_analysis_reports_session_scoped_schema() -> None:
+    """迁移 0020：analysis_reports 支持会话级报告。"""
+    async with engine.connect() as connection:
+        constraints = await connection.run_sync(
+            lambda sync: inspect(sync).get_unique_constraints("analysis_reports")
+        )
+        columns = await connection.run_sync(
+            lambda sync: inspect(sync).get_columns("analysis_reports")
+        )
+    names = {item["name"] for item in constraints}
+    assert "uq_analysis_reports_session_version" in names
+    assert "uq_analysis_reports_task_version" in names
+    task_id_column = {item["name"]: item for item in columns}["task_id"]
+    assert task_id_column["nullable"] is True
+
+
+async def test_0020_session_kol_selections_schema() -> None:
+    """迁移 0020：session_kol_selections 圈选名单表结构。"""
+    async with engine.connect() as connection:
+        table_names = await connection.run_sync(lambda sync: inspect(sync).get_table_names())
+        constraints = await connection.run_sync(
+            lambda sync: inspect(sync).get_unique_constraints("session_kol_selections")
+        )
+        indexes = await connection.run_sync(
+            lambda sync: inspect(sync).get_indexes("session_kol_selections")
+        )
+    assert "session_kol_selections" in table_names
+    assert "uq_kol_selection_session_platform_uid" in {item["name"] for item in constraints}
+    assert "ix_kol_selection_user" in {item["name"] for item in indexes}
+
+
 def _run_alembic(*args: str) -> None:
     backend_dir = Path(__file__).resolve().parents[1]
     alembic = Path(sys.executable).with_name("alembic")
