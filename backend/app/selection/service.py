@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
@@ -11,22 +12,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.selection.models import SessionKolSelection
 from app.selection.normalizers import (
+    _GENERIC_PLATFORM_ALIASES,
     _MERGEABLE_FIELDS,
     UnknownEvidenceToolError,
     normalize_tool_evidence,
 )
 from app.selection.schemas import DimensionInputs, NormalizedKolEvidence, ToolEvidence
 from app.selection.scoring import rating, score_candidate
-from app.tasks.errors import _PLATFORM_LABELS
 from app.workspace.models import WorkspaceSession
 
 
-# datasource 中文标签 → 平台码（_PLATFORM_LABELS 反转）；同时容忍参数里
-# 直接写平台码（如 ["douyin"]）的形态。
-_DATASOURCE_PLATFORM_CODES = {
-    **{label: code for code, label in _PLATFORM_LABELS.items()},
-    **{code: code for code in _PLATFORM_LABELS},
-}
+def _normalize_platform_code(value: Any) -> str | None:
+    """平台标签/平台码（任意大小写、含空白）→ 规范平台码；无法识别返回 None。"""
+    if not isinstance(value, str):
+        return None
+    return _GENERIC_PLATFORM_ALIASES.get(value.strip().casefold())
 
 
 def _payload_with_platform_hint(
@@ -34,28 +34,37 @@ def _payload_with_platform_hint(
 ) -> dict[str, Any]:
     """kol.detail/insight 工具的平台不在行内，从调用参数注入 payload 级提示。
 
-    - arguments.platform（如 kol.detail 的 "xiaohongshu"）直接注入；
-    - arguments.datasource（insight 工具，形如 ["小红书"]）取首个可映射标签，
-      经中文→平台码映射注入；无匹配则不注入。
+    - arguments.platform（如 kol.detail 的 "xiaohongshu"）：经别名/大小写
+      规范化后注入（"小红书"/"Xiaohongshu" → "xiaohongshu"），无法识别不注入；
+    - arguments.datasource（insight 工具，形如 ["小红书"] 或裸字符串 "小红书"）
+      取首个可映射标签，同样规范化后注入。
     payload 已有 platform 键时不覆盖。
     """
     if not isinstance(arguments, dict) or not arguments or "platform" in structured_content:
         return structured_content
-    platform = arguments.get("platform")
-    if isinstance(platform, str) and platform.strip():
-        return {**structured_content, "platform": platform.strip()}
-    datasource = arguments.get("datasource")
-    if isinstance(datasource, (list, tuple)):
-        for label in datasource:
-            code = _DATASOURCE_PLATFORM_CODES.get(str(label).strip())
-            if code:
-                return {**structured_content, "platform": code}
-    return structured_content
+    code = _normalize_platform_code(arguments.get("platform"))
+    if code is None:
+        datasource = arguments.get("datasource")
+        if isinstance(datasource, str):
+            labels: tuple[Any, ...] = (datasource,)
+        elif isinstance(datasource, (list, tuple)):
+            labels = tuple(datasource)
+        else:
+            labels = ()
+        code = next(
+            (mapped for label in labels if (mapped := _normalize_platform_code(label))),
+            None,
+        )
+    if code is None:
+        return structured_content
+    return {**structured_content, "platform": code}
 
 
 _NESTED_DICT_FIELDS = ("export_fields", "analytics_fields")
 # as_dict() 中与评分缺失判定相关的标量字段，复用 normalizers 的合并字段清单。
 _MISSING_FIELD_NAMES = _MERGEABLE_FIELDS
+# normalizers 对缺稳定身份的达人派生的占位 uid 格式（{platform}:{sha256hex24}）。
+_DERIVED_UID_PATTERN = re.compile(r"[a-z0-9_]+:[0-9a-f]{24}")
 
 
 def _utcnow() -> datetime:
@@ -231,6 +240,31 @@ class KolSelectionService:
                 SessionKolSelection.kol_uid == kol_uid,
             )
         )
+        if existing is None and _present(item.nickname):
+            # 二次归并：派生 uid（{platform}:{24位hex}）只是无 用户ID 证据的占位
+            # 身份，同一达人先后以派生/真实 uid 入场时不得重复建行。
+            # - 新证据是派生 uid：并入同 nickname 的已有行（任意 uid）；
+            # - 新证据是真实 uid：并入同 nickname 的派生占位行并把行重挂到
+            #   真实 uid（同 nickname 的真实 uid 行不并，避免误并不同达人）。
+            # nickname 为空不做二次归并。
+            sibling = await self._db.scalar(
+                select(SessionKolSelection)
+                .where(
+                    SessionKolSelection.session_id == session_id,
+                    SessionKolSelection.platform == platform,
+                    SessionKolSelection.nickname == str(item.nickname)[:200],
+                )
+                .order_by(SessionKolSelection.created_at)
+                .limit(1)
+            )
+            if sibling is not None:
+                new_uid_is_derived = _DERIVED_UID_PATTERN.fullmatch(kol_uid) is not None
+                if new_uid_is_derived:
+                    existing = sibling
+                elif _DERIVED_UID_PATTERN.fullmatch(sibling.kol_uid) is not None:
+                    # 真实 uid 行此时尚不存在（上方按 uid 查询未命中），重挂不撞唯一约束。
+                    sibling.kol_uid = kol_uid
+                    existing = sibling
         now = _utcnow()
         if existing is None:
             fields = item.as_dict()

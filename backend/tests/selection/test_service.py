@@ -547,3 +547,184 @@ async def test_ingest_query_analysis_then_kol_detail_merges_into_one_row(
     assert row.fields_json["analytics_fields"]["audience_age"] == {"18-24": 40, "25-34": 35}
     assert row.source_tool == _INSIGHT_QUERY_TOOL
     assert row.last_task_id == "task-1"
+
+
+@pytest.mark.asyncio
+async def test_ingest_merges_derived_uid_rows_by_nickname(db_session, user_factory) -> None:
+    """Fix 1 生产复现：query.analysis 无 用户ID（派生 uid）→ 带 用户ID → kol.detail。
+
+    同一达人不得出现派生 uid / 真实 uid 两行。
+    """
+    user_id, session_id = await _create_session(db_session, user_factory)
+    service = KolSelectionService(db_session)
+
+    # 第一次：未带 用户ID 维度 → 派生 uid 占位行。
+    first = await service.ingest_tool_evidence(
+        user_id=user_id,
+        session_id=session_id,
+        task_id="task-1",
+        tool_name=_INSIGHT_QUERY_TOOL,
+        structured_content={
+            "result": json.dumps(
+                [
+                    _insight_user_row(None, "uan"),
+                    _insight_user_row(None, "逃离地球世界"),
+                ],
+                ensure_ascii=False,
+            )
+        },
+        arguments={"datasource": ["小红书"]},
+    )
+    assert first == 2
+    assert all(
+        row.kol_uid.startswith("xiaohongshu:")
+        for row in await _rows(db_session, session_id)
+    )
+
+    # 第二次：带 用户ID → 同 nickname 归并，派生行被真实 uid 行取代。
+    second = await service.ingest_tool_evidence(
+        user_id=user_id,
+        session_id=session_id,
+        task_id="task-1",
+        tool_name=_INSIGHT_QUERY_TOOL,
+        structured_content={
+            "result": json.dumps(
+                [
+                    _insight_user_row("uid-uan", "uan"),
+                    _insight_user_row("uid-earth", "逃离地球世界"),
+                ],
+                ensure_ascii=False,
+            )
+        },
+        arguments={"datasource": ["小红书"]},
+    )
+    assert second == 2
+
+    # 第三次：kol.detail 按真实 uid 合并补字段。
+    third = await service.ingest_tool_evidence(
+        user_id=user_id,
+        session_id=session_id,
+        task_id="task-1",
+        tool_name=_DETAIL_TOOL,
+        structured_content=_detail_payload(**{"账号ID (kwUid)": "uid-uan"}),
+        arguments={"platform": "xiaohongshu"},
+    )
+    assert third == 1
+
+    rows = {row.kol_uid: row for row in await _rows(db_session, session_id)}
+    # 只有 2 行：两位达人各一，派生占位行已归并删除。
+    assert set(rows) == {"uid-uan", "uid-earth"}
+    row = rows["uid-uan"]
+    assert row.nickname == "uan"
+    assert row.followers == 100
+    assert row.fields_json["engagement_rate"] == pytest.approx(3.0)
+    export_fields = row.fields_json["export_fields"]
+    assert export_fields["total_interactions"] == 9
+    assert export_fields["average_interactions"] == 900
+    assert rows["uid-earth"].nickname == "逃离地球世界"
+
+
+@pytest.mark.asyncio
+async def test_ingest_derived_evidence_merges_into_existing_real_uid_row(
+    db_session, user_factory
+) -> None:
+    """Fix 1 反向顺序：真实 uid 行已存在时，派生 uid 证据按 nickname 并入，不新建行。"""
+    user_id, session_id = await _create_session(db_session, user_factory)
+    service = KolSelectionService(db_session)
+
+    await service.ingest_tool_evidence(
+        user_id=user_id,
+        session_id=session_id,
+        task_id="task-1",
+        tool_name=_INSIGHT_QUERY_TOOL,
+        structured_content={
+            "result": json.dumps([_insight_user_row("uid-uan", "uan")], ensure_ascii=False)
+        },
+        arguments={"datasource": ["小红书"]},
+    )
+    written = await service.ingest_tool_evidence(
+        user_id=user_id,
+        session_id=session_id,
+        task_id="task-2",
+        tool_name=_INSIGHT_QUERY_TOOL,
+        structured_content={
+            "result": json.dumps(
+                [_insight_user_row(None, "uan", 用户粉丝数=200)], ensure_ascii=False
+            )
+        },
+        arguments={"datasource": ["小红书"]},
+    )
+
+    assert written == 1
+    rows = await _rows(db_session, session_id)
+    assert len(rows) == 1
+    assert rows[0].kol_uid == "uid-uan"
+    assert rows[0].first_task_id == "task-1"
+    assert rows[0].last_task_id == "task-2"
+    assert rows[0].followers == 200
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("platform_arg", ["小红书", "Xiaohongshu", " xiaohongshu "])
+async def test_platform_hint_normalizes_label_to_code(
+    db_session, user_factory, platform_arg: str
+) -> None:
+    """Fix 2：arguments.platform 中文标签/大小写/空白统一规范化为平台码。"""
+    user_id, session_id = await _create_session(db_session, user_factory)
+    service = KolSelectionService(db_session)
+
+    written = await service.ingest_tool_evidence(
+        user_id=user_id,
+        session_id=session_id,
+        task_id="task-1",
+        tool_name=_DETAIL_TOOL,
+        structured_content=_detail_payload(),
+        arguments={"platform": platform_arg},
+    )
+
+    assert written == 1
+    (row,) = await _rows(db_session, session_id)
+    assert row.platform == "xiaohongshu"
+
+
+@pytest.mark.asyncio
+async def test_platform_hint_rejects_unrecognized_value(db_session, user_factory) -> None:
+    """Fix 2：无法识别的 arguments.platform 不注入，行因缺平台身份被跳过。"""
+    user_id, session_id = await _create_session(db_session, user_factory)
+    service = KolSelectionService(db_session)
+
+    written = await service.ingest_tool_evidence(
+        user_id=user_id,
+        session_id=session_id,
+        task_id="task-1",
+        tool_name=_DETAIL_TOOL,
+        structured_content=_detail_payload(),
+        arguments={"platform": "火星平台"},
+    )
+
+    assert written == 0
+    assert await _rows(db_session, session_id) == []
+
+
+@pytest.mark.asyncio
+async def test_datasource_bare_string_is_treated_as_single_label(
+    db_session, user_factory
+) -> None:
+    """Fix 3：datasource 为裸字符串时按单标签处理。"""
+    user_id, session_id = await _create_session(db_session, user_factory)
+    service = KolSelectionService(db_session)
+
+    written = await service.ingest_tool_evidence(
+        user_id=user_id,
+        session_id=session_id,
+        task_id="task-1",
+        tool_name=_INSIGHT_QUERY_TOOL,
+        structured_content={
+            "result": json.dumps([_insight_user_row("uid-1", "uan")], ensure_ascii=False)
+        },
+        arguments={"datasource": "小红书"},
+    )
+
+    assert written == 1
+    (row,) = await _rows(db_session, session_id)
+    assert row.platform == "xiaohongshu"
