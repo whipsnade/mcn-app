@@ -238,3 +238,24 @@ async def test_list_selection_orders_by_score_and_checks_ownership(
         await service.list_selection(user_id=other_user.id, session_id=session_id)
     with pytest.raises(LookupError, match="session_not_found"):
         await service.get_all_for_export(user_id=other_user.id, session_id=session_id)
+
+
+@pytest.mark.asyncio
+async def test_count_selections_batches_multiple_sessions(db_session, user_factory) -> None:
+    user_id, session_id = await _create_session(db_session, user_factory)
+    _other_user_id, empty_session_id = await _create_session(db_session, user_factory)
+    service = KolSelectionService(db_session)
+    await service.ingest_tool_evidence(
+        user_id=user_id,
+        session_id=session_id,
+        task_id="task-1",
+        tool_name=_XHS_TOOL,
+        structured_content=_xhs_payload(_xhs_row("xhs-001"), _xhs_row("xhs-002")),
+    )
+
+    counts = await service.count_selections(
+        session_ids=[session_id, empty_session_id, "missing-session"]
+    )
+
+    assert counts == {session_id: 2, empty_session_id: 0, "missing-session": 0}
+    assert await service.count_selections(session_ids=[]) == {}

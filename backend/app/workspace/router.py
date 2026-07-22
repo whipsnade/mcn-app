@@ -57,6 +57,7 @@ async def session_read(
     *,
     include_messages: bool,
     include_analysis: bool = False,
+    kol_selection_count: int | None = None,
 ) -> SessionRead:
     messages = (
         await service.list_messages(workspace.user_id, workspace.id) if include_messages else []
@@ -93,9 +94,10 @@ async def session_read(
         )
         if analysis_report is not None:
             latest_analysis_report = analysis_report_summary(analysis_report)
-    kol_selection_count = await KolSelectionService(service.db).count_selection(
-        session_id=workspace.id
-    )
+    if kol_selection_count is None:
+        kol_selection_count = await KolSelectionService(service.db).count_selection(
+            session_id=workspace.id
+        )
     return SessionRead(
         id=workspace.id,
         title=workspace.title,
@@ -160,7 +162,19 @@ async def list_sessions(
 ) -> list[SessionRead]:
     service = WorkspaceService(db)
     workspaces = await service.list_sessions(user.id)
-    return [await session_read(service, item, include_messages=False) for item in workspaces]
+    # 批量取数避免逐会话 COUNT 的 N+1。
+    counts = await KolSelectionService(db).count_selections(
+        session_ids=[item.id for item in workspaces]
+    )
+    return [
+        await session_read(
+            service,
+            item,
+            include_messages=False,
+            kol_selection_count=counts.get(item.id, 0),
+        )
+        for item in workspaces
+    ]
 
 
 @router.get("/{session_id}", response_model=SessionRead)

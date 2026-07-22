@@ -288,3 +288,22 @@ async def test_session_read_includes_kol_selection_count(auth_client_factory, db
     assert detail.status_code == 200
     assert detail.json()["kol_selection_count"] == 2
     assert listed.json()[0]["kol_selection_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_list_sessions_batches_kol_selection_counts(auth_client_factory, db_session) -> None:
+    client = await auth_client_factory("13600000083")
+    first = await client.post("/api/v1/sessions", json={})
+    second = await client.post("/api/v1/sessions", json={})
+    first_id, second_id = first.json()["id"], second.json()["id"]
+
+    first_session = await db_session.get(WorkspaceSession, first_id)
+    db_session.add(_selection_row(first_session.user_id, first_id, "a", 80.0))
+    db_session.add(_selection_row(first_session.user_id, first_id, "b", 60.0))
+    db_session.add(_selection_row(first_session.user_id, second_id, "c", 70.0))
+    await db_session.flush()
+
+    listed = await client.get("/api/v1/sessions")
+
+    counts = {item["id"]: item["kol_selection_count"] for item in listed.json()}
+    assert counts == {first_id: 2, second_id: 1}

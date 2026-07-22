@@ -1,9 +1,7 @@
-import io
 from typing import Annotated, Any
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.errors import ErrorCode
@@ -62,7 +60,7 @@ async def export_kol_selection(
     session_id: str,
     user: CurrentUser,
     db: Annotated[AsyncSession, Depends(get_db)],
-) -> StreamingResponse:
+) -> Response:
     """圈选名单 Excel 导出：模板渲染 4 sheet 工作簿。"""
     try:
         workbook = await export_session_selection(db, user.id, session_id)
@@ -77,8 +75,8 @@ async def export_kol_selection(
                 status_code=status.HTTP_409_CONFLICT, detail="NO_KOL_SELECTION"
             ) from error
         raise
-    return StreamingResponse(
-        io.BytesIO(workbook.content),
+    return Response(
+        content=workbook.content,
         media_type=workbook.content_type,
         headers={
             "Content-Disposition": (

@@ -143,6 +143,78 @@ def test_methodology_rating_table_uses_four_tiers() -> None:
     assert sheet.cell(21, 1).value is None  # 旧「不推荐」行不再写入
 
 
+def test_render_workbook_escapes_formula_injection_in_third_party_strings() -> None:
+    """KOL 昵称/标签等第三方可控文本以 =、+、-、@ 开头时必须转义，不得写成公式。"""
+    candidate = ExportCandidate(
+        rank=1,
+        platform="xiaohongshu",
+        nickname='=HYPERLINK("http://evil.example","click")',
+        followers=10_000,
+        city="杭州市",
+        total_score=80.0,
+        rating="重点推荐",
+        stars="★★★★★",
+        values={"content_tags": "+cmd", "engagement_rate": "@evil", "summary": "-1+1"},
+    )
+    content = render_workbook(
+        metadata={"brand": "注入测试", "category": "美食", "generated_at": "2026-07-22"},
+        candidates=[candidate],
+    )
+
+    workbook = load_workbook(BytesIO(content))
+    summary = workbook["KOL匹配度筛选"]
+    nickname_cell = summary.cell(5, 3)
+    assert nickname_cell.data_type != "f"
+    assert nickname_cell.value == "'=HYPERLINK(\"http://evil.example\",\"click\")"
+
+    detail = workbook["达人详细画像"]
+    detail_values = [cell.value for row in detail.iter_rows() for cell in row if cell.value]
+    assert any(str(value).startswith("'+cmd") for value in detail_values)
+    assert any(str(value).startswith("'@evil") for value in detail_values)
+    assert all(cell.data_type != "f" for row in detail.iter_rows() for cell in row)
+    fan_profile = workbook["粉丝画像详情"]
+    assert all(cell.data_type != "f" for row in fan_profile.iter_rows() for cell in row)
+
+
+def test_rating_block_and_chart_move_below_large_candidate_pool() -> None:
+    """超过模板预留行数时评级块下移，图表锚点与引用区间同步更新。"""
+    candidates = [_candidate(index) for index in range(1, 17)]
+    content = render_workbook(
+        metadata={"brand": "大名单", "category": "美食", "generated_at": "2026-07-22"},
+        candidates=candidates,
+    )
+
+    workbook = load_workbook(BytesIO(content))
+    summary = workbook["KOL匹配度筛选"]
+    rating_title_row = 5 + len(candidates) + 2  # 23，超过模板默认的 20
+    start_row = rating_title_row + 1
+    assert summary.cell(rating_title_row, 1).value == "评级分布汇总"
+    assert summary.cell(start_row, 1).value == "评级"
+    assert [summary.cell(start_row + 1 + i, 1).value for i in range(4)] == [
+        "重点推荐", "推荐", "可考虑", "观察",
+    ]
+    assert [summary.cell(start_row + i, 18).value for i in range(4)] == [
+        "重点推荐", "推荐", "可考虑", "观察",
+    ]
+    # 候选人评级均为「推荐」，辅助列计数总和覆盖全部候选人。
+    assert sum(summary.cell(start_row + i, 19).value for i in range(4)) == len(candidates)
+
+    charts = summary._charts
+    assert len(charts) == 1
+    assert charts[0].anchor._from.row == rating_title_row + 7 - 1
+    refs = [
+        (series.cat.numRef.f, series.val.numRef.f)
+        for series in charts[0].ser
+        if getattr(getattr(series, "cat", None), "numRef", None) is not None
+    ]
+    assert refs == [
+        (
+            f"'KOL匹配度筛选'!$R${start_row}:$R${start_row + 3}",
+            f"'KOL匹配度筛选'!$S${start_row}:$S${start_row + 3}",
+        )
+    ]
+
+
 def test_render_workbook_contains_all_candidates_and_template_sheets() -> None:
     content = render_workbook(
         metadata={
@@ -257,7 +329,7 @@ async def _create_session(
     user: User,
     *,
     brand: str = "海底捞",
-    category: str = "美食",
+    category: str | None = "美食",
     filters_snapshot: dict[str, Any] | None = None,
 ) -> WorkspaceSession:
     now = datetime.now(UTC).replace(tzinfo=None)
@@ -392,6 +464,22 @@ async def test_export_session_selection_falls_back_to_target_fan_locations(
 
     summary = load_workbook(BytesIO(workbook_out.content))["KOL匹配度筛选"]
     assert "浙江、湖州" in (summary.cell(2, 1).value or "")
+
+
+@pytest.mark.asyncio
+async def test_export_filename_sanitizes_brand_and_defaults_category(
+    db_session: AsyncSession, user_factory
+) -> None:
+    user = await user_factory()
+    session = await _create_session(db_session, user, brand='品/牌"A', category=None)
+    db_session.add(_selection_row(user.id, session.id, "a"))
+    await db_session.flush()
+
+    workbook_out = await export_session_selection(db_session, user.id, session.id)
+
+    assert "/" not in workbook_out.filename
+    assert '"' not in workbook_out.filename
+    assert re.fullmatch(r"品_牌_A_未分类_KOL匹配度分析_\d{8}_\d{4}\.xlsx", workbook_out.filename)
 
 
 @pytest_asyncio.fixture

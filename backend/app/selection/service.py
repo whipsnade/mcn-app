@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
@@ -139,6 +140,18 @@ class KolSelectionService:
             .where(SessionKolSelection.session_id == session_id)
         )
         return int(total or 0)
+
+    async def count_selections(self, *, session_ids: Sequence[str]) -> dict[str, int]:
+        """批量统计多个会话的圈选行数，未出现的会话补 0（列表页避免 N+1）。"""
+        if not session_ids:
+            return {}
+        result = await self._db.execute(
+            select(SessionKolSelection.session_id, func.count())
+            .where(SessionKolSelection.session_id.in_(session_ids))
+            .group_by(SessionKolSelection.session_id)
+        )
+        counts = {session_id: int(count) for session_id, count in result.all()}
+        return {session_id: counts.get(session_id, 0) for session_id in session_ids}
 
     async def get_all_for_export(
         self, *, user_id: str, session_id: str

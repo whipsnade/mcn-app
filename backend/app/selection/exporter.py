@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from copy import copy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -81,10 +82,15 @@ async def export_session_selection(
         "field_contract_version": EXPORT_FIELD_CONTRACT_VERSION,
     }
     filename = _safe_filename(
-        f"{session.brand}_{session.category}_KOL匹配度分析_{generated_at.strftime('%Y%m%d_%H%M')}.xlsx"
+        f"{session.brand}_{session.category or '未分类'}_KOL匹配度分析_"
+        f"{generated_at.strftime('%Y%m%d_%H%M')}.xlsx"
     )
     return ExportedWorkbook(
-        content=render_workbook(metadata=metadata, candidates=candidates),
+        # 模板渲染是 CPU 密集的同步 openpyxl 操作，放到线程避免阻塞事件循环；
+        # 不触 db，ORM 属性已在上面的 _selection_candidate 阶段全部取出。
+        content=await asyncio.to_thread(
+            render_workbook, metadata=metadata, candidates=candidates
+        ),
         filename=filename,
     )
 
@@ -299,6 +305,7 @@ def _render_detail_standard_blocks(sheet: Any, metadata: dict[str, Any], candida
     for row in sheet.iter_rows():
         for cell in row:
             cell.value = None
+    known_merges: set[str] = set()
 
     _set_widths(sheet, {"A": 24, "B": 36, "C": 22, "D": 22, "E": 22, "F": 22})
     for index, candidate in enumerate(candidates):
@@ -316,7 +323,7 @@ def _render_detail_standard_blocks(sheet: Any, metadata: dict[str, Any], candida
             f"{candidate.rating} {candidate.stars} (综合评分: {_display(candidate.total_score)}；"
             f"公开主页：{candidate.profile_url or '数据缺失'})"
         )
-        _merge_range_if_missing(sheet, start, 1, 6)
+        _merge_range_if_missing(sheet, known_merges, start, 1, 6)
         _write_detail_header(sheet, start, title)
         sections = [
             (1, "【达人概况】", (("城市", candidate.city), ("粉丝数", candidate.followers), ("总赞藏", candidate.values.get("total_likes")), ("赞藏/粉丝比", candidate.values.get("likes_followers_ratio")), ("内容标签", candidate.values.get("content_tags")), ("性别", candidate.values.get("gender")))),
@@ -327,7 +334,7 @@ def _render_detail_standard_blocks(sheet: Any, metadata: dict[str, Any], candida
         ]
         for section_offset, section, entries in sections:
             section_row = start + section_offset
-            _merge_range_if_missing(sheet, section_row, 1, 6)
+            _merge_range_if_missing(sheet, known_merges, section_row, 1, 6)
             section_cell = sheet.cell(section_row, 1)
             section_cell.value = section
             section_cell.font = Font(name="微软雅黑", bold=True, color="1F4E79", size=12)
@@ -335,10 +342,10 @@ def _render_detail_standard_blocks(sheet: Any, metadata: dict[str, Any], candida
                 row = start + entry_offset
                 rendered = _cell_value(_present(value))
                 if section == "【综合概述】":
-                    _merge_range_if_missing(sheet, row, 1, 6)
+                    _merge_range_if_missing(sheet, known_merges, row, 1, 6)
                     sheet.cell(row, 1).value = f"{label}：{rendered}"
                 else:
-                    _merge_range_if_missing(sheet, row, 2, 6)
+                    _merge_range_if_missing(sheet, known_merges, row, 2, 6)
                     sheet.cell(row, 1).value = label
                     sheet.cell(row, 2).value = rendered
                     sheet.cell(row, 2).alignment = Alignment(wrap_text=True, vertical="top")
@@ -359,41 +366,13 @@ def _render_fan_profile(sheet: Any, metadata: dict[str, Any], candidates: Sequen
     _set_widths(sheet, {"A": 7, "B": 12, "C": 18, "D": 12, "E": 11, "F": 11, "G": 11, "H": 11, "I": 11, "J": 14, "K": 14, "L": 14, "M": 12})
 
 
-def _render_methodology(sheet: Any, metadata: dict[str, Any], candidates: Sequence[ExportCandidate]) -> None:
-    _clear_sheet(sheet)
-    sheet.merge_cells("A1:D1")
-    sheet["A1"] = "评分方法论与数据来源"
-    sheet["A1"].font = Font(name="微软雅黑", bold=True, size=16, color="1F4E79")
-    rows = [
-        ("一、评分维度与计算方式", None, None, None),
-        ("维度", "满分", "计算方式", "说明"),
-        (f"{metadata.get('category') or '行业'}兴趣占比", 20, "按 MCP 返回的行业兴趣占比评分，上限20", "行业兴趣是本轮投放匹配的核心指标"),
-        ("目标地区粉丝占比", 15, "按用户指定地区占比评分，上限15", "地区由本轮会话筛选条件确定"),
-        ("目标年龄段占比", 15, "按用户指定年龄段占比评分，上限15", "年龄分桶按 MCP 实际返回口径聚合"),
-        ("互动率", 15, "按平台规范化互动率评分，上限15", "平台口径在采集结果中保留"),
-        ("活跃粉丝率", 10, "按活跃粉丝比例评分，上限10", "缺失时标记数据缺失"),
-        ("内容标签匹配", 10, "按行业和提问中的内容要求评估，上限10", "不得编造未返回标签"),
-        ("粉丝规模", 10, "按粉丝规模评分，上限10", "粉丝数为规范化数值"),
-        ("互动沉淀与粉丝比", 5, "按各平台可获得的赞、藏、评等指标计算，上限5", "抖音和小红书采用各自平台口径"),
-        ("二、数据来源说明", None, None, None),
-        ("本轮候选总数", len(candidates), None, None),
-        ("来源服务", "、".join(sorted({name for item in candidates for name in item.source_names})) or "数据来源未标注", None, None),
-        ("数据质量", "缺失字段显示数据缺失；评分理由会标注按规则处理的字段", None, None),
-        ("安全说明", "本工作簿不包含内部 ID、MCP 调用 ID、密钥、接口地址或原始响应", None, None),
-    ]
-    for row, values in enumerate(rows, start=3):
-        _write_styled_row(sheet, row, list(values), source_row=4 if row == 4 else 5)
-        for cell in sheet[row]:
-            cell.alignment = Alignment(wrap_text=True, vertical="top")
-    _set_widths(sheet, {"A": 24, "B": 18, "C": 48, "D": 48})
-
-
 def _render_methodology_preserving_template(
     sheet: Any, metadata: dict[str, Any], candidates: Sequence[ExportCandidate]
 ) -> None:
     """Populate the original methodology layout without destroying its merges."""
     _clear_sheet(sheet)
-    _merge_range_if_missing(sheet, 1, 1, 4)
+    known_merges = {str(merged) for merged in sheet.merged_cells.ranges}
+    _merge_range_if_missing(sheet, known_merges, 1, 1, 4)
     sheet["A1"] = "评分方法论与数据来源"
     sheet["A1"].font = Font(name="微软雅黑", bold=True, size=16, color="1F4E79")
     dimensions = [
@@ -406,13 +385,13 @@ def _render_methodology_preserving_template(
         ("粉丝规模", 10, "按粉丝规模评分，上限10", "粉丝数为规范化数值"),
         ("互动沉淀与粉丝比", 5, "按各平台可获得的赞、藏、评等指标计算，上限5", "抖音和小红书采用各自平台口径"),
     ]
-    _merge_range_if_missing(sheet, 3, 1, 4)
+    _merge_range_if_missing(sheet, known_merges, 3, 1, 4)
     sheet["A3"] = "一、评分维度与计算方式"
     _write_styled_row(sheet, 4, ["维度", "满分", "计算方式", "说明"], source_row=4)
     for row, values in enumerate(dimensions, start=5):
         _write_styled_row(sheet, row, values, source_row=row)
 
-    _merge_range_if_missing(sheet, 15, 1, 4)
+    _merge_range_if_missing(sheet, known_merges, 15, 1, 4)
     sheet["A15"] = "二、评级映射"
     _write_styled_row(sheet, 16, ["评级", "星级", "分数区间", "建议"], source_row=16)
     ratings = [
@@ -425,7 +404,7 @@ def _render_methodology_preserving_template(
         _write_styled_row(sheet, row, values, source_row=row)
         _apply_rating_fill(sheet.cell(row, 1), values[0])
 
-    _merge_range_if_missing(sheet, 24, 1, 4)
+    _merge_range_if_missing(sheet, known_merges, 24, 1, 4)
     sheet["A24"] = "三、数据来源说明"
     source_rows = [
         f"1. 本轮候选总数：{len(candidates)}。",
@@ -437,7 +416,7 @@ def _render_methodology_preserving_template(
         f"7. 报告生成日期：{str(metadata.get('generated_at') or '')[:10]}。",
     ]
     for row, text in enumerate(source_rows, start=25):
-        _merge_range_if_missing(sheet, row, 1, 4)
+        _merge_range_if_missing(sheet, known_merges, row, 1, 4)
         sheet.cell(row, 1).value = text
         sheet.cell(row, 1).alignment = Alignment(wrap_text=True, vertical="top")
     _set_widths(sheet, {"A": 24, "B": 18, "C": 48, "D": 48})
@@ -452,6 +431,8 @@ def _write_detail_header(sheet: Any, row: int, title: str) -> None:
 
 
 def _write_styled_row(sheet: Any, row: int, values: Sequence[Any], *, source_row: int) -> None:
+    # sheet.max_column 在 openpyxl 中是 O(全表单元格数)，热循环外取一次。
+    max_column = max(1, sheet.max_column)
     for index, value in enumerate(values, start=1):
         target = sheet.cell(row, index)
         # openpyxl represents every non-anchor cell of a merged range as a
@@ -459,7 +440,7 @@ def _write_styled_row(sheet: Any, row: int, values: Sequence[Any], *, source_row
         # leave those cells untouched rather than assigning to them.
         if isinstance(target, MergedCell):
             continue
-        source = sheet.cell(source_row, min(index, max(1, sheet.max_column)))
+        source = sheet.cell(source_row, min(index, max_column))
         if source.has_style:
             target._style = copy(source._style)
         target.value = _cell_value(value)
@@ -486,10 +467,14 @@ def _clear_sheet(sheet: Any) -> None:
                 cell.value = None
 
 
-def _merge_range_if_missing(sheet: Any, row: int, start_column: int, end_column: int) -> None:
+def _merge_range_if_missing(
+    sheet: Any, known: set[str], row: int, start_column: int, end_column: int
+) -> None:
+    """按本地集合判重后合并单元格，避免每次线性扫描 merged_cells.ranges。"""
     reference = f"{get_column_letter(start_column)}{row}:{get_column_letter(end_column)}{row}"
-    if not any(str(item) == reference for item in sheet.merged_cells.ranges):
+    if reference not in known:
         sheet.merge_cells(reference)
+        known.add(reference)
 
 
 def _ensure_summary_merge(sheet: Any, reference: str) -> None:
@@ -551,9 +536,19 @@ def _display(value: Any) -> str:
     return f"{value:,}" if isinstance(value, int) else str(value)
 
 
+_FORMULA_PREFIXES = ("=", "+", "-", "@")
+
+
 def _cell_value(value: Any) -> Any:
-    """将结构化 MCP 字段转换为 Excel 可写的标量，同时保留数字类型。"""
-    return _display(value) if isinstance(value, (list, tuple, set, dict)) else value
+    """将结构化 MCP 字段转换为 Excel 可写的标量，同时保留数字类型。
+
+    第三方可控文本（昵称、标签等）以 ``=``、``+``、``-``、``@`` 开头时
+    openpyxl/Excel 会按公式解析，前缀 ``'`` 转义防止公式注入。
+    """
+    rendered = _display(value) if isinstance(value, (list, tuple, set, dict)) else value
+    if isinstance(rendered, str) and rendered.startswith(_FORMULA_PREFIXES):
+        return f"'{rendered}"
+    return rendered
 
 
 def _present(value: Any) -> Any:
