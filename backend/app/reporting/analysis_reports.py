@@ -12,6 +12,7 @@ from typing import Any
 from uuid import uuid4
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.mcp_gateway.contracts import McpCallStatus
@@ -123,14 +124,68 @@ class AnalysisReportService:
         )
         return report
 
+    async def build_session_report(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        document: ReportDocument,
+    ) -> AnalysisReport:
+        """持久化一份会话级自由报告（task_id 为 NULL）；不幂等，每次调用生成新版本。
+
+        同步端点直接返回报告，不发 report.updated 事件。同会话并发点击可能
+        撞 (session_id, version) 唯一约束：SAVEPOINT 回滚后重算 version 重试
+        一次，再失败向上抛。
+        """
+        session = await self._db.scalar(
+            select(WorkspaceSession).where(
+                WorkspaceSession.id == session_id,
+                WorkspaceSession.user_id == user_id,
+                WorkspaceSession.deleted_at.is_(None),
+            )
+        )
+        if session is None:
+            raise LookupError("session_not_found")
+        for attempt in (1, 2):
+            version = (
+                await self._db.scalar(
+                    select(func.max(AnalysisReport.version)).where(
+                        AnalysisReport.session_id == session_id
+                    )
+                )
+                or 0
+            ) + 1
+            now = _now()
+            report = AnalysisReport(
+                id=str(uuid4()),
+                task_id=None,
+                session_id=session_id,
+                version=version,
+                title=document.title,
+                blocks_json=[block.model_dump(mode="json") for block in document.blocks],
+                conclusion_text=document.conclusion,
+                status="completed",
+                created_at=now,
+                updated_at=now,
+            )
+            try:
+                async with self._db.begin_nested():
+                    self._db.add(report)
+                    await self._db.flush()
+                return report
+            except IntegrityError:
+                if attempt == 2:
+                    raise
+        raise RuntimeError("unreachable")  # pragma: no cover
+
     async def get_owned_report(self, user_id: str, report_id: str) -> AnalysisReport:
+        # 按会话归属鉴权（session_id 全行 NOT NULL），任务级与会话级报告统一。
         report = await self._db.scalar(
             select(AnalysisReport)
-            .join(AnalysisTask, AnalysisTask.id == AnalysisReport.task_id)
-            .join(WorkspaceSession, WorkspaceSession.id == AnalysisTask.session_id)
+            .join(WorkspaceSession, WorkspaceSession.id == AnalysisReport.session_id)
             .where(
                 AnalysisReport.id == report_id,
-                AnalysisTask.user_id == user_id,
+                WorkspaceSession.user_id == user_id,
                 WorkspaceSession.deleted_at.is_(None),
             )
         )
@@ -139,10 +194,12 @@ class AnalysisReportService:
         return report
 
     async def latest_session_report(self, session_id: str) -> AnalysisReport | None:
+        # version 按会话递增（迁移 0020），比 created_at 排序更确定
+        # （MySQL DATETIME 秒级精度，同秒两次构建会并列）。
         return await self._db.scalar(
             select(AnalysisReport)
             .where(AnalysisReport.session_id == session_id, AnalysisReport.status == "completed")
-            .order_by(AnalysisReport.created_at.desc())
+            .order_by(AnalysisReport.version.desc())
             .limit(1)
         )
 

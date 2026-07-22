@@ -18,7 +18,7 @@ class TaskAnalysisSummary(BaseModel):
 
 class AnalysisReportRead(BaseModel):
     id: str
-    task_id: str
+    task_id: str | None = None
     version: int
     title: str
     blocks: list[dict[str, Any]]
@@ -29,7 +29,7 @@ class AnalysisReportRead(BaseModel):
 
 class AnalysisReportSummary(BaseModel):
     id: str
-    task_id: str
+    task_id: str | None = None
     version: int
     title: str
     status: str

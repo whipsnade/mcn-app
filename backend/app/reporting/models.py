@@ -152,12 +152,14 @@ class AnalysisReport(Base):
     __tablename__ = "analysis_reports"
     __table_args__ = (
         UniqueConstraint("task_id", "version", name="uq_analysis_reports_task_version"),
+        UniqueConstraint("session_id", "version", name="uq_analysis_reports_session_version"),
         Index("ix_analysis_reports_session_created", "session_id", "created_at"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
-    task_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("analysis_tasks.id", ondelete="CASCADE"), nullable=False
+    # 会话级报告（手动生成）task_id 为 NULL；任务级报告仍指向 analysis_tasks。
+    task_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("analysis_tasks.id", ondelete="CASCADE"), nullable=True
     )
     session_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False
