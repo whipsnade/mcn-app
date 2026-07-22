@@ -18,6 +18,7 @@ ModelPurpose = Literal[
     "brainstorm",
     "quick_evaluate",
     "quick_feature",
+    "kol_analysis",
 ]
 
 
@@ -88,6 +89,7 @@ class ModelRequestMetadata(BaseModel):
         "brainstorm",
         "quick_evaluate",
         "quick_feature",
+        "kol_analysis",
     ]
     provider: str
     model: str
