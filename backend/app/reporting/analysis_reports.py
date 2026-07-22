@@ -1,7 +1,8 @@
-"""自由分析报告（agent 任务产物）的构建与查询。
+"""会话级分析报告的构建与查询。
 
-与 BI 报告不同：没有候选版本概念，报告内容来自 report_writer 模型对
-已结算 MCP 证据的结构化撰写，落库前经 ReportDocument 再次校验。
+唯一写入方是 kol-analysis 手动分析（``build_session_report``，task_id 为 NULL，
+同步端点直返不发 SSE）；历史任务级报告（``build``）已无生产调用方，仅保留只读查询。
+报告内容来自模型对代码聚合统计的结构化撰写，落库前经 ReportDocument 校验。
 """
 
 from __future__ import annotations
@@ -15,8 +16,6 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.mcp_gateway.contracts import McpCallStatus
-from app.mcp_gateway.models import McpCall
 from app.orchestration.context import project_reporting_summary
 from app.reporting.blocks import ReportDocument
 from app.reporting.models import AnalysisReport
@@ -46,24 +45,6 @@ def sanitize_evidence(payload: Any) -> Any:
 class AnalysisReportService:
     def __init__(self, db: AsyncSession) -> None:
         self._db = db
-
-    async def writer_input(self, task_id: str) -> dict[str, Any]:
-        """report_writer 的输入：已结算调用的脱敏证据，按调用顺序排列。"""
-        task = await self._db.get(AnalysisTask, task_id)
-        if task is None:
-            raise LookupError("analysis_task_not_found")
-        rows = await self._settled_calls(task_id)
-        return {
-            "task_id": task_id,
-            "evidence": [
-                {
-                    "step": row.plan_step_id,
-                    "tool": row.internal_tool_name,
-                    "data": sanitize_evidence((row.evidence_json or {}).get("structured_content")),
-                }
-                for row in rows
-            ],
-        }
 
     async def build(
         self,
@@ -210,20 +191,6 @@ class AnalysisReportService:
             .where(AnalysisReport.session_id == session_id, AnalysisReport.status == "completed")
             .order_by(AnalysisReport.version.desc())
             .limit(1)
-        )
-
-    async def _settled_calls(self, task_id: str) -> list[McpCall]:
-        return list(
-            (
-                await self._db.scalars(
-                    select(McpCall)
-                    .where(
-                        McpCall.task_id == task_id,
-                        McpCall.status == McpCallStatus.SETTLED.value,
-                    )
-                    .order_by(McpCall.created_at.asc())
-                )
-            ).all()
         )
 
     @staticmethod

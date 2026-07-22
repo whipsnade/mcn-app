@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from typing import Any, Mapping
 
 from app.selection.schemas import CandidateScore, DimensionInputs, DimensionScore
 
@@ -95,3 +96,14 @@ def rating(total: float) -> tuple[str, str]:
     if total >= 48:
         return "可考虑", "★★★"
     return "观察", "★★"
+
+
+def score_reason(fields: Mapping[str, Any]) -> str:
+    """评分理由生成规则：Excel 导出与聚合分析共用同一口径。
+
+    normalizers 白名单不产出 score_reason 字段，理由由代码按缺失字段情况生成：
+    存在缺失字段时说明按评分规则处理，否则标注基于规范化 MCP 数据评分。
+    """
+    if fields.get("missing_fields"):
+        return "数据缺失字段按评分规则处理"
+    return "基于规范化 MCP 数据评分"

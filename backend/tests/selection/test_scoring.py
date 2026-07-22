@@ -1,6 +1,6 @@
 import pytest
 
-from app.selection.scoring import WEIGHT_PROFILES, score_candidate
+from app.selection.scoring import WEIGHT_PROFILES, score_candidate, score_reason
 from tests.selection.fakes import all_dimensions
 
 
@@ -48,3 +48,18 @@ def test_rating_boundaries_match_four_tier_spec() -> None:
     assert rating(48) == ("可考虑", "★★★")
     assert rating(47.9) == ("观察", "★★")
     assert rating(0) == ("观察", "★★")
+
+
+class TestScoreReason:
+    """导出 Excel 与聚合分析共用的评分理由生成规则（exporter/analysis 同一口径）。"""
+
+    def test_missing_fields_present(self) -> None:
+        assert score_reason({"missing_fields": ["engagement_rate"]}) == (
+            "数据缺失字段按评分规则处理"
+        )
+
+    def test_no_missing_fields(self) -> None:
+        assert score_reason({"missing_fields": []}) == "基于规范化 MCP 数据评分"
+
+    def test_missing_fields_key_absent(self) -> None:
+        assert score_reason({}) == "基于规范化 MCP 数据评分"

@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.selection.contract import EXPORT_FIELD_CONTRACT_VERSION
 from app.selection.models import SessionKolSelection
-from app.selection.scoring import rating
+from app.selection.scoring import rating, score_reason
 from app.selection.service import KolSelectionService
 from app.workspace.models import WorkspaceSession
 
@@ -109,6 +109,16 @@ def _export_locations(session: WorkspaceSession) -> list[str]:
     return []
 
 
+def _target_region_rate_label(metadata: dict[str, Any]) -> str:
+    """达人详细画像的地区占比展示标签：{地区}粉丝占比，缺省「目标地区粉丝占比」。"""
+    locations = metadata.get("locations") or []
+    if locations:
+        first = str(locations[0]).strip()
+        if first:
+            return f"{first}粉丝占比"
+    return "目标地区粉丝占比"
+
+
 def _selection_candidate(row: SessionKolSelection, rank: int) -> ExportCandidate:
     fields = row.fields_json or {}
     score = row.score_json or {}
@@ -146,11 +156,7 @@ def _selection_candidate(row: SessionKolSelection, rank: int) -> ExportCandidate
         stars=stars,
         dimension_scores=scores,
         values=values,
-        score_reason=(
-            "数据缺失字段按评分规则处理"
-            if fields.get("missing_fields")
-            else "基于规范化 MCP 数据评分"
-        ),
+        score_reason=score_reason(fields),
         source_names=("已授权数据服务",),
         collected_at=row.updated_at.isoformat() if row.updated_at else None,
     )
@@ -330,7 +336,7 @@ def _render_detail_standard_blocks(sheet: Any, metadata: dict[str, Any], candida
         sections = [
             (1, "【达人概况】", (("城市", candidate.city), ("粉丝数", candidate.followers), ("总赞藏", candidate.values.get("total_likes")), ("赞藏/粉丝比", candidate.values.get("likes_followers_ratio")), ("内容标签", candidate.values.get("content_tags")), ("性别", candidate.values.get("gender")))),
             (8, "【帖子表现】", (("平均阅读", candidate.values.get("average_reads")), ("平均互动", candidate.values.get("average_interactions")), ("互动率", candidate.values.get("engagement_rate")))),
-            (12, "【粉丝画像】", (("<18岁", candidate.values.get("age_under_18")), ("18-24岁", candidate.values.get("age_18_24")), ("25-34岁", candidate.values.get("age_25_34")), ("35-44岁", candidate.values.get("age_35_44")), (">44岁", candidate.values.get("age_over_44")), ("浙江粉丝占比", candidate.values.get("target_region_rate")), ("活跃粉丝率", candidate.values.get("active_follower_rate")), ("兴趣Top标签", candidate.values.get("content_tags")), ("省份", candidate.values.get("province")))),
+            (12, "【粉丝画像】", (("<18岁", candidate.values.get("age_under_18")), ("18-24岁", candidate.values.get("age_18_24")), ("25-34岁", candidate.values.get("age_25_34")), ("35-44岁", candidate.values.get("age_35_44")), (">44岁", candidate.values.get("age_over_44")), (_target_region_rate_label(metadata), candidate.values.get("target_region_rate")), ("活跃粉丝率", candidate.values.get("active_follower_rate")), ("兴趣Top标签", candidate.values.get("content_tags")), ("省份", candidate.values.get("province")))),
             (22, "【综合评估】", (("综合评分", candidate.total_score), ("星级", candidate.stars), ("评级", candidate.rating), ("评分明细", _score_detail(candidate.dimension_scores)), ("评估理由", candidate.score_reason))),
             (28, "【综合概述】", (("报告摘要", candidate.values.get("summary")),)),
         ]

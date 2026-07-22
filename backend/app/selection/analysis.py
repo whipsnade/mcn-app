@@ -17,6 +17,7 @@ from app.reporting.analysis_reports import AnalysisReportService
 from app.reporting.blocks import ReportDocument
 from app.reporting.models import AnalysisReport
 from app.selection.models import SessionKolSelection
+from app.selection.scoring import score_reason
 from app.selection.service import KolSelectionService
 from app.tasks.errors import _PLATFORM_LABELS
 from app.workspace.models import WorkspaceSession
@@ -29,6 +30,7 @@ def _platform_label(platform: str) -> str:
 
 _RATING_KEYS = ("重点推荐", "推荐", "可考虑", "观察")
 _FOLLOWERS_BUCKET_KEYS = ("<10万", "10-50万", "50-100万", "100-500万", ">500万")
+_ENGAGEMENT_RATE_BUCKET_KEYS = ("<3%", "3-5%", "5-10%", ">10%", "未知")
 # 评分理由字段：export_fields 规范键优先，兼容中文原始键。
 _SCORE_REASON_KEYS = ("score_reason", "评分理由")
 
@@ -45,14 +47,53 @@ def _followers_bucket(followers: int) -> str:
     return ">500万"
 
 
+def _engagement_rate_value(raw: Any) -> float | None:
+    """解析 fields_json.engagement_rate 为百分数数值；解析失败返回 None（归「未知」桶）。
+
+    normalizers 产出的是百分数浮点（5.2 即 5.2%）；防御性兼容字符串形态
+    （"5.2%"、"0.05" 小数），口径与 normalizers._percentage 一致。
+    """
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, int | float):
+        value = float(raw)
+        return value if 0 <= value <= 100 else None
+    text = str(raw).strip()
+    if not text:
+        return None
+    has_percent_sign = text.endswith("%")
+    try:
+        value = float(text[:-1] if has_percent_sign else text)
+    except ValueError:
+        return None
+    if value <= 1 and not has_percent_sign:
+        value *= 100
+    return value if 0 <= value <= 100 else None
+
+
+def _engagement_rate_bucket(raw: Any) -> str:
+    value = _engagement_rate_value(raw)
+    if value is None:
+        return "未知"
+    if value < 3:
+        return "<3%"
+    if value < 5:
+        return "3-5%"
+    if value <= 10:
+        return "5-10%"
+    return ">10%"
+
+
 def _score_reason(row: SessionKolSelection) -> str:
-    export_fields = (row.fields_json or {}).get("export_fields") or {}
+    fields_json = row.fields_json or {}
+    export_fields = fields_json.get("export_fields") or {}
     for key in _SCORE_REASON_KEYS:
         value = export_fields.get(key)
         if value:
             # 防御性截断：评分理由进模型上下文，异常长文本按 200 字符截断。
             return str(value)[:200]
-    return ""
+    # normalizers 白名单不产出 score_reason，按与 Excel 导出相同的规则生成。
+    return score_reason(fields_json)
 
 
 def build_kol_analysis_summary(
@@ -66,6 +107,7 @@ def build_kol_analysis_summary(
     platform_counts: dict[str, int] = {}
     rating_counts = {key: 0 for key in _RATING_KEYS}
     followers_buckets = {key: 0 for key in _FOLLOWERS_BUCKET_KEYS}
+    engagement_rate_buckets = {key: 0 for key in _ENGAGEMENT_RATE_BUCKET_KEYS}
     city_counts: dict[str, int] = {}
     scores: list[float] = []
     for row in rows:
@@ -77,6 +119,10 @@ def build_kol_analysis_summary(
             rating_counts[rating] += 1
         if row.followers is not None:
             followers_buckets[_followers_bucket(row.followers)] += 1
+        engagement_bucket = _engagement_rate_bucket(
+            (row.fields_json or {}).get("engagement_rate")
+        )
+        engagement_rate_buckets[engagement_bucket] += 1
         if row.city:
             city_counts[row.city] = city_counts.get(row.city, 0) + 1
         total = score_json.get("total")
@@ -104,6 +150,7 @@ def build_kol_analysis_summary(
         "platform_counts": platform_counts,
         "rating_counts": rating_counts,
         "followers_buckets": followers_buckets,
+        "engagement_rate_buckets": engagement_rate_buckets,
         "avg_score": round(sum(scores) / len(scores), 1) if scores else 0,
         "city_top10": city_top10,
         "top10": top10,

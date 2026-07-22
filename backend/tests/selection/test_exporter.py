@@ -143,6 +143,33 @@ def test_methodology_rating_table_uses_four_tiers() -> None:
     assert sheet.cell(21, 1).value is None  # 旧「不推荐」行不再写入
 
 
+def test_detail_region_rate_label_follows_metadata_locations() -> None:
+    """达人详细画像的「{地区}粉丝占比」标签随 metadata.locations 动态生成。"""
+    content = render_workbook(
+        metadata={
+            "brand": "地区标签测试",
+            "category": "美食",
+            "locations": ["上海", "杭州"],
+            "generated_at": "2026-07-22",
+        },
+        candidates=[_candidate(1)],
+    )
+
+    detail = load_workbook(BytesIO(content))["达人详细画像"]
+    assert detail.cell(19, 1).value == "上海粉丝占比"  # 多个地区取第一个
+
+
+def test_detail_region_rate_label_fallback_without_locations() -> None:
+    content = render_workbook(
+        metadata={"brand": "地区标签测试", "category": "美食", "locations": [],
+                  "generated_at": "2026-07-22"},
+        candidates=[_candidate(1)],
+    )
+
+    detail = load_workbook(BytesIO(content))["达人详细画像"]
+    assert detail.cell(19, 1).value == "目标地区粉丝占比"
+
+
 def test_render_workbook_escapes_formula_injection_in_third_party_strings() -> None:
     """KOL 昵称/标签等第三方可控文本以 =、+、-、@ 开头时必须转义，不得写成公式。"""
     candidate = ExportCandidate(

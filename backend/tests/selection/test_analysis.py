@@ -38,6 +38,8 @@ def _row(
     rating: str = "重点推荐",
     score_reason: str | None = None,
     extra_export_fields: dict[str, Any] | None = None,
+    engagement_rate: Any = None,
+    missing_fields: list[str] | None = None,
 ) -> SessionKolSelection:
     export_fields: dict[str, Any] = dict(extra_export_fields or {})
     if score_reason is not None:
@@ -53,7 +55,11 @@ def _row(
         followers=followers,
         city=city,
         profile_url=None,
-        fields_json={"export_fields": export_fields},
+        fields_json={
+            "export_fields": export_fields,
+            "engagement_rate": engagement_rate,
+            "missing_fields": list(missing_fields or []),
+        },
         score_json={"total": total, "rating": rating, "stars": "★★★★★", "dimensions": {}},
         source_tool="tool",
         first_task_id="t1",
@@ -105,7 +111,7 @@ class TestBuildKolAnalysisSummary:
             "rating": "重点推荐",
             "score_reason": "受众匹配",
         }
-        assert summary["top10"][1]["score_reason"] == ""
+        assert summary["top10"][1]["score_reason"] == "基于规范化 MCP 数据评分"
         assert summary["brand"] == "海底捞"
         assert summary["category"] == "美食"
         assert summary["target_audience"] == "25-35岁"
@@ -187,6 +193,56 @@ class TestBuildKolAnalysisSummary:
         summary = build_kol_analysis_summary(rows, brand="", category=None, target_audience="")
 
         assert summary["top10"][0]["score_reason"] == "长" * 200
+
+    def test_score_reason_generated_from_missing_fields_matches_export_rule(self) -> None:
+        """export_fields 无 score_reason 时按与 Excel 导出相同的规则生成。"""
+        rows = [
+            _row("a", missing_fields=["engagement_rate", "quoted_price_cny"]),
+            _row("b"),
+        ]
+
+        summary = build_kol_analysis_summary(rows, brand="", category=None, target_audience="")
+
+        assert summary["top10"][0]["score_reason"] == "数据缺失字段按评分规则处理"
+        assert summary["top10"][1]["score_reason"] == "基于规范化 MCP 数据评分"
+
+    def test_engagement_rate_buckets_parse_numeric_and_string(self) -> None:
+        rows = [
+            _row("a", engagement_rate=2.5),
+            _row("b", engagement_rate="3.0%"),
+            _row("c", engagement_rate=7.5),
+            _row("d", engagement_rate="12%"),
+            _row("e", engagement_rate=None),
+            _row("f", engagement_rate="无法解析"),
+        ]
+
+        summary = build_kol_analysis_summary(rows, brand="", category=None, target_audience="")
+
+        assert summary["engagement_rate_buckets"] == {
+            "<3%": 1, "3-5%": 1, "5-10%": 1, ">10%": 1, "未知": 2,
+        }
+
+    def test_engagement_rate_bucket_boundaries(self) -> None:
+        rows = [
+            _row("a", engagement_rate=3.0),
+            _row("b", engagement_rate=5.0),
+            _row("c", engagement_rate=10.0),
+        ]
+
+        summary = build_kol_analysis_summary(rows, brand="", category=None, target_audience="")
+
+        assert summary["engagement_rate_buckets"] == {
+            "<3%": 0, "3-5%": 1, "5-10%": 2, ">10%": 0, "未知": 0,
+        }
+
+    def test_engagement_rate_buckets_fixed_keys_when_empty(self) -> None:
+        rows = [_row("a", engagement_rate=None)]
+
+        summary = build_kol_analysis_summary(rows, brand="", category=None, target_audience="")
+
+        assert summary["engagement_rate_buckets"] == {
+            "<3%": 0, "3-5%": 0, "5-10%": 0, ">10%": 0, "未知": 1,
+        }
 
 
 _XHS_TOOL = "datatap.xiaohongshu.kol.search.v1"
