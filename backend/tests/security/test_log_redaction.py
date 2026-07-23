@@ -38,3 +38,23 @@ def test_redaction_removes_nested_auth_phone_and_supplier_tokens() -> None:
 def test_redaction_preserves_non_sensitive_shape() -> None:
     rendered = redact_for_log({"count": 2, "items": ["ok", {"name": "达人"}]})
     assert rendered == {"count": 2, "items": ["ok", {"name": "达人"}]}
+
+
+def test_redaction_masks_env_style_assignments_without_overmatching_business_text() -> None:
+    value = (
+        "api_key=short-model-value token=short-mcp-value "
+        "TENCENT_PLAN_API_KEY=env-model-value "
+        "DATATAP_MCP_TOKEN=env-mcp-value "
+        "品牌 token 化传播策略保持不变"
+    )
+
+    rendered = redact_for_log(value)
+
+    for secret in (
+        "short-model-value",
+        "short-mcp-value",
+        "env-model-value",
+        "env-mcp-value",
+    ):
+        assert secret not in rendered
+    assert "品牌 token 化传播策略保持不变" in rendered

@@ -29,7 +29,7 @@ _BEARER_PATTERN = re.compile(r"\bBearer\s+[^\s,;，；]+", re.IGNORECASE)
 _SECRET_TOKEN_PATTERN = re.compile(r"\bsk-[A-Za-z0-9][A-Za-z0-9._-]*", re.IGNORECASE)
 _JWT_PATTERN = re.compile(r"\b[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b")
 _SENSITIVE_ASSIGNMENT_PATTERN = re.compile(
-    r"\b(?:authorization|api[_\s-]?key|apikey|key|token|secret|credential|"
+    r"(?<![^\W_])(?:authorization|api[_\s-]?key|apikey|key|token|secret|credential|"
     r"password|passwd|endpoint|base[_\s-]?url|url)\b"
     r"\s*[:=]\s*(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;，；]+)",
     re.IGNORECASE,
