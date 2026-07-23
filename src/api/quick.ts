@@ -1,4 +1,4 @@
-import { authorizedFetch, request } from './client';
+import { request } from './client';
 import type {
   ApiQuickEvaluateResult,
   ApiQuickKolDetail,
@@ -43,19 +43,16 @@ export function getTopPosts(platform: ApiQuickPlatform): Promise<ApiQuickTopPost
   return request<ApiQuickTopPosts>(`/api/v1/quick/top-posts?${search.toString()}`);
 }
 
-export async function postEvaluate(file: File): Promise<ApiQuickEvaluateResult> {
-  // client.ts 的 request 会强制 JSON Content-Type，multipart 需自行组装（鉴权/401 刷新走 authorizedFetch）。
-  const form = new FormData();
-  form.append('file', file);
-  const response = await authorizedFetch('/api/v1/quick/evaluate', {
+export interface EvaluateInput {
+  activityName: string;
+  kolNames: string[];
+}
+
+export function postEvaluate(input: EvaluateInput): Promise<ApiQuickEvaluateResult> {
+  return request<ApiQuickEvaluateResult>('/api/v1/quick/evaluate', {
     method: 'POST',
-    body: form,
+    body: JSON.stringify({ activity_name: input.activityName, kol_names: input.kolNames }),
   });
-  if (!response.ok) {
-    const body = await response.json().catch(() => ({ detail: `HTTP_${response.status}` }));
-    throw new Error(body.detail ?? `HTTP_${response.status}`);
-  }
-  return response.json() as Promise<ApiQuickEvaluateResult>;
 }
 
 // 快捷功能错误统一兜底：积分不足提示充值，其余提示稍后重试。

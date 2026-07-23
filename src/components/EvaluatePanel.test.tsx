@@ -12,8 +12,17 @@ vi.mock('../api/quick', () => ({
 
 const mockPostEvaluate = vi.mocked(postEvaluate);
 
-function selectFile(file: File) {
-  fireEvent.change(screen.getByLabelText('选择数据表格'), { target: { files: [file] } });
+function fillActivityName(value: string) {
+  fireEvent.change(screen.getByLabelText('活动名称'), { target: { value } });
+}
+
+function kolNameInput() {
+  return screen.getByLabelText('达人名称');
+}
+
+function addKolName(name: string) {
+  fireEvent.change(kolNameInput(), { target: { value: name } });
+  fireEvent.keyDown(kolNameInput(), { key: 'Enter' });
 }
 
 describe('EvaluatePanel', () => {
@@ -22,53 +31,109 @@ describe('EvaluatePanel', () => {
     mockPostEvaluate.mockResolvedValue({ title: '火锅活动评估', analysis_markdown: '**热度很高**\n\n持续上升' });
   });
 
-  it('opens the upload modal on entry and rejects files over 5MB', () => {
+  it('keeps the submit button disabled until an activity name and at least one kol are entered', () => {
     render(<EvaluatePanel />);
 
-    expect(screen.getByText('上传数据表格')).toBeTruthy();
-    const bigFile = new File([new Uint8Array(6 * 1024 * 1024)], 'big.xlsx');
-    selectFile(bigFile as File);
+    const submit = screen.getByRole('button', { name: '开始评估' });
+    expect(submit).toBeDisabled();
 
-    expect(screen.getByText('文件不能超过 5MB')).toBeTruthy();
-    expect(screen.getByRole('button', { name: '开始评估' })).toBeDisabled();
+    fillActivityName('火锅节活动');
+    expect(submit).toBeDisabled();
+
+    addKolName('达人甲');
+    expect(submit).toBeEnabled();
   });
 
-  it('rejects unsupported file extensions', () => {
+  it('adds kol names as chips on enter, comma and blur, deduplicates and removes chips', () => {
     render(<EvaluatePanel />);
 
-    selectFile(new File(['plain'], 'notes.txt', { type: 'text/plain' }));
+    addKolName('达人甲');
+    // 逗号分隔添加
+    fireEvent.change(kolNameInput(), { target: { value: '达人乙,' } });
+    // 失焦添加
+    fireEvent.change(kolNameInput(), { target: { value: ' 达人丙 ' } });
+    fireEvent.blur(kolNameInput());
+    // 去重：重复输入不新增
+    addKolName('达人甲');
 
-    expect(screen.getByText('仅支持 xlsx 或 csv 文件')).toBeTruthy();
-    expect(screen.getByRole('button', { name: '开始评估' })).toBeDisabled();
+    expect(screen.getByText('达人甲')).toBeTruthy();
+    expect(screen.getByText('达人乙')).toBeTruthy();
+    expect(screen.getByText('达人丙')).toBeTruthy();
+    expect(screen.getAllByRole('button', { name: /^移除 / })).toHaveLength(3);
+
+    fireEvent.click(screen.getByRole('button', { name: '移除 达人乙' }));
+    expect(screen.queryByText('达人乙')).toBeNull();
   });
 
-  it('uploads the selected file and renders the markdown analysis', async () => {
+  it('shows a hint when more than 20 kol names are entered', () => {
     render(<EvaluatePanel />);
 
-    const file = new File(['nick,interact\n达人甲,1000'], 'campaign.csv', { type: 'text/csv' });
-    selectFile(file);
+    for (let index = 1; index <= 20; index += 1) {
+      addKolName(`达人${index}`);
+    }
+    addKolName('达人21');
+
+    expect(screen.getByText(/最多添加 20 位达人/)).toBeTruthy();
+    expect(screen.getAllByRole('button', { name: /^移除 / })).toHaveLength(20);
+  });
+
+  it('submits the JSON payload and renders the markdown analysis', async () => {
+    render(<EvaluatePanel />);
+
+    fillActivityName('火锅节活动');
+    addKolName('达人甲');
+    addKolName('达人乙');
     fireEvent.click(screen.getByRole('button', { name: '开始评估' }));
 
     expect(await screen.findByText('火锅活动评估')).toBeTruthy();
     expect(mockPostEvaluate).toHaveBeenCalledTimes(1);
-    expect(mockPostEvaluate.mock.calls[0]?.[0]).toBe(file);
+    expect(mockPostEvaluate).toHaveBeenCalledWith({ activityName: '火锅节活动', kolNames: ['达人甲', '达人乙'] });
     // markdown 渲染复用报告样式（whitespace-pre-wrap 保留换行）
     expect(screen.getByText(/热度很高/)).toBeTruthy();
-    // 成功后上传对话框关闭
-    expect(screen.queryByText('上传数据表格')).toBeNull();
   });
 
-  it('keeps the modal open and shows the error when the upload fails', async () => {
-    mockPostEvaluate.mockRejectedValue(new Error('QUICK_CALL_FAILED'));
+  it('shows the quick error message when the evaluate request fails', async () => {
+    mockPostEvaluate.mockRejectedValue(new Error('INSUFFICIENT_POINTS'));
     render(<EvaluatePanel />);
 
-    selectFile(new File(['a,b\n1,2'], 'campaign.csv', { type: 'text/csv' }));
+    fillActivityName('火锅节活动');
+    addKolName('达人甲');
     fireEvent.click(screen.getByRole('button', { name: '开始评估' }));
 
-    await waitFor(() => {
-      expect(screen.getAllByText('评估失败，请稍后重试').length).toBeGreaterThan(0);
-    });
-    expect(screen.getByText('上传数据表格')).toBeTruthy();
+    expect(await screen.findByText('积分不足，请充值')).toBeTruthy();
   });
 
+  it('clears the result but keeps the inputs when re-evaluating', async () => {
+    render(<EvaluatePanel />);
+
+    fillActivityName('火锅节活动');
+    addKolName('达人甲');
+    fireEvent.click(screen.getByRole('button', { name: '开始评估' }));
+    expect(await screen.findByText('火锅活动评估')).toBeTruthy();
+
+    fireEvent.click(screen.getByRole('button', { name: '重新评估' }));
+
+    expect(screen.queryByText('火锅活动评估')).toBeNull();
+    expect((screen.getByLabelText('活动名称') as HTMLInputElement).value).toBe('火锅节活动');
+    expect(screen.getByText('达人甲')).toBeTruthy();
+    expect(screen.getByRole('button', { name: '开始评估' })).toBeEnabled();
+  });
+
+  it('shows the long-running hint while evaluating', async () => {
+    let resolveEvaluate: (value: { title: string; analysis_markdown: string }) => void = () => undefined;
+    mockPostEvaluate.mockImplementation(
+      () => new Promise(resolve => {
+        resolveEvaluate = resolve;
+      }),
+    );
+    render(<EvaluatePanel />);
+
+    fillActivityName('火锅节活动');
+    addKolName('达人甲');
+    fireEvent.click(screen.getByRole('button', { name: '开始评估' }));
+
+    expect(await screen.findByText(/评估中，可能需要几分钟/)).toBeTruthy();
+    resolveEvaluate({ title: '火锅活动评估', analysis_markdown: 'ok' });
+    await waitFor(() => expect(screen.queryByText(/评估中，可能需要几分钟/)).toBeNull());
+  });
 });

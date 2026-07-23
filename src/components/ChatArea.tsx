@@ -5,6 +5,14 @@ import type { FollowupSuggestion } from '../api/contracts';
 import TaskFlowNodes from './TaskFlowNodes';
 import type { TaskFlowNode } from '../state/taskEvents';
 
+/** 空白会话（无消息、无 followup 建议）展示的默认分析建议，点击填入输入框。 */
+const DEFAULT_SUGGESTIONS: { title: string; prompt: string }[] = [
+  { title: '品牌声量分析', prompt: '分析某品牌最近3个月在各平台的声量变化和用户情感趋势' },
+  { title: '多品牌对比', prompt: '对比多个品牌在社交媒体的传播策略和用户反响差异' },
+  { title: '行业趋势分析', prompt: '分析某行业在社交媒体的讨论热度、用户关注点和发展趋势' },
+  { title: '品牌提及博主圈选', prompt: '圈选近1个月内容中提及过某品牌的各平台博主，按互动量排序' },
+];
+
 interface ChatAreaProps {
   session: Session;
   onSendMessage: (text: string) => Promise<unknown>;
@@ -45,6 +53,13 @@ export default function ChatArea({
 }: ChatAreaProps) {
   const [inputText, setInputText] = useState('');
   const chatEndRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  // 建议点击统一行为：填入输入框并聚焦，不自动提交，由用户确认后发送。
+  const fillInput = (text: string) => {
+    setInputText(text);
+    textareaRef.current?.focus();
+  };
 
   // Auto scroll to bottom
   useEffect(() => {
@@ -214,7 +229,7 @@ export default function ChatArea({
                         type="button"
                         disabled={isAnalyzing}
                         onClick={() => {
-                          if (!isAnalyzing) void onSendMessage(option).catch(() => undefined);
+                          if (!isAnalyzing) fillInput(option);
                         }}
                         className={`rounded-lg border px-2.5 py-1.5 text-[10px] font-semibold transition active:scale-95 ${isAnalyzing
                           ? 'cursor-not-allowed border-slate-100 bg-slate-50 text-slate-300'
@@ -277,7 +292,34 @@ export default function ChatArea({
 
       {/* Input panel container */}
       <div className="shrink-0 p-4 bg-white border-t border-slate-100 space-y-2.5">
-        
+
+        {!followupStatus && session.messages.length === 0 && (
+          <section aria-label="开始分析建议" className="rounded-xl border border-indigo-100 bg-indigo-50/40 px-3 py-2.5">
+            <div className="flex items-center gap-1.5 text-[10px] font-bold text-indigo-600">
+              <Sparkles className="h-3 w-3" />
+              开始分析建议
+            </div>
+            <div className="mt-2 flex gap-1.5 overflow-x-auto pb-0.5 scrollbar-none">
+              {DEFAULT_SUGGESTIONS.map(suggestion => (
+                <button
+                  key={suggestion.title}
+                  type="button"
+                  disabled={isAnalyzing}
+                  onClick={() => {
+                    if (!isAnalyzing) fillInput(suggestion.prompt);
+                  }}
+                  className={`min-w-[150px] rounded-lg border px-2.5 py-2 text-left transition active:scale-95 ${isAnalyzing
+                    ? 'cursor-not-allowed border-slate-100 bg-slate-50 text-slate-300'
+                    : 'border-indigo-100 bg-white text-indigo-700 hover:border-indigo-300 hover:bg-indigo-50'
+                  }`}
+                >
+                  <span className="block text-[10px] font-semibold">{suggestion.title}</span>
+                </button>
+              ))}
+            </div>
+          </section>
+        )}
+
         {followupStatus && (
           <section aria-label="进一步分析建议" className="rounded-xl border border-indigo-100 bg-indigo-50/40 px-3 py-2.5">
             <div className="flex items-center gap-1.5 text-[10px] font-bold text-indigo-600">
@@ -314,7 +356,7 @@ export default function ChatArea({
                     title={suggestion.rationale}
                     disabled={isAnalyzing}
                     onClick={() => {
-                      if (!isAnalyzing) void onSendMessage(suggestion.prompt).catch(() => undefined);
+                      if (!isAnalyzing) fillInput(suggestion.prompt);
                     }}
                     className={`min-w-[150px] rounded-lg border px-2.5 py-2 text-left transition active:scale-95 ${isAnalyzing
                       ? 'cursor-not-allowed border-slate-100 bg-slate-50 text-slate-300'
@@ -337,6 +379,7 @@ export default function ChatArea({
         >
           
           <textarea
+            ref={textareaRef}
             rows={1}
             value={inputText}
             onChange={(e) => setInputText(e.target.value)}

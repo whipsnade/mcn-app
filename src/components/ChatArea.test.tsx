@@ -135,7 +135,7 @@ describe('ChatArea', () => {
     expect(onRetryMessage).toHaveBeenCalledWith('message-1');
   });
 
-  it('shows ready follow-up suggestions and starts the next round from a clicked prompt', async () => {
+  it('shows ready follow-up suggestions and fills the input with the clicked prompt without sending', async () => {
     const onSendMessage = vi.fn().mockResolvedValue(undefined);
     render(
       <ChatArea
@@ -153,7 +153,9 @@ describe('ChatArea', () => {
     await act(async () => {
       fireEvent.click(screen.getByRole('button', { name: /分析地域/ }));
     });
-    expect(onSendMessage).toHaveBeenCalledWith('请进一步分析粉丝地域分布');
+    expect(onSendMessage).not.toHaveBeenCalled();
+    expect((screen.getByPlaceholderText(/输入消息并向 AI 分析师提问/) as HTMLTextAreaElement).value)
+      .toBe('请进一步分析粉丝地域分布');
   });
 
   it('keeps a long message history inside the fixed workspace column', () => {
@@ -177,7 +179,7 @@ describe('ChatArea', () => {
     expect(screen.getByRole('form', { name: '发送消息' }).parentElement).toHaveClass('shrink-0');
   });
 
-  it('renders brainstorm option chips under the latest assistant message and sends the clicked option', async () => {
+  it('renders brainstorm option chips under the latest assistant message and fills the input with the clicked option', async () => {
     const onSendMessage = vi.fn().mockResolvedValue(undefined);
     const clarifyingSession: Session = {
       ...session,
@@ -207,7 +209,9 @@ describe('ChatArea', () => {
     await act(async () => {
       fireEvent.click(chip);
     });
-    expect(onSendMessage).toHaveBeenCalledWith('小红书');
+    expect(onSendMessage).not.toHaveBeenCalled();
+    expect((screen.getByPlaceholderText(/输入消息并向 AI 分析师提问/) as HTMLTextAreaElement).value)
+      .toBe('小红书');
   });
 
   it('hides brainstorm options of older assistant messages once a newer one arrives', () => {
@@ -304,5 +308,57 @@ describe('ChatArea', () => {
     expect(screen.getByText('进一步分析建议暂时生成失败，请稍后重试。')).toBeVisible();
     await act(async () => fireEvent.click(screen.getByRole('button', { name: '重试建议生成' })));
     expect(onRetryFollowups).toHaveBeenCalledOnce();
+  });
+
+  it('renders the four default suggestions for a blank session and fills the input on click', async () => {
+    const onSendMessage = vi.fn().mockResolvedValue(undefined);
+    render(
+      <ChatArea
+        session={{ ...session, messages: [] }}
+        onSendMessage={onSendMessage}
+        isAnalyzing={false}
+        isMockMode={false}
+      />,
+    );
+
+    expect(screen.getByText('品牌声量分析')).toBeVisible();
+    expect(screen.getByText('多品牌对比')).toBeVisible();
+    expect(screen.getByText('行业趋势分析')).toBeVisible();
+    expect(screen.getByText('品牌提及博主圈选')).toBeVisible();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /品牌声量分析/ }));
+    });
+    expect(onSendMessage).not.toHaveBeenCalled();
+    expect((screen.getByPlaceholderText(/输入消息并向 AI 分析师提问/) as HTMLTextAreaElement).value)
+      .toBe('分析某品牌最近3个月在各平台的声量变化和用户情感趋势');
+  });
+
+  it('hides the default suggestions once the session has messages', () => {
+    render(
+      <ChatArea
+        session={{ ...session, messages: [{ id: 'message-1', sender: 'user', text: '你好', timestamp: '10:00' }] }}
+        onSendMessage={vi.fn()}
+        isAnalyzing={false}
+        isMockMode={false}
+      />,
+    );
+
+    expect(screen.queryByText('品牌声量分析')).toBeNull();
+  });
+
+  it('hides the default suggestions while follow-up suggestions are active', () => {
+    render(
+      <ChatArea
+        session={{ ...session, messages: [] }}
+        onSendMessage={vi.fn()}
+        isAnalyzing={false}
+        isMockMode={false}
+        followupStatus="pending"
+      />,
+    );
+
+    expect(screen.queryByText('品牌声量分析')).toBeNull();
+    expect(screen.getByText('正在生成进一步分析建议…')).toBeVisible();
   });
 });

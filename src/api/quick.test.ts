@@ -62,24 +62,29 @@ describe('quick api client', () => {
     expect(url).toBe('/api/v1/quick/top-posts?platform=douyin');
   });
 
-  it('posts the evaluate file as multipart form data without a JSON content type', async () => {
+  it('posts the evaluate request as JSON with activity name and kol names', async () => {
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ title: '评估', analysis_markdown: '**ok**' }));
     vi.stubGlobal('fetch', fetchMock);
     setAccessToken('token');
 
-    const file = new File(['a,b\n1,2'], 'campaign.csv', { type: 'text/csv' });
-    const result = await postEvaluate(file);
+    const result = await postEvaluate({ activityName: '火锅节活动', kolNames: ['达人甲', '达人乙'] });
 
     expect(result.title).toBe('评估');
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe('/api/v1/quick/evaluate');
     expect(init.method).toBe('POST');
-    expect(init.body).toBeInstanceOf(FormData);
-    const form = init.body as FormData;
-    expect((form.get('file') as File | null)?.name).toBe('campaign.csv');
+    expect(init.body).toBe(JSON.stringify({ activity_name: '火锅节活动', kol_names: ['达人甲', '达人乙'] }));
     const headers = new Headers(init.headers);
     expect(headers.get('Authorization')).toBe('Bearer token');
-    expect(headers.get('Content-Type')).toBeNull();
+    expect(headers.get('Content-Type')).toBe('application/json');
+  });
+
+  it('throws the backend detail when the evaluate request fails', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ detail: 'INSUFFICIENT_POINTS' }, 409));
+    vi.stubGlobal('fetch', fetchMock);
+    setAccessToken('token');
+
+    await expect(postEvaluate({ activityName: '活动', kolNames: ['达人甲'] })).rejects.toThrow('INSUFFICIENT_POINTS');
   });
 
   it('throws the backend detail for insufficient points', async () => {
