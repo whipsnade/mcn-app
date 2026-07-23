@@ -54,7 +54,16 @@ def _decision_fragment(response: Any) -> dict[str, Any]:
     if not isinstance(response, dict):
         return {}
     fragment: dict[str, Any] = {}
-    for key in ("action", "internal_tool_name", "arguments", "result"):
+    for key in (
+        "action",
+        "internal_tool_name",
+        "arguments",
+        "result",
+        "goals",
+        "active_brand",
+        "brand_source",
+        "question",
+    ):
         if key in response:
             fragment[key] = response[key]
     return fragment

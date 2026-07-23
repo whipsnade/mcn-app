@@ -125,3 +125,39 @@ async def test_find_success_exemplars_without_tags_matches_purpose_only(
     exemplars = await find_success_exemplars(db_session, purpose="quick_feature")
 
     assert len(exemplars) == 1
+
+
+@pytest.mark.asyncio
+async def test_goal_planner_exemplar_keeps_goal_fields(db_session: AsyncSession) -> None:
+    db_session.add(
+        _log(
+            purpose="goal_planner",
+            tags=["goal_planner:shadow"],
+            response={
+                "action": "execute",
+                "active_brand": "喜茶",
+                "brand_source": "explicit",
+                "question": None,
+                "goals": [
+                    {
+                        "sequence": 1,
+                        "goal_type": "campaign_analysis",
+                        "params": {"brand": "喜茶", "campaign": "618"},
+                        "request_evidence": "分析喜茶 618 表现",
+                    }
+                ],
+            },
+        )
+    )
+    await db_session.flush()
+
+    [exemplar] = await find_success_exemplars(
+        db_session,
+        purpose="goal_planner",
+        tags=["goal_planner:shadow"],
+    )
+
+    excerpt = json.loads(exemplar["excerpt"])
+    assert excerpt["response"]["active_brand"] == "喜茶"
+    assert excerpt["response"]["brand_source"] == "explicit"
+    assert excerpt["response"]["goals"][0]["goal_type"] == "campaign_analysis"
