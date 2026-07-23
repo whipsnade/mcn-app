@@ -34,7 +34,7 @@ cd backend
 ## GoalPlanner 影子模式
 
 1. UAT 设置 `GOAL_PLANNER_SHADOW_ENABLED=true` 后重启后端。
-2. 影子规划在旧任务进入终态后运行，不调用 MCP、不扣积分、不改变旧 Agent Loop。
+2. 影子规划在旧任务进入终态后运行，不调用 MCP、不扣积分；当前尚未创建 TaskGoal 与 TaskArtifact，GoalPlanner 未接管执行，真实任务仍走旧 Agent Loop。
 3. 使用以下命令汇总最近 100 条 GoalPlanner 日志；JSON 中的 `current_message` 供人工复核：
 
    ```bash

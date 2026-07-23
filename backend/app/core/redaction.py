@@ -21,6 +21,19 @@ _SENSITIVE_KEY_PARTS = (
     "credential",
 )
 _PHONE_PATTERN = re.compile(r"(?<!\d)(?:1[3-9]\d{9})(?!\d)")
+_URI_PATTERN = re.compile(
+    r"(?:(?:https?|ftp|file|ws|wss):/{2,}|//)[^\s<>\"'，；。！？、)\]}]+",
+    re.IGNORECASE,
+)
+_BEARER_PATTERN = re.compile(r"\bBearer\s+[^\s,;，；]+", re.IGNORECASE)
+_SECRET_TOKEN_PATTERN = re.compile(r"\bsk-[A-Za-z0-9][A-Za-z0-9._-]*", re.IGNORECASE)
+_JWT_PATTERN = re.compile(r"\b[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b")
+_SENSITIVE_ASSIGNMENT_PATTERN = re.compile(
+    r"\b(?:authorization|api[_\s-]?key|apikey|key|token|secret|credential|"
+    r"password|passwd|endpoint|base[_\s-]?url|url)\b"
+    r"\s*[:=]\s*(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;，；]+)",
+    re.IGNORECASE,
+)
 
 
 def _normalise_key(key: object) -> str:
@@ -39,9 +52,9 @@ def _sensitive_key(key: object) -> bool:
 def redact_for_log(value: Any) -> Any:
     """Return a log-safe copy of nested data.
 
-    Keys containing credentials are replaced wholesale. Phone numbers are masked
-    even when embedded in ordinary text, which protects structured and free-form
-    log fields alike. Unknown scalar values are returned unchanged.
+    Keys containing credentials are replaced wholesale. Free-form credentials,
+    service URLs and phone numbers are masked even when embedded in ordinary
+    text. Unknown scalar values are returned unchanged.
     """
 
     if isinstance(value, Mapping):
@@ -54,7 +67,12 @@ def redact_for_log(value: Any) -> Any:
     if isinstance(value, tuple):
         return tuple(redact_for_log(item) for item in value)
     if isinstance(value, str):
-        return _PHONE_PATTERN.sub(_REDACTED, value)
+        redacted = _BEARER_PATTERN.sub(_REDACTED, value)
+        redacted = _SENSITIVE_ASSIGNMENT_PATTERN.sub(_REDACTED, redacted)
+        redacted = _URI_PATTERN.sub(_REDACTED, redacted)
+        redacted = _SECRET_TOKEN_PATTERN.sub(_REDACTED, redacted)
+        redacted = _JWT_PATTERN.sub(_REDACTED, redacted)
+        return _PHONE_PATTERN.sub(_REDACTED, redacted)
     return value
 
 
