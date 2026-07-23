@@ -31,6 +31,21 @@ cd backend
 - 创建会话后应依次出现 `plan.ready`、真实 MCP 调用和 `report.updated` 自由分析报告；调用失败的诊断仅保存字段名、字段类型、长度与 Schema 校验路径。
 - 所有任务按 agent 迭代循环执行（`kind` 固定 `"agent"`）：每轮一个 MCP 调用，`report.updated` 事件先于终态到达，右侧展示自由分析报告。循环由 `orchestration/bi_requirements.py` 的 8 项 BI 数据项驱动：模型 finish 前服务端做覆盖门禁，缺失数据项回喂补齐（连续被拒 3 次后放行；工具 settled 但返回空视为已满足）。循环不设调用次数上限，仅当钱包可用余额不足一次 10 积分调用时停止，任务进入 `insufficient_balance` 终态；余额不足前已采集证据时仍生成分析报告。其循环轨迹持久化在 `plan_json`（`agent_trajectory_v1`）；恢复时按轨迹原参数重放未完成的步骤，绝不重发 `unknown` 调用。连续两次非法决策（工具/参数越界）任务直接失败，错误码即校验失败码。
 
+## GoalPlanner 影子模式
+
+1. UAT 设置 `GOAL_PLANNER_SHADOW_ENABLED=true` 后重启后端。
+2. 影子规划在旧任务进入终态后运行，不调用 MCP、不扣积分、不改变旧 Agent Loop。
+3. 使用以下命令汇总最近 100 条 GoalPlanner 日志；JSON 中的 `current_message` 供人工复核：
+
+   ```bash
+   cd backend
+   .venv/bin/python scripts/evaluate_goal_planner_shadow.py --limit 100
+   ```
+
+4. 人工抽查 `brand_source`、campaign 的 `brand` / `campaign`、`kol_selection` 的 `request_evidence`。
+5. 非圈选消息出现 `kol_selection` 时不得进入下一阶段。
+6. 紧急关闭：设置 `GOAL_PLANNER_SHADOW_ENABLED=false` 并重启；无需数据库回滚。
+
 ## 回滚
 
 先关闭新任务并等待当前请求进入终态，再回滚应用版本。数据库迁移只按 Alembic 的可逆 downgrade 执行；不要手工删除账本、调用记录或会话历史。回滚后运行一次只读健康检查和 focused 回归，确认租约、积分和版本门控一致后再开放新任务。
