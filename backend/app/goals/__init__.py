@@ -1,3 +1,5 @@
+from app.goals.context import GoalPlannerContext, GoalPlannerContextBuilder
+from app.goals.planner import GoalPlannerService
 from app.goals.schemas import (
     BrandSource,
     GoalParams,
@@ -12,7 +14,10 @@ __all__ = [
     "BrandSource",
     "GoalParams",
     "GoalPlanSemanticError",
+    "GoalPlannerContext",
+    "GoalPlannerContextBuilder",
     "GoalPlannerOutput",
+    "GoalPlannerService",
     "GoalQuestion",
     "GoalSpec",
     "GoalType",
