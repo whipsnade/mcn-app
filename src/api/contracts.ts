@@ -225,11 +225,15 @@ export interface ApiAnalysisReportSummary {
 }
 
 export interface ApiFavorite {
-  kol_id: string;
+  id: string;
+  // 新路径（platform+kol_uid）收藏的行的 kol_id / platform_account_id 为 null。
+  kol_id: string | null;
   nickname?: string | null;
   platform: string;
-  platform_account_id: string;
+  platform_account_id: string | null;
+  kol_uid: string | null;
   profile_url: string | null;
+  snapshot: Record<string, unknown> | null;
   note: string | null;
   source_task_id: string | null;
   created_at: string;

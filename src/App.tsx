@@ -31,6 +31,8 @@ export default function App() {
   const [mobilePane, setMobilePane] = useState<WorkspacePane>('sessions');
   const [workspaceTab, setWorkspaceTab] = useState<WorkspaceTab>('chat');
   const [favorites, setFavorites] = useState<readonly ApiFavorite[]>([]);
+  const [favoritesLoading, setFavoritesLoading] = useState(false);
+  const [favoritesRefreshKey, setFavoritesRefreshKey] = useState(0);
   const [selectedKol, setSelectedKol] = useState<QuickKolSelection | null>(null);
 
   const refreshWallet = useCallback(async () => {
@@ -42,23 +44,28 @@ export default function App() {
     }
   }, []);
 
-  const syncFavorites = useCallback((items: readonly ApiFavorite[]) => {
-    setFavorites(items);
+  // 收藏是用户级数据：登出/会话切换不重置，仅未登录与拉取失败时按空列表处理（不阻塞面板）。
+  const refreshFavorites = useCallback(() => {
+    setFavoritesRefreshKey(key => key + 1);
   }, []);
 
   useEffect(() => {
     if (authStatus !== 'authenticated') {
       setFavorites([]);
+      setFavoritesLoading(false);
       return;
     }
     let active = true;
+    setFavoritesLoading(true);
     listFavorites().then(items => {
-      if (active) syncFavorites(items);
+      if (active) setFavorites(items);
     }).catch(() => {
-      if (active) syncFavorites([]);
+      if (active) setFavorites([]);
+    }).finally(() => {
+      if (active) setFavoritesLoading(false);
     });
     return () => { active = false; };
-  }, [authStatus, syncFavorites]);
+  }, [authStatus, favoritesRefreshKey]);
 
   useEffect(() => {
     if (authStatus !== 'authenticated') {
@@ -153,6 +160,8 @@ export default function App() {
               {workspaceTab === 'kol' && (
                 <KolRecommendPanel
                   onSelectKol={kol => setSelectedKol(kol)}
+                  favorites={favorites}
+                  onFavoriteToggled={refreshFavorites}
                 />
               )}
               {workspaceTab === 'posts-xhs' && (
@@ -188,8 +197,9 @@ export default function App() {
               )}
               {workspaceTab === 'favorites' && (
                 <FavoritesPanel
-                  refreshKey={0}
-                  onFavoritesChange={syncFavorites}
+                  favorites={favorites}
+                  loading={favoritesLoading}
+                  onRefresh={refreshFavorites}
                 />
               )}
             </>
@@ -221,6 +231,8 @@ export default function App() {
               taskStatus={(workspace.taskRuntime?.status ?? workspace.activeSession?.analysis?.status) as import('./api/contracts').ApiTaskStatus | undefined}
               sessionId={workspace.activeSession?.id}
               selectionCount={workspace.activeSession?.kolSelectionCount}
+              favorites={favorites}
+              onFavoriteToggled={refreshFavorites}
               onReportReady={(nextReport) => {
                 if (workspace.activeSession) {
                   workspace.setAnalysisReport(workspace.activeSession.id, nextReport);

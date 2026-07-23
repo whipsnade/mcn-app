@@ -1,7 +1,8 @@
 import { act, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { ApiQuickKolRecommendations } from '../api/contracts';
+import type { ApiFavorite, ApiQuickKolRecommendations } from '../api/contracts';
+import { createFavoriteByKey, deleteFavoriteByKey } from '../api/favorites';
 import { getKolRecommendations } from '../api/quick';
 import KolRecommendPanel from './KolRecommendPanel';
 
@@ -11,7 +12,31 @@ vi.mock('../api/quick', () => ({
     error instanceof Error && error.message === 'INSUFFICIENT_POINTS' ? '积分不足，请充值' : '查询失败，请稍后重试',
 }));
 
+vi.mock('../api/favorites', () => ({
+  createFavoriteByKey: vi.fn(),
+  deleteFavoriteByKey: vi.fn(),
+}));
+
 const mockGetKolRecommendations = vi.mocked(getKolRecommendations);
+const mockCreateFavoriteByKey = vi.mocked(createFavoriteByKey);
+const mockDeleteFavoriteByKey = vi.mocked(deleteFavoriteByKey);
+
+function favoriteFixture(overrides: Partial<ApiFavorite> = {}): ApiFavorite {
+  return {
+    id: 'fav-1',
+    kol_id: null,
+    platform: 'xiaohongshu',
+    platform_account_id: null,
+    kol_uid: 'uid-1',
+    nickname: '美食达人甲',
+    profile_url: null,
+    snapshot: null,
+    note: null,
+    source_task_id: null,
+    created_at: '2026-07-20T10:00:00Z',
+    ...overrides,
+  };
+}
 
 const RESULT: ApiQuickKolRecommendations = {
   items: [
@@ -52,6 +77,8 @@ describe('KolRecommendPanel', () => {
     vi.useFakeTimers();
     vi.clearAllMocks();
     mockGetKolRecommendations.mockResolvedValue(RESULT);
+    mockCreateFavoriteByKey.mockReset();
+    mockDeleteFavoriteByKey.mockReset();
   });
 
   afterEach(() => {
@@ -129,5 +156,68 @@ describe('KolRecommendPanel', () => {
     await advanceDebounce();
 
     expect(screen.getByText('积分不足，请充值')).toBeTruthy();
+  });
+
+  it('creates a favorite from a recommendation card with a defensive snapshot', async () => {
+    mockCreateFavoriteByKey.mockResolvedValue(favoriteFixture());
+    const onFavoriteToggled = vi.fn();
+    render(<KolRecommendPanel onSelectKol={vi.fn()} favorites={[]} onFavoriteToggled={onFavoriteToggled} />);
+    fireEvent.click(screen.getByRole('button', { name: /查询\/刷新/ }));
+    await advanceDebounce();
+
+    const stars = screen.getAllByRole('button', { name: '收藏' });
+    expect(stars).toHaveLength(2);
+    await act(async () => {
+      fireEvent.click(stars[0]);
+    });
+
+    expect(mockCreateFavoriteByKey).toHaveBeenCalledWith({
+      platform: 'xiaohongshu',
+      kolUid: 'uid-1',
+      nickname: '美食达人甲',
+      snapshot: { followers: 125_000, price: 30_000, engagement_rate: 5.2, city: '上海' },
+    });
+    expect(onFavoriteToggled).toHaveBeenCalledTimes(1);
+  });
+
+  it('omits null fields from the snapshot', async () => {
+    mockCreateFavoriteByKey.mockResolvedValue(favoriteFixture());
+    render(<KolRecommendPanel onSelectKol={vi.fn()} favorites={[]} onFavoriteToggled={vi.fn()} />);
+    fireEvent.click(screen.getByRole('button', { name: /查询\/刷新/ }));
+    await advanceDebounce();
+
+    await act(async () => {
+      fireEvent.click(screen.getAllByRole('button', { name: '收藏' })[1]);
+    });
+
+    expect(mockCreateFavoriteByKey).toHaveBeenCalledWith({
+      platform: 'douyin',
+      kolUid: 'uid-2',
+      nickname: '探店达人乙',
+      snapshot: { followers: 8_000 },
+    });
+  });
+
+  it('marks favorited items as active and removes them through deleteFavoriteByKey', async () => {
+    mockDeleteFavoriteByKey.mockResolvedValue();
+    const onFavoriteToggled = vi.fn();
+    render(
+      <KolRecommendPanel
+        onSelectKol={vi.fn()}
+        favorites={[favoriteFixture({ platform: 'douyin', kol_uid: 'uid-2', nickname: '探店达人乙' })]}
+        onFavoriteToggled={onFavoriteToggled}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /查询\/刷新/ }));
+    await advanceDebounce();
+
+    expect(screen.getAllByRole('button', { name: '收藏' })).toHaveLength(1);
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '取消收藏' }));
+    });
+
+    expect(mockDeleteFavoriteByKey).toHaveBeenCalledWith('douyin', 'uid-2');
+    expect(mockCreateFavoriteByKey).not.toHaveBeenCalled();
+    expect(onFavoriteToggled).toHaveBeenCalledTimes(1);
   });
 });

@@ -1,6 +1,8 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
+import type { ApiFavorite } from '../api/contracts';
+import { createFavoriteByKey, deleteFavoriteByKey } from '../api/favorites';
 import { downloadKolSelection, getKolSelection, runKolAnalysis } from '../api/kolSelection';
 import { analysisReportFixture } from '../test/fixtures';
 import UniversalReport from './UniversalReport';
@@ -10,6 +12,28 @@ vi.mock('../api/kolSelection', () => ({
   downloadKolSelection: vi.fn(),
   getKolSelection: vi.fn(),
 }));
+
+vi.mock('../api/favorites', () => ({
+  createFavoriteByKey: vi.fn(),
+  deleteFavoriteByKey: vi.fn(),
+}));
+
+function favoriteFixture(overrides: Partial<ApiFavorite> = {}): ApiFavorite {
+  return {
+    id: 'fav-1',
+    kol_id: null,
+    platform: 'xiaohongshu',
+    platform_account_id: null,
+    kol_uid: 'uid-1',
+    nickname: '达人小A',
+    profile_url: null,
+    snapshot: null,
+    note: null,
+    source_task_id: null,
+    created_at: '2026-07-20T10:00:00Z',
+    ...overrides,
+  };
+}
 
 function kolSelectionItem(overrides: Record<string, unknown> = {}) {
   return {
@@ -30,6 +54,8 @@ describe('UniversalReport', () => {
     vi.mocked(runKolAnalysis).mockReset();
     vi.mocked(downloadKolSelection).mockReset();
     vi.mocked(getKolSelection).mockReset();
+    vi.mocked(createFavoriteByKey).mockReset();
+    vi.mocked(deleteFavoriteByKey).mockReset();
   });
 
   it('renders every supported block type from the analysis report DTO', () => {
@@ -273,5 +299,82 @@ describe('UniversalReport', () => {
 
     fireEvent.click(screen.getByRole('tab', { name: 'KOL 分析' }));
     expect(screen.getByText(/已圈选 1 位达人/)).toBeVisible();
+  });
+
+  it('favorites a selection card with a defensive snapshot', async () => {
+    vi.mocked(getKolSelection).mockResolvedValue({ total: 1, items: [kolSelectionItem()] });
+    vi.mocked(createFavoriteByKey).mockResolvedValue(favoriteFixture());
+    const onFavoriteToggled = vi.fn();
+    render(
+      <UniversalReport sessionId="session-1" selectionCount={1} favorites={[]} onFavoriteToggled={onFavoriteToggled} />,
+    );
+
+    fireEvent.click(screen.getByRole('tab', { name: '圈选达人 (1)' }));
+    expect(await screen.findByText('达人小A')).toBeVisible();
+
+    fireEvent.click(screen.getByRole('button', { name: '收藏' }));
+
+    await waitFor(() => expect(createFavoriteByKey).toHaveBeenCalledWith({
+      platform: 'xiaohongshu',
+      kolUid: 'uid-1',
+      nickname: '达人小A',
+      snapshot: {
+        followers: 120000,
+        rating: '重点推荐',
+        stars: '★★★★★',
+        engagement_rate: 5.2,
+        quoted_price_cny: 12000,
+        city: '上海',
+        profile_url: 'https://www.xiaohongshu.com/user/profile/uid-1',
+      },
+    }));
+    expect(deleteFavoriteByKey).not.toHaveBeenCalled();
+    expect(onFavoriteToggled).toHaveBeenCalledTimes(1);
+  });
+
+  it('marks favorited selection cards as active and unfavorites them by key', async () => {
+    vi.mocked(getKolSelection).mockResolvedValue({ total: 1, items: [kolSelectionItem()] });
+    vi.mocked(deleteFavoriteByKey).mockResolvedValue();
+    const onFavoriteToggled = vi.fn();
+    render(
+      <UniversalReport
+        sessionId="session-1"
+        selectionCount={1}
+        favorites={[favoriteFixture()]}
+        onFavoriteToggled={onFavoriteToggled}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('tab', { name: '圈选达人 (1)' }));
+    expect(await screen.findByText('达人小A')).toBeVisible();
+
+    fireEvent.click(screen.getByRole('button', { name: '取消收藏' }));
+
+    await waitFor(() => expect(deleteFavoriteByKey).toHaveBeenCalledWith('xiaohongshu', 'uid-1'));
+    expect(createFavoriteByKey).not.toHaveBeenCalled();
+    expect(onFavoriteToggled).toHaveBeenCalledTimes(1);
+  });
+
+  it('omits missing fields from the favorite snapshot', async () => {
+    vi.mocked(getKolSelection).mockResolvedValue({
+      total: 1,
+      items: [kolSelectionItem({ followers: null, city: null, profile_url: null, fields: {}, score: {} })],
+    });
+    vi.mocked(createFavoriteByKey).mockResolvedValue(favoriteFixture());
+    render(
+      <UniversalReport sessionId="session-1" selectionCount={1} favorites={[]} onFavoriteToggled={vi.fn()} />,
+    );
+
+    fireEvent.click(screen.getByRole('tab', { name: '圈选达人 (1)' }));
+    expect(await screen.findByText('达人小A')).toBeVisible();
+
+    fireEvent.click(screen.getByRole('button', { name: '收藏' }));
+
+    await waitFor(() => expect(createFavoriteByKey).toHaveBeenCalledWith({
+      platform: 'xiaohongshu',
+      kolUid: 'uid-1',
+      nickname: '达人小A',
+      snapshot: {},
+    }));
   });
 });

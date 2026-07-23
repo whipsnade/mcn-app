@@ -9,8 +9,10 @@ import { Fragment, useEffect, useRef, useState } from 'react';
 import { downloadKolSelection, getKolSelection, runKolAnalysis } from '../api/kolSelection';
 import type { KolSelectionItem } from '../api/kolSelection';
 import type {
-  ApiAnalysisReport, ApiAnalysisReportChartSeries, ApiAnalysisReportMetricItem, ApiTaskStatus, ReportBlock,
+  ApiAnalysisReport, ApiAnalysisReportChartSeries, ApiAnalysisReportMetricItem, ApiFavorite, ApiTaskStatus, ReportBlock,
 } from '../api/contracts';
+import { createFavoriteByKey, deleteFavoriteByKey } from '../api/favorites';
+import FavoriteStar from './FavoriteStar';
 import { Card, formatExposure, formatNumber, MetricCard } from './reportPrimitives';
 
 interface UniversalReportProps {
@@ -19,6 +21,8 @@ interface UniversalReportProps {
   sessionId?: string;
   selectionCount?: number;
   onReportReady?: (report: ApiAnalysisReport) => void;
+  favorites?: readonly ApiFavorite[];
+  onFavoriteToggled?: () => void;
 }
 
 const chartColors = ['#4f46e5', '#818cf8', '#14b8a6', '#f59b00', '#0ea5e9', '#f43f4f'];
@@ -341,7 +345,14 @@ function selectionMetric(item: KolSelectionItem, key: string): number | null {
   return finiteNumber(item.fields?.[key]);
 }
 
-function KolSelectionCard({ item }: { item: KolSelectionItem }) {
+interface KolSelectionCardProps {
+  item: KolSelectionItem;
+  favoriteActive: boolean;
+  favoriteBusy: boolean;
+  onToggleFavorite: () => void;
+}
+
+function KolSelectionCard({ item, favoriteActive, favoriteBusy, onToggleFavorite }: KolSelectionCardProps) {
   const nickname = item.nickname || '未知达人';
   const stars = stringValue(item.score?.stars);
   const rating = stringValue(item.score?.rating);
@@ -379,6 +390,7 @@ function KolSelectionCard({ item }: { item: KolSelectionItem }) {
             )}
           </div>
         )}
+        <FavoriteStar active={favoriteActive} busy={favoriteBusy} onToggle={onToggleFavorite} />
       </div>
       {(engagementRate != null || quotedPrice != null) && (
         <div className="mt-2.5 flex flex-wrap gap-1.5">
@@ -394,7 +406,7 @@ function KolSelectionCard({ item }: { item: KolSelectionItem }) {
   );
 }
 
-export default function UniversalReport({ report, taskStatus, sessionId, selectionCount, onReportReady }: UniversalReportProps) {
+export default function UniversalReport({ report, taskStatus, sessionId, selectionCount, onReportReady, favorites = [], onFavoriteToggled }: UniversalReportProps) {
   const [analyzing, setAnalyzing] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [actionError, setActionError] = useState<string>();
@@ -403,6 +415,7 @@ export default function UniversalReport({ report, taskStatus, sessionId, selecti
   const [selectionLoading, setSelectionLoading] = useState(false);
   const [selectionError, setSelectionError] = useState(false);
   const [selectionRefresh, setSelectionRefresh] = useState(0);
+  const [favoriteBusyKey, setFavoriteBusyKey] = useState<string | null>(null);
 
   // 面板实例跨会话复用：切换会话时重置本地操作状态，避免把上一个会话的 loading/错误带过来。
   useEffect(() => {
@@ -479,6 +492,49 @@ export default function UniversalReport({ report, taskStatus, sessionId, selecti
     }
   };
 
+  const isKolFavorited = (item: KolSelectionItem) =>
+    favorites.some(favorite => favorite.platform === item.platform && favorite.kol_uid === item.kol_uid);
+
+  // 快照防御取数：缺字段直接省略该键。
+  const favoriteSnapshot = (item: KolSelectionItem): Record<string, unknown> => {
+    const snapshot: Record<string, unknown> = {};
+    if (item.followers != null) snapshot.followers = item.followers;
+    const rating = stringValue(item.score?.rating);
+    if (rating) snapshot.rating = rating;
+    const stars = stringValue(item.score?.stars);
+    if (stars) snapshot.stars = stars;
+    const engagementRate = selectionMetric(item, 'engagement_rate');
+    if (engagementRate != null) snapshot.engagement_rate = engagementRate;
+    const quotedPrice = selectionMetric(item, 'quoted_price_cny');
+    if (quotedPrice != null) snapshot.quoted_price_cny = quotedPrice;
+    if (item.city) snapshot.city = item.city;
+    if (item.profile_url) snapshot.profile_url = item.profile_url;
+    return snapshot;
+  };
+
+  const toggleKolFavorite = async (item: KolSelectionItem) => {
+    const key = `${item.platform}-${item.kol_uid}`;
+    if (favoriteBusyKey === key) return;
+    setFavoriteBusyKey(key);
+    try {
+      if (isKolFavorited(item)) {
+        await deleteFavoriteByKey(item.platform, item.kol_uid);
+      } else {
+        await createFavoriteByKey({
+          platform: item.platform,
+          kolUid: item.kol_uid,
+          nickname: item.nickname || undefined,
+          snapshot: favoriteSnapshot(item),
+        });
+      }
+      onFavoriteToggled?.();
+    } catch (reason) {
+      console.warn('favorite toggle failed', reason);
+    } finally {
+      setFavoriteBusyKey(current => (current === key ? null : current));
+    }
+  };
+
   const blocks = (report?.blocks ?? [])
     .filter(block => block && typeof block === 'object')
     .filter(blockHasContent);
@@ -551,7 +607,12 @@ export default function UniversalReport({ report, taskStatus, sessionId, selecti
           ) : (
             <div className="space-y-2.5">
               {selectionItems.map(item => (
-                <Fragment key={`${item.platform}-${item.kol_uid}`}>{KolSelectionCard({ item })}</Fragment>
+                <Fragment key={`${item.platform}-${item.kol_uid}`}>{KolSelectionCard({
+                  item,
+                  favoriteActive: isKolFavorited(item),
+                  favoriteBusy: favoriteBusyKey === `${item.platform}-${item.kol_uid}`,
+                  onToggleFavorite: () => void toggleKolFavorite(item),
+                })}</Fragment>
               ))}
             </div>
           )
