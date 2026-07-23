@@ -91,13 +91,17 @@ class DatabaseTaskStore:
     async def save_trajectory(self, *args: Any): return await self._write("save_trajectory", *args)
     async def cancel_requested(self, *args: Any): return await self._read("cancel_requested", *args)
     async def renew_lease(self, *args: Any): return await self._write("renew_lease", *args)
-    async def mark_completed(self, *args: Any): return await self._write("mark_completed", *args)
-    async def mark_completed_with_warnings(self, *args: Any):
+    async def mark_completed(self, *args: Any) -> bool:
+        return await self._write("mark_completed", *args)
+    async def mark_completed_with_warnings(self, *args: Any) -> bool:
         return await self._write("mark_completed_with_warnings", *args)
-    async def mark_cancelled(self, *args: Any): return await self._write("mark_cancelled", *args)
-    async def mark_interrupted(self, *args: Any): return await self._write("mark_interrupted", *args)
-    async def mark_failed(self, *args: Any): return await self._write("mark_failed", *args)
-    async def mark_insufficient_balance(self, *args: Any):
+    async def mark_cancelled(self, *args: Any) -> bool:
+        return await self._write("mark_cancelled", *args)
+    async def mark_interrupted(self, *args: Any) -> bool:
+        return await self._write("mark_interrupted", *args)
+    async def mark_failed(self, *args: Any) -> bool:
+        return await self._write("mark_failed", *args)
+    async def mark_insufficient_balance(self, *args: Any) -> bool:
         return await self._write("mark_insufficient_balance", *args)
     async def release_lease(self, *args: Any): return await self._write("release_lease", *args)
     async def recoverable_task_ids(self): return await self._read("recoverable_task_ids")

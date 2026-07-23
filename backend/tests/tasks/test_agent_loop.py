@@ -24,6 +24,7 @@ from app.selection.models import SessionKolSelection
 from app.tasks.dependencies import _TaskArtifacts
 from app.tasks.executor import TaskExecutor
 from app.tasks.models import AnalysisTask, TaskEvent
+from app.tasks.repository import TaskRepository
 from app.workspace.models import Message, WorkspaceSession
 
 
@@ -112,6 +113,14 @@ class _FakeStore:
         self.terminal: str | None = None
         self.save_plan_result = True
         self.save_trajectory_result = True
+        self.terminal_results = {
+            "completed": True,
+            "completed_with_warnings": True,
+            "cancelled": True,
+            "interrupted": True,
+            "failed": True,
+            "insufficient_balance": True,
+        }
 
     async def claim_lease(self, task_id, worker_id, lease_seconds):
         return self.task
@@ -137,22 +146,40 @@ class _FakeStore:
         return True
 
     async def mark_completed(self, task_id, worker_id):
+        if not self.terminal_results["completed"]:
+            return False
         self.terminal = "completed"
+        return True
 
     async def mark_completed_with_warnings(self, task_id, worker_id, code, message=None):
+        if not self.terminal_results["completed_with_warnings"]:
+            return False
         self.terminal = f"completed_with_warnings:{code}"
+        return True
 
     async def mark_cancelled(self, task_id, worker_id):
+        if not self.terminal_results["cancelled"]:
+            return False
         self.terminal = "cancelled"
+        return True
 
     async def mark_interrupted(self, task_id, worker_id):
+        if not self.terminal_results["interrupted"]:
+            return False
         self.terminal = "interrupted"
+        return True
 
     async def mark_failed(self, task_id, worker_id, code, message=None):
+        if not self.terminal_results["failed"]:
+            return False
         self.terminal = f"failed:{code}"
+        return True
 
     async def mark_insufficient_balance(self, task_id, worker_id):
+        if not self.terminal_results["insufficient_balance"]:
+            return False
         self.terminal = "insufficient_balance"
+        return True
 
     async def append_event(self, task_id, user_id, event_type, payload):
         self.events.append((str(event_type), payload))
@@ -317,6 +344,28 @@ async def test_shadow_goal_planner_skips_when_lease_write_fails(
     assert shadow.task_ids == []
     assert decider.calls == expected_decider_calls
     assert store.terminal is None
+
+
+@pytest.mark.asyncio
+async def test_shadow_goal_planner_skips_when_completed_terminal_persistence_fails() -> None:
+    task = _task()
+    store = _FakeStore(task)
+    store.terminal_results["completed"] = False
+    shadow = FakeGoalPlannerShadow(store=store)
+    decider = _ScriptedDecider([_call(), _finish("旧流程尝试完成")])
+    executor = _executor(
+        store,
+        decider,
+        _FakeGateway([(_settled(),)]),
+        _FakeArtifacts(),
+        goal_planner_shadow=shadow,
+    )
+
+    await executor.run(task.id)
+
+    assert len(store.trajectories[-1]["results"]) == 1
+    assert store.terminal is None
+    assert shadow.task_ids == []
 
 
 @pytest.mark.asyncio
@@ -883,6 +932,53 @@ async def _cleanup_leased_task(ids: dict[str, str]) -> None:
         await db.execute(delete(Message).where(Message.session_id == ids["session_id"]))
         await db.execute(delete(WorkspaceSession).where(WorkspaceSession.id == ids["session_id"]))
         await db.execute(delete(User).where(User.id == ids["user_id"]))
+
+
+@pytest.mark.parametrize("lease_is_valid", [True, False])
+@pytest.mark.parametrize(
+    ("method_name", "extra_args", "expected_status"),
+    [
+        ("mark_completed", (), "completed"),
+        (
+            "mark_completed_with_warnings",
+            ("mcp_partial_failure", "部分查询失败"),
+            "completed_with_warnings",
+        ),
+        ("mark_cancelled", (), "cancelled"),
+        ("mark_interrupted", (), "interrupted"),
+        ("mark_failed", ("upstream_error", None), "failed"),
+        ("mark_insufficient_balance", (), "insufficient_balance"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_task_repository_terminal_methods_report_persistence(
+    method_name: str,
+    extra_args: tuple[object, ...],
+    expected_status: str,
+    lease_is_valid: bool,
+) -> None:
+    worker_id = f"test-worker-{uuid4()}"
+    ids = await _create_leased_task(worker_id)
+    try:
+        if not lease_is_valid:
+            async with SessionFactory.begin() as db:
+                task = await db.get(AnalysisTask, ids["task_id"])
+                assert task is not None
+                task.lease_expires_at = datetime.now(UTC).replace(tzinfo=None) - timedelta(minutes=1)
+
+        async with SessionFactory.begin() as db:
+            repository = TaskRepository(db)
+            result = await getattr(repository, method_name)(
+                ids["task_id"],
+                worker_id,
+                *extra_args,
+            )
+            task = await db.get(AnalysisTask, ids["task_id"])
+            assert task is not None
+            assert result is lease_is_valid
+            assert task.status == (expected_status if lease_is_valid else "running")
+    finally:
+        await _cleanup_leased_task(ids)
 
 
 @pytest.mark.asyncio

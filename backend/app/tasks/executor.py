@@ -34,23 +34,23 @@ class TaskStore(Protocol):
 
     async def cancel_requested(self, task_id: str) -> bool: ...
 
-    async def mark_cancelled(self, task_id: str, worker_id: str) -> None: ...
+    async def mark_cancelled(self, task_id: str, worker_id: str) -> bool: ...
 
     async def renew_lease(self, task_id: str, worker_id: str, lease_seconds: int) -> bool: ...
 
-    async def mark_completed(self, task_id: str, worker_id: str) -> None: ...
+    async def mark_completed(self, task_id: str, worker_id: str) -> bool: ...
 
     async def mark_completed_with_warnings(
         self, task_id: str, worker_id: str, warning_code: str, warning_message: str | None = None
-    ) -> None: ...
+    ) -> bool: ...
 
-    async def mark_interrupted(self, task_id: str, worker_id: str) -> None: ...
+    async def mark_interrupted(self, task_id: str, worker_id: str) -> bool: ...
 
     async def mark_failed(
         self, task_id: str, worker_id: str, code: str, message: str | None = None
-    ) -> None: ...
+    ) -> bool: ...
 
-    async def mark_insufficient_balance(self, task_id: str, worker_id: str) -> None: ...
+    async def mark_insufficient_balance(self, task_id: str, worker_id: str) -> bool: ...
 
     async def append_event(
         self, task_id: str, user_id: str, event_type: str, payload: dict[str, Any]
@@ -257,8 +257,7 @@ class TaskExecutor:
         finish_conclusion = ""
         while True:
             if await self.repository.cancel_requested(task.id):
-                await self.repository.mark_cancelled(task.id, self.worker_id)
-                return True
+                return await self.repository.mark_cancelled(task.id, self.worker_id)
             # A persisted step without a result is replayed with its original
             # arguments (crash between prepare and finalize); only when no
             # pending step exists do we ask the model for the next move.
@@ -401,8 +400,7 @@ class TaskExecutor:
             if row_status in {"unknown", "planned", "reserved", "running", "succeeded"}:
                 # Possibly-sent calls are never replayed in this run; recovery
                 # reconciles them later.
-                await self.repository.mark_interrupted(task.id, self.worker_id)
-                return True
+                return await self.repository.mark_interrupted(task.id, self.worker_id)
             if row_status == "settled":
                 structured_content = (getattr(row, "evidence_json", None) or {}).get(
                     "structured_content"
@@ -460,29 +458,32 @@ class TaskExecutor:
             if has_settled and self.artifacts is not None:
                 await self.artifacts.write_conclusion_message(task.id, finish_conclusion)
                 await self.artifacts.auto_kol_analysis(task.id)
-            await self.repository.mark_insufficient_balance(task.id, self.worker_id)
-            return True
+            return await self.repository.mark_insufficient_balance(task.id, self.worker_id)
         if not has_settled:
             # 门禁拆除后模型首轮即可 finish，此时可能从未发起过 MCP 调用，
             # 错误码只描述事实：没有采集到任何证据。
-            await self.repository.mark_failed(task.id, self.worker_id, "no_evidence_collected")
-            return True
+            return await self.repository.mark_failed(
+                task.id,
+                self.worker_id,
+                "no_evidence_collected",
+            )
         if self.artifacts is not None:
             await self.artifacts.write_conclusion_message(task.id, finish_conclusion)
             # 结论消息之后、终态标记之前触发自动 KOL 分析：report.updated
             # 事件先于任务终态事件发出（SSE 流尚未关闭）。
             await self.artifacts.auto_kol_analysis(task.id)
         if has_failures:
-            await self.repository.mark_completed_with_warnings(
+            terminal_persisted = await self.repository.mark_completed_with_warnings(
                 task.id,
                 self.worker_id,
                 "mcp_partial_failure",
                 "部分社媒渠道查询失败，结论已基于可用数据生成。",
             )
         else:
-            await self.repository.mark_completed(task.id, self.worker_id)
-        await self._finish_followups(task.id)
-        return True
+            terminal_persisted = await self.repository.mark_completed(task.id, self.worker_id)
+        if terminal_persisted:
+            await self._finish_followups(task.id)
+        return terminal_persisted
 
     async def _finish_followups(self, task_id: str) -> None:
         # The task terminal event is durable before suggestion generation

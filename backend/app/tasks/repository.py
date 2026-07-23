@@ -142,15 +142,20 @@ class TaskRepository:
         await self.db.flush()
         return True
 
-    async def mark_completed(self, task_id: str, worker_id: str) -> None:
-        await self._mark_terminal(task_id, worker_id, TaskStatus.COMPLETED, TaskEventType.TASK_COMPLETED)
+    async def mark_completed(self, task_id: str, worker_id: str) -> bool:
+        return await self._mark_terminal(
+            task_id,
+            worker_id,
+            TaskStatus.COMPLETED,
+            TaskEventType.TASK_COMPLETED,
+        )
 
     async def mark_completed_with_warnings(
         self, task_id: str, worker_id: str, warning_code: str, warning_message: str | None = None
-    ) -> None:
+    ) -> bool:
         task = await self._locked(task_id)
         if not self._owns_active_lease(task, worker_id) or task.status in TERMINAL_TASK_STATUSES:
-            return
+            return False
         now = utc_now()
         task.status = TaskStatus.COMPLETED_WITH_WARNINGS
         task.retry_key = None
@@ -167,57 +172,69 @@ class TaskRepository:
             {"code": failure.code, "message": failure.message, "message_id": message.id},
         )
         await self.db.flush()
+        return True
 
-    async def mark_cancelled(self, task_id: str, worker_id: str) -> None:
-        await self._mark_terminal(task_id, worker_id, TaskStatus.CANCELLED, TaskEventType.TASK_CANCELLED)
+    async def mark_cancelled(self, task_id: str, worker_id: str) -> bool:
+        return await self._mark_terminal(
+            task_id,
+            worker_id,
+            TaskStatus.CANCELLED,
+            TaskEventType.TASK_CANCELLED,
+        )
 
-    async def mark_interrupted(self, task_id: str, worker_id: str) -> None:
+    async def mark_interrupted(self, task_id: str, worker_id: str) -> bool:
         task = await self._locked(task_id)
-        if self._owns_active_lease(task, worker_id) and task.status not in TERMINAL_TASK_STATUSES:
-            task.status = TaskStatus.INTERRUPTED
-            task.updated_at = utc_now()
-            await self.db.flush()
+        if not self._owns_active_lease(task, worker_id) or task.status in TERMINAL_TASK_STATUSES:
+            return False
+        task.status = TaskStatus.INTERRUPTED
+        task.updated_at = utc_now()
+        await self.db.flush()
+        return True
 
     async def mark_failed(
         self, task_id: str, worker_id: str, code: str, message: str | None = None
-    ) -> None:
+    ) -> bool:
         task = await self._locked(task_id)
-        if self._owns_active_lease(task, worker_id) and task.status not in TERMINAL_TASK_STATUSES:
-            failure = safe_error(code, message)
-            task.status = TaskStatus.FAILED
-            task.retry_key = None
-            task.error_code = failure.code
-            task.error_message = failure.message
-            task.completed_at = utc_now()
-            task.updated_at = task.completed_at
-            error_message = await self._append_error_message(task, failure)
-            await self.append_event(
-                task.id,
-                task.user_id,
-                TaskEventType.TASK_FAILED,
-                {"code": failure.code, "message": failure.message, "message_id": error_message.id},
-            )
-            await self.db.flush()
+        if not self._owns_active_lease(task, worker_id) or task.status in TERMINAL_TASK_STATUSES:
+            return False
+        failure = safe_error(code, message)
+        task.status = TaskStatus.FAILED
+        task.retry_key = None
+        task.error_code = failure.code
+        task.error_message = failure.message
+        task.completed_at = utc_now()
+        task.updated_at = task.completed_at
+        error_message = await self._append_error_message(task, failure)
+        await self.append_event(
+            task.id,
+            task.user_id,
+            TaskEventType.TASK_FAILED,
+            {"code": failure.code, "message": failure.message, "message_id": error_message.id},
+        )
+        await self.db.flush()
+        return True
 
-    async def mark_insufficient_balance(self, task_id: str, worker_id: str) -> None:
+    async def mark_insufficient_balance(self, task_id: str, worker_id: str) -> bool:
         """余额不足终态：与 mark_failed 同构，状态为 INSUFFICIENT_BALANCE。"""
         task = await self._locked(task_id)
-        if self._owns_active_lease(task, worker_id) and task.status not in TERMINAL_TASK_STATUSES:
-            failure = safe_error("insufficient_balance")
-            task.status = TaskStatus.INSUFFICIENT_BALANCE
-            task.retry_key = None
-            task.error_code = failure.code
-            task.error_message = failure.message
-            task.completed_at = utc_now()
-            task.updated_at = task.completed_at
-            error_message = await self._append_error_message(task, failure)
-            await self.append_event(
-                task.id,
-                task.user_id,
-                TaskEventType.TASK_FAILED,
-                {"code": failure.code, "message": failure.message, "message_id": error_message.id},
-            )
-            await self.db.flush()
+        if not self._owns_active_lease(task, worker_id) or task.status in TERMINAL_TASK_STATUSES:
+            return False
+        failure = safe_error("insufficient_balance")
+        task.status = TaskStatus.INSUFFICIENT_BALANCE
+        task.retry_key = None
+        task.error_code = failure.code
+        task.error_message = failure.message
+        task.completed_at = utc_now()
+        task.updated_at = task.completed_at
+        error_message = await self._append_error_message(task, failure)
+        await self.append_event(
+            task.id,
+            task.user_id,
+            TaskEventType.TASK_FAILED,
+            {"code": failure.code, "message": failure.message, "message_id": error_message.id},
+        )
+        await self.db.flush()
+        return True
 
     async def release_lease(self, task_id: str, worker_id: str) -> None:
         task = await self._locked(task_id)
@@ -398,10 +415,10 @@ class TaskRepository:
 
     async def _mark_terminal(
         self, task_id: str, worker_id: str, status: TaskStatus, event: TaskEventType
-    ) -> None:
+    ) -> bool:
         task = await self._locked(task_id)
         if not self._owns_active_lease(task, worker_id) or task.status in TERMINAL_TASK_STATUSES:
-            return
+            return False
         now = utc_now()
         task.status = status
         task.retry_key = None
@@ -409,6 +426,7 @@ class TaskRepository:
         task.updated_at = now
         await self.append_event(task.id, task.user_id, event, {"status": status})
         await self.db.flush()
+        return True
 
     @staticmethod
     def _owns_active_lease(task: AnalysisTask, worker_id: str) -> bool:
