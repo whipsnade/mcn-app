@@ -246,6 +246,55 @@ async def test_forced_round_still_calling_raises(db_session: AsyncSession) -> No
 
 
 @pytest.mark.asyncio
+async def test_campaign_evaluate_result_contract(db_session: AsyncSession) -> None:
+    model = _ScriptedModel(
+        [
+            # title 超 20 字：不合对象契约，回喂后重 finish。
+            {"action": "finish", "result": {"title": "t" * 21, "analysis_markdown": "内容"}},
+            {"action": "finish", "result": {"title": "火锅节评估", "analysis_markdown": "# 结论"}},
+        ]
+    )
+    call = _ScriptedCall()
+
+    kwargs = _run_kwargs(db_session, model, call)
+    kwargs["feature"] = "campaign_evaluate"
+    result = await run_quick_feature(**kwargs)
+
+    assert result.title == "火锅节评估"
+    assert result.analysis_markdown == "# 结论"
+    assert call.calls == []
+    second_user = json.loads(model.requests[1].messages[-1].content)
+    assert second_user["evidence"][0]["tool"] == "output_contract"
+
+
+@pytest.mark.asyncio
+async def test_campaign_evaluate_empty_markdown_violates_contract(
+    db_session: AsyncSession,
+) -> None:
+    model = _ScriptedModel(
+        [{"action": "finish", "result": {"title": "评估", "analysis_markdown": ""}}] * 2
+    )
+    call = _ScriptedCall()
+
+    kwargs = _run_kwargs(db_session, model, call)
+    kwargs["feature"] = "campaign_evaluate"
+    with pytest.raises(QuickCallFailedError, match="invalid_result"):
+        await run_quick_feature(**kwargs)
+
+
+@pytest.mark.asyncio
+async def test_system_prompt_override(db_session: AsyncSession) -> None:
+    model = _ScriptedModel([{"action": "finish", "result": POST_ROWS}])
+    call = _ScriptedCall()
+
+    kwargs = _run_kwargs(db_session, model, call)
+    kwargs["system_prompt"] = "自定义系统提示"
+    await run_quick_feature(**kwargs)
+
+    assert model.requests[0].messages[0].content == "自定义系统提示"
+
+
+@pytest.mark.asyncio
 async def test_kol_detail_result_contract(db_session: AsyncSession) -> None:
     model = _ScriptedModel(
         [{"action": "finish", "result": {"detail": {"昵称": "达人"}, "posts": POST_ROWS}}]
@@ -275,6 +324,19 @@ async def test_quick_feature_tool_names_subsets() -> None:
     assert set(quick_feature_tool_names("kol_detail", ("xiaohongshu",))) == {
         "datatap.social.grow.kol.detail.v1",
         "datatap.insight.query.raw.posts.v1",
+    }
+    assert set(
+        quick_feature_tool_names(
+            "campaign_evaluate", ("xiaohongshu", "douyin", "bilibili", "weibo", "wechat")
+        )
+    ) == {
+        "datatap.xiaohongshu.kol.search.v1",
+        "datatap.douyin.kol.search.v1",
+        "datatap.social.grow.kol.bilibili.search.v1",
+        "datatap.social.grow.kol.weibo.search.v1",
+        "datatap.social.grow.kol.wechat.search.v1",
+        "datatap.social.grow.kol.detail.v1",
+        "datatap.social.grow.kol.match.mentions.tag.v1",
     }
 
 

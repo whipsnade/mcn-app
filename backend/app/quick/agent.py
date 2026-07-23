@@ -78,6 +78,10 @@ _OUTPUT_CONTRACTS = {
         'result 必须是 {"detail": 达人详情对象, "posts": 帖子对象列表}；'
         '热帖获取失败时 posts 给空列表并附加 "posts_degraded": true'
     ),
+    "campaign_evaluate": (
+        'result 必须是 {"title": 评估标题（不超过 20 个字）, "analysis_markdown": 评估结论'
+        " Markdown（非空）}；结论只能基于本轮已获得的工具证据"
+    ),
 }
 
 _LIST_ADAPTER = TypeAdapter(list)
@@ -106,6 +110,13 @@ class KolDetailFeatureResult(BaseModel):
     posts_degraded: bool = False
 
 
+class CampaignEvaluateFeatureResult(BaseModel):
+    """活动评估的 finish 结果契约（对象型）。"""
+
+    title: str = Field(min_length=1, max_length=20)
+    analysis_markdown: str = Field(min_length=1)
+
+
 def quick_feature_tool_names(feature: str, platforms: tuple[str, ...]) -> tuple[str, ...]:
     """按 feature 给出的可用工具子集（内部名）。"""
     if feature == "top_posts":
@@ -120,6 +131,11 @@ def quick_feature_tool_names(feature: str, platforms: tuple[str, ...]) -> tuple[
         names = [KOL_MATCH_MENTIONS_TAG_TOOL]
         names.extend(KOL_SEARCH_TOOLS[platform] for platform in platforms if platform in KOL_SEARCH_TOOLS)
         return tuple(names)
+    if feature == "campaign_evaluate":
+        # 逐个达人查证：五平台 KOL 搜索 + kol_detail 补字段 + 标签匹配。
+        names = [KOL_MATCH_MENTIONS_TAG_TOOL, KOL_DETAIL_TOOL]
+        names.extend(KOL_SEARCH_TOOLS[platform] for platform in platforms if platform in KOL_SEARCH_TOOLS)
+        return tuple(names)
     raise QuickCallFailedError("unknown_feature")
 
 
@@ -127,7 +143,7 @@ def validate_feature_result(feature: str, result: Any) -> Any:
     """finish 结果的结构校验；不合契约抛 PlanValidationError（回喂或报错）。
 
     爆贴/达人推荐 = 列表（模型常包一层 {"items": [...]}，单列表值时自动解包）；
-    达人详情 = {"detail": 对象, "posts": 列表}。
+    达人详情 = {"detail": 对象, "posts": 列表}；活动评估 = {"title", "analysis_markdown"}。
     """
     if feature in ("top_posts", "kol_recommend"):
         rows = result
@@ -136,6 +152,11 @@ def validate_feature_result(feature: str, result: Any) -> Any:
             rows = lists[0] if len(lists) == 1 else None
         try:
             return _LIST_ADAPTER.validate_python(rows)
+        except ValidationError as error:
+            raise PlanValidationError("QUICK_RESULT_INVALID") from error
+    if feature == "campaign_evaluate":
+        try:
+            return CampaignEvaluateFeatureResult.model_validate(result)
         except ValidationError as error:
             raise PlanValidationError("QUICK_RESULT_INVALID") from error
     try:
@@ -199,11 +220,13 @@ async def run_quick_feature(
     industries: list[str],
     tags: list[str],
     period_days: int = 29,
+    system_prompt: str | None = None,
 ) -> Any:
     """同步小循环：模型决策 → 校验 → 计费执行 → 证据回填，直至 finish。
 
     返回通过该 feature 输出契约校验的原始结果（端点层再做归一化清洗）。
     period_days 为场景的默认时间窗（爆贴用 7 日热榜传 6）。
+    system_prompt 缺省为 QUICK_AGENT_PROMPT.system（活动评估等场景传专用 prompt）。
     """
     if not tools:
         raise QuickCallFailedError("tool_not_enabled")
@@ -225,7 +248,7 @@ async def run_quick_feature(
                 purpose="quick_feature",
                 template_name=QUICK_AGENT_PROMPT.name,
                 messages=(
-                    ChatMessage(role="system", content=QUICK_AGENT_PROMPT.system),
+                    ChatMessage(role="system", content=system_prompt or QUICK_AGENT_PROMPT.system),
                     ChatMessage(
                         role="user",
                         content=_user_content(
@@ -361,6 +384,7 @@ def slim_quick_evidence(payload: Any) -> Any:
 __all__ = [
     "DATASOURCE_BY_PLATFORM",
     "KOL_SEARCH_TOOLS",
+    "CampaignEvaluateFeatureResult",
     "KolDetailFeatureResult",
     "QUICK_AGENT_MAX_ROUNDS",
     "QuickDecision",

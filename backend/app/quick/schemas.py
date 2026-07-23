@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Annotated, Any
 
 from pydantic import BaseModel, Field
 
@@ -45,6 +45,15 @@ class TopPostsResponse(BaseModel):
     # insight-cube 原帖查询失败时的跨网关降级：返回同行业热门达人代替。
     degraded: bool = False
     fallback_kols: list[KolRecommendationItem] = Field(default_factory=list)
+
+
+class EvaluateRequest(BaseModel):
+    """活动评估输入：活动名 + 达人名单（每项 1-64 字符，至多 20 项）。"""
+
+    activity_name: str = Field(min_length=1, max_length=100)
+    kol_names: list[Annotated[str, Field(min_length=1, max_length=64)]] = Field(
+        min_length=1, max_length=20
+    )
 
 
 class EvaluateResponse(BaseModel):

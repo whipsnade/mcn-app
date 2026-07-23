@@ -1,161 +1,149 @@
-import io
-from collections.abc import AsyncIterator
-from datetime import UTC, datetime, timedelta
-from uuid import uuid4
+"""活动评估：JSON 输入（活动名 + 达人名单）+ 模型小循环查数。"""
 
-import openpyxl
+import json
+
 import pytest
-import pytest_asyncio
-from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.billing.models import Wallet
-from app.core.security import create_access_token
-from app.db.session import get_db
-from app.identity.models import LoginSession, User
-from app.main import create_app
-from app.model.contracts import StructuredResult
+from app.model.prompts import CAMPAIGN_EVALUATE_PROMPT
 from app.quick.models import QuickMcpCall
-from app.quick.router import quick_model
-from app.quick.service import MAX_UPLOAD_BYTES, EvaluateDocument
 
 
-class FakeModel:
-    def __init__(self, document: EvaluateDocument) -> None:
-        self.document = document
-        self.requests: list = []
+_XHS_SEARCH = "datatap.xiaohongshu.kol.search.v1"
+_DETAIL_TOOL = "datatap.social.grow.kol.detail.v1"
 
-    async def complete_json(self, request):
-        self.requests.append(request)
-        return StructuredResult(
-            value=self.document,
-            usage=None,
-            request_id="req-test",
-            regeneration_count=0,
-        )
-
-    def stream_text(self, request):  # pragma: no cover - 评估不走流式
-        raise NotImplementedError
-
-    async def aclose(self) -> None:
-        return None
-
-
-@pytest_asyncio.fixture
-async def evaluate_client_factory(db_session: AsyncSession):
-    clients: list[AsyncClient] = []
-
-    async def create(
-        *, industries: tuple[str, ...] = ("美食",), balance: int = 1000
-    ) -> tuple[AsyncClient, User, FakeModel]:
-        app = create_app()
-
-        async def override_get_db() -> AsyncIterator[AsyncSession]:
-            yield db_session
-
-        model = FakeModel(EvaluateDocument(title="火锅热度评估", analysis_markdown="# 结论\n热度上升"))
-        app.dependency_overrides[get_db] = override_get_db
-        app.dependency_overrides[quick_model] = lambda: model
-        now = datetime.now(UTC).replace(tzinfo=None)
-        user = User(
-            id=str(uuid4()),
-            nickname="评估用户",
-            role="user",
-            status="active",
-            industries=list(industries),
-            created_at=now,
-            updated_at=now,
-        )
-        db_session.add(user)
-        await db_session.flush()
-        db_session.add(
-            Wallet(user_id=user.id, balance=balance, reserved=0, version=0, updated_at=now)
-        )
-        login_session = LoginSession(
-            id=str(uuid4()),
-            user_id=user.id,
-            refresh_token_hash=uuid4().hex + uuid4().hex,
-            expires_at=now + timedelta(days=1),
-            revoked_at=None,
-            created_at=now,
-            last_seen_at=now,
-        )
-        db_session.add(login_session)
-        await db_session.flush()
-        token = create_access_token(user_id=user.id, session_id=login_session.id, role="user")
-        test_client = AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
-        test_client.headers["Authorization"] = f"Bearer {token}"
-        clients.append(test_client)
-        return test_client, user, model
-
-    yield create
-    for test_client in clients:
-        await test_client.aclose()
+SEARCH_RESULT = {
+    "KOL 列表": [
+        {
+            "账号ID (kwUid)": "xhs-1",
+            "平台": "xiaohongshu",
+            "昵称": "火锅小王",
+            "粉丝数": 120000,
+        }
+    ]
+}
+DETAIL_RESULT = {
+    "详情列表": [
+        {
+            "账号ID (kwUid)": "xhs-1",
+            "昵称": "火锅小王",
+            "粉丝数": 120000,
+            "平均互动": 3000.0,
+        }
+    ]
+}
+FINISH_RESULT = {"title": "夏季火锅节评估", "analysis_markdown": "# 结论\n火锅小王匹配度高"}
 
 
-def _xlsx_bytes() -> bytes:
-    workbook = openpyxl.Workbook()
-    sheet = workbook.active
-    sheet.append(["日期", "话题", "声量"])
-    sheet.append(["2026-07-01", "火锅", 12345])
-    sheet.append(["2026-07-02", "烧烤", 5432])
-    buffer = io.BytesIO()
-    workbook.save(buffer)
-    return buffer.getvalue()
+def _search_decision(keyword: str) -> dict:
+    return {
+        "action": "call_tool",
+        "internal_tool_name": _XHS_SEARCH,
+        "arguments": {"request": {"page": 1, "size": 10, "textContentWord": keyword}},
+    }
+
+
+def _detail_decision() -> dict:
+    return {
+        "action": "call_tool",
+        "internal_tool_name": _DETAIL_TOOL,
+        "arguments": {
+            "platform": "xiaohongshu",
+            "kwUidList": ["xhs-1"],
+            "scope": ["fansAudience", "postSummaryStatistics"],
+        },
+    }
+
+
+def _decisions() -> list:
+    return [
+        _search_decision("火锅小王"),
+        _detail_decision(),
+        {"action": "finish", "result": FINISH_RESULT},
+    ]
 
 
 @pytest.mark.asyncio
-async def test_evaluate_parses_xlsx_and_returns_model_document(
-    evaluate_client_factory, db_session
-) -> None:
-    client, user, model = await evaluate_client_factory(balance=500)
+async def test_evaluate_json_contract_and_model_loop(quick_client_factory, db_session) -> None:
+    client, user, transport, model = await quick_client_factory(
+        balance=500, decisions=_decisions()
+    )
+    transport.results["kol_xiaohongshu_search"] = SEARCH_RESULT
+    transport.results["kol_detail"] = DETAIL_RESULT
 
     response = await client.post(
         "/api/v1/quick/evaluate",
-        files={"file": ("热度数据.xlsx", _xlsx_bytes(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+        json={"activity_name": "夏季火锅节", "kol_names": ["火锅小王"]},
     )
 
     assert response.status_code == 200
-    body = response.json()
-    assert body == {"title": "火锅热度评估", "analysis_markdown": "# 结论\n热度上升"}
-    [request] = model.requests
-    assert request.purpose == "quick_evaluate"
-    assert request.template_name == "quick_evaluate_v1"
-    user_message = request.messages[-1].content
-    assert "火锅" in user_message
-    assert "12345" in user_message
-    assert "美食" in user_message  # 用户行业属性注入
-    # 纯模型调用：不计费、不留 quick_mcp_calls 痕。
+    assert response.json() == FINISH_RESULT
+    # 小循环 goal 含活动名与全部达人名；system 用活动评估专用 prompt。
+    first = model.requests[0]
+    assert first.purpose == "quick_feature"
+    assert first.messages[0].content == CAMPAIGN_EVALUATE_PROMPT.system
+    user_content = json.loads(first.messages[-1].content)
+    assert user_content["feature"] == "campaign_evaluate"
+    assert "夏季火锅节" in user_content["goal"]
+    assert "火锅小王" in user_content["goal"]
+    # 工具按模型决策执行并计费留痕（2 次 × 10 积分）。
+    [search_args] = transport.called_arguments("kol_xiaohongshu_search")
+    assert search_args["request"]["textContentWord"] == "火锅小王"
     wallet = await db_session.get(Wallet, user.id)
-    assert wallet.balance == 500
-    assert wallet.reserved == 0
-    assert (
-        await db_session.scalar(select(QuickMcpCall).where(QuickMcpCall.user_id == user.id))
-        is None
+    assert wallet.balance == 480
+    rows = list(
+        (await db_session.scalars(select(QuickMcpCall).where(QuickMcpCall.user_id == user.id))).all()
     )
+    assert len(rows) == 2
+    assert {row.internal_tool_name for row in rows} == {_XHS_SEARCH, _DETAIL_TOOL}
 
 
 @pytest.mark.asyncio
-async def test_evaluate_accepts_csv(evaluate_client_factory) -> None:
-    client, _user, model = await evaluate_client_factory()
+async def test_evaluate_goal_contains_all_kol_names(quick_client_factory) -> None:
+    client, _user, _transport, model = await quick_client_factory(
+        decisions=[{"action": "finish", "result": FINISH_RESULT}]
+    )
 
     response = await client.post(
         "/api/v1/quick/evaluate",
-        files={"file": ("data.csv", "日期,话题,声量\n2026-07-01,火锅,123\n".encode(), "text/csv")},
+        json={"activity_name": "新品发布会", "kol_names": ["达人甲", "达人乙", "达人甲"]},
     )
 
     assert response.status_code == 200
-    assert "火锅" in model.requests[-1].messages[-1].content
+    user_content = json.loads(model.requests[0].messages[-1].content)
+    assert "新品发布会" in user_content["goal"]
+    assert "达人甲" in user_content["goal"]
+    assert "达人乙" in user_content["goal"]
 
 
 @pytest.mark.asyncio
-async def test_evaluate_rejects_unsupported_extension(evaluate_client_factory) -> None:
-    client, _user, _model = await evaluate_client_factory()
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"activity_name": "", "kol_names": ["达人"]},
+        {"activity_name": "x" * 101, "kol_names": ["达人"]},
+        {"activity_name": "活动", "kol_names": []},
+        {"activity_name": "活动", "kol_names": [f"达人{i}" for i in range(21)]},
+        {"activity_name": "活动", "kol_names": [""]},
+        {"activity_name": "活动", "kol_names": ["x" * 65]},
+    ],
+)
+async def test_evaluate_rejects_invalid_payload(quick_client_factory, payload) -> None:
+    client, _user, _transport, _model = await quick_client_factory()
+
+    response = await client.post("/api/v1/quick/evaluate", json=payload)
+
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_evaluate_rejects_names_blank_after_strip(quick_client_factory) -> None:
+    client, _user, _transport, _model = await quick_client_factory()
 
     response = await client.post(
         "/api/v1/quick/evaluate",
-        files={"file": ("notes.txt", b"hello", "text/plain")},
+        json={"activity_name": "活动", "kol_names": ["   "]},
     )
 
     assert response.status_code == 422
@@ -163,12 +151,35 @@ async def test_evaluate_rejects_unsupported_extension(evaluate_client_factory) -
 
 
 @pytest.mark.asyncio
-async def test_evaluate_rejects_oversize_upload(evaluate_client_factory) -> None:
-    client, _user, _model = await evaluate_client_factory()
+async def test_evaluate_insufficient_balance_returns_409(quick_client_factory, db_session) -> None:
+    client, user, transport, _model = await quick_client_factory(
+        balance=5, decisions=[_search_decision("火锅小王")]
+    )
+    transport.results["kol_xiaohongshu_search"] = SEARCH_RESULT
 
     response = await client.post(
         "/api/v1/quick/evaluate",
-        files={"file": ("big.csv", b"x" * (MAX_UPLOAD_BYTES + 1), "text/csv")},
+        json={"activity_name": "夏季火锅节", "kol_names": ["火锅小王"]},
     )
 
-    assert response.status_code == 422
+    assert response.status_code == 409
+    assert response.json()["detail"] == "INSUFFICIENT_POINTS"
+    wallet = await db_session.get(Wallet, user.id)
+    assert wallet.balance == 5
+    assert wallet.reserved == 0
+
+
+@pytest.mark.asyncio
+async def test_evaluate_model_loop_failure_returns_502(quick_client_factory) -> None:
+    # finish 结果连续两次不合对象契约（缺 analysis_markdown）→ 小循环报错。
+    client, _user, _transport, _model = await quick_client_factory(
+        decisions=[{"action": "finish", "result": {"title": "缺字段"}}] * 2
+    )
+
+    response = await client.post(
+        "/api/v1/quick/evaluate",
+        json={"activity_name": "夏季火锅节", "kol_names": ["火锅小王"]},
+    )
+
+    assert response.status_code == 502
+    assert response.json()["detail"] == "QUICK_CALL_FAILED"

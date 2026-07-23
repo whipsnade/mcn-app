@@ -4,23 +4,19 @@ QuickCallService 串联：require_enabled → validate_input → transport.call_
 validate_output → 记账（reserve→成功 settle/失败 release，reference_type=
 "quick_mcp_call"）→ 写 quick_mcp_calls 留痕 → 响应归一化（{result: str} 解析）。
 
-爆贴/达人推荐/达人详情的工具选择与参数填充由 quick/agent.py 的模型小循环
-决策；本模块只做：执行护栏、结果归一化清洗（模型 result 可能不完整）、
-预算过滤/top50 截断（纯代码排序过滤）与评估上传。
+爆贴/达人推荐/达人详情/活动评估的工具选择与参数填充由 quick/agent.py 的模型
+小循环决策；本模块只做：执行护栏、结果归一化清洗（模型 result 可能不完整）、
+预算过滤/top50 截断（纯代码排序过滤）。
 """
 
 from __future__ import annotations
 
-import csv
-import io
 import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
-import openpyxl
-from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -43,12 +39,13 @@ from app.mcp_gateway.transport import (
     PossiblySentTimeout,
 )
 from app.mcp_gateway.validation import McpValidationError, validate_input, validate_output
-from app.model.contracts import ChatMessage, ModelAdapter, StructuredModelRequest
-from app.model.prompts import EVALUATE_PROMPT
+from app.model.contracts import ModelAdapter
+from app.model.prompts import CAMPAIGN_EVALUATE_PROMPT
 from app.orchestration.schemas import PlannerTool
 from app.quick.agent import (
     DATASOURCE_BY_PLATFORM,
     KOL_SEARCH_TOOLS,
+    CampaignEvaluateFeatureResult,
     KolDetailFeatureResult,
     QuickToolCaller,
     quick_feature_tool_names,
@@ -62,15 +59,12 @@ from app.quick.schemas import KolRecommendationItem, TopPostItem
 __all__ = [
     "DATASOURCE_BY_PLATFORM",
     "KOL_SEARCH_TOOLS",
-    "MAX_UPLOAD_BYTES",
     "QuickCallFailedError",
     "QuickCallService",
     "QuickService",
 ]
 
 
-MAX_UPLOAD_BYTES = 5 * 1024 * 1024
-MAX_TABLE_CHARS = 8000
 # 报价有效性下限：低于该值（或为 0/缺失）视为无报价。
 MIN_VALID_PRICE = 500.0
 
@@ -459,45 +453,6 @@ def apply_budget_filter(
     return [candidate.item for candidate in (priced + unpriced)[:50]]
 
 
-class EvaluateDocument(BaseModel):
-    """quick_evaluate 模型输出契约。"""
-
-    title: str
-    analysis_markdown: str
-
-
-def render_upload_table(filename: str, content: bytes) -> str:
-    """xlsx/csv → 紧凑文本表（截断 ~8k 字符）；不支持的类型与解析失败抛 ValueError。"""
-    lowered = filename.lower()
-    if lowered.endswith(".xlsx"):
-        try:
-            workbook = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
-        except Exception as error:
-            raise ValueError("upload_parse_failed") from error
-        lines: list[str] = []
-        multiple = len(workbook.sheetnames) > 1
-        for sheet in workbook.worksheets:
-            if multiple:
-                lines.append(f"# sheet: {sheet.title}")
-            for row in sheet.iter_rows(values_only=True):
-                cells = ["" if cell is None else str(cell) for cell in row]
-                if not any(cell.strip() for cell in cells):
-                    continue
-                lines.append("\t".join(cells).rstrip())
-        workbook.close()
-    elif lowered.endswith(".csv"):
-        text = content.decode("utf-8-sig", errors="replace")
-        reader = csv.reader(io.StringIO(text))
-        lines = [
-            "\t".join(row).rstrip()
-            for row in reader
-            if any(cell.strip() for cell in row)
-        ]
-    else:
-        raise ValueError("unsupported_file_type")
-    return "\n".join(lines)[:MAX_TABLE_CHARS]
-
-
 @dataclass
 class QuickService:
     """四个快捷端点的业务编排；points 跟踪本次请求实际计费调用数。"""
@@ -570,6 +525,7 @@ class QuickService:
         platforms: tuple[str, ...],
         tags: list[str],
         period_days: int = 29,
+        system_prompt: str | None = None,
     ) -> Any:
         industries = user_industries(user)
         tools = await self._feature_tools(feature, platforms)
@@ -585,6 +541,7 @@ class QuickService:
             industries=industries,
             tags=tags,
             period_days=period_days,
+            system_prompt=system_prompt,
         )
 
     async def top_posts(self, user: User, *, platform: str) -> tuple[list[TopPostItem], int]:
@@ -652,34 +609,21 @@ class QuickService:
             self.points,
         )
 
-    async def evaluate(
-        self, user: User, *, filename: str, content: bytes
-    ) -> EvaluateDocument:
+    async def evaluate_campaign(
+        self, user: User, *, activity_name: str, kol_names: list[str]
+    ) -> tuple[CampaignEvaluateFeatureResult, int]:
+        """活动评估：模型小循环逐个达人查证后产出 {title, analysis_markdown}。"""
         industries = user_industries(user)
-        table_text = render_upload_table(filename, content)
-        result = await self._require_model().complete_json(
-            StructuredModelRequest(
-                purpose="quick_evaluate",
-                template_name=EVALUATE_PROMPT.name,
-                messages=(
-                    ChatMessage(role="system", content=EVALUATE_PROMPT.system),
-                    ChatMessage(
-                        role="user",
-                        content=json.dumps(
-                            {
-                                "industries": industries,
-                                "uploaded_table": table_text,
-                            },
-                            ensure_ascii=False,
-                        ),
-                    ),
-                ),
-                output_model=EvaluateDocument,
-                max_tokens=4096,
-                log_context={
-                    "user_id": user.id,
-                    "tags": ["quick:evaluate", f"industry:{industries[0]}"],
-                },
-            )
+        result: CampaignEvaluateFeatureResult = await self._run_feature(
+            user,
+            feature="campaign_evaluate",
+            goal=(
+                f"评估活动「{activity_name}」与达人名单（{'、'.join(kol_names)}）的"
+                "匹配度与投放价值：逐个达人搜索查证并用 kol_detail 补齐字段后给出评估结论"
+            ),
+            scenario={"activity_name": activity_name, "kol_names": kol_names},
+            platforms=tuple(KOL_SEARCH_TOOLS),
+            tags=["quick:campaign_evaluate", f"industry:{industries[0]}"],
+            system_prompt=CAMPAIGN_EVALUATE_PROMPT.system,
         )
-        return result.value
+        return result, self.points

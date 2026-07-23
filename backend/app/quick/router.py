@@ -2,7 +2,7 @@ from typing import Annotated
 
 from functools import lru_cache
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -17,6 +17,7 @@ from app.mcp_gateway.transport import McpTransport
 from app.model.contracts import ModelAdapter, ModelAdapterError
 from app.model.dependencies import get_model_adapter
 from app.quick.schemas import (
+    EvaluateRequest,
     EvaluateResponse,
     KolDetailResponse,
     KolRecommendationsResponse,
@@ -25,7 +26,6 @@ from app.quick.schemas import (
 from app.quick.service import (
     DATASOURCE_BY_PLATFORM,
     KOL_SEARCH_TOOLS,
-    MAX_UPLOAD_BYTES,
     QuickCallFailedError,
     QuickService,
 )
@@ -180,22 +180,30 @@ async def top_posts(
 async def evaluate(
     user: CurrentUser,
     db: Annotated[AsyncSession, Depends(get_db)],
+    transport: Annotated[McpTransport, Depends(quick_transport)],
     model: Annotated[ModelAdapter, Depends(quick_model)],
-    file: Annotated[UploadFile, File()],
+    payload: EvaluateRequest,
 ) -> EvaluateResponse:
-    content = await file.read()
-    if not content or len(content) > MAX_UPLOAD_BYTES:
+    # 项 strip 去空去重；全空视为无效输入。
+    kol_names = list(
+        dict.fromkeys(name.strip() for name in payload.kol_names if name.strip())
+    )
+    if not kol_names:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=ErrorCode.VALIDATION_ERROR,
         )
-    service = QuickService(db, model=model)
+    service = QuickService(db, transport=transport, model=model)
     try:
-        document = await service.evaluate(
-            user, filename=file.filename or "", content=content
+        document, _points = await service.evaluate_campaign(
+            user, activity_name=payload.activity_name.strip(), kol_names=kol_names
         )
     except ValueError as error:
         raise invalid(error) from error
+    except InsufficientPointsError as error:
+        raise insufficient(error) from error
+    except QuickCallFailedError as error:
+        raise call_failed(error) from error
     except ModelAdapterError as error:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY, detail=ErrorCode.QUICK_CALL_FAILED
