@@ -177,6 +177,9 @@ class UserKolFavorite(Base):
     __tablename__ = "user_kol_favorites"
     __table_args__ = (
         UniqueConstraint("user_id", "kol_id", name="uq_user_kol_favorites_user_kol"),
+        UniqueConstraint(
+            "user_id", "platform", "kol_uid", name="uq_user_kol_favorites_user_platform_uid"
+        ),
         Index("ix_user_kol_favorites_user_created", "user_id", "created_at"),
     )
 
@@ -184,9 +187,14 @@ class UserKolFavorite(Base):
     user_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
     )
-    kol_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("kols.id", ondelete="CASCADE"), nullable=False
+    # 旧路径：绑定 kols 表行；新路径（platform+kol_uid）下为 NULL。
+    kol_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("kols.id", ondelete="CASCADE"), nullable=True
     )
+    platform: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    kol_uid: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    nickname: Mapped[str] = mapped_column(String(200), nullable=False, server_default="")
+    snapshot_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     note: Mapped[str | None] = mapped_column(String(500))
     source_task_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("analysis_tasks.id", ondelete="SET NULL")

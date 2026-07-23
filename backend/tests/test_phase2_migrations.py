@@ -21,7 +21,7 @@ def test_migration_chain_has_single_head() -> None:
     config = Config(str(backend_dir / "alembic.ini"))
     config.set_main_option("script_location", str(backend_dir / "migrations"))
     heads = ScriptDirectory.from_config(config).get_heads()
-    assert heads == ["0020_kol_selection_session_rpts"]
+    assert heads == ["0021_favorite_platform_uid"]
 
 
 async def test_phase_two_unique_constraints() -> None:
@@ -356,6 +356,25 @@ async def test_0020_session_kol_selections_schema() -> None:
     assert "session_kol_selections" in table_names
     assert "uq_kol_selection_session_platform_uid" in {item["name"] for item in constraints}
     assert "ix_kol_selection_user" in {item["name"] for item in indexes}
+
+
+async def test_0021_user_kol_favorites_platform_uid_schema() -> None:
+    """迁移 0021：user_kol_favorites 扩展 platform/kol_uid 身份列。"""
+    async with engine.connect() as connection:
+        columns = await connection.run_sync(
+            lambda sync: inspect(sync).get_columns("user_kol_favorites")
+        )
+        constraints = await connection.run_sync(
+            lambda sync: inspect(sync).get_unique_constraints("user_kol_favorites")
+        )
+    by_name = {item["name"]: item for item in columns}
+    for name in ("platform", "kol_uid", "nickname", "snapshot_json"):
+        assert name in by_name
+    assert by_name["kol_id"]["nullable"] is True
+    assert by_name["nickname"]["nullable"] is False
+    names = {item["name"] for item in constraints}
+    assert "uq_user_kol_favorites_user_platform_uid" in names
+    assert "uq_user_kol_favorites_user_kol" in names
 
 
 def _run_alembic(*args: str) -> None:

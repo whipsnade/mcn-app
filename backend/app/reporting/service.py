@@ -23,12 +23,12 @@ class ReportingService:
     def __init__(self, db_session: AsyncSession) -> None:
         self._db = db_session
 
-    async def list_favorites(self, user_id: str) -> list[tuple[UserKolFavorite, Kol]]:
+    async def list_favorites(self, user_id: str) -> list[tuple[UserKolFavorite, Kol | None]]:
         return list(
             (
                 await self._db.execute(
                     select(UserKolFavorite, Kol)
-                    .join(Kol, Kol.id == UserKolFavorite.kol_id)
+                    .outerjoin(Kol, Kol.id == UserKolFavorite.kol_id)
                     .where(UserKolFavorite.user_id == user_id)
                     .order_by(UserKolFavorite.created_at.desc())
                 )
@@ -79,6 +79,73 @@ class ReportingService:
             if favorite is None:
                 raise RuntimeError("favorite_upsert_failed")
             return favorite, kol
+
+    async def create_favorite_by_key(
+        self,
+        user_id: str,
+        *,
+        platform: str,
+        kol_uid: str,
+        nickname: str,
+        snapshot: dict[str, Any] | None,
+    ) -> UserKolFavorite:
+        """platform+kol_uid 新路径：幂等 upsert，不走 TaskCandidate 校验。
+
+        重复收藏时 nickname/snapshot 仅在新值非空时更新；snapshot 按顶层键合并，
+        新值为 None/空串的键不覆盖旧值。
+        """
+        async with self._transaction():
+            now = _now()
+            statement = mysql_insert(UserKolFavorite).values(
+                id=str(uuid4()),
+                user_id=user_id,
+                platform=platform,
+                kol_uid=kol_uid,
+                nickname=nickname,
+                snapshot_json=snapshot,
+                created_at=now,
+                updated_at=now,
+            )
+            await self._db.execute(statement.on_duplicate_key_update(updated_at=now))
+            await self._db.flush()
+            favorite = await self._db.scalar(
+                select(UserKolFavorite)
+                .where(
+                    UserKolFavorite.user_id == user_id,
+                    UserKolFavorite.platform == platform,
+                    UserKolFavorite.kol_uid == kol_uid,
+                )
+                .with_for_update()
+            )
+            if favorite is None:
+                raise RuntimeError("favorite_upsert_failed")
+            if nickname:
+                favorite.nickname = nickname
+            if snapshot:
+                merged = dict(favorite.snapshot_json or {})
+                for key, value in snapshot.items():
+                    if value is not None and value != "":
+                        merged[key] = value
+                favorite.snapshot_json = merged
+            favorite.updated_at = now
+            await self._db.flush()
+            return favorite
+
+    async def delete_favorite_by_key(self, user_id: str, platform: str, kol_uid: str) -> None:
+        async with self._transaction():
+            favorite = await self._db.scalar(
+                select(UserKolFavorite)
+                .where(
+                    UserKolFavorite.user_id == user_id,
+                    UserKolFavorite.platform == platform,
+                    UserKolFavorite.kol_uid == kol_uid,
+                )
+                .with_for_update()
+            )
+            if favorite is None:
+                raise LookupError("favorite_not_found")
+            await self._db.delete(favorite)
+            await self._db.flush()
 
     async def delete_favorite(self, user_id: str, kol_id: str) -> None:
         async with self._transaction():
