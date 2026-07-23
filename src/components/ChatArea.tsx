@@ -5,12 +5,12 @@ import type { FollowupSuggestion } from '../api/contracts';
 import TaskFlowNodes from './TaskFlowNodes';
 import type { TaskFlowNode } from '../state/taskEvents';
 
-/** 空白会话（无消息、无 followup 建议）展示的默认分析建议，点击填入输入框。 */
+/** 空白会话（无消息、无 followup 建议）展示的默认圈选建议，点击填入输入框。 */
 const DEFAULT_SUGGESTIONS: { title: string; prompt: string }[] = [
-  { title: '品牌声量分析', prompt: '分析某品牌最近3个月在各平台的声量变化和用户情感趋势' },
-  { title: '多品牌对比', prompt: '对比多个品牌在社交媒体的传播策略和用户反响差异' },
-  { title: '行业趋势分析', prompt: '分析某行业在社交媒体的讨论热度、用户关注点和发展趋势' },
+  { title: '按品类圈选达人', prompt: '圈选某品类（如美食）近1个月表现最好的各平台达人，按互动量排序' },
   { title: '品牌提及博主圈选', prompt: '圈选近1个月内容中提及过某品牌的各平台博主，按互动量排序' },
+  { title: '按受众画像圈选', prompt: '圈选粉丝以某地区某年龄段女性为主的各平台达人，适合推广某类产品' },
+  { title: '按预算圈选达人', prompt: '在10万元预算内圈选适合推广某品牌的高性价比达人，给出组合建议' },
 ];
 
 interface ChatAreaProps {
@@ -294,10 +294,10 @@ export default function ChatArea({
       <div className="shrink-0 p-4 bg-white border-t border-slate-100 space-y-2.5">
 
         {!followupStatus && session.messages.length === 0 && (
-          <section aria-label="开始分析建议" className="rounded-xl border border-indigo-100 bg-indigo-50/40 px-3 py-2.5">
+          <section aria-label="开始圈选建议" className="rounded-xl border border-indigo-100 bg-indigo-50/40 px-3 py-2.5">
             <div className="flex items-center gap-1.5 text-[10px] font-bold text-indigo-600">
               <Sparkles className="h-3 w-3" />
-              开始分析建议
+              开始圈选建议
             </div>
             <div className="mt-2 flex gap-1.5 overflow-x-auto pb-0.5 scrollbar-none">
               {DEFAULT_SUGGESTIONS.map(suggestion => (

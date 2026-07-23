@@ -321,17 +321,17 @@ describe('ChatArea', () => {
       />,
     );
 
-    expect(screen.getByText('品牌声量分析')).toBeVisible();
-    expect(screen.getByText('多品牌对比')).toBeVisible();
-    expect(screen.getByText('行业趋势分析')).toBeVisible();
+    expect(screen.getByText('按品类圈选达人')).toBeVisible();
     expect(screen.getByText('品牌提及博主圈选')).toBeVisible();
+    expect(screen.getByText('按受众画像圈选')).toBeVisible();
+    expect(screen.getByText('按预算圈选达人')).toBeVisible();
 
     await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: /品牌声量分析/ }));
+      fireEvent.click(screen.getByRole('button', { name: /按品类圈选达人/ }));
     });
     expect(onSendMessage).not.toHaveBeenCalled();
     expect((screen.getByPlaceholderText(/输入消息并向 AI 分析师提问/) as HTMLTextAreaElement).value)
-      .toBe('分析某品牌最近3个月在各平台的声量变化和用户情感趋势');
+      .toBe('圈选某品类（如美食）近1个月表现最好的各平台达人，按互动量排序');
   });
 
   it('hides the default suggestions once the session has messages', () => {
@@ -344,7 +344,7 @@ describe('ChatArea', () => {
       />,
     );
 
-    expect(screen.queryByText('品牌声量分析')).toBeNull();
+    expect(screen.queryByText('按品类圈选达人')).toBeNull();
   });
 
   it('hides the default suggestions while follow-up suggestions are active', () => {
@@ -358,7 +358,7 @@ describe('ChatArea', () => {
       />,
     );
 
-    expect(screen.queryByText('品牌声量分析')).toBeNull();
+    expect(screen.queryByText('按品类圈选达人')).toBeNull();
     expect(screen.getByText('正在生成进一步分析建议…')).toBeVisible();
   });
 });
