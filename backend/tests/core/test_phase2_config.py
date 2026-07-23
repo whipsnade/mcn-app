@@ -45,6 +45,14 @@ def test_billing_constant_cannot_drift() -> None:
         settings(mcp_call_points=9)
 
 
+def test_goal_planner_shadow_defaults_off() -> None:
+    assert settings().goal_planner_shadow_enabled is False
+
+
+def test_goal_planner_shadow_can_be_enabled() -> None:
+    assert settings(goal_planner_shadow_enabled=True).goal_planner_shadow_enabled is True
+
+
 def test_model_provider_endpoint_and_name_are_configurable() -> None:
     config = settings(
         tencent_plan_base_url="https://api.moonshot.cn/v1",

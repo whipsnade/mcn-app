@@ -202,27 +202,115 @@ class _FakeArtifacts:
         self.calls.append("auto_analysis")
 
 
-def _task(plan_json: dict | None = None) -> SimpleNamespace:
+class FakeGoalPlannerShadow:
+    def __init__(self, error: Exception | None = None) -> None:
+        self.task_ids: list[str] = []
+        self.error = error
+
+    async def plan_task(self, task_id: str) -> None:
+        self.task_ids.append(task_id)
+        if self.error is not None:
+            raise self.error
+
+
+def _task(
+    plan_json: dict | None = None,
+    *,
+    retry_of_task_id: str | None = None,
+) -> SimpleNamespace:
     return SimpleNamespace(
         id="task-1",
         user_id="user-1",
         session_id="session-1",
         kind="agent",
         plan_json=plan_json,
+        retry_of_task_id=retry_of_task_id,
     )
 
 
-def _executor(store, decider, gateway, artifacts, context_builder=None) -> TaskExecutor:
+def _executor(
+    store,
+    decider,
+    gateway,
+    artifacts,
+    context_builder=None,
+    *,
+    goal_planner_shadow=None,
+) -> TaskExecutor:
     return TaskExecutor(
         repository=store,
         context_builder=context_builder or _FakeContextBuilder(),
         planner=decider,
         gateway=gateway,
         artifacts=artifacts,
+        goal_planner_shadow=goal_planner_shadow,
         worker_id="worker-1",
         lease_seconds=60,
         heartbeat_seconds=0.05,
     )
+
+
+@pytest.mark.asyncio
+async def test_shadow_goal_planner_runs_after_legacy_agent_loop() -> None:
+    task = _task()
+    store = _FakeStore(task)
+    shadow = FakeGoalPlannerShadow()
+    decider = _ScriptedDecider([_call(), _finish("旧流程正常完成")])
+    executor = _executor(
+        store,
+        decider,
+        _FakeGateway([(_settled(),)]),
+        _FakeArtifacts(),
+        goal_planner_shadow=shadow,
+    )
+
+    await executor.run(task.id)
+
+    assert shadow.task_ids == ["task-1"]
+    assert decider.calls == 2
+    assert store.terminal == "completed"
+
+
+@pytest.mark.asyncio
+async def test_shadow_goal_planner_failure_does_not_fail_task() -> None:
+    task = _task()
+    store = _FakeStore(task)
+    shadow = FakeGoalPlannerShadow(RuntimeError("shadow-only"))
+    decider = _ScriptedDecider([_call(), _finish("旧流程正常完成")])
+    executor = _executor(
+        store,
+        decider,
+        _FakeGateway([(_settled(),)]),
+        _FakeArtifacts(),
+        goal_planner_shadow=shadow,
+    )
+
+    await executor.run(task.id)
+
+    assert shadow.task_ids == ["task-1"]
+    assert decider.calls == 2
+    assert store.terminal == "completed"
+
+
+@pytest.mark.asyncio
+async def test_shadow_goal_planner_skips_retry_task() -> None:
+    task = _task(retry_of_task_id="source-task")
+    store = _FakeStore(task)
+    shadow = FakeGoalPlannerShadow()
+    decider = _ScriptedDecider([_call(), _finish("重试旧流程正常完成")])
+    executor = _executor(
+        store,
+        decider,
+        _FakeGateway([(_settled(),)]),
+        _FakeArtifacts(),
+        goal_planner_shadow=shadow,
+    )
+
+    await executor.run(task.id)
+
+    assert shadow.task_ids == []
+    assert decider.calls == 2
+    assert store.terminal == "completed"
 
 
 @pytest.mark.asyncio

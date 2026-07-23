@@ -67,6 +67,11 @@ class TaskPlanner(Protocol):
     async def agent_decide(self, context: AgentLoopContext) -> Any: ...
 
 
+class GoalPlannerShadow(Protocol):
+    async def plan_task(self, task_id: str) -> Any:
+        raise NotImplementedError
+
+
 class McpBatchGateway(Protocol):
     async def execute_batch(self, commands: tuple[ExecuteMcpCall, ...]) -> tuple[Any, ...]: ...
 
@@ -156,6 +161,7 @@ class TaskExecutor:
         gateway: McpBatchGateway,
         artifacts: TaskArtifacts | None = None,
         selection: SelectionIngest | None = None,
+        goal_planner_shadow: GoalPlannerShadow | None = None,
         worker_id: str,
         lease_seconds: int = 60,
         heartbeat_seconds: float | None = None,
@@ -167,6 +173,7 @@ class TaskExecutor:
         self.gateway = gateway
         self.artifacts = artifacts
         self.selection = selection
+        self.goal_planner_shadow = goal_planner_shadow
         self.worker_id = worker_id
         self.lease_seconds = lease_seconds
         self.heartbeat_seconds = (
@@ -189,6 +196,18 @@ class TaskExecutor:
             # 所有任务统一走 agent 迭代循环（历史 kind="pipeline" 行的固定
             # DAG 路径已移除，恢复时按空轨迹重新进入迭代循环）。
             await self._run_agent_loop(task)
+            if (
+                self.goal_planner_shadow is not None
+                and getattr(task, "retry_of_task_id", None) is None
+            ):
+                try:
+                    await self.goal_planner_shadow.plan_task(task.id)
+                except Exception:
+                    logger.warning(
+                        "goal_planner_shadow_failed task_id=%s",
+                        task.id,
+                        exc_info=True,
+                    )
         except asyncio.CancelledError:
             await self.repository.mark_interrupted(task.id, self.worker_id)
             raise

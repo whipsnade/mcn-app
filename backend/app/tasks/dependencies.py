@@ -14,6 +14,8 @@ from sqlalchemy.exc import IntegrityError
 
 from app.core.config import get_settings
 from app.db.session import SessionFactory
+from app.goals.context import GoalPlannerContextBuilder
+from app.goals.planner import GoalPlannerService
 from app.identity.models import User, UserChannelPermission
 from app.mcp_gateway.datatap import DataTapTransport
 from app.mcp_gateway.contracts import DataTapService
@@ -334,9 +336,18 @@ class DatabaseSelectionIngest:
 
 class TaskExecutionDependencies:
     def __init__(self) -> None:
+        settings = get_settings()
         self.store = DatabaseTaskStore()
         self.worker_id_prefix = f"inproc-{os.getpid()}"
         self._model = get_model_adapter()
+        self._goal_planner_shadow = (
+            GoalPlannerService(
+                model=self._model,
+                context_builder=GoalPlannerContextBuilder(),
+            )
+            if settings.goal_planner_shadow_enabled
+            else None
+        )
         self._followups = FollowupSuggestionService(self._model)
         self._transport = get_mcp_transport()
         self._arguments = _PlanArguments()
@@ -431,6 +442,7 @@ class TaskExecutionDependencies:
             gateway=self,
             artifacts=_TaskArtifacts(worker_id, get_model_adapter()),
             selection=self._selection,
+            goal_planner_shadow=self._goal_planner_shadow,
             worker_id=worker_id,
             lease_seconds=get_settings().task_lease_seconds,
         )
