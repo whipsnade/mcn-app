@@ -195,9 +195,10 @@ class TaskExecutor:
         try:
             # 所有任务统一走 agent 迭代循环（历史 kind="pipeline" 行的固定
             # DAG 路径已移除，恢复时按空轨迹重新进入迭代循环）。
-            await self._run_agent_loop(task)
+            terminal_persisted = await self._run_agent_loop(task)
             if (
-                self.goal_planner_shadow is not None
+                terminal_persisted
+                and self.goal_planner_shadow is not None
                 and getattr(task, "retry_of_task_id", None) is None
             ):
                 try:
@@ -206,7 +207,6 @@ class TaskExecutor:
                     logger.warning(
                         "goal_planner_shadow_failed task_id=%s",
                         task.id,
-                        exc_info=True,
                     )
         except asyncio.CancelledError:
             await self.repository.mark_interrupted(task.id, self.worker_id)
@@ -232,11 +232,11 @@ class TaskExecutor:
             await asyncio.gather(heartbeat, return_exceptions=True)
             await self.repository.release_lease(task.id, self.worker_id)
 
-    async def _run_agent_loop(self, task: Any) -> None:
+    async def _run_agent_loop(self, task: Any) -> bool:
         """迭代式工具调用循环：每轮由模型决定下一步，finish 结论写成 assistant 消息。
 
         循环没有调用次数上限：退出条件只有模型 finish、取消、积分余额不足
-        或异常。
+        或异常。仅在旧任务终态已持久化时返回 True；租约写入失败早退返回 False。
         """
         build_agent_context = getattr(self.context_builder, "build_agent_context", None)
         decide = getattr(self.planner, "agent_decide", None)
@@ -249,7 +249,7 @@ class TaskExecutor:
             if not await self.repository.save_plan(
                 task.id, self.worker_id, trajectory.as_plan_json()
             ):
-                return
+                return False
         feedback: list[EvidenceNote] = []
         invalid_streak = 0
         throttle_streak = 0
@@ -258,7 +258,7 @@ class TaskExecutor:
         while True:
             if await self.repository.cancel_requested(task.id):
                 await self.repository.mark_cancelled(task.id, self.worker_id)
-                return
+                return True
             # A persisted step without a result is replayed with its original
             # arguments (crash between prepare and finalize); only when no
             # pending step exists do we ask the model for the next move.
@@ -340,7 +340,7 @@ class TaskExecutor:
                 if not await self.repository.save_trajectory(
                     task.id, self.worker_id, trajectory.as_plan_json()
                 ):
-                    return
+                    return False
             step_index = len(trajectory.results) + 1
             await self.repository.append_event(
                 task.id,
@@ -402,7 +402,7 @@ class TaskExecutor:
                 # Possibly-sent calls are never replayed in this run; recovery
                 # reconciles them later.
                 await self.repository.mark_interrupted(task.id, self.worker_id)
-                return
+                return True
             if row_status == "settled":
                 structured_content = (getattr(row, "evidence_json", None) or {}).get(
                     "structured_content"
@@ -451,7 +451,7 @@ class TaskExecutor:
             if not await self.repository.save_trajectory(
                 task.id, self.worker_id, trajectory.as_plan_json()
             ):
-                return
+                return False
         has_settled = any(note.status == "settled" for note in trajectory.results)
         has_failures = any(note.status == "failed" for note in trajectory.results)
         if balance_exhausted:
@@ -461,12 +461,12 @@ class TaskExecutor:
                 await self.artifacts.write_conclusion_message(task.id, finish_conclusion)
                 await self.artifacts.auto_kol_analysis(task.id)
             await self.repository.mark_insufficient_balance(task.id, self.worker_id)
-            return
+            return True
         if not has_settled:
             # 门禁拆除后模型首轮即可 finish，此时可能从未发起过 MCP 调用，
             # 错误码只描述事实：没有采集到任何证据。
             await self.repository.mark_failed(task.id, self.worker_id, "no_evidence_collected")
-            return
+            return True
         if self.artifacts is not None:
             await self.artifacts.write_conclusion_message(task.id, finish_conclusion)
             # 结论消息之后、终态标记之前触发自动 KOL 分析：report.updated
@@ -482,6 +482,7 @@ class TaskExecutor:
         else:
             await self.repository.mark_completed(task.id, self.worker_id)
         await self._finish_followups(task.id)
+        return True
 
     async def _finish_followups(self, task_id: str) -> None:
         # The task terminal event is durable before suggestion generation

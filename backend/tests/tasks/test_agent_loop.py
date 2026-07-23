@@ -110,16 +110,22 @@ class _FakeStore:
         self.events: list[tuple[str, dict]] = []
         self.trajectories: list[dict] = []
         self.terminal: str | None = None
+        self.save_plan_result = True
+        self.save_trajectory_result = True
 
     async def claim_lease(self, task_id, worker_id, lease_seconds):
         return self.task
 
     async def save_plan(self, task_id, worker_id, plan_json):
+        if not self.save_plan_result:
+            return False
         self.task.plan_json = plan_json
         self.trajectories.append(plan_json)
         return True
 
     async def save_trajectory(self, task_id, worker_id, trajectory_json):
+        if not self.save_trajectory_result:
+            return False
         self.task.plan_json = trajectory_json
         self.trajectories.append(trajectory_json)
         return True
@@ -203,12 +209,20 @@ class _FakeArtifacts:
 
 
 class FakeGoalPlannerShadow:
-    def __init__(self, error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        error: Exception | None = None,
+        *,
+        store: _FakeStore | None = None,
+    ) -> None:
         self.task_ids: list[str] = []
+        self.terminals_at_call: list[str | None] = []
         self.error = error
+        self.store = store
 
     async def plan_task(self, task_id: str) -> None:
         self.task_ids.append(task_id)
+        self.terminals_at_call.append(self.store.terminal if self.store is not None else None)
         if self.error is not None:
             raise self.error
 
@@ -254,7 +268,7 @@ def _executor(
 async def test_shadow_goal_planner_runs_after_legacy_agent_loop() -> None:
     task = _task()
     store = _FakeStore(task)
-    shadow = FakeGoalPlannerShadow()
+    shadow = FakeGoalPlannerShadow(store=store)
     decider = _ScriptedDecider([_call(), _finish("旧流程正常完成")])
     executor = _executor(
         store,
@@ -267,15 +281,52 @@ async def test_shadow_goal_planner_runs_after_legacy_agent_loop() -> None:
     await executor.run(task.id)
 
     assert shadow.task_ids == ["task-1"]
+    assert shadow.terminals_at_call == ["completed"]
     assert decider.calls == 2
     assert store.terminal == "completed"
+
+
+@pytest.mark.parametrize(
+    ("failed_write", "decisions", "expected_decider_calls"),
+    [
+        ("save_plan_result", [_finish("不会执行")], 0),
+        ("save_trajectory_result", [_call()], 1),
+    ],
+)
+@pytest.mark.asyncio
+async def test_shadow_goal_planner_skips_when_lease_write_fails(
+    failed_write: str,
+    decisions: list[AgentDecision],
+    expected_decider_calls: int,
+) -> None:
+    task = _task()
+    store = _FakeStore(task)
+    setattr(store, failed_write, False)
+    shadow = FakeGoalPlannerShadow(store=store)
+    decider = _ScriptedDecider(decisions)
+    executor = _executor(
+        store,
+        decider,
+        _FakeGateway([]),
+        _FakeArtifacts(),
+        goal_planner_shadow=shadow,
+    )
+
+    await executor.run(task.id)
+
+    assert shadow.task_ids == []
+    assert decider.calls == expected_decider_calls
+    assert store.terminal is None
 
 
 @pytest.mark.asyncio
-async def test_shadow_goal_planner_failure_does_not_fail_task() -> None:
+async def test_shadow_goal_planner_failure_does_not_fail_task(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     task = _task()
     store = _FakeStore(task)
-    shadow = FakeGoalPlannerShadow(RuntimeError("shadow-only"))
+    sensitive_marker = "sensitive-model-output-must-not-leak"
+    shadow = FakeGoalPlannerShadow(RuntimeError(sensitive_marker))
     decider = _ScriptedDecider([_call(), _finish("旧流程正常完成")])
     executor = _executor(
         store,
@@ -285,11 +336,18 @@ async def test_shadow_goal_planner_failure_does_not_fail_task() -> None:
         goal_planner_shadow=shadow,
     )
 
-    await executor.run(task.id)
+    with caplog.at_level("WARNING", logger="app.tasks.executor"):
+        await executor.run(task.id)
 
     assert shadow.task_ids == ["task-1"]
     assert decider.calls == 2
     assert store.terminal == "completed"
+    record = next(
+        item for item in caplog.records if item.getMessage().startswith("goal_planner_shadow_failed")
+    )
+    assert record.getMessage() == "goal_planner_shadow_failed task_id=task-1"
+    assert record.exc_info is None
+    assert sensitive_marker not in caplog.text
 
 
 @pytest.mark.asyncio
