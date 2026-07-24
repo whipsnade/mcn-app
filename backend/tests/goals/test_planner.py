@@ -135,6 +135,32 @@ async def test_second_semantic_failure_is_raised_without_third_request() -> None
 
 
 @pytest.mark.asyncio
+async def test_planner_validates_brand_source_against_session_context() -> None:
+    conflict = GoalPlannerOutput(
+        action="execute",
+        active_brand="奈雪",
+        brand_source="session",
+        goals=[
+            GoalSpec(
+                sequence=1,
+                goal_type="campaign_analysis",
+                params=GoalParams(brand="奈雪", campaign="618"),
+                request_evidence="分析喜茶 618 表现",
+            )
+        ],
+    )
+    valid = _valid_output()
+    model = FakeModel([conflict, valid])
+
+    result = await GoalPlannerService(model=model, context_builder=None).plan_context(_context())
+
+    assert result == valid
+    assert len(model.requests) == 2
+    repair_payload = json.loads(model.requests[1].messages[-1].content)
+    assert repair_payload["validation_error"] == "brand_source_context_mismatch"
+
+
+@pytest.mark.asyncio
 async def test_plan_task_closes_context_session_before_model_call() -> None:
     state = {"session_open": False}
 

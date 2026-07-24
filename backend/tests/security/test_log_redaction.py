@@ -58,3 +58,17 @@ def test_redaction_masks_env_style_assignments_without_overmatching_business_tex
     ):
         assert secret not in rendered
     assert "品牌 token 化传播策略保持不变" in rendered
+
+
+def test_redaction_masks_quoted_json_credentials_without_overmatching_business_text() -> None:
+    value = (
+        '{"token":"quoted-token-value","api_key": "quoted-api-key-value",'
+        '"campaign":"品牌 token 化传播策略","note":"api key 视觉主题"}'
+    )
+
+    rendered = redact_for_log(value)
+
+    assert "quoted-token-value" not in rendered
+    assert "quoted-api-key-value" not in rendered
+    assert "品牌 token 化传播策略" in rendered
+    assert "api key 视觉主题" in rendered

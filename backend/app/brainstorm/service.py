@@ -126,7 +126,12 @@ class BrainstormService:
             if profile.category and profile.category.strip()
             else []
         )
-        exemplars = await find_success_exemplars(self.db, purpose="brainstorm", tags=tags)
+        exemplars = await find_success_exemplars(
+            self.db,
+            purpose="brainstorm",
+            tags=tags,
+            user_id=user_id,
+        )
         user_content = json.dumps(
             {
                 "messages": [message.model_dump(mode="json") for message in recent_messages],

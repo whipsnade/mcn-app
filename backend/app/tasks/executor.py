@@ -400,7 +400,9 @@ class TaskExecutor:
             if row_status in {"unknown", "planned", "reserved", "running", "succeeded"}:
                 # Possibly-sent calls are never replayed in this run; recovery
                 # reconciles them later.
-                return await self.repository.mark_interrupted(task.id, self.worker_id)
+                await self.repository.mark_interrupted(task.id, self.worker_id)
+                # interrupted 可被恢复任务重新领取，不是允许影子规划的终态。
+                return False
             if row_status == "settled":
                 structured_content = (getattr(row, "evidence_json", None) or {}).get(
                     "structured_content"

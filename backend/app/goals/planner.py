@@ -73,7 +73,15 @@ class GoalPlannerService:
                 )
             )
             try:
-                validate_goal_plan(result.value, context.current_message)
+                session_brand = context.session_context.get("active_brand")
+                validate_goal_plan(
+                    result.value,
+                    context.current_message,
+                    session_brand=(
+                        session_brand if isinstance(session_brand, str) else None
+                    ),
+                    account_default_brand=context.account_default_brand,
+                )
             except GoalPlanSemanticError as error:
                 if attempt == 2:
                     raise

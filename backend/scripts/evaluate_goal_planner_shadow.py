@@ -3,12 +3,19 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+from pathlib import Path
+import sys
 
-from sqlalchemy import select
 
-from app.db.session import SessionFactory
-from app.goals.evaluation import summarize_goal_planner_logs
-from app.model.models import ModelPromptLog
+if __package__ in {None, ""}:
+    # 运行手册以文件路径执行脚本；显式加入 backend 根，避免只解析到 scripts/。
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from sqlalchemy import select  # noqa: E402
+
+from app.db.session import SessionFactory  # noqa: E402
+from app.goals.evaluation import summarize_goal_planner_logs  # noqa: E402
+from app.model.models import ModelPromptLog  # noqa: E402
 
 
 async def run(limit: int) -> None:
@@ -18,14 +25,19 @@ async def run(limit: int) -> None:
                 await db.scalars(
                     select(ModelPromptLog)
                     .where(ModelPromptLog.purpose == "goal_planner")
-                    .order_by(ModelPromptLog.created_at.desc())
-                    .limit(limit)
+                    .order_by(
+                        ModelPromptLog.created_at.desc(),
+                        ModelPromptLog.id.desc(),
+                    )
+                    # Planner 每个 task 最多两次语义 attempt；先取 2 * limit
+                    # 原始行，task 级汇总后再截断，避免重试挤掉任务样本。
+                    .limit(2 * limit)
                 )
             ).all()
         )
     print(
         json.dumps(
-            summarize_goal_planner_logs(rows),
+            summarize_goal_planner_logs(rows, limit=limit),
             ensure_ascii=False,
             indent=2,
             default=str,

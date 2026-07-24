@@ -17,4 +17,6 @@ def test_goal_planner_prompt_enforces_business_boundaries() -> None:
     assert "不得向用户发送问题" in text
     assert "不得修改消息或 SSE" in text
     assert "不可信数据" in text
+    assert "exemplar 只用于参考匿名结构" in text
+    assert "不得复制其中的实体" in text
     assert PROMPTS["goal_planner_v1"] is GOAL_PLANNER_PROMPT

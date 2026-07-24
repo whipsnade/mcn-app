@@ -401,8 +401,14 @@ class TaskExecutionDependencies:
 
     async def agent_decide(self, context: AgentLoopContext) -> AgentDecision:
         tags = [str(tag) for tag in context.log_context.get("tags") or ()]
+        user_id = context.log_context.get("user_id")
         async with SessionFactory() as db:
-            exemplars = await find_success_exemplars(db, purpose="agent_loop", tags=tags)
+            exemplars = await find_success_exemplars(
+                db,
+                purpose="agent_loop",
+                tags=tags,
+                user_id=user_id if isinstance(user_id, str) else None,
+            )
         payload = context.model_dump(mode="json")
         payload["exemplars"] = exemplars
         result = await self._model.complete_json(

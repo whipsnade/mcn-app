@@ -237,7 +237,12 @@ async def run_quick_feature(
         requested_period=_default_period(period_days),
     )
     log_context = {"user_id": user_id, "tags": list(tags)}
-    exemplars = await find_success_exemplars(db, purpose="quick_feature", tags=tags)
+    exemplars = await find_success_exemplars(
+        db,
+        purpose="quick_feature",
+        tags=tags,
+        user_id=user_id,
+    )
     notes: list[EvidenceNote] = []
     invalid_streak = 0
     for round_index in range(QUICK_AGENT_MAX_ROUNDS + 1):

@@ -562,6 +562,7 @@ async def test_agent_loop_failure_note_includes_upstream_hint() -> None:
 async def test_agent_loop_unknown_call_interrupts_without_report() -> None:
     task = _task()
     store = _FakeStore(task)
+    shadow = FakeGoalPlannerShadow(store=store)
     unknown = SimpleNamespace(
         status="unknown",
         internal_tool_name=_TOOL_NAME,
@@ -573,10 +574,17 @@ async def test_agent_loop_unknown_call_interrupts_without_report() -> None:
     gateway = _FakeGateway([(unknown,)])
     artifacts = _FakeArtifacts()
 
-    await _executor(store, decider, gateway, artifacts).run(task.id)
+    await _executor(
+        store,
+        decider,
+        gateway,
+        artifacts,
+        goal_planner_shadow=shadow,
+    ).run(task.id)
 
     assert store.terminal == "interrupted"
     assert artifacts.conclusions == []
+    assert shadow.task_ids == []
 
 
 @pytest.mark.asyncio

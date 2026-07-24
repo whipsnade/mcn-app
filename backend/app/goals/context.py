@@ -80,6 +80,7 @@ class GoalPlannerContextBuilder:
             db,
             purpose="goal_planner",
             tags=["goal_planner:shadow"],
+            user_id=task.user_id,
         )
         return GoalPlannerContext(
             user_id=task.user_id,

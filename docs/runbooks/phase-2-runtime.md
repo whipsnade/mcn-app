@@ -35,16 +35,27 @@ cd backend
 
 1. UAT 设置 `GOAL_PLANNER_SHADOW_ENABLED=true` 后重启后端。
 2. 影子规划在旧任务进入终态后运行，不调用 MCP、不扣积分；当前尚未创建 TaskGoal 与 TaskArtifact，GoalPlanner 未接管执行，真实任务仍走旧 Agent Loop。
-3. 使用以下命令汇总最近 100 条 GoalPlanner 日志；JSON 中的 `current_message` 供人工复核：
+3. 本地开发环境使用后端目录内的虚拟环境汇总最近 100 个 GoalPlanner 任务；
+   JSON 中的 `current_message` 已脱敏，供人工复核：
 
    ```bash
    cd backend
    .venv/bin/python scripts/evaluate_goal_planner_shadow.py --limit 100
    ```
 
-4. 人工抽查 `brand_source`、campaign 的 `brand` / `campaign`、`kol_selection` 的 `request_evidence`。
-5. 非圈选消息出现 `kol_selection` 时不得进入下一阶段。
-6. 紧急关闭：设置 `GOAL_PLANNER_SHADOW_ENABLED=false` 并重启；无需数据库回滚。
+4. UAT 的虚拟环境位于项目根目录，必须使用以下独立命令：
+
+   ```bash
+   cd /home/kol_insight/backend
+   ../.venv/bin/python scripts/evaluate_goal_planner_shadow.py --limit 100
+   ```
+
+5. `--limit` 仅允许 1–1000。阶段一只做低量、只读 UAT 评估；CLI 在 task 聚合前最多
+   读取 `2 * limit` 行。当前不新增迁移；待真实日志规模和查询计划证明必要后，再评估
+   增加 `(purpose, created_at)` 索引。
+6. 人工抽查 `brand_source`、campaign 的 `brand` / `campaign`、`kol_selection` 的 `request_evidence`。
+7. 非圈选消息出现 `kol_selection` 时不得进入下一阶段。
+8. 紧急关闭：设置 `GOAL_PLANNER_SHADOW_ENABLED=false` 并重启；无需数据库回滚。
 
 ## 回滚
 

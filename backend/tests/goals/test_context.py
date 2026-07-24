@@ -10,8 +10,30 @@ from app.workspace.service import WorkspaceService
 
 
 @pytest.mark.asyncio
-async def test_context_uses_trigger_message_and_session_brand(db_session, user_factory) -> None:
+async def test_context_uses_trigger_message_session_brand_and_user_scoped_exemplars(
+    db_session,
+    user_factory,
+    monkeypatch,
+) -> None:
     user = await user_factory()
+    exemplar_query: dict[str, object] = {}
+
+    async def scoped_exemplars(db, *, purpose, tags, user_id, limit=2):
+        exemplar_query.update(
+            {
+                "db": db,
+                "purpose": purpose,
+                "tags": tags,
+                "user_id": user_id,
+                "limit": limit,
+            }
+        )
+        return [{"excerpt": "anonymous"}]
+
+    monkeypatch.setattr(
+        "app.goals.context.find_success_exemplars",
+        scoped_exemplars,
+    )
     workspace = await WorkspaceService(db_session).create_session(
         user.id,
         SessionCreate(brand="喜茶", category="茶饮"),
@@ -39,6 +61,10 @@ async def test_context_uses_trigger_message_and_session_brand(db_session, user_f
         "kol_selection",
     )
     assert context.recent_messages[-1].content == "分析 618 活动表现"
+    assert context.exemplars == ({"excerpt": "anonymous"},)
+    assert exemplar_query["purpose"] == "goal_planner"
+    assert exemplar_query["tags"] == ["goal_planner:shadow"]
+    assert exemplar_query["user_id"] == user.id
 
 
 @pytest.mark.asyncio
