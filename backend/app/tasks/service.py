@@ -64,6 +64,7 @@ class TaskService:
         idempotency_payload_hash: str | None = None,
         goal_type: str = "kol_selection",
         goal_params: dict | None = None,
+        goal_specs: list[dict] | None = None,
     ) -> AnalysisTask:
         workspace_service = WorkspaceService(self.db)
         session = await workspace_service.get_owned_session(user_id, session_id, for_update=True)
@@ -137,21 +138,40 @@ class TaskService:
         # 阶段二单 Goal 包装：每条新任务（含重试任务）同事务落一条 goal。
         # 默认 kol_selection + 会话 brand/category 快照（None 省略）；
         # enforce 模式下由 planner 透传 goal_type/params（合并到快照之上）。
+        # 阶段四：goal_specs 列表按 sequence 建多行，depends_on_sequence 同批解析为 id。
         goal_snapshot = {
             key: value
             for key, value in {"brand": session.brand, "category": session.category}.items()
             if value is not None
         }
-        merged_goal_params = {**goal_snapshot, **goal_params} if goal_params else goal_snapshot
-        self.db.add(
-            TaskGoal(
+        if goal_specs is None:
+            merged_goal_params = (
+                {**goal_snapshot, **goal_params} if goal_params else goal_snapshot
+            )
+            goal_specs = [
+                {
+                    "goal_type": goal_type,
+                    "sequence": 1,
+                    "depends_on_sequence": None,
+                    "params": merged_goal_params,
+                }
+            ]
+        goal_id_by_sequence: dict[int, str] = {}
+        for spec in sorted(goal_specs, key=lambda item: int(item["sequence"])):
+            spec_params = spec.get("params") or {}
+            depends_on_sequence = spec.get("depends_on_sequence")
+            goal = TaskGoal(
                 id=str(uuid4()),
                 task_id=task.id,
-                sequence=1,
-                goal_type=goal_type,
+                sequence=int(spec["sequence"]),
+                goal_type=str(spec["goal_type"]),
                 status="pending",
-                depends_on_goal_id=None,
-                params_json=merged_goal_params,
+                depends_on_goal_id=(
+                    goal_id_by_sequence.get(int(depends_on_sequence))
+                    if depends_on_sequence is not None
+                    else None
+                ),
+                params_json={**goal_snapshot, **spec_params},
                 trajectory_json=None,
                 result_summary_json=None,
                 warning_code=None,
@@ -161,8 +181,9 @@ class TaskService:
                 created_at=now,
                 updated_at=now,
             )
-        )
-        await self.db.flush()
+            self.db.add(goal)
+            await self.db.flush()
+            goal_id_by_sequence[goal.sequence] = goal.id
         await self.repository.append_event(
             task.id,
             task.user_id,
@@ -193,6 +214,7 @@ class TaskService:
         *,
         goal_type: str = "kol_selection",
         goal_params: dict | None = None,
+        goal_specs: list[dict] | None = None,
     ) -> tuple[AnalysisTask, bool]:
         """Create once per user/session/key, atomically across processes."""
         key_hash = idempotency_key_digest(idempotency_key)
@@ -220,6 +242,7 @@ class TaskService:
                     idempotency_payload_hash=payload_hash,
                     goal_type=goal_type,
                     goal_params=goal_params,
+                    goal_specs=goal_specs,
                 )
         except IntegrityError:
             # Another process won the unique index race. The savepoint keeps
@@ -269,6 +292,9 @@ class TaskService:
         if active is not None and not can_retry_status(active.status):
             return active
         try:
+            # 复制源任务的 goal 结构（类型/顺序/依赖/params），不重新调 planner；
+            # 旧任务无 goals 时走默认单 kol_selection。
+            goal_specs = await self._goal_specs_of(source.id)
             return await self.create(
                 user_id,
                 source.session_id,
@@ -276,6 +302,7 @@ class TaskService:
                 trigger_message_id=message.id,
                 retry_of_task_id=source.id,
                 retry_key=retry_key,
+                goal_specs=goal_specs,
             )
         except IntegrityError:
             existing = await self.db.scalar(
@@ -284,6 +311,26 @@ class TaskService:
             if existing is None:
                 raise
             return existing
+
+    async def _goal_specs_of(self, task_id: str) -> list[dict] | None:
+        """源任务的 goal 结构转 goal_specs（依赖按 sequence 重建）；无 goals 返回 None。"""
+        goals = await self.repository.get_task_goals(task_id)
+        if not goals:
+            return None
+        sequence_by_id = {goal.id: goal.sequence for goal in goals}
+        return [
+            {
+                "goal_type": goal.goal_type,
+                "sequence": goal.sequence,
+                "depends_on_sequence": (
+                    sequence_by_id.get(goal.depends_on_goal_id)
+                    if goal.depends_on_goal_id
+                    else None
+                ),
+                "params": dict(goal.params_json or {}),
+            }
+            for goal in goals
+        ]
 
     async def cancel(self, user_id: str, task_id: str) -> AnalysisTask:
         task = await self.repository.get_owned(task_id, user_id)

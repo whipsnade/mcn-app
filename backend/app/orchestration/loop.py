@@ -197,6 +197,8 @@ class AgentLoopContext(BaseModel):
     # 进 user JSON，供模型感知品牌/活动/周期；legacy 任务保持默认 kol_selection。
     goal_type: str = "kol_selection"
     goal_params: dict[str, Any] = Field(default_factory=dict)
+    # 上游 goal 的结果摘要（阶段四软依赖）：result_summary_json 原样注入 user JSON。
+    dependency_summaries: tuple[dict[str, Any], ...] = ()
     # prompt 学习日志上下文（user_id/session_id/task_id/tags）；仅用于落库，
     # exclude=True 保证不进入发给模型的 prompt JSON。
     log_context: dict[str, Any] = Field(default_factory=dict, exclude=True)
@@ -221,7 +223,8 @@ class TrajectoryStep(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    id: str = Field(pattern=r"^step_[0-9]+$")
+    # v1 为 step_N；v2 带 goal 命名空间 g{sequence}_step_N。
+    id: str = Field(pattern=r"^(?:g[0-9]+_)?step_[0-9]+$")
     internal_tool_name: str = Field(min_length=1, max_length=128)
     arguments: dict[str, Any]
     evidence_goal: str = Field(default="", max_length=300)

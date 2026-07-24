@@ -198,6 +198,7 @@ async def create_task(
     service = TaskService(db)
     goal_type = "kol_selection"
     goal_params: dict | None = None
+    goal_specs: list[dict] | None = None
     if get_settings().goal_planner_enforce_enabled:
         # 带幂等键先查命中：命中不再调 planner（避免重复扣调用），
         # 仍走 create_idempotent 保留 payload 一致性校验。
@@ -219,23 +220,33 @@ async def create_task(
                 await db.commit()
                 return TaskOutcomeClarify(message=message_read(message))
             if planner_output is not None:
-                primary = next(
-                    (goal for goal in planner_output.goals if goal.sequence == 1),
-                    planner_output.goals[0],
-                )
-                if len(planner_output.goals) > 1:
-                    # 复合编排属阶段四：>1 个 goal 只执行 sequence=1，其余丢弃。
-                    logger.warning(
-                        "goal_planner_multi_goal_discarded session_id=%s goals=%d",
-                        session_id,
-                        len(planner_output.goals),
+                # 阶段四顺序编排：planner 输出的 1-3 个 goal 全部落库。
+                goal_specs = [
+                    {
+                        "goal_type": goal.goal_type,
+                        "sequence": goal.sequence,
+                        "depends_on_sequence": goal.depends_on_sequence,
+                        "params": goal.params.model_dump(mode="json", exclude_none=True),
+                    }
+                    for goal in sorted(
+                        planner_output.goals, key=lambda item: item.sequence
                     )
-                goal_type = primary.goal_type
-                goal_params = primary.params.model_dump(mode="json", exclude_none=True)
+                ]
+                if len(goal_specs) > 1:
+                    logger.info(
+                        "goal_planner_multi_goal session_id=%s goals=%d",
+                        session_id,
+                        len(goal_specs),
+                    )
     try:
         if idempotency_key is None:
             task = await service.create(
-                user.id, session_id, payload, goal_type=goal_type, goal_params=goal_params
+                user.id,
+                session_id,
+                payload,
+                goal_type=goal_type,
+                goal_params=goal_params,
+                goal_specs=goal_specs,
             )
             reused = False
         else:
@@ -246,6 +257,7 @@ async def create_task(
                 idempotency_key,
                 goal_type=goal_type,
                 goal_params=goal_params,
+                goal_specs=goal_specs,
             )
     except TaskConflictError as error:
         detail = (

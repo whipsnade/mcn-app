@@ -105,6 +105,19 @@ def test_goal_report_prompts_are_registered_and_structured() -> None:
         assert "目标 Schema" in text
 
 
+def test_goal_summary_prompt_is_registered_and_constrained() -> None:
+    from app.model.prompts import GOAL_SUMMARY_PROMPT
+
+    assert PROMPTS["goal_summary_v1"] is GOAL_SUMMARY_PROMPT
+    text = GOAL_SUMMARY_PROMPT.system
+    assert "不可信数据" in text
+    assert "只能使用传入" in text
+    assert "summary" in text and "highlights" in text
+    assert "brand_analysis" in text
+    assert "campaign_analysis" in text
+    assert "kol_selection" in text
+
+
 def test_prompts_do_not_contain_provider_endpoints_or_environment_values(monkeypatch) -> None:
     secret = "unit-test-secret-never-in-prompt"
     endpoint = "https://datatap.example.invalid/private"

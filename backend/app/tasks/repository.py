@@ -73,6 +73,18 @@ class TaskRepository:
             select(TaskGoal).where(TaskGoal.task_id == task_id, TaskGoal.sequence == 1)
         )
 
+    async def get_task_goals(self, task_id: str) -> list[TaskGoal]:
+        """任务的全部 Goal（按 sequence 排序；阶段四多 Goal 编排）。"""
+        return list(
+            (
+                await self.db.scalars(
+                    select(TaskGoal)
+                    .where(TaskGoal.task_id == task_id)
+                    .order_by(TaskGoal.sequence)
+                )
+            ).all()
+        )
+
     async def mark_goal_running(self, goal_id: str) -> bool:
         """goal 标记 running（落 started_at）；仅 pending → running，幂等。"""
         goal = await self.db.get(TaskGoal, goal_id)

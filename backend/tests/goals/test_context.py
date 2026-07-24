@@ -2,12 +2,23 @@ from contextlib import asynccontextmanager
 
 import pytest
 
+from app.artifacts.service import ArtifactService
 from app.goals.context import GoalPlannerContextBuilder
 from app.identity.brand_profiles import BrandProfileService
+from app.reporting.analysis_reports import AnalysisReportService
+from app.reporting.blocks import MetricGridBlock, MetricItem, ReportDocument
 from app.tasks.schemas import TaskCreate
 from app.tasks.service import TaskService
 from app.workspace.schemas import MessageCreate, SessionCreate
 from app.workspace.service import WorkspaceService
+
+
+def _document(title: str) -> ReportDocument:
+    return ReportDocument(
+        title=title,
+        conclusion="结论。",
+        blocks=[MetricGridBlock(items=[MetricItem(label="总声量", value=1200)])],
+    )
 
 
 @pytest.mark.asyncio
@@ -179,3 +190,81 @@ async def test_build_for_message_rejects_foreign_session(db_session, user_factor
         await GoalPlannerContextBuilder(borrowed_session).build_for_message(
             other.id, workspace.id, "越权消息"
         )
+
+
+@pytest.mark.asyncio
+async def test_context_injects_artifact_summaries(db_session, user_factory) -> None:
+    """artifact_summaries：每 module 最新 completed artifact 的紧凑投影；无产物为 ()。"""
+    user = await user_factory()
+    workspace = await WorkspaceService(db_session).create_session(
+        user.id,
+        SessionCreate(brand="喜茶", category="茶饮"),
+    )
+    artifacts = ArtifactService(db_session)
+    report = await AnalysisReportService(db_session).build_session_report(
+        user_id=user.id,
+        session_id=workspace.id,
+        document=_document("品牌分析v1"),
+        report_type="brand_analysis",
+        scope={"brand": "喜茶"},
+    )
+    await artifacts.register_artifact(
+        user_id=user.id,
+        session_id=workspace.id,
+        artifact_key="goal:g1:brand_report",
+        artifact_type="brand_report",
+        title="喜茶品牌声量分析",
+        version=1,
+        status="completed",
+        report_id=report.id,
+        scope={"brand": "喜茶"},
+    )
+    # failed artifact 不进入摘要。
+    await artifacts.register_artifact(
+        user_id=user.id,
+        session_id=workspace.id,
+        artifact_key="goal:g2:campaign_report",
+        artifact_type="campaign_report",
+        title="活动复盘报告",
+        version=1,
+        status="failed",
+        error_code="no_evidence_collected",
+    )
+
+    @asynccontextmanager
+    async def borrowed_session():
+        yield db_session
+
+    context = await GoalPlannerContextBuilder(borrowed_session).build_for_message(
+        user.id, workspace.id, "继续分析"
+    )
+
+    assert len(context.artifact_summaries) == 1
+    summary = context.artifact_summaries[0]
+    assert summary["module_key"] == "brand"
+    assert summary["artifact_type"] == "brand_report"
+    assert summary["title"] == "喜茶品牌声量分析"
+    assert summary["version"] == 1
+    assert summary["scope"] == {"brand": "喜茶"}
+    assert summary["created_at"]
+
+
+@pytest.mark.asyncio
+async def test_context_artifact_summaries_empty_without_artifacts(
+    db_session, user_factory
+) -> None:
+    user = await user_factory()
+    workspace = await WorkspaceService(db_session).create_session(
+        user.id,
+        SessionCreate(brand="喜茶", category="茶饮"),
+    )
+
+    @asynccontextmanager
+    async def borrowed_session():
+        yield db_session
+
+    context = await GoalPlannerContextBuilder(borrowed_session).build_for_message(
+        user.id, workspace.id, "继续分析"
+    )
+
+    assert context.artifact_summaries == ()

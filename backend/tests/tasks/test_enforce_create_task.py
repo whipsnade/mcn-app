@@ -153,7 +153,7 @@ async def test_enforce_execute_creates_typed_goal_with_params(
 
 
 @pytest.mark.asyncio
-async def test_enforce_multi_goal_keeps_only_first(
+async def test_enforce_multi_goal_persists_all_with_dependency(
     auth_client_factory, db_session, monkeypatch
 ) -> None:
     _enable_enforce(monkeypatch)
@@ -162,25 +162,46 @@ async def test_enforce_multi_goal_keeps_only_first(
         return GoalPlannerOutput(
             action="execute",
             goals=[
-                _spec(1, "brand_analysis", brand="海底捞"),
-                _spec(2, "campaign_analysis", brand="海底捞", campaign="618"),
+                _spec(1, "campaign_analysis", brand="海底捞", campaign="618大促"),
+                _spec(2, "kol_selection", brand="海底捞"),
             ],
         )
 
     monkeypatch.setattr(GoalPlannerService, "plan_context", fake_plan)
+    # planner 输出依赖：kol_selection 依赖 sequence=1（GoalSpec.depends_on_sequence）。
+    original_spec = _spec
+
+    async def fake_plan_with_dependency(self, context):
+        first = original_spec(1, "campaign_analysis", brand="海底捞", campaign="618大促")
+        second = original_spec(2, "kol_selection", brand="海底捞")
+        return GoalPlannerOutput(
+            action="execute",
+            goals=[first, second.model_copy(update={"depends_on_sequence": 1})],
+        )
+
+    monkeypatch.setattr(GoalPlannerService, "plan_context", fake_plan_with_dependency)
     client = await auth_client_factory("13400000083")
     session_id = await _create_session(client)
 
     response = await client.post(
-        f"/api/v1/sessions/{session_id}/tasks", json={"content": "分析品牌也看活动"}
+        f"/api/v1/sessions/{session_id}/tasks", json={"content": "复盘海底捞 618 并圈选达人"}
     )
 
     assert response.status_code == 202
     assert response.json()["outcome"] == "task"
-    goals = list((await db_session.scalars(select(TaskGoal))).all())
-    # 复合编排属阶段四：>1 个 goal 只建 sequence=1 的。
-    assert len(goals) == 1
-    assert goals[0].goal_type == "brand_analysis"
+    goals = list(
+        (
+            await db_session.scalars(select(TaskGoal).order_by(TaskGoal.sequence))
+        ).all()
+    )
+    # 阶段四顺序编排：planner 输出的 1-3 个 goal 全部落库，依赖解析为 id。
+    assert len(goals) == 2
+    assert goals[0].goal_type == "campaign_analysis"
+    assert goals[0].sequence == 1
+    assert goals[0].depends_on_goal_id is None
+    assert goals[1].goal_type == "kol_selection"
+    assert goals[1].sequence == 2
+    assert goals[1].depends_on_goal_id == goals[0].id
 
 
 @pytest.mark.asyncio
@@ -323,3 +344,84 @@ async def test_task_service_create_accepts_goal_overrides(db_session, user_facto
         "category": "美食",
         "campaign": "618大促",
     }
+
+
+@pytest.mark.asyncio
+async def test_task_service_create_persists_goal_specs_with_dependency(
+    db_session, user_factory
+) -> None:
+    """goal_specs 列表：按 sequence 建多行 TaskGoal，depends_on_sequence 解析为 id。"""
+    from app.tasks.schemas import TaskCreate
+    from app.tasks.service import TaskService
+
+    user = await user_factory()
+    now = datetime.now(UTC).replace(tzinfo=None)
+    session = WorkspaceSession(
+        id=str(uuid4()),
+        user_id=user.id,
+        title="多 goal 落库测试",
+        brand="海底捞",
+        campaign_name=None,
+        status="active",
+        platforms=["xiaohongshu"],
+        category="美食",
+        target_audience="",
+        budget_min=None,
+        budget_max=None,
+        filters_snapshot={},
+        is_starred=False,
+        last_accessed_at=now,
+        created_at=now,
+        updated_at=now,
+    )
+    db_session.add(session)
+    await db_session.flush()
+
+    task = await TaskService(db_session).create(
+        user.id,
+        session.id,
+        TaskCreate(content="复盘海底捞 618 并分析品牌再圈选达人"),
+        goal_specs=[
+            {
+                "goal_type": "campaign_analysis",
+                "sequence": 1,
+                "depends_on_sequence": None,
+                "params": {"brand": "海底捞", "campaign": "618大促"},
+            },
+            {
+                "goal_type": "kol_selection",
+                "sequence": 2,
+                "depends_on_sequence": 1,
+                "params": {"brand": "海底捞"},
+            },
+            {
+                "goal_type": "brand_analysis",
+                "sequence": 3,
+                "depends_on_sequence": None,
+                "params": {"brand": "海底捞"},
+            },
+        ],
+    )
+
+    goals = list(
+        (
+            await db_session.scalars(
+                select(TaskGoal)
+                .where(TaskGoal.task_id == task.id)
+                .order_by(TaskGoal.sequence)
+            )
+        ).all()
+    )
+    assert [goal.goal_type for goal in goals] == [
+        "campaign_analysis",
+        "kol_selection",
+        "brand_analysis",
+    ]
+    assert [goal.sequence for goal in goals] == [1, 2, 3]
+    assert goals[0].depends_on_goal_id is None
+    assert goals[1].depends_on_goal_id == goals[0].id
+    assert goals[2].depends_on_goal_id is None
+    # params 各自合并会话快照（category 来自会话）。
+    assert goals[0].params_json == {"brand": "海底捞", "category": "美食", "campaign": "618大促"}
+    assert goals[1].params_json == {"brand": "海底捞", "category": "美食"}
+    assert all(goal.status == "pending" for goal in goals)

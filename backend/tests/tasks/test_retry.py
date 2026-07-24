@@ -1,9 +1,13 @@
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+from uuid import uuid4
 
 import pytest
+from sqlalchemy import select
 
+from app.goals.models import TaskGoal
 from app.tasks import router as tasks_router
+from app.tasks.models import AnalysisTask
 from app.tasks.service import (
     can_retry_status,
     idempotency_key_digest,
@@ -12,6 +16,7 @@ from app.tasks.service import (
     TaskConflictError,
 )
 from app.tasks.state import TERMINAL_TASK_STATUSES, TaskStatus
+from app.workspace.models import Message, WorkspaceSession
 
 
 @pytest.mark.parametrize("status", tuple(TERMINAL_TASK_STATUSES))
@@ -159,3 +164,169 @@ async def test_create_task_returns_409_for_same_key_with_different_payload(monke
     assert error.value.status_code == 409
     assert error.value.detail == "幂等键对应的请求参数不一致"
     runner.submit.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# retry 复制 goal 结构（阶段四）
+# ---------------------------------------------------------------------------
+
+
+async def _seed_source_task(db_session, user_factory, goal_rows: list[dict]):
+    """造一个终态源任务 + 指定 goal 行，返回 (user_id, source_task, source_goals)。"""
+    from datetime import UTC, datetime
+
+    user = await user_factory()
+    now = datetime.now(UTC).replace(tzinfo=None)
+    session = WorkspaceSession(
+        id=str(uuid4()),
+        user_id=user.id,
+        title="retry goal 结构测试",
+        brand="海底捞",
+        campaign_name=None,
+        status="active",
+        platforms=["xiaohongshu"],
+        category="美食",
+        target_audience="",
+        budget_min=None,
+        budget_max=None,
+        filters_snapshot={},
+        is_starred=False,
+        last_accessed_at=now,
+        created_at=now,
+        updated_at=now,
+    )
+    db_session.add(session)
+    await db_session.flush()
+    message = Message(
+        id=str(uuid4()),
+        session_id=session.id,
+        user_id=user.id,
+        role="user",
+        content="复盘海底捞 618 并圈选达人",
+        sequence=1,
+        metadata_json={},
+        created_at=now,
+    )
+    db_session.add(message)
+    await db_session.flush()
+    task = AnalysisTask(
+        id=str(uuid4()),
+        user_id=user.id,
+        session_id=session.id,
+        trigger_message_id=message.id,
+        status="completed",
+        kind="agent",
+        max_calls=10,
+        estimated_points=0,
+        creation_order=1,
+        created_at=now,
+        updated_at=now,
+    )
+    db_session.add(task)
+    await db_session.flush()
+    goals: list[TaskGoal] = []
+    id_by_sequence: dict[int, str] = {}
+    for row in goal_rows:
+        goal = TaskGoal(
+            id=str(uuid4()),
+            task_id=task.id,
+            sequence=row["sequence"],
+            goal_type=row["goal_type"],
+            status="completed",
+            depends_on_goal_id=(
+                id_by_sequence.get(row["depends_on_sequence"])
+                if row.get("depends_on_sequence")
+                else None
+            ),
+            params_json=row["params"],
+            result_summary_json=None,
+            started_at=now,
+            completed_at=now,
+            created_at=now,
+            updated_at=now,
+        )
+        db_session.add(goal)
+        await db_session.flush()
+        id_by_sequence[goal.sequence] = goal.id
+        goals.append(goal)
+    return user.id, task, goals
+
+
+@pytest.mark.asyncio
+async def test_retry_multi_goal_task_copies_goal_structure(db_session, user_factory) -> None:
+    user_id, source_task, source_goals = await _seed_source_task(
+        db_session,
+        user_factory,
+        [
+            {
+                "sequence": 1,
+                "goal_type": "campaign_analysis",
+                "params": {"brand": "海底捞", "category": "美食", "campaign": "618大促"},
+            },
+            {
+                "sequence": 2,
+                "goal_type": "kol_selection",
+                "depends_on_sequence": 1,
+                "params": {"brand": "海底捞", "category": "美食"},
+            },
+        ],
+    )
+
+    retry = await TaskService(db_session).retry(user_id, source_task.id)
+
+    assert retry.id != source_task.id
+    new_goals = list(
+        (
+            await db_session.scalars(
+                select(TaskGoal)
+                .where(TaskGoal.task_id == retry.id)
+                .order_by(TaskGoal.sequence)
+            )
+        ).all()
+    )
+    assert [goal.goal_type for goal in new_goals] == ["campaign_analysis", "kol_selection"]
+    assert [goal.sequence for goal in new_goals] == [1, 2]
+    assert all(goal.status == "pending" for goal in new_goals)
+    assert {goal.id for goal in new_goals}.isdisjoint({goal.id for goal in source_goals})
+    assert new_goals[0].params_json == source_goals[0].params_json
+    assert new_goals[1].params_json == source_goals[1].params_json
+    # 依赖在新批内重新解析（不指向源任务的 goal）。
+    assert new_goals[0].depends_on_goal_id is None
+    assert new_goals[1].depends_on_goal_id == new_goals[0].id
+    assert new_goals[1].depends_on_goal_id != source_goals[0].id
+
+
+@pytest.mark.asyncio
+async def test_retry_brand_task_copies_goal_type(db_session, user_factory) -> None:
+    user_id, source_task, _ = await _seed_source_task(
+        db_session,
+        user_factory,
+        [
+            {
+                "sequence": 1,
+                "goal_type": "brand_analysis",
+                "params": {"brand": "海底捞", "category": "美食"},
+            },
+        ],
+    )
+
+    retry = await TaskService(db_session).retry(user_id, source_task.id)
+
+    goal = await db_session.scalar(select(TaskGoal).where(TaskGoal.task_id == retry.id))
+    assert goal is not None
+    assert goal.goal_type == "brand_analysis"
+    assert goal.status == "pending"
+    assert goal.params_json == {"brand": "海底捞", "category": "美食"}
+
+
+@pytest.mark.asyncio
+async def test_retry_legacy_task_without_goals_keeps_default(db_session, user_factory) -> None:
+    user_id, source_task, _ = await _seed_source_task(db_session, user_factory, [])
+
+    retry = await TaskService(db_session).retry(user_id, source_task.id)
+
+    goal = await db_session.scalar(select(TaskGoal).where(TaskGoal.task_id == retry.id))
+    assert goal is not None
+    assert goal.goal_type == "kol_selection"
+    assert goal.sequence == 1
+    assert goal.params_json == {"brand": "海底捞", "category": "美食"}

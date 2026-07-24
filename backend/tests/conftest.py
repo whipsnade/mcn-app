@@ -17,6 +17,8 @@ os.environ.setdefault("MYSQL_DATABASE", "kol_insight_test")
 os.environ.setdefault("MYSQL_USER", "kol_test")
 os.environ.setdefault("MYSQL_PASSWORD", "test-only-password")
 os.environ.setdefault("JWT_SECRET", "test-only-jwt-secret-at-least-32-characters")
+# 测试环境确定性：enforce 开关一律由用例显式控制，不受开发 .env 影响。
+os.environ.setdefault("GOAL_PLANNER_ENFORCE_ENABLED", "false")
 
 from app.db.session import engine  # noqa: E402
 from app.db.session import get_db  # noqa: E402

@@ -14,6 +14,28 @@ from app.tasks.models import AnalysisTask
 from app.workspace.models import Message, WorkspaceSession
 
 
+# artifact_type → planner 摘要模块键（与 artifacts/router 的模块映射一致）。
+_MODULE_KEY_BY_ARTIFACT_TYPE = {
+    "brand_report": "brand",
+    "campaign_report": "campaign",
+    "kol_report": "kol_analysis",
+    "kol_selection_set": "kol_selection",
+}
+_MODULE_ORDER = ("brand", "campaign", "kol_analysis", "kol_selection")
+
+
+def _compact_scope(scope: Any) -> dict[str, Any] | None:
+    """scope 紧凑投影：只保留短字段，防止 planner payload 膨胀。"""
+    if not isinstance(scope, dict):
+        return None
+    compact = {
+        key: scope[key]
+        for key in ("brand", "campaign", "period", "platforms")
+        if scope.get(key) is not None
+    }
+    return compact or None
+
+
 @dataclass(frozen=True)
 class GoalPlannerContext:
     user_id: str
@@ -87,8 +109,8 @@ class GoalPlannerContextBuilder:
         recent.append(
             PlannerMessage(role="user", content=message, sequence=tail_sequence)
         )
-        session_context, account_default_brand, exemplars = await self._session_parts(
-            db, user_id=user_id, workspace=workspace
+        session_context, account_default_brand, exemplars, artifact_summaries = (
+            await self._session_parts(db, user_id=user_id, workspace=workspace)
         )
         return GoalPlannerContext(
             user_id=user_id,
@@ -99,12 +121,12 @@ class GoalPlannerContextBuilder:
             recent_messages=tuple(recent),
             session_context=session_context,
             account_default_brand=account_default_brand,
-            artifact_summaries=(),
+            artifact_summaries=artifact_summaries,
             exemplars=exemplars,
         )
 
     async def _session_parts(self, db, *, user_id: str, workspace) -> tuple:
-        """session_context / account_default_brand / exemplars 公共组装。"""
+        """session_context / account_default_brand / exemplars / artifact_summaries 公共组装。"""
         profile = (workspace.filters_snapshot or {}).get("brainstorm_profile") or {}
         active_brand = workspace.brand or profile.get("brand") or None
         # 账户级默认品牌：来自 user_brand_profiles（品牌解析优先级最低档）。
@@ -128,7 +150,47 @@ class GoalPlannerContextBuilder:
             "target_audience": workspace.target_audience,
             "brainstorm_profile": profile,
         }
-        return session_context, account_default_brand, tuple(exemplars)
+        artifact_summaries = await self._artifact_summaries(db, workspace.id)
+        return session_context, account_default_brand, tuple(exemplars), artifact_summaries
+
+    async def _artifact_summaries(self, db, session_id: str) -> tuple[dict[str, Any], ...]:
+        """每 module 最新一条 completed artifact 的紧凑投影（设计 §6.1 planner 输入）。"""
+        # 延迟导入：artifacts.models 依赖 goals 包，模块级导入会循环。
+        from app.artifacts.models import TaskArtifact
+
+        rows = list(
+            (
+                await db.scalars(
+                    select(TaskArtifact)
+                    .where(
+                        TaskArtifact.session_id == session_id,
+                        TaskArtifact.status == "completed",
+                    )
+                    .order_by(TaskArtifact.version.desc(), TaskArtifact.created_at.desc())
+                )
+            ).all()
+        )
+        latest_by_module: dict[str, TaskArtifact] = {}
+        for row in rows:
+            module_key = _MODULE_KEY_BY_ARTIFACT_TYPE.get(row.artifact_type)
+            if module_key is not None and module_key not in latest_by_module:
+                latest_by_module[module_key] = row
+        summaries: list[dict[str, Any]] = []
+        for module_key in _MODULE_ORDER:
+            row = latest_by_module.get(module_key)
+            if row is None:
+                continue
+            summaries.append(
+                {
+                    "module_key": module_key,
+                    "artifact_type": row.artifact_type,
+                    "title": row.title[:80],
+                    "version": row.version,
+                    "scope": _compact_scope(row.scope_json),
+                    "created_at": row.created_at.isoformat(),
+                }
+            )
+        return tuple(summaries)
 
     async def _build(self, db, task_id: str) -> GoalPlannerContext:
         task = await db.get(AnalysisTask, task_id)
@@ -165,8 +227,8 @@ class GoalPlannerContextBuilder:
                 )
             ).all()
         )
-        session_context, account_default_brand, exemplars = await self._session_parts(
-            db, user_id=task.user_id, workspace=workspace
+        session_context, account_default_brand, exemplars, artifact_summaries = (
+            await self._session_parts(db, user_id=task.user_id, workspace=workspace)
         )
         return GoalPlannerContext(
             user_id=task.user_id,
@@ -176,6 +238,6 @@ class GoalPlannerContextBuilder:
             recent_messages=compress_messages(messages, max_chars=12_000),
             session_context=session_context,
             account_default_brand=account_default_brand,
-            artifact_summaries=(),
+            artifact_summaries=artifact_summaries,
             exemplars=exemplars,
         )

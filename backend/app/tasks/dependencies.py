@@ -18,6 +18,7 @@ from app.goals.context import GoalPlannerContextBuilder
 from app.goals.models import TaskGoal
 from app.goals.planner import GoalPlannerService
 from app.goals.policies import policy_for
+from app.goals.summary import build_goal_result_summary
 from app.artifacts.models import TaskArtifact
 from app.artifacts.service import ArtifactService, module_key_of
 from app.identity.models import User, UserChannelPermission
@@ -33,7 +34,11 @@ from app.orchestration.context import compress_messages
 from app.orchestration.loop import AgentDecision, AgentLoopContext
 from app.orchestration.routing import extract_requested_period
 from app.orchestration.schemas import PlannerTool
-from app.reporting.builders import run_brand_analysis, run_campaign_analysis
+from app.reporting.builders import (
+    collect_goal_evidence,
+    run_brand_analysis,
+    run_campaign_analysis,
+)
 from app.reporting.models import AnalysisReport
 from app.selection.analysis import run_kol_analysis
 from app.selection.contract import build_export_field_contract
@@ -50,6 +55,14 @@ from app.workspace.service import WorkspaceService
 
 
 logger = logging.getLogger(__name__)
+
+def _goal_evidence(trajectory_json: Any, goal_id: str) -> list[dict]:
+    """摘要证据：v2 轨迹按 goal_id 切片提取 settled results，v1 取全量。"""
+    if isinstance(trajectory_json, dict) and trajectory_json.get("schema") == "agent_trajectory_v2":
+        goal_slice = (trajectory_json.get("goals") or {}).get(goal_id) or {}
+        return collect_goal_evidence({"results": goal_slice.get("results") or []})
+    return collect_goal_evidence(trajectory_json)
+
 
 # goal_type → (artifact_type, 报告构建器, report.updated 事件 label, 失败占位标题)
 _ANALYSIS_GOAL_TABLE = {
@@ -127,6 +140,7 @@ class DatabaseTaskStore:
         return await self._write("release_expired_unknown", *args)
     async def append_event(self, *args: Any): return await self._write("append_event", *args)
     async def load_task_goal(self, *args: Any): return await self._read("get_task_goal", *args)
+    async def get_task_goals(self, *args: Any): return await self._read("get_task_goals", *args)
     async def mark_goal_running(self, *args: Any):
         return await self._write("mark_goal_running", *args)
 
@@ -150,9 +164,16 @@ class _PlanArguments:
             task = await db.get(AnalysisTask, task_id)
             if task is None or task.plan_json is None:
                 raise LookupError("task_plan_not_found")
-            for step in task.plan_json.get("steps", []):
-                if step.get("id") == plan_step_id:
-                    return step["arguments"]
+            if task.plan_json.get("schema") == "agent_trajectory_v2":
+                # v2：step id 含 goal 命名空间（g{S}_step_N），全量扫描各切片。
+                for goal_slice in (task.plan_json.get("goals") or {}).values():
+                    for step in goal_slice.get("steps", []):
+                        if step.get("id") == plan_step_id:
+                            return step["arguments"]
+            else:
+                for step in task.plan_json.get("steps", []):
+                    if step.get("id") == plan_step_id:
+                        return step["arguments"]
         raise LookupError("task_plan_step_not_found")
 
 
@@ -236,29 +257,36 @@ class _TaskArtifacts:
             logger.warning("auto_kol_analysis_failed task_id=%s", task_id, exc_info=True)
 
     async def finalize_goal(
-        self, task_id: str, *, terminal_status: str, error_code: str | None = None
+        self,
+        task_id: str,
+        *,
+        goal_id: str,
+        terminal_status: str,
+        error_code: str | None = None,
+        warning_code: str | None = None,
     ) -> None:
         """goal 收尾：set 完成 + Artifact 登记 + goal 终态与事件（尽力而为，绝不阻塞终态）。
 
         独立短事务；任何异常只记 warning。Artifact 按 artifact_key 幂等 upsert，
         恢复重放不重复建行、不重复发 artifact.updated。成功类终态
         （completed/completed_with_warnings/insufficient_balance）发
-        goal.completed，failed/skipped 发 goal.failed。
+        goal.completed，failed/skipped 发 goal.failed。成功收尾时生成结果摘要
+        落 goal.result_summary_json（阶段四软依赖注入下游）。
         """
         try:
             async with SessionFactory.begin() as db:
                 task = await db.get(AnalysisTask, task_id)
                 if task is None:
                     return
-                goal = await TaskRepository(db).get_task_goal(task.id)
-                if goal is None:
+                goal = await db.get(TaskGoal, goal_id)
+                if goal is None or goal.task_id != task.id:
                     return
                 now = datetime.now(UTC).replace(tzinfo=None)
                 # 轨迹镜像 task.plan_json（agent_trajectory_v1）。
                 goal.trajectory_json = task.plan_json
                 artifact_service = ArtifactService(db)
                 status_override: str | None = None
-                warning_code: str | None = None
+                analysis_warning: str | None = None
                 if goal.goal_type == "kol_selection":
                     selection_set = await db.scalar(
                         select(KolSelectionSet)
@@ -307,14 +335,23 @@ class _TaskArtifacts:
                 elif goal.goal_type in {"brand_analysis", "campaign_analysis"} and (
                     terminal_status in {"completed", "completed_with_warnings"}
                 ):
-                    status_override, warning_code = await self._finalize_analysis_goal(
+                    status_override, analysis_warning = await self._finalize_analysis_goal(
                         db, artifact_service, task=task, goal=goal
                     )
                 goal.status = status_override or terminal_status
-                goal.warning_code = warning_code
+                goal.warning_code = warning_code or analysis_warning
                 goal.error_code = error_code
                 goal.completed_at = now
                 goal.updated_at = now
+                if goal.status in {"completed", "completed_with_warnings"}:
+                    # 成功收尾：生成结果摘要（模型失败回退代码摘要，绝不阻塞编排）。
+                    params = goal.params_json if isinstance(goal.params_json, dict) else None
+                    goal.result_summary_json = await build_goal_result_summary(
+                        self._model,
+                        goal_type=goal.goal_type,
+                        scope=params,
+                        evidence=_goal_evidence(goal.trajectory_json, goal.id),
+                    )
                 event_type = (
                     TaskEventType.GOAL_FAILED
                     if goal.status in {"failed", "skipped"}

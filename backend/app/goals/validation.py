@@ -121,15 +121,26 @@ def validate_goal_plan(
     sequences = [goal.sequence for goal in output.goals]
     if sequences != list(range(1, len(output.goals) + 1)):
         raise GoalPlanSemanticError("goal_sequence_invalid")
+    # 依赖组合白名单（先于类型去重判定）：只有 kol_selection 允许有依赖，
+    # 且被依赖方必须是 brand_analysis 或 campaign_analysis。
+    type_by_sequence = {goal.sequence: goal.goal_type for goal in output.goals}
+    for goal in output.goals:
+        dependency = goal.depends_on_sequence
+        if dependency is None:
+            continue
+        if dependency >= goal.sequence:
+            raise GoalPlanSemanticError("dependency_must_precede_goal")
+        if goal.goal_type != "kol_selection" or type_by_sequence.get(dependency) not in {
+            "brand_analysis",
+            "campaign_analysis",
+        }:
+            raise GoalPlanSemanticError("dependency_combination_not_allowed")
     goal_types = [goal.goal_type for goal in output.goals]
     if len(goal_types) != len(set(goal_types)):
         raise GoalPlanSemanticError("duplicate_goal_type")
 
     message_text = _normalized_text(current_message)
     for goal in output.goals:
-        dependency = goal.depends_on_sequence
-        if dependency is not None and dependency >= goal.sequence:
-            raise GoalPlanSemanticError("dependency_must_precede_goal")
         if goal.goal_type == "brand_analysis" and not _nonblank(goal.params.brand):
             raise GoalPlanSemanticError("brand_scope_required")
         if goal.goal_type == "campaign_analysis" and (

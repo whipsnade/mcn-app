@@ -298,6 +298,7 @@ class _FakeArtifacts:
     def __init__(self, store: _FakeStore | None = None) -> None:
         self.calls: list[str] = []
         self.finalized: list[tuple[str, str | None, str | None]] = []
+        self.finalized_goal_ids: list[str] = []
         self._store = store
 
     async def write_conclusion_message(self, task_id, conclusion):
@@ -306,11 +307,14 @@ class _FakeArtifacts:
     async def auto_kol_analysis(self, task_id):
         self.calls.append("auto_analysis")
 
-    async def finalize_goal(self, task_id, *, terminal_status, error_code=None):
+    async def finalize_goal(
+        self, task_id, *, goal_id, terminal_status, error_code=None, warning_code=None
+    ):
         # 记录调用时的任务终态，断言 goal 收尾先于任务终态。
         self.finalized.append(
             (terminal_status, error_code, self._store.terminal if self._store else None)
         )
+        self.finalized_goal_ids.append(goal_id)
 
 
 class _FakeSelection:
@@ -632,13 +636,16 @@ async def test_finalize_brand_goal_builds_report_and_artifacts() -> None:
     try:
         artifacts = _TaskArtifacts(worker_id, model=_FakeAnalysisModel(_document()))
 
-        await artifacts.finalize_goal(ids["task_id"], terminal_status="completed")
+        await artifacts.finalize_goal(ids["task_id"], goal_id=ids["goal_id"], terminal_status="completed")
 
         async with SessionFactory() as db:
             goal = await db.get(TaskGoal, ids["goal_id"])
             assert goal is not None
             assert goal.status == "completed"
             assert goal.warning_code is None
+            # 成功收尾：结果摘要落库（假模型输出与 GoalResultSummary 不符 → 回退代码摘要）。
+            assert goal.result_summary_json is not None
+            assert "summary" in goal.result_summary_json
 
             report = await db.scalar(
                 select(AnalysisReport).where(AnalysisReport.session_id == ids["session_id"])
@@ -701,7 +708,7 @@ async def test_finalize_campaign_goal_report_failure_degrades_to_warnings() -> N
         # 模型输出校验失败：报告生成失败 → goal 降级 + failed artifact，不删证据。
         artifacts = _TaskArtifacts(worker_id, model=_FakeAnalysisModel(None))
 
-        await artifacts.finalize_goal(ids["task_id"], terminal_status="completed")
+        await artifacts.finalize_goal(ids["task_id"], goal_id=ids["goal_id"], terminal_status="completed")
 
         async with SessionFactory() as db:
             goal = await db.get(TaskGoal, ids["goal_id"])
@@ -759,7 +766,7 @@ async def test_finalize_brand_goal_empty_evidence_marks_failed_artifact() -> Non
     try:
         artifacts = _TaskArtifacts(worker_id, model=_FakeAnalysisModel(_document()))
 
-        await artifacts.finalize_goal(ids["task_id"], terminal_status="completed")
+        await artifacts.finalize_goal(ids["task_id"], goal_id=ids["goal_id"], terminal_status="completed")
 
         async with SessionFactory() as db:
             goal = await db.get(TaskGoal, ids["goal_id"])
@@ -826,7 +833,7 @@ async def test_finalize_goal_completes_set_and_registers_artifacts() -> None:
         set_id, report_id = await _seed_set_and_report(ids)
         artifacts = _TaskArtifacts(worker_id, model=None)
 
-        await artifacts.finalize_goal(ids["task_id"], terminal_status="completed")
+        await artifacts.finalize_goal(ids["task_id"], goal_id=ids["goal_id"], terminal_status="completed")
 
         async with SessionFactory() as db:
             goal = await db.get(TaskGoal, ids["goal_id"])
@@ -912,9 +919,9 @@ async def test_finalize_goal_replay_does_not_duplicate_artifacts() -> None:
         await _seed_set_and_report(ids)
         artifacts = _TaskArtifacts(worker_id, model=None)
 
-        await artifacts.finalize_goal(ids["task_id"], terminal_status="completed")
+        await artifacts.finalize_goal(ids["task_id"], goal_id=ids["goal_id"], terminal_status="completed")
         # 崩溃恢复重放收尾段：artifact_key 幂等，不重复建行、不重复发事件。
-        await artifacts.finalize_goal(ids["task_id"], terminal_status="completed")
+        await artifacts.finalize_goal(ids["task_id"], goal_id=ids["goal_id"], terminal_status="completed")
 
         async with SessionFactory() as db:
             total = await db.scalar(
@@ -944,7 +951,7 @@ async def test_finalize_goal_insufficient_balance_keeps_artifacts() -> None:
         await _seed_set_and_report(ids)
         artifacts = _TaskArtifacts(worker_id, model=None)
 
-        await artifacts.finalize_goal(ids["task_id"], terminal_status="insufficient_balance")
+        await artifacts.finalize_goal(ids["task_id"], goal_id=ids["goal_id"], terminal_status="insufficient_balance")
 
         async with SessionFactory() as db:
             goal = await db.get(TaskGoal, ids["goal_id"])
@@ -977,7 +984,10 @@ async def test_finalize_goal_failed_emits_goal_failed() -> None:
         artifacts = _TaskArtifacts(worker_id, model=None)
 
         await artifacts.finalize_goal(
-            ids["task_id"], terminal_status="failed", error_code="no_evidence_collected"
+            ids["task_id"],
+            goal_id=ids["goal_id"],
+            terminal_status="failed",
+            error_code="no_evidence_collected",
         )
 
         async with SessionFactory() as db:

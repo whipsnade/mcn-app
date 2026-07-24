@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from typing import Any, Protocol
 from uuid import NAMESPACE_URL, uuid5
 
@@ -13,6 +14,7 @@ from app.mcp_gateway.service import ExecuteMcpCall
 from app.model.contracts import ModelAdapterError
 from app.orchestration.loop import (
     AgentLoopContext,
+    AgentTrajectory,
     EvidenceNote,
     TrajectoryStep,
     resolve_agent_call,
@@ -118,6 +120,40 @@ logger = logging.getLogger(__name__)
 _MAX_EMPTY_CALLS_PER_TOOL = 2
 _MAX_THROTTLE_STREAK = 3
 
+# 终态 goal（恢复时跳过）：与 dependencies.finalize_goal 的落库值一致。
+_TERMINAL_GOAL_STATUSES = frozenset(
+    {"completed", "completed_with_warnings", "failed", "skipped", "insufficient_balance"}
+)
+
+# goal 终态聚合中的「成功类」集合。
+_SUCCESS_GOAL_STATUSES = frozenset({"completed", "completed_with_warnings"})
+
+
+@dataclass
+class GoalOutcome:
+    """单个 goal 循环的终局信息（多 Goal 编排按此决定收尾动作）。"""
+
+    finish_conclusion: str = ""
+    has_settled: bool = False
+    has_failures: bool = False
+    balance_exhausted: bool = False
+    cancelled: bool = False
+    interrupted: bool = False
+    lease_write_failed: bool = False
+
+
+def _v2_plan_json(slices: dict[str, AgentTrajectory]) -> dict[str, Any]:
+    """轨迹 v2 落库形状：{"schema": "agent_trajectory_v2", "goals": {goal_id: 切片}}。"""
+    return {
+        "schema": "agent_trajectory_v2",
+        "goals": {
+            goal_id: trajectory.model_dump(
+                mode="json", by_alias=True, include={"steps", "results"}
+            )
+            for goal_id, trajectory in slices.items()
+        },
+    }
+
 
 def _is_empty_summary(summary: Any) -> bool:
     """空值判定：None、空 dict/list，或 JSON 编码后为 null/{}/[] 的字符串。"""
@@ -197,6 +233,8 @@ class TaskExecutor:
         if self.heartbeat_seconds <= 0 or self.heartbeat_seconds >= lease_seconds:
             raise ValueError("heartbeat_seconds_must_be_less_than_lease_seconds")
         self.checkpoint = checkpoint
+        # 多 Goal 编排中当前执行的 goal（通用异常路径按 goal_id 标 failed）。
+        self._active_goal: Any | None = None
 
     async def _load_goal(self, task: Any) -> Any | None:
         """加载任务的 kol_selection 单 Goal；旧任务/未接线存储返回 None（legacy 分支）。"""
@@ -230,6 +268,7 @@ class TaskExecutor:
         goal: Any | None,
         terminal_status: str,
         error_code: str | None = None,
+        warning_code: str | None = None,
     ) -> None:
         if goal is None:
             return
@@ -237,7 +276,13 @@ class TaskExecutor:
         if finalize is None:
             return
         try:
-            await finalize(task_id, terminal_status=terminal_status, error_code=error_code)
+            await finalize(
+                task_id,
+                goal_id=goal.id,
+                terminal_status=terminal_status,
+                error_code=error_code,
+                warning_code=warning_code,
+            )
         except Exception:
             logger.warning("goal_finalize_failed task_id=%s", task_id, exc_info=True)
 
@@ -283,7 +328,7 @@ class TaskExecutor:
                 type(error).__name__,
                 code,
             )
-            goal = await self._load_goal(task)
+            goal = self._active_goal or await self._load_goal(task)
             await self._finalize_goal(task.id, goal, "failed", error_code=code)
             await self.repository.mark_failed(task.id, self.worker_id, code)
         finally:
@@ -297,11 +342,28 @@ class TaskExecutor:
 
         循环没有调用次数上限：退出条件只有模型 finish、取消、积分余额不足
         或异常。仅在旧任务终态已持久化时返回 True；租约写入失败早退返回 False。
+        多 Goal（≥2）走 v2 顺序编排；单 Goal/无 Goal 走 v1 单循环（行为与现状一致）。
         """
         build_agent_context = getattr(self.context_builder, "build_agent_context", None)
         decide = getattr(self.planner, "agent_decide", None)
         if build_agent_context is None or decide is None:
             raise PlanValidationError("AGENT_RUNTIME_UNAVAILABLE")
+        goals_loader = getattr(self.repository, "get_task_goals", None)
+        goals: list[Any] = []
+        if goals_loader is not None:
+            try:
+                goals = list(await goals_loader(task.id))
+            except Exception:
+                logger.warning("task_goals_load_failed task_id=%s", task.id, exc_info=True)
+                goals = []
+        if len(goals) >= 2:
+            return await self._orchestrate_goals(
+                task, goals, goals_loader, build_agent_context, decide
+            )
+        return await self._run_single_goal_loop(task, build_agent_context, decide)
+
+    async def _run_single_goal_loop(self, task: Any, build_agent_context, decide) -> bool:
+        """v1 单 Goal 循环（阶段二/三行为；多 Goal 之外的唯一路径）。"""
         # 阶段二单 Goal 包装：加载任务的 goal（旧任务/恢复无 goal 时 goal_id
         # 保持 None，行为与现状完全一致，不发 goal 事件、不写新表）。
         goal = await self._load_goal(task)
@@ -340,15 +402,264 @@ class TaskExecutor:
                 task.id, self.worker_id, trajectory.as_plan_json()
             ):
                 return False
+
+        async def persist() -> bool:
+            return await self.repository.save_trajectory(
+                task.id, self.worker_id, trajectory.as_plan_json()
+            )
+
+        self._active_goal = goal
+        outcome = await self._run_goal_loop(
+            task,
+            context=context,
+            decide=decide,
+            trajectory=trajectory,
+            policy=policy,
+            goal_id=goal_id,
+            set_title=set_title,
+            set_scope=set_scope,
+            step_prefix="step",
+            persist=persist,
+        )
+        self._active_goal = None
+        if outcome.cancelled:
+            await self._finalize_goal(task.id, goal, "skipped")
+            return await self.repository.mark_cancelled(task.id, self.worker_id)
+        if outcome.lease_write_failed:
+            return False
+        if outcome.interrupted:
+            await self.repository.mark_interrupted(task.id, self.worker_id)
+            # interrupted 可被恢复任务重新领取，不是允许影子规划的终态。
+            return False
+        if outcome.balance_exhausted:
+            # 余额不足：已采集的 settled 证据仍写结论消息，再进入
+            # insufficient_balance 终态；无任何证据则直接收尾。
+            if outcome.has_settled and self.artifacts is not None:
+                await self.artifacts.write_conclusion_message(task.id, outcome.finish_conclusion)
+                await self.artifacts.auto_kol_analysis(task.id)
+            await self._finalize_goal(task.id, goal, "insufficient_balance")
+            return await self.repository.mark_insufficient_balance(task.id, self.worker_id)
+        if not outcome.has_settled:
+            # 门禁拆除后模型首轮即可 finish，此时可能从未发起过 MCP 调用，
+            # 错误码只描述事实：没有采集到任何证据。
+            await self._finalize_goal(
+                task.id, goal, "failed", error_code="no_evidence_collected"
+            )
+            return await self.repository.mark_failed(
+                task.id,
+                self.worker_id,
+                "no_evidence_collected",
+            )
+        if self.artifacts is not None:
+            await self.artifacts.write_conclusion_message(task.id, outcome.finish_conclusion)
+            # 结论消息之后、终态标记之前触发自动 KOL 分析：report.updated
+            # 事件先于任务终态事件发出（SSE 流尚未关闭）。
+            await self.artifacts.auto_kol_analysis(task.id)
+        if outcome.has_failures:
+            await self._finalize_goal(task.id, goal, "completed_with_warnings")
+            terminal_persisted = await self.repository.mark_completed_with_warnings(
+                task.id,
+                self.worker_id,
+                "mcp_partial_failure",
+                "部分社媒渠道查询失败，结论已基于可用数据生成。",
+            )
+        else:
+            await self._finalize_goal(task.id, goal, "completed")
+            terminal_persisted = await self.repository.mark_completed(task.id, self.worker_id)
+        if terminal_persisted:
+            await self._finish_followups(task.id)
+        return terminal_persisted
+
+    async def _orchestrate_goals(
+        self, task: Any, goals: list[Any], goals_loader, build_agent_context, decide
+    ) -> bool:
+        """多 Goal 顺序编排（轨迹 v2，绝不并发）：按 sequence 逐个执行，终态跳过。"""
+        slices: dict[str, AgentTrajectory] = {}
+        plan_json = getattr(task, "plan_json", None)
+        if isinstance(plan_json, dict) and plan_json.get("schema") == "agent_trajectory_v2":
+            for goal_id, goal_slice in (plan_json.get("goals") or {}).items():
+                slices[goal_id] = AgentTrajectory.model_validate(goal_slice)
+
+        async def persist() -> bool:
+            return await self.repository.save_trajectory(
+                task.id, self.worker_id, _v2_plan_json(slices)
+            )
+
+        if getattr(task, "plan_json", None) is None:
+            # First run: emit plan.ready once so clients leave the planning phase.
+            if not await self.repository.save_plan(
+                task.id, self.worker_id, _v2_plan_json(slices)
+            ):
+                return False
+        for goal in goals:
+            if goal.status in _TERMINAL_GOAL_STATUSES:
+                continue
+            params = goal.params_json if isinstance(goal.params_json, dict) else {}
+            # 软依赖组装：上游成功注入摘要；上游失败记 dependency_missing（仍执行）；
+            # 下游 kol 缺 brand 且上游非成功 → skipped 不执行。
+            dependency_summaries: list[dict] = []
+            dependency_failed = False
+            upstream_id = getattr(goal, "depends_on_goal_id", None)
+            if upstream_id:
+                upstream = next((item for item in goals if item.id == upstream_id), None)
+                upstream_status = getattr(upstream, "status", None)
+                if upstream_status in _SUCCESS_GOAL_STATUSES:
+                    summary = getattr(upstream, "result_summary_json", None)
+                    if isinstance(summary, dict) and summary:
+                        dependency_summaries.append(
+                            {"goal_type": upstream.goal_type, **summary}
+                        )
+                else:
+                    dependency_failed = True
+            if (
+                dependency_failed
+                and goal.goal_type == "kol_selection"
+                and not str(params.get("brand") or "").strip()
+            ):
+                await self._finalize_goal(
+                    task.id, goal, "skipped", error_code="dependency_missing_brand"
+                )
+                goal.status = "skipped"
+                continue
+            set_title = "默认名单"
+            set_scope: dict | None = None
+            if params:
+                set_scope = params
+                brand = params.get("brand")
+                if isinstance(brand, str) and brand.strip():
+                    set_title = f"{brand.strip()}圈选名单"
+            await self._start_goal(task, goal)
+            policy = policy_for(getattr(goal, "goal_type", None) or "kol_selection")
+            context = await build_agent_context(
+                task.user_id,
+                task.session_id,
+                goal_type=goal.goal_type,
+                goal_params=params or None,
+            )
+            if dependency_summaries:
+                context = context.model_copy(
+                    update={"dependency_summaries": tuple(dependency_summaries)}
+                )
+            trajectory = slices.setdefault(goal.id, AgentTrajectory())
+            self._active_goal = goal
+            outcome = await self._run_goal_loop(
+                task,
+                context=context,
+                decide=decide,
+                trajectory=trajectory,
+                policy=policy,
+                goal_id=goal.id,
+                set_title=set_title,
+                set_scope=set_scope,
+                step_prefix=f"g{goal.sequence}_step",
+                persist=persist,
+            )
+            self._active_goal = None
+            if outcome.cancelled:
+                await self._finalize_goal(task.id, goal, "skipped")
+                goal.status = "skipped"
+                # 取消：当前 goal 与全部 pending goal 标 skipped。
+                for pending_goal in goals:
+                    if pending_goal.status == "pending":
+                        await self._finalize_goal(task.id, pending_goal, "skipped")
+                        pending_goal.status = "skipped"
+                return await self.repository.mark_cancelled(task.id, self.worker_id)
+            if outcome.lease_write_failed:
+                return False
+            if outcome.interrupted:
+                await self.repository.mark_interrupted(task.id, self.worker_id)
+                # interrupted 可被恢复任务重新领取，不是允许影子规划的终态。
+                return False
+            if outcome.balance_exhausted:
+                # 余额不足：已采集的 settled 证据仍写结论消息；后续 goal 保持 pending。
+                if outcome.has_settled and self.artifacts is not None:
+                    await self.artifacts.write_conclusion_message(
+                        task.id, outcome.finish_conclusion
+                    )
+                    if policy.ingest_enabled:
+                        await self.artifacts.auto_kol_analysis(task.id)
+                await self._finalize_goal(task.id, goal, "insufficient_balance")
+                goal.status = "insufficient_balance"
+                return await self.repository.mark_insufficient_balance(
+                    task.id, self.worker_id
+                )
+            if not outcome.has_settled:
+                # 门禁拆除后模型首轮即可 finish，此时可能从未发起过 MCP 调用，
+                # 错误码只描述事实：没有采集到任何证据。
+                await self._finalize_goal(
+                    task.id, goal, "failed", error_code="no_evidence_collected"
+                )
+                goal.status = "failed"
+                continue
+            if self.artifacts is not None:
+                await self.artifacts.write_conclusion_message(
+                    task.id, outcome.finish_conclusion
+                )
+                if policy.ingest_enabled:
+                    await self.artifacts.auto_kol_analysis(task.id)
+            terminal = "completed_with_warnings" if outcome.has_failures else "completed"
+            await self._finalize_goal(
+                task.id,
+                goal,
+                terminal,
+                warning_code="dependency_missing" if dependency_failed else None,
+            )
+            goal.status = terminal
+            # 刷新状态与结果摘要（finalize 在独立事务落库），供下游软依赖注入。
+            try:
+                fresh_goals = await goals_loader(task.id)
+                fresh_by_id = {item.id: item for item in fresh_goals}
+                for current in goals:
+                    newer = fresh_by_id.get(current.id)
+                    if newer is not None:
+                        current.status = newer.status
+                        current.result_summary_json = newer.result_summary_json
+            except Exception:
+                logger.warning(
+                    "task_goals_refresh_failed task_id=%s", task.id, exc_info=True
+                )
+        # 任务终态聚合：全 completed → completed；全 failed → failed；其余 → warnings。
+        statuses = [goal.status for goal in goals]
+        if all(status == "completed" for status in statuses):
+            terminal_persisted = await self.repository.mark_completed(task.id, self.worker_id)
+        elif all(status == "failed" for status in statuses):
+            terminal_persisted = await self.repository.mark_failed(
+                task.id, self.worker_id, "all_goals_failed"
+            )
+        else:
+            terminal_persisted = await self.repository.mark_completed_with_warnings(
+                task.id,
+                self.worker_id,
+                "goals_partial_failure",
+                "部分分析目标未达成，结论已基于可用数据生成。",
+            )
+        if terminal_persisted:
+            await self._finish_followups(task.id)
+        return terminal_persisted
+
+    async def _run_goal_loop(
+        self,
+        task: Any,
+        *,
+        context: AgentLoopContext,
+        decide,
+        trajectory: AgentTrajectory,
+        policy,
+        goal_id: str | None,
+        set_title: str,
+        set_scope: dict | None,
+        step_prefix: str,
+        persist,
+    ) -> GoalOutcome:
+        """单 goal 的迭代轮次循环（v1/v2 共用；轨迹与 step 命名由调用方参数化）。"""
+        outcome = GoalOutcome()
         feedback: list[EvidenceNote] = []
         invalid_streak = 0
         throttle_streak = 0
-        balance_exhausted = False
-        finish_conclusion = ""
         while True:
             if await self.repository.cancel_requested(task.id):
-                await self._finalize_goal(task.id, goal, "skipped")
-                return await self.repository.mark_cancelled(task.id, self.worker_id)
+                outcome.cancelled = True
+                return outcome
             # A persisted step without a result is replayed with its original
             # arguments (crash between prepare and finalize); only when no
             # pending step exists do we ask the model for the next move.
@@ -366,7 +677,7 @@ class TaskExecutor:
                 )
                 decision = await decide(round_context)
                 if decision.action == "finish":
-                    finish_conclusion = decision.conclusion
+                    outcome.finish_conclusion = decision.conclusion
                     break
                 # 工具/渠道校验、参数归一化（平台别名、默认三个月时间窗回填、
                 # 时间窗钳制、keyword 必填 name）与 Schema 校验一次完成；
@@ -419,7 +730,7 @@ class TaskExecutor:
                     continue
                 throttle_streak = 0
                 pending = TrajectoryStep(
-                    id=f"step_{len(trajectory.results) + 1}",
+                    id=f"{step_prefix}_{len(trajectory.results) + 1}",
                     internal_tool_name=decision.internal_tool_name or "",
                     arguments=normalized_arguments,
                     evidence_goal=decision.evidence_goal,
@@ -427,10 +738,9 @@ class TaskExecutor:
                 trajectory.steps.append(pending)
                 # Persist BEFORE invoking so the gateway's arguments_loader can
                 # reload byte-identical arguments after a crash.
-                if not await self.repository.save_trajectory(
-                    task.id, self.worker_id, trajectory.as_plan_json()
-                ):
-                    return False
+                if not await persist():
+                    outcome.lease_write_failed = True
+                    return outcome
             step_index = len(trajectory.results) + 1
             await self.repository.append_event(
                 task.id,
@@ -460,7 +770,7 @@ class TaskExecutor:
             except InsufficientPointsError:
                 # 余额不足以再发起一次调用（预留阶段抛出，未产生计费）：
                 # 停止循环，按余额不足收尾。
-                balance_exhausted = True
+                outcome.balance_exhausted = True
                 break
             row = rows[0] if rows else None
             row_status = getattr(row, "status", None)
@@ -494,9 +804,8 @@ class TaskExecutor:
             if row_status in {"unknown", "planned", "reserved", "running", "succeeded"}:
                 # Possibly-sent calls are never replayed in this run; recovery
                 # reconciles them later.
-                await self.repository.mark_interrupted(task.id, self.worker_id)
-                # interrupted 可被恢复任务重新领取，不是允许影子规划的终态。
-                return False
+                outcome.interrupted = True
+                return outcome
             if row_status == "settled":
                 structured_content = (getattr(row, "evidence_json", None) or {}).get(
                     "structured_content"
@@ -545,50 +854,12 @@ class TaskExecutor:
                         summary=note_summary,
                     )
                 )
-            if not await self.repository.save_trajectory(
-                task.id, self.worker_id, trajectory.as_plan_json()
-            ):
-                return False
-        has_settled = any(note.status == "settled" for note in trajectory.results)
-        has_failures = any(note.status == "failed" for note in trajectory.results)
-        if balance_exhausted:
-            # 余额不足：已采集的 settled 证据仍写结论消息，再进入
-            # insufficient_balance 终态；无任何证据则直接收尾。
-            if has_settled and self.artifacts is not None:
-                await self.artifacts.write_conclusion_message(task.id, finish_conclusion)
-                await self.artifacts.auto_kol_analysis(task.id)
-            await self._finalize_goal(task.id, goal, "insufficient_balance")
-            return await self.repository.mark_insufficient_balance(task.id, self.worker_id)
-        if not has_settled:
-            # 门禁拆除后模型首轮即可 finish，此时可能从未发起过 MCP 调用，
-            # 错误码只描述事实：没有采集到任何证据。
-            await self._finalize_goal(
-                task.id, goal, "failed", error_code="no_evidence_collected"
-            )
-            return await self.repository.mark_failed(
-                task.id,
-                self.worker_id,
-                "no_evidence_collected",
-            )
-        if self.artifacts is not None:
-            await self.artifacts.write_conclusion_message(task.id, finish_conclusion)
-            # 结论消息之后、终态标记之前触发自动 KOL 分析：report.updated
-            # 事件先于任务终态事件发出（SSE 流尚未关闭）。
-            await self.artifacts.auto_kol_analysis(task.id)
-        if has_failures:
-            await self._finalize_goal(task.id, goal, "completed_with_warnings")
-            terminal_persisted = await self.repository.mark_completed_with_warnings(
-                task.id,
-                self.worker_id,
-                "mcp_partial_failure",
-                "部分社媒渠道查询失败，结论已基于可用数据生成。",
-            )
-        else:
-            await self._finalize_goal(task.id, goal, "completed")
-            terminal_persisted = await self.repository.mark_completed(task.id, self.worker_id)
-        if terminal_persisted:
-            await self._finish_followups(task.id)
-        return terminal_persisted
+            if not await persist():
+                outcome.lease_write_failed = True
+                return outcome
+        outcome.has_settled = any(note.status == "settled" for note in trajectory.results)
+        outcome.has_failures = any(note.status == "failed" for note in trajectory.results)
+        return outcome
 
     async def _finish_followups(self, task_id: str) -> None:
         # The task terminal event is durable before suggestion generation

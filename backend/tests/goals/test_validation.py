@@ -54,7 +54,85 @@ def test_execute_rejects_duplicate_types_and_forward_dependency() -> None:
         validate_goal_plan(forward, "分析喜茶并圈选达人")
 
 
-def test_campaign_requires_brand_and_campaign() -> None:
+def test_dependency_combination_whitelist() -> None:
+    """依赖组合白名单：仅 brand/campaign → kol_selection 合法。"""
+    brand_then_kol = _execute(
+        GoalSpec(
+            sequence=1,
+            goal_type="brand_analysis",
+            params=GoalParams(brand="喜茶"),
+            request_evidence="分析喜茶",
+        ),
+        GoalSpec(
+            sequence=2,
+            goal_type="kol_selection",
+            depends_on_sequence=1,
+            params=GoalParams(brand="喜茶"),
+            request_evidence="圈选达人",
+        ),
+        active_brand="喜茶",
+        brand_source="explicit",
+    )
+    # 合法：brand_analysis → kol_selection。
+    validate_goal_plan(brand_then_kol, "分析喜茶并圈选达人")
+
+    campaign_then_kol = _execute(
+        GoalSpec(
+            sequence=1,
+            goal_type="campaign_analysis",
+            params=GoalParams(brand="喜茶", campaign="618"),
+            request_evidence="复盘 618",
+        ),
+        GoalSpec(
+            sequence=2,
+            goal_type="kol_selection",
+            depends_on_sequence=1,
+            params=GoalParams(brand="喜茶"),
+            request_evidence="圈选达人",
+        ),
+        active_brand="喜茶",
+        brand_source="explicit",
+    )
+    # 合法：campaign_analysis → kol_selection。
+    validate_goal_plan(campaign_then_kol, "复盘喜茶 618 并圈选达人")
+
+    brand_depends_on_campaign = _execute(
+        GoalSpec(
+            sequence=1,
+            goal_type="campaign_analysis",
+            params=GoalParams(brand="喜茶", campaign="618"),
+            request_evidence="复盘 618",
+        ),
+        GoalSpec(
+            sequence=2,
+            goal_type="brand_analysis",
+            depends_on_sequence=1,
+            params=GoalParams(brand="喜茶"),
+            request_evidence="分析喜茶",
+        ),
+    )
+    # 非法：brand_analysis 不允许有依赖（brand→campaign）。
+    with pytest.raises(GoalPlanSemanticError, match="dependency_combination_not_allowed"):
+        validate_goal_plan(brand_depends_on_campaign, "复盘喜茶 618 并分析喜茶")
+
+    kol_depends_on_kol = _execute(
+        GoalSpec(
+            sequence=1,
+            goal_type="kol_selection",
+            params=GoalParams(brand="喜茶"),
+            request_evidence="圈选达人",
+        ),
+        GoalSpec(
+            sequence=2,
+            goal_type="kol_selection",
+            depends_on_sequence=1,
+            params=GoalParams(brand="喜茶"),
+            request_evidence="再圈选一批达人",
+        ),
+    )
+    # 非法：kol_selection 的被依赖方必须是 brand/campaign（kol 依赖 kol）。
+    with pytest.raises(GoalPlanSemanticError, match="dependency_combination_not_allowed"):
+        validate_goal_plan(kol_depends_on_kol, "圈选达人后再圈选一批达人")
     output = _execute(
         GoalSpec(
             sequence=1,
