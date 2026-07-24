@@ -229,7 +229,57 @@ def test_kol_selection_rejects_analysis_only_evidence(evidence: str) -> None:
         validate_goal_plan(output, f"分析活动中哪些{evidence}最好")
 
 
-@pytest.mark.parametrize("evidence", ["推荐下一轮达人", "圈选下一轮达人"])
+@pytest.mark.parametrize(
+    ("current_message", "evidence"),
+    [
+        ("推荐下一轮达人投放策略", "推荐下一轮达人"),
+        (
+            "请推荐一套适合达人投放的内容策略",
+            "请推荐一套适合达人投放的内容策略",
+        ),
+    ],
+)
+def test_kol_selection_rejects_strategy_as_the_real_recommendation_target(
+    current_message: str,
+    evidence: str,
+) -> None:
+    output = _execute(
+        GoalSpec(
+            sequence=1,
+            goal_type="kol_selection",
+            params=GoalParams(),
+            request_evidence=evidence,
+        )
+    )
+
+    with pytest.raises(GoalPlanSemanticError, match="selection_intent_not_explicit"):
+        validate_goal_plan(output, current_message)
+
+
+@pytest.mark.parametrize(
+    "brand",
+    ["品牌", "这个品牌", "该品牌", "它", "本品牌"],
+)
+def test_explicit_brand_rejects_generic_placeholders(brand: str) -> None:
+    output = _execute(
+        GoalSpec(
+            sequence=1,
+            goal_type="brand_analysis",
+            params=GoalParams(brand=brand),
+            request_evidence=f"分析{brand}",
+        ),
+        active_brand=brand,
+        brand_source="explicit",
+    )
+
+    with pytest.raises(GoalPlanSemanticError, match="brand_source_context_mismatch"):
+        validate_goal_plan(output, f"分析{brand}表现")
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    ["推荐下一轮达人", "圈选下一轮达人", "圈选达人名单"],
+)
 def test_kol_selection_accepts_explicit_selection_action(evidence: str) -> None:
     output = _execute(
         GoalSpec(

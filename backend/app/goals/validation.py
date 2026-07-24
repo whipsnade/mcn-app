@@ -33,6 +33,27 @@ _SELECTION_INTENT_PATTERNS = (
     ),
     re.compile(r"(?:候选达人|候选博主|达人候选|博主候选|达人名单|博主名单|kol名单)"),
 )
+_NON_SELECTION_TARGET_CONTINUATION = re.compile(
+    r"^(?:的)?(?:投放(?:的)?(?:内容)?|内容|营销|传播|运营|合作)"
+    r"(?:的)?(?:策略|方案|规划|计划)"
+)
+_GENERIC_BRAND_REFERENCES = frozenset({"品牌", "这个品牌", "该品牌", "它", "本品牌"})
+
+
+def _has_explicit_selection_intent(evidence: str, message: str) -> bool:
+    occurrence_starts: list[int] = []
+    start = 0
+    while (index := message.find(evidence, start)) >= 0:
+        occurrence_starts.append(index)
+        start = index + 1
+
+    for pattern in _SELECTION_INTENT_PATTERNS:
+        for match in pattern.finditer(evidence):
+            for occurrence_start in occurrence_starts:
+                continuation = message[occurrence_start + match.end() :]
+                if not _NON_SELECTION_TARGET_CONTINUATION.match(continuation):
+                    return True
+    return False
 
 
 def _validate_brand_resolution(
@@ -49,7 +70,11 @@ def _validate_brand_resolution(
     normalized_account = _normalized_text(_nonblank(account_default_brand))
 
     if output.brand_source == "explicit":
-        if not normalized_active or normalized_active not in normalized_message:
+        if (
+            not normalized_active
+            or normalized_active in _GENERIC_BRAND_REFERENCES
+            or normalized_active not in normalized_message
+        ):
             raise GoalPlanSemanticError("brand_source_context_mismatch")
     elif output.brand_source == "session":
         if (
@@ -117,7 +142,7 @@ def validate_goal_plan(
                 raise GoalPlanSemanticError("selection_evidence_not_in_message")
             if len(evidence) < 4:
                 raise GoalPlanSemanticError("selection_evidence_too_short")
-            if not any(pattern.search(evidence) for pattern in _SELECTION_INTENT_PATTERNS):
+            if not _has_explicit_selection_intent(evidence, message_text):
                 raise GoalPlanSemanticError("selection_intent_not_explicit")
 
     _validate_brand_resolution(

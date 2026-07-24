@@ -230,6 +230,53 @@ def test_summary_projects_contract_fields_and_redacts_sample_text() -> None:
         assert forbidden not in encoded
 
 
+def test_summary_redacts_escaped_json_credentials_from_projected_text() -> None:
+    credentials = json.dumps(
+        {
+            "password": 'password-prefix"password-tail\\password-end',
+            "token": 'token-prefix"token-tail\\token-end',
+            "api_key": 'key-prefix"key-tail\\key-end',
+        },
+        ensure_ascii=False,
+    )
+    row = _row(
+        "task-escaped-sensitive",
+        {
+            "action": "execute",
+            "goals": [
+                {
+                    "sequence": 1,
+                    "goal_type": "brand_analysis",
+                    "params": {
+                        "brand": "喜茶",
+                        "campaign": None,
+                        "period": None,
+                        "platforms": [],
+                        "requirement": credentials,
+                    },
+                    "request_evidence": "分析喜茶",
+                }
+            ],
+        },
+        status="invalid",
+        current_message=f"普通业务文本；调试载荷 {credentials}",
+    )
+
+    sample = summarize_goal_planner_logs([row])["samples"][0]
+    encoded = json.dumps(sample, ensure_ascii=False)
+
+    for leaked_suffix in (
+        "password-tail",
+        "password-end",
+        "token-tail",
+        "token-end",
+        "key-tail",
+        "key-end",
+    ):
+        assert leaked_suffix not in encoded
+    assert "普通业务文本" in encoded
+
+
 def test_task_and_log_grouping_namespaces_do_not_collide() -> None:
     rows = [
         _row(

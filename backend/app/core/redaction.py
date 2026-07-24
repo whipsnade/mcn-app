@@ -33,7 +33,10 @@ _SENSITIVE_ASSIGNMENT_PATTERN = re.compile(
     r"(?:authorization|api[_\s-]?key|apikey|key|token|secret|credential|"
     r"password|passwd|endpoint|base[_\s-]?url|url)\b"
     r"(?P=key_quote)"
-    r"\s*[:=]\s*(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s,;，；]+)",
+    r"\s*[:=]\s*(?:"
+    r'"(?:\\.|[^"\\\r\n])*"'
+    r"|'(?:\\.|[^'\\\r\n])*'"
+    r"|[^\s,;，；]+)",
     re.IGNORECASE,
 )
 

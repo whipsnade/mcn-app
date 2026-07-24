@@ -299,3 +299,44 @@ ruff check --no-cache app tests scripts
 - 稳定排序、task 去重后 limit、无 task_id 独立分组均有测试；
 - 影子开关默认值、MCP、钱包、旧 Agent Loop、KOL 沉淀和终态契约未被扩大或改写；
 - 没有 Critical / Important 遗留；索引 Minor 按阶段约束明确延期。
+
+## 最终复审追加修复（2026-07-24）
+
+### 根因与最小修复
+
+1. KOL 圈选校验只在 `request_evidence` 内找到“推荐…达人”即通过，未检查该匹配在
+   完整消息中的后续宾语，因此截断证据和“达人投放策略”都会误判为圈选。
+   修复后把证据匹配映射回完整消息；若达人对象后紧跟投放、内容、营销、传播、
+   运营或合作的策略/方案/规划/计划，则拒绝为
+   `selection_intent_not_explicit`。真实的“推荐下一轮达人”“圈选达人名单”仍通过。
+2. `brand_source=explicit` 只要求 `active_brand` 出现在消息中，“品牌”“该品牌”“它”
+   等指代词可被当成真实品牌。修复后显式拒绝
+   `品牌/这个品牌/该品牌/它/本品牌`，统一触发
+   `brand_source_context_mismatch`，真实品牌“喜茶”保持有效。
+3. 自由文本脱敏的引号值模式不识别 JSON 转义，遇到 `\"` 会提前结束匹配并泄露
+   后缀。修复后单、双引号值均按转义感知方式完整消费；security 测试与 GoalPlanner
+   evaluation 投影测试共同覆盖 password、token、api_key 的转义引号与反斜杠。
+
+### RED / GREEN
+
+- RED：新增的 9 个聚焦用例全部按预期失败：
+  `9 failed in 0.12s`。
+- GREEN：相同命令在最小实现后全部通过：
+  `9 passed in 0.01s`。
+- 相关域回归：
+  `pytest -q tests/goals tests/security tests/model tests/tasks`，
+  结果 `198 passed in 3.22s`。
+
+### 最终验证
+
+- CLI：
+  `python scripts/evaluate_goal_planner_shadow.py --help`，
+  正常输出 `usage: evaluate_goal_planner_shadow.py [-h] [--limit LIMIT]`。
+- 全量后端：
+  `pytest -q`，
+  结果 `509 passed, 4 warnings in 34.48s`；4 条仍为既有 Starlette 422 弃用告警。
+- 完整 Ruff：
+  `ruff check --no-cache app tests scripts`，
+  结果 `All checks passed!`。
+- 所有 pytest 均显式锁定 `kol_insight_test`，只从仓库现有环境文件加载供应商凭据，
+  且未输出凭据；未运行迁移，未启用影子模式。

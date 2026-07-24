@@ -72,3 +72,28 @@ def test_redaction_masks_quoted_json_credentials_without_overmatching_business_t
     assert "quoted-api-key-value" not in rendered
     assert "品牌 token 化传播策略" in rendered
     assert "api key 视觉主题" in rendered
+
+
+def test_redaction_consumes_escaped_json_credential_values_completely() -> None:
+    value = json.dumps(
+        {
+            "password": 'password-prefix"password-tail\\password-end',
+            "token": 'token-prefix"token-tail\\token-end',
+            "api_key": 'key-prefix"key-tail\\key-end',
+            "campaign": "品牌 token 化传播策略",
+        },
+        ensure_ascii=False,
+    )
+
+    rendered = redact_for_log(value)
+
+    for leaked_suffix in (
+        "password-tail",
+        "password-end",
+        "token-tail",
+        "token-end",
+        "key-tail",
+        "key-end",
+    ):
+        assert leaked_suffix not in rendered
+    assert "品牌 token 化传播策略" in rendered
