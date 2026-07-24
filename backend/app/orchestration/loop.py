@@ -193,6 +193,10 @@ class AgentLoopContext(BaseModel):
     # 序列化结果）：required_field_names/labels/notes 随会话画像动态生成，
     # 告诉模型需要为每位达人采齐哪些导出字段；空 dict 表示无契约。
     export_contract: dict[str, Any] = Field(default_factory=dict)
+    # 当前 goal 的类型与目标参数（阶段三 GoalPolicy）：goal_params 随 model_dump
+    # 进 user JSON，供模型感知品牌/活动/周期；legacy 任务保持默认 kol_selection。
+    goal_type: str = "kol_selection"
+    goal_params: dict[str, Any] = Field(default_factory=dict)
     # prompt 学习日志上下文（user_id/session_id/task_id/tags）；仅用于落库，
     # exclude=True 保证不进入发给模型的 prompt JSON。
     log_context: dict[str, Any] = Field(default_factory=dict, exclude=True)

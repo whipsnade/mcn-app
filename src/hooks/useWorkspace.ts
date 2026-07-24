@@ -10,7 +10,8 @@ import {
 } from '../api/sessions';
 import { isBrainstormProfileReady, postBrainstorm } from '../api/brainstorm';
 import { createTask, getAnalysisReport, getTask, retryFollowups as retryFollowupsRequest, retryTask } from '../api/tasks';
-import type { ApiAnalysisReport, CreateSessionInput } from '../api/contracts';
+import { getArtifactsSummary, markArtifactRead } from '../api/reports';
+import type { ApiAnalysisReport, ArtifactModuleKey, CreateSessionInput } from '../api/contracts';
 import { useTaskStream } from './useTaskStream';
 import { isTerminalTaskStatus } from '../state/taskEvents';
 import type { Message, Session } from '../types';
@@ -372,9 +373,26 @@ export function useWorkspace(userId?: string) {
         }
         return response;
       }
-      const task = await createTask(requestedSessionId, { content });
+      const result = await createTask(requestedSessionId, { content });
       if (generationRef.current !== generation) throw new Error('STALE_WORKSPACE_REQUEST');
-      if (!sessionOperationIsCurrent(requestedSessionId, operationEpoch)) return task;
+      if (!sessionOperationIsCurrent(requestedSessionId, operationEpoch)) return result;
+      if (result.outcome === 'clarify') {
+        // planner 澄清：不落任务；插入用户提问与 assistant 澄清消息
+        //（metadata.clarify.options 由 ChatArea 渲染为可点 chips，复用 brainstorm 机制）。
+        const userMessage: Message = {
+          id: `pending-clarify-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`,
+          sender: 'user',
+          text: content,
+          timestamp: new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }),
+        };
+        const assistantMessage = toMessage(result.message);
+        setSessions(current => current.map(session => session.id === requestedSessionId ? {
+          ...session,
+          messages: [...session.messages, userMessage, assistantMessage],
+        } : session));
+        return result;
+      }
+      const task = result.task;
       const pendingMessage: Message = {
         id: task.trigger_message_id ?? `pending-${task.id}`,
         sender: 'user',
@@ -562,6 +580,50 @@ export function useWorkspace(userId?: string) {
     [activeSessionId, sessions],
   );
 
+  // 会话激活 / 任务状态变化（含终态）/ artifact.updated 到达时拉取 artifacts summary
+  // （三 Tab 的最新产物与未读标记）。artifactUpdates 每次事件都是新对象引用。
+  const runtimeArtifactUpdates = currentTaskRuntime?.artifactUpdates;
+  const runtimeStatus = currentTaskRuntime?.status;
+  useEffect(() => {
+    if (!userId || !activeSessionId) return;
+    const generation = generationRef.current;
+    const operationEpoch = getSessionOperationEpoch(activeSessionId);
+    void getArtifactsSummary(activeSessionId)
+      .then(summary => {
+        if (
+          generationRef.current !== generation
+          || !sessionOperationIsCurrent(activeSessionId, operationEpoch)
+        ) return;
+        setSessions(current => current.map(session => session.id === activeSessionId ? {
+          ...session,
+          artifactsSummary: summary,
+        } : session));
+      })
+      .catch(() => undefined);
+  }, [activeSessionId, runtimeStatus, runtimeArtifactUpdates, userId, getSessionOperationEpoch, sessionOperationIsCurrent]);
+
+  // 点击 Tab 后标记模块已读：先调 api（失败保持未读），再本地清 unread。
+  const markArtifactSeen = useCallback(async (moduleKey: ArtifactModuleKey, artifactId: string) => {
+    if (!userId || !activeSessionId) return;
+    try {
+      await markArtifactRead(activeSessionId, moduleKey, artifactId);
+    } catch {
+      return;
+    }
+    setSessions(current => current.map(session => {
+      if (session.id !== activeSessionId || !session.artifactsSummary) return session;
+      const entry = session.artifactsSummary[moduleKey];
+      if (!entry) return session;
+      return {
+        ...session,
+        artifactsSummary: {
+          ...session.artifactsSummary,
+          [moduleKey]: { ...entry, unread: false },
+        },
+      };
+    }));
+  }, [activeSessionId, userId]);
+
   // 手动 KOL 分析（会话级报告，task_id 为 null）成功后，由面板回调写回会话状态。
   const setAnalysisReport = useCallback((sessionId: string, report: ApiAnalysisReport) => {
     setSessions(current => {
@@ -639,5 +701,6 @@ export function useWorkspace(userId?: string) {
     retryMessage,
     retryFollowups,
     setAnalysisReport,
+    markArtifactSeen,
   };
 }

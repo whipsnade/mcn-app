@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { authorizedFetch } from './client';
-import { downloadKolSelection, runKolAnalysis } from './kolSelection';
+import { downloadKolSelection, getKolSelection, listSelectionSets, runKolAnalysis } from './kolSelection';
 
 vi.mock('./client', () => ({
   authorizedFetch: vi.fn(),
@@ -87,5 +87,34 @@ describe('kolSelection api', () => {
     await downloadKolSelection('session-1');
 
     expect(clicked?.download).toBe('KOL匹配度分析.xlsx');
+  });
+
+  it('passes set_id through to the selection list and export', async () => {
+    const { request } = await import('./client');
+    vi.mocked(request).mockResolvedValue({ total: 0, items: [] });
+    vi.mocked(authorizedFetch).mockResolvedValue({
+      ok: true,
+      headers: new Headers({ 'Content-Disposition': 'attachment' }),
+      blob: () => Promise.resolve(new Blob(['xlsx'])),
+    } as Response);
+
+    await getKolSelection('session-1', 'set-1');
+    expect(request).toHaveBeenCalledWith(
+      '/api/v1/sessions/session-1/kol-selection?limit=200&set_id=set-1',
+    );
+
+    await downloadKolSelection('session-1', 'set-1');
+    expect(vi.mocked(authorizedFetch).mock.calls.at(-1)?.[0]).toBe(
+      '/api/v1/sessions/session-1/kol-selection/export?set_id=set-1',
+    );
+  });
+
+  it('lists selection sets', async () => {
+    const { request } = await import('./client');
+    vi.mocked(request).mockResolvedValue([]);
+
+    await listSelectionSets('session-1');
+
+    expect(request).toHaveBeenCalledWith('/api/v1/sessions/session-1/selection-sets');
   });
 });

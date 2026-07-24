@@ -1,5 +1,5 @@
 import { request } from './client';
-import type { ApiAnalysisReport, ApiTask } from './contracts';
+import type { ApiAnalysisReport, ApiTask, TaskCreateResult } from './contracts';
 
 
 export interface CreateTaskInput {
@@ -16,8 +16,8 @@ export function createTask(
   sessionId: string,
   input: CreateTaskInput,
   idempotencyKey = createIdempotencyKey(),
-): Promise<ApiTask> {
-  return request<ApiTask>(`/api/v1/sessions/${sessionId}/tasks`, {
+): Promise<TaskCreateResult> {
+  return request<TaskCreateResult>(`/api/v1/sessions/${sessionId}/tasks`, {
     method: 'POST',
     headers: { 'Idempotency-Key': idempotencyKey },
     body: JSON.stringify(input),

@@ -17,6 +17,7 @@ from app.db.session import SessionFactory
 from app.goals.context import GoalPlannerContextBuilder
 from app.goals.models import TaskGoal
 from app.goals.planner import GoalPlannerService
+from app.goals.policies import policy_for
 from app.artifacts.models import TaskArtifact
 from app.artifacts.service import ArtifactService, module_key_of
 from app.identity.models import User, UserChannelPermission
@@ -28,11 +29,11 @@ from app.model.dependencies import get_model_adapter
 from app.model.contracts import ChatMessage, StructuredModelRequest
 from app.model.exemplars import find_success_exemplars
 from app.model.persona import describe_user_persona
-from app.model.prompts import AGENT_LOOP_PROMPT
 from app.orchestration.context import compress_messages
 from app.orchestration.loop import AgentDecision, AgentLoopContext
 from app.orchestration.routing import extract_requested_period
 from app.orchestration.schemas import PlannerTool
+from app.reporting.builders import run_brand_analysis, run_campaign_analysis
 from app.reporting.models import AnalysisReport
 from app.selection.analysis import run_kol_analysis
 from app.selection.contract import build_export_field_contract
@@ -49,6 +50,17 @@ from app.workspace.service import WorkspaceService
 
 
 logger = logging.getLogger(__name__)
+
+# goal_type → (artifact_type, 报告构建器, report.updated 事件 label, 失败占位标题)
+_ANALYSIS_GOAL_TABLE = {
+    "brand_analysis": ("brand_report", run_brand_analysis, "品牌分析报告已生成", "品牌分析报告"),
+    "campaign_analysis": (
+        "campaign_report",
+        run_campaign_analysis,
+        "活动复盘报告已生成",
+        "活动复盘报告",
+    ),
+}
 
 
 def agent_loop_tags(context: AgentLoopContext) -> list[str]:
@@ -245,67 +257,165 @@ class _TaskArtifacts:
                 # 轨迹镜像 task.plan_json（agent_trajectory_v1）。
                 goal.trajectory_json = task.plan_json
                 artifact_service = ArtifactService(db)
-                selection_set = await db.scalar(
-                    select(KolSelectionSet)
-                    .where(KolSelectionSet.goal_id == goal.id)
-                    .order_by(KolSelectionSet.version.desc())
-                    .limit(1)
-                )
-                if selection_set is not None:
-                    item_count = await KolSelectionService(db).count_items(selection_set.id)
-                    if item_count > 0:
-                        selection_set.status = "completed"
-                        selection_set.updated_at = now
-                        await self._register_goal_artifact(
-                            db,
-                            artifact_service,
-                            task=task,
-                            goal=goal,
-                            artifact_key=f"goal:{goal.id}:kol_selection_set",
-                            artifact_type="kol_selection_set",
-                            title=selection_set.title,
-                            version=selection_set.version,
-                            selection_set_id=selection_set.id,
-                            scope=selection_set.scope_json,
+                status_override: str | None = None
+                warning_code: str | None = None
+                if goal.goal_type == "kol_selection":
+                    selection_set = await db.scalar(
+                        select(KolSelectionSet)
+                        .where(KolSelectionSet.goal_id == goal.id)
+                        .order_by(KolSelectionSet.version.desc())
+                        .limit(1)
+                    )
+                    if selection_set is not None:
+                        item_count = await KolSelectionService(db).count_items(
+                            selection_set.id
                         )
-                if terminal_status in {
-                    "completed",
-                    "completed_with_warnings",
-                    "insufficient_balance",
-                }:
-                    report = await self._goal_report(db, task)
-                    if report is not None:
-                        await self._register_goal_artifact(
-                            db,
-                            artifact_service,
-                            task=task,
-                            goal=goal,
-                            artifact_key=f"goal:{goal.id}:kol_report",
-                            artifact_type="kol_report",
-                            title=report.title,
-                            version=report.version,
-                            report_id=report.id,
-                            scope=report.scope_json,
-                        )
-                goal.status = terminal_status
+                        if item_count > 0:
+                            selection_set.status = "completed"
+                            selection_set.updated_at = now
+                            await self._register_goal_artifact(
+                                db,
+                                artifact_service,
+                                task=task,
+                                goal=goal,
+                                artifact_key=f"goal:{goal.id}:kol_selection_set",
+                                artifact_type="kol_selection_set",
+                                title=selection_set.title,
+                                version=selection_set.version,
+                                selection_set_id=selection_set.id,
+                                scope=selection_set.scope_json,
+                            )
+                    if terminal_status in {
+                        "completed",
+                        "completed_with_warnings",
+                        "insufficient_balance",
+                    }:
+                        report = await self._goal_report(db, task)
+                        if report is not None:
+                            await self._register_goal_artifact(
+                                db,
+                                artifact_service,
+                                task=task,
+                                goal=goal,
+                                artifact_key=f"goal:{goal.id}:kol_report",
+                                artifact_type="kol_report",
+                                title=report.title,
+                                version=report.version,
+                                report_id=report.id,
+                                scope=report.scope_json,
+                            )
+                elif goal.goal_type in {"brand_analysis", "campaign_analysis"} and (
+                    terminal_status in {"completed", "completed_with_warnings"}
+                ):
+                    status_override, warning_code = await self._finalize_analysis_goal(
+                        db, artifact_service, task=task, goal=goal
+                    )
+                goal.status = status_override or terminal_status
+                goal.warning_code = warning_code
                 goal.error_code = error_code
                 goal.completed_at = now
                 goal.updated_at = now
                 event_type = (
                     TaskEventType.GOAL_FAILED
-                    if terminal_status in {"failed", "skipped"}
+                    if goal.status in {"failed", "skipped"}
                     else TaskEventType.GOAL_COMPLETED
                 )
                 payload: dict[str, Any] = {
                     "goal_id": goal.id,
                     "goal_type": goal.goal_type,
-                    "status": terminal_status,
+                    "status": goal.status,
                 }
                 if error_code:
                     payload["error_code"] = error_code
                 await TaskRepository(db).append_event(task.id, task.user_id, event_type, payload)
         except Exception:
             logger.warning("finalize_goal_failed task_id=%s", task_id, exc_info=True)
+
+    # goal_type → (artifact_type, 构建器, report.updated 事件 label, 失败占位标题)
+    async def _finalize_analysis_goal(
+        self, db, artifact_service: ArtifactService, *, task: AnalysisTask, goal: TaskGoal
+    ) -> tuple[str | None, str | None]:
+        """品牌/活动 goal 收尾：构建报告 → 登记 artifact + 双发事件。
+
+        返回 (status_override, warning_code)：报告生成失败时降级
+        completed_with_warnings 并登记 failed artifact（不删证据、任务终态不受影响）。
+        """
+        artifact_type, builder, label, fallback_title = _ANALYSIS_GOAL_TABLE[goal.goal_type]
+        artifact_key = f"goal:{goal.id}:{artifact_type}"
+        build_error: Exception | None = None
+        report: AnalysisReport | None = None
+        if self._model is None:
+            build_error = RuntimeError("model_unavailable")
+        else:
+            try:
+                report = await builder(
+                    db,
+                    self._model,
+                    user_id=task.user_id,
+                    session_id=task.session_id,
+                    task=task,
+                    goal=goal,
+                )
+            except Exception as error:
+                build_error = error
+        if build_error is not None:
+            code = str(
+                getattr(build_error, "code", None) or str(build_error) or "report_build_failed"
+            )[:64]
+            logger.warning(
+                "goal_report_build_failed goal_id=%s error=%s", goal.id, code, exc_info=True
+            )
+            artifact = await artifact_service.register_artifact(
+                user_id=task.user_id,
+                session_id=task.session_id,
+                artifact_key=artifact_key,
+                artifact_type=artifact_type,
+                title=fallback_title,
+                version=1,
+                status="failed",
+                task_id=task.id,
+                goal_id=goal.id,
+                error_code=code,
+            )
+            await TaskRepository(db).append_event(
+                task.id,
+                task.user_id,
+                TaskEventType.ARTIFACT_UPDATED,
+                {
+                    "artifact_id": artifact.id,
+                    "goal_id": goal.id,
+                    "artifact_type": artifact.artifact_type,
+                    "module_key": module_key_of(artifact.artifact_type),
+                    "version": artifact.version,
+                    "title": artifact.title,
+                },
+            )
+            return "completed_with_warnings", code
+        assert report is not None
+        await self._register_goal_artifact(
+            db,
+            artifact_service,
+            task=task,
+            goal=goal,
+            artifact_key=artifact_key,
+            artifact_type=artifact_type,
+            title=report.title,
+            version=report.version,
+            report_id=report.id,
+            scope=report.scope_json,
+        )
+        await TaskRepository(db).append_event(
+            task.id,
+            task.user_id,
+            TaskEventType.REPORT_UPDATED,
+            {
+                "report_id": report.id,
+                "version": report.version,
+                "phase": "ai_summary",
+                "label": label,
+            },
+        )
+        return None, None
 
     async def _goal_report(self, db, task: AnalysisTask) -> AnalysisReport | None:
         """auto_kol_analysis 产出的报告；恢复重放时回退会话最新 kol_analysis 报告。"""
@@ -587,8 +697,21 @@ class TaskExecutionDependencies:
         self._arguments = _PlanArguments()
         self._selection = DatabaseSelectionIngest()
 
-    async def build_agent_context(self, user_id: str, session_id: str) -> AgentLoopContext:
-        """迭代循环的轻量上下文：消息 + 已审核工具 + 渠道权限，无会话表单约束。"""
+    async def build_agent_context(
+        self,
+        user_id: str,
+        session_id: str,
+        *,
+        goal_type: str = "kol_selection",
+        goal_params: dict | None = None,
+    ) -> AgentLoopContext:
+        """迭代循环的轻量上下文：消息 + 已审核工具 + 渠道权限，无会话表单约束。
+
+        goal_params 合并进 param_profile（brand/period/platforms 等键优先于
+        brainstorm 画像）；export_contract 仅 kol_selection 注入（GoalPolicy）。
+        """
+        policy = policy_for(goal_type)
+        goal_params = dict(goal_params or {})
         async with SessionFactory() as db:
             workspace_service = WorkspaceService(db)
             workspace = await workspace_service.get_owned_session(user_id, session_id)
@@ -604,10 +727,12 @@ class TaskExecutionDependencies:
         param_profile = (workspace.filters_snapshot or {}).get("brainstorm_profile") or {}
         if not isinstance(param_profile, dict):
             param_profile = {}
+        # goal_params 优先于 brainstorm 画像（planner 确认的目标参数）。
+        merged_profile = {**param_profile, **goal_params}
         requested_period = extract_requested_period(
             "\n".join(message.content for message in recent_messages)
         )
-        period_override = param_profile_period_override(param_profile)
+        period_override = param_profile_period_override(merged_profile)
         if period_override is not None:
             requested_period = period_override
         context = AgentLoopContext(
@@ -616,11 +741,17 @@ class TaskExecutionDependencies:
             allowed_channels=effective_channels,
             current_date=date.today().isoformat(),
             requested_period=requested_period,
-            param_profile=param_profile,
+            param_profile=merged_profile,
             user_persona=describe_user_persona(
                 list(user.industries) if user is not None and user.industries else []
             ),
-            export_contract=build_export_field_contract(workspace).model_dump(mode="json"),
+            export_contract=(
+                build_export_field_contract(workspace).model_dump(mode="json")
+                if policy.inject_export_contract
+                else {}
+            ),
+            goal_type=goal_type,
+            goal_params=goal_params,
         )
         context.log_context = {
             "user_id": user_id,
@@ -641,12 +772,14 @@ class TaskExecutionDependencies:
             )
         payload = context.model_dump(mode="json")
         payload["exemplars"] = exemplars
+        # 系统 prompt 按 goal_type 分派（GoalPolicy）；purpose 保持 agent_loop 共享案例池。
+        policy = policy_for(context.goal_type)
         result = await self._model.complete_json(
             StructuredModelRequest(
                 purpose="agent_loop",
-                template_name=AGENT_LOOP_PROMPT.name,
+                template_name=policy.prompt.name,
                 messages=(
-                    ChatMessage(role="system", content=AGENT_LOOP_PROMPT.system),
+                    ChatMessage(role="system", content=policy.loop_system_prompt()),
                     ChatMessage(
                         role="user",
                         content=json.dumps(

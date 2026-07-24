@@ -5,6 +5,7 @@ export interface Message {
   timestamp: string;
   taskId?: string;
   brainstorm?: import('./api/contracts').BrainstormMetadata;
+  clarify?: import('./api/contracts').ClarifyMetadata;
 }
 
 export interface SentimentData {
@@ -94,6 +95,7 @@ export interface Session {
   analysis?: SessionAnalysis;
   analysisReport?: import('./api/contracts').ApiAnalysisReport;
   kolSelectionCount?: number;
+  artifactsSummary?: import('./api/contracts').ApiArtifactsSummary;
 }
 
 export interface SessionAnalysis {

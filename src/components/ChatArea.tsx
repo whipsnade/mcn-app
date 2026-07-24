@@ -169,9 +169,10 @@ export default function ChatArea({
             );
           }
 
-          // 仅最新一条 assistant 消息的 brainstorm 选项渲染为可点 chips。
+          // 仅最新一条 assistant 消息的澄清选项渲染为可点 chips
+          //（brainstorm 画像澄清与 planner clarify 共用同一交互）。
           const brainstormOptions = isAI && msg.id === latestAssistantMessageId
-            ? msg.brainstorm?.options ?? []
+            ? msg.brainstorm?.options ?? msg.clarify?.options ?? []
             : [];
 
           return (

@@ -161,3 +161,91 @@ async def test_export_empty_session_returns_409(auth_client_factory) -> None:
 
     assert response.status_code == 409
     assert response.json()["detail"] == "NO_KOL_SELECTION"
+
+
+@pytest.mark.asyncio
+async def test_selection_sets_lists_versions_with_counts(auth_client_factory, db_session) -> None:
+    client = await auth_client_factory("13400000102")
+    session_id = await _session_id_of(client)
+    session = await db_session.get(WorkspaceSession, session_id)
+    first_set = await _seed_items(
+        db_session, session.user_id, session_id, [("a", 80.0), ("b", 60.0)], title="历史默认名单"
+    )
+    second_set = await _seed_items(
+        db_session, session.user_id, session_id, [("c", 70.0)], title="默认名单"
+    )
+
+    response = await client.get(f"/api/v1/sessions/{session_id}/selection-sets")
+
+    assert response.status_code == 200
+    items = response.json()
+    assert [item["version"] for item in items] == [2, 1]
+    assert items[0]["set_id"] == second_set
+    assert items[0]["title"] == "默认名单"
+    assert items[0]["status"] == "active"
+    assert items[0]["item_count"] == 1
+    assert items[0]["created_at"]
+    assert items[1]["set_id"] == first_set
+    assert items[1]["item_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_selection_sets_empty_and_foreign(auth_client_factory) -> None:
+    owner = await auth_client_factory("13400000103")
+    other = await auth_client_factory("13400000104")
+    session_id = await _session_id_of(owner)
+
+    empty = await owner.get(f"/api/v1/sessions/{session_id}/selection-sets")
+    assert empty.status_code == 200
+    assert empty.json() == []
+    foreign = await other.get(f"/api/v1/sessions/{session_id}/selection-sets")
+    assert foreign.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_list_and_export_with_set_id_switch(auth_client_factory, db_session) -> None:
+    client = await auth_client_factory("13400000105")
+    session_id = await _session_id_of(client)
+    session = await db_session.get(WorkspaceSession, session_id)
+    first_set = await _seed_items(
+        db_session, session.user_id, session_id, [("old-1", 80.0), ("old-2", 60.0)],
+        title="历史默认名单",
+    )
+    await _seed_items(db_session, session.user_id, session_id, [("new-1", 90.0)])
+
+    # 缺省读最新 set（version=2）。
+    default = await client.get(f"/api/v1/sessions/{session_id}/kol-selection")
+    assert [item["kol_uid"] for item in default.json()["items"]] == ["new-1"]
+    # set_id 切回历史名单。
+    switched = await client.get(
+        f"/api/v1/sessions/{session_id}/kol-selection", params={"set_id": first_set}
+    )
+    assert switched.status_code == 200
+    assert switched.json()["total"] == 2
+    assert [item["kol_uid"] for item in switched.json()["items"]] == ["old-1", "old-2"]
+    exported = await client.get(
+        f"/api/v1/sessions/{session_id}/kol-selection/export", params={"set_id": first_set}
+    )
+    assert exported.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_set_id_from_another_session_returns_404(auth_client_factory, db_session) -> None:
+    client = await auth_client_factory("13400000106")
+    session_id = await _session_id_of(client)
+    other_session_id = await _session_id_of(client)
+    session = await db_session.get(WorkspaceSession, other_session_id)
+    other_set = await _seed_items(db_session, session.user_id, other_session_id, [("a", 80.0)])
+
+    list_response = await client.get(
+        f"/api/v1/sessions/{session_id}/kol-selection", params={"set_id": other_set}
+    )
+    assert list_response.status_code == 404
+    export_response = await client.get(
+        f"/api/v1/sessions/{session_id}/kol-selection/export", params={"set_id": other_set}
+    )
+    assert export_response.status_code == 404
+    missing = await client.get(
+        f"/api/v1/sessions/{session_id}/kol-selection", params={"set_id": "missing-set"}
+    )
+    assert missing.status_code == 404

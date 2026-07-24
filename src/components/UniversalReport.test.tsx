@@ -1,9 +1,11 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { ApiFavorite } from '../api/contracts';
+import type { ApiArtifactsSummary, ApiFavorite } from '../api/contracts';
 import { createFavoriteByKey, deleteFavoriteByKey } from '../api/favorites';
-import { downloadKolSelection, getKolSelection, runKolAnalysis } from '../api/kolSelection';
+import { downloadKolSelection, getKolSelection, listSelectionSets, runKolAnalysis } from '../api/kolSelection';
+import { listSessionReports } from '../api/reports';
+import { getAnalysisReport } from '../api/tasks';
 import { analysisReportFixture } from '../test/fixtures';
 import UniversalReport from './UniversalReport';
 
@@ -11,6 +13,17 @@ vi.mock('../api/kolSelection', () => ({
   runKolAnalysis: vi.fn(),
   downloadKolSelection: vi.fn(),
   getKolSelection: vi.fn(),
+  listSelectionSets: vi.fn(),
+}));
+
+vi.mock('../api/reports', () => ({
+  listSessionReports: vi.fn(),
+  getArtifactsSummary: vi.fn(),
+  markArtifactRead: vi.fn(),
+}));
+
+vi.mock('../api/tasks', () => ({
+  getAnalysisReport: vi.fn(),
 }));
 
 vi.mock('../api/favorites', () => ({
@@ -54,6 +67,9 @@ describe('UniversalReport', () => {
     vi.mocked(runKolAnalysis).mockReset();
     vi.mocked(downloadKolSelection).mockReset();
     vi.mocked(getKolSelection).mockReset();
+    vi.mocked(listSelectionSets).mockReset().mockResolvedValue([]);
+    vi.mocked(listSessionReports).mockReset().mockResolvedValue([]);
+    vi.mocked(getAnalysisReport).mockReset();
     vi.mocked(createFavoriteByKey).mockReset();
     vi.mocked(deleteFavoriteByKey).mockReset();
   });
@@ -376,5 +392,150 @@ describe('UniversalReport', () => {
       nickname: '达人小A',
       snapshot: {},
     }));
+  });
+
+  it('renders three top-level tabs with the kol tab selected by default', () => {
+    render(<UniversalReport sessionId="session-1" selectionCount={2} />);
+
+    expect(screen.getByRole('tab', { name: '品牌分析' })).toHaveAttribute('aria-selected', 'false');
+    expect(screen.getByRole('tab', { name: '活动分析' })).toHaveAttribute('aria-selected', 'false');
+    expect(screen.getByRole('tab', { name: '达人' })).toHaveAttribute('aria-selected', 'true');
+    // 达人 Tab 内保留原有 KOL 分析/圈选达人两子 Tab。
+    expect(screen.getByRole('tab', { name: 'KOL 分析' })).toBeVisible();
+    expect(screen.getByRole('tab', { name: '圈选达人 (2)' })).toBeVisible();
+  });
+
+  it('shows the brand analysis empty state', () => {
+    render(<UniversalReport sessionId="session-1" selectionCount={0} />);
+
+    fireEvent.click(screen.getByRole('tab', { name: '品牌分析' }));
+
+    expect(screen.getByText('完成一次品牌分析后在此展示')).toBeVisible();
+    fireEvent.click(screen.getByRole('tab', { name: '活动分析' }));
+    expect(screen.getByText('完成一次活动分析后在此展示')).toBeVisible();
+  });
+
+  it('renders the latest brand report with scope and switches versions', async () => {
+    const brandV1 = analysisReportFixture({
+      id: 'brand-report-1', version: 1, title: '海底捞品牌分析v1',
+      scope: { brand: '海底捞' },
+    });
+    const brandV2 = analysisReportFixture({
+      id: 'brand-report-2', version: 2, title: '海底捞品牌分析v2',
+      scope: { brand: '海底捞' },
+    });
+    vi.mocked(listSessionReports).mockResolvedValue([
+      { report_id: 'brand-report-2', title: '海底捞品牌分析v2', version: 2, scope: { brand: '海底捞' }, status: 'completed', created_at: '2026-07-24T11:00:00Z' },
+      { report_id: 'brand-report-1', title: '海底捞品牌分析v1', version: 1, scope: { brand: '海底捞' }, status: 'completed', created_at: '2026-07-24T10:00:00Z' },
+    ]);
+    vi.mocked(getAnalysisReport).mockImplementation(async id => id === 'brand-report-2' ? brandV2 : brandV1);
+    render(<UniversalReport sessionId="session-1" selectionCount={0} />);
+
+    fireEvent.click(screen.getByRole('tab', { name: '品牌分析' }));
+
+    expect(await screen.findByText('海底捞品牌分析v2')).toBeVisible();
+    expect(screen.getByText(/品牌：海底捞/)).toBeVisible();
+
+    fireEvent.change(screen.getByRole('combobox', { name: '报告版本' }), { target: { value: 'brand-report-1' } });
+    expect(await screen.findByText('海底捞品牌分析v1')).toBeVisible();
+  });
+
+  it('shows a failure hint when the latest artifact failed', () => {
+    const summary: ApiArtifactsSummary = {
+      brand: {
+        latest_artifact: {
+          artifact_id: 'artifact-failed', artifact_type: 'brand_report', title: '品牌分析报告',
+          version: 1, scope: null, status: 'failed', created_at: '2026-07-24T10:00:00Z',
+        },
+        unread: false,
+      },
+      campaign: { latest_artifact: null, unread: false },
+      kol_analysis: { latest_artifact: null, unread: false },
+      kol_selection: { latest_artifact: null, unread: false },
+    };
+    render(<UniversalReport sessionId="session-1" selectionCount={0} artifactsSummary={summary} />);
+
+    fireEvent.click(screen.getByRole('tab', { name: '品牌分析' }));
+
+    expect(screen.getByRole('alert')).toHaveTextContent('上一次报告生成失败');
+  });
+
+  it('shows unread dots and clears them via onMarkArtifactSeen on tab click', () => {
+    const summary: ApiArtifactsSummary = {
+      brand: {
+        latest_artifact: {
+          artifact_id: 'artifact-brand', artifact_type: 'brand_report', title: '品牌分析',
+          version: 1, scope: null, status: 'completed', created_at: '2026-07-24T10:00:00Z',
+        },
+        unread: true,
+      },
+      campaign: { latest_artifact: null, unread: false },
+      kol_analysis: {
+        latest_artifact: {
+          artifact_id: 'artifact-kol', artifact_type: 'kol_report', title: 'KOL 分析',
+          version: 1, scope: null, status: 'completed', created_at: '2026-07-24T10:00:00Z',
+        },
+        unread: true,
+      },
+      kol_selection: { latest_artifact: null, unread: false },
+    };
+    const onMarkArtifactSeen = vi.fn();
+    render(
+      <UniversalReport
+        sessionId="session-1"
+        selectionCount={0}
+        artifactsSummary={summary}
+        onMarkArtifactSeen={onMarkArtifactSeen}
+      />,
+    );
+
+    // 未读点的 aria-label 会并入按钮可访问名，这里用正则匹配 tab。
+    expect(screen.getByRole('tab', { name: /品牌分析/ }).querySelector('[aria-label="未读"]')).not.toBeNull();
+    expect(screen.getByRole('tab', { name: /^达人/ }).querySelector('[aria-label="未读"]')).not.toBeNull();
+    expect(screen.getByRole('tab', { name: '活动分析' }).querySelector('[aria-label="未读"]')).toBeNull();
+
+    fireEvent.click(screen.getByRole('tab', { name: /品牌分析/ }));
+    expect(onMarkArtifactSeen).toHaveBeenCalledWith('brand', 'artifact-brand');
+  });
+
+  it('does not auto-switch tabs when an unread summary arrives', () => {
+    const { rerender } = render(<UniversalReport sessionId="session-1" selectionCount={3} />);
+    expect(screen.getByText(/已圈选 3 位达人/)).toBeVisible();
+
+    const summary: ApiArtifactsSummary = {
+      brand: {
+        latest_artifact: {
+          artifact_id: 'artifact-brand', artifact_type: 'brand_report', title: '品牌分析',
+          version: 1, scope: null, status: 'completed', created_at: '2026-07-24T10:00:00Z',
+        },
+        unread: true,
+      },
+      campaign: { latest_artifact: null, unread: false },
+      kol_analysis: { latest_artifact: null, unread: false },
+      kol_selection: { latest_artifact: null, unread: false },
+    };
+    rerender(<UniversalReport sessionId="session-1" selectionCount={3} artifactsSummary={summary} />);
+
+    // 仍在「达人」Tab，不因未读自动切换。
+    expect(screen.getByRole('tab', { name: '达人' })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.getByText(/已圈选 3 位达人/)).toBeVisible();
+  });
+
+  it('switches selection sets and exports the chosen set', async () => {
+    vi.mocked(listSelectionSets).mockResolvedValue([
+      { set_id: 'set-2', title: '默认名单', version: 2, status: 'active', item_count: 1, created_at: '2026-07-24T10:00:00Z' },
+      { set_id: 'set-1', title: '历史默认名单', version: 1, status: 'completed', item_count: 1, created_at: '2026-07-23T10:00:00Z' },
+    ]);
+    vi.mocked(getKolSelection).mockResolvedValue({ total: 1, items: [kolSelectionItem()] });
+    render(<UniversalReport sessionId="session-1" selectionCount={1} />);
+
+    fireEvent.click(screen.getByRole('tab', { name: '圈选达人 (1)' }));
+    await waitFor(() => expect(getKolSelection).toHaveBeenCalledWith('session-1'));
+
+    fireEvent.change(await screen.findByRole('combobox', { name: '名单版本' }), { target: { value: 'set-1' } });
+    await waitFor(() => expect(getKolSelection).toHaveBeenCalledWith('session-1', 'set-1'));
+
+    fireEvent.click(screen.getByRole('button', { name: '导出 Excel' }));
+    await waitFor(() => expect(downloadKolSelection).toHaveBeenCalledWith('session-1', 'set-1'));
   });
 });

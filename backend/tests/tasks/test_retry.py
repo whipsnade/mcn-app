@@ -107,7 +107,9 @@ async def test_create_task_reuses_idempotent_task_without_resubmitting(monkeypat
         def __init__(self, db):
             self.db = db
 
-        async def create_idempotent(self, user_id, session_id, payload, idempotency_key):
+        async def create_idempotent(
+            self, user_id, session_id, payload, idempotency_key, **_kwargs
+        ):
             assert (user_id, session_id, idempotency_key) == ("user-1", "session-1", "browser-key")
             return task, True
 
@@ -124,7 +126,8 @@ async def test_create_task_reuses_idempotent_task_without_resubmitting(monkeypat
         "browser-key",
     )
 
-    assert result.id == "task-existing"
+    assert result.outcome == "task"
+    assert result.task.id == "task-existing"
     runner.submit.assert_not_called()
 
 
@@ -134,7 +137,9 @@ async def test_create_task_returns_409_for_same_key_with_different_payload(monke
         def __init__(self, db):
             self.db = db
 
-        async def create_idempotent(self, user_id, session_id, payload, idempotency_key):
+        async def create_idempotent(
+            self, user_id, session_id, payload, idempotency_key, **_kwargs
+        ):
             raise TaskConflictError("idempotency_payload_mismatch")
 
     monkeypatch.setattr(tasks_router, "TaskService", StubTaskService)

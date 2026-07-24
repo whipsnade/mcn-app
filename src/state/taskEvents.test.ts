@@ -272,4 +272,53 @@ describe('task flow nodes', () => {
     ]);
     expect(tools?.[1].detail).toBe('响应未确认');
   });
+
+  it('records artifact.updated per module and overwrites the same module key', () => {
+    let state = initialTaskRuntime('task-1');
+    state = reduceTaskEvent(state, {
+      id: 1,
+      taskId: 'task-1',
+      type: 'artifact.updated',
+      payload: {
+        artifact_id: 'artifact-1',
+        goal_id: 'goal-1',
+        artifact_type: 'brand_report',
+        module_key: 'brand',
+        version: 1,
+        title: '品牌分析v1',
+      },
+    });
+    state = reduceTaskEvent(state, {
+      id: 2,
+      taskId: 'task-1',
+      type: 'artifact.updated',
+      payload: {
+        artifact_id: 'artifact-2',
+        goal_id: 'goal-1',
+        artifact_type: 'brand_report',
+        module_key: 'brand',
+        version: 2,
+        title: '品牌分析v2',
+      },
+    });
+    state = reduceTaskEvent(state, {
+      id: 3,
+      taskId: 'task-1',
+      type: 'artifact.updated',
+      payload: {
+        artifact_id: 'artifact-3',
+        artifact_type: 'kol_report',
+        module_key: 'kol_analysis',
+        version: 1,
+        title: 'KOL 分析',
+      },
+    });
+
+    expect(state.artifactUpdates).toEqual({
+      brand: { artifactId: 'artifact-2', moduleKey: 'brand', version: 2, title: '品牌分析v2' },
+      kol_analysis: { artifactId: 'artifact-3', moduleKey: 'kol_analysis', version: 1, title: 'KOL 分析' },
+    });
+    // report.updated 逻辑不受 artifact.updated 影响。
+    expect(state.visibleAnalysisReportId).toBeUndefined();
+  });
 });

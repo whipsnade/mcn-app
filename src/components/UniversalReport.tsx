@@ -6,10 +6,15 @@ import {
 } from 'recharts';
 import { Fragment, useEffect, useRef, useState } from 'react';
 
-import { downloadKolSelection, getKolSelection, runKolAnalysis } from '../api/kolSelection';
+import { downloadKolSelection, getKolSelection, listSelectionSets, runKolAnalysis } from '../api/kolSelection';
 import type { KolSelectionItem } from '../api/kolSelection';
+import { listSessionReports } from '../api/reports';
+import type { SessionReportType } from '../api/reports';
+import { getAnalysisReport } from '../api/tasks';
 import type {
-  ApiAnalysisReport, ApiAnalysisReportChartSeries, ApiAnalysisReportMetricItem, ApiFavorite, ApiTaskStatus, ReportBlock,
+  ApiAnalysisReport, ApiAnalysisReportChartSeries, ApiAnalysisReportMetricItem, ApiArtifactsSummary,
+  ApiArtifactModuleSummary, ApiFavorite, ApiSelectionSetItem, ApiSessionReportItem, ApiTaskStatus,
+  ArtifactModuleKey, ReportBlock,
 } from '../api/contracts';
 import { createFavoriteByKey, deleteFavoriteByKey } from '../api/favorites';
 import FavoriteStar from './FavoriteStar';
@@ -23,6 +28,8 @@ interface UniversalReportProps {
   onReportReady?: (report: ApiAnalysisReport) => void;
   favorites?: readonly ApiFavorite[];
   onFavoriteToggled?: () => void;
+  artifactsSummary?: ApiArtifactsSummary;
+  onMarkArtifactSeen?: (moduleKey: ArtifactModuleKey, artifactId: string) => void;
 }
 
 const chartColors = ['#4f46e5', '#818cf8', '#14b8a6', '#f59b00', '#0ea5e9', '#f43f4f'];
@@ -406,7 +413,147 @@ function KolSelectionCard({ item, favoriteActive, favoriteBusy, onToggleFavorite
   );
 }
 
-export default function UniversalReport({ report, taskStatus, sessionId, selectionCount, onReportReady, favorites = [], onFavoriteToggled }: UniversalReportProps) {
+function formatScopeText(scope: Record<string, unknown> | null | undefined): string {
+  if (!scope) return '';
+  const parts: string[] = [];
+  if (typeof scope.brand === 'string' && scope.brand) parts.push(`品牌：${scope.brand}`);
+  if (typeof scope.campaign === 'string' && scope.campaign) parts.push(`活动：${scope.campaign}`);
+  const period = scope.period;
+  if (period && typeof period === 'object') {
+    const start = String((period as Record<string, unknown>).start ?? '');
+    const end = String((period as Record<string, unknown>).end ?? '');
+    if (start && end) parts.push(`${start}~${end}`);
+  }
+  return parts.join(' · ');
+}
+
+function ReportBlocks({ report }: { report: ApiAnalysisReport }) {
+  const blocks = (report.blocks ?? [])
+    .filter(block => block && typeof block === 'object')
+    .filter(blockHasContent);
+  return (
+    <div className="space-y-3">
+      {blocks.map((block, index) => (
+        <Fragment key={`${block.type}-${index}`}>{ReportBlockView({ block })}</Fragment>
+      ))}
+      {textOf(report.conclusion) && (
+        <Card title="AI 结论" icon={<Sparkles className="h-4 w-4" />}>
+          <p className="whitespace-pre-wrap text-[11px] leading-5 text-slate-600">{report.conclusion}</p>
+        </Card>
+      )}
+      {blocks.length === 0 && !textOf(report.conclusion) && (
+        <p className="rounded-lg bg-slate-50 px-2.5 py-2 text-[11px] text-slate-400">报告内容为空</p>
+      )}
+    </div>
+  );
+}
+
+const versionSelectClass = 'shrink-0 rounded-lg border border-slate-200 bg-white px-2 py-1 text-[10px] font-semibold text-slate-600 shadow-sm';
+
+/** 品牌/活动一级 Tab：该类型最新报告 + 版本下拉 + scope + 失败提示。 */
+function TypedReportPanel({ sessionId, reportType, summaryEntry, emptyText }: {
+  sessionId?: string;
+  reportType: SessionReportType;
+  summaryEntry?: ApiArtifactModuleSummary;
+  emptyText: string;
+}) {
+  const [versions, setVersions] = useState<ApiSessionReportItem[]>([]);
+  const [selectedReportId, setSelectedReportId] = useState<string>();
+  const [report, setReport] = useState<ApiAnalysisReport>();
+  const [loading, setLoading] = useState(false);
+
+  // 版本列表：会话/类型切换时重拉并选中最新一版。
+  useEffect(() => {
+    setVersions([]);
+    setSelectedReportId(undefined);
+    setReport(undefined);
+    if (!sessionId) return;
+    let cancelled = false;
+    setLoading(true);
+    listSessionReports(sessionId, reportType)
+      .then(items => {
+        if (cancelled) return;
+        setVersions(items);
+        setSelectedReportId(items[0]?.report_id);
+        setLoading(false);
+      })
+      .catch(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId, reportType]);
+
+  // 选中版本变化时拉详情。
+  useEffect(() => {
+    if (!selectedReportId) {
+      setReport(undefined);
+      return;
+    }
+    let cancelled = false;
+    getAnalysisReport(selectedReportId)
+      .then(detail => {
+        if (!cancelled) setReport(detail);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedReportId]);
+
+  const scopeText = formatScopeText(
+    report?.scope ?? versions.find(item => item.report_id === selectedReportId)?.scope,
+  );
+  const failedArtifact = summaryEntry?.latest_artifact?.status === 'failed'
+    ? summaryEntry.latest_artifact
+    : undefined;
+
+  return (
+    <div className="flex-1 overflow-y-auto bg-slate-50/40 p-3">
+      <div className="mb-3 flex items-start justify-between gap-2 px-1">
+        <div className="min-w-0">
+          <h3 className="truncate text-[12px] font-bold text-slate-800">{report?.title || emptyText}</h3>
+          {report && (
+            <p className="mt-0.5 text-[9px] text-slate-400">
+              {scopeText && <span>{scopeText} · </span>}
+              报告 v{report.version} · {new Date(report.generated_at).toLocaleString('zh-CN')}
+            </p>
+          )}
+        </div>
+        {versions.length > 0 && (
+          <select
+            aria-label="报告版本"
+            value={selectedReportId ?? ''}
+            onChange={event => setSelectedReportId(event.target.value)}
+            className={versionSelectClass}
+          >
+            {versions.map(item => (
+              <option key={item.report_id} value={item.report_id}>v{item.version}</option>
+            ))}
+          </select>
+        )}
+      </div>
+      {failedArtifact && (
+        <p role="alert" className="mb-3 rounded-lg bg-rose-50 px-2.5 py-2 text-[11px] text-rose-600">
+          上一次报告生成失败，可在会话中重新发起分析
+        </p>
+      )}
+      {loading ? (
+        <p role="status" className="p-6 text-center text-xs text-slate-400">加载中…</p>
+      ) : report ? (
+        <ReportBlocks report={report} />
+      ) : (
+        <div className="flex min-h-[120px] items-center justify-center p-6 text-center text-xs leading-5 text-slate-500">
+          {emptyText}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** 「达人」一级 Tab：KOL 分析 + 圈选达人两子 Tab（原 UniversalReport 主体）。 */
+function KolPanel({ report, taskStatus, sessionId, selectionCount, onReportReady, favorites = [], onFavoriteToggled }: UniversalReportProps) {
   const [analyzing, setAnalyzing] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [actionError, setActionError] = useState<string>();
@@ -416,6 +563,10 @@ export default function UniversalReport({ report, taskStatus, sessionId, selecti
   const [selectionError, setSelectionError] = useState(false);
   const [selectionRefresh, setSelectionRefresh] = useState(0);
   const [favoriteBusyKey, setFavoriteBusyKey] = useState<string | null>(null);
+  const [reportVersions, setReportVersions] = useState<ApiSessionReportItem[]>([]);
+  const [viewReport, setViewReport] = useState<ApiAnalysisReport>();
+  const [selectionSets, setSelectionSets] = useState<ApiSelectionSetItem[]>([]);
+  const [selectedSetId, setSelectedSetId] = useState<string>();
 
   // 面板实例跨会话复用：切换会话时重置本地操作状态，避免把上一个会话的 loading/错误带过来。
   useEffect(() => {
@@ -426,15 +577,40 @@ export default function UniversalReport({ report, taskStatus, sessionId, selecti
     setSelectionItems([]);
     setSelectionLoading(false);
     setSelectionError(false);
+    setReportVersions([]);
+    setViewReport(undefined);
+    setSelectionSets([]);
+    setSelectedSetId(undefined);
   }, [sessionId]);
 
-  // 圈选达人 tab 激活时拉取名单（切 tab / 换会话 / 手动刷新计数）。
+  // kol_analysis 报告版本列表：会话切换/分析成功后重拉（选中版本在 props.report 更新时复位）。
+  useEffect(() => {
+    if (!sessionId) return;
+    let cancelled = false;
+    listSessionReports(sessionId, 'kol_analysis')
+      .then(items => {
+        if (!cancelled) setReportVersions(items);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId, selectionRefresh]);
+
+  useEffect(() => {
+    setViewReport(undefined);
+  }, [report?.id]);
+
+  // 圈选达人 tab 激活时拉取名单（切 tab / 换会话 / 换名单版本 / 手动刷新计数）。
   useEffect(() => {
     if (activeTab !== 'selection' || !sessionId) return;
     let cancelled = false;
     setSelectionLoading(true);
     setSelectionError(false);
-    getKolSelection(sessionId)
+    const request = selectedSetId
+      ? getKolSelection(sessionId, selectedSetId)
+      : getKolSelection(sessionId);
+    request
       .then((data) => {
         if (cancelled) return;
         setSelectionItems(Array.isArray(data.items) ? data.items : []);
@@ -448,7 +624,21 @@ export default function UniversalReport({ report, taskStatus, sessionId, selecti
     return () => {
       cancelled = true;
     };
-  }, [activeTab, sessionId, selectionRefresh]);
+  }, [activeTab, sessionId, selectionRefresh, selectedSetId]);
+
+  // 名单版本列表：圈选达人 tab 激活时拉取。
+  useEffect(() => {
+    if (activeTab !== 'selection' || !sessionId) return;
+    let cancelled = false;
+    listSelectionSets(sessionId)
+      .then(items => {
+        if (!cancelled) setSelectionSets(items);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [activeTab, sessionId]);
 
   // 任务状态仅在「变为终态」的跃迁时刷新名单（正在达人 tab 才刷），避免中间态每次变化重复拉取。
   const taskSettled = isTerminal(taskStatus);
@@ -468,7 +658,7 @@ export default function UniversalReport({ report, taskStatus, sessionId, selecti
     try {
       const nextReport = await runKolAnalysis(sessionId);
       onReportReady?.(nextReport);
-      // 分析成功说明圈选名单已有内容，正在达人 tab 时同步刷新列表。
+      // 分析成功说明圈选名单与报告版本都有更新，正在达人 tab 时同步刷新列表。
       setSelectionRefresh(tick => tick + 1);
     } catch (reason) {
       setActionError(analyzeErrorMessage(reason));
@@ -482,7 +672,11 @@ export default function UniversalReport({ report, taskStatus, sessionId, selecti
     setExporting(true);
     setActionError(undefined);
     try {
-      await downloadKolSelection(sessionId);
+      if (selectedSetId) {
+        await downloadKolSelection(sessionId, selectedSetId);
+      } else {
+        await downloadKolSelection(sessionId);
+      }
     } catch (reason) {
       setActionError(reason instanceof Error && reason.message === 'NO_KOL_SELECTION'
         ? '暂无圈选达人，请先在会话中完成圈选'
@@ -535,9 +729,7 @@ export default function UniversalReport({ report, taskStatus, sessionId, selecti
     }
   };
 
-  const blocks = (report?.blocks ?? [])
-    .filter(block => block && typeof block === 'object')
-    .filter(blockHasContent);
+  const displayedReport = viewReport ?? report;
   const selectedCount = selectionCount ?? 0;
   const emptyText = taskStatus === 'insufficient_balance'
     ? '积分不足，任务已停止'
@@ -546,12 +738,35 @@ export default function UniversalReport({ report, taskStatus, sessionId, selecti
       : '尚未圈选达人，请先在会话中发起圈选';
 
   return (
-    <aside className="flex h-full w-full shrink-0 flex-col overflow-hidden border-l border-slate-200 bg-white shadow-sm xl:w-[420px]">
+    <>
       <header className="flex h-14 shrink-0 items-center justify-between gap-2 border-b border-slate-200 bg-white px-4">
         <div className="min-w-0">
-          <h2 className="truncate text-xs font-bold uppercase tracking-widest text-slate-800">{report?.title || '智能分析报告'}</h2>
-          {report && (
-            <p className="mt-0.5 text-[9px] text-slate-400">报告 v{report.version} · {new Date(report.generated_at).toLocaleString('zh-CN')}</p>
+          <h2 className="truncate text-xs font-bold uppercase tracking-widest text-slate-800">{displayedReport?.title || '智能分析报告'}</h2>
+          {displayedReport && (
+            <p className="mt-0.5 flex items-center gap-1.5 text-[9px] text-slate-400">
+              {reportVersions.length > 0 ? (
+                <select
+                  aria-label="报告版本"
+                  value={viewReport?.id ?? report?.id ?? ''}
+                  onChange={(event) => {
+                    const reportId = event.target.value;
+                    if (!reportId || reportId === report?.id) {
+                      setViewReport(undefined);
+                      return;
+                    }
+                    void getAnalysisReport(reportId).then(setViewReport).catch(() => undefined);
+                  }}
+                  className={versionSelectClass}
+                >
+                  {reportVersions.map(item => (
+                    <option key={item.report_id} value={item.report_id}>v{item.version}</option>
+                  ))}
+                </select>
+              ) : (
+                <span>报告 v{displayedReport.version} · </span>
+              )}
+              {new Date(displayedReport.generated_at).toLocaleString('zh-CN')}
+            </p>
           )}
         </div>
         {sessionId && (
@@ -596,49 +811,56 @@ export default function UniversalReport({ report, taskStatus, sessionId, selecti
       </div>
       <div className="flex-1 overflow-y-auto bg-slate-50/40 p-3">
         {activeTab === 'selection' ? (
-          selectionLoading ? (
-            <p role="status" className="p-6 text-center text-xs text-slate-400">加载中…</p>
-          ) : selectionError ? (
-            <p role="alert" className="rounded-lg bg-rose-50 px-2.5 py-2 text-[11px] text-rose-600">达人名单加载失败，请稍后重试</p>
-          ) : selectionItems.length === 0 ? (
-            <div className="flex min-h-[120px] items-center justify-center p-6 text-center text-xs leading-5 text-slate-500">
-              暂无圈选达人，发起会话后自动圈选
-            </div>
-          ) : (
-            <div className="space-y-2.5">
-              {selectionItems.map(item => (
-                <Fragment key={`${item.platform}-${item.kol_uid}`}>{KolSelectionCard({
-                  item,
-                  favoriteActive: isKolFavorited(item),
-                  favoriteBusy: favoriteBusyKey === `${item.platform}-${item.kol_uid}`,
-                  onToggleFavorite: () => void toggleKolFavorite(item),
-                })}</Fragment>
-              ))}
-            </div>
-          )
+          <>
+            {selectionSets.length > 0 && (
+              <div className="mb-2.5 flex justify-end">
+                <select
+                  aria-label="名单版本"
+                  value={selectedSetId ?? ''}
+                  onChange={event => setSelectedSetId(event.target.value || undefined)}
+                  className={versionSelectClass}
+                >
+                  <option value="">最新名单</option>
+                  {selectionSets.map(item => (
+                    <option key={item.set_id} value={item.set_id}>
+                      {item.title} v{item.version}（{item.item_count}人）
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+            {selectionLoading ? (
+              <p role="status" className="p-6 text-center text-xs text-slate-400">加载中…</p>
+            ) : selectionError ? (
+              <p role="alert" className="rounded-lg bg-rose-50 px-2.5 py-2 text-[11px] text-rose-600">达人名单加载失败，请稍后重试</p>
+            ) : selectionItems.length === 0 ? (
+              <div className="flex min-h-[120px] items-center justify-center p-6 text-center text-xs leading-5 text-slate-500">
+                暂无圈选达人，发起会话后自动圈选
+              </div>
+            ) : (
+              <div className="space-y-2.5">
+                {selectionItems.map(item => (
+                  <Fragment key={`${item.platform}-${item.kol_uid}`}>{KolSelectionCard({
+                    item,
+                    favoriteActive: isKolFavorited(item),
+                    favoriteBusy: favoriteBusyKey === `${item.platform}-${item.kol_uid}`,
+                    onToggleFavorite: () => void toggleKolFavorite(item),
+                  })}</Fragment>
+                ))}
+              </div>
+            )}
+          </>
         ) : (
           <>
             {actionError && (
               <p role="alert" className="mb-3 rounded-lg bg-rose-50 px-2.5 py-2 text-[11px] text-rose-600">{actionError}</p>
             )}
-            {report ? (
+            {displayedReport ? (
               <>
-                {taskStatus && !isTerminal(taskStatus) && (
+                {taskStatus && !isTerminal(taskStatus) && !viewReport && (
                   <p role="status" className="mb-3 rounded-lg bg-indigo-50 px-2.5 py-2 text-[11px] text-indigo-600">任务进行中，报告内容可能继续更新…</p>
                 )}
-                <div className="space-y-3">
-                  {blocks.map((block, index) => (
-                    <Fragment key={`${block.type}-${index}`}>{ReportBlockView({ block })}</Fragment>
-                  ))}
-                  {textOf(report.conclusion) && (
-                    <Card title="AI 结论" icon={<Sparkles className="h-4 w-4" />}>
-                      <p className="whitespace-pre-wrap text-[11px] leading-5 text-slate-600">{report.conclusion}</p>
-                    </Card>
-                  )}
-                  {blocks.length === 0 && !textOf(report.conclusion) && (
-                    <p className="rounded-lg bg-slate-50 px-2.5 py-2 text-[11px] text-slate-400">报告内容为空</p>
-                  )}
-                </div>
+                <ReportBlocks report={displayedReport} />
               </>
             ) : (
               <div className="flex min-h-[120px] items-center justify-center p-6 text-center text-xs leading-5 text-slate-500">
@@ -648,6 +870,77 @@ export default function UniversalReport({ report, taskStatus, sessionId, selecti
           </>
         )}
       </div>
+    </>
+  );
+}
+
+type TopTabId = 'brand' | 'campaign' | 'kol';
+
+const TOP_TABS: { id: TopTabId; label: string }[] = [
+  { id: 'brand', label: '品牌分析' },
+  { id: 'campaign', label: '活动分析' },
+  { id: 'kol', label: '达人' },
+];
+
+export default function UniversalReport(props: UniversalReportProps) {
+  const { artifactsSummary, onMarkArtifactSeen, sessionId } = props;
+  const [topTab, setTopTab] = useState<TopTabId>('kol');
+
+  // 切换会话回到默认一级 Tab；任务完成/artifact.updated 不自动切换（保持当前 Tab）。
+  useEffect(() => {
+    setTopTab('kol');
+  }, [sessionId]);
+
+  const unreadOf = (id: TopTabId): boolean => {
+    if (!artifactsSummary) return false;
+    if (id === 'kol') {
+      return Boolean(artifactsSummary.kol_analysis?.unread || artifactsSummary.kol_selection?.unread);
+    }
+    return Boolean(artifactsSummary[id]?.unread);
+  };
+
+  const handleSelect = (id: TopTabId) => {
+    setTopTab(id);
+    const modules: ArtifactModuleKey[] = id === 'kol' ? ['kol_analysis', 'kol_selection'] : [id];
+    for (const moduleKey of modules) {
+      const entry = artifactsSummary?.[moduleKey];
+      if (entry?.unread && entry.latest_artifact) {
+        onMarkArtifactSeen?.(moduleKey, entry.latest_artifact.artifact_id);
+      }
+    }
+  };
+
+  return (
+    <aside className="flex h-full w-full shrink-0 flex-col overflow-hidden border-l border-slate-200 bg-white shadow-sm xl:w-[420px]">
+      <div role="tablist" aria-label="分析报告" className="flex h-11 shrink-0 border-b border-slate-200 bg-white px-4">
+        {TOP_TABS.map(({ id, label }) => (
+          <button
+            key={id}
+            type="button"
+            role="tab"
+            aria-selected={topTab === id}
+            onClick={() => handleSelect(id)}
+            className={topTab === id
+              ? 'flex shrink-0 items-center gap-1.5 border-b-2 border-indigo-600 px-3 text-[11px] font-semibold text-indigo-600'
+              : 'flex shrink-0 items-center gap-1.5 px-3 text-[11px] font-medium text-slate-500 transition hover:text-slate-800'}
+          >
+            {label}
+            {unreadOf(id) && (
+              <span aria-label="未读" className="h-1.5 w-1.5 rounded-full bg-rose-500" />
+            )}
+          </button>
+        ))}
+      </div>
+      {topTab === 'kol' ? (
+        <KolPanel {...props} />
+      ) : (
+        <TypedReportPanel
+          sessionId={sessionId}
+          reportType={topTab === 'brand' ? 'brand_analysis' : 'campaign_analysis'}
+          summaryEntry={artifactsSummary?.[topTab]}
+          emptyText={topTab === 'brand' ? '完成一次品牌分析后在此展示' : '完成一次活动分析后在此展示'}
+        />
+      )}
     </aside>
   );
 }

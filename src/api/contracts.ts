@@ -94,8 +94,13 @@ export interface BrainstormMetadata {
   profile_summary?: ApiBrainstormProfile | null;
 }
 
+export interface ClarifyMetadata {
+  options: string[];
+}
+
 export interface ApiMessageMetadata extends Record<string, unknown> {
   brainstorm?: BrainstormMetadata;
+  clarify?: ClarifyMetadata;
 }
 
 export interface ApiMessage {
@@ -163,6 +168,20 @@ export interface ApiTask {
   followup_error?: Record<string, unknown> | null;
 }
 
+/** create_task 已建任务（enforce 关闭或 planner execute）。 */
+export interface ApiTaskCreateTaskOutcome {
+  outcome: 'task';
+  task: ApiTask;
+}
+
+/** create_task planner 澄清：不落任务，返回 assistant 澄清消息。 */
+export interface ApiTaskCreateClarifyOutcome {
+  outcome: 'clarify';
+  message: ApiMessage;
+}
+
+export type TaskCreateResult = ApiTaskCreateTaskOutcome | ApiTaskCreateClarifyOutcome;
+
 export interface ApiTaskSummary {
   id: string;
   status: ApiTaskStatus;
@@ -206,12 +225,51 @@ export interface ApiAnalysisReport {
   id: string;
   // 会话级 KOL 分析报告不绑定任务，task_id 为 null。
   task_id: string | null;
+  report_type?: string;
+  scope?: Record<string, unknown> | null;
   version: number;
   title: string;
   blocks: ReportBlock[];
   conclusion: string | null;
   status: string;
   generated_at: string;
+}
+
+export interface ApiSessionReportItem {
+  report_id: string;
+  title: string;
+  version: number;
+  scope: Record<string, unknown> | null;
+  status: string;
+  created_at: string;
+}
+
+export type ArtifactModuleKey = 'brand' | 'campaign' | 'kol_analysis' | 'kol_selection';
+
+export interface ApiArtifactSummaryEntry {
+  artifact_id: string;
+  artifact_type: string;
+  title: string;
+  version: number;
+  scope: Record<string, unknown> | null;
+  status: string;
+  created_at: string;
+}
+
+export interface ApiArtifactModuleSummary {
+  latest_artifact: ApiArtifactSummaryEntry | null;
+  unread: boolean;
+}
+
+export type ApiArtifactsSummary = Record<ArtifactModuleKey, ApiArtifactModuleSummary>;
+
+export interface ApiSelectionSetItem {
+  set_id: string;
+  title: string;
+  version: number;
+  status: string;
+  item_count: number;
+  created_at: string;
 }
 
 export interface ApiAnalysisReportSummary {

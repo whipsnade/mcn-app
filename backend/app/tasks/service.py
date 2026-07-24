@@ -62,6 +62,8 @@ class TaskService:
         retry_key: str | None = None,
         idempotency_key_hash: str | None = None,
         idempotency_payload_hash: str | None = None,
+        goal_type: str = "kol_selection",
+        goal_params: dict | None = None,
     ) -> AnalysisTask:
         workspace_service = WorkspaceService(self.db)
         session = await workspace_service.get_owned_session(user_id, session_id, for_update=True)
@@ -132,22 +134,24 @@ class TaskService:
         }
         self.db.add(task)
         await self.db.flush()
-        # 阶段二单 Goal 包装：每条新任务（含重试任务）同事务落一条
-        # kol_selection goal，params 取会话 brand/category 快照（None 省略）。
-        goal_params = {
+        # 阶段二单 Goal 包装：每条新任务（含重试任务）同事务落一条 goal。
+        # 默认 kol_selection + 会话 brand/category 快照（None 省略）；
+        # enforce 模式下由 planner 透传 goal_type/params（合并到快照之上）。
+        goal_snapshot = {
             key: value
             for key, value in {"brand": session.brand, "category": session.category}.items()
             if value is not None
         }
+        merged_goal_params = {**goal_snapshot, **goal_params} if goal_params else goal_snapshot
         self.db.add(
             TaskGoal(
                 id=str(uuid4()),
                 task_id=task.id,
                 sequence=1,
-                goal_type="kol_selection",
+                goal_type=goal_type,
                 status="pending",
                 depends_on_goal_id=None,
-                params_json=goal_params,
+                params_json=merged_goal_params,
                 trajectory_json=None,
                 result_summary_json=None,
                 warning_code=None,
@@ -167,12 +171,28 @@ class TaskService:
         )
         return task
 
+    async def find_idempotent(
+        self, user_id: str, session_id: str, idempotency_key: str
+    ) -> AnalysisTask | None:
+        """幂等键预查（enforce 模式：命中则跳过 planner，不重复扣调用）。"""
+        key_hash = idempotency_key_digest(idempotency_key)
+        return await self.db.scalar(
+            select(AnalysisTask).where(
+                AnalysisTask.user_id == user_id,
+                AnalysisTask.session_id == session_id,
+                AnalysisTask.idempotency_key_hash == key_hash,
+            )
+        )
+
     async def create_idempotent(
         self,
         user_id: str,
         session_id: str,
         payload: TaskCreate,
         idempotency_key: str,
+        *,
+        goal_type: str = "kol_selection",
+        goal_params: dict | None = None,
     ) -> tuple[AnalysisTask, bool]:
         """Create once per user/session/key, atomically across processes."""
         key_hash = idempotency_key_digest(idempotency_key)
@@ -198,6 +218,8 @@ class TaskService:
                     payload,
                     idempotency_key_hash=key_hash,
                     idempotency_payload_hash=payload_hash,
+                    goal_type=goal_type,
+                    goal_params=goal_params,
                 )
         except IntegrityError:
             # Another process won the unique index race. The savepoint keeps

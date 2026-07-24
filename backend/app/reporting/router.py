@@ -1,14 +1,25 @@
 from __future__ import annotations
 
+import logging
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.artifacts.service import ArtifactService
+from app.core.errors import ErrorCode
 from app.db.session import get_db
+from app.goals.models import TaskGoal
 from app.identity.dependencies import CurrentUser
+from app.model.contracts import ModelAdapter, ModelAdapterError
+from app.model.dependencies import get_model_adapter
 from app.reporting.analysis_reports import AnalysisReportService
+from app.reporting.builders import (
+    collect_goal_evidence,
+    run_brand_analysis,
+    run_campaign_analysis,
+)
 from app.reporting.models import (
     AnalysisReport,
     Kol,
@@ -18,19 +29,38 @@ from app.reporting.models import (
 from app.reporting.schemas import (
     AnalysisReportRead,
     AnalysisReportSummary,
+    AnalysisRetryRequest,
     FavoriteCreate,
     FavoriteRead,
+    SessionReportItem,
+    SessionReportType,
 )
 from app.reporting.service import ReportingService
+from app.tasks.models import AnalysisTask
+from app.workspace.models import WorkspaceSession
 
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
+
+# report_type → (artifact_type, 构建器)
+_ANALYSIS_RETRY_BUILDERS = {
+    "brand_analysis": ("brand_report", run_brand_analysis),
+    "campaign_analysis": ("campaign_report", run_campaign_analysis),
+}
+
+
+def analysis_model() -> ModelAdapter:
+    """间接引用便于测试替换模型适配器。"""
+    return get_model_adapter()
 
 
 def analysis_report_read(report: AnalysisReport) -> AnalysisReportRead:
     return AnalysisReportRead(
         id=report.id,
         task_id=report.task_id,
+        report_type=report.report_type,
+        scope=report.scope_json,
         version=report.version,
         title=report.title,
         blocks=list(report.blocks_json),
@@ -82,6 +112,118 @@ def favorite_read(
 
 def not_found(detail: str) -> HTTPException:
     return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=detail)
+
+
+@router.get("/sessions/{session_id}/reports", response_model=list[SessionReportItem])
+async def list_session_reports(
+    session_id: str,
+    user: CurrentUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    report_type: Annotated[SessionReportType, Query()],
+) -> list[SessionReportItem]:
+    """按类型列出会话报告版本（version desc）。"""
+    session = await db.get(WorkspaceSession, session_id)
+    if session is None or session.user_id != user.id or session.deleted_at is not None:
+        raise not_found("session_not_found")
+    reports = list(
+        (
+            await db.scalars(
+                select(AnalysisReport)
+                .where(
+                    AnalysisReport.session_id == session_id,
+                    AnalysisReport.report_type == report_type,
+                )
+                .order_by(AnalysisReport.version.desc())
+            )
+        ).all()
+    )
+    return [
+        SessionReportItem(
+            report_id=report.id,
+            title=report.title,
+            version=report.version,
+            scope=report.scope_json,
+            status=report.status,
+            created_at=report.created_at,
+        )
+        for report in reports
+    ]
+
+
+@router.post("/sessions/{session_id}/analysis-retry", response_model=AnalysisReportRead)
+async def retry_analysis(
+    session_id: str,
+    payload: AnalysisRetryRequest,
+    user: CurrentUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    model: Annotated[ModelAdapter, Depends(analysis_model)],
+) -> AnalysisReportRead:
+    """品牌/活动报告手动重试：重跑构建器（不调 MCP、零积分），同步返回不发 SSE。
+
+    找会话最近一个该 goal_type 且轨迹证据非空的 task_goal；无则 409 NO_EVIDENCE。
+    """
+    session = await db.get(WorkspaceSession, session_id)
+    if session is None or session.user_id != user.id or session.deleted_at is not None:
+        raise not_found("session_not_found")
+    goals = list(
+        (
+            await db.scalars(
+                select(TaskGoal)
+                .join(AnalysisTask, AnalysisTask.id == TaskGoal.task_id)
+                .where(
+                    AnalysisTask.session_id == session_id,
+                    TaskGoal.goal_type == payload.report_type,
+                )
+                .order_by(TaskGoal.created_at.desc())
+            )
+        ).all()
+    )
+    target: tuple[AnalysisTask, TaskGoal] | None = None
+    for goal in goals:
+        task = await db.get(AnalysisTask, goal.task_id)
+        if task is not None and collect_goal_evidence(task.plan_json):
+            target = (task, goal)
+            break
+    if target is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="NO_EVIDENCE"
+        )
+    task, goal = target
+    artifact_type, builder = _ANALYSIS_RETRY_BUILDERS[payload.report_type]
+    try:
+        report = await builder(
+            db,
+            model,
+            user_id=user.id,
+            session_id=session_id,
+            task=task,
+            goal=goal,
+        )
+    except ModelAdapterError as error:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=ErrorCode.ANALYSIS_MODEL_ERROR,
+        ) from error
+    try:
+        # 手动重试产物登记 manual Artifact（artifact_key 含 report_id，天然幂等）。
+        await ArtifactService(db).register_artifact(
+            user_id=user.id,
+            session_id=session_id,
+            artifact_key=f"manual:{report.id}:{artifact_type}",
+            artifact_type=artifact_type,
+            title=report.title,
+            version=report.version,
+            status=report.status,
+            task_id=None,
+            report_id=report.id,
+            scope=report.scope_json,
+        )
+    except Exception:
+        logger.warning(
+            "analysis_retry_artifact_register_failed report_id=%s", report.id, exc_info=True
+        )
+    await db.commit()
+    return analysis_report_read(report)
 
 
 @router.get("/analysis-reports/{report_id}", response_model=AnalysisReportRead)

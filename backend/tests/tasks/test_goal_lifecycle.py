@@ -12,6 +12,7 @@ from app.db.session import SessionFactory
 from app.goals.models import TaskGoal
 from app.identity.models import User
 from app.mcp_gateway.contracts import DataTapService
+from app.model.contracts import ModelPlanInvalidError, StructuredResult
 from app.orchestration.loop import AgentDecision, AgentLoopContext
 from app.orchestration.schemas import PlannerTool
 from app.reporting.analysis_reports import AnalysisReportService
@@ -260,7 +261,11 @@ class _LegacyStore(_FakeStore):
 
 
 class _FakeContextBuilder:
-    async def build_agent_context(self, user_id, session_id):
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    async def build_agent_context(self, user_id, session_id, **kwargs):
+        self.calls.append(kwargs)
         return AgentLoopContext(
             recent_messages=(),
             tools=(_tool(),),
@@ -327,10 +332,10 @@ def _task() -> SimpleNamespace:
     )
 
 
-def _executor(store, decider, gateway, artifacts, selection=None) -> TaskExecutor:
+def _executor(store, decider, gateway, artifacts, selection=None, context_builder=None) -> TaskExecutor:
     return TaskExecutor(
         repository=store,
-        context_builder=_FakeContextBuilder(),
+        context_builder=context_builder or _FakeContextBuilder(),
         planner=decider,
         gateway=gateway,
         artifacts=artifacts,
@@ -401,6 +406,34 @@ async def test_goal_flow_no_evidence_fails_goal_with_error_code() -> None:
 
 
 @pytest.mark.asyncio
+async def test_brand_goal_skips_selection_ingest_and_passes_goal_context() -> None:
+    brand_goal = SimpleNamespace(
+        id="goal-brand",
+        goal_type="brand_analysis",
+        sequence=1,
+        params_json={"brand": "海底捞"},
+    )
+    store = _FakeStore(_task(), goal=brand_goal)
+    gateway = _FakeGateway([(_settled(),)])
+    artifacts = _FakeArtifacts(store)
+    selection = _FakeSelection()
+    context_builder = _FakeContextBuilder()
+    executor = _executor(store, _ScriptedDecider([_call(), _finish("done")]), gateway,
+                         artifacts, selection, context_builder)
+
+    await executor.run("task-1")
+
+    # 品牌/活动 goal 不沉淀圈选名单（ingest 仅 kol_selection 触发）。
+    assert selection.calls == []
+    # goal_type/params 传入 build_agent_context。
+    assert context_builder.calls == [
+        {"goal_type": "brand_analysis", "goal_params": {"brand": "海底捞"}}
+    ]
+    assert store.events[0][0] == "goal.started"
+    assert store.terminal == "completed"
+
+
+@pytest.mark.asyncio
 async def test_goal_flow_legacy_task_has_zero_behavior_diff() -> None:
     store = _LegacyStore(_task(), goal=None)
     gateway = _FakeGateway([(_settled(),)])
@@ -427,8 +460,14 @@ async def test_goal_flow_legacy_task_has_zero_behavior_diff() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def _create_leased_task_with_goal(worker_id: str) -> dict[str, str]:
-    """写入持有有效租约的任务 + kol_selection goal（plan_json 非空验证轨迹镜像）。"""
+async def _create_leased_task_with_goal(
+    worker_id: str,
+    *,
+    goal_type: str = "kol_selection",
+    goal_params: dict | None = None,
+    plan_results: list[dict] | None = None,
+) -> dict[str, str]:
+    """写入持有有效租约的任务 + goal（plan_json 非空验证轨迹镜像/证据聚合）。"""
     now = datetime.now(UTC).replace(tzinfo=None)
     ids = {
         "user_id": str(uuid4()),
@@ -437,6 +476,15 @@ async def _create_leased_task_with_goal(worker_id: str) -> dict[str, str]:
         "task_id": str(uuid4()),
         "goal_id": str(uuid4()),
     }
+    if plan_results is None:
+        plan_results = [
+            {
+                "step_id": "step_1",
+                "tool": "datatap.insight.query.analysis.v1",
+                "status": "settled",
+                "summary": {"total_volume": 12345},
+            }
+        ]
     async with SessionFactory.begin() as db:
         db.add(
             User(
@@ -485,7 +533,7 @@ async def _create_leased_task_with_goal(worker_id: str) -> dict[str, str]:
                 trigger_message_id=ids["message_id"],
                 status="running",
                 kind="agent",
-                plan_json={"agent_trajectory_v1": {"steps": [], "results": []}},
+                plan_json={"schema": "agent_trajectory_v1", "steps": [], "results": plan_results},
                 lease_owner=worker_id,
                 lease_expires_at=now + timedelta(minutes=5),
                 started_at=now,
@@ -502,9 +550,13 @@ async def _create_leased_task_with_goal(worker_id: str) -> dict[str, str]:
                 id=ids["goal_id"],
                 task_id=ids["task_id"],
                 sequence=1,
-                goal_type="kol_selection",
+                goal_type=goal_type,
                 status="running",
-                params_json={"brand": "海底捞", "category": "美食"},
+                params_json=(
+                    goal_params
+                    if goal_params is not None
+                    else {"brand": "海底捞", "category": "美食"}
+                ),
                 started_at=now,
                 created_at=now,
                 updated_at=now,
@@ -550,6 +602,180 @@ def _document() -> ReportDocument:
         conclusion="名单质量良好。",
         blocks=[MetricGridBlock(items=[MetricItem(label="圈选总数", value=2)])],
     )
+
+
+class _FakeAnalysisModel:
+    """报告构建模型 stub：document 为 None 时模拟模型输出校验失败。"""
+
+    def __init__(self, document: ReportDocument | None) -> None:
+        self.document = document
+        self.requests: list = []
+
+    async def complete_json(self, request):
+        self.requests.append(request)
+        if self.document is None:
+            raise ModelPlanInvalidError("MODEL_PLAN_INVALID", retryable=False)
+        return StructuredResult(
+            value=self.document,
+            usage=None,
+            request_id="req-test",
+            regeneration_count=0,
+        )
+
+
+@pytest.mark.asyncio
+async def test_finalize_brand_goal_builds_report_and_artifacts() -> None:
+    worker_id = f"test-worker-{uuid4()}"
+    ids = await _create_leased_task_with_goal(
+        worker_id, goal_type="brand_analysis", goal_params={"brand": "海底捞"}
+    )
+    try:
+        artifacts = _TaskArtifacts(worker_id, model=_FakeAnalysisModel(_document()))
+
+        await artifacts.finalize_goal(ids["task_id"], terminal_status="completed")
+
+        async with SessionFactory() as db:
+            goal = await db.get(TaskGoal, ids["goal_id"])
+            assert goal is not None
+            assert goal.status == "completed"
+            assert goal.warning_code is None
+
+            report = await db.scalar(
+                select(AnalysisReport).where(AnalysisReport.session_id == ids["session_id"])
+            )
+            assert report is not None
+            assert report.report_type == "brand_analysis"
+            assert report.version == 1
+            assert report.scope_json == {"brand": "海底捞"}
+
+            artifact_rows = {
+                artifact.artifact_key: artifact
+                for artifact in (
+                    await db.scalars(
+                        select(TaskArtifact).where(TaskArtifact.goal_id == ids["goal_id"])
+                    )
+                ).all()
+            }
+            # 品牌 goal：只有 brand_report artifact，无 kol 专属产物。
+            assert set(artifact_rows) == {f"goal:{ids['goal_id']}:brand_report"}
+            artifact = artifact_rows[f"goal:{ids['goal_id']}:brand_report"]
+            assert artifact.artifact_type == "brand_report"
+            assert artifact.report_id == report.id
+            assert artifact.version == 1
+            assert artifact.status == "completed"
+            assert artifact.scope_json == {"brand": "海底捞"}
+
+            events = list(
+                (
+                    await db.scalars(
+                        select(TaskEvent)
+                        .where(TaskEvent.task_id == ids["task_id"])
+                        .order_by(TaskEvent.id)
+                    )
+                ).all()
+            )
+            event_types = [event.event_type for event in events]
+            assert "report.updated" in event_types
+            assert "artifact.updated" in event_types
+            assert "goal.completed" in event_types
+            report_event = next(e for e in events if e.event_type == "report.updated")
+            assert report_event.payload_json["report_id"] == report.id
+            assert report_event.payload_json["version"] == 1
+            artifact_event = next(e for e in events if e.event_type == "artifact.updated")
+            assert artifact_event.payload_json["artifact_type"] == "brand_report"
+            assert artifact_event.payload_json["module_key"] == "brand"
+            assert artifact_event.payload_json["artifact_id"] == artifact.id
+    finally:
+        await _cleanup(ids)
+
+
+@pytest.mark.asyncio
+async def test_finalize_campaign_goal_report_failure_degrades_to_warnings() -> None:
+    worker_id = f"test-worker-{uuid4()}"
+    ids = await _create_leased_task_with_goal(
+        worker_id,
+        goal_type="campaign_analysis",
+        goal_params={"brand": "海底捞", "campaign": "618大促"},
+    )
+    try:
+        # 模型输出校验失败：报告生成失败 → goal 降级 + failed artifact，不删证据。
+        artifacts = _TaskArtifacts(worker_id, model=_FakeAnalysisModel(None))
+
+        await artifacts.finalize_goal(ids["task_id"], terminal_status="completed")
+
+        async with SessionFactory() as db:
+            goal = await db.get(TaskGoal, ids["goal_id"])
+            assert goal is not None
+            assert goal.status == "completed_with_warnings"
+            assert goal.warning_code is not None
+            # 证据保留：trajectory 仍镜像 task.plan_json。
+            assert goal.trajectory_json is not None
+
+            assert (
+                await db.scalar(
+                    select(AnalysisReport).where(
+                        AnalysisReport.session_id == ids["session_id"]
+                    )
+                )
+                is None
+            )
+            artifact = await db.scalar(
+                select(TaskArtifact).where(
+                    TaskArtifact.artifact_key == f"goal:{ids['goal_id']}:campaign_report"
+                )
+            )
+            assert artifact is not None
+            assert artifact.artifact_type == "campaign_report"
+            assert artifact.status == "failed"
+            assert artifact.report_id is None
+            assert artifact.error_code is not None
+
+            events = list(
+                (
+                    await db.scalars(
+                        select(TaskEvent).where(TaskEvent.task_id == ids["task_id"])
+                    )
+                ).all()
+            )
+            event_types = [event.event_type for event in events]
+            assert "report.updated" not in event_types
+            artifact_event = next(e for e in events if e.event_type == "artifact.updated")
+            assert artifact_event.payload_json["artifact_type"] == "campaign_report"
+            goal_event = next(e for e in events if e.event_type == "goal.completed")
+            assert goal_event.payload_json["status"] == "completed_with_warnings"
+    finally:
+        await _cleanup(ids)
+
+
+@pytest.mark.asyncio
+async def test_finalize_brand_goal_empty_evidence_marks_failed_artifact() -> None:
+    worker_id = f"test-worker-{uuid4()}"
+    ids = await _create_leased_task_with_goal(
+        worker_id,
+        goal_type="brand_analysis",
+        goal_params={"brand": "海底捞"},
+        plan_results=[],
+    )
+    try:
+        artifacts = _TaskArtifacts(worker_id, model=_FakeAnalysisModel(_document()))
+
+        await artifacts.finalize_goal(ids["task_id"], terminal_status="completed")
+
+        async with SessionFactory() as db:
+            goal = await db.get(TaskGoal, ids["goal_id"])
+            assert goal is not None
+            assert goal.status == "completed_with_warnings"
+            assert goal.warning_code == "no_evidence_collected"
+            artifact = await db.scalar(
+                select(TaskArtifact).where(
+                    TaskArtifact.artifact_key == f"goal:{ids['goal_id']}:brand_report"
+                )
+            )
+            assert artifact is not None
+            assert artifact.status == "failed"
+            assert artifact.error_code == "no_evidence_collected"
+    finally:
+        await _cleanup(ids)
 
 
 async def _seed_set_and_report(ids: dict[str, str]) -> tuple[str, str]:
@@ -609,7 +835,18 @@ async def test_finalize_goal_completes_set_and_registers_artifacts() -> None:
             assert goal.completed_at is not None
             assert goal.error_code is None
             # 轨迹镜像 task.plan_json。
-            assert goal.trajectory_json == {"agent_trajectory_v1": {"steps": [], "results": []}}
+            assert goal.trajectory_json == {
+                "schema": "agent_trajectory_v1",
+                "steps": [],
+                "results": [
+                    {
+                        "step_id": "step_1",
+                        "tool": "datatap.insight.query.analysis.v1",
+                        "status": "settled",
+                        "summary": {"total_volume": 12345},
+                    }
+                ],
+            }
             selection_set = await db.get(KolSelectionSet, set_id)
             assert selection_set is not None
             assert selection_set.status == "completed"

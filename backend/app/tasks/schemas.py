@@ -4,6 +4,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, field_validator
 
 from app.tasks.state import TaskEventType, TaskStatus
+from app.workspace.schemas import MessageRead
 
 
 class TaskCreate(BaseModel):
@@ -38,3 +39,20 @@ class TaskEventRead(BaseModel):
     type: TaskEventType
     payload: dict[str, Any]
     created_at: datetime
+
+
+class TaskOutcomeTask(BaseModel):
+    """create_task 已建任务（enforce 关闭或 planner execute）。"""
+
+    outcome: Literal["task"] = "task"
+    task: TaskRead
+
+
+class TaskOutcomeClarify(BaseModel):
+    """create_task planner 澄清：不落任务，返回落库的 assistant 澄清消息。"""
+
+    outcome: Literal["clarify"] = "clarify"
+    message: MessageRead
+
+
+TaskCreateResult = TaskOutcomeTask | TaskOutcomeClarify

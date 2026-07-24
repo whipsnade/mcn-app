@@ -122,3 +122,60 @@ async def test_context_carries_account_default_brand_from_profiles(
     assert context.account_default_brand == "海底捞"
     # 会话 active_brand 优先级不受影响，仍取会话品牌。
     assert context.session_context["active_brand"] == "喜茶"
+
+
+@pytest.mark.asyncio
+async def test_build_for_message_assembles_context_without_task(
+    db_session, user_factory
+) -> None:
+    """build_for_message 不依赖 task：当前消息用入参（可能尚未落库），尾部补进 recent。"""
+    user = await user_factory()
+    await BrandProfileService(db_session).set_default_brand(user.id, "海底捞")
+    workspace_service = WorkspaceService(db_session)
+    workspace = await workspace_service.create_session(
+        user.id,
+        SessionCreate(brand="喜茶", category="茶饮"),
+    )
+    await workspace_service.append_message(
+        user.id, workspace.id, MessageCreate(content="先看看历史消息")
+    )
+
+    @asynccontextmanager
+    async def borrowed_session():
+        yield db_session
+
+    context = await GoalPlannerContextBuilder(borrowed_session).build_for_message(
+        user.id, workspace.id, "分析一下 618 活动"
+    )
+
+    assert context.user_id == user.id
+    assert context.session_id == workspace.id
+    assert context.task_id == ""
+    assert context.current_message == "分析一下 618 活动"
+    # 尾部是未落库的当前消息（role=user），历史消息在前。
+    assert context.recent_messages[-1].content == "分析一下 618 活动"
+    assert context.recent_messages[-1].role == "user"
+    assert context.recent_messages[-2].content == "先看看历史消息"
+    assert context.session_context["active_brand"] == "喜茶"
+    assert context.session_context["category"] == "茶饮"
+    assert context.account_default_brand == "海底捞"
+    assert context.artifact_summaries == ()
+
+
+@pytest.mark.asyncio
+async def test_build_for_message_rejects_foreign_session(db_session, user_factory) -> None:
+    user = await user_factory()
+    other = await user_factory()
+    workspace = await WorkspaceService(db_session).create_session(
+        user.id,
+        SessionCreate(brand="喜茶", category="茶饮"),
+    )
+
+    @asynccontextmanager
+    async def borrowed_session():
+        yield db_session
+
+    with pytest.raises(LookupError, match="session_not_found"):
+        await GoalPlannerContextBuilder(borrowed_session).build_for_message(
+            other.id, workspace.id, "越权消息"
+        )

@@ -21,6 +21,7 @@ export function toMessage(message: ApiMessage): Message {
       ? message.metadata.latest_analysis_task_id
       : typeof message.metadata.task_id === 'string' ? message.metadata.task_id : undefined,
     brainstorm: message.metadata.brainstorm,
+    clarify: message.metadata.clarify,
     timestamp: new Date(message.created_at).toLocaleTimeString('zh-CN', {
       hour: '2-digit',
       minute: '2-digit',

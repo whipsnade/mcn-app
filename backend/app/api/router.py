@@ -1,6 +1,7 @@
 from fastapi import APIRouter
 
 from app.admin.router import router as admin_router
+from app.artifacts.router import router as artifacts_router
 from app.billing.router import router as billing_router
 from app.brainstorm.router import router as brainstorm_router
 from app.identity.router import auth_router, users_router
@@ -21,3 +22,4 @@ api_router.include_router(quick_router, prefix="/quick", tags=["quick"])
 api_router.include_router(tasks_router, tags=["tasks"])
 api_router.include_router(reporting_router, tags=["reporting"])
 api_router.include_router(selection_router, tags=["selection"])
+api_router.include_router(artifacts_router, tags=["artifacts"])

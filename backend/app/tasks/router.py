@@ -1,27 +1,43 @@
 import json
 import asyncio
+import logging
 from contextlib import suppress
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from typing import Annotated
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
 from app.db.session import SessionFactory, get_db
+from app.goals.context import GoalPlannerContextBuilder
+from app.goals.planner import GoalPlannerService
+from app.goals.schemas import GoalPlannerOutput
 from app.identity.dependencies import FunctionScopedCurrentUser
+from app.model.dependencies import get_model_adapter
 from app.tasks.models import AnalysisTask, TaskEvent
 from app.tasks.events import TaskEventBroker, TaskEventStream
 from app.tasks.repository import TaskRepository
-from app.tasks.schemas import TaskCreate, TaskRead
+from app.tasks.schemas import (
+    TaskCreate,
+    TaskCreateResult,
+    TaskOutcomeClarify,
+    TaskOutcomeTask,
+    TaskRead,
+)
 from app.tasks.service import TaskConflictError, TaskService
 from app.tasks.executor import TaskRunner
 from app.workspace.models import Message
+from app.workspace.serializers import message_read
 
 
 router = APIRouter()
 task_event_broker = TaskEventBroker()
+logger = logging.getLogger(__name__)
 
 
 def get_task_event_stream() -> TaskEventStream:
@@ -125,7 +141,52 @@ def task_not_found(error: LookupError) -> HTTPException:
     return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="task_not_found")
 
 
-@router.post("/sessions/{session_id}/tasks", response_model=TaskRead, status_code=202)
+async def _plan_goal_or_fallback(
+    db: AsyncSession, user_id: str, session_id: str, content: str
+) -> GoalPlannerOutput | None:
+    """enforce 规划；任何失败回退 None（kol_selection 单 Goal），不阻塞用户。
+
+    ``LookupError("session_not_found")`` 是会话归属问题，原样上抛映射 404。
+    """
+    try:
+        context = await GoalPlannerContextBuilder().build_for_message(
+            user_id, session_id, content, db=db
+        )
+        return await GoalPlannerService(
+            model=get_model_adapter(), context_builder=None
+        ).plan_context(context)
+    except LookupError:
+        raise
+    except Exception:
+        logger.warning(
+            "goal_planner_enforce_fallback session_id=%s", session_id, exc_info=True
+        )
+        return None
+
+
+async def _append_clarify_message(
+    db: AsyncSession, user_id: str, session_id: str, question
+) -> Message:
+    """planner clarify：落一条 assistant 澄清消息（options 存 metadata.clarify）。"""
+    max_sequence = await db.scalar(
+        select(func.max(Message.sequence)).where(Message.session_id == session_id)
+    )
+    message = Message(
+        id=str(uuid4()),
+        session_id=session_id,
+        user_id=user_id,
+        role="assistant",
+        content=question.text,
+        sequence=(max_sequence or 0) + 1,
+        metadata_json={"clarify": {"options": list(question.options)}},
+        created_at=datetime.now(UTC).replace(tzinfo=None),
+    )
+    db.add(message)
+    await db.flush()
+    return message
+
+
+@router.post("/sessions/{session_id}/tasks", response_model=TaskCreateResult, status_code=202)
 async def create_task(
     session_id: str,
     payload: TaskCreate,
@@ -133,14 +194,58 @@ async def create_task(
     db: Annotated[AsyncSession, Depends(get_db, scope="function")],
     task_runner: Annotated[TaskRunner, Depends(get_task_runner)],
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
-) -> TaskRead:
+) -> TaskCreateResult:
+    service = TaskService(db)
+    goal_type = "kol_selection"
+    goal_params: dict | None = None
+    if get_settings().goal_planner_enforce_enabled:
+        # 带幂等键先查命中：命中不再调 planner（避免重复扣调用），
+        # 仍走 create_idempotent 保留 payload 一致性校验。
+        plan_needed = True
+        if idempotency_key is not None:
+            existing = await service.find_idempotent(user.id, session_id, idempotency_key)
+            plan_needed = existing is None
+        if plan_needed:
+            try:
+                planner_output = await _plan_goal_or_fallback(
+                    db, user.id, session_id, payload.content
+                )
+            except LookupError as error:
+                raise task_not_found(error) from error
+            if planner_output is not None and planner_output.action == "clarify":
+                message = await _append_clarify_message(
+                    db, user.id, session_id, planner_output.question
+                )
+                await db.commit()
+                return TaskOutcomeClarify(message=message_read(message))
+            if planner_output is not None:
+                primary = next(
+                    (goal for goal in planner_output.goals if goal.sequence == 1),
+                    planner_output.goals[0],
+                )
+                if len(planner_output.goals) > 1:
+                    # 复合编排属阶段四：>1 个 goal 只执行 sequence=1，其余丢弃。
+                    logger.warning(
+                        "goal_planner_multi_goal_discarded session_id=%s goals=%d",
+                        session_id,
+                        len(planner_output.goals),
+                    )
+                goal_type = primary.goal_type
+                goal_params = primary.params.model_dump(mode="json", exclude_none=True)
     try:
         if idempotency_key is None:
-            task = await TaskService(db).create(user.id, session_id, payload)
+            task = await service.create(
+                user.id, session_id, payload, goal_type=goal_type, goal_params=goal_params
+            )
             reused = False
         else:
-            task, reused = await TaskService(db).create_idempotent(
-                user.id, session_id, payload, idempotency_key
+            task, reused = await service.create_idempotent(
+                user.id,
+                session_id,
+                payload,
+                idempotency_key,
+                goal_type=goal_type,
+                goal_params=goal_params,
             )
     except TaskConflictError as error:
         detail = (
@@ -150,13 +255,13 @@ async def create_task(
         )
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=detail) from error
     except ValueError as error:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="invalid_idempotency_key") from error
+        raise HTTPException(status_code=422, detail="invalid_idempotency_key") from error
     except LookupError as error:
         raise task_not_found(error) from error
     await db.commit()
     if not reused:
         task_runner.submit(task.id)
-    return task_read(task)
+    return TaskOutcomeTask(task=task_read(task))
 
 
 @router.post("/tasks/{task_id}/retry", response_model=TaskRead, status_code=202)

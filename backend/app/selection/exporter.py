@@ -53,9 +53,9 @@ class ExportedWorkbook:
 
 
 async def export_session_selection(
-    db: AsyncSession, user_id: str, session_id: str
+    db: AsyncSession, user_id: str, session_id: str, *, set_id: str | None = None
 ) -> ExportedWorkbook:
-    # 先校验会话归属（404 语义），再读最新 selection set 的 items（切读新表）。
+    # 先校验会话归属（404 语义），再解析 selection set（缺省最新，set_id 切换历史）。
     session = await db.scalar(
         select(WorkspaceSession).where(
             WorkspaceSession.id == session_id,
@@ -66,7 +66,9 @@ async def export_session_selection(
     if session is None:
         raise LookupError("session_not_found")
     service = KolSelectionService(db)
-    selection_set = await service.latest_selection_set(session_id)
+    selection_set = await service.resolve_selection_set(
+        user_id=user_id, session_id=session_id, selection_set_id=set_id
+    )
     rows = (
         []
         if selection_set is None

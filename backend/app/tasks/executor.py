@@ -8,6 +8,7 @@ from typing import Any, Protocol
 from uuid import NAMESPACE_URL, uuid5
 
 from app.billing.service import InsufficientPointsError
+from app.goals.policies import policy_for
 from app.mcp_gateway.service import ExecuteMcpCall
 from app.model.contracts import ModelAdapterError
 from app.orchestration.loop import (
@@ -60,7 +61,14 @@ class TaskStore(Protocol):
 
 
 class ContextBuilder(Protocol):
-    async def build_agent_context(self, user_id: str, session_id: str) -> AgentLoopContext: ...
+    async def build_agent_context(
+        self,
+        user_id: str,
+        session_id: str,
+        *,
+        goal_type: str = "kol_selection",
+        goal_params: dict | None = None,
+    ) -> AgentLoopContext: ...
 
 
 class TaskPlanner(Protocol):
@@ -294,22 +302,37 @@ class TaskExecutor:
         decide = getattr(self.planner, "agent_decide", None)
         if build_agent_context is None or decide is None:
             raise PlanValidationError("AGENT_RUNTIME_UNAVAILABLE")
-        context = await build_agent_context(task.user_id, task.session_id)
-        # 阶段二单 Goal 包装：加载任务的 kol_selection goal（旧任务/恢复无 goal
-        # 时 goal_id 保持 None，行为与现状完全一致，不发 goal 事件、不写新表）。
+        # 阶段二单 Goal 包装：加载任务的 goal（旧任务/恢复无 goal 时 goal_id
+        # 保持 None，行为与现状完全一致，不发 goal 事件、不写新表）。
         goal = await self._load_goal(task)
         goal_id: str | None = None
         set_title = "默认名单"
         set_scope: dict | None = None
+        # GoalPolicy 分派：legacy（无 goal）等价 kol_selection。
+        goal_type = "kol_selection"
+        goal_params: dict | None = None
         if goal is not None:
             goal_id = goal.id
-            goal_params = getattr(goal, "params_json", None)
-            if isinstance(goal_params, dict) and goal_params:
-                set_scope = goal_params
-                brand = goal_params.get("brand")
+            goal_type = getattr(goal, "goal_type", None) or "kol_selection"
+            raw_params = getattr(goal, "params_json", None)
+            if isinstance(raw_params, dict) and raw_params:
+                goal_params = raw_params
+                set_scope = raw_params
+                brand = raw_params.get("brand")
                 if isinstance(brand, str) and brand.strip():
                     set_title = f"{brand.strip()}圈选名单"
             await self._start_goal(task, goal)
+        policy = policy_for(goal_type)
+        if goal is not None:
+            context = await build_agent_context(
+                task.user_id,
+                task.session_id,
+                goal_type=goal_type,
+                goal_params=goal_params,
+            )
+        else:
+            # legacy 路径：不传 goal 参数，上下文与现状完全一致。
+            context = await build_agent_context(task.user_id, task.session_id)
         trajectory = restore_agent_trajectory(getattr(task, "plan_json", None))
         if getattr(task, "plan_json", None) is None:
             # First run: emit plan.ready once so clients leave the planning phase.
@@ -486,7 +509,7 @@ class TaskExecutor:
                         summary=sanitize_evidence(structured_content),
                     )
                 )
-                if self.selection is not None:
+                if self.selection is not None and policy.ingest_enabled:
                     try:
                         await self.selection.ingest(
                             user_id=task.user_id,

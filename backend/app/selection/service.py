@@ -346,6 +346,45 @@ class KolSelectionService:
             .limit(1)
         )
 
+    async def resolve_selection_set(
+        self, *, user_id: str, session_id: str, selection_set_id: str | None
+    ) -> KolSelectionSet | None:
+        """端点 set 解析：set_id 缺省取最新；显式 set_id 必须属于该会话。
+
+        ``LookupError("selection_set_not_found")``：set_id 不存在或不属于该会话。
+        """
+        await self._require_owned_session(user_id, session_id)
+        if selection_set_id is None:
+            return await self.latest_selection_set(session_id)
+        selection_set = await self._db.get(KolSelectionSet, selection_set_id)
+        if selection_set is None or selection_set.session_id != session_id:
+            raise LookupError("selection_set_not_found")
+        return selection_set
+
+    async def list_selection_sets(
+        self, *, user_id: str, session_id: str
+    ) -> list[tuple[KolSelectionSet, int]]:
+        """名单版本列表（version desc）+ 各 set 的 item 数（单次聚合查询）。"""
+        await self._require_owned_session(user_id, session_id)
+        sets = list(
+            (
+                await self._db.scalars(
+                    select(KolSelectionSet)
+                    .where(KolSelectionSet.session_id == session_id)
+                    .order_by(KolSelectionSet.version.desc())
+                )
+            ).all()
+        )
+        if not sets:
+            return []
+        counts = await self._db.execute(
+            select(KolSelectionItem.selection_set_id, func.count())
+            .where(KolSelectionItem.selection_set_id.in_([item.id for item in sets]))
+            .group_by(KolSelectionItem.selection_set_id)
+        )
+        count_by_set = {set_id: int(count) for set_id, count in counts.all()}
+        return [(item, count_by_set.get(item.id, 0)) for item in sets]
+
     async def list_latest_items(
         self, *, user_id: str, session_id: str, offset: int = 0, limit: int = 200
     ) -> tuple[int, list[KolSelectionItem]]:

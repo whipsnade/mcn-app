@@ -46,6 +46,7 @@ class Settings(BaseSettings):
     mcp_unknown_reconcile_seconds: int = Field(default=300, gt=0)
     task_lease_seconds: int = Field(default=60, gt=0)
     goal_planner_shadow_enabled: bool = False
+    goal_planner_enforce_enabled: bool = False
 
     @property
     def database_url(self) -> str:

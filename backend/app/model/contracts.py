@@ -20,6 +20,8 @@ ModelPurpose = Literal[
     "quick_feature",
     "kol_analysis",
     "goal_planner",
+    "brand_analysis",
+    "campaign_analysis",
 ]
 
 
@@ -92,6 +94,8 @@ class ModelRequestMetadata(BaseModel):
         "quick_feature",
         "kol_analysis",
         "goal_planner",
+        "brand_analysis",
+        "campaign_analysis",
     ]
     provider: str
     model: str

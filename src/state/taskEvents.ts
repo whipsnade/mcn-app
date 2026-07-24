@@ -26,12 +26,21 @@ export interface TaskFlowNode {
   detail?: string;
 }
 
+export interface ArtifactUpdate {
+  artifactId: string;
+  moduleKey: string;
+  version: number;
+  title: string;
+}
+
 export interface TaskRuntimeState {
   taskId: string;
   lastEventId: number;
   assistantDraft: string;
   /** 执行流程节点；测试夹具可省略，reducer 按空数组处理。 */
   nodes?: TaskFlowNode[];
+  /** artifact.updated 按 module_key 覆盖式记账（三 Tab 未读/刷新信号）。 */
+  artifactUpdates?: Record<string, ArtifactUpdate>;
   visibleAnalysisReportId?: string;
   status?: string;
   phase?: TaskPhase;
@@ -285,6 +294,25 @@ export function reduceTaskEvent(state: TaskRuntimeState, event: TaskEvent): Task
           phaseLabel: String(event.payload.label ?? '分析报告已生成'),
           activity: '分析报告已更新',
         }, event);
+      }
+    case 'artifact.updated':
+      {
+        const artifactId = valueOf(event.payload, 'artifactId', 'artifact_id');
+        const moduleKey = valueOf(event.payload, 'moduleKey', 'module_key');
+        if (artifactId === undefined || artifactId === null || moduleKey === undefined || moduleKey === null) {
+          return next;
+        }
+        const update: ArtifactUpdate = {
+          artifactId: String(artifactId),
+          moduleKey: String(moduleKey),
+          version: Number(event.payload.version ?? 0),
+          title: String(event.payload.title ?? ''),
+        };
+        // 与 report.updated 不重复处理：artifact.updated 只按 module 记账。
+        return {
+          ...next,
+          artifactUpdates: { ...(next.artifactUpdates ?? {}), [update.moduleKey]: update },
+        };
       }
     default:
       return withFlowNode(applyStatusAndPointEvent(next, event), event);

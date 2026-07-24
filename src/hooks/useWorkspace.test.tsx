@@ -6,8 +6,19 @@ import type { ApiBrainstormResponse } from '../api/contracts';
 import { postBrainstorm } from '../api/brainstorm';
 import { createSession, deleteSession, getSession, listSessions, updateSession } from '../api/sessions';
 import { createTask, getAnalysisReport, getTask, retryFollowups, retryTask } from '../api/tasks';
+import { getArtifactsSummary, markArtifactRead } from '../api/reports';
+import type { ApiArtifactsSummary } from '../api/contracts';
 import { initialTaskRuntime } from '../state/taskEvents';
 import { useTaskStream } from './useTaskStream';
+import type { TaskCreateResult } from '../api/contracts';
+
+
+function taskOutcome(task: {
+  id: string; session_id: string; status: string; estimated_points: number;
+  error_code: null; latest_report_id: null;
+}): TaskCreateResult {
+  return { outcome: 'task', task: task as TaskCreateResult extends { task: infer T } ? T : never };
+}
 import { useWorkspace } from './useWorkspace';
 
 
@@ -66,6 +77,13 @@ const emptyProfile: ApiBrainstormResponse['profile'] = {
   goal: null,
 };
 
+const emptyArtifactsSummary: ApiArtifactsSummary = {
+  brand: { latest_artifact: null, unread: false },
+  campaign: { latest_artifact: null, unread: false },
+  kol_analysis: { latest_artifact: null, unread: false },
+  kol_selection: { latest_artifact: null, unread: false },
+};
+
 function deferred<T>() {
   let resolve!: (value: T) => void;
   return {
@@ -101,6 +119,12 @@ vi.mock('../api/tasks', () => ({
   retryTask: vi.fn(),
 }));
 
+vi.mock('../api/reports', () => ({
+  getArtifactsSummary: vi.fn(),
+  listSessionReports: vi.fn(),
+  markArtifactRead: vi.fn(),
+}));
+
 vi.mock('./useTaskStream', () => ({
   useTaskStream: vi.fn(),
 }));
@@ -111,6 +135,8 @@ describe('useWorkspace', () => {
     vi.mocked(listSessions).mockResolvedValue([session]);
     vi.mocked(getSession).mockResolvedValue(restoredSession);
     vi.mocked(useTaskStream).mockReturnValue(undefined);
+    vi.mocked(getArtifactsSummary).mockResolvedValue(emptyArtifactsSummary);
+    vi.mocked(markArtifactRead).mockResolvedValue(undefined);
   });
 
   afterEach(() => {
@@ -122,7 +148,7 @@ describe('useWorkspace', () => {
 
     await waitFor(() => expect(result.current.loading).toBe(false));
 
-    expect(result.current.sessions).toEqual([restoredSession]);
+    expect(result.current.sessions).toEqual([{ ...restoredSession, artifactsSummary: emptyArtifactsSummary }]);
     expect(result.current.activeSession?.id).toBe('session-1');
     expect(result.current.activeSession?.messages[0]?.text).toBe('恢复这条历史提问');
   });
@@ -287,7 +313,7 @@ describe('useWorkspace', () => {
       await result.current.deleteSession('session-1');
     })).rejects.toThrow('DELETE_FAILED');
 
-    expect(result.current.sessions).toEqual([restoredSession]);
+    expect(result.current.sessions).toEqual([{ ...restoredSession, artifactsSummary: emptyArtifactsSummary }]);
     expect(result.current.activeSession?.id).toBe('session-1');
   });
 
@@ -318,9 +344,7 @@ describe('useWorkspace', () => {
   });
 
   it('ignores a late task creation response after its session is deleted', async () => {
-    const pendingTask = deferred<{
-      id: string; session_id: string; status: 'pending'; estimated_points: number; error_code: null; latest_report_id: null;
-    }>();
+    const pendingTask = deferred<TaskCreateResult>();
     vi.mocked(createTask).mockReturnValue(pendingTask.promise);
     vi.mocked(deleteSession).mockResolvedValue(undefined);
     const { result } = renderHook(() => useWorkspace('user-a'));
@@ -336,10 +360,10 @@ describe('useWorkspace', () => {
     });
 
     await act(async () => {
-      pendingTask.resolve({
+      pendingTask.resolve(taskOutcome({
         id: 'task-late', session_id: 'session-1', status: 'pending', estimated_points: 0,
         error_code: null, latest_report_id: null,
-      });
+      }));
       await appendPromise;
     });
 
@@ -350,12 +374,8 @@ describe('useWorkspace', () => {
 
   it('releases only the deleted session task lock and keeps a newer session lock owned', async () => {
     const otherSession = { ...session, id: 'session-2', title: '会话 B', messages: [readyBrainstormMessage] };
-    const firstTask = deferred<{
-      id: string; session_id: string; status: 'pending'; estimated_points: number; error_code: null; latest_report_id: null;
-    }>();
-    const secondTask = deferred<{
-      id: string; session_id: string; status: 'pending'; estimated_points: number; error_code: null; latest_report_id: null;
-    }>();
+    const firstTask = deferred<TaskCreateResult>();
+    const secondTask = deferred<TaskCreateResult>();
     vi.mocked(listSessions).mockResolvedValue([session, otherSession]);
     vi.mocked(getSession).mockImplementation(async id => id === 'session-1' ? restoredSession : otherSession);
     vi.mocked(createTask)
@@ -383,19 +403,19 @@ describe('useWorkspace', () => {
     await waitFor(() => expect(createTask).toHaveBeenCalledTimes(2));
 
     await act(async () => {
-      firstTask.resolve({
+      firstTask.resolve(taskOutcome({
         id: 'task-a', session_id: 'session-1', status: 'pending', estimated_points: 0,
         error_code: null, latest_report_id: null,
-      });
+      }));
       await firstPromise;
     });
     await expect(result.current.appendMessage('会话 B 的重复任务')).rejects.toThrow('TASK_IN_PROGRESS');
 
     await act(async () => {
-      secondTask.resolve({
+      secondTask.resolve(taskOutcome({
         id: 'task-b', session_id: 'session-2', status: 'pending', estimated_points: 0,
         error_code: null, latest_report_id: null,
-      });
+      }));
       await secondPromise;
     });
     expect(result.current.activeTaskId).toBe('task-b');
@@ -408,9 +428,7 @@ describe('useWorkspace', () => {
       title: '会话 B',
       analysis: { taskId: 'task-b', status: 'completed' },
     };
-    const pendingTask = deferred<{
-      id: string; session_id: string; status: 'pending'; estimated_points: number; error_code: null; latest_report_id: null;
-    }>();
+    const pendingTask = deferred<TaskCreateResult>();
     vi.mocked(listSessions).mockResolvedValue([session, otherSession]);
     vi.mocked(getSession).mockImplementation(async id => id === 'session-1' ? restoredSession : otherSession);
     vi.mocked(createTask).mockReturnValue(pendingTask.promise);
@@ -428,10 +446,10 @@ describe('useWorkspace', () => {
     await waitFor(() => expect(result.current.activeTaskId).toBe('task-b'));
 
     await act(async () => {
-      pendingTask.resolve({
+      pendingTask.resolve(taskOutcome({
         id: 'task-a-late', session_id: 'session-1', status: 'pending', estimated_points: 0,
         error_code: null, latest_report_id: null,
-      });
+      }));
       await appendPromise;
     });
 
@@ -490,10 +508,10 @@ describe('useWorkspace', () => {
       messages: restoredSession.messages.map(message => ({ ...message, taskId: 'task-old' })),
     } : otherSession);
     vi.mocked(retryTask).mockReturnValue(pendingRetry.promise);
-    vi.mocked(createTask).mockResolvedValue({
+    vi.mocked(createTask).mockResolvedValue(taskOutcome({
       id: 'task-b', session_id: 'session-2', status: 'pending', estimated_points: 0,
       error_code: null, latest_report_id: null,
-    });
+    }));
     vi.mocked(deleteSession).mockResolvedValue(undefined);
     const { result } = renderHook(() => useWorkspace('user-a'));
     await waitFor(() => expect(result.current.activeTaskId).toBe('task-old'));
@@ -670,15 +688,45 @@ describe('useWorkspace', () => {
     expect(result.current.activeSession).toBeUndefined();
   });
 
-  it('creates a pending analysis task and merges the user message immediately', async () => {
+  it('renders planner clarify response as an assistant message without creating a task', async () => {
     vi.mocked(createTask).mockResolvedValue({
+      outcome: 'clarify',
+      message: {
+        id: 'message-clarify-1',
+        role: 'assistant',
+        content: '想看哪个品牌的分析？',
+        sequence: 3,
+        metadata: { clarify: { options: ['海底捞', '喜茶'] } },
+        created_at: '2026-07-24T10:00:00Z',
+      },
+    });
+    const { result } = renderHook(() => useWorkspace('user-a'));
+    await waitFor(() => expect(result.current.activeSession?.id).toBe('session-1'));
+
+    await act(async () => {
+      await result.current.appendMessage('帮我做个分析');
+    });
+
+    expect(createTask).toHaveBeenCalledWith('session-1', { content: '帮我做个分析' });
+    const active = result.current.activeSession;
+    // 不落任务：状态与 analysis 不变，不进入 analyzing。
+    expect(active?.status).toBe('draft');
+    expect(active?.analysis).toBeUndefined();
+    const texts = active?.messages.map(message => [message.sender, message.text]);
+    expect(texts?.at(-2)).toEqual(['user', '帮我做个分析']);
+    expect(texts?.at(-1)).toEqual(['ai', '想看哪个品牌的分析？']);
+    expect(active?.messages.at(-1)?.clarify?.options).toEqual(['海底捞', '喜茶']);
+  });
+
+  it('creates a pending analysis task and merges the user message immediately', async () => {
+    vi.mocked(createTask).mockResolvedValue(taskOutcome({
       id: 'task-1',
       session_id: 'session-1',
       status: 'pending',
       estimated_points: 0,
       error_code: null,
       latest_report_id: null,
-    });
+    }));
     const { result } = renderHook(() => useWorkspace('user-a'));
     await waitFor(() => expect(result.current.activeSession?.id).toBe('session-1'));
 
@@ -701,10 +749,10 @@ describe('useWorkspace', () => {
         blocks: [], conclusion: null, status: 'completed', generated_at: '2026-07-21T10:00:00Z',
       },
     });
-    vi.mocked(createTask).mockResolvedValue({
+    vi.mocked(createTask).mockResolvedValue(taskOutcome({
       id: 'task-new', session_id: 'session-1', status: 'pending', estimated_points: 0,
       error_code: null, latest_report_id: null,
-    });
+    }));
     const { result } = renderHook(() => useWorkspace('user-a'));
     await waitFor(() => expect(result.current.activeSession?.analysisReport?.id).toBe('analysis-report-kol'));
 
@@ -806,14 +854,14 @@ describe('useWorkspace', () => {
   });
 
   it('does not create a second task while the active task is still running', async () => {
-    vi.mocked(createTask).mockResolvedValue({
+    vi.mocked(createTask).mockResolvedValue(taskOutcome({
       id: 'task-1',
       session_id: 'session-1',
       status: 'pending',
       estimated_points: 0,
       error_code: null,
       latest_report_id: null,
-    });
+    }));
     const { result } = renderHook(() => useWorkspace('user-a'));
     await waitFor(() => expect(result.current.activeSession?.id).toBe('session-1'));
 
@@ -839,9 +887,7 @@ describe('useWorkspace', () => {
   });
 
   it('rejects a second submission while the first task request is still pending', async () => {
-    const pendingTask = deferred<{
-      id: string; session_id: string; status: 'pending'; estimated_points: number; error_code: null; latest_report_id: null;
-    }>();
+    const pendingTask = deferred<TaskCreateResult>();
     vi.mocked(createTask).mockReturnValueOnce(pendingTask.promise);
     const { result } = renderHook(() => useWorkspace('user-a'));
     await waitFor(() => expect(result.current.activeSession?.id).toBe('session-1'));
@@ -856,11 +902,75 @@ describe('useWorkspace', () => {
     expect(createTask).toHaveBeenCalledTimes(1);
 
     await act(async () => {
-      pendingTask.resolve({
+      pendingTask.resolve(taskOutcome({
         id: 'task-1', session_id: 'session-1', status: 'pending', estimated_points: 0, error_code: null, latest_report_id: null,
-      });
+      }));
       await firstSubmission;
     });
+  });
+
+  it('loads artifacts summary when a session activates and refreshes on artifact updates', async () => {
+    const summary: ApiArtifactsSummary = {
+      brand: { latest_artifact: null, unread: false },
+      campaign: { latest_artifact: null, unread: false },
+      kol_analysis: {
+        latest_artifact: {
+          artifact_id: 'artifact-1', artifact_type: 'kol_report', title: 'KOL 分析',
+          version: 1, scope: null, status: 'completed', created_at: '2026-07-24T10:00:00Z',
+        },
+        unread: true,
+      },
+      kol_selection: { latest_artifact: null, unread: false },
+    };
+    vi.mocked(getArtifactsSummary).mockResolvedValue(summary);
+    vi.mocked(getSession).mockResolvedValue({
+      ...restoredSession,
+      analysis: { taskId: 'task-1', status: 'running' },
+    });
+    vi.mocked(useTaskStream).mockReturnValue({
+      taskId: 'task-1', lastEventId: 1, assistantDraft: '', connection: 'connected', status: 'running',
+    });
+    const { result, rerender } = renderHook(() => useWorkspace('user-a'));
+
+    await waitFor(() => expect(result.current.activeSession?.artifactsSummary).toEqual(summary));
+    expect(getArtifactsSummary).toHaveBeenCalledWith('session-1');
+    const callsAfterActivate = vi.mocked(getArtifactsSummary).mock.calls.length;
+
+    // artifact.updated 到达（artifactUpdates 记账更新）→ 重新拉取 summary。
+    vi.mocked(useTaskStream).mockReturnValue({
+      taskId: 'task-1', lastEventId: 2, assistantDraft: '', connection: 'connected', status: 'running',
+      artifactUpdates: {
+        brand: { artifactId: 'artifact-2', moduleKey: 'brand', version: 1, title: '品牌分析' },
+      },
+    });
+    rerender();
+    await waitFor(() => expect(vi.mocked(getArtifactsSummary).mock.calls.length).toBeGreaterThan(callsAfterActivate));
+  });
+
+  it('markArtifactSeen calls the api and clears the unread flag locally', async () => {
+    const summary: ApiArtifactsSummary = {
+      brand: { latest_artifact: null, unread: false },
+      campaign: { latest_artifact: null, unread: false },
+      kol_analysis: {
+        latest_artifact: {
+          artifact_id: 'artifact-1', artifact_type: 'kol_report', title: 'KOL 分析',
+          version: 1, scope: null, status: 'completed', created_at: '2026-07-24T10:00:00Z',
+        },
+        unread: true,
+      },
+      kol_selection: { latest_artifact: null, unread: false },
+    };
+    vi.mocked(getArtifactsSummary).mockResolvedValue(summary);
+    vi.mocked(markArtifactRead).mockResolvedValue(undefined);
+    const { result } = renderHook(() => useWorkspace('user-a'));
+    await waitFor(() => expect(result.current.activeSession?.artifactsSummary?.kol_analysis.unread).toBe(true));
+
+    await act(async () => {
+      await result.current.markArtifactSeen('kol_analysis', 'artifact-1');
+    });
+
+    expect(markArtifactRead).toHaveBeenCalledWith('session-1', 'kol_analysis', 'artifact-1');
+    expect(result.current.activeSession?.artifactsSummary?.kol_analysis.unread).toBe(false);
   });
 
   it('ignores a task runtime that does not belong to the active task', async () => {

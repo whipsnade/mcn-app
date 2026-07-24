@@ -26,11 +26,43 @@ async def list_kol_selection(
     db: Annotated[AsyncSession, Depends(get_db)],
     offset: Annotated[int, Query(ge=0)] = 0,
     limit: Annotated[int, Query(ge=1, le=500)] = 200,
+    set_id: Annotated[str | None, Query()] = None,
 ) -> dict[str, Any]:
-    """圈选名单列表：读最新 selection set，按综合评分倒序，校验会话归属。"""
+    """圈选名单列表：缺省读最新 selection set；set_id 切换历史名单。"""
+    service = KolSelectionService(db)
     try:
-        total, rows = await KolSelectionService(db).list_latest_items(
-            user_id=user.id, session_id=session_id, offset=offset, limit=limit
+        selection_set = await service.resolve_selection_set(
+            user_id=user.id, session_id=session_id, selection_set_id=set_id
+        )
+        if selection_set is None:
+            total, rows = 0, []
+        else:
+            total, rows = await service.list_selection_items(
+                user_id=user.id,
+                selection_set_id=selection_set.id,
+                offset=offset,
+                limit=limit,
+            )
+    except LookupError as error:
+        detail = str(error)
+        if detail in {"session_not_found", "selection_set_not_found"}:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail=detail
+            ) from error
+        raise
+    return {"total": total, "items": [serialize_selection_item(row) for row in rows]}
+
+
+@router.get("/sessions/{session_id}/selection-sets")
+async def list_selection_sets(
+    session_id: str,
+    user: CurrentUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> list[dict[str, Any]]:
+    """名单版本列表（version desc）。"""
+    try:
+        sets = await KolSelectionService(db).list_selection_sets(
+            user_id=user.id, session_id=session_id
         )
     except LookupError as error:
         if str(error) == "session_not_found":
@@ -38,7 +70,17 @@ async def list_kol_selection(
                 status_code=status.HTTP_404_NOT_FOUND, detail="session_not_found"
             ) from error
         raise
-    return {"total": total, "items": [serialize_selection_item(row) for row in rows]}
+    return [
+        {
+            "set_id": selection_set.id,
+            "title": selection_set.title,
+            "version": selection_set.version,
+            "status": selection_set.status,
+            "item_count": item_count,
+            "created_at": selection_set.created_at.isoformat(),
+        }
+        for selection_set, item_count in sets
+    ]
 
 
 @router.get("/sessions/{session_id}/kol-selection/export")
@@ -46,13 +88,14 @@ async def export_kol_selection(
     session_id: str,
     user: CurrentUser,
     db: Annotated[AsyncSession, Depends(get_db)],
+    set_id: Annotated[str | None, Query()] = None,
 ) -> Response:
-    """圈选名单 Excel 导出：模板渲染 4 sheet 工作簿。"""
+    """圈选名单 Excel 导出：缺省导最新 set；set_id 切换历史名单。"""
     try:
-        workbook = await export_session_selection(db, user.id, session_id)
+        workbook = await export_session_selection(db, user.id, session_id, set_id=set_id)
     except LookupError as error:
         code = str(error)
-        if code == "session_not_found":
+        if code in {"session_not_found", "selection_set_not_found"}:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail=code
             ) from error

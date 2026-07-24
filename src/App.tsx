@@ -233,6 +233,10 @@ export default function App() {
               selectionCount={workspace.activeSession?.kolSelectionCount}
               favorites={favorites}
               onFavoriteToggled={refreshFavorites}
+              artifactsSummary={workspace.activeSession?.artifactsSummary}
+              onMarkArtifactSeen={(moduleKey, artifactId) => {
+                void workspace.markArtifactSeen(moduleKey, artifactId).catch(() => undefined);
+              }}
               onReportReady={(nextReport) => {
                 if (workspace.activeSession) {
                   workspace.setAnalysisReport(workspace.activeSession.id, nextReport);

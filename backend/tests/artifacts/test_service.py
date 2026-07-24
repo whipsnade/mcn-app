@@ -195,6 +195,40 @@ async def test_mark_seen_upserts_read_state(db_session, user_factory) -> None:
 
 
 @pytest.mark.asyncio
+async def test_register_failed_artifact_allows_no_target(db_session, user_factory) -> None:
+    """报告生成失败的 Artifact：无 report_id/selection_set_id 也允许登记（status=failed）。"""
+    user_id, session_id = await _create_session(db_session, user_factory)
+    service = ArtifactService(db_session)
+
+    artifact = await service.register_artifact(
+        user_id=user_id,
+        session_id=session_id,
+        artifact_key="goal:g1:brand_report",
+        artifact_type="brand_report",
+        title="品牌分析报告",
+        version=1,
+        status="failed",
+        error_code="no_evidence_collected",
+    )
+
+    assert artifact.status == "failed"
+    assert artifact.report_id is None
+    assert artifact.selection_set_id is None
+    assert artifact.error_code == "no_evidence_collected"
+    # 成功状态的 brand_report 仍强制 report_id。
+    with pytest.raises(ValueError):
+        await service.register_artifact(
+            user_id=user_id,
+            session_id=session_id,
+            artifact_key="goal:g2:brand_report",
+            artifact_type="brand_report",
+            title="品牌分析报告",
+            version=1,
+            status="completed",
+        )
+
+
+@pytest.mark.asyncio
 async def test_artifact_service_enforces_ownership(db_session, user_factory) -> None:
     _, session_id = await _create_session(db_session, user_factory)
     other = await user_factory()

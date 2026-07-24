@@ -70,19 +70,19 @@ class ArtifactService:
     ) -> TaskArtifact:
         """按 artifact_key 幂等 upsert 一条 Artifact。
 
-        - report_id 与 selection_set_id 必须二选一，且需满足类型语义
-          （kol_report 必有 report_id、kol_selection_set 必有 selection_set_id），
-          违反抛 ValueError；
+        - report_id 与 selection_set_id 的二选一及类型语义校验仅约束成功产物
+          （status="completed"）；failed 产物允许无关联对象（证据保留、记录 error_code）；
         - 会话归属不符抛 ``LookupError("session_not_found")``；
         - 已存在同 key 行时更新可变字段并返回，不重复建行。
         """
-        if (report_id is None) == (selection_set_id is None):
-            raise ValueError("artifact_requires_exactly_one_target")
-        required_target = _REQUIRED_TARGET_BY_TYPE.get(artifact_type)
-        if required_target == "report_id" and report_id is None:
-            raise ValueError(f"{artifact_type}_requires_report_id")
-        if required_target == "selection_set_id" and selection_set_id is None:
-            raise ValueError(f"{artifact_type}_requires_selection_set_id")
+        if status == "completed":
+            if (report_id is None) == (selection_set_id is None):
+                raise ValueError("artifact_requires_exactly_one_target")
+            required_target = _REQUIRED_TARGET_BY_TYPE.get(artifact_type)
+            if required_target == "report_id" and report_id is None:
+                raise ValueError(f"{artifact_type}_requires_report_id")
+            if required_target == "selection_set_id" and selection_set_id is None:
+                raise ValueError(f"{artifact_type}_requires_selection_set_id")
         await self._require_owned_session(user_id, session_id)
         now = _utcnow()
         artifact = await self._db.scalar(

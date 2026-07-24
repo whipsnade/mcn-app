@@ -1,9 +1,14 @@
 from app.model.prompts import (
     AGENT_LOOP_PROMPT,
     BRAINSTORM_PROMPT,
+    BRAND_ANALYSIS_LOOP_PROMPT,
+    BRAND_ANALYSIS_PROMPT,
+    CAMPAIGN_ANALYSIS_LOOP_PROMPT,
+    CAMPAIGN_ANALYSIS_PROMPT,
     CAMPAIGN_EVALUATE_PROMPT,
     FOLLOWUP_PROMPT,
     GOAL_PLANNER_PROMPT,
+    PROMPTS,
     QUICK_AGENT_PROMPT,
     REPORT_WRITER_PROMPT,
     SUMMARY_PROMPT,
@@ -19,6 +24,10 @@ _ALL_PROMPTS = (
     CAMPAIGN_EVALUATE_PROMPT,
     QUICK_AGENT_PROMPT,
     GOAL_PLANNER_PROMPT,
+    BRAND_ANALYSIS_LOOP_PROMPT,
+    CAMPAIGN_ANALYSIS_LOOP_PROMPT,
+    BRAND_ANALYSIS_PROMPT,
+    CAMPAIGN_ANALYSIS_PROMPT,
 )
 
 
@@ -41,6 +50,59 @@ def test_prompts_treat_external_content_as_untrusted_and_limit_capabilities() ->
     assert "required_metrics" not in AGENT_LOOP_PROMPT.system
     assert "数据看板" in REPORT_WRITER_PROMPT.system
     assert "KOL 看板" in REPORT_WRITER_PROMPT.system
+
+
+def test_goal_loop_prompts_are_registered_and_goal_specific() -> None:
+    assert PROMPTS["brand_loop_v1"] is BRAND_ANALYSIS_LOOP_PROMPT
+    assert PROMPTS["campaign_loop_v1"] is CAMPAIGN_ANALYSIS_LOOP_PROMPT
+    brand = BRAND_ANALYSIS_LOOP_PROMPT.system
+    assert "密钥" in brand and "URL" in brand
+    assert "声量" in brand
+    assert "情感" in brand
+    assert "竞品" in brand
+    assert "平台分布" in brand
+    assert "内容主题" in brand
+    assert "export_contract" not in brand
+    assert "圈选名单" not in brand
+    campaign = CAMPAIGN_ANALYSIS_LOOP_PROMPT.system
+    assert "密钥" in campaign and "URL" in campaign
+    assert "平台贡献" in campaign
+    assert "达人贡献" in campaign
+    assert "节奏" in campaign
+    assert "复盘" in campaign
+    assert "export_contract" not in campaign
+    assert "圈选名单" not in campaign
+    # 通用约束段与 AGENT_LOOP 一致（积分护栏/时间基准/空结果）。
+    for text in (brand, campaign):
+        assert "每次调用消耗 10 积分" in text
+        assert "current_date" in text and "requested_period" in text
+        assert "空结果即结论" in text
+        assert "goal_params" in text
+
+
+def test_goal_report_prompts_are_registered_and_structured() -> None:
+    assert PROMPTS["brand_analysis_v1"] is BRAND_ANALYSIS_PROMPT
+    assert PROMPTS["campaign_analysis_v1"] is CAMPAIGN_ANALYSIS_PROMPT
+    brand = BRAND_ANALYSIS_PROMPT.system
+    assert "不可信数据" in brand and "只能使用传入" in brand
+    for block in ("metric_grid", "pie_chart", "line_chart", "tag_list", "markdown"):
+        assert block in brand
+    assert "声量" in brand
+    assert "情感" in brand
+    assert "内容主题" in brand
+    assert "conclusion" in brand
+    campaign = CAMPAIGN_ANALYSIS_PROMPT.system
+    assert "不可信数据" in campaign and "只能使用传入" in campaign
+    for block in ("metric_grid", "table", "line_chart", "markdown"):
+        assert block in campaign
+    assert "平台贡献" in campaign
+    assert "达人贡献" in campaign
+    assert "复盘" in campaign
+    assert "conclusion" in campaign
+    # 报告撰写器同样禁止编造。
+    for text in (brand, campaign):
+        assert "禁止编造" in text
+        assert "目标 Schema" in text
 
 
 def test_prompts_do_not_contain_provider_endpoints_or_environment_values(monkeypatch) -> None:

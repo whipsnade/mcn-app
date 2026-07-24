@@ -1,5 +1,5 @@
 import { authorizedFetch, request } from './client';
-import type { ApiAnalysisReport } from './contracts';
+import type { ApiAnalysisReport, ApiSelectionSetItem } from './contracts';
 
 export interface KolSelectionItem {
   platform: string;
@@ -12,8 +12,16 @@ export interface KolSelectionItem {
   score: Record<string, unknown>;
 }
 
-export function getKolSelection(sessionId: string): Promise<{ total: number; items: KolSelectionItem[] }> {
-  return request(`/api/v1/sessions/${sessionId}/kol-selection?limit=200`);
+export function getKolSelection(
+  sessionId: string,
+  setId?: string,
+): Promise<{ total: number; items: KolSelectionItem[] }> {
+  const setQuery = setId ? `&set_id=${encodeURIComponent(setId)}` : '';
+  return request(`/api/v1/sessions/${sessionId}/kol-selection?limit=200${setQuery}`);
+}
+
+export function listSelectionSets(sessionId: string): Promise<ApiSelectionSetItem[]> {
+  return request<ApiSelectionSetItem[]>(`/api/v1/sessions/${sessionId}/selection-sets`);
 }
 
 export function runKolAnalysis(sessionId: string): Promise<ApiAnalysisReport> {
@@ -21,8 +29,9 @@ export function runKolAnalysis(sessionId: string): Promise<ApiAnalysisReport> {
 }
 
 // xlsx 是二进制下载，不能走 request 的 JSON 路径（错误处理模式参照 quick.ts 的 postEvaluate）。
-export async function downloadKolSelection(sessionId: string): Promise<void> {
-  const response = await authorizedFetch(`/api/v1/sessions/${sessionId}/kol-selection/export`);
+export async function downloadKolSelection(sessionId: string, setId?: string): Promise<void> {
+  const setQuery = setId ? `?set_id=${encodeURIComponent(setId)}` : '';
+  const response = await authorizedFetch(`/api/v1/sessions/${sessionId}/kol-selection/export${setQuery}`);
   if (!response.ok) {
     const body = (await response.json().catch(() => null)) as { detail?: string } | null;
     throw new Error(body?.detail ?? `HTTP_${response.status}`);

@@ -19,6 +19,8 @@ class TaskAnalysisSummary(BaseModel):
 class AnalysisReportRead(BaseModel):
     id: str
     task_id: str | None = None
+    report_type: str = "kol_analysis"
+    scope: dict[str, Any] | None = None
     version: int
     title: str
     blocks: list[dict[str, Any]]
@@ -34,6 +36,22 @@ class AnalysisReportSummary(BaseModel):
     title: str
     status: str
     generated_at: datetime
+
+
+class AnalysisRetryRequest(BaseModel):
+    report_type: Literal["brand_analysis", "campaign_analysis"]
+
+
+SessionReportType = Literal["brand_analysis", "campaign_analysis", "kol_analysis"]
+
+
+class SessionReportItem(BaseModel):
+    report_id: str
+    title: str
+    version: int
+    scope: dict[str, Any] | None
+    status: str
+    created_at: datetime
 
 
 class FavoriteCreate(BaseModel):

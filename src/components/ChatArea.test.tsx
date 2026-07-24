@@ -214,6 +214,41 @@ describe('ChatArea', () => {
       .toBe('小红书');
   });
 
+  it('renders planner clarify option chips and fills the input on click', async () => {
+    const onSendMessage = vi.fn().mockResolvedValue(undefined);
+    const clarifyingSession: Session = {
+      ...session,
+      messages: [
+        { id: 'message-u1', sender: 'user', text: '帮我做个分析', timestamp: '10:00' },
+        {
+          id: 'message-a1',
+          sender: 'ai',
+          text: '想看哪个品牌的分析？',
+          timestamp: '10:01',
+          clarify: { options: ['海底捞', '喜茶'] },
+        },
+      ],
+    };
+    render(
+      <ChatArea
+        session={clarifyingSession}
+        onSendMessage={onSendMessage}
+        isAnalyzing={false}
+        isMockMode={false}
+      />,
+    );
+
+    const chip = screen.getByRole('button', { name: '海底捞' });
+    expect(chip).toBeVisible();
+    expect(screen.getByRole('button', { name: '喜茶' })).toBeVisible();
+    await act(async () => {
+      fireEvent.click(chip);
+    });
+    expect(onSendMessage).not.toHaveBeenCalled();
+    expect((screen.getByPlaceholderText(/输入消息并向 AI 分析师提问/) as HTMLTextAreaElement).value)
+      .toBe('海底捞');
+  });
+
   it('hides brainstorm options of older assistant messages once a newer one arrives', () => {
     const clarifyingSession: Session = {
       ...session,
