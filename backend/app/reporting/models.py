@@ -152,7 +152,12 @@ class AnalysisReport(Base):
     __tablename__ = "analysis_reports"
     __table_args__ = (
         UniqueConstraint("task_id", "version", name="uq_analysis_reports_task_version"),
-        UniqueConstraint("session_id", "version", name="uq_analysis_reports_session_version"),
+        UniqueConstraint(
+            "session_id",
+            "report_type",
+            "version",
+            name="uq_analysis_reports_session_type_version",
+        ),
         Index("ix_analysis_reports_session_created", "session_id", "created_at"),
     )
 
@@ -164,6 +169,11 @@ class AnalysisReport(Base):
     session_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False
     )
+    # 报告类型：kol_analysis / brand_report / campaign_report（后两种阶段三启用）。
+    report_type: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="kol_analysis", server_default="kol_analysis"
+    )
+    scope_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     version: Mapped[int] = mapped_column(Integer, nullable=False)
     title: Mapped[str] = mapped_column(String(200), nullable=False, default="")
     blocks_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False)

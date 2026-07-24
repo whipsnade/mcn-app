@@ -67,12 +67,13 @@ class AnalysisReportService:
         )
         if existing is not None:
             return existing
-        # version 按会话编号（迁移 0020 起 (session_id, version) 唯一），
-        # 同一会话多个任务的报告依次递增。
+        # version 按 (session_id, report_type) 编号（迁移 0022 起三元组唯一），
+        # 任务级历史路径固定 kol_analysis。
         version = (
             await self._db.scalar(
                 select(func.max(AnalysisReport.version)).where(
-                    AnalysisReport.session_id == task.session_id
+                    AnalysisReport.session_id == task.session_id,
+                    AnalysisReport.report_type == "kol_analysis",
                 )
             )
             or 0
@@ -82,6 +83,7 @@ class AnalysisReportService:
             id=str(uuid4()),
             task_id=task.id,
             session_id=task.session_id,
+            report_type="kol_analysis",
             version=version,
             title=document.title,
             blocks_json=[block.model_dump(mode="json") for block in document.blocks],
@@ -111,12 +113,15 @@ class AnalysisReportService:
         user_id: str,
         session_id: str,
         document: ReportDocument,
+        report_type: str = "kol_analysis",
+        scope: dict[str, Any] | None = None,
     ) -> AnalysisReport:
         """持久化一份会话级自由报告（task_id 为 NULL）；不幂等，每次调用生成新版本。
 
-        同步端点直接返回报告，不发 report.updated 事件。同会话并发点击可能
-        撞 (session_id, version) 唯一约束：SAVEPOINT 回滚后重算 version 重试
-        一次，再失败抛领域错误由端点层映射。
+        同步端点直接返回报告，不发 report.updated 事件。version 按
+        (session_id, report_type) 独立编号；同会话并发点击可能撞
+        (session_id, report_type, version) 唯一约束：SAVEPOINT 回滚后重算
+        version 重试一次，再失败抛领域错误由端点层映射。
 
         错误契约：
         - ``LookupError("session_not_found")``：会话不存在/不属于该用户/已软删 → 404；
@@ -138,7 +143,10 @@ class AnalysisReportService:
             version = (
                 await self._db.scalar(
                     select(func.max(AnalysisReport.version))
-                    .where(AnalysisReport.session_id == session_id)
+                    .where(
+                        AnalysisReport.session_id == session_id,
+                        AnalysisReport.report_type == report_type,
+                    )
                     .with_for_update()
                 )
                 or 0
@@ -148,6 +156,8 @@ class AnalysisReportService:
                 id=str(uuid4()),
                 task_id=None,
                 session_id=session_id,
+                report_type=report_type,
+                scope_json=scope,
                 version=version,
                 title=document.title,
                 blocks_json=[block.model_dump(mode="json") for block in document.blocks],
@@ -183,12 +193,18 @@ class AnalysisReportService:
             raise LookupError("report_not_found")
         return report
 
-    async def latest_session_report(self, session_id: str) -> AnalysisReport | None:
-        # version 按会话递增（迁移 0020），比 created_at 排序更确定
-        # （MySQL DATETIME 秒级精度，同秒两次构建会并列）。
+    async def latest_session_report(
+        self, session_id: str, *, report_type: str = "kol_analysis"
+    ) -> AnalysisReport | None:
+        # version 按 (session_id, report_type) 递增（迁移 0022），比 created_at
+        # 排序更确定（MySQL DATETIME 秒级精度，同秒两次构建会并列）。
         return await self._db.scalar(
             select(AnalysisReport)
-            .where(AnalysisReport.session_id == session_id, AnalysisReport.status == "completed")
+            .where(
+                AnalysisReport.session_id == session_id,
+                AnalysisReport.report_type == report_type,
+                AnalysisReport.status == "completed",
+            )
             .order_by(AnalysisReport.version.desc())
             .limit(1)
         )

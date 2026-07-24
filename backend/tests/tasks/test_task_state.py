@@ -47,6 +47,10 @@ def test_task_event_type_values_are_frozen() -> None:
         "replan.ready",
         "task.failed",
         "task.cancelled",
+        "goal.started",
+        "goal.completed",
+        "goal.failed",
+        "artifact.updated",
     }
 
 

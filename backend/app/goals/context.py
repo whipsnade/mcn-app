@@ -6,6 +6,7 @@ from typing import Any
 from sqlalchemy import select
 
 from app.db.session import SessionFactory
+from app.identity.models import UserBrandProfile
 from app.model.exemplars import find_success_exemplars
 from app.orchestration.context import compress_messages
 from app.orchestration.schemas import PlannerMessage
@@ -76,6 +77,13 @@ class GoalPlannerContextBuilder:
         )
         profile = (workspace.filters_snapshot or {}).get("brainstorm_profile") or {}
         active_brand = workspace.brand or profile.get("brand") or None
+        # 账户级默认品牌：来自 user_brand_profiles（品牌解析优先级最低档）。
+        account_default_brand = await db.scalar(
+            select(UserBrandProfile.brand_name).where(
+                UserBrandProfile.user_id == task.user_id,
+                UserBrandProfile.is_default.is_(True),
+            )
+        )
         exemplars = await find_success_exemplars(
             db,
             purpose="goal_planner",
@@ -96,7 +104,7 @@ class GoalPlannerContextBuilder:
                 "target_audience": workspace.target_audience,
                 "brainstorm_profile": profile,
             },
-            account_default_brand=None,
+            account_default_brand=account_default_brand,
             artifact_summaries=(),
             exemplars=tuple(exemplars),
         )

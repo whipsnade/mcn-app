@@ -3,7 +3,8 @@ from uuid import uuid4
 
 import pytest
 
-from app.selection.models import SessionKolSelection
+from app.selection.models import KolSelectionItem, SessionKolSelection
+from app.selection.service import KolSelectionService
 from app.workspace import service as workspace_service
 from app.workspace.models import WorkspaceSession
 
@@ -270,6 +271,36 @@ def _selection_row(user_id: str, session_id: str, uid: str, total: float) -> Ses
     )
 
 
+async def _seed_items(db_session, user_id: str, session_id: str, rows: list) -> None:
+    """把旧表形态的测试行播种为最新 selection set 的 items（计数已切读新表）。"""
+    selection_set = await KolSelectionService(db_session).ensure_selection_set(
+        user_id, session_id, title="默认名单"
+    )
+    now = datetime.now(UTC).replace(tzinfo=None)
+    for row in rows:
+        db_session.add(
+            KolSelectionItem(
+                id=str(uuid4()),
+                user_id=user_id,
+                selection_set_id=selection_set.id,
+                platform=row.platform,
+                kol_uid=row.kol_uid,
+                nickname=row.nickname,
+                followers=row.followers,
+                city=row.city,
+                profile_url=row.profile_url,
+                fields_json=row.fields_json,
+                score_json=row.score_json,
+                source_tool=row.source_tool,
+                first_task_id=row.first_task_id,
+                last_task_id=row.last_task_id,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+    await db_session.flush()
+
+
 @pytest.mark.asyncio
 async def test_session_read_includes_kol_selection_count(auth_client_factory, db_session) -> None:
     client = await auth_client_factory("13600000082")
@@ -278,9 +309,10 @@ async def test_session_read_includes_kol_selection_count(auth_client_factory, db
     assert created.json()["kol_selection_count"] == 0
 
     session = await db_session.get(WorkspaceSession, session_id)
-    db_session.add(_selection_row(session.user_id, session_id, "a", 80.0))
-    db_session.add(_selection_row(session.user_id, session_id, "b", 60.0))
-    await db_session.flush()
+    await _seed_items(db_session, session.user_id, session_id, [
+        _selection_row(session.user_id, session_id, "a", 80.0),
+        _selection_row(session.user_id, session_id, "b", 60.0),
+    ])
 
     detail = await client.get(f"/api/v1/sessions/{session_id}")
     listed = await client.get("/api/v1/sessions")
@@ -298,12 +330,36 @@ async def test_list_sessions_batches_kol_selection_counts(auth_client_factory, d
     first_id, second_id = first.json()["id"], second.json()["id"]
 
     first_session = await db_session.get(WorkspaceSession, first_id)
-    db_session.add(_selection_row(first_session.user_id, first_id, "a", 80.0))
-    db_session.add(_selection_row(first_session.user_id, first_id, "b", 60.0))
-    db_session.add(_selection_row(first_session.user_id, second_id, "c", 70.0))
-    await db_session.flush()
+    await _seed_items(db_session, first_session.user_id, first_id, [
+        _selection_row(first_session.user_id, first_id, "a", 80.0),
+        _selection_row(first_session.user_id, first_id, "b", 60.0),
+    ])
+    await _seed_items(db_session, first_session.user_id, second_id, [
+        _selection_row(first_session.user_id, second_id, "c", 70.0),
+    ])
 
     listed = await client.get("/api/v1/sessions")
 
     counts = {item["id"]: item["kol_selection_count"] for item in listed.json()}
     assert counts == {first_id: 2, second_id: 1}
+
+
+@pytest.mark.asyncio
+async def test_kol_selection_count_reflects_latest_set(auth_client_factory, db_session) -> None:
+    """同会话多份 set 时 kol_selection_count 取 version 最大的那份。"""
+    client = await auth_client_factory("13600000084")
+    created = await client.post("/api/v1/sessions", json={})
+    session_id = created.json()["id"]
+    session = await db_session.get(WorkspaceSession, session_id)
+    await _seed_items(db_session, session.user_id, session_id, [
+        _selection_row(session.user_id, session_id, "a", 80.0),
+        _selection_row(session.user_id, session_id, "b", 60.0),
+    ])
+    # 第二份 set（version=2）只有 1 条：计数应切换到它。
+    await _seed_items(db_session, session.user_id, session_id, [
+        _selection_row(session.user_id, session_id, "c", 70.0),
+    ])
+
+    detail = await client.get(f"/api/v1/sessions/{session_id}")
+
+    assert detail.json()["kol_selection_count"] == 1

@@ -23,7 +23,8 @@ from app.selection.exporter import (
     export_session_selection,
     render_workbook,
 )
-from app.selection.models import SessionKolSelection
+from app.selection.models import KolSelectionItem, SessionKolSelection
+from app.selection.service import KolSelectionService
 from app.workspace.models import WorkspaceSession
 
 
@@ -354,6 +355,41 @@ def _selection_row(
     )
 
 
+async def _seed_items(
+    db_session: AsyncSession,
+    user_id: str,
+    session_id: str,
+    rows: list[SessionKolSelection],
+) -> None:
+    """把旧表形态的测试行播种为最新 selection set 的 items（导出/列表已切读新表）。"""
+    selection_set = await KolSelectionService(db_session).ensure_selection_set(
+        user_id, session_id, title="默认名单"
+    )
+    now = datetime.now(UTC).replace(tzinfo=None)
+    for row in rows:
+        db_session.add(
+            KolSelectionItem(
+                id=str(uuid4()),
+                user_id=user_id,
+                selection_set_id=selection_set.id,
+                platform=row.platform,
+                kol_uid=row.kol_uid,
+                nickname=row.nickname,
+                followers=row.followers,
+                city=row.city,
+                profile_url=row.profile_url,
+                fields_json=row.fields_json,
+                score_json=row.score_json,
+                source_tool=row.source_tool,
+                first_task_id=row.first_task_id,
+                last_task_id=row.last_task_id,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+    await db_session.flush()
+
+
 async def _create_session(
     db_session: AsyncSession,
     user: User,
@@ -392,14 +428,16 @@ async def test_export_session_selection_renders_rows_sorted_by_score(
 ) -> None:
     user = await user_factory()
     session = await _create_session(db_session, user)
-    db_session.add(
-        _selection_row(user.id, session.id, "low", nickname="低分达人", total=50.0,
-                       rating="可考虑", stars="★★★")
+    await _seed_items(
+        db_session,
+        user.id,
+        session.id,
+        [
+            _selection_row(user.id, session.id, "low", nickname="低分达人", total=50.0,
+                           rating="可考虑", stars="★★★"),
+            _selection_row(user.id, session.id, "high", nickname="高分达人", total=90.0),
+        ],
     )
-    db_session.add(
-        _selection_row(user.id, session.id, "high", nickname="高分达人", total=90.0)
-    )
-    await db_session.flush()
 
     workbook_out = await export_session_selection(db_session, user.id, session.id)
 
@@ -447,8 +485,7 @@ async def test_export_session_selection_checks_ownership(
     user = await user_factory()
     other = await user_factory()
     session = await _create_session(db_session, user)
-    db_session.add(_selection_row(user.id, session.id, "a"))
-    await db_session.flush()
+    await _seed_items(db_session, user.id, session.id, [_selection_row(user.id, session.id, "a")])
 
     with pytest.raises(LookupError, match="session_not_found"):
         await export_session_selection(db_session, other.id, session.id)
@@ -467,8 +504,7 @@ async def test_export_session_selection_prefers_brainstorm_region(
             "target_fan_locations": ["旧地区"],
         },
     )
-    db_session.add(_selection_row(user.id, session.id, "a"))
-    await db_session.flush()
+    await _seed_items(db_session, user.id, session.id, [_selection_row(user.id, session.id, "a")])
 
     workbook_out = await export_session_selection(db_session, user.id, session.id)
 
@@ -487,8 +523,7 @@ async def test_export_session_selection_falls_back_to_target_fan_locations(
     session = await _create_session(
         db_session, user, filters_snapshot={"target_fan_locations": ["浙江", "湖州"]}
     )
-    db_session.add(_selection_row(user.id, session.id, "a"))
-    await db_session.flush()
+    await _seed_items(db_session, user.id, session.id, [_selection_row(user.id, session.id, "a")])
 
     workbook_out = await export_session_selection(db_session, user.id, session.id)
 
@@ -502,8 +537,7 @@ async def test_export_filename_sanitizes_brand_and_defaults_category(
 ) -> None:
     user = await user_factory()
     session = await _create_session(db_session, user, brand='品/牌"A', category=None)
-    db_session.add(_selection_row(user.id, session.id, "a"))
-    await db_session.flush()
+    await _seed_items(db_session, user.id, session.id, [_selection_row(user.id, session.id, "a")])
 
     workbook_out = await export_session_selection(db_session, user.id, session.id)
 
@@ -562,14 +596,11 @@ async def test_list_kol_selection_returns_total_and_items(
     export_client_factory, db_session: AsyncSession
 ) -> None:
     client, user, session_id = await export_client_factory()
-    db_session.add(
+    await _seed_items(db_session, user.id, session_id, [
         _selection_row(user.id, session_id, "low", nickname="低分达人", total=50.0,
-                       rating="可考虑", stars="★★★")
-    )
-    db_session.add(
-        _selection_row(user.id, session_id, "high", nickname="高分达人", total=90.0)
-    )
-    await db_session.flush()
+                       rating="可考虑", stars="★★★"),
+        _selection_row(user.id, session_id, "high", nickname="高分达人", total=90.0),
+    ])
 
     response = await client.get(f"/api/v1/sessions/{session_id}/kol-selection")
 
@@ -606,8 +637,9 @@ async def test_export_kol_selection_streams_workbook(
     export_client_factory, db_session: AsyncSession
 ) -> None:
     client, user, session_id = await export_client_factory()
-    db_session.add(_selection_row(user.id, session_id, "a", nickname="导出达人"))
-    await db_session.flush()
+    await _seed_items(
+        db_session, user.id, session_id, [_selection_row(user.id, session_id, "a", nickname="导出达人")]
+    )
 
     response = await client.get(f"/api/v1/sessions/{session_id}/kol-selection/export")
 

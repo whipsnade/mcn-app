@@ -90,6 +90,8 @@ class ExecuteMcpCall:
     internal_tool_name: str
     arguments: dict[str, JsonValue]
     lease_owner: str | None = None
+    # 归属的 task_goals.id；Task 7 接线前调用方传 None。
+    goal_id: str | None = None
 
 
 class TaskLeaseLostError(RuntimeError):
@@ -128,6 +130,7 @@ class McpCallService:
         plan_step_id: str,
         internal_tool_name: str,
         arguments: dict[str, JsonValue],
+        goal_id: str | None = None,
     ) -> McpCall:
         arguments_digest = hashlib.sha256(canonical_json_bytes(arguments)).hexdigest()
         existing = await self._by_logical_id(logical_call_id)
@@ -139,6 +142,7 @@ class McpCallService:
                 plan_step_id=plan_step_id,
                 internal_tool_name=internal_tool_name,
                 arguments_digest=arguments_digest,
+                goal_id=goal_id,
             ):
                 raise LogicalCallConflictError(
                     "logical_call_id already exists with a different request"
@@ -157,6 +161,7 @@ class McpCallService:
             id=str(uuid4()),
             logical_call_id=logical_call_id,
             task_id=task_id,
+            goal_id=goal_id,
             batch_no=0,
             plan_step_id=plan_step_id,
             attempt=1,
@@ -183,6 +188,7 @@ class McpCallService:
                 plan_step_id=plan_step_id,
                 internal_tool_name=internal_tool_name,
                 arguments_digest=arguments_digest,
+                goal_id=goal_id,
             ):
                 return winner
             raise LogicalCallConflictError(
@@ -479,6 +485,7 @@ class McpCallService:
         plan_step_id: str,
         internal_tool_name: str,
         arguments_digest: str,
+        goal_id: str | None = None,
     ) -> bool:
         task_user_id = await self._db.scalar(
             select(AnalysisTask.user_id).where(AnalysisTask.id == row.task_id)
@@ -489,6 +496,7 @@ class McpCallService:
             and row.internal_tool_name == internal_tool_name
             and row.arguments_digest == arguments_digest
             and task_user_id == user_id
+            and row.goal_id == goal_id
         )
 
 
@@ -543,6 +551,7 @@ class McpGatewayService:
                     plan_step_id=command.plan_step_id,
                     internal_tool_name=command.internal_tool_name,
                     arguments=command.arguments,
+                    goal_id=command.goal_id,
                 )
                 for command in commands
             ])

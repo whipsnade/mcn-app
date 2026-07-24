@@ -17,7 +17,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.selection.contract import EXPORT_FIELD_CONTRACT_VERSION
-from app.selection.models import SessionKolSelection
+from app.selection.models import KolSelectionItem, SessionKolSelection
 from app.selection.scoring import rating, score_reason
 from app.selection.service import KolSelectionService
 from app.workspace.models import WorkspaceSession
@@ -55,11 +55,7 @@ class ExportedWorkbook:
 async def export_session_selection(
     db: AsyncSession, user_id: str, session_id: str
 ) -> ExportedWorkbook:
-    rows = await KolSelectionService(db).get_all_for_export(
-        user_id=user_id, session_id=session_id
-    )  # 归属校验在 service 内，无权限/无会话抛 LookupError("session_not_found")
-    if not rows:
-        raise LookupError("no_kol_selection")
+    # 先校验会话归属（404 语义），再读最新 selection set 的 items（切读新表）。
     session = await db.scalar(
         select(WorkspaceSession).where(
             WorkspaceSession.id == session_id,
@@ -69,6 +65,17 @@ async def export_session_selection(
     )
     if session is None:
         raise LookupError("session_not_found")
+    service = KolSelectionService(db)
+    selection_set = await service.latest_selection_set(session_id)
+    rows = (
+        []
+        if selection_set is None
+        else await service.get_all_items_for_export(
+            user_id=user_id, selection_set_id=selection_set.id
+        )
+    )
+    if not rows:
+        raise LookupError("no_kol_selection")
     candidates = [
         _selection_candidate(row, rank) for rank, row in enumerate(rows, start=1)
     ]
@@ -119,7 +126,9 @@ def _target_region_rate_label(metadata: dict[str, Any]) -> str:
     return "目标地区粉丝占比"
 
 
-def _selection_candidate(row: SessionKolSelection, rank: int) -> ExportCandidate:
+def _selection_candidate(
+    row: SessionKolSelection | KolSelectionItem, rank: int
+) -> ExportCandidate:
     fields = row.fields_json or {}
     score = row.score_json or {}
     dimensions = score.get("dimensions") or {}

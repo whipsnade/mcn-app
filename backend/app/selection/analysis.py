@@ -7,20 +7,25 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.artifacts.service import ArtifactService
 from app.model.contracts import ChatMessage, ModelAdapter, StructuredModelRequest
 from app.model.prompts import KOL_ANALYSIS_PROMPT
 from app.reporting.analysis_reports import AnalysisReportService
 from app.reporting.blocks import ReportDocument
 from app.reporting.models import AnalysisReport
-from app.selection.models import SessionKolSelection
+from app.selection.models import KolSelectionItem, SessionKolSelection
 from app.selection.scoring import score_reason
 from app.selection.service import KolSelectionService
 from app.tasks.errors import _PLATFORM_LABELS
 from app.workspace.models import WorkspaceSession
+
+
+logger = logging.getLogger(__name__)
 
 
 def _platform_label(platform: str) -> str:
@@ -84,7 +89,7 @@ def _engagement_rate_bucket(raw: Any) -> str:
     return ">10%"
 
 
-def _score_reason(row: SessionKolSelection) -> str:
+def _score_reason(row: SessionKolSelection | KolSelectionItem) -> str:
     fields_json = row.fields_json or {}
     export_fields = fields_json.get("export_fields") or {}
     for key in _SCORE_REASON_KEYS:
@@ -97,7 +102,7 @@ def _score_reason(row: SessionKolSelection) -> str:
 
 
 def build_kol_analysis_summary(
-    rows: list[SessionKolSelection],
+    rows: list[SessionKolSelection] | list[KolSelectionItem],
     *,
     brand: str,
     category: str | None,
@@ -174,18 +179,36 @@ async def run_kol_analysis(
     - ``LookupError("no_kol_selection")``：名单为空；
     - ``LookupError("report_version_conflict")``：落库版本冲突（来自报告服务）。
     """
-    rows = await KolSelectionService(db).get_all_for_export(
-        user_id=user_id, session_id=session_id
+    # 归属校验先行（404 语义），再读最新 selection set 的 items（切读新表）。
+    session = await db.get(WorkspaceSession, session_id)
+    if session is None or session.user_id != user_id or session.deleted_at is not None:
+        raise LookupError("session_not_found")
+    service = KolSelectionService(db)
+    selection_set = await service.latest_selection_set(session_id)
+    rows = (
+        []
+        if selection_set is None
+        else await service.get_all_items_for_export(
+            user_id=user_id, selection_set_id=selection_set.id
+        )
     )
     if not rows:
         raise LookupError("no_kol_selection")
-    session = await db.get(WorkspaceSession, session_id)
     summary = build_kol_analysis_summary(
         rows,
         brand=session.brand if session else "",
         category=session.category if session else None,
         target_audience=session.target_audience if session else "",
     )
+    # 报告 scope 快照：brand/category，None 字段省略。
+    scope = {
+        key: value
+        for key, value in {
+            "brand": session.brand if session else None,
+            "category": session.category if session else None,
+        }.items()
+        if value is not None
+    } or None
     result = await model.complete_json(
         StructuredModelRequest(
             purpose="kol_analysis",
@@ -206,11 +229,32 @@ async def run_kol_analysis(
             },
         )
     )
-    return await AnalysisReportService(db).build_session_report(
+    report = await AnalysisReportService(db).build_session_report(
         user_id=user_id,
         session_id=session_id,
         document=result.value,
+        scope=scope,
     )
+    try:
+        # 手动分析产物登记 manual Artifact（artifact_key 含 report_id，天然幂等）。
+        await ArtifactService(db).register_artifact(
+            user_id=user_id,
+            session_id=session_id,
+            artifact_key=f"manual:{report.id}:kol_report",
+            artifact_type="kol_report",
+            title=report.title,
+            version=report.version,
+            status=report.status,
+            task_id=None,
+            report_id=report.id,
+            scope=report.scope_json,
+        )
+    except Exception:
+        # Artifact 登记失败不影响分析响应。
+        logger.warning(
+            "kol_analysis_artifact_register_failed report_id=%s", report.id, exc_info=True
+        )
+    return report
 
 
 __all__ = ["build_kol_analysis_summary", "run_kol_analysis"]

@@ -36,6 +36,11 @@ class TaskEventType(StrEnum):
     REPLAN_READY = "replan.ready"
     TASK_FAILED = "task.failed"
     TASK_CANCELLED = "task.cancelled"
+    # 阶段二 goal/artifact 基础设施：goal 生命周期与 Artifact 登记事件。
+    GOAL_STARTED = "goal.started"
+    GOAL_COMPLETED = "goal.completed"
+    GOAL_FAILED = "goal.failed"
+    ARTIFACT_UPDATED = "artifact.updated"
 
 
 TERMINAL_TASK_STATUSES = {

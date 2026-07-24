@@ -1,6 +1,6 @@
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class SmsCodeRequest(BaseModel):
@@ -32,3 +32,24 @@ class UserRead(BaseModel):
     role: Literal["user", "admin"]
     channels: list[str]
     industries: list[str]
+
+
+class BrandProfileItem(BaseModel):
+    brand_name: str
+    is_default: bool
+
+
+class BrandProfileList(BaseModel):
+    items: list[BrandProfileItem]
+
+
+class BrandProfileDefaultSet(BaseModel):
+    brand_name: str = Field(min_length=1, max_length=100)
+
+    @field_validator("brand_name")
+    @classmethod
+    def _strip_and_require_nonblank(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("brand_name_empty")
+        return stripped

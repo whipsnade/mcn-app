@@ -359,3 +359,95 @@ async def test_session_report_rejects_soft_deleted_session(
     response = await owner.get(f"/api/v1/analysis-reports/{report.id}")
     assert response.status_code == 404
 
+
+@pytest.mark.asyncio
+async def test_build_session_report_versions_scoped_by_report_type(
+    auth_client_factory, db_session
+) -> None:
+    """version 按 (session_id, report_type) 独立编号：不同类型互不占号。"""
+    client = await auth_client_factory("13400000054")
+    session_id, task_id = await _create_agent_session(client, "report-type")
+    source = await db_session.get(AnalysisTask, task_id)
+    assert source is not None
+
+    service = AnalysisReportService(db_session)
+    kol_v1 = await service.build_session_report(
+        user_id=source.user_id, session_id=session_id, document=_document()
+    )
+    kol_v2 = await service.build_session_report(
+        user_id=source.user_id, session_id=session_id, document=_document()
+    )
+    brand_v1 = await service.build_session_report(
+        user_id=source.user_id,
+        session_id=session_id,
+        document=_document(),
+        report_type="brand_analysis",
+    )
+    kol_v3 = await service.build_session_report(
+        user_id=source.user_id, session_id=session_id, document=_document()
+    )
+
+    assert (kol_v1.version, kol_v2.version, kol_v3.version) == (1, 2, 3)
+    assert brand_v1.version == 1
+    assert kol_v1.report_type == "kol_analysis"
+    assert brand_v1.report_type == "brand_analysis"
+    persisted = await db_session.scalar(
+        select(func.count(AnalysisReport.id)).where(AnalysisReport.session_id == session_id)
+    )
+    assert persisted == 4
+
+
+@pytest.mark.asyncio
+async def test_build_session_report_persists_scope_json(auth_client_factory, db_session) -> None:
+    client = await auth_client_factory("13400000055")
+    session_id, task_id = await _create_agent_session(client, "scope")
+    source = await db_session.get(AnalysisTask, task_id)
+    assert source is not None
+
+    service = AnalysisReportService(db_session)
+    scoped = await service.build_session_report(
+        user_id=source.user_id,
+        session_id=session_id,
+        document=_document(),
+        scope={"brand": "海底捞", "category": "美食"},
+    )
+    assert scoped.scope_json == {"brand": "海底捞", "category": "美食"}
+
+    plain = await service.build_session_report(
+        user_id=source.user_id, session_id=session_id, document=_document()
+    )
+    assert plain.scope_json is None
+
+
+@pytest.mark.asyncio
+async def test_latest_session_report_filters_by_report_type(
+    auth_client_factory, db_session
+) -> None:
+    client = await auth_client_factory("13400000056")
+    session_id, task_id = await _create_agent_session(client, "latest-by-type")
+    source = await db_session.get(AnalysisTask, task_id)
+    assert source is not None
+
+    service = AnalysisReportService(db_session)
+    await service.build_session_report(
+        user_id=source.user_id, session_id=session_id, document=_document()
+    )
+    brand = await service.build_session_report(
+        user_id=source.user_id,
+        session_id=session_id,
+        document=_document(),
+        report_type="brand_analysis",
+    )
+    kol_v2 = await service.build_session_report(
+        user_id=source.user_id, session_id=session_id, document=_document()
+    )
+
+    latest = await service.latest_session_report(session_id)
+    assert latest is not None
+    assert latest.id == kol_v2.id
+    latest_brand = await service.latest_session_report(
+        session_id, report_type="brand_analysis"
+    )
+    assert latest_brand is not None
+    assert latest_brand.id == brand.id
+

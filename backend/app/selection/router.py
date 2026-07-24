@@ -13,24 +13,10 @@ from app.reporting.router import analysis_report_read
 from app.reporting.schemas import AnalysisReportRead
 from app.selection.analysis import run_kol_analysis
 from app.selection.exporter import export_session_selection
-from app.selection.models import SessionKolSelection
-from app.selection.service import KolSelectionService
+from app.selection.service import KolSelectionService, serialize_selection_item
 
 
 router = APIRouter()
-
-
-def _selection_item(row: SessionKolSelection) -> dict[str, Any]:
-    return {
-        "platform": row.platform,
-        "kol_uid": row.kol_uid,
-        "nickname": row.nickname,
-        "followers": row.followers,
-        "city": row.city,
-        "profile_url": row.profile_url,
-        "fields": row.fields_json,
-        "score": row.score_json,
-    }
 
 
 @router.get("/sessions/{session_id}/kol-selection")
@@ -41,9 +27,9 @@ async def list_kol_selection(
     offset: Annotated[int, Query(ge=0)] = 0,
     limit: Annotated[int, Query(ge=1, le=500)] = 200,
 ) -> dict[str, Any]:
-    """圈选名单列表：按综合评分倒序，校验会话归属。"""
+    """圈选名单列表：读最新 selection set，按综合评分倒序，校验会话归属。"""
     try:
-        total, rows = await KolSelectionService(db).list_selection(
+        total, rows = await KolSelectionService(db).list_latest_items(
             user_id=user.id, session_id=session_id, offset=offset, limit=limit
         )
     except LookupError as error:
@@ -52,7 +38,7 @@ async def list_kol_selection(
                 status_code=status.HTTP_404_NOT_FOUND, detail="session_not_found"
             ) from error
         raise
-    return {"total": total, "items": [_selection_item(row) for row in rows]}
+    return {"total": total, "items": [serialize_selection_item(row) for row in rows]}
 
 
 @router.get("/sessions/{session_id}/kol-selection/export")

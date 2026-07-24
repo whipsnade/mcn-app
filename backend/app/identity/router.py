@@ -7,10 +7,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import get_settings
 from app.core.security import REFRESH_COOKIE
 from app.db.session import get_db
+from app.identity.brand_profiles import BrandProfileService
 from app.identity.dependencies import CurrentUser
 from app.identity.models import UserChannelPermission
 from app.identity.providers import MockSmsAuthProvider, MockWechatAuthProvider
 from app.identity.schemas import (
+    BrandProfileItem,
+    BrandProfileList,
+    BrandProfileDefaultSet,
     SmsCodeRequest,
     SmsCodeResponse,
     SmsLoginRequest,
@@ -131,3 +135,31 @@ async def get_me(user: CurrentUser, db: Annotated[AsyncSession, Depends(get_db)]
         channels=channels,
         industries=[str(item) for item in (user.industries or ["美食"])],
     )
+
+
+def _brand_profile_list(rows) -> BrandProfileList:
+    return BrandProfileList(
+        items=[
+            BrandProfileItem(brand_name=row.brand_name, is_default=row.is_default is True)
+            for row in rows
+        ]
+    )
+
+
+@users_router.get("/me/brand-profiles", response_model=BrandProfileList)
+async def list_brand_profiles(
+    user: CurrentUser, db: Annotated[AsyncSession, Depends(get_db)]
+) -> BrandProfileList:
+    rows = await BrandProfileService(db).list_brand_profiles(user.id)
+    return _brand_profile_list(rows)
+
+
+@users_router.put("/me/brand-profiles", response_model=BrandProfileList)
+async def set_default_brand_profile(
+    payload: BrandProfileDefaultSet,
+    user: CurrentUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> BrandProfileList:
+    service = BrandProfileService(db)
+    await service.set_default_brand(user.id, payload.brand_name)
+    return _brand_profile_list(await service.list_brand_profiles(user.id))

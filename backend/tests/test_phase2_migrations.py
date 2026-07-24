@@ -21,7 +21,7 @@ def test_migration_chain_has_single_head() -> None:
     config = Config(str(backend_dir / "alembic.ini"))
     config.set_main_option("script_location", str(backend_dir / "migrations"))
     heads = ScriptDirectory.from_config(config).get_heads()
-    assert heads == ["0021_favorite_platform_uid"]
+    assert heads == ["0023_goal_artifact_backfill"]
 
 
 async def test_phase_two_unique_constraints() -> None:
@@ -337,7 +337,8 @@ async def test_0020_analysis_reports_session_scoped_schema() -> None:
             lambda sync: inspect(sync).get_columns("analysis_reports")
         )
     names = {item["name"] for item in constraints}
-    assert "uq_analysis_reports_session_version" in names
+    # (session_id, version) 唯一约束由 0022 升级为 (session_id, report_type, version)。
+    assert "uq_analysis_reports_session_type_version" in names
     assert "uq_analysis_reports_task_version" in names
     task_id_column = {item["name"]: item for item in columns}["task_id"]
     assert task_id_column["nullable"] is True
@@ -375,6 +376,86 @@ async def test_0021_user_kol_favorites_platform_uid_schema() -> None:
     names = {item["name"] for item in constraints}
     assert "uq_user_kol_favorites_user_platform_uid" in names
     assert "uq_user_kol_favorites_user_kol" in names
+
+
+async def test_0022_goal_artifact_infra_schema() -> None:
+    """迁移 0022：goal/artifact 基础设施新表与 analysis_reports/mcp_calls 扩展列。"""
+    async with engine.connect() as connection:
+        table_names = await connection.run_sync(lambda sync: inspect(sync).get_table_names())
+        goal_constraints = await connection.run_sync(
+            lambda sync: inspect(sync).get_unique_constraints("task_goals")
+        )
+        artifact_constraints = await connection.run_sync(
+            lambda sync: inspect(sync).get_unique_constraints("task_artifacts")
+        )
+        artifact_indexes = await connection.run_sync(
+            lambda sync: inspect(sync).get_indexes("task_artifacts")
+        )
+        set_constraints = await connection.run_sync(
+            lambda sync: inspect(sync).get_unique_constraints("kol_selection_sets")
+        )
+        item_constraints = await connection.run_sync(
+            lambda sync: inspect(sync).get_unique_constraints("kol_selection_items")
+        )
+        item_indexes = await connection.run_sync(
+            lambda sync: inspect(sync).get_indexes("kol_selection_items")
+        )
+        read_state_constraints = await connection.run_sync(
+            lambda sync: inspect(sync).get_unique_constraints("artifact_read_states")
+        )
+        brand_constraints = await connection.run_sync(
+            lambda sync: inspect(sync).get_unique_constraints("user_brand_profiles")
+        )
+        brand_columns = await connection.run_sync(
+            lambda sync: inspect(sync).get_columns("user_brand_profiles")
+        )
+        report_constraints = await connection.run_sync(
+            lambda sync: inspect(sync).get_unique_constraints("analysis_reports")
+        )
+        report_columns = await connection.run_sync(
+            lambda sync: inspect(sync).get_columns("analysis_reports")
+        )
+        mcp_call_columns = await connection.run_sync(
+            lambda sync: inspect(sync).get_columns("mcp_calls")
+        )
+
+    for table in (
+        "task_goals",
+        "task_artifacts",
+        "kol_selection_sets",
+        "kol_selection_items",
+        "artifact_read_states",
+        "user_brand_profiles",
+    ):
+        assert table in table_names
+
+    assert "uq_task_goals_task_sequence" in {item["name"] for item in goal_constraints}
+    assert "uq_task_artifacts_artifact_key" in {item["name"] for item in artifact_constraints}
+    assert "ix_task_artifacts_session_type" in {item["name"] for item in artifact_indexes}
+    assert "uq_kol_selection_sets_session_version" in {item["name"] for item in set_constraints}
+    assert "uq_kol_selection_items_set_platform_uid" in {
+        item["name"] for item in item_constraints
+    }
+    assert "ix_kol_selection_items_user" in {item["name"] for item in item_indexes}
+    assert "uq_artifact_read_states_user_session_module" in {
+        item["name"] for item in read_state_constraints
+    }
+
+    brand_names = {item["name"] for item in brand_constraints}
+    assert "uq_user_brand_profiles_user_brand" in brand_names
+    assert "uq_user_brand_profiles_user_default" in brand_names
+    brand_by_name = {item["name"]: item for item in brand_columns}
+    assert brand_by_name["is_default"]["nullable"] is True
+
+    report_names = {item["name"] for item in report_constraints}
+    assert "uq_analysis_reports_session_type_version" in report_names
+    assert "uq_analysis_reports_session_version" not in report_names
+    report_by_name = {item["name"]: item for item in report_columns}
+    assert report_by_name["report_type"]["nullable"] is False
+    assert report_by_name["scope_json"]["nullable"] is True
+
+    mcp_call_by_name = {item["name"]: item for item in mcp_call_columns}
+    assert mcp_call_by_name["goal_id"]["nullable"] is True
 
 
 def _run_alembic(*args: str) -> None:

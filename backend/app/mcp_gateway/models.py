@@ -128,6 +128,8 @@ class McpCall(Base):
     task_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("analysis_tasks.id", ondelete="CASCADE"), nullable=False
     )
+    # 归属的 task_goals.id；旧调用与 quick 旁路为 NULL（阶段二逐接线）。
+    goal_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     batch_no: Mapped[int] = mapped_column(Integer, nullable=False)
     plan_step_id: Mapped[str] = mapped_column(String(64), nullable=False)
     attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=1)

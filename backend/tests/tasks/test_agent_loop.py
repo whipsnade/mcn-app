@@ -6,6 +6,7 @@ import pytest
 from sqlalchemy import delete, select
 
 from app.billing.service import InsufficientPointsError
+from app.artifacts.models import TaskArtifact
 from app.db.session import SessionFactory
 from app.identity.models import User
 from app.mcp_gateway.contracts import DataTapService
@@ -20,7 +21,8 @@ from app.orchestration.loop import (
     TrajectoryStep,
 )
 from app.orchestration.schemas import PlannerTool
-from app.selection.models import SessionKolSelection
+from app.selection.models import KolSelectionItem, KolSelectionSet, SessionKolSelection
+from app.selection.service import KolSelectionService
 from app.tasks.dependencies import _TaskArtifacts
 from app.tasks.executor import TaskExecutor
 from app.tasks.models import AnalysisTask, TaskEvent
@@ -837,6 +839,10 @@ async def test_agent_loop_ingests_settled_evidence_into_selection() -> None:
             # 调用参数必须透传给沉淀钩子：kol.detail/insight 工具的平台
             # 身份靠 arguments 里的 platform/datasource 注入。
             "arguments": {"keyword": "美妆"},
+            # 无 goal 的 legacy 任务：goal 上下文为空，双写新表侧不触发。
+            "goal_id": None,
+            "set_title": "默认名单",
+            "set_scope": None,
         }
     ]
 
@@ -928,6 +934,20 @@ async def _create_leased_task(worker_id: str) -> dict[str, str]:
 async def _cleanup_leased_task(ids: dict[str, str]) -> None:
     async with SessionFactory.begin() as db:
         await db.execute(delete(TaskEvent).where(TaskEvent.task_id == ids["task_id"]))
+        # TaskArtifact 引用 kol_selection_sets/analysis_reports（RESTRICT），先删。
+        await db.execute(delete(TaskArtifact).where(TaskArtifact.session_id == ids["session_id"]))
+        await db.execute(
+            delete(KolSelectionItem).where(
+                KolSelectionItem.selection_set_id.in_(
+                    select(KolSelectionSet.id).where(
+                        KolSelectionSet.session_id == ids["session_id"]
+                    )
+                )
+            )
+        )
+        await db.execute(
+            delete(KolSelectionSet).where(KolSelectionSet.session_id == ids["session_id"])
+        )
         await db.execute(delete(AnalysisTask).where(AnalysisTask.id == ids["task_id"]))
         await db.execute(
             delete(AnalysisReport).where(AnalysisReport.session_id == ids["session_id"])
@@ -1108,14 +1128,18 @@ class _FakeAnalysisModel:
 
 
 async def _seed_selection_rows(ids: dict[str, str], count: int) -> None:
+    """按现行读取路径播种：selection set + items（自动分析已切读新表）。"""
     now = datetime.now(UTC).replace(tzinfo=None)
     async with SessionFactory.begin() as db:
+        selection_set = await KolSelectionService(db).ensure_selection_set(
+            ids["user_id"], ids["session_id"], title="默认名单"
+        )
         for index in range(count):
             db.add(
-                SessionKolSelection(
+                KolSelectionItem(
                     id=str(uuid4()),
                     user_id=ids["user_id"],
-                    session_id=ids["session_id"],
+                    selection_set_id=selection_set.id,
                     platform="xiaohongshu",
                     kol_uid=f"uid-{index}",
                     nickname=f"达人{index}",

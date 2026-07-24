@@ -6,6 +6,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.goals.models import TaskGoal
 from app.tasks.models import AnalysisTask, TaskEvent
 from app.tasks.errors import SafeTaskError, safe_error
 from app.tasks.state import TERMINAL_TASK_STATUSES, TaskEventType, TaskStatus
@@ -65,6 +66,24 @@ class TaskRepository:
     ) -> list[TaskEvent]:
         await self.get_owned(task_id, user_id)
         return await self.list_events_after(task_id, last_event_id)
+
+    async def get_task_goal(self, task_id: str) -> TaskGoal | None:
+        """任务的 kol_selection 单 Goal（阶段二固定 sequence=1），无则 None。"""
+        return await self.db.scalar(
+            select(TaskGoal).where(TaskGoal.task_id == task_id, TaskGoal.sequence == 1)
+        )
+
+    async def mark_goal_running(self, goal_id: str) -> bool:
+        """goal 标记 running（落 started_at）；仅 pending → running，幂等。"""
+        goal = await self.db.get(TaskGoal, goal_id)
+        if goal is None or goal.status != "pending":
+            return False
+        now = utc_now()
+        goal.status = "running"
+        goal.started_at = now
+        goal.updated_at = now
+        await self.db.flush()
+        return True
 
     async def claim_lease(
         self, task_id: str, worker_id: str, lease_seconds: int

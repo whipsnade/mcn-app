@@ -15,7 +15,10 @@ from sqlalchemy.exc import IntegrityError
 from app.core.config import get_settings
 from app.db.session import SessionFactory
 from app.goals.context import GoalPlannerContextBuilder
+from app.goals.models import TaskGoal
 from app.goals.planner import GoalPlannerService
+from app.artifacts.models import TaskArtifact
+from app.artifacts.service import ArtifactService, module_key_of
 from app.identity.models import User, UserChannelPermission
 from app.mcp_gateway.datatap import DataTapTransport
 from app.mcp_gateway.contracts import DataTapService
@@ -30,8 +33,10 @@ from app.orchestration.context import compress_messages
 from app.orchestration.loop import AgentDecision, AgentLoopContext
 from app.orchestration.routing import extract_requested_period
 from app.orchestration.schemas import PlannerTool
+from app.reporting.models import AnalysisReport
 from app.selection.analysis import run_kol_analysis
 from app.selection.contract import build_export_field_contract
+from app.selection.models import KolSelectionSet
 from app.selection.service import KolSelectionService
 from app.tasks.executor import TaskExecutor, TaskRunner
 from app.tasks.followups import FollowupSuggestionService
@@ -109,6 +114,9 @@ class DatabaseTaskStore:
     async def release_expired_unknown(self, *args: Any):
         return await self._write("release_expired_unknown", *args)
     async def append_event(self, *args: Any): return await self._write("append_event", *args)
+    async def load_task_goal(self, *args: Any): return await self._read("get_task_goal", *args)
+    async def mark_goal_running(self, *args: Any):
+        return await self._write("mark_goal_running", *args)
 
 
 class _Permissions:
@@ -143,6 +151,9 @@ class _TaskArtifacts:
         self._worker_id = worker_id
         self._model = model
         self._followups = FollowupSuggestionService(model)
+        # auto_kol_analysis 产出的报告 id（按 task_id 记录），finalize_goal
+        # 登记 kol_report Artifact 时优先取它，缺席再回退会话最新报告。
+        self._report_ids: dict[str, str] = {}
 
     async def prepare_followups(self, task_id: str) -> bool:
         return await self._followups.prepare(task_id)
@@ -178,8 +189,13 @@ class _TaskArtifacts:
                         "auto_kol_analysis skipped: already reported task_id=%s", task_id
                     )
                     return
-                count = await KolSelectionService(db).count_selection(
-                    session_id=task.session_id
+                # 空名单护栏与读取路径一致：按最新 selection set 的 item 数判断。
+                selection_service = KolSelectionService(db)
+                selection_set = await selection_service.latest_selection_set(task.session_id)
+                count = (
+                    await selection_service.count_items(selection_set.id)
+                    if selection_set is not None
+                    else 0
                 )
                 if count == 0:
                     logger.debug(
@@ -192,6 +208,7 @@ class _TaskArtifacts:
                     user_id=task.user_id,
                     session_id=task.session_id,
                 )
+                self._report_ids[task.id] = report.id
                 await TaskRepository(db).append_event(
                     task.id,
                     task.user_id,
@@ -205,6 +222,161 @@ class _TaskArtifacts:
                 )
         except Exception:
             logger.warning("auto_kol_analysis_failed task_id=%s", task_id, exc_info=True)
+
+    async def finalize_goal(
+        self, task_id: str, *, terminal_status: str, error_code: str | None = None
+    ) -> None:
+        """goal 收尾：set 完成 + Artifact 登记 + goal 终态与事件（尽力而为，绝不阻塞终态）。
+
+        独立短事务；任何异常只记 warning。Artifact 按 artifact_key 幂等 upsert，
+        恢复重放不重复建行、不重复发 artifact.updated。成功类终态
+        （completed/completed_with_warnings/insufficient_balance）发
+        goal.completed，failed/skipped 发 goal.failed。
+        """
+        try:
+            async with SessionFactory.begin() as db:
+                task = await db.get(AnalysisTask, task_id)
+                if task is None:
+                    return
+                goal = await TaskRepository(db).get_task_goal(task.id)
+                if goal is None:
+                    return
+                now = datetime.now(UTC).replace(tzinfo=None)
+                # 轨迹镜像 task.plan_json（agent_trajectory_v1）。
+                goal.trajectory_json = task.plan_json
+                artifact_service = ArtifactService(db)
+                selection_set = await db.scalar(
+                    select(KolSelectionSet)
+                    .where(KolSelectionSet.goal_id == goal.id)
+                    .order_by(KolSelectionSet.version.desc())
+                    .limit(1)
+                )
+                if selection_set is not None:
+                    item_count = await KolSelectionService(db).count_items(selection_set.id)
+                    if item_count > 0:
+                        selection_set.status = "completed"
+                        selection_set.updated_at = now
+                        await self._register_goal_artifact(
+                            db,
+                            artifact_service,
+                            task=task,
+                            goal=goal,
+                            artifact_key=f"goal:{goal.id}:kol_selection_set",
+                            artifact_type="kol_selection_set",
+                            title=selection_set.title,
+                            version=selection_set.version,
+                            selection_set_id=selection_set.id,
+                            scope=selection_set.scope_json,
+                        )
+                if terminal_status in {
+                    "completed",
+                    "completed_with_warnings",
+                    "insufficient_balance",
+                }:
+                    report = await self._goal_report(db, task)
+                    if report is not None:
+                        await self._register_goal_artifact(
+                            db,
+                            artifact_service,
+                            task=task,
+                            goal=goal,
+                            artifact_key=f"goal:{goal.id}:kol_report",
+                            artifact_type="kol_report",
+                            title=report.title,
+                            version=report.version,
+                            report_id=report.id,
+                            scope=report.scope_json,
+                        )
+                goal.status = terminal_status
+                goal.error_code = error_code
+                goal.completed_at = now
+                goal.updated_at = now
+                event_type = (
+                    TaskEventType.GOAL_FAILED
+                    if terminal_status in {"failed", "skipped"}
+                    else TaskEventType.GOAL_COMPLETED
+                )
+                payload: dict[str, Any] = {
+                    "goal_id": goal.id,
+                    "goal_type": goal.goal_type,
+                    "status": terminal_status,
+                }
+                if error_code:
+                    payload["error_code"] = error_code
+                await TaskRepository(db).append_event(task.id, task.user_id, event_type, payload)
+        except Exception:
+            logger.warning("finalize_goal_failed task_id=%s", task_id, exc_info=True)
+
+    async def _goal_report(self, db, task: AnalysisTask) -> AnalysisReport | None:
+        """auto_kol_analysis 产出的报告；恢复重放时回退会话最新 kol_analysis 报告。"""
+        report_id = self._report_ids.get(task.id)
+        if report_id is not None:
+            report = await db.get(AnalysisReport, report_id)
+            if report is not None:
+                return report
+        return await db.scalar(
+            select(AnalysisReport)
+            .where(
+                AnalysisReport.session_id == task.session_id,
+                AnalysisReport.report_type == "kol_analysis",
+                AnalysisReport.status == "completed",
+            )
+            .order_by(AnalysisReport.version.desc())
+            .limit(1)
+        )
+
+    async def _register_goal_artifact(
+        self,
+        db,
+        artifact_service: ArtifactService,
+        *,
+        task: AnalysisTask,
+        goal: TaskGoal,
+        artifact_key: str,
+        artifact_type: str,
+        title: str,
+        version: int,
+        report_id: str | None = None,
+        selection_set_id: str | None = None,
+        scope: dict[str, Any] | None = None,
+    ) -> None:
+        existing = await db.scalar(
+            select(TaskArtifact).where(TaskArtifact.artifact_key == artifact_key)
+        )
+        artifact = await artifact_service.register_artifact(
+            user_id=task.user_id,
+            session_id=task.session_id,
+            artifact_key=artifact_key,
+            artifact_type=artifact_type,
+            title=title,
+            version=version,
+            status="completed",
+            task_id=task.id,
+            goal_id=goal.id,
+            report_id=report_id,
+            selection_set_id=selection_set_id,
+            scope=scope,
+        )
+        # 重放时已存在同版本同状态行：不重复发 artifact.updated。
+        if (
+            existing is not None
+            and existing.version == artifact.version
+            and existing.status == artifact.status
+        ):
+            return
+        await TaskRepository(db).append_event(
+            task.id,
+            task.user_id,
+            TaskEventType.ARTIFACT_UPDATED,
+            {
+                "artifact_id": artifact.id,
+                "goal_id": goal.id,
+                "artifact_type": artifact.artifact_type,
+                "module_key": module_key_of(artifact.artifact_type),
+                "version": artifact.version,
+                "title": artifact.title,
+            },
+        )
 
     async def write_conclusion_message(self, task_id: str, conclusion: str) -> None:
         """任务收尾：把 finish 结论写成一条 assistant 消息（幂等，重试安全）。"""
@@ -305,7 +477,30 @@ class DatabaseSelectionIngest:
         internal_tool_name: str,
         structured_content: Any,
         arguments: dict | None = None,
+        goal_id: str | None = None,
+        set_title: str = "默认名单",
+        set_scope: dict | None = None,
     ) -> None:
+        # 双写过渡：提供了 goal 上下文时先写新表（ensure set + items），
+        # 再照旧写旧表 session_kol_selections；两边各自独立事务与异常
+        # 兜底，任一失败只记 warning 不影响另一边（阶段五才停写旧表）。
+        if goal_id is not None:
+            try:
+                await self._ingest_to_set(
+                    user_id=user_id,
+                    session_id=session_id,
+                    task_id=task_id,
+                    internal_tool_name=internal_tool_name,
+                    structured_content=structured_content,
+                    arguments=arguments,
+                    goal_id=goal_id,
+                    set_title=set_title,
+                    set_scope=set_scope,
+                )
+            except Exception:
+                logger.warning(
+                    "kol_selection_set_ingest_failed task_id=%s", task_id, exc_info=True
+                )
         for attempt in (1, 2):
             try:
                 async with SessionFactory.begin() as db:
@@ -328,6 +523,41 @@ class DatabaseSelectionIngest:
                 # 第二次 select 会命中已有行走 merge；再失败只记 warning。
                 if attempt == 2:
                     logger.warning("kol_selection_ingest_conflict", exc_info=True)
+
+    async def _ingest_to_set(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        task_id: str,
+        internal_tool_name: str,
+        structured_content: Any,
+        arguments: dict | None,
+        goal_id: str,
+        set_title: str,
+        set_scope: dict | None,
+    ) -> None:
+        async with SessionFactory.begin() as db:
+            mapping = await self._tool_mapping(db)
+            if internal_tool_name not in mapping:
+                return
+            service = KolSelectionService(db)
+            selection_set = await service.ensure_selection_set(
+                user_id,
+                session_id,
+                task_id=task_id,
+                goal_id=goal_id,
+                title=set_title,
+                scope=set_scope,
+            )
+            await service.ingest_tool_evidence_to_set(
+                user_id=user_id,
+                selection_set_id=selection_set.id,
+                task_id=task_id,
+                tool_name=internal_tool_name,
+                structured_content=structured_content,
+                arguments=arguments,
+            )
 
     async def _tool_mapping(self, db) -> dict[str, str]:
         if self._remote_by_internal is None:

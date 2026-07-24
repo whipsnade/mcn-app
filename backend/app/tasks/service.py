@@ -7,6 +7,7 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.goals.models import TaskGoal
 from app.tasks.models import AnalysisTask
 from app.tasks.repository import TaskRepository
 from app.tasks.schemas import TaskCreate
@@ -63,7 +64,7 @@ class TaskService:
         idempotency_payload_hash: str | None = None,
     ) -> AnalysisTask:
         workspace_service = WorkspaceService(self.db)
-        await workspace_service.get_owned_session(user_id, session_id, for_update=True)
+        session = await workspace_service.get_owned_session(user_id, session_id, for_update=True)
         active_task_id = await self.db.scalar(
             select(AnalysisTask.id)
             .where(
@@ -130,6 +131,33 @@ class TaskService:
             "latest_analysis_task_id": task.id,
         }
         self.db.add(task)
+        await self.db.flush()
+        # 阶段二单 Goal 包装：每条新任务（含重试任务）同事务落一条
+        # kol_selection goal，params 取会话 brand/category 快照（None 省略）。
+        goal_params = {
+            key: value
+            for key, value in {"brand": session.brand, "category": session.category}.items()
+            if value is not None
+        }
+        self.db.add(
+            TaskGoal(
+                id=str(uuid4()),
+                task_id=task.id,
+                sequence=1,
+                goal_type="kol_selection",
+                status="pending",
+                depends_on_goal_id=None,
+                params_json=goal_params,
+                trajectory_json=None,
+                result_summary_json=None,
+                warning_code=None,
+                error_code=None,
+                started_at=None,
+                completed_at=None,
+                created_at=now,
+                updated_at=now,
+            )
+        )
         await self.db.flush()
         await self.repository.append_event(
             task.id,

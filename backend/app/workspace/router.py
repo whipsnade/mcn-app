@@ -95,8 +95,12 @@ async def session_read(
         if analysis_report is not None:
             latest_analysis_report = analysis_report_summary(analysis_report)
     if kol_selection_count is None:
-        kol_selection_count = await KolSelectionService(service.db).count_selection(
-            session_id=workspace.id
+        selection_service = KolSelectionService(service.db)
+        selection_set = await selection_service.latest_selection_set(workspace.id)
+        kol_selection_count = (
+            await selection_service.count_items(selection_set.id)
+            if selection_set is not None
+            else 0
         )
     return SessionRead(
         id=workspace.id,
@@ -162,8 +166,8 @@ async def list_sessions(
 ) -> list[SessionRead]:
     service = WorkspaceService(db)
     workspaces = await service.list_sessions(user.id)
-    # 批量取数避免逐会话 COUNT 的 N+1。
-    counts = await KolSelectionService(db).count_selections(
+    # 批量取数避免逐会话 COUNT 的 N+1（取各会话最新 selection set 的 item 数）。
+    counts = await KolSelectionService(db).count_latest_items(
         session_ids=[item.id for item in workspaces]
     )
     return [

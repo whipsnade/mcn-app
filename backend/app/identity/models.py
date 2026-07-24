@@ -72,3 +72,23 @@ class UserChannelPermission(Base):
     is_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class UserBrandProfile(Base):
+    """User-scoped brand profile; at most one default per user (non-default rows store NULL)."""
+
+    __tablename__ = "user_brand_profiles"
+    __table_args__ = (
+        UniqueConstraint("user_id", "brand_name", name="uq_user_brand_profiles_user_brand"),
+        UniqueConstraint("user_id", "is_default", name="uq_user_brand_profiles_user_default"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    brand_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    is_default: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    metadata_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
