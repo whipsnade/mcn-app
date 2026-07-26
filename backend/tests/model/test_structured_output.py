@@ -13,7 +13,7 @@ from app.model.structured_output import (
         ('{"value":1}', '{"value":1}'),
         ('```json\n{"value":1}\n```', '{"value":1}'),
         ('说明文字 {"value":{"items":[1,2]}} 结束', '{"value":{"items":[1,2]}}'),
-        ('前缀 {"text":"包含 } 和 \\\\" 引号"} 后缀', '{"text":"包含 } 和 \\\\" 引号"}'),
+        (r'前缀 {"text":"包含 } 和 \" 引号"} 后缀', r'{"text":"包含 } 和 \" 引号"}'),
     ],
 )
 def test_extract_single_json_object(source: str, expected: str) -> None:
@@ -26,6 +26,8 @@ def test_extract_single_json_object(source: str, expected: str) -> None:
         "没有 JSON",
         '{"value":1',
         '{"value":1} {"value":2}',
+        r'{"a":"未闭合}',
+        r'{"a":"未闭合} {"b":2}',
     ],
 )
 def test_extract_single_json_object_rejects_missing_truncated_or_multiple(source: str) -> None:

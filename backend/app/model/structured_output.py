@@ -55,12 +55,7 @@ def extract_single_json_object(text: str) -> str:
                 end = index + 1
                 break
     if end is None:
-        # 提取阶段不校验 JSON；若上游给出未闭合字符串，仍保留最外层对象
-        # 供调用方的 JSON/Pydantic 校验报告具体格式错误。
-        fallback_end = source.rfind("}")
-        if fallback_end < start:
-            raise ValueError("structured_json_invalid")
-        end = fallback_end + 1
+        raise ValueError("structured_json_invalid")
     if "{" in source[end:].strip():
         raise ValueError("structured_json_invalid")
     return source[start:end]
