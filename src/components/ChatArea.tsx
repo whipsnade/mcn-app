@@ -43,7 +43,7 @@ export function mergeHistoricalAndRuntimeThinking(
       const key = blockKey(block);
       const historical = byOperation.get(key);
       // 已持久化的终态 metadata 是最终快照；其余情况优先展示更实时的流内容。
-      if (historical && historical.status !== 'running' && block.status === 'running') return;
+      if (historical && historical.status !== 'running') return;
       byOperation.set(key, { ...block, turnId });
     });
     merged.set(turnId, byOperation);

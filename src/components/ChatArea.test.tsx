@@ -3,7 +3,7 @@ import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Session, ThinkingBlock } from '../types';
 import { useSessionThinkingStream } from '../hooks/useSessionThinkingStream';
-import ChatArea from './ChatArea';
+import ChatArea, { mergeHistoricalAndRuntimeThinking } from './ChatArea';
 
 vi.mock('../hooks/useSessionThinkingStream', () => ({
   useSessionThinkingStream: vi.fn(),
@@ -103,6 +103,44 @@ describe('ChatArea', () => {
     expect(logText.indexOf('请分析品牌')).toBeLessThan(logText.indexOf('运行时分析品牌'));
     expect(logText.indexOf('运行时分析品牌')).toBeLessThan(logText.indexOf('品牌分析完成'));
   });
+
+  it.each(['completed', 'interrupted'] as const)(
+    'keeps persisted terminal thinking over %s runtime blocks',
+    runtimeStatus => {
+      const historical = thinkingBlock('持久化终态内容', {
+        status: 'completed',
+        durationMs: 21808,
+      });
+      const merged = mergeHistoricalAndRuntimeThinking(
+        [{
+          id: 'message-assistant',
+          sender: 'ai',
+          text: '分析完成',
+          timestamp: '10:01',
+          turnId: 'turn-1',
+          thinking: {
+            version: 1,
+            status: 'completed',
+            blocks: [historical],
+          },
+        }],
+        {
+          'turn-1': [thinkingBlock('runtime 终态内容', {
+            status: runtimeStatus,
+            durationMs: 20000,
+          })],
+        },
+      );
+
+      expect(merged['turn-1']).toEqual([
+        expect.objectContaining({
+          content: '持久化终态内容',
+          status: 'completed',
+          durationMs: 21808,
+        }),
+      ]);
+    },
+  );
 
   it('does not render thinking panels for empty event blocks', () => {
     vi.mocked(useSessionThinkingStream).mockReturnValue({

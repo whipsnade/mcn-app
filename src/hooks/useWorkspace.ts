@@ -416,9 +416,12 @@ export function useWorkspace(userId?: string) {
           generationRef.current === generation
           && sessionOperationIsCurrent(requestedSessionId, operationEpoch)
         ) {
+          const persistedHasTurn = persisted?.messages.some(
+            message => message.turnId === turnId,
+          ) ?? false;
           setSessions(current => current.map(session => {
             if (session.id !== requestedSessionId) return session;
-            if (persisted?.messages.some(message => message.turnId === turnId)) {
+            if (persisted && persistedHasTurn) {
               return {
                 ...persisted,
                 artifactsSummary: session.artifactsSummary,
@@ -429,6 +432,9 @@ export function useWorkspace(userId?: string) {
               messages: session.messages.filter(message => message.id !== optimisticMessage.id),
             };
           }));
+          if (persistedHasTurn && activeSessionIdRef.current === requestedSessionId) {
+            setActiveTaskId(persisted?.analysis?.taskId);
+          }
           setError(reason instanceof Error ? reason.message : '保存消息失败');
         }
       }

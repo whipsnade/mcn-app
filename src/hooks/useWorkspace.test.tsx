@@ -956,6 +956,42 @@ describe('useWorkspace', () => {
     });
   });
 
+  it('subscribes to a task that persisted before the create response failed', async () => {
+    const persistedAfterError: Session = {
+      ...restoredSession,
+      status: 'analyzing',
+      analysis: {
+        taskId: 'task-persisted',
+        status: 'pending',
+        kind: 'agent',
+      },
+      messages: [
+        ...restoredSession.messages,
+        {
+          id: 'message-persisted',
+          sender: 'user',
+          text: '任务已落库',
+          timestamp: '10:00',
+          turnId: 'turn-1',
+          taskId: 'task-persisted',
+        },
+      ],
+    };
+    vi.mocked(getSession)
+      .mockResolvedValueOnce(restoredSession)
+      .mockResolvedValueOnce(persistedAfterError);
+    vi.mocked(createTask).mockRejectedValue(new Error('NETWORK_FAILED'));
+    const { result } = renderHook(() => useWorkspace('user-a'));
+    await waitFor(() => expect(result.current.activeSession?.id).toBe('session-1'));
+
+    await act(async () => {
+      await expect(result.current.appendMessage('任务已落库')).rejects.toThrow('NETWORK_FAILED');
+    });
+
+    expect(result.current.activeTaskId).toBe('task-persisted');
+    expect(result.current.isAnalyzing).toBe(true);
+  });
+
   it('does not create a second task while the active task is still running', async () => {
     vi.mocked(createTask).mockResolvedValue(taskOutcome({
       id: 'task-1',
