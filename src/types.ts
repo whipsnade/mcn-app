@@ -1,3 +1,57 @@
+export type ThinkingBlockStatus = 'running' | 'completed' | 'interrupted';
+
+export interface ThinkingBlock {
+  operationId: string;
+  turnId?: string;
+  purpose: string;
+  attempt: number;
+  label: string;
+  content: string;
+  status: ThinkingBlockStatus;
+  startedAt?: string;
+  completedAt?: string;
+  durationMs?: number;
+  taskId?: string;
+  goalId?: string;
+  triggerMessageId?: string;
+  truncated: boolean;
+  errorCode?: string;
+  sequence?: number;
+}
+
+export interface ThinkingMetadata {
+  version: 1;
+  status: ThinkingBlockStatus;
+  blocks: ThinkingBlock[];
+}
+
+export type SessionThinkingEventType =
+  | 'thinking.started'
+  | 'thinking.delta'
+  | 'thinking.snapshot'
+  | 'thinking.completed'
+  | 'thinking.failed';
+
+export interface SessionThinkingEvent {
+  id: string;
+  type: SessionThinkingEventType;
+  sessionId: string;
+  operationId: string;
+  turnId: string;
+  purpose: string;
+  attempt: number;
+  label: string;
+  sequence: number;
+  taskId?: string;
+  goalId?: string;
+  triggerMessageId?: string;
+  text?: string;
+  status?: ThinkingBlockStatus;
+  durationMs?: number;
+  errorCode?: string;
+  truncated?: boolean;
+}
+
 export interface Message {
   id: string;
   sender: 'user' | 'ai' | 'system';
@@ -6,6 +60,7 @@ export interface Message {
   taskId?: string;
   brainstorm?: import('./api/contracts').BrainstormMetadata;
   clarify?: import('./api/contracts').ClarifyMetadata;
+  thinking?: ThinkingMetadata;
 }
 
 export interface SentimentData {
@@ -113,4 +168,3 @@ export interface QuickKolSelection {
   kw_uid: string;
   nickname: string;
 }
-
