@@ -104,6 +104,16 @@ class _ModelUnsupportedError(Exception):
     body = {"error": {"message": "upstream model is not supported"}}
 
 
+class _ResponseFormatUnsupportedWithValidStreamError(Exception):
+    status_code = 400
+    body = {
+        "error": {
+            "message": "model does not support response_format; stream parameter is valid",
+            "param": "response_format",
+        }
+    }
+
+
 def stream_chunks(
     *,
     content_chunks: list[str | None],
@@ -248,6 +258,19 @@ async def test_complete_json_falls_back_when_stream_is_not_supported() -> None:
 async def test_complete_json_does_not_downgrade_for_unsupported_upstream_model() -> None:
     sink = CaptureThinkingSink()
     client = FakeCompletions([_ModelUnsupportedError()])
+    adapter = TencentPlanAdapter(client=client, log_writer=_CaptureWriter(), stream_support_cache={})
+
+    with pytest.raises(ModelAdapterError, match="MODEL_UPSTREAM_ERROR"):
+        await adapter.complete_json(_request(thinking_sink=sink))
+
+    assert [call["stream"] for call in client.calls] == [True]
+    assert sink.terminal == ("failed", 1)
+
+
+@pytest.mark.asyncio
+async def test_complete_json_does_not_downgrade_when_response_format_is_unsupported() -> None:
+    sink = CaptureThinkingSink()
+    client = FakeCompletions([_ResponseFormatUnsupportedWithValidStreamError()])
     adapter = TencentPlanAdapter(client=client, log_writer=_CaptureWriter(), stream_support_cache={})
 
     with pytest.raises(ModelAdapterError, match="MODEL_UPSTREAM_ERROR"):

@@ -94,3 +94,38 @@ ruff check app/model/contracts.py app/model/tencent_plan.py \
 
 All checks passed!
 ```
+
+## 审查修复（round 2/5）
+
+### 修复内容
+
+- stream 能力降级现在要求“不支持”直接指向 stream：`param == "stream"`，或消息明确表达 `stream` / `streaming` / `stream_options` 不支持（例如 `stream is not supported`、`does not support stream`）。不再把独立出现的“不支持”和“stream”机械组合。
+- 因此 `model does not support response_format; stream parameter is valid` 不会降级、重放请求或写入 stream 能力缓存。
+
+### TDD RED/GREEN
+
+1. RED：`test_complete_json_does_not_downgrade_when_response_format_is_unsupported` 在旧匹配下观察到调用序列 `[True, False]`，说明 `response_format` 的不支持错误被误归类为 stream 不支持。
+2. GREEN：修复后同一测试通过，调用序列为 `[True]`，Sink 收到 failed，未发生降级。
+
+### 测试命令和输出
+
+```text
+TENCENT_PLAN_API_KEY=test-model-token DATATAP_MCP_TOKEN=test-datatap-token \
+  /Users/hanxiang/Works/Projects/codex/mcn-app/backend/.venv/bin/pytest \
+  backend/tests/model/test_structured_stream.py::test_complete_json_does_not_downgrade_when_response_format_is_unsupported -q
+
+1 passed in 0.01s
+
+TENCENT_PLAN_API_KEY=test-model-token DATATAP_MCP_TOKEN=test-datatap-token \
+  /Users/hanxiang/Works/Projects/codex/mcn-app/backend/.venv/bin/pytest \
+  tests/model/test_structured_output.py tests/model/test_structured_stream.py \
+  tests/model/test_prompt_logs.py tests/model/test_reasoning_effort.py -q
+
+33 passed in 0.08s
+
+ruff check app/model/contracts.py app/model/tencent_plan.py \
+  tests/model/test_structured_stream.py tests/model/test_prompt_logs.py \
+  tests/model/test_reasoning_effort.py
+
+All checks passed!
+```

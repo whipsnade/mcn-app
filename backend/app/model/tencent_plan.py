@@ -720,10 +720,23 @@ class TencentPlanAdapter:
             phrase in message
             for phrase in ("not supported", "does not support", "unsupported")
         )
-        stream_referenced = param == "stream" or bool(
-            re.search(r"\b(?:stream|streaming|stream_options)\b", message)
+        if not explicitly_unsupported:
+            return False
+        if param == "stream":
+            return True
+        stream_term = r"(?:stream|streaming|stream_options)"
+        return bool(
+            re.search(
+                rf"\b{stream_term}\b(?:\s+(?:parameter|option))?\s+"
+                r"(?:is\s+)?(?:not\s+supported|unsupported)\b",
+                message,
+            )
+            or re.search(
+                rf"\b(?:does\s+not\s+support|unsupported)\s+(?:the\s+)?"
+                rf"{stream_term}\b",
+                message,
+            )
         )
-        return explicitly_unsupported and stream_referenced
 
     def _completion_content(self, response: Any) -> str:
         choices = _value(response, "choices") or ()
