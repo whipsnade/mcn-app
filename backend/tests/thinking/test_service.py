@@ -145,6 +145,46 @@ async def test_terminal_block_uses_bound_task_and_is_owner_isolated() -> None:
 
 
 @pytest.mark.asyncio
+async def test_rebinding_retry_turn_preserves_old_task_blocks_and_explicit_new_task() -> None:
+    _, SessionThinkingService = thinking_types()
+    service = SessionThinkingService()
+    await service.bind_turn(
+        turn_id="turn-1",
+        user_id="user-1",
+        session_id="session-1",
+        task_id="source-task",
+        trigger_message_id="message-1",
+    )
+    source = service.create_sink(operation("op-source", "turn-1", "session-1"))
+    await source.started(attempt=1)
+    await source.completed(attempt=1, duration_ms=1)
+
+    await service.bind_turn(
+        turn_id="turn-1",
+        user_id="user-1",
+        session_id="session-1",
+        task_id="retry-task",
+        trigger_message_id="message-1",
+    )
+    retry = service.create_sink(
+        operation("op-retry", "turn-1", "session-1", task_id="retry-task")
+    )
+    await retry.started(attempt=1)
+    await retry.completed(attempt=1, duration_ms=1)
+
+    blocks = await service.completed_blocks(
+        turn_id="turn-1",
+        user_id="user-1",
+        session_id="session-1",
+    )
+
+    assert [(block.operation_id, block.task_id) for block in blocks] == [
+        ("op-source", "source-task"),
+        ("op-retry", "retry-task"),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_failed_sink_creates_interrupted_block_and_removes_running_snapshot() -> None:
     _, SessionThinkingService = thinking_types()
     service = SessionThinkingService()

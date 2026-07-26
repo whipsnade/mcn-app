@@ -14,6 +14,30 @@ from app.model.contracts import (
 from app.model.prompts import GOAL_PLANNER_PROMPT
 
 
+class _AttemptOffsetThinkingSink:
+    def __init__(self, sink: ThinkingSink, offset: int) -> None:
+        self._sink = sink
+        self._offset = offset
+
+    async def started(self, *, attempt: int) -> None:
+        await self._sink.started(attempt=attempt + self._offset)
+
+    async def delta(self, text: str, *, attempt: int) -> None:
+        await self._sink.delta(text, attempt=attempt + self._offset)
+
+    async def completed(self, *, attempt: int, duration_ms: int) -> None:
+        await self._sink.completed(
+            attempt=attempt + self._offset,
+            duration_ms=duration_ms,
+        )
+
+    async def failed(self, *, attempt: int, error_code: str) -> None:
+        await self._sink.failed(
+            attempt=attempt + self._offset,
+            error_code=error_code,
+        )
+
+
 class GoalPlannerService:
     def __init__(
         self,
@@ -64,6 +88,7 @@ class GoalPlannerService:
             "session_id": context.session_id,
             "task_id": context.task_id,
         }
+        thinking_attempt_offset = 0
         for attempt in (1, 2):
             log_context = {
                 **base_log_context,
@@ -80,9 +105,17 @@ class GoalPlannerService:
                     output_model=GoalPlannerOutput,
                     max_tokens=2048,
                     log_context=log_context,
-                    thinking_sink=thinking_sink,
+                    thinking_sink=(
+                        thinking_sink
+                        if thinking_sink is None or thinking_attempt_offset == 0
+                        else _AttemptOffsetThinkingSink(
+                            thinking_sink,
+                            thinking_attempt_offset,
+                        )
+                    ),
                 )
             )
+            thinking_attempt_offset += result.regeneration_count + 1
             try:
                 session_brand = context.session_context.get("active_brand")
                 validate_goal_plan(

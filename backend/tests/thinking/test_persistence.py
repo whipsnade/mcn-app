@@ -3,7 +3,8 @@ from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import event, select
+from sqlalchemy.exc import IntegrityError
 
 from app.thinking.contracts import ThinkingBlock
 from app.thinking.persistence import ThinkingMessageStore, record_brainstorm_failure
@@ -148,6 +149,115 @@ async def test_persist_block_allows_task_id_assistant_fallback(db_session, user_
 
     assert assistant_message is not None
     assert assistant_message.metadata_json["thinking"]["blocks"][0]["operation_id"] == "op-1"
+
+
+@pytest.mark.asyncio
+async def test_retry_block_does_not_attach_to_source_assistant_with_same_turn(
+    db_session, user_factory
+) -> None:
+    turn_id = "8a9fda07-77c5-44ea-967e-a17e795266ef"
+    user, session, user_message, source_assistant = await _seed_turn(
+        db_session,
+        user_factory,
+        turn_id=turn_id,
+        assistant_metadata={
+            "turn_id": turn_id,
+            "task_id": "source-task",
+            "kind": "conclusion",
+        },
+    )
+    store = ThinkingMessageStore(db_session)
+
+    await store.persist_block(
+        _block(
+            turn_id=turn_id,
+            operation_id="retry-op",
+            task_id="retry-task",
+        ),
+        user_id=user.id,
+        session_id=session.id,
+    )
+
+    assert source_assistant is not None
+    assert "thinking" not in source_assistant.metadata_json
+    assert user_message.metadata_json["thinking_pending"]["blocks"][0]["task_id"] == "retry-task"
+
+    retry_assistant = Message(
+        id=str(uuid4()),
+        session_id=session.id,
+        user_id=user.id,
+        role="assistant",
+        content="重试结论",
+        sequence=3,
+        metadata_json={"task_id": "retry-task", "kind": "conclusion"},
+        created_at=datetime.now(UTC).replace(tzinfo=None),
+    )
+    db_session.add(retry_assistant)
+    await db_session.flush()
+    await store.attach_turn_to_assistant(
+        retry_assistant,
+        user_id=user.id,
+        session_id=session.id,
+        turn_id=turn_id,
+    )
+
+    assert retry_assistant.metadata_json["thinking"]["blocks"][0]["operation_id"] == "retry-op"
+    assert "thinking_pending" not in user_message.metadata_json
+
+
+@pytest.mark.asyncio
+async def test_thinking_flush_failure_keeps_business_session_usable(
+    db_session, user_factory, monkeypatch
+) -> None:
+    user, session, user_message, _ = await _seed_turn(db_session, user_factory)
+    injected = False
+    begin_nested_calls = 0
+    original_begin_nested = db_session.begin_nested
+
+    def tracked_begin_nested():
+        nonlocal begin_nested_calls
+        begin_nested_calls += 1
+        return original_begin_nested()
+
+    monkeypatch.setattr(db_session, "begin_nested", tracked_begin_nested)
+
+    def inject_duplicate_on_thinking_flush(sync_session, *_args) -> None:
+        nonlocal injected
+        if injected or "thinking_pending" not in (user_message.metadata_json or {}):
+            return
+        injected = True
+        sync_session.add(
+            Message(
+                id=str(uuid4()),
+                session_id=session.id,
+                user_id=user.id,
+                role="assistant",
+                content="制造唯一键冲突",
+                sequence=user_message.sequence,
+                metadata_json={},
+                created_at=datetime.now(UTC).replace(tzinfo=None),
+            )
+        )
+
+    event.listen(db_session.sync_session, "before_flush", inject_duplicate_on_thinking_flush)
+    try:
+        with pytest.raises(IntegrityError):
+            await ThinkingMessageStore(db_session).persist_block(
+                _block(),
+                user_id=user.id,
+                session_id=session.id,
+            )
+    finally:
+        event.remove(
+            db_session.sync_session,
+            "before_flush",
+            inject_duplicate_on_thinking_flush,
+        )
+
+    session.title = "业务事务仍可提交"
+    await db_session.flush()
+    assert begin_nested_calls == 1
+    assert session.title == "业务事务仍可提交"
 
 
 @pytest.mark.asyncio

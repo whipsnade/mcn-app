@@ -398,14 +398,14 @@ class _TaskArtifacts:
         返回 (status_override, warning_code)：报告生成失败时降级
         completed_with_warnings 并登记 failed artifact（不删证据、任务终态不受影响）。
         """
-        artifact_type, builder, label, fallback_title = _ANALYSIS_GOAL_TABLE[goal.goal_type]
+        artifact_type, builder, event_label, fallback_title = _ANALYSIS_GOAL_TABLE[goal.goal_type]
         artifact_key = f"goal:{goal.id}:{artifact_type}"
         build_error: Exception | None = None
         report: AnalysisReport | None = None
         if self._model is None:
             build_error = RuntimeError("model_unavailable")
         else:
-            label = (
+            thinking_label = (
                 "正在生成品牌报告"
                 if goal.goal_type == "brand_analysis"
                 else "正在生成活动报告"
@@ -414,7 +414,7 @@ class _TaskArtifacts:
                 db,
                 task,
                 purpose=goal.goal_type,
-                label=label,
+                label=thinking_label,
                 goal_id=goal.id,
             )
             try:
@@ -491,7 +491,7 @@ class _TaskArtifacts:
                 "report_id": report.id,
                 "version": report.version,
                 "phase": "ai_summary",
-                "label": label,
+                "label": event_label,
             },
         )
         return None, None

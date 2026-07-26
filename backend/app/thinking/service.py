@@ -124,9 +124,15 @@ class SessionThinkingService:
             for state in self._running.values():
                 if state.spec.turn_id == turn_id:
                     self._assert_owner(state.spec, user_id, session_id)
-                    state.spec = replace(state.spec, task_id=task_id)
+                    if state.spec.task_id is None and task_id is not None:
+                        state.spec = replace(state.spec, task_id=task_id)
             blocks = self._completed.get(turn_id, [])
-            self._completed[turn_id] = [replace(block, task_id=task_id) for block in blocks]
+            self._completed[turn_id] = [
+                replace(block, task_id=task_id)
+                if block.task_id is None and task_id is not None
+                else block
+                for block in blocks
+            ]
 
     async def completed_blocks(
         self,
@@ -280,7 +286,7 @@ class SessionThinkingService:
 
     def _bound_spec(self, spec: ThinkingOperationSpec) -> ThinkingOperationSpec:
         binding = self._turn_bindings[spec.turn_id]
-        return replace(spec, task_id=binding.task_id or spec.task_id)
+        return replace(spec, task_id=spec.task_id or binding.task_id)
 
     def _fit_turn_budget(self, turn_id: str, content: str) -> tuple[str, bool]:
         used = sum(len(block.content) for block in self._completed.get(turn_id, ()))

@@ -82,6 +82,18 @@ def _metadata_matches_task(metadata: dict[str, Any], task_id: str) -> bool:
     return isinstance(task_ids, list) and task_id in task_ids
 
 
+def _partition_blocks_for_task(
+    blocks: list[dict[str, Any]],
+    task_id: str | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    matched: list[dict[str, Any]] = []
+    remaining: list[dict[str, Any]] = []
+    for block in blocks:
+        target = matched if block.get("task_id") == task_id else remaining
+        target.append(block)
+    return matched, remaining
+
+
 class ThinkingMessageStore:
     def __init__(self, db: AsyncSession) -> None:
         self.db = db
@@ -94,22 +106,23 @@ class ThinkingMessageStore:
         session_id: str,
     ) -> None:
         messages = await self._messages(user_id=user_id, session_id=session_id)
-        assistant = next(
-            (
-                message
-                for message in messages
-                if message.role == "assistant"
-                and (message.metadata_json or {}).get("turn_id") == block.turn_id
-            ),
-            None,
-        )
-        if assistant is None and block.task_id is not None:
+        if block.task_id is not None:
             assistant = next(
                 (
                     message
                     for message in messages
                     if message.role == "assistant"
                     and _metadata_matches_task(message.metadata_json or {}, block.task_id)
+                ),
+                None,
+            )
+        else:
+            assistant = next(
+                (
+                    message
+                    for message in messages
+                    if message.role == "assistant"
+                    and (message.metadata_json or {}).get("turn_id") == block.turn_id
                 ),
                 None,
             )
@@ -134,33 +147,43 @@ class ThinkingMessageStore:
             )
 
         serialized = _serialize_block(block)
-        if assistant is not None:
-            assistant_metadata = dict(assistant.metadata_json or {})
-            pending_blocks: list[dict[str, Any]] = []
-            if user_message is not None:
-                user_metadata = dict(user_message.metadata_json or {})
-                pending_blocks = _blocks_from(user_metadata, "thinking_pending")
-                if "thinking_pending" in user_metadata:
-                    user_metadata.pop("thinking_pending")
-                    user_message.metadata_json = user_metadata
-            assistant_metadata.setdefault("turn_id", block.turn_id)
-            assistant_metadata["thinking"] = _thinking_metadata(
-                [
-                    *_blocks_from(assistant_metadata, "thinking"),
-                    *pending_blocks,
-                    serialized,
-                ]
-            )
-            assistant.metadata_json = assistant_metadata
-        elif user_message is not None:
-            user_metadata = dict(user_message.metadata_json or {})
-            user_metadata["thinking_pending"] = _thinking_metadata(
-                [*_blocks_from(user_metadata, "thinking_pending"), serialized]
-            )
-            user_message.metadata_json = user_metadata
-        else:
+        if assistant is None and user_message is None:
             raise LookupError("thinking_turn_message_not_found")
-        await self.db.flush()
+
+        async with self.db.begin_nested():
+            if assistant is not None:
+                assistant_metadata = dict(assistant.metadata_json or {})
+                pending_blocks: list[dict[str, Any]] = []
+                if user_message is not None:
+                    user_metadata = dict(user_message.metadata_json or {})
+                    pending_blocks, remaining_blocks = _partition_blocks_for_task(
+                        _blocks_from(user_metadata, "thinking_pending"),
+                        block.task_id,
+                    )
+                    if remaining_blocks:
+                        user_metadata["thinking_pending"] = _thinking_metadata(
+                            remaining_blocks
+                        )
+                    else:
+                        user_metadata.pop("thinking_pending", None)
+                    user_message.metadata_json = user_metadata
+                assistant_metadata.setdefault("turn_id", block.turn_id)
+                assistant_metadata["thinking"] = _thinking_metadata(
+                    [
+                        *_blocks_from(assistant_metadata, "thinking"),
+                        *pending_blocks,
+                        serialized,
+                    ]
+                )
+                assistant.metadata_json = assistant_metadata
+            else:
+                assert user_message is not None
+                user_metadata = dict(user_message.metadata_json or {})
+                user_metadata["thinking_pending"] = _thinking_metadata(
+                    [*_blocks_from(user_metadata, "thinking_pending"), serialized]
+                )
+                user_message.metadata_json = user_metadata
+            await self.db.flush()
 
     async def attach_turn_to_assistant(
         self,
@@ -189,21 +212,32 @@ class ThinkingMessageStore:
         )
         assistant_metadata = dict(message.metadata_json or {})
         assistant_metadata["turn_id"] = turn_id
-        if user_message is not None:
-            user_metadata = dict(user_message.metadata_json or {})
-            pending_blocks = _blocks_from(user_metadata, "thinking_pending")
-            if pending_blocks:
-                assistant_metadata["thinking"] = _thinking_metadata(
-                    [
-                        *_blocks_from(assistant_metadata, "thinking"),
-                        *pending_blocks,
-                    ]
+        target_task_id = assistant_metadata.get("task_id")
+        if not isinstance(target_task_id, str):
+            target_task_id = None
+        async with self.db.begin_nested():
+            if user_message is not None:
+                user_metadata = dict(user_message.metadata_json or {})
+                pending_blocks, remaining_blocks = _partition_blocks_for_task(
+                    _blocks_from(user_metadata, "thinking_pending"),
+                    target_task_id,
                 )
-            if "thinking_pending" in user_metadata:
-                user_metadata.pop("thinking_pending")
+                if pending_blocks:
+                    assistant_metadata["thinking"] = _thinking_metadata(
+                        [
+                            *_blocks_from(assistant_metadata, "thinking"),
+                            *pending_blocks,
+                        ]
+                    )
+                if remaining_blocks:
+                    user_metadata["thinking_pending"] = _thinking_metadata(
+                        remaining_blocks
+                    )
+                else:
+                    user_metadata.pop("thinking_pending", None)
                 user_message.metadata_json = user_metadata
-        message.metadata_json = assistant_metadata
-        await self.db.flush()
+            message.metadata_json = assistant_metadata
+            await self.db.flush()
 
     async def _messages(self, *, user_id: str, session_id: str) -> list[Message]:
         statement = (
