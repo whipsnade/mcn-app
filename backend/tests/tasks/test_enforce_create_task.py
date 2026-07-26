@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -19,10 +20,74 @@ from app.goals.schemas import (
     GoalQuestion,
     GoalSpec,
 )
+from app.model.tencent_plan import TencentPlanAdapter
 from app.tasks.models import AnalysisTask
 from app.tasks.schemas import TaskCreate
 from app.tasks.service import TaskService
+from app.thinking.service import SessionThinkingService
 from app.workspace.models import Message, WorkspaceSession
+
+
+class _GoalPlannerCompletions:
+    async def create(self, **kwargs):
+        assert kwargs["stream"] is True
+        content = (
+            '{"action":"execute","question":null,"goals":[{"sequence":1,'
+            '"goal_type":"brand_analysis","depends_on_sequence":null,'
+            '"params":{"brand":"喜茶","campaign":null,"period":null,'
+            '"platforms":[],"requirement":"分析六月声量"},'
+            '"request_evidence":"分析喜茶六月声量"}],'
+            '"active_brand":"喜茶","brand_source":"explicit"}'
+        )
+        chunks = [
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(
+                            content=f"<think>先识别分析目标。</think>{content}",
+                            reasoning_content=None,
+                        ),
+                        finish_reason=None,
+                    )
+                ],
+                usage=None,
+                _request_id="req-goal-planner",
+            ),
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(content=None, reasoning_content=None),
+                        finish_reason="stop",
+                    )
+                ],
+                usage=None,
+                _request_id="req-goal-planner",
+            ),
+        ]
+
+        async def stream():
+            for chunk in chunks:
+                yield chunk
+
+        return stream()
+
+
+class _FailingThinkingSink:
+    async def started(self, *, attempt: int) -> None:
+        raise RuntimeError("sink down")
+
+    async def delta(self, text: str, *, attempt: int) -> None:
+        raise RuntimeError("sink down")
+
+    async def completed(self, *, attempt: int, duration_ms: int) -> None:
+        raise RuntimeError("sink down")
+
+    async def failed(self, *, attempt: int, error_code: str) -> None:
+        raise RuntimeError("sink down")
+
+
+async def _ignore_prompt_log(_entry) -> None:
+    return None
 
 
 def _enable_enforce(monkeypatch) -> None:
@@ -168,6 +233,39 @@ async def test_enforce_execute_creates_typed_goal_with_params(
         "platforms": ["xiaohongshu"],
         "requirement": "看品牌声量",
     }
+
+
+@pytest.mark.asyncio
+async def test_enforce_creates_planned_goal_when_every_thinking_sink_method_fails(
+    auth_client_factory, db_session, monkeypatch
+) -> None:
+    _enable_enforce(monkeypatch)
+    monkeypatch.setattr(
+        SessionThinkingService,
+        "create_sink",
+        lambda _self, _spec: _FailingThinkingSink(),
+    )
+    adapter = TencentPlanAdapter(
+        client=_GoalPlannerCompletions(),
+        log_writer=_ignore_prompt_log,
+        stream_support_cache={},
+    )
+    monkeypatch.setattr("app.tasks.router.get_model_adapter", lambda: adapter)
+    client = await auth_client_factory("13400000088")
+    session_id = await _create_session(client)
+    await _set_session_profile(db_session, session_id, brand="海底捞", category="美食")
+
+    response = await client.post(
+        f"/api/v1/sessions/{session_id}/tasks",
+        json={"content": "分析喜茶六月声量"},
+    )
+
+    assert response.status_code == 202
+    assert response.json()["outcome"] == "task"
+    goal = await db_session.scalar(select(TaskGoal))
+    assert goal is not None
+    assert goal.goal_type == "brand_analysis"
+    assert goal.params_json["brand"] == "喜茶"
 
 
 @pytest.mark.asyncio

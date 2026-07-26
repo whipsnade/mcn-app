@@ -162,6 +162,42 @@ describe('useWorkspace', () => {
     expect(result.current.activeSession?.messages[0]?.text).toBe('恢复这条历史提问');
   });
 
+  it('keeps persisted terminal thinking metadata when restoring a session', async () => {
+    const persistedThinking = {
+      version: 1 as const,
+      status: 'completed' as const,
+      blocks: [{
+        operationId: 'operation-1',
+        purpose: 'agent_loop',
+        attempt: 1,
+        label: '正在分析数据',
+        content: '先核对平台数据，再汇总结论。',
+        status: 'completed' as const,
+        startedAt: '2026-07-26T10:00:00Z',
+        completedAt: '2026-07-26T10:00:01Z',
+        durationMs: 1000,
+        taskId: 'task-1',
+        goalId: 'goal-1',
+        truncated: false,
+      }],
+    };
+    vi.mocked(getSession).mockResolvedValue({
+      ...restoredSession,
+      messages: [
+        restoredSession.messages[0],
+        { ...readyBrainstormMessage, thinking: persistedThinking },
+      ],
+    });
+
+    const { result } = renderHook(() => useWorkspace('user-a'));
+
+    await waitFor(() => expect(
+      result.current.activeSession?.messages[1]?.thinking,
+    ).toEqual(persistedThinking));
+    expect(result.current.activeSession?.messages[1]?.thinking?.blocks[0]?.content)
+      .toBe('先核对平台数据，再汇总结论。');
+  });
+
   it('accepts follow-up events only for the active task and exposes the latest suggestions', async () => {
     const withTask = {
       ...restoredSession,

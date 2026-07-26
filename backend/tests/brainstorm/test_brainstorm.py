@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
@@ -11,9 +12,80 @@ from app.brainstorm.schemas import (
     BrainstormRequest,
 )
 from app.model.contracts import ModelAdapterError, StructuredResult
+from app.model.prompt_logs import PromptLogEntry
+from app.model.tencent_plan import TencentPlanAdapter
 from app.tasks import dependencies
+from app.thinking.service import SessionThinkingService
 from app.workspace.schemas import SessionCreate
 from app.workspace.service import WorkspaceService
+
+
+MINIMAX_THINK_RESPONSE = (
+    "<think>检查当前画像，确认品牌、品类和平台是否齐全。</think>\n"
+    '{"assistant_message":"请确认品类","extracted":{"audience":null,'
+    '"brand":"Manner","category":null,"goal":"声量和情感趋势",'
+    '"kol_filters":null,"period":null,"platforms":[],"region":null},'
+    '"question":{"options":["咖啡/现制饮品"],"text":"请选择品类"},'
+    '"ready":false,"title_suggestion":"Manner品牌分析"}'
+)
+
+
+class _MiniMaxCompletions:
+    async def create(self, **kwargs):
+        assert kwargs["stream"] is True
+        chunks = [
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(
+                            content=MINIMAX_THINK_RESPONSE,
+                            reasoning_content=None,
+                        ),
+                        finish_reason=None,
+                    )
+                ],
+                usage=None,
+                _request_id="req-minimax",
+            ),
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(content=None, reasoning_content=None),
+                        finish_reason="stop",
+                    )
+                ],
+                usage=None,
+                _request_id="req-minimax",
+            ),
+        ]
+
+        async def stream():
+            for chunk in chunks:
+                yield chunk
+
+        return stream()
+
+
+class _CapturePromptWriter:
+    def __init__(self) -> None:
+        self.entries: list[PromptLogEntry] = []
+
+    async def __call__(self, entry: PromptLogEntry) -> None:
+        self.entries.append(entry)
+
+
+class _FailingThinkingSink:
+    async def started(self, *, attempt: int) -> None:
+        raise RuntimeError("sink down")
+
+    async def delta(self, text: str, *, attempt: int) -> None:
+        raise RuntimeError("sink down")
+
+    async def completed(self, *, attempt: int, duration_ms: int) -> None:
+        raise RuntimeError("sink down")
+
+    async def failed(self, *, attempt: int, error_code: str) -> None:
+        raise RuntimeError("sink down")
 
 
 class FakeBrainstormModel:
@@ -61,6 +133,67 @@ def test_brainstorm_request_accepts_turn_id_and_rejects_invalid_uuid() -> None:
     assert str(BrainstormRequest(content="分析品牌", turn_id=turn_id).turn_id) == turn_id
     with pytest.raises(ValidationError):
         BrainstormRequest(content="分析品牌", turn_id="not-a-uuid")
+
+
+@pytest.mark.asyncio
+async def test_minimax_think_response_returns_json_message_and_persists_thinking(
+    auth_client_factory, monkeypatch
+) -> None:
+    writer = _CapturePromptWriter()
+    model = TencentPlanAdapter(
+        client=_MiniMaxCompletions(),
+        log_writer=writer,
+        stream_support_cache={},
+    )
+    _install_model(monkeypatch, model)
+    client = await auth_client_factory("13900000011")
+    created = await client.post("/api/v1/sessions", json={})
+    session_id = created.json()["id"]
+    turn_id = "8a9fda07-77c5-44ea-967e-a17e795266ef"
+
+    response = await client.post(
+        f"/api/v1/sessions/{session_id}/brainstorm",
+        json={"content": "分析 Manner", "turn_id": turn_id},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["message"]["content"] == "请确认品类"
+    restored = await client.get(f"/api/v1/sessions/{session_id}")
+    assistant = restored.json()["messages"][-1]
+    [block] = assistant["metadata"]["thinking"]["blocks"]
+    assert block["content"] == "检查当前画像，确认品牌、品类和平台是否齐全。"
+    assert "<think>" not in assistant["content"]
+    [entry] = writer.entries
+    assert entry.status == "success"
+    assert entry.response == MINIMAX_THINK_RESPONSE
+
+
+@pytest.mark.asyncio
+async def test_brainstorm_succeeds_when_every_thinking_sink_method_fails(
+    auth_client_factory, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        SessionThinkingService,
+        "create_sink",
+        lambda _self, _spec: _FailingThinkingSink(),
+    )
+    model = TencentPlanAdapter(
+        client=_MiniMaxCompletions(),
+        log_writer=_CapturePromptWriter(),
+        stream_support_cache={},
+    )
+    _install_model(monkeypatch, model)
+    client = await auth_client_factory("13900000012")
+    created = await client.post("/api/v1/sessions", json={})
+    session_id = created.json()["id"]
+
+    response = await client.post(
+        f"/api/v1/sessions/{session_id}/brainstorm",
+        json={"content": "分析 Manner"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["message"]["content"] == "请确认品类"
 
 
 @pytest.mark.asyncio
