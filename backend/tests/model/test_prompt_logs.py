@@ -133,6 +133,20 @@ async def test_complete_json_success_logs_with_log_context() -> None:
 
 
 @pytest.mark.asyncio
+async def test_complete_json_non_stream_ignores_think_wrapper() -> None:
+    writer = _CaptureWriter()
+    adapter = TencentPlanAdapter(
+        client=_FakeCompletions([_json_response('<think>检查字段</think>{"value": 3}')]),
+        log_writer=writer,
+    )
+
+    result = await adapter.complete_json(_request())
+
+    assert result.value.value == 3
+    assert writer.entries[0].response == '<think>检查字段</think>{"value": 3}'
+
+
+@pytest.mark.asyncio
 async def test_complete_json_repair_still_invalid_logs_invalid() -> None:
     writer = _CaptureWriter()
     adapter = TencentPlanAdapter(
