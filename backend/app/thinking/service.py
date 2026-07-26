@@ -31,6 +31,7 @@ class _RunningOperation:
     spec: ThinkingOperationSpec
     attempt: int
     started_at: datetime
+    sequence: int = 1
     raw_text: str = ""
     public_text: str = ""
     truncated: bool = False
@@ -144,14 +145,14 @@ class SessionThinkingService:
             return tuple(self._completed.get(turn_id, ()))
 
     async def subscribe(self, session_id: str) -> ThinkingQueue:
-        queue: ThinkingQueue = asyncio.Queue(maxsize=self._queue_size)
+        queue: ThinkingQueue = asyncio.Queue()
         async with self._lock:
             self._subscribers.setdefault(session_id, set()).add(queue)
             states = [
                 state for state in self._running.values() if state.spec.session_id == session_id
             ]
             for state in states:
-                self._put_snapshot(queue, state)
+                queue.put_nowait(self._snapshot(state))
         return queue
 
     async def unsubscribe(self, session_id: str, queue: ThinkingQueue) -> None:
@@ -193,6 +194,7 @@ class SessionThinkingService:
             state.truncated = sanitized.truncated
             if state.public_text == previous:
                 return
+            state.sequence += 1
             if state.public_text.startswith(previous):
                 event_type: ThinkingEventType = "thinking.delta"
                 public_delta = state.public_text[len(previous) :]
@@ -219,6 +221,7 @@ class SessionThinkingService:
             if state is None or state.attempt != attempt:
                 return
             self._running.pop(spec.operation_id, None)
+            state.sequence += 1
             completed_at = datetime.now(UTC)
             elapsed_ms = max(0, int((completed_at - state.started_at).total_seconds() * 1000))
             public_text, turn_truncated = self._fit_turn_budget(
@@ -241,7 +244,7 @@ class SessionThinkingService:
             )
             self._completed.setdefault(state.spec.turn_id, []).append(block)
             event_type: ThinkingEventType = (
-                "thinking.completed" if status == "completed" else "thinking.interrupted"
+                "thinking.completed" if status == "completed" else "thinking.failed"
             )
             payload = self._payload(
                 state,
@@ -296,6 +299,7 @@ class SessionThinkingService:
             "session_id": state.spec.session_id,
             "purpose": state.spec.purpose,
             "attempt": state.attempt,
+            "sequence": state.sequence,
             "label": state.spec.label,
         }
         optional = {
@@ -317,11 +321,6 @@ class SessionThinkingService:
             self._payload(state, text=state.public_text, truncated=state.truncated),
         )
 
-    def _put_snapshot(self, queue: ThinkingQueue, state: _RunningOperation) -> None:
-        if queue.full():
-            self._clear_queue(queue)
-        queue.put_nowait(self._snapshot(state))
-
     def _publish_locked(
         self,
         session_id: str,
@@ -332,13 +331,15 @@ class SessionThinkingService:
     ) -> None:
         for queue in tuple(self._subscribers.get(session_id, ())):
             try:
-                queue.put_nowait(event)
-            except asyncio.QueueFull:
-                self._clear_queue(queue)
-                if terminal or state is None:
-                    queue.put_nowait(event)
+                if queue.qsize() >= self._queue_size:
+                    self._clear_queue(queue)
+                    for running in self._running.values():
+                        if running.spec.session_id == session_id:
+                            queue.put_nowait(self._snapshot(running))
+                    if terminal or state is None:
+                        queue.put_nowait(event)
                 else:
-                    queue.put_nowait(self._snapshot(state))
+                    queue.put_nowait(event)
             except Exception:
                 logger.warning("thinking subscriber publish failed", exc_info=True)
 

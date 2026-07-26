@@ -8,18 +8,23 @@ _HIDDEN = "[已隐藏]"
 _SCHEMA_HIDDEN = "[输出结构说明已隐藏]"
 _TRUNCATED_SUFFIX = "思考内容过长，已截断"
 
-_BEARER_RE = re.compile(r"\bBearer\s+[^\s,;，；\"']+", re.IGNORECASE)
+_BEARER_RE = re.compile(r"\bBearer\s+[\"']?[^\s,;，；\"']+[\"']?", re.IGNORECASE)
 _JWT_RE = re.compile(
     r"(?<![A-Za-z0-9_-])"
     r"[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}"
     r"(?![A-Za-z0-9_-])"
 )
+_JWT_PREFIX_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]*(?:\.[A-Za-z0-9_-]*){0,2}",
+)
 _API_KEY_RE = re.compile(
-    r"\b(api[_ -]?key|access[_ -]?token|secret[_ -]?key|token)"
-    r"(\s*[:=]\s*)[^\s,;，；\"']+",
+    r"""(?P<prefix>["']?(?:api[_ -]?key|access[_ -]?token|secret[_ -]?key|token)["']?"""
+    r"""\s*[:=]\s*)(?P<quote>["']?)(?P<value>[^"'\\\s,;，；}\]]+)""",
     re.IGNORECASE,
 )
+_OPENAI_KEY_RE = re.compile(r"(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]*", re.IGNORECASE)
 _SYSTEM_TAG_RE = re.compile(r"<system\b[^>]*>.*?</system\s*>", re.IGNORECASE | re.DOTALL)
+_UNCLOSED_SYSTEM_TAG_RE = re.compile(r"<system\b[^>]*>.*\Z", re.IGNORECASE | re.DOTALL)
 _SYSTEM_SEGMENT_RE = re.compile(
     r"(^|\n)"
     r"(?:#{1,6}\s*)?"
@@ -50,11 +55,17 @@ class SanitizedThinking:
 def _hide_secrets(text: str) -> str:
     hidden = _BEARER_RE.sub(_HIDDEN, text)
     hidden = _JWT_RE.sub(_HIDDEN, hidden)
-    return _API_KEY_RE.sub(lambda match: f"{match.group(1)}{match.group(2)}{_HIDDEN}", hidden)
+    hidden = _JWT_PREFIX_RE.sub(_HIDDEN, hidden)
+    hidden = _API_KEY_RE.sub(
+        lambda match: f"{match.group('prefix')}{match.group('quote')}{_HIDDEN}",
+        hidden,
+    )
+    return _OPENAI_KEY_RE.sub(_HIDDEN, hidden)
 
 
 def _hide_system_prompts(text: str) -> str:
     hidden = _SYSTEM_TAG_RE.sub(_HIDDEN, text)
+    hidden = _UNCLOSED_SYSTEM_TAG_RE.sub(_HIDDEN, hidden)
     return _SYSTEM_SEGMENT_RE.sub(lambda match: f"{match.group(1)}{_HIDDEN}\n", hidden)
 
 

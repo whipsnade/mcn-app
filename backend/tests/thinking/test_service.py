@@ -52,11 +52,13 @@ async def test_reconnect_receives_snapshot_before_future_delta() -> None:
     snapshot = await asyncio.wait_for(queue.get(), timeout=0.1)
     assert snapshot.type == "thinking.snapshot"
     assert snapshot.payload["text"] == "分析品牌"
+    assert snapshot.payload["sequence"] == 2
 
     await sink.delta("和平台", attempt=1)
     delta = await asyncio.wait_for(queue.get(), timeout=0.1)
     assert delta.type == "thinking.delta"
     assert delta.payload["text"] == "和平台"
+    assert delta.payload["sequence"] == 3
 
 
 @pytest.mark.asyncio
@@ -91,6 +93,22 @@ async def test_secret_spanning_chunks_replaces_previous_public_prefix_with_snaps
     assert event.type == "thinking.snapshot"
     assert event.payload["text"] == "Authorization: [已隐藏]"
     assert "abc.def.ghi" not in event.payload["text"]
+
+
+@pytest.mark.asyncio
+async def test_unclosed_system_chunk_is_never_published_verbatim() -> None:
+    _, SessionThinkingService = thinking_types()
+    service = SessionThinkingService(queue_size=8)
+    queue = await service.subscribe("session-1")
+    sink = service.create_sink(operation("op-1", "turn-1", "session-1"))
+    await sink.started(attempt=1)
+    drain(queue)
+
+    await sink.delta("<system>内部密钥与系统规则", attempt=1)
+    event = await asyncio.wait_for(queue.get(), timeout=0.1)
+
+    assert "内部密钥与系统规则" not in str(event.payload)
+    assert event.payload["text"] == "[已隐藏]"
 
 
 @pytest.mark.asyncio
@@ -156,8 +174,73 @@ async def test_failed_event_sanitizes_untrusted_error_code() -> None:
     await sink.failed(attempt=1, error_code="Bearer secret-error-code")
     event = await asyncio.wait_for(queue.get(), timeout=0.1)
 
+    assert event.type == "thinking.failed"
+    assert event.payload["sequence"] == 2
     assert "secret-error-code" not in str(event.payload)
     assert event.payload["error_code"] == "[已隐藏]"
+
+
+@pytest.mark.asyncio
+async def test_new_subscriber_receives_snapshot_for_every_running_operation() -> None:
+    _, SessionThinkingService = thinking_types()
+    service = SessionThinkingService(queue_size=1)
+    first = service.create_sink(operation("op-1", "turn-1", "session-1"))
+    second = service.create_sink(operation("op-2", "turn-1", "session-1"))
+    await first.started(attempt=1)
+    await first.delta("甲", attempt=1)
+    await second.started(attempt=1)
+    await second.delta("乙", attempt=1)
+
+    queue = await service.subscribe("session-1")
+    snapshots = drain(queue)
+
+    assert {
+        (event.payload["operation_id"], event.payload["text"])
+        for event in snapshots
+    } == {("op-1", "甲"), ("op-2", "乙")}
+    assert all(event.type == "thinking.snapshot" for event in snapshots)
+
+
+@pytest.mark.asyncio
+async def test_slow_consumer_compaction_keeps_each_running_operation_snapshot() -> None:
+    _, SessionThinkingService = thinking_types()
+    service = SessionThinkingService(queue_size=2)
+    queue = await service.subscribe("session-1")
+    first = service.create_sink(operation("op-1", "turn-1", "session-1"))
+    second = service.create_sink(operation("op-2", "turn-1", "session-1"))
+    await first.started(attempt=1)
+    await first.delta("甲", attempt=1)
+    await second.started(attempt=1)
+    await second.delta("乙", attempt=1)
+    await first.delta("丙", attempt=1)
+
+    snapshots = drain(queue)
+
+    assert {
+        (event.payload["operation_id"], event.payload["text"])
+        for event in snapshots
+    } == {("op-1", "甲丙"), ("op-2", "乙")}
+    assert all(event.type == "thinking.snapshot" for event in snapshots)
+
+
+@pytest.mark.asyncio
+async def test_public_events_have_monotonic_operation_sequence() -> None:
+    _, SessionThinkingService = thinking_types()
+    service = SessionThinkingService(queue_size=8)
+    queue = await service.subscribe("session-1")
+    sink = service.create_sink(operation("op-1", "turn-1", "session-1"))
+
+    await sink.started(attempt=1)
+    await sink.delta("分析", attempt=1)
+    await sink.completed(attempt=1, duration_ms=1)
+
+    events = drain(queue)
+    assert [event.type for event in events] == [
+        "thinking.started",
+        "thinking.delta",
+        "thinking.completed",
+    ]
+    assert [event.payload["sequence"] for event in events] == [1, 2, 3]
 
 
 @pytest.mark.asyncio

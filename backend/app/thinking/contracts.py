@@ -39,7 +39,7 @@ ThinkingEventType = Literal[
     "thinking.delta",
     "thinking.snapshot",
     "thinking.completed",
-    "thinking.interrupted",
+    "thinking.failed",
 ]
 
 

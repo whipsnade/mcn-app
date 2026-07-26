@@ -11,7 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_db
-from app.identity.dependencies import CurrentUser
+from app.identity.dependencies import FunctionScopedCurrentUser
 from app.thinking.contracts import ThinkingEvent
 from app.thinking.service import (
     SessionThinkingService,
@@ -53,8 +53,8 @@ async def thinking_event_chunks(
 @router.get("/{session_id}/events")
 async def stream_session_thinking_events(
     session_id: str,
-    user: CurrentUser,
-    db: Annotated[AsyncSession, Depends(get_db)],
+    user: FunctionScopedCurrentUser,
+    db: Annotated[AsyncSession, Depends(get_db, scope="function")],
     service: Annotated[SessionThinkingService, Depends(get_session_thinking_service)],
     last_event_id: Annotated[str | None, Header(alias="Last-Event-ID")] = None,
 ) -> StreamingResponse:

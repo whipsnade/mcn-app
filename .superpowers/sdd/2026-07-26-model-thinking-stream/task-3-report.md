@@ -25,7 +25,7 @@ Broker/Sink、会话 SSE 路由及 API 注册；未接线 brainstorm、GoalPlann
    - Sink 内部异常被隔离，不反向改变模型调用结果；取消异常保持向上传播；
    - 失败事件的 `error_code` 也经过公共脱敏。
 4. 新增 `GET /api/v1/sessions/{session_id}/events`：
-   - 使用 `CurrentUser`；
+   - 使用 `FunctionScopedCurrentUser` 与 function-scoped DB；
    - 流建立前按 `WorkspaceSession.id/user_id/deleted_at` 查询 owner，越权统一 404；
    - SSE 使用 `id/event/data` 格式，连接初始及每 15 秒发送 keepalive；
    - 接收但不依赖 `Last-Event-ID`，重连权威状态来自 snapshot；
@@ -145,3 +145,116 @@ exit 0
    但本任务没有提前扩展该接口。
 3. 真实供应商集成测试需要有效 DataTap token，并需消除对固定模型名的环境耦合；
    本任务未修改这些既有测试。
+
+## Fix round 1（审查修复）
+
+### Findings 与根因
+
+1. **Critical：公开脱敏不完整**
+   - 原 API key 正则把引号排除在 value 首字符外，导致
+     `api_key="..."` 和 JSON 字符串 value 不匹配；
+   - 原 system tag 正则只匹配完整 `</system>`，流式首 chunk 的未闭合标签会直接发布；
+   - 没有识别裸 `sk-*`，JWT 也只在三段完整后才识别。
+2. **Important：SSE 占用 DB**
+   - 会话 SSE 使用默认 request-scoped `CurrentUser/get_db`，yield 依赖要等响应流结束才释放。
+3. **Important：多 operation 快照丢失**
+   - `queue_size` 同时被当成 `asyncio.Queue.maxsize`；当运行 operation 数量超过该硬容量时，
+     新订阅和慢消费者压缩在物理上无法保留全部 snapshot。
+4. **Important：事件契约不一致**
+   - failure 发 `thinking.interrupted`，且运行态没有 per-operation sequence。
+
+### 修复
+
+1. 凭证脱敏支持引号和 JSON key/value，补充裸 `sk-*` 与流式 JWT 前缀识别；
+   未闭合 `<system>` 和未闭合引号 API key 都 fail-closed 为 `[已隐藏]`。Sink 仍对累计原文
+   每次重新脱敏，因此敏感内容不会先以 delta 发布再依赖 snapshot 撤回。
+2. SSE 改用 `FunctionScopedCurrentUser` 和 `Depends(get_db, scope="function")`。
+3. `queue_size` 改为软背压阈值，subscriber queue 不设硬容量；压缩时清空旧事件并为同会话
+   **每个**运行 operation 放入最新 snapshot，终态事件随后放入。
+4. `_RunningOperation.sequence` 从 1 开始，每次可见状态变化单调递增；所有 service 生成的
+   started/delta/snapshot/completed/failed payload 统一从 `_payload` 携带 sequence。
+   failure 事件统一为 `thinking.failed`，`ThinkingBlock.status` 仍按固定契约为
+   `interrupted`。
+
+### TDD RED
+
+首次仅添加 8 个/组审查回归行为后运行：
+
+```text
+8 failed in 0.14s
+```
+
+失败分别证明：
+
+- 引号/JSON/bare `sk-proj-*` 凭证仍可见；
+- 未闭合 `<system>` 在 sanitizer 与 sink 首 delta 中仍可见；
+- 新订阅只剩最后一个 operation snapshot；
+- 慢消费者压缩只剩最后更新的 operation snapshot；
+- payload 缺 `sequence`；
+- failure type 仍为 `thinking.interrupted`；
+- SSE unsubscribe 时活动 DB 依赖数为 1。
+
+自审追加的任意未闭合 API key 用例：
+
+```text
+test_sanitize_thinking_fails_closed_for_unclosed_quoted_api_key
+1 failed in 0.05s
+```
+
+失败值仍包含 `partial-sensitive-value`，确认此前只覆盖闭合样例还不够。
+
+### TDD GREEN
+
+分项最小修复后的证据：
+
+```text
+# Critical：脱敏 + sink 未闭合 system chunk
+6 passed in 0.01s
+
+# SSE function scope
+2 passed in 0.09s
+
+# Broker 多 operation + sequence/type
+12 passed in 0.01s
+
+# 未闭合任意 API key fail-closed
+6 passed in 0.01s
+```
+
+### Fix round 最终验证
+
+```text
+ruff check app tests
+All checks passed!
+
+pytest tests/thinking/test_sanitizer.py tests/thinking/test_service.py \
+  tests/thinking/test_router.py -q
+20 passed in 0.11s
+
+pytest -q --ignore=tests/integration/test_real_providers.py
+681 passed, 4 warnings in 19.61s
+
+git diff --check
+exit 0
+```
+
+4 条 warning 仍是既有 FastAPI/Starlette 422 常量弃用提示。
+
+### Fix round 变更文件
+
+- `backend/app/thinking/contracts.py`
+- `backend/app/thinking/router.py`
+- `backend/app/thinking/sanitizer.py`
+- `backend/app/thinking/service.py`
+- `backend/tests/thinking/test_router.py`
+- `backend/tests/thinking/test_sanitizer.py`
+- `backend/tests/thinking/test_service.py`
+- `.superpowers/sdd/2026-07-26-model-thinking-stream/task-3-report.md`
+
+### Fix round 自审
+
+- 未新增业务接线、数据库表、迁移或运行时依赖。
+- 所有敏感回归都断言具体 secret 从首次公开结果中缺失，而非只断言最终 snapshot。
+- DB 生命周期测试观察真实 yield dependency 在 unsubscribe 时的活动计数，不检查源码文本。
+- 多 operation 测试使用 `queue_size < operation 数量`，可抓住硬容量导致的真实丢失。
+- started/delta/completed 和 failed/snapshot 两条路径均验证 sequence。
