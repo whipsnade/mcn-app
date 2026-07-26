@@ -39,6 +39,7 @@ function pendingUntilAbort(signal: AbortSignal): Promise<void> {
 
 describe('useSessionThinkingStream', () => {
   afterEach(() => {
+    vi.restoreAllMocks();
     vi.useRealTimers();
     vi.resetAllMocks();
   });
@@ -96,6 +97,31 @@ describe('useSessionThinkingStream', () => {
     });
     expect(streamSessionThinking).toHaveBeenCalledTimes(3);
     expect(result.current?.connection).toBe('reconnecting');
+    unmount();
+  });
+
+  it('removes the reconnect abort listener after a normal delay expires', async () => {
+    vi.useFakeTimers();
+    const addEventListener = vi.spyOn(AbortSignal.prototype, 'addEventListener');
+    const removeEventListener = vi.spyOn(AbortSignal.prototype, 'removeEventListener');
+    vi.mocked(streamSessionThinking)
+      .mockRejectedValueOnce(new Error('network'))
+      .mockImplementation(() => new Promise<void>(() => undefined));
+
+    const { unmount } = renderHook(() => useSessionThinkingStream('session-1'));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    const reconnectAbortListener = addEventListener.mock.calls.find(
+      ([type]) => type === 'abort',
+    )?.[1];
+
+    expect(reconnectAbortListener).toBeTypeOf('function');
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(25);
+    });
+
+    expect(removeEventListener).toHaveBeenCalledWith('abort', reconnectAbortListener);
     unmount();
   });
 

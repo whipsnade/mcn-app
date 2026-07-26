@@ -47,11 +47,16 @@ export function useSessionThinkingStream(
       setRuntime(next);
     };
     const waitForReconnect = (delay: number) => new Promise<void>(resolve => {
-      const timer = window.setTimeout(resolve, delay);
-      controller.signal.addEventListener('abort', () => {
+      let settled = false;
+      const complete = () => {
+        if (settled) return;
+        settled = true;
         window.clearTimeout(timer);
+        controller.signal.removeEventListener('abort', complete);
         resolve();
-      }, { once: true });
+      };
+      const timer = window.setTimeout(complete, delay);
+      controller.signal.addEventListener('abort', complete, { once: true });
     });
     const connect = async () => {
       while (!stopped && !controller.signal.aborted) {
