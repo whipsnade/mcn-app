@@ -56,3 +56,41 @@ All checks passed!
 ## 顾虑
 
 - 当前验证使用脚本化 OpenAI 兼容流；真实供应商的 stream 不支持错误体已按 `status_code=400`、`body.error.message/param` 识别，建议在具备真实供应商环境时补一条集成冒烟验证。
+
+## 审查修复（round 1/5）
+
+### 修复内容
+
+- 收紧 stream 不支持判断：明确 `param == "stream"`，或消息中以单词边界匹配 `stream`、`streaming`、`stream_options` 才降级；`upstream model is not supported` 中的 `upstream` 不再被误判为 stream 能力不支持，也不会污染能力缓存或重放为非流式。
+- 降级非流式路径改用 `ThinkJsonStreamParser` 先向 Sink 发布完整 `<think>` 内容，再 `finish()` 提取 JSON。因此首轮 JSON 无效并进入修复时，用户仍可收到该轮完整思考。
+
+### 新增回归测试与 TDD
+
+1. RED：`test_complete_json_does_not_downgrade_for_unsupported_upstream_model` 观察到调用序列为 `[True, False]`，证明 `upstream` 的裸子串 `stream` 触发了错误降级。
+   GREEN：修复后调用序列为 `[True]`，Sink 收到 failed。
+2. RED：`test_complete_json_fallback_publishes_think_before_repairing_invalid_json` 成功修复到第二轮，但 Sink delta 为空。
+   GREEN：修复后第一轮发布 `[(1, "第一次分析")]`，随后按 attempt 2 完成。
+
+### 测试命令和输出
+
+```text
+TENCENT_PLAN_API_KEY=test-model-token DATATAP_MCP_TOKEN=test-datatap-token \
+  /Users/hanxiang/Works/Projects/codex/mcn-app/backend/.venv/bin/pytest \
+  backend/tests/model/test_structured_stream.py::test_complete_json_does_not_downgrade_for_unsupported_upstream_model \
+  backend/tests/model/test_structured_stream.py::test_complete_json_fallback_publishes_think_before_repairing_invalid_json -q
+
+2 passed in 0.01s
+
+TENCENT_PLAN_API_KEY=test-model-token DATATAP_MCP_TOKEN=test-datatap-token \
+  /Users/hanxiang/Works/Projects/codex/mcn-app/backend/.venv/bin/pytest \
+  tests/model/test_structured_output.py tests/model/test_structured_stream.py \
+  tests/model/test_prompt_logs.py tests/model/test_reasoning_effort.py -q
+
+32 passed in 0.08s
+
+ruff check app/model/contracts.py app/model/tencent_plan.py \
+  tests/model/test_structured_stream.py tests/model/test_prompt_logs.py \
+  tests/model/test_reasoning_effort.py
+
+All checks passed!
+```

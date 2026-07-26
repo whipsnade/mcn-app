@@ -8,7 +8,12 @@ from typing import Any
 import pytest
 from pydantic import BaseModel
 
-from app.model.contracts import ChatMessage, ModelPlanInvalidError, StructuredModelRequest
+from app.model.contracts import (
+    ChatMessage,
+    ModelAdapterError,
+    ModelPlanInvalidError,
+    StructuredModelRequest,
+)
 from app.model.prompt_logs import PromptLogEntry
 from app.model.tencent_plan import TencentPlanAdapter
 
@@ -92,6 +97,11 @@ class FakeCompletions:
 class _StreamUnsupportedError(Exception):
     status_code = 400
     body = {"error": {"message": "stream is not supported", "param": "stream"}}
+
+
+class _ModelUnsupportedError(Exception):
+    status_code = 400
+    body = {"error": {"message": "upstream model is not supported"}}
 
 
 def stream_chunks(
@@ -232,6 +242,39 @@ async def test_complete_json_falls_back_when_stream_is_not_supported() -> None:
     assert [call["stream"] for call in client.calls] == [True, False]
     assert sink.deltas == [(1, "分析")]
     assert sink.terminal == ("completed", 1)
+
+
+@pytest.mark.asyncio
+async def test_complete_json_does_not_downgrade_for_unsupported_upstream_model() -> None:
+    sink = CaptureThinkingSink()
+    client = FakeCompletions([_ModelUnsupportedError()])
+    adapter = TencentPlanAdapter(client=client, log_writer=_CaptureWriter(), stream_support_cache={})
+
+    with pytest.raises(ModelAdapterError, match="MODEL_UPSTREAM_ERROR"):
+        await adapter.complete_json(_request(thinking_sink=sink))
+
+    assert [call["stream"] for call in client.calls] == [True]
+    assert sink.terminal == ("failed", 1)
+
+
+@pytest.mark.asyncio
+async def test_complete_json_fallback_publishes_think_before_repairing_invalid_json() -> None:
+    sink = CaptureThinkingSink()
+    client = FakeCompletions(
+        [
+            _StreamUnsupportedError(),
+            json_response("<think>第一次分析</think>not-json"),
+            json_response('{"value":4}'),
+        ]
+    )
+    adapter = TencentPlanAdapter(client=client, log_writer=_CaptureWriter(), stream_support_cache={})
+
+    result = await adapter.complete_json(_request(thinking_sink=sink))
+
+    assert result.value.value == 4
+    assert [call["stream"] for call in client.calls] == [True, False, False]
+    assert sink.deltas == [(1, "第一次分析")]
+    assert sink.terminals == [("failed", 1), ("completed", 2)]
 
 
 @pytest.mark.asyncio

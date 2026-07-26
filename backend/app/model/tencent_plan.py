@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import random
+import re
 import time
 from collections.abc import Awaitable, Callable, MutableMapping
 from typing import Any
@@ -384,9 +385,10 @@ class TencentPlanAdapter:
         log.parts = [content]
         usage = _usage(response)
         log.usage = usage
-        parsed = parse_non_stream_output(content)
-        if parsed.thinking_text:
-            await self._safe_sink_call(sink, "delta", parsed.thinking_text, attempt=attempt)
+        parser = ThinkJsonStreamParser()
+        for text in parser.feed_content(content):
+            await self._safe_sink_call(sink, "delta", text, attempt=attempt)
+        parsed = parser.finish()
         return parsed, usage, _request_id(response)
 
     async def _create_json_stream_with_retry(
@@ -718,7 +720,10 @@ class TencentPlanAdapter:
             phrase in message
             for phrase in ("not supported", "does not support", "unsupported")
         )
-        return explicitly_unsupported and (param == "stream" or "stream" in message)
+        stream_referenced = param == "stream" or bool(
+            re.search(r"\b(?:stream|streaming|stream_options)\b", message)
+        )
+        return explicitly_unsupported and stream_referenced
 
     def _completion_content(self, response: Any) -> str:
         choices = _value(response, "choices") or ()
