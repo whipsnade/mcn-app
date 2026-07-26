@@ -9,7 +9,14 @@ import {
   updateSession as updateSessionRequest,
 } from '../api/sessions';
 import { isBrainstormProfileReady, postBrainstorm } from '../api/brainstorm';
-import { createTask, getAnalysisReport, getTask, retryFollowups as retryFollowupsRequest, retryTask } from '../api/tasks';
+import {
+  createTask,
+  createTurnId,
+  getAnalysisReport,
+  getTask,
+  retryFollowups as retryFollowupsRequest,
+  retryTask,
+} from '../api/tasks';
 import { getArtifactsSummary, markArtifactRead } from '../api/reports';
 import type { ApiAnalysisReport, ArtifactModuleKey, CreateSessionInput } from '../api/contracts';
 import { useTaskStream } from './useTaskStream';
@@ -311,6 +318,14 @@ export function useWorkspace(userId?: string) {
     const generation = generationRef.current;
     const requestedSessionId = activeSessionId;
     const operationEpoch = getSessionOperationEpoch(requestedSessionId);
+    const turnId = createTurnId();
+    const optimisticMessage: Message = {
+      id: `pending-turn-${turnId}`,
+      sender: 'user',
+      text: content,
+      timestamp: new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }),
+      turnId,
+    };
     const taskCreateLock: TaskCreateLock = {
       sessionId: requestedSessionId,
       token: Symbol(requestedSessionId),
@@ -318,35 +333,17 @@ export function useWorkspace(userId?: string) {
     taskCreateInFlightRef.current = taskCreateLock;
     setBusy(true);
     setError(undefined);
+    setSessions(current => current.map(session => session.id === requestedSessionId ? {
+      ...session,
+      messages: [...session.messages, optimisticMessage],
+    } : session));
     try {
       if (activeSession && !isBrainstormProfileReady(activeSession)) {
         // 画像未 ready：走 brainstorm 澄清，同步请求-响应，ready 后直接绑定已创建的任务。
-        const optimisticMessage: Message = {
-          id: `pending-brainstorm-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`,
-          sender: 'user',
-          text: content,
-          timestamp: new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }),
-        };
         setIsClarifying(true);
-        setSessions(current => current.map(session => session.id === requestedSessionId ? {
-          ...session,
-          messages: [...session.messages, optimisticMessage],
-        } : session));
         let response;
         try {
-          response = await postBrainstorm(requestedSessionId, content);
-        } catch (reason) {
-          // 失败时回滚乐观消息，输入框草稿由 ChatArea 保留（与 createTask 失败处理一致）。
-          if (
-            generationRef.current === generation
-            && sessionOperationIsCurrent(requestedSessionId, operationEpoch)
-          ) {
-            setSessions(current => current.map(session => session.id === requestedSessionId ? {
-              ...session,
-              messages: session.messages.filter(message => message.id !== optimisticMessage.id),
-            } : session));
-          }
-          throw reason;
+          response = await postBrainstorm(requestedSessionId, content, turnId);
         } finally {
           setIsClarifying(false);
         }
@@ -373,37 +370,30 @@ export function useWorkspace(userId?: string) {
         }
         return response;
       }
-      const result = await createTask(requestedSessionId, { content });
+      const result = await createTask(requestedSessionId, { content, turn_id: turnId });
       if (generationRef.current !== generation) throw new Error('STALE_WORKSPACE_REQUEST');
       if (!sessionOperationIsCurrent(requestedSessionId, operationEpoch)) return result;
       if (result.outcome === 'clarify') {
-        // planner 澄清：不落任务；插入用户提问与 assistant 澄清消息
+        // planner 澄清：不落任务；保留乐观用户提问并追加 assistant 澄清消息
         //（metadata.clarify.options 由 ChatArea 渲染为可点 chips，复用 brainstorm 机制）。
-        const userMessage: Message = {
-          id: `pending-clarify-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`,
-          sender: 'user',
-          text: content,
-          timestamp: new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }),
-        };
         const assistantMessage = toMessage(result.message);
         setSessions(current => current.map(session => session.id === requestedSessionId ? {
           ...session,
-          messages: [...session.messages, userMessage, assistantMessage],
+          messages: [...session.messages, assistantMessage],
         } : session));
         return result;
       }
       const task = result.task;
-      const pendingMessage: Message = {
-        id: task.trigger_message_id ?? `pending-${task.id}`,
-        sender: 'user',
-        text: content,
-        timestamp: new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }),
-        taskId: task.id,
-      };
       setSessions(current => current.map(session => session.id === requestedSessionId ? {
         ...session,
         status: 'analyzing',
-        messages: [...session.messages, pendingMessage],
+        messages: session.messages.map(message => message.id === optimisticMessage.id
+          ? {
+            ...message,
+            id: task.trigger_message_id ?? message.id,
+            taskId: task.id,
+          }
+          : message),
         analysis: { taskId: task.id, status: task.status, kind: task.kind },
         analysisReport: reportAfterNewTask(session),
       } : session));
@@ -416,7 +406,31 @@ export function useWorkspace(userId?: string) {
         generationRef.current === generation
         && sessionOperationIsCurrent(requestedSessionId, operationEpoch)
       ) {
-        setError(reason instanceof Error ? reason.message : '保存消息失败');
+        let persisted: Session | undefined;
+        try {
+          persisted = await getSession(requestedSessionId);
+        } catch {
+          // 后端状态无法读取时仍移除本地乐观消息，避免留下未确认内容。
+        }
+        if (
+          generationRef.current === generation
+          && sessionOperationIsCurrent(requestedSessionId, operationEpoch)
+        ) {
+          setSessions(current => current.map(session => {
+            if (session.id !== requestedSessionId) return session;
+            if (persisted?.messages.some(message => message.turnId === turnId)) {
+              return {
+                ...persisted,
+                artifactsSummary: session.artifactsSummary,
+              };
+            }
+            return {
+              ...session,
+              messages: session.messages.filter(message => message.id !== optimisticMessage.id),
+            };
+          }));
+          setError(reason instanceof Error ? reason.message : '保存消息失败');
+        }
       }
       throw reason;
     } finally {

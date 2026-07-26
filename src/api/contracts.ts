@@ -148,6 +148,7 @@ export interface ApiSessionThinkingEventPayload {
 }
 
 export interface ApiMessageMetadata extends Record<string, unknown> {
+  turn_id?: string;
   brainstorm?: BrainstormMetadata;
   clarify?: ClarifyMetadata;
   thinking?: ApiThinkingMetadata;

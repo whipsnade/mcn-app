@@ -158,6 +158,63 @@ describe('toSession', () => {
     });
   });
 
+  it('maps turn and thinking metadata onto messages', () => {
+    const session = toSession({
+      id: 's-thinking',
+      title: '思考会话',
+      brand: '',
+      campaign_name: null,
+      status: 'completed',
+      platforms: [],
+      category: '',
+      target_audience: '',
+      budget_min: null,
+      budget_max: null,
+      filters: {},
+      is_starred: false,
+      kol_selection_count: 0,
+      messages: [{
+        id: 'm-thinking',
+        role: 'assistant',
+        content: '分析完成',
+        sequence: 2,
+        metadata: {
+          turn_id: 'turn-1',
+          thinking: {
+            version: 1,
+            status: 'completed',
+            blocks: [{
+              operation_id: 'operation-1',
+              purpose: 'agent_loop',
+              attempt: 1,
+              label: '分析品牌',
+              content: '先分析品牌定位',
+              status: 'completed',
+              duration_ms: 21808,
+              truncated: false,
+            }],
+          },
+        },
+        created_at: '2026-07-26T10:00:00Z',
+      }],
+      created_at: '2026-07-26T10:00:00Z',
+      updated_at: '2026-07-26T10:01:00Z',
+    });
+
+    expect(session.messages[0]).toMatchObject({
+      turnId: 'turn-1',
+      thinking: {
+        version: 1,
+        status: 'completed',
+        blocks: [{
+          operationId: 'operation-1',
+          label: '分析品牌',
+          durationMs: 21808,
+        }],
+      },
+    });
+  });
+
   it('deletes a session through the session endpoint', async () => {
     vi.mocked(request).mockResolvedValue(undefined);
 

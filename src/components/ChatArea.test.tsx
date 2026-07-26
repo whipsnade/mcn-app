@@ -1,8 +1,13 @@
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { beforeAll, describe, expect, it, vi } from 'vitest';
+import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { Session } from '../types';
+import type { Session, ThinkingBlock } from '../types';
+import { useSessionThinkingStream } from '../hooks/useSessionThinkingStream';
 import ChatArea from './ChatArea';
+
+vi.mock('../hooks/useSessionThinkingStream', () => ({
+  useSessionThinkingStream: vi.fn(),
+}));
 
 
 const session: Session = {
@@ -21,10 +26,256 @@ const session: Session = {
   updatedAt: '2026-07-14T10:00:00Z',
 };
 
+function thinkingBlock(
+  content: string,
+  changes: Partial<ThinkingBlock> = {},
+): ThinkingBlock {
+  return {
+    operationId: 'operation-1',
+    turnId: 'turn-1',
+    purpose: 'agent_loop',
+    attempt: 1,
+    label: '分析品牌',
+    content,
+    status: 'running',
+    truncated: false,
+    ...changes,
+  };
+}
+
 
 describe('ChatArea', () => {
   beforeAll(() => {
     Element.prototype.scrollIntoView = vi.fn();
+  });
+
+  beforeEach(() => {
+    vi.mocked(useSessionThinkingStream).mockReset();
+    vi.mocked(useSessionThinkingStream).mockReturnValue(undefined);
+    vi.mocked(Element.prototype.scrollIntoView).mockClear();
+  });
+
+  it('merges historical and runtime thinking once between its user and assistant messages', () => {
+    vi.mocked(useSessionThinkingStream).mockReturnValue({
+      sessionId: 'session-1',
+      byTurn: {
+        'turn-1': [thinkingBlock('运行时分析品牌')],
+      },
+      sequenceByOperationAttempt: { 'operation-1:1': 2 },
+      connection: 'connected',
+    });
+    render(
+      <ChatArea
+        session={{
+          ...session,
+          messages: [
+            {
+              id: 'message-user',
+              sender: 'user',
+              text: '请分析品牌',
+              timestamp: '10:00',
+              turnId: 'turn-1',
+            },
+            {
+              id: 'message-assistant',
+              sender: 'ai',
+              text: '品牌分析完成',
+              timestamp: '10:01',
+              turnId: 'turn-1',
+              thinking: {
+                version: 1,
+                status: 'running',
+                blocks: [thinkingBlock('历史分析品牌')],
+              },
+            },
+          ],
+        }}
+        onSendMessage={vi.fn()}
+        isAnalyzing
+        isMockMode={false}
+      />,
+    );
+
+    expect(screen.getAllByRole('button', { name: '思考中' })).toHaveLength(1);
+    expect(screen.getByText('运行时分析品牌')).toBeVisible();
+    expect(screen.queryByText('历史分析品牌')).toBeNull();
+    const logText = screen.getByRole('log', { name: '会话消息' }).textContent ?? '';
+    expect(logText.indexOf('请分析品牌')).toBeLessThan(logText.indexOf('运行时分析品牌'));
+    expect(logText.indexOf('运行时分析品牌')).toBeLessThan(logText.indexOf('品牌分析完成'));
+  });
+
+  it('does not render thinking panels for empty event blocks', () => {
+    vi.mocked(useSessionThinkingStream).mockReturnValue({
+      sessionId: 'session-1',
+      byTurn: {
+        'turn-1': [thinkingBlock('', { status: 'completed', durationMs: 80 })],
+      },
+      sequenceByOperationAttempt: { 'operation-1:1': 2 },
+      connection: 'connected',
+    });
+    render(
+      <ChatArea
+        session={{
+          ...session,
+          messages: [{
+            id: 'message-user',
+            sender: 'user',
+            text: '请分析品牌',
+            timestamp: '10:00',
+            turnId: 'turn-1',
+          }],
+        }}
+        onSendMessage={vi.fn()}
+        isAnalyzing={false}
+        isMockMode={false}
+      />,
+    );
+
+    expect(screen.queryByRole('button', { name: /思考/ })).toBeNull();
+  });
+
+  it('does not follow thinking deltas after the user scrolls away from the bottom', () => {
+    let runtimeContent = '第一段';
+    vi.mocked(useSessionThinkingStream).mockImplementation(() => ({
+      sessionId: 'session-1',
+      byTurn: { 'turn-1': [thinkingBlock(runtimeContent)] },
+      sequenceByOperationAttempt: { 'operation-1:1': 2 },
+      connection: 'connected',
+    }));
+    const thinkingSession: Session = {
+      ...session,
+      messages: [{
+        id: 'message-user',
+        sender: 'user',
+        text: '请分析品牌',
+        timestamp: '10:00',
+        turnId: 'turn-1',
+      }],
+    };
+    const { rerender } = render(
+      <ChatArea
+        session={thinkingSession}
+        onSendMessage={vi.fn()}
+        isAnalyzing
+        isMockMode={false}
+      />,
+    );
+    const log = screen.getByRole('log', { name: '会话消息' });
+    Object.defineProperties(log, {
+      scrollHeight: { configurable: true, value: 1000 },
+      clientHeight: { configurable: true, value: 400 },
+      scrollTop: { configurable: true, writable: true, value: 400 },
+    });
+    fireEvent.scroll(log);
+    vi.mocked(Element.prototype.scrollIntoView).mockClear();
+
+    runtimeContent = '第一段第二段';
+    rerender(
+      <ChatArea
+        session={thinkingSession}
+        onSendMessage={vi.fn()}
+        isAnalyzing
+        isMockMode={false}
+      />,
+    );
+
+    expect(Element.prototype.scrollIntoView).not.toHaveBeenCalled();
+  });
+
+  it('follows thinking deltas while the user remains near the bottom', () => {
+    let runtimeContent = '第一段';
+    vi.mocked(useSessionThinkingStream).mockImplementation(() => ({
+      sessionId: 'session-1',
+      byTurn: { 'turn-1': [thinkingBlock(runtimeContent)] },
+      sequenceByOperationAttempt: { 'operation-1:1': 2 },
+      connection: 'connected',
+    }));
+    const thinkingSession: Session = {
+      ...session,
+      messages: [{
+        id: 'message-user',
+        sender: 'user',
+        text: '请分析品牌',
+        timestamp: '10:00',
+        turnId: 'turn-1',
+      }],
+    };
+    const { rerender } = render(
+      <ChatArea
+        session={thinkingSession}
+        onSendMessage={vi.fn()}
+        isAnalyzing
+        isMockMode={false}
+      />,
+    );
+    const log = screen.getByRole('log', { name: '会话消息' });
+    Object.defineProperties(log, {
+      scrollHeight: { configurable: true, value: 1000 },
+      clientHeight: { configurable: true, value: 400 },
+      scrollTop: { configurable: true, writable: true, value: 570 },
+    });
+    fireEvent.scroll(log);
+    vi.mocked(Element.prototype.scrollIntoView).mockClear();
+
+    runtimeContent = '第一段第二段';
+    rerender(
+      <ChatArea
+        session={thinkingSession}
+        onSendMessage={vi.fn()}
+        isAnalyzing
+        isMockMode={false}
+      />,
+    );
+
+    expect(Element.prototype.scrollIntoView).toHaveBeenCalledOnce();
+  });
+
+  it('does not show thinking left over from another session', () => {
+    vi.mocked(useSessionThinkingStream).mockReturnValue({
+      sessionId: 'session-1',
+      byTurn: { 'turn-1': [thinkingBlock('旧会话思考')] },
+      sequenceByOperationAttempt: { 'operation-1:1': 2 },
+      connection: 'connected',
+    });
+    const { rerender } = render(
+      <ChatArea
+        session={{
+          ...session,
+          messages: [{
+            id: 'message-user',
+            sender: 'user',
+            text: '旧会话问题',
+            timestamp: '10:00',
+            turnId: 'turn-1',
+          }],
+        }}
+        onSendMessage={vi.fn()}
+        isAnalyzing
+        isMockMode={false}
+      />,
+    );
+    expect(screen.getByText('旧会话思考')).toBeVisible();
+
+    rerender(
+      <ChatArea
+        session={{
+          ...session,
+          id: 'session-2',
+          messages: [{
+            id: 'message-user-2',
+            sender: 'user',
+            text: '新会话问题',
+            timestamp: '10:00',
+            turnId: 'turn-1',
+          }],
+        }}
+        onSendMessage={vi.fn()}
+        isAnalyzing={false}
+        isMockMode={false}
+      />,
+    );
+
+    expect(screen.queryByText('旧会话思考')).toBeNull();
   });
 
   it('keeps the draft until the message is persisted successfully', async () => {

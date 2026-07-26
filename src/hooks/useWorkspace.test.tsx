@@ -5,7 +5,14 @@ import type { Session } from '../types';
 import type { ApiBrainstormResponse } from '../api/contracts';
 import { postBrainstorm } from '../api/brainstorm';
 import { createSession, deleteSession, getSession, listSessions, updateSession } from '../api/sessions';
-import { createTask, getAnalysisReport, getTask, retryFollowups, retryTask } from '../api/tasks';
+import {
+  createTask,
+  createTurnId,
+  getAnalysisReport,
+  getTask,
+  retryFollowups,
+  retryTask,
+} from '../api/tasks';
 import { getArtifactsSummary, markArtifactRead } from '../api/reports';
 import type { ApiArtifactsSummary } from '../api/contracts';
 import { initialTaskRuntime } from '../state/taskEvents';
@@ -113,6 +120,7 @@ vi.mock('../api/brainstorm', async importOriginal => {
 
 vi.mock('../api/tasks', () => ({
   createTask: vi.fn(),
+  createTurnId: vi.fn(),
   getTask: vi.fn(),
   getAnalysisReport: vi.fn(),
   retryFollowups: vi.fn(),
@@ -132,6 +140,7 @@ vi.mock('./useTaskStream', () => ({
 
 describe('useWorkspace', () => {
   beforeEach(() => {
+    vi.mocked(createTurnId).mockReturnValue('turn-1');
     vi.mocked(listSessions).mockResolvedValue([session]);
     vi.mocked(getSession).mockResolvedValue(restoredSession);
     vi.mocked(useTaskStream).mockReturnValue(undefined);
@@ -530,7 +539,10 @@ describe('useWorkspace', () => {
       await result.current.appendMessage('会话 B 可以提交');
     });
 
-    expect(createTask).toHaveBeenCalledWith('session-2', { content: '会话 B 可以提交' });
+    expect(createTask).toHaveBeenCalledWith(
+      'session-2',
+      { content: '会话 B 可以提交', turn_id: 'turn-1' },
+    );
     expect(result.current.activeTaskId).toBe('task-b');
 
     await act(async () => {
@@ -707,7 +719,10 @@ describe('useWorkspace', () => {
       await result.current.appendMessage('帮我做个分析');
     });
 
-    expect(createTask).toHaveBeenCalledWith('session-1', { content: '帮我做个分析' });
+    expect(createTask).toHaveBeenCalledWith(
+      'session-1',
+      { content: '帮我做个分析', turn_id: 'turn-1' },
+    );
     const active = result.current.activeSession;
     // 不落任务：状态与 analysis 不变，不进入 analyzing。
     expect(active?.status).toBe('draft');
@@ -715,6 +730,8 @@ describe('useWorkspace', () => {
     const texts = active?.messages.map(message => [message.sender, message.text]);
     expect(texts?.at(-2)).toEqual(['user', '帮我做个分析']);
     expect(texts?.at(-1)).toEqual(['ai', '想看哪个品牌的分析？']);
+    expect(active?.messages.filter(message => message.text === '帮我做个分析')).toHaveLength(1);
+    expect(active?.messages.at(-2)?.turnId).toBe('turn-1');
     expect(active?.messages.at(-1)?.clarify?.options).toEqual(['海底捞', '喜茶']);
   });
 
@@ -734,7 +751,10 @@ describe('useWorkspace', () => {
       await result.current.appendMessage('帮我筛选美妆达人');
     });
 
-    expect(createTask).toHaveBeenCalledWith('session-1', { content: '帮我筛选美妆达人' });
+    expect(createTask).toHaveBeenCalledWith(
+      'session-1',
+      { content: '帮我筛选美妆达人', turn_id: 'turn-1' },
+    );
     expect(result.current.activeTaskId).toBe('task-1');
     expect(result.current.activeSession?.status).toBe('analyzing');
     expect(result.current.activeSession?.messages.at(-1)?.text).toBe('帮我筛选美妆达人');
@@ -775,10 +795,15 @@ describe('useWorkspace', () => {
     act(() => {
       appendPromise = result.current.appendMessage('想分析新品防晒');
     });
-    await waitFor(() => expect(postBrainstorm).toHaveBeenCalledWith('session-1', '想分析新品防晒'));
+    await waitFor(() => expect(postBrainstorm).toHaveBeenCalledWith(
+      'session-1',
+      '想分析新品防晒',
+      'turn-1',
+    ));
     // 澄清进行中：本地已追加 user 消息并暴露 clarifying 状态，不创建任务。
     expect(result.current.isClarifying).toBe(true);
     expect(result.current.activeSession?.messages.at(-1)?.text).toBe('想分析新品防晒');
+    expect(result.current.activeSession?.messages.at(-1)?.turnId).toBe('turn-1');
     expect(createTask).not.toHaveBeenCalled();
 
     await act(async () => {
@@ -851,6 +876,84 @@ describe('useWorkspace', () => {
     expect(result.current.error).toBe('BRAINSTORM_FAILED');
     expect(result.current.isClarifying).toBe(false);
     expect(createTask).not.toHaveBeenCalled();
+  });
+
+  it('inserts a turn-linked task message before the request settles and replaces its id on success', async () => {
+    const pending = deferred<TaskCreateResult>();
+    vi.mocked(createTask).mockReturnValue(pending.promise);
+    const { result } = renderHook(() => useWorkspace('user-a'));
+    await waitFor(() => expect(result.current.activeSession?.id).toBe('session-1'));
+
+    let appendPromise!: Promise<unknown>;
+    act(() => {
+      appendPromise = result.current.appendMessage('分析品牌');
+    });
+
+    await waitFor(() => expect(createTask).toHaveBeenCalledWith(
+      'session-1',
+      { content: '分析品牌', turn_id: 'turn-1' },
+    ));
+    expect(result.current.activeSession?.messages.at(-1)).toMatchObject({
+      sender: 'user',
+      text: '分析品牌',
+      turnId: 'turn-1',
+    });
+
+    await act(async () => {
+      pending.resolve({
+        outcome: 'task',
+        task: {
+          id: 'task-turn',
+          session_id: 'session-1',
+          trigger_message_id: 'message-trigger',
+          status: 'pending',
+          estimated_points: 0,
+          error_code: null,
+          latest_report_id: null,
+        },
+      });
+      await appendPromise;
+    });
+
+    expect(result.current.activeSession?.messages.at(-1)).toMatchObject({
+      id: 'message-trigger',
+      taskId: 'task-turn',
+      turnId: 'turn-1',
+    });
+    expect(result.current.activeSession?.messages.filter(message => message.text === '分析品牌'))
+      .toHaveLength(1);
+  });
+
+  it('refreshes the session after a task request error and keeps a persisted message for the turn', async () => {
+    const persistedAfterError: Session = {
+      ...restoredSession,
+      messages: [
+        ...restoredSession.messages,
+        {
+          id: 'message-error',
+          sender: 'user',
+          text: '会失败但已落库',
+          timestamp: '10:00',
+          turnId: 'turn-1',
+        },
+      ],
+    };
+    vi.mocked(getSession)
+      .mockResolvedValueOnce(restoredSession)
+      .mockResolvedValueOnce(persistedAfterError);
+    vi.mocked(createTask).mockRejectedValue(new Error('TASK_FAILED'));
+    const { result } = renderHook(() => useWorkspace('user-a'));
+    await waitFor(() => expect(result.current.activeSession?.id).toBe('session-1'));
+
+    await act(async () => {
+      await expect(result.current.appendMessage('会失败但已落库')).rejects.toThrow('TASK_FAILED');
+    });
+
+    expect(getSession).toHaveBeenCalledTimes(2);
+    expect(result.current.activeSession?.messages.at(-1)).toMatchObject({
+      id: 'message-error',
+      turnId: 'turn-1',
+    });
   });
 
   it('does not create a second task while the active task is still running', async () => {

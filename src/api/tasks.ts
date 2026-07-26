@@ -4,12 +4,19 @@ import type { ApiAnalysisReport, ApiTask, TaskCreateResult } from './contracts';
 
 export interface CreateTaskInput {
   content: string;
+  turn_id?: string;
 }
 
 export function createIdempotencyKey(): string {
   const randomUUID = globalThis.crypto?.randomUUID;
   if (typeof randomUUID === 'function') return randomUUID.call(globalThis.crypto);
   return `task-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
+export function createTurnId(): string {
+  const randomUUID = globalThis.crypto?.randomUUID;
+  if (typeof randomUUID === 'function') return randomUUID.call(globalThis.crypto);
+  return `turn-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
 
 export function createTask(

@@ -46,11 +46,11 @@ describe('postBrainstorm', () => {
     };
     vi.mocked(request).mockResolvedValue(response);
 
-    const result = await postBrainstorm('session-1', '想分析新品防晒');
+    const result = await postBrainstorm('session-1', '想分析新品防晒', 'turn-1');
 
     expect(request).toHaveBeenCalledWith('/api/v1/sessions/session-1/brainstorm', {
       method: 'POST',
-      body: JSON.stringify({ content: '想分析新品防晒' }),
+      body: JSON.stringify({ content: '想分析新品防晒', turn_id: 'turn-1' }),
     });
     expect(result).toBe(response);
   });

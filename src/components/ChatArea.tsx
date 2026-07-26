@@ -1,8 +1,10 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { Send, Sparkles, ShieldAlert } from 'lucide-react';
-import { Session, Message } from '../types';
+import { Session, Message, type ThinkingBlock } from '../types';
 import type { FollowupSuggestion } from '../api/contracts';
+import { useSessionThinkingStream } from '../hooks/useSessionThinkingStream';
 import TaskFlowNodes from './TaskFlowNodes';
+import ThinkingPanel from './ThinkingPanel';
 import type { TaskFlowNode } from '../state/taskEvents';
 
 /** 空白会话（无消息、无 followup 建议）展示的默认圈选建议，点击填入输入框。 */
@@ -12,6 +14,45 @@ const DEFAULT_SUGGESTIONS: { title: string; prompt: string }[] = [
   { title: '按受众画像圈选', prompt: '圈选粉丝以某地区某年龄段女性为主的各平台达人，适合推广某类产品' },
   { title: '按预算圈选达人', prompt: '在10万元预算内圈选适合推广某品牌的高性价比达人，给出组合建议' },
 ];
+
+const NEAR_BOTTOM_THRESHOLD_PX = 48;
+const EMPTY_THINKING_BY_TURN: Record<string, ThinkingBlock[]> = {};
+
+function blockKey(block: ThinkingBlock): string {
+  return `${block.operationId}:${block.attempt}`;
+}
+
+export function mergeHistoricalAndRuntimeThinking(
+  messages: Message[],
+  runtimeByTurn: Record<string, ThinkingBlock[]> = {},
+): Record<string, ThinkingBlock[]> {
+  const merged = new Map<string, Map<string, ThinkingBlock>>();
+
+  messages.forEach(message => {
+    if (!message.turnId || !message.thinking) return;
+    const byOperation = merged.get(message.turnId) ?? new Map<string, ThinkingBlock>();
+    message.thinking.blocks.forEach(block => {
+      byOperation.set(blockKey(block), { ...block, turnId: message.turnId });
+    });
+    merged.set(message.turnId, byOperation);
+  });
+
+  Object.entries(runtimeByTurn).forEach(([turnId, blocks]) => {
+    const byOperation = merged.get(turnId) ?? new Map<string, ThinkingBlock>();
+    blocks.forEach(block => {
+      const key = blockKey(block);
+      const historical = byOperation.get(key);
+      // 已持久化的终态 metadata 是最终快照；其余情况优先展示更实时的流内容。
+      if (historical && historical.status !== 'running' && block.status === 'running') return;
+      byOperation.set(key, { ...block, turnId });
+    });
+    merged.set(turnId, byOperation);
+  });
+
+  return Object.fromEntries(
+    [...merged.entries()].map(([turnId, blocks]) => [turnId, [...blocks.values()]]),
+  );
+}
 
 interface ChatAreaProps {
   session: Session;
@@ -53,7 +94,25 @@ export default function ChatArea({
 }: ChatAreaProps) {
   const [inputText, setInputText] = useState('');
   const chatEndRef = useRef<HTMLDivElement>(null);
+  const chatLogRef = useRef<HTMLDivElement>(null);
+  const isNearBottomRef = useRef(true);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const thinkingRuntime = useSessionThinkingStream(session.id);
+  const runtimeByTurn = thinkingRuntime?.sessionId === session.id
+    ? thinkingRuntime.byTurn
+    : EMPTY_THINKING_BY_TURN;
+  const thinkingByTurn: Record<string, ThinkingBlock[]> = useMemo(
+    () => mergeHistoricalAndRuntimeThinking(session.messages, runtimeByTurn),
+    [runtimeByTurn, session.messages],
+  );
+  const thinkingTextKey = useMemo(
+    () => Object.entries(thinkingByTurn)
+      .flatMap(([turnId, blocks]) => blocks.map(block => (
+        `${turnId}:${blockKey(block)}:${block.status}:${block.content}`
+      )))
+      .join('|'),
+    [thinkingByTurn],
+  );
 
   // 建议点击统一行为：填入输入框并聚焦，不自动提交，由用户确认后发送。
   const fillInput = (text: string) => {
@@ -61,10 +120,23 @@ export default function ChatArea({
     textareaRef.current?.focus();
   };
 
-  // Auto scroll to bottom
   useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [session.messages, isAnalyzing]);
+    isNearBottomRef.current = true;
+  }, [session.id]);
+
+  // 仅在用户仍靠近底部时跟随新消息或思考增量。
+  useEffect(() => {
+    if (isNearBottomRef.current) {
+      chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [session.id, session.messages, isAnalyzing, thinkingTextKey]);
+
+  const handleChatScroll = () => {
+    const container = chatLogRef.current;
+    if (!container) return;
+    const distanceFromBottom = container.scrollHeight - container.scrollTop - container.clientHeight;
+    isNearBottomRef.current = distanceFromBottom <= NEAR_BOTTOM_THRESHOLD_PX;
+  };
 
   const handleSend = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -146,7 +218,13 @@ export default function ChatArea({
       </div>
 
       {/* Messages Feed */}
-      <div role="log" aria-label="会话消息" className="min-h-0 flex-1 overflow-y-auto p-6 space-y-5 bg-white">
+      <div
+        ref={chatLogRef}
+        role="log"
+        aria-label="会话消息"
+        onScroll={handleChatScroll}
+        className="min-h-0 flex-1 overflow-y-auto p-6 space-y-5 bg-white"
+      >
         
         {/* System welcome event banner */}
         <div className="flex justify-center">
@@ -174,76 +252,85 @@ export default function ChatArea({
           const brainstormOptions = isAI && msg.id === latestAssistantMessageId
             ? msg.brainstorm?.options ?? msg.clarify?.options ?? []
             : [];
+          const thinkingBlocks = !isAI && msg.turnId
+            ? thinkingByTurn[msg.turnId] ?? []
+            : [];
 
           return (
-            <div 
-              key={msg.id} 
-              className={`flex items-start gap-3 max-w-[85%] ${
-                isAI ? 'mr-auto' : 'ml-auto flex-row-reverse'
-              }`}
-            >
-              {/* Avatar Icon */}
-              <div className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-full font-bold text-[10px] shadow-sm ${
-                isAI 
-                  ? 'bg-indigo-600 text-white' 
-                  : 'bg-slate-200 text-slate-700'
-              }`}>
-                {isAI ? 'AI' : 'U'}
-              </div>
-
-              {/* Message Details */}
-              <div className="space-y-1 flex-1">
-                <div className={`flex items-center gap-2 text-[10px] text-slate-400 ${
-                  isAI ? 'justify-start' : 'justify-end'
+            <React.Fragment key={msg.id}>
+              <div
+                className={`flex items-start gap-3 max-w-[85%] ${
+                  isAI ? 'mr-auto' : 'ml-auto flex-row-reverse'
+                }`}
+              >
+                {/* Avatar Icon */}
+                <div className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-full font-bold text-[10px] shadow-sm ${
+                  isAI
+                    ? 'bg-indigo-600 text-white'
+                    : 'bg-slate-200 text-slate-700'
                 }`}>
-                  <span className="font-semibold text-slate-500">{isAI ? 'AI 分析师' : '品牌方'}</span>
-                  <span>{msg.timestamp || '10:15'}</span>
+                  {isAI ? 'AI' : 'U'}
                 </div>
 
-                {/* Message Bubble */}
-                <div className={`rounded-2xl px-4 py-3 text-xs md:text-sm leading-relaxed ${
-                  isAI 
-                    ? 'bg-indigo-600 text-white rounded-tl-none shadow-md' 
-                    : 'bg-slate-100 text-slate-700 rounded-tr-none border border-slate-200/50'
-                }`}>
-                  {/* Handle multiline text rendering nicely */}
-                  <div className="whitespace-pre-line font-normal">
-                    {msg.text}
+                {/* Message Details */}
+                <div className="space-y-1 flex-1">
+                  <div className={`flex items-center gap-2 text-[10px] text-slate-400 ${
+                    isAI ? 'justify-start' : 'justify-end'
+                  }`}>
+                    <span className="font-semibold text-slate-500">{isAI ? 'AI 分析师' : '品牌方'}</span>
+                    <span>{msg.timestamp || '10:15'}</span>
                   </div>
-                  {!isAI && msg.taskId && onRetryMessage && !isAnalyzing && (
-                    <button
-                      type="button"
-                      onClick={() => void onRetryMessage(msg.id).catch(() => undefined)}
-                      className="mt-2 rounded-lg border border-indigo-200 bg-white px-2.5 py-1 text-[10px] font-semibold text-indigo-600 transition hover:bg-indigo-50"
-                    >
-                      再次执行
-                    </button>
+
+                  {/* Message Bubble */}
+                  <div className={`rounded-2xl px-4 py-3 text-xs md:text-sm leading-relaxed ${
+                    isAI
+                      ? 'bg-indigo-600 text-white rounded-tl-none shadow-md'
+                      : 'bg-slate-100 text-slate-700 rounded-tr-none border border-slate-200/50'
+                  }`}>
+                    {/* Handle multiline text rendering nicely */}
+                    <div className="whitespace-pre-line font-normal">
+                      {msg.text}
+                    </div>
+                    {!isAI && msg.taskId && onRetryMessage && !isAnalyzing && (
+                      <button
+                        type="button"
+                        onClick={() => void onRetryMessage(msg.id).catch(() => undefined)}
+                        className="mt-2 rounded-lg border border-indigo-200 bg-white px-2.5 py-1 text-[10px] font-semibold text-indigo-600 transition hover:bg-indigo-50"
+                      >
+                        再次执行
+                      </button>
+                    )}
+                  </div>
+
+                  {/* Brainstorm 澄清选项 chips（样式复用进一步分析建议 chips） */}
+                  {brainstormOptions.length > 0 && (
+                    <div className="mt-2 flex flex-wrap gap-1.5" aria-label="澄清选项">
+                      {brainstormOptions.map(option => (
+                        <button
+                          key={option}
+                          type="button"
+                          disabled={isAnalyzing}
+                          onClick={() => {
+                            if (!isAnalyzing) fillInput(option);
+                          }}
+                          className={`rounded-lg border px-2.5 py-1.5 text-[10px] font-semibold transition active:scale-95 ${isAnalyzing
+                            ? 'cursor-not-allowed border-slate-100 bg-slate-50 text-slate-300'
+                            : 'border-indigo-100 bg-white text-indigo-700 hover:border-indigo-300 hover:bg-indigo-50'
+                          }`}
+                        >
+                          {option}
+                        </button>
+                      ))}
+                    </div>
                   )}
                 </div>
-
-                {/* Brainstorm 澄清选项 chips（样式复用进一步分析建议 chips） */}
-                {brainstormOptions.length > 0 && (
-                  <div className="mt-2 flex flex-wrap gap-1.5" aria-label="澄清选项">
-                    {brainstormOptions.map(option => (
-                      <button
-                        key={option}
-                        type="button"
-                        disabled={isAnalyzing}
-                        onClick={() => {
-                          if (!isAnalyzing) fillInput(option);
-                        }}
-                        className={`rounded-lg border px-2.5 py-1.5 text-[10px] font-semibold transition active:scale-95 ${isAnalyzing
-                          ? 'cursor-not-allowed border-slate-100 bg-slate-50 text-slate-300'
-                          : 'border-indigo-100 bg-white text-indigo-700 hover:border-indigo-300 hover:bg-indigo-50'
-                        }`}
-                      >
-                        {option}
-                      </button>
-                    ))}
-                  </div>
-                )}
               </div>
-            </div>
+              {thinkingBlocks.length > 0 && (
+                <div className="mr-auto ml-11 w-[calc(85%-2.75rem)] max-w-[85%]">
+                  <ThinkingPanel blocks={thinkingBlocks} />
+                </div>
+              )}
+            </React.Fragment>
           );
         })}
 

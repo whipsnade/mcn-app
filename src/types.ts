@@ -57,6 +57,7 @@ export interface Message {
   sender: 'user' | 'ai' | 'system';
   text: string;
   timestamp: string;
+  turnId?: string;
   taskId?: string;
   brainstorm?: import('./api/contracts').BrainstormMetadata;
   clarify?: import('./api/contracts').ClarifyMetadata;
