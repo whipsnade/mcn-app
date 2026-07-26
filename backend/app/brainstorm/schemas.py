@@ -1,4 +1,5 @@
 from typing import Any
+from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -49,6 +50,7 @@ class BrainstormModelOutput(BaseModel):
 
 class BrainstormRequest(BaseModel):
     content: str = Field(min_length=1, max_length=5000)
+    turn_id: UUID = Field(default_factory=uuid4)
 
 
 class BrainstormOutcome(BaseModel):

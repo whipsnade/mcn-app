@@ -94,6 +94,9 @@ class TaskService:
             )
             if message is None:
                 raise LookupError("trigger_message_not_found")
+        message_metadata = dict(message.metadata_json or {})
+        message_metadata.setdefault("turn_id", str(payload.turn_id))
+        message.metadata_json = message_metadata
         now = utc_now()
         latest_creation_order = await self.db.scalar(
             select(func.max(AnalysisTask.creation_order)).where(
@@ -295,10 +298,16 @@ class TaskService:
             # 复制源任务的 goal 结构（类型/顺序/依赖/params），不重新调 planner；
             # 旧任务无 goals 时走默认单 kol_selection。
             goal_specs = await self._goal_specs_of(source.id)
+            source_turn_id = (message.metadata_json or {}).get("turn_id")
+            retry_payload = (
+                TaskCreate(content=message.content, turn_id=source_turn_id)
+                if source_turn_id is not None
+                else TaskCreate(content=message.content)
+            )
             return await self.create(
                 user_id,
                 source.session_id,
-                TaskCreate(content=message.content),
+                retry_payload,
                 trigger_message_id=message.id,
                 retry_of_task_id=source.id,
                 retry_key=retry_key,

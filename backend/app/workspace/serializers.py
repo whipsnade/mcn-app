@@ -29,5 +29,7 @@ def public_message_metadata(metadata: dict) -> dict:
         "followup_error",
         "brainstorm",
         "clarify",
+        "turn_id",
+        "thinking",
     }
     return {key: value for key, value in metadata.items() if key in allowed}

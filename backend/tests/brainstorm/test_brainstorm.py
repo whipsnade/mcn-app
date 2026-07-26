@@ -1,12 +1,14 @@
 import json
 
 import pytest
+from pydantic import ValidationError
 
 from app.brainstorm.schemas import (
     BrainstormModelOutput,
     BrainstormPeriod,
     BrainstormProfile,
     BrainstormQuestion,
+    BrainstormRequest,
 )
 from app.model.contracts import ModelAdapterError, StructuredResult
 from app.tasks import dependencies
@@ -44,6 +46,14 @@ def _full_profile() -> BrainstormProfile:
         period=BrainstormPeriod(start="2026-04-01", end="2026-06-30"),
         goal="达人投放",
     )
+
+
+def test_brainstorm_request_accepts_turn_id_and_rejects_invalid_uuid() -> None:
+    turn_id = "8a9fda07-77c5-44ea-967e-a17e795266ef"
+
+    assert str(BrainstormRequest(content="分析品牌", turn_id=turn_id).turn_id) == turn_id
+    with pytest.raises(ValidationError):
+        BrainstormRequest(content="分析品牌", turn_id="not-a-uuid")
 
 
 @pytest.mark.asyncio

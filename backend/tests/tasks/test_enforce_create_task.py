@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from uuid import uuid4
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import func, select
 
 from app.core.config import get_settings
@@ -19,6 +20,8 @@ from app.goals.schemas import (
     GoalSpec,
 )
 from app.tasks.models import AnalysisTask
+from app.tasks.schemas import TaskCreate
+from app.tasks.service import TaskService
 from app.workspace.models import Message, WorkspaceSession
 
 
@@ -69,6 +72,14 @@ async def _set_session_profile(db_session, session_id: str, *, brand: str, categ
     session.brand = brand
     session.category = category
     await db_session.flush()
+
+
+def test_task_create_accepts_turn_id_and_rejects_invalid_uuid() -> None:
+    turn_id = "8a9fda07-77c5-44ea-967e-a17e795266ef"
+
+    assert str(TaskCreate(content="分析品牌", turn_id=turn_id).turn_id) == turn_id
+    with pytest.raises(ValidationError):
+        TaskCreate(content="分析品牌", turn_id="not-a-uuid")
 
 
 @pytest.mark.asyncio
@@ -297,9 +308,6 @@ async def test_enforce_idempotent_hit_skips_planner(
 @pytest.mark.asyncio
 async def test_task_service_create_accepts_goal_overrides(db_session, user_factory) -> None:
     """TaskService.create 按入参建 goal；缺省保持 kol_selection + 会话快照。"""
-    from app.tasks.schemas import TaskCreate
-    from app.tasks.service import TaskService
-
     user = await user_factory()
     now = datetime.now(UTC).replace(tzinfo=None)
     session = WorkspaceSession(
@@ -347,13 +355,53 @@ async def test_task_service_create_accepts_goal_overrides(db_session, user_facto
 
 
 @pytest.mark.asyncio
+async def test_task_service_create_persists_turn_id_and_retry_reuses_it(
+    db_session, user_factory
+) -> None:
+    user = await user_factory()
+    now = datetime.now(UTC).replace(tzinfo=None)
+    session = WorkspaceSession(
+        id=str(uuid4()),
+        user_id=user.id,
+        title="turn 持久化测试",
+        brand="海底捞",
+        campaign_name=None,
+        status="active",
+        platforms=["xiaohongshu"],
+        category="美食",
+        target_audience="",
+        budget_min=None,
+        budget_max=None,
+        filters_snapshot={},
+        is_starred=False,
+        last_accessed_at=now,
+        created_at=now,
+        updated_at=now,
+    )
+    db_session.add(session)
+    await db_session.flush()
+    turn_id = "8a9fda07-77c5-44ea-967e-a17e795266ef"
+
+    source = await TaskService(db_session).create(
+        user.id,
+        session.id,
+        TaskCreate(content="分析品牌", turn_id=turn_id),
+    )
+    source.status = "completed"
+    await db_session.flush()
+    retry = await TaskService(db_session).retry(user.id, source.id)
+    message = await db_session.get(Message, source.trigger_message_id)
+
+    assert message is not None
+    assert retry.trigger_message_id == source.trigger_message_id
+    assert message.metadata_json["turn_id"] == turn_id
+
+
+@pytest.mark.asyncio
 async def test_task_service_create_persists_goal_specs_with_dependency(
     db_session, user_factory
 ) -> None:
     """goal_specs 列表：按 sequence 建多行 TaskGoal，depends_on_sequence 解析为 id。"""
-    from app.tasks.schemas import TaskCreate
-    from app.tasks.service import TaskService
-
     user = await user_factory()
     now = datetime.now(UTC).replace(tzinfo=None)
     session = WorkspaceSession(

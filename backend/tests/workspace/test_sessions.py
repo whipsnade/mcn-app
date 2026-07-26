@@ -7,6 +7,7 @@ from app.selection.models import KolSelectionItem, SessionKolSelection
 from app.selection.service import KolSelectionService
 from app.workspace import service as workspace_service
 from app.workspace.models import WorkspaceSession
+from app.workspace.serializers import public_message_metadata
 
 
 def _session_payload(**overrides):
@@ -27,6 +28,20 @@ def test_default_session_title_returns_none_when_form_is_empty() -> None:
 
     assert callable(title_builder)
     assert title_builder("", None, "") is None
+
+
+def test_public_message_metadata_exposes_thinking_but_hides_pending() -> None:
+    metadata = public_message_metadata(
+        {
+            "turn_id": "turn-1",
+            "thinking": {"version": 1, "status": "completed", "blocks": []},
+            "thinking_pending": {"blocks": [{"content": "internal staging"}]},
+        }
+    )
+
+    assert metadata["turn_id"] == "turn-1"
+    assert "thinking" in metadata
+    assert "thinking_pending" not in metadata
 
 
 @pytest.mark.asyncio
