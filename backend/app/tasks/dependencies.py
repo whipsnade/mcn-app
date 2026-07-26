@@ -49,6 +49,12 @@ from app.tasks.followups import FollowupSuggestionService
 from app.tasks.models import AnalysisTask, TaskEvent
 from app.tasks.recovery import TaskRecovery
 from app.tasks.repository import TaskRepository
+from app.thinking.contracts import ThinkingOperationSpec
+from app.thinking.persistence import ThinkingMessageStore
+from app.thinking.service import (
+    SessionThinkingService,
+    get_session_thinking_service,
+)
 from app.workspace.models import Message
 from app.tasks.state import TaskEventType
 from app.workspace.service import WorkspaceService
@@ -235,12 +241,27 @@ class _TaskArtifacts:
                         "auto_kol_analysis skipped: empty selection task_id=%s", task_id
                     )
                     return
-                report = await run_kol_analysis(
+                thinking_service, turn_id, thinking_sink = await self._thinking_sink(
                     db,
-                    self._model,
-                    user_id=task.user_id,
-                    session_id=task.session_id,
+                    task,
+                    purpose="kol_analysis",
+                    label="正在生成KOL报告",
                 )
+                try:
+                    report = await run_kol_analysis(
+                        db,
+                        self._model,
+                        user_id=task.user_id,
+                        session_id=task.session_id,
+                        thinking_sink=thinking_sink,
+                    )
+                finally:
+                    await self._persist_thinking(
+                        db,
+                        thinking_service,
+                        task=task,
+                        turn_id=turn_id,
+                    )
                 self._report_ids[task.id] = report.id
                 await TaskRepository(db).append_event(
                     task.id,
@@ -384,15 +405,36 @@ class _TaskArtifacts:
         if self._model is None:
             build_error = RuntimeError("model_unavailable")
         else:
+            label = (
+                "正在生成品牌报告"
+                if goal.goal_type == "brand_analysis"
+                else "正在生成活动报告"
+            )
+            thinking_service, turn_id, thinking_sink = await self._thinking_sink(
+                db,
+                task,
+                purpose=goal.goal_type,
+                label=label,
+                goal_id=goal.id,
+            )
             try:
-                report = await builder(
-                    db,
-                    self._model,
-                    user_id=task.user_id,
-                    session_id=task.session_id,
-                    task=task,
-                    goal=goal,
-                )
+                try:
+                    report = await builder(
+                        db,
+                        self._model,
+                        user_id=task.user_id,
+                        session_id=task.session_id,
+                        task=task,
+                        goal=goal,
+                        thinking_sink=thinking_sink,
+                    )
+                finally:
+                    await self._persist_thinking(
+                        db,
+                        thinking_service,
+                        task=task,
+                        turn_id=turn_id,
+                    )
             except Exception as error:
                 build_error = error
         if build_error is not None:
@@ -539,6 +581,7 @@ class _TaskArtifacts:
                 )
             )
             if existing is not None:
+                await self._attach_turn_to_assistant(db, task, existing)
                 return
             text = conclusion.strip()
             if not text:
@@ -573,6 +616,7 @@ class _TaskArtifacts:
             )
             db.add(message)
             await db.flush()
+            await self._attach_turn_to_assistant(db, task, message)
             await TaskRepository(db).append_event(
                 task.id,
                 task.user_id,
@@ -580,6 +624,105 @@ class _TaskArtifacts:
                 # 前端 reducer 靠 payload.text 直接渲染气泡（无 message.delta
                 # 前置时 draft 为空），结论全文必须随事件下发。
                 {"message_id": message.id, "text": text},
+            )
+
+    async def _thinking_sink(
+        self,
+        db,
+        task: AnalysisTask,
+        *,
+        purpose: str,
+        label: str,
+        goal_id: str | None = None,
+    ):
+        """从任务触发消息创建 Sink；缺 turn 或内部异常时静默禁用。"""
+        try:
+            trigger = await db.get(Message, task.trigger_message_id)
+            turn_id = (
+                (trigger.metadata_json or {}).get("turn_id")
+                if trigger is not None
+                else None
+            )
+            if not isinstance(turn_id, str) or not turn_id:
+                return None, None, None
+            service = get_session_thinking_service()
+            sink = service.create_sink(
+                ThinkingOperationSpec(
+                    operation_id=str(uuid4()),
+                    turn_id=turn_id,
+                    session_id=task.session_id,
+                    user_id=task.user_id,
+                    purpose=purpose,
+                    label=label,
+                    task_id=task.id,
+                    goal_id=goal_id,
+                )
+            )
+            return service, turn_id, sink
+        except Exception:
+            logger.warning(
+                "task_thinking_sink_create_failed task_id=%s",
+                task.id,
+                exc_info=True,
+            )
+            return None, None, None
+
+    async def _persist_thinking(
+        self,
+        db,
+        service: SessionThinkingService | None,
+        *,
+        task: AnalysisTask,
+        turn_id: str | None,
+    ) -> None:
+        if service is None or turn_id is None:
+            return
+        try:
+            blocks = await service.completed_blocks(
+                turn_id=turn_id,
+                user_id=task.user_id,
+                session_id=task.session_id,
+            )
+            store = ThinkingMessageStore(db)
+            for block in blocks:
+                await store.persist_block(
+                    block,
+                    user_id=task.user_id,
+                    session_id=task.session_id,
+                )
+        except Exception:
+            logger.warning(
+                "task_thinking_persist_failed task_id=%s",
+                task.id,
+                exc_info=True,
+            )
+
+    async def _attach_turn_to_assistant(
+        self,
+        db,
+        task: AnalysisTask,
+        message: Message,
+    ) -> None:
+        try:
+            trigger = await db.get(Message, task.trigger_message_id)
+            turn_id = (
+                (trigger.metadata_json or {}).get("turn_id")
+                if trigger is not None
+                else None
+            )
+            if not isinstance(turn_id, str) or not turn_id:
+                return
+            await ThinkingMessageStore(db).attach_turn_to_assistant(
+                message,
+                user_id=task.user_id,
+                session_id=task.session_id,
+                turn_id=turn_id,
+            )
+        except Exception:
+            logger.warning(
+                "task_conclusion_thinking_attach_failed task_id=%s",
+                task.id,
+                exc_info=True,
             )
 
     async def _locked_active_task(self, db, task_id: str) -> AnalysisTask:
@@ -800,6 +943,10 @@ class TaskExecutionDependencies:
     async def agent_decide(self, context: AgentLoopContext) -> AgentDecision:
         tags = [str(tag) for tag in context.log_context.get("tags") or ()]
         user_id = context.log_context.get("user_id")
+        session_id = context.log_context.get("session_id")
+        task_id = context.log_context.get("task_id")
+        goal_id = context.log_context.get("goal_id")
+        turn_id = context.log_context.get("turn_id")
         async with SessionFactory() as db:
             exemplars = await find_success_exemplars(
                 db,
@@ -807,31 +954,116 @@ class TaskExecutionDependencies:
                 tags=tags,
                 user_id=user_id if isinstance(user_id, str) else None,
             )
+            if isinstance(task_id, str) and (
+                not isinstance(turn_id, str) or not isinstance(goal_id, str)
+            ):
+                task = await db.get(AnalysisTask, task_id)
+                if task is not None:
+                    trigger = await db.get(Message, task.trigger_message_id)
+                    candidate_turn = (
+                        (trigger.metadata_json or {}).get("turn_id")
+                        if trigger is not None
+                        else None
+                    )
+                    if isinstance(candidate_turn, str) and candidate_turn:
+                        turn_id = candidate_turn
+                    if not isinstance(goal_id, str):
+                        running_goal = await db.scalar(
+                            select(TaskGoal)
+                            .where(
+                                TaskGoal.task_id == task_id,
+                                TaskGoal.status == "running",
+                            )
+                            .order_by(TaskGoal.sequence)
+                            .limit(1)
+                        )
+                        if running_goal is not None:
+                            goal_id = running_goal.id
         payload = context.model_dump(mode="json")
         payload["exemplars"] = exemplars
         # 系统 prompt 按 goal_type 分派（GoalPolicy）；purpose 保持 agent_loop 共享案例池。
         policy = policy_for(context.goal_type)
-        result = await self._model.complete_json(
-            StructuredModelRequest(
-                purpose="agent_loop",
-                template_name=policy.prompt.name,
-                messages=(
-                    ChatMessage(role="system", content=policy.loop_system_prompt()),
-                    ChatMessage(
-                        role="user",
-                        content=json.dumps(
-                            payload,
-                            ensure_ascii=False,
-                            sort_keys=True,
-                            separators=(",", ":"),
+        model_log_context = {
+            **context.log_context,
+            "task_id": task_id,
+            "goal_id": goal_id if isinstance(goal_id, str) else None,
+            "turn_id": turn_id if isinstance(turn_id, str) else None,
+        }
+        context.log_context = model_log_context
+        thinking_service: SessionThinkingService | None = None
+        thinking_sink = None
+        if (
+            isinstance(turn_id, str)
+            and turn_id
+            and isinstance(user_id, str)
+            and isinstance(session_id, str)
+        ):
+            try:
+                thinking_service = get_session_thinking_service()
+                thinking_sink = thinking_service.create_sink(
+                    ThinkingOperationSpec(
+                        operation_id=str(uuid4()),
+                        turn_id=turn_id,
+                        session_id=session_id,
+                        user_id=user_id,
+                        purpose="agent_loop",
+                        label="正在分析数据",
+                        task_id=task_id if isinstance(task_id, str) else None,
+                        goal_id=goal_id if isinstance(goal_id, str) else None,
+                    )
+                )
+            except Exception:
+                logger.warning(
+                    "agent_thinking_sink_create_failed task_id=%s",
+                    task_id,
+                    exc_info=True,
+                )
+        try:
+            result = await self._model.complete_json(
+                StructuredModelRequest(
+                    purpose="agent_loop",
+                    template_name=policy.prompt.name,
+                    messages=(
+                        ChatMessage(role="system", content=policy.loop_system_prompt()),
+                        ChatMessage(
+                            role="user",
+                            content=json.dumps(
+                                payload,
+                                ensure_ascii=False,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ),
                         ),
                     ),
-                ),
-                output_model=AgentDecision,
-                max_tokens=4096,
-                log_context=context.log_context or None,
+                    output_model=AgentDecision,
+                    max_tokens=4096,
+                    log_context=model_log_context,
+                    thinking_sink=thinking_sink,
+                )
             )
-        )
+        finally:
+            if thinking_service is not None and isinstance(turn_id, str):
+                try:
+                    blocks = await thinking_service.completed_blocks(
+                        turn_id=turn_id,
+                        user_id=user_id,
+                        session_id=session_id,
+                    )
+                    if blocks:
+                        async with SessionFactory.begin() as db:
+                            store = ThinkingMessageStore(db)
+                            for block in blocks:
+                                await store.persist_block(
+                                    block,
+                                    user_id=user_id,
+                                    session_id=session_id,
+                                )
+                except Exception:
+                    logger.warning(
+                        "agent_thinking_persist_failed task_id=%s",
+                        task_id,
+                        exc_info=True,
+                    )
         return result.value
 
     async def execute_batch(self, commands):

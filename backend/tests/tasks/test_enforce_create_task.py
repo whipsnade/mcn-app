@@ -88,7 +88,8 @@ async def test_enforce_clarify_stores_message_without_task(
 ) -> None:
     _enable_enforce(monkeypatch)
 
-    async def fake_plan(self, context):
+    async def fake_plan(self, context, **kwargs):
+        assert kwargs["thinking_sink"] is not None
         return _clarify_output()
 
     monkeypatch.setattr(GoalPlannerService, "plan_context", fake_plan)
@@ -105,16 +106,22 @@ async def test_enforce_clarify_stores_message_without_task(
     assert body["message"]["role"] == "assistant"
     assert body["message"]["content"] == "想看哪个品牌的分析？"
     assert body["message"]["metadata"]["clarify"] == {"options": ["海底捞", "喜茶"]}
+    assert body["message"]["metadata"]["turn_id"]
     # 不落任务：analysis_tasks 为空，assistant 消息已持久化。
     task_count = await db_session.scalar(select(func.count()).select_from(AnalysisTask))
     assert task_count == 0
-    persisted = await db_session.scalar(
-        select(Message).where(
-            Message.session_id == session_id, Message.role == "assistant"
-        )
+    persisted = list(
+        (
+            await db_session.scalars(
+                select(Message)
+                .where(Message.session_id == session_id)
+                .order_by(Message.sequence)
+            )
+        ).all()
     )
-    assert persisted is not None
-    assert persisted.metadata_json["clarify"] == {"options": ["海底捞", "喜茶"]}
+    assert [message.role for message in persisted] == ["user", "assistant"]
+    assert persisted[0].metadata_json["turn_id"] == persisted[1].metadata_json["turn_id"]
+    assert persisted[1].metadata_json["clarify"] == {"options": ["海底捞", "喜茶"]}
 
 
 @pytest.mark.asyncio
@@ -123,7 +130,7 @@ async def test_enforce_execute_creates_typed_goal_with_params(
 ) -> None:
     _enable_enforce(monkeypatch)
 
-    async def fake_plan(self, context):
+    async def fake_plan(self, context, **_kwargs):
         return GoalPlannerOutput(
             action="execute",
             goals=[
@@ -169,7 +176,7 @@ async def test_enforce_multi_goal_persists_all_with_dependency(
 ) -> None:
     _enable_enforce(monkeypatch)
 
-    async def fake_plan(self, context):
+    async def fake_plan(self, context, **_kwargs):
         return GoalPlannerOutput(
             action="execute",
             goals=[
@@ -182,7 +189,7 @@ async def test_enforce_multi_goal_persists_all_with_dependency(
     # planner 输出依赖：kol_selection 依赖 sequence=1（GoalSpec.depends_on_sequence）。
     original_spec = _spec
 
-    async def fake_plan_with_dependency(self, context):
+    async def fake_plan_with_dependency(self, context, **_kwargs):
         first = original_spec(1, "campaign_analysis", brand="海底捞", campaign="618大促")
         second = original_spec(2, "kol_selection", brand="海底捞")
         return GoalPlannerOutput(
@@ -221,7 +228,7 @@ async def test_enforce_planner_failure_falls_back_to_kol_selection(
 ) -> None:
     _enable_enforce(monkeypatch)
 
-    async def failing_plan(self, context):
+    async def failing_plan(self, context, **_kwargs):
         raise RuntimeError("model unavailable")
 
     monkeypatch.setattr(GoalPlannerService, "plan_context", failing_plan)
@@ -245,7 +252,7 @@ async def test_enforce_disabled_keeps_legacy_path(
 ) -> None:
     called = False
 
-    async def forbidden_plan(self, context):
+    async def forbidden_plan(self, context, **_kwargs):
         nonlocal called
         called = True
         raise AssertionError("planner must not run when enforce is off")
@@ -273,7 +280,7 @@ async def test_enforce_idempotent_hit_skips_planner(
     _enable_enforce(monkeypatch)
     calls = 0
 
-    async def counting_plan(self, context):
+    async def counting_plan(self, context, **_kwargs):
         nonlocal calls
         calls += 1
         return GoalPlannerOutput(action="execute", goals=[_spec(1, "kol_selection")])

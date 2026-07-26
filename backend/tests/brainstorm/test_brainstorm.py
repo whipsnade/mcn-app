@@ -26,8 +26,15 @@ class FakeBrainstormModel:
     async def complete_json(self, request):
         self.requests.append(request)
         output = self._outputs.pop(0)
+        if request.thinking_sink is not None:
+            await request.thinking_sink.started(attempt=1)
+            await request.thinking_sink.delta("正在梳理用户需求", attempt=1)
         if isinstance(output, Exception):
+            if request.thinking_sink is not None:
+                await request.thinking_sink.failed(attempt=1, error_code=output.code)
             raise output
+        if request.thinking_sink is not None:
+            await request.thinking_sink.completed(attempt=1, duration_ms=12)
         return StructuredResult(
             value=output, usage=None, request_id="fake-brainstorm", regeneration_count=0
         )
@@ -99,6 +106,7 @@ async def test_first_round_incomplete_profile_asks_one_question_with_options(
     # 模型请求契约：purpose/模板/输入结构（消息历史 + 当前画像 + 关键字表清单）。
     request = model.requests[0]
     assert request.purpose == "brainstorm"
+    assert request.thinking_sink is not None
     assert request.template_name == "brainstorm_v1"
     assert request.max_tokens == 2048
     model_input = json.loads(request.messages[-1].content)
@@ -119,6 +127,8 @@ async def test_first_round_incomplete_profile_asks_one_question_with_options(
     restored = await client.get(f"/api/v1/sessions/{session_id}")
     messages = restored.json()["messages"]
     assert [item["role"] for item in messages] == ["user", "assistant"]
+    assert messages[0]["metadata"]["turn_id"] == messages[1]["metadata"]["turn_id"]
+    assert messages[1]["metadata"]["thinking"]["blocks"][0]["label"] == "正在理解需求"
     assert messages[1]["metadata"]["brainstorm"]["options"] == ["小红书", "抖音", "微博"]
     assert restored.json()["filters"]["brainstorm_profile"]["brand"] == "欧诗漫"
     # ready=false 时不得建任务、不得写回标量列。
@@ -315,10 +325,28 @@ async def test_brainstorm_without_token_returns_401(client, monkeypatch) -> None
 
 
 @pytest.mark.asyncio
-async def test_brainstorm_model_error_returns_friendly_502(auth_client_factory, monkeypatch) -> None:
+async def test_brainstorm_model_error_returns_friendly_502(
+    auth_client_factory, db_session, monkeypatch
+) -> None:
+    class _SessionCM:
+        async def __aenter__(self):
+            return db_session
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class _SessionFactory:
+        @staticmethod
+        def begin():
+            return _SessionCM()
+
+    monkeypatch.setattr("app.brainstorm.router.SessionFactory", _SessionFactory)
     client = await auth_client_factory("13900000007")
     created = await client.post("/api/v1/sessions", json={})
     session_id = created.json()["id"]
+    # 生产中会话来自前一请求且已提交；测试共享事务需显式结束当前 savepoint，
+    # 才能验证 brainstorm 本轮 rollback 后的独立失败落库。
+    await db_session.commit()
     model = FakeBrainstormModel([ModelAdapterError("MODEL_TIMEOUT", retryable=False)])
     _install_model(monkeypatch, model)
 
@@ -328,6 +356,12 @@ async def test_brainstorm_model_error_returns_friendly_502(auth_client_factory, 
 
     assert response.status_code == 502
     assert response.json()["detail"] == "BRAINSTORM_MODEL_ERROR"
+    restored = await client.get(f"/api/v1/sessions/{session_id}")
+    messages = restored.json()["messages"]
+    assert [message["role"] for message in messages] == ["user", "assistant"]
+    assert messages[0]["metadata"]["turn_id"] == messages[1]["metadata"]["turn_id"]
+    assert messages[1]["metadata"]["thinking"]["status"] == "interrupted"
+    assert messages[1]["metadata"]["thinking"]["blocks"][0]["label"] == "正在理解需求"
 
 
 def _patch_runtime(monkeypatch, db_session) -> None:

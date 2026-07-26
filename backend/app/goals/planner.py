@@ -5,7 +5,12 @@ import json
 from app.goals.context import GoalPlannerContext, GoalPlannerContextBuilder
 from app.goals.schemas import GoalPlannerOutput
 from app.goals.validation import GoalPlanSemanticError, validate_goal_plan
-from app.model.contracts import ChatMessage, ModelAdapter, StructuredModelRequest
+from app.model.contracts import (
+    ChatMessage,
+    ModelAdapter,
+    StructuredModelRequest,
+    ThinkingSink,
+)
 from app.model.prompts import GOAL_PLANNER_PROMPT
 
 
@@ -25,7 +30,12 @@ class GoalPlannerService:
         context = await self._context_builder.build(task_id)
         return await self.plan_context(context)
 
-    async def plan_context(self, context: GoalPlannerContext) -> GoalPlannerOutput:
+    async def plan_context(
+        self,
+        context: GoalPlannerContext,
+        *,
+        thinking_sink: ThinkingSink | None = None,
+    ) -> GoalPlannerOutput:
         payload = {
             "current_message": context.current_message,
             "recent_messages": [
@@ -70,6 +80,7 @@ class GoalPlannerService:
                     output_model=GoalPlannerOutput,
                     max_tokens=2048,
                     log_context=log_context,
+                    thinking_sink=thinking_sink,
                 )
             )
             try:

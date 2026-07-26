@@ -1,3 +1,4 @@
+import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
@@ -10,7 +11,11 @@ from app.goals.models import TaskGoal
 from app.tasks.models import AnalysisTask, TaskEvent
 from app.tasks.errors import SafeTaskError, safe_error
 from app.tasks.state import TERMINAL_TASK_STATUSES, TaskEventType, TaskStatus
+from app.thinking.persistence import ThinkingMessageStore
 from app.workspace.models import Message, WorkspaceSession
+
+
+logger = logging.getLogger(__name__)
 
 
 def utc_now() -> datetime:
@@ -413,6 +418,7 @@ class TaskRepository:
             select(Message).where(Message.error_idempotency_key == key)
         )
         if existing is not None:
+            await self._attach_error_thinking(task, existing)
             return existing
         sequence = (
             await self.db.scalar(
@@ -441,8 +447,38 @@ class TaskRepository:
             )
             if existing is None:
                 raise
+            await self._attach_error_thinking(task, existing)
             return existing
+        await self._attach_error_thinking(task, message)
         return message
+
+    async def _attach_error_thinking(
+        self,
+        task: AnalysisTask,
+        message: Message,
+    ) -> None:
+        """错误消息吸收 trigger turn；失败只记日志，不改变任务终态。"""
+        try:
+            trigger = await self.db.get(Message, task.trigger_message_id)
+            turn_id = (
+                (trigger.metadata_json or {}).get("turn_id")
+                if trigger is not None
+                else None
+            )
+            if not isinstance(turn_id, str) or not turn_id:
+                return
+            await ThinkingMessageStore(self.db).attach_turn_to_assistant(
+                message,
+                user_id=task.user_id,
+                session_id=task.session_id,
+                turn_id=turn_id,
+            )
+        except Exception:
+            logger.warning(
+                "task_error_thinking_attach_failed task_id=%s",
+                task.id,
+                exc_info=True,
+            )
 
     async def _mark_terminal(
         self, task_id: str, worker_id: str, status: TaskStatus, event: TaskEventType

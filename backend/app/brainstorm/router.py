@@ -1,3 +1,4 @@
+import logging
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -6,16 +7,22 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.brainstorm.schemas import BrainstormRequest, BrainstormResponse
 from app.brainstorm.service import BrainstormService
 from app.core.errors import ErrorCode
-from app.db.session import get_db
+from app.db.session import SessionFactory, get_db
 from app.identity.dependencies import CurrentUser
 from app.model.contracts import ModelAdapter, ModelAdapterError
 from app.model.dependencies import get_model_adapter
 from app.tasks.executor import TaskRunner
 from app.tasks.router import get_task_runner
 from app.tasks.service import TaskConflictError
+from app.thinking.persistence import record_brainstorm_failure
+from app.thinking.service import (
+    SessionThinkingService,
+    get_session_thinking_service,
+)
 
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 def brainstorm_model() -> ModelAdapter:
@@ -31,15 +38,42 @@ async def brainstorm(
     db: Annotated[AsyncSession, Depends(get_db)],
     task_runner: Annotated[TaskRunner, Depends(get_task_runner)],
     model: Annotated[ModelAdapter, Depends(brainstorm_model)],
+    thinking_service: Annotated[
+        SessionThinkingService, Depends(get_session_thinking_service)
+    ],
 ) -> BrainstormResponse:
-    service = BrainstormService(db, model)
+    user_id = user.id
+    service = BrainstormService(db, model, thinking_service)
     try:
-        outcome = await service.respond(user.id, session_id, payload)
+        outcome = await service.respond(user_id, session_id, payload)
     except LookupError as error:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="session_not_found"
         ) from error
     except ModelAdapterError as error:
+        try:
+            blocks = await thinking_service.completed_blocks(
+                turn_id=str(payload.turn_id),
+                user_id=user_id,
+                session_id=session_id,
+            )
+        except Exception:
+            logger.warning(
+                "brainstorm_failure_thinking_read_failed session_id=%s",
+                session_id,
+                exc_info=True,
+            )
+            blocks = ()
+        await db.rollback()
+        await record_brainstorm_failure(
+            SessionFactory,
+            user_id=user_id,
+            session_id=session_id,
+            turn_id=str(payload.turn_id),
+            user_content=payload.content,
+            blocks=blocks,
+            error_code=error.code,
+        )
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=ErrorCode.BRAINSTORM_MODEL_ERROR,

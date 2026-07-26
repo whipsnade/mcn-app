@@ -1,4 +1,5 @@
 import json
+import logging
 from datetime import UTC, datetime
 from uuid import uuid4
 
@@ -20,10 +21,16 @@ from app.orchestration.context import compress_messages
 from app.orchestration.schemas import PlannerMessage
 from app.tasks.schemas import TaskCreate
 from app.tasks.service import TaskService
+from app.thinking.contracts import ThinkingOperationSpec
+from app.thinking.persistence import ThinkingMessageStore
+from app.thinking.service import SessionThinkingService, get_session_thinking_service
 from app.workspace.models import Message
 from app.workspace.router import message_read
 from app.workspace.schemas import MessageCreate
 from app.workspace.service import WorkspaceService, is_default_session_title
+
+
+logger = logging.getLogger(__name__)
 
 
 def utc_now() -> datetime:
@@ -33,9 +40,15 @@ def utc_now() -> datetime:
 class BrainstormService:
     """澄清阶段的同步问答：请求线程内完成一次模型调用并落库问答消息。"""
 
-    def __init__(self, db: AsyncSession, model: ModelAdapter) -> None:
+    def __init__(
+        self,
+        db: AsyncSession,
+        model: ModelAdapter,
+        thinking_service: SessionThinkingService | None = None,
+    ) -> None:
         self.db = db
         self.model = model
+        self.thinking_service = thinking_service or get_session_thinking_service()
 
     async def respond(
         self, user_id: str, session_id: str, payload: BrainstormRequest
@@ -45,12 +58,35 @@ class BrainstormService:
         user_message = await workspace_service.append_message(
             user_id, session_id, MessageCreate(content=payload.content)
         )
+        turn_id = str(payload.turn_id)
+        user_message.metadata_json = {"turn_id": turn_id}
+        await self.db.flush()
+        try:
+            await self.thinking_service.bind_turn(
+                turn_id=turn_id,
+                user_id=user_id,
+                session_id=session_id,
+                task_id=None,
+                trigger_message_id=user_message.id,
+            )
+        except Exception:
+            logger.warning(
+                "brainstorm_thinking_bind_failed session_id=%s",
+                session_id,
+                exc_info=True,
+            )
         profile = BrainstormProfile.model_validate(
             (workspace.filters_snapshot or {}).get("brainstorm_profile") or {}
         )
         messages = await workspace_service.list_messages(user_id, session_id)
         recent_messages = compress_messages(messages, max_chars=24_000)
-        output = await self._complete(profile, recent_messages, user_id, session_id)
+        output = await self._complete(
+            profile,
+            recent_messages,
+            user_id,
+            session_id,
+            turn_id=turn_id,
+        )
 
         merged = merge_profile(profile, output.extracted)
         ready = bool(output.ready)
@@ -78,6 +114,25 @@ class BrainstormService:
                 trigger_message_id=user_message.id,
             )
             task_id = task.id
+            try:
+                await self.thinking_service.bind_turn(
+                    turn_id=turn_id,
+                    user_id=user_id,
+                    session_id=session_id,
+                    task_id=task.id,
+                    trigger_message_id=user_message.id,
+                )
+            except Exception:
+                logger.warning(
+                    "brainstorm_thinking_bind_failed task_id=%s",
+                    task.id,
+                    exc_info=True,
+                )
+        await self._persist_completed_blocks(
+            user_id=user_id,
+            session_id=session_id,
+            turn_id=turn_id,
+        )
         workspace.updated_at = utc_now()
         workspace.last_accessed_at = workspace.updated_at
 
@@ -107,6 +162,19 @@ class BrainstormService:
         )
         self.db.add(assistant_message)
         await self.db.flush()
+        try:
+            await ThinkingMessageStore(self.db).attach_turn_to_assistant(
+                assistant_message,
+                user_id=user_id,
+                session_id=session_id,
+                turn_id=turn_id,
+            )
+        except Exception:
+            logger.warning(
+                "brainstorm_thinking_attach_failed session_id=%s",
+                session_id,
+                exc_info=True,
+            )
         return BrainstormOutcome(
             ready=ready,
             task_id=task_id,
@@ -120,6 +188,8 @@ class BrainstormService:
         recent_messages: tuple[PlannerMessage, ...],
         user_id: str,
         session_id: str,
+        *,
+        turn_id: str,
     ) -> BrainstormModelOutput:
         tags = (
             [f"industry:{profile.category.strip()}"]
@@ -158,6 +228,54 @@ class BrainstormService:
                     "session_id": session_id,
                     "tags": tags,
                 },
+                thinking_sink=self._thinking_sink(
+                    ThinkingOperationSpec(
+                        operation_id=str(uuid4()),
+                        turn_id=turn_id,
+                        session_id=session_id,
+                        user_id=user_id,
+                        purpose="brainstorm",
+                        label="正在理解需求",
+                    ),
+                ),
             )
         )
         return result.value
+
+    def _thinking_sink(self, spec: ThinkingOperationSpec):
+        try:
+            return self.thinking_service.create_sink(spec)
+        except Exception:
+            logger.warning(
+                "brainstorm_thinking_sink_create_failed session_id=%s",
+                spec.session_id,
+                exc_info=True,
+            )
+            return None
+
+    async def _persist_completed_blocks(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        turn_id: str,
+    ) -> None:
+        try:
+            blocks = await self.thinking_service.completed_blocks(
+                turn_id=turn_id,
+                user_id=user_id,
+                session_id=session_id,
+            )
+            store = ThinkingMessageStore(self.db)
+            for block in blocks:
+                await store.persist_block(
+                    block,
+                    user_id=user_id,
+                    session_id=session_id,
+                )
+        except Exception:
+            logger.warning(
+                "brainstorm_thinking_persist_failed session_id=%s",
+                session_id,
+                exc_info=True,
+            )

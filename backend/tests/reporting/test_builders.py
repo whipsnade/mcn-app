@@ -153,9 +153,16 @@ async def test_run_brand_analysis_persists_report_with_scope(db_session, user_fa
             "campaign": None,
         }
     )
+    thinking_sink = object()
 
     report = await run_brand_analysis(
-        db_session, model, user_id=user_id, session_id=session_id, task=task, goal=goal
+        db_session,
+        model,
+        user_id=user_id,
+        session_id=session_id,
+        task=task,
+        goal=goal,
+        thinking_sink=thinking_sink,
     )
 
     assert report.report_type == "brand_analysis"
@@ -169,6 +176,7 @@ async def test_run_brand_analysis_persists_report_with_scope(db_session, user_fa
     assert report.title == "品牌声量分析"
     [request] = model.requests
     assert request.purpose == "brand_analysis"
+    assert request.thinking_sink is thinking_sink
     assert request.template_name == "brand_analysis_v1"
     assert request.max_tokens == 8192
     assert request.log_context["tags"] == ["brand_analysis"]
@@ -182,12 +190,19 @@ async def test_run_campaign_analysis_versions_independently(db_session, user_fac
     task = _task(_plan_json(_note("tool.a", {"volume": 100})))
     brand_goal = _goal({"brand": "海底捞"})
     campaign_goal = _goal({"brand": "海底捞", "campaign": "618大促"})
+    campaign_sink = object()
 
     brand_v1 = await run_brand_analysis(
         db_session, model, user_id=user_id, session_id=session_id, task=task, goal=brand_goal
     )
     campaign_v1 = await run_campaign_analysis(
-        db_session, model, user_id=user_id, session_id=session_id, task=task, goal=campaign_goal
+        db_session,
+        model,
+        user_id=user_id,
+        session_id=session_id,
+        task=task,
+        goal=campaign_goal,
+        thinking_sink=campaign_sink,
     )
     brand_v2 = await run_brand_analysis(
         db_session, model, user_id=user_id, session_id=session_id, task=task, goal=brand_goal
@@ -198,6 +213,7 @@ async def test_run_campaign_analysis_versions_independently(db_session, user_fac
     assert campaign_v1.report_type == "campaign_analysis"
     assert campaign_v1.scope_json == {"brand": "海底捞", "campaign": "618大促"}
     assert model.requests[1].purpose == "campaign_analysis"
+    assert model.requests[1].thinking_sink is campaign_sink
     assert model.requests[1].template_name == "campaign_analysis_v1"
     assert model.requests[1].log_context["tags"] == ["campaign_analysis"]
 

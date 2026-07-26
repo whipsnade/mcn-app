@@ -87,12 +87,14 @@ async def test_plan_task_builds_logged_structured_request() -> None:
     output = _valid_output()
     model = FakeModel([output])
     service = GoalPlannerService(model=model, context_builder=None)
+    thinking_sink = object()
 
-    result = await service.plan_context(_context())
+    result = await service.plan_context(_context(), thinking_sink=thinking_sink)
 
     assert result == output
     request = model.requests[0]
     assert request.purpose == "goal_planner"
+    assert request.thinking_sink is thinking_sink
     assert request.template_name == "goal_planner_v1"
     assert request.output_model is GoalPlannerOutput
     assert request.max_tokens == 2048

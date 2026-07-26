@@ -31,6 +31,12 @@ from app.tasks.schemas import (
 )
 from app.tasks.service import TaskConflictError, TaskService
 from app.tasks.executor import TaskRunner
+from app.thinking.contracts import ThinkingOperationSpec
+from app.thinking.persistence import ThinkingMessageStore
+from app.thinking.service import (
+    SessionThinkingService,
+    get_session_thinking_service,
+)
 from app.workspace.models import Message
 from app.workspace.serializers import message_read
 
@@ -142,19 +148,46 @@ def task_not_found(error: LookupError) -> HTTPException:
 
 
 async def _plan_goal_or_fallback(
-    db: AsyncSession, user_id: str, session_id: str, content: str
+    db: AsyncSession,
+    user_id: str,
+    session_id: str,
+    content: str,
+    *,
+    turn_id: str,
+    thinking_service: SessionThinkingService,
 ) -> GoalPlannerOutput | None:
     """enforce 规划；任何失败回退 None（kol_selection 单 Goal），不阻塞用户。
 
     ``LookupError("session_not_found")`` 是会话归属问题，原样上抛映射 404。
     """
+    thinking_sink = None
+    try:
+        thinking_sink = thinking_service.create_sink(
+            ThinkingOperationSpec(
+                operation_id=str(uuid4()),
+                turn_id=turn_id,
+                session_id=session_id,
+                user_id=user_id,
+                purpose="goal_planner",
+                label="正在规划分析目标",
+            )
+        )
+    except Exception:
+        logger.warning(
+            "goal_planner_thinking_sink_create_failed session_id=%s",
+            session_id,
+            exc_info=True,
+        )
     try:
         context = await GoalPlannerContextBuilder().build_for_message(
             user_id, session_id, content, db=db
         )
         return await GoalPlannerService(
             model=get_model_adapter(), context_builder=None
-        ).plan_context(context)
+        ).plan_context(
+            context,
+            thinking_sink=thinking_sink,
+        )
     except LookupError:
         raise
     except Exception:
@@ -165,11 +198,28 @@ async def _plan_goal_or_fallback(
 
 
 async def _append_clarify_message(
-    db: AsyncSession, user_id: str, session_id: str, question
-) -> Message:
-    """planner clarify：落一条 assistant 澄清消息（options 存 metadata.clarify）。"""
+    db: AsyncSession,
+    user_id: str,
+    session_id: str,
+    *,
+    content: str,
+    turn_id: str,
+    question,
+) -> tuple[Message, Message]:
+    """planner clarify：落同 turn 的 user + assistant 澄清消息。"""
     max_sequence = await db.scalar(
         select(func.max(Message.sequence)).where(Message.session_id == session_id)
+    )
+    now = datetime.now(UTC).replace(tzinfo=None)
+    user_message = Message(
+        id=str(uuid4()),
+        session_id=session_id,
+        user_id=user_id,
+        role="user",
+        content=content,
+        sequence=(max_sequence or 0) + 1,
+        metadata_json={"turn_id": turn_id},
+        created_at=now,
     )
     message = Message(
         id=str(uuid4()),
@@ -177,13 +227,46 @@ async def _append_clarify_message(
         user_id=user_id,
         role="assistant",
         content=question.text,
-        sequence=(max_sequence or 0) + 1,
-        metadata_json={"clarify": {"options": list(question.options)}},
-        created_at=datetime.now(UTC).replace(tzinfo=None),
+        sequence=(max_sequence or 0) + 2,
+        metadata_json={
+            "turn_id": turn_id,
+            "clarify": {"options": list(question.options)},
+        },
+        created_at=now,
     )
-    db.add(message)
+    db.add_all([user_message, message])
     await db.flush()
-    return message
+    return user_message, message
+
+
+async def _persist_turn_blocks(
+    db: AsyncSession,
+    thinking_service: SessionThinkingService,
+    *,
+    user_id: str,
+    session_id: str,
+    turn_id: str,
+) -> None:
+    """思考持久化尽力而为，不得改变任务创建结果。"""
+    try:
+        blocks = await thinking_service.completed_blocks(
+            turn_id=turn_id,
+            user_id=user_id,
+            session_id=session_id,
+        )
+        store = ThinkingMessageStore(db)
+        for block in blocks:
+            await store.persist_block(
+                block,
+                user_id=user_id,
+                session_id=session_id,
+            )
+    except Exception:
+        logger.warning(
+            "task_turn_thinking_persist_failed session_id=%s",
+            session_id,
+            exc_info=True,
+        )
 
 
 @router.post("/sessions/{session_id}/tasks", response_model=TaskCreateResult, status_code=202)
@@ -194,11 +277,14 @@ async def create_task(
     db: Annotated[AsyncSession, Depends(get_db, scope="function")],
     task_runner: Annotated[TaskRunner, Depends(get_task_runner)],
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+    thinking_service: SessionThinkingService = Depends(get_session_thinking_service),
 ) -> TaskCreateResult:
     service = TaskService(db)
     goal_type = "kol_selection"
     goal_params: dict | None = None
     goal_specs: list[dict] | None = None
+    planner_attempted = False
+    turn_id = str(payload.turn_id)
     if get_settings().goal_planner_enforce_enabled:
         # 带幂等键先查命中：命中不再调 planner（避免重复扣调用），
         # 仍走 create_idempotent 保留 payload 一致性校验。
@@ -207,16 +293,54 @@ async def create_task(
             existing = await service.find_idempotent(user.id, session_id, idempotency_key)
             plan_needed = existing is None
         if plan_needed:
+            planner_attempted = True
             try:
                 planner_output = await _plan_goal_or_fallback(
-                    db, user.id, session_id, payload.content
+                    db,
+                    user.id,
+                    session_id,
+                    payload.content,
+                    turn_id=turn_id,
+                    thinking_service=thinking_service,
                 )
             except LookupError as error:
                 raise task_not_found(error) from error
             if planner_output is not None and planner_output.action == "clarify":
-                message = await _append_clarify_message(
-                    db, user.id, session_id, planner_output.question
+                user_message, message = await _append_clarify_message(
+                    db,
+                    user.id,
+                    session_id,
+                    content=payload.content,
+                    turn_id=turn_id,
+                    question=planner_output.question,
                 )
+                try:
+                    await thinking_service.bind_turn(
+                        turn_id=turn_id,
+                        user_id=user.id,
+                        session_id=session_id,
+                        task_id=None,
+                        trigger_message_id=user_message.id,
+                    )
+                    await _persist_turn_blocks(
+                        db,
+                        thinking_service,
+                        user_id=user.id,
+                        session_id=session_id,
+                        turn_id=turn_id,
+                    )
+                    await ThinkingMessageStore(db).attach_turn_to_assistant(
+                        message,
+                        user_id=user.id,
+                        session_id=session_id,
+                        turn_id=turn_id,
+                    )
+                except Exception:
+                    logger.warning(
+                        "goal_planner_clarify_thinking_attach_failed session_id=%s",
+                        session_id,
+                        exc_info=True,
+                    )
                 await db.commit()
                 return TaskOutcomeClarify(message=message_read(message))
             if planner_output is not None:
@@ -270,6 +394,28 @@ async def create_task(
         raise HTTPException(status_code=422, detail="invalid_idempotency_key") from error
     except LookupError as error:
         raise task_not_found(error) from error
+    if planner_attempted:
+        try:
+            await thinking_service.bind_turn(
+                turn_id=turn_id,
+                user_id=user.id,
+                session_id=session_id,
+                task_id=task.id,
+                trigger_message_id=task.trigger_message_id,
+            )
+            await _persist_turn_blocks(
+                db,
+                thinking_service,
+                user_id=user.id,
+                session_id=session_id,
+                turn_id=turn_id,
+            )
+        except Exception:
+            logger.warning(
+                "goal_planner_task_thinking_bind_failed task_id=%s",
+                task.id,
+                exc_info=True,
+            )
     await db.commit()
     if not reused:
         task_runner.submit(task.id)
