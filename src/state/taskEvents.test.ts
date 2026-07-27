@@ -321,4 +321,73 @@ describe('task flow nodes', () => {
     // report.updated 逻辑不受 artifact.updated 影响。
     expect(state.visibleAnalysisReportId).toBeUndefined();
   });
+
+  it('stores the upstream error detail on the running tool node when tool.failed carries it', () => {
+    let state = initialTaskRuntime('task-1');
+    state = reduceTaskEvent(state, { id: 1, taskId: 'task-1', type: 'tool.started', payload: { platform: '小红书', step_index: 1 } });
+    state = reduceTaskEvent(state, {
+      id: 2,
+      taskId: 'task-1',
+      type: 'tool.failed',
+      payload: {
+        platform: '小红书',
+        step_index: 1,
+        message: '社媒数据服务返回错误，请稍后重试。',
+        upstream_message: 'HTTP 502 Bad Gateway: datatap gateway timeout',
+      },
+    });
+
+    const node = state.nodes?.find(item => item.id === 'tool-1');
+    expect(node?.status).toBe('failed');
+    expect(node?.detail).toBe('社媒数据服务返回错误，请稍后重试。');
+    expect(node?.upstreamDetail).toBe('HTTP 502 Bad Gateway: datatap gateway timeout');
+  });
+
+  it('stores the upstream error detail on a late-pushed node when no running node matches', () => {
+    const state = reduceTaskEvent(initialTaskRuntime('task-1'), {
+      id: 1,
+      taskId: 'task-1',
+      type: 'tool.failed',
+      payload: {
+        platform: '抖音',
+        step_index: 3,
+        message: '响应未确认',
+        upstream_message: 'MCP tool call timeout after 30s',
+      },
+    });
+
+    const node = state.nodes?.find(item => item.id.startsWith('tool-3-late-'));
+    expect(node?.status).toBe('failed');
+    expect(node?.upstreamDetail).toBe('MCP tool call timeout after 30s');
+  });
+
+  it('leaves upstream detail empty when tool.failed has no upstream_message', () => {
+    let state = initialTaskRuntime('task-1');
+    state = reduceTaskEvent(state, { id: 1, taskId: 'task-1', type: 'tool.started', payload: { platform: '小红书', step_index: 1 } });
+    state = reduceTaskEvent(state, {
+      id: 2,
+      taskId: 'task-1',
+      type: 'tool.failed',
+      payload: { platform: '小红书', step_index: 1, message: '社媒数据服务返回错误，请稍后重试。' },
+    });
+
+    const node = state.nodes?.find(item => item.id === 'tool-1');
+    expect(node?.detail).toBe('社媒数据服务返回错误，请稍后重试。');
+    expect(node?.upstreamDetail).toBeUndefined();
+  });
+
+  it('never stores upstream detail on a succeeded node', () => {
+    let state = initialTaskRuntime('task-1');
+    state = reduceTaskEvent(state, { id: 1, taskId: 'task-1', type: 'tool.started', payload: { platform: '小红书', step_index: 1 } });
+    state = reduceTaskEvent(state, {
+      id: 2,
+      taskId: 'task-1',
+      type: 'tool.succeeded',
+      payload: { platform: '小红书', step_index: 1, upstream_message: 'should-not-appear' },
+    });
+
+    const node = state.nodes?.find(item => item.id === 'tool-1');
+    expect(node?.status).toBe('succeeded');
+    expect(node?.upstreamDetail).toBeUndefined();
+  });
 });
