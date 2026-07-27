@@ -44,7 +44,8 @@ ready 分支（`service.py:100-131`）改为：
      （purpose=goal_planner、label=正在规划分析目标、同 turn_id），创建失败静默禁用；
    - 输出 execute 且 goals 非空 → 按 sequence 排序转 `goal_specs=[{goal_type, sequence,
      depends_on_sequence, params}]`（与 tasks/router enforce 同构），返回 goal_specs；
-   - 输出 clarify、goals 为空、或任何异常（除 LookupError 上抛 404）→ 记 warning
+   - 输出 clarify、**输出 respond（brainstorm 场景下答疑由澄清消息承担，不复制 router
+     的 respond 分支）**、goals 为空、或任何异常（除 LookupError 上抛 404）→ 记 warning
      返回 None（回退）。
 3. **建任务**：`TaskService.create(..., goal_specs=goal_specs)`；goal_specs 为 None 时
    与现状完全一致（默认 kol_selection 单 goal）。
@@ -68,6 +69,7 @@ ready 分支（`service.py:100-131`）改为：
 - ready + planner execute 多 goal（brand_analysis → kol_selection 依赖）→ 多 goal 落库
   且依赖正确。
 - ready + planner 输出 clarify → 回退 kol_selection 单 goal，brainstorm 200。
+- ready + planner 输出 respond → 同样回退 kol_selection 单 goal，brainstorm 200。
 - ready + planner 抛异常 → 回退 kol_selection，brainstorm 200。
 - enforce 关闭 → planner 未被调用，默认 kol_selection。
 - 既有 brainstorm 测试全绿。
