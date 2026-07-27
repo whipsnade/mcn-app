@@ -16,6 +16,7 @@ from app.core.config import get_settings
 from app.db.session import SessionFactory, get_db
 from app.goals.context import GoalPlannerContextBuilder
 from app.goals.planner import GoalPlannerService
+from app.goals.respond import OUT_OF_SCOPE_TEXT, USAGE_GUIDE_TEXT, answer_context_qa
 from app.goals.schemas import GoalPlannerOutput
 from app.identity.dependencies import FunctionScopedCurrentUser
 from app.model.dependencies import get_model_adapter
@@ -26,6 +27,7 @@ from app.tasks.schemas import (
     TaskCreate,
     TaskCreateResult,
     TaskOutcomeClarify,
+    TaskOutcomeRespond,
     TaskOutcomeTask,
     TaskRead,
 )
@@ -239,6 +241,46 @@ async def _append_clarify_message(
     return user_message, message
 
 
+async def _append_respond_message(
+    db: AsyncSession,
+    user_id: str,
+    session_id: str,
+    *,
+    content: str,
+    turn_id: str,
+    respond_type: str,
+    reply: str,
+) -> tuple[Message, Message]:
+    """planner respond：落同 turn 的 user + assistant 回复消息。"""
+    max_sequence = await db.scalar(
+        select(func.max(Message.sequence)).where(Message.session_id == session_id)
+    )
+    now = datetime.now(UTC).replace(tzinfo=None)
+    user_message = Message(
+        id=str(uuid4()),
+        session_id=session_id,
+        user_id=user_id,
+        role="user",
+        content=content,
+        sequence=(max_sequence or 0) + 1,
+        metadata_json={"turn_id": turn_id},
+        created_at=now,
+    )
+    message = Message(
+        id=str(uuid4()),
+        session_id=session_id,
+        user_id=user_id,
+        role="assistant",
+        content=reply,
+        sequence=(max_sequence or 0) + 2,
+        metadata_json={"turn_id": turn_id, "respond": {"type": respond_type}},
+        created_at=now,
+    )
+    db.add_all([user_message, message])
+    await db.flush()
+    return user_message, message
+
+
 async def _persist_turn_blocks(
     db: AsyncSession,
     thinking_service: SessionThinkingService,
@@ -353,6 +395,60 @@ async def create_task(
                     )
                 await db.commit()
                 return TaskOutcomeClarify(message=message_read(message))
+            if planner_output is not None and planner_output.action == "respond":
+                respond_type = planner_output.respond_type
+                if respond_type == "usage_help":
+                    reply = USAGE_GUIDE_TEXT
+                elif respond_type == "out_of_scope":
+                    reply = OUT_OF_SCOPE_TEXT
+                else:
+                    reply = await answer_context_qa(
+                        db,
+                        get_model_adapter(),
+                        user_id=user.id,
+                        session_id=session_id,
+                        question=payload.content,
+                    )
+                user_message, message = await _append_respond_message(
+                    db,
+                    user.id,
+                    session_id,
+                    content=payload.content,
+                    turn_id=turn_id,
+                    respond_type=respond_type,
+                    reply=reply,
+                )
+                try:
+                    await thinking_service.bind_turn(
+                        turn_id=turn_id,
+                        user_id=user.id,
+                        session_id=session_id,
+                        task_id=None,
+                        trigger_message_id=user_message.id,
+                    )
+                    await _persist_turn_blocks(
+                        db,
+                        thinking_service,
+                        user_id=user.id,
+                        session_id=session_id,
+                        turn_id=turn_id,
+                    )
+                    await ThinkingMessageStore(db).attach_turn_to_assistant(
+                        message,
+                        user_id=user.id,
+                        session_id=session_id,
+                        turn_id=turn_id,
+                    )
+                except Exception:
+                    logger.warning(
+                        "goal_planner_respond_thinking_attach_failed session_id=%s",
+                        session_id,
+                        exc_info=True,
+                    )
+                await db.commit()
+                return TaskOutcomeRespond(
+                    respond_type=respond_type, message=message_read(message)
+                )
             if planner_output is not None:
                 # 阶段四顺序编排：planner 输出的 1-3 个 goal 全部落库。
                 goal_specs = [

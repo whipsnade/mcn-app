@@ -57,4 +57,12 @@ class TaskOutcomeClarify(BaseModel):
     message: MessageRead
 
 
-TaskCreateResult = TaskOutcomeTask | TaskOutcomeClarify
+class TaskOutcomeRespond(BaseModel):
+    """create_task planner 对话式回复：不落任务，返回落库的 assistant 回复消息。"""
+
+    outcome: Literal["respond"] = "respond"
+    respond_type: Literal["context_qa", "usage_help", "out_of_scope"]
+    message: MessageRead
+
+
+TaskCreateResult = TaskOutcomeTask | TaskOutcomeClarify | TaskOutcomeRespond
