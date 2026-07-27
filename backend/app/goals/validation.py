@@ -110,6 +110,10 @@ def validate_goal_plan(
     session_brand: str | None = None,
     account_default_brand: str | None = None,
 ) -> None:
+    # respond 是对话式回复：不参与 goal 序列/依赖/证据/品牌解析校验，
+    # 否则会被 execute 校验误判并回退误建 kol_selection 任务。
+    if output.action == "respond":
+        return
     if output.action == "clarify":
         _validate_brand_resolution(
             output,
