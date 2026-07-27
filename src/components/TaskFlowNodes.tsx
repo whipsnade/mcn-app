@@ -50,9 +50,14 @@ type FlowItem =
 function mergeThinkingIntoFlow(nodes: TaskFlowNode[], blocks: ThinkingBlock[]): FlowItem[] {
   if (blocks.length === 0) return nodes.map(node => ({ kind: 'flow', node }));
 
-  const planning = blocks.filter(block => PLANNING_PURPOSES.has(block.purpose));
-  const agentLoop = blocks.filter(block => block.purpose === 'agent_loop');
-  const tail = blocks.filter(
+  // 与 ThinkingPanel 一致：空内容的终态块不展示；running 块保留（显示「思考中」）。
+  const visible = blocks.filter(
+    block => block.status === 'running' || block.content.trim().length > 0,
+  );
+
+  const planning = visible.filter(block => PLANNING_PURPOSES.has(block.purpose));
+  const agentLoop = visible.filter(block => block.purpose === 'agent_loop');
+  const tail = visible.filter(
     block => !PLANNING_PURPOSES.has(block.purpose) && block.purpose !== 'agent_loop',
   );
 

@@ -212,4 +212,27 @@ describe('TaskFlowNodes 思考节点合并', () => {
     expect(screen.getByRole('button', { name: /决策一/ })).toHaveAttribute('aria-expanded', 'true');
     expect(screen.getByText('新内容')).toBeVisible();
   });
+
+  it('skips completed/interrupted blocks with empty content but keeps running ones', () => {
+    render(
+      <TaskFlowNodes
+        nodes={flowNodesFixture}
+        thinkingBlocks={[
+          makeThinkingBlock('agent_loop', '空完成块', { content: '   ', status: 'completed' }),
+          makeThinkingBlock('agent_loop', '空中断块', { content: '', status: 'interrupted' }),
+          makeThinkingBlock('agent_loop', '空运行块', {
+            content: '',
+            status: 'running',
+            durationMs: undefined,
+          }),
+        ]}
+      />,
+    );
+
+    // 与 ThinkingPanel 一致：空内容的终态块不渲染；running 块保留显示「思考中」。
+    expect(screen.queryByRole('button', { name: /空完成块/ })).toBeNull();
+    expect(screen.queryByRole('button', { name: /空中断块/ })).toBeNull();
+    expect(screen.getByRole('button', { name: /空运行块/ })).toBeInTheDocument();
+    expect(screen.getByText('思考中')).toBeInTheDocument();
+  });
 });
