@@ -231,7 +231,19 @@ export interface ApiTaskCreateClarifyOutcome {
   message: ApiMessage;
 }
 
-export type TaskCreateResult = ApiTaskCreateTaskOutcome | ApiTaskCreateClarifyOutcome;
+/** create_task planner 对话式回复：不落任务，返回 assistant 回复消息。 */
+export type ApiRespondType = 'context_qa' | 'usage_help' | 'out_of_scope';
+
+export interface ApiTaskCreateRespondOutcome {
+  outcome: 'respond';
+  respond_type: ApiRespondType;
+  message: ApiMessage;
+}
+
+export type TaskCreateResult =
+  | ApiTaskCreateTaskOutcome
+  | ApiTaskCreateClarifyOutcome
+  | ApiTaskCreateRespondOutcome;
 
 export interface ApiTaskSummary {
   id: string;

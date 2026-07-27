@@ -771,6 +771,42 @@ describe('useWorkspace', () => {
     expect(active?.messages.at(-1)?.clarify?.options).toEqual(['海底捞', '喜茶']);
   });
 
+  it('renders planner respond outcome as an assistant message without creating a task', async () => {
+    vi.mocked(createTask).mockResolvedValue({
+      outcome: 'respond',
+      respond_type: 'usage_help',
+      message: {
+        id: 'message-respond-1',
+        role: 'assistant',
+        content: '我可以帮你圈选达人、分析品牌或活动。',
+        sequence: 3,
+        metadata: { respond: { type: 'usage_help' } },
+        created_at: '2026-07-27T10:00:00Z',
+      },
+    });
+    const { result } = renderHook(() => useWorkspace('user-a'));
+    await waitFor(() => expect(result.current.activeSession?.id).toBe('session-1'));
+
+    await act(async () => {
+      await result.current.appendMessage('你能做什么？');
+    });
+
+    expect(createTask).toHaveBeenCalledWith(
+      'session-1',
+      { content: '你能做什么？', turn_id: 'turn-1' },
+    );
+    const active = result.current.activeSession;
+    // 不落任务：状态与 analysis 不变，不进入 analyzing，也不设置 activeTaskId。
+    expect(active?.status).toBe('draft');
+    expect(active?.analysis).toBeUndefined();
+    expect(result.current.activeTaskId).toBeUndefined();
+    const texts = active?.messages.map(message => [message.sender, message.text]);
+    expect(texts?.at(-2)).toEqual(['user', '你能做什么？']);
+    expect(texts?.at(-1)).toEqual(['ai', '我可以帮你圈选达人、分析品牌或活动。']);
+    expect(active?.messages.filter(message => message.text === '你能做什么？')).toHaveLength(1);
+    expect(active?.messages.at(-2)?.turnId).toBe('turn-1');
+  });
+
   it('creates a pending analysis task and merges the user message immediately', async () => {
     vi.mocked(createTask).mockResolvedValue(taskOutcome({
       id: 'task-1',

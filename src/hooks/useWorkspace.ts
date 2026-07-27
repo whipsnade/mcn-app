@@ -373,9 +373,9 @@ export function useWorkspace(userId?: string) {
       const result = await createTask(requestedSessionId, { content, turn_id: turnId });
       if (generationRef.current !== generation) throw new Error('STALE_WORKSPACE_REQUEST');
       if (!sessionOperationIsCurrent(requestedSessionId, operationEpoch)) return result;
-      if (result.outcome === 'clarify') {
-        // planner 澄清：不落任务；保留乐观用户提问并追加 assistant 澄清消息
-        //（metadata.clarify.options 由 ChatArea 渲染为可点 chips，复用 brainstorm 机制）。
+      if (result.outcome === 'clarify' || result.outcome === 'respond') {
+        // planner 澄清/对话式回复：不落任务；保留乐观用户提问并追加 assistant 消息
+        //（metadata.clarify.options 由 ChatArea 渲染为可点 chips；respond 为普通回复气泡）。
         const assistantMessage = toMessage(result.message);
         setSessions(current => current.map(session => session.id === requestedSessionId ? {
           ...session,
