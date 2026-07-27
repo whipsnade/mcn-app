@@ -119,6 +119,31 @@ class TaskRepository:
             task.status = TaskStatus.CANCELLED
             task.completed_at = now
             task.updated_at = now
+            # 级联转变非终态 goals：取消路径绕过 executor，goal 不得停留 running/pending。
+            non_terminal_goals = list(
+                (
+                    await self.db.scalars(
+                        select(TaskGoal).where(
+                            TaskGoal.task_id == task.id,
+                            TaskGoal.status.in_(("pending", "running")),
+                        )
+                    )
+                ).all()
+            )
+            for goal in non_terminal_goals:
+                goal.status = "skipped"
+                goal.completed_at = now
+                goal.updated_at = now
+                await self.append_event(
+                    task.id,
+                    task.user_id,
+                    TaskEventType.GOAL_FAILED,
+                    {
+                        "goal_id": goal.id,
+                        "goal_type": goal.goal_type,
+                        "status": "skipped",
+                    },
+                )
             await self.append_event(task.id, task.user_id, TaskEventType.TASK_CANCELLED, {})
             await self.db.flush()
             return None
@@ -394,6 +419,33 @@ class TaskRepository:
         task.error_message = failure.message
         task.completed_at = utc_now()
         task.updated_at = task.completed_at
+        # 级联转变非终态 goals：恢复路径绕过 executor，goal 不得停留 running/pending。
+        non_terminal_goals = list(
+            (
+                await self.db.scalars(
+                    select(TaskGoal).where(
+                        TaskGoal.task_id == task.id,
+                        TaskGoal.status.in_(("pending", "running")),
+                    )
+                )
+            ).all()
+        )
+        for goal in non_terminal_goals:
+            goal.status = "failed"
+            goal.error_code = failure.code
+            goal.completed_at = task.completed_at
+            goal.updated_at = task.completed_at
+            await self.append_event(
+                task.id,
+                task.user_id,
+                TaskEventType.GOAL_FAILED,
+                {
+                    "goal_id": goal.id,
+                    "goal_type": goal.goal_type,
+                    "status": "failed",
+                    "error_code": failure.code,
+                },
+            )
         error_message = await self._append_error_message(task, failure)
         await self.append_event(
             task.id,
