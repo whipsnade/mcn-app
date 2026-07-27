@@ -82,7 +82,35 @@ def test_sanitize_thinking_truncates_at_exact_limit() -> None:
 
     assert len(result.text) <= 12_000
     assert result.truncated is True
-    assert result.text.endswith("思考内容过长，已截断")
+    assert result.text.startswith("…（早期内容已折叠）")
+
+
+def test_sanitize_thinking_keeps_tail_and_marks_folded_prefix() -> None:
+    source = f"早期推理{'分析' * 7000}最新结论"
+
+    result = sanitize(source)
+
+    assert result.truncated is True
+    assert result.text.startswith("…（早期内容已折叠）")
+    assert len(result.text) == 12_000
+    assert result.text.endswith("最新结论")
+    assert "早期推理" not in result.text
+
+
+def test_sanitize_thinking_truncates_marker_when_limit_below_marker_length() -> None:
+    result = sanitize("分析" * 100, max_chars=5)
+
+    assert result.truncated is True
+    assert result.text == "…（早期内容已折叠）"[:5]
+
+
+def test_sanitize_thinking_within_limit_keeps_text_unchanged() -> None:
+    source = "分析品牌表现"
+
+    result = sanitize(source)
+
+    assert result.text == source
+    assert result.truncated is False
 
 
 def test_sanitize_thinking_hides_unheaded_json_schema_blob() -> None:

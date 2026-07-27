@@ -23,7 +23,9 @@ logger = logging.getLogger(__name__)
 
 _BLOCK_MAX_CHARS = 12_000
 _TURN_MAX_CHARS = 30_000
-_TRUNCATED_SUFFIX = "思考内容过长，已截断"
+_FOLDED_PLACEHOLDER = "「早期思考已折叠」"
+# 块已截断（滑动窗口）后，距上次发布的 raw 增长达到该阈值才发布新 snapshot，控制带宽。
+_TRUNCATED_SNAPSHOT_MIN_RAW_GROWTH = 1_000
 # 每会话保留的近期终态事件条数：断线重连后回放，避免前端永久停留在「思考中」。
 _RECENT_TERMINAL_LIMIT = 200
 # 进程内最多保留的 turn 状态数（完成块、绑定、持久化游标）；超限按最旧淘汰。
@@ -41,6 +43,7 @@ class _RunningOperation:
     raw_text: str = ""
     public_text: str = ""
     truncated: bool = False
+    last_published_raw_len: int = 0
 
 
 @dataclass(frozen=True)
@@ -260,13 +263,25 @@ class SessionThinkingService:
             state.truncated = sanitized.truncated
             if state.public_text == previous:
                 return
+            if state.truncated:
+                # 滑动窗口下内容不再前缀递增，只能整段替换；raw 增长不足阈值时
+                # 仅更新状态不发布事件（节流），客户端看到略旧内容属有意取舍。
+                if (
+                    len(state.raw_text) - state.last_published_raw_len
+                    < _TRUNCATED_SNAPSHOT_MIN_RAW_GROWTH
+                ):
+                    return
+                event_type: ThinkingEventType = "thinking.snapshot"
+            elif state.public_text.startswith(previous):
+                event_type = "thinking.delta"
+            else:
+                event_type = "thinking.snapshot"
             state.sequence += 1
-            if state.public_text.startswith(previous):
-                event_type: ThinkingEventType = "thinking.delta"
+            state.last_published_raw_len = len(state.raw_text)
+            if event_type == "thinking.delta":
                 public_delta = state.public_text[len(previous) :]
                 payload = self._payload(state, text=public_delta)
             else:
-                event_type = "thinking.snapshot"
                 payload = self._payload(state, text=state.public_text)
             self._publish_locked(
                 state.spec.session_id,
@@ -290,9 +305,12 @@ class SessionThinkingService:
             state.sequence += 1
             completed_at = datetime.now(UTC)
             elapsed_ms = max(0, int((completed_at - state.started_at).total_seconds() * 1000))
-            public_text, turn_truncated = self._fit_turn_budget(
-                state.spec.turn_id, state.public_text
+            public_text, truncated = self._fit_turn_budget(
+                state.spec.turn_id, state.raw_text
             )
+            if not public_text and truncated:
+                # 防御：折叠后预算必足（单块 12k < turn 30k）；仍避免落库空串。
+                public_text = _FOLDED_PLACEHOLDER
             block = ThinkingBlock(
                 operation_id=state.spec.operation_id,
                 turn_id=state.spec.turn_id,
@@ -306,7 +324,7 @@ class SessionThinkingService:
                 duration_ms=duration_ms if duration_ms is not None else elapsed_ms,
                 task_id=state.spec.task_id,
                 goal_id=state.spec.goal_id,
-                truncated=state.truncated or turn_truncated,
+                truncated=truncated,
             )
             self._completed.setdefault(state.spec.turn_id, []).append(block)
             event_type: ThinkingEventType = (
@@ -383,14 +401,35 @@ class SessionThinkingService:
         binding = self._turn_bindings[spec.turn_id]
         return replace(spec, task_id=spec.task_id or binding.task_id)
 
-    def _fit_turn_budget(self, turn_id: str, content: str) -> tuple[str, bool]:
-        used = sum(len(block.content) for block in self._completed.get(turn_id, ()))
-        remaining = max(0, _TURN_MAX_CHARS - used)
-        if len(content) <= remaining:
-            return content, False
-        suffix = _TRUNCATED_SUFFIX[:remaining]
-        prefix_length = max(0, remaining - len(suffix))
-        return f"{content[:prefix_length]}{suffix}", True
+    def _fit_turn_budget(self, turn_id: str, raw_text: str) -> tuple[str, bool]:
+        """按 turn 预算收敛新块内容：额度不足时按完成顺序折叠最旧已完成块。
+
+        折叠只改 content（占位符 + truncated=True），不改 (operation_id, attempt)，
+        持久化游标不受影响；已是占位符的块跳过，保证幂等。不向在线客户端补发
+        折叠事件：live 客户端已收全文，刷新后以落库折叠态为准。
+        """
+        blocks = self._completed.get(turn_id, [])
+        while True:
+            used = sum(len(block.content) for block in blocks)
+            remaining = max(0, _TURN_MAX_CHARS - used)
+            budget = min(_BLOCK_MAX_CHARS, remaining)
+            sanitized = sanitize_thinking(raw_text, max_chars=budget)
+            if not sanitized.truncated or remaining >= _BLOCK_MAX_CHARS:
+                # 未截断，或截断是单块上限所致（折叠无法释放更多额度）。
+                return sanitized.text, sanitized.truncated
+            target = next(
+                (
+                    index
+                    for index, block in enumerate(blocks)
+                    if block.content != _FOLDED_PLACEHOLDER
+                ),
+                None,
+            )
+            if target is None:
+                return sanitized.text, True
+            blocks[target] = replace(
+                blocks[target], content=_FOLDED_PLACEHOLDER, truncated=True
+            )
 
     def _payload(self, state: _RunningOperation, **extra: Any) -> dict[str, Any]:
         binding = self._turn_bindings.get(state.spec.turn_id)
