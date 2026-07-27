@@ -39,7 +39,8 @@ prompt 渠道码规则、`sessions.platforms` 写回、agent loop 逐平台检�
 
 ### 前端
 
-4. **类型**（`src/types.ts`）：Message 的 brainstorm metadata 解析加 `multi?: boolean`。
+4. **类型**（`src/api/contracts.ts` 的 `BrainstormMetadata`，`src/types.ts` 仅引用）：加
+   `multi?: boolean`。
 5. **ChatArea**：最新消息 `brainstorm.options` 非空且 `brainstorm.multi === true` 时：
    - chips 渲染为可切换选中态（选中高亮/打勾样式），本地 state 记录选中集合
     （消息 id 变化时重置）；
@@ -64,3 +65,7 @@ prompt 渠道码规则、`sessions.platforms` 写回、agent loop 逐平台检�
 
 - prompt 引导模型在平台问题输出 multi=true 的准确率需实测观察（误判为多选只是交互
   形态变化，不丢数据）。
+- `merge_profile` 并集语义下平台只增不减：用户改主意（先确认抖音、后说「只要小红书」）
+  无法移除旧值。当前澄清流程 platforms 必填且一次问完，触发概率低，接受该取舍；
+  后续如高频出现再评估「重新设置」语义。
+- options 上限 4 个（schema 现状）而渠道共 5 个，维持现状不扩展。
