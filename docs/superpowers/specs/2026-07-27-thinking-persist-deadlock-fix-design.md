@@ -31,8 +31,10 @@
 
 - 保持「思考持久化尽力而为」语义：持久化失败不阻塞主流程、不改变响应状态码。
 - 不改变 `safe_error` 白名单、思考流 SSE、任务状态机。
--  brainstorm/clarify/respond 三条请求内路径统一修复；executor worker 路径（agent loop
-  finally）已用独立事务，不在本次范围。
+- **四条请求内路径统一修复**：brainstorm 成功路径、tasks 路由的 clarify 分支、respond
+  分支、**execute 分支（`planner_attempted` 时的 `_persist_turn_blocks`，与 brainstorm
+  事故同型：死锁回滚 → 202 幽灵 task_id + `task_runner.submit` 幻影提交）**。
+  executor worker 路径（agent loop finally）已用独立事务，不在本次范围。
 - 锁范围收窄（整会话 FOR UPDATE → turn 级）**不做**：MySQL 无索引 JSON 查询同样
   产生大范围 next-key 锁，收益不确定；以「移出请求事务 + 短事务 + 死锁重试」为主修复，
   锁收窄留作后续观察项。
@@ -45,27 +47,39 @@
   `attach_turn_to_assistant` 调用（`backend/app/brainstorm/service.py:131-135, 165-177`），
   请求事务只负责业务写入（消息、画像、任务）。
 - `brainstorm/router.py` 在 `await db.commit()` 之后调用新 helper
-  `persist_brainstorm_thinking(session_factory, *, user_id, session_id, turn_id,
-  assistant_message_id)`（`app/thinking/persistence.py` 新增）：
-  - 独立 `session_factory.begin()` 事务；
-  - 内部：`completed_blocks(only_unpersisted=True)` → `persist_block` 逐块 →
-    `mark_blocks_persisted` → `attach_turn_to_assistant`（按 message id 取 assistant 行）；
-  - **死锁/OperationalError 重试一次**（1213 是瞬时错误，MySQL 官方建议重试）；
-  - 全部异常只记 warning，不影响已提交的响应。
-- 响应 DTO 不再携带本轮 thinking metadata（持久化在响应后发生）；实时展示由会话级
-  thinking SSE 覆盖，刷新后从消息 metadata 恢复——行为差异可接受。
+  `persist_turn_thinking(session_factory, *, user_id, session_id, turn_id,
+  assistant_message_id)`（`app/thinking/persistence.py` 新增，brainstorm/tasks 共用）：
+  - 调用前先从 thinking service 取 `completed_blocks(only_unpersisted=True)` **并捕获列表**；
+  - 独立 `session_factory.begin()` 事务：逐块 `persist_block` →
+    `attach_turn_to_assistant`（`assistant_message_id` 为 None 时跳过 attach，
+    供 execute 分支复用）；
+  - **commit 成功后才 `mark_blocks_persisted`**（内存标记不得先于事务成功，
+    否则死锁重试时 block 永久丢失）；
+  - **死锁/OperationalError（mysql errno 1213）用捕获的同一 blocks 列表重试一次**
+    （`_thinking_metadata` 按 (operation_id, attempt) 去重，重复 persist 安全）；
+    再失败记 warning 放弃（尽力而为语义不变）。
+- 响应 DTO 变化（明示，不算回归）：
+  - brainstorm 响应 message 不再携带本轮 thinking metadata；且 `turn_id` 此前完全靠
+    attach 补写，修复后响应 DTO 的 message 也没有 `turn_id`（前端对
+    `response.message.turnId` 无直接依赖，chips 用 brainstorm/clarify options，思考
+    展示走会话级 thinking SSE + 刷新恢复）。
+  - clarify/respond 响应同样不再携带 thinking metadata（现状 attach 在 commit 前）。
+    前端 `toMessage(response.message)` 并入 thinking 仅影响「本轮思考即时回放」，
+    由会话级 thinking SSE 覆盖。
 
-### 2. tasks 路由 clarify/respond 路径：同样移到 commit 后
+### 2. tasks 路由三分支：同样移到 commit 后
 
-- `tasks/router.py` 的 clarify 分支（:369-395）与 respond 分支（:421-447）中的
+- `tasks/router.py` 的 clarify 分支（:369-395）、respond 分支（:421-447）与
+  **execute 分支（`planner_attempted` 的 `_persist_turn_blocks`，:503-524）**中的
   `_persist_turn_blocks` + `attach_turn_to_assistant` 移到各自 `await db.commit()` 之后，
-  复用第 1 点的独立事务 helper（泛化命名 `persist_turn_thinking`，brainstorm/tasks 共用）。
-- `bind_turn`（纯内存操作，无 DB 锁）留在请求内，提前到 planner 之后即可（现状如此，不动）。
+  统一调用第 1 点的 `persist_turn_thinking`（execute 分支无 assistant 消息，
+  `assistant_message_id=None`；`task_runner.submit` 仍在 persist 之后按现状顺序）。
+- `bind_turn`（纯内存操作，无 DB 锁）留在请求内，位置不动。
 
 ### 3. 死锁重试
 
-- `persist_turn_thinking` 捕获 `sqlalchemy.exc.OperationalError` 且 mysql errno 为 1213
-  时，用新事务重试一次；再失败记 warning 放弃（尽力而为语义不变）。
+- 见 §1 helper 语义：捕获 blocks 列表 → 独立事务 → commit 成功后 mark；
+  1213 死锁用同一列表在新事务重试一次；再失败记 warning。
 
 ### 4. 前端：events 404 停止重试并复位
 
@@ -82,8 +96,10 @@
 - 后端：
   1. brainstorm ready → 200 且响应 task_id 在 `analysis_tasks` **真实存在**（幻影任务回归）。
   2. monkeypatch `persist_block` 抛 `OperationalError(1213)` → brainstorm 仍 200、任务
-     存在、重试被触发（断言调用次数 ≥2）。
-  3. monkeypatch 持久化 helper 整体抛错 → brainstorm/clarify/respond 响应不受影响。
+     存在、重试被触发（断言调用次数 ≥2）；重试复用同一 blocks 列表，commit 成功后才
+     `mark_blocks_persisted`（首轮死锁时 mark 不被调用）。
+  3. monkeypatch 持久化 helper 整体抛错 → brainstorm/clarify/respond/execute 响应不受影响，
+     且 execute 分支任务真实落库、`task_runner.submit` 正常。
   4. 既有 thinking/brainstorm/tasks 测试全绿。
 - 前端：
   5. useTaskStream：SSE_404 后不再重连、connection=closed、notFound=true；SSE_500 仍重连。
@@ -94,3 +110,6 @@
 - `_messages` 整会话 `FOR UPDATE` 锁范围问题留作观察项；若死锁仍频发再评估收窄。
 - executor worker 路径的思考持久化已是独立事务，但同样可能死锁——失败后 block 仅
   留存内存（进程内），属既有尽力而为语义。
+- helper 部分失败终态：persist 成功、mark 已调、但 attach 重试后仍失败时，assistant
+  行缺 `turn_id` 且 user 消息可能残留 `thinking_pending`（blocks 已在
+  assistant.metadata.thinking 里，刷新恢复基本可用），属尽力而为可接受范围。
