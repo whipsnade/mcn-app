@@ -27,8 +27,11 @@
 按块的 `purpose` + 完成顺序映射到流节点位置：
 
 - `goal_planner` / `brainstorm` 块 → 插在首个工具节点之前（规划先于执行）。
-- `agent_loop` 块 → 第 i 块（按完成顺序）插在 `step_index = i` 的工具节点**之前**
+- `agent_loop` 块 → 第 i 块（按完成顺序）插在**第 i 个工具节点**（按出现顺序计数，
+  不解析 step_index 值——多 goal v2 下 step_index 每个 goal 从 1 重启）**之前**
   （第 i 轮迭代：先模型决策、后工具调用）；多出的块排在最后工具节点之后。
+  决策校验失败重试、空数据熔断回喂等轮次会产生无工具调用的 agent_loop 块，
+  多 goal 场景下接受错位（展示层启发式）。
 - `kol_analysis` / `brand_analysis` / `campaign_analysis` / `goal_summary` 等收尾类块 →
   插在最后一个工具节点之后、终态节点（分析完成/任务失败/报告已生成）之前。
 - 无工具节点时按上述类别顺序依次排列。
@@ -45,10 +48,11 @@
 
 ### 3. 与 ThinkingPanel 的关系（去重）
 
-- 活跃 turn（有可见执行流程的任务所属 turn）：**消息下方的 ThinkingPanel 隐藏**，
-  思考只在流程面板中出现，避免同一内容两处展示。
+- 活跃 turn（最新用户消息的 turnId）且 `flowNodes.length > 0` 且流程非终态：
+  **消息下方的 ThinkingPanel 隐藏**，思考只在流程面板中出现，避免同一内容两处展示。
 - 任务终态后：流程面板自动折叠为摘要行（现状），消息级 ThinkingPanel 恢复显示
-  （completed 折叠态）——刷新/回看路径不变。
+  （completed 折叠态）——刷新/回看路径不变。终态后用户重新展开流程面板时，思考块
+  会同时出现在流程节点与 ThinkingPanel 中（有意为之，与现状一致）。
 - 历史 turn 的 ThinkingPanel 完全不受影响。
 
 ### 4. 数据来源与接线
@@ -57,7 +61,8 @@
   用户消息的 `turnId`），作为新 prop 传入 `TaskFlowNodes`。
 - `TaskFlowNodes` 新增可选 prop `thinkingBlocks?: ThinkingBlock[]`，内部按 §1 规则
   把思考块转换为 `ThinkingFlowNode` 与流节点合并渲染；折叠态为本组件本地 state
-  （Set<nodeKey>，默认空=全折叠）。
+  （`Set<nodeKey>`，nodeKey = `operationId:attempt`，默认空=全折叠；content 更新
+  不改变 key，展开态稳定保留）。
 
 ### 不做的事（YAGNI）
 
