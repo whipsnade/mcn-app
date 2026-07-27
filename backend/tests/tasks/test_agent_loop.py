@@ -565,6 +565,52 @@ async def test_agent_loop_failure_note_includes_upstream_hint() -> None:
 
 
 @pytest.mark.asyncio
+async def test_agent_loop_failed_tool_event_payload_includes_upstream_message() -> None:
+    # 接线覆盖：失败行 evidence_json 的 upstream_error_message（落库前已脱敏）
+    # 必须随 tool.failed 事件 payload 落库，供事件重放/恢复路径一致使用。
+    task = _task()
+    store = _FakeStore(task)
+    upstream_hint = '分析对象校验失败: 标签名称 "美妆" 不在列表中。建议使用 match_best_tag。'
+    released_with_hint = SimpleNamespace(
+        status="released",
+        internal_tool_name=_TOOL_NAME,
+        plan_step_id="step_1",
+        evidence_json={"outcome": "failed", "upstream_error_message": upstream_hint},
+        error_type="upstream_tool_error",
+    )
+    decider = _ScriptedDecider([_call(), _call(), _finish()])
+    gateway = _FakeGateway([(released_with_hint,), (_settled(),)])
+    artifacts = _FakeArtifacts()
+
+    await _executor(store, decider, gateway, artifacts).run(task.id)
+
+    failed_events = [payload for event, payload in store.events if event == "tool.failed"]
+    assert len(failed_events) == 1
+    assert failed_events[0]["upstream_message"] == upstream_hint
+    assert failed_events[0]["message"]  # 白名单文案保留
+    # 成功事件不带该键。
+    succeeded_events = [payload for event, payload in store.events if event == "tool.succeeded"]
+    assert len(succeeded_events) == 1
+    assert "upstream_message" not in succeeded_events[0]
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_failed_tool_event_payload_omits_upstream_message_when_absent() -> None:
+    # 失败行未携带 upstream_error_message 时，事件 payload 省略该键。
+    task = _task()
+    store = _FakeStore(task)
+    decider = _ScriptedDecider([_call(), _call(), _finish()])
+    gateway = _FakeGateway([(_released(),), (_settled(),)])
+    artifacts = _FakeArtifacts()
+
+    await _executor(store, decider, gateway, artifacts).run(task.id)
+
+    failed_events = [payload for event, payload in store.events if event == "tool.failed"]
+    assert len(failed_events) == 1
+    assert "upstream_message" not in failed_events[0]
+
+
+@pytest.mark.asyncio
 async def test_agent_loop_unknown_call_interrupts_without_report() -> None:
     task = _task()
     store = _FakeStore(task)
