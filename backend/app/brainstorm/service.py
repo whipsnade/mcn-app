@@ -267,7 +267,8 @@ class BrainstormService:
                     ChatMessage(role="user", content=user_content),
                 ),
                 output_model=BrainstormModelOutput,
-                max_tokens=2048,
+                # 推理模型 <think> 占用输出预算，2048 易把 JSON 截断，放大到 6144。
+                max_tokens=6144,
                 log_context={
                     "user_id": user_id,
                     "session_id": session_id,

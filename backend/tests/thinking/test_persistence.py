@@ -489,3 +489,85 @@ async def test_persist_turn_thinking_without_assistant_skips_attach(
     assert len(_FakeStore.instances[0].persist_calls) == 1
     assert _FakeStore.instances[0].attach_calls == []
     assert service.mark_calls == [[("op-1", 1)]]
+
+
+class _FlakyBeginSessionFactory:
+    """前 fail_count 次 begin() 抛指定异常、之后正常复用同一 db_session 的假工厂。"""
+
+    def __init__(self, db_session, error: Exception, *, fail_count: int = 1) -> None:
+        self._db_session = db_session
+        self._error = error
+        self._fail_count = fail_count
+        self.attempts = 0
+
+    @asynccontextmanager
+    async def begin(self):
+        self.attempts += 1
+        if self.attempts <= self._fail_count:
+            raise self._error
+        yield self._db_session
+
+
+@pytest.mark.asyncio
+async def test_record_brainstorm_failure_retries_once_on_deadlock(
+    db_session, user_factory
+) -> None:
+    user, session, _, _ = await _seed_turn(db_session, user_factory)
+    turn_id = "8a9fda07-77c5-44ea-967e-a17e795266ef"
+    factory = _FlakyBeginSessionFactory(db_session, _deadlock_error(), fail_count=1)
+
+    assistant = await record_brainstorm_failure(
+        factory,
+        user_id=user.id,
+        session_id=session.id,
+        turn_id=turn_id,
+        user_content="分析品牌",
+        blocks=(_block(turn_id=turn_id, status="interrupted"),),
+        error_code="model_unavailable",
+    )
+
+    assert factory.attempts == 2
+    assert assistant.content == "模型暂时无法完成需求理解，请稍后重试。"
+    assert assistant.metadata_json["error_code"] == "model_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_record_brainstorm_failure_reraises_second_deadlock(
+    db_session, user_factory
+) -> None:
+    user, session, _, _ = await _seed_turn(db_session, user_factory)
+    factory = _FlakyBeginSessionFactory(db_session, _deadlock_error(), fail_count=2)
+
+    with pytest.raises(OperationalError):
+        await record_brainstorm_failure(
+            factory,
+            user_id=user.id,
+            session_id=session.id,
+            turn_id="8a9fda07-77c5-44ea-967e-a17e795266ef",
+            user_content="分析品牌",
+            blocks=(),
+            error_code="model_unavailable",
+        )
+
+    assert factory.attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_record_brainstorm_failure_does_not_retry_non_deadlock(
+    db_session, user_factory
+) -> None:
+    user, session, _, _ = await _seed_turn(db_session, user_factory)
+    factory = _FlakyBeginSessionFactory(db_session, RuntimeError("boom"), fail_count=1)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        await record_brainstorm_failure(
+            factory,
+            user_id=user.id,
+            session_id=session.id,
+            turn_id="8a9fda07-77c5-44ea-967e-a17e795266ef",
+            user_content="分析品牌",
+            blocks=(),
+            error_code="model_unavailable",
+        )
+
+    assert factory.attempts == 1

@@ -268,7 +268,7 @@ async def test_first_round_incomplete_profile_asks_one_question_with_options(
     assert request.purpose == "brainstorm"
     assert request.thinking_sink is not None
     assert request.template_name == "brainstorm_v1"
-    assert request.max_tokens == 2048
+    assert request.max_tokens == 6144
     model_input = json.loads(request.messages[-1].content)
     assert model_input["messages"][-1]["content"] == "我想分析欧诗漫"
     assert model_input["current_profile"]["brand"] is None

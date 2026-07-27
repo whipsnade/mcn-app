@@ -97,7 +97,7 @@ async def test_plan_task_builds_logged_structured_request() -> None:
     assert request.thinking_sink is thinking_sink
     assert request.template_name == "goal_planner_v1"
     assert request.output_model is GoalPlannerOutput
-    assert request.max_tokens == 2048
+    assert request.max_tokens == 4096
     assert request.log_context == {
         "user_id": "user-1",
         "session_id": "session-1",

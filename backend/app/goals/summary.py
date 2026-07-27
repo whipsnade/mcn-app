@@ -73,7 +73,8 @@ async def build_goal_result_summary(
                         ),
                     ),
                     output_model=GoalResultSummary,
-                    max_tokens=1024,
+                    # 推理模型 <think> 占用输出预算，1024 几乎必然截断 JSON 走代码摘要兜底。
+                    max_tokens=2_048,
                     log_context={"tags": ["goal_summary"]},
                 )
             )

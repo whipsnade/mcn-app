@@ -103,7 +103,8 @@ class GoalPlannerService:
                     template_name=GOAL_PLANNER_PROMPT.name,
                     messages=tuple(messages),
                     output_model=GoalPlannerOutput,
-                    max_tokens=2048,
+                    # 推理模型 <think> 占用输出预算，2048 易把 JSON 截断，放大到 4096。
+                    max_tokens=4096,
                     log_context=log_context,
                     thinking_sink=(
                         thinking_sink
