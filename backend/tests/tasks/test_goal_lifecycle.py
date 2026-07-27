@@ -479,6 +479,7 @@ async def _create_leased_task_with_goal(
         "message_id": str(uuid4()),
         "task_id": str(uuid4()),
         "goal_id": str(uuid4()),
+        "turn_id": str(uuid4()),
     }
     if plan_results is None:
         plan_results = [
@@ -524,7 +525,7 @@ async def _create_leased_task_with_goal(
                 role="user",
                 content="帮我圈选达人",
                 sequence=1,
-                metadata_json={},
+                metadata_json={"turn_id": ids["turn_id"]},
                 created_at=now,
             )
         )
@@ -688,10 +689,19 @@ async def test_finalize_brand_goal_builds_report_and_artifacts() -> None:
             report_event = next(e for e in events if e.event_type == "report.updated")
             assert report_event.payload_json["report_id"] == report.id
             assert report_event.payload_json["version"] == 1
+            assert report_event.payload_json["label"] == "品牌分析报告已生成"
             artifact_event = next(e for e in events if e.event_type == "artifact.updated")
             assert artifact_event.payload_json["artifact_type"] == "brand_report"
             assert artifact_event.payload_json["module_key"] == "brand"
             assert artifact_event.payload_json["artifact_id"] == artifact.id
+            assert artifacts._model.requests[0].purpose == "brand_analysis"
+            assert artifacts._model.requests[0].thinking_sink is not None
+            summary_request = next(
+                request
+                for request in artifacts._model.requests
+                if request.purpose == "goal_summary"
+            )
+            assert summary_request.thinking_sink is None
     finally:
         await _cleanup(ids)
 

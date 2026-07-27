@@ -3,10 +3,14 @@ import { request } from './client';
 import type { ApiBrainstormResponse } from './contracts';
 
 
-export function postBrainstorm(sessionId: string, content: string): Promise<ApiBrainstormResponse> {
+export function postBrainstorm(
+  sessionId: string,
+  content: string,
+  turnId: string,
+): Promise<ApiBrainstormResponse> {
   return request<ApiBrainstormResponse>(`/api/v1/sessions/${sessionId}/brainstorm`, {
     method: 'POST',
-    body: JSON.stringify({ content }),
+    body: JSON.stringify({ content, turn_id: turnId }),
   });
 }
 

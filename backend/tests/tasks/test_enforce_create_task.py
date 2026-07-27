@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import func, select
 
 from app.core.config import get_settings
@@ -18,8 +20,74 @@ from app.goals.schemas import (
     GoalQuestion,
     GoalSpec,
 )
+from app.model.tencent_plan import TencentPlanAdapter
 from app.tasks.models import AnalysisTask
+from app.tasks.schemas import TaskCreate
+from app.tasks.service import TaskService
+from app.thinking.service import SessionThinkingService
 from app.workspace.models import Message, WorkspaceSession
+
+
+class _GoalPlannerCompletions:
+    async def create(self, **kwargs):
+        assert kwargs["stream"] is True
+        content = (
+            '{"action":"execute","question":null,"goals":[{"sequence":1,'
+            '"goal_type":"brand_analysis","depends_on_sequence":null,'
+            '"params":{"brand":"喜茶","campaign":null,"period":null,'
+            '"platforms":[],"requirement":"分析六月声量"},'
+            '"request_evidence":"分析喜茶六月声量"}],'
+            '"active_brand":"喜茶","brand_source":"explicit"}'
+        )
+        chunks = [
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(
+                            content=f"<think>先识别分析目标。</think>{content}",
+                            reasoning_content=None,
+                        ),
+                        finish_reason=None,
+                    )
+                ],
+                usage=None,
+                _request_id="req-goal-planner",
+            ),
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(content=None, reasoning_content=None),
+                        finish_reason="stop",
+                    )
+                ],
+                usage=None,
+                _request_id="req-goal-planner",
+            ),
+        ]
+
+        async def stream():
+            for chunk in chunks:
+                yield chunk
+
+        return stream()
+
+
+class _FailingThinkingSink:
+    async def started(self, *, attempt: int) -> None:
+        raise RuntimeError("sink down")
+
+    async def delta(self, text: str, *, attempt: int) -> None:
+        raise RuntimeError("sink down")
+
+    async def completed(self, *, attempt: int, duration_ms: int) -> None:
+        raise RuntimeError("sink down")
+
+    async def failed(self, *, attempt: int, error_code: str) -> None:
+        raise RuntimeError("sink down")
+
+
+async def _ignore_prompt_log(_entry) -> None:
+    return None
 
 
 def _enable_enforce(monkeypatch) -> None:
@@ -71,13 +139,22 @@ async def _set_session_profile(db_session, session_id: str, *, brand: str, categ
     await db_session.flush()
 
 
+def test_task_create_accepts_turn_id_and_rejects_invalid_uuid() -> None:
+    turn_id = "8a9fda07-77c5-44ea-967e-a17e795266ef"
+
+    assert str(TaskCreate(content="分析品牌", turn_id=turn_id).turn_id) == turn_id
+    with pytest.raises(ValidationError):
+        TaskCreate(content="分析品牌", turn_id="not-a-uuid")
+
+
 @pytest.mark.asyncio
 async def test_enforce_clarify_stores_message_without_task(
     auth_client_factory, db_session, monkeypatch
 ) -> None:
     _enable_enforce(monkeypatch)
 
-    async def fake_plan(self, context):
+    async def fake_plan(self, context, **kwargs):
+        assert kwargs["thinking_sink"] is not None
         return _clarify_output()
 
     monkeypatch.setattr(GoalPlannerService, "plan_context", fake_plan)
@@ -94,16 +171,22 @@ async def test_enforce_clarify_stores_message_without_task(
     assert body["message"]["role"] == "assistant"
     assert body["message"]["content"] == "想看哪个品牌的分析？"
     assert body["message"]["metadata"]["clarify"] == {"options": ["海底捞", "喜茶"]}
+    assert body["message"]["metadata"]["turn_id"]
     # 不落任务：analysis_tasks 为空，assistant 消息已持久化。
     task_count = await db_session.scalar(select(func.count()).select_from(AnalysisTask))
     assert task_count == 0
-    persisted = await db_session.scalar(
-        select(Message).where(
-            Message.session_id == session_id, Message.role == "assistant"
-        )
+    persisted = list(
+        (
+            await db_session.scalars(
+                select(Message)
+                .where(Message.session_id == session_id)
+                .order_by(Message.sequence)
+            )
+        ).all()
     )
-    assert persisted is not None
-    assert persisted.metadata_json["clarify"] == {"options": ["海底捞", "喜茶"]}
+    assert [message.role for message in persisted] == ["user", "assistant"]
+    assert persisted[0].metadata_json["turn_id"] == persisted[1].metadata_json["turn_id"]
+    assert persisted[1].metadata_json["clarify"] == {"options": ["海底捞", "喜茶"]}
 
 
 @pytest.mark.asyncio
@@ -112,7 +195,7 @@ async def test_enforce_execute_creates_typed_goal_with_params(
 ) -> None:
     _enable_enforce(monkeypatch)
 
-    async def fake_plan(self, context):
+    async def fake_plan(self, context, **_kwargs):
         return GoalPlannerOutput(
             action="execute",
             goals=[
@@ -153,12 +236,45 @@ async def test_enforce_execute_creates_typed_goal_with_params(
 
 
 @pytest.mark.asyncio
+async def test_enforce_creates_planned_goal_when_every_thinking_sink_method_fails(
+    auth_client_factory, db_session, monkeypatch
+) -> None:
+    _enable_enforce(monkeypatch)
+    monkeypatch.setattr(
+        SessionThinkingService,
+        "create_sink",
+        lambda _self, _spec: _FailingThinkingSink(),
+    )
+    adapter = TencentPlanAdapter(
+        client=_GoalPlannerCompletions(),
+        log_writer=_ignore_prompt_log,
+        stream_support_cache={},
+    )
+    monkeypatch.setattr("app.tasks.router.get_model_adapter", lambda: adapter)
+    client = await auth_client_factory("13400000088")
+    session_id = await _create_session(client)
+    await _set_session_profile(db_session, session_id, brand="海底捞", category="美食")
+
+    response = await client.post(
+        f"/api/v1/sessions/{session_id}/tasks",
+        json={"content": "分析喜茶六月声量"},
+    )
+
+    assert response.status_code == 202
+    assert response.json()["outcome"] == "task"
+    goal = await db_session.scalar(select(TaskGoal))
+    assert goal is not None
+    assert goal.goal_type == "brand_analysis"
+    assert goal.params_json["brand"] == "喜茶"
+
+
+@pytest.mark.asyncio
 async def test_enforce_multi_goal_persists_all_with_dependency(
     auth_client_factory, db_session, monkeypatch
 ) -> None:
     _enable_enforce(monkeypatch)
 
-    async def fake_plan(self, context):
+    async def fake_plan(self, context, **_kwargs):
         return GoalPlannerOutput(
             action="execute",
             goals=[
@@ -171,7 +287,7 @@ async def test_enforce_multi_goal_persists_all_with_dependency(
     # planner 输出依赖：kol_selection 依赖 sequence=1（GoalSpec.depends_on_sequence）。
     original_spec = _spec
 
-    async def fake_plan_with_dependency(self, context):
+    async def fake_plan_with_dependency(self, context, **_kwargs):
         first = original_spec(1, "campaign_analysis", brand="海底捞", campaign="618大促")
         second = original_spec(2, "kol_selection", brand="海底捞")
         return GoalPlannerOutput(
@@ -210,7 +326,7 @@ async def test_enforce_planner_failure_falls_back_to_kol_selection(
 ) -> None:
     _enable_enforce(monkeypatch)
 
-    async def failing_plan(self, context):
+    async def failing_plan(self, context, **_kwargs):
         raise RuntimeError("model unavailable")
 
     monkeypatch.setattr(GoalPlannerService, "plan_context", failing_plan)
@@ -234,7 +350,7 @@ async def test_enforce_disabled_keeps_legacy_path(
 ) -> None:
     called = False
 
-    async def forbidden_plan(self, context):
+    async def forbidden_plan(self, context, **_kwargs):
         nonlocal called
         called = True
         raise AssertionError("planner must not run when enforce is off")
@@ -262,7 +378,7 @@ async def test_enforce_idempotent_hit_skips_planner(
     _enable_enforce(monkeypatch)
     calls = 0
 
-    async def counting_plan(self, context):
+    async def counting_plan(self, context, **_kwargs):
         nonlocal calls
         calls += 1
         return GoalPlannerOutput(action="execute", goals=[_spec(1, "kol_selection")])
@@ -297,9 +413,6 @@ async def test_enforce_idempotent_hit_skips_planner(
 @pytest.mark.asyncio
 async def test_task_service_create_accepts_goal_overrides(db_session, user_factory) -> None:
     """TaskService.create 按入参建 goal；缺省保持 kol_selection + 会话快照。"""
-    from app.tasks.schemas import TaskCreate
-    from app.tasks.service import TaskService
-
     user = await user_factory()
     now = datetime.now(UTC).replace(tzinfo=None)
     session = WorkspaceSession(
@@ -347,13 +460,53 @@ async def test_task_service_create_accepts_goal_overrides(db_session, user_facto
 
 
 @pytest.mark.asyncio
+async def test_task_service_create_persists_turn_id_and_retry_reuses_it(
+    db_session, user_factory
+) -> None:
+    user = await user_factory()
+    now = datetime.now(UTC).replace(tzinfo=None)
+    session = WorkspaceSession(
+        id=str(uuid4()),
+        user_id=user.id,
+        title="turn 持久化测试",
+        brand="海底捞",
+        campaign_name=None,
+        status="active",
+        platforms=["xiaohongshu"],
+        category="美食",
+        target_audience="",
+        budget_min=None,
+        budget_max=None,
+        filters_snapshot={},
+        is_starred=False,
+        last_accessed_at=now,
+        created_at=now,
+        updated_at=now,
+    )
+    db_session.add(session)
+    await db_session.flush()
+    turn_id = "8a9fda07-77c5-44ea-967e-a17e795266ef"
+
+    source = await TaskService(db_session).create(
+        user.id,
+        session.id,
+        TaskCreate(content="分析品牌", turn_id=turn_id),
+    )
+    source.status = "completed"
+    await db_session.flush()
+    retry = await TaskService(db_session).retry(user.id, source.id)
+    message = await db_session.get(Message, source.trigger_message_id)
+
+    assert message is not None
+    assert retry.trigger_message_id == source.trigger_message_id
+    assert message.metadata_json["turn_id"] == turn_id
+
+
+@pytest.mark.asyncio
 async def test_task_service_create_persists_goal_specs_with_dependency(
     db_session, user_factory
 ) -> None:
     """goal_specs 列表：按 sequence 建多行 TaskGoal，depends_on_sequence 解析为 id。"""
-    from app.tasks.schemas import TaskCreate
-    from app.tasks.service import TaskService
-
     user = await user_factory()
     now = datetime.now(UTC).replace(tzinfo=None)
     session = WorkspaceSession(

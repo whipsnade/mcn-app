@@ -98,9 +98,60 @@ export interface ClarifyMetadata {
   options: string[];
 }
 
+export type ApiThinkingBlockStatus = 'running' | 'completed' | 'interrupted';
+
+export interface ApiThinkingBlock {
+  operation_id: string;
+  purpose: string;
+  attempt: number;
+  label: string;
+  content: string;
+  status: ApiThinkingBlockStatus;
+  started_at?: string;
+  completed_at?: string;
+  duration_ms?: number;
+  task_id?: string | null;
+  goal_id?: string | null;
+  truncated?: boolean;
+  error_code?: string | null;
+}
+
+export interface ApiThinkingMetadata {
+  version: 1;
+  status: ApiThinkingBlockStatus;
+  blocks: ApiThinkingBlock[];
+}
+
+export type ApiSessionThinkingEventType =
+  | 'thinking.started'
+  | 'thinking.delta'
+  | 'thinking.snapshot'
+  | 'thinking.completed'
+  | 'thinking.failed';
+
+export interface ApiSessionThinkingEventPayload {
+  operation_id: string;
+  turn_id: string;
+  session_id: string;
+  purpose: string;
+  attempt: number;
+  label: string;
+  sequence: number;
+  task_id?: string | null;
+  goal_id?: string | null;
+  trigger_message_id?: string | null;
+  text?: string;
+  status?: ApiThinkingBlockStatus;
+  duration_ms?: number;
+  error_code?: string | null;
+  truncated?: boolean;
+}
+
 export interface ApiMessageMetadata extends Record<string, unknown> {
+  turn_id?: string;
   brainstorm?: BrainstormMetadata;
   clarify?: ClarifyMetadata;
+  thinking?: ApiThinkingMetadata;
 }
 
 export interface ApiMessage {

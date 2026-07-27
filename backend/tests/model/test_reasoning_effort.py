@@ -44,6 +44,20 @@ class _FakeCompletions:
         return self.outcome
 
 
+class _ThinkingSink:
+    async def started(self, *, attempt: int) -> None:
+        pass
+
+    async def delta(self, text: str, *, attempt: int) -> None:
+        pass
+
+    async def completed(self, *, attempt: int, duration_ms: int) -> None:
+        pass
+
+    async def failed(self, *, attempt: int, error_code: str) -> None:
+        pass
+
+
 def _json_response(content: str) -> Any:
     return SimpleNamespace(
         choices=[SimpleNamespace(message=SimpleNamespace(content=content), finish_reason="stop")],
@@ -52,10 +66,10 @@ def _json_response(content: str) -> Any:
     )
 
 
-def _stream_chunks() -> Any:
+def _stream_chunks(content: str | None = None) -> Any:
     chunks = [
         SimpleNamespace(
-            choices=[SimpleNamespace(delta=SimpleNamespace(content=None), finish_reason="stop")],
+            choices=[SimpleNamespace(delta=SimpleNamespace(content=content), finish_reason="stop")],
             usage=None,
         )
     ]
@@ -75,6 +89,7 @@ async def test_reasoning_effort_sent_when_configured() -> None:
     await adapter.complete_json(_json_request())
 
     assert client.calls[0]["reasoning_effort"] == "high"
+    assert client.calls[0]["stream"] is False
 
 
 @pytest.mark.asyncio
@@ -96,3 +111,25 @@ async def test_reasoning_effort_sent_on_stream_when_configured() -> None:
         pass
 
     assert client.calls[0]["reasoning_effort"] == "max"
+
+
+@pytest.mark.asyncio
+async def test_reasoning_effort_sent_on_structured_thinking_stream() -> None:
+    client = _FakeCompletions(_stream_chunks('{"value": 1}'))
+    adapter = TencentPlanAdapter(client=client, reasoning_effort="high")
+
+    await adapter.complete_json(
+        StructuredModelRequest(
+            purpose="agent_loop",
+            template_name="agent_loop_v1",
+            messages=(
+                ChatMessage(role="system", content="sys"),
+                ChatMessage(role="user", content="user"),
+            ),
+            output_model=_Out,
+            thinking_sink=_ThinkingSink(),
+        )
+    )
+
+    assert client.calls[0]["reasoning_effort"] == "high"
+    assert client.calls[0]["stream"] is True

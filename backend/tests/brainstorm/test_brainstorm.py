@@ -1,17 +1,91 @@
 import json
+from types import SimpleNamespace
 
 import pytest
+from pydantic import ValidationError
 
 from app.brainstorm.schemas import (
     BrainstormModelOutput,
     BrainstormPeriod,
     BrainstormProfile,
     BrainstormQuestion,
+    BrainstormRequest,
 )
 from app.model.contracts import ModelAdapterError, StructuredResult
+from app.model.prompt_logs import PromptLogEntry
+from app.model.tencent_plan import TencentPlanAdapter
 from app.tasks import dependencies
+from app.thinking.service import SessionThinkingService
 from app.workspace.schemas import SessionCreate
 from app.workspace.service import WorkspaceService
+
+
+MINIMAX_THINK_RESPONSE = (
+    "<think>检查当前画像，确认品牌、品类和平台是否齐全。</think>\n"
+    '{"assistant_message":"请确认品类","extracted":{"audience":null,'
+    '"brand":"Manner","category":null,"goal":"声量和情感趋势",'
+    '"kol_filters":null,"period":null,"platforms":[],"region":null},'
+    '"question":{"options":["咖啡/现制饮品"],"text":"请选择品类"},'
+    '"ready":false,"title_suggestion":"Manner品牌分析"}'
+)
+
+
+class _MiniMaxCompletions:
+    async def create(self, **kwargs):
+        assert kwargs["stream"] is True
+        chunks = [
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(
+                            content=MINIMAX_THINK_RESPONSE,
+                            reasoning_content=None,
+                        ),
+                        finish_reason=None,
+                    )
+                ],
+                usage=None,
+                _request_id="req-minimax",
+            ),
+            SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        delta=SimpleNamespace(content=None, reasoning_content=None),
+                        finish_reason="stop",
+                    )
+                ],
+                usage=None,
+                _request_id="req-minimax",
+            ),
+        ]
+
+        async def stream():
+            for chunk in chunks:
+                yield chunk
+
+        return stream()
+
+
+class _CapturePromptWriter:
+    def __init__(self) -> None:
+        self.entries: list[PromptLogEntry] = []
+
+    async def __call__(self, entry: PromptLogEntry) -> None:
+        self.entries.append(entry)
+
+
+class _FailingThinkingSink:
+    async def started(self, *, attempt: int) -> None:
+        raise RuntimeError("sink down")
+
+    async def delta(self, text: str, *, attempt: int) -> None:
+        raise RuntimeError("sink down")
+
+    async def completed(self, *, attempt: int, duration_ms: int) -> None:
+        raise RuntimeError("sink down")
+
+    async def failed(self, *, attempt: int, error_code: str) -> None:
+        raise RuntimeError("sink down")
 
 
 class FakeBrainstormModel:
@@ -24,8 +98,15 @@ class FakeBrainstormModel:
     async def complete_json(self, request):
         self.requests.append(request)
         output = self._outputs.pop(0)
+        if request.thinking_sink is not None:
+            await request.thinking_sink.started(attempt=1)
+            await request.thinking_sink.delta("正在梳理用户需求", attempt=1)
         if isinstance(output, Exception):
+            if request.thinking_sink is not None:
+                await request.thinking_sink.failed(attempt=1, error_code=output.code)
             raise output
+        if request.thinking_sink is not None:
+            await request.thinking_sink.completed(attempt=1, duration_ms=12)
         return StructuredResult(
             value=output, usage=None, request_id="fake-brainstorm", regeneration_count=0
         )
@@ -44,6 +125,75 @@ def _full_profile() -> BrainstormProfile:
         period=BrainstormPeriod(start="2026-04-01", end="2026-06-30"),
         goal="达人投放",
     )
+
+
+def test_brainstorm_request_accepts_turn_id_and_rejects_invalid_uuid() -> None:
+    turn_id = "8a9fda07-77c5-44ea-967e-a17e795266ef"
+
+    assert str(BrainstormRequest(content="分析品牌", turn_id=turn_id).turn_id) == turn_id
+    with pytest.raises(ValidationError):
+        BrainstormRequest(content="分析品牌", turn_id="not-a-uuid")
+
+
+@pytest.mark.asyncio
+async def test_minimax_think_response_returns_json_message_and_persists_thinking(
+    auth_client_factory, monkeypatch
+) -> None:
+    writer = _CapturePromptWriter()
+    model = TencentPlanAdapter(
+        client=_MiniMaxCompletions(),
+        log_writer=writer,
+        stream_support_cache={},
+    )
+    _install_model(monkeypatch, model)
+    client = await auth_client_factory("13900000011")
+    created = await client.post("/api/v1/sessions", json={})
+    session_id = created.json()["id"]
+    turn_id = "8a9fda07-77c5-44ea-967e-a17e795266ef"
+
+    response = await client.post(
+        f"/api/v1/sessions/{session_id}/brainstorm",
+        json={"content": "分析 Manner", "turn_id": turn_id},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["message"]["content"] == "请确认品类"
+    restored = await client.get(f"/api/v1/sessions/{session_id}")
+    assistant = restored.json()["messages"][-1]
+    [block] = assistant["metadata"]["thinking"]["blocks"]
+    assert block["content"] == "检查当前画像，确认品牌、品类和平台是否齐全。"
+    assert "<think>" not in assistant["content"]
+    [entry] = writer.entries
+    assert entry.status == "success"
+    assert entry.response == MINIMAX_THINK_RESPONSE
+
+
+@pytest.mark.asyncio
+async def test_brainstorm_succeeds_when_every_thinking_sink_method_fails(
+    auth_client_factory, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        SessionThinkingService,
+        "create_sink",
+        lambda _self, _spec: _FailingThinkingSink(),
+    )
+    model = TencentPlanAdapter(
+        client=_MiniMaxCompletions(),
+        log_writer=_CapturePromptWriter(),
+        stream_support_cache={},
+    )
+    _install_model(monkeypatch, model)
+    client = await auth_client_factory("13900000012")
+    created = await client.post("/api/v1/sessions", json={})
+    session_id = created.json()["id"]
+
+    response = await client.post(
+        f"/api/v1/sessions/{session_id}/brainstorm",
+        json={"content": "分析 Manner"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["message"]["content"] == "请确认品类"
 
 
 @pytest.mark.asyncio
@@ -89,6 +239,7 @@ async def test_first_round_incomplete_profile_asks_one_question_with_options(
     # 模型请求契约：purpose/模板/输入结构（消息历史 + 当前画像 + 关键字表清单）。
     request = model.requests[0]
     assert request.purpose == "brainstorm"
+    assert request.thinking_sink is not None
     assert request.template_name == "brainstorm_v1"
     assert request.max_tokens == 2048
     model_input = json.loads(request.messages[-1].content)
@@ -109,6 +260,8 @@ async def test_first_round_incomplete_profile_asks_one_question_with_options(
     restored = await client.get(f"/api/v1/sessions/{session_id}")
     messages = restored.json()["messages"]
     assert [item["role"] for item in messages] == ["user", "assistant"]
+    assert messages[0]["metadata"]["turn_id"] == messages[1]["metadata"]["turn_id"]
+    assert messages[1]["metadata"]["thinking"]["blocks"][0]["label"] == "正在理解需求"
     assert messages[1]["metadata"]["brainstorm"]["options"] == ["小红书", "抖音", "微博"]
     assert restored.json()["filters"]["brainstorm_profile"]["brand"] == "欧诗漫"
     # ready=false 时不得建任务、不得写回标量列。
@@ -305,10 +458,28 @@ async def test_brainstorm_without_token_returns_401(client, monkeypatch) -> None
 
 
 @pytest.mark.asyncio
-async def test_brainstorm_model_error_returns_friendly_502(auth_client_factory, monkeypatch) -> None:
+async def test_brainstorm_model_error_returns_friendly_502(
+    auth_client_factory, db_session, monkeypatch
+) -> None:
+    class _SessionCM:
+        async def __aenter__(self):
+            return db_session
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class _SessionFactory:
+        @staticmethod
+        def begin():
+            return _SessionCM()
+
+    monkeypatch.setattr("app.brainstorm.router.SessionFactory", _SessionFactory)
     client = await auth_client_factory("13900000007")
     created = await client.post("/api/v1/sessions", json={})
     session_id = created.json()["id"]
+    # 生产中会话来自前一请求且已提交；测试共享事务需显式结束当前 savepoint，
+    # 才能验证 brainstorm 本轮 rollback 后的独立失败落库。
+    await db_session.commit()
     model = FakeBrainstormModel([ModelAdapterError("MODEL_TIMEOUT", retryable=False)])
     _install_model(monkeypatch, model)
 
@@ -316,6 +487,51 @@ async def test_brainstorm_model_error_returns_friendly_502(auth_client_factory, 
         f"/api/v1/sessions/{session_id}/brainstorm", json={"content": "分析一下欧诗漫"}
     )
 
+    assert response.status_code == 502
+    assert response.json()["detail"] == "BRAINSTORM_MODEL_ERROR"
+    restored = await client.get(f"/api/v1/sessions/{session_id}")
+    messages = restored.json()["messages"]
+    assert [message["role"] for message in messages] == ["user", "assistant"]
+    assert messages[0]["metadata"]["turn_id"] == messages[1]["metadata"]["turn_id"]
+    assert messages[1]["metadata"]["thinking"]["status"] == "interrupted"
+    assert messages[1]["metadata"]["thinking"]["blocks"][0]["label"] == "正在理解需求"
+
+
+@pytest.mark.asyncio
+async def test_brainstorm_model_error_keeps_502_when_failure_record_fails(
+    auth_client_factory, db_session, monkeypatch
+) -> None:
+    class _SessionCM:
+        async def __aenter__(self):
+            return db_session
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class _SessionFactory:
+        @staticmethod
+        def begin():
+            return _SessionCM()
+
+    async def _failing_record(*_args, **_kwargs):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr("app.brainstorm.router.SessionFactory", _SessionFactory)
+    monkeypatch.setattr(
+        "app.brainstorm.router.record_brainstorm_failure", _failing_record
+    )
+    client = await auth_client_factory("13900000008")
+    created = await client.post("/api/v1/sessions", json={})
+    session_id = created.json()["id"]
+    await db_session.commit()
+    model = FakeBrainstormModel([ModelAdapterError("MODEL_TIMEOUT", retryable=False)])
+    _install_model(monkeypatch, model)
+
+    response = await client.post(
+        f"/api/v1/sessions/{session_id}/brainstorm", json={"content": "分析一下欧诗漫"}
+    )
+
+    # 思考失败落库再次失败也不得把 502 升级为 500。
     assert response.status_code == 502
     assert response.json()["detail"] == "BRAINSTORM_MODEL_ERROR"
 

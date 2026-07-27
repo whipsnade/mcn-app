@@ -13,15 +13,38 @@ const platformNames: Record<string, string> = {
 
 
 export function toMessage(message: ApiMessage): Message {
+  const thinking = message.metadata.thinking;
   return {
     id: message.id,
     sender: message.role === 'assistant' ? 'ai' : message.role,
     text: message.content,
+    turnId: typeof message.metadata.turn_id === 'string'
+      ? message.metadata.turn_id
+      : undefined,
     taskId: typeof message.metadata.latest_analysis_task_id === 'string'
       ? message.metadata.latest_analysis_task_id
       : typeof message.metadata.task_id === 'string' ? message.metadata.task_id : undefined,
     brainstorm: message.metadata.brainstorm,
     clarify: message.metadata.clarify,
+    thinking: thinking ? {
+      version: thinking.version,
+      status: thinking.status,
+      blocks: thinking.blocks.map(block => ({
+        operationId: block.operation_id,
+        purpose: block.purpose,
+        attempt: block.attempt,
+        label: block.label,
+        content: block.content,
+        status: block.status,
+        startedAt: block.started_at,
+        completedAt: block.completed_at,
+        durationMs: block.duration_ms,
+        taskId: block.task_id ?? undefined,
+        goalId: block.goal_id ?? undefined,
+        truncated: block.truncated ?? false,
+        errorCode: block.error_code ?? undefined,
+      })),
+    } : undefined,
     timestamp: new Date(message.created_at).toLocaleTimeString('zh-CN', {
       hour: '2-digit',
       minute: '2-digit',

@@ -417,6 +417,8 @@ async def test_kol_analysis_builds_session_report(
     assert [block["type"] for block in body["blocks"]] == ["metric_grid", "bar_chart"]
     [request] = model.requests
     assert request.purpose == "kol_analysis"
+    # 手动 /kol-analysis 没有任务 turn 上下文，绝不接入思考流。
+    assert request.thinking_sink is None
     assert request.template_name == "kol_analysis_v1"
     payload = json.loads(request.messages[-1].content)
     assert payload["total"] == 2

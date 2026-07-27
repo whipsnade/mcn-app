@@ -11,7 +11,12 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.model.contracts import ChatMessage, ModelAdapter, StructuredModelRequest
+from app.model.contracts import (
+    ChatMessage,
+    ModelAdapter,
+    StructuredModelRequest,
+    ThinkingSink,
+)
 from app.model.prompts import (
     BRAND_ANALYSIS_PROMPT,
     CAMPAIGN_ANALYSIS_PROMPT,
@@ -67,6 +72,7 @@ async def _run_goal_analysis(
     session_id: str,
     task: Any,
     goal: Any,
+    thinking_sink: ThinkingSink | None = None,
 ) -> AnalysisReport:
     evidence = collect_goal_evidence(getattr(task, "plan_json", None))
     if not evidence:
@@ -99,6 +105,7 @@ async def _run_goal_analysis(
                 "task_id": task.id,
                 "tags": [purpose],
             },
+            thinking_sink=thinking_sink,
         )
     )
     return await AnalysisReportService(db).build_session_report(
@@ -118,6 +125,7 @@ async def run_brand_analysis(
     session_id: str,
     task: Any,
     goal: Any,
+    thinking_sink: ThinkingSink | None = None,
 ) -> AnalysisReport:
     """品牌分析报告：证据聚合 → brand_analysis_v1 → 落库 report_type=brand_analysis。
 
@@ -134,6 +142,7 @@ async def run_brand_analysis(
         session_id=session_id,
         task=task,
         goal=goal,
+        thinking_sink=thinking_sink,
     )
 
 
@@ -145,6 +154,7 @@ async def run_campaign_analysis(
     session_id: str,
     task: Any,
     goal: Any,
+    thinking_sink: ThinkingSink | None = None,
 ) -> AnalysisReport:
     """活动复盘报告：证据聚合 → campaign_analysis_v1 → 落库 report_type=campaign_analysis。"""
     return await _run_goal_analysis(
@@ -158,4 +168,5 @@ async def run_campaign_analysis(
         session_id=session_id,
         task=task,
         goal=goal,
+        thinking_sink=thinking_sink,
     )

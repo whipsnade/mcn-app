@@ -43,6 +43,20 @@ class TokenUsage(BaseModel):
     reasoning_tokens: int | None = None
 
 
+class ThinkingSink(Protocol):
+    async def started(self, *, attempt: int) -> None:
+        raise NotImplementedError
+
+    async def delta(self, text: str, *, attempt: int) -> None:
+        raise NotImplementedError
+
+    async def completed(self, *, attempt: int, duration_ms: int) -> None:
+        raise NotImplementedError
+
+    async def failed(self, *, attempt: int, error_code: str) -> None:
+        raise NotImplementedError
+
+
 @dataclass(frozen=True)
 class StructuredModelRequest(Generic[T]):
     purpose: ModelPurpose
@@ -52,6 +66,7 @@ class StructuredModelRequest(Generic[T]):
     max_tokens: int = 4096
     # prompt 学习日志上下文（user_id/session_id/task_id/tags），不写进 prompt。
     log_context: dict[str, Any] | None = field(default=None, compare=False)
+    thinking_sink: ThinkingSink | None = field(default=None, compare=False)
 
 
 class StreamingModelRequest(BaseModel):

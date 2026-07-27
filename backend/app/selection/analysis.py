@@ -13,7 +13,12 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.artifacts.service import ArtifactService
-from app.model.contracts import ChatMessage, ModelAdapter, StructuredModelRequest
+from app.model.contracts import (
+    ChatMessage,
+    ModelAdapter,
+    StructuredModelRequest,
+    ThinkingSink,
+)
 from app.model.prompts import KOL_ANALYSIS_PROMPT
 from app.reporting.analysis_reports import AnalysisReportService
 from app.reporting.blocks import ReportDocument
@@ -171,6 +176,7 @@ async def run_kol_analysis(
     *,
     user_id: str,
     session_id: str,
+    thinking_sink: ThinkingSink | None = None,
 ) -> AnalysisReport:
     """聚合名单 → 模型撰写报告 → 会话级落库，同步返回报告。
 
@@ -227,6 +233,7 @@ async def run_kol_analysis(
                 "session_id": session_id,
                 "tags": ["kol_analysis"],
             },
+            thinking_sink=thinking_sink,
         )
     )
     report = await AnalysisReportService(db).build_session_report(

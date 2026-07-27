@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import random
+import re
 import time
 from collections.abc import Awaitable, Callable, MutableMapping
 from typing import Any
@@ -22,14 +23,21 @@ from app.model.contracts import (
     StructuredModelRequest,
     StructuredResult,
     T,
+    ThinkingSink,
     TokenUsage,
 )
 from app.model.prompt_logs import PromptLogEntry, PromptLogWriter
+from app.model.structured_output import (
+    ParsedStructuredOutput,
+    ThinkJsonStreamParser,
+    parse_non_stream_output,
+)
 
 
 CONFIRMED_BASE_URL = "https://tokenhub.tencentmaas.com/plan/v3"
 CONFIRMED_MODEL = "deepseek-v4-pro"
 _SCHEMA_SUPPORT_CACHE: dict[tuple[str, str, str], bool] = {}
+_STREAM_SUPPORT_CACHE: dict[tuple[str, str], bool] = {}
 logger = logging.getLogger(__name__)
 _RETRYABLE_STATUS_CODES = {429, 502, 503, 504}
 _MAX_VALIDATION_ERRORS = 20
@@ -52,6 +60,11 @@ _STATUS_ERROR_CODES = {
 
 
 class _ResponseFormatUnsupported(Exception):
+    def __init__(self, request_id: str | None) -> None:
+        self.request_id = request_id
+
+
+class _StreamUnsupported(Exception):
     def __init__(self, request_id: str | None) -> None:
         self.request_id = request_id
 
@@ -113,6 +126,7 @@ class TencentPlanAdapter:
         jitter: Callable[[], float] = random.random,
         max_attempts: int = 3,
         schema_support_cache: MutableMapping[tuple[str, str, str], bool] | None = None,
+        stream_support_cache: MutableMapping[tuple[str, str], bool] | None = None,
         owned_client: AsyncOpenAI | None = None,
         log_writer: PromptLogWriter | None = None,
         reasoning_effort: str | None = None,
@@ -126,6 +140,9 @@ class TencentPlanAdapter:
         self._max_attempts = max_attempts
         self._schema_support_cache = (
             schema_support_cache if schema_support_cache is not None else _SCHEMA_SUPPORT_CACHE
+        )
+        self._stream_support_cache = (
+            stream_support_cache if stream_support_cache is not None else _STREAM_SUPPORT_CACHE
         )
         self._owned_client = owned_client
         # None = 使用默认写库实现（惰性导入，避免模块 import 期触碰数据库配置）。
@@ -193,6 +210,15 @@ class TencentPlanAdapter:
             messages = [messages[0], schema_instruction, *messages[1:]]
         log.messages = list(messages)
 
+        if request.thinking_sink is not None:
+            return await self._complete_json_stream(
+                request=request,
+                log=log,
+                schema=schema,
+                messages=messages,
+                use_schema=use_schema,
+            )
+
         for regeneration_count in range(2):
             response_format = self._response_format(request, schema, use_schema=use_schema)
             try:
@@ -216,8 +242,9 @@ class TencentPlanAdapter:
             log.parts = [content]
             log.usage = _usage(response)
             try:
-                value = request.output_model.model_validate_json(content, strict=True)
-            except ValidationError as exc:
+                parsed = parse_non_stream_output(content)
+                value = request.output_model.model_validate_json(parsed.json_text, strict=True)
+            except (ValidationError, ValueError) as exc:
                 if regeneration_count == 1:
                     raise ModelPlanInvalidError(
                         "MODEL_PLAN_INVALID",
@@ -236,6 +263,237 @@ class TencentPlanAdapter:
             )
 
         raise AssertionError("unreachable")
+
+    async def _complete_json_stream(
+        self,
+        *,
+        request: StructuredModelRequest[T],
+        log: _PromptLogState,
+        schema: dict[str, Any],
+        messages: list[dict[str, str]],
+        use_schema: bool,
+    ) -> StructuredResult[T]:
+        sink = request.thinking_sink
+        assert sink is not None
+        stream_cache_key = (self.base_url, self.model)
+
+        for regeneration_count in range(2):
+            attempt = regeneration_count + 1
+            started = time.monotonic()
+            await self._safe_sink_call(sink, "started", attempt=attempt)
+            response_format = self._response_format(request, schema, use_schema=use_schema)
+            log.parts = []
+            request_id: str | None = None
+            try:
+                if self._stream_support_cache.get(stream_cache_key, True):
+                    try:
+                        parsed, usage, request_id = await self._create_json_stream_with_retry(
+                            messages=messages,
+                            max_tokens=request.max_tokens,
+                            response_format=response_format,
+                            sink=sink,
+                            attempt=attempt,
+                            log=log,
+                        )
+                    except _StreamUnsupported:
+                        self._stream_support_cache[stream_cache_key] = False
+                        parsed, usage, request_id = await self._create_json_non_stream_for_sink(
+                            messages=messages,
+                            max_tokens=request.max_tokens,
+                            response_format=response_format,
+                            sink=sink,
+                            attempt=attempt,
+                            log=log,
+                        )
+                else:
+                    parsed, usage, request_id = await self._create_json_non_stream_for_sink(
+                        messages=messages,
+                        max_tokens=request.max_tokens,
+                        response_format=response_format,
+                        sink=sink,
+                        attempt=attempt,
+                        log=log,
+                    )
+
+                value = request.output_model.model_validate_json(parsed.json_text, strict=True)
+            except asyncio.CancelledError:
+                # Sink 已 started 后被取消也必须给出失败终态，
+                # 否则运行中的 operation 快照会永久残留。
+                await self._safe_sink_call(
+                    sink,
+                    "failed",
+                    attempt=attempt,
+                    error_code="CANCELLED",
+                )
+                raise
+            except (ValidationError, ValueError) as exc:
+                await self._safe_sink_call(
+                    sink,
+                    "failed",
+                    attempt=attempt,
+                    error_code="MODEL_PLAN_INVALID",
+                )
+                if regeneration_count == 1:
+                    raise ModelPlanInvalidError(
+                        "MODEL_PLAN_INVALID",
+                        retryable=False,
+                        request_id=request_id,
+                    ) from exc
+                messages = [*messages, self._repair_message(exc)]
+                log.messages = list(messages)
+                continue
+            except ModelAdapterError as exc:
+                await self._safe_sink_call(
+                    sink,
+                    "failed",
+                    attempt=attempt,
+                    error_code=exc.code,
+                )
+                raise
+            except Exception as exc:
+                mapped = self._map_error(exc)
+                await self._safe_sink_call(
+                    sink,
+                    "failed",
+                    attempt=attempt,
+                    error_code=mapped.code,
+                )
+                raise mapped from exc
+
+            await self._safe_sink_call(
+                sink,
+                "completed",
+                attempt=attempt,
+                duration_ms=int((time.monotonic() - started) * 1000),
+            )
+            return StructuredResult[T](
+                value=value,
+                usage=usage,
+                request_id=request_id,
+                regeneration_count=regeneration_count,
+            )
+
+        raise AssertionError("unreachable")
+
+    async def _create_json_non_stream_for_sink(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        max_tokens: int,
+        response_format: dict[str, Any],
+        sink: ThinkingSink,
+        attempt: int,
+        log: _PromptLogState,
+    ) -> tuple[ParsedStructuredOutput, TokenUsage | None, str | None]:
+        response = await self._create_with_retry(
+            messages=messages,
+            max_tokens=max_tokens,
+            response_format=response_format,
+            detect_schema_unsupported=False,
+        )
+        content = self._completion_content(response)
+        log.parts = [content]
+        usage = _usage(response)
+        log.usage = usage
+        parser = ThinkJsonStreamParser()
+        for text in parser.feed_content(content):
+            await self._safe_sink_call(sink, "delta", text, attempt=attempt)
+        parsed = parser.finish()
+        return parsed, usage, _request_id(response)
+
+    async def _create_json_stream_with_retry(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        max_tokens: int,
+        response_format: dict[str, Any],
+        sink: ThinkingSink,
+        attempt: int,
+        log: _PromptLogState,
+    ) -> tuple[ParsedStructuredOutput, TokenUsage | None, str | None]:
+        create_attempt = 0
+        while True:
+            parser = ThinkJsonStreamParser()
+            partial_output_received = False
+            finish_reason: str | None = None
+            request_id: str | None = None
+            usage: TokenUsage | None = None
+            try:
+                stream = await self._client.create(
+                    model=self.model,
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    response_format=response_format,
+                    stream=True,
+                    stream_options={"include_usage": True},
+                    **self._create_kwargs(),
+                )
+                async for chunk in stream:
+                    request_id = _request_id(chunk) or request_id
+                    chunk_usage = _usage(chunk)
+                    if chunk_usage is not None:
+                        usage = chunk_usage
+                        log.usage = chunk_usage
+                    choices = _value(chunk, "choices") or ()
+                    for choice in choices:
+                        reason = _value(choice, "finish_reason")
+                        if reason is not None:
+                            finish_reason = str(reason)
+                        delta = _value(choice, "delta")
+                        reasoning = _value(delta, "reasoning_content")
+                        if reasoning:
+                            partial_output_received = True
+                            for text in parser.feed_reasoning(str(reasoning)):
+                                await self._safe_sink_call(sink, "delta", text, attempt=attempt)
+                        content = _value(delta, "content")
+                        if content:
+                            partial_output_received = True
+                            text_content = str(content)
+                            log.parts.append(text_content)
+                            for text in parser.feed_content(text_content):
+                                await self._safe_sink_call(sink, "delta", text, attempt=attempt)
+                if finish_reason is None:
+                    raise ModelStreamInterrupted(
+                        partial_output_received=partial_output_received,
+                        request_id=request_id,
+                    )
+                return parser.finish(), usage, request_id
+            except asyncio.CancelledError:
+                raise
+            except ValueError:
+                raise
+            except ModelStreamInterrupted:
+                raise
+            except Exception as exc:
+                if not partial_output_received and self._is_stream_unsupported(exc):
+                    raise _StreamUnsupported(_request_id(exc) or request_id) from exc
+                mapped = self._map_error(exc)
+                if (
+                    mapped.retryable
+                    and not partial_output_received
+                    and create_attempt + 1 < self._max_attempts
+                ):
+                    await self._backoff(create_attempt)
+                    create_attempt += 1
+                    continue
+                if partial_output_received:
+                    raise ModelStreamInterrupted(
+                        partial_output_received=True,
+                        request_id=mapped.request_id or request_id,
+                    ) from exc
+                raise mapped from exc
+
+    async def _safe_sink_call(
+        self,
+        sink: ThinkingSink,
+        method: str,
+        *args: Any,
+        **kwargs: Any,
+    ) -> None:
+        try:
+            await getattr(sink, method)(*args, **kwargs)
+        except Exception:
+            logger.warning("thinking sink failed method=%s", method, exc_info=True)
 
     async def stream_text(self, request: StreamingModelRequest):
         log = _PromptLogState(request.purpose, request.log_context)
@@ -457,6 +715,39 @@ class TencentPlanAdapter:
         response_format_referenced = param == "response_format" or "json_schema" in message
         return response_format_referenced and explicitly_unsupported
 
+    def _is_stream_unsupported(self, exc: Exception) -> bool:
+        """仅识别供应商明确返回的 stream 参数不支持，其他 400 仍正常报错。"""
+        if _value(exc, "status_code") != 400:
+            return False
+        body = _value(exc, "body")
+        error = body.get("error", body) if isinstance(body, dict) else {}
+        if not isinstance(error, dict):
+            return False
+        param = str(error.get("param") or "").lower()
+        code = str(error.get("code") or "").lower()
+        message = str(error.get("message") or exc).lower()
+        explicitly_unsupported = "unsupported" in code or any(
+            phrase in message
+            for phrase in ("not supported", "does not support", "unsupported")
+        )
+        if not explicitly_unsupported:
+            return False
+        if param == "stream":
+            return True
+        stream_term = r"(?:stream|streaming|stream_options)"
+        return bool(
+            re.search(
+                rf"\b{stream_term}\b(?:\s+(?:parameter|option))?\s+"
+                r"(?:is\s+)?(?:not\s+supported|unsupported)\b",
+                message,
+            )
+            or re.search(
+                rf"\b(?:does\s+not\s+support|unsupported)\s+(?:the\s+)?"
+                rf"{stream_term}\b",
+                message,
+            )
+        )
+
     def _completion_content(self, response: Any) -> str:
         choices = _value(response, "choices") or ()
         if not choices:
@@ -465,11 +756,14 @@ class TencentPlanAdapter:
         content = _value(message, "content")
         return content if isinstance(content, str) else ""
 
-    def _repair_message(self, exc: ValidationError) -> dict[str, str]:
+    def _repair_message(self, exc: ValidationError | ValueError) -> dict[str, str]:
         safe_errors: list[dict[str, Any]] = []
-        for error in exc.errors(include_url=False, include_input=False)[
-            :_MAX_VALIDATION_ERRORS
-        ]:
+        errors = (
+            exc.errors(include_url=False, include_input=False)
+            if isinstance(exc, ValidationError)
+            else [{"type": "json_invalid", "loc": []}]
+        )
+        for error in errors[:_MAX_VALIDATION_ERRORS]:
             error_type = error.get("type")
             safe_type = (
                 error_type[:_MAX_VALIDATION_TYPE_LENGTH]

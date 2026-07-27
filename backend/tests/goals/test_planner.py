@@ -87,12 +87,14 @@ async def test_plan_task_builds_logged_structured_request() -> None:
     output = _valid_output()
     model = FakeModel([output])
     service = GoalPlannerService(model=model, context_builder=None)
+    thinking_sink = object()
 
-    result = await service.plan_context(_context())
+    result = await service.plan_context(_context(), thinking_sink=thinking_sink)
 
     assert result == output
     request = model.requests[0]
     assert request.purpose == "goal_planner"
+    assert request.thinking_sink is thinking_sink
     assert request.template_name == "goal_planner_v1"
     assert request.output_model is GoalPlannerOutput
     assert request.max_tokens == 2048
@@ -122,6 +124,45 @@ async def test_semantic_invalid_output_gets_one_feedback_retry() -> None:
         "goal_planner:shadow",
         "goal_planner:attempt:2",
     ]
+
+
+@pytest.mark.asyncio
+async def test_semantic_retry_uses_distinct_sink_attempts() -> None:
+    class CaptureSink:
+        def __init__(self) -> None:
+            self.started_attempts: list[int] = []
+            self.completed_attempts: list[int] = []
+
+        async def started(self, *, attempt: int) -> None:
+            self.started_attempts.append(attempt)
+
+        async def delta(self, text: str, *, attempt: int) -> None:
+            return None
+
+        async def completed(self, *, attempt: int, duration_ms: int) -> None:
+            self.completed_attempts.append(attempt)
+
+        async def failed(self, *, attempt: int, error_code: str) -> None:
+            return None
+
+    class ThinkingModel(FakeModel):
+        async def complete_json(self, request):
+            await request.thinking_sink.started(attempt=1)
+            result = await super().complete_json(request)
+            await request.thinking_sink.completed(attempt=1, duration_ms=1)
+            return result
+
+    sink = CaptureSink()
+    model = ThinkingModel([_invalid_output(), _valid_output()])
+
+    result = await GoalPlannerService(model=model, context_builder=None).plan_context(
+        _context(),
+        thinking_sink=sink,
+    )
+
+    assert result == _valid_output()
+    assert sink.started_attempts == [1, 2]
+    assert sink.completed_attempts == [1, 2]
 
 
 @pytest.mark.asyncio

@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { createTask } from './tasks';
+import { createTask, createTurnId } from './tasks';
 import type { TaskCreateResult } from './contracts';
 
 vi.mock('./client', () => ({
@@ -11,6 +11,31 @@ vi.mock('./client', () => ({
 describe('tasks api', () => {
   afterEach(() => {
     vi.clearAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it('creates a turn id with crypto.randomUUID when available', () => {
+    const randomUUID = vi.fn().mockReturnValue('turn-uuid');
+    vi.stubGlobal('crypto', { randomUUID });
+
+    expect(createTurnId()).toBe('turn-uuid');
+    expect(randomUUID).toHaveBeenCalledOnce();
+  });
+
+  it('creates a valid UUID v4 fallback turn id without crypto.randomUUID', () => {
+    vi.stubGlobal('crypto', {});
+
+    expect(createTurnId()).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
+  });
+
+  it('uses crypto.getRandomValues for the fallback when available', () => {
+    const getRandomValues = vi.fn((bytes: Uint8Array) => bytes.fill(7));
+    vi.stubGlobal('crypto', { getRandomValues });
+
+    expect(createTurnId()).toBe('07070707-0707-4707-8707-070707070707');
+    expect(getRandomValues).toHaveBeenCalledOnce();
   });
 
   it('returns the task outcome payload as-is', async () => {
@@ -28,12 +53,16 @@ describe('tasks api', () => {
     };
     vi.mocked(request).mockResolvedValue(outcome);
 
-    const result = await createTask('session-1', { content: '圈选达人' }, 'key-1');
+    const result = await createTask(
+      'session-1',
+      { content: '圈选达人', turn_id: 'turn-1' },
+      'key-1',
+    );
 
     expect(request).toHaveBeenCalledWith('/api/v1/sessions/session-1/tasks', {
       method: 'POST',
       headers: { 'Idempotency-Key': 'key-1' },
-      body: JSON.stringify({ content: '圈选达人' }),
+      body: JSON.stringify({ content: '圈选达人', turn_id: 'turn-1' }),
     });
     expect(result).toEqual(outcome);
     expect(result.outcome).toBe('task');

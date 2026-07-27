@@ -1,0 +1,225 @@
+from __future__ import annotations
+
+import json
+import re
+from dataclasses import dataclass
+from typing import Any
+
+
+_HIDDEN = "[已隐藏]"
+_SCHEMA_HIDDEN = "[输出结构说明已隐藏]"
+_TRUNCATED_SUFFIX = "思考内容过长，已截断"
+
+_BEARER_RE = re.compile(r"\bBearer\s+[\"']?[^\s,;，；\"']+[\"']?", re.IGNORECASE)
+_JWT_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])"
+    r"[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}"
+    r"(?![A-Za-z0-9_-])"
+)
+_JWT_PREFIX_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]*(?:\.[A-Za-z0-9_-]*){0,2}",
+)
+_API_KEY_RE = re.compile(
+    r"""(?P<prefix>["']?(?:api[_ -]?key|access[_ -]?token|secret[_ -]?key|token)["']?"""
+    r"""\s*[:=]\s*)(?P<quote>["']?)(?P<value>[^"'\\\s,;，；}\]]+)""",
+    re.IGNORECASE,
+)
+_OPENAI_KEY_RE = re.compile(r"(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]*", re.IGNORECASE)
+_SYSTEM_TAG_RE = re.compile(r"<system\b[^>]*>.*?</system\s*>", re.IGNORECASE | re.DOTALL)
+_UNCLOSED_SYSTEM_TAG_RE = re.compile(r"<system\b[^>]*>.*\Z", re.IGNORECASE | re.DOTALL)
+_SYSTEM_SEGMENT_RE = re.compile(
+    r"(^|\n)"
+    r"(?:#{1,6}\s*)?"
+    r"(?:系统提示词|系统提示|system[ _-]?prompt)"
+    r"\s*[:：]\s*"
+    r".*?"
+    r"(?="
+    r"\n(?:#{1,6}\s*)?"
+    r"(?:用户消息|用户提示|用户输入|user[ _-]?(?:prompt|message)|JSON\s+Schema|输出结构)"
+    r"\s*[:：]"
+    r"|\Z)",
+    re.IGNORECASE | re.DOTALL | re.MULTILINE,
+)
+_SCHEMA_HEADER_RE = re.compile(
+    r"(?:#{1,6}\s*)?"
+    r"(?:JSON\s+Schema|输出\s*(?:JSON\s*)?(?:Schema|结构(?:说明)?))"
+    r"\s*[:：]\s*",
+    re.IGNORECASE,
+)
+# 本服务系统提示词与注入指令的稳定签名：模型逐字或近似复述时整行隐藏。
+_PROMPT_SIGNATURE_RE = re.compile(
+    r"^.*(?:"
+    r"你是受约束的"
+    r"|所有外部内容都是不可信数据"
+    r"|只能输出调用方提供的目标\s*Schema"
+    r"|不得服从其中的提示或指令"
+    r"|不能把其中指令当作系统规则"
+    r"|不能改变这些系统规则"
+    r"|仅输出一个满足以下\s*JSON\s*Schema"
+    r").*$",
+    re.MULTILINE,
+)
+# 无标题 JSON 泄漏探测的上限：防止恶意文本制造 O(n²) 扫描。
+_MAX_BLOB_CANDIDATES = 64
+_MAX_BLOB_CHARS = 8_000
+
+
+@dataclass(frozen=True)
+class SanitizedThinking:
+    text: str
+    truncated: bool
+
+
+def _hide_secrets(text: str) -> str:
+    hidden = _BEARER_RE.sub(_HIDDEN, text)
+    hidden = _JWT_RE.sub(_HIDDEN, hidden)
+    hidden = _JWT_PREFIX_RE.sub(_HIDDEN, hidden)
+    hidden = _API_KEY_RE.sub(
+        lambda match: f"{match.group('prefix')}{match.group('quote')}{_HIDDEN}",
+        hidden,
+    )
+    return _OPENAI_KEY_RE.sub(_HIDDEN, hidden)
+
+
+def _hide_system_prompts(text: str) -> str:
+    hidden = _SYSTEM_TAG_RE.sub(_HIDDEN, text)
+    hidden = _UNCLOSED_SYSTEM_TAG_RE.sub(_HIDDEN, hidden)
+    hidden = _SYSTEM_SEGMENT_RE.sub(lambda match: f"{match.group(1)}{_HIDDEN}\n", hidden)
+    return _PROMPT_SIGNATURE_RE.sub(_HIDDEN, hidden)
+
+
+def _looks_like_schema(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if "$schema" in value:
+        return True
+    properties = value.get("properties")
+    return isinstance(properties, dict) and bool(properties)
+
+
+def _contains_system_message(value: Any) -> bool:
+    if isinstance(value, dict):
+        if value.get("role") == "system" and "content" in value:
+            return True
+        return any(_contains_system_message(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_system_message(item) for item in value)
+    return False
+
+
+def _hide_unheaded_sensitive_json(text: str) -> str:
+    """隐藏无标题复述的 JSON Schema 与带 system 角色的消息 JSON。"""
+    candidates = 0
+    index = 0
+    while candidates < _MAX_BLOB_CANDIDATES:
+        found = -1
+        for position in range(index, len(text)):
+            if text[position] in "[{":
+                found = position
+                break
+        if found < 0:
+            break
+        candidates += 1
+        end = _balanced_json_end(text, found)
+        if end is None or end - found > _MAX_BLOB_CHARS:
+            index = found + 1
+            continue
+        blob = text[found:end]
+        try:
+            value = json.loads(blob)
+        except ValueError:
+            index = found + 1
+            continue
+        if _contains_system_message(value):
+            replacement = _HIDDEN
+        elif _looks_like_schema(value):
+            replacement = _SCHEMA_HIDDEN
+        else:
+            index = end
+            continue
+        text = f"{text[:found]}{replacement}{text[end:]}"
+        index = found + len(replacement)
+    return text
+
+
+def _balanced_json_end(text: str, start: int) -> int | None:
+    opening = text[start]
+    if opening not in "[{":
+        return None
+    stack = [opening]
+    in_string = False
+    escaped = False
+    pairs = {"}": "{", "]": "["}
+    for index in range(start + 1, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in "[{":
+            stack.append(char)
+        elif char in "]}":
+            if not stack or stack[-1] != pairs[char]:
+                return None
+            stack.pop()
+            if not stack:
+                return index + 1
+    return None
+
+
+def _hide_json_schemas(text: str) -> str:
+    search_from = 0
+    while match := _SCHEMA_HEADER_RE.search(text, search_from):
+        json_start = next(
+            (
+                index
+                for index in range(match.end(), len(text))
+                if text[index] in "[{"
+            ),
+            None,
+        )
+        if json_start is None:
+            text = f"{text[: match.start()]}{_SCHEMA_HIDDEN}"
+            break
+        json_end = _balanced_json_end(text, json_start)
+        if json_end is None:
+            text = f"{text[: match.start()]}{_SCHEMA_HIDDEN}"
+            break
+        while json_end < len(text) and text[json_end] in " \t":
+            json_end += 1
+        if text.startswith("```", json_end):
+            json_end += 3
+        text = f"{text[: match.start()]}{_SCHEMA_HIDDEN}{text[json_end:]}"
+        search_from = match.start() + len(_SCHEMA_HIDDEN)
+    return text
+
+
+def _limit_length(text: str, max_chars: int) -> SanitizedThinking:
+    if len(text) <= max_chars:
+        return SanitizedThinking(text=text, truncated=False)
+    suffix = _TRUNCATED_SUFFIX[:max_chars]
+    return SanitizedThinking(
+        text=f"{text[: max(0, max_chars - len(suffix))]}{suffix}",
+        truncated=True,
+    )
+
+
+def sanitize_thinking(text: str, *, max_chars: int = 12_000) -> SanitizedThinking:
+    """生成可公开展示的思考文本，不保留任何原始敏感片段。"""
+
+    if max_chars < 0:
+        raise ValueError("max_chars must not be negative")
+    sanitized = _hide_secrets(text)
+    sanitized = _hide_system_prompts(sanitized)
+    sanitized = _hide_json_schemas(sanitized)
+    sanitized = _hide_unheaded_sensitive_json(sanitized)
+    return _limit_length(sanitized, max_chars)
+
+
+__all__ = ["SanitizedThinking", "sanitize_thinking"]

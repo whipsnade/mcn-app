@@ -23,10 +23,14 @@ from app.orchestration.loop import (
 from app.orchestration.schemas import PlannerTool
 from app.selection.models import KolSelectionItem, KolSelectionSet, SessionKolSelection
 from app.selection.service import KolSelectionService
-from app.tasks.dependencies import _TaskArtifacts
+from app.tasks import dependencies
+from app.tasks.dependencies import TaskExecutionDependencies, _TaskArtifacts
+from app.tasks.errors import safe_error
 from app.tasks.executor import TaskExecutor
 from app.tasks.models import AnalysisTask, TaskEvent
 from app.tasks.repository import TaskRepository
+from app.thinking.contracts import ThinkingBlock
+from app.thinking.persistence import ThinkingMessageStore
 from app.workspace.models import Message, WorkspaceSession
 
 
@@ -871,6 +875,7 @@ async def _create_leased_task(worker_id: str) -> dict[str, str]:
         "session_id": str(uuid4()),
         "message_id": str(uuid4()),
         "task_id": str(uuid4()),
+        "turn_id": str(uuid4()),
     }
     async with SessionFactory.begin() as db:
         db.add(
@@ -908,7 +913,7 @@ async def _create_leased_task(worker_id: str) -> dict[str, str]:
                 role="user",
                 content="帮我圈选达人",
                 sequence=1,
-                metadata_json={},
+                metadata_json={"turn_id": ids["turn_id"]},
                 created_at=now,
             )
         )
@@ -1010,10 +1015,90 @@ async def test_task_repository_terminal_methods_report_persistence(
 
 
 @pytest.mark.asyncio
+async def test_task_error_message_absorbs_pending_thinking_on_create_and_replay() -> None:
+    worker_id = f"test-worker-{uuid4()}"
+    ids = await _create_leased_task(worker_id)
+    try:
+        now = datetime.now(UTC)
+
+        async def persist(operation_id: str) -> None:
+            async with SessionFactory.begin() as db:
+                await ThinkingMessageStore(db).persist_block(
+                    ThinkingBlock(
+                        operation_id=operation_id,
+                        turn_id=ids["turn_id"],
+                        purpose="agent_loop",
+                        attempt=1,
+                        label="正在分析数据",
+                        content=f"思考 {operation_id}",
+                        status="interrupted",
+                        started_at=now,
+                        completed_at=now,
+                        duration_ms=8,
+                        task_id=ids["task_id"],
+                    ),
+                    user_id=ids["user_id"],
+                    session_id=ids["session_id"],
+                )
+
+        await persist("agent-error-1")
+        async with SessionFactory.begin() as db:
+            assert await TaskRepository(db).mark_failed(
+                ids["task_id"], worker_id, "upstream_error"
+            )
+            first_message = await db.scalar(
+                select(Message).where(
+                    Message.error_idempotency_key
+                    == f"{ids['task_id']}:upstream_error"
+                )
+            )
+            assert first_message is not None
+            assert first_message.metadata_json["thinking"]["blocks"][0][
+                "operation_id"
+            ] == "agent-error-1"
+        await persist("agent-error-2")
+        async with SessionFactory.begin() as db:
+            task = await db.get(AnalysisTask, ids["task_id"])
+            assert task is not None
+            message = await TaskRepository(db)._append_error_message(
+                task, safe_error("upstream_error")
+            )
+            assert message.metadata_json["turn_id"] == ids["turn_id"]
+            assert [
+                block["operation_id"]
+                for block in message.metadata_json["thinking"]["blocks"]
+            ] == ["agent-error-1", "agent-error-2"]
+            user_message = await db.get(Message, ids["message_id"])
+            assert user_message is not None
+            assert "thinking_pending" not in user_message.metadata_json
+    finally:
+        await _cleanup_leased_task(ids)
+
+
+@pytest.mark.asyncio
 async def test_write_conclusion_message_persists_assistant_message_idempotently() -> None:
     worker_id = f"test-worker-{uuid4()}"
     ids = await _create_leased_task(worker_id)
     try:
+        now = datetime.now(UTC)
+        async with SessionFactory.begin() as db:
+            await ThinkingMessageStore(db).persist_block(
+                ThinkingBlock(
+                    operation_id="agent-op-1",
+                    turn_id=ids["turn_id"],
+                    purpose="agent_loop",
+                    attempt=1,
+                    label="正在分析数据",
+                    content="正在核对达人数据",
+                    status="completed",
+                    started_at=now,
+                    completed_at=now,
+                    duration_ms=8,
+                    task_id=ids["task_id"],
+                ),
+                user_id=ids["user_id"],
+                session_id=ids["session_id"],
+            )
         artifacts = _TaskArtifacts(worker_id, model=None)
         await artifacts.write_conclusion_message(ids["task_id"], "已圈选 12 位达人，覆盖小红书。")
         # 重试安全：相同 task_id 的结论消息已存在时直接返回，不重复写入。
@@ -1037,6 +1122,26 @@ async def test_write_conclusion_message_persists_assistant_message_idempotently(
                 "task_id": ids["task_id"],
                 "kind": "conclusion",
                 "status": "completed",
+                "turn_id": ids["turn_id"],
+                "thinking": {
+                    "version": 1,
+                    "status": "completed",
+                    "blocks": [
+                        {
+                            "operation_id": "agent-op-1",
+                            "purpose": "agent_loop",
+                            "attempt": 1,
+                            "label": "正在分析数据",
+                            "content": "正在核对达人数据",
+                            "status": "completed",
+                            "started_at": now.isoformat(),
+                            "completed_at": now.isoformat(),
+                            "duration_ms": 8,
+                            "truncated": False,
+                            "task_id": ids["task_id"],
+                        }
+                    ],
+                },
             }
             event = await db.scalar(
                 select(TaskEvent).where(
@@ -1115,8 +1220,10 @@ class _FakeAnalysisModel:
 
     def __init__(self, document: ReportDocument | None) -> None:
         self.document = document
+        self.requests: list = []
 
     async def complete_json(self, request):
+        self.requests.append(request)
         if self.document is None:
             raise ModelPlanInvalidError("MODEL_PLAN_INVALID", retryable=False)
         return StructuredResult(
@@ -1157,10 +1264,13 @@ async def test_auto_kol_analysis_builds_session_report_and_emits_event() -> None
     ids = await _create_leased_task(worker_id)
     try:
         await _seed_selection_rows(ids, 2)
-        artifacts = _TaskArtifacts(worker_id, model=_FakeAnalysisModel(_analysis_document()))
+        model = _FakeAnalysisModel(_analysis_document())
+        artifacts = _TaskArtifacts(worker_id, model=model)
 
         await artifacts.auto_kol_analysis(ids["task_id"])
 
+        assert model.requests[0].purpose == "kol_analysis"
+        assert model.requests[0].thinking_sink is not None
         async with SessionFactory() as db:
             report = await db.scalar(
                 select(AnalysisReport).where(
@@ -1188,6 +1298,75 @@ async def test_auto_kol_analysis_builds_session_report_and_emits_event() -> None
             }
     finally:
         await _cleanup_leased_task(ids)
+
+
+@pytest.mark.asyncio
+async def test_agent_decide_only_connects_task_turn_to_thinking_sink(monkeypatch) -> None:
+    class _Model:
+        def __init__(self) -> None:
+            self.requests: list = []
+
+        async def complete_json(self, request):
+            self.requests.append(request)
+            return StructuredResult(
+                value=_finish("完成"),
+                usage=None,
+                request_id="agent-thinking",
+                regeneration_count=0,
+            )
+
+    class _ThinkingService:
+        def __init__(self) -> None:
+            self.sink = object()
+
+        def create_sink(self, spec):
+            self.spec = spec
+            return self.sink
+
+        async def completed_blocks(self, **_kwargs):
+            return ()
+
+    class _SessionCM:
+        async def __aenter__(self):
+            return object()
+
+        async def __aexit__(self, *_args):
+            return None
+
+    async def no_exemplars(*_args, **_kwargs):
+        return []
+
+    model = _Model()
+    thinking_service = _ThinkingService()
+    runtime = object.__new__(TaskExecutionDependencies)
+    runtime._model = model
+    monkeypatch.setattr(dependencies, "SessionFactory", lambda: _SessionCM())
+    monkeypatch.setattr(dependencies, "find_success_exemplars", no_exemplars)
+    monkeypatch.setattr(
+        dependencies, "get_session_thinking_service", lambda: thinking_service
+    )
+    context = AgentLoopContext(
+        recent_messages=(),
+        tools=(_tool(),),
+        allowed_channels=("xiaohongshu",),
+        log_context={
+            "user_id": "user-1",
+            "session_id": "session-1",
+            "task_id": "task-1",
+            "goal_id": "goal-1",
+            "turn_id": "turn-1",
+            "tags": ["platform:xiaohongshu"],
+        },
+    )
+
+    await runtime.agent_decide(context)
+
+    [request] = model.requests
+    assert request.purpose == "agent_loop"
+    assert request.thinking_sink is thinking_service.sink
+    assert thinking_service.spec.task_id == "task-1"
+    assert thinking_service.spec.goal_id == "goal-1"
+    assert thinking_service.spec.label == "正在分析数据"
 
 
 @pytest.mark.asyncio
