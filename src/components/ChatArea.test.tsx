@@ -339,7 +339,7 @@ describe('ChatArea', () => {
     await waitFor(() => expect(input.value).toBe(''));
   });
 
-  it('keeps the input available while a task is running but prevents a duplicate submit', () => {
+  it('keeps the input available while a task is running and replaces the submit button with a pause button', () => {
     const onSendMessage = vi.fn().mockResolvedValue(undefined);
     render(
       <ChatArea
@@ -353,10 +353,74 @@ describe('ChatArea', () => {
     const input = screen.getByPlaceholderText(/正在进行深度多维数据分析中/) as HTMLTextAreaElement;
     expect(input).toBeEnabled();
     fireEvent.change(input, { target: { value: '稍后继续分析' } });
-    fireEvent.click(screen.getByRole('button', { name: '发送' }));
+    fireEvent.click(screen.getByRole('button', { name: '暂停' }));
 
     expect(input.value).toBe('稍后继续分析');
+    expect(screen.queryByRole('button', { name: '发送' })).toBeNull();
     expect(onSendMessage).not.toHaveBeenCalled();
+  });
+
+  it('renders an icon send button that stays disabled while the input is empty', () => {
+    render(
+      <ChatArea
+        session={session}
+        onSendMessage={vi.fn()}
+        isAnalyzing={false}
+        isMockMode
+      />,
+    );
+
+    const sendButton = screen.getByRole('button', { name: '发送' });
+    expect(sendButton).toBeDisabled();
+
+    fireEvent.change(screen.getByPlaceholderText(/输入消息并向 AI 分析师提问/), {
+      target: { value: '请分析品牌' },
+    });
+    expect(sendButton).toBeEnabled();
+  });
+
+  it('calls onCancelTask from the pause button without submitting the form', async () => {
+    const onSendMessage = vi.fn().mockResolvedValue(undefined);
+    const onCancelTask = vi.fn().mockResolvedValue(undefined);
+    render(
+      <ChatArea
+        session={session}
+        onSendMessage={onSendMessage}
+        onCancelTask={onCancelTask}
+        isAnalyzing
+        isMockMode
+      />,
+    );
+
+    const input = screen.getByPlaceholderText(/正在进行深度多维数据分析中/) as HTMLTextAreaElement;
+    fireEvent.change(input, { target: { value: '这条不应被提交' } });
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '暂停' }));
+    });
+
+    expect(onCancelTask).toHaveBeenCalledOnce();
+    expect(onSendMessage).not.toHaveBeenCalled();
+    expect(input.value).toBe('这条不应被提交');
+  });
+
+  it('disables the pause button and labels it 正在取消 while a cancel is in flight', () => {
+    const onCancelTask = vi.fn().mockResolvedValue(undefined);
+    render(
+      <ChatArea
+        session={session}
+        onSendMessage={vi.fn()}
+        onCancelTask={onCancelTask}
+        isAnalyzing
+        isCancelling
+        isMockMode
+      />,
+    );
+
+    const button = screen.getByRole('button', { name: '正在取消' });
+    expect(button).toBeDisabled();
+    fireEvent.click(button);
+    expect(onCancelTask).not.toHaveBeenCalled();
+    expect(screen.queryByRole('button', { name: '暂停' })).toBeNull();
   });
 
   it('shows the flow nodes with failure detail without exposing transport details', () => {

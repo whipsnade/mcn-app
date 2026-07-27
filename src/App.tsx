@@ -181,6 +181,8 @@ export default function App() {
                   }}
                   isAnalyzing={workspace.isAnalyzing}
                   isClarifying={workspace.isClarifying}
+                  onCancelTask={workspace.cancelActiveTask}
+                  isCancelling={workspace.cancelRequested}
                   isMockMode={false}
                   flowNodes={workspace.taskRuntime?.nodes ?? []}
                   flowTerminal={isTerminalTaskStatus(workspace.taskRuntime?.status)}

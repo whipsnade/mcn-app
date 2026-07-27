@@ -10,6 +10,7 @@ import {
 } from '../api/sessions';
 import { isBrainstormProfileReady, postBrainstorm } from '../api/brainstorm';
 import {
+  cancelTask,
   createTask,
   createTurnId,
   getAnalysisReport,
@@ -55,6 +56,7 @@ export function useWorkspace(userId?: string) {
   const [error, setError] = useState<string>();
   const [activeTaskId, setActiveTaskId] = useState<string>();
   const [isClarifying, setIsClarifying] = useState(false);
+  const [cancelRequested, setCancelRequested] = useState(false);
   const generationRef = useRef(0);
   const selectionRequestRef = useRef(0);
   const sessionsRef = useRef<Session[]>([]);
@@ -530,6 +532,21 @@ export function useWorkspace(userId?: string) {
     }
   }, [activeSessionId, getSessionOperationEpoch, sessionOperationIsCurrent, sessions, userId]);
 
+  // 取消当前任务：点击后立即 latch（按钮禁用），API 失败立即复位可重试；
+  // 成功时不在此处复位，等 SSE task.cancelled 收敛为终态后由下方 effect 复位。
+  const cancelActiveTask = useCallback(async () => {
+    const taskId = activeTaskId;
+    if (!taskId || cancelRequested) return;
+    setCancelRequested(true);
+    try {
+      await cancelTask(taskId);
+      // latch：不在此处复位，等 SSE task.cancelled（终态）由 effect 复位。
+    } catch (cancelError) {
+      console.warn('cancel task failed', cancelError);
+      setCancelRequested(false);
+    }
+  }, [activeTaskId, cancelRequested]);
+
   useEffect(() => {
     if (!currentTaskRuntime || !activeTaskId) return;
     const generation = generationRef.current;
@@ -701,6 +718,19 @@ export function useWorkspace(userId?: string) {
     activeSession?.analysis && taskIsInProgress(currentTaskRuntime?.status ?? activeSession.analysis.status),
   );
 
+  // cancelRequested latch 复位：终态到达 / 任务消失 / 不再 analyzing 三路。
+  useEffect(() => {
+    if (!cancelRequested) return;
+    if (!activeTaskId || !isAnalyzing) {
+      setCancelRequested(false);
+      return;
+    }
+    const status = currentTaskRuntime?.status;
+    if (status && isTerminalTaskStatus(status)) {
+      setCancelRequested(false);
+    }
+  }, [cancelRequested, activeTaskId, isAnalyzing, currentTaskRuntime?.status]);
+
   return {
     sessions,
     activeSession,
@@ -711,6 +741,8 @@ export function useWorkspace(userId?: string) {
     busy,
     isAnalyzing,
     isClarifying,
+    cancelRequested,
+    cancelActiveTask,
     error,
     reload,
     selectSession,

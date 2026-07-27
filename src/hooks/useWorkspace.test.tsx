@@ -6,6 +6,7 @@ import type { ApiBrainstormResponse } from '../api/contracts';
 import { postBrainstorm } from '../api/brainstorm';
 import { createSession, deleteSession, getSession, listSessions, updateSession } from '../api/sessions';
 import {
+  cancelTask,
   createTask,
   createTurnId,
   getAnalysisReport,
@@ -119,6 +120,7 @@ vi.mock('../api/brainstorm', async importOriginal => {
 });
 
 vi.mock('../api/tasks', () => ({
+  cancelTask: vi.fn(),
   createTask: vi.fn(),
   createTurnId: vi.fn(),
   getTask: vi.fn(),
@@ -144,6 +146,10 @@ describe('useWorkspace', () => {
     vi.mocked(listSessions).mockResolvedValue([session]);
     vi.mocked(getSession).mockResolvedValue(restoredSession);
     vi.mocked(useTaskStream).mockReturnValue(undefined);
+    vi.mocked(cancelTask).mockResolvedValue({
+      id: 'task-1', session_id: 'session-1', status: 'running', estimated_points: 0,
+      error_code: null, latest_report_id: null,
+    });
     vi.mocked(getArtifactsSummary).mockResolvedValue(emptyArtifactsSummary);
     vi.mocked(markArtifactRead).mockResolvedValue(undefined);
   });
@@ -1402,5 +1408,131 @@ describe('useWorkspace', () => {
     await waitFor(() => expect(result.current.activeSession?.messages).toHaveLength(3));
     rerender();
     expect(result.current.activeSession?.messages.filter(message => message.id === 'error-1')).toHaveLength(1);
+  });
+
+  it('cancelActiveTask calls cancelTask for the active task and sets cancelRequested', async () => {
+    vi.mocked(createTask).mockResolvedValue(taskOutcome({
+      id: 'task-1', session_id: 'session-1', status: 'pending', estimated_points: 0,
+      error_code: null, latest_report_id: null,
+    }));
+    const { result } = renderHook(() => useWorkspace('user-a'));
+    await waitFor(() => expect(result.current.activeSession?.id).toBe('session-1'));
+    await act(async () => {
+      await result.current.appendMessage('先跑一个任务');
+    });
+    expect(result.current.activeTaskId).toBe('task-1');
+    expect(result.current.isAnalyzing).toBe(true);
+    expect(result.current.cancelRequested).toBe(false);
+
+    await act(async () => {
+      await result.current.cancelActiveTask();
+    });
+
+    expect(cancelTask).toHaveBeenCalledWith('task-1');
+    expect(result.current.cancelRequested).toBe(true);
+  });
+
+  it('keeps cancelRequested latched after the cancel API resolves until the terminal event arrives', async () => {
+    vi.mocked(createTask).mockResolvedValue(taskOutcome({
+      id: 'task-1', session_id: 'session-1', status: 'pending', estimated_points: 0,
+      error_code: null, latest_report_id: null,
+    }));
+    const pendingCancel = deferred<Awaited<ReturnType<typeof cancelTask>>>();
+    vi.mocked(cancelTask).mockReturnValue(pendingCancel.promise);
+    const { result } = renderHook(() => useWorkspace('user-a'));
+    await waitFor(() => expect(result.current.activeSession?.id).toBe('session-1'));
+    await act(async () => {
+      await result.current.appendMessage('先跑一个任务');
+    });
+
+    let cancelPromise!: Promise<unknown>;
+    act(() => {
+      cancelPromise = result.current.cancelActiveTask();
+    });
+    await waitFor(() => expect(result.current.cancelRequested).toBe(true));
+    expect(cancelTask).toHaveBeenCalledWith('task-1');
+
+    await act(async () => {
+      pendingCancel.resolve({
+        id: 'task-1', session_id: 'session-1', status: 'running', estimated_points: 0,
+        error_code: null, latest_report_id: null,
+      });
+      await cancelPromise;
+    });
+
+    // API 已 resolve，但 task.cancelled（终态 SSE）未到：latch 保持，重复点击不再调用。
+    expect(result.current.cancelRequested).toBe(true);
+    await act(async () => {
+      await result.current.cancelActiveTask();
+    });
+    expect(cancelTask).toHaveBeenCalledTimes(1);
+  });
+
+  it('resets cancelRequested once the task runtime reaches a terminal status', async () => {
+    vi.mocked(createTask).mockResolvedValue(taskOutcome({
+      id: 'task-1', session_id: 'session-1', status: 'pending', estimated_points: 0,
+      error_code: null, latest_report_id: null,
+    }));
+    const { result, rerender } = renderHook(() => useWorkspace('user-a'));
+    await waitFor(() => expect(result.current.activeSession?.id).toBe('session-1'));
+    await act(async () => {
+      await result.current.appendMessage('先跑一个任务');
+    });
+    await act(async () => {
+      await result.current.cancelActiveTask();
+    });
+    expect(result.current.cancelRequested).toBe(true);
+
+    vi.mocked(useTaskStream).mockReturnValue({
+      taskId: 'task-1', lastEventId: 3, assistantDraft: '', connection: 'closed', status: 'cancelled',
+    });
+    rerender();
+
+    await waitFor(() => expect(result.current.cancelRequested).toBe(false));
+    expect(result.current.isAnalyzing).toBe(false);
+  });
+
+  it('cancelActiveTask is a no-op when there is no active task', async () => {
+    const { result } = renderHook(() => useWorkspace('user-a'));
+    await waitFor(() => expect(result.current.activeSession?.id).toBe('session-1'));
+    expect(result.current.activeTaskId).toBeUndefined();
+
+    await act(async () => {
+      await result.current.cancelActiveTask();
+    });
+
+    expect(cancelTask).not.toHaveBeenCalled();
+    expect(result.current.cancelRequested).toBe(false);
+  });
+
+  it('resets cancelRequested immediately when the cancel request fails so it can be retried', async () => {
+    vi.mocked(createTask).mockResolvedValue(taskOutcome({
+      id: 'task-1', session_id: 'session-1', status: 'pending', estimated_points: 0,
+      error_code: null, latest_report_id: null,
+    }));
+    vi.mocked(cancelTask).mockRejectedValue(new Error('CANCEL_FAILED'));
+    const { result } = renderHook(() => useWorkspace('user-a'));
+    await waitFor(() => expect(result.current.activeSession?.id).toBe('session-1'));
+    await act(async () => {
+      await result.current.appendMessage('先跑一个任务');
+    });
+
+    await act(async () => {
+      await result.current.cancelActiveTask();
+    });
+
+    expect(cancelTask).toHaveBeenCalledWith('task-1');
+    expect(result.current.cancelRequested).toBe(false);
+
+    // 失败复位后可重试。
+    vi.mocked(cancelTask).mockResolvedValue({
+      id: 'task-1', session_id: 'session-1', status: 'running', estimated_points: 0,
+      error_code: null, latest_report_id: null,
+    });
+    await act(async () => {
+      await result.current.cancelActiveTask();
+    });
+    expect(cancelTask).toHaveBeenCalledTimes(2);
+    expect(result.current.cancelRequested).toBe(true);
   });
 });
