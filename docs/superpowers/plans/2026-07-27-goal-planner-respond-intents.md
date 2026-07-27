@@ -10,7 +10,10 @@
 
 **Spec:** `docs/superpowers/specs/2026-07-27-goal-planner-respond-intents-design.md`
 
-**与 spec 的一处偏差（实现细化，已确认更优）：** spec 写 context_qa 走 `stream_text`，但 `StreamingModelRequest` 的 `purpose`/`template_name` 被 Literal 锁定为 summary 专用（`backend/app/model/contracts.py:72-79`）， widening 影响面大。改用现有结构化出口 `complete_json` + 小输出模型 `ContextQaAnswer{answer}`，零 widening 且自动获得 `<think>` 分离与修复重试。
+**与 spec 的偏差（实现细化，已确认更优）：**
+
+1. spec 写 context_qa 走 `stream_text`，但 `StreamingModelRequest` 的 `purpose`/`template_name` 被 Literal 锁定为 summary 专用（`backend/app/model/contracts.py:72-79`），widening 影响面大。改用现有结构化出口 `complete_json` + 小输出模型 `ContextQaAnswer{answer}`，零 widening 且自动获得 `<think>` 分离与修复重试。
+2. spec 把静态文案放在新模块 `app/workspace/usage_guide.py`，计划改为集中在 `app/goals/respond.py`——三类回复的文案与生成逻辑同一模块更内聚，不新增模块。
 
 **验证命令（每个 Task 的 Commit 前必跑）：**
 
@@ -320,7 +323,9 @@ async def test_recent_task_outcomes_projects_latest_three(auth_client_factory, d
     assert "error_message" in outcomes[0]
 ```
 
-注意：`AnalysisTask` 必填字段以 `backend/app/tasks/models.py` 为准，实现时先读模型再补齐（上表为示意，字段名/必填项不一致时按模型修正）。`status` 是 `TaskStatus` 枚举。
+注意（plan 评审已核对 `backend/app/tasks/models.py`）：
+- `AnalysisTask.status` 是纯 `Mapped[str]`（String(32)），**不是枚举**，不要写 `task.status.value`。
+- `AnalysisTask.trigger_message_id` 是 `nullable=False` 且带 `ForeignKey("messages.id")`：测试需先落一条 `Message` 再用其 id 回填，否则 `flush()` 触发 NOT NULL 约束失败。其余必填字段以模型源码为准补齐。
 
 - [ ] **Step 2: 跑测试确认失败**
 
@@ -351,7 +356,7 @@ async def recent_task_outcomes(
     )
     return [
         {
-            "status": task.status.value,
+            "status": task.status,
             "error_code": task.error_code,
             "error_message": task.error_message,
             "completed_at": (
@@ -638,9 +643,9 @@ def _fit_budget(evidence: dict[str, Any]) -> dict[str, Any]:
     return evidence
 
 
-async def build_context_qa_evidence(
+async def _recent_messages_projection(
     db, *, user_id: str, session_id: str
-) -> dict[str, Any]:
+) -> list[dict[str, Any]]:
     history = list(
         (
             await db.scalars(
@@ -655,9 +660,19 @@ async def build_context_qa_evidence(
         ).all()
     )
     history.reverse()
-    recent = compress_messages(history, max_chars=_RECENT_MESSAGES_MAX_CHARS)
+    return [
+        message.model_dump(mode="json")
+        for message in compress_messages(history, max_chars=_RECENT_MESSAGES_MAX_CHARS)
+    ]
+
+
+async def build_context_qa_evidence(
+    db, *, user_id: str, session_id: str
+) -> dict[str, Any]:
     evidence: dict[str, Any] = {
-        "recent_messages": [message.model_dump(mode="json") for message in recent],
+        "recent_messages": await _recent_messages_projection(
+            db, user_id=user_id, session_id=session_id
+        ),
         "recent_task_outcomes": await recent_task_outcomes(db, user_id, session_id),
         "selection": await _selection_projection(db, session_id),
         "reports": await _report_projections(db, session_id),
@@ -679,8 +694,21 @@ async def answer_context_qa(
             db, user_id=user_id, session_id=session_id
         )
     except Exception:
+        # spec 降级语义：证据包组装失败时降级为仅最近消息；再失败给空包。
         logger.warning("context_qa_evidence_failed session_id=%s", session_id, exc_info=True)
-        evidence = {}
+        try:
+            evidence = {
+                "recent_messages": await _recent_messages_projection(
+                    db, user_id=user_id, session_id=session_id
+                )
+            }
+        except Exception:
+            logger.warning(
+                "context_qa_recent_messages_failed session_id=%s",
+                session_id,
+                exc_info=True,
+            )
+            evidence = {}
     try:
         result = await model.complete_json(
             StructuredModelRequest(
