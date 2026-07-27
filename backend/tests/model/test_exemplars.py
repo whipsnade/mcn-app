@@ -376,3 +376,55 @@ async def test_goal_planner_exemplar_uses_only_final_semantic_success(
     assert json.loads(exemplars[0]["excerpt"])["response"]["goals"][0]["goal_type"] == (
         "campaign_analysis"
     )
+
+
+@pytest.mark.asyncio
+async def test_find_success_exemplars_parses_think_wrapped_response(
+    db_session: AsyncSession,
+) -> None:
+    """推理模型历史响应带 <think> 前缀时，仍能提取决策片段而不是空 excerpt。"""
+    db_session.add(
+        _log(
+            tags=["quick:top_posts"],
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        '<think>梳理一下场景</think>{"feature":"top_posts","goal":"找爆贴"}'
+                    ),
+                }
+            ],
+            response='<think>先推理一下</think>{"action":"finish","result":"ok"}',
+        )
+    )
+    await db_session.flush()
+
+    [exemplar] = await find_success_exemplars(
+        db_session, purpose="quick_feature", tags=["quick:top_posts"]
+    )
+
+    excerpt = json.loads(exemplar["excerpt"])
+    assert excerpt["response"]["action"] == "finish"
+    assert excerpt["response"]["result"] == "ok"
+    assert excerpt["request"]["feature"] == "top_posts"
+
+
+@pytest.mark.asyncio
+async def test_find_success_exemplars_plain_json_response_unchanged(
+    db_session: AsyncSession,
+) -> None:
+    """回归：普通 JSON 响应的 excerpt 行为不变。"""
+    db_session.add(
+        _log(
+            tags=["quick:top_posts"],
+            response={"action": "finish", "result": "ok"},
+        )
+    )
+    await db_session.flush()
+
+    [exemplar] = await find_success_exemplars(
+        db_session, purpose="quick_feature", tags=["quick:top_posts"]
+    )
+
+    excerpt = json.loads(exemplar["excerpt"])
+    assert excerpt["response"] == {"action": "finish", "result": "ok"}

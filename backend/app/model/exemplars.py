@@ -18,6 +18,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.model.models import ModelPromptLog
+from app.model.structured_output import extract_single_json_object
 
 
 # 单条案例注入 prompt 的长度上限（字符）。
@@ -47,6 +48,12 @@ def _parse_json(text: str | None) -> Any:
         return None
     try:
         return json.loads(text)
+    except ValueError:
+        pass
+    # 推理模型历史记录常带 <think>…</think> 前缀/包裹，直接 loads 失败，
+    # 回退用结构化输出的括号扫描提取其中的 JSON 对象再解析。
+    try:
+        return json.loads(extract_single_json_object(text))
     except ValueError:
         return None
 
