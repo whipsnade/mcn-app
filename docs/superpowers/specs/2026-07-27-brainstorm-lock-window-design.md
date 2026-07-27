@@ -45,8 +45,13 @@
 
 5. 重新 `get_owned_session(for_update=True)`，**重读画像**（并发下可能已被另一请求
    推进），以最新画像为 base 做 `merge_profile`。
-6. 落用户消息（sequence 取 max+1）、更新 workspace（profile/title/标量列）、
-   ready 时 `TaskService.create(goal_specs)`、落 assistant 消息、flush；
+6. 沿用 `workspace_service.append_message` 落用户消息（其内部自带会话行锁与
+   `updated_at/last_accessed_at` 刷新），并**显式写
+   `user_message.metadata_json = {"turn_id": turn_id}`**——思考持久化
+   （`persist_block`/`record_brainstorm_failure`）匹配用户消息靠的就是这个 metadata
+   键而非 SSE 的 trigger_message_id；非 ready 路径无任何兜底，漏写会让该 turn 的
+   思考块静默丢失。随后更新 workspace（profile/title/标量列）、ready 时
+   `TaskService.create(goal_specs)`、落 assistant 消息、flush；
    `bind_turn` 补绑 `trigger_message_id=user_message.id`（bind_turn 幂等更新绑定）。
 7. 路由不变：commit → `persist_turn_thinking` → `task_runner.submit`。
 
@@ -70,8 +75,8 @@
 - 新增：模型失败时请求事务零写入（断言失败落库由 record_brainstorm_failure 独立
   完成且用户消息只有一条）；ready 路径写阶段重读画像（并发推进画像时以最新为准，
   可用先写一条 profile 再调 respond 的方式模拟）。
-- thinking 绑定：写阶段补绑 trigger_message_id 后，持久化块正确挂到 assistant 消息
-  （既有恢复断言覆盖）。
+- thinking 持久化：用户消息 `metadata_json.turn_id` 存在；块经 `thinking_pending` →
+  attach 挂到 assistant 消息（既有恢复断言覆盖）。
 
 ## 遗留事项
 
