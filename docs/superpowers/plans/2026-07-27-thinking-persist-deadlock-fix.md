@@ -43,7 +43,10 @@ async def test_persist_turn_thinking_without_assistant_skips_attach(...) -> None
 ```
 
 fixture 参考该文件既有用例（auth_client_factory / db_session / 真实 session+消息构造）。
-`OperationalError` 构造：`sqlalchemy.exc.OperationalError("","", Exception("(1213, 'Deadlock found when trying to get lock; try restarting transaction')"))`——helper 判定 1213 的方式：检查 `error.orig` 的 args 首元素元组含 1213（先读 asyncmy OperationalError 的实际结构，以能稳定判定为准；判不了就放宽为「任何 OperationalError 重试一次」并在注释说明）。
+`OperationalError` 构造：`sqlalchemy.exc.OperationalError("","", Exception())` 并把
+`error.orig` 调整为 `args=(1213, "Deadlock found ...")` 的异常（helper 的 `_is_deadlock`
+按 asyncmy 形态 `orig.args[:1] == (1213,)` 判定）。monkeypatch 注入点：
+`app.thinking.persistence.ThinkingMessageStore`（helper 内模块级引用）。
 
 - [ ] **Step 2: 跑测试确认失败**
 
@@ -128,9 +131,8 @@ async def persist_turn_thinking(
 def _is_deadlock(error: Exception) -> bool:
     orig = getattr(error, "orig", None)
     args = getattr(orig, "args", ())
-    return any(isinstance(arg, tuple) and 1213 in arg for arg in args) or (
-        isinstance(orig, Exception) and "1213" in str(orig)
-    )
+    # asyncmy/PyMySQL 的 orig.args 形态为 (1213, "Deadlock found ...")。
+    return args[:1] == (1213,) or "1213" in str(orig)
 ```
 
 imports 补：`import logging`、`from sqlalchemy.exc import OperationalError`（如未导入）、`from app.workspace.models import Message`（已导入）。`logger = logging.getLogger(__name__)` 如文件没有则补。
@@ -206,10 +208,22 @@ async def test_brainstorm_ready_survives_thinking_persist_deadlock(auth_client_f
 
 （helper 内部已吞异常，外层 try 是双保险，与现有风格一致。）
 
+**测试环境关键前置（plan 评审发现，必须照做）**：测试 fixture 用共享连接 + savepoint
+隔离，请求事务的 commit 只释放 savepoint；helper 走真实 `SessionFactory`（新连接）
+会看不到未提交数据而静默 no-op，导致 `test_brainstorm.py` 中经 GET 恢复验证
+`metadata.thinking`/`turn_id` 的既有用例失败。**这些恢复态断言不是响应 DTO 断言，
+不得删除或改弱**。正确做法（仓库已有先例 `test_brainstorm.py:464-476`）：相关用例
+monkeypatch `app.brainstorm.router.SessionFactory` 为产出共享 `db_session` 的假
+`_SessionFactory`，helper 即可在同连接内真实执行，既有断言无需改动。
+
 - [ ] **Step 4: 跑测试确认通过 + 回归**
 
 Run: `cd backend && .venv/bin/ruff check app tests && DATATAP_MCP_TOKEN=test-only-token .venv/bin/pytest tests/brainstorm tests/thinking -q`
-Expected: PASS（既有用例中如有断言「响应 message 带 turn_id/thinking」的，按 spec §1 的 DTO 变化声明更新断言，不得删测试）
+Expected: PASS。两类既有用例区分处理：
+- 断言**响应 DTO** 带 thinking metadata / turn_id 的：按 spec §1 的 DTO 变化声明更新；
+- 经 GET 恢复验证**落库** `metadata.thinking`/`turn_id` 的（如 test_brainstorm.py:163、:263-264）：
+  不得改动——按 Step 3 的「测试环境关键前置」给这些用例注入共享 db_session 的假
+  SessionFactory 让它们真实通过。
 
 - [ ] **Step 5: Commit**
 
@@ -244,10 +258,14 @@ async def test_enforce_clarify_survives_thinking_persist_failure(auth_client_fac
 - [ ] **Step 3: 实现**
 
 `backend/app/tasks/router.py`：
-- imports：`from app.thinking.persistence import persist_turn_thinking`（`_persist_turn_blocks` 不再被三分支使用则删除该函数，ruff 检查残留引用——注意可能有其他调用点，先 grep）。
+- imports：`from app.thinking.persistence import persist_turn_thinking`（`_persist_turn_blocks` 不再被三分支使用则删除该函数——已确认调用点只有 clarify/respond/execute 三处，删除安全，ruff 会兜底检查残留）。
 - clarify 分支：`await db.commit()`（:396）之后插入 `persist_turn_thinking(SessionFactory, thinking_service, user_id=..., session_id=..., turn_id=turn_id, assistant_message_id=message.id)`（try/except warning 双保险），删除分支内原 `_persist_turn_blocks` + `attach_turn_to_assistant` 段；`bind_turn` 保留在原位置。
 - respond 分支：同上（assistant_message_id=message.id）。
-- execute 分支：`await db.commit()`（:525）之后、`task_runner.submit` 之前插入 `persist_turn_thinking(..., assistant_message_id=None)`；删除 `if planner_attempted:` 块内 `_persist_turn_blocks` 调用（保留 `bind_turn`）。
+- execute 分支：`await db.commit()`（:525）之后、`task_runner.submit` 之前**无条件**插入 `persist_turn_thinking(..., assistant_message_id=None)`（enforce 关闭时 blocks 为空且 assistant_message_id=None → helper 提前 return，无害）；删除 `if planner_attempted:` 块内 `_persist_turn_blocks` 调用（保留 `bind_turn`）。
+- **测试环境关键前置（同 Task 2）**：test_enforce_create_task.py 中经恢复验证落库
+  `metadata.thinking`/`turn_id` 的既有用例不得改弱；给相关用例 monkeypatch
+  `app.tasks.router.SessionFactory` 为共享 `db_session` 的假 `_SessionFactory`
+  （先例 `test_brainstorm.py:464-476`），helper 才能看到请求事务的数据。
 
 - [ ] **Step 4: 跑测试确认通过 + 回归**
 
