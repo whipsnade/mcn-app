@@ -56,20 +56,30 @@ class BrainstormService:
         self, user_id: str, session_id: str, payload: BrainstormRequest
     ) -> BrainstormOutcome:
         workspace_service = WorkspaceService(self.db)
-        workspace = await workspace_service.get_owned_session(user_id, session_id, for_update=True)
-        user_message = await workspace_service.append_message(
-            user_id, session_id, MessageCreate(content=payload.content)
-        )
         turn_id = str(payload.turn_id)
-        user_message.metadata_json = {"turn_id": turn_id}
-        await self.db.flush()
+
+        # ── 读阶段：无锁、无写，模型调用全程不持有任何行锁（锁窗口收窄，
+        # 见 docs/superpowers/specs/2026-07-27-brainstorm-lock-window-design.md）。
+        workspace = await workspace_service.get_owned_session(
+            user_id, session_id, for_update=False
+        )
+        profile = BrainstormProfile.model_validate(
+            (workspace.filters_snapshot or {}).get("brainstorm_profile") or {}
+        )
+        messages = await workspace_service.list_messages(user_id, session_id)
+        # 用户消息尚未落库：镜像 GoalPlannerContextBuilder，把当前消息拼到压缩列表尾部。
+        recent_messages = list(compress_messages(messages, max_chars=24_000))
+        tail_sequence = recent_messages[-1].sequence + 1 if recent_messages else 1
+        recent_messages.append(
+            PlannerMessage(role="user", content=payload.content, sequence=tail_sequence)
+        )
         try:
             await self.thinking_service.bind_turn(
                 turn_id=turn_id,
                 user_id=user_id,
                 session_id=session_id,
                 task_id=None,
-                trigger_message_id=user_message.id,
+                trigger_message_id=None,
             )
         except Exception:
             logger.warning(
@@ -77,21 +87,40 @@ class BrainstormService:
                 session_id,
                 exc_info=True,
             )
-        profile = BrainstormProfile.model_validate(
-            (workspace.filters_snapshot or {}).get("brainstorm_profile") or {}
-        )
-        messages = await workspace_service.list_messages(user_id, session_id)
-        recent_messages = compress_messages(messages, max_chars=24_000)
         output = await self._complete(
             profile,
-            recent_messages,
+            tuple(recent_messages),
             user_id,
             session_id,
             turn_id=turn_id,
         )
-
-        merged = merge_profile(profile, output.extracted)
         ready = bool(output.ready)
+        goal_specs = None
+        if ready and get_settings().goal_planner_enforce_enabled:
+            goal_specs = await self._plan_task_goals(
+                user_id=user_id,
+                session_id=session_id,
+                content=payload.content,
+                turn_id=turn_id,
+            )
+
+        # ── 写阶段：短事务，锁窗口内只写不跑模型。
+        workspace = await workspace_service.get_owned_session(
+            user_id, session_id, for_update=True
+        )
+        # 重读画像：并发请求可能已在模型调用期间推进画像，以最新值为 merge base。
+        # identity map 不会用新行覆盖未过期实例，须显式 locking refresh 才真读到新值。
+        await self.db.refresh(workspace, with_for_update=True)
+        profile = BrainstormProfile.model_validate(
+            (workspace.filters_snapshot or {}).get("brainstorm_profile") or {}
+        )
+        merged = merge_profile(profile, output.extracted)
+        user_message = await workspace_service.append_message(
+            user_id, session_id, MessageCreate(content=payload.content)
+        )
+        # 思考持久化靠这个 metadata 键匹配用户消息，非 ready 路径无兜底，必须显式写。
+        user_message.metadata_json = {"turn_id": turn_id}
+        await self.db.flush()
         filters = dict(workspace.filters_snapshot or {})
         filters["brainstorm_profile"] = merged.model_dump(mode="json")
         workspace.filters_snapshot = filters
@@ -109,14 +138,6 @@ class BrainstormService:
                 workspace.platforms = list(merged.platforms)
             if merged.audience:
                 workspace.target_audience = merged.audience[:500]
-            goal_specs = None
-            if get_settings().goal_planner_enforce_enabled:
-                goal_specs = await self._plan_task_goals(
-                    user_id=user_id,
-                    session_id=session_id,
-                    content=payload.content,
-                    turn_id=turn_id,
-                )
             task = await TaskService(self.db).create(
                 user_id,
                 session_id,
@@ -125,20 +146,6 @@ class BrainstormService:
                 goal_specs=goal_specs,
             )
             task_id = task.id
-            try:
-                await self.thinking_service.bind_turn(
-                    turn_id=turn_id,
-                    user_id=user_id,
-                    session_id=session_id,
-                    task_id=task.id,
-                    trigger_message_id=user_message.id,
-                )
-            except Exception:
-                logger.warning(
-                    "brainstorm_thinking_bind_failed task_id=%s",
-                    task.id,
-                    exc_info=True,
-                )
         workspace.updated_at = utc_now()
         workspace.last_accessed_at = workspace.updated_at
 
@@ -169,6 +176,21 @@ class BrainstormService:
         )
         self.db.add(assistant_message)
         await self.db.flush()
+        try:
+            # 补绑 trigger/task（bind_turn 幂等更新绑定）。
+            await self.thinking_service.bind_turn(
+                turn_id=turn_id,
+                user_id=user_id,
+                session_id=session_id,
+                task_id=task_id,
+                trigger_message_id=user_message.id,
+            )
+        except Exception:
+            logger.warning(
+                "brainstorm_thinking_bind_failed session_id=%s",
+                session_id,
+                exc_info=True,
+            )
         return BrainstormOutcome(
             ready=ready,
             task_id=task_id,

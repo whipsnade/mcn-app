@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 
 from app.brainstorm.schemas import (
     BrainstormModelOutput,
@@ -22,6 +22,7 @@ from app.model.prompt_logs import PromptLogEntry
 from app.model.tencent_plan import TencentPlanAdapter
 from app.tasks import dependencies
 from app.thinking.service import SessionThinkingService
+from app.workspace.models import Message, WorkspaceSession
 from app.workspace.schemas import SessionCreate
 from app.workspace.service import WorkspaceService
 
@@ -588,6 +589,112 @@ async def test_brainstorm_model_error_returns_friendly_502(
     assert messages[0]["metadata"]["turn_id"] == messages[1]["metadata"]["turn_id"]
     assert messages[1]["metadata"]["thinking"]["status"] == "interrupted"
     assert messages[1]["metadata"]["thinking"]["blocks"][0]["label"] == "正在理解需求"
+
+
+@pytest.mark.asyncio
+async def test_brainstorm_model_error_request_transaction_writes_nothing(
+    auth_client_factory, db_session, monkeypatch
+) -> None:
+    """模型失败发生在写阶段之前：请求事务零写入，用户消息仅由失败落库自建一条。"""
+    _share_session_factory(monkeypatch, db_session)
+    client = await auth_client_factory("13900000033")
+    created = await client.post("/api/v1/sessions", json={})
+    session_id = created.json()["id"]
+    await db_session.commit()
+    model = FakeBrainstormModel([ModelAdapterError("MODEL_TIMEOUT", retryable=False)])
+    _install_model(monkeypatch, model)
+    turn_id = "5c1f6d1e-2b4a-4b5c-9f6e-7d8c9b0a1f2e"
+
+    response = await client.post(
+        f"/api/v1/sessions/{session_id}/brainstorm",
+        json={"content": "分析一下欧诗漫", "turn_id": turn_id},
+    )
+
+    assert response.status_code == 502
+    # 该 turn 的 user 消息只有一条（record_brainstorm_failure 自建）：
+    # 请求事务在模型失败前没有任何写入，rollback 后也不会有残留。
+    user_message_count = await db_session.scalar(
+        select(func.count())
+        .select_from(Message)
+        .where(Message.session_id == session_id, Message.role == "user")
+    )
+    assert user_message_count == 1
+    restored = await client.get(f"/api/v1/sessions/{session_id}")
+    messages = restored.json()["messages"]
+    assert [message["role"] for message in messages] == ["user", "assistant"]
+    assert messages[0]["metadata"]["turn_id"] == turn_id
+    assert messages[1]["metadata"]["thinking"]["status"] == "interrupted"
+
+
+@pytest.mark.asyncio
+async def test_brainstorm_ready_write_phase_rereads_profile_and_locks_after_model(
+    auth_client_factory, db_session, monkeypatch
+) -> None:
+    """写阶段以重读的最新画像为 merge base；模型调用全程不持有行锁。"""
+    client = await auth_client_factory("13900000034")
+    created = await client.post("/api/v1/sessions", json={})
+    session_id = created.json()["id"]
+
+    events: list[tuple[str, bool]] = []
+    real_get_owned_session = WorkspaceService.get_owned_session
+
+    async def spy_get_owned_session(self, user_id, session_id, *, for_update=False):
+        events.append(("get_owned_session", for_update))
+        return await real_get_owned_session(
+            self, user_id, session_id, for_update=for_update
+        )
+
+    monkeypatch.setattr(WorkspaceService, "get_owned_session", spy_get_owned_session)
+
+    class _ConcurrentProfileModel(FakeBrainstormModel):
+        async def complete_json(self, request):
+            events.append(("model", False))
+            # 模拟并发请求在模型调用期间把画像品牌推进为「新品牌」：
+            # 绕过 identity map 直写行，等价于另一请求已提交的效果。
+            await db_session.execute(
+                update(WorkspaceSession)
+                .where(WorkspaceSession.id == session_id)
+                .values(filters_snapshot={"brainstorm_profile": {"brand": "新品牌"}})
+                .execution_options(synchronize_session=False)
+            )
+            return await super().complete_json(request)
+
+    model = _ConcurrentProfileModel(
+        [
+            BrainstormModelOutput(
+                ready=True,
+                assistant_message="信息已齐，开始分析。",
+                # extracted 不带 brand：merge 保留 base 的品牌，可直接区分 base 新旧。
+                extracted=BrainstormProfile(
+                    category="美妆护肤",
+                    platforms=["xiaohongshu"],
+                    audience="18-30 岁女性",
+                    goal="达人投放",
+                ),
+            )
+        ]
+    )
+    _install_model(monkeypatch, model)
+    _share_session_factory(monkeypatch, db_session)
+
+    events.clear()
+    response = await client.post(
+        f"/api/v1/sessions/{session_id}/brainstorm",
+        json={"content": "小红书，美妆护肤，看达人投放"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ready"] is True
+    # 写阶段重读画像：merge base 是并发推进后的「新品牌」而非读阶段的空画像。
+    assert body["profile"]["brand"] == "新品牌"
+    restored = await client.get(f"/api/v1/sessions/{session_id}")
+    assert restored.json()["filters"]["brainstorm_profile"]["brand"] == "新品牌"
+    assert restored.json()["brand"] == "新品牌"
+    # 锁窗口收窄：模型调用之前不得有任何 FOR UPDATE，模型之后才允许加锁。
+    model_index = next(i for i, event in enumerate(events) if event[0] == "model")
+    assert all(not locked for _, locked in events[:model_index])
+    assert any(locked for _, locked in events[model_index:])
 
 
 @pytest.mark.asyncio
