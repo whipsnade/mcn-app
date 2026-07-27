@@ -33,6 +33,8 @@ class BrainstormQuestion(BaseModel):
 
     text: str = Field(min_length=1, max_length=500)
     options: list[str] = Field(default_factory=list, max_length=4)
+    # multi=true 表示该问题允许多选（如渠道），前端据此渲染多选 chips。
+    multi: bool = False
 
 
 class BrainstormModelOutput(BaseModel):
@@ -70,12 +72,17 @@ class BrainstormResponse(BaseModel):
 
 
 def merge_profile(current: BrainstormProfile, extracted: BrainstormProfile) -> BrainstormProfile:
-    """以本轮提炼覆盖画像：模型只确认过的字段非空，空值不擦除已有确认。"""
+    """以本轮提炼覆盖画像：模型只确认过的字段非空，空值不擦除已有确认。
+
+    platforms 例外：多选渠道按并集合并（保序去重，先旧后新），避免后轮确认擦除前轮选择。
+    """
 
     updates: dict[str, Any] = {}
     for field in BrainstormProfile.model_fields:
         value = getattr(extracted, field)
         if value is None or value == []:
             continue
+        if field == "platforms":
+            value = list(dict.fromkeys([*current.platforms, *value]))
         updates[field] = value
     return current.model_copy(update=updates)

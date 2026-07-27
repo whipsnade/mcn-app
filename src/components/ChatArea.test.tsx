@@ -749,4 +749,149 @@ describe('ChatArea', () => {
     expect(screen.queryByText('按品类圈选达人')).toBeNull();
     expect(screen.getByText('正在生成进一步分析建议…')).toBeVisible();
   });
+
+  it('lets multi-select brainstorm chips toggle and joins the confirmed options into the input', async () => {
+    const onSendMessage = vi.fn().mockResolvedValue(undefined);
+    const clarifyingSession: Session = {
+      ...session,
+      messages: [
+        { id: 'message-u1', sender: 'user', text: '想分析新品防晒', timestamp: '10:00' },
+        {
+          id: 'message-a1',
+          sender: 'ai',
+          text: '想分析哪些平台？（可多选）',
+          timestamp: '10:01',
+          brainstorm: { ready: false, options: ['小红书', '抖音', '哔哩哔哩'], multi: true },
+        },
+      ],
+    };
+    render(
+      <ChatArea
+        session={clarifyingSession}
+        onSendMessage={onSendMessage}
+        isAnalyzing={false}
+        isMockMode={false}
+      />,
+    );
+
+    const confirmButton = screen.getByRole('button', { name: '确认' });
+    expect(confirmButton).toBeDisabled();
+
+    const xiaohongshuChip = screen.getByRole('button', { name: '小红书' });
+    const douyinChip = screen.getByRole('button', { name: '抖音' });
+    expect(xiaohongshuChip).toHaveAttribute('aria-pressed', 'false');
+    expect(douyinChip).toHaveAttribute('aria-pressed', 'false');
+
+    await act(async () => {
+      fireEvent.click(xiaohongshuChip);
+      fireEvent.click(douyinChip);
+    });
+    expect(xiaohongshuChip).toHaveAttribute('aria-pressed', 'true');
+    expect(douyinChip).toHaveAttribute('aria-pressed', 'true');
+    expect(confirmButton).toBeEnabled();
+    expect((screen.getByPlaceholderText(/输入消息并向 AI 分析师提问/) as HTMLTextAreaElement).value)
+      .toBe('');
+
+    // 再次点击取消选中
+    await act(async () => {
+      fireEvent.click(xiaohongshuChip);
+    });
+    expect(xiaohongshuChip).toHaveAttribute('aria-pressed', 'false');
+
+    await act(async () => {
+      fireEvent.click(xiaohongshuChip);
+    });
+    await act(async () => {
+      fireEvent.click(confirmButton);
+    });
+    expect(onSendMessage).not.toHaveBeenCalled();
+    expect((screen.getByPlaceholderText(/输入消息并向 AI 分析师提问/) as HTMLTextAreaElement).value)
+      .toBe('抖音、小红书');
+    expect(xiaohongshuChip).toHaveAttribute('aria-pressed', 'false');
+    expect(douyinChip).toHaveAttribute('aria-pressed', 'false');
+    expect(confirmButton).toBeDisabled();
+  });
+
+  it('keeps single-fill behavior for brainstorm chips with multi=false', async () => {
+    const onSendMessage = vi.fn().mockResolvedValue(undefined);
+    const clarifyingSession: Session = {
+      ...session,
+      messages: [
+        { id: 'message-u1', sender: 'user', text: '想分析新品防晒', timestamp: '10:00' },
+        {
+          id: 'message-a1',
+          sender: 'ai',
+          text: '想分析哪个平台？',
+          timestamp: '10:01',
+          brainstorm: { ready: false, options: ['小红书', '抖音'], multi: false },
+        },
+      ],
+    };
+    render(
+      <ChatArea
+        session={clarifyingSession}
+        onSendMessage={onSendMessage}
+        isAnalyzing={false}
+        isMockMode={false}
+      />,
+    );
+
+    expect(screen.queryByRole('button', { name: '确认' })).toBeNull();
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '小红书' }));
+    });
+    expect(onSendMessage).not.toHaveBeenCalled();
+    expect((screen.getByPlaceholderText(/输入消息并向 AI 分析师提问/) as HTMLTextAreaElement).value)
+      .toBe('小红书');
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '抖音' }));
+    });
+    expect((screen.getByPlaceholderText(/输入消息并向 AI 分析师提问/) as HTMLTextAreaElement).value)
+      .toBe('抖音');
+  });
+
+  it('resets multi-select state when a new assistant message becomes the latest', async () => {
+    const baseProps = {
+      onSendMessage: vi.fn().mockResolvedValue(undefined),
+      isAnalyzing: false,
+      isMockMode: false,
+    };
+    const firstSession: Session = {
+      ...session,
+      messages: [
+        {
+          id: 'message-a1',
+          sender: 'ai',
+          text: '想分析哪些平台？（可多选）',
+          timestamp: '10:01',
+          brainstorm: { ready: false, options: ['小红书', '抖音'], multi: true },
+        },
+      ],
+    };
+    const { rerender } = render(<ChatArea session={firstSession} {...baseProps} />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '小红书' }));
+    });
+    expect(screen.getByRole('button', { name: '小红书' })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('button', { name: '确认' })).toBeEnabled();
+
+    const nextSession: Session = {
+      ...session,
+      messages: [
+        {
+          id: 'message-a2',
+          sender: 'ai',
+          text: '分析目标是什么？（可多选）',
+          timestamp: '10:03',
+          brainstorm: { ready: false, options: ['声量口碑', '达人投放'], multi: true },
+        },
+      ],
+    };
+    rerender(<ChatArea session={nextSession} {...baseProps} />);
+
+    expect(screen.getByRole('button', { name: '声量口碑' })).toHaveAttribute('aria-pressed', 'false');
+    expect(screen.getByRole('button', { name: '达人投放' })).toHaveAttribute('aria-pressed', 'false');
+    expect(screen.getByRole('button', { name: '确认' })).toBeDisabled();
+  });
 });

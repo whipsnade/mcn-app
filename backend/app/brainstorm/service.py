@@ -136,6 +136,7 @@ class BrainstormService:
         brainstorm_metadata: dict = {
             "ready": ready,
             "options": options,
+            "multi": output.question.multi if output.question is not None else False,
             "profile_summary": merged.model_dump(mode="json"),
         }
         assistant_metadata: dict = {"brainstorm": brainstorm_metadata}
