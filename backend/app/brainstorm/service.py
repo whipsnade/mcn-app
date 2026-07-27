@@ -185,22 +185,16 @@ class BrainstormService:
         turn_id: str,
     ) -> list[dict] | None:
         """enforce 规划；clarify/respond/失败一律回退 None（默认 kol_selection）。"""
-        thinking_sink = None
-        try:
-            thinking_sink = self.thinking_service.create_sink(
-                ThinkingOperationSpec(
-                    operation_id=str(uuid4()),
-                    turn_id=turn_id,
-                    session_id=session_id,
-                    user_id=user_id,
-                    purpose="goal_planner",
-                    label="正在规划分析目标",
-                )
+        thinking_sink = self._thinking_sink(
+            ThinkingOperationSpec(
+                operation_id=str(uuid4()),
+                turn_id=turn_id,
+                session_id=session_id,
+                user_id=user_id,
+                purpose="goal_planner",
+                label="正在规划分析目标",
             )
-        except Exception:
-            logger.warning(
-                "brainstorm_goal_planner_sink_failed session_id=%s", session_id, exc_info=True
-            )
+        )
         try:
             context = await GoalPlannerContextBuilder().build_for_message(
                 user_id, session_id, content, db=self.db
@@ -217,9 +211,10 @@ class BrainstormService:
             return None
         if output.action != "execute" or not output.goals:
             logger.info(
-                "brainstorm_goal_planner_non_execute session_id=%s action=%s",
+                "brainstorm_goal_planner_non_execute session_id=%s action=%s question=%s",
                 session_id,
                 output.action,
+                getattr(output.question, "text", None),
             )
             return None
         return [
