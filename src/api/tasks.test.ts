@@ -90,4 +90,29 @@ describe('tasks api', () => {
       expect(result.message.metadata.clarify?.options).toEqual(['海底捞', '喜茶']);
     }
   });
+
+  it('returns the respond outcome payload as-is', async () => {
+    const { request } = await import('./client');
+    const outcome: TaskCreateResult = {
+      outcome: 'respond',
+      respond_type: 'context_qa',
+      message: {
+        id: 'message-1',
+        role: 'assistant',
+        content: '上次失败是因为未采集到有效数据。',
+        sequence: 4,
+        metadata: { respond: { type: 'context_qa' } },
+        created_at: '2026-07-27T00:00:00',
+      },
+    };
+    vi.mocked(request).mockResolvedValue(outcome);
+
+    const result = await createTask('session-1', { content: '为什么失败了？' }, 'key-3');
+
+    expect(result).toEqual(outcome);
+    if (result.outcome === 'respond') {
+      expect(result.respond_type).toBe('context_qa');
+      expect(result.message.content).toBe('上次失败是因为未采集到有效数据。');
+    }
+  });
 });

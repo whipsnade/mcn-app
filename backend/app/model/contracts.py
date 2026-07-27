@@ -23,6 +23,7 @@ ModelPurpose = Literal[
     "brand_analysis",
     "campaign_analysis",
     "goal_summary",
+    "context_qa",
 ]
 
 
@@ -113,6 +114,7 @@ class ModelRequestMetadata(BaseModel):
         "brand_analysis",
         "campaign_analysis",
         "goal_summary",
+        "context_qa",
     ]
     provider: str
     model: str

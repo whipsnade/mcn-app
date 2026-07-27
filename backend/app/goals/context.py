@@ -36,6 +36,36 @@ def _compact_scope(scope: Any) -> dict[str, Any] | None:
     return compact or None
 
 
+async def recent_task_outcomes(
+    db, user_id: str, session_id: str, *, limit: int = 3
+) -> list[dict[str, Any]]:
+    """最近任务终态投影：planner 判断失败追问的事实依据，也是答疑证据包素材。"""
+    rows = list(
+        (
+            await db.scalars(
+                select(AnalysisTask)
+                .where(
+                    AnalysisTask.user_id == user_id,
+                    AnalysisTask.session_id == session_id,
+                )
+                .order_by(AnalysisTask.created_at.desc())
+                .limit(limit)
+            )
+        ).all()
+    )
+    return [
+        {
+            "status": task.status,
+            "error_code": task.error_code,
+            "error_message": task.error_message,
+            "completed_at": (
+                task.completed_at.isoformat() if task.completed_at else None
+            ),
+        }
+        for task in rows
+    ]
+
+
 @dataclass(frozen=True)
 class GoalPlannerContext:
     user_id: str
@@ -149,6 +179,9 @@ class GoalPlannerContextBuilder:
             "platforms": list(workspace.platforms or []),
             "target_audience": workspace.target_audience,
             "brainstorm_profile": profile,
+            "recent_task_outcomes": await recent_task_outcomes(
+                db, user_id, workspace.id
+            ),
         }
         artifact_summaries = await self._artifact_summaries(db, workspace.id)
         return session_context, account_default_brand, tuple(exemplars), artifact_summaries

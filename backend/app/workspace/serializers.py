@@ -29,6 +29,7 @@ def public_message_metadata(metadata: dict) -> dict:
         "followup_error",
         "brainstorm",
         "clarify",
+        "respond",
         "turn_id",
         "thinking",
     }

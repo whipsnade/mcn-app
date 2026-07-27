@@ -578,3 +578,98 @@ async def test_task_service_create_persists_goal_specs_with_dependency(
     assert goals[0].params_json == {"brand": "海底捞", "category": "美食", "campaign": "618大促"}
     assert goals[1].params_json == {"brand": "海底捞", "category": "美食"}
     assert all(goal.status == "pending" for goal in goals)
+
+
+def _respond_output(respond_type: str) -> GoalPlannerOutput:
+    return GoalPlannerOutput(action="respond", respond_type=respond_type)
+
+
+@pytest.mark.asyncio
+async def test_enforce_respond_usage_help_returns_static_message(
+    auth_client_factory, db_session, monkeypatch
+) -> None:
+    _enable_enforce(monkeypatch)
+
+    async def fake_plan(self, context, **kwargs):
+        return _respond_output("usage_help")
+
+    monkeypatch.setattr(GoalPlannerService, "plan_context", fake_plan)
+    client = await auth_client_factory("13400000095")
+    session_id = await _create_session(client)
+
+    response = await client.post(
+        f"/api/v1/sessions/{session_id}/tasks", json={"content": "这个产品怎么用？"}
+    )
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["outcome"] == "respond"
+    assert body["respond_type"] == "usage_help"
+    assert "使用方法" in body["message"]["content"]
+    assert body["message"]["metadata"]["respond"] == {"type": "usage_help"}
+    task_count = await db_session.scalar(select(func.count()).select_from(AnalysisTask))
+    assert task_count == 0
+
+
+@pytest.mark.asyncio
+async def test_enforce_respond_out_of_scope_rejects_politely(
+    auth_client_factory, db_session, monkeypatch
+) -> None:
+    _enable_enforce(monkeypatch)
+
+    async def fake_plan(self, context, **kwargs):
+        return _respond_output("out_of_scope")
+
+    monkeypatch.setattr(GoalPlannerService, "plan_context", fake_plan)
+    client = await auth_client_factory("13400000096")
+    session_id = await _create_session(client)
+
+    response = await client.post(
+        f"/api/v1/sessions/{session_id}/tasks", json={"content": "帮我写一段 Python 代码"}
+    )
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["respond_type"] == "out_of_scope"
+    assert "营销分析助手" in body["message"]["content"]
+
+
+@pytest.mark.asyncio
+async def test_enforce_respond_context_qa_uses_model_answer(
+    auth_client_factory, db_session, monkeypatch
+) -> None:
+    _enable_enforce(monkeypatch)
+
+    async def fake_plan(self, context, **kwargs):
+        return _respond_output("context_qa")
+
+    monkeypatch.setattr(GoalPlannerService, "plan_context", fake_plan)
+
+    async def fake_answer(db, model, *, user_id, session_id, question):
+        return "上次失败是因为未采集到有效数据。"
+
+    monkeypatch.setattr("app.tasks.router.answer_context_qa", fake_answer)
+    client = await auth_client_factory("13400000097")
+    session_id = await _create_session(client)
+
+    response = await client.post(
+        f"/api/v1/sessions/{session_id}/tasks", json={"content": "为什么上次失败了？"}
+    )
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["respond_type"] == "context_qa"
+    assert body["message"]["content"] == "上次失败是因为未采集到有效数据。"
+    task_count = await db_session.scalar(select(func.count()).select_from(AnalysisTask))
+    assert task_count == 0
+    persisted = list(
+        (
+            await db_session.scalars(
+                select(Message)
+                .where(Message.session_id == session_id)
+                .order_by(Message.sequence)
+            )
+        ).all()
+    )
+    assert [message.role for message in persisted] == ["user", "assistant"]
+    assert persisted[1].metadata_json["respond"] == {"type": "context_qa"}
