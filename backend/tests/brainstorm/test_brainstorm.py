@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
+from sqlalchemy import select
 
 from app.brainstorm.schemas import (
     BrainstormModelOutput,
@@ -12,6 +13,10 @@ from app.brainstorm.schemas import (
     BrainstormRequest,
     merge_profile,
 )
+from app.core.config import get_settings
+from app.goals.models import TaskGoal
+from app.goals.planner import GoalPlannerService
+from app.goals.schemas import GoalParams, GoalPlannerOutput, GoalQuestion, GoalSpec
 from app.model.contracts import ModelAdapterError, StructuredResult
 from app.model.prompt_logs import PromptLogEntry
 from app.model.tencent_plan import TencentPlanAdapter
@@ -754,3 +759,231 @@ async def test_brainstorm_question_multi_flag_in_metadata(
     assert response.status_code == 200
     brainstorm_meta = response.json()["message"]["metadata"]["brainstorm"]
     assert brainstorm_meta["multi"] is True
+
+
+def _goal_spec(
+    sequence: int,
+    goal_type: str,
+    *,
+    brand: str = "蓉李记",
+    depends_on_sequence: int | None = None,
+) -> GoalSpec:
+    return GoalSpec(
+        sequence=sequence,
+        goal_type=goal_type,
+        depends_on_sequence=depends_on_sequence,
+        params=GoalParams(brand=brand),
+        request_evidence="声量与互动数据",
+    )
+
+
+def _ready_brainstorm_model() -> FakeBrainstormModel:
+    return FakeBrainstormModel(
+        [
+            BrainstormModelOutput(
+                ready=True,
+                assistant_message="信息已齐，开始分析。",
+                extracted=_full_profile(),
+            )
+        ]
+    )
+
+
+@pytest.mark.asyncio
+async def test_brainstorm_ready_plan_execute_creates_brand_analysis_goal(
+    auth_client_factory, db_session, monkeypatch
+) -> None:
+    """ready 内联建任务经 GoalPlanner 规划：brand_analysis 不再被强制成 kol_selection。"""
+    monkeypatch.setattr(get_settings(), "goal_planner_enforce_enabled", True)
+
+    async def fake_plan(self, context, **_kwargs):
+        return GoalPlannerOutput(
+            action="execute", goals=[_goal_spec(1, "brand_analysis")]
+        )
+
+    monkeypatch.setattr(GoalPlannerService, "plan_context", fake_plan)
+    client = await auth_client_factory("13900000021")
+    created = await client.post("/api/v1/sessions", json={})
+    session_id = created.json()["id"]
+    _install_model(monkeypatch, _ready_brainstorm_model())
+    _share_session_factory(monkeypatch, db_session)
+
+    response = await client.post(
+        f"/api/v1/sessions/{session_id}/brainstorm",
+        json={"content": "分析蓉李记声量情感"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ready"] is True
+    assert body["task_id"]
+    goal = await db_session.scalar(select(TaskGoal))
+    assert goal is not None
+    assert goal.task_id == body["task_id"]
+    assert goal.goal_type == "brand_analysis"
+    assert goal.sequence == 1
+    assert goal.params_json["brand"] == "蓉李记"
+
+
+@pytest.mark.asyncio
+async def test_brainstorm_ready_plan_multi_goal_persists_dependency(
+    auth_client_factory, db_session, monkeypatch
+) -> None:
+    monkeypatch.setattr(get_settings(), "goal_planner_enforce_enabled", True)
+
+    async def fake_plan(self, context, **_kwargs):
+        return GoalPlannerOutput(
+            action="execute",
+            goals=[
+                _goal_spec(1, "brand_analysis"),
+                _goal_spec(2, "kol_selection", depends_on_sequence=1),
+            ],
+        )
+
+    monkeypatch.setattr(GoalPlannerService, "plan_context", fake_plan)
+    client = await auth_client_factory("13900000022")
+    created = await client.post("/api/v1/sessions", json={})
+    session_id = created.json()["id"]
+    _install_model(monkeypatch, _ready_brainstorm_model())
+    _share_session_factory(monkeypatch, db_session)
+
+    response = await client.post(
+        f"/api/v1/sessions/{session_id}/brainstorm",
+        json={"content": "分析蓉李记声量并圈选达人"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["task_id"]
+    goals = list(
+        (await db_session.scalars(select(TaskGoal).order_by(TaskGoal.sequence))).all()
+    )
+    assert len(goals) == 2
+    assert goals[0].goal_type == "brand_analysis"
+    assert goals[0].sequence == 1
+    assert goals[0].depends_on_goal_id is None
+    assert goals[1].goal_type == "kol_selection"
+    assert goals[1].sequence == 2
+    assert goals[1].depends_on_goal_id == goals[0].id
+
+
+@pytest.mark.asyncio
+async def test_brainstorm_ready_plan_clarify_falls_back_to_kol_selection(
+    auth_client_factory, db_session, monkeypatch
+) -> None:
+    """brainstorm 已判定 ready，planner clarify 不回问，按默认 kol_selection 建任务。"""
+    monkeypatch.setattr(get_settings(), "goal_planner_enforce_enabled", True)
+
+    async def fake_plan(self, context, **_kwargs):
+        return GoalPlannerOutput(
+            action="clarify",
+            question=GoalQuestion(text="想看哪个品牌？", options=["蓉李记"]),
+        )
+
+    monkeypatch.setattr(GoalPlannerService, "plan_context", fake_plan)
+    client = await auth_client_factory("13900000023")
+    created = await client.post("/api/v1/sessions", json={})
+    session_id = created.json()["id"]
+    _install_model(monkeypatch, _ready_brainstorm_model())
+    _share_session_factory(monkeypatch, db_session)
+
+    response = await client.post(
+        f"/api/v1/sessions/{session_id}/brainstorm",
+        json={"content": "分析蓉李记声量情感"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ready"] is True
+    assert body["task_id"]
+    goal = await db_session.scalar(select(TaskGoal))
+    assert goal is not None
+    assert goal.goal_type == "kol_selection"
+
+
+@pytest.mark.asyncio
+async def test_brainstorm_ready_plan_respond_falls_back_to_kol_selection(
+    auth_client_factory, db_session, monkeypatch
+) -> None:
+    monkeypatch.setattr(get_settings(), "goal_planner_enforce_enabled", True)
+
+    async def fake_plan(self, context, **_kwargs):
+        return GoalPlannerOutput(action="respond", respond_type="context_qa")
+
+    monkeypatch.setattr(GoalPlannerService, "plan_context", fake_plan)
+    client = await auth_client_factory("13900000024")
+    created = await client.post("/api/v1/sessions", json={})
+    session_id = created.json()["id"]
+    _install_model(monkeypatch, _ready_brainstorm_model())
+    _share_session_factory(monkeypatch, db_session)
+
+    response = await client.post(
+        f"/api/v1/sessions/{session_id}/brainstorm",
+        json={"content": "分析蓉李记声量情感"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["task_id"]
+    goal = await db_session.scalar(select(TaskGoal))
+    assert goal is not None
+    assert goal.goal_type == "kol_selection"
+
+
+@pytest.mark.asyncio
+async def test_brainstorm_ready_plan_error_falls_back_to_kol_selection(
+    auth_client_factory, db_session, monkeypatch
+) -> None:
+    monkeypatch.setattr(get_settings(), "goal_planner_enforce_enabled", True)
+
+    async def failing_plan(self, context, **_kwargs):
+        raise RuntimeError("model unavailable")
+
+    monkeypatch.setattr(GoalPlannerService, "plan_context", failing_plan)
+    client = await auth_client_factory("13900000025")
+    created = await client.post("/api/v1/sessions", json={})
+    session_id = created.json()["id"]
+    _install_model(monkeypatch, _ready_brainstorm_model())
+    _share_session_factory(monkeypatch, db_session)
+
+    response = await client.post(
+        f"/api/v1/sessions/{session_id}/brainstorm",
+        json={"content": "分析蓉李记声量情感"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ready"] is True
+    assert body["task_id"]
+    goal = await db_session.scalar(select(TaskGoal))
+    assert goal is not None
+    assert goal.goal_type == "kol_selection"
+
+
+@pytest.mark.asyncio
+async def test_brainstorm_ready_plan_disabled_skips_planner(
+    auth_client_factory, db_session, monkeypatch
+) -> None:
+    called = False
+
+    async def forbidden_plan(self, context, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("planner must not run when enforce is off")
+
+    monkeypatch.setattr(GoalPlannerService, "plan_context", forbidden_plan)
+    client = await auth_client_factory("13900000026")
+    created = await client.post("/api/v1/sessions", json={})
+    session_id = created.json()["id"]
+    _install_model(monkeypatch, _ready_brainstorm_model())
+    _share_session_factory(monkeypatch, db_session)
+
+    response = await client.post(
+        f"/api/v1/sessions/{session_id}/brainstorm",
+        json={"content": "分析蓉李记声量情感"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["task_id"]
+    assert called is False
+    goal = await db_session.scalar(select(TaskGoal))
+    assert goal is not None
+    assert goal.goal_type == "kol_selection"
