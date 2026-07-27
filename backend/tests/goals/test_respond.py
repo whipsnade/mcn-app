@@ -1,6 +1,14 @@
 import pytest
 from pydantic import ValidationError
 
+from app.goals.respond import (
+    CONTEXT_QA_FALLBACK_TEXT,
+    OUT_OF_SCOPE_TEXT,
+    USAGE_GUIDE_TEXT,
+    ContextQaAnswer,
+    answer_context_qa,
+    build_context_qa_evidence,
+)
 from app.goals.schemas import GoalParams, GoalPlannerOutput, GoalSpec
 from app.goals.validation import validate_goal_plan
 
@@ -130,3 +138,83 @@ async def test_recent_task_outcomes_projects_latest_three(
     assert outcomes[0]["status"] == "failed"
     assert outcomes[0]["error_code"] == "no_evidence_collected"
     assert "error_message" in outcomes[0]
+
+
+@pytest.mark.asyncio
+async def test_build_context_qa_evidence_empty_session(auth_client_factory, db_session) -> None:
+    client = await auth_client_factory("13400000092")
+    created = await client.post("/api/v1/sessions", json={})
+    session_id = created.json()["id"]
+    me = await client.get("/api/v1/users/me")
+
+    evidence = await build_context_qa_evidence(
+        db_session, user_id=me.json()["id"], session_id=session_id
+    )
+
+    assert evidence["recent_task_outcomes"] == []
+    assert evidence["selection"] == []
+    assert evidence["reports"] == []
+
+
+class _FakeQaModel:
+    def __init__(self, output):
+        self._output = output
+        self.requests = []
+
+    async def complete_json(self, request):
+        self.requests.append(request)
+        if isinstance(self._output, Exception):
+            raise self._output
+        from app.model.contracts import StructuredResult
+
+        return StructuredResult(
+            value=self._output, usage=None, request_id="fake", regeneration_count=0
+        )
+
+
+@pytest.mark.asyncio
+async def test_answer_context_qa_returns_model_answer(auth_client_factory, db_session) -> None:
+    client = await auth_client_factory("13400000093")
+    created = await client.post("/api/v1/sessions", json={})
+    session_id = created.json()["id"]
+    me = await client.get("/api/v1/users/me")
+    model = _FakeQaModel(ContextQaAnswer(answer="因为圈选时互动率权重最高。"))
+
+    answer = await answer_context_qa(
+        db_session,
+        model,
+        user_id=me.json()["id"],
+        session_id=session_id,
+        question="为什么圈选这个达人？",
+    )
+
+    assert answer == "因为圈选时互动率权重最高。"
+    request = model.requests[0]
+    assert request.purpose == "context_qa"
+
+
+@pytest.mark.asyncio
+async def test_answer_context_qa_falls_back_on_model_error(auth_client_factory, db_session) -> None:
+    client = await auth_client_factory("13400000094")
+    created = await client.post("/api/v1/sessions", json={})
+    session_id = created.json()["id"]
+    me = await client.get("/api/v1/users/me")
+    from app.model.contracts import ModelAdapterError
+
+    model = _FakeQaModel(ModelAdapterError("MODEL_TIMEOUT", retryable=False))
+
+    answer = await answer_context_qa(
+        db_session,
+        model,
+        user_id=me.json()["id"],
+        session_id=session_id,
+        question="为什么失败？",
+    )
+
+    assert answer == CONTEXT_QA_FALLBACK_TEXT
+
+
+def test_static_texts_are_non_empty_chinese() -> None:
+    assert "达人" in USAGE_GUIDE_TEXT
+    assert "营销分析" in OUT_OF_SCOPE_TEXT
+    assert CONTEXT_QA_FALLBACK_TEXT
