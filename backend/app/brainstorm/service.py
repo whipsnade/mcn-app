@@ -14,6 +14,9 @@ from app.brainstorm.schemas import (
     BrainstormRequest,
     merge_profile,
 )
+from app.core.config import get_settings
+from app.goals.context import GoalPlannerContextBuilder
+from app.goals.planner import GoalPlannerService
 from app.model.contracts import ChatMessage, ModelAdapter, StructuredModelRequest
 from app.model.exemplars import find_success_exemplars
 from app.model.prompts import BRAINSTORM_PROMPT
@@ -106,11 +109,20 @@ class BrainstormService:
                 workspace.platforms = list(merged.platforms)
             if merged.audience:
                 workspace.target_audience = merged.audience[:500]
+            goal_specs = None
+            if get_settings().goal_planner_enforce_enabled:
+                goal_specs = await self._plan_task_goals(
+                    user_id=user_id,
+                    session_id=session_id,
+                    content=payload.content,
+                    turn_id=turn_id,
+                )
             task = await TaskService(self.db).create(
                 user_id,
                 session_id,
                 TaskCreate(content=payload.content),
                 trigger_message_id=user_message.id,
+                goal_specs=goal_specs,
             )
             task_id = task.id
             try:
@@ -163,6 +175,62 @@ class BrainstormService:
             message=message_read(assistant_message),
             profile=merged,
         )
+
+    async def _plan_task_goals(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        content: str,
+        turn_id: str,
+    ) -> list[dict] | None:
+        """enforce 规划；clarify/respond/失败一律回退 None（默认 kol_selection）。"""
+        thinking_sink = None
+        try:
+            thinking_sink = self.thinking_service.create_sink(
+                ThinkingOperationSpec(
+                    operation_id=str(uuid4()),
+                    turn_id=turn_id,
+                    session_id=session_id,
+                    user_id=user_id,
+                    purpose="goal_planner",
+                    label="正在规划分析目标",
+                )
+            )
+        except Exception:
+            logger.warning(
+                "brainstorm_goal_planner_sink_failed session_id=%s", session_id, exc_info=True
+            )
+        try:
+            context = await GoalPlannerContextBuilder().build_for_message(
+                user_id, session_id, content, db=self.db
+            )
+            output = await GoalPlannerService(
+                model=self.model, context_builder=None
+            ).plan_context(context, thinking_sink=thinking_sink)
+        except LookupError:
+            raise
+        except Exception:
+            logger.warning(
+                "brainstorm_goal_planner_fallback session_id=%s", session_id, exc_info=True
+            )
+            return None
+        if output.action != "execute" or not output.goals:
+            logger.info(
+                "brainstorm_goal_planner_non_execute session_id=%s action=%s",
+                session_id,
+                output.action,
+            )
+            return None
+        return [
+            {
+                "goal_type": goal.goal_type,
+                "sequence": goal.sequence,
+                "depends_on_sequence": goal.depends_on_sequence,
+                "params": goal.params.model_dump(mode="json", exclude_none=True),
+            }
+            for goal in sorted(output.goals, key=lambda item: item.sequence)
+        ]
 
     async def _complete(
         self,
