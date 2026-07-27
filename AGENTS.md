@@ -89,7 +89,7 @@ server.ts           旧的 Express/Gemini 原型，仅 dev:legacy 保留，不�
 2. `cp .env.example .env`，填写 MySQL 密码、随机 JWT 密钥（≥32 字符）、`TENCENT_PLAN_API_KEY`、`DATATAP_MCP_TOKEN`。
 3. 后端依赖：`cd backend && python -m venv .venv && .venv/bin/pip install -e '.[dev]'`
 4. 迁移：`cd backend && .venv/bin/alembic upgrade head`（测试库用 README 中的 `APP_ENV=test … alembic upgrade head` 命令单独迁移）。
-5. 启动后端：`cd backend && .venv/bin/uvicorn app.main:app --reload --port 8000`
+5. 启动后端：`cd backend && .venv/bin/uvicorn app.main:app --reload --port 8000 --timeout-graceful-shutdown 5`（超时参数防止前端 SSE 长连接把 reload 的优雅停机卡死）。
 6. 启动前端：`npm install && npm run dev`，访问 `http://127.0.0.1:5173`。Vite 将 `/api` 代理到 `127.0.0.1:8000`。
 7. 开发环境短信验证码固定为 `000000`。
 

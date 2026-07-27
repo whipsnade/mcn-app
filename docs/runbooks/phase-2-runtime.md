@@ -9,8 +9,10 @@
 ```bash
 cd backend
 .venv/bin/alembic upgrade head
-.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1
+.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1 --timeout-graceful-shutdown 5
 ```
+
+`--timeout-graceful-shutdown 5` 限制优雅停机等待时长：前端 SSE 长连接（任务事件/思考流）不释放时，重启与热重载不会被无限期卡住。
 
 开发环境只保留 `AUTH_MODE=mock` 的短信与微信登录模拟。模型与 MCP 在所有环境均使用真实供应商；测试前确认密钥有效，且测试日志不得输出模型响应、达人数据、令牌或接口地址。
 
