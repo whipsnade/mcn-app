@@ -22,7 +22,6 @@ from app.orchestration.schemas import PlannerMessage
 from app.tasks.schemas import TaskCreate
 from app.tasks.service import TaskService
 from app.thinking.contracts import ThinkingOperationSpec
-from app.thinking.persistence import ThinkingMessageStore
 from app.thinking.service import SessionThinkingService, get_session_thinking_service
 from app.workspace.models import Message
 from app.workspace.router import message_read
@@ -128,11 +127,6 @@ class BrainstormService:
                     task.id,
                     exc_info=True,
                 )
-        await self._persist_completed_blocks(
-            user_id=user_id,
-            session_id=session_id,
-            turn_id=turn_id,
-        )
         workspace.updated_at = utc_now()
         workspace.last_accessed_at = workspace.updated_at
 
@@ -162,19 +156,6 @@ class BrainstormService:
         )
         self.db.add(assistant_message)
         await self.db.flush()
-        try:
-            await ThinkingMessageStore(self.db).attach_turn_to_assistant(
-                assistant_message,
-                user_id=user_id,
-                session_id=session_id,
-                turn_id=turn_id,
-            )
-        except Exception:
-            logger.warning(
-                "brainstorm_thinking_attach_failed session_id=%s",
-                session_id,
-                exc_info=True,
-            )
         return BrainstormOutcome(
             ready=ready,
             task_id=task_id,
@@ -252,40 +233,3 @@ class BrainstormService:
                 exc_info=True,
             )
             return None
-
-    async def _persist_completed_blocks(
-        self,
-        *,
-        user_id: str,
-        session_id: str,
-        turn_id: str,
-    ) -> None:
-        try:
-            blocks = await self.thinking_service.completed_blocks(
-                turn_id=turn_id,
-                user_id=user_id,
-                session_id=session_id,
-                only_unpersisted=True,
-            )
-            store = ThinkingMessageStore(self.db)
-            persisted_keys: list[tuple[str, int]] = []
-            for block in blocks:
-                await store.persist_block(
-                    block,
-                    user_id=user_id,
-                    session_id=session_id,
-                )
-                persisted_keys.append((block.operation_id, block.attempt))
-            if persisted_keys:
-                await self.thinking_service.mark_blocks_persisted(
-                    turn_id=turn_id,
-                    user_id=user_id,
-                    session_id=session_id,
-                    keys=persisted_keys,
-                )
-        except Exception:
-            logger.warning(
-                "brainstorm_thinking_persist_failed session_id=%s",
-                session_id,
-                exc_info=True,
-            )
