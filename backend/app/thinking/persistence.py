@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from contextlib import AbstractAsyncContextManager
 from datetime import UTC, datetime
 from typing import Any, Protocol
@@ -13,6 +14,8 @@ from app.workspace.models import Message, WorkspaceSession
 
 
 _BRAINSTORM_FAILURE_MESSAGE = "模型暂时无法完成需求理解，请稍后重试。"
+
+logger = logging.getLogger(__name__)
 
 
 class _SessionFactory(Protocol):
@@ -373,3 +376,82 @@ async def record_brainstorm_failure(
         user_message.metadata_json = user_metadata
         await db.flush()
         return assistant
+
+
+async def persist_turn_thinking(
+    session_factory: _SessionFactory,
+    thinking_service,
+    *,
+    user_id: str,
+    session_id: str,
+    turn_id: str,
+    assistant_message_id: str | None = None,
+) -> None:
+    """请求 commit 后的思考持久化：独立短事务 + 死锁重试一次。
+
+    顺序契约（spec §1）：先捕获 blocks 列表 → 独立事务 persist+attach →
+    commit 成功后才 mark_blocks_persisted（内存标记不得先于事务成功，
+    否则死锁重试时 block 永久丢失）。assistant_message_id 为 None 时跳过
+    attach（execute 分支无 assistant 消息）。全部异常只记 warning。
+    """
+    try:
+        blocks = await thinking_service.completed_blocks(
+            turn_id=turn_id,
+            user_id=user_id,
+            session_id=session_id,
+            only_unpersisted=True,
+        )
+    except Exception:
+        logger.warning(
+            "persist_turn_thinking_read_failed session_id=%s", session_id, exc_info=True
+        )
+        return
+    if not blocks and assistant_message_id is None:
+        return
+
+    async def _persist_once() -> None:
+        async with session_factory.begin() as db:
+            store = ThinkingMessageStore(db)
+            for block in blocks:
+                await store.persist_block(block, user_id=user_id, session_id=session_id)
+            if assistant_message_id is not None:
+                assistant = await db.get(Message, assistant_message_id)
+                if assistant is not None:
+                    await store.attach_turn_to_assistant(
+                        assistant,
+                        user_id=user_id,
+                        session_id=session_id,
+                        turn_id=turn_id,
+                    )
+
+    attempts = 0
+    while attempts < 2:
+        attempts += 1
+        try:
+            await _persist_once()
+            break
+        except Exception as error:  # noqa: BLE001 — 尽力而为，死锁重试一次
+            if attempts >= 2 or not _is_deadlock(error):
+                logger.warning(
+                    "persist_turn_thinking_failed session_id=%s", session_id, exc_info=True
+                )
+                return
+    if blocks:
+        try:
+            await thinking_service.mark_blocks_persisted(
+                turn_id=turn_id,
+                user_id=user_id,
+                session_id=session_id,
+                keys=[(block.operation_id, block.attempt) for block in blocks],
+            )
+        except Exception:
+            logger.warning(
+                "persist_turn_thinking_mark_failed session_id=%s", session_id, exc_info=True
+            )
+
+
+def _is_deadlock(error: Exception) -> bool:
+    orig = getattr(error, "orig", None)
+    args = getattr(orig, "args", ())
+    # asyncmy/PyMySQL 的 orig.args 形态为 (1213, "Deadlock found ...")。
+    return args[:1] == (1213,) or "1213" in str(orig)
