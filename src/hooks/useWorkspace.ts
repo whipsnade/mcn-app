@@ -67,6 +67,13 @@ export function useWorkspace(userId?: string) {
   const taskRuntime = useTaskStream(activeTaskId);
   const currentTaskRuntime = taskRuntime?.taskId === activeTaskId ? taskRuntime : undefined;
 
+  // events 404（幽灵/已删除任务）是永久态：复位 activeTaskId，停止流订阅。
+  useEffect(() => {
+    if (currentTaskRuntime?.notFound) {
+      setActiveTaskId(undefined);
+    }
+  }, [currentTaskRuntime?.notFound]);
+
   const getSessionOperationEpoch = useCallback(
     (id: string) => sessionOperationEpochsRef.current.get(id) ?? 0,
     [],

@@ -256,6 +256,25 @@ describe('useWorkspace', () => {
     await waitFor(() => expect(result.current.activeSession?.analysis?.followupSuggestions?.[0]?.title).toBe('恢复建议'));
   });
 
+  it('clears the active task when the stream reports the task as not found', async () => {
+    vi.mocked(getSession).mockResolvedValue({
+      ...restoredSession,
+      status: 'analyzing',
+      analysis: { taskId: 'task-ghost', status: 'running' },
+    });
+    vi.mocked(useTaskStream).mockReturnValue({
+      taskId: 'task-ghost',
+      lastEventId: 0,
+      assistantDraft: '',
+      connection: 'closed',
+      notFound: true,
+    });
+    const { result } = renderHook(() => useWorkspace('user-a'));
+
+    await waitFor(() => expect(useTaskStream).toHaveBeenCalledWith('task-ghost'));
+    await waitFor(() => expect(result.current.activeTaskId).toBeUndefined());
+  });
+
   it('clears the workspace when the user logs out', async () => {
     const { result, rerender } = renderHook(
       ({ userId }) => useWorkspace(userId),
