@@ -497,6 +497,45 @@ async def test_brainstorm_model_error_returns_friendly_502(
     assert messages[1]["metadata"]["thinking"]["blocks"][0]["label"] == "正在理解需求"
 
 
+@pytest.mark.asyncio
+async def test_brainstorm_model_error_keeps_502_when_failure_record_fails(
+    auth_client_factory, db_session, monkeypatch
+) -> None:
+    class _SessionCM:
+        async def __aenter__(self):
+            return db_session
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class _SessionFactory:
+        @staticmethod
+        def begin():
+            return _SessionCM()
+
+    async def _failing_record(*_args, **_kwargs):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr("app.brainstorm.router.SessionFactory", _SessionFactory)
+    monkeypatch.setattr(
+        "app.brainstorm.router.record_brainstorm_failure", _failing_record
+    )
+    client = await auth_client_factory("13900000008")
+    created = await client.post("/api/v1/sessions", json={})
+    session_id = created.json()["id"]
+    await db_session.commit()
+    model = FakeBrainstormModel([ModelAdapterError("MODEL_TIMEOUT", retryable=False)])
+    _install_model(monkeypatch, model)
+
+    response = await client.post(
+        f"/api/v1/sessions/{session_id}/brainstorm", json={"content": "分析一下欧诗漫"}
+    )
+
+    # 思考失败落库再次失败也不得把 502 升级为 500。
+    assert response.status_code == 502
+    assert response.json()["detail"] == "BRAINSTORM_MODEL_ERROR"
+
+
 def _patch_runtime(monkeypatch, db_session) -> None:
     """把运行时依赖改到测试会话：SessionFactory 直出测试连接，工具目录置空。"""
 

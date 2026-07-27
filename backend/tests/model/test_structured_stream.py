@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 from typing import Any
 
@@ -331,3 +332,36 @@ async def test_complete_json_stream_second_invalid_output_notifies_sink_failure(
         await adapter.complete_json(_request(thinking_sink=sink))
 
     assert sink.terminals == [("failed", 1), ("failed", 2)]
+
+
+def _cancelled_stream() -> Any:
+    chunk = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                delta=SimpleNamespace(content="<think>分析", reasoning_content=None),
+                finish_reason=None,
+            )
+        ],
+        usage=None,
+        _request_id="req-cancel",
+    )
+
+    async def stream() -> Any:
+        yield chunk
+        raise asyncio.CancelledError
+
+    return stream()
+
+
+@pytest.mark.asyncio
+async def test_complete_json_stream_cancellation_notifies_sink_failure() -> None:
+    sink = CaptureThinkingSink()
+    client = FakeCompletions([_cancelled_stream()])
+    adapter = TencentPlanAdapter(client=client, log_writer=_CaptureWriter(), stream_support_cache={})
+
+    with pytest.raises(asyncio.CancelledError):
+        await adapter.complete_json(_request(thinking_sink=sink))
+
+    # Sink 已 started 后被取消也必须收到失败终态，不能遗留运行中快照。
+    assert sink.started_attempts == [1]
+    assert sink.terminals == [("failed", 1)]

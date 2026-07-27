@@ -316,6 +316,16 @@ class TencentPlanAdapter:
                     )
 
                 value = request.output_model.model_validate_json(parsed.json_text, strict=True)
+            except asyncio.CancelledError:
+                # Sink 已 started 后被取消也必须给出失败终态，
+                # 否则运行中的 operation 快照会永久残留。
+                await self._safe_sink_call(
+                    sink,
+                    "failed",
+                    attempt=attempt,
+                    error_code="CANCELLED",
+                )
+                raise
             except (ValidationError, ValueError) as exc:
                 await self._safe_sink_call(
                     sink,

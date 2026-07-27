@@ -682,13 +682,23 @@ class _TaskArtifacts:
                 turn_id=turn_id,
                 user_id=task.user_id,
                 session_id=task.session_id,
+                only_unpersisted=True,
             )
             store = ThinkingMessageStore(db)
+            persisted_keys: list[tuple[str, int]] = []
             for block in blocks:
                 await store.persist_block(
                     block,
                     user_id=task.user_id,
                     session_id=task.session_id,
+                )
+                persisted_keys.append((block.operation_id, block.attempt))
+            if persisted_keys:
+                await service.mark_blocks_persisted(
+                    turn_id=turn_id,
+                    user_id=task.user_id,
+                    session_id=task.session_id,
+                    keys=persisted_keys,
                 )
         except Exception:
             logger.warning(
@@ -1048,16 +1058,27 @@ class TaskExecutionDependencies:
                         turn_id=turn_id,
                         user_id=user_id,
                         session_id=session_id,
+                        only_unpersisted=True,
                     )
                     if blocks:
                         async with SessionFactory.begin() as db:
                             store = ThinkingMessageStore(db)
+                            persisted_keys: list[tuple[str, int]] = []
                             for block in blocks:
                                 await store.persist_block(
                                     block,
                                     user_id=user_id,
                                     session_id=session_id,
                                 )
+                                persisted_keys.append(
+                                    (block.operation_id, block.attempt)
+                                )
+                        await thinking_service.mark_blocks_persisted(
+                            turn_id=turn_id,
+                            user_id=user_id,
+                            session_id=session_id,
+                            keys=persisted_keys,
+                        )
                 except Exception:
                     logger.warning(
                         "agent_thinking_persist_failed task_id=%s",

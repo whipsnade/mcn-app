@@ -65,15 +65,23 @@ async def brainstorm(
             )
             blocks = ()
         await db.rollback()
-        await record_brainstorm_failure(
-            SessionFactory,
-            user_id=user_id,
-            session_id=session_id,
-            turn_id=str(payload.turn_id),
-            user_content=payload.content,
-            blocks=blocks,
-            error_code=error.code,
-        )
+        try:
+            await record_brainstorm_failure(
+                SessionFactory,
+                user_id=user_id,
+                session_id=session_id,
+                turn_id=str(payload.turn_id),
+                user_content=payload.content,
+                blocks=blocks,
+                error_code=error.code,
+            )
+        except Exception:
+            # 失败落库是尽力而为的附加动作，不得把原本的 502 升级为 500。
+            logger.warning(
+                "brainstorm_failure_record_failed session_id=%s",
+                session_id,
+                exc_info=True,
+            )
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=ErrorCode.BRAINSTORM_MODEL_ERROR,

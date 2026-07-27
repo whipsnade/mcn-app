@@ -265,13 +265,23 @@ class BrainstormService:
                 turn_id=turn_id,
                 user_id=user_id,
                 session_id=session_id,
+                only_unpersisted=True,
             )
             store = ThinkingMessageStore(self.db)
+            persisted_keys: list[tuple[str, int]] = []
             for block in blocks:
                 await store.persist_block(
                     block,
                     user_id=user_id,
                     session_id=session_id,
+                )
+                persisted_keys.append((block.operation_id, block.attempt))
+            if persisted_keys:
+                await self.thinking_service.mark_blocks_persisted(
+                    turn_id=turn_id,
+                    user_id=user_id,
+                    session_id=session_id,
+                    keys=persisted_keys,
                 )
         except Exception:
             logger.warning(

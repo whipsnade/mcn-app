@@ -198,8 +198,162 @@ async def test_failed_sink_creates_interrupted_block_and_removes_running_snapsho
         turn_id="turn-1", user_id="user-1", session_id="session-1"
     )
 
-    assert queue.empty()
+    # 新订阅不再收到运行中快照，但会回放近期终态事件（断线重连收敛）。
+    replayed = drain(queue)
+    assert [event.type for event in replayed] == ["thinking.failed"]
+    assert replayed[0].payload["status"] == "interrupted"
     assert blocks[0].status == "interrupted"
+
+
+@pytest.mark.asyncio
+async def test_resubscribe_replays_terminal_reached_while_disconnected() -> None:
+    _, SessionThinkingService = thinking_types()
+    service = SessionThinkingService(queue_size=8)
+    queue = await service.subscribe("session-1")
+    sink = service.create_sink(operation("op-1", "turn-1", "session-1"))
+    await sink.started(attempt=1)
+    await sink.delta("分析中", attempt=1)
+    drain(queue)
+    await service.unsubscribe("session-1", queue)
+
+    # 断线期间 operation 进入终态。
+    await sink.completed(attempt=1, duration_ms=5)
+
+    reconnected = await service.subscribe("session-1")
+    replayed = drain(reconnected)
+    assert [event.type for event in replayed] == ["thinking.completed"]
+    assert replayed[0].payload["operation_id"] == "op-1"
+    assert replayed[0].payload["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_terminal_replay_is_bounded_per_session() -> None:
+    _, SessionThinkingService = thinking_types()
+    service = SessionThinkingService(queue_size=512)
+    for index in range(210):
+        sink = service.create_sink(
+            operation(f"op-{index}", f"turn-{index}", "session-1")
+        )
+        await sink.started(attempt=1)
+        await sink.completed(attempt=1, duration_ms=1)
+
+    queue = await service.subscribe("session-1")
+    replayed = drain(queue)
+
+    assert len(replayed) == 200
+    assert replayed[0].payload["operation_id"] == "op-10"
+
+
+@pytest.mark.asyncio
+async def test_turn_budget_clamps_running_delta_in_real_time() -> None:
+    _, SessionThinkingService = thinking_types()
+    service = SessionThinkingService(queue_size=16)
+    # 两个已完成 block 各占满 12k，turn 预算剩余约 6k。
+    for index in range(2):
+        sink = service.create_sink(operation(f"op-{index}", "turn-1", "session-1"))
+        await sink.started(attempt=1)
+        await sink.delta("甲" * 25_000, attempt=1)
+        await sink.completed(attempt=1, duration_ms=1)
+
+    queue = await service.subscribe("session-1")
+    drain(queue)
+    streaming = service.create_sink(operation("op-2", "turn-1", "session-1"))
+    await streaming.started(attempt=1)
+    await streaming.delta("乙" * 12_000, attempt=1)
+
+    published = [
+        event
+        for event in drain(queue)
+        if event.type in ("thinking.delta", "thinking.snapshot")
+    ]
+    assert published
+    # 实时 delta 即按 turn 剩余额度收敛，而非等终态才截断。
+    latest = published[-1].payload["text"]
+    assert len(latest) <= 6_000
+    assert latest.endswith("思考内容过长，已截断")
+
+
+@pytest.mark.asyncio
+async def test_completed_blocks_tracks_persisted_keys() -> None:
+    _, SessionThinkingService = thinking_types()
+    service = SessionThinkingService()
+    first = service.create_sink(operation("op-1", "turn-1", "session-1"))
+    await first.started(attempt=1)
+    await first.completed(attempt=1, duration_ms=1)
+
+    await service.mark_blocks_persisted(
+        turn_id="turn-1",
+        user_id="user-1",
+        session_id="session-1",
+        keys=[("op-1", 1)],
+    )
+    second = service.create_sink(operation("op-2", "turn-1", "session-1"))
+    await second.started(attempt=1)
+    await second.completed(attempt=1, duration_ms=1)
+
+    unpersisted = await service.completed_blocks(
+        turn_id="turn-1",
+        user_id="user-1",
+        session_id="session-1",
+        only_unpersisted=True,
+    )
+    all_blocks = await service.completed_blocks(
+        turn_id="turn-1", user_id="user-1", session_id="session-1"
+    )
+
+    assert [block.operation_id for block in unpersisted] == ["op-2"]
+    assert [block.operation_id for block in all_blocks] == ["op-1", "op-2"]
+    stranger = await service.completed_blocks(
+        turn_id="turn-1",
+        user_id="stranger",
+        session_id="session-1",
+        only_unpersisted=True,
+    )
+    assert stranger == ()
+
+
+@pytest.mark.asyncio
+async def test_turn_state_is_evicted_beyond_retention_cap() -> None:
+    _, SessionThinkingService = thinking_types()
+    service = SessionThinkingService(max_retained_turns=2)
+    for index in range(3):
+        sink = service.create_sink(
+            operation(f"op-{index}", f"turn-{index}", "session-1")
+        )
+        await sink.started(attempt=1)
+        await sink.completed(attempt=1, duration_ms=1)
+
+    evicted = await service.completed_blocks(
+        turn_id="turn-0", user_id="user-1", session_id="session-1"
+    )
+    retained = await service.completed_blocks(
+        turn_id="turn-2", user_id="user-1", session_id="session-1"
+    )
+
+    assert evicted == ()
+    assert [block.operation_id for block in retained] == ["op-2"]
+
+
+@pytest.mark.asyncio
+async def test_running_turn_is_never_evicted() -> None:
+    _, SessionThinkingService = thinking_types()
+    service = SessionThinkingService(max_retained_turns=2)
+    running = service.create_sink(operation("op-running", "turn-0", "session-1"))
+    await running.started(attempt=1)
+    for index in range(1, 4):
+        sink = service.create_sink(
+            operation(f"op-{index}", f"turn-{index}", "session-1")
+        )
+        await sink.started(attempt=1)
+        await sink.completed(attempt=1, duration_ms=1)
+
+    await running.delta("仍在分析", attempt=1)
+    queue = await service.subscribe("session-1")
+    snapshots = [
+        event for event in drain(queue) if event.type == "thinking.snapshot"
+    ]
+
+    assert [event.payload["operation_id"] for event in snapshots] == ["op-running"]
 
 
 @pytest.mark.asyncio

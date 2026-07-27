@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import OrderedDict, deque
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from functools import lru_cache
@@ -22,6 +24,10 @@ logger = logging.getLogger(__name__)
 _BLOCK_MAX_CHARS = 12_000
 _TURN_MAX_CHARS = 30_000
 _TRUNCATED_SUFFIX = "思考内容过长，已截断"
+# 每会话保留的近期终态事件条数：断线重连后回放，避免前端永久停留在「思考中」。
+_RECENT_TERMINAL_LIMIT = 200
+# 进程内最多保留的 turn 状态数（完成块、绑定、持久化游标）；超限按最旧淘汰。
+_DEFAULT_MAX_RETAINED_TURNS = 256
 
 ThinkingQueue = asyncio.Queue[ThinkingEvent | None]
 
@@ -86,15 +92,26 @@ class SessionThinkingSink:
 
 
 class SessionThinkingService:
-    def __init__(self, *, queue_size: int = 32) -> None:
+    def __init__(
+        self,
+        *,
+        queue_size: int = 32,
+        max_retained_turns: int = _DEFAULT_MAX_RETAINED_TURNS,
+    ) -> None:
         if queue_size < 1:
             raise ValueError("queue_size must be positive")
+        if max_retained_turns < 1:
+            raise ValueError("max_retained_turns must be positive")
         self._queue_size = queue_size
+        self._max_retained_turns = max_retained_turns
         self._lock = asyncio.Lock()
         self._subscribers: dict[str, set[ThinkingQueue]] = {}
         self._running: dict[str, _RunningOperation] = {}
         self._completed: dict[str, list[ThinkingBlock]] = {}
         self._turn_bindings: dict[str, _TurnBinding] = {}
+        self._persisted: dict[str, set[tuple[str, int]]] = {}
+        self._turn_order: OrderedDict[str, None] = OrderedDict()
+        self._recent_terminal: dict[str, deque[ThinkingEvent]] = {}
 
     def create_sink(self, spec: ThinkingOperationSpec) -> SessionThinkingSink:
         return SessionThinkingSink(self, spec)
@@ -121,6 +138,7 @@ class SessionThinkingService:
                 trigger_message_id=trigger_message_id,
             )
             self._turn_bindings[turn_id] = binding
+            self._touch_turn_locked(turn_id)
             for state in self._running.values():
                 if state.spec.turn_id == turn_id:
                     self._assert_owner(state.spec, user_id, session_id)
@@ -133,6 +151,7 @@ class SessionThinkingService:
                 else block
                 for block in blocks
             ]
+            self._evict_turns_locked()
 
     async def completed_blocks(
         self,
@@ -140,6 +159,7 @@ class SessionThinkingService:
         turn_id: str,
         user_id: str,
         session_id: str,
+        only_unpersisted: bool = False,
     ) -> tuple[ThinkingBlock, ...]:
         async with self._lock:
             binding = self._turn_bindings.get(turn_id)
@@ -148,7 +168,32 @@ class SessionThinkingService:
             owner = (binding.user_id, binding.session_id)
             if owner != (user_id, session_id):
                 return ()
-            return tuple(self._completed.get(turn_id, ()))
+            blocks = self._completed.get(turn_id, ())
+            if only_unpersisted:
+                persisted = self._persisted.get(turn_id, set())
+                blocks = [
+                    block
+                    for block in blocks
+                    if (block.operation_id, block.attempt) not in persisted
+                ]
+            return tuple(blocks)
+
+    async def mark_blocks_persisted(
+        self,
+        *,
+        turn_id: str,
+        user_id: str,
+        session_id: str,
+        keys: Iterable[tuple[str, int]],
+    ) -> None:
+        """登记已成功落库的 (operation_id, attempt)，避免重复扫描与重复持久化。"""
+        async with self._lock:
+            binding = self._turn_bindings.get(turn_id)
+            if binding is None:
+                return
+            if (binding.user_id, binding.session_id) != (user_id, session_id):
+                return
+            self._persisted.setdefault(turn_id, set()).update(keys)
 
     async def subscribe(self, session_id: str) -> ThinkingQueue:
         queue: ThinkingQueue = asyncio.Queue()
@@ -159,6 +204,10 @@ class SessionThinkingService:
             ]
             for state in states:
                 queue.put_nowait(self._snapshot(state))
+            # 回放近期终态事件：断线期间完成的 operation 也能收敛到终态。
+            # 前端按 operation+attempt+sequence 去重，重复回放不会产生副作用。
+            for event in self._recent_terminal.get(session_id, ()):
+                queue.put_nowait(event)
         return queue
 
     async def unsubscribe(self, session_id: str, queue: ThinkingQueue) -> None:
@@ -173,6 +222,7 @@ class SessionThinkingService:
     async def _started(self, spec: ThinkingOperationSpec, attempt: int) -> None:
         async with self._lock:
             self._register_turn_owner(spec)
+            self._touch_turn_locked(spec.turn_id)
             spec = self._bound_spec(spec)
             state = _RunningOperation(
                 spec=spec,
@@ -185,6 +235,7 @@ class SessionThinkingService:
                 self._event("thinking.started", self._payload(state)),
                 state=state,
             )
+            self._evict_turns_locked()
 
     async def _delta(self, spec: ThinkingOperationSpec, text: str, attempt: int) -> None:
         if not text:
@@ -195,7 +246,16 @@ class SessionThinkingService:
                 return
             previous = state.public_text
             state.raw_text += text
-            sanitized = sanitize_thinking(state.raw_text, max_chars=_BLOCK_MAX_CHARS)
+            # turn 级预算实时收敛：已完成的同 turn block 占用额度后，
+            # 运行中的 delta 立即截断，不再等到终态才发现超限。
+            used = sum(
+                len(block.content)
+                for block in self._completed.get(state.spec.turn_id, ())
+            )
+            remaining = max(0, _TURN_MAX_CHARS - used)
+            sanitized = sanitize_thinking(
+                state.raw_text, max_chars=min(_BLOCK_MAX_CHARS, remaining)
+            )
             state.public_text = sanitized.text
             state.truncated = sanitized.truncated
             if state.public_text == previous:
@@ -261,11 +321,15 @@ class SessionThinkingService:
             )
             if error_code is not None:
                 payload["error_code"] = sanitize_thinking(error_code, max_chars=200).text
+            event = self._event(event_type, payload)
+            self._record_recent_terminal_locked(state.spec.session_id, event)
+            self._touch_turn_locked(state.spec.turn_id)
             self._publish_locked(
                 state.spec.session_id,
-                self._event(event_type, payload),
+                event,
                 terminal=True,
             )
+            self._evict_turns_locked()
 
     def _register_turn_owner(self, spec: ThinkingOperationSpec) -> None:
         binding = self._turn_bindings.get(spec.turn_id)
@@ -278,6 +342,37 @@ class SessionThinkingService:
             )
             return
         self._assert_owner(spec, binding.user_id, binding.session_id)
+
+    def _touch_turn_locked(self, turn_id: str) -> None:
+        self._turn_order[turn_id] = None
+        self._turn_order.move_to_end(turn_id)
+
+    def _evict_turns_locked(self) -> None:
+        """按最旧顺序释放 turn 状态；仍有运行中 operation 的 turn 跳过不淘汰。"""
+        overflow = len(self._turn_order) - self._max_retained_turns
+        if overflow <= 0:
+            return
+        active_turns = {state.spec.turn_id for state in self._running.values()}
+        for turn_id in list(self._turn_order):
+            if overflow <= 0:
+                break
+            if turn_id in active_turns:
+                continue
+            self._turn_order.pop(turn_id, None)
+            self._turn_bindings.pop(turn_id, None)
+            self._completed.pop(turn_id, None)
+            self._persisted.pop(turn_id, None)
+            overflow -= 1
+
+    def _record_recent_terminal_locked(self, session_id: str, event: ThinkingEvent) -> None:
+        recent = self._recent_terminal.get(session_id)
+        if recent is None:
+            recent = deque(maxlen=_RECENT_TERMINAL_LIMIT)
+            self._recent_terminal[session_id] = recent
+            # 会话数同样有界：超出的最旧会话整体丢弃。
+            if len(self._recent_terminal) > self._max_retained_turns * 2:
+                self._recent_terminal.pop(next(iter(self._recent_terminal)))
+        recent.append(event)
 
     @staticmethod
     def _assert_owner(spec: ThinkingOperationSpec, user_id: str, session_id: str) -> None:

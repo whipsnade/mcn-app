@@ -22,10 +22,20 @@ describe('tasks api', () => {
     expect(randomUUID).toHaveBeenCalledOnce();
   });
 
-  it('creates a namespaced fallback turn id without crypto.randomUUID', () => {
+  it('creates a valid UUID v4 fallback turn id without crypto.randomUUID', () => {
     vi.stubGlobal('crypto', {});
 
-    expect(createTurnId()).toMatch(/^turn-[a-z0-9]+-[a-z0-9]+$/);
+    expect(createTurnId()).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
+  });
+
+  it('uses crypto.getRandomValues for the fallback when available', () => {
+    const getRandomValues = vi.fn((bytes: Uint8Array) => bytes.fill(7));
+    vi.stubGlobal('crypto', { getRandomValues });
+
+    expect(createTurnId()).toBe('07070707-0707-4707-8707-070707070707');
+    expect(getRandomValues).toHaveBeenCalledOnce();
   });
 
   it('returns the task outcome payload as-is', async () => {
