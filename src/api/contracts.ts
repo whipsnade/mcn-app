@@ -92,6 +92,8 @@ export interface BrainstormMetadata {
   ready: boolean;
   options: string[];
   profile_summary?: ApiBrainstormProfile | null;
+  /** 平台问题等允许多选的澄清选项；缺省/false 为单选（点击即填入）。 */
+  multi?: boolean;
 }
 
 export interface ClarifyMetadata {

@@ -99,6 +99,7 @@ export default function ChatArea({
   onRetryFollowups,
 }: ChatAreaProps) {
   const [inputText, setInputText] = useState('');
+  const [selectedOptions, setSelectedOptions] = useState<string[]>([]);
   const chatEndRef = useRef<HTMLDivElement>(null);
   const chatLogRef = useRef<HTMLDivElement>(null);
   const isNearBottomRef = useRef(true);
@@ -191,6 +192,11 @@ export default function ChatArea({
     }
   }
 
+  // 最新 assistant 消息变化时清空多选选中态，避免选中项串到新一轮澄清。
+  useEffect(() => {
+    setSelectedOptions([]);
+  }, [latestAssistantMessageId]);
+
   return (
     <div className="flex min-h-0 flex-1 flex-col bg-white border-r border-slate-200 h-full no-print">
 
@@ -258,6 +264,8 @@ export default function ChatArea({
           const brainstormOptions = isAI && msg.id === latestAssistantMessageId
             ? msg.brainstorm?.options ?? msg.clarify?.options ?? []
             : [];
+          // 仅 brainstorm 显式标记 multi=true 走多选；clarify 与存量无 multi 消息保持单选。
+          const isMultiSelect = brainstormOptions.length > 0 && msg.brainstorm?.multi === true;
           const thinkingBlocks = !isAI && msg.turnId
             ? thinkingByTurn[msg.turnId] ?? []
             : [];
@@ -311,22 +319,52 @@ export default function ChatArea({
                   {/* Brainstorm 澄清选项 chips（样式复用进一步分析建议 chips） */}
                   {brainstormOptions.length > 0 && (
                     <div className="mt-2 flex flex-wrap gap-1.5" aria-label="澄清选项">
-                      {brainstormOptions.map(option => (
+                      {brainstormOptions.map(option => {
+                        const selected = isMultiSelect && selectedOptions.includes(option);
+                        return (
+                          <button
+                            key={option}
+                            type="button"
+                            disabled={isAnalyzing}
+                            aria-pressed={isMultiSelect ? selected : undefined}
+                            onClick={() => {
+                              if (isAnalyzing) return;
+                              if (isMultiSelect) {
+                                setSelectedOptions(current => current.includes(option)
+                                  ? current.filter(item => item !== option)
+                                  : [...current, option]);
+                              } else {
+                                fillInput(option);
+                              }
+                            }}
+                            className={`rounded-lg border px-2.5 py-1.5 text-[10px] font-semibold transition active:scale-95 ${isAnalyzing
+                              ? 'cursor-not-allowed border-slate-100 bg-slate-50 text-slate-300'
+                              : selected
+                                ? 'border-indigo-400 bg-indigo-100 text-indigo-700'
+                                : 'border-indigo-100 bg-white text-indigo-700 hover:border-indigo-300 hover:bg-indigo-50'
+                            }`}
+                          >
+                            {option}
+                          </button>
+                        );
+                      })}
+                      {isMultiSelect && (
                         <button
-                          key={option}
                           type="button"
-                          disabled={isAnalyzing}
+                          disabled={isAnalyzing || selectedOptions.length === 0}
                           onClick={() => {
-                            if (!isAnalyzing) fillInput(option);
+                            if (isAnalyzing || selectedOptions.length === 0) return;
+                            fillInput(selectedOptions.join('、'));
+                            setSelectedOptions([]);
                           }}
-                          className={`rounded-lg border px-2.5 py-1.5 text-[10px] font-semibold transition active:scale-95 ${isAnalyzing
+                          className={`rounded-lg border px-2.5 py-1.5 text-[10px] font-semibold transition active:scale-95 ${isAnalyzing || selectedOptions.length === 0
                             ? 'cursor-not-allowed border-slate-100 bg-slate-50 text-slate-300'
-                            : 'border-indigo-100 bg-white text-indigo-700 hover:border-indigo-300 hover:bg-indigo-50'
+                            : 'border-indigo-600 bg-indigo-600 text-white hover:bg-indigo-500'
                           }`}
                         >
-                          {option}
+                          确认
                         </button>
-                      ))}
+                      )}
                     </div>
                   )}
                 </div>
