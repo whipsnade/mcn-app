@@ -227,7 +227,8 @@ async def answer_context_qa(
                     ),
                 ),
                 output_model=ContextQaAnswer,
-                max_tokens=2048,
+                # 推理模型 <think> 占用输出预算，2048 易把 JSON 截断，放大到 4096。
+                max_tokens=4096,
                 log_context={"user_id": user_id, "session_id": session_id},
             )
         )

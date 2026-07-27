@@ -191,6 +191,7 @@ async def test_answer_context_qa_returns_model_answer(auth_client_factory, db_se
     assert answer == "因为圈选时互动率权重最高。"
     request = model.requests[0]
     assert request.purpose == "context_qa"
+    assert request.max_tokens == 4096
 
 
 @pytest.mark.asyncio
