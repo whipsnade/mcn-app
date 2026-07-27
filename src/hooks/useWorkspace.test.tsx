@@ -273,6 +273,10 @@ describe('useWorkspace', () => {
 
     await waitFor(() => expect(useTaskStream).toHaveBeenCalledWith('task-ghost'));
     await waitFor(() => expect(result.current.activeTaskId).toBeUndefined());
+    // 幽灵任务：本地会话分析态同步终态化，解除输入阻塞（isAnalyzing 变 false）。
+    await waitFor(() => expect(result.current.activeSession?.analysis?.status).toBe('failed'));
+    expect(result.current.activeSession?.analysis?.taskId).toBe('task-ghost');
+    expect(result.current.isAnalyzing).toBe(false);
   });
 
   it('clears the workspace when the user logs out', async () => {
