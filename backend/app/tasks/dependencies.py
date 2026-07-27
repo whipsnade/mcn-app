@@ -272,6 +272,7 @@ class _TaskArtifacts:
                         "version": report.version,
                         "phase": "ai_summary",
                         "label": "KOL 分析报告已生成",
+                        "report_type": "kol_analysis",
                     },
                 )
         except Exception:
@@ -492,6 +493,7 @@ class _TaskArtifacts:
                 "version": report.version,
                 "phase": "ai_summary",
                 "label": event_label,
+                "report_type": report.report_type,
             },
         )
         return None, None

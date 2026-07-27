@@ -1341,6 +1341,7 @@ async def test_auto_kol_analysis_builds_session_report_and_emits_event() -> None
                 "version": 1,
                 "phase": "ai_summary",
                 "label": "KOL 分析报告已生成",
+                "report_type": "kol_analysis",
             }
     finally:
         await _cleanup_leased_task(ids)
