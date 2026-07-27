@@ -10,6 +10,7 @@ from app.brainstorm.schemas import (
     BrainstormProfile,
     BrainstormQuestion,
     BrainstormRequest,
+    merge_profile,
 )
 from app.model.contracts import ModelAdapterError, StructuredResult
 from app.model.prompt_logs import PromptLogEntry
@@ -701,3 +702,55 @@ def test_param_profile_period_override_validation() -> None:
         "start": "2026-04-01",
         "end": "2026-04-30",
     }
+
+
+def test_question_multi_defaults_false() -> None:
+    q = BrainstormQuestion(text="哪个品牌？", options=["海底捞"])
+    assert q.multi is False
+
+
+def test_merge_profile_platforms_union_preserves_order_and_dedupes() -> None:
+    base = BrainstormProfile(brand="问界", platforms=["douyin", "xiaohongshu"])
+    incoming = BrainstormProfile(platforms=["xiaohongshu", "bilibili"])
+    merged = merge_profile(base, incoming)
+    assert merged.platforms == ["douyin", "xiaohongshu", "bilibili"]
+
+
+def test_merge_profile_platforms_incoming_empty_keeps_base() -> None:
+    base = BrainstormProfile(brand="问界", platforms=["douyin"])
+    merged = merge_profile(base, BrainstormProfile())
+    assert merged.platforms == ["douyin"]
+
+
+@pytest.mark.asyncio
+async def test_brainstorm_question_multi_flag_in_metadata(
+    auth_client_factory, db_session, monkeypatch
+) -> None:
+    client = await auth_client_factory("13900000013")
+    created = await client.post("/api/v1/sessions", json={})
+    assert created.status_code == 201
+    session_id = created.json()["id"]
+    model = FakeBrainstormModel(
+        [
+            BrainstormModelOutput(
+                ready=False,
+                assistant_message="好的，再确认要查看的渠道（可多选）。",
+                question=BrainstormQuestion(
+                    text="在哪些平台查看？",
+                    options=["抖音", "小红书", "B站"],
+                    multi=True,
+                ),
+                extracted=BrainstormProfile(brand="欧诗漫"),
+            )
+        ]
+    )
+    _install_model(monkeypatch, model)
+    _share_session_factory(monkeypatch, db_session)
+
+    response = await client.post(
+        f"/api/v1/sessions/{session_id}/brainstorm", json={"content": "我想分析欧诗漫"}
+    )
+
+    assert response.status_code == 200
+    brainstorm_meta = response.json()["message"]["metadata"]["brainstorm"]
+    assert brainstorm_meta["multi"] is True
