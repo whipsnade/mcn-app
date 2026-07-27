@@ -55,6 +55,8 @@ export interface TaskRuntimeState {
   errorMessageId?: string;
   activity?: string;
   connection: TaskConnection;
+  /** events 端点 404：任务不存在或已不可见，永久态，上层据此复位 activeTaskId。 */
+  notFound?: boolean;
   followupStatus?: 'pending' | 'completed' | 'failed';
   followupSuggestions?: Array<{ title: string; prompt: string; rationale: string }>;
   followupError?: string;

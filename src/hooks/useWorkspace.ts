@@ -67,6 +67,21 @@ export function useWorkspace(userId?: string) {
   const taskRuntime = useTaskStream(activeTaskId);
   const currentTaskRuntime = taskRuntime?.taskId === activeTaskId ? taskRuntime : undefined;
 
+  // events 404（幽灵/已删除任务）是永久态：复位 activeTaskId，停止流订阅。
+  useEffect(() => {
+    if (!currentTaskRuntime?.notFound) return;
+    setActiveTaskId(undefined);
+    const sessionId = activeSessionIdRef.current;
+    if (!sessionId) return;
+    // 幽灵任务（服务端不存在）：本地会话分析态置 failed，解除输入阻塞；
+    // 下次 getSession 会以服务端真实状态为准。
+    setSessions(current => current.map(session => (
+      session.id === sessionId && session.analysis
+        ? { ...session, analysis: { ...session.analysis, status: 'failed' } }
+        : session
+    )));
+  }, [currentTaskRuntime?.notFound]);
+
   const getSessionOperationEpoch = useCallback(
     (id: string) => sessionOperationEpochsRef.current.get(id) ?? 0,
     [],

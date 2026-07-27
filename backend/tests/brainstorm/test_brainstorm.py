@@ -116,6 +116,25 @@ def _install_model(monkeypatch, model: FakeBrainstormModel) -> None:
     monkeypatch.setattr("app.brainstorm.router.get_model_adapter", lambda: model)
 
 
+def _share_session_factory(monkeypatch, db_session) -> None:
+    """commit 后的思考持久化走 SessionFactory 独立事务；测试 fixture 是共享连接 +
+    savepoint，真实 SessionFactory 的新连接看不到未提交数据，需替换为共享会话。"""
+
+    class _SessionCM:
+        async def __aenter__(self):
+            return db_session
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class _SessionFactory:
+        @staticmethod
+        def begin():
+            return _SessionCM()
+
+    monkeypatch.setattr("app.brainstorm.router.SessionFactory", _SessionFactory)
+
+
 def _full_profile() -> BrainstormProfile:
     return BrainstormProfile(
         brand="欧诗漫",
@@ -137,7 +156,7 @@ def test_brainstorm_request_accepts_turn_id_and_rejects_invalid_uuid() -> None:
 
 @pytest.mark.asyncio
 async def test_minimax_think_response_returns_json_message_and_persists_thinking(
-    auth_client_factory, monkeypatch
+    auth_client_factory, db_session, monkeypatch
 ) -> None:
     writer = _CapturePromptWriter()
     model = TencentPlanAdapter(
@@ -146,6 +165,7 @@ async def test_minimax_think_response_returns_json_message_and_persists_thinking
         stream_support_cache={},
     )
     _install_model(monkeypatch, model)
+    _share_session_factory(monkeypatch, db_session)
     client = await auth_client_factory("13900000011")
     created = await client.post("/api/v1/sessions", json={})
     session_id = created.json()["id"]
@@ -198,7 +218,7 @@ async def test_brainstorm_succeeds_when_every_thinking_sink_method_fails(
 
 @pytest.mark.asyncio
 async def test_first_round_incomplete_profile_asks_one_question_with_options(
-    auth_client_factory, monkeypatch
+    auth_client_factory, db_session, monkeypatch
 ) -> None:
     client = await auth_client_factory("13900000001")
     created = await client.post("/api/v1/sessions", json={})
@@ -217,6 +237,7 @@ async def test_first_round_incomplete_profile_asks_one_question_with_options(
         ]
     )
     _install_model(monkeypatch, model)
+    _share_session_factory(monkeypatch, db_session)
 
     response = await client.post(
         f"/api/v1/sessions/{session_id}/brainstorm", json={"content": "我想分析欧诗漫"}
@@ -271,7 +292,7 @@ async def test_first_round_incomplete_profile_asks_one_question_with_options(
 
 @pytest.mark.asyncio
 async def test_second_round_ready_creates_task_with_trigger_message(
-    auth_client_factory, monkeypatch
+    auth_client_factory, db_session, monkeypatch
 ) -> None:
     client = await auth_client_factory("13900000002")
     created = await client.post("/api/v1/sessions", json={})
@@ -300,6 +321,7 @@ async def test_second_round_ready_creates_task_with_trigger_message(
         ]
     )
     _install_model(monkeypatch, model)
+    _share_session_factory(monkeypatch, db_session)
 
     first = await client.post(
         f"/api/v1/sessions/{session_id}/brainstorm", json={"content": "我想分析欧诗漫"}
@@ -348,8 +370,82 @@ async def test_second_round_ready_creates_task_with_trigger_message(
 
 
 @pytest.mark.asyncio
+async def test_brainstorm_ready_task_actually_exists(
+    auth_client_factory, db_session, monkeypatch
+) -> None:
+    client = await auth_client_factory("13900000013")
+    created = await client.post("/api/v1/sessions", json={})
+    session_id = created.json()["id"]
+    model = FakeBrainstormModel(
+        [
+            BrainstormModelOutput(
+                ready=True,
+                assistant_message="信息已齐，开始分析。",
+                extracted=_full_profile(),
+            )
+        ]
+    )
+    _install_model(monkeypatch, model)
+    _share_session_factory(monkeypatch, db_session)
+
+    response = await client.post(
+        f"/api/v1/sessions/{session_id}/brainstorm",
+        json={"content": "小红书，美妆护肤，看达人投放"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ready"] is True
+    assert body["task_id"]
+    # 幽灵任务回归：响应中的 task_id 必须在 analysis_tasks 真实存在
+    # （事故根因是请求事务内思考持久化死锁导致 InnoDB 静默回滚，前端无限 404）。
+    task = await client.get(f"/api/v1/tasks/{body['task_id']}")
+    assert task.status_code == 200
+    assert task.json()["kind"] == "agent"
+
+
+@pytest.mark.asyncio
+async def test_brainstorm_ready_survives_thinking_persist_deadlock(
+    auth_client_factory, db_session, monkeypatch
+) -> None:
+    async def _deadlocked_persist(*_args, **_kwargs):
+        raise RuntimeError("Deadlock found when trying to get lock")
+
+    monkeypatch.setattr("app.brainstorm.router.persist_turn_thinking", _deadlocked_persist)
+    client = await auth_client_factory("13900000014")
+    created = await client.post("/api/v1/sessions", json={})
+    session_id = created.json()["id"]
+    model = FakeBrainstormModel(
+        [
+            BrainstormModelOutput(
+                ready=True,
+                assistant_message="信息已齐，开始分析。",
+                extracted=_full_profile(),
+            )
+        ]
+    )
+    _install_model(monkeypatch, model)
+
+    response = await client.post(
+        f"/api/v1/sessions/{session_id}/brainstorm",
+        json={"content": "小红书，美妆护肤，看达人投放"},
+    )
+
+    # 思考持久化在 commit 后独立事务执行，即使它抛错也不影响响应与已提交数据。
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ready"] is True
+    task = await client.get(f"/api/v1/tasks/{body['task_id']}")
+    assert task.status_code == 200
+    restored = await client.get(f"/api/v1/sessions/{session_id}")
+    assistant = restored.json()["messages"][-1]
+    assert assistant["role"] == "assistant"
+    assert assistant["content"] == "信息已齐，开始分析。"
+
+
+@pytest.mark.asyncio
 async def test_title_suggestion_updates_default_title_only_while_default(
-    auth_client_factory, monkeypatch
+    auth_client_factory, db_session, monkeypatch
 ) -> None:
     client = await auth_client_factory("13900000003")
     created = await client.post("/api/v1/sessions", json={})
@@ -374,6 +470,7 @@ async def test_title_suggestion_updates_default_title_only_while_default(
         ]
     )
     _install_model(monkeypatch, model)
+    _share_session_factory(monkeypatch, db_session)
 
     await client.post(
         f"/api/v1/sessions/{session_id}/brainstorm", json={"content": "我想分析欧诗漫"}
@@ -390,7 +487,7 @@ async def test_title_suggestion_updates_default_title_only_while_default(
 
 @pytest.mark.asyncio
 async def test_blank_title_fallback_increments_and_empty_suggestion_keeps_default(
-    auth_client_factory, monkeypatch
+    auth_client_factory, db_session, monkeypatch
 ) -> None:
     client = await auth_client_factory("13900000004")
     first = await client.post("/api/v1/sessions", json={})
@@ -408,6 +505,7 @@ async def test_blank_title_fallback_increments_and_empty_suggestion_keeps_defaul
         ]
     )
     _install_model(monkeypatch, model)
+    _share_session_factory(monkeypatch, db_session)
 
     await client.post(
         f"/api/v1/sessions/{second.json()['id']}/brainstorm", json={"content": "随便看看"}
@@ -418,7 +516,7 @@ async def test_blank_title_fallback_increments_and_empty_suggestion_keeps_defaul
 
 
 @pytest.mark.asyncio
-async def test_brainstorm_requires_owner(auth_client_factory, monkeypatch) -> None:
+async def test_brainstorm_requires_owner(auth_client_factory, db_session, monkeypatch) -> None:
     owner = await auth_client_factory("13900000005")
     outsider = await auth_client_factory("13900000006")
     created = await owner.post("/api/v1/sessions", json={})
@@ -433,6 +531,7 @@ async def test_brainstorm_requires_owner(auth_client_factory, monkeypatch) -> No
         ]
     )
     _install_model(monkeypatch, model)
+    _share_session_factory(monkeypatch, db_session)
 
     forbidden = await outsider.post(
         f"/api/v1/sessions/{session_id}/brainstorm", json={"content": "越权访问"}
@@ -461,19 +560,7 @@ async def test_brainstorm_without_token_returns_401(client, monkeypatch) -> None
 async def test_brainstorm_model_error_returns_friendly_502(
     auth_client_factory, db_session, monkeypatch
 ) -> None:
-    class _SessionCM:
-        async def __aenter__(self):
-            return db_session
-
-        async def __aexit__(self, *_args):
-            return None
-
-    class _SessionFactory:
-        @staticmethod
-        def begin():
-            return _SessionCM()
-
-    monkeypatch.setattr("app.brainstorm.router.SessionFactory", _SessionFactory)
+    _share_session_factory(monkeypatch, db_session)
     client = await auth_client_factory("13900000007")
     created = await client.post("/api/v1/sessions", json={})
     session_id = created.json()["id"]
@@ -501,22 +588,10 @@ async def test_brainstorm_model_error_returns_friendly_502(
 async def test_brainstorm_model_error_keeps_502_when_failure_record_fails(
     auth_client_factory, db_session, monkeypatch
 ) -> None:
-    class _SessionCM:
-        async def __aenter__(self):
-            return db_session
-
-        async def __aexit__(self, *_args):
-            return None
-
-    class _SessionFactory:
-        @staticmethod
-        def begin():
-            return _SessionCM()
-
     async def _failing_record(*_args, **_kwargs):
         raise RuntimeError("database unavailable")
 
-    monkeypatch.setattr("app.brainstorm.router.SessionFactory", _SessionFactory)
+    _share_session_factory(monkeypatch, db_session)
     monkeypatch.setattr(
         "app.brainstorm.router.record_brainstorm_failure", _failing_record
     )

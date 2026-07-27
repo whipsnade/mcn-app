@@ -34,7 +34,7 @@ from app.tasks.schemas import (
 from app.tasks.service import TaskConflictError, TaskService
 from app.tasks.executor import TaskRunner
 from app.thinking.contracts import ThinkingOperationSpec
-from app.thinking.persistence import ThinkingMessageStore
+from app.thinking.persistence import persist_turn_thinking
 from app.thinking.service import (
     SessionThinkingService,
     get_session_thinking_service,
@@ -281,46 +281,6 @@ async def _append_respond_message(
     return user_message, message
 
 
-async def _persist_turn_blocks(
-    db: AsyncSession,
-    thinking_service: SessionThinkingService,
-    *,
-    user_id: str,
-    session_id: str,
-    turn_id: str,
-) -> None:
-    """思考持久化尽力而为，不得改变任务创建结果。"""
-    try:
-        blocks = await thinking_service.completed_blocks(
-            turn_id=turn_id,
-            user_id=user_id,
-            session_id=session_id,
-            only_unpersisted=True,
-        )
-        store = ThinkingMessageStore(db)
-        persisted_keys: list[tuple[str, int]] = []
-        for block in blocks:
-            await store.persist_block(
-                block,
-                user_id=user_id,
-                session_id=session_id,
-            )
-            persisted_keys.append((block.operation_id, block.attempt))
-        if persisted_keys:
-            await thinking_service.mark_blocks_persisted(
-                turn_id=turn_id,
-                user_id=user_id,
-                session_id=session_id,
-                keys=persisted_keys,
-            )
-    except Exception:
-        logger.warning(
-            "task_turn_thinking_persist_failed session_id=%s",
-            session_id,
-            exc_info=True,
-        )
-
-
 @router.post("/sessions/{session_id}/tasks", response_model=TaskCreateResult, status_code=202)
 async def create_task(
     session_id: str,
@@ -374,26 +334,28 @@ async def create_task(
                         task_id=None,
                         trigger_message_id=user_message.id,
                     )
-                    await _persist_turn_blocks(
-                        db,
-                        thinking_service,
-                        user_id=user.id,
-                        session_id=session_id,
-                        turn_id=turn_id,
-                    )
-                    await ThinkingMessageStore(db).attach_turn_to_assistant(
-                        message,
-                        user_id=user.id,
-                        session_id=session_id,
-                        turn_id=turn_id,
-                    )
                 except Exception:
                     logger.warning(
-                        "goal_planner_clarify_thinking_attach_failed session_id=%s",
+                        "goal_planner_clarify_thinking_bind_failed session_id=%s",
                         session_id,
                         exc_info=True,
                     )
                 await db.commit()
+                try:
+                    await persist_turn_thinking(
+                        SessionFactory,
+                        thinking_service,
+                        user_id=user.id,
+                        session_id=session_id,
+                        turn_id=turn_id,
+                        assistant_message_id=message.id,
+                    )
+                except Exception:
+                    logger.warning(
+                        "goal_planner_clarify_thinking_persist_failed session_id=%s",
+                        session_id,
+                        exc_info=True,
+                    )
                 return TaskOutcomeClarify(message=message_read(message))
             if planner_output is not None and planner_output.action == "respond":
                 respond_type = planner_output.respond_type
@@ -426,26 +388,28 @@ async def create_task(
                         task_id=None,
                         trigger_message_id=user_message.id,
                     )
-                    await _persist_turn_blocks(
-                        db,
-                        thinking_service,
-                        user_id=user.id,
-                        session_id=session_id,
-                        turn_id=turn_id,
-                    )
-                    await ThinkingMessageStore(db).attach_turn_to_assistant(
-                        message,
-                        user_id=user.id,
-                        session_id=session_id,
-                        turn_id=turn_id,
-                    )
                 except Exception:
                     logger.warning(
-                        "goal_planner_respond_thinking_attach_failed session_id=%s",
+                        "goal_planner_respond_thinking_bind_failed session_id=%s",
                         session_id,
                         exc_info=True,
                     )
                 await db.commit()
+                try:
+                    await persist_turn_thinking(
+                        SessionFactory,
+                        thinking_service,
+                        user_id=user.id,
+                        session_id=session_id,
+                        turn_id=turn_id,
+                        assistant_message_id=message.id,
+                    )
+                except Exception:
+                    logger.warning(
+                        "goal_planner_respond_thinking_persist_failed session_id=%s",
+                        session_id,
+                        exc_info=True,
+                    )
                 return TaskOutcomeRespond(
                     respond_type=respond_type, message=message_read(message)
                 )
@@ -509,13 +473,6 @@ async def create_task(
                 task_id=task.id,
                 trigger_message_id=task.trigger_message_id,
             )
-            await _persist_turn_blocks(
-                db,
-                thinking_service,
-                user_id=user.id,
-                session_id=session_id,
-                turn_id=turn_id,
-            )
         except Exception:
             logger.warning(
                 "goal_planner_task_thinking_bind_failed task_id=%s",
@@ -523,6 +480,23 @@ async def create_task(
                 exc_info=True,
             )
     await db.commit()
+    # 思考持久化移到 commit 后独立事务：请求事务内的长事务 + 行锁曾是
+    # InnoDB 死锁/静默回滚（幽灵 task_id）的根源。enforce 关闭时 blocks 为空
+    # 且 assistant_message_id=None，helper 提前 return，无害。
+    try:
+        await persist_turn_thinking(
+            SessionFactory,
+            thinking_service,
+            user_id=user.id,
+            session_id=session_id,
+            turn_id=turn_id,
+        )
+    except Exception:
+        logger.warning(
+            "goal_planner_task_thinking_persist_failed task_id=%s",
+            task.id,
+            exc_info=True,
+        )
     if not reused:
         task_runner.submit(task.id)
     return TaskOutcomeTask(task=task_read(task))

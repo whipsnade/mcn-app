@@ -63,6 +63,11 @@ export function useTaskStream(
         } catch (error) {
           if (controller.signal.aborted || stopped) break;
           const currentState = latestState.current ?? initial;
+          if (error instanceof Error && error.message === 'SSE_404') {
+            // 任务不存在（或已不可见）：永久态，停止重连并标记，交由上层复位。
+            update({ ...currentState, connection: 'closed', notFound: true });
+            break;
+          }
           update({ ...currentState, connection: 'error' });
         }
         const currentState = latestState.current ?? initial;

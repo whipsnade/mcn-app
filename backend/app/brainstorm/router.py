@@ -14,7 +14,7 @@ from app.model.dependencies import get_model_adapter
 from app.tasks.executor import TaskRunner
 from app.tasks.router import get_task_runner
 from app.tasks.service import TaskConflictError
-from app.thinking.persistence import record_brainstorm_failure
+from app.thinking.persistence import persist_turn_thinking, record_brainstorm_failure
 from app.thinking.service import (
     SessionThinkingService,
     get_session_thinking_service,
@@ -91,6 +91,19 @@ async def brainstorm(
             status_code=status.HTTP_409_CONFLICT, detail="task_in_progress"
         ) from error
     await db.commit()
+    try:
+        await persist_turn_thinking(
+            SessionFactory,
+            thinking_service,
+            user_id=user_id,
+            session_id=session_id,
+            turn_id=str(payload.turn_id),
+            assistant_message_id=outcome.message.id,
+        )
+    except Exception:
+        logger.warning(
+            "brainstorm_thinking_persist_failed session_id=%s", session_id, exc_info=True
+        )
     if outcome.task_id is not None:
         task_runner.submit(outcome.task_id)
     return BrainstormResponse(

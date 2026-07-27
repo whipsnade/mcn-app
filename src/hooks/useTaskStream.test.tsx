@@ -2,6 +2,7 @@ import { renderHook, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import * as tasksApi from '../api/tasks';
+import * as taskStreamApi from '../api/taskStream';
 import { installFetchSse } from '../test/fakeSse';
 import { calculateReconnectDelay, useTaskStream } from './useTaskStream';
 
@@ -36,6 +37,25 @@ describe('useTaskStream', () => {
 
     await waitFor(() => expect(fake.connectionCount()).toBe(1));
     fake.restore();
+  });
+
+  it('stops reconnecting and marks notFound when the events endpoint returns 404', async () => {
+    const stream = vi.spyOn(taskStreamApi, 'streamTaskEvents')
+      .mockRejectedValue(new Error('SSE_404'));
+    const { result } = renderHook(() => useTaskStream('task-ghost'));
+
+    await waitFor(() => expect(result.current?.notFound).toBe(true));
+
+    expect(result.current?.connection).toBe('closed');
+    expect(stream).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps reconnecting on transient stream failures', async () => {
+    const stream = vi.spyOn(taskStreamApi, 'streamTaskEvents')
+      .mockRejectedValue(new Error('SSE_500'));
+    renderHook(() => useTaskStream('task-1'));
+
+    await waitFor(() => expect(stream.mock.calls.length).toBeGreaterThan(1));
   });
 
   it('uses an injected bounded jitter for exponential reconnect delays', () => {
