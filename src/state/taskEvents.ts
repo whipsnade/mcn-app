@@ -294,13 +294,20 @@ export function reduceTaskEvent(state: TaskRuntimeState, event: TaskEvent): Task
       {
         const reportId = valueOf(event.payload, 'reportId', 'report_id');
         if (reportId === undefined || reportId === null) return next;
-        return withFlowNode({
+        // 品牌/活动报告的 report.updated 不进入「达人」Tab 的 KOL 分析子 Tab；
+        // 无 report_type 的历史事件按 KOL 处理（过渡近似）。
+        const reportType = valueOf(event.payload, 'reportType', 'report_type');
+        const isKolReport = reportType === undefined || reportType === 'kol_analysis';
+        const base = {
           ...next,
-          visibleAnalysisReportId: String(reportId),
-          phase: 'ai_summary',
+          phase: 'ai_summary' as const,
           phaseLabel: String(event.payload.label ?? '分析报告已生成'),
           activity: '分析报告已更新',
-        }, event);
+        };
+        return withFlowNode(
+          isKolReport ? { ...base, visibleAnalysisReportId: String(reportId) } : base,
+          event,
+        );
       }
     case 'artifact.updated':
       {

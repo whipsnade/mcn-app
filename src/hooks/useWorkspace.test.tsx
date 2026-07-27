@@ -1345,6 +1345,44 @@ describe('useWorkspace', () => {
     expect(result.current.activeSession?.analysisReport).toBeUndefined();
   });
 
+  it('does not mount a brand report announced by report.updated into the KOL analysis tab', async () => {
+    vi.mocked(getSession).mockResolvedValue({
+      ...restoredSession,
+      status: 'analyzing',
+      analysis: { taskId: 'task-1', status: 'running', kind: 'agent' },
+    });
+    vi.mocked(useTaskStream).mockReturnValue({
+      taskId: 'task-1', lastEventId: 1, assistantDraft: '', connection: 'connected',
+      status: 'running', visibleAnalysisReportId: 'analysis-report-brand',
+    });
+    vi.mocked(getAnalysisReport).mockResolvedValue({
+      id: 'analysis-report-brand', task_id: null, version: 1, title: '品牌分析报告',
+      report_type: 'brand_analysis',
+      blocks: [], conclusion: null, status: 'completed', generated_at: '2026-07-24T10:00:00Z',
+    });
+    const { result } = renderHook(() => useWorkspace('user-a'));
+
+    await waitFor(() => expect(getAnalysisReport).toHaveBeenCalledWith('analysis-report-brand'));
+    expect(result.current.activeSession?.analysisReport).toBeUndefined();
+  });
+
+  it('does not mount a persisted brand report as the session analysis report', async () => {
+    vi.mocked(getSession).mockResolvedValue({
+      ...restoredSession,
+      analysis: { taskId: 'task-1', status: 'completed', kind: 'agent', analysisReportId: 'analysis-report-brand' },
+    });
+    vi.mocked(getAnalysisReport).mockResolvedValue({
+      id: 'analysis-report-brand', task_id: null, version: 1, title: '品牌分析报告',
+      report_type: 'brand_analysis',
+      blocks: [], conclusion: null, status: 'completed', generated_at: '2026-07-24T10:00:00Z',
+    });
+    const { result } = renderHook(() => useWorkspace('user-a'));
+
+    await waitFor(() => expect(getAnalysisReport).toHaveBeenCalledWith('analysis-report-brand'));
+    expect(result.current.activeSession?.analysisReport).toBeUndefined();
+    expect(result.current.activeSession?.analysis?.analysisReportId).toBeUndefined();
+  });
+
   it('restores the persisted analysis report for an agent session', async () => {
     vi.mocked(getSession).mockResolvedValue({
       ...restoredSession,
