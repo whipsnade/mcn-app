@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Session, ThinkingBlock } from '../types';
@@ -893,5 +893,88 @@ describe('ChatArea', () => {
     expect(screen.getByRole('button', { name: '声量口碑' })).toHaveAttribute('aria-pressed', 'false');
     expect(screen.getByRole('button', { name: '达人投放' })).toHaveAttribute('aria-pressed', 'false');
     expect(screen.getByRole('button', { name: '确认' })).toBeDisabled();
+  });
+
+  it('hides the active turn thinking panel while flow nodes stream and keeps history panels', () => {
+    vi.mocked(useSessionThinkingStream).mockReturnValue({
+      sessionId: 'session-1',
+      byTurn: {
+        'turn-1': [thinkingBlock('历史思考内容', {
+          status: 'completed',
+          durationMs: 21808,
+          label: '历史决策',
+        })],
+        'turn-2': [thinkingBlock('活跃思考内容', {
+          operationId: 'operation-2',
+          turnId: 'turn-2',
+          status: 'completed',
+          durationMs: 5000,
+          label: '活跃决策',
+        })],
+      },
+      sequenceByOperationAttempt: {},
+      connection: 'connected',
+    });
+    render(
+      <ChatArea
+        session={{
+          ...session,
+          messages: [
+            { id: 'message-u1', sender: 'user', text: '第一问', timestamp: '10:00', turnId: 'turn-1' },
+            { id: 'message-u2', sender: 'user', text: '第二问', timestamp: '10:01', turnId: 'turn-2' },
+          ],
+        }}
+        onSendMessage={vi.fn()}
+        isAnalyzing
+        isMockMode={false}
+        flowNodes={[{ id: 'tool-1', label: '查询数据', status: 'running' }]}
+      />,
+    );
+
+    // 历史 turn 的 ThinkingPanel 保留；活跃 turn 的 ThinkingPanel 去重隐藏。
+    expect(screen.getByRole('button', { name: '已思考 21.8 秒' })).toBeVisible();
+    expect(screen.queryByRole('button', { name: '已思考 5.0 秒' })).toBeNull();
+    // 活跃 turn 的思考块并入执行流程节点（默认折叠，展示标签）。
+    const flowSection = screen.getByRole('region', { name: '执行流程' });
+    expect(within(flowSection).getByText('活跃决策')).toBeVisible();
+  });
+
+  it('restores the active turn thinking panel after the flow reaches a terminal state', () => {
+    vi.mocked(useSessionThinkingStream).mockReturnValue({
+      sessionId: 'session-1',
+      byTurn: {
+        'turn-2': [thinkingBlock('活跃思考内容', {
+          operationId: 'operation-2',
+          turnId: 'turn-2',
+          status: 'completed',
+          durationMs: 5000,
+          label: '活跃决策',
+        })],
+      },
+      sequenceByOperationAttempt: {},
+      connection: 'connected',
+    });
+    render(
+      <ChatArea
+        session={{
+          ...session,
+          messages: [
+            { id: 'message-u2', sender: 'user', text: '第二问', timestamp: '10:01', turnId: 'turn-2' },
+          ],
+        }}
+        onSendMessage={vi.fn()}
+        isAnalyzing={false}
+        isMockMode={false}
+        flowTerminal
+        flowTerminalLabel="分析完成"
+        flowNodes={[
+          { id: 'tool-1', label: '查询数据', status: 'succeeded' },
+          { id: 'terminal', label: '分析完成', status: 'succeeded' },
+        ]}
+      />,
+    );
+
+    // 终态后消息下方的 ThinkingPanel 恢复渲染。
+    expect(screen.getByRole('button', { name: '已思考 5.0 秒' })).toBeVisible();
   });
 });

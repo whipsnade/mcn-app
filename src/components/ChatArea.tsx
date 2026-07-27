@@ -121,6 +121,19 @@ export default function ChatArea({
     [thinkingByTurn],
   );
 
+  // 活跃 turn = 最新一条用户消息的 turnId；其思考块并入执行流程节点展示。
+  const activeTurnId = useMemo(() => {
+    for (let index = session.messages.length - 1; index >= 0; index -= 1) {
+      const message = session.messages[index];
+      if (message.sender === 'user' && message.turnId) return message.turnId;
+    }
+    return undefined;
+  }, [session.messages]);
+  const activeThinkingBlocks = activeTurnId ? thinkingByTurn[activeTurnId] : undefined;
+  // 活跃 turn 且流程进行中：思考只出现在流程节点里，消息下方的 ThinkingPanel 去重隐藏；
+  // 终态后流程面板收缩为摘要行，ThinkingPanel 恢复（历史 turn 始终不受影响）。
+  const dedupeActiveThinkingPanel = flowNodes.length > 0 && !flowTerminal;
+
   // 建议点击统一行为：填入输入框并聚焦，不自动提交，由用户确认后发送。
   const fillInput = (text: string) => {
     setInputText(text);
@@ -369,7 +382,7 @@ export default function ChatArea({
                   )}
                 </div>
               </div>
-              {thinkingBlocks.length > 0 && (
+              {thinkingBlocks.length > 0 && !(dedupeActiveThinkingPanel && msg.turnId === activeTurnId) && (
                 <div className="mr-auto ml-11 w-[calc(85%-2.75rem)] max-w-[85%]">
                   <ThinkingPanel blocks={thinkingBlocks} />
                 </div>
@@ -394,6 +407,7 @@ export default function ChatArea({
                   nodes={flowNodes}
                   terminal={flowTerminal}
                   terminalLabel={flowTerminalLabel}
+                  thinkingBlocks={activeThinkingBlocks}
                 />
               )}
               {assistantDraft ? (
