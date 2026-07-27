@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 GoalType = Literal["brand_analysis", "campaign_analysis", "kol_selection"]
 BrandSource = Literal["explicit", "session", "account", "none"]
+RespondType = Literal["context_qa", "usage_help", "out_of_scope"]
 
 
 class GoalPeriod(BaseModel):
@@ -46,7 +47,8 @@ class GoalQuestion(BaseModel):
 class GoalPlannerOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    action: Literal["clarify", "execute"]
+    action: Literal["clarify", "execute", "respond"]
+    respond_type: RespondType | None = None
     question: GoalQuestion | None = None
     goals: list[GoalSpec] = Field(default_factory=list, max_length=3)
     active_brand: str | None = Field(default=None, min_length=1, max_length=100)
@@ -55,9 +57,17 @@ class GoalPlannerOutput(BaseModel):
     @model_validator(mode="after")
     def validate_action_shape(self) -> "GoalPlannerOutput":
         if self.action == "clarify":
-            if self.question is None or self.goals:
+            if self.question is None or self.goals or self.respond_type is not None:
                 raise ValueError("clarify_shape_invalid")
             return self
-        if self.question is not None or not self.goals:
+        if self.action == "respond":
+            if (
+                self.respond_type is None
+                or self.question is not None
+                or self.goals
+            ):
+                raise ValueError("respond_shape_invalid")
+            return self
+        if self.question is not None or not self.goals or self.respond_type is not None:
             raise ValueError("execute_shape_invalid")
         return self
