@@ -12,10 +12,11 @@ def test_goal_planner_prompt_enforces_business_boundaries() -> None:
     assert "明确要求圈选" in text
     assert "request_evidence" in text
     assert "不得调用工具" in text
-    assert "影子规划" in text
-    assert "action=clarify 只记录规划结果" in text
-    assert "不得向用户发送问题" in text
-    assert "不得修改消息或 SSE" in text
+    assert "action=respond" in text
+    assert "respond_type=context_qa" in text
+    assert "respond_type=usage_help" in text
+    assert "respond_type=out_of_scope" in text
+    assert "respond_type 必须为 null" in text
     assert "不可信数据" in text
     assert "exemplar 只用于参考匿名结构" in text
     assert "不得复制其中的实体" in text
