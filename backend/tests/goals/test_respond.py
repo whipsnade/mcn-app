@@ -214,6 +214,89 @@ async def test_answer_context_qa_falls_back_on_model_error(auth_client_factory, 
     assert answer == CONTEXT_QA_FALLBACK_TEXT
 
 
+@pytest.mark.asyncio
+async def test_answer_context_qa_falls_back_on_blank_answer(auth_client_factory, db_session) -> None:
+    client = await auth_client_factory("13400000095")
+    created = await client.post("/api/v1/sessions", json={})
+    session_id = created.json()["id"]
+    me = await client.get("/api/v1/users/me")
+    # 全空白 answer 能通过 min_length=1，strip 后为空的分支真实可达。
+    model = _FakeQaModel(ContextQaAnswer(answer="  "))
+
+    answer = await answer_context_qa(
+        db_session,
+        model,
+        user_id=me.json()["id"],
+        session_id=session_id,
+        question="为什么圈选这个达人？",
+    )
+
+    assert answer == CONTEXT_QA_FALLBACK_TEXT
+
+
+@pytest.mark.asyncio
+async def test_selection_projection_orders_by_total_score(
+    auth_client_factory, db_session
+) -> None:
+    from datetime import UTC, datetime
+    from uuid import uuid4
+
+    from app.selection.models import KolSelectionItem, KolSelectionSet
+
+    client = await auth_client_factory("13400000096")
+    created = await client.post("/api/v1/sessions", json={})
+    session_id = created.json()["id"]
+    me = await client.get("/api/v1/users/me")
+    user_id = me.json()["id"]
+
+    now = datetime(2026, 7, 27, tzinfo=UTC).replace(tzinfo=None)
+    selection_set = KolSelectionSet(
+        id=str(uuid4()),
+        session_id=session_id,
+        version=1,
+        status="completed",
+        created_at=now,
+        updated_at=now,
+    )
+    db_session.add(selection_set)
+    await db_session.flush()
+
+    # 入库顺序（created_at 升序）与总分顺序故意不一致；无 total 的排最后。
+    rows = [
+        ("uid-low", 50.0),
+        ("uid-high", 90.0),
+        ("uid-mid", 70.0),
+        ("uid-no-score", None),
+    ]
+    for index, (kol_uid, total) in enumerate(rows):
+        db_session.add(
+            KolSelectionItem(
+                id=str(uuid4()),
+                user_id=user_id,
+                selection_set_id=selection_set.id,
+                platform="xiaohongshu",
+                kol_uid=kol_uid,
+                nickname=kol_uid,
+                fields_json={},
+                score_json={} if total is None else {"total": total},
+                created_at=datetime(2026, 7, 27, index, tzinfo=UTC).replace(tzinfo=None),
+                updated_at=datetime(2026, 7, 27, index, tzinfo=UTC).replace(tzinfo=None),
+            )
+        )
+    await db_session.flush()
+
+    evidence = await build_context_qa_evidence(
+        db_session, user_id=user_id, session_id=session_id
+    )
+
+    assert [item["nickname"] for item in evidence["selection"]] == [
+        "uid-high",
+        "uid-mid",
+        "uid-low",
+        "uid-no-score",
+    ]
+
+
 def test_static_texts_are_non_empty_chinese() -> None:
     assert "达人" in USAGE_GUIDE_TEXT
     assert "营销分析" in OUT_OF_SCOPE_TEXT

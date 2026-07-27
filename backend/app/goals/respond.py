@@ -58,20 +58,29 @@ async def _selection_projection(db, session_id: str) -> list[dict[str, Any]]:
     )
     if latest_set is None:
         return []
+    # 圈选名单量级 ≤50，全取后在 Python 内按总分倒序取 top 20；
+    # score_json 无 total（或非数值）的达人排最后，保持稳定入库序。
     items = list(
         (
             await db.scalars(
                 select(KolSelectionItem)
                 .where(KolSelectionItem.selection_set_id == latest_set.id)
                 .order_by(KolSelectionItem.created_at)
-                .limit(_SELECTION_TOP_N)
             )
         ).all()
     )
-    projection: list[dict[str, Any]] = []
-    for item in items:
+
+    def _total(item: KolSelectionItem) -> float | None:
         total = (item.score_json or {}).get("total")
-        label = rating(total)[0] if isinstance(total, (int, float)) else None
+        return float(total) if isinstance(total, (int, float)) else None
+
+    items.sort(
+        key=lambda item: (_total(item) is None, -(_total(item) or 0.0)),
+    )
+    projection: list[dict[str, Any]] = []
+    for item in items[:_SELECTION_TOP_N]:
+        total = _total(item)
+        label = rating(total)[0] if total is not None else None
         projection.append(
             {
                 "platform": item.platform,
@@ -146,6 +155,7 @@ async def _recent_messages_projection(
 async def build_context_qa_evidence(
     db, *, user_id: str, session_id: str
 ) -> dict[str, Any]:
+    """组装 context_qa 证据包；调用方需已完成会话归属校验。"""
     evidence: dict[str, Any] = {
         "recent_messages": await _recent_messages_projection(
             db, user_id=user_id, session_id=session_id
