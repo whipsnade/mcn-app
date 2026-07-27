@@ -48,7 +48,9 @@
   请求事务只负责业务写入（消息、画像、任务）。
 - `brainstorm/router.py` 在 `await db.commit()` 之后调用新 helper
   `persist_turn_thinking(session_factory, *, user_id, session_id, turn_id,
-  assistant_message_id)`（`app/thinking/persistence.py` 新增，brainstorm/tasks 共用）：
+  assistant_message_id)`（`app/thinking/persistence.py` 新增，brainstorm/tasks 共用），
+  **顺序为 commit → persist_turn_thinking → `task_runner.submit`**（persist 先于 submit，
+  降低 helper 与 executor 思考持久化的瞬时锁竞争）：
   - 调用前先从 thinking service 取 `completed_blocks(only_unpersisted=True)` **并捕获列表**；
   - 独立 `session_factory.begin()` 事务：逐块 `persist_block` →
     `attach_turn_to_assistant`（`assistant_message_id` 为 None 时跳过 attach，
@@ -110,6 +112,5 @@
 - `_messages` 整会话 `FOR UPDATE` 锁范围问题留作观察项；若死锁仍频发再评估收窄。
 - executor worker 路径的思考持久化已是独立事务，但同样可能死锁——失败后 block 仅
   留存内存（进程内），属既有尽力而为语义。
-- helper 部分失败终态：persist 成功、mark 已调、但 attach 重试后仍失败时，assistant
-  行缺 `turn_id` 且 user 消息可能残留 `thinking_pending`（blocks 已在
-  assistant.metadata.thinking 里，刷新恢复基本可用），属尽力而为可接受范围。
+- helper 的终态只有两种：persist+attach 全部落库（commit 成功后 mark），或全部未落库
+  （内存未标记，后续 persist 路径可重试）——同一事务内不存在部分落库中间态。
