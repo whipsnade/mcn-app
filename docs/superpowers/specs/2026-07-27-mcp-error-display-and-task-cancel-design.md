@@ -40,26 +40,27 @@
 
 **前端**：
 
-- `src/state/taskEvents.ts`：`FlowNode`（或等价类型）加 `upstreamDetail?: string`；`withFlowNode` 在 `tool.failed/tool.unknown` 时读取 `payload.upstream_message`（str 且非空才存）。
+- `src/state/taskEvents.ts`：`FlowNode`（或等价类型）加 `upstreamDetail?: string`；`withFlowNode` 在 `tool.failed/tool.unknown` 时读取 `payload.upstream_message`（str 且非空才存）。**注意两条写入路径都要覆盖**：常规 `updateNode` 与 late-node `pushNode`（taskEvents.ts:139），否则迟到的失败事件会丢详情。
 - `src/components/TaskFlowNodes.tsx`：`node.upstreamDetail` 非空时，在白名单 detail 行下方再渲染一行更小号的浅灰等宽文本（`text-xs text-slate-500 font-mono`，failed/unknown 共用相同样式，不与白名单文案混淆）。
 
 ### 功能 2：发送/暂停图标按钮
 
 **`useWorkspace`**（`src/hooks/useWorkspace.ts`）：
 
-- 新增 state `cancelling: boolean` 与方法 `cancelActiveTask(): Promise<void>`：
-  - 无 `activeTaskId` 或已在 cancelling → 直接返回。
-  - `setCancelling(true)` → `await cancelTask(activeTaskId)` → 成功不手动改任务状态（等 SSE `task.cancelled` 收敛：`taskRuntime.status` 变 `cancelled` → `isAnalyzing` 变 false）；`finally setCancelling(false)`。
-  - API 失败：记 warning 并恢复（`cancelling` 复位，按钮回到 Pause），不抛出打断 UI。
-- `App.tsx`：把 `cancelActiveTask` 与 `cancelling` 传入 ChatArea。
+- 新增 state `cancelRequested: boolean` 与方法 `cancelActiveTask(): Promise<void>`：
+  - 无 `activeTaskId` 或已 `cancelRequested` → 直接返回。
+  - 先 `setCancelRequested(true)`（按钮立即进入禁用「取消中」态，防重复点击）→ `await cancelTask(activeTaskId)`。
+  - **latch 语义**：`cancelRequested` 不在 HTTP 返回后复位——协作式取消要等 executor 循环边界才发 `task.cancelled`（可能几十秒），用 `useEffect` 在 `activeTaskId` 变化或 `taskRuntime.status` 进入终态（cancelled/failed/completed 等）时复位，与已确认的过渡态一致（禁用直到 SSE 收敛）。
+  - API 失败：复位 `cancelRequested`（按钮回到 Pause 可重试），记 warning，不抛出打断 UI。
+- `App.tsx`：把 `cancelActiveTask` 与 `cancelRequested` 传入 ChatArea。
 
 **`ChatArea.tsx`**：
 
-- props 新增 `onCancelTask: () => Promise<unknown>`、`isCancelling: boolean`。
-- 发送按钮改图标按钮（`aria-label` 三态：`发送`/`暂停`/`正在取消`）：
+- props 新增 `onCancelTask: () => Promise<unknown>`、`isCancelling: boolean`（接 `cancelRequested`）。
+- 发送按钮改图标按钮（`aria-label` 三态：`发送`/`暂停`/`正在取消`；`Pause`/`Loader2` 图标需新增 lucide-react import，`Send` 已 import）：
   - 非 analyzing：`type="submit"`，`Send` 图标，`disabled={!inputText.trim()}`，样式沿用 indigo。
-  - analyzing 且非 cancelling：`type="button"`，`Pause` 图标（lucide-react），`onClick={() => void onCancelTask()}`。
-  - cancelling：`Loader2` 旋转图标（或 Pause 灰化），disabled。
+  - analyzing 且非 cancelling：`type="button"`，`Pause` 图标，`onClick={() => void onCancelTask()}`。
+  - cancelling：`Loader2` 旋转图标，disabled。
 - textarea 的 analyzing placeholder 与建议 chips 禁用逻辑不变。
 
 ### 不做的事（YAGNI）
@@ -75,8 +76,8 @@
 | --- | --- |
 | 失败工具调用无上游原文（传输级） | 只显示白名单文案，与现状一致 |
 | 上游原文被 `safe_upstream_text` 判为含敏感标记 | 不落库 → 事件不带 `upstream_message`，只显示白名单文案 |
-| cancel API 失败（网络/409） | 按钮恢复 Pause，可再次点击 |
-| 取消标记后任务恰已终态 | `TaskService.cancel` 幂等返回；SSE 终态事件正常收敛 |
+| cancel API 失败（网络/404） | 复位 `cancelRequested`，按钮回到 Pause，可再次点击 |
+| 取消标记后任务恰已终态 | `TaskService.cancel` 幂等返回；SSE 终态事件正常收敛，`cancelRequested` 随终态复位 |
 
 ## 测试策略
 
@@ -87,4 +88,4 @@
   - reducer：failed 事件存 `upstreamDetail`；无字段时节点无 upstreamDetail。
   - TaskFlowNodes：两行文案都渲染；无 upstreamDetail 时只有一行。
   - ChatArea：三态按钮（Send 可点/运行中 Pause/取消中禁用）；点 Pause 调 onCancelTask。
-  - useWorkspace：`cancelActiveTask` 调 cancelTask API、cancelling 状态切换、无 activeTaskId 时 no-op、API 失败恢复。
+  - useWorkspace：`cancelActiveTask` 调 cancelTask API、`cancelRequested` latch 直到终态（含「取消请求后、SSE `task.cancelled` 到达前」窗口内按钮保持禁用）、无 activeTaskId 时 no-op、API 失败立即复位。
