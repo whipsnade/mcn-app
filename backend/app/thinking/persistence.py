@@ -265,117 +265,126 @@ async def record_brainstorm_failure(
     blocks: tuple[ThinkingBlock, ...],
     error_code: str,
 ) -> Message:
-    async with session_factory.begin() as db:
-        workspace = await db.scalar(
-            select(WorkspaceSession)
-            .where(
-                WorkspaceSession.id == session_id,
-                WorkspaceSession.user_id == user_id,
-                WorkspaceSession.deleted_at.is_(None),
-            )
-            .with_for_update()
-        )
-        if workspace is None:
-            raise LookupError("session_not_found")
-
-        store = ThinkingMessageStore(db)
-        messages = await store._messages(user_id=user_id, session_id=session_id)
-        user_message = next(
-            (
-                message
-                for message in messages
-                if message.role == "user"
-                and (message.metadata_json or {}).get("turn_id") == turn_id
-            ),
-            None,
-        )
-        if user_message is None:
-            sequence = (
-                await db.scalar(
-                    select(func.max(Message.sequence)).where(
-                        Message.user_id == user_id,
-                        Message.session_id == session_id,
+    # 失败落库与 brainstorm 主事务并发时可能撞 1213 死锁：最多重试一轮，
+    # 第二轮仍失败按原样上抛（调用方 router 已有 try/except 兜底）。
+    attempts = 0
+    while True:
+        attempts += 1
+        try:
+            async with session_factory.begin() as db:
+                workspace = await db.scalar(
+                    select(WorkspaceSession)
+                    .where(
+                        WorkspaceSession.id == session_id,
+                        WorkspaceSession.user_id == user_id,
+                        WorkspaceSession.deleted_at.is_(None),
                     )
+                    .with_for_update()
                 )
-                or 0
-            ) + 1
-            user_message = Message(
-                id=str(uuid4()),
-                session_id=session_id,
-                user_id=user_id,
-                role="user",
-                content=user_content,
-                sequence=sequence,
-                metadata_json={"turn_id": turn_id},
-                created_at=_utc_now(),
-            )
-            db.add(user_message)
-            await db.flush()
-            messages.append(user_message)
-        else:
-            user_metadata = dict(user_message.metadata_json or {})
-            user_metadata.setdefault("turn_id", turn_id)
-            user_message.metadata_json = user_metadata
+                if workspace is None:
+                    raise LookupError("session_not_found")
 
-        existing = next(
-            (
-                message
-                for message in messages
-                if message.role == "assistant"
-                and (message.metadata_json or {}).get("turn_id") == turn_id
-                and (message.metadata_json or {}).get("message_type") == "error"
-            ),
-            None,
-        )
-        serialized_blocks = [
-            _serialize_block(block) for block in blocks if block.turn_id == turn_id
-        ]
-        if existing is not None:
-            existing_metadata = dict(existing.metadata_json or {})
-            existing_metadata["thinking"] = _thinking_metadata(
-                [
-                    *_blocks_from(existing_metadata, "thinking"),
-                    *serialized_blocks,
-                ],
-                force_interrupted=True,
-            )
-            existing.metadata_json = existing_metadata
-            await db.flush()
-            return existing
-
-        sequence = (
-            await db.scalar(
-                select(func.max(Message.sequence)).where(
-                    Message.user_id == user_id,
-                    Message.session_id == session_id,
+                store = ThinkingMessageStore(db)
+                messages = await store._messages(user_id=user_id, session_id=session_id)
+                user_message = next(
+                    (
+                        message
+                        for message in messages
+                        if message.role == "user"
+                        and (message.metadata_json or {}).get("turn_id") == turn_id
+                    ),
+                    None,
                 )
-            )
-            or 0
-        ) + 1
-        assistant = Message(
-            id=str(uuid4()),
-            session_id=session_id,
-            user_id=user_id,
-            role="assistant",
-            content=_BRAINSTORM_FAILURE_MESSAGE,
-            sequence=sequence,
-            metadata_json={
-                "turn_id": turn_id,
-                "message_type": "error",
-                "error_code": error_code,
-                "thinking": _thinking_metadata(
-                    serialized_blocks,
-                    force_interrupted=True,
-                ),
-            },
-            created_at=_utc_now(),
-        )
-        db.add(assistant)
-        user_metadata = dict(user_message.metadata_json or {})
-        user_metadata.pop("thinking_pending", None)
-        user_message.metadata_json = user_metadata
-        await db.flush()
-        return assistant
+                if user_message is None:
+                    sequence = (
+                        await db.scalar(
+                            select(func.max(Message.sequence)).where(
+                                Message.user_id == user_id,
+                                Message.session_id == session_id,
+                            )
+                        )
+                        or 0
+                    ) + 1
+                    user_message = Message(
+                        id=str(uuid4()),
+                        session_id=session_id,
+                        user_id=user_id,
+                        role="user",
+                        content=user_content,
+                        sequence=sequence,
+                        metadata_json={"turn_id": turn_id},
+                        created_at=_utc_now(),
+                    )
+                    db.add(user_message)
+                    await db.flush()
+                    messages.append(user_message)
+                else:
+                    user_metadata = dict(user_message.metadata_json or {})
+                    user_metadata.setdefault("turn_id", turn_id)
+                    user_message.metadata_json = user_metadata
+
+                existing = next(
+                    (
+                        message
+                        for message in messages
+                        if message.role == "assistant"
+                        and (message.metadata_json or {}).get("turn_id") == turn_id
+                        and (message.metadata_json or {}).get("message_type") == "error"
+                    ),
+                    None,
+                )
+                serialized_blocks = [
+                    _serialize_block(block) for block in blocks if block.turn_id == turn_id
+                ]
+                if existing is not None:
+                    existing_metadata = dict(existing.metadata_json or {})
+                    existing_metadata["thinking"] = _thinking_metadata(
+                        [
+                            *_blocks_from(existing_metadata, "thinking"),
+                            *serialized_blocks,
+                        ],
+                        force_interrupted=True,
+                    )
+                    existing.metadata_json = existing_metadata
+                    await db.flush()
+                    return existing
+
+                sequence = (
+                    await db.scalar(
+                        select(func.max(Message.sequence)).where(
+                            Message.user_id == user_id,
+                            Message.session_id == session_id,
+                        )
+                    )
+                    or 0
+                ) + 1
+                assistant = Message(
+                    id=str(uuid4()),
+                    session_id=session_id,
+                    user_id=user_id,
+                    role="assistant",
+                    content=_BRAINSTORM_FAILURE_MESSAGE,
+                    sequence=sequence,
+                    metadata_json={
+                        "turn_id": turn_id,
+                        "message_type": "error",
+                        "error_code": error_code,
+                        "thinking": _thinking_metadata(
+                            serialized_blocks,
+                            force_interrupted=True,
+                        ),
+                    },
+                    created_at=_utc_now(),
+                )
+                db.add(assistant)
+                user_metadata = dict(user_message.metadata_json or {})
+                user_metadata.pop("thinking_pending", None)
+                user_message.metadata_json = user_metadata
+                await db.flush()
+                return assistant
+        except Exception as error:  # noqa: BLE001 — 仅 1213 死锁重试一次，其余原样上抛
+            if attempts >= 2 or not _is_deadlock(error):
+                raise
 
 
 async def persist_turn_thinking(
