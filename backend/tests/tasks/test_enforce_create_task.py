@@ -90,6 +90,26 @@ async def _ignore_prompt_log(_entry) -> None:
     return None
 
 
+def _share_session_factory(monkeypatch, db_session) -> None:
+    """commit 后的思考持久化走 SessionFactory 独立事务；测试 fixture 是共享连接 +
+    savepoint，真实 SessionFactory 的新连接看不到未提交数据（会撞 InnoDB 锁等待），
+    需替换为共享会话。先例：tests/brainstorm/test_brainstorm.py。"""
+
+    class _SessionCM:
+        async def __aenter__(self):
+            return db_session
+
+        async def __aexit__(self, *_args):
+            return None
+
+    class _SessionFactory:
+        @staticmethod
+        def begin():
+            return _SessionCM()
+
+    monkeypatch.setattr("app.tasks.router.SessionFactory", _SessionFactory)
+
+
 def _enable_enforce(monkeypatch) -> None:
     monkeypatch.setattr(get_settings(), "goal_planner_enforce_enabled", True)
 
@@ -158,6 +178,7 @@ async def test_enforce_clarify_stores_message_without_task(
         return _clarify_output()
 
     monkeypatch.setattr(GoalPlannerService, "plan_context", fake_plan)
+    _share_session_factory(monkeypatch, db_session)
     client = await auth_client_factory("13400000081")
     session_id = await _create_session(client)
 
@@ -211,6 +232,7 @@ async def test_enforce_execute_creates_typed_goal_with_params(
         )
 
     monkeypatch.setattr(GoalPlannerService, "plan_context", fake_plan)
+    _share_session_factory(monkeypatch, db_session)
     client = await auth_client_factory("13400000082")
     session_id = await _create_session(client)
     await _set_session_profile(db_session, session_id, brand="海底捞", category="美食")
@@ -251,6 +273,7 @@ async def test_enforce_creates_planned_goal_when_every_thinking_sink_method_fail
         stream_support_cache={},
     )
     monkeypatch.setattr("app.tasks.router.get_model_adapter", lambda: adapter)
+    _share_session_factory(monkeypatch, db_session)
     client = await auth_client_factory("13400000088")
     session_id = await _create_session(client)
     await _set_session_profile(db_session, session_id, brand="海底捞", category="美食")
@@ -296,6 +319,7 @@ async def test_enforce_multi_goal_persists_all_with_dependency(
         )
 
     monkeypatch.setattr(GoalPlannerService, "plan_context", fake_plan_with_dependency)
+    _share_session_factory(monkeypatch, db_session)
     client = await auth_client_factory("13400000083")
     session_id = await _create_session(client)
 
@@ -330,6 +354,7 @@ async def test_enforce_planner_failure_falls_back_to_kol_selection(
         raise RuntimeError("model unavailable")
 
     monkeypatch.setattr(GoalPlannerService, "plan_context", failing_plan)
+    _share_session_factory(monkeypatch, db_session)
     client = await auth_client_factory("13400000084")
     session_id = await _create_session(client)
 
@@ -356,6 +381,7 @@ async def test_enforce_disabled_keeps_legacy_path(
         raise AssertionError("planner must not run when enforce is off")
 
     monkeypatch.setattr(GoalPlannerService, "plan_context", forbidden_plan)
+    _share_session_factory(monkeypatch, db_session)
     client = await auth_client_factory("13400000085")
     session_id = await _create_session(client)
 
@@ -384,6 +410,7 @@ async def test_enforce_idempotent_hit_skips_planner(
         return GoalPlannerOutput(action="execute", goals=[_spec(1, "kol_selection")])
 
     monkeypatch.setattr(GoalPlannerService, "plan_context", counting_plan)
+    _share_session_factory(monkeypatch, db_session)
     client = await auth_client_factory("13400000086")
     session_id = await _create_session(client)
     headers = {"Idempotency-Key": "enforce-key-1"}
@@ -594,6 +621,7 @@ async def test_enforce_respond_usage_help_returns_static_message(
         return _respond_output("usage_help")
 
     monkeypatch.setattr(GoalPlannerService, "plan_context", fake_plan)
+    _share_session_factory(monkeypatch, db_session)
     client = await auth_client_factory("13400000095")
     session_id = await _create_session(client)
 
@@ -621,6 +649,7 @@ async def test_enforce_respond_out_of_scope_rejects_politely(
         return _respond_output("out_of_scope")
 
     monkeypatch.setattr(GoalPlannerService, "plan_context", fake_plan)
+    _share_session_factory(monkeypatch, db_session)
     client = await auth_client_factory("13400000096")
     session_id = await _create_session(client)
 
@@ -649,6 +678,7 @@ async def test_enforce_respond_context_qa_uses_model_answer(
         return "上次失败是因为未采集到有效数据。"
 
     monkeypatch.setattr("app.tasks.router.answer_context_qa", fake_answer)
+    _share_session_factory(monkeypatch, db_session)
     client = await auth_client_factory("13400000097")
     session_id = await _create_session(client)
 
@@ -673,3 +703,72 @@ async def test_enforce_respond_context_qa_uses_model_answer(
     )
     assert [message.role for message in persisted] == ["user", "assistant"]
     assert persisted[1].metadata_json["respond"] == {"type": "context_qa"}
+
+
+@pytest.mark.asyncio
+async def test_enforce_execute_task_exists_when_thinking_persist_fails(
+    auth_client_factory, db_session, monkeypatch
+) -> None:
+    """思考持久化（commit 后独立事务）失败不得影响任务落库与 202 响应。"""
+    _enable_enforce(monkeypatch)
+
+    async def fake_plan(self, context, **_kwargs):
+        return GoalPlannerOutput(action="execute", goals=[_spec(1, "kol_selection")])
+
+    async def failing_persist(*_args, **_kwargs):
+        raise RuntimeError("thinking persist down")
+
+    monkeypatch.setattr(GoalPlannerService, "plan_context", fake_plan)
+    monkeypatch.setattr("app.tasks.router.persist_turn_thinking", failing_persist)
+    client = await auth_client_factory("13400000098")
+    session_id = await _create_session(client)
+
+    response = await client.post(
+        f"/api/v1/sessions/{session_id}/tasks", json={"content": "圈选美食达人"}
+    )
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["outcome"] == "task"
+    # 响应的 task_id 真实存在于 analysis_tasks（非幽灵任务）。
+    task = await db_session.get(AnalysisTask, body["task"]["id"])
+    assert task is not None
+    assert task.session_id == session_id
+    goal = await db_session.scalar(select(TaskGoal))
+    assert goal is not None
+    assert goal.task_id == task.id
+
+
+@pytest.mark.asyncio
+async def test_enforce_clarify_survives_thinking_persist_failure(
+    auth_client_factory, db_session, monkeypatch
+) -> None:
+    """思考持久化失败不得影响 clarify 消息落库（GET 恢复可见）。"""
+    _enable_enforce(monkeypatch)
+
+    async def fake_plan(self, context, **_kwargs):
+        return _clarify_output()
+
+    async def failing_persist(*_args, **_kwargs):
+        raise RuntimeError("thinking persist down")
+
+    monkeypatch.setattr(GoalPlannerService, "plan_context", fake_plan)
+    monkeypatch.setattr("app.tasks.router.persist_turn_thinking", failing_persist)
+    client = await auth_client_factory("13400000099")
+    session_id = await _create_session(client)
+
+    response = await client.post(
+        f"/api/v1/sessions/{session_id}/tasks", json={"content": "帮我做个分析"}
+    )
+
+    assert response.status_code == 202
+    body = response.json()
+    assert body["outcome"] == "clarify"
+    # clarify 消息真实落库：GET 恢复可见。
+    recovered = await client.get(f"/api/v1/sessions/{session_id}")
+    assert recovered.status_code == 200
+    messages = recovered.json()["messages"]
+    assert [message["role"] for message in messages] == ["user", "assistant"]
+    assert messages[1]["content"] == "想看哪个品牌的分析？"
+    assert messages[1]["metadata"]["clarify"] == {"options": ["海底捞", "喜茶"]}
+    assert messages[0]["metadata"]["turn_id"] == messages[1]["metadata"]["turn_id"]
