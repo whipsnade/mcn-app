@@ -178,7 +178,8 @@ def build_followup_request(
             ChatMessage(role="user", content=_safe_json(safe_input)),
         ),
         output_model=FollowupSuggestions,
-        max_tokens=2_048,
+        # 推理模型 <think> 占用输出预算，2048 易被截断（同 brainstorm/planner 的修复）。
+        max_tokens=4_096,
     )
 
 

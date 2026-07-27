@@ -56,7 +56,7 @@ async def test_model_path_returns_summary_highlights_and_artifact() -> None:
     [request] = model.requests
     assert request.purpose == "goal_summary"
     assert request.template_name == "goal_summary_v1"
-    assert request.max_tokens == 1024
+    assert request.max_tokens == 2048
     assert request.output_model is GoalResultSummary
     assert request.log_context["tags"] == ["goal_summary"]
 
