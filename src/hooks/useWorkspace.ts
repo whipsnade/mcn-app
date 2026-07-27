@@ -113,7 +113,10 @@ export function useWorkspace(userId?: string) {
       generationRef.current !== generation
       || !sessionOperationIsCurrent(session.id, operationEpoch)
     ) return session;
+    // 品牌/活动报告不挂载到「达人」Tab 的 KOL 分析子 Tab；report_type 缺省视为
+    // kol_analysis（后端 AnalysisReportRead server_default 为 kol_analysis）。
     const matchingAnalysisReport = analysisReportResponse
+      && (analysisReportResponse.report_type === undefined || analysisReportResponse.report_type === 'kol_analysis')
       && (analysisReportResponse.task_id === null || analysisReportResponse.task_id === analysis.taskId)
       ? analysisReportResponse
       : undefined;
@@ -613,8 +616,11 @@ export function useWorkspace(userId?: string) {
         .then(report => {
           // 任务级报告必须属于当前任务；会话级报告（task_id 为 null，自动/手动
           // KOL 分析）始终接受，与 hydrateAnalysis/toSession 的口径一致。
+          // 品牌/活动报告（report_type 非 kol_analysis）不挂载到 KOL 分析子 Tab，
+          // report_type 缺省视为 kol_analysis。
           if (
             generationRef.current !== generation
+            || (report.report_type !== undefined && report.report_type !== 'kol_analysis')
             || (report.task_id !== null && report.task_id !== requestedTaskId)
           ) return;
           setSessions(current => current.map(session => session.analysis?.taskId === requestedTaskId

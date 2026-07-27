@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { ApiArtifactsSummary, ApiFavorite } from '../api/contracts';
+import type { ApiAnalysisReport, ApiArtifactsSummary, ApiFavorite, ApiSessionReportItem } from '../api/contracts';
 import { createFavoriteByKey, deleteFavoriteByKey } from '../api/favorites';
 import { downloadKolSelection, getKolSelection, listSelectionSets, runKolAnalysis } from '../api/kolSelection';
 import { listSessionReports } from '../api/reports';
@@ -60,6 +60,16 @@ function kolSelectionItem(overrides: Record<string, unknown> = {}) {
     score: { total: 82, rating: '重点推荐', stars: '★★★★★', dimensions: {}, data_completeness: 0.9 },
     ...overrides,
   };
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
 }
 
 describe('UniversalReport', () => {
@@ -537,5 +547,97 @@ describe('UniversalReport', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '导出 Excel' }));
     await waitFor(() => expect(downloadKolSelection).toHaveBeenCalledWith('session-1', 'set-1'));
+  });
+
+  it('shows an animated loading state while the report version list is loading', () => {
+    vi.mocked(listSessionReports).mockReturnValue(new Promise<ApiSessionReportItem[]>(() => undefined));
+    render(<UniversalReport sessionId="session-1" selectionCount={0} />);
+
+    fireEvent.click(screen.getByRole('tab', { name: '品牌分析' }));
+
+    const status = screen.getByRole('status');
+    expect(status).toHaveTextContent('正在连接数据服务…');
+    expect(status.querySelector('.animate-spin')).not.toBeNull();
+  });
+
+  it('keeps the loading state while the report detail is in flight', async () => {
+    const detail = deferred<ApiAnalysisReport>();
+    vi.mocked(listSessionReports).mockResolvedValue([
+      { report_id: 'brand-report-1', title: '海底捞品牌分析v1', version: 1, scope: null, status: 'completed', created_at: '2026-07-24T10:00:00Z' },
+    ]);
+    vi.mocked(getAnalysisReport).mockReturnValue(detail.promise);
+    render(<UniversalReport sessionId="session-1" selectionCount={0} />);
+
+    fireEvent.click(screen.getByRole('tab', { name: '品牌分析' }));
+
+    // 列表已到、详情在途：仍是加载态而不是空态文案（标题 h3 除外，这里限定正文容器）。
+    await waitFor(() => expect(getAnalysisReport).toHaveBeenCalledWith('brand-report-1'));
+    expect(screen.getByRole('status')).toHaveTextContent('正在连接数据服务…');
+    expect(screen.queryByText('完成一次品牌分析后在此展示', { selector: 'div' })).not.toBeInTheDocument();
+
+    detail.resolve(analysisReportFixture({ id: 'brand-report-1', title: '海底捞品牌分析v1' }));
+    expect(await screen.findByText('一、核心结论')).toBeVisible();
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+  });
+
+  it('falls back to the empty state when the report detail fetch fails', async () => {
+    vi.mocked(listSessionReports).mockResolvedValue([
+      { report_id: 'brand-report-1', title: '海底捞品牌分析v1', version: 1, scope: null, status: 'completed', created_at: '2026-07-24T10:00:00Z' },
+    ]);
+    vi.mocked(getAnalysisReport).mockRejectedValue(new Error('HTTP_500'));
+    render(<UniversalReport sessionId="session-1" selectionCount={0} />);
+
+    fireEvent.click(screen.getByRole('tab', { name: '品牌分析' }));
+
+    // 详情失败不应永久卡在加载态，回到空态文案。
+    expect(await screen.findByText('完成一次品牌分析后在此展示', { selector: 'div' })).toBeVisible();
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+  });
+
+  it('shows only the top 20 selection items ordered by engagement rate with a summary line', async () => {
+    const items = [
+      ...Array.from({ length: 18 }, (_, index) => kolSelectionItem({
+        kol_uid: `uid-r${index + 1}`,
+        nickname: `达人r${index + 1}`,
+        fields: { engagement_rate: index + 1 },
+      })),
+      ...Array.from({ length: 7 }, (_, index) => kolSelectionItem({
+        kol_uid: `uid-n${index + 1}`,
+        nickname: `达人n${index + 1}`,
+        fields: {},
+      })),
+    ];
+    vi.mocked(getKolSelection).mockResolvedValue({ total: 25, items });
+    render(<UniversalReport sessionId="session-1" selectionCount={25} />);
+
+    fireEvent.click(screen.getByRole('tab', { name: '圈选达人 (25)' }));
+
+    expect(await screen.findByText('共 25 位达人，按互动率展示 Top 20')).toBeVisible();
+    const rendered = await screen.findAllByText(/^达人[rn]\d+$/);
+    const names = rendered.map(node => node.textContent);
+    expect(names).toHaveLength(20);
+    // 互动率倒序：r18 最高 … r1 最低。
+    expect(names.slice(0, 18)).toEqual(Array.from({ length: 18 }, (_, index) => `达人r${18 - index}`));
+    // 无互动率的排最后，保持原有相对顺序（稳定排序）。
+    expect(names.slice(18)).toEqual(['达人n1', '达人n2']);
+  });
+
+  it('renders all selection items without a summary line when there are at most 20', async () => {
+    const items = [
+      kolSelectionItem({ kol_uid: 'uid-a', nickname: '达人甲', fields: { engagement_rate: 1 } }),
+      kolSelectionItem({ kol_uid: 'uid-b', nickname: '达人乙', fields: { engagement_rate: 9 } }),
+      kolSelectionItem({ kol_uid: 'uid-c', nickname: '达人丙', fields: { engagement_rate: 5 } }),
+    ];
+    vi.mocked(getKolSelection).mockResolvedValue({ total: 3, items });
+    render(<UniversalReport sessionId="session-1" selectionCount={3} />);
+
+    fireEvent.click(screen.getByRole('tab', { name: '圈选达人 (3)' }));
+
+    expect(await screen.findByText('达人甲')).toBeVisible();
+    expect(screen.getByText('达人乙')).toBeVisible();
+    expect(screen.getByText('达人丙')).toBeVisible();
+    expect(screen.queryByText(/按互动率展示 Top 20/)).not.toBeInTheDocument();
+    // 子 Tab 标签计数仍来自 selectionCount，不受 Top20 截断影响。
+    expect(screen.getByRole('tab', { name: '圈选达人 (3)' })).toBeVisible();
   });
 });

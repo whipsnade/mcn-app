@@ -270,7 +270,8 @@ async def test_turn_budget_clamps_running_delta_in_real_time() -> None:
     # 实时 delta 即按 turn 剩余额度收敛，而非等终态才截断。
     latest = published[-1].payload["text"]
     assert len(latest) <= 6_000
-    assert latest.endswith("思考内容过长，已截断")
+    assert latest.startswith("…（早期内容已折叠）")
+    assert latest.endswith("乙" * 100)
 
 
 @pytest.mark.asyncio
@@ -452,8 +453,88 @@ async def test_turn_completed_blocks_share_a_30k_public_text_budget() -> None:
     )
 
     assert sum(len(block.content) for block in blocks) <= 30_000
-    assert blocks[-1].truncated is True
-    assert blocks[-1].content.endswith("思考内容过长，已截断")
+    # 预算不足时折叠最旧已完成块，最新块保持完整。
+    assert blocks[0].content == "「早期思考已折叠」"
+    assert blocks[0].truncated is True
+    assert blocks[-1].content == "2" * 12_000
+    assert blocks[-1].truncated is False
+
+
+@pytest.mark.asyncio
+async def test_turn_budget_folds_oldest_completed_blocks_for_new_block() -> None:
+    _, SessionThinkingService = thinking_types()
+    service = SessionThinkingService()
+    for index in range(4):
+        sink = service.create_sink(operation(f"op-{index}", "turn-1", "session-1"))
+        await sink.started(attempt=1)
+        await sink.delta(str(index) * 12_000, attempt=1)
+        await sink.completed(attempt=1, duration_ms=1)
+
+    blocks = await service.completed_blocks(
+        turn_id="turn-1", user_id="user-1", session_id="session-1"
+    )
+
+    # 按完成顺序折叠最旧块，直到新块写入额度足够。
+    assert blocks[0].content == "「早期思考已折叠」"
+    assert blocks[1].content == "「早期思考已折叠」"
+    assert blocks[2].content == "2" * 12_000
+    assert blocks[3].content == "3" * 12_000
+    assert blocks[3].truncated is False
+    assert sum(len(block.content) for block in blocks) <= 30_000
+
+    # 幂等：后续块完成时占位符不被二次折叠或改写。
+    fifth = service.create_sink(operation("op-4", "turn-1", "session-1"))
+    await fifth.started(attempt=1)
+    await fifth.delta("尾" * 100, attempt=1)
+    await fifth.completed(attempt=1, duration_ms=1)
+
+    blocks = await service.completed_blocks(
+        turn_id="turn-1", user_id="user-1", session_id="session-1"
+    )
+
+    assert blocks[0].content == "「早期思考已折叠」"
+    assert blocks[1].content == "「早期思考已折叠」"
+    assert blocks[4].content == "尾" * 100
+    assert sum(len(block.content) for block in blocks) <= 30_000
+
+
+@pytest.mark.asyncio
+async def test_truncated_block_streams_throttled_tail_snapshots() -> None:
+    _, SessionThinkingService = thinking_types()
+    service = SessionThinkingService(queue_size=16)
+    queue = await service.subscribe("session-1")
+    sink = service.create_sink(operation("op-1", "turn-1", "session-1"))
+    await sink.started(attempt=1)
+    drain(queue)
+
+    # 单块超 12k：保尾后不再前缀递增，发布整段 snapshot。
+    await sink.delta("甲" * 13_000, attempt=1)
+    first = await asyncio.wait_for(queue.get(), timeout=0.1)
+    assert first.type == "thinking.snapshot"
+    assert first.payload["text"].startswith("…（早期内容已折叠）")
+    assert first.payload["text"].endswith("甲" * 100)
+    assert len(first.payload["text"]) <= 12_000
+
+    # 截断后小额增长（<1000 raw 字符）被节流，不发布新事件。
+    await sink.delta("乙" * 500, attempt=1)
+    assert queue.empty()
+
+    # 累计增长达到 1000 raw 字符后发布最新尾部快照。
+    await sink.delta("丙" * 500, attempt=1)
+    second = await asyncio.wait_for(queue.get(), timeout=0.1)
+    assert second.type == "thinking.snapshot"
+    assert second.payload["text"].startswith("…（早期内容已折叠）")
+    assert second.payload["text"].endswith("丙" * 500)
+
+    # 终态块内容始终是最新尾部（节流不影响落库内容）。
+    await sink.completed(attempt=1, duration_ms=1)
+    blocks = await service.completed_blocks(
+        turn_id="turn-1", user_id="user-1", session_id="session-1"
+    )
+    assert blocks[0].truncated is True
+    assert blocks[0].content.startswith("…（早期内容已折叠）")
+    assert blocks[0].content.endswith("丙" * 500)
+    assert len(blocks[0].content) <= 12_000
 
 
 @pytest.mark.asyncio

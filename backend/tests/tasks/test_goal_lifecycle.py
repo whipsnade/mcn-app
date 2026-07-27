@@ -688,6 +688,7 @@ async def test_finalize_brand_goal_builds_report_and_artifacts() -> None:
             assert "goal.completed" in event_types
             report_event = next(e for e in events if e.event_type == "report.updated")
             assert report_event.payload_json["report_id"] == report.id
+            assert report_event.payload_json["report_type"] == "brand_analysis"
             assert report_event.payload_json["version"] == 1
             assert report_event.payload_json["label"] == "品牌分析报告已生成"
             artifact_event = next(e for e in events if e.event_type == "artifact.updated")

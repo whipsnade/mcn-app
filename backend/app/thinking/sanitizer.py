@@ -8,7 +8,7 @@ from typing import Any
 
 _HIDDEN = "[已隐藏]"
 _SCHEMA_HIDDEN = "[输出结构说明已隐藏]"
-_TRUNCATED_SUFFIX = "思考内容过长，已截断"
+_FOLDED_PREFIX = "…（早期内容已折叠）"
 
 _BEARER_RE = re.compile(r"\bBearer\s+[\"']?[^\s,;，；\"']+[\"']?", re.IGNORECASE)
 _JWT_RE = re.compile(
@@ -203,11 +203,11 @@ def _hide_json_schemas(text: str) -> str:
 def _limit_length(text: str, max_chars: int) -> SanitizedThinking:
     if len(text) <= max_chars:
         return SanitizedThinking(text=text, truncated=False)
-    suffix = _TRUNCATED_SUFFIX[:max_chars]
-    return SanitizedThinking(
-        text=f"{text[: max(0, max_chars - len(suffix))]}{suffix}",
-        truncated=True,
-    )
+    # 滑动窗口：保留最新（尾部）内容，头部以前缀标记代替；标记长度计入 max_chars。
+    marker = _FOLDED_PREFIX[:max_chars]
+    keep = max_chars - len(marker)
+    tail = text[-keep:] if keep > 0 else ""
+    return SanitizedThinking(text=f"{marker}{tail}", truncated=True)
 
 
 def sanitize_thinking(text: str, *, max_chars: int = 12_000) -> SanitizedThinking:

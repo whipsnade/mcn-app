@@ -175,6 +175,55 @@ describe('task event reducer', () => {
     expect(state.visibleAnalysisReportId).toBe('analysis-report-2');
   });
 
+  it('does not expose a brand/campaign report as the visible KOL analysis report', () => {
+    const state = reduceTaskEvent(initialTaskRuntime('task-agent'), {
+      id: 1,
+      taskId: 'task-agent',
+      type: 'report.updated',
+      payload: {
+        report_id: 'analysis-report-brand',
+        report_type: 'brand_analysis',
+        phase: 'ai_summary',
+        label: '品牌分析报告已生成',
+      },
+    });
+
+    expect(state.visibleAnalysisReportId).toBeUndefined();
+    // phase/phaseLabel/activity 与 flow 节点更新不受影响。
+    expect(state.phase).toBe('ai_summary');
+    expect(state.phaseLabel).toBe('品牌分析报告已生成');
+    expect(state.activity).toBe('分析报告已更新');
+  });
+
+  it('exposes the report when report.updated carries a KOL report type', () => {
+    const state = reduceTaskEvent(initialTaskRuntime('task-agent'), {
+      id: 1,
+      taskId: 'task-agent',
+      type: 'report.updated',
+      payload: {
+        report_id: 'analysis-report-kol',
+        report_type: 'kol_analysis',
+        phase: 'ai_summary',
+        label: 'KOL 分析报告已生成',
+      },
+    });
+
+    expect(state.visibleAnalysisReportId).toBe('analysis-report-kol');
+    expect(state.phase).toBe('ai_summary');
+    expect(state.phaseLabel).toBe('KOL 分析报告已生成');
+  });
+
+  it('accepts the camelCase report type on report.updated', () => {
+    const state = reduceTaskEvent(initialTaskRuntime('task-agent'), {
+      id: 1,
+      taskId: 'task-agent',
+      type: 'report.updated',
+      payload: { reportId: 'analysis-report-campaign', reportType: 'campaign_analysis' },
+    });
+
+    expect(state.visibleAnalysisReportId).toBeUndefined();
+  });
+
   it('clears the visible analysis report when a new task starts', () => {
     const withReport = reduceTaskEvent(initialTaskRuntime('task-agent'), {
       id: 1,

@@ -1,5 +1,5 @@
 import {
-  Activity, BarChart2, Database, PieChart as PieChartIcon, Sparkles, Table as TableIcon, Tags,
+  Activity, BarChart2, Database, Loader2, PieChart as PieChartIcon, Sparkles, Table as TableIcon, Tags,
 } from 'lucide-react';
 import {
   Bar, BarChart, Cell, Legend, Line, LineChart, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis,
@@ -19,6 +19,7 @@ import type {
 import { createFavoriteByKey, deleteFavoriteByKey } from '../api/favorites';
 import FavoriteStar from './FavoriteStar';
 import { Card, formatExposure, formatNumber, MetricCard } from './reportPrimitives';
+import { useLoadingMessage } from '../hooks/useLoadingMessage';
 
 interface UniversalReportProps {
   report?: ApiAnalysisReport;
@@ -461,12 +462,15 @@ function TypedReportPanel({ sessionId, reportType, summaryEntry, emptyText }: {
   const [selectedReportId, setSelectedReportId] = useState<string>();
   const [report, setReport] = useState<ApiAnalysisReport>();
   const [loading, setLoading] = useState(false);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const loadingMessage = useLoadingMessage(loading || detailLoading);
 
   // 版本列表：会话/类型切换时重拉并选中最新一版。
   useEffect(() => {
     setVersions([]);
     setSelectedReportId(undefined);
     setReport(undefined);
+    setDetailLoading(false);
     if (!sessionId) return;
     let cancelled = false;
     setLoading(true);
@@ -485,18 +489,26 @@ function TypedReportPanel({ sessionId, reportType, summaryEntry, emptyText }: {
     };
   }, [sessionId, reportType]);
 
-  // 选中版本变化时拉详情。
+  // 选中版本变化时拉详情；成功失败都复位 detailLoading，不永久卡加载态。
   useEffect(() => {
     if (!selectedReportId) {
       setReport(undefined);
+      setDetailLoading(false);
       return;
     }
     let cancelled = false;
+    setDetailLoading(true);
     getAnalysisReport(selectedReportId)
       .then(detail => {
-        if (!cancelled) setReport(detail);
+        if (cancelled) return;
+        setReport(detail);
+        setDetailLoading(false);
       })
-      .catch(() => undefined);
+      .catch(() => {
+        if (cancelled) return;
+        setReport(undefined);
+        setDetailLoading(false);
+      });
     return () => {
       cancelled = true;
     };
@@ -539,8 +551,11 @@ function TypedReportPanel({ sessionId, reportType, summaryEntry, emptyText }: {
           上一次报告生成失败，可在会话中重新发起分析
         </p>
       )}
-      {loading ? (
-        <p role="status" className="p-6 text-center text-xs text-slate-400">加载中…</p>
+      {loading || detailLoading ? (
+        <p role="status" className="flex items-center justify-center gap-2 p-6 text-center text-xs text-slate-400">
+          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+          {loadingMessage}
+        </p>
       ) : report ? (
         <ReportBlocks report={report} />
       ) : (
@@ -731,6 +746,17 @@ function KolPanel({ report, taskStatus, sessionId, selectionCount, onReportReady
 
   const displayedReport = viewReport ?? report;
   const selectedCount = selectionCount ?? 0;
+  // 名单按互动率倒序展示 Top 20：无互动率（null/非数值）排最后，保持原有相对顺序。
+  const topSelectionItems = selectionItems
+    .map((item, index) => ({ item, index, rate: selectionMetric(item, 'engagement_rate') }))
+    .sort((a, b) => {
+      if (a.rate == null && b.rate == null) return a.index - b.index;
+      if (a.rate == null) return 1;
+      if (b.rate == null) return -1;
+      return b.rate - a.rate || a.index - b.index;
+    })
+    .slice(0, 20)
+    .map(entry => entry.item);
   const emptyText = taskStatus === 'insufficient_balance'
     ? '积分不足，任务已停止'
     : selectedCount > 0
@@ -839,7 +865,12 @@ function KolPanel({ report, taskStatus, sessionId, selectionCount, onReportReady
               </div>
             ) : (
               <div className="space-y-2.5">
-                {selectionItems.map(item => (
+                {selectionItems.length > 20 && (
+                  <p className="px-1 text-[10px] text-slate-400">
+                    共 {selectionItems.length} 位达人，按互动率展示 Top 20
+                  </p>
+                )}
+                {topSelectionItems.map(item => (
                   <Fragment key={`${item.platform}-${item.kol_uid}`}>{KolSelectionCard({
                     item,
                     favoriteActive: isKolFavorited(item),
