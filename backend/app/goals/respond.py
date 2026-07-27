@@ -74,6 +74,18 @@ async def _selection_projection(db, session_id: str) -> list[dict[str, Any]]:
         total = (item.score_json or {}).get("total")
         return float(total) if isinstance(total, (int, float)) else None
 
+    def _dimensions(item: KolSelectionItem) -> dict[str, Any]:
+        # 6 维评分要点紧凑投影（{维度名: raw_score}），供「为什么圈选这个达人」引用依据；
+        # raw_score 为 None 保留 None，score_json 无 dimensions 给 {}。
+        raw = (item.score_json or {}).get("dimensions")
+        if not isinstance(raw, dict):
+            return {}
+        return {
+            name: detail.get("raw_score")
+            for name, detail in raw.items()
+            if isinstance(detail, dict)
+        }
+
     items.sort(
         key=lambda item: (_total(item) is None, -(_total(item) or 0.0)),
     )
@@ -89,6 +101,7 @@ async def _selection_projection(db, session_id: str) -> list[dict[str, Any]]:
                 "city": item.city,
                 "total_score": total,
                 "rating": label,
+                "dimensions": _dimensions(item),
             }
         )
     return projection

@@ -262,6 +262,7 @@ async def test_selection_projection_orders_by_total_score(
     await db_session.flush()
 
     # 入库顺序（created_at 升序）与总分顺序故意不一致；无 total 的排最后。
+    # uid-high 带 6 维评分结构（与 CandidateScore.as_dict 同构），验证 dimensions 投影。
     rows = [
         ("uid-low", 50.0),
         ("uid-high", 90.0),
@@ -269,6 +270,16 @@ async def test_selection_projection_orders_by_total_score(
         ("uid-no-score", None),
     ]
     for index, (kol_uid, total) in enumerate(rows):
+        score_json: dict = {} if total is None else {"total": total}
+        if kol_uid == "uid-high":
+            score_json["dimensions"] = {
+                "audience": {"raw_score": 88.0, "weight": 25, "weighted_score": 22.0},
+                "content": {"raw_score": 80.0, "weight": 20, "weighted_score": 16.0},
+                "engagement": {"raw_score": None, "weight": 20, "weighted_score": 0},
+                "budget": {"raw_score": 70.0, "weight": 15, "weighted_score": 10.5},
+                "growth": {"raw_score": 60.0, "weight": 10, "weighted_score": 6.0},
+                "brand_safety": {"raw_score": 90.0, "weight": 10, "weighted_score": 9.0},
+            }
         db_session.add(
             KolSelectionItem(
                 id=str(uuid4()),
@@ -278,7 +289,7 @@ async def test_selection_projection_orders_by_total_score(
                 kol_uid=kol_uid,
                 nickname=kol_uid,
                 fields_json={},
-                score_json={} if total is None else {"total": total},
+                score_json=score_json,
                 created_at=datetime(2026, 7, 27, index, tzinfo=UTC).replace(tzinfo=None),
                 updated_at=datetime(2026, 7, 27, index, tzinfo=UTC).replace(tzinfo=None),
             )
@@ -295,6 +306,17 @@ async def test_selection_projection_orders_by_total_score(
         "uid-low",
         "uid-no-score",
     ]
+    high = evidence["selection"][0]
+    assert high["dimensions"] == {
+        "audience": 88.0,
+        "content": 80.0,
+        "engagement": None,
+        "budget": 70.0,
+        "growth": 60.0,
+        "brand_safety": 90.0,
+    }
+    # 无 dimensions 的 item 投影为空对象。
+    assert evidence["selection"][1]["dimensions"] == {}
 
 
 def test_static_texts_are_non_empty_chinese() -> None:
