@@ -25,7 +25,7 @@
 
 - `GoalPlannerOutput`（`backend/app/goals/schemas.py`）：`action: Literal["clarify","execute"]`，model_validator 强制 clarify 有 question 无 goals、execute 反之。
 - enforce 路由（`backend/app/tasks/router.py`）：planner 输出 clarify → 落 user+assistant 消息、不建任务、返回 `TaskOutcomeClarify`；execute → 落 1-3 个 goal 建任务；planner 异常回退 kol_selection 单 goal。
-- 上下文构建（`backend/app/goals/context.py`）：最近 20 条消息压缩 + `session_context`（active_brand/campaign/category/platforms/audience/brainstorm_profile）+ `account_default_brand` + `artifact_summaries`（各模块最新 completed artifact 的**元数据**投影，无正文）。
+- 上下文构建（`backend/app/goals/context.py`）：最近 20 条消息压缩 + `session_context`（active_brand/campaign_name/category/platforms/target_audience/brainstorm_profile）+ `account_default_brand` + `artifact_summaries`（各模块最新 completed artifact 的**元数据**投影，无正文）。
 - 任务失败信息已落库：`analysis_tasks.error_code/error_message`（白名单安全文案）、goal 行 `error_code`、assistant 错误消息（`metadata.message_type="error"`）。
 - 圈选名单已有 6 维加权评分与 rating（`selection/scoring.py`），存在 `kol_selection_items`。
 
@@ -74,9 +74,11 @@ model_validator 规则：
 TaskOutcomeRespond { outcome: "respond", respond_type: str, message: MessageRead }
 ```
 
+路由 `status_code=202`，respond 三分支（含降级文案）均返回 202。幂等键行为与 clarify 现状一致：命中幂等键时跳过 planner，但不落幂等记录，重复提交会重复落消息——本设计不新增幂等记录。
+
 三个分支：
 
-- **`context_qa`**：组装第 3 节证据包 → 一次零积分模型调用（新 prompt `context_qa_v1`，`purpose="context_qa"`，文本输出走 `stream_text` 出口以复用 prompt 日志）。prompt 约束：只能基于证据包回答；证据不足时明说"当前会话中没有相关信息"；不得编造达人、数据或结论。模型调用失败 → 降级为固定文案（"暂时无法回答，请稍后重试。"），仍返回 200。assistant 消息 `metadata.respond = {"type": "context_qa"}`。
+- **`context_qa`**：组装第 3 节证据包 → 一次零积分模型调用（新 prompt `context_qa_v1`，`purpose="context_qa"`，文本输出走 `stream_text` 出口以复用 prompt 日志）。prompt 约束：只能基于证据包回答；证据不足时明说"当前会话中没有相关信息"；不得编造达人、数据或结论。模型调用失败 → 降级为固定文案（"暂时无法回答，请稍后重试。"），仍返回 202。assistant 消息 `metadata.respond = {"type": "context_qa"}`。
 - **`usage_help`**：仓库内维护的静态中文使用指南 + 案例（新模块 `app/workspace/usage_guide.py` 常量），直接落消息，零模型调用。
 - **`out_of_scope`**：固定拒答文案（说明本系统是营销分析助手，仅支持 KOL/品牌/活动相关分析与历史会话内容问答），零模型调用。
 
@@ -84,7 +86,7 @@ TaskOutcomeRespond { outcome: "respond", respond_type: str, message: MessageRead
 
 ### 5. validation 与 shadow
 
-- `goals/validation.py`：`respond` action 只做结构校验（第 1 节互斥规则由 schema validator 保证），不参与 goal 序列/依赖/证据校验。语义重试机制（`GoalPlanSemanticError` 重试一次）对 respond 不适用，保持现状即可。
+- `goals/validation.py` 的 `validate_goal_plan` **必须新增 `action == "respond"` 的 early-return 分支**（与 clarify 同样跳过 goal 序列/依赖/证据/品牌解析校验）。现状只早退 clarify，其余 action 一律落入 execute 校验并执行 `_validate_brand_resolution`——respond 输出在会话已有 active_brand 时会误触 `brand_source_context_mismatch`，经语义重试后抛错回退误建 kol_selection 任务，respond 将不可用。互斥规则（respond 无 goals/question）由 schema validator 保证，无需重复校验。
 - shadow planner：输出只写 `model_prompt_logs`，新 action 被 schema 接受即可，无需其他改动；观测上可统计 respond 各类型的分布。
 
 ### 6. 前端
@@ -97,7 +99,7 @@ TaskOutcomeRespond { outcome: "respond", respond_type: str, message: MessageRead
 | 环节 | 失败表现 | 处理 |
 | --- | --- | --- |
 | planner 调用/校验失败 | 抛异常 | 沿用现状：回退 kol_selection 单 goal，不阻塞用户 |
-| `context_qa` 模型调用失败 | ModelAdapterError | 降级固定文案落消息，返回 200 |
+| `context_qa` 模型调用失败 | ModelAdapterError | 降级固定文案落消息，返回 202 |
 | 思考块持久化失败 | 异常 | 沿用现状：只记 warning |
 | 证据包组装失败（DB 查询异常） | 异常 | 只记 warning，证据包降级为仅最近消息 |
 
