@@ -185,6 +185,7 @@ def build_tool_event_payload(
     step_total: int | None,
     error_code: str | None = None,
     goal_id: str | None = None,
+    upstream_message: str | None = None,
 ) -> dict[str, object]:
     payload: dict[str, object] = {
         "platform": canonical_platform(internal_tool_name),
@@ -197,6 +198,10 @@ def build_tool_event_payload(
     if status in {"failed", "unknown"}:
         failure = safe_error(error_code)
         payload.update({"error_code": failure.code, "message": failure.message})
+        # 上游错误原文（mcp_calls 落库前已 safe_upstream_text 脱敏）随事件透传，
+        # 与白名单 message 并存；缺失/空白时省略该键。
+        if upstream_message and upstream_message.strip():
+            payload["upstream_message"] = upstream_message
     return payload
 
 
@@ -781,6 +786,14 @@ class TaskExecutor:
                 if row_status == "unknown"
                 else TaskEventType.TOOL_FAILED
             )
+            # 上游错误原文在 mcp_calls 落库前已 safe_upstream_text 脱敏，可随事件透传。
+            upstream = None
+            if row is not None:
+                candidate = (getattr(row, "evidence_json", None) or {}).get(
+                    "upstream_error_message"
+                )
+                if isinstance(candidate, str):
+                    upstream = candidate
             await self.repository.append_event(
                 task.id,
                 task.user_id,
@@ -798,6 +811,7 @@ class TaskExecutor:
                     step_total=None,
                     error_code=getattr(row, "error_type", None),
                     goal_id=goal_id,
+                    upstream_message=upstream,
                 ),
             )
             await self.checkpoint("after_mcp_result")

@@ -24,6 +24,8 @@ export interface TaskFlowNode {
   status: TaskFlowNodeStatus;
   /** 失败/未确认节点的用户可读原因（报错信息）。 */
   detail?: string;
+  /** MCP 上游返回的错误详情（后端已脱敏），展示在 detail 下方。 */
+  upstreamDetail?: string;
 }
 
 export interface ArtifactUpdate {
@@ -134,11 +136,14 @@ function withFlowNode(state: TaskRuntimeState, event: TaskEvent): TaskRuntimeSta
             ? 'failed'
             : 'unknown';
         const detail = status === 'succeeded' ? undefined : String(event.payload.message ?? '') || undefined;
+        const upstreamDetail = status === 'succeeded'
+          ? undefined
+          : String(event.payload.upstream_message ?? '').trim() || undefined;
         const index = latestRunningToolNode(nodes, stepIndex);
         if (index === -1) {
-          return { ...state, nodes: pushNode(nodes, { id: `tool-${stepIndex}-late-${event.id}`, label: `查询${platform}数据`, status, detail }) };
+          return { ...state, nodes: pushNode(nodes, { id: `tool-${stepIndex}-late-${event.id}`, label: `查询${platform}数据`, status, detail, upstreamDetail }) };
         }
-        return { ...state, nodes: updateNode(nodes, index, { status, detail }) };
+        return { ...state, nodes: updateNode(nodes, index, { status, detail, upstreamDetail }) };
       }
     case 'report.updated':
       return { ...state, nodes: pushNode(nodes, { id: 'report', label: '分析报告已生成', status: 'succeeded' }) };

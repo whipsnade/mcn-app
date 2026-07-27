@@ -35,6 +35,11 @@ function FlowNodeRow({ node }: { node: TaskFlowNode }) {
             {node.detail}
           </p>
         )}
+        {node.upstreamDetail && (
+          <p className="mt-0.5 font-mono text-[10px] leading-4 text-slate-500">
+            {node.upstreamDetail}
+          </p>
+        )}
       </div>
     </li>
   );

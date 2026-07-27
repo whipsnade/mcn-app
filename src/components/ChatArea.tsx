@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Send, Sparkles, ShieldAlert } from 'lucide-react';
+import { Loader2, Pause, Send, Sparkles, ShieldAlert } from 'lucide-react';
 import { Session, Message, type ThinkingBlock } from '../types';
 import type { FollowupSuggestion } from '../api/contracts';
 import { useSessionThinkingStream } from '../hooks/useSessionThinkingStream';
@@ -60,6 +60,10 @@ interface ChatAreaProps {
   isAnalyzing: boolean;
   /** 是否处于 brainstorm 澄清等待中（loading 文案区分于任务分析）。 */
   isClarifying?: boolean;
+  /** 取消当前运行中的任务（点击暂停按钮触发）。 */
+  onCancelTask?: () => Promise<unknown>;
+  /** 取消请求已发出、等待任务收敛到终态（暂停按钮禁用并显示 loading）。 */
+  isCancelling?: boolean;
   isMockMode: boolean;
   /** 当前任务的执行流程节点（竖状节点图）。 */
   flowNodes?: TaskFlowNode[];
@@ -81,6 +85,8 @@ export default function ChatArea({
   onSendMessage,
   isAnalyzing,
   isClarifying = false,
+  onCancelTask,
+  isCancelling = false,
   isMockMode,
   flowNodes = [],
   flowTerminal = false,
@@ -476,17 +482,36 @@ export default function ChatArea({
             className="flex-1 bg-transparent border-none focus:ring-0 px-3 text-xs md:text-sm text-slate-700 placeholder-slate-400 py-2 font-normal outline-none resize-none max-h-20"
           />
 
-          <button
-            type="submit"
-            disabled={!inputText.trim() || isAnalyzing}
-            className={`px-4 py-2 rounded-lg text-xs font-bold text-white transition active:scale-95 ${
-              inputText.trim() && !isAnalyzing
-                ? 'bg-indigo-600 hover:bg-indigo-700'
-                : 'bg-slate-200 text-slate-400 cursor-not-allowed'
-            }`}
-          >
-            发送
-          </button>
+          {isAnalyzing ? (
+            <button
+              type="button"
+              aria-label={isCancelling ? '正在取消' : '暂停'}
+              disabled={isCancelling}
+              onClick={() => void onCancelTask?.()}
+              className={`px-3 py-2 rounded-lg text-white transition active:scale-95 ${
+                isCancelling
+                  ? 'bg-slate-200 text-slate-400 cursor-not-allowed'
+                  : 'bg-rose-500 hover:bg-rose-600'
+              }`}
+            >
+              {isCancelling
+                ? <Loader2 className="h-4 w-4 animate-spin" />
+                : <Pause className="h-4 w-4" />}
+            </button>
+          ) : (
+            <button
+              type="submit"
+              aria-label="发送"
+              disabled={!inputText.trim()}
+              className={`px-3 py-2 rounded-lg text-white transition active:scale-95 ${
+                inputText.trim()
+                  ? 'bg-indigo-600 hover:bg-indigo-700'
+                  : 'bg-slate-200 text-slate-400 cursor-not-allowed'
+              }`}
+            >
+              <Send className="h-4 w-4" />
+            </button>
+          )}
         </form>
         <p className="text-[10px] text-slate-400 text-center">
           💡 提示：你可以要求 AI 调整、模拟特定达人的销售转化、提升正向舆情占比，右侧分析报告将同步更新。
