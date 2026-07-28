@@ -235,6 +235,32 @@ async def test_request_envelope_skipped_when_tool_not_allowed(db_session: AsyncS
     assert call.calls == []
 
 
+@pytest.mark.asyncio
+async def test_request_envelope_kept_when_schema_declares_request(
+    db_session: AsyncSession,
+) -> None:
+    # schema 顶层声明 request 属性的工具（如 kol.search）：信封是合法结构，不解包。
+    search_args = {"request": {"page": 1, "size": 10, "textContentWord": "美食"}}
+    model = _ScriptedModel(
+        [
+            {
+                "action": "call_tool",
+                "internal_tool_name": "datatap.xiaohongshu.kol.search.v1",
+                "arguments": search_args,
+            },
+            {"action": "finish", "result": POST_ROWS},
+        ]
+    )
+    call = _ScriptedCall({"datatap.xiaohongshu.kol.search.v1": {"达人列表": POST_ROWS}})
+
+    result = await run_quick_feature(**_run_kwargs(db_session, model, call))
+
+    assert result == POST_ROWS
+    [(tool_name, arguments)] = call.calls
+    assert tool_name == "datatap.xiaohongshu.kol.search.v1"
+    assert arguments == search_args
+
+
 _INVALID_ENVELOPE = {"request": {"target_type": "keyword"}}
 
 
