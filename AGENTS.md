@@ -72,7 +72,7 @@ src/                React 前端
   auth/             AuthProvider
   components/       页面组件（组件名.test.tsx 同目录单测）
   hooks/            useWorkspace、useTaskStream
-  state/            任务事件状态
+  state/            任务事件状态、快捷 Tab 状态缓存（QuickFeatureCacheProvider，userId 隔离）
   test/             Vitest setup、fixtures、SSE 模拟
 e2e/                Playwright 端到端测试
 docs/               架构设计、分阶段计划、运行手册（runbooks）、QA 记录

@@ -2,11 +2,16 @@ import { act, fireEvent, render, screen } from '@testing-library/react';
 import { useState } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+import App from './App';
 import type { ApiQuickKolRecommendations, ApiQuickTopPosts } from './api/contracts';
+import { listFavorites } from './api/favorites';
 import { getKolRecommendations, getTopPosts, postEvaluate } from './api/quick';
+import { getWallet } from './api/wallet';
+import { useAuth } from './auth/AuthProvider';
 import EvaluatePanel from './components/EvaluatePanel';
 import KolRecommendPanel from './components/KolRecommendPanel';
 import TopPostsPanel from './components/TopPostsPanel';
+import { useWorkspace } from './hooks/useWorkspace';
 import { QuickFeatureCacheProvider } from './state/QuickFeatureCache';
 
 vi.mock('./api/quick', () => ({
@@ -20,11 +25,43 @@ vi.mock('./api/quick', () => ({
 vi.mock('./api/favorites', () => ({
   createFavoriteByKey: vi.fn(),
   deleteFavoriteByKey: vi.fn(),
+  listFavorites: vi.fn(),
 }));
+
+vi.mock('./api/wallet', () => ({
+  getWallet: vi.fn(),
+}));
+
+vi.mock('./auth/AuthProvider', () => ({
+  useAuth: vi.fn(),
+}));
+
+vi.mock('./hooks/useWorkspace', () => ({
+  useWorkspace: vi.fn(),
+}));
+
+// App 集成测试只保留 WorkspaceTabs / KolRecommendPanel / QuickFeatureCacheProvider 为真实组件，
+// 其余重组件全部替身化，避免牵扯会话流、报告等无关模块。
+vi.mock('./components/SessionList', () => ({ default: () => null }));
+vi.mock('./components/MobileWorkspaceNav', () => ({ default: () => null }));
+vi.mock('./components/ChatArea', () => ({ default: () => <div>会话区</div> }));
+vi.mock('./components/FavoritesPanel', () => ({ default: () => <div>收藏面板</div> }));
+vi.mock('./components/UniversalReport', async importOriginal => {
+  // 保留真实命名导出（EvaluatePanel 依赖 MarkdownBlock），仅替身化默认导出。
+  const actual = await importOriginal<typeof import('./components/UniversalReport')>();
+  return { ...actual, default: () => null };
+});
+vi.mock('./components/RechargeModal', () => ({ default: () => null }));
+vi.mock('./components/AdminPanel', () => ({ default: () => null }));
+vi.mock('./components/KolDetailView', () => ({ default: () => null }));
 
 const mockGetTopPosts = vi.mocked(getTopPosts);
 const mockGetKolRecommendations = vi.mocked(getKolRecommendations);
 const mockPostEvaluate = vi.mocked(postEvaluate);
+const mockListFavorites = vi.mocked(listFavorites);
+const mockGetWallet = vi.mocked(getWallet);
+const mockUseAuth = vi.mocked(useAuth);
+const mockUseWorkspace = vi.mocked(useWorkspace);
 
 const XHS_RESULT: ApiQuickTopPosts = {
   items: [
@@ -262,5 +299,83 @@ describe('快捷 Tab 容器集成（QuickFeatureCacheProvider）', () => {
     expect(mockGetTopPosts).toHaveBeenCalledTimes(2);
     expect(mockGetKolRecommendations).toHaveBeenCalledTimes(1);
     expect(mockPostEvaluate).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ---- App 级集成：Provider 挂载位置 ----
+
+// 可变 workspace：activeSession 通过 ref 控制，配合 rerender 模拟「会话被删除/恢复」。
+const workspaceRef: { current: { activeSession: unknown } } = {
+  current: { activeSession: null },
+};
+
+function workspaceValue() {
+  return {
+    sessions: [],
+    activeSessionId: null,
+    activeSession: workspaceRef.current.activeSession,
+    loading: false,
+    error: null,
+    taskRuntime: undefined,
+    isAnalyzing: false,
+    isClarifying: false,
+    cancelRequested: false,
+    createSession: vi.fn(),
+    selectSession: vi.fn(),
+    updateSession: vi.fn(),
+    deleteSession: vi.fn(),
+    appendMessage: vi.fn(),
+    cancelActiveTask: vi.fn(),
+    retryMessage: vi.fn(),
+    retryFollowups: vi.fn(),
+    setAnalysisReport: vi.fn(),
+    markArtifactSeen: vi.fn(),
+  };
+}
+
+describe('App 集成：无活跃会话时快捷缓存不随条件块卸载', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGetKolRecommendations.mockResolvedValue(KOL_RESULT);
+    mockListFavorites.mockResolvedValue([]);
+    mockGetWallet.mockResolvedValue({ available: 100 } as never);
+    mockUseAuth.mockReturnValue({
+      user: { id: 'user-1', nickname: '测试用户', role: 'user' },
+      status: 'authenticated',
+      logout: vi.fn(),
+    } as never);
+    mockUseWorkspace.mockImplementation(() => workspaceValue() as never);
+  });
+
+  it('快捷 Tab 查询后切到「智能会话」（无会话空态）再切回，缓存不丢、不重复请求', async () => {
+    vi.useFakeTimers();
+    workspaceRef.current = { activeSession: { id: 'session-1' } };
+    const view = render(<App />);
+
+    // 切到达人推荐并完成一次查询
+    fireEvent.click(screen.getByRole('tab', { name: '达人推荐' }));
+    fireEvent.click(screen.getByRole('button', { name: /查询\/刷新/ }));
+    await advanceDebounce();
+    expect(screen.getByText('推荐达人甲')).toBeTruthy();
+    expect(mockGetKolRecommendations).toHaveBeenCalledTimes(1);
+
+    // 会话被删除（activeSession = null），当前仍在快捷 Tab，面板不受影响
+    workspaceRef.current = { activeSession: null };
+    view.rerender(<App />);
+    expect(screen.getByText('推荐达人甲')).toBeTruthy();
+
+    // 切到「智能会话」：无活跃会话 → 条件块整体卸载
+    // （修复前 Provider 挂在条件块内，随之一并卸载、缓存全丢）
+    fireEvent.click(screen.getByRole('tab', { name: '智能会话' }));
+    expect(screen.getByText('请选择或新建一个 KOL 筛选会话')).toBeTruthy();
+
+    // 恢复会话后切回达人推荐：结果与积分消耗仍在，不重复请求
+    workspaceRef.current = { activeSession: { id: 'session-2' } };
+    view.rerender(<App />);
+    fireEvent.click(screen.getByRole('tab', { name: '达人推荐' }));
+    expect(screen.getByText('推荐达人甲')).toBeTruthy();
+    expect(screen.getByText('上次消耗 20 积分', { exact: false })).toBeTruthy();
+    await advanceDebounce();
+    expect(mockGetKolRecommendations).toHaveBeenCalledTimes(1);
   });
 });

@@ -151,78 +151,82 @@ export default function App() {
         </div>
 
         <div className={`${mobilePane === 'chat' ? 'flex' : 'hidden'} h-full min-h-0 min-w-0 flex-1 flex-col xl:flex`}>
-          {workspace.activeSession || QUICK_TAB_IDS.includes(workspaceTab) ? (
-            <QuickFeatureCacheProvider userId={user.id}>
-              <WorkspaceTabs
-                active={workspaceTab}
-                onChange={setWorkspaceTab}
-                favoriteCount={favorites.length}
-              />
-              {workspaceTab === 'kol' && (
-                <KolRecommendPanel
-                  onSelectKol={kol => setSelectedKol(kol)}
-                  favorites={favorites}
-                  onFavoriteToggled={refreshFavorites}
+          {/* Provider 挂在条件块外：快捷功能是不绑定会话的全局功能，
+              无会话时切到非快捷 Tab 只卸载条件块内容，缓存保留。 */}
+          <QuickFeatureCacheProvider userId={user.id}>
+            {workspace.activeSession || QUICK_TAB_IDS.includes(workspaceTab) ? (
+              <>
+                <WorkspaceTabs
+                  active={workspaceTab}
+                  onChange={setWorkspaceTab}
+                  favoriteCount={favorites.length}
                 />
-              )}
-              {workspaceTab === 'posts-xhs' && (
-                <TopPostsPanel platform="xiaohongshu" />
-              )}
-              {workspaceTab === 'posts-dy' && (
-                <TopPostsPanel platform="douyin" />
-              )}
-              {workspaceTab === 'evaluate' && (
-                <EvaluatePanel />
-              )}
-              {workspace.activeSession && workspaceTab === 'chat' && (
-                <ChatArea
-                  session={workspace.activeSession}
-                  onSendMessage={async text => {
-                    await workspace.appendMessage(text);
-                  }}
-                  isAnalyzing={workspace.isAnalyzing}
-                  isClarifying={workspace.isClarifying}
-                  onCancelTask={workspace.cancelActiveTask}
-                  isCancelling={workspace.cancelRequested}
-                  isMockMode={false}
-                  flowNodes={workspace.taskRuntime?.nodes ?? []}
-                  flowTerminal={isTerminalTaskStatus(workspace.taskRuntime?.status)}
-                  flowTerminalLabel={workspace.taskRuntime?.phaseLabel}
-                  assistantDraft={workspace.taskRuntime?.assistantDraft ?? ''}
-                  onRetryMessage={messageId => workspace.retryMessage(messageId)}
-                  followupStatus={workspace.activeSession.analysis?.followupStatus}
-                  followupSuggestions={workspace.activeSession.analysis?.followupSuggestions}
-                  followupError={typeof workspace.activeSession.analysis?.followupError?.message === 'string'
-                    ? workspace.activeSession.analysis.followupError.message
-                    : undefined}
-                  onRetryFollowups={() => workspace.retryFollowups()}
-                />
-              )}
-              {workspaceTab === 'favorites' && (
-                <FavoritesPanel
-                  favorites={favorites}
-                  loading={favoritesLoading}
-                  onRefresh={refreshFavorites}
-                />
-              )}
-            </QuickFeatureCacheProvider>
-          ) : (
-            <div className="flex flex-1 items-center justify-center bg-slate-50">
-              <div className="text-center">
-                <p className="text-xs font-medium text-slate-500">
-                  {workspace.loading ? '正在加载历史会话…' : '请选择或新建一个 KOL 筛选会话'}
-                </p>
-                {!workspace.loading && (
-                  <button
-                    onClick={() => void handleCreateSession().catch(() => undefined)}
-                    className="mt-3 rounded-lg bg-indigo-600 px-3 py-1.5 text-[11px] font-semibold text-white shadow-sm transition hover:bg-indigo-700"
-                  >
-                    新建分析会话
-                  </button>
+                {workspaceTab === 'kol' && (
+                  <KolRecommendPanel
+                    onSelectKol={kol => setSelectedKol(kol)}
+                    favorites={favorites}
+                    onFavoriteToggled={refreshFavorites}
+                  />
                 )}
+                {workspaceTab === 'posts-xhs' && (
+                  <TopPostsPanel platform="xiaohongshu" />
+                )}
+                {workspaceTab === 'posts-dy' && (
+                  <TopPostsPanel platform="douyin" />
+                )}
+                {workspaceTab === 'evaluate' && (
+                  <EvaluatePanel />
+                )}
+                {workspace.activeSession && workspaceTab === 'chat' && (
+                  <ChatArea
+                    session={workspace.activeSession}
+                    onSendMessage={async text => {
+                      await workspace.appendMessage(text);
+                    }}
+                    isAnalyzing={workspace.isAnalyzing}
+                    isClarifying={workspace.isClarifying}
+                    onCancelTask={workspace.cancelActiveTask}
+                    isCancelling={workspace.cancelRequested}
+                    isMockMode={false}
+                    flowNodes={workspace.taskRuntime?.nodes ?? []}
+                    flowTerminal={isTerminalTaskStatus(workspace.taskRuntime?.status)}
+                    flowTerminalLabel={workspace.taskRuntime?.phaseLabel}
+                    assistantDraft={workspace.taskRuntime?.assistantDraft ?? ''}
+                    onRetryMessage={messageId => workspace.retryMessage(messageId)}
+                    followupStatus={workspace.activeSession.analysis?.followupStatus}
+                    followupSuggestions={workspace.activeSession.analysis?.followupSuggestions}
+                    followupError={typeof workspace.activeSession.analysis?.followupError?.message === 'string'
+                      ? workspace.activeSession.analysis.followupError.message
+                      : undefined}
+                    onRetryFollowups={() => workspace.retryFollowups()}
+                  />
+                )}
+                {workspaceTab === 'favorites' && (
+                  <FavoritesPanel
+                    favorites={favorites}
+                    loading={favoritesLoading}
+                    onRefresh={refreshFavorites}
+                  />
+                )}
+              </>
+            ) : (
+              <div className="flex flex-1 items-center justify-center bg-slate-50">
+                <div className="text-center">
+                  <p className="text-xs font-medium text-slate-500">
+                    {workspace.loading ? '正在加载历史会话…' : '请选择或新建一个 KOL 筛选会话'}
+                  </p>
+                  {!workspace.loading && (
+                    <button
+                      onClick={() => void handleCreateSession().catch(() => undefined)}
+                      className="mt-3 rounded-lg bg-indigo-600 px-3 py-1.5 text-[11px] font-semibold text-white shadow-sm transition hover:bg-indigo-700"
+                    >
+                      新建分析会话
+                    </button>
+                  )}
+                </div>
               </div>
-            </div>
-          )}
+            )}
+          </QuickFeatureCacheProvider>
         </div>
 
         <div className={`${mobilePane === 'bi' ? 'block' : 'hidden'} h-full min-h-0 w-full shrink-0 xl:block xl:w-auto`}>
