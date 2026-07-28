@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 import { useEffect } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -200,6 +200,45 @@ describe('TopPostsPanel', () => {
     expect(screen.getByText('抖音爆款第一条')).toBeTruthy();
     expect(screen.getByText('抖音达人')).toBeTruthy();
     expect(mockGetTopPosts).not.toHaveBeenCalled();
+  });
+
+  it('keeps the loading state across unmount and remount while the query is in flight', async () => {
+    let resolveQuery: (value: ApiQuickTopPosts) => void = () => undefined;
+    mockGetTopPosts.mockImplementation(
+      () => new Promise(resolve => {
+        resolveQuery = resolve;
+      }),
+    );
+    // 只卸载面板、保留 Provider，模拟切换 Tab 后再切回来。
+    function Harness({ showPanel }: { showPanel: boolean }) {
+      return (
+        <QuickFeatureCacheProvider userId="test-user">
+          {showPanel ? <TopPostsPanel platform="xiaohongshu" /> : null}
+        </QuickFeatureCacheProvider>
+      );
+    }
+    const view = render(<Harness showPanel />);
+
+    fireEvent.click(screen.getByRole('button', { name: /查询\/刷新/ }));
+    expect(await screen.findByText(/正在加载爆贴榜单/)).toBeTruthy();
+    expect(mockGetTopPosts).toHaveBeenCalledTimes(1);
+
+    view.rerender(<Harness showPanel={false} />);
+    view.rerender(<Harness showPanel />);
+
+    // 查询中的加载态从缓存恢复，而不是退回「未查询」空态
+    expect(screen.getByText(/正在加载爆贴榜单/)).toBeTruthy();
+    expect(screen.queryByText(/点击右上角「查询\/刷新」获取/)).toBeNull();
+
+    // in-flight 期间再次点击不发起第二次请求
+    fireEvent.click(screen.getByRole('button', { name: /查询\/刷新/ }));
+    expect(mockGetTopPosts).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      resolveQuery(RESULT);
+    });
+    expect(await screen.findByText('年度必吃榜第一名')).toBeTruthy();
+    expect(mockGetTopPosts).toHaveBeenCalledTimes(1);
   });
 
   it('keeps xiaohongshu and douyin cache entries isolated', () => {

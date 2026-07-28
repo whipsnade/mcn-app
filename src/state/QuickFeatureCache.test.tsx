@@ -2,8 +2,8 @@ import { act, renderHook } from '@testing-library/react';
 import type { ReactNode } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { ApiQuickTopPost } from '../api/contracts';
-import { getKolRecommendations } from '../api/quick';
+import type { ApiQuickTopPost, ApiQuickTopPosts } from '../api/contracts';
+import { getKolRecommendations, getTopPosts } from '../api/quick';
 import {
   QuickFeatureCacheProvider,
   useQuickFeatureCache,
@@ -16,6 +16,7 @@ vi.mock('../api/quick', () => ({
   quickErrorMessage: () => '查询失败，请稍后重试',
 }));
 
+const mockGetTopPosts = vi.mocked(getTopPosts);
 const mockGetKolRecommendations = vi.mocked(getKolRecommendations);
 
 const douyinEntry: QuickTopPostsCacheEntry = {
@@ -114,6 +115,95 @@ describe('QuickFeatureCache', () => {
     userRef.current = 'user-a';
     rerender();
     expect(result.current.topPosts.douyin).toBeUndefined();
+  });
+});
+
+describe('QuickFeatureCache · in-flight loading 状态', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('queryTopPosts 进行中 entry.loading 为 true 且保留旧字段，成功后复位', async () => {
+    let resolveQuery: (value: ApiQuickTopPosts) => void = () => undefined;
+    mockGetTopPosts.mockImplementation(
+      () => new Promise(resolve => {
+        resolveQuery = resolve;
+      }),
+    );
+    const { result } = setup('user-a');
+
+    let pending: Promise<void> = Promise.resolve();
+    act(() => {
+      pending = result.current.queryTopPosts('douyin');
+    });
+
+    // 查询中：loading=true，hasQueried 仍为 false（面板以 loading 分支优先展示）
+    expect(result.current.topPosts.douyin).toMatchObject({
+      loading: true,
+      hasQueried: false,
+      items: [],
+    });
+
+    await act(async () => {
+      resolveQuery({ items: [], points_cost: 10 });
+      await pending;
+    });
+
+    expect(result.current.topPosts.douyin).toMatchObject({
+      loading: false,
+      hasQueried: true,
+      pointsCost: 10,
+    });
+  });
+
+  it('queryTopPosts 失败同样复位 loading 并保留旧列表', async () => {
+    mockGetTopPosts.mockRejectedValue(new Error('boom'));
+    const { result } = setup('user-a');
+    act(() => {
+      result.current.setTopPosts('douyin', douyinEntry);
+    });
+
+    let pending: Promise<void> = Promise.resolve();
+    act(() => {
+      pending = result.current.queryTopPosts('douyin');
+    });
+    expect(result.current.topPosts.douyin).toMatchObject({ loading: true, hasQueried: true });
+
+    await act(async () => {
+      await pending;
+    });
+    expect(result.current.topPosts.douyin).toMatchObject({
+      loading: false,
+      hasQueried: true,
+      error: '查询失败，请稍后重试',
+      items: douyinEntry.items,
+    });
+  });
+
+  it('queryKolRecommendations 进行中 entry.loading 为 true，settle 后复位', async () => {
+    let resolveQuery: (value: { items: never[]; points_cost: number }) => void = () => undefined;
+    mockGetKolRecommendations.mockImplementation(
+      () => new Promise(resolve => {
+        resolveQuery = resolve;
+      }),
+    );
+    const { result } = setup('user-a');
+
+    let pending: Promise<void> = Promise.resolve();
+    act(() => {
+      pending = result.current.queryKolRecommendations(50_000);
+    });
+    expect(result.current.kolRecommend).toMatchObject({ loading: true });
+
+    await act(async () => {
+      resolveQuery({ items: [], points_cost: 20 });
+      await pending;
+    });
+    expect(result.current.kolRecommend).toMatchObject({
+      loading: false,
+      queriedBudget: 50_000,
+      hasQueried: true,
+    });
   });
 });
 

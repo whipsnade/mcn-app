@@ -48,12 +48,13 @@ function platformBadgeClass(platform: string): string {
 }
 
 export default function KolRecommendPanel({ onSelectKol, favorites = [], onFavoriteToggled }: KolRecommendPanelProps) {
-  // 预算与查询结果全部来自快捷功能缓存，切换 Tab 回来可直接恢复；
-  // loading 与收藏 busy 是瞬态，留在面板本地。
+  // 预算、查询结果与 loading 全部来自快捷功能缓存，切换 Tab 回来可直接恢复；
+  // 收藏 busy 是瞬态，留在面板本地。
   const { kolRecommend, setKolRecommend, queryKolRecommendations } = useQuickFeatureCache();
   const entry = kolRecommend ?? DEFAULT_CACHE_ENTRY;
   const { budget, queriedBudget, items, pointsCost, hasQueried, error } = entry;
-  const [loading, setLoading] = useState(false);
+  // loading 存在缓存里：查询中切 Tab 再切回仍能恢复加载态，并阻止 in-flight 重复请求
+  const loading = entry.loading ?? false;
   const [favoriteBusyKey, setFavoriteBusyKey] = useState<string | null>(null);
   const [queryNonce, setQueryNonce] = useState(0);
   const loadingMessage = useLoadingMessage(loading, [
@@ -67,6 +68,8 @@ export default function KolRecommendPanel({ onSelectKol, favorites = [], onFavor
   };
 
   const handleQuery = () => {
+    // in-flight 期间不重复触发
+    if (loading) return;
     // 打开 tab 不自动查询：首次查询由「查询/刷新」按钮触发，之后拖动预算条继续防抖刷新
     updateEntry({ hasQueried: true });
     setQueryNonce(nonce => nonce + 1);
@@ -112,18 +115,19 @@ export default function KolRecommendPanel({ onSelectKol, favorites = [], onFavor
   // budget !== queriedBudget 说明当前预算尚未查询过（典型：防抖期内切 Tab，
   // 防抖 timer 随卸载被清理，查询丢失），重挂载后据此补查一次；
   // queryNonce 变化代表手动「查询/刷新」。ref 只在同次挂载内对 nonce 去重，
-  // 过期响应由 Provider 内的请求序号抑制。
+  // 过期响应由 Provider 内的请求序号抑制。in-flight（loading）期间不再发起新查询，
+  // loading 结束（缓存回写）后 effect 重跑，按预算差异补查。
   const lastHandledNonce = useRef(queryNonce);
   useEffect(() => {
     if (!hasQueried) return;
+    if (loading) return;
     if (budget === queriedBudget && lastHandledNonce.current === queryNonce) return;
     lastHandledNonce.current = queryNonce;
-    setLoading(true);
     const timer = window.setTimeout(() => {
-      void queryKolRecommendations(budget).finally(() => setLoading(false));
+      void queryKolRecommendations(budget);
     }, DEBOUNCE_MS);
     return () => window.clearTimeout(timer);
-  }, [budget, queriedBudget, queryNonce, hasQueried, queryKolRecommendations]);
+  }, [budget, queriedBudget, queryNonce, hasQueried, loading, queryKolRecommendations]);
 
   return (
     <div className="flex min-h-0 flex-1 flex-col bg-slate-50">

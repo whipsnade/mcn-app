@@ -23,6 +23,8 @@ export interface QuickTopPostsCacheEntry {
   degraded: boolean;
   pointsCost: number | null;
   hasQueried: boolean;
+  // in-flight 标记：查询进行中为 true，面板卸载/重挂载后仍能恢复加载态并防止重复请求。
+  loading?: boolean;
   error?: string;
 }
 
@@ -34,6 +36,8 @@ export interface QuickKolRecommendCacheEntry {
   items: ApiQuickKolItem[];
   pointsCost: number | null;
   hasQueried: boolean;
+  // in-flight 标记：查询进行中为 true，面板卸载/重挂载后仍能恢复加载态并防止重复请求。
+  loading?: boolean;
   error?: string;
 }
 
@@ -42,6 +46,8 @@ export interface QuickEvaluateCacheEntry {
   kolNames: string[];
   kolDraft: string;
   result: ApiQuickEvaluateResult | null;
+  // in-flight 标记：提交进行中为 true，面板卸载/重挂载后仍能恢复提交中态并防止重复提交。
+  submitting?: boolean;
   error?: string;
 }
 
@@ -105,6 +111,26 @@ export function QuickFeatureCacheProvider({ userId, children }: QuickFeatureCach
     const requestUserId = userIdRef.current;
     const isStale = () =>
       topPostsQuerySeq.current[platform] !== seq || userIdRef.current !== requestUserId;
+    // 开始时把 in-flight 标记写入缓存（保留旧字段）：面板即使卸载重挂载也能恢复加载态，
+    // 并据此阻止 in-flight 期间的重复查询。
+    setState(prev => {
+      const prevEntry = prev.topPosts[platform];
+      return {
+        ...prev,
+        topPosts: {
+          ...prev.topPosts,
+          [platform]: {
+            items: prevEntry?.items ?? [],
+            fallbackKols: prevEntry?.fallbackKols ?? [],
+            degraded: prevEntry?.degraded ?? false,
+            pointsCost: prevEntry?.pointsCost ?? null,
+            hasQueried: prevEntry?.hasQueried ?? false,
+            error: prevEntry?.error,
+            loading: true,
+          },
+        },
+      };
+    });
     try {
       const result = await getTopPosts(platform);
       if (isStale()) return;
@@ -118,6 +144,7 @@ export function QuickFeatureCacheProvider({ userId, children }: QuickFeatureCach
             degraded: result.degraded === true,
             pointsCost: typeof result.points_cost === 'number' ? result.points_cost : null,
             hasQueried: true,
+            loading: false,
           },
         },
       }));
@@ -137,6 +164,7 @@ export function QuickFeatureCacheProvider({ userId, children }: QuickFeatureCach
               degraded: prevEntry?.degraded ?? false,
               pointsCost: prevEntry?.pointsCost ?? null,
               hasQueried: true,
+              loading: false,
               error: message,
             },
           },
@@ -154,6 +182,23 @@ export function QuickFeatureCacheProvider({ userId, children }: QuickFeatureCach
     const requestUserId = userIdRef.current;
     const isStale = () =>
       kolRecommendQuerySeq.current !== seq || userIdRef.current !== requestUserId;
+    // 开始时把 in-flight 标记写入缓存（保留旧字段）：面板即使卸载重挂载也能恢复加载态，
+    // 并据此阻止 in-flight 期间的重复查询。
+    setState(prev => {
+      const prevEntry = prev.kolRecommend;
+      return {
+        ...prev,
+        kolRecommend: {
+          budget: prevEntry?.budget ?? budget,
+          queriedBudget: prevEntry?.queriedBudget ?? null,
+          items: prevEntry?.items ?? [],
+          pointsCost: prevEntry?.pointsCost ?? null,
+          hasQueried: prevEntry?.hasQueried ?? false,
+          error: prevEntry?.error,
+          loading: true,
+        },
+      };
+    });
     try {
       const result = await getKolRecommendations({ budget });
       if (isStale()) return;
@@ -166,6 +211,7 @@ export function QuickFeatureCacheProvider({ userId, children }: QuickFeatureCach
           items: result.items ?? [],
           pointsCost: typeof result.points_cost === 'number' ? result.points_cost : null,
           hasQueried: true,
+          loading: false,
         },
       }));
     } catch (error) {
@@ -182,6 +228,7 @@ export function QuickFeatureCacheProvider({ userId, children }: QuickFeatureCach
             items: prevEntry?.items ?? [],
             pointsCost: prevEntry?.pointsCost ?? null,
             hasQueried: true,
+            loading: false,
             error: message,
           },
         };

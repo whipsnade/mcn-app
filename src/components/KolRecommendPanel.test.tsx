@@ -225,6 +225,82 @@ describe('KolRecommendPanel', () => {
     expect(mockGetKolRecommendations).toHaveBeenCalledTimes(1);
   });
 
+  it('in-flight 查询中卸载/重挂载 loading 保留，且不重复请求', async () => {
+    let resolveQuery: (value: ApiQuickKolRecommendations) => void = () => undefined;
+    mockGetKolRecommendations.mockImplementation(
+      () => new Promise(resolve => {
+        resolveQuery = resolve;
+      }),
+    );
+    // 只卸载面板、保留 Provider，模拟切换快捷 Tab 后再切回来。
+    function Harness({ showPanel }: { showPanel: boolean }) {
+      return (
+        <QuickFeatureCacheProvider userId="test-user">
+          {showPanel ? <KolRecommendPanel onSelectKol={vi.fn()} /> : null}
+        </QuickFeatureCacheProvider>
+      );
+    }
+    const view = render(<Harness showPanel />);
+
+    fireEvent.click(screen.getByRole('button', { name: /查询\/刷新/ }));
+    await advanceDebounce();
+    expect(mockGetKolRecommendations).toHaveBeenCalledTimes(1);
+    expect(screen.getByText(/正在加载达人推荐/)).toBeTruthy();
+
+    view.rerender(<Harness showPanel={false} />);
+    view.rerender(<Harness showPanel />);
+
+    // loading 态从缓存恢复；in-flight 期间再次点击与防抖窗口都不重复请求
+    expect(screen.getByText(/正在加载达人推荐/)).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: /查询\/刷新/ }));
+    await advanceDebounce();
+    expect(mockGetKolRecommendations).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      resolveQuery(RESULT);
+    });
+    // fake timers 下不用 findByText（waitFor 轮询依赖计时器），act 刷新后同步断言
+    expect(screen.getByText('美食达人甲')).toBeTruthy();
+    expect(mockGetKolRecommendations).toHaveBeenCalledTimes(1);
+  });
+
+  it('in-flight 期间拖动预算，settle 后按新预算恰好补查一次', async () => {
+    let resolveQuery: (value: ApiQuickKolRecommendations) => void = () => undefined;
+    mockGetKolRecommendations.mockImplementationOnce(
+      () => new Promise(resolve => {
+        resolveQuery = resolve;
+      }),
+    );
+    renderPanel(<KolRecommendPanel onSelectKol={vi.fn()} />);
+
+    // 首次手动查询（预算 ¥5.0万），请求保持 in-flight
+    fireEvent.click(screen.getByRole('button', { name: /查询\/刷新/ }));
+    await advanceDebounce();
+    expect(mockGetKolRecommendations).toHaveBeenCalledTimes(1);
+    expect(mockGetKolRecommendations).toHaveBeenLastCalledWith({ budget: 50_000 });
+    expect(screen.getByText(/正在加载达人推荐/)).toBeTruthy();
+
+    // in-flight 期间把预算拖到 ¥20.0万：loading 守卫生效，防抖窗口内不发新请求
+    fireEvent.change(screen.getByLabelText('单达人报价预算'), { target: { value: '200000' } });
+    await advanceDebounce();
+    expect(mockGetKolRecommendations).toHaveBeenCalledTimes(1);
+
+    // 第一次查询 settle：loading 复位后 effect 重跑，按预算差异经防抖补查恰好一次
+    await act(async () => {
+      resolveQuery(RESULT);
+    });
+    expect(screen.getByText('美食达人甲')).toBeTruthy();
+    expect(mockGetKolRecommendations).toHaveBeenCalledTimes(1);
+
+    await advanceDebounce();
+    expect(mockGetKolRecommendations).toHaveBeenCalledTimes(2);
+    expect(mockGetKolRecommendations).toHaveBeenLastCalledWith({ budget: 200_000 });
+
+    // 补查完成后预算与已查询预算一致，不再出现第三次请求
+    await advanceDebounce();
+    expect(mockGetKolRecommendations).toHaveBeenCalledTimes(2);
+  });
+
   it('reports the selected kol when a row is clicked', async () => {
     const onSelectKol = vi.fn();
     renderPanel(<KolRecommendPanel onSelectKol={onSelectKol} />);
