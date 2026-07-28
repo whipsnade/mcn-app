@@ -263,7 +263,7 @@ async def test_run_brand_analysis_injects_limitation_note(db_session, user_facto
     content = _user_content(request)
     assert content["limitation"] == "趋势数据未成功获取"
     system_text = next(m.content for m in request.messages if m.role == "system")
-    assert "趋势数据未成功获取" in system_text or "limitation" in system_text
+    assert "limitation" in system_text
     assert "不输出跨期趋势结论" in system_text
     assert "环比" in system_text
 
