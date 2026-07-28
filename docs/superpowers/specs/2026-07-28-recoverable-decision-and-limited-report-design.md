@@ -40,21 +40,31 @@
   附当前允许的工具名清单（紧凑投影）与本 goal 的目标提示——本案语境下即
   「已拿到 overview，若要判断变化趋势，应明确选择并填写
   `datatap.insight.social.statistic.trend.v1`」。
-- **连续修正上限 2 次**（该错误码独立计数，不与其他非法决策混算）；第 3 次仍错
-  进入 §2 受限交付，不再 raise。
+- **连续修正上限 2 次**：`missing_tool_name_streak` 独立计数——仅该错误发生时 +1、
+  任何决策校验成功时清零，与 `invalid_streak` 互不影响（混发时各自计数）。
+  第 3 次仍错进入 §2 受限交付，不再 raise。
 - 其余 `PlanValidationError`（TOOL_NOT_ALLOWED / INVALID_TOOL_ARGUMENTS / 渠道）
   维持现状：第 2 次熔断。
+- 回喂 EvidenceNote 格式：一行错因 + 「允许的工具：internal_name（一行用途）×N」
+  （N=`context.tools` 实际长度，品牌场景约十余个）+ 一句本 goal 目标提示。
 
 ### 2. 连续修正失败时生成「受限报告」
 
-决策修正失败（或其他循环失败）且**已有 ≥1 条 settled 证据**时：
+**范围限定：仅「缺工具名修正失败（连续修正上限耗尽）」这一条路径**触发受限交付；
+其他异常（ModelAdapterError、MCP 失败等）维持现状失败路径，不降级。
 
-- Goal 终态 `completed_with_warnings` + 警告码 `brand_trend_data_unavailable`（按缺口
-  类型编码；缺工具名修正失败场景用此码）。
-- 走既有 `_finalize_analysis_goal` 报告构建（品牌报告）：prompt 层注入
-  **受限声明**——「已完成品牌概览与情感快照；趋势工具未成功执行，不输出跨期趋势
+- Goal 终态 `completed_with_warnings`，警告码落 `goal.warning_code` 列
+  （`brand_trend_data_unavailable`；`error_code` 列只用于失败码，不写）。
+- executor 在修正上限耗尽时：先写 `goal.warning_code` 再走既有
+  `_finalize_analysis_goal` 报告构建，并把警告码透传给它——构建器按**固定映射**
+  （`brand_trend_data_unavailable` → 「趋势数据未成功获取」）在报告 prompt 中注入
+  **受限声明**：「已完成品牌概览与情感快照；趋势工具未成功执行，不输出跨期趋势
   结论」，禁止根据 overview 的环比字段伪造完整趋势分析。
-- 产物登记 `brand_report` artifact（completed），goal `error_code` 记警告码。
+- 产物登记 `brand_report` artifact（completed）。
+- 任务级终态：走既有 `completed_with_warnings` 路径，reason 从硬编码
+  `"mcp_partial_failure"` 扩为按场景取值——本场景用新 reason
+  `"decision_recovery_exhausted"`，用户可见消息为
+  「部分数据未能获取，已基于已采集数据生成报告。」（SSE 终态事件同构）。
 - **零有效证据时才保持 Goal 失败**（现状路径）。
 
 ### 3. 强化 brand_loop prompt 与结构化契约
@@ -65,8 +75,8 @@
   只有能给出完整工具名时才输出 call_tool；不确定时 finish 并说明证据不足，不得
   输出空工具调用。
 - 按阶段排序的工具提示：① 品牌标签匹配 → ② 概览 → ③ 趋势 → ④ 可选话题/受众。
-- 循环上下文每轮注入**简短状态**：已调用工具清单 + 剩余证据缺口（已在
-  `AgentLoopContext`/user payload 结构上扩展，降低模型遗漏字段概率）。
+- 循环上下文每轮注入**简短状态**（本 spec 新增工作）：已调用工具清单 +
+  剩余证据缺口（扩展 `AgentLoopContext`/user payload，降低模型遗漏字段概率）。
 
 ### 4. 相对时间锚点修复（用户要求单列）
 
@@ -74,8 +84,11 @@
   （`goals/planner.py`）注入 `current_date`（`date.today().isoformat()`）；
   两个 prompt 各加一行：「相对时间（最近 N 天/个月）一律以 current_date 为基准折算」。
 - `param_profile_period_override`（`tasks/dependencies.py:94-111`）增加合理性校验：
-  `end > today` 或窗口终点早于 `today - 370 天` 时**拒绝覆写**（记 warning 并按无
-  覆写处理，回退代码解析的 requested_period）。
+  `end > today`（未来窗口必然错误）或 `end < today - 400 天`（约 13 个月前，
+  超出「最近」类表达的合理范围）时**拒绝覆写**（记 warning 并按无覆写处理，回退
+  代码解析的 requested_period）。采用「拒绝」而非 loop 内的「钳制」语义：覆写来源
+  是模型生成的画像，错误的绝对窗口应整体弃用而非截成更隐蔽的错误；400 天阈值
+  保住活动复盘（如去年双 11）等合法旧窗口。
 
 ### 不做的事（YAGNI）
 
