@@ -2,10 +2,10 @@ import { X } from 'lucide-react';
 import { useEffect, useState } from 'react';
 
 import type { ApiQuickKolDetail } from '../api/contracts';
+import { quickPlatformLabel } from '../api/platforms';
 import { getKolDetail, quickErrorMessage } from '../api/quick';
 import { useLoadingMessage } from '../hooks/useLoadingMessage';
 import type { QuickKolSelection } from '../types';
-import { quickPlatformLabel } from './KolRecommendPanel';
 
 interface KolDetailViewProps {
   selection: QuickKolSelection;

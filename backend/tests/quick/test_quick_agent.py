@@ -9,7 +9,7 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.mcp_gateway.contracts import DataTapService
-from app.model.contracts import StructuredResult
+from app.model.contracts import ModelAdapterError, StructuredResult
 from app.orchestration.schemas import PlannerTool
 from app.quick.agent import (
     QUICK_AGENT_MAX_ROUNDS,
@@ -84,6 +84,8 @@ class _ScriptedModel:
     async def complete_json(self, request: Any) -> StructuredResult[Any]:
         self.requests.append(request)
         payload = self.script.pop(0) if self.script else {"action": "finish", "result": []}
+        if isinstance(payload, Exception):
+            raise payload
         if callable(payload):
             payload = payload(request)
         return StructuredResult(
@@ -196,6 +198,173 @@ async def test_invalid_decisions_twice_raise(db_session: AsyncSession) -> None:
         await run_quick_feature(**_run_kwargs(db_session, model, call))
 
     assert call.calls == []
+
+
+@pytest.mark.asyncio
+async def test_request_envelope_unwrapped_before_call(db_session: AsyncSession) -> None:
+    # 模型把平铺参数包成 {"request": {...}} 信封：schema 无 request 属性时本地解包。
+    model = _ScriptedModel(
+        [_call_payload({"request": dict(_VALID_ARGS)}), {"action": "finish", "result": POST_ROWS}]
+    )
+    call = _ScriptedCall({"datatap.insight.query.raw.posts.v1": {"帖子列表": POST_ROWS}})
+
+    result = await run_quick_feature(**_run_kwargs(db_session, model, call))
+
+    assert result == POST_ROWS
+    [(tool_name, arguments)] = call.calls
+    assert tool_name == "datatap.insight.query.raw.posts.v1"
+    assert "request" not in arguments
+    assert arguments["datasource"] == ["短视频__抖音"]
+
+
+@pytest.mark.asyncio
+async def test_request_envelope_skipped_when_tool_not_allowed(db_session: AsyncSession) -> None:
+    # 工具名不在白名单时跳过解包，直接走 TOOL_NOT_ALLOWED（上限 2 终止，回归）。
+    payload = {
+        "action": "call_tool",
+        "internal_tool_name": "datatap.not.allowed.v1",
+        "arguments": {"request": dict(_VALID_ARGS)},
+    }
+    model = _ScriptedModel([payload, dict(payload)])
+    call = _ScriptedCall()
+
+    with pytest.raises(QuickCallFailedError, match="invalid_decision"):
+        await run_quick_feature(**_run_kwargs(db_session, model, call))
+
+    assert len(model.requests) == 2
+    assert call.calls == []
+
+
+@pytest.mark.asyncio
+async def test_request_envelope_kept_when_schema_declares_request(
+    db_session: AsyncSession,
+) -> None:
+    # schema 顶层声明 request 属性的工具（如 kol.search）：信封是合法结构，不解包。
+    search_args = {"request": {"page": 1, "size": 10, "textContentWord": "美食"}}
+    model = _ScriptedModel(
+        [
+            {
+                "action": "call_tool",
+                "internal_tool_name": "datatap.xiaohongshu.kol.search.v1",
+                "arguments": search_args,
+            },
+            {"action": "finish", "result": POST_ROWS},
+        ]
+    )
+    call = _ScriptedCall({"datatap.xiaohongshu.kol.search.v1": {"达人列表": POST_ROWS}})
+
+    result = await run_quick_feature(**_run_kwargs(db_session, model, call))
+
+    assert result == POST_ROWS
+    [(tool_name, arguments)] = call.calls
+    assert tool_name == "datatap.xiaohongshu.kol.search.v1"
+    assert arguments == search_args
+
+
+_INVALID_ENVELOPE = {"request": {"target_type": "keyword"}}
+
+
+@pytest.mark.asyncio
+async def test_invalid_arguments_feedback_details_and_envelope_hint(
+    db_session: AsyncSession,
+) -> None:
+    # 信封内层缺 required 字段：回喂含具体缺失字段与禁止信封提示，继续循环后恢复。
+    model = _ScriptedModel(
+        [
+            _call_payload(dict(_INVALID_ENVELOPE)),
+            _call_payload(dict(_INVALID_ENVELOPE)),
+            _call_payload(_VALID_ARGS),
+            {"action": "finish", "result": POST_ROWS},
+        ]
+    )
+    call = _ScriptedCall({"datatap.insight.query.raw.posts.v1": {"帖子列表": POST_ROWS}})
+
+    result = await run_quick_feature(**_run_kwargs(db_session, model, call))
+
+    assert result == POST_ROWS
+    # 前两次 INVALID_TOOL_ARGUMENTS 不终止（上限 3），第三次修正后正常执行。
+    assert len(call.calls) == 1
+    feedback = json.loads(model.requests[1].messages[-1].content)["evidence"][0]
+    assert feedback["status"] == "failed"
+    assert "datasource" in feedback["summary"]
+    assert "禁止包 request 信封" in feedback["summary"]
+
+
+@pytest.mark.asyncio
+async def test_invalid_arguments_third_streak_raises(db_session: AsyncSession) -> None:
+    model = _ScriptedModel([_call_payload(dict(_INVALID_ENVELOPE))] * 3)
+    call = _ScriptedCall()
+
+    with pytest.raises(QuickCallFailedError, match="invalid_decision"):
+        await run_quick_feature(**_run_kwargs(db_session, model, call))
+
+    assert len(model.requests) == 3
+    assert call.calls == []
+
+
+@pytest.mark.asyncio
+async def test_mixed_streak_limit_follows_current_code(db_session: AsyncSession) -> None:
+    # 混合 streak 按本次错误码取上限：INVALID(1) 后 TOOL_NOT_ALLOWED(2，上限 2) 即终止。
+    model = _ScriptedModel(
+        [
+            _call_payload(dict(_INVALID_ENVELOPE)),
+            {
+                "action": "call_tool",
+                "internal_tool_name": "datatap.not.allowed.v1",
+                "arguments": {},
+            },
+        ]
+    )
+    call = _ScriptedCall()
+
+    with pytest.raises(QuickCallFailedError, match="invalid_decision"):
+        await run_quick_feature(**_run_kwargs(db_session, model, call))
+
+    assert len(model.requests) == 2
+    assert call.calls == []
+
+
+@pytest.mark.asyncio
+async def test_model_timeout_retried_once_then_succeeds(db_session: AsyncSession) -> None:
+    model = _ScriptedModel(
+        [
+            ModelAdapterError("MODEL_TIMEOUT", retryable=False),
+            {"action": "finish", "result": POST_ROWS},
+        ]
+    )
+    call = _ScriptedCall()
+
+    result = await run_quick_feature(**_run_kwargs(db_session, model, call))
+
+    assert result == POST_ROWS
+    assert len(model.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_model_timeout_twice_raises(db_session: AsyncSession) -> None:
+    model = _ScriptedModel(
+        [
+            ModelAdapterError("MODEL_TIMEOUT", retryable=False),
+            ModelAdapterError("MODEL_TIMEOUT", retryable=False),
+        ]
+    )
+    call = _ScriptedCall()
+
+    with pytest.raises(ModelAdapterError, match="MODEL_TIMEOUT"):
+        await run_quick_feature(**_run_kwargs(db_session, model, call))
+
+    assert len(model.requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_other_model_error_not_retried(db_session: AsyncSession) -> None:
+    model = _ScriptedModel([ModelAdapterError("MODEL_RATE_LIMITED", retryable=False)])
+    call = _ScriptedCall()
+
+    with pytest.raises(ModelAdapterError, match="MODEL_RATE_LIMITED"):
+        await run_quick_feature(**_run_kwargs(db_session, model, call))
+
+    assert len(model.requests) == 1
 
 
 @pytest.mark.asyncio

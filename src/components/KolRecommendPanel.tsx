@@ -3,6 +3,12 @@ import { useEffect, useRef, useState } from 'react';
 
 import type { ApiFavorite, ApiQuickKolItem } from '../api/contracts';
 import { createFavoriteByKey, deleteFavoriteByKey } from '../api/favorites';
+import {
+  QUICK_PLATFORMS,
+  QUICK_PLATFORM_LABELS,
+  quickPlatformLabel,
+  type QuickPlatform,
+} from '../api/platforms';
 import { useLoadingMessage } from '../hooks/useLoadingMessage';
 import { useQuickFeatureCache, type QuickKolRecommendCacheEntry } from '../state/QuickFeatureCache';
 import type { QuickKolSelection } from '../types';
@@ -22,6 +28,9 @@ const DEBOUNCE_MS = 800;
 const DEFAULT_CACHE_ENTRY: QuickKolRecommendCacheEntry = {
   budget: 50_000,
   queriedBudget: null,
+  // 平台多选默认全选（有意为之：与后端缺省「用户启用渠道 ∩ 五平台」不同，以多选 UI 为准）
+  platforms: [...QUICK_PLATFORMS],
+  queriedPlatforms: null,
   items: [],
   pointsCost: null,
   hasQueried: false,
@@ -37,10 +46,6 @@ function formatCount(value: number | null): string {
   return value.toLocaleString('zh-CN');
 }
 
-export function quickPlatformLabel(platform: string): string {
-  return ({ xiaohongshu: '小红书', douyin: '抖音' } as Record<string, string>)[platform] ?? platform;
-}
-
 function platformBadgeClass(platform: string): string {
   if (platform === 'xiaohongshu') return 'bg-rose-50 text-rose-600 border border-rose-200/40';
   if (platform === 'douyin') return 'bg-slate-900 text-white border border-slate-900';
@@ -48,11 +53,11 @@ function platformBadgeClass(platform: string): string {
 }
 
 export default function KolRecommendPanel({ onSelectKol, favorites = [], onFavoriteToggled }: KolRecommendPanelProps) {
-  // 预算、查询结果与 loading 全部来自快捷功能缓存，切换 Tab 回来可直接恢复；
+  // 预算、平台选择、查询结果与 loading 全部来自快捷功能缓存，切换 Tab 回来可直接恢复；
   // 收藏 busy 是瞬态，留在面板本地。
   const { kolRecommend, setKolRecommend, queryKolRecommendations } = useQuickFeatureCache();
   const entry = kolRecommend ?? DEFAULT_CACHE_ENTRY;
-  const { budget, queriedBudget, items, pointsCost, hasQueried, error } = entry;
+  const { budget, queriedBudget, platforms, queriedPlatforms, items, pointsCost, hasQueried, error } = entry;
   // loading 存在缓存里：查询中切 Tab 再切回仍能恢复加载态，并阻止 in-flight 重复请求
   const loading = entry.loading ?? false;
   const [favoriteBusyKey, setFavoriteBusyKey] = useState<string | null>(null);
@@ -68,11 +73,20 @@ export default function KolRecommendPanel({ onSelectKol, favorites = [], onFavor
   };
 
   const handleQuery = () => {
-    // in-flight 期间不重复触发
-    if (loading) return;
+    // in-flight 期间或全不选时不重复触发
+    if (loading || platforms.length === 0) return;
     // 打开 tab 不自动查询：首次查询由「查询/刷新」按钮触发，之后拖动预算条继续防抖刷新
     updateEntry({ hasQueried: true });
     setQueryNonce(nonce => nonce + 1);
+  };
+
+  // 平台 chips 多选（交互复用 brainstorm multi chips：toggle + aria-pressed + 高亮）；
+  // 始终保持五平台常量顺序，避免切换顺序影响触发键比较。
+  const togglePlatform = (platform: QuickPlatform) => {
+    const next = platforms.includes(platform)
+      ? platforms.filter(item => item !== platform)
+      : [...platforms, platform];
+    updateEntry({ platforms: QUICK_PLATFORMS.filter(item => next.includes(item)) });
   };
 
   const isFavorited = (item: ApiQuickKolItem) =>
@@ -111,23 +125,41 @@ export default function KolRecommendPanel({ onSelectKol, favorites = [], onFavor
     }
   };
 
-  // 预算滑动条 800ms 防抖刷新。是否需要查询以缓存 entry 为基准：
-  // budget !== queriedBudget 说明当前预算尚未查询过（典型：防抖期内切 Tab，
-  // 防抖 timer 随卸载被清理，查询丢失），重挂载后据此补查一次；
-  // queryNonce 变化代表手动「查询/刷新」。ref 只在同次挂载内对 nonce 去重，
-  // 过期响应由 Provider 内的请求序号抑制。in-flight（loading）期间不再发起新查询，
-  // loading 结束（缓存回写）后 effect 重跑，按预算差异补查。
+  // 预算滑动条/平台 chips 800ms 防抖刷新。是否需要查询以缓存 entry 为基准：
+  // budget !== queriedBudget 或平台组合（排序后）与 queriedPlatforms 不一致，
+  // 说明当前预算/平台选择尚未查询过（典型：防抖期内切 Tab，防抖 timer 随卸载
+  // 被清理，查询丢失），重挂载后据此补查一次；queryNonce 变化代表手动「查询/刷新」。
+  // ref 只在同次挂载内对 nonce 去重，过期响应由 Provider 内的请求序号抑制。
+  // in-flight（loading）期间不再发起新查询，loading 结束（缓存回写）后 effect
+  // 重跑，按预算/平台差异补查。平台全不选时不查询。
   const lastHandledNonce = useRef(queryNonce);
+  const platformsKey = [...platforms].sort().join();
+  const queriedPlatformsKey = [...(queriedPlatforms ?? [])].sort().join();
   useEffect(() => {
     if (!hasQueried) return;
     if (loading) return;
-    if (budget === queriedBudget && lastHandledNonce.current === queryNonce) return;
+    if (platforms.length === 0) return;
+    if (
+      budget === queriedBudget &&
+      platformsKey === queriedPlatformsKey &&
+      lastHandledNonce.current === queryNonce
+    ) return;
     lastHandledNonce.current = queryNonce;
     const timer = window.setTimeout(() => {
-      void queryKolRecommendations(budget);
+      void queryKolRecommendations(budget, platforms);
     }, DEBOUNCE_MS);
     return () => window.clearTimeout(timer);
-  }, [budget, queriedBudget, queryNonce, hasQueried, loading, queryKolRecommendations]);
+  }, [
+    budget,
+    queriedBudget,
+    platforms,
+    platformsKey,
+    queriedPlatformsKey,
+    queryNonce,
+    hasQueried,
+    loading,
+    queryKolRecommendations,
+  ]);
 
   return (
     <div className="flex min-h-0 flex-1 flex-col bg-slate-50">
@@ -136,12 +168,35 @@ export default function KolRecommendPanel({ onSelectKol, favorites = [], onFavor
         <button
           type="button"
           onClick={handleQuery}
-          disabled={loading}
+          disabled={loading || platforms.length === 0}
           className="flex items-center gap-1 rounded-lg px-2 py-1 text-[11px] font-bold text-indigo-600 transition hover:bg-indigo-50 active:scale-95 disabled:opacity-50"
         >
           <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />
           查询/刷新
         </button>
+      </div>
+
+      <div className="shrink-0 border-b border-slate-100 bg-white px-4 py-3">
+        <div className="text-[11px] font-bold text-slate-500">平台</div>
+        <div className="mt-1.5 flex flex-wrap gap-1.5" aria-label="选择平台">
+          {QUICK_PLATFORMS.map(platform => {
+            const selected = platforms.includes(platform);
+            return (
+              <button
+                key={platform}
+                type="button"
+                aria-pressed={selected}
+                onClick={() => togglePlatform(platform)}
+                className={`rounded-lg border px-2.5 py-1 text-[10px] font-semibold transition active:scale-95 ${selected
+                  ? 'border-indigo-400 bg-indigo-100 text-indigo-700'
+                  : 'border-indigo-100 bg-white text-slate-400 hover:border-indigo-300 hover:bg-indigo-50'
+                }`}
+              >
+                {QUICK_PLATFORM_LABELS[platform]}
+              </button>
+            );
+          })}
+        </div>
       </div>
 
       <div className="shrink-0 border-b border-slate-100 bg-white px-4 py-3">
