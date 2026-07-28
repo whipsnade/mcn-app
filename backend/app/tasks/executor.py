@@ -17,6 +17,7 @@ from app.orchestration.loop import (
     AgentTrajectory,
     EvidenceNote,
     TrajectoryStep,
+    build_loop_state,
     resolve_agent_call,
     restore_agent_trajectory,
 )
@@ -743,9 +744,16 @@ class TaskExecutor:
                 else None
             )
             if pending is None:
+                # 循环状态注入：按当前 goal 已 settled 的轨迹重算 called_tools
+                # 与 evidence_gaps，随 model_dump 进入 agent_loop user JSON。
+                called_tools, evidence_gaps = build_loop_state(
+                    context.goal_type, trajectory.results
+                )
                 round_context = context.model_copy(
                     update={
                         "notes": (*trajectory.results, *feedback),
+                        "called_tools": called_tools,
+                        "evidence_gaps": evidence_gaps,
                         "log_context": {**context.log_context, "task_id": task.id},
                     }
                 )
