@@ -16,7 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.mcp_gateway.transport import JsonValue
-from app.model.contracts import ChatMessage, ModelAdapter, StructuredModelRequest
+from app.model.contracts import ChatMessage, ModelAdapter, ModelAdapterError, StructuredModelRequest
 from app.model.exemplars import find_success_exemplars
 from app.model.prompts import QUICK_AGENT_PROMPT
 from app.orchestration.loop import (
@@ -32,9 +32,12 @@ from app.model.persona import describe_user_persona
 
 
 # 小循环护栏：最多 8 轮工具调用决策，第 9 轮起强制 finish；连续 2 次无效
-# 决策（白名单/Schema 校验失败或 finish 结果不合契约）直接报错。
+# 决策（白名单/Schema 校验失败或 finish 结果不合契约）直接报错；
+# INVALID_TOOL_ARGUMENTS（参数不合 schema）放宽到连续 3 次才终止，给模型
+# 2 次修正机会（真实事故：模型包 request 信封被剔除后连续缺字段）。
 QUICK_AGENT_MAX_ROUNDS = 8
 QUICK_AGENT_MAX_INVALID_STREAK = 2
+QUICK_AGENT_MAX_INVALID_ARGUMENTS_STREAK = 3
 
 MATCH_BEST_TAG_TOOL = "datatap.insight.match.best.tag.v1"
 RAW_POSTS_TOOL = "datatap.insight.query.raw.posts.v1"
@@ -207,6 +210,50 @@ def _user_content(
     )
 
 
+def _unwrap_request_envelope(
+    internal_tool_name: str | None,
+    arguments: dict[str, Any],
+    context: AgentLoopContext,
+) -> dict[str, Any]:
+    """兼容模型把平铺参数包成 {"request": {...}} 信封的习惯。
+
+    仅当 arguments 只有一个 request 键、其值是 dict、且目标工具 schema 不含
+    request 属性时解包为内层 dict；工具名未知时不解包（走既有
+    TOOL_NOT_ALLOWED 分支）；解包后仍不合法按 INVALID_TOOL_ARGUMENTS 回喂。
+    """
+    if set(arguments) != {"request"} or not isinstance(arguments.get("request"), dict):
+        return arguments
+    tools_by_name = {tool.internal_name: tool for tool in context.tools}
+    target = tools_by_name.get(internal_tool_name or "")
+    if target is None:
+        return arguments
+    properties = target.input_schema.get("properties")
+    if isinstance(properties, dict) and "request" in properties:
+        return arguments
+    return dict(arguments["request"])
+
+
+def _invalid_arguments_detail(error: PlanValidationError | ValidationError) -> str | None:
+    """从 INVALID_TOOL_ARGUMENTS 的 cause 链提取具体缺失/多余字段（截断 300 字符）。
+
+    cause 通常是 McpValidationError（diagnostic 带 validator/schema_path，
+    其 __cause__ 的 jsonschema 错误消息含具体字段名）；pydantic
+    ValidationError 没有 cause，返回 None 由调用方回退通用提示。
+    """
+    cause = error.__cause__
+    if cause is None:
+        return None
+    parts: list[str] = []
+    # 最具体的排最前：jsonschema 错误消息含具体字段名（如缺哪个 required）。
+    if cause.__cause__ is not None:
+        parts.append(str(cause.__cause__))
+    parts.append(str(cause))
+    diagnostic = getattr(cause, "diagnostic", None)
+    if isinstance(diagnostic, dict):
+        parts.append(json.dumps(diagnostic, ensure_ascii=False, sort_keys=True, default=str))
+    return "；".join(parts)[:300]
+
+
 async def run_quick_feature(
     *,
     db: AsyncSession,
@@ -248,31 +295,37 @@ async def run_quick_feature(
     for round_index in range(QUICK_AGENT_MAX_ROUNDS + 1):
         # 超出 8 轮：把现有证据交给模型，要求立即 finish。
         force_finish = round_index >= QUICK_AGENT_MAX_ROUNDS
-        result = await model.complete_json(
-            StructuredModelRequest(
-                purpose="quick_feature",
-                template_name=QUICK_AGENT_PROMPT.name,
-                messages=(
-                    ChatMessage(role="system", content=system_prompt or QUICK_AGENT_PROMPT.system),
-                    ChatMessage(
-                        role="user",
-                        content=_user_content(
-                            feature=feature,
-                            goal=goal,
-                            scenario=scenario,
-                            industries=industries,
-                            tools=tools,
-                            notes=notes,
-                            exemplars=exemplars,
-                            force_finish=force_finish,
-                        ),
+        request = StructuredModelRequest(
+            purpose="quick_feature",
+            template_name=QUICK_AGENT_PROMPT.name,
+            messages=(
+                ChatMessage(role="system", content=system_prompt or QUICK_AGENT_PROMPT.system),
+                ChatMessage(
+                    role="user",
+                    content=_user_content(
+                        feature=feature,
+                        goal=goal,
+                        scenario=scenario,
+                        industries=industries,
+                        tools=tools,
+                        notes=notes,
+                        exemplars=exemplars,
+                        force_finish=force_finish,
                     ),
                 ),
-                output_model=QuickDecision,
-                max_tokens=4096,
-                log_context=log_context,
-            )
+            ),
+            output_model=QuickDecision,
+            max_tokens=4096,
+            log_context=log_context,
         )
+        try:
+            result = await model.complete_json(request)
+        except ModelAdapterError as error:
+            if error.code != "MODEL_TIMEOUT":
+                raise
+            # MODEL_TIMEOUT 标记 retryable=False（adapter 不做内部重试），
+            # 这里按 code 特判补一次重试；仍失败按现状上抛。
+            result = await model.complete_json(request)
         decision = result.value
         if decision.action == "finish":
             try:
@@ -300,23 +353,44 @@ async def run_quick_feature(
             agent_decision = AgentDecision(
                 action="call_tool",
                 internal_tool_name=decision.internal_tool_name,
-                arguments=decision.arguments,
+                arguments=_unwrap_request_envelope(
+                    decision.internal_tool_name, decision.arguments, context
+                ),
             )
             tool, arguments = resolve_agent_call(agent_decision, context)
         except (PlanValidationError, ValidationError) as error:
             invalid_streak += 1
-            if invalid_streak >= QUICK_AGENT_MAX_INVALID_STREAK:
-                raise QuickCallFailedError("invalid_decision") from error
             code = error.code if isinstance(error, PlanValidationError) else "INVALID_TOOL_ARGUMENTS"
+            # 上限按本次失败的 code 判定：参数不合 schema 给模型 2 次修正机会
+            # （第 3 次仍错才终止），其余码维持上限 2；混合 streak 按当前码取上限。
+            limit = (
+                QUICK_AGENT_MAX_INVALID_ARGUMENTS_STREAK
+                if code == "INVALID_TOOL_ARGUMENTS"
+                else QUICK_AGENT_MAX_INVALID_STREAK
+            )
+            if invalid_streak >= limit:
+                raise QuickCallFailedError("invalid_decision") from error
+            summary = (
+                f"上一次决策未通过校验（{code}），"
+                "请在 tools 列表内选择工具并按其 input_schema 填写参数。"
+            )
+            if code == "INVALID_TOOL_ARGUMENTS":
+                detail = _invalid_arguments_detail(error)
+                hint = (
+                    "arguments 必须是该工具 schema 的平铺顶层字段，禁止包 request 信封；"
+                    "请按 input_schema 逐字段填写。"
+                )
+                summary = (
+                    f"上一次决策未通过校验（{code}）：{detail}。{hint}"
+                    if detail
+                    else f"上一次决策未通过校验（{code}）。{hint}"
+                )
             notes.append(
                 EvidenceNote(
                     step_id=f"invalid_{invalid_streak}",
                     tool=decision.internal_tool_name or "unknown",
                     status="failed",
-                    summary=(
-                        f"上一次决策未通过校验（{code}），"
-                        "请在 tools 列表内选择工具并按其 input_schema 填写参数。"
-                    ),
+                    summary=summary,
                 )
             )
             continue
