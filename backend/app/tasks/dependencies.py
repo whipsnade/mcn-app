@@ -405,9 +405,8 @@ class _TaskArtifacts:
         返回 (status_override, warning_code)：报告生成失败时降级
         completed_with_warnings 并登记 failed artifact（不删证据、任务终态不受影响）。
         warning_code 为修正耗尽等受限交付场景的外部告警码（如
-        brand_trend_data_unavailable），暂存待用，由报告构建器消费（Task 3）。
+        brand_trend_data_unavailable），透传给报告构建器注入受限声明。
         """
-        _ = warning_code  # 透传占位：Task 3 报告构建器消费，本 Task 只完成接线。
         artifact_type, builder, event_label, fallback_title = _ANALYSIS_GOAL_TABLE[goal.goal_type]
         artifact_key = f"goal:{goal.id}:{artifact_type}"
         build_error: Exception | None = None
@@ -437,6 +436,7 @@ class _TaskArtifacts:
                         task=task,
                         goal=goal,
                         thinking_sink=thinking_sink,
+                        warning_code=warning_code,
                     )
                 finally:
                     await self._persist_thinking(

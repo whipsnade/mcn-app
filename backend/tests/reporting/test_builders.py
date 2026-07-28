@@ -236,6 +236,58 @@ async def test_run_brand_analysis_rejects_empty_evidence(db_session, user_factor
     assert model.requests == []
 
 
+def _user_content(request) -> dict:
+    import json
+
+    user_messages = [m for m in request.messages if m.role == "user"]
+    assert len(user_messages) == 1
+    return json.loads(user_messages[0].content)
+
+
+@pytest.mark.asyncio
+async def test_run_brand_analysis_injects_limitation_note(db_session, user_factory) -> None:
+    user_id, session_id = await _create_session(db_session, user_factory)
+    model = FakeModel(_document())
+
+    await run_brand_analysis(
+        db_session,
+        model,
+        user_id=user_id,
+        session_id=session_id,
+        task=_task(_plan_json(_note("tool.a", {"volume": 100}))),
+        goal=_goal({"brand": "海底捞"}),
+        warning_code="brand_trend_data_unavailable",
+    )
+
+    [request] = model.requests
+    content = _user_content(request)
+    assert content["limitation"] == "趋势数据未成功获取"
+    system_text = next(m.content for m in request.messages if m.role == "system")
+    assert "趋势数据未成功获取" in system_text or "limitation" in system_text
+    assert "不输出跨期趋势结论" in system_text
+    assert "环比" in system_text
+
+
+@pytest.mark.asyncio
+async def test_run_brand_analysis_without_warning_omits_limitation(
+    db_session, user_factory
+) -> None:
+    user_id, session_id = await _create_session(db_session, user_factory)
+    model = FakeModel(_document())
+
+    await run_brand_analysis(
+        db_session,
+        model,
+        user_id=user_id,
+        session_id=session_id,
+        task=_task(_plan_json(_note("tool.a", {"volume": 100}))),
+        goal=_goal({"brand": "海底捞"}),
+    )
+
+    [request] = model.requests
+    assert "limitation" not in _user_content(request)
+
+
 @pytest.mark.asyncio
 async def test_run_campaign_analysis_rejects_empty_evidence(db_session, user_factory) -> None:
     user_id, session_id = await _create_session(db_session, user_factory)

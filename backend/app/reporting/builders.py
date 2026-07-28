@@ -60,6 +60,10 @@ def _goal_scope(params: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]
     return scope or None
 
 
+# warning_code → 报告受限声明（注入模型输入 limitation 键）。
+_LIMITATION_NOTES = {"brand_trend_data_unavailable": "趋势数据未成功获取"}
+
+
 async def _run_goal_analysis(
     db: AsyncSession,
     model: ModelAdapter,
@@ -73,6 +77,7 @@ async def _run_goal_analysis(
     task: Any,
     goal: Any,
     thinking_sink: ThinkingSink | None = None,
+    warning_code: str | None = None,
 ) -> AnalysisReport:
     evidence = collect_goal_evidence(getattr(task, "plan_json", None))
     if not evidence:
@@ -81,6 +86,10 @@ async def _run_goal_analysis(
     if not isinstance(params, dict):
         params = {}
     scope = _goal_scope(params, scope_keys)
+    content: dict[str, Any] = {"scope": scope, "evidence": evidence}
+    limitation = _LIMITATION_NOTES.get(warning_code) if warning_code else None
+    if limitation is not None:
+        content["limitation"] = limitation
     result = await model.complete_json(
         StructuredModelRequest(
             purpose=purpose,
@@ -90,7 +99,7 @@ async def _run_goal_analysis(
                 ChatMessage(
                     role="user",
                     content=json.dumps(
-                        {"scope": scope, "evidence": evidence},
+                        content,
                         ensure_ascii=False,
                         sort_keys=True,
                         separators=(",", ":"),
@@ -126,10 +135,12 @@ async def run_brand_analysis(
     task: Any,
     goal: Any,
     thinking_sink: ThinkingSink | None = None,
+    warning_code: str | None = None,
 ) -> AnalysisReport:
     """品牌分析报告：证据聚合 → brand_analysis_v1 → 落库 report_type=brand_analysis。
 
     证据为空抛 ``LookupError("no_evidence_collected")``（由 finalize 映射降级终态）。
+    warning_code 命中受限映射时向模型输入注入 limitation 声明。
     """
     return await _run_goal_analysis(
         db,
@@ -143,6 +154,7 @@ async def run_brand_analysis(
         task=task,
         goal=goal,
         thinking_sink=thinking_sink,
+        warning_code=warning_code,
     )
 
 
@@ -155,6 +167,7 @@ async def run_campaign_analysis(
     task: Any,
     goal: Any,
     thinking_sink: ThinkingSink | None = None,
+    warning_code: str | None = None,
 ) -> AnalysisReport:
     """活动复盘报告：证据聚合 → campaign_analysis_v1 → 落库 report_type=campaign_analysis。"""
     return await _run_goal_analysis(
@@ -169,4 +182,5 @@ async def run_campaign_analysis(
         task=task,
         goal=goal,
         thinking_sink=thinking_sink,
+        warning_code=warning_code,
     )
