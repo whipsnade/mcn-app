@@ -18,6 +18,7 @@ import TopPostsPanel from './components/TopPostsPanel';
 import UniversalReport from './components/UniversalReport';
 import { QUICK_TAB_IDS, WorkspaceTabs, type WorkspaceTab } from './components/WorkspaceTabs';
 import { useWorkspace } from './hooks/useWorkspace';
+import { QuickFeatureCacheProvider } from './state/QuickFeatureCache';
 import { isTerminalTaskStatus } from './state/taskEvents';
 import type { QuickKolSelection } from './types';
 
@@ -151,7 +152,7 @@ export default function App() {
 
         <div className={`${mobilePane === 'chat' ? 'flex' : 'hidden'} h-full min-h-0 min-w-0 flex-1 flex-col xl:flex`}>
           {workspace.activeSession || QUICK_TAB_IDS.includes(workspaceTab) ? (
-            <>
+            <QuickFeatureCacheProvider userId={user.id}>
               <WorkspaceTabs
                 active={workspaceTab}
                 onChange={setWorkspaceTab}
@@ -204,7 +205,7 @@ export default function App() {
                   onRefresh={refreshFavorites}
                 />
               )}
-            </>
+            </QuickFeatureCacheProvider>
           ) : (
             <div className="flex flex-1 items-center justify-center bg-slate-50">
               <div className="text-center">
