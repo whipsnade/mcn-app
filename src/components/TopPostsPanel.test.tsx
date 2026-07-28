@@ -1,8 +1,14 @@
 import { fireEvent, render, screen } from '@testing-library/react';
+import { useEffect } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { ApiQuickTopPosts } from '../api/contracts';
+import type { ApiQuickPlatform, ApiQuickTopPosts } from '../api/contracts';
 import { getTopPosts } from '../api/quick';
+import {
+  QuickFeatureCacheProvider,
+  useQuickFeatureCache,
+  type QuickTopPostsCacheEntry,
+} from '../state/QuickFeatureCache';
 import TopPostsPanel from './TopPostsPanel';
 
 vi.mock('../api/quick', () => ({
@@ -41,6 +47,43 @@ const RESULT: ApiQuickTopPosts = {
   points_cost: 10,
 };
 
+function renderPanel(platform: ApiQuickPlatform) {
+  return render(
+    <QuickFeatureCacheProvider userId="test-user">
+      <TopPostsPanel platform={platform} />
+    </QuickFeatureCacheProvider>,
+  );
+}
+
+// 在挂载面板前向缓存写入指定平台的爆贴结果，模拟「上次查询过」的状态。
+function SeedTopPosts({ platform, entry }: { platform: ApiQuickPlatform; entry: QuickTopPostsCacheEntry }) {
+  const { setTopPosts } = useQuickFeatureCache();
+  useEffect(() => {
+    setTopPosts(platform, entry);
+  }, [setTopPosts, platform, entry]);
+  return null;
+}
+
+const DOUYIN_ENTRY: QuickTopPostsCacheEntry = {
+  items: [
+    {
+      title: '抖音爆款第一条',
+      nickname: '抖音达人',
+      interact: 88_000,
+      like: 60_000,
+      comment: 5_000,
+      collect: 2_000,
+      publish_time: '2026-07-02T10:00:00Z',
+      url: 'https://example.com/douyin-1',
+      platform: 'douyin',
+    },
+  ],
+  fallbackKols: [],
+  degraded: false,
+  pointsCost: 30,
+  hasQueried: true,
+};
+
 describe('TopPostsPanel', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -48,7 +91,7 @@ describe('TopPostsPanel', () => {
   });
 
   it('does not fetch on mount; fetches after clicking the query button', async () => {
-    render(<TopPostsPanel platform="xiaohongshu" />);
+    renderPanel('xiaohongshu');
 
     expect(screen.getByText(/点击右上角「查询\/刷新」/)).toBeTruthy();
     expect(mockGetTopPosts).not.toHaveBeenCalled();
@@ -72,7 +115,7 @@ describe('TopPostsPanel', () => {
   });
 
   it('shows the douyin title for the douyin platform', async () => {
-    render(<TopPostsPanel platform="douyin" />);
+    renderPanel('douyin');
 
     expect(screen.getByText('抖音前十爆贴')).toBeTruthy();
     fireEvent.click(screen.getByRole('button', { name: /查询\/刷新/ }));
@@ -82,7 +125,7 @@ describe('TopPostsPanel', () => {
 
   it('shows the insufficient-points hint on 409', async () => {
     mockGetTopPosts.mockRejectedValue(new Error('INSUFFICIENT_POINTS'));
-    render(<TopPostsPanel platform="xiaohongshu" />);
+    renderPanel('xiaohongshu');
 
     fireEvent.click(screen.getByRole('button', { name: /查询\/刷新/ }));
 
@@ -108,7 +151,7 @@ describe('TopPostsPanel', () => {
         },
       ],
     });
-    render(<TopPostsPanel platform="xiaohongshu" />);
+    renderPanel('xiaohongshu');
 
     fireEvent.click(screen.getByRole('button', { name: /查询\/刷新/ }));
 
@@ -116,5 +159,60 @@ describe('TopPostsPanel', () => {
     expect(screen.getByText('美食小达人')).toBeTruthy();
     expect(screen.getByText('12.0万')).toBeTruthy();
     expect(screen.getByText('¥8,000')).toBeTruthy();
+  });
+
+  it('restores the cached douyin result on remount without fetching again', async () => {
+    // 只卸载面板、保留 Provider，模拟切换 Tab 后再切回来。
+    function Harness({ showPanel }: { showPanel: boolean }) {
+      return (
+        <QuickFeatureCacheProvider userId="test-user">
+          {showPanel ? <TopPostsPanel platform="douyin" /> : null}
+        </QuickFeatureCacheProvider>
+      );
+    }
+    const view = render(<Harness showPanel />);
+
+    fireEvent.click(screen.getByRole('button', { name: /查询\/刷新/ }));
+    expect(await screen.findByText('年度必吃榜第一名')).toBeTruthy();
+    expect(mockGetTopPosts).toHaveBeenCalledTimes(1);
+
+    view.rerender(<Harness showPanel={false} />);
+    expect(screen.queryByText('年度必吃榜第一名')).toBeNull();
+    view.rerender(<Harness showPanel />);
+
+    // 缓存仍在：标题、积分与列表直接恢复，不再次请求
+    expect(screen.getByText('抖音前十爆贴')).toBeTruthy();
+    expect(screen.getByText(/消耗 10 积分/)).toBeTruthy();
+    expect(screen.getByText('年度必吃榜第一名')).toBeTruthy();
+    expect(mockGetTopPosts).toHaveBeenCalledTimes(1);
+  });
+
+  it('renders a cached result injected into the cache without calling the API', () => {
+    render(
+      <QuickFeatureCacheProvider userId="test-user">
+        <SeedTopPosts platform="douyin" entry={DOUYIN_ENTRY} />
+        <TopPostsPanel platform="douyin" />
+      </QuickFeatureCacheProvider>,
+    );
+
+    expect(screen.getByText('抖音前十爆贴')).toBeTruthy();
+    expect(screen.getByText(/消耗 30 积分/)).toBeTruthy();
+    expect(screen.getByText('抖音爆款第一条')).toBeTruthy();
+    expect(screen.getByText('抖音达人')).toBeTruthy();
+    expect(mockGetTopPosts).not.toHaveBeenCalled();
+  });
+
+  it('keeps xiaohongshu and douyin cache entries isolated', () => {
+    render(
+      <QuickFeatureCacheProvider userId="test-user">
+        <SeedTopPosts platform="douyin" entry={DOUYIN_ENTRY} />
+        <TopPostsPanel platform="xiaohongshu" />
+      </QuickFeatureCacheProvider>,
+    );
+
+    // 小红书面板读不到抖音缓存：仍处于未查询状态，也不展示抖音条目
+    expect(screen.getByText(/点击右上角「查询\/刷新」/)).toBeTruthy();
+    expect(screen.queryByText('抖音爆款第一条')).toBeNull();
+    expect(mockGetTopPosts).not.toHaveBeenCalled();
   });
 });
