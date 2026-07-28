@@ -1,5 +1,4 @@
 import { RefreshCw, TriangleAlert } from 'lucide-react';
-import { useState } from 'react';
 
 import type { ApiQuickPlatform } from '../api/contracts';
 import { useLoadingMessage } from '../hooks/useLoadingMessage';
@@ -34,8 +33,8 @@ export default function TopPostsPanel({ platform }: TopPostsPanelProps) {
   const error = entry?.error;
   // 打开 tab 不自动查询：由「查询/刷新」按钮触发
   const hasQueried = entry?.hasQueried ?? false;
-  // loading 是瞬态，不进缓存
-  const [loading, setLoading] = useState(false);
+  // loading 存在缓存里：查询中切 Tab 再切回仍能恢复加载态，并阻止 in-flight 重复请求
+  const loading = entry?.loading ?? false;
   const loadingMessage = useLoadingMessage(loading, [
     [0, '正在加载爆贴榜单…'],
     [8000, '数据服务响应较慢，请稍候…'],
@@ -43,8 +42,8 @@ export default function TopPostsPanel({ platform }: TopPostsPanelProps) {
   ]);
 
   const handleQuery = () => {
-    setLoading(true);
-    void queryTopPosts(platform).finally(() => setLoading(false));
+    if (loading) return;
+    void queryTopPosts(platform);
   };
 
   const title = platform === 'xiaohongshu' ? '小红书前十爆贴' : '抖音前十爆贴';
@@ -69,14 +68,14 @@ export default function TopPostsPanel({ platform }: TopPostsPanelProps) {
         </button>
       </div>
 
-      {!hasQueried ? (
+      {loading ? (
+        <div className="flex flex-1 items-center justify-center bg-slate-50 text-xs font-medium text-slate-400">
+          {loadingMessage}
+        </div>
+      ) : !hasQueried ? (
         <div className="flex flex-1 flex-col items-center justify-center gap-2 bg-slate-50 text-xs font-medium text-slate-400">
           <RefreshCw className="h-8 w-8 text-slate-300 stroke-[1.5]" />
           点击右上角「查询/刷新」获取近 7 日爆贴榜单
-        </div>
-      ) : loading ? (
-        <div className="flex flex-1 items-center justify-center bg-slate-50 text-xs font-medium text-slate-400">
-          {loadingMessage}
         </div>
       ) : error && items.length === 0 && fallbackKols.length === 0 ? (
         <div className="flex flex-1 flex-col items-center justify-center gap-2 bg-slate-50 text-xs font-medium text-slate-400">

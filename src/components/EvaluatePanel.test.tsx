@@ -212,6 +212,35 @@ describe('EvaluatePanel', () => {
     expect(mockPostEvaluate).not.toHaveBeenCalled();
   });
 
+  it('keeps the submitting state across remount and blocks duplicate submits while in flight', async () => {
+    let resolveEvaluate: (value: { title: string; analysis_markdown: string }) => void = () => undefined;
+    mockPostEvaluate.mockImplementation(
+      () => new Promise(resolve => {
+        resolveEvaluate = resolve;
+      }),
+    );
+    const view = render(renderHarness(true));
+
+    fillActivityName('火锅节活动');
+    addKolName('达人甲');
+    fireEvent.click(screen.getByRole('button', { name: '开始评估' }));
+    expect(await screen.findByText(/评估中，可能需要几分钟/)).toBeTruthy();
+
+    // 提交中切走再切回：提交中态从缓存恢复，不回到表单，也无法重复提交
+    view.rerender(renderHarness(false));
+    view.rerender(renderHarness(true));
+
+    expect(screen.getByText(/评估中，可能需要几分钟/)).toBeTruthy();
+    expect(screen.queryByRole('button', { name: '开始评估' })).toBeNull();
+    expect(mockPostEvaluate).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      resolveEvaluate({ title: '火锅活动评估', analysis_markdown: 'ok' });
+    });
+    expect(await screen.findByText('火锅活动评估')).toBeTruthy();
+    expect(mockPostEvaluate).toHaveBeenCalledTimes(1);
+  });
+
   it('keeps an in-flight evaluate result when the panel unmounts before it resolves', async () => {
     let resolveEvaluate: (value: { title: string; analysis_markdown: string }) => void = () => undefined;
     mockPostEvaluate.mockImplementation(

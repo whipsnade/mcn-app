@@ -15,13 +15,14 @@ const DEFAULT_EVALUATE_ENTRY: QuickEvaluateCacheEntry = {
 };
 
 export default function EvaluatePanel() {
-  // 表单、报告与错误全部来自快捷功能缓存，切换 Tab 回来可直接恢复；
-  // submitting 与 kolHint 是瞬态，留在面板本地。
+  // 表单、报告、错误与 submitting 全部来自快捷功能缓存，切换 Tab 回来可直接恢复；
+  // kolHint 是瞬态，留在面板本地。
   const { evaluate, setEvaluate } = useQuickFeatureCache();
   const entry = evaluate ?? DEFAULT_EVALUATE_ENTRY;
   const { activityName, kolNames, kolDraft, result, error } = entry;
   const [kolHint, setKolHint] = useState<string>();
-  const [submitting, setSubmitting] = useState(false);
+  // submitting 存在缓存里：提交中切 Tab 再切回仍能恢复提交中态，并阻止重复提交
+  const submitting = entry.submitting ?? false;
 
   const updateEntry = (patch: Partial<QuickEvaluateCacheEntry>) => {
     setEvaluate({ ...entry, ...patch });
@@ -64,13 +65,14 @@ export default function EvaluatePanel() {
   const canSubmit = activityName.trim().length > 0 && kolNames.length > 0 && !submitting;
 
   const handleSubmit = async () => {
+    // in-flight 期间禁止重复提交（缓存里的 submitting 跨卸载/重挂载仍生效）
+    if (entry.submitting) return;
     if (!canSubmit) return;
     // 快照提交参数：请求期间面板可能被卸载/重挂载，闭包里的 entry 不再可靠。
     const submittedName = activityName.trim();
     const submittedKolNames = [...kolNames];
     const submittedKolDraft = kolDraft;
-    setSubmitting(true);
-    updateEntry({ error: undefined });
+    updateEntry({ submitting: true, error: undefined });
     try {
       const evaluated = await postEvaluate({ activityName: submittedName, kolNames: submittedKolNames });
       // 结果写入缓存：即使请求期间面板被卸载，重新挂载后也能恢复报告。
@@ -80,6 +82,7 @@ export default function EvaluatePanel() {
         kolNames: submittedKolNames,
         kolDraft: submittedKolDraft,
         result: evaluated,
+        submitting: false,
       });
     } catch (err) {
       setEvaluate({
@@ -87,10 +90,9 @@ export default function EvaluatePanel() {
         kolNames: submittedKolNames,
         kolDraft: submittedKolDraft,
         result: null,
+        submitting: false,
         error: quickErrorMessage(err, '评估失败，请稍后重试'),
       });
-    } finally {
-      setSubmitting(false);
     }
   };
 
