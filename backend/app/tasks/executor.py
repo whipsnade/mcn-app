@@ -120,6 +120,18 @@ logger = logging.getLogger(__name__)
 _MAX_EMPTY_CALLS_PER_TOOL = 2
 _MAX_THROTTLE_STREAK = 3
 
+# 缺工具名决策（AGENT_DECISION_MISSING_TOOL_NAME）的连续修正机会：回喂结构化
+# 错因后允许模型自我修正，超过上限仍有证据则按受限交付收尾（生产事故教训：
+# 笼统回喂无法修正误嵌 arguments 形态，熔断后已采集证据被整体丢弃）。
+_MAX_MISSING_TOOL_NAME_STREAK = 2
+
+# goal_type → 目标提示文案（缺工具名回喂用；params.requirement 优先）。
+_GOAL_TYPE_LABELS = {
+    "kol_selection": "KOL 圈选与导出",
+    "brand_analysis": "品牌分析",
+    "campaign_analysis": "活动分析",
+}
+
 # 终态 goal（恢复时跳过）：与 dependencies.finalize_goal 的落库值一致。
 _TERMINAL_GOAL_STATUSES = frozenset(
     {"completed", "completed_with_warnings", "failed", "skipped", "insufficient_balance"}
@@ -140,6 +152,8 @@ class GoalOutcome:
     cancelled: bool = False
     interrupted: bool = False
     lease_write_failed: bool = False
+    # 缺工具名决策连续修正耗尽（>2 次仍缺名）：单 goal 路径据此做受限交付。
+    recovery_exhausted: bool = False
 
 
 def _v2_plan_json(slices: dict[str, AgentTrajectory]) -> dict[str, Any]:
@@ -175,6 +189,30 @@ def _is_empty_summary(summary: Any) -> bool:
 
 async def _noop_checkpoint(_: str) -> None:
     return None
+
+
+def _missing_tool_name_feedback(
+    decision: Any, context: AgentLoopContext, goal_params: dict | None
+) -> str:
+    """缺工具名决策的结构化回喂：错因（区分误嵌形态）+ 允许工具清单 + 目标提示。"""
+    if isinstance(decision.arguments, dict) and "internal_tool_name" in decision.arguments:
+        cause = (
+            "上一次决策缺少顶层 internal_tool_name 字段：工具名误嵌在 arguments 内，"
+            "请把工具名放到顶层 internal_tool_name 字段，arguments 只放工具参数。"
+        )
+    else:
+        cause = (
+            "上一次决策缺少顶层 internal_tool_name 字段，"
+            "请把要调用的工具名放到顶层 internal_tool_name 字段。"
+        )
+    tools_text = "；".join(
+        f"{tool.internal_name}（{tool.description}）" for tool in context.tools
+    )
+    requirement = ""
+    if isinstance(goal_params, dict):
+        requirement = str(goal_params.get("requirement") or "").strip()
+    goal_label = requirement or _GOAL_TYPE_LABELS.get(context.goal_type, context.goal_type)
+    return f"{cause}\n允许的工具：{tools_text}\n当前目标：{goal_label}。"
 
 
 def build_tool_event_payload(
@@ -444,6 +482,26 @@ class TaskExecutor:
                 await self.artifacts.auto_kol_analysis(task.id)
             await self._finalize_goal(task.id, goal, "insufficient_balance")
             return await self.repository.mark_insufficient_balance(task.id, self.worker_id)
+        if outcome.recovery_exhausted and outcome.has_settled:
+            # 缺工具名修正耗尽但有 settled 证据：不判失败，走既有 finalize 管线
+            # 做受限交付（报告构建在 finalize_goal 内部完成，这里绝不能直接调
+            # _finalize_analysis_goal，否则会重复构建报告）；无证据时落入下方
+            # 既有 no_evidence_collected 失败分支。
+            await self._finalize_goal(
+                task.id,
+                goal,
+                "completed_with_warnings",
+                warning_code="brand_trend_data_unavailable",
+            )
+            terminal_persisted = await self.repository.mark_completed_with_warnings(
+                task.id,
+                self.worker_id,
+                "decision_recovery_exhausted",
+                "部分数据未能获取，已基于已采集数据生成报告。",
+            )
+            if terminal_persisted:
+                await self._finish_followups(task.id)
+            return terminal_persisted
         if not outcome.has_settled:
             # 门禁拆除后模型首轮即可 finish，此时可能从未发起过 MCP 调用，
             # 错误码只描述事实：没有采集到任何证据。
@@ -602,6 +660,9 @@ class TaskExecutor:
                 )
                 if policy.ingest_enabled:
                     await self.artifacts.auto_kol_analysis(task.id)
+            # 缺工具名修正耗尽（recovery_exhausted）的受限交付本期只在单 goal
+            # 路径接线；编排路径按现状处理：耗尽本身不产生 failed 证据，
+            # 仍按 has_failures 决定 completed / completed_with_warnings。
             terminal = "completed_with_warnings" if outcome.has_failures else "completed"
             await self._finalize_goal(
                 task.id,
@@ -660,6 +721,7 @@ class TaskExecutor:
         outcome = GoalOutcome()
         feedback: list[EvidenceNote] = []
         invalid_streak = 0
+        missing_tool_name_streak = 0
         throttle_streak = 0
         while True:
             if await self.repository.cancel_requested(task.id):
@@ -690,6 +752,25 @@ class TaskExecutor:
                 try:
                     _tool, normalized_arguments = resolve_agent_call(decision, context)
                 except PlanValidationError as error:
+                    if error.code == "AGENT_DECISION_MISSING_TOOL_NAME":
+                        # 缺工具名单独计数（不占 invalid_streak）：回喂结构化错因
+                        # 给模型修正机会，不调 MCP、不扣积分；连续修正耗尽则跳出
+                        # 循环，由终态分支按已采集证据做受限交付。
+                        missing_tool_name_streak += 1
+                        if missing_tool_name_streak > _MAX_MISSING_TOOL_NAME_STREAK:
+                            outcome.recovery_exhausted = True
+                            break
+                        feedback.append(
+                            EvidenceNote(
+                                step_id=f"missing_name_{missing_tool_name_streak}",
+                                tool="unknown",
+                                status="failed",
+                                summary=_missing_tool_name_feedback(
+                                    decision, context, set_scope
+                                ),
+                            )
+                        )
+                        continue
                     invalid_streak += 1
                     if invalid_streak >= 2:
                         raise
@@ -706,6 +787,7 @@ class TaskExecutor:
                     )
                     continue
                 invalid_streak = 0
+                missing_tool_name_streak = 0
                 empty_calls = sum(
                     1
                     for note in trajectory.results

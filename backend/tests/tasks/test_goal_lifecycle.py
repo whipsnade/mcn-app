@@ -183,6 +183,25 @@ def _goal() -> SimpleNamespace:
     )
 
 
+def _brand_goal() -> SimpleNamespace:
+    return SimpleNamespace(
+        id="goal-brand",
+        goal_type="brand_analysis",
+        sequence=1,
+        params_json={"brand": "海底捞", "requirement": "评估海底捞近三个月品牌声量"},
+    )
+
+
+def _missing_name_call(arguments: dict | None = None) -> AgentDecision:
+    """缺工具名决策（生产事故形态）：internal_tool_name 为空或误嵌 arguments。"""
+    return AgentDecision(
+        action="call_tool",
+        internal_tool_name=None,
+        arguments={"keyword": "美妆"} if arguments is None else arguments,
+        evidence_goal="声量概览",
+    )
+
+
 class _FakeStore:
     """含 goal 接缝的存储 fake；goal=None 时等价 legacy 任务。"""
 
@@ -191,6 +210,7 @@ class _FakeStore:
         self.goal = goal
         self.events: list[tuple[str, dict]] = []
         self.terminal: str | None = None
+        self.terminal_message: str | None = None
         self.running_goals: list[str] = []
 
     async def claim_lease(self, task_id, worker_id, lease_seconds):
@@ -216,6 +236,7 @@ class _FakeStore:
 
     async def mark_completed_with_warnings(self, task_id, worker_id, code, message=None):
         self.terminal = f"completed_with_warnings:{code}"
+        self.terminal_message = message
         return True
 
     async def mark_cancelled(self, task_id, worker_id):
@@ -276,8 +297,10 @@ class _FakeContextBuilder:
 class _ScriptedDecider:
     def __init__(self, decisions: list[AgentDecision]) -> None:
         self._decisions = list(decisions)
+        self.contexts: list[AgentLoopContext] = []
 
     async def agent_decide(self, context):
+        self.contexts.append(context)
         return self._decisions.pop(0)
 
 
@@ -298,6 +321,7 @@ class _FakeArtifacts:
     def __init__(self, store: _FakeStore | None = None) -> None:
         self.calls: list[str] = []
         self.finalized: list[tuple[str, str | None, str | None]] = []
+        self.finalized_warnings: list[str | None] = []
         self.finalized_goal_ids: list[str] = []
         self._store = store
 
@@ -314,6 +338,7 @@ class _FakeArtifacts:
         self.finalized.append(
             (terminal_status, error_code, self._store.terminal if self._store else None)
         )
+        self.finalized_warnings.append(warning_code)
         self.finalized_goal_ids.append(goal_id)
 
 
@@ -456,6 +481,110 @@ async def test_goal_flow_legacy_task_has_zero_behavior_diff() -> None:
     assert gateway.commands[0].goal_id is None
     assert selection.calls[0]["goal_id"] is None
     assert artifacts.finalized == []
+    assert store.terminal == "completed"
+
+
+@pytest.mark.asyncio
+async def test_missing_tool_name_decisions_get_structured_feedback() -> None:
+    # 连续 2 次缺工具名决策：不调 MCP、不扣积分；每次回喂错因 + 允许工具清单
+    # + goal 目标提示；误嵌 arguments 形态点名「误嵌在 arguments 内」。
+    store = _FakeStore(_task(), goal=_brand_goal())
+    gateway = _FakeGateway([(_settled(),)])
+    artifacts = _FakeArtifacts(store)
+    decider = _ScriptedDecider(
+        [
+            _missing_name_call(),
+            _missing_name_call({"internal_tool_name": _TOOL_NAME, "keyword": "美妆"}),
+            _call(),
+            _finish("done"),
+        ]
+    )
+    executor = _executor(store, decider, gateway, artifacts)
+
+    await executor.run("task-1")
+
+    # 前两次决策未触达 MCP，仅第 3 次合法调用执行一次。
+    assert len(gateway.commands) == 1
+    assert store.terminal == "completed"
+    # 第 2 轮上下文带回喂 1：错因 + 允许工具清单 + goal 目标提示。
+    feedback1 = decider.contexts[1].notes[-1]
+    assert feedback1.status == "failed"
+    assert "internal_tool_name" in feedback1.summary
+    assert "误嵌在 arguments 内" not in feedback1.summary
+    assert _TOOL_NAME in feedback1.summary
+    assert "声量概览" in feedback1.summary
+    assert "评估海底捞近三个月品牌声量" in feedback1.summary
+    # 第 3 轮上下文带回喂 2：误嵌形态点名「误嵌在 arguments 内」。
+    feedback2 = decider.contexts[2].notes[-1]
+    assert "误嵌在 arguments 内" in feedback2.summary
+    assert _TOOL_NAME in feedback2.summary
+
+
+@pytest.mark.asyncio
+async def test_missing_tool_name_recovery_exhausted_delivers_limited_result() -> None:
+    # 第 3 次缺工具名且有 settled 证据：goal 不失败——completed_with_warnings +
+    # warning_code=brand_trend_data_unavailable，任务 reason 与受限交付文案。
+    store = _FakeStore(_task(), goal=_brand_goal())
+    gateway = _FakeGateway([(_settled(),)])
+    artifacts = _FakeArtifacts(store)
+    decider = _ScriptedDecider(
+        [_call(), _missing_name_call(), _missing_name_call(), _missing_name_call()]
+    )
+    executor = _executor(store, decider, gateway, artifacts)
+
+    await executor.run("task-1")
+
+    assert len(gateway.commands) == 1
+    # 修正耗尽即收尾，不再向模型要第 5 轮决策。
+    assert len(decider.contexts) == 4
+    assert artifacts.finalized == [("completed_with_warnings", None, None)]
+    assert artifacts.finalized_warnings == ["brand_trend_data_unavailable"]
+    assert store.terminal == "completed_with_warnings:decision_recovery_exhausted"
+    assert store.terminal_message == "部分数据未能获取，已基于已采集数据生成报告。"
+
+
+@pytest.mark.asyncio
+async def test_missing_tool_name_recovery_exhausted_without_evidence_fails() -> None:
+    # 零 settled 证据时第 3 次缺工具名：维持现状 failed。
+    store = _FakeStore(_task(), goal=_brand_goal())
+    gateway = _FakeGateway([])
+    artifacts = _FakeArtifacts(store)
+    decider = _ScriptedDecider(
+        [_missing_name_call(), _missing_name_call(), _missing_name_call()]
+    )
+    executor = _executor(store, decider, gateway, artifacts)
+
+    await executor.run("task-1")
+
+    assert gateway.commands == []
+    assert artifacts.finalized == [("failed", "no_evidence_collected", None)]
+    assert store.terminal == "failed:no_evidence_collected"
+
+
+@pytest.mark.asyncio
+async def test_missing_tool_name_streak_resets_after_valid_decision() -> None:
+    # 修正成功后计数清零：后续再缺名重新按 2 次机会计，不误判耗尽。
+    store = _FakeStore(_task(), goal=_goal())
+    gateway = _FakeGateway([(_settled(),), (_settled(),)])
+    artifacts = _FakeArtifacts(store)
+    decider = _ScriptedDecider(
+        [
+            _missing_name_call(),
+            _missing_name_call(),
+            _call(),
+            _missing_name_call(),
+            _missing_name_call(),
+            _call(),
+            _missing_name_call(),
+            _missing_name_call(),
+            _finish("done"),
+        ]
+    )
+    executor = _executor(store, decider, gateway, artifacts)
+
+    await executor.run("task-1")
+
+    assert len(gateway.commands) == 2
     assert store.terminal == "completed"
 
 
@@ -792,6 +921,39 @@ async def test_finalize_brand_goal_empty_evidence_marks_failed_artifact() -> Non
             assert artifact is not None
             assert artifact.status == "failed"
             assert artifact.error_code == "no_evidence_collected"
+    finally:
+        await _cleanup(ids)
+
+
+@pytest.mark.asyncio
+async def test_finalize_brand_goal_limited_delivery_builds_report() -> None:
+    # 修正耗尽受限交付：finalize 收到 warning_code 仍触发内部报告构建，
+    # goal 终态 completed_with_warnings 且 warning_code 落库。
+    worker_id = f"test-worker-{uuid4()}"
+    ids = await _create_leased_task_with_goal(
+        worker_id, goal_type="brand_analysis", goal_params={"brand": "海底捞"}
+    )
+    try:
+        artifacts = _TaskArtifacts(worker_id, model=_FakeAnalysisModel(_document()))
+
+        await artifacts.finalize_goal(
+            ids["task_id"],
+            goal_id=ids["goal_id"],
+            terminal_status="completed_with_warnings",
+            warning_code="brand_trend_data_unavailable",
+        )
+
+        async with SessionFactory() as db:
+            goal = await db.get(TaskGoal, ids["goal_id"])
+            assert goal is not None
+            assert goal.status == "completed_with_warnings"
+            assert goal.warning_code == "brand_trend_data_unavailable"
+
+            report = await db.scalar(
+                select(AnalysisReport).where(AnalysisReport.session_id == ids["session_id"])
+            )
+            assert report is not None
+            assert report.report_type == "brand_analysis"
     finally:
         await _cleanup(ids)
 
