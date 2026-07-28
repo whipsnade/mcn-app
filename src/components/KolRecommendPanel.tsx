@@ -21,6 +21,7 @@ const DEBOUNCE_MS = 800;
 
 const DEFAULT_CACHE_ENTRY: QuickKolRecommendCacheEntry = {
   budget: 50_000,
+  queriedBudget: null,
   items: [],
   pointsCost: null,
   hasQueried: false,
@@ -51,7 +52,7 @@ export default function KolRecommendPanel({ onSelectKol, favorites = [], onFavor
   // loading 与收藏 busy 是瞬态，留在面板本地。
   const { kolRecommend, setKolRecommend, queryKolRecommendations } = useQuickFeatureCache();
   const entry = kolRecommend ?? DEFAULT_CACHE_ENTRY;
-  const { budget, items, pointsCost, hasQueried, error } = entry;
+  const { budget, queriedBudget, items, pointsCost, hasQueried, error } = entry;
   const [loading, setLoading] = useState(false);
   const [favoriteBusyKey, setFavoriteBusyKey] = useState<string | null>(null);
   const [queryNonce, setQueryNonce] = useState(0);
@@ -107,20 +108,22 @@ export default function KolRecommendPanel({ onSelectKol, favorites = [], onFavor
     }
   };
 
-  // 预算滑动条 800ms 防抖刷新；挂载时以缓存中的预算/序号为基准，
-  // 重挂载（缓存恢复）不自动重查，过期响应由 Provider 内的请求序号抑制。
-  const lastQueryKey = useRef({ budget, nonce: queryNonce });
+  // 预算滑动条 800ms 防抖刷新。是否需要查询以缓存 entry 为基准：
+  // budget !== queriedBudget 说明当前预算尚未查询过（典型：防抖期内切 Tab，
+  // 防抖 timer 随卸载被清理，查询丢失），重挂载后据此补查一次；
+  // queryNonce 变化代表手动「查询/刷新」。ref 只在同次挂载内对 nonce 去重，
+  // 过期响应由 Provider 内的请求序号抑制。
+  const lastHandledNonce = useRef(queryNonce);
   useEffect(() => {
     if (!hasQueried) return;
-    const key = lastQueryKey.current;
-    if (key.budget === budget && key.nonce === queryNonce) return;
-    lastQueryKey.current = { budget, nonce: queryNonce };
+    if (budget === queriedBudget && lastHandledNonce.current === queryNonce) return;
+    lastHandledNonce.current = queryNonce;
     setLoading(true);
     const timer = window.setTimeout(() => {
       void queryKolRecommendations(budget).finally(() => setLoading(false));
     }, DEBOUNCE_MS);
     return () => window.clearTimeout(timer);
-  }, [budget, queryNonce, hasQueried, queryKolRecommendations]);
+  }, [budget, queriedBudget, queryNonce, hasQueried, queryKolRecommendations]);
 
   return (
     <div className="flex min-h-0 flex-1 flex-col bg-slate-50">

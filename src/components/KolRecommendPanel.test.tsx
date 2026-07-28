@@ -184,6 +184,47 @@ describe('KolRecommendPanel', () => {
     expect(mockGetKolRecommendations).toHaveBeenCalledWith({ budget: 300_000 });
   });
 
+  it('拖拽预算后防抖窗口内切 Tab（卸载），切回后按预算差异补查恰好一次', async () => {
+    // 只卸载面板、保留 Provider，模拟切换快捷 Tab。
+    function Harness({ showPanel }: { showPanel: boolean }) {
+      return (
+        <QuickFeatureCacheProvider userId="test-user">
+          {showPanel ? <KolRecommendPanel onSelectKol={vi.fn()} /> : null}
+        </QuickFeatureCacheProvider>
+      );
+    }
+    const view = render(<Harness showPanel />);
+
+    // 首次手动查询（预算 ¥5.0万）
+    fireEvent.click(screen.getByRole('button', { name: /查询\/刷新/ }));
+    await advanceDebounce();
+    expect(mockGetKolRecommendations).toHaveBeenCalledTimes(1);
+    expect(mockGetKolRecommendations).toHaveBeenLastCalledWith({ budget: 50_000 });
+    expect(screen.getByText('美食达人甲')).toBeTruthy();
+
+    // 拖到 ¥20.0万，防抖窗口内卸载面板：防抖 timer 被 cleanup 清掉，查询从未发出
+    fireEvent.change(screen.getByLabelText('单达人报价预算'), { target: { value: '200000' } });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(400);
+    });
+    view.rerender(<Harness showPanel={false} />);
+    await advanceDebounce();
+    expect(mockGetKolRecommendations).toHaveBeenCalledTimes(1);
+    mockGetKolRecommendations.mockClear();
+
+    // 切回：滑动条显示新预算（缓存），经过防抖后以新预算补查恰好一次
+    view.rerender(<Harness showPanel />);
+    expect(screen.getByText('¥20.0万')).toBeTruthy();
+    expect(screen.getByText('美食达人甲')).toBeTruthy();
+    await advanceDebounce();
+    expect(mockGetKolRecommendations).toHaveBeenCalledTimes(1);
+    expect(mockGetKolRecommendations).toHaveBeenCalledWith({ budget: 200_000 });
+
+    // 补查完成后预算与已查询预算一致，不再重复请求
+    await advanceDebounce();
+    expect(mockGetKolRecommendations).toHaveBeenCalledTimes(1);
+  });
+
   it('reports the selected kol when a row is clicked', async () => {
     const onSelectKol = vi.fn();
     renderPanel(<KolRecommendPanel onSelectKol={onSelectKol} />);

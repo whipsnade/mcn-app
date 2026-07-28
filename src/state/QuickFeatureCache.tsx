@@ -28,6 +28,9 @@ export interface QuickTopPostsCacheEntry {
 
 export interface QuickKolRecommendCacheEntry {
   budget: number;
+  // 本次实际成功/失败请求所用的预算；budget !== queriedBudget 说明缓存预算尚未查询
+  // （典型场景：防抖期内切 Tab，防抖 timer 随卸载被清理，查询从未发出）。
+  queriedBudget: number | null;
   items: ApiQuickKolItem[];
   pointsCost: number | null;
   hasQueried: boolean;
@@ -157,7 +160,9 @@ export function QuickFeatureCacheProvider({ userId, children }: QuickFeatureCach
       setState(prev => ({
         ...prev,
         kolRecommend: {
-          budget,
+          // 回写保留用户当前预算（in-flight 期间可能又拖过滑动条），只记录已查询预算。
+          budget: prev.kolRecommend?.budget ?? budget,
+          queriedBudget: budget,
           items: result.items ?? [],
           pointsCost: typeof result.points_cost === 'number' ? result.points_cost : null,
           hasQueried: true,
@@ -166,13 +171,14 @@ export function QuickFeatureCacheProvider({ userId, children }: QuickFeatureCach
     } catch (error) {
       if (isStale()) return;
       const message = quickErrorMessage(error);
-      // 刷新失败保留旧列表，只更新错误信息（与迁移前的面板行为一致）。
+      // 刷新失败保留旧列表与当前预算，只更新已查询预算与错误信息（与迁移前的面板行为一致）。
       setState(prev => {
         const prevEntry = prev.kolRecommend;
         return {
           ...prev,
           kolRecommend: {
-            budget,
+            budget: prevEntry?.budget ?? budget,
+            queriedBudget: budget,
             items: prevEntry?.items ?? [],
             pointsCost: prevEntry?.pointsCost ?? null,
             hasQueried: true,
