@@ -14,7 +14,7 @@ import type {
   ApiQuickPlatform,
   ApiQuickTopPost,
 } from '../api/contracts';
-import { getTopPosts, quickErrorMessage } from '../api/quick';
+import { getKolRecommendations, getTopPosts, quickErrorMessage } from '../api/quick';
 
 // 爆贴缓存按平台分键，切换 Tab 回来时可直接恢复上次查询结果。
 export interface QuickTopPostsCacheEntry {
@@ -53,6 +53,8 @@ export interface QuickFeatureCacheValue extends QuickFeatureCacheState {
   // 查询爆贴并写入缓存；按平台递增序号抑制过期响应，reject 不会向上抛出。
   queryTopPosts: (platform: ApiQuickPlatform) => Promise<void>;
   setKolRecommend: (entry: QuickKolRecommendCacheEntry | null) => void;
+  // 按预算查询达人推荐并写入缓存；递增序号抑制过期响应，reject 不会向上抛出。
+  queryKolRecommendations: (budget: number) => Promise<void>;
   setEvaluate: (entry: QuickEvaluateCacheEntry | null) => void;
 }
 
@@ -75,6 +77,8 @@ export function QuickFeatureCacheProvider({ userId, children }: QuickFeatureCach
   const [state, setState] = useState<QuickFeatureCacheState>(EMPTY_STATE);
   // 每个平台独立的请求序号：回包时序号不匹配说明已有更新的查询，直接丢弃。
   const topPostsQuerySeq = useRef<Partial<Record<ApiQuickPlatform, number>>>({});
+  // 达人推荐的请求序号：与爆贴同理，过期响应直接丢弃。
+  const kolRecommendQuerySeq = useRef(0);
   const userIdRef = useRef(userId);
   userIdRef.current = userId;
 
@@ -142,6 +146,43 @@ export function QuickFeatureCacheProvider({ userId, children }: QuickFeatureCach
     setState(prev => ({ ...prev, kolRecommend: entry }));
   }, []);
 
+  const queryKolRecommendations = useCallback(async (budget: number) => {
+    const seq = ++kolRecommendQuerySeq.current;
+    const requestUserId = userIdRef.current;
+    const isStale = () =>
+      kolRecommendQuerySeq.current !== seq || userIdRef.current !== requestUserId;
+    try {
+      const result = await getKolRecommendations({ budget });
+      if (isStale()) return;
+      setState(prev => ({
+        ...prev,
+        kolRecommend: {
+          budget,
+          items: result.items ?? [],
+          pointsCost: typeof result.points_cost === 'number' ? result.points_cost : null,
+          hasQueried: true,
+        },
+      }));
+    } catch (error) {
+      if (isStale()) return;
+      const message = quickErrorMessage(error);
+      // 刷新失败保留旧列表，只更新错误信息（与迁移前的面板行为一致）。
+      setState(prev => {
+        const prevEntry = prev.kolRecommend;
+        return {
+          ...prev,
+          kolRecommend: {
+            budget,
+            items: prevEntry?.items ?? [],
+            pointsCost: prevEntry?.pointsCost ?? null,
+            hasQueried: true,
+            error: message,
+          },
+        };
+      });
+    }
+  }, []);
+
   const setEvaluate = useCallback((entry: QuickEvaluateCacheEntry | null) => {
     setState(prev => ({ ...prev, evaluate: entry }));
   }, []);
@@ -154,9 +195,10 @@ export function QuickFeatureCacheProvider({ userId, children }: QuickFeatureCach
       setTopPosts,
       queryTopPosts,
       setKolRecommend,
+      queryKolRecommendations,
       setEvaluate,
     }),
-    [cachedUserId, userId, state, setTopPosts, queryTopPosts, setKolRecommend, setEvaluate],
+    [cachedUserId, userId, state, setTopPosts, queryTopPosts, setKolRecommend, queryKolRecommendations, setEvaluate],
   );
 
   return (

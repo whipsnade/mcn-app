@@ -1,9 +1,11 @@
 import { act, fireEvent, render, screen } from '@testing-library/react';
+import type { ReactElement } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { ApiFavorite, ApiQuickKolRecommendations } from '../api/contracts';
 import { createFavoriteByKey, deleteFavoriteByKey } from '../api/favorites';
 import { getKolRecommendations } from '../api/quick';
+import { QuickFeatureCacheProvider } from '../state/QuickFeatureCache';
 import KolRecommendPanel from './KolRecommendPanel';
 
 vi.mock('../api/quick', () => ({
@@ -72,6 +74,10 @@ async function advanceDebounce(ms = 800) {
   });
 }
 
+function renderPanel(ui: ReactElement) {
+  return render(<QuickFeatureCacheProvider userId="test-user">{ui}</QuickFeatureCacheProvider>);
+}
+
 describe('KolRecommendPanel', () => {
   beforeEach(() => {
     vi.useFakeTimers();
@@ -86,7 +92,7 @@ describe('KolRecommendPanel', () => {
   });
 
   it('does not fetch on mount; fetches after clicking the query button', async () => {
-    render(<KolRecommendPanel onSelectKol={vi.fn()} />);
+    renderPanel(<KolRecommendPanel onSelectKol={vi.fn()} />);
 
     expect(screen.getByText(/点击右上角「查询\/刷新」/)).toBeTruthy();
     await advanceDebounce();
@@ -107,7 +113,7 @@ describe('KolRecommendPanel', () => {
   });
 
   it('debounces slider changes only after the first manual query', async () => {
-    render(<KolRecommendPanel onSelectKol={vi.fn()} />);
+    renderPanel(<KolRecommendPanel onSelectKol={vi.fn()} />);
 
     // 未手动查询前拖动滑动条不触发请求
     fireEvent.change(screen.getByLabelText('单达人报价预算'), { target: { value: '200000' } });
@@ -134,9 +140,53 @@ describe('KolRecommendPanel', () => {
     expect(screen.getByText('¥30.0万')).toBeTruthy();
   });
 
+  it('restores budget and results from cache after remount without fetching again', async () => {
+    // 只卸载面板、保留 Provider，模拟切换快捷 Tab 后再切回来。
+    function Harness({ showPanel }: { showPanel: boolean }) {
+      return (
+        <QuickFeatureCacheProvider userId="test-user">
+          {showPanel ? <KolRecommendPanel onSelectKol={vi.fn()} /> : null}
+        </QuickFeatureCacheProvider>
+      );
+    }
+    const view = render(<Harness showPanel />);
+
+    fireEvent.click(screen.getByRole('button', { name: /查询\/刷新/ }));
+    await advanceDebounce();
+    expect(mockGetKolRecommendations).toHaveBeenCalledTimes(1);
+    expect(screen.getByText('美食达人甲')).toBeTruthy();
+
+    // 调整预算并让防抖查询完成，随后卸载面板
+    fireEvent.change(screen.getByLabelText('单达人报价预算'), { target: { value: '200000' } });
+    await advanceDebounce();
+    expect(mockGetKolRecommendations).toHaveBeenCalledWith({ budget: 200_000 });
+    view.rerender(<Harness showPanel={false} />);
+    mockGetKolRecommendations.mockClear();
+
+    view.rerender(<Harness showPanel />);
+
+    // 预算、名单与积分消耗都从缓存恢复，且不再发起请求
+    expect(screen.getByText('¥20.0万')).toBeTruthy();
+    expect(screen.getByText('美食达人甲')).toBeTruthy();
+    expect(screen.getByText('探店达人乙')).toBeTruthy();
+    expect(screen.getByText('上次消耗 20 积分', { exact: false })).toBeTruthy();
+    await advanceDebounce();
+    expect(mockGetKolRecommendations).not.toHaveBeenCalled();
+
+    // 重挂载后再修改预算：防抖间隔后仅发起一次新请求
+    fireEvent.change(screen.getByLabelText('单达人报价预算'), { target: { value: '300000' } });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(400);
+    });
+    expect(mockGetKolRecommendations).not.toHaveBeenCalled();
+    await advanceDebounce(400);
+    expect(mockGetKolRecommendations).toHaveBeenCalledTimes(1);
+    expect(mockGetKolRecommendations).toHaveBeenCalledWith({ budget: 300_000 });
+  });
+
   it('reports the selected kol when a row is clicked', async () => {
     const onSelectKol = vi.fn();
-    render(<KolRecommendPanel onSelectKol={onSelectKol} />);
+    renderPanel(<KolRecommendPanel onSelectKol={onSelectKol} />);
     fireEvent.click(screen.getByRole('button', { name: /查询\/刷新/ }));
     await advanceDebounce();
 
@@ -151,7 +201,7 @@ describe('KolRecommendPanel', () => {
 
   it('shows a recharge hint when points are insufficient', async () => {
     mockGetKolRecommendations.mockRejectedValue(new Error('INSUFFICIENT_POINTS'));
-    render(<KolRecommendPanel onSelectKol={vi.fn()} />);
+    renderPanel(<KolRecommendPanel onSelectKol={vi.fn()} />);
     fireEvent.click(screen.getByRole('button', { name: /查询\/刷新/ }));
     await advanceDebounce();
 
@@ -161,7 +211,7 @@ describe('KolRecommendPanel', () => {
   it('creates a favorite from a recommendation card with a defensive snapshot', async () => {
     mockCreateFavoriteByKey.mockResolvedValue(favoriteFixture());
     const onFavoriteToggled = vi.fn();
-    render(<KolRecommendPanel onSelectKol={vi.fn()} favorites={[]} onFavoriteToggled={onFavoriteToggled} />);
+    renderPanel(<KolRecommendPanel onSelectKol={vi.fn()} favorites={[]} onFavoriteToggled={onFavoriteToggled} />);
     fireEvent.click(screen.getByRole('button', { name: /查询\/刷新/ }));
     await advanceDebounce();
 
@@ -182,7 +232,7 @@ describe('KolRecommendPanel', () => {
 
   it('omits null fields from the snapshot', async () => {
     mockCreateFavoriteByKey.mockResolvedValue(favoriteFixture());
-    render(<KolRecommendPanel onSelectKol={vi.fn()} favorites={[]} onFavoriteToggled={vi.fn()} />);
+    renderPanel(<KolRecommendPanel onSelectKol={vi.fn()} favorites={[]} onFavoriteToggled={vi.fn()} />);
     fireEvent.click(screen.getByRole('button', { name: /查询\/刷新/ }));
     await advanceDebounce();
 
@@ -201,7 +251,7 @@ describe('KolRecommendPanel', () => {
   it('marks favorited items as active and removes them through deleteFavoriteByKey', async () => {
     mockDeleteFavoriteByKey.mockResolvedValue();
     const onFavoriteToggled = vi.fn();
-    render(
+    renderPanel(
       <KolRecommendPanel
         onSelectKol={vi.fn()}
         favorites={[favoriteFixture({ platform: 'douyin', kol_uid: 'uid-2', nickname: '探店达人乙' })]}
