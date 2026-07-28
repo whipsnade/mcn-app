@@ -68,17 +68,24 @@ export default function EvaluatePanel() {
     // 快照提交参数：请求期间面板可能被卸载/重挂载，闭包里的 entry 不再可靠。
     const submittedName = activityName.trim();
     const submittedKolNames = [...kolNames];
+    const submittedKolDraft = kolDraft;
     setSubmitting(true);
     updateEntry({ error: undefined });
     try {
       const evaluated = await postEvaluate({ activityName: submittedName, kolNames: submittedKolNames });
       // 结果写入缓存：即使请求期间面板被卸载，重新挂载后也能恢复报告。
-      setEvaluate({ activityName: submittedName, kolNames: submittedKolNames, kolDraft: '', result: evaluated });
+      // kolDraft 保持不动：未提交的草稿在成功/失败后都应保留（与迁移前一致）。
+      setEvaluate({
+        activityName: submittedName,
+        kolNames: submittedKolNames,
+        kolDraft: submittedKolDraft,
+        result: evaluated,
+      });
     } catch (err) {
       setEvaluate({
         activityName: submittedName,
         kolNames: submittedKolNames,
-        kolDraft: '',
+        kolDraft: submittedKolDraft,
         result: null,
         error: quickErrorMessage(err, '评估失败，请稍后重试'),
       });

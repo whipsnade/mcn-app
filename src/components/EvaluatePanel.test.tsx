@@ -126,6 +126,23 @@ describe('EvaluatePanel', () => {
     expect(await screen.findByText('积分不足，请充值')).toBeTruthy();
   });
 
+  it('keeps the unsubmitted kol draft after a failed evaluate, even across remount', async () => {
+    mockPostEvaluate.mockRejectedValue(new Error('INSUFFICIENT_POINTS'));
+    const view = render(renderHarness(true));
+
+    fillActivityName('火锅节活动');
+    addKolName('达人甲');
+    // 输入到一半的草稿（未回车提交）在失败后应保留
+    fireEvent.change(kolNameInput(), { target: { value: '达人乙' } });
+    fireEvent.click(screen.getByRole('button', { name: '开始评估' }));
+    expect(await screen.findByText('积分不足，请充值')).toBeTruthy();
+
+    view.rerender(renderHarness(false));
+    view.rerender(renderHarness(true));
+
+    expect((kolNameInput() as HTMLInputElement).value).toBe('达人乙');
+  });
+
   it('clears the result but keeps the inputs when re-evaluating', async () => {
     renderPanel();
 
