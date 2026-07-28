@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+from datetime import date
 import json
 
 import pytest
@@ -107,6 +108,7 @@ async def test_plan_task_builds_logged_structured_request() -> None:
     payload = json.loads(request.messages[-1].content)
     assert payload["current_message"] == _context().current_message
     assert payload["account_default_brand"] is None
+    assert payload["current_date"] == date.today().isoformat()
 
 
 @pytest.mark.asyncio

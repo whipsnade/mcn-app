@@ -8,6 +8,7 @@ agent 任务（kind="agent"）不使用一次性 ToolPlan：模型每轮根据�
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime, timedelta
 from typing import Any, Literal
 
@@ -172,6 +173,40 @@ class EvidenceNote(BaseModel):
     summary: Any = None
 
 
+# 循环状态注入（called_tools / evidence_gaps）：brand 分析的静态阶段清单，
+# 阶段是否已覆盖按已调用工具名的子串映射判断；映射不到的阶段保留在
+# evidence_gaps 中提示模型补采。
+BRAND_ANALYSIS_STAGES: tuple[str, ...] = ("标签匹配", "概览", "趋势", "话题", "受众")
+_STAGE_TOOL_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("标签匹配", ("best.tag", "best_tag", "mentions_tag", "tag_match")),
+    ("概览", ("overview",)),
+    ("趋势", ("trend",)),
+    ("话题", ("hot.topic", "hot_topic", "topic")),
+    ("受众", ("user.profile", "user_profile", "audience")),
+)
+_GOAL_STAGES: dict[str, tuple[str, ...]] = {
+    "brand_analysis": BRAND_ANALYSIS_STAGES,
+}
+
+
+def build_loop_state(
+    goal_type: str | None, notes: Sequence[EvidenceNote]
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """从已 settled 证据推导 called_tools（去重保序）与 evidence_gaps。"""
+    called: list[str] = []
+    for note in notes:
+        if note.status == "settled" and note.tool not in called:
+            called.append(note.tool)
+    stages = _GOAL_STAGES.get(goal_type or "", ())
+    hints = dict(_STAGE_TOOL_HINTS)
+    gaps = tuple(
+        stage
+        for stage in stages
+        if not any(hint in tool for tool in called for hint in hints[stage])
+    )
+    return tuple(called), gaps
+
+
 class AgentLoopContext(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -199,6 +234,12 @@ class AgentLoopContext(BaseModel):
     goal_params: dict[str, Any] = Field(default_factory=dict)
     # 上游 goal 的结果摘要（阶段四软依赖）：result_summary_json 原样注入 user JSON。
     dependency_summaries: tuple[dict[str, Any], ...] = ()
+    # 循环状态注入（每轮由 executor 按当前 goal 轨迹经 build_loop_state 重算）：
+    # called_tools 为已 settled 的工具名去重（保序）；evidence_gaps 为按
+    # goal_type 阶段清单减已覆盖阶段的剩余缺口（当前仅 brand_analysis 有
+    # 静态阶段表，其他 goal_type 恒为空）。
+    called_tools: tuple[str, ...] = ()
+    evidence_gaps: tuple[str, ...] = ()
     # prompt 学习日志上下文（user_id/session_id/task_id/tags）；仅用于落库，
     # exclude=True 保证不进入发给模型的 prompt JSON。
     log_context: dict[str, Any] = Field(default_factory=dict, exclude=True)
@@ -256,7 +297,7 @@ def resolve_agent_call(
     回填后再走必填校验。
     """
     if not decision.internal_tool_name:
-        raise PlanValidationError("AGENT_TOOL_MISSING")
+        raise PlanValidationError("AGENT_DECISION_MISSING_TOOL_NAME")
     tools = {tool.internal_name: tool for tool in context.tools}
     tool = tools.get(decision.internal_tool_name)
     if tool is None:
@@ -292,6 +333,7 @@ __all__ = [
     "AgentTrajectory",
     "EvidenceNote",
     "TrajectoryStep",
+    "build_loop_state",
     "normalize_agent_arguments",
     "resolve_agent_call",
     "restore_agent_trajectory",

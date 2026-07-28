@@ -103,6 +103,16 @@ def param_profile_period_override(profile: dict[str, Any]) -> dict[str, Any] | N
         return None
     if end < start:
         return None
+    # 合理性校验：未来窗口或早于 400 天前的窗口视为模型折算错误，拒绝覆写。
+    today = date.today()
+    if end > today or (today - end).days > 400:
+        logger.warning(
+            "param_profile_period_override_rejected start=%s end=%s today=%s",
+            start.isoformat(),
+            end.isoformat(),
+            today.isoformat(),
+        )
+        return None
     return {
         "unit": "day",
         "value": (end - start).days,
@@ -358,7 +368,7 @@ class _TaskArtifacts:
                     terminal_status in {"completed", "completed_with_warnings"}
                 ):
                     status_override, analysis_warning = await self._finalize_analysis_goal(
-                        db, artifact_service, task=task, goal=goal
+                        db, artifact_service, task=task, goal=goal, warning_code=warning_code
                     )
                 goal.status = status_override or terminal_status
                 goal.warning_code = warning_code or analysis_warning
@@ -392,12 +402,20 @@ class _TaskArtifacts:
 
     # goal_type → (artifact_type, 构建器, report.updated 事件 label, 失败占位标题)
     async def _finalize_analysis_goal(
-        self, db, artifact_service: ArtifactService, *, task: AnalysisTask, goal: TaskGoal
+        self,
+        db,
+        artifact_service: ArtifactService,
+        *,
+        task: AnalysisTask,
+        goal: TaskGoal,
+        warning_code: str | None = None,
     ) -> tuple[str | None, str | None]:
         """品牌/活动 goal 收尾：构建报告 → 登记 artifact + 双发事件。
 
         返回 (status_override, warning_code)：报告生成失败时降级
         completed_with_warnings 并登记 failed artifact（不删证据、任务终态不受影响）。
+        warning_code 为修正耗尽等受限交付场景的外部告警码（如
+        brand_trend_data_unavailable），透传给报告构建器注入受限声明。
         """
         artifact_type, builder, event_label, fallback_title = _ANALYSIS_GOAL_TABLE[goal.goal_type]
         artifact_key = f"goal:{goal.id}:{artifact_type}"
@@ -428,6 +446,7 @@ class _TaskArtifacts:
                         task=task,
                         goal=goal,
                         thinking_sink=thinking_sink,
+                        warning_code=warning_code,
                     )
                 finally:
                     await self._persist_thinking(

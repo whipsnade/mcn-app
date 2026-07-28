@@ -203,6 +203,16 @@ class _FakeContextBuilder:
         )
 
 
+class _BrandContextBuilder:
+    async def build_agent_context(self, user_id, session_id):
+        return AgentLoopContext(
+            recent_messages=(),
+            tools=(_tool(), _stat_tool()),
+            allowed_channels=("xiaohongshu", "douyin"),
+            goal_type="brand_analysis",
+        )
+
+
 class _ScriptedDecider:
     def __init__(self, decisions: list[AgentDecision]) -> None:
         self._decisions = list(decisions)
@@ -448,6 +458,39 @@ async def test_agent_loop_calls_tools_until_finish_then_writes_conclusion() -> N
     final = store.trajectories[-1]
     assert final["schema"] == "agent_trajectory_v1"
     assert len(final["results"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_agent_loop_injects_called_tools_and_evidence_gaps_into_round_context() -> None:
+    # 循环状态注入：每轮根据当前 goal 已 settled 的轨迹重算 called_tools
+    # （去重保序）与 evidence_gaps（brand 阶段清单减已覆盖阶段），
+    # 随 AgentLoopContext.model_dump 进入 agent_loop user content JSON。
+    task = _task()
+    store = _FakeStore(task)
+    decider = _ScriptedDecider([_call(), _finish("品牌分析完成")])
+    gateway = _FakeGateway([(_settled(),)])
+
+    await _executor(
+        store,
+        decider,
+        gateway,
+        _FakeArtifacts(),
+        context_builder=_BrandContextBuilder(),
+    ).run(task.id)
+
+    assert store.terminal == "completed"
+    first, second = decider.contexts
+    # 首轮无 settled 证据：called_tools 为空，阶段缺口完整。
+    assert first.called_tools == ()
+    assert first.evidence_gaps == ("标签匹配", "概览", "趋势", "话题", "受众")
+    # 第二轮：概览已 settled，evidence_gaps 中移除「概览」。
+    assert second.called_tools == (_TOOL_NAME,)
+    assert "概览" not in second.evidence_gaps
+    assert "趋势" in second.evidence_gaps
+    # model_dump 即 agent_loop user content JSON 的来源：键必须存在。
+    payload = second.model_dump(mode="json")
+    assert payload["called_tools"] == [_TOOL_NAME]
+    assert "evidence_gaps" in payload
 
 
 @pytest.mark.asyncio

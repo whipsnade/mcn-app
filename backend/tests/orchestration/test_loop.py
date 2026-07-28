@@ -5,6 +5,7 @@ from app.orchestration.loop import (
     AgentTrajectory,
     EvidenceNote,
     TrajectoryStep,
+    build_loop_state,
     normalize_agent_arguments,
     restore_agent_trajectory,
     validate_agent_decision,
@@ -65,7 +66,19 @@ def test_unknown_tool_is_rejected() -> None:
 def test_missing_tool_name_is_rejected() -> None:
     decision = AgentDecision(action="call_tool", arguments={})
 
-    with pytest.raises(PlanValidationError, match="AGENT_TOOL_MISSING"):
+    with pytest.raises(PlanValidationError, match="AGENT_DECISION_MISSING_TOOL_NAME"):
+        validate_agent_decision(decision, _context())
+
+
+def test_tool_name_nested_in_arguments_is_rejected() -> None:
+    # 模型把 internal_tool_name 误嵌进 arguments（顶层为 None）时，
+    # 必须报「缺工具名」而非笼统的工具缺失，以便上层做可恢复修正。
+    decision = AgentDecision(
+        action="call_tool",
+        arguments={"internal_tool_name": _TOOL_NAME, "keyword": "美妆"},
+    )
+
+    with pytest.raises(PlanValidationError, match="AGENT_DECISION_MISSING_TOOL_NAME"):
         validate_agent_decision(decision, _context())
 
 
@@ -107,6 +120,63 @@ def test_trajectory_roundtrip_and_restore() -> None:
 def test_restore_ignores_missing_or_foreign_plan_json() -> None:
     assert restore_agent_trajectory(None).steps == []
     assert restore_agent_trajectory({"steps": []}).steps == []
+
+
+def _note(tool: str, status: str = "settled", step_id: str = "step_1") -> EvidenceNote:
+    return EvidenceNote(step_id=step_id, tool=tool, status=status, summary={"ok": True})
+
+
+def test_build_loop_state_dedupes_settled_tools_in_order() -> None:
+    notes = [
+        _note("datatap.insight.match.best.tag.v1", step_id="step_1"),
+        _note("datatap.insight.social.statistic.overview.v1", step_id="step_2"),
+        # 重复与失败调用不计入 called_tools。
+        _note("datatap.insight.match.best.tag.v1", step_id="step_3"),
+        _note("datatap.insight.social.statistic.trend.v1", status="failed", step_id="step_4"),
+    ]
+
+    called, _gaps = build_loop_state("brand_analysis", notes)
+
+    assert called == (
+        "datatap.insight.match.best.tag.v1",
+        "datatap.insight.social.statistic.overview.v1",
+    )
+
+
+def test_build_loop_state_brand_gaps_subtract_covered_stages() -> None:
+    notes = [
+        _note("datatap.insight.match.best.tag.v1", step_id="step_1"),
+        _note("datatap.insight.social.statistic.overview.v1", step_id="step_2"),
+        _note("datatap.insight.social.statistic.trend.v1", step_id="step_3"),
+    ]
+
+    _called, gaps = build_loop_state("brand_analysis", notes)
+
+    # 标签匹配/概览/趋势已覆盖；话题与受众未映射到任何已调用工具，保留。
+    assert gaps == ("话题", "受众")
+
+
+def test_build_loop_state_unmapped_tools_keep_all_brand_stages() -> None:
+    called, gaps = build_loop_state(
+        "brand_analysis", [_note("datatap.insight.query.raw.posts.v1")]
+    )
+
+    assert called == ("datatap.insight.query.raw.posts.v1",)
+    assert gaps == ("标签匹配", "概览", "趋势", "话题", "受众")
+
+
+def test_build_loop_state_non_brand_goal_has_no_stage_gaps() -> None:
+    called, gaps = build_loop_state("kol_selection", [_note(_TOOL_NAME)])
+
+    assert called == (_TOOL_NAME,)
+    assert gaps == ()
+
+
+def test_build_loop_state_empty_notes() -> None:
+    called, gaps = build_loop_state("brand_analysis", [])
+
+    assert called == ()
+    assert gaps == ("标签匹配", "概览", "趋势", "话题", "受众")
 
 
 def test_trajectory_has_no_call_count_cap() -> None:

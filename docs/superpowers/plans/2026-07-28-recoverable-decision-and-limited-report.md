@@ -52,7 +52,8 @@ cd backend && .venv/bin/ruff check app tests && DATATAP_MCP_TOKEN=test-only-toke
 ### Task 2: executor 可恢复修正 + 修正耗尽受限交付
 
 **Files:**
-- Modify: `backend/app/tasks/executor.py:690-707`（回喂/熔断）与 `:322-338`（失败捕获/finalize）
+- Modify: `backend/app/tasks/executor.py`（`_run_goal_loop` 的回喂/熔断与终态分支）
+- Modify: `backend/app/tasks/dependencies.py`（`finalize_goal` 把 warning_code 转发给 `_finalize_analysis_goal`）
 - Test: `backend/tests/tasks/test_agent_loop.py` 或 test_goal_lifecycle.py（就近）
 
 - [ ] **Step 1: 写失败测试**
@@ -73,11 +74,12 @@ cd backend && .venv/bin/ruff check app tests && DATATAP_MCP_TOKEN=test-only-toke
 - [ ] **Step 3: 实现**
 
 `executor.py`：
-- 新计数器 `missing_name_streak`（与 invalid_streak 并列，校验成功时两计数器都清零）。
+- 新计数器 `missing_tool_name_streak`（与 invalid_streak 并列，校验成功时两计数器都清零）。
 - `PlanValidationError("AGENT_DECISION_MISSING_TOOL_NAME")` 分支：streak += 1 → ≤2 时回喂结构化 EvidenceNote 继续循环（不调 MCP 不扣积分，与现有回喂同路径）；>2 时进入受限交付：
-  - `goal.warning_code = "brand_trend_data_unavailable"`（finalize 前写库）
-  - 有 settled 证据 → goal 终态 completed_with_warnings + 调 `_finalize_analysis_goal`（透传 warning_code，见 Task 3）+ 任务 reason `"decision_recovery_exhausted"`（`mark_completed_with_warnings` 的 reason/消息从硬编码扩为按场景传入：「部分数据未能获取，已基于已采集数据生成报告。」）
+  - **接线（plan 评审修正）**：不得在 executor 直接调 `_finalize_analysis_goal`（会重复构建）。正确路径是走既有 `self._finalize_goal(task.id, goal, "completed_with_warnings", warning_code="brand_trend_data_unavailable")`（**不传 error_code**），并由 `finalize_goal` 把 warning_code 转发给内部的 `_finalize_analysis_goal`（`dependencies.py:360` 调用点同步透传，见 Task 3）。
+  - 有 settled 证据 → 上述 finalize；任务 reason `"decision_recovery_exhausted"`（`mark_completed_with_warnings` 的 reason/消息从硬编码扩为按场景传入：「部分数据未能获取，已基于已采集数据生成报告。」）。
   - 无 settled 证据 → 维持现状 failed。
+  - **多 goal 编排路径（`_orchestrate_goals`）本期不做**：该路径耗尽时按现状 has_failures 收尾（单 goal 路径才有受限交付），spec 遗留项记录。
 - 回喂 EvidenceNote 构造：错因行（误嵌 arguments 内检测并点名）+ `允许的工具：{internal_name} ×N`（附一行用途）+ goal 目标提示（params.requirement 或 goal_type 描述）。
 
 - [ ] **Step 4: 回归** → PASS

@@ -1,6 +1,6 @@
 import json
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from uuid import uuid4
 
 from sqlalchemy import func, select
@@ -271,6 +271,7 @@ class BrainstormService:
         )
         user_content = json.dumps(
             {
+                "current_date": date.today().isoformat(),
                 "messages": [message.model_dump(mode="json") for message in recent_messages],
                 "current_profile": profile.model_dump(mode="json"),
                 "parameter_checklist": list(BRAINSTORM_PARAMETERS),

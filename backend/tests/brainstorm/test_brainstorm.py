@@ -1,4 +1,6 @@
 import json
+import logging
+from datetime import date, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -271,6 +273,7 @@ async def test_first_round_incomplete_profile_asks_one_question_with_options(
     assert request.template_name == "brainstorm_v1"
     assert request.max_tokens == 6144
     model_input = json.loads(request.messages[-1].content)
+    assert model_input["current_date"] == date.today().isoformat()
     assert model_input["messages"][-1]["content"] == "我想分析欧诗漫"
     assert model_input["current_profile"]["brand"] is None
     assert [item["key"] for item in model_input["parameter_checklist"]] == [
@@ -800,6 +803,8 @@ def test_parameter_checklist_includes_region_and_prompt_mentions_it() -> None:
     entry = next(item for item in BRAINSTORM_PARAMETERS if item["key"] == "region")
     assert entry["label"] == "目标地区"
     assert "region" in BRAINSTORM_PROMPT.system
+    # 日期锚点规则：相对时间以 current_date 为基准折算。
+    assert "current_date" in BRAINSTORM_PROMPT.system
 
 
 def test_param_profile_period_override_validation() -> None:
@@ -813,6 +818,57 @@ def test_param_profile_period_override_validation() -> None:
         "value": 29,
         "start": "2026-04-01",
         "end": "2026-04-30",
+    }
+
+
+def test_param_profile_period_override_recency_bounds(caplog) -> None:
+    """end 在未来或早于 400 天前的窗口拒绝覆写；近期与去年活动复盘窗口放行。"""
+    override = dependencies.param_profile_period_override
+    today = date.today()
+
+    with caplog.at_level(logging.WARNING, logger="app.tasks.dependencies"):
+        # end 在未来 → 拒绝并记 warning。
+        assert override(
+            {
+                "period": {
+                    "start": today.isoformat(),
+                    "end": (today + timedelta(days=1)).isoformat(),
+                }
+            }
+        ) is None
+        # end 早于 400 天前 → 拒绝并记 warning。
+        stale_end = today - timedelta(days=401)
+        assert override(
+            {
+                "period": {
+                    "start": (stale_end - timedelta(days=30)).isoformat(),
+                    "end": stale_end.isoformat(),
+                }
+            }
+        ) is None
+    assert caplog.text.count("param_profile_period_override_rejected") == 2
+
+    # 合法近期窗口（近 30 天）→ 正常覆写。
+    recent_start = today - timedelta(days=30)
+    assert override(
+        {"period": {"start": recent_start.isoformat(), "end": today.isoformat()}}
+    ) == {
+        "unit": "day",
+        "value": 30,
+        "start": recent_start.isoformat(),
+        "end": today.isoformat(),
+    }
+
+    # 约 9 个月前的活动复盘窗口（如去年双 11）→ 接受。
+    replay_end = today - timedelta(days=270)
+    replay_start = replay_end - timedelta(days=10)
+    assert override(
+        {"period": {"start": replay_start.isoformat(), "end": replay_end.isoformat()}}
+    ) == {
+        "unit": "day",
+        "value": 10,
+        "start": replay_start.isoformat(),
+        "end": replay_end.isoformat(),
     }
 
 

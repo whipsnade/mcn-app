@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import date
 
 from app.goals.context import GoalPlannerContext, GoalPlannerContextBuilder
 from app.goals.schemas import GoalPlannerOutput
@@ -61,6 +62,7 @@ class GoalPlannerService:
         thinking_sink: ThinkingSink | None = None,
     ) -> GoalPlannerOutput:
         payload = {
+            "current_date": date.today().isoformat(),
             "current_message": context.current_message,
             "recent_messages": [
                 message.model_dump(mode="json") for message in context.recent_messages

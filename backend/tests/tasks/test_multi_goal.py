@@ -54,6 +54,16 @@ def _finish(conclusion: str = "") -> AgentDecision:
     return AgentDecision(action="finish", conclusion=conclusion)
 
 
+def _missing_name_call() -> AgentDecision:
+    """缺工具名决策（生产事故形态）：internal_tool_name 误嵌 arguments。"""
+    return AgentDecision(
+        action="call_tool",
+        internal_tool_name=None,
+        arguments={"internal_tool_name": _TOOL_NAME, "keyword": "美妆"},
+        evidence_goal="声量概览",
+    )
+
+
 def _settled(keyword: str = "美妆") -> SimpleNamespace:
     return SimpleNamespace(
         status="settled",
@@ -498,6 +508,45 @@ async def test_terminal_aggregation_all_failed_marks_all_goals_failed() -> None:
 
     assert [entry["status"] for entry in artifacts.finalized] == ["failed", "failed"]
     assert store.terminal == "failed:all_goals_failed"
+
+
+@pytest.mark.asyncio
+async def test_recovery_exhausted_goal_fails_without_limited_delivery() -> None:
+    # 编排路径不做受限交付：goal 连续 3 次缺工具名（recovery_exhausted）按失败
+    # 收尾，不写空 conclusion（避免落入 KOL 专用回退文案），其余 goal 不受影响。
+    goals = [
+        _goal("goal-campaign", "campaign_analysis", 1, params={"brand": "海底捞", "campaign": "618"}),
+        _goal("goal-brand", "brand_analysis", 2, params={"brand": "海底捞"}),
+    ]
+    store = _MultiGoalStore(_task(), goals)
+    gateway = _FakeGateway([(_settled(),), (_settled(),)])
+    artifacts = _FakeArtifacts(store)
+    decider = _ScriptedDecider(
+        [
+            _call(),
+            _finish("活动复盘完成"),
+            _call(),
+            _missing_name_call(),
+            _missing_name_call(),
+            _missing_name_call(),
+        ]
+    )
+    executor = _executor(store, decider, gateway, artifacts, _FakeSelection())
+
+    await executor.run("task-1")
+
+    # 耗尽即收尾，不再向模型要第 7 轮决策。
+    assert len(decider.contexts) == 6
+    # goal-campaign 正常完成；goal-brand 按失败收尾（编排路径本期不降级交付）。
+    assert [entry["status"] for entry in artifacts.finalized] == ["completed", "failed"]
+    assert artifacts.finalized[1]["goal_id"] == "goal-brand"
+    assert artifacts.finalized[1]["error_code"] == "AGENT_DECISION_MISSING_TOOL_NAME"
+    assert artifacts.finalized[1]["warning_code"] is None
+    assert goals[1].status == "failed"
+    # 耗尽的 goal 不写空 conclusion 消息。
+    assert artifacts.conclusions == ["活动复盘完成"]
+    # 混合终态聚合不变。
+    assert store.terminal == "completed_with_warnings:goals_partial_failure"
 
 
 # ---------------------------------------------------------------------------
