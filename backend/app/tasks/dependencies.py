@@ -103,6 +103,16 @@ def param_profile_period_override(profile: dict[str, Any]) -> dict[str, Any] | N
         return None
     if end < start:
         return None
+    # 合理性校验：未来窗口或早于 400 天前的窗口视为模型折算错误，拒绝覆写。
+    today = date.today()
+    if end > today or (today - end).days > 400:
+        logger.warning(
+            "param_profile_period_override_rejected start=%s end=%s today=%s",
+            start.isoformat(),
+            end.isoformat(),
+            today.isoformat(),
+        )
+        return None
     return {
         "unit": "day",
         "value": (end - start).days,

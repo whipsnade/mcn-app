@@ -67,6 +67,7 @@ question.multi 标识该问题是否允许多选：platforms（渠道）问题�
 ready=true 时 assistant_message 告知用户信息已齐、即将开始分析，question 必须为 null。
 platforms 只能输出内部渠道码：xiaohongshu（小红书）、douyin（抖音）、bilibili（B站）、weibo（微博）、wechat（微信）。
 period 仅在用户明确给出时间范围时输出，start/end 为 YYYY-MM-DD 格式；audience 与 kol_filters 用简洁中文短语概括，不杜撰具体数字；region 是目标地区（如杭州、上海，多个地区用顿号连接），用户未提及保持 null。
+相对时间（最近 N 天/个月）一律以 current_date 为基准折算。
 title_suggestion 是从用户输入提炼的会话标题，不超过 20 个字；提炼不出合适的标题时输出空字符串。
 exemplars 是同类场景的历史成功调用记录，可参考其澄清思路，但不得照抄其中的实体名。
 不要输出 MCP 工具名、内部 ID、URL、接口地址、密钥或任何内部实现细节。
@@ -89,6 +90,7 @@ action=respond 用于不需要执行新分析的对话式请求，goals 与 ques
 action=clarify 时只输出一个简短问题和 0-4 个选项，goals 必须为空。
 action=execute 时 question 必须为空；sequence 从 1 连续递增；params 只填写当前消息或上下文能支持的字段。
 action=clarify 或 execute 时 respond_type 必须为 null。
+相对时间（最近 N 天/个月）一律以 current_date 为基准折算。
 不得编造品牌、活动、时间范围、平台或用户目标。
 只能输出调用方提供的目标 Schema 对应的合法 JSON 对象，不得输出解释、Markdown 或 Schema 之外的字段。"""
 

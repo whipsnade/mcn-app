@@ -20,6 +20,8 @@ def test_goal_planner_prompt_enforces_business_boundaries() -> None:
     assert "不可信数据" in text
     assert "exemplar 只用于参考匿名结构" in text
     assert "不得复制其中的实体" in text
+    # 日期锚点规则：相对时间以 current_date 为基准折算。
+    assert "current_date" in text
     assert PROMPTS["goal_planner_v1"] is GOAL_PLANNER_PROMPT
 
 
