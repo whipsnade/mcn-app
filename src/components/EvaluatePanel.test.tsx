@@ -1,7 +1,9 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import type { ReactElement } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { postEvaluate } from '../api/quick';
+import { QuickFeatureCacheProvider } from '../state/QuickFeatureCache';
 import EvaluatePanel from './EvaluatePanel';
 
 vi.mock('../api/quick', () => ({
@@ -25,6 +27,27 @@ function addKolName(name: string) {
   fireEvent.keyDown(kolNameInput(), { key: 'Enter' });
 }
 
+function renderPanel() {
+  return render(
+    <QuickFeatureCacheProvider userId="test-user">
+      <EvaluatePanel />
+    </QuickFeatureCacheProvider>,
+  );
+}
+
+// 只卸载面板、保留 Provider，模拟切换快捷 Tab 后再切回来。
+function RemountHarness({ showPanel }: { showPanel: boolean }) {
+  return (
+    <QuickFeatureCacheProvider userId="test-user">
+      {showPanel ? <EvaluatePanel /> : null}
+    </QuickFeatureCacheProvider>
+  );
+}
+
+function renderHarness(showPanel: boolean): ReactElement {
+  return <RemountHarness showPanel={showPanel} />;
+}
+
 describe('EvaluatePanel', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -32,7 +55,7 @@ describe('EvaluatePanel', () => {
   });
 
   it('keeps the submit button disabled until an activity name and at least one kol are entered', () => {
-    render(<EvaluatePanel />);
+    renderPanel();
 
     const submit = screen.getByRole('button', { name: '开始评估' });
     expect(submit).toBeDisabled();
@@ -45,7 +68,7 @@ describe('EvaluatePanel', () => {
   });
 
   it('adds kol names as chips on enter, comma and blur, deduplicates and removes chips', () => {
-    render(<EvaluatePanel />);
+    renderPanel();
 
     addKolName('达人甲');
     // 逗号分隔添加
@@ -66,7 +89,7 @@ describe('EvaluatePanel', () => {
   });
 
   it('shows a hint when more than 20 kol names are entered', () => {
-    render(<EvaluatePanel />);
+    renderPanel();
 
     for (let index = 1; index <= 20; index += 1) {
       addKolName(`达人${index}`);
@@ -78,7 +101,7 @@ describe('EvaluatePanel', () => {
   });
 
   it('submits the JSON payload and renders the markdown analysis', async () => {
-    render(<EvaluatePanel />);
+    renderPanel();
 
     fillActivityName('火锅节活动');
     addKolName('达人甲');
@@ -94,7 +117,7 @@ describe('EvaluatePanel', () => {
 
   it('shows the quick error message when the evaluate request fails', async () => {
     mockPostEvaluate.mockRejectedValue(new Error('INSUFFICIENT_POINTS'));
-    render(<EvaluatePanel />);
+    renderPanel();
 
     fillActivityName('火锅节活动');
     addKolName('达人甲');
@@ -103,8 +126,25 @@ describe('EvaluatePanel', () => {
     expect(await screen.findByText('积分不足，请充值')).toBeTruthy();
   });
 
+  it('keeps the unsubmitted kol draft after a failed evaluate, even across remount', async () => {
+    mockPostEvaluate.mockRejectedValue(new Error('INSUFFICIENT_POINTS'));
+    const view = render(renderHarness(true));
+
+    fillActivityName('火锅节活动');
+    addKolName('达人甲');
+    // 输入到一半的草稿（未回车提交）在失败后应保留
+    fireEvent.change(kolNameInput(), { target: { value: '达人乙' } });
+    fireEvent.click(screen.getByRole('button', { name: '开始评估' }));
+    expect(await screen.findByText('积分不足，请充值')).toBeTruthy();
+
+    view.rerender(renderHarness(false));
+    view.rerender(renderHarness(true));
+
+    expect((kolNameInput() as HTMLInputElement).value).toBe('达人乙');
+  });
+
   it('clears the result but keeps the inputs when re-evaluating', async () => {
-    render(<EvaluatePanel />);
+    renderPanel();
 
     fillActivityName('火锅节活动');
     addKolName('达人甲');
@@ -126,7 +166,7 @@ describe('EvaluatePanel', () => {
         resolveEvaluate = resolve;
       }),
     );
-    render(<EvaluatePanel />);
+    renderPanel();
 
     fillActivityName('火锅节活动');
     addKolName('达人甲');
@@ -135,5 +175,64 @@ describe('EvaluatePanel', () => {
     expect(await screen.findByText(/评估中，可能需要几分钟/)).toBeTruthy();
     resolveEvaluate({ title: '火锅活动评估', analysis_markdown: 'ok' });
     await waitFor(() => expect(screen.queryByText(/评估中，可能需要几分钟/)).toBeNull());
+  });
+
+  it('keeps the form inputs in cache across unmount and remount', () => {
+    const view = render(renderHarness(true));
+
+    fillActivityName('火锅节活动');
+    addKolName('达人甲');
+    // 未回车提交的草稿也应保留
+    fireEvent.change(kolNameInput(), { target: { value: '达人乙' } });
+
+    view.rerender(renderHarness(false));
+    view.rerender(renderHarness(true));
+
+    expect((screen.getByLabelText('活动名称') as HTMLInputElement).value).toBe('火锅节活动');
+    expect(screen.getByText('达人甲')).toBeTruthy();
+    expect((kolNameInput() as HTMLInputElement).value).toBe('达人乙');
+    expect(mockPostEvaluate).not.toHaveBeenCalled();
+  });
+
+  it('restores the report from cache after remount without evaluating again', async () => {
+    const view = render(renderHarness(true));
+
+    fillActivityName('火锅节活动');
+    addKolName('达人甲');
+    fireEvent.click(screen.getByRole('button', { name: '开始评估' }));
+    expect(await screen.findByText('火锅活动评估')).toBeTruthy();
+
+    view.rerender(renderHarness(false));
+    mockPostEvaluate.mockClear();
+    view.rerender(renderHarness(true));
+
+    // 报告从缓存恢复展示，不再发起评估请求
+    expect(screen.getByText('火锅活动评估')).toBeTruthy();
+    expect(screen.getByText(/热度很高/)).toBeTruthy();
+    expect(mockPostEvaluate).not.toHaveBeenCalled();
+  });
+
+  it('keeps an in-flight evaluate result when the panel unmounts before it resolves', async () => {
+    let resolveEvaluate: (value: { title: string; analysis_markdown: string }) => void = () => undefined;
+    mockPostEvaluate.mockImplementation(
+      () => new Promise(resolve => {
+        resolveEvaluate = resolve;
+      }),
+    );
+    const view = render(renderHarness(true));
+
+    fillActivityName('火锅节活动');
+    addKolName('达人甲');
+    fireEvent.click(screen.getByRole('button', { name: '开始评估' }));
+    expect(await screen.findByText(/评估中，可能需要几分钟/)).toBeTruthy();
+
+    // 请求未完成时卸载面板，resolve 后结果写入缓存而不是随卸载丢失
+    view.rerender(renderHarness(false));
+    await act(async () => {
+      resolveEvaluate({ title: '火锅活动评估', analysis_markdown: 'ok' });
+    });
+    view.rerender(renderHarness(true));
+
+    expect(await screen.findByText('火锅活动评估')).toBeTruthy();
   });
 });

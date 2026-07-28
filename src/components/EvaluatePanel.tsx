@@ -1,26 +1,37 @@
 import { ClipboardList, X } from 'lucide-react';
 import { useState } from 'react';
 
-import type { ApiQuickEvaluateResult } from '../api/contracts';
 import { postEvaluate, quickErrorMessage } from '../api/quick';
+import { useQuickFeatureCache, type QuickEvaluateCacheEntry } from '../state/QuickFeatureCache';
 import { MarkdownBlock } from './UniversalReport';
 
 const MAX_KOL_NAMES = 20;
 
+const DEFAULT_EVALUATE_ENTRY: QuickEvaluateCacheEntry = {
+  activityName: '',
+  kolNames: [],
+  kolDraft: '',
+  result: null,
+};
+
 export default function EvaluatePanel() {
-  const [activityName, setActivityName] = useState('');
-  const [kolNames, setKolNames] = useState<string[]>([]);
-  const [kolDraft, setKolDraft] = useState('');
+  // 表单、报告与错误全部来自快捷功能缓存，切换 Tab 回来可直接恢复；
+  // submitting 与 kolHint 是瞬态，留在面板本地。
+  const { evaluate, setEvaluate } = useQuickFeatureCache();
+  const entry = evaluate ?? DEFAULT_EVALUATE_ENTRY;
+  const { activityName, kolNames, kolDraft, result, error } = entry;
   const [kolHint, setKolHint] = useState<string>();
   const [submitting, setSubmitting] = useState(false);
-  const [result, setResult] = useState<ApiQuickEvaluateResult | null>(null);
-  const [error, setError] = useState<string>();
+
+  const updateEntry = (patch: Partial<QuickEvaluateCacheEntry>) => {
+    setEvaluate({ ...entry, ...patch });
+  };
 
   // 回车/逗号/失焦都会触发添加；支持逗号分隔批量粘贴，strip 后去重。
   const addKolNames = (raw: string) => {
     const parts = raw.split(/[,，]/).map(part => part.trim()).filter(Boolean);
     if (parts.length === 0) {
-      setKolDraft('');
+      updateEntry({ kolDraft: '' });
       return;
     }
     let overflow = false;
@@ -34,12 +45,11 @@ export default function EvaluatePanel() {
       next.push(part);
     }
     setKolHint(overflow ? `最多添加 ${MAX_KOL_NAMES} 位达人` : undefined);
-    setKolNames(next);
-    setKolDraft('');
+    updateEntry({ kolNames: next, kolDraft: '' });
   };
 
   const removeKolName = (name: string) => {
-    setKolNames(kolNames.filter(item => item !== name));
+    updateEntry({ kolNames: kolNames.filter(item => item !== name) });
     setKolHint(undefined);
   };
 
@@ -47,7 +57,7 @@ export default function EvaluatePanel() {
     if (value.includes(',') || value.includes('，')) {
       addKolNames(value);
     } else {
-      setKolDraft(value);
+      updateEntry({ kolDraft: value });
     }
   };
 
@@ -55,13 +65,30 @@ export default function EvaluatePanel() {
 
   const handleSubmit = async () => {
     if (!canSubmit) return;
+    // 快照提交参数：请求期间面板可能被卸载/重挂载，闭包里的 entry 不再可靠。
+    const submittedName = activityName.trim();
+    const submittedKolNames = [...kolNames];
+    const submittedKolDraft = kolDraft;
     setSubmitting(true);
-    setError(undefined);
+    updateEntry({ error: undefined });
     try {
-      const evaluated = await postEvaluate({ activityName: activityName.trim(), kolNames });
-      setResult(evaluated);
+      const evaluated = await postEvaluate({ activityName: submittedName, kolNames: submittedKolNames });
+      // 结果写入缓存：即使请求期间面板被卸载，重新挂载后也能恢复报告。
+      // kolDraft 保持不动：未提交的草稿在成功/失败后都应保留（与迁移前一致）。
+      setEvaluate({
+        activityName: submittedName,
+        kolNames: submittedKolNames,
+        kolDraft: submittedKolDraft,
+        result: evaluated,
+      });
     } catch (err) {
-      setError(quickErrorMessage(err, '评估失败，请稍后重试'));
+      setEvaluate({
+        activityName: submittedName,
+        kolNames: submittedKolNames,
+        kolDraft: submittedKolDraft,
+        result: null,
+        error: quickErrorMessage(err, '评估失败，请稍后重试'),
+      });
     } finally {
       setSubmitting(false);
     }
@@ -84,7 +111,7 @@ export default function EvaluatePanel() {
               <h3 className="text-[13px] font-bold text-slate-800">{result.title || '评估结果'}</h3>
               <button
                 type="button"
-                onClick={() => setResult(null)}
+                onClick={() => updateEntry({ result: null })}
                 className="shrink-0 rounded-lg border border-slate-200 bg-white px-2 py-1 text-[10px] font-bold text-slate-500 transition hover:bg-slate-50 active:scale-95"
               >
                 重新评估
@@ -116,7 +143,7 @@ export default function EvaluatePanel() {
                 type="text"
                 value={activityName}
                 maxLength={100}
-                onChange={event => setActivityName(event.target.value)}
+                onChange={event => updateEntry({ activityName: event.target.value })}
                 placeholder="例如：火锅节新品推广"
                 className="mt-1.5 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-700 outline-none transition placeholder:text-slate-400 focus:border-indigo-300 focus:ring-2 focus:ring-indigo-500/20"
               />

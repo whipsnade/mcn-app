@@ -1,9 +1,9 @@
 import { RefreshCw, TriangleAlert } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 
-import type { ApiQuickKolItem, ApiQuickPlatform, ApiQuickTopPost } from '../api/contracts';
-import { getTopPosts, quickErrorMessage } from '../api/quick';
+import type { ApiQuickPlatform } from '../api/contracts';
 import { useLoadingMessage } from '../hooks/useLoadingMessage';
+import { useQuickFeatureCache } from '../state/QuickFeatureCache';
 import { quickPlatformLabel } from './KolRecommendPanel';
 
 interface TopPostsPanelProps {
@@ -24,15 +24,18 @@ function formatPublishTime(value: string | null): string {
 }
 
 export default function TopPostsPanel({ platform }: TopPostsPanelProps) {
-  const [items, setItems] = useState<ApiQuickTopPost[]>([]);
-  const [fallbackKols, setFallbackKols] = useState<ApiQuickKolItem[]>([]);
-  const [degraded, setDegraded] = useState(false);
-  const [pointsCost, setPointsCost] = useState<number | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string>();
+  // 展示状态全部来自快捷功能缓存（按平台分键），切换 Tab 回来可直接恢复。
+  const { topPosts, queryTopPosts } = useQuickFeatureCache();
+  const entry = topPosts[platform];
+  const items = entry?.items ?? [];
+  const fallbackKols = entry?.fallbackKols ?? [];
+  const degraded = entry?.degraded ?? false;
+  const pointsCost = entry?.pointsCost ?? null;
+  const error = entry?.error;
   // 打开 tab 不自动查询：由「查询/刷新」按钮触发
-  const [hasQueried, setHasQueried] = useState(false);
-  const [queryNonce, setQueryNonce] = useState(0);
+  const hasQueried = entry?.hasQueried ?? false;
+  // loading 是瞬态，不进缓存
+  const [loading, setLoading] = useState(false);
   const loadingMessage = useLoadingMessage(loading, [
     [0, '正在加载爆贴榜单…'],
     [8000, '数据服务响应较慢，请稍候…'],
@@ -40,32 +43,9 @@ export default function TopPostsPanel({ platform }: TopPostsPanelProps) {
   ]);
 
   const handleQuery = () => {
-    setHasQueried(true);
-    setQueryNonce(nonce => nonce + 1);
-  };
-
-  useEffect(() => {
-    if (!hasQueried) return;
-    let current = true;
     setLoading(true);
-    setError(undefined);
-    getTopPosts(platform)
-      .then(result => {
-        if (!current) return;
-        setItems(result.items ?? []);
-        setFallbackKols(result.fallback_kols ?? []);
-        setDegraded(result.degraded === true);
-        setPointsCost(typeof result.points_cost === 'number' ? result.points_cost : null);
-      })
-      .catch((err: unknown) => {
-        if (!current) return;
-        setError(quickErrorMessage(err));
-      })
-      .finally(() => {
-        if (current) setLoading(false);
-      });
-    return () => { current = false; };
-  }, [platform, queryNonce, hasQueried]);
+    void queryTopPosts(platform).finally(() => setLoading(false));
+  };
 
   const title = platform === 'xiaohongshu' ? '小红书前十爆贴' : '抖音前十爆贴';
 

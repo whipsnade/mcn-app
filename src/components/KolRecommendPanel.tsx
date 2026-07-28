@@ -1,10 +1,10 @@
 import { RefreshCw } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 import type { ApiFavorite, ApiQuickKolItem } from '../api/contracts';
 import { createFavoriteByKey, deleteFavoriteByKey } from '../api/favorites';
-import { getKolRecommendations, quickErrorMessage } from '../api/quick';
 import { useLoadingMessage } from '../hooks/useLoadingMessage';
+import { useQuickFeatureCache, type QuickKolRecommendCacheEntry } from '../state/QuickFeatureCache';
 import type { QuickKolSelection } from '../types';
 import FavoriteStar from './FavoriteStar';
 
@@ -18,6 +18,14 @@ const MIN_BUDGET = 10_000;
 const MAX_BUDGET = 500_000;
 const BUDGET_STEP = 10_000;
 const DEBOUNCE_MS = 800;
+
+const DEFAULT_CACHE_ENTRY: QuickKolRecommendCacheEntry = {
+  budget: 50_000,
+  queriedBudget: null,
+  items: [],
+  pointsCost: null,
+  hasQueried: false,
+};
 
 function formatBudget(budget: number): string {
   return `¥${(budget / 10_000).toFixed(1)}万`;
@@ -40,14 +48,13 @@ function platformBadgeClass(platform: string): string {
 }
 
 export default function KolRecommendPanel({ onSelectKol, favorites = [], onFavoriteToggled }: KolRecommendPanelProps) {
-  const [budget, setBudget] = useState(50_000);
-  const [items, setItems] = useState<ApiQuickKolItem[]>([]);
-  const [pointsCost, setPointsCost] = useState<number | null>(null);
+  // 预算与查询结果全部来自快捷功能缓存，切换 Tab 回来可直接恢复；
+  // loading 与收藏 busy 是瞬态，留在面板本地。
+  const { kolRecommend, setKolRecommend, queryKolRecommendations } = useQuickFeatureCache();
+  const entry = kolRecommend ?? DEFAULT_CACHE_ENTRY;
+  const { budget, queriedBudget, items, pointsCost, hasQueried, error } = entry;
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string>();
   const [favoriteBusyKey, setFavoriteBusyKey] = useState<string | null>(null);
-  // 打开 tab 不自动查询：首次查询由「查询/刷新」按钮触发，之后拖动预算条继续防抖刷新
-  const [hasQueried, setHasQueried] = useState(false);
   const [queryNonce, setQueryNonce] = useState(0);
   const loadingMessage = useLoadingMessage(loading, [
     [0, '正在加载达人推荐…'],
@@ -55,8 +62,13 @@ export default function KolRecommendPanel({ onSelectKol, favorites = [], onFavor
     [25000, '仍在等待上游返回，请耐心稍候…'],
   ]);
 
+  const updateEntry = (patch: Partial<QuickKolRecommendCacheEntry>) => {
+    setKolRecommend({ ...entry, ...patch });
+  };
+
   const handleQuery = () => {
-    setHasQueried(true);
+    // 打开 tab 不自动查询：首次查询由「查询/刷新」按钮触发，之后拖动预算条继续防抖刷新
+    updateEntry({ hasQueried: true });
     setQueryNonce(nonce => nonce + 1);
   };
 
@@ -90,38 +102,28 @@ export default function KolRecommendPanel({ onSelectKol, favorites = [], onFavor
       }
       onFavoriteToggled?.();
     } catch {
-      setError('收藏操作失败，请稍后重试');
+      updateEntry({ error: '收藏操作失败，请稍后重试' });
     } finally {
       setFavoriteBusyKey(current => (current === key ? null : current));
     }
   };
 
-  // 预算滑动条 800ms 防抖刷新；过期响应经 current 标记丢弃
+  // 预算滑动条 800ms 防抖刷新。是否需要查询以缓存 entry 为基准：
+  // budget !== queriedBudget 说明当前预算尚未查询过（典型：防抖期内切 Tab，
+  // 防抖 timer 随卸载被清理，查询丢失），重挂载后据此补查一次；
+  // queryNonce 变化代表手动「查询/刷新」。ref 只在同次挂载内对 nonce 去重，
+  // 过期响应由 Provider 内的请求序号抑制。
+  const lastHandledNonce = useRef(queryNonce);
   useEffect(() => {
     if (!hasQueried) return;
-    let current = true;
+    if (budget === queriedBudget && lastHandledNonce.current === queryNonce) return;
+    lastHandledNonce.current = queryNonce;
     setLoading(true);
     const timer = window.setTimeout(() => {
-      getKolRecommendations({ budget })
-        .then(result => {
-          if (!current) return;
-          setItems(result.items ?? []);
-          setPointsCost(typeof result.points_cost === 'number' ? result.points_cost : null);
-          setError(undefined);
-        })
-        .catch((err: unknown) => {
-          if (!current) return;
-          setError(quickErrorMessage(err));
-        })
-        .finally(() => {
-          if (current) setLoading(false);
-        });
+      void queryKolRecommendations(budget).finally(() => setLoading(false));
     }, DEBOUNCE_MS);
-    return () => {
-      current = false;
-      window.clearTimeout(timer);
-    };
-  }, [budget, queryNonce, hasQueried]);
+    return () => window.clearTimeout(timer);
+  }, [budget, queriedBudget, queryNonce, hasQueried, queryKolRecommendations]);
 
   return (
     <div className="flex min-h-0 flex-1 flex-col bg-slate-50">
@@ -149,7 +151,7 @@ export default function KolRecommendPanel({ onSelectKol, favorites = [], onFavor
           max={MAX_BUDGET}
           step={BUDGET_STEP}
           value={budget}
-          onChange={event => setBudget(Number(event.target.value))}
+          onChange={event => updateEntry({ budget: Number(event.target.value) })}
           className="mt-2 w-full accent-indigo-600"
           aria-label="单达人报价预算"
         />
