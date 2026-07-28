@@ -152,7 +152,8 @@ class GoalOutcome:
     cancelled: bool = False
     interrupted: bool = False
     lease_write_failed: bool = False
-    # 缺工具名决策连续修正耗尽（>2 次仍缺名）：单 goal 路径据此做受限交付。
+    # 缺工具名决策连续修正耗尽（>2 次仍缺名）：单 goal 路径据此做受限交付，
+    # 编排路径按失败收尾（本期不做降级）。
     recovery_exhausted: bool = False
 
 
@@ -646,6 +647,15 @@ class TaskExecutor:
                 return await self.repository.mark_insufficient_balance(
                     task.id, self.worker_id
                 )
+            if outcome.recovery_exhausted:
+                # 缺工具名修正耗尽：编排路径本期不做受限交付（与单 goal 路径的
+                # completed_with_warnings 降级不同），按既有失败语义收尾；
+                # 不写空 conclusion（回退文案是 KOL 专用话术，对品牌/活动文不对题）。
+                await self._finalize_goal(
+                    task.id, goal, "failed", error_code="AGENT_DECISION_MISSING_TOOL_NAME"
+                )
+                goal.status = "failed"
+                continue
             if not outcome.has_settled:
                 # 门禁拆除后模型首轮即可 finish，此时可能从未发起过 MCP 调用，
                 # 错误码只描述事实：没有采集到任何证据。
@@ -660,9 +670,6 @@ class TaskExecutor:
                 )
                 if policy.ingest_enabled:
                     await self.artifacts.auto_kol_analysis(task.id)
-            # 缺工具名修正耗尽（recovery_exhausted）的受限交付本期只在单 goal
-            # 路径接线；编排路径按现状处理：耗尽本身不产生 failed 证据，
-            # 仍按 has_failures 决定 completed / completed_with_warnings。
             terminal = "completed_with_warnings" if outcome.has_failures else "completed"
             await self._finalize_goal(
                 task.id,
