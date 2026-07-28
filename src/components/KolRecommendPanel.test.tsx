@@ -23,6 +23,9 @@ const mockGetKolRecommendations = vi.mocked(getKolRecommendations);
 const mockCreateFavoriteByKey = vi.mocked(createFavoriteByKey);
 const mockDeleteFavoriteByKey = vi.mocked(deleteFavoriteByKey);
 
+// 默认全选的五平台（顺序与 QUICK_PLATFORMS 一致）
+const ALL_PLATFORMS = ['xiaohongshu', 'douyin', 'bilibili', 'weibo', 'wechat'];
+
 function favoriteFixture(overrides: Partial<ApiFavorite> = {}): ApiFavorite {
   return {
     id: 'fav-1',
@@ -102,7 +105,7 @@ describe('KolRecommendPanel', () => {
     await advanceDebounce();
 
     expect(mockGetKolRecommendations).toHaveBeenCalledTimes(1);
-    expect(mockGetKolRecommendations).toHaveBeenCalledWith({ budget: 50_000 });
+    expect(mockGetKolRecommendations).toHaveBeenCalledWith({ budget: 50_000, platforms: ALL_PLATFORMS });
     expect(screen.getByText('美食达人甲')).toBeTruthy();
     expect(screen.getByText('探店达人乙')).toBeTruthy();
     expect(screen.getByText('粉丝 12.5万')).toBeTruthy();
@@ -136,7 +139,7 @@ describe('KolRecommendPanel', () => {
 
     await advanceDebounce(400);
     expect(mockGetKolRecommendations).toHaveBeenCalledTimes(1);
-    expect(mockGetKolRecommendations).toHaveBeenCalledWith({ budget: 300_000 });
+    expect(mockGetKolRecommendations).toHaveBeenCalledWith({ budget: 300_000, platforms: ALL_PLATFORMS });
     expect(screen.getByText('¥30.0万')).toBeTruthy();
   });
 
@@ -159,7 +162,7 @@ describe('KolRecommendPanel', () => {
     // 调整预算并让防抖查询完成，随后卸载面板
     fireEvent.change(screen.getByLabelText('单达人报价预算'), { target: { value: '200000' } });
     await advanceDebounce();
-    expect(mockGetKolRecommendations).toHaveBeenCalledWith({ budget: 200_000 });
+    expect(mockGetKolRecommendations).toHaveBeenCalledWith({ budget: 200_000, platforms: ALL_PLATFORMS });
     view.rerender(<Harness showPanel={false} />);
     mockGetKolRecommendations.mockClear();
 
@@ -181,7 +184,7 @@ describe('KolRecommendPanel', () => {
     expect(mockGetKolRecommendations).not.toHaveBeenCalled();
     await advanceDebounce(400);
     expect(mockGetKolRecommendations).toHaveBeenCalledTimes(1);
-    expect(mockGetKolRecommendations).toHaveBeenCalledWith({ budget: 300_000 });
+    expect(mockGetKolRecommendations).toHaveBeenCalledWith({ budget: 300_000, platforms: ALL_PLATFORMS });
   });
 
   it('拖拽预算后防抖窗口内切 Tab（卸载），切回后按预算差异补查恰好一次', async () => {
@@ -199,7 +202,7 @@ describe('KolRecommendPanel', () => {
     fireEvent.click(screen.getByRole('button', { name: /查询\/刷新/ }));
     await advanceDebounce();
     expect(mockGetKolRecommendations).toHaveBeenCalledTimes(1);
-    expect(mockGetKolRecommendations).toHaveBeenLastCalledWith({ budget: 50_000 });
+    expect(mockGetKolRecommendations).toHaveBeenLastCalledWith({ budget: 50_000, platforms: ALL_PLATFORMS });
     expect(screen.getByText('美食达人甲')).toBeTruthy();
 
     // 拖到 ¥20.0万，防抖窗口内卸载面板：防抖 timer 被 cleanup 清掉，查询从未发出
@@ -218,7 +221,7 @@ describe('KolRecommendPanel', () => {
     expect(screen.getByText('美食达人甲')).toBeTruthy();
     await advanceDebounce();
     expect(mockGetKolRecommendations).toHaveBeenCalledTimes(1);
-    expect(mockGetKolRecommendations).toHaveBeenCalledWith({ budget: 200_000 });
+    expect(mockGetKolRecommendations).toHaveBeenCalledWith({ budget: 200_000, platforms: ALL_PLATFORMS });
 
     // 补查完成后预算与已查询预算一致，不再重复请求
     await advanceDebounce();
@@ -277,7 +280,7 @@ describe('KolRecommendPanel', () => {
     fireEvent.click(screen.getByRole('button', { name: /查询\/刷新/ }));
     await advanceDebounce();
     expect(mockGetKolRecommendations).toHaveBeenCalledTimes(1);
-    expect(mockGetKolRecommendations).toHaveBeenLastCalledWith({ budget: 50_000 });
+    expect(mockGetKolRecommendations).toHaveBeenLastCalledWith({ budget: 50_000, platforms: ALL_PLATFORMS });
     expect(screen.getByText(/正在加载达人推荐/)).toBeTruthy();
 
     // in-flight 期间把预算拖到 ¥20.0万：loading 守卫生效，防抖窗口内不发新请求
@@ -294,7 +297,7 @@ describe('KolRecommendPanel', () => {
 
     await advanceDebounce();
     expect(mockGetKolRecommendations).toHaveBeenCalledTimes(2);
-    expect(mockGetKolRecommendations).toHaveBeenLastCalledWith({ budget: 200_000 });
+    expect(mockGetKolRecommendations).toHaveBeenLastCalledWith({ budget: 200_000, platforms: ALL_PLATFORMS });
 
     // 补查完成后预算与已查询预算一致，不再出现第三次请求
     await advanceDebounce();
@@ -386,5 +389,106 @@ describe('KolRecommendPanel', () => {
     expect(mockDeleteFavoriteByKey).toHaveBeenCalledWith('douyin', 'uid-2');
     expect(mockCreateFavoriteByKey).not.toHaveBeenCalled();
     expect(onFavoriteToggled).toHaveBeenCalledTimes(1);
+  });
+
+  describe('平台多选', () => {
+    it('平台 chips 默认全选，点击可切换选中态（aria-pressed）', () => {
+      renderPanel(<KolRecommendPanel onSelectKol={vi.fn()} />);
+
+      for (const label of ['小红书', '抖音', 'B站', '微博', '微信']) {
+        expect(screen.getByRole('button', { name: label })).toHaveAttribute('aria-pressed', 'true');
+      }
+
+      fireEvent.click(screen.getByRole('button', { name: 'B站' }));
+      expect(screen.getByRole('button', { name: 'B站' })).toHaveAttribute('aria-pressed', 'false');
+
+      fireEvent.click(screen.getByRole('button', { name: 'B站' }));
+      expect(screen.getByRole('button', { name: 'B站' })).toHaveAttribute('aria-pressed', 'true');
+    });
+
+    it('全不选时「查询/刷新」禁用', () => {
+      renderPanel(<KolRecommendPanel onSelectKol={vi.fn()} />);
+
+      for (const label of ['小红书', '抖音', 'B站', '微博', '微信']) {
+        fireEvent.click(screen.getByRole('button', { name: label }));
+      }
+
+      expect(screen.getByRole('button', { name: /查询\/刷新/ })).toBeDisabled();
+
+      // 重新勾选一个后恢复可用
+      fireEvent.click(screen.getByRole('button', { name: '小红书' }));
+      expect(screen.getByRole('button', { name: /查询\/刷新/ })).toBeEnabled();
+    });
+
+    it('查询时将选中的 platforms 传给后端', async () => {
+      renderPanel(<KolRecommendPanel onSelectKol={vi.fn()} />);
+
+      fireEvent.click(screen.getByRole('button', { name: '微博' }));
+      fireEvent.click(screen.getByRole('button', { name: '微信' }));
+      fireEvent.click(screen.getByRole('button', { name: /查询\/刷新/ }));
+      await advanceDebounce();
+
+      expect(mockGetKolRecommendations).toHaveBeenCalledTimes(1);
+      expect(mockGetKolRecommendations).toHaveBeenCalledWith({
+        budget: 50_000,
+        platforms: ['xiaohongshu', 'douyin', 'bilibili'],
+      });
+    });
+
+    it('平台选择存入缓存，切 Tab（卸载/重挂载）后保留', async () => {
+      function Harness({ showPanel }: { showPanel: boolean }) {
+        return (
+          <QuickFeatureCacheProvider userId="test-user">
+            {showPanel ? <KolRecommendPanel onSelectKol={vi.fn()} /> : null}
+          </QuickFeatureCacheProvider>
+        );
+      }
+      const view = render(<Harness showPanel />);
+
+      fireEvent.click(screen.getByRole('button', { name: '微博' }));
+      fireEvent.click(screen.getByRole('button', { name: '微信' }));
+      view.rerender(<Harness showPanel={false} />);
+      view.rerender(<Harness showPanel />);
+
+      expect(screen.getByRole('button', { name: '微博' })).toHaveAttribute('aria-pressed', 'false');
+      expect(screen.getByRole('button', { name: '微信' })).toHaveAttribute('aria-pressed', 'false');
+      expect(screen.getByRole('button', { name: '小红书' })).toHaveAttribute('aria-pressed', 'true');
+      // 全不选禁用状态也应从缓存恢复
+      for (const label of ['小红书', '抖音', 'B站']) {
+        fireEvent.click(screen.getByRole('button', { name: label }));
+      }
+      expect(screen.getByRole('button', { name: /查询\/刷新/ })).toBeDisabled();
+    });
+
+    it('改变平台选择后触发重新查询（排序后比较）', async () => {
+      renderPanel(<KolRecommendPanel onSelectKol={vi.fn()} />);
+
+      fireEvent.click(screen.getByRole('button', { name: /查询\/刷新/ }));
+      await advanceDebounce();
+      expect(mockGetKolRecommendations).toHaveBeenCalledTimes(1);
+      mockGetKolRecommendations.mockClear();
+
+      // 取消一个平台：防抖后按新平台组合重新查询
+      fireEvent.click(screen.getByRole('button', { name: '微博' }));
+      await advanceDebounce();
+      expect(mockGetKolRecommendations).toHaveBeenCalledTimes(1);
+      expect(mockGetKolRecommendations).toHaveBeenLastCalledWith({
+        budget: 50_000,
+        platforms: ['xiaohongshu', 'douyin', 'bilibili', 'wechat'],
+      });
+
+      // 选回微博：平台组合与最近一次 queriedPlatforms（4 平台）不同，再次触发查询
+      fireEvent.click(screen.getByRole('button', { name: '微博' }));
+      await advanceDebounce();
+      expect(mockGetKolRecommendations).toHaveBeenCalledTimes(2);
+      expect(mockGetKolRecommendations).toHaveBeenLastCalledWith({
+        budget: 50_000,
+        platforms: ALL_PLATFORMS,
+      });
+
+      // 组合稳定后不再重复请求
+      await advanceDebounce();
+      expect(mockGetKolRecommendations).toHaveBeenCalledTimes(2);
+    });
   });
 });

@@ -1,9 +1,9 @@
 import { RefreshCw, TriangleAlert } from 'lucide-react';
 
 import type { ApiQuickPlatform } from '../api/contracts';
+import { quickPlatformLabel } from '../api/platforms';
 import { useLoadingMessage } from '../hooks/useLoadingMessage';
 import { useQuickFeatureCache } from '../state/QuickFeatureCache';
-import { quickPlatformLabel } from './KolRecommendPanel';
 
 interface TopPostsPanelProps {
   platform: ApiQuickPlatform;

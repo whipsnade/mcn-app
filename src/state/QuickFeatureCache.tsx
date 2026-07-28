@@ -33,6 +33,10 @@ export interface QuickKolRecommendCacheEntry {
   // 本次实际成功/失败请求所用的预算；budget !== queriedBudget 说明缓存预算尚未查询
   // （典型场景：防抖期内切 Tab，防抖 timer 随卸载被清理，查询从未发出）。
   queriedBudget: number | null;
+  // 用户当前选中的平台（chips 多选，默认全选）；queriedPlatforms 是本次实际请求的平台
+  // 组合（排序存储），与 platforms 排序后不一致说明平台选择尚未查询，需补查。
+  platforms: string[];
+  queriedPlatforms: string[] | null;
   items: ApiQuickKolItem[];
   pointsCost: number | null;
   hasQueried: boolean;
@@ -62,8 +66,8 @@ export interface QuickFeatureCacheValue extends QuickFeatureCacheState {
   // 查询爆贴并写入缓存；按平台递增序号抑制过期响应，reject 不会向上抛出。
   queryTopPosts: (platform: ApiQuickPlatform) => Promise<void>;
   setKolRecommend: (entry: QuickKolRecommendCacheEntry | null) => void;
-  // 按预算查询达人推荐并写入缓存；递增序号抑制过期响应，reject 不会向上抛出。
-  queryKolRecommendations: (budget: number) => Promise<void>;
+  // 按预算与平台组合查询达人推荐并写入缓存；递增序号抑制过期响应，reject 不会向上抛出。
+  queryKolRecommendations: (budget: number, platforms: string[]) => Promise<void>;
   setEvaluate: (entry: QuickEvaluateCacheEntry | null) => void;
 }
 
@@ -177,7 +181,7 @@ export function QuickFeatureCacheProvider({ userId, children }: QuickFeatureCach
     setState(prev => ({ ...prev, kolRecommend: entry }));
   }, []);
 
-  const queryKolRecommendations = useCallback(async (budget: number) => {
+  const queryKolRecommendations = useCallback(async (budget: number, platforms: string[]) => {
     const seq = ++kolRecommendQuerySeq.current;
     const requestUserId = userIdRef.current;
     const isStale = () =>
@@ -191,6 +195,8 @@ export function QuickFeatureCacheProvider({ userId, children }: QuickFeatureCach
         kolRecommend: {
           budget: prevEntry?.budget ?? budget,
           queriedBudget: prevEntry?.queriedBudget ?? null,
+          platforms: prevEntry?.platforms ?? platforms,
+          queriedPlatforms: prevEntry?.queriedPlatforms ?? null,
           items: prevEntry?.items ?? [],
           pointsCost: prevEntry?.pointsCost ?? null,
           hasQueried: prevEntry?.hasQueried ?? false,
@@ -200,14 +206,17 @@ export function QuickFeatureCacheProvider({ userId, children }: QuickFeatureCach
       };
     });
     try {
-      const result = await getKolRecommendations({ budget });
+      const result = await getKolRecommendations({ budget, platforms });
       if (isStale()) return;
       setState(prev => ({
         ...prev,
         kolRecommend: {
-          // 回写保留用户当前预算（in-flight 期间可能又拖过滑动条），只记录已查询预算。
+          // 回写保留用户当前预算与平台选择（in-flight 期间可能又拖过滑动条/切换 chips），
+          // 只记录已查询的预算与平台组合（排序存储，避免 chips 切换顺序造成假差异）。
           budget: prev.kolRecommend?.budget ?? budget,
           queriedBudget: budget,
+          platforms: prev.kolRecommend?.platforms ?? platforms,
+          queriedPlatforms: [...platforms].sort(),
           items: result.items ?? [],
           pointsCost: typeof result.points_cost === 'number' ? result.points_cost : null,
           hasQueried: true,
@@ -217,7 +226,7 @@ export function QuickFeatureCacheProvider({ userId, children }: QuickFeatureCach
     } catch (error) {
       if (isStale()) return;
       const message = quickErrorMessage(error);
-      // 刷新失败保留旧列表与当前预算，只更新已查询预算与错误信息（与迁移前的面板行为一致）。
+      // 刷新失败保留旧列表与当前预算/平台选择，只更新已查询参数与错误信息（与迁移前的面板行为一致）。
       setState(prev => {
         const prevEntry = prev.kolRecommend;
         return {
@@ -225,6 +234,8 @@ export function QuickFeatureCacheProvider({ userId, children }: QuickFeatureCach
           kolRecommend: {
             budget: prevEntry?.budget ?? budget,
             queriedBudget: budget,
+            platforms: prevEntry?.platforms ?? platforms,
+            queriedPlatforms: [...platforms].sort(),
             items: prevEntry?.items ?? [],
             pointsCost: prevEntry?.pointsCost ?? null,
             hasQueried: true,

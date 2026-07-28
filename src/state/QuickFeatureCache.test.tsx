@@ -81,6 +81,8 @@ describe('QuickFeatureCache', () => {
       result.current.setKolRecommend({
         budget: 50_000,
         queriedBudget: 50_000,
+        platforms: ['xiaohongshu', 'douyin'],
+        queriedPlatforms: ['xiaohongshu', 'douyin'],
         items: [],
         pointsCost: 10,
         hasQueried: true,
@@ -180,7 +182,7 @@ describe('QuickFeatureCache · in-flight loading 状态', () => {
     });
   });
 
-  it('queryKolRecommendations 进行中 entry.loading 为 true，settle 后复位', async () => {
+  it('queryKolRecommendations 进行中 entry.loading 为 true 且保留平台选择，settle 后复位', async () => {
     let resolveQuery: (value: { items: never[]; points_cost: number }) => void = () => undefined;
     mockGetKolRecommendations.mockImplementation(
       () => new Promise(resolve => {
@@ -191,9 +193,23 @@ describe('QuickFeatureCache · in-flight loading 状态', () => {
 
     let pending: Promise<void> = Promise.resolve();
     act(() => {
-      pending = result.current.queryKolRecommendations(50_000);
+      result.current.setKolRecommend({
+        budget: 50_000,
+        queriedBudget: null,
+        platforms: ['douyin', 'xiaohongshu'],
+        queriedPlatforms: null,
+        items: [],
+        pointsCost: null,
+        hasQueried: true,
+      });
     });
-    expect(result.current.kolRecommend).toMatchObject({ loading: true });
+    act(() => {
+      pending = result.current.queryKolRecommendations(50_000, ['douyin', 'xiaohongshu']);
+    });
+    expect(result.current.kolRecommend).toMatchObject({
+      loading: true,
+      platforms: ['douyin', 'xiaohongshu'],
+    });
 
     await act(async () => {
       resolveQuery({ items: [], points_cost: 20 });
@@ -217,14 +233,47 @@ describe('QuickFeatureCache · 达人推荐 queriedBudget', () => {
     const { result } = setup('user-a');
 
     await act(async () => {
-      await result.current.queryKolRecommendations(120_000);
+      await result.current.queryKolRecommendations(120_000, ['xiaohongshu', 'douyin']);
     });
 
-    expect(mockGetKolRecommendations).toHaveBeenCalledWith({ budget: 120_000 });
+    expect(mockGetKolRecommendations).toHaveBeenCalledWith({
+      budget: 120_000,
+      platforms: ['xiaohongshu', 'douyin'],
+    });
     expect(result.current.kolRecommend).toMatchObject({
       budget: 120_000,
       queriedBudget: 120_000,
       hasQueried: true,
+    });
+  });
+
+  it('查询回写时记录本次实际请求的平台（queriedPlatforms 排序存储）', async () => {
+    mockGetKolRecommendations.mockResolvedValue({ items: [], points_cost: 20 });
+    const { result } = setup('user-a');
+    act(() => {
+      result.current.setKolRecommend({
+        budget: 120_000,
+        queriedBudget: null,
+        // 缓存里的 platforms 保留用户的切换顺序；queriedPlatforms 要求排序存储
+        platforms: ['douyin', 'xiaohongshu', 'bilibili'],
+        queriedPlatforms: null,
+        items: [],
+        pointsCost: null,
+        hasQueried: true,
+      });
+    });
+
+    await act(async () => {
+      await result.current.queryKolRecommendations(120_000, ['douyin', 'xiaohongshu', 'bilibili']);
+    });
+
+    expect(mockGetKolRecommendations).toHaveBeenCalledWith({
+      budget: 120_000,
+      platforms: ['douyin', 'xiaohongshu', 'bilibili'],
+    });
+    expect(result.current.kolRecommend).toMatchObject({
+      platforms: ['douyin', 'xiaohongshu', 'bilibili'],
+      queriedPlatforms: ['bilibili', 'douyin', 'xiaohongshu'],
     });
   });
 
@@ -236,6 +285,8 @@ describe('QuickFeatureCache · 达人推荐 queriedBudget', () => {
       result.current.setKolRecommend({
         budget: 300_000,
         queriedBudget: 50_000,
+        platforms: ['xiaohongshu'],
+        queriedPlatforms: ['xiaohongshu'],
         items: [],
         pointsCost: null,
         hasQueried: true,
@@ -243,22 +294,26 @@ describe('QuickFeatureCache · 达人推荐 queriedBudget', () => {
     });
 
     await act(async () => {
-      await result.current.queryKolRecommendations(120_000);
+      await result.current.queryKolRecommendations(120_000, ['xiaohongshu']);
     });
 
     expect(result.current.kolRecommend).toMatchObject({
       budget: 300_000,
       queriedBudget: 120_000,
+      platforms: ['xiaohongshu'],
+      queriedPlatforms: ['xiaohongshu'],
     });
   });
 
-  it('查询失败同样记录 queriedBudget，保留当前预算与旧列表只更新错误', async () => {
+  it('查询失败同样记录 queriedBudget 与 queriedPlatforms，保留当前预算与旧列表只更新错误', async () => {
     mockGetKolRecommendations.mockRejectedValue(new Error('boom'));
     const { result } = setup('user-a');
     act(() => {
       result.current.setKolRecommend({
         budget: 300_000,
         queriedBudget: null,
+        platforms: ['xiaohongshu', 'weibo'],
+        queriedPlatforms: null,
         items: [],
         pointsCost: 20,
         hasQueried: true,
@@ -266,12 +321,14 @@ describe('QuickFeatureCache · 达人推荐 queriedBudget', () => {
     });
 
     await act(async () => {
-      await result.current.queryKolRecommendations(120_000);
+      await result.current.queryKolRecommendations(120_000, ['xiaohongshu', 'weibo']);
     });
 
     expect(result.current.kolRecommend).toMatchObject({
       budget: 300_000,
       queriedBudget: 120_000,
+      platforms: ['xiaohongshu', 'weibo'],
+      queriedPlatforms: ['weibo', 'xiaohongshu'],
       pointsCost: 20,
       error: '查询失败，请稍后重试',
     });
