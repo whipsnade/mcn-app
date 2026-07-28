@@ -256,7 +256,7 @@ def resolve_agent_call(
     回填后再走必填校验。
     """
     if not decision.internal_tool_name:
-        raise PlanValidationError("AGENT_TOOL_MISSING")
+        raise PlanValidationError("AGENT_DECISION_MISSING_TOOL_NAME")
     tools = {tool.internal_name: tool for tool in context.tools}
     tool = tools.get(decision.internal_tool_name)
     if tool is None:

@@ -65,7 +65,19 @@ def test_unknown_tool_is_rejected() -> None:
 def test_missing_tool_name_is_rejected() -> None:
     decision = AgentDecision(action="call_tool", arguments={})
 
-    with pytest.raises(PlanValidationError, match="AGENT_TOOL_MISSING"):
+    with pytest.raises(PlanValidationError, match="AGENT_DECISION_MISSING_TOOL_NAME"):
+        validate_agent_decision(decision, _context())
+
+
+def test_tool_name_nested_in_arguments_is_rejected() -> None:
+    # 模型把 internal_tool_name 误嵌进 arguments（顶层为 None）时，
+    # 必须报「缺工具名」而非笼统的工具缺失，以便上层做可恢复修正。
+    decision = AgentDecision(
+        action="call_tool",
+        arguments={"internal_tool_name": _TOOL_NAME, "keyword": "美妆"},
+    )
+
+    with pytest.raises(PlanValidationError, match="AGENT_DECISION_MISSING_TOOL_NAME"):
         validate_agent_decision(decision, _context())
 
 
