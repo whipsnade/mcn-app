@@ -485,6 +485,16 @@ class TaskExecutor:
             await self._finalize_goal(task.id, goal, "insufficient_balance")
             return await self.repository.mark_insufficient_balance(task.id, self.worker_id)
         if outcome.recovery_exhausted and outcome.has_settled:
+            if getattr(goal, "goal_type", None) not in {"brand_analysis", "campaign_analysis"}:
+                # 受限交付是按品牌/活动分析设计的；kol_selection（含 legacy）
+                # 修正耗尽按失败收尾（与编排路径对齐），不写 conclusion、
+                # 不触发 auto_kol_analysis。
+                await self._finalize_goal(
+                    task.id, goal, "failed", error_code="AGENT_DECISION_MISSING_TOOL_NAME"
+                )
+                return await self.repository.mark_failed(
+                    task.id, self.worker_id, "AGENT_DECISION_MISSING_TOOL_NAME"
+                )
             # 缺工具名修正耗尽但有 settled 证据：不判失败，走既有 finalize 管线
             # 做受限交付（报告构建在 finalize_goal 内部完成，这里绝不能直接调
             # _finalize_analysis_goal，否则会重复构建报告）；无证据时落入下方

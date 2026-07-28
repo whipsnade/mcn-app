@@ -562,6 +562,27 @@ async def test_missing_tool_name_recovery_exhausted_without_evidence_fails() -> 
 
 
 @pytest.mark.asyncio
+async def test_missing_tool_name_recovery_exhausted_kol_goal_fails() -> None:
+    # kol_selection goal 修正耗尽不适用品牌受限交付：按失败收尾（与编排路径对齐），
+    # 不落 brand_trend_data_unavailable、不写 conclusion、不触发 auto_kol_analysis。
+    store = _FakeStore(_task(), goal=_goal())
+    gateway = _FakeGateway([(_settled(),)])
+    artifacts = _FakeArtifacts(store)
+    decider = _ScriptedDecider(
+        [_call(), _missing_name_call(), _missing_name_call(), _missing_name_call()]
+    )
+    executor = _executor(store, decider, gateway, artifacts, _FakeSelection())
+
+    await executor.run("task-1")
+
+    assert len(gateway.commands) == 1
+    assert artifacts.finalized == [("failed", "AGENT_DECISION_MISSING_TOOL_NAME", None)]
+    assert artifacts.finalized_warnings == [None]
+    assert artifacts.calls == []
+    assert store.terminal == "failed:AGENT_DECISION_MISSING_TOOL_NAME"
+
+
+@pytest.mark.asyncio
 async def test_missing_tool_name_streak_resets_after_valid_decision() -> None:
     # 修正成功后计数清零：后续再缺名重新按 2 次机会计，不误判耗尽。
     store = _FakeStore(_task(), goal=_goal())
