@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { ApiAnalysisReport, ApiArtifactsSummary, ApiFavorite, ApiSessionReportItem } from '../api/contracts';
 import { createFavoriteByKey, deleteFavoriteByKey } from '../api/favorites';
-import { downloadKolSelection, getKolSelection, getKolTop10Trend, listSelectionSets, runKolAnalysis } from '../api/kolSelection';
+import { downloadKolSelection, getKolSelection, getKolSelectionDetail, getKolTop10Trend, listSelectionSets, queryKolSelectionDetail, runKolAnalysis } from '../api/kolSelection';
 import { listSessionReports } from '../api/reports';
 import { getAnalysisReport } from '../api/tasks';
 import { analysisReportFixture } from '../test/fixtures';
@@ -15,6 +15,8 @@ vi.mock('../api/kolSelection', () => ({
   getKolSelection: vi.fn(),
   getKolTop10Trend: vi.fn(),
   listSelectionSets: vi.fn(),
+  getKolSelectionDetail: vi.fn(),
+  queryKolSelectionDetail: vi.fn(),
 }));
 
 vi.mock('../api/reports', () => ({
@@ -80,6 +82,8 @@ describe('UniversalReport', () => {
     vi.mocked(getKolSelection).mockReset();
     vi.mocked(getKolTop10Trend).mockReset().mockResolvedValue({ set_id: null, items: [] });
     vi.mocked(listSelectionSets).mockReset().mockResolvedValue([]);
+    vi.mocked(getKolSelectionDetail).mockReset();
+    vi.mocked(queryKolSelectionDetail).mockReset();
     vi.mocked(listSessionReports).mockReset().mockResolvedValue([]);
     vi.mocked(getAnalysisReport).mockReset();
     vi.mocked(createFavoriteByKey).mockReset();
@@ -672,5 +676,23 @@ describe('UniversalReport', () => {
     expect(screen.queryByText(/按互动率展示 Top 20/)).not.toBeInTheDocument();
     // 子 Tab 标签计数仍来自 selectionCount，不受 Top20 截断影响。
     expect(screen.getByRole('tab', { name: '圈选达人 (3)' })).toBeVisible();
+  });
+
+  it('clicking a selection item opens its version-scoped detail BI dialog', async () => {
+    vi.mocked(getKolSelection).mockResolvedValue({ total: 1, items: [kolSelectionItem()] });
+    vi.mocked(getKolSelectionDetail).mockResolvedValue({
+      set_id: 'set-1', platform: 'xiaohongshu', kol_uid: 'uid-1', source: 'cache', points_cost: 0,
+      posts_degraded: false, fetched_at: '2026-07-29T10:00:00', posts: [],
+      detail: { nickname: '达人小A', followers: 120000, score: { total: 82 } },
+    });
+    render(<UniversalReport sessionId="session-1" selectionCount={1} />);
+
+    fireEvent.click(screen.getByRole('tab', { name: '圈选达人 (1)' }));
+    fireEvent.click(await screen.findByRole('button', { name: '查看达人小A详情' }));
+
+    expect(await screen.findByRole('dialog', { name: '达人小A达人详情' })).toBeVisible();
+    expect(getKolSelectionDetail).toHaveBeenCalledWith('session-1', {
+      set_id: undefined, platform: 'xiaohongshu', kol_uid: 'uid-1',
+    });
   });
 });

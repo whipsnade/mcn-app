@@ -22,6 +22,25 @@ export interface KolTop10TrendItem {
   trend_points: Array<{ week_start: string; average_interactions: number; post_count?: number }>;
 }
 
+export interface KolSelectionDetail {
+  set_id: string;
+  platform: string;
+  kol_uid: string;
+  detail: Record<string, unknown>;
+  posts: Array<Record<string, unknown>>;
+  source: 'cache' | 'query' | 'refresh' | 'missing';
+  points_cost: number;
+  posts_degraded: boolean;
+  fetched_at: string | null;
+}
+
+export interface KolSelectionDetailQuery {
+  set_id?: string;
+  platform: string;
+  kol_uid: string;
+  refresh: boolean;
+}
+
 export function getKolSelection(
   sessionId: string,
   setId?: string,
@@ -37,6 +56,25 @@ export function listSelectionSets(sessionId: string): Promise<ApiSelectionSetIte
 export function getKolTop10Trend(sessionId: string, setId?: string): Promise<{ set_id: string | null; items: KolTop10TrendItem[] }> {
   const query = setId ? `?set_id=${encodeURIComponent(setId)}` : '';
   return request(`/api/v1/sessions/${sessionId}/kol-top10-trend${query}`);
+}
+
+export function getKolSelectionDetail(
+  sessionId: string,
+  query: Omit<KolSelectionDetailQuery, 'refresh'>,
+): Promise<KolSelectionDetail> {
+  const params = new URLSearchParams({ platform: query.platform, kol_uid: query.kol_uid });
+  if (query.set_id) params.set('set_id', query.set_id);
+  return request(`/api/v1/sessions/${sessionId}/kol-selection/detail?${params.toString()}`);
+}
+
+export function queryKolSelectionDetail(
+  sessionId: string,
+  payload: KolSelectionDetailQuery,
+): Promise<KolSelectionDetail> {
+  return request(`/api/v1/sessions/${sessionId}/kol-selection/detail/query`, {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
 }
 
 export function runKolAnalysis(sessionId: string): Promise<ApiAnalysisReport> {
