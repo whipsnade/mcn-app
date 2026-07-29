@@ -18,6 +18,7 @@ import type {
 } from '../api/contracts';
 import { createFavoriteByKey, deleteFavoriteByKey } from '../api/favorites';
 import FavoriteStar from './FavoriteStar';
+import KolSelectionDetailDialog from './KolSelectionDetailDialog';
 import { Card, formatExposure, formatNumber, MetricCard } from './reportPrimitives';
 import { useLoadingMessage } from '../hooks/useLoadingMessage';
 
@@ -397,9 +398,10 @@ interface KolSelectionCardProps {
   favoriteActive: boolean;
   favoriteBusy: boolean;
   onToggleFavorite: () => void;
+  onOpenDetail: () => void;
 }
 
-function KolSelectionCard({ item, favoriteActive, favoriteBusy, onToggleFavorite }: KolSelectionCardProps) {
+function KolSelectionCard({ item, favoriteActive, favoriteBusy, onToggleFavorite, onOpenDetail }: KolSelectionCardProps) {
   const nickname = item.nickname || '未知达人';
   const stars = stringValue(item.score?.stars);
   const rating = stringValue(item.score?.rating);
@@ -417,28 +419,30 @@ function KolSelectionCard({ item, favoriteActive, favoriteBusy, onToggleFavorite
   return (
     <section className="rounded-xl border border-slate-100 bg-white p-3.5 shadow-sm">
       <div className="flex items-center gap-2.5">
-        <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-indigo-100 text-[13px] font-bold text-indigo-600">
-          {nickname.slice(0, 1)}
-        </span>
-        <div className="min-w-0 flex-1">
-          <p className="flex items-center gap-1.5">
-            <span className="truncate text-[12px] font-semibold text-slate-800">{nickname}</span>
-            {stars && <span className="shrink-0 text-[10px] text-amber-500">{stars}</span>}
-          </p>
-          <p className="mt-0.5 truncate text-[10px] text-slate-400">{metaParts.join(' · ')}</p>
-        </div>
-        {(total != null || rating) && (
-          <div className="shrink-0 text-right">
-            {total != null && (
-              <p className="text-[12px] font-bold text-slate-800">
-                <span className="mr-1 text-[10px] font-normal text-slate-400">综合评分</span>{total}
-              </p>
-            )}
-            {rating && (
-              <span className="mt-1 inline-block rounded-full bg-indigo-50 px-2 py-0.5 text-[10px] font-semibold text-indigo-600">{rating}</span>
-            )}
+        <button type="button" aria-label={`查看${nickname}详情`} onClick={onOpenDetail} className="flex min-w-0 flex-1 items-center gap-2.5 text-left">
+          <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-indigo-100 text-[13px] font-bold text-indigo-600">
+            {nickname.slice(0, 1)}
+          </span>
+          <div className="min-w-0 flex-1">
+            <p className="flex items-center gap-1.5">
+              <span className="truncate text-[12px] font-semibold text-slate-800">{nickname}</span>
+              {stars && <span className="shrink-0 text-[10px] text-amber-500">{stars}</span>}
+            </p>
+            <p className="mt-0.5 truncate text-[10px] text-slate-400">{metaParts.join(' · ')}</p>
           </div>
-        )}
+          {(total != null || rating) && (
+            <div className="shrink-0 text-right">
+              {total != null && (
+                <p className="text-[12px] font-bold text-slate-800">
+                  <span className="mr-1 text-[10px] font-normal text-slate-400">综合评分</span>{total}
+                </p>
+              )}
+              {rating && (
+                <span className="mt-1 inline-block rounded-full bg-indigo-50 px-2 py-0.5 text-[10px] font-semibold text-indigo-600">{rating}</span>
+              )}
+            </div>
+          )}
+        </button>
         <FavoriteStar active={favoriteActive} busy={favoriteBusy} onToggle={onToggleFavorite} />
       </div>
       {(engagementRate != null || quotedPrice != null) && (
@@ -627,6 +631,7 @@ function KolPanel({ report, taskStatus, sessionId, selectionCount, onReportReady
   const [selectionSets, setSelectionSets] = useState<ApiSelectionSetItem[]>([]);
   const [selectedSetId, setSelectedSetId] = useState<string>();
   const [trendItems, setTrendItems] = useState<KolTop10TrendItem[]>([]);
+  const [detailItem, setDetailItem] = useState<KolSelectionItem>();
 
   // 面板实例跨会话复用：切换会话时重置本地操作状态，避免把上一个会话的 loading/错误带过来。
   useEffect(() => {
@@ -642,6 +647,7 @@ function KolPanel({ report, taskStatus, sessionId, selectionCount, onReportReady
     setSelectionSets([]);
     setSelectedSetId(undefined);
     setTrendItems([]);
+    setDetailItem(undefined);
   }, [sessionId]);
 
   // kol_analysis 报告版本列表：会话切换/分析成功后重拉（选中版本在 props.report 更新时复位）。
@@ -927,12 +933,15 @@ function KolPanel({ report, taskStatus, sessionId, selectionCount, onReportReady
                   </p>
                 )}
                 {topSelectionItems.map(item => (
-                  <Fragment key={`${item.platform}-${item.kol_uid}`}>{KolSelectionCard({
-                    item,
-                    favoriteActive: isKolFavorited(item),
-                    favoriteBusy: favoriteBusyKey === `${item.platform}-${item.kol_uid}`,
-                    onToggleFavorite: () => void toggleKolFavorite(item),
-                  })}</Fragment>
+                  <Fragment key={`${item.platform}-${item.kol_uid}`}>
+                    <KolSelectionCard
+                    item={item}
+                    favoriteActive={isKolFavorited(item)}
+                    favoriteBusy={favoriteBusyKey === `${item.platform}-${item.kol_uid}`}
+                    onToggleFavorite={() => void toggleKolFavorite(item)}
+                    onOpenDetail={() => setDetailItem(item)}
+                    />
+                  </Fragment>
                 ))}
               </div>
             )}
@@ -956,6 +965,14 @@ function KolPanel({ report, taskStatus, sessionId, selectionCount, onReportReady
           </>
         )}
       </div>
+      {sessionId && detailItem && (
+        <KolSelectionDetailDialog
+          sessionId={sessionId}
+          setId={selectedSetId}
+          item={detailItem}
+          onClose={() => setDetailItem(undefined)}
+        />
+      )}
     </>
   );
 }
