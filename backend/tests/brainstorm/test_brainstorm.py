@@ -353,6 +353,117 @@ async def test_age_question_with_empty_options_gets_standard_buckets(
 
 
 @pytest.mark.asyncio
+async def test_region_answer_extracted_when_model_leaves_regions_empty(
+    auth_client_factory, db_session, monkeypatch
+) -> None:
+    """模型把地区答案写进单数 region、regions 恒空时，服务端从用户答案确定性解析
+    （生产事故形态：地区问题无限循环）。"""
+    client = await auth_client_factory("13900000003")
+    created = await client.post("/api/v1/sessions", json={})
+    assert created.status_code == 201
+    session_id = created.json()["id"]
+    model = FakeBrainstormModel(
+        [
+            # 第一轮：模型问目标地区，其余 v2 字段已齐。
+            BrainstormModelOutput(
+                ready=False,
+                assistant_message="请确认希望覆盖的目标地区，可多选。",
+                question=BrainstormQuestion(
+                    text="请确认希望覆盖的目标地区，可多选。",
+                    options=["上海", "杭州", "北京", "广州"],
+                    multi=True,
+                ),
+                extracted=BrainstormProfile(
+                    category="餐饮",
+                    industry="美食",
+                    goal="圈选达人推荐",
+                    kol_filters="女性达人",
+                    platforms=["xiaohongshu"],
+                    age_ranges=["18-24"],
+                ),
+            ),
+            # 第二轮：用户答「上海」，模型仍 regions=[]（写进单数 region）但 ready=true。
+            BrainstormModelOutput(
+                ready=True,
+                assistant_message="信息已齐，开始分析。",
+                extracted=BrainstormProfile(region="上海"),
+            ),
+        ]
+    )
+    _install_model(monkeypatch, model)
+    _share_session_factory(monkeypatch, db_session)
+
+    first = await client.post(
+        f"/api/v1/sessions/{session_id}/brainstorm",
+        json={"content": "餐饮行业、小红书渠道，圈选女性达人"},
+    )
+    assert first.status_code == 200
+    response = await client.post(
+        f"/api/v1/sessions/{session_id}/brainstorm", json={"content": "上海"}
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["profile"]["regions"] == ["上海"]
+    # regions 已被确定性解析补齐：不因模型漏提取而回退为继续追问地区。
+    assert body["ready"] is True
+    assert body["task_id"] is not None
+
+
+@pytest.mark.asyncio
+async def test_age_answer_extracted_from_previous_age_question(
+    auth_client_factory, db_session, monkeypatch
+) -> None:
+    """上一轮问年龄、用户答「18-24岁、25-34」时按标准桶解析进 age_ranges。"""
+    client = await auth_client_factory("13900000004")
+    created = await client.post("/api/v1/sessions", json={})
+    assert created.status_code == 201
+    session_id = created.json()["id"]
+    model = FakeBrainstormModel(
+        [
+            BrainstormModelOutput(
+                ready=False,
+                assistant_message="您希望覆盖哪些年龄段的受众？",
+                question=BrainstormQuestion(
+                    text="请选择目标受众年龄段（可多选）。",
+                    options=["<18", "18-24", "25-34", "35-44", "45+"],
+                    multi=True,
+                ),
+                extracted=BrainstormProfile(
+                    category="餐饮",
+                    industry="美食",
+                    goal="圈选达人推荐",
+                    kol_filters="女性达人",
+                    platforms=["xiaohongshu"],
+                    regions=["上海"],
+                ),
+            ),
+            BrainstormModelOutput(
+                ready=True,
+                assistant_message="信息已齐，开始分析。",
+                extracted=BrainstormProfile(),
+            ),
+        ]
+    )
+    _install_model(monkeypatch, model)
+    _share_session_factory(monkeypatch, db_session)
+
+    await client.post(
+        f"/api/v1/sessions/{session_id}/brainstorm",
+        json={"content": "餐饮行业、小红书渠道、目标地区上海，圈选女性达人"},
+    )
+    response = await client.post(
+        f"/api/v1/sessions/{session_id}/brainstorm", json={"content": "18-24岁、25-34"}
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["profile"]["age_ranges"] == ["18-24", "25-34"]
+    assert body["ready"] is True
+    assert body["task_id"] is not None
+
+
+@pytest.mark.asyncio
 async def test_first_round_request_contract_continues(
     auth_client_factory, db_session, monkeypatch
 ) -> None:

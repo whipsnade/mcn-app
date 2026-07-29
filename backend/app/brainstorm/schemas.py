@@ -36,7 +36,8 @@ class BrainstormQuestion(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     text: str = Field(min_length=1, max_length=500)
-    options: list[str] = Field(default_factory=list, max_length=4)
+    # 年龄问题有五个固定档位（<18/18-24/25-34/35-44/45+），上限按 5 放宽。
+    options: list[str] = Field(default_factory=list, max_length=5)
     # multi=true 表示该问题允许多选（如渠道），前端据此渲染多选 chips。
     multi: bool = False
 
