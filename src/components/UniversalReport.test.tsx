@@ -86,6 +86,18 @@ describe('UniversalReport', () => {
     vi.mocked(deleteFavoriteByKey).mockReset();
   });
 
+  it('shows v2 score completeness and opens the score guide from the selection tab', async () => {
+    vi.mocked(getKolSelection).mockResolvedValue({
+      total: 1,
+      items: [kolSelectionItem({ score: { version: 'kol_score_v2', total: 82, rating: '重点推荐', stars: '★★★★★', data_completeness: 100 } })],
+    });
+    render(<UniversalReport sessionId="session-1" selectionCount={1} />);
+    fireEvent.click(screen.getByRole('tab', { name: '圈选达人 (1)' }));
+    expect(await screen.findByText('数据完整度 100%')).toBeVisible();
+    fireEvent.click(screen.getByRole('button', { name: '评分说明' }));
+    expect(screen.getByRole('tooltip')).toHaveTextContent('行业兴趣 10%');
+  });
+
   it('renders every supported block type from the analysis report DTO', () => {
     render(<UniversalReport report={analysisReportFixture()} taskStatus="completed" />);
 

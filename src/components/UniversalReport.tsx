@@ -371,6 +371,19 @@ function stringValue(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
 }
 
+const SCORE_GUIDE = '评分 v2：行业兴趣 10%、目标地区 8%、目标年龄 8%、互动表现 20%、活跃粉丝 15%、内容质量 15%、粉丝规模 10%、互动粉丝比 14%。任一字段缺失、无效或无法匹配时，该维度记 0 分；评级为重点推荐≥78、推荐≥62、可考虑≥48、观察<48。';
+
+function ScoreGuide() {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="relative mb-2 flex items-center gap-1 px-1 text-[10px] text-slate-500">
+      <span>评分说明</span>
+      <button type="button" aria-label="评分说明" onClick={() => setOpen(value => !value)} className="flex h-4 w-4 items-center justify-center rounded-full border border-slate-300 text-[10px] font-bold" title={SCORE_GUIDE}>?</button>
+      {open && <p role="tooltip" className="absolute left-0 top-5 z-10 w-72 rounded-lg border border-slate-200 bg-white p-2 leading-4 shadow-lg">{SCORE_GUIDE}</p>}
+    </div>
+  );
+}
+
 // 互动率/报价是归一化后的合并字段（_MERGEABLE_FIELDS），落在 fields_json 顶层；防御性取数。
 function selectionMetric(item: KolSelectionItem, key: string): number | null {
   return finiteNumber(item.fields?.[key]);
@@ -388,6 +401,8 @@ function KolSelectionCard({ item, favoriteActive, favoriteBusy, onToggleFavorite
   const stars = stringValue(item.score?.stars);
   const rating = stringValue(item.score?.rating);
   const total = finiteNumber(item.score?.total);
+  const version = stringValue(item.score?.version);
+  const completeness = finiteNumber(item.score?.data_completeness);
   const engagementRate = selectionMetric(item, 'engagement_rate');
   const quotedPrice = selectionMetric(item, 'quoted_price_cny');
   const metaParts = [
@@ -432,6 +447,9 @@ function KolSelectionCard({ item, favoriteActive, favoriteBusy, onToggleFavorite
             <span className="rounded-lg bg-slate-100 px-2 py-1 text-[10px] font-semibold text-slate-600">预估报价 ¥{formatNumber(quotedPrice)}</span>
           )}
         </div>
+      )}
+      {version === 'kol_score_v2' && completeness != null && (
+        <p className="mt-2 text-[10px] text-slate-400">数据完整度 {completeness}%</p>
       )}
     </section>
   );
@@ -899,6 +917,7 @@ function KolPanel({ report, taskStatus, sessionId, selectionCount, onReportReady
               </div>
             ) : (
               <div className="space-y-2.5">
+                <ScoreGuide />
                 {selectionItems.length > 20 && (
                   <p className="px-1 text-[10px] text-slate-400">
                     共 {selectionItems.length} 位达人，按互动率展示 Top 20
