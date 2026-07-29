@@ -162,8 +162,15 @@ export default function KolSelectionDetailDialog({ sessionId, setId, item, onClo
       </header>
       <div className="min-h-0 flex-1 overflow-y-auto p-5">
         {loading ? <div role="status" className="flex min-h-72 flex-col items-center justify-center gap-3 text-[12px] text-slate-500"><Loader2 className="h-6 w-6 animate-spin text-indigo-500" />正在查询达人详情与热帖…</div>
-          : error ? <div className="flex min-h-72 flex-col items-center justify-center gap-3 text-center"><p role="alert" className="text-[12px] font-medium text-rose-600">{error}</p><button type="button" onClick={() => void refresh()} className="rounded-lg border border-slate-200 px-3 py-1.5 text-[11px] font-semibold text-slate-600">重试查询</button></div>
+          : error && !data ? <div className="flex min-h-72 flex-col items-center justify-center gap-3 text-center"><p role="alert" className="text-[12px] font-medium text-rose-600">{error}</p><button type="button" onClick={() => void refresh()} className="rounded-lg border border-slate-200 px-3 py-1.5 text-[11px] font-semibold text-slate-600">重试查询</button></div>
           : <div className="space-y-4">
+            {/* 刷新失败但已有缓存时：保留旧数据展示，顶部呈现可操作的错误提示（设计要求）。 */}
+            {error && (
+              <div className="flex items-center justify-between gap-2 rounded-lg bg-rose-50 px-3 py-2 text-[11px] font-medium text-rose-600">
+                <p role="alert">刷新失败：{error}（以下为已缓存的数据）</p>
+                <button type="button" onClick={() => void refresh()} className="shrink-0 rounded-md border border-rose-200 px-2 py-1 text-[10px] font-semibold hover:bg-rose-100">重试</button>
+              </div>
+            )}
             <div className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-indigo-100 bg-indigo-50/70 px-3 py-2 text-[11px] text-indigo-700">
               <span>{data?.source === 'cache' ? '来自缓存，不消耗积分' : data?.source === 'refresh' ? `刷新完成，本次查询消耗 ${data.points_cost} 积分` : `本次查询消耗 ${data?.points_cost ?? 0} 积分`}</span>
               {data?.fetched_at && <span className="text-[10px] text-indigo-400">更新于 {new Date(data.fetched_at).toLocaleString('zh-CN')}</span>}

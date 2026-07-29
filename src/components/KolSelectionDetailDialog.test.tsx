@@ -91,4 +91,19 @@ describe('KolSelectionDetailDialog', () => {
     }));
     expect(await screen.findByText(/本次查询消耗 20 积分/)).toBeVisible();
   });
+
+  it('刷新失败且已有缓存时保留旧数据并展示错误横幅', async () => {
+    vi.mocked(getKolSelectionDetail).mockResolvedValue({ ...queried, source: 'cache', points_cost: 0 });
+    vi.mocked(queryKolSelectionDetail).mockRejectedValue(new Error('上游服务暂时不可用'));
+
+    render(<KolSelectionDetailDialog sessionId="session-1" setId="set-1" item={item} onClose={vi.fn()} />);
+
+    await screen.findByText('来自缓存，不消耗积分');
+    fireEvent.click(screen.getByRole('button', { name: '刷新达人详情' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('达人详情加载失败，请稍后重试');
+    // 旧缓存内容仍展示（不全屏错误）
+    expect(screen.getByText('互动趋势')).toBeVisible();
+    expect(screen.getByText(/以下为已缓存的数据/)).toBeVisible();
+  });
 });
