@@ -26,6 +26,10 @@ class BrainstormProfile(BaseModel):
     kol_filters: str | None = Field(default=None, max_length=500)
     goal: str | None = Field(default=None, max_length=500)
     region: str | None = Field(default=None, max_length=200)
+    # 仅在圈选达人目标中强制确认，用作评分 v2 的目标画像。
+    industry: str | None = Field(default=None, max_length=100)
+    regions: list[str] = Field(default_factory=list, max_length=10)
+    age_ranges: list[str] = Field(default_factory=list, max_length=5)
 
 
 class BrainstormQuestion(BaseModel):

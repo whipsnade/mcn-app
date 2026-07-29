@@ -152,7 +152,50 @@ def _full_profile() -> BrainstormProfile:
         audience="18-30 岁女性",
         period=BrainstormPeriod(start="2026-04-01", end="2026-06-30"),
         goal="达人投放",
+        industry="美妆护肤",
+        regions=["杭州"],
+        age_ranges=["18-24", "25-34"],
     )
+
+
+@pytest.mark.asyncio
+async def test_kol_brainstorm_does_not_create_task_when_score_target_profile_is_incomplete(
+    auth_client_factory, db_session, monkeypatch
+) -> None:
+    """达人投放目标缺少评分画像时，模型误报 ready 也不得创建任务。"""
+    client = await auth_client_factory("13900000041")
+    created = await client.post("/api/v1/sessions", json={})
+    session_id = created.json()["id"]
+    model = FakeBrainstormModel(
+        [
+            BrainstormModelOutput(
+                ready=True,
+                assistant_message="信息已齐，开始分析。",
+                extracted=BrainstormProfile(
+                    brand="欧诗漫",
+                    category="美妆护肤",
+                    platforms=["xiaohongshu"],
+                    goal="达人投放",
+                ),
+            )
+        ]
+    )
+    _install_model(monkeypatch, model)
+    _share_session_factory(monkeypatch, db_session)
+
+    response = await client.post(
+        f"/api/v1/sessions/{session_id}/brainstorm", json={"content": "帮我圈选达人"}
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ready"] is False
+    assert body["task_id"] is None
+    assert body["message"]["content"] == "为了按目标画像评分，还需要先确认目标行业。"
+    assert body["message"]["metadata"]["brainstorm"]["options"] == ["美妆护肤"]
+    assert body["profile"]["industry"] is None
+    assert body["profile"]["regions"] == []
+    assert body["profile"]["age_ranges"] == []
 
 
 def test_brainstorm_request_accepts_turn_id_and_rejects_invalid_uuid() -> None:
@@ -285,6 +328,9 @@ async def test_first_round_incomplete_profile_asks_one_question_with_options(
         "kol_filters",
         "goal",
         "region",
+        "industry",
+        "regions",
+        "age_ranges",
     ]
 
     # 画像与问答消息已持久化，metadata 经白名单后仍带 brainstorm 键。
@@ -326,6 +372,9 @@ async def test_second_round_ready_creates_task_with_trigger_message(
                     period=BrainstormPeriod(start="2026-04-01", end="2026-06-30"),
                     goal="达人投放",
                     region="杭州",
+                    industry="美妆护肤",
+                    regions=["杭州"],
+                    age_ranges=["18-24", "25-34"],
                 ),
             ),
         ]
@@ -358,6 +407,9 @@ async def test_second_round_ready_creates_task_with_trigger_message(
         "kol_filters": None,
         "goal": "达人投放",
         "region": "杭州",
+        "industry": "美妆护肤",
+        "regions": ["杭州"],
+        "age_ranges": ["18-24", "25-34"],
     }
 
     task = await client.get(f"/api/v1/tasks/{body['task_id']}")
@@ -673,6 +725,9 @@ async def test_brainstorm_ready_write_phase_rereads_profile_and_locks_after_mode
                     platforms=["xiaohongshu"],
                     audience="18-30 岁女性",
                     goal="达人投放",
+                    industry="美妆护肤",
+                    regions=["杭州"],
+                    age_ranges=["18-24", "25-34"],
                 ),
             )
         ]
@@ -794,7 +849,7 @@ async def test_build_agent_context_without_profile_keeps_text_period(
     assert context.requested_period["value"] == 3
 
 
-def test_parameter_checklist_includes_region_and_prompt_mentions_it() -> None:
+def test_parameter_checklist_includes_score_targeting_and_prompt_mentions_it() -> None:
     from app.brainstorm.parameters import BRAINSTORM_PARAMETERS
     from app.model.prompts import BRAINSTORM_PROMPT
 
@@ -803,6 +858,8 @@ def test_parameter_checklist_includes_region_and_prompt_mentions_it() -> None:
     entry = next(item for item in BRAINSTORM_PARAMETERS if item["key"] == "region")
     assert entry["label"] == "目标地区"
     assert "region" in BRAINSTORM_PROMPT.system
+    assert {"industry", "regions", "age_ranges"}.issubset(keys)
+    assert "age_ranges" in BRAINSTORM_PROMPT.system
     # 日期锚点规则：相对时间以 current_date 为基准折算。
     assert "current_date" in BRAINSTORM_PROMPT.system
 
