@@ -5,6 +5,7 @@ from app.orchestration.loop import (
     AgentTrajectory,
     EvidenceNote,
     TrajectoryStep,
+    _prune_arguments,
     build_loop_state,
     normalize_agent_arguments,
     restore_agent_trajectory,
@@ -13,6 +14,41 @@ from app.orchestration.loop import (
 from app.orchestration.schemas import PlanValidationError, PlannerTool
 
 import pytest
+
+
+def test_prune_arguments_drops_undeclared_nested_keys_in_anyof_variant() -> None:
+    """anyOf 包装内层 additionalProperties: False 时，嵌套的编造参数也必须被剔除
+    （事故形态：kol.search 的 request 里被模型塞进 explosiveRateMax/Min）。"""
+    schema = {
+        "type": "object",
+        "properties": {
+            "request": {
+                "anyOf": [
+                    {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "size": {"type": "integer"},
+                            "kwProvinceList": {"type": "array", "items": {"type": "string"}},
+                        },
+                    },
+                    {"type": "null"},
+                ]
+            }
+        },
+    }
+    value = {
+        "request": {
+            "size": 20,
+            "kwProvinceList": ["上海市"],
+            "explosiveRateMax": 1,
+            "explosiveRateMin": 0.01,
+        }
+    }
+
+    assert _prune_arguments(value, schema) == {
+        "request": {"size": 20, "kwProvinceList": ["上海市"]}
+    }
 
 
 _TOOL_NAME = "datatap.insight.social.statistic.overview.v1"
