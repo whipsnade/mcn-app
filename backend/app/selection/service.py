@@ -187,9 +187,9 @@ def _score_payload(
                     else _number(fields.get("content_score"))
                 ),
                 followers=followers,
-                interaction_follower_ratio=_number(
-                    facts.get("average_interaction_per_follower_rate")
-                ),
+                # 互动粉丝比不传详情侧 rate（其分子是汇总均值）；
+                # 由 score_candidate_v2 用同一个 30 天优先的平均互动量 / followers 计算，
+                # 保证「互动表现」与「互动粉丝比」分子同源（spec 表格口径）。
             ),
         )
     dimensions = DimensionInputs(

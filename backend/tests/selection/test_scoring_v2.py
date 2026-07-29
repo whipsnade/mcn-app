@@ -71,3 +71,12 @@ def test_missing_input_is_zero_without_weight_redistribution() -> None:
     assert result["dimensions"]["engagement"]["missing_reason"] == "missing_average_interactions"
     assert result["total"] == 12
     assert result["data_completeness"] == 15
+
+
+def test_full_width_age_bucket_matches_after_normalization() -> None:
+    result = score_candidate_v2(
+        ScoreContextV2(industry="美食", regions=("上海",), age_ranges=("18-24",)),
+        ScoreInputsV2(audience_age={"１８－２４岁": 55}),
+    )
+
+    assert result["dimensions"]["target_age"]["raw_score"] == 55

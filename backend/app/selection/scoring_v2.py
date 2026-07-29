@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -40,7 +41,8 @@ class ScoreInputsV2:
 
 
 def _text(value: str) -> str:
-    return value.strip().casefold().replace(" ", "").replace("岁", "").replace("至", "-")
+    normalized = unicodedata.normalize("NFKC", value.strip())
+    return normalized.casefold().replace(" ", "").replace("岁", "").replace("至", "-")
 
 
 def _distribution_score(values: dict[str, float], targets: tuple[str, ...]) -> float | None:

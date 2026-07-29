@@ -95,7 +95,15 @@ describe('UniversalReport', () => {
     fireEvent.click(screen.getByRole('tab', { name: '圈选达人 (1)' }));
     expect(await screen.findByText('数据完整度 100%')).toBeVisible();
     fireEvent.click(screen.getByRole('button', { name: '评分说明' }));
-    expect(screen.getByRole('tooltip')).toHaveTextContent('行业兴趣 10%');
+    const tooltip = screen.getByRole('tooltip');
+    expect(tooltip).toHaveTextContent('行业兴趣 10%');
+    // 说明必须含分档表与字段来源（spec 验收口径）
+    expect(tooltip).toHaveTextContent('粉丝数');
+    expect(tooltip).toHaveTextContent('≥100万');
+    expect(tooltip).toHaveTextContent('互动粉丝比');
+    expect(tooltip).toHaveTextContent('0.5-1%');
+    expect(tooltip).toHaveTextContent('受众兴趣');
+    expect(tooltip).toHaveTextContent('重点推荐≥78');
   });
 
   it('renders every supported block type from the analysis report DTO', () => {
