@@ -578,6 +578,71 @@ class KolSelectionService:
         rows.sort(key=_score_total, reverse=True)
         return len(rows), rows[offset : offset + limit]
 
+    async def resolve_selection_detail_subject(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        selection_set_id: str | None,
+        platform: str,
+        kol_uid: str,
+    ) -> tuple[KolSelectionSet, KolSelectionItem, KolSelectionDetailSnapshot | None]:
+        """解析详情目标，并在查询 MCP 前完成名单版本与达人身份归属校验。"""
+        selection_set = await self.resolve_selection_set(
+            user_id=user_id,
+            session_id=session_id,
+            selection_set_id=selection_set_id,
+        )
+        if selection_set is None:
+            raise LookupError("selection_set_not_found")
+        item = await self._db.scalar(
+            select(KolSelectionItem).where(
+                KolSelectionItem.selection_set_id == selection_set.id,
+                KolSelectionItem.platform == platform,
+                KolSelectionItem.kol_uid == kol_uid,
+            )
+        )
+        if item is None:
+            raise LookupError("selection_item_not_found")
+        snapshot = await self._db.scalar(
+            select(KolSelectionDetailSnapshot).where(
+                KolSelectionDetailSnapshot.selection_set_id == selection_set.id,
+                KolSelectionDetailSnapshot.platform == platform,
+                KolSelectionDetailSnapshot.kol_uid == kol_uid,
+            )
+        )
+        return selection_set, item, snapshot
+
+    @staticmethod
+    def serialize_selection_detail(
+        item: KolSelectionItem,
+        snapshot: KolSelectionDetailSnapshot | None,
+        cached_detail: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """组合名单基础字段、Top20 快照与主动查询缓存，输出 BI 安全合约。"""
+        fields = item.fields_json or {}
+        detail: dict[str, Any] = {
+            "nickname": item.nickname,
+            "score": item.score_json or {},
+        }
+        for key, value in {
+            "followers": item.followers,
+            "city": item.city,
+            "profile_url": item.profile_url,
+            "engagement_rate": fields.get("engagement_rate"),
+            "quoted_price_cny": fields.get("quoted_price_cny"),
+            "content_score": fields.get("content_score"),
+        }.items():
+            if _present(value):
+                detail[key] = value
+        if snapshot is not None:
+            detail.update(snapshot.facts_json or {})
+            if snapshot.trend_points_json:
+                detail["trend_points"] = snapshot.trend_points_json
+        if cached_detail:
+            detail.update(cached_detail)
+        return detail
+
     async def count_items(self, selection_set_id: str) -> int:
         total = await self._db.scalar(
             select(func.count())

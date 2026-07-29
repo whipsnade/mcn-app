@@ -8,6 +8,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.selection.models import KolSelectionDetailView
+from app.selection.normalizers import normalize_kol_detail_facts
 
 
 _DETAIL_NUMBER_FIELDS = {
@@ -96,6 +97,38 @@ def normalize_detail_view_payload(detail: Mapping[str, Any]) -> dict[str, Any]:
         if normalized_points:
             normalized["trend_points"] = normalized_points
     return normalized
+
+
+def normalize_mcp_detail_view_payload(
+    *, platform: str, kol_uid: str, detail: Mapping[str, Any]
+) -> dict[str, Any]:
+    """将快捷详情工具返回的原始行投影为详情缓存白名单字段。
+
+    QuickService 已负责模型驱动的工具调用与计费；这里复用名单详情快照的
+    归一化器，保证原始供应商字段不会直接进入版本化缓存。
+    """
+    details = normalize_kol_detail_facts(
+        "datatap.social.grow.kol.detail.v1",
+        {
+            "platform": platform,
+            "kwUidList": [kol_uid],
+            "scope": ["fansAudience", "postSummaryStatistics", "accountTrend"],
+        },
+        {"result": dict(detail)},
+    )
+    matched = next(
+        (
+            item
+            for item in details
+            if item.platform == platform and item.platform_account_id == kol_uid
+        ),
+        None,
+    )
+    if matched is None:
+        return {}
+    return normalize_detail_view_payload(
+        {**matched.facts, "trend_points": list(matched.trend_points)}
+    )
 
 
 def normalize_detail_view_posts(posts: Sequence[Any]) -> list[dict[str, Any]]:
