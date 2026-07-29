@@ -42,6 +42,9 @@ _SCORE_PROFILE_FIELDS: tuple[tuple[str, str], ...] = (
     ("regions", "目标地区"),
     ("age_ranges", "目标年龄段"),
 )
+# 评分 v2 目标年龄段固定档位（与 selection/scoring_v2 的标准桶一致）。
+_AGE_RANGE_BUCKETS: list[str] = ["<18", "18-24", "25-34", "35-44", "45+"]
+_AGE_QUESTION_PATTERN = re.compile(r"年龄|岁")
 
 
 def utc_now() -> datetime:
@@ -71,7 +74,7 @@ def score_target_profile_question(profile: BrainstormProfile, missing: tuple[str
         return "为了按目标画像评分，还需要先确认目标行业。", options, False
     if label == "目标地区":
         return "为了按目标画像评分，还需要确认目标地区（可多选）。", [], True
-    return "为了按目标画像评分，还需要确认目标年龄段（可多选）。", ["18-24", "25-34"], True
+    return "为了按目标画像评分，还需要确认目标年龄段（可多选）。", list(_AGE_RANGE_BUCKETS), True
 
 
 class BrainstormService:
@@ -211,12 +214,22 @@ class BrainstormService:
         workspace.last_accessed_at = workspace.updated_at
 
         options: list[str] = []
+        multi = output.question.multi if output.question is not None else False
         if not ready and output.question is not None:
             options = list(output.question.options)
+            # 确定性兜底：评分画像缺目标年龄段且模型问的是年龄问题但 options 为空
+            #（模型常把档位写进问题文本），按固定档位注入并强制多选。
+            if (
+                not options
+                and not merged.age_ranges
+                and _AGE_QUESTION_PATTERN.search(output.question.text)
+            ):
+                options = list(_AGE_RANGE_BUCKETS)
+                multi = True
         brainstorm_metadata: dict = {
             "ready": ready,
             "options": options,
-            "multi": output.question.multi if output.question is not None else False,
+            "multi": multi,
             "profile_summary": merged.model_dump(mode="json"),
         }
         assistant_metadata: dict = {"brainstorm": brainstorm_metadata}

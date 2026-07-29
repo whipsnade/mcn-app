@@ -309,6 +309,78 @@ async def test_first_round_incomplete_profile_asks_one_question_with_options(
     assert body["profile"]["category"] is None
     assert body["profile"]["platforms"] == []
 
+
+@pytest.mark.asyncio
+async def test_age_question_with_empty_options_gets_standard_buckets(
+    auth_client_factory, db_session, monkeypatch
+) -> None:
+    """模型问年龄问题但 options 为空时，服务端注入五个标准年龄档并强制多选。"""
+    client = await auth_client_factory("13900000002")
+    created = await client.post("/api/v1/sessions", json={})
+    assert created.status_code == 201
+    session_id = created.json()["id"]
+    model = FakeBrainstormModel(
+        [
+            BrainstormModelOutput(
+                ready=False,
+                assistant_message="还差一个关键信息：您希望覆盖哪些年龄段的受众？",
+                # 模型把档位写进文本而不给 options 的真实故障形态。
+                question=BrainstormQuestion(
+                    text="请选择目标受众年龄段（可多选）：<18、18-24、25-34、35-44、45+",
+                    multi=True,
+                ),
+                extracted=BrainstormProfile(
+                    category="餐饮",
+                    goal="圈选最近3个月内有爆贴的女性达人",
+                    platforms=["xiaohongshu"],
+                    regions=["上海"],
+                ),
+            )
+        ]
+    )
+    _install_model(monkeypatch, model)
+    _share_session_factory(monkeypatch, db_session)
+
+    response = await client.post(
+        f"/api/v1/sessions/{session_id}/brainstorm",
+        json={"content": "餐饮行业整体、小红书渠道、目标地区上海，圈选女性达人，推荐20个"},
+    )
+
+    assert response.status_code == 200
+    brainstorm_meta = response.json()["message"]["metadata"]["brainstorm"]
+    assert brainstorm_meta["options"] == ["<18", "18-24", "25-34", "35-44", "45+"]
+    assert brainstorm_meta["multi"] is True
+
+
+@pytest.mark.asyncio
+async def test_first_round_request_contract_continues(
+    auth_client_factory, db_session, monkeypatch
+) -> None:
+    """首轮澄清的模型请求契约与消息持久化（承接上一个用例的请求结构断言）。"""
+    client = await auth_client_factory("13900000001")
+    created = await client.post("/api/v1/sessions", json={})
+    assert created.status_code == 201
+    session_id = created.json()["id"]
+    model = FakeBrainstormModel(
+        [
+            BrainstormModelOutput(
+                ready=False,
+                assistant_message="好的，先确认要分析的渠道。",
+                question=BrainstormQuestion(
+                    text="想在哪些渠道做分析？", options=["小红书", "抖音", "微博"]
+                ),
+                extracted=BrainstormProfile(brand="欧诗漫"),
+            )
+        ]
+    )
+    _install_model(monkeypatch, model)
+    _share_session_factory(monkeypatch, db_session)
+
+    response = await client.post(
+        f"/api/v1/sessions/{session_id}/brainstorm", json={"content": "我想分析欧诗漫"}
+    )
+    assert response.status_code == 200
+
     # 模型请求契约：purpose/模板/输入结构（消息历史 + 当前画像 + 关键字表清单）。
     request = model.requests[0]
     assert request.purpose == "brainstorm"
