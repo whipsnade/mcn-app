@@ -30,6 +30,7 @@ from app.selection.top10_enrichment import (
 )
 from app.selection.schemas import DimensionInputs, NormalizedKolEvidence, ToolEvidence
 from app.selection.scoring import rating, score_candidate
+from app.selection.scoring_v2 import ScoreContextV2, ScoreInputsV2, score_candidate_v2
 from app.workspace.models import WorkspaceSession
 
 
@@ -112,7 +113,85 @@ def _merge_fields(old: dict[str, Any], new: dict[str, Any]) -> dict[str, Any]:
     return merged
 
 
-def _score_payload(fields: dict[str, Any]) -> dict[str, Any]:
+def _score_context_from_profile(profile: Any) -> ScoreContextV2 | None:
+    """仅包含完整评分目标画像的新名单启用 v2；历史名单沿用原评分。"""
+    if not isinstance(profile, dict):
+        return None
+    industry = profile.get("industry")
+    regions = profile.get("regions")
+    age_ranges = profile.get("age_ranges")
+    if not isinstance(industry, str) or not industry.strip():
+        return None
+    if not isinstance(regions, list) or not isinstance(age_ranges, list):
+        return None
+    normalized_regions = tuple(item.strip() for item in regions if isinstance(item, str) and item.strip())
+    normalized_ages = tuple(item.strip() for item in age_ranges if isinstance(item, str) and item.strip())
+    if not normalized_regions or not normalized_ages:
+        return None
+    return ScoreContextV2(
+        industry=industry.strip(), regions=normalized_regions, age_ranges=normalized_ages
+    )
+
+
+def _number(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None
+
+
+def _whole_number(value: Any) -> int | None:
+    number = _number(value)
+    return int(number) if number is not None and number >= 0 else None
+
+
+def _distribution(value: Any) -> dict[str, float]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        key: number
+        for key, item in value.items()
+        if isinstance(key, str) and (number := _number(item)) is not None and number >= 0
+    }
+
+
+def _score_payload(
+    fields: dict[str, Any],
+    *,
+    score_context: ScoreContextV2 | None = None,
+    detail_facts: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if score_context is not None:
+        facts = detail_facts or {}
+        followers = _whole_number(facts.get("followers")) or _whole_number(fields.get("followers"))
+        average_interactions = _number(facts.get("recent_30d_average_interactions"))
+        if average_interactions is None:
+            average_interactions = _number(facts.get("average_interactions"))
+        return score_candidate_v2(
+            score_context,
+            ScoreInputsV2(
+                audience_interests=_distribution(facts.get("audience_interests")),
+                audience_regions=_distribution(facts.get("audience_regions")),
+                audience_age=_distribution(facts.get("audience_age")),
+                average_interactions=average_interactions,
+                effective_follower_rate=(
+                    _number(facts.get("effective_follower_rate"))
+                    if facts.get("effective_follower_rate") is not None
+                    else _number(fields.get("audience_score"))
+                ),
+                active_follower_count=_whole_number(facts.get("active_follower_count")),
+                content_score=(
+                    _number(facts.get("content_score"))
+                    if facts.get("content_score") is not None
+                    else _number(fields.get("content_score"))
+                ),
+                followers=followers,
+                interaction_follower_ratio=_number(
+                    facts.get("average_interaction_per_follower_rate")
+                ),
+            ),
+        )
     dimensions = DimensionInputs(
         audience=fields.get("audience_score"),
         content=fields.get("content_score"),
@@ -177,6 +256,7 @@ class KolSelectionService:
             arguments=arguments,
             source_call_id=task_id,
         )
+        score_context = await self._score_context_for_session(session_id)
         for item in normalized_rows:
             await self._upsert_row(
                 model=SessionKolSelection,
@@ -186,6 +266,7 @@ class KolSelectionService:
                 task_id=task_id,
                 tool_name=tool_name,
                 item=item,
+                score_context=score_context,
             )
         await self._db.flush()
         return len(normalized_rows)
@@ -242,6 +323,11 @@ class KolSelectionService:
         session = await self._db.get(WorkspaceSession, session_id)
         if session is None or session.user_id != user_id or session.deleted_at is not None:
             raise LookupError("session_not_found")
+
+    async def _score_context_for_session(self, session_id: str) -> ScoreContextV2 | None:
+        session = await self._db.get(WorkspaceSession, session_id)
+        profile = (session.filters_snapshot or {}).get("brainstorm_profile") if session else None
+        return _score_context_from_profile(profile)
 
     async def ensure_selection_set(
         self,
@@ -328,6 +414,7 @@ class KolSelectionService:
         归属校验经 set→session。返回写入行数。
         """
         selection_set = await self._require_owned_set(user_id, selection_set_id)
+        score_context = await self._score_context_for_session(selection_set.session_id)
         normalized_rows = self._normalize_evidence(
             tool_name=tool_name,
             structured_content=structured_content,
@@ -343,9 +430,42 @@ class KolSelectionService:
                 task_id=task_id,
                 tool_name=tool_name,
                 item=item,
+                score_context=score_context,
             )
         await self._db.flush()
         return len(normalized_rows)
+
+    async def rescore_selection_set_details(self, selection_set_id: str) -> int:
+        """Top20 详情落库后，仅重算带完整目标画像的当前名单项。"""
+        selection_set = await self._db.get(KolSelectionSet, selection_set_id)
+        if selection_set is None:
+            return 0
+        score_context = await self._score_context_for_session(selection_set.session_id)
+        if score_context is None:
+            return 0
+        snapshots = {
+            (snapshot.platform, snapshot.kol_uid): snapshot.facts_json or {}
+            for snapshot in (
+                await self._db.scalars(
+                    select(KolSelectionDetailSnapshot).where(
+                        KolSelectionDetailSnapshot.selection_set_id == selection_set_id
+                    )
+                )
+            ).all()
+        }
+        changed = 0
+        for row in await self._set_rows(selection_set_id):
+            facts = snapshots.get((row.platform, row.kol_uid))
+            if facts is None:
+                continue
+            row.score_json = _score_payload(
+                row.fields_json or {}, score_context=score_context, detail_facts=facts
+            )
+            row.updated_at = _utcnow()
+            changed += 1
+        if changed:
+            await self._db.flush()
+        return changed
 
     async def latest_selection_set(self, session_id: str) -> KolSelectionSet | None:
         """会话最新一份名单容器（version 最大），无则 None。"""
@@ -602,6 +722,7 @@ class KolSelectionService:
         task_id: str,
         tool_name: str,
         item: NormalizedKolEvidence,
+        score_context: ScoreContextV2 | None,
     ) -> None:
         """按 (归属列, platform, kol_uid) upsert，新旧两张圈选表共用。
 
@@ -657,16 +778,20 @@ class KolSelectionService:
                 updated_at=now,
                 **{owner_attr.key: owner_id},
             )
-            self._apply_fields(row, fields)
+            self._apply_fields(row, fields, score_context=score_context)
             self._db.add(row)
             return
         fields = _merge_fields(existing.fields_json or {}, item.as_dict())
         existing.last_task_id = task_id
         existing.updated_at = now
-        self._apply_fields(existing, fields)
+        self._apply_fields(existing, fields, score_context=score_context)
 
     def _apply_fields(
-        self, row: SessionKolSelection | KolSelectionItem, fields: dict[str, Any]
+        self,
+        row: SessionKolSelection | KolSelectionItem,
+        fields: dict[str, Any],
+        *,
+        score_context: ScoreContextV2 | None,
     ) -> None:
         export_fields = fields.get("export_fields") or {}
         city = export_fields.get("city")
@@ -676,4 +801,4 @@ class KolSelectionService:
         profile_url = fields.get("normalized_profile_url")
         row.profile_url = str(profile_url)[:512] if _present(profile_url) else None
         row.fields_json = fields
-        row.score_json = _score_payload(fields)
+        row.score_json = _score_payload(fields, score_context=score_context)

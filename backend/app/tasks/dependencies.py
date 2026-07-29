@@ -957,6 +957,9 @@ class DatabaseTop20DetailEnrichment:
                     facts=facts,
                     trend_points=trend_points,
                 )
+            # 详情是评分 v2 的权威数据源；仅含完整目标画像的新名单会被重算，
+            # 历史名单保持旧评分与排序，不做迁移或回填。
+            await KolSelectionService(db).rescore_selection_set_details(plan.selection_set_id)
 
 
 class TaskExecutionDependencies:

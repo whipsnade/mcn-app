@@ -533,6 +533,9 @@ def _normalize_detail_row(
     followers = _first_value(row, _GENERIC_FOLLOWER_KEYS, _unit_integer)
     if followers is not None:
         facts["followers"] = followers
+    content_score = _first_value(row, ("综合评分", "content_score"), _score)
+    if content_score is not None:
+        facts["content_score"] = content_score
 
     if "fansAudience" in requested_scopes:
         audience = _first_detail_mapping(row, _DETAIL_AUDIENCE_KEYS)
@@ -552,7 +555,10 @@ def _normalize_detail_row(
     if "accountTrend" in requested_scopes:
         trend_rows = _first_detail_list(row, _DETAIL_TREND_KEYS)
         trend_points = _weekly_trend_points(trend_rows)
-        if trend_points:
+        recent_average_interactions = _recent_average_interactions(trend_rows)
+        if recent_average_interactions is not None:
+            facts["recent_30d_average_interactions"] = recent_average_interactions
+        if trend_points or recent_average_interactions is not None:
             completed.add("accountTrend")
 
     return facts, trend_points, tuple(scope for scope in _DETAIL_SCOPE_ORDER if scope in completed)
@@ -639,6 +645,21 @@ def _weekly_trend_points(rows: list[Any]) -> tuple[dict[str, Any], ...]:
         }
         for week_start, values in sorted(grouped.items())[-4:]
     )
+
+
+def _recent_average_interactions(rows: list[Any]) -> float | None:
+    """详情趋势中的有效日值优先作为近30天平均互动；不足30天也只按真实日值平均。"""
+    today = date.today()
+    earliest = today - timedelta(days=29)
+    values: list[int | float] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        trend_date = _detail_trend_date(row)
+        interactions = _first_value(row, ("互动数", "互动量", "interactions"), _non_negative_number)
+        if trend_date is not None and interactions is not None and earliest <= trend_date <= today:
+            values.append(interactions)
+    return round(sum(values) / len(values), 2) if values else None
 
 
 def _detail_trend_date(row: dict[str, Any]) -> date | None:

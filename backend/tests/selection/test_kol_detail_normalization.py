@@ -16,6 +16,7 @@ def test_normalizes_batch_detail_scopes_and_groups_recent_trend_by_week() -> Non
                     {
                         "账号ID (kwUid)": "dy-1",
                         "粉丝数": "10万",
+                        "综合评分": 85,
                         "受众画像": {
                             "粉丝年龄分布": {"18-24": "40%", "25-34": "35%"},
                             "粉丝省份分布Top10": {"上海": "18%", "北京": "12%"},
@@ -61,6 +62,7 @@ def test_normalizes_batch_detail_scopes_and_groups_recent_trend_by_week() -> Non
     )
     assert detail.facts == {
         "followers": 100_000,
+        "content_score": 85.0,
         "effective_follower_rate": 62.0,
         "active_follower_count": 62_000,
         "audience_age": {"18-24": 40, "25-34": 35},
@@ -70,6 +72,7 @@ def test_normalizes_batch_detail_scopes_and_groups_recent_trend_by_week() -> Non
         "average_interactions": 1200,
         "average_reads": 20_000,
         "average_interaction_per_follower_rate": 1.2,
+        "recent_30d_average_interactions": 300.0,
     }
     first_week = first_day - timedelta(days=first_day.weekday())
     last_day = today - timedelta(days=2)

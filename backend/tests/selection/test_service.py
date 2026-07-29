@@ -9,6 +9,7 @@ import pytest
 from sqlalchemy import select
 
 from app.selection.models import SessionKolSelection
+from app.selection.detail_snapshots import DetailSnapshotStore
 from app.selection.scoring import rating
 from app.selection.service import KolSelectionService
 from app.workspace.models import WorkspaceSession
@@ -113,6 +114,67 @@ async def test_ingest_xiaohongshu_search_upserts_scored_rows(db_session, user_fa
     assert row.score_json["stars"] == expected_stars
     assert row.fields_json["quoted_price_cny"] == 8000.0
     assert row.fields_json["export_fields"]["city"] == "杭州市"
+
+
+@pytest.mark.asyncio
+async def test_detail_facts_rescore_new_selection_with_strict_v2_profile(
+    db_session, user_factory
+) -> None:
+    user_id, session_id = await _create_session(db_session, user_factory)
+    session = await db_session.get(WorkspaceSession, session_id)
+    assert session is not None
+    session.filters_snapshot = {
+        "brainstorm_profile": {
+            "industry": "美食",
+            "regions": ["上海"],
+            "age_ranges": ["18-24", "25-34"],
+        }
+    }
+    service = KolSelectionService(db_session)
+    selection_set = await service.ensure_selection_set(
+        user_id, session_id, task_id="task-v2", title="评分 v2 名单"
+    )
+    await service.ingest_tool_evidence_to_set(
+        user_id=user_id,
+        selection_set_id=selection_set.id,
+        task_id="task-v2",
+        tool_name=_XHS_TOOL,
+        structured_content=_xhs_payload(_xhs_row("xhs-v2")),
+    )
+    _total, initial_rows = await service.list_selection_items(
+        user_id=user_id, selection_set_id=selection_set.id
+    )
+    assert initial_rows[0].score_json["version"] == "kol_score_v2"
+    assert initial_rows[0].score_json["data_completeness"] == 40
+    await DetailSnapshotStore(db_session).upsert(
+        selection_set_id=selection_set.id,
+        platform="xiaohongshu",
+        kol_uid="xhs-v2",
+        rank=1,
+        ranking_interaction=6_000,
+        scope_status={"fansAudience": "succeeded", "postSummaryStatistics": "succeeded"},
+        facts={
+            "audience_interests": {"美食": 45},
+            "audience_regions": {"上海": 18},
+            "audience_age": {"18-24": 40, "25-34": 30},
+            "recent_30d_average_interactions": 6_000,
+            "effective_follower_rate": 62,
+        },
+        trend_points=[],
+    )
+
+    changed = await service.rescore_selection_set_details(selection_set.id)
+
+    assert changed == 1
+    _total, rows = await service.list_selection_items(
+        user_id=user_id, selection_set_id=selection_set.id
+    )
+    score = rows[0].score_json
+    assert score["version"] == "kol_score_v2"
+    assert score["data_completeness"] == 100
+    assert score["dimensions"]["industry_interest"]["raw_score"] == 45
+    assert score["dimensions"]["engagement"]["raw_score"] == 60
+    assert score["dimensions"]["engagement_follower_ratio"]["raw_score"] == 80
 
 
 @pytest.mark.asyncio
