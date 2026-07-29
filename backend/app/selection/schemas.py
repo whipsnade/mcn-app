@@ -159,3 +159,14 @@ class NormalizedKolEvidence:
             "export_fields": self.export_fields,
             "analytics_fields": self.analytics_fields,
         }
+
+
+@dataclass(frozen=True)
+class NormalizedKolDetailFacts:
+    """批量 ``kol.detail`` 响应中可安全持久化的达人详情事实。"""
+
+    platform: str
+    platform_account_id: str
+    facts: dict[str, Any]
+    trend_points: tuple[dict[str, Any], ...]
+    completed_scopes: tuple[str, ...]
