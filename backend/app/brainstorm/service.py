@@ -1,7 +1,9 @@
 import json
 import logging
 import re
+import unicodedata
 from datetime import UTC, date, datetime
+from typing import Any
 from uuid import uuid4
 
 from sqlalchemy import func, select
@@ -45,6 +47,51 @@ _SCORE_PROFILE_FIELDS: tuple[tuple[str, str], ...] = (
 # 评分 v2 目标年龄段固定档位（与 selection/scoring_v2 的标准桶一致）。
 _AGE_RANGE_BUCKETS: list[str] = ["<18", "18-24", "25-34", "35-44", "45+"]
 _AGE_QUESTION_PATTERN = re.compile(r"年龄|岁")
+_REGION_QUESTION_PATTERN = re.compile(r"地区")
+_REGION_SPLIT_PATTERN = re.compile(r"[、，,/，,]|\s+")
+
+
+def _last_assistant_question(messages: list) -> str:
+    for message in reversed(messages):
+        if message.role == "assistant":
+            return message.content or ""
+    return ""
+
+
+def _parse_region_answer(text: str) -> list[str]:
+    """把用户对地区问题的自由回答拆成地区数组；明显不像地区列表时返回空。"""
+    parts = [part.strip() for part in _REGION_SPLIT_PATTERN.split(text) if part.strip()]
+    if not parts or len(parts) > 10 or any(len(part) > 20 for part in parts):
+        return []
+    return list(dict.fromkeys(parts))
+
+
+def _parse_age_range_answer(text: str) -> list[str]:
+    """从用户对年龄问题的回答中匹配标准年龄桶。"""
+    normalized = (
+        unicodedata.normalize("NFKC", text).replace(" ", "").replace("岁", "").replace("至", "-")
+    )
+    return [bucket for bucket in _AGE_RANGE_BUCKETS if bucket in normalized]
+
+
+def _deterministic_v2_answers(
+    missing: tuple[str, ...], question_text: str, answer_text: str
+) -> dict[str, Any]:
+    """模型漏提取时的确定性兜底：上一轮问的是哪个 v2 字段，就从用户答案解析哪个字段。
+
+    实证形态：MiniMax 把用户对目标地区问题的回答写进单数 region 字段、regions 数组
+    恒为空，导致地区问题无限循环（2026-07-29 生产事故）。
+    """
+    updates: dict[str, Any] = {}
+    if "目标地区" in missing and _REGION_QUESTION_PATTERN.search(question_text):
+        regions = _parse_region_answer(answer_text)
+        if regions:
+            updates["regions"] = regions
+    if "目标年龄段" in missing and _AGE_QUESTION_PATTERN.search(question_text):
+        age_ranges = _parse_age_range_answer(answer_text)
+        if age_ranges:
+            updates["age_ranges"] = age_ranges
+    return updates
 
 
 def utc_now() -> datetime:
@@ -136,6 +183,19 @@ class BrainstormService:
         # 直接进入会扣 MCP 积分的 KOL 任务。
         candidate_profile = merge_profile(profile, output.extracted)
         missing = missing_score_target_profile(candidate_profile)
+        if missing:
+            # 模型漏提取兜底：上一轮问的是哪个 v2 字段，就从用户答案解析哪个字段。
+            updates = _deterministic_v2_answers(
+                missing,
+                _last_assistant_question(messages),
+                payload.content,
+            )
+            if updates:
+                output = output.model_copy(
+                    update={"extracted": output.extracted.model_copy(update=updates)}
+                )
+                candidate_profile = merge_profile(profile, output.extracted)
+                missing = missing_score_target_profile(candidate_profile)
         if output.ready and missing:
             message, options, multi = score_target_profile_question(candidate_profile, missing)
             output = output.model_copy(
