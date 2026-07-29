@@ -11,7 +11,12 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.selection.models import KolSelectionItem, KolSelectionSet, SessionKolSelection
+from app.selection.models import (
+    KolSelectionDetailSnapshot,
+    KolSelectionItem,
+    KolSelectionSet,
+    SessionKolSelection,
+)
 from app.selection.normalizers import (
     _GENERIC_PLATFORM_ALIASES,
     _MERGEABLE_FIELDS,
@@ -495,6 +500,54 @@ class KolSelectionService:
             selection_set_id=selection_set.id,
             groups=group_detail_targets_by_platform(targets),
         )
+
+    async def list_top10_trend(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        selection_set_id: str | None,
+    ) -> tuple[str | None, list[dict[str, Any]]]:
+        """读取指定名单版本的前十趋势快照；仅返回 BI 所需的安全字段。"""
+        selection_set = await self.resolve_selection_set(
+            user_id=user_id,
+            session_id=session_id,
+            selection_set_id=selection_set_id,
+        )
+        if selection_set is None:
+            return None, []
+        snapshots = list(
+            (
+                await self._db.scalars(
+                    select(KolSelectionDetailSnapshot)
+                    .where(
+                        KolSelectionDetailSnapshot.selection_set_id == selection_set.id,
+                        KolSelectionDetailSnapshot.rank <= 10,
+                    )
+                    .order_by(KolSelectionDetailSnapshot.rank)
+                )
+            ).all()
+        )
+        item_by_identity = {
+            (item.platform, item.kol_uid): item
+            for item in await self._set_rows(selection_set.id)
+        }
+        return selection_set.id, [
+            {
+                "rank": snapshot.rank,
+                "platform": snapshot.platform,
+                "kol_uid": snapshot.kol_uid,
+                "nickname": item_by_identity.get(
+                    (snapshot.platform, snapshot.kol_uid)
+                ).nickname
+                if item_by_identity.get((snapshot.platform, snapshot.kol_uid)) is not None
+                else "",
+                "ranking_interaction": snapshot.ranking_interaction,
+                "scope_status": snapshot.scope_status_json or {},
+                "trend_points": snapshot.trend_points_json or [],
+            }
+            for snapshot in snapshots
+        ]
 
     async def _set_rows(self, selection_set_id: str) -> list[KolSelectionItem]:
         return list(

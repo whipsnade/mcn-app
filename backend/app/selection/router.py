@@ -83,6 +83,27 @@ async def list_selection_sets(
     ]
 
 
+@router.get("/sessions/{session_id}/kol-top10-trend")
+async def list_kol_top10_trend(
+    session_id: str,
+    user: CurrentUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    set_id: Annotated[str | None, Query()] = None,
+) -> dict[str, Any]:
+    """KOL 分析页趋势图：指定名单版本的 rank 1–10，缺省读最新版本。"""
+    try:
+        resolved_set_id, items = await KolSelectionService(db).list_top10_trend(
+            user_id=user.id,
+            session_id=session_id,
+            selection_set_id=set_id,
+        )
+    except LookupError as error:
+        if str(error) in {"session_not_found", "selection_set_not_found"}:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(error)) from error
+        raise
+    return {"set_id": resolved_set_id, "items": items}
+
+
 @router.get("/sessions/{session_id}/kol-selection/export")
 async def export_kol_selection(
     session_id: str,

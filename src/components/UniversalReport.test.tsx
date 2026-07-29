@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { ApiAnalysisReport, ApiArtifactsSummary, ApiFavorite, ApiSessionReportItem } from '../api/contracts';
 import { createFavoriteByKey, deleteFavoriteByKey } from '../api/favorites';
-import { downloadKolSelection, getKolSelection, listSelectionSets, runKolAnalysis } from '../api/kolSelection';
+import { downloadKolSelection, getKolSelection, getKolTop10Trend, listSelectionSets, runKolAnalysis } from '../api/kolSelection';
 import { listSessionReports } from '../api/reports';
 import { getAnalysisReport } from '../api/tasks';
 import { analysisReportFixture } from '../test/fixtures';
@@ -13,6 +13,7 @@ vi.mock('../api/kolSelection', () => ({
   runKolAnalysis: vi.fn(),
   downloadKolSelection: vi.fn(),
   getKolSelection: vi.fn(),
+  getKolTop10Trend: vi.fn(),
   listSelectionSets: vi.fn(),
 }));
 
@@ -77,6 +78,7 @@ describe('UniversalReport', () => {
     vi.mocked(runKolAnalysis).mockReset();
     vi.mocked(downloadKolSelection).mockReset();
     vi.mocked(getKolSelection).mockReset();
+    vi.mocked(getKolTop10Trend).mockReset().mockResolvedValue({ set_id: null, items: [] });
     vi.mocked(listSelectionSets).mockReset().mockResolvedValue([]);
     vi.mocked(listSessionReports).mockReset().mockResolvedValue([]);
     vi.mocked(getAnalysisReport).mockReset();
@@ -239,6 +241,17 @@ describe('UniversalReport', () => {
 
     expect(screen.getByText(/已圈选 3 位达人/)).toBeVisible();
     expect(getKolSelection).not.toHaveBeenCalled();
+  });
+
+  it('renders the Top10 KOL weekly interaction trend on the analysis tab', async () => {
+    vi.mocked(getKolTop10Trend).mockResolvedValue({
+      set_id: 'set-1',
+      items: [{ rank: 1, platform: 'douyin', kol_uid: 'dy-1', nickname: '达人甲', ranking_interaction: 1200, scope_status: {}, trend_points: [{ week_start: '2026-07-06', average_interactions: 1200, post_count: 2 }] }],
+    });
+    render(<UniversalReport sessionId="session-1" selectionCount={1} />);
+
+    expect(await screen.findByText('Top10 KOL互动趋势')).toBeVisible();
+    expect(getKolTop10Trend).toHaveBeenCalledWith('session-1', undefined);
   });
 
   it('loads and renders KOL cards when switching to the selection tab', async () => {

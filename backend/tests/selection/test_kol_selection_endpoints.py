@@ -9,6 +9,7 @@ from uuid import uuid4
 import pytest
 
 from app.selection.models import KolSelectionItem
+from app.selection.detail_snapshots import DetailSnapshotStore
 from app.selection.service import KolSelectionService
 from app.workspace.models import WorkspaceSession
 
@@ -249,3 +250,44 @@ async def test_set_id_from_another_session_returns_404(auth_client_factory, db_s
         f"/api/v1/sessions/{session_id}/kol-selection", params={"set_id": "missing-set"}
     )
     assert missing.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_top10_trend_returns_safe_ranked_snapshot_data(auth_client_factory, db_session) -> None:
+    client = await auth_client_factory("13400000107")
+    session_id = await _session_id_of(client)
+    session = await db_session.get(WorkspaceSession, session_id)
+    set_id = await _seed_items(
+        db_session, session.user_id, session_id, [("uid-a", 80.0), ("uid-b", 70.0)]
+    )
+    snapshots = DetailSnapshotStore(db_session)
+    await snapshots.upsert(
+        selection_set_id=set_id,
+        platform="xiaohongshu",
+        kol_uid="uid-a",
+        rank=1,
+        ranking_interaction=1234.0,
+        scope_status={"accountTrend": "succeeded"},
+        facts={"effective_follower_rate": 60.0},
+        trend_points=[{"week_start": "2026-07-06", "average_interactions": 1234.0, "post_count": 3}],
+    )
+
+    response = await client.get(f"/api/v1/sessions/{session_id}/kol-top10-trend")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "set_id": set_id,
+        "items": [
+            {
+                "rank": 1,
+                "platform": "xiaohongshu",
+                "kol_uid": "uid-a",
+                "nickname": "达人uid-a",
+                "ranking_interaction": 1234.0,
+                "scope_status": {"accountTrend": "succeeded"},
+                "trend_points": [
+                    {"week_start": "2026-07-06", "average_interactions": 1234.0, "post_count": 3}
+                ],
+            }
+        ],
+    }
