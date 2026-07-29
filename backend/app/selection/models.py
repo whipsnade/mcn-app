@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import JSON, BigInteger, CheckConstraint, DateTime, Float, ForeignKey, Index, Integer, String
+from sqlalchemy import Boolean, JSON, BigInteger, CheckConstraint, DateTime, Float, ForeignKey, Index, Integer, String
 from sqlalchemy import UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -136,5 +136,36 @@ class KolSelectionDetailSnapshot(Base):
     scope_status_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     facts_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     trend_points_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class KolSelectionDetailView(Base):
+    """用户主动查看的达人详情缓存，严格按名单版本隔离。"""
+
+    __tablename__ = "kol_selection_detail_views"
+    __table_args__ = (
+        UniqueConstraint(
+            "selection_set_id",
+            "platform",
+            "kol_uid",
+            name="uq_kol_detail_view_set_platform_uid",
+        ),
+        Index("ix_kol_detail_view_set_fetched", "selection_set_id", "fetched_at"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    selection_set_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("kol_selection_sets.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    platform: Mapped[str] = mapped_column(String(32), nullable=False)
+    kol_uid: Mapped[str] = mapped_column(String(128), nullable=False)
+    detail_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    posts_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False)
+    points_cost: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    posts_degraded: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
