@@ -18,6 +18,11 @@ from app.selection.normalizers import (
     UnknownEvidenceToolError,
     normalize_tool_evidence,
 )
+from app.selection.top10_enrichment import (
+    DetailEnrichmentPlan,
+    group_detail_targets_by_platform,
+    select_top20_detail_targets,
+)
 from app.selection.schemas import DimensionInputs, NormalizedKolEvidence, ToolEvidence
 from app.selection.scoring import rating, score_candidate
 from app.workspace.models import WorkspaceSession
@@ -463,6 +468,33 @@ class KolSelectionService:
         rows = await self._set_rows(selection_set.id)
         rows.sort(key=_score_total, reverse=True)
         return rows
+
+    async def build_top20_detail_plan(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+        task_id: str,
+        goal_id: str | None,
+    ) -> DetailEnrichmentPlan | None:
+        """找到当前任务产生的名单版本，并按跨平台互动量生成 Top20 批量计划。"""
+        await self._require_owned_session(user_id, session_id)
+        statement = select(KolSelectionSet).where(
+            KolSelectionSet.session_id == session_id,
+            KolSelectionSet.task_id == task_id,
+        )
+        if goal_id is not None:
+            statement = statement.where(KolSelectionSet.goal_id == goal_id)
+        selection_set = await self._db.scalar(statement.order_by(KolSelectionSet.version.desc()).limit(1))
+        if selection_set is None:
+            return None
+        targets = select_top20_detail_targets(await self._set_rows(selection_set.id))
+        if not targets:
+            return None
+        return DetailEnrichmentPlan(
+            selection_set_id=selection_set.id,
+            groups=group_detail_targets_by_platform(targets),
+        )
 
     async def _set_rows(self, selection_set_id: str) -> list[KolSelectionItem]:
         return list(

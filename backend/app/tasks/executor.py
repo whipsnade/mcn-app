@@ -15,12 +15,14 @@ from app.model.contracts import ModelAdapterError
 from app.orchestration.loop import (
     AgentLoopContext,
     AgentTrajectory,
+    DetailEnrichmentStep,
     EvidenceNote,
     TrajectoryStep,
     build_loop_state,
     resolve_agent_call,
     restore_agent_trajectory,
 )
+from app.selection.top10_enrichment import DETAIL_SCOPES, DetailEnrichmentPlan, DetailEnrichmentTarget
 from app.orchestration.schemas import PlanValidationError
 from app.reporting.analysis_reports import sanitize_evidence
 from app.tasks.errors import canonical_platform, safe_error
@@ -113,6 +115,23 @@ class SelectionIngest(Protocol):
     ) -> None: ...
 
 
+class DetailEnrichment(Protocol):
+    async def prepare(
+        self, *, user_id: str, session_id: str, task_id: str, goal_id: str | None
+    ) -> DetailEnrichmentPlan | None: ...
+
+    async def persist(
+        self,
+        *,
+        plan: DetailEnrichmentPlan,
+        platform: str,
+        targets: tuple[DetailEnrichmentTarget, ...],
+        arguments: dict[str, Any],
+        structured_content: Any,
+        succeeded: bool,
+    ) -> None: ...
+
+
 Checkpoint = Callable[[str], Awaitable[None]]
 logger = logging.getLogger(__name__)
 
@@ -156,6 +175,7 @@ class GoalOutcome:
     # 缺工具名决策连续修正耗尽（>2 次仍缺名）：单 goal 路径据此做受限交付，
     # 编排路径按失败收尾（本期不做降级）。
     recovery_exhausted: bool = False
+    enrichment_failed: bool = False
 
 
 def _v2_plan_json(slices: dict[str, AgentTrajectory]) -> dict[str, Any]:
@@ -164,7 +184,9 @@ def _v2_plan_json(slices: dict[str, AgentTrajectory]) -> dict[str, Any]:
         "schema": "agent_trajectory_v2",
         "goals": {
             goal_id: trajectory.model_dump(
-                mode="json", by_alias=True, include={"steps", "results"}
+                mode="json",
+                by_alias=True,
+                include={"steps", "results", "detail_enrichment_steps"},
             )
             for goal_id, trajectory in slices.items()
         },
@@ -257,6 +279,7 @@ class TaskExecutor:
         gateway: McpBatchGateway,
         artifacts: TaskArtifacts | None = None,
         selection: SelectionIngest | None = None,
+        detail_enrichment: DetailEnrichment | None = None,
         goal_planner_shadow: GoalPlannerShadow | None = None,
         worker_id: str,
         lease_seconds: int = 60,
@@ -269,6 +292,7 @@ class TaskExecutor:
         self.gateway = gateway
         self.artifacts = artifacts
         self.selection = selection
+        self.detail_enrichment = detail_enrichment
         self.goal_planner_shadow = goal_planner_shadow
         self.worker_id = worker_id
         self.lease_seconds = lease_seconds
@@ -330,6 +354,109 @@ class TaskExecutor:
             )
         except Exception:
             logger.warning("goal_finalize_failed task_id=%s", task_id, exc_info=True)
+
+    async def _enrich_top20_details(
+        self,
+        *,
+        task: Any,
+        goal_id: str | None,
+        trajectory: AgentTrajectory,
+        step_prefix: str,
+        persist,
+    ) -> tuple[bool, bool]:
+        """在报告构建前批量补全 Top20；返回 ``(失败, 租约写入失败)``。
+
+        每个平台将最多 20 位 uid 合并为一次真实 MCP 调用。参数先落入
+        trajectory 的独立详情步骤，保证计费网关在崩溃恢复时可重取同一参数。
+        详情失败不会推翻已完成的圈选，只使任务以 warnings 收尾。
+        """
+        if self.detail_enrichment is None:
+            return False, False
+        try:
+            plan = await self.detail_enrichment.prepare(
+                user_id=task.user_id,
+                session_id=task.session_id,
+                task_id=task.id,
+                goal_id=goal_id,
+            )
+        except Exception:
+            logger.warning("top20_detail_plan_failed task_id=%s", task.id, exc_info=True)
+            return True, False
+        if plan is None:
+            return False, False
+
+        namespace = step_prefix.removesuffix("_step")
+        existing = {step.id: step for step in trajectory.detail_enrichment_steps}
+        scheduled: list[tuple[DetailEnrichmentStep, str, tuple[DetailEnrichmentTarget, ...]]] = []
+        for platform, targets in plan.groups:
+            step_id = f"{namespace}_detail_{platform}" if namespace != "step" else f"detail_{platform}"
+            arguments = {
+                "platform": platform,
+                "kwUidList": [target.kol_uid for target in targets],
+                "scope": list(DETAIL_SCOPES),
+            }
+            step = existing.get(step_id)
+            if step is None:
+                step = DetailEnrichmentStep(id=step_id, arguments=arguments)
+                trajectory.detail_enrichment_steps.append(step)
+            if step.status == "planned":
+                scheduled.append((step, platform, targets))
+        if not scheduled:
+            return False, False
+        if not await persist():
+            return False, True
+
+        commands = tuple(
+            ExecuteMcpCall(
+                logical_call_id=str(uuid5(NAMESPACE_URL, f"{task.id}:{step.id}")),
+                user_id=task.user_id,
+                task_id=task.id,
+                plan_step_id=step.id,
+                internal_tool_name="datatap.social.grow.kol.detail.v1",
+                arguments=step.arguments,
+                lease_owner=self.worker_id,
+                goal_id=goal_id,
+            )
+            for step, _platform, _targets in scheduled
+        )
+        try:
+            rows = await self.gateway.execute_batch(commands)
+        except InsufficientPointsError:
+            for step, _platform, _targets in scheduled:
+                step.status = "skipped"
+            if not await persist():
+                return False, True
+            return True, False
+        except Exception:
+            logger.warning("top20_detail_batch_failed task_id=%s", task.id, exc_info=True)
+            rows = ()
+
+        failed = len(rows) != len(scheduled)
+        for index, (step, platform, targets) in enumerate(scheduled):
+            row = rows[index] if index < len(rows) else None
+            succeeded = getattr(row, "status", None) == "settled"
+            content = (
+                (getattr(row, "evidence_json", None) or {}).get("structured_content")
+                if row is not None
+                else None
+            )
+            try:
+                await self.detail_enrichment.persist(
+                    plan=plan,
+                    platform=platform,
+                    targets=targets,
+                    arguments=step.arguments,
+                    structured_content=content,
+                    succeeded=succeeded,
+                )
+            except Exception:
+                logger.warning("top20_detail_snapshot_failed task_id=%s", task.id, exc_info=True)
+                succeeded = False
+            step.status = "succeeded" if succeeded else "failed"
+            failed = failed or not succeeded
+        if not await persist():
+            return failed, True
+        return failed, False
 
     async def run(self, task_id: str) -> None:
         task = await self.repository.claim_lease(task_id, self.worker_id, self.lease_seconds)
@@ -525,6 +652,17 @@ class TaskExecutor:
                 self.worker_id,
                 "no_evidence_collected",
             )
+        if policy.ingest_enabled:
+            outcome.enrichment_failed, enrichment_lease_failed = await self._enrich_top20_details(
+                task=task,
+                goal_id=goal_id,
+                trajectory=trajectory,
+                step_prefix="step",
+                persist=persist,
+            )
+            if enrichment_lease_failed:
+                return False
+            outcome.has_failures = outcome.has_failures or outcome.enrichment_failed
         if self.artifacts is not None:
             await self.artifacts.write_conclusion_message(task.id, outcome.finish_conclusion)
             # 结论消息之后、终态标记之前触发自动 KOL 分析：report.updated
@@ -675,6 +813,17 @@ class TaskExecutor:
                 )
                 goal.status = "failed"
                 continue
+            if policy.ingest_enabled:
+                outcome.enrichment_failed, enrichment_lease_failed = await self._enrich_top20_details(
+                    task=task,
+                    goal_id=goal.id,
+                    trajectory=trajectory,
+                    step_prefix=f"g{goal.sequence}_step",
+                    persist=persist,
+                )
+                if enrichment_lease_failed:
+                    return False
+                outcome.has_failures = outcome.has_failures or outcome.enrichment_failed
             if self.artifacts is not None:
                 await self.artifacts.write_conclusion_message(
                     task.id, outcome.finish_conclusion

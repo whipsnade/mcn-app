@@ -271,12 +271,23 @@ class TrajectoryStep(BaseModel):
     evidence_goal: str = Field(default="", max_length=300)
 
 
+class DetailEnrichmentStep(BaseModel):
+    """任务收尾时系统发起的批量达人详情调用，独立于模型循环步骤。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(pattern=r"^(?:g[0-9]+_)?detail_[a-z0-9_]+$")
+    arguments: dict[str, Any]
+    status: Literal["planned", "succeeded", "failed", "skipped"] = "planned"
+
+
 class AgentTrajectory(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     schema_: str = Field(default=TRAJECTORY_SCHEMA, alias="schema")
     steps: list[TrajectoryStep] = Field(default_factory=list)
     results: list[EvidenceNote] = Field(default_factory=list)
+    detail_enrichment_steps: list[DetailEnrichmentStep] = Field(default_factory=list)
 
     def as_plan_json(self) -> dict[str, Any]:
         return self.model_dump(mode="json", by_alias=True)
@@ -331,6 +342,7 @@ __all__ = [
     "AgentDecision",
     "AgentLoopContext",
     "AgentTrajectory",
+    "DetailEnrichmentStep",
     "EvidenceNote",
     "TrajectoryStep",
     "build_loop_state",
