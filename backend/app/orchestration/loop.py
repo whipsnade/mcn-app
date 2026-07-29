@@ -57,6 +57,18 @@ def _prune_arguments(value: object, schema: dict) -> object:
                 {name: child for name, child in raw_properties.items() if isinstance(child, dict)}
             )
     additional = schema.get("additionalProperties")
+    if additional is None:
+        # anyOf/oneOf/allOf 分支里只要有一个声明 additionalProperties: False，
+        # 未声明的嵌套键也按封闭 schema 剔除——否则模型编造的嵌套参数（如
+        # explosiveRateMax）会漏过裁剪直接撞 validate_input（2026-07-29 事故）。
+        additional = next(
+            (
+                variant.get("additionalProperties")
+                for variant in variants[1:]
+                if variant.get("additionalProperties") is not None
+            ),
+            None,
+        )
     if additional is False or properties:
         result: dict[str, object] = {}
         for key, item in value.items():
