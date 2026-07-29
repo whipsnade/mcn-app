@@ -5,6 +5,8 @@ import type { TaskFlowNode, TaskFlowNodeStatus } from '../state/taskEvents';
 import type { ThinkingBlock } from '../types';
 
 interface TaskFlowNodesProps {
+  /** 当前流程所属任务；切换任务时重置仅属于旧任务的 UI 状态。 */
+  taskId?: string;
   nodes: TaskFlowNode[];
   /** 任务已到终态：节点图自动收缩为一行摘要。 */
   terminal?: boolean;
@@ -190,6 +192,7 @@ function ThinkingFlowNode({ block, expanded, onToggle }: ThinkingFlowNodeProps) 
 }
 
 export default function TaskFlowNodes({
+  taskId,
   nodes,
   terminal = false,
   terminalLabel,
@@ -199,6 +202,13 @@ export default function TaskFlowNodes({
   // 已展开的思考节点集合（nodeKey = operationId:attempt），默认空 = 全折叠；
   // content 更新不改变 key，展开态稳定保留。
   const [expandedThinking, setExpandedThinking] = useState<Set<string>>(new Set());
+
+  // 每次进一步分析都会创建新任务。收起状态和思考节点展开态不应跨任务继承，
+  // 否则新流程会被错误显示成上一流程的终态摘要。
+  useEffect(() => {
+    setCollapsed(false);
+    setExpandedThinking(new Set());
+  }, [taskId]);
 
   // 任务结束（终态）时自动收缩节点图，只留一行可展开的摘要。
   useEffect(() => {

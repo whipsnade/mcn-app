@@ -6,6 +6,23 @@ import type { TaskFlowNode } from '../state/taskEvents';
 import type { ThinkingBlock } from '../types';
 
 describe('TaskFlowNodes', () => {
+  it('在新任务开始时重置上一任务完成后的收起状态', () => {
+    const nodes: TaskFlowNode[] = [
+      { id: 'accepted', label: '任务已受理', status: 'succeeded' },
+    ];
+    const { rerender } = render(
+      <TaskFlowNodes taskId="task-finished" nodes={nodes} terminal terminalLabel="分析完成" />,
+    );
+
+    expect(screen.getByRole('button', { name: /执行流程 · 共 1 步/ }))
+      .toHaveAttribute('aria-expanded', 'false');
+
+    rerender(<TaskFlowNodes taskId="task-next" nodes={nodes} terminal={false} />);
+
+    expect(screen.getByRole('button', { name: '执行流程' }))
+      .toHaveAttribute('aria-expanded', 'true');
+  });
+
   it('renders both the detail and the upstream detail on a failed node', () => {
     const nodes: TaskFlowNode[] = [
       {

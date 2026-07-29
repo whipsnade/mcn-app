@@ -188,6 +188,7 @@ export default function App() {
                     onCancelTask={workspace.cancelActiveTask}
                     isCancelling={workspace.cancelRequested}
                     isMockMode={false}
+                    flowTaskId={workspace.taskRuntime?.taskId}
                     flowNodes={workspace.taskRuntime?.nodes ?? []}
                     flowTerminal={isTerminalTaskStatus(workspace.taskRuntime?.status)}
                     flowTerminalLabel={workspace.taskRuntime?.phaseLabel}

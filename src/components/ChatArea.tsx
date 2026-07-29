@@ -65,6 +65,8 @@ interface ChatAreaProps {
   /** 取消请求已发出、等待任务收敛到终态（暂停按钮禁用并显示 loading）。 */
   isCancelling?: boolean;
   isMockMode: boolean;
+  /** 当前流程所属任务，用于隔离不同轮次分析的流程 UI 状态。 */
+  flowTaskId?: string;
   /** 当前任务的执行流程节点（竖状节点图）。 */
   flowNodes?: TaskFlowNode[];
   /** 任务是否已到终态（节点图自动收缩）。 */
@@ -88,6 +90,7 @@ export default function ChatArea({
   onCancelTask,
   isCancelling = false,
   isMockMode,
+  flowTaskId,
   flowNodes = [],
   flowTerminal = false,
   flowTerminalLabel,
@@ -404,6 +407,7 @@ export default function ChatArea({
               </div>
               {flowNodes.length > 0 && (
                 <TaskFlowNodes
+                  taskId={flowTaskId}
                   nodes={flowNodes}
                   terminal={flowTerminal}
                   terminalLabel={flowTerminalLabel}
