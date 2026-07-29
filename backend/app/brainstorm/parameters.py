@@ -61,6 +61,27 @@ BRAINSTORM_PARAMETERS: tuple[dict[str, str], ...] = (
         "required": "可选",
         "mcp_mapping": "受众地域过滤",
     },
+    {
+        "key": "industry",
+        "label": "目标行业",
+        "description": "拟圈选达人覆盖的行业兴趣，如美食、美妆护肤",
+        "required": "KOL 意图时必填",
+        "mcp_mapping": "受众兴趣匹配与评分",
+    },
+    {
+        "key": "regions",
+        "label": "目标地区",
+        "description": "拟覆盖受众的地区，可多选，如上海、杭州",
+        "required": "KOL 意图时必填",
+        "mcp_mapping": "受众地域匹配与评分",
+    },
+    {
+        "key": "age_ranges",
+        "label": "目标年龄段",
+        "description": "拟覆盖受众年龄段，可多选：<18、18-24、25-34、35-44、45+",
+        "required": "KOL 意图时必填",
+        "mcp_mapping": "受众年龄匹配与评分",
+    },
 )
 
 __all__ = ["BRAINSTORM_PARAMETERS"]

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from dataclasses import replace
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from functools import reduce
 import hashlib
@@ -14,6 +14,7 @@ import unicodedata
 from app.selection.schemas import (
     EvidencePriority,
     NormalizedBrandEvidence,
+    NormalizedKolDetailFacts,
     NormalizedKolEvidence,
     ToolEvidence,
 )
@@ -437,6 +438,247 @@ _GENERIC_PLATFORM_ALIASES = {
     "微信": "wechat",
     "wechat": "wechat",
 }
+_DETAIL_SCOPE_ORDER = ("fansAudience", "postSummaryStatistics", "accountTrend")
+_DETAIL_AUDIENCE_KEYS = ("受众画像", "粉丝画像", "fansAudience")
+_DETAIL_SUMMARY_KEYS = ("发帖数据-汇总统计", "postSummaryStatistics")
+_DETAIL_TREND_KEYS = ("账号趋势", "账号数据趋势", "accountTrend")
+
+
+def normalize_kol_detail_facts(
+    internal_tool_name: str,
+    arguments: dict[str, Any],
+    structured_content: dict[str, Any],
+) -> tuple[NormalizedKolDetailFacts, ...]:
+    """将一次批量 ``kol.detail`` 调用投影为名单快照可用的白名单事实。
+
+    仅处理 DataTap 已审核工具、调用方明确请求的三类 scope，以及请求中的
+    ``kwUidList``。这使供应商返回的其它字段（尤其链接和原始嵌套信息）不会
+    进入持久化快照。
+    """
+    if internal_tool_name != "datatap.social.grow.kol.detail.v1":
+        return ()
+    platform_raw = arguments.get("platform")
+    if not isinstance(platform_raw, str):
+        return ()
+    platform = _GENERIC_PLATFORM_ALIASES.get(platform_raw.strip().casefold())
+    if platform is None:
+        return ()
+    requested_uids = _detail_requested_uids(arguments.get("kwUidList"))
+    requested_scopes = _detail_requested_scopes(arguments.get("scope"))
+    if not requested_uids or not requested_scopes:
+        return ()
+    payload = _detail_payload(structured_content)
+    if payload is None:
+        return ()
+    try:
+        rows = _datatap_candidate_rows(payload)
+    except ValueError:
+        return ()
+
+    details: list[NormalizedKolDetailFacts] = []
+    for row in rows:
+        uid = _first_present_string(row, _GENERIC_ACCOUNT_ID_KEYS)
+        if uid is None or uid not in requested_uids:
+            continue
+        facts, trend_points, completed_scopes = _normalize_detail_row(row, requested_scopes)
+        details.append(
+            NormalizedKolDetailFacts(
+                platform=platform,
+                platform_account_id=uid,
+                facts=facts,
+                trend_points=trend_points,
+                completed_scopes=completed_scopes,
+            )
+        )
+    return tuple(details)
+
+
+def _detail_requested_uids(value: Any) -> set[str]:
+    if not isinstance(value, list):
+        return set()
+    uids: set[str] = set()
+    for item in value[:20]:
+        try:
+            uid = _optional_string(item)
+        except ValueError:
+            continue
+        if uid is not None:
+            uids.add(uid)
+    return uids
+
+
+def _detail_requested_scopes(value: Any) -> set[str]:
+    if not isinstance(value, list) or not value:
+        return set()
+    if any(not isinstance(item, str) or item not in _DETAIL_SCOPE_ORDER for item in value):
+        return set()
+    return set(value)
+
+
+def _detail_payload(structured_content: dict[str, Any]) -> Any | None:
+    raw = structured_content.get("result")
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+    return raw if isinstance(raw, (dict, list)) else None
+
+
+def _normalize_detail_row(
+    row: dict[str, Any], requested_scopes: set[str]
+) -> tuple[dict[str, Any], tuple[dict[str, Any], ...], tuple[str, ...]]:
+    facts: dict[str, Any] = {}
+    completed: set[str] = set()
+    followers = _first_value(row, _GENERIC_FOLLOWER_KEYS, _unit_integer)
+    if followers is not None:
+        facts["followers"] = followers
+    content_score = _first_value(row, ("综合评分", "content_score"), _score)
+    if content_score is not None:
+        facts["content_score"] = content_score
+
+    if "fansAudience" in requested_scopes:
+        audience = _first_detail_mapping(row, _DETAIL_AUDIENCE_KEYS)
+        audience_facts = _detail_audience_facts(audience)
+        if audience_facts:
+            facts.update(audience_facts)
+            completed.add("fansAudience")
+
+    if "postSummaryStatistics" in requested_scopes:
+        summary = _first_detail_mapping(row, _DETAIL_SUMMARY_KEYS)
+        summary_facts = _detail_summary_facts(summary, followers)
+        if summary_facts:
+            facts.update(summary_facts)
+            completed.add("postSummaryStatistics")
+
+    trend_points: tuple[dict[str, Any], ...] = ()
+    if "accountTrend" in requested_scopes:
+        trend_rows = _first_detail_list(row, _DETAIL_TREND_KEYS)
+        trend_points = _weekly_trend_points(trend_rows)
+        recent_average_interactions = _recent_average_interactions(trend_rows)
+        if recent_average_interactions is not None:
+            facts["recent_30d_average_interactions"] = recent_average_interactions
+        if trend_points or recent_average_interactions is not None:
+            completed.add("accountTrend")
+
+    return facts, trend_points, tuple(scope for scope in _DETAIL_SCOPE_ORDER if scope in completed)
+
+
+def _first_detail_mapping(row: dict[str, Any], keys: tuple[str, ...]) -> dict[str, Any]:
+    for key in keys:
+        value = row.get(key)
+        if isinstance(value, dict):
+            return value
+    return {}
+
+
+def _first_detail_list(row: dict[str, Any], keys: tuple[str, ...]) -> list[Any]:
+    for key in keys:
+        value = row.get(key)
+        if isinstance(value, list):
+            return value
+    return []
+
+
+def _detail_audience_facts(audience: dict[str, Any]) -> dict[str, Any]:
+    facts: dict[str, Any] = {}
+    distribution_fields = {
+        "audience_age": ("粉丝年龄分布", "年龄分布"),
+        "audience_regions": ("粉丝省份分布Top10", "粉丝省份分布", "粉丝地域分布"),
+        "audience_interests": ("粉丝兴趣分布", "兴趣分布"),
+    }
+    for target, aliases in distribution_fields.items():
+        for alias in aliases:
+            distribution = _safe_distribution(audience.get(alias))
+            if distribution:
+                facts[target] = distribution
+                break
+    effective_rate = _first_value(audience, ("有效粉丝率", "effective_follower_rate"), _percentage)
+    if effective_rate is not None:
+        facts["effective_follower_rate"] = effective_rate
+    active_followers = _first_value(
+        audience, ("活跃粉丝数", "有效粉丝数", "active_follower_count"), _unit_integer
+    )
+    if active_followers is not None:
+        facts["active_follower_count"] = active_followers
+    return facts
+
+
+def _detail_summary_facts(summary: dict[str, Any], followers: int | None) -> dict[str, Any]:
+    facts: dict[str, Any] = {}
+    values = {
+        "works_count": ("作品数", "笔记数", "视频数"),
+        "average_interactions": ("平均互动", "平均互动量", "平均互动数"),
+        "average_reads": ("平均阅读", "平均阅读量", "平均播放", "平均播放量"),
+    }
+    for target, aliases in values.items():
+        parsed = _first_value(summary, aliases, _non_negative_number)
+        if parsed is not None:
+            facts[target] = parsed
+    average_interactions = facts.get("average_interactions")
+    if followers and average_interactions is not None:
+        facts["average_interaction_per_follower_rate"] = round(
+            float(average_interactions) / followers * 100,
+            4,
+        )
+    return facts
+
+
+def _weekly_trend_points(rows: list[Any]) -> tuple[dict[str, Any], ...]:
+    today = date.today()
+    earliest = today - timedelta(days=29)
+    grouped: dict[date, list[int | float]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        trend_date = _detail_trend_date(row)
+        interactions = _first_value(row, ("互动数", "互动量", "interactions"), _non_negative_number)
+        if trend_date is None or interactions is None or not earliest <= trend_date <= today:
+            continue
+        week_start = trend_date - timedelta(days=trend_date.weekday())
+        grouped.setdefault(week_start, []).append(interactions)
+    return tuple(
+        {
+            "week_start": week_start.isoformat(),
+            "average_interactions": round(sum(values) / len(values), 2),
+            "post_count": len(values),
+        }
+        for week_start, values in sorted(grouped.items())[-4:]
+    )
+
+
+def _recent_average_interactions(rows: list[Any]) -> float | None:
+    """详情趋势中的有效日值优先作为近30天平均互动；不足30天也只按真实日值平均。"""
+    today = date.today()
+    earliest = today - timedelta(days=29)
+    values: list[int | float] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        trend_date = _detail_trend_date(row)
+        interactions = _first_value(row, ("互动数", "互动量", "interactions"), _non_negative_number)
+        if trend_date is not None and interactions is not None and earliest <= trend_date <= today:
+            values.append(interactions)
+    return round(sum(values) / len(values), 2) if values else None
+
+
+def _detail_trend_date(row: dict[str, Any]) -> date | None:
+    value = next(
+        (row[key] for key in ("日期", "时间", "date", "published_at") if _has_value(row.get(key))),
+        None,
+    )
+    if value is None:
+        return None
+    try:
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, date):
+            return value
+        if not isinstance(value, str):
+            return None
+        return date.fromisoformat(value.strip().replace("/", "-")[:10])
+    except ValueError:
+        return None
 
 
 def _datatap_generic_kol_search_adapter(item: ToolEvidence) -> tuple[NormalizedKolEvidence, ...]:

@@ -42,8 +42,11 @@ from app.reporting.builders import (
 from app.reporting.models import AnalysisReport
 from app.selection.analysis import run_kol_analysis
 from app.selection.contract import build_export_field_contract
+from app.selection.detail_snapshots import DetailSnapshotStore
 from app.selection.models import KolSelectionSet
+from app.selection.normalizers import normalize_kol_detail_facts
 from app.selection.service import KolSelectionService
+from app.selection.top10_enrichment import DETAIL_SCOPES, DetailEnrichmentPlan, DetailEnrichmentTarget
 from app.tasks.executor import TaskExecutor, TaskRunner
 from app.tasks.followups import FollowupSuggestionService
 from app.tasks.models import AnalysisTask, TaskEvent
@@ -186,8 +189,14 @@ class _PlanArguments:
                     for step in goal_slice.get("steps", []):
                         if step.get("id") == plan_step_id:
                             return step["arguments"]
+                    for step in goal_slice.get("detail_enrichment_steps", []):
+                        if step.get("id") == plan_step_id:
+                            return step["arguments"]
             else:
                 for step in task.plan_json.get("steps", []):
+                    if step.get("id") == plan_step_id:
+                        return step["arguments"]
+                for step in task.plan_json.get("detail_enrichment_steps", []):
                     if step.get("id") == plan_step_id:
                         return step["arguments"]
         raise LookupError("task_plan_step_not_found")
@@ -889,6 +898,70 @@ class DatabaseSelectionIngest:
         return self._remote_by_internal
 
 
+class DatabaseTop20DetailEnrichment:
+    """Top20 详情补全的 DB 边界：读名单、写快照，不持有 MCP 网络连接。"""
+
+    async def prepare(
+        self, *, user_id: str, session_id: str, task_id: str, goal_id: str | None
+    ) -> DetailEnrichmentPlan | None:
+        async with SessionFactory() as db:
+            return await KolSelectionService(db).build_top20_detail_plan(
+                user_id=user_id,
+                session_id=session_id,
+                task_id=task_id,
+                goal_id=goal_id,
+            )
+
+    async def persist(
+        self,
+        *,
+        plan: DetailEnrichmentPlan,
+        platform: str,
+        targets: tuple[DetailEnrichmentTarget, ...],
+        arguments: dict[str, Any],
+        structured_content: Any,
+        succeeded: bool,
+    ) -> None:
+        normalized = {
+            item.platform_account_id: item
+            for item in normalize_kol_detail_facts(
+                "datatap.social.grow.kol.detail.v1", arguments, structured_content
+            )
+        } if succeeded and isinstance(structured_content, dict) else {}
+        requested_scopes = {
+            scope for scope in arguments.get("scope", []) if scope in DETAIL_SCOPES
+        }
+        async with SessionFactory.begin() as db:
+            store = DetailSnapshotStore(db)
+            for target in targets:
+                detail = normalized.get(target.kol_uid)
+                if succeeded:
+                    completed = set(detail.completed_scopes) if detail is not None else set()
+                    statuses = {
+                        scope: "succeeded" if scope in completed else "skipped"
+                        for scope in requested_scopes
+                    }
+                    facts = detail.facts if detail is not None else {}
+                    trend_points = list(detail.trend_points) if detail is not None else []
+                else:
+                    statuses = {scope: "failed" for scope in requested_scopes}
+                    facts = {}
+                    trend_points = []
+                await store.upsert(
+                    selection_set_id=plan.selection_set_id,
+                    platform=platform,
+                    kol_uid=target.kol_uid,
+                    rank=target.rank,
+                    ranking_interaction=target.ranking_interaction,
+                    scope_status=statuses,
+                    facts=facts,
+                    trend_points=trend_points,
+                )
+            # 详情是评分 v2 的权威数据源；仅含完整目标画像的新名单会被重算，
+            # 历史名单保持旧评分与排序，不做迁移或回填。
+            await KolSelectionService(db).rescore_selection_set_details(plan.selection_set_id)
+
+
 class TaskExecutionDependencies:
     def __init__(self) -> None:
         settings = get_settings()
@@ -907,6 +980,7 @@ class TaskExecutionDependencies:
         self._transport = get_mcp_transport()
         self._arguments = _PlanArguments()
         self._selection = DatabaseSelectionIngest()
+        self._detail_enrichment = DatabaseTop20DetailEnrichment()
 
     async def build_agent_context(
         self,
@@ -1126,6 +1200,7 @@ class TaskExecutionDependencies:
             gateway=self,
             artifacts=_TaskArtifacts(worker_id, get_model_adapter()),
             selection=self._selection,
+            detail_enrichment=self._detail_enrichment,
             goal_planner_shadow=self._goal_planner_shadow,
             worker_id=worker_id,
             lease_seconds=get_settings().task_lease_seconds,

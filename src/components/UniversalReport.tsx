@@ -6,8 +6,8 @@ import {
 } from 'recharts';
 import { Fragment, useEffect, useRef, useState } from 'react';
 
-import { downloadKolSelection, getKolSelection, listSelectionSets, runKolAnalysis } from '../api/kolSelection';
-import type { KolSelectionItem } from '../api/kolSelection';
+import { downloadKolSelection, getKolSelection, getKolTop10Trend, listSelectionSets, runKolAnalysis } from '../api/kolSelection';
+import type { KolSelectionItem, KolTop10TrendItem } from '../api/kolSelection';
 import { listSessionReports } from '../api/reports';
 import type { SessionReportType } from '../api/reports';
 import { getAnalysisReport } from '../api/tasks';
@@ -34,6 +34,29 @@ interface UniversalReportProps {
 }
 
 const chartColors = ['#4f46e5', '#818cf8', '#14b8a6', '#f59b00', '#0ea5e9', '#f43f4f'];
+const trendColors = [...chartColors, '#8b5cf6', '#ec4899', '#22c55e', '#64748b'];
+
+function Top10KolTrendChart({ items }: { items: KolTop10TrendItem[] }) {
+  const [hidden, setHidden] = useState<Set<string>>(new Set());
+  const weeks = [...new Set(items.flatMap(item => item.trend_points.map(point => point.week_start)))].sort();
+  if (!weeks.length) return null;
+  const names = items.map(item => `#${item.rank} ${item.nickname || item.kol_uid}`);
+  const data = weeks.map(week => {
+    const row: Record<string, string | number> = { week: week.slice(5) };
+    items.forEach((item, index) => {
+      const point = item.trend_points.find(value => value.week_start === week);
+      if (point) row[names[index]] = point.average_interactions;
+    });
+    return row;
+  });
+  return <Card title="Top10 KOL互动趋势" icon={<Activity className="h-4 w-4" />}>
+    <p className="mb-2 text-[10px] text-slate-400">近四周平均单帖互动量 · 点击图例筛选达人</p>
+    <div className="mb-2 flex flex-wrap gap-1" aria-label="KOL趋势图例">
+      {names.map((name, index) => <button key={name} type="button" onClick={() => setHidden(current => { const next = new Set(current); next.has(name) ? next.delete(name) : next.add(name); return next; })} className={`rounded px-1.5 py-0.5 text-[9px] ${hidden.has(name) ? 'bg-slate-100 text-slate-400 line-through' : 'bg-indigo-50 text-slate-600'}`}><i className="mr-1 inline-block h-1.5 w-1.5 rounded-full" style={{ backgroundColor: trendColors[index] }} />{name}</button>)}
+    </div>
+    <div className="h-48" aria-label="Top10 KOL互动趋势图表"><ResponsiveContainer width="100%" height="100%"><LineChart data={data} margin={{ top: 8, right: 8, bottom: 4, left: -12 }}><XAxis dataKey="week" tick={{ fontSize: 10, fill: '#94a3b8' }} /><YAxis tick={{ fontSize: 10, fill: '#94a3b8' }} width={42} /><Tooltip formatter={(value, name) => [formatNumber(Number(value)), name]} />{names.map((name, index) => !hidden.has(name) && <Line key={name} type="monotone" dataKey={name} stroke={trendColors[index]} strokeWidth={2} dot={{ r: 2 }} connectNulls />)}</LineChart></ResponsiveContainer></div>
+  </Card>;
+}
 
 function isTerminal(status?: string): boolean {
   return status === 'completed' || status === 'completed_with_warnings' || status === 'insufficient_balance';
@@ -348,6 +371,22 @@ function stringValue(value: unknown): string {
   return typeof value === 'string' ? value.trim() : '';
 }
 
+const SCORE_GUIDE = `评分 v2（八维加权，缺失/无效/无法匹配该维记 0 分，不做估算）：
+行业兴趣 10%（受众兴趣与行业匹配占比）｜目标地区 8%（受众地区与目标地区匹配占比）｜目标年龄 8%（受众年龄桶与目标年龄相交占比）｜互动表现 20%（近 30 天平均单帖互动量，分档）｜活跃粉丝 15%（有效粉丝率或活跃粉丝/粉丝数）｜内容质量 15%（供应商综合评分）｜粉丝规模 10%（粉丝数，分档）｜互动粉丝比 14%（同一平均互动量/粉丝数，分档）。
+分档：粉丝数 <1万/1-10万/10-50万/50-100万/≥100万 对应 20/40/60/80/100 分；平均互动 <1千/1千-5千/5千-2万/2万-10万/≥10万 同档；互动粉丝比 <0.5%/0.5-1%/1-3%/3-6%/≥6% 同档。
+评级：重点推荐≥78、推荐≥62、可考虑≥48、观察<48。`;
+
+function ScoreGuide() {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="relative mb-2 flex items-center gap-1 px-1 text-[10px] text-slate-500">
+      <span>评分说明</span>
+      <button type="button" aria-label="评分说明" onClick={() => setOpen(value => !value)} className="flex h-4 w-4 items-center justify-center rounded-full border border-slate-300 text-[10px] font-bold" title={SCORE_GUIDE}>?</button>
+      {open && <p role="tooltip" className="absolute left-0 top-5 z-10 w-72 rounded-lg border border-slate-200 bg-white p-2 leading-4 shadow-lg">{SCORE_GUIDE}</p>}
+    </div>
+  );
+}
+
 // 互动率/报价是归一化后的合并字段（_MERGEABLE_FIELDS），落在 fields_json 顶层；防御性取数。
 function selectionMetric(item: KolSelectionItem, key: string): number | null {
   return finiteNumber(item.fields?.[key]);
@@ -365,6 +404,8 @@ function KolSelectionCard({ item, favoriteActive, favoriteBusy, onToggleFavorite
   const stars = stringValue(item.score?.stars);
   const rating = stringValue(item.score?.rating);
   const total = finiteNumber(item.score?.total);
+  const version = stringValue(item.score?.version);
+  const completeness = finiteNumber(item.score?.data_completeness);
   const engagementRate = selectionMetric(item, 'engagement_rate');
   const quotedPrice = selectionMetric(item, 'quoted_price_cny');
   const metaParts = [
@@ -409,6 +450,9 @@ function KolSelectionCard({ item, favoriteActive, favoriteBusy, onToggleFavorite
             <span className="rounded-lg bg-slate-100 px-2 py-1 text-[10px] font-semibold text-slate-600">预估报价 ¥{formatNumber(quotedPrice)}</span>
           )}
         </div>
+      )}
+      {version === 'kol_score_v2' && completeness != null && (
+        <p className="mt-2 text-[10px] text-slate-400">数据完整度 {completeness}%</p>
       )}
     </section>
   );
@@ -582,6 +626,7 @@ function KolPanel({ report, taskStatus, sessionId, selectionCount, onReportReady
   const [viewReport, setViewReport] = useState<ApiAnalysisReport>();
   const [selectionSets, setSelectionSets] = useState<ApiSelectionSetItem[]>([]);
   const [selectedSetId, setSelectedSetId] = useState<string>();
+  const [trendItems, setTrendItems] = useState<KolTop10TrendItem[]>([]);
 
   // 面板实例跨会话复用：切换会话时重置本地操作状态，避免把上一个会话的 loading/错误带过来。
   useEffect(() => {
@@ -596,6 +641,7 @@ function KolPanel({ report, taskStatus, sessionId, selectionCount, onReportReady
     setViewReport(undefined);
     setSelectionSets([]);
     setSelectedSetId(undefined);
+    setTrendItems([]);
   }, [sessionId]);
 
   // kol_analysis 报告版本列表：会话切换/分析成功后重拉（选中版本在 props.report 更新时复位）。
@@ -641,9 +687,9 @@ function KolPanel({ report, taskStatus, sessionId, selectionCount, onReportReady
     };
   }, [activeTab, sessionId, selectionRefresh, selectedSetId]);
 
-  // 名单版本列表：圈选达人 tab 激活时拉取。
+  // 名单版本列表：报告与圈选子页共用同一版本。
   useEffect(() => {
-    if (activeTab !== 'selection' || !sessionId) return;
+    if (!sessionId) return;
     let cancelled = false;
     listSelectionSets(sessionId)
       .then(items => {
@@ -653,7 +699,16 @@ function KolPanel({ report, taskStatus, sessionId, selectionCount, onReportReady
     return () => {
       cancelled = true;
     };
-  }, [activeTab, sessionId]);
+  }, [sessionId, selectionRefresh]);
+
+  useEffect(() => {
+    if (!sessionId || activeTab !== 'report') return;
+    let cancelled = false;
+    getKolTop10Trend(sessionId, selectedSetId).then(data => {
+      if (!cancelled) setTrendItems(Array.isArray(data.items) ? data.items : []);
+    }).catch(() => { if (!cancelled) setTrendItems([]); });
+    return () => { cancelled = true; };
+  }, [activeTab, sessionId, selectedSetId, selectionRefresh]);
 
   // 任务状态仅在「变为终态」的跃迁时刷新名单（正在达人 tab 才刷），避免中间态每次变化重复拉取。
   const taskSettled = isTerminal(taskStatus);
@@ -661,7 +716,7 @@ function KolPanel({ report, taskStatus, sessionId, selectionCount, onReportReady
   useEffect(() => {
     const wasSettled = prevSettledRef.current;
     prevSettledRef.current = taskSettled;
-    if (taskSettled && !wasSettled && activeTab === 'selection') {
+    if (taskSettled && !wasSettled) {
       setSelectionRefresh(tick => tick + 1);
     }
   }, [taskSettled, activeTab]);
@@ -865,6 +920,7 @@ function KolPanel({ report, taskStatus, sessionId, selectionCount, onReportReady
               </div>
             ) : (
               <div className="space-y-2.5">
+                <ScoreGuide />
                 {selectionItems.length > 20 && (
                   <p className="px-1 text-[10px] text-slate-400">
                     共 {selectionItems.length} 位达人，按互动率展示 Top 20
@@ -888,15 +944,14 @@ function KolPanel({ report, taskStatus, sessionId, selectionCount, onReportReady
             )}
             {displayedReport ? (
               <>
+                <Top10KolTrendChart items={trendItems} />
                 {taskStatus && !isTerminal(taskStatus) && !viewReport && (
                   <p role="status" className="mb-3 rounded-lg bg-indigo-50 px-2.5 py-2 text-[11px] text-indigo-600">任务进行中，报告内容可能继续更新…</p>
                 )}
                 <ReportBlocks report={displayedReport} />
               </>
             ) : (
-              <div className="flex min-h-[120px] items-center justify-center p-6 text-center text-xs leading-5 text-slate-500">
-                {emptyText}
-              </div>
+              <>{trendItems.length > 0 && <div className="mb-3"><Top10KolTrendChart items={trendItems} /></div>}<div className="flex min-h-[120px] items-center justify-center p-6 text-center text-xs leading-5 text-slate-500">{emptyText}</div></>
             )}
           </>
         )}

@@ -109,6 +109,11 @@ def _export_locations(session: WorkspaceSession) -> list[str]:
     filters = session.filters_snapshot or {}
     profile = filters.get("brainstorm_profile") or {}
     if isinstance(profile, dict):
+        regions = profile.get("regions")
+        if isinstance(regions, list):
+            values = [str(value).strip() for value in regions if str(value).strip()]
+            if values:
+                return values
         region = str(profile.get("region") or "").strip()
         if region:
             return [region]
@@ -134,16 +139,16 @@ def _selection_candidate(
     fields = row.fields_json or {}
     score = row.score_json or {}
     dimensions = score.get("dimensions") or {}
-    # 模板 8 个评分列由 6 个评分维度的 raw_score 映射而来（沿用旧 pipeline 口径）。
+    # v2 直接导出八个评分维度；旧快照保留兼容映射。
     scores = {
-        "industry_interest": _raw_score(dimensions, "content"),
-        "target_region": _raw_score(dimensions, "audience"),
-        "target_age": _raw_score(dimensions, "audience"),
+        "industry_interest": _raw_score(dimensions, "industry_interest") if "industry_interest" in dimensions else _raw_score(dimensions, "content"),
+        "target_region": _raw_score(dimensions, "target_region") if "target_region" in dimensions else _raw_score(dimensions, "audience"),
+        "target_age": _raw_score(dimensions, "target_age") if "target_age" in dimensions else _raw_score(dimensions, "audience"),
         "engagement": _raw_score(dimensions, "engagement"),
-        "active_follower": _raw_score(dimensions, "growth"),
+        "active_follower": _raw_score(dimensions, "active_follower") if "active_follower" in dimensions else _raw_score(dimensions, "growth"),
         "content": _raw_score(dimensions, "content"),
-        "followers": _raw_score(dimensions, "audience"),
-        "engagement_follower_ratio": _raw_score(dimensions, "engagement"),
+        "followers": _raw_score(dimensions, "followers") if "followers" in dimensions else _raw_score(dimensions, "audience"),
+        "engagement_follower_ratio": _raw_score(dimensions, "engagement_follower_ratio") if "engagement_follower_ratio" in dimensions else _raw_score(dimensions, "engagement"),
     }
     raw_values = fields.get("export_fields", {})
     values = dict(raw_values) if isinstance(raw_values, dict) else {}
@@ -244,9 +249,9 @@ def _summary_headers(metadata: dict[str, Any]) -> list[str]:
     age = metadata.get("target_audience") or "目标年龄段"
     return [
         "序号", "平台", "昵称", "评级(★)", "粉丝数", "城市",
-        f"{category}兴趣分\n(满分20)", f"{region}粉丝分\n(满分15)",
-        f"{age}分\n(满分15)", "互动率分\n(满分15)", "活跃粉丝分\n(满分10)",
-        "内容标签分\n(满分10)", "粉丝规模分\n(满分10)", "互动沉淀与粉丝比分\n(满分5)",
+        f"{category}兴趣匹配\n(权重10%)", f"{region}匹配\n(权重8%)",
+        f"{age}匹配\n(权重8%)", "互动表现\n(权重20%)", "活跃粉丝\n(权重15%)",
+        "内容质量\n(权重15%)", "粉丝规模\n(权重10%)", "互动粉丝比\n(权重14%)",
         "综合评分", "匹配评估", "评分理由",
     ]
 
@@ -395,14 +400,14 @@ def _render_methodology_preserving_template(
     sheet["A1"] = "评分方法论与数据来源"
     sheet["A1"].font = Font(name="微软雅黑", bold=True, size=16, color="1F4E79")
     dimensions = [
-        (f"{metadata.get('category') or '行业'}兴趣占比", 20, "按 MCP 返回的行业兴趣占比评分，上限20", "行业兴趣是本轮投放匹配的核心指标"),
-        ("目标地区粉丝占比", 15, "按用户指定地区占比评分，上限15", "地区由本轮会话筛选条件确定"),
-        ("目标年龄段占比", 15, "按 MCP 返回的年龄分布评分，上限15", "年龄分桶按 MCP 实际返回口径聚合"),
-        ("互动率", 15, "按平台规范化互动率评分，上限15", "平台口径在采集结果中保留"),
-        ("活跃粉丝率", 10, "按活跃粉丝比例评分，上限10", "缺失时标记数据缺失"),
-        ("内容标签匹配", 10, "按行业和提问中的内容要求评估，上限10", "不得编造未返回标签"),
-        ("粉丝规模", 10, "按粉丝规模评分，上限10", "粉丝数为规范化数值"),
-        ("互动沉淀与粉丝比", 5, "按各平台可获得的赞、藏、评等指标计算，上限5", "抖音和小红书采用各自平台口径"),
+        (f"{metadata.get('category') or '行业'}兴趣匹配", 10, "受众兴趣中精确匹配目标行业的占比", "缺失或无法匹配记 0 分"),
+        ("目标地区匹配", 8, "目标地区受众占比之和", "缺失或无法匹配记 0 分"),
+        ("目标年龄匹配", 8, "标准年龄桶受众占比之和", "不跨年龄桶匹配"),
+        ("互动表现", 20, "近30天平均单帖互动量分档", "趋势日值优先，不足30天按真实日值平均"),
+        ("活跃粉丝", 15, "有效粉丝率；无该字段时活跃粉丝数/粉丝数", "缺失记 0 分"),
+        ("内容质量", 15, "供应商综合评分", "详情优先、搜索结果回退"),
+        ("粉丝规模", 10, "粉丝数分档", "<1万/1-10万/10-50万/50-100万/≥100万"),
+        ("互动粉丝比", 14, "平均互动量/粉丝数分档", "<0.5%/0.5-1%/1-3%/3-6%/≥6%"),
     ]
     _merge_range_if_missing(sheet, known_merges, 3, 1, 4)
     sheet["A3"] = "一、评分维度与计算方式"

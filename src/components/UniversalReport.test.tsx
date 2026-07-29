@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { ApiAnalysisReport, ApiArtifactsSummary, ApiFavorite, ApiSessionReportItem } from '../api/contracts';
 import { createFavoriteByKey, deleteFavoriteByKey } from '../api/favorites';
-import { downloadKolSelection, getKolSelection, listSelectionSets, runKolAnalysis } from '../api/kolSelection';
+import { downloadKolSelection, getKolSelection, getKolTop10Trend, listSelectionSets, runKolAnalysis } from '../api/kolSelection';
 import { listSessionReports } from '../api/reports';
 import { getAnalysisReport } from '../api/tasks';
 import { analysisReportFixture } from '../test/fixtures';
@@ -13,6 +13,7 @@ vi.mock('../api/kolSelection', () => ({
   runKolAnalysis: vi.fn(),
   downloadKolSelection: vi.fn(),
   getKolSelection: vi.fn(),
+  getKolTop10Trend: vi.fn(),
   listSelectionSets: vi.fn(),
 }));
 
@@ -77,11 +78,32 @@ describe('UniversalReport', () => {
     vi.mocked(runKolAnalysis).mockReset();
     vi.mocked(downloadKolSelection).mockReset();
     vi.mocked(getKolSelection).mockReset();
+    vi.mocked(getKolTop10Trend).mockReset().mockResolvedValue({ set_id: null, items: [] });
     vi.mocked(listSelectionSets).mockReset().mockResolvedValue([]);
     vi.mocked(listSessionReports).mockReset().mockResolvedValue([]);
     vi.mocked(getAnalysisReport).mockReset();
     vi.mocked(createFavoriteByKey).mockReset();
     vi.mocked(deleteFavoriteByKey).mockReset();
+  });
+
+  it('shows v2 score completeness and opens the score guide from the selection tab', async () => {
+    vi.mocked(getKolSelection).mockResolvedValue({
+      total: 1,
+      items: [kolSelectionItem({ score: { version: 'kol_score_v2', total: 82, rating: '重点推荐', stars: '★★★★★', data_completeness: 100 } })],
+    });
+    render(<UniversalReport sessionId="session-1" selectionCount={1} />);
+    fireEvent.click(screen.getByRole('tab', { name: '圈选达人 (1)' }));
+    expect(await screen.findByText('数据完整度 100%')).toBeVisible();
+    fireEvent.click(screen.getByRole('button', { name: '评分说明' }));
+    const tooltip = screen.getByRole('tooltip');
+    expect(tooltip).toHaveTextContent('行业兴趣 10%');
+    // 说明必须含分档表与字段来源（spec 验收口径）
+    expect(tooltip).toHaveTextContent('粉丝数');
+    expect(tooltip).toHaveTextContent('≥100万');
+    expect(tooltip).toHaveTextContent('互动粉丝比');
+    expect(tooltip).toHaveTextContent('0.5-1%');
+    expect(tooltip).toHaveTextContent('受众兴趣');
+    expect(tooltip).toHaveTextContent('重点推荐≥78');
   });
 
   it('renders every supported block type from the analysis report DTO', () => {
@@ -239,6 +261,17 @@ describe('UniversalReport', () => {
 
     expect(screen.getByText(/已圈选 3 位达人/)).toBeVisible();
     expect(getKolSelection).not.toHaveBeenCalled();
+  });
+
+  it('renders the Top10 KOL weekly interaction trend on the analysis tab', async () => {
+    vi.mocked(getKolTop10Trend).mockResolvedValue({
+      set_id: 'set-1',
+      items: [{ rank: 1, platform: 'douyin', kol_uid: 'dy-1', nickname: '达人甲', ranking_interaction: 1200, scope_status: {}, trend_points: [{ week_start: '2026-07-06', average_interactions: 1200, post_count: 2 }] }],
+    });
+    render(<UniversalReport sessionId="session-1" selectionCount={1} />);
+
+    expect(await screen.findByText('Top10 KOL互动趋势')).toBeVisible();
+    expect(getKolTop10Trend).toHaveBeenCalledWith('session-1', undefined);
   });
 
   it('loads and renders KOL cards when switching to the selection tab', async () => {

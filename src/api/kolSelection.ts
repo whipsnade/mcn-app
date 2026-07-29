@@ -12,6 +12,16 @@ export interface KolSelectionItem {
   score: Record<string, unknown>;
 }
 
+export interface KolTop10TrendItem {
+  rank: number;
+  platform: string;
+  kol_uid: string;
+  nickname: string;
+  ranking_interaction: number;
+  scope_status: Record<string, string>;
+  trend_points: Array<{ week_start: string; average_interactions: number; post_count?: number }>;
+}
+
 export function getKolSelection(
   sessionId: string,
   setId?: string,
@@ -22,6 +32,11 @@ export function getKolSelection(
 
 export function listSelectionSets(sessionId: string): Promise<ApiSelectionSetItem[]> {
   return request<ApiSelectionSetItem[]>(`/api/v1/sessions/${sessionId}/selection-sets`);
+}
+
+export function getKolTop10Trend(sessionId: string, setId?: string): Promise<{ set_id: string | null; items: KolTop10TrendItem[] }> {
+  const query = setId ? `?set_id=${encodeURIComponent(setId)}` : '';
+  return request(`/api/v1/sessions/${sessionId}/kol-top10-trend${query}`);
 }
 
 export function runKolAnalysis(sessionId: string): Promise<ApiAnalysisReport> {

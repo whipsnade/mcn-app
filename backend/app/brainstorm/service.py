@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 from datetime import UTC, date, datetime
 from uuid import uuid4
 
@@ -11,6 +12,7 @@ from app.brainstorm.schemas import (
     BrainstormModelOutput,
     BrainstormOutcome,
     BrainstormProfile,
+    BrainstormQuestion,
     BrainstormRequest,
     merge_profile,
 )
@@ -34,9 +36,42 @@ from app.workspace.service import WorkspaceService, is_default_session_title
 
 logger = logging.getLogger(__name__)
 
+_KOL_INTENT_PATTERN = re.compile(r"达人|kol|圈选|投放|主播|博主", re.IGNORECASE)
+_SCORE_PROFILE_FIELDS: tuple[tuple[str, str], ...] = (
+    ("industry", "目标行业"),
+    ("regions", "目标地区"),
+    ("age_ranges", "目标年龄段"),
+)
+
 
 def utc_now() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
+
+
+def missing_score_target_profile(profile: BrainstormProfile) -> tuple[str, ...]:
+    """仅达人意图校验评分画像；缺项保持严格 0 分前先阻止建任务。"""
+    intent_text = " ".join(
+        value for value in (profile.goal, profile.kol_filters) if isinstance(value, str)
+    )
+    if _KOL_INTENT_PATTERN.search(intent_text) is None:
+        return ()
+    return tuple(
+        label
+        for field, label in _SCORE_PROFILE_FIELDS
+        if not (value := getattr(profile, field))
+        or (isinstance(value, str) and not value.strip())
+    )
+
+
+def score_target_profile_question(profile: BrainstormProfile, missing: tuple[str, ...]) -> tuple[str, list[str], bool]:
+    """模型违反 ready 契约时的无模型兜底，保证不会越过评分画像直接建任务。"""
+    label = missing[0]
+    if label == "目标行业":
+        options = [profile.category] if profile.category else []
+        return "为了按目标画像评分，还需要先确认目标行业。", options, False
+    if label == "目标地区":
+        return "为了按目标画像评分，还需要确认目标地区（可多选）。", [], True
+    return "为了按目标画像评分，还需要确认目标年龄段（可多选）。", ["18-24", "25-34"], True
 
 
 class BrainstormService:
@@ -94,6 +129,19 @@ class BrainstormService:
             session_id,
             turn_id=turn_id,
         )
+        # 模型只负责对话式采集；ready 仍需由服务端守住，避免评分画像缺项时
+        # 直接进入会扣 MCP 积分的 KOL 任务。
+        candidate_profile = merge_profile(profile, output.extracted)
+        missing = missing_score_target_profile(candidate_profile)
+        if output.ready and missing:
+            message, options, multi = score_target_profile_question(candidate_profile, missing)
+            output = output.model_copy(
+                update={
+                    "ready": False,
+                    "assistant_message": message,
+                    "question": BrainstormQuestion(text=message, options=options, multi=multi),
+                }
+            )
         ready = bool(output.ready)
         goal_specs = None
         if ready and get_settings().goal_planner_enforce_enabled:
@@ -115,6 +163,19 @@ class BrainstormService:
             (workspace.filters_snapshot or {}).get("brainstorm_profile") or {}
         )
         merged = merge_profile(profile, output.extracted)
+        # 并发请求在模型调用期间可能推进 goal/kol_filters，锁内再校验一次。
+        missing = missing_score_target_profile(merged)
+        if ready and missing:
+            message, options, multi = score_target_profile_question(merged, missing)
+            output = output.model_copy(
+                update={
+                    "ready": False,
+                    "assistant_message": message,
+                    "question": BrainstormQuestion(text=message, options=options, multi=multi),
+                }
+            )
+            ready = False
+            goal_specs = None
         user_message = await workspace_service.append_message(
             user_id, session_id, MessageCreate(content=payload.content)
         )

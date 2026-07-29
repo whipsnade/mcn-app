@@ -144,6 +144,19 @@ def test_methodology_rating_table_uses_four_tiers() -> None:
     assert sheet.cell(21, 1).value is None  # 旧「不推荐」行不再写入
 
 
+def test_methodology_uses_v2_eight_dimension_weights() -> None:
+    content = render_workbook(
+        metadata={"brand": "方法论测试", "category": "美食", "generated_at": "2026-07-22"},
+        candidates=[_candidate(1)],
+    )
+    sheet = load_workbook(BytesIO(content))["评分方法论与数据来源"]
+    assert [(sheet.cell(row, 1).value, sheet.cell(row, 2).value) for row in range(5, 13)] == [
+        ("美食兴趣匹配", 10), ("目标地区匹配", 8), ("目标年龄匹配", 8),
+        ("互动表现", 20), ("活跃粉丝", 15), ("内容质量", 15),
+        ("粉丝规模", 10), ("互动粉丝比", 14),
+    ]
+
+
 def test_detail_region_rate_label_follows_metadata_locations() -> None:
     """达人详细画像的「{地区}粉丝占比」标签随 metadata.locations 动态生成。"""
     content = render_workbook(
