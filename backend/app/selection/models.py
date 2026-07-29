@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import JSON, BigInteger, DateTime, ForeignKey, Index, Integer, String
+from sqlalchemy import JSON, BigInteger, CheckConstraint, DateTime, Float, ForeignKey, Index, Integer, String
 from sqlalchemy import UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -104,5 +104,37 @@ class KolSelectionItem(Base):
     source_tool: Mapped[str] = mapped_column(String(128), nullable=False, default="")
     first_task_id: Mapped[str] = mapped_column(String(36), nullable=False, default="")
     last_task_id: Mapped[str] = mapped_column(String(36), nullable=False, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class KolSelectionDetailSnapshot(Base):
+    """一份版本化名单内 Top20 达人的补全详情与互动趋势快照。"""
+
+    __tablename__ = "kol_selection_detail_snapshots"
+    __table_args__ = (
+        CheckConstraint("`rank` BETWEEN 1 AND 20", name="ck_kol_detail_snapshot_rank"),
+        UniqueConstraint(
+            "selection_set_id",
+            "platform",
+            "kol_uid",
+            name="uq_kol_detail_snapshot_set_platform_uid",
+        ),
+        Index("ix_kol_detail_snapshot_set_rank", "selection_set_id", "rank"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    selection_set_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("kol_selection_sets.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    platform: Mapped[str] = mapped_column(String(32), nullable=False)
+    kol_uid: Mapped[str] = mapped_column(String(128), nullable=False)
+    rank: Mapped[int] = mapped_column(Integer, nullable=False)
+    ranking_interaction: Mapped[float] = mapped_column(Float, nullable=False)
+    scope_status_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    facts_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    trend_points_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
