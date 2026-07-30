@@ -114,6 +114,14 @@ async def test_kol_detail_model_driven_flow(quick_client_factory) -> None:
     assert body["points_cost"] == 20
 
 
+def test_kol_detail_finish_contract_requires_post_url() -> None:
+    """finish 契约必须要求每个帖子带 url（帖子链接），否则模型会丢链接。"""
+    from app.quick.agent import _OUTPUT_CONTRACTS
+
+    contract = _OUTPUT_CONTRACTS["kol_detail"]
+    assert "url" in contract and "帖子链接" in contract
+
+
 @pytest.mark.asyncio
 async def test_kol_detail_posts_failure_model_marks_degraded(quick_client_factory) -> None:
     from app.mcp_gateway.transport import McpConnectionError

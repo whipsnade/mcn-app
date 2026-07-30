@@ -79,6 +79,7 @@ _OUTPUT_CONTRACTS = {
     ),
     "kol_detail": (
         'result 必须是 {"detail": 达人详情对象, "posts": 帖子对象列表}；'
+        '每个帖子对象必须保留上游原始字段，且必须包含 url（帖子链接）字段；'
         '热帖获取失败时 posts 给空列表并附加 "posts_degraded": true'
     ),
     "campaign_evaluate": (
