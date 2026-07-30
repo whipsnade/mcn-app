@@ -383,7 +383,30 @@ function ScoreGuide() {
     <div className="relative mb-2 flex items-center gap-1 px-1 text-[10px] text-slate-500">
       <span>评分说明</span>
       <button type="button" aria-label="评分说明" onClick={() => setOpen(value => !value)} className="flex h-4 w-4 items-center justify-center rounded-full border border-slate-300 text-[10px] font-bold" title={SCORE_GUIDE}>?</button>
-      {open && <p role="tooltip" className="absolute left-0 top-5 z-10 w-72 rounded-lg border border-slate-200 bg-white p-2 leading-4 shadow-lg">{SCORE_GUIDE}</p>}
+      {open && (
+        <div role="tooltip" className="absolute left-0 top-5 z-10 w-72 space-y-1.5 rounded-lg border border-slate-200 bg-white p-2 leading-4 shadow-lg">
+          <p>
+            <span className="font-bold text-slate-700">评分 v2</span>
+            <br />
+            八维加权，缺失/无效/无法匹配该维记 0 分，不做估算。
+          </p>
+          <p>
+            <span className="font-bold text-slate-700">维度权重</span>
+            <br />
+            行业兴趣 10%（受众兴趣与行业匹配占比）｜目标地区 8%（受众地区与目标地区匹配占比）｜目标年龄 8%（受众年龄桶与目标年龄相交占比）｜互动表现 20%（近 30 天平均单帖互动量，分档）｜活跃粉丝 15%（有效粉丝率或活跃粉丝/粉丝数）｜内容质量 15%（供应商综合评分）｜粉丝规模 10%（粉丝数，分档）｜互动粉丝比 14%（同一平均互动量/粉丝数，分档）。
+          </p>
+          <p>
+            <span className="font-bold text-slate-700">分档规则</span>
+            <br />
+            粉丝数 &lt;1万/1-10万/10-50万/50-100万/≥100万 对应 20/40/60/80/100 分；平均互动 &lt;1千/1千-5千/5千-2万/2万-10万/≥10万 同档；互动粉丝比 &lt;0.5%/0.5-1%/1-3%/3-6%/≥6% 同档。
+          </p>
+          <p>
+            <span className="font-bold text-slate-700">评级标准</span>
+            <br />
+            重点推荐≥78、推荐≥62、可考虑≥48、观察&lt;48。
+          </p>
+        </div>
+      )}
     </div>
   );
 }
