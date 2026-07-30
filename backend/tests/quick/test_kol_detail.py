@@ -114,12 +114,13 @@ async def test_kol_detail_model_driven_flow(quick_client_factory) -> None:
     assert body["points_cost"] == 20
 
 
-def test_kol_detail_finish_contract_requires_post_url() -> None:
-    """finish 契约必须要求每个帖子带 url（帖子链接），否则模型会丢链接。"""
+def test_kol_detail_finish_contract_keeps_raw_fields_without_hard_url_requirement() -> None:
+    """finish 契约不得硬要求 url：抖音等上游无链接字段，硬要求会让模型误标 degraded。"""
     from app.quick.agent import _OUTPUT_CONTRACTS
 
     contract = _OUTPUT_CONTRACTS["kol_detail"]
-    assert "url" in contract and "帖子链接" in contract
+    assert "内容ID" in contract and "不算获取失败" in contract
+    assert "必须包含 url" not in contract
 
 
 def test_normalize_posts_synthesizes_douyin_video_link_from_content_id() -> None:
@@ -170,6 +171,34 @@ async def test_kol_detail_posts_failure_model_marks_degraded(quick_client_factor
     assert body["posts"] == []
     assert body["posts_degraded"] is True
     assert body["points_cost"] == 10  # 热帖调用失败已释放
+
+
+@pytest.mark.asyncio
+async def test_kol_detail_mislabeled_degraded_overridden_when_posts_present(
+    quick_client_factory,
+) -> None:
+    """模型误把「帖子无 url 字段」当失败标 degraded 时，以实际数据为准不降级。"""
+
+    client, _user, transport, _model = await quick_client_factory(
+        balance=1000,
+        decisions=[
+            _detail_decision(),
+            _posts_decision(),
+            _finish(posts=POSTS_RESULT["帖子列表"][:3], posts_degraded=True),
+        ],
+    )
+    transport.results["kol_detail"] = DETAIL_RESULT
+    transport.results["query_raw_posts"] = POSTS_RESULT
+
+    response = await client.get(
+        "/api/v1/quick/kol-detail",
+        params={"platform": "xiaohongshu", "kw_uid": "xhs-1", "nickname": "美食小达人"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert len(body["posts"]) == 3
+    assert body["posts_degraded"] is False
 
 
 @pytest.mark.asyncio

@@ -608,10 +608,14 @@ class QuickService:
             platforms=(platform,),
             tags=["quick:kol_detail", f"industry:{industries[0]}", f"platform:{platform}"],
         )
+        posts = _normalize_posts(result.posts, platform)[:10]
+        # 护栏：模型可能把「帖子无 url 字段」误判为获取失败而标 degraded；
+        # 以实际数据为准，仅在确实没有帖子时才降级。
+        degraded = result.posts_degraded and not posts
         return (
             _extract_detail(result.detail),
-            _normalize_posts(result.posts, platform)[:10],
-            result.posts_degraded,
+            posts,
+            degraded,
             self.points,
         )
 
