@@ -392,11 +392,13 @@ def _normalize_posts(payload: JsonValue, platform: str) -> list[TopPostItem]:
     posts: list[TopPostItem] = []
     for entry in _find_rows(payload, ("帖子列表", "数据列表", "posts", "list", "items")):
         url = _text(_first(entry, "帖子链接", "链接", "url"))
-        if not url and platform == "douyin":
-            # 抖音上游不给直接链接，但有内容 ID；按官方视频页格式合成。
-            content_id = _text(_first(entry, "内容ID", "视频ID", "aweme_id", "内容id"))
-            if content_id:
+        if not url:
+            # 抖音/小红书上游不给直接链接，但有内容 ID；按官方页面格式合成。
+            content_id = _text(_first(entry, "内容ID", "视频ID", "笔记ID", "aweme_id", "内容id"))
+            if content_id and platform == "douyin":
                 url = f"https://www.douyin.com/video/{content_id}"
+            elif content_id and platform == "xiaohongshu":
+                url = f"https://www.xiaohongshu.com/explore/{content_id}"
         posts.append(
             TopPostItem(
                 title=_text(_first(entry, "标题", "帖子标题", "内容", "title")),

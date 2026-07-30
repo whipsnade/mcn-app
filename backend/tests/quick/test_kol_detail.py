@@ -140,9 +140,20 @@ def test_normalize_posts_synthesizes_douyin_video_link_from_content_id() -> None
     )
     assert direct[0].url == "https://v.douyin.com/abc"
 
-    # 非抖音平台不合成
-    xhs = _normalize_posts([{"内容ID": "abc123", "互动数": 1}], "xiaohongshu")
-    assert xhs[0].url in (None, "")
+
+def test_normalize_posts_synthesizes_xiaohongshu_note_link_from_content_id() -> None:
+    """小红书无直接链接时按内容 ID（笔记 ID）合成 explore 页链接；不支持的平台不合成。"""
+    from app.quick.service import _normalize_posts
+
+    xhs = _normalize_posts(
+        [{"内容ID": "6a5b092c000000001d021f78", "互动数": 1, "用户昵称": "黄润汐"}],
+        "xiaohongshu",
+    )
+    assert xhs[0].url == "https://www.xiaohongshu.com/explore/6a5b092c000000001d021f78"
+
+    # 不支持合成的平台保持无链接
+    other = _normalize_posts([{"内容ID": "abc123", "互动数": 1}], "bilibili")
+    assert other[0].url in (None, "")
 
 
 @pytest.mark.asyncio
