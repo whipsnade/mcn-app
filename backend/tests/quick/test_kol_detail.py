@@ -122,6 +122,28 @@ def test_kol_detail_finish_contract_requires_post_url() -> None:
     assert "url" in contract and "帖子链接" in contract
 
 
+def test_normalize_posts_synthesizes_douyin_video_link_from_content_id() -> None:
+    """抖音无直接链接时按内容 ID 合成官方视频页链接；其他平台不误合成。"""
+    from app.quick.service import _normalize_posts
+
+    douyin_posts = _normalize_posts(
+        [{"内容ID": "7658181733593910537", "互动数": 714829, "用户昵称": "日食记"}],
+        "douyin",
+    )
+    assert douyin_posts[0].url == "https://www.douyin.com/video/7658181733593910537"
+
+    # 已有直接链接时以原始链接为准
+    direct = _normalize_posts(
+        [{"内容ID": "7658181733593910537", "帖子链接": "https://v.douyin.com/abc"}],
+        "douyin",
+    )
+    assert direct[0].url == "https://v.douyin.com/abc"
+
+    # 非抖音平台不合成
+    xhs = _normalize_posts([{"内容ID": "abc123", "互动数": 1}], "xiaohongshu")
+    assert xhs[0].url in (None, "")
+
+
 @pytest.mark.asyncio
 async def test_kol_detail_posts_failure_model_marks_degraded(quick_client_factory) -> None:
     from app.mcp_gateway.transport import McpConnectionError
