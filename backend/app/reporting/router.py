@@ -36,6 +36,8 @@ from app.reporting.schemas import (
     SessionReportType,
 )
 from app.reporting.service import ReportingService
+from app.selection.models import KolSelectionItem, KolSelectionSet
+from app.selection.service import serialize_selection_item
 from app.tasks.models import AnalysisTask
 from app.workspace.models import WorkspaceSession
 
@@ -259,6 +261,41 @@ async def list_favorites(
         nickname = snapshot.normalized_json.get("nickname") if snapshot else None
         result.append(favorite_read(favorite, kol, nickname if isinstance(nickname, str) else None))
     return result
+
+
+@router.get("/favorites/kol-selection-ref")
+async def get_favorite_kol_selection_ref(
+    user: CurrentUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    platform: Annotated[str, Query(min_length=1, max_length=32)],
+    kol_uid: Annotated[str, Query(min_length=1, max_length=128)],
+) -> dict:
+    """把收藏达人解析到其最新圈选名单条目，供前端复用圈选详情弹窗与版本缓存。
+
+    收藏本身不绑定名单；按 user_id+platform+kol_uid 取最新 selection set 中的条目。
+    该达人不在任何圈选名单（如快捷推荐里收藏的）时返回 404，前端回退快捷详情。
+    """
+    row = (
+        await db.execute(
+            select(KolSelectionItem, KolSelectionSet)
+            .join(KolSelectionSet, KolSelectionItem.selection_set_id == KolSelectionSet.id)
+            .where(
+                KolSelectionItem.user_id == user.id,
+                KolSelectionItem.platform == platform,
+                KolSelectionItem.kol_uid == kol_uid,
+            )
+            .order_by(desc(KolSelectionSet.created_at))
+            .limit(1)
+        )
+    ).first()
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="selection_ref_not_found")
+    item, selection_set = row
+    return {
+        "session_id": selection_set.session_id,
+        "set_id": selection_set.id,
+        "item": serialize_selection_item(item),
+    }
 
 
 @router.post("/favorites", response_model=FavoriteRead, status_code=status.HTTP_201_CREATED)

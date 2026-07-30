@@ -175,3 +175,95 @@ async def test_legacy_kol_id_path_still_works(auth_client_factory, db_session) -
     deleted = await client.delete(f"/api/v1/favorites/{kol.id}")
     assert deleted.status_code == 204
     assert await _favorite_count(db_session) == 0
+
+
+async def _seed_selection_item(
+    db_session: AsyncSession, client, *, platform: str = "xiaohongshu", kol_uid: str = "uid-ref"
+) -> tuple[str, str]:
+    """建会话 + selection set + 一条 item，返回 (session_id, set_id)。"""
+    created = await client.post("/api/v1/sessions", json={})
+    assert created.status_code == 201
+    session_id = created.json()["id"]
+    from app.workspace.models import WorkspaceSession
+
+    session = await db_session.get(WorkspaceSession, session_id)
+    assert session is not None
+    from app.selection.models import KolSelectionItem
+    from app.selection.service import KolSelectionService
+
+    selection_set = await KolSelectionService(db_session).ensure_selection_set(
+        session.user_id, session_id, title="默认名单"
+    )
+    now = datetime.now(UTC).replace(tzinfo=None)
+    db_session.add(
+        KolSelectionItem(
+            id=str(uuid4()),
+            user_id=session.user_id,
+            selection_set_id=selection_set.id,
+            platform=platform,
+            kol_uid=kol_uid,
+            nickname="圈选达人",
+            followers=1000,
+            city="杭州市",
+            profile_url=None,
+            fields_json={"export_fields": {}},
+            score_json={"total": 80.0},
+            source_tool="tool",
+            first_task_id="t1",
+            last_task_id="t1",
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    await db_session.flush()
+    return session_id, selection_set.id
+
+
+@pytest.mark.asyncio
+async def test_favorite_kol_selection_ref_resolves_latest_selection_item(
+    auth_client_factory, db_session
+) -> None:
+    """收藏达人能解析到其最新圈选名单条目（session_id + set_id + item）。"""
+    client = await auth_client_factory("13500000008")
+    session_id, set_id = await _seed_selection_item(db_session, client)
+
+    response = await client.get(
+        "/api/v1/favorites/kol-selection-ref",
+        params={"platform": "xiaohongshu", "kol_uid": "uid-ref"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["session_id"] == session_id
+    assert payload["set_id"] == set_id
+    assert payload["item"]["kol_uid"] == "uid-ref"
+    assert payload["item"]["nickname"] == "圈选达人"
+
+
+@pytest.mark.asyncio
+async def test_favorite_kol_selection_ref_404_without_selection_item(auth_client_factory) -> None:
+    """达人不在任何圈选名单（如快捷推荐收藏的）时 404，前端回退快捷详情。"""
+    client = await auth_client_factory("13500000009")
+
+    response = await client.get(
+        "/api/v1/favorites/kol-selection-ref",
+        params={"platform": "douyin", "kol_uid": "uid-absent"},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "selection_ref_not_found"
+
+
+@pytest.mark.asyncio
+async def test_favorite_kol_selection_ref_isolated_per_user(auth_client_factory, db_session) -> None:
+    """他人名单里的同名达人不可解析。"""
+    owner = await auth_client_factory("13500000010")
+    other = await auth_client_factory("13500000011")
+    await _seed_selection_item(db_session, owner)
+
+    response = await other.get(
+        "/api/v1/favorites/kol-selection-ref",
+        params={"platform": "xiaohongshu", "kol_uid": "uid-ref"},
+    )
+
+    assert response.status_code == 404

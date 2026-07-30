@@ -1,7 +1,8 @@
 import React, { useCallback, useEffect, useState } from 'react';
 
 import type { ApiFavorite } from './api/contracts';
-import { listFavorites } from './api/favorites';
+import { getFavoriteKolSelectionRef, listFavorites } from './api/favorites';
+import type { KolSelectionItem } from './api/kolSelection';
 import { getWallet } from './api/wallet';
 import { useAuth } from './auth/AuthProvider';
 import AdminPanel from './components/AdminPanel';
@@ -10,6 +11,7 @@ import EvaluatePanel from './components/EvaluatePanel';
 import FavoritesPanel from './components/FavoritesPanel';
 import KolDetailView from './components/KolDetailView';
 import KolRecommendPanel from './components/KolRecommendPanel';
+import KolSelectionDetailDialog from './components/KolSelectionDetailDialog';
 import LoginPage from './components/LoginPage';
 import MobileWorkspaceNav, { type WorkspacePane } from './components/MobileWorkspaceNav';
 import RechargeModal from './components/RechargeModal';
@@ -35,6 +37,18 @@ export default function App() {
   const [favoritesLoading, setFavoritesLoading] = useState(false);
   const [favoritesRefreshKey, setFavoritesRefreshKey] = useState(0);
   const [selectedKol, setSelectedKol] = useState<QuickKolSelection | null>(null);
+  // 收藏点击：优先复用圈选详情弹窗与名单版本缓存（解析失败回退快捷详情）。
+  const [favoriteDetail, setFavoriteDetail] = useState<{
+    sessionId: string;
+    setId: string;
+    item: KolSelectionItem;
+  } | null>(null);
+
+  const handleFavoriteSelect = useCallback((kol: QuickKolSelection) => {
+    getFavoriteKolSelectionRef(kol.platform, kol.kw_uid)
+      .then(ref => setFavoriteDetail({ sessionId: ref.session_id, setId: ref.set_id, item: ref.item }))
+      .catch(() => setSelectedKol(kol));
+  }, []);
 
   const refreshWallet = useCallback(async () => {
     try {
@@ -207,7 +221,7 @@ export default function App() {
                     favorites={favorites}
                     loading={favoritesLoading}
                     onRefresh={refreshFavorites}
-                    onSelectKol={kol => setSelectedKol(kol)}
+                    onSelectKol={handleFavoriteSelect}
                   />
                 )}
               </>
@@ -260,6 +274,15 @@ export default function App() {
         <div className="absolute bottom-5 left-1/2 z-40 -translate-x-1/2 rounded-xl border border-rose-100 bg-white px-4 py-2 text-xs font-medium text-rose-600 shadow-lg">
           {workspace.error}
         </div>
+      )}
+
+      {favoriteDetail && (
+        <KolSelectionDetailDialog
+          sessionId={favoriteDetail.sessionId}
+          setId={favoriteDetail.setId}
+          item={favoriteDetail.item}
+          onClose={() => setFavoriteDetail(null)}
+        />
       )}
 
       <RechargeModal
