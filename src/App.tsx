@@ -206,6 +206,7 @@ export default function App() {
                     flowNodes={workspace.taskRuntime?.nodes ?? []}
                     flowTerminal={isTerminalTaskStatus(workspace.taskRuntime?.status)}
                     flowTerminalLabel={workspace.taskRuntime?.phaseLabel}
+                    taskFlows={workspace.taskFlows}
                     assistantDraft={workspace.taskRuntime?.assistantDraft ?? ''}
                     onRetryMessage={messageId => workspace.retryMessage(messageId)}
                     followupStatus={workspace.activeSession.analysis?.followupStatus}

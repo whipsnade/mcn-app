@@ -470,6 +470,111 @@ describe('ChatArea', () => {
     expect(screen.getByText('社媒数据服务返回错误，请稍后重试。')).toBeVisible();
   });
 
+  it('anchors each task flow under its own user message instead of sharing one flow', () => {
+    render(
+      <ChatArea
+        session={{
+          ...session,
+          messages: [
+            { id: 'm1', sender: 'user', text: '第一轮分析', timestamp: '10:00', taskId: 'task-1' },
+            { id: 'm2', sender: 'user', text: '第二轮分析', timestamp: '10:05', taskId: 'task-2' },
+          ],
+        }}
+        onSendMessage={vi.fn()}
+        isAnalyzing={false}
+        isMockMode={false}
+        flowTaskId="task-2"
+        flowTerminal
+        flowTerminalLabel="分析完成"
+        flowNodes={[
+          { id: 'accepted', label: '任务已受理', status: 'succeeded' },
+          { id: 'terminal', label: '分析完成', status: 'succeeded' },
+        ]}
+        taskFlows={{
+          'task-1': {
+            runtime: {
+              taskId: 'task-1',
+              lastEventId: 2,
+              assistantDraft: '',
+              connection: 'closed',
+              status: 'completed',
+              phaseLabel: '分析完成',
+              nodes: [
+                { id: 'accepted', label: '任务已受理', status: 'succeeded' },
+                { id: 'tool-1', label: '查询抖音数据', status: 'succeeded' },
+                { id: 'terminal', label: '分析完成', status: 'succeeded' },
+              ],
+            },
+          },
+        }}
+      />,
+    );
+
+    // 两张终态流程卡各自锚定（底部不再出现第三块共享流程区）。
+    const toggles = screen.getAllByRole('button', { name: /执行流程/ });
+    expect(toggles).toHaveLength(2);
+    expect(toggles[0]).toHaveTextContent('共 3 步');
+    expect(toggles[1]).toHaveTextContent('共 2 步');
+    // 第一张卡在第二轮用户消息之前（锚定在第一轮消息下方）。
+    const secondMessage = screen.getByText('第二轮分析');
+    expect(toggles[0].compareDocumentPosition(secondMessage) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it('shows a loading placeholder while a historical flow is replaying and no card when missing', () => {
+    const { rerender } = render(
+      <ChatArea
+        session={{
+          ...session,
+          messages: [{ id: 'm1', sender: 'user', text: '历史分析', timestamp: '10:00', taskId: 'task-h' }],
+        }}
+        onSendMessage={vi.fn()}
+        isAnalyzing={false}
+        isMockMode={false}
+        taskFlows={{}}
+      />,
+    );
+
+    expect(screen.getByText('执行流程加载中…')).toBeVisible();
+
+    rerender(
+      <ChatArea
+        session={{
+          ...session,
+          messages: [{ id: 'm1', sender: 'user', text: '历史分析', timestamp: '10:00', taskId: 'task-h' }],
+        }}
+        onSendMessage={vi.fn()}
+        isAnalyzing={false}
+        isMockMode={false}
+        taskFlows={{ 'task-h': { missing: true } }}
+      />,
+    );
+
+    expect(screen.queryByText('执行流程加载中…')).toBeNull();
+    expect(screen.queryByRole('button', { name: /执行流程/ })).toBeNull();
+  });
+
+  it('renders the active flow live under its trigger message without duplicating the bottom block', () => {
+    render(
+      <ChatArea
+        session={{
+          ...session,
+          messages: [{ id: 'm1', sender: 'user', text: '正在进行的分析', timestamp: '10:00', taskId: 'task-1', turnId: 'turn-1' }],
+        }}
+        onSendMessage={vi.fn()}
+        isAnalyzing
+        isMockMode={false}
+        flowTaskId="task-1"
+        flowNodes={[{ id: 'tool-1', label: '查询小红书数据', status: 'running' }]}
+        assistantDraft="已找到 2 位候选…"
+      />,
+    );
+
+    // 实时节点 + 草稿锚定在消息下方，全流程区只有这一块。
+    expect(screen.getByText('查询小红书数据')).toBeVisible();
+    expect(screen.getByText(/已找到 2 位候选/)).toBeVisible();
+    expect(screen.getAllByLabelText('执行流程')).toHaveLength(1);
+  });
+
   it('allows retrying a terminal user message', async () => {
     const onRetryMessage = vi.fn().mockResolvedValue(undefined);
     render(
