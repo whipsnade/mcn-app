@@ -769,6 +769,8 @@ function KolPanel({ report, taskStatus, sessionId, selectionCount, onReportReady
   const favoriteSnapshot = (item: KolSelectionItem): Record<string, unknown> => {
     const snapshot: Record<string, unknown> = {};
     if (item.followers != null) snapshot.followers = item.followers;
+    const total = finiteNumber(item.score?.total);
+    if (total != null) snapshot.score_total = total;
     const rating = stringValue(item.score?.rating);
     if (rating) snapshot.rating = rating;
     const stars = stringValue(item.score?.stars);

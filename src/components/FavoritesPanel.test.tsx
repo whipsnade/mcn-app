@@ -66,6 +66,34 @@ describe('FavoritesPanel', () => {
     expect(screen.getByText('探店达人乙')).toBeVisible();
   });
 
+  it('renders the selection-style card with score, rating, stars and engagement chips', () => {
+    render(
+      <FavoritesPanel
+        favorites={[favoriteFixture({
+          snapshot: {
+            followers: 120000,
+            city: '上海',
+            quoted_price_cny: 12000,
+            engagement_rate: 5.2,
+            score_total: 86,
+            rating: '重点推荐',
+            stars: '★★★★★',
+          },
+        })]}
+        loading={false}
+      />,
+    );
+
+    // 与圈选达人列表卡片一致的信息结构
+    expect(screen.getByText('★★★★★')).toBeVisible();
+    expect(screen.getByText(/上海/)).toBeVisible();
+    expect(screen.getByText('综合评分')).toBeVisible();
+    expect(screen.getByText('86')).toBeVisible();
+    expect(screen.getByText('重点推荐')).toBeVisible();
+    expect(screen.getByText('互动率 5.2%')).toBeVisible();
+    expect(screen.getByText(/预估报价 ¥12,000/)).toBeVisible();
+  });
+
   it('reports the favorite count through onCountChange', () => {
     const onCountChange = vi.fn();
     render(
