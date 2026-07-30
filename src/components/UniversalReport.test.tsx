@@ -383,6 +383,7 @@ describe('UniversalReport', () => {
       nickname: '达人小A',
       snapshot: {
         followers: 120000,
+        score_total: 82,
         rating: '重点推荐',
         stars: '★★★★★',
         engagement_rate: 5.2,

@@ -1,10 +1,10 @@
 import { Star } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { Fragment, useEffect, useState } from 'react';
 
 import { deleteFavorite, deleteFavoriteByKey } from '../api/favorites';
 import type { ApiFavorite } from '../api/contracts';
 import type { QuickKolSelection } from '../types';
-import { formatExposure } from './reportPrimitives';
+import { formatExposure, formatNumber } from './reportPrimitives';
 
 interface FavoritesPanelProps {
   favorites: readonly ApiFavorite[];
@@ -23,9 +23,94 @@ function snapshotNumber(snapshot: Record<string, unknown> | null, key: string): 
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
+function snapshotText(snapshot: Record<string, unknown> | null, key: string): string {
+  const value = snapshot?.[key];
+  return typeof value === 'string' ? value.trim() : '';
+}
+
 // 快照报价：圈选卡片写 quoted_price_cny，快捷推荐卡片写 price。
 function snapshotPrice(snapshot: Record<string, unknown> | null): number | null {
   return snapshotNumber(snapshot, 'quoted_price_cny') ?? snapshotNumber(snapshot, 'price');
+}
+
+interface FavoriteCardProps {
+  favorite: ApiFavorite;
+  selectable: boolean;
+  onOpenDetail: () => void;
+  onRemove: () => void;
+}
+
+// 与圈选达人列表 KolSelectionCard 同款卡片：头像 + 昵称/星级 + 平台·地区·粉丝
+// + 综合评分/rating 徽标 + 互动率/报价 chips；快照缺的字段直接省略。
+function FavoriteCard({ favorite, selectable, onOpenDetail, onRemove }: FavoriteCardProps) {
+  const name = favorite.nickname?.trim() || '未命名达人';
+  const snapshot = favorite.snapshot;
+  const stars = snapshotText(snapshot, 'stars');
+  const rating = snapshotText(snapshot, 'rating');
+  const total = snapshotNumber(snapshot, 'score_total');
+  const followers = snapshotNumber(snapshot, 'followers');
+  const city = snapshotText(snapshot, 'city');
+  const engagementRate = snapshotNumber(snapshot, 'engagement_rate');
+  const price = snapshotPrice(snapshot);
+  const metaParts = [
+    platformName(favorite.platform),
+    city || null,
+    followers !== null ? `粉丝 ${formatExposure(followers)}` : null,
+  ].filter(Boolean);
+
+  const head = (
+    <>
+      <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-indigo-100 text-[13px] font-bold text-indigo-600">
+        {name.slice(0, 1)}
+      </span>
+      <div className="min-w-0 flex-1">
+        <p className="flex items-center gap-1.5">
+          <span className="truncate text-[12px] font-semibold text-slate-800">{name}</span>
+          {stars && <span className="shrink-0 text-[10px] text-amber-500">{stars}</span>}
+        </p>
+        <p className="mt-0.5 truncate text-[10px] text-slate-400">{metaParts.join(' · ')}</p>
+      </div>
+      {(total !== null || rating) && (
+        <div className="shrink-0 text-right">
+          {total !== null && (
+            <p className="text-[12px] font-bold text-slate-800">
+              <span className="mr-1 text-[10px] font-normal text-slate-400">综合评分</span>{total}
+            </p>
+          )}
+          {rating && (
+            <span className="mt-1 inline-block rounded-full bg-indigo-50 px-2 py-0.5 text-[10px] font-semibold text-indigo-600">{rating}</span>
+          )}
+        </div>
+      )}
+    </>
+  );
+
+  return (
+    <section className="rounded-xl border border-slate-100 bg-white p-3.5 shadow-sm">
+      <div className="flex items-center gap-2.5">
+        {selectable ? (
+          <button type="button" aria-label={`查看达人详情 ${name}`} onClick={onOpenDetail} className="flex min-w-0 flex-1 items-center gap-2.5 text-left">
+            {head}
+          </button>
+        ) : (
+          <div className="flex min-w-0 flex-1 items-center gap-2.5">{head}</div>
+        )}
+        <button type="button" aria-label={`取消收藏 ${name}`} onClick={onRemove} className="shrink-0 rounded-lg p-1.5 text-amber-500 transition hover:bg-amber-50">
+          <Star className="h-3.5 w-3.5 fill-amber-400" />
+        </button>
+      </div>
+      {(engagementRate !== null || price !== null) && (
+        <div className="mt-2.5 flex flex-wrap gap-1.5">
+          {engagementRate !== null && (
+            <span className="rounded-lg bg-emerald-50 px-2 py-1 text-[10px] font-semibold text-emerald-600">互动率 {engagementRate}%</span>
+          )}
+          {price !== null && (
+            <span className="rounded-lg bg-slate-100 px-2 py-1 text-[10px] font-semibold text-slate-600">预估报价 ¥{formatNumber(price)}</span>
+          )}
+        </div>
+      )}
+    </section>
+  );
 }
 
 export default function FavoritesPanel({ favorites, loading = false, onRefresh, onCountChange, onSelectKol }: FavoritesPanelProps) {
@@ -56,15 +141,16 @@ export default function FavoritesPanel({ favorites, loading = false, onRefresh, 
 
   return <div className="min-h-0 flex-1 overflow-y-auto bg-slate-50 p-4"><div className="space-y-2">{error && <p role="alert" className="rounded-lg border border-rose-100 bg-rose-50 px-3 py-2 text-[11px] font-medium text-rose-600">{error}</p>}{favorites.map(favorite => {
     const name = favorite.nickname?.trim() || '未命名达人';
-    const followers = snapshotNumber(favorite.snapshot, 'followers');
-    const price = snapshotPrice(favorite.snapshot);
-    const metaParts = [
-      platformName(favorite.platform),
-      followers !== null ? `粉丝 ${formatExposure(followers)}` : null,
-      price !== null ? `¥${price.toLocaleString('zh-CN')}` : null,
-    ].filter(Boolean);
     const selectable = Boolean(onSelectKol && favorite.kol_uid);
-    const info = <><div className="text-xs font-semibold text-slate-800">{name}</div><div className="mt-1 text-[10px] text-slate-400">{metaParts.join(' · ')}</div></>;
-    return <div key={favorite.id} className="flex items-center justify-between rounded-xl border border-slate-200 bg-white px-4 py-3 shadow-sm">{selectable ? <button type="button" aria-label={`查看达人详情 ${name}`} onClick={() => onSelectKol?.({ platform: favorite.platform, kw_uid: favorite.kol_uid!, nickname: name })} className="min-w-0 flex-1 rounded-lg text-left transition hover:text-indigo-600">{info}</button> : <div>{info}</div>}<button type="button" aria-label={`取消收藏 ${name}`} onClick={() => void remove(favorite)} className="rounded-lg p-1.5 text-amber-500 transition hover:bg-amber-50"><Star className="h-3.5 w-3.5 fill-amber-400" /></button></div>;
+    return (
+      <Fragment key={favorite.id}>
+        <FavoriteCard
+          favorite={favorite}
+          selectable={selectable}
+          onOpenDetail={() => onSelectKol?.({ platform: favorite.platform, kw_uid: favorite.kol_uid!, nickname: name })}
+          onRemove={() => void remove(favorite)}
+        />
+      </Fragment>
+    );
   })}</div></div>;
 }
