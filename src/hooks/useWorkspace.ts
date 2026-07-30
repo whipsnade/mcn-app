@@ -21,6 +21,7 @@ import {
 import { getArtifactsSummary, markArtifactRead } from '../api/reports';
 import type { ApiAnalysisReport, ArtifactModuleKey, CreateSessionInput } from '../api/contracts';
 import { useTaskStream } from './useTaskStream';
+import { useTaskFlows } from './useTaskFlows';
 import { isTerminalTaskStatus } from '../state/taskEvents';
 import type { Message, Session } from '../types';
 
@@ -638,6 +639,14 @@ export function useWorkspace(userId?: string) {
     [activeSessionId, sessions],
   );
 
+  // 每个任务一张执行流程卡：活跃任务终态冻结 + 历史任务事件回放（锚定在用户消息上）。
+  const taskFlows = useTaskFlows(
+    activeSessionId,
+    activeSession?.messages ?? [],
+    activeTaskId,
+    currentTaskRuntime,
+  );
+
   // 会话激活 / 任务状态变化（含终态）/ artifact.updated 到达时拉取 artifacts summary
   // （三 Tab 的最新产物与未读标记）。artifactUpdates 每次事件都是新对象引用。
   const runtimeArtifactUpdates = currentTaskRuntime?.artifactUpdates;
@@ -758,6 +767,7 @@ export function useWorkspace(userId?: string) {
     activeSessionId,
     activeTaskId,
     taskRuntime: currentTaskRuntime,
+    taskFlows,
     loading,
     busy,
     isAnalyzing,

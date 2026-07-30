@@ -5,7 +5,8 @@ import type { FollowupSuggestion } from '../api/contracts';
 import { useSessionThinkingStream } from '../hooks/useSessionThinkingStream';
 import TaskFlowNodes from './TaskFlowNodes';
 import ThinkingPanel from './ThinkingPanel';
-import type { TaskFlowNode } from '../state/taskEvents';
+import { isTerminalTaskStatus, type TaskFlowNode } from '../state/taskEvents';
+import type { TaskFlowReplay } from '../hooks/useTaskFlows';
 
 /** 空白会话（无消息、无 followup 建议）展示的默认圈选建议，点击填入输入框。 */
 const DEFAULT_SUGGESTIONS: { title: string; prompt: string }[] = [
@@ -73,6 +74,8 @@ interface ChatAreaProps {
   flowTerminal?: boolean;
   /** 终态摘要文案（如 分析完成 / 任务失败）。 */
   flowTerminalLabel?: string;
+  /** 各任务的历史执行流程（终态冻结 / 事件回放重建），锚定在触发消息下方。 */
+  taskFlows?: Record<string, TaskFlowReplay>;
   /** AI 摘要的流式草稿，实时渲染在节点图下方。 */
   assistantDraft?: string;
   onRetryMessage?: (messageId: string) => Promise<unknown>;
@@ -94,6 +97,7 @@ export default function ChatArea({
   flowNodes = [],
   flowTerminal = false,
   flowTerminalLabel,
+  taskFlows = {},
   assistantDraft = '',
   onRetryMessage,
   followupStatus,
@@ -133,6 +137,10 @@ export default function ChatArea({
     return undefined;
   }, [session.messages]);
   const activeThinkingBlocks = activeTurnId ? thinkingByTurn[activeTurnId] : undefined;
+  // 活跃流程是否已锚定到触发它的用户消息（锚定后底部不再重复渲染流程区）。
+  const activeFlowAnchored = Boolean(
+    flowTaskId && session.messages.some(message => message.sender === 'user' && message.taskId === flowTaskId),
+  );
   // 活跃 turn 且流程进行中：思考只出现在流程节点里，消息下方的 ThinkingPanel 去重隐藏；
   // 终态后流程面板收缩为摘要行，ThinkingPanel 恢复（历史 turn 始终不受影响）。
   const dedupeActiveThinkingPanel = flowNodes.length > 0 && !flowTerminal;
@@ -390,12 +398,72 @@ export default function ChatArea({
                   <ThinkingPanel blocks={thinkingBlocks} />
                 </div>
               )}
+              {/* 每个任务一张执行流程卡，锚定在触发它的用户消息下方，终态收缩保留可回看 */}
+              {!isAI && msg.taskId && (() => {
+                const isActiveFlow = msg.taskId === flowTaskId;
+                if (!isActiveFlow) {
+                  const replay = taskFlows[msg.taskId];
+                  if (replay?.missing) return null;
+                  if (!replay?.runtime) {
+                    return (
+                      <div className="mr-auto ml-11 w-[calc(85%-2.75rem)] max-w-[85%]">
+                        <div className="flex items-center gap-2 rounded-xl border border-slate-100 bg-slate-50 px-3 py-2.5 text-[11px] font-medium text-slate-400" role="status">
+                          <Loader2 className="h-3 w-3 animate-spin" />
+                          执行流程加载中…
+                        </div>
+                      </div>
+                    );
+                  }
+                  return (
+                    <div className="mr-auto ml-11 w-[calc(85%-2.75rem)] max-w-[85%]">
+                      <TaskFlowNodes
+                        taskId={msg.taskId}
+                        nodes={replay.runtime.nodes ?? []}
+                        terminal={isTerminalTaskStatus(replay.runtime.status)}
+                        terminalLabel={replay.runtime.phaseLabel}
+                      />
+                    </div>
+                  );
+                }
+                if (flowNodes.length === 0 && !assistantDraft && !isAnalyzing) return null;
+                return (
+                  <div className="flex items-start gap-3 mr-auto max-w-[85%]">
+                    <div className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-full font-bold text-[10px] shadow-sm ${isAnalyzing ? 'bg-indigo-500 text-white animate-pulse' : 'bg-indigo-600 text-white'}`}>
+                      AI
+                    </div>
+                    <div className="space-y-2 flex-1 min-w-0">
+                      <div className="flex items-center gap-2 text-[10px] text-slate-400">
+                        <span className="font-semibold text-slate-500">AI 分析师</span>
+                        {isAnalyzing && <span className="text-indigo-500">分析中…</span>}
+                      </div>
+                      {flowNodes.length > 0 && (
+                        <TaskFlowNodes
+                          taskId={flowTaskId}
+                          nodes={flowNodes}
+                          terminal={flowTerminal}
+                          terminalLabel={flowTerminalLabel}
+                          thinkingBlocks={msg.turnId === activeTurnId ? activeThinkingBlocks : undefined}
+                        />
+                      )}
+                      {assistantDraft && (
+                        <div className="rounded-2xl rounded-tl-none bg-indigo-600 px-4 py-3 text-xs md:text-sm leading-relaxed text-white shadow-md">
+                          <div className="whitespace-pre-line font-normal">
+                            {assistantDraft}
+                            {isAnalyzing && <span className="ml-0.5 inline-block h-3.5 w-1.5 animate-pulse rounded-sm bg-white/70 align-middle" />}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                );
+              })()}
             </React.Fragment>
           );
         })}
 
-        {/* 执行流程节点图 + AI 流式结果：终态后节点图自动收缩，只留最终回复 */}
-        {(isAnalyzing || flowNodes.length > 0 || assistantDraft) && (
+        {/* 过渡形态：活跃任务尚未锚定到消息（POST 未返回的窗口期）时，底部显示进行中指示；
+            一旦锚定（或已是历史任务）流程卡渲染在对应用户消息下方。 */}
+        {!activeFlowAnchored && (isAnalyzing || flowNodes.length > 0 || assistantDraft) && (
           <div className="flex items-start gap-3 mr-auto max-w-[85%]">
             <div className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-full font-bold text-[10px] shadow-sm ${isAnalyzing ? 'bg-indigo-500 text-white animate-pulse' : 'bg-indigo-600 text-white'}`}>
               AI
