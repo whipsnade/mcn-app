@@ -1,7 +1,7 @@
 # 品牌分析报告导出与 BI 重构设计
 
-日期：2026-07-30  
-状态：已确认，待实施  
+日期：2026-07-30
+状态：评审修订中，待二次确认
 关联模板：`brand_report.xlsx`
 
 ## 背景与目标
@@ -22,6 +22,8 @@
 - 数据不完整时允许生成受限报告；不以 0 填补、不编造趋势或结论，必须标明未取得的字段和原因。
 - 导出的是当前选中的历史版本；导出过程不调用模型或 MCP，不计费。
 - 模板中的示例品牌数据不作为运行时内容；需制作去样例的受控模板副本。
+- 环比默认查询上一个等长周期；同比仅在用户明确选择「环比+同比」或在消息中明确要求同比时查询。未请求同比显示「未请求」，查询失败显示对应受限原因。
+- 图表不依赖样例模板中的既有数据引用：导出时按当前结构化快照删除并重建日趋势两图和地域 Top20 图；对应章节不可用时不绘制图表。
 
 ## 模板章节与数据契约
 
@@ -30,7 +32,8 @@
 ```text
 template_version: "brand_report_v2"
 data_status: complete | partial
-scope: 品牌、关键词、时间窗、平台
+scope: 品牌、时间窗、平台、comparison_mode
+query_spec: 原始品牌名、标准标签或关键词回退、比较期定义
 data: 归一化且可追溯的数值与明细
 narrative: 基于 data 生成的文本洞察
 availability: 各章节的状态、缺失字段与原因
@@ -38,6 +41,8 @@ sources: 数据工具、采集时间与证据引用
 ```
 
 其中 `data` 是唯一的数值事实来源，必须由服务端从本次目标已 settled 的 MCP 证据归一得到。`narrative` 只能引用 `data`；模型不得创造、换算或修改指标数值。
+
+整体 `data_status` 只取 `complete` 或 `partial`：所有数据章节（综合概览、情感、日趋势、内容与达人、地域、热帖、舆情）均为 `complete` 时为 `complete`；任一章节为 `partial` 或 `unavailable` 时为 `partial`。方法论由服务端生成，不参与状态降级。若连综合概览的最小证据也无法组装，则不是受限报告，而是报告构建失败，沿用现有失败 Artifact 路径。
 
 | 章节 / Excel Sheet | `data` 固定内容 | BI 呈现 |
 |---|---|---|
@@ -58,7 +63,37 @@ sources: 数据工具、采集时间与证据引用
 - 标题或原帖链接缺失时保留原始记录，将对应字段标为「未提供」，禁止拼接或猜测 URL。
 - 每个章节在 `availability` 中记录：`complete`、`partial` 或 `unavailable`，并记录 `missing_fields`、`reason`、`source_tools` 与 `collected_at`。
 
+### 对比期与查询词
+
+- `scope.brand` 仍只来自 `goal.params_json.brand`；不新增一个来源不明的「关键词」字段。
+- `query_spec.original_term` 固定为用户确认的品牌名；`query_spec.matched_tag` 只在标签匹配成功后写入；匹配失败时 `query_spec.fallback_keyword` 为同一品牌名。模板的「搜索方式」由这个结构渲染。
+- `comparison_mode` 为 `mom` 或 `mom_yoy`：默认 `mom`，查询上一个等长周期；用户明确要求同比或在澄清中选择「环比+同比」时才使用 `mom_yoy`，额外查询同日历区间的上一年数据。
+- 对比期查询与当期证据一样需 settled 才能写入；因无数据、工具失败或余额不足无法取得时，对应单元格显示「数据受限」及原因，叙事层不得引用该比较结论。
+
+### 热帖字段 × 平台可得性
+
+归一化后每一行都有 `platform`、平台原始帖子标识与采集时间；其他字段均允许为 `null`，前端/Excel 必须按下表处理，而不假定字段必有。
+
+| 字段 | 小红书 | 抖音 | 归一化与展示规则 |
+|---|---|---|---|
+| 标题、作者、互动数、情感 | 可用但可能缺失 | 可用但可能缺失 | 保存原始值；缺失显示「未提供」 |
+| 阅读/播放数 | 可选 | 可选 | 统一为 `exposure_count`，标签按平台显示「阅读数」或「播放数」 |
+| 点赞、评论 | 可选 | 可选 | 分别保存，缺失不参与总和 |
+| 收藏 | 可选 | 可选 | 仅在源字段存在时展示 |
+| 转发/分享 | 可选 | 可选 | 统一为 `share_count`，标签按平台显示「转发」或「分享」 |
+| 原帖链接 | 可选 | 可选 | 仅使用 MCP 返回的合法 URL；缺失时不渲染跳转按钮 |
+| 达人层级 | 可选 | 可选 | 由已采集的粉丝/账号字段映射；证据不足则为空 |
+
 ## 后端设计
+
+### 数据库迁移与 API 契约
+
+新增 Alembic `0026_brand_report_v2_payload.py`（`down_revision=0025_kol_selection_detail_views`）：
+
+- `analysis_reports.payload_json`：可空 JSON，仅新品牌报告写入；旧行保持 `NULL`。
+- `analysis_reports.template_version`：可空 `VARCHAR(32)`，新品牌报告写入 `brand_report_v2`；旧行保持 `NULL`。
+
+迁移的 downgrade 必须删除两列。`AnalysisReport` ORM、`AnalysisReportRead`、前端 `ApiAnalysisReport` 同步增加可选结构化 payload 字段；报告列表 API 不返回大载荷，仅详情 API 返回。现有 `blocks_json` 与所有非品牌报告行为不变。
 
 ### 报告构建
 
@@ -68,7 +103,11 @@ sources: 数据工具、采集时间与证据引用
 2. `BrandReportNarrativeBuilder`：把结构化数据作为唯一模型输入，生成好评点、负面洞察、扩张信号、AI 结论和结论与建议。
 3. `AnalysisReportService`：将模板版本、结构化快照、叙事文本与原有报告元数据一起按当前 `(session_id, report_type, version)` 规则落库。
 
-为避免把复杂业务结构塞入通用 Block，`AnalysisReport` 增加独立的 `payload_json` 与 `template_version` 字段。原 `blocks_json` 保留，供旧报告与其他报告类型兼容；新品牌报告仍可生成兼容性 Block，但 BI/Excel 的事实数据只读 `payload_json`。
+`run_brand_analysis` 原地演进为 v2 构建器，不并存第二条自动构建链路：先组装快照，再由模型生成叙事，最后调用 `build_session_report` 一次性落库。它仍由 `GoalFinalizer._finalize_analysis_goal` 在品牌 Goal 的终态收尾事务中调用；因此快照、报告版本、成功 Artifact 与事件都对应同一次 goal 收尾，BI/导出不会按需再生成快照。
+
+现有失败语义保持：预期的数据缺口生成 `partial` 报告，不算构建失败；组装器校验、模型或落库异常则由 `_finalize_analysis_goal` 捕获，登记 failed `brand_report` Artifact 并将 Goal 降级为 `completed_with_warnings`。手动 `analysis-retry` 从原任务的冻结 evidence 新建一个报告版本；已生成版本永不改写。
+
+为避免把复杂业务结构塞入通用 Block，`AnalysisReport` 增加独立的 `payload_json` 与 `template_version` 字段。原 `blocks_json` 保留，供旧报告与其他报告类型兼容；新品牌报告仍生成兼容性 Block，但 BI/Excel 的事实数据只读 `payload_json`。
 
 旧的 `brand_analysis` 记录不回填、不修改。读取时若无 `brand_report_v2`，前端走现有通用 Block 渲染，并明确提示该历史版本不支持模板导出。
 
@@ -84,8 +123,12 @@ GET /sessions/{session_id}/reports/{report_id}/export
 - 校验 `report_id` 与 `session_id` 的归属关系，防止跨会话和跨用户读取。
 - 仅读取该记录已保存的 `brand_report_v2` 快照；不调用模型、MCP、任务执行器和积分系统。
 - 以版本化、去样例的 8 Sheet Excel 模板为基础填充数据，保留模板版式、表头、数字格式与图表。
+- 运行时模板固定放在 `backend/app/reporting/templates/brand_report_v2.xlsx`；仓库根目录的 `brand_report.xlsx` 在实施时迁入该目录并清除样例品牌/数据。模板版本变更时复制为新文件并同步递增 `template_version`，历史报告继续使用生成时版本。
 - 空章节保留 Sheet、列头和受限说明；模板加载、填充或导出失败时返回明确错误，绝不输出半截文件。
-- 下载文件名：`{品牌}_品牌社媒分析报告_{开始日期}-{结束日期}_v{版本}.xlsx`。
+- 日趋势及地域图在填充数据后由导出代码删除旧图表并按当前数据范围新建；无可用数据时不建图，只保留受限说明。2026-07-30 的隔离探针已验证当前 `openpyxl>=3.1` 对参考模板的 3 个图表可读写往返保留，但不把该行为作为动态范围正确性的保障。
+- 下载文件名：`{品牌}_品牌社媒分析报告_{开始日期}-{结束日期}_v{版本}.xlsx`。品牌片段须剔除控制字符和 `< > : " / \\ | ? *`，合并连续空白/下划线、移除尾部点和空格，并截断到 80 个字符；清洗后为空时使用「未命名品牌」。
+
+该路由与现有 `GET /sessions/{session_id}/reports?report_type=` 不冲突：后者是精确的集合路径，导出路由为更深的 `/sessions/{session_id}/reports/{report_id}/export`。
 
 ## 右侧品牌分析 BI
 
@@ -140,10 +183,11 @@ AI 结论
 1. 组装层：指标、Top 15/Top 20 截断、日期完整性、缺失字段、来源追溯。
 2. 叙事层：模型只能引用结构化输入，缺失章节不能生成虚假数值。
 3. 存储层：报告版本独立、历史快照不可变、旧版兼容。
-4. 导出：8 个 Sheet、表头、数值、日期/百分比格式、图表数据范围、受限章节、文件名。
-5. API：会话/用户隔离、类型校验、当前版本导出、无需积分且不触发 MCP。
-6. 前端：章节锚点、版本切换、数据受限、热帖展开与链接、旧版降级提示、导出状态。
-7. E2E：生成一版完整/一版受限报告，切换版本并下载，核对页面与 Excel 的关键指标一致。
+4. 迁移：upgrade/downgrade、旧报告两列为 NULL、新行 payload/template_version 写入正确。
+5. 导出：8 个 Sheet、表头、数值、日期/百分比格式、图表数据范围与空数据无图、受限章节、文件名清洗。
+6. API：会话/用户隔离、类型校验、当前版本导出、无需积分且不触发 MCP；路由与报告列表/详情端点共存。
+7. 前端：章节锚点、版本切换、数据受限、热帖字段空值与链接、旧版降级提示、导出状态。
+8. E2E：生成一版完整/一版受限报告，切换版本并下载，核对页面与 Excel 的关键指标一致。
 
 ## 非目标
 
