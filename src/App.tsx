@@ -207,6 +207,7 @@ export default function App() {
                     favorites={favorites}
                     loading={favoritesLoading}
                     onRefresh={refreshFavorites}
+                    onSelectKol={kol => setSelectedKol(kol)}
                   />
                 )}
               </>

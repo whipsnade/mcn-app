@@ -118,4 +118,25 @@ describe('FavoritesPanel', () => {
 
     expect(screen.getByText('还没有收藏的达人')).toBeVisible();
   });
+
+  it('opens the KOL detail for platform+kol_uid rows via onSelectKol', () => {
+    const onSelectKol = vi.fn();
+    render(<FavoritesPanel favorites={[favoriteFixture()]} loading={false} onSelectKol={onSelectKol} />);
+
+    fireEvent.click(screen.getByRole('button', { name: '查看达人详情 达人小A' }));
+
+    expect(onSelectKol).toHaveBeenCalledWith({
+      platform: 'xiaohongshu',
+      kw_uid: 'uid-1',
+      nickname: '达人小A',
+    });
+  });
+
+  it('does not render a detail entry for legacy rows without kol_uid', () => {
+    const onSelectKol = vi.fn();
+    render(<FavoritesPanel favorites={[LEGACY_ROW]} loading={false} onSelectKol={onSelectKol} />);
+
+    expect(screen.queryByRole('button', { name: /查看达人详情/ })).toBeNull();
+    expect(screen.getByText('探店达人乙')).toBeVisible();
+  });
 });
