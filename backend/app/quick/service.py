@@ -391,6 +391,12 @@ def _normalize_kol(payload: JsonValue, platform: str) -> list[_KolCandidate]:
 def _normalize_posts(payload: JsonValue, platform: str) -> list[TopPostItem]:
     posts: list[TopPostItem] = []
     for entry in _find_rows(payload, ("帖子列表", "数据列表", "posts", "list", "items")):
+        url = _text(_first(entry, "帖子链接", "链接", "url"))
+        if not url and platform == "douyin":
+            # 抖音上游不给直接链接，但有内容 ID；按官方视频页格式合成。
+            content_id = _text(_first(entry, "内容ID", "视频ID", "aweme_id", "内容id"))
+            if content_id:
+                url = f"https://www.douyin.com/video/{content_id}"
         posts.append(
             TopPostItem(
                 title=_text(_first(entry, "标题", "帖子标题", "内容", "title")),
@@ -400,7 +406,7 @@ def _normalize_posts(payload: JsonValue, platform: str) -> list[TopPostItem]:
                 comment=_number(_first(entry, "评论数", "评论", "comment")),
                 collect=_number(_first(entry, "收藏数", "收藏", "collect")),
                 publish_time=_text(_first(entry, "发布时间", "发布日期", "publish_time")),
-                url=_text(_first(entry, "帖子链接", "链接", "url")),
+                url=url,
                 platform=platform,
             )
         )
