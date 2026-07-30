@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react';
 
 import { deleteFavorite, deleteFavoriteByKey } from '../api/favorites';
 import type { ApiFavorite } from '../api/contracts';
+import type { QuickKolSelection } from '../types';
 import { formatExposure } from './reportPrimitives';
 
 interface FavoritesPanelProps {
@@ -10,6 +11,7 @@ interface FavoritesPanelProps {
   loading?: boolean;
   onRefresh?: () => void;
   onCountChange?: (count: number) => void;
+  onSelectKol?: (kol: QuickKolSelection) => void;
 }
 
 function platformName(platform: string): string {
@@ -26,7 +28,7 @@ function snapshotPrice(snapshot: Record<string, unknown> | null): number | null 
   return snapshotNumber(snapshot, 'quoted_price_cny') ?? snapshotNumber(snapshot, 'price');
 }
 
-export default function FavoritesPanel({ favorites, loading = false, onRefresh, onCountChange }: FavoritesPanelProps) {
+export default function FavoritesPanel({ favorites, loading = false, onRefresh, onCountChange, onSelectKol }: FavoritesPanelProps) {
   const [error, setError] = useState<string>();
 
   useEffect(() => {
@@ -61,6 +63,8 @@ export default function FavoritesPanel({ favorites, loading = false, onRefresh, 
       followers !== null ? `粉丝 ${formatExposure(followers)}` : null,
       price !== null ? `¥${price.toLocaleString('zh-CN')}` : null,
     ].filter(Boolean);
-    return <div key={favorite.id} className="flex items-center justify-between rounded-xl border border-slate-200 bg-white px-4 py-3 shadow-sm"><div><div className="text-xs font-semibold text-slate-800">{name}</div><div className="mt-1 text-[10px] text-slate-400">{metaParts.join(' · ')}</div></div><button type="button" aria-label={`取消收藏 ${name}`} onClick={() => void remove(favorite)} className="rounded-lg p-1.5 text-amber-500 transition hover:bg-amber-50"><Star className="h-3.5 w-3.5 fill-amber-400" /></button></div>;
+    const selectable = Boolean(onSelectKol && favorite.kol_uid);
+    const info = <><div className="text-xs font-semibold text-slate-800">{name}</div><div className="mt-1 text-[10px] text-slate-400">{metaParts.join(' · ')}</div></>;
+    return <div key={favorite.id} className="flex items-center justify-between rounded-xl border border-slate-200 bg-white px-4 py-3 shadow-sm">{selectable ? <button type="button" aria-label={`查看达人详情 ${name}`} onClick={() => onSelectKol?.({ platform: favorite.platform, kw_uid: favorite.kol_uid!, nickname: name })} className="min-w-0 flex-1 rounded-lg text-left transition hover:text-indigo-600">{info}</button> : <div>{info}</div>}<button type="button" aria-label={`取消收藏 ${name}`} onClick={() => void remove(favorite)} className="rounded-lg p-1.5 text-amber-500 transition hover:bg-amber-50"><Star className="h-3.5 w-3.5 fill-amber-400" /></button></div>;
   })}</div></div>;
 }
