@@ -631,16 +631,18 @@ describe('UniversalReport', () => {
     expect(screen.queryByRole('status')).not.toBeInTheDocument();
   });
 
-  it('shows only the top 20 selection items ordered by engagement rate with a summary line', async () => {
+  it('shows only the top 20 selection items ordered by total score with a summary line', async () => {
     const items = [
       ...Array.from({ length: 18 }, (_, index) => kolSelectionItem({
         kol_uid: `uid-r${index + 1}`,
         nickname: `达人r${index + 1}`,
-        fields: { engagement_rate: index + 1 },
+        score: { version: 'kol_score_v2', total: index + 1, rating: '观察' },
+        fields: { engagement_rate: 99 - index },
       })),
       ...Array.from({ length: 7 }, (_, index) => kolSelectionItem({
         kol_uid: `uid-n${index + 1}`,
         nickname: `达人n${index + 1}`,
+        score: undefined,
         fields: {},
       })),
     ];
@@ -649,13 +651,13 @@ describe('UniversalReport', () => {
 
     fireEvent.click(screen.getByRole('tab', { name: '圈选达人 (25)' }));
 
-    expect(await screen.findByText('共 25 位达人，按互动率展示 Top 20')).toBeVisible();
+    expect(await screen.findByText('共 25 位达人，按综合评分展示 Top 20')).toBeVisible();
     const rendered = await screen.findAllByText(/^达人[rn]\d+$/);
     const names = rendered.map(node => node.textContent);
     expect(names).toHaveLength(20);
-    // 互动率倒序：r18 最高 … r1 最低。
+    // 综合评分倒序：r18 最高 … r1 最低（与互动率方向相反，证明按评分排序）。
     expect(names.slice(0, 18)).toEqual(Array.from({ length: 18 }, (_, index) => `达人r${18 - index}`));
-    // 无互动率的排最后，保持原有相对顺序（稳定排序）。
+    // 无评分的排最后，保持原有相对顺序（稳定排序）。
     expect(names.slice(18)).toEqual(['达人n1', '达人n2']);
   });
 
@@ -673,7 +675,7 @@ describe('UniversalReport', () => {
     expect(await screen.findByText('达人甲')).toBeVisible();
     expect(screen.getByText('达人乙')).toBeVisible();
     expect(screen.getByText('达人丙')).toBeVisible();
-    expect(screen.queryByText(/按互动率展示 Top 20/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/按综合评分展示 Top 20/)).not.toBeInTheDocument();
     // 子 Tab 标签计数仍来自 selectionCount，不受 Top20 截断影响。
     expect(screen.getByRole('tab', { name: '圈选达人 (3)' })).toBeVisible();
   });

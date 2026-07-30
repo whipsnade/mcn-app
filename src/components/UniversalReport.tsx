@@ -807,14 +807,14 @@ function KolPanel({ report, taskStatus, sessionId, selectionCount, onReportReady
 
   const displayedReport = viewReport ?? report;
   const selectedCount = selectionCount ?? 0;
-  // 名单按互动率倒序展示 Top 20：无互动率（null/非数值）排最后，保持原有相对顺序。
+  // 名单按综合评分（score.total）倒序展示 Top 20：无评分（null/非数值）排最后，保持原有相对顺序。
   const topSelectionItems = selectionItems
-    .map((item, index) => ({ item, index, rate: selectionMetric(item, 'engagement_rate') }))
+    .map((item, index) => ({ item, index, total: finiteNumber(item.score?.total) }))
     .sort((a, b) => {
-      if (a.rate == null && b.rate == null) return a.index - b.index;
-      if (a.rate == null) return 1;
-      if (b.rate == null) return -1;
-      return b.rate - a.rate || a.index - b.index;
+      if (a.total == null && b.total == null) return a.index - b.index;
+      if (a.total == null) return 1;
+      if (b.total == null) return -1;
+      return b.total - a.total || a.index - b.index;
     })
     .slice(0, 20)
     .map(entry => entry.item);
@@ -929,7 +929,7 @@ function KolPanel({ report, taskStatus, sessionId, selectionCount, onReportReady
                 <ScoreGuide />
                 {selectionItems.length > 20 && (
                   <p className="px-1 text-[10px] text-slate-400">
-                    共 {selectionItems.length} 位达人，按互动率展示 Top 20
+                    共 {selectionItems.length} 位达人，按综合评分展示 Top 20
                   </p>
                 )}
                 {topSelectionItems.map(item => (
