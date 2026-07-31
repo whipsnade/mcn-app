@@ -449,6 +449,9 @@ async def create_task(
                         "goal_type": goal.goal_type,
                         "sequence": goal.sequence,
                         "depends_on_sequence": goal.depends_on_sequence,
+                        # 注意：model_dump 不排除默认值，GoalParams.comparison_mode
+                        # 的默认值 "mom" 会并入所有 goal 类型（含 campaign/kol）的
+                        # params_json；消费方仅 brand_analysis 读取该字段。
                         "params": goal.params.model_dump(mode="json", exclude_none=True),
                     }
                     for goal in sorted(
