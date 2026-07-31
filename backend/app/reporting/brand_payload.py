@@ -8,7 +8,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -241,6 +241,25 @@ class BrandReportData(BaseModel):
     top_posts: list[TopPostRow] = Field(default_factory=list)  # 每平台 ≤15，互动量降序
 
 
+class BrandReportNarrative(BaseModel):
+    """叙事层输出（Task 5，brand_narrative.build_brand_narrative 由模型撰写）。
+
+    定义在本模块而非 brand_narrative.py：后者需要 import BrandReportPayload，
+    模型放这里可避免双向 import 循环。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    praise_points: list[str] = Field(default_factory=list)  # 好评点
+    complaint_points: list[str] = Field(default_factory=list)  # 槽点
+    impact_level: Literal["低", "中", "高"] = "低"  # 负面影响程度
+    expansion_signals: list[str] = Field(default_factory=list)  # 扩张信号
+    noise_notes: str | None = None  # 噪音说明
+    key_findings: list[str] = Field(default_factory=list)  # 情感关键发现
+    conclusion: str = ""  # AI 结论
+    recommendations: list[str] = Field(default_factory=list)  # 结论与建议
+
+
 class BrandReportPayload(BaseModel):
     """brand_report_v2 顶层快照。"""
 
@@ -251,9 +270,8 @@ class BrandReportPayload(BaseModel):
     scope: ReportScope
     query_spec: QuerySpec
     data: BrandReportData
-    # Task 5 叙事层回填；Task 4 阶段为 dict 占位，Task 5 收窄为
-    # BrandReportNarrative 模型（brand_narrative.py）。
-    narrative: dict[str, Any] | None = None
+    # Task 5 叙事层回填（build_brand_narrative 撰写，数值只能引用 data）。
+    narrative: BrandReportNarrative | None = None
     availability: dict[str, ChapterAvailability]  # 8 章节键，见 ALL_CHAPTERS
     sources: list[SourceEntry] = Field(default_factory=list)
 
@@ -262,6 +280,7 @@ __all__ = [
     "ALL_CHAPTERS",
     "DATA_CHAPTERS",
     "BrandReportData",
+    "BrandReportNarrative",
     "BrandReportPayload",
     "ChapterAvailability",
     "ContentTypeRow",

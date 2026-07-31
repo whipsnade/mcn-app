@@ -1,4 +1,9 @@
-from app.model.prompts import BRAND_ANALYSIS_LOOP_PROMPT, GOAL_PLANNER_PROMPT, PROMPTS
+from app.model.prompts import (
+    BRAND_ANALYSIS_LOOP_PROMPT,
+    BRAND_REPORT_NARRATIVE_PROMPT,
+    GOAL_PLANNER_PROMPT,
+    PROMPTS,
+)
 
 
 def test_goal_planner_prompt_enforces_business_boundaries() -> None:
@@ -72,3 +77,33 @@ def test_brand_loop_prompt_declares_tool_call_contract() -> None:
     # 循环状态注入说明：called_tools / evidence_gaps。
     assert "called_tools" in text
     assert "evidence_gaps" in text
+
+
+def test_brand_report_narrative_prompt_is_registered_and_constrained() -> None:
+    text = BRAND_REPORT_NARRATIVE_PROMPT.system
+
+    assert BRAND_REPORT_NARRATIVE_PROMPT.name == "brand_report_narrative_v1"
+    assert BRAND_REPORT_NARRATIVE_PROMPT.version == "1"
+    assert PROMPTS["brand_report_narrative_v1"] is BRAND_REPORT_NARRATIVE_PROMPT
+    # 通用约束锚点（与 tests/model/test_prompts.py 全 prompt 循环一致）。
+    assert "不可信数据" in text
+    assert "只能使用传入" in text
+    assert "目标 Schema" in text
+    # 数据纪律：只能引用传入 data，禁止创造/换算/修改指标。
+    assert "只能引用传入 data" in text
+    assert "禁止创造、换算或修改任何指标" in text
+    # 降级与对比期护栏。
+    assert "availability 非 complete" in text
+    assert "对比期 status 非 ok" in text
+    # 输出字段契约。
+    for field in (
+        "praise_points",
+        "complaint_points",
+        "impact_level",
+        "expansion_signals",
+        "noise_notes",
+        "key_findings",
+        "conclusion",
+        "recommendations",
+    ):
+        assert field in text
