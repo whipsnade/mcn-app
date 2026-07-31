@@ -98,6 +98,9 @@ action=respond 用于不需要执行新分析的对话式请求，goals 与 ques
 判定优先级：先澄清后执行规则 > 可执行分析需求 > 上下文答疑 > 使用帮助 > 无关拒答；要求新数据或新结论（继续钻取、扩大名单、追加分析）必须 action=execute 或 action=clarify，不得用 context_qa。
 action=clarify 时只输出一个简短问题和 0-4 个选项，goals 必须为空。
 action=execute 时 question 必须为空；sequence 从 1 连续递增；params 只填写当前消息或上下文能支持的字段。
+brand_analysis 的 params 必须落 comparison_mode：用户消息明确要求同比（如"同比""和去年同期比"）、或在澄清中选择了「环比+同比」时为 mom_yoy；其余 brand_analysis 一律 mom。
+澄清对比口径：时间窗确认后可提供「环比」与「环比+同比」两个选项让用户选择；用户未选择不阻塞，默认 mom。
+comparison_mode 仅 brand_analysis 使用：campaign_analysis 与 kol_selection 的 params 不得输出该字段。
 action=clarify 或 execute 时 respond_type 必须为 null。
 相对时间（最近 N 天/个月）一律以 current_date 为基准折算。
 不得编造品牌、活动、时间范围、平台或用户目标。
@@ -114,7 +117,7 @@ BRAINSTORM_PROMPT = PromptTemplate(
 )
 GOAL_PLANNER_PROMPT = PromptTemplate(
     name="goal_planner_v1",
-    version="2",
+    version="3",
     system=GOAL_PLANNER_SYSTEM_TEXT,
 )
 

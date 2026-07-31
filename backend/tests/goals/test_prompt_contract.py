@@ -4,7 +4,7 @@ from app.model.prompts import BRAND_ANALYSIS_LOOP_PROMPT, GOAL_PLANNER_PROMPT, P
 def test_goal_planner_prompt_enforces_business_boundaries() -> None:
     text = GOAL_PLANNER_PROMPT.system
     assert GOAL_PLANNER_PROMPT.name == "goal_planner_v1"
-    assert GOAL_PLANNER_PROMPT.version == "2"
+    assert GOAL_PLANNER_PROMPT.version == "3"
     assert "brand_analysis" in text
     assert "campaign_analysis" in text
     assert "kol_selection" in text
@@ -29,6 +29,11 @@ def test_goal_planner_prompt_enforces_business_boundaries() -> None:
     assert "澄清轮次由你判断" in text
     assert "不得重复追问用户已回答过的条件" in text
     assert "直接执行" in text
+    # comparison_mode 落参规则：仅 brand_analysis 使用，默认 mom，明确要求同比时 mom_yoy。
+    assert "comparison_mode" in text
+    assert "mom_yoy" in text
+    assert "其余 brand_analysis 一律 mom" in text
+    assert "campaign_analysis 与 kol_selection 的 params 不得输出该字段" in text
     assert PROMPTS["goal_planner_v1"] is GOAL_PLANNER_PROMPT
 
 

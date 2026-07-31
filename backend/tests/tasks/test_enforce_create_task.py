@@ -131,6 +131,7 @@ def _spec(
     period: GoalPeriod | None = None,
     platforms: list[str] | None = None,
     requirement: str = "",
+    comparison_mode: str = "mom",
 ) -> GoalSpec:
     return GoalSpec(
         sequence=sequence,
@@ -141,6 +142,7 @@ def _spec(
             period=period,
             platforms=platforms or [],
             requirement=requirement,
+            comparison_mode=comparison_mode,
         ),
         request_evidence="声量与互动数据",
     )
@@ -354,14 +356,54 @@ async def test_enforce_execute_creates_typed_goal_with_params(
     goal = await db_session.scalar(select(TaskGoal))
     assert goal is not None
     assert goal.goal_type == "brand_analysis"
-    # planner params 合并会话快照：brand 被 planner 覆盖，category 来自会话。
+    # planner params 合并会话快照：brand 被 planner 覆盖，category 来自会话；
+    # comparison_mode 未输出时按 GoalParams 默认落 mom。
     assert goal.params_json == {
         "brand": "喜茶",
         "category": "美食",
         "period": {"start": "2026-06-01", "end": "2026-06-30"},
         "platforms": ["xiaohongshu"],
         "requirement": "看品牌声量",
+        "comparison_mode": "mom",
     }
+
+
+@pytest.mark.asyncio
+async def test_enforce_brand_goal_persists_comparison_mode(
+    auth_client_factory, db_session, monkeypatch
+) -> None:
+    """planner 输出 comparison_mode=mom_yoy 时随 params 落库；未输出默认 mom。"""
+    _enable_enforce(monkeypatch)
+
+    async def fake_plan(self, context, **_kwargs):
+        return GoalPlannerOutput(
+            action="execute",
+            goals=[
+                _spec(
+                    1,
+                    "brand_analysis",
+                    brand="喜茶",
+                    requirement="环比加同比看声量",
+                    comparison_mode="mom_yoy",
+                )
+            ],
+        )
+
+    monkeypatch.setattr(GoalPlannerService, "plan_context", fake_plan)
+    _share_session_factory(monkeypatch, db_session)
+    client = await auth_client_factory("13400000087")
+    session_id = await _create_session(client)
+
+    response = await client.post(
+        f"/api/v1/sessions/{session_id}/tasks", json={"content": "分析喜茶声量，环比加同比"}
+    )
+
+    assert response.status_code == 202
+    assert response.json()["outcome"] == "task"
+    goal = await db_session.scalar(select(TaskGoal))
+    assert goal is not None
+    assert goal.goal_type == "brand_analysis"
+    assert goal.params_json["comparison_mode"] == "mom_yoy"
 
 
 @pytest.mark.asyncio

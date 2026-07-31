@@ -25,6 +25,8 @@ class GoalParams(BaseModel):
     period: GoalPeriod | None = None
     platforms: list[str] = Field(default_factory=list, max_length=5)
     requirement: str = Field(default="", max_length=1000)
+    # 品牌分析对比口径：mom=仅环比（默认）；mom_yoy=环比+同比（用户明确要求时）。
+    comparison_mode: Literal["mom", "mom_yoy"] = "mom"
 
 
 class GoalSpec(BaseModel):
