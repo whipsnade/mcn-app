@@ -20,6 +20,7 @@ from app.goals.schemas import (
     GoalQuestion,
     GoalSpec,
 )
+from app.mcp_gateway.models import McpToolCatalog
 from app.model.tencent_plan import TencentPlanAdapter
 from app.tasks.models import AnalysisTask
 from app.tasks.schemas import TaskCreate
@@ -208,6 +209,112 @@ async def test_enforce_clarify_stores_message_without_task(
     assert [message.role for message in persisted] == ["user", "assistant"]
     assert persisted[0].metadata_json["turn_id"] == persisted[1].metadata_json["turn_id"]
     assert persisted[1].metadata_json["clarify"] == {"options": ["海底捞", "喜茶"]}
+
+
+def _catalog_row(
+    *,
+    internal_name: str = "kol_search",
+    is_enabled: bool = True,
+    review_status: str = "approved",
+) -> McpToolCatalog:
+    now = datetime.now(UTC).replace(tzinfo=None)
+    return McpToolCatalog(
+        id=str(uuid4()),
+        service_slug="social-grow-mcp",
+        internal_tool_name=internal_name,
+        reviewed_description="按平台与标签检索达人",
+        input_schema_json={
+            "type": "object",
+            "required": ["platform"],
+            "properties": {"platform": {"type": "string"}},
+        },
+        output_validator_version="kol_search_v1",
+        discovery_digest="d" * 64,
+        review_status=review_status,
+        is_enabled=is_enabled,
+        created_at=now,
+        updated_at=now,
+    )
+
+
+@pytest.mark.asyncio
+async def test_enforce_injects_available_tools_into_planner_context(
+    auth_client_factory, db_session, monkeypatch
+) -> None:
+    """enforce 规划上下文注入已审核工具紧凑投影；quarantined/disabled 不注入。"""
+    _enable_enforce(monkeypatch)
+    db_session.add(_catalog_row())
+    db_session.add(_catalog_row(internal_name="kol_detail_quarantined", review_status="quarantined"))
+    db_session.add(_catalog_row(internal_name="kol_detail_disabled", is_enabled=False))
+    await db_session.flush()
+    captured: dict[str, object] = {}
+
+    async def fake_plan(self, context, **kwargs):
+        captured["available_tools"] = context.available_tools
+        return _clarify_output()
+
+    monkeypatch.setattr(GoalPlannerService, "plan_context", fake_plan)
+    _share_session_factory(monkeypatch, db_session)
+    client = await auth_client_factory("13400000091")
+    session_id = await _create_session(client)
+
+    response = await client.post(
+        f"/api/v1/sessions/{session_id}/tasks", json={"content": "帮我圈选达人"}
+    )
+
+    assert response.status_code == 202
+    assert captured["available_tools"] == (
+        {
+            "internal_name": "kol_search",
+            "description": "按平台与标签检索达人",
+            "required_params": ["platform"],
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_enforce_clarify_then_answer_executes_with_history(
+    auth_client_factory, db_session, monkeypatch
+) -> None:
+    """首轮 clarify 不落任务；用户回答后重新规划能看到澄清问答并 execute 建任务。"""
+    _enable_enforce(monkeypatch)
+    contexts = []
+
+    async def fake_plan(self, context, **kwargs):
+        contexts.append(context)
+        if len(contexts) == 1:
+            return _clarify_output()
+        return GoalPlannerOutput(
+            action="execute",
+            goals=[_spec(1, "brand_analysis", brand="喜茶", requirement="六月声量")],
+        )
+
+    monkeypatch.setattr(GoalPlannerService, "plan_context", fake_plan)
+    _share_session_factory(monkeypatch, db_session)
+    client = await auth_client_factory("13400000092")
+    session_id = await _create_session(client)
+    await _set_session_profile(db_session, session_id, brand="喜茶", category="茶饮")
+
+    first = await client.post(
+        f"/api/v1/sessions/{session_id}/tasks", json={"content": "分析喜茶声量"}
+    )
+    assert first.status_code == 202
+    assert first.json()["outcome"] == "clarify"
+
+    second = await client.post(
+        f"/api/v1/sessions/{session_id}/tasks", json={"content": "看六月的数据"}
+    )
+    assert second.status_code == 202
+    assert second.json()["outcome"] == "task"
+
+    # 第二次规划的 recent_messages 含首轮澄清问答与本次回答。
+    history = [message.content for message in contexts[1].recent_messages]
+    assert "分析喜茶声量" in history
+    assert "想看哪个品牌的分析？" in history
+    assert contexts[1].recent_messages[-1].content == "看六月的数据"
+    goal = await db_session.scalar(select(TaskGoal))
+    assert goal is not None
+    assert goal.goal_type == "brand_analysis"
 
 
 @pytest.mark.asyncio

@@ -19,6 +19,7 @@ from app.goals.planner import GoalPlannerService
 from app.goals.respond import OUT_OF_SCOPE_TEXT, USAGE_GUIDE_TEXT, answer_context_qa
 from app.goals.schemas import GoalPlannerOutput
 from app.identity.dependencies import FunctionScopedCurrentUser
+from app.mcp_gateway.models import McpToolCatalog
 from app.model.dependencies import get_model_adapter
 from app.tasks.models import AnalysisTask, TaskEvent
 from app.tasks.events import TaskEventBroker, TaskEventStream
@@ -181,8 +182,36 @@ async def _plan_goal_or_fallback(
             exc_info=True,
         )
     try:
+        # 已审核 MCP 工具的紧凑投影：planner 围绕数据能力追问执行条件的依据。
+        # 只查 catalog 表不走网络；失败不阻塞规划（空清单也能规划）。
+        try:
+            catalog_rows = (
+                await db.scalars(
+                    select(McpToolCatalog).where(
+                        McpToolCatalog.is_enabled.is_(True),
+                        McpToolCatalog.review_status == "approved",
+                    )
+                )
+            ).all()
+            available_tools = tuple(
+                {
+                    "internal_name": row.internal_tool_name,
+                    "description": row.reviewed_description,
+                    "required_params": list(
+                        (row.input_schema_json or {}).get("required") or []
+                    ),
+                }
+                for row in catalog_rows
+            )
+        except Exception:
+            logger.warning(
+                "goal_planner_tools_load_failed session_id=%s",
+                session_id,
+                exc_info=True,
+            )
+            available_tools = ()
         context = await GoalPlannerContextBuilder().build_for_message(
-            user_id, session_id, content, db=db
+            user_id, session_id, content, db=db, available_tools=available_tools
         )
         return await GoalPlannerService(
             model=get_model_adapter(), context_builder=None

@@ -3,6 +3,8 @@
 本文件面向 AI 编码代理，概述项目结构、开发命令与必须遵守的约定。详细信息以仓库内的 `README.md`、`docs/runbooks/phase-2-runtime.md` 和各模块源码为准。
 
 > **新会话预热**：开始工作前先读 `changelog/` 目录最新 2-3 篇按日期的变更日志（改了什么、为什么、遗留事项），可快速建立上下文；约定见 `changelog/README.md`。
+>
+> **每日记录**：每天的功能与架构变更必须追加到当日 `changelog/YYYY-MM-DD.md`（没有则新建），结构为 背景与目标 / 主要改动（含关键文件）/ 验证结果 / 遗留事项；写给没有本会话记忆的后来者，记录决策与原因，不只罗列 diff。
 
 ## 项目概述
 
@@ -34,7 +36,7 @@ KOL Insight AI：面向品牌用户的网红 KOL 与 MCN 营销效果智能筛�
 
 Prompt 学习日志与成功案例回放：所有模型调用在 `TencentPlanAdapter.complete_json/stream_text` 统一出口写入 `model_prompt_logs` 表（迁移 0019；完整 messages/response 为 MEDIUMTEXT，purpose/tags 标签化，status=success/invalid/failed + error_code，token 用量与耗时；写日志走独立 SessionFactory 会话，异常只记 warning 绝不阻塞主流程）。调用点经请求的 `log_context`（user_id/session_id/task_id/tags）透传上下文。`model/exemplars.py` 的 `find_success_exemplars` 按 purpose + status=success + tags 交集检索最近成功记录（截断 ~1500 字符、剔除 key/token 特征字段），注入 agent_loop、quick 小循环与 brainstorm 的 user content JSON 的 `"exemplars"` 键，供模型参考工具选择与参数写法。
 
-GoalPlanner 当前处于可配置的影子模式：只在启用配置时为新任务记录规划结果，尚未创建 TaskGoal 与 TaskArtifact，也尚未接管执行；真实任务仍走旧 Agent Loop 的 KOL 圈选路径。
+GoalPlanner 已可按配置接管执行：`GOAL_PLANNER_ENFORCE_ENABLED=true` 时，画像 ready 后的消息先经 planner 规划（enforce 路径），planner 输入含已审核 MCP 工具紧凑投影 `available_tools`（internal_name/description/required_params，直接查 `mcp_tool_catalog` 表注入）；`goal_planner_v1` prompt（version=2）要求「先澄清后执行」——分析类意图（brand/campaign/kol_selection）首轮必须 `action=clarify`，从执行稳定/数据精准角度问最关键的执行条件（每轮一问、2-4 个可执行选项），澄清轮次由模型自主判断（可多轮直到条件足够，通常 1-3 轮收敛，无服务端硬上限），用户回答后（或说"直接执行"）再次发消息即 execute 建任务；planner 异常仍回退 kol_selection 单 Goal 老路径。影子模式（`GOAL_PLANNER_SHADOW_ENABLED`）保留，只写 `model_prompt_logs`。
 
 ## 项目结构
 

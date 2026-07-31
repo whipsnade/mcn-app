@@ -82,6 +82,9 @@ class GoalPlannerContext:
         "campaign_analysis",
         "kol_selection",
     )
+    # enforce 入口注入的已审核 MCP 工具紧凑投影（internal_name/description/required_params）；
+    # 影子入口不注入，保持空 tuple。
+    available_tools: tuple[dict[str, Any], ...] = ()
 
 
 class GoalPlannerContextBuilder:
@@ -93,20 +96,37 @@ class GoalPlannerContextBuilder:
             return await self._build(db, task_id)
 
     async def build_for_message(
-        self, user_id: str, session_id: str, message: str, *, db=None
+        self,
+        user_id: str,
+        session_id: str,
+        message: str,
+        *,
+        db=None,
+        available_tools: tuple[dict[str, Any], ...] = (),
     ) -> GoalPlannerContext:
         """不依赖 task 的规划上下文（enforce 入口：任务尚未创建）。
 
         current_message 用入参（此刻用户消息可能尚未落库）；recent_messages
         取会话最近消息（sequence 正序）并在尾部补上这条新消息。
+        available_tools 是已审核 MCP 工具的紧凑投影，供 planner 围绕数据能力追问。
         """
         if db is not None:
-            return await self._build_for_message(db, user_id, session_id, message)
+            return await self._build_for_message(
+                db, user_id, session_id, message, available_tools=available_tools
+            )
         async with self._session_factory() as owned_db:
-            return await self._build_for_message(owned_db, user_id, session_id, message)
+            return await self._build_for_message(
+                owned_db, user_id, session_id, message, available_tools=available_tools
+            )
 
     async def _build_for_message(
-        self, db, user_id: str, session_id: str, message: str
+        self,
+        db,
+        user_id: str,
+        session_id: str,
+        message: str,
+        *,
+        available_tools: tuple[dict[str, Any], ...] = (),
     ) -> GoalPlannerContext:
         workspace = await db.scalar(
             select(WorkspaceSession).where(
@@ -153,6 +173,7 @@ class GoalPlannerContextBuilder:
             account_default_brand=account_default_brand,
             artifact_summaries=artifact_summaries,
             exemplars=exemplars,
+            available_tools=available_tools,
         )
 
     async def _session_parts(self, db, *, user_id: str, workspace) -> tuple:

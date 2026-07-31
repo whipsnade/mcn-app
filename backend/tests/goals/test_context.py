@@ -174,6 +174,37 @@ async def test_build_for_message_assembles_context_without_task(
 
 
 @pytest.mark.asyncio
+async def test_build_for_message_passthrough_available_tools(db_session, user_factory) -> None:
+    """available_tools 由调用方（enforce 入口）注入并原样透传；缺省为空 tuple。"""
+    user = await user_factory()
+    workspace = await WorkspaceService(db_session).create_session(
+        user.id,
+        SessionCreate(brand="喜茶", category="茶饮"),
+    )
+
+    @asynccontextmanager
+    async def borrowed_session():
+        yield db_session
+
+    tools = (
+        {
+            "internal_name": "social_statistic_trend",
+            "description": "社媒趋势统计",
+            "required_params": ["datasource", "name"],
+        },
+    )
+    context = await GoalPlannerContextBuilder(borrowed_session).build_for_message(
+        user.id, workspace.id, "分析喜茶声量", available_tools=tools
+    )
+    assert context.available_tools == tools
+
+    default_context = await GoalPlannerContextBuilder(borrowed_session).build_for_message(
+        user.id, workspace.id, "分析喜茶声量"
+    )
+    assert default_context.available_tools == ()
+
+
+@pytest.mark.asyncio
 async def test_build_for_message_rejects_foreign_session(db_session, user_factory) -> None:
     user = await user_factory()
     other = await user_factory()

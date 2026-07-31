@@ -4,7 +4,7 @@ from app.model.prompts import BRAND_ANALYSIS_LOOP_PROMPT, GOAL_PLANNER_PROMPT, P
 def test_goal_planner_prompt_enforces_business_boundaries() -> None:
     text = GOAL_PLANNER_PROMPT.system
     assert GOAL_PLANNER_PROMPT.name == "goal_planner_v1"
-    assert GOAL_PLANNER_PROMPT.version == "1"
+    assert GOAL_PLANNER_PROMPT.version == "2"
     assert "brand_analysis" in text
     assert "campaign_analysis" in text
     assert "kol_selection" in text
@@ -22,6 +22,13 @@ def test_goal_planner_prompt_enforces_business_boundaries() -> None:
     assert "不得复制其中的实体" in text
     # 日期锚点规则：相对时间以 current_date 为基准折算。
     assert "current_date" in text
+    # 先澄清后执行：分析类意图首轮必须 clarify，围绕 available_tools 能力追问；
+    # 澄清轮次由模型判断，可多轮直到条件足够。
+    assert "available_tools" in text
+    assert "先澄清后执行" in text
+    assert "澄清轮次由你判断" in text
+    assert "不得重复追问用户已回答过的条件" in text
+    assert "直接执行" in text
     assert PROMPTS["goal_planner_v1"] is GOAL_PLANNER_PROMPT
 
 

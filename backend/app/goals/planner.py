@@ -72,6 +72,7 @@ class GoalPlannerService:
             "artifact_summaries": list(context.artifact_summaries),
             "exemplars": list(context.exemplars),
             "allowed_goal_types": list(context.allowed_goal_types),
+            "available_tools": list(context.available_tools),
         }
         messages = [
             ChatMessage(role="system", content=GOAL_PLANNER_PROMPT.system),

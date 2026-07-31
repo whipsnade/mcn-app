@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import date
 import json
 
@@ -109,6 +110,24 @@ async def test_plan_task_builds_logged_structured_request() -> None:
     assert payload["current_message"] == _context().current_message
     assert payload["account_default_brand"] is None
     assert payload["current_date"] == date.today().isoformat()
+
+
+@pytest.mark.asyncio
+async def test_plan_context_payload_includes_available_tools() -> None:
+    tools = (
+        {
+            "internal_name": "social_statistic_trend",
+            "description": "社媒趋势统计",
+            "required_params": ["datasource", "name"],
+        },
+    )
+    context = replace(_context(), available_tools=tools)
+    model = FakeModel([_valid_output()])
+
+    await GoalPlannerService(model=model, context_builder=None).plan_context(context)
+
+    payload = json.loads(model.requests[0].messages[-1].content)
+    assert payload["available_tools"] == list(tools)
 
 
 @pytest.mark.asyncio
