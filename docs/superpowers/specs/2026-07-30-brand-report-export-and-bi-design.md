@@ -24,6 +24,7 @@
 - 模板中的示例品牌数据不作为运行时内容；需制作去样例的受控模板副本。
 - 环比默认查询上一个等长周期；同比仅在用户明确选择「环比+同比」或在消息中明确要求同比时查询。未请求同比显示「未请求」，查询失败显示对应受限原因。
 - 图表不依赖样例模板中的既有数据引用：导出时按当前结构化快照删除并重建日趋势两图和地域 Top20 图；对应章节不可用时不绘制图表。
+- `comparison_mode` 是品牌 Goal 的显式参数，不是仅由报告组装器推断的展示选项；其默认环比查询会增加额外 MCP 调用成本。
 
 ## 模板章节与数据契约
 
@@ -95,6 +96,8 @@ sources: 数据工具、采集时间与证据引用
 
 迁移的 downgrade 必须删除两列。`AnalysisReport` ORM、`AnalysisReportRead`、前端 `ApiAnalysisReport` 同步增加可选结构化 payload 字段；报告列表 API 不返回大载荷，仅详情 API 返回。现有 `blocks_json` 与所有非品牌报告行为不变。
 
+`GoalParams` 新增 `comparison_mode: Literal["mom", "mom_yoy"] = "mom"`，并同步更新 GoalPlanner 输出 Schema、Goal 创建/重试测试和 planner prompt。Planner 在生成 `brand_analysis` Goal 时必须把该字段落入 `TaskGoal.params_json`：用户明确要求同比、或选择「环比+同比」时为 `mom_yoy`；其他品牌分析默认为 `mom`。澄清选项可在时间窗确认后提供「环比」与「环比+同比」，但用户未选择时不阻塞，采用 `mom` 默认值。
+
 ### 报告构建
 
 新增独立的品牌报告组装层，职责分离如下：
@@ -103,11 +106,23 @@ sources: 数据工具、采集时间与证据引用
 2. `BrandReportNarrativeBuilder`：把结构化数据作为唯一模型输入，生成好评点、负面洞察、扩张信号、AI 结论和结论与建议。
 3. `AnalysisReportService`：将模板版本、结构化快照、叙事文本与原有报告元数据一起按当前 `(session_id, report_type, version)` 规则落库。
 
-`run_brand_analysis` 原地演进为 v2 构建器，不并存第二条自动构建链路：先组装快照，再由模型生成叙事，最后调用 `build_session_report` 一次性落库。它仍由 `GoalFinalizer._finalize_analysis_goal` 在品牌 Goal 的终态收尾事务中调用；因此快照、报告版本、成功 Artifact 与事件都对应同一次 goal 收尾，BI/导出不会按需再生成快照。
+`run_brand_analysis` 原地演进为 v2 构建器，不并存第二条自动构建链路：先组装快照，再由模型生成叙事，最后调用 `build_session_report` 一次性落库。它仍由 `TaskExecutionDependencies._finalize_analysis_goal` 在品牌 Goal 的终态收尾事务中调用；因此快照、报告版本、成功 Artifact 与事件都对应同一次 goal 收尾，BI/导出不会按需再生成快照。
 
 现有失败语义保持：预期的数据缺口生成 `partial` 报告，不算构建失败；组装器校验、模型或落库异常则由 `_finalize_analysis_goal` 捕获，登记 failed `brand_report` Artifact 并将 Goal 降级为 `completed_with_warnings`。手动 `analysis-retry` 从原任务的冻结 evidence 新建一个报告版本；已生成版本永不改写。
 
 为避免把复杂业务结构塞入通用 Block，`AnalysisReport` 增加独立的 `payload_json` 与 `template_version` 字段。原 `blocks_json` 保留，供旧报告与其他报告类型兼容；新品牌报告仍生成兼容性 Block，但 BI/Excel 的事实数据只读 `payload_json`。
+
+### 对比期证据采集链路与积分
+
+`brand_loop_v1` 必须增加对比期阶段，执行顺序为：当期最小证据 → 对比期最小证据 → 其余模板维度。Loop 基于 `goal_params.comparison_mode` 和当前 `period` 计算时间窗，并复用同一品牌标签/关键词、平台集合与统计口径：
+
+1. `mom`：额外查询紧邻当前期的上一个等长周期；
+2. `mom_yoy`：在环比查询之外，再查询上一自然年相同起止日期；2 月 29 日向前平移时使用 2 月 28 日；
+3. 无有效当前期 `period` 时不猜测对比窗，对比章节标为 `unavailable: invalid_period`。
+
+Loop 的每一条对比调用必须在 `evidence_goal` 标注 `current`、`mom` 或 `yoy`，且工具 arguments 使用对应的开始/结束日期。`BrandReportDataAssembler` 不只消费摘要列表：它以 `EvidenceNote.step_id` 关联 `TrajectoryStep.id`，从 `TrajectoryStep.arguments` 的日期参数与 `evidence_goal` 识别证据期别，再归一为比较表。这样无需扩大 `EvidenceNote` 的现有存储契约。
+
+默认 `mom` 会让品牌分析至少增加一组与当期同口径的统计调用；实际增加次数取决于平台数和模型选择的最小工具路径，完整多维查询的总积分消耗可能接近不含对比期时的两倍。前端任务过程沿用现有每次 MCP 调用 10 积分展示；余额不足时保留当期已 settled 证据、将对比字段标为 `insufficient_points`，生成受限报告而不重复扣费。
 
 旧的 `brand_analysis` 记录不回填、不修改。读取时若无 `brand_report_v2`，前端走现有通用 Block 渲染，并明确提示该历史版本不支持模板导出。
 
@@ -119,7 +134,7 @@ sources: 数据工具、采集时间与证据引用
 GET /sessions/{session_id}/reports/{report_id}/export
 ```
 
-- 只允许当前用户导出自己会话中的 `brand_analysis` 已完成/受限版本。
+- 只允许当前用户导出自己会话中 `report_type=brand_analysis`、`template_version=brand_report_v2` 且 `payload_json` 通过品牌报告 v2 校验的报告版本；`partial` 是 payload 内的 `data_status`，不是报告行状态筛选条件。
 - 校验 `report_id` 与 `session_id` 的归属关系，防止跨会话和跨用户读取。
 - 仅读取该记录已保存的 `brand_report_v2` 快照；不调用模型、MCP、任务执行器和积分系统。
 - 以版本化、去样例的 8 Sheet Excel 模板为基础填充数据，保留模板版式、表头、数字格式与图表。
