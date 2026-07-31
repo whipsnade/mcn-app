@@ -52,6 +52,8 @@ def test_brand_loop_prompt_declares_tool_call_contract() -> None:
     assert "current:" in text
     assert "mom:" in text
     assert "yoy:" in text
+    # 期别无关的调用（如标签匹配）标注 current:。
+    assert "期别无关" in text
     # internal_tool_name 是顶层必填字段，禁止嵌进 arguments。
     assert "internal_tool_name 是 call_tool 决策的顶层必填字段" in text
     assert "禁止嵌进 arguments" in text

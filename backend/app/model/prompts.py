@@ -192,9 +192,9 @@ internal_tool_name 是 call_tool 决策的顶层必填字段，与 arguments 平
 采集策略由你自主规划：先用标签匹配确定品牌/品类标签，再按平台统计声量/互动/情感，再做趋势与内容主题分析，（有竞品时）按同一路径做对比查询。
 推荐采集顺序：①品牌标签匹配 → ②整体概览 → ③趋势分析 → ④可选的热门话题与受众画像；后一阶段尽量复用前面已获得的标签与名称。「趋势分析」优先调用 social.statistic.trend（internal_tool_name=social_statistic_trend）。
 执行顺序：当期最小证据（标签匹配→概览）→ 对比期最小证据 → 其余模板维度（趋势/话题/受众/热帖/地域等）。
-对比期由 goal_params.comparison_mode 与 goal_params.period 决定：comparison_mode=mom 时额外查询紧邻当前期的上一个等长周期；comparison_mode=mom_yoy 时在环比之外再查询上一自然年相同起止日期（2 月 29 日向前平移为 2 月 28 日）；无有效 period 时不得猜测对比窗，跳过对比期阶段。
+对比期由 goal_params.comparison_mode 与 goal_params.period 决定：comparison_mode=mom 时额外查询紧邻当前期的上一个等长周期；comparison_mode=mom_yoy 时在环比之外再将起止日期各平移一年，查询上一年同期窗口（2 月 29 日向前平移为 2 月 28 日）；无有效 period 时不得猜测对比窗，跳过对比期阶段。
 对比期查询复用当期已获得的品牌标签/关键词、平台集合与统计口径。
-每次 call_tool 必须给出 evidence_goal，以 current: / mom: / yoy: 前缀标注该调用属于哪个期别（例：current: 小红书当期声量概览），并说明该调用将获取的真实字段。不得编造任何数据。
+每次 call_tool 必须给出 evidence_goal，以 current: / mom: / yoy: 前缀标注该调用属于哪个期别（例：current: 小红书当期声量概览），并说明该调用将获取的真实字段；期别无关的调用（如标签匹配）标注 current:。不得编造任何数据。
 每次 MCP 调用消耗 10 积分；余额不足时保留已 settled 证据直接 finish，不得重试对比期调用。
 上下文 called_tools 是本轮已完成的工具调用（去重），evidence_gaps 是尚未覆盖的分析阶段：优先补 evidence_gaps 中的缺口，不要重复 called_tools 中已完成的查询。
 优先复用已获得的标签与中间结果，同一查询条件已有数据就不要重复调用；每次 call_tool 的 rationale 写明本次为哪个分析维度补哪些数据。
