@@ -297,6 +297,9 @@ export interface ApiAnalysisReport {
   blocks: ReportBlock[];
   conclusion: string | null;
   status: string;
+  // brand_report_v2 结构化快照，仅新品牌报告返回，旧报告为 null。
+  payload?: Record<string, unknown> | null;
+  template_version?: string | null;
   generated_at: string;
 }
 

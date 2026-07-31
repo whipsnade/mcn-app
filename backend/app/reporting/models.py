@@ -169,7 +169,7 @@ class AnalysisReport(Base):
     session_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False
     )
-    # 报告类型：kol_analysis / brand_report / campaign_report（后两种阶段三启用）。
+    # 报告类型：kol_analysis / brand_analysis / campaign_analysis（后两种阶段三启用）。
     report_type: Mapped[str] = mapped_column(
         String(32), nullable=False, default="kol_analysis", server_default="kol_analysis"
     )
@@ -179,6 +179,9 @@ class AnalysisReport(Base):
     blocks_json: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False)
     conclusion_text: Mapped[str | None] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(16), nullable=False)
+    # brand_report_v2 结构化快照：仅新品牌报告写入，旧行保持 NULL。
+    payload_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    template_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 

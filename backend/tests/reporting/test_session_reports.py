@@ -99,6 +99,55 @@ async def test_reports_list_empty_and_foreign(auth_client_factory) -> None:
 
 
 @pytest.mark.asyncio
+async def test_report_detail_includes_payload_but_list_does_not(
+    auth_client_factory, db_session
+) -> None:
+    """详情端点带出 payload/template_version；版本列表项不含这两个字段。"""
+    client = await auth_client_factory("13400000095")
+    session_id = await _create_session(client)
+    session = await db_session.get(WorkspaceSession, session_id)
+    service = AnalysisReportService(db_session)
+    report = await service.build_session_report(
+        user_id=session.user_id,
+        session_id=session_id,
+        document=_document("品牌分析v1"),
+        report_type="brand_analysis",
+        scope={"brand": "海底捞"},
+    )
+    report.payload_json = {"summary": "结构化快照"}
+    report.template_version = "brand_report_v2"
+    legacy = await service.build_session_report(
+        user_id=session.user_id,
+        session_id=session_id,
+        document=_document("品牌分析v2"),
+        report_type="brand_analysis",
+        scope={"brand": "海底捞"},
+    )
+    await db_session.flush()
+
+    detail = await client.get(f"/api/v1/analysis-reports/{report.id}")
+    assert detail.status_code == 200
+    body = detail.json()
+    assert body["payload"] == {"summary": "结构化快照"}
+    assert body["template_version"] == "brand_report_v2"
+
+    legacy_detail = await client.get(f"/api/v1/analysis-reports/{legacy.id}")
+    assert legacy_detail.status_code == 200
+    legacy_body = legacy_detail.json()
+    assert legacy_body["payload"] is None
+    assert legacy_body["template_version"] is None
+
+    listing = await client.get(
+        f"/api/v1/sessions/{session_id}/reports", params={"report_type": "brand_analysis"}
+    )
+    assert listing.status_code == 200
+    assert len(listing.json()) == 2
+    for item in listing.json():
+        assert "payload" not in item
+        assert "template_version" not in item
+
+
+@pytest.mark.asyncio
 async def test_reports_list_requires_valid_type(auth_client_factory) -> None:
     client = await auth_client_factory("13400000094")
     session_id = await _create_session(client)

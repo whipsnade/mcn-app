@@ -26,6 +26,8 @@ class AnalysisReportRead(BaseModel):
     blocks: list[dict[str, Any]]
     conclusion: str | None = None
     status: str
+    payload: dict[str, Any] | None = None
+    template_version: str | None = None
     generated_at: datetime
 
 

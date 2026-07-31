@@ -68,6 +68,8 @@ def analysis_report_read(report: AnalysisReport) -> AnalysisReportRead:
         blocks=list(report.blocks_json),
         conclusion=report.conclusion_text,
         status=report.status,
+        payload=report.payload_json,
+        template_version=report.template_version,
         generated_at=report.created_at,
     )
 
