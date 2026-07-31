@@ -8,7 +8,7 @@ import { Fragment, useEffect, useRef, useState } from 'react';
 
 import { downloadKolSelection, getKolSelection, getKolTop10Trend, listSelectionSets, runKolAnalysis } from '../api/kolSelection';
 import type { KolSelectionItem, KolTop10TrendItem } from '../api/kolSelection';
-import { listSessionReports } from '../api/reports';
+import { listSessionReports, downloadBrandReport } from '../api/reports';
 import type { SessionReportType } from '../api/reports';
 import { getAnalysisReport } from '../api/tasks';
 import type {
@@ -18,6 +18,7 @@ import type {
 } from '../api/contracts';
 import { createFavoriteByKey, deleteFavoriteByKey } from '../api/favorites';
 import FavoriteStar from './FavoriteStar';
+import BrandReportView from './BrandReportView';
 import KolSelectionDetailDialog from './KolSelectionDetailDialog';
 import { Card, formatExposure, formatNumber, MetricCard } from './reportPrimitives';
 import { useLoadingMessage } from '../hooks/useLoadingMessage';
@@ -534,6 +535,8 @@ function TypedReportPanel({ sessionId, reportType, summaryEntry, emptyText }: {
   const [report, setReport] = useState<ApiAnalysisReport>();
   const [loading, setLoading] = useState(false);
   const [detailLoading, setDetailLoading] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState<string>();
   const loadingMessage = useLoadingMessage(loading || detailLoading);
 
   // 版本列表：会话/类型切换时重拉并选中最新一版。
@@ -542,6 +545,8 @@ function TypedReportPanel({ sessionId, reportType, summaryEntry, emptyText }: {
     setSelectedReportId(undefined);
     setReport(undefined);
     setDetailLoading(false);
+    setExporting(false);
+    setExportError(undefined);
     if (!sessionId) return;
     let cancelled = false;
     setLoading(true);
@@ -591,6 +596,23 @@ function TypedReportPanel({ sessionId, reportType, summaryEntry, emptyText }: {
   const failedArtifact = summaryEntry?.latest_artifact?.status === 'failed'
     ? summaryEntry.latest_artifact
     : undefined;
+  // brand_report_v2 结构化快照才走章节式 BI 与模板导出；防御性：非 v2 模板不信任 payload 形状。
+  const isBrandV2 = reportType === 'brand_analysis'
+    && report?.template_version === 'brand_report_v2'
+    && Boolean(report?.payload);
+
+  const handleExportReport = async () => {
+    if (!sessionId || !selectedReportId || exporting) return;
+    setExporting(true);
+    setExportError(undefined);
+    try {
+      await downloadBrandReport(sessionId, selectedReportId);
+    } catch {
+      setExportError('导出失败，请稍后重试');
+    } finally {
+      setExporting(false);
+    }
+  };
 
   return (
     <div className="flex-1 overflow-y-auto bg-slate-50/40 p-3">
@@ -604,23 +626,49 @@ function TypedReportPanel({ sessionId, reportType, summaryEntry, emptyText }: {
             </p>
           )}
         </div>
-        {versions.length > 0 && (
-          <select
-            aria-label="报告版本"
-            value={selectedReportId ?? ''}
-            onChange={event => setSelectedReportId(event.target.value)}
-            className={versionSelectClass}
-          >
-            {versions.map(item => (
-              <option key={item.report_id} value={item.report_id}>v{item.version}</option>
-            ))}
-          </select>
-        )}
+        <div className="flex shrink-0 items-center gap-1.5">
+          {isBrandV2 && (
+            <span className={report?.payload?.data_status === 'complete'
+              ? 'rounded-full bg-emerald-50 px-2 py-0.5 text-[9px] font-semibold text-emerald-600'
+              : 'rounded-full bg-amber-50 px-2 py-0.5 text-[9px] font-semibold text-amber-600'}
+            >
+              {report?.payload?.data_status === 'complete' ? '完整' : '数据受限'}
+            </span>
+          )}
+          {isBrandV2 && sessionId && selectedReportId && (
+            <button
+              type="button"
+              onClick={() => void handleExportReport()}
+              disabled={exporting}
+              className="rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-[10px] font-semibold text-slate-600 shadow-sm transition hover:bg-slate-50 active:scale-95 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {exporting ? '导出中…' : '导出报告'}
+            </button>
+          )}
+          {versions.length > 0 && (
+            <select
+              aria-label="报告版本"
+              value={selectedReportId ?? ''}
+              onChange={event => {
+                setSelectedReportId(event.target.value);
+                setExportError(undefined);
+              }}
+              className={versionSelectClass}
+            >
+              {versions.map(item => (
+                <option key={item.report_id} value={item.report_id}>v{item.version}</option>
+              ))}
+            </select>
+          )}
+        </div>
       </div>
       {failedArtifact && (
         <p role="alert" className="mb-3 rounded-lg bg-rose-50 px-2.5 py-2 text-[11px] text-rose-600">
           上一次报告生成失败，可在会话中重新发起分析
         </p>
+      )}
+      {exportError && (
+        <p role="alert" className="mb-3 rounded-lg bg-rose-50 px-2.5 py-2 text-[11px] text-rose-600">{exportError}</p>
       )}
       {loading || detailLoading ? (
         <p role="status" className="flex items-center justify-center gap-2 p-6 text-center text-xs text-slate-400">
@@ -628,7 +676,18 @@ function TypedReportPanel({ sessionId, reportType, summaryEntry, emptyText }: {
           {loadingMessage}
         </p>
       ) : report ? (
-        <ReportBlocks report={report} />
+        isBrandV2 ? (
+          <BrandReportView report={report} />
+        ) : (
+          <>
+            {reportType === 'brand_analysis' && (
+              <p className="mb-3 rounded-lg bg-slate-100 px-2.5 py-2 text-[11px] text-slate-500">
+                该历史版本不支持模板导出
+              </p>
+            )}
+            <ReportBlocks report={report} />
+          </>
+        )
       ) : (
         <div className="flex min-h-[120px] items-center justify-center p-6 text-center text-xs leading-5 text-slate-500">
           {emptyText}

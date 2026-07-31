@@ -17,12 +17,15 @@ export function Card({
   title,
   icon,
   hint,
+  badge,
   children,
   className = '',
 }: {
   title: string;
   icon: ReactNode;
   hint?: string;
+  /** 标题旁的标记（如章节受限徽标）。 */
+  badge?: ReactNode;
   children: ReactNode;
   className?: string;
 }) {
@@ -32,6 +35,7 @@ export function Card({
         <h3 className="flex min-w-0 items-center gap-1.5 text-[14px] font-bold text-slate-700">
           <span className="shrink-0 text-indigo-500">{icon}</span>
           <span className="truncate">{title}</span>
+          {badge}
           <HelpCircle aria-hidden="true" className="h-3.5 w-3.5 shrink-0 text-slate-300" />
         </h3>
         {hint && <span className="shrink-0 text-[10px] text-slate-400">{hint}</span>}

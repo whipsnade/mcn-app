@@ -286,6 +286,174 @@ export type ReportBlock =
   | { type: 'tag_list'; title?: string; items: string[] }
   | { type: 'sources'; items: Array<{ name: string; collected_at?: string; evidence?: string }> };
 
+// ---- brand_report_v2 结构化快照契约（镜像 backend/app/reporting/brand_payload.py）----
+
+export type BrandReportPeriodStatus = 'ok' | 'not_requested' | 'restricted';
+
+export interface BrandReportPeriodValue {
+  value: number | null;
+  status: BrandReportPeriodStatus;
+  reason?: string | null;
+}
+
+export interface BrandReportChapterAvailability {
+  status: 'complete' | 'partial' | 'unavailable';
+  missing_fields: string[];
+  reason?: string | null;
+  source_tools: string[];
+  collected_at?: string | null;
+}
+
+export interface BrandReportScope {
+  brand: string;
+  period_start: string | null;
+  period_end: string | null;
+  platforms: string[];
+  comparison_mode: 'mom' | 'mom_yoy';
+  data_as_of?: string | null;
+}
+
+export interface BrandReportQuerySpec {
+  original_term: string;
+  matched_tag?: string | null;
+  fallback_keyword?: string | null;
+  comparison_definition: string;
+}
+
+export interface BrandReportSourceEntry {
+  tool: string;
+  collected_at?: string | null;
+  step_id?: string | null;
+}
+
+export interface BrandReportPlatformOverview {
+  platform: string;
+  mentions: number | null;
+  exposure: number | null;
+  interactions: number | null;
+}
+
+export interface BrandReportMetricComparison {
+  current: number | null;
+  mom: BrandReportPeriodValue;
+  yoy: BrandReportPeriodValue;
+  mom_change_pct: number | null;
+  yoy_change_pct: number | null;
+}
+
+export interface BrandReportSentimentSplit {
+  positive: number | null;
+  neutral: number | null;
+  negative: number | null;
+}
+
+export interface BrandReportOverviewSection {
+  platforms: BrandReportPlatformOverview[];
+  total_mentions: BrandReportMetricComparison;
+  total_exposure: BrandReportMetricComparison;
+  total_interactions: BrandReportMetricComparison;
+  sentiment_split: BrandReportSentimentSplit;
+}
+
+export interface BrandReportSentimentRow {
+  platform: string;
+  sentiment: string;
+  mentions: number | null;
+  interactions: number | null;
+  share_pct: number | null;
+}
+
+export interface BrandReportTrendPoint {
+  date: string;
+  mentions: number | null;
+  interactions: number | null;
+}
+
+export interface BrandReportDailyTrendSection {
+  points: BrandReportTrendPoint[];
+  peak_date: string | null;
+  peak_mentions: number | null;
+}
+
+export interface BrandReportContentTypeRow {
+  content_type: string;
+  mentions: number | null;
+  share_pct: number | null;
+}
+
+export interface BrandReportCreatorTierRow {
+  tier: string;
+  mentions: number | null;
+  share_pct: number | null;
+}
+
+export interface BrandReportOrganicVsPaid {
+  organic_mentions: number | null;
+  paid_mentions: number | null;
+  organic_share_pct: number | null;
+  paid_share_pct: number | null;
+}
+
+export interface BrandReportRegionRow {
+  region: string;
+  mentions: number | null;
+  interactions: number | null;
+  share_pct: number | null;
+}
+
+export interface BrandReportTopPost {
+  platform: string;
+  post_id?: string | null;
+  collected_at?: string | null;
+  title: string | null;
+  author: string | null;
+  interactions: number | null;
+  /** 小红书=阅读数 / 抖音=播放数 */
+  exposure_count: number | null;
+  like_count: number | null;
+  comment_count: number | null;
+  collect_count: number | null;
+  /** 小红书=转发 / 抖音=分享 */
+  share_count: number | null;
+  sentiment: string | null;
+  creator_tier: string | null;
+  url: string | null;
+}
+
+export interface BrandReportData {
+  overview: BrandReportOverviewSection;
+  sentiment: { rows: BrandReportSentimentRow[] };
+  daily_trend: BrandReportDailyTrendSection;
+  content_types: BrandReportContentTypeRow[];
+  creator_tiers: BrandReportCreatorTierRow[];
+  organic_vs_paid: BrandReportOrganicVsPaid;
+  regions: BrandReportRegionRow[];
+  top_posts: BrandReportTopPost[];
+}
+
+export interface BrandReportNarrative {
+  praise_points: string[];
+  complaint_points: string[];
+  impact_level: '低' | '中' | '高';
+  expansion_signals: string[];
+  noise_notes?: string | null;
+  key_findings: string[];
+  conclusion: string;
+  recommendations: string[];
+}
+
+export interface BrandReportPayload {
+  template_version: 'brand_report_v2';
+  data_status: 'complete' | 'partial';
+  scope: BrandReportScope;
+  query_spec: BrandReportQuerySpec;
+  data: BrandReportData;
+  narrative?: BrandReportNarrative | null;
+  /** 8 章节键：overview/sentiment/daily_trend/content_creators/regions/top_posts/insights/methodology */
+  availability: Record<string, BrandReportChapterAvailability>;
+  sources: BrandReportSourceEntry[];
+}
+
 export interface ApiAnalysisReport {
   id: string;
   // 会话级 KOL 分析报告不绑定任务，task_id 为 null。
@@ -298,7 +466,7 @@ export interface ApiAnalysisReport {
   conclusion: string | null;
   status: string;
   // brand_report_v2 结构化快照，仅新品牌报告返回，旧报告为 null。
-  payload?: Record<string, unknown> | null;
+  payload?: BrandReportPayload | null;
   template_version?: string | null;
   generated_at: string;
 }

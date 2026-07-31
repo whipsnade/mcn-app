@@ -5,8 +5,9 @@ import type { ApiAnalysisReport, ApiArtifactsSummary, ApiFavorite, ApiSessionRep
 import { createFavoriteByKey, deleteFavoriteByKey } from '../api/favorites';
 import { downloadKolSelection, getKolSelection, getKolSelectionDetail, getKolTop10Trend, listSelectionSets, queryKolSelectionDetail, runKolAnalysis } from '../api/kolSelection';
 import { listSessionReports } from '../api/reports';
+import { downloadBrandReport } from '../api/reports';
 import { getAnalysisReport } from '../api/tasks';
-import { analysisReportFixture } from '../test/fixtures';
+import { analysisReportFixture, brandReportPayloadFixture } from '../test/fixtures';
 import UniversalReport from './UniversalReport';
 
 vi.mock('../api/kolSelection', () => ({
@@ -23,6 +24,7 @@ vi.mock('../api/reports', () => ({
   listSessionReports: vi.fn(),
   getArtifactsSummary: vi.fn(),
   markArtifactRead: vi.fn(),
+  downloadBrandReport: vi.fn(),
 }));
 
 vi.mock('../api/tasks', () => ({
@@ -85,6 +87,7 @@ describe('UniversalReport', () => {
     vi.mocked(getKolSelectionDetail).mockReset();
     vi.mocked(queryKolSelectionDetail).mockReset();
     vi.mocked(listSessionReports).mockReset().mockResolvedValue([]);
+    vi.mocked(downloadBrandReport).mockReset().mockResolvedValue(undefined);
     vi.mocked(getAnalysisReport).mockReset();
     vi.mocked(createFavoriteByKey).mockReset();
     vi.mocked(deleteFavoriteByKey).mockReset();
@@ -697,5 +700,128 @@ describe('UniversalReport', () => {
     expect(getKolSelectionDetail).toHaveBeenCalledWith('session-1', {
       set_id: undefined, platform: 'xiaohongshu', kol_uid: 'uid-1',
     });
+  });
+
+  it('renders the chapter BI view with status badge and export button for brand_report_v2', async () => {
+    const report = analysisReportFixture({
+      id: 'brand-report-v2',
+      report_type: 'brand_analysis',
+      title: '海底捞品牌分析',
+      template_version: 'brand_report_v2',
+      payload: brandReportPayloadFixture(),
+    });
+    vi.mocked(listSessionReports).mockResolvedValue([
+      { report_id: 'brand-report-v2', title: '海底捞品牌分析', version: 1, scope: { brand: '海底捞' }, status: 'completed', created_at: '2026-07-30T10:00:00Z' },
+    ]);
+    vi.mocked(getAnalysisReport).mockResolvedValue(report);
+    render(<UniversalReport sessionId="session-1" selectionCount={0} />);
+
+    fireEvent.click(screen.getByRole('tab', { name: '品牌分析' }));
+
+    // 章节式渲染 + 数据状态徽标 + 导出按钮。
+    expect(await screen.findByRole('navigation', { name: '报告章节' })).toBeVisible();
+    expect(screen.getByText('完整')).toBeVisible();
+    expect(screen.queryByText('一、核心结论')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '导出报告' }));
+    await waitFor(() => expect(downloadBrandReport).toHaveBeenCalledWith('session-1', 'brand-report-v2'));
+  });
+
+  it('shows an inline error when the brand report export fails', async () => {
+    const report = analysisReportFixture({
+      id: 'brand-report-v2',
+      report_type: 'brand_analysis',
+      title: '海底捞品牌分析',
+      template_version: 'brand_report_v2',
+      payload: brandReportPayloadFixture(),
+    });
+    vi.mocked(listSessionReports).mockResolvedValue([
+      { report_id: 'brand-report-v2', title: '海底捞品牌分析', version: 1, scope: null, status: 'completed', created_at: '2026-07-30T10:00:00Z' },
+    ]);
+    vi.mocked(getAnalysisReport).mockResolvedValue(report);
+    vi.mocked(downloadBrandReport).mockRejectedValue(new Error('EXPORT_RENDER_FAILED'));
+    render(<UniversalReport sessionId="session-1" selectionCount={0} />);
+
+    fireEvent.click(screen.getByRole('tab', { name: '品牌分析' }));
+    fireEvent.click(await screen.findByRole('button', { name: '导出报告' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('导出失败，请稍后重试');
+  });
+
+  it('falls back to block rendering with a template-export hint for legacy brand reports', async () => {
+    vi.mocked(listSessionReports).mockResolvedValue([
+      { report_id: 'brand-report-legacy', title: '海底捞品牌分析v1', version: 1, scope: { brand: '海底捞' }, status: 'completed', created_at: '2026-07-24T10:00:00Z' },
+    ]);
+    vi.mocked(getAnalysisReport).mockResolvedValue(analysisReportFixture({
+      id: 'brand-report-legacy',
+      report_type: 'brand_analysis',
+      title: '海底捞品牌分析v1',
+      payload: null,
+      template_version: null,
+    }));
+    render(<UniversalReport sessionId="session-1" selectionCount={0} />);
+
+    fireEvent.click(screen.getByRole('tab', { name: '品牌分析' }));
+
+    expect(await screen.findByText('一、核心结论')).toBeVisible();
+    expect(screen.getByText('该历史版本不支持模板导出')).toBeVisible();
+    expect(screen.queryByRole('button', { name: '导出报告' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('navigation', { name: '报告章节' })).not.toBeInTheDocument();
+  });
+
+  it('never uses the chapter view for campaign reports even when a payload is present', async () => {
+    vi.mocked(listSessionReports).mockResolvedValue([
+      { report_id: 'campaign-report-1', title: '618活动分析', version: 1, scope: { campaign: '618' }, status: 'completed', created_at: '2026-07-24T10:00:00Z' },
+    ]);
+    vi.mocked(getAnalysisReport).mockResolvedValue(analysisReportFixture({
+      id: 'campaign-report-1',
+      report_type: 'campaign_analysis',
+      title: '618活动分析',
+      template_version: 'brand_report_v2',
+      payload: brandReportPayloadFixture(),
+    }));
+    render(<UniversalReport sessionId="session-1" selectionCount={0} />);
+
+    fireEvent.click(screen.getByRole('tab', { name: '活动分析' }));
+
+    expect(await screen.findByText('一、核心结论')).toBeVisible();
+    expect(screen.queryByRole('navigation', { name: '报告章节' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '导出报告' })).not.toBeInTheDocument();
+    expect(screen.queryByText('该历史版本不支持模板导出')).not.toBeInTheDocument();
+  });
+
+  it('targets the selected version when exporting after switching versions', async () => {
+    const reportV2 = analysisReportFixture({
+      id: 'brand-report-2',
+      report_type: 'brand_analysis',
+      title: '海底捞品牌分析v2',
+      template_version: 'brand_report_v2',
+      payload: brandReportPayloadFixture({ data_status: 'partial' }),
+    });
+    const reportV1 = analysisReportFixture({
+      id: 'brand-report-1',
+      report_type: 'brand_analysis',
+      title: '海底捞品牌分析v1',
+      template_version: 'brand_report_v2',
+      payload: brandReportPayloadFixture(),
+    });
+    vi.mocked(listSessionReports).mockResolvedValue([
+      { report_id: 'brand-report-2', title: '海底捞品牌分析v2', version: 2, scope: { brand: '海底捞' }, status: 'completed', created_at: '2026-07-30T10:00:00Z' },
+      { report_id: 'brand-report-1', title: '海底捞品牌分析v1', version: 1, scope: { brand: '海底捞' }, status: 'completed', created_at: '2026-07-29T10:00:00Z' },
+    ]);
+    vi.mocked(getAnalysisReport).mockImplementation(async id => id === 'brand-report-2' ? reportV2 : reportV1);
+    render(<UniversalReport sessionId="session-1" selectionCount={0} />);
+
+    fireEvent.click(screen.getByRole('tab', { name: '品牌分析' }));
+
+    // 最新版（v2，partial）：数据受限徽标。
+    expect(await screen.findByText('数据受限')).toBeVisible();
+
+    fireEvent.change(screen.getByRole('combobox', { name: '报告版本' }), { target: { value: 'brand-report-1' } });
+    await waitFor(() => expect(getAnalysisReport).toHaveBeenCalledWith('brand-report-1'));
+    expect(await screen.findByText('完整')).toBeVisible();
+
+    fireEvent.click(screen.getByRole('button', { name: '导出报告' }));
+    await waitFor(() => expect(downloadBrandReport).toHaveBeenCalledWith('session-1', 'brand-report-1'));
   });
 });
