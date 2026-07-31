@@ -318,9 +318,11 @@ def _render_top_posts(sheet: Any, payload: BrandReportPayload) -> None:
     sheet.column_dimensions["M"].width = 40
     posts = payload.data.top_posts
     if not posts:
+        # 空章节：保留 Sheet + 列头 + availability.reason 受限说明，不隐藏。
         sheet.merge_cells("A1:M1")
         sheet["A1"] = "热门帖子 TOP（品牌相关，按互动数排序）"
-        sheet["A3"] = _chapter_reason(payload, "top_posts") or MISSING
+        _write_top_post_headers(sheet, 3)
+        sheet["A4"] = _chapter_reason(payload, "top_posts") or MISSING
         return
     ordered_platforms = sorted(
         {post.platform for post in posts},
@@ -339,10 +341,7 @@ def _render_top_posts(sheet: Any, payload: BrandReportPayload) -> None:
         )
         title_cell.font = Font(name="微软雅黑", bold=True, size=12)
         header_row = row + 1
-        for column, header in enumerate(TOP_POST_HEADERS, start=1):
-            cell = sheet.cell(header_row, column)
-            cell.value = header
-            cell.font = Font(name="微软雅黑", bold=True, size=10)
+        _write_top_post_headers(sheet, header_row)
         for rank, post in enumerate(group, start=1):
             data_row = header_row + rank
             values = (
@@ -370,6 +369,13 @@ def _render_top_posts(sheet: Any, payload: BrandReportPayload) -> None:
                 # url 列只写合法 URL，否则「未提供」，绝不拼接猜测。
                 url_cell.value = MISSING
         row = header_row + len(group) + 2
+
+
+def _write_top_post_headers(sheet: Any, row: int) -> None:
+    for column, header in enumerate(TOP_POST_HEADERS, start=1):
+        cell = sheet.cell(row, column)
+        cell.value = header
+        cell.font = Font(name="微软雅黑", bold=True, size=10)
 
 
 def _render_insights(sheet: Any, payload: BrandReportPayload) -> None:

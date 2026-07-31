@@ -344,6 +344,33 @@ def test_render_top_post_missing_fields_and_no_fake_link() -> None:
     assert sheet.cell(8, 13).hyperlink is None
 
 
+def test_render_top_post_javascript_url_no_hyperlink() -> None:
+    """带 scheme 的协议注入（javascript:）同样不生成 hyperlink，显示「未提供」。"""
+    payload = _payload()
+    payload.data.top_posts[2].url = "javascript:alert(1)"
+    workbook = _load(render_brand_workbook(payload))
+    sheet = workbook["热门帖子TOP"]
+    assert sheet["C8"].value == "抖音测评"
+    assert sheet.cell(8, 13).value == "未提供"
+    assert sheet.cell(8, 13).hyperlink is None
+
+
+def test_render_empty_top_posts_keeps_headers_and_reason() -> None:
+    """热帖空章节：保留 Sheet + 13 列通用列头 + availability.reason 受限说明。"""
+    payload = _payload()
+    payload.data.top_posts = []
+    payload.availability["top_posts"] = ChapterAvailability(
+        status="unavailable", reason="原帖查询工具调用失败"
+    )
+    workbook = _load(render_brand_workbook(payload))
+    sheet = workbook["热门帖子TOP"]
+    assert [sheet.cell(3, col).value for col in range(1, 14)] == [
+        "排名", "平台", "标题", "用户昵称", "互动数", "阅读数",
+        "点赞", "评论", "收藏", "转发", "情感", "达人层级", "链接",
+    ]
+    assert any("原帖查询工具调用失败" in text for text in _column_values(sheet))
+
+
 # ---------- 往返 ----------
 
 
