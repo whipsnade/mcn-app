@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+import json
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -17,6 +18,7 @@ from app.orchestration.loop import AgentDecision, AgentLoopContext
 from app.orchestration.schemas import PlannerTool
 from app.reporting.analysis_reports import AnalysisReportService
 from app.reporting.blocks import MetricGridBlock, MetricItem, ReportDocument
+from app.reporting.brand_payload import BrandReportNarrative
 from app.reporting.models import AnalysisReport
 from app.selection.models import KolSelectionItem, KolSelectionSet, SessionKolSelection
 from app.selection.service import KolSelectionService
@@ -759,8 +761,40 @@ def _document() -> ReportDocument:
     )
 
 
+# 品牌 v2 最小证据：当期 overview 指标行（DataTap result 包装），
+# 能通过 assemble_brand_report 的综合概览最小证据门禁。
+_BRAND_OVERVIEW_RESULTS = [
+    {
+        "step_id": "step_1",
+        "tool": "datatap.insight.social.statistic.overview.v1",
+        "status": "settled",
+        "summary": {
+            "result": json.dumps(
+                [{"平台": "小红书", "声量": 12345, "曝光量": 50000, "互动数": 8000}],
+                ensure_ascii=False,
+            )
+        },
+    }
+]
+
+_BRAND_NARRATIVE_OUTPUT = {
+    "praise_points": ["新品测评内容互动表现好"],
+    "complaint_points": [],
+    "impact_level": "低",
+    "expansion_signals": [],
+    "noise_notes": None,
+    "key_findings": ["正面声量占主导"],
+    "conclusion": "品牌声量稳步上升。",
+    "recommendations": ["延续新品测评内容节奏"],
+}
+
+
 class _FakeAnalysisModel:
-    """报告构建模型 stub：document 为 None 时模拟模型输出校验失败。"""
+    """报告构建模型 stub：document 为 None 时模拟模型输出校验失败。
+
+    品牌 v2 叙事请求（output_model=BrandReportNarrative）返回固定叙事校验结果，
+    其余请求维持旧行为直返 document。
+    """
 
     def __init__(self, document: ReportDocument | None) -> None:
         self.document = document
@@ -770,6 +804,13 @@ class _FakeAnalysisModel:
         self.requests.append(request)
         if self.document is None:
             raise ModelPlanInvalidError("MODEL_PLAN_INVALID", retryable=False)
+        if request.output_model is BrandReportNarrative:
+            return StructuredResult(
+                value=BrandReportNarrative.model_validate(_BRAND_NARRATIVE_OUTPUT),
+                usage=None,
+                request_id="req-test",
+                regeneration_count=0,
+            )
         return StructuredResult(
             value=self.document,
             usage=None,
@@ -782,7 +823,10 @@ class _FakeAnalysisModel:
 async def test_finalize_brand_goal_builds_report_and_artifacts() -> None:
     worker_id = f"test-worker-{uuid4()}"
     ids = await _create_leased_task_with_goal(
-        worker_id, goal_type="brand_analysis", goal_params={"brand": "海底捞"}
+        worker_id,
+        goal_type="brand_analysis",
+        goal_params={"brand": "海底捞"},
+        plan_results=list(_BRAND_OVERVIEW_RESULTS),
     )
     try:
         artifacts = _TaskArtifacts(worker_id, model=_FakeAnalysisModel(_document()))
@@ -845,8 +889,9 @@ async def test_finalize_brand_goal_builds_report_and_artifacts() -> None:
             assert artifact_event.payload_json["artifact_type"] == "brand_report"
             assert artifact_event.payload_json["module_key"] == "brand"
             assert artifact_event.payload_json["artifact_id"] == artifact.id
-            assert artifacts._model.requests[0].purpose == "brand_analysis"
-            assert artifacts._model.requests[0].thinking_sink is not None
+            # 品牌 v2：报告构建只发叙事请求（purpose=brand_report_narrative）。
+            assert artifacts._model.requests[0].purpose == "brand_report_narrative"
+            assert artifacts._model.requests[0].output_model is BrandReportNarrative
             summary_request = next(
                 request
                 for request in artifacts._model.requests
@@ -952,7 +997,10 @@ async def test_finalize_brand_goal_limited_delivery_builds_report() -> None:
     # goal 终态 completed_with_warnings 且 warning_code 落库。
     worker_id = f"test-worker-{uuid4()}"
     ids = await _create_leased_task_with_goal(
-        worker_id, goal_type="brand_analysis", goal_params={"brand": "海底捞"}
+        worker_id,
+        goal_type="brand_analysis",
+        goal_params={"brand": "海底捞"},
+        plan_results=list(_BRAND_OVERVIEW_RESULTS),
     )
     try:
         artifacts = _TaskArtifacts(worker_id, model=_FakeAnalysisModel(_document()))

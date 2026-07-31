@@ -208,6 +208,14 @@ async def retry_analysis(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=ErrorCode.ANALYSIS_MODEL_ERROR,
         ) from error
+    except LookupError as error:
+        # 品牌 v2 组装器门禁严于预检（要求 overview 证据）：旧轨迹只有非 overview
+        # 证据时映射 409 NO_EVIDENCE，而非 500；其余 LookupError 原样上抛。
+        if str(error) != "no_evidence_collected":
+            raise
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="NO_EVIDENCE"
+        ) from error
     try:
         # 手动重试产物登记 manual Artifact（artifact_key 含 report_id，天然幂等）。
         await ArtifactService(db).register_artifact(

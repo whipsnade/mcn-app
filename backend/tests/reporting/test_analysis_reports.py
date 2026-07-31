@@ -420,6 +420,36 @@ async def test_build_session_report_persists_scope_json(auth_client_factory, db_
 
 
 @pytest.mark.asyncio
+async def test_build_session_report_persists_payload_and_template_version(
+    auth_client_factory, db_session
+) -> None:
+    """传 payload/template_version → 两列落库；不传 → 两列 NULL（kol_analysis 旧行为）。"""
+    client = await auth_client_factory("13400000057")
+    session_id, task_id = await _create_agent_session(client, "payload")
+    source = await db_session.get(AnalysisTask, task_id)
+    assert source is not None
+
+    service = AnalysisReportService(db_session)
+    snapshot = {"template_version": "brand_report_v2", "data_status": "partial"}
+    with_payload = await service.build_session_report(
+        user_id=source.user_id,
+        session_id=session_id,
+        document=_document(),
+        report_type="brand_analysis",
+        payload=snapshot,
+        template_version="brand_report_v2",
+    )
+    assert with_payload.payload_json == snapshot
+    assert with_payload.template_version == "brand_report_v2"
+
+    plain = await service.build_session_report(
+        user_id=source.user_id, session_id=session_id, document=_document()
+    )
+    assert plain.payload_json is None
+    assert plain.template_version is None
+
+
+@pytest.mark.asyncio
 async def test_latest_session_report_filters_by_report_type(
     auth_client_factory, db_session
 ) -> None:

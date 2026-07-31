@@ -2,6 +2,11 @@
 
 参照 run_kol_analysis 的事务模式：证据先从 task.plan_json 读出（纯内存），
 模型调用不持有数据库事务，落库走 build_session_report（按 report_type 独立编号）。
+
+品牌路径为 v2（Task 6）：assemble_brand_report 代码组装结构化快照 →
+build_brand_narrative 模型撰写叙事 → 快照 + 兼容 ReportDocument 一次落库
+（payload_json + template_version="brand_report_v2"）；活动路径保持
+campaign_analysis_v1 模型直出 ReportDocument。
 """
 
 from __future__ import annotations
@@ -17,13 +22,23 @@ from app.model.contracts import (
     StructuredModelRequest,
     ThinkingSink,
 )
-from app.model.prompts import (
-    BRAND_ANALYSIS_PROMPT,
-    CAMPAIGN_ANALYSIS_PROMPT,
-    PromptTemplate,
-)
+from app.model.prompts import CAMPAIGN_ANALYSIS_PROMPT, PromptTemplate
 from app.reporting.analysis_reports import AnalysisReportService, sanitize_evidence
-from app.reporting.blocks import ReportDocument
+from app.reporting.blocks import (
+    ChartBlock,
+    ChartSeries,
+    MarkdownBlock,
+    MetricGridBlock,
+    MetricItem,
+    ReportBlock,
+    ReportDocument,
+    SourceItem,
+    SourcesBlock,
+    TableBlock,
+)
+from app.reporting.brand_assembler import assemble_brand_report
+from app.reporting.brand_narrative import build_brand_narrative
+from app.reporting.brand_payload import BrandReportPayload
 from app.reporting.models import AnalysisReport
 
 
@@ -137,24 +152,157 @@ async def run_brand_analysis(
     thinking_sink: ThinkingSink | None = None,
     warning_code: str | None = None,
 ) -> AnalysisReport:
-    """品牌分析报告：证据聚合 → brand_analysis_v1 → 落库 report_type=brand_analysis。
+    """品牌分析报告 v2：代码组装快照 → 模型叙事 → 快照 + 兼容 Block 一次落库。
 
-    证据为空抛 ``LookupError("no_evidence_collected")``（由 finalize 映射降级终态）。
-    warning_code 命中受限映射时向模型输入注入 limitation 声明。
+    数值事实全部来自 assemble_brand_report 的确定性归一（plan_json settled 证据），
+    模型只写叙事层；叙事失败原样上抛（不落成 partial 报告，由 finalize 降级）。
+    证据不足抛 ``LookupError("no_evidence_collected")``（由 finalize 映射降级终态）。
+    warning_code 合并进 availability 对应章节 reason。thinking_sink 保留在签名中
+    （finalize 调用方不变），叙事层暂不支持思考流透传。
     """
-    return await _run_goal_analysis(
-        db,
+    params = goal.params_json if isinstance(getattr(goal, "params_json", None), dict) else {}
+    payload = assemble_brand_report(
+        getattr(task, "plan_json", None), params, warning_code=warning_code
+    )
+    narrative = await build_brand_narrative(
         model,
-        purpose="brand_analysis",
-        prompt=BRAND_ANALYSIS_PROMPT,
-        report_type="brand_analysis",
-        scope_keys=("brand", "period", "platforms"),
+        payload,
+        log_context={
+            "user_id": user_id,
+            "session_id": session_id,
+            "task_id": task.id,
+            # build_brand_narrative 会自行追加 "brand_report_narrative" 标签。
+            "tags": [],
+        },
+    )
+    payload = payload.model_copy(update={"narrative": narrative})
+    document = build_brand_compat_document(payload)
+    scope = _goal_scope(params, ("brand", "period", "platforms"))
+    return await AnalysisReportService(db).build_session_report(
         user_id=user_id,
         session_id=session_id,
-        task=task,
-        goal=goal,
-        thinking_sink=thinking_sink,
-        warning_code=warning_code,
+        document=document,
+        report_type="brand_analysis",
+        scope=scope,
+        payload=payload.model_dump(mode="json"),
+        template_version="brand_report_v2",
+    )
+
+
+# 热帖兼容表的最大行数；日趋势折线受 ChartBlock categories/values 上限约束。
+_COMPAT_TOP_POST_ROWS = 10
+_COMPAT_TREND_POINTS = 60
+
+
+def build_brand_compat_document(payload: BrandReportPayload) -> ReportDocument:
+    """brand_report_v2 快照 → 兼容 ReportDocument（纯代码，不调模型）。
+
+    供旧 BI/通用报表页等只认 blocks_json 的消费方渲染；缺数据的块整块省略，
+    metric_grid（总声量/总互动/覆盖平台/时间窗）恒在，保证 blocks 非空。
+    """
+    scope = payload.scope
+    data = payload.data
+    narrative = payload.narrative
+    blocks: list[ReportBlock] = []
+
+    overview = data.overview
+    period = (
+        f"{scope.period_start}~{scope.period_end}"
+        if scope.period_start and scope.period_end
+        else "未指定"
+    )
+    blocks.append(
+        MetricGridBlock(
+            title="综合概览",
+            items=[
+                MetricItem(
+                    label="总声量",
+                    value=overview.total_mentions.current
+                    if overview.total_mentions.current is not None
+                    else "—",
+                ),
+                MetricItem(
+                    label="总互动",
+                    value=overview.total_interactions.current
+                    if overview.total_interactions.current is not None
+                    else "—",
+                ),
+                MetricItem(
+                    label="覆盖平台",
+                    value=len(overview.platforms) or len(scope.platforms),
+                    unit="个",
+                ),
+                MetricItem(label="时间窗", value=period),
+            ],
+        )
+    )
+
+    split = overview.sentiment_split
+    if any(
+        value is not None for value in (split.positive, split.neutral, split.negative)
+    ):
+        blocks.append(
+            ChartBlock(
+                type="pie_chart",
+                title="情感占比",
+                categories=["正面", "中性", "负面"],
+                series=[
+                    ChartSeries(
+                        name="声量",
+                        values=[split.positive, split.neutral, split.negative],
+                    )
+                ],
+            )
+        )
+
+    points = data.daily_trend.points[-_COMPAT_TREND_POINTS:]
+    if points:
+        blocks.append(
+            ChartBlock(
+                type="line_chart",
+                title="日趋势",
+                categories=[point.date for point in points],
+                series=[
+                    ChartSeries(name="声量", values=[point.mentions for point in points]),
+                    ChartSeries(name="互动数", values=[point.interactions for point in points]),
+                ],
+            )
+        )
+
+    posts = data.top_posts[:_COMPAT_TOP_POST_ROWS]
+    if posts:
+        blocks.append(
+            TableBlock(
+                title="热门原帖",
+                columns=["平台", "标题", "作者", "互动数"],
+                rows=[
+                    [post.platform, post.title, post.author, post.interactions] for post in posts
+                ],
+            )
+        )
+
+    if narrative is not None:
+        lines = [narrative.conclusion]
+        if narrative.recommendations:
+            lines.append("")
+            lines.extend(f"- {item}" for item in narrative.recommendations)
+        blocks.append(MarkdownBlock(text="\n".join(lines)))
+
+    if payload.sources:
+        blocks.append(
+            SourcesBlock(
+                items=[
+                    SourceItem(name=source.tool, collected_at=source.collected_at)
+                    for source in payload.sources[:20]
+                ]
+            )
+        )
+
+    title = f"{scope.brand} 品牌分析报告" if scope.brand else "品牌分析报告"
+    return ReportDocument(
+        title=title,
+        conclusion=narrative.conclusion if narrative is not None else None,
+        blocks=blocks,
     )
 
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
+import json
 from uuid import uuid4
 
 import pytest
@@ -21,6 +22,8 @@ from app.identity.models import LoginSession, User
 from app.main import create_app
 from app.model.contracts import ModelPlanInvalidError, StructuredResult
 from app.reporting.blocks import MetricGridBlock, MetricItem, ReportDocument
+from app.reporting.brand_payload import BrandReportNarrative, BrandReportPayload
+from app.reporting.models import AnalysisReport
 from app.reporting.router import analysis_model
 from app.tasks.models import AnalysisTask
 from app.workspace.models import Message, WorkspaceSession
@@ -34,15 +37,35 @@ def _document() -> ReportDocument:
     )
 
 
+_NARRATIVE_OUTPUT = {
+    "praise_points": ["新品测评内容互动表现好"],
+    "complaint_points": [],
+    "impact_level": "低",
+    "expansion_signals": [],
+    "noise_notes": None,
+    "key_findings": ["正面声量占主导"],
+    "conclusion": "品牌声量稳步上升。",
+    "recommendations": ["延续新品测评内容节奏"],
+}
+
+
 class FakeModel:
+    """按 request.output_model 分派：品牌 v2 叙事输出 narrative dict，其余输出 document。"""
+
     def __init__(self, document: ReportDocument | None) -> None:
         self.document = document
 
     async def complete_json(self, request):
         if self.document is None:
             raise ModelPlanInvalidError("MODEL_PLAN_INVALID", retryable=False)
+        raw = (
+            _NARRATIVE_OUTPUT
+            if request.output_model is BrandReportNarrative
+            else self.document.model_dump(mode="json")
+        )
+        value = request.output_model.model_validate(raw)
         return StructuredResult(
-            value=self.document,
+            value=value,
             usage=None,
             request_id="req-test",
             regeneration_count=0,
@@ -124,6 +147,7 @@ async def _seed_goal(
     *,
     goal_type: str = "brand_analysis",
     with_evidence: bool = True,
+    plan_results: list[dict] | None = None,
 ) -> TaskGoal:
     now = datetime.now(UTC).replace(tzinfo=None)
     message = Message(
@@ -138,6 +162,24 @@ async def _seed_goal(
     )
     db_session.add(message)
     await db_session.flush()
+    if plan_results is None:
+        plan_results = (
+            [
+                {
+                    "step_id": "step_1",
+                    "tool": "datatap.insight.social.statistic.overview.v1",
+                    "status": "settled",
+                    "summary": {
+                        "result": json.dumps(
+                            [{"平台": "小红书", "声量": 12345, "曝光量": 50000, "互动数": 8000}],
+                            ensure_ascii=False,
+                        )
+                    },
+                }
+            ]
+            if with_evidence
+            else []
+        )
     task = AnalysisTask(
         id=str(uuid4()),
         user_id=user_id,
@@ -145,22 +187,7 @@ async def _seed_goal(
         trigger_message_id=message.id,
         status="completed",
         kind="agent",
-        plan_json={
-            "schema": "agent_trajectory_v1",
-            "steps": [],
-            "results": (
-                [
-                    {
-                        "step_id": "step_1",
-                        "tool": "datatap.insight.query.analysis.v1",
-                        "status": "settled",
-                        "summary": {"total_volume": 12345},
-                    }
-                ]
-                if with_evidence
-                else []
-            ),
-        },
+        plan_json={"schema": "agent_trajectory_v1", "steps": [], "results": plan_results},
         max_calls=10,
         estimated_points=0,
         creation_order=1,
@@ -197,7 +224,7 @@ async def test_analysis_retry_builds_new_version_without_points(
     )
     assert first.status_code == 200
     assert first.json()["version"] == 1
-    assert first.json()["title"] == "品牌声量分析"
+    assert first.json()["title"] == "海底捞 品牌分析报告"
 
     second = await client.post(
         f"/api/v1/sessions/{session_id}/analysis-retry",
@@ -221,6 +248,58 @@ async def test_analysis_retry_builds_new_version_without_points(
     assert artifact.artifact_type == "brand_report"
     assert artifact.report_id == second.json()["id"]
     assert artifact.version == 2
+
+
+@pytest.mark.asyncio
+async def test_analysis_retry_brand_versions_carry_v2_payload(
+    retry_client_factory, db_session: AsyncSession
+) -> None:
+    """品牌重试：新版本带 payload/template_version 落库，旧版本行不被改写。"""
+    client, user, session_id = await retry_client_factory()
+    await _seed_goal(db_session, user.id, session_id)
+
+    first = await client.post(
+        f"/api/v1/sessions/{session_id}/analysis-retry",
+        json={"report_type": "brand_analysis"},
+    )
+    assert first.status_code == 200
+    first_id = first.json()["id"]
+    before = await db_session.get(AnalysisReport, first_id)
+    assert before is not None
+    first_payload = before.payload_json
+    first_updated_at = before.updated_at
+
+    second = await client.post(
+        f"/api/v1/sessions/{session_id}/analysis-retry",
+        json={"report_type": "brand_analysis"},
+    )
+    assert second.status_code == 200
+
+    rows = list(
+        (
+            await db_session.scalars(
+                select(AnalysisReport)
+                .where(
+                    AnalysisReport.session_id == session_id,
+                    AnalysisReport.report_type == "brand_analysis",
+                )
+                .order_by(AnalysisReport.version)
+            )
+        ).all()
+    )
+    assert len(rows) == 2
+    for row in rows:
+        assert row.template_version == "brand_report_v2"
+        payload = BrandReportPayload.model_validate(row.payload_json)
+        assert payload.narrative is not None
+        assert row.conclusion_text == payload.narrative.conclusion
+        assert row.blocks_json
+    # 旧版本行不被改写。
+    v1 = rows[0]
+    assert v1.id == first_id
+    assert v1.payload_json == first_payload
+    assert v1.updated_at == first_updated_at
+    assert rows[1].id == second.json()["id"]
 
 
 @pytest.mark.asyncio
@@ -266,6 +345,35 @@ async def test_analysis_retry_without_evidence_returns_409(
     )
     assert empty.status_code == 409
     assert empty.json()["detail"] == "NO_EVIDENCE"
+
+
+@pytest.mark.asyncio
+async def test_analysis_retry_legacy_evidence_without_overview_returns_409(
+    retry_client_factory, db_session: AsyncSession
+) -> None:
+    """旧轨迹只有非 overview 证据：预检通过但组装器门禁拒绝 → 409 NO_EVIDENCE（非 500）。"""
+    client, user, session_id = await retry_client_factory()
+    await _seed_goal(
+        db_session,
+        user.id,
+        session_id,
+        plan_results=[
+            {
+                "step_id": "step_1",
+                "tool": "datatap.insight.query.analysis.v1",
+                "status": "settled",
+                "summary": {"total_volume": 12345},
+            }
+        ],
+    )
+
+    response = await client.post(
+        f"/api/v1/sessions/{session_id}/analysis-retry",
+        json={"report_type": "brand_analysis"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "NO_EVIDENCE"
 
 
 @pytest.mark.asyncio

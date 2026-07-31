@@ -115,6 +115,8 @@ class AnalysisReportService:
         document: ReportDocument,
         report_type: str = "kol_analysis",
         scope: dict[str, Any] | None = None,
+        payload: dict[str, Any] | None = None,
+        template_version: str | None = None,
     ) -> AnalysisReport:
         """持久化一份会话级自由报告（task_id 为 NULL）；不幂等，每次调用生成新版本。
 
@@ -122,6 +124,8 @@ class AnalysisReportService:
         (session_id, report_type) 独立编号；同会话并发点击可能撞
         (session_id, report_type, version) 唯一约束：SAVEPOINT 回滚后重算
         version 重试一次，再失败抛领域错误由端点层映射。
+        payload/template_version 为 brand_report_v2 结构化快照可选列，
+        不传保持 NULL（kol_analysis 等旧路径行为不变）。
 
         错误契约：
         - ``LookupError("session_not_found")``：会话不存在/不属于该用户/已软删 → 404；
@@ -163,6 +167,8 @@ class AnalysisReportService:
                 blocks_json=[block.model_dump(mode="json") for block in document.blocks],
                 conclusion_text=document.conclusion,
                 status="completed",
+                payload_json=payload,
+                template_version=template_version,
                 created_at=now,
                 updated_at=now,
             )
