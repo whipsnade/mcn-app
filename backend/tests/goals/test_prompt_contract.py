@@ -41,6 +41,17 @@ def test_brand_loop_prompt_declares_tool_call_contract() -> None:
     text = BRAND_ANALYSIS_LOOP_PROMPT.system
 
     assert BRAND_ANALYSIS_LOOP_PROMPT.name == "brand_loop_v1"
+    # brand_loop_v1 于 2026-07-31 升级 v2：对比期阶段（环比/同比）与期别标注。
+    assert BRAND_ANALYSIS_LOOP_PROMPT.version == "2"
+    # 对比期由 comparison_mode 与 period 决定；无有效 period 时不得猜测对比窗。
+    assert "comparison_mode" in text
+    assert "mom_yoy" in text
+    assert "2 月 28 日" in text
+    assert "不得猜测对比窗" in text
+    # evidence_goal 必须以期别前缀标注该调用属于哪个期别。
+    assert "current:" in text
+    assert "mom:" in text
+    assert "yoy:" in text
     # internal_tool_name 是顶层必填字段，禁止嵌进 arguments。
     assert "internal_tool_name 是 call_tool 决策的顶层必填字段" in text
     assert "禁止嵌进 arguments" in text
