@@ -8,7 +8,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -241,23 +241,31 @@ class BrandReportData(BaseModel):
     top_posts: list[TopPostRow] = Field(default_factory=list)  # 每平台 ≤15，互动量降序
 
 
+# 叙事列表单项长度上限（与 compat 文档 MarkdownBlock.text ≤20000 对齐留余量）。
+_NarrativeItem = Annotated[str, Field(max_length=500)]
+
+
 class BrandReportNarrative(BaseModel):
     """叙事层输出（Task 5，brand_narrative.build_brand_narrative 由模型撰写）。
 
     定义在本模块而非 brand_narrative.py：后者需要 import BrandReportPayload，
-    模型放这里可避免双向 import 循环。
+    模型放这里可避免双向 import 循环。字段上限与下游兼容文档约束对齐
+    （ReportDocument.conclusion ≤4000、MarkdownBlock.text ≤20000、列表条数
+    受块构造上限约束），防止合法叙事打爆 compat 文档。
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    praise_points: list[str] = Field(default_factory=list)  # 好评点
-    complaint_points: list[str] = Field(default_factory=list)  # 槽点
+    praise_points: list[_NarrativeItem] = Field(default_factory=list, max_length=10)  # 好评点
+    complaint_points: list[_NarrativeItem] = Field(default_factory=list, max_length=10)  # 槽点
     impact_level: Literal["低", "中", "高"] = "低"  # 负面影响程度
-    expansion_signals: list[str] = Field(default_factory=list)  # 扩张信号
-    noise_notes: str | None = None  # 噪音说明
-    key_findings: list[str] = Field(default_factory=list)  # 情感关键发现
-    conclusion: str = Field(min_length=1)  # AI 结论（必填非空）
-    recommendations: list[str] = Field(default_factory=list)  # 结论与建议
+    expansion_signals: list[_NarrativeItem] = Field(default_factory=list, max_length=10)  # 扩张信号
+    noise_notes: str | None = Field(default=None, max_length=2000)  # 噪音说明
+    key_findings: list[_NarrativeItem] = Field(default_factory=list, max_length=10)  # 情感关键发现
+    conclusion: str = Field(min_length=1, max_length=4000)  # AI 结论（必填非空）
+    recommendations: list[_NarrativeItem] = Field(
+        default_factory=list, max_length=10
+    )  # 结论与建议
 
 
 class BrandReportPayload(BaseModel):

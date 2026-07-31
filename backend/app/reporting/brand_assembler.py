@@ -991,12 +991,14 @@ def _build_availability(
 
 
 _WARNING_CHAPTER = {"brand_trend_data_unavailable": "daily_trend"}
+# warning code → 人话说明（进叙事 prompt 与导出受限声明）；未知 code 保留原文。
+_WARNING_REASON_TEXT = {"brand_trend_data_unavailable": "趋势数据未成功获取"}
 
 
 def _merge_warning(
     availability: dict[str, ChapterAvailability], warning_code: str | None
 ) -> None:
-    """warning_code（如 brand_trend_data_unavailable）合并进对应章节 reason。"""
+    """warning_code（如 brand_trend_data_unavailable）合并进对应章节 reason（人话）。"""
     if not warning_code:
         return
     chapter_key = _WARNING_CHAPTER.get(warning_code)
@@ -1005,7 +1007,8 @@ def _merge_warning(
     chapter = availability[chapter_key]
     if chapter.status == "complete":
         return  # 证据完整时以证据为准，warning 不降级
-    chapter.reason = f"{chapter.reason}；{warning_code}" if chapter.reason else warning_code
+    text = _WARNING_REASON_TEXT.get(warning_code, warning_code)
+    chapter.reason = f"{chapter.reason}；{text}" if chapter.reason else text
 
 
 # ---------------------------------------------------------------------------

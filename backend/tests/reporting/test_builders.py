@@ -8,7 +8,7 @@ campaign_analysis_v1 模型直出 ReportDocument 不变。
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 import json
 from types import SimpleNamespace
 from uuid import uuid4
@@ -34,7 +34,20 @@ from app.reporting.blocks import (
     TagListBlock,
 )
 from app.reporting.brand_assembler import assemble_brand_report
-from app.reporting.brand_payload import BrandReportNarrative, BrandReportPayload
+from app.reporting.brand_payload import (
+    BrandReportData,
+    BrandReportNarrative,
+    BrandReportPayload,
+    DailyTrendSection,
+    MetricComparison,
+    OverviewSection,
+    QuerySpec,
+    ReportScope,
+    SentimentSplit,
+    SourceEntry,
+    TopPostRow,
+    TrendPoint,
+)
 from app.reporting.builders import (
     build_brand_compat_document,
     collect_goal_evidence,
@@ -269,7 +282,7 @@ async def test_run_brand_analysis_merges_warning_into_payload_availability(
 
     trend = report.payload_json["availability"]["daily_trend"]
     assert trend["status"] == "unavailable"
-    assert "brand_trend_data_unavailable" in (trend["reason"] or "")
+    assert "趋势数据未成功获取" in (trend["reason"] or "")
 
 
 @pytest.mark.asyncio
@@ -372,6 +385,32 @@ async def test_run_campaign_analysis_rejects_empty_evidence(db_session, user_fac
         )
 
 
+def _user_content(request) -> dict:
+    user_messages = [m for m in request.messages if m.role == "user"]
+    assert len(user_messages) == 1
+    return json.loads(user_messages[0].content)
+
+
+@pytest.mark.asyncio
+async def test_run_campaign_analysis_injects_limitation_note(db_session, user_factory) -> None:
+    """campaign 路径保留 _LIMITATION_NOTES 注入：warning_code → 模型输入 limitation 人话。"""
+    user_id, session_id = await _create_session(db_session, user_factory)
+    model = FakeModel(_document())
+
+    await run_campaign_analysis(
+        db_session,
+        model,
+        user_id=user_id,
+        session_id=session_id,
+        task=_task(_plan_json(_overview_note())),
+        goal=_goal({"brand": "海底捞", "campaign": "618大促"}),
+        warning_code="brand_trend_data_unavailable",
+    )
+
+    [request] = model.requests
+    assert _user_content(request)["limitation"] == "趋势数据未成功获取"
+
+
 def _payload_for_compat() -> BrandReportPayload:
     """仅 overview 证据的最小快照 + 固定叙事（无情感/趋势/热帖数据）。"""
     payload = assemble_brand_report(
@@ -399,3 +438,93 @@ def test_build_brand_compat_document_omits_blocks_without_data() -> None:
     assert values["总互动"] == 8000.0
     assert values["覆盖平台"] == 1
     assert values["时间窗"] == "2026-06-01~2026-06-30"
+
+
+def _full_payload() -> BrandReportPayload:
+    """全数据快照（手工构造）：情感/趋势（70 点，验证截断）/热帖齐全。
+
+    overview.platforms 置空以验证「覆盖平台」fallback 到 scope.platforms——
+    组装器产出恒有平台行，该分支只能由后续模板/手工快照触达。
+    """
+    base = date(2026, 6, 1)
+    points = [
+        TrendPoint(
+            date=(base + timedelta(days=offset)).isoformat(),
+            mentions=float(offset + 1),
+            interactions=float((offset + 1) * 2),
+        )
+        for offset in range(70)
+    ]
+    return BrandReportPayload(
+        data_status="partial",
+        scope=ReportScope(
+            brand="海底捞",
+            period_start="2026-06-01",
+            period_end="2026-08-09",
+            platforms=["xiaohongshu", "douyin"],
+            comparison_mode="mom",
+        ),
+        query_spec=QuerySpec(original_term="海底捞", matched_tag="海底捞"),
+        data=BrandReportData(
+            overview=OverviewSection(
+                platforms=[],
+                total_mentions=MetricComparison(current=3000.0),
+                total_interactions=MetricComparison(current=20000.0),
+                sentiment_split=SentimentSplit(positive=1800.0, neutral=900.0, negative=300.0),
+            ),
+            daily_trend=DailyTrendSection(points=points),
+            top_posts=[
+                TopPostRow(
+                    platform="xiaohongshu", title="热帖A", author="达人A", interactions=999
+                )
+            ],
+        ),
+        narrative=BrandReportNarrative.model_validate(_narrative_output()),
+        availability={},
+        sources=[SourceEntry(tool="datatap.insight.social.statistic.overview.v1")],
+    )
+
+
+def test_build_brand_compat_document_full_data_renders_all_blocks() -> None:
+    """全数据快照：pie/line/table 都生成，趋势截 60 点，覆盖平台走 scope fallback。"""
+    payload = _full_payload()
+
+    document = build_brand_compat_document(payload)
+
+    assert document.title == "海底捞 品牌分析报告"
+    assert document.conclusion == "品牌声量稳步上升。"
+    block_types = [block.type for block in document.blocks]
+    assert block_types == [
+        "metric_grid",
+        "pie_chart",
+        "line_chart",
+        "table",
+        "markdown",
+        "sources",
+    ]
+
+    grid, pie, line, table, markdown, sources = document.blocks
+    grid_values = {item.label: item.value for item in grid.items}
+    assert grid_values["总声量"] == 3000.0
+    assert grid_values["总互动"] == 20000.0
+    assert grid_values["覆盖平台"] == 2  # overview.platforms 为空 → len(scope.platforms)
+    assert grid_values["时间窗"] == "2026-06-01~2026-08-09"
+
+    assert pie.categories == ["正面", "中性", "负面"]
+    assert pie.series[0].values == [1800.0, 900.0, 300.0]
+
+    # 70 个趋势点截尾 60：首日落在第 11 个点（2026-06-11）。
+    assert len(line.categories) == 60
+    assert line.categories[0] == "2026-06-11"
+    assert line.categories[-1] == "2026-08-09"
+    assert [series.name for series in line.series] == ["声量", "互动数"]
+    assert line.series[0].values[0] == 11.0
+    assert line.series[1].values[0] == 22.0
+
+    assert table.columns == ["平台", "标题", "作者", "互动数"]
+    assert table.rows == [["xiaohongshu", "热帖A", "达人A", 999]]
+
+    assert "品牌声量稳步上升。" in markdown.text
+    assert "- 延续新品测评内容节奏" in markdown.text
+
+    assert sources.items[0].name == "datatap.insight.social.statistic.overview.v1"

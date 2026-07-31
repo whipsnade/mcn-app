@@ -152,6 +152,16 @@ async def test_empty_conclusion_raises_validation_error() -> None:
 
 
 @pytest.mark.asyncio
+async def test_overlong_conclusion_raises_validation_error() -> None:
+    """conclusion 超 4000 字（ReportDocument.conclusion 上限）→ 校验异常上抛。"""
+    output = {**_valid_output(), "conclusion": "长" * 4001}
+    model = FakeModel([output])
+
+    with pytest.raises(ModelPlanInvalidError, match="MODEL_PLAN_INVALID"):
+        await build_brand_narrative(model, _payload(), log_context={})
+
+
+@pytest.mark.asyncio
 async def test_request_purpose_and_log_tags() -> None:
     model = FakeModel([_valid_output()])
 

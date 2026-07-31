@@ -512,7 +512,9 @@ def test_missing_dimension_chapter_unavailable_and_warning_merged() -> None:
     chapter = payload.availability["daily_trend"]
     assert chapter.status == "unavailable"
     assert chapter.reason is not None
-    assert "brand_trend_data_unavailable" in chapter.reason
+    # warning 人话化：reason 写入人话说明而非裸 code。
+    assert "趋势数据未成功获取" in chapter.reason
+    assert "brand_trend_data_unavailable" not in chapter.reason
     assert chapter.missing_fields == []
     assert chapter.source_tools == []
     assert chapter.collected_at is None
