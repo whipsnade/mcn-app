@@ -1,9 +1,11 @@
 import pytest
+from pydantic import BaseModel
 
 from app.model.structured_output import (
     ThinkJsonStreamParser,
     extract_single_json_object,
     parse_non_stream_output,
+    validate_with_repair,
 )
 
 
@@ -61,3 +63,30 @@ def test_non_stream_parser_ignores_think_and_markdown() -> None:
     )
     assert result.thinking_text == "内部思考"
     assert result.json_text == '{"value":1}'
+
+
+class _Decision(BaseModel):
+    action: str
+    rationale: str | None = None
+
+
+def test_validate_with_repair_passes_valid_json_unchanged() -> None:
+    result = validate_with_repair(_Decision, '{"action":"finish","rationale":"够了"}')
+    assert result.action == "finish"
+    assert result.rationale == "够了"
+
+
+def test_validate_with_repair_fixes_unescaped_quotes() -> None:
+    # 还原 2026-07-30 UAT 失败样例：字符串内含未转义双引号
+    broken = (
+        '{"action":"call_tool",'
+        '"rationale":"evidence_gaps中包含"受众"缺口，补充受众维度分析。"}'
+    )
+    result = validate_with_repair(_Decision, broken)
+    assert result.action == "call_tool"
+    assert result.rationale is not None and "受众" in result.rationale
+
+
+def test_validate_with_repair_raises_original_error_when_unfixable() -> None:
+    with pytest.raises(ValueError):
+        validate_with_repair(_Decision, '{"rationale":"缺少必填字段"}')

@@ -1,6 +1,13 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from typing import TypeVar
+
+from json_repair import repair_json
+from pydantic import BaseModel, ValidationError
+
+ModelT = TypeVar("ModelT", bound=BaseModel)
 
 
 _THINK_OPEN = "<think>"
@@ -119,6 +126,21 @@ class ThinkJsonStreamParser:
         else:
             self._content_parts.append(self._pending)
         self._pending = ""
+
+
+def validate_with_repair(model: type[ModelT], json_text: str) -> ModelT:
+    """先按严格 JSON 校验；失败时尝试 json-repair 修复未转义引号等常见问题再校验。
+
+    修复仍失败时抛回原始校验错误，保持上层修复重试回喂的内容不变。
+    """
+    try:
+        return model.model_validate_json(json_text, strict=True)
+    except (ValidationError, ValueError) as strict_error:
+        repaired = repair_json(json_text, return_objects=True)
+        try:
+            return model.model_validate_json(json.dumps(repaired, ensure_ascii=False), strict=True)
+        except (ValidationError, ValueError):
+            raise strict_error from None
 
 
 def parse_non_stream_output(text: str) -> ParsedStructuredOutput:
