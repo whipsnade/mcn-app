@@ -9,7 +9,7 @@ import type {
   ApiAnalysisReport, BrandReportChapterAvailability, BrandReportMetricComparison,
   BrandReportNarrative, BrandReportPayload, BrandReportPeriodValue, BrandReportTopPost,
 } from '../api/contracts';
-import { Card, formatExposure, formatNumber, Missing } from './reportPrimitives';
+import { Card, formatNumber, Missing } from './reportPrimitives';
 
 const PLATFORM_NAMES: Record<string, string> = {
   xiaohongshu: '小红书',
@@ -62,7 +62,7 @@ function periodLine(label: string, period: BrandReportPeriodValue | undefined, p
   return { text: `${label} ${pct > 0 ? '+' : ''}${pct}%`, tone: pct < 0 ? 'down' : 'up' };
 }
 
-function ComparisonCard({ label, metric, exposure = false }: { label: string; metric?: BrandReportMetricComparison; exposure?: boolean }) {
+function ComparisonCard({ label, metric }: { label: string; metric?: BrandReportMetricComparison }) {
   const current = metric?.current;
   const hasValue = typeof current === 'number' && Number.isFinite(current);
   const lines = [
@@ -73,7 +73,7 @@ function ComparisonCard({ label, metric, exposure = false }: { label: string; me
     <section className="min-w-0 rounded-xl border border-slate-100 bg-white px-3.5 py-3 shadow-sm">
       <p className="text-[12px] font-medium text-slate-400">{label}</p>
       <p className={`mt-1.5 truncate text-[20px] font-bold leading-none tracking-tight ${hasValue ? 'text-slate-800' : 'text-slate-300'}`}>
-        {hasValue ? (exposure ? formatExposure(current) : formatNumber(current)) : '数据不足'}
+        {hasValue ? formatNumber(current) : '数据不足'}
       </p>
       <div className="mt-1.5 flex flex-wrap gap-x-2 gap-y-0.5">
         {lines.map(line => (
@@ -123,18 +123,16 @@ function OverviewChapter({ payload }: { payload: BrandReportPayload }) {
         {scope.platforms.length > 0 ? ` · ${scope.platforms.map(platformName).join('、')}` : ''}
         {scope.data_as_of ? ` · 数据截至 ${scope.data_as_of}` : ''}
       </p>
-      <div className="grid grid-cols-3 gap-2">
+      <div className="grid grid-cols-2 gap-2">
         <ComparisonCard label="总声量" metric={overview.total_mentions} />
-        <ComparisonCard label="总曝光" metric={overview.total_exposure} exposure />
         <ComparisonCard label="总互动" metric={overview.total_interactions} />
       </div>
       {overview.platforms.length > 0 && (
         <DataTable
-          columns={['平台', '声量', '曝光', '互动']}
+          columns={['平台', '声量', '互动']}
           rows={overview.platforms.map(item => [
             platformName(item.platform),
             fmt(item.mentions),
-            item.exposure != null && Number.isFinite(item.exposure) ? formatExposure(item.exposure) : '未提供',
             fmt(item.interactions),
           ])}
         />

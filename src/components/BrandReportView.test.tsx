@@ -27,7 +27,10 @@ function chapter(container: HTMLElement, key: string): HTMLElement {
 
 describe('BrandReportView', () => {
   it('renders all eight chapters with narrative sections placed after the data chapters', () => {
-    const { container } = renderView(brandReportPayloadFixture());
+    const payload = brandReportPayloadFixture();
+    // not_requested 的对比期不展示数值（把总互动的同比置为未请求）。
+    payload.data.overview.total_interactions.yoy = { value: null, status: 'not_requested', reason: null };
+    const { container } = renderView(payload);
 
     const nav = screen.getByRole('navigation', { name: '报告章节' });
     const navButtons = within(nav).getAllByRole('button');
@@ -81,7 +84,7 @@ describe('BrandReportView', () => {
       data_status: 'partial',
       availability: {
         ...base.availability,
-        overview: { status: 'partial', missing_fields: ['total_exposure'], reason: 'no_data', source_tools: ['brand_mention_query'], collected_at: null },
+        overview: { status: 'partial', missing_fields: ['total_interactions'], reason: 'no_data', source_tools: ['brand_mention_query'], collected_at: null },
       },
     });
     const { container } = renderView(payload);
@@ -89,7 +92,7 @@ describe('BrandReportView', () => {
     const overview = chapter(container, 'overview');
     expect(within(overview).getByText('受限')).toBeVisible();
     expect(within(overview).getByText(/查询无数据/)).toBeVisible();
-    expect(within(overview).getByText(/total_exposure/)).toBeVisible();
+    expect(within(overview).getByText(/total_interactions/)).toBeVisible();
   });
 
   it('switches top post platforms and labels exposure/share per platform', () => {

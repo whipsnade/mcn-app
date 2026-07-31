@@ -438,7 +438,7 @@ def _aggregate_overview(
     aggregate_rows: list[tuple[str, dict]] = []
     for evidence in evidences:
         for raw in _iter_rows(evidence.summary):
-            if not _has_any(raw, _MENTIONS_KEYS + _EXPOSURE_KEYS + _INTERACTIONS_KEYS):
+            if not _has_any(raw, _MENTIONS_KEYS + _INTERACTIONS_KEYS):
                 continue
             platform = _canon_platform(_first(raw, _PLATFORM_KEYS))
             if platform in _AGGREGATE_PLATFORM_NAMES:
@@ -450,7 +450,6 @@ def _aggregate_overview(
     split: dict[str, float | None] = {"positive": None, "neutral": None, "negative": None}
     metric_aliases = (
         ("mentions", _MENTIONS_KEYS),
-        ("exposure", _EXPOSURE_KEYS),
         ("interactions", _INTERACTIONS_KEYS),
     )
     split_aliases = (
@@ -460,7 +459,7 @@ def _aggregate_overview(
     )
     for platform, raw in rows_to_use:
         slot = per_platform.setdefault(
-            platform, {"mentions": None, "exposure": None, "interactions": None}
+            platform, {"mentions": None, "interactions": None}
         )
         for metric, aliases in metric_aliases:
             value = _num(_first(raw, aliases))
@@ -475,7 +474,7 @@ def _aggregate_overview(
 
 def _totals(per_platform: dict[str, dict[str, float | None]]) -> dict[str, float | None]:
     totals: dict[str, float | None] = {}
-    for metric in ("mentions", "exposure", "interactions"):
+    for metric in ("mentions", "interactions"):
         values = [row[metric] for row in per_platform.values() if row[metric] is not None]
         totals[metric] = sum(values) if values else None
     return totals
@@ -510,7 +509,7 @@ def _build_overview_section(
         has_failed=yoy_failed,
     )
     comparisons: dict[str, MetricComparison] = {}
-    for metric in ("mentions", "exposure", "interactions"):
+    for metric in ("mentions", "interactions"):
         comparisons[metric] = _metric_comparison(
             current_totals[metric],
             mom_totals[metric] if mom_totals else None,
@@ -522,20 +521,18 @@ def _build_overview_section(
         PlatformOverview(
             platform=platform,
             mentions=values["mentions"],
-            exposure=values["exposure"],
             interactions=values["interactions"],
         )
         for platform, values in sorted(current.items(), key=_platform_sort_key)
     ]
     missing = [
-        metric for metric in ("mentions", "exposure", "interactions") if current_totals[metric] is None
+        metric for metric in ("mentions", "interactions") if current_totals[metric] is None
     ]
     if all(split[name] is None for name in ("positive", "neutral", "negative")):
         missing.append("sentiment_split")
     section = OverviewSection(
         platforms=platforms,
         total_mentions=comparisons["mentions"],
-        total_exposure=comparisons["exposure"],
         total_interactions=comparisons["interactions"],
         sentiment_split=SentimentSplit(
             positive=split["positive"], neutral=split["neutral"], negative=split["negative"]

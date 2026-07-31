@@ -275,7 +275,6 @@ def test_complete_evidence_assembles_full_payload() -> None:
     # 环比/同比百分比由组装器按 data 计算：(3000-1500)/1500、(3000-1000)/1000
     assert totals.mom_change_pct == 100.0
     assert totals.yoy_change_pct == 200.0
-    assert payload.data.overview.total_exposure.current == 140000
     assert payload.data.overview.total_interactions.current == 20000
     split = payload.data.overview.sentiment_split
     assert (split.positive, split.neutral, split.negative) == (1800, 900, 300)

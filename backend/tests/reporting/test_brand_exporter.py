@@ -58,11 +58,11 @@ def _payload() -> BrandReportPayload:
             overview=OverviewSection(
                 platforms=[
                     PlatformOverview(
-                        platform="xiaohongshu", mentions=1000.0, exposure=50000.0,
+                        platform="xiaohongshu", mentions=1000.0,
                         interactions=8000.0,
                     ),
                     PlatformOverview(
-                        platform="douyin", mentions=2000.0, exposure=90000.0,
+                        platform="douyin", mentions=2000.0,
                         interactions=12000.0,
                     ),
                 ],
@@ -73,7 +73,6 @@ def _payload() -> BrandReportPayload:
                     mom_change_pct=20.0,
                     yoy_change_pct=50.0,
                 ),
-                total_exposure=MetricComparison(current=140000.0, mom_change_pct=10.0),
                 total_interactions=MetricComparison(
                     current=20000.0, mom_change_pct=-5.5, yoy_change_pct=30.0
                 ),
@@ -271,7 +270,7 @@ def test_render_overview_five_platforms_dynamic_columns() -> None:
     # 合计落在第 7 列（有表头），数值为五平台之和。
     assert overview.cell(7, 7).value == 1500.0
     assert overview.cell(6, 8).value is None
-    # 互动数/阅读播放数各平台缺失 → 合计「未提供」。
+    # 互动数各平台缺失 → 合计「未提供」。
     assert overview.cell(8, 7).value == "未提供"
 
 

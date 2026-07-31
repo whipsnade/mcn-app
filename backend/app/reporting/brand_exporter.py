@@ -166,7 +166,7 @@ def _render_overview(sheet: Any, payload: BrandReportPayload) -> None:
     headers = ["指标"] + [_platform_label(item.platform) for item in platforms] + ["合计"]
     for column in range(1, clear_to + 1):
         sheet.cell(6, column).value = headers[column - 1] if column <= total_columns else None
-    metrics = (("声量(帖数)", "mentions"), ("互动数", "interactions"), ("阅读/播放数", "exposure"))
+    metrics = (("声量(帖数)", "mentions"), ("互动数", "interactions"))
     for offset, (label, field) in enumerate(metrics):
         row = 7 + offset
         sheet.cell(row, 1).value = label
@@ -178,14 +178,13 @@ def _render_overview(sheet: Any, payload: BrandReportPayload) -> None:
         sheet.cell(row, total_columns).value = _total(values)
         for column in range(total_columns + 1, clear_to + 1):
             sheet.cell(row, column).value = None
-    # 模板行 10-15 是样例独有的细分指标（用户数/点赞等），payload 无此口径，整行清除。
-    _clear_rows(sheet, 10, 15, clear_to)
+    # 模板行 9-15 是样例独有的细分指标（阅读播放/用户数/点赞等），payload 无此口径，整行清除。
+    _clear_rows(sheet, 9, 15, clear_to)
     reason = _chapter_reason(payload, "overview")
     sheet["A16"] = reason
     comparisons = (
         ("声量", overview.total_mentions),
         ("互动数", overview.total_interactions),
-        ("阅读/播放数", overview.total_exposure),
     )
     for offset, (label, comparison) in enumerate(comparisons):
         row = 19 + offset
@@ -193,7 +192,7 @@ def _render_overview(sheet: Any, payload: BrandReportPayload) -> None:
         sheet.cell(row, 2).value = _num(comparison.current)
         _write_pct(sheet.cell(row, 3), comparison.mom_change_pct)
         _write_pct(sheet.cell(row, 4), comparison.yoy_change_pct)
-    _clear_rows(sheet, 22, 22, clear_to)
+    _clear_rows(sheet, 21, 22, clear_to)
     split = overview.sentiment_split
     parts = (("正面声量", split.positive), ("中性声量", split.neutral), ("负面声量", split.negative))
     known = [value for _, value in parts if value is not None]

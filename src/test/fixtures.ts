@@ -76,8 +76,8 @@ export function brandReportPayloadFixture(overrides: Partial<BrandReportPayload>
     data: {
       overview: {
         platforms: [
-          { platform: 'xiaohongshu', mentions: 1200, exposure: 3400000, interactions: 56000 },
-          { platform: 'douyin', mentions: 800, exposure: 5200000, interactions: 91000 },
+          { platform: 'xiaohongshu', mentions: 1200, interactions: 56000 },
+          { platform: 'douyin', mentions: 800, interactions: 91000 },
         ],
         total_mentions: {
           current: 2000,
@@ -85,13 +85,6 @@ export function brandReportPayloadFixture(overrides: Partial<BrandReportPayload>
           yoy: { value: 1500, status: 'ok', reason: null },
           mom_change_pct: 11.1,
           yoy_change_pct: 33.3,
-        },
-        total_exposure: {
-          current: 8600000,
-          mom: { value: 7000000, status: 'ok', reason: null },
-          yoy: { value: null, status: 'not_requested', reason: null },
-          mom_change_pct: 22.9,
-          yoy_change_pct: null,
         },
         total_interactions: {
           current: 147000,

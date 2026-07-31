@@ -89,13 +89,15 @@ class SourceEntry(BaseModel):
 
 
 class PlatformOverview(BaseModel):
-    """单平台当期概览指标；缺失字段保留 null，不以 0 填补。"""
+    """单平台当期概览指标；缺失字段保留 null，不以 0 填补。
+
+    不含曝光指标：DataTap 口径中曝光与声量同义（2026-07-31 确认，只保留声量）。
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     platform: str
     mentions: float | None = None
-    exposure: float | None = None
     interactions: float | None = None
 
 
@@ -128,7 +130,6 @@ class OverviewSection(BaseModel):
 
     platforms: list[PlatformOverview] = Field(default_factory=list)
     total_mentions: MetricComparison = Field(default_factory=MetricComparison)
-    total_exposure: MetricComparison = Field(default_factory=MetricComparison)
     total_interactions: MetricComparison = Field(default_factory=MetricComparison)
     sentiment_split: SentimentSplit = Field(default_factory=SentimentSplit)
 

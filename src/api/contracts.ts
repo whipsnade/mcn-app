@@ -329,7 +329,6 @@ export interface BrandReportSourceEntry {
 export interface BrandReportPlatformOverview {
   platform: string;
   mentions: number | null;
-  exposure: number | null;
   interactions: number | null;
 }
 
@@ -350,7 +349,6 @@ export interface BrandReportSentimentSplit {
 export interface BrandReportOverviewSection {
   platforms: BrandReportPlatformOverview[];
   total_mentions: BrandReportMetricComparison;
-  total_exposure: BrandReportMetricComparison;
   total_interactions: BrandReportMetricComparison;
   sentiment_split: BrandReportSentimentSplit;
 }
