@@ -253,6 +253,28 @@ def test_render_daily_trend_charts_point_at_written_range() -> None:
     assert any("$C$4:$C$6" in ref for ref in references)
 
 
+def test_render_overview_five_platforms_dynamic_columns() -> None:
+    """5 平台 payload：表头/合计列按实际列数排布，不截断、不落到无表头列。"""
+    payload = _payload()
+    payload.scope.platforms = ["xiaohongshu", "douyin", "weibo", "bilibili", "wechat"]
+    payload.data.overview.platforms = [
+        PlatformOverview(platform=platform, mentions=float(index * 100))
+        for index, platform in enumerate(
+            ["xiaohongshu", "douyin", "weibo", "bilibili", "wechat"], start=1
+        )
+    ]
+    workbook = _load(render_brand_workbook(payload))
+    overview = workbook["综合概览"]
+    assert [overview.cell(6, col).value for col in range(1, 8)] == [
+        "指标", "小红书", "抖音", "微博", "哔哩哔哩", "微信", "合计",
+    ]
+    # 合计落在第 7 列（有表头），数值为五平台之和。
+    assert overview.cell(7, 7).value == 1500.0
+    assert overview.cell(6, 8).value is None
+    # 互动数/阅读播放数各平台缺失 → 合计「未提供」。
+    assert overview.cell(8, 7).value == "未提供"
+
+
 def test_render_regions_bar_chart() -> None:
     workbook = _load(render_brand_workbook(_payload()))
     sheet = workbook["地域分布"]
@@ -263,6 +285,36 @@ def test_render_regions_bar_chart() -> None:
     chart = sheet._charts[0]
     assert isinstance(chart, BarChart)
     assert "$B$4:$B$5" in chart.ser[0].val.numRef.f
+
+
+def test_render_content_creators_dynamic_rows_and_reason_placement() -> None:
+    """内容类型与达人 Sheet：三段动态行、占比数值格式、reason 落位不覆盖 A1 标题。"""
+    payload = _payload()
+    payload.availability["content_creators"] = ChapterAvailability(
+        status="partial", reason="达人层级数据部分缺失"
+    )
+    workbook = _load(render_brand_workbook(payload))
+    sheet = workbook["内容类型与达人"]
+    # A1 模板标题不被覆盖；reason 写在第 2 行（模板该行无内容）。
+    assert sheet["A1"].value == "内容类型分布"
+    assert "达人层级数据部分缺失" in sheet["A2"].value
+    # 内容类型段：表头第 3 行，数据第 4 行。
+    assert [sheet.cell(3, col).value for col in (1, 2, 3)] == ["内容类型", "声量", "占比"]
+    assert sheet["A4"].value == "探店"
+    assert sheet["B4"].value == 400.0
+    assert sheet["C4"].value == 40.0
+    assert "%" in sheet["C4"].number_format
+    # 达人层级段（动态：内容类型 1 行数据 → 标题 6、表头 7、数据 8）。
+    assert sheet["A6"].value == "达人层级分布 (品牌相关内容)"
+    assert sheet["A8"].value == "尾部(1w-5w)"
+    assert sheet["C8"].value == 50.0
+    # 商单 vs 自然段（标题 10、表头 11、数据 12-13）。
+    assert sheet["A10"].value == "商单 vs 自然内容"
+    assert sheet["A12"].value == "自然内容(非商单)"
+    assert sheet["C12"].value == 96.67
+    assert "%" in sheet["C12"].number_format
+    assert sheet["A13"].value == "商单内容"
+    assert sheet["C13"].value == 3.33
 
 
 def test_render_top_posts_dual_platform_sections() -> None:

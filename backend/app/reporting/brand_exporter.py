@@ -156,9 +156,12 @@ def _render_overview(sheet: Any, payload: BrandReportPayload) -> None:
     sheet["B3"] = f"DataTap 聆媒洞察 MCP（{_platforms_label(scope.platforms)}）"
     sheet["B4"] = _cell_value(_query_label(payload))
     platforms = overview.platforms
+    # 表头/清尾按实际列数（平台数+合计）动态计算，不截断平台。
+    total_columns = 2 + len(platforms)
+    clear_to = max(6, total_columns)
     headers = ["指标"] + [_platform_label(item.platform) for item in platforms] + ["合计"]
-    for column in range(1, 7):
-        sheet.cell(6, column).value = headers[column - 1] if column <= len(headers) else None
+    for column in range(1, clear_to + 1):
+        sheet.cell(6, column).value = headers[column - 1] if column <= total_columns else None
     metrics = (("声量(帖数)", "mentions"), ("互动数", "interactions"), ("阅读/播放数", "exposure"))
     for offset, (label, field) in enumerate(metrics):
         row = 7 + offset
@@ -168,11 +171,11 @@ def _render_overview(sheet: Any, payload: BrandReportPayload) -> None:
             value = getattr(item, field)
             values.append(value)
             sheet.cell(row, 2 + index).value = _num(value)
-        sheet.cell(row, 2 + len(platforms)).value = _total(values)
-        for column in range(3 + len(platforms), 7):
+        sheet.cell(row, total_columns).value = _total(values)
+        for column in range(total_columns + 1, clear_to + 1):
             sheet.cell(row, column).value = None
     # 模板行 10-15 是样例独有的细分指标（用户数/点赞等），payload 无此口径，整行清除。
-    _clear_rows(sheet, 10, 15, 6)
+    _clear_rows(sheet, 10, 15, clear_to)
     reason = _chapter_reason(payload, "overview")
     sheet["A16"] = reason
     comparisons = (
@@ -186,7 +189,7 @@ def _render_overview(sheet: Any, payload: BrandReportPayload) -> None:
         sheet.cell(row, 2).value = _num(comparison.current)
         _write_pct(sheet.cell(row, 3), comparison.mom_change_pct)
         _write_pct(sheet.cell(row, 4), comparison.yoy_change_pct)
-    _clear_rows(sheet, 22, 22, 6)
+    _clear_rows(sheet, 22, 22, clear_to)
     split = overview.sentiment_split
     parts = (("正面声量", split.positive), ("中性声量", split.neutral), ("负面声量", split.negative))
     known = [value for _, value in parts if value is not None]

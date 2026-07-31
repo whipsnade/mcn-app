@@ -273,6 +273,11 @@ async def export_session_report(
     except LookupError as error:
         raise not_found(str(error)) from error
     except Exception as error:
+        logger.exception(
+            "brand_report_export_render_failed session_id=%s report_id=%s",
+            session_id,
+            report_id,
+        )
         raise HTTPException(status_code=500, detail="EXPORT_RENDER_FAILED") from error
     return Response(
         content=workbook.content,
