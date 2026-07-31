@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from typing import Annotated
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy import desc, select
@@ -15,6 +16,7 @@ from app.identity.dependencies import CurrentUser
 from app.model.contracts import ModelAdapter, ModelAdapterError
 from app.model.dependencies import get_model_adapter
 from app.reporting.analysis_reports import AnalysisReportService
+from app.reporting.brand_exporter import export_brand_report
 from app.reporting.builders import (
     collect_goal_evidence,
     run_brand_analysis,
@@ -256,6 +258,31 @@ async def get_analysis_report(
     except LookupError as error:
         raise not_found("report_not_found") from error
     return analysis_report_read(report)
+
+
+@router.get("/sessions/{session_id}/reports/{report_id}/export")
+async def export_session_report(
+    session_id: str,
+    report_id: str,
+    user: CurrentUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> Response:
+    """品牌报告 Excel 导出（brand_report_v2 模板渲染，零模型/零 MCP/零积分）。"""
+    try:
+        workbook = await export_brand_report(db, user.id, session_id, report_id)
+    except LookupError as error:
+        raise not_found(str(error)) from error
+    except Exception as error:
+        raise HTTPException(status_code=500, detail="EXPORT_RENDER_FAILED") from error
+    return Response(
+        content=workbook.content,
+        media_type=workbook.content_type,
+        headers={
+            "Content-Disposition": (
+                f"attachment; filename*=UTF-8''{quote(workbook.filename)}"
+            ),
+        },
+    )
 
 
 @router.get("/favorites", response_model=list[FavoriteRead])
