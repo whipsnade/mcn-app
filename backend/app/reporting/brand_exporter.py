@@ -40,10 +40,14 @@ SHEET_ORDER = (
 MISSING = "未提供"
 PCT_FORMAT = '0.00"%"'
 
-TOP_POST_HEADERS = (
-    "排名", "平台", "标题", "用户昵称", "互动数", "阅读数",
-    "点赞", "评论", "收藏", "转发", "情感", "达人层级", "链接",
-)
+def _top_post_headers(platform: str | None = None) -> tuple[str, ...]:
+    """热帖表头按平台段切换口径：小红书=阅读数/转发，抖音=播放数/分享（对齐 BI）。"""
+    exposure = "播放数" if platform == "douyin" else "阅读数"
+    share = "分享" if platform == "douyin" else "转发"
+    return (
+        "排名", "平台", "标题", "用户昵称", "互动数", exposure,
+        "点赞", "评论", "收藏", share, "情感", "达人层级", "链接",
+    )
 
 _CHAPTER_LABELS = {
     "overview": "综合概览",
@@ -317,7 +321,7 @@ def _render_top_posts(sheet: Any, payload: BrandReportPayload) -> None:
     """双段布局：小红书段 + 抖音段顺序排列，按平台动态重写（unmerge/clear/rewrite）。"""
     for merged in list(sheet.merged_cells.ranges):
         sheet.unmerge_cells(str(merged))
-    _clear_rows(sheet, 1, max(sheet.max_row, 45), len(TOP_POST_HEADERS))
+    _clear_rows(sheet, 1, max(sheet.max_row, 45), len(_top_post_headers()))
     sheet.column_dimensions["M"].width = 40
     posts = payload.data.top_posts
     if not posts:
@@ -344,7 +348,7 @@ def _render_top_posts(sheet: Any, payload: BrandReportPayload) -> None:
         )
         title_cell.font = Font(name="微软雅黑", bold=True, size=12)
         header_row = row + 1
-        _write_top_post_headers(sheet, header_row)
+        _write_top_post_headers(sheet, header_row, platform)
         for rank, post in enumerate(group, start=1):
             data_row = header_row + rank
             values = (
@@ -374,8 +378,8 @@ def _render_top_posts(sheet: Any, payload: BrandReportPayload) -> None:
         row = header_row + len(group) + 2
 
 
-def _write_top_post_headers(sheet: Any, row: int) -> None:
-    for column, header in enumerate(TOP_POST_HEADERS, start=1):
+def _write_top_post_headers(sheet: Any, row: int, platform: str | None = None) -> None:
+    for column, header in enumerate(_top_post_headers(platform), start=1):
         cell = sheet.cell(row, column)
         cell.value = header
         cell.font = Font(name="微软雅黑", bold=True, size=10)
@@ -544,9 +548,15 @@ def _query_label(payload: BrandReportPayload) -> str:
 
 def _chapter_reason(payload: BrandReportPayload, chapter: str) -> str | None:
     availability = payload.availability.get(chapter)
-    if availability and availability.status != "complete" and availability.reason:
-        return f"数据受限：{availability.reason}"
-    return None
+    if not availability or availability.status == "complete":
+        return None
+    # 组装器 partial 章节常只填 missing_fields 不填 reason：受限说明两者都要落。
+    reason = availability.reason or "部分数据缺失"
+    if availability.missing_fields:
+        reason = f"{reason}（缺失字段：{'、'.join(availability.missing_fields)}）"
+    elif not availability.reason:
+        return None
+    return f"数据受限：{reason}"
 
 
 def _availability_summary(payload: BrandReportPayload) -> str:

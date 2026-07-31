@@ -570,6 +570,92 @@ def test_v2_trajectory_supported() -> None:
     assert {entry.step_id for entry in payload.sources} == {"g1_step_1", "g1_step_2"}
 
 
+def _v2_dual_goal_plan() -> dict[str, object]:
+    """双 goal v2 轨迹：品牌切片 overview+热帖；kol 切片 raw_posts+tag（污染源）。"""
+    brand_slice = {
+        "steps": [
+            _step("g1_step_1", TOOL_OVERVIEW, start="2026-06-01", end="2026-06-30",
+                  goal="current: 当期概览"),
+            _step("g1_step_2", TOOL_RAW_POSTS, start="2026-06-01", end="2026-06-30",
+                  goal="current: 品牌热门原帖"),
+        ],
+        "results": [
+            _note("g1_step_1", TOOL_OVERVIEW, _summary([{"平台": "小红书", "声量": 900}])),
+            _note(
+                "g1_step_2",
+                TOOL_RAW_POSTS,
+                _summary([{"平台": "小红书", "帖子ID": "xhs-b1", "标题": "品牌切片热帖", "互动数": 500}]),
+            ),
+        ],
+    }
+    kol_slice = {
+        "steps": [
+            _step("g2_step_1", TOOL_RAW_POSTS, start="2026-06-01", end="2026-06-30",
+                  goal="current: kol 原帖"),
+            _step("g2_step_2", TOOL_TAG, goal="current: kol 标签"),
+        ],
+        "results": [
+            _note(
+                "g2_step_1",
+                TOOL_RAW_POSTS,
+                _summary([{"平台": "抖音", "作品ID": "dy-k1", "标题": "KOL切片污染帖", "互动数": 9999}]),
+            ),
+            _note("g2_step_2", TOOL_TAG, _summary([{"标签名称": "海底捞"}])),
+        ],
+    }
+    return {
+        "schema": "agent_trajectory_v2",
+        "goals": {"goal-brand": brand_slice, "goal-kol": kol_slice},
+    }
+
+
+def test_v2_goal_id_filters_other_goal_slices() -> None:
+    """v2 多 goal 轨迹：goal_id 只恢复本 goal 切片，kol 切片证据不得污染品牌章节。"""
+    payload = assemble_brand_report(_v2_dual_goal_plan(), _minimal_params(), goal_id="goal-brand")
+
+    assert payload.data.overview.total_mentions.current == 900
+    assert [post.title for post in payload.data.top_posts] == ["品牌切片热帖"]
+    # kol 切片的标签匹配不得进入 query_spec。
+    assert payload.query_spec.matched_tag is None
+    assert payload.query_spec.fallback_keyword == "肯德基"
+    assert {entry.step_id for entry in payload.sources} == {"g1_step_1", "g1_step_2"}
+
+
+def test_v2_goal_id_missing_slice_raises_no_evidence() -> None:
+    """goal_id 切片缺失：按空证据处理，走 no_evidence_collected 门禁。"""
+    with pytest.raises(LookupError, match="no_evidence_collected"):
+        assemble_brand_report(_v2_dual_goal_plan(), _minimal_params(), goal_id="goal-nonexistent")
+
+
+def test_v2_without_goal_id_merges_all_slices() -> None:
+    """不传 goal_id 保持旧行为：合并所有切片（向后兼容）。"""
+    payload = assemble_brand_report(_v2_dual_goal_plan(), _minimal_params())
+
+    assert payload.query_spec.matched_tag == "海底捞"
+    assert {post.title for post in payload.data.top_posts} == {"品牌切片热帖", "KOL切片污染帖"}
+
+
+def test_overview_skips_aggregate_rows() -> None:
+    """合计/全部/总计/all 平台行跳过：与平台明细行并存时防双计。"""
+    rows = [
+        {"平台": "小红书", "声量": 1000, "互动数": 800},
+        {"平台": "合计", "声量": 99999, "互动数": 99999},
+        {"平台": "全部", "声量": 88888},
+        {"平台": "总计", "声量": 66666},
+        {"平台": "all", "声量": 77777},
+    ]
+    steps = [
+        _step("step_1", TOOL_OVERVIEW, start="2026-06-01", end="2026-06-30", goal="current: 当期")
+    ]
+    notes = [_note("step_1", TOOL_OVERVIEW, _summary(rows))]
+
+    payload = assemble_brand_report(_plan(steps, notes), PARAMS)
+
+    assert payload.data.overview.total_mentions.current == 1000
+    assert payload.data.overview.total_interactions.current == 800
+    assert [item.platform for item in payload.data.overview.platforms] == ["xiaohongshu"]
+
+
 def test_truncated_or_unparseable_summary_ignored() -> None:
     # sanitize_evidence 超长截断后 summary 是非法 JSON 字符串：不得崩溃，按无数据处理。
     steps = [

@@ -8,8 +8,9 @@
   前缀优先；缺失时用 ``arguments`` 起止日期与 ``comparison_windows`` 结果精确
   匹配兜底；都判不出按 current 处理。
 - 轨迹 v1（agent_trajectory_v1）与 v2（agent_trajectory_v2，按 goal 分片）都
-  支持；v2 合并所有 goal 切片的证据——品牌章节只消费 insight 统计/原帖工具，
-  其他 goal 的 KOL 工具不会映射进品牌章节。
+  支持；v2 默认合并所有 goal 切片，调用方传 ``goal_id`` 时只恢复该切片——
+  品牌章节只消费 insight 统计/原帖工具，复合任务必须传 goal_id 防跨 goal
+  证据污染。
 - 对比期数值与环比/同比百分比全部由本模块按 data 计算，不依赖模型。
 - 轨迹 EvidenceNote 不携带采集时间戳：availability/sources 的 collected_at
   恒为 null（源级时间戳需关联 mcp_calls，超出组装器输入）。
@@ -166,6 +167,10 @@ class _Evidence(NamedTuple):
     summary: Any
 
 
+# 合计/汇总平台行（ canon 后）：overview 聚合时跳过，防与平台明细双计。
+_AGGREGATE_PLATFORM_NAMES = frozenset({"all", "全部", "合计", "总计"})
+
+
 # ---------------------------------------------------------------------------
 # 主入口
 # ---------------------------------------------------------------------------
@@ -176,11 +181,15 @@ def assemble_brand_report(
     goal_params: dict[str, Any],
     *,
     warning_code: str | None = None,
+    goal_id: str | None = None,
 ) -> BrandReportPayload:
     """settled 证据 → brand_report_v2（data+availability+query_spec+sources；narrative 留空）。
 
     综合概览最小证据（任一平台当期 overview 指标行）缺失时抛
     ``LookupError("no_evidence_collected")``（由 finalize 映射为构建失败）。
+    goal_id：v2 轨迹只恢复该 goal 的切片（切片缺失按空证据走同一门禁），
+    防止复合任务中其他 goal（如 kol_selection）的证据污染品牌章节；
+    v1 轨迹忽略该参数。
     """
     params = dict(goal_params) if isinstance(goal_params, dict) else {}
     brand = str(params.get("brand") or "").strip()
@@ -200,7 +209,7 @@ def assemble_brand_report(
             current_window = None
             windows = {}
 
-    settled, failed = _bucket_evidence(task_plan_json, current_window, windows)
+    settled, failed = _bucket_evidence(task_plan_json, current_window, windows, goal_id=goal_id)
 
     # ---- 综合概览（最小证据门禁） ----
     overview_ev = [e for e in settled if e.chapter == "overview"]
@@ -327,19 +336,26 @@ def assemble_brand_report(
 # ---------------------------------------------------------------------------
 
 
-def _restore_trajectory(plan_json: dict[str, Any] | None) -> AgentTrajectory:
-    """v1 直接恢复；v2 合并所有 goal 切片（step id 已按 g{seq}_ 命名空间隔离）。"""
+def _restore_trajectory(plan_json: dict[str, Any] | None, goal_id: str | None = None) -> AgentTrajectory:
+    """v1 直接恢复；v2 按 goal_id 取切片（None 合并所有切片，step id 已按 g{seq}_ 命名空间隔离）。"""
     if isinstance(plan_json, dict) and plan_json.get("schema") == "agent_trajectory_v2":
-        merged = AgentTrajectory()
         goals = plan_json.get("goals")
+        slices: list[Any] = []
         if isinstance(goals, dict):
-            for goal_slice in goals.values():
-                try:
-                    slice_trajectory = AgentTrajectory.model_validate(goal_slice)
-                except ValidationError:
-                    continue
-                merged.steps.extend(slice_trajectory.steps)
-                merged.results.extend(slice_trajectory.results)
+            if goal_id is None:
+                slices = list(goals.values())
+            else:
+                goal_slice = goals.get(goal_id)
+                if goal_slice is not None:
+                    slices = [goal_slice]
+        merged = AgentTrajectory()
+        for goal_slice in slices:
+            try:
+                slice_trajectory = AgentTrajectory.model_validate(goal_slice)
+            except ValidationError:
+                continue
+            merged.steps.extend(slice_trajectory.steps)
+            merged.results.extend(slice_trajectory.results)
         return merged
     return restore_agent_trajectory(plan_json)
 
@@ -348,8 +364,9 @@ def _bucket_evidence(
     plan_json: dict[str, Any] | None,
     current_window: tuple[date, date] | None,
     windows: dict[str, tuple[date, date]],
+    goal_id: str | None = None,
 ) -> tuple[list[_Evidence], list[_Evidence]]:
-    trajectory = _restore_trajectory(plan_json)
+    trajectory = _restore_trajectory(plan_json, goal_id)
     steps_by_id = {step.id: step for step in trajectory.steps}
     settled: list[_Evidence] = []
     failed: list[_Evidence] = []
@@ -411,7 +428,11 @@ def _period_kind(
 def _aggregate_overview(
     evidences: list[_Evidence],
 ) -> tuple[dict[str, dict[str, float | None]], dict[str, float | None]]:
-    """按平台合并 overview 行；同平台多行数值累加，缺失保持 None。"""
+    """按平台合并 overview 行；同平台多行数值累加，缺失保持 None。
+
+    合计/全部/总计/all 行（DataTap 常在明细后附合计行）跳过，防与平台行双计；
+    无平台键的行同样按 all 处理被跳过（无法归属平台的聚合行不参与分平台合并）。
+    """
     per_platform: dict[str, dict[str, float | None]] = {}
     split: dict[str, float | None] = {"positive": None, "neutral": None, "negative": None}
     metric_aliases = (
@@ -429,6 +450,8 @@ def _aggregate_overview(
             if not _has_any(raw, _MENTIONS_KEYS + _EXPOSURE_KEYS + _INTERACTIONS_KEYS):
                 continue
             platform = _canon_platform(_first(raw, _PLATFORM_KEYS))
+            if platform in _AGGREGATE_PLATFORM_NAMES:
+                continue
             slot = per_platform.setdefault(
                 platform, {"mentions": None, "exposure": None, "interactions": None}
             )

@@ -173,6 +173,21 @@ def test_collect_goal_evidence_empty_inputs() -> None:
     assert collect_goal_evidence("not-a-dict") == []
 
 
+def test_collect_goal_evidence_v2_filters_by_goal_id() -> None:
+    """v2 轨迹：goal_id 取对应切片（缺失为空）；None 合并所有切片。"""
+    plan = {
+        "schema": "agent_trajectory_v2",
+        "goals": {
+            "g1": {"steps": [], "results": [_note("tool.a", {"v": 1})]},
+            "g2": {"steps": [], "results": [_note("tool.b", {"v": 2})]},
+        },
+    }
+
+    assert [e["tool"] for e in collect_goal_evidence(plan, "g1")] == ["tool.a"]
+    assert collect_goal_evidence(plan, "missing") == []
+    assert [e["tool"] for e in collect_goal_evidence(plan)] == ["tool.a", "tool.b"]
+
+
 async def _create_session(db_session, user_factory) -> tuple[str, str]:
     user = await user_factory()
     now = datetime.now(UTC).replace(tzinfo=None)
@@ -365,6 +380,116 @@ async def test_run_brand_analysis_rejects_empty_evidence(db_session, user_factor
             session_id=session_id,
             task=task,
             goal=_goal({"brand": "海底捞"}),
+        )
+    assert model.requests == []
+
+
+@pytest.mark.asyncio
+async def test_run_brand_analysis_v2_uses_only_goal_slice(db_session, user_factory) -> None:
+    """v2 多 goal 轨迹：只组装本 goal 切片证据，kol 切片 raw_posts 不进入品牌章节。"""
+    user_id, session_id = await _create_session(db_session, user_factory)
+    model = FakeModel(_document())
+    plan = {
+        "schema": "agent_trajectory_v2",
+        "goals": {
+            "goal-brand": {"steps": [], "results": [_overview_note()]},
+            "goal-kol": {
+                "steps": [],
+                "results": [
+                    _note(
+                        "datatap.insight.query.raw.posts.v1",
+                        {"result": json.dumps([{"平台": "抖音", "作品ID": "k1", "标题": "KOL污染帖", "互动数": 9999}], ensure_ascii=False)},
+                    )
+                ],
+            },
+        },
+    }
+    task = _task(plan)
+    goal = SimpleNamespace(id="goal-brand", params_json={"brand": "海底捞"})
+
+    report = await run_brand_analysis(
+        db_session, model, user_id=user_id, session_id=session_id, task=task, goal=goal
+    )
+
+    payload = BrandReportPayload.model_validate(report.payload_json)
+    assert payload.data.overview.total_mentions.current == 1200.0
+    assert payload.data.top_posts == []
+    assert {entry.step_id for entry in payload.sources} == {"step_1"}
+
+
+@pytest.mark.asyncio
+async def test_run_brand_analysis_v2_missing_goal_slice_rejected(
+    db_session, user_factory
+) -> None:
+    """v2 轨迹中本 goal 切片缺失：按空证据走 no_evidence_collected。"""
+    user_id, session_id = await _create_session(db_session, user_factory)
+    model = FakeModel(_document())
+    plan = {
+        "schema": "agent_trajectory_v2",
+        "goals": {"goal-other": {"steps": [], "results": [_overview_note()]}},
+    }
+
+    with pytest.raises(LookupError, match="no_evidence_collected"):
+        await run_brand_analysis(
+            db_session,
+            model,
+            user_id=user_id,
+            session_id=session_id,
+            task=_task(plan),
+            goal=SimpleNamespace(id="goal-brand", params_json={"brand": "海底捞"}),
+        )
+    assert model.requests == []
+
+
+@pytest.mark.asyncio
+async def test_run_campaign_analysis_v2_uses_goal_slice(db_session, user_factory) -> None:
+    """campaign 路径同样按 goal 切片取证据：证据在本切片 → 构建成功。"""
+    user_id, session_id = await _create_session(db_session, user_factory)
+    model = FakeModel(_document())
+    plan = {
+        "schema": "agent_trajectory_v2",
+        "goals": {
+            "goal-campaign": {"steps": [], "results": [_note("tool.a", {"volume": 100})]},
+            "goal-brand": {"steps": [], "results": []},
+        },
+    }
+
+    report = await run_campaign_analysis(
+        db_session,
+        model,
+        user_id=user_id,
+        session_id=session_id,
+        task=_task(plan),
+        goal=SimpleNamespace(id="goal-campaign", params_json={"brand": "海底捞", "campaign": "618"}),
+    )
+
+    assert report.report_type == "campaign_analysis"
+    assert report.version == 1
+
+
+@pytest.mark.asyncio
+async def test_run_campaign_analysis_v2_empty_slice_rejected(db_session, user_factory) -> None:
+    """campaign 路径：证据只在其他 goal 切片时按无证据拒绝（不跨 goal 借用）。"""
+    user_id, session_id = await _create_session(db_session, user_factory)
+    model = FakeModel(_document())
+    plan = {
+        "schema": "agent_trajectory_v2",
+        "goals": {
+            "goal-brand": {"steps": [], "results": [_overview_note()]},
+            "goal-campaign": {"steps": [], "results": []},
+        },
+    }
+
+    with pytest.raises(LookupError, match="no_evidence_collected"):
+        await run_campaign_analysis(
+            db_session,
+            model,
+            user_id=user_id,
+            session_id=session_id,
+            task=_task(plan),
+            goal=SimpleNamespace(
+                id="goal-campaign", params_json={"brand": "海底捞", "campaign": "618"}
+            ),
         )
     assert model.requests == []
 

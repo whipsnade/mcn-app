@@ -42,15 +42,36 @@ from app.reporting.brand_payload import BrandReportPayload
 from app.reporting.models import AnalysisReport
 
 
-def collect_goal_evidence(task_plan_json: dict[str, Any] | None) -> list[dict[str, Any]]:
-    """从 plan_json（agent_trajectory_v1）提取 settled 证据并脱敏截断。
+def collect_goal_evidence(
+    task_plan_json: dict[str, Any] | None, goal_id: str | None = None
+) -> list[dict[str, Any]]:
+    """从 plan_json 提取 settled 证据并脱敏截断。
 
     返回 [{"tool": 内部工具名, "structured_content": 脱敏后的证据}]；
-    无轨迹或无 settled 证据返回 []。
+    无轨迹或无 settled 证据返回 []。v2 轨迹（agent_trajectory_v2，按 goal
+    分片）按 goal_id 取对应切片（切片缺失返回 []），goal_id 为 None 时合并
+    所有切片；v1 轨迹忽略 goal_id。
     """
     if not isinstance(task_plan_json, dict):
         return []
-    results = task_plan_json.get("results")
+    if task_plan_json.get("schema") == "agent_trajectory_v2":
+        goals = task_plan_json.get("goals")
+        if not isinstance(goals, dict):
+            return []
+        if goal_id is not None:
+            goal_slice = goals.get(goal_id)
+            if not isinstance(goal_slice, dict):
+                return []
+            return _settled_evidence(goal_slice.get("results"))
+        evidence: list[dict[str, Any]] = []
+        for goal_slice in goals.values():
+            if isinstance(goal_slice, dict):
+                evidence.extend(_settled_evidence(goal_slice.get("results")))
+        return evidence
+    return _settled_evidence(task_plan_json.get("results"))
+
+
+def _settled_evidence(results: Any) -> list[dict[str, Any]]:
     if not isinstance(results, list):
         return []
     evidence: list[dict[str, Any]] = []
@@ -94,7 +115,7 @@ async def _run_goal_analysis(
     thinking_sink: ThinkingSink | None = None,
     warning_code: str | None = None,
 ) -> AnalysisReport:
-    evidence = collect_goal_evidence(getattr(task, "plan_json", None))
+    evidence = collect_goal_evidence(getattr(task, "plan_json", None), getattr(goal, "id", None))
     if not evidence:
         raise LookupError("no_evidence_collected")
     params = getattr(goal, "params_json", None)
@@ -162,7 +183,10 @@ async def run_brand_analysis(
     """
     params = goal.params_json if isinstance(getattr(goal, "params_json", None), dict) else {}
     payload = assemble_brand_report(
-        getattr(task, "plan_json", None), params, warning_code=warning_code
+        getattr(task, "plan_json", None),
+        params,
+        warning_code=warning_code,
+        goal_id=getattr(goal, "id", None),
     )
     narrative = await build_brand_narrative(
         model,

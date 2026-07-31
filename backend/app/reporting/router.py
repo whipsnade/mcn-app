@@ -187,7 +187,9 @@ async def retry_analysis(
     target: tuple[AnalysisTask, TaskGoal] | None = None
     for goal in goals:
         task = await db.get(AnalysisTask, goal.task_id)
-        if task is not None and collect_goal_evidence(task.plan_json):
+        # 预检针对该 goal 的轨迹切片（v2 按 goal_id 取片，v1 取全量）；
+        # 组装器的 overview 门禁会把关证据充分性。
+        if task is not None and collect_goal_evidence(task.plan_json, goal.id):
             target = (task, goal)
             break
     if target is None:

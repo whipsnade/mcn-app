@@ -67,10 +67,7 @@ logger = logging.getLogger(__name__)
 
 def _goal_evidence(trajectory_json: Any, goal_id: str) -> list[dict]:
     """摘要证据：v2 轨迹按 goal_id 切片提取 settled results，v1 取全量。"""
-    if isinstance(trajectory_json, dict) and trajectory_json.get("schema") == "agent_trajectory_v2":
-        goal_slice = (trajectory_json.get("goals") or {}).get(goal_id) or {}
-        return collect_goal_evidence({"results": goal_slice.get("results") or []})
-    return collect_goal_evidence(trajectory_json)
+    return collect_goal_evidence(trajectory_json, goal_id)
 
 
 # goal_type → (artifact_type, 报告构建器, report.updated 事件 label, 失败占位标题)

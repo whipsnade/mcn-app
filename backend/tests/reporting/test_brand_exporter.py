@@ -378,6 +378,35 @@ def test_render_empty_trend_and_regions_no_charts_with_reason() -> None:
     ]
 
 
+# ---------- 热帖平台表头 / partial 受限说明 ----------
+
+
+def test_render_top_posts_platform_specific_headers() -> None:
+    """热帖表头按平台段切换：小红书段「阅读数/转发」，抖音段「播放数/分享」。"""
+    workbook = _load(render_brand_workbook(_payload()))
+    sheet = workbook["热门帖子TOP"]
+    # 小红书段表头（第 2 行）。
+    assert sheet.cell(2, 6).value == "阅读数"
+    assert sheet.cell(2, 10).value == "转发"
+    # 抖音段表头（标题第 6 行 → 表头第 7 行）。
+    assert sheet.cell(7, 6).value == "播放数"
+    assert sheet.cell(7, 10).value == "分享"
+
+
+def test_render_partial_chapter_reason_includes_missing_fields() -> None:
+    """partial 章节只填 missing_fields（无 reason）时，受限说明也要落到 Sheet。"""
+    payload = _payload()
+    payload.data.regions = []
+    payload.availability["regions"] = ChapterAvailability(
+        status="partial", missing_fields=["interactions"]
+    )
+    workbook = _load(render_brand_workbook(payload))
+    texts = _column_values(workbook["地域分布"])
+    assert any(
+        "数据受限" in text and "缺失字段：interactions" in text for text in texts
+    )
+
+
 # ---------- 热帖缺失字段 ----------
 
 

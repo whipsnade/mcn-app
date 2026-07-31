@@ -348,6 +348,138 @@ async def test_analysis_retry_without_evidence_returns_409(
 
 
 @pytest.mark.asyncio
+async def test_analysis_retry_v2_trajectory_uses_brand_goal_slice(
+    retry_client_factory, db_session: AsyncSession
+) -> None:
+    """v2 多 goal 轨迹：retry 预检与构建都按品牌 goal 切片取证据（200 且不被 kol 切片污染）。"""
+    client, user, session_id = await retry_client_factory()
+    now = datetime.now(UTC).replace(tzinfo=None)
+    message = Message(
+        id=str(uuid4()),
+        session_id=session_id,
+        user_id=user.id,
+        role="user",
+        content="分析品牌并圈选达人",
+        sequence=1,
+        metadata_json={},
+        created_at=now,
+    )
+    db_session.add(message)
+    await db_session.flush()
+    brand_goal_id = str(uuid4())
+    kol_goal_id = str(uuid4())
+    task = AnalysisTask(
+        id=str(uuid4()),
+        user_id=user.id,
+        session_id=session_id,
+        trigger_message_id=message.id,
+        status="completed",
+        kind="agent",
+        plan_json={
+            "schema": "agent_trajectory_v2",
+            "goals": {
+                brand_goal_id: {
+                    "steps": [],
+                    "results": [
+                        {
+                            "step_id": "g1_step_1",
+                            "tool": "datatap.insight.social.statistic.overview.v1",
+                            "status": "settled",
+                            "summary": {
+                                "result": json.dumps(
+                                    [{"平台": "小红书", "声量": 12345, "互动数": 8000}],
+                                    ensure_ascii=False,
+                                )
+                            },
+                        },
+                        {
+                            "step_id": "g1_step_2",
+                            "tool": "datatap.insight.query.raw.posts.v1",
+                            "status": "settled",
+                            "summary": {
+                                "result": json.dumps(
+                                    [{"平台": "小红书", "帖子ID": "x1", "标题": "品牌切片热帖", "互动数": 500}],
+                                    ensure_ascii=False,
+                                )
+                            },
+                        },
+                    ],
+                },
+                kol_goal_id: {
+                    "steps": [],
+                    "results": [
+                        {
+                            "step_id": "g2_step_1",
+                            "tool": "datatap.insight.query.raw.posts.v1",
+                            "status": "settled",
+                            "summary": {
+                                "result": json.dumps(
+                                    [{"平台": "抖音", "作品ID": "k1", "标题": "KOL污染帖", "互动数": 9999}],
+                                    ensure_ascii=False,
+                                )
+                            },
+                        },
+                        {
+                            "step_id": "g2_step_2",
+                            "tool": "datatap.insight.match.best.tag.v1",
+                            "status": "settled",
+                            "summary": {"result": json.dumps([{"标签名称": "海底捞"}], ensure_ascii=False)},
+                        },
+                    ],
+                },
+            },
+        },
+        max_calls=10,
+        estimated_points=0,
+        creation_order=1,
+        created_at=now,
+        updated_at=now,
+    )
+    db_session.add(task)
+    await db_session.flush()
+    db_session.add(
+        TaskGoal(
+            id=brand_goal_id,
+            task_id=task.id,
+            sequence=1,
+            goal_type="brand_analysis",
+            status="completed",
+            params_json={"brand": "海底捞"},
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    db_session.add(
+        TaskGoal(
+            id=kol_goal_id,
+            task_id=task.id,
+            sequence=2,
+            goal_type="kol_selection",
+            status="completed",
+            params_json={"brand": "海底捞"},
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    await db_session.flush()
+
+    response = await client.post(
+        f"/api/v1/sessions/{session_id}/analysis-retry",
+        json={"report_type": "brand_analysis"},
+    )
+
+    assert response.status_code == 200
+    row = await db_session.get(AnalysisReport, response.json()["id"])
+    assert row is not None
+    payload = BrandReportPayload.model_validate(row.payload_json)
+    # 热帖只来自品牌切片；kol 切片的标签匹配不得污染 query_spec。
+    assert [post.title for post in payload.data.top_posts] == ["品牌切片热帖"]
+    assert payload.query_spec.matched_tag is None
+    assert payload.query_spec.fallback_keyword == "海底捞"
+    assert payload.data.overview.total_mentions.current == 12345.0
+
+
+@pytest.mark.asyncio
 async def test_analysis_retry_legacy_evidence_without_overview_returns_409(
     retry_client_factory, db_session: AsyncSession
 ) -> None:
