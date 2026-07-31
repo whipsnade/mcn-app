@@ -272,6 +272,7 @@ function TopPostCard({ post }: { post: BrandReportTopPost }) {
       <div className="mt-1.5 flex items-center gap-2">
         <button
           type="button"
+          aria-expanded={expanded}
           onClick={() => setExpanded(value => !value)}
           className="text-[10px] font-semibold text-indigo-500 hover:text-indigo-600"
         >
@@ -442,11 +443,34 @@ function ChapterCard({ title, icon, availability, children }: {
   );
 }
 
+/**
+ * brand_report_v2 payload 运行时形状守卫：只查几个关键键（data.overview 对象、
+ * data.top_posts 数组、scope 对象、availability 对象的值含 missing_fields 数组），
+ * 不做全量校验。落库快照被截断/漂移时返回 false，调用方降级到旧 Block 渲染而非白屏。
+ */
+export function isBrandReportPayload(value: unknown): value is BrandReportPayload {
+  if (!value || typeof value !== 'object') return false;
+  const candidate = value as Partial<BrandReportPayload>;
+  const data = candidate.data;
+  if (!data || typeof data !== 'object') return false;
+  if (!data.overview || typeof data.overview !== 'object') return false;
+  if (!Array.isArray(data.top_posts)) return false;
+  if (!candidate.scope || typeof candidate.scope !== 'object') return false;
+  const availability = candidate.availability;
+  if (!availability || typeof availability !== 'object' || Array.isArray(availability)) return false;
+  return Object.values(availability).every(
+    entry => Boolean(entry) && typeof entry === 'object'
+      && Array.isArray((entry as BrandReportChapterAvailability).missing_fields),
+  );
+}
+
 export default function BrandReportView({ report }: { report: ApiAnalysisReport }) {
   const [activeChapter, setActiveChapter] = useState<ChapterKey>('overview');
   const sectionRefs = useRef<Partial<Record<ChapterKey, HTMLElement | null>>>({});
-  // 防御性：非 brand_report_v2 模板不信任 payload 形状（旧报告 payload 为 null）。
-  const payload = report.template_version === 'brand_report_v2' ? report.payload ?? null : null;
+  // 防御性：非 brand_report_v2 模板或形状不合格的 payload 走空态，不白屏。
+  const payload = report.template_version === 'brand_report_v2' && isBrandReportPayload(report.payload)
+    ? report.payload
+    : null;
   if (!payload) {
     return <p className="rounded-lg bg-slate-50 px-2.5 py-2 text-[11px] text-slate-400">报告内容为空</p>;
   }
@@ -490,6 +514,8 @@ export default function BrandReportView({ report }: { report: ApiAnalysisReport 
           key={key}
           id={`brand-chapter-${key}`}
           data-chapter={key}
+          // 导航 sticky top-0：锚点滚动到 block:'start' 时留出导航高度，避免章节标题被遮挡。
+          className="scroll-mt-10"
           ref={element => {
             sectionRefs.current[key] = element;
           }}

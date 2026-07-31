@@ -18,7 +18,7 @@ import type {
 } from '../api/contracts';
 import { createFavoriteByKey, deleteFavoriteByKey } from '../api/favorites';
 import FavoriteStar from './FavoriteStar';
-import BrandReportView from './BrandReportView';
+import BrandReportView, { isBrandReportPayload } from './BrandReportView';
 import KolSelectionDetailDialog from './KolSelectionDetailDialog';
 import { Card, formatExposure, formatNumber, MetricCard } from './reportPrimitives';
 import { useLoadingMessage } from '../hooks/useLoadingMessage';
@@ -596,10 +596,10 @@ function TypedReportPanel({ sessionId, reportType, summaryEntry, emptyText }: {
   const failedArtifact = summaryEntry?.latest_artifact?.status === 'failed'
     ? summaryEntry.latest_artifact
     : undefined;
-  // brand_report_v2 结构化快照才走章节式 BI 与模板导出；防御性：非 v2 模板不信任 payload 形状。
+  // brand_report_v2 结构化快照才走章节式 BI 与模板导出；形状不合格（截断/漂移）降级旧 Block 渲染。
   const isBrandV2 = reportType === 'brand_analysis'
     && report?.template_version === 'brand_report_v2'
-    && Boolean(report?.payload);
+    && isBrandReportPayload(report?.payload);
 
   const handleExportReport = async () => {
     if (!sessionId || !selectedReportId || exporting) return;
@@ -607,8 +607,9 @@ function TypedReportPanel({ sessionId, reportType, summaryEntry, emptyText }: {
     setExportError(undefined);
     try {
       await downloadBrandReport(sessionId, selectedReportId);
-    } catch {
-      setExportError('导出失败，请稍后重试');
+    } catch (reason) {
+      // 透传 server detail（如 report_not_found / EXPORT_RENDER_FAILED），无 detail 时给默认文案。
+      setExportError(reason instanceof Error && reason.message ? reason.message : '导出失败，请稍后重试');
     } finally {
       setExporting(false);
     }

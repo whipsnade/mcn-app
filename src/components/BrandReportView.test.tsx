@@ -152,16 +152,19 @@ describe('BrandReportView', () => {
     const title = within(topPosts).getByText(/海底捞隐藏吃法合集/);
     expect(title).toHaveClass('line-clamp-2');
     expect(within(topPosts).queryByRole('link')).not.toBeInTheDocument();
+    expect(within(topPosts).getByRole('button', { name: '展开' })).toHaveAttribute('aria-expanded', 'false');
 
     fireEvent.click(within(topPosts).getByRole('button', { name: '展开' }));
 
     expect(title).not.toHaveClass('line-clamp-2');
+    expect(within(topPosts).getByRole('button', { name: '收起' })).toHaveAttribute('aria-expanded', 'true');
     const link = within(topPosts).getByRole('link', { name: '查看原帖' });
     expect(link).toHaveAttribute('href', 'https://www.xiaohongshu.com/explore/xhs-1');
     expect(link).toHaveAttribute('target', '_blank');
 
     fireEvent.click(within(topPosts).getByRole('button', { name: '收起' }));
     expect(title).toHaveClass('line-clamp-2');
+    expect(within(topPosts).getByRole('button', { name: '展开' })).toHaveAttribute('aria-expanded', 'false');
   });
 
   it('scrolls to the chapter and marks it active from the anchor nav', () => {
@@ -202,5 +205,23 @@ describe('BrandReportView', () => {
     render(<BrandReportView report={analysisReportFixture({ template_version: null, payload: null })} />);
 
     expect(screen.getByText('报告内容为空')).toBeVisible();
+  });
+
+  it('falls back to an empty note instead of crashing when the payload shape is malformed', () => {
+    const malformed = {
+      ...brandReportPayloadFixture(),
+      data: { overview: null, top_posts: 'truncated' },
+    };
+    render(
+      <BrandReportView
+        report={analysisReportFixture({
+          template_version: 'brand_report_v2',
+          payload: malformed as unknown as BrandReportPayload,
+        })}
+      />,
+    );
+
+    expect(screen.getByText('报告内容为空')).toBeVisible();
+    expect(screen.queryByRole('navigation', { name: '报告章节' })).not.toBeInTheDocument();
   });
 });

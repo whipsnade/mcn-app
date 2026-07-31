@@ -1,7 +1,7 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { ApiAnalysisReport, ApiArtifactsSummary, ApiFavorite, ApiSessionReportItem } from '../api/contracts';
+import type { ApiAnalysisReport, ApiArtifactsSummary, ApiFavorite, ApiSessionReportItem, BrandReportPayload } from '../api/contracts';
 import { createFavoriteByKey, deleteFavoriteByKey } from '../api/favorites';
 import { downloadKolSelection, getKolSelection, getKolSelectionDetail, getKolTop10Trend, listSelectionSets, queryKolSelectionDetail, runKolAnalysis } from '../api/kolSelection';
 import { listSessionReports } from '../api/reports';
@@ -727,7 +727,7 @@ describe('UniversalReport', () => {
     await waitFor(() => expect(downloadBrandReport).toHaveBeenCalledWith('session-1', 'brand-report-v2'));
   });
 
-  it('shows an inline error when the brand report export fails', async () => {
+  it('passes the server detail through when the brand report export fails', async () => {
     const report = analysisReportFixture({
       id: 'brand-report-v2',
       report_type: 'brand_analysis',
@@ -739,13 +739,61 @@ describe('UniversalReport', () => {
       { report_id: 'brand-report-v2', title: '海底捞品牌分析', version: 1, scope: null, status: 'completed', created_at: '2026-07-30T10:00:00Z' },
     ]);
     vi.mocked(getAnalysisReport).mockResolvedValue(report);
-    vi.mocked(downloadBrandReport).mockRejectedValue(new Error('EXPORT_RENDER_FAILED'));
+    vi.mocked(downloadBrandReport).mockRejectedValue(new Error('report_not_found'));
+    render(<UniversalReport sessionId="session-1" selectionCount={0} />);
+
+    fireEvent.click(screen.getByRole('tab', { name: '品牌分析' }));
+    fireEvent.click(await screen.findByRole('button', { name: '导出报告' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('report_not_found');
+  });
+
+  it('falls back to a generic message when the export error carries no detail', async () => {
+    const report = analysisReportFixture({
+      id: 'brand-report-v2',
+      report_type: 'brand_analysis',
+      title: '海底捞品牌分析',
+      template_version: 'brand_report_v2',
+      payload: brandReportPayloadFixture(),
+    });
+    vi.mocked(listSessionReports).mockResolvedValue([
+      { report_id: 'brand-report-v2', title: '海底捞品牌分析', version: 1, scope: null, status: 'completed', created_at: '2026-07-30T10:00:00Z' },
+    ]);
+    vi.mocked(getAnalysisReport).mockResolvedValue(report);
+    vi.mocked(downloadBrandReport).mockRejectedValue(new Error(''));
     render(<UniversalReport sessionId="session-1" selectionCount={0} />);
 
     fireEvent.click(screen.getByRole('tab', { name: '品牌分析' }));
     fireEvent.click(await screen.findByRole('button', { name: '导出报告' }));
 
     expect(await screen.findByRole('alert')).toHaveTextContent('导出失败，请稍后重试');
+  });
+
+  it('degrades to legacy blocks with the export hint when the v2 payload shape is malformed', async () => {
+    const malformed = {
+      ...brandReportPayloadFixture(),
+      data: { overview: {}, top_posts: null },
+    };
+    const report = analysisReportFixture({
+      id: 'brand-report-v2',
+      report_type: 'brand_analysis',
+      title: '海底捞品牌分析',
+      template_version: 'brand_report_v2',
+      payload: malformed as unknown as BrandReportPayload,
+    });
+    vi.mocked(listSessionReports).mockResolvedValue([
+      { report_id: 'brand-report-v2', title: '海底捞品牌分析', version: 1, scope: { brand: '海底捞' }, status: 'completed', created_at: '2026-07-30T10:00:00Z' },
+    ]);
+    vi.mocked(getAnalysisReport).mockResolvedValue(report);
+    render(<UniversalReport sessionId="session-1" selectionCount={0} />);
+
+    fireEvent.click(screen.getByRole('tab', { name: '品牌分析' }));
+
+    // 不白屏：降级到旧 Block 渲染 + 不支持模板导出提示。
+    expect(await screen.findByText('一、核心结论')).toBeVisible();
+    expect(screen.getByText('该历史版本不支持模板导出')).toBeVisible();
+    expect(screen.queryByRole('navigation', { name: '报告章节' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '导出报告' })).not.toBeInTheDocument();
   });
 
   it('falls back to block rendering with a template-export hint for legacy brand reports', async () => {
