@@ -46,8 +46,9 @@ def test_brand_loop_prompt_declares_tool_call_contract() -> None:
     text = BRAND_ANALYSIS_LOOP_PROMPT.system
 
     assert BRAND_ANALYSIS_LOOP_PROMPT.name == "brand_loop_v1"
-    # brand_loop_v1 于 2026-07-31 升级 v2：对比期阶段（环比/同比）与期别标注。
-    assert BRAND_ANALYSIS_LOOP_PROMPT.version == "2"
+    # brand_loop_v1 于 2026-07-31 升级 v3：失败不得整体收尾、趋势单平台查询
+    # （v2：对比期阶段与期别标注）。
+    assert BRAND_ANALYSIS_LOOP_PROMPT.version == "3"
     # 对比期由 comparison_mode 与 period 决定；无有效 period 时不得猜测对比窗。
     assert "comparison_mode" in text
     assert "mom_yoy" in text
@@ -59,6 +60,9 @@ def test_brand_loop_prompt_declares_tool_call_contract() -> None:
     assert "yoy:" in text
     # 期别无关的调用（如标签匹配）标注 current:。
     assert "期别无关" in text
+    # 工具失败不得整体收尾；趋势按单平台逐个调用。
+    assert "不得触发整体收尾" in text
+    assert "datasource 每次只传一个平台" in text
     # internal_tool_name 是顶层必填字段，禁止嵌进 arguments。
     assert "internal_tool_name 是 call_tool 决策的顶层必填字段" in text
     assert "禁止嵌进 arguments" in text
@@ -66,11 +70,12 @@ def test_brand_loop_prompt_declares_tool_call_contract() -> None:
     assert "完整的 internal_tool_name 时才输出 call_tool" in text
     assert "证据不足" in text
     assert "不得输出空工具调用" in text
-    # 阶段工具顺序提示：①品牌标签匹配 → ②概览 → ③趋势 → ④可选话题/受众。
+    # 阶段工具顺序提示：①品牌标签匹配 → ②概览 → ③对比期 → ④趋势 → ⑤情感/话题/受众/热帖。
     assert "①品牌标签匹配" in text
     assert "②整体概览" in text
-    assert "③趋势分析" in text
-    assert "④可选的热门话题与受众画像" in text
+    assert "③对比期" in text
+    assert "④趋势分析" in text
+    assert "⑤情感明细/热门话题/受众画像/热门帖子" in text
     # 「趋势分析」优先调用 social.statistic.trend。
     assert "趋势分析" in text
     assert "social.statistic.trend" in text

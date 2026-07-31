@@ -524,14 +524,23 @@ def test_missing_dimension_chapter_unavailable_and_warning_merged() -> None:
     assert payload.availability["methodology"].status == "complete"
 
 
-def test_missing_sentiment_degrades_insights() -> None:
+def test_missing_sentiment_falls_back_to_overview_split() -> None:
+    """无情感明细工具证据时，情感章节用 overview 汇总构成兜底（partial 而非 unavailable）。"""
     plan = _complete_plan()
     plan["steps"] = [step for step in plan["steps"] if step["id"] != "step_6"]
     plan["results"] = [note for note in plan["results"] if note["step_id"] != "step_6"]
     payload = assemble_brand_report(plan, PARAMS)
-    assert payload.availability["sentiment"].status == "unavailable"
-    assert payload.availability["sentiment"].reason == "no_evidence"
-    # insights：top_posts 仍有证据 → 随缺失字段降级为 partial
+    availability = payload.availability["sentiment"]
+    assert availability.status == "partial"
+    assert availability.reason == "情感明细未采集，构成来自综合概览汇总"
+    assert set(availability.missing_fields) == {"platform_breakdown", "interactions"}
+    rows = payload.data.sentiment.rows
+    assert {row.platform for row in rows} == {"all"}
+    positive = next(row for row in rows if row.sentiment == "正面")
+    assert positive.mentions == 1800
+    assert positive.interactions is None
+    assert positive.share_pct == 60.0
+    # insights：sentiment 兜底有证据 + top_posts 有证据 → partial
     assert payload.availability["insights"].status == "partial"
     assert payload.data_status == "partial"
 
@@ -684,6 +693,9 @@ def test_overview_aggregate_only_rows_are_used() -> None:
     assert split.positive == 23817
     assert split.negative == 6328
     assert split.neutral == 126293
+    # 情感章节兜底：overview 汇总构成生成 platform="all" 的情感行（partial 而非 unavailable）。
+    assert payload.availability["sentiment"].status == "partial"
+    assert {row.sentiment for row in payload.data.sentiment.rows} == {"正面", "中性", "负面"}
 
 
 def test_truncated_or_unparseable_summary_ignored() -> None:

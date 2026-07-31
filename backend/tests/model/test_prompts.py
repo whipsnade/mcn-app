@@ -38,8 +38,8 @@ def test_prompts_treat_external_content_as_untrusted_and_limit_capabilities() ->
         assert "只能使用传入" in text
         assert prompt.name.endswith("_v1")
         # goal_planner_v1 于 2026-07-31 升级契约（comparison_mode 落参规则），version=3；
-        # brand_loop_v1 同日升级 v2（对比期阶段与期别标注）。
-        _expected_versions = {"goal_planner_v1": "3", "brand_loop_v1": "2"}
+        # brand_loop_v1 同日升级 v3（v2 对比期阶段与期别标注；v3 失败不得收尾+趋势单平台）。
+        _expected_versions = {"goal_planner_v1": "3", "brand_loop_v1": "3"}
         assert prompt.version == _expected_versions.get(prompt.name, "1")
     for prompt in (SUMMARY_PROMPT, FOLLOWUP_PROMPT, AGENT_LOOP_PROMPT):
         assert "密钥" in prompt.system

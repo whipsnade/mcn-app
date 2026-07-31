@@ -482,7 +482,7 @@ async def test_agent_loop_injects_called_tools_and_evidence_gaps_into_round_cont
     first, second = decider.contexts
     # 首轮无 settled 证据：called_tools 为空，阶段缺口完整。
     assert first.called_tools == ()
-    assert first.evidence_gaps == ("标签匹配", "概览", "趋势", "话题", "受众")
+    assert first.evidence_gaps == ("标签匹配", "概览", "趋势", "情感", "话题", "受众与地域", "热帖")
     # 第二轮：概览已 settled，evidence_gaps 中移除「概览」。
     assert second.called_tools == (_TOOL_NAME,)
     assert "概览" not in second.evidence_gaps

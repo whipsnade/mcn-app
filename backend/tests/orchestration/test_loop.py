@@ -188,17 +188,25 @@ def test_build_loop_state_brand_gaps_subtract_covered_stages() -> None:
 
     _called, gaps = build_loop_state("brand_analysis", notes)
 
-    # 标签匹配/概览/趋势已覆盖；话题与受众未映射到任何已调用工具，保留。
-    assert gaps == ("话题", "受众")
+    # 标签匹配/概览/趋势已覆盖；情感/话题/受众与地域/热帖未映射到任何已调用工具，保留。
+    assert gaps == ("情感", "话题", "受众与地域", "热帖")
 
 
 def test_build_loop_state_unmapped_tools_keep_all_brand_stages() -> None:
     called, gaps = build_loop_state(
+        "brand_analysis", [_note("datatap.insight.query.kol.detail.v1")]
+    )
+
+    assert called == ("datatap.insight.query.kol.detail.v1",)
+    assert gaps == ("标签匹配", "概览", "趋势", "情感", "话题", "受众与地域", "热帖")
+
+
+def test_build_loop_state_raw_posts_covers_top_posts_stage() -> None:
+    _called, gaps = build_loop_state(
         "brand_analysis", [_note("datatap.insight.query.raw.posts.v1")]
     )
 
-    assert called == ("datatap.insight.query.raw.posts.v1",)
-    assert gaps == ("标签匹配", "概览", "趋势", "话题", "受众")
+    assert "热帖" not in gaps
 
 
 def test_build_loop_state_non_brand_goal_has_no_stage_gaps() -> None:
@@ -212,7 +220,7 @@ def test_build_loop_state_empty_notes() -> None:
     called, gaps = build_loop_state("brand_analysis", [])
 
     assert called == ()
-    assert gaps == ("标签匹配", "概览", "趋势", "话题", "受众")
+    assert gaps == ("标签匹配", "概览", "趋势", "情感", "话题", "受众与地域", "热帖")
 
 
 def test_trajectory_has_no_call_count_cap() -> None:

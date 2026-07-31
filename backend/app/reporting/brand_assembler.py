@@ -238,6 +238,12 @@ def assemble_brand_report(
     sentiment_rows, sentiment_contrib = _build_sentiment(
         [e for e in settled if e.chapter in ("analysis", "overview") and e.kind == "current"]
     )
+    # 情感兜底：无情感明细工具证据时，用 overview 汇总的正面/中性/负面构成
+    # （platform="all"、互动数不可得），避免 overview 已有构成却显示「未采集」。
+    sentiment_fallback = False
+    if not sentiment_rows:
+        sentiment_rows = _sentiment_rows_from_split(split)
+        sentiment_fallback = bool(sentiment_rows)
     dimension_ev = [
         e for e in settled if e.chapter in ("analysis", "topics") and e.kind == "current"
     ]
@@ -284,6 +290,7 @@ def assemble_brand_report(
         sentiment_rows=sentiment_rows,
         sentiment_tools=[e.tool for e in sentiment_contrib],
         sentiment_failed=any(e.chapter == "analysis" for e in failed),
+        sentiment_fallback=sentiment_fallback,
         daily_trend=daily_trend,
         trend_tools=[e.tool for e in trend_contrib],
         trend_failed=any(e.chapter == "trend" for e in failed),
@@ -663,6 +670,34 @@ def _build_sentiment(evidences: list[_Evidence]) -> tuple[list[SentimentRow], li
     return rows, contributing
 
 
+def _sentiment_rows_from_split(split: dict[str, float | None]) -> list[SentimentRow]:
+    """overview 汇总情感构成的兜底行：正面/中性/负面各一行（platform="all"）。
+
+    仅在没有任何情感明细工具证据时使用；互动数不可得（None），占比按已知构成计算。
+    """
+    labeled = (
+        ("positive", "正面"),
+        ("neutral", "中性"),
+        ("negative", "负面"),
+    )
+    values = [(label, split.get(key)) for key, label in labeled]
+    known = [value for _, value in values if value is not None]
+    if not known:
+        return []
+    total = sum(known)
+    return [
+        SentimentRow(
+            platform="all",
+            sentiment=label,
+            mentions=value,
+            interactions=None,
+            share_pct=round(value / total * 100, 2) if total else None,
+        )
+        for label, value in values
+        if value is not None
+    ]
+
+
 def _build_share_rows(
     evidences: list[_Evidence],
     label_keys: tuple[str, ...],
@@ -901,6 +936,7 @@ def _build_availability(
     sentiment_rows: list[SentimentRow],
     sentiment_tools: list[str],
     sentiment_failed: bool,
+    sentiment_fallback: bool,
     daily_trend: DailyTrendSection,
     trend_tools: list[str],
     trend_failed: bool,
@@ -927,6 +963,14 @@ def _build_availability(
     if not sentiment_rows:
         availability["sentiment"] = _chapter(
             "unavailable", reason=_unavailable_reason(sentiment_failed)
+        )
+    elif sentiment_fallback:
+        # 兜底行来自 overview 汇总构成：无平台明细、无互动数。
+        availability["sentiment"] = _chapter(
+            "partial",
+            missing=["platform_breakdown", "interactions"],
+            reason="情感明细未采集，构成来自综合概览汇总",
+            tools=overview_tools,
         )
     else:
         missing: list[str] = []

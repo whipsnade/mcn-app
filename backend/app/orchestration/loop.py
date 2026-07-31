@@ -186,15 +186,18 @@ class EvidenceNote(BaseModel):
 
 
 # 循环状态注入（called_tools / evidence_gaps）：brand 分析的静态阶段清单，
-# 阶段是否已覆盖按已调用工具名的子串映射判断；映射不到的阶段保留在
-# evidence_gaps 中提示模型补采。
-BRAND_ANALYSIS_STAGES: tuple[str, ...] = ("标签匹配", "概览", "趋势", "话题", "受众")
+# 与 brand_report_v2 模板章节对齐（概览/趋势/情感/话题/受众与地域/热帖 +
+# 前置标签匹配）；阶段是否已覆盖按已调用工具名的子串映射判断，映射不到
+# 的阶段保留在 evidence_gaps 中提示模型补采。
+BRAND_ANALYSIS_STAGES: tuple[str, ...] = ("标签匹配", "概览", "趋势", "情感", "话题", "受众与地域", "热帖")
 _STAGE_TOOL_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("标签匹配", ("best.tag", "best_tag", "mentions_tag", "tag_match")),
     ("概览", ("overview",)),
     ("趋势", ("trend",)),
+    ("情感", ("query.analysis", "query_analysis")),
     ("话题", ("hot.topic", "hot_topic", "topic")),
-    ("受众", ("user.profile", "user_profile", "audience")),
+    ("受众与地域", ("user.profile", "user_profile", "audience")),
+    ("热帖", ("raw.posts", "raw_posts")),
 )
 _GOAL_STAGES: dict[str, tuple[str, ...]] = {
     "brand_analysis": BRAND_ANALYSIS_STAGES,
