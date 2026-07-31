@@ -656,6 +656,37 @@ def test_overview_skips_aggregate_rows() -> None:
     assert [item.platform for item in payload.data.overview.platforms] == ["xiaohongshu"]
 
 
+def test_overview_aggregate_only_rows_are_used() -> None:
+    """上游只返回聚合行（无平台键的合计记录）时，聚合行是唯一数据，必须使用。
+
+    真实案例（2026-07-31 蔚来任务）：多数据源 overview 返回单条无平台键的
+    合计行，全部被跳过会误报 no_evidence_collected。
+    """
+    rows = [
+        {
+            "声量": 156438,
+            "互动数": 12283794,
+            "正面声量数": 23817,
+            "负面声量数": 6328,
+            "中性声量数": 126293,
+        }
+    ]
+    steps = [
+        _step("step_1", TOOL_OVERVIEW, start="2026-06-01", end="2026-06-30", goal="current: 当期")
+    ]
+    notes = [_note("step_1", TOOL_OVERVIEW, _summary(rows))]
+
+    payload = assemble_brand_report(_plan(steps, notes), PARAMS)
+
+    assert payload.data.overview.total_mentions.current == 156438
+    assert payload.data.overview.total_interactions.current == 12283794
+    assert [item.platform for item in payload.data.overview.platforms] == ["all"]
+    split = payload.data.overview.sentiment_split
+    assert split.positive == 23817
+    assert split.negative == 6328
+    assert split.neutral == 126293
+
+
 def test_truncated_or_unparseable_summary_ignored() -> None:
     # sanitize_evidence 超长截断后 summary 是非法 JSON 字符串：不得崩溃，按无数据处理。
     steps = [

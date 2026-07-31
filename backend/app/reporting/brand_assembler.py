@@ -135,9 +135,9 @@ _PLATFORM_KEYS = ("平台", "platform", "媒体", "媒介", "datasource", "数�
 _MENTIONS_KEYS = ("声量", "品牌声量", "品牌提及量", "发帖数", "帖子数", "brand_mentions", "volume")
 _EXPOSURE_KEYS = ("曝光量", "曝光数", "曝光", "阅读数", "播放数", "播放量", "exposure")
 _INTERACTIONS_KEYS = ("互动数", "互动量", "互动", "interactions")
-_POSITIVE_KEYS = ("正面声量", "正面", "positive")
-_NEUTRAL_KEYS = ("中性声量", "中性", "neutral")
-_NEGATIVE_KEYS = ("负面声量", "负面", "negative")
+_POSITIVE_KEYS = ("正面声量数", "正面声量", "正面", "positive")
+_NEUTRAL_KEYS = ("中性声量数", "中性声量", "中性", "neutral")
+_NEGATIVE_KEYS = ("负面声量数", "负面声量", "负面", "negative")
 _DATE_KEYS = ("日期", "时间", "date", "published_at")
 _SENTIMENT_KEYS = ("情感", "内容情感", "情绪", "sentiment")
 _REGION_KEYS = ("地区", "省份", "地域", "region", "province")
@@ -430,9 +430,22 @@ def _aggregate_overview(
 ) -> tuple[dict[str, dict[str, float | None]], dict[str, float | None]]:
     """按平台合并 overview 行；同平台多行数值累加，缺失保持 None。
 
-    合计/全部/总计/all 行（DataTap 常在明细后附合计行）跳过，防与平台行双计；
-    无平台键的行同样按 all 处理被跳过（无法归属平台的聚合行不参与分平台合并）。
+    合计/全部/总计/all 行（DataTap 常在明细后附合计行）在存在具名平台行时跳过，
+    防与平台行双计；但上游只返回聚合行（单条无平台键的合计记录，如多数据源
+    合并统计）时，聚合行就是唯一数据，改为使用聚合行（归入 "all" 平台）。
     """
+    named_rows: list[tuple[str, dict]] = []
+    aggregate_rows: list[tuple[str, dict]] = []
+    for evidence in evidences:
+        for raw in _iter_rows(evidence.summary):
+            if not _has_any(raw, _MENTIONS_KEYS + _EXPOSURE_KEYS + _INTERACTIONS_KEYS):
+                continue
+            platform = _canon_platform(_first(raw, _PLATFORM_KEYS))
+            if platform in _AGGREGATE_PLATFORM_NAMES:
+                aggregate_rows.append((platform, raw))
+            else:
+                named_rows.append((platform, raw))
+    rows_to_use = named_rows if named_rows else aggregate_rows
     per_platform: dict[str, dict[str, float | None]] = {}
     split: dict[str, float | None] = {"positive": None, "neutral": None, "negative": None}
     metric_aliases = (
@@ -445,24 +458,18 @@ def _aggregate_overview(
         ("neutral", _NEUTRAL_KEYS),
         ("negative", _NEGATIVE_KEYS),
     )
-    for evidence in evidences:
-        for raw in _iter_rows(evidence.summary):
-            if not _has_any(raw, _MENTIONS_KEYS + _EXPOSURE_KEYS + _INTERACTIONS_KEYS):
-                continue
-            platform = _canon_platform(_first(raw, _PLATFORM_KEYS))
-            if platform in _AGGREGATE_PLATFORM_NAMES:
-                continue
-            slot = per_platform.setdefault(
-                platform, {"mentions": None, "exposure": None, "interactions": None}
-            )
-            for metric, aliases in metric_aliases:
-                value = _num(_first(raw, aliases))
-                if value is not None:
-                    slot[metric] = (slot[metric] or 0.0) + value
-            for name, aliases in split_aliases:
-                value = _num(_first(raw, aliases))
-                if value is not None:
-                    split[name] = (split[name] or 0.0) + value
+    for platform, raw in rows_to_use:
+        slot = per_platform.setdefault(
+            platform, {"mentions": None, "exposure": None, "interactions": None}
+        )
+        for metric, aliases in metric_aliases:
+            value = _num(_first(raw, aliases))
+            if value is not None:
+                slot[metric] = (slot[metric] or 0.0) + value
+        for name, aliases in split_aliases:
+            value = _num(_first(raw, aliases))
+            if value is not None:
+                split[name] = (split[name] or 0.0) + value
     return per_platform, split
 
 
