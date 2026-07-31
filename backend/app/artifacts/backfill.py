@@ -10,7 +10,7 @@ from uuid import uuid4
 
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, defer
 
 from app.artifacts.models import TaskArtifact
 from app.reporting.models import AnalysisReport
@@ -134,7 +134,14 @@ def _backfill_selection_sets(session: Session, stats: BackfillStats, now: dateti
 def _backfill_report_artifacts(
     session: Session, stats: BackfillStats, now: datetime, existing_keys: set[str]
 ) -> None:
-    reports = session.scalars(select(AnalysisReport)).all()
+    # payload_json/template_version 由迁移 0026 新增：本回填随 0023 执行时两列尚不存在，
+    # defer 使其不进 SELECT 字段列表，保证旧库迁移链路可用；回填本身不读这些列。
+    reports = session.scalars(
+        select(AnalysisReport).options(
+            defer(AnalysisReport.payload_json),
+            defer(AnalysisReport.template_version),
+        )
+    ).all()
     for report in reports:
         artifact_key = f"{LEGACY_ARTIFACT_KEY_PREFIX}{report.id}:kol_report"
         if artifact_key in existing_keys:
