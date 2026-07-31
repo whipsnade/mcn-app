@@ -1,8 +1,9 @@
 import { expect, test } from '@playwright/test';
 
 
-// 品牌含文件名非法字符（/ : * ? " < > |），后端导出会按 sanitize_report_filename 剔除，
-// mock 的 Content-Disposition 直接给清洗后的文件名，断言前端解码还原。
+// 品牌含文件名非法字符（/ : * ? " < > |），后端导出会按 sanitize_report_filename 剔除。
+// sanitize 规则本身由后端单测覆盖，此处仅验证前端对 Content-Disposition 的解码还原：
+// mock 直接给清洗后的文件名，断言 suggestedFilename 与之一致。
 const EXPORT_FILENAME = '海底捞火锅2026_品牌社媒分析报告_2026-06-01-2026-06-30_v2.xlsx';
 
 // brand_report_v2 简化快照（形状参照 src/test/fixtures.ts 的 brandReportPayloadFixture）：
@@ -142,7 +143,9 @@ const brandPayloadV2 = {
 const reportV2 = {
   id: 'brand-report-v2', task_id: 'task-brand', report_type: 'brand_analysis',
   scope: { brand: '海底捞' },
-  version: 2, title: '海底捞品牌社媒分析报告', blocks: [], conclusion: null,
+  version: 2, title: '海底捞品牌社媒分析报告', conclusion: null,
+  // 真实 v2 报告必落非空兼容 blocks（旧渲染路径降级用），mock 保持一致。
+  blocks: [{ type: 'markdown', text: '兼容旧渲染的降级块。' }],
   status: 'completed', generated_at: '2026-07-30T10:00:00Z',
   template_version: 'brand_report_v2', payload: brandPayloadV2,
 };
@@ -202,7 +205,6 @@ test('brand report switches versions, shows restricted chapters and downloads th
   await page.route('**/api/v1/sessions', route => route.fulfill({ json: [session] }));
   await page.route('**/api/v1/sessions/session-brand/artifacts/summary', route => route.fulfill({ json: artifactsSummary }));
   await page.route('**/api/v1/sessions/session-brand/artifact-read-state', route => route.fulfill({ status: 200, json: {} }));
-  // 先注册版本列表，后注册导出（路由按注册逆序匹配，导出优先）。
   await page.route(
     url => url.pathname === '/api/v1/sessions/session-brand/reports'
       && url.searchParams.get('report_type') === 'brand_analysis',
@@ -223,7 +225,10 @@ test('brand report switches versions, shows restricted chapters and downloads th
 
   await page.reload();
   const mobileNavigation = page.getByRole('navigation', { name: '移动工作区导航' });
-  if (await mobileNavigation.isVisible()) {
+  // 移动导航 xl 断点（1280px）以下才可见：按视口判定后确定性等待其出现再点击，
+  // 避免 reload 后渲染未完的非等待探测竞态。
+  if ((page.viewportSize()?.width ?? 1440) < 1280) {
+    await expect(mobileNavigation).toBeVisible();
     await mobileNavigation.getByRole('button', { name: '分析报告' }).click();
   }
 
