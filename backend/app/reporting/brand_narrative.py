@@ -1,6 +1,7 @@
 """brand_report_v2 叙事层：结构化数据唯一输入的模型撰写（Task 5）。
 
-模型输入只有 payload.data 与 payload.availability（JSON）——data 是唯一数值
+模型输入只有 payload.scope/query_spec/data/availability（JSON）——scope 与
+query_spec 提供主语、时间窗与数据截至日（无数值指标），data 仍是唯一数值
 事实来源；原始证据与 sources（内部 step_id）不进 prompt。输出经
 BrandReportNarrative 校验，异常（ModelPlanInvalidError）直接上抛，由调用方
 走失败 Artifact 路径。BrandReportNarrative 模型定义在 brand_payload.py
@@ -31,6 +32,8 @@ async def build_brand_narrative(
     经 complete_json 统一出口落 model_prompt_logs。
     """
     content = {
+        "scope": payload.scope.model_dump(mode="json"),
+        "query_spec": payload.query_spec.model_dump(mode="json"),
         "data": payload.data.model_dump(mode="json"),
         "availability": {
             chapter: availability.model_dump(mode="json")

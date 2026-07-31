@@ -256,7 +256,7 @@ class BrandReportNarrative(BaseModel):
     expansion_signals: list[str] = Field(default_factory=list)  # 扩张信号
     noise_notes: str | None = None  # 噪音说明
     key_findings: list[str] = Field(default_factory=list)  # 情感关键发现
-    conclusion: str = ""  # AI 结论
+    conclusion: str = Field(min_length=1)  # AI 结论（必填非空）
     recommendations: list[str] = Field(default_factory=list)  # 结论与建议
 
 

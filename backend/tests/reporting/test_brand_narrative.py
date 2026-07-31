@@ -98,11 +98,14 @@ async def test_model_input_only_contains_data_and_availability() -> None:
     assert request.messages[0].role == "system"
     content = request.messages[-1].content
     user = json.loads(content)
-    # 模型输入只有 data + availability 两键：不含原始 evidence、不含 sources 内部 step_id。
-    assert set(user) == {"data", "availability"}
+    # 模型输入只有 scope/query_spec/data/availability 四键：不含原始 evidence、
+    # 不含 sources 内部 step_id；scope/query_spec 提供主语与时间窗（无数值指标）。
+    assert set(user) == {"scope", "query_spec", "data", "availability"}
     assert "evidence" not in user
     assert "sources" not in user
     assert "step_id" not in content
+    assert user["scope"]["brand"] == "肯德基"
+    assert user["query_spec"]["matched_tag"] == "肯德基"
     assert user["data"]["overview"]["total_mentions"]["current"] == 1000.0
     assert set(user["availability"]) == set(ALL_CHAPTERS)
 
@@ -133,6 +136,15 @@ async def test_extra_field_in_model_output_raises_validation_error() -> None:
 @pytest.mark.asyncio
 async def test_invalid_impact_level_raises_validation_error() -> None:
     output = {**_valid_output(), "impact_level": "严重"}
+    model = FakeModel([output])
+
+    with pytest.raises(ModelPlanInvalidError, match="MODEL_PLAN_INVALID"):
+        await build_brand_narrative(model, _payload(), log_context={})
+
+
+@pytest.mark.asyncio
+async def test_empty_conclusion_raises_validation_error() -> None:
+    output = {**_valid_output(), "conclusion": ""}
     model = FakeModel([output])
 
     with pytest.raises(ModelPlanInvalidError, match="MODEL_PLAN_INVALID"):
