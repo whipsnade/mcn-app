@@ -360,7 +360,7 @@ export function useWorkspace(userId?: string) {
     } : session));
     try {
       if (activeSession && !isBrainstormProfileReady(activeSession)) {
-        // 画像未 ready：走 brainstorm 澄清，同步请求-响应，ready 后直接绑定已创建的任务。
+        // 画像未 ready：走 brainstorm 澄清；ready 后可能绑定已创建任务，也可能继续接收 Planner 澄清。
         setIsClarifying(true);
         let response;
         try {

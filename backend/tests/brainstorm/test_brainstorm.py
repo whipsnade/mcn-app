@@ -1192,6 +1192,23 @@ def _ready_brainstorm_model() -> FakeBrainstormModel:
     )
 
 
+def _ready_brand_brainstorm_model() -> FakeBrainstormModel:
+    return FakeBrainstormModel(
+        [
+            BrainstormModelOutput(
+                ready=True,
+                assistant_message="信息已齐，开始分析。",
+                extracted=BrainstormProfile(
+                    brand="蓉李记",
+                    category="餐饮美食",
+                    platforms=["xiaohongshu", "douyin"],
+                    goal="品牌声量与情感分析",
+                ),
+            )
+        ]
+    )
+
+
 @pytest.mark.asyncio
 async def test_brainstorm_ready_plan_execute_creates_brand_analysis_goal(
     auth_client_factory, db_session, monkeypatch
@@ -1208,7 +1225,7 @@ async def test_brainstorm_ready_plan_execute_creates_brand_analysis_goal(
     client = await auth_client_factory("13900000021")
     created = await client.post("/api/v1/sessions", json={})
     session_id = created.json()["id"]
-    _install_model(monkeypatch, _ready_brainstorm_model())
+    _install_model(monkeypatch, _ready_brand_brainstorm_model())
     _share_session_factory(monkeypatch, db_session)
 
     response = await client.post(
@@ -1270,10 +1287,10 @@ async def test_brainstorm_ready_plan_multi_goal_persists_dependency(
 
 
 @pytest.mark.asyncio
-async def test_brainstorm_ready_plan_clarify_falls_back_to_kol_selection(
+async def test_brainstorm_ready_plan_clarify_does_not_create_default_kol_task(
     auth_client_factory, db_session, monkeypatch
 ) -> None:
-    """brainstorm 已判定 ready，planner clarify 不回问，按默认 kol_selection 建任务。"""
+    """Planner 要求补充分析条件时，只追问，不得默认创建达人圈选任务。"""
     monkeypatch.setattr(get_settings(), "goal_planner_enforce_enabled", True)
 
     async def fake_plan(self, context, **_kwargs):
@@ -1297,14 +1314,15 @@ async def test_brainstorm_ready_plan_clarify_falls_back_to_kol_selection(
     assert response.status_code == 200
     body = response.json()
     assert body["ready"] is True
-    assert body["task_id"]
+    assert body["task_id"] is None
+    assert body["message"]["content"] == "想看哪个品牌？"
+    assert body["message"]["metadata"]["clarify"]["options"] == ["蓉李记"]
     goal = await db_session.scalar(select(TaskGoal))
-    assert goal is not None
-    assert goal.goal_type == "kol_selection"
+    assert goal is None
 
 
 @pytest.mark.asyncio
-async def test_brainstorm_ready_plan_respond_falls_back_to_kol_selection(
+async def test_brainstorm_ready_plan_respond_does_not_create_default_kol_task(
     auth_client_factory, db_session, monkeypatch
 ) -> None:
     monkeypatch.setattr(get_settings(), "goal_planner_enforce_enabled", True)
@@ -1325,14 +1343,13 @@ async def test_brainstorm_ready_plan_respond_falls_back_to_kol_selection(
     )
 
     assert response.status_code == 200
-    assert response.json()["task_id"]
+    assert response.json()["task_id"] is None
     goal = await db_session.scalar(select(TaskGoal))
-    assert goal is not None
-    assert goal.goal_type == "kol_selection"
+    assert goal is None
 
 
 @pytest.mark.asyncio
-async def test_brainstorm_ready_plan_error_falls_back_to_kol_selection(
+async def test_brainstorm_ready_plan_error_asks_for_intent_without_creating_task(
     auth_client_factory, db_session, monkeypatch
 ) -> None:
     monkeypatch.setattr(get_settings(), "goal_planner_enforce_enabled", True)
@@ -1344,7 +1361,7 @@ async def test_brainstorm_ready_plan_error_falls_back_to_kol_selection(
     client = await auth_client_factory("13900000025")
     created = await client.post("/api/v1/sessions", json={})
     session_id = created.json()["id"]
-    _install_model(monkeypatch, _ready_brainstorm_model())
+    _install_model(monkeypatch, _ready_brand_brainstorm_model())
     _share_session_factory(monkeypatch, db_session)
 
     response = await client.post(
@@ -1355,14 +1372,19 @@ async def test_brainstorm_ready_plan_error_falls_back_to_kol_selection(
     assert response.status_code == 200
     body = response.json()
     assert body["ready"] is True
-    assert body["task_id"]
+    assert body["task_id"] is None
+    assert body["message"]["content"] == "请确认您希望进行品牌分析、活动分析，还是达人圈选？"
+    assert body["message"]["metadata"]["clarify"]["options"] == [
+        "品牌分析",
+        "活动分析",
+        "达人圈选",
+    ]
     goal = await db_session.scalar(select(TaskGoal))
-    assert goal is not None
-    assert goal.goal_type == "kol_selection"
+    assert goal is None
 
 
 @pytest.mark.asyncio
-async def test_brainstorm_ready_plan_disabled_skips_planner(
+async def test_brainstorm_ready_plan_disabled_creates_task_for_explicit_kol_intent(
     auth_client_factory, db_session, monkeypatch
 ) -> None:
     called = False
@@ -1390,3 +1412,25 @@ async def test_brainstorm_ready_plan_disabled_skips_planner(
     goal = await db_session.scalar(select(TaskGoal))
     assert goal is not None
     assert goal.goal_type == "kol_selection"
+
+
+@pytest.mark.asyncio
+async def test_brainstorm_ready_plan_disabled_asks_for_intent_when_profile_is_not_kol(
+    auth_client_factory, db_session, monkeypatch
+) -> None:
+    client = await auth_client_factory("13900000027")
+    created = await client.post("/api/v1/sessions", json={})
+    session_id = created.json()["id"]
+    _install_model(monkeypatch, _ready_brand_brainstorm_model())
+    _share_session_factory(monkeypatch, db_session)
+
+    response = await client.post(
+        f"/api/v1/sessions/{session_id}/brainstorm",
+        json={"content": "分析蓉李记声量情感"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["task_id"] is None
+    assert body["message"]["content"] == "请确认您希望进行品牌分析、活动分析，还是达人圈选？"
+    assert await db_session.scalar(select(TaskGoal)) is None

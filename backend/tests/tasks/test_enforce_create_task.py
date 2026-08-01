@@ -494,7 +494,7 @@ async def test_enforce_multi_goal_persists_all_with_dependency(
 
 
 @pytest.mark.asyncio
-async def test_enforce_planner_failure_falls_back_to_kol_selection(
+async def test_enforce_planner_failure_asks_for_intent_without_creating_kol_task(
     auth_client_factory, db_session, monkeypatch
 ) -> None:
     _enable_enforce(monkeypatch)
@@ -512,14 +512,20 @@ async def test_enforce_planner_failure_falls_back_to_kol_selection(
     )
 
     assert response.status_code == 202
-    assert response.json()["outcome"] == "task"
+    body = response.json()
+    assert body["outcome"] == "clarify"
+    assert body["message"]["content"] == "请确认您希望进行品牌分析、活动分析，还是达人圈选？"
+    assert body["message"]["metadata"]["clarify"]["options"] == [
+        "品牌分析",
+        "活动分析",
+        "达人圈选",
+    ]
     goal = await db_session.scalar(select(TaskGoal))
-    assert goal is not None
-    assert goal.goal_type == "kol_selection"
+    assert goal is None
 
 
 @pytest.mark.asyncio
-async def test_enforce_disabled_keeps_legacy_path(
+async def test_enforce_disabled_asks_for_intent_without_creating_kol_task(
     auth_client_factory, db_session, monkeypatch
 ) -> None:
     called = False
@@ -539,11 +545,12 @@ async def test_enforce_disabled_keeps_legacy_path(
     )
 
     assert response.status_code == 202
-    assert response.json()["outcome"] == "task"
+    body = response.json()
+    assert body["outcome"] == "clarify"
+    assert body["message"]["content"] == "请确认您希望进行品牌分析、活动分析，还是达人圈选？"
     assert called is False
     goal = await db_session.scalar(select(TaskGoal))
-    assert goal is not None
-    assert goal.goal_type == "kol_selection"
+    assert goal is None
 
 
 @pytest.mark.asyncio

@@ -21,6 +21,7 @@ from app.brainstorm.schemas import (
 from app.core.config import get_settings
 from app.goals.context import GoalPlannerContextBuilder
 from app.goals.planner import GoalPlannerService
+from app.goals.schemas import GoalPlannerOutput
 from app.model.contracts import ChatMessage, ModelAdapter, StructuredModelRequest
 from app.model.exemplars import find_success_exemplars
 from app.model.prompts import BRAINSTORM_PROMPT
@@ -38,6 +39,8 @@ from app.workspace.service import WorkspaceService, is_default_session_title
 
 logger = logging.getLogger(__name__)
 
+_INTENT_CLARIFY_TEXT = "请确认您希望进行品牌分析、活动分析，还是达人圈选？"
+_INTENT_CLARIFY_OPTIONS = ["品牌分析", "活动分析", "达人圈选"]
 _KOL_INTENT_PATTERN = re.compile(r"达人|kol|圈选|投放|主播|博主", re.IGNORECASE)
 _SCORE_PROFILE_FIELDS: tuple[tuple[str, str], ...] = (
     ("industry", "目标行业"),
@@ -111,6 +114,28 @@ def missing_score_target_profile(profile: BrainstormProfile) -> tuple[str, ...]:
         if not (value := getattr(profile, field))
         or (isinstance(value, str) and not value.strip())
     )
+
+
+def explicit_kol_goal_specs(profile: BrainstormProfile) -> list[dict[str, Any]] | None:
+    """画像明确表达达人意图时，显式创建 KOL Goal；不得作为未知意图的兜底。"""
+    intent_text = " ".join(
+        value for value in (profile.goal, profile.kol_filters) if isinstance(value, str)
+    )
+    if _KOL_INTENT_PATTERN.search(intent_text) is None:
+        return None
+    params = {
+        key: value
+        for key, value in {"brand": profile.brand, "category": profile.category}.items()
+        if value is not None
+    }
+    return [
+        {
+            "goal_type": "kol_selection",
+            "sequence": 1,
+            "depends_on_sequence": None,
+            "params": params,
+        }
+    ]
 
 
 def score_target_profile_question(profile: BrainstormProfile, missing: tuple[str, ...]) -> tuple[str, list[str], bool]:
@@ -206,9 +231,10 @@ class BrainstormService:
                 }
             )
         ready = bool(output.ready)
-        goal_specs = None
-        if ready and get_settings().goal_planner_enforce_enabled:
-            goal_specs = await self._plan_task_goals(
+        planner_enabled = get_settings().goal_planner_enforce_enabled
+        planner_output: GoalPlannerOutput | None = None
+        if ready and planner_enabled:
+            planner_output = await self._plan_task_goals(
                 user_id=user_id,
                 session_id=session_id,
                 content=payload.content,
@@ -238,7 +264,7 @@ class BrainstormService:
                 }
             )
             ready = False
-            goal_specs = None
+            planner_output = None
         user_message = await workspace_service.append_message(
             user_id, session_id, MessageCreate(content=payload.content)
         )
@@ -252,6 +278,8 @@ class BrainstormService:
             workspace.title = output.title_suggestion.strip()
 
         task_id = None
+        planner_clarify: tuple[str, list[str]] | None = None
+        planner_respond_type: str | None = None
         if ready:
             # ready 时把已确认画像写回标量列（截断到列宽，避免长文本写库失败）。
             if merged.brand:
@@ -262,14 +290,39 @@ class BrainstormService:
                 workspace.platforms = list(merged.platforms)
             if merged.audience:
                 workspace.target_audience = merged.audience[:500]
-            task = await TaskService(self.db).create(
-                user_id,
-                session_id,
-                TaskCreate(content=payload.content),
-                trigger_message_id=user_message.id,
-                goal_specs=goal_specs,
-            )
-            task_id = task.id
+            goal_specs = None
+            if planner_output is not None and planner_output.action == "execute":
+                goal_specs = [
+                    {
+                        "goal_type": goal.goal_type,
+                        "sequence": goal.sequence,
+                        "depends_on_sequence": goal.depends_on_sequence,
+                        "params": goal.params.model_dump(mode="json", exclude_none=True),
+                    }
+                    for goal in sorted(planner_output.goals, key=lambda item: item.sequence)
+                ]
+            elif planner_output is not None and planner_output.action == "clarify":
+                question = planner_output.question
+                if question is not None:
+                    planner_clarify = (question.text, list(question.options))
+            elif planner_output is not None and planner_output.action == "respond":
+                planner_respond_type = planner_output.respond_type
+            elif not planner_enabled:
+                goal_specs = explicit_kol_goal_specs(merged)
+                if goal_specs is None:
+                    planner_clarify = (_INTENT_CLARIFY_TEXT, list(_INTENT_CLARIFY_OPTIONS))
+            else:
+                # 无法取得可执行的最终意图时，不得回退为达人圈选。
+                planner_clarify = (_INTENT_CLARIFY_TEXT, list(_INTENT_CLARIFY_OPTIONS))
+            if goal_specs is not None:
+                task = await TaskService(self.db).create(
+                    user_id,
+                    session_id,
+                    TaskCreate(content=payload.content),
+                    trigger_message_id=user_message.id,
+                    goal_specs=goal_specs,
+                )
+                task_id = task.id
         workspace.updated_at = utc_now()
         workspace.last_accessed_at = workspace.updated_at
 
@@ -292,7 +345,13 @@ class BrainstormService:
             "multi": multi,
             "profile_summary": merged.model_dump(mode="json"),
         }
+        assistant_content = output.assistant_message
         assistant_metadata: dict = {"brainstorm": brainstorm_metadata}
+        if planner_clarify is not None:
+            assistant_content, clarify_options = planner_clarify
+            assistant_metadata["clarify"] = {"options": clarify_options}
+        elif planner_respond_type is not None:
+            assistant_metadata["respond"] = {"type": planner_respond_type}
         if task_id is not None:
             assistant_metadata["task_id"] = task_id
         max_sequence = await self.db.scalar(
@@ -303,7 +362,7 @@ class BrainstormService:
             session_id=session_id,
             user_id=user_id,
             role="assistant",
-            content=output.assistant_message,
+            content=assistant_content,
             sequence=(max_sequence or 0) + 1,
             metadata_json=assistant_metadata,
             created_at=utc_now(),
@@ -339,8 +398,8 @@ class BrainstormService:
         session_id: str,
         content: str,
         turn_id: str,
-    ) -> list[dict] | None:
-        """enforce 规划；clarify/respond/失败一律回退 None（默认 kol_selection）。"""
+    ) -> GoalPlannerOutput | None:
+        """执行 Planner；异常返回 None，由调用方追问最终意图且不创建任务。"""
         thinking_sink = self._thinking_sink(
             ThinkingOperationSpec(
                 operation_id=str(uuid4()),
@@ -365,23 +424,7 @@ class BrainstormService:
                 "brainstorm_goal_planner_fallback session_id=%s", session_id, exc_info=True
             )
             return None
-        if output.action != "execute" or not output.goals:
-            logger.info(
-                "brainstorm_goal_planner_non_execute session_id=%s action=%s question=%s",
-                session_id,
-                output.action,
-                getattr(output.question, "text", None),
-            )
-            return None
-        return [
-            {
-                "goal_type": goal.goal_type,
-                "sequence": goal.sequence,
-                "depends_on_sequence": goal.depends_on_sequence,
-                "params": goal.params.model_dump(mode="json", exclude_none=True),
-            }
-            for goal in sorted(output.goals, key=lambda item: item.sequence)
-        ]
+        return output
 
     async def _complete(
         self,

@@ -17,7 +17,7 @@ from app.db.session import SessionFactory, get_db
 from app.goals.context import GoalPlannerContextBuilder
 from app.goals.planner import GoalPlannerService
 from app.goals.respond import OUT_OF_SCOPE_TEXT, USAGE_GUIDE_TEXT, answer_context_qa
-from app.goals.schemas import GoalPlannerOutput
+from app.goals.schemas import GoalPlannerOutput, GoalQuestion
 from app.identity.dependencies import FunctionScopedCurrentUser
 from app.mcp_gateway.models import McpToolCatalog
 from app.model.dependencies import get_model_adapter
@@ -47,6 +47,9 @@ from app.workspace.serializers import message_read
 router = APIRouter()
 task_event_broker = TaskEventBroker()
 logger = logging.getLogger(__name__)
+
+_INTENT_CLARIFY_TEXT = "请确认您希望进行品牌分析、活动分析，还是达人圈选？"
+_INTENT_CLARIFY_OPTIONS = ["品牌分析", "活动分析", "达人圈选"]
 
 
 def get_task_event_stream() -> TaskEventStream:
@@ -159,7 +162,7 @@ async def _plan_goal_or_fallback(
     turn_id: str,
     thinking_service: SessionThinkingService,
 ) -> GoalPlannerOutput | None:
-    """enforce 规划；任何失败回退 None（kol_selection 单 Goal），不阻塞用户。
+    """执行规划；失败返回 None，由调用方转为最终意图澄清，不创建任务。
 
     ``LookupError("session_not_found")`` 是会话归属问题，原样上抛映射 404。
     """
@@ -321,19 +324,18 @@ async def create_task(
     thinking_service: SessionThinkingService = Depends(get_session_thinking_service),
 ) -> TaskCreateResult:
     service = TaskService(db)
-    goal_type = "kol_selection"
-    goal_params: dict | None = None
     goal_specs: list[dict] | None = None
     planner_attempted = False
     turn_id = str(payload.turn_id)
-    if get_settings().goal_planner_enforce_enabled:
-        # 带幂等键先查命中：命中不再调 planner（避免重复扣调用），
-        # 仍走 create_idempotent 保留 payload 一致性校验。
-        plan_needed = True
-        if idempotency_key is not None:
-            existing = await service.find_idempotent(user.id, session_id, idempotency_key)
-            plan_needed = existing is None
-        if plan_needed:
+    planner_enabled = get_settings().goal_planner_enforce_enabled
+    planner_output: GoalPlannerOutput | None = None
+    # 带幂等键命中时不再调 Planner，也不改变该请求既有的任务结果。
+    plan_needed = True
+    if idempotency_key is not None:
+        existing = await service.find_idempotent(user.id, session_id, idempotency_key)
+        plan_needed = existing is None
+    if plan_needed:
+        if planner_enabled:
             planner_attempted = True
             try:
                 planner_output = await _plan_goal_or_fallback(
@@ -346,132 +348,135 @@ async def create_task(
                 )
             except LookupError as error:
                 raise task_not_found(error) from error
-            if planner_output is not None and planner_output.action == "clarify":
-                user_message, message = await _append_clarify_message(
-                    db,
-                    user.id,
-                    session_id,
-                    content=payload.content,
+        if planner_output is None:
+            planner_output = GoalPlannerOutput(
+                action="clarify",
+                question=GoalQuestion(
+                    text=_INTENT_CLARIFY_TEXT,
+                    options=list(_INTENT_CLARIFY_OPTIONS),
+                ),
+            )
+        if planner_output.action == "clarify":
+            user_message, message = await _append_clarify_message(
+                db,
+                user.id,
+                session_id,
+                content=payload.content,
+                turn_id=turn_id,
+                question=planner_output.question,
+            )
+            try:
+                await thinking_service.bind_turn(
                     turn_id=turn_id,
-                    question=planner_output.question,
+                    user_id=user.id,
+                    session_id=session_id,
+                    task_id=None,
+                    trigger_message_id=user_message.id,
                 )
-                try:
-                    await thinking_service.bind_turn(
-                        turn_id=turn_id,
-                        user_id=user.id,
-                        session_id=session_id,
-                        task_id=None,
-                        trigger_message_id=user_message.id,
-                    )
-                except Exception:
-                    logger.warning(
-                        "goal_planner_clarify_thinking_bind_failed session_id=%s",
-                        session_id,
-                        exc_info=True,
-                    )
-                await db.commit()
-                try:
-                    await persist_turn_thinking(
-                        SessionFactory,
-                        thinking_service,
-                        user_id=user.id,
-                        session_id=session_id,
-                        turn_id=turn_id,
-                        assistant_message_id=message.id,
-                    )
-                except Exception:
-                    logger.warning(
-                        "goal_planner_clarify_thinking_persist_failed session_id=%s",
-                        session_id,
-                        exc_info=True,
-                    )
-                return TaskOutcomeClarify(message=message_read(message))
-            if planner_output is not None and planner_output.action == "respond":
-                respond_type = planner_output.respond_type
-                if respond_type == "usage_help":
-                    reply = USAGE_GUIDE_TEXT
-                elif respond_type == "out_of_scope":
-                    reply = OUT_OF_SCOPE_TEXT
-                else:
-                    reply = await answer_context_qa(
-                        db,
-                        get_model_adapter(),
-                        user_id=user.id,
-                        session_id=session_id,
-                        question=payload.content,
-                    )
-                user_message, message = await _append_respond_message(
-                    db,
-                    user.id,
+            except Exception:
+                logger.warning(
+                    "goal_planner_clarify_thinking_bind_failed session_id=%s",
                     session_id,
-                    content=payload.content,
+                    exc_info=True,
+                )
+            await db.commit()
+            try:
+                await persist_turn_thinking(
+                    SessionFactory,
+                    thinking_service,
+                    user_id=user.id,
+                    session_id=session_id,
                     turn_id=turn_id,
-                    respond_type=respond_type,
-                    reply=reply,
+                    assistant_message_id=message.id,
                 )
-                try:
-                    await thinking_service.bind_turn(
-                        turn_id=turn_id,
-                        user_id=user.id,
-                        session_id=session_id,
-                        task_id=None,
-                        trigger_message_id=user_message.id,
-                    )
-                except Exception:
-                    logger.warning(
-                        "goal_planner_respond_thinking_bind_failed session_id=%s",
-                        session_id,
-                        exc_info=True,
-                    )
-                await db.commit()
-                try:
-                    await persist_turn_thinking(
-                        SessionFactory,
-                        thinking_service,
-                        user_id=user.id,
-                        session_id=session_id,
-                        turn_id=turn_id,
-                        assistant_message_id=message.id,
-                    )
-                except Exception:
-                    logger.warning(
-                        "goal_planner_respond_thinking_persist_failed session_id=%s",
-                        session_id,
-                        exc_info=True,
-                    )
-                return TaskOutcomeRespond(
-                    respond_type=respond_type, message=message_read(message)
+            except Exception:
+                logger.warning(
+                    "goal_planner_clarify_thinking_persist_failed session_id=%s",
+                    session_id,
+                    exc_info=True,
                 )
-            if planner_output is not None:
-                # 阶段四顺序编排：planner 输出的 1-3 个 goal 全部落库。
-                goal_specs = [
-                    {
-                        "goal_type": goal.goal_type,
-                        "sequence": goal.sequence,
-                        "depends_on_sequence": goal.depends_on_sequence,
-                        # 注意：model_dump 不排除默认值，GoalParams.comparison_mode
-                        # 的默认值 "mom" 会并入所有 goal 类型（含 campaign/kol）的
-                        # params_json；消费方仅 brand_analysis 读取该字段。
-                        "params": goal.params.model_dump(mode="json", exclude_none=True),
-                    }
-                    for goal in sorted(
-                        planner_output.goals, key=lambda item: item.sequence
-                    )
-                ]
-                if len(goal_specs) > 1:
-                    logger.info(
-                        "goal_planner_multi_goal session_id=%s goals=%d",
-                        session_id,
-                        len(goal_specs),
-                    )
+            return TaskOutcomeClarify(message=message_read(message))
+        if planner_output.action == "respond":
+            respond_type = planner_output.respond_type
+            if respond_type == "usage_help":
+                reply = USAGE_GUIDE_TEXT
+            elif respond_type == "out_of_scope":
+                reply = OUT_OF_SCOPE_TEXT
+            else:
+                reply = await answer_context_qa(
+                    db,
+                    get_model_adapter(),
+                    user_id=user.id,
+                    session_id=session_id,
+                    question=payload.content,
+                )
+            user_message, message = await _append_respond_message(
+                db,
+                user.id,
+                session_id,
+                content=payload.content,
+                turn_id=turn_id,
+                respond_type=respond_type,
+                reply=reply,
+            )
+            try:
+                await thinking_service.bind_turn(
+                    turn_id=turn_id,
+                    user_id=user.id,
+                    session_id=session_id,
+                    task_id=None,
+                    trigger_message_id=user_message.id,
+                )
+            except Exception:
+                logger.warning(
+                    "goal_planner_respond_thinking_bind_failed session_id=%s",
+                    session_id,
+                    exc_info=True,
+                )
+            await db.commit()
+            try:
+                await persist_turn_thinking(
+                    SessionFactory,
+                    thinking_service,
+                    user_id=user.id,
+                    session_id=session_id,
+                    turn_id=turn_id,
+                    assistant_message_id=message.id,
+                )
+            except Exception:
+                logger.warning(
+                    "goal_planner_respond_thinking_persist_failed session_id=%s",
+                    session_id,
+                    exc_info=True,
+                )
+            return TaskOutcomeRespond(
+                respond_type=respond_type, message=message_read(message)
+            )
+        # 阶段四顺序编排：planner 输出的 1-3 个 goal 全部落库。
+        goal_specs = [
+            {
+                "goal_type": goal.goal_type,
+                "sequence": goal.sequence,
+                "depends_on_sequence": goal.depends_on_sequence,
+                # 注意：model_dump 不排除默认值，GoalParams.comparison_mode
+                # 的默认值 "mom" 会并入所有 goal 类型（含 campaign/kol）的
+                # params_json；消费方仅 brand_analysis 读取该字段。
+                "params": goal.params.model_dump(mode="json", exclude_none=True),
+            }
+            for goal in sorted(planner_output.goals, key=lambda item: item.sequence)
+        ]
+        if len(goal_specs) > 1:
+            logger.info(
+                "goal_planner_multi_goal session_id=%s goals=%d",
+                session_id,
+                len(goal_specs),
+            )
     try:
         if idempotency_key is None:
             task = await service.create(
                 user.id,
                 session_id,
                 payload,
-                goal_type=goal_type,
-                goal_params=goal_params,
                 goal_specs=goal_specs,
             )
             reused = False
@@ -481,8 +486,6 @@ async def create_task(
                 session_id,
                 payload,
                 idempotency_key,
-                goal_type=goal_type,
-                goal_params=goal_params,
                 goal_specs=goal_specs,
             )
     except TaskConflictError as error:
