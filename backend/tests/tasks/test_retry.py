@@ -112,6 +112,11 @@ async def test_create_task_reuses_idempotent_task_without_resubmitting(monkeypat
         def __init__(self, db):
             self.db = db
 
+        async def find_idempotent(self, user_id, session_id, idempotency_key):
+            # 幂等命中：跳过 planner，直接进入 create_idempotent 复用路径。
+            assert (user_id, session_id, idempotency_key) == ("user-1", "session-1", "browser-key")
+            return task
+
         async def create_idempotent(
             self, user_id, session_id, payload, idempotency_key, **_kwargs
         ):
@@ -141,6 +146,10 @@ async def test_create_task_returns_409_for_same_key_with_different_payload(monke
     class StubTaskService:
         def __init__(self, db):
             self.db = db
+
+        async def find_idempotent(self, user_id, session_id, idempotency_key):
+            # 幂等命中：跳过 planner；create_idempotent 负责 payload 一致性校验。
+            return SimpleNamespace(id="task-existing")
 
         async def create_idempotent(
             self, user_id, session_id, payload, idempotency_key, **_kwargs

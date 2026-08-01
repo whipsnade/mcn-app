@@ -74,13 +74,24 @@ def test_normalizes_batch_detail_scopes_and_groups_recent_trend_by_week() -> Non
         "average_interaction_per_follower_rate": 1.2,
         "recent_30d_average_interactions": 300.0,
     }
-    first_week = first_day - timedelta(days=first_day.weekday())
-    last_day = today - timedelta(days=2)
-    last_week = last_day - timedelta(days=last_day.weekday())
-    assert detail.trend_points == (
-        {"week_start": first_week.isoformat(), "average_interactions": 200.0, "post_count": 2},
-        {"week_start": last_week.isoformat(), "average_interactions": 500.0, "post_count": 1},
+    # 期望按周起始（周一）动态分桶：first_day 与次日可能跨周（日期敏感修复，
+    # 曾假设二者恒同周，每周日边界时失败）。
+    buckets: dict[date, list[int]] = {}
+    for day, value in (
+        (first_day, 100),
+        (first_day + timedelta(days=1), 300),
+        (today - timedelta(days=2), 500),
+    ):
+        buckets.setdefault(day - timedelta(days=day.weekday()), []).append(value)
+    expected = tuple(
+        {
+            "week_start": week_start.isoformat(),
+            "average_interactions": sum(values) / len(values),
+            "post_count": len(values),
+        }
+        for week_start, values in sorted(buckets.items())
     )
+    assert detail.trend_points == expected
 
 
 def test_detail_normalizer_omits_invalid_and_future_trend_rows_without_faking_points() -> None:

@@ -42,6 +42,7 @@ from app.thinking.service import (
 )
 from app.workspace.models import Message
 from app.workspace.serializers import message_read
+from app.workspace.service import WorkspaceService
 
 
 router = APIRouter()
@@ -324,6 +325,12 @@ async def create_task(
     thinking_service: SessionThinkingService = Depends(get_session_thinking_service),
 ) -> TaskCreateResult:
     service = TaskService(db)
+    # 会话归属/删除态校验前置：planner 关闭或失败走意图澄清的分支也必须 404，
+    # 不能在已删除会话上落澄清消息。
+    try:
+        await WorkspaceService(db).get_owned_session(user.id, session_id)
+    except LookupError as error:
+        raise task_not_found(error) from error
     goal_specs: list[dict] | None = None
     planner_attempted = False
     turn_id = str(payload.turn_id)
