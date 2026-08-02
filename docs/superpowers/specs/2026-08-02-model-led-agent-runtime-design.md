@@ -1,6 +1,6 @@
 # 模型主导的统一 Agent 运行时设计
 
-状态：已确认，待实施计划  
+状态：已确认，待用户最终书面复核
 日期：2026-08-02  
 适用范围：所有使用模型的用户功能、MCP 调用、分析产物与前端执行状态
 
@@ -129,7 +129,7 @@ call_tool
   rationale
 
 submit_review
-  artifact_draft_id
+  artifact_draft_ids[]   # 本 Run 待发布的全部正式 Draft，非空且去重
   completion_text       # Reviewer 通过后写入 assistant 消息
   summary
 
@@ -140,7 +140,9 @@ complete
 
 Artifact 创建、更新、历史读取和计算统一作为受控内部工具通过 `call_tool` 执行，避免在顶层动作中持续增加业务特例。
 
-模型输出 `ask_user` 时，本 Run 以 `clarification_requested` 结果完成；用户回答创建新 Run，并通过 `parent_run_id` 和待回答 Memory 关联。模型输出 `complete` 且没有正式 Artifact 时不触发 Reviewer。正式 Artifact 的用户回复由 `submit_review.completion_text` 暂存，只有 Reviewer 通过并发布后才写入 assistant 消息。
+模型输出 `ask_user` 时，本 Run 以 `clarification_requested` 结果完成；用户回答创建新 Run，并通过 `parent_run_id` 和待回答 Memory 关联。模型输出 `complete` 且没有正式 Artifact 时不触发 Reviewer。正式 Artifact 的用户回复由 `submit_review.completion_text` 暂存，只有本次提交批次中的全部 Artifact 都经 Reviewer 通过并原子发布后才写入 assistant 消息。
+
+一个 Run 可以创建多个 Draft，但只能提交一个包含全部待发布 Draft 的 review batch。Review 以 Artifact 为单位记录结果，发布以 batch 为单位保持原子性：任何 Draft 尚未 approve 时，所有 Draft 都不发布；任一 Draft 最终 reject 时，整个 batch 失败且不产生部分发布。已 approve 的 Draft revision 可在后续 batch review 中复用；只有被修改或曾被 revise 的 Draft 重新审核。主 Agent 可将无法形成完整结果的模块改写为诚实披露限制的 `restricted` Draft，再由 Reviewer 决定是否 approve。
 
 ## 七、Run 状态机
 
@@ -152,8 +154,8 @@ stateDiagram-v2
     running --> clarification_requested: ask_user
     running --> reviewing: submit_review
     reviewing --> running: revise（最多打回 2 次）
-    reviewing --> completed: approve + publish
-    reviewing --> failed: reject / 第 3 次仍未 approve
+    reviewing --> completed: batch 全部 approve + 原子发布
+    reviewing --> failed: 任一 Draft reject / 第 3 次仍未 approve
     running --> completed: complete（无正式产物）
     running --> paused: 30 分钟或 50 决策
     paused --> running: 用户继续
@@ -186,7 +188,8 @@ stateDiagram-v2
 
 #### `agent_runs`
 
-- `id`, `session_id`, `user_id`, `input_message_id`, `parent_run_id nullable`；
+- `id`, `session_id`, `user_id`, `input_message_id nullable`, `parent_run_id nullable`；
+- `run_kind`: `user/internal`, `visibility`: `user/internal`；
 - `profile_name`, `profile_version`, `model`, `prompt_snapshot_json`；
 - `status`, `outcome`, `decision_count`, `review_count`, `revision_count`；
 - `started_at`, `paused_at`, `completed_at`, `error_code`；
@@ -201,11 +204,13 @@ stateDiagram-v2
 
 #### `agent_steps`
 
-- `id`, `run_id`, `sequence`, `step_type`；
+- `id`, `run_id`, `attempt_id`, `sequence`, `step_type`；
 - `input_json`, `output_json`, `status`, `duration_ms`；
 - `thinking_text nullable`, `visibility`: `user/internal`；
 - `model_request_id`, `token_usage_json`, `created_at`；
 - 唯一 `(run_id, sequence)`。
+
+Reviewer 与 Utility 不借用父 Run 的 Profile。每次 Reviewer 调用创建一个 `run_kind=internal`、`visibility=internal` 的子 `agent_runs`，Profile 为 `artifact_reviewer_v1`，`parent_run_id` 指向用户 Run；每个 Utility 任务同样创建 `utility_v1` 内部 Run。它们各自保存 Profile、Prompt 快照、模型、Step 和 token 用量，但不出现在用户执行卡中，也不计入父 Run 的 Attempt 决策阈值。父 Run 只追加 review/utility 结果引用。KOL Detail 是用户可见轻量 Run，使用 `kol_detail_v1` Profile。
 
 #### `agent_tool_calls`
 
@@ -226,33 +231,76 @@ stateDiagram-v2
 
 #### `artifact_drafts`
 
-- `id`, `artifact_id`, `session_id`, `run_id`；
-- `payload_json`, `evidence_refs_json`；
-- `schema_version`, `revision`, `status`, `updated_at`；
-- `artifact_id` 唯一；同一 Run 内按 revision 乐观锁更新。
+- `id`, `artifact_id`, `session_id`, `owner_run_id nullable`；
+- `current_revision`, `status`: `idle/drafting/reviewing/failed`；
+- `review_count`, `revision_count`, `updated_at`；
+- `artifact_id` 唯一；它是每个稳定 Artifact 的长期工作头，不在发布后删除或归档；
+- 新 Run 要更新同一 Artifact 时锁定该行，将 `owner_run_id` 切换到新 Run 并继续递增 revision；若仍由另一个活动 Run 持有，返回结构化 `artifact_busy`，不得覆盖。
+
+#### `artifact_draft_revisions`
+
+- `id`, `draft_id`, `artifact_id`, `run_id`, `revision`；
+- `schema_version`, `payload_json`, `evidence_refs_json`, `parent_artifact_version_id nullable`；
+- `payload_hash`, `created_at`；唯一 `(draft_id, revision)`；
+- 每次 Draft 更新都先插入不可变 Revision，再以乐观锁推进 `artifact_drafts.current_revision`；Reviewer、发布和审计一律引用 Revision ID，不引用可变工作头内容。
+
+#### `artifact_review_batches` / `artifact_review_items`
+
+- Batch：`id`, `parent_run_id`, `status`, `completion_text`, `created_at`, `completed_at`；一个用户 Run 最多一条 Batch；
+- Item：`id`, `batch_id`, `artifact_id`, `draft_revision_id`, `status`；唯一 `(batch_id, artifact_id)`；
+- 每个 Item 的审核上限独立计算，Batch/父 Run 的 `review_count`、`revision_count` 仅做汇总审计；
+- Draft 修改后，Item 改绑新 Revision，先前对旧 Revision 的 approve 自动失效；未修改且已 approve 的 Revision 可以在下一轮复核中复用；
+- 发布事务锁定 Batch、全部 Item、Draft 和 Artifact，确认所有 Item 都是当前 Revision 的 approve 后，一次性插入全部 Version 并提交；任一校验失败则整批回滚。
+
+#### `artifact_review_attempts`
+
+- `id`, `review_item_id`, `attempt`, `draft_revision_id`, `review_run_id`；
+- `decision`: `approve/revise/reject`, `issues_json`, `created_at`；
+- 唯一 `(review_item_id, attempt)`；每次 Reviewer 调用插入一条不可变记录，完整保留最多三次复核的 Profile、Prompt、Step、输入 Revision 和结果关系；
+- `artifact_review_items.status` 只是当前聚合状态，不代替 Attempt 历史。
 
 #### `agent_artifacts`
 
 - `id`, `session_id`, `user_id`, `module`, `artifact_type`；
-- `parent_artifact_id nullable`, `parent_artifact_version_id nullable`；
-- `artifact_key`, `status`: `draft/reviewing/published/failed`, `latest_version`；
+- `parent_artifact_id nullable`；
+- `artifact_key`, `status`: `draft/reviewing/published/failed`, `latest_version`, `activity_sequence`；
 - `created_at`, `updated_at`；
 - 创建 Draft 时先创建稳定 Artifact 身份，再创建引用它的 `artifact_drafts`；不直接在稳定身份行保存报告内容；
-- 子 Artifact 同时记录父稳定身份与本次钻取依据的父版本，避免父报告后续升级改变历史语义。
+- 子 Artifact 在稳定身份上只记录父 Artifact；本次分析实际绑定的父 Version 保存在 Draft Revision 和发布 Version 上，避免更新稳定行改变历史语义。
+
+`artifact_key` 在 Session 内唯一，数据库约束为 `(session_id, artifact_key)`：
+
+- 品牌：`brand:{normalized_brand}`；
+- 活动：`campaign:{normalized_brand}:{normalized_campaign}`；
+- 圈选名单：`kol-selection:{normalized_scope_hash}`；
+- KOL 分析：`kol-analysis:{selection_artifact_id}`；
+- 达人详情：`kol-detail:{platform}:{kol_uid}`；
+- 钻取：`insight:{parent_artifact_version_id}:{normalized_question_hash}`。
+
+标准化使用 NFKC、trim、连续空白折叠和小写英文；hash 使用 SHA-256。模型提供业务字段，服务端生成 key，模型不能直接指定数据库 key。
 
 #### `agent_artifact_versions`
 
-- `id`, `artifact_id`, `version`, `source_run_id`；
+- `id`, `artifact_id`, `version`, `source_run_id`, `source_draft_revision_id`；
+- `parent_artifact_version_id nullable`；
 - `schema_version`, `payload_json`, `evidence_refs_json`；
 - `review_json`, `data_status`, `created_at`；
 - 唯一 `(artifact_id, version)`；发布后不可更新。
 
-发布事务必须原子执行：锁定 Artifact 与 Draft revision，插入不可变 Version，更新 `agent_artifacts.latest_version/status`，删除或归档 Draft，并追加 `artifact.published` 事件。Draft 事件始终使用稳定 `artifact_id`，因此前端从生成中到正式版本无需更换身份。
+发布事务必须原子执行：锁定 Artifact 与 Draft Revision，插入不可变 Version（复制 Revision 的 `parent_artifact_version_id`），更新 `agent_artifacts.latest_version/status`，将 Draft 工作头置回 `idle` 并释放 `owner_run_id`，再追加 `artifact.published` 事件。Draft Revision 和 Review Attempt 永久保留用于审计。Draft 事件始终使用稳定 `artifact_id`，因此前端从生成中到正式版本无需更换身份。
+
+#### `artifact_events`
+
+- `id`, `session_id`, `user_id`, `sequence`, `module`, `artifact_id`；
+- `event_type`: `draft_created/draft_updated/reviewing/published/failed`；
+- `draft_revision nullable`, `artifact_version_id nullable`, `created_at`；
+- 唯一 `(session_id, sequence)`；每次 Draft 更新和发布都递增 Session 级 Artifact sequence。
 
 #### `artifact_read_states`
 
-- `user_id`, `session_id`, `module`, `last_read_artifact_version_id`, `updated_at`；
+- `user_id`, `session_id`, `module`, `last_seen_sequence`, `updated_at`；
 - 唯一 `(user_id, session_id, module)`；仅用于三个固定 BI Tab 的未读圆点。
+- 当模块最新 `artifact_events.sequence > last_seen_sequence` 时显示圆点，因此可同时覆盖 Draft revision、多核心 Artifact 和子 Artifact。
 
 #### `agent_events`
 
@@ -267,9 +315,9 @@ stateDiagram-v2
 
 #### `kol_detail_cache`
 
-- `user_id`, `platform`, `kol_uid`, `schema_version`；
+- `user_id`, `session_id`, `platform`, `kol_uid`, `schema_version`；
 - `payload_json`, `evidence_refs_json`, `fetched_at`, `expires_at`；
-- 唯一 `(user_id, platform, kol_uid)`，防止不同用户共享已付费证据；
+- 唯一 `(user_id, session_id, platform, kol_uid)`，缓存 Evidence 与当前 Session 归属保持一致；
 - 默认 TTL 24 小时，由 `KOL_DETAIL_CACHE_TTL_HOURS` 配置。缓存过期后 KOL Detail Agent 可自主决定是否补查。
 
 ### 8.2 保留表
@@ -298,6 +346,8 @@ Session Agent 每轮默认获得：
 所有历史读取工具必须校验 Evidence/Artifact 属于当前用户和 Session。大结果返回摘要、游标和有限分片，避免上下文无限增长。
 
 钻取 Artifact 必须声明 `module` 和 `parent_artifact_id`。改变品牌、活动、时间窗口或核心口径时，模型应创建新的核心 Artifact 或新版本；只对既有结论做局部解释时创建 `insight_board_v1` 子 Artifact。
+
+子 Artifact 的 Draft Revision 只能绑定已发布的 `parent_artifact_version_id`，发布后原样复制到子 Artifact Version；不允许在同一 Batch 中让子 Artifact 指向尚未发布的父 Draft。若本轮先生成新的核心报告，相关钻取应并入该核心 payload，或等发布后由下一条用户消息创建子 Artifact。`kol-analysis:{selection_artifact_id}` 可以跨名单版本复用同一稳定身份，但每个 `kol_analysis_v2` Version 都通过自己的 `parent_artifact_version_id` 固定到当时的名单 Version。
 
 ## 十、工具运行时
 
@@ -349,6 +399,7 @@ MCP 原始结果完整落 `evidence_items.raw_payload_json`。返回模型的工
     "artifact_path": "/data/overview/total_volume",
     "sources": [
       {
+        "source_type": "evidence",
         "evidence_id": "...",
         "source_path": "/0/声量"
       }
@@ -358,8 +409,8 @@ MCP 原始结果完整落 `evidence_items.raw_payload_json`。返回模型的工
   {
     "artifact_path": "/data/sentiment/positive_share",
     "sources": [
-      {"evidence_id": "...", "source_path": "/0/正面声量数"},
-      {"evidence_id": "...", "source_path": "/0/声量"}
+      {"source_type": "evidence", "evidence_id": "...", "source_path": "/0/正面声量数"},
+      {"source_type": "evidence", "evidence_id": "...", "source_path": "/0/声量"}
     ],
     "derivation": {
       "tool_call_id": "...",
@@ -373,11 +424,12 @@ MCP 原始结果完整落 `evidence_items.raw_payload_json`。返回模型的工
 约束：
 
 1. `artifact_path` 和 `source_path` 使用 RFC 6901 JSON Pointer；
-2. `evidence_id` 必须属于当前用户和 Session，且 payload 中存在 `source_path`；
+2. `sources[]` 是判别联合：`source_type=evidence` 时必须提供当前用户、当前 Session 的 `evidence_id`；`source_type=artifact` 时必须提供当前 Session 的 `artifact_version_id`；两者指向的 payload 中都必须存在 `source_path`；
 3. `derivation.tool_call_id` 必须指向已 settled 的内部确定性计算工具调用；
 4. 每个强类型 Artifact Schema 明确标记哪些字段需要 lineage；
 5. `insight_board_v1` 中 metric 值、series 数值和 table 数字单元格全部要求 lineage，布局序号、日期组成和版本号除外；
-6. 运行时在提交 Reviewer 前进行完整性校验，缺少或失效引用时拒绝进入 review；Reviewer 负责语义一致性复核，不代替结构校验。
+6. Artifact 来源必须递归解析到 Evidence；发布时把完整传递闭包固化进 lineage 快照，禁止只引用没有底层 Evidence 的叙事字段；
+7. 运行时在提交 Reviewer 前进行完整性校验，缺少或失效引用时拒绝进入 review；Reviewer 负责语义一致性复核，不代替结构校验。
 
 Evidence 和 Artifact payload 都计算内容哈希；发布版本保存 lineage 快照，后续 Evidence 不可修改，因此历史数字来源保持稳定。
 
@@ -388,6 +440,7 @@ Thinking 不是动作 JSON 的字段，也不是 `rationale` 的流式版本。�
 - 主 Agent：通过 `ThinkingSink` 产生 `thinking.started/delta/completed/failed`，实时发送并写入 `agent_events`；最终脱敏文本写入对应 `agent_steps.thinking_text`，单次上限 64 KiB；
 - Reviewer 与 Utility：thinking 仅写内部 Step 审计，不产生用户可见事件；
 - 不暴露供应商未返回的隐藏推理，也不通过额外 prompt 要求模型生成伪思考；
+- 若供应商本次响应没有 `reasoning_content` 或 `<think>`，后端不发送任何 `thinking.*` 事件；前端仅展示不可展开的通用“正在处理”状态，绝不补写或推测思考内容；
 - Thinking 使用与 Prompt 日志相同的密钥/token 脱敏，并限制单事件大小；
 - 严格 JSON 动作只解析 think 结束后的 JSON 数据，thinking 内容不参与 Pydantic 动作校验。
 
@@ -426,13 +479,100 @@ service + internal_tool_name + SHA256(normalized_arguments)
 
 ### 12.1 强类型 Artifact
 
-- `brand_report_v3`：品牌范围、平台概览、情感、趋势、内容、地域、热帖、洞察、方法论和 Evidence 引用；
-- `campaign_report_v2`：活动范围、节奏、平台贡献、内容/达人贡献、情感和复盘；
-- `kol_selection_v3`：名单、评分输入、评分版本、评分结果和证据；
-- `kol_analysis_v2`：名单统计、趋势现状、分布和投放建议；
-- `kol_detail_v2`：身份、平台指标、趋势、画像、主页链接、缓存状态和最新 5 条热帖。
+五类强类型 payload 均使用 Pydantic `extra="forbid"`，共同外壳如下：
 
-强类型 Artifact 继续支持专用 BI 和 Excel 导出。现有 v2 payload 不兼容迁移，新系统使用新 schema version。
+```text
+schema_version        # 固定字面量
+module                # brand / campaign / kol
+scope                 # 各类型定义的查询范围
+data_status           # complete / restricted
+availability          # 章节名 -> {status: complete|partial|unavailable, reason_codes[]}
+limitations[]         # {code, message, affected_paths[]}
+data                   # 确定性结构化数据
+narrative              # 类型化结论，禁止混入未落 data 的新数字
+methodology            # {data_as_of, source_names[], notes[]}
+```
+
+整体状态按必需章节聚合：全部 `complete` 才能为 `data_status=complete`；任一必需章节 `partial/unavailable` 时必须为 `restricted` 并给出 limitation。业务数值允许 `null`，但对应路径必须处于 `partial/unavailable`，前端显示“数据受限”，不得把 `null` 当 0。数组项具有稳定业务键，重复项由 Schema 校验拒绝。
+
+#### `brand_report_v3`
+
+- `scope`：`brand`、`period{start,end,timezone}`、`platforms[]`、`keywords[]`、`comparison_mode:none|mom|mom_yoy`；
+- `data.overview`：`total_volume/total_engagement/total_posts/sentiment_score`，以及 `platforms[]{platform,volume,engagement,posts,share_of_voice,sentiment_score}`；
+- `data.comparisons`：`mom` 与 `yoy`，每项含 `status`、`baseline_period` 和 `metrics[]{metric,current,baseline,delta,rate}`；未请求的对比固定为 `status=not_requested` 且无 metrics；
+- `data.sentiment`：`summary{positive,neutral,negative counts/shares}` 与 `by_platform[]`；
+- `data.daily_trend[]`：`date,platform,volume,engagement,positive,neutral,negative`；
+- `data.content_types[]`：`platform,type,posts,volume,engagement`；
+- `data.creator_tiers[]`：`platform,tier,creator_count,posts,volume,engagement`；
+- `data.organic_vs_paid[]`：`platform,kind,posts,volume,engagement`；
+- `data.regions[]`：`region,volume,share,sentiment_score`；
+- `data.topics[]`：`topic,volume,engagement,sentiment_score`；
+- `data.top_posts[]`（最多 20）：`platform,post_id,title,url,author,published_at,likes,comments,shares,engagement`；
+- `narrative`：`executive_summary`、`findings[]{title,detail,supporting_paths[]}`、`recommendations[]{title,action,rationale,supporting_paths[]}`。
+
+必需章节为 overview、sentiment、daily_trend、topics、top_posts；其他章节允许受限。它映射品牌 BI 的概览、平台、趋势、情感、内容、创作者、地域/话题、热帖八个章节，也是一阶段品牌 Excel 的唯一数据源。
+
+#### `campaign_report_v2`
+
+- `scope`：`brand,campaign,period{start,end,timezone},platforms[],keywords[]`；
+- `data.overview`：`total_volume,total_engagement,total_posts,total_creators,sentiment_score`；
+- `data.platform_contributions[]`：`platform,volume,engagement,posts,creators,share`；
+- `data.timeline[]`：`date,platform,volume,engagement,posts`；
+- `data.kol_contributions[]`（最多 20）：`platform,kol_uid,nickname,posts,volume,engagement,contribution_share`；
+- `data.content_types[]`：`platform,type,posts,volume,engagement`；
+- `data.sentiment`：与品牌报告相同的 summary/by_platform 结构；
+- `data.top_posts[]`（最多 20）：与品牌报告相同；
+- `narrative`：`executive_summary,phase_review[],findings[],recommendations[]`，每项均带 `supporting_paths[]`。
+
+必需章节为 overview、platform_contributions、timeline、sentiment、top_posts；它映射活动 BI，不在首期提供 Excel 导出。
+
+#### `kol_selection_v3`
+
+- `scope`：`brand nullable,category nullable,campaign nullable,platforms[],audience{regions[],age_ranges[],interests[]},filters{budget_min,budget_max,follower_min,follower_max}`；
+- `data.scoring`：`version,method,weights{engagement,active_fans,growth,commercial_fit,audience_fit,cost_efficiency},missing_value_policy`；其中缺失值策略固定为严格模式 `missing_as_zero`；
+- `data.items[]`（跨平台合计最多 20，默认按 `engagement_total` 降序）：`rank,platform,kol_uid,nickname,avatar_url,homepage_url,followers,active_followers,active_follower_rate,growth_rate,engagement_total,avg_engagement,likes,comments,shares,quoted_price,score,rating,reasons[],missing_fields[],audience{regions[],age_ranges[],interests[]}`；
+- `data.summary`：`candidate_count,selected_count,platform_distribution[],rating_distribution[]`；
+- `narrative`：`selection_summary,fit_findings[],risk_notes[],usage_advice[]`，结论通过 `kol_uid` 或 `supporting_paths[]` 关联名单。
+
+`score` 必须由 `rank_kols` 产生；评分输入引用 Evidence，score/rank/rating 再引用该确定性调用。它映射“圈选达人”列表、评分说明、KOL 趋势现状图，并继续支持 KOL 名单 Excel 导出。
+
+#### `kol_analysis_v2`
+
+- `scope`：`selection_artifact_id,selection_version,analysis_period nullable`；
+- `data.summary`：`kol_count,total_followers,total_active_followers,total_engagement,avg_score`；
+- `data.platform_distribution[]`、`rating_distribution[]`、`follower_distribution[]`、`engagement_distribution[]`、`region_distribution[]`：统一为 `{key,label,count,share}`；
+- `data.kol_trend[]`（最多 20）：`platform,kol_uid,nickname,followers,active_followers,engagement_total,avg_engagement,growth_rate,score`；
+- `data.top_kols[]`（最多 20）：`rank,platform,kol_uid,nickname,score,engagement_total,rating`；
+- `narrative`：`executive_summary,portfolio_findings[],mix_recommendations[],risk_notes[]`，均带 `supporting_paths[]`。
+
+本类型的数据首先引用指定的不可变 `kol_selection_v3` Version，并通过其 lineage 递归追溯 Evidence；若 Agent 补查新数据，也可直接引用新 Evidence。它映射“KOL 分析”子 Tab，不在首期提供 Excel 导出。
+
+#### `kol_detail_v2`
+
+- `scope`：`platform,kol_uid,selection_artifact_id nullable,selection_version nullable`；
+- `data.identity`：`nickname,avatar_url,homepage_url,bio,verification,region`；
+- `data.metrics`：`followers,following,posts,likes,active_followers,active_follower_rate,growth_rate,engagement_total,avg_engagement`；
+- `data.audience`：`gender_distribution[],age_distribution[],region_distribution[],interest_distribution[]`，每项 `{key,label,value,share}`；
+- `data.trend[]`：`date,followers nullable,engagement nullable,posts nullable`；
+- `data.latest_posts[]`（最多 5）：`post_id,title,url,published_at,likes,comments,shares,engagement`；
+- `data.cache`：`hit,fetched_at,expires_at`；
+- `narrative`：`profile_summary,content_strengths[],commercial_notes[],risk_notes[]`，均带 `supporting_paths[]`。
+
+它映射圈选列表中的达人详情弹层，不在首期提供 Excel 导出。`homepage_url` 和热帖 `url` 缺失时必须披露限制，前端显示不可用，不伪造链接。
+
+#### Lineage 与消费边界
+
+除日期、枚举、稳定身份、版本、展示顺序和纯文本标签外，`data` 下所有观测或计算得到的业务数值都要求 lineage；数组的 `rank/count/share`、评分结果和分布统计也不例外。缓存 TTL、Schema version 等运行时元数据不要求 lineage。`narrative` 不单独复制业务数值；需要引用数字时使用 `supporting_paths[]` 指向 `data`。
+
+| Artifact | 专用 BI | 首期 Excel |
+|---|---|---|
+| `brand_report_v3` | 品牌八章节 | 支持，读取已发布 Version |
+| `campaign_report_v2` | 活动分析 | 不支持 |
+| `kol_selection_v3` | 圈选达人、评分说明、趋势现状 | 支持，读取已发布 Version |
+| `kol_analysis_v2` | KOL 分析 | 不支持 |
+| `kol_detail_v2` | 达人详情弹层 | 不支持 |
+
+现有 v2 payload 不兼容迁移，新系统使用新 schema version；导出器收到不支持的 Artifact 类型返回 409 `ARTIFACT_EXPORT_UNSUPPORTED`，不会回退旧报告或调用模型补写。
 
 ### 12.2 通用 Artifact
 
@@ -442,7 +582,7 @@ service + internal_tool_name + SHA256(normalized_arguments)
 
 模型通过内部工具创建和更新 Draft。前端可以展示 Draft，但必须标识 `generating/restricted/reviewing`，且不进入版本历史。
 
-正式 Artifact 提交 Reviewer 时冻结一个 review revision。Reviewer 输入仅包括：用户问题、Draft payload、Evidence 引用解析结果、允许的 Artifact Schema 和已知数据限制；Reviewer 不允许调用 MCP。
+正式 Artifact 提交 Reviewer 时引用一个不可变 `artifact_draft_revisions` 记录。Reviewer 输入仅包括：用户问题、该 Revision 的 payload、Evidence 引用解析结果、允许的 Artifact Schema 和已知数据限制；Reviewer 不允许调用 MCP。
 
 Reviewer 输出：
 
@@ -532,6 +672,8 @@ Artifact 发布或 Draft 更新只显示对应 Tab 更新圆点，不自动切�
 
 所有资源查询同时校验当前用户、Session 归属和软删除状态，归属失败统一返回 404。
 
+`artifact-read-state` 请求体为 `{module, last_seen_sequence}`。前端仅提交自己已渲染的最新 sequence；后端校验它不大于当前 Session sequence，并以 `max(旧值, 新值)` 更新，避免并发到达的新 Artifact 事件被误标为已读。
+
 ### 15.3 SSE 事件
 
 - `run.started/paused/resumed/completed/failed/cancelled`；
@@ -542,7 +684,7 @@ Artifact 发布或 Draft 更新只显示对应 Tab 更新圆点，不自动切�
 - `artifact.published`；
 - `message.completed`。
 
-事件 payload 必须带 `run_id`；Artifact 事件带 `artifact_id/module/parent_artifact_id/status`。前端按事件 sequence 幂等归并。
+事件 payload 必须带 `run_id`；Artifact 事件带 `artifact_id/module/parent_artifact_id/status`，Review 事件带 `review_batch_id/artifact_id/draft_revision_id`。前端按事件 sequence 幂等归并。
 
 ## 十六、安全与审计
 
@@ -562,7 +704,9 @@ Artifact 发布或 Draft 更新只显示对应 Tab 更新圆点，不自动切�
 - 动作 Schema、Profile 权限与工具 Schema；
 - Artifact 强类型和通用 Block；
 - Evidence 引用归属、存在性和不可变性；
-- Reviewer 通过、打回、拒绝和两轮上限；
+- Reviewer 通过、打回、拒绝、单 Artifact 两轮上限和多 Artifact 原子发布；
+- Reviewer/Utility 内部子 Run 的 Profile、审计、可见性和父 Attempt 计数隔离；
+- 供应商有/无 thinking 两种事件协议与前端降级；
 - 记忆压缩与按需读取。
 
 ### 17.2 运行时集成测试
@@ -572,7 +716,7 @@ Artifact 发布或 Draft 更新只显示对应 Tab 更新圆点，不自动切�
 - 三种故障分类的积分状态；
 - 同参数熔断不影响其他工具/参数；
 - 进程中断、租约恢复、SSE 断线续传；
-- Draft → Review → Published 的事务与并发；
+- 单/多 Draft → Review → Published 的事务、并发、revision 失效和整批回滚；
 - 跨用户 Session、Evidence、Artifact 全部拒绝。
 
 ### 17.3 真实模型 + 真实 MCP UAT
@@ -626,7 +770,7 @@ Artifact 发布或 Draft 更新只显示对应 Tab 更新圆点，不自动切�
 1. MCP 调用可能重复执行、重复扣费或错误释放 unknown 预留；
 2. 正式 Artifact 存在无法追溯到 Evidence 的数值；
 3. 跨用户 Session、Evidence、Artifact 或达人详情越权；
-4. 品牌、活动、KOL 任一强类型 Artifact 无法被 BI 或 Excel 消费；
+4. 任一强类型 Artifact 无法被对应 BI 消费，或声明支持 Excel 的 Artifact 无法导出；
 5. Run 恢复导致步骤重放、当前 Attempt 保护计数未重置或执行卡复用；
 6. Reviewer 可以被主 Agent 绕过；
 7. 四个旧快捷入口、API 或缓存仍可从新系统触达；
@@ -639,7 +783,7 @@ Artifact 发布或 Draft 更新只显示对应 Tab 更新圆点，不自动切�
 1. **数据模型与可信工具内核**：Session/Run/Attempt/Step/ToolCall/Event、计费、幂等、故障分类和 Evidence；
 2. **统一模型循环基础**：动作协议、ThinkingSink、Session Agent 基础循环、Utility Profile、暂停/恢复；
 3. **Artifact 与 Reviewer 内核**：稳定身份、Draft、字段级 lineage、不可变版本、通用 Block、Reviewer 循环；
-4. **业务强类型产物与专业 Profile**：品牌、活动、KOL 名单/分析、KOL Detail Profile、用户级 24 小时详情缓存；
+4. **业务强类型产物与专业 Profile**：品牌、活动、KOL 名单/分析、KOL Detail Profile、Session 级 24 小时详情缓存；
 5. **新 API、SSE 与前端全量迁移**：Session、Run、Artifact、固定 BI、详情、删除 Quick；
 6. **真实服务 UAT 与切换**：真实模型/MCP、故障注入、备份、冒烟和回滚演练。
 
