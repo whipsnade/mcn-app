@@ -197,6 +197,26 @@ def test_protocol_violation_rejected_at_registration() -> None:
         registry.register(NonIntCost(), category=CALCULATION_TOOLS)
 
 
+def test_negative_points_cost_rejected() -> None:
+    class NegativeCost:
+        name = "negative_cost"
+        input_model = FakeCalcArgs
+        points_cost = -1
+        external_side_effect = True
+
+        async def execute(self, context, arguments): ...  # pragma: no cover
+
+    registry = ToolRegistry()
+    with pytest.raises(ToolContractError):
+        registry.register(NegativeCost(), category=CALCULATION_TOOLS)
+
+
+def test_zero_points_cost_is_allowed() -> None:
+    registry = ToolRegistry()
+    entry = registry.register(FakeTool("calculate_expression"), category=CALCULATION_TOOLS)
+    assert entry.points_cost == 0
+
+
 def test_tool_input_model_cannot_declare_server_reserved_keys() -> None:
     class ReservedArgs(BaseModel):
         user_id: str

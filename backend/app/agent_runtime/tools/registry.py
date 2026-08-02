@@ -117,8 +117,9 @@ def _validate_tool(tool: TrustedTool) -> None:
     input_model = getattr(tool, "input_model", None)
     if not (isinstance(input_model, type) and issubclass(input_model, BaseModel)):
         raise ToolContractError("tool.input_model must be a Pydantic BaseModel subclass")
-    if not isinstance(getattr(tool, "points_cost", None), int):
-        raise ToolContractError("tool.points_cost must be an int")
+    points_cost = getattr(tool, "points_cost", None)
+    if not isinstance(points_cost, int) or points_cost < 0:
+        raise ToolContractError("tool.points_cost must be a non-negative int")
     if not isinstance(getattr(tool, "external_side_effect", None), bool):
         raise ToolContractError("tool.external_side_effect must be a bool")
     execute = getattr(tool, "execute", None)
