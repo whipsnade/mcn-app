@@ -59,6 +59,8 @@ export interface Message {
   timestamp: string;
   turnId?: string;
   taskId?: string;
+  /** 触发本条消息的 Agent Run（会话区执行卡锚点，对应 API run_id）。 */
+  runId?: string;
   brainstorm?: import('./api/contracts').BrainstormMetadata;
   clarify?: import('./api/contracts').ClarifyMetadata;
   thinking?: ThinkingMetadata;

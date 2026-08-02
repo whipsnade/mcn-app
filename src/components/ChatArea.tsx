@@ -3,10 +3,11 @@ import { Loader2, Pause, Send, Sparkles, ShieldAlert } from 'lucide-react';
 import { Session, Message, type ThinkingBlock } from '../types';
 import type { FollowupSuggestion } from '../api/contracts';
 import { useSessionThinkingStream } from '../hooks/useSessionThinkingStream';
-import TaskFlowNodes from './TaskFlowNodes';
 import ThinkingPanel from './ThinkingPanel';
-import { isTerminalTaskStatus, type TaskFlowNode } from '../state/taskEvents';
+import { isTerminalRunStatus, type RunRuntimeState } from '../state/agentEvents';
+import type { TaskFlowNode } from '../state/taskEvents';
 import type { TaskFlowReplay } from '../hooks/useTaskFlows';
+import AgentRunCard, { type RunClarification } from './agent/AgentRunCard';
 
 /** 空白会话（无消息、无 followup 建议）展示的默认圈选建议，点击填入输入框。 */
 const DEFAULT_SUGGESTIONS: { title: string; prompt: string }[] = [
@@ -55,34 +56,58 @@ export function mergeHistoricalAndRuntimeThinking(
   );
 }
 
+/**
+ * Run 澄清内容来自与该 Run 关联的 assistant 消息（agent_messages.run_id 关联）：
+ * 问题即 assistant 文本，选项取 clarify/brainstorm metadata。
+ */
+function clarificationFor(runId: string, messages: Message[]): RunClarification | undefined {
+  for (const message of messages) {
+    if (message.runId !== runId || message.sender !== 'ai') continue;
+    const options = message.clarify?.options ?? message.brainstorm?.options ?? [];
+    if (options.length === 0) continue;
+    return { question: message.text, options };
+  }
+  return undefined;
+}
+
 interface ChatAreaProps {
   session: Session;
   onSendMessage: (text: string) => Promise<unknown>;
   isAnalyzing: boolean;
   /** 是否处于 brainstorm 澄清等待中（loading 文案区分于任务分析）。 */
   isClarifying?: boolean;
-  /** 取消当前运行中的任务（点击暂停按钮触发）。 */
-  onCancelTask?: () => Promise<unknown>;
   /** 取消请求已发出、等待任务收敛到终态（暂停按钮禁用并显示 loading）。 */
   isCancelling?: boolean;
   isMockMode: boolean;
-  /** 当前流程所属任务，用于隔离不同轮次分析的流程 UI 状态。 */
-  flowTaskId?: string;
-  /** 当前任务的执行流程节点（竖状节点图）。 */
-  flowNodes?: TaskFlowNode[];
-  /** 任务是否已到终态（节点图自动收缩）。 */
-  flowTerminal?: boolean;
-  /** 终态摘要文案（如 分析完成 / 任务失败）。 */
-  flowTerminalLabel?: string;
-  /** 各任务的历史执行流程（终态冻结 / 事件回放重建），锚定在触发消息下方。 */
-  taskFlows?: Record<string, TaskFlowReplay>;
-  /** AI 摘要的流式草稿，实时渲染在节点图下方。 */
-  assistantDraft?: string;
+  /** 当前活跃 Run 的运行时状态（实时执行卡，锚定在触发消息下方）。 */
+  run?: RunRuntimeState;
+  /** 历史 Run 的终态冻结 runtime（按 runId 索引），锚定在各自触发消息下方。 */
+  runHistory?: Record<string, RunRuntimeState>;
+  /** 恢复暂停的 Run（paused → 继续）。 */
+  onResumeRun?: () => Promise<unknown>;
+  /** 暂停当前 Run（点击暂停按钮触发）。 */
+  onCancelRun?: () => Promise<unknown>;
+  /** 兜底取消（旧任务流 App 仍传 onCancelTask；Task 23 切换到 onCancelRun 后移除）。 */
+  onCancelTask?: () => Promise<unknown>;
   onRetryMessage?: (messageId: string) => Promise<unknown>;
   followupStatus?: 'pending' | 'completed' | 'failed';
   followupSuggestions?: FollowupSuggestion[];
   followupError?: string;
   onRetryFollowups?: () => Promise<unknown>;
+
+  // —— 以下旧任务流 props 已被 Run 卡取代，仅为 Task 23 一次性切换前保持 App 编译而保留。 ——
+  /** @deprecated 由 run/runHistory 取代。 */
+  flowTaskId?: string;
+  /** @deprecated 由 run 取代。 */
+  flowNodes?: TaskFlowNode[];
+  /** @deprecated 由 run.status 取代。 */
+  flowTerminal?: boolean;
+  /** @deprecated 由 run.status 取代。 */
+  flowTerminalLabel?: string;
+  /** @deprecated 由 runHistory 取代。 */
+  taskFlows?: Record<string, TaskFlowReplay>;
+  /** @deprecated Run 卡不渲染 assistant 草稿。 */
+  assistantDraft?: string;
 }
 
 export default function ChatArea({
@@ -90,15 +115,13 @@ export default function ChatArea({
   onSendMessage,
   isAnalyzing,
   isClarifying = false,
-  onCancelTask,
   isCancelling = false,
   isMockMode,
-  flowTaskId,
-  flowNodes = [],
-  flowTerminal = false,
-  flowTerminalLabel,
-  taskFlows = {},
-  assistantDraft = '',
+  run,
+  runHistory = {},
+  onResumeRun,
+  onCancelRun,
+  onCancelTask,
   onRetryMessage,
   followupStatus,
   followupSuggestions = [],
@@ -128,7 +151,8 @@ export default function ChatArea({
     [thinkingByTurn],
   );
 
-  // 活跃 turn = 最新一条用户消息的 turnId；其思考块并入执行流程节点展示。
+  // 活跃 turn = 最新一条用户消息的 turnId；活跃 Run 流式期间其 ThinkingPanel 去重隐藏
+  //（思考实时展示在 Run 卡的 AgentThinking 里）。
   const activeTurnId = useMemo(() => {
     for (let index = session.messages.length - 1; index >= 0; index -= 1) {
       const message = session.messages[index];
@@ -136,14 +160,13 @@ export default function ChatArea({
     }
     return undefined;
   }, [session.messages]);
-  const activeThinkingBlocks = activeTurnId ? thinkingByTurn[activeTurnId] : undefined;
-  // 活跃流程是否已锚定到触发它的用户消息（锚定后底部不再重复渲染流程区）。
-  const activeFlowAnchored = Boolean(
-    flowTaskId && session.messages.some(message => message.sender === 'user' && message.taskId === flowTaskId),
+  // 活跃 Run 是否已锚定到触发它的用户消息（锚定后底部不再重复渲染执行卡）。
+  const activeRunAnchored = Boolean(
+    run && session.messages.some(message => message.sender === 'user' && message.runId === run.runId),
   );
-  // 活跃 turn 且流程进行中：思考只出现在流程节点里，消息下方的 ThinkingPanel 去重隐藏；
-  // 终态后流程面板收缩为摘要行，ThinkingPanel 恢复（历史 turn 始终不受影响）。
-  const dedupeActiveThinkingPanel = flowNodes.length > 0 && !flowTerminal;
+  // 活跃 Run 且流式进行中：思考只在 Run 卡里展示，消息下方 ThinkingPanel 去重隐藏；
+  // 终态后 Run 卡收缩，ThinkingPanel 恢复（历史 turn 始终不受影响）。
+  const dedupeActiveThinkingPanel = Boolean(run && !isTerminalRunStatus(run.status));
 
   // 建议点击统一行为：填入输入框并聚焦，不自动提交，由用户确认后发送。
   const fillInput = (text: string) => {
@@ -398,62 +421,29 @@ export default function ChatArea({
                   <ThinkingPanel blocks={thinkingBlocks} />
                 </div>
               )}
-              {/* 每个任务一张执行流程卡，锚定在触发它的用户消息下方，终态收缩保留可回看 */}
-              {!isAI && msg.taskId && (() => {
-                const isActiveFlow = msg.taskId === flowTaskId;
-                if (!isActiveFlow) {
-                  const replay = taskFlows[msg.taskId];
-                  if (replay?.missing) return null;
-                  if (!replay?.runtime) {
-                    return (
-                      <div className="mr-auto ml-11 w-[calc(85%-2.75rem)] max-w-[85%]">
-                        <div className="flex items-center gap-2 rounded-xl border border-slate-100 bg-slate-50 px-3 py-2.5 text-[11px] font-medium text-slate-400" role="status">
-                          <Loader2 className="h-3 w-3 animate-spin" />
-                          执行流程加载中…
-                        </div>
-                      </div>
-                    );
-                  }
+              {/* 每个 Run 一张独立执行卡，锚定在触发它的用户消息下方；终态收缩保留可回看 */}
+              {!isAI && msg.runId && (() => {
+                const isActiveRun = msg.runId === run?.runId;
+                const runtime = isActiveRun ? run : runHistory[msg.runId];
+                if (!runtime) {
                   return (
                     <div className="mr-auto ml-11 w-[calc(85%-2.75rem)] max-w-[85%]">
-                      <TaskFlowNodes
-                        taskId={msg.taskId}
-                        nodes={replay.runtime.nodes ?? []}
-                        terminal={isTerminalTaskStatus(replay.runtime.status)}
-                        terminalLabel={replay.runtime.phaseLabel}
-                      />
+                      <div className="flex items-center gap-2 rounded-xl border border-slate-100 bg-slate-50 px-3 py-2.5 text-[11px] font-medium text-slate-400" role="status">
+                        <Loader2 className="h-3 w-3 animate-spin" />
+                        Run 加载中…
+                      </div>
                     </div>
                   );
                 }
-                if (flowNodes.length === 0 && !assistantDraft && !isAnalyzing) return null;
                 return (
-                  <div className="flex items-start gap-3 mr-auto max-w-[85%]">
-                    <div className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-full font-bold text-[10px] shadow-sm ${isAnalyzing ? 'bg-indigo-500 text-white animate-pulse' : 'bg-indigo-600 text-white'}`}>
-                      AI
-                    </div>
-                    <div className="space-y-2 flex-1 min-w-0">
-                      <div className="flex items-center gap-2 text-[10px] text-slate-400">
-                        <span className="font-semibold text-slate-500">AI 分析师</span>
-                        {isAnalyzing && <span className="text-indigo-500">分析中…</span>}
-                      </div>
-                      {flowNodes.length > 0 && (
-                        <TaskFlowNodes
-                          taskId={flowTaskId}
-                          nodes={flowNodes}
-                          terminal={flowTerminal}
-                          terminalLabel={flowTerminalLabel}
-                          thinkingBlocks={msg.turnId === activeTurnId ? activeThinkingBlocks : undefined}
-                        />
-                      )}
-                      {assistantDraft && (
-                        <div className="rounded-2xl rounded-tl-none bg-indigo-600 px-4 py-3 text-xs md:text-sm leading-relaxed text-white shadow-md">
-                          <div className="whitespace-pre-line font-normal">
-                            {assistantDraft}
-                            {isAnalyzing && <span className="ml-0.5 inline-block h-3.5 w-1.5 animate-pulse rounded-sm bg-white/70 align-middle" />}
-                          </div>
-                        </div>
-                      )}
-                    </div>
+                  <div className="mr-auto ml-11 w-[calc(85%-2.75rem)] max-w-[85%]">
+                    <AgentRunCard
+                      run={runtime}
+                      clarification={clarificationFor(msg.runId, session.messages)}
+                      onPause={onCancelRun || onCancelTask ? () => void (onCancelRun ?? onCancelTask)?.() : undefined}
+                      onResume={onResumeRun ? () => void onResumeRun() : undefined}
+                      onClarify={fillInput}
+                    />
                   </div>
                 );
               })()}
@@ -461,46 +451,38 @@ export default function ChatArea({
           );
         })}
 
-        {/* 过渡形态：活跃任务尚未锚定到消息（POST 未返回的窗口期）时，底部显示进行中指示；
-            一旦锚定（或已是历史任务）流程卡渲染在对应用户消息下方。 */}
-        {!activeFlowAnchored && (isAnalyzing || flowNodes.length > 0 || assistantDraft) && (
+        {/* 过渡形态：活跃 Run 尚未锚定到消息（POST 未返回的窗口期）时，底部显示实时执行卡；
+            一旦锚定，执行卡渲染在触发它的用户消息下方。 */}
+        {!activeRunAnchored && run && !isTerminalRunStatus(run.status) && (
+          <div className="mr-auto ml-11 w-[calc(85%-2.75rem)] max-w-[85%]">
+            <AgentRunCard
+              run={run}
+              clarification={clarificationFor(run.runId, session.messages)}
+              onPause={onCancelRun || onCancelTask ? () => void (onCancelRun ?? onCancelTask)?.() : undefined}
+              onResume={onResumeRun ? () => void onResumeRun() : undefined}
+              onClarify={fillInput}
+            />
+          </div>
+        )}
+        {/* Run 尚未创建（POST 未返回 / brainstorm 澄清等待）时保留进行中提示。 */}
+        {!activeRunAnchored && !run && isAnalyzing && (
           <div className="flex items-start gap-3 mr-auto max-w-[85%]">
-            <div className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-full font-bold text-[10px] shadow-sm ${isAnalyzing ? 'bg-indigo-500 text-white animate-pulse' : 'bg-indigo-600 text-white'}`}>
+            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500 font-bold text-[10px] text-white shadow-sm animate-pulse">
               AI
             </div>
             <div className="space-y-2 flex-1 min-w-0">
               <div className="flex items-center gap-2 text-[10px] text-slate-400">
                 <span className="font-semibold text-slate-500">AI 分析师</span>
-                {isAnalyzing && <span className="text-indigo-500">分析中…</span>}
+                <span className="text-indigo-500">分析中…</span>
               </div>
-              {flowNodes.length > 0 && (
-                <TaskFlowNodes
-                  taskId={flowTaskId}
-                  nodes={flowNodes}
-                  terminal={flowTerminal}
-                  terminalLabel={flowTerminalLabel}
-                  thinkingBlocks={activeThinkingBlocks}
-                />
-              )}
-              {assistantDraft ? (
-                <div className="rounded-2xl rounded-tl-none bg-indigo-600 px-4 py-3 text-xs md:text-sm leading-relaxed text-white shadow-md">
-                  <div className="whitespace-pre-line font-normal">
-                    {assistantDraft}
-                    {isAnalyzing && <span className="ml-0.5 inline-block h-3.5 w-1.5 animate-pulse rounded-sm bg-white/70 align-middle" />}
-                  </div>
+              <div className="rounded-2xl rounded-tl-none border border-slate-100 bg-white px-4 py-3.5 shadow-sm">
+                <div className="flex items-center gap-1.5" role="status">
+                  <span className="h-2 w-2 rounded-full bg-indigo-500 animate-bounce" />
+                  <span className="h-2 w-2 rounded-full bg-indigo-500 animate-bounce [animation-delay:0.2s]" />
+                  <span className="h-2 w-2 rounded-full bg-indigo-500 animate-bounce [animation-delay:0.4s]" />
+                  <span className="text-xs text-slate-400 font-medium ml-1">{isClarifying ? '正在澄清需求…' : '正在分析数据并编制图表...'}</span>
                 </div>
-              ) : (
-                isAnalyzing && (
-                  <div className="rounded-2xl rounded-tl-none bg-white border border-slate-100 px-4 py-3.5 shadow-sm">
-                    <div className="flex items-center gap-1.5" role="status">
-                      <span className="h-2 w-2 rounded-full bg-indigo-500 animate-bounce" />
-                      <span className="h-2 w-2 rounded-full bg-indigo-500 animate-bounce [animation-delay:0.2s]" />
-                      <span className="h-2 w-2 rounded-full bg-indigo-500 animate-bounce [animation-delay:0.4s]" />
-                      <span className="text-xs text-slate-400 font-medium ml-1">{isClarifying ? '正在澄清需求…' : '正在分析数据并编制图表...'}</span>
-                    </div>
-                  </div>
-                )
-              )}
+              </div>
             </div>
           </div>
         )}
@@ -611,7 +593,7 @@ export default function ChatArea({
               type="button"
               aria-label={isCancelling ? '正在取消' : '暂停'}
               disabled={isCancelling}
-              onClick={() => void onCancelTask?.()}
+              onClick={() => void (onCancelRun ?? onCancelTask)?.()}
               className={`px-3 py-2 rounded-lg text-white transition active:scale-95 ${
                 isCancelling
                   ? 'bg-slate-200 text-slate-400 cursor-not-allowed'

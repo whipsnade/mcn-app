@@ -21,6 +21,7 @@ export type RunStatus =
   | 'running'
   | 'reviewing'
   | 'paused'
+  | 'clarification_requested'
   | 'completed'
   | 'failed'
   | 'cancelled';
@@ -47,6 +48,10 @@ export interface RunToolCall {
   name: string;
   status: 'running' | 'succeeded' | 'failed' | 'unknown';
   detail?: string;
+  /** 工具耗时（毫秒）；仅 tool.succeeded 事件带耗时字段时填充（§13.1 工具步骤展示）。 */
+  durationMs?: number;
+  /** 本次调用结算积分；无积分字段时不展示（零积分工具）。 */
+  points?: number;
 }
 
 export interface RunArtifactDraft {
@@ -213,11 +218,17 @@ function withToolCall(state: RunRuntimeState, event: RunEvent): RunRuntimeState 
             : 'unknown';
         const index = state.toolCalls.findIndex(call => call.status === 'running');
         if (index === -1) return state;
+        const durationValue = valueOf(event.payload, 'durationMs', 'duration_ms');
+        const pointsValue = valueOf(event.payload, 'points', 'points');
+        const durationMs = Number(durationValue);
+        const points = Number(pointsValue);
         const toolCalls = [...state.toolCalls];
         toolCalls[index] = {
           ...toolCalls[index],
           status,
           detail: String(event.payload.error_type ?? event.payload.message ?? '') || undefined,
+          ...(durationValue != null && Number.isFinite(durationMs) ? { durationMs } : {}),
+          ...(pointsValue != null && Number.isFinite(points) ? { points } : {}),
         };
         return { ...state, toolCalls };
       }

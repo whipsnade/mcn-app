@@ -3,11 +3,16 @@ import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Session, ThinkingBlock } from '../types';
 import { useSessionThinkingStream } from '../hooks/useSessionThinkingStream';
+import { initialRunRuntime, type RunRuntimeState } from '../state/agentEvents';
 import ChatArea, { mergeHistoricalAndRuntimeThinking } from './ChatArea';
 
 vi.mock('../hooks/useSessionThinkingStream', () => ({
   useSessionThinkingStream: vi.fn(),
 }));
+
+function runtime(runId: string, overrides: Partial<RunRuntimeState> = {}): RunRuntimeState {
+  return { ...initialRunRuntime(runId), ...overrides };
+}
 
 
 const session: Session = {
@@ -423,156 +428,165 @@ describe('ChatArea', () => {
     expect(screen.queryByRole('button', { name: '暂停' })).toBeNull();
   });
 
-  it('shows the flow nodes with failure detail without exposing transport details', () => {
+  it('shows a failed run as a terminal card without exposing transport details', async () => {
     render(
       <ChatArea
-        session={session}
-        onSendMessage={vi.fn()}
-        isAnalyzing
-        isMockMode={false}
-        flowNodes={[
-          { id: 'accepted', label: '任务已受理', status: 'succeeded' },
-          { id: 'tool-1', label: '查询小红书数据', status: 'failed', detail: '社媒数据服务返回错误，请稍后重试。' },
-        ]}
-      />,
-    );
-
-    expect(screen.getByText('查询小红书数据')).toBeVisible();
-    expect(screen.getByText('社媒数据服务返回错误，请稍后重试。')).toBeVisible();
-    expect(screen.queryByText('/api/v1/mcp')).not.toBeInTheDocument();
-  });
-
-  it('collapses the flow nodes after the terminal event and keeps the final reply', async () => {
-    render(
-      <ChatArea
-        session={session}
+        session={{
+          ...session,
+          messages: [{ id: 'm1', sender: 'user', text: '第一轮分析', timestamp: '10:00', runId: 'run-1' }],
+        }}
         onSendMessage={vi.fn()}
         isAnalyzing={false}
         isMockMode={false}
-        flowTerminal
-        flowTerminalLabel="分析完成"
-        assistantDraft="本轮共找到 3 位候选达人。"
-        flowNodes={[
-          { id: 'accepted', label: '任务已受理', status: 'succeeded' },
-          { id: 'tool-1', label: '查询小红书数据', status: 'failed', detail: '社媒数据服务返回错误，请稍后重试。' },
-          { id: 'terminal', label: '分析完成', status: 'succeeded' },
-        ]}
+        run={runtime('run-1', {
+          status: 'failed',
+          errorMessage: '社媒数据服务返回错误，请稍后重试。',
+          steps: [
+            { id: 'run', label: '开始执行', status: 'succeeded' },
+            { id: 'terminal-1', label: '运行失败', status: 'failed' },
+          ],
+          toolCalls: [{ id: 'tool-1', name: 'brand_search', status: 'failed' }],
+        })}
       />,
     );
 
-    // 终态后自动收缩：节点明细默认不可见，摘要行可见，最终回复保留。
-    expect(screen.queryByText('查询小红书数据')).not.toBeInTheDocument();
-    expect(screen.getByText('本轮共找到 3 位候选达人。')).toBeVisible();
-    const toggle = screen.getByRole('button', { name: /执行流程/ });
-    expect(toggle).toHaveTextContent('1 步失败');
-    fireEvent.click(toggle);
-    expect(await screen.findByText('查询小红书数据')).toBeVisible();
-    expect(screen.getByText('社媒数据服务返回错误，请稍后重试。')).toBeVisible();
+    // 终态收缩为摘要行，失败提示保留在展开明细里。
+    const collapsed = screen.getByRole('button', { name: /执行卡/ });
+    expect(collapsed).toHaveTextContent('运行失败');
+    expect(screen.queryByText('/api/v1/mcp')).not.toBeInTheDocument();
+    fireEvent.click(collapsed);
+    expect(await screen.findByText('社媒数据服务返回错误，请稍后重试。')).toBeVisible();
+    expect(screen.getByText('brand_search')).toBeVisible();
   });
 
-  it('anchors each task flow under its own user message instead of sharing one flow', () => {
+  it('anchors each run card under its triggering user message; historical runs collapse, the active run is live', () => {
     render(
       <ChatArea
         session={{
           ...session,
           messages: [
-            { id: 'm1', sender: 'user', text: '第一轮分析', timestamp: '10:00', taskId: 'task-1' },
-            { id: 'm2', sender: 'user', text: '第二轮分析', timestamp: '10:05', taskId: 'task-2' },
+            { id: 'm1', sender: 'user', text: '第一轮分析', timestamp: '10:00', runId: 'run-1' },
+            { id: 'm2', sender: 'user', text: '第二轮分析', timestamp: '10:05', runId: 'run-2' },
           ],
         }}
         onSendMessage={vi.fn()}
         isAnalyzing={false}
         isMockMode={false}
-        flowTaskId="task-2"
-        flowTerminal
-        flowTerminalLabel="分析完成"
-        flowNodes={[
-          { id: 'accepted', label: '任务已受理', status: 'succeeded' },
-          { id: 'terminal', label: '分析完成', status: 'succeeded' },
-        ]}
-        taskFlows={{
-          'task-1': {
-            runtime: {
-              taskId: 'task-1',
-              lastEventId: 2,
-              assistantDraft: '',
-              connection: 'closed',
-              status: 'completed',
-              phaseLabel: '分析完成',
-              nodes: [
-                { id: 'accepted', label: '任务已受理', status: 'succeeded' },
-                { id: 'tool-1', label: '查询抖音数据', status: 'succeeded' },
-                { id: 'terminal', label: '分析完成', status: 'succeeded' },
-              ],
-            },
-          },
+        run={runtime('run-2', {
+          status: 'running',
+          hasThinking: true,
+          thinkingStatus: 'running',
+          thinking: '正在交叉匹配达人',
+          toolCalls: [{ id: 'tool-1', name: 'kol_feed', status: 'running' }],
+        })}
+        runHistory={{
+          'run-1': runtime('run-1', {
+            status: 'completed',
+            steps: [
+              { id: 'run', label: '开始执行', status: 'succeeded' },
+              { id: 'terminal-1', label: '分析完成', status: 'succeeded' },
+            ],
+          }),
         }}
       />,
     );
 
-    // 两张终态流程卡各自锚定（底部不再出现第三块共享流程区）。
-    const toggles = screen.getAllByRole('button', { name: /执行流程/ });
-    expect(toggles).toHaveLength(2);
-    expect(toggles[0]).toHaveTextContent('共 3 步');
-    expect(toggles[1]).toHaveTextContent('共 2 步');
-    // 第一张卡在第二轮用户消息之前（锚定在第一轮消息下方）。
+    // 历史 run-1 收缩为终态摘要；活跃 run-2 实时展示节点与思考。
+    const collapsed = screen.getByRole('button', { name: /执行卡/ });
+    expect(collapsed).toHaveTextContent('分析完成');
+    expect(collapsed).toHaveTextContent('共 2 步');
+    expect(screen.getByText('kol_feed')).toBeVisible();
+    expect(screen.getByText('正在交叉匹配达人')).toBeVisible();
+    // 活跃 Run 已锚定到消息，底部不再重复渲染执行卡。
+    expect(screen.getAllByLabelText('执行卡')).toHaveLength(1);
+    // 历史卡锚定在第一轮消息之后、第二轮消息之前；活跃卡在第二轮消息之后。
     const secondMessage = screen.getByText('第二轮分析');
-    expect(toggles[0].compareDocumentPosition(secondMessage) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(collapsed.compareDocumentPosition(secondMessage) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    const activeCard = screen.getByLabelText('执行卡');
+    expect(secondMessage.compareDocumentPosition(activeCard) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
-  it('shows a loading placeholder while a historical flow is replaying and no card when missing', () => {
-    const { rerender } = render(
-      <ChatArea
-        session={{
-          ...session,
-          messages: [{ id: 'm1', sender: 'user', text: '历史分析', timestamp: '10:00', taskId: 'task-h' }],
-        }}
-        onSendMessage={vi.fn()}
-        isAnalyzing={false}
-        isMockMode={false}
-        taskFlows={{}}
-      />,
-    );
-
-    expect(screen.getByText('执行流程加载中…')).toBeVisible();
-
-    rerender(
-      <ChatArea
-        session={{
-          ...session,
-          messages: [{ id: 'm1', sender: 'user', text: '历史分析', timestamp: '10:00', taskId: 'task-h' }],
-        }}
-        onSendMessage={vi.fn()}
-        isAnalyzing={false}
-        isMockMode={false}
-        taskFlows={{ 'task-h': { missing: true } }}
-      />,
-    );
-
-    expect(screen.queryByText('执行流程加载中…')).toBeNull();
-    expect(screen.queryByRole('button', { name: /执行流程/ })).toBeNull();
-  });
-
-  it('renders the active flow live under its trigger message without duplicating the bottom block', () => {
+  it('shows a loading placeholder while a historical run runtime is still loading', () => {
     render(
       <ChatArea
         session={{
           ...session,
-          messages: [{ id: 'm1', sender: 'user', text: '正在进行的分析', timestamp: '10:00', taskId: 'task-1', turnId: 'turn-1' }],
+          messages: [{ id: 'm1', sender: 'user', text: '历史分析', timestamp: '10:00', runId: 'run-h' }],
         }}
         onSendMessage={vi.fn()}
-        isAnalyzing
+        isAnalyzing={false}
         isMockMode={false}
-        flowTaskId="task-1"
-        flowNodes={[{ id: 'tool-1', label: '查询小红书数据', status: 'running' }]}
-        assistantDraft="已找到 2 位候选…"
+        runHistory={{}}
       />,
     );
 
-    // 实时节点 + 草稿锚定在消息下方，全流程区只有这一块。
-    expect(screen.getByText('查询小红书数据')).toBeVisible();
-    expect(screen.getByText(/已找到 2 位候选/)).toBeVisible();
-    expect(screen.getAllByLabelText('执行流程')).toHaveLength(1);
+    expect(screen.getByText('Run 加载中…')).toBeVisible();
+  });
+
+  it('wires clarification chips and pause/resume through ChatArea', async () => {
+    const onSendMessage = vi.fn().mockResolvedValue(undefined);
+    const onCancelRun = vi.fn().mockResolvedValue(undefined);
+    const onResumeRun = vi.fn().mockResolvedValue(undefined);
+    const { rerender } = render(
+      <ChatArea
+        session={{
+          ...session,
+          messages: [
+            { id: 'm1', sender: 'user', text: '帮我分析', timestamp: '10:00', runId: 'run-1' },
+            { id: 'a1', sender: 'ai', text: '想看哪个品牌的分析？', timestamp: '10:01', runId: 'run-1', clarify: { options: ['海底捞', '喜茶'] } },
+          ],
+        }}
+        onSendMessage={onSendMessage}
+        isAnalyzing={false}
+        isMockMode={false}
+        run={runtime('run-1', { status: 'clarification_requested' })}
+        onCancelRun={onCancelRun}
+        onResumeRun={onResumeRun}
+      />,
+    );
+
+    // 澄清 chips：点击只填入输入框，不自动提交。
+    const card = screen.getByLabelText('执行卡');
+    await act(async () => {
+      fireEvent.click(within(card).getByRole('button', { name: '海底捞' }));
+    });
+    expect(onSendMessage).not.toHaveBeenCalled();
+    expect((screen.getByPlaceholderText(/输入消息并向 AI 分析师提问/) as HTMLTextAreaElement).value)
+      .toBe('海底捞');
+
+    // paused → 继续按钮调用 onResumeRun。
+    rerender(
+      <ChatArea
+        session={{ ...session, messages: [{ id: 'm1', sender: 'user', text: '帮我分析', timestamp: '10:00', runId: 'run-1' }] }}
+        onSendMessage={onSendMessage}
+        isAnalyzing={false}
+        isMockMode={false}
+        run={runtime('run-1', { status: 'paused' })}
+        onCancelRun={onCancelRun}
+        onResumeRun={onResumeRun}
+      />,
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '继续' }));
+    });
+    expect(onResumeRun).toHaveBeenCalledOnce();
+
+    // running → 暂停按钮调用 onCancelRun。
+    rerender(
+      <ChatArea
+        session={{ ...session, messages: [{ id: 'm1', sender: 'user', text: '帮我分析', timestamp: '10:00', runId: 'run-1' }] }}
+        onSendMessage={onSendMessage}
+        isAnalyzing={false}
+        isMockMode={false}
+        run={runtime('run-1', { status: 'running' })}
+        onCancelRun={onCancelRun}
+        onResumeRun={onResumeRun}
+      />,
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '暂停' }));
+    });
+    expect(onCancelRun).toHaveBeenCalledOnce();
   });
 
   it('allows retrying a terminal user message', async () => {
@@ -1000,7 +1014,7 @@ describe('ChatArea', () => {
     expect(screen.getByRole('button', { name: '确认' })).toBeDisabled();
   });
 
-  it('hides the active turn thinking panel while flow nodes stream and keeps history panels', () => {
+  it('hides the active run turn thinking panel while the run streams and keeps history panels', () => {
     vi.mocked(useSessionThinkingStream).mockReturnValue({
       sessionId: 'session-1',
       byTurn: {
@@ -1026,25 +1040,24 @@ describe('ChatArea', () => {
           ...session,
           messages: [
             { id: 'message-u1', sender: 'user', text: '第一问', timestamp: '10:00', turnId: 'turn-1' },
-            { id: 'message-u2', sender: 'user', text: '第二问', timestamp: '10:01', turnId: 'turn-2' },
+            { id: 'message-u2', sender: 'user', text: '第二问', timestamp: '10:01', turnId: 'turn-2', runId: 'run-1' },
           ],
         }}
         onSendMessage={vi.fn()}
         isAnalyzing
         isMockMode={false}
-        flowNodes={[{ id: 'tool-1', label: '查询数据', status: 'running' }]}
+        run={runtime('run-1', { status: 'running' })}
       />,
     );
 
-    // 历史 turn 的 ThinkingPanel 保留；活跃 turn 的 ThinkingPanel 去重隐藏。
+    // 历史 turn 的 ThinkingPanel 保留；活跃 Run 流式期间其 turn 的 ThinkingPanel 去重隐藏。
     expect(screen.getByRole('button', { name: '已思考 21.8 秒' })).toBeVisible();
     expect(screen.queryByRole('button', { name: '已思考 5.0 秒' })).toBeNull();
-    // 活跃 turn 的思考块并入执行流程节点（默认折叠，展示标签）。
-    const flowSection = screen.getByRole('region', { name: '执行流程' });
-    expect(within(flowSection).getByText('活跃决策')).toBeVisible();
+    // 活跃 Run 卡展示自己的思考区（无 thinking 事件时为「正在处理」）。
+    expect(screen.getByText('正在处理')).toBeVisible();
   });
 
-  it('restores the active turn thinking panel after the flow reaches a terminal state', () => {
+  it('restores the active turn thinking panel after the run reaches a terminal state', () => {
     vi.mocked(useSessionThinkingStream).mockReturnValue({
       sessionId: 'session-1',
       byTurn: {
@@ -1064,18 +1077,16 @@ describe('ChatArea', () => {
         session={{
           ...session,
           messages: [
-            { id: 'message-u2', sender: 'user', text: '第二问', timestamp: '10:01', turnId: 'turn-2' },
+            { id: 'message-u2', sender: 'user', text: '第二问', timestamp: '10:01', turnId: 'turn-2', runId: 'run-1' },
           ],
         }}
         onSendMessage={vi.fn()}
         isAnalyzing={false}
         isMockMode={false}
-        flowTerminal
-        flowTerminalLabel="分析完成"
-        flowNodes={[
-          { id: 'tool-1', label: '查询数据', status: 'succeeded' },
-          { id: 'terminal', label: '分析完成', status: 'succeeded' },
-        ]}
+        run={runtime('run-1', {
+          status: 'completed',
+          steps: [{ id: 'terminal-1', label: '分析完成', status: 'succeeded' }],
+        })}
       />,
     );
 
