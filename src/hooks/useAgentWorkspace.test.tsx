@@ -7,6 +7,7 @@ import type { ApiAgentArtifact } from '../api/agentArtifacts';
 import * as agentArtifactsApi from '../api/agentArtifacts';
 import type { ApiWallet } from '../api/contracts';
 import * as walletApi from '../api/wallet';
+import { initialRunRuntime } from '../state/agentEvents';
 import { useAgentRun } from './useAgentRun';
 import { useAgentWorkspace } from './useAgentWorkspace';
 
@@ -244,5 +245,45 @@ describe('useAgentWorkspace', () => {
     expect(runId).toBe('run-2');
     expect(result.current.activeRunId).toBe('run-2');
     expect(vi.mocked(useAgentRun).mock.calls.at(-1)?.[0]).toBe('run-2');
+  });
+
+  it('refetches artifacts only when artifact-relevant run events arrive, not on thinking deltas', async () => {
+    vi.mocked(agentApi.listSessions).mockResolvedValue([s1]);
+    vi.mocked(agentApi.getSession).mockResolvedValue(s1Detail);
+    vi.mocked(agentArtifactsApi.listArtifacts).mockResolvedValue([]);
+    const base = {
+      ...initialRunRuntime('run-1'),
+      connection: 'connected' as const,
+      lastEventId: 1,
+      artifactsVersion: 0,
+    };
+    vi.mocked(useAgentRun).mockReturnValue(base);
+
+    const { rerender } = renderHook(() => useAgentWorkspace('user-1'));
+    await waitFor(() => expect(agentArtifactsApi.listArtifacts).toHaveBeenCalledTimes(1));
+
+    // 纯 thinking 增量：lastEventId 增长但 artifactsVersion 不变 → 不重拉目录。
+    vi.mocked(useAgentRun).mockReturnValue({
+      ...base,
+      lastEventId: 99,
+      thinking: '思考增量',
+      hasThinking: true,
+    });
+    await act(async () => {
+      rerender();
+    });
+    expect(agentArtifactsApi.listArtifacts).toHaveBeenCalledTimes(1);
+
+    // artifact.published 事件：artifactsVersion 增长 → 重拉目录。
+    vi.mocked(useAgentRun).mockReturnValue({
+      ...base,
+      lastEventId: 100,
+      artifactsVersion: 1,
+      drafts: [{ artifactId: 'art-1', module: 'brand', version: 1, status: 'published' }],
+    });
+    await act(async () => {
+      rerender();
+    });
+    expect(agentArtifactsApi.listArtifacts).toHaveBeenCalledTimes(2);
   });
 });

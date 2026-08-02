@@ -28,6 +28,11 @@ export function calculateRunReconnectDelay(
   return Math.round(cap * (0.5 + jitter * 0.5));
 }
 
+/** 4xx 是永久失败：Run 不存在/不可见（404）或请求被拒，重连不会成功。 */
+function isPermanentSseError(error: unknown): boolean {
+  return error instanceof Error && /^SSE_4\d{2}$/.test(error.message);
+}
+
 export function useAgentRun(
   runId: string | undefined,
   options: AgentRunOptions = {},
@@ -83,6 +88,12 @@ export function useAgentRun(
         } catch (error) {
           if (controller.signal.aborted || stopped || generation !== generationRef.current) break;
           const currentState = latestState.current ?? initial;
+          if (isPermanentSseError(error)) {
+            // Run 不存在/不可见（404）或请求被拒（其它 4xx）：永久态，
+            // 停止重连并标记，交由上层复位 activeRunId。
+            update({ ...currentState, connection: 'closed', notFound: true });
+            break;
+          }
           update({ ...currentState, connection: 'error' });
         }
         const currentState = latestState.current ?? initial;

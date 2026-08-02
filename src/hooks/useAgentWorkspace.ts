@@ -23,6 +23,7 @@ import type { ApiAgentArtifact } from '../api/agentArtifacts';
 import { listArtifacts, markArtifactRead } from '../api/agentArtifacts';
 import type { ApiWallet } from '../api/contracts';
 import { getWallet } from '../api/wallet';
+import { isTerminalRunStatus } from '../state/agentEvents';
 import type { RunRuntimeState } from '../state/agentEvents';
 import { useAgentRun } from './useAgentRun';
 
@@ -264,19 +265,25 @@ export function useAgentWorkspace(userId?: string) {
 
   const cancelActiveRun = useCallback(async () => {
     if (!activeRunId) return;
+    const generation = generationRef.current;
     try {
       await cancelRunRequest(activeRunId);
     } catch (reason) {
-      console.warn('cancel run failed', reason);
+      if (generationRef.current === generation) {
+        setError(reason instanceof Error ? reason.message : '取消运行失败');
+      }
     }
   }, [activeRunId]);
 
   const resumeActiveRun = useCallback(async () => {
     if (!activeRunId) return;
+    const generation = generationRef.current;
     try {
       await resumeRunRequest(activeRunId);
     } catch (reason) {
-      console.warn('resume run failed', reason);
+      if (generationRef.current === generation) {
+        setError(reason instanceof Error ? reason.message : '恢复运行失败');
+      }
     }
   }, [activeRunId]);
 
@@ -314,7 +321,9 @@ export function useAgentWorkspace(userId?: string) {
     }
   }, [userId]);
 
-  // 会话激活 / 新 Run 事件到达时刷新当前会话的 artifact 目录（BI 三 Tab）。
+  // 会话激活 / Run 产物相关事件（draft/review/publish）到达时刷新当前会话的
+  // artifact 目录（BI 三 Tab）。只依赖 artifactsVersion：纯 thinking/tool 增量
+  // 不会触发整目录重拉。
   useEffect(() => {
     if (!userId || !activeSessionId) return;
     const generation = generationRef.current;
@@ -324,13 +333,20 @@ export function useAgentWorkspace(userId?: string) {
         setArtifacts(items);
       })
       .catch(() => undefined);
-  }, [activeSessionId, run?.lastEventId, userId]);
+  }, [activeSessionId, run?.artifactsVersion, userId]);
 
-  // 加载后 + Run 到达终态（积分结算）时刷新钱包余额。
+  // 加载后 + Run 到达终态（积分结算）时刷新钱包余额；
+  // 只在终态翻转时刷新，不在 running/reviewing 之间反复拉取。
   useEffect(() => {
     if (!userId) return;
     void refreshWallet();
-  }, [refreshWallet, run?.status, userId]);
+  }, [refreshWallet, userId, isTerminalRunStatus(run?.status)]);
+
+  // run events 404/4xx（已删除/不可见）是永久态：复位 activeRunId，停止流订阅。
+  useEffect(() => {
+    if (!run?.notFound) return;
+    setActiveRunId(undefined);
+  }, [run?.notFound]);
 
   const markArtifactSeen = useCallback(async (module: string, lastSeenSequence: number) => {
     if (!userId || !activeSessionId) return;

@@ -72,6 +72,27 @@ describe('useAgentRun', () => {
     fake.restore();
   });
 
+  it('stops reconnecting and marks notFound when the events endpoint returns 404', async () => {
+    const fetchRunEvents = vi.spyOn(agentApi, 'fetchRunEvents')
+      .mockRejectedValue(new Error('SSE_404'));
+    const { result } = renderHook(() => useAgentRun('run-ghost'));
+
+    await waitFor(() => expect(result.current?.notFound).toBe(true));
+
+    expect(result.current?.connection).toBe('closed');
+    expect(fetchRunEvents).toHaveBeenCalledTimes(1);
+  });
+
+  it('treats other 4xx SSE responses as permanent too', async () => {
+    const fetchRunEvents = vi.spyOn(agentApi, 'fetchRunEvents')
+      .mockRejectedValue(new Error('SSE_403'));
+    const { result } = renderHook(() => useAgentRun('run-blocked'));
+
+    await waitFor(() => expect(result.current?.notFound).toBe(true));
+
+    expect(fetchRunEvents).toHaveBeenCalledTimes(1);
+  });
+
   it('drops stale late responses from a previous run via the generation token', async () => {
     const pending = new Promise<void>(() => {});
     const callbacks: Array<(event: RunEvent) => void> = [];

@@ -88,6 +88,11 @@ export interface RunRuntimeState {
   drafts: RunArtifactDraft[];
   review?: RunReview;
   messageCompleted: boolean;
+  /** 产物相关事件（draft 创建/更新、published、review 各态）到达次数；
+   * 上层据此只在产物变化时刷新 artifact 目录，而非每个 SSE 帧都刷新。 */
+  artifactsVersion: number;
+  /** events 端点 404/4xx：Run 不存在或不可见，永久态，上层据此复位 activeRunId。 */
+  notFound?: boolean;
   errorCode?: string;
   errorMessage?: string;
   activity?: string;
@@ -104,6 +109,7 @@ export function initialRunRuntime(runId: string): RunRuntimeState {
     hasThinking: false,
     drafts: [],
     messageCompleted: false,
+    artifactsVersion: 0,
   };
 }
 
@@ -348,9 +354,21 @@ function withMessage(state: RunRuntimeState, event: RunEvent): RunRuntimeState {
   return state;
 }
 
+function isArtifactRelevantEvent(event: RunEvent): boolean {
+  return event.type.startsWith('artifact.draft.')
+    || event.type === 'artifact.published'
+    || event.type.startsWith('review.');
+}
+
 export function reduceRunEvent(state: RunRuntimeState, event: RunEvent): RunRuntimeState {
   if (event.runId !== state.runId || event.id <= state.lastEventId) return state;
-  const next = { ...state, lastEventId: event.id };
+  const next = {
+    ...state,
+    lastEventId: event.id,
+    artifactsVersion: isArtifactRelevantEvent(event)
+      ? state.artifactsVersion + 1
+      : state.artifactsVersion,
+  };
   return withSteps(
     withMessage(
       withReview(
