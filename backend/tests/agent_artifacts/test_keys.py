@@ -53,6 +53,30 @@ def test_kol_selection_scope_hash_is_order_independent() -> None:
     assert key_a == f"kol-selection:{expected}"
 
 
+def test_kol_selection_scope_hash_normalizes_string_leaves() -> None:
+    # 同一业务 scope 仅空白/大小写不同 → 递归标准化后 hash 一致（§8.1 统一规则）
+    scope_a = {
+        "brand": " 瑞幸  Coffee ",
+        "platforms": ["douyin", "XHS"],
+        "audience": {"age_ranges": ["18-24", " 25-34 "]},
+    }
+    scope_b = {
+        "brand": "瑞幸 Coffee",
+        "platforms": ["douyin", "xhs"],
+        "audience": {"age_ranges": ["18-24", "25-34"]},
+    }
+    key_a = build_artifact_key("kol-selection", scope=scope_a)
+    key_b = build_artifact_key("kol-selection", scope=scope_b)
+    assert key_a == key_b
+    assert key_a.startswith("kol-selection:")
+    # 非字符串叶子（数字/布尔）参与 hash，不因类型误归一化
+    assert build_artifact_key(
+        "kol-selection", scope={"brand": "瑞幸", "budget_min": 1000}
+    ) != build_artifact_key(
+        "kol-selection", scope={"brand": "瑞幸", "budget_min": 2000}
+    )
+
+
 def test_kol_selection_scope_hash_changes_with_scope() -> None:
     assert build_artifact_key("kol-selection", scope={"brand": "瑞幸"}) != build_artifact_key(
         "kol-selection", scope={"brand": "星巴克"}

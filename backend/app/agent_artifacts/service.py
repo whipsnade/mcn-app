@@ -28,7 +28,8 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_artifacts.keys import build_artifact_key
@@ -364,20 +365,59 @@ class ArtifactService:
     async def advance_read_state(
         self, user_id: str, session_id: str, module: str, sequence: int
     ) -> int:
-        """水位只前进：``new = max(old, sequence)``，绝不后退。返回新的水位。"""
+        """水位只前进：``new = max(old, sequence)``，绝不后退。返回新的水位。
+
+        兼容两种 key 形状：新列 ``(user_id, session_id, module)`` 与遗留列
+        ``(user_id, session_id, module_key)``。遗留写入方（app/artifacts/service）
+        留下的行 ``module`` 为 NULL，按新形状查不到，必须再按 ``module_key`` 查询，
+        命中后更新同一行而非 INSERT，避免撞遗留唯一约束产生 DuplicateKey。
+        并发首插竞争（另一事务已插入同一行）时捕获 IntegrityError 后重读并更新。
+        """
         now = _utcnow()
         table = AgentArtifactReadState.__table__
-        row = await self.db.execute(
-            select(table.c.id, table.c.last_seen_sequence)
-            .where(
+
+        async def _load(predicate: Any) -> Any:
+            row = await self.db.execute(
+                select(table.c.id, table.c.last_seen_sequence, table.c.module)
+                .where(predicate)
+                .with_for_update()
+            )
+            return row.first()
+
+        existing = await _load(
+            and_(
                 table.c.user_id == user_id,
                 table.c.session_id == session_id,
                 table.c.module == module,
             )
-            .with_for_update()
         )
-        existing = row.first()
         if existing is None:
+            existing = await _load(
+                and_(
+                    table.c.user_id == user_id,
+                    table.c.session_id == session_id,
+                    table.c.module_key == module,
+                )
+            )
+
+        if existing is not None:
+            # 遗留行的 last_seen_sequence 可能为 NULL，按 0 处理。
+            new_sequence = max(existing.last_seen_sequence or 0, sequence)
+            # 命中遗留行时 module 为 NULL，即使水位未变也要补齐新列。
+            if new_sequence != (existing.last_seen_sequence or 0) or existing.module is None:
+                await self.db.execute(
+                    table.update()
+                    .where(table.c.id == existing.id)
+                    .values(
+                        module=module,
+                        last_seen_sequence=new_sequence,
+                        updated_at=now,
+                        seen_at=now,
+                    )
+                )
+            return new_sequence
+
+        try:
             await self.db.execute(
                 table.insert().values(
                     id=str(uuid4()),
@@ -391,12 +431,35 @@ class ArtifactService:
                     seen_at=now,
                 )
             )
-            return sequence
-        new_sequence = max(existing.last_seen_sequence, sequence)
-        if new_sequence != existing.last_seen_sequence:
+        except IntegrityError:
+            # 并发首插竞争：另一事务先插入了同一 (module) 或 (module_key) 行 →
+            # 重读并更新，而不是把 DuplicateKey 抛给上层。
+            existing = await _load(
+                or_(
+                    and_(
+                        table.c.user_id == user_id,
+                        table.c.session_id == session_id,
+                        table.c.module == module,
+                    ),
+                    and_(
+                        table.c.user_id == user_id,
+                        table.c.session_id == session_id,
+                        table.c.module_key == module,
+                    ),
+                )
+            )
+            if existing is None:  # pragma: no cover - 竞态窗口内行必然已存在
+                raise
+            new_sequence = max(existing.last_seen_sequence or 0, sequence)
             await self.db.execute(
                 table.update()
                 .where(table.c.id == existing.id)
-                .values(last_seen_sequence=new_sequence, updated_at=now, seen_at=now)
+                .values(
+                    module=module,
+                    last_seen_sequence=new_sequence,
+                    updated_at=now,
+                    seen_at=now,
+                )
             )
-        return new_sequence
+            return new_sequence
+        return sequence

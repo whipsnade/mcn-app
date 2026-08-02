@@ -10,7 +10,8 @@
 - 钻取：``insight:{parent_artifact_version_id}:{normalized_question_hash}``。
 
 标准化 = NFKC + trim + 连续空白折叠 + 英文小写；hash 使用 SHA-256。
-``scope``/``question`` 的序列化用 ``sort_keys``，保证与 dict 键顺序无关。
+``scope`` 先递归标准化所有字符串叶子再序列化，``question`` 先 ``_normalize`` 再
+序列化；序列化统一用 ``sort_keys``，保证与 dict 键顺序无关。
 
 API 只接受业务字段，不接受模型自定义 key —— 模型无法直接指定数据库 key。
 """
@@ -39,6 +40,21 @@ def _stable_hash(value: Any) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _normalize_value(value: Any) -> Any:
+    """递归标准化 JSON 结构中的字符串叶子（与 ``_normalize`` 同规则）。
+
+    非字符串叶子（数字/布尔/None）保持原样，dict 键不变，保证同一业务 scope
+    即使空白/大小写不同也生成同一 hash（设计 §8.1 统一标准化规则）。
+    """
+    if isinstance(value, str):
+        return _normalize(value)
+    if isinstance(value, dict):
+        return {key: _normalize_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_normalize_value(item) for item in value]
+    return value
+
+
 def build_artifact_key(
     module: str,
     *,
@@ -57,7 +73,7 @@ def build_artifact_key(
     if module == "campaign":
         return f"campaign:{_normalize(brand or '')}:{_normalize(campaign or '')}"
     if module == "kol-selection":
-        return f"kol-selection:{_stable_hash(scope)}"
+        return f"kol-selection:{_stable_hash(_normalize_value(scope))}"
     if module == "kol-analysis":
         return f"kol-analysis:{selection_artifact_id}"
     if module == "kol-detail":
