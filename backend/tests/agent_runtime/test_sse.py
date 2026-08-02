@@ -24,6 +24,14 @@ def test_encode_sse_event_framing_and_run_id() -> None:
     assert data["text"] == "hi"
 
 
+def test_encode_sse_event_forces_server_run_id() -> None:
+    encoded = encode_sse_event("run-1", 5, "tool.started", {"run_id": "spoofed"})
+
+    data_lines = [line for line in encoded.split("\n") if line.startswith("data:")]
+    data = json.loads(data_lines[0][len("data:") :])
+    assert data["run_id"] == "run-1"
+
+
 def test_encode_sse_event_escapes_newlines_in_payload() -> None:
     encoded = encode_sse_event("run-1", 2, "thinking.delta", {"text": "line1\nline2"})
 

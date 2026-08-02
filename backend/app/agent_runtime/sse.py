@@ -9,19 +9,23 @@ import asyncio
 import json
 from collections.abc import AsyncIterator
 from contextlib import suppress
+from typing import Any
+
+from app.agent_runtime.models import AgentEvent
 
 
 def encode_sse_event(
-    run_id: str, sequence: int, event_type: str, payload: dict | None
+    run_id: str, sequence: int, event_type: str, payload: dict[str, Any] | None
 ) -> str:
-    """编码单条 SSE 帧；``data`` 负载保证携带 ``run_id``。"""
-    data = {"run_id": run_id, **(payload or {})}
+    """编码单条 SSE 帧；``data`` 负载的 ``run_id`` 以服务端为准。"""
+    # 服务端 run_id 放在合并右侧强制覆盖，客户端传的同名键不能伪造
+    data = {**(payload or {}), "run_id": run_id}
     body = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
     return f"id: {sequence}\nevent: {event_type}\ndata: {body}\n\n"
 
 
 async def sse_event_chunks(
-    events: AsyncIterator, *, heartbeat_seconds: float = 15
+    events: AsyncIterator[AgentEvent], *, heartbeat_seconds: float = 15
 ) -> AsyncIterator[str]:
     """把事件迭代器转成 SSE 分块；空闲超过心跳间隔产出 ``: heartbeat``。"""
     iterator = events.__aiter__()

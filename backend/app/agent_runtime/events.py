@@ -5,7 +5,7 @@
 broker 只承担"有新事件"的唤醒信号。
 
 事件 payload 约定（spec §15.3）：
-- 所有事件 payload 必须带 ``run_id``；
+- 所有事件 payload 必须带 ``run_id``（服务端强制写入，客户端不可伪造）；
 - Artifact 事件带 ``artifact_id/module/parent_artifact_id/status``；
 - Review 事件带 ``review_batch_id/artifact_id/draft_revision_id``。
 ``append`` 会自动把 ``run_id`` 合入 payload，调用方无需重复携带。
@@ -16,6 +16,7 @@ from collections import defaultdict
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from enum import StrEnum
+from typing import Any
 from uuid import uuid4
 
 from sqlalchemy import func, select
@@ -108,18 +109,24 @@ class AgentEventStream:
         self.broker = broker
 
     async def append(
-        self, run_id: str, user_id: str, event_type: str, payload: dict | None
+        self, run_id: str, user_id: str, event_type: str, payload: dict[str, Any] | None
     ) -> AgentEvent:
         """分配下一条 per-run sequence 并持久化，成功后广播到 broker。
 
         以 ``SELECT ... FOR UPDATE`` 锁住 Run 行序列化并发 append，
         +``(run_id, sequence)`` 唯一约束兜底，保证 sequence 连续无空洞、无重复。
+
+        append 是事件行的提交点：先 ``commit()`` 再 ``publish()``，回滚窗口内
+        不会产生幽灵 broker 事件。调用方不应把 append 放进打算回滚的更大事务里。
+        归属校验拒绝非属主注入（含伪造终态事件），与 stream 一致。
         """
         run = await self.db.scalar(
             select(AgentRun).where(AgentRun.id == run_id).with_for_update()
         )
         if run is None:
-            raise LookupError("run_not_found")
+            raise RunEventForbidden("run_not_found")
+        if run.user_id != user_id:
+            raise RunEventForbidden("run_not_owned")
         max_sequence = await self.db.scalar(
             select(func.max(AgentEvent.sequence)).where(AgentEvent.run_id == run_id)
         )
@@ -129,11 +136,13 @@ class AgentEventStream:
             user_id=user_id,
             sequence=(max_sequence or 0) + 1,
             event_type=event_type,
-            payload_json={"run_id": run_id, **(payload or {})},
+            # 服务端 run_id 强制覆盖，payload 里的同名键不能伪造
+            payload_json={**(payload or {}), "run_id": run_id},
             created_at=utc_now(),
         )
         self.db.add(event)
         await self.db.flush()
+        await self.db.commit()
         await self.broker.publish(event)
         return event
 
@@ -143,8 +152,12 @@ class AgentEventStream:
         """按 ``last_event_id``（per-run sequence）从 DB 重放，再跟随 broker。
 
         归属校验失败抛 :class:`RunEventForbidden`（路由层映射 404）。
-        重放后循环等待 broker；broker 超时则回查 DB 兜底（数据库是事实来源）。
+        循环中先查库、再等 broker；broker 超时回到查库兜底（数据库是事实来源）。
         终态事件（``run.completed/failed/cancelled``）送达后流结束。
+
+        每个 DB 轮询前 ``commit()`` 释放当前事务快照：MySQL REPEATABLE-READ 下
+        快照在事务首查后固定，若不释放，跨进程/跨 worker 已提交的事件永远不可见，
+        跨 worker 的终态事件将无法结束流。stream 在归属校验后只读，commit 不改数据。
         """
         run = await self.db.scalar(select(AgentRun).where(AgentRun.id == run_id))
         if run is None:
@@ -154,25 +167,20 @@ class AgentEventStream:
         queue = await self.broker.subscribe(run_id)
         seen = last_event_id
         try:
-            for row in await self._list_after(run_id, seen):
-                if row.sequence > seen:
-                    seen = row.sequence
-                    yield row
-                    if is_terminal_event(row.event_type):
-                        return
             while True:
+                # 释放快照后查询，看到其它进程已提交的事件（初始重放也走这里）
+                await self.db.commit()
+                for row in await self._list_after(run_id, user_id, seen):
+                    if row.sequence > seen:
+                        seen = row.sequence
+                        yield row
+                        if is_terminal_event(row.event_type):
+                            return
                 try:
                     row = await asyncio.wait_for(queue.get(), timeout=0.5)
                 except TimeoutError:
-                    # 跨进程/跨 worker 写入的事件不经过本进程 broker，
-                    # 回查数据库补齐。超时轮询本身充当心跳。
-                    rows = await self._list_after(run_id, seen)
-                    for row in rows:
-                        if row.sequence > seen:
-                            seen = row.sequence
-                            yield row
-                            if is_terminal_event(row.event_type):
-                                return
+                    # 同进程 append 会经 broker 唤醒；超时说明跨进程写入，
+                    # 回到循环顶部的查库补齐。超时轮询本身充当心跳。
                     continue
                 if row.user_id == user_id and row.sequence > seen:
                     seen = row.sequence
@@ -183,7 +191,7 @@ class AgentEventStream:
             await self.broker.unsubscribe(run_id, queue)
 
     async def _list_after(
-        self, run_id: str, seen: int
+        self, run_id: str, user_id: str, seen: int
     ) -> list[AgentEvent]:
         return list(
             (
@@ -191,6 +199,7 @@ class AgentEventStream:
                     select(AgentEvent)
                     .where(
                         AgentEvent.run_id == run_id,
+                        AgentEvent.user_id == user_id,
                         AgentEvent.sequence > seen,
                     )
                     .order_by(AgentEvent.sequence)
