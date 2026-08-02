@@ -56,32 +56,44 @@ function DataTable({ rows, columns }: {
 }
 
 function TimelineChart({ timeline }: { timeline: CampaignReportPayload['data']['timeline'] }) {
+  // §12.1：timeline 是必需章节，单日任一项 volume/engagement 为 null 时该序列点
+  // 置为 null（缺口），绝不把 null 求和成 0 渲染到坐标轴/提示框。
   const dates = [...new Set(timeline.map(item => item.date))].sort();
   const rows = dates.map(date => {
-    const row: Record<string, string | number> = { date };
-    let volume = 0;
-    let engagement = 0;
-    for (const item of timeline) {
-      if (item.date !== date) continue;
-      volume += item.volume ?? 0;
-      engagement += item.engagement ?? 0;
-    }
-    row.声量 = volume;
-    row.互动 = engagement;
+    const items = timeline.filter(item => item.date === date);
+    const volumeRestricted = items.some(item => item.volume == null);
+    const engagementRestricted = items.some(item => item.engagement == null);
+    const row: Record<string, string | number | null | boolean> = {
+      date,
+      声量: volumeRestricted ? null : items.reduce((sum, item) => sum + (item.volume ?? 0), 0),
+      互动: engagementRestricted ? null : items.reduce((sum, item) => sum + (item.engagement ?? 0), 0),
+    };
     return row;
   });
+  const restrictedDates = rows.filter(row => row.声量 == null || row.互动 == null).map(row => String(row.date));
   return (
-    <div className="h-44" aria-label="活动声量趋势图表">
-      <ResponsiveContainer width="100%" height="100%">
-        <LineChart data={rows} margin={{ top: 8, right: 8, bottom: 4, left: -12 }}>
-          <XAxis dataKey="date" tickFormatter={value => String(value).slice(5)} tick={{ fontSize: 10, fill: '#94a3b8' }} />
-          <YAxis tick={{ fontSize: 10, fill: '#94a3b8' }} width={42} />
-          <Tooltip formatter={(value) => [restrictedCount(Number(value)), '数值']} />
-          <Line type="monotone" dataKey="声量" stroke="#4f46e5" strokeWidth={2} dot={{ r: 3 }} connectNulls />
-          <Line type="monotone" dataKey="互动" stroke="#14b8a6" strokeWidth={2} dot={{ r: 3 }} connectNulls />
-        </LineChart>
-      </ResponsiveContainer>
-    </div>
+    <>
+      <div className="h-44" aria-label="活动声量趋势图表">
+        <ResponsiveContainer width="100%" height="100%">
+          <LineChart data={rows} margin={{ top: 8, right: 8, bottom: 4, left: -12 }}>
+            <XAxis dataKey="date" tickFormatter={value => String(value).slice(5)} tick={{ fontSize: 10, fill: '#94a3b8' }} />
+            <YAxis tick={{ fontSize: 10, fill: '#94a3b8' }} width={42} />
+            <Tooltip formatter={(value) => [value == null ? '数据受限' : restrictedCount(Number(value)), '数值']} />
+            <Line type="monotone" dataKey="声量" stroke="#4f46e5" strokeWidth={2} dot={{ r: 3 }} />
+            <Line type="monotone" dataKey="互动" stroke="#14b8a6" strokeWidth={2} dot={{ r: 3 }} />
+          </LineChart>
+        </ResponsiveContainer>
+      </div>
+      {restrictedDates.length > 0 && (
+        <div className="mt-2 flex flex-wrap gap-1.5">
+          {restrictedDates.map(date => (
+            <span key={date} className="rounded bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-600">
+              {date.slice(5)} 数据受限
+            </span>
+          ))}
+        </div>
+      )}
+    </>
   );
 }
 
@@ -101,6 +113,7 @@ function TopPosts({ posts }: { posts: CampaignReportPayload['data']['top_posts']
               </p>
               <p className="mt-1 text-[10px] text-slate-400">
                 {platformName(post.platform)} · {post.author || '未知达人'}{post.published_at ? ` · ${post.published_at}` : ''}
+                {!url && <span className="ml-1 text-amber-600">数据受限（无原文链接）</span>}
               </p>
             </div>
             <p className="shrink-0 text-[10px] text-slate-400">互动 {restrictedScore(post.engagement)}</p>

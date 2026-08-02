@@ -157,4 +157,26 @@ describe('BrandArtifactView', () => {
     expect(screen.getByText('建议')).toBeVisible();
     expect(screen.getByText('优化排队体验')).toBeVisible();
   });
+
+  it('daily_trend 中 null 声量渲染为数据受限缺口而非 0', () => {
+    const base = brandPayload();
+    const p: BrandReportPayload = {
+      ...base,
+      data: {
+        ...base.data,
+        daily_trend: [
+          { date: '2026-07-01', platform: 'xiaohongshu', volume: 4000, engagement: 120, positive: 10, neutral: 5, negative: 2 },
+          { date: '2026-07-02', platform: 'xiaohongshu', volume: null, engagement: null, positive: 11, neutral: 5, negative: 1 },
+        ],
+      },
+    };
+    const { container } = render(<BrandArtifactView payload={p} />);
+    const trend = container.querySelector('[data-chapter="daily_trend"]') as HTMLElement;
+    expect(trend).toBeTruthy();
+
+    // 受限日期被明确披露为「数据受限」，而不是把 null 当 0 渲染。
+    expect(within(trend).getByText(/07-02 数据受限/)).toBeVisible();
+    // 正常日期不被标记受限。
+    expect(within(trend).queryByText(/07-01 数据受限/)).not.toBeInTheDocument();
+  });
 });

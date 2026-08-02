@@ -11,7 +11,7 @@ import type {
   KolDetailPayload,
   KolSelectionPayload,
 } from '../../api/agentArtifacts';
-import { getArtifactVersion } from '../../api/agentArtifacts';
+import { getArtifact, getArtifactVersion } from '../../api/agentArtifacts';
 import { useAgentRun } from '../../hooks/useAgentRun';
 import { initialRunRuntime } from '../../state/agentEvents';
 import type { RunRuntimeState } from '../../state/agentEvents';
@@ -398,6 +398,18 @@ describe('ArtifactWorkspace', () => {
       drafts: [{ artifactId: 'art-detail', module: 'kol', version: 1, status: 'published' }],
     };
     vi.mocked(useAgentRun).mockImplementation(runId => (runId ? completedRun : undefined));
+    vi.mocked(getArtifact).mockResolvedValue({
+      id: 'art-detail',
+      module: 'kol',
+      artifact_type: 'kol_detail_v2',
+      parent_artifact_id: null,
+      artifact_key: 'kol-detail:xiaohongshu:kol-1',
+      status: 'published',
+      latest_version: 1,
+      activity_sequence: 9,
+      created_at: '2026-08-01T12:00:00',
+      updated_at: '2026-08-01T12:00:00',
+    });
 
     renderWorkspace([kolArtifact], createKolDetail);
     fireEvent.click(screen.getByRole('tab', { name: '达人' }));
@@ -413,5 +425,60 @@ describe('ArtifactWorkspace', () => {
       expect.objectContaining({ artifact_id: 'kol-selection-1', version: '1' }),
     ));
     expect(await screen.findByRole('dialog', { name: '达人甲达人详情' })).toBeVisible();
+  });
+
+  it('生成中的 Draft 不替换已发布视图为空状态', async () => {
+    const draft = brandArtifact({
+      id: 'brand-draft-2',
+      status: 'draft',
+      latest_version: 0,
+      activity_sequence: 6,
+      updated_at: '2026-08-01T11:00:00',
+    });
+    renderWorkspace([brandArtifact(), draft]);
+    fireEvent.click(screen.getByRole('tab', { name: '品牌分析' }));
+
+    // 已发布视图仍可见（回退到最近一版已发布产物），并提示生成中。
+    expect(await screen.findByText('海底捞')).toBeVisible();
+    expect(screen.getByText(/生成中/)).toBeVisible();
+    expect(screen.queryByText('完成一次品牌分析后在此展示')).not.toBeInTheDocument();
+  });
+
+  it('辅助 Run 失败且无已发布产物时展示错误态而非无限加载', async () => {
+    const kolArtifact: ApiAgentArtifact = {
+      id: 'kol-selection-1',
+      module: 'kol',
+      artifact_type: 'kol_selection_v3',
+      parent_artifact_id: null,
+      artifact_key: 'kol-selection:hash',
+      status: 'published',
+      latest_version: 1,
+      activity_sequence: 8,
+      created_at: '2026-08-01T12:00:00',
+      updated_at: '2026-08-01T12:00:00',
+    };
+    const createKolDetail = vi.fn().mockResolvedValue({
+      run_id: 'detail-run-fail',
+      artifact_id: null,
+      cached: false,
+      detail: null,
+    } satisfies AgentKolDetailResponse);
+    const failedRun: RunRuntimeState = {
+      ...initialRunRuntime('detail-run-fail'),
+      status: 'failed',
+      connection: 'closed',
+      drafts: [],
+    };
+    vi.mocked(useAgentRun).mockImplementation(runId => (runId ? failedRun : undefined));
+
+    renderWorkspace([kolArtifact], createKolDetail);
+    fireEvent.click(screen.getByRole('tab', { name: '达人' }));
+    fireEvent.click(screen.getByRole('tab', { name: '圈选达人' }));
+    await screen.findByText('达人甲');
+
+    fireEvent.click(screen.getByRole('button', { name: /查看达人甲详情/ }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(/达人详情生成失败/);
+    expect(screen.queryByText('正在生成达人详情…')).not.toBeInTheDocument();
   });
 });

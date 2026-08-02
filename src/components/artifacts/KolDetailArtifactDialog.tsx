@@ -87,8 +87,9 @@ function LatestPosts({ posts }: { posts: KolDetailPayload['data']['latest_posts'
                 ) : title}
               </p>
               <p className="mt-1 text-[10px] text-slate-400">
-                {url ? '' : '数据受限'}
-                {post.published_at ? `${url ? ' · ' : ''}${post.published_at}` : ''}
+                {url
+                  ? post.published_at || ''
+                  : `数据受限${post.published_at ? ` · ${post.published_at}` : ''}`}
               </p>
               <p className="mt-0.5 text-[10px] text-slate-400">
                 赞 {restrictedScore(post.likes)} · 评 {restrictedScore(post.comments)} · 转 {restrictedScore(post.shares)}
@@ -104,10 +105,14 @@ function LatestPosts({ posts }: { posts: KolDetailPayload['data']['latest_posts'
 
 export interface KolDetailArtifactDialogProps {
   payload?: KolDetailPayload;
+  /** 辅助 Run 失败或详情不可用时的错误文案；提供时展示错误态而非无限加载。 */
+  error?: string;
+  /** 错误态的重试入口；由工作区重新发起 createKolDetail。 */
+  onRetry?: () => void;
   onClose: () => void;
 }
 
-export default function KolDetailArtifactDialog({ payload, onClose }: KolDetailArtifactDialogProps) {
+export default function KolDetailArtifactDialog({ payload, error, onRetry, onClose }: KolDetailArtifactDialogProps) {
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => { if (event.key === 'Escape') onClose(); };
     window.addEventListener('keydown', onKeyDown);
@@ -170,7 +175,29 @@ export default function KolDetailArtifactDialog({ payload, onClose }: KolDetailA
         </header>
 
         <div className="min-h-0 flex-1 overflow-y-auto p-5">
-          {!payload ? (
+          {error ? (
+            <div role="alert" className="flex min-h-72 flex-col items-center justify-center gap-3 text-center">
+              <p className="text-[12px] font-medium text-rose-600">{error}</p>
+              <div className="flex items-center gap-2">
+                {onRetry && (
+                  <button
+                    type="button"
+                    onClick={onRetry}
+                    className="rounded-lg bg-indigo-600 px-3 py-1.5 text-[11px] font-semibold text-white shadow-sm transition hover:bg-indigo-700"
+                  >
+                    重试
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={onClose}
+                  className="rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-[11px] font-semibold text-slate-600 transition hover:bg-slate-50"
+                >
+                  关闭
+                </button>
+              </div>
+            </div>
+          ) : !payload ? (
             <div role="status" className="flex min-h-72 flex-col items-center justify-center gap-3 text-[12px] text-slate-500">
               <Loader2 className="h-6 w-6 animate-spin text-indigo-500" />
               正在生成达人详情…

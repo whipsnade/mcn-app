@@ -9,6 +9,10 @@ import {
 import type { BrandReportPayload } from '../../api/agentArtifacts';
 import { Card, Missing, restrictedCount, restrictedRatio, restrictedScore } from '../reportPrimitives';
 
+// 注（review I3）：Metric/platformName/DataTable 等展示基元在五类视图间有复制，
+// 本轮有意保持各视图自包含（按 schema_version 直接消费 DTO），
+// 待视图稳定后再抽公共基元；现在合并风险高于收益。
+
 const CHART_COLORS = ['#4f46e5', '#14b8a6', '#f59b00', '#ec4899', '#0ea5e9', '#8b5cf6', '#22c55e', '#64748b'];
 
 /** 概览指标卡：null 显示「数据受限」而非 0。 */
@@ -66,54 +70,75 @@ function DataTable({ rows, columns }: {
 }
 
 function TrendChart({ data }: { data: BrandReportPayload['data']['daily_trend'] }) {
+  // §12.1：daily_trend 是必需章节，单日任一项 volume/engagement 为 null 时该序列点
+  // 置为 null（缺口），绝不把 null 求和成 0 渲染到坐标轴/提示框。
   const dates = [...new Set(data.map(item => item.date))].sort();
   const rows = dates.map(date => {
-    const row: Record<string, string | number | null> = { date };
-    let volume: number | null = 0;
-    let engagement: number | null = 0;
-    for (const item of data) {
-      if (item.date !== date) continue;
-      volume += item.volume ?? 0;
-      engagement += item.engagement ?? 0;
-    }
-    row.声量 = volume;
-    row.互动 = engagement;
+    const items = data.filter(item => item.date === date);
+    const volumeRestricted = items.some(item => item.volume == null);
+    const engagementRestricted = items.some(item => item.engagement == null);
+    const row: Record<string, string | number | null | boolean> = {
+      date,
+      声量: volumeRestricted ? null : items.reduce((sum, item) => sum + (item.volume ?? 0), 0),
+      互动: engagementRestricted ? null : items.reduce((sum, item) => sum + (item.engagement ?? 0), 0),
+    };
     return row;
   });
+  const restrictedDates = rows.filter(row => row.声量 == null || row.互动 == null).map(row => String(row.date));
   return (
-    <div className="h-44" aria-label="品牌声量趋势图表">
-      <ResponsiveContainer width="100%" height="100%">
-        <LineChart data={rows} margin={{ top: 8, right: 8, bottom: 4, left: -12 }}>
-          <XAxis dataKey="date" tickFormatter={value => String(value).slice(5)} tick={{ fontSize: 10, fill: '#94a3b8' }} />
-          <YAxis tick={{ fontSize: 10, fill: '#94a3b8' }} width={42} />
-          <Tooltip formatter={(value) => [restrictedCount(Number(value)), '数值']} />
-          <Line type="monotone" dataKey="声量" stroke="#4f46e5" strokeWidth={2} dot={{ r: 3 }} connectNulls />
-          <Line type="monotone" dataKey="互动" stroke="#14b8a6" strokeWidth={2} dot={{ r: 3 }} connectNulls />
-        </LineChart>
-      </ResponsiveContainer>
-    </div>
+    <>
+      <div className="h-44" aria-label="品牌声量趋势图表">
+        <ResponsiveContainer width="100%" height="100%">
+          <LineChart data={rows} margin={{ top: 8, right: 8, bottom: 4, left: -12 }}>
+            <XAxis dataKey="date" tickFormatter={value => String(value).slice(5)} tick={{ fontSize: 10, fill: '#94a3b8' }} />
+            <YAxis tick={{ fontSize: 10, fill: '#94a3b8' }} width={42} />
+            <Tooltip formatter={(value) => [value == null ? '数据受限' : restrictedCount(Number(value)), '数值']} />
+            <Line type="monotone" dataKey="声量" stroke="#4f46e5" strokeWidth={2} dot={{ r: 3 }} />
+            <Line type="monotone" dataKey="互动" stroke="#14b8a6" strokeWidth={2} dot={{ r: 3 }} />
+          </LineChart>
+        </ResponsiveContainer>
+      </div>
+      {restrictedDates.length > 0 && (
+        <div className="mt-2 flex flex-wrap gap-1.5">
+          {restrictedDates.map(date => (
+            <span key={date} className="rounded bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-600">
+              {date.slice(5)} 数据受限
+            </span>
+          ))}
+        </div>
+      )}
+    </>
   );
 }
 
 function SentimentChart({ summary }: { summary: BrandReportPayload['data']['sentiment']['summary'] }) {
-  const data = [
+  // §12.1：null 计数不得静默丢弃——饼图只画有效正数，明细列表对 null 显示「数据受限」。
+  const data: Array<{ name: string; value: number | null }> = [
     { name: '正面', value: summary.positive.count },
     { name: '中性', value: summary.neutral.count },
     { name: '负面', value: summary.negative.count },
-  ].filter(item => item.value > 0);
-  if (data.length === 0) return <Missing label="数据不足" />;
+  ];
+  const pieData = data.filter(
+    (item): item is { name: string; value: number } => item.value != null && Number.isFinite(item.value) && item.value > 0,
+  );
   return (
     <div className="flex items-center gap-2">
-      <div className="h-[110px] w-[110px] shrink-0" aria-label="情感占比环形图">
-        <ResponsiveContainer width="100%" height="100%">
-          <PieChart>
-            <Pie data={data} dataKey="value" nameKey="name" innerRadius={28} outerRadius={48} paddingAngle={2} stroke="none">
-              {data.map((item, index) => <Cell key={item.name} fill={CHART_COLORS[index % CHART_COLORS.length]} />)}
-            </Pie>
-            <Tooltip formatter={(value) => [restrictedCount(Number(value)), '篇']} />
-          </PieChart>
-        </ResponsiveContainer>
-      </div>
+      {pieData.length > 0 ? (
+        <div className="h-[110px] w-[110px] shrink-0" aria-label="情感占比环形图">
+          <ResponsiveContainer width="100%" height="100%">
+            <PieChart>
+              <Pie data={pieData} dataKey="value" nameKey="name" innerRadius={28} outerRadius={48} paddingAngle={2} stroke="none">
+                {pieData.map((item, index) => <Cell key={item.name} fill={CHART_COLORS[index % CHART_COLORS.length]} />)}
+              </Pie>
+              <Tooltip formatter={(value) => [restrictedCount(Number(value)), '篇']} />
+            </PieChart>
+          </ResponsiveContainer>
+        </div>
+      ) : (
+        <div className="flex h-[110px] w-[110px] shrink-0 items-center justify-center rounded-xl bg-slate-50 text-[10px] text-slate-400">
+          数据不足
+        </div>
+      )}
       <ul className="min-w-0 flex-1 space-y-1.5">
         {data.map((item, index) => (
           <li key={item.name} className="flex items-center justify-between gap-2 text-[11px] text-slate-500">
@@ -121,7 +146,7 @@ function SentimentChart({ summary }: { summary: BrandReportPayload['data']['sent
               <i className="h-2 w-2 shrink-0 rounded-full" style={{ backgroundColor: CHART_COLORS[index % CHART_COLORS.length] }} />
               {item.name}
             </span>
-            <b className="text-slate-700">{restrictedCount(item.value)}</b>
+            <b className="text-slate-700">{item.value == null ? '数据受限' : restrictedCount(item.value)}</b>
           </li>
         ))}
       </ul>
@@ -147,6 +172,7 @@ function TopPostsList({ posts }: { posts: BrandReportPayload['data']['top_posts'
               </p>
               <p className="mt-1 text-[10px] text-slate-400">
                 {platformName(post.platform)} · {post.author || '未知达人'}{post.published_at ? ` · ${post.published_at}` : ''}
+                {!url && <span className="ml-1 text-amber-600">数据受限（无原文链接）</span>}
               </p>
             </div>
             <div className="shrink-0 text-right text-[10px] text-slate-400">

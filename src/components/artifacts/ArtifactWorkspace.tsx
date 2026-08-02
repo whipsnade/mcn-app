@@ -18,6 +18,7 @@ import {
   getArtifactVersion,
 } from '../../api/agentArtifacts';
 import { useAgentRun } from '../../hooks/useAgentRun';
+import { isTerminalRunStatus } from '../../state/agentEvents';
 import { ArtifactStatus } from './ArtifactStatus';
 import BrandArtifactView from './BrandArtifactView';
 import CampaignArtifactView from './CampaignArtifactView';
@@ -114,9 +115,14 @@ export default function ArtifactWorkspace({
   const [payloadLoading, setPayloadLoading] = useState(false);
 
   // KOL 详情弹层：createKolDetail → 订阅辅助 Run → 解析 kol_detail_v2 payload。
-  const [pendingDetail, setPendingDetail] = useState<{ platform: string; kolUid: string } | null>(null);
+  const [pendingDetail, setPendingDetail] = useState<{
+    platform: string;
+    kolUid: string;
+    selectionRef?: AgentKolDetailSelectionRef;
+  } | null>(null);
   const [detailRunId, setDetailRunId] = useState<string>();
   const [kolDetailPayload, setKolDetailPayload] = useState<KolDetailPayload>();
+  const [detailError, setDetailError] = useState<string>();
   const detailLoadedRef = useRef(false);
   const helperRun = useAgentRun(detailRunId);
 
@@ -128,14 +134,32 @@ export default function ArtifactWorkspace({
         ? 'kol_selection_v3'
         : 'kol_analysis_v2';
 
-  const activeArtifact = useMemo(
-    () => [...artifacts]
-      .filter(artifact => artifact.artifact_type === activeType)
-      .sort(
-        (a, b) => b.activity_sequence - a.activity_sequence || b.updated_at.localeCompare(a.updated_at),
-      )[0],
+  // §13.2：Draft/发布只打圆点。展示主体取「非生成中」的最新产物；若当前最新是
+  // 生成中的 Draft（latest_version 0 / generating / reviewing），回退到上一个
+  // 已发布产物保持内容可见，同时由 UI 展示「生成中」提示（review Fix 2）。
+  const isGeneratingArtifact = (artifact: ApiAgentArtifact): boolean =>
+    artifact.latest_version === 0
+    || artifact.status === 'generating'
+    || artifact.status === 'draft'
+    || artifact.status === 'reviewing';
+
+  const activeTypeCandidates = useMemo(
+    () => artifacts.filter(artifact => artifact.artifact_type === activeType),
     [artifacts, activeType],
   );
+  const hasGeneratingDraft = useMemo(
+    () => activeTypeCandidates.some(isGeneratingArtifact),
+    [activeTypeCandidates],
+  );
+  const activeArtifact = useMemo(() => {
+    const byNewest = (list: ApiAgentArtifact[]) => [...list].sort(
+      (a, b) => b.activity_sequence - a.activity_sequence || b.updated_at.localeCompare(a.updated_at),
+    );
+    const newest = byNewest(activeTypeCandidates)[0];
+    if (!newest) return undefined;
+    if (!isGeneratingArtifact(newest)) return newest;
+    return byNewest(activeTypeCandidates.filter(artifact => !isGeneratingArtifact(artifact)))[0] ?? newest;
+  }, [activeTypeCandidates]);
 
   const maxSeq = useCallback((module: string) => {
     const sequences = artifacts
@@ -201,54 +225,67 @@ export default function ArtifactWorkspace({
     };
   }, [sessionId, activeArtifact?.id, activeArtifact?.latest_version, activeArtifact?.updated_at, versionNumber]);
 
+  // 详情版本统一走 getArtifact().latest_version（Draft 事件携带的 version 可能是
+  // 未提交的 0）；失败时落错误态，避免 detailLoadedRef 卡死无限加载（review Fix 3）。
   const loadArtifactDetail = async (artifactId: string) => {
     try {
       const meta = await getArtifact(artifactId);
       const version = await getArtifactVersion(artifactId, meta.latest_version);
       const resolved = getAgentArtifactPayload(version);
-      if (resolved?.schema_version === 'kol_detail_v2') setKolDetailPayload(resolved);
+      if (resolved?.schema_version === 'kol_detail_v2') {
+        setKolDetailPayload(resolved);
+        return;
+      }
+      setDetailError('达人详情数据不可用，请稍后重试');
     } catch {
-      // 详情不可用时保持弹层加载态，由弹层兜底。
+      setDetailError('达人详情加载失败，请稍后重试');
     }
   };
 
-  const openKolDetail = async (item: KolSelectionItem) => {
+  const runKolDetailFlow = async (platform: string, kolUid: string, selectionRef: AgentKolDetailSelectionRef) => {
     if (!sessionId) return;
-    setPendingDetail({ platform: item.platform, kolUid: item.kol_uid });
     setKolDetailPayload(undefined);
+    setDetailError(undefined);
     setDetailRunId(undefined);
     detailLoadedRef.current = false;
-    const selectionRef: AgentKolDetailSelectionRef = {
-      artifact_id: activeArtifact?.id,
-      version: versionNumber !== undefined ? String(versionNumber) : undefined,
-    };
     try {
-      const result = await createKolDetail(sessionId, item.platform, item.kol_uid, selectionRef);
+      const result = await createKolDetail(sessionId, platform, kolUid, selectionRef);
       if (result.artifact_id) {
         detailLoadedRef.current = true;
         void loadArtifactDetail(result.artifact_id);
       } else if (result.run_id) {
         setDetailRunId(result.run_id);
       }
-    } catch {
-      // 保持弹层加载态。
+    } catch (reason) {
+      setDetailError(reason instanceof Error && reason.message ? reason.message : '达人详情创建失败，请稍后重试');
     }
   };
 
-  // 辅助 Run 到达终态后，从其 drafts 中取已发布 kol_detail 产物并解析 payload。
+  const openKolDetail = (item: KolSelectionItem) => {
+    if (!sessionId) return;
+    const selectionRef: AgentKolDetailSelectionRef = {
+      artifact_id: activeArtifact?.id,
+      version: versionNumber !== undefined ? String(versionNumber) : undefined,
+    };
+    setPendingDetail({ platform: item.platform, kolUid: item.kol_uid, selectionRef });
+    void runKolDetailFlow(item.platform, item.kol_uid, selectionRef);
+  };
+
+  // 辅助 Run 到达终态后，从其 drafts 中取已发布 kol_detail 产物并解析 payload；
+  // 终态却没有已发布产物（review reject / run failed）时落错误态而非无限加载。
   useEffect(() => {
     if (!detailRunId || !helperRun || detailLoadedRef.current) return;
+    if (!isTerminalRunStatus(helperRun.status)) return;
+    detailLoadedRef.current = true;
     const published = helperRun.drafts.find(
       draft => draft.artifactId && draft.status === 'published',
     );
-    if (!published) return;
-    detailLoadedRef.current = true;
-    getArtifactVersion(published.artifactId, published.version)
-      .then(item => {
-        const resolved = getAgentArtifactPayload(item);
-        if (resolved?.schema_version === 'kol_detail_v2') setKolDetailPayload(resolved);
-      })
-      .catch(() => undefined);
+    if (published) {
+      void loadArtifactDetail(published.artifactId);
+      return;
+    }
+    setDetailRunId(undefined);
+    setDetailError('达人详情生成失败，请稍后重试');
   }, [detailRunId, helperRun]);
 
   const childInsights = useMemo(
@@ -303,6 +340,8 @@ export default function ArtifactWorkspace({
               : 'flex shrink-0 items-center gap-1.5 px-3 text-[11px] font-medium text-slate-500 transition hover:text-slate-800'}
           >
             {label}
+            {/* 注（review M3）：未读圆点按模块聚合且仅用颜色区分，无独立可访问名称；
+                已在 data-testid 上留查询锚点，无障碍优化列为后续打磨项。 */}
             {unread(module) && <span data-testid="unread-dot" className="h-1.5 w-1.5 rounded-full bg-rose-500" />}
           </button>
         ))}
@@ -358,7 +397,22 @@ export default function ArtifactWorkspace({
             加载中…
           </p>
         ) : payload ? (
-          renderView()
+          <>
+            {hasGeneratingDraft && (
+              <p className="mb-3 flex items-center gap-1.5 rounded-lg bg-indigo-50 px-2.5 py-2 text-[11px] font-medium text-indigo-700">
+                <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+                新产物生成中，正在展示最近一版分析
+              </p>
+            )}
+            {renderView()}
+          </>
+        ) : hasGeneratingDraft ? (
+          <div className="flex min-h-[120px] items-center justify-center p-6 text-center text-xs leading-5 text-slate-500">
+            <span className="flex items-center gap-2">
+              <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+              正在生成分析…
+            </span>
+          </div>
         ) : (
           <div className="flex min-h-[120px] items-center justify-center p-6 text-center text-xs leading-5 text-slate-500">
             {emptyText}
@@ -382,9 +436,16 @@ export default function ArtifactWorkspace({
       {pendingDetail && (
         <KolDetailArtifactDialog
           payload={kolDetailPayload}
+          error={detailError}
+          onRetry={() => void runKolDetailFlow(
+            pendingDetail.platform,
+            pendingDetail.kolUid,
+            pendingDetail.selectionRef ?? {},
+          )}
           onClose={() => {
             setPendingDetail(null);
             setKolDetailPayload(undefined);
+            setDetailError(undefined);
             setDetailRunId(undefined);
             detailLoadedRef.current = false;
           }}

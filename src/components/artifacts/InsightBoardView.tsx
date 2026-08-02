@@ -99,7 +99,7 @@ function BarChartBlock({ block }: { block: InsightBlock }) {
         <BarChart data={data} margin={{ top: 8, right: 8, bottom: 4, left: -12 }}>
           <XAxis dataKey="name" tick={{ fontSize: 10, fill: '#94a3b8' }} />
           <YAxis tick={{ fontSize: 10, fill: '#94a3b8' }} width={42} />
-          <Tooltip formatter={(value) => [formatNumber(Number(value)), '数值']} />
+          <Tooltip formatter={(value) => [value == null ? '数据受限' : formatNumber(Number(value)), '数值']} />
           {names.map((name, index) => (
             <Bar key={name} dataKey={name} fill={CHART_COLORS[index % CHART_COLORS.length]} radius={[4, 4, 0, 0]} />
           ))}
@@ -120,9 +120,9 @@ function LineChartBlock({ block }: { block: InsightBlock }) {
         <LineChart data={data} margin={{ top: 8, right: 8, bottom: 4, left: -12 }}>
           <XAxis dataKey="name" tick={{ fontSize: 10, fill: '#94a3b8' }} />
           <YAxis tick={{ fontSize: 10, fill: '#94a3b8' }} width={42} />
-          <Tooltip formatter={(value) => [formatNumber(Number(value)), '数值']} />
+          <Tooltip formatter={(value) => [value == null ? '数据受限' : formatNumber(Number(value)), '数值']} />
           {names.map((name, index) => (
-            <Line key={name} type="monotone" dataKey={name} stroke={CHART_COLORS[index % CHART_COLORS.length]} strokeWidth={2} dot={{ r: 3 }} connectNulls />
+            <Line key={name} type="monotone" dataKey={name} stroke={CHART_COLORS[index % CHART_COLORS.length]} strokeWidth={2} dot={{ r: 3 }} />
           ))}
         </LineChart>
       </ResponsiveContainer>
