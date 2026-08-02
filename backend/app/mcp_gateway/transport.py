@@ -38,6 +38,8 @@ class McpTransport(Protocol):
         arguments: Mapping[str, JsonValue],
     ) -> RemoteToolResult: ...
 
+    async def reconcile_tool_call(self, upstream_request_id: str) -> RemoteToolResult | None: ...
+
 
 @dataclass(frozen=True)
 class ToolInvocationOutcome:

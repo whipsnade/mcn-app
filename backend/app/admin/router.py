@@ -1,6 +1,6 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.admin.schemas import (
@@ -8,6 +8,8 @@ from app.admin.schemas import (
     AdminUserItem,
     AdminUserListResponse,
     AdminUserUpdate,
+    AgentToolCallReconcileRequest,
+    AgentToolCallReconcileResponse,
     PointsAdjustRequest,
     PointsAdjustResponse,
     PointsHistoryResponse,
@@ -145,3 +147,28 @@ async def points_history(
     except LookupError as error:
         raise not_found(error) from error
     return PointsHistoryResponse(items=items, total=total)
+
+
+@router.post("/agent-tool-calls/{call_id}/reconcile", response_model=AgentToolCallReconcileResponse)
+async def reconcile_agent_tool_call(
+    call_id: str,
+    payload: AgentToolCallReconcileRequest,
+    request: Request,
+    admin: AdminUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    idempotency_key: Annotated[str | None, Header()] = None,
+) -> AgentToolCallReconcileResponse:
+    reconciler = getattr(request.app.state, "agent_tool_reconciler", None)
+    try:
+        outcome = await AdminService(
+            db, tool_call_reconciler=reconciler
+        ).reconcile_tool_call(
+            admin,
+            call_id,
+            decision=payload.decision,
+            note=payload.note,
+            idempotency_key=idempotency_key,
+        )
+    except LookupError as error:
+        raise not_found(error) from error
+    return AgentToolCallReconcileResponse(**outcome)

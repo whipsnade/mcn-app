@@ -45,10 +45,14 @@ class ToolContext(BaseModel):
     session_id: str
     run_id: str
     profile_name: str
+    # MCP 桥挂靠 agent_tool_calls 所需；非 MCP 工具可为 None。
+    step_id: str | None = None
 
 
 # 服务端保留键：模型参数中出现这些键一律在进入工具前被剥离。
-SERVER_RESERVED_KEYS: frozenset[str] = frozenset({"user_id", "session_id", "run_id"})
+SERVER_RESERVED_KEYS: frozenset[str] = frozenset(
+    {"user_id", "session_id", "run_id", "step_id"}
+)
 
 
 class TrustedTool(Protocol):

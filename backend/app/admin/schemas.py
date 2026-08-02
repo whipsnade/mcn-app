@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field
 
@@ -64,3 +64,25 @@ class PointsHistoryEntry(BaseModel):
 class PointsHistoryResponse(BaseModel):
     items: list[PointsHistoryEntry]
     total: int
+
+
+class AgentToolCallReconcileRequest(BaseModel):
+    """管理员核对 result_unknown 的 Agent 工具调用。
+
+    - confirm_success：可确认成功。能取回 payload 时创建 Evidence 并结算，
+      否则只结算并标记结果不可用（不得伪造 Evidence）；
+    - confirm_failure：确认失败，释放预留；
+    - keep_unknown：无法核对，保持 reserved/unknown 并追加核对审计。
+    """
+
+    decision: Literal["confirm_success", "confirm_failure", "keep_unknown"]
+    note: str | None = Field(default=None, max_length=500)
+
+
+class AgentToolCallReconcileResponse(BaseModel):
+    call_id: str
+    status: str
+    error_type: str | None = None
+    points_reserved: int
+    points_settled: int
+    evidence_id: str | None = None

@@ -133,9 +133,15 @@ def _validate_tool(tool: TrustedTool) -> None:
 
 
 def _channel_for_catalog_row(row: CatalogRow) -> str | None:
-    """解析目录行所需渠道：先按内部工具名细分，再按服务回退。"""
+    """解析目录行所需渠道：先按内部工具名细分，再按服务回退。
+
+    Task 7 硬化：未知 service_slug 一律抛错（fail-closed），而不是默认放行无渠道
+    门槛。已知 slug 映射为 None 才表示跨平台、无渠道门槛。
+    """
     channel = _MCP_INTERNAL_CHANNEL.get(row.internal_tool_name)
     if channel is None:
+        if row.service_slug not in _MCP_SERVICE_CHANNEL:
+            raise ToolContractError(f"unknown service_slug: {row.service_slug!r}")
         channel = _MCP_SERVICE_CHANNEL.get(row.service_slug)
     return channel
 
@@ -151,9 +157,13 @@ class ToolRegistry:
             | Callable[[], Iterable[CatalogRow] | Awaitable[Iterable[CatalogRow]]]
             | None
         ) = None,
+        mcp_executor_factory: Callable[[CatalogRow], TrustedTool | None] | None = None,
     ) -> None:
         self._entries: dict[str, RegisteredTool] = {}
         self._catalog_source = catalog_source
+        # Task 8：目录来源的 MCP 工具在注册时经该工厂挂上 AgentMcpTool 执行器；
+        # 引擎在接线时注入（内部名 → service/remote/schema 由 mcp_gateway 解析）。
+        self._mcp_executor_factory = mcp_executor_factory
         self._catalog_loaded = False
 
     def register(self, tool: TrustedTool, *, category: str) -> RegisteredTool:
@@ -216,17 +226,28 @@ class ToolRegistry:
         user_id: str,
         session_id: str,
         run_id: str,
-        profile_name: str,
+        profile: AgentProfile,
+        channel_permissions: Iterable[str] = (),
+        step_id: str | None = None,
     ) -> ToolResult:
         """构建服务端 ToolContext、剥离保留键后调用工具。
 
-        模型提供的参数在进入工具前剥离 ``user_id/session_id/run_id``（§16），
-        实际身份始终来自服务端注入的 ``ToolContext``。
+        模型提供的参数在进入工具前剥离 ``user_id/session_id/run_id/step_id``
+        （§16），实际身份始终来自服务端注入的 ``ToolContext``。
+        Task 7 硬化 (b)：执行前重新校验工具对当前 Profile 可见（Profile 分类 +
+        实时审核状态 + 用户渠道权限求交），防止审核撤销后仍被执行。
         """
         await self._ensure_catalog()
         entry = self._entries.get(internal_name)
         if entry is None or entry.tool is None:
             raise UnknownToolError(f"tool is not registered or not executable: {internal_name!r}")
+        if entry.category not in profile.allowed_tool_categories:
+            raise UnknownToolError(f"tool is not allowed by profile: {internal_name!r}")
+        if entry.category == MCP_TOOLS:
+            if entry.review_status != "approved" or not entry.is_enabled:
+                raise UnknownToolError(f"tool is not approved or enabled: {internal_name!r}")
+            if entry.channel is not None and entry.channel not in frozenset(channel_permissions):
+                raise UnknownToolError(f"tool requires channel: {entry.channel!r}")
         scrubbed = {
             key: value for key, value in arguments.items() if key not in SERVER_RESERVED_KEYS
         }
@@ -239,9 +260,24 @@ class ToolRegistry:
             user_id=user_id,
             session_id=session_id,
             run_id=run_id,
-            profile_name=profile_name,
+            profile_name=profile.full_name,
+            step_id=step_id,
         )
         return await entry.tool.execute(context, parsed)
+
+    async def reload_catalog(self) -> None:
+        """重读目录源并替换 MCP 条目，审核状态不被无限期缓存（Task 7 硬化 a）。
+
+        引擎可周期性调用，或在关键操作前强制刷新。
+        """
+        for name in [
+            name
+            for name, entry in self._entries.items()
+            if entry.category == MCP_TOOLS
+        ]:
+            del self._entries[name]
+        self._catalog_loaded = False
+        await self._ensure_catalog()
 
     async def _ensure_catalog(self) -> None:
         """加载一次注入的 MCP 目录源（快照或 DB 查询），并把批准启用工具纳入注册表。"""
@@ -259,6 +295,11 @@ class ToolRegistry:
         internal_name = row.internal_tool_name
         if internal_name in self._entries:
             raise ToolContractError(f"duplicate tool internal_name: {internal_name!r}")
+        executor = (
+            self._mcp_executor_factory(row)
+            if self._mcp_executor_factory is not None
+            else None
+        )
         self._entries[internal_name] = RegisteredTool(
             internal_name=internal_name,
             category=MCP_TOOLS,
@@ -267,7 +308,7 @@ class ToolRegistry:
             description=row.reviewed_description,
             channel=_channel_for_catalog_row(row),
             input_model=None,
-            tool=None,
+            tool=executor,
             review_status=row.review_status,
             is_enabled=row.is_enabled,
         )

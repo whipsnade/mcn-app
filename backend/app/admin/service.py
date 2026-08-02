@@ -12,6 +12,14 @@ from app.admin.schemas import (
     AdminUserUpdate,
     PointsHistoryEntry,
 )
+from app.agent_runtime.evidence import EvidenceWriter
+from app.agent_runtime.models import (
+    AgentRun,
+    AgentToolCall,
+    AgentToolCallReconciliation,
+    EvidenceItem,
+)
+from app.agent_runtime.tools.mcp import AgentMcpAccounting
 from app.billing.models import Wallet, WalletTransaction
 from app.billing.service import WalletService
 from app.core.redaction import redact_for_log
@@ -41,8 +49,17 @@ class PhoneConflictError(Exception):
 
 
 class AdminService:
-    def __init__(self, db: AsyncSession) -> None:
+    def __init__(
+        self,
+        db: AsyncSession,
+        *,
+        tool_call_reconciler: Any | None = None,
+    ) -> None:
         self.db = db
+        # 管理员核对时取回上游 payload 的注入器（生产由 app.state 接线到
+        # transport.reconcile_tool_call；测试注入假 reconciler）。为 None 时
+        # confirm_success 视为无 payload 可取。
+        self._tool_call_reconciler = tool_call_reconciler
 
     async def _get_user(self, user_id: str) -> User:
         user = await self.db.get(User, user_id)
@@ -478,3 +495,152 @@ class AdminService:
             for tx in transactions
         ]
         return items, total or 0
+
+    async def reconcile_tool_call(
+        self,
+        admin: User,
+        call_id: str,
+        *,
+        decision: str,
+        note: str | None,
+        idempotency_key: str | None,
+    ) -> dict[str, Any]:
+        """管理员核对 result_unknown 的 Agent 工具调用（§11.1 / §16）。
+
+        - confirm_success：能取回 payload 时创建 Evidence 并结算；取不回则只
+          结算并标记 result_unavailable（管理员不能伪造 Evidence）；
+        - confirm_failure：释放预留；
+        - keep_unknown：保持 reserved/unknown 并追加核对审计。
+        终态（settled/failed）重放幂等：按当前状态返回，不再改钱包或重复审计。
+        """
+        call = await self.db.get(AgentToolCall, call_id)
+        if call is None:
+            raise LookupError("agent_tool_call_not_found")
+        user_id = await self._agent_run_user_id(call)
+
+        if call.status in ("settled", "failed"):
+            evidence = await self._evidence_by_call(call.id)
+            return self._reconcile_payload(
+                call, evidence_id=evidence.id if evidence is not None else None
+            )
+
+        before_status = call.status
+        evidence_id: str | None = None
+        if decision == "confirm_success":
+            evidence = await self._retrievable_evidence(call)
+            if evidence is not None:
+                evidence_id = evidence.id
+            await AgentMcpAccounting(self.db).settle(user_id, call)
+            if evidence is None:
+                call.safe_error_message = "result_unavailable"
+        elif decision == "confirm_failure":
+            await AgentMcpAccounting(self.db).release(
+                user_id,
+                call,
+                error_type="admin_confirmed_failure",
+                message=note or "admin confirmed failure",
+            )
+        elif decision == "keep_unknown":
+            pass  # 保持 reserved/unknown，不触碰钱包
+        else:  # pragma: no cover - schema 已约束
+            raise ValueError("invalid reconcile decision")
+
+        if decision == "keep_unknown":
+            already = await self.db.scalar(
+                select(AgentToolCallReconciliation).where(
+                    AgentToolCallReconciliation.tool_call_id == call.id,
+                    AgentToolCallReconciliation.source == "admin",
+                    AgentToolCallReconciliation.decision == "keep_unknown",
+                )
+            )
+            if already is not None:
+                await self.db.flush()
+                return self._reconcile_payload(call, evidence_id=evidence_id)
+
+        self._append_admin_reconciliation(call, decision, admin.id, note)
+        self._audit(
+            admin.id,
+            action="agent_tool_call.reconcile",
+            target_type="agent_tool_call",
+            target_id=call.id,
+            detail={
+                "decision": decision,
+                "note": note,
+                "before_status": before_status,
+                "after_status": call.status,
+                "idempotency_key": idempotency_key,
+            },
+        )
+        await self.db.flush()
+        return self._reconcile_payload(call, evidence_id=evidence_id)
+
+    async def _agent_run_user_id(self, call: AgentToolCall) -> str:
+        run = await self.db.get(AgentRun, call.run_id)
+        if run is None:
+            raise LookupError("agent_run_not_found")
+        return run.user_id
+
+    async def _evidence_by_call(self, call_id: str) -> EvidenceItem | None:
+        return await self.db.scalar(
+            select(EvidenceItem).where(EvidenceItem.tool_call_id == call_id)
+        )
+
+    async def _retrievable_evidence(self, call: AgentToolCall) -> EvidenceItem | None:
+        """已落库的 Evidence 优先；否则经注入的 reconciler 取回 payload 并新建。"""
+        existing = await self._evidence_by_call(call.id)
+        if existing is not None:
+            return existing
+        if self._tool_call_reconciler is None or not call.upstream_request_id:
+            return None
+        result = await self._tool_call_reconciler(call.upstream_request_id)
+        if (
+            result is None
+            or getattr(result, "is_error", False)
+            or result.structured_content is None
+        ):
+            return None
+        run = await self.db.get(AgentRun, call.run_id)
+        return await EvidenceWriter(self.db).write(
+            session_id=run.session_id if run is not None else call.run_id,
+            run_id=call.run_id,
+            tool_call_id=call.id,
+            source_type="mcp",
+            source_name=call.internal_tool_name,
+            scope_json=self._scope_from_arguments(call.arguments_json),
+            period_json=None,
+            raw_payload=result.structured_content,
+        )
+
+    @staticmethod
+    def _scope_from_arguments(arguments: dict[str, Any] | None) -> dict[str, Any] | None:
+        if not arguments:
+            return None
+        keys = ("scope", "brand", "keyword", "platform", "datasource")
+        scope = {key: value for key, value in arguments.items() if key in keys}
+        return scope or arguments
+
+    def _append_admin_reconciliation(
+        self, call: AgentToolCall, decision: str, admin_id: str, note: str | None
+    ) -> None:
+        self.db.add(
+            AgentToolCallReconciliation(
+                id=str(uuid4()),
+                tool_call_id=call.id,
+                source="admin",
+                decision=decision,
+                actor_user_id=admin_id,
+                note=note,
+                created_at=utc_now(),
+            )
+        )
+
+    @staticmethod
+    def _reconcile_payload(call: AgentToolCall, *, evidence_id: str | None) -> dict[str, Any]:
+        return {
+            "call_id": call.id,
+            "status": call.status,
+            "error_type": call.error_type,
+            "points_reserved": call.points_reserved,
+            "points_settled": call.points_settled,
+            "evidence_id": evidence_id,
+        }

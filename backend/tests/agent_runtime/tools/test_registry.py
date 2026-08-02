@@ -285,7 +285,7 @@ async def test_model_arguments_cannot_override_server_context() -> None:
         user_id="server-user",
         session_id="server-session",
         run_id="server-run",
-        profile_name="session_analyst_v1",
+        profile=session_analyst,
     )
 
     assert result.status == "success"
@@ -309,7 +309,7 @@ async def test_execute_unknown_tool_raises() -> None:
             user_id="u",
             session_id="s",
             run_id="r",
-            profile_name="session_analyst_v1",
+            profile=session_analyst,
         )
 
 
@@ -447,7 +447,7 @@ async def test_tool_context_propagates_server_context() -> None:
         user_id="u-1",
         session_id="s-1",
         run_id="r-1",
-        profile_name="session_analyst_v1",
+        profile=session_analyst,
     )
 
     context, parsed = tool.calls[0]
@@ -480,7 +480,7 @@ async def test_failed_result_propagates_error_type() -> None:
         user_id="u",
         session_id="s",
         run_id="r",
-        profile_name="session_analyst_v1",
+        profile=session_analyst,
     )
     assert result.status == "failed"
     assert result.error_type == "definitely_not_sent"

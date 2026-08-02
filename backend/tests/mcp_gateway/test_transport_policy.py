@@ -15,6 +15,7 @@ from app.mcp_gateway.contracts import DataTapService
 from app.mcp_gateway.datatap import DataTapTransport
 from app.mcp_gateway.service import McpCallService, PreparedMcpInvocation
 from app.mcp_gateway.transport import (
+    McpCircuitOpen,
     McpConnectionTimeout,
     McpGatewayTimeout,
     McpProtocolError,
@@ -384,3 +385,46 @@ def test_protocol_session_digest_is_scoped_and_contains_no_raw_identifiers() -> 
     assert "gateway-session-secret" not in digest
     assert "credential-v7" not in digest
     assert "unit-test-token" not in digest
+
+
+async def test_circuit_scope_none_never_opens_service_circuit() -> None:
+    """Agent Transport 使用 circuit_scope="none"：不维护服务级熔断，队列照常。"""
+    transport = DataTapTransport(
+        token=SecretStr("unit-test-token"),
+        circuit_scope="none",
+        failure_threshold=3,
+    )
+    state = transport._states[DataTapService.BILIBILI]
+    for _ in range(5):  # 连续失败远超 threshold
+        epoch = await transport._enter_circuit(state)
+        await transport._record_failure(state, epoch)
+    # scope=none：熔断器永不打开，_enter_circuit 直接放行
+    epoch = await transport._enter_circuit(state)
+    assert transport._states[DataTapService.BILIBILI].opened_at is None
+    assert epoch == transport._states[DataTapService.BILIBILI].epoch
+
+
+async def test_circuit_scope_service_still_opens_after_threshold() -> None:
+    """legacy 默认 circuit_scope="service"：连续失败后服务级熔断打开。"""
+    transport = DataTapTransport(
+        token=SecretStr("unit-test-token"),
+        circuit_scope="service",
+        failure_threshold=3,
+    )
+    state = transport._states[DataTapService.BILIBILI]
+    for _ in range(3):
+        epoch = await transport._enter_circuit(state)
+        await transport._record_failure(state, epoch)
+    with pytest.raises(McpCircuitOpen):
+        await transport._enter_circuit(state)
+    assert transport._states[DataTapService.BILIBILI].opened_at is not None
+
+
+async def test_circuit_scope_none_still_serializes_by_queue() -> None:
+    """scope=none 只是关闭服务级熔断，队列并发限制与超时仍然生效。"""
+    transport = DataTapTransport(
+        token=SecretStr("unit-test-token"),
+        circuit_scope="none",
+        max_concurrency_per_service=1,
+    )
+    assert transport._states[DataTapService.BILIBILI].semaphore._value == 1

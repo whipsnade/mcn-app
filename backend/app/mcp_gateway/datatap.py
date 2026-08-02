@@ -7,7 +7,7 @@ from collections.abc import Callable, Mapping
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from datetime import timedelta
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 import httpx
@@ -78,6 +78,11 @@ class DataTapTransport:
         write_timeout_seconds: float = 10.0,
         pool_timeout_seconds: float = 5.0,
         clock: Callable[[], float] = time.monotonic,
+        # "service"：legacy 服务级熔断（默认，行为不变）。
+        # "none"：Agent 桥固定使用，服务级熔断不再维护 open 状态，改由
+        #   agent_runtime.circuit_breaker 的 service+tool+args-hash 细粒度熔断
+        #   单独负责；队列并发限制与超时仍然生效。禁止两层熔断叠加。
+        circuit_scope: Literal["service", "none"] = "service",
     ) -> None:
         secret = token.get_secret_value()
         if not secret.strip():
@@ -88,6 +93,9 @@ class DataTapTransport:
             raise ValueError("failure_threshold must be positive")
         if circuit_reset_seconds <= 0 or queue_timeout_seconds <= 0:
             raise ValueError("timeouts must be positive")
+        if circuit_scope not in ("service", "none"):
+            raise ValueError("circuit_scope must be 'service' or 'none'")
+        self.circuit_scope = circuit_scope
 
         self.gateway_session_id = gateway_session_id or str(uuid4())
         if not self.gateway_session_id.strip() or not credential_version.strip():
@@ -104,6 +112,9 @@ class DataTapTransport:
             service: _ServiceState(asyncio.Semaphore(max_concurrency_per_service))
             for service in DataTapService
         }
+        # 已确认结果按 upstream_request_id 的受限本地缓存，供 reconcile_tool_call
+        # 只读核对（见下）。
+        self._recent_results: dict[str, RemoteToolResult] = {}
         self._client = httpx.AsyncClient(
             headers={"Authorization": f"Bearer {secret}"},
             timeout=httpx.Timeout(
@@ -211,7 +222,32 @@ class DataTapTransport:
                     raise
                 raise McpProtocolError("MCP protocol operation failed") from exc
 
-        return await self._run_isolated_with_retry(checked, operation)
+        result = await self._run_isolated_with_retry(checked, operation)
+        if result.upstream_request_id:
+            self._record_recent(result)
+        return result
+
+    async def reconcile_tool_call(self, upstream_request_id: str) -> RemoteToolResult | None:
+        """READ ONLY：按 upstream_request_id 回查本地已确认结果，绝不重放原调用。
+
+        调用结果在 :meth:`call_tool` 返回时按 ``upstream_request_id`` 记录在
+        受控大小的本地缓存；恢复流程据此确认 result_unknown，不重新外发
+        原调用（§11.1「禁止自动重放」）。
+        """
+        if not upstream_request_id:
+            return None
+        return self._recent_results.get(upstream_request_id)
+
+    _MAX_RECENT_RESULTS = 1_000
+
+    def _record_recent(self, result: RemoteToolResult) -> None:
+        request_id = result.upstream_request_id
+        if request_id is None:
+            return
+        if len(self._recent_results) >= self._MAX_RECENT_RESULTS:
+            oldest = next(iter(self._recent_results))
+            self._recent_results.pop(oldest, None)
+        self._recent_results[request_id] = result
 
     async def _run_isolated_with_retry(
         self, service: DataTapService, operation: Callable[[], Any]
@@ -275,6 +311,9 @@ class DataTapTransport:
             state.semaphore.release()
 
     async def _enter_circuit(self, state: _ServiceState) -> int:
+        if self.circuit_scope == "none":
+            # 服务级熔断不参与 Agent 路径；立即放行。
+            return state.epoch
         async with state.lock:
             if state.opened_at is None:
                 return state.epoch
@@ -286,6 +325,8 @@ class DataTapTransport:
             return state.epoch
 
     async def _record_failure(self, state: _ServiceState, epoch: int) -> None:
+        if self.circuit_scope == "none":
+            return
         async with state.lock:
             if epoch != state.epoch:
                 return
@@ -296,6 +337,8 @@ class DataTapTransport:
             state.half_open_in_flight = False
 
     async def _record_success(self, state: _ServiceState, epoch: int) -> None:
+        if self.circuit_scope == "none":
+            return
         async with state.lock:
             if epoch != state.epoch:
                 return
