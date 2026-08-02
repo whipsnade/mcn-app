@@ -61,14 +61,16 @@
 
 > 每个场景记录：run_id、MCP 调用状态、积分前后、产物版本、限制。完整结构化结果见
 > `outputs/agent-runtime-uat-results.json`（无密钥、无完整原始 prompt / payload）。
+> 测试在 engine.run 前即登记 run_id 并落盘：后续真实 DataTap 挂起时，run_id 也会被保留
+> （Fix 5）；本次 HANG 场景因进程被终止且事务回滚，run_id 未持久化。
 
 | # | 场景 | 结果 | run_id（截断） | 说明 |
 |---|------|------|----------------|------|
 | 1 | 信息不足时主动澄清 | PASS | 见 JSON | 真实模型输出 ask_user，Run → clarification_requested，写 pending Memory；0 次 MCP，1000→1000 |
-| 2 | 品牌分析 → brand_report_v3 | HANG | 见 JSON | 真实模型抓数成功（多次 settled 10 分），随后某 DataTap 查询挂起（Incident #8）；probe 另见 draft lineage 反复修订 / Attempt 暂停 |
-| 3 | 活动分析（campaign） | HANG | 见 JSON | 同 Incident #8：真实 MCP 调用正常，长查询挂起 |
-| 4 | Top20 达人圈选 + KOL 分析 | HANG | 见 JSON | 同 Incident #8 |
-| 5 | 基于已发布 Artifact 钻取（insight_board_v1） | N/A | 见 JSON | 依赖父品牌发布；父场景挂起未发布 → 无法执行 |
+| 2 | 品牌分析 → brand_report_v3 | HANG | 未持久化 | 真实模型抓数成功（多次 settled 10 分），随后某 DataTap 查询挂起（Incident #8），run 进程被终止、事务回滚，run_id 未持久化；probe 另见 draft lineage 反复修订 / Attempt 暂停 |
+| 3 | 活动分析（campaign） | HANG | 未持久化 | 同 Incident #8：真实 MCP 调用正常，长查询挂起，run 进程被终止 |
+| 4 | Top20 达人圈选 + KOL 分析 | HANG | 未持久化 | 同 Incident #8，run 进程被终止 |
+| 5 | 基于已发布 Artifact 钻取（insight_board_v1） | N/A | 未持久化 | 依赖父品牌发布；父场景挂起未发布 → 无法执行 |
 | 6 | 达人详情缓存（kol_detail_v2 + 24h cache） | PASS | — | 确定性验证缓存命中；真实 fetch 路径被缺陷 7 阻断 |
 | 7 | 趋势 504 后继续其他工具 | PASS | 见 JSON | 504 → result_unknown（保留预留 10），后续 calculate_expression 成功，Run completed，1000→990 |
 | 8 | 钱包不足后的 restricted 交付 | PASS | 见 JSON | 余额 5 分，模型感知余额不足后澄清交付；钱包不为负，无 settled 扣费 |
@@ -81,10 +83,15 @@
 - **settled 调用恰好 10 分**：MCP 调用 `points_settled == 10`、`points_reserved == 0`；
   内部计算/历史/草稿工具（`service="internal"`）0 分。✅（trend_504 场景 calculate_expression settled 0，
   reviewer 场景 query_analysis_data settled 10）
-- **failed_confirmed / definitely_not_sent → 释放预留**：`points_reserved == 0`、
-  `points_settled == 0`，钱包 `release` 流水回补。✅（trend_504 场景释放 10）
+- **failed_confirmed / definitely_not_sent → 释放预留**：本次 UAT **未实际触发**该释放路径——
+  trend_504 场景的 `social_statistic_trend` 是网关 504，按 mcp.py 分类为 `result_unknown`
+  （`points_reserved=10` 保持预留，`points_settled=0`），并非 `failed_confirmed`。
+  失败释放（release 流水）需后续构造 upstream isError / 输出校验失败等场景再验证。
 - **unknown → 恢复核对或保持预留并有审计行**：504 网关超时 → `result_unknown`，
-  `points_reserved` 保持 10（等恢复循环 reconcile）。✅（trend_504 场景）
+  `points_reserved` 保持 10（等恢复循环 reconcile）。✅（trend_504 场景，预留保持半段成立）。
+  ⚠️ **审计行（keep_unknown）半段本次未验证**：恢复循环是独立进程组件，本 UAT 不运行它，
+  因此该 unknown 调用**没有** `AgentToolCallReconciliation` 审计行（JSON limitation 已如实记录）；
+  该项需在带恢复循环的集成测试中验证。
 - **发布 Artifact 每个正式数值字段有有效 lineage**：reviewer 场景发布的 brand_report_v3 v1，
   `validate_and_freeze_lineage` 通过，`lineage_ok=True`。✅
 
@@ -108,6 +115,8 @@
 ## 结论
 
 真实模型 + 真实 DataTap 的运行时机制（状态机、计费、证据、故障分类、Reviewer 闭环、缓存）经本次 UAT
-验证**正确**；账本与证据断言全部通过（settled=10、unknown 保留预留、失败释放、发布 lineage 有效）。
-但 **cutover 阻断**：① 真实 DataTap 长查询可挂死 Run（Incident #8）；② 模型驱动的正式 Artifact
+**部分验证**：settled=10、unknown 保持预留、发布 lineage 有效均通过；**failed_confirmed 释放与
+unknown 审计行两段本次未实际触发**（trend_504 走 result_unknown 保留预留；恢复循环组件未运行），
+已在“账本与证据验证”如实标注为待后续场景验证的缺口。
+**cutover 阻断**：① 真实 DataTap 长查询可挂死 Run（Incident #8）；② 模型驱动的正式 Artifact
 交付在现有 prompt 工程下不可靠；③ 存在 Profile 与生产接线缺陷。建议按“未决问题”顺序修复后再切换。

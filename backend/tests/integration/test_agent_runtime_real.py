@@ -110,6 +110,9 @@ class CallRecord:
     points_reserved: int
     points_settled: int
     service: str | None = None
+    # unknown 调用是否已被恢复循环 reconcile（有 AgentToolCallReconciliation 审计行）。
+    # 本 UAT 不运行恢复循环进程组件，审计行缺失是已知缺口（§11.1），见 QA doc。
+    reconciled: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -120,6 +123,7 @@ class CallRecord:
             "points_reserved": self.points_reserved,
             "points_settled": self.points_settled,
             "service": self.service,
+            "reconciled": self.reconciled,
         }
 
 
@@ -361,6 +365,21 @@ async def _run_scenario(
             gateway=gateway,
             reviewer_gateway=reviewer_gateway,
         )
+        # 先登记 run_id（status=running）并立即落盘：即使真实 DataTap 查询挂起
+        # 导致 engine.run 无法返回，JSON 仍保留该场景的 run_id（Fix 5）。
+        record = ScenarioRecord(
+            scenario=scenario,
+            prompt_tag=prompt[:60],
+            profile=profile_name,
+            run_id=run.id,
+            status="running",
+            decision_count=0,
+            points_before=balance,
+            points_after=balance,
+        )
+        _ALL_RECORDS.append(record)
+        _dump_results()
+
         outcome = await engine.run(
             run=run,
             attempt_id=attempt.id,
@@ -369,18 +388,10 @@ async def _run_scenario(
         )
 
         wallet_row = await session.get(Wallet, user.id)
-        record = ScenarioRecord(
-            scenario=scenario,
-            prompt_tag=prompt[:60],
-            profile=profile_name,
-            run_id=run.id,
-            status=str(outcome.status),
-            decision_count=outcome.decision_count,
-            points_before=balance,
-            points_after=wallet_row.balance if wallet_row is not None else 0,
-        )
+        record.status = str(outcome.status)
+        record.decision_count = outcome.decision_count
+        record.points_after = wallet_row.balance if wallet_row is not None else 0
         await _collect_run_record(session, run.id, record)
-        _ALL_RECORDS.append(record)
         await session.commit()
         return record
 
@@ -400,6 +411,23 @@ async def _collect_run_record(db: AsyncSession, run_id: str, record: ScenarioRec
         ).all()
     )
     for call in calls:
+        reconciled = False
+        if call.status == "unknown":
+            recon_count = await db.scalar(
+                select(func.count(AgentToolCallReconciliation.id)).where(
+                    AgentToolCallReconciliation.tool_call_id == call.id
+                )
+            )
+            reconciled = (recon_count or 0) > 0
+            if reconciled:
+                record.unknown_reconciled = True
+            else:
+                # §11.1 后半（keep_unknown 审计行）由恢复循环进程组件负责；本 UAT
+                # 不运行该组件，审计行缺失是已知缺口，如实记录为 limitation。
+                record.limitations.append(
+                    f"unknown call {call.internal_tool_name} keeps reservation but lacks "
+                    "reconciliation audit row (recovery loop not exercised in UAT)"
+                )
         record.calls.append(
             CallRecord(
                 tool_call_id=call.id,
@@ -409,20 +437,9 @@ async def _collect_run_record(db: AsyncSession, run_id: str, record: ScenarioRec
                 points_reserved=call.points_reserved or 0,
                 points_settled=call.points_settled or 0,
                 service=call.service,
+                reconciled=reconciled,
             )
         )
-        if call.status == "unknown":
-            recon_count = await db.scalar(
-                select(func.count(AgentToolCallReconciliation.id)).where(
-                    AgentToolCallReconciliation.tool_call_id == call.id
-                )
-            )
-            if (recon_count or 0) > 0:
-                record.unknown_reconciled = True
-            else:
-                record.limitations.append(
-                    f"unknown call {call.internal_tool_name} lacks reconciliation audit row"
-                )
 
     steps = list(
         (
@@ -445,15 +462,25 @@ async def _collect_run_record(db: AsyncSession, run_id: str, record: ScenarioRec
             }
         )
 
-    transactions = list(
-        (
-            await db.scalars(
-                select(WalletTransaction)
-                .where(WalletTransaction.reference_type == "agent_tool_call")
-                .order_by(WalletTransaction.created_at)
-            )
-        ).all()
-    )
+    # 钱包流水只取本 Run 的 agent_tool_call 预留/结算/释放：按 user_id 与
+    # reference_id（本 Run 各调用 id）双重限定，避免跨场景流水串扰。
+    call_ids = [call.id for call in calls]
+    if call_ids:
+        transactions = list(
+            (
+                await db.scalars(
+                    select(WalletTransaction)
+                    .where(
+                        WalletTransaction.reference_type == "agent_tool_call",
+                        WalletTransaction.user_id == user_id,
+                        WalletTransaction.reference_id.in_(call_ids),
+                    )
+                    .order_by(WalletTransaction.created_at)
+                )
+            ).all()
+        )
+    else:
+        transactions = []
     for tx in transactions:
         record.wallet_tx_summary.append(
             {
@@ -549,9 +576,25 @@ async def _assert_ledger(record: ScenarioRecord) -> None:
             )
         elif call.status == "unknown":
             assert call.points_settled == 0
-            if not record.unknown_reconciled:
+            if call.reconciled:
+                # 已被恢复循环 reconcile：结算或释放后预留清零。
+                assert call.points_reserved == 0, (
+                    f"reconciled unknown call {call.tool_call_id} still reserved "
+                    f"{call.points_reserved}"
+                )
+            else:
+                # §11.1：未 reconcile 的 unknown 必须保持预留（等恢复循环核对）。
                 assert call.points_reserved > 0, (
-                    "unknown call must be reconciled or stay reserved with an audit row"
+                    f"unknown call {call.tool_call_id} lost its reservation without reconciliation"
+                )
+                # 审计行（keep_unknown）由恢复循环进程组件写入；本 UAT 不运行该组件，
+                # 缺失已在 _collect_run_record 记录为 limitation（已知缺口，见 QA doc）。
+                assert any(
+                    "lacks reconciliation audit row" in limitation
+                    for limitation in record.limitations
+                ), (
+                    f"unknown call {call.tool_call_id} audit-row gap must be recorded as a "
+                    "known limitation"
                 )
 
 

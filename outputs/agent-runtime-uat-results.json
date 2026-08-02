@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-08-02T22:13:41.057955",
+  "generated_at": "2026-08-02T22:38:14.017197",
   "env": {
     "app_env": "test",
     "mysql_database": "kol_insight_test",
@@ -10,7 +10,7 @@
       "scenario": "clarification",
       "prompt_tag": "帮我分析一下某个品牌的声量和情感，但我不确定具体要分析哪个品牌。",
       "profile": "session_analyst_v1",
-      "run_id": "bd564481-e656-4a11-ab1c-30ee143e8788",
+      "run_id": "8057eeb5-79c9-4830-b792-e754da5a8dcc",
       "status": "clarification_requested",
       "decision_count": 1,
       "points_before": 1000,
@@ -22,7 +22,7 @@
       "assistant_summary": [
         {
           "type": "clarification",
-          "content_prefix": "请问您想分析哪个品牌？可以告诉我品牌名称，我来帮您匹配标准标签并进行声量和情感分析。"
+          "content_prefix": "请问您想分析哪个品牌的声量和情感？请提供品牌名称，我可以帮您进行精准的品牌分析。"
         }
       ],
       "unknown_reconciled": false,
@@ -51,7 +51,7 @@
       "scenario": "trend_504_continue",
       "prompt_tag": "504 后继续其他工具（确定性）",
       "profile": "session_analyst_v1",
-      "run_id": "24434e31-961e-4d8b-b9d7-d7e5a02a9941",
+      "run_id": "3460c7a5-d1e0-46ee-a3e7-3d0d393eaf7f",
       "status": "completed",
       "decision_count": 3,
       "points_before": 1000,
@@ -65,22 +65,24 @@
       ],
       "calls": [
         {
-          "tool_call_id": "c78dd608-ddf0-4a5d-b898-072c42a3b2f4",
+          "tool_call_id": "3a63b1a7-e6e9-4bfd-bfa3-cae1d2aead17",
           "internal_tool_name": "social_statistic_trend",
           "status": "unknown",
           "error_type": "result_unknown",
           "points_reserved": 10,
           "points_settled": 0,
-          "service": "insight-cube-mcp"
+          "service": "insight-cube-mcp",
+          "reconciled": false
         },
         {
-          "tool_call_id": "e11a92a4-b2f0-450f-addc-2edbab32f156",
+          "tool_call_id": "5a701a5a-f827-4244-80e4-cb495e834e46",
           "internal_tool_name": "calculate_expression",
           "status": "settled",
           "error_type": null,
           "points_reserved": 0,
           "points_settled": 0,
-          "service": "internal"
+          "service": "internal",
+          "reconciled": false
         }
       ],
       "steps": [
@@ -106,25 +108,19 @@
       ],
       "unknown_reconciled": false,
       "limitations": [
-        "unknown call social_statistic_trend lacks reconciliation audit row"
+        "unknown call social_statistic_trend keeps reservation but lacks reconciliation audit row (recovery loop not exercised in UAT)"
       ]
     },
     {
       "scenario": "wallet_insufficient",
       "prompt_tag": "请分析瑞幸咖啡最近一个月的品牌声量。",
       "profile": "session_analyst_v1",
-      "run_id": "abdedea1-b286-4c7d-ba0c-4745ec312681",
+      "run_id": "dd7490cc-bf50-4a54-b097-ccccc81a9a88",
       "status": "clarification_requested",
       "decision_count": 2,
       "points_before": 5,
       "points_after": 5,
-      "wallet_tx_summary": [
-        {
-          "kind": "reserve",
-          "balance_delta": -10,
-          "reserved_delta": 10
-        }
-      ],
+      "wallet_tx_summary": [],
       "calls": [],
       "steps": [
         {
@@ -138,7 +134,7 @@
       "assistant_summary": [
         {
           "type": "clarification",
-          "content_prefix": "很抱歉，当前账户积分为 5，而品牌声量分析所需的 MCP 数据查询工具每次调用需消耗 10 积分，积分不足无法执行查询。请问您是否可以先充值积分后再发起分析？或者您有其他不需要消耗积分的问题我可以协助？"
+          "content_prefix": "账户积分余额不足（当前仅剩 5 积分），无法调用品牌声量查询所需的 MCP 数据工具。是否需要我尝试以下方案之一？"
         }
       ],
       "unknown_reconciled": false,
@@ -148,27 +144,22 @@
       "scenario": "reviewer_revise",
       "prompt_tag": "submit_review → revise → fix → approve → publish",
       "profile": "session_analyst_v1",
-      "run_id": "d7613f1e-bc21-4032-8c7e-b3223cb90847",
+      "run_id": "d8e9dada-a7a5-4b08-b59b-231213e89f28",
       "status": "completed",
       "decision_count": 4,
       "points_before": 1000,
       "points_after": 1000,
-      "wallet_tx_summary": [
-        {
-          "kind": "reserve",
-          "balance_delta": -10,
-          "reserved_delta": 10
-        }
-      ],
+      "wallet_tx_summary": [],
       "calls": [
         {
-          "tool_call_id": "758e31d0-59cd-4e83-a42b-87b24f27066a",
+          "tool_call_id": "7d129619-fbcc-483e-8112-2ff9301ddac0",
           "internal_tool_name": "query_analysis_data",
           "status": "settled",
           "error_type": null,
           "points_reserved": 0,
           "points_settled": 10,
-          "service": "insight-cube-mcp"
+          "service": "insight-cube-mcp",
+          "reconciled": false
         }
       ],
       "steps": [
@@ -193,7 +184,7 @@
       ],
       "artifact_versions": [
         {
-          "artifact_id": "5232d082-e211-4fad-9544-9297a838bc16",
+          "artifact_id": "a04e769c-be8f-4c07-92ed-cd5e836c05b6",
           "version": 1,
           "schema_version": "brand_report_v3",
           "data_status": "complete",
