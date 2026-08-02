@@ -170,6 +170,30 @@ async def test_calculate_expression_rejects_arbitrary_code() -> None:
         assert result.safe_summary
 
 
+async def test_calculate_expression_rejects_huge_power_fast() -> None:
+    tool = CalculateExpressionTool()
+    # 9**9**9 ≈ 10^(3.7e8 位)：必须在构造天文数字前被拒绝（快速返回，不挂起）。
+    result = await tool.execute(CTX, type(tool).input_model(expression="9**9**9"))
+    assert result.status == "failed"
+    assert "exponent too large" in result.safe_summary
+
+
+async def test_calculate_expression_rejects_huge_exponent_constant() -> None:
+    tool = CalculateExpressionTool()
+    result = await tool.execute(CTX, type(tool).input_model(expression="2**100000"))
+    assert result.status == "failed"
+    assert "exponent too large" in result.safe_summary
+
+
+async def test_calculate_expression_oversized_result_is_structured_error() -> None:
+    tool = CalculateExpressionTool()
+    # (10**999)**5 ≈ 10^4995，超过 Python int→str 的 4300 位上限：
+    # 返回结构化错误而非抛异常崩溃。
+    result = await tool.execute(CTX, type(tool).input_model(expression="(10**999)**5"))
+    assert result.status == "failed"
+    assert "serialize" in result.safe_summary
+
+
 # ---------------------------------------------------------------------------
 # aggregate_metrics：确定性聚合
 # ---------------------------------------------------------------------------
@@ -432,3 +456,32 @@ async def test_rank_kols_records_settled_zero_cost_tool_call(db_session, user_fa
     assert row.arguments_hash
     # logical_call_id 确定性派生：同一 run/step/参数重入复用同一行。
     assert len({row.logical_call_id for row in rows}) == 1
+
+
+async def test_settled_call_duplicate_insert_is_idempotent(db_session, user_factory) -> None:
+    from unittest.mock import AsyncMock, patch
+
+    user = await user_factory()
+    session, run, step = await _make_chain(db_session, user.id)
+    tool = RankKolsTool(db_session)
+    context = ToolContext(
+        user_id=user.id,
+        session_id=session.id,
+        run_id=run.id,
+        profile_name="session_analyst_v1",
+        step_id=step.id,
+    )
+    args = type(tool).input_model(
+        items=[_kol_item(uid="1", engagement_total=100)],
+        context={"industry": "美食", "regions": ["上海"], "age_ranges": ["18-24"]},
+    )
+    await tool.execute(context, args)
+
+    # 模拟并发 TOCTOU：幂等预查 miss，INSERT 撞唯一约束 → 不崩溃、不重复落库。
+    with patch.object(db_session, "scalar", new=AsyncMock(return_value=None)):
+        result = await tool.execute(context, args)
+    assert result.status == "success"
+    rows = (
+        await db_session.scalars(select(AgentToolCall).where(AgentToolCall.run_id == run.id))
+    ).all()
+    assert len(rows) == 1

@@ -22,6 +22,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_runtime.models import AgentToolCall
@@ -41,6 +42,12 @@ _RANK_MAX_LIMIT = 50
 
 # 受限表达式求值的 AST 节点数上限（防御深度嵌套/超大表达式）。
 _MAX_AST_NODES = 200
+
+# DoS 防护（§10.3）：超大指数先于 pow 求值被拒绝；整数结果位长受限，使
+# `**`/`*` 等运算无法构造天文数字。位长上限放宽到 Python int→str 限制
+# （4300 位）之上，让「结果无法序列化」走结构化错误而非崩溃。
+_MAX_POW_EXPONENT = 1000
+_MAX_RESULT_BITS = 40_000
 
 _SAFE_BIN_OPS: dict[type[ast.operator], Any] = {
     ast.Add: operator.add,
@@ -131,9 +138,18 @@ def _evaluate(node: ast.AST, variables: Mapping[str, Any]) -> Any:
     if isinstance(node, ast.BinOp):
         if type(node.op) not in _SAFE_BIN_OPS:
             raise _UnsafeExpression(f"unsupported operator: {type(node.op).__name__}")
-        return _SAFE_BIN_OPS[type(node.op)](
-            _evaluate(node.left, variables), _evaluate(node.right, variables)
-        )
+        left = _evaluate(node.left, variables)
+        right = _evaluate(node.right, variables)
+        if type(node.op) is ast.Pow:
+            # DoS 防护：先于 pow 拒绝超大指数（如 9**9**9），避免构造天文数字。
+            if not isinstance(right, (int, float)) or abs(right) > _MAX_POW_EXPONENT:
+                raise _UnsafeExpression("exponent too large")
+        result = _SAFE_BIN_OPS[type(node.op)](left, right)
+        # 结果量级防护：bit_length() 为 O(1)，限制每一步中间结果的位长。
+        if isinstance(result, int) and not isinstance(result, bool):
+            if result.bit_length() > _MAX_RESULT_BITS:
+                raise _UnsafeExpression("result magnitude too large")
+        return result
     if isinstance(node, ast.UnaryOp):
         if type(node.op) not in _SAFE_UNARY_OPS:
             raise _UnsafeExpression(f"unsupported operator: {type(node.op).__name__}")
@@ -172,6 +188,10 @@ def evaluate_expression(expression: str, variables: Mapping[str, Any]) -> Any:
     result = _evaluate(tree.body, dict(variables))
     if not isinstance(result, (int, float, bool)):
         raise _UnsafeExpression("expression must evaluate to a number or boolean")
+    # 最终结果量级防护：字面量超大整数（无任何运算）同样被拦截。
+    if isinstance(result, int) and not isinstance(result, bool):
+        if result.bit_length() > _MAX_RESULT_BITS:
+            raise _UnsafeExpression("result magnitude too large")
     return result
 
 
@@ -189,7 +209,9 @@ async def _record_settled_call(
     """确定性调用成功落库为 settled 零积分 tool call（供 lineage 引用）。
 
     只有存在 DB 且 ``ToolContext.step_id`` 可用时才落库（否则跳过）。
-    ``logical_call_id`` 由 run+step+工具+参数哈希确定性派生，重入复用同一行。
+    ``logical_call_id`` 由 run+step+工具+参数哈希确定性派生；正常重入经预查
+    幂等复用，并发 TOCTOU 由唯一约束 + savepoint + expunge 兜底（镜像
+    mcp.py 的模式），绝不崩溃也不重复落库。
     """
     if db is None or context.step_id is None:
         return
@@ -207,24 +229,36 @@ async def _record_settled_call(
     if existing is not None:
         return
     now = datetime.now(UTC).replace(tzinfo=None)
-    db.add(
-        AgentToolCall(
-            id=str(uuid4()),
-            run_id=context.run_id,
-            step_id=context.step_id,
-            logical_call_id=logical_call_id,
-            service="internal",
-            internal_tool_name=internal_tool_name,
-            arguments_json=normalized,
-            arguments_hash=args_hash,
-            status="settled",
-            points_reserved=0,
-            points_settled=0,
-            started_at=now,
-            completed_at=now,
-        )
+    row = AgentToolCall(
+        id=str(uuid4()),
+        run_id=context.run_id,
+        step_id=context.step_id,
+        logical_call_id=logical_call_id,
+        service="internal",
+        internal_tool_name=internal_tool_name,
+        arguments_json=normalized,
+        arguments_hash=args_hash,
+        status="settled",
+        points_reserved=0,
+        points_settled=0,
+        started_at=now,
+        completed_at=now,
     )
-    await db.flush()
+    try:
+        # 在既有事务内用 savepoint 隔离插入，避免唯一约束冲突毒化外层事务。
+        if db.in_transaction():
+            async with db.begin_nested():
+                db.add(row)
+                await db.flush()
+        else:
+            async with db.begin():
+                db.add(row)
+                await db.flush()
+    except IntegrityError:
+        if row in db:
+            db.expunge(row)
+        # 并发 TOCTOU：另一调用已插入同一 logical_call_id，幂等复用其行。
+        return
 
 
 class CalculateExpressionArgs(BaseModel):
@@ -253,13 +287,15 @@ class CalculateExpressionTool:
             return _calc_failed("division by zero")
         except (TypeError, ValueError, OverflowError, KeyError) as exc:
             return _calc_failed(f"invalid expression: {exc}")
-        await _record_settled_call(self._db, context, self.name, args)
-        return ToolResult(
-            status="success",
-            safe_summary=json.dumps(
+        try:
+            summary = json.dumps(
                 {"expression": args.expression, "result": result}, ensure_ascii=False
-            ),
-        )
+            )
+        except (TypeError, ValueError) as exc:
+            # Python int→str 有 4300 位上限：结果过大时转为结构化错误而非崩溃。
+            return _calc_failed(f"result too large to serialize: {exc}")
+        await _record_settled_call(self._db, context, self.name, args)
+        return ToolResult(status="success", safe_summary=summary)
 
 
 class MetricSpec(BaseModel):

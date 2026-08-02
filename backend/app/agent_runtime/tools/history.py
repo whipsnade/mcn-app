@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -31,18 +31,44 @@ FORBIDDEN = "forbidden"
 
 # search_evidence 默认返回的匹配上限（无分页参数，超出置 truncated）。
 _SEARCH_MATCH_LIMIT = 20
-# read_tool_result 默认页大小。
+# search_evidence 单次扫描的 SQL LIMIT（投影后仍避免无限加载整 Session 证据）。
+_SEARCH_SCAN_LIMIT = 500
+# read_tool_result 默认页大小与页大小上限（§10.2：绝不整页返回大结果）。
 _TOOL_RESULT_DEFAULT_LIMIT = 20
+_TOOL_RESULT_MAX_LIMIT = 200
 # search_evidence filters 支持的等值列。
 _FILTER_COLUMNS: dict[str, Any] = {
     "source_type": EvidenceItem.source_type,
     "source_name": EvidenceItem.source_name,
     "availability_status": EvidenceItem.availability_status,
 }
+# search_evidence 只投影匹配/展示所需列，绝不加载大字段 raw_payload_json。
+_EVIDENCE_MATCH_COLUMNS = (
+    EvidenceItem.id,
+    EvidenceItem.run_id,
+    EvidenceItem.source_type,
+    EvidenceItem.source_name,
+    EvidenceItem.scope_json,
+    EvidenceItem.period_json,
+    EvidenceItem.normalized_preview_json,
+    EvidenceItem.collected_at,
+)
+# 参数校验失败的结构化错误类型。
+INVALID_ARGUMENTS = "invalid_arguments"
 
 
 def _failed(error_type: str, message: str) -> ToolResult:
     return ToolResult(status="failed", safe_summary=message, error_type=error_type)
+
+
+def _parse_args(
+    model_cls: type[BaseModel], arguments: Any
+) -> tuple[BaseModel | None, ToolResult | None]:
+    """校验工具参数；失败返回结构化错误而非抛异常。"""
+    try:
+        return model_cls.model_validate(arguments), None
+    except ValidationError as exc:
+        return None, _failed(INVALID_ARGUMENTS, f"invalid arguments: {exc}")
 
 
 async def _owned_session(
@@ -91,7 +117,9 @@ class ReadArtifactTool:
         self._db = db_session
 
     async def execute(self, context: ToolContext, arguments: BaseModel) -> ToolResult:
-        args = ReadArtifactArgs.model_validate(arguments)
+        args, parse_error = _parse_args(ReadArtifactArgs, arguments)
+        if parse_error is not None:
+            return parse_error
         _session, error = await _owned_session(self._db, context)
         if error is not None:
             return _failed(error, "session_" + error)
@@ -156,7 +184,9 @@ class SearchEvidenceTool:
         self._db = db_session
 
     async def execute(self, context: ToolContext, arguments: BaseModel) -> ToolResult:
-        args = SearchEvidenceArgs.model_validate(arguments)
+        args, parse_error = _parse_args(SearchEvidenceArgs, arguments)
+        if parse_error is not None:
+            return parse_error
         _session, error = await _owned_session(self._db, context)
         if error is not None:
             return _failed(error, "session_" + error)
@@ -183,13 +213,15 @@ class SearchEvidenceTool:
                 if column is not None:
                     conditions.append(column == value)
 
-        rows = (
-            await self._db.scalars(
-                select(EvidenceItem)
-                .where(*conditions)
-                .order_by(EvidenceItem.collected_at.desc(), EvidenceItem.id.desc())
-            )
-        ).all()
+        # 只投影匹配/展示所需列（不加载大字段 raw_payload_json），并加 SQL LIMIT
+        # 限制单次扫描量，避免长 Session 无限加载。
+        result = await self._db.execute(
+            select(*_EVIDENCE_MATCH_COLUMNS)
+            .where(*conditions)
+            .order_by(EvidenceItem.collected_at.desc(), EvidenceItem.id.desc())
+            .limit(_SEARCH_SCAN_LIMIT)
+        )
+        rows = result.all()
         matches = [item for item in rows if self._matches(item, args.query or "")]
         total = len(matches)
         page = matches[:_SEARCH_MATCH_LIMIT]
@@ -265,7 +297,10 @@ class SearchEvidenceTool:
 class ReadToolResultArgs(BaseModel):
     evidence_id: str = Field(min_length=1)
     cursor: int | None = None
-    limit: int = _TOOL_RESULT_DEFAULT_LIMIT
+    # §10.2：limit 上限 200，防御超大 limit 整页返回大结果。
+    limit: int = Field(
+        default=_TOOL_RESULT_DEFAULT_LIMIT, ge=1, le=_TOOL_RESULT_MAX_LIMIT
+    )
 
 
 class ReadToolResultTool:
@@ -280,7 +315,9 @@ class ReadToolResultTool:
         self._db = db_session
 
     async def execute(self, context: ToolContext, arguments: BaseModel) -> ToolResult:
-        args = ReadToolResultArgs.model_validate(arguments)
+        args, parse_error = _parse_args(ReadToolResultArgs, arguments)
+        if parse_error is not None:
+            return parse_error
         _session, error = await _owned_session(self._db, context)
         if error is not None:
             return _failed(error, "session_" + error)
@@ -292,7 +329,8 @@ class ReadToolResultTool:
 
         sequence, total = self._sequence(evidence.raw_payload_json)
         offset = max(args.cursor or 0, 0)
-        limit = max(args.limit, 1)
+        # 防御性钳制：即使未来字段放宽，页大小也绝不超过上限。
+        limit = min(max(args.limit, 1), _TOOL_RESULT_MAX_LIMIT)
         page = sequence[offset : offset + limit]
         next_offset = offset + limit
         next_cursor = str(next_offset) if next_offset < total else None
@@ -327,6 +365,7 @@ class ReadToolResultTool:
 
 __all__ = [
     "FORBIDDEN",
+    "INVALID_ARGUMENTS",
     "NOT_FOUND",
     "ReadArtifactArgs",
     "ReadArtifactTool",

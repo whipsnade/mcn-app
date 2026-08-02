@@ -25,6 +25,8 @@ from app.billing.service import WalletService
 
 # 默认最近消息窗口大小（§九「最近有限条消息」）。
 DEFAULT_RECENT_MESSAGE_WINDOW = 8
+# 默认历史 Run 摘要上限：与最近消息窗口一致，防止长 Session 摘要无限增长。
+DEFAULT_RUN_SUMMARY_LIMIT = 20
 
 
 class MemorySessionNotFound(LookupError):
@@ -56,6 +58,7 @@ class MemoryContextBuilder:
         current_user_message: str,
         channel_permissions: Iterable[str] = (),
         recent_message_window: int = DEFAULT_RECENT_MESSAGE_WINDOW,
+        run_summary_limit: int = DEFAULT_RUN_SUMMARY_LIMIT,
     ) -> dict[str, Any]:
         """组装默认上下文；Session 缺失或属他人时抛 :class:`LookupError`/异常。"""
         session = await self._db.get(AgentSession, session_id)
@@ -65,7 +68,7 @@ class MemoryContextBuilder:
             raise MemorySessionForbidden("agent_session_forbidden")
 
         recent = await self._recent_messages(session_id, recent_message_window)
-        run_summaries = await self._run_summaries(session_id)
+        run_summaries = await self._run_summaries(session_id, run_summary_limit)
         artifact_directory = await self._artifact_directory(session_id)
         tools = await self._registry.visible_tools(profile, channel_permissions=channel_permissions)
 
@@ -107,18 +110,25 @@ class MemoryContextBuilder:
             for message in rows
         ]
 
-    async def _run_summaries(self, session_id: str) -> list[dict[str, Any]]:
-        entries = (
-            await self._db.scalars(
-                select(MemoryEntry)
-                .where(
-                    MemoryEntry.session_id == session_id,
-                    MemoryEntry.memory_type == "run_summary",
-                    MemoryEntry.superseded_at.is_(None),
-                )
-                .order_by(MemoryEntry.created_at.asc())
+    async def _run_summaries(self, session_id: str, limit: int) -> list[dict[str, Any]]:
+        # 只取最近 limit 条（created_at 降序 + limit，再反转为时间正序），
+        # 防止长 Session 的摘要无限挤占每轮上下文。
+        entries = list(
+            reversed(
+                (
+                    await self._db.scalars(
+                        select(MemoryEntry)
+                        .where(
+                            MemoryEntry.session_id == session_id,
+                            MemoryEntry.memory_type == "run_summary",
+                            MemoryEntry.superseded_at.is_(None),
+                        )
+                        .order_by(MemoryEntry.created_at.desc())
+                        .limit(max(limit, 1))
+                    )
+                ).all()
             )
-        ).all()
+        )
         summaries: list[dict[str, Any]] = []
         for entry in entries:
             content = dict(entry.content_json or {})
@@ -137,15 +147,20 @@ class MemoryContextBuilder:
         ).all()
         if not artifacts:
             return []
-        versions = (
-            await self._db.scalars(
-                select(AgentArtifactVersion).where(
-                    AgentArtifactVersion.artifact_id.in_([artifact.id for artifact in artifacts])
-                )
+        # 只投影目录所需列（artifact_id/version/data_status），绝不加载大字段
+        # payload_json / evidence_refs_json（§九「紧凑目录」）。
+        version_result = await self._db.execute(
+            select(
+                AgentArtifactVersion.artifact_id,
+                AgentArtifactVersion.version,
+                AgentArtifactVersion.data_status,
+            ).where(
+                AgentArtifactVersion.artifact_id.in_([artifact.id for artifact in artifacts])
             )
-        ).all()
-        latest: dict[str, AgentArtifactVersion] = {}
-        for version in versions:
+        )
+        version_rows = version_result.all()
+        latest: dict[str, Any] = {}
+        for version in version_rows:
             current = latest.get(version.artifact_id)
             if current is None or version.version > current.version:
                 latest[version.artifact_id] = version
@@ -178,6 +193,7 @@ class MemoryContextBuilder:
 
 __all__ = [
     "DEFAULT_RECENT_MESSAGE_WINDOW",
+    "DEFAULT_RUN_SUMMARY_LIMIT",
     "MemoryContextBuilder",
     "MemorySessionForbidden",
     "MemorySessionNotFound",

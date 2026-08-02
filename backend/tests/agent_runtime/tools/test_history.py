@@ -31,6 +31,7 @@ from app.agent_runtime.models import (
 from app.agent_runtime.tools.contracts import ToolContext
 from app.agent_runtime.tools.history import (
     FORBIDDEN,
+    INVALID_ARGUMENTS,
     NOT_FOUND,
     ReadArtifactTool,
     ReadToolResultTool,
@@ -453,3 +454,57 @@ async def test_read_tool_result_cross_user_forbidden(db_session, user_factory) -
     result = await tool.execute(context, type(tool).input_model(evidence_id=evidence_id))
     assert result.status == "failed"
     assert result.error_type == FORBIDDEN
+
+
+async def test_read_tool_result_oversized_limit_rejected(db_session, user_factory) -> None:
+    user = await user_factory()
+    session, run, _step, call = await _make_chain(db_session, user.id)
+    evidence_id = await _make_evidence(
+        db_session, session, run, call, raw_payload={"rows": [{"i": i} for i in range(300)]}
+    )
+    context = ToolContext(user_id=user.id, session_id=session.id, run_id=run.id, profile_name="session_analyst_v1")
+    tool = ReadToolResultTool(db_session)
+    # 以 dict 传入，触发 execute 内参数校验（构造时 le=200 会直接拦截）。
+    result = await tool.execute(context, {"evidence_id": evidence_id, "limit": 10**9})
+    assert result.status == "failed"
+    assert result.error_type == INVALID_ARGUMENTS
+    # 合法但大的 limit 也不超上限：永远不整页返回大结果（§10.2）。
+    bounded = await tool.execute(
+        context, type(tool).input_model(evidence_id=evidence_id, limit=200)
+    )
+    assert bounded.status == "success"
+    assert len(json.loads(bounded.safe_summary)["items"]) == 200
+
+
+async def test_search_evidence_does_not_load_raw_payload_columns(db_session, user_factory) -> None:
+    from sqlalchemy import event
+
+    from app.db.session import engine
+
+    captured: list[str] = []
+
+    @event.listens_for(engine.sync_engine, "before_execute")
+    def _capture(conn, clause, multiparams, params, execution_options):
+        captured.append(str(clause))
+
+    try:
+        user = await user_factory()
+        session, run, _step, call = await _make_chain(db_session, user.id)
+        await _make_evidence(db_session, session, run, call, raw_payload={"rows": [{"关键词": "美妆"}]})
+        context = ToolContext(user_id=user.id, session_id=session.id, run_id=run.id, profile_name="session_analyst_v1")
+        tool = SearchEvidenceTool(db_session)
+        result = await tool.execute(context, type(tool).input_model(query="美妆"))
+        assert result.status == "success"
+        assert json.loads(result.safe_summary)["total_matches"] == 1
+    finally:
+        event.remove(engine.sync_engine, "before_execute", _capture)
+
+    # search_evidence 只投影匹配/展示列，绝不加载大字段 raw_payload_json。
+    search_selects = [
+        sql
+        for sql in captured
+        if sql.lstrip().lower().startswith("select") and "evidence_items" in sql
+    ]
+    assert search_selects
+    for sql in search_selects:
+        assert "raw_payload_json" not in sql

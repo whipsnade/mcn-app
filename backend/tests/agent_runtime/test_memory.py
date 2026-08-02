@@ -21,6 +21,7 @@ from app.agent_artifacts.models import (
     ArtifactDraftRevision,
 )
 from app.agent_runtime.memory import (
+    DEFAULT_RUN_SUMMARY_LIMIT,
     MemoryContextBuilder,
     MemorySessionForbidden,
     MemorySessionNotFound,
@@ -362,3 +363,82 @@ async def test_context_for_missing_session_is_rejected(db_session, user_factory)
             profile=session_analyst,
             current_user_message="继续分析",
         )
+
+
+# ---------------------------------------------------------------------------
+# 上下文预算：Run 摘要有界、目录不加载 payload
+# ---------------------------------------------------------------------------
+
+
+async def test_run_summaries_bounded(db_session, user_factory) -> None:
+    from datetime import timedelta
+
+    user = await user_factory()
+    session = await _seed_session(db_session, user.id)
+    now = _now()
+    # 追加 25 条更晚的 run_summary，共 26 条，超出默认上限 20。
+    for index in range(25):
+        db_session.add(
+            MemoryEntry(
+                id=str(uuid4()),
+                session_id=session.id,
+                source_run_id=None,
+                memory_type="run_summary",
+                content_json={"summary": f"追加摘要-{index}"},
+                created_at=now + timedelta(seconds=index + 1),
+            )
+        )
+    await db_session.flush()
+
+    builder = MemoryContextBuilder(db_session, _registry(db_session))
+    context = await builder.build(
+        user_id=user.id,
+        session_id=session.id,
+        profile=session_analyst,
+        current_user_message="继续",
+    )
+    summaries = context["run_summaries"]
+    assert len(summaries) == DEFAULT_RUN_SUMMARY_LIMIT
+    kept = {summary["summary"] for summary in summaries}
+    # 只保留最近 20 条：最新的在，最旧的（基础摘要与追加摘要-0）被截掉。
+    assert "追加摘要-24" in kept
+    assert "追加摘要-0" not in kept
+    assert "第一轮完成品牌声量趋势分析" not in kept
+
+
+async def test_artifact_directory_does_not_load_payload_columns(db_session, user_factory) -> None:
+    from sqlalchemy import event
+
+    from app.db.session import engine
+
+    user = await user_factory()
+    session = await _seed_session(db_session, user.id)
+    builder = MemoryContextBuilder(db_session, _registry(db_session))
+
+    captured: list[str] = []
+
+    @event.listens_for(engine.sync_engine, "before_execute")
+    def _capture(conn, clause, multiparams, params, execution_options):
+        captured.append(str(clause))
+
+    try:
+        context = await builder.build(
+            user_id=user.id,
+            session_id=session.id,
+            profile=session_analyst,
+            current_user_message="继续",
+        )
+        assert len(context["artifact_directory"]) == 2
+    finally:
+        event.remove(engine.sync_engine, "before_execute", _capture)
+
+    # Artifact 目录查询只投影 artifact_id/version/data_status，绝不加载大字段。
+    version_selects = [
+        sql
+        for sql in captured
+        if sql.lstrip().lower().startswith("select") and "agent_artifact_versions" in sql
+    ]
+    assert version_selects
+    for sql in version_selects:
+        assert "payload_json" not in sql
+        assert "evidence_refs_json" not in sql
