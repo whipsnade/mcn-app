@@ -1,3 +1,4 @@
+import { memo } from 'react';
 import { CheckCircle2, Loader2, MinusCircle, XCircle } from 'lucide-react';
 
 import type { RunToolCall } from '../../state/agentEvents';
@@ -23,7 +24,7 @@ function formatDuration(durationMs: number): string {
  * 刻意不渲染 toolCalls[].detail：detail 可能携带工具错误原文，
  * 为遵守「不展示密钥或完整敏感参数」，错误细节由后端脱敏后在别处呈现。
  */
-export default function AgentRunSteps({ toolCalls }: AgentRunStepsProps) {
+export function AgentRunStepsImpl({ toolCalls }: AgentRunStepsProps) {
   if (toolCalls.length === 0) return null;
 
   return (
@@ -52,3 +53,6 @@ export default function AgentRunSteps({ toolCalls }: AgentRunStepsProps) {
     </ul>
   );
 }
+
+// 工具步骤列表：活跃卡 thinking 增量不改变 toolCalls 时跳过重渲染。
+export default memo(AgentRunStepsImpl);

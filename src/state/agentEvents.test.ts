@@ -119,4 +119,24 @@ describe('reduceRunEvent', () => {
     state = reduceRunEvent(state, event('review.rejected', 6, { review_batch_id: 'batch-1' }));
     expect(state.review?.status).toBe('rejected');
   });
+
+  it('produces clarification_requested from an ask_user message.completed event', () => {
+    let state = initialRunRuntime('run-1');
+    state = reduceRunEvent(state, event('run.started', 1, {}));
+    state = reduceRunEvent(state, event('message.completed', 2, { type: 'clarification' }));
+
+    expect(state.status).toBe('clarification_requested');
+    expect(state.messageCompleted).toBe(true);
+    // 澄清非执行终态：SSE 保持连接，等待用户回答后由新 Run 接续。
+    expect(isTerminalRunStatus(state.status)).toBe(false);
+  });
+
+  it('does not set clarification_requested for a normal completion message', () => {
+    let state = initialRunRuntime('run-1');
+    state = reduceRunEvent(state, event('run.completed', 1, { outcome: 'completed' }));
+    state = reduceRunEvent(state, event('message.completed', 2, { type: 'completion' }));
+
+    expect(state.status).toBe('completed');
+    expect(state.messageCompleted).toBe(true);
+  });
 });

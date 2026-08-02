@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { memo, useEffect, useRef, useState } from 'react';
 import { ChevronDown, ChevronRight, Pause, Play, ShieldCheck, Workflow } from 'lucide-react';
 
 import {
@@ -29,6 +29,8 @@ export interface AgentRunCardProps {
   clarification?: RunClarification;
 }
 
+// queued 来自设计状态机（[*] --> queued）；reducer 尚未发出 run.queued 事件，
+// 保留为合法初始/兜底状态（status 缺失时卡片按执行中展示）。
 const STATUS_META: Record<string, { label: string; dot: string }> = {
   queued: { label: '排队中', dot: 'bg-slate-400' },
   running: { label: '执行中', dot: 'bg-indigo-500 animate-pulse' },
@@ -54,8 +56,11 @@ const REVIEW_LABELS: Record<RunReviewStatus, string> = {
  * - thinking 实时展示、完成后折叠；
  * - 工具步骤只显示安全名称/状态/耗时/积分；
  * - paused 显示继续按钮；clarification_requested 显示问题与选项 chips。
+ *
+ * React.memo：历史 Run 卡（run/澄清/回调 props 稳定）跳过每次 SSE 增量引发的
+ * 整树重渲染，只有活跃卡跟随实时状态更新。
  */
-export default function AgentRunCard({
+export function AgentRunCardImpl({
   run,
   onResume,
   onPause,
@@ -144,7 +149,9 @@ export default function AgentRunCard({
 
       {/* 内容区：思考 + 工具步骤 + Reviewer + 澄清 + 错误 */}
       <div className="space-y-2.5 px-3.5 py-3">
-        <AgentThinking text={run.thinking} hasThinking={run.hasThinking} status={run.thinkingStatus} />
+        {(run.hasThinking || !terminal) && (
+          <AgentThinking text={run.thinking} hasThinking={run.hasThinking} status={run.thinkingStatus} />
+        )}
         <AgentRunSteps toolCalls={run.toolCalls} />
         {run.review && (
           <div className="flex items-center gap-1.5">
@@ -170,3 +177,5 @@ export default function AgentRunCard({
     </section>
   );
 }
+
+export default memo(AgentRunCardImpl);

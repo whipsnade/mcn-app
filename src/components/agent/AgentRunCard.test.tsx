@@ -1,8 +1,10 @@
+import { memo } from 'react';
 import { fireEvent, render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 
 import { initialRunRuntime, type RunRuntimeState } from '../../state/agentEvents';
-import AgentRunCard from './AgentRunCard';
+import AgentRunCard, { AgentRunCardImpl, type AgentRunCardProps } from './AgentRunCard';
+import AgentThinking from './AgentThinking';
 
 function run(overrides: Partial<RunRuntimeState> = {}): RunRuntimeState {
   return {
@@ -121,6 +123,70 @@ describe('AgentRunCard', () => {
     expect(screen.queryByRole('button', { name: /思考/ })).toBeNull();
     // 不编造推理：无思考文本。
     expect(screen.queryByText(/正在检索|推理过程/)).toBeNull();
+  });
+
+  it('relabels a settled thinking state without content as 未生成思考', () => {
+    render(<AgentThinking text="" hasThinking={false} status="completed" />);
+    expect(screen.getByText('未生成思考')).toBeVisible();
+    expect(screen.queryByRole('status')).toBeNull();
+  });
+
+  it('does not show a processing spinner when a terminal run has no thinking', () => {
+    render(
+      <AgentRunCard
+        run={run({
+          status: 'completed',
+          hasThinking: false,
+          thinking: '',
+          steps: [{ id: 'terminal-1', label: '分析完成', status: 'succeeded' }],
+        })}
+      />,
+    );
+    // 终态卡展开后思考区不再渲染“正在处理”旋转占位。
+    fireEvent.click(screen.getByRole('button', { name: /执行卡/ }));
+    expect(screen.queryByText('正在处理')).toBeNull();
+    expect(screen.queryByText('未生成思考')).toBeNull();
+  });
+
+  it('default export is a memoized run card', () => {
+    expect((AgentRunCard as unknown as { $$typeof?: symbol }).$$typeof).toBe(Symbol.for('react.memo'));
+  });
+
+  it('memoizes the run card so a completed run is not re-rendered by the next run delta', () => {
+    const impl = vi.fn((props: AgentRunCardProps) => <AgentRunCardImpl {...props} />);
+    const MemoizedCard = memo(impl);
+    const noop = () => undefined;
+    const completedRun = run({
+      runId: 'run-1',
+      status: 'completed',
+      steps: [
+        { id: 'run', label: '开始执行', status: 'succeeded' },
+        { id: 'terminal-1', label: '分析完成', status: 'succeeded' },
+      ],
+    });
+    const activeRun = run({
+      runId: 'run-2',
+      status: 'running',
+      toolCalls: [{ id: 'tool-1', name: 'brand_search', status: 'running' }],
+    });
+    const { rerender } = render(
+      <>
+        <MemoizedCard run={completedRun} onResume={noop} />
+        <MemoizedCard run={activeRun} onResume={noop} />
+      </>,
+    );
+    expect(impl).toHaveBeenCalledTimes(2);
+
+    // 新 Run 增量：活跃卡 props 变化重渲染，完成卡 props 相同被 memo 跳过。
+    rerender(
+      <>
+        <MemoizedCard run={completedRun} onResume={noop} />
+        <MemoizedCard run={{ ...activeRun, thinking: '更多增量' }} onResume={noop} />
+      </>,
+    );
+    expect(impl).toHaveBeenCalledTimes(3);
+    expect(screen.getByText('brand_search')).toBeVisible();
+    expect(screen.getByRole('button', { name: /执行卡/ })).toHaveTextContent('共 2 步');
   });
 
   it('shows safe tool names/status/duration/points without raw parameters', () => {

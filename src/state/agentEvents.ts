@@ -48,7 +48,7 @@ export interface RunToolCall {
   name: string;
   status: 'running' | 'succeeded' | 'failed' | 'unknown';
   detail?: string;
-  /** 工具耗时（毫秒）；仅 tool.succeeded 事件带耗时字段时填充（§13.1 工具步骤展示）。 */
+  /** 工具耗时（毫秒）；tool.succeeded/failed/unknown 事件带耗时字段时填充（§13.1 工具步骤展示）。 */
   durationMs?: number;
   /** 本次调用结算积分；无积分字段时不展示（零积分工具）。 */
   points?: number;
@@ -359,10 +359,16 @@ function withSteps(state: RunRuntimeState, event: RunEvent): RunRuntimeState {
 }
 
 function withMessage(state: RunRuntimeState, event: RunEvent): RunRuntimeState {
-  if (event.type === 'message.completed') {
-    return { ...state, messageCompleted: true, activity: '已生成回复' };
+  if (event.type !== 'message.completed') return state;
+  const next = { ...state, messageCompleted: true };
+  // ask_user：engine 以 message.completed + {type: 'clarification'} 收尾澄清 Run
+  //（agent_messages.metadata.type='clarification'，写入问题与选项）。
+  // 这里据此把 Run 状态置为 clarification_requested，执行卡展示问题与选项 chips（§13.1）。
+  // 该状态非执行终态：SSE 不关闭，等待用户回答后由新 Run（parent_run_id）接续。
+  if (String(event.payload.type ?? '') === 'clarification') {
+    return { ...next, status: 'clarification_requested', activity: '等待补充信息' };
   }
-  return state;
+  return { ...next, activity: '已生成回复' };
 }
 
 function isArtifactRelevantEvent(event: RunEvent): boolean {

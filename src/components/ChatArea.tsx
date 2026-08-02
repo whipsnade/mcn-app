@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Loader2, Pause, Send, Sparkles, ShieldAlert } from 'lucide-react';
 import { Session, Message, type ThinkingBlock } from '../types';
 import type { FollowupSuggestion } from '../api/contracts';
@@ -54,20 +54,6 @@ export function mergeHistoricalAndRuntimeThinking(
   return Object.fromEntries(
     [...merged.entries()].map(([turnId, blocks]) => [turnId, [...blocks.values()]]),
   );
-}
-
-/**
- * Run 澄清内容来自与该 Run 关联的 assistant 消息（agent_messages.run_id 关联）：
- * 问题即 assistant 文本，选项取 clarify/brainstorm metadata。
- */
-function clarificationFor(runId: string, messages: Message[]): RunClarification | undefined {
-  for (const message of messages) {
-    if (message.runId !== runId || message.sender !== 'ai') continue;
-    const options = message.clarify?.options ?? message.brainstorm?.options ?? [];
-    if (options.length === 0) continue;
-    return { question: message.text, options };
-  }
-  return undefined;
 }
 
 interface ChatAreaProps {
@@ -169,10 +155,31 @@ export default function ChatArea({
   const dedupeActiveThinkingPanel = Boolean(run && !isTerminalRunStatus(run.status));
 
   // 建议点击统一行为：填入输入框并聚焦，不自动提交，由用户确认后发送。
-  const fillInput = (text: string) => {
+  // useCallback + AgentRunCard 的 React.memo：稳定引用让历史卡跳过每次 SSE 增量重渲染。
+  const fillInput = useCallback((text: string) => {
     setInputText(text);
     textareaRef.current?.focus();
-  };
+  }, []);
+  const handlePauseRun = useCallback(
+    () => void (onCancelRun ?? onCancelTask)?.(),
+    [onCancelRun, onCancelTask],
+  );
+  const handleResumeRun = useCallback(
+    () => void onResumeRun?.(),
+    [onResumeRun],
+  );
+  // 澄清内容按 runId 建索引（来自关联 assistant 消息的 clarify/brainstorm metadata），
+  // 引用稳定，避免每次渲染重建触发 memo 卡重渲染。
+  const clarificationByRun = useMemo(() => {
+    const map: Record<string, RunClarification> = {};
+    for (const message of session.messages) {
+      if (message.sender !== 'ai' || !message.runId) continue;
+      const options = message.clarify?.options ?? message.brainstorm?.options ?? [];
+      if (options.length === 0 || map[message.runId]) continue;
+      map[message.runId] = { question: message.text, options };
+    }
+    return map;
+  }, [session.messages]);
 
   useEffect(() => {
     isNearBottomRef.current = true;
@@ -439,9 +446,9 @@ export default function ChatArea({
                   <div className="mr-auto ml-11 w-[calc(85%-2.75rem)] max-w-[85%]">
                     <AgentRunCard
                       run={runtime}
-                      clarification={clarificationFor(msg.runId, session.messages)}
-                      onPause={onCancelRun || onCancelTask ? () => void (onCancelRun ?? onCancelTask)?.() : undefined}
-                      onResume={onResumeRun ? () => void onResumeRun() : undefined}
+                      clarification={clarificationByRun[msg.runId]}
+                      onPause={onCancelRun || onCancelTask ? handlePauseRun : undefined}
+                      onResume={onResumeRun ? handleResumeRun : undefined}
                       onClarify={fillInput}
                     />
                   </div>
@@ -457,9 +464,9 @@ export default function ChatArea({
           <div className="mr-auto ml-11 w-[calc(85%-2.75rem)] max-w-[85%]">
             <AgentRunCard
               run={run}
-              clarification={clarificationFor(run.runId, session.messages)}
-              onPause={onCancelRun || onCancelTask ? () => void (onCancelRun ?? onCancelTask)?.() : undefined}
-              onResume={onResumeRun ? () => void onResumeRun() : undefined}
+              clarification={clarificationByRun[run.runId]}
+              onPause={onCancelRun || onCancelTask ? handlePauseRun : undefined}
+              onResume={onResumeRun ? handleResumeRun : undefined}
               onClarify={fillInput}
             />
           </div>

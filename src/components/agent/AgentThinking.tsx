@@ -41,8 +41,16 @@ export default function AgentThinking({ text, hasThinking, status }: AgentThinki
     previousRunningRef.current = isRunning;
   }, [status]);
 
-  // 无 thinking 事件：渲染通用「正在处理」，不可展开、无思考文本。
+  // 无 thinking 事件：运行中渲染不可展开的「正在处理」，避免编造推理；
+  // 已完成的思考流（completed/interrupted）不再显示旋转占位，改标为「未生成思考」。
   if (!hasThinking) {
+    if (status === 'completed' || status === 'interrupted') {
+      return (
+        <div className="flex items-center gap-1.5">
+          <span className="text-[11px] font-medium text-slate-400">未生成思考</span>
+        </div>
+      );
+    }
     return (
       <div className="flex items-center gap-1.5" role="status">
         <Loader2 className="h-3 w-3 animate-spin text-indigo-500" />
