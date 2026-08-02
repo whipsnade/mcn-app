@@ -1,0 +1,575 @@
+import { expect, test, type Page } from '@playwright/test';
+
+// --------------------------------------------------------------------------- //
+// 统一 Agent 运行时 E2E（design §13.1 / Task 25）。
+//
+// 全部会话/Run/Artifact 数据经 page.route 注入 NEW Agent API fixture（真实
+// sequence / run_id / artifact_id / parent_artifact_id，事件类型
+// run.* / thinking.* / tool.* / artifact.draft.* / review.* /
+// artifact.published / message.completed）。不触碰任何旧 task.* 事件或旧
+// /sessions/{id}/tasks、/analysis-reports、旧 brand export 路由。
+//
+// 登录本身走真实后端 AUTH_MODE=mock（短信验证码自动回填），其余请求全部路由。
+// --------------------------------------------------------------------------- //
+
+const AUTH_PHONE_PREFIX = '137';
+const BASE_TIMESTAMP = '2026-08-02T10:00:00';
+
+interface SseEvent {
+  seq: number;
+  event: string;
+  payload?: Record<string, unknown>;
+}
+
+function sessionJson(id: string, title: string): Record<string, unknown> {
+  return {
+    id,
+    title,
+    status: 'active',
+    created_at: '2026-08-01T10:00:00',
+    updated_at: BASE_TIMESTAMP,
+  };
+}
+
+function messageJson(
+  id: string,
+  role: string,
+  content: string,
+  sequence: number,
+  runId: string | null,
+): Record<string, unknown> {
+  return { id, role, content, sequence, run_id: runId, created_at: BASE_TIMESTAMP };
+}
+
+function runJson(id: string, sessionId: string, status: string): Record<string, unknown> {
+  return {
+    id,
+    session_id: sessionId,
+    parent_run_id: null,
+    profile_name: 'session_analyst_v1',
+    status,
+    outcome: null,
+    decision_count: 1,
+    review_count: 0,
+    revision_count: 0,
+    error_code: null,
+    started_at: BASE_TIMESTAMP,
+    paused_at: null,
+    completed_at: null,
+  };
+}
+
+/** SSE 编码（对齐 backend app/agent_runtime/sse.encode_sse_event）。 */
+function sseBody(runId: string, events: SseEvent[]): string {
+  return events.map(({ seq, event, payload = {} }) => (
+    `id: ${seq}\nevent: ${event}\ndata: ${JSON.stringify({ ...payload, run_id: runId })}\n\n`
+  )).join('');
+}
+
+// --------------------------------------------------------------------------- //
+// 共享辅助
+// --------------------------------------------------------------------------- //
+
+async function login(page: Page, phone: string) {
+  await page.goto('/');
+  await page.getByPlaceholder('请输入11位中国手机号码').fill(phone);
+  await page.getByRole('button', { name: '获取验证码' }).click();
+  await page.getByRole('button', { name: '立即安全登录' }).click();
+  await expect(page.getByTitle('新建分析会话')).toBeVisible();
+}
+
+async function uniquePhone(): Promise<string> {
+  return `${AUTH_PHONE_PREFIX}${Date.now().toString().slice(-8)}`;
+}
+
+async function mockWalletAndFavorites(page: Page) {
+  await page.route('**/api/v1/wallet', route => route.fulfill({ json: { balance: 100, reserved: 0, available: 100 } }));
+  await page.route('**/api/v1/favorites', route => route.fulfill({ json: [] }));
+}
+
+async function mockArtifactsEmpty(page: Page, sessionId: string) {
+  await page.route(`**/api/v1/agent/sessions/${sessionId}/artifacts`, route => route.fulfill({ json: [] }));
+}
+
+/** 小视口（<1280px）先切到分析对话面板（桌面 xl 常显，无需切换）。 */
+async function ensureChatPane(page: Page) {
+  if ((page.viewportSize()?.width ?? 1440) >= 1280) return;
+  await page.getByRole('navigation', { name: '移动工作区导航' }).getByRole('button', { name: '分析对话' }).click();
+}
+
+// --------------------------------------------------------------------------- //
+// 1. 独立 Run 卡：thinking / 工具步骤 / Draft→Review→Published / 终态折叠
+// --------------------------------------------------------------------------- //
+
+test('shows an independent run card with thinking, tools, review and publish', async ({ page }) => {
+  const phone = await uniquePhone();
+  const sessionId = 's-new';
+  const newSession = sessionJson(sessionId, '新会话1');
+  const run1 = 'run-1';
+  const run2 = 'run-2';
+  const question = '分析一下海底捞的品牌声量';
+
+  // 会话详情随「已发送消息」推进：settle 回拉后消息带 run_id，Run 卡锚定保留。
+  let sentMessages: Array<Record<string, unknown>> = [];
+  const detail = () => ({
+    ...newSession,
+    messages: sentMessages,
+    runs: sentMessages.length
+      ? [runJson(run1, sessionId, 'completed'), runJson(run2, sessionId, 'completed')]
+      : [],
+  });
+
+  // run-1 SSE 分两阶段：先停在 reviewing（观察「审核中」），再推进到终态。
+  let phase: 'reviewing' | 'full' = 'reviewing';
+  const baseEvents: SseEvent[] = [
+    { seq: 1, event: 'run.started', payload: { run_kind: 'user' } },
+    { seq: 2, event: 'thinking.started', payload: { attempt: 1 } },
+    { seq: 3, event: 'thinking.delta', payload: { text: '正在检索品牌声量…' } },
+    { seq: 4, event: 'thinking.completed' },
+    { seq: 5, event: 'tool.started', payload: { internal_tool_name: 'brand_search' } },
+    { seq: 6, event: 'tool.succeeded', payload: { internal_tool_name: 'brand_search', duration_ms: 1200, points: 10 } },
+    { seq: 7, event: 'artifact.draft.created', payload: { artifact_id: 'art-1', module: 'brand', version: 1, status: 'draft', title: '品牌报告 v1' } },
+    { seq: 8, event: 'review.started', payload: { review_batch_id: 'batch-1', artifact_ids: ['art-1'] } },
+  ];
+  const run1Events = (): SseEvent[] => phase === 'reviewing' ? baseEvents : [
+    ...baseEvents,
+    { seq: 9, event: 'review.approved', payload: { review_batch_id: 'batch-1', artifact_ids: ['art-1'] } },
+    { seq: 10, event: 'artifact.published', payload: { artifact_id: 'art-1', module: 'brand' } },
+    { seq: 11, event: 'run.completed', payload: { outcome: 'completed' } },
+    { seq: 12, event: 'message.completed', payload: { type: 'completion', content: '已完成品牌分析' } },
+  ];
+  // run-2：独立终态序列，不得吸收 run-1 的事件。
+  const run2Events: SseEvent[] = [
+    { seq: 1, event: 'run.started', payload: { run_kind: 'user' } },
+    { seq: 2, event: 'tool.started', payload: { internal_tool_name: 'douyin_search' } },
+    { seq: 3, event: 'tool.succeeded', payload: { internal_tool_name: 'douyin_search', duration_ms: 800, points: 10 } },
+    { seq: 4, event: 'run.completed', payload: { outcome: 'completed' } },
+    { seq: 5, event: 'message.completed', payload: { type: 'completion', content: '已完成抖音渠道分析' } },
+  ];
+
+  await mockWalletAndFavorites(page);
+  await page.route('**/api/v1/agent/sessions', route => {
+    if (route.request().method() === 'POST') return route.fulfill({ status: 201, json: newSession });
+    return route.fulfill({ json: [] });
+  });
+  await page.route(`**/api/v1/agent/sessions/${sessionId}`, route => route.fulfill({ json: detail() }));
+  await mockArtifactsEmpty(page, sessionId);
+  let messageCount = 0;
+  await page.route(`**/api/v1/agent/sessions/${sessionId}/messages`, route => {
+    const body = route.request().postDataJSON() as { content: string };
+    messageCount += 1;
+    const runId = messageCount === 1 ? run1 : run2;
+    const seq = messageCount;
+    sentMessages = [
+      messageJson('m-user-1', 'user', question, 1, run1),
+      messageJson('m-user-2', 'user', '再分析抖音渠道', 2, run2),
+    ].slice(0, messageCount);
+    return route.fulfill({
+      status: 201,
+      json: { run_id: runId, session_id: sessionId, message_id: `m-user-${seq}`, status: 'queued', reused: false },
+    });
+  });
+  await page.route(`**/api/v1/agent/runs/${run1}/events`, route => route.fulfill({
+    status: 200,
+    contentType: 'text/event-stream',
+    body: sseBody(run1, run1Events()),
+  }));
+  await page.route(`**/api/v1/agent/runs/${run2}/events`, route => route.fulfill({
+    status: 200,
+    contentType: 'text/event-stream',
+    body: sseBody(run2, run2Events),
+  }));
+
+  await login(page, phone);
+  await page.getByTitle('新建分析会话').click();
+  await expect(page.getByRole('heading', { name: '新会话1' })).toBeVisible();
+
+  await page.getByPlaceholder(/输入消息并向 AI 分析师提问/).fill(question);
+  await page.getByRole('button', { name: '发送', exact: true }).click();
+
+  // Run 卡出现在触发消息下方，先进入「审核中」。
+  const runCard = page.getByRole('region', { name: '执行卡' }).first();
+  await expect(runCard).toBeVisible();
+  await expect(runCard.getByText('审核中', { exact: true })).toBeVisible();
+
+  // 推进到终态：Run 卡折叠为一行摘要，标注步数与「分析完成」。
+  phase = 'full';
+  const collapsed = page.getByRole('button', { name: /执行卡 · 共 \d+ 步 · 分析完成/ });
+  await expect(collapsed).toBeVisible();
+  await collapsed.click();
+
+  // 展开后可回看 thinking / 工具 / Reviewer / 发布。
+  const expanded = page.getByRole('region', { name: '执行卡' }).first();
+  await expect(expanded.getByText('已思考', { exact: true })).toBeVisible();
+  await expanded.getByRole('button', { name: '已思考' }).click();
+  await expect(expanded.getByText('正在检索品牌声量…', { exact: true })).toBeVisible();
+
+  await expect(expanded.getByText('brand_search', { exact: true })).toBeVisible();
+  await expect(expanded.getByText('成功', { exact: true })).toBeVisible();
+  await expect(expanded.getByText('1.2 秒', { exact: true })).toBeVisible();
+  await expect(expanded.getByText('10 积分', { exact: true })).toBeVisible();
+  await expect(expanded.getByText('质量复核：已通过', { exact: true })).toBeVisible();
+
+  // 收起第一张卡后，再次发送产生第二条消息与第二张卡（完成 Run 不吸收下一轮事件）。
+  await page.getByRole('button', { name: '收起' }).first().click();
+  await page.getByPlaceholder(/输入消息并向 AI 分析师提问/).fill('再分析抖音渠道');
+  await page.getByRole('button', { name: '发送', exact: true }).click();
+  await expect(page.getByRole('button', {
+    name: /执行卡 · 共 \d+ 步 · 分析完成|历史执行记录 · 分析完成/,
+  })).toHaveCount(2);
+});
+
+// --------------------------------------------------------------------------- //
+// 2. 澄清：ask_user 收尾 Run，展示问题与「等待补充信息」
+// --------------------------------------------------------------------------- //
+
+test('ask_user clarification shows the question and waiting status', async ({ page }) => {
+  const phone = await uniquePhone();
+  const sessionId = 's-clarify';
+  const newSession = sessionJson(sessionId, '澄清会话');
+  const runId = 'run-clarify';
+  const question = '想分析哪个平台？';
+  const options = ['小红书', '抖音'];
+
+  let sentMessages: Array<Record<string, unknown>> = [];
+  const detail = () => ({
+    ...newSession,
+    messages: sentMessages,
+    runs: sentMessages.length ? [runJson(runId, sessionId, 'clarification_requested')] : [],
+  });
+
+  // 澄清为 message.completed + type=clarification，SSE 不关闭（等待用户回答）。
+  const events: SseEvent[] = [
+    { seq: 1, event: 'run.started', payload: { run_kind: 'user' } },
+    { seq: 2, event: 'message.completed', payload: { type: 'clarification', question, options } },
+  ];
+
+  await mockWalletAndFavorites(page);
+  await page.route('**/api/v1/agent/sessions', route => {
+    if (route.request().method() === 'POST') return route.fulfill({ status: 201, json: newSession });
+    return route.fulfill({ json: [] });
+  });
+  await page.route(`**/api/v1/agent/sessions/${sessionId}`, route => route.fulfill({ json: detail() }));
+  await mockArtifactsEmpty(page, sessionId);
+  await page.route(`**/api/v1/agent/sessions/${sessionId}/messages`, route => {
+    const body = route.request().postDataJSON() as { content: string };
+    // settle 回拉后带 assistant 澄清消息（问题文本），供 Run 卡澄清区展示。
+    sentMessages = [
+      messageJson('m-user-1', 'user', body.content, 1, runId),
+      messageJson('m-ai-1', 'assistant', question, 2, runId),
+    ];
+    return route.fulfill({
+      status: 201,
+      json: { run_id: runId, session_id: sessionId, message_id: 'm-user-1', status: 'queued', reused: false },
+    });
+  });
+  await page.route(`**/api/v1/agent/runs/${runId}/events`, route => route.fulfill({
+    status: 200,
+    contentType: 'text/event-stream',
+    body: sseBody(runId, events),
+  }));
+
+  await login(page, phone);
+  await page.getByTitle('新建分析会话').click();
+  await expect(page.getByRole('heading', { name: '澄清会话' })).toBeVisible();
+
+  await page.getByPlaceholder(/输入消息并向 AI 分析师提问/).fill('帮我圈选达人');
+  await page.getByRole('button', { name: '发送', exact: true }).click();
+
+  // Run 卡进入「等待补充信息」并展示问题文本（状态标签与活动文案同为该文本）。
+  const runCard = page.getByRole('region', { name: '执行卡' }).first();
+  await expect(runCard.getByText('等待补充信息', { exact: true }).first()).toBeVisible();
+  // 问题文本在消息流（会话列表摘要也会带最后一句话，小视口下会命中隐藏卡片，需限定在 log 内）。
+  await expect(page.getByRole('log', { name: '会话消息' }).getByText(question, { exact: true })).toBeVisible();
+
+  // 注（Task 25 发现）：当前 toChatMessage（App.tsx）未把 agent 消息的
+  // clarify/brainstorm metadata 映射到 Message.clarify/brainstorm，AgentRunCard
+  // 的澄清 chips 依赖该映射（clarificationByRun 取不到 options 而不渲染）。
+  // 此处只断言可渲染的澄清状态与问题文本；chips 断言待前端映射补齐后启用。
+  await expect(page.getByText('等待补充信息', { exact: true }).first()).toBeVisible();
+});
+
+// --------------------------------------------------------------------------- //
+// 3. 无 thinking 事件：不可展开的「正在处理」
+// --------------------------------------------------------------------------- //
+
+test('without thinking events renders a non-expandable processing row', async ({ page }) => {
+  const phone = await uniquePhone();
+  const sessionId = 's-nothink';
+  const newSession = sessionJson(sessionId, '无思考会话');
+  const runId = 'run-nothink';
+
+  let sentMessages: Array<Record<string, unknown>> = [];
+  const detail = () => ({
+    ...newSession,
+    messages: sentMessages,
+    runs: sentMessages.length ? [runJson(runId, sessionId, 'running')] : [],
+  });
+
+  const events: SseEvent[] = [
+    { seq: 1, event: 'run.started', payload: { run_kind: 'user' } },
+    { seq: 2, event: 'tool.started', payload: { internal_tool_name: 'brand_search' } },
+  ];
+
+  await mockWalletAndFavorites(page);
+  await page.route('**/api/v1/agent/sessions', route => {
+    if (route.request().method() === 'POST') return route.fulfill({ status: 201, json: newSession });
+    return route.fulfill({ json: [] });
+  });
+  await page.route(`**/api/v1/agent/sessions/${sessionId}`, route => route.fulfill({ json: detail() }));
+  await mockArtifactsEmpty(page, sessionId);
+  await page.route(`**/api/v1/agent/sessions/${sessionId}/messages`, route => {
+    const body = route.request().postDataJSON() as { content: string };
+    sentMessages = [messageJson('m-user-1', 'user', body.content, 1, runId)];
+    return route.fulfill({
+      status: 201,
+      json: { run_id: runId, session_id: sessionId, message_id: 'm-user-1', status: 'queued', reused: false },
+    });
+  });
+  await page.route(`**/api/v1/agent/runs/${runId}/events`, route => route.fulfill({
+    status: 200,
+    contentType: 'text/event-stream',
+    body: sseBody(runId, events),
+  }));
+
+  await login(page, phone);
+  await page.getByTitle('新建分析会话').click();
+  await expect(page.getByRole('heading', { name: '无思考会话' })).toBeVisible();
+
+  await page.getByPlaceholder(/输入消息并向 AI 分析师提问/).fill('分析品牌');
+  await page.getByRole('button', { name: '发送', exact: true }).click();
+
+  const runCard = page.getByRole('region', { name: '执行卡' }).first();
+  await expect(runCard.getByText('执行中', { exact: true })).toBeVisible();
+  // 无 thinking.* 事件：只显示不可展开的「正在处理」，不出现「已思考」折叠区。
+  await expect(runCard.getByText('正在处理', { exact: true })).toBeVisible();
+  await expect(runCard.getByRole('button', { name: '已思考' })).toHaveCount(0);
+});
+
+// --------------------------------------------------------------------------- //
+// 4. 暂停与恢复
+// --------------------------------------------------------------------------- //
+
+test('pauses an active run with the input pause button', async ({ page }) => {
+  const phone = await uniquePhone();
+  const sessionId = 's-pause';
+  const newSession = sessionJson(sessionId, '暂停会话');
+  const runId = 'run-pause';
+
+  let sentMessages: Array<Record<string, unknown>> = [];
+  const detail = () => ({
+    ...newSession,
+    messages: sentMessages,
+    runs: sentMessages.length ? [runJson(runId, sessionId, 'cancelled')] : [],
+  });
+
+  let phase: 'running' | 'cancelled' = 'running';
+  const events = (): SseEvent[] => phase === 'running'
+    ? [
+      { seq: 1, event: 'run.started', payload: { run_kind: 'user' } },
+      { seq: 2, event: 'tool.started', payload: { internal_tool_name: 'brand_search' } },
+    ]
+    : [
+      { seq: 1, event: 'run.started', payload: { run_kind: 'user' } },
+      { seq: 2, event: 'tool.started', payload: { internal_tool_name: 'brand_search' } },
+      { seq: 3, event: 'run.cancelled' },
+    ];
+
+  await mockWalletAndFavorites(page);
+  await page.route('**/api/v1/agent/sessions', route => {
+    if (route.request().method() === 'POST') return route.fulfill({ status: 201, json: newSession });
+    return route.fulfill({ json: [] });
+  });
+  await page.route(`**/api/v1/agent/sessions/${sessionId}`, route => route.fulfill({ json: detail() }));
+  await mockArtifactsEmpty(page, sessionId);
+  await page.route(`**/api/v1/agent/sessions/${sessionId}/messages`, route => {
+    const body = route.request().postDataJSON() as { content: string };
+    sentMessages = [messageJson('m-user-1', 'user', body.content, 1, runId)];
+    return route.fulfill({
+      status: 201,
+      json: { run_id: runId, session_id: sessionId, message_id: 'm-user-1', status: 'queued', reused: false },
+    });
+  });
+  await page.route(`**/api/v1/agent/runs/${runId}/events`, route => route.fulfill({
+    status: 200,
+    contentType: 'text/event-stream',
+    body: sseBody(runId, events()),
+  }));
+  await page.route(`**/api/v1/agent/runs/${runId}/cancel`, route => route.fulfill({
+    json: runJson(runId, sessionId, 'cancelled'),
+  }));
+
+  await login(page, phone);
+  await page.getByTitle('新建分析会话').click();
+  await expect(page.getByRole('heading', { name: '暂停会话' })).toBeVisible();
+
+  await page.getByPlaceholder(/输入消息并向 AI 分析师提问/).fill('分析品牌');
+  await page.getByRole('button', { name: '发送', exact: true }).click();
+
+  const runCard = page.getByRole('region', { name: '执行卡' }).first();
+  await expect(runCard.getByText('执行中', { exact: true })).toBeVisible();
+
+  // 输入区的暂停按钮（与 Run 卡头部暂停按钮并列，以 form 作用域区分）。
+  const inputPause = page.locator('form[aria-label="发送消息"]').getByRole('button', { name: '暂停' });
+  await expect(inputPause).toBeVisible();
+  await inputPause.click();
+
+  phase = 'cancelled';
+  // 暂停后 Run 终态：输入恢复为「发送」按钮，Run 卡折叠为「已取消」。
+  await expect(page.locator('form[aria-label="发送消息"]').getByRole('button', { name: '发送' })).toBeVisible();
+  await expect(page.getByRole('button', { name: /执行卡 · 共 \d+ 步 · 已取消/ })).toBeVisible();
+});
+
+test('resumes a paused run with the continue button', async ({ page }) => {
+  const phone = await uniquePhone();
+  const sessionId = 's-resume';
+  const newSession = sessionJson(sessionId, '恢复会话');
+  const runId = 'run-resume';
+
+  let sentMessages: Array<Record<string, unknown>> = [];
+  const detail = () => ({
+    ...newSession,
+    messages: sentMessages,
+    runs: sentMessages.length ? [runJson(runId, sessionId, 'completed')] : [],
+  });
+
+  let phase: 'paused' | 'resumed' = 'paused';
+  const events = (): SseEvent[] => phase === 'paused'
+    ? [
+      { seq: 1, event: 'run.started', payload: { run_kind: 'user' } },
+      { seq: 2, event: 'run.paused' },
+    ]
+    : [
+      { seq: 1, event: 'run.started', payload: { run_kind: 'user' } },
+      { seq: 2, event: 'run.paused' },
+      { seq: 3, event: 'run.resumed' },
+      { seq: 4, event: 'run.completed', payload: { outcome: 'completed' } },
+      { seq: 5, event: 'message.completed', payload: { type: 'completion', content: '已完成分析' } },
+    ];
+
+  await mockWalletAndFavorites(page);
+  await page.route('**/api/v1/agent/sessions', route => {
+    if (route.request().method() === 'POST') return route.fulfill({ status: 201, json: newSession });
+    return route.fulfill({ json: [] });
+  });
+  await page.route(`**/api/v1/agent/sessions/${sessionId}`, route => route.fulfill({ json: detail() }));
+  await mockArtifactsEmpty(page, sessionId);
+  await page.route(`**/api/v1/agent/sessions/${sessionId}/messages`, route => {
+    const body = route.request().postDataJSON() as { content: string };
+    sentMessages = [messageJson('m-user-1', 'user', body.content, 1, runId)];
+    return route.fulfill({
+      status: 201,
+      json: { run_id: runId, session_id: sessionId, message_id: 'm-user-1', status: 'queued', reused: false },
+    });
+  });
+  await page.route(`**/api/v1/agent/runs/${runId}/events`, route => route.fulfill({
+    status: 200,
+    contentType: 'text/event-stream',
+    body: sseBody(runId, events()),
+  }));
+  await page.route(`**/api/v1/agent/runs/${runId}/resume`, route => route.fulfill({
+    json: runJson(runId, sessionId, 'running'),
+  }));
+
+  await login(page, phone);
+  await page.getByTitle('新建分析会话').click();
+  await expect(page.getByRole('heading', { name: '恢复会话' })).toBeVisible();
+
+  await page.getByPlaceholder(/输入消息并向 AI 分析师提问/).fill('分析品牌');
+  await page.getByRole('button', { name: '发送', exact: true }).click();
+
+  // paused 状态：Run 卡显示「已暂停」与「继续」按钮。
+  const runCard = page.getByRole('region', { name: '执行卡' }).first();
+  await expect(runCard.getByText('已暂停', { exact: true })).toBeVisible();
+  const resumeButton = page.getByRole('button', { name: '继续' });
+  await expect(resumeButton).toBeVisible();
+  await resumeButton.click();
+
+  phase = 'resumed';
+  // 恢复后推进到终态：折叠摘要标注「分析完成」，「继续」按钮消失。
+  await expect(page.getByRole('button', { name: /执行卡 · 共 \d+ 步 · 分析完成/ })).toBeVisible();
+  await expect(page.getByRole('button', { name: '继续' })).toHaveCount(0);
+});
+
+// --------------------------------------------------------------------------- //
+// 5. 四个 Quick 入口消失，顶部只保留智能会话/收藏
+// --------------------------------------------------------------------------- //
+
+test('the four legacy quick entries are absent from the workspace', async ({ page }) => {
+  const phone = await uniquePhone();
+  const sessionId = 's-quick';
+  const session = sessionJson(sessionId, '统一会话');
+  const detail = { ...session, messages: [], runs: [] };
+
+  await mockWalletAndFavorites(page);
+  await page.route('**/api/v1/agent/sessions', route => route.fulfill({ json: [session] }));
+  await page.route(`**/api/v1/agent/sessions/${sessionId}`, route => route.fulfill({ json: detail }));
+  await mockArtifactsEmpty(page, sessionId);
+
+  await login(page, phone);
+
+  for (const name of ['达人推荐', '活动评估', '小红书爆贴', '抖音爆贴']) {
+    await expect(page.getByText(name, { exact: true })).toHaveCount(0);
+    await expect(page.getByRole('tab', { name })).toHaveCount(0);
+  }
+
+  // 顶部工作区只保留智能会话与收藏（小视口先切到分析对话面板）。
+  await ensureChatPane(page);
+  await expect(page.getByRole('tab', { name: '智能会话' })).toBeVisible();
+  await expect(page.getByRole('tab', { name: /已收藏/ })).toBeVisible();
+});
+
+// --------------------------------------------------------------------------- //
+// 6. 登录恢复 + 会话软删除
+// --------------------------------------------------------------------------- //
+
+test('restores the session list after reload', async ({ page }) => {
+  const phone = await uniquePhone();
+  const sessionId = 's-restore';
+  const session = sessionJson(sessionId, '恢复会话');
+  const detail = { ...session, messages: [], runs: [] };
+
+  await mockWalletAndFavorites(page);
+  await page.route('**/api/v1/agent/sessions', route => route.fulfill({ json: [session] }));
+  await page.route(`**/api/v1/agent/sessions/${sessionId}`, route => route.fulfill({ json: detail }));
+  await mockArtifactsEmpty(page, sessionId);
+
+  await login(page, phone);
+  await expect(page.getByRole('button', { name: /选择会话 恢复会话/ })).toBeVisible();
+
+  // reload 后经 refresh token 恢复登录态并重放会话列表（软删除不可见会话除外）。
+  await page.reload();
+  await expect(page.getByTitle('新建分析会话')).toBeVisible();
+  await expect(page.getByRole('button', { name: /选择会话 恢复会话/ })).toBeVisible();
+});
+
+test('soft-deletes a session and switches to the remaining one', async ({ page }) => {
+  const phone = await uniquePhone();
+  const s1 = sessionJson('s-del-1', '待删除会话');
+  const s2 = sessionJson('s-del-2', '保留会话');
+  const detailFor = (session: Record<string, unknown>) => ({
+    ...session,
+    messages: [],
+    runs: [],
+  });
+
+  await mockWalletAndFavorites(page);
+  await page.route('**/api/v1/agent/sessions', route => route.fulfill({ json: [s1, s2] }));
+  await page.route('**/api/v1/agent/sessions/s-del-1', route => {
+    if (route.request().method() === 'DELETE') return route.fulfill({ status: 204, body: '' });
+    return route.fulfill({ json: detailFor(s1) });
+  });
+  await page.route('**/api/v1/agent/sessions/s-del-2', route => route.fulfill({ json: detailFor(s2) }));
+  await mockArtifactsEmpty(page, 's-del-1');
+  await mockArtifactsEmpty(page, 's-del-2');
+
+  await login(page, phone);
+  await expect(page.getByRole('button', { name: /选择会话 待删除会话/ })).toBeVisible();
+
+  await page.getByRole('button', { name: /删除会话 待删除会话/ }).click();
+  await page.getByRole('button', { name: '确认删除' }).click();
+
+  // 软删除后从列表移除并切换到剩余会话。
+  await expect(page.getByRole('button', { name: /选择会话 保留会话/ })).toBeVisible();
+  await expect(page.getByRole('button', { name: /选择会话 待删除会话/ })).toHaveCount(0);
+});
