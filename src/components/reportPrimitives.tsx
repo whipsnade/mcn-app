@@ -88,3 +88,24 @@ export function MetricCard({ label, metric, format = 'number', accent = 'text-sl
     </section>
   );
 }
+
+// --------------------------------------------------------------------------- //
+// Artifact 视图共用：null 业务数值统一展示「数据受限」，绝不把 null 当 0。
+// （§12.1：业务数值允许 null，但对应路径必须处于 partial/unavailable，
+// 前端显示「数据受限」。）
+// --------------------------------------------------------------------------- //
+
+export function restrictedCount(value: number | null | undefined): string {
+  return typeof value === 'number' && Number.isFinite(value) ? formatExposure(value) : '数据受限';
+}
+
+export function restrictedScore(value: number | null | undefined): string {
+  return typeof value === 'number' && Number.isFinite(value) ? formatNumber(value) : '数据受限';
+}
+
+/** 0~1 比值展示为百分比；null 显示「数据受限」。 */
+export function restrictedRatio(value: number | null | undefined, digits = 1): string {
+  return typeof value === 'number' && Number.isFinite(value)
+    ? `${(value * 100).toLocaleString('zh-CN', { maximumFractionDigits: digits })}%`
+    : '数据受限';
+}
