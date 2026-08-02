@@ -1,5 +1,6 @@
 from app.agent_artifacts.models import (
     AgentArtifact,
+    AgentArtifactReadState,
     AgentArtifactVersion,
     ArtifactDraft,
     ArtifactDraftRevision,
@@ -53,6 +54,7 @@ from app.workspace.models import Message, WorkspaceSession
 __all__ = [
     "AdminAuditLog",
     "AgentArtifact",
+    "AgentArtifactReadState",
     "AgentArtifactVersion",
     "AgentEvent",
     "AgentMessage",

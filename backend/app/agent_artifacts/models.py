@@ -7,7 +7,6 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
-    Index,
     Integer,
     String,
     UniqueConstraint,
@@ -16,22 +15,20 @@ from sqlalchemy.dialects.mysql import MEDIUMTEXT
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
-
-# NOTE: the new unified schema does not redefine `artifact_read_states` here. The
-# legacy app.artifacts.models.ArtifactReadState already owns that table name on
-# Base.metadata with an older column set (module_key / last_seen_artifact_id /
-# seen_at). The spec's read-state columns (module / last_seen_sequence /
-# updated_at) differ, and SQLAlchemy forbids two classes on one table name, so
-# the migration step must reconcile the existing table instead.
+# The legacy app.artifacts.models.ArtifactReadState owns the `artifact_read_states`
+# table name; it must be registered first so AgentArtifactReadState can extend the
+# existing table (extend_existing) rather than collide with it.
+import app.artifacts.models  # noqa: F401
 
 
 class AgentArtifact(Base):
     __tablename__ = "agent_artifacts"
     __table_args__ = (
         UniqueConstraint("session_id", "artifact_key", name="uq_agent_artifacts_session_key"),
-        CheckConstraint("status IN ('draft','reviewing','published','failed')",
-                        name="ck_agent_artifacts_status"),
-        Index("ix_agent_artifacts_session_user", "session_id", "user_id"),
+        CheckConstraint(
+            "status IN ('draft','reviewing','published','failed')",
+            name="ck_agent_artifacts_status",
+        ),
     )
 
     id: Mapped[str] = mapped_column(
@@ -60,9 +57,10 @@ class ArtifactDraft(Base):
     __tablename__ = "artifact_drafts"
     __table_args__ = (
         UniqueConstraint("artifact_id", name="uq_artifact_drafts_artifact"),
-        CheckConstraint("status IN ('idle','drafting','reviewing','failed')",
-                        name="ck_artifact_drafts_status"),
-        Index("ix_artifact_drafts_session_id", "session_id"),
+        CheckConstraint(
+            "status IN ('idle','drafting','reviewing','failed')",
+            name="ck_artifact_drafts_status",
+        ),
     )
 
     id: Mapped[str] = mapped_column(
@@ -81,7 +79,6 @@ class ArtifactDraft(Base):
     status: Mapped[str] = mapped_column(String(24), nullable=False, default="idle")
     review_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     revision_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 
 
@@ -91,7 +88,6 @@ class ArtifactDraftRevision(Base):
     __tablename__ = "artifact_draft_revisions"
     __table_args__ = (
         UniqueConstraint("draft_id", "revision", name="uq_artifact_draft_revisions_draft_revision"),
-        Index("ix_artifact_draft_revisions_artifact_id", "artifact_id"),
     )
 
     id: Mapped[str] = mapped_column(
@@ -133,14 +129,12 @@ class ArtifactReviewBatch(Base):
     completion_text: Mapped[str | None] = mapped_column(MEDIUMTEXT, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 
 
 class ArtifactReviewItem(Base):
     __tablename__ = "artifact_review_items"
     __table_args__ = (
         UniqueConstraint("batch_id", "artifact_id", name="uq_artifact_review_items_batch_artifact"),
-        Index("ix_artifact_review_items_artifact_id", "artifact_id"),
     )
 
     id: Mapped[str] = mapped_column(
@@ -156,8 +150,6 @@ class ArtifactReviewItem(Base):
         String(36), ForeignKey("artifact_draft_revisions.id"), nullable=False
     )
     status: Mapped[str] = mapped_column(String(24), nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 
 
 class ArtifactReviewAttempt(Base):
@@ -166,9 +158,10 @@ class ArtifactReviewAttempt(Base):
     __tablename__ = "artifact_review_attempts"
     __table_args__ = (
         UniqueConstraint("review_item_id", "attempt", name="uq_artifact_review_attempt"),
-        CheckConstraint("decision IN ('approve','revise','reject')",
-                        name="ck_artifact_review_attempts_decision"),
-        Index("ix_artifact_review_attempts_review_run_id", "review_run_id"),
+        CheckConstraint(
+            "decision IN ('approve','revise','reject')",
+            name="ck_artifact_review_attempts_decision",
+        ),
     )
 
     id: Mapped[str] = mapped_column(
@@ -195,7 +188,6 @@ class AgentArtifactVersion(Base):
     __tablename__ = "agent_artifact_versions"
     __table_args__ = (
         UniqueConstraint("artifact_id", "version", name="uq_agent_artifact_versions_artifact_version"),
-        Index("ix_agent_artifact_versions_source_run", "source_run_id"),
     )
 
     id: Mapped[str] = mapped_column(
@@ -230,7 +222,6 @@ class ArtifactEvent(Base):
             "event_type IN ('draft_created','draft_updated','reviewing','published','failed')",
             name="ck_artifact_events_event_type",
         ),
-        Index("ix_artifact_events_artifact_id", "artifact_id"),
     )
 
     id: Mapped[str] = mapped_column(
@@ -255,6 +246,34 @@ class ArtifactEvent(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 
 
+class AgentArtifactReadState(Base):
+    """Spec §8.1 read cursor (module/last_seen_sequence) for the BI unread dots.
+
+    Coexists with the legacy ArtifactReadState (module_key/seen_at) on the same
+    table via extend_existing; the migration step reconciles the two column sets.
+    """
+
+    __tablename__ = "artifact_read_states"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "session_id",
+            "module",
+            name="uq_artifact_read_states_user_session_module_v2",
+        ),
+        {"extend_existing": True},
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    user_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    session_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False
+    )
+    module: Mapped[str] = mapped_column(String(32), nullable=False)
+    last_seen_sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
 class KolDetailCache(Base):
     __tablename__ = "kol_detail_cache"
     __table_args__ = (
@@ -265,7 +284,6 @@ class KolDetailCache(Base):
             "kol_uid",
             name="uq_kol_detail_cache_user_session_platform_kol",
         ),
-        Index("ix_kol_detail_cache_expires_at", "expires_at"),
     )
 
     id: Mapped[str] = mapped_column(
@@ -284,5 +302,3 @@ class KolDetailCache(Base):
     evidence_refs_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     fetched_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)

@@ -20,7 +20,6 @@ from app.db.base import Base
 
 class AgentSession(Base):
     __tablename__ = "agent_sessions"
-    __table_args__ = (Index("ix_agent_sessions_user_archived", "user_id", "archived_at"),)
 
     id: Mapped[str] = mapped_column(
         String(36), primary_key=True, default=lambda: str(uuid4())
@@ -41,7 +40,6 @@ class AgentMessage(Base):
     __tablename__ = "agent_messages"
     __table_args__ = (
         UniqueConstraint("session_id", "sequence", name="uq_agent_messages_session_sequence"),
-        Index("ix_agent_messages_session_id", "session_id"),
     )
 
     id: Mapped[str] = mapped_column(
@@ -66,7 +64,6 @@ class AgentRun(Base):
         CheckConstraint("run_kind IN ('user','internal')", name="ck_agent_runs_kind"),
         CheckConstraint("visibility IN ('user','internal')", name="ck_agent_runs_visibility"),
         Index("ix_agent_runs_status_lease", "status", "lease_expires_at"),
-        Index("ix_agent_runs_session_user", "session_id", "user_id"),
     )
 
     id: Mapped[str] = mapped_column(
@@ -102,8 +99,6 @@ class AgentRun(Base):
     lease_owner: Mapped[str | None] = mapped_column(String(64), nullable=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 
 
 class AgentRunAttempt(Base):
@@ -127,8 +122,6 @@ class AgentRunAttempt(Base):
     ended_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     decision_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     outcome: Mapped[str] = mapped_column(String(24), nullable=False, default="running")
-    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 
 
 class AgentStep(Base):
@@ -136,7 +129,6 @@ class AgentStep(Base):
     __table_args__ = (
         UniqueConstraint("run_id", "sequence", name="uq_agent_steps_run_sequence"),
         CheckConstraint("visibility IN ('user','internal')", name="ck_agent_steps_visibility"),
-        Index("ix_agent_steps_attempt_id", "attempt_id"),
     )
 
     id: Mapped[str] = mapped_column(
@@ -169,7 +161,6 @@ class AgentToolCall(Base):
             "status IN ('planned','reserved','running','settled','failed','unknown')",
             name="ck_agent_tool_calls_status",
         ),
-        Index("ix_agent_tool_calls_run_id", "run_id"),
     )
 
     id: Mapped[str] = mapped_column(
@@ -194,18 +185,12 @@ class AgentToolCall(Base):
     safe_error_message: Mapped[str | None] = mapped_column(String(500), nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
-    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 
 
 class EvidenceItem(Base):
     """Immutable evidence captured from read-only tools; models only obtain it via tools."""
 
     __tablename__ = "evidence_items"
-    __table_args__ = (
-        Index("ix_evidence_items_session_id", "session_id"),
-        Index("ix_evidence_items_tool_call_id", "tool_call_id"),
-    )
 
     id: Mapped[str] = mapped_column(
         String(36), primary_key=True, default=lambda: str(uuid4())
@@ -228,14 +213,12 @@ class EvidenceItem(Base):
     payload_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     collected_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     availability_status: Mapped[str] = mapped_column(String(32), nullable=False, default="available")
-    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 
 
 class AgentEvent(Base):
     __tablename__ = "agent_events"
     __table_args__ = (
         UniqueConstraint("run_id", "sequence", name="uq_agent_events_run_sequence"),
-        Index("ix_agent_events_user_id", "user_id"),
     )
 
     id: Mapped[str] = mapped_column(
@@ -266,7 +249,6 @@ class AgentToolCallReconciliation(Base):
             "decision IN ('confirm_success','confirm_failure','keep_unknown')",
             name="ck_agent_tool_call_reconciliations_decision",
         ),
-        Index("ix_agent_tool_call_reconciliations_tool_call_id", "tool_call_id"),
     )
 
     id: Mapped[str] = mapped_column(
@@ -291,7 +273,6 @@ class MemoryEntry(Base):
             "memory_type IN ('run_summary','artifact_index','pending_question')",
             name="ck_memory_entries_type",
         ),
-        Index("ix_memory_entries_session_id", "session_id"),
     )
 
     id: Mapped[str] = mapped_column(

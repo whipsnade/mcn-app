@@ -46,3 +46,16 @@ def test_artifact_events_session_sequence_unique() -> None:
         for constraint in events.constraints
         if isinstance(constraint, UniqueConstraint)
     )
+
+
+def test_artifact_read_states_has_new_schema_columns_and_unique() -> None:
+    states = Base.metadata.tables["artifact_read_states"]
+    assert "module" in states.c
+    assert "last_seen_sequence" in states.c
+    assert "updated_at" in states.c
+    assert any(
+        tuple(column.name for column in constraint.columns)
+        == ("user_id", "session_id", "module")
+        for constraint in states.constraints
+        if isinstance(constraint, UniqueConstraint)
+    )
