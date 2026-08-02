@@ -617,6 +617,9 @@ def downgrade() -> None:
     op.drop_column("artifact_read_states", "last_seen_sequence")
     op.drop_column("artifact_read_states", "module")
 
+    # 先删除延后创建的外键约束再删表：agent_runs 与 artifact_draft_revisions 上的
+    # 循环外键分别指向 agent_messages / agent_artifact_versions，MySQL 要求先解除
+    # 引用约束，才能 drop 被引用的表。
     op.drop_constraint(
         "fk_agent_runs_input_message_id_agent_messages", "agent_runs", type_="foreignkey"
     )

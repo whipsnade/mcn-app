@@ -59,7 +59,7 @@ async def payload_columns() -> set[str]:
     return {row[0] for row in rows}
 
 
-def test_alembic_head_is_0026() -> None:
+def test_alembic_head_is_0027() -> None:
     assert head_revision() == EXPECTED_HEAD
 
 

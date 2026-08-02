@@ -79,7 +79,7 @@ class AgentRun(Base):
         String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
     )
     input_message_id: Mapped[str | None] = mapped_column(
-        String(36), ForeignKey("agent_messages.id"), nullable=True
+        String(36), ForeignKey("agent_messages.id", use_alter=True), nullable=True
     )
     parent_run_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("agent_runs.id"), nullable=True

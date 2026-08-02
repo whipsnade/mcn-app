@@ -107,7 +107,7 @@ class ArtifactDraftRevision(Base):
     payload_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     evidence_refs_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     parent_artifact_version_id: Mapped[str | None] = mapped_column(
-        String(36), ForeignKey("agent_artifact_versions.id"), nullable=True
+        String(36), ForeignKey("agent_artifact_versions.id", use_alter=True), nullable=True
     )
     payload_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
