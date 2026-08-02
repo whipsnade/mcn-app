@@ -529,12 +529,13 @@ methodology            # {data_as_of, source_names[], notes[]}
 #### `kol_selection_v3`
 
 - `scope`：`brand nullable,category nullable,campaign nullable,platforms[],audience{regions[],age_ranges[],interests[]},filters{budget_min,budget_max,follower_min,follower_max}`；
-- `data.scoring`：`version,method,weights{engagement,active_fans,growth,commercial_fit,audience_fit,cost_efficiency},missing_value_policy`；其中缺失值策略固定为严格模式 `missing_as_zero`；
-- `data.items[]`（跨平台合计最多 20，默认按 `engagement_total` 降序）：`rank,platform,kol_uid,nickname,avatar_url,homepage_url,followers,active_followers,active_follower_rate,growth_rate,engagement_total,avg_engagement,likes,comments,shares,quoted_price,score,rating,reasons[],missing_fields[],audience{regions[],age_ranges[],interests[]}`；
+- `data.scoring`：`version="kol_score_v2"`、`method="weighted_sum"`、`weights{industry_interest:10,target_region:8,target_age:8,engagement:20,active_follower:15,content:15,followers:10,engagement_follower_ratio:14}`、`missing_value_policy="missing_as_zero"`；权重总和固定为 100；
+- `data.items[]`（跨平台合计最多 20，默认按 `engagement_total` 降序）：`rank,platform,kol_uid,nickname,avatar_url,homepage_url,followers,active_followers,active_follower_rate,growth_rate,engagement_total,avg_engagement,likes,comments,shares,quoted_price,reasons[],missing_fields[],audience{regions[],age_ranges[],interests[]},score_snapshot`；
+- `score_snapshot`：`version="kol_score_v2",total,rating,stars,data_completeness,dimensions`；`dimensions` 必须精确包含八个维度，每项为 `{raw_score,weight,weighted_score,source nullable,missing_reason nullable}`，不得只保存总分；
 - `data.summary`：`candidate_count,selected_count,platform_distribution[],rating_distribution[]`；
 - `narrative`：`selection_summary,fit_findings[],risk_notes[],usage_advice[]`，结论通过 `kol_uid` 或 `supporting_paths[]` 关联名单。
 
-`score` 必须由 `rank_kols` 产生；评分输入引用 Evidence，score/rank/rating 再引用该确定性调用。它映射“圈选达人”列表、评分说明、KOL 趋势现状图，并继续支持 KOL 名单 Excel 导出。
+`score_snapshot` 必须由 `rank_kols` 调用现有严格八维 `kol_score_v2` 产生；缺失、无效或无法匹配的维度记 0 分且不重分配权重。`growth_rate` 与 `quoted_price` 作为展示/筛选字段，不进入 v2 总分。每个维度的原始输入引用 Evidence，`raw_score/weighted_score/total/rating/stars/data_completeness` 再引用该确定性调用。它映射“圈选达人”列表、评分说明、数据完整度、KOL 趋势现状图，并继续支持 KOL 名单 Excel 导出；Excel 展示八个 `raw_score` 列和总分/评级/星级/完整度，不展示 weighted_score 列。
 
 #### `kol_analysis_v2`
 
