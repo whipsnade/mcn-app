@@ -29,7 +29,7 @@ from app.agent_artifacts.models import (
     ArtifactReviewAttempt,
     ArtifactReviewItem,
 )
-from app.agent_artifacts.service import ArtifactService
+from app.agent_artifacts.service import ArtifactBusy, ArtifactService
 from app.agent_runtime.model_gateway import AgentModelGateway
 from app.agent_runtime.models import (
     AgentMessage,
@@ -41,7 +41,11 @@ from app.agent_runtime.models import (
     EvidenceItem,
 )
 from app.agent_runtime.repository import AgentRunRepository
-from app.agent_runtime.reviewer import ReviewAttemptResult, ReviewerDriver
+from app.agent_runtime.reviewer import (
+    ReviewAttemptResult,
+    ReviewOwnershipError,
+    ReviewerDriver,
+)
 from app.agent_runtime.state import RunStatus
 from app.model.prompt_logs import PromptLogEntry
 from app.model.tencent_plan import TencentPlanAdapter
@@ -560,6 +564,125 @@ async def test_reviewer_input_contract_no_mcp_and_resolved_lineage(
     ) == 0
 
     assert result.decision == "approve"
+
+
+async def test_cancel_reviewing_frees_reviewing_draft_for_new_run(
+    db_session, user_factory
+) -> None:
+    """父 Run 取消/系统失败时，cancel_reviewing 释放 reviewing Draft 供新 Run 接管。"""
+    run_a, _ = await _setup_run(db_session, user_factory)
+    await _submit_review(AgentRunRepository(db_session), run_a)
+    service = ArtifactService(db_session)
+    _, draft, _ = await _make_draft(
+        service,
+        session_id=run_a.session_id,
+        user_id=run_a.user_id,
+        run_id=run_a.id,
+        brand="瑞幸",
+        payload=PAYLOAD_V1,
+        evidence_refs=[],
+    )
+
+    gateway, _ = _make_gateway(db_session, [APPROVE_JSON])
+    driver = ReviewerDriver(db_session, gateway, worker_id="worker")
+    await driver.create_batch(
+        parent_run_id=run_a.id, draft_ids=(draft.id,), completion_text="完成"
+    )
+    assert draft.status == "reviewing"
+
+    # 父 Run 在 reviewing 状态被取消（系统原因，非 reject）
+    await driver.cancel_reviewing(run_id=run_a.id, draft_ids=(draft.id,), outcome="failed")
+    # 幂等：owner 已释放后再次调用同一 hook 不报错
+    await driver.cancel_reviewing(run_id=run_a.id, draft_ids=(draft.id,), outcome="failed")
+
+    draft_row = await db_session.get(type(draft), draft.id)
+    assert draft_row is not None
+    assert draft_row.status == "failed"
+    assert draft_row.owner_run_id is None
+
+    # 新 Run（同一 session）可立即接管同一 Artifact，不再 artifact_busy，
+    # Revision 在历史之上递增。
+    now = utc_now()
+    run_b = AgentRun(
+        id=str(uuid4()),
+        session_id=run_a.session_id,
+        user_id=run_a.user_id,
+        run_kind="user",
+        visibility="user",
+        profile_name="session_analyst_v1",
+        profile_version="v1",
+        model="test-model",
+        status="running",
+        decision_count=0,
+        review_count=0,
+        revision_count=0,
+        started_at=now,
+    )
+    db_session.add(run_b)
+    await db_session.flush()
+    await AgentRunRepository(db_session).claim_lease(run_b.id, "worker", 300)
+
+    artifact_b, draft_b, revision_b = await _make_draft(
+        service,
+        session_id=run_a.session_id,
+        user_id=run_a.user_id,
+        run_id=run_b.id,
+        brand="瑞幸",
+        payload=PAYLOAD_V2,
+        evidence_refs=[],
+    )
+    assert artifact_b.id == draft.artifact_id
+    assert draft_b.id == draft.id
+    assert draft_b.owner_run_id == run_b.id
+    assert draft_b.status == "drafting"
+    assert revision_b.revision == 2
+
+    # 防御：Draft 已被另一 Run 接管后，原 Run 再 cancel 必须 ArtifactBusy（防误释放）
+    with pytest.raises(ArtifactBusy):
+        await driver.cancel_reviewing(run_id=run_a.id, draft_ids=(draft.id,), outcome="failed")
+
+
+async def test_review_item_rejects_mismatched_parent_run(
+    db_session, user_factory
+) -> None:
+    """Item 所属 batch 的 parent_run 与传入的父 Run 不一致时必须拒绝。"""
+    run_a, _ = await _setup_run(db_session, user_factory)
+    await _submit_review(AgentRunRepository(db_session), run_a)
+    service = ArtifactService(db_session)
+    _, draft, _ = await _make_draft(
+        service,
+        session_id=run_a.session_id,
+        user_id=run_a.user_id,
+        run_id=run_a.id,
+        brand="瑞幸",
+        payload=PAYLOAD_V1,
+        evidence_refs=[],
+    )
+
+    gateway, _ = _make_gateway(db_session, [APPROVE_JSON])
+    driver = ReviewerDriver(db_session, gateway, worker_id="worker")
+    batch = await driver.create_batch(
+        parent_run_id=run_a.id, draft_ids=(draft.id,), completion_text="完成"
+    )
+    item = (
+        await db_session.scalars(
+            select(ArtifactReviewItem).where(ArtifactReviewItem.batch_id == batch.id)
+        )
+    ).one()
+
+    run_b, _ = await _setup_run(db_session, user_factory)
+    with pytest.raises(ReviewOwnershipError):
+        await driver.review_item(parent_run=run_b, item=item, user_question="分析")
+
+    # Item 未被误改，也没有产生任何 attempt
+    assert item.status == "pending"
+    assert (
+        await db_session.scalar(
+            select(func.count(ArtifactReviewAttempt.id)).where(
+                ArtifactReviewAttempt.review_item_id == item.id
+            )
+        )
+    ) == 0
 
 
 async def test_review_attempts_recorded_immutably_per_item_attempt(

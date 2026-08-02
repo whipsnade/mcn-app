@@ -359,9 +359,13 @@ class ArtifactService:
     # -- 批量原子发布（Task 13）------------------------------------------------------
 
     async def publish_batch(
-        self, review_batch_id: str, *, worker_id: str = "reviewer"
+        self, review_batch_id: str, *, worker_id: str
     ) -> list[AgentArtifactVersion]:
         """原子发布一个 Review Batch（设计 §8.1 / §12.3）。
+
+        ``worker_id`` 是**必填**参数：它把父 Run 从 reviewing 迁移到 completed，
+        必须与父 Run 租约持有者一致（引擎传入自己的 worker id），否则
+        ``transition()`` 抛 ``run_lease_not_held`` 会连带整批发布回滚。
 
         单事务内：锁定 Batch + 全部 Item + Draft + Artifact；先校验所有 Item 都在
         **当前** Revision 上 approve（任一不满足即抛 ``PublishBlocked``、整批回滚，

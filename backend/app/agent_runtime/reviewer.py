@@ -45,7 +45,7 @@ from app.agent_artifacts.models import (
     ArtifactReviewItem,
 )
 from app.agent_artifacts.payloads import TYPED_PAYLOAD_BY_SCHEMA
-from app.agent_artifacts.service import ArtifactService
+from app.agent_artifacts.service import ArtifactBusy, ArtifactService
 from app.agent_runtime.model_gateway import AgentModelGateway
 from app.agent_runtime.models import AgentRun
 from app.agent_runtime.profiles import get_profile
@@ -88,6 +88,10 @@ class ReviewLimitExceeded(RuntimeError):
     """Item 的复核次数已达上限（3 次）仍被再次送审，属引擎编排错误。"""
 
 
+class ReviewOwnershipError(ValueError):
+    """Item 所属 batch 的 parent_run 与传入的父 Run 不一致，拒绝复核。"""
+
+
 @dataclass(frozen=True)
 class ReviewAttemptResult:
     """一次 Reviewer 调用的结果摘要（含 attempt 与内部 Run 引用）。"""
@@ -108,8 +112,10 @@ class ReviewerDriver:
 
     内部 Run 的创建模式与 AgentRun 一致（含 Attempt / Step / token 审计），
     但 Reviewer 永不调用工具，因此不会产生任何 ``agent_tool_calls`` 行。
-    ``worker_id`` 用于把父 Run 状态迁移到 reviewing→completed/failed（引擎持有
-    父 Run 租约时以同一 worker 传入）。
+    ``worker_id`` 是**必填**参数：它用于把父 Run 状态迁移到 reviewing→
+    completed/failed，必须与父 Run 租约持有者一致（引擎传入自己的 worker id），
+    否则 ``transition()`` 会抛 ``run_lease_not_held``——与其在运行期暴露不一致，
+    不如让缺失在调用点成为编译期错误。
     """
 
     def __init__(
@@ -117,7 +123,7 @@ class ReviewerDriver:
         db: AsyncSession,
         gateway: AgentModelGateway,
         *,
-        worker_id: str = "reviewer",
+        worker_id: str,
     ) -> None:
         self.db = db
         self.gateway = gateway
@@ -194,6 +200,12 @@ class ReviewerDriver:
         batch = await self.db.get(ArtifactReviewBatch, item.batch_id)
         if batch is None:
             raise LookupError(f"review batch {item.batch_id!r} not found")
+        # 防御：Item 必须属于传入的父 Run，防止审计/状态迁移错位。
+        if batch.parent_run_id != parent_run.id:
+            raise ReviewOwnershipError(
+                f"review item {item.id!r} belongs to batch {batch.id!r} of run "
+                f"{batch.parent_run_id!r}, not run {parent_run.id!r}"
+            )
         draft = await self.db.scalar(
             select(ArtifactDraft).where(ArtifactDraft.artifact_id == item.artifact_id)
         )
@@ -325,6 +337,39 @@ class ReviewerDriver:
                 break
         return results
 
+    # -- 取消 / 系统失败回收 --------------------------------------------------------
+
+    async def cancel_reviewing(
+        self,
+        *,
+        run_id: str,
+        draft_ids: tuple[str, ...] | list[str],
+        outcome: str = "failed",
+    ) -> None:
+        """取消 / 系统失败时释放仍属于 ``run_id`` 的 working head（Task 13 hook）。
+
+        父 Run 在 reviewing 状态被取消或系统失败（非 reject）时，引擎调用本方法把
+        该批 Draft 置回 ``idle``/``failed`` 并释放 ``owner_run_id``，历史 Revision
+        永久保留；此后新 Run 可立即接管同一 Artifact，避免 Artifact 永久
+        ``artifact_busy``。不属于本 Run 的 Draft 抛 ``ArtifactBusy``（防误释放）；
+        已释放（owner 为 None）的 Draft 幂等跳过。
+        """
+        if outcome not in ("idle", "failed"):
+            raise ValueError(f"invalid cancel outcome: {outcome!r}")
+        for draft_id in draft_ids:
+            draft = await self.db.get(ArtifactDraft, draft_id)
+            if draft is None:
+                raise LookupError(f"draft {draft_id!r} not found")
+            if draft.owner_run_id is None:
+                continue  # 已释放，幂等
+            if draft.owner_run_id != run_id:
+                raise ArtifactBusy(
+                    draft.artifact_id,
+                    draft_id=draft.id,
+                    owner_run_id=draft.owner_run_id,
+                )
+            await self._service.release_draft(draft.id, outcome=outcome)
+
     # -- 内部工具 -----------------------------------------------------------------
 
     def _new_review_run(self, parent_run: AgentRun, now: datetime) -> AgentRun:
@@ -440,5 +485,6 @@ __all__ = [
     "ReviewDecision",
     "ReviewIssue",
     "ReviewLimitExceeded",
+    "ReviewOwnershipError",
     "ReviewerDriver",
 ]
