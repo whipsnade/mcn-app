@@ -15,7 +15,10 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, Callable
 
+from pydantic import ValidationError
+
 from app.agent_artifacts.builders.common import (
+    DraftBuildError,
     DraftBuildResult,
     distribution,
     methodology_dict,
@@ -375,8 +378,20 @@ def build_kol_analysis_draft(
             data_as_of=data_as_of,
             source_names=source_names,
         )
-        KolAnalysisV2.model_validate(payload)
+        try:
+            KolAnalysisV2.model_validate(payload)
+        except ValidationError as exc:
+            raise DraftBuildError(f"invalid kol_analysis_v2 payload: {exc}") from exc
         return _result(payload, [])
+
+    if not selection_refs:
+        # 分析数据必须追溯到名单 Version 的 Evidence；缺少其 evidence_refs 时
+        # lineage 会被静默丢弃（只能由 Reviewer 兜底）——builder 直接 fail-fast。
+        raise DraftBuildError(
+            "build_kol_analysis_draft requires selection_refs (the analyzed "
+            "kol_selection_v3 version's evidence_refs) to emit lineage"
+        )
+    covered = {ref.get("artifact_path") for ref in selection_refs}
 
     analysis_data = _analysis_data(items)
     narrative = _analysis_narrative(items, analysis_data)
@@ -405,8 +420,11 @@ def build_kol_analysis_draft(
             data_as_of=data_as_of,
             source_names=source_names,
         )
-        KolAnalysisV2.model_validate(payload)
-        return _result(payload, [])
+        try:
+            KolAnalysisV2.model_validate(payload)
+        except ValidationError as exc:
+            raise DraftBuildError(f"invalid kol_analysis_v2 payload: {exc}") from exc
+        return _result(payload, _analysis_lineage(payload, parent_artifact_version_id, covered, items))
 
     payload = _assemble_payload(
         scope=scope,
@@ -422,9 +440,11 @@ def build_kol_analysis_draft(
         data_as_of=data_as_of,
         source_names=source_names,
     )
-    KolAnalysisV2.model_validate(payload)
+    try:
+        KolAnalysisV2.model_validate(payload)
+    except ValidationError as exc:
+        raise DraftBuildError(f"invalid kol_analysis_v2 payload: {exc}") from exc
 
-    covered = {ref.get("artifact_path") for ref in (selection_refs or [])}
     refs = _analysis_lineage(payload, parent_artifact_version_id, covered, items)
     return _result(payload, refs)
 

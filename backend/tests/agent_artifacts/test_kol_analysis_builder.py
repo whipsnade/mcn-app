@@ -18,11 +18,13 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 from typing import Any
+from unittest.mock import patch
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import select
 
-from app.agent_artifacts.builders.common import DraftBuildResult
+from app.agent_artifacts.builders.common import DraftBuildError, DraftBuildResult
 from app.agent_artifacts.builders.kol_analysis import build_kol_analysis_draft
 from app.agent_artifacts.lineage import (
     ArtifactVersionRecord,
@@ -120,6 +122,58 @@ def _selection_payload(items: list[dict[str, Any]]) -> dict[str, Any]:
     return {"data": {"items": items}}
 
 
+def _selection_refs(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """名单版本的代表性 lineage：覆盖分析引用所需的各数字路径。
+
+    只用于让分析 builder 能构建 lineage（非 lineage 用例）；断言级 lineage 覆盖
+    由 ``test_analysis_lineage_recurses_to_selection_evidence`` 负责。
+    """
+    refs: list[dict[str, Any]] = []
+    for i in range(len(items)):
+        refs.append(
+            {
+                "artifact_path": f"/data/items/{i}/rank",
+                "sources": [
+                    {"source_type": "evidence", "evidence_id": "ev-1", "source_path": f"/{i}/kol_uid"}
+                ],
+                "derivation": None,
+            }
+        )
+        for field in ("followers", "active_followers", "engagement_total", "avg_engagement", "growth_rate"):
+            refs.append(
+                {
+                    "artifact_path": f"/data/items/{i}/{field}",
+                    "sources": [
+                        {"source_type": "evidence", "evidence_id": "ev-1", "source_path": f"/{i}/{field}"}
+                    ],
+                    "derivation": None,
+                }
+            )
+        refs.append(
+            {
+                "artifact_path": f"/data/items/{i}/score_snapshot/total",
+                "sources": [
+                    {
+                        "source_type": "evidence",
+                        "evidence_id": "ev-1",
+                        "source_path": f"/{i}/engagement_total",
+                    }
+                ],
+                "derivation": None,
+            }
+        )
+    refs.append(
+        {
+            "artifact_path": "/data/summary/candidate_count",
+            "sources": [
+                {"source_type": "evidence", "evidence_id": "ev-1", "source_path": "/0/kol_uid"}
+            ],
+            "derivation": None,
+        }
+    )
+    return refs
+
+
 def _draft_args(build: DraftBuildResult) -> dict[str, Any]:
     return {
         "module": build.module,
@@ -193,12 +247,14 @@ class MemoryLoader:
 
 
 def test_parent_version_binding_fixed() -> None:
-    selection_payload = _selection_payload([_selection_item("1")])
+    items = [_selection_item("1")]
+    selection_payload = _selection_payload(items)
     build = build_kol_analysis_draft(
         selection_artifact_id="artifact-A",
         selection_payload=selection_payload,
         parent_artifact_version_id="version-V1",
         selection_version="1",
+        selection_refs=_selection_refs(items),
     )
     # 每个 kol_analysis_v2 通过 parent_artifact_version_id 固定到分析的名单版本。
     assert build.parent_artifact_version_id == "version-V1"
@@ -209,6 +265,35 @@ def test_parent_version_binding_fixed() -> None:
     assert build.module == "kol-analysis"
     assert build.business_fields == {"selection_artifact_id": "artifact-A"}
     KolAnalysisV2.model_validate(build.payload)
+
+
+def test_analysis_builder_requires_selection_refs() -> None:
+    """缺少名单版本 evidence_refs 时 fail-fast，而不是静默丢弃 lineage。"""
+    items = [_selection_item("1")]
+    with pytest.raises(DraftBuildError):
+        build_kol_analysis_draft(
+            selection_artifact_id="A",
+            selection_payload=_selection_payload(items),
+            parent_artifact_version_id="V1",
+            selection_version="1",
+        )
+
+
+def test_analysis_builder_wraps_payload_validation_error() -> None:
+    """Schema 校验失败统一抛 DraftBuildError，而不是泄漏裸 ValidationError。"""
+    items = [_selection_item("1")]
+    with patch(
+        "app.agent_artifacts.builders.kol_analysis.KolAnalysisV2.model_validate",
+        side_effect=ValidationError.from_exception_data("kol_analysis_v2", []),
+    ):
+        with pytest.raises(DraftBuildError):
+            build_kol_analysis_draft(
+                selection_artifact_id="A",
+                selection_payload=_selection_payload(items),
+                parent_artifact_version_id="V1",
+                selection_version="1",
+                selection_refs=_selection_refs(items),
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +312,7 @@ def test_distributions_and_narrative_build_correctly() -> None:
         selection_payload=_selection_payload(items),
         parent_artifact_version_id="V1",
         selection_version="1",
+        selection_refs=_selection_refs(items),
     )
     data = build.payload["data"]
     assert data["summary"]["kol_count"] == 3
@@ -272,6 +358,7 @@ def test_top_kols_and_kol_trend_capped_at_20() -> None:
         selection_payload=_selection_payload(items),
         parent_artifact_version_id="V1",
         selection_version="1",
+        selection_refs=_selection_refs(items),
     )
     assert len(build.payload["data"]["kol_trend"]) == 20
     assert len(build.payload["data"]["top_kols"]) == 20
@@ -290,71 +377,7 @@ async def test_analysis_lineage_recurses_to_selection_evidence() -> None:
     ]
 
     evidence = items
-    # 名单版本的 lineage：每个数字字段都指向 evidence 叶子。
-    selection_refs = []
-    for i, item in enumerate(items):
-        selection_refs.extend(
-            [
-                {
-                    "artifact_path": f"/data/items/{i}/rank",
-                    "sources": [
-                        {"source_type": "evidence", "evidence_id": "ev-1", "source_path": f"/{i}/engagement_total"}
-                    ],
-                    "derivation": None,
-                },
-                {
-                    "artifact_path": f"/data/items/{i}/followers",
-                    "sources": [
-                        {"source_type": "evidence", "evidence_id": "ev-1", "source_path": f"/{i}/followers"}
-                    ],
-                    "derivation": None,
-                },
-                {
-                    "artifact_path": f"/data/items/{i}/engagement_total",
-                    "sources": [
-                        {"source_type": "evidence", "evidence_id": "ev-1", "source_path": f"/{i}/engagement_total"}
-                    ],
-                    "derivation": None,
-                },
-                {
-                    "artifact_path": f"/data/items/{i}/active_followers",
-                    "sources": [
-                        {"source_type": "evidence", "evidence_id": "ev-1", "source_path": f"/{i}/active_followers"}
-                    ],
-                    "derivation": None,
-                },
-                {
-                    "artifact_path": f"/data/items/{i}/avg_engagement",
-                    "sources": [
-                        {"source_type": "evidence", "evidence_id": "ev-1", "source_path": f"/{i}/avg_engagement"}
-                    ],
-                    "derivation": None,
-                },
-                {
-                    "artifact_path": f"/data/items/{i}/growth_rate",
-                    "sources": [
-                        {"source_type": "evidence", "evidence_id": "ev-1", "source_path": f"/{i}/growth_rate"}
-                    ],
-                    "derivation": None,
-                },
-                {
-                    "artifact_path": f"/data/items/{i}/score_snapshot/total",
-                    "sources": [
-                        {"source_type": "evidence", "evidence_id": "ev-1", "source_path": f"/{i}/engagement_total"}
-                    ],
-                    "derivation": None,
-                },
-            ]
-        )
-    selection_refs.append(
-        {
-            "artifact_path": "/data/summary/candidate_count",
-            "sources": [
-                {"source_type": "evidence", "evidence_id": "ev-1", "source_path": "/0/engagement_total"}
-            ],
-            "derivation": None,
-        }
-    )
+    selection_refs = _selection_refs(items)
     selection_payload = _selection_payload(items)
 
     build = build_kol_analysis_draft(
@@ -445,6 +468,7 @@ async def test_stable_identity_reuse_keeps_old_parent_binding(
         selection_payload=selection_payload_v1,
         parent_artifact_version_id=version_v1.id,
         selection_version="1",
+        selection_refs=_selection_refs([_selection_item("1")]),
     )
     result1 = await tool.execute(ctx, CreateDraftArgs(**{**_draft_args(build1), "module": "kol-analysis"}))
     data1 = json.loads(result1.safe_summary)
@@ -499,6 +523,7 @@ async def test_stable_identity_reuse_keeps_old_parent_binding(
         selection_payload=selection_payload_v2,
         parent_artifact_version_id=version_v2.id,
         selection_version="2",
+        selection_refs=_selection_refs(selection_payload_v2["data"]["items"]),
     )
     result2 = await tool.execute(ctx, CreateDraftArgs(**{**_draft_args(build2), "module": "kol-analysis"}))
     data2 = json.loads(result2.safe_summary)
@@ -667,6 +692,7 @@ async def test_analysis_create_draft_writes_parent_binding(
         selection_payload=selection_payload,
         parent_artifact_version_id=parent_version.id,
         selection_version="1",
+        selection_refs=_selection_refs(selection_payload["data"]["items"]),
     )
     result = await tool.execute(ctx, CreateDraftArgs(**{**_draft_args(build), "module": "kol-analysis"}))
     assert result.status == "success"

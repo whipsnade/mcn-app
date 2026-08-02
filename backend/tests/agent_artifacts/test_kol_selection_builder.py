@@ -14,11 +14,13 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from typing import Any
+from unittest.mock import patch
 from uuid import uuid4
 
 import pytest
 from pydantic import ValidationError
 
+from app.agent_artifacts.builders.common import DraftBuildError
 from app.agent_artifacts.builders.kol_selection import build_kol_selection_draft
 from app.agent_artifacts.lineage import (
     DbLineageLoader,
@@ -327,6 +329,27 @@ async def test_sparse_data_produces_restricted_artifact() -> None:
     KolSelectionV3.model_validate(payload)
 
 
+async def test_all_engagement_total_null_produces_restricted() -> None:
+    """排序键完全缺失时顺序无业务含义：必须 restricted 披露，不得声称按互动量降序。"""
+    items = [
+        _kol_item(uid="1", engagement_total=None),
+        _kol_item(uid="2", engagement_total=None),
+    ]
+    build = await build_kol_selection_draft(
+        scope=SCOPE, evidence_id="ev-1", items=items, context=LIGHT_CTX
+    )
+    payload = build.payload
+    assert payload["data_status"] == "restricted"
+    assert payload["limitations"]
+    assert payload["limitations"][0]["code"] == "sort_key_missing"
+    assert payload["availability"]["items"]["status"] == "partial"
+    # 不得声称「（按互动量降序）」；须披露无法排序。
+    assert "（按互动量降序）" not in payload["narrative"]["selection_summary"]
+    assert "无法按互动量降序" in payload["narrative"]["selection_summary"]
+    assert len(payload["data"]["items"]) == 2
+    KolSelectionV3.model_validate(payload)
+
+
 # ---------------------------------------------------------------------------
 # 4. Lineage：Evidence + settled rank_kols
 # ---------------------------------------------------------------------------
@@ -417,3 +440,18 @@ async def test_lineage_references_evidence_and_settled_rank_kols(
 
     # 全部必选 numeric 都被覆盖（missing_lineage 不会触发，校验已成功）。
     assert len(frozen.refs) >= 20
+
+
+async def test_selection_builder_wraps_payload_validation_error() -> None:
+    """Schema 校验失败统一抛 DraftBuildError，而不是泄漏裸 ValidationError。"""
+    with patch(
+        "app.agent_artifacts.builders.kol_selection.KolSelectionV3.model_validate",
+        side_effect=ValidationError.from_exception_data("kol_selection_v3", []),
+    ):
+        with pytest.raises(DraftBuildError):
+            await build_kol_selection_draft(
+                scope=SCOPE,
+                evidence_id="ev-1",
+                items=[_kol_item(uid="1", engagement_total=100)],
+                context=LIGHT_CTX,
+            )

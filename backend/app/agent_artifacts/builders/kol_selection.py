@@ -20,6 +20,7 @@ import json
 from datetime import UTC, datetime
 from typing import Any
 
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -73,6 +74,10 @@ _DISPLAY_NUMERIC_FIELDS = (
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
 def _scoring_block() -> dict[str, Any]:
@@ -165,8 +170,21 @@ def _build_item(entry: dict[str, Any], raw: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _narrative(items: list[dict[str, Any]], candidate_count: int) -> dict[str, Any]:
+def _narrative(
+    items: list[dict[str, Any]], candidate_count: int, *, sort_missing: bool = False
+) -> dict[str, Any]:
     selected_count = len(items)
+    if sort_missing:
+        selection_summary = (
+            f"基于 {candidate_count} 位候选 KOL，按 kol_score_v2 八维加权评分圈选 "
+            f"Top{selected_count}；候选缺少互动量数据，无法按互动量降序，名单按原始"
+            f"顺序展示（数据受限）。"
+        )
+    else:
+        selection_summary = (
+            f"基于 {candidate_count} 位候选 KOL，按 kol_score_v2 八维加权评分"
+            f"圈选 Top{selected_count} 名单（按互动量降序）。"
+        )
     fit_findings = [
         {
             "text": f"第 {item['rank']} 名 {item['nickname']} 综合评分 "
@@ -185,6 +203,14 @@ def _narrative(items: list[dict[str, Any]], candidate_count: int) -> dict[str, A
         for index, item in enumerate(items)
         if item["missing_fields"]
     ]
+    if sort_missing:
+        risk_notes.append(
+            {
+                "text": "所有候选均缺少互动量数据，名单排序不代表互动量高低。",
+                "kol_uid": None,
+                "supporting_paths": ["data.items.0.engagement_total"],
+            }
+        )
     usage_advice = (
         [
             {
@@ -196,10 +222,7 @@ def _narrative(items: list[dict[str, Any]], candidate_count: int) -> dict[str, A
         else []
     )
     return {
-        "selection_summary": (
-            f"基于 {candidate_count} 位候选 KOL，按 kol_score_v2 八维加权评分"
-            f"圈选 Top{selected_count} 名单（按互动量降序）。"
-        ),
+        "selection_summary": selection_summary,
         "fit_findings": fit_findings,
         "risk_notes": risk_notes,
         "usage_advice": usage_advice,
@@ -213,18 +236,37 @@ def _build_payload(
     candidate_count: int,
     data_as_of: datetime | None,
     source_names: tuple[str, ...],
+    sort_missing: bool = False,
 ) -> dict[str, Any]:
+    """组装名单 payload；``sort_missing`` 时按互动量排序不可用 → restricted。
+
+    数据存在但排序键（``engagement_total``）完全缺失时，rank_kols 只能按稳定
+    输入顺序输出（任意顺序），不得声称「按互动量降序」——必须受限披露。
+    """
     selected_count = len(items)
     return {
         "schema_version": SCHEMA_VERSION,
         "module": "kol",
-        "data_status": "complete",
+        "data_status": "restricted" if sort_missing else "complete",
         "availability": {
             "scoring": {"status": "complete", "reason_codes": []},
-            "items": {"status": "complete", "reason_codes": []},
+            "items": {
+                "status": "partial" if sort_missing else "complete",
+                "reason_codes": ["sort_key_missing"] if sort_missing else [],
+            },
             "summary": {"status": "complete", "reason_codes": []},
         },
-        "limitations": [],
+        "limitations": (
+            [
+                {
+                    "code": "sort_key_missing",
+                    "message": "候选 KOL 缺少互动量数据，无法按互动量排序，名单按原始顺序展示",
+                    "affected_paths": ["items"],
+                }
+            ]
+            if sort_missing
+            else []
+        ),
         "methodology": methodology_dict(data_as_of=data_as_of, source_names=source_names),
         "scope": scope,
         "data": {
@@ -239,7 +281,7 @@ def _build_payload(
                 ),
             },
         },
-        "narrative": _narrative(items, candidate_count),
+        "narrative": _narrative(items, candidate_count, sort_missing=sort_missing),
     }
 
 
@@ -284,7 +326,10 @@ def _restricted_draft(
             "usage_advice": [],
         },
     }
-    KolSelectionV3.model_validate(payload)
+    try:
+        KolSelectionV3.model_validate(payload)
+    except ValidationError as exc:
+        raise DraftBuildError(f"invalid kol_selection_v3 payload: {exc}") from exc
     return DraftBuildResult(
         module="kol-selection",
         schema_version=SCHEMA_VERSION,
@@ -529,14 +574,23 @@ async def build_kol_selection_draft(
         raw_mapping.append(raw_index)
         payload_items.append(_build_item(entry, items[raw_index]))
 
+    # 排序键（engagement_total）完全缺失时，rank_kols 只能按稳定输入顺序输出，
+    # 顺序不具业务含义——必须受限披露，且与分析 builder（total_engagement 为 None
+    # 即 restricted）行为一致。
+    sort_missing = not any(_is_number(item.get("engagement_total")) for item in items)
+
     payload = _build_payload(
         scope=scope_dict,
         items=payload_items,
         candidate_count=len(items),
         data_as_of=data_as_of,
         source_names=source_names,
+        sort_missing=sort_missing,
     )
-    KolSelectionV3.model_validate(payload)  # fail-fast：builder 输出必须合法。
+    try:
+        KolSelectionV3.model_validate(payload)  # fail-fast：builder 输出必须合法。
+    except ValidationError as exc:
+        raise DraftBuildError(f"invalid kol_selection_v3 payload: {exc}") from exc
 
     refs = _build_lineage(
         payload=payload,

@@ -18,27 +18,13 @@ from app.agent_artifacts.payloads.common import (
     OptionalHttpUrl,
     UniqueKeyValidator,
 )
+from app.selection.scoring_v2 import WEIGHTS_V2
 
-SCORE_DIMENSIONS = (
-    "industry_interest",
-    "target_region",
-    "target_age",
-    "engagement",
-    "active_follower",
-    "content",
-    "followers",
-    "engagement_follower_ratio",
-)
-WEIGHTS = {
-    "industry_interest": 10,
-    "target_region": 8,
-    "target_age": 8,
-    "engagement": 20,
-    "active_follower": 15,
-    "content": 15,
-    "followers": 10,
-    "engagement_follower_ratio": 14,
-}
+# kol_score_v2 八维权重/维度的单一事实来源是 selection/scoring_v2.WEIGHTS_V2
+# （评分器唯一真源）。payload 派生自它，避免双表漂移导致「评分块声称的权重」
+# 与实际评分使用的权重不一致。
+SCORE_DIMENSIONS = tuple(WEIGHTS_V2)
+WEIGHTS = dict(WEIGHTS_V2)
 
 
 class AudienceFilter(BaseModel):
