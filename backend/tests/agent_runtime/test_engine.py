@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
@@ -144,6 +145,21 @@ class NoopTool:
 
     async def execute(self, context: Any, arguments: BaseModel) -> ToolResult:
         return ToolResult(status="success", safe_summary="noop ok")
+
+
+class CountingTool:
+    """零积分工具：记录实际外发次数，用于断言 decide→dispatch 间隙的取消拦截。"""
+
+    def __init__(self, executed: list[Any]) -> None:
+        self.executed = executed
+        self.name = "counting_tool"
+        self.input_model = NoopArgs
+        self.points_cost = 0
+        self.external_side_effect = False
+
+    async def execute(self, context: Any, arguments: BaseModel) -> ToolResult:
+        self.executed.append(arguments)
+        return ToolResult(status="success", safe_summary="counted ok")
 
 
 class RaisingMcpTool:
@@ -553,6 +569,8 @@ async def test_submit_review_approve_publishes(db_session, user_factory) -> None
     assert msg.role == "assistant"
     assert msg.content == "品牌分析完成"
     assert msg.run_id == run.id
+    # 发布路径的 assistant 消息 id 回传进 RunOutcome（与 ask_user/complete 一致）
+    assert outcome.assistant_message_id == msg.id
 
     version = await db_session.scalar(
         select(AgentArtifactVersion).where(AgentArtifactVersion.source_run_id == run.id)
@@ -568,6 +586,17 @@ async def test_submit_review_approve_publishes(db_session, user_factory) -> None
     assert draft_row is not None
     assert draft_row.status == "idle"
     assert draft_row.owner_run_id is None
+
+    # 发布后也发出 message.completed 事件（与 complete 路径一致）
+    event_types = {
+        row.event_type
+        for row in (
+            await db_session.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.id)
+            )
+        ).all()
+    }
+    assert "message.completed" in event_types
 
 
 async def test_submit_review_revise_then_approve(db_session, user_factory) -> None:
@@ -711,6 +740,55 @@ async def test_submit_review_with_invalid_lineage_fed_back_as_structured_error(
     ) == 0
 
 
+async def test_submit_review_publish_failure_fails_run_and_releases_drafts(
+    db_session, user_factory, monkeypatch
+) -> None:
+    """publish_batch 抛异常：不把 Run 卡在 reviewing，释放 Draft 并收口 failed。"""
+    from app.agent_artifacts.service import ArtifactService, PublishBlocked
+
+    run, attempt, _, _ = await _setup_run(db_session, user_factory)
+    _, draft, _ = await _make_draft(db_session, run)
+
+    async def boom(self, review_batch_id: str, *, worker_id: str):
+        raise PublishBlocked("publish exploded")
+
+    monkeypatch.setattr(ArtifactService, "publish_batch", boom)
+
+    engine, _, _ = _make_engine(
+        db_session,
+        actions=[
+            SubmitReview(
+                action="submit_review",
+                artifact_draft_ids=(draft.id,),
+                completion_text="分析",
+                summary="瑞幸品牌分析",
+            ),
+        ],
+        decisions=[ReviewDecision(decision="approve")],
+    )
+    outcome = await engine.run(
+        run=run,
+        attempt_id=attempt.id,
+        profile=get_profile("session_analyst_v1"),
+        messages=[ChatMessage(role="user", content="分析瑞幸品牌")],
+    )
+    assert outcome.status == RunStatus.FAILED
+    assert run.status == RunStatus.FAILED
+    # working head 已释放（不是卡在 reviewing 持有者）
+    draft_row = await db_session.get(ArtifactDraft, draft.id)
+    assert draft_row is not None
+    assert draft_row.status == "failed"
+    assert draft_row.owner_run_id is None
+    # 未产生任何版本（部分发布被拒绝）
+    assert (
+        await db_session.scalar(
+            select(func.count(AgentArtifactVersion.id)).where(
+                AgentArtifactVersion.source_run_id == run.id
+            )
+        )
+    ) == 0
+
+
 # ---------------------------------------------------------------------------
 # 2. 保护：暂停 / 恢复 / 取消 / 非法动作
 # ---------------------------------------------------------------------------
@@ -767,11 +845,41 @@ async def test_pause_at_decision_limit_and_resume(db_session, user_factory) -> N
     assert run.decision_count == 51
 
 
+async def test_expired_lease_fails_run_cleanly(db_session, user_factory) -> None:
+    """租约过期后续租失败：干净收口 failed，而不是静默绕过 50 决策守卫。"""
+    run, attempt, _, _ = await _setup_run(db_session, user_factory)
+    # 让租约过期（模拟长 Attempt 期间租约到期 / heartbeat 丢失）
+    run_row = await db_session.get(AgentRun, run.id)
+    run_row.lease_expires_at = utc_now() - timedelta(seconds=1)
+    await db_session.flush()
+
+    engine, _, _ = _make_engine(
+        db_session, actions=[Complete(action="complete", text="完成")], decisions=[]
+    )
+    outcome = await engine.run(
+        run=run,
+        attempt_id=attempt.id,
+        profile=get_profile("session_analyst_v1"),
+        messages=[ChatMessage(role="user", content="开始")],
+    )
+    assert outcome.status == RunStatus.FAILED
+    assert run.status == RunStatus.FAILED
+    assert run.error_code == "run_lease_lost"
+    # open attempt 已收口（未卡在 running）
+    attempt_row = await db_session.get(AgentRunAttempt, attempt.id)
+    assert attempt_row is not None
+    assert attempt_row.outcome == "failed"
+    assert attempt_row.ended_at is not None
+
+
 async def test_cancel_requested_stops_new_calls_and_settles_inflight(
     db_session, user_factory
 ) -> None:
     run, attempt, _, _ = await _setup_run(db_session, user_factory)
     repo = AgentRunRepository(db_session)
+    executed: list[Any] = []
+    registry = ToolRegistry()
+    registry.register(CountingTool(executed), category="calculation")
 
     async def on_decide(run, index):
         if index == 2:
@@ -782,15 +890,15 @@ async def test_cancel_requested_stops_new_calls_and_settles_inflight(
         actions=[
             CallTool(
                 action="call_tool",
-                internal_tool_name="noop_calc", arguments={"value": "a"}, rationale="x"
+                internal_tool_name="counting_tool", arguments={"value": "a"}, rationale="x"
             ),
             CallTool(
                 action="call_tool",
-                internal_tool_name="noop_calc", arguments={"value": "b"}, rationale="x"
+                internal_tool_name="counting_tool", arguments={"value": "b"}, rationale="x"
             ),
         ],
         decisions=[],
-        registry=_noop_registry(),
+        registry=registry,
         on_decide=on_decide,
     )
     outcome = await engine.run(
@@ -801,7 +909,8 @@ async def test_cancel_requested_stops_new_calls_and_settles_inflight(
     )
     assert outcome.status == RunStatus.CANCELLED
     assert run.status == RunStatus.CANCELLED
-    # safe point（循环顶）前已启动的两个工具都正常完成；之后不再启动新调用
+    # 第一个工具已外发并结算；第二个在 decide→dispatch 间隙被取消拦截，未外发
+    assert len(executed) == 1
     steps = (
         await db_session.scalars(
             select(AgentStep).where(
@@ -810,7 +919,56 @@ async def test_cancel_requested_stops_new_calls_and_settles_inflight(
         )
     ).all()
     assert len(steps) == 2
-    assert all(step.status == "completed" for step in steps)
+    assert [step.status for step in steps] == ["completed", "failed"]
+    assert steps[1].output_json["error_type"] == "cancelled_not_sent"
+
+
+async def test_cancel_between_decide_and_dispatch_blocks_tool_call(
+    db_session, user_factory
+) -> None:
+    """decide（长模型调用）期间收到取消：外发前再核对，绝不发起工具调用（§11.3）。"""
+    run, attempt, _, _ = await _setup_run(db_session, user_factory)
+    repo = AgentRunRepository(db_session)
+    executed: list[Any] = []
+    registry = ToolRegistry()
+    registry.register(CountingTool(executed), category="calculation")
+
+    async def on_decide(run, index):
+        if index == 1:
+            await repo.request_cancel(run.id, run.user_id)
+
+    engine, _, _ = _make_engine(
+        db_session,
+        actions=[
+            CallTool(
+                action="call_tool",
+                internal_tool_name="counting_tool",
+                arguments={"value": "x"},
+                rationale="x",
+            ),
+        ],
+        decisions=[],
+        registry=registry,
+        on_decide=on_decide,
+    )
+    outcome = await engine.run(
+        run=run,
+        attempt_id=attempt.id,
+        profile=get_profile("session_analyst_v1"),
+        messages=[ChatMessage(role="user", content="开始任务")],
+    )
+    assert outcome.status == RunStatus.CANCELLED
+    assert run.status == RunStatus.CANCELLED
+    # 工具从未真正外发
+    assert executed == []
+    step = await db_session.scalar(
+        select(AgentStep).where(
+            AgentStep.run_id == run.id, AgentStep.step_type == "tool_call"
+        )
+    )
+    assert step is not None
+    assert step.status == "failed"
+    assert step.output_json["error_type"] == "cancelled_not_sent"
 
 
 async def test_invalid_actions_reach_threshold_and_fail_run(

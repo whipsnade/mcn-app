@@ -117,6 +117,58 @@ class AgentRunRepository:
         await self.db.flush()
         return True
 
+    async def renew_lease(
+        self,
+        run_id: str,
+        worker_id: str,
+        lease_seconds: int,
+        *,
+        now: datetime | None = None,
+    ) -> bool:
+        """续租：只有当前活跃租约持有者可延长；无租约/过期/他人持有返回 False。
+
+        Task 14 硬化：引擎在每个决策循环顶调用，避免长 Attempt（最长 30 分钟）
+        期间租约过期导致 ``pause`` / ``transition`` 静默失效（``_owns_active_lease``
+        为 False 时 pause 返回 False、transition 抛 run_lease_not_held）。
+        """
+        now = now or utc_now()
+        run = await self.lock_run(run_id)
+        if not self._owns_active_lease(run, worker_id):
+            return False
+        run.lease_expires_at = now + timedelta(seconds=lease_seconds)
+        run.heartbeat_at = now
+        await self.db.flush()
+        return True
+
+    async def force_fail(
+        self,
+        run_id: str,
+        *,
+        error_code: str | None = None,
+    ) -> bool:
+        """系统级失败收口：租约丢失（过期/未抢到）后仍把 Run 干净置为 failed。
+
+        仅在无其他 worker 活跃持有时生效；已被他人持有活跃租约（已接管）返回
+        False 交给接管方。避免 Run 卡在 running/reviewing + open attempt。
+        """
+        run = await self.lock_run(run_id)
+        if RunStatus(run.status) in TERMINAL_RUN_STATUSES:
+            return False
+        if run.lease_owner is not None and (
+            run.lease_expires_at is None or run.lease_expires_at > utc_now()
+        ):
+            return False
+        ensure_transition(RunStatus(run.status), RunStatus.FAILED)
+        now = utc_now()
+        run.status = RunStatus.FAILED
+        run.completed_at = run.completed_at or now
+        run.error_code = error_code
+        run.lease_owner = None
+        run.lease_expires_at = None
+        await self._end_open_attempt(run_id, "failed", now)
+        await self.db.flush()
+        return True
+
     async def pause(self, run_id: str, worker_id: str) -> bool:
         """运行达到阈值后暂停：释放租约、结束当前 Attempt（outcome=paused）。"""
         run = await self.lock_run(run_id)

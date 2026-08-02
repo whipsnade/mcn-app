@@ -55,7 +55,7 @@ from app.agent_runtime.repository import (
 )
 from app.agent_runtime.reviewer import ReviewerDriver
 from app.agent_runtime.schemas import FOUR_ACTIONS
-from app.agent_runtime.state import RunStatus
+from app.agent_runtime.state import InvalidRunTransition, RunStatus
 from app.agent_runtime.tools.contracts import ToolResult
 from app.agent_runtime.tools.mcp import DEFINITELY_NOT_SENT
 from app.agent_runtime.tools.registry import ToolRegistry, UnknownToolError
@@ -105,6 +105,7 @@ class AgentEngine:
         repo: AgentRunRepository | None = None,
         context_builder: SessionContextBuilder | None = None,
         channel_permissions: Any = (),
+        lease_seconds: int = 300,
     ) -> None:
         self._db = db
         self._gateway = gateway
@@ -112,6 +113,7 @@ class AgentEngine:
         self._events = events
         self._reviewer = reviewer
         self._worker_id = worker_id
+        self._lease_seconds = lease_seconds
         self._repo = repo or AgentRunRepository(db)
         self._service = ArtifactService(db)
         self._context_builder = context_builder or SessionContextBuilder(db, registry)
@@ -139,6 +141,11 @@ class AgentEngine:
         assistant_message_id: str | None = None
 
         while await self._is_running(run):
+            # 续租：长 Attempt（最长 30 分钟）期间租约不能过期，否则 pause 静默
+            # 失效、终态迁移抛 run_lease_not_held。续租失败视为不可恢复系统错误。
+            if not await self._renew_lease(run):
+                await self._fail_run(run)
+                break
             if await self._guard_attempt_limits(run, attempt_id):
                 await self._events.append(
                     run.id, run.user_id, "run.paused", {"attempt_id": attempt_id}
@@ -183,7 +190,7 @@ class AgentEngine:
                 assistant_message_id = message.id
                 break
             if action.action == "call_tool":
-                await self._handle_call_tool(
+                call_result = await self._handle_call_tool(
                     run=run,
                     attempt_id=attempt_id,
                     profile=profile,
@@ -192,15 +199,23 @@ class AgentEngine:
                     step_sequence=next_sequence,
                 )
                 next_sequence += 1
+                if call_result == "cancelled":
+                    # decide→dispatch 间隙收到取消：不发起新调用，直接收口 cancelled
+                    await self._repo.cancel(run.id, run.user_id)
+                    await self._events.append(run.id, run.user_id, "run.cancelled", {})
+                    break
                 continue
             if action.action == "submit_review":
-                settled = await self._handle_submit_review(
+                settled, published_message_id = await self._handle_submit_review(
                     run=run,
                     action=action,
                     conversation=conversation,
                     user_question=user_question,
                 )
-                if settled in ("approved", "rejected"):
+                if settled == "approved":
+                    assistant_message_id = published_message_id or assistant_message_id
+                    break
+                if settled == "rejected":
                     break
                 continue  # revise / lineage 错误 → 模型修正后继续
             if action.action == "complete":
@@ -267,11 +282,12 @@ class AgentEngine:
         action: Any,
         conversation: list[ChatMessage],
         step_sequence: int,
-    ) -> None:
+    ) -> str:
         """call_tool：可见性校验 → 外发前持久化 Step → 执行 → 结果回喂消息列表。
 
         ``InsufficientPointsError`` 作为结构化工具错误回喂模型（§11.3），
-        不崩溃；已 settled 调用正常结算。
+        不崩溃；已 settled 调用正常结算。返回 ``"cancelled"``（decide→dispatch
+        间隙收到取消，未发起调用）或 ``"ok"``。
         """
         visible = await self._registry.visible_tools(
             profile, channel_permissions=self._channel_permissions
@@ -286,7 +302,7 @@ class AgentEngine:
                     error_type="unknown_tool",
                 ),
             )
-            return
+            return "ok"
 
         step = AgentStep(
             id=str(uuid4()),
@@ -310,6 +326,28 @@ class AgentEngine:
             "tool.started",
             {"internal_tool_name": action.internal_tool_name},
         )
+
+        # §11.3：decide（长模型调用）期间用户取消 → 外发前再核对一次，
+        # 已请求取消则绝不发起新调用。
+        if await self._cancel_requested(run):
+            step.status = "failed"
+            step.output_json = {
+                "internal_tool_name": action.internal_tool_name,
+                "status": "failed",
+                "error_type": "cancelled_not_sent",
+            }
+            await self._db.flush()
+            await self._events.append(
+                run.id,
+                run.user_id,
+                "tool.failed",
+                {
+                    "internal_tool_name": action.internal_tool_name,
+                    "status": "failed",
+                    "error_type": "cancelled_not_sent",
+                },
+            )
+            return "cancelled"
 
         try:
             result = await self._registry.execute(
@@ -360,6 +398,7 @@ class AgentEngine:
             },
         )
         self._feed_tool_result(conversation, result)
+        return "ok"
 
     async def _handle_submit_review(
         self,
@@ -368,10 +407,12 @@ class AgentEngine:
         action: Any,
         conversation: list[ChatMessage],
         user_question: str,
-    ) -> str:
+    ) -> tuple[str, str | None]:
         """submit_review：lineage 校验 → 建/复用 Batch → Reviewer 收口。
 
-        返回 ``approved`` / ``rejected``（终态）或 ``revise``（继续循环）。
+        返回 ``(settled, assistant_message_id)``：``settled`` 取
+        ``approved`` / ``rejected``（终态）或 ``revise``（继续循环）；
+        approve 时附带已发布消息 id（供 RunOutcome 回传）。
         """
         for draft_id in action.artifact_draft_ids:
             error = await self._validate_draft_lineage(run, draft_id)
@@ -389,7 +430,7 @@ class AgentEngine:
                         ),
                     )
                 )
-                return "revise"
+                return "revise", None
 
         batch = await self._get_or_create_batch(run, action)
         await self._repo.transition(
@@ -402,9 +443,17 @@ class AgentEngine:
             {"review_batch_id": batch.id, "artifact_ids": list(action.artifact_draft_ids)},
         )
 
-        results = await self._reviewer.review_pending(
-            parent_run=run, batch=batch, user_question=user_question
-        )
+        try:
+            results = await self._reviewer.review_pending(
+                parent_run=run, batch=batch, user_question=user_question
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("reviewer failed for run %s; failing run", run.id)
+            await self._abort_review(run, action)
+            return "rejected", None
+
         decisions = {result.decision for result in results}
         if "reject" in decisions:
             await self._events.append(
@@ -413,7 +462,7 @@ class AgentEngine:
                 "review.rejected",
                 {"review_batch_id": batch.id},
             )
-            return "rejected"
+            return "rejected", None
         if any(result.decision == "revise" for result in results):
             await self._events.append(
                 run.id,
@@ -425,16 +474,27 @@ class AgentEngine:
             await self._repo.transition(
                 run.id, RunStatus.RUNNING, worker_id=self._worker_id
             )
-            return "revise"
+            return "revise", None
 
         await self._events.append(
             run.id, run.user_id, "review.approved", {"review_batch_id": batch.id}
         )
-        await self._service.publish_batch(batch.id, worker_id=self._worker_id)
+        try:
+            await self._service.publish_batch(batch.id, worker_id=self._worker_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("publish_batch failed for run %s; failing run", run.id)
+            await self._abort_review(run, action)
+            return "rejected", None
         await self._events.append(
             run.id, run.user_id, "run.completed", {"outcome": "completed"}
         )
-        return "approved"
+        await self._events.append(
+            run.id, run.user_id, "message.completed", {"type": "completion"}
+        )
+        published = await self._latest_assistant_message(run.id)
+        return "approved", (published.id if published is not None else None)
 
     async def _handle_complete(self, run: AgentRun, action: Any) -> AgentMessage:
         """complete（无正式产物）：写 assistant 消息，Run → completed。"""
@@ -483,10 +543,44 @@ class AgentEngine:
         return False
 
     async def _fail_run(self, run: AgentRun) -> None:
-        await self._repo.transition(
-            run.id, RunStatus.FAILED, worker_id=self._worker_id
-        )
-        await self._events.append(run.id, run.user_id, "run.failed", {"outcome": "failed"})
+        """把 Run 收口为 failed；租约已丢失（过期/被接管）时回退到系统级 force_fail。
+
+        正常路径持有租约经 ``transition`` 迁移；续租失败导致的系统错误无法持有
+        租约，此时用 ``force_fail`` 干净收口，避免卡在 running + open attempt。
+        """
+        try:
+            await self._repo.transition(
+                run.id, RunStatus.FAILED, worker_id=self._worker_id
+            )
+            failed = True
+        except InvalidRunTransition as exc:
+            if "run_lease_not_held" not in str(exc):
+                # 已是终态等：幂等跳过，不重复发失败事件。
+                return
+            failed = await self._repo.force_fail(run.id, error_code="run_lease_lost")
+        if failed:
+            await self._events.append(run.id, run.user_id, "run.failed", {"outcome": "failed"})
+
+    async def _renew_lease(self, run: AgentRun) -> bool:
+        try:
+            return await self._repo.renew_lease(
+                run.id, self._worker_id, self._lease_seconds
+            )
+        except Exception:
+            logger.exception("lease renewal failed for run %s", run.id)
+            return False
+
+    async def _abort_review(self, run: AgentRun, action: Any) -> None:
+        """Reviewer/发布异常时的收口：先释放 working head，再让 Run 失败。"""
+        try:
+            await self._reviewer.cancel_reviewing(
+                run_id=run.id,
+                draft_ids=action.artifact_draft_ids,
+                outcome="failed",
+            )
+        except Exception:
+            logger.exception("cancel_reviewing failed for run %s", run.id)
+        await self._fail_run(run)
 
     async def _count_decision(self, run: AgentRun, attempt_id: str) -> None:
         run.decision_count += 1
@@ -632,6 +726,14 @@ class AgentEngine:
         self._db.add(message)
         await self._db.flush()
         return message
+
+    async def _latest_assistant_message(self, run_id: str) -> AgentMessage | None:
+        return await self._db.scalar(
+            select(AgentMessage)
+            .where(AgentMessage.run_id == run_id, AgentMessage.role == "assistant")
+            .order_by(AgentMessage.sequence.desc())
+            .limit(1)
+        )
 
     # ------------------------------------------------------------------ #
     # 提交校验 / 批次
