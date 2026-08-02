@@ -332,6 +332,36 @@ async def test_expired_lease_takeover_resumes_from_last_complete_step(
     assert all(step.sequence > 2 for step in steps if step.attempt_id == attempts[1].id)
 
 
+async def test_null_lease_running_run_reuses_open_attempt(db_session, user_factory) -> None:
+    """无租约（NULL）running Run：执行器直接沿用现有 open Attempt，不 pause+重建。
+
+    这是 API resume 经 ``begin_attempt(resumed=True)`` 后的状态——新 Attempt 已
+    就绪，若再 pause+重建会产生一个多余的暂停 Attempt。
+    """
+    run, _, _ = await _make_session(db_session, user_factory)
+    repo = AgentRunRepository(db_session)
+    attempt1 = await repo.begin_attempt(run.id)
+    # begin_attempt 只置 running、不建租约 → lease_expires_at 为 NULL
+    assert (await db_session.get(AgentRun, run.id)).lease_expires_at is None
+
+    gateway = FakeAgentGateway([Complete(action="complete", text="恢复完成")])
+    executor = _build_executor(db_session, gateway=gateway)
+
+    run_id = await executor.claim_and_process_one()
+
+    assert run_id == run.id
+    fresh = await db_session.get(AgentRun, run.id)
+    assert fresh.status == RunStatus.COMPLETED
+    assert fresh.lease_owner is None
+    assert fresh.paused_at is None
+
+    # 复用 attempt 1，不新增 attempt 2
+    attempts = await _attempts(db_session, run.id)
+    assert [attempt.attempt for attempt in attempts] == [1]
+    assert attempts[0].id == attempt1.id
+    assert attempts[0].outcome == "completed"
+
+
 async def test_unexpired_lease_not_reclaimed_by_other_worker(db_session, user_factory) -> None:
     run, _, _ = await _make_session(db_session, user_factory)
     repo = AgentRunRepository(db_session)

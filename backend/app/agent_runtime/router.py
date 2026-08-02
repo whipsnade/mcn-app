@@ -182,25 +182,32 @@ def _not_found(detail: str) -> HTTPException:
     return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=detail)
 
 
-async def _get_owned_session(db: AsyncSession, user_id: str, session_id: str) -> AgentSession:
-    session = await db.scalar(
-        select(AgentSession).where(
-            AgentSession.id == session_id,
-            AgentSession.user_id == user_id,
-            AgentSession.archived_at.is_(None),
-        )
+async def _get_owned_session(
+    db: AsyncSession, user_id: str, session_id: str, *, for_update: bool = False
+) -> AgentSession:
+    statement = select(AgentSession).where(
+        AgentSession.id == session_id,
+        AgentSession.user_id == user_id,
+        AgentSession.archived_at.is_(None),
     )
+    if for_update:
+        statement = statement.with_for_update()
+    session = await db.scalar(statement)
     if session is None:
         raise _not_found("session_not_found")
     return session
 
 
 async def _get_owned_run(db: AsyncSession, user_id: str, run_id: str) -> AgentRun:
+    """Run 归属 + 父 Session 软删除态校验（设计 §15.2「同时校验 Session 归属与软删除」）。"""
     run = await db.scalar(
-        select(AgentRun).where(
+        select(AgentRun)
+        .join(AgentSession, AgentRun.session_id == AgentSession.id)
+        .where(
             AgentRun.id == run_id,
             AgentRun.user_id == user_id,
             AgentRun.visibility == "user",
+            AgentSession.archived_at.is_(None),
         )
     )
     if run is None:
@@ -371,7 +378,12 @@ async def append_message(
     executor: Annotated[AgentRunExecutor, Depends(get_agent_executor)],
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> MessageRunResponse:
-    await _get_owned_session(db, user.id, session_id)
+    # 以「锁 Session 行」串行化同一 Session 的并发 messages：MySQL 没有部分唯一
+    # 索引兜底活动 Run 约束，未加锁的 active 检查会被两个并发请求同时通过并各自
+    # 建 Run（消息 sequence 也会竞态撞 uq_agent_messages_session_sequence → 500）。
+    # 先 FOR UPDATE 锁住 Session 行（同 kol_detail working-head 锁），后续请求在
+    # 前一个请求提交后才拿到锁，此时 active 检查能看到已提交的 Run → 409。
+    await _get_owned_session(db, user.id, session_id, for_update=True)
     content_hash = _content_hash(payload.content)
 
     # 幂等优先：同 key + 同 payload → 复用同一 Run；不同 payload → 409。
@@ -393,6 +405,10 @@ async def append_message(
             )
 
     # 活动并发：同一 Session 只允许一个活动 session_analyst_v1 Run。
+    # 用 FOR UPDATE（锁定读）而不是普通一致读：请求事务的 REPEATABLE-READ 快照
+    # 在鉴权阶段就已建立，普通 SELECT 看不到另一个并发请求已提交的 Run；锁定读
+    # 读最新已提交数据，配合上面的 Session 行锁保证「后到者在拿到锁后看到先到者
+    # 已提交的 Run → 409」，从而只有一个 Run 被创建。
     active = await db.scalar(
         select(AgentRun.id)
         .where(
@@ -401,6 +417,7 @@ async def append_message(
             AgentRun.profile_name == SESSION_ANALYST_PROFILE,
             AgentRun.status.in_(tuple(_ACTIVE_RUN_STATUSES)),
         )
+        .with_for_update()
         .limit(1)
     )
     if active is not None:
@@ -495,6 +512,11 @@ async def resume_run(
     try:
         await repo.begin_attempt(run.id, resumed=True)
     except InvalidRunTransition as error:
+        # 仅 paused 可恢复；已请求取消（cancel_requested）不得再启动 Attempt，需区分。
+        if str(error) == "run_cancel_requested":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail="run_cancel_requested"
+            ) from error
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="run_not_paused") from error
     await db.commit()
     executor.submit(run.id)
@@ -510,6 +532,9 @@ async def stream_run_events(
     last_event_id: Annotated[str | None, Query()] = None,
     last_event_id_header: Annotated[str | None, Header(alias="Last-Event-ID")] = None,
 ) -> StreamingResponse:
+    # SSE 在流生命周期内持有该请求的 DB 连接（AgentEventStream.stream 全程轮询
+    # DB + broker），连接直到 Run 到达终态事件或客户端断开才释放；不应在流开启
+    # 后继续用同一 session 做其他写入。
     await _get_owned_run(db, user.id, run_id)
     seen = _resolve_last_event_id(last_event_id_header, last_event_id)
     stream = AgentEventStream(db, broker)

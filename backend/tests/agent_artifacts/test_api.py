@@ -403,3 +403,25 @@ async def test_artifact_ownership_isolation_returns_404(
             json={"module": "brand", "last_seen_sequence": 1},
         )
     ).status_code == 404
+
+
+async def test_artifact_under_archived_session_is_404(
+    auth_client_factory, db_session
+) -> None:
+    """§15.2：删除（软删除）Session 后，其下的 Artifact 一律 404，不泄露存在。"""
+    alice = await auth_client_factory("13700000009")
+    session_id = await _create_session(alice)
+    user_id = await _me_id(alice)
+    artifact = await _make_published_artifact(
+        db_session, user_id, session_id, payload=build_brand_dict()
+    )
+
+    assert (await alice.delete(f"/api/v1/agent/sessions/{session_id}")).status_code == 204
+
+    assert (await alice.get(f"/api/v1/agent/artifacts/{artifact.id}")).status_code == 404
+    assert (
+        await alice.get(f"/api/v1/agent/artifacts/{artifact.id}/versions/1")
+    ).status_code == 404
+    assert (
+        await alice.get(f"/api/v1/agent/artifacts/{artifact.id}/export")
+    ).status_code == 404

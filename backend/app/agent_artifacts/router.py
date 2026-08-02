@@ -87,10 +87,14 @@ async def _get_owned_session(db: AsyncSession, user_id: str, session_id: str) ->
 async def _get_owned_artifact(
     db: AsyncSession, user_id: str, artifact_id: str
 ) -> AgentArtifact:
+    """Artifact 归属 + 父 Session 软删除态校验（设计 §15.2「同时校验 Session 归属与软删除」）。"""
     artifact = await db.scalar(
-        select(AgentArtifact).where(
+        select(AgentArtifact)
+        .join(AgentSession, AgentArtifact.session_id == AgentSession.id)
+        .where(
             AgentArtifact.id == artifact_id,
             AgentArtifact.user_id == user_id,
+            AgentSession.archived_at.is_(None),
         )
     )
     if artifact is None:
@@ -217,6 +221,8 @@ async def export_artifact_xlsx(
     user: CurrentUser,
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> StreamingResponse:
+    # 导出器在内存中构建整个 .xlsx bytes（export_artifact 返回 bytes）再以
+    # StreamingResponse 单块下发；对超大 payload 会占内存，但导出是低频表现层能力。
     artifact = await _get_owned_artifact(db, user.id, artifact_id)
     version = await db.scalar(
         select(AgentArtifactVersion)

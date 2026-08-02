@@ -23,7 +23,7 @@ from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_runtime.executor import AgentRunExecutor
@@ -113,7 +113,12 @@ class RecoveryLoop:
     # ------------------------------------------------------------------ #
 
     async def reclaim_expired_runs(self) -> tuple[str, ...]:
-        """扫描租约已过期的 running Run，重新提交给执行器（新 Attempt + 引擎继续）。"""
+        """扫描可接管的 running Run，重新提交给执行器（新 Attempt + 引擎继续）。
+
+        与执行器 ``_find_claimable_id`` 一致：租约过期或无租约（NULL）的 running
+        Run 都可接管——NULL 租约是 API resume 经 ``begin_attempt(resumed=True)``
+        留下的状态，执行器停止时若恢复循环也不接管会永久卡在 running。
+        """
         reclaimed: list[str] = []
         async with self._session_factory() as db:
             expired = (
@@ -123,8 +128,10 @@ class RecoveryLoop:
                         AgentRun.run_kind == "user",
                         AgentRun.status == RunStatus.RUNNING,
                         AgentRun.cancel_requested.is_(False),
-                        AgentRun.lease_expires_at.isnot(None),
-                        AgentRun.lease_expires_at <= self._clock(),
+                        or_(
+                            AgentRun.lease_expires_at.is_(None),
+                            AgentRun.lease_expires_at <= self._clock(),
+                        ),
                     )
                     .order_by(AgentRun.id.asc())
                     .limit(_SCAN_LIMIT)

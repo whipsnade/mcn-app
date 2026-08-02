@@ -12,18 +12,22 @@
 
 from __future__ import annotations
 
+import asyncio
+from datetime import timedelta
 from uuid import uuid4
 
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import select
+from sqlalchemy import delete, select, update
 
 from app.agent_artifacts.models import AgentArtifact, ArtifactDraft
 from app.agent_runtime.events import AgentEventStream
 from app.agent_runtime.kol_detail import KolDetailRunService
-from app.agent_runtime.models import AgentMessage, AgentRun, AgentRunAttempt
+from app.agent_runtime.models import AgentMessage, AgentRun, AgentRunAttempt, AgentSession
 from app.agent_runtime.repository import AgentRunRepository, utc_now
-from app.db.session import get_db
+from app.core.security import create_access_token
+from app.db.session import SessionFactory, get_db
+from app.identity.models import LoginSession, User
 from app.main import create_app
 
 
@@ -357,6 +361,112 @@ async def test_second_active_run_is_rejected(agent_client_factory, db_session) -
     assert runs[0].status == "queued"
 
 
+async def test_concurrent_messages_serialize_per_session():
+    """两个并发 messages POST 只创建一个 Run，另一个 409（Session 行 FOR UPDATE 串行化）。
+
+    用真实 DB 连接（独立事务）跑并发：两个请求必须各自可见对方的提交，否则会
+    双双通过 active 检查并撞 uq_agent_messages_session_sequence（500）。
+    """
+    app = create_app()  # 不覆写 get_db：每个请求用真实 SessionFactory 独立连接
+    session_id: str | None = None
+    user_id: str | None = None
+    try:
+        token, session_id, user_id = await _committed_user_with_session()
+        headers = {"Authorization": f"Bearer {token}"}
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            results = await asyncio.gather(
+                client.post(
+                    f"/api/v1/agent/sessions/{session_id}/messages",
+                    json={"content": "并发一"},
+                    headers=headers,
+                ),
+                client.post(
+                    f"/api/v1/agent/sessions/{session_id}/messages",
+                    json={"content": "并发二"},
+                    headers=headers,
+                ),
+                return_exceptions=True,
+            )
+
+        statuses = sorted(
+            resp.status_code for resp in results if not isinstance(resp, Exception)
+        )
+        # 一个 201 创建 Run，另一个 409（活动并发）——不允许 500
+        assert statuses == [201, 409]
+
+        # 只创建了一个 Run + 一条用户消息（无 500、无重复 sequence）
+        async with SessionFactory() as db:
+            runs = (
+                await db.scalars(
+                    select(AgentRun).where(AgentRun.session_id == session_id)
+                )
+            ).all()
+            messages = (
+                await db.scalars(
+                    select(AgentMessage).where(AgentMessage.session_id == session_id)
+                )
+            ).all()
+        assert len(runs) == 1
+        assert len(messages) == 1
+    finally:
+        if session_id is not None and user_id is not None:
+            await _purge_committed_user(session_id, user_id)
+
+
+async def _committed_user_with_session() -> tuple[str, str, str]:
+    """真实连接提交 user + login_session + agent_session，返回 (token, session_id, user_id)。"""
+    async with SessionFactory() as db:
+        now = utc_now()
+        user = User(
+            id=str(uuid4()),
+            nickname="并发用户",
+            role="user",
+            status="active",
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(user)
+        await db.flush()
+        login = LoginSession(
+            id=str(uuid4()),
+            user_id=user.id,
+            refresh_token_hash=f"race-{uuid4().hex}",
+            expires_at=now + timedelta(days=1),
+            created_at=now,
+            last_seen_at=now,
+        )
+        db.add(login)
+        session = AgentSession(
+            id=str(uuid4()),
+            user_id=user.id,
+            title="并发会话",
+            status="active",
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(session)
+        await db.flush()
+        await db.commit()
+        token = create_access_token(user_id=user.id, session_id=login.id, role=user.role)
+        return token, session.id, user.id
+
+
+async def _purge_committed_user(session_id: str, user_id: str) -> None:
+    """清理真实连接提交的测试行（message↔run 存在循环 FK，先解绑 run_id）。"""
+    async with SessionFactory() as db:
+        await db.execute(
+            update(AgentMessage)
+            .where(AgentMessage.session_id == session_id)
+            .values(run_id=None)
+        )
+        await db.execute(delete(AgentRun).where(AgentRun.session_id == session_id))
+        await db.execute(delete(AgentMessage).where(AgentMessage.session_id == session_id))
+        await db.execute(delete(AgentSession).where(AgentSession.id == session_id))
+        await db.execute(delete(LoginSession).where(LoginSession.user_id == user_id))
+        await db.execute(delete(User).where(User.id == user_id))
+        await db.commit()
+
+
 # ---------------------------------------------------------------------------
 # Run 生命周期：detail / cancel / resume / SSE
 # ---------------------------------------------------------------------------
@@ -419,6 +529,42 @@ async def test_resume_only_when_paused_creates_new_attempt(
     assert [attempt.attempt for attempt in attempts] == [1, 2]
     assert attempts[-1].outcome == "running"
     assert attempts[-1].ended_at is None
+
+
+async def test_resume_cancelled_run_maps_distinct_code(
+    agent_client_factory, db_session
+) -> None:
+    alice, _ = await agent_client_factory("13600000052")
+    session_id = await _create_session(alice)
+    user_id = await _me_id(alice)
+    # 已请求取消（cancel_requested）的 paused Run：不能恢复，且错误码要区分取消语义
+    cancelled = await _add_run(
+        db_session,
+        user_id,
+        session_id,
+        status="paused",
+        cancel_requested=True,
+        paused_at=utc_now(),
+    )
+
+    resp = await alice.post(f"/api/v1/agent/runs/{cancelled.id}/resume")
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == "run_cancel_requested"
+
+
+async def test_run_under_archived_session_is_404(agent_client_factory) -> None:
+    """§15.2：删除（软删除）Session 后，其下的 Run 一律 404，不泄露存在。"""
+    executor = FakeExecutor()
+    alice, _ = await agent_client_factory("13600000053", executor=executor)
+    session_id = await _create_session(alice)
+    run_id = (await _post_message(alice, session_id, "分析")).json()["run_id"]
+
+    assert (await alice.delete(f"/api/v1/agent/sessions/{session_id}")).status_code == 204
+
+    assert (await alice.get(f"/api/v1/agent/runs/{run_id}")).status_code == 404
+    assert (await alice.post(f"/api/v1/agent/runs/{run_id}/cancel")).status_code == 404
+    assert (await alice.post(f"/api/v1/agent/runs/{run_id}/resume")).status_code == 404
+    assert (await alice.get(f"/api/v1/agent/runs/{run_id}/events")).status_code == 404
 
 
 async def test_events_sse_streams_and_honors_last_event_id(

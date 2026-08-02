@@ -15,6 +15,12 @@
 （持有 ``kol-detail:{platform}:{kol_uid}`` working head）时幂等返回现有 Run，
 不重复创建。
 
+**同步执行（Task 19 评审文档项）**：``create`` 在缓存未命中且无活动 Run 时会在
+**当前请求线程内同步**驱动 ``AgentEngine`` 到发布（含 MCP/模型调用），因此该 HTTP
+请求会阻塞到达人详情 Run 出结果（最长到 Attempt 的 30 分钟 / 50 决策保护阈值），
+而不是后台异步返回。这是 Task 17 的设计决策：响应直接携带可渲染的 detail
+（cache hit）或 ``run_id`` + ``artifact_id``（fresh run）。前端应为此连接持有等待。
+
 并发与恢复硬化（Code Review Fix 1/2）：
 - 幂等检查对 working head 行 ``with_for_update`` 串行化并发 create，持有锁后
   重查缓存（并发写入者可能刚填好），避免重复创建 Run 造成重复 MCP/模型消耗；

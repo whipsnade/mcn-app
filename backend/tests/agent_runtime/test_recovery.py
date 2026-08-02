@@ -256,6 +256,28 @@ async def test_recovery_reclaims_expired_lease_run(db_session, user_factory) -> 
     assert attempts[1].outcome == "completed"
 
 
+async def test_recovery_reclaims_null_lease_running_run(db_session, user_factory) -> None:
+    """无租约（NULL）running Run 也应被恢复循环接管（与执行器 _find_claimable_id 一致）。
+
+    NULL 租约是 API resume 经 ``begin_attempt(resumed=True)`` 留下的状态；
+    执行器停止时若恢复循环也不接管会永久卡在 running。
+    """
+    user = await _funded_user(db_session, user_factory)
+    session, run, step = await _make_chain(db_session, user.id)
+    row = await db_session.get(AgentRun, run.id)
+    assert row.lease_expires_at is None  # _make_chain 未设租约
+
+    executor = await _make_executor(db_session)
+    recovery = _make_recovery(db_session, executor=executor, transport=FakeMcpTransport())
+
+    reclaimed = await recovery.reclaim_expired_runs()
+
+    assert run.id in reclaimed
+    fresh = await db_session.get(AgentRun, run.id)
+    assert fresh.status == RunStatus.COMPLETED
+    assert fresh.lease_owner is None
+
+
 async def test_recovery_skips_run_with_unexpired_lease(db_session, user_factory) -> None:
     user = await _funded_user(db_session, user_factory)
     session, run, step = await _make_chain(db_session, user.id)
