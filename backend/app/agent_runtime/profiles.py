@@ -1,0 +1,120 @@
+"""Agent Profile 注册表（设计文档 §五）。
+
+Profile 只限定 Agent 的能力边界：允许动作、是否要求 Reviewer、输出 Schema、
+最大上下文预算、system prompt 引用。**Profile 不包含任何业务调用顺序或固定
+阶段清单**——这是结构性保证：字段集合即唯一能力描述载体，见 test_profiles.py
+对字段名的断言。
+"""
+
+from dataclasses import dataclass
+
+from app.agent_runtime.schemas import FOUR_ACTIONS
+
+
+@dataclass(frozen=True)
+class AgentProfile:
+    """一个冻结的 Agent 能力配置。
+
+    ``allowed_actions`` 必须是四种动作协议（schemas.FOUR_ACTIONS）的子集。
+    ``output_schema`` 是短描述符：``agent_actions``（四种动作协议）/
+    ``review_decision``（approve/revise/reject，独立于动作协议）/
+    ``utility_json``（对应强类型 Utility 输出）。
+    """
+
+    name: str
+    version: str
+    allowed_actions: frozenset[str]
+    requires_reviewer: bool
+    max_context_budget: int
+    output_schema: str
+    system_prompt_key: str
+
+    def __post_init__(self) -> None:
+        if not self.allowed_actions.issubset(FOUR_ACTIONS):
+            raise ValueError(
+                f"allowed_actions must be a subset of {sorted(FOUR_ACTIONS)}; "
+                f"got {sorted(self.allowed_actions)}"
+            )
+
+    @property
+    def full_name(self) -> str:
+        """注册表键，如 ``session_analyst_v1``。"""
+        return f"{self.name}_{self.version}"
+
+
+def _make_profile(
+    name: str,
+    version: str,
+    allowed_actions: frozenset[str],
+    requires_reviewer: bool,
+    max_context_budget: int,
+    output_schema: str,
+) -> AgentProfile:
+    return AgentProfile(
+        name=name,
+        version=version,
+        allowed_actions=allowed_actions,
+        requires_reviewer=requires_reviewer,
+        max_context_budget=max_context_budget,
+        output_schema=output_schema,
+        system_prompt_key=f"{name}_{version}",
+    )
+
+
+PROFILES: dict[str, AgentProfile] = {
+    profile.full_name: profile
+    for profile in [
+        # 所有普通会话消息的入口：全部四种动作，正式产物需 Reviewer 把关。
+        _make_profile(
+            name="session_analyst",
+            version="v1",
+            allowed_actions=frozenset({"ask_user", "call_tool", "submit_review", "complete"}),
+            requires_reviewer=True,
+            max_context_budget=128_000,
+            output_schema="agent_actions",
+        ),
+        # 正式 Artifact 提交复核：只读，输出 approve/revise/reject，禁用工具。
+        _make_profile(
+            name="artifact_reviewer",
+            version="v1",
+            allowed_actions=frozenset(),
+            requires_reviewer=False,
+            max_context_budget=32_000,
+            output_schema="review_decision",
+        ),
+        # 点击圈选达人的轻量 Run：缓存/MCP 读详情后发布 kol_detail_v2。
+        # 点击触发的无澄清交互，故不允许 ask_user。
+        _make_profile(
+            name="kol_detail",
+            version="v1",
+            allowed_actions=frozenset({"call_tool", "submit_review", "complete"}),
+            requires_reviewer=True,
+            max_context_budget=32_000,
+            output_schema="agent_actions",
+        ),
+        # 标题、Run 摘要、建议等后台轻量任务：只输出受控结构，不需要 Reviewer。
+        _make_profile(
+            name="utility",
+            version="v1",
+            allowed_actions=frozenset({"complete"}),
+            requires_reviewer=False,
+            max_context_budget=8_000,
+            output_schema="utility_json",
+        ),
+    ]
+}
+
+
+def get_profile(name: str) -> AgentProfile:
+    """按全名（如 ``session_analyst_v1``）查找 Profile；未注册抛出 KeyError。"""
+    try:
+        return PROFILES[name]
+    except KeyError:
+        raise KeyError(f"unknown agent profile: {name!r}") from None
+
+
+__all__ = [
+    "AgentProfile",
+    "PROFILES",
+    "get_profile",
+]
