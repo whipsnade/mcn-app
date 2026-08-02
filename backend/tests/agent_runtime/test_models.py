@@ -42,6 +42,12 @@ def test_agent_runs_kind_and_visibility_check_constraints() -> None:
     assert checks["ck_agent_runs_visibility"] == "visibility IN ('user','internal')"
 
 
+def test_agent_runs_cancel_requested_column_is_not_nullable() -> None:
+    runs = Base.metadata.tables["agent_runs"]
+    assert "cancel_requested" in runs.c
+    assert runs.c.cancel_requested.nullable is False
+
+
 def test_agent_runs_status_lease_index() -> None:
     runs = Base.metadata.tables["agent_runs"]
     assert any(

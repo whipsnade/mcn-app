@@ -4,6 +4,7 @@ from uuid import uuid4
 
 from sqlalchemy import (
     JSON,
+    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -11,6 +12,7 @@ from sqlalchemy import (
     Integer,
     String,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.dialects.mysql import MEDIUMTEXT
 from sqlalchemy.orm import Mapped, mapped_column
@@ -92,6 +94,9 @@ class AgentRun(Base):
     prompt_snapshot_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     status: Mapped[str] = mapped_column(String(24), nullable=False, default="queued")
     outcome: Mapped[str | None] = mapped_column(String(24), nullable=True)
+    cancel_requested: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("0")
+    )
     decision_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     review_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     revision_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

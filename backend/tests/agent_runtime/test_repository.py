@@ -238,6 +238,83 @@ async def test_cancel_transitions_running_to_cancelled_and_blocks_further_transi
         await repo.transition(run_id, RunStatus.RUNNING, worker_id="worker-a")
 
 
+async def test_claim_lease_refuses_run_with_cancel_requested(
+    db_session, user_factory
+) -> None:
+    user_id, run_id = await _create_queued_run(db_session, user_factory)
+    repo = AgentRunRepository(db_session)
+    await repo.begin_attempt(run_id)
+    run = await db_session.get(AgentRun, run_id)
+    run.cancel_requested = True
+    await db_session.flush()
+
+    assert await repo.claim_lease(run_id, "worker-a", 300) is False
+    run = await db_session.get(AgentRun, run_id)
+    assert run.lease_owner is None
+
+
+async def test_request_cancel_sets_signal_and_blocks_claim(
+    db_session, user_factory
+) -> None:
+    user_id, run_id = await _create_queued_run(db_session, user_factory)
+    repo = AgentRunRepository(db_session)
+    await repo.begin_attempt(run_id)
+    await repo.claim_lease(run_id, "worker-a", 300)
+
+    assert await repo.request_cancel(run_id, user_id) is True
+    run = await db_session.get(AgentRun, run_id)
+    assert run.cancel_requested is True
+    # 信号持久化后，任何 worker 都不能再抢占该 Run
+    assert await repo.claim_lease(run_id, "worker-b", 300) is False
+
+
+async def test_request_cancel_on_terminal_run_returns_false(
+    db_session, user_factory
+) -> None:
+    user_id, run_id = await _create_queued_run(db_session, user_factory)
+    repo = AgentRunRepository(db_session)
+    await repo.begin_attempt(run_id)
+    await repo.cancel(run_id, user_id)
+
+    assert await repo.request_cancel(run_id, user_id) is False
+
+
+async def test_request_cancel_is_idempotent(db_session, user_factory) -> None:
+    user_id, run_id = await _create_queued_run(db_session, user_factory)
+    repo = AgentRunRepository(db_session)
+    await repo.begin_attempt(run_id)
+
+    assert await repo.request_cancel(run_id, user_id) is True
+    assert await repo.request_cancel(run_id, user_id) is True
+    run = await db_session.get(AgentRun, run_id)
+    assert run.cancel_requested is True
+
+
+async def test_transition_to_clarification_requested_closes_attempt(
+    db_session, user_factory
+) -> None:
+    user_id, run_id = await _create_queued_run(db_session, user_factory)
+    repo = AgentRunRepository(db_session)
+    await repo.begin_attempt(run_id)
+    await repo.claim_lease(run_id, "worker-a", 300)
+
+    run = await repo.transition(
+        run_id, RunStatus.CLARIFICATION_REQUESTED, worker_id="worker-a"
+    )
+
+    assert run.status == "clarification_requested"
+    attempts = list(
+        (
+            await db_session.scalars(
+                select(AgentRunAttempt).where(AgentRunAttempt.run_id == run_id)
+            )
+        ).all()
+    )
+    assert len(attempts) == 1
+    assert attempts[0].outcome == "completed"
+    assert attempts[0].ended_at is not None
+
+
 async def test_transition_reviewing_to_completed_is_terminal_and_releases_lease(
     db_session, user_factory
 ) -> None:

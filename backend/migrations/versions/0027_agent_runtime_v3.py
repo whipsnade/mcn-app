@@ -106,6 +106,12 @@ def upgrade() -> None:
         sa.Column("prompt_snapshot_json", sa.JSON(), nullable=True),
         sa.Column("status", sa.String(24), nullable=False),
         sa.Column("outcome", sa.String(24), nullable=True),
+        sa.Column(
+            "cancel_requested",
+            sa.Boolean(),
+            nullable=False,
+            server_default=sa.text("0"),
+        ),
         sa.Column("decision_count", sa.Integer(), nullable=False),
         sa.Column("review_count", sa.Integer(), nullable=False),
         sa.Column("revision_count", sa.Integer(), nullable=False),
