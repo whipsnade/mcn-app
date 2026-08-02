@@ -17,6 +17,7 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
+from pydantic import RootModel, TypeAdapter
 from sqlalchemy import select
 
 from app.agent_runtime.model_gateway import MAX_THINKING_TEXT_CHARS, AgentModelGateway
@@ -542,3 +543,64 @@ async def test_decide_user_run_marks_step_user_visibility(
     step = await _get_step(db_session, run.id)
     assert step is not None
     assert step.visibility == "user"
+
+
+async def test_decide_accepts_custom_decision_root_and_adapter(
+    db_session, user_factory
+) -> None:
+    """自定义输出 Schema（如 Reviewer/Utility）可复用 decide() 解析路径。"""
+
+    class _TagRoot(RootModel[dict[str, str]]):
+        pass
+
+    tag_adapter = TypeAdapter(dict[str, str])
+    run, attempt = await _create_run(db_session, user_factory)
+    gateway = _make_gateway(
+        db_session,
+        [stream_chunks(content_chunks=['{"tag":"hello"}'], reasoning_chunks=[None])],
+    )
+
+    decision = await gateway.decide(
+        run=run,
+        attempt_id=attempt.id,
+        profile=_PROFILE,
+        messages=[ChatMessage(role="user", content="hi")],
+        thinking_sink=None,
+        step_sequence=1,
+        decision_root=_TagRoot,
+        decision_adapter=tag_adapter,
+    )
+
+    assert decision == {"tag": "hello"}
+    step = await _get_step(db_session, run.id)
+    assert step is not None
+    assert step.status == "completed"
+    assert step.output_json == {"tag": "hello"}
+
+
+async def test_decide_passes_log_context_to_prompt_log(db_session, user_factory) -> None:
+    run, attempt = await _create_run(db_session, user_factory)
+    writer = _CaptureWriter()
+    adapter = TencentPlanAdapter(
+        client=FakeCompletions(
+            [stream_chunks(content_chunks=[_COMPLETE], reasoning_chunks=[None])]
+        ),
+        log_writer=writer,
+        stream_support_cache={},
+    )
+    gateway = AgentModelGateway(adapter, db=db_session)
+
+    await gateway.decide(
+        run=run,
+        attempt_id=attempt.id,
+        profile=_PROFILE,
+        messages=[ChatMessage(role="user", content="hi")],
+        thinking_sink=None,
+        step_sequence=1,
+    )
+
+    assert len(writer.entries) == 1
+    entry = writer.entries[0]
+    assert entry.user_id == run.user_id
+    assert entry.session_id == run.session_id
+    assert entry.task_id == run.id

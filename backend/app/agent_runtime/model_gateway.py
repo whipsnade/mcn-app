@@ -6,8 +6,10 @@
 - 思考流：只转发供应商实际暴露的 ``reasoning_content`` / ``<think>``，通过
   ``_GatedThinkingSink`` 延迟补发 ``started``，供应商无思考时后端不产生任何
   ``thinking.*`` 事件（spec §10.5）；
-- 动作解析：把四种动作协议（Task 5 的 ``AgentAction``）作为输出 Schema 交给
-  适配器严格校验与修复，最终经 ``AGENT_ACTION_ADAPTER`` 解析成冻结动作；
+- 动作解析：把动作/输出 Schema（默认是 Task 5 的 ``AgentAction`` 判别联合）
+  作为输出 Schema 交给适配器严格校验与修复，返回适配器已校验的 payload，
+  网关不再重复解析；自定义输出 Schema 的 Profile（Reviewer/Utility）通过
+  ``decision_root`` / ``decision_adapter`` 复用本入口；
 - Step 审计：调用前落一条 running Step，结束/失败后补齐输出、用量、请求 ID
   与脱敏 thinking（≤ 64 KiB），内部 Run 的 Step 标记 internal。
 
@@ -16,20 +18,21 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, TypeVar
 from uuid import uuid4
 
-from pydantic import RootModel
+from pydantic import BaseModel, RootModel, TypeAdapter
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_runtime.models import AgentRun, AgentStep
 from app.agent_runtime.profiles import AgentProfile
 from app.agent_runtime.prompts import get_system_prompt
-from app.agent_runtime.schemas import AGENT_ACTION_ADAPTER, AgentAction
+from app.agent_runtime.schemas import AgentAction
 from app.core.redaction import redact_for_log
 from app.model.contracts import (
     ChatMessage,
@@ -53,12 +56,22 @@ class _AgentActionRoot(RootModel[AgentAction]):
     pass
 
 
+_DecisionT = TypeVar("_DecisionT")
+
+
 def _utc_now() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
 
 
 def _elapsed_ms(started: float) -> int:
     return int((time.monotonic() - started) * 1000)
+
+
+def _output_json(decision: Any) -> Any:
+    """Step 审计输出序列化：BaseModel 实例 dump，其他（dict/str 等）原样。"""
+    if isinstance(decision, BaseModel):
+        return decision.model_dump()
+    return decision
 
 
 class _GatedThinkingSink:
@@ -111,7 +124,14 @@ class _GatedThinkingSink:
 
 
 class AgentModelGateway:
-    """每个 Profile 的模型决策统一入口：一次决策 = 一次模型调用 + 一条 Step 审计。"""
+    """每个 Profile 的模型决策统一入口：一次决策 = 一次模型调用 + 一条 Step 审计。
+
+    ``decide`` 默认走 ``AgentAction`` 判别联合（``decision_root`` 默认
+    ``_AgentActionRoot``，payload 即受控动作，无需 adapter 再转）。Reviewer
+    （approve/revise/reject）与 Utility（utility JSON）等自定义输出 Schema
+    的 Profile 传入各自的 ``decision_root``（RootModel 包装的 Schema 作为模型
+    输出约束）与可选的 ``decision_adapter``（把 root payload 转成强类型决策）。
+    """
 
     def __init__(
         self,
@@ -135,7 +155,9 @@ class AgentModelGateway:
         step_sequence: int,
         purpose: ModelPurpose = "agent_loop",
         template_name: str = "agent_loop_v1",
-    ) -> AgentAction:
+        decision_root: type[RootModel[_DecisionT]] = _AgentActionRoot,
+        decision_adapter: TypeAdapter[_DecisionT] | None = None,
+    ) -> _DecisionT:
         full_messages = self._prepend_system_prompt(profile, messages)
         # 总是带 gated sink：内部 Run 传 None 时仍走流式路径以捕获思考审计。
         gated = _GatedThinkingSink(thinking_sink)
@@ -156,36 +178,45 @@ class AgentModelGateway:
         self._db.add(step)
         await self._db.flush()
 
-        # 2) 复用适配器流式调用：只转发供应商暴露的 thinking，JSON 修复在适配器内。
+        # 2) 复用适配器流式调用：只转发供应商暴露的 thinking，JSON 修复与
+        #    Schema 严格校验都在适配器内。log_context 供 prompt 学习日志归属。
         started = time.monotonic()
         request = StructuredModelRequest(
             purpose=purpose,
             template_name=template_name,
             messages=tuple(full_messages),
-            output_model=_AgentActionRoot,
+            output_model=decision_root,
+            log_context={
+                "user_id": run.user_id,
+                "session_id": run.session_id,
+                "task_id": run.id,
+            },
             thinking_sink=gated,
         )
         try:
             result = await self._adapter.complete_json(request)
-        except BaseException:
+            # 3) 适配器已按 decision_root 严格校验过；root payload 即最终决策。
+            #    默认 AgentAction 路径直接使用，不重复解析；自定义路径可再经
+            #    decision_adapter 强类型化。
+            decision = result.value.root
+            if decision_adapter is not None:
+                decision = decision_adapter.validate_python(decision)
+        except (Exception, asyncio.CancelledError):
             # 失败/取消也必须给出 Step 终态，避免运行中快照残留。
             await self._mark_step_failed(step, started, gated)
             raise
 
-        # 3) 冻结动作协议解析（Task 5）。
-        action = AGENT_ACTION_ADAPTER.validate_python(result.value.root)
-
         # 4) 补齐 Step：输出、用量、请求 ID、脱敏 thinking。
         step.status = "completed"
         step.duration_ms = _elapsed_ms(started)
-        step.output_json = action.model_dump()
+        step.output_json = _output_json(decision)
         step.token_usage_json = (
             result.usage.model_dump() if result.usage is not None else None
         )
         step.model_request_id = result.request_id
         step.thinking_text = self._finalize_thinking(gated)
         await self._db.flush()
-        return action
+        return decision
 
     def _prepend_system_prompt(
         self, profile: AgentProfile, messages: list[ChatMessage]
