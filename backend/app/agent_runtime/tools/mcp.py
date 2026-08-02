@@ -30,6 +30,7 @@ from uuid import uuid4
 
 from pydantic import BaseModel
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_runtime.circuit_breaker import FineGrainedCircuitBreaker
@@ -271,8 +272,10 @@ class AgentMcpTool:
             arguments_hash=args_hash,
             status="planned",
         )
-        self._db.add(row)
-        # 外发前持久化：行 + 预留原子落库；余额不足不落预留。
+        # 外发前持久化：先预留积分。行对象暂不加入会话——WalletService 内部查询会
+        # 触发 autoflush，若先把行加入会话，余额不足抛错后 savepoint 回滚无法保证
+        # 清掉 pending 行（会被后续查询的 autoflush 重新 flush，撞唯一约束）。因此
+        # 余额不足路径天然不残留任何 planned 行（Fix 4）。
         try:
             async with _db_transaction(self._db):
                 await self._accounting.reserve(context.user_id, row)
@@ -282,8 +285,20 @@ class AgentMcpTool:
                 safe_summary="insufficient points for MCP call",
                 error_type=DEFINITELY_NOT_SENT,
             )
-        async with _db_transaction(self._db):
-            await self._accounting.mark_running(row)
+        # 预留成功：行 + running 状态原子落库（durable-before-send）。
+        self._db.add(row)
+        try:
+            async with _db_transaction(self._db):
+                await self._accounting.mark_running(row)
+        except IntegrityError:
+            # 并发窗口 TOCTOU：另一调用先插入了相同 logical_call_id（§17.2）。
+            # 唯一约束失败视为已存在 → 幂等复用其行，绝不重发。
+            if row in self._db:
+                self._db.expunge(row)
+            existing = await self._by_logical_call_id(logical_call_id)
+            if existing is not None:
+                return await self._replay(existing)
+            raise
 
         try:
             result = await self._transport.call_tool(
@@ -293,7 +308,7 @@ class AgentMcpTool:
             return await self._finalize_unknown(row, normalized, message=self._error_message(exc))
         except _PRE_CONNECTION_ERRORS as exc:
             return await self._finalize_definitely_not_sent(
-                row, context, message=self._error_message(exc)
+                row, context, normalized, message=self._error_message(exc)
             )
         except Exception as exc:
             return await self._finalize_unknown(row, normalized, message=self._error_message(exc))
@@ -487,8 +502,20 @@ class AgentMcpTool:
         return ToolResult(status="unknown", safe_summary=message, error_type=RESULT_UNKNOWN)
 
     async def _finalize_definitely_not_sent(
-        self, row: AgentToolCall, context: ToolContext, *, message: str
+        self,
+        row: AgentToolCall,
+        context: ToolContext,
+        normalized: Mapping[str, Any],
+        *,
+        message: str,
     ) -> ToolResult:
+        # 外发前失败同样是上游健康信号：记录到细粒度熔断键，避免对同一调用反复
+        # 撞入断连。半开探测失败时 record_failure 会重新打开并清掉 probe_in_flight，
+        # 该键不会被永久卡死（见 circuit_breaker.allow 的 half-open 语义）。
+        # 注意：熔断打开与余额不足两条路径都提前 return，不会走到这里。
+        self._breaker.record_failure(
+            service=self._service.value, internal_tool_name=self.name, arguments=normalized
+        )
         async with _db_transaction(self._db):
             await self._accounting.release(
                 context.user_id, row, error_type=DEFINITELY_NOT_SENT, message=message

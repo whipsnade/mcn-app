@@ -40,6 +40,7 @@ from app.agent_runtime.tools.mcp import (
     logical_call_id_for,
 )
 from app.agent_runtime.tools.registry import ToolRegistry
+from app.billing.models import Wallet
 from app.billing.service import WalletService
 from app.mcp_gateway.contracts import DataTapService
 from app.mcp_gateway.transport import (
@@ -174,6 +175,27 @@ def _context(session: AgentSession, run: AgentRun, step: AgentStep, user_id: str
         profile_name="session_analyst_v1",
         step_id=step.id,
     )
+
+
+async def _make_extra_steps(
+    db_session, run: AgentRun, attempt: AgentRunAttempt, *, count: int, start_sequence: int = 2
+) -> list[AgentStep]:
+    """额外创建多个 step：不同 step_id → 不同 logical_call_id，但共享熔断键。"""
+    steps: list[AgentStep] = []
+    for sequence in range(start_sequence, start_sequence + count):
+        step = AgentStep(
+            id=str(uuid4()),
+            run_id=run.id,
+            attempt_id=attempt.id,
+            sequence=sequence,
+            step_type="tool_call",
+            status="running",
+            created_at=_now(),
+        )
+        db_session.add(step)
+        steps.append(step)
+    await db_session.flush()
+    return steps
 
 
 def _bridge(
@@ -619,3 +641,134 @@ async def test_reconcile_confirms_success_settles_and_writes_evidence(
         )
     )
     assert reconciliation.decision == "confirm_success"
+
+
+# ---------------------------------------------------------------------------
+# 6. 外发前失败也记录到细粒度熔断键（Fix 1）
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_connection_errors_trip_fine_grained_breaker(db_session, user_factory) -> None:
+    """外发前错误（connection）必须计入细粒度熔断键，否则相同调用会反复撞入断连。"""
+    user = await _funded_user(db_session, user_factory)
+    session, run, step = await _make_chain(db_session, user.id)
+    attempt = await db_session.scalar(
+        select(AgentRunAttempt).where(AgentRunAttempt.run_id == run.id)
+    )
+    steps = [step] + await _make_extra_steps(db_session, run, attempt, count=3)
+    breaker = FineGrainedCircuitBreaker(failure_threshold=3, reset_seconds=60)
+    transport = FakeMcpTransport([McpConnectionTimeout("connect timeout")] * 3)
+    bridge = _bridge(db_session, transport, breaker=breaker)
+
+    for index in range(3):
+        result = await bridge.execute(
+            _context(session, run, steps[index], user.id), {"keyword": "美妆"}
+        )
+        assert result.error_type == "definitely_not_sent"
+    assert len(transport.calls) == 3
+
+    # 熔断键已打开：相同调用被拦截，不再外发
+    assert (
+        breaker.allow(DataTapService.INSIGHT_CUBE.value, INTERNAL_NAME, {"keyword": "美妆"})
+        is False
+    )
+    blocked = await bridge.execute(
+        _context(session, run, steps[3], user.id), {"keyword": "美妆"}
+    )
+    assert blocked.error_type == "definitely_not_sent"
+    assert len(transport.calls) == 3
+
+
+@pytest.mark.asyncio
+async def test_half_open_probe_connection_error_does_not_wedge_key(
+    db_session, user_factory
+) -> None:
+    """半开探测以外发前错误失败后，键重新打开而非永久卡死（Fix 1 (b)）。"""
+    now = [100.0]
+    user = await _funded_user(db_session, user_factory)
+    session, run, step = await _make_chain(db_session, user.id)
+    attempt = await db_session.scalar(
+        select(AgentRunAttempt).where(AgentRunAttempt.run_id == run.id)
+    )
+    steps = [step] + await _make_extra_steps(db_session, run, attempt, count=5)
+    breaker = FineGrainedCircuitBreaker(
+        failure_threshold=3, reset_seconds=30.0, clock=lambda: now[0]
+    )
+    transport = FakeMcpTransport(
+        [McpConnectionTimeout("connect timeout")] * 4 + [_ok_result()]
+    )
+    bridge = _bridge(db_session, transport, breaker=breaker)
+
+    for index in range(3):
+        result = await bridge.execute(
+            _context(session, run, steps[index], user.id), {"keyword": "美妆"}
+        )
+        assert result.error_type == "definitely_not_sent"
+
+    # 越过复位窗口 → 半开探测放行；探测以外发前错误失败
+    now[0] += 40.0
+    probe = await bridge.execute(
+        _context(session, run, steps[3], user.id), {"keyword": "美妆"}
+    )
+    assert probe.error_type == "definitely_not_sent"
+    assert len(transport.calls) == 4
+
+    # 键未被永久卡死：复位窗口内再次拒绝（重新打开，probe_in_flight 已清）
+    assert (
+        breaker.allow(DataTapService.INSIGHT_CUBE.value, INTERNAL_NAME, {"keyword": "美妆"})
+        is False
+    )
+    blocked = await bridge.execute(
+        _context(session, run, steps[4], user.id), {"keyword": "美妆"}
+    )
+    assert blocked.error_type == "definitely_not_sent"
+    assert len(transport.calls) == 4
+
+    # 越过新的复位窗口后，合法调用可继续外发
+    now[0] += 40.0
+    ok = await bridge.execute(
+        _context(session, run, steps[5], user.id), {"keyword": "美妆"}
+    )
+    assert ok.status == "success"
+    assert len(transport.calls) == 5
+
+
+# ---------------------------------------------------------------------------
+# 7. 余额不足：无残留 planned 行，充值后可重试（Fix 4）
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_insufficient_balance_leaves_no_dangling_row_and_retry_proceeds(
+    db_session, user_factory
+) -> None:
+    user = await user_factory()
+    now = _now()
+    db_session.add(Wallet(user_id=user.id, balance=0, reserved=0, version=0, updated_at=now))
+    await db_session.flush()
+    session, run, step = await _make_chain(db_session, user.id)
+    transport = FakeMcpTransport([_ok_result()])
+    bridge = _bridge(db_session, transport)
+
+    result = await bridge.execute(_context(session, run, step, user.id), {"keyword": "美妆"})
+    assert result.status == "failed"
+    assert result.error_type == "definitely_not_sent"
+    # 无残留 planned 行、未外发
+    rows = (
+        await db_session.scalars(
+            select(AgentToolCall).where(AgentToolCall.run_id == run.id)
+        )
+    ).all()
+    assert rows == []
+    assert transport.calls == []
+
+    # 充值后同一 logical_call_id 可重试并成功
+    wallet = await db_session.get(Wallet, user.id)
+    wallet.balance = 100
+    await db_session.flush()
+    retry = await bridge.execute(_context(session, run, step, user.id), {"keyword": "美妆"})
+    assert retry.status == "success"
+    assert len(transport.calls) == 1
+    row = await _only_row(db_session, run.id)
+    assert row.status == "settled"

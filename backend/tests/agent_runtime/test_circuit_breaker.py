@@ -87,3 +87,30 @@ def test_record_success_resets_open_state() -> None:
     assert breaker.allow("insight-cube-mcp", _TREND, arguments) is False
     breaker.record_success("insight-cube-mcp", _TREND, arguments)
     assert breaker.allow("insight-cube-mcp", _TREND, arguments) is True
+
+
+def test_half_open_probe_failure_reopens_key_not_wedged() -> None:
+    """半开探测失败（如外发前错误）后，record_failure 必须重新打开并清掉
+    probe_in_flight；该键不得被永久卡死（Fix 1 (b)）。"""
+    now = [100.0]
+    breaker = FineGrainedCircuitBreaker(
+        failure_threshold=3, reset_seconds=30.0, clock=lambda: now[0]
+    )
+    arguments = _args()
+
+    # 打开熔断键
+    for _ in range(3):
+        breaker.record_failure("insight-cube-mcp", _TREND, arguments)
+    assert breaker.allow("insight-cube-mcp", _TREND, arguments) is False
+
+    # 越过复位窗口 → 半开探测放行
+    now[0] += 40.0
+    assert breaker.allow("insight-cube-mcp", _TREND, arguments) is True
+
+    # 探测失败 → 重新打开（opened_at 刷新、probe_in_flight 清掉），非永久卡死
+    breaker.record_failure("insight-cube-mcp", _TREND, arguments)
+    assert breaker.allow("insight-cube-mcp", _TREND, arguments) is False
+
+    # 越过新的复位窗口后，合法探测可继续
+    now[0] += 40.0
+    assert breaker.allow("insight-cube-mcp", _TREND, arguments) is True

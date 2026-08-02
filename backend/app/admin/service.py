@@ -512,6 +512,10 @@ class AdminService:
         - confirm_failure：释放预留；
         - keep_unknown：保持 reserved/unknown 并追加核对审计。
         终态（settled/failed）重放幂等：按当前状态返回，不再改钱包或重复审计。
+
+        注意：Idempotency-Key 目前仅记录进审计日志，去重依赖终态守卫 + 钱包
+        幂等键（agent-mcp:{logical_call_id}:{settle|release}）。完整的
+        Idempotency-Key 级去重延后到 Task 24 恢复循环接线 reconciler 时实现。
         """
         call = await self.db.get(AgentToolCall, call_id)
         if call is None:
@@ -613,11 +617,14 @@ class AdminService:
 
     @staticmethod
     def _scope_from_arguments(arguments: dict[str, Any] | None) -> dict[str, Any] | None:
+        """只提取 scope 相关键作为 scope_json；无匹配键时返回 None（与
+        agent_runtime.tools.mcp._extract_scope_period 保持一致，不把完整参数
+        当 scope 存储）。"""
         if not arguments:
             return None
         keys = ("scope", "brand", "keyword", "platform", "datasource")
         scope = {key: value for key, value in arguments.items() if key in keys}
-        return scope or arguments
+        return scope or None
 
     def _append_admin_reconciliation(
         self, call: AgentToolCall, decision: str, admin_id: str, note: str | None
