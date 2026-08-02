@@ -11,6 +11,7 @@ from app.agent_artifacts.payloads.common import (
     ArtifactPayloadBase,
     NarrativeFinding,
     OptionalHttpUrl,
+    UniqueKeyValidator,
 )
 
 
@@ -57,13 +58,20 @@ class KolAudienceDistribution(BaseModel):
     share: float | None
 
 
-class KolAudience(BaseModel):
+class KolAudience(UniqueKeyValidator):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     gender_distribution: tuple[KolAudienceDistribution, ...] = Field(default_factory=tuple)
     age_distribution: tuple[KolAudienceDistribution, ...] = Field(default_factory=tuple)
     region_distribution: tuple[KolAudienceDistribution, ...] = Field(default_factory=tuple)
     interest_distribution: tuple[KolAudienceDistribution, ...] = Field(default_factory=tuple)
+
+    STABLE_KEYS = {
+        "gender_distribution": ("key",),
+        "age_distribution": ("key",),
+        "region_distribution": ("key",),
+        "interest_distribution": ("key",),
+    }
 
 
 class KolTrendItem(BaseModel):

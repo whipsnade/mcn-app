@@ -961,3 +961,128 @@ def test_insight_requires_module_title_scope_parent() -> None:
         del d[key]
         with pytest.raises(ValidationError):
             InsightBoardV1.model_validate(d)
+
+
+# ---------------------------------------------------------------- stable-key uniqueness
+
+
+def test_kol_selection_items_duplicate_kol_uid_rejected() -> None:
+    d = build_kol_selection_dict()
+    item = d["data"]["items"][0]
+    dup = item.copy()
+    dup["rank"] = 2  # same platform + kol_uid
+    d["data"]["items"] = [item, dup]
+    with pytest.raises(ValidationError):
+        KolSelectionV3.model_validate(d)
+
+
+def test_kol_selection_items_distinct_pass() -> None:
+    d = build_kol_selection_dict()
+    item = d["data"]["items"][0]
+    other = item.copy()
+    other["rank"] = 2
+    other["kol_uid"] = "k2"
+    d["data"]["items"] = [item, other]
+    assert len(KolSelectionV3.model_validate(d).data.items) == 2
+
+
+def test_brand_top_posts_duplicate_post_id_rejected() -> None:
+    d = build_brand_dict()
+    d["data"]["top_posts"] = [_top_post("p1"), _top_post("p1")]
+    with pytest.raises(ValidationError):
+        BrandReportV3.model_validate(d)
+
+
+def test_brand_top_posts_distinct_pass() -> None:
+    d = build_brand_dict()
+    d["data"]["top_posts"] = [_top_post("p1"), _top_post("p2")]
+    assert len(BrandReportV3.model_validate(d).data.top_posts) == 2
+
+
+def test_campaign_top_posts_duplicate_post_id_rejected() -> None:
+    d = build_campaign_dict()
+    d["data"]["top_posts"] = [_top_post("p1"), _top_post("p1")]
+    with pytest.raises(ValidationError):
+        CampaignReportV2.model_validate(d)
+
+
+def test_campaign_kol_contributions_duplicate_kol_uid_rejected() -> None:
+    d = build_campaign_dict()
+    row = d["data"]["kol_contributions"][0]
+    d["data"]["kol_contributions"] = [row, row.copy()]
+    with pytest.raises(ValidationError):
+        CampaignReportV2.model_validate(d)
+
+
+def test_brand_section_arrays_duplicate_keys_rejected() -> None:
+    d = build_brand_dict()
+    d["data"]["regions"] = [
+        {"region": "上海", "volume": 300, "share": 0.3, "sentiment_score": 0.7}
+    ] * 2
+    with pytest.raises(ValidationError):
+        BrandReportV3.model_validate(d)
+
+    d2 = build_brand_dict()
+    d2["data"]["topics"] = [
+        {"topic": "咖啡", "volume": 500, "engagement": 2500, "sentiment_score": 0.6}
+    ] * 2
+    with pytest.raises(ValidationError):
+        BrandReportV3.model_validate(d2)
+
+
+def test_kol_analysis_distribution_duplicate_key_rejected() -> None:
+    d = build_kol_analysis_dict()
+    d["data"]["platform_distribution"] = [{"key": "xhs", "label": "小红书", "count": 5, "share": 1.0}] * 2
+    with pytest.raises(ValidationError):
+        KolAnalysisV2.model_validate(d)
+
+
+def test_kol_detail_audience_duplicate_key_rejected() -> None:
+    d = build_kol_detail_dict()
+    d["data"]["audience"]["gender_distribution"] = [
+        {"key": "f", "label": "女", "value": 60000, "share": 0.6}
+    ] * 2
+    with pytest.raises(ValidationError):
+        KolDetailV2.model_validate(d)
+
+
+def test_insight_table_duplicate_columns_rejected() -> None:
+    d = build_insight_dict()
+    d["data"].append(
+        {
+            "block_type": "table",
+            "title": "表",
+            "columns": ["col_a", "col_b", "col_a"],
+            "rows": [["1", "2", "3"]],
+        }
+    )
+    with pytest.raises(ValidationError):
+        InsightBoardV1.model_validate(d)
+
+
+# ---------------------------------------------------------------- brand comparison invariant
+
+
+def test_brand_comparison_not_requested_must_have_no_metrics() -> None:
+    d = build_brand_dict()
+    d["data"]["comparisons"]["yoy"]["status"] = "not_requested"
+    d["data"]["comparisons"]["yoy"]["metrics"] = [
+        {"metric": "total_volume", "current": 1000, "baseline": 800, "delta": 200, "rate": 0.25}
+    ]
+    with pytest.raises(ValidationError):
+        BrandReportV3.model_validate(d)
+
+
+def test_brand_comparison_present_requires_metrics() -> None:
+    d = build_brand_dict()
+    d["data"]["comparisons"]["mom"]["status"] = "complete"
+    d["data"]["comparisons"]["mom"]["metrics"] = []
+    with pytest.raises(ValidationError):
+        BrandReportV3.model_validate(d)
+
+
+def test_brand_comparison_not_requested_without_metrics_passes() -> None:
+    inst = BrandReportV3.model_validate(build_brand_dict())
+    assert inst.data.comparisons.yoy.status == "not_requested"
+    assert inst.data.comparisons.yoy.metrics == ()
+    assert len(inst.data.comparisons.mom.metrics) == 1

@@ -16,6 +16,7 @@ from app.agent_artifacts.payloads.common import (
     ArtifactPayloadBase,
     DistributionItem,
     OptionalHttpUrl,
+    UniqueKeyValidator,
 )
 
 SCORE_DIMENSIONS = (
@@ -150,12 +151,16 @@ class KolSelectionSummary(BaseModel):
     rating_distribution: tuple[DistributionItem, ...] = Field(default_factory=tuple)
 
 
-class KolSelectionData(BaseModel):
+class KolSelectionData(UniqueKeyValidator):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     scoring: ScoringConfig
     items: tuple[KolSelectionItem, ...] = Field(default_factory=tuple, max_length=20)
     summary: KolSelectionSummary
+
+    STABLE_KEYS = {
+        "items": ("platform", "kol_uid"),
+    }
 
 
 class KolSelectionNote(BaseModel):

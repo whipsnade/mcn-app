@@ -10,9 +10,14 @@ from __future__ import annotations
 from datetime import date
 from typing import Annotated, Literal, Union
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from app.agent_artifacts.payloads.common import ArtifactPayloadBase, HttpUrl, Period
+from app.agent_artifacts.payloads.common import (
+    ArtifactPayloadBase,
+    HttpUrl,
+    Period,
+    validate_unique,
+)
 
 ScalarCell = int | float | str
 
@@ -56,6 +61,11 @@ class TableBlock(BaseModel):
     title: str
     columns: tuple[str, ...] = Field(default_factory=tuple, max_length=20)
     rows: tuple[tuple[ScalarCell, ...], ...] = Field(default_factory=tuple, max_length=200)
+
+    @model_validator(mode="after")
+    def _validate_unique_columns(self) -> TableBlock:
+        validate_unique(self.columns, (), "table.columns")
+        return self
 
 
 class ChartSeries(BaseModel):

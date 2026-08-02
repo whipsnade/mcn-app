@@ -16,7 +16,7 @@ Every payload is a frozen Pydantic contract with `extra="forbid"`:
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import Annotated, Any, ClassVar, Literal
+from typing import Annotated, Any, ClassVar, Literal, Sequence
 from urllib.parse import urlsplit
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, model_validator
@@ -212,6 +212,37 @@ def _has_covering_limitation(limitations: tuple[Limitation, ...], path: str) -> 
         or path in limitation.affected_paths
         for limitation in limitations
     )
+
+
+def validate_unique(items: Sequence[Any], key_fields: Sequence[str], label: str) -> None:
+    """Reject duplicate stable-business keys within a sequence of items.
+
+    Array items carry stable business keys (spec §12.1); duplicates are schema
+    errors. With empty `key_fields` the item itself is the key (e.g. column
+    headers of an insight table).
+    """
+    seen: set[Any] = set()
+    for item in items:
+        key: Any = item if not key_fields else tuple(getattr(item, field) for field in key_fields)
+        if key in seen:
+            raise ValueError(f"duplicate stable key {key!r} in {label}")
+        seen.add(key)
+
+
+class UniqueKeyValidator(BaseModel):
+    """Mixin enforcing stable-business-key uniqueness across tuple fields.
+
+    Subclasses declare `STABLE_KEYS: dict[field_name, tuple[key_field, ...]]`;
+    every tuple field listed is checked for duplicates after validation.
+    """
+
+    STABLE_KEYS: ClassVar[dict[str, tuple[str, ...]]] = {}
+
+    @model_validator(mode="after")
+    def _validate_stable_keys(self) -> UniqueKeyValidator:
+        for field_name, key_fields in self.STABLE_KEYS.items():
+            validate_unique(getattr(self, field_name), key_fields, field_name)
+        return self
 
 
 class ArtifactPayloadBase(BaseModel):

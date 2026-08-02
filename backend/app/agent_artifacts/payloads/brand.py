@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import date
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.agent_artifacts.payloads.common import (
     ArtifactPayloadBase,
@@ -15,6 +15,7 @@ from app.agent_artifacts.payloads.common import (
     Period,
     SentimentSection,
     TopPost,
+    UniqueKeyValidator,
 )
 
 
@@ -65,6 +66,16 @@ class Comparison(BaseModel):
     status: Literal["not_requested", "complete", "partial", "unavailable"]
     baseline_period: Period | None = None
     metrics: tuple[ComparisonMetric, ...] = Field(default_factory=tuple)
+
+    @model_validator(mode="after")
+    def _validate_requested_invariant(self) -> Comparison:
+        """Spec §12.1: an unrequested comparison is not_requested and has no metrics."""
+        if self.status == "not_requested":
+            if self.metrics:
+                raise ValueError("status=not_requested comparison must have no metrics")
+        elif not self.metrics:
+            raise ValueError(f"comparison with status={self.status!r} must have metrics")
+        return self
 
 
 class BrandComparisons(BaseModel):
@@ -125,7 +136,7 @@ class TopicItem(BaseModel):
     sentiment_score: float | None
 
 
-class BrandData(BaseModel):
+class BrandData(UniqueKeyValidator):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     overview: BrandOverview
@@ -138,6 +149,15 @@ class BrandData(BaseModel):
     regions: tuple[RegionItem, ...] = Field(default_factory=tuple)
     topics: tuple[TopicItem, ...] = Field(default_factory=tuple)
     top_posts: tuple[TopPost, ...] = Field(default_factory=tuple, max_length=20)
+
+    STABLE_KEYS = {
+        "top_posts": ("platform", "post_id"),
+        "regions": ("region",),
+        "topics": ("topic",),
+        "content_types": ("platform", "type"),
+        "creator_tiers": ("platform", "tier"),
+        "organic_vs_paid": ("platform", "kind"),
+    }
 
 
 class BrandNarrative(BaseModel):

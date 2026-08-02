@@ -10,6 +10,7 @@ from app.agent_artifacts.payloads.common import (
     ArtifactPayloadBase,
     DistributionItem,
     NarrativeFinding,
+    UniqueKeyValidator,
 )
 
 
@@ -57,7 +58,7 @@ class TopKolItem(BaseModel):
     rating: str
 
 
-class KolAnalysisData(BaseModel):
+class KolAnalysisData(UniqueKeyValidator):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     summary: KolAnalysisSummary
@@ -68,6 +69,14 @@ class KolAnalysisData(BaseModel):
     region_distribution: tuple[DistributionItem, ...] = Field(default_factory=tuple)
     kol_trend: tuple[KolTrendItem, ...] = Field(default_factory=tuple, max_length=20)
     top_kols: tuple[TopKolItem, ...] = Field(default_factory=tuple, max_length=20)
+
+    STABLE_KEYS = {
+        "platform_distribution": ("key",),
+        "rating_distribution": ("key",),
+        "follower_distribution": ("key",),
+        "engagement_distribution": ("key",),
+        "region_distribution": ("key",),
+    }
 
 
 class KolAnalysisNarrative(BaseModel):

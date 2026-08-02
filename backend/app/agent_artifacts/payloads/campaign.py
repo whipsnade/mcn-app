@@ -15,6 +15,7 @@ from app.agent_artifacts.payloads.common import (
     Period,
     SentimentSection,
     TopPost,
+    UniqueKeyValidator,
 )
 
 
@@ -71,7 +72,7 @@ class KolContribution(BaseModel):
     contribution_share: float | None
 
 
-class CampaignData(BaseModel):
+class CampaignData(UniqueKeyValidator):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     overview: CampaignOverview
@@ -81,6 +82,11 @@ class CampaignData(BaseModel):
     content_types: tuple[ContentTypeItem, ...] = Field(default_factory=tuple)
     sentiment: SentimentSection
     top_posts: tuple[TopPost, ...] = Field(default_factory=tuple, max_length=20)
+
+    STABLE_KEYS = {
+        "top_posts": ("platform", "post_id"),
+        "kol_contributions": ("platform", "kol_uid"),
+    }
 
 
 class PhaseReview(BaseModel):
