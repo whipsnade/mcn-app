@@ -32,6 +32,16 @@ class CreateDraftArgs(BaseModel):
     parent_artifact_version_id: str | None = None
 
 
+_ARTIFACT_MODULES = {
+    "brand": ("brand_report_v3", {"brand": "品牌名"}),
+    "campaign": ("campaign_report_v2", {"brand": "品牌名", "campaign": "活动名"}),
+    "kol-selection": ("kol_selection_v3", {"scope": "圈选条件对象（品牌/平台/粉丝要求等）"}),
+    "kol-analysis": ("kol_analysis_v2", {"selection_artifact_id": "父圈选名单 Artifact id"}),
+    "kol-detail": ("kol_detail_v2", {"platform": "平台", "kol_uid": "达人 uid"}),
+    "insight": ("insight_board_v1", {"parent_artifact_version_id": "父已发布 Version id", "question": "钻取问题"}),
+}
+
+
 class CreateDraftTool:
     """创建（或复用稳定身份后继续）一个 Artifact Draft。
 
@@ -39,6 +49,18 @@ class CreateDraftTool:
     不能直接指定数据库 key（设计 §8.1）。子 Artifact（如 kol_analysis_v2）通过
     ``parent_artifact_version_id`` 固定到当时的父 Version。
     """
+
+    description = (
+        "持久化一个强类型 Artifact Draft（正式产物，提交后经 Reviewer 审核发布）。"
+        "可用 module → (schema_version, business_fields) 对照："
+        + ", ".join(
+            f"{module}:{schema}(business_fields={list(fields)})"
+            for module, (schema, fields) in _ARTIFACT_MODULES.items()
+        )
+        + "。artifact_type 与 schema_version 相同。payload 必须满足对应 schema；"
+        "payload 中 data 下的每个业务数值都必须有一条 evidence_refs 条目（LineageRef："
+        "artifact_path 为 RFC6901 JSON Pointer，sources 指向当前会话 evidence_id 的字段）。"
+    )
 
     name = "create_draft"
     input_model = CreateDraftArgs

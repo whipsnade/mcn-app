@@ -1,0 +1,214 @@
+{
+  "generated_at": "2026-08-02T22:13:41.057955",
+  "env": {
+    "app_env": "test",
+    "mysql_database": "kol_insight_test",
+    "auth_mode": "mock"
+  },
+  "scenarios": [
+    {
+      "scenario": "clarification",
+      "prompt_tag": "帮我分析一下某个品牌的声量和情感，但我不确定具体要分析哪个品牌。",
+      "profile": "session_analyst_v1",
+      "run_id": "bd564481-e656-4a11-ab1c-30ee143e8788",
+      "status": "clarification_requested",
+      "decision_count": 1,
+      "points_before": 1000,
+      "points_after": 1000,
+      "wallet_tx_summary": [],
+      "calls": [],
+      "steps": [],
+      "artifact_versions": [],
+      "assistant_summary": [
+        {
+          "type": "clarification",
+          "content_prefix": "请问您想分析哪个品牌？可以告诉我品牌名称，我来帮您匹配标准标签并进行声量和情感分析。"
+        }
+      ],
+      "unknown_reconciled": false,
+      "limitations": []
+    },
+    {
+      "scenario": "kol_detail",
+      "prompt_tag": "kol_detail_v2 + 24h cache（确定性命中）",
+      "profile": "kol_detail_v1",
+      "run_id": "",
+      "status": "completed",
+      "decision_count": 0,
+      "points_before": 1000,
+      "points_after": 1000,
+      "wallet_tx_summary": [],
+      "calls": [],
+      "steps": [],
+      "artifact_versions": [],
+      "assistant_summary": [],
+      "unknown_reconciled": false,
+      "limitations": [
+        "kol_detail_v1 Profile 未允许 MCP_TOOLS，生产接线无法触达真实 kol_detail MCP 工具"
+      ]
+    },
+    {
+      "scenario": "trend_504_continue",
+      "prompt_tag": "504 后继续其他工具（确定性）",
+      "profile": "session_analyst_v1",
+      "run_id": "24434e31-961e-4d8b-b9d7-d7e5a02a9941",
+      "status": "completed",
+      "decision_count": 3,
+      "points_before": 1000,
+      "points_after": 990,
+      "wallet_tx_summary": [
+        {
+          "kind": "reserve",
+          "balance_delta": -10,
+          "reserved_delta": 10
+        }
+      ],
+      "calls": [
+        {
+          "tool_call_id": "c78dd608-ddf0-4a5d-b898-072c42a3b2f4",
+          "internal_tool_name": "social_statistic_trend",
+          "status": "unknown",
+          "error_type": "result_unknown",
+          "points_reserved": 10,
+          "points_settled": 0,
+          "service": "insight-cube-mcp"
+        },
+        {
+          "tool_call_id": "e11a92a4-b2f0-450f-addc-2edbab32f156",
+          "internal_tool_name": "calculate_expression",
+          "status": "settled",
+          "error_type": null,
+          "points_reserved": 0,
+          "points_settled": 0,
+          "service": "internal"
+        }
+      ],
+      "steps": [
+        {
+          "sequence": 2,
+          "internal_tool_name": "social_statistic_trend",
+          "status": "failed",
+          "error_type": "result_unknown"
+        },
+        {
+          "sequence": 4,
+          "internal_tool_name": "calculate_expression",
+          "status": "completed",
+          "error_type": null
+        }
+      ],
+      "artifact_versions": [],
+      "assistant_summary": [
+        {
+          "type": "completion",
+          "content_prefix": "完成分析"
+        }
+      ],
+      "unknown_reconciled": false,
+      "limitations": [
+        "unknown call social_statistic_trend lacks reconciliation audit row"
+      ]
+    },
+    {
+      "scenario": "wallet_insufficient",
+      "prompt_tag": "请分析瑞幸咖啡最近一个月的品牌声量。",
+      "profile": "session_analyst_v1",
+      "run_id": "abdedea1-b286-4c7d-ba0c-4745ec312681",
+      "status": "clarification_requested",
+      "decision_count": 2,
+      "points_before": 5,
+      "points_after": 5,
+      "wallet_tx_summary": [
+        {
+          "kind": "reserve",
+          "balance_delta": -10,
+          "reserved_delta": 10
+        }
+      ],
+      "calls": [],
+      "steps": [
+        {
+          "sequence": 2,
+          "internal_tool_name": "match_best_tag",
+          "status": "failed",
+          "error_type": "definitely_not_sent"
+        }
+      ],
+      "artifact_versions": [],
+      "assistant_summary": [
+        {
+          "type": "clarification",
+          "content_prefix": "很抱歉，当前账户积分为 5，而品牌声量分析所需的 MCP 数据查询工具每次调用需消耗 10 积分，积分不足无法执行查询。请问您是否可以先充值积分后再发起分析？或者您有其他不需要消耗积分的问题我可以协助？"
+        }
+      ],
+      "unknown_reconciled": false,
+      "limitations": []
+    },
+    {
+      "scenario": "reviewer_revise",
+      "prompt_tag": "submit_review → revise → fix → approve → publish",
+      "profile": "session_analyst_v1",
+      "run_id": "d7613f1e-bc21-4032-8c7e-b3223cb90847",
+      "status": "completed",
+      "decision_count": 4,
+      "points_before": 1000,
+      "points_after": 1000,
+      "wallet_tx_summary": [
+        {
+          "kind": "reserve",
+          "balance_delta": -10,
+          "reserved_delta": 10
+        }
+      ],
+      "calls": [
+        {
+          "tool_call_id": "758e31d0-59cd-4e83-a42b-87b24f27066a",
+          "internal_tool_name": "query_analysis_data",
+          "status": "settled",
+          "error_type": null,
+          "points_reserved": 0,
+          "points_settled": 10,
+          "service": "insight-cube-mcp"
+        }
+      ],
+      "steps": [
+        {
+          "sequence": 1,
+          "internal_tool_name": "query_analysis_data",
+          "status": "completed",
+          "error_type": null
+        },
+        {
+          "sequence": 3,
+          "internal_tool_name": "create_draft",
+          "status": "completed",
+          "error_type": null
+        },
+        {
+          "sequence": 6,
+          "internal_tool_name": "update_draft",
+          "status": "completed",
+          "error_type": null
+        }
+      ],
+      "artifact_versions": [
+        {
+          "artifact_id": "5232d082-e211-4fad-9544-9297a838bc16",
+          "version": 1,
+          "schema_version": "brand_report_v3",
+          "data_status": "complete",
+          "lineage_ok": true,
+          "lineage_error": null
+        }
+      ],
+      "assistant_summary": [
+        {
+          "type": "completion",
+          "content_prefix": "品牌分析报告已完成"
+        }
+      ],
+      "unknown_reconciled": false,
+      "limitations": []
+    }
+  ]
+}

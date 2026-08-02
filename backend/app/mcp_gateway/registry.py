@@ -190,9 +190,13 @@ class ToolRegistryService:
             for service, tools in DYNAMIC_TOOL_ALLOWLIST.items()
             for remote, (internal_name, description, output_schema) in tools.items()
         }
+        # UAT 发现：实时 DataTap 网关以审核内部名（allowlist key）暴露工具，
+        # allowlist 值里的旧式 remote_name 已与网关不同步。remote_name 一律取
+        # 内部名，保证 legacy require_enabled 路径与 AgentMcpTool 一致。
         self._dynamic_by_internal = {
-            internal_name: (service, remote, description, output_schema)
-            for (service, remote), (internal_name, description, output_schema) in self._dynamic_by_remote.items()
+            internal_name: (service, internal_name, description, output_schema)
+            for (service, internal_name), (_stale_remote, description, output_schema)
+            in self._dynamic_by_remote.items()
         }
 
     async def refresh_service(self, service: DataTapService) -> DiscoveryReport:
@@ -370,7 +374,12 @@ class ToolRegistryService:
         approved: list[str],
         quarantined: list[str],
     ) -> None:
-        internal_name, description, _output_schema = self._dynamic_by_remote[(service, tool.name)]
+        # ``_dynamic_by_remote`` 以审核 allowlist 的内部工具名为键（DataTap 网关
+        # 实际以该内部名暴露工具），值为 ``(remote_name, description, output_schema)``。
+        # 目录行的 ``internal_tool_name`` 必须存内部名，否则 ``_make_mcp_tool`` /
+        # ``require_enabled`` 无法解析到远端名，Agent 与 legacy 两条 MCP 路径全断。
+        _remote_name, description, _output_schema = self._dynamic_by_remote[(service, tool.name)]
+        internal_name = tool.name
         observed_digest = discovery_digest(tool)
         row = await self._row_by_internal(internal_name)
         if row is not None and row.discovery_digest != observed_digest:

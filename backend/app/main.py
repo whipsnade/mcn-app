@@ -33,8 +33,18 @@ RECOVERY_INTERVAL_SECONDS = 30
 
 
 def _resolve_remote_entry(service: DataTapService, internal_tool_name: str):
-    """从审核 allowlist 解析 (remote_name, description, output_schema)；未收录返回 None。"""
-    return DYNAMIC_TOOL_ALLOWLIST.get(service, {}).get(internal_tool_name)
+    """从审核 allowlist 解析 (remote_name, description, output_schema)；未收录返回 None。
+
+    UAT 发现：实时 DataTap 网关以审核内部名（allowlist key，如 ``match_best_tag``）
+    暴露 MCP 工具，allowlist 值里的旧式 remote_name（``datatap.insight.*.v1``）已与
+    网关不同步，直接调用会返回 ``Unknown tool``。因此 remote_name 一律取内部名，
+    与实际网关工具名保持一致（见 2026-08-02-agent-runtime-uat.md Incident）。
+    """
+    entry = DYNAMIC_TOOL_ALLOWLIST.get(service, {}).get(internal_tool_name)
+    if entry is None:
+        return None
+    _stale_remote_name, description, output_schema = entry
+    return (internal_tool_name, description, output_schema)
 
 
 async def _load_catalog(db):

@@ -36,6 +36,11 @@ dev = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# 真实服务 UAT 标记：只有显式 ``-m real_services`` 且脚本设置 ``RUN_REAL_SERVICES=1``
+# 才会运行 tests/integration/test_agent_runtime_real.py（真实模型 + 真实 DataTap MCP）。
+markers = [
+  "real_services: 真实模型 + 真实 DataTap MCP UAT（默认跳过，RUN_REAL_SERVICES=1 启用）",
+]
 
 [tool.ruff]
 line-length = 100

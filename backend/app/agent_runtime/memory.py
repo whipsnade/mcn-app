@@ -84,6 +84,9 @@ class MemoryContextBuilder:
                     "category": entry.category,
                     "points_cost": entry.points_cost,
                     "description": entry.description,
+                    # 模型必须看到工具输入 Schema 才能构造合法参数（设计 §九/§10）；
+                    # 见 registry.RegisteredTool.input_schema。
+                    "input_schema": entry.input_schema,
                 }
                 for entry in tools
             ],

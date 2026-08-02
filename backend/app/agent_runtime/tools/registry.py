@@ -29,6 +29,7 @@ from app.agent_runtime.tools.contracts import (
     ToolResult,
     TrustedTool,
 )
+from app.mcp_gateway.registry import close_input_schema
 
 
 class ToolContractError(ValueError):
@@ -85,6 +86,10 @@ class RegisteredTool:
     tool: TrustedTool | None = None
     review_status: str | None = None
     is_enabled: bool = True
+    # 模型可见的输入 JSON Schema（§九/§10：模型需要看到 Schema 才能构造合法参数）。
+    # 静态工具取 ``input_model.model_json_schema()``；目录 MCP 工具取实时发现并
+    # 封闭后的 ``input_schema_json``。
+    input_schema: dict[str, Any] | None = None
 
 
 # service_slug -> 该服务工具所需的渠道权限；None 表示跨平台、无渠道门槛。
@@ -181,13 +186,22 @@ class ToolRegistry:
         _validate_tool(tool)
         if tool.name in self._entries:
             raise ToolContractError(f"duplicate tool internal_name: {tool.name!r}")
+        # 静态工具的描述优先取工具显式声明的 ``description``，否则回退到 docstring
+        # 首行；模型上下文里的 available_tools 依赖该描述理解工具用途（UAT 发现：
+        # 空描述导致模型猜错 create_draft 的 module 取值）。
+        tool_description = (
+            getattr(tool, "description", None)
+            or (((tool.__doc__ or "").strip().splitlines() or [""])[0])
+        )
         entry = RegisteredTool(
             internal_name=tool.name,
             category=category,
             points_cost=tool.points_cost,
             external_side_effect=tool.external_side_effect,
+            description=tool_description,
             input_model=tool.input_model,
             tool=tool,
+            input_schema=tool.input_model.model_json_schema(),
         )
         self._entries[tool.name] = entry
         return entry
@@ -311,6 +325,7 @@ class ToolRegistry:
             tool=executor,
             review_status=row.review_status,
             is_enabled=row.is_enabled,
+            input_schema=close_input_schema(row.input_schema_json),
         )
 
 

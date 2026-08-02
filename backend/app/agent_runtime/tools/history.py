@@ -22,7 +22,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_artifacts.models import AgentArtifact, AgentArtifactVersion
-from app.agent_runtime.models import AgentRun, AgentSession, EvidenceItem
+from app.agent_runtime.models import AgentSession, EvidenceItem
 from app.agent_runtime.tools.contracts import ToolContext, ToolResult
 
 # 结构化错误类型；Router 层把两者都映射为 404（§九「跨 Session 返回 404」）。
@@ -168,7 +168,6 @@ class ReadArtifactTool:
 class SearchEvidenceArgs(BaseModel):
     query: str = ""
     artifact_id: str | None = None
-    run_id: str | None = None
     filters: dict[str, Any] | None = None
 
 
@@ -192,13 +191,6 @@ class SearchEvidenceTool:
             return _failed(error, "session_" + error)
 
         conditions = [EvidenceItem.session_id == context.session_id]
-        if args.run_id:
-            run = await self._db.get(AgentRun, args.run_id)
-            if run is None or run.session_id != context.session_id:
-                return _failed(NOT_FOUND, "run_not_found")
-            if run.user_id != context.user_id:
-                return _failed(FORBIDDEN, "run_forbidden")
-            conditions.append(EvidenceItem.run_id == args.run_id)
         if args.artifact_id:
             artifact = await self._db.get(AgentArtifact, args.artifact_id)
             if artifact is None or artifact.session_id != context.session_id:
