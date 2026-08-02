@@ -1,0 +1,116 @@
+# Agent Runtime v3 一次性切换清单（Cutover Checklist）
+
+状态：**待发布**（2026-08-03，Task 27）
+适用范围：从旧多链路模型架构一次性切换到模型主导的统一 Agent 运行时（设计
+`docs/superpowers/specs/2026-08-02-model-led-agent-runtime-design.md` §18/§19；实施计划
+`docs/superpowers/plans/2026-08-02-model-led-agent-runtime.md` Task 26/27）。
+
+这是一次**一次性开关（one-shot switch）**：不设新旧运行时功能开关，不允许部分用户继续
+使用旧模型链路；新前端与新后端必须在**同一发布批次**完成契约切换。旧执行表**首次切换不
+物理删除**，保留用于回滚；只有稳定运行并经用户单独批准后，才可另立清理迁移删除旧表。
+
+---
+
+## 0. 状态摘要
+
+| 检查项 | 状态 |
+|---|---|
+| 代码与测试（迁移 0027 + 运行时 + 前端 + E2E） | ✅ 已完成，全量验证矩阵通过（见 §4） |
+| 真实模型 + 真实 DataTap UAT（Task 26） | ⚠️ 已执行，运行时机制部分验证；**存在 2 个阻断项**（见 §1） |
+| 生产切档 | ⛔ **禁止**——阻断项未解决前不得执行 §3 步骤 |
+
+---
+
+## 1. UAT 发现的发布阻断项（必须先解决）
+
+来源：`docs/qa/2026-08-02-agent-runtime-uat.md`「未决问题 / 切换阻断项」。
+任一未解决，**不得执行切档**。
+
+### 阻断项 1：真实 DataTap 传输层无可靠超时/取消（Incident #8）—— 必须解决后才能切档
+
+- **现象**：真实品牌/活动/圈选场景中，DataTap 某些统计查询长时间持续返回数据，`transport.call_tool`
+  挂起数十分钟；`asyncio.wait_for` 无法打断 httpx C 层阻塞（`PossiblySentTimeout` 分类正确但取消不生效）。
+  一个慢查询即可让整个 Run 挂死，是真实 UAT 场景 2/3/4 无法跑完的直接原因。
+- **判定标准**：同一服务同一工具的长查询必须在受控超时窗口内以 `result_unknown` 分类收口、
+  保持预留并让 Run 继续其他工具；已发出但未知的请求经恢复核对，绝不重复扣费或重复请求。
+- **修复方向**：进程级 watchdog，或对长查询工具设置独立可取消超时。**未修复**。
+
+### 阻断项 2：真实模型无法在 Attempt 预算内可靠产出 lineage 有效正式 Artifact —— 必须解决后才能切档
+
+- **现象**：真实模型能驱动 MCP 抓数，但会反复修订 Draft lineage（probe 观察 brand run
+  45 决策 / 17 次 revision 仍未过审）并触发 Attempt 保护（50 决策 / 30 分钟）暂停。这与
+  `prompts.py`「完整 prompt 工程在后续任务完成」一致：schema 注入、evidence 映射、
+  builder 工具化指引不完整，正式 Artifact 交付不可靠。
+- **判定标准**：在单个 Attempt 预算（50 决策 / 30 分钟）内，模型能够提交并让 Reviewer
+  approve 一个 lineage 完整的正式 Artifact（`validate_and_freeze_lineage` 通过、`lineage_ok=True`）；
+  多次独立运行不依赖放宽 Attempt 上限。
+- **修复方向**：补齐 Artifact 构建指引（schema 注入、evidence 映射、builder 工具化）。
+  **未修复**。
+
+### 其余 UAT 缺口（切档前应一并关闭）
+
+- **kol_detail_v1 Profile 未允许 `MCP_TOOLS`**：生产接线无法触达真实 `kol_detail` MCP 工具，
+  达人详情真实 fetch 链路当前不可用（缓存链路可用）。需修复 Profile 或工具分类。
+- **生产引擎静态工具注册缺失**：`app/main.py` 的 `create_agent_runtime` 只注入 MCP 目录工具，
+  未注册 calculation/history/artifact 静态工具（UAT 测试自带完整注册表）——不补齐则生产
+  Run 无法产出正式 Artifact。修复后应复用 `agent_runtime/tools/registry.py` 的 `register()`。
+- **`test_real_providers.py::test_real_tencent_adapter_uses_confirmed_model`** 与本环境不符
+  （断言 `deepseek-v4-pro`，`backend/.env` 为 `glm-5.2`）——历史遗留，非本次引入。
+
+---
+
+## 2. 发布阻断条件（设计 §19）
+
+出现任一情况**不得切换**：
+
+1. MCP 调用可能重复执行、重复扣费或错误释放 unknown 预留；
+2. 正式 Artifact 存在无法追溯到当前 Session Evidence 的数值；
+3. 跨用户 Session、Evidence、Artifact 或达人详情越权；
+4. 任一强类型 Artifact 无法被对应 BI 消费，或声明支持 Excel 的 Artifact 无法导出；
+5. Run 恢复导致步骤重放、当前 Attempt 保护计数未重置或新消息复用旧执行卡；
+6. Reviewer 可以被主 Agent 绕过，或多 Artifact 发生部分发布；
+7. 四个旧快捷入口、API 或缓存仍可从新系统触达；
+8. 前后端无法在同一发布批次完成契约切换。
+
+## 3. 切档执行步骤
+
+> 前置：§1 两个阻断项已解决并复跑真实 UAT 通过；设计 §19 阻断条件逐条核实无命中。
+
+1. **测试库迁移**：在独立测试库（`kol_insight_test`）执行
+   `cd backend && APP_ENV=test .venv/bin/alembic upgrade head`，确认到 `0027_agent_runtime_v3`；
+   全量 pytest（含 `test_legacy_routes_removed.py` 的旧路由 404 断言）通过。
+2. **生产备份**：切换前对生产库执行完整备份（含全部旧表——它们要在回滚时恢复读取），
+   并记录备份文件路径与时间戳；同时备份 `/home/kol_insight/` 下的 `backend/.env`。
+3. **同一发布批次部署新后端 + 新前端**：同步 `backend/` 代码到 UAT/生产
+   （不覆盖远端 `.env`），执行 `alembic upgrade head`（只新增新表）；构建 `dist/` 并同步前端。
+   重启 `systemctl restart kol-insight.service`。
+4. **路由冒烟**：确认旧执行入口不可达——`/api/v1/quick/*`、`/api/v1/sessions/{id}/brainstorm`、
+   `/api/v1/sessions/{id}/tasks`、手动 `/kol-analysis` 均返回 404；新 `/api/v1/agent/*` 可用；
+   `GET /healthz` 返回 ok，`GET /api/v1/agent/sessions` 公网期望 401。
+5. **功能冒烟**：真实账号完成 会话 → 澄清 → 品牌/活动/圈选 → Reviewer 发布 → BI 展示 →
+   达人详情 → 品牌/圈选 Excel 导出 的冒烟；确认三个 BI Tab / 两个达人子 Tab 正常，快捷四入口消失。
+6. **积分抽查**：核对每笔 settled DataTap 调用 `points_settled == 10`、`points_reserved == 0`，
+   与 `wallet_ledger` 一致；制造一个 504/超时验证 `result_unknown` 保持预留且不重放；
+   `unknown` 经恢复核对或管理员 reconcile 后正确结算/释放。
+7. **发布闸门复核**：对照 §2 逐条记录通过依据。
+8. **回滚预案确认**：首次切换**不 drop 旧表**；冒烟失败时按 §4 回滚应用版本，旧数据未删除
+   可恢复旧系统。
+
+## 4. 回滚应用版本
+
+- 冒烟失败或命中任一发布阻断条件时：关闭新任务 → 回滚后端代码与前端 `dist/` 到上一版本 →
+  重启服务（旧执行路由随之恢复）→ 旧 Agent 新表保留用于排障但不再写入 → 运行只读健康检查
+  与 focused 回归（租约、积分、版本门控）→ 开放任务。
+- 数据库迁移只按 Alembic 的可逆 downgrade 执行；**不要**手工删除账本、调用记录、Evidence、
+  Artifact 或会话历史。新表未被写入时可直接 downgrade 0027；已写入则保留新表、仅回滚应用版本，
+  由后续排障决定清理。
+- 稳定运行并经用户单独批准后，才可另立**清理迁移**物理删除旧会话、任务、Goal、报告、旧 Artifact、
+  旧 MCP/Quick 状态表。清理前必须再次备份并列出准确表名，**不得**在首次切换迁移中隐式删除。
+
+## 5. 参考
+
+- 真实 UAT 记录与账本验证：`docs/qa/2026-08-02-agent-runtime-uat.md`（结构化结果
+  `outputs/agent-runtime-uat-results.json`，不提交 Git）。
+- 运行/恢复/账务排查：`docs/runbooks/phase-2-runtime.md`。
+- 架构设计与 §19 发布阻断条件：`docs/superpowers/specs/2026-08-02-model-led-agent-runtime-design.md`。
+- 真实 UAT 复跑入口：`cd backend && ./scripts/run_real_agent_uat.sh`（Task 26 已执行，本次切档前须复跑）。

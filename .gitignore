@@ -18,6 +18,7 @@ __pycache__/
 test-results/
 playwright-report/
 output/playwright/
+outputs/
 changelog/
 output/ppt/gen_pptx.py
 output/ppt/KOL-Insight-AI-产品介绍.pptx

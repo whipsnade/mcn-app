@@ -1,10 +1,10 @@
 # AGENTS.md
 
-本文件面向 AI 编码代理，概述项目结构、开发命令与必须遵守的约定。详细信息以仓库内的 `README.md`、`docs/runbooks/phase-2-runtime.md` 和各模块源码为准。
+本文件面向 AI 编码代理，概述项目结构、开发命令与必须遵守的约定。详细信息以仓库内的 `README.md`、`docs/runbooks/agent-runtime-v3-cutover.md`、`docs/runbooks/phase-2-runtime.md` 和各模块源码为准。
 
-> **新会话预热**：开始工作前先读 `changelog/` 目录最新 2-3 篇按日期的变更日志（改了什么、为什么、遗留事项），可快速建立上下文；约定见 `changelog/README.md`。
+> **新会话预热**：开始工作前先读 `changelog/` 目录最新 2-3 篇按日期的变更日志（改了什么、为什么、遗留事项），可快速建立上下文。
 >
-> **每日记录**：每天的功能与架构变更必须追加到当日 `changelog/YYYY-MM-DD.md`（没有则新建），结构为 背景与目标 / 主要改动（含关键文件）/ 验证结果 / 遗留事项；写给没有本会话记忆的后来者，记录决策与原因，不只罗列 diff。
+> **每日记录**：每天的功能与架构变更必须追加到当日 `changelog/YYYY-MM-DD.md`（没有则新建；changelog 目录在 .gitignore 中，新增文件需 `git add -f`），结构为 背景与目标 / 主要改动（含关键文件）/ 验证结果 / 遗留事项；写给没有本会话记忆的后来者，记录决策与原因，不只罗列 diff。
 
 ## 项目概述
 
@@ -13,75 +13,91 @@ KOL Insight AI：面向品牌用户的网红 KOL 与 MCN 营销效果智能筛�
 - 前端：React 19 + TypeScript + Vite + Tailwind CSS 4 + Motion + Recharts，端口 5173。
 - 后端：Python 3.11/3.12 + FastAPI 模块化单体 + SQLAlchemy Async（asyncmy）+ Alembic，端口 8000。
 - 数据库：MySQL 8，字符集 `utf8mb4`。
-- 外部服务：腾讯 Token Plan 大模型（`deepseek-v4-pro`）与 DataTap MCP 网关。除登录外，模型与 MCP 只使用真实服务，不做 mock。
+- 外部服务：腾讯 Token Plan 大模型（`TENCENT_PLAN_MODEL` 配置）与 DataTap MCP 网关。除登录外，模型与 MCP 只使用真实服务，不做 mock。
 - 测试：Vitest（前端单测）、pytest（后端）、Playwright（E2E）。
 
-业务要点：模拟短信/微信登录（访问令牌在内存，刷新令牌走 HttpOnly Cookie）、新用户一次性 1000 积分、不可变账本、会话按用户隔离、积分预留/结算/失败释放状态机、每次 MCP 工具调用固定计费 10 积分。充值与真实支付未开放。
+业务要点：模拟短信/微信登录（访问令牌在内存，刷新令牌走 HttpOnly Cookie）、新用户一次性 1000 积分、不可变账本、会话按用户隔离、积分预留/结算/失败释放状态机、每次 DataTap MCP 工具调用固定计费 10 积分。充值与真实支付未开放。管理端 `/api/v1/admin` 提供用户管理、积分人工调整（`admin_adjust` 账本，支持 `Idempotency-Key`）与 `agent_tool_calls` 的 unknown 调用人工核对（`reconcile`），写操作落 `admin_audit_logs` 审计表。
 
-管理端能力：`/api/v1/admin` 提供管理员（`users.role == "admin"`，依赖 `identity/dependencies.py` 的 `require_admin`）账号管理接口——用户列表/搜索/渠道筛选、创建、编辑、软禁用（吊销全部刷新会话）、积分人工调整（账本 `kind="admin_adjust"`，支持 `Idempotency-Key`）与单用户积分流水；所有写操作落 `admin_audit_logs` 审计表（手机号掩码）。
+### 当前架构：模型主导的统一 Agent 运行时（Agent Runtime v3）
 
-任务单一 agent 模式（`analysis_tasks.kind` 固定为 `"agent"`，核心功能是 **KOL 圈选 + 导出 Excel**）：每条消息创建的任务都走 `orchestration/loop.py` 的迭代式工具调用循环。循环由圈选导向 prompt 驱动：`selection/contract.py` 定义 kol_excel_v2 导出字段契约（labels 中行业兴趣/目标地区/目标年龄段随会话画像动态生成），经 `AgentLoopContext.export_contract` 注入，模型逐轮采集证据并圈选达人。每次工具调用 settled 后由 `DatabaseSelectionIngest` 自动沉淀到 `session_kol_selections`（失败只记 warning 不阻塞）；模型 finish 即结束循环（不再做覆盖门禁），finish 结论（`AgentDecision.conclusion`）直写为 assistant 消息（`message.completed` 事件带 text）；零证据 finish 报 `no_evidence_collected`。同一工具累计 2 次 settled 但返回空数据后熔断（拒绝重复调用并回喂，连续熔断 3 次按现有证据收尾）。循环不设调用次数上限，仅当钱包可用余额不足一次 10 积分调用（`InsufficientPointsError`）时停止，任务进入 `insufficient_balance` 终态（发 `task.failed`，code="insufficient_balance"）。轨迹持久化在 `plan_json`（`agent_trajectory_v1`）。历史表（bi_reports/task_candidates/kols 等）保留但不再写入；favorites 支持新旧双路径：新路径以 platform+kol_uid 为身份（迁移 0021，`uq_user_kol_favorites_user_platform_uid` 唯一，nickname 冗余 + snapshot_json 快照随收藏落库，重复收藏幂等且快照仅新值非空才更新，删除走 `DELETE /favorites?platform=&kol_uid=`），旧 kol_id 路径保留兼容。
+自 2026-08-02 起系统一次性切换为「模型主导 + 可信执行内核」架构（设计 `docs/superpowers/specs/2026-08-02-model-led-agent-runtime-design.md`，实施计划 `docs/superpowers/plans/2026-08-02-model-led-agent-runtime.md`）。模型决定业务分析流程（澄清、工具选择、失败处理、钻取、产物生成），代码只负责能力边界、安全、计费、状态、证据、结构校验与表现层。
 
-报告不再随任务自动生成：会话级分析报告由用户手动触发 `POST /sessions/{id}/kol-analysis`（零积分，同步响应，不发 SSE；代码聚合圈选名单 + KOL_ANALYSIS_PROMPT 模型撰写），落 `analysis_reports`（会话级版本化）；Excel 导出走 `GET /sessions/{id}/kol-selection/export`（旧 4-sheet 模板渲染）。名单为空时导出/分析返回 409 `NO_KOL_SELECTION`。圈选相关的评分与归一化代码（`selection/normalizers.py`/`scoring.py`/`exporter.py`）恢复自旧 pipeline（git 7e44355^/ff3b652）：6 个 DataTap 工具适配器、6 维度加权评分，rating 4 档（重点推荐≥78/推荐≥62/可考虑≥48/观察<48）。
-
-多意图 Goal/Artifact 基础设施（设计 `docs/superpowers/specs/2026-07-23-multi-intent-task-artifacts-design.md`，阶段一影子 + 阶段二基础设施已落地，用户行为不变）：每条新任务创建时同事务落一条 `task_goals`（当前固定 `kol_selection`、sequence=1；GoalPlanner 仍是影子模式，输出只写 `model_prompt_logs`，开关 `GOAL_PLANNER_SHADOW_ENABLED`，品牌/活动分析 GoalPolicy 属阶段三未做）。执行期工具事件、`mcp_calls.goal_id` 与圈选沉淀都携带 goal_id；圈选证据双写 `session_kol_selections`（旧表，阶段五停写）与 `kol_selection_items`（挂在版本化 `kol_selection_sets` 下，唯一 (session_id, version)）。任务收尾 `finalize_goal` 把名单置 completed 并登记 `task_artifacts`（artifact_key 幂等：`goal:{goal_id}:{type}` / `manual:{report_id}:{type}` / `legacy:{domain_id}:{type}`），发送 `goal.started/goal.completed/goal.failed/artifact.updated`（`report.updated` 双发保留，前端未知事件走 default 分支忽略）。`analysis_reports` 加 `report_type`（默认 kol_analysis）+ `scope_json`，唯一约束改 (session_id, report_type, version)。兼容端点（kol-selection 列表/导出/分析、kol_selection_count）已切读最新 selection set，DTO 形状不变；旧数据由迁移 0023 回填为「历史默认名单」+ legacy Artifact。用户默认品牌存 `user_brand_profiles`（`GET/PUT /users/me/brand-profiles`，事务内保证最多一个默认品牌），供 GoalPlanner 上下文的 `account_default_brand` 使用。
-
-多意图阶段三（品牌/活动分析，实施计划 `docs/superpowers/plans/2026-07-24-brand-campaign-analysis.md`）：GoalPlanner 可正式接管消息规划——开关 `GOAL_PLANNER_ENFORCE_ENABLED`（默认 false；开启后 `POST /sessions/{id}/tasks` 先规划，`clarify` 落 assistant 澄清消息（metadata.clarify.options，响应 union `{outcome:"task"|"clarify"}`）不建任务，`execute` 按 planner 输出落 1-3 个 Goal（阶段四起全部执行；Planner 失败回退 kol_selection）。`goals/policies.py` 按 goal_type 分派：仅 kol_selection 注入 export_contract、启用沉淀与自动 KOL 分析；品牌/活动用独立 loop prompt（`brand_loop_v1` version=2 含对比期阶段与 evidence_goal 期别前缀 current:/mom:/yoy:/`campaign_loop_v1`）；活动报告仍走 `reporting/builders.py` + `campaign_analysis_v1`（证据取 plan_json 的 settled EvidenceNote）；品牌报告自 2026-07-31 起为 `brand_report_v2` 结构化快照：`brand_assembler.py` 从 settled 证据确定性归一 data+availability（期别用 EvidenceNote.step_id 关联 TrajectoryStep.arguments 识别；GoalParams.comparison_mode=mom/mom_yoy 驱动环比/同比对比期查询，mom 默认会多一组同口径 MCP 调用）、`brand_narrative.py` 以 scope/query_spec/data/availability 为唯一模型输入生成叙事（brand_report_narrative_v1，brand_analysis_v1 不再使用）、`analysis_reports` 落 `payload_json`+`template_version`（迁移 0026，旧行 NULL 走通用 Block 降级）并生成兼容 Block；收尾登记 brand_report/campaign_report artifact，报告失败降级 goal completed_with_warnings + failed artifact；手动重试 `POST /sessions/{id}/analysis-retry`（零积分不重调 MCP）。品牌报告 Excel 导出 `GET /sessions/{id}/reports/{report_id}/export`（零积分不调模型/MCP，模板 `reporting/templates/brand_report_v2.xlsx` 去样例 8 Sheet，图表删除重建，归属/类型校验失败统一 404 不泄漏存在性）；前端品牌分析 Tab 对 v2 payload 走章节式 BI（BrandReportView 8 章节锚点+受限标记+导出按钮，形状守卫 isBrandReportPayload 不过则降级旧 Block 并提示不支持导出）。读取 API：`GET /sessions/{id}/reports?report_type=`（版本列表）、`GET /sessions/{id}/artifacts/summary`（四模块最新产物+未读）、`PUT /sessions/{id}/artifact-read-state`、`GET /sessions/{id}/selection-sets` 与 kol-selection/export 的 `set_id` 参数。前端右侧 BI 固定三个一级 Tab「品牌分析 | 活动分析 | 达人」（达人内含 KOL 分析/圈选达人两子 Tab），报告与名单均支持历史版本下拉，Tab 未读圆点点击后写已读；任务完成不自动切 Tab。
-
-多意图阶段四（复合任务编排，实施计划 `docs/superpowers/plans/2026-07-24-multi-goal-orchestration.md`）：planner 输出的 1-3 个 Goal 全部落库并顺序执行（依赖组合白名单：仅 brand/campaign → kol_selection）。≥2 goals 走 `_orchestrate_goals`：轨迹 v2（`plan_json` 按 goal_id 分片，step id 命名空间 `g{seq}_step_N`，`_PlanArguments` 支持 v2 扫描）；单 goal/legacy 保持 v1 不变。软依赖：上游成功注入 `dependency_summaries`（上游摘要由 `goals/summary.py` 的 `goal_summary_v1` 模型调用生成落 `result_summary_json`，失败回退代码摘要）；上游失败记 `dependency_missing` 仍执行；kol 下游缺 brand + 上游失败 → skipped。余额不足当前 goal 停、后续 pending；取消时当前+pending 全 skipped；任务终态聚合（全成功 completed / 混合 completed_with_warnings / 全失败 all_goals_failed）。`TaskService.retry` 复制源任务 goal 结构。前端无改动。
-
-会话生命周期（空白会话 + brainstorm 澄清）：新建会话不再走表单，`POST /sessions` 空 body 直接创建空白会话（标题「新会话N」）。会话画像未 ready 前，用户消息走 `POST /sessions/{id}/brainstorm`（同步问答，零积分）：`brainstorm/parameters.py` 定义 8 项 MCP 参数关键字表（brand/category/platforms/audience/period/kol_filters/goal/region），`BRAINSTORM_PROMPT` 驱动模型逐项提炼，信息不足时一次一问（优先 2-4 个选项）；画像落 `sessions.filters_snapshot["brainstorm_profile"]`，title_suggestion 提炼会话名，`ready=true` 时后端内联创建 agent 任务并写回 brand/category/platforms/target_audience 标量列。画像 ready 后消息走原有 `POST /sessions/{id}/tasks`。任务循环上下文经 `AgentLoopContext.param_profile` 注入画像（period 合法时覆写 `requested_period`），优先级高于消息文本推断。前端会话建议交互：空白会话（`session.messages.length === 0`）且无 followup 建议时，输入框上方展示 4 条前端静态默认建议（`ChatArea.tsx` 的 `DEFAULT_SUGGESTIONS`）；所有建议（默认建议 / followup chips / brainstorm 选项 chips）点击统一为填入输入框并聚焦，不自动提交，由用户确认后发送。
-
-行业属性与快捷功能（/api/v1/quick）：用户带 `industries` JSON 多值字段（迁移 0018，存量回填「美食」，admin 可编辑）。会话列表 2x2 快捷按钮提供四个全局功能（按用户行业过滤、不绑定会话）：达人推荐（`GET /quick/kol-recommendations`，预算 1万~50万滑动条、top50、单达人报价 ≤ 预算）、达人/活动评估（`POST /quick/evaluate`，JSON 活动名 + 达人名单（1-20 个），`campaign_evaluate` feature 模型小循环逐个达人查 MCP 后输出 `{title, analysis_markdown}`，同步耗时可达数分钟）、小红书/抖音前十爆贴（`GET /quick/top-posts`，近 30 天互动数倒序）。快捷调用是同步 HTTP 非任务路径：爆贴/达人推荐/达人详情/活动评估由 `quick/agent.py` 的模型驱动同步小循环决策（代码只组装场景 prompt + 护栏：白名单/Schema 校验、上限 8 轮、连续 2 次无效决策报错；finish 结果按 feature 输出契约校验），单次成本随模型选择的调用次数浮动；每次 MCP 调用仍固定 10 积分，经 `QuickCallService.call_tool` 轻量计费（`quick_mcp_calls` 留痕、`reference_type="quick_mcp_call"`），悬挂预留由恢复循环清扫；余额不足返回 409 `INSUFFICIENT_POINTS`。预算过滤（报价 ≤ 预算、无报价排最后）与 top50 截断留在端点层（纯代码排序过滤），模型结果经归一化函数兜底清洗。
-
-Prompt 学习日志与成功案例回放：所有模型调用在 `TencentPlanAdapter.complete_json/stream_text` 统一出口写入 `model_prompt_logs` 表（迁移 0019；完整 messages/response 为 MEDIUMTEXT，purpose/tags 标签化，status=success/invalid/failed + error_code，token 用量与耗时；写日志走独立 SessionFactory 会话，异常只记 warning 绝不阻塞主流程）。调用点经请求的 `log_context`（user_id/session_id/task_id/tags）透传上下文。`model/exemplars.py` 的 `find_success_exemplars` 按 purpose + status=success + tags 交集检索最近成功记录（截断 ~1500 字符、剔除 key/token 特征字段），注入 agent_loop、quick 小循环与 brainstorm 的 user content JSON 的 `"exemplars"` 键，供模型参考工具选择与参数写法。
-
-GoalPlanner 已可按配置接管执行：`GOAL_PLANNER_ENFORCE_ENABLED=true` 时，画像 ready 后的消息先经 planner 规划（enforce 路径），planner 输入含已审核 MCP 工具紧凑投影 `available_tools`（internal_name/description/required_params，直接查 `mcp_tool_catalog` 表注入）；`goal_planner_v1` prompt（version=3）要求「先澄清后执行」——分析类意图（brand/campaign/kol_selection）首轮必须 `action=clarify`，从执行稳定/数据精准角度问最关键的执行条件（每轮一问、2-4 个可执行选项），澄清轮次由模型自主判断（可多轮直到条件足够，通常 1-3 轮收敛，无服务端硬上限），用户回答后（或说"直接执行"）再次发消息即 execute 建任务；brand_analysis Goal 必落 `params.comparison_mode`（明确要求同比或澄清选「环比+同比」→mom_yoy，其余 mom；campaign/kol 不输出该字段，但落库 model_dump 不排除默认值，mom 会并入所有 goal 的 params_json，消费方仅 brand_analysis 读取）；planner 异常仍回退 kol_selection 单 Goal 老路径。影子模式（`GOAL_PLANNER_SHADOW_ENABLED`）保留，只写 `model_prompt_logs`。
+- **每条用户消息创建一个独立、可恢复、可审计的 Agent Run**，对应 `agent_runs` / `agent_run_attempts` / `agent_steps` / `agent_tool_calls` / `agent_events`。Run 状态机：`queued → running → clarification_requested / reviewing / completed / failed / paused / cancelled`。只有用户显式点击「继续」恢复 `paused` Run 才复用原 Run；普通多轮消息绝不复用已完成 Run 的执行卡。
+- **四个 Profile**（`agent_runtime/profiles.py`，只限能力集合，不包含任何固定业务调用顺序）：`session_analyst_v1`（所有普通会话消息，四种动作全开）、`artifact_reviewer_v1`（正式 Artifact 提交复核，只读，输出 approve/revise/reject）、`kol_detail_v1`（点击圈选达人，轻量 Run）、`utility_v1`（标题/摘要/建议等后台轻量任务）。模型审计用途收敛为 `session_agent` / `artifact_reviewer` / `kol_detail_agent` / `utility` 四类。
+- **统一动作协议**（`agent_runtime/schemas.py`，Pydantic 严格判别联合）：`ask_user`、`call_tool`、`submit_review`、`complete`。Artifact 创建/更新/历史读取/计算统一作为受控内部工具经 `call_tool` 执行，顶层动作不再增加业务特例。
+- **统一工具运行时**（`agent_runtime/tools/registry.py`）：已审核 DataTap MCP 工具（固定 10 积分）、历史读取工具（`read_artifact`/`search_evidence`/`read_tool_result`，零积分）、确定性计算工具（`calculate_expression`/`aggregate_metrics`/`calculate_period_comparison`/`normalize_sentiment`/`rank_kols`，零积分；设计 §10.3 的 `validate_artifact_payload` 未实现，schema 校验走 lineage validator）、Artifact Draft 工具（零积分）。模型可见工具 = Profile 允许分类 ∩ 实时审核状态（approved+enabled）∩ 用户渠道权限。服务端 `user_id/session_id/run_id` 保留键在进入工具前被剥离，模型参数不能覆盖。
+- **证据与产物**：`evidence_items` 不可变（完整 raw_payload_json + 内容 hash + 截断 preview），模型只能通过只读工具获取。正式 Artifact 强类型（`extra="forbid"`）：`brand_report_v3` / `campaign_report_v2` / `kol_selection_v3` / `kol_analysis_v2` / `kol_detail_v2`，加通用钻取 `insight_board_v1`（8 种 Block）。字段级 lineage（RFC 6901 JSON Pointer）必须递归到当前用户 Session 的 Evidence；正式数值缺 lineage 拒绝进入复核。Draft 可连续更新（`artifact_draft_revisions` 不可变），提交 Reviewer（最多两次 revise，第三次只能 approve/reject）后以 batch 原子发布不可变 `agent_artifact_versions`；Reviewer 不可被主 Agent 绕过，`restricted` 产物需 Reviewer 明确批准才可发布。
+- **运行保护**：每个 Run Attempt 上限 30 分钟或 50 次模型决策，触发后 Run 以 `paused` 结束而非失败；resume 创建新 Attempt 并从零计数，`agent_runs.decision_count` 保留跨 Attempt 累计值用于审计。
+- **计费与故障**：模型/历史/计算/Artifact 工具零积分，DataTap MCP 每次 10 积分；不设单 Run 预算，每次外部调用前实时检查钱包，余额不足作为结构化工具错误回喂模型。故障分类 `definitely_not_sent`（可自动重试一次并释放预留）/ `failed_confirmed`（不自动重放、释放预留）/ `result_unknown`（禁止自动重放、保持预留进入恢复核对）/ `settled`（结算 10 分）。细粒度熔断键 `service + internal_tool_name + SHA256(normalized_arguments)`，只阻断同参数重复撞击，不影响其他工具/参数。
+- **历史数据**：只保留账号、钱包/积分账本、管理员审计与收藏（`user_kol_favorites`）；旧会话、任务、Goal、报告、旧 Artifact 与 Quick 状态不迁移、不展示、不读取。旧执行源码已删除（`brainstorm/`、`orchestration/` 整包移除；quick/goals/tasks/artifacts/reporting/workspace/selection 的 `models.py` 仅作为 legacy ORM 保留注册表，标注只读，不再导出执行服务）。
+- **迁移**：`0027_agent_runtime_v3` 新增 19 张新表（agent_sessions/agent_messages/agent_runs/agent_run_attempts/agent_steps/agent_tool_calls/agent_tool_call_reconciliations/evidence_items/agent_events/memory_entries/agent_artifacts/artifact_drafts/artifact_draft_revisions/artifact_review_batches/artifact_review_items/artifact_review_attempts/agent_artifact_versions/artifact_events/kol_detail_cache），并扩展既有 `artifact_read_states`（0022 遗留表）的 module/last_seen_sequence/updated_at 读游标列；**不 drop 任何旧表**；首次切换保留旧表用于回滚，稳定后需单独迁移 + 单独用户批准才能清理。
+- **UAT 已知阻断项**：真实 DataTap 长查询传输层无法可靠超时/取消（Incident #8，可挂死 Run）；真实模型在 Attempt 预算内无法可靠产出 lineage 有效正式 Artifact（probe 45 决策 / 17 次 revision 仍未过审）。两者是 cutover 的 must-resolve 阻断项，见 `docs/runbooks/agent-runtime-v3-cutover.md` 与 `docs/qa/2026-08-02-agent-runtime-uat.md`。
 
 ## 项目结构
 
 ```text
 backend/            FastAPI 后端
   app/
-    api/router.py   /api/v1 路由聚合（auth、users、wallet、sessions、admin、tasks、reporting）
+    api/router.py   /api/v1 路由聚合（auth、users、wallet、admin、favorites、agent_runtime、agent_artifacts、thinking）
     core/           配置（pydantic-settings）、错误、安全、日志脱敏
     db/             SQLAlchemy Base、引擎与会话
     identity/       用户、模拟认证提供商、JWT；dependencies.py 含 require_admin
     billing/        钱包、账本、积分预留/结算/管理员调整（admin_adjust）
-    admin/          管理端账号与积分管理、审计日志（/api/v1/admin）
-    workspace/      KOL 会话与消息（空白新建、标星、重命名、恢复；metadata 白名单）
-    brainstorm/     需求澄清（关键字表 parameters.py、画像提炼 service、/sessions/{id}/brainstorm）
-    quick/          快捷功能（模型小循环 agent.py、同步计费护栏 service.py、/quick/* 端点：达人推荐/达人详情/爆贴/活动评估）
-    tasks/          异步流式任务运行时、事件、恢复、幂等
-    model/          腾讯 Token Plan 模型适配层；prompt_logs.py 是 prompt 学习日志写入口，exemplars.py 是成功案例回放检索
-    mcp_gateway/    DataTap MCP 客户端、工具注册/校验、计费记账
-    orchestration/  路由、上下文与迭代循环；loop.py 是 agent 迭代循环契约
-    goals/          多意图目标规划（GoalPlanner 影子模式 + TaskGoal 模型；阶段一/二）
-    artifacts/      类型化产物注册（TaskArtifact、已读状态、旧数据回填 backfill.py）
-    selection/      KOL 圈选与 Excel 导出（核心模块）：
-                    contract.py 导出字段契约（kol_excel_v2，标签随会话画像动态生成）
-                    models.py SessionKolSelection 表（迁移 0020，session_id+platform+kol_uid 唯一）
-                                + KolSelectionSet/KolSelectionItem（迁移 0022，版本化名单）
-                    normalizers.py/scoring.py 工具证据归一化与 6 维度加权评分（rating 4 档）
-                    service.py 圈选沉淀/查询（ingest_tool_evidence upsert、count_selections 批量）
-                    analysis.py/router.py kol-analysis 手动分析、kol-selection 名单与导出端点
-                    exporter.py + templates/ 旧 4-sheet Excel 模板渲染
-    reporting/      收藏（新旧双路径：platform+kol_uid / kol_id）与版本化分析报告；analysis_reports.py 会话级（task_id 可空）
-  migrations/       Alembic 迁移（0001_… 顺序编号）
-  tests/            pytest，目录结构与 app/ 对齐
+    admin/          管理端账号/积分管理与 agent_tool_calls 人工核对（/api/v1/admin）
+    favorites/      收藏（/api/v1/favorites，platform+kol_uid 身份 + snapshot_json 快照）
+    agent_runtime/  模型主导 Agent 运行时（当前核心）：
+                    models.py Session/Run/Attempt/Step/ToolCall/Evidence/Event/Memory ORM
+                    schemas.py 四动作协议与 Agent API DTO
+                    profiles.py 四个 Profile（session_analyst_v1/reviewer/kol_detail/utility）
+                    state.py / repository.py Run 状态机、Attempt、租约与持久化
+                    events.py / sse.py 持久事件流与 Last-Event-ID 断线续传
+                    memory.py 分层记忆（最近消息+摘要+Artifact 目录+按需历史读取）
+                    engine.py 统一模型动作循环（session_analyst）
+                    executor.py / recovery.py 租约执行器、恢复循环、unknown 核对
+                    reviewer.py Reviewer 内部 Run 与批次复核驱动
+                    kol_detail.py KOL 详情轻量 Run 与 24h 会话缓存
+                    utility.py 标题/摘要/建议等后台任务
+                    model_gateway.py 统一模型适配 + thinking 流分离
+                    circuit_breaker.py 细粒度熔断
+                    evidence.py Evidence 入库/不可变/预览
+                    tools/ 可信工具运行时：registry.py 注册表、contracts.py 契约、
+                            mcp.py MCP 桥+计费、history.py 历史读取、calculation.py 确定性计算、
+                            artifacts.py Artifact Draft 工具
+    agent_artifacts/ 强类型产物（当前核心）：
+                    models.py Artifact/Draft/Revision/Review/Version/未读/缓存 ORM
+                    payloads/ 五类强类型 payload + insight_board_v1（extra=forbid）
+                    lineage.py 字段级来源链校验与递归固化
+                    keys.py Artifact key 标准化（NFKC/SHA-256）
+                    service.py Draft/Review/原子发布/版本/未读水位
+                    builders/ 把已选 Evidence + 确定性计算转成强类型 Draft
+                    exporters/ 只读已发布 Version 生成 Excel（品牌/圈选）
+                    router.py /schemas.py Artifact 列表/详情/版本/已读/导出 API
+    mcp_gateway/    DataTap MCP 客户端、工具审核注册/校验、计费记账（复用不复制）
+    model/          腾讯 Token Plan 适配层（OpenAI 兼容 + reasoning 分离）、契约与依赖
+    selection/      scoring_v2.py 严格八维 KOL 评分（复用）、normalizers.py/schemas.py 证据归一化（复用）
+    thinking/       thinking 流 SSE（/sessions/{id}/events）保留给前端消费
+    quick/          仅保留 models.py（legacy ORM 只读，路由已移除）
+    goals/          仅保留 models.py（legacy ORM 只读）
+    tasks/          仅保留 models.py（legacy ORM 只读）
+    artifacts/      仅保留 models.py（legacy ORM 只读）
+    reporting/      仅保留 models.py + templates（legacy ORM 只读）
+    selection/      仅保留 models.py + scoring_v2.py + normalizers.py + schemas.py（legacy ORM 只读）
+    workspace/      仅保留 models.py（legacy ORM 只读）
+  migrations/       Alembic 迁移（0001_… 顺序编号；head 为 0027_agent_runtime_v3）
+  tests/            pytest，目录结构与 app/ 对齐；agent_runtime/ 与 agent_artifacts/ 为新运行时测试
 src/                React 前端
-  api/              API Client 与类型契约
-  auth/             AuthProvider
-  components/       页面组件（组件名.test.tsx 同目录单测）
-  hooks/            useWorkspace、useTaskStream
-  state/            任务事件状态、快捷 Tab 状态缓存（QuickFeatureCacheProvider，userId 隔离）
+  api/              API Client 与类型契约；agent.ts / agentArtifacts.ts 为新 Agent API
+  state/            agentEvents.ts Run SSE reducer
+  hooks/            useAgentRun、useAgentWorkspace（新运行时）、useSessionThinkingStream（thinking 消费）
+  components/       ChatArea、SessionList、WorkspaceTabs 等；agent/ 为 Run 卡/步骤/thinking/澄清；
+                    artifacts/ 为三个 BI Tab 与五类 Artifact 视图、达人详情
   test/             Vitest setup、fixtures、SSE 模拟
-e2e/                Playwright 端到端测试
+e2e/                Playwright 端到端测试（agent-runtime.spec.ts / artifact-workspace.spec.ts）
 docs/               架构设计、分阶段计划、运行手册（runbooks）、QA 记录
 server.ts           旧的 Express/Gemini 原型，仅 dev:legacy 保留，不是当前架构
 ```
 
-`package.json` 中的 `server.ts`、`@google/genai` 属于遗留原型；当前系统以后端 FastAPI 为准，新功能不要改 server.ts。
+`package.json` 中的 `server.ts`、`@google/genai` 属于遗留原型；当前系统以后端 FastAPI 为准，新功能不要改 server.ts。`src/api/` 下的旧 `sessions.ts` / `tasks.ts` / `brainstorm.ts` / `taskStream.ts` 等是遗留 API Client，新运行时已不消费，属于待清理的只读残留，不要在它们之上新增功能。
 
 ## 本地启动
 
@@ -113,20 +129,29 @@ npm run build    # 生产构建
 npm run test:e2e
 ```
 
+真实模型 + 真实 DataTap 的 UAT 默认被 pytest 跳过（`real_services` marker，`RUN_REAL_SERVICES=1` 启用），单独入口 `cd backend && ./scripts/run_real_agent_uat.sh`（强制覆盖测试隔离变量，不触碰 dev DB）。Task 26 已执行过真实 UAT；本次切档前的复跑入口与记录见 `docs/qa/2026-08-02-agent-runtime-uat.md`。
+
 ## 代码约定
 
 - Python：ruff，行宽 100，目标 `py311`。后端使用 async SQLAlchemy 2.0 风格与 pydantic-settings 配置。
 - TypeScript：`tsc --noEmit` 作为 lint；路径别名 `@/*` 指向仓库根目录。React 组件与其测试文件同目录（`Xxx.tsx` / `Xxx.test.tsx`）。
-- 数据库变更必须新增 Alembic 迁移（`backend/migrations/versions/`，沿用 `NNNN_描述.py` 编号格式），不可手改已合入的迁移。
-- API 契约：前端类型集中在 `src/api/contracts.ts`，后端 schema 在各模块 `schemas.py`，两端改动需保持一致。
-- agent 模式契约：报告块类型定义在 `backend/app/reporting/blocks.py`（前端 `ReportBlock` 与之镜像）；查询端点 `GET /api/v1/analysis-reports/{id}`；会话 DTO 带 `latest_analysis_report` 与 `kol_selection_count`，任务 DTO 带 `kind`（固定 `"agent"`）。`AgentLoopContext` 注入 `export_contract`（kol_excel_v2 导出字段契约，已无 required_metrics/remaining_calls）；每轮决策前由 executor 经 `build_loop_state` 重算 `called_tools`（当前 goal 已 settled 工具名去重保序）与 `evidence_gaps`（brand_analysis 静态阶段清单 标签匹配/概览/趋势/话题/受众 减已覆盖阶段，按工具名子串映射，其他 goal_type 恒为空）注入 user JSON；SSE 工具进度事件 `step_total` 为 null（无调用次数分母）；余额不足终态为 `insufficient_balance`（`task.failed` code="insufficient_balance"）；零证据 finish 为 `no_evidence_collected`；finish 结论写 assistant 消息（`message.completed` 带 text）。圈选契约：`session_kol_selections` 表（迁移 0020，session_id+platform+kol_uid 唯一，rating 4 档评分）；`GET /sessions/{id}/kol-selection`（名单）、`GET /sessions/{id}/kol-selection/export`（Excel 下载）、`POST /sessions/{id}/kol-analysis`（手动分析，同步响应，不发 `report.updated` SSE；名单为空返回 409 `NO_KOL_SELECTION`）；`analysis_reports` 为会话级（迁移 0020：task_id 可空、(session_id, version) 唯一）。
+- 数据库变更必须新增 Alembic 迁移（`backend/migrations/versions/`，沿用 `NNNN_描述.py` 编号格式），不可手改已合入的迁移。**新执行功能不得读取/写入旧会话、任务、Goal、报告、Quick 表**（legacy ORM 只读）。
+- API 契约：前端类型集中在 `src/api/agent.ts` / `src/api/agentArtifacts.ts`（新 Agent API）与 `src/api/contracts.ts`；后端 schema 在各模块 `schemas.py`，两端改动需保持一致。
+- Agent 契约（当前核心）：
+  - 端点前缀 `/api/v1/agent`：`POST/GET /agent/sessions`、`GET/PATCH/DELETE /agent/sessions/{session_id}`、`POST /agent/sessions/{session_id}/messages`（写消息 + 建 `session_analyst_v1` Run，`Idempotency-Key` 幂等 + 活动 Run 并发 409）、`GET /agent/runs/{run_id}`、`GET /agent/runs/{run_id}/events`（SSE，Last-Event-ID 续传）、`POST /agent/runs/{run_id}/cancel`、`POST /agent/runs/{run_id}/resume`、`POST /agent/sessions/{session_id}/kol-details`（创建 `kol_detail_v1` 轻量 Run）、`GET /agent/sessions/{session_id}/artifacts`、`GET /agent/artifacts/{artifact_id}`、`GET /agent/artifacts/{artifact_id}/versions/{version}`、`PUT /agent/sessions/{session_id}/artifact-read-state`、`GET /agent/artifacts/{artifact_id}/export`。
+  - SSE 事件：`run.started/paused/resumed/completed/failed/cancelled`、`thinking.started/delta/completed/failed`、`tool.started/succeeded/failed/unknown`、`artifact.draft.created/updated`、`review.started/revision_requested/approved/rejected`、`artifact.published`、`message.completed`；payload 必须带 `run_id`，前端按 sequence 幂等归并。
+  - 归属失败统一 404（不泄漏存在性）；导出不支持类型或未发布 draft → 409 `ARTIFACT_EXPORT_UNSUPPORTED`。
+  - Artifact 是强类型不可变 Version，`data_status` 只能 `complete/restricted`；业务数值允许 `null` 但对应路径必须 partial/unavailable 并给 limitation，前端显示「数据受限」，不得把 `null` 当 0。
+  - 不设固定阶段清单/固定工具顺序；不要在引擎里加 brand_analysis_stages、GoalPolicy、固定工具数或 KOL fallback。模型只能经 `call_tool` 间接读写数据，不能直接持有数据库连接或 DataTap 密钥。
 - 注释与文档：仓库内 Markdown 文档使用中文；代码注释可中英混用，保持与所在文件一致。
 
 ## 测试策略
 
 - 后端 pytest：`backend/tests/conftest.py` 默认注入测试环境变量，固定使用独立测试库 `kol_insight_test` 与专用账号 `kol_test`；数据库 fixture 以事务回滚方式隔离每个用例，绝不写开发库。运行 pytest 前测试库需已迁移到 head。
+  - 新运行时核心测试：`tests/agent_runtime/`（state/repository/events/sse/actions/profiles/model_gateway/tools/engine/executor/recovery/reviewer/utility/kol_detail/api/legacy_routes_removed）与 `tests/agent_artifacts/`（payloads/lineage/keys/drafts/review_batch/read_state/builders/export/cache/api）。
+  - `tests/agent_runtime/test_legacy_routes_removed.py` 断言旧执行入口（`/api/v1/quick/*`、`/sessions/{id}/brainstorm`、`/sessions/{id}/tasks`、旧 cancel/retry/events、手动 /kol-analysis 等）返回 404。
 - 前端 Vitest：jsdom 环境，setup 在 `src/test/setup.ts`，SSE 用 `src/test/fakeSse.ts` 模拟。
-- Playwright：自动拉起 8000 端口 FastAPI（注入测试环境变量）与 5173 端口 Vite，覆盖 1440×900、1024×768、390×844 三种视口；`reuseExistingServer: false`，端口被占用会直接失败——运行前确认两个端口空闲。
+- Playwright：自动拉起 8000 端口 FastAPI（注入测试环境变量）与 5173 端口 Vite，覆盖 1440×900、1024×768、390×844 三种视口；`reuseExistingServer: false`，端口被占用会直接失败——运行前确认两个端口空闲。规格为 `e2e/agent-runtime.spec.ts` 与 `e2e/artifact-workspace.spec.ts`（route mock 注入新 Agent API/SSE fixture）。
 
 ## 配置与安全
 
@@ -134,9 +159,11 @@ npm run test:e2e
 - `app/core/config.py` 在启动时做硬性校验：`MCP_CALL_POINTS` 必须为 10、密钥不得为空。模型供应商可自由配置：`TENCENT_PLAN_BASE_URL` / `TENCENT_PLAN_MODEL` / `TENCENT_PLAN_API_KEY` 支持任意 OpenAI 兼容端点（腾讯 Token Plan、月之暗面 Kimi 等）；`TENCENT_PLAN_REASONING_EFFORT`（low/high/max）为可选思考深度，仅 k3 等推理模型生效，缺省不向端点发送该参数。
 - `AUTH_MODE=mock` 仅允许 `development` 与 `test`；`production` 下检测到 mock 认证会拒绝启动。
 - 测试账号 `kol_test` 只能访问 `kol_insight_test`，禁止授予开发库或生产库权限。
-- 工具启用流程：远程发现的工具默认 quarantined；启用 = 在 `mcp_gateway/registry.py` 的 `DYNAMIC_TOOL_ALLOWLIST` 登记（内部名、审核描述、输出 Schema）并将 `review_status` 置 approved，启动时按实时签名复核，digest 变化会重新隔离。
-- 普通用户的会话、消息、钱包查询必须始终带当前认证用户条件（用户数据隔离），新增查询时不得遗漏。
+- 工具启用流程：远程发现的工具默认 quarantined；启用 = 在 `mcp_gateway/registry.py` 的 `DYNAMIC_TOOL_ALLOWLIST` 登记（内部名、审核描述、输出 Schema）并将 `review_status` 置 approved，启动时按实时签名复核，digest 变化会重新隔离。`remote_name` 一律取审核内部名（与实时网关工具名一致）。
+- 普通用户的会话、消息、Run、Evidence、Artifact、达人缓存查询必须始终带当前认证用户 + Session 归属条件（用户数据隔离），新增查询时不得遗漏；归属失败统一 404。
+- 模型永远不接触 DataTap token、数据库 DSN、JWT 密钥或完整管理员信息；`unknown` MCP 调用禁止自动重放，只能经恢复核对（`agent_tool_call_reconciliations`）后结算/释放。
 
 ## 运行手册
 
-第二阶段（模型 + MCP + KOL 圈选/报告）的运行、恢复、回滚与供应商授权步骤见 `docs/runbooks/phase-2-runtime.md`。
+- 一次性切换、发布阻断条件与回滚清单见 `docs/runbooks/agent-runtime-v3-cutover.md`（含 UAT 发现的两个 must-resolve 阻断项）。
+- 第二阶段运行/恢复/回滚与真实供应商授权、UAT 服务器部署约定见 `docs/runbooks/phase-2-runtime.md`。
