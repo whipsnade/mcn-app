@@ -52,6 +52,7 @@ function toChatSession(source: AgentWorkspaceSession): Session {
 
 // 历史 Run 的终态冻结快照：当前无历史 Run 的 SSE 回放，先用会话内 Run 元数据
 // 生成最简终态卡（无步骤/工具明细），避免历史消息下的执行卡永久停留在「加载中」。
+// 后续任务可在此按 runId 挂载 useAgentRun 回放 SSE，以渲染完整步骤/工具/思考。
 function buildRunHistory(session: AgentWorkspaceSession | undefined): Record<string, RunRuntimeState> {
   const history: Record<string, RunRuntimeState> = {};
   for (const run of session?.runs ?? []) {
@@ -196,6 +197,9 @@ export default function App() {
             favoriteCount={favorites.length}
           />
           {chatSession && workspaceTab === 'chat' ? (
+            // 注（代码审查 I3）：agent 运行时用 Run 稳定态后的建议（Task 14 complete）承载
+            // 进一步分析，resume 取代旧的 message retry；RunRuntimeState 尚未暴露 suggestions，
+            // 故 ChatArea 的 followup 区与「再次执行」暂不接线，留待 Run 回放 suggestions 后接入。
             <ChatArea
               session={chatSession}
               onSendMessage={text => workspace.sendMessage(chatSession.id, text)}

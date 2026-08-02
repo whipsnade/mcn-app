@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { Plus, Search, MessageSquare, Sparkles, SlidersHorizontal, BarChart3, LogOut, Star, Edit2, Check, X, Shield, Trash2, LoaderCircle } from 'lucide-react';
+import { Plus, Search, LogOut, Edit2, Check, X, Shield, Trash2, LoaderCircle } from 'lucide-react';
 import { Session } from '../types';
 
 interface SessionListProps {
@@ -8,7 +8,6 @@ interface SessionListProps {
   activeSessionId: string;
   onSelectSession: (id: string) => void;
   onCreateSession: () => void;
-  onToggleStar?: (id: string) => void;
   onRenameSession?: (id: string, brand: string, campaignName: string) => void;
   onDeleteSession?: (id: string) => Promise<void>;
   user?: { nickname: string; role?: 'admin' | 'user' } | null;
@@ -46,7 +45,6 @@ export default function SessionList({
   activeSessionId,
   onSelectSession,
   onCreateSession,
-  onToggleStar,
   onRenameSession,
   onDeleteSession,
   user,
@@ -56,7 +54,6 @@ export default function SessionList({
   onOpenAdmin
  }: SessionListProps) {
   const [searchQuery, setSearchQuery] = useState('');
-  const [showOnlyStarred, setShowOnlyStarred] = useState(false);
   const [editingSessionId, setEditingSessionId] = useState<string | null>(null);
   const [editBrand, setEditBrand] = useState('');
   const [editCampaignName, setEditCampaignName] = useState('');
@@ -143,12 +140,8 @@ export default function SessionList({
   };
   const maxPoints = 5000;
 
-  // Filter sessions by project metadata or message content, and optionally Starred status
+  // Filter sessions by project metadata or message content
   const filteredSessions = sessions.filter(s => {
-    if (showOnlyStarred && !s.isStarred) {
-      return false;
-    }
-
     const query = searchQuery.toLowerCase();
     const matchMeta = 
       s.brand.toLowerCase().includes(query) ||
@@ -195,7 +188,7 @@ export default function SessionList({
           </div>
         </div>
 
-        {/* Search Bar & Starred filter */}
+        {/* Search Bar（agent 运行时未建模标星，不再渲染「仅看已标星」过滤与标星按钮） */}
         <div className="flex items-center gap-1.5 mt-2">
           <div className="relative flex-1">
             <Search className="absolute left-3 top-2.5 h-3.5 w-3.5 text-slate-400" />
@@ -207,18 +200,6 @@ export default function SessionList({
               className="w-full bg-slate-100 border-none rounded-md py-1.5 pl-8.5 pr-3 text-xs focus:ring-2 focus:ring-indigo-500 text-slate-700 placeholder-slate-400 transition outline-none"
             />
           </div>
-          <button
-            onClick={() => setShowOnlyStarred(!showOnlyStarred)}
-            className={`flex h-7 px-2 items-center gap-1 justify-center rounded-lg transition active:scale-95 border shrink-0 text-[11px] font-bold ${
-              showOnlyStarred 
-                ? 'bg-amber-50 text-amber-600 border-amber-200/60' 
-                : 'bg-white text-slate-500 border-slate-200 hover:bg-slate-50'
-            }`}
-            title={showOnlyStarred ? "查看全部项目" : "仅看已标星重点项目"}
-          >
-            <Star className={`h-3 w-3 ${showOnlyStarred ? 'fill-amber-400 text-amber-500' : ''}`} />
-            <span>重点</span>
-          </button>
         </div>
       </div>
 
@@ -350,20 +331,6 @@ export default function SessionList({
                           <Trash2 className="h-3.5 w-3.5" />
                         </button>
                       )}
-                      <button
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          if (onToggleStar) onToggleStar(session.id);
-                        }}
-                        className={`p-1 rounded transition duration-150 ${
-                          session.isStarred 
-                            ? 'text-amber-500 hover:bg-amber-100/60' 
-                            : 'text-slate-300 hover:text-slate-500 hover:bg-slate-100'
-                        }`}
-                        title={session.isStarred ? "取消标星" : "标星为重点营销项目"}
-                      >
-                        <Star className={`h-3.5 w-3.5 ${session.isStarred ? 'fill-amber-400' : ''}`} />
-                      </button>
                       <span className="text-[10px] opacity-70 ml-0.5">
                         {formatUpdatedAt(session.updatedAt)}
                       </span>

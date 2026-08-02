@@ -148,6 +148,19 @@ describe('AgentRunCard', () => {
     expect(screen.queryByText('未生成思考')).toBeNull();
   });
 
+  it('labels a terminal run without replayed steps as 历史执行记录 instead of 共 0 步', () => {
+    render(<AgentRunCard run={run({ status: 'completed', steps: [], toolCalls: [] })} />);
+
+    // 折叠摘要不渲染误导性的“共 0 步”。
+    const collapsed = screen.getByRole('button', { name: /历史执行记录/ });
+    expect(collapsed).toHaveTextContent('分析完成');
+    expect(collapsed).not.toHaveTextContent('共 0 步');
+
+    // 展开后展示「暂未回放」说明，而不是空白。
+    fireEvent.click(collapsed);
+    expect(screen.getByText('该历史执行详情暂未回放')).toBeVisible();
+  });
+
   it('default export is a memoized run card', () => {
     expect((AgentRunCard as unknown as { $$typeof?: symbol }).$$typeof).toBe(Symbol.for('react.memo'));
   });

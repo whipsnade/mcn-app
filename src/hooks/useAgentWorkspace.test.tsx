@@ -1,7 +1,7 @@
 import { act, renderHook, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { ApiAgentRun, ApiAgentSession, ApiAgentSessionDetail } from '../api/agent';
+import type { ApiAgentMessage, ApiAgentRun, ApiAgentSession, ApiAgentSessionDetail } from '../api/agent';
 import * as agentApi from '../api/agent';
 import type { ApiAgentArtifact } from '../api/agentArtifacts';
 import * as agentArtifactsApi from '../api/agentArtifacts';
@@ -245,6 +245,70 @@ describe('useAgentWorkspace', () => {
     expect(runId).toBe('run-2');
     expect(result.current.activeRunId).toBe('run-2');
     expect(vi.mocked(useAgentRun).mock.calls.at(-1)?.[0]).toBe('run-2');
+  });
+
+  it('optimistically shows the user message and refetches the session detail after the run settles', async () => {
+    const userMessage: ApiAgentMessage = {
+      id: 'm-user',
+      role: 'user',
+      content: '帮我分析品牌',
+      sequence: 1,
+      run_id: 'run-2',
+      created_at: '2026-08-02T10:00:00',
+    };
+    const assistantReply: ApiAgentMessage = {
+      id: 'm-ai',
+      role: 'assistant',
+      content: '已完成分析',
+      sequence: 2,
+      run_id: 'run-2',
+      created_at: '2026-08-02T10:00:01',
+    };
+    const settledDetail: ApiAgentSessionDetail = {
+      ...s1,
+      messages: [userMessage, assistantReply],
+      runs: [run1, { ...run1, id: 'run-2', status: 'completed', completed_at: '2026-08-02T10:00:01' }],
+    };
+    vi.mocked(agentApi.listSessions).mockResolvedValue([s1]);
+    // 初始加载返回无消息详情；Run 稳定态后的回拉返回含 assistant 回复的详情。
+    vi.mocked(agentApi.getSession)
+      .mockResolvedValueOnce(s1Detail)
+      .mockResolvedValue(settledDetail);
+    vi.mocked(agentApi.sendMessage).mockResolvedValue({
+      run_id: 'run-2',
+      session_id: 's1',
+      message_id: 'm2',
+      status: 'queued',
+      reused: false,
+    });
+
+    const { rerender, result } = renderHook(() => useAgentWorkspace('user-1'));
+    await waitFor(() => expect(result.current.activeSessionId).toBe('s1'));
+
+    // 发送后用户消息立即出现（乐观插入），并回填 run_id 供执行卡锚定。
+    await act(async () => {
+      await result.current.sendMessage('s1', '帮我分析品牌');
+    });
+    expect(result.current.activeRunId).toBe('run-2');
+    const optimistic = result.current.activeSession?.messages.find(message => message.content === '帮我分析品牌');
+    expect(optimistic).toBeTruthy();
+    expect(optimistic?.run_id).toBe('run-2');
+    expect(result.current.activeSession?.messages.some(message => message.content === '已完成分析')).toBe(false);
+
+    // Run 到达终态 → 回拉会话详情，assistant 回复出现在消息流。
+    vi.mocked(useAgentRun).mockReturnValue({
+      ...initialRunRuntime('run-2'),
+      status: 'completed',
+      connection: 'closed',
+      steps: [{ id: 'terminal-1', label: '分析完成', status: 'succeeded' }],
+    });
+    await act(async () => {
+      rerender();
+    });
+    await waitFor(() => {
+      expect(result.current.activeSession?.messages.some(message => message.content === '已完成分析')).toBe(true);
+    });
+    expect(agentApi.getSession).toHaveBeenCalledTimes(2);
   });
 
   it('refetches artifacts only when artifact-relevant run events arrive, not on thinking deltas', async () => {

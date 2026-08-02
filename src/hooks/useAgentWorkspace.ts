@@ -71,6 +71,14 @@ function replaceSession(sessions: AgentWorkspaceSession[], next: AgentWorkspaceS
   return sessions.map(session => session.id === next.id ? next : session);
 }
 
+// 会话详情需要回拉同步的「稳定态」：终态（含积分结算）+ 暂停 + 澄清等待。
+// running/reviewing/queued 期间不打扰（由 Run SSE 驱动实时卡）。
+function isSettledRunStatus(status: string | undefined): boolean {
+  return isTerminalRunStatus(status)
+    || status === 'paused'
+    || status === 'clarification_requested';
+}
+
 export function useAgentWorkspace(userId?: string) {
   const [sessions, setSessions] = useState<AgentWorkspaceSession[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string>();
@@ -85,6 +93,8 @@ export function useAgentWorkspace(userId?: string) {
   const sessionsRef = useRef<AgentWorkspaceSession[]>([]);
   const activeSessionIdRef = useRef<string>();
   const deletedSessionIdsRef = useRef(new Set<string>());
+  // Run 稳定态回拉会话详情去重键：(sessionId, runId, status) 相同不再重复拉取。
+  const lastSessionRefetchRef = useRef<{ sessionId?: string; runId?: string; status?: string }>({});
 
   const run: RunRuntimeState | undefined = useAgentRun(activeRunId);
 
@@ -248,12 +258,36 @@ export function useAgentWorkspace(userId?: string) {
     const generation = generationRef.current;
     setBusy(true);
     setError(undefined);
+    // 乐观插入：用户消息立即出现在会话流，响应成功回填 run_id 以锚定执行卡；
+    // assistant 回复在 Run 进入稳定态后由下方 effect 回拉会话详情补充。
+    const optimisticId = `pending-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const optimisticMessage: ApiAgentMessage = {
+      id: optimisticId,
+      role: 'user',
+      content,
+      sequence: 0,
+      run_id: null,
+      created_at: new Date().toISOString(),
+    };
+    const patchMessages = (sessionIdToPatch: string, patch: (messages: ApiAgentMessage[]) => ApiAgentMessage[]) => {
+      sessionsRef.current = sessionsRef.current.map(session => session.id === sessionIdToPatch
+        ? { ...session, messages: patch(session.messages) }
+        : session);
+      setSessions(sessionsRef.current);
+    };
+    patchMessages(sessionId, messages => [...messages, optimisticMessage]);
     try {
       const response = await sendMessageRequest(sessionId, content);
       if (generationRef.current !== generation) throw new Error('STALE_WORKSPACE_REQUEST');
+      // 回填 run_id：执行卡锚定到触发它的用户消息下方。
+      patchMessages(sessionId, messages => messages.map(message => message.id === optimisticId
+        ? { ...message, run_id: response.run_id }
+        : message));
       if (activeSessionIdRef.current === sessionId) setActiveRunId(response.run_id);
       return response.run_id;
     } catch (reason) {
+      // 失败移除乐观消息，避免留下未确认内容。
+      patchMessages(sessionId, messages => messages.filter(message => message.id !== optimisticId));
       if (generationRef.current === generation) {
         setError(reason instanceof Error ? reason.message : '发送消息失败');
       }
@@ -334,6 +368,27 @@ export function useAgentWorkspace(userId?: string) {
       })
       .catch(() => undefined);
   }, [activeSessionId, run?.artifactsVersion, userId]);
+
+  // Run 进入稳定态（终态 / paused / 澄清等待）后重新拉取会话详情：让 assistant 回复
+  // （含澄清消息）出现在消息流，同时把乐观用户消息替换为服务端持久化版本。
+  useEffect(() => {
+    if (!userId || !activeSessionId || !run) return;
+    const status = run.status;
+    if (!isSettledRunStatus(status)) return;
+    const last = lastSessionRefetchRef.current;
+    if (last.sessionId === activeSessionId && last.runId === run.runId && last.status === status) return;
+    lastSessionRefetchRef.current = { sessionId: activeSessionId, runId: run.runId, status };
+    const generation = generationRef.current;
+    const requestedSessionId = activeSessionId;
+    void getSession(requestedSessionId)
+      .then(detail => {
+        if (generationRef.current !== generation) return;
+        const session = toWorkspaceSession(detail);
+        sessionsRef.current = replaceSession(sessionsRef.current, session);
+        setSessions(sessionsRef.current);
+      })
+      .catch(() => undefined);
+  }, [activeSessionId, run, userId]);
 
   // 加载后 + Run 到达终态（积分结算）时刷新钱包余额；
   // 只在终态翻转时刷新，不在 running/reviewing 之间反复拉取。

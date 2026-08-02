@@ -87,8 +87,12 @@ export function AgentRunCardImpl({
   const stepCount = run.steps.length;
   const canPause = (run.status === 'running' || run.status === 'reviewing') && onPause !== undefined;
 
-  // 终态折叠：一行可展开摘要。
+  // 终态折叠：一行可展开摘要。历史 Run（未回放步骤）不渲染“共 0 步”的误导文案，
+  // 改用「历史执行记录」；后续可在此按 runId 回放 SSE 以展示完整步骤（见 buildRunHistory 注释）。
   if (collapsed) {
+    const summaryLabel = terminal && stepCount === 0
+      ? '历史执行记录'
+      : `执行卡 · 共 ${stepCount} 步`;
     return (
       <button
         type="button"
@@ -98,7 +102,7 @@ export function AgentRunCardImpl({
       >
         <Workflow className="h-3.5 w-3.5 shrink-0 text-indigo-500" aria-hidden="true" />
         <span className="flex-1 text-[11px] font-medium text-slate-600">
-          执行卡 · 共 {stepCount} 步
+          {summaryLabel}
           <span className="text-slate-400"> · {statusMeta.label}</span>
         </span>
         <ChevronRight className="h-3.5 w-3.5 shrink-0 text-slate-400" aria-hidden="true" />
@@ -153,6 +157,12 @@ export function AgentRunCardImpl({
           <AgentThinking text={run.thinking} hasThinking={run.hasThinking} status={run.thinkingStatus} />
         )}
         <AgentRunSteps toolCalls={run.toolCalls} />
+        {/* 历史 Run 未回放步骤时的展开说明（避免展开后空白误导）。 */}
+        {terminal && stepCount === 0 && (
+          <p className="rounded-lg bg-slate-50 px-3 py-2 text-[10px] leading-4 text-slate-400">
+            该历史执行详情暂未回放
+          </p>
+        )}
         {run.review && (
           <div className="flex items-center gap-1.5">
             <ShieldCheck className="h-3.5 w-3.5 shrink-0 text-indigo-500" aria-hidden="true" />
