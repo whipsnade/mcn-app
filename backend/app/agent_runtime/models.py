@@ -16,6 +16,9 @@ from sqlalchemy.dialects.mysql import MEDIUMTEXT
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
+# Load agent_artifacts tables so agent_runtime.models imports standalone without
+# relying on db/models.py to register the FK target (memory_entries.source_artifact_id).
+import app.agent_artifacts.models  # noqa: F401
 
 
 class AgentSession(Base):

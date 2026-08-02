@@ -59,3 +59,20 @@ def test_artifact_read_states_has_new_schema_columns_and_unique() -> None:
         for constraint in states.constraints
         if isinstance(constraint, UniqueConstraint)
     )
+
+
+def test_artifact_read_states_session_id_foreign_key() -> None:
+    states = Base.metadata.tables["artifact_read_states"]
+    assert {fk.target_fullname for fk in states.c.session_id.foreign_keys} == {"sessions.id"}
+
+
+def test_immutable_tables_have_no_updated_at() -> None:
+    for table_name in (
+        "artifact_draft_revisions",
+        "agent_artifact_versions",
+        "artifact_review_attempts",
+        "agent_tool_call_reconciliations",
+    ):
+        assert "updated_at" not in [
+            column.name for column in Base.metadata.tables[table_name].columns
+        ]

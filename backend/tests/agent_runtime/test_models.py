@@ -67,3 +67,17 @@ def test_agent_events_run_sequence_unique() -> None:
         for constraint in events.constraints
         if isinstance(constraint, UniqueConstraint)
     )
+
+
+def test_agent_tool_calls_step_id_not_null() -> None:
+    tool_calls = Base.metadata.tables["agent_tool_calls"]
+    assert tool_calls.c.step_id.nullable is False
+
+
+def test_agent_tool_calls_logical_call_id_unique() -> None:
+    tool_calls = Base.metadata.tables["agent_tool_calls"]
+    assert any(
+        tuple(column.name for column in constraint.columns) == ("logical_call_id",)
+        for constraint in tool_calls.constraints
+        if isinstance(constraint, UniqueConstraint)
+    )
