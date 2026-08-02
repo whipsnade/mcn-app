@@ -9,7 +9,17 @@ import dataclasses
 
 import pytest
 
-from app.agent_runtime.profiles import AgentProfile, PROFILES, get_profile
+from app.agent_runtime.profiles import (
+    ARTIFACT_TOOLS,
+    CALCULATION_TOOLS,
+    HISTORY_TOOLS,
+    KOL_DETAIL_TOOLS,
+    MCP_TOOLS,
+    TOOL_CATEGORIES,
+    AgentProfile,
+    PROFILES,
+    get_profile,
+)
 from app.agent_runtime.prompts import get_system_prompt
 
 FOUR_ACTIONS = frozenset({"ask_user", "call_tool", "submit_review", "complete"})
@@ -18,6 +28,7 @@ EXPECTED_FIELDS = {
     "name",
     "version",
     "allowed_actions",
+    "allowed_tool_categories",
     "requires_reviewer",
     "max_context_budget",
     "output_schema",
@@ -76,6 +87,53 @@ def test_utility_complete_only_no_reviewer() -> None:
     profile = PROFILES["utility_v1"]
     assert profile.allowed_actions == frozenset({"complete"})
     assert profile.requires_reviewer is False
+
+
+def test_session_analyst_tool_categories() -> None:
+    profile = PROFILES["session_analyst_v1"]
+    assert profile.allowed_tool_categories == frozenset(
+        {MCP_TOOLS, HISTORY_TOOLS, CALCULATION_TOOLS, ARTIFACT_TOOLS}
+    )
+
+
+def test_artifact_reviewer_has_no_tools() -> None:
+    profile = PROFILES["artifact_reviewer_v1"]
+    assert profile.allowed_tool_categories == frozenset()
+
+
+def test_kol_detail_tool_categories() -> None:
+    profile = PROFILES["kol_detail_v1"]
+    assert profile.allowed_tool_categories == frozenset({KOL_DETAIL_TOOLS, ARTIFACT_TOOLS})
+
+
+def test_utility_has_no_tools() -> None:
+    profile = PROFILES["utility_v1"]
+    assert profile.allowed_tool_categories == frozenset()
+
+
+def test_tool_categories_are_a_set_not_a_sequence() -> None:
+    for profile in PROFILES.values():
+        # 分类是集合而非有序序列：仍然满足「Profile 不含固定工具调用顺序」。
+        assert isinstance(profile.allowed_tool_categories, frozenset)
+
+
+def test_unknown_tool_category_rejected() -> None:
+    with pytest.raises(ValueError):
+        AgentProfile(
+            name="bad",
+            version="v1",
+            allowed_actions=frozenset({"complete"}),
+            allowed_tool_categories=frozenset({"typo_category"}),
+            requires_reviewer=False,
+            max_context_budget=8_000,
+            output_schema="utility_json",
+            system_prompt_key="bad_v1",
+        )
+
+
+def test_all_registered_categories_are_in_vocabulary() -> None:
+    for profile in PROFILES.values():
+        assert profile.allowed_tool_categories.issubset(TOOL_CATEGORIES)
 
 
 def test_profile_fields_are_frozen_schema() -> None:

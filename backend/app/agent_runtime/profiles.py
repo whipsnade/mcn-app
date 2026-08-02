@@ -10,12 +10,27 @@ from dataclasses import dataclass
 
 from app.agent_runtime.schemas import FOUR_ACTIONS
 
+# 工具分类标签词汇表（设计文档 §五「允许工具集合」）。
+# 分类是 CATEGORY TAGS 而非具体工具名：具体工具在 Task 7 Tool Registry 中
+# 按分类解析。引擎据此对 call_tool.internal_tool_name 做按 Profile 的校验。
+MCP_TOOLS = "mcp"  # 已审核 DataTap MCP 工具
+HISTORY_TOOLS = "history"  # read_artifact / search_evidence / read_tool_result
+CALCULATION_TOOLS = "calculation"  # calculate_expression / aggregate_metrics / rank_kols
+ARTIFACT_TOOLS = "artifact"  # Artifact Draft 创建 / 更新 / 提交工具
+KOL_DETAIL_TOOLS = "kol_detail"  # KOL 详情 / 原帖 / 只读缓存工具
+
+TOOL_CATEGORIES: frozenset[str] = frozenset(
+    {MCP_TOOLS, HISTORY_TOOLS, CALCULATION_TOOLS, ARTIFACT_TOOLS, KOL_DETAIL_TOOLS}
+)
+
 
 @dataclass(frozen=True)
 class AgentProfile:
     """一个冻结的 Agent 能力配置。
 
     ``allowed_actions`` 必须是四种动作协议（schemas.FOUR_ACTIONS）的子集。
+    ``allowed_tool_categories`` 必须是 TOOL_CATEGORIES 词汇表的子集，且是集合
+    而非有序序列——Profile 仍不编码任何固定工具调用顺序。
     ``output_schema`` 是短描述符：``agent_actions``（四种动作协议）/
     ``review_decision``（approve/revise/reject，独立于动作协议）/
     ``utility_json``（对应强类型 Utility 输出）。
@@ -24,6 +39,7 @@ class AgentProfile:
     name: str
     version: str
     allowed_actions: frozenset[str]
+    allowed_tool_categories: frozenset[str]
     requires_reviewer: bool
     max_context_budget: int
     output_schema: str
@@ -34,6 +50,11 @@ class AgentProfile:
             raise ValueError(
                 f"allowed_actions must be a subset of {sorted(FOUR_ACTIONS)}; "
                 f"got {sorted(self.allowed_actions)}"
+            )
+        if not self.allowed_tool_categories.issubset(TOOL_CATEGORIES):
+            raise ValueError(
+                f"allowed_tool_categories must be a subset of {sorted(TOOL_CATEGORIES)}; "
+                f"got {sorted(self.allowed_tool_categories)}"
             )
 
     @property
@@ -46,6 +67,7 @@ def _make_profile(
     name: str,
     version: str,
     allowed_actions: frozenset[str],
+    allowed_tool_categories: frozenset[str],
     requires_reviewer: bool,
     max_context_budget: int,
     output_schema: str,
@@ -54,6 +76,7 @@ def _make_profile(
         name=name,
         version=version,
         allowed_actions=allowed_actions,
+        allowed_tool_categories=allowed_tool_categories,
         requires_reviewer=requires_reviewer,
         max_context_budget=max_context_budget,
         output_schema=output_schema,
@@ -69,6 +92,9 @@ PROFILES: dict[str, AgentProfile] = {
             name="session_analyst",
             version="v1",
             allowed_actions=frozenset({"ask_user", "call_tool", "submit_review", "complete"}),
+            allowed_tool_categories=frozenset(
+                {MCP_TOOLS, HISTORY_TOOLS, CALCULATION_TOOLS, ARTIFACT_TOOLS}
+            ),
             requires_reviewer=True,
             max_context_budget=128_000,
             output_schema="agent_actions",
@@ -78,6 +104,7 @@ PROFILES: dict[str, AgentProfile] = {
             name="artifact_reviewer",
             version="v1",
             allowed_actions=frozenset(),
+            allowed_tool_categories=frozenset(),
             requires_reviewer=False,
             max_context_budget=32_000,
             output_schema="review_decision",
@@ -88,6 +115,7 @@ PROFILES: dict[str, AgentProfile] = {
             name="kol_detail",
             version="v1",
             allowed_actions=frozenset({"call_tool", "submit_review", "complete"}),
+            allowed_tool_categories=frozenset({KOL_DETAIL_TOOLS, ARTIFACT_TOOLS}),
             requires_reviewer=True,
             max_context_budget=32_000,
             output_schema="agent_actions",
@@ -97,6 +125,7 @@ PROFILES: dict[str, AgentProfile] = {
             name="utility",
             version="v1",
             allowed_actions=frozenset({"complete"}),
+            allowed_tool_categories=frozenset(),
             requires_reviewer=False,
             max_context_budget=8_000,
             output_schema="utility_json",
@@ -114,7 +143,13 @@ def get_profile(name: str) -> AgentProfile:
 
 
 __all__ = [
+    "ARTIFACT_TOOLS",
     "AgentProfile",
+    "CALCULATION_TOOLS",
+    "HISTORY_TOOLS",
+    "KOL_DETAIL_TOOLS",
+    "MCP_TOOLS",
     "PROFILES",
+    "TOOL_CATEGORIES",
     "get_profile",
 ]
