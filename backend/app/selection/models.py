@@ -1,3 +1,5 @@
+"""legacy/read-only ORM：仅注册旧表（圈选/快照），不导出执行服务。"""
+
 from __future__ import annotations
 
 from datetime import datetime

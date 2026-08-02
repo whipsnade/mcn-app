@@ -1,3 +1,5 @@
+"""legacy/read-only ORM：仅注册旧表（TaskArtifact/ArtifactReadState），不导出执行服务。"""
+
 from datetime import datetime
 from typing import Any
 

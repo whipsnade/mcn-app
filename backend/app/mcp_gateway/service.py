@@ -6,6 +6,7 @@ import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import lru_cache
 from typing import Protocol
 from uuid import uuid4
 
@@ -13,7 +14,10 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.mcp_gateway.contracts import McpCallStatus
+from app.core.config import get_settings
+from app.db.session import SessionFactory
+from app.mcp_gateway.contracts import DataTapService, McpCallStatus
+from app.mcp_gateway.datatap import DataTapTransport
 from app.mcp_gateway.models import McpCall
 from app.mcp_gateway.accounting import McpAccounting
 from app.mcp_gateway.registry import ToolNotEnabledError, ToolRegistryService
@@ -45,6 +49,39 @@ logger = logging.getLogger(__name__)
 
 
 _UNSAFE_TEXT_MARKERS = ("http://", "https://", "bearer", "token", "api_key", "apikey")
+
+
+@lru_cache
+def get_mcp_transport() -> DataTapTransport:
+    """构造 DataTap MCP 桥传输（原 tasks.dependencies 迁移，供 Agent 工具/恢复共用）。"""
+    settings = get_settings()
+    return DataTapTransport(
+        token=settings.datatap_mcp_token,
+        read_timeout_seconds=settings.datatap_read_timeout_seconds,
+    )
+
+
+async def refresh_approved_datatap_tools() -> None:
+    """服务启动时将已审核工具的最新签名写入本地目录。
+
+    目录读取不触发 MCP 工具函数调用，也不计费。
+    签名发生变化时注册中心会自动隔离工具，避免后续调用使用未复核的参数契约。
+    """
+    async with SessionFactory.begin() as db:
+        registry = ToolRegistryService(db, get_mcp_transport())
+        # Brand insight and all-channel KOL capabilities are independently
+        # refreshed. A temporary outage in one service must not hide tools
+        # already approved for the remaining channels.
+        for service in (
+            DataTapService.INSIGHT_CUBE,
+            DataTapService.SOCIAL_GROW,
+            DataTapService.SOCIAL_GROW_CONTENT,
+            DataTapService.BILIBILI,
+        ):
+            try:
+                await registry.refresh_service(service)
+            except Exception:
+                continue
 
 
 def safe_upstream_text(text: str | None, *, limit: int = 300) -> str | None:

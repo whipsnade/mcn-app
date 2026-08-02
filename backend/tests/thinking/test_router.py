@@ -1,21 +1,54 @@
 import asyncio
 import json
 from collections.abc import AsyncIterator, Callable
+from datetime import UTC, datetime
+from uuid import uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_db
+from app.identity.models import AuthIdentity
 from app.main import create_app
 from app.thinking.contracts import ThinkingEvent
+from app.workspace.models import WorkspaceSession
+
+
+async def _seed_session(db_session: AsyncSession, phone: str) -> str:
+    """为指定手机号用户直接播种一个会话（legacy workspace POST /sessions 已下线）。"""
+    identity = await db_session.scalar(
+        select(AuthIdentity).where(
+            AuthIdentity.provider == "sms", AuthIdentity.provider_subject == phone
+        )
+    )
+    assert identity is not None
+    now = datetime.now(UTC).replace(tzinfo=None)
+    session = WorkspaceSession(
+        id=str(uuid4()),
+        user_id=identity.user_id,
+        title="思考会话",
+        brand="",
+        status="draft",
+        platforms=[],
+        target_audience="",
+        last_accessed_at=now,
+        created_at=now,
+        updated_at=now,
+    )
+    db_session.add(session)
+    await db_session.flush()
+    return session.id
 
 
 @pytest.mark.asyncio
-async def test_session_thinking_events_require_session_owner(auth_client_factory) -> None:
-    owner = await auth_client_factory("13500000101")
+async def test_session_thinking_events_require_session_owner(
+    auth_client_factory, db_session
+) -> None:
+    await auth_client_factory("13500000101")
     stranger = await auth_client_factory("13500000102")
-    session_id = (await owner.post("/api/v1/sessions", json={})).json()["id"]
+    session_id = await _seed_session(db_session, "13500000101")
 
     response = await stranger.get(
         f"/api/v1/sessions/{session_id}/events",
@@ -89,7 +122,7 @@ async def test_session_thinking_events_emit_sse_snapshot_keepalive_and_cleanup(
             json={"phone": "13500000103", "code": "000000"},
         )
         client.headers["Authorization"] = f"Bearer {login.json()['access_token']}"
-        session_id = (await client.post("/api/v1/sessions", json={})).json()["id"]
+        session_id = await _seed_session(db_session, "13500000103")
 
         response = await client.get(
             f"/api/v1/sessions/{session_id}/events",

@@ -1,4 +1,3 @@
-import asyncio
 import os
 from collections.abc import Callable
 from contextlib import asynccontextmanager
@@ -23,9 +22,7 @@ from app.mcp_gateway.contracts import DataTapService
 from app.mcp_gateway.models import McpToolCatalog
 from app.mcp_gateway.registry import DYNAMIC_TOOL_ALLOWLIST
 from app.model.dependencies import get_model_adapter
-from app.quick.service import release_stale_quick_calls
-from app.tasks.dependencies import (
-    create_task_runtime,
+from app.mcp_gateway.service import (
     get_mcp_transport,
     refresh_approved_datatap_tools,
 )
@@ -138,53 +135,26 @@ def create_agent_runtime() -> tuple[
 
 def create_app() -> FastAPI:
     settings = get_settings()
-    runner, recovery = create_task_runtime()
     agent_executor, agent_recovery, agent_broker, agent_engine_factory = create_agent_runtime()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         await refresh_approved_datatap_tools()
-        app.state.task_runner = runner
         app.state.agent_executor = agent_executor
         app.state.agent_recovery = agent_recovery
         app.state.agent_event_broker = agent_broker
         app.state.agent_engine_factory = agent_engine_factory
         agent_executor.start()
         agent_recovery.start()
-        stop_recovery = asyncio.Event()
-
-        async def recover_once() -> None:
-            try:
-                await recovery.recover_expired()
-                await recovery.recover_pending_followups()
-                await release_stale_quick_calls(older_than_seconds=300)
-            except Exception:
-                # A later fixed-interval pass retries transient database faults.
-                return
-
-        async def recover_periodically() -> None:
-            while not stop_recovery.is_set():
-                try:
-                    await asyncio.wait_for(stop_recovery.wait(), timeout=30)
-                except TimeoutError:
-                    await recover_once()
-
-        startup_recovery = asyncio.create_task(recover_once())
-        coordinator = asyncio.create_task(recover_periodically())
         try:
             yield
         finally:
-            stop_recovery.set()
-            await coordinator
-            await startup_recovery
-            await runner.shutdown()
             await agent_recovery.stop()
             await agent_executor.stop()
 
     app = FastAPI(title="KOL Insight API", version="0.1.0", lifespan=lifespan)
     # httpx's ASGI transport may skip lifespan in narrow route tests; keep the
-    # same runner available while production startup still performs recovery.
-    app.state.task_runner = runner
+    # same agent runtime available while production startup still performs recovery.
     app.state.agent_executor = agent_executor
     app.state.agent_recovery = agent_recovery
     app.state.agent_event_broker = agent_broker
