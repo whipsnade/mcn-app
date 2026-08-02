@@ -81,7 +81,7 @@ export function runKolAnalysis(sessionId: string): Promise<ApiAnalysisReport> {
   return request<ApiAnalysisReport>(`/api/v1/sessions/${sessionId}/kol-analysis`, { method: 'POST' });
 }
 
-// xlsx 是二进制下载，不能走 request 的 JSON 路径（错误处理模式参照 quick.ts 的 postEvaluate）。
+// xlsx 是二进制下载，不能走 request 的 JSON 路径（错误处理直接按 HTTP 状态码兜底）。
 export async function downloadKolSelection(sessionId: string, setId?: string): Promise<void> {
   const setQuery = setId ? `?set_id=${encodeURIComponent(setId)}` : '';
   const response = await authorizedFetch(`/api/v1/sessions/${sessionId}/kol-selection/export${setQuery}`);

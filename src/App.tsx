@@ -1,34 +1,80 @@
-import React, { useCallback, useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 
+import type { ApiAgentMessage } from './api/agent';
 import type { ApiFavorite } from './api/contracts';
 import { getFavoriteKolSelectionRef, listFavorites } from './api/favorites';
 import type { KolSelectionItem } from './api/kolSelection';
-import { getWallet } from './api/wallet';
 import { useAuth } from './auth/AuthProvider';
 import AdminPanel from './components/AdminPanel';
+import ArtifactWorkspace from './components/artifacts/ArtifactWorkspace';
 import ChatArea from './components/ChatArea';
-import EvaluatePanel from './components/EvaluatePanel';
 import FavoritesPanel from './components/FavoritesPanel';
-import KolDetailView from './components/KolDetailView';
-import KolRecommendPanel from './components/KolRecommendPanel';
 import KolSelectionDetailDialog from './components/KolSelectionDetailDialog';
 import LoginPage from './components/LoginPage';
 import MobileWorkspaceNav, { type WorkspacePane } from './components/MobileWorkspaceNav';
 import RechargeModal from './components/RechargeModal';
 import SessionList from './components/SessionList';
-import TopPostsPanel from './components/TopPostsPanel';
-import UniversalReport from './components/UniversalReport';
-import { QUICK_TAB_IDS, WorkspaceTabs, type WorkspaceTab } from './components/WorkspaceTabs';
-import { useWorkspace } from './hooks/useWorkspace';
-import { QuickFeatureCacheProvider } from './state/QuickFeatureCache';
-import { isTerminalTaskStatus } from './state/taskEvents';
-import type { QuickKolSelection } from './types';
+import { WorkspaceTabs, type WorkspaceTab } from './components/WorkspaceTabs';
+import { useAgentWorkspace, type AgentWorkspaceSession } from './hooks/useAgentWorkspace';
+import { isTerminalRunStatus, type RunRuntimeState } from './state/agentEvents';
+import type { Message, QuickKolSelection, Session } from './types';
 
+
+// 把 agent 会话消息（ApiAgentMessage）适配为 ChatArea/SessionList 期望的 Message。
+function toChatMessage(message: ApiAgentMessage): Message {
+  return {
+    id: message.id,
+    sender: message.role === 'assistant' ? 'ai' : message.role === 'user' ? 'user' : 'system',
+    text: message.content,
+    timestamp: new Date(message.created_at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }),
+    runId: message.run_id ?? undefined,
+  };
+}
+
+// agent 会话没有旧会话的结构化品牌/渠道元数据，全部置空（标题为主展示）。
+function toChatSession(source: AgentWorkspaceSession): Session {
+  return {
+    id: source.id,
+    title: source.title,
+    brand: '',
+    campaignName: null,
+    status: 'completed',
+    platform: '',
+    category: '',
+    targetAudience: '',
+    summary: source.messages.find(message => message.role === 'user')?.content ?? '',
+    messages: source.messages.map(toChatMessage),
+    isStarred: false,
+    createdAt: source.createdAt,
+    updatedAt: source.updatedAt,
+  };
+}
+
+// 历史 Run 的终态冻结快照：当前无历史 Run 的 SSE 回放，先用会话内 Run 元数据
+// 生成最简终态卡（无步骤/工具明细），避免历史消息下的执行卡永久停留在「加载中」。
+function buildRunHistory(session: AgentWorkspaceSession | undefined): Record<string, RunRuntimeState> {
+  const history: Record<string, RunRuntimeState> = {};
+  for (const run of session?.runs ?? []) {
+    history[run.id] = {
+      runId: run.id,
+      lastEventId: 0,
+      connection: 'closed',
+      status: run.status as RunRuntimeState['status'],
+      steps: [],
+      toolCalls: [],
+      thinking: '',
+      hasThinking: false,
+      drafts: [],
+      messageCompleted: false,
+      artifactsVersion: 0,
+    };
+  }
+  return history;
+}
 
 export default function App() {
   const { user, status: authStatus, logout } = useAuth();
-  const workspace = useWorkspace(authStatus === 'authenticated' ? user?.id : undefined);
-  const [points, setPoints] = useState<number | null>(null);
+  const workspace = useAgentWorkspace(authStatus === 'authenticated' ? user?.id : undefined);
   const [isRechargeOpen, setIsRechargeOpen] = useState(false);
   const [isAdminOpen, setIsAdminOpen] = useState(false);
   const [mobilePane, setMobilePane] = useState<WorkspacePane>('sessions');
@@ -36,28 +82,39 @@ export default function App() {
   const [favorites, setFavorites] = useState<readonly ApiFavorite[]>([]);
   const [favoritesLoading, setFavoritesLoading] = useState(false);
   const [favoritesRefreshKey, setFavoritesRefreshKey] = useState(0);
-  const [selectedKol, setSelectedKol] = useState<QuickKolSelection | null>(null);
-  // 收藏点击：优先复用圈选详情弹窗与名单版本缓存（解析失败回退快捷详情）。
+  // 收藏点击：优先复用圈选详情弹窗（缓存快照优先，弹窗内可刷新）；
+  // 解析失败不回退旧 Quick API——快照仍在卡片展示，刷新依赖活跃会话。
   const [favoriteDetail, setFavoriteDetail] = useState<{
     sessionId: string;
     setId: string;
     item: KolSelectionItem;
   } | null>(null);
 
+  const chatSession = useMemo(
+    () => (workspace.activeSession ? toChatSession(workspace.activeSession) : undefined),
+    [workspace.activeSession],
+  );
+  const runHistory = useMemo(
+    () => buildRunHistory(workspace.activeSession),
+    [workspace.activeSession],
+  );
+  const runStatus = workspace.run?.status;
+  // 执行中 / 审核中视为分析中，禁止发送；澄清等待（clarification_requested）需用户作答，不阻塞输入。
+  const isAnalyzing = workspace.busy || Boolean(
+    runStatus && runStatus !== 'clarification_requested' && !isTerminalRunStatus(runStatus),
+  );
+
   const handleFavoriteSelect = useCallback((kol: QuickKolSelection) => {
     getFavoriteKolSelectionRef(kol.platform, kol.kw_uid)
       .then(ref => setFavoriteDetail({ sessionId: ref.session_id, setId: ref.set_id, item: ref.item }))
-      .catch(() => setSelectedKol(kol));
+      .catch(() => undefined);
   }, []);
 
-  const refreshWallet = useCallback(async () => {
-    try {
-      const wallet = await getWallet();
-      setPoints(wallet.available);
-    } catch {
-      setPoints(null);
-    }
-  }, []);
+  // 有活跃会话时走新 kol-details API（createKolDetail）刷新达人详情。
+  const handleRefreshFavoriteDetail = useCallback((favorite: ApiFavorite) => {
+    if (!workspace.activeSessionId || !favorite.kol_uid) return;
+    return workspace.createKolDetail(workspace.activeSessionId, favorite.platform, favorite.kol_uid);
+  }, [workspace.activeSessionId, workspace.createKolDetail]);
 
   // 收藏是用户级数据：登出/会话切换不重置，仅未登录与拉取失败时按空列表处理（不阻塞面板）。
   const refreshFavorites = useCallback(() => {
@@ -82,48 +139,17 @@ export default function App() {
     return () => { active = false; };
   }, [authStatus, favoritesRefreshKey]);
 
-  useEffect(() => {
-    if (authStatus !== 'authenticated') {
-      setPoints(null);
-      return;
-    }
-
-    void refreshWallet();
-  }, [authStatus, refreshWallet]);
-
-  useEffect(() => {
-    if (authStatus !== 'authenticated') return;
-    const status = workspace.taskRuntime?.status;
-    const settled = workspace.taskRuntime?.activity === '本次调用积分已结算';
-    if (!settled && !isTerminalTaskStatus(status)) return;
-    void refreshWallet();
-  }, [authStatus, refreshWallet, workspace.taskRuntime?.activity, workspace.taskRuntime?.status]);
-
   const handleCreateSession = async () => {
     setWorkspaceTab('chat');
-    await workspace.createSession({});
+    await workspace.createSession();
     setMobilePane('chat');
   };
 
-  const handleToggleStar = async (id: string) => {
-    const session = workspace.sessions.find(item => item.id === id);
-    if (!session) return;
-    await workspace.updateSession(id, { is_starred: !session.isStarred });
-  };
-
-  const handleRenameSession = async (
-    id: string,
-    brand: string,
-    campaignName: string,
-  ) => {
-    const changes: Record<string, unknown> = {
-      brand,
-      campaign_name: campaignName,
-    };
-    // brand/campaign 都为空时不 PATCH 空 title（后端会 422）。
+  const handleRenameSession = async (id: string, brand: string, campaignName: string) => {
+    // agent 会话重命名只落 title；brand/campaign 都为空时不 PATCH 空标题。
     const title = campaignName ? `${brand}-${campaignName}` : brand;
-    if (title.trim()) changes.title = title;
-    await workspace.updateSession(id, changes);
+    if (!title.trim()) return;
+    await workspace.renameSession(id, title);
   };
 
   if (authStatus === 'loading') {
@@ -145,7 +171,7 @@ export default function App() {
       <div className="flex min-h-0 flex-1 overflow-hidden">
         <div className={`${mobilePane === 'sessions' ? 'block' : 'hidden'} h-full min-h-0 w-full shrink-0 xl:block xl:w-auto`}>
           <SessionList
-            sessions={workspace.sessions}
+            sessions={workspace.sessions.map(toChatSession)}
             activeSessionId={workspace.activeSessionId ?? ''}
             onSelectSession={id => {
               setWorkspaceTab('chat');
@@ -153,121 +179,70 @@ export default function App() {
               setMobilePane('chat');
             }}
             onCreateSession={() => void handleCreateSession().catch(() => undefined)}
-            onToggleStar={id => void handleToggleStar(id).catch(() => undefined)}
             onRenameSession={(id, brand, campaignName) => void handleRenameSession(id, brand, campaignName).catch(() => undefined)}
             onDeleteSession={id => workspace.deleteSession(id)}
             user={user}
             onLogout={() => void logout()}
-            points={points}
+            points={workspace.wallet?.available ?? null}
             onOpenRecharge={() => setIsRechargeOpen(true)}
             onOpenAdmin={user.role === 'admin' ? () => setIsAdminOpen(true) : undefined}
           />
         </div>
 
         <div className={`${mobilePane === 'chat' ? 'flex' : 'hidden'} h-full min-h-0 min-w-0 flex-1 flex-col xl:flex`}>
-          {/* Provider 挂在条件块外：快捷功能是不绑定会话的全局功能，
-              无会话时切到非快捷 Tab 只卸载条件块内容，缓存保留。 */}
-          <QuickFeatureCacheProvider userId={user.id}>
-            {workspace.activeSession || QUICK_TAB_IDS.includes(workspaceTab) ? (
-              <>
-                <WorkspaceTabs
-                  active={workspaceTab}
-                  onChange={setWorkspaceTab}
-                  favoriteCount={favorites.length}
-                />
-                {workspaceTab === 'kol' && (
-                  <KolRecommendPanel
-                    onSelectKol={kol => setSelectedKol(kol)}
-                    favorites={favorites}
-                    onFavoriteToggled={refreshFavorites}
-                  />
+          <WorkspaceTabs
+            active={workspaceTab}
+            onChange={setWorkspaceTab}
+            favoriteCount={favorites.length}
+          />
+          {chatSession && workspaceTab === 'chat' ? (
+            <ChatArea
+              session={chatSession}
+              onSendMessage={text => workspace.sendMessage(chatSession.id, text)}
+              isAnalyzing={isAnalyzing}
+              isMockMode={false}
+              run={workspace.run}
+              runHistory={runHistory}
+              onResumeRun={() => workspace.resumeActiveRun()}
+              onCancelRun={() => workspace.cancelActiveRun()}
+            />
+          ) : workspaceTab === 'favorites' ? (
+            <FavoritesPanel
+              favorites={favorites}
+              loading={favoritesLoading}
+              onRefresh={refreshFavorites}
+              onSelectKol={handleFavoriteSelect}
+              sessionId={workspace.activeSessionId}
+              onRefreshDetail={handleRefreshFavoriteDetail}
+            />
+          ) : (
+            <div className="flex flex-1 items-center justify-center bg-slate-50">
+              <div className="text-center">
+                <p className="text-xs font-medium text-slate-500">
+                  {workspace.loading ? '正在加载历史会话…' : '请选择或新建一个 KOL 筛选会话'}
+                </p>
+                {!workspace.loading && (
+                  <button
+                    onClick={() => void handleCreateSession().catch(() => undefined)}
+                    className="mt-3 rounded-lg bg-indigo-600 px-3 py-1.5 text-[11px] font-semibold text-white shadow-sm transition hover:bg-indigo-700"
+                  >
+                    新建分析会话
+                  </button>
                 )}
-                {workspaceTab === 'posts-xhs' && (
-                  <TopPostsPanel platform="xiaohongshu" />
-                )}
-                {workspaceTab === 'posts-dy' && (
-                  <TopPostsPanel platform="douyin" />
-                )}
-                {workspaceTab === 'evaluate' && (
-                  <EvaluatePanel />
-                )}
-                {workspace.activeSession && workspaceTab === 'chat' && (
-                  <ChatArea
-                    session={workspace.activeSession}
-                    onSendMessage={async text => {
-                      await workspace.appendMessage(text);
-                    }}
-                    isAnalyzing={workspace.isAnalyzing}
-                    isClarifying={workspace.isClarifying}
-                    onCancelTask={workspace.cancelActiveTask}
-                    isCancelling={workspace.cancelRequested}
-                    isMockMode={false}
-                    flowTaskId={workspace.taskRuntime?.taskId}
-                    flowNodes={workspace.taskRuntime?.nodes ?? []}
-                    flowTerminal={isTerminalTaskStatus(workspace.taskRuntime?.status)}
-                    flowTerminalLabel={workspace.taskRuntime?.phaseLabel}
-                    taskFlows={workspace.taskFlows}
-                    assistantDraft={workspace.taskRuntime?.assistantDraft ?? ''}
-                    onRetryMessage={messageId => workspace.retryMessage(messageId)}
-                    followupStatus={workspace.activeSession.analysis?.followupStatus}
-                    followupSuggestions={workspace.activeSession.analysis?.followupSuggestions}
-                    followupError={typeof workspace.activeSession.analysis?.followupError?.message === 'string'
-                      ? workspace.activeSession.analysis.followupError.message
-                      : undefined}
-                    onRetryFollowups={() => workspace.retryFollowups()}
-                  />
-                )}
-                {workspaceTab === 'favorites' && (
-                  <FavoritesPanel
-                    favorites={favorites}
-                    loading={favoritesLoading}
-                    onRefresh={refreshFavorites}
-                    onSelectKol={handleFavoriteSelect}
-                  />
-                )}
-              </>
-            ) : (
-              <div className="flex flex-1 items-center justify-center bg-slate-50">
-                <div className="text-center">
-                  <p className="text-xs font-medium text-slate-500">
-                    {workspace.loading ? '正在加载历史会话…' : '请选择或新建一个 KOL 筛选会话'}
-                  </p>
-                  {!workspace.loading && (
-                    <button
-                      onClick={() => void handleCreateSession().catch(() => undefined)}
-                      className="mt-3 rounded-lg bg-indigo-600 px-3 py-1.5 text-[11px] font-semibold text-white shadow-sm transition hover:bg-indigo-700"
-                    >
-                      新建分析会话
-                    </button>
-                  )}
-                </div>
               </div>
-            )}
-          </QuickFeatureCacheProvider>
+            </div>
+          )}
         </div>
 
         <div className={`${mobilePane === 'bi' ? 'block' : 'hidden'} h-full min-h-0 w-full shrink-0 xl:block xl:w-auto`}>
-          {selectedKol ? (
-            <KolDetailView selection={selectedKol} onClose={() => setSelectedKol(null)} />
-          ) : (
-            <UniversalReport
-              report={workspace.activeSession?.analysisReport}
-              taskStatus={(workspace.taskRuntime?.status ?? workspace.activeSession?.analysis?.status) as import('./api/contracts').ApiTaskStatus | undefined}
-              sessionId={workspace.activeSession?.id}
-              selectionCount={workspace.activeSession?.kolSelectionCount}
-              favorites={favorites}
-              onFavoriteToggled={refreshFavorites}
-              artifactsSummary={workspace.activeSession?.artifactsSummary}
-              onMarkArtifactSeen={(moduleKey, artifactId) => {
-                void workspace.markArtifactSeen(moduleKey, artifactId).catch(() => undefined);
-              }}
-              onReportReady={(nextReport) => {
-                if (workspace.activeSession) {
-                  workspace.setAnalysisReport(workspace.activeSession.id, nextReport);
-                }
-              }}
-            />
-          )}
+          <ArtifactWorkspace
+            sessionId={workspace.activeSessionId}
+            artifacts={workspace.artifacts}
+            markArtifactSeen={(module, lastSeenSequence) => {
+              void workspace.markArtifactSeen(module, lastSeenSequence).catch(() => undefined);
+            }}
+            createKolDetail={workspace.createKolDetail}
+          />
         </div>
       </div>
 
@@ -290,7 +265,7 @@ export default function App() {
         isOpen={isRechargeOpen}
         onClose={() => setIsRechargeOpen(false)}
         onRechargeSuccess={() => setIsRechargeOpen(false)}
-        currentPoints={points}
+        currentPoints={workspace.wallet?.available ?? null}
         maxPoints={5000}
         isAvailable={false}
       />

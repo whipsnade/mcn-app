@@ -1,4 +1,4 @@
-import { Star } from 'lucide-react';
+import { RefreshCw, Star } from 'lucide-react';
 import { Fragment, useEffect, useState } from 'react';
 
 import { deleteFavorite, deleteFavoriteByKey } from '../api/favorites';
@@ -12,6 +12,10 @@ interface FavoritesPanelProps {
   onRefresh?: () => void;
   onCountChange?: (count: number) => void;
   onSelectKol?: (kol: QuickKolSelection) => void;
+  /** 活跃会话 id；无会话时刷新入口显示「新建会话后刷新」，不回退旧 Quick API。 */
+  sessionId?: string;
+  /** 有活跃会话时的刷新入口：走新 kol-details API（createKolDetail）。 */
+  onRefreshDetail?: (favorite: ApiFavorite) => void | Promise<unknown>;
 }
 
 function platformName(platform: string): string {
@@ -38,11 +42,13 @@ interface FavoriteCardProps {
   selectable: boolean;
   onOpenDetail: () => void;
   onRemove: () => void;
+  sessionId?: string;
+  onRefreshDetail?: (favorite: ApiFavorite) => void | Promise<unknown>;
 }
 
 // 与圈选达人列表 KolSelectionCard 同款卡片：头像 + 昵称/星级 + 平台·地区·粉丝
 // + 综合评分/rating 徽标 + 互动率/报价 chips；快照缺的字段直接省略。
-function FavoriteCard({ favorite, selectable, onOpenDetail, onRemove }: FavoriteCardProps) {
+function FavoriteCard({ favorite, selectable, onOpenDetail, onRemove, sessionId, onRefreshDetail }: FavoriteCardProps) {
   const name = favorite.nickname?.trim() || '未命名达人';
   const snapshot = favorite.snapshot;
   const stars = snapshotText(snapshot, 'stars');
@@ -109,11 +115,30 @@ function FavoriteCard({ favorite, selectable, onOpenDetail, onRemove }: Favorite
           )}
         </div>
       )}
+      {/* 达人详情刷新走新 kol-details API（Task 23 §13.3）：有活跃会话才可刷新，
+          无会话提示新建会话后刷新，不回退旧 Quick API。 */}
+      {selectable && (
+        <div className="mt-2.5 border-t border-slate-100 pt-2">
+          {sessionId && onRefreshDetail ? (
+            <button
+              type="button"
+              aria-label={`刷新达人详情 ${name}`}
+              onClick={() => void onRefreshDetail(favorite)}
+              className="flex items-center gap-1 rounded-lg border border-indigo-100 bg-indigo-50 px-2.5 py-1 text-[10px] font-semibold text-indigo-600 transition hover:bg-indigo-100"
+            >
+              <RefreshCw className="h-3 w-3" aria-hidden="true" />
+              刷新详情
+            </button>
+          ) : (
+            <p className="text-[10px] font-medium text-slate-400">新建会话后刷新</p>
+          )}
+        </div>
+      )}
     </section>
   );
 }
 
-export default function FavoritesPanel({ favorites, loading = false, onRefresh, onCountChange, onSelectKol }: FavoritesPanelProps) {
+export default function FavoritesPanel({ favorites, loading = false, onRefresh, onCountChange, onSelectKol, sessionId, onRefreshDetail }: FavoritesPanelProps) {
   const [error, setError] = useState<string>();
 
   useEffect(() => {
@@ -149,6 +174,8 @@ export default function FavoritesPanel({ favorites, loading = false, onRefresh, 
           selectable={selectable}
           onOpenDetail={() => onSelectKol?.({ platform: favorite.platform, kw_uid: favorite.kol_uid!, nickname: name })}
           onRemove={() => void remove(favorite)}
+          sessionId={sessionId}
+          onRefreshDetail={onRefreshDetail}
         />
       </Fragment>
     );

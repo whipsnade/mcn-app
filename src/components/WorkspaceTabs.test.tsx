@@ -4,21 +4,19 @@ import { describe, expect, it, vi } from 'vitest';
 import { WorkspaceTabs } from './WorkspaceTabs';
 
 describe('WorkspaceTabs', () => {
-  it('exposes chat and favorites with prototype styling', () => {
-    render(<WorkspaceTabs active="chat" onChange={vi.fn()} favoriteCount={2} />);
+  it('顶部只保留智能会话与收藏', () => {
+    const onChange = vi.fn();
+    render(<WorkspaceTabs active="chat" onChange={onChange} favoriteCount={2} />);
 
     expect(screen.getByRole('tab', { name: '智能会话' })).toHaveAttribute('aria-selected', 'true');
     expect(screen.getByRole('tab', { name: '已收藏 2' })).toBeVisible();
-    expect(screen.queryByRole('tab', { name: /候选清单/ })).toBeNull();
   });
 
-  it('exposes the four quick-feature tabs after favorites', () => {
-    const onChange = vi.fn();
-    render(<WorkspaceTabs active="posts-xhs" onChange={onChange} favoriteCount={0} />);
+  it('四个快捷入口不再出现', () => {
+    render(<WorkspaceTabs active="favorites" onChange={vi.fn()} favoriteCount={0} />);
 
     for (const name of ['达人推荐', '活动评估', '小红书爆贴', '抖音爆贴']) {
-      expect(screen.getByRole('tab', { name })).toBeVisible();
+      expect(screen.queryByRole('tab', { name })).toBeNull();
     }
-    expect(screen.getByRole('tab', { name: '小红书爆贴' })).toHaveAttribute('aria-selected', 'true');
   });
 });
