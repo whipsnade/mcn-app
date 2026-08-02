@@ -67,6 +67,9 @@ class AgentMessageRead(BaseModel):
     sequence: int
     run_id: str | None = None
     created_at: datetime
+    # ask_user 澄清等结构化 metadata（镜像 engine._handle_ask_user 的
+    # {type:'clarification', question, options}），前端据此渲染澄清 chips。
+    metadata: dict[str, Any] | None = None
 
 
 class AgentRunRead(BaseModel):
@@ -331,7 +334,18 @@ async def get_session(
         status=session.status,
         created_at=session.created_at,
         updated_at=session.updated_at,
-        messages=[AgentMessageRead.model_validate(item) for item in messages],
+        messages=[
+            AgentMessageRead(
+                id=item.id,
+                role=item.role,
+                content=item.content,
+                sequence=item.sequence,
+                run_id=item.run_id,
+                created_at=item.created_at,
+                metadata=item.metadata_json,
+            )
+            for item in messages
+        ],
         runs=[AgentRunRead.model_validate(item) for item in runs],
     )
 

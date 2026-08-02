@@ -37,8 +37,9 @@ function messageJson(
   content: string,
   sequence: number,
   runId: string | null,
+  metadata?: Record<string, unknown> | null,
 ): Record<string, unknown> {
-  return { id, role, content, sequence, run_id: runId, created_at: BASE_TIMESTAMP };
+  return { id, role, content, sequence, run_id: runId, created_at: BASE_TIMESTAMP, ...(metadata ? { metadata } : {}) };
 }
 
 function runJson(id: string, sessionId: string, status: string): Record<string, unknown> {
@@ -253,10 +254,14 @@ test('ask_user clarification shows the question and waiting status', async ({ pa
   await mockArtifactsEmpty(page, sessionId);
   await page.route(`**/api/v1/agent/sessions/${sessionId}/messages`, route => {
     const body = route.request().postDataJSON() as { content: string };
-    // settle 回拉后带 assistant 澄清消息（问题文本），供 Run 卡澄清区展示。
+    // settle 回拉后带 assistant 澄清消息（问题文本 + metadata），供 Run 卡澄清区展示。
     sentMessages = [
       messageJson('m-user-1', 'user', body.content, 1, runId),
-      messageJson('m-ai-1', 'assistant', question, 2, runId),
+      messageJson('m-ai-1', 'assistant', question, 2, runId, {
+        type: 'clarification',
+        question,
+        options,
+      }),
     ];
     return route.fulfill({
       status: 201,
@@ -279,14 +284,16 @@ test('ask_user clarification shows the question and waiting status', async ({ pa
   // Run 卡进入「等待补充信息」并展示问题文本（状态标签与活动文案同为该文本）。
   const runCard = page.getByRole('region', { name: '执行卡' }).first();
   await expect(runCard.getByText('等待补充信息', { exact: true }).first()).toBeVisible();
-  // 问题文本在消息流（会话列表摘要也会带最后一句话，小视口下会命中隐藏卡片，需限定在 log 内）。
-  await expect(page.getByRole('log', { name: '会话消息' }).getByText(question, { exact: true })).toBeVisible();
+  // 问题文本在消息流（澄清卡与消息气泡各一处；会话列表摘要也会带最后一句话，
+  // 小视口下会命中隐藏卡片，需限定在 log 内）。
+  await expect(page.getByRole('log', { name: '会话消息' }).getByText(question, { exact: true }).first()).toBeVisible();
 
-  // 注（Task 25 发现）：当前 toChatMessage（App.tsx）未把 agent 消息的
-  // clarify/brainstorm metadata 映射到 Message.clarify/brainstorm，AgentRunCard
-  // 的澄清 chips 依赖该映射（clarificationByRun 取不到 options 而不渲染）。
-  // 此处只断言可渲染的澄清状态与问题文本；chips 断言待前端映射补齐后启用。
-  await expect(page.getByText('等待补充信息', { exact: true }).first()).toBeVisible();
+  // 选项 chips 由 Run 卡澄清区渲染（toChatMessage 映射 clarify metadata）；点击只
+  // 填入输入框，不自动提交。
+  const optionChip = page.getByRole('button', { name: options[0], exact: true }).first();
+  await expect(optionChip).toBeVisible();
+  await optionChip.click();
+  await expect(page.getByPlaceholder(/输入消息并向 AI 分析师提问/)).toHaveValue(options[0]);
 });
 
 // --------------------------------------------------------------------------- //

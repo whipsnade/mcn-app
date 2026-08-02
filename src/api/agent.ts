@@ -17,6 +17,13 @@ export interface ApiAgentSession {
   updated_at: string;
 }
 
+/** assistant 消息 metadata（镜像 backend ask_user 澄清 metadata：type/question/options）。 */
+export interface ApiAgentMessageMetadata {
+  type?: string;
+  question?: string;
+  options?: string[];
+}
+
 export interface ApiAgentMessage {
   id: string;
   role: string;
@@ -24,6 +31,8 @@ export interface ApiAgentMessage {
   sequence: number;
   run_id: string | null;
   created_at: string;
+  /** ask_user 澄清等结构化元数据（backend AgentMessageRead.metadata）。 */
+  metadata?: ApiAgentMessageMetadata | null;
 }
 
 export interface ApiAgentRun {

@@ -493,14 +493,17 @@ test('shows an unread dot on a module with a newer artifact and clears it when s
   const brandTab = page.getByRole('tab', { name: '品牌分析' });
   const unreadDot = brandTab.getByTestId('unread-dot');
 
-  // 首屏：已有产物不标未读。
-  await expect(unreadDot).toHaveCount(0);
+  // 首屏先进入品牌分析，等 brandArt1（seq 10）渲染完成：此时模块水位初始化为 10，
+  // 避免「首屏产物拉取与 phase 翻转竞态」导致水位被更高 sequence 的 brandArt2 覆盖
+  //（桌面端首屏拉取晚于翻转时可复现——水位 20 则永不出圆点）。
+  await brandTab.click();
+  await expect(page.getByText('概览', { exact: true }).first()).toBeVisible();
 
-  // 目录出现更高 sequence 的产物 → 圆点出现。
+  // 目录出现更高 sequence（20）的产物 → 圆点出现（20 > 水位 10）。
   phase = 'published';
   await expect(unreadDot).toHaveCount(1);
 
-  // 点击品牌分析 Tab → 圆点清除。
+  // 再次点击品牌分析 Tab → 圆点清除。
   await brandTab.click();
   await expect(unreadDot).toHaveCount(0);
 });
@@ -601,11 +604,13 @@ test('exports a published artifact via the new artifact export route', async ({ 
 
   // UI 尚无导出入口（新视图未接线），直接调用客户端 exportArtifact 验证
   // 新 export 路由 + Content-Disposition 解码（沿用旧品牌导出的价值断言）。
+  // moduleUrl 以参数传入：browser 在 Vite 源服务下动态 import，tsc 不做模块解析。
+  const moduleUrl = '/src/api/agentArtifacts.ts';
   const downloadPromise = page.waitForEvent('download');
-  await page.evaluate(async () => {
-    const mod = await import('/src/api/agentArtifacts.ts');
+  await page.evaluate(async (url: string) => {
+    const mod = await import(url);
     await mod.exportArtifact('brand-art');
-  });
+  }, moduleUrl);
   const download = await downloadPromise;
   expect(download.suggestedFilename()).toBe(EXPORT_FILENAME);
 });

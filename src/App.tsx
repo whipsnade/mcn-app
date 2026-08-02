@@ -21,6 +21,8 @@ import type { Message, QuickKolSelection, Session } from './types';
 
 
 // 把 agent 会话消息（ApiAgentMessage）适配为 ChatArea/SessionList 期望的 Message。
+// ask_user 澄清的 metadata（type=clarification + options）映射到 Message.clarify，
+// 供 ChatArea 的 clarificationByRun 为 Run 卡渲染澄清问题与选项 chips（§13.1）。
 function toChatMessage(message: ApiAgentMessage): Message {
   return {
     id: message.id,
@@ -28,6 +30,9 @@ function toChatMessage(message: ApiAgentMessage): Message {
     text: message.content,
     timestamp: new Date(message.created_at).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }),
     runId: message.run_id ?? undefined,
+    clarify: message.metadata?.type === 'clarification'
+      ? { options: message.metadata.options ?? [] }
+      : undefined,
   };
 }
 
