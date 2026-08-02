@@ -105,7 +105,7 @@ class ArtifactDraftRevision(Base):
     revision: Mapped[int] = mapped_column(Integer, nullable=False)
     schema_version: Mapped[str] = mapped_column(String(32), nullable=False)
     payload_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
-    evidence_refs_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    evidence_refs_json: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
     parent_artifact_version_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("agent_artifact_versions.id", use_alter=True), nullable=True
     )
@@ -208,7 +208,7 @@ class AgentArtifactVersion(Base):
     )
     schema_version: Mapped[str] = mapped_column(String(32), nullable=False)
     payload_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
-    evidence_refs_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    evidence_refs_json: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
     review_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     data_status: Mapped[str] = mapped_column(String(32), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
@@ -301,6 +301,6 @@ class KolDetailCache(Base):
     kol_uid: Mapped[str] = mapped_column(String(64), nullable=False)
     schema_version: Mapped[str] = mapped_column(String(32), nullable=False)
     payload_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
-    evidence_refs_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    evidence_refs_json: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
     fetched_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)

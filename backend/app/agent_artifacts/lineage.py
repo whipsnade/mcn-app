@@ -34,12 +34,18 @@ from app.agent_artifacts.schemas import (
     ArtifactSource,
     DerivationRef,
     EvidenceSource,
+    FrozenDerivationRef,
     FrozenEvidenceSource,
     FrozenLineage,
     FrozenLineageRef,
     LineageRef,
 )
+
 from app.agent_runtime.models import AgentRun, AgentToolCall, EvidenceItem
+
+# Artifact 递归展开的最大深度：超过即报 ``lineage_too_deep``，防止深链/组合爆炸
+# 拖垮校验请求（菱形共享子图已由 memo 消除重复查询）。
+MAX_ARTIFACT_DEPTH = 32
 
 
 class LineageError(Exception):
@@ -119,7 +125,8 @@ def resolve_pointer(document: Any, pointer: str) -> Any:
                 raise PointerError(
                     f"JSON Pointer {pointer!r} does not resolve: '-' is not an existing element"
                 )
-            if not token.isdigit():
+            # RFC 6901 §4：数组下标必须是无前导零的无符号十进制整数。
+            if not token.isdigit() or (len(token) > 1 and token.startswith("0")):
                 raise PointerError(
                     f"JSON Pointer {pointer!r} does not resolve: bad array index {token!r}"
                 )
@@ -144,7 +151,9 @@ def _require_pointer(document: Any, pointer: str, code: str) -> None:
 
 
 # 例外键：数值叶子即便出现在 ``data`` 下也不要求 lineage（日期/运行时元数据/
-# 评分公式常量权重等；spec §12.1「Lineage 与消费边界」）。
+# 版本号等；spec §12.1「Lineage 与消费边界」）。注意 ``weight`` 不在此列——
+# 评分公式常量权重只在 ``score_snapshot`` 维度下排除（见 _SCORING_WEIGHT_ANCESTOR），
+# 普通业务字段名为 ``weight``（如 insight 的物流权重）仍要求 lineage。
 _NON_LINEAGE_KEYS = frozenset(
     {
         "date",
@@ -159,12 +168,15 @@ _NON_LINEAGE_KEYS = frozenset(
         "collected_at",
         "version",
         "schema_version",
-        "weight",  # kol_score_v2 评分公式常量权重，非观测/计算业务值
     }
 )
 
 # ``data`` 下整体视为配置/公式元数据的子树，不要求 lineage。
 _NON_LINEAGE_DATA_SUBTREES = frozenset({"scoring"})
+
+# kol_score_v2 每维度权重（``data.items[].score_snapshot.dimensions.*.weight``）
+# 是评分公式常量，仅当祖先路径含 ``score_snapshot`` 时排除。
+_SCORING_WEIGHT_ANCESTOR = "score_snapshot"
 
 
 def _is_number(value: Any) -> bool:
@@ -190,6 +202,8 @@ def required_numeric_pointers(payload: dict[str, Any]) -> frozenset[str]:
         if isinstance(node, dict):
             for key, value in node.items():
                 if key in _NON_LINEAGE_KEYS:
+                    continue
+                if key == "weight" and _SCORING_WEIGHT_ANCESTOR in parts:
                     continue
                 walk(value, [*parts, key])
         elif isinstance(node, (list, tuple)):
@@ -225,11 +239,17 @@ def _parse_refs(raw: Any) -> list[LineageRef]:
 async def _resolve_source(
     source: EvidenceSource | ArtifactSource,
     path_stack: frozenset[str],
+    memo: dict[tuple[str, str], tuple[list[_ResolvedEvidence], Any]],
+    depth: int,
     loader: LineageLoader,
     owner: LineageOwner,
 ) -> tuple[list[_ResolvedEvidence], Any]:
     """把一个来源解析为证据叶子列表，同时返回该来源的直接 payload（供 derivation
-    ``input_paths`` 解析）。Artifact 来源递归展开到 Evidence。"""
+    ``input_paths`` 解析）。Artifact 来源递归展开到 Evidence。
+
+    ``memo`` 以 ``(artifact_version_id, source_path)`` 缓存已完成展开，菱形共享子图
+    中每个版本只查询一次；``depth`` 限制递归深度，超 ``MAX_ARTIFACT_DEPTH`` 即拒绝。
+    """
     if isinstance(source, EvidenceSource):
         record = await loader.load_evidence(source.evidence_id)
         if record is None:
@@ -256,6 +276,16 @@ async def _resolve_source(
             "lineage_cycle",
             f"artifact lineage cycle detected at version {source.artifact_version_id!r}",
         )
+    if depth >= MAX_ARTIFACT_DEPTH:
+        raise LineageError(
+            "lineage_too_deep",
+            f"artifact lineage exceeds max depth {MAX_ARTIFACT_DEPTH} "
+            f"at version {source.artifact_version_id!r}",
+        )
+    memo_key = (source.artifact_version_id, source.source_path)
+    if memo_key in memo:
+        cached_leaves, cached_payload = memo[memo_key]
+        return list(cached_leaves), cached_payload
     record = await loader.load_artifact_version(source.artifact_version_id)
     if record is None:
         raise LineageError(
@@ -282,13 +312,16 @@ async def _resolve_source(
     leaves: list[_ResolvedEvidence] = []
     next_stack = path_stack | {record.id}
     for sub_source in match.sources:
-        sub_leaves, _ = await _resolve_source(sub_source, next_stack, loader, owner)
+        sub_leaves, _ = await _resolve_source(
+            sub_source, next_stack, memo, depth + 1, loader, owner
+        )
         leaves.extend(sub_leaves)
     if not leaves:
         raise LineageError(
             "no_evidence_base",
             f"artifact version {record.id!r} field {source.source_path!r} has no evidence base",
         )
+    memo[memo_key] = (list(leaves), record.payload)
     return leaves, record.payload
 
 
@@ -359,13 +392,14 @@ async def validate_and_freeze_lineage(
 
     # 2. 逐字段解析来源 + derivation，构建冻结闭包。
     frozen_refs: list[FrozenLineageRef] = []
+    memo: dict[tuple[str, str], tuple[list[_ResolvedEvidence], Any]] = {}
     for ref in parsed_refs:
         leaves: list[_ResolvedEvidence] = []
         source_payloads: list[Any] = []
         seen: set[tuple[str, str]] = set()
         for source in ref.sources:
             resolved_leaves, source_payload = await _resolve_source(
-                source, frozenset(), loader, owner
+                source, frozenset(), memo, 0, loader, owner
             )
             for leaf in resolved_leaves:
                 key = (leaf.evidence_id, leaf.source_path)
@@ -390,7 +424,13 @@ async def validate_and_freeze_lineage(
                     )
                     for leaf in leaves
                 ),
-                derivation=ref.derivation,
+                # 复制为不可变 FrozenDerivationRef：发布后修改可变输入 ref 不得
+                # 污染已冻结快照（自包含、稳定）。
+                derivation=(
+                    FrozenDerivationRef(**ref.derivation.model_dump())
+                    if ref.derivation is not None
+                    else None
+                ),
             )
         )
 
@@ -468,6 +508,7 @@ __all__ = [
     "LineageError",
     "LineageLoader",
     "LineageOwner",
+    "MAX_ARTIFACT_DEPTH",
     "ToolCallRecord",
     "required_numeric_pointers",
     "resolve_pointer",

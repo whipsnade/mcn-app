@@ -110,6 +110,20 @@ class LineageRef(BaseModel):
         return validate_json_pointer(value)
 
 
+class FrozenDerivationRef(BaseModel):
+    """冻结快照中的确定性推导。
+
+    独立于输入 ``DerivationRef`` 且不可变：发布后修改模型产物（可变 input ref）
+    不得污染已发布快照，保证「自包含、稳定」的 lineage 承诺（设计 §10.4 约束 6）。
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    tool_call_id: str
+    method: str
+    input_paths: tuple[str, ...] = Field(default_factory=tuple)
+
+
 class FrozenEvidenceSource(BaseModel):
     """闭包快照中的证据叶子。Evidence 不可变，故引用永不失效、快照不陈旧。"""
 
@@ -127,7 +141,7 @@ class FrozenLineageRef(BaseModel):
 
     artifact_path: str
     sources: tuple[FrozenEvidenceSource, ...] = Field(min_length=1)
-    derivation: DerivationRef | None = None
+    derivation: FrozenDerivationRef | None = None
 
 
 class FrozenLineage(BaseModel):
@@ -146,6 +160,7 @@ __all__ = [
     "ArtifactSource",
     "DerivationRef",
     "EvidenceSource",
+    "FrozenDerivationRef",
     "FrozenEvidenceSource",
     "FrozenLineage",
     "FrozenLineageRef",

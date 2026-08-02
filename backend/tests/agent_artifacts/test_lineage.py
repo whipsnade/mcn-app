@@ -25,6 +25,7 @@ import pytest
 from pydantic import ValidationError
 
 from app.agent_artifacts.lineage import (
+    MAX_ARTIFACT_DEPTH,
     ArtifactVersionRecord,
     DbLineageLoader,
     EvidenceRecord,
@@ -37,6 +38,7 @@ from app.agent_artifacts.schemas import (
     ArtifactSource,
     DerivationRef,
     EvidenceSource,
+    FrozenDerivationRef,
     FrozenEvidenceSource,
     FrozenLineage,
     LineageRef,
@@ -83,6 +85,8 @@ class MemoryLoader:
         self.evidence: dict[str, dict] = {}
         self.artifact_versions: dict[str, dict] = {}
         self.tool_calls: dict[str, dict] = {}
+        # 记录每个 artifact version 的查询次数，用于断言菱形展开去重。
+        self.artifact_loads: dict[str, int] = {}
 
     def add_evidence(self, evidence_id: str, session_id: str, payload: object) -> None:
         self.evidence[evidence_id] = {
@@ -124,6 +128,7 @@ class MemoryLoader:
         row = self.artifact_versions.get(version_id)
         if row is None:
             return None
+        self.artifact_loads[version_id] = self.artifact_loads.get(version_id, 0) + 1
         return ArtifactVersionRecord(
             id=version_id,
             session_id=row["session_id"],
@@ -586,7 +591,7 @@ async def test_missing_required_numeric_lineage_rejected() -> None:
     assert "/data/blocks/0/cards/0/value" in exc_info.value.message
 
 
-async def test_date_version_weight_layout_excluded() -> None:
+async def test_date_and_version_layout_excluded() -> None:
     loader = MemoryLoader()
     loader.add_evidence("ev-1", "s-1", EVIDENCE_PAYLOAD)
     payload = {
@@ -605,10 +610,9 @@ async def test_date_version_weight_layout_excluded() -> None:
                 },
             ],
             "version": "1.0",
-            "weight": 10,
         },
     }
-    # 只有 metric value 需要 lineage；date/version/weight 都不要求。
+    # 只有 metric value 需要 lineage；date 组合与 version 都是例外。
     frozen = await validate_and_freeze_lineage(
         payload=payload,
         refs=[_ref("/data/blocks/1/cards/0/value")],
@@ -618,7 +622,40 @@ async def test_date_version_weight_layout_excluded() -> None:
     assert len(frozen.refs) == 1
 
 
+async def test_insight_metric_named_weight_requires_lineage() -> None:
+    """Fix 3：``weight`` 不是全局例外键——业务 metric 名为 weight 也必须可溯源。"""
+    loader = MemoryLoader()
+    loader.add_evidence("ev-1", "s-1", EVIDENCE_PAYLOAD)
+    payload = {
+        "schema_version": "insight_board_v1",
+        "data": {
+            "blocks": [
+                {
+                    "block_type": "metric_grid",
+                    "title": "物流",
+                    "cards": [{"key": "weight", "label": "物流权重", "value": 3.5}],
+                }
+            ]
+        },
+    }
+    with pytest.raises(LineageError) as exc_info:
+        await validate_and_freeze_lineage(payload=payload, refs=[], owner=OWNER, loader=loader)
+    assert exc_info.value.code == "missing_lineage"
+    assert "/data/blocks/0/cards/0/value" in exc_info.value.message
+    # 补齐 lineage 后通过。
+    frozen = await validate_and_freeze_lineage(
+        payload=payload,
+        refs=[_ref("/data/blocks/0/cards/0/value")],
+        owner=OWNER,
+        loader=loader,
+    )
+    assert len(frozen.refs) == 1
+
+
 async def test_scoring_formula_weights_excluded() -> None:
+    """Fix 3：评分公式常量权重（scoring.weights.* 与 score_snapshot.dimensions.*.weight）
+    是配置常量，不要求 lineage；其余业务数（rank/total/raw_score/weighted_score/
+    candidate_count）都要求。"""
     loader = MemoryLoader()
     loader.add_evidence("ev-1", "s-1", EVIDENCE_PAYLOAD)
     payload = {
@@ -630,17 +667,41 @@ async def test_scoring_formula_weights_excluded() -> None:
                 "weights": {"engagement": 20, "followers": 10},
                 "missing_value_policy": "missing_as_zero",
             },
+            "items": [
+                {
+                    "rank": 1,
+                    "platform": "xiaohongshu",
+                    "kol_uid": "k1",
+                    "score_snapshot": {
+                        "version": "kol_score_v2",
+                        "total": 78.0,
+                        "rating": "重点推荐",
+                        "stars": "★★★★★",
+                        "data_completeness": 100.0,
+                        "dimensions": {
+                            "engagement": {"raw_score": 80.0, "weight": 20, "weighted_score": 16.0}
+                        },
+                    },
+                }
+            ],
             "summary": {"candidate_count": 50},
         },
     }
-    # scoring 公式权重是配置常量，不要求 lineage；summary.candidate_count 是业务数。
+    required_paths = (
+        "/data/items/0/rank",
+        "/data/items/0/score_snapshot/total",
+        "/data/items/0/score_snapshot/data_completeness",
+        "/data/items/0/score_snapshot/dimensions/engagement/raw_score",
+        "/data/items/0/score_snapshot/dimensions/engagement/weighted_score",
+        "/data/summary/candidate_count",
+    )
     frozen = await validate_and_freeze_lineage(
         payload=payload,
-        refs=[_ref("/data/summary/candidate_count")],
+        refs=[_ref(path) for path in required_paths],
         owner=OWNER,
         loader=loader,
     )
-    assert len(frozen.refs) == 1
+    assert {ref.artifact_path for ref in frozen.refs} == set(required_paths)
 
 
 async def test_duplicate_artifact_path_rejected() -> None:
@@ -687,6 +748,143 @@ async def test_frozen_snapshot_is_self_contained_closure() -> None:
             assert source.evidence_id == "ev-1"
             assert source.source_path == "/0/声量"
             assert source.payload_hash == "ph-ev-1"
+
+
+async def test_frozen_snapshot_does_not_alias_input_derivation() -> None:
+    """Fix 1：冻结后修改可变输入 ref 的 derivation 不得污染已发布快照。"""
+    loader = MemoryLoader()
+    loader.add_evidence("ev-1", "s-1", EVIDENCE_PAYLOAD)
+    loader.add_tool_call("tc-1", "s-1", service="internal", status="settled")
+    source_ref = _share_ref()
+    frozen = await validate_and_freeze_lineage(
+        payload=_share_payload(), refs=[source_ref], owner=OWNER, loader=loader
+    )
+    assert frozen.refs[0].derivation is not None
+    assert isinstance(frozen.refs[0].derivation, FrozenDerivationRef)
+    assert frozen.refs[0].derivation.method == "divide"
+    # 快照持有独立副本，且 FrozenDerivationRef 自身不可变。
+    source_ref.derivation.method = "multiply"  # type: ignore[union-attr]
+    assert frozen.refs[0].derivation.method == "divide"
+    with pytest.raises(ValidationError):
+        frozen.refs[0].derivation.method = "add"  # type: ignore[index]
+
+
+async def test_diamond_chain_loads_each_version_once() -> None:
+    """Fix 2：菱形共享子图（V→A/B→C）每个 artifact version 只查询一次。"""
+    loader = MemoryLoader()
+    loader.add_evidence("ev-1", "s-1", EVIDENCE_PAYLOAD)
+
+    def ref_to(next_version_id: str | None) -> dict:
+        """每个版本引用同一字段 /data/x：叶子指向 evidence，否则指向下一版本。"""
+        sources = (
+            [{"source_type": "evidence", "evidence_id": "ev-1", "source_path": "/0/声量"}]
+            if next_version_id is None
+            else [
+                {
+                    "source_type": "artifact",
+                    "artifact_version_id": next_version_id,
+                    "source_path": "/data/x",
+                }
+            ]
+        )
+        return {"artifact_path": "/data/x", "sources": sources, "derivation": None}
+
+    loader.add_artifact_version("vC", "s-1", {"data": {"x": 1}}, [ref_to(None)])
+    loader.add_artifact_version("vA", "s-1", {"data": {"x": 1}}, [ref_to("vC")])
+    loader.add_artifact_version("vB", "s-1", {"data": {"x": 1}}, [ref_to("vC")])
+    loader.add_artifact_version(
+        "vV",
+        "s-1",
+        {"data": {"x": 1}},
+        [
+            {
+                "artifact_path": "/data/x",
+                "sources": [
+                    {"source_type": "artifact", "artifact_version_id": "vA", "source_path": "/data/x"},
+                    {"source_type": "artifact", "artifact_version_id": "vB", "source_path": "/data/x"},
+                ],
+                "derivation": None,
+            }
+        ],
+    )
+    payload = {"schema_version": "insight_board_v1", "data": {"final": 1}}
+    refs = [
+        LineageRef(
+            artifact_path="/data/final",
+            sources=(ArtifactSource(artifact_version_id="vV", source_path="/data/x"),),
+        )
+    ]
+    frozen = await validate_and_freeze_lineage(payload=payload, refs=refs, owner=OWNER, loader=loader)
+    # 证据叶子去重为一条，且每个版本仅查询一次。
+    assert len(frozen.refs[0].sources) == 1
+    for version_id in ("vV", "vA", "vB", "vC"):
+        assert loader.artifact_loads.get(version_id) == 1, version_id
+
+
+async def test_excessively_deep_chain_rejected() -> None:
+    """Fix 2：超过 MAX_ARTIFACT_DEPTH 的递归链拒绝（lineage_too_deep）。"""
+    loader = MemoryLoader()
+    loader.add_evidence("ev-1", "s-1", EVIDENCE_PAYLOAD)
+    leaf_version = f"v{MAX_ARTIFACT_DEPTH}"
+    loader.add_artifact_version(
+        leaf_version,
+        "s-1",
+        {"data": {"f": 1}},
+        [
+            {
+                "artifact_path": "/data/f",
+                "sources": [
+                    {"source_type": "evidence", "evidence_id": "ev-1", "source_path": "/0/声量"}
+                ],
+                "derivation": None,
+            }
+        ],
+    )
+    for index in range(MAX_ARTIFACT_DEPTH - 1, -1, -1):
+        loader.add_artifact_version(
+            f"v{index}",
+            "s-1",
+            {"data": {"f": 1}},
+            [
+                {
+                    "artifact_path": "/data/f",
+                    "sources": [
+                        {
+                            "source_type": "artifact",
+                            "artifact_version_id": f"v{index + 1}",
+                            "source_path": "/data/f",
+                        }
+                    ],
+                    "derivation": None,
+                }
+            ],
+        )
+    payload = {"schema_version": "insight_board_v1", "data": {"final": 1}}
+    refs = [
+        LineageRef(
+            artifact_path="/data/final",
+            sources=(ArtifactSource(artifact_version_id="v0", source_path="/data/f"),),
+        )
+    ]
+    with pytest.raises(LineageError) as exc_info:
+        await validate_and_freeze_lineage(payload=payload, refs=refs, owner=OWNER, loader=loader)
+    assert exc_info.value.code == "lineage_too_deep"
+
+
+async def test_array_index_leading_zeros_rejected() -> None:
+    """Minor：RFC 6901 数组下标不允许前导零（"/00/..." 非法）。"""
+    loader = MemoryLoader()
+    loader.add_evidence("ev-1", "s-1", EVIDENCE_PAYLOAD)
+    payload = {"schema_version": "insight_board_v1", "data": {"overview": {"total_volume": 100000}}}
+    refs = [
+        LineageRef(
+            artifact_path="/data/overview/total_volume",
+            sources=(EvidenceSource(evidence_id="ev-1", source_path="/00/声量"),),
+        )
+    ]
+    with pytest.raises(LineageError) as exc_info:
+        await validate_and_freeze_lineage(payload=payload, refs=refs, owner=OWNER, loader=loader)
+    assert exc_info.value.code == "evidence_source_path_not_found"
 
 
 # ---------------------------------------------------------------------------
