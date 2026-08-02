@@ -49,6 +49,9 @@ class AgentRunRepository:
         ``run.decision_count`` 与 ``run.started_at`` 保留累计审计值。
         """
         run = await self.lock_run(run_id)
+        if run.cancel_requested:
+            # 已请求取消的 Run 不得再启动/恢复 Attempt，避免卡在 running + open attempt。
+            raise InvalidRunTransition("run_cancel_requested")
         current = RunStatus(run.status)
         if resumed:
             if current != RunStatus.PAUSED:
@@ -86,11 +89,18 @@ class AgentRunRepository:
         *,
         now: datetime | None = None,
     ) -> bool:
-        """抢占租约；拒绝终态、clarification 完成态、取消请求以及他人未过期租约。"""
+        """抢占租约；只允许已 running 的 Run（Attempt 必须先存在）。
+
+        拒绝终态、clarification、取消请求、他人未过期租约。对 paused/queued/reviewing
+        一律返回 False：paused 只能由用户经 begin_attempt(resumed=True) 恢复并重建
+        Attempt，reviewing 不能因租约接管被拉回 running。
+        ``now`` 仅供测试注入确定性时钟做精确到期断言；其余方法统一走模块
+        ``utc_now()``（同样可 monkeypatch）。
+        """
         now = now or utc_now()
         run = await self.lock_run(run_id)
         current = RunStatus(run.status)
-        if current in TERMINAL_RUN_STATUSES or current == RunStatus.CLARIFICATION_REQUESTED:
+        if current != RunStatus.RUNNING:
             return False
         if run.cancel_requested:
             return False
@@ -154,7 +164,11 @@ class AgentRunRepository:
         return run
 
     async def cancel(self, run_id: str, user_id: str) -> bool:
-        """用户取消：running → cancelled；非属主或已是终态时幂等返回 False。"""
+        """用户取消：任意非终态 → cancelled；非属主或已是终态时幂等返回 False。
+
+        释放租约、以 outcome=cancelled 关闭当前 open Attempt、记录 completed_at。
+        queued/paused/clarification 下无 open Attempt（未开始或已收尾），收尾自动空操作。
+        """
         run = await self.lock_run(run_id)
         if run.user_id != user_id or RunStatus(run.status) in TERMINAL_RUN_STATUSES:
             return False

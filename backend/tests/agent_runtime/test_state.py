@@ -44,6 +44,11 @@ def test_terminal_run_statuses_are_completed_failed_cancelled() -> None:
         (RunStatus.REVIEWING, RunStatus.COMPLETED),  # batch 全部 approve + 原子发布
         (RunStatus.REVIEWING, RunStatus.FAILED),  # reject / 第 3 次仍未 approve
         (RunStatus.PAUSED, RunStatus.RUNNING),  # 用户继续
+        # 用户取消是跨切面迁移：除终态外任何非终态都必须可取消
+        (RunStatus.QUEUED, RunStatus.CANCELLED),
+        (RunStatus.PAUSED, RunStatus.CANCELLED),
+        (RunStatus.REVIEWING, RunStatus.CANCELLED),
+        (RunStatus.CLARIFICATION_REQUESTED, RunStatus.CANCELLED),
     ],
 )
 def test_allowed_run_transitions(source: RunStatus, target: RunStatus) -> None:
@@ -56,10 +61,7 @@ def test_allowed_run_transitions(source: RunStatus, target: RunStatus) -> None:
         (RunStatus.QUEUED, RunStatus.REVIEWING),
         (RunStatus.QUEUED, RunStatus.PAUSED),
         (RunStatus.QUEUED, RunStatus.COMPLETED),
-        (RunStatus.QUEUED, RunStatus.CANCELLED),
         (RunStatus.PAUSED, RunStatus.COMPLETED),
-        (RunStatus.PAUSED, RunStatus.CANCELLED),
-        (RunStatus.REVIEWING, RunStatus.CANCELLED),
         (RunStatus.REVIEWING, RunStatus.PAUSED),
         (RunStatus.CLARIFICATION_REQUESTED, RunStatus.RUNNING),
         (RunStatus.CLARIFICATION_REQUESTED, RunStatus.COMPLETED),

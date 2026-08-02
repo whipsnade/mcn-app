@@ -290,6 +290,111 @@ async def test_request_cancel_is_idempotent(db_session, user_factory) -> None:
     assert run.cancel_requested is True
 
 
+async def test_begin_attempt_rejects_run_with_cancel_requested(
+    db_session, user_factory
+) -> None:
+    user_id, run_id = await _create_queued_run(db_session, user_factory)
+    repo = AgentRunRepository(db_session)
+    run = await db_session.get(AgentRun, run_id)
+    run.cancel_requested = True
+    await db_session.flush()
+
+    with pytest.raises(InvalidRunTransition) as exc_info:
+        await repo.begin_attempt(run_id)
+
+    assert str(exc_info.value) == "run_cancel_requested"
+
+
+@pytest.mark.parametrize("status", ["queued", "paused", "reviewing"])
+async def test_claim_lease_requires_running_state(
+    db_session, user_factory, status
+) -> None:
+    user_id, run_id = await _create_queued_run(db_session, user_factory)
+    repo = AgentRunRepository(db_session)
+    if status != "queued":
+        await repo.begin_attempt(run_id)
+    run = await db_session.get(AgentRun, run_id)
+    run.status = status
+    await db_session.flush()
+
+    assert await repo.claim_lease(run_id, "worker-a", 300) is False
+    run = await db_session.get(AgentRun, run_id)
+    assert run.lease_owner is None
+
+
+async def test_cancel_from_queued(db_session, user_factory) -> None:
+    user_id, run_id = await _create_queued_run(db_session, user_factory)
+    repo = AgentRunRepository(db_session)
+
+    assert await repo.cancel(run_id, user_id) is True
+    run = await db_session.get(AgentRun, run_id)
+    assert run.status == "cancelled"
+    assert run.completed_at is not None
+
+
+async def test_cancel_from_paused_releases_lease(db_session, user_factory) -> None:
+    user_id, run_id = await _create_queued_run(db_session, user_factory)
+    repo = AgentRunRepository(db_session)
+    await repo.begin_attempt(run_id)
+    await repo.claim_lease(run_id, "worker-a", 300)
+    await repo.pause(run_id, "worker-a")
+
+    assert await repo.cancel(run_id, user_id) is True
+    run = await db_session.get(AgentRun, run_id)
+    assert run.status == "cancelled"
+    assert run.lease_owner is None
+    assert run.completed_at is not None
+
+
+async def test_cancel_from_reviewing_ends_open_attempt(db_session, user_factory) -> None:
+    user_id, run_id = await _create_queued_run(db_session, user_factory)
+    repo = AgentRunRepository(db_session)
+    await repo.begin_attempt(run_id)
+    await repo.claim_lease(run_id, "worker-a", 300)
+    await repo.transition(run_id, RunStatus.REVIEWING, worker_id="worker-a")
+
+    assert await repo.cancel(run_id, user_id) is True
+    run = await db_session.get(AgentRun, run_id)
+    assert run.status == "cancelled"
+    assert run.lease_owner is None
+    assert run.completed_at is not None
+    attempts = list(
+        (
+            await db_session.scalars(
+                select(AgentRunAttempt).where(AgentRunAttempt.run_id == run_id)
+            )
+        ).all()
+    )
+    assert len(attempts) == 1
+    assert attempts[0].outcome == "cancelled"
+    assert attempts[0].ended_at is not None
+
+
+async def test_cancel_from_clarification_requested(db_session, user_factory) -> None:
+    user_id, run_id = await _create_queued_run(db_session, user_factory)
+    repo = AgentRunRepository(db_session)
+    await repo.begin_attempt(run_id)
+    await repo.claim_lease(run_id, "worker-a", 300)
+    await repo.transition(
+        run_id, RunStatus.CLARIFICATION_REQUESTED, worker_id="worker-a"
+    )
+
+    assert await repo.cancel(run_id, user_id) is True
+    run = await db_session.get(AgentRun, run_id)
+    assert run.status == "cancelled"
+    assert run.completed_at is not None
+    # 澄清等待期间取消：Attempt 已以 completed 收尾，取消无需再动它
+    attempts = list(
+        (
+            await db_session.scalars(
+                select(AgentRunAttempt).where(AgentRunAttempt.run_id == run_id)
+            )
+        ).all()
+    )
+    assert attempts[0].outcome == "completed"
+    assert attempts[0].ended_at is not None
+
+
 async def test_transition_to_clarification_requested_closes_attempt(
     db_session, user_factory
 ) -> None:
