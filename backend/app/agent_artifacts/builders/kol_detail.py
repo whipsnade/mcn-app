@@ -12,6 +12,11 @@ latest_posts）转换为强类型 ``kol_detail_v2`` Draft：
   source_path 与 Evidence raw payload 的结构一一对应。
 
 builder 只做确定性转换，不调用 MCP。
+
+注意（设计确认，非强制接线）：kol_detail_v1 运行时由模型经 Task 14 引擎内联
+产出 kol_detail_v2 并经 Reviewer（Task 13）把关，本 builder 不在此路径上强制
+调用——它供缓存命中重建与 Draft 工具做确定性转换（与 Task 16 其它 builder
+一致），引擎不强制注入 builder。
 """
 
 from __future__ import annotations
@@ -60,6 +65,7 @@ _LIMITATION_MESSAGE = {
     "homepage_url_missing": "未获取到达人主页链接，前端展示不可用",
     "metric_data_missing": "达人部分核心指标缺失，数据受限披露",
     "audience_missing": "未获取到达人受众画像，数据受限披露",
+    "audience_partial": "达人部分受众分布缺失，数据受限披露",
     "trend_missing": "未获取到达人趋势数据，数据受限披露",
     "latest_posts_missing": "未获取到达人最新热帖，数据受限披露",
     "post_url_missing": "部分热帖缺少原帖链接，前端展示不可用",
@@ -78,14 +84,16 @@ def _iso(value: Any) -> Any:
 
 
 def _sanitize_url(value: Any) -> str | None:
-    """只保留 http/https URL；缺失或非法 scheme 一律按缺失（None）处理。"""
+    """只保留 http/https 且带主机名的 URL；缺失/非法 scheme/空 host 一律按缺失处理。"""
     if not isinstance(value, str) or not value.strip():
         return None
     try:
-        scheme = urlsplit(value).scheme
+        parts = urlsplit(value)
     except ValueError:
         return None
-    if scheme not in ("http", "https"):
+    if parts.scheme not in ("http", "https"):
+        return None
+    if not parts.hostname:
         return None
     return value
 
@@ -182,10 +190,19 @@ def _section_plan(data: dict[str, Any]) -> dict[str, tuple[str, tuple[str, ...],
     else:
         plan["metrics"] = ("complete", (), ())
 
-    if any(data["audience"].get(field) for field in _AUDIENCE_FIELDS):
-        plan["audience"] = ("complete", (), ())
-    else:
+    non_empty = [field for field in _AUDIENCE_FIELDS if data["audience"].get(field)]
+    if not non_empty:
         plan["audience"] = ("unavailable", ("audience_missing",), ())
+    elif len(non_empty) < len(_AUDIENCE_FIELDS):
+        # 部分受众分布缺失：partial 披露，避免把「缺失」当「完整」。
+        missing = [field for field in _AUDIENCE_FIELDS if not data["audience"].get(field)]
+        plan["audience"] = (
+            "partial",
+            ("audience_partial",),
+            tuple(f"audience.{field}" for field in missing),
+        )
+    else:
+        plan["audience"] = ("complete", (), ())
 
     if data["trend"]:
         plan["trend"] = ("complete", (), ())

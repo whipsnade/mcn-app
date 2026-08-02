@@ -144,11 +144,17 @@ class FakeKolDetailFetchTool:
 
 
 class KolDetailFakeGateway:
-    """脚本化动作网关；支持可调用动作（工厂）在运行时解析 draft id。"""
+    """脚本化动作网关；支持可调用动作（工厂）在运行时解析 draft id。
+
+    ``interleave``：在首次 submit_review 被分发前注入一次并发 ``create()``，
+    模拟 TOCTOU 窗口（第二个 create 撞上正在进行的 Run）。
+    """
 
     def __init__(self, actions: list[Any]) -> None:
         self.actions = list(actions)
         self.calls: list[dict[str, Any]] = []
+        self.interleave = None
+        self.interleave_result = None
 
     async def decide(self, *, run, attempt_id, profile, messages, thinking_sink=None, **kwargs):
         self.calls.append(
@@ -166,6 +172,12 @@ class KolDetailFakeGateway:
         action = self.actions.pop(0)
         if callable(action):
             action = await action(run)
+        if (
+            self.interleave is not None
+            and self.interleave_result is None
+            and isinstance(action, SubmitReview)
+        ):
+            self.interleave_result = await self.interleave()
         return action
 
 
@@ -569,6 +581,161 @@ async def test_same_kol_detail_active_run_is_idempotent(db_session, user_factory
     assert count == 1
 
 
+async def test_concurrent_create_interleave_only_one_run(db_session, user_factory) -> None:
+    """TOCTOU 竞态（Fix 1）：首个 Run 进行中并发 create → 幂等返回同一 Run。"""
+    user = await user_factory()
+    session = await _make_session(db_session, user.id)
+    evidence = await _make_evidence(db_session, user.id, session.id)
+    gateway, service = _make_service(
+        db_session,
+        actions=_make_actions(db_session, evidence, _cache_state()),
+        evidence=evidence,
+        now_fn=lambda: T0,
+    )
+
+    async def interleave():
+        return await service.create(user.id, session.id, PLATFORM, KOL_UID)
+
+    gateway.interleave = interleave
+
+    summary = await service.create(user.id, session.id, PLATFORM, KOL_UID)
+    assert summary.cached is False
+    # 并发 create 在首个 Run 提交复核时触发：幂等返回同一活动 Run，不创建第二个。
+    assert gateway.interleave_result is not None
+    assert gateway.interleave_result.run_id == summary.run_id
+    assert gateway.interleave_result.cached is False
+    count = await db_session.scalar(
+        select(func.count(AgentRun.id)).where(
+            AgentRun.session_id == session.id,
+            AgentRun.profile_name == "kol_detail_v1",
+        )
+    )
+    assert count == 1
+    # 缓存回填成功（不 500）。
+    cache_row = await db_session.scalar(
+        select(KolDetailCache).where(KolDetailCache.session_id == session.id)
+    )
+    assert cache_row is not None
+
+
+async def test_paused_owner_does_not_block_fresh_run(db_session, user_factory) -> None:
+    """paused/终态 owner（Fix 2）：不再阻塞，释放 working head 让新 Run 接管。"""
+    user = await user_factory()
+    session = await _make_session(db_session, user.id)
+    now = utc_now()
+    paused_run = AgentRun(
+        id=str(uuid4()),
+        session_id=session.id,
+        user_id=user.id,
+        run_kind="user",
+        visibility="user",
+        profile_name="kol_detail_v1",
+        profile_version="v1",
+        model="test-model",
+        status="paused",
+        started_at=now,
+    )
+    db_session.add(paused_run)
+    await db_session.flush()
+    artifact = AgentArtifact(
+        id=str(uuid4()),
+        session_id=session.id,
+        user_id=user.id,
+        module="kol",
+        artifact_type="kol_detail_v2",
+        artifact_key="kol-detail:xiaohongshu:k1",
+        status="draft",
+        latest_version=0,
+        activity_sequence=0,
+        created_at=now,
+        updated_at=now,
+    )
+    db_session.add(artifact)
+    await db_session.flush()
+    draft = ArtifactDraft(
+        id=str(uuid4()),
+        artifact_id=artifact.id,
+        session_id=session.id,
+        owner_run_id=paused_run.id,
+        current_revision=0,
+        status="drafting",
+        review_count=0,
+        revision_count=0,
+        updated_at=now,
+    )
+    db_session.add(draft)
+    await db_session.flush()
+
+    evidence = await _make_evidence(db_session, user.id, session.id)
+    gateway, service = _make_service(
+        db_session,
+        actions=_make_actions(db_session, evidence, _cache_state()),
+        evidence=evidence,
+        now_fn=lambda: T0,
+    )
+    summary = await service.create(user.id, session.id, PLATFORM, KOL_UID)
+    assert summary.cached is False
+    assert summary.run_id is not None
+    assert summary.run_id != paused_run.id  # 新 Run，不被暂停的 owner 阻塞
+    # 新 Run 已接管 working head 并发布；发布后 head 复位（owner=None），
+    # 暂停的 owner 不再持有。
+    fresh_draft = await db_session.scalar(
+        select(ArtifactDraft).where(ArtifactDraft.artifact_id == artifact.id)
+    )
+    assert fresh_draft is not None
+    assert fresh_draft.owner_run_id is None
+    version = await db_session.scalar(
+        select(AgentArtifactVersion).where(
+            AgentArtifactVersion.source_run_id == summary.run_id
+        )
+    )
+    assert version is not None
+    # 缓存回填成功。
+    cache_row = await db_session.scalar(
+        select(KolDetailCache).where(KolDetailCache.session_id == session.id)
+    )
+    assert cache_row is not None
+
+
+async def test_corrupt_cache_evicted_and_refreshed(db_session, user_factory) -> None:
+    """损坏的缓存 payload：驱逐并刷新，而不是对用户 500（Fix minor）。"""
+    user = await user_factory()
+    session = await _make_session(db_session, user.id)
+    evidence = await _make_evidence(db_session, user.id, session.id)
+    gateway, service = _make_service(
+        db_session,
+        actions=_make_actions(db_session, evidence, _cache_state()),
+        evidence=evidence,
+        now_fn=lambda: T0,
+    )
+    summary1 = await service.create(user.id, session.id, PLATFORM, KOL_UID)
+    assert summary1.cached is False
+
+    cache_row = await db_session.scalar(
+        select(KolDetailCache).where(KolDetailCache.session_id == session.id)
+    )
+    assert cache_row is not None
+    # 损坏 payload（缺必需字段 → Schema 校验失败）。
+    cache_row.payload_json = {
+        "schema_version": "kol_detail_v2",
+        "data": {"cache": {"hit": False}},
+    }
+    await db_session.flush()
+
+    gateway.actions = _make_actions(db_session, evidence, _cache_state())
+    summary2 = await service.create(user.id, session.id, PLATFORM, KOL_UID)
+    assert summary2.cached is False
+    assert summary2.run_id is not None
+    assert summary2.run_id != summary1.run_id
+    # 旧缓存行已被驱逐，只留下新回填的一行。
+    rows = (
+        await db_session.scalars(
+            select(KolDetailCache).where(KolDetailCache.session_id == session.id)
+        )
+    ).all()
+    assert len(rows) == 1
+
+
 # ---------------------------------------------------------------------------
 # 5. kol_detail_v2 契约（builder 输出被 Task 10 Schema 接受）
 # ---------------------------------------------------------------------------
@@ -646,6 +813,46 @@ def test_builder_rejects_non_http_url_scheme() -> None:
     detail = dict(DETAIL)
     detail["identity"] = dict(DETAIL["identity"])
     detail["identity"]["homepage_url"] = "javascript:alert(1)"
+    build = build_kol_detail_draft(
+        platform=PLATFORM,
+        kol_uid=KOL_UID,
+        detail=detail,
+        evidence_id="ev-1",
+        cache_state=_cache_state(),
+    )
+    assert build.payload["data"]["identity"]["homepage_url"] is None
+    assert "homepage_url_missing" in {
+        lim["code"] for lim in build.payload["limitations"]
+    }
+    KolDetailV2.model_validate(build.payload)
+
+
+def test_builder_discloses_partial_audience_sections() -> None:
+    """部分受众分布缺失：partial 披露，不把缺失当完整（Fix minor）。"""
+    detail = dict(DETAIL)
+    detail["audience"] = dict(DETAIL["audience"])
+    detail["audience"]["gender_distribution"] = []
+    detail["audience"]["age_distribution"] = []
+    build = build_kol_detail_draft(
+        platform=PLATFORM,
+        kol_uid=KOL_UID,
+        detail=detail,
+        evidence_id="ev-1",
+        cache_state=_cache_state(),
+    )
+    payload = build.payload
+    assert payload["data_status"] == "restricted"
+    codes = {lim["code"] for lim in payload["limitations"]}
+    assert "audience_partial" in codes
+    assert payload["availability"]["audience"]["status"] == "partial"
+    KolDetailV2.model_validate(payload)
+
+
+def test_builder_rejects_empty_host_http_url() -> None:
+    """``http://``（空 host）视为缺失，不产出伪造链接（Fix minor）。"""
+    detail = dict(DETAIL)
+    detail["identity"] = dict(DETAIL["identity"])
+    detail["identity"]["homepage_url"] = "http://"
     build = build_kol_detail_draft(
         platform=PLATFORM,
         kol_uid=KOL_UID,

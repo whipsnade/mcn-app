@@ -15,6 +15,20 @@
 （持有 ``kol-detail:{platform}:{kol_uid}`` working head）时幂等返回现有 Run，
 不重复创建。
 
+并发与恢复硬化（Code Review Fix 1/2）：
+- 幂等检查对 working head 行 ``with_for_update`` 串行化并发 create，持有锁后
+  重查缓存（并发写入者可能刚填好），避免重复创建 Run 造成重复 MCP/模型消耗；
+- 只有「活动」（queued/running/reviewing）owner 才阻塞；paused/终态 owner
+  无继续/恢复价值，释放 working head 让新 Run 接管，避免用户被卡死；
+- 首次 create（artifact/draft 尚不存在）的并发窗口在无迁移下无法完全封闭，
+  由 ``(session_id, artifact_key)`` 唯一约束 + 引擎 ArtifactBusy +
+  ``set_cached_detail`` 的 IntegrityError 恢复共同兜底；
+- 缓存 payload 损坏时驱逐缓存行并刷新，而不是 500。
+
+builder 的角色：``build_kol_detail_draft``（Task 17）不是运行时强制接线——
+kol_detail_v1 由模型经引擎内联产出 kol_detail_v2 并经 Reviewer（Task 13）把关，
+builder 供缓存命中重建与 Draft 工具做确定性转换。
+
 TTL 默认 24h，由 ``KOL_DETAIL_CACHE_TTL_HOURS`` 配置；测试可注入 ``now_fn``
 做确定性过期断言。
 """
@@ -27,7 +41,8 @@ from typing import Any, Callable
 from uuid import uuid4
 
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import insert, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_artifacts.keys import build_artifact_key
@@ -38,12 +53,25 @@ from app.agent_artifacts.models import (
     KolDetailCache,
 )
 from app.agent_artifacts.payloads.kol_detail import KolDetailV2
+from app.agent_artifacts.service import ArtifactService
 from app.agent_runtime.engine import AgentEngine
 from app.agent_runtime.models import AgentRun
 from app.agent_runtime.profiles import get_profile
 from app.agent_runtime.repository import AgentRunRepository, utc_now
 from app.agent_runtime.state import RunStatus
 from app.model.contracts import ChatMessage
+
+SCHEMA_VERSION = "kol_detail_v2"
+
+# 已暂停/终态的 owner 不再视为「活动」：不再阻塞新 Run，允许其接管 working head。
+_NON_ACTIVE_OWNER_STATUSES = frozenset(
+    {
+        RunStatus.PAUSED,
+        RunStatus.COMPLETED,
+        RunStatus.FAILED,
+        RunStatus.CANCELLED,
+    }
+)
 
 
 class KolDetailRunFailed(RuntimeError):
@@ -100,6 +128,7 @@ class KolDetailRunService:
         )
         self.now_fn = now_fn or utc_now
         self._model = model or settings.tencent_plan_model
+        self._service = ArtifactService(db)
 
     # ------------------------------------------------------------------ #
     # 缓存
@@ -138,37 +167,70 @@ class KolDetailRunService:
 
         缓存行的 Evidence refs 与当前 Session 归属一致（§8.1）：缓存命中时
         从缓存 payload 重建，引用仍是本 Session 的不可变 Evidence。
+
+        并发回填的 IntegrityError 兜底（Fix 1）：两个并发 create 都 miss 缓存、
+        都走到回填时，先插入者成功、后插入者撞唯一约束——捕获后重读并更新，
+        而不是对用户 500（MySQL 重复键不中止事务，可继续）。
         """
+        normalized = self._normalize_cache_payload(payload, fetched_at, expires_at)
         row = await self.get_cached_detail(user_id, session_id, platform, kol_uid)
-        payload = dict(payload or {})
-        payload["data"] = dict((payload.get("data") or {}))
-        payload["data"]["cache"] = {
+        if row is not None:
+            self._update_cache_row(row, normalized, evidence_refs, fetched_at, expires_at)
+            await self.db.flush()
+            return row
+        try:
+            await self.db.execute(
+                insert(KolDetailCache).values(
+                    id=str(uuid4()),
+                    user_id=user_id,
+                    session_id=session_id,
+                    platform=platform,
+                    kol_uid=kol_uid,
+                    schema_version=SCHEMA_VERSION,
+                    payload_json=normalized,
+                    evidence_refs_json=evidence_refs,
+                    fetched_at=fetched_at,
+                    expires_at=expires_at,
+                )
+            )
+        except IntegrityError:
+            winner = await self.get_cached_detail(user_id, session_id, platform, kol_uid)
+            if winner is None:  # pragma: no cover - 竞态窗口内行必然已存在
+                raise
+            self._update_cache_row(winner, normalized, evidence_refs, fetched_at, expires_at)
+            await self.db.flush()
+            return winner
+        await self.db.flush()
+        row = await self.get_cached_detail(user_id, session_id, platform, kol_uid)
+        if row is None:  # pragma: no cover - 刚插入必然可读
+            raise KolDetailRunFailed("cache row not readable after insert")
+        return row
+
+    def _normalize_cache_payload(
+        self, payload: dict[str, Any], fetched_at: datetime, expires_at: datetime
+    ) -> dict[str, Any]:
+        normalized = dict(payload or {})
+        normalized["data"] = dict((normalized.get("data") or {}))
+        normalized["data"]["cache"] = {
             "hit": False,
             "fetched_at": _iso(fetched_at),
             "expires_at": _iso(expires_at),
         }
-        if row is None:
-            row = KolDetailCache(
-                id=str(uuid4()),
-                user_id=user_id,
-                session_id=session_id,
-                platform=platform,
-                kol_uid=kol_uid,
-                schema_version="kol_detail_v2",
-                payload_json=payload,
-                evidence_refs_json=evidence_refs,
-                fetched_at=fetched_at,
-                expires_at=expires_at,
-            )
-            self.db.add(row)
-        else:
-            row.schema_version = "kol_detail_v2"
-            row.payload_json = payload
-            row.evidence_refs_json = evidence_refs
-            row.fetched_at = fetched_at
-            row.expires_at = expires_at
-        await self.db.flush()
-        return row
+        return normalized
+
+    @staticmethod
+    def _update_cache_row(
+        row: KolDetailCache,
+        payload: dict[str, Any],
+        evidence_refs: list[dict[str, Any]],
+        fetched_at: datetime,
+        expires_at: datetime,
+    ) -> None:
+        row.schema_version = SCHEMA_VERSION
+        row.payload_json = payload
+        row.evidence_refs_json = evidence_refs
+        row.fetched_at = fetched_at
+        row.expires_at = expires_at
 
     # ------------------------------------------------------------------ #
     # create
@@ -185,13 +247,21 @@ class KolDetailRunService:
     ) -> KolDetailRunSummary:
         """缓存优先；未命中/过期才创建 kol_detail_v1 轻量 Run（§13.2）。"""
         cached = await self.get_cached_detail(user_id, session_id, platform, kol_uid)
-        if cached is not None and not self.is_expired(cached):
-            return self._summary_from_cache(cached)
+        hit = await self._try_cache_hit(cached)
+        if hit is not None:
+            return hit
 
+        # 幂等 + 串行化：锁住 working head（with_for_update），并发 create 在此串行。
         existing = await self._active_kol_detail_run(session_id, platform, kol_uid)
         if existing is not None:
             # 同一 (platform, kol_uid) 已有活动 kol-detail Run：幂等返回，不重复创建。
             return KolDetailRunSummary(run_id=existing, detail=None, cached=False)
+
+        # 持有锁后重查缓存：并发写入者可能已填好缓存，避免重复抓取/模型消耗。
+        cached = await self.get_cached_detail(user_id, session_id, platform, kol_uid)
+        hit = await self._try_cache_hit(cached)
+        if hit is not None:
+            return hit
 
         return await self._start_fresh_run(
             user_id,
@@ -221,13 +291,33 @@ class KolDetailRunService:
             raise KolDetailRunFailed(f"invalid cached kol_detail_v2 payload: {exc}") from exc
         return KolDetailRunSummary(run_id=None, detail=detail, cached=True)
 
+    async def _try_cache_hit(
+        self, cached: KolDetailCache | None
+    ) -> KolDetailRunSummary | None:
+        """缓存可用时返回命中摘要；过期/损坏返回 None（损坏时驱逐缓存行）。
+
+        损坏的缓存 payload 不再对用户 500：驱逐该行并让 create 落到刷新路径。
+        """
+        if cached is None or self.is_expired(cached):
+            return None
+        try:
+            return self._summary_from_cache(cached)
+        except KolDetailRunFailed:
+            await self.db.delete(cached)
+            await self.db.flush()
+            return None
+
     async def _active_kol_detail_run(
         self, session_id: str, platform: str, kol_uid: str
     ) -> str | None:
         """查找同一 (platform, kol_uid) 是否已有活动 kol-detail Run（持有 working head）。
 
-        working head 的 owner 只可能是 kol-detail Run（artifact_key 专属）；
-        已发布/失败的 Draft owner 已释放，返回 None 允许新 Run 接管。
+        - 对 working head 行 ``with_for_update``：并发 create 在此串行，后到者
+          看到先到者的活动 Run（Fix 1）；
+        - working head 的 owner 只可能是 kol-detail Run（artifact_key 专属）；
+        - paused/终态 owner（无继续/恢复价值）不再阻塞：释放 working head 让
+          新 Run 接管，避免用户被卡死（Fix 2）；
+        - 已发布/失败的 Draft owner 已释放，返回 None 允许新 Run 接管。
         """
         artifact_key = build_artifact_key("kol-detail", platform=platform, kol_uid=kol_uid)
         artifact = await self.db.scalar(
@@ -239,11 +329,24 @@ class KolDetailRunService:
         if artifact is None:
             return None
         draft = await self.db.scalar(
-            select(ArtifactDraft).where(ArtifactDraft.artifact_id == artifact.id)
+            select(ArtifactDraft)
+            .where(ArtifactDraft.artifact_id == artifact.id)
+            .with_for_update()
         )
-        if draft is not None and draft.owner_run_id is not None:
-            return draft.owner_run_id
-        return None
+        if draft is None or draft.owner_run_id is None:
+            return None
+        if not await self._owner_is_active(draft.owner_run_id):
+            await self._service.release_draft(draft.id, outcome="failed")
+            await self.db.flush()
+            return None
+        return draft.owner_run_id
+
+    async def _owner_is_active(self, run_id: str) -> bool:
+        """owner Run 是否仍活动（queued/running/reviewing）；缺失/暂停/终态视为非活动。"""
+        run = await self.db.get(AgentRun, run_id)
+        if run is None:
+            return False
+        return RunStatus(run.status) not in _NON_ACTIVE_OWNER_STATUSES
 
     async def _start_fresh_run(
         self,

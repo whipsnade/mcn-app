@@ -186,3 +186,54 @@ async def test_ttl_configurable(db_session) -> None:
     assert service.cache_ttl_hours == 6
     default = _make_service(db_session)
     assert default.cache_ttl_hours == 24
+
+
+async def test_set_cached_detail_recovers_from_concurrent_insert(
+    db_session, user_factory, session_factory, monkeypatch
+) -> None:
+    """并发回填撞唯一约束（Fix 1）：捕获 IntegrityError 重读并更新，而不是 500。"""
+    user = await user_factory()
+    session = await session_factory(user.id)
+    service = _make_service(db_session)
+    # 并发赢家已插入缓存行。
+    await service.set_cached_detail(
+        user_id=user.id,
+        session_id=session.id,
+        platform="xiaohongshu",
+        kol_uid="k1",
+        payload=PAYLOAD,
+        evidence_refs=[],
+        fetched_at=T0,
+        expires_at=T0 + timedelta(hours=24),
+    )
+    real_get = service.get_cached_detail
+    seen = {"n": 0}
+
+    async def stale_get(user_id: str, session_id: str, platform: str, kol_uid: str):
+        seen["n"] += 1
+        if seen["n"] == 1:
+            return None  # 竞态：本事务快照看不到赢家刚提交的行
+        return await real_get(user_id, session_id, platform, kol_uid)
+
+    monkeypatch.setattr(service, "get_cached_detail", stale_get)
+    # 后插入者撞唯一约束 → 恢复：重读赢家行并更新。
+    updated = await service.set_cached_detail(
+        user_id=user.id,
+        session_id=session.id,
+        platform="xiaohongshu",
+        kol_uid="k1",
+        payload=PAYLOAD,
+        evidence_refs=[{"artifact_path": "/data/trend/0/followers"}],
+        fetched_at=T0,
+        expires_at=T0 + timedelta(hours=25),
+    )
+    assert updated.evidence_refs_json == [{"artifact_path": "/data/trend/0/followers"}]
+    assert updated.expires_at == T0 + timedelta(hours=25)
+    # 没有 500、没有重复行。
+    count = await db_session.scalar(
+        select(func.count(KolDetailCache.id)).where(
+            KolDetailCache.user_id == user.id,
+            KolDetailCache.session_id == session.id,
+        )
+    )
+    assert count == 1
