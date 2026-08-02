@@ -1,0 +1,282 @@
+"""统一 Tool Registry（设计文档 §十「工具运行时」/ §16「安全与审计」）。
+
+注册所有可被 Agent 调用的可信工具，并在模型可见性上做三重求交（§16）：
+
+1. **Profile 分类**：工具按分类（MCP / history / calculation / artifact /
+   kol_detail，见 profiles.TOOL_CATEGORIES）注册，只有 Profile
+   ``allowed_tool_categories`` 允许的分类可见；
+2. **实时审核状态**：MCP 工具来自 ``mcp_tool_catalog``（通过注入的目录源），
+   只有 ``review_status == "approved"`` 且 ``is_enabled`` 可见；
+3. **用户渠道权限**：MCP 工具按其服务对应渠道，与用户的渠道权限求交。
+
+执行时服务端上下文（``user_id/session_id/run_id/profile_name``）通过
+:class:`ToolContext` 注入；模型参数中的服务端保留键在进入工具前被剥离（§16）。
+"""
+
+from __future__ import annotations
+
+import inspect
+from collections.abc import Awaitable, Callable, Iterable, Mapping
+from dataclasses import dataclass
+from typing import Any, Protocol
+
+from pydantic import BaseModel
+
+from app.agent_runtime.profiles import AgentProfile, MCP_TOOLS, TOOL_CATEGORIES
+from app.agent_runtime.tools.contracts import (
+    SERVER_RESERVED_KEYS,
+    ToolContext,
+    ToolResult,
+    TrustedTool,
+)
+
+
+class ToolContractError(ValueError):
+    """工具不满足 TrustedTool 契约，或注册/目录冲突。"""
+
+
+class UnknownToolError(LookupError):
+    """internal_name 未注册或当前不可执行。"""
+
+
+class CatalogRow(Protocol):
+    """``mcp_tool_catalog`` 行的最小形状（McpToolCatalog ORM 行或轻量投影）。
+
+    两种来源（ORM 行与 :class:`McpCatalogEntry` 快照）字段一致，可互换注入。
+    """
+
+    internal_tool_name: str
+    service_slug: str
+    reviewed_description: str
+    input_schema_json: dict[str, Any]
+    review_status: str
+    is_enabled: bool
+
+
+@dataclass(frozen=True)
+class McpCatalogEntry:
+    """MCP 目录行的内存快照，用于纯单元测试注入。"""
+
+    internal_tool_name: str
+    service_slug: str
+    reviewed_description: str
+    input_schema_json: dict[str, Any]
+    review_status: str
+    is_enabled: bool
+
+
+@dataclass(frozen=True)
+class RegisteredTool:
+    """注册表内一条工具描述。
+
+    - ``category``：TOOL_CATEGORIES 词汇表分类（§五）；
+    - ``channel``：MCP 工具所需渠道权限，``None`` 表示跨平台/无渠道门槛；
+    - ``tool``：可执行对象；目录来源的 MCP 工具在 Task 8 接入执行器前为 ``None``；
+    - ``review_status`` / ``is_enabled``：仅目录来源的 MCP 工具携带。
+    """
+
+    internal_name: str
+    category: str
+    points_cost: int
+    external_side_effect: bool
+    description: str = ""
+    channel: str | None = None
+    input_model: type[BaseModel] | None = None
+    tool: TrustedTool | None = None
+    review_status: str | None = None
+    is_enabled: bool = True
+
+
+# service_slug -> 该服务工具所需的渠道权限；None 表示跨平台、无渠道门槛。
+_MCP_SERVICE_CHANNEL: dict[str, str | None] = {
+    "insight-cube-mcp": None,
+    "social-grow-mcp": None,  # 多平台服务，按内部工具名细分（见下）
+    "social-grow-content-mcp": "xiaohongshu",
+    "aktools-mcp": None,
+    "bilibili-mcp": "bilibili",
+}
+
+# social-grow 多平台服务按内部工具名细分渠道。
+_MCP_INTERNAL_CHANNEL: dict[str, str] = {
+    "kol_xiaohongshu_search": "xiaohongshu",
+    "kol_douyin_search": "douyin",
+    "kol_bilibili_search": "bilibili",
+    "kol_weibo_search": "weibo",
+    "kol_wechat_search": "wechat",
+}
+
+# §11.3：每次 DataTap MCP 调用固定 10 积分。
+_MCP_POINTS_COST = 10
+
+
+def _validate_tool(tool: TrustedTool) -> None:
+    """结构校验 TrustedTool 契约；失败抛 :class:`ToolContractError`。"""
+    name = getattr(tool, "name", None)
+    if not isinstance(name, str) or not name:
+        raise ToolContractError("tool.name must be a non-empty string")
+    input_model = getattr(tool, "input_model", None)
+    if not (isinstance(input_model, type) and issubclass(input_model, BaseModel)):
+        raise ToolContractError("tool.input_model must be a Pydantic BaseModel subclass")
+    if not isinstance(getattr(tool, "points_cost", None), int):
+        raise ToolContractError("tool.points_cost must be an int")
+    if not isinstance(getattr(tool, "external_side_effect", None), bool):
+        raise ToolContractError("tool.external_side_effect must be a bool")
+    execute = getattr(tool, "execute", None)
+    if not callable(execute) or not inspect.iscoroutinefunction(execute):
+        raise ToolContractError("tool.execute must be an async callable")
+    reserved = SERVER_RESERVED_KEYS & input_model.model_fields.keys()
+    if reserved:
+        raise ToolContractError(
+            f"tool.input_model must not declare server-reserved keys: {sorted(reserved)}"
+        )
+
+
+def _channel_for_catalog_row(row: CatalogRow) -> str | None:
+    """解析目录行所需渠道：先按内部工具名细分，再按服务回退。"""
+    channel = _MCP_INTERNAL_CHANNEL.get(row.internal_tool_name)
+    if channel is None:
+        channel = _MCP_SERVICE_CHANNEL.get(row.service_slug)
+    return channel
+
+
+class ToolRegistry:
+    """统一工具注册表：注册 + Profile/渠道/审核状态过滤 + 服务端上下文注入执行。"""
+
+    def __init__(
+        self,
+        *,
+        catalog_source: (
+            Iterable[CatalogRow]
+            | Callable[[], Iterable[CatalogRow] | Awaitable[Iterable[CatalogRow]]]
+            | None
+        ) = None,
+    ) -> None:
+        self._entries: dict[str, RegisteredTool] = {}
+        self._catalog_source = catalog_source
+        self._catalog_loaded = False
+
+    def register(self, tool: TrustedTool, *, category: str) -> RegisteredTool:
+        """注册一个可信工具。
+
+        MCP 工具不通过 register 注册（一律来自审核目录），分类必须是
+        TOOL_CATEGORIES 词汇表成员，internal_name 不得重复。
+        """
+        if category not in TOOL_CATEGORIES:
+            raise ToolContractError(f"unknown tool category: {category!r}")
+        if category == MCP_TOOLS:
+            raise ToolContractError(
+                "MCP tools are sourced from the approved catalog, not register()"
+            )
+        _validate_tool(tool)
+        if tool.name in self._entries:
+            raise ToolContractError(f"duplicate tool internal_name: {tool.name!r}")
+        entry = RegisteredTool(
+            internal_name=tool.name,
+            category=category,
+            points_cost=tool.points_cost,
+            external_side_effect=tool.external_side_effect,
+            input_model=tool.input_model,
+            tool=tool,
+        )
+        self._entries[tool.name] = entry
+        return entry
+
+    @property
+    def registered_tools(self) -> tuple[RegisteredTool, ...]:
+        """当前已注册的工具集合（含已加载的 MCP 目录工具）。"""
+        return tuple(sorted(self._entries.values(), key=lambda entry: entry.internal_name))
+
+    async def visible_tools(
+        self,
+        profile: AgentProfile,
+        *,
+        channel_permissions: Iterable[str] = (),
+    ) -> tuple[RegisteredTool, ...]:
+        """返回 Profile + 用户渠道权限 + 实时审核状态共同允许的工具。"""
+        await self._ensure_catalog()
+        granted = frozenset(channel_permissions)
+        result: list[RegisteredTool] = []
+        for entry in self._entries.values():
+            if entry.category not in profile.allowed_tool_categories:
+                continue
+            if entry.category == MCP_TOOLS:
+                if entry.review_status != "approved" or not entry.is_enabled:
+                    continue
+                if entry.channel is not None and entry.channel not in granted:
+                    continue
+            result.append(entry)
+        return tuple(sorted(result, key=lambda entry: entry.internal_name))
+
+    async def execute(
+        self,
+        *,
+        internal_name: str,
+        arguments: Mapping[str, Any],
+        user_id: str,
+        session_id: str,
+        run_id: str,
+        profile_name: str,
+    ) -> ToolResult:
+        """构建服务端 ToolContext、剥离保留键后调用工具。
+
+        模型提供的参数在进入工具前剥离 ``user_id/session_id/run_id``（§16），
+        实际身份始终来自服务端注入的 ``ToolContext``。
+        """
+        await self._ensure_catalog()
+        entry = self._entries.get(internal_name)
+        if entry is None or entry.tool is None:
+            raise UnknownToolError(f"tool is not registered or not executable: {internal_name!r}")
+        scrubbed = {
+            key: value for key, value in arguments.items() if key not in SERVER_RESERVED_KEYS
+        }
+        parsed: BaseModel | Mapping[str, Any]
+        if entry.input_model is not None:
+            parsed = entry.input_model.model_validate(scrubbed)
+        else:
+            parsed = scrubbed
+        context = ToolContext(
+            user_id=user_id,
+            session_id=session_id,
+            run_id=run_id,
+            profile_name=profile_name,
+        )
+        return await entry.tool.execute(context, parsed)
+
+    async def _ensure_catalog(self) -> None:
+        """加载一次注入的 MCP 目录源（快照或 DB 查询），并把批准启用工具纳入注册表。"""
+        if self._catalog_loaded:
+            return
+        if self._catalog_source is not None:
+            raw = self._catalog_source() if callable(self._catalog_source) else self._catalog_source
+            if inspect.isawaitable(raw):
+                raw = await raw
+            for row in raw:
+                self._register_catalog_row(row)
+        self._catalog_loaded = True
+
+    def _register_catalog_row(self, row: CatalogRow) -> None:
+        internal_name = row.internal_tool_name
+        if internal_name in self._entries:
+            raise ToolContractError(f"duplicate tool internal_name: {internal_name!r}")
+        self._entries[internal_name] = RegisteredTool(
+            internal_name=internal_name,
+            category=MCP_TOOLS,
+            points_cost=_MCP_POINTS_COST,
+            external_side_effect=True,
+            description=row.reviewed_description,
+            channel=_channel_for_catalog_row(row),
+            input_model=None,
+            tool=None,
+            review_status=row.review_status,
+            is_enabled=row.is_enabled,
+        )
+
+
+__all__ = [
+    "CatalogRow",
+    "McpCatalogEntry",
+    "RegisteredTool",
+    "ToolContractError",
+    "ToolRegistry",
+    "UnknownToolError",
+]
