@@ -1,0 +1,592 @@
+"""确定性计算工具（设计文档 §10.3）。
+
+五个零积分确定性工具：calculate_expression / aggregate_metrics /
+calculate_period_comparison / normalize_sentiment / rank_kols。它们只计算和
+校验，绝不决定业务步骤。关键数值进入 Artifact 时通过 settled 的 tool call
+行（``lineage.derivation.tool_call_id``）建立字段级来源链。
+
+``rank_kols`` 严格复用 ``selection.scoring_v2`` 的八维 ``kol_score_v2``：
+任一维度缺失/无效记 0 分且不重分配权重；默认跨平台按 ``engagement_total``
+降序取 Top20。``growth_rate`` 与 ``quoted_price`` 只展示/筛选，不进入总分。
+"""
+
+from __future__ import annotations
+
+import ast
+import json
+import operator
+from collections.abc import Mapping
+from datetime import UTC, datetime
+from typing import Any, Literal
+from uuid import uuid4
+
+from pydantic import BaseModel, Field
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.agent_runtime.models import AgentToolCall
+from app.agent_runtime.tools.contracts import ToolContext, ToolResult
+from app.agent_runtime.tools.mcp import arguments_hash, logical_call_id_for
+from app.mcp_gateway.validation import McpValidationError
+from app.selection.scoring_v2 import (
+    SCORE_VERSION_V2,
+    ScoreContextV2,
+    ScoreInputsV2,
+    score_candidate_v2,
+)
+
+# rank_kols 默认跨平台 Top20（§9.3：跨平台合计最多 20）。
+_RANK_DEFAULT_LIMIT = 20
+_RANK_MAX_LIMIT = 50
+
+# 受限表达式求值的 AST 节点数上限（防御深度嵌套/超大表达式）。
+_MAX_AST_NODES = 200
+
+_SAFE_BIN_OPS: dict[type[ast.operator], Any] = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+    ast.Pow: operator.pow,
+}
+_SAFE_UNARY_OPS: dict[type[ast.unaryop], Any] = {
+    ast.UAdd: operator.pos,
+    ast.USub: operator.neg,
+}
+_SAFE_CMP_OPS: dict[type[ast.cmpop], Any] = {
+    ast.Eq: operator.eq,
+    ast.NotEq: operator.ne,
+    ast.Lt: operator.lt,
+    ast.LtE: operator.le,
+    ast.Gt: operator.gt,
+    ast.GtE: operator.ge,
+    ast.In: lambda a, b: a in b,
+    ast.NotIn: lambda a, b: a not in b,
+}
+_SAFE_BOOL_OPS: dict[type[ast.boolop], Any] = {
+    ast.And: all,
+    ast.Or: any,
+}
+
+_POSITIVE_LABELS = frozenset(
+    {"正面", "正", "积极", "正向", "好评", "满意", "positive", "pos", "up"}
+)
+_NEGATIVE_LABELS = frozenset(
+    {"负面", "负", "消极", "差评", "不满意", "negative", "neg", "down"}
+)
+_NEUTRAL_LABELS = frozenset({"中性", "中", "一般", "neutral", "neu"})
+
+
+class _UnsafeExpression(ValueError):
+    """表达式包含受限求值器不支持的结构。"""
+
+
+def _calc_failed(message: str) -> ToolResult:
+    return ToolResult(status="failed", safe_summary=str(message)[:500])
+
+
+def _is_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _number(value: Any) -> float | None:
+    if _is_number(value):
+        return float(value)
+    return None
+
+
+def _whole(value: Any) -> int | None:
+    number = _number(value)
+    return int(number) if number is not None and number >= 0 else None
+
+
+def _number_distribution(value: Any) -> dict[str, float]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        key: number
+        for key, item in value.items()
+        if isinstance(key, str) and (number := _number(item)) is not None and number >= 0
+    }
+
+
+# --------------------------------------------------------------------------- #
+# 受限安全表达式求值（calculate_expression）
+# --------------------------------------------------------------------------- #
+
+
+def _evaluate(node: ast.AST, variables: Mapping[str, Any]) -> Any:
+    if isinstance(node, ast.Expression):
+        return _evaluate(node.body, variables)
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, (int, float, bool)):
+            return node.value
+        raise _UnsafeExpression(f"unsupported constant: {node.value!r}")
+    if isinstance(node, ast.Name):
+        if node.id not in variables or not isinstance(variables[node.id], (int, float, bool)):
+            raise _UnsafeExpression(f"undefined or non-numeric variable: {node.id!r}")
+        return variables[node.id]
+    if isinstance(node, ast.BinOp):
+        if type(node.op) not in _SAFE_BIN_OPS:
+            raise _UnsafeExpression(f"unsupported operator: {type(node.op).__name__}")
+        return _SAFE_BIN_OPS[type(node.op)](
+            _evaluate(node.left, variables), _evaluate(node.right, variables)
+        )
+    if isinstance(node, ast.UnaryOp):
+        if type(node.op) not in _SAFE_UNARY_OPS:
+            raise _UnsafeExpression(f"unsupported operator: {type(node.op).__name__}")
+        return _SAFE_UNARY_OPS[type(node.op)](_evaluate(node.operand, variables))
+    if isinstance(node, ast.BoolOp):
+        if type(node.op) not in _SAFE_BOOL_OPS:
+            raise _UnsafeExpression(f"unsupported operator: {type(node.op).__name__}")
+        values = [_evaluate(value, variables) for value in node.values]
+        return _SAFE_BOOL_OPS[type(node.op)](values)
+    if isinstance(node, ast.Compare):
+        left = _evaluate(node.left, variables)
+        comparators = [_evaluate(value, variables) for value in node.comparators]
+        result = True
+        for index, comparator_op in enumerate(node.ops):
+            if type(comparator_op) not in _SAFE_CMP_OPS:
+                raise _UnsafeExpression(f"unsupported operator: {type(comparator_op).__name__}")
+            if not _SAFE_CMP_OPS[type(comparator_op)](
+                left if index == 0 else comparators[index - 1], comparators[index]
+            ):
+                result = False
+        return result
+    raise _UnsafeExpression(f"unsupported node: {type(node).__name__}")
+
+
+def evaluate_expression(expression: str, variables: Mapping[str, Any]) -> Any:
+    """在受限节点白名单下求值算术表达式；结果必须是数字或布尔。"""
+    try:
+        tree = ast.parse(expression, mode="eval")
+    except SyntaxError as exc:
+        raise _UnsafeExpression(f"invalid expression: {exc}") from exc
+    node_count = 0
+    for _ in ast.walk(tree):
+        node_count += 1
+        if node_count > _MAX_AST_NODES:
+            raise _UnsafeExpression("expression too large")
+    result = _evaluate(tree.body, dict(variables))
+    if not isinstance(result, (int, float, bool)):
+        raise _UnsafeExpression("expression must evaluate to a number or boolean")
+    return result
+
+
+# --------------------------------------------------------------------------- #
+# 计算工具
+# --------------------------------------------------------------------------- #
+
+
+async def _record_settled_call(
+    db: AsyncSession | None,
+    context: ToolContext,
+    internal_tool_name: str,
+    arguments: BaseModel,
+) -> None:
+    """确定性调用成功落库为 settled 零积分 tool call（供 lineage 引用）。
+
+    只有存在 DB 且 ``ToolContext.step_id`` 可用时才落库（否则跳过）。
+    ``logical_call_id`` 由 run+step+工具+参数哈希确定性派生，重入复用同一行。
+    """
+    if db is None or context.step_id is None:
+        return
+    normalized = arguments.model_dump() if isinstance(arguments, BaseModel) else dict(arguments)
+    try:
+        args_hash = arguments_hash(normalized)
+    except McpValidationError:
+        return
+    logical_call_id = logical_call_id_for(
+        context.run_id, context.step_id, internal_tool_name, args_hash
+    )
+    existing = await db.scalar(
+        select(AgentToolCall.id).where(AgentToolCall.logical_call_id == logical_call_id)
+    )
+    if existing is not None:
+        return
+    now = datetime.now(UTC).replace(tzinfo=None)
+    db.add(
+        AgentToolCall(
+            id=str(uuid4()),
+            run_id=context.run_id,
+            step_id=context.step_id,
+            logical_call_id=logical_call_id,
+            service="internal",
+            internal_tool_name=internal_tool_name,
+            arguments_json=normalized,
+            arguments_hash=args_hash,
+            status="settled",
+            points_reserved=0,
+            points_settled=0,
+            started_at=now,
+            completed_at=now,
+        )
+    )
+    await db.flush()
+
+
+class CalculateExpressionArgs(BaseModel):
+    expression: str = Field(min_length=1, max_length=500)
+    variables: dict[str, float] = {}
+
+
+class CalculateExpressionTool:
+    """受限算术表达式求值（零积分）。"""
+
+    name = "calculate_expression"
+    input_model = CalculateExpressionArgs
+    points_cost = 0
+    external_side_effect = False
+
+    def __init__(self, db_session: AsyncSession | None = None) -> None:
+        self._db = db_session
+
+    async def execute(self, context: ToolContext, arguments: BaseModel) -> ToolResult:
+        args = CalculateExpressionArgs.model_validate(arguments)
+        try:
+            result = evaluate_expression(args.expression, args.variables)
+        except _UnsafeExpression as exc:
+            return _calc_failed(str(exc))
+        except ZeroDivisionError:
+            return _calc_failed("division by zero")
+        except (TypeError, ValueError, OverflowError, KeyError) as exc:
+            return _calc_failed(f"invalid expression: {exc}")
+        await _record_settled_call(self._db, context, self.name, args)
+        return ToolResult(
+            status="success",
+            safe_summary=json.dumps(
+                {"expression": args.expression, "result": result}, ensure_ascii=False
+            ),
+        )
+
+
+class MetricSpec(BaseModel):
+    name: str = Field(min_length=1)
+    field: str = Field(min_length=1)
+    op: Literal["sum", "avg", "count", "min", "max"]
+
+
+class AggregateMetricsArgs(BaseModel):
+    rows: list[dict[str, Any]] = Field(min_length=1)
+    group_by: str | list[str] | None = None
+    metrics: list[MetricSpec] = Field(min_length=1)
+
+
+class AggregateMetricsTool:
+    """数据切片上的确定性聚合（sum/avg/count/min/max，零积分）。"""
+
+    name = "aggregate_metrics"
+    input_model = AggregateMetricsArgs
+    points_cost = 0
+    external_side_effect = False
+
+    def __init__(self, db_session: AsyncSession | None = None) -> None:
+        self._db = db_session
+
+    async def execute(self, context: ToolContext, arguments: BaseModel) -> ToolResult:
+        args = AggregateMetricsArgs.model_validate(arguments)
+        groups: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+        for row in args.rows:
+            key = _group_key(row, args.group_by)
+            groups.setdefault(key, []).append(row)
+
+        results: list[dict[str, Any]] = []
+        for key in _ordered_group_keys(groups):
+            group_rows = groups[key]
+            metric_output: dict[str, Any] = {}
+            for spec in args.metrics:
+                metric_output[spec.name] = _aggregate(group_rows, spec)
+            results.append({"group": _group_value(key, args.group_by), **metric_output})
+
+        await _record_settled_call(self._db, context, self.name, args)
+        return ToolResult(
+            status="success",
+            safe_summary=json.dumps(
+                {"groups": results, "rows_processed": len(args.rows)}, ensure_ascii=False
+            ),
+        )
+
+
+class CalculatePeriodComparisonArgs(BaseModel):
+    current: Any
+    baseline: Any
+
+
+class CalculatePeriodComparisonTool:
+    """周期对比：delta + rate（零积分）。"""
+
+    name = "calculate_period_comparison"
+    input_model = CalculatePeriodComparisonArgs
+    points_cost = 0
+    external_side_effect = False
+
+    def __init__(self, db_session: AsyncSession | None = None) -> None:
+        self._db = db_session
+
+    async def execute(self, context: ToolContext, arguments: BaseModel) -> ToolResult:
+        args = CalculatePeriodComparisonArgs.model_validate(arguments)
+        try:
+            result = _period_comparison(args.current, args.baseline)
+        except ValueError as exc:
+            return _calc_failed(str(exc))
+        await _record_settled_call(self._db, context, self.name, args)
+        return ToolResult(status="success", safe_summary=json.dumps(result, ensure_ascii=False))
+
+
+class NormalizeSentimentArgs(BaseModel):
+    raw: Any
+
+
+class NormalizeSentimentTool:
+    """把情感值映射到规范 positive/neutral/negative 形状（零积分）。"""
+
+    name = "normalize_sentiment"
+    input_model = NormalizeSentimentArgs
+    points_cost = 0
+    external_side_effect = False
+
+    def __init__(self, db_session: AsyncSession | None = None) -> None:
+        self._db = db_session
+
+    async def execute(self, context: ToolContext, arguments: BaseModel) -> ToolResult:
+        args = NormalizeSentimentArgs.model_validate(arguments)
+        try:
+            sentiment, polarity = _normalize_sentiment(args.raw)
+        except ValueError as exc:
+            return _calc_failed(str(exc))
+        await _record_settled_call(self._db, context, self.name, args)
+        return ToolResult(
+            status="success",
+            safe_summary=json.dumps(
+                {"sentiment": sentiment, "polarity": polarity, "raw": args.raw},
+                ensure_ascii=False,
+            ),
+        )
+
+
+class RankKolsArgs(BaseModel):
+    items: list[dict[str, Any]] = Field(min_length=1)
+    context: dict[str, Any] | None = None
+    limit: int = Field(default=_RANK_DEFAULT_LIMIT, ge=1, le=_RANK_MAX_LIMIT)
+    order_by: str = "engagement_total"
+    desc: bool = True
+
+
+class RankKolsTool:
+    """KOL 排序：严格复用 kol_score_v2 八维评分，默认 engagement_total Top20。
+
+    score_inputs 是评分的唯一来源；顶层的 followers / engagement_total /
+    growth_rate / quoted_price 只作展示与排序，不进入总分（spec 口径）。
+    """
+
+    name = "rank_kols"
+    input_model = RankKolsArgs
+    points_cost = 0
+    external_side_effect = False
+
+    def __init__(self, db_session: AsyncSession | None = None) -> None:
+        self._db = db_session
+
+    async def execute(self, context: ToolContext, arguments: BaseModel) -> ToolResult:
+        args = RankKolsArgs.model_validate(arguments)
+        score_context = _score_context(args.context)
+        scored: list[dict[str, Any]] = []
+        for item in args.items:
+            snapshot = score_candidate_v2(score_context, _score_inputs(item))
+            scored.append(
+                {
+                    "platform": item.get("platform"),
+                    "kol_uid": item.get("kol_uid"),
+                    "nickname": item.get("nickname"),
+                    "followers": item.get("followers"),
+                    "engagement_total": item.get("engagement_total"),
+                    "growth_rate": item.get("growth_rate"),
+                    "quoted_price": item.get("quoted_price"),
+                    "score_snapshot": snapshot,
+                    "missing_fields": [
+                        name
+                        for name, dimension in snapshot["dimensions"].items()
+                        if dimension["missing_reason"] is not None
+                    ],
+                }
+            )
+        ordered = _sort_entries(scored, args.order_by, args.desc)
+        page = ordered[: args.limit]
+        for index, entry in enumerate(page, start=1):
+            entry["rank"] = index
+        await _record_settled_call(self._db, context, self.name, args)
+        return ToolResult(
+            status="success",
+            safe_summary=json.dumps(
+                {"items": page, "total": len(ordered), "truncated": len(ordered) > args.limit},
+                ensure_ascii=False,
+            ),
+        )
+
+
+# --------------------------------------------------------------------------- #
+# 纯函数辅助
+# --------------------------------------------------------------------------- #
+
+
+def _group_key(row: Mapping[str, Any], group_by: str | list[str] | None) -> tuple[Any, ...]:
+    if group_by is None:
+        return ()
+    keys = [group_by] if isinstance(group_by, str) else list(group_by)
+    return tuple(row.get(key) for key in keys)
+
+
+def _group_value(key: tuple[Any, ...], group_by: str | list[str] | None) -> Any:
+    if group_by is None:
+        return None
+    keys = [group_by] if isinstance(group_by, str) else list(group_by)
+    return dict(zip(keys, key, strict=True))
+
+
+def _ordered_group_keys(groups: Mapping[tuple[Any, ...], Any]) -> list[tuple[Any, ...]]:
+    # 确定性顺序：按规范化字符串键排序，避免哈希/插入序不确定。
+    return sorted(groups.keys(), key=lambda key: tuple(str(value) for value in key))
+
+
+def _aggregate(rows: list[Mapping[str, Any]], spec: MetricSpec) -> Any:
+    values: list[float] = []
+    for row in rows:
+        value = row.get(spec.field)
+        if _is_number(value):
+            values.append(float(value))
+    if spec.op == "count":
+        return len(values)
+    if not values:
+        return None
+    if spec.op == "sum":
+        return sum(values)
+    if spec.op == "avg":
+        return round(sum(values) / len(values), 6)
+    if spec.op == "min":
+        return min(values)
+    if spec.op == "max":
+        return max(values)
+    raise ValueError(f"unknown op: {spec.op}")
+
+
+def _rate(current: float, baseline: float) -> float | None:
+    if baseline == 0:
+        return None
+    return (current - baseline) / baseline
+
+
+def _period_comparison(current: Any, baseline: Any) -> dict[str, Any]:
+    if isinstance(current, dict) and isinstance(baseline, dict):
+        keys = sorted(set(current) | set(baseline))
+        result: dict[str, Any] = {}
+        for key in keys:
+            current_value, baseline_value = current.get(key), baseline.get(key)
+            if _is_number(current_value) and _is_number(baseline_value):
+                result[key] = {
+                    "delta": current_value - baseline_value,
+                    "rate": _rate(float(current_value), float(baseline_value)),
+                }
+            else:
+                result[key] = {"delta": None, "rate": None}
+        return result
+    if _is_number(current) and _is_number(baseline):
+        return {
+            "delta": current - baseline,
+            "rate": _rate(float(current), float(baseline)),
+        }
+    raise ValueError("current and baseline must be both numbers or both dicts of numbers")
+
+
+def _text_sentiment(value: str) -> str:
+    import unicodedata
+
+    return unicodedata.normalize("NFKC", value.strip()).casefold()
+
+
+def _normalize_sentiment(raw: Any) -> tuple[str, int]:
+    if isinstance(raw, bool):
+        raise ValueError("sentiment must be numeric or text")
+    if _is_number(raw):
+        if -1 <= raw <= 1:
+            if raw > 0.2:
+                return "positive", 1
+            if raw < -0.2:
+                return "negative", -1
+            return "neutral", 0
+        if 0 <= raw <= 100:
+            if raw > 60:
+                return "positive", 1
+            if raw < 40:
+                return "negative", -1
+            return "neutral", 0
+        raise ValueError("numeric sentiment out of supported range")
+    if isinstance(raw, str):
+        key = _text_sentiment(raw)
+        if key in _POSITIVE_LABELS:
+            return "positive", 1
+        if key in _NEGATIVE_LABELS:
+            return "negative", -1
+        if key in _NEUTRAL_LABELS:
+            return "neutral", 0
+        # 未知标签保守归为中性。
+        return "neutral", 0
+    raise ValueError("sentiment must be numeric or text")
+
+
+def _score_context(context: Mapping[str, Any] | None) -> ScoreContextV2:
+    if not context:
+        return ScoreContextV2(industry="", regions=(), age_ranges=())
+    regions = tuple(
+        item for item in context.get("regions") or [] if isinstance(item, str) and item.strip()
+    )
+    ages = tuple(
+        item for item in context.get("age_ranges") or [] if isinstance(item, str) and item.strip()
+    )
+    return ScoreContextV2(
+        industry=context.get("industry") or "", regions=regions, age_ranges=ages
+    )
+
+
+def _score_inputs(item: Mapping[str, Any]) -> ScoreInputsV2:
+    """评分输入只来自 ``score_inputs``；顶层字段仅展示/排序（spec 口径）。"""
+    raw = item.get("score_inputs") or {}
+    return ScoreInputsV2(
+        audience_interests=_number_distribution(raw.get("audience_interests")),
+        audience_regions=_number_distribution(raw.get("audience_regions")),
+        audience_age=_number_distribution(raw.get("audience_age")),
+        average_interactions=_number(raw.get("average_interactions")),
+        effective_follower_rate=_number(raw.get("effective_follower_rate")),
+        active_follower_count=_whole(raw.get("active_follower_count")),
+        content_score=_number(raw.get("content_score")),
+        followers=_whole(raw.get("followers")),
+        interaction_follower_ratio=_number(raw.get("interaction_follower_ratio")),
+    )
+
+
+def _sort_entries(entries: list[dict[str, Any]], order_by: str, desc: bool) -> list[dict[str, Any]]:
+    def key(entry: dict[str, Any]) -> tuple[int, float]:
+        value = entry.get(order_by)
+        if not _is_number(value):
+            return (1, 0.0)
+        return (0, -float(value) if desc else float(value))
+
+    return sorted(entries, key=key)
+
+
+__all__ = [
+    "AggregateMetricsArgs",
+    "AggregateMetricsTool",
+    "CalculateExpressionArgs",
+    "CalculateExpressionTool",
+    "CalculatePeriodComparisonArgs",
+    "CalculatePeriodComparisonTool",
+    "MetricSpec",
+    "NormalizeSentimentArgs",
+    "NormalizeSentimentTool",
+    "RankKolsArgs",
+    "RankKolsTool",
+    "SCORE_VERSION_V2",
+    "evaluate_expression",
+]
