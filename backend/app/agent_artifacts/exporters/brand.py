@@ -5,6 +5,20 @@
 「数据受限/未采集」说明，绝不因空数据画误导性图表；受限章节通过
 ``availability``/``limitations`` 披露。任何异常向上抛（Task 19 路由映射），
 绝不输出半截文件。
+
+模板行号契约（与 ``scripts/build_agent_artifact_templates.py`` 一一对应，
+改模板布局必须同步改两处并更新测试）：
+- 综合概览：``A1``(合并)/``A2``(合并)/``A3``(合并) 为标题/周期/来源锚点；
+  ``核心指标`` 标题@4、表头@5、指标行@6-9；``clear_rows(11, 60, 6)`` 后
+  平台表现与对比分析由渲染器自 11 行起动态排布。
+- 情感分析/内容与达人/洞察与建议：标题@1，其余自第 3 行起渲染器完全接管。
+- 日趋势：标题@1，表头@3（模板固定），数据自 4 行起；折线图数值引用
+   ``min_row=3``（表头作系列名）+ 分类轴 ``min_row=4``。
+- 地域与话题：标题@1；``write_table`` 布局为 标题@3/表头@4/数据@5+；
+  柱状图数值引用 ``min_row=4``（表头作系列名）+ 分类轴 ``min_row=5``，
+  锚定在话题表之后。
+- 热门帖子TOP：表头@3（渲染器重写），数据自 4 行起。
+- 方法论：表头@3（模板固定），数据自 4 行起。
 """
 
 from __future__ import annotations
@@ -182,7 +196,8 @@ def _render_daily_trend(sheet, report) -> None:
     for index, point in enumerate(points):
         row = 4 + index
         sheet.cell(row, 1).value = point.date
-        sheet.cell(row, 2).value = platform_label(point.platform)
+        # 平台名是第三方可控文本，经 cell_value 转义防止公式注入。
+        sheet.cell(row, 2).value = cell_value(platform_label(point.platform))
         sheet.cell(row, 3).value = point.volume
         sheet.cell(row, 4).value = point.engagement
         sheet.cell(row, 5).value = point.positive
@@ -268,19 +283,24 @@ def _render_regions_topics(sheet, report) -> None:
         pct_columns=(3,),
         note=empty_note(report, "regions"),
     )
+    chart: BarChart | None = None
     if regions:
+        # write_table 布局：标题@3 / 表头@4 / 数据@5+。图表数值引用必须落在
+        # 真实数据行（5..4+len(regions)）：表头行 4 只作为系列名（titles_from_data），
+        # 分类轴从数据首行 5 开始——绝不把表头/合并标题混进数据，也不丢末行。
         chart = BarChart()
         chart.type = "col"
         chart.title = "发帖用户地域声量分布"
         chart.add_data(
-            Reference(sheet, min_col=2, min_row=3, max_row=3 + len(regions)),
+            Reference(sheet, min_col=2, min_row=4, max_row=4 + len(regions)),
             titles_from_data=True,
         )
-        chart.set_categories(Reference(sheet, min_col=1, min_row=4, max_row=3 + len(regions)))
+        chart.set_categories(
+            Reference(sheet, min_col=1, min_row=5, max_row=4 + len(regions))
+        )
         chart.height = 8
         chart.width = 16
-        sheet.add_chart(chart, f"A{3 + len(regions) + 2}")
-    write_table(
+    row = write_table(
         sheet,
         row + 1,
         "话题分布",
@@ -292,6 +312,9 @@ def _render_regions_topics(sheet, report) -> None:
         columns=4,
         note=empty_note(report, "topics"),
     )
+    if chart is not None:
+        # 图表锚定在两张表之后，避免与数据/后续表格重叠。
+        sheet.add_chart(chart, f"A{row + 1}")
 
 
 def _render_top_posts(sheet, report) -> None:

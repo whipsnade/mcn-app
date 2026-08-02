@@ -54,9 +54,31 @@ def _values(ws) -> list:
     ]
 
 
+def _brand_version_multi() -> _Version:
+    """多点位 fixture：3 个日趋势点 + 2 个地域，覆盖图表区间计算（防单点掩盖 off-by-one）。"""
+    payload = build_brand_dict()
+    payload["data"]["daily_trend"] = [
+        {
+            "date": date(2026, 1, day),
+            "platform": "xiaohongshu",
+            "volume": day * 100,
+            "engagement": day * 500,
+            "positive": day * 70,
+            "neutral": 20,
+            "negative": 10,
+        }
+        for day in (1, 2, 3)
+    ]
+    payload["data"]["regions"] = [
+        {"region": "上海", "volume": 300, "share": 0.3, "sentiment_score": 0.7},
+        {"region": "北京", "volume": 700, "share": 0.7, "sentiment_score": 0.6},
+    ]
+    return _Version("brand_report_v3", payload)
+
+
 def test_published_brand_report_exports_valid_workbook() -> None:
     """已发布 brand_report_v3 导出为可重载 .xlsx，八章节/关键单元格齐全。"""
-    content = export_artifact(_brand_version())
+    content = export_artifact(_brand_version_multi())
     assert content[:2] == b"PK"
     wb = load_workbook(BytesIO(content))
     assert tuple(wb.sheetnames) == BRAND_SHEETS
@@ -72,7 +94,7 @@ def test_published_brand_report_exports_valid_workbook() -> None:
     assert 10 in _values(sentiment)  # 每个情感桶计数
     assert 0.5 in _values(sentiment)  # 占比
 
-    # 日趋势：数据行 + 图表引用正确区间。
+    # 日趋势：数据行 + 折线图引用全部数据点（3 行），不含表头行。
     trend = wb["日趋势"]
     assert any(
         isinstance(value, date) and value.year == 2026 and value.month == 1 and value.day == 1
@@ -81,10 +103,10 @@ def test_published_brand_report_exports_valid_workbook() -> None:
     assert 100 in _values(trend)  # volume
     charts = trend._charts
     assert len(charts) == 1
-    # openpyxl 排除表头行：数据引用从首个数据行（行 4）开始，指向声量/互动列。
-    assert charts[0].ser[0].val.numRef.f == "'日趋势'!$C$4"  # 声量列
-    assert charts[0].ser[1].val.numRef.f == "'日趋势'!$D$4"  # 互动列
-    assert charts[0].ser[0].cat.numRef.f == "'日趋势'!$A$4"  # 日期列
+    # openpyxl 排除表头行：数据引用从首个数据行（行 4）到末个数据行（行 6）。
+    assert charts[0].ser[0].val.numRef.f == "'日趋势'!$C$4:$C$6"  # 声量列
+    assert charts[0].ser[1].val.numRef.f == "'日趋势'!$D$4:$D$6"  # 互动列
+    assert charts[0].ser[0].cat.numRef.f == "'日趋势'!$A$4:$A$6"  # 日期列
 
     # 话题：话题名 + 声量。
     topics = wb["地域与话题"]
@@ -96,6 +118,45 @@ def test_published_brand_report_exports_valid_workbook() -> None:
     assert "热帖" in _values(top_posts)
     assert "author" in _values(top_posts)
     assert 115 in _values(top_posts)
+
+
+def test_region_chart_covers_region_values() -> None:
+    """地域柱状图的数据区间必须落在真实数据行，不得把表头/合并标题混进数据或丢末行。"""
+    payload = build_brand_dict()
+    payload["data"]["regions"] = [
+        {"region": "上海", "volume": 300, "share": 0.3, "sentiment_score": 0.7},
+        {"region": "北京", "volume": 700, "share": 0.7, "sentiment_score": 0.6},
+    ]
+    wb = load_workbook(BytesIO(export_artifact(_Version("brand_report_v3", payload))))
+    sheet = wb["地域与话题"]
+    assert len(sheet._charts) == 1
+    chart = sheet._charts[0]
+    # write_table 布局：标题@3/表头@4/数据@5+；数据引用 B5:B6 覆盖两个地域真实值。
+    assert chart.ser[0].val.numRef.f == "'地域与话题'!$B$5:$B$6"
+    assert chart.ser[0].cat.numRef.f == "'地域与话题'!$A$5:$A$6"
+    assert sheet["B4"].value == "声量"  # 表头仅作系列名，不进数据区间
+    assert sheet["B5"].value == 300
+    assert sheet["B6"].value == 700
+
+
+def test_daily_trend_platform_cell_is_escaped() -> None:
+    """平台名是第三方可控文本：以 = 开头时必须转义存为文本，不能成为公式。"""
+    payload = build_brand_dict()
+    payload["data"]["daily_trend"] = [
+        {
+            "date": date(2026, 1, 1),
+            "platform": "=1+1",
+            "volume": 100,
+            "engagement": 500,
+            "positive": 70,
+            "neutral": 20,
+            "negative": 10,
+        }
+    ]
+    wb = load_workbook(BytesIO(export_artifact(_Version("brand_report_v3", payload))))
+    cell = wb["日趋势"]["B4"]
+    assert cell.value == "'=1+1"  # 前缀 ' 转义
+    assert isinstance(cell.value, str) and cell.value.startswith("'")
 
 
 def test_draft_brand_report_raises_unsupported() -> None:

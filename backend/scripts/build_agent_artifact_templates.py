@@ -4,6 +4,15 @@
 承载标题/表头/列宽/合并/数字格式，不携带样例数据行。评分维度权重从
 ``app.selection.scoring_v2.WEIGHTS_V2``（评分唯一真源）派生。
 
+行号契约（与 ``exporters/brand.py`` / ``exporters/kol_selection.py`` 一一对应，
+改布局必须同步改渲染器并更新测试）：
+- brand 综合概览：标题@1 / 周期@2 / 来源@3 均为 A..F 合并锚点，核心指标
+  标题@4、表头@5、指标行@6-9；平台表现+对比分析由渲染器自 11 行起接管。
+- brand 日趋势 / 热门帖子TOP / 方法论：表头固定于第 3 行，数据自第 4 行起。
+- brand 其余 Sheet（情感分析/内容与达人/地域与话题/洞察与建议）：标题@1，
+  渲染器自第 3 行起接管（write_table 布局：标题/表头/数据）。
+- kol KOL匹配度筛选：标题@1、元数据@2、表头@4，数据自第 5 行起（18 列）。
+
 运行：cd backend && .venv/bin/python scripts/build_agent_artifact_templates.py
 """
 
