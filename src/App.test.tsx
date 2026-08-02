@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import App from './App';
 import type { ApiFavorite } from './api/contracts';
-import { getFavoriteKolSelectionRef, listFavorites } from './api/favorites';
+import { listFavorites } from './api/favorites';
 import { useAuth } from './auth/AuthProvider';
 import { useAgentWorkspace } from './hooks/useAgentWorkspace';
 
@@ -11,7 +11,6 @@ vi.mock('./api/favorites', () => ({
   createFavoriteByKey: vi.fn(),
   deleteFavorite: vi.fn(),
   deleteFavoriteByKey: vi.fn(),
-  getFavoriteKolSelectionRef: vi.fn(),
   listFavorites: vi.fn(),
 }));
 
@@ -27,14 +26,13 @@ vi.mock('./hooks/useAgentWorkspace', () => ({
 // 其余重组件替身化，避免牵扯会话流、报告等无关模块。
 vi.mock('./components/ChatArea', () => ({ default: () => <div>会话区</div> }));
 vi.mock('./components/MobileWorkspaceNav', () => ({ default: () => null }));
-vi.mock('./components/KolSelectionDetailDialog', () => ({ default: () => null }));
+vi.mock('./components/artifacts/KolDetailArtifactDialog', () => ({ default: () => null }));
 vi.mock('./components/RechargeModal', () => ({ default: () => null }));
 vi.mock('./components/AdminPanel', () => ({ default: () => null }));
 
 const mockUseAuth = vi.mocked(useAuth);
 const mockUseAgentWorkspace = vi.mocked(useAgentWorkspace);
 const mockListFavorites = vi.mocked(listFavorites);
-const mockGetFavoriteKolSelectionRef = vi.mocked(getFavoriteKolSelectionRef);
 
 const mockCreateKolDetail = vi.fn();
 const mockSelectSession = vi.fn();
@@ -129,7 +127,6 @@ describe('App 集成：一次性切换到统一 Agent 工作区', () => {
     } as never);
     mockUseAgentWorkspace.mockImplementation(() => workspaceValue() as never);
     mockListFavorites.mockResolvedValue([]);
-    mockGetFavoriteKolSelectionRef.mockRejectedValue(new Error('NOT_FOUND'));
   });
 
   it('会话列表来自 agent 工作区，右侧渲染 ArtifactWorkspace，四个快捷入口消失', async () => {
@@ -162,7 +159,6 @@ describe('App 集成：一次性切换到统一 Agent 工作区', () => {
       activeSessionId: undefined,
     };
     mockListFavorites.mockResolvedValue([favoriteFixture()]);
-    mockGetFavoriteKolSelectionRef.mockRejectedValue(new Error('NOT_FOUND'));
 
     render(<App />);
     fireEvent.click(screen.getByRole('tab', { name: /已收藏/ }));
@@ -175,10 +171,40 @@ describe('App 集成：一次性切换到统一 Agent 工作区', () => {
     // 无会话：刷新入口提示「新建会话后刷新」
     expect(screen.getByText('新建会话后刷新')).toBeVisible();
 
-    // 点击达人详情：解析不到圈选条目时不回退旧 Quick API，也不触发新 kol-details
+    // 点击达人详情：无活跃会话不触发新 kol-details（也不回退旧 Quick/旧 selection detail API）
     fireEvent.click(screen.getByRole('button', { name: /查看达人详情 达人小A/ }));
     await act(async () => {});
     expect(mockCreateKolDetail).not.toHaveBeenCalled();
+  });
+
+  it('收藏保留：有活跃会话时打开达人详情走新 kol-details API，而非旧 selection detail 路由', async () => {
+    workspaceRef.current = {
+      sessions: [AGENT_SESSION],
+      activeSession: AGENT_SESSION,
+      activeSessionId: 's1',
+    };
+    mockListFavorites.mockResolvedValue([favoriteFixture()]);
+    mockCreateKolDetail.mockResolvedValue({
+      run_id: null,
+      artifact_id: null,
+      cached: true,
+      detail: {
+        schema_version: 'kol_detail_v2',
+        module: 'kol',
+        scope: { platform: 'xiaohongshu', kol_uid: 'uid-1', selection_artifact_id: null, selection_version: null },
+        data: { cache: { hit: true, fetched_at: '', expires_at: '' } },
+        narrative: { profile_summary: '', content_strengths: [], commercial_notes: [], risk_notes: [] },
+      },
+    });
+
+    render(<App />);
+    fireEvent.click(screen.getByRole('tab', { name: /已收藏/ }));
+    expect(await screen.findByText('达人小A')).toBeVisible();
+
+    fireEvent.click(screen.getByRole('button', { name: /查看达人详情 达人小A/ }));
+    await waitFor(() => {
+      expect(mockCreateKolDetail).toHaveBeenCalledWith('s1', 'xiaohongshu', 'uid-1');
+    });
   });
 
   it('收藏保留：有活跃会话时经新 kol-details API 刷新', async () => {

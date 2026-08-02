@@ -2,20 +2,20 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 
 import type { ApiAgentMessage } from './api/agent';
 import type { ApiFavorite } from './api/contracts';
-import { getFavoriteKolSelectionRef, listFavorites } from './api/favorites';
-import type { KolSelectionItem } from './api/kolSelection';
+import { listFavorites } from './api/favorites';
 import { useAuth } from './auth/AuthProvider';
 import AdminPanel from './components/AdminPanel';
 import ArtifactWorkspace from './components/artifacts/ArtifactWorkspace';
 import ChatArea from './components/ChatArea';
+import KolDetailArtifactDialog from './components/artifacts/KolDetailArtifactDialog';
 import FavoritesPanel from './components/FavoritesPanel';
-import KolSelectionDetailDialog from './components/KolSelectionDetailDialog';
 import LoginPage from './components/LoginPage';
 import MobileWorkspaceNav, { type WorkspacePane } from './components/MobileWorkspaceNav';
 import RechargeModal from './components/RechargeModal';
 import SessionList from './components/SessionList';
 import { WorkspaceTabs, type WorkspaceTab } from './components/WorkspaceTabs';
 import { useAgentWorkspace, type AgentWorkspaceSession } from './hooks/useAgentWorkspace';
+import { useKolDetailFlow } from './hooks/useKolDetailFlow';
 import { isTerminalRunStatus, type RunRuntimeState } from './state/agentEvents';
 import type { Message, QuickKolSelection, Session } from './types';
 
@@ -83,13 +83,15 @@ export default function App() {
   const [favorites, setFavorites] = useState<readonly ApiFavorite[]>([]);
   const [favoritesLoading, setFavoritesLoading] = useState(false);
   const [favoritesRefreshKey, setFavoritesRefreshKey] = useState(0);
-  // 收藏点击：优先复用圈选详情弹窗（缓存快照优先，弹窗内可刷新）；
-  // 解析失败不回退旧 Quick API——快照仍在卡片展示，刷新依赖活跃会话。
+  // 收藏点击：经新 kol-details API 打开达人详情弹窗（review Fix 1——旧
+  // /sessions/{id}/kol-selection/detail* 路由已随 Task 24 删除）。需要活跃
+  // agent 会话；无会话时快照仍在卡片展示，刷新入口提示「新建会话后刷新」。
   const [favoriteDetail, setFavoriteDetail] = useState<{
     sessionId: string;
-    setId: string;
-    item: KolSelectionItem;
+    platform: string;
+    kolUid: string;
   } | null>(null);
+  const favoriteDetailFlow = useKolDetailFlow(workspace.createKolDetail);
 
   const chatSession = useMemo(
     () => (workspace.activeSession ? toChatSession(workspace.activeSession) : undefined),
@@ -106,10 +108,10 @@ export default function App() {
   );
 
   const handleFavoriteSelect = useCallback((kol: QuickKolSelection) => {
-    getFavoriteKolSelectionRef(kol.platform, kol.kw_uid)
-      .then(ref => setFavoriteDetail({ sessionId: ref.session_id, setId: ref.set_id, item: ref.item }))
-      .catch(() => undefined);
-  }, []);
+    if (!workspace.activeSessionId) return;
+    setFavoriteDetail({ sessionId: workspace.activeSessionId, platform: kol.platform, kolUid: kol.kw_uid });
+    void favoriteDetailFlow.run(workspace.activeSessionId, kol.platform, kol.kw_uid);
+  }, [workspace.activeSessionId, favoriteDetailFlow.run]);
 
   // 有活跃会话时走新 kol-details API（createKolDetail）刷新达人详情。
   const handleRefreshFavoriteDetail = useCallback((favorite: ApiFavorite) => {
@@ -257,10 +259,14 @@ export default function App() {
       )}
 
       {favoriteDetail && (
-        <KolSelectionDetailDialog
-          sessionId={favoriteDetail.sessionId}
-          setId={favoriteDetail.setId}
-          item={favoriteDetail.item}
+        <KolDetailArtifactDialog
+          payload={favoriteDetailFlow.payload}
+          error={favoriteDetailFlow.error}
+          onRetry={() => void favoriteDetailFlow.run(
+            favoriteDetail.sessionId,
+            favoriteDetail.platform,
+            favoriteDetail.kolUid,
+          )}
           onClose={() => setFavoriteDetail(null)}
         />
       )}
