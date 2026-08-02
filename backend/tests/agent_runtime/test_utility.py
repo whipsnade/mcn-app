@@ -6,7 +6,8 @@
 2. 上下文是受限短上下文（recent_messages 有界，不注入完整历史）；
 3. 强类型结果正确落库：标题 → agent_sessions.title、摘要 → memory_entry、
    建议 → 完成消息 metadata；
-4. Utility 失败是 best-effort：只记内部 Run 失败，绝不改变父 Run 结果。
+4. Utility 失败是 best-effort：只记内部 Run 失败，绝不改变父 Run 结果；
+5. 上下文序列化必须落在 max_context_chars 预算内（含超大 Artifact 目录）。
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from uuid import uuid4
 
 from sqlalchemy import select
 
+from app.agent_artifacts.models import AgentArtifact
 from app.agent_runtime.models import (
     AgentMessage,
     AgentRun,
@@ -258,3 +260,51 @@ async def test_utility_failure_does_not_change_parent_run_outcome(db_session, us
             select(MemoryEntry).where(MemoryEntry.source_run_id == run.id)
         )
     ) is None
+
+
+# ---------------------------------------------------------------------------
+# 5. 上下文硬预算：超大 Artifact 目录仍不超 max_context_chars（Fix 3）
+# ---------------------------------------------------------------------------
+
+
+async def test_context_respects_hard_char_budget_with_huge_artifact_directory(
+    db_session, user_factory
+) -> None:
+    session, user = await _make_session_with_messages(db_session, user_factory, message_count=30)
+    now = utc_now()
+    # 大量 Artifact 目录条目（紧凑投影仍会膨胀序列化体积）
+    for index in range(60):
+        artifact = AgentArtifact(
+            id=str(uuid4()),
+            session_id=session.id,
+            user_id=user.id,
+            module="brand",
+            artifact_type="brand_report_v3",
+            artifact_key=f"brand:{index}:{('x' * 40)}",
+            status="published",
+            latest_version=index + 1,
+            activity_sequence=index,
+            created_at=now,
+            updated_at=now,
+        )
+        db_session.add(artifact)
+    await db_session.flush()
+    run = await _parent_run(db_session, session, user, with_assistant=False)
+    gateway = FakeUtilityGateway([{"task": "run_summary", "summary": "摘要"}])
+    runner = UtilityRunner(
+        db=db_session,
+        gateway=gateway,
+        worker_id="utility-worker",
+        recent_message_window=6,
+        max_context_chars=500,
+        artifact_directory_cap=10,
+    )
+
+    await runner.generate_run_summary(run=run)
+
+    context = await _context_from_call(gateway.calls[0])
+    serialized = json.dumps(context, ensure_ascii=False, default=str)
+    assert len(serialized) <= 500  # 硬预算：即使目录很大也不超
+    assert context.get("truncated") is True
+    # 目录被压到上限内
+    assert len(context.get("artifact_directory", [])) <= 10

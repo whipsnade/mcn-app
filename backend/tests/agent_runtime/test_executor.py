@@ -177,14 +177,14 @@ def _build_executor(
     reviewer = ReviewerDriver(db_session, _FakeReviewerGateway(), worker_id=worker)
     registry = registry or ToolRegistry()
 
-    def engine_factory(db):
+    def engine_factory(db, worker_id):
         return AgentEngine(
             db,
             gateway=gateway,
             registry=registry,
             events=events,
             reviewer=reviewer,
-            worker_id=worker,
+            worker_id=worker_id,
             lease_seconds=lease_seconds,
         )
 

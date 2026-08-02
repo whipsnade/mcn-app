@@ -387,9 +387,8 @@ class AgentMcpTool:
             return await self._replay(row)
         user_id = await self._user_id(row)
         if row.upstream_request_id is None:
-            await self._append_reconciliation(
-                row, source="upstream_probe", decision="keep_unknown",
-                note="no upstream_request_id to reconcile",
+            await self._append_keep_unknown(
+                row, note="no upstream_request_id to reconcile"
             )
             return ToolResult(
                 status="unknown", safe_summary="cannot reconcile without upstream_request_id",
@@ -397,9 +396,8 @@ class AgentMcpTool:
             )
         recon = getattr(self._transport, "reconcile_tool_call", None)
         if recon is None:
-            await self._append_reconciliation(
-                row, source="upstream_probe", decision="keep_unknown",
-                note="transport does not support reconciliation",
+            await self._append_keep_unknown(
+                row, note="transport does not support reconciliation"
             )
             return ToolResult(
                 status="unknown", safe_summary="transport cannot reconcile",
@@ -407,9 +405,8 @@ class AgentMcpTool:
             )
         result = await recon(row.upstream_request_id)
         if result is None:
-            await self._append_reconciliation(
-                row, source="upstream_probe", decision="keep_unknown",
-                note="outcome not confirmable",
+            await self._append_keep_unknown(
+                row, note="outcome not confirmable"
             )
             return ToolResult(
                 status="unknown", safe_summary="outcome not confirmable",
@@ -561,6 +558,30 @@ class AgentMcpTool:
             )
         )
         await self._db.flush()
+
+    async def _append_keep_unknown(self, call: AgentToolCall, *, note: str) -> None:
+        """追加 keep_unknown 审计；若该调用已记录过 keep_unknown 则跳过。
+
+        无法核对的 unknown 调用每轮恢复扫描都会被再次探测，但不得每轮都追加一条
+        审计（约 2880 行/天/调用）——状态未变化时不重复记账（§11.1）。
+        """
+        last = await self._last_reconciliation_decision(call.id)
+        if last == "keep_unknown":
+            return
+        await self._append_reconciliation(
+            call, source="upstream_probe", decision="keep_unknown", note=note
+        )
+
+    async def _last_reconciliation_decision(self, tool_call_id: str) -> str | None:
+        return await self._db.scalar(
+            select(AgentToolCallReconciliation.decision)
+            .where(AgentToolCallReconciliation.tool_call_id == tool_call_id)
+            .order_by(
+                AgentToolCallReconciliation.created_at.desc(),
+                AgentToolCallReconciliation.id.desc(),
+            )
+            .limit(1)
+        )
 
 
 __all__ = [

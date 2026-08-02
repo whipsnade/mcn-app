@@ -35,10 +35,12 @@ logger = logging.getLogger(__name__)
 
 UTILITY_PROFILE_NAME = "utility_v1"
 
-# Utility 只读短上下文：最近消息窗口上限与单条消息内容上限。
+# Utility 只读短上下文：最近消息窗口上限、单条消息内容上限、目录条目上限。
 DEFAULT_RECENT_MESSAGE_WINDOW = 6
 DEFAULT_MAX_CONTEXT_CHARS = 8_000
+DEFAULT_ARTIFACT_DIRECTORY_CAP = 20
 _MESSAGE_CONTENT_CAP = 2_000
+_TRUNCATED_MESSAGE_CONTENT_CAP = 128
 
 
 class UtilityDecision(BaseModel):
@@ -82,6 +84,7 @@ class UtilityRunner:
         worker_id: str = "utility-worker",
         recent_message_window: int = DEFAULT_RECENT_MESSAGE_WINDOW,
         max_context_chars: int = DEFAULT_MAX_CONTEXT_CHARS,
+        artifact_directory_cap: int = DEFAULT_ARTIFACT_DIRECTORY_CAP,
         model: str = "utility-model",
     ) -> None:
         self._db = db
@@ -89,6 +92,7 @@ class UtilityRunner:
         self._worker_id = worker_id
         self._recent_message_window = recent_message_window
         self._max_context_chars = max_context_chars
+        self._artifact_directory_cap = artifact_directory_cap
         self._model = model
         self._repo = AgentRunRepository(db)
         self._profile = get_profile(UTILITY_PROFILE_NAME)
@@ -259,13 +263,20 @@ class UtilityRunner:
         user_id: str,
         parent_run: AgentRun | None,
     ) -> dict[str, Any]:
-        """有界短上下文：最近有限条消息 + Artifact 紧凑目录，绝不注入完整历史。"""
+        """有界短上下文：最近有限条消息 + Artifact 紧凑目录（最多最近 N 条）。
+
+        串行化后必须落在 ``max_context_chars`` 预算内：超预算时先截断消息正文
+        并压缩目录，仍超则逐字段丢弃（目录 → parent_run → 消息），最终只保留
+        最小骨架也保证不超预算。
+        """
         recent = await self._recent_messages(session_id)
+        directory = await self._artifact_directory(session_id)
+        directory = directory[-self._artifact_directory_cap :]
         context: dict[str, Any] = {
             "task": task,
             "session_id": session_id,
             "recent_messages": recent,
-            "artifact_directory": await self._artifact_directory(session_id),
+            "artifact_directory": directory,
         }
         if parent_run is not None:
             context["parent_run"] = {
@@ -275,19 +286,24 @@ class UtilityRunner:
                 "decision_count": parent_run.decision_count,
             }
         text = json.dumps(context, ensure_ascii=False, default=str)
-        if len(text) > self._max_context_chars:
-            # 超预算：丢弃消息正文，只保留目录骨架 + 截断摘要，保证硬上限。
-            context = {
-                "task": task,
-                "session_id": session_id,
-                "truncated": True,
-                "recent_messages": [
-                    {"sequence": m["sequence"], "role": m["role"], "content": m["content"][:128]}
-                    for m in recent
-                ],
-                "artifact_directory": context["artifact_directory"],
-            }
+        if len(text) <= self._max_context_chars:
             return context
+        # 超预算：截断消息正文，优先丢弃最重的字段，重序列化后必须落在预算内。
+        context["truncated"] = True
+        context["recent_messages"] = [
+            {
+                "sequence": m["sequence"],
+                "role": m["role"],
+                "content": m["content"][:_TRUNCATED_MESSAGE_CONTENT_CAP],
+            }
+            for m in recent
+        ]
+        for drop_key in ("artifact_directory", "parent_run", "recent_messages"):
+            context.pop(drop_key, None)
+            text = json.dumps(context, ensure_ascii=False, default=str)
+            if len(text) <= self._max_context_chars:
+                return context
+        # 理论不可达：最小骨架（task + session_id + truncated）必然在预算内。
         return context
 
     async def _recent_messages(self, session_id: str) -> list[dict[str, Any]]:
@@ -351,6 +367,7 @@ class UtilityRunner:
 
 
 __all__ = [
+    "DEFAULT_ARTIFACT_DIRECTORY_CAP",
     "DEFAULT_MAX_CONTEXT_CHARS",
     "DEFAULT_RECENT_MESSAGE_WINDOW",
     "UTILITY_DECISION_ADAPTER",

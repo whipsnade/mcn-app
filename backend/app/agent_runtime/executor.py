@@ -40,15 +40,16 @@ class AgentRunExecutor:
 
     ``session_factory`` 必须是一个可异步上下文管理的会话工厂
     （``async with session_factory() as db`` 产生 :class:`AsyncSession`）；
-    ``engine_factory`` 接收会话并返回绑定该会话的 :class:`AgentEngine`。
-    测试可注入 ``lambda: <共享 AsyncSession 的上下文管理器>``。
+    ``engine_factory`` 接收 ``(会话, worker_id)`` 并返回绑定该会话与租约
+    worker 的 :class:`AgentEngine`。测试可注入
+    ``lambda: <共享 AsyncSession 的上下文管理器>``。
     """
 
     def __init__(
         self,
         *,
         session_factory: Callable[[], AbstractAsyncContextManager[AsyncSession]],
-        engine_factory: Callable[[AsyncSession], AgentEngine],
+        engine_factory: Callable[[AsyncSession, str], AgentEngine],
         worker_id: str,
         lease_seconds: int = 300,
         claim_interval_seconds: float = 1.0,
@@ -115,23 +116,31 @@ class AgentRunExecutor:
             run_id = await self._find_claimable_id(db)
             if run_id is None:
                 return None
-            await self._process_run(db, run_id)
+            await self._process_run(db, run_id, self._worker_id)
         return run_id
 
-    async def process_run(self, run_id: str) -> RunStatus | None:
-        """对指定 Run 执行一次完整领取 + 引擎执行（恢复循环入口）。"""
-        async with self._session_factory() as db:
-            return await self._process_run(db, run_id)
+    async def process_run(
+        self, run_id: str, *, worker_id: str | None = None
+    ) -> RunStatus | None:
+        """对指定 Run 执行一次完整领取 + 引擎执行（恢复循环入口）。
 
-    async def _process_run(self, db: AsyncSession, run_id: str) -> RunStatus | None:
+        ``worker_id`` 默认取 executor 自己的；恢复循环可传入独立 worker id，
+        避免与原 worker 共用租约导致同一 Run 被并发执行（Fix 4）。
+        """
+        async with self._session_factory() as db:
+            return await self._process_run(db, run_id, worker_id or self._worker_id)
+
+    async def _process_run(
+        self, db: AsyncSession, run_id: str, worker_id: str
+    ) -> RunStatus | None:
         repo = AgentRunRepository(db)
-        prepared = await self._claim_and_prepare(db, repo, run_id)
+        prepared = await self._claim_and_prepare(db, repo, run_id, worker_id)
         if prepared is None:
             return None
         run, attempt = prepared
         try:
             messages = await self._build_messages(db, run)
-            engine = self._engine_factory(db)
+            engine = self._engine_factory(db, worker_id)
             outcome = await engine.run(
                 run=run,
                 attempt_id=attempt.id,
@@ -145,7 +154,7 @@ class AgentRunExecutor:
             raise
         except Exception:
             logger.exception("agent run %s failed in executor", run_id)
-            await self._finalize_failed(db, repo, run_id)
+            await self._finalize_failed(db, repo, run_id, worker_id)
             await db.commit()
             return RunStatus.FAILED
 
@@ -178,7 +187,7 @@ class AgentRunExecutor:
         )
 
     async def _claim_and_prepare(
-        self, db: AsyncSession, repo: AgentRunRepository, run_id: str
+        self, db: AsyncSession, repo: AgentRunRepository, run_id: str, worker_id: str
     ) -> tuple[AgentRun, AgentRunAttempt] | None:
         """领取 Run 并准备 Attempt；抢不到（他人活跃租约 / 已取消）返回 None。"""
         run = await db.get(AgentRun, run_id)
@@ -189,17 +198,17 @@ class AgentRunExecutor:
         status = RunStatus(run.status)
         if status == RunStatus.QUEUED:
             attempt = await repo.begin_attempt(run_id)
-            if not await repo.claim_lease(run_id, self._worker_id, self._lease_seconds):
+            if not await repo.claim_lease(run_id, worker_id, self._lease_seconds):
                 return None
             return run, attempt
         if status == RunStatus.RUNNING:
             # 过期租约接管：pause 收口旧 Attempt → 新建 Attempt → 重新领取。
-            if not await repo.claim_lease(run_id, self._worker_id, self._lease_seconds):
+            if not await repo.claim_lease(run_id, worker_id, self._lease_seconds):
                 return None
-            if not await repo.pause(run_id, self._worker_id):
+            if not await repo.pause(run_id, worker_id):
                 return None
             attempt = await repo.begin_attempt(run_id, resumed=True)
-            if not await repo.claim_lease(run_id, self._worker_id, self._lease_seconds):
+            if not await repo.claim_lease(run_id, worker_id, self._lease_seconds):
                 return None
             return run, attempt
         return None
@@ -227,10 +236,12 @@ class AgentRunExecutor:
             return [ChatMessage(role="user", content=latest.content)]
         return [ChatMessage(role="user", content="")]
 
-    async def _finalize_failed(self, db: AsyncSession, repo: AgentRunRepository, run_id: str) -> None:
+    async def _finalize_failed(
+        self, db: AsyncSession, repo: AgentRunRepository, run_id: str, worker_id: str
+    ) -> None:
         """执行器错误收口：持有租约经 transition，否则回退系统级 force_fail。"""
         try:
-            await repo.transition(run_id, RunStatus.FAILED, worker_id=self._worker_id)
+            await repo.transition(run_id, RunStatus.FAILED, worker_id=worker_id)
         except InvalidRunTransition:
             try:
                 await repo.force_fail(run_id, error_code="executor_error")

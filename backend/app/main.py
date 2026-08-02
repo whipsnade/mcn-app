@@ -85,11 +85,18 @@ def _make_recovery_tool(db, call) -> AgentMcpTool | None:
 
 
 def create_agent_runtime() -> tuple[AgentRunExecutor, RecoveryLoop]:
-    """构建进程级 Agent 执行器 + 恢复循环（共享一个事件 broker）。"""
-    worker_id = f"agent-{os.getpid()}"
+    """构建进程级 Agent 执行器 + 恢复循环（共享一个事件 broker）。
+
+    executor 与 recovery 使用**不同**的 worker id（``agent-{pid}`` /
+    ``recovery-{pid}``）：若原 worker 的一次 decide 超过租约时长导致租约过期，
+    恢复循环接管后原 worker 的 ``renew_lease`` 会因租约归属变化而失败并在下一个
+    安全点停止，避免同一 Run 被两个 worker 并发执行（Fix 4）。
+    """
+    executor_worker_id = f"agent-{os.getpid()}"
+    recovery_worker_id = f"recovery-{os.getpid()}"
     broker = AgentEventBroker()
 
-    def engine_factory(db) -> AgentEngine:
+    def engine_factory(db, worker_id) -> AgentEngine:
         gateway = AgentModelGateway(get_model_adapter(), db=db)
         registry = ToolRegistry(
             catalog_source=lambda: _load_catalog(db),
@@ -107,14 +114,14 @@ def create_agent_runtime() -> tuple[AgentRunExecutor, RecoveryLoop]:
     executor = AgentRunExecutor(
         session_factory=SessionFactory,
         engine_factory=engine_factory,
-        worker_id=worker_id,
+        worker_id=executor_worker_id,
         lease_seconds=AGENT_LEASE_SECONDS,
     )
     recovery = RecoveryLoop(
         executor=executor,
         session_factory=SessionFactory,
         tool_factory=_make_recovery_tool,
-        worker_id=worker_id,
+        worker_id=recovery_worker_id,
         lease_seconds=AGENT_LEASE_SECONDS,
         interval_seconds=RECOVERY_INTERVAL_SECONDS,
     )

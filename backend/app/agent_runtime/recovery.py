@@ -27,7 +27,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_runtime.executor import AgentRunExecutor
-from app.agent_runtime.models import AgentRun, AgentToolCall
+from app.agent_runtime.models import (
+    AgentRun,
+    AgentToolCall,
+    AgentToolCallReconciliation,
+)
 from app.agent_runtime.repository import utc_now
 from app.agent_runtime.state import RunStatus
 from app.agent_runtime.tools.mcp import AgentMcpTool
@@ -128,7 +132,9 @@ class RecoveryLoop:
             ).all()
         for run_id in expired:
             try:
-                await self._executor.process_run(run_id)
+                # 使用恢复循环自己的 worker id：与原 worker 租约隔离，避免同一
+                # Run 被两个 worker 并发执行（Fix 4）。
+                await self._executor.process_run(run_id, worker_id=self._worker_id)
                 reclaimed.append(run_id)
             except asyncio.CancelledError:
                 raise
@@ -169,22 +175,43 @@ class RecoveryLoop:
                 if tool is None:
                     continue
                 try:
+                    # 记录核对前审计状态；只有核对改变了状态才发运维告警，
+                    # 避免每轮扫描对同一 unconfirmable 调用重复告警。
+                    before = await self._last_reconciliation_decision(db, call.id)
                     result = await tool.reconcile(call.logical_call_id)
+                    after = await self._last_reconciliation_decision(db, call.id)
                 except asyncio.CancelledError:
                     raise
                 except Exception:
                     logger.exception("reconcile failed for call %s", call.logical_call_id)
                     continue
                 reconciled.append(call.logical_call_id)
-                if result.status == "unknown":
-                    # 无法核对：保持预留并产生运维告警（不自动释放）。
+                if result.status == "unknown" and after != before:
+                    # 无法核对且状态首次确认：保持预留并产生运维告警（不自动释放）。
                     logger.warning(
                         "agent_tool_call unconfirmable logical_call_id=%s note=%s",
                         call.logical_call_id,
                         result.safe_summary,
                     )
                     warnings.append(call.logical_call_id)
+            # 核对结果（settle/release/evidence/审计）必须提交：否则整轮核对在
+            # 生产环境静默回滚（会话在 SELECT 后 autobegin，close 时回滚）。
+            await db.commit()
         return tuple(reconciled), tuple(warnings)
+
+    @staticmethod
+    async def _last_reconciliation_decision(
+        db: AsyncSession, tool_call_id: str
+    ) -> str | None:
+        return await db.scalar(
+            select(AgentToolCallReconciliation.decision)
+            .where(AgentToolCallReconciliation.tool_call_id == tool_call_id)
+            .order_by(
+                AgentToolCallReconciliation.created_at.desc(),
+                AgentToolCallReconciliation.id.desc(),
+            )
+            .limit(1)
+        )
 
 
 __all__ = ["RecoveryLoop"]
