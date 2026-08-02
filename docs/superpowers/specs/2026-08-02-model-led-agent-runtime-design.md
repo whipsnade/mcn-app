@@ -105,7 +105,7 @@ flowchart LR
 
 | Profile | 入口 | 工具权限 | 输出 |
 |---|---|---|---|
-| `session_analyst_v1` | 所有普通会话消息 | 已审核 MCP、历史、计算、Artifact Draft | `ask_user`、`respond`、工具调用、正式或通用 Artifact |
+| `session_analyst_v1` | 所有普通会话消息 | 已审核 MCP、历史、计算、Artifact Draft | `ask_user`、`complete`、工具调用、正式或通用 Artifact |
 | `artifact_reviewer_v1` | 正式 Artifact 提交复核 | 只读 Artifact 和 Evidence，不允许 MCP | `approve`、`revise`、`reject` |
 | `kol_detail_v1` | 点击圈选达人 | KOL 详情、原帖、只读缓存、Artifact Draft | `kol_detail_v2` |
 | `utility_v1` | 标题、Run 摘要、建议等后台轻量任务 | 不允许 MCP，只读短上下文 | 对应强类型 Utility 输出 |
@@ -123,10 +123,6 @@ ask_user
   question
   options[]             # 可空；有选项时 2-4 项
 
-respond
-  text
-  suggestions[]         # 可选
-
 call_tool
   internal_tool_name
   arguments
@@ -134,16 +130,17 @@ call_tool
 
 submit_review
   artifact_draft_id
+  completion_text       # Reviewer 通过后写入 assistant 消息
   summary
 
-finish
+complete
   text
   suggestions[]         # 可选
 ```
 
 Artifact 创建、更新、历史读取和计算统一作为受控内部工具通过 `call_tool` 执行，避免在顶层动作中持续增加业务特例。
 
-模型输出 `ask_user` 时，本 Run 以 `clarification_requested` 结果完成；用户回答创建新 Run，并通过 `parent_run_id` 和待回答 Memory 关联。模型输出普通 `respond/finish` 且没有正式 Artifact 时不触发 Reviewer。
+模型输出 `ask_user` 时，本 Run 以 `clarification_requested` 结果完成；用户回答创建新 Run，并通过 `parent_run_id` 和待回答 Memory 关联。模型输出 `complete` 且没有正式 Artifact 时不触发 Reviewer。正式 Artifact 的用户回复由 `submit_review.completion_text` 暂存，只有 Reviewer 通过并发布后才写入 assistant 消息。
 
 ## 七、Run 状态机
 
@@ -154,10 +151,10 @@ stateDiagram-v2
     running --> running: call_tool / draft update
     running --> clarification_requested: ask_user
     running --> reviewing: submit_review
-    reviewing --> running: revise（最多 2 次）
+    reviewing --> running: revise（最多打回 2 次）
     reviewing --> completed: approve + publish
-    reviewing --> failed: reject / 无法形成有效产物
-    running --> completed: respond / finish（无正式产物）
+    reviewing --> failed: reject / 第 3 次仍未 approve
+    running --> completed: complete（无正式产物）
     running --> paused: 30 分钟或 50 决策
     paused --> running: 用户继续
     running --> cancelled: 用户取消
@@ -165,6 +162,8 @@ stateDiagram-v2
 ```
 
 每条新用户消息创建独立 Run。只有用户点击“继续”恢复 `paused` Run 时才复用原 Run；普通多轮消息绝不复用已完成 Run 的执行卡。
+
+30 分钟/50 决策保护按 **Run Attempt** 计算，不按整个 Run 累计。首次启动和每次用户主动恢复都会创建新的 `agent_run_attempts` 行，并将该 Attempt 的 `started_at` 与 `decision_count` 从零开始；`agent_runs.decision_count` 保留跨 Attempt 累计值用于审计。一个 Attempt 达到任一阈值时结束为 `paused`，不会在恢复后立即再次触发。恢复次数不设额外上限，但每次恢复必须由用户显式触发。
 
 每次模型决策前持久化上下文游标；每次工具调用在外发前持久化 Step 和 `logical_call_id`。恢复时从最后一个完整 Step 继续，禁止凭内存状态重建调用。
 
@@ -189,14 +188,22 @@ stateDiagram-v2
 
 - `id`, `session_id`, `user_id`, `input_message_id`, `parent_run_id nullable`；
 - `profile_name`, `profile_version`, `model`, `prompt_snapshot_json`；
-- `status`, `outcome`, `decision_count`, `review_count`；
+- `status`, `outcome`, `decision_count`, `review_count`, `revision_count`；
 - `started_at`, `paused_at`, `completed_at`, `error_code`；
 - 租约字段：`lease_owner`, `lease_expires_at`, `heartbeat_at`。
+
+#### `agent_run_attempts`
+
+- `id`, `run_id`, `attempt`, `started_at`, `ended_at`；
+- `decision_count`, `outcome`: `running/paused/completed/failed/cancelled`；
+- 唯一 `(run_id, attempt)`；首次执行为 1，每次用户恢复递增；
+- 30 分钟/50 决策阈值只读取当前 Attempt。
 
 #### `agent_steps`
 
 - `id`, `run_id`, `sequence`, `step_type`；
 - `input_json`, `output_json`, `status`, `duration_ms`；
+- `thinking_text nullable`, `visibility`: `user/internal`；
 - `model_request_id`, `token_usage_json`, `created_at`；
 - 唯一 `(run_id, sequence)`。
 
@@ -219,17 +226,19 @@ stateDiagram-v2
 
 #### `artifact_drafts`
 
-- `id`, `session_id`, `run_id`, `module`, `artifact_type`；
-- `parent_artifact_id nullable`, `payload_json`, `evidence_refs_json`；
+- `id`, `artifact_id`, `session_id`, `run_id`；
+- `payload_json`, `evidence_refs_json`；
 - `schema_version`, `revision`, `status`, `updated_at`；
-- 唯一 `(run_id, id)`；同一 Run 内按 revision 乐观锁更新。
+- `artifact_id` 唯一；同一 Run 内按 revision 乐观锁更新。
 
 #### `agent_artifacts`
 
 - `id`, `session_id`, `user_id`, `module`, `artifact_type`；
-- `parent_artifact_id nullable`, `artifact_key`, `latest_version`；
+- `parent_artifact_id nullable`, `parent_artifact_version_id nullable`；
+- `artifact_key`, `status`: `draft/reviewing/published/failed`, `latest_version`；
 - `created_at`, `updated_at`；
-- 作为稳定身份，不直接保存可变报告内容。
+- 创建 Draft 时先创建稳定 Artifact 身份，再创建引用它的 `artifact_drafts`；不直接在稳定身份行保存报告内容；
+- 子 Artifact 同时记录父稳定身份与本次钻取依据的父版本，避免父报告后续升级改变历史语义。
 
 #### `agent_artifact_versions`
 
@@ -237,6 +246,13 @@ stateDiagram-v2
 - `schema_version`, `payload_json`, `evidence_refs_json`；
 - `review_json`, `data_status`, `created_at`；
 - 唯一 `(artifact_id, version)`；发布后不可更新。
+
+发布事务必须原子执行：锁定 Artifact 与 Draft revision，插入不可变 Version，更新 `agent_artifacts.latest_version/status`，删除或归档 Draft，并追加 `artifact.published` 事件。Draft 事件始终使用稳定 `artifact_id`，因此前端从生成中到正式版本无需更换身份。
+
+#### `artifact_read_states`
+
+- `user_id`, `session_id`, `module`, `last_read_artifact_version_id`, `updated_at`；
+- 唯一 `(user_id, session_id, module)`；仅用于三个固定 BI Tab 的未读圆点。
 
 #### `agent_events`
 
@@ -248,6 +264,13 @@ stateDiagram-v2
 - `id`, `session_id`, `source_run_id nullable`, `source_artifact_id nullable`；
 - `memory_type`: `run_summary/artifact_index/pending_question`；
 - `content_json`, `created_at`, `superseded_at`。
+
+#### `kol_detail_cache`
+
+- `user_id`, `platform`, `kol_uid`, `schema_version`；
+- `payload_json`, `evidence_refs_json`, `fetched_at`, `expires_at`；
+- 唯一 `(user_id, platform, kol_uid)`，防止不同用户共享已付费证据；
+- 默认 TTL 24 小时，由 `KOL_DETAIL_CACHE_TTL_HOURS` 配置。缓存过期后 KOL Detail Agent 可自主决定是否补查。
 
 ### 8.2 保留表
 
@@ -285,10 +308,11 @@ Session Agent 每轮默认获得：
 - 审核通过的 DataTap MCP 工具；
 - 历史读取工具；
 - 确定性计算、聚合、排序和 KOL 评分工具；
-- Artifact Draft 工具；
-- 必要的文件/Excel 导出能力。
+- Artifact Draft 工具。
 
 每个工具声明内部名、说明、输入/输出 JSON Schema、计费点数、是否有外部副作用、最大结果大小和授权规则。模型只能看到当前 Profile 与用户渠道权限共同允许的工具。
+
+Excel 渲染不是 Agent 工具。用户点击导出时，后端导出器只读取已发布的强类型 Artifact Version 并生成文件，不调用模型或 MCP，属于表现层能力。
 
 ### 10.2 大结果处理
 
@@ -313,7 +337,59 @@ MCP 原始结果完整落 `evidence_items.raw_payload_json`。返回模型的工
 - `rank_kols`；
 - `validate_artifact_payload`。
 
-这些工具只计算和校验，不决定业务步骤。关键数值进入 Artifact 时必须带 `evidence_refs` 或计算来源链。
+这些工具只计算和校验，不决定业务步骤。关键数值进入 Artifact 时必须带强类型字段级来源链。
+
+### 10.4 字段级 Evidence Lineage
+
+`evidence_refs_json` 不是自由 JSON，而是以下结构的数组：
+
+```json
+[
+  {
+    "artifact_path": "/data/overview/total_volume",
+    "sources": [
+      {
+        "evidence_id": "...",
+        "source_path": "/0/声量"
+      }
+    ],
+    "derivation": null
+  },
+  {
+    "artifact_path": "/data/sentiment/positive_share",
+    "sources": [
+      {"evidence_id": "...", "source_path": "/0/正面声量数"},
+      {"evidence_id": "...", "source_path": "/0/声量"}
+    ],
+    "derivation": {
+      "tool_call_id": "...",
+      "method": "divide",
+      "input_paths": ["/0/正面声量数", "/0/声量"]
+    }
+  }
+]
+```
+
+约束：
+
+1. `artifact_path` 和 `source_path` 使用 RFC 6901 JSON Pointer；
+2. `evidence_id` 必须属于当前用户和 Session，且 payload 中存在 `source_path`；
+3. `derivation.tool_call_id` 必须指向已 settled 的内部确定性计算工具调用；
+4. 每个强类型 Artifact Schema 明确标记哪些字段需要 lineage；
+5. `insight_board_v1` 中 metric 值、series 数值和 table 数字单元格全部要求 lineage，布局序号、日期组成和版本号除外；
+6. 运行时在提交 Reviewer 前进行完整性校验，缺少或失效引用时拒绝进入 review；Reviewer 负责语义一致性复核，不代替结构校验。
+
+Evidence 和 Artifact payload 都计算内容哈希；发布版本保存 lineage 快照，后续 Evidence 不可修改，因此历史数字来源保持稳定。
+
+### 10.5 Thinking 流协议
+
+Thinking 不是动作 JSON 的字段，也不是 `rationale` 的流式版本。它只来自模型供应商明确暴露的 `reasoning_content` 或响应中的 `<think>...</think>` 部分；适配器在解析最终 JSON 动作前将其分离。
+
+- 主 Agent：通过 `ThinkingSink` 产生 `thinking.started/delta/completed/failed`，实时发送并写入 `agent_events`；最终脱敏文本写入对应 `agent_steps.thinking_text`，单次上限 64 KiB；
+- Reviewer 与 Utility：thinking 仅写内部 Step 审计，不产生用户可见事件；
+- 不暴露供应商未返回的隐藏推理，也不通过额外 prompt 要求模型生成伪思考；
+- Thinking 使用与 Prompt 日志相同的密钥/token 脱敏，并限制单事件大小；
+- 严格 JSON 动作只解析 think 结束后的 JSON 数据，thinking 内容不参与 Pydantic 动作校验。
 
 ## 十一、MCP 故障与积分
 
@@ -370,11 +446,11 @@ service + internal_tool_name + SHA256(normalized_arguments)
 
 Reviewer 输出：
 
-- `approve`：冻结为不可变 Artifact Version；
+- `approve`：冻结为不可变 Artifact Version；允许 `data_status=restricted`，但必须确认限制披露充分；
 - `revise`：返回结构化问题清单，主 Agent 自主补查或修订；
-- `reject`：Artifact 无法形成可信结果。
+- `reject`：Artifact 无法形成可信结果，禁止发布。
 
-Reviewer 检查回答完整性、数字可追溯、引用有效、结论不冲突和数据限制披露。最多打回两次。第二次仍未通过时，主 Agent只能发布明确标记 `restricted` 的受限产物或以失败结束，不得绕过 Reviewer 发布完整状态。
+Reviewer 检查回答完整性、数字可追溯、引用有效、结论不冲突和数据限制披露。`review_count` 统计 Reviewer 调用次数，`revision_count` 统计 `revise` 次数。最多允许两次 `revise`，因此最多进行三次 Reviewer 调用：前两次可返回 `approve/revise/reject`；第三次只能返回 `approve/reject`，若模型仍输出 `revise`，运行时按 `reject` 处理。只有 `approve` 可以发布，包括 Reviewer 明确批准的 `restricted` 产物；`reject` 必须以 Artifact failed、Run failed 收口，主 Agent无权绕过。
 
 ## 十三、前端设计
 
@@ -551,7 +627,7 @@ Artifact 发布或 Draft 更新只显示对应 Tab 更新圆点，不自动切�
 2. 正式 Artifact 存在无法追溯到 Evidence 的数值；
 3. 跨用户 Session、Evidence、Artifact 或达人详情越权；
 4. 品牌、活动、KOL 任一强类型 Artifact 无法被 BI 或 Excel 消费；
-5. Run 恢复导致步骤重放或执行卡复用；
+5. Run 恢复导致步骤重放、当前 Attempt 保护计数未重置或执行卡复用；
 6. Reviewer 可以被主 Agent 绕过；
 7. 四个旧快捷入口、API 或缓存仍可从新系统触达；
 8. 前后端无法在同一发布批次完成契约切换。
@@ -560,12 +636,11 @@ Artifact 发布或 Draft 更新只显示对应 Tab 更新圆点，不自动切�
 
 尽管最终一次性切换，开发应按以下依赖顺序拆分，前一部分达到测试门槛后再进入下一部分：
 
-1. **数据模型与可信工具内核**：新表、状态机、计费、幂等、故障分类、Evidence；
-2. **统一模型循环与 Profile**：Session Agent、Reviewer、Utility、KOL Detail；
-3. **Artifact 与强类型产物**：Draft、版本、通用 Block、品牌/活动/KOL/KOL 详情；
-4. **新 API 与 SSE**：Session、Run、Artifact、取消/恢复和事件续传；
-5. **前端全量迁移**：新会话状态、执行卡、固定 BI、详情、删除 Quick；
+1. **数据模型与可信工具内核**：Session/Run/Attempt/Step/ToolCall/Event、计费、幂等、故障分类和 Evidence；
+2. **统一模型循环基础**：动作协议、ThinkingSink、Session Agent 基础循环、Utility Profile、暂停/恢复；
+3. **Artifact 与 Reviewer 内核**：稳定身份、Draft、字段级 lineage、不可变版本、通用 Block、Reviewer 循环；
+4. **业务强类型产物与专业 Profile**：品牌、活动、KOL 名单/分析、KOL Detail Profile、用户级 24 小时详情缓存；
+5. **新 API、SSE 与前端全量迁移**：Session、Run、Artifact、固定 BI、详情、删除 Quick；
 6. **真实服务 UAT 与切换**：真实模型/MCP、故障注入、备份、冒烟和回滚演练。
 
 这些部分共同组成一个发布版本，不设置新旧运行时功能开关，也不允许部分用户继续使用旧模型链路。
-
