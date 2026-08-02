@@ -36,10 +36,25 @@ from app.agent_artifacts.keys import build_artifact_key
 from app.agent_artifacts.models import (
     AgentArtifact,
     AgentArtifactReadState,
+    AgentArtifactVersion,
     ArtifactDraft,
     ArtifactDraftRevision,
     ArtifactEvent,
+    ArtifactReviewAttempt,
+    ArtifactReviewBatch,
+    ArtifactReviewItem,
 )
+from app.agent_runtime.models import AgentMessage
+from app.agent_runtime.repository import AgentRunRepository
+from app.agent_runtime.state import RunStatus
+
+
+class PublishBlocked(Exception):
+    """批量发布被阻止（设计 §12.3 / Task 13）。
+
+    任一 Item 未在当前 Revision 上 approve、或 Batch 已终态/无 Item 时抛出；
+    调用方不得忽略——整批回滚、不产生任何部分 Version。
+    """
 
 
 class ArtifactBusy(Exception):
@@ -100,6 +115,7 @@ class ArtifactService:
         artifact_id: str,
         event_type: str,
         draft_revision: int | None = None,
+        artifact_version_id: str | None = None,
     ) -> ArtifactEvent:
         event = ArtifactEvent(
             session_id=session_id,
@@ -109,6 +125,7 @@ class ArtifactService:
             artifact_id=artifact_id,
             event_type=event_type,
             draft_revision=draft_revision,
+            artifact_version_id=artifact_version_id,
             created_at=_utcnow(),
         )
         self.db.add(event)
@@ -338,6 +355,172 @@ class ArtifactService:
         draft.updated_at = _utcnow()
         await self.db.flush()
         return draft
+
+    # -- 批量原子发布（Task 13）------------------------------------------------------
+
+    async def publish_batch(
+        self, review_batch_id: str, *, worker_id: str = "reviewer"
+    ) -> list[AgentArtifactVersion]:
+        """原子发布一个 Review Batch（设计 §8.1 / §12.3）。
+
+        单事务内：锁定 Batch + 全部 Item + Draft + Artifact；先校验所有 Item 都在
+        **当前** Revision 上 approve（任一不满足即抛 ``PublishBlocked``、整批回滚，
+        不产生任何部分 Version）；全部通过后才一次性插入全部
+        ``agent_artifact_versions``、更新 ``agent_artifacts.latest_version/status``、
+        把 Draft working head 置回 ``idle`` 并释放 owner、追加 ``published`` 事件、
+        写入 assistant 消息（``completion_text``），最后把父 Run 迁移到 completed。
+        """
+        now = _utcnow()
+        batch = await self.db.scalar(
+            select(ArtifactReviewBatch)
+            .where(ArtifactReviewBatch.id == review_batch_id)
+            .with_for_update()
+        )
+        if batch is None:
+            raise KeyError(f"review batch {review_batch_id!r} not found")
+        if batch.status in ("completed", "failed"):
+            raise PublishBlocked(
+                f"review batch {review_batch_id!r} already finalized: {batch.status}"
+            )
+        items = (
+            await self.db.scalars(
+                select(ArtifactReviewItem)
+                .where(ArtifactReviewItem.batch_id == batch.id)
+                .with_for_update()
+            )
+        ).all()
+        if not items:
+            raise PublishBlocked(f"review batch {review_batch_id!r} has no items")
+
+        # 1) 全部校验通过前不写任何业务行（all-or-nothing）。
+        plans: list[
+            tuple[ArtifactReviewItem, ArtifactDraft, ArtifactDraftRevision, AgentArtifact]
+        ] = []
+        for item in items:
+            draft = await self.db.scalar(
+                select(ArtifactDraft)
+                .where(ArtifactDraft.artifact_id == item.artifact_id)
+                .with_for_update()
+            )
+            if draft is None:
+                raise PublishBlocked(f"draft for artifact {item.artifact_id!r} not found")
+            current_rev = await self.db.scalar(
+                select(ArtifactDraftRevision).where(
+                    ArtifactDraftRevision.draft_id == draft.id,
+                    ArtifactDraftRevision.revision == draft.current_revision,
+                )
+            )
+            if current_rev is None:
+                raise PublishBlocked(
+                    f"revision {draft.current_revision} for draft {draft.id!r} not found"
+                )
+            if item.draft_revision_id != current_rev.id or item.status != "approved":
+                raise PublishBlocked(
+                    f"review item {item.id!r} is not approved on current revision "
+                    f"(bound={item.draft_revision_id}, current={current_rev.id}, "
+                    f"status={item.status!r})"
+                )
+            artifact = await self.db.scalar(
+                select(AgentArtifact)
+                .where(AgentArtifact.id == item.artifact_id)
+                .with_for_update()
+            )
+            if artifact is None:
+                raise PublishBlocked(f"artifact {item.artifact_id!r} not found")
+            plans.append((item, draft, current_rev, artifact))
+
+        # 2) 一次性插入全部不可变 Version（复制 Revision 的 parent_artifact_version_id）。
+        versions: list[AgentArtifactVersion] = []
+        for _item, _draft, current_rev, artifact in plans:
+            version = AgentArtifactVersion(
+                id=str(uuid4()),
+                artifact_id=artifact.id,
+                version=artifact.latest_version + 1,
+                source_run_id=batch.parent_run_id,
+                source_draft_revision_id=current_rev.id,
+                parent_artifact_version_id=current_rev.parent_artifact_version_id,
+                schema_version=current_rev.schema_version,
+                payload_json=current_rev.payload_json,
+                evidence_refs_json=current_rev.evidence_refs_json,
+                review_json=await self._review_json_for_item(_item.id),
+                data_status=(current_rev.payload_json or {}).get("data_status", "complete"),
+                created_at=now,
+            )
+            self.db.add(version)
+            versions.append(version)
+        await self.db.flush()
+
+        # 3) 释放 working head、更新稳定身份、追加 published 事件。
+        for (_item, draft, current_rev, artifact), version in zip(
+            plans, versions, strict=True
+        ):
+            await self.release_draft(draft.id, outcome="idle")
+            event = await self._emit_event(
+                session_id=artifact.session_id,
+                user_id=artifact.user_id,
+                module=artifact.module,
+                artifact_id=artifact.id,
+                event_type="published",
+                draft_revision=current_rev.revision,
+                artifact_version_id=version.id,
+            )
+            artifact.latest_version = version.version
+            artifact.status = "published"
+            artifact.activity_sequence = event.sequence
+            artifact.updated_at = now
+
+        # 4) Batch 完成 + 写 assistant 消息（completion_text 只在整批发布后落地）。
+        batch.status = "completed"
+        batch.completed_at = now
+        await self._write_assistant_message(
+            session_id=plans[0][3].session_id,
+            run_id=batch.parent_run_id,
+            content=batch.completion_text,
+        )
+
+        # 5) 父 Run reviewing → completed。
+        await AgentRunRepository(self.db).transition(
+            batch.parent_run_id, RunStatus.COMPLETED, worker_id=worker_id
+        )
+        await self.db.flush()
+        return versions
+
+    async def _review_json_for_item(self, review_item_id: str) -> dict[str, Any]:
+        attempts = (
+            await self.db.scalars(
+                select(ArtifactReviewAttempt)
+                .where(ArtifactReviewAttempt.review_item_id == review_item_id)
+                .order_by(ArtifactReviewAttempt.attempt)
+            )
+        ).all()
+        return {
+            "decision": "approve",
+            "attempts": len(attempts),
+            "issues": [a.issues_json for a in attempts if a.issues_json] or None,
+        }
+
+    async def _write_assistant_message(
+        self, *, session_id: str, run_id: str, content: str | None
+    ) -> AgentMessage | None:
+        if not content:
+            return None
+        sequence = await self.db.scalar(
+            select(func.max(AgentMessage.sequence)).where(
+                AgentMessage.session_id == session_id
+            )
+        )
+        message = AgentMessage(
+            id=str(uuid4()),
+            session_id=session_id,
+            run_id=run_id,
+            role="assistant",
+            content=content,
+            metadata_json=None,
+            sequence=(sequence or 0) + 1,
+            created_at=_utcnow(),
+        )
+        self.db.add(message)
+        return message
 
     # -- 未读水位 ------------------------------------------------------------------
 
