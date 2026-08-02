@@ -7,11 +7,13 @@ MCP 工具——那是引擎里模型的职责（Task 14）。
 
 from app.agent_artifacts.builders.common import DraftBuildError, DraftBuildResult
 from app.agent_artifacts.builders.kol_analysis import build_kol_analysis_draft
+from app.agent_artifacts.builders.kol_detail import build_kol_detail_draft
 from app.agent_artifacts.builders.kol_selection import build_kol_selection_draft
 
 __all__ = [
     "DraftBuildError",
     "DraftBuildResult",
     "build_kol_analysis_draft",
+    "build_kol_detail_draft",
     "build_kol_selection_draft",
 ]

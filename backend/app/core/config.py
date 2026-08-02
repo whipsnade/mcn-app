@@ -44,6 +44,8 @@ class Settings(BaseSettings):
     datatap_read_timeout_seconds: float = Field(default=60.0, gt=0)
     mcp_call_points: int = 10
     mcp_unknown_reconcile_seconds: int = Field(default=300, gt=0)
+    # 达人详情 Session 级缓存 TTL（设计 §8.1 kol_detail_cache）：默认 24 小时。
+    kol_detail_cache_ttl_hours: int = Field(default=24, ge=1)
     task_lease_seconds: int = Field(default=60, gt=0)
     goal_planner_shadow_enabled: bool = False
     goal_planner_enforce_enabled: bool = False
