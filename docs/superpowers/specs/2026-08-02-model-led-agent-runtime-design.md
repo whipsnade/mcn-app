@@ -1,0 +1,571 @@
+# 模型主导的统一 Agent 运行时设计
+
+状态：已确认，待实施计划  
+日期：2026-08-02  
+适用范围：所有使用模型的用户功能、MCP 调用、分析产物与前端执行状态
+
+## 一、背景
+
+当前系统把模型能力拆散在 Brainstorm、GoalPlanner、GoalPolicy、Agent Loop、快捷功能小循环、报告叙事、KOL 分析、摘要、追问建议和上下文答疑等多条链路中。业务步骤有一部分写在 prompt，一部分由代码通过 goal 类型、阶段清单、证据缺口和专用端点控制。
+
+真实品牌分析暴露出当前边界的问题：模型名义上自主规划，但仍需理解大量工程规则；代码又没有把关键业务约束落实为可靠状态，只把 `evidence_gaps` 等提示交给模型。单个重型 MCP 查询失败还可能触发服务级熔断，阻断其他无关维度。
+
+本设计将系统重建为“模型主导 + 可信执行内核”：模型决定业务分析流程，代码仅负责能力边界、安全、计费、状态、证据、结构校验和表现层。
+
+## 二、已确认决策
+
+| 主题 | 决策 |
+|---|---|
+| 切换方式 | 一次性替换所有模型功能，不保留旧执行路径 |
+| 代码迁移 | 全量重建新 API、新 Agent 数据模型和前端执行状态 |
+| 历史数据 | 仅保留账号、积分账本和收藏；旧会话、任务、报告不迁移且不展示 |
+| Artifact | 核心产物强类型；开放式钻取使用通用 Artifact |
+| 模型组织 | 统一运行时 + 多 Agent Profile；Profile 限定能力，不规定业务步骤 |
+| 会话入口 | 合并 Brainstorm、GoalPlanner 和执行 Agent 为 Session Agent |
+| 质量复核 | 正式产物由独立 Reviewer 复核，最多打回两次 |
+| 积分 | 不设单 Run 上限，只受钱包可用余额限制 |
+| 会话记忆 | 最近消息 + 摘要 + Artifact 目录；原始历史按需通过工具读取 |
+| MCP 故障 | 同工具、同参数指纹细粒度熔断；未确认调用禁止自动重放 |
+| 模型 | 所有 Profile 使用同一配置模型 |
+| 运行保护 | 最长 30 分钟或 50 次模型决策，触发后暂停而非失败 |
+| Artifact 发布 | Draft 可持续更新；Reviewer 通过后发布不可变版本 |
+| BI 导航 | 固定“品牌分析 / 活动分析 / 达人”三个一级 Tab |
+| 达人子 Tab | 继续保留“KOL 分析 / 圈选达人” |
+| 快捷功能 | 删除达人推荐、活动评估、小红书爆贴、抖音爆贴独立页面与 API |
+| 达人详情 | 保留，迁移至统一运行时和缓存机制 |
+| 思考展示 | 主 Agent 思考流实时展示并在完成后折叠；Reviewer 仅展示状态 |
+
+## 三、目标与非目标
+
+### 3.1 目标
+
+1. 每条用户消息创建一个独立、可恢复、可审计的 Agent Run。
+2. Session Agent 自主完成澄清、答疑、工具选择、失败处理、钻取和产物生成。
+3. 所有模型能力复用同一个决策循环、工具协议、事件协议和调用日志。
+4. 所有 MCP 调用具备用户隔离、白名单、参数校验、幂等、计费和精确故障状态。
+5. 所有正式数值产物可追溯到当前用户会话内的 Evidence。
+6. 多轮钻取复用既有 Artifact 和 Evidence，不向模型全量注入历史数据。
+7. 前端只消费统一 Run 事件和 Artifact，不根据具体业务流程拼装执行状态。
+
+### 3.2 非目标
+
+1. 不保留旧 Session、Task、Goal、Report 的执行兼容路径。
+2. 不迁移旧会话、旧任务、旧报告和旧 Artifact 到新数据模型。
+3. 不为模型规定品牌、活动或达人分析的固定工具顺序。
+4. 不保留四个快捷功能的独立页面、API 或缓存。
+5. 首次上线不物理删除旧表；旧表停止读取并隐藏，稳定后另行批准清理。
+6. 不允许模型直接持有数据库连接、DataTap 密钥或绕过计费网关。
+
+## 四、总体架构
+
+```mermaid
+flowchart LR
+    UI[会话 / 达人详情 UI] --> API[Agent API]
+    API --> RUN[Agent Run Engine]
+    RUN --> PROFILE[Agent Profile Registry]
+    RUN --> MODEL[统一模型适配器]
+    RUN --> TOOL[Trusted Tool Runtime]
+    TOOL --> MCP[DataTap MCP]
+    TOOL --> MEMORY[历史与证据工具]
+    TOOL --> CALC[计算 / 归一 / 评分工具]
+    TOOL --> DRAFT[Artifact Draft 工具]
+    RUN --> REVIEW[Artifact Reviewer]
+    REVIEW --> DRAFT
+    DRAFT --> ART[Published Artifact]
+    RUN --> EVENTS[SSE Event Log]
+    EVENTS --> UI
+    ART --> BI[品牌 / 活动 / 达人 BI]
+```
+
+### 4.1 模型拥有的业务控制权
+
+- 判断当前输入是澄清回答、普通答疑、首次分析还是继续钻取；
+- 决定是否需要询问用户；
+- 选择工具、参数和调用顺序；
+- 读取哪些历史 Artifact 或 Evidence；
+- 工具失败后决定修正参数、切换工具、继续其他维度或结束；
+- 创建、更新和提交哪些 Artifact；
+- 决定何时信息足够并结束 Run。
+
+### 4.2 代码保留的可信边界
+
+- 用户身份、数据隔离、工具授权和密钥安全；
+- 模型动作与工具参数 Schema 校验；
+- MCP 调用幂等、计费、故障分类和恢复；
+- Run 状态、Step、Evidence、事件和 Artifact 持久化；
+- 运行时长和模型决策次数保护；
+- Artifact 类型校验、Evidence 引用归属校验和版本不可变性；
+- 前端展示、Excel 导出和文件下载。
+
+代码不得再维护按业务维度定义的固定阶段清单、固定调用顺序或 GoalPolicy 工具流程。
+
+## 五、Agent Profile
+
+所有 Profile 使用同一配置模型、同一 OpenAI 兼容适配器、同一日志与错误契约。
+
+| Profile | 入口 | 工具权限 | 输出 |
+|---|---|---|---|
+| `session_analyst_v1` | 所有普通会话消息 | 已审核 MCP、历史、计算、Artifact Draft | `ask_user`、`respond`、工具调用、正式或通用 Artifact |
+| `artifact_reviewer_v1` | 正式 Artifact 提交复核 | 只读 Artifact 和 Evidence，不允许 MCP | `approve`、`revise`、`reject` |
+| `kol_detail_v1` | 点击圈选达人 | KOL 详情、原帖、只读缓存、Artifact Draft | `kol_detail_v2` |
+| `utility_v1` | 标题、Run 摘要、建议等后台轻量任务 | 不允许 MCP，只读短上下文 | 对应强类型 Utility 输出 |
+
+Profile 注册项包含：名称、版本、system prompt、允许工具集合、允许动作、输出 Schema、是否要求 Reviewer、最大上下文预算。Profile 不包含业务调用顺序。
+
+现有 13 类 `ModelPurpose` 收敛为 `session_agent`、`artifact_reviewer`、`kol_detail_agent`、`utility` 四类审计用途。
+
+## 六、统一模型动作协议
+
+每次模型决策必须输出一个受 Pydantic 严格校验的动作：
+
+```text
+ask_user
+  question
+  options[]             # 可空；有选项时 2-4 项
+
+respond
+  text
+  suggestions[]         # 可选
+
+call_tool
+  internal_tool_name
+  arguments
+  rationale
+
+submit_review
+  artifact_draft_id
+  summary
+
+finish
+  text
+  suggestions[]         # 可选
+```
+
+Artifact 创建、更新、历史读取和计算统一作为受控内部工具通过 `call_tool` 执行，避免在顶层动作中持续增加业务特例。
+
+模型输出 `ask_user` 时，本 Run 以 `clarification_requested` 结果完成；用户回答创建新 Run，并通过 `parent_run_id` 和待回答 Memory 关联。模型输出普通 `respond/finish` 且没有正式 Artifact 时不触发 Reviewer。
+
+## 七、Run 状态机
+
+```mermaid
+stateDiagram-v2
+    [*] --> queued
+    queued --> running
+    running --> running: call_tool / draft update
+    running --> clarification_requested: ask_user
+    running --> reviewing: submit_review
+    reviewing --> running: revise（最多 2 次）
+    reviewing --> completed: approve + publish
+    reviewing --> failed: reject / 无法形成有效产物
+    running --> completed: respond / finish（无正式产物）
+    running --> paused: 30 分钟或 50 决策
+    paused --> running: 用户继续
+    running --> cancelled: 用户取消
+    running --> failed: 不可恢复系统错误
+```
+
+每条新用户消息创建独立 Run。只有用户点击“继续”恢复 `paused` Run 时才复用原 Run；普通多轮消息绝不复用已完成 Run 的执行卡。
+
+每次模型决策前持久化上下文游标；每次工具调用在外发前持久化 Step 和 `logical_call_id`。恢复时从最后一个完整 Step 继续，禁止凭内存状态重建调用。
+
+## 八、数据模型
+
+### 8.1 新表
+
+#### `agent_sessions`
+
+- `id`, `user_id`, `title`, `status`；
+- `session_summary`, `summary_version`；
+- `created_at`, `updated_at`, `archived_at`；
+- 所有查询必须带 `user_id` 与未归档条件。
+
+#### `agent_messages`
+
+- `id`, `session_id`, `run_id nullable`, `role`, `content`；
+- `metadata_json`, `sequence`, `created_at`；
+- 唯一 `(session_id, sequence)`。
+
+#### `agent_runs`
+
+- `id`, `session_id`, `user_id`, `input_message_id`, `parent_run_id nullable`；
+- `profile_name`, `profile_version`, `model`, `prompt_snapshot_json`；
+- `status`, `outcome`, `decision_count`, `review_count`；
+- `started_at`, `paused_at`, `completed_at`, `error_code`；
+- 租约字段：`lease_owner`, `lease_expires_at`, `heartbeat_at`。
+
+#### `agent_steps`
+
+- `id`, `run_id`, `sequence`, `step_type`；
+- `input_json`, `output_json`, `status`, `duration_ms`；
+- `model_request_id`, `token_usage_json`, `created_at`；
+- 唯一 `(run_id, sequence)`。
+
+#### `agent_tool_calls`
+
+- `id`, `run_id`, `step_id`, `logical_call_id`；
+- `service`, `internal_tool_name`, `arguments_json`, `arguments_hash`；
+- `status`: `planned/reserved/running/settled/failed/unknown`；
+- `points_reserved`, `points_settled`, `upstream_request_id`；
+- `error_type`, `safe_error_message`, `started_at`, `completed_at`；
+- `logical_call_id` 全局唯一。
+
+#### `evidence_items`
+
+- `id`, `session_id`, `run_id`, `tool_call_id`；
+- `source_type`, `source_name`, `scope_json`, `period_json`；
+- `raw_payload_json`, `normalized_preview_json`, `payload_hash`；
+- `collected_at`, `availability_status`；
+- Evidence 不可变，模型只能通过只读工具获取。
+
+#### `artifact_drafts`
+
+- `id`, `session_id`, `run_id`, `module`, `artifact_type`；
+- `parent_artifact_id nullable`, `payload_json`, `evidence_refs_json`；
+- `schema_version`, `revision`, `status`, `updated_at`；
+- 唯一 `(run_id, id)`；同一 Run 内按 revision 乐观锁更新。
+
+#### `agent_artifacts`
+
+- `id`, `session_id`, `user_id`, `module`, `artifact_type`；
+- `parent_artifact_id nullable`, `artifact_key`, `latest_version`；
+- `created_at`, `updated_at`；
+- 作为稳定身份，不直接保存可变报告内容。
+
+#### `agent_artifact_versions`
+
+- `id`, `artifact_id`, `version`, `source_run_id`；
+- `schema_version`, `payload_json`, `evidence_refs_json`；
+- `review_json`, `data_status`, `created_at`；
+- 唯一 `(artifact_id, version)`；发布后不可更新。
+
+#### `agent_events`
+
+- `id`, `run_id`, `user_id`, `sequence`, `event_type`, `payload_json`, `created_at`；
+- 唯一 `(run_id, sequence)`；SSE 使用 Last-Event-ID 断线续传。
+
+#### `memory_entries`
+
+- `id`, `session_id`, `source_run_id nullable`, `source_artifact_id nullable`；
+- `memory_type`: `run_summary/artifact_index/pending_question`；
+- `content_json`, `created_at`, `superseded_at`。
+
+### 8.2 保留表
+
+保留用户、认证、钱包、积分账本、管理员审计和收藏相关表。新系统不读取旧会话、任务、Goal、MCP 调用、旧报告、旧 Artifact 和 Quick 状态表。
+
+迁移建议：当前 head 后新增 `0027_agent_runtime_v3.py` 创建新表和约束；首次发布仅停止旧表读取。稳定验收后再以单独迁移和单独用户确认清理旧表，避免首次切换失去回滚能力。
+
+## 九、分层记忆与多轮钻取
+
+Session Agent 每轮默认获得：
+
+1. 当前用户消息；
+2. 最近有限条消息；
+3. 当前 Session Summary；
+4. 历史 Run 摘要；
+5. Artifact 紧凑目录，包括类型、版本、范围、父子关系和数据状态；
+6. 当前可用工具、工具成本和钱包余额。
+
+不默认注入完整 MCP 结果或全部历史报告。模型按需调用：
+
+- `read_artifact(artifact_id, version?, section?)`；
+- `search_evidence(query, artifact_id?, run_id?, filters?)`；
+- `read_tool_result(evidence_id, cursor?, limit?)`。
+
+所有历史读取工具必须校验 Evidence/Artifact 属于当前用户和 Session。大结果返回摘要、游标和有限分片，避免上下文无限增长。
+
+钻取 Artifact 必须声明 `module` 和 `parent_artifact_id`。改变品牌、活动、时间窗口或核心口径时，模型应创建新的核心 Artifact 或新版本；只对既有结论做局部解释时创建 `insight_board_v1` 子 Artifact。
+
+## 十、工具运行时
+
+### 10.1 工具注册
+
+统一 Tool Registry 同时注册：
+
+- 审核通过的 DataTap MCP 工具；
+- 历史读取工具；
+- 确定性计算、聚合、排序和 KOL 评分工具；
+- Artifact Draft 工具；
+- 必要的文件/Excel 导出能力。
+
+每个工具声明内部名、说明、输入/输出 JSON Schema、计费点数、是否有外部副作用、最大结果大小和授权规则。模型只能看到当前 Profile 与用户渠道权限共同允许的工具。
+
+### 10.2 大结果处理
+
+MCP 原始结果完整落 `evidence_items.raw_payload_json`。返回模型的工具结果为：
+
+- `evidence_id`；
+- 结构化预览；
+- 总行数和截断标记；
+- 可用字段；
+- 后续读取游标。
+
+不得再仅以可能丢 URL 或字段的自由文本摘要作为唯一证据。
+
+### 10.3 确定性能力
+
+模型可自主选择调用以下零积分工具：
+
+- `calculate_expression`；
+- `aggregate_metrics`；
+- `calculate_period_comparison`；
+- `normalize_sentiment`；
+- `rank_kols`；
+- `validate_artifact_payload`。
+
+这些工具只计算和校验，不决定业务步骤。关键数值进入 Artifact 时必须带 `evidence_refs` 或计算来源链。
+
+## 十一、MCP 故障与积分
+
+### 11.1 故障分类
+
+| 分类 | 示例 | 重放 | 积分 |
+|---|---|---|---|
+| `definitely_not_sent` | Schema/白名单拒绝、队列/熔断、连接前失败 | 可安全自动重试一次 | 释放预留 |
+| `failed_confirmed` | MCP 明确 `isError` 或确定业务失败 | 不自动重放，交模型决定 | 释放预留 |
+| `result_unknown` | 请求发出后读超时、504、无法确认的 5xx | 禁止自动重放 | 保持预留并进入恢复核对 |
+| `settled` | 获得并保存合法结果 | 不重复调用 | 结算 10 积分 |
+
+未知结果的工具调用返回结构化状态给模型，模型可以继续调用其他工具，但不得原样重放未知调用。恢复任务负责核对和最终结算；无法核对时保留审计状态并按现有账本规则人工处理。
+
+### 11.2 细粒度熔断
+
+熔断键为：
+
+```text
+service + internal_tool_name + SHA256(normalized_arguments)
+```
+
+只阻止短时间内对相同调用的重复撞击。趋势工具失败不得封锁情感、地域、热帖或不同平台参数。熔断错误作为普通工具结果返回模型，运行时不指定替代工具。
+
+### 11.3 钱包规则
+
+- 模型调用、历史读取、计算和 Artifact 工具为零积分；仍记录 token 和供应商成本；
+- 每次 DataTap MCP 调用固定 10 积分；
+- 不设单 Run 预算；每次外部调用前实时检查钱包；
+- 余额不足作为结构化工具错误返回模型；模型可说明限制、询问充值或使用已有证据完成；
+- 用户取消时停止新调用，已 settled 调用正常结算，reserved/unknown 进入恢复。
+
+## 十二、Artifact 与 Reviewer
+
+### 12.1 强类型 Artifact
+
+- `brand_report_v3`：品牌范围、平台概览、情感、趋势、内容、地域、热帖、洞察、方法论和 Evidence 引用；
+- `campaign_report_v2`：活动范围、节奏、平台贡献、内容/达人贡献、情感和复盘；
+- `kol_selection_v3`：名单、评分输入、评分版本、评分结果和证据；
+- `kol_analysis_v2`：名单统计、趋势现状、分布和投放建议；
+- `kol_detail_v2`：身份、平台指标、趋势、画像、主页链接、缓存状态和最新 5 条热帖。
+
+强类型 Artifact 继续支持专用 BI 和 Excel 导出。现有 v2 payload 不兼容迁移，新系统使用新 schema version。
+
+### 12.2 通用 Artifact
+
+`insight_board_v1` 允许以下 Block：`metric_grid/table/bar_chart/line_chart/pie_chart/markdown/timeline/references`。模型可用于开放式钻取，但必须提供 `module`、`title`、`scope`、`parent_artifact_id` 和数字级 Evidence 引用。
+
+### 12.3 Draft 与发布
+
+模型通过内部工具创建和更新 Draft。前端可以展示 Draft，但必须标识 `generating/restricted/reviewing`，且不进入版本历史。
+
+正式 Artifact 提交 Reviewer 时冻结一个 review revision。Reviewer 输入仅包括：用户问题、Draft payload、Evidence 引用解析结果、允许的 Artifact Schema 和已知数据限制；Reviewer 不允许调用 MCP。
+
+Reviewer 输出：
+
+- `approve`：冻结为不可变 Artifact Version；
+- `revise`：返回结构化问题清单，主 Agent 自主补查或修订；
+- `reject`：Artifact 无法形成可信结果。
+
+Reviewer 检查回答完整性、数字可追溯、引用有效、结论不冲突和数据限制披露。最多打回两次。第二次仍未通过时，主 Agent只能发布明确标记 `restricted` 的受限产物或以失败结束，不得绕过 Reviewer 发布完整状态。
+
+## 十三、前端设计
+
+### 13.1 会话区
+
+- 每个 Run 对应独立执行卡；已完成 Run 不被后续消息复用；
+- 主 Agent thinking 通过 SSE 实时展示，完成后默认折叠；
+- Reviewer 仅显示“质量复核中 / 需要补充 / 已通过 / 未通过”；
+- 工具步骤显示名称、状态、耗时和积分，不展示密钥或完整敏感参数；
+- `paused` 显示继续按钮，`clarification_requested` 显示问题和选项 chips；
+- 建议 chips 仍只填入输入框，不自动提交。
+
+### 13.2 BI 区
+
+固定三个一级 Tab：
+
+1. 品牌分析；
+2. 活动分析；
+3. 达人，内部继续保留“KOL 分析 / 圈选达人”。
+
+Artifact 发布或 Draft 更新只显示对应 Tab 更新圆点，不自动切换。核心 Artifact 提供版本选择；通用钻取 Artifact 作为父 Artifact 下的子分析列表展示。
+
+点击圈选达人创建 `kol_detail_v1` 轻量 Run：先读取新缓存，缓存不存在或过期时再调用 MCP，发布 `kol_detail_v2`。详情保留主页链接和最新 5 条热帖。
+
+### 13.3 删除快捷功能
+
+删除达人推荐、活动评估、小红书爆贴、抖音爆贴：
+
+- 顶部/侧栏入口；
+- 前端组件、API Client、QuickFeatureCacheProvider 及测试；
+- `/api/v1/quick/*` 路由、quick agent/service/schema 及专用传输实例；
+- 对应独立模型输出契约。
+
+这些分析仍可由用户在普通会话中自然语言发起，由 Session Agent 自主调用同类 MCP 能力，并将结果放入固定 BI 模块。
+
+## 十四、功能迁移矩阵
+
+| 旧功能 | 新归属 | 处理 |
+|---|---|---|
+| Brainstorm | Session Agent | 删除独立服务和 prompt |
+| GoalPlanner | Session Agent | 删除 enforce/shadow 和 Goal 前置规划 |
+| TaskGoal / GoalPolicy | Agent Run / Profile | 删除业务阶段与 prompt 分派 |
+| Brand/Campaign/KOL Agent Loop | Session Agent | 使用统一动作循环和工具注册 |
+| Brand Narrative | Session Agent + Reviewer | 不再单独调用 narrative 模型 |
+| KOL Analysis / Report Writer | Artifact Draft + Reviewer | 生成强类型产物 |
+| Context QA | Session Agent | 读取 Artifact/Evidence 后直接回答 |
+| Followup / Summary / 标题 | Utility Profile | 使用统一模型调用协议 |
+| KOL Detail | KOL Detail Profile | 保留 UI，迁移执行与缓存 |
+| 四个 Quick 功能 | 删除 | 能力转入普通会话，不保留入口 |
+| model_prompt_logs | agent_steps + 模型调用审计 | 新 Run 内统一追踪 |
+| analysis_tasks/task_goals | agent_runs/agent_steps | 不迁移旧记录 |
+| analysis_reports/task_artifacts | agent_artifacts/versions | 不迁移旧记录 |
+
+## 十五、新 API 与事件
+
+建议 API 前缀：`/api/v1/agent`。
+
+### 15.1 会话与 Run
+
+- `POST /agent/sessions`
+- `GET /agent/sessions`
+- `GET /agent/sessions/{session_id}`
+- `PATCH /agent/sessions/{session_id}`
+- `DELETE /agent/sessions/{session_id}`
+- `POST /agent/sessions/{session_id}/messages`：写用户消息并创建 Run
+- `GET /agent/runs/{run_id}`
+- `GET /agent/runs/{run_id}/events`
+- `POST /agent/runs/{run_id}/cancel`
+- `POST /agent/runs/{run_id}/resume`
+
+### 15.2 Artifact
+
+- `GET /agent/sessions/{session_id}/artifacts?module=&parent_artifact_id=`
+- `GET /agent/artifacts/{artifact_id}`
+- `GET /agent/artifacts/{artifact_id}/versions/{version}`
+- `PUT /agent/sessions/{session_id}/artifact-read-state`
+- `GET /agent/artifacts/{artifact_id}/export`
+- 达人详情由统一 Run 创建，不另设 Quick API。
+
+所有资源查询同时校验当前用户、Session 归属和软删除状态，归属失败统一返回 404。
+
+### 15.3 SSE 事件
+
+- `run.started/paused/resumed/completed/failed/cancelled`；
+- `thinking.started/delta/completed/failed`；
+- `tool.started/succeeded/failed/unknown`；
+- `artifact.draft.created/updated`；
+- `review.started/revision_requested/approved/rejected`；
+- `artifact.published`；
+- `message.completed`。
+
+事件 payload 必须带 `run_id`；Artifact 事件带 `artifact_id/module/parent_artifact_id/status`。前端按事件 sequence 幂等归并。
+
+## 十六、安全与审计
+
+- 模型永远不接触 DataTap token、数据库 DSN、JWT 密钥或完整管理员信息；
+- 所有工具调用携带服务端解析的 `user_id/session_id/run_id`，模型参数不能覆盖；
+- 模型看到的工具集合由 Profile、渠道权限和实时工具审核状态求交集；
+- Evidence 与 Artifact 的读取必须同时验证用户和 Session；
+- Prompt、模型响应、thinking、工具参数、工具结果哈希、积分和 Reviewer 结果统一挂在 Run 审计链；
+- 对外事件和日志继续使用脱敏规则，原始 Evidence 仅后端受控读取；
+- Artifact 内 URL 只允许 `https/http`，前端继续做协议白名单。
+
+## 十七、测试策略
+
+### 17.1 单元和契约测试
+
+- 所有 Run 状态转换和非法转换；
+- 动作 Schema、Profile 权限与工具 Schema；
+- Artifact 强类型和通用 Block；
+- Evidence 引用归属、存在性和不可变性；
+- Reviewer 通过、打回、拒绝和两轮上限；
+- 记忆压缩与按需读取。
+
+### 17.2 运行时集成测试
+
+- 工具调用持久化先于外发；
+- 相同 `logical_call_id` 不重复执行或扣费；
+- 三种故障分类的积分状态；
+- 同参数熔断不影响其他工具/参数；
+- 进程中断、租约恢复、SSE 断线续传；
+- Draft → Review → Published 的事务与并发；
+- 跨用户 Session、Evidence、Artifact 全部拒绝。
+
+### 17.3 真实模型 + 真实 MCP UAT
+
+必须覆盖：
+
+- 信息不足主动澄清；
+- 品牌、活动、达人圈选、KOL 分析；
+- 基于父 Artifact 的情感、峰值、平台和竞品钻取；
+- KOL 详情缓存、主页链接和 5 条热帖；
+- 趋势 504 后继续其他工具；
+- 钱包不足后基于已有证据受限交付；
+- Reviewer 打回后补查或修订；
+- 每个正式数值产物均有有效 Evidence 引用。
+
+真实 UAT 不断言固定工具顺序，只断言用户目标、状态、计费、证据和 Artifact 契约。
+
+### 17.4 前端 E2E
+
+- 1440×900、1024×768、390×844；
+- 每轮独立 Run 卡和 thinking 折叠；
+- SSE 断线恢复；
+- Draft、Reviewer、Published 状态；
+- 三个 BI Tab、版本、子分析和更新圆点；
+- 达人两个子 Tab 和详情弹窗；
+- 四个快捷入口彻底消失。
+
+## 十八、一次性切换与回滚
+
+### 18.1 切换顺序
+
+1. 冻结旧模型功能开发；
+2. 完成新数据模型、统一运行时、新 API、新前端；
+3. 在独立测试库完成迁移和全场景真实 UAT；
+4. 切换前完整备份数据库；
+5. 同一发布批次部署新后端和新前端；
+6. 停止注册旧 sessions/tasks/quick/reporting 执行路由；
+7. 新前端只读取新 Agent API；
+8. 使用真实账号完成会话、计费、品牌、活动、达人和导出冒烟。
+
+### 18.2 回滚
+
+首次切换不物理删除旧表。若冒烟失败：回滚应用版本和路由注册，恢复旧前端；新 Agent 表保留用于排障但不再接收写入。旧数据因未删除可恢复旧系统。
+
+稳定运行并经用户单独批准后，才可新增清理迁移删除旧会话、任务、Goal、报告、Artifact、旧 MCP 调用和 Quick 状态表。清理前必须再次备份并列出准确表名，不得在首次切换迁移中隐式删除。
+
+## 十九、发布阻断条件
+
+出现任一情况不得切换：
+
+1. MCP 调用可能重复执行、重复扣费或错误释放 unknown 预留；
+2. 正式 Artifact 存在无法追溯到 Evidence 的数值；
+3. 跨用户 Session、Evidence、Artifact 或达人详情越权；
+4. 品牌、活动、KOL 任一强类型 Artifact 无法被 BI 或 Excel 消费；
+5. Run 恢复导致步骤重放或执行卡复用；
+6. Reviewer 可以被主 Agent 绕过；
+7. 四个旧快捷入口、API 或缓存仍可从新系统触达；
+8. 前后端无法在同一发布批次完成契约切换。
+
+## 二十、实施分解
+
+尽管最终一次性切换，开发应按以下依赖顺序拆分，前一部分达到测试门槛后再进入下一部分：
+
+1. **数据模型与可信工具内核**：新表、状态机、计费、幂等、故障分类、Evidence；
+2. **统一模型循环与 Profile**：Session Agent、Reviewer、Utility、KOL Detail；
+3. **Artifact 与强类型产物**：Draft、版本、通用 Block、品牌/活动/KOL/KOL 详情；
+4. **新 API 与 SSE**：Session、Run、Artifact、取消/恢复和事件续传；
+5. **前端全量迁移**：新会话状态、执行卡、固定 BI、详情、删除 Quick；
+6. **真实服务 UAT 与切换**：真实模型/MCP、故障注入、备份、冒烟和回滚演练。
+
+这些部分共同组成一个发布版本，不设置新旧运行时功能开关，也不允许部分用户继续使用旧模型链路。
+
