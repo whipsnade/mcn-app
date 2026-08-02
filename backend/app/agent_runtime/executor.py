@@ -22,7 +22,7 @@ import logging
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_runtime.engine import AgentEngine
@@ -62,6 +62,7 @@ class AgentRunExecutor:
         self._lease_seconds = lease_seconds
         self._claim_interval_seconds = claim_interval_seconds
         self._stop = asyncio.Event()
+        self._wake = asyncio.Event()
         self._loop_task: asyncio.Task[None] | None = None
 
     # ------------------------------------------------------------------ #
@@ -88,6 +89,17 @@ class AgentRunExecutor:
                 await asyncio.gather(self._loop_task, return_exceptions=True)
             self._loop_task = None
 
+    def submit(self, run_id: str) -> None:
+        """把新 Run 提交给执行器（Task 19 API 接线入口）。
+
+        执行器是轮询式 worker：queued Run 落库后后台循环自动领取，因此 submit
+        不做按 run_id 分发，只唤醒循环立即扫描以缩短创建→执行的延迟；后台循环
+        尚未启动（如窄路由测试 / 单测）或已停止时安全空转。幂等安全。
+        """
+        del run_id
+        if self._loop_task is not None and not self._stop.is_set():
+            self._wake.set()
+
     async def _run_loop(self) -> None:
         while not self._stop.is_set():
             try:
@@ -96,10 +108,17 @@ class AgentRunExecutor:
                 raise
             except Exception:
                 logger.exception("agent executor loop iteration failed")
+            # 等待下一领取间隔；submit() 置位 _wake 时立即唤醒，不等待完整间隔。
+            stop_wait = asyncio.ensure_future(self._stop.wait())
+            wake_wait = asyncio.ensure_future(self._wake.wait())
             try:
-                await asyncio.wait_for(self._stop.wait(), timeout=self._claim_interval_seconds)
-            except TimeoutError:
-                pass
+                await asyncio.wait(
+                    {stop_wait, wake_wait}, timeout=self._claim_interval_seconds
+                )
+            finally:
+                self._wake.clear()
+                stop_wait.cancel()
+                wake_wait.cancel()
 
     # ------------------------------------------------------------------ #
     # 领取 / 执行
@@ -159,7 +178,13 @@ class AgentRunExecutor:
             return RunStatus.FAILED
 
     async def _find_claimable_id(self, db: AsyncSession) -> str | None:
-        """返回一个可领取的 user Run id：queued 新任务优先，其次过期租约。"""
+        """返回一个可领取的 user Run id：queued 新任务优先，其次过期/无租约 RUNNING。
+
+        无租约 RUNNING（``lease_expires_at`` 为 NULL）是 API resume 经
+        ``begin_attempt(resumed=True)`` 或 begin_attempt 后崩溃留下的状态：
+        当前 Attempt 已就绪、无活跃 worker 持有，必须可被领取，否则恢复后
+        的 Run 会永久卡在 running。
+        """
         now = utc_now()
         queued = await db.scalar(
             select(AgentRun.id)
@@ -179,8 +204,10 @@ class AgentRunExecutor:
                 AgentRun.run_kind == "user",
                 AgentRun.status == RunStatus.RUNNING,
                 AgentRun.cancel_requested.is_(False),
-                AgentRun.lease_expires_at.isnot(None),
-                AgentRun.lease_expires_at <= now,
+                or_(
+                    AgentRun.lease_expires_at.is_(None),
+                    AgentRun.lease_expires_at <= now,
+                ),
             )
             .order_by(AgentRun.id.asc())
             .limit(1)
@@ -202,9 +229,24 @@ class AgentRunExecutor:
                 return None
             return run, attempt
         if status == RunStatus.RUNNING:
-            # 过期租约接管：pause 收口旧 Attempt → 新建 Attempt → 重新领取。
+            # 无租约 RUNNING（API resume / begin_attempt 后崩溃）：新 Attempt 已
+            # 就绪，直接沿用当前 open Attempt，不再 pause+重建（避免每次用户恢复
+            # 都多出一个暂停 Attempt）。
+            had_lease = run.lease_expires_at is not None
             if not await repo.claim_lease(run_id, worker_id, self._lease_seconds):
                 return None
+            if not had_lease:
+                attempt = await self._current_open_attempt(db, run_id)
+                if attempt is not None:
+                    return run, attempt
+                # 异常兜底：无 open Attempt 时走暂停重建路径。
+                if not await repo.pause(run_id, worker_id):
+                    return None
+                attempt = await repo.begin_attempt(run_id, resumed=True)
+                if not await repo.claim_lease(run_id, worker_id, self._lease_seconds):
+                    return None
+                return run, attempt
+            # 过期租约接管：pause 收口旧 Attempt → 新建 Attempt → 重新领取。
             if not await repo.pause(run_id, worker_id):
                 return None
             attempt = await repo.begin_attempt(run_id, resumed=True)
@@ -212,6 +254,20 @@ class AgentRunExecutor:
                 return None
             return run, attempt
         return None
+
+    async def _current_open_attempt(
+        self, db: AsyncSession, run_id: str
+    ) -> AgentRunAttempt | None:
+        """返回当前尚未收尾的 Attempt（``ended_at IS NULL``），无则 None。"""
+        return await db.scalar(
+            select(AgentRunAttempt)
+            .where(
+                AgentRunAttempt.run_id == run_id,
+                AgentRunAttempt.ended_at.is_(None),
+            )
+            .order_by(AgentRunAttempt.attempt.desc())
+            .limit(1)
+        )
 
     # ------------------------------------------------------------------ #
     # 会话 / 收口

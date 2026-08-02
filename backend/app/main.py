@@ -1,10 +1,12 @@
 import asyncio
 import os
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.router import api_router
 from app.agent_runtime.engine import AgentEngine
@@ -84,19 +86,25 @@ def _make_recovery_tool(db, call) -> AgentMcpTool | None:
     )
 
 
-def create_agent_runtime() -> tuple[AgentRunExecutor, RecoveryLoop]:
+def create_agent_runtime() -> tuple[
+    AgentRunExecutor, RecoveryLoop, AgentEventBroker, Callable[[AsyncSession, str], AgentEngine]
+]:
     """构建进程级 Agent 执行器 + 恢复循环（共享一个事件 broker）。
 
     executor 与 recovery 使用**不同**的 worker id（``agent-{pid}`` /
     ``recovery-{pid}``）：若原 worker 的一次 decide 超过租约时长导致租约过期，
     恢复循环接管后原 worker 的 ``renew_lease`` 会因租约归属变化而失败并在下一个
     安全点停止，避免同一 Run 被两个 worker 并发执行（Fix 4）。
+
+    额外返回 ``broker`` 与 ``engine_factory``：Task 19 API 的 SSE 路由共享
+    broker（同进程事件即时唤醒），kol-details 路由用 ``engine_factory`` 构建
+    绑定请求会话的 ``AgentEngine`` 驱动 ``KolDetailRunService``。
     """
     executor_worker_id = f"agent-{os.getpid()}"
     recovery_worker_id = f"recovery-{os.getpid()}"
     broker = AgentEventBroker()
 
-    def engine_factory(db, worker_id) -> AgentEngine:
+    def engine_factory(db: AsyncSession, worker_id: str) -> AgentEngine:
         gateway = AgentModelGateway(get_model_adapter(), db=db)
         registry = ToolRegistry(
             catalog_source=lambda: _load_catalog(db),
@@ -125,13 +133,13 @@ def create_agent_runtime() -> tuple[AgentRunExecutor, RecoveryLoop]:
         lease_seconds=AGENT_LEASE_SECONDS,
         interval_seconds=RECOVERY_INTERVAL_SECONDS,
     )
-    return executor, recovery
+    return executor, recovery, broker, engine_factory
 
 
 def create_app() -> FastAPI:
     settings = get_settings()
     runner, recovery = create_task_runtime()
-    agent_executor, agent_recovery = create_agent_runtime()
+    agent_executor, agent_recovery, agent_broker, agent_engine_factory = create_agent_runtime()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -139,6 +147,8 @@ def create_app() -> FastAPI:
         app.state.task_runner = runner
         app.state.agent_executor = agent_executor
         app.state.agent_recovery = agent_recovery
+        app.state.agent_event_broker = agent_broker
+        app.state.agent_engine_factory = agent_engine_factory
         agent_executor.start()
         agent_recovery.start()
         stop_recovery = asyncio.Event()
@@ -177,6 +187,8 @@ def create_app() -> FastAPI:
     app.state.task_runner = runner
     app.state.agent_executor = agent_executor
     app.state.agent_recovery = agent_recovery
+    app.state.agent_event_broker = agent_broker
+    app.state.agent_engine_factory = agent_engine_factory
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[settings.frontend_origin],

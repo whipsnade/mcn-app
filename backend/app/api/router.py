@@ -1,6 +1,8 @@
 from fastapi import APIRouter
 
 from app.admin.router import router as admin_router
+from app.agent_artifacts.router import router as agent_artifacts_router
+from app.agent_runtime.router import router as agent_runtime_router
 from app.artifacts.router import router as artifacts_router
 from app.billing.router import router as billing_router
 from app.brainstorm.router import router as brainstorm_router
@@ -25,3 +27,5 @@ api_router.include_router(tasks_router, tags=["tasks"])
 api_router.include_router(reporting_router, tags=["reporting"])
 api_router.include_router(selection_router, tags=["selection"])
 api_router.include_router(artifacts_router, tags=["artifacts"])
+api_router.include_router(agent_runtime_router, prefix="/agent", tags=["agent"])
+api_router.include_router(agent_artifacts_router, prefix="/agent", tags=["agent"])
