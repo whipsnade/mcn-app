@@ -33,6 +33,31 @@ def test_phase_two_tables_are_registered() -> None:
     }.issubset(Base.metadata.tables)
 
 
+def test_agent_runtime_tables_are_registered() -> None:
+    assert {
+        "agent_sessions",
+        "agent_messages",
+        "agent_runs",
+        "agent_run_attempts",
+        "agent_steps",
+        "agent_tool_calls",
+        "evidence_items",
+        "agent_events",
+        "agent_tool_call_reconciliations",
+        "memory_entries",
+        "agent_artifacts",
+        "artifact_drafts",
+        "artifact_draft_revisions",
+        "artifact_review_batches",
+        "artifact_review_items",
+        "artifact_review_attempts",
+        "agent_artifact_versions",
+        "artifact_events",
+        "artifact_read_states",
+        "kol_detail_cache",
+    }.issubset(Base.metadata.tables)
+
+
 def test_sessions_register_soft_delete_column_and_visibility_index() -> None:
     sessions = Base.metadata.tables["sessions"]
 

@@ -19,7 +19,7 @@ from app.reporting.models import AnalysisReport
 
 
 BACKEND_ROOT = Path(__file__).resolve().parents[2]
-EXPECTED_HEAD = "0026_brand_report_v2_payload"
+EXPECTED_HEAD = "0027_agent_runtime_v3"
 
 
 def head_revision() -> str:
@@ -70,7 +70,8 @@ async def test_0026_upgrade_downgrade_upgrade_column_lifecycle() -> None:
         assert return_code == 0, output
         assert await payload_columns() == {"payload_json", "template_version"}
 
-        return_code, output = await run_alembic("downgrade", "-1")
+        # 回退到 0026 前一版，确保 0026 的 downgrade 执行并移除 payload 列。
+        return_code, output = await run_alembic("downgrade", "0025_kol_selection_detail_views")
         assert return_code == 0, output
         assert await payload_columns() == set()
 

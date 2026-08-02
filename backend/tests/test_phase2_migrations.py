@@ -21,7 +21,7 @@ def test_migration_chain_has_single_head() -> None:
     config = Config(str(backend_dir / "alembic.ini"))
     config.set_main_option("script_location", str(backend_dir / "migrations"))
     heads = ScriptDirectory.from_config(config).get_heads()
-    assert heads == ["0026_brand_report_v2_payload"]
+    assert heads == ["0027_agent_runtime_v3"]
 
 
 async def test_phase_two_unique_constraints() -> None:
@@ -456,6 +456,102 @@ async def test_0022_goal_artifact_infra_schema() -> None:
 
     mcp_call_by_name = {item["name"]: item for item in mcp_call_columns}
     assert mcp_call_by_name["goal_id"]["nullable"] is True
+
+
+async def test_0027_agent_runtime_v3_schema() -> None:
+    """迁移 0027：统一 Agent 运行时新表与 artifact_read_states 扩展列。"""
+    async with engine.connect() as connection:
+        table_names = await connection.run_sync(lambda sync: inspect(sync).get_table_names())
+        artifact_constraints = await connection.run_sync(
+            lambda sync: inspect(sync).get_unique_constraints("agent_artifacts")
+        )
+        draft_constraints = await connection.run_sync(
+            lambda sync: inspect(sync).get_unique_constraints("artifact_drafts")
+        )
+        step_foreign_keys = await connection.run_sync(
+            lambda sync: inspect(sync).get_foreign_keys("agent_steps")
+        )
+        version_columns = await connection.run_sync(
+            lambda sync: inspect(sync).get_columns("agent_artifact_versions")
+        )
+        tool_call_constraints = await connection.run_sync(
+            lambda sync: inspect(sync).get_unique_constraints("agent_tool_calls")
+        )
+        reconciliation_foreign_keys = await connection.run_sync(
+            lambda sync: inspect(sync).get_foreign_keys("agent_tool_call_reconciliations")
+        )
+        cache_constraints = await connection.run_sync(
+            lambda sync: inspect(sync).get_unique_constraints("kol_detail_cache")
+        )
+        read_state_constraints = await connection.run_sync(
+            lambda sync: inspect(sync).get_unique_constraints("artifact_read_states")
+        )
+        read_state_columns = await connection.run_sync(
+            lambda sync: inspect(sync).get_columns("artifact_read_states")
+        )
+
+    for table in (
+        "agent_sessions",
+        "agent_messages",
+        "agent_runs",
+        "agent_run_attempts",
+        "agent_steps",
+        "agent_tool_calls",
+        "evidence_items",
+        "agent_events",
+        "agent_tool_call_reconciliations",
+        "memory_entries",
+        "agent_artifacts",
+        "artifact_drafts",
+        "artifact_draft_revisions",
+        "artifact_review_batches",
+        "artifact_review_items",
+        "artifact_review_attempts",
+        "agent_artifact_versions",
+        "artifact_events",
+        "kol_detail_cache",
+    ):
+        assert table in table_names
+
+    assert "uq_agent_artifacts_session_key" in {item["name"] for item in artifact_constraints}
+    assert "uq_artifact_drafts_artifact" in {item["name"] for item in draft_constraints}
+
+    step_fk_targets = {
+        tuple(item["constrained_columns"]): item["referred_table"] for item in step_foreign_keys
+    }
+    assert step_fk_targets[("attempt_id",)] == "agent_run_attempts"
+
+    version_by_name = {item["name"]: item for item in version_columns}
+    assert "source_draft_revision_id" in version_by_name
+    assert "parent_artifact_version_id" in version_by_name
+
+    assert "uq_agent_tool_calls_logical_call_id" in {
+        item["name"] for item in tool_call_constraints
+    }
+    reconciliation_targets = {
+        tuple(item["constrained_columns"]): item["referred_table"]
+        for item in reconciliation_foreign_keys
+    }
+    assert reconciliation_targets[("tool_call_id",)] == "agent_tool_calls"
+
+    assert "uq_kol_detail_cache_user_session_platform_kol" in {
+        item["name"] for item in cache_constraints
+    }
+
+    read_state_names = {item["name"] for item in read_state_constraints}
+    assert "uq_artifact_read_states_user_session_module_v2" in read_state_names
+    assert "uq_artifact_read_states_user_session_module" in read_state_names
+    v2_constraint = next(
+        item
+        for item in read_state_constraints
+        if item["name"] == "uq_artifact_read_states_user_session_module_v2"
+    )
+    assert v2_constraint["column_names"] == ["user_id", "session_id", "module"]
+    read_state_by_name = {item["name"]: item for item in read_state_columns}
+    for column in ("module", "last_seen_sequence", "updated_at"):
+        assert column in read_state_by_name
+    for column in ("module_key", "last_seen_artifact_id", "seen_at"):
+        assert column in read_state_by_name
 
 
 def _run_alembic(*args: str) -> None:
