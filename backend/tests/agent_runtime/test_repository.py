@@ -305,7 +305,7 @@ async def test_begin_attempt_rejects_run_with_cancel_requested(
     assert str(exc_info.value) == "run_cancel_requested"
 
 
-@pytest.mark.parametrize("status", ["queued", "paused", "reviewing"])
+@pytest.mark.parametrize("status", ["queued", "paused"])
 async def test_claim_lease_requires_running_state(
     db_session, user_factory, status
 ) -> None:
@@ -320,6 +320,27 @@ async def test_claim_lease_requires_running_state(
     assert await repo.claim_lease(run_id, "worker-a", 300) is False
     run = await db_session.get(AgentRun, run_id)
     assert run.lease_owner is None
+
+
+async def test_claim_lease_on_reviewing_keeps_reviewing_state(
+    db_session, user_factory
+) -> None:
+    """reviewing 接管（§5.5）：租约过期的 reviewing Run 可被领取，且状态保持
+    reviewing（不拉回 running）——由引擎继续未完成的复核。"""
+    user_id, run_id = await _create_queued_run(db_session, user_factory)
+    repo = AgentRunRepository(db_session)
+    await repo.begin_attempt(run_id)
+    await repo.claim_lease(run_id, "worker-a", 300)
+    await repo.transition(run_id, RunStatus.REVIEWING, worker_id="worker-a")
+    run = await db_session.get(AgentRun, run_id)
+    run.lease_expires_at = utc_now() - timedelta(seconds=10)
+    await db_session.flush()
+
+    assert await repo.claim_lease(run_id, "worker-b", 300) is True
+    run = await db_session.get(AgentRun, run_id)
+    assert run.status == RunStatus.REVIEWING
+    assert run.lease_owner == "worker-b"
+    assert run.lease_expires_at > utc_now()
 
 
 async def test_cancel_from_queued(db_session, user_factory) -> None:

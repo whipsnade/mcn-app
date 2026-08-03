@@ -1,4 +1,5 @@
-"""统一 Session Agent Engine（设计文档 §四 / §4.1 / §七 / §11.3 / Task 14）。
+"""统一 Session Agent Engine（设计文档 §四 / §4.1 / §七 / §11.3 / Task 14；
+v3 加固 §5.4/§5.5）。
 
 ``AgentEngine.run`` 是模型主导的统一决策循环：反复 build context → model
 decide → 分发四种动作（ask_user / call_tool / submit_review / complete），
@@ -8,6 +9,18 @@ decide → 分发四种动作（ask_user / call_tool / submit_review / complete�
 **引擎是业务无关的**：不维护品牌/活动/KOL 阶段清单、固定工具顺序或
 GoalPolicy；模型决定一切业务流程。代码只保留能力边界、状态、计费、证据、
 校验与审计。
+
+v3 加固（§5.5）在循环内落实三条不变量：
+
+- **租约心跳**：``RunLeaseHeartbeat``（独立 DB Session，每 lease/3 续租）覆盖
+  decide / MCP / Reviewer 长调用全程；发布 Artifact 与写 Run 终态前必须再次
+  确认租约持有，丢失则安静退出（不发布、不写终态），交还接管方；
+- **取消收口**：每轮循环顶、decide 返回后、工具外发前、Reviewer 返回后检查
+  ``cancel_requested``，收口为恰好一个 ``run.cancelled`` 终态事件；decide
+  返回后取消已到达时不得落任何 assistant 消息；
+- **reviewing 接管**：Run 以 reviewing 进入引擎时（复核期间崩溃恢复），读取
+  既有 Review Batch/Item/Attempt 与当前 Draft Revision 继续复核——已 approve
+  的 Item 不重审，发布幂等（重复接管不产生重复 Version/事件）。
 """
 
 from __future__ import annotations
@@ -15,7 +28,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
@@ -40,6 +54,7 @@ from app.agent_artifacts.models import (
 from app.agent_artifacts.service import ArtifactService
 from app.agent_runtime.context import SessionContextBuilder
 from app.agent_runtime.events import AgentEventStream
+from app.agent_runtime.heartbeat import RunLeaseHeartbeat
 from app.agent_runtime.models import (
     AgentMessage,
     AgentRun,
@@ -107,6 +122,7 @@ class AgentEngine:
         context_builder: SessionContextBuilder | None = None,
         channel_permissions: Iterable[str] = (),
         lease_seconds: int = 300,
+        session_factory: Callable[[], AbstractAsyncContextManager[AsyncSession]] | None = None,
     ) -> None:
         self._db = db
         self._gateway = gateway
@@ -119,6 +135,15 @@ class AgentEngine:
         self._service = ArtifactService(db)
         self._context_builder = context_builder or SessionContextBuilder(db, registry)
         self._channel_permissions = tuple(channel_permissions or ())
+        if session_factory is None:
+            # 缺省心跳会话与引擎共享（测试注入）；生产必须经 main.engine_factory
+            # 传入独立 SessionFactory，心跳续租才能真实提交并对其他连接可见。
+            @asynccontextmanager
+            async def _shared_session() -> Any:
+                yield db
+
+            session_factory = _shared_session
+        self._session_factory = session_factory
 
     # ------------------------------------------------------------------ #
     # 主循环
@@ -132,108 +157,156 @@ class AgentEngine:
         profile: AgentProfile,
         messages: list[ChatMessage],
         thinking_sink: Any = None,
+        resume_step: AgentStep | None = None,
+        resumed_by: str | None = None,
     ) -> RunOutcome:
-        """执行一次用户 Run：直到终态 / clarification / paused / cancelled。"""
+        """执行一次用户 Run：直到终态 / clarification / paused / cancelled。
+
+        ``resume_step`` 是 transcript 重建发现的崩溃残留 tool_call Step
+        （外发后 / settle 前崩溃）：模型重新发起相同调用时复用它（同一
+        ``logical_call_id``，协调器幂等回放，绝不重发、不重复扣费）。
+        ``resumed_by`` 区分本次执行是首次启动（None）、用户主动 resume
+        （``"user"``）还是系统接管（``"system"``），供 run.resumed 事件归因。
+        """
         conversation = list(messages)
         user_question = self._current_user_question(conversation)
         next_sequence = await self._next_step_sequence(run.id)
-        await self._emit_run_started(run, attempt_id)
-        consecutive_invalid = 0
         assistant_message_id: str | None = None
 
-        while await self._is_running(run):
-            # 续租：长 Attempt（最长 30 分钟）期间租约不能过期，否则 pause 静默
-            # 失效、终态迁移抛 run_lease_not_held。续租失败视为不可恢复系统错误。
-            if not await self._renew_lease(run):
-                await self._fail_run(run)
-                break
-            if await self._guard_attempt_limits(run, attempt_id):
+        # 租约心跳（§5.5）：独立 DB Session 每 lease/3 续租，覆盖 decide /
+        # MCP / Reviewer 长调用全程；心跳丢失后发布/终态写入前的再确认会拦住。
+        heartbeat = RunLeaseHeartbeat(
+            session_factory=self._session_factory,
+            run_id=run.id,
+            worker_id=self._worker_id,
+            lease_seconds=self._lease_seconds,
+        )
+        await heartbeat.start()
+        try:
+            fresh = await self._repo.lock_run(run.id)
+            if RunStatus(fresh.status) == RunStatus.REVIEWING:
+                # reviewing 接管（复核期间崩溃恢复）：继续未完成的复核——已
+                # approve 的 Item 不重审，pending/revise 继续，原子发布幂等。
                 await self._events.append(
-                    run.id, run.user_id, "run.paused", {"attempt_id": attempt_id}
+                    run.id,
+                    run.user_id,
+                    "run.resumed",
+                    {"resumed_by": resumed_by or "system", "reviewing": True},
                 )
-                break
-            if await self._cancel_requested(run):
-                await self._repo.cancel(run.id, run.user_id)
-                await self._events.append(run.id, run.user_id, "run.cancelled", {})
-                break
-
-            context = await self._build_context(run, profile, conversation, user_question)
-            try:
-                action = await self._gateway.decide(
-                    run=run,
-                    attempt_id=attempt_id,
-                    profile=profile,
-                    messages=context,
-                    thinking_sink=thinking_sink,
-                    step_sequence=next_sequence,
+                settled, published_message_id = await self._resume_reviewing(
+                    run, conversation, user_question
                 )
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("model decision failed; failing run %s", run.id)
-                await self._fail_run(run)
-                break
-            next_sequence += 1
-            await self._count_decision(run, attempt_id)
+                if settled != "revise":
+                    return await self._outcome(run, published_message_id)
+                # revise：已打回 running 并回喂问题，落入主循环让模型修订。
+            else:
+                await self._emit_run_started(run, attempt_id, resumed_by=resumed_by)
 
-            if not self._is_known_action(action):
-                consecutive_invalid += 1
-                if consecutive_invalid >= MAX_INVALID_ACTIONS:
+            consecutive_invalid = 0
+            while await self._is_running(run):
+                # 续租：长 Attempt（最长 30 分钟）期间租约不能过期，否则 pause 静默
+                # 失效、终态迁移抛 run_lease_not_held。续租失败视为不可恢复系统错误。
+                if not await self._renew_lease(run):
                     await self._fail_run(run)
                     break
-                self._feed_validation_error(conversation, action)
-                continue
-            consecutive_invalid = 0
-            conversation.append(self._action_message(action))
+                if await self._guard_attempt_limits(run, attempt_id):
+                    await self._events.append(
+                        run.id, run.user_id, "run.paused", {"attempt_id": attempt_id}
+                    )
+                    break
+                # 取消检查点 1：每轮循环顶。
+                if await self._cancel_requested(run):
+                    await self._settle_cancelled(run)
+                    break
 
-            if action.action == "ask_user":
-                message = await self._handle_ask_user(run, action)
-                assistant_message_id = message.id
-                break
-            if action.action == "call_tool":
-                call_result = await self._handle_call_tool(
-                    run=run,
-                    attempt_id=attempt_id,
-                    profile=profile,
-                    action=action,
-                    conversation=conversation,
-                    step_sequence=next_sequence,
-                )
+                context = await self._build_context(run, profile, conversation, user_question)
+                try:
+                    action = await self._gateway.decide(
+                        run=run,
+                        attempt_id=attempt_id,
+                        profile=profile,
+                        messages=context,
+                        thinking_sink=thinking_sink,
+                        step_sequence=next_sequence,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("model decision failed; failing run %s", run.id)
+                    await self._fail_run(run)
+                    break
                 next_sequence += 1
-                if call_result == "cancelled":
-                    # decide→dispatch 间隙收到取消：不发起新调用，直接收口 cancelled
-                    await self._repo.cancel(run.id, run.user_id)
-                    await self._events.append(run.id, run.user_id, "run.cancelled", {})
-                    break
-                continue
-            if action.action == "submit_review":
-                settled, published_message_id = await self._handle_submit_review(
-                    run=run,
-                    action=action,
-                    conversation=conversation,
-                    user_question=user_question,
-                )
-                if settled == "approved":
-                    assistant_message_id = published_message_id or assistant_message_id
-                    break
-                if settled == "rejected":
-                    break
-                continue  # revise / lineage 错误 → 模型修正后继续
-            if action.action == "complete":
-                message = await self._handle_complete(run, action)
-                assistant_message_id = message.id
-                break
+                await self._count_decision(run, attempt_id)
 
-        final = await self._db.get(AgentRun, run.id)
-        final_status = (
-            RunStatus(final.status) if final is not None else RunStatus.FAILED
-        )
-        return RunOutcome(
-            run_id=run.id,
-            status=final_status,
-            decision_count=run.decision_count,
-            assistant_message_id=assistant_message_id,
-        )
+                if not self._is_known_action(action):
+                    consecutive_invalid += 1
+                    if consecutive_invalid >= MAX_INVALID_ACTIONS:
+                        await self._fail_run(run)
+                        break
+                    self._feed_validation_error(conversation, action)
+                    continue
+                consecutive_invalid = 0
+
+                # 取消检查点 2 + 租约再确认（§5.5）：decide（长模型调用）返回后、
+                # 动作分发前重查运行态——取消已到达则不得落任何 assistant 产物
+                # （消息 / 工具外发 / 提交复核）；租约被接管则安静退出。
+                gate = await self._post_decision_gate(run)
+                if gate == "cancelled":
+                    await self._settle_cancelled(run)
+                    break
+                if gate == "lease_lost":
+                    logger.info(
+                        "run %s lease lost after decide; worker %s stops",
+                        run.id,
+                        self._worker_id,
+                    )
+                    break
+
+                conversation.append(self._action_message(action))
+
+                if action.action == "ask_user":
+                    message = await self._handle_ask_user(run, action)
+                    assistant_message_id = message.id
+                    break
+                if action.action == "call_tool":
+                    call_result = await self._handle_call_tool(
+                        run=run,
+                        attempt_id=attempt_id,
+                        profile=profile,
+                        action=action,
+                        conversation=conversation,
+                        step_sequence=next_sequence,
+                        resume_step=resume_step,
+                    )
+                    if call_result == "resumed":
+                        resume_step = None  # 崩溃残留 Step 已复用收口，只用一次
+                    next_sequence += 1
+                    if call_result == "cancelled":
+                        # decide→dispatch 间隙收到取消：不发起新调用，直接收口 cancelled
+                        await self._settle_cancelled(run)
+                        break
+                    continue
+                if action.action == "submit_review":
+                    settled, published_message_id = await self._handle_submit_review(
+                        run=run,
+                        action=action,
+                        conversation=conversation,
+                        user_question=user_question,
+                    )
+                    if settled == "approved":
+                        assistant_message_id = published_message_id or assistant_message_id
+                        break
+                    if settled in ("rejected", "cancelled", "lease_lost"):
+                        break
+                    continue  # revise / lineage 错误 → 模型修正后继续
+                if action.action == "complete":
+                    message = await self._handle_complete(run, action)
+                    assistant_message_id = message.id
+                    break
+        finally:
+            await heartbeat.stop()
+
+        return await self._outcome(run, assistant_message_id)
 
     # ------------------------------------------------------------------ #
     # 四种动作
@@ -283,12 +356,19 @@ class AgentEngine:
         action: Any,
         conversation: list[ChatMessage],
         step_sequence: int,
+        resume_step: AgentStep | None = None,
     ) -> str:
         """call_tool：可见性校验 → 外发前持久化 Step → 执行 → 结果回喂消息列表。
 
         ``InsufficientPointsError`` 作为结构化工具错误回喂模型（§11.3），
-        不崩溃；已 settled 调用正常结算。返回 ``"cancelled"``（decide→dispatch
-        间隙收到取消，未发起调用）或 ``"ok"``。
+        不崩溃；已 settled 调用正常结算。返回 ``"ok"``（新建 Step 执行）、
+        ``"resumed"``（复用崩溃残留 Step 执行）或 ``"cancelled"``
+        （decide→dispatch 间隙收到取消，未发起调用）。
+
+        **崩溃重续（§5.4）**：``resume_step`` 是 transcript 重建发现的 running
+        残留 Step；当本次动作的工具名与参数与其完全一致时复用该 Step——
+        step_id 不变 → ``logical_call_id`` 不变 → 协调器按行幂等回放，
+        绝不重复外发、不重复扣费（防重不依赖模型记忆）。
         """
         visible = await self._registry.visible_tools(
             profile, channel_permissions=self._channel_permissions
@@ -305,28 +385,36 @@ class AgentEngine:
             )
             return "ok"
 
-        step = AgentStep(
-            id=str(uuid4()),
-            run_id=run.id,
-            attempt_id=attempt_id,
-            sequence=step_sequence,
-            step_type="tool_call",
-            input_json={
-                "internal_tool_name": action.internal_tool_name,
-                "arguments": action.arguments,
-            },
-            status="running",
-            visibility=run.visibility,
-            created_at=utc_now(),
-        )
-        self._db.add(step)
-        await self._db.flush()
-        await self._events.append(
-            run.id,
-            run.user_id,
-            "tool.started",
-            {"internal_tool_name": action.internal_tool_name},
-        )
+        resumed = self._match_resume_step(resume_step, action)
+        if resumed is not None:
+            # 复用崩溃残留 Step：审计归属切换到当前 Attempt；不重复发
+            # tool.started（崩溃前已发出，事件流是持久的）。
+            step = resumed
+            step.attempt_id = attempt_id
+            await self._db.flush()
+        else:
+            step = AgentStep(
+                id=str(uuid4()),
+                run_id=run.id,
+                attempt_id=attempt_id,
+                sequence=step_sequence,
+                step_type="tool_call",
+                input_json={
+                    "internal_tool_name": action.internal_tool_name,
+                    "arguments": action.arguments,
+                },
+                status="running",
+                visibility=run.visibility,
+                created_at=utc_now(),
+            )
+            self._db.add(step)
+            await self._db.flush()
+            await self._events.append(
+                run.id,
+                run.user_id,
+                "tool.started",
+                {"internal_tool_name": action.internal_tool_name},
+            )
 
         # §11.3：decide（长模型调用）期间用户取消 → 外发前再核对一次，
         # 已请求取消则绝不发起新调用。
@@ -399,7 +487,7 @@ class AgentEngine:
             },
         )
         self._feed_tool_result(conversation, result)
-        return "ok"
+        return "resumed" if resumed is not None else "ok"
 
     async def _handle_submit_review(
         self,
@@ -409,11 +497,11 @@ class AgentEngine:
         conversation: list[ChatMessage],
         user_question: str,
     ) -> tuple[str, str | None]:
-        """submit_review：lineage 校验 → 建/复用 Batch → Reviewer 收口。
+        """submit_review：lineage 校验 → 建/复用 Batch → 转 reviewing → 收口。
 
         返回 ``(settled, assistant_message_id)``：``settled`` 取
-        ``approved`` / ``rejected``（终态）或 ``revise``（继续循环）；
-        approve 时附带已发布消息 id（供 RunOutcome 回传）。
+        ``approved`` / ``rejected`` / ``cancelled`` / ``lease_lost``（终态
+        或交还接管方）或 ``revise``（继续循环）；approve 时附带已发布消息 id。
         """
         for draft_id in action.artifact_draft_ids:
             error = await self._validate_draft_lineage(run, draft_id)
@@ -443,8 +531,67 @@ class AgentEngine:
             "review.started",
             {"review_batch_id": batch.id, "artifact_ids": list(action.artifact_draft_ids)},
         )
+        return await self._settle_review(
+            run=run,
+            batch=batch,
+            conversation=conversation,
+            user_question=user_question,
+        )
 
+    async def _resume_reviewing(
+        self,
+        run: AgentRun,
+        conversation: list[ChatMessage],
+        user_question: str,
+    ) -> tuple[str, str | None]:
+        """reviewing 接管（§5.5）：读取既有 Batch/Item/Attempt 继续复核。
+
+        复核期间崩溃后，Run 以 reviewing 被新 worker 领取进入引擎。既有
+        Review Batch/Item/Attempt 与当前 Draft Revision 是唯一事实来源：
+        已 approve 的 Item 由 ``review_pending`` 自动跳过（不重审），
+        pending/revise 的继续复核，完成后走原有原子发布（重复接管不产生
+        重复 Version/事件）。
+        """
+        if await self._cancel_requested(run):
+            await self._settle_cancelled(run)
+            return "cancelled", None
+        batch = await self._db.scalar(
+            select(ArtifactReviewBatch).where(
+                ArtifactReviewBatch.parent_run_id == run.id
+            )
+        )
+        if batch is None or batch.status in ("completed", "failed"):
+            # 不变量破坏：reviewing 但无可复核 Batch——按系统错误干净收口，
+            # 绝不卡在 reviewing。
+            logger.error(
+                "reviewing run %s has no active review batch; failing", run.id
+            )
+            await self._fail_run(run)
+            return "failed", None
+        return await self._settle_review(
+            run=run,
+            batch=batch,
+            conversation=conversation,
+            user_question=user_question,
+        )
+
+    async def _settle_review(
+        self,
+        *,
+        run: AgentRun,
+        batch: ArtifactReviewBatch,
+        conversation: list[ChatMessage],
+        user_question: str,
+    ) -> tuple[str, str | None]:
+        """Reviewer 复核与收口（submit_review 与 reviewing 接管共用）。
+
+        ``settled`` 取值：``approved``（已原子发布）、``rejected``（reject 或
+        Reviewer/发布异常，Run failed）、``revise``（打回 running 继续循环）、
+        ``cancelled``（Reviewer 返回后发现取消：不发布，释放 Draft 收口）、
+        ``lease_lost``（发布前租约丢失：不发布、不写终态，交还接管方）。
+        """
         try:
+            # 只审需要复核的 Item：已 approve 且 Revision 未变的自动跳过（不重审）。
             results = await self._reviewer.review_pending(
                 parent_run=run, batch=batch, user_question=user_question
             )
@@ -452,8 +599,14 @@ class AgentEngine:
             raise
         except Exception:
             logger.exception("reviewer failed for run %s; failing run", run.id)
-            await self._abort_review(run, action)
+            await self._abort_review(run, batch)
             return "rejected", None
+
+        # 取消检查点：Reviewer（长调用）返回后——不发布/不打回，释放 Draft
+        # working head（idle），收口为恰好一个 run.cancelled 终态事件。
+        if await self._cancel_requested(run):
+            await self._settle_cancelled(run)
+            return "cancelled", None
 
         decisions = {result.decision for result in results}
         if "reject" in decisions:
@@ -477,16 +630,28 @@ class AgentEngine:
             )
             return "revise", None
 
-        await self._events.append(
-            run.id, run.user_id, "review.approved", {"review_batch_id": batch.id}
-        )
+        # 全 approve。results 为空说明是重复接管（全部 Item 早已 approve，
+        # review.approved 事件此前已发）——幂等：不重复发事件、不重复复核。
+        if results:
+            await self._events.append(
+                run.id, run.user_id, "review.approved", {"review_batch_id": batch.id}
+            )
+        # 发布前再次确认租约持有（§5.5）：丢失则不发布、不写终态，安静交还
+        # 接管方——绝不出现两个 worker 并发发布。
+        if not await self._repo.holds_lease(run.id, self._worker_id):
+            logger.info(
+                "run %s lease lost before publish; worker %s skips publish",
+                run.id,
+                self._worker_id,
+            )
+            return "lease_lost", None
         try:
             await self._service.publish_batch(batch.id, worker_id=self._worker_id)
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception("publish_batch failed for run %s; failing run", run.id)
-            await self._abort_review(run, action)
+            await self._abort_review(run, batch)
             return "rejected", None
         await self._events.append(
             run.id, run.user_id, "run.completed", {"outcome": "completed"}
@@ -571,17 +736,114 @@ class AgentEngine:
             logger.exception("lease renewal failed for run %s", run.id)
             return False
 
-    async def _abort_review(self, run: AgentRun, action: Any) -> None:
+    async def _abort_review(self, run: AgentRun, batch: ArtifactReviewBatch) -> None:
         """Reviewer/发布异常时的收口：先释放 working head，再让 Run 失败。"""
         try:
             await self._reviewer.cancel_reviewing(
                 run_id=run.id,
-                draft_ids=action.artifact_draft_ids,
+                draft_ids=await self._batch_draft_ids(batch),
                 outcome="failed",
             )
         except Exception:
             logger.exception("cancel_reviewing failed for run %s", run.id)
         await self._fail_run(run)
+
+    async def _settle_cancelled(self, run: AgentRun) -> None:
+        """取消收口：释放本 Run 持有的 Draft（idle）→ 迁移 cancelled → 发恰好一个
+        run.cancelled 终态事件。
+
+        已被收口（API 立即取消路径或其他 worker）时幂等跳过——同一 Run 全
+        局恰好一个 ``run.cancelled`` 事件。
+        """
+        fresh = await self._repo.lock_run(run.id)
+        if RunStatus(fresh.status) == RunStatus.CANCELLED:
+            return
+        await self._release_owned_drafts(run)
+        cancelled = await self._repo.cancel(run.id, run.user_id)
+        if cancelled:
+            await self._events.append(run.id, run.user_id, "run.cancelled", {})
+
+    async def _release_owned_drafts(self, run: AgentRun) -> None:
+        """释放本 Run 持有的全部 Draft working head（idle），保留不可变 Revision
+        ——cancelled 出口不得让 Artifact 永久 busy（§5.7）。"""
+        drafts = (
+            await self._db.scalars(
+                select(ArtifactDraft).where(ArtifactDraft.owner_run_id == run.id)
+            )
+        ).all()
+        if not drafts:
+            return
+        await self._reviewer.cancel_reviewing(
+            run_id=run.id,
+            draft_ids=[draft.id for draft in drafts],
+            outcome="idle",
+        )
+
+    async def _batch_draft_ids(self, batch: ArtifactReviewBatch) -> list[str]:
+        """Batch 全部 Item 对应的 Draft id 列表（release/abort 用）。"""
+        items = (
+            await self._db.scalars(
+                select(ArtifactReviewItem).where(
+                    ArtifactReviewItem.batch_id == batch.id
+                )
+            )
+        ).all()
+        draft_ids: list[str] = []
+        for item in items:
+            draft = await self._db.scalar(
+                select(ArtifactDraft).where(
+                    ArtifactDraft.artifact_id == item.artifact_id
+                )
+            )
+            if draft is not None:
+                draft_ids.append(draft.id)
+        return draft_ids
+
+    async def _post_decision_gate(self, run: AgentRun) -> str:
+        """decide 返回后、动作分发前的运行态闸门（§5.5）。
+
+        返回 ``"ok"`` / ``"cancelled"`` / ``"lease_lost"``：取消已到达则禁止
+        分发（不落 assistant 消息、不外发工具、不提交复核）；租约被其他
+        worker 接管则安静退出（旧 worker 不得再写任何 Run 状态）。
+        """
+        fresh = await self._repo.lock_run(run.id)
+        if fresh.cancel_requested:
+            return "cancelled"
+        if RunStatus(fresh.status) != RunStatus.RUNNING:
+            return "lease_lost"
+        if not AgentRunRepository.owns_active_lease(fresh, self._worker_id):
+            return "lease_lost"
+        return "ok"
+
+    async def _outcome(
+        self, run: AgentRun, assistant_message_id: str | None
+    ) -> RunOutcome:
+        """读取最新 Run 状态组装 RunOutcome（引擎出口统一收口）。"""
+        final = await self._db.get(AgentRun, run.id)
+        final_status = (
+            RunStatus(final.status) if final is not None else RunStatus.FAILED
+        )
+        return RunOutcome(
+            run_id=run.id,
+            status=final_status,
+            decision_count=run.decision_count,
+            assistant_message_id=assistant_message_id,
+        )
+
+    @staticmethod
+    def _match_resume_step(
+        resume_step: AgentStep | None, action: Any
+    ) -> AgentStep | None:
+        """崩溃残留 Step 复用匹配：工具名与参数完全一致才复用（同一
+        ``logical_call_id`` 幂等回放）；不匹配则新建 Step 正常外发。"""
+        if resume_step is None:
+            return None
+        input_json = resume_step.input_json or {}
+        if input_json.get("internal_tool_name") != action.internal_tool_name:
+            return None
+        if (input_json.get("arguments") or {}) != dict(action.arguments):
+            return None
+        return resume_step
 
     async def _count_decision(self, run: AgentRun, attempt_id: str) -> None:
         run.decision_count += 1
@@ -792,14 +1054,19 @@ class AgentEngine:
     # 审计辅助
     # ------------------------------------------------------------------ #
 
-    async def _emit_run_started(self, run: AgentRun, attempt_id: str) -> None:
+    async def _emit_run_started(
+        self, run: AgentRun, attempt_id: str, *, resumed_by: str | None = None
+    ) -> None:
         attempt = await self._db.get(AgentRunAttempt, attempt_id)
         if attempt is not None and attempt.attempt > 1:
+            # resumed_by 由执行器按领取路径归因：用户主动 resume（"user"，
+            # NULL 租约沿用 open Attempt）或系统接管（"system"，过期租约
+            # pause+重建）；引擎直接调用未归因时按系统接管处理。
             await self._events.append(
                 run.id,
                 run.user_id,
                 "run.resumed",
-                {"attempt": attempt.attempt},
+                {"attempt": attempt.attempt, "resumed_by": resumed_by or "system"},
             )
             return
         await self._events.append(

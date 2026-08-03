@@ -89,18 +89,19 @@ class AgentRunRepository:
         *,
         now: datetime | None = None,
     ) -> bool:
-        """抢占租约；只允许已 running 的 Run（Attempt 必须先存在）。
+        """抢占租约；只允许 running / reviewing 的 Run（Attempt 必须先存在）。
 
-        拒绝终态、clarification、取消请求、他人未过期租约。对 paused/queued/reviewing
-        一律返回 False：paused 只能由用户经 begin_attempt(resumed=True) 恢复并重建
-        Attempt，reviewing 不能因租约接管被拉回 running。
+        拒绝终态、clarification、取消请求、他人未过期租约。对 paused/queued
+        一律返回 False：paused 只能由用户经 begin_attempt(resumed=True) 恢复并
+        重建 Attempt。reviewing 接管（复核期间崩溃恢复，§5.5）保持 reviewing
+        状态——由引擎继续未完成的复核，不把 Run 拉回 running。
         ``now`` 仅供测试注入确定性时钟做精确到期断言；其余方法统一走模块
         ``utc_now()``（同样可 monkeypatch）。
         """
         now = now or utc_now()
         run = await self.lock_run(run_id)
         current = RunStatus(run.status)
-        if current != RunStatus.RUNNING:
+        if current not in (RunStatus.RUNNING, RunStatus.REVIEWING):
             return False
         if run.cancel_requested:
             return False
@@ -111,11 +112,16 @@ class AgentRunRepository:
         run.lease_owner = worker_id
         run.lease_expires_at = now + timedelta(seconds=lease_seconds)
         run.heartbeat_at = now
-        run.status = RunStatus.RUNNING
-        run.started_at = run.started_at or now
-        run.paused_at = None
+        if current == RunStatus.RUNNING:
+            run.started_at = run.started_at or now
+            run.paused_at = None
         await self.db.flush()
         return True
+
+    async def holds_lease(self, run_id: str, worker_id: str) -> bool:
+        """当前是否仍持有该 Run 的活跃租约（发布/终态写入前的再确认，§5.5）。"""
+        run = await self.lock_run(run_id)
+        return self.owns_active_lease(run, worker_id)
 
     async def renew_lease(
         self,
@@ -128,12 +134,12 @@ class AgentRunRepository:
         """续租：只有当前活跃租约持有者可延长；无租约/过期/他人持有返回 False。
 
         Task 14 硬化：引擎在每个决策循环顶调用，避免长 Attempt（最长 30 分钟）
-        期间租约过期导致 ``pause`` / ``transition`` 静默失效（``_owns_active_lease``
+        期间租约过期导致 ``pause`` / ``transition`` 静默失效（``owns_active_lease``
         为 False 时 pause 返回 False、transition 抛 run_lease_not_held）。
         """
         now = now or utc_now()
         run = await self.lock_run(run_id)
-        if not self._owns_active_lease(run, worker_id):
+        if not self.owns_active_lease(run, worker_id):
             return False
         run.lease_expires_at = now + timedelta(seconds=lease_seconds)
         run.heartbeat_at = now
@@ -172,7 +178,7 @@ class AgentRunRepository:
     async def pause(self, run_id: str, worker_id: str) -> bool:
         """运行达到阈值后暂停：释放租约、结束当前 Attempt（outcome=paused）。"""
         run = await self.lock_run(run_id)
-        if not self._owns_active_lease(run, worker_id):
+        if not self.owns_active_lease(run, worker_id):
             return False
         ensure_transition(RunStatus(run.status), RunStatus.PAUSED)
         now = utc_now()
@@ -190,7 +196,7 @@ class AgentRunRepository:
         """按状态机迁移 Run 状态；仅活跃租约持有者可迁移，终态/暂停做 Attempt 收尾。"""
         run = await self.lock_run(run_id)
         ensure_transition(RunStatus(run.status), target)
-        if not self._owns_active_lease(run, worker_id):
+        if not self.owns_active_lease(run, worker_id):
             raise InvalidRunTransition("run_lease_not_held")
         now = utc_now()
         run.status = target
@@ -262,7 +268,8 @@ class AgentRunRepository:
             open_attempt.outcome = outcome
 
     @staticmethod
-    def _owns_active_lease(run: AgentRun, worker_id: str) -> bool:
+    def owns_active_lease(run: AgentRun, worker_id: str) -> bool:
+        """run 当前是否由 worker_id 持有未过期租约（发布/终态写入前的再确认）。"""
         return (
             run.lease_owner == worker_id
             and run.lease_expires_at is not None

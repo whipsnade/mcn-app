@@ -98,6 +98,9 @@ def create_agent_runtime(*, stuck_seconds: float | None = None) -> tuple[
             reviewer=ReviewerDriver(db, gateway, worker_id=worker_id),
             worker_id=worker_id,
             channel_permissions=channel_permissions,
+            # 租约心跳（§5.5）：独立 Session 真实提交续租，覆盖 decide/MCP/
+            # Reviewer 长调用；缺省共享会话只用于测试注入。
+            session_factory=SessionFactory,
         )
 
     executor = AgentRunExecutor(

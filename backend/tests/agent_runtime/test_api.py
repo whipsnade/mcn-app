@@ -23,7 +23,13 @@ from sqlalchemy import delete, select, update
 from app.agent_artifacts.models import AgentArtifact, ArtifactDraft
 from app.agent_runtime.events import AgentEventStream
 from app.agent_runtime.kol_detail import KolDetailRunService
-from app.agent_runtime.models import AgentMessage, AgentRun, AgentRunAttempt, AgentSession
+from app.agent_runtime.models import (
+    AgentEvent,
+    AgentMessage,
+    AgentRun,
+    AgentRunAttempt,
+    AgentSession,
+)
 from app.agent_runtime.repository import AgentRunRepository, utc_now
 from app.core.security import create_access_token
 from app.db.session import SessionFactory, get_db
@@ -511,6 +517,13 @@ async def test_resume_only_when_paused_creates_new_attempt(
     refused = await alice.post(f"/api/v1/agent/runs/{queued.id}/resume")
     assert refused.status_code == 409
 
+    # 活动 Run 存在时 resume 被互斥拒绝（§5.5 单活动主 Run）；先取消 queued Run
+    blocked = await alice.post(f"/api/v1/agent/runs/{paused.id}/resume")
+    assert blocked.status_code == 409
+    assert blocked.json()["detail"] == "active_run_in_progress"
+    cancelled = await alice.post(f"/api/v1/agent/runs/{queued.id}/cancel")
+    assert cancelled.status_code == 200
+
     # paused 恢复 → 200，新 Attempt 递增
     resumed = await alice.post(f"/api/v1/agent/runs/{paused.id}/resume")
     assert resumed.status_code == 200
@@ -550,6 +563,136 @@ async def test_resume_cancelled_run_maps_distinct_code(
     resp = await alice.post(f"/api/v1/agent/runs/{cancelled.id}/resume")
     assert resp.status_code == 409
     assert resp.json()["detail"] == "run_cancel_requested"
+
+
+# ---------------------------------------------------------------------------
+# 取消语义（v3 加固 §5.5）：queued/paused/clarification 立即取消；
+# running/reviewing 只写 cancel_requested，由 Engine 在安全点收口
+# ---------------------------------------------------------------------------
+
+
+async def _cancelled_events(db_session, run_id: str) -> list[AgentEvent]:
+    return [
+        event
+        for event in (
+            await db_session.scalars(select(AgentEvent).where(AgentEvent.run_id == run_id))
+        ).all()
+        if event.event_type == "run.cancelled"
+    ]
+
+
+async def test_cancel_queued_run_cancels_immediately_with_terminal_event(
+    agent_client_factory, db_session
+) -> None:
+    """queued Run：API 立即迁移 cancelled 并写恰好一个 run.cancelled 终态事件。"""
+    executor = FakeExecutor()
+    alice, _ = await agent_client_factory("13600000091", executor=executor)
+    session_id = await _create_session(alice)
+    run_id = (await _post_message(alice, session_id, "分析")).json()["run_id"]
+
+    resp = await alice.post(f"/api/v1/agent/runs/{run_id}/cancel")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "cancelled"
+    assert len(await _cancelled_events(db_session, run_id)) == 1
+
+    # 已终态再取消幂等：不重复写事件
+    again = await alice.post(f"/api/v1/agent/runs/{run_id}/cancel")
+    assert again.status_code == 200
+    assert len(await _cancelled_events(db_session, run_id)) == 1
+
+
+async def test_cancel_paused_run_cancels_immediately(
+    agent_client_factory, db_session
+) -> None:
+    """paused Run：无在飞执行，API 立即取消（含终态事件）。"""
+    alice, _ = await agent_client_factory("13600000092")
+    session_id = await _create_session(alice)
+    user_id = await _me_id(alice)
+    paused = await _add_paused_run(db_session, user_id, session_id)
+
+    resp = await alice.post(f"/api/v1/agent/runs/{paused.id}/cancel")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "cancelled"
+    assert len(await _cancelled_events(db_session, paused.id)) == 1
+
+
+async def test_cancel_running_run_marks_cancel_requested_only(
+    agent_client_factory, db_session
+) -> None:
+    """running Run：API 只写 cancel_requested——不写终态、不发 run.cancelled，
+    由 Engine 在下一个安全点收口。
+    """
+    alice, _ = await agent_client_factory("13600000093")
+    session_id = await _create_session(alice)
+    user_id = await _me_id(alice)
+    now = utc_now()
+    running = await _add_run(
+        db_session,
+        user_id,
+        session_id,
+        status="running",
+        started_at=now,
+        lease_owner="worker-a",
+        lease_expires_at=now + timedelta(seconds=300),
+    )
+
+    resp = await alice.post(f"/api/v1/agent/runs/{running.id}/cancel")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "running"
+
+    fresh = await db_session.get(AgentRun, running.id)
+    assert fresh.status == "running"
+    assert fresh.cancel_requested is True
+    assert await _cancelled_events(db_session, running.id) == []
+
+
+async def test_cancel_reviewing_run_marks_cancel_requested_only(
+    agent_client_factory, db_session
+) -> None:
+    """reviewing Run：与 running 一致——只写 cancel_requested，Reviewer 返回后收口。"""
+    alice, _ = await agent_client_factory("13600000094")
+    session_id = await _create_session(alice)
+    user_id = await _me_id(alice)
+    now = utc_now()
+    reviewing = await _add_run(
+        db_session,
+        user_id,
+        session_id,
+        status="reviewing",
+        started_at=now,
+        lease_owner="worker-a",
+        lease_expires_at=now + timedelta(seconds=300),
+    )
+
+    resp = await alice.post(f"/api/v1/agent/runs/{reviewing.id}/cancel")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "reviewing"
+
+    fresh = await db_session.get(AgentRun, reviewing.id)
+    assert fresh.status == "reviewing"
+    assert fresh.cancel_requested is True
+    assert await _cancelled_events(db_session, reviewing.id) == []
+
+
+async def test_resume_rejected_when_other_active_run_exists(
+    agent_client_factory, db_session
+) -> None:
+    """resume 互斥（§5.5）：同 Session 已有其他活动 session_analyst_v1 Run
+    （queued/running/reviewing）时，恢复 paused Run 返回 409 active_run_in_progress。
+    """
+    executor = FakeExecutor()
+    alice, _ = await agent_client_factory("13600000095", executor=executor)
+    session_id = await _create_session(alice)
+    user_id = await _me_id(alice)
+    paused = await _add_paused_run(db_session, user_id, session_id)
+    await _add_run(db_session, user_id, session_id, status="running", started_at=utc_now())
+
+    resp = await alice.post(f"/api/v1/agent/runs/{paused.id}/resume")
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == "active_run_in_progress"
+    # paused Run 未被恢复，执行器未被唤醒
+    assert (await db_session.get(AgentRun, paused.id)).status == "paused"
+    assert executor.submitted == []
 
 
 async def test_run_under_archived_session_is_404(agent_client_factory) -> None:

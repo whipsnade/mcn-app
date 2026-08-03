@@ -917,7 +917,8 @@ async def test_cancel_requested_stops_new_calls_and_settles_inflight(
     )
     assert outcome.status == RunStatus.CANCELLED
     assert run.status == RunStatus.CANCELLED
-    # 第一个工具已外发并结算；第二个在 decide→dispatch 间隙被取消拦截，未外发
+    # 第一个工具已外发并结算；第二次 decide 后取消已到达，分发前被闸门拦截——
+    # 第二个工具不外发、不产生任何新 Step
     assert len(executed) == 1
     steps = (
         await db_session.scalars(
@@ -926,15 +927,25 @@ async def test_cancel_requested_stops_new_calls_and_settles_inflight(
             )
         )
     ).all()
-    assert len(steps) == 2
-    assert [step.status for step in steps] == ["completed", "failed"]
-    assert steps[1].output_json["error_type"] == "cancelled_not_sent"
+    assert len(steps) == 1
+    assert steps[0].status == "completed"
+    # 恰好一个 run.cancelled 终态事件
+    cancelled_events = [
+        row
+        for row in (
+            await db_session.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.id)
+            )
+        ).all()
+        if row.event_type == "run.cancelled"
+    ]
+    assert len(cancelled_events) == 1
 
 
 async def test_cancel_between_decide_and_dispatch_blocks_tool_call(
     db_session, user_factory
 ) -> None:
-    """decide（长模型调用）期间收到取消：外发前再核对，绝不发起工具调用（§11.3）。"""
+    """decide（长模型调用）期间收到取消：分发前闸门拦截，绝不发起工具调用（§11.3/§5.5）。"""
     run, attempt, _, _ = await _setup_run(db_session, user_factory)
     repo = AgentRunRepository(db_session)
     executed: list[Any] = []
@@ -967,16 +978,26 @@ async def test_cancel_between_decide_and_dispatch_blocks_tool_call(
     )
     assert outcome.status == RunStatus.CANCELLED
     assert run.status == RunStatus.CANCELLED
-    # 工具从未真正外发
+    # 工具从未真正外发，也未产生 tool_call Step
     assert executed == []
-    step = await db_session.scalar(
-        select(AgentStep).where(
-            AgentStep.run_id == run.id, AgentStep.step_type == "tool_call"
+    assert (
+        await db_session.scalar(
+            select(func.count(AgentStep.id)).where(
+                AgentStep.run_id == run.id, AgentStep.step_type == "tool_call"
+            )
         )
-    )
-    assert step is not None
-    assert step.status == "failed"
-    assert step.output_json["error_type"] == "cancelled_not_sent"
+    ) == 0
+    # 恰好一个 run.cancelled 终态事件
+    cancelled_events = [
+        row
+        for row in (
+            await db_session.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.id)
+            )
+        ).all()
+        if row.event_type == "run.cancelled"
+    ]
+    assert len(cancelled_events) == 1
 
 
 async def test_invalid_actions_reach_threshold_and_fail_run(

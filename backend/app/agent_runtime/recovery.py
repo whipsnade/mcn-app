@@ -2,8 +2,9 @@
 
 ``RecoveryLoop`` 周期性扫描三类积压：
 
-1. **过期租约 Run**：running 且租约已过期的 Run 重新提交给 :class:`AgentRunExecutor`
-   （新 worker 领取 + 新建 Attempt + 引擎继续），避免进程崩溃后卡死；
+1. **过期租约 Run**：running/reviewing 且租约已过期的 Run 重新提交给
+   :class:`AgentRunExecutor`（新 worker 领取 + 新建/沿用 Attempt + 引擎继续），
+   避免进程崩溃后卡死；reviewing Run 由引擎继续未完成的复核（§5.5）；
 2. **stuck running/reserved MCP 调用**：超过受控时间（``stuck_seconds``，配置
    ``AGENT_TOOL_CALL_STUCK_SECONDS``）仍处于 ``running``/``reserved`` 的调用，
    先**迁移为 unknown**（保留预留，绝不直接释放或重新外发，§5.4），再交给
@@ -124,11 +125,13 @@ class RecoveryLoop:
     # ------------------------------------------------------------------ #
 
     async def reclaim_expired_runs(self) -> tuple[str, ...]:
-        """扫描可接管的 running Run，重新提交给执行器（新 Attempt + 引擎继续）。
+        """扫描可接管的 running/reviewing Run，重新提交给执行器。
 
-        与执行器 ``_find_claimable_id`` 一致：租约过期或无租约（NULL）的 running
-        Run 都可接管——NULL 租约是 API resume 经 ``begin_attempt(resumed=True)``
-        留下的状态，执行器停止时若恢复循环也不接管会永久卡在 running。
+        与执行器 ``_find_claimable_id`` 一致：租约过期或无租约（NULL）的
+        running Run 都可接管——NULL 租约是 API resume 经
+        ``begin_attempt(resumed=True)`` 留下的状态，执行器停止时若恢复循环
+        也不接管会永久卡在 running。租约过期的 reviewing Run（复核期间崩溃，
+        §5.5）同样接管，由引擎继续未完成的复核。
         """
         reclaimed: list[str] = []
         async with self._session_factory() as db:
@@ -137,7 +140,7 @@ class RecoveryLoop:
                     select(AgentRun.id)
                     .where(
                         AgentRun.run_kind == "user",
-                        AgentRun.status == RunStatus.RUNNING,
+                        AgentRun.status.in_((RunStatus.RUNNING, RunStatus.REVIEWING)),
                         AgentRun.cancel_requested.is_(False),
                         or_(
                             AgentRun.lease_expires_at.is_(None),

@@ -30,7 +30,7 @@ from app.agent_runtime.kol_detail import KolDetailRunService
 from app.agent_runtime.models import AgentMessage, AgentRun, AgentSession
 from app.agent_runtime.repository import AgentRunRepository, utc_now
 from app.agent_runtime.sse import sse_event_chunks
-from app.agent_runtime.state import InvalidRunTransition
+from app.agent_runtime.state import InvalidRunTransition, RunStatus
 from app.agent_runtime.tools.factory import load_channel_permissions
 from app.core.config import get_settings
 from app.db.session import get_db
@@ -40,6 +40,14 @@ router = APIRouter()
 
 # 同一 Session 同时只允许一个活动 session_analyst_v1 Run（设计 Task 19）。
 _ACTIVE_RUN_STATUSES = frozenset({"queued", "running", "reviewing"})
+
+# 取消语义（§5.5）：无在飞执行的状态立即迁移 cancelled 并写终态事件；
+# 有在飞执行（decide/MCP/Reviewer）的状态只写 cancel_requested，由 Engine
+# 在安全点收口（恰好一个 run.cancelled 终态事件）。
+_IMMEDIATE_CANCEL_STATUSES = frozenset(
+    {RunStatus.QUEUED, RunStatus.PAUSED, RunStatus.CLARIFICATION_REQUESTED}
+)
+_REQUEST_CANCEL_STATUSES = frozenset({RunStatus.RUNNING, RunStatus.REVIEWING})
 
 SESSION_ANALYST_PROFILE = "session_analyst_v1"
 
@@ -512,10 +520,23 @@ async def cancel_run(
     run_id: str,
     user: CurrentUser,
     db: Annotated[AsyncSession, Depends(get_db)],
+    broker: Annotated[AgentEventBroker, Depends(get_agent_event_broker)],
 ) -> AgentRunRead:
+    """取消 Run（§5.5）：queued/paused/clarification 立即迁移 cancelled 并写
+    恰好一个 ``run.cancelled`` 终态事件；running/reviewing 只写
+    ``cancel_requested``，由 Engine 在下一个安全点（外发前 / 模型返回后 /
+    Reviewer 返回后 / 循环顶）收口。终态幂等返回。
+    """
     run = await _get_owned_run(db, user.id, run_id)
     repo = AgentRunRepository(db)
-    await repo.cancel(run.id, user.id)
+    current = RunStatus(run.status)
+    if current in _IMMEDIATE_CANCEL_STATUSES:
+        if await repo.cancel(run.id, user.id):
+            await AgentEventStream(db, broker).append(
+                run.id, user.id, "run.cancelled", {}
+            )
+    elif current in _REQUEST_CANCEL_STATUSES:
+        await repo.request_cancel(run.id, user.id)
     await db.commit()
     return AgentRunRead.model_validate(run)
 
@@ -528,6 +549,26 @@ async def resume_run(
     executor: Annotated[AgentRunExecutor, Depends(get_agent_executor)],
 ) -> AgentRunRead:
     run = await _get_owned_run(db, user.id, run_id)
+    # 单活动主 Run 约束（§5.5）：锁 Session 行后检查同 Session 是否已有其他
+    # 活动 session_analyst_v1 Run（queued/running/reviewing），存在则 409——
+    # 与 messages 并发车道同一语义，防止 paused resume 绕过限制造成双主 Run。
+    await _get_owned_session(db, user.id, run.session_id, for_update=True)
+    active = await db.scalar(
+        select(AgentRun.id)
+        .where(
+            AgentRun.session_id == run.session_id,
+            AgentRun.user_id == user.id,
+            AgentRun.profile_name == SESSION_ANALYST_PROFILE,
+            AgentRun.status.in_(tuple(_ACTIVE_RUN_STATUSES)),
+            AgentRun.id != run.id,
+        )
+        .with_for_update()
+        .limit(1)
+    )
+    if active is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="active_run_in_progress"
+        )
     repo = AgentRunRepository(db)
     try:
         await repo.begin_attempt(run.id, resumed=True)
