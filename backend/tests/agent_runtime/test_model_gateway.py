@@ -20,12 +20,16 @@ import pytest
 from pydantic import RootModel, TypeAdapter
 from sqlalchemy import select
 
-from app.agent_runtime.model_gateway import MAX_THINKING_TEXT_CHARS, AgentModelGateway
+from app.agent_runtime.model_gateway import (
+    MAX_THINKING_TEXT_CHARS,
+    AgentModelGateway,
+    InvalidModelOutput,
+)
 from app.agent_runtime.models import AgentRun, AgentRunAttempt, AgentSession, AgentStep
 from app.agent_runtime.profiles import PROFILES
 from app.agent_runtime.prompts import get_system_prompt
 from app.agent_runtime.repository import AgentRunRepository
-from app.model.contracts import ChatMessage, ModelPlanInvalidError
+from app.model.contracts import ChatMessage, ModelAdapterError, ModelPlanInvalidError
 from app.model.prompt_logs import PromptLogEntry
 from app.model.tencent_plan import TencentPlanAdapter
 
@@ -257,9 +261,11 @@ async def test_decide_repairs_broken_json_tail(db_session, user_factory) -> None
     assert action.text == 'it\'s a "great" day'
 
 
-async def test_decide_unrepairable_json_raises_adapter_error(
+async def test_decide_unrepairable_json_returns_invalid_model_output(
     db_session, user_factory
 ) -> None:
+    """修复后仍非法：默认动作协议路径返回可恢复 ``InvalidModelOutput``（§5.8），
+    由 Engine 计入无效动作并回喂，不再直接抛出杀死 Run。"""
     run, attempt = await _create_run(db_session, user_factory)
     truncated = '{"action":"complete","text":"unterminated'
     gateway = _make_gateway(
@@ -270,7 +276,66 @@ async def test_decide_unrepairable_json_raises_adapter_error(
         ],
     )
 
+    decision = await gateway.decide(
+        run=run,
+        attempt_id=attempt.id,
+        profile=_PROFILE,
+        messages=[ChatMessage(role="user", content="hi")],
+        thinking_sink=None,
+        step_sequence=1,
+    )
+
+    assert isinstance(decision, InvalidModelOutput)
+    assert decision.code == "MODEL_PLAN_INVALID"
+
+    step = await _get_step(db_session, run.id)
+    assert step is not None
+    assert step.status == "failed"
+
+
+async def test_decide_unrepairable_json_custom_root_still_raises(
+    db_session, user_factory
+) -> None:
+    """自定义输出 Schema（Reviewer/Utility 一次性调用）维持抛出
+    ``ModelPlanInvalidError``：其驱动方已按系统失败收口，无 Engine 容错循环。"""
+
+    class _TagRoot(RootModel[dict[str, str]]):
+        pass
+
+    run, attempt = await _create_run(db_session, user_factory)
+    truncated = '{"tag":"unterminated'
+    gateway = _make_gateway(
+        db_session,
+        [
+            stream_chunks(content_chunks=[truncated], reasoning_chunks=[None]),
+            stream_chunks(content_chunks=[truncated], reasoning_chunks=[None]),
+        ],
+    )
+
     with pytest.raises(ModelPlanInvalidError):
+        await gateway.decide(
+            run=run,
+            attempt_id=attempt.id,
+            profile=_PROFILE,
+            messages=[ChatMessage(role="user", content="hi")],
+            thinking_sink=None,
+            step_sequence=1,
+            decision_root=_TagRoot,
+        )
+
+    step = await _get_step(db_session, run.id)
+    assert step is not None
+    assert step.status == "failed"
+
+
+async def test_decide_provider_error_still_raises_as_system_error(
+    db_session, user_factory
+) -> None:
+    """供应商/协议错误不是可恢复非法输出：仍按系统错误抛出（§5.8 分层）。"""
+    run, attempt = await _create_run(db_session, user_factory)
+    gateway = _make_gateway(db_session, [RuntimeError("provider exploded")])
+
+    with pytest.raises(ModelAdapterError):
         await gateway.decide(
             run=run,
             attempt_id=attempt.id,

@@ -44,6 +44,7 @@ from app.agent_runtime.repository import utc_now
 from app.agent_runtime.reviewer import ReviewDecision, ReviewerDriver
 from app.agent_runtime.schemas import CallTool, SubmitReview
 from app.agent_runtime.state import RunStatus
+from app.agent_runtime.thinking import AgentEventThinkingSink
 from app.agent_runtime.tools.artifacts import CreateDraftTool
 from app.agent_runtime.tools.contracts import ToolResult
 from app.agent_runtime.tools.registry import ToolRegistry
@@ -410,6 +411,29 @@ async def test_cache_hit_serves_without_new_model_call(db_session, user_factory)
     assert summary2.detail["data"]["cache"]["expires_at"]
     assert len(gateway.calls) == calls_after_first  # 无新模型调用
     assert summary2.detail["data"]["latest_posts"]  # 缓存保留热帖
+
+
+async def test_fresh_run_receives_thinking_sink(db_session, user_factory) -> None:
+    """kol_detail Run 是用户可见 Run：引擎注入 AgentEventThinkingSink，
+    主 Agent 真实 thinking 才能实时 SSE（§5.8/§10.5）。"""
+    user = await user_factory()
+    session = await _make_session(db_session, user.id)
+    evidence = await _make_evidence(db_session, user.id, session.id)
+    gateway, service = _make_service(
+        db_session,
+        actions=_make_actions(db_session, evidence, _cache_state()),
+        evidence=evidence,
+        now_fn=lambda: T0,
+    )
+
+    summary = await service.create(user.id, session.id, PLATFORM, KOL_UID)
+
+    assert summary.cached is False
+    assert gateway.calls
+    assert all(
+        isinstance(call["thinking_sink"], AgentEventThinkingSink)
+        for call in gateway.calls
+    )
 
 
 # ---------------------------------------------------------------------------

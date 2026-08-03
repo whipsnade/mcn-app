@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from contextlib import asynccontextmanager
 from datetime import timedelta
@@ -20,7 +21,7 @@ from uuid import uuid4
 
 import pytest
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 
 from app.agent_artifacts.models import (
     AgentArtifactVersion,
@@ -30,6 +31,7 @@ from app.agent_artifacts.models import (
 from app.agent_artifacts.service import ArtifactService
 from app.agent_runtime.engine import MAX_INVALID_ACTIONS, AgentEngine, RunOutcome
 from app.agent_runtime.events import AgentEventBroker, AgentEventStream
+from app.agent_runtime.model_gateway import AgentModelGateway
 from app.agent_runtime.models import (
     AgentEvent,
     AgentMessage,
@@ -46,15 +48,21 @@ from app.agent_runtime.repository import AgentRunRepository, utc_now
 from app.agent_runtime.reviewer import ReviewDecision, ReviewIssue, ReviewerDriver
 from app.agent_runtime.schemas import AskUser, CallTool, Complete, SubmitReview
 from app.agent_runtime.state import InvalidRunTransition, RunStatus
+from app.agent_runtime.thinking import AgentEventThinkingSink
 from app.agent_runtime.tools.contracts import ToolResult
 from app.agent_runtime.tools.calculation import CalculateExpressionTool
 from app.agent_runtime.tools.mcp import AgentMcpTool
 from app.agent_runtime.tools.registry import McpCatalogEntry, ToolRegistry
 from app.billing.models import Wallet
 from app.billing.service import InsufficientPointsError, WalletService
+from app.db.session import SessionFactory
+from app.db.session import engine as db_engine
+from app.identity.models import User
 from app.mcp_gateway.contracts import DataTapService
 from app.mcp_gateway.transport import RemoteToolResult
 from app.model.contracts import ChatMessage
+from app.model.prompt_logs import PromptLogEntry
+from app.model.tencent_plan import TencentPlanAdapter
 
 from tests.agent_artifacts.payload_fixtures import insight_metric_payload, insight_payload
 
@@ -1544,3 +1552,585 @@ async def test_reviewer_calls_use_artifact_reviewer_purpose(
     assert outcome.status == RunStatus.COMPLETED
     assert len(reviewer_gateway.calls) == 1
     assert reviewer_gateway.calls[0]["purpose"] == "artifact_reviewer"
+
+
+# ---------------------------------------------------------------------------
+# 5. A6：Profile allowed_actions 运行时强制（§5.8）
+# ---------------------------------------------------------------------------
+
+
+async def test_disallowed_action_fed_back_as_validation_error_and_recovers(
+    db_session, user_factory
+) -> None:
+    """kol_detail_v1 不允许 ask_user：结构化 validation_error 回喂并计入无效动作，
+    不分发、不写澄清消息/ pending Memory；模型随后合法 complete 正常收尾（§5.8）。"""
+    run, attempt, _, _ = await _setup_run(db_session, user_factory)
+    engine, gateway, _ = _make_engine(
+        db_session,
+        actions=[
+            AskUser(action="ask_user", question="需要确认详情范围", options=["概览", "全量"]),
+            Complete(action="complete", text="直接给出达人详情"),
+        ],
+        decisions=[],
+    )
+    outcome = await engine.run(
+        run=run,
+        attempt_id=attempt.id,
+        profile=get_profile("kol_detail_v1"),
+        messages=[ChatMessage(role="user", content="查看达人详情")],
+    )
+    assert outcome.status == RunStatus.COMPLETED
+    assert len(gateway.calls) == 2
+    # 不允许的动作作为结构化 validation_error 回喂（含稳定 code 与动作名）
+    feedback = gateway.calls[1]["messages"][-1]
+    assert feedback.role == "user"
+    assert "validation_error" in feedback.content
+    assert "action_not_allowed" in feedback.content
+    assert "ask_user" in feedback.content
+    # 未分发 ask_user：只有 complete 落的一条 assistant 消息，无澄清消息
+    messages = (
+        await db_session.scalars(
+            select(AgentMessage).where(AgentMessage.run_id == run.id)
+        )
+    ).all()
+    assert len(messages) == 1
+    assert messages[0].metadata_json["type"] == "completion"
+    assert (
+        await db_session.scalar(
+            select(func.count(MemoryEntry.id)).where(
+                MemoryEntry.memory_type == "pending_question"
+            )
+        )
+    ) == 0
+
+
+async def test_disallowed_action_reaches_threshold_and_fails_run(
+    db_session, user_factory
+) -> None:
+    """连续输出 Profile 不允许的动作：达到统一无效动作上限后 Run failed（§5.8）。"""
+    run, attempt, _, _ = await _setup_run(db_session, user_factory)
+    engine, gateway, _ = _make_engine(
+        db_session,
+        actions=[
+            AskUser(action="ask_user", question=f"问题{index}", options=["是", "否"])
+            for index in range(MAX_INVALID_ACTIONS)
+        ],
+        decisions=[],
+    )
+    outcome = await engine.run(
+        run=run,
+        attempt_id=attempt.id,
+        profile=get_profile("kol_detail_v1"),
+        messages=[ChatMessage(role="user", content="查看达人详情")],
+    )
+    assert outcome.status == RunStatus.FAILED
+    assert run.status == RunStatus.FAILED
+    assert len(gateway.calls) == MAX_INVALID_ACTIONS
+    assert all(
+        any("validation_error" in m.content for m in call["messages"])
+        for call in gateway.calls[1:]
+    )
+    # 达上限的失败路径不收口为 clarification，澄清消息绝不落库
+    assert (
+        await db_session.scalar(
+            select(func.count(AgentMessage.id)).where(AgentMessage.run_id == run.id)
+        )
+    ) == 0
+
+
+async def test_disallowed_action_count_resets_after_valid_interaction(
+    db_session, user_factory
+) -> None:
+    """不允许动作与合法动作交替：有效交互清零计数，两次间隔的违规不致 Run 失败。"""
+    run, attempt, _, _ = await _setup_run(db_session, user_factory)
+    engine, gateway, _ = _make_engine(
+        db_session,
+        actions=[
+            AskUser(action="ask_user", question="违规1", options=["是", "否"]),
+            CallTool(
+                action="call_tool",
+                internal_tool_name="noop_calc",
+                arguments={"value": "x"},
+                rationale="步进",
+            ),
+            AskUser(action="ask_user", question="违规2", options=["是", "否"]),
+            Complete(action="complete", text="完成"),
+        ],
+        decisions=[],
+        registry=_noop_registry(),
+    )
+    outcome = await engine.run(
+        run=run,
+        attempt_id=attempt.id,
+        profile=get_profile("kol_detail_v1"),
+        messages=[ChatMessage(role="user", content="查看达人详情")],
+    )
+    assert outcome.status == RunStatus.COMPLETED
+    assert len(gateway.calls) == 4
+
+
+# ---------------------------------------------------------------------------
+# 6. A6：非法模型输出分层容错（§5.8，真实网关 + 脚本化供应商）
+# ---------------------------------------------------------------------------
+
+
+class _FakeCompletions:
+    """脚本化 OpenAI completions 客户端：按序吐出流式响应或抛出异常。"""
+
+    def __init__(self, outcomes: list[Any]) -> None:
+        self.outcomes = list(outcomes)
+        self.calls: list[dict[str, Any]] = []
+
+    async def create(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        if not self.outcomes:
+            raise AssertionError("fake completions exhausted")
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+class _CaptureLogWriter:
+    def __init__(self) -> None:
+        self.entries: list[PromptLogEntry] = []
+
+    async def __call__(self, entry: PromptLogEntry) -> None:
+        self.entries.append(entry)
+
+
+def _stream_chunks(
+    *, content_chunks: list[str | None], reasoning_chunks: list[str | None]
+) -> Any:
+    """生成带最终 usage 块和 finish_reason=stop 的流式响应。"""
+    chunks = [
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(content=content, reasoning_content=reasoning),
+                    finish_reason=None,
+                )
+            ],
+            usage=None,
+            _request_id="req-stream",
+        )
+        for content, reasoning in zip(content_chunks, reasoning_chunks, strict=True)
+    ]
+    chunks.append(
+        SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    delta=SimpleNamespace(content=None, reasoning_content=None),
+                    finish_reason="stop",
+                )
+            ],
+            usage=None,
+            _request_id="req-stream",
+        )
+    )
+
+    async def stream() -> Any:
+        for chunk in chunks:
+            yield chunk
+
+    return stream()
+
+
+class _RecordingGateway:
+    """记录 decide 入参后委托真实网关（回喂内容断言用）。"""
+
+    def __init__(self, real: AgentModelGateway) -> None:
+        self.real = real
+        self.calls: list[dict[str, Any]] = []
+
+    async def decide(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        return await self.real.decide(**kwargs)
+
+
+def _make_engine_with_real_gateway(
+    db_session, client: _FakeCompletions, writer: _CaptureLogWriter
+) -> tuple[AgentEngine, _RecordingGateway]:
+    adapter = TencentPlanAdapter(
+        client=client, log_writer=writer, stream_support_cache={}
+    )
+    gateway = _RecordingGateway(AgentModelGateway(adapter, db=db_session))
+    broker = AgentEventBroker()
+    events = AgentEventStream(db_session, broker)
+    reviewer = ReviewerDriver(db_session, FakeReviewerGateway([]), worker_id="worker")
+    engine = AgentEngine(
+        db_session,
+        gateway=gateway,
+        registry=ToolRegistry(),
+        events=events,
+        reviewer=reviewer,
+        worker_id="worker",
+    )
+    return engine, gateway
+
+
+_BROKEN_JSON = '{"action":"complete","text":"unterminated'
+_COMPLETE_JSON = '{"action":"complete","text":"分析完成"}'
+
+
+async def test_unrepairable_model_output_counted_and_run_recovers(
+    db_session, user_factory
+) -> None:
+    """一次修复后仍非法的输出：网关交回可恢复结果，引擎计数回喂后 Run 继续完成。"""
+    run, attempt, _, _ = await _setup_run(db_session, user_factory)
+    writer = _CaptureLogWriter()
+    client = _FakeCompletions(
+        [
+            _stream_chunks(content_chunks=[_BROKEN_JSON], reasoning_chunks=[None]),
+            _stream_chunks(content_chunks=[_BROKEN_JSON], reasoning_chunks=[None]),
+            _stream_chunks(content_chunks=[_COMPLETE_JSON], reasoning_chunks=[None]),
+        ]
+    )
+    engine, gateway = _make_engine_with_real_gateway(db_session, client, writer)
+    outcome = await engine.run(
+        run=run,
+        attempt_id=attempt.id,
+        profile=get_profile("session_analyst_v1"),
+        messages=[ChatMessage(role="user", content="分析品牌")],
+    )
+    assert outcome.status == RunStatus.COMPLETED
+    assert len(gateway.calls) == 2
+    # 适配器单次修复语义保留：第一次 decide 内 2 次供应商调用，第二次 1 次
+    assert len(client.calls) == 3
+    # 坏输出作为 validation_error 回喂进第二次 decide，且计入决策计数
+    assert any(
+        m.role == "user" and "validation_error" in m.content
+        for m in gateway.calls[1]["messages"]
+    )
+    assert run.decision_count == 2
+    # prompt 学习日志：invalid 与 success 各一条
+    assert [entry.status for entry in writer.entries] == ["invalid", "success"]
+
+
+async def test_unrepairable_model_output_three_times_fails_run(
+    db_session, user_factory
+) -> None:
+    """连续修复后仍非法：达到统一上限（3 次）后 Run failed，不再无界重试。"""
+    run, attempt, _, _ = await _setup_run(db_session, user_factory)
+    writer = _CaptureLogWriter()
+    client = _FakeCompletions(
+        [
+            _stream_chunks(content_chunks=[_BROKEN_JSON], reasoning_chunks=[None])
+            for _ in range(MAX_INVALID_ACTIONS * 2)
+        ]
+    )
+    engine, gateway = _make_engine_with_real_gateway(db_session, client, writer)
+    outcome = await engine.run(
+        run=run,
+        attempt_id=attempt.id,
+        profile=get_profile("session_analyst_v1"),
+        messages=[ChatMessage(role="user", content="分析品牌")],
+    )
+    assert outcome.status == RunStatus.FAILED
+    assert run.status == RunStatus.FAILED
+    assert len(gateway.calls) == MAX_INVALID_ACTIONS
+    assert len(client.calls) == MAX_INVALID_ACTIONS * 2
+    assert all(entry.status == "invalid" for entry in writer.entries)
+    event_types = [
+        row.event_type
+        for row in (
+            await db_session.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.id)
+            )
+        ).all()
+    ]
+    assert "run.failed" in event_types
+
+
+async def test_provider_error_fails_run_immediately_without_invalid_counting(
+    db_session, user_factory
+) -> None:
+    """供应商/协议错误属系统错误：直接收口 failed，不进入无效动作计数重试。"""
+    run, attempt, _, _ = await _setup_run(db_session, user_factory)
+    writer = _CaptureLogWriter()
+    client = _FakeCompletions([RuntimeError("provider exploded")])
+    engine, gateway = _make_engine_with_real_gateway(db_session, client, writer)
+    outcome = await engine.run(
+        run=run,
+        attempt_id=attempt.id,
+        profile=get_profile("session_analyst_v1"),
+        messages=[ChatMessage(role="user", content="分析品牌")],
+    )
+    assert outcome.status == RunStatus.FAILED
+    assert run.status == RunStatus.FAILED
+    # 系统错误不进入容错循环：只调一次 decide、不重试供应商
+    assert len(gateway.calls) == 1
+    assert len(client.calls) == 1
+    assert [entry.status for entry in writer.entries] == ["failed"]
+    assert run.decision_count == 0
+
+
+# ---------------------------------------------------------------------------
+# 7. A6：thinking 实时事件（§5.8/§10.5，真实网关 + AgentEventThinkingSink）
+# ---------------------------------------------------------------------------
+
+
+async def test_thinking_events_flow_from_real_gateway_through_sink(
+    db_session, user_factory
+) -> None:
+    """供应商真实返回 thinking：持久化为 thinking.started/delta/completed 事件。"""
+    run, attempt, _, _ = await _setup_run(db_session, user_factory)
+    writer = _CaptureLogWriter()
+    client = _FakeCompletions(
+        [
+            _stream_chunks(
+                content_chunks=[None, _COMPLETE_JSON],
+                reasoning_chunks=["先想一步", None],
+            )
+        ]
+    )
+    engine, _ = _make_engine_with_real_gateway(db_session, client, writer)
+    sink = engine.thinking_sink_for(run)
+    assert isinstance(sink, AgentEventThinkingSink)
+    outcome = await engine.run(
+        run=run,
+        attempt_id=attempt.id,
+        profile=get_profile("session_analyst_v1"),
+        messages=[ChatMessage(role="user", content="分析品牌")],
+        thinking_sink=sink,
+    )
+    assert outcome.status == RunStatus.COMPLETED
+    rows = (
+        await db_session.scalars(
+            select(AgentEvent)
+            .where(AgentEvent.run_id == run.id)
+            .order_by(AgentEvent.sequence)
+        )
+    ).all()
+    types = [row.event_type for row in rows]
+    assert types == [
+        "run.started",
+        "thinking.started",
+        "thinking.delta",
+        "thinking.completed",
+        "message.completed",
+        "run.completed",
+    ]
+    delta = rows[2]
+    assert delta.payload_json["text"] == "先想一步"
+    assert delta.payload_json["attempt"] == 1
+    assert delta.payload_json["run_id"] == run.id
+
+
+async def test_no_thinking_from_provider_emits_no_thinking_events(
+    db_session, user_factory
+) -> None:
+    """供应商无 thinking：即使注入 sink 也零 thinking.* 事件（§10.5 门控语义）。"""
+    run, attempt, _, _ = await _setup_run(db_session, user_factory)
+    writer = _CaptureLogWriter()
+    client = _FakeCompletions(
+        [_stream_chunks(content_chunks=[_COMPLETE_JSON], reasoning_chunks=[None])]
+    )
+    engine, _ = _make_engine_with_real_gateway(db_session, client, writer)
+    outcome = await engine.run(
+        run=run,
+        attempt_id=attempt.id,
+        profile=get_profile("session_analyst_v1"),
+        messages=[ChatMessage(role="user", content="分析品牌")],
+        thinking_sink=engine.thinking_sink_for(run),
+    )
+    assert outcome.status == RunStatus.COMPLETED
+    types = [
+        row.event_type
+        for row in (
+            await db_session.scalars(
+                select(AgentEvent)
+                .where(AgentEvent.run_id == run.id)
+                .order_by(AgentEvent.sequence)
+            )
+        ).all()
+    ]
+    assert types == ["run.started", "message.completed", "run.completed"]
+
+
+async def test_thinking_sink_for_internal_run_returns_none(
+    db_session, user_factory
+) -> None:
+    """Reviewer/Utility 内部 Run 不注入 thinking sink（visibility != user）。"""
+    run, attempt, _, _ = await _setup_run(db_session, user_factory)
+    engine, _, _ = _make_engine(db_session, actions=[], decisions=[])
+    assert engine.thinking_sink_for(run) is not None
+    run.visibility = "internal"
+    assert engine.thinking_sink_for(run) is None
+
+
+# ---------------------------------------------------------------------------
+# 8. A6：事件顺序（§5.8：assistant message → message.completed → 终态事件最后）
+# ---------------------------------------------------------------------------
+
+
+async def _event_types(db_session, run_id: str) -> list[str]:
+    return [
+        row.event_type
+        for row in (
+            await db_session.scalars(
+                select(AgentEvent)
+                .where(AgentEvent.run_id == run_id)
+                .order_by(AgentEvent.sequence)
+            )
+        ).all()
+    ]
+
+
+async def test_complete_emits_message_completed_before_run_completed(
+    db_session, user_factory
+) -> None:
+    """complete 路径：message.completed 先于 run.completed，终态事件最后（§5.8）。"""
+    run, attempt, _, _ = await _setup_run(db_session, user_factory)
+    engine, _, _ = _make_engine(
+        db_session,
+        actions=[Complete(action="complete", text="分析完成")],
+        decisions=[],
+    )
+    outcome = await engine.run(
+        run=run,
+        attempt_id=attempt.id,
+        profile=get_profile("session_analyst_v1"),
+        messages=[ChatMessage(role="user", content="分析品牌")],
+    )
+    assert outcome.status == RunStatus.COMPLETED
+    types = await _event_types(db_session, run.id)
+    assert types[-2:] == ["message.completed", "run.completed"]
+
+
+async def test_approve_publish_emits_message_completed_before_run_completed(
+    db_session, user_factory
+) -> None:
+    """approve 发布路径：review/artifact 事件 → message.completed → run.completed。"""
+    run, attempt, _, _ = await _setup_run(db_session, user_factory)
+    _, draft, _ = await _make_draft(db_session, run)
+    engine, _, _ = _make_engine(
+        db_session,
+        actions=[
+            SubmitReview(
+                action="submit_review",
+                artifact_draft_ids=(draft.id,),
+                completion_text="品牌分析完成",
+                summary="瑞幸品牌分析",
+            ),
+        ],
+        decisions=[ReviewDecision(decision="approve")],
+    )
+    outcome = await engine.run(
+        run=run,
+        attempt_id=attempt.id,
+        profile=get_profile("session_analyst_v1"),
+        messages=[ChatMessage(role="user", content="分析瑞幸品牌")],
+    )
+    assert outcome.status == RunStatus.COMPLETED
+    types = await _event_types(db_session, run.id)
+    assert types[-2:] == ["message.completed", "run.completed"]
+    assert types.index("review.approved") < types.index("message.completed")
+
+
+async def _create_committed_agent_run() -> tuple[str, str, str]:
+    """在独立事务中提交 user/session/run，供跨会话在线消费测试使用。"""
+    async with SessionFactory() as db:
+        now = utc_now()
+        user = User(
+            id=str(uuid4()),
+            nickname="测试用户",
+            role="user",
+            status="active",
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(user)
+        await db.flush()
+        session = AgentSession(
+            id=str(uuid4()),
+            user_id=user.id,
+            title="在线消费测试会话",
+            status="active",
+            created_at=now,
+            updated_at=now,
+        )
+        db.add(session)
+        await db.flush()
+        run = AgentRun(
+            id=str(uuid4()),
+            session_id=session.id,
+            user_id=user.id,
+            run_kind="user",
+            visibility="user",
+            profile_name="session_analyst_v1",
+            profile_version="v1",
+            model="test-model",
+            status="queued",
+            decision_count=0,
+            review_count=0,
+            revision_count=0,
+        )
+        db.add(run)
+        await db.flush()
+        await db.commit()
+        return user.id, session.id, run.id
+
+
+async def _purge_committed_agent_run(user_id: str, session_id: str, run_id: str) -> None:
+    """删除在线消费测试提交的行，保持测试库干净。"""
+    async with db_engine.begin() as conn:
+        await conn.execute(delete(AgentEvent).where(AgentEvent.run_id == run_id))
+        await conn.execute(delete(AgentMessage).where(AgentMessage.run_id == run_id))
+        await conn.execute(delete(AgentStep).where(AgentStep.run_id == run_id))
+        await conn.execute(
+            delete(AgentRunAttempt).where(AgentRunAttempt.run_id == run_id)
+        )
+        await conn.execute(delete(AgentRun).where(AgentRun.id == run_id))
+        await conn.execute(delete(AgentSession).where(AgentSession.id == session_id))
+        await conn.execute(delete(User).where(User.id == user_id))
+
+
+async def test_live_stream_delivers_message_completed_before_run_completed() -> None:
+    """在线消费（reader 独立会话）：message.completed 先于 run.completed 到达，
+    流在终态事件收口——终态事件必须是该 Run 最后一条用户可见事件（§5.8）。"""
+    user_id, session_id, run_id = await _create_committed_agent_run()
+    broker = AgentEventBroker()
+    try:
+        async with SessionFactory() as writer:
+            repo = AgentRunRepository(writer)
+            attempt = await repo.begin_attempt(run_id)
+            assert await repo.claim_lease(run_id, "worker", 300)
+            engine = AgentEngine(
+                writer,
+                gateway=FakeAgentGateway([Complete(action="complete", text="完成")]),
+                registry=ToolRegistry(),
+                events=AgentEventStream(writer, broker),
+                reviewer=ReviewerDriver(
+                    writer, FakeReviewerGateway([]), worker_id="worker"
+                ),
+                worker_id="worker",
+            )
+            run = await writer.get(AgentRun, run_id)
+            assert run is not None
+
+            received: list[str] = []
+
+            async def consume() -> None:
+                async with SessionFactory() as reader:
+                    stream = AgentEventStream(reader, broker)
+                    async for event in stream.stream(run_id, user_id, last_event_id=0):
+                        received.append(event.event_type)
+
+            consumer = asyncio.create_task(consume())
+            await asyncio.sleep(0.05)  # reader 完成重放并进入 broker 等待
+            outcome = await engine.run(
+                run=run,
+                attempt_id=attempt.id,
+                profile=get_profile("session_analyst_v1"),
+                messages=[ChatMessage(role="user", content="分析品牌")],
+            )
+            assert outcome.status == RunStatus.COMPLETED
+            await asyncio.wait_for(consumer, timeout=5)
+    finally:
+        await _purge_committed_agent_run(user_id, session_id, run_id)
+
+    # 旧顺序（run.completed 先发）会让在线客户端永远收不到 message.completed
+    assert received[-1] == "run.completed"
+    assert "message.completed" in received
+    assert received.index("message.completed") < received.index("run.completed")

@@ -401,6 +401,8 @@ class KolDetailRunService:
             attempt_id=attempt.id,
             profile=get_profile("kol_detail_v1"),
             messages=messages,
+            # §5.8/§10.5：kol_detail Run 是用户可见 Run，注入 thinking sink。
+            thinking_sink=self._engine.thinking_sink_for(run),
         )
         if outcome.status != RunStatus.COMPLETED:
             raise KolDetailRunFailed(f"kol_detail_v1 run ended with status {outcome.status}")

@@ -32,6 +32,7 @@ from app.agent_runtime.repository import AgentRunRepository, utc_now
 from app.agent_runtime.reviewer import ReviewerDriver
 from app.agent_runtime.schemas import CallTool, Complete
 from app.agent_runtime.state import RunStatus
+from app.agent_runtime.thinking import AgentEventThinkingSink
 from app.agent_runtime.tools.contracts import ToolResult
 from app.agent_runtime.tools.registry import ToolRegistry
 
@@ -241,6 +242,22 @@ async def test_queued_run_is_claimed_and_reaches_terminal_state(
     assert any(
         m.role == "user" and "帮我分析品牌" in m.content for m in gateway.calls[0]["messages"]
     )
+
+
+async def test_executor_injects_thinking_sink_for_user_run(
+    db_session, user_factory
+) -> None:
+    """用户可见 Run（session_analyst 主 Run）：执行器注入 AgentEventThinkingSink，
+    主 Agent 真实 thinking 才能实时 SSE（§5.8/§10.5）。"""
+    run, _, _ = await _make_session(db_session, user_factory)
+    gateway = FakeAgentGateway([Complete(action="complete", text="分析完成")])
+    executor = _build_executor(db_session, gateway=gateway)
+
+    run_id = await executor.claim_and_process_one()
+
+    assert run_id == run.id
+    assert len(gateway.calls) == 1
+    assert isinstance(gateway.calls[0]["thinking_sink"], AgentEventThinkingSink)
 
 
 async def test_claim_and_process_one_returns_none_when_nothing_queued(

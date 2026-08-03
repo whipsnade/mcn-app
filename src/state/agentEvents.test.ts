@@ -34,8 +34,9 @@ describe('reduceRunEvent', () => {
     state = reduceRunEvent(state, event('review.started', 7, { review_batch_id: 'batch-1' }));
     state = reduceRunEvent(state, event('review.approved', 8, { review_batch_id: 'batch-1' }));
     state = reduceRunEvent(state, event('artifact.published', 9, { artifact_id: 'art-1', module: 'brand' }));
-    state = reduceRunEvent(state, event('run.completed', 10, { outcome: 'completed' }));
-    state = reduceRunEvent(state, event('message.completed', 11, { type: 'completion' }));
+    // §5.8 事件顺序：message.completed 先于 run.completed，终态事件最后。
+    state = reduceRunEvent(state, event('message.completed', 10, { type: 'completion' }));
+    state = reduceRunEvent(state, event('run.completed', 11, { outcome: 'completed' }));
 
     expect(state.status).toBe('completed');
     expect(state.connection).toBe('closed');
@@ -138,5 +139,27 @@ describe('reduceRunEvent', () => {
 
     expect(state.status).toBe('completed');
     expect(state.messageCompleted).toBe(true);
+  });
+
+  it('folds thinking on thinking.completed and marks interrupted on thinking.failed', () => {
+    let state = initialRunRuntime('run-1');
+    state = reduceRunEvent(state, event('thinking.started', 1, { attempt: 1 }));
+    state = reduceRunEvent(state, event('thinking.delta', 2, { text: '推理中' }));
+    state = reduceRunEvent(state, event('thinking.completed', 3, { attempt: 1, duration_ms: 120 }));
+
+    expect(state.hasThinking).toBe(true);
+    expect(state.thinking).toBe('推理中');
+    expect(state.thinkingStatus).toBe('completed');
+
+    let failedState = initialRunRuntime('run-1');
+    failedState = reduceRunEvent(failedState, event('thinking.started', 1, { attempt: 1 }));
+    failedState = reduceRunEvent(failedState, event('thinking.delta', 2, { text: '半截' }));
+    failedState = reduceRunEvent(
+      failedState,
+      event('thinking.failed', 3, { attempt: 1, error_code: 'MODEL_PLAN_INVALID' }),
+    );
+
+    expect(failedState.thinkingStatus).toBe('interrupted');
+    expect(failedState.thinking).toBe('半截');
   });
 });

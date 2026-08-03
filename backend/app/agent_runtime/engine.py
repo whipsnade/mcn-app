@@ -1,5 +1,5 @@
 """统一 Session Agent Engine（设计文档 §四 / §4.1 / §七 / §11.3 / Task 14；
-v3 加固 §5.4/§5.5）。
+v3 加固 §5.4/§5.5/§5.8）。
 
 ``AgentEngine.run`` 是模型主导的统一决策循环：反复 build context → model
 decide → 分发四种动作（ask_user / call_tool / submit_review / complete），
@@ -30,6 +30,23 @@ v3 加固（§5.7）的 Draft/Batch 生命周期不变量：
   无效动作（上限后 Run failed），不整 Run 崩溃；
 - ask_user/complete/paused/cancelled/failed 全部非发布出口释放本 Run 持有的
   Draft working head（保留不可变 Revision），Artifact 绝不永久 artifact_busy。
+
+v3 加固（§5.8）的动作协议与事件不变量：
+
+- **allowed_actions 强制**：dispatch 前校验 ``action.action in
+  profile.allowed_actions``（如 kol_detail_v1 不允许 ask_user）；违规动作
+  作为结构化 ``action_not_allowed`` validation error 回喂并计入无效动作，
+  达到统一上限（``MAX_INVALID_ACTIONS``）才收口 failed；
+- **非法输出分层**：适配器修复后仍非法的输出以可恢复 ``InvalidModelOutput``
+  返回，计入无效动作并回喂；供应商/鉴权/不可恢复协议错误才按系统错误
+  ``_fail_run``；
+- **thinking 实时事件**：用户可见 Run 由执行层注入
+  ``AgentEventThinkingSink``（见 ``thinking_sink_for``），Reviewer/Utility
+  内部 Run 不注入；
+- **事件顺序**：thinking/tool/review/artifact → assistant message →
+  ``message.completed`` → ``run.completed|failed|cancelled``——终态事件是该
+  Run 最后一条用户可见事件，在线客户端不会在流关闭前漏收
+  ``message.completed``。
 """
 
 from __future__ import annotations
@@ -64,6 +81,7 @@ from app.agent_artifacts.service import ArtifactBusy, ArtifactService
 from app.agent_runtime.context import SessionContextBuilder
 from app.agent_runtime.events import AgentEventStream
 from app.agent_runtime.heartbeat import RunLeaseHeartbeat
+from app.agent_runtime.model_gateway import InvalidModelOutput
 from app.agent_runtime.models import (
     AgentMessage,
     AgentRun,
@@ -81,6 +99,7 @@ from app.agent_runtime.repository import (
 from app.agent_runtime.reviewer import ReviewBatchDraftSetMismatch, ReviewerDriver
 from app.agent_runtime.schemas import FOUR_ACTIONS
 from app.agent_runtime.state import InvalidRunTransition, RunStatus
+from app.agent_runtime.thinking import AgentEventThinkingSink
 from app.agent_runtime.tools.contracts import ToolResult
 from app.agent_runtime.tools.mcp import DEFINITELY_NOT_SENT
 from app.agent_runtime.tools.registry import ToolRegistry, UnknownToolError
@@ -262,12 +281,17 @@ class AgentEngine:
                 next_sequence += 1
                 await self._count_decision(run, attempt_id)
 
-                if not self._is_known_action(action):
+                # §5.8：可恢复非法输出（InvalidModelOutput）、未知动作与 Profile
+                # 不允许的动作统一按无效动作计数回喂，达上限才收口 failed。
+                validation_error = self._action_validation_error(action, profile)
+                if validation_error is not None:
                     consecutive_invalid += 1
                     if consecutive_invalid >= MAX_INVALID_ACTIONS:
                         await self._fail_run(run)
                         break
-                    self._feed_validation_error(conversation, action)
+                    self._feed_validation_error(
+                        conversation, action, message=validation_error
+                    )
                     continue
                 # 无效计数在「有效交互」完成后清零（call_tool 结算、submit_review
                 # 未抛输入错误）：submit_review 输入错误在分发后累计，连续达到
@@ -347,6 +371,20 @@ class AgentEngine:
             await heartbeat.stop()
 
         return await self._outcome(run, assistant_message_id)
+
+    def thinking_sink_for(self, run: AgentRun) -> AgentEventThinkingSink | None:
+        """为用户可见 Run 构造 thinking sink（§5.8/§10.5）；内部 Run 返回 None。
+
+        执行层（executor / KolDetailRunService）为 session_analyst 主 Run 与
+        kol_detail Run 注入：模型网关的真实 thinking delta 经 sink 持久化为
+        ``thinking.*`` 事件实时 SSE。Reviewer/Utility 内部 Run
+        （``visibility != "user"``）不注入，只写 internal Step 审计。
+        """
+        if run.visibility != "user" or run.run_kind != "user":
+            return None
+        return AgentEventThinkingSink(
+            self._events, run_id=run.id, user_id=run.user_id
+        )
 
     # ------------------------------------------------------------------ #
     # 四种动作
@@ -708,11 +746,13 @@ class AgentEngine:
             logger.exception("publish_batch failed for run %s; failing run", run.id)
             await self._abort_review(run, batch)
             return "rejected", None
-        await self._events.append(
-            run.id, run.user_id, "run.completed", {"outcome": "completed"}
-        )
+        # §5.8 事件顺序：assistant message → message.completed → run.completed，
+        # 终态事件是该 Run 最后一条用户可见事件（在线客户端不会漏收 message.completed）。
         await self._events.append(
             run.id, run.user_id, "message.completed", {"type": "completion"}
+        )
+        await self._events.append(
+            run.id, run.user_id, "run.completed", {"outcome": "completed"}
         )
         published = await self._latest_assistant_message(run.id)
         return "approved", (published.id if published is not None else None)
@@ -722,6 +762,7 @@ class AgentEngine:
 
         §5.7：非发布出口释放本 Run 持有的 Draft working head（保留不可变
         Revision），不得永久 artifact_busy。
+        §5.8 事件顺序：message.completed 先于 run.completed，终态事件最后。
         """
         metadata = {"type": "completion", "suggestions": action.suggestions}
         message = await self._append_message(
@@ -736,10 +777,10 @@ class AgentEngine:
             run.id, RunStatus.COMPLETED, worker_id=self._worker_id
         )
         await self._events.append(
-            run.id, run.user_id, "run.completed", {"outcome": "completed"}
+            run.id, run.user_id, "message.completed", {"type": "completion"}
         )
         await self._events.append(
-            run.id, run.user_id, "message.completed", {"type": "completion"}
+            run.id, run.user_id, "run.completed", {"outcome": "completed"}
         )
         return message
 
@@ -945,8 +986,30 @@ class AgentEngine:
         return ""
 
     @staticmethod
-    def _is_known_action(action: Any) -> bool:
-        return bool(getattr(action, "action", None) in FOUR_ACTIONS)
+    def _action_validation_error(action: Any, profile: AgentProfile) -> str | None:
+        """dispatch 前的动作校验（§5.8）；返回 None 表示可分发，否则为回喂消息。
+
+        三类不可分发输入：
+        - ``InvalidModelOutput``：适配器修复后仍非法的输出（可恢复结果）；
+        - 未知动作名：不在四种动作协议内；
+        - Profile 不允许的动作：合法动作但不在 ``profile.allowed_actions``
+          （如 kol_detail_v1 不允许 ask_user——点击触发的详情弹层没有回答
+          入口，分发了会让 Run 卡死在 clarification）。
+        """
+        if isinstance(action, InvalidModelOutput):
+            return (
+                "model output failed schema validation after repair; "
+                "return exactly one valid action JSON object"
+            )
+        name = getattr(action, "action", None)
+        if name not in FOUR_ACTIONS:
+            return f"invalid or unknown agent action: {name!r}"
+        if name not in profile.allowed_actions:
+            return (
+                f"action {name!r} is not allowed for profile "
+                f"{profile.full_name!r}; choose from {sorted(profile.allowed_actions)}"
+            )
+        return None
 
     @staticmethod
     def _action_message(action: Any) -> ChatMessage:
@@ -957,16 +1020,30 @@ class AgentEngine:
             content=json.dumps(vars(action), ensure_ascii=False, default=str),
         )
 
-    def _feed_validation_error(self, conversation: list[ChatMessage], action: Any) -> None:
-        conversation.append(self._action_message(action))
+    def _feed_validation_error(
+        self, conversation: list[ChatMessage], action: Any, *, message: str
+    ) -> None:
+        """无效动作的结构化回喂（§5.8）：回显动作原文（若有）+ validation_error。
+
+        ``InvalidModelOutput`` 没有可回显的动作对象（适配器修复后仍非法），
+        只回喂错误本身；code 供模型与日志分辨违规类型。
+        """
+        code = "validation_error"
+        if isinstance(action, InvalidModelOutput):
+            code = "model_output_invalid"
+        else:
+            # 回显动作原文，模型据此看到自己输出了什么并修正。
+            conversation.append(self._action_message(action))
+            if getattr(action, "action", None) in FOUR_ACTIONS:
+                code = "action_not_allowed"
         conversation.append(
             ChatMessage(
                 role="user",
                 content=json.dumps(
                     {
                         "error_type": "validation_error",
-                        "message": "invalid or unknown agent action: "
-                        f"{getattr(action, 'action', None)!r}",
+                        "code": code,
+                        "message": message,
                     },
                     ensure_ascii=False,
                 ),

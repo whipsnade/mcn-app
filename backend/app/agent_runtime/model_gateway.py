@@ -1,4 +1,4 @@
-"""统一模型决策网关（设计文档 §10.5 / §六 / Task 6）。
+"""统一模型决策网关（设计文档 §10.5 / §六 / Task 6；v3 加固 §5.8）。
 
 每个 Agent Profile 的模型决策都经过 ``AgentModelGateway``：一次调用、一个
 ``AgentStep`` 审计（running → completed/failed）。职责：
@@ -10,6 +10,11 @@
   作为输出 Schema 交给适配器严格校验与修复，返回适配器已校验的 payload，
   网关不再重复解析；自定义输出 Schema 的 Profile（Reviewer/Utility）通过
   ``decision_root`` / ``decision_adapter`` 复用本入口；
+- 非法输出分层（§5.8）：适配器单次修复后仍非法的 JSON 输出是可恢复结果
+  ``InvalidModelOutput``，交给 Engine 计入无效动作并回喂；供应商错误、
+  鉴权错误与不可恢复协议错误仍按系统错误抛出。只有默认动作协议路径
+  （``decision_root is _AgentActionRoot``）做该转换——Reviewer/Utility 是
+  一次性调用，其驱动方已按系统失败收口，维持抛出语义；
 - Step 审计：调用前落一条 running Step，结束/失败后补齐输出、用量、请求 ID
   与脱敏 thinking（≤ 64 KiB），内部 Run 的 Step 标记 internal。
 
@@ -22,6 +27,7 @@ import asyncio
 import logging
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, TypeVar
 from uuid import uuid4
@@ -36,6 +42,7 @@ from app.agent_runtime.schemas import AgentAction
 from app.core.redaction import redact_for_log
 from app.model.contracts import (
     ChatMessage,
+    ModelPlanInvalidError,
     ModelPurpose,
     StructuredModelRequest,
     ThinkingSink,
@@ -47,6 +54,19 @@ logger = logging.getLogger(__name__)
 
 # agent_steps.thinking_text 单次上限（spec §10.5）：64 KiB。
 MAX_THINKING_TEXT_CHARS = 64 * 1024
+
+
+@dataclass(frozen=True)
+class InvalidModelOutput:
+    """适配器单次修复后仍非法的模型输出（可恢复结果，§5.8）。
+
+    只用于默认四种动作协议路径：Engine 收到后按无效动作计数并结构化回喂，
+    连续达到统一上限才收口 failed；供应商/鉴权/不可恢复协议错误不走本类型，
+    仍按系统错误抛出。
+    """
+
+    code: str = "MODEL_PLAN_INVALID"
+    request_id: str | None = None
 
 # 四种动作协议（判别联合）作为模型输出 Schema。用 RootModel 包装使
 # ``model_json_schema`` 产出 oneOf + discriminator 的完整动作 Schema，
@@ -201,6 +221,19 @@ class AgentModelGateway:
             decision = result.value.root
             if decision_adapter is not None:
                 decision = decision_adapter.validate_python(decision)
+        except ModelPlanInvalidError as exc:
+            # §5.8 分层：修复后仍非法的 JSON 输出是可恢复结果，交 Engine 计入
+            # 无效动作并回喂，不直接把 Run 失败。仅默认动作协议路径转换；
+            # Reviewer/Utility 自定义路径是一次性调用，维持抛出（其驱动方按
+            # 系统失败收口）。
+            await self._mark_step_failed(step, started, gated)
+            if decision_root is _AgentActionRoot:
+                logger.info(
+                    "model output invalid after repair for run %s; feeding back",
+                    run.id,
+                )
+                return InvalidModelOutput(code=exc.code, request_id=exc.request_id)  # type: ignore[return-value]
+            raise
         except (Exception, asyncio.CancelledError):
             # 失败/取消也必须给出 Step 终态，避免运行中快照残留。
             await self._mark_step_failed(step, started, gated)
@@ -245,4 +278,4 @@ class AgentModelGateway:
             logger.exception("failed to finalize failed agent step")
 
 
-__all__ = ["AgentModelGateway", "MAX_THINKING_TEXT_CHARS"]
+__all__ = ["AgentModelGateway", "InvalidModelOutput", "MAX_THINKING_TEXT_CHARS"]

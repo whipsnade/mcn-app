@@ -179,6 +179,9 @@ class AgentRunExecutor:
                 attempt_id=attempt.id,
                 profile=get_profile(run.profile_name),
                 messages=transcript.messages,
+                # §5.8/§10.5：用户可见 Run 注入 thinking sink，主 Agent 真实
+                # thinking 实时 SSE；内部 Run（Reviewer/Utility）为 None 不注入。
+                thinking_sink=engine.thinking_sink_for(run),
                 resume_step=transcript.resume_step,
                 resumed_by=resumed_by,
             )
