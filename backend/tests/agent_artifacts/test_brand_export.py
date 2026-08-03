@@ -166,6 +166,16 @@ def test_draft_brand_report_raises_unsupported() -> None:
     assert excinfo.value.code == "ARTIFACT_EXPORT_UNSUPPORTED"
 
 
+def test_invalid_published_payload_raises_unsupported() -> None:
+    """历史/旁路非法 payload（强类型 ValidationError）→ 稳定 409，不泄漏 500。"""
+    payload = build_brand_dict()
+    payload["data"]["overview"] = {"totally": "wrong"}  # 结构非法
+    with pytest.raises(ArtifactExportUnsupported) as excinfo:
+        export_artifact(_Version("brand_report_v3", payload))
+    assert excinfo.value.code == "ARTIFACT_EXPORT_UNSUPPORTED"
+    assert excinfo.value.schema_version == "brand_report_v3"
+
+
 def test_restricted_brand_discloses_restricted_sections() -> None:
     """data_status=restricted：受限章节保留列头 + 受限说明，不画误导性图表。"""
     payload = build_brand_dict()

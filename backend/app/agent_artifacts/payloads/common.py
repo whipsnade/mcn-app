@@ -214,6 +214,21 @@ def _has_covering_limitation(limitations: tuple[Limitation, ...], path: str) -> 
     )
 
 
+def _has_section_limitation(limitations: tuple[Limitation, ...], section: str) -> bool:
+    """A limitation covers a section: generic (empty paths) or its first path
+    segment (after an optional leading ``data``) equals the section name."""
+    for limitation in limitations:
+        if not limitation.affected_paths:
+            return True
+        for path in limitation.affected_paths:
+            parts = path.split(".")
+            if parts and parts[0] == "data":
+                parts = parts[1:]
+            if parts and parts[0] == section:
+                return True
+    return False
+
+
 def validate_unique(items: Sequence[Any], key_fields: Sequence[str], label: str) -> None:
     """Reject duplicate stable-business keys within a sequence of items.
 
@@ -273,16 +288,39 @@ class ArtifactPayloadBase(BaseModel):
         required = self.REQUIRED_SECTIONS
         data_dict = _to_dict(self.data)
 
+        # §2.5 反向聚合：所有必需章节必须存在于 availability。
+        missing_required = sorted(section for section in required if section not in availability)
+        if missing_required:
+            raise ValueError(
+                f"availability is missing required sections: {missing_required}"
+            )
+
         if self.data_status == "complete":
             for section in required:
-                entry = availability.get(section)
-                if entry is None or entry.status != "complete":
+                entry = availability[section]
+                if entry.status != "complete":
                     raise ValueError(
                         f"data_status=complete requires required section {section!r} to be complete"
                     )
         elif self.data_status == "restricted":
-            if not self.limitations:
-                raise ValueError("data_status=restricted requires at least one limitation")
+            # §2.5 反向聚合：restricted 当且仅当至少一个必需章节受限，且有覆盖
+            # 该章节的 limitation（affected_paths 为空 = 通用覆盖）。
+            restricted_required = [
+                section for section in required if availability[section].status != "complete"
+            ]
+            if not restricted_required:
+                raise ValueError(
+                    "data_status=restricted requires at least one required section "
+                    "to be partial/unavailable"
+                )
+            if not any(
+                _has_section_limitation(self.limitations, section)
+                for section in restricted_required
+            ):
+                raise ValueError(
+                    "data_status=restricted requires a limitation covering a "
+                    "restricted required section"
+                )
 
         # null business numeric is allowed only when its section is partial/unavailable
         # AND a limitation covers it; the null must never be coerced to 0.

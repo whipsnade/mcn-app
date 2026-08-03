@@ -33,15 +33,18 @@ from app.agent_runtime.state import RunStatus
 from app.model.prompt_logs import PromptLogEntry
 from app.model.tencent_plan import TencentPlanAdapter
 
+from tests.agent_artifacts.payload_fixtures import insight_payload
+
 APPROVE_JSON = '{"decision":"approve","issues":[]}'
 REVISE_JSON = (
     '{"decision":"revise","issues":[{"code":"missing_data","message":"需要补查"}]}'
 )
 REJECT_JSON = '{"decision":"reject","issues":[{"code":"untrusted","message":"无法追溯"}]}'
 
-# 无必需数字叶子，lineage 解析为空闭包，测试无需建 Evidence。
-PAYLOAD_V1 = {"data": {"overview": {"brand": "瑞幸"}}}
-PAYLOAD_V2 = {"data": {"overview": {"brand": "瑞幸", "note": "补查后"}}}
+# 无必需数字叶子的合法 payload（insight markdown），lineage 解析为空闭包，
+# 测试无需建 Evidence；A5 起 Draft 必须过强类型校验。
+PAYLOAD_V1 = insight_payload(title="初稿")
+PAYLOAD_V2 = insight_payload(title="补查后")
 
 
 def utc_now() -> datetime:
@@ -131,12 +134,12 @@ async def _make_draft(
         session_id=session_id,
         user_id=user_id,
         run_id=run_id,
-        module="brand",
-        business_fields={"brand": brand},
-        schema_version="brand_report_v3",
+        module="insight",
+        business_fields={"parent_artifact_version_id": "pv-1", "question": brand},
+        schema_version="insight_board_v1",
         payload=payload,
         evidence_refs=[],
-        artifact_type="brand_report_v3",
+        artifact_type="insight_board_v1",
     )
 
 

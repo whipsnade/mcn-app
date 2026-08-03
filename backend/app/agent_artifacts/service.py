@@ -1,21 +1,28 @@
-"""Artifact Draft 生命周期与未读水位服务（设计文档 §8.1 / Task 12）。
+"""Artifact Draft 生命周期与未读水位服务（设计文档 §8.1 / Task 12；v3 加固 §5.6/§5.7）。
 
 服务端职责：
 1. 稳定 Artifact 身份：``(session_id, artifact_key)`` 唯一；模型只提供业务字段，
    服务端用 ``build_artifact_key`` 生成 key，模型不能直接指定数据库 key；
-2. 不可变 Draft Revision：每次更新先插入新 Revision（``(draft_id, revision)`` 唯一），
+2. 强类型发布边界（§5.6）：create/update Draft 先过 ``ArtifactPayloadValidator``
+   （固定组合 + business fields 非空 + payload 契约），落库标准化
+   ``model_dump(mode="json")``，失败抛 ``ArtifactPayloadInvalid`` 不写任何行；
+   发布事务内锁定 Revision 后二次校验（防旧 Draft/旁路绕过）；
+3. 不可变 Draft Revision：每次更新先插入新 Revision（``(draft_id, revision)`` 唯一），
    再以乐观锁推进 ``artifact_drafts.current_revision``；旧 Revision 永久保留；
-3. artifact_busy 并发：working head 只允许一个活动 Run 持有；他人抢占返回结构化
+4. artifact_busy 并发：working head 只允许一个活动 Run 持有；他人抢占返回结构化
    ``ArtifactBusy``（``code == "artifact_busy"``），不覆盖、不静默丢写；
-   owner 释放（publish/fail）后新 Run 才能接管；
-4. Session 级 artifact sequence：每次创建/更新 Draft 递增 ``artifact_events.sequence``，
+   owner 释放（publish/fail/全出口释放）或旧 owner 已非活动（paused/终态/消失）
+   后新 Run 才能接管（§5.7）；
+5. Session 级 artifact sequence：每次创建/更新 Draft 递增 ``artifact_events.sequence``，
    事件携带 ``draft_revision`` 与稳定 ``artifact_id``；
-5. 未读水位：``agent_artifact_read_states`` 按 (user, session, module) 记录
+6. 未读水位：``agent_artifact_read_states`` 按 (user, session, module) 记录
    ``last_seen_sequence``，只前进到前端已渲染的 sequence（max(old, new)），
    绝不后退。
 
-``mark_draft_reviewing`` / ``release_draft`` 是 Task 13（Reviewer + 原子发布）的
-状态钩子：本任务只负责状态与 owner 释放，发布事务与版本写入由 Task 13 完成。
+``publish_batch`` 是发布事务：锁定 Batch/Item/Draft/Artifact 后先做发布边界校验
+（强类型二次校验 + ``ArtifactLineageFreezer`` 冻结 lineage 传递闭包写入
+``lineage_snapshot_json``，``evidence_refs_json`` 原样保留模型直接引用），
+全部通过才一次性插入全部不可变 Version。
 已读水位自迁移 0028 起读写独立的 ``agent_artifact_read_states``
 （session FK → agent_sessions）；遗留 ``artifact_read_states``
 （``app.artifacts.models.ArtifactReadState``）保持不动，仅供旧应用版本回滚。
@@ -34,6 +41,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_artifacts.keys import build_artifact_key
+from app.agent_artifacts.lineage import ArtifactLineageFreezer, LineageOwner
 from app.agent_artifacts.models import (
     AgentArtifact,
     AgentArtifactReadState,
@@ -45,9 +53,24 @@ from app.agent_artifacts.models import (
     ArtifactReviewBatch,
     ArtifactReviewItem,
 )
-from app.agent_runtime.models import AgentMessage
+from app.agent_artifacts.validation import (
+    ArtifactPayloadInvalid as ArtifactPayloadInvalid,
+    ArtifactPayloadValidator,
+)
+from app.agent_runtime.models import AgentMessage, AgentRun
 from app.agent_runtime.repository import AgentRunRepository
 from app.agent_runtime.state import RunStatus
+
+# 已暂停/终态的 Draft owner 不再视为「活动」：不阻塞新 Run 接管 working head
+# （与 kol_detail 的 _NON_ACTIVE_OWNER_STATUSES 模式对齐，§5.7）。
+_NON_ACTIVE_OWNER_STATUSES = frozenset(
+    {
+        RunStatus.PAUSED,
+        RunStatus.COMPLETED,
+        RunStatus.FAILED,
+        RunStatus.CANCELLED,
+    }
+)
 
 
 class PublishBlocked(Exception):
@@ -152,9 +175,19 @@ class ArtifactService:
         """构建 key → 锁定/创建稳定身份 → 锁定/认领 working head → 写入首个 Revision。
 
         - 稳定身份不存在时创建（``(session_id, artifact_key)`` 唯一约束兜底）；
-        - 另一个活动 Run 持有 working head 时抛 ``ArtifactBusy``；
-        - ``parent_artifact_version_id`` 只写进 Draft Revision，不写稳定行。
+        - 另一个活动 Run 持有 working head 时抛 ``ArtifactBusy``；旧 owner 已
+          非活动（paused/终态/消失）时新 Run 直接接管（§5.7）；
+        - ``parent_artifact_version_id`` 只写进 Draft Revision，不写稳定行；
+        - payload 先过强类型校验（§5.6），落库为标准化 ``model_dump(mode="json")``，
+          失败抛 ``ArtifactPayloadInvalid``、不落任何行。
         """
+        normalized_payload = ArtifactPayloadValidator.validate_new_draft(
+            module=module,
+            schema_version=schema_version,
+            artifact_type=artifact_type,
+            business_fields=business_fields,
+            payload=payload,
+        )
         artifact_key = build_artifact_key(module, **business_fields)
         now = _utcnow()
 
@@ -202,14 +235,18 @@ class ArtifactService:
             )
             self.db.add(draft)
             await self.db.flush()
-        elif draft.owner_run_id is not None and draft.owner_run_id != run_id:
+        elif (
+            draft.owner_run_id is not None
+            and draft.owner_run_id != run_id
+            and await self._owner_is_active(draft.owner_run_id)
+        ):
             raise ArtifactBusy(
                 artifact_key,
                 draft_id=draft.id,
                 owner_run_id=draft.owner_run_id,
             )
         else:
-            # 空闲/本人持有：认领（切换 owner 到当前 Run）
+            # 空闲/本人持有/旧 owner 已非活动（§5.7）：认领（切换 owner 到当前 Run）
             draft.owner_run_id = run_id
             draft.status = "drafting"
             draft.updated_at = now
@@ -221,10 +258,10 @@ class ArtifactService:
             run_id=run_id,
             revision=revision_no,
             schema_version=schema_version,
-            payload_json=payload,
+            payload_json=normalized_payload,
             evidence_refs_json=evidence_refs,
             parent_artifact_version_id=parent_artifact_version_id,
-            payload_hash=_payload_hash(payload),
+            payload_hash=_payload_hash(normalized_payload),
             created_at=now,
         )
         self.db.add(revision)
@@ -283,6 +320,13 @@ class ArtifactService:
         schema_version = (
             current_revision.schema_version if current_revision is not None else artifact.artifact_type
         )
+        # 强类型校验（§5.6）：失败抛 ArtifactPayloadInvalid，不写新 Revision。
+        normalized_payload = ArtifactPayloadValidator.validate_revision_payload(
+            module=artifact.module,
+            schema_version=schema_version,
+            artifact_type=artifact.artifact_type,
+            payload=payload,
+        )
 
         revision_no = draft.current_revision + 1
         revision = ArtifactDraftRevision(
@@ -291,12 +335,12 @@ class ArtifactService:
             run_id=run_id,
             revision=revision_no,
             schema_version=schema_version,
-            payload_json=payload,
+            payload_json=normalized_payload,
             evidence_refs_json=evidence_refs,
             parent_artifact_version_id=current_revision.parent_artifact_version_id
             if current_revision is not None
             else None,
-            payload_hash=_payload_hash(payload),
+            payload_hash=_payload_hash(normalized_payload),
             created_at=now,
         )
         self.db.add(revision)
@@ -317,6 +361,14 @@ class ArtifactService:
 
         await self.db.flush()
         return draft, revision
+
+    async def _owner_is_active(self, run_id: str) -> bool:
+        """owner Run 是否仍活动（queued/running/reviewing/clarification）；缺失/
+        paused/终态视为非活动，允许新 Run 接管 working head（§5.7）。"""
+        owner = await self.db.get(AgentRun, run_id)
+        if owner is None:
+            return False
+        return RunStatus(owner.status) not in _NON_ACTIVE_OWNER_STATUSES
 
     async def mark_draft_reviewing(self, run_id: str, draft_id: str) -> ArtifactDraft:
         """把 working head 置为 ``reviewing``（Task 13 发布事务的前置钩子）。"""
@@ -370,10 +422,12 @@ class ArtifactService:
 
         单事务内：锁定 Batch + 全部 Item + Draft + Artifact；先校验所有 Item 都在
         **当前** Revision 上 approve（任一不满足即抛 ``PublishBlocked``、整批回滚，
-        不产生任何部分 Version）；全部通过后才一次性插入全部
-        ``agent_artifact_versions``、更新 ``agent_artifacts.latest_version/status``、
-        把 Draft working head 置回 ``idle`` 并释放 owner、追加 ``published`` 事件、
-        写入 assistant 消息（``completion_text``），最后把父 Run 迁移到 completed。
+        不产生任何部分 Version）；再对每个 Revision 做发布边界校验（§5.6：强类型
+        payload 二次校验 + ``ArtifactLineageFreezer`` 冻结 lineage 传递闭包）；
+        全部通过后才一次性插入全部 ``agent_artifact_versions``、更新
+        ``agent_artifacts.latest_version/status``、把 Draft working head 置回
+        ``idle`` 并释放 owner、追加 ``published`` 事件、写入 assistant 消息
+        （``completion_text``），最后把父 Run 迁移到 completed。
         """
         now = _utcnow()
         batch = await self.db.scalar(
@@ -399,8 +453,16 @@ class ArtifactService:
 
         # 1) 全部校验通过前不写任何业务行（all-or-nothing）。
         plans: list[
-            tuple[ArtifactReviewItem, ArtifactDraft, ArtifactDraftRevision, AgentArtifact]
+            tuple[
+                ArtifactReviewItem,
+                ArtifactDraft,
+                ArtifactDraftRevision,
+                AgentArtifact,
+                dict[str, Any],
+                dict[str, Any],
+            ]
         ] = []
+        freezer = ArtifactLineageFreezer(self.db)
         for item in items:
             draft = await self.db.scalar(
                 select(ArtifactDraft)
@@ -432,11 +494,32 @@ class ArtifactService:
             )
             if artifact is None:
                 raise PublishBlocked(f"artifact {item.artifact_id!r} not found")
-            plans.append((item, draft, current_rev, artifact))
+            # 发布边界（§5.6）：锁定 Revision 后再次强类型校验，防旧 Draft/旁路
+            # 写入绕过 create/update 校验（失败抛 ArtifactPayloadInvalid，整批回滚）。
+            validated_payload = ArtifactPayloadValidator.validate_revision_payload(
+                module=artifact.module,
+                schema_version=current_rev.schema_version,
+                artifact_type=artifact.artifact_type,
+                payload=current_rev.payload_json,
+            )
+            # 冻结 lineage 传递闭包（菱形去重、跨层级展开），写入 Version 审计快照。
+            lineage_snapshot = await freezer.freeze(
+                payload=validated_payload,
+                refs=current_rev.evidence_refs_json,
+                owner=LineageOwner(
+                    user_id=artifact.user_id,
+                    session_id=artifact.session_id,
+                    run_id=batch.parent_run_id,
+                ),
+            )
+            plans.append(
+                (item, draft, current_rev, artifact, validated_payload, lineage_snapshot)
+            )
 
-        # 2) 一次性插入全部不可变 Version（复制 Revision 的 parent_artifact_version_id）。
+        # 2) 一次性插入全部不可变 Version（复制 Revision 的 parent_artifact_version_id；
+        # evidence_refs_json 原样保留模型直接引用，lineage_snapshot_json 存冻结闭包）。
         versions: list[AgentArtifactVersion] = []
-        for _item, _draft, current_rev, artifact in plans:
+        for _item, _draft, current_rev, artifact, validated_payload, lineage_snapshot in plans:
             version = AgentArtifactVersion(
                 id=str(uuid4()),
                 artifact_id=artifact.id,
@@ -445,10 +528,11 @@ class ArtifactService:
                 source_draft_revision_id=current_rev.id,
                 parent_artifact_version_id=current_rev.parent_artifact_version_id,
                 schema_version=current_rev.schema_version,
-                payload_json=current_rev.payload_json,
+                payload_json=validated_payload,
                 evidence_refs_json=current_rev.evidence_refs_json,
+                lineage_snapshot_json=lineage_snapshot,
                 review_json=await self._review_json_for_item(_item.id),
-                data_status=(current_rev.payload_json or {}).get("data_status", "complete"),
+                data_status=validated_payload["data_status"],
                 created_at=now,
             )
             self.db.add(version)
@@ -456,7 +540,7 @@ class ArtifactService:
         await self.db.flush()
 
         # 3) 释放 working head、更新稳定身份、追加 published 事件。
-        for (_item, draft, current_rev, artifact), version in zip(
+        for (_item, draft, current_rev, artifact, _payload, _snapshot), version in zip(
             plans, versions, strict=True
         ):
             await self.release_draft(draft.id, outcome="idle")

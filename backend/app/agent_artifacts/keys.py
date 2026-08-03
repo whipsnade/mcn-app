@@ -14,6 +14,9 @@
 序列化；序列化统一用 ``sort_keys``，保证与 dict 键顺序无关。
 
 API 只接受业务字段，不接受模型自定义 key —— 模型无法直接指定数据库 key。
+business fields 的非空校验（拒绝 ``brand:`` 这类裸 key）由发布边界的
+``ArtifactPayloadValidator``（``agent_artifacts/validation.py``）统一负责，
+本模块只做标准化与拼接。
 """
 
 from __future__ import annotations

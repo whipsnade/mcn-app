@@ -16,6 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_artifacts.service import ArtifactBusy, ArtifactService
+from app.agent_artifacts.validation import ArtifactPayloadInvalid, SCHEMA_VERSION_BY_MODULE
 from app.agent_runtime.tools.contracts import ToolContext, ToolResult
 
 
@@ -32,13 +33,20 @@ class CreateDraftArgs(BaseModel):
     parent_artifact_version_id: str | None = None
 
 
+_ARTIFACT_FIELD_HINTS: dict[str, dict[str, str]] = {
+    "brand": {"brand": "品牌名"},
+    "campaign": {"brand": "品牌名", "campaign": "活动名"},
+    "kol-selection": {"scope": "圈选条件对象（品牌/平台/粉丝要求等）"},
+    "kol-analysis": {"selection_artifact_id": "父圈选名单 Artifact id"},
+    "kol-detail": {"platform": "平台", "kol_uid": "达人 uid"},
+    "insight": {"parent_artifact_version_id": "父已发布 Version id", "question": "钻取问题"},
+}
+
+# module → (schema_version, business_fields 提示)；schema_version 与发布校验边界的
+# 固定组合（agent_artifacts.validation.SCHEMA_VERSION_BY_MODULE）保持同一真源。
 _ARTIFACT_MODULES = {
-    "brand": ("brand_report_v3", {"brand": "品牌名"}),
-    "campaign": ("campaign_report_v2", {"brand": "品牌名", "campaign": "活动名"}),
-    "kol-selection": ("kol_selection_v3", {"scope": "圈选条件对象（品牌/平台/粉丝要求等）"}),
-    "kol-analysis": ("kol_analysis_v2", {"selection_artifact_id": "父圈选名单 Artifact id"}),
-    "kol-detail": ("kol_detail_v2", {"platform": "平台", "kol_uid": "达人 uid"}),
-    "insight": ("insight_board_v1", {"parent_artifact_version_id": "父已发布 Version id", "question": "钻取问题"}),
+    module: (SCHEMA_VERSION_BY_MODULE[module], fields)
+    for module, fields in _ARTIFACT_FIELD_HINTS.items()
 }
 
 
@@ -91,6 +99,8 @@ class CreateDraftTool:
                 parent_artifact_version_id=args.parent_artifact_version_id,
             )
         except ArtifactBusy as exc:
+            return ToolResult(status="failed", safe_summary=str(exc), error_type=exc.code)
+        except ArtifactPayloadInvalid as exc:
             return ToolResult(status="failed", safe_summary=str(exc), error_type=exc.code)
         return ToolResult(
             status="success",
@@ -147,6 +157,8 @@ class UpdateDraftTool:
         except KeyError as exc:
             return ToolResult(status="failed", safe_summary=str(exc))
         except ArtifactBusy as exc:
+            return ToolResult(status="failed", safe_summary=str(exc), error_type=exc.code)
+        except ArtifactPayloadInvalid as exc:
             return ToolResult(status="failed", safe_summary=str(exc), error_type=exc.code)
         return ToolResult(
             status="success",

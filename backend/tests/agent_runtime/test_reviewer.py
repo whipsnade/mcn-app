@@ -50,6 +50,12 @@ from app.agent_runtime.state import RunStatus
 from app.model.prompt_logs import PromptLogEntry
 from app.model.tencent_plan import TencentPlanAdapter
 
+from tests.agent_artifacts.payload_fixtures import (
+    insight_metric_payload,
+    insight_metric_refs,
+    insight_payload,
+)
+
 APPROVE_JSON = '{"decision":"approve","issues":[]}'
 REVISE_JSON = (
     '{"decision":"revise","issues":[{"code":"missing_data","message":"需要补查声量数据"}]}'
@@ -58,24 +64,14 @@ REJECT_JSON = (
     '{"decision":"reject","issues":[{"code":"untrusted","message":"数字无法追溯"}]}'
 )
 
-# 无必需数字叶子的 payload：lineage 校验结果为空闭包，测试无需建 Evidence。
-PAYLOAD_V1 = {"data": {"overview": {"brand": "瑞幸"}}}
-PAYLOAD_V2 = {"data": {"overview": {"brand": "瑞幸", "note": "补查后"}}}
+# 无必需数字叶子的合法 payload（insight markdown）：lineage 校验结果为空闭包，
+# 测试无需建 Evidence；A5 起 Draft 必须过强类型校验。
+PAYLOAD_V1 = insight_payload(title="初稿")
+PAYLOAD_V2 = insight_payload(title="补查后")
 
-# 需要 lineage 的 payload + 对应 Evidence。
-PAYLOAD_WITH_NUMBER = {"data": {"overview": {"total_volume": 100}}}
-EVIDENCE_REFS = [
-    {
-        "artifact_path": "/data/overview/total_volume",
-        "sources": [
-            {
-                "source_type": "evidence",
-                "evidence_id": "e-1",
-                "source_path": "/0/声量",
-            }
-        ],
-    }
-]
+# 需要 lineage 的合法 payload（metric_grid 数字叶子）+ 对应 Evidence refs。
+PAYLOAD_WITH_NUMBER = insight_metric_payload(value=100)
+EVIDENCE_REFS = insight_metric_refs("e-1")
 
 
 def utc_now() -> datetime:
@@ -283,12 +279,12 @@ async def _make_draft(
         session_id=session_id,
         user_id=user_id,
         run_id=run_id,
-        module="brand",
-        business_fields={"brand": brand},
-        schema_version="brand_report_v3",
+        module="insight",
+        business_fields={"parent_artifact_version_id": "pv-1", "question": brand},
+        schema_version="insight_board_v1",
         payload=payload,
         evidence_refs=evidence_refs,
-        artifact_type="brand_report_v3",
+        artifact_type="insight_board_v1",
     )
 
 
@@ -546,10 +542,10 @@ async def test_reviewer_input_contract_no_mcp_and_resolved_lineage(
     assert context["payload"] == PAYLOAD_WITH_NUMBER
     # 解析后的 lineage 闭包含 Evidence 叶子
     lineage = context["lineage"]
-    assert lineage["refs"][0]["artifact_path"] == "/data/overview/total_volume"
+    assert lineage["refs"][0]["artifact_path"] == "/data/0/cards/0/value"
     assert lineage["refs"][0]["sources"][0]["evidence_id"] == "e-1"
     # 允许的 Schema + 已知限制
-    assert context["schema"]["schema_version"] == "brand_report_v3"
+    assert context["schema"]["schema_version"] == "insight_board_v1"
     assert isinstance(context["limitations"], list)
     # 请求不带任何工具注册
     assert "tools" not in client.calls[0]

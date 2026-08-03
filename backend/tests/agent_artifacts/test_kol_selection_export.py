@@ -162,6 +162,16 @@ def test_draft_kol_selection_raises_unsupported() -> None:
     assert excinfo.value.code == "ARTIFACT_EXPORT_UNSUPPORTED"
 
 
+def test_invalid_published_payload_raises_unsupported() -> None:
+    """历史/旁路非法 payload（强类型 ValidationError）→ 稳定 409，不泄漏 500。"""
+    payload = build_kol_selection_dict()
+    payload["data"]["scoring"] = {"version": "kol_score_v1"}  # 非法评分块
+    with pytest.raises(ArtifactExportUnsupported) as excinfo:
+        export_artifact(_Version("kol_selection_v3", payload))
+    assert excinfo.value.code == "ARTIFACT_EXPORT_UNSUPPORTED"
+    assert excinfo.value.schema_version == "kol_selection_v3"
+
+
 def test_export_never_calls_model_or_mcp() -> None:
     """导出是表现层能力：传入的 model/gateway 桩绝不被调用。"""
     model = Mock()

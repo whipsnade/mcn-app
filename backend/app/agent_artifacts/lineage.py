@@ -501,7 +501,35 @@ class DbLineageLoader:
         )
 
 
+class ArtifactLineageFreezer:
+    """发布事务的 lineage 冻结边界（v3 加固 §5.6 / A5）。
+
+    发布时重算 ``validate_and_freeze_lineage`` 的 Evidence 传递闭包，产出可直接
+    落库 ``agent_artifact_versions.lineage_snapshot_json`` 的 JSON dict。
+    ``evidence_refs_json`` 仍记录模型直接引用，两者职责分离（引用 vs 审计快照）。
+    """
+
+    def __init__(self, db: AsyncSession) -> None:
+        self._loader = DbLineageLoader(db)
+
+    async def freeze(
+        self,
+        *,
+        payload: dict[str, Any],
+        refs: list[dict[str, Any]] | None,
+        owner: LineageOwner,
+    ) -> dict[str, Any]:
+        frozen = await validate_and_freeze_lineage(
+            payload=payload,
+            refs=refs or [],
+            owner=owner,
+            loader=self._loader,
+        )
+        return frozen.model_dump(mode="json")
+
+
 __all__ = [
+    "ArtifactLineageFreezer",
     "ArtifactVersionRecord",
     "DbLineageLoader",
     "EvidenceRecord",

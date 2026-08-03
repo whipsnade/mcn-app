@@ -92,6 +92,25 @@ class ReviewOwnershipError(ValueError):
     """Item 所属 batch 的 parent_run 与传入的父 Run 不一致，拒绝复核。"""
 
 
+class ReviewBatchDraftSetMismatch(ValueError):
+    """复用既有 Batch 时提交的 Draft 集合与首次冻结的集合不一致（§5.7）。
+
+    首次 ``submit_review`` 创建 Batch 后冻结 Draft ID 集合与 completion_text；
+    后续提交必须与原集合一致，新增/遗漏/替换 Draft 都抛本异常，由引擎转为
+    结构化 ``review_batch_draft_set_mismatch`` 回喂模型（不建/不改 Batch）。
+    """
+
+    code = "review_batch_draft_set_mismatch"
+
+    def __init__(self, *, frozen: list[str], submitted: list[str]) -> None:
+        self.frozen = frozen
+        self.submitted = submitted
+        super().__init__(
+            f"submitted draft set {submitted} does not match the frozen review "
+            f"batch draft set {frozen}; revise the original drafts or finish the run"
+        )
+
+
 @dataclass(frozen=True)
 class ReviewAttemptResult:
     """一次 Reviewer 调用的结果摘要（含 attempt 与内部 Run 引用）。"""
@@ -144,7 +163,23 @@ class ReviewerDriver:
 
         每个 Item 绑定该 Draft 的**当前**不可变 Revision；Draft 后续被修改时由
         ``review_item`` 在下次调用前改绑新 Revision 并使旧 approve 失效。
+
+        先整体校验全部 Draft 存在且归本 Run 所有（幻觉/他人 draft_id 抛
+        ``LookupError``/``ArtifactBusy``），再写任何行——绝不留下半成品 Batch。
+        首次创建后 Batch 的 Draft 集合与 completion_text 即冻结（§5.7）。
         """
+        drafts: list[ArtifactDraft] = []
+        for draft_id in draft_ids:
+            draft = await self.db.get(ArtifactDraft, draft_id)
+            if draft is None:
+                raise LookupError(f"draft {draft_id!r} not found")
+            if draft.owner_run_id != parent_run_id:
+                raise ArtifactBusy(
+                    draft.artifact_id,
+                    draft_id=draft.id,
+                    owner_run_id=draft.owner_run_id,
+                )
+            drafts.append(draft)
         batch = ArtifactReviewBatch(
             id=str(uuid4()),
             parent_run_id=parent_run_id,
@@ -154,11 +189,8 @@ class ReviewerDriver:
         )
         self.db.add(batch)
         await self.db.flush()
-        for draft_id in draft_ids:
-            draft = await self.db.get(ArtifactDraft, draft_id)
-            if draft is None:
-                raise LookupError(f"draft {draft_id!r} not found")
-            # working head 置为 reviewing（owner 必须是本 Run）。
+        for draft in drafts:
+            # working head 置为 reviewing（owner 已预校验是本 Run）。
             await self._service.mark_draft_reviewing(parent_run_id, draft.id)
             current_rev = await self.db.scalar(
                 select(ArtifactDraftRevision).where(
@@ -256,7 +288,7 @@ class ReviewerDriver:
             messages=[ChatMessage(role="user", content=json.dumps(context, ensure_ascii=False))],
             thinking_sink=None,
             step_sequence=1,
-            purpose="agent_loop",
+            purpose="artifact_reviewer",
             template_name="artifact_reviewer_v1",
             decision_root=REVIEW_DECISION_ROOT,
         )
@@ -346,13 +378,13 @@ class ReviewerDriver:
         draft_ids: tuple[str, ...] | list[str],
         outcome: str = "failed",
     ) -> None:
-        """取消 / 系统失败时释放仍属于 ``run_id`` 的 working head（Task 13 hook）。
+        """非发布出口释放仍属于 ``run_id`` 的 working head（§5.7）。
 
-        父 Run 在 reviewing 状态被取消或系统失败（非 reject）时，引擎调用本方法把
-        该批 Draft 置回 ``idle``/``failed`` 并释放 ``owner_run_id``，历史 Revision
-        永久保留；此后新 Run 可立即接管同一 Artifact，避免 Artifact 永久
-        ``artifact_busy``。不属于本 Run 的 Draft 抛 ``ArtifactBusy``（防误释放）；
-        已释放（owner 为 None）的 Draft 幂等跳过。
+        取消、系统失败、ask_user/complete/paused/failed 出口都经本方法把该
+        Run 持有的 Draft 置回 ``idle``/``failed`` 并释放 ``owner_run_id``，
+        历史 Revision 永久保留；此后新 Run 可立即接管同一 Artifact，避免
+        Artifact 永久 ``artifact_busy``。不属于本 Run 的 Draft 抛
+        ``ArtifactBusy``（防误释放）；已释放（owner 为 None）的 Draft 幂等跳过。
         """
         if outcome not in ("idle", "failed"):
             raise ValueError(f"invalid cancel outcome: {outcome!r}")
@@ -482,6 +514,7 @@ __all__ = [
     "MAX_REVIEW_ATTEMPTS",
     "REVIEW_DECISION_ROOT",
     "ReviewAttemptResult",
+    "ReviewBatchDraftSetMismatch",
     "ReviewDecision",
     "ReviewIssue",
     "ReviewLimitExceeded",

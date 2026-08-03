@@ -1013,10 +1013,34 @@ async def test_uat_reviewer_revise_then_fix() -> None:
             self.calls = 0
             self.draft_id: str | None = None
             self._evidence_id = evidence_id
-            self._payload = {"data": {"overview": {"brand": "瑞幸", "volume": 100}}}
+            # A5 起 create_draft 必须过强类型校验：insight_board_v1 + 指向真实
+            # Evidence 的 lineage ref（数字叶子 /data/0/cards/0/value）。
+            self._payload = {
+                "schema_version": "insight_board_v1",
+                "module": "brand",
+                "data_status": "complete",
+                "availability": {"blocks": {"status": "complete", "reason_codes": []}},
+                "limitations": [],
+                "methodology": {
+                    "data_as_of": "2026-08-03T00:00:00",
+                    "source_names": ["query_analysis_data"],
+                    "notes": [],
+                },
+                "title": "瑞幸声量钻取",
+                "scope": {"summary": "瑞幸品牌声量"},
+                "parent_artifact_id": "manual-scenario",
+                "narrative": {"summary": "声量 100", "findings": []},
+                "data": [
+                    {
+                        "block_type": "metric_grid",
+                        "title": "指标",
+                        "cards": [{"key": "volume", "label": "声量", "value": 100}],
+                    }
+                ],
+            }
             self._refs = [
                 {
-                    "artifact_path": "/data/overview/volume",
+                    "artifact_path": "/data/0/cards/0/value",
                     "sources": [
                         {
                             "source_type": "evidence",
@@ -1036,10 +1060,13 @@ async def test_uat_reviewer_revise_then_fix() -> None:
                     action="call_tool",
                     internal_tool_name="create_draft",
                     arguments={
-                        "module": "brand",
-                        "schema_version": "brand_report_v3",
-                        "artifact_type": "brand_report_v3",
-                        "business_fields": {"brand": "瑞幸"},
+                        "module": "insight",
+                        "schema_version": "insight_board_v1",
+                        "artifact_type": "insight_board_v1",
+                        "business_fields": {
+                            "parent_artifact_version_id": "manual-scenario",
+                            "question": "瑞幸声量如何",
+                        },
                         "payload": self._payload,
                         "evidence_refs": self._refs,
                     },

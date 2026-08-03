@@ -56,6 +56,8 @@ from app.mcp_gateway.contracts import DataTapService
 from app.mcp_gateway.transport import RemoteToolResult
 from app.model.contracts import ChatMessage
 
+from tests.agent_artifacts.payload_fixtures import insight_metric_payload, insight_payload
+
 INPUT_SCHEMA = {
     "type": "object",
     "properties": {"keyword": {"type": "string"}},
@@ -77,8 +79,9 @@ OK_PAYLOAD = {
 INTERNAL_NAME = "query_analysis_data"
 REMOTE_NAME = "datatap.insight.query.analysis.v1"
 
-# 无必需数字叶子的 payload：lineage 校验结果为空闭包，无需建 Evidence。
-PAYLOAD_V1 = {"data": {"overview": {"brand": "瑞幸"}}}
+# 无必需数字叶子的合法 payload（insight markdown）：lineage 校验结果为空闭包，
+# 无需建 Evidence；A5 起 Draft 必须过强类型校验。
+PAYLOAD_V1 = insight_payload()
 
 
 # ---------------------------------------------------------------------------
@@ -309,12 +312,12 @@ async def _make_draft(
         session_id=run.session_id,
         user_id=run.user_id,
         run_id=run.id,
-        module="brand",
-        business_fields={"brand": brand},
-        schema_version="brand_report_v3",
+        module="insight",
+        business_fields={"parent_artifact_version_id": "pv-1", "question": brand},
+        schema_version="insight_board_v1",
         payload=payload if payload is not None else PAYLOAD_V1,
         evidence_refs=evidence_refs,
-        artifact_type="brand_report_v3",
+        artifact_type="insight_board_v1",
     )
     return service, draft, revision
 
@@ -711,7 +714,7 @@ async def test_submit_review_with_invalid_lineage_fed_back_as_structured_error(
 ) -> None:
     """必需数字叶子的 Draft 缺 lineage：拒绝进入 Review，回喂模型修正（§10.4）。"""
     run, attempt, _, _ = await _setup_run(db_session, user_factory)
-    payload = {"data": {"overview": {"total_volume": 100}}}
+    payload = insight_metric_payload(value=100)
     _, draft, _ = await _make_draft(db_session, run, payload=payload)
     engine, gateway, _ = _make_engine(
         db_session,
@@ -1102,3 +1105,442 @@ async def test_fresh_run_per_message_and_only_paused_resumes(
     repo = AgentRunRepository(db_session)
     with pytest.raises(InvalidRunTransition):
         await repo.begin_attempt(run_a.id, resumed=True)
+
+
+# ---------------------------------------------------------------------------
+# 4. A5：Review Batch 集合冻结 / 幻觉 draft_id 回喂 / Draft 全出口释放
+# ---------------------------------------------------------------------------
+
+
+async def test_review_batch_draft_set_mismatch_added_draft(
+    db_session, user_factory
+) -> None:
+    """首次 submit 冻结 Batch 集合后，新增 Draft 提交 → 结构化 mismatch 回喂，
+    不建/不改 Batch，模型可继续（§5.7）。"""
+    run, attempt, _, _ = await _setup_run(db_session, user_factory)
+    _, draft_a, _ = await _make_draft(db_session, run, brand="瑞幸")
+    _, draft_b, _ = await _make_draft(db_session, run, brand="库迪")
+    engine, gateway, _ = _make_engine(
+        db_session,
+        actions=[
+            SubmitReview(
+                action="submit_review",
+                artifact_draft_ids=(draft_a.id,),
+                completion_text="品牌分析完成",
+                summary="分析",
+            ),
+            SubmitReview(
+                action="submit_review",
+                artifact_draft_ids=(draft_a.id, draft_b.id),
+                completion_text="品牌分析完成",
+                summary="分析",
+            ),
+            Complete(action="complete", text="结束"),
+        ],
+        decisions=[
+            ReviewDecision(
+                decision="revise",
+                issues=[ReviewIssue(code="missing_data", message="需要补查")],
+            ),
+        ],
+    )
+    outcome = await engine.run(
+        run=run,
+        attempt_id=attempt.id,
+        profile=get_profile("session_analyst_v1"),
+        messages=[ChatMessage(role="user", content="分析瑞幸品牌")],
+    )
+    assert outcome.status == RunStatus.COMPLETED
+    # 只有一条 Batch，且未被改动（仍 pending 等原集合复审）
+    batches = (
+        await db_session.scalars(
+            select(ArtifactReviewBatch).where(ArtifactReviewBatch.parent_run_id == run.id)
+        )
+    ).all()
+    assert len(batches) == 1
+    assert batches[0].status == "pending"
+    # mismatch 回喂进第三次 decide 的消息
+    assert len(gateway.calls) == 3
+    assert any(
+        "review_batch_draft_set_mismatch" in m.content for m in gateway.calls[2]["messages"]
+    )
+
+
+async def test_review_batch_draft_set_mismatch_missing_draft(
+    db_session, user_factory
+) -> None:
+    """遗漏冻结集合中的 Draft → mismatch 回喂。"""
+    run, attempt, _, _ = await _setup_run(db_session, user_factory)
+    _, draft_a, _ = await _make_draft(db_session, run, brand="瑞幸")
+    _, draft_b, _ = await _make_draft(db_session, run, brand="库迪")
+    engine, gateway, _ = _make_engine(
+        db_session,
+        actions=[
+            SubmitReview(
+                action="submit_review",
+                artifact_draft_ids=(draft_a.id, draft_b.id),
+                completion_text="完成",
+                summary="分析",
+            ),
+            SubmitReview(
+                action="submit_review",
+                artifact_draft_ids=(draft_a.id,),
+                completion_text="完成",
+                summary="分析",
+            ),
+            Complete(action="complete", text="结束"),
+        ],
+        decisions=[
+            ReviewDecision(
+                decision="revise",
+                issues=[ReviewIssue(code="missing_data", message="需要补查")],
+            ),
+            ReviewDecision(
+                decision="revise",
+                issues=[ReviewIssue(code="missing_data", message="需要补查")],
+            ),
+        ],
+    )
+    outcome = await engine.run(
+        run=run,
+        attempt_id=attempt.id,
+        profile=get_profile("session_analyst_v1"),
+        messages=[ChatMessage(role="user", content="分析两个品牌")],
+    )
+    assert outcome.status == RunStatus.COMPLETED
+    assert any(
+        "review_batch_draft_set_mismatch" in m.content for m in gateway.calls[2]["messages"]
+    )
+
+
+async def test_review_batch_draft_set_mismatch_replaced_draft(
+    db_session, user_factory
+) -> None:
+    """替换 Draft（放弃原 Draft 新建）→ mismatch 回喂，原 Batch 不受影响。"""
+    run, attempt, _, _ = await _setup_run(db_session, user_factory)
+    _, draft_a, _ = await _make_draft(db_session, run, brand="瑞幸")
+    _, draft_b, _ = await _make_draft(db_session, run, brand="库迪")
+    engine, gateway, _ = _make_engine(
+        db_session,
+        actions=[
+            SubmitReview(
+                action="submit_review",
+                artifact_draft_ids=(draft_a.id,),
+                completion_text="完成",
+                summary="分析",
+            ),
+            SubmitReview(
+                action="submit_review",
+                artifact_draft_ids=(draft_b.id,),
+                completion_text="完成",
+                summary="分析",
+            ),
+            Complete(action="complete", text="结束"),
+        ],
+        decisions=[
+            ReviewDecision(
+                decision="revise",
+                issues=[ReviewIssue(code="missing_data", message="需要补查")],
+            ),
+        ],
+    )
+    outcome = await engine.run(
+        run=run,
+        attempt_id=attempt.id,
+        profile=get_profile("session_analyst_v1"),
+        messages=[ChatMessage(role="user", content="分析瑞幸品牌")],
+    )
+    assert outcome.status == RunStatus.COMPLETED
+    batches = (
+        await db_session.scalars(
+            select(ArtifactReviewBatch).where(ArtifactReviewBatch.parent_run_id == run.id)
+        )
+    ).all()
+    assert len(batches) == 1
+    assert any(
+        "review_batch_draft_set_mismatch" in m.content for m in gateway.calls[2]["messages"]
+    )
+
+
+async def test_review_batch_mismatch_counts_as_invalid_and_fails_run(
+    db_session, user_factory
+) -> None:
+    """连续 mismatch 计入无效动作：达到上限后 Run failed，不无限循环。"""
+    run, attempt, _, _ = await _setup_run(db_session, user_factory)
+    _, draft_a, _ = await _make_draft(db_session, run, brand="瑞幸")
+    _, draft_b, _ = await _make_draft(db_session, run, brand="库迪")
+    engine, gateway, _ = _make_engine(
+        db_session,
+        actions=[
+            SubmitReview(
+                action="submit_review",
+                artifact_draft_ids=(draft_a.id,),
+                completion_text="完成",
+                summary="分析",
+            ),
+            *[
+                SubmitReview(
+                    action="submit_review",
+                    artifact_draft_ids=(draft_b.id,),
+                    completion_text="完成",
+                    summary="分析",
+                )
+                for _ in range(MAX_INVALID_ACTIONS)
+            ],
+        ],
+        decisions=[
+            ReviewDecision(
+                decision="revise",
+                issues=[ReviewIssue(code="missing_data", message="需要补查")],
+            ),
+        ],
+    )
+    outcome = await engine.run(
+        run=run,
+        attempt_id=attempt.id,
+        profile=get_profile("session_analyst_v1"),
+        messages=[ChatMessage(role="user", content="分析瑞幸品牌")],
+    )
+    assert outcome.status == RunStatus.FAILED
+    assert len(gateway.calls) == 1 + MAX_INVALID_ACTIONS
+    assert any(
+        "review_batch_draft_set_mismatch" in m.content for m in gateway.calls[-1]["messages"]
+    )
+
+
+async def test_submit_review_with_nonexistent_draft_id_fed_back_as_validation_error(
+    db_session, user_factory
+) -> None:
+    """幻觉 draft_id（不存在）：结构化 validation_error 回喂并计入无效动作，
+    不整 Run 崩溃；模型随后可正常完成。"""
+    run, attempt, _, _ = await _setup_run(db_session, user_factory)
+    engine, gateway, _ = _make_engine(
+        db_session,
+        actions=[
+            SubmitReview(
+                action="submit_review",
+                artifact_draft_ids=("ghost-draft-id",),
+                completion_text="完成",
+                summary="分析",
+            ),
+            Complete(action="complete", text="改为直接回答"),
+        ],
+        decisions=[],
+    )
+    outcome = await engine.run(
+        run=run,
+        attempt_id=attempt.id,
+        profile=get_profile("session_analyst_v1"),
+        messages=[ChatMessage(role="user", content="分析瑞幸品牌")],
+    )
+    assert outcome.status == RunStatus.COMPLETED
+    assert len(gateway.calls) == 2
+    assert any(
+        "draft_not_found" in m.content for m in gateway.calls[1]["messages"]
+    )
+    # 未创建任何 Review Batch
+    assert (
+        await db_session.scalar(
+            select(func.count(ArtifactReviewBatch.id)).where(
+                ArtifactReviewBatch.parent_run_id == run.id
+            )
+        )
+    ) == 0
+
+
+async def test_submit_review_with_foreign_draft_id_fed_back_as_artifact_busy(
+    db_session, user_factory
+) -> None:
+    """幻觉 draft_id（属于其他活动 Run）：结构化 artifact_busy 回喂，
+    他人的 Draft 不被误标 reviewing、不建 Batch。"""
+    run, attempt, user, session = await _setup_run(db_session, user_factory)
+    run_b, _ = await _new_run(db_session, user_id=user.id, session_id=session.id)
+    _, draft_b, _ = await _make_draft(db_session, run_b, brand="瑞幸")
+    engine, gateway, _ = _make_engine(
+        db_session,
+        actions=[
+            SubmitReview(
+                action="submit_review",
+                artifact_draft_ids=(draft_b.id,),
+                completion_text="完成",
+                summary="分析",
+            ),
+            Complete(action="complete", text="改为直接回答"),
+        ],
+        decisions=[],
+    )
+    outcome = await engine.run(
+        run=run,
+        attempt_id=attempt.id,
+        profile=get_profile("session_analyst_v1"),
+        messages=[ChatMessage(role="user", content="分析瑞幸品牌")],
+    )
+    assert outcome.status == RunStatus.COMPLETED
+    assert any(
+        "artifact_busy" in m.content for m in gateway.calls[1]["messages"]
+    )
+    # 他人 Draft 不受影响：owner 不变、状态不进入 reviewing
+    draft_row = await db_session.get(ArtifactDraft, draft_b.id)
+    assert draft_row is not None
+    assert draft_row.owner_run_id == run_b.id
+    assert draft_row.status == "drafting"
+    assert (
+        await db_session.scalar(
+            select(func.count(ArtifactReviewBatch.id)).where(
+                ArtifactReviewBatch.parent_run_id == run.id
+            )
+        )
+    ) == 0
+
+
+async def test_ask_user_releases_owned_drafts_and_new_run_can_take_over(
+    db_session, user_factory
+) -> None:
+    """模型建 Draft 后 ask_user：当前 Run 持有的 Draft 释放（idle，Revision 保留），
+    新 Run 同 key 可立即接管（§5.7）。"""
+    run, attempt, user, session = await _setup_run(db_session, user_factory)
+    service, draft, _ = await _make_draft(db_session, run, brand="瑞幸")
+    engine, _, _ = _make_engine(
+        db_session,
+        actions=[
+            AskUser(action="ask_user", question="确认分析方向", options=["声量", "情感"]),
+        ],
+        decisions=[],
+    )
+    outcome = await engine.run(
+        run=run,
+        attempt_id=attempt.id,
+        profile=get_profile("session_analyst_v1"),
+        messages=[ChatMessage(role="user", content="分析瑞幸品牌")],
+    )
+    assert outcome.status == RunStatus.CLARIFICATION_REQUESTED
+    draft_row = await db_session.get(ArtifactDraft, draft.id)
+    assert draft_row is not None
+    assert draft_row.owner_run_id is None
+    assert draft_row.status == "idle"
+
+    # 新 Run 同 key 可接管（不再 artifact_busy），Revision 在历史之上递增。
+    run_b, _ = await _new_run(db_session, user_id=user.id, session_id=session.id)
+    artifact_b, draft_b, revision_b = await service.create_or_get_draft(
+        session_id=session.id,
+        user_id=user.id,
+        run_id=run_b.id,
+        module="insight",
+        business_fields={"parent_artifact_version_id": "pv-1", "question": "瑞幸"},
+        schema_version="insight_board_v1",
+        payload=PAYLOAD_V1,
+        evidence_refs=[],
+        artifact_type="insight_board_v1",
+    )
+    assert draft_b.id == draft.id
+    assert draft_b.owner_run_id == run_b.id
+    assert revision_b.revision == 2
+
+
+async def test_complete_releases_owned_drafts(db_session, user_factory) -> None:
+    """complete 出口（无正式产物）释放本 Run 持有的 Draft（§5.7）。"""
+    run, attempt, _, _ = await _setup_run(db_session, user_factory)
+    _, draft, _ = await _make_draft(db_session, run, brand="瑞幸")
+    engine, _, _ = _make_engine(
+        db_session,
+        actions=[Complete(action="complete", text="直接回答完毕")],
+        decisions=[],
+    )
+    outcome = await engine.run(
+        run=run,
+        attempt_id=attempt.id,
+        profile=get_profile("session_analyst_v1"),
+        messages=[ChatMessage(role="user", content="随便聊聊")],
+    )
+    assert outcome.status == RunStatus.COMPLETED
+    draft_row = await db_session.get(ArtifactDraft, draft.id)
+    assert draft_row is not None
+    assert draft_row.owner_run_id is None
+    assert draft_row.status == "idle"
+
+
+async def test_pause_releases_owned_drafts(db_session, user_factory) -> None:
+    """paused 出口释放本 Run 持有的 Draft（§5.7）。"""
+    run, attempt, _, _ = await _setup_run(db_session, user_factory)
+    _, draft, _ = await _make_draft(db_session, run, brand="瑞幸")
+    actions = [
+        CallTool(
+            action="call_tool",
+            internal_tool_name="noop_calc",
+            arguments={"value": str(index)},
+            rationale="步进",
+        )
+        for index in range(50)
+    ]
+    engine, _, _ = _make_engine(
+        db_session, actions=actions, decisions=[], registry=_noop_registry()
+    )
+    outcome = await engine.run(
+        run=run,
+        attempt_id=attempt.id,
+        profile=get_profile("session_analyst_v1"),
+        messages=[ChatMessage(role="user", content="跑满决策数")],
+    )
+    assert outcome.status == RunStatus.PAUSED
+    draft_row = await db_session.get(ArtifactDraft, draft.id)
+    assert draft_row is not None
+    assert draft_row.owner_run_id is None
+    assert draft_row.status == "idle"
+
+
+async def test_run_failure_releases_owned_drafts_as_failed(
+    db_session, user_factory
+) -> None:
+    """failed 出口（模型决策异常）释放本 Run 持有的 Draft（failed，§5.7）。"""
+    run, attempt, _, _ = await _setup_run(db_session, user_factory)
+    _, draft, _ = await _make_draft(db_session, run, brand="瑞幸")
+
+    async def boom(_run, _index) -> None:
+        raise RuntimeError("model exploded")
+
+    engine, _, _ = _make_engine(
+        db_session,
+        actions=[Complete(action="complete", text="不会到达")],
+        decisions=[],
+        on_decide=boom,
+    )
+    outcome = await engine.run(
+        run=run,
+        attempt_id=attempt.id,
+        profile=get_profile("session_analyst_v1"),
+        messages=[ChatMessage(role="user", content="开始")],
+    )
+    assert outcome.status == RunStatus.FAILED
+    draft_row = await db_session.get(ArtifactDraft, draft.id)
+    assert draft_row is not None
+    assert draft_row.owner_run_id is None
+    assert draft_row.status == "failed"
+
+
+async def test_reviewer_calls_use_artifact_reviewer_purpose(
+    db_session, user_factory
+) -> None:
+    """Reviewer 调用的审计 purpose 是 artifact_reviewer（不再误标 agent_loop）。"""
+    run, attempt, _, _ = await _setup_run(db_session, user_factory)
+    _, draft, _ = await _make_draft(db_session, run)
+    engine, _, reviewer_gateway = _make_engine(
+        db_session,
+        actions=[
+            SubmitReview(
+                action="submit_review",
+                artifact_draft_ids=(draft.id,),
+                completion_text="品牌分析完成",
+                summary="瑞幸品牌分析",
+            ),
+        ],
+        decisions=[ReviewDecision(decision="approve")],
+    )
+    outcome = await engine.run(
+        run=run,
+        attempt_id=attempt.id,
+        profile=get_profile("session_analyst_v1"),
+        messages=[ChatMessage(role="user", content="分析瑞幸品牌")],
+    )
+    assert outcome.status == RunStatus.COMPLETED
+    assert len(reviewer_gateway.calls) == 1
+    assert reviewer_gateway.calls[0]["purpose"] == "artifact_reviewer"

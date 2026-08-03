@@ -26,6 +26,7 @@ from sqlalchemy import select
 
 from app.agent_artifacts.builders.common import DraftBuildError, DraftBuildResult
 from app.agent_artifacts.builders.kol_analysis import build_kol_analysis_draft
+from app.agent_artifacts.keys import build_artifact_key
 from app.agent_artifacts.lineage import (
     ArtifactVersionRecord,
     EvidenceRecord,
@@ -44,6 +45,8 @@ from app.agent_runtime.profiles import ARTIFACT_TOOLS, PROFILES
 from app.agent_runtime.tools.artifacts import CreateDraftArgs, CreateDraftTool, UpdateDraftTool
 from app.agent_runtime.tools.contracts import ToolContext
 from app.agent_runtime.tools.registry import ToolRegistry
+
+from tests.agent_artifacts.payload_fixtures import insight_payload
 
 session_analyst = PROFILES["session_analyst_v1"]
 
@@ -119,7 +122,66 @@ def _selection_item(
 
 
 def _selection_payload(items: list[dict[str, Any]]) -> dict[str, Any]:
-    return {"data": {"items": items}}
+    """完整合法 kol_selection_v3（A5 起 Draft 必须过强类型校验）。
+
+    分析 builder 只读 ``data.items``；标准化 dump 保证「输入即存储形态」。
+    超过 Top20 上限时返回未校验的历史版本形态（分析 builder 的截断测试需要
+    25 条候选；发布侧的 Top20 约束由 KolSelectionV3 保证）。
+    """
+    from app.agent_artifacts.payloads.kol_selection import KolSelectionV3
+
+    payload = {
+        "schema_version": "kol_selection_v3",
+        "module": "kol",
+        "data_status": "complete",
+        "availability": {
+            section: {"status": "complete", "reason_codes": []}
+            for section in ("scoring", "items", "summary")
+        },
+        "limitations": [],
+        "methodology": {
+            "data_as_of": datetime(2026, 1, 15, 12, 0),
+            "source_names": ["DataTap"],
+            "notes": [],
+        },
+        "scope": {
+            "brand": "某品牌",
+            "category": None,
+            "campaign": None,
+            "platforms": ["小红书"],
+            "audience": {"regions": [], "age_ranges": [], "interests": []},
+            "filters": {
+                "budget_min": None,
+                "budget_max": None,
+                "follower_min": None,
+                "follower_max": None,
+            },
+        },
+        "data": {
+            "scoring": {
+                "version": "kol_score_v2",
+                "method": "weighted_sum",
+                "weights": WEIGHTS,
+                "missing_value_policy": "missing_as_zero",
+            },
+            "items": items,
+            "summary": {
+                "candidate_count": len(items),
+                "selected_count": len(items),
+                "platform_distribution": [],
+                "rating_distribution": [],
+            },
+        },
+        "narrative": {
+            "selection_summary": "名单",
+            "fit_findings": [],
+            "risk_notes": [],
+            "usage_advice": [],
+        },
+    }
+    if len(items) > 20:
+        return payload
+    return KolSelectionV3.model_validate(payload).model_dump(mode="json")
 
 
 def _selection_refs(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -577,10 +639,10 @@ async def test_create_and_update_draft_tools_persist_through_service(
     registry.register(CreateDraftTool(db_session), category=ARTIFACT_TOOLS)
     registry.register(UpdateDraftTool(db_session), category=ARTIFACT_TOOLS)
 
-    payload_v1 = {"data": {"overview": {"total_volume": 100}}}
+    payload_v1 = insight_payload(title="初稿")
     evidence_refs = [
         {
-            "artifact_path": "/data/overview/total_volume",
+            "artifact_path": "/data/0/title",
             "sources": [{"source_type": "evidence", "evidence_id": "e-1", "source_path": "/0/x"}],
             "derivation": None,
         }
@@ -589,10 +651,10 @@ async def test_create_and_update_draft_tools_persist_through_service(
     result = await registry.execute(
         internal_name="create_draft",
         arguments={
-            "module": "brand",
-            "schema_version": "brand_report_v3",
-            "artifact_type": "brand_report_v3",
-            "business_fields": {"brand": "瑞幸"},
+            "module": "insight",
+            "schema_version": "insight_board_v1",
+            "artifact_type": "insight_board_v1",
+            "business_fields": {"parent_artifact_version_id": "pv-1", "question": "为什么"},
             "payload": payload_v1,
             "evidence_refs": evidence_refs,
         },
@@ -603,16 +665,18 @@ async def test_create_and_update_draft_tools_persist_through_service(
     )
     assert result.status == "success"
     created = json.loads(result.safe_summary)
-    assert created["artifact_key"] == "brand:瑞幸"
+    assert created["artifact_key"] == build_artifact_key(
+        "insight", parent_artifact_version_id="pv-1", question="为什么"
+    )
 
     rev = await db_session.get(ArtifactDraftRevision, created["revision_id"])
     assert rev is not None
     assert rev.payload_json == payload_v1
     assert rev.evidence_refs_json == evidence_refs
-    assert rev.schema_version == "brand_report_v3"
+    assert rev.schema_version == "insight_board_v1"
 
     # update_draft 追加不可变新 Revision。
-    payload_v2 = {"data": {"overview": {"total_volume": 150}}}
+    payload_v2 = insight_payload(title="修订")
     updated = await registry.execute(
         internal_name="update_draft",
         arguments={"draft_id": created["draft_id"], "payload": payload_v2, "evidence_refs": evidence_refs},

@@ -21,6 +21,15 @@ v3 加固（§5.5）在循环内落实三条不变量：
 - **reviewing 接管**：Run 以 reviewing 进入引擎时（复核期间崩溃恢复），读取
   既有 Review Batch/Item/Attempt 与当前 Draft Revision 继续复核——已 approve
   的 Item 不重审，发布幂等（重复接管不产生重复 Version/事件）。
+
+v3 加固（§5.7）的 Draft/Batch 生命周期不变量：
+
+- 首次 submit_review 创建 Batch 后冻结 Draft 集合与 completion_text；后续提交
+  集合不一致回喂 ``review_batch_draft_set_mismatch``，不建/不改 Batch；
+- 幻觉/他人 draft_id 转 ``draft_not_found``/``artifact_busy`` 结构化回喂并计入
+  无效动作（上限后 Run failed），不整 Run 崩溃；
+- ask_user/complete/paused/cancelled/failed 全部非发布出口释放本 Run 持有的
+  Draft working head（保留不可变 Revision），Artifact 绝不永久 artifact_busy。
 """
 
 from __future__ import annotations
@@ -51,7 +60,7 @@ from app.agent_artifacts.models import (
     ArtifactReviewBatch,
     ArtifactReviewItem,
 )
-from app.agent_artifacts.service import ArtifactService
+from app.agent_artifacts.service import ArtifactBusy, ArtifactService
 from app.agent_runtime.context import SessionContextBuilder
 from app.agent_runtime.events import AgentEventStream
 from app.agent_runtime.heartbeat import RunLeaseHeartbeat
@@ -69,7 +78,7 @@ from app.agent_runtime.repository import (
     AgentRunRepository,
     utc_now,
 )
-from app.agent_runtime.reviewer import ReviewerDriver
+from app.agent_runtime.reviewer import ReviewBatchDraftSetMismatch, ReviewerDriver
 from app.agent_runtime.schemas import FOUR_ACTIONS
 from app.agent_runtime.state import InvalidRunTransition, RunStatus
 from app.agent_runtime.tools.contracts import ToolResult
@@ -89,6 +98,19 @@ _TOOL_EVENT_BY_STATUS = {
     "failed": "tool.failed",
     "unknown": "tool.unknown",
 }
+
+
+class _InvalidSubmitReview(Exception):
+    """submit_review 的输入类错误（幻觉/他人 draft_id、Batch 集合不一致）。
+
+    只用于送审前的输入校验阶段：引擎捕获后转结构化 validation error 回喂并
+    计入无效动作计数，绝不把整 Run 打挂（§5.7/§5.8）。``code`` 为稳定错误码。
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        self.code = code
+        self.message = message
+        super().__init__(message)
 
 
 @dataclass(frozen=True)
@@ -210,6 +232,8 @@ class AgentEngine:
                     await self._fail_run(run)
                     break
                 if await self._guard_attempt_limits(run, attempt_id):
+                    # paused 出口释放 Draft working head（§5.7），新 Run/恢复后可接管。
+                    await self._release_owned_drafts(run)
                     await self._events.append(
                         run.id, run.user_id, "run.paused", {"attempt_id": attempt_id}
                     )
@@ -245,7 +269,9 @@ class AgentEngine:
                         break
                     self._feed_validation_error(conversation, action)
                     continue
-                consecutive_invalid = 0
+                # 无效计数在「有效交互」完成后清零（call_tool 结算、submit_review
+                # 未抛输入错误）：submit_review 输入错误在分发后累计，连续达到
+                # MAX_INVALID_ACTIONS 同样收口 failed（§5.7/§5.8）。
 
                 # 取消检查点 2 + 租约再确认（§5.5）：decide（长模型调用）返回后、
                 # 动作分发前重查运行态——取消已到达则不得落任何 assistant 产物
@@ -278,6 +304,7 @@ class AgentEngine:
                         step_sequence=next_sequence,
                         resume_step=resume_step,
                     )
+                    consecutive_invalid = 0  # 有效交互（工具错误也是合法结果）
                     if call_result == "resumed":
                         resume_step = None  # 崩溃残留 Step 已复用收口，只用一次
                     next_sequence += 1
@@ -287,12 +314,25 @@ class AgentEngine:
                         break
                     continue
                 if action.action == "submit_review":
-                    settled, published_message_id = await self._handle_submit_review(
-                        run=run,
-                        action=action,
-                        conversation=conversation,
-                        user_question=user_question,
-                    )
+                    try:
+                        settled, published_message_id = await self._handle_submit_review(
+                            run=run,
+                            action=action,
+                            conversation=conversation,
+                            user_question=user_question,
+                        )
+                    except _InvalidSubmitReview as exc:
+                        # 幻觉/他人 draft_id、Batch 集合不一致：结构化回喂并计入
+                        # 无效动作（§5.7/§5.8），不整 Run 崩溃。
+                        consecutive_invalid += 1
+                        if consecutive_invalid >= MAX_INVALID_ACTIONS:
+                            await self._fail_run(run)
+                            break
+                        self._feed_submit_review_error(
+                            conversation, code=exc.code, message=exc.message
+                        )
+                        continue
+                    consecutive_invalid = 0  # 送审成功进入复核流程：有效交互
                     if settled == "approved":
                         assistant_message_id = published_message_id or assistant_message_id
                         break
@@ -313,7 +353,11 @@ class AgentEngine:
     # ------------------------------------------------------------------ #
 
     async def _handle_ask_user(self, run: AgentRun, action: Any) -> AgentMessage:
-        """ask_user：写 assistant 澄清消息 + pending Memory，Run 以 clarification 收尾。"""
+        """ask_user：写 assistant 澄清消息 + pending Memory，Run 以 clarification 收尾。
+
+        §5.7：非发布出口释放本 Run 持有的 Draft working head（保留不可变
+        Revision），新 Run 可基于历史 Revision 继续，不得永久 artifact_busy。
+        """
         metadata = {
             "type": "clarification",
             "question": action.question,
@@ -339,6 +383,7 @@ class AgentEngine:
                 created_at=utc_now(),
             )
         )
+        await self._release_owned_drafts(run)
         await self._repo.transition(
             run.id, RunStatus.CLARIFICATION_REQUESTED, worker_id=self._worker_id
         )
@@ -502,26 +547,36 @@ class AgentEngine:
         返回 ``(settled, assistant_message_id)``：``settled`` 取
         ``approved`` / ``rejected`` / ``cancelled`` / ``lease_lost``（终态
         或交还接管方）或 ``revise``（继续循环）；approve 时附带已发布消息 id。
-        """
-        for draft_id in action.artifact_draft_ids:
-            error = await self._validate_draft_lineage(run, draft_id)
-            if error is not None:
-                conversation.append(
-                    ChatMessage(
-                        role="user",
-                        content=json.dumps(
-                            {
-                                "error_type": "lineage_error",
-                                "message": error,
-                                "draft_id": draft_id,
-                            },
-                            ensure_ascii=False,
-                        ),
-                    )
-                )
-                return "revise", None
 
-        batch = await self._get_or_create_batch(run, action)
+        送审前的输入错误（幻觉/他人 draft_id、Batch 集合不一致）抛
+        ``_InvalidSubmitReview``，由主循环转结构化回喂并计入无效动作。
+        """
+        try:
+            for draft_id in action.artifact_draft_ids:
+                error = await self._validate_draft_lineage(run, draft_id)
+                if error is not None:
+                    conversation.append(
+                        ChatMessage(
+                            role="user",
+                            content=json.dumps(
+                                {
+                                    "error_type": "lineage_error",
+                                    "message": error,
+                                    "draft_id": draft_id,
+                                },
+                                ensure_ascii=False,
+                            ),
+                        )
+                    )
+                    return "revise", None
+
+            batch = await self._get_or_create_batch(run, action)
+        except ReviewBatchDraftSetMismatch as exc:
+            raise _InvalidSubmitReview(exc.code, str(exc)) from exc
+        except ArtifactBusy as exc:
+            raise _InvalidSubmitReview(exc.code, str(exc)) from exc
+        except LookupError as exc:
+            raise _InvalidSubmitReview("draft_not_found", str(exc)) from exc
         await self._repo.transition(
             run.id, RunStatus.REVIEWING, worker_id=self._worker_id
         )
@@ -663,7 +718,11 @@ class AgentEngine:
         return "approved", (published.id if published is not None else None)
 
     async def _handle_complete(self, run: AgentRun, action: Any) -> AgentMessage:
-        """complete（无正式产物）：写 assistant 消息，Run → completed。"""
+        """complete（无正式产物）：写 assistant 消息，Run → completed。
+
+        §5.7：非发布出口释放本 Run 持有的 Draft working head（保留不可变
+        Revision），不得永久 artifact_busy。
+        """
         metadata = {"type": "completion", "suggestions": action.suggestions}
         message = await self._append_message(
             session_id=run.session_id,
@@ -672,6 +731,7 @@ class AgentEngine:
             content=action.text,
             metadata=metadata,
         )
+        await self._release_owned_drafts(run)
         await self._repo.transition(
             run.id, RunStatus.COMPLETED, worker_id=self._worker_id
         )
@@ -713,6 +773,8 @@ class AgentEngine:
 
         正常路径持有租约经 ``transition`` 迁移；续租失败导致的系统错误无法持有
         租约，此时用 ``force_fail`` 干净收口，避免卡在 running + open attempt。
+        收口成功（含 force_fail 确认无其他活跃持有者）后释放本 Run 持有的
+        Draft working head（§5.7 failed 出口，保留不可变 Revision）。
         """
         try:
             await self._repo.transition(
@@ -725,6 +787,7 @@ class AgentEngine:
                 return
             failed = await self._repo.force_fail(run.id, error_code="run_lease_lost")
         if failed:
+            await self._release_owned_drafts(run, outcome="failed")
             await self._events.append(run.id, run.user_id, "run.failed", {"outcome": "failed"})
 
     async def _renew_lease(self, run: AgentRun) -> bool:
@@ -763,9 +826,12 @@ class AgentEngine:
         if cancelled:
             await self._events.append(run.id, run.user_id, "run.cancelled", {})
 
-    async def _release_owned_drafts(self, run: AgentRun) -> None:
-        """释放本 Run 持有的全部 Draft working head（idle），保留不可变 Revision
-        ——cancelled 出口不得让 Artifact 永久 busy（§5.7）。"""
+    async def _release_owned_drafts(self, run: AgentRun, *, outcome: str = "idle") -> None:
+        """释放本 Run 持有的全部 Draft working head，保留不可变 Revision（§5.7）。
+
+        ask_user/complete/paused/cancelled 出口用 ``idle``，failed 出口用
+        ``failed``——任何非发布出口都不得让 Artifact 永久 artifact_busy。
+        """
         drafts = (
             await self._db.scalars(
                 select(ArtifactDraft).where(ArtifactDraft.owner_run_id == run.id)
@@ -776,7 +842,7 @@ class AgentEngine:
         await self._reviewer.cancel_reviewing(
             run_id=run.id,
             draft_ids=[draft.id for draft in drafts],
-            outcome="idle",
+            outcome=outcome,
         )
 
     async def _batch_draft_ids(self, batch: ArtifactReviewBatch) -> list[str]:
@@ -907,6 +973,26 @@ class AgentEngine:
             )
         )
 
+    def _feed_submit_review_error(
+        self, conversation: list[ChatMessage], *, code: str, message: str
+    ) -> None:
+        """submit_review 输入错误的结构化回喂（§5.7）：幻觉/他人 draft_id
+        （draft_not_found/artifact_busy）与 Batch 集合不一致
+        （review_batch_draft_set_mismatch），模型据此修订或结束 Run。"""
+        conversation.append(
+            ChatMessage(
+                role="user",
+                content=json.dumps(
+                    {
+                        "error_type": "validation_error",
+                        "code": code,
+                        "message": message,
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+        )
+
     def _feed_tool_result(self, conversation: list[ChatMessage], result: ToolResult) -> None:
         conversation.append(
             ChatMessage(
@@ -1005,11 +1091,13 @@ class AgentEngine:
     async def _validate_draft_lineage(self, run: AgentRun, draft_id: str) -> str | None:
         """提交 Reviewer 前校验 Draft 的字段级 lineage（§10.4 / Task 11）。
 
-        失败返回结构化错误消息（回喂模型），成功返回 None。
+        失败返回结构化错误消息（回喂模型），成功返回 None。幻觉 draft_id
+        （不存在）抛 ``LookupError``，由上层转 ``draft_not_found`` 回喂并
+        计入无效动作。
         """
         draft = await self._db.get(ArtifactDraft, draft_id)
         if draft is None:
-            return "draft not found"
+            raise LookupError(f"draft {draft_id!r} not found")
         revision = await self._db.scalar(
             select(ArtifactDraftRevision).where(
                 ArtifactDraftRevision.draft_id == draft.id,
@@ -1036,13 +1124,24 @@ class AgentEngine:
     async def _get_or_create_batch(
         self, run: AgentRun, action: Any
     ) -> ArtifactReviewBatch:
-        """一个用户 Run 最多一条 Review Batch（§8.1）：存在则复用。"""
+        """一个用户 Run 最多一条 Review Batch（§8.1）：存在则复用。
+
+        复用前核对冻结的 Draft 集合（§5.7）：首次 submit 后 Batch 的 draft id
+        集合与 completion_text 冻结；后续提交集合不一致（新增/遗漏/替换）抛
+        ``ReviewBatchDraftSetMismatch``，不建/不改 Batch。
+        """
         existing = await self._db.scalar(
             select(ArtifactReviewBatch).where(
                 ArtifactReviewBatch.parent_run_id == run.id
             )
         )
         if existing is not None:
+            frozen_ids = await self._batch_draft_ids(existing)
+            if set(action.artifact_draft_ids) != set(frozen_ids):
+                raise ReviewBatchDraftSetMismatch(
+                    frozen=sorted(frozen_ids),
+                    submitted=sorted(str(d) for d in action.artifact_draft_ids),
+                )
             return existing
         return await self._reviewer.create_batch(
             parent_run_id=run.id,

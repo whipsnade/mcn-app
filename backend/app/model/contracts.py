@@ -25,6 +25,7 @@ ModelPurpose = Literal[
     "goal_summary",
     "context_qa",
     "brand_report_narrative",
+    "artifact_reviewer",
 ]
 
 

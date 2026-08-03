@@ -340,6 +340,24 @@ async def test_export_draft_without_version_conflicts(auth_client_factory, db_se
     assert resp.json()["detail"] == "ARTIFACT_EXPORT_UNSUPPORTED"
 
 
+async def test_export_invalid_published_payload_conflicts_not_500(
+    auth_client_factory, db_session
+) -> None:
+    """历史/旁路非法 payload（强类型 ValidationError）→ 稳定 409，不泄漏 500。"""
+    client = await auth_client_factory("13700000007")
+    session_id = await _create_session(client)
+    user_id = await _me_id(client)
+    bad_payload = build_brand_dict()
+    bad_payload["data"]["overview"] = {"totally": "wrong"}
+    artifact = await _make_published_artifact(
+        db_session, user_id, session_id, payload=bad_payload
+    )
+
+    resp = await client.get(f"/api/v1/agent/artifacts/{artifact.id}/export")
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == "ARTIFACT_EXPORT_UNSUPPORTED"
+
+
 # ---------------------------------------------------------------------------
 # 归属隔离（无存在泄露 → 404）
 # ---------------------------------------------------------------------------

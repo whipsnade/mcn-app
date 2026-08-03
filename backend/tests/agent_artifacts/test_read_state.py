@@ -14,6 +14,8 @@ from app.agent_artifacts.models import AgentArtifactReadState
 from app.agent_artifacts.service import ArtifactService
 from app.artifacts.models import ArtifactReadState
 
+from tests.agent_artifacts.payload_fixtures import brand_payload, campaign_payload
+
 
 async def _draft_brand(db_session, user, session, run, service, brand="瑞幸"):
     artifact, draft, revision = await service.create_or_get_draft(
@@ -23,7 +25,7 @@ async def _draft_brand(db_session, user, session, run, service, brand="瑞幸"):
         module="brand",
         business_fields={"brand": brand},
         schema_version="brand_report_v3",
-        payload={"data": {"overview": {"total_volume": 100}}},
+        payload=brand_payload(),
         evidence_refs=[],
         artifact_type="brand_report_v3",
     )
@@ -49,7 +51,7 @@ async def test_unread_until_marked_seen(
 
     # 新 Draft 更新产生 sequence=2 → 再次未读
     await service.update_draft(
-        run_id=run.id, draft_id=draft.id, payload={"data": {"overview": {"x": 2}}},
+        run_id=run.id, draft_id=draft.id, payload=brand_payload(),
         evidence_refs=[],
     )
     assert await service.get_unread(user.id, session.id, "brand") is True
@@ -69,7 +71,7 @@ async def test_read_state_watermark_only_advances_and_never_backwards(
     await service.advance_read_state(user.id, session.id, "brand", 1)
 
     await service.update_draft(
-        run_id=run.id, draft_id=draft.id, payload={"data": {"overview": {"x": 2}}},
+        run_id=run.id, draft_id=draft.id, payload=brand_payload(),
         evidence_refs=[],
     )
     # 前端渲染到 sequence=2
@@ -104,7 +106,7 @@ async def test_unread_is_per_module(
         module="campaign",
         business_fields={"brand": "瑞幸", "campaign": "双十一"},
         schema_version="campaign_report_v2",
-        payload={"data": {}},
+        payload=campaign_payload(),
         evidence_refs=[],
         artifact_type="campaign_report_v2",
     )  # campaign seq 2

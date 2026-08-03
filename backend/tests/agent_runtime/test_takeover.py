@@ -57,6 +57,8 @@ from app.mcp_gateway.contracts import DataTapService
 from app.mcp_gateway.transport import RemoteToolResult
 from app.mcp_gateway.validation import canonical_json_bytes
 
+from tests.agent_artifacts.payload_fixtures import insight_payload
+
 INPUT_SCHEMA = {
     "type": "object",
     "properties": {"keyword": {"type": "string"}},
@@ -78,7 +80,7 @@ OK_PAYLOAD = {
 INTERNAL_NAME = "query_analysis_data"
 REMOTE_NAME = "datatap.insight.query.analysis.v1"
 
-PAYLOAD_V1 = {"data": {"overview": {"brand": "瑞幸"}}}
+PAYLOAD_V1 = insight_payload()
 
 
 # ---------------------------------------------------------------------------
@@ -700,11 +702,11 @@ async def _make_reviewing_scene(
             session_id=run.session_id,
             user_id=run.user_id,
             run_id=run.id,
-            module="brand",
-            business_fields={"brand": brand},
-            schema_version="brand_report_v3",
-            payload={"data": {"overview": {"brand": brand}}},
-            artifact_type="brand_report_v3",
+            module="insight",
+            business_fields={"parent_artifact_version_id": "pv-1", "question": brand},
+            schema_version="insight_board_v1",
+            payload=insight_payload(title=brand),
+            artifact_type="insight_board_v1",
         )
         draft.status = "reviewing"
         item = ArtifactReviewItem(
@@ -972,11 +974,11 @@ async def test_publish_is_skipped_when_lease_lost_before_publish(
         session_id=run.session_id,
         user_id=run.user_id,
         run_id=run.id,
-        module="brand",
-        business_fields={"brand": "瑞幸"},
-        schema_version="brand_report_v3",
+        module="insight",
+        business_fields={"parent_artifact_version_id": "pv-1", "question": "瑞幸"},
+        schema_version="insight_board_v1",
         payload=PAYLOAD_V1,
-        artifact_type="brand_report_v3",
+        artifact_type="insight_board_v1",
     )
 
     async def steal_lease(_run) -> None:
@@ -1159,11 +1161,11 @@ async def test_cancel_after_reviewer_return_releases_drafts_and_cancels(
         session_id=run.session_id,
         user_id=run.user_id,
         run_id=run.id,
-        module="brand",
-        business_fields={"brand": "瑞幸"},
-        schema_version="brand_report_v3",
+        module="insight",
+        business_fields={"parent_artifact_version_id": "pv-1", "question": "瑞幸"},
+        schema_version="insight_board_v1",
         payload=PAYLOAD_V1,
-        artifact_type="brand_report_v3",
+        artifact_type="insight_board_v1",
     )
 
     async def cancel_on_review(_run) -> None:
