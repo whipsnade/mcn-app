@@ -641,6 +641,58 @@ async def test_internal_runs_excluded_from_session_detail(
     assert internal.id not in run_ids
 
 
+async def test_session_detail_runs_ordered_by_created_at_not_random_id(
+    agent_client_factory, db_session
+) -> None:
+    """runs 按 created_at 升序（id 仅作 tie-break）：前端取最后一个即最新 Run。
+
+    旧实现按 AgentRun.id（uuid4 随机）排序，刷新后前端会锚定到任意历史 Run；
+    这里让 id 字典序与 created_at 完全相反，锁定排序键是 created_at。
+    kol_detail 辅助 Run 与用户主 Run 共用同一排序语义。
+    """
+    alice, _ = await agent_client_factory("13600000072")
+    session_id = await _create_session(alice)
+    user_id = await _me_id(alice)
+
+    base = utc_now()
+
+    async def insert_run(run_id: str, minutes: int, profile: str) -> None:
+        db_session.add(
+            AgentRun(
+                id=run_id,
+                session_id=session_id,
+                user_id=user_id,
+                run_kind="user",
+                visibility="user",
+                profile_name=profile,
+                profile_version="v1",
+                model="test-model",
+                status="completed",
+                decision_count=0,
+                review_count=0,
+                revision_count=0,
+                created_at=base + timedelta(minutes=minutes),
+                started_at=base + timedelta(minutes=minutes),
+                completed_at=base + timedelta(minutes=minutes + 1),
+            )
+        )
+        await db_session.flush()
+
+    # id 字典序：newest < middle < oldest；created_at 顺序恰好相反。
+    await insert_run("00000000-0000-4000-8000-0000000000a1", 2, "kol_detail_v1")
+    await insert_run("7fffffff-ffff-4fff-bfff-ffffffffffff", 1, "session_analyst_v1")
+    await insert_run("ffffffff-ffff-4fff-bfff-ffffffffffff", 0, "session_analyst_v1")
+
+    detail = await alice.get(f"/api/v1/agent/sessions/{session_id}")
+    assert detail.status_code == 200
+    run_ids = [run["id"] for run in detail.json()["runs"]]
+    assert run_ids == [
+        "ffffffff-ffff-4fff-bfff-ffffffffffff",
+        "7fffffff-ffff-4fff-bfff-ffffffffffff",
+        "00000000-0000-4000-8000-0000000000a1",
+    ]
+
+
 # ---------------------------------------------------------------------------
 # kol-details
 # ---------------------------------------------------------------------------

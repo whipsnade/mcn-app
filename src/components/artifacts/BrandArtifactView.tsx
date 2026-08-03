@@ -8,6 +8,7 @@ import {
 
 import type { BrandReportPayload } from '../../api/agentArtifacts';
 import { Card, Missing, restrictedCount, restrictedRatio, restrictedScore } from '../reportPrimitives';
+import { safeHttpUrl } from './urlUtils';
 
 // 注（review I3）：Metric/platformName/DataTable 等展示基元在五类视图间有复制，
 // 本轮有意保持各视图自包含（按 schema_version 直接消费 DTO），
@@ -159,7 +160,8 @@ function TopPostsList({ posts }: { posts: BrandReportPayload['data']['top_posts'
   return (
     <div className="divide-y divide-slate-100">
       {posts.slice(0, 20).map((post, index) => {
-        const url = post.url;
+        // URL 白名单：非 http(s) 链接按无链接的受限态渲染，不注入可执行协议。
+        const url = safeHttpUrl(post.url);
         const title = post.title || '无标题';
         return (
           <article key={`${post.platform}-${post.post_id}-${index}`} className="flex items-center gap-3 py-3">

@@ -444,6 +444,52 @@ describe('ArtifactWorkspace', () => {
     expect(screen.queryByText('完成一次品牌分析后在此展示')).not.toBeInTheDocument();
   });
 
+  it('切换会话后未读水位重新初始化，旧会话高水位不抑制新会话圆点', async () => {
+    // 会话 s1：brand 模块已推进到水位 9。
+    const { rerender } = render(
+      <ArtifactWorkspace
+        sessionId="s1"
+        artifacts={[brandArtifact({ activity_sequence: 9 })]}
+        markArtifactSeen={vi.fn()}
+        createKolDetail={vi.fn()}
+      />,
+    );
+    // 初始化水位为 9：无未读圆点。
+    await waitFor(() => expect(screen.queryAllByTestId('unread-dot')).toHaveLength(0));
+
+    // 切换到会话 s2（组件不卸载）：新会话 brand 当前最大 seq 5。
+    const s2Published = brandArtifact({ id: 'brand-s2', activity_sequence: 5 });
+    rerender(
+      <ArtifactWorkspace
+        sessionId="s2"
+        artifacts={[s2Published]}
+        markArtifactSeen={vi.fn()}
+        createKolDetail={vi.fn()}
+      />,
+    );
+    await waitFor(() => expect(screen.queryAllByTestId('unread-dot')).toHaveLength(0));
+
+    // s2 随后到达 seq 7 的 Draft：若旧水位 9 未重置，7 > 9 不成立，圆点被吞掉。
+    const s2Draft = brandArtifact({
+      id: 'brand-s2-draft',
+      status: 'draft',
+      latest_version: 1,
+      activity_sequence: 7,
+      updated_at: '2026-08-01T11:00:00',
+    });
+    rerender(
+      <ArtifactWorkspace
+        sessionId="s2"
+        artifacts={[s2Published, s2Draft]}
+        markArtifactSeen={vi.fn()}
+        createKolDetail={vi.fn()}
+      />,
+    );
+
+    const brandTab = screen.getByRole('tab', { name: '品牌分析' });
+    await waitFor(() => expect(within(brandTab).getByTestId('unread-dot')).toBeVisible());
+  });
+
   it('辅助 Run 失败且无已发布产物时展示错误态而非无限加载', async () => {
     const kolArtifact: ApiAgentArtifact = {
       id: 'kol-selection-1',

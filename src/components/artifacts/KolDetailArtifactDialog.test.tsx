@@ -106,6 +106,18 @@ describe('KolDetailArtifactDialog', () => {
     expect(screen.getByText('夏日美妆分享')).toBeVisible();
   });
 
+  it('非 http/https 的主页与帖子链接不渲染为链接（URL 白名单）', () => {
+    const p = detail();
+    p.data.identity.homepage_url = 'javascript:alert(1)';
+    p.data.latest_posts = [{ ...p.data.latest_posts[0], url: 'javascript:alert(1)' }];
+
+    render(<KolDetailArtifactDialog payload={p} onClose={vi.fn()} />);
+
+    expect(screen.queryByRole('link')).not.toBeInTheDocument();
+    expect(screen.getByText('夏日美妆分享')).toBeVisible();
+    expect(screen.getAllByText(/数据受限/).length).toBeGreaterThan(0);
+  });
+
   it('点击关闭按钮调用 onClose', () => {
     const onClose = vi.fn();
     render(<KolDetailArtifactDialog payload={detail()} onClose={onClose} />);

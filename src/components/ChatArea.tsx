@@ -1,9 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Loader2, Pause, Send, Sparkles, ShieldAlert } from 'lucide-react';
-import { Session, Message, type ThinkingBlock } from '../types';
+import { Session } from '../types';
 import type { FollowupSuggestion } from '../api/contracts';
-import { useSessionThinkingStream } from '../hooks/useSessionThinkingStream';
-import ThinkingPanel from './ThinkingPanel';
 import { isTerminalRunStatus, type RunRuntimeState } from '../state/agentEvents';
 import type { TaskFlowNode } from '../state/taskEvents';
 import type { TaskFlowReplay } from '../hooks/useTaskFlows';
@@ -18,43 +16,6 @@ const DEFAULT_SUGGESTIONS: { title: string; prompt: string }[] = [
 ];
 
 const NEAR_BOTTOM_THRESHOLD_PX = 48;
-const EMPTY_THINKING_BY_TURN: Record<string, ThinkingBlock[]> = {};
-
-function blockKey(block: ThinkingBlock): string {
-  return `${block.operationId}:${block.attempt}`;
-}
-
-export function mergeHistoricalAndRuntimeThinking(
-  messages: Message[],
-  runtimeByTurn: Record<string, ThinkingBlock[]> = {},
-): Record<string, ThinkingBlock[]> {
-  const merged = new Map<string, Map<string, ThinkingBlock>>();
-
-  messages.forEach(message => {
-    if (!message.turnId || !message.thinking) return;
-    const byOperation = merged.get(message.turnId) ?? new Map<string, ThinkingBlock>();
-    message.thinking.blocks.forEach(block => {
-      byOperation.set(blockKey(block), { ...block, turnId: message.turnId });
-    });
-    merged.set(message.turnId, byOperation);
-  });
-
-  Object.entries(runtimeByTurn).forEach(([turnId, blocks]) => {
-    const byOperation = merged.get(turnId) ?? new Map<string, ThinkingBlock>();
-    blocks.forEach(block => {
-      const key = blockKey(block);
-      const historical = byOperation.get(key);
-      // 已持久化的终态 metadata 是最终快照；其余情况优先展示更实时的流内容。
-      if (historical && historical.status !== 'running') return;
-      byOperation.set(key, { ...block, turnId });
-    });
-    merged.set(turnId, byOperation);
-  });
-
-  return Object.fromEntries(
-    [...merged.entries()].map(([turnId, blocks]) => [turnId, [...blocks.values()]]),
-  );
-}
 
 interface ChatAreaProps {
   session: Session;
@@ -120,39 +81,11 @@ export default function ChatArea({
   const chatLogRef = useRef<HTMLDivElement>(null);
   const isNearBottomRef = useRef(true);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const thinkingRuntime = useSessionThinkingStream(session.id);
-  const runtimeByTurn = thinkingRuntime?.sessionId === session.id
-    ? thinkingRuntime.byTurn
-    : EMPTY_THINKING_BY_TURN;
-  const thinkingByTurn: Record<string, ThinkingBlock[]> = useMemo(
-    () => mergeHistoricalAndRuntimeThinking(session.messages, runtimeByTurn),
-    [runtimeByTurn, session.messages],
-  );
-  const thinkingTextKey = useMemo(
-    () => Object.entries(thinkingByTurn)
-      .flatMap(([turnId, blocks]) => blocks.map(block => (
-        `${turnId}:${blockKey(block)}:${block.status}:${block.content}`
-      )))
-      .join('|'),
-    [thinkingByTurn],
-  );
 
-  // 活跃 turn = 最新一条用户消息的 turnId；活跃 Run 流式期间其 ThinkingPanel 去重隐藏
-  //（思考实时展示在 Run 卡的 AgentThinking 里）。
-  const activeTurnId = useMemo(() => {
-    for (let index = session.messages.length - 1; index >= 0; index -= 1) {
-      const message = session.messages[index];
-      if (message.sender === 'user' && message.turnId) return message.turnId;
-    }
-    return undefined;
-  }, [session.messages]);
   // 活跃 Run 是否已锚定到触发它的用户消息（锚定后底部不再重复渲染执行卡）。
   const activeRunAnchored = Boolean(
     run && session.messages.some(message => message.sender === 'user' && message.runId === run.runId),
   );
-  // 活跃 Run 且流式进行中：思考只在 Run 卡里展示，消息下方 ThinkingPanel 去重隐藏；
-  // 终态后 Run 卡收缩，ThinkingPanel 恢复（历史 turn 始终不受影响）。
-  const dedupeActiveThinkingPanel = Boolean(run && !isTerminalRunStatus(run.status));
 
   // 建议点击统一行为：填入输入框并聚焦，不自动提交，由用户确认后发送。
   // useCallback + AgentRunCard 的 React.memo：稳定引用让历史卡跳过每次 SSE 增量重渲染。
@@ -185,12 +118,12 @@ export default function ChatArea({
     isNearBottomRef.current = true;
   }, [session.id]);
 
-  // 仅在用户仍靠近底部时跟随新消息或思考增量。
+  // 仅在用户仍靠近底部时跟随新消息。
   useEffect(() => {
     if (isNearBottomRef.current) {
       chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
     }
-  }, [session.id, session.messages, isAnalyzing, thinkingTextKey]);
+  }, [session.id, session.messages, isAnalyzing]);
 
   const handleChatScroll = () => {
     const container = chatLogRef.current;
@@ -320,9 +253,6 @@ export default function ChatArea({
             : [];
           // 仅 brainstorm 显式标记 multi=true 走多选；clarify 与存量无 multi 消息保持单选。
           const isMultiSelect = brainstormOptions.length > 0 && msg.brainstorm?.multi === true;
-          const thinkingBlocks = !isAI && msg.turnId
-            ? thinkingByTurn[msg.turnId] ?? []
-            : [];
 
           return (
             <React.Fragment key={msg.id}>
@@ -423,11 +353,6 @@ export default function ChatArea({
                   )}
                 </div>
               </div>
-              {thinkingBlocks.length > 0 && !(dedupeActiveThinkingPanel && msg.turnId === activeTurnId) && (
-                <div className="mr-auto ml-11 w-[calc(85%-2.75rem)] max-w-[85%]">
-                  <ThinkingPanel blocks={thinkingBlocks} />
-                </div>
-              )}
               {/* 每个 Run 一张独立执行卡，锚定在触发它的用户消息下方；终态收缩保留可回看 */}
               {!isAI && msg.runId && (() => {
                 const isActiveRun = msg.runId === run?.runId;

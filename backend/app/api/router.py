@@ -6,7 +6,6 @@ from app.agent_runtime.router import router as agent_runtime_router
 from app.billing.router import router as billing_router
 from app.favorites.router import router as favorites_router
 from app.identity.router import auth_router, users_router
-from app.thinking.router import router as thinking_router
 
 api_router = APIRouter(prefix="/api/v1")
 api_router.include_router(auth_router, prefix="/auth", tags=["auth"])
@@ -16,5 +15,6 @@ api_router.include_router(favorites_router, tags=["favorites"])
 api_router.include_router(admin_router, prefix="/admin", tags=["admin"])
 api_router.include_router(agent_runtime_router, prefix="/agent", tags=["agent"])
 api_router.include_router(agent_artifacts_router, prefix="/agent", tags=["agent"])
-# 前端 ChatArea 仍通过 /sessions/{id}/events 消费 thinking 流（Task 24 不删除 thinking）。
-api_router.include_router(thinking_router, prefix="/sessions", tags=["sessions"])
+# 旧 Session thinking SSE（GET /sessions/{id}/events）已随统一 Agent 运行时移除：
+# 新运行时的 thinking 事件只走 /agent/runs/{id}/events（§5.8/§6.4），前端旧订阅
+# 会对新会话 404 并无限重连。app.thinking 包已无生产引用，整体删除。

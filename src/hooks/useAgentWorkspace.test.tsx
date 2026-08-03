@@ -80,6 +80,10 @@ const run1: ApiAgentRun = {
 const s1Detail: ApiAgentSessionDetail = { ...s1, messages: [], runs: [run1] };
 const s2Detail: ApiAgentSessionDetail = { ...s2, messages: [], runs: [] };
 
+function makeRun(id: string, status: string): ApiAgentRun {
+  return { ...run1, id, status };
+}
+
 const artifact: ApiAgentArtifact = {
   id: 'art-1',
   module: 'brand',
@@ -121,6 +125,65 @@ describe('useAgentWorkspace', () => {
     expect(walletApi.getWallet).toHaveBeenCalled();
     expect(result.current.wallet).toEqual(wallet);
     expect(vi.mocked(useAgentRun).mock.calls.at(-1)?.[0]).toBe('run-1');
+  });
+
+  it('anchors to the active run over a later terminal run in server order', async () => {
+    // §6.4：恢复锚点优先活动 Run（queued/running/reviewing/paused）；
+    // 即使服务端顺序里更后有终态 Run（如 kol_detail 辅助 Run）也不锚定它。
+    const detail: ApiAgentSessionDetail = {
+      ...s1,
+      messages: [],
+      runs: [
+        makeRun('run-active', 'running'),
+        makeRun('run-detail', 'completed'),
+      ],
+    };
+    vi.mocked(agentApi.listSessions).mockResolvedValue([s1]);
+    vi.mocked(agentApi.getSession).mockResolvedValue(detail);
+
+    const { result } = renderHook(() => useAgentWorkspace('user-1'));
+    await waitFor(() => expect(result.current.activeSessionId).toBe('s1'));
+
+    expect(result.current.activeRunId).toBe('run-active');
+  });
+
+  it('anchors to the latest active run when several runs are active', async () => {
+    const detail: ApiAgentSessionDetail = {
+      ...s1,
+      messages: [],
+      runs: [
+        makeRun('run-queued', 'queued'),
+        makeRun('run-paused', 'paused'),
+        makeRun('run-done', 'completed'),
+      ],
+    };
+    vi.mocked(agentApi.listSessions).mockResolvedValue([s1]);
+    vi.mocked(agentApi.getSession).mockResolvedValue(detail);
+
+    const { result } = renderHook(() => useAgentWorkspace('user-1'));
+    await waitFor(() => expect(result.current.activeSessionId).toBe('s1'));
+
+    expect(result.current.activeRunId).toBe('run-paused');
+  });
+
+  it('anchors to the last run in server order when no run is active', async () => {
+    // 全部终态：取服务端顺序（created_at 升序）的最后一个，与列表顺序无关的
+    // 随机 uuid 不再影响锚点。
+    const detail: ApiAgentSessionDetail = {
+      ...s1,
+      messages: [],
+      runs: [
+        makeRun('run-first', 'completed'),
+        makeRun('run-latest', 'failed'),
+      ],
+    };
+    vi.mocked(agentApi.listSessions).mockResolvedValue([s1]);
+    vi.mocked(agentApi.getSession).mockResolvedValue(detail);
+
+    const { result } = renderHook(() => useAgentWorkspace('user-1'));
+    await waitFor(() => expect(result.current.activeSessionId).toBe('s1'));
+
+    expect(result.current.activeRunId).toBe('run-latest');
   });
 
   it('does not load when no user is present', () => {

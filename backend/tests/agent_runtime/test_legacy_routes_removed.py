@@ -29,6 +29,8 @@ LEGACY_GET_ROUTES = [
     "/api/v1/quick/kol-detail",
     "/api/v1/quick/top-posts",
     "/api/v1/tasks/{task_id}/events",
+    # 旧 Session thinking SSE（ChatArea 404 重连风暴的来源）：新运行时不发布该事件。
+    "/api/v1/sessions/{session_id}/events",
     "/api/v1/sessions/{session_id}/kol-selection/detail",
     "/api/v1/sessions/{session_id}/kol-selection",
     "/api/v1/sessions/{session_id}/selection-sets",
@@ -154,3 +156,13 @@ async def test_new_agent_runtime_still_available(auth_client_factory) -> None:
     client = await auth_client_factory("13500000006")
     response = await client.get("/api/v1/agent/sessions")
     assert response.status_code == 200
+
+
+def test_legacy_thinking_sse_route_unregistered() -> None:
+    """旧 thinking SSE 路由不在应用路由表中（只校验注册，404 契约由上方参数化用例锁定）。
+
+    归属校验失败也会返回 404，单凭状态码无法区分「路由已删除」与「会话不存在」，
+    因此这里直接断言路由未注册，防止未来被重新挂载。
+    """
+    app = create_app()
+    assert "/api/v1/sessions/{session_id}/events" not in app.openapi()["paths"]

@@ -5,6 +5,7 @@ import { Bar, BarChart, Cell, Line, LineChart, Pie, PieChart, ResponsiveContaine
 
 import type { InsightBoardPayload } from '../../api/agentArtifacts';
 import { Card, formatNumber, restrictedScore } from '../reportPrimitives';
+import { safeHttpUrl } from './urlUtils';
 
 /** §12.2：insight_board_v1 仅允许以下 8 种 Block；其它类型一律不渲染。 */
 const ALLOWED_BLOCK_TYPES = new Set([
@@ -208,8 +209,10 @@ function ReferencesBlock({ block }: { block: InsightBlock }) {
   return blockCard(block, (
     <ul className="space-y-1.5">
       {refs.map((ref, index) => {
-        const url = asString(ref.url);
-        const label = asString(ref.label) || url;
+        // URL 白名单：非 http(s) 链接降级为纯文本，不注入可执行协议。
+        const rawUrl = asString(ref.url);
+        const url = safeHttpUrl(rawUrl);
+        const label = asString(ref.label) || rawUrl;
         return (
           <li key={index} className="flex items-center gap-1.5 text-[11px]">
             <Link2 className="h-3 w-3 shrink-0 text-slate-300" aria-hidden="true" />

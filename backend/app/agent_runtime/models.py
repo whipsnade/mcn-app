@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
@@ -21,6 +21,11 @@ from app.db.base import Base
 # Load agent_artifacts tables so agent_runtime.models imports standalone without
 # relying on db/models.py to register the FK target (memory_entries.source_artifact_id).
 import app.agent_artifacts.models  # noqa: F401
+
+
+def _utc_now() -> datetime:
+    # 与 repository.utc_now 同义；models 不能反向 import repository（循环依赖）。
+    return datetime.now(UTC).replace(tzinfo=None)
 
 
 class AgentSession(Base):
@@ -107,6 +112,11 @@ class AgentRun(Base):
     lease_owner: Mapped[str | None] = mapped_column(String(64), nullable=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # 会话详情 runs 的稳定排序键（迁移 0029）：按创建时刻升序、id tie-break，
+    # 前端取列表最后一个即最新 Run，不再受随机 uuid 顺序影响。
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=_utc_now
+    )
 
 
 class AgentRunAttempt(Base):

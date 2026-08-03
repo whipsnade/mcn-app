@@ -38,7 +38,7 @@ KOL Insight AI：面向品牌用户的网红 KOL 与 MCN 营销效果智能筛�
 ```text
 backend/            FastAPI 后端
   app/
-    api/router.py   /api/v1 路由聚合（auth、users、wallet、admin、favorites、agent_runtime、agent_artifacts、thinking）
+    api/router.py   /api/v1 路由聚合（auth、users、wallet、admin、favorites、agent_runtime、agent_artifacts）
     core/           配置（pydantic-settings）、错误、安全、日志脱敏
     db/             SQLAlchemy Base、引擎与会话
     identity/       用户、模拟认证提供商、JWT；dependencies.py 含 require_admin
@@ -75,7 +75,6 @@ backend/            FastAPI 后端
     mcp_gateway/    DataTap MCP 客户端、工具审核注册/校验、计费记账（复用不复制）
     model/          腾讯 Token Plan 适配层（OpenAI 兼容 + reasoning 分离）、契约与依赖
     selection/      scoring_v2.py 严格八维 KOL 评分（复用）、normalizers.py/schemas.py 证据归一化（复用）
-    thinking/       thinking 流 SSE（/sessions/{id}/events）保留给前端消费
     quick/          仅保留 models.py（legacy ORM 只读，路由已移除）
     goals/          仅保留 models.py（legacy ORM 只读）
     tasks/          仅保留 models.py（legacy ORM 只读）
@@ -88,7 +87,7 @@ backend/            FastAPI 后端
 src/                React 前端
   api/              API Client 与类型契约；agent.ts / agentArtifacts.ts 为新 Agent API
   state/            agentEvents.ts Run SSE reducer
-  hooks/            useAgentRun、useAgentWorkspace（新运行时）、useSessionThinkingStream（thinking 消费）
+  hooks/            useAgentRun、useAgentWorkspace（新运行时）
   components/       ChatArea、SessionList、WorkspaceTabs 等；agent/ 为 Run 卡/步骤/thinking/澄清；
                     artifacts/ 为三个 BI Tab 与五类 Artifact 视图、达人详情
   test/             Vitest setup、fixtures、SSE 模拟

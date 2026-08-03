@@ -179,4 +179,21 @@ describe('BrandArtifactView', () => {
     // 正常日期不被标记受限。
     expect(within(trend).queryByText(/07-01 数据受限/)).not.toBeInTheDocument();
   });
+
+  it('非 http/https 的热帖链接降级为不可点文本（URL 白名单）', () => {
+    const base = brandPayload();
+    const p: BrandReportPayload = {
+      ...base,
+      data: {
+        ...base.data,
+        top_posts: [{ ...base.data.top_posts[0], url: 'javascript:alert(1)' }],
+      },
+    };
+    render(<BrandArtifactView payload={p} />);
+
+    // javascript: 协议不渲染链接，按无链接的受限态展示。
+    expect(screen.queryByRole('link')).not.toBeInTheDocument();
+    expect(screen.getByText('海底捞隐藏吃法合集')).toBeVisible();
+    expect(screen.getByText(/数据受限（无原文链接）/)).toBeVisible();
+  });
 });

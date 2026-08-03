@@ -3,6 +3,7 @@ import { Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'rec
 
 import type { CampaignReportPayload } from '../../api/agentArtifacts';
 import { Card, Missing, restrictedCount, restrictedRatio, restrictedScore } from '../reportPrimitives';
+import { safeHttpUrl } from './urlUtils';
 
 const PLATFORM_NAMES: Record<string, string> = {
   xiaohongshu: '小红书', douyin: '抖音', bilibili: 'B站', kuaishou: '快手', weibo: '微博',
@@ -102,7 +103,8 @@ function TopPosts({ posts }: { posts: CampaignReportPayload['data']['top_posts']
   return (
     <div className="divide-y divide-slate-100">
       {posts.slice(0, 20).map((post, index) => {
-        const url = post.url;
+        // URL 白名单：非 http(s) 链接按无链接的受限态渲染，不注入可执行协议。
+        const url = safeHttpUrl(post.url);
         const title = post.title || '无标题';
         return (
           <article key={`${post.platform}-${post.post_id}-${index}`} className="flex items-center gap-3 py-3">

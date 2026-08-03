@@ -51,8 +51,20 @@ function toSummarySession(source: ApiAgentSession): AgentWorkspaceSession {
   };
 }
 
+// Run 恢复锚点（§6.4）：优先当前活动（queued/running/reviewing/paused）的用户可见
+// Run，否则取服务端顺序（created_at 升序 + id tie-break）的最后一个用户可见 Run。
+// 服务端已过滤 visibility=user；不再用随机 uuid 顺序推断最新 Run，kol_detail
+// 辅助 Run 与用户主 Run 共用同一锚定语义。
+const ANCHOR_ACTIVE_RUN_STATUSES = new Set(['queued', 'running', 'reviewing', 'paused']);
+
+function pickAnchorRunId(runs: ApiAgentRun[]): string | undefined {
+  for (let index = runs.length - 1; index >= 0; index -= 1) {
+    if (ANCHOR_ACTIVE_RUN_STATUSES.has(runs[index].status)) return runs[index].id;
+  }
+  return runs.at(-1)?.id;
+}
+
 function toWorkspaceSession(detail: ApiAgentSessionDetail): AgentWorkspaceSession {
-  const latestRun = detail.runs.at(-1);
   return {
     id: detail.id,
     title: detail.title,
@@ -61,7 +73,7 @@ function toWorkspaceSession(detail: ApiAgentSessionDetail): AgentWorkspaceSessio
     updatedAt: detail.updated_at,
     runs: detail.runs,
     messages: detail.messages,
-    latestRunId: latestRun?.id,
+    latestRunId: pickAnchorRunId(detail.runs),
   };
 }
 

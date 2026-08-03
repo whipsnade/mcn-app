@@ -168,6 +168,14 @@ export default function ArtifactWorkspace({
     return sequences.length ? Math.max(...sequences) : null;
   }, [artifacts]);
 
+  // 切换会话时重置未读水位与初始化标记：组件跨会话复用不卸载，旧会话的
+  // 高水位若不清零会抑制新会话的未读圆点。本 effect 声明在下方初始化
+  // effect 之前，同一渲染批次内先重置、再按新会话产物重新初始化。
+  useEffect(() => {
+    initRef.current = new Set();
+    setLastSeen({});
+  }, [sessionId]);
+
   // 模块首次出现时把水位初始化为当前最大 sequence：已有产物不标未读，
   // 之后更高的 Draft/发布才显示圆点。
   useEffect(() => {

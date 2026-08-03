@@ -21,7 +21,7 @@ def test_migration_chain_has_single_head() -> None:
     config = Config(str(backend_dir / "alembic.ini"))
     config.set_main_option("script_location", str(backend_dir / "migrations"))
     heads = ScriptDirectory.from_config(config).get_heads()
-    assert heads == ["0028_agent_artifact_read_states"]
+    assert heads == ["0029_agent_run_created_at"]
 
 
 async def test_phase_two_unique_constraints() -> None:
