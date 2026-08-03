@@ -61,6 +61,25 @@ def get_mcp_transport() -> DataTapTransport:
     )
 
 
+@lru_cache
+def get_agent_mcp_transport() -> DataTapTransport:
+    """Agent 运行时专用 DataTap 传输（设计 §5.3）。
+
+    - ``circuit_scope="none"``：旧服务级熔断对新运行时不生效，改由
+      ``agent_runtime.circuit_breaker`` 的 service+tool+args-hash 细粒度熔断
+      单独负责，禁止两层叠加；
+    - ``retry_policy="never"``：504、5xx、协议中断与 PossiblySentTimeout 都属
+      "可能已发送"，禁止自动重放，由上层故障分类收口。
+    """
+    settings = get_settings()
+    return DataTapTransport(
+        token=settings.datatap_mcp_token,
+        read_timeout_seconds=settings.datatap_read_timeout_seconds,
+        circuit_scope="none",
+        retry_policy="never",
+    )
+
+
 async def refresh_approved_datatap_tools() -> None:
     """服务启动时将已审核工具的最新签名写入本地目录。
 

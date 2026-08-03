@@ -1,10 +1,15 @@
-"""Agent Run 恢复循环（设计文档 §11.1 / §七 / Task 15）。
+"""Agent Run 恢复循环（设计文档 §11.1 / §5.3 / §5.4 / §七 / Task 15）。
 
-``RecoveryLoop`` 周期性扫描两类积压：
+``RecoveryLoop`` 周期性扫描三类积压：
 
 1. **过期租约 Run**：running 且租约已过期的 Run 重新提交给 :class:`AgentRunExecutor`
    （新 worker 领取 + 新建 Attempt + 引擎继续），避免进程崩溃后卡死；
-2. **unknown MCP 调用**：``agent_tool_calls.status == 'unknown'`` 的调用经
+2. **stuck running/reserved MCP 调用**：超过受控时间（``stuck_seconds``，配置
+   ``AGENT_TOOL_CALL_STUCK_SECONDS``）仍处于 ``running``/``reserved`` 的调用，
+   先**迁移为 unknown**（保留预留，绝不直接释放或重新外发，§5.4），再交给
+   只读核对；``started_at`` 为超时判断依据，NULL（旧两阶段流程崩溃残留）按
+   stuck 处理；
+3. **unknown MCP 调用**：``agent_tool_calls.status == 'unknown'`` 的调用经
    Task 8 ``AgentMcpTool.reconcile(logical_call_id)`` 按 ``logical_call_id``
    **只读核对**，绝不重发原工具。结果落 ``agent_tool_call_reconciliations``
    （source=``upstream_probe``）：确认成功可回取 payload → 建 Evidence + settle；
@@ -21,7 +26,7 @@ import asyncio
 import logging
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -34,7 +39,7 @@ from app.agent_runtime.models import (
 )
 from app.agent_runtime.repository import utc_now
 from app.agent_runtime.state import RunStatus
-from app.agent_runtime.tools.mcp import AgentMcpTool
+from app.agent_runtime.tools.mcp import RESULT_UNKNOWN, AgentMcpTool
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +60,7 @@ class RecoveryLoop:
         lease_seconds: int = 300,
         interval_seconds: float = 30.0,
         clock: Callable[[], datetime] = utc_now,
+        stuck_seconds: float = 900.0,
     ) -> None:
         self._executor = executor
         self._session_factory = session_factory
@@ -63,6 +69,7 @@ class RecoveryLoop:
         self._lease_seconds = lease_seconds
         self._interval_seconds = interval_seconds
         self._clock = clock
+        self._stuck_seconds = stuck_seconds
         self._stop = asyncio.Event()
         self._loop_task: asyncio.Task[None] | None = None
 
@@ -102,11 +109,15 @@ class RecoveryLoop:
     # 单轮扫描
     # ------------------------------------------------------------------ #
 
-    async def run_once(self) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
-        """执行一轮恢复；返回 ``(已领取重建的 run_ids, 已核对 logical_call_ids, 运维告警 ids)``。"""
+    async def run_once(self) -> tuple[
+        tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...]
+    ]:
+        """执行一轮恢复；返回 ``(已领取重建的 run_ids, stuck 迁移 logical_call_ids,
+        已核对 logical_call_ids, 运维告警 ids)``。"""
         reclaimed = await self.reclaim_expired_runs()
+        stuck = await self.migrate_stuck_tool_calls()
         reconciled, warnings = await self.reconcile_unknown_calls()
-        return reclaimed, reconciled, warnings
+        return reclaimed, stuck, reconciled, warnings
 
     # ------------------------------------------------------------------ #
     # 过期租约 Run 恢复
@@ -148,6 +159,61 @@ class RecoveryLoop:
             except Exception:
                 logger.exception("recovery reclaim failed for run %s", run_id)
         return tuple(reclaimed)
+
+    # ------------------------------------------------------------------ #
+    # stuck running/reserved MCP 调用迁移（§5.4）
+    # ------------------------------------------------------------------ #
+
+    async def migrate_stuck_tool_calls(self) -> tuple[str, ...]:
+        """超过受控时间仍处于 ``running``/``reserved`` 的调用迁移为 ``unknown``。
+
+        以 ``started_at`` 为超时判断依据（阈值 ``stuck_seconds``，配置
+        ``AGENT_TOOL_CALL_STUCK_SECONDS``）；``started_at`` 为 NULL 的
+        ``reserved`` 行只可能来自旧两阶段流程的崩溃窗口，按 stuck 处理。
+        迁移只改状态、保留预留——**绝不直接释放或重新外发**，随后由
+        :meth:`reconcile_unknown_calls` 走既有只读核对。
+
+        迁移用 ``SELECT ... FOR UPDATE`` + 状态谓词守护：与在途调用的
+        finalize 竞态时，已终态（settled/failed）的行不会被翻回 unknown。
+        """
+        threshold = self._clock() - timedelta(seconds=self._stuck_seconds)
+        now = self._clock()
+        migrated: list[str] = []
+        async with self._session_factory() as db:
+            stuck = list(
+                (
+                    await db.execute(
+                        select(AgentToolCall.id, AgentToolCall.logical_call_id)
+                        .where(
+                            AgentToolCall.status.in_(("running", "reserved")),
+                            or_(
+                                AgentToolCall.started_at.is_(None),
+                                AgentToolCall.started_at <= threshold,
+                            ),
+                        )
+                        .order_by(AgentToolCall.started_at.asc())
+                        .limit(_SCAN_LIMIT)
+                    )
+                ).all()
+            )
+            for call_id, logical_call_id in stuck:
+                row = await db.scalar(
+                    select(AgentToolCall)
+                    .where(
+                        AgentToolCall.id == call_id,
+                        AgentToolCall.status.in_(("running", "reserved")),
+                    )
+                    .with_for_update()
+                )
+                if row is None:
+                    continue  # 扫描与并发 finalize 竞态：已终态的行不得翻回 unknown
+                row.status = "unknown"
+                row.error_type = RESULT_UNKNOWN
+                row.safe_error_message = "stuck running/reserved beyond controlled window"
+                row.completed_at = now
+                migrated.append(logical_call_id)
+            await db.commit()
+        return tuple(migrated)
 
     # ------------------------------------------------------------------ #
     # unknown MCP 调用恢复核对

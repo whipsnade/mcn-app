@@ -289,7 +289,8 @@ async def test_gateway_504_is_classified_as_upstream_timeout() -> None:
         await transport.call_tool(DataTapService.BILIBILI, "search", {"keyword": "美妆"})
 
 
-async def test_transient_upstream_error_is_retried_once_and_succeeds() -> None:
+async def test_transient_upstream_error_is_retried_once_under_legacy_policy() -> None:
+    """显式 opt-in legacy ``retry_policy="transient_once"``：瞬时 5xx 自动重试一次。"""
     @asynccontextmanager
     async def opener(url: str, **_kwargs):
         service = next(item for item in DataTapService if item.value in url)
@@ -300,6 +301,7 @@ async def test_transient_upstream_error_is_retried_once_and_succeeds() -> None:
         token=SecretStr("unit-test-token"),
         session_opener=opener,
         session_factory=FlakyUpstreamSession,
+        retry_policy="transient_once",
     )
 
     result = await transport.call_tool(DataTapService.BILIBILI, "search", {"keyword": "美妆"})
@@ -309,7 +311,9 @@ async def test_transient_upstream_error_is_retried_once_and_succeeds() -> None:
     assert result.structured_content == {"result": "{}"}
 
 
-async def test_transient_upstream_error_gives_up_after_one_retry() -> None:
+async def test_possibly_sent_5xx_is_never_retried_by_default() -> None:
+    """默认 ``retry_policy="never"``（Agent 路径契约，设计 §5.3/§11.1）：
+    5xx 属"可能已发送"，绝不自动重放，一次失败即抛出。"""
     @asynccontextmanager
     async def opener(url: str, **_kwargs):
         service = next(item for item in DataTapService if item.value in url)
@@ -325,7 +329,50 @@ async def test_transient_upstream_error_gives_up_after_one_retry() -> None:
     with pytest.raises(McpUpstreamHttpError):
         await transport.call_tool(DataTapService.BILIBILI, "search", {"keyword": "美妆"})
 
-    assert AlwaysUpstreamErrorSession.call_count == 2
+    assert AlwaysUpstreamErrorSession.call_count == 1
+
+
+async def test_gateway_504_is_never_retried_by_default() -> None:
+    """默认策略下 504 同样只外发一次（408/504 属"可能已发送"）。"""
+    opens = 0
+
+    def opener(url: str, **_kwargs):
+        nonlocal opens
+        opens += 1
+        service = next(item for item in DataTapService if item.value in url)
+        return GatewayTimeoutOpener(service)
+
+    transport = DataTapTransport(
+        token=SecretStr("unit-test-token"),
+        session_opener=opener,
+        session_factory=FakeProtocolSession,
+    )
+
+    with pytest.raises(McpGatewayTimeout):
+        await transport.call_tool(DataTapService.BILIBILI, "search", {"keyword": "美妆"})
+
+    assert opens == 1
+
+
+async def test_possibly_sent_timeout_is_never_retried_even_under_legacy_policy() -> None:
+    """即使 opt-in legacy 策略，PossiblySentTimeout 也不自动重试（结果未确认）。"""
+    @asynccontextmanager
+    async def opener(url: str, **_kwargs):
+        service = next(item for item in DataTapService if item.value in url)
+        yield service, object(), lambda: "session-1"
+
+    SdkReadTimeoutSession.call_count = 0
+    transport = DataTapTransport(
+        token=SecretStr("unit-test-token"),
+        session_opener=opener,
+        session_factory=SdkReadTimeoutSession,
+        retry_policy="transient_once",
+    )
+
+    with pytest.raises(PossiblySentTimeout):
+        await transport.call_tool(DataTapService.BILIBILI, "search", {"keyword": "美妆"})
+
+    assert SdkReadTimeoutSession.call_count == 1
 
 
 @pytest.mark.parametrize(

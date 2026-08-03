@@ -1,16 +1,20 @@
-"""Agent MCP 工具桥与 Agent 归属计费（设计文档 §11「MCP 故障与积分」）。
+"""Agent MCP 工具桥与 Agent 归属计费（设计文档 §11「MCP 故障与积分」/ 加固 §5.3）。
 
-:class:`AgentMcpTool` 是 MCP 目录工具的 TrustedTool 执行器：
-- 参数先按工具 Schema 校验归一化，再 canonical JSON + SHA-256 得
-  ``arguments_hash``（§11.2 熔断键 / §8.1 agent_tool_calls）；
-- **外发前持久化**：``agent_tool_calls`` 行（logical_call_id、状态）先落库并
-  预留积分，再外发调用（§17.2「工具调用持久化先于外发」）；
+:class:`AgentMcpTool` 是 MCP 目录工具的 TrustedTool 执行器；所有数据库读写经
+:class:`DurableToolCallCoordinator` 的**独立会话、独立事务**：
+
+- ``prepare`` 单一事务完成 Run/Step 归属校验、``logical_call_id`` 计算与锁定、
+  ``agent_tool_calls`` 行插入或复用、10 积分预留、``running`` + ``started_at``
+  落库——**commit 之后才允许调用 transport**（durable-before-send，§2.1/§5.3）。
+  预留与调用行在同一事务，不存在"悬挂预留"窗口；
+- 外发后 finalize 各自独立事务：成功 = 输出 Schema 校验 + 写 Evidence + settle；
+  ``failed_confirmed`` / ``definitely_not_sent`` = release；``result_unknown`` =
+  保留预留置 unknown 进入恢复核对；进程取消且请求可能已发送 = 按
+  ``result_unknown`` 收口；
 - ``logical_call_id`` 由 run+step+工具+参数哈希确定性派生：相同调用重入只
-  复用行，绝不重复执行或扣费；
-- 四种故障分类（§11.1）：definitely_not_sent 释放、failed_confirmed 释放、
-  result_unknown 保持预留进入恢复核对、settled 结算 10 积分；
-- 成功时经 :class:`EvidenceWriter` 落不可变 Evidence（完整 raw_payload +
-  受限 preview），模型只拿 evidence_id 与预览。
+  复用已提交行（幂等回放），绝不重复执行或扣费；
+- 恢复核对（reconcile）同样走独立事务并即时提交；取回的 payload 必须重新过
+  输出 Schema 校验才能写 Evidence（与 execute 路径一致，§5.3）。
 
 :class:`AgentMcpAccounting` 与 legacy ``McpAccounting`` 解耦：共用
 ``WalletService`` 的 reserve/settle/release，但挂靠 ``agent_tool_calls``，
@@ -20,10 +24,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
-from collections.abc import Mapping
-from contextlib import asynccontextmanager
+from collections.abc import Callable, Mapping
+from contextlib import AbstractAsyncContextManager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
@@ -37,11 +43,13 @@ from app.agent_runtime.circuit_breaker import FineGrainedCircuitBreaker
 from app.agent_runtime.evidence import EvidenceWriter
 from app.agent_runtime.models import (
     AgentRun,
+    AgentStep,
     AgentToolCall,
     AgentToolCallReconciliation,
 )
 from app.agent_runtime.tools.contracts import ToolContext, ToolResult
 from app.billing.service import InsufficientPointsError, WalletService
+from app.db.session import SessionFactory
 from app.mcp_gateway.contracts import DataTapService
 from app.mcp_gateway.registry import close_input_schema
 from app.mcp_gateway.service import safe_upstream_text
@@ -92,6 +100,9 @@ _PERIOD_KEYS = frozenset(
     {"period", "start", "end", "start_date", "end_date", "date", "cycle_type"}
 )
 
+# 会话工厂类型：生产为 SessionFactory（独立连接真实提交）；测试可注入共享会话。
+SessionFactoryLike = Callable[[], AbstractAsyncContextManager[AsyncSession]]
+
 
 def _now() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
@@ -110,21 +121,27 @@ def logical_call_id_for(
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
-@asynccontextmanager
-async def _db_transaction(db: AsyncSession):
-    """在既有事务内开 savepoint，否则开新事务；退出即提交。"""
-    if db.in_transaction():
-        async with db.begin_nested():
-            yield
-    else:
-        async with db.begin():
-            yield
-
-
 def _extract_scope_period(arguments: Mapping[str, Any]) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     scope = {key: value for key, value in arguments.items() if key in _SCOPE_KEYS}
     period = {key: value for key, value in arguments.items() if key in _PERIOD_KEYS}
     return (scope if scope else None), (period if period else None)
+
+
+@dataclass(frozen=True)
+class AgentToolCallSnapshot:
+    """协调器读模型：reconcile 决策所需的调用行 + 归属信息（脱离会话的纯数据）。"""
+
+    call_id: str
+    logical_call_id: str
+    run_id: str
+    step_id: str
+    user_id: str
+    session_id: str
+    status: str
+    error_type: str | None
+    safe_error_message: str | None
+    upstream_request_id: str | None
+    arguments_json: dict[str, Any] | None
 
 
 class AgentMcpAccounting:
@@ -191,8 +208,398 @@ class AgentMcpAccounting:
         await self._db.flush()
 
 
+class DurableToolCallCoordinator:
+    """MCP 调用的事务边界（§5.3）：外发前持久化、外发后结算、恢复核对。
+
+    每个操作使用**独立 DB Session 的单一事务并即时提交**：
+
+    - :meth:`prepare` 提交后调用行（running + 10 分预留）对其它连接已可见，
+      之后才允许外发——进程在"外发后、返回前"崩溃时行与预留不再整体回滚；
+    - finalize 三个方法各自独立提交，终态守护 + 钱包幂等键保证重入安全；
+    - reconcile 系列方法（load/keep_unknown/confirm_*）同样即时提交，
+      恢复循环与人工核对的结果不再依赖外层会话的提交时机。
+    """
+
+    def __init__(
+        self,
+        *,
+        session_factory: SessionFactoryLike,
+        service: DataTapService,
+        internal_tool_name: str,
+    ) -> None:
+        self._session_factory = session_factory
+        self._service = service
+        self._internal_tool_name = internal_tool_name
+
+    # ------------------------------------------------------------------ #
+    # prepare：外发前持久化（§5.3）
+    # ------------------------------------------------------------------ #
+
+    async def prepare(
+        self,
+        context: ToolContext,
+        *,
+        logical_call_id: str,
+        args_hash: str,
+        normalized_arguments: Mapping[str, Any],
+    ) -> ToolResult | None:
+        """独立会话单一事务：校验归属 → 锁定 logical_call_id → 插入或复用行 →
+        预留 10 积分 → 写 running + started_at → **commit**。
+
+        返回 ``None`` 表示行已提交 running、允许外发；返回 :class:`ToolResult`
+        表示幂等回放（既有行 / 余额不足），调用方不得外发。
+        """
+        if context.step_id is None:
+            raise ValueError("step_id is required for MCP tool calls")
+        async with self._session_factory() as db:
+            try:
+                # 1. 校验 Run/Step 归属（模型不能伪造他人上下文）。
+                run = await db.get(AgentRun, context.run_id)
+                if (
+                    run is None
+                    or run.user_id != context.user_id
+                    or run.session_id != context.session_id
+                ):
+                    raise ValueError("agent_run_context_mismatch")
+                step = await db.get(AgentStep, context.step_id)
+                if step is None or step.run_id != run.id:
+                    raise ValueError("agent_step_context_mismatch")
+                # 2. 计算并锁定 logical_call_id：已存在则幂等回放（绝不重发）。
+                existing = await self._by_logical_call_id(db, logical_call_id, for_update=True)
+                if existing is not None:
+                    return await self._replay(db, existing)
+                # 3-5. 行 + 预留 + running 同一事务提交。
+                row = AgentToolCall(
+                    id=str(uuid4()),
+                    run_id=context.run_id,
+                    step_id=context.step_id,
+                    logical_call_id=logical_call_id,
+                    service=self._service.value,
+                    internal_tool_name=self._internal_tool_name,
+                    arguments_json=dict(normalized_arguments),
+                    arguments_hash=args_hash,
+                    status="planned",
+                )
+                db.add(row)
+                accounting = AgentMcpAccounting(db)
+                await accounting.reserve(context.user_id, row)
+                await accounting.mark_running(row)
+                await db.commit()
+                return None
+            except InsufficientPointsError:
+                # 行与预留同一事务整体回滚：不残留 planned 行、不残留预留。
+                await db.rollback()
+                return ToolResult(
+                    status="failed",
+                    safe_summary="insufficient points for MCP call",
+                    error_type=DEFINITELY_NOT_SENT,
+                )
+            except IntegrityError:
+                # 并发窗口 TOCTOU：另一调用先提交了相同 logical_call_id（§17.2）。
+                # 唯一约束失败视为已存在 → 幂等回放其行，绝不重发。
+                await db.rollback()
+                winner = await self._by_logical_call_id(db, logical_call_id, for_update=True)
+                if winner is not None:
+                    return await self._replay(db, winner)
+                raise
+
+    # ------------------------------------------------------------------ #
+    # finalize：外发后结算（各自独立事务，§5.3）
+    # ------------------------------------------------------------------ #
+
+    async def finalize_success(
+        self,
+        *,
+        logical_call_id: str,
+        user_id: str,
+        session_id: str,
+        validated_payload: Any,
+        upstream_request_id: str | None,
+    ) -> tuple[str, dict[str, Any] | None]:
+        """成功收口：写 Evidence + settle 10 分，返回 (evidence_id, preview)。
+
+        幂等：已 settled 的调用直接回放既有 Evidence（重入不重复写、不重复扣费）。
+        """
+        async with self._session_factory() as db:
+            row = await self._require_call(db, logical_call_id, for_update=True)
+            if row.status == "settled":
+                evidence = await EvidenceWriter(db).get_by_tool_call_id(row.id)
+                if evidence is None:
+                    raise LookupError("evidence_missing_for_settled_call")
+                return evidence.id, evidence.normalized_preview_json
+            if row.status == "failed":
+                raise RuntimeError("agent_tool_call_already_failed")
+            scope, period = _extract_scope_period(row.arguments_json or {})
+            evidence = await EvidenceWriter(db).write(
+                session_id=session_id,
+                run_id=row.run_id,
+                tool_call_id=row.id,
+                source_type="mcp",
+                source_name=self._internal_tool_name,
+                scope_json=scope,
+                period_json=period,
+                raw_payload=validated_payload,
+            )
+            row.upstream_request_id = upstream_request_id
+            await AgentMcpAccounting(db).settle(user_id, row)
+            await db.commit()
+            return evidence.id, evidence.normalized_preview_json
+
+    async def finalize_release(
+        self,
+        *,
+        logical_call_id: str,
+        user_id: str,
+        error_type: str,
+        message: str,
+        upstream_request_id: str | None = None,
+    ) -> None:
+        """失败收口（definitely_not_sent / failed_confirmed）：释放预留。"""
+        async with self._session_factory() as db:
+            row = await self._require_call(db, logical_call_id, for_update=True)
+            if row.status in ("settled", "failed"):
+                return  # 已终态：幂等跳过，不重复触碰钱包
+            if upstream_request_id:
+                row.upstream_request_id = upstream_request_id
+            await AgentMcpAccounting(db).release(
+                user_id, row, error_type=error_type, message=message
+            )
+            await db.commit()
+
+    async def finalize_unknown(
+        self,
+        *,
+        logical_call_id: str,
+        message: str,
+        upstream_request_id: str | None = None,
+    ) -> None:
+        """result_unknown 收口：保留预留、置 unknown，进入恢复核对。"""
+        async with self._session_factory() as db:
+            row = await self._require_call(db, logical_call_id, for_update=True)
+            if row.status in ("settled", "failed"):
+                return  # 已终态：幂等跳过（与并发 finalize/核对竞态安全）
+            if upstream_request_id:
+                row.upstream_request_id = upstream_request_id
+            row.status = "unknown"
+            row.error_type = RESULT_UNKNOWN
+            row.safe_error_message = message
+            row.completed_at = _now()
+            await db.commit()
+
+    # ------------------------------------------------------------------ #
+    # 恢复核对（reconcile）：独立事务即时提交，绝不重放（§11.1 / §5.3）
+    # ------------------------------------------------------------------ #
+
+    async def load_call(self, logical_call_id: str) -> AgentToolCallSnapshot | None:
+        """独立会话读取调用行 + 归属快照（reconcile 决策的只读输入）。"""
+        async with self._session_factory() as db:
+            row = await self._by_logical_call_id(db, logical_call_id)
+            if row is None:
+                return None
+            run = await db.get(AgentRun, row.run_id)
+            if run is None:
+                raise LookupError("agent_run_not_found")
+            return AgentToolCallSnapshot(
+                call_id=row.id,
+                logical_call_id=row.logical_call_id,
+                run_id=row.run_id,
+                step_id=row.step_id,
+                user_id=run.user_id,
+                session_id=run.session_id,
+                status=row.status,
+                error_type=row.error_type,
+                safe_error_message=row.safe_error_message,
+                upstream_request_id=row.upstream_request_id,
+                arguments_json=row.arguments_json,
+            )
+
+    async def replay_result(self, logical_call_id: str) -> ToolResult | None:
+        """独立会话按当前状态构造幂等回放结果；行不存在返回 None。"""
+        async with self._session_factory() as db:
+            row = await self._by_logical_call_id(db, logical_call_id)
+            if row is None:
+                return None
+            return await self._replay(db, row)
+
+    async def keep_unknown(self, snapshot: AgentToolCallSnapshot, *, note: str) -> None:
+        """追加 keep_unknown 审计；同一调用已记录过 keep_unknown 则跳过。
+
+        无法核对的 unknown 调用每轮恢复扫描都会被再次探测，但不得每轮都追加一条
+        审计（约 2880 行/天/调用）——状态未变化时不重复记账（§11.1）。
+        """
+        async with self._session_factory() as db:
+            last = await self._last_reconciliation_decision(db, snapshot.call_id)
+            if last == "keep_unknown":
+                return
+            self._append_reconciliation(
+                db,
+                snapshot.call_id,
+                source="upstream_probe",
+                decision="keep_unknown",
+                note=note,
+            )
+            await db.commit()
+
+    async def confirm_failure(
+        self,
+        snapshot: AgentToolCallSnapshot,
+        *,
+        message: str,
+        note: str,
+        upstream_request_id: str | None = None,
+    ) -> None:
+        """核对确认失败：release + confirm_failure 审计（独立事务提交）。"""
+        async with self._session_factory() as db:
+            row = await self._require_call(db, snapshot.logical_call_id, for_update=True)
+            if row.status in ("settled", "failed"):
+                return
+            if upstream_request_id:
+                row.upstream_request_id = upstream_request_id
+            await AgentMcpAccounting(db).release(
+                snapshot.user_id, row, error_type=FAILED_CONFIRMED, message=message
+            )
+            self._append_reconciliation(
+                db,
+                row.id,
+                source="upstream_probe",
+                decision="confirm_failure",
+                note=note,
+            )
+            await db.commit()
+
+    async def confirm_success(
+        self,
+        snapshot: AgentToolCallSnapshot,
+        *,
+        validated_payload: Any,
+        upstream_request_id: str | None,
+        note: str,
+    ) -> str | None:
+        """核对确认成功：（有 payload 时）写 Evidence + settle + 审计。
+
+        ``validated_payload`` 为 ``None`` 表示 payload 不可取回：只结算并标记
+        ``result_unavailable``，绝不伪造 Evidence。返回 evidence_id 或 None。
+        """
+        async with self._session_factory() as db:
+            row = await self._require_call(db, snapshot.logical_call_id, for_update=True)
+            if row.status in ("settled", "failed"):
+                evidence = await EvidenceWriter(db).get_by_tool_call_id(row.id)
+                return evidence.id if evidence is not None else None
+            evidence_id: str | None = None
+            if validated_payload is not None:
+                scope, period = _extract_scope_period(row.arguments_json or {})
+                evidence = await EvidenceWriter(db).write(
+                    session_id=snapshot.session_id,
+                    run_id=row.run_id,
+                    tool_call_id=row.id,
+                    source_type="mcp",
+                    source_name=self._internal_tool_name,
+                    scope_json=scope,
+                    period_json=period,
+                    raw_payload=validated_payload,
+                )
+                evidence_id = evidence.id
+            if upstream_request_id:
+                row.upstream_request_id = upstream_request_id
+            await AgentMcpAccounting(db).settle(snapshot.user_id, row)
+            if evidence_id is None:
+                row.safe_error_message = "result_unavailable"
+            self._append_reconciliation(
+                db,
+                row.id,
+                source="upstream_probe",
+                decision="confirm_success",
+                note=note,
+            )
+            await db.commit()
+            return evidence_id
+
+    # ------------------------------------------------------------------ #
+    # helpers
+    # ------------------------------------------------------------------ #
+
+    async def _replay(self, db: AsyncSession, row: AgentToolCall) -> ToolResult:
+        if row.status == "settled":
+            evidence = await EvidenceWriter(db).get_by_tool_call_id(row.id)
+            if evidence is not None:
+                return ToolResult(status="success", safe_summary="already settled", evidence_id=evidence.id)
+            return ToolResult(status="success", safe_summary="already settled")
+        if row.status == "failed":
+            return ToolResult(
+                status="failed",
+                safe_summary=row.safe_error_message or "tool call failed",
+                error_type=row.error_type or FAILED_CONFIRMED,
+            )
+        if row.status == "unknown":
+            return ToolResult(
+                status="unknown",
+                safe_summary=row.safe_error_message or "result unknown",
+                error_type=RESULT_UNKNOWN,
+            )
+        return ToolResult(
+            status="unknown",
+            safe_summary="tool call already in progress; awaiting recovery",
+            error_type=RESULT_UNKNOWN,
+        )
+
+    async def _by_logical_call_id(
+        self, db: AsyncSession, logical_call_id: str, *, for_update: bool = False
+    ) -> AgentToolCall | None:
+        statement = select(AgentToolCall).where(
+            AgentToolCall.logical_call_id == logical_call_id
+        )
+        if for_update:
+            statement = statement.with_for_update()
+        return await db.scalar(statement)
+
+    async def _require_call(
+        self, db: AsyncSession, logical_call_id: str, *, for_update: bool = False
+    ) -> AgentToolCall:
+        row = await self._by_logical_call_id(db, logical_call_id, for_update=for_update)
+        if row is None:
+            raise LookupError("agent_tool_call_not_found")
+        return row
+
+    def _append_reconciliation(
+        self,
+        db: AsyncSession,
+        tool_call_id: str,
+        *,
+        source: str,
+        decision: str,
+        note: str,
+    ) -> None:
+        db.add(
+            AgentToolCallReconciliation(
+                id=str(uuid4()),
+                tool_call_id=tool_call_id,
+                source=source,
+                decision=decision,
+                note=note,
+                created_at=_now(),
+            )
+        )
+
+    async def _last_reconciliation_decision(
+        self, db: AsyncSession, tool_call_id: str
+    ) -> str | None:
+        return await db.scalar(
+            select(AgentToolCallReconciliation.decision)
+            .where(AgentToolCallReconciliation.tool_call_id == tool_call_id)
+            .order_by(
+                AgentToolCallReconciliation.created_at.desc(),
+                AgentToolCallReconciliation.id.desc(),
+            )
+            .limit(1)
+        )
+
+
 class AgentMcpTool:
-    """已审核 DataTap MCP 目录工具的受控执行器（TrustedTool 兼容）。"""
+    """已审核 DataTap MCP 目录工具的受控执行器（TrustedTool 兼容）。
+
+    ``db_session`` 为构造兼容参数（A2 装配路径按 Engine 会话传入）；所有
+    durable 读写经 ``session_factory`` 独立会话提交，不再使用该会话。
+    """
 
     name: str
     input_model: type[BaseModel] | None = None
@@ -207,9 +614,10 @@ class AgentMcpTool:
         remote_name: str,
         input_schema: dict[str, Any],
         output_schema: dict[str, Any],
-        db_session: AsyncSession,
         transport: McpTransport,
+        db_session: AsyncSession | None = None,
         breaker: FineGrainedCircuitBreaker | None = None,
+        session_factory: SessionFactoryLike = SessionFactory,
     ) -> None:
         if not isinstance(service, DataTapService):
             raise TypeError("service must be a DataTapService")
@@ -221,8 +629,11 @@ class AgentMcpTool:
         self._db = db_session
         self._transport = transport
         self._breaker = breaker or FineGrainedCircuitBreaker()
-        self._accounting = AgentMcpAccounting(db_session)
-        self._evidence = EvidenceWriter(db_session)
+        self._coordinator = DurableToolCallCoordinator(
+            session_factory=session_factory,
+            service=service,
+            internal_tool_name=internal_name,
+        )
 
     # ------------------------------------------------------------------ #
     # execute
@@ -247,9 +658,6 @@ class AgentMcpTool:
         logical_call_id = logical_call_id_for(
             context.run_id, context.step_id, self.name, args_hash
         )
-        existing = await self._by_logical_call_id(logical_call_id)
-        if existing is not None:
-            return await self._replay(existing)
 
         # 细粒度熔断：只封锁相同 service+tool+参数（§11.2）。
         if not self._breaker.allow(
@@ -261,70 +669,57 @@ class AgentMcpTool:
                 error_type=DEFINITELY_NOT_SENT,
             )
 
-        row = AgentToolCall(
-            id=str(uuid4()),
-            run_id=context.run_id,
-            step_id=context.step_id,
+        # durable-before-send：行 + 预留 commit 之后才允许外发（§2.1/§5.3）。
+        replay = await self._coordinator.prepare(
+            context,
             logical_call_id=logical_call_id,
-            service=self._service.value,
-            internal_tool_name=self.name,
-            arguments_json=normalized,
-            arguments_hash=args_hash,
-            status="planned",
+            args_hash=args_hash,
+            normalized_arguments=normalized,
         )
-        # 外发前持久化：先预留积分。行对象暂不加入会话——WalletService 内部查询会
-        # 触发 autoflush，若先把行加入会话，余额不足抛错后 savepoint 回滚无法保证
-        # 清掉 pending 行（会被后续查询的 autoflush 重新 flush，撞唯一约束）。因此
-        # 余额不足路径天然不残留任何 planned 行（Fix 4）。
-        try:
-            async with _db_transaction(self._db):
-                await self._accounting.reserve(context.user_id, row)
-        except InsufficientPointsError:
-            return ToolResult(
-                status="failed",
-                safe_summary="insufficient points for MCP call",
-                error_type=DEFINITELY_NOT_SENT,
-            )
-        # 预留成功：行 + running 状态原子落库（durable-before-send）。
-        self._db.add(row)
-        try:
-            async with _db_transaction(self._db):
-                await self._accounting.mark_running(row)
-        except IntegrityError:
-            # 并发窗口 TOCTOU：另一调用先插入了相同 logical_call_id（§17.2）。
-            # 唯一约束失败视为已存在 → 幂等复用其行，绝不重发。
-            if row in self._db:
-                self._db.expunge(row)
-            existing = await self._by_logical_call_id(logical_call_id)
-            if existing is not None:
-                return await self._replay(existing)
-            raise
+        if replay is not None:
+            return replay
 
         try:
             result = await self._transport.call_tool(
                 self._service, self._remote_name, normalized
             )
+        except asyncio.CancelledError:
+            # 进程取消且请求可能已发送：按 result_unknown 收口（§5.3），
+            # 绝不静默丢失已提交行与预留；随后继续抛出取消。
+            self._breaker.record_failure(
+                service=self._service.value, internal_tool_name=self.name, arguments=normalized
+            )
+            try:
+                await self._coordinator.finalize_unknown(
+                    logical_call_id=logical_call_id,
+                    message="cancelled after dispatch; outcome unconfirmed",
+                )
+            finally:
+                raise
         except _UNCONFIRMED_ERRORS as exc:
-            return await self._finalize_unknown(row, normalized, message=self._error_message(exc))
+            return await self._finalize_unknown(
+                logical_call_id, normalized, message=self._error_message(exc)
+            )
         except _PRE_CONNECTION_ERRORS as exc:
             return await self._finalize_definitely_not_sent(
-                row, context, normalized, message=self._error_message(exc)
+                context, logical_call_id, normalized, message=self._error_message(exc)
             )
         except Exception as exc:
-            return await self._finalize_unknown(row, normalized, message=self._error_message(exc))
+            return await self._finalize_unknown(
+                logical_call_id, normalized, message=self._error_message(exc)
+            )
 
         if result.is_error:
             self._breaker.record_success(
                 service=self._service.value, internal_tool_name=self.name, arguments=normalized
             )
-            async with _db_transaction(self._db):
-                row.upstream_request_id = result.upstream_request_id
-                await self._accounting.release(
-                    context.user_id,
-                    row,
-                    error_type=FAILED_CONFIRMED,
-                    message=safe_upstream_text(result.error_text) or "MCP call failed",
-                )
+            await self._coordinator.finalize_release(
+                logical_call_id=logical_call_id,
+                user_id=context.user_id,
+                error_type=FAILED_CONFIRMED,
+                message=safe_upstream_text(result.error_text) or "MCP call failed",
+                upstream_request_id=result.upstream_request_id,
+            )
             return ToolResult(
                 status="failed", safe_summary="upstream reported a business error",
                 error_type=FAILED_CONFIRMED,
@@ -337,12 +732,13 @@ class AgentMcpTool:
                 self._breaker.record_success(
                     service=self._service.value, internal_tool_name=self.name, arguments=normalized
                 )
-                async with _db_transaction(self._db):
-                    row.upstream_request_id = result.upstream_request_id
-                    await self._accounting.release(
-                        context.user_id, row, error_type=FAILED_CONFIRMED,
-                        message="output validation failed",
-                    )
+                await self._coordinator.finalize_release(
+                    logical_call_id=logical_call_id,
+                    user_id=context.user_id,
+                    error_type=FAILED_CONFIRMED,
+                    message="output validation failed",
+                    upstream_request_id=result.upstream_request_id,
+                )
                 return ToolResult(
                     status="failed", safe_summary="output validation failed",
                     error_type=FAILED_CONFIRMED,
@@ -353,25 +749,18 @@ class AgentMcpTool:
         self._breaker.record_success(
             service=self._service.value, internal_tool_name=self.name, arguments=normalized
         )
-        scope, period = _extract_scope_period(normalized)
-        async with _db_transaction(self._db):
-            evidence = await self._evidence.write(
-                session_id=context.session_id,
-                run_id=context.run_id,
-                tool_call_id=row.id,
-                source_type="mcp",
-                source_name=self.name,
-                scope_json=scope,
-                period_json=period,
-                raw_payload=validated,
-            )
-            row.upstream_request_id = result.upstream_request_id
-            await self._accounting.settle(context.user_id, row)
-        summary = json.dumps(evidence.normalized_preview_json, ensure_ascii=False)
+        evidence_id, preview = await self._coordinator.finalize_success(
+            logical_call_id=logical_call_id,
+            user_id=context.user_id,
+            session_id=context.session_id,
+            validated_payload=validated,
+            upstream_request_id=result.upstream_request_id,
+        )
+        summary = json.dumps(preview, ensure_ascii=False)
         return ToolResult(
             status="success",
             safe_summary=summary[:1_000],
-            evidence_id=evidence.id,
+            evidence_id=evidence_id,
         )
 
     # ------------------------------------------------------------------ #
@@ -380,15 +769,16 @@ class AgentMcpTool:
 
     async def reconcile(self, logical_call_id: str) -> ToolResult:
         """恢复任务入口：对 result_unknown 调用按 logical_call_id 只读核对。"""
-        row = await self._by_logical_call_id(logical_call_id)
-        if row is None:
+        snapshot = await self._coordinator.load_call(logical_call_id)
+        if snapshot is None:
             raise LookupError("agent_tool_call_not_found")
-        if row.status not in ("unknown", "reserved"):
-            return await self._replay(row)
-        user_id = await self._user_id(row)
-        if row.upstream_request_id is None:
-            await self._append_keep_unknown(
-                row, note="no upstream_request_id to reconcile"
+        if snapshot.status not in ("unknown", "reserved"):
+            replay = await self._coordinator.replay_result(logical_call_id)
+            assert replay is not None  # load_call 刚读到该行
+            return replay
+        if snapshot.upstream_request_id is None:
+            await self._coordinator.keep_unknown(
+                snapshot, note="no upstream_request_id to reconcile"
             )
             return ToolResult(
                 status="unknown", safe_summary="cannot reconcile without upstream_request_id",
@@ -396,112 +786,83 @@ class AgentMcpTool:
             )
         recon = getattr(self._transport, "reconcile_tool_call", None)
         if recon is None:
-            await self._append_keep_unknown(
-                row, note="transport does not support reconciliation"
+            await self._coordinator.keep_unknown(
+                snapshot, note="transport does not support reconciliation"
             )
             return ToolResult(
                 status="unknown", safe_summary="transport cannot reconcile",
                 error_type=RESULT_UNKNOWN,
             )
-        result = await recon(row.upstream_request_id)
+        result = await recon(snapshot.upstream_request_id)
         if result is None:
-            await self._append_keep_unknown(
-                row, note="outcome not confirmable"
-            )
+            await self._coordinator.keep_unknown(snapshot, note="outcome not confirmable")
             return ToolResult(
                 status="unknown", safe_summary="outcome not confirmable",
                 error_type=RESULT_UNKNOWN,
             )
         if result.is_error:
-            async with _db_transaction(self._db):
-                await self._accounting.release(
-                    user_id, row, error_type=FAILED_CONFIRMED,
-                    message="upstream confirmed failure",
-                )
-            await self._append_reconciliation(
-                row, source="upstream_probe", decision="confirm_failure",
+            await self._coordinator.confirm_failure(
+                snapshot,
+                message="upstream confirmed failure",
                 note="upstream reported isError",
+                upstream_request_id=result.upstream_request_id,
             )
             return ToolResult(
                 status="failed", safe_summary="upstream confirmed failure",
                 error_type=FAILED_CONFIRMED,
             )
-        # 可确认成功；能取回 payload 则落 Evidence，否则只结算并标记结果不可用。
+        # 可确认成功；payload 必须重新过输出 Schema 校验才能写 Evidence（§5.3）。
         if result.structured_content is None:
-            async with _db_transaction(self._db):
-                await self._accounting.settle(user_id, row)
-                row.safe_error_message = "result_unavailable"
-            await self._append_reconciliation(
-                row, source="upstream_probe", decision="confirm_success",
+            await self._coordinator.confirm_success(
+                snapshot,
+                validated_payload=None,
+                upstream_request_id=result.upstream_request_id,
                 note="payload not retrievable",
             )
             return ToolResult(
                 status="success", safe_summary="confirmed success (payload unavailable)",
                 evidence_id=None,
             )
-        scope, period = _extract_scope_period(row.arguments_json or {})
-        async with _db_transaction(self._db):
-            evidence = await self._evidence.write(
-                session_id=(await self._run(row)).session_id,
-                run_id=row.run_id,
-                tool_call_id=row.id,
-                source_type="mcp",
-                source_name=self.name,
-                scope_json=scope,
-                period_json=period,
-                raw_payload=result.structured_content,
+        try:
+            validated = validate_output(result.structured_content, self._output_schema)
+        except McpValidationError:
+            await self._coordinator.confirm_failure(
+                snapshot,
+                message="output validation failed",
+                note="output validation failed",
+                upstream_request_id=result.upstream_request_id,
             )
-            row.upstream_request_id = result.upstream_request_id or row.upstream_request_id
-            await self._accounting.settle(user_id, row)
-        await self._append_reconciliation(
-            row, source="upstream_probe", decision="confirm_success",
+            return ToolResult(
+                status="failed", safe_summary="output validation failed",
+                error_type=FAILED_CONFIRMED,
+            )
+        evidence_id = await self._coordinator.confirm_success(
+            snapshot,
+            validated_payload=validated,
+            upstream_request_id=result.upstream_request_id,
             note="confirmed via upstream",
         )
-        return ToolResult(status="success", safe_summary="confirmed success", evidence_id=evidence.id)
+        return ToolResult(status="success", safe_summary="confirmed success", evidence_id=evidence_id)
 
     # ------------------------------------------------------------------ #
     # helpers
     # ------------------------------------------------------------------ #
 
-    async def _replay(self, row: AgentToolCall) -> ToolResult:
-        if row.status == "settled":
-            evidence = await self._evidence.get_by_tool_call_id(row.id)
-            if evidence is not None:
-                return ToolResult(status="success", safe_summary="already settled", evidence_id=evidence.id)
-            return ToolResult(status="success", safe_summary="already settled")
-        if row.status == "failed":
-            return ToolResult(
-                status="failed",
-                safe_summary=row.safe_error_message or "tool call failed",
-                error_type=row.error_type or FAILED_CONFIRMED,
-            )
-        if row.status == "unknown":
-            return ToolResult(
-                status="unknown",
-                safe_summary=row.safe_error_message or "result unknown",
-                error_type=RESULT_UNKNOWN,
-            )
-        return ToolResult(
-            status="unknown",
-            safe_summary="tool call already in progress; awaiting recovery",
-            error_type=RESULT_UNKNOWN,
-        )
-
-    async def _finalize_unknown(self, row: AgentToolCall, normalized, *, message: str) -> ToolResult:
+    async def _finalize_unknown(
+        self, logical_call_id: str, normalized: Mapping[str, Any], *, message: str
+    ) -> ToolResult:
         self._breaker.record_failure(
             service=self._service.value, internal_tool_name=self.name, arguments=normalized
         )
-        async with _db_transaction(self._db):
-            row.status = "unknown"
-            row.error_type = RESULT_UNKNOWN
-            row.safe_error_message = message
-            row.completed_at = _now()
+        await self._coordinator.finalize_unknown(
+            logical_call_id=logical_call_id, message=message
+        )
         return ToolResult(status="unknown", safe_summary=message, error_type=RESULT_UNKNOWN)
 
     async def _finalize_definitely_not_sent(
         self,
-        row: AgentToolCall,
         context: ToolContext,
+        logical_call_id: str,
         normalized: Mapping[str, Any],
         *,
         message: str,
@@ -513,75 +874,17 @@ class AgentMcpTool:
         self._breaker.record_failure(
             service=self._service.value, internal_tool_name=self.name, arguments=normalized
         )
-        async with _db_transaction(self._db):
-            await self._accounting.release(
-                context.user_id, row, error_type=DEFINITELY_NOT_SENT, message=message
-            )
+        await self._coordinator.finalize_release(
+            logical_call_id=logical_call_id,
+            user_id=context.user_id,
+            error_type=DEFINITELY_NOT_SENT,
+            message=message,
+        )
         return ToolResult(status="failed", safe_summary=message, error_type=DEFINITELY_NOT_SENT)
 
     @staticmethod
     def _error_message(exc: BaseException) -> str:
         return str(exc) or exc.__class__.__name__
-
-    async def _by_logical_call_id(self, logical_call_id: str) -> AgentToolCall | None:
-        return await self._db.scalar(
-            select(AgentToolCall).where(AgentToolCall.logical_call_id == logical_call_id)
-        )
-
-    async def _run(self, call: AgentToolCall) -> AgentRun:
-        run = await self._db.get(AgentRun, call.run_id)
-        if run is None:
-            raise LookupError("agent_run_not_found")
-        return run
-
-    async def _user_id(self, call: AgentToolCall) -> str:
-        return (await self._run(call)).user_id
-
-    async def _append_reconciliation(
-        self,
-        call: AgentToolCall,
-        *,
-        source: str,
-        decision: str,
-        note: str,
-        actor_user_id: str | None = None,
-    ) -> None:
-        self._db.add(
-            AgentToolCallReconciliation(
-                id=str(uuid4()),
-                tool_call_id=call.id,
-                source=source,
-                decision=decision,
-                actor_user_id=actor_user_id,
-                note=note,
-                created_at=_now(),
-            )
-        )
-        await self._db.flush()
-
-    async def _append_keep_unknown(self, call: AgentToolCall, *, note: str) -> None:
-        """追加 keep_unknown 审计；若该调用已记录过 keep_unknown 则跳过。
-
-        无法核对的 unknown 调用每轮恢复扫描都会被再次探测，但不得每轮都追加一条
-        审计（约 2880 行/天/调用）——状态未变化时不重复记账（§11.1）。
-        """
-        last = await self._last_reconciliation_decision(call.id)
-        if last == "keep_unknown":
-            return
-        await self._append_reconciliation(
-            call, source="upstream_probe", decision="keep_unknown", note=note
-        )
-
-    async def _last_reconciliation_decision(self, tool_call_id: str) -> str | None:
-        return await self._db.scalar(
-            select(AgentToolCallReconciliation.decision)
-            .where(AgentToolCallReconciliation.tool_call_id == tool_call_id)
-            .order_by(
-                AgentToolCallReconciliation.created_at.desc(),
-                AgentToolCallReconciliation.id.desc(),
-            )
-            .limit(1)
-        )
 
 
 __all__ = [
@@ -591,6 +894,8 @@ __all__ = [
     "RESULT_UNKNOWN",
     "AgentMcpAccounting",
     "AgentMcpTool",
+    "AgentToolCallSnapshot",
+    "DurableToolCallCoordinator",
     "arguments_hash",
     "logical_call_id_for",
 ]

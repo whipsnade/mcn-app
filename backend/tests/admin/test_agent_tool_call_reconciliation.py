@@ -368,3 +368,40 @@ async def test_reconcile_idempotent_replay_no_double_settle(
     wallet = await WalletService(db_session).get_wallet(user.id)
     assert wallet.balance == 990
     assert wallet.reserved == 0
+
+
+@pytest.mark.asyncio
+async def test_confirm_success_with_invalid_payload_settles_without_evidence(
+    db_session, user_factory, reconcile_client_factory
+) -> None:
+    """人工取回的 payload 必须重新过输出 Schema 校验（设计 §5.3）：
+    校验不过 → 不落 Evidence，退化为 settle + result_unavailable。"""
+    async def invalid_payload_reconciler(upstream_request_id: str) -> RemoteToolResult | None:
+        return RemoteToolResult(
+            structured_content={"wrong_shape": 123},
+            is_error=False,
+            upstream_request_id=upstream_request_id,
+        )
+
+    user = await user_factory()
+    await WalletService(db_session).ensure_welcome_grant(user.id)
+    call = await _make_unknown_call(db_session, user.id)
+    admin_client, _ = await reconcile_client_factory(invalid_payload_reconciler)
+
+    response = await admin_client.post(
+        f"/api/v1/admin/agent-tool-calls/{call.id}/reconcile",
+        json={"decision": "confirm_success", "note": "人工确认成功"},
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == "settled"
+    assert response.json()["evidence_id"] is None
+
+    # 非法 payload 绝不写 Evidence
+    evidence = await db_session.scalar(
+        select(EvidenceItem).where(EvidenceItem.tool_call_id == call.id)
+    )
+    assert evidence is None
+    refreshed = await db_session.get(AgentToolCall, call.id)
+    assert refreshed.safe_error_message == "result_unavailable"
+    wallet = await WalletService(db_session).get_wallet(user.id)
+    assert (wallet.balance, wallet.reserved) == (990, 0)

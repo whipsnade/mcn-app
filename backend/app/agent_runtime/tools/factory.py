@@ -26,6 +26,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_runtime.profiles import ARTIFACT_TOOLS, CALCULATION_TOOLS, HISTORY_TOOLS
+from app.agent_runtime.circuit_breaker import FineGrainedCircuitBreaker
 from app.agent_runtime.tools.artifacts import CreateDraftTool, UpdateDraftTool
 from app.agent_runtime.tools.calculation import (
     AggregateMetricsTool,
@@ -45,7 +46,7 @@ from app.identity.models import UserChannelPermission
 from app.mcp_gateway.contracts import DataTapService
 from app.mcp_gateway.models import McpToolCatalog
 from app.mcp_gateway.registry import DYNAMIC_TOOL_ALLOWLIST
-from app.mcp_gateway.service import get_mcp_transport
+from app.mcp_gateway.service import get_agent_mcp_transport
 from app.mcp_gateway.transport import McpTransport
 
 
@@ -77,11 +78,20 @@ async def load_channel_permissions(db: AsyncSession, user_id: str) -> frozenset[
 class AgentToolRegistryFactory:
     """生产工具装配工厂：给定 db session 构建完整 ToolRegistry。
 
-    ``transport_getter`` 可注入以便测试替换；默认取进程级 DataTap 传输。
+    ``transport_getter`` 可注入以便测试替换；默认取 Agent 运行时专用传输
+    （``circuit_scope="none"`` + 禁止 possibly-sent 自动重试，设计 §5.3）。
+    ``breaker`` 为进程级共享细粒度熔断器，生产必须由 main 装配注入；为 None
+    时每个 MCP 工具实例各建独立熔断器（仅测试便利，失败计数不跨实例累积）。
     """
 
-    def __init__(self, *, transport_getter: Callable[[], McpTransport] = get_mcp_transport) -> None:
+    def __init__(
+        self,
+        *,
+        transport_getter: Callable[[], McpTransport] = get_agent_mcp_transport,
+        breaker: FineGrainedCircuitBreaker | None = None,
+    ) -> None:
         self._transport_getter = transport_getter
+        self._breaker = breaker
 
     def build(self, db: AsyncSession) -> ToolRegistry:
         """构建注册齐内部工具并接入 MCP 审核目录的 ToolRegistry。"""
@@ -122,6 +132,7 @@ class AgentToolRegistryFactory:
             output_schema=output_schema,
             db_session=db,
             transport=self._transport_getter(),
+            breaker=self._breaker,
         )
 
 

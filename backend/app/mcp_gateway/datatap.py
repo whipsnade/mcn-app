@@ -83,6 +83,11 @@ class DataTapTransport:
         #   agent_runtime.circuit_breaker 的 service+tool+args-hash 细粒度熔断
         #   单独负责；队列并发限制与超时仍然生效。禁止两层熔断叠加。
         circuit_scope: Literal["service", "none"] = "service",
+        # "never"（默认）：任何失败都不自动重发——504、5xx、协议中断与
+        #   PossiblySentTimeout 都属"可能已发送"（result_unknown），设计
+        #   §5.3/§11.1 禁止自动重放；明确的连接前失败交由模型决定是否重新尝试。
+        # "transient_once"：legacy 策略，瞬时上游错误自动重试一次。
+        retry_policy: Literal["transient_once", "never"] = "never",
     ) -> None:
         secret = token.get_secret_value()
         if not secret.strip():
@@ -95,7 +100,10 @@ class DataTapTransport:
             raise ValueError("timeouts must be positive")
         if circuit_scope not in ("service", "none"):
             raise ValueError("circuit_scope must be 'service' or 'none'")
+        if retry_policy not in ("transient_once", "never"):
+            raise ValueError("retry_policy must be 'transient_once' or 'never'")
         self.circuit_scope = circuit_scope
+        self.retry_policy = retry_policy
 
         self.gateway_session_id = gateway_session_id or str(uuid4())
         if not self.gateway_session_id.strip() or not credential_version.strip():
@@ -252,11 +260,17 @@ class DataTapTransport:
     async def _run_isolated_with_retry(
         self, service: DataTapService, operation: Callable[[], Any]
     ):
-        """瞬时上游错误（5xx/网关超时/连接失败）自动重试一次。
+        """按 ``retry_policy`` 决定是否自动重发。
 
-        PossiblySentTimeout 不在重试之列（结果未确认，重试可能重复执行上游
-        查询）；熔断器/队列类错误立即抛出（立即重试同样会被拒绝）。
+        - ``"never"``（默认）：绝不重发。504、5xx、协议中断与
+          PossiblySentTimeout 都属"可能已发送"（result_unknown），自动重放
+          可能重复执行上游查询（设计 §5.3/§11.1 禁止）；
+        - ``"transient_once"``（legacy）：瞬时上游错误（5xx/网关超时/连接
+          失败）自动重试一次。PossiblySentTimeout 仍不在重试之列；熔断器/
+          队列类错误立即抛出（立即重试同样会被拒绝）。
         """
+        if self.retry_policy == "never":
+            return await self._run_isolated(service, operation)
         try:
             return await self._run_isolated(service, operation)
         except (

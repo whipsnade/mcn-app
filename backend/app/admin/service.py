@@ -19,12 +19,15 @@ from app.agent_runtime.models import (
     AgentToolCallReconciliation,
     EvidenceItem,
 )
+from app.agent_runtime.tools.factory import resolve_allowlist_entry
 from app.agent_runtime.tools.mcp import AgentMcpAccounting
 from app.billing.models import Wallet, WalletTransaction
 from app.billing.service import WalletService
 from app.core.redaction import redact_for_log
 from app.identity.models import AuthIdentity, LoginSession, User, UserChannelPermission
+from app.mcp_gateway.contracts import DataTapService
 from app.mcp_gateway.models import McpCall
+from app.mcp_gateway.validation import McpValidationError, validate_output
 from app.quick.models import QuickMcpCall
 from app.tasks.models import AnalysisTask
 from app.workspace.models import WorkspaceSession
@@ -590,7 +593,12 @@ class AdminService:
         )
 
     async def _retrievable_evidence(self, call: AgentToolCall) -> EvidenceItem | None:
-        """已落库的 Evidence 优先；否则经注入的 reconciler 取回 payload 并新建。"""
+        """已落库的 Evidence 优先；否则经注入的 reconciler 取回 payload 并新建。
+
+        设计 §5.3：人工/恢复取回的 payload 必须重新过输出 Schema 校验才能写
+        Evidence（与 execute/reconcile 路径一致）；无法确定输出契约或校验
+        不过时绝不落 Evidence（退化为 settle + result_unavailable）。
+        """
         existing = await self._evidence_by_call(call.id)
         if existing is not None:
             return existing
@@ -603,6 +611,18 @@ class AdminService:
             or result.structured_content is None
         ):
             return None
+        try:
+            service = DataTapService(call.service)
+        except ValueError:
+            return None
+        entry = resolve_allowlist_entry(service, call.internal_tool_name)
+        if entry is None:
+            return None
+        _remote_name, _description, output_schema = entry
+        try:
+            validated = validate_output(result.structured_content, output_schema)
+        except McpValidationError:
+            return None
         run = await self.db.get(AgentRun, call.run_id)
         return await EvidenceWriter(self.db).write(
             session_id=run.session_id if run is not None else call.run_id,
@@ -612,7 +632,7 @@ class AdminService:
             source_name=call.internal_tool_name,
             scope_json=self._scope_from_arguments(call.arguments_json),
             period_json=None,
-            raw_payload=result.structured_content,
+            raw_payload=validated,
         )
 
     @staticmethod

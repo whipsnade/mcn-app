@@ -44,6 +44,9 @@ class Settings(BaseSettings):
     datatap_read_timeout_seconds: float = Field(default=60.0, gt=0)
     mcp_call_points: int = 10
     mcp_unknown_reconcile_seconds: int = Field(default=300, gt=0)
+    # Agent 工具调用 stuck 阈值：超过该时长仍处于 running/reserved 的调用由恢复
+    # 循环迁移为 unknown 再核对（设计 §5.4）；须大于 DataTap 队列 + 读取超时。
+    agent_tool_call_stuck_seconds: float = Field(default=900.0, gt=0)
     # 达人详情 Session 级缓存 TTL（设计 §8.1 kol_detail_cache）：默认 24 小时。
     kol_detail_cache_ttl_hours: int = Field(default=24, ge=1)
     task_lease_seconds: int = Field(default=60, gt=0)

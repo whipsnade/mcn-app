@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.router import api_router
+from app.agent_runtime.circuit_breaker import FineGrainedCircuitBreaker
 from app.agent_runtime.engine import AgentEngine
 from app.agent_runtime.events import AgentEventBroker, AgentEventStream
 from app.agent_runtime.executor import AgentRunExecutor
@@ -19,15 +20,18 @@ from app.core.config import get_settings
 from app.db.session import SessionFactory
 from app.mcp_gateway.contracts import DataTapService
 from app.model.dependencies import get_model_adapter
-from app.mcp_gateway.service import get_mcp_transport, refresh_approved_datatap_tools
+from app.mcp_gateway.service import get_agent_mcp_transport, refresh_approved_datatap_tools
 
 # 新 Agent 运行时默认租约时长 / 恢复扫描间隔（Task 15）。
 AGENT_LEASE_SECONDS = 300
 RECOVERY_INTERVAL_SECONDS = 30
 
 
-def _make_recovery_tool(db, call) -> AgentMcpTool | None:
-    """unknown 调用行 → 用于 reconcile 的 AgentMcpTool（只读核对，绝不重放）。"""
+def _make_recovery_tool(db, call, *, breaker, transport) -> AgentMcpTool | None:
+    """unknown 调用行 → 用于 reconcile 的 AgentMcpTool（只读核对，绝不重放）。
+
+    与 engine 工具共享同一进程级细粒度熔断器与 Agent 传输（设计 §5.3）。
+    """
     try:
         service = DataTapService(call.service)
     except ValueError:
@@ -43,11 +47,12 @@ def _make_recovery_tool(db, call) -> AgentMcpTool | None:
         input_schema={},
         output_schema=output_schema,
         db_session=db,
-        transport=get_mcp_transport(),
+        transport=transport,
+        breaker=breaker,
     )
 
 
-def create_agent_runtime() -> tuple[
+def create_agent_runtime(*, stuck_seconds: float | None = None) -> tuple[
     AgentRunExecutor, RecoveryLoop, AgentEventBroker, Callable[..., AgentEngine]
 ]:
     """构建进程级 Agent 执行器 + 恢复循环（共享一个事件 broker）。
@@ -65,11 +70,20 @@ def create_agent_runtime() -> tuple[
     §5.1 生产工具装配唯一入口）构建：注册 history/calculation/artifact 内部
     工具并接入审核 MCP 目录；``channel_permissions`` 由调用方（executor 按 Run
     用户、kol-details 路由按当前用户）查询注入。
+
+    设计 §5.3 接线：进程级共享一个 ``FineGrainedCircuitBreaker``（engine 工具
+    与恢复工具同一实例，失败计数跨实例累积）；Agent 路径传输固定
+    ``circuit_scope="none"`` + ``retry_policy="never"``（旧服务级熔断与
+    possibly-sent 自动重试对新运行时不生效）。
     """
     executor_worker_id = f"agent-{os.getpid()}"
     recovery_worker_id = f"recovery-{os.getpid()}"
     broker = AgentEventBroker()
-    tool_registry_factory = AgentToolRegistryFactory()
+    breaker = FineGrainedCircuitBreaker()
+    agent_transport = get_agent_mcp_transport()
+    tool_registry_factory = AgentToolRegistryFactory(
+        transport_getter=get_agent_mcp_transport, breaker=breaker
+    )
 
     def engine_factory(
         db: AsyncSession, worker_id: str, channel_permissions: Iterable[str] = ()
@@ -95,10 +109,17 @@ def create_agent_runtime() -> tuple[
     recovery = RecoveryLoop(
         executor=executor,
         session_factory=SessionFactory,
-        tool_factory=_make_recovery_tool,
+        tool_factory=lambda db, call: _make_recovery_tool(
+            db, call, breaker=breaker, transport=agent_transport
+        ),
         worker_id=recovery_worker_id,
         lease_seconds=AGENT_LEASE_SECONDS,
         interval_seconds=RECOVERY_INTERVAL_SECONDS,
+        stuck_seconds=(
+            stuck_seconds
+            if stuck_seconds is not None
+            else get_settings().agent_tool_call_stuck_seconds
+        ),
     )
     return executor, recovery, broker, engine_factory
 
@@ -114,6 +135,7 @@ def create_app() -> FastAPI:
         app.state.agent_recovery = agent_recovery
         app.state.agent_event_broker = agent_broker
         app.state.agent_engine_factory = agent_engine_factory
+        app.state.agent_tool_reconciler = get_agent_mcp_transport().reconcile_tool_call
         agent_executor.start()
         agent_recovery.start()
         try:
@@ -129,6 +151,9 @@ def create_app() -> FastAPI:
     app.state.agent_recovery = agent_recovery
     app.state.agent_event_broker = agent_broker
     app.state.agent_engine_factory = agent_engine_factory
+    # 管理员人工核对（/admin/agent-tool-calls/{id}/reconcile）取回上游 payload
+    # 的只读核对器：与 Agent 调用共享同一传输实例的已确认结果缓存（设计 §5.3）。
+    app.state.agent_tool_reconciler = get_agent_mcp_transport().reconcile_tool_call
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[settings.frontend_origin],

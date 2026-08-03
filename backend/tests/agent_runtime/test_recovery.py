@@ -1,4 +1,4 @@
-"""RecoveryLoop 集成测试（Task 15 / 设计文档 §11.1 / §11.2）。
+"""RecoveryLoop 集成测试（Task 15 / 设计文档 §11.1 / §11.2 / v3 加固 §5.4）。
 
 覆盖：
 1. 过期租约 Run 被恢复循环领取重建 Attempt，引擎继续执行到终态；
@@ -9,7 +9,9 @@
    不使用旧的 release_expired_unknown 超时自动释放策略；
 4. 恢复核对结果必须提交（独立会话读回可见），而非在会话关闭时回滚；
 5. 同一 unconfirmable 调用多次扫描只追加一条 keep_unknown 审计；
-6. 恢复循环使用独立 worker id，与原 worker 租约隔离。
+6. 恢复循环使用独立 worker id，与原 worker 租约隔离；
+7. 超过受控时间仍处于 running/reserved 的调用先迁移为 unknown 再走只读核对
+   （§5.4），绝不直接释放或重新外发。
 """
 
 from __future__ import annotations
@@ -143,6 +145,7 @@ def _bridge(db_session, transport: FakeMcpTransport) -> AgentMcpTool:
         output_schema=OUTPUT_SCHEMA,
         db_session=db_session,
         transport=transport,
+        session_factory=lambda: _shared_session(db_session),
     )
 
 
@@ -189,7 +192,7 @@ async def _reconciliation(db_session, call: AgentToolCall) -> AgentToolCallRecon
     )
 
 
-def _make_recovery(db_session, *, executor, transport: FakeMcpTransport) -> RecoveryLoop:
+def _make_recovery(db_session, *, executor, transport: FakeMcpTransport, stuck_seconds: float = 900.0) -> RecoveryLoop:
     return RecoveryLoop(
         executor=executor,
         session_factory=lambda: _shared_session(db_session),
@@ -198,6 +201,7 @@ def _make_recovery(db_session, *, executor, transport: FakeMcpTransport) -> Reco
         lease_seconds=300,
         interval_seconds=0.01,
         clock=utc_now,
+        stuck_seconds=stuck_seconds,
     )
 
 
@@ -441,8 +445,13 @@ async def test_reconcile_does_not_auto_release_old_unknown_by_timeout(db_session
 # ---------------------------------------------------------------------------
 
 
-async def _setup_unknown_call_committed(*, upstream_request_id: str = "req-1"):
-    """在独立已提交事务中创建 unknown 调用，供恢复循环（真实 SessionFactory）读取。"""
+async def _setup_call_committed(
+    *,
+    status: str = "unknown",
+    upstream_request_id: str | None = "req-1",
+    started_at=None,
+):
+    """在独立已提交事务中创建调用链（默认 unknown），供恢复循环（真实 SessionFactory）读取。"""
     now = utc_now()
     async with SessionFactory.begin() as db:
         user = User(
@@ -492,10 +501,10 @@ async def _setup_unknown_call_committed(*, upstream_request_id: str = "req-1"):
             internal_tool_name=INTERNAL_NAME,
             arguments_json={"keyword": "美妆"},
             arguments_hash=args_hash,
-            status="unknown",
+            status=status,
             points_reserved=MCP_POINTS_COST,
             upstream_request_id=upstream_request_id,
-            started_at=now,
+            started_at=started_at if started_at is not None else now,
         )
         db.add(call)
         await db.flush()
@@ -506,6 +515,11 @@ async def _setup_unknown_call_committed(*, upstream_request_id: str = "req-1"):
         await db.flush()
         user_id, call_id = user.id, call.id
     return user_id, call_id, logical_id
+
+
+async def _setup_unknown_call_committed(*, upstream_request_id: str = "req-1"):
+    """在独立已提交事务中创建 unknown 调用，供恢复循环（真实 SessionFactory）读取。"""
+    return await _setup_call_committed(upstream_request_id=upstream_request_id)
 
 
 async def _cleanup_committed_user(user_id: str, call_id: str) -> None:
@@ -667,3 +681,252 @@ async def test_recovery_reclaim_uses_distinct_worker_id(db_session, user_factory
     assert seen_worker_ids == ["recovery-worker"]
     fresh = await db_session.get(AgentRun, run.id)
     assert fresh.status == RunStatus.COMPLETED
+
+
+# ---------------------------------------------------------------------------
+# 7. stuck running/reserved 调用：先迁移 unknown 再核对，绝不直接释放或重发（§5.4）
+# ---------------------------------------------------------------------------
+
+
+async def _make_call(
+    db_session,
+    user_id: str,
+    run: AgentRun,
+    step: AgentStep,
+    *,
+    status: str,
+    upstream_request_id: str | None,
+    started_at,
+) -> tuple[str, AgentToolCall]:
+    """任意状态的调用行 + 10 分预留（模拟 prepare 已提交后的各种崩溃残留）。"""
+    args_hash = hashlib.sha256(canonical_json_bytes({"keyword": "美妆"})).hexdigest()
+    logical_id = logical_call_id_for(run.id, step.id, INTERNAL_NAME, args_hash)
+    call = AgentToolCall(
+        id=str(uuid4()),
+        run_id=run.id,
+        step_id=step.id,
+        logical_call_id=logical_id,
+        service=DataTapService.INSIGHT_CUBE.value,
+        internal_tool_name=INTERNAL_NAME,
+        arguments_json={"keyword": "美妆"},
+        arguments_hash=args_hash,
+        status=status,
+        points_reserved=MCP_POINTS_COST,
+        upstream_request_id=upstream_request_id,
+        started_at=started_at,
+    )
+    db_session.add(call)
+    await WalletService(db_session).reserve(
+        user_id, MCP_POINTS_COST, f"agent-mcp:{logical_id}:reserve", call.id,
+        reference_type="agent_tool_call",
+    )
+    await db_session.flush()
+    return logical_id, call
+
+
+async def test_stuck_running_call_migrates_to_unknown_then_reconciles(
+    db_session, user_factory
+) -> None:
+    """外发后崩溃残留的 running 调用（超过受控时间）→ 迁移 unknown → 只读核对 settle。"""
+    user = await _funded_user(db_session, user_factory)
+    session, run, step = await _make_chain(db_session, user.id)
+    logical_id, call = await _make_call(
+        db_session, user.id, run, step,
+        status="running",
+        upstream_request_id="req-stuck",
+        started_at=utc_now() - timedelta(hours=1),
+    )
+    transport = FakeMcpTransport()
+    transport.reconciled["req-stuck"] = RemoteToolResult(
+        structured_content={"result": "ok"}, is_error=False, upstream_request_id="req-stuck"
+    )
+    executor = await _make_executor(db_session)
+    recovery = _make_recovery(db_session, executor=executor, transport=transport, stuck_seconds=60)
+
+    migrated = await recovery.migrate_stuck_tool_calls()
+
+    assert migrated == (logical_id,)
+    fresh = await db_session.get(AgentToolCall, call.id)
+    assert fresh.status == "unknown"
+    assert fresh.error_type == "result_unknown"
+    # 迁移只改状态：预留保留，绝不直接释放
+    assert fresh.points_reserved == MCP_POINTS_COST
+    wallet = await WalletService(db_session).get_wallet(user.id)
+    assert (wallet.balance, wallet.reserved) == (990, 10)
+
+    reconciled, warnings = await recovery.reconcile_unknown_calls()
+
+    assert logical_id in reconciled
+    assert warnings == ()
+    assert transport.calls == []  # 绝不重新外发
+    fresh = await db_session.get(AgentToolCall, call.id)
+    assert fresh.status == "settled"
+    assert fresh.points_settled == MCP_POINTS_COST
+    evidence = await db_session.scalar(
+        select(EvidenceItem).where(EvidenceItem.tool_call_id == call.id)
+    )
+    assert evidence is not None
+    wallet = await WalletService(db_session).get_wallet(user.id)
+    assert (wallet.balance, wallet.reserved) == (990, 0)
+
+
+async def test_run_once_migrates_stuck_then_reconciles_in_same_round(
+    db_session, user_factory
+) -> None:
+    """run_once 单轮内完成 stuck 迁移 + 核对；返回四元组含迁移清单。"""
+    user = await _funded_user(db_session, user_factory)
+    session, run, step = await _make_chain(db_session, user.id)
+    # Run 租约未过期：本轮不触发 Run 接管，隔离断言 stuck 迁移路径
+    run_row = await db_session.get(AgentRun, run.id)
+    run_row.lease_expires_at = utc_now() + timedelta(seconds=300)
+    await db_session.flush()
+    logical_id, call = await _make_call(
+        db_session, user.id, run, step,
+        status="running",
+        upstream_request_id="req-stuck",
+        started_at=utc_now() - timedelta(hours=1),
+    )
+    transport = FakeMcpTransport()
+    transport.reconciled["req-stuck"] = RemoteToolResult(
+        structured_content={"result": "ok"}, is_error=False, upstream_request_id="req-stuck"
+    )
+    executor = await _make_executor(db_session)
+    recovery = _make_recovery(db_session, executor=executor, transport=transport, stuck_seconds=60)
+
+    reclaimed, stuck, reconciled, warnings = await recovery.run_once()
+
+    assert reclaimed == ()
+    assert stuck == (logical_id,)
+    assert logical_id in reconciled
+    assert warnings == ()
+    fresh = await db_session.get(AgentToolCall, call.id)
+    assert fresh.status == "settled"
+
+
+async def test_fresh_running_call_is_not_migrated(db_session, user_factory) -> None:
+    """受控时间内的 running 调用（正常在途）不得迁移。"""
+    user = await _funded_user(db_session, user_factory)
+    session, run, step = await _make_chain(db_session, user.id)
+    logical_id, call = await _make_call(
+        db_session, user.id, run, step,
+        status="running",
+        upstream_request_id=None,
+        started_at=utc_now(),
+    )
+    executor = await _make_executor(db_session)
+    recovery = _make_recovery(db_session, executor=executor, transport=FakeMcpTransport())
+
+    migrated = await recovery.migrate_stuck_tool_calls()
+
+    assert migrated == ()
+    fresh = await db_session.get(AgentToolCall, call.id)
+    assert fresh.status == "running"
+    assert fresh.points_reserved == MCP_POINTS_COST
+
+
+async def test_stuck_reserved_call_without_started_at_migrates_to_unknown(
+    db_session, user_factory
+) -> None:
+    """reserved 且无 started_at（旧两阶段流程崩溃残留）按 stuck 迁移为 unknown。"""
+    user = await _funded_user(db_session, user_factory)
+    session, run, step = await _make_chain(db_session, user.id)
+    logical_id, call = await _make_call(
+        db_session, user.id, run, step,
+        status="reserved",
+        upstream_request_id=None,
+        started_at=None,
+    )
+    executor = await _make_executor(db_session)
+    recovery = _make_recovery(db_session, executor=executor, transport=FakeMcpTransport())
+
+    migrated = await recovery.migrate_stuck_tool_calls()
+
+    assert migrated == (logical_id,)
+    fresh = await db_session.get(AgentToolCall, call.id)
+    assert fresh.status == "unknown"
+    # 绝不直接释放：预留保留等待核对
+    assert fresh.points_reserved == MCP_POINTS_COST
+    wallet = await WalletService(db_session).get_wallet(user.id)
+    assert (wallet.balance, wallet.reserved) == (990, 10)
+
+
+async def test_stuck_migration_is_atomic_against_concurrent_finalize(
+    db_session, user_factory
+) -> None:
+    """迁移用条件 UPDATE 守护：已终态（settled/failed）的行不会被翻回 unknown。"""
+    user = await _funded_user(db_session, user_factory)
+    session, run, step = await _make_chain(db_session, user.id)
+    logical_id, call = await _make_call(
+        db_session, user.id, run, step,
+        status="running",
+        upstream_request_id="req-stuck",
+        started_at=utc_now() - timedelta(hours=1),
+    )
+    # 扫描读到 running 之后、迁移之前，调用已被 finalize 为 settled
+    await WalletService(db_session).settle(
+        user.id, MCP_POINTS_COST, f"agent-mcp:{logical_id}:settle", call.id,
+        reference_type="agent_tool_call",
+    )
+    settled = await db_session.get(AgentToolCall, call.id)
+    settled.status = "settled"
+    settled.points_reserved = 0
+    settled.points_settled = MCP_POINTS_COST
+    await db_session.flush()
+    executor = await _make_executor(db_session)
+    recovery = _make_recovery(db_session, executor=executor, transport=FakeMcpTransport())
+
+    migrated = await recovery.migrate_stuck_tool_calls()
+
+    assert migrated == ()
+    fresh = await db_session.get(AgentToolCall, call.id)
+    assert fresh.status == "settled"
+    wallet = await WalletService(db_session).get_wallet(user.id)
+    assert (wallet.balance, wallet.reserved) == (990, 0)
+
+
+async def test_stuck_running_call_recovers_via_committed_sessions(
+    db_session, user_factory
+) -> None:
+    """真实崩溃场景（真实 SessionFactory 独立连接）：外发后未 finalize 的 running 行
+    被恢复扫描迁移为 unknown 并核对 settle，结果对全新会话可见。"""
+    transport = FakeMcpTransport()
+    transport.reconciled["req-stuck"] = RemoteToolResult(
+        structured_content={"result": "ok"}, is_error=False, upstream_request_id="req-stuck"
+    )
+    user_id, call_id, logical_id = await _setup_call_committed(
+        status="running",
+        upstream_request_id="req-stuck",
+        started_at=utc_now() - timedelta(hours=1),
+    )
+    try:
+        executor = await _make_executor(db_session)
+        recovery = RecoveryLoop(
+            executor=executor,
+            session_factory=SessionFactory,
+            tool_factory=lambda db, _call: _bridge(db, transport),
+            worker_id="recovery-worker",
+            lease_seconds=300,
+            interval_seconds=0.01,
+            clock=utc_now,
+            stuck_seconds=60,
+        )
+
+        migrated = await recovery.migrate_stuck_tool_calls()
+        reconciled, warnings = await recovery.reconcile_unknown_calls()
+
+        assert migrated == (logical_id,)
+        assert logical_id in reconciled
+        assert warnings == ()
+        assert transport.calls == []
+        async with SessionFactory() as db:
+            call = await db.get(AgentToolCall, call_id)
+            assert call.status == "settled"
+            assert call.points_settled == MCP_POINTS_COST
+            evidence = await db.scalar(
+                select(EvidenceItem).where(EvidenceItem.tool_call_id == call_id)
+            )
+            assert evidence is not None
+            wallet = await db.get(Wallet, user_id)
+            assert (wallet.balance, wallet.reserved) == (990, 0)
+    finally:
+        await _cleanup_committed_user(user_id, call_id)

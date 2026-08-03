@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import asynccontextmanager
 from datetime import timedelta
 from types import SimpleNamespace
 from typing import Any
@@ -204,6 +205,12 @@ def _mcp_registry(db_session, *, executor_factory: Any) -> ToolRegistry:
         is_enabled=True,
     )
     return ToolRegistry(catalog_source=[entry], mcp_executor_factory=executor_factory)
+
+
+@asynccontextmanager
+async def _shared_session(db_session):
+    """与引擎共享同一夹具会话的 session_factory（durable 写入在同一连接内提交）。"""
+    yield db_session
 
 
 def _calc_registry(db_session) -> ToolRegistry:
@@ -448,6 +455,7 @@ async def test_mcp_tool_through_bridge_settles_points(db_session, user_factory) 
             output_schema=OUTPUT_SCHEMA,
             db_session=db_session,
             transport=transport,
+            session_factory=lambda: _shared_session(db_session),
         ),
     )
     engine, _, _ = _make_engine(
