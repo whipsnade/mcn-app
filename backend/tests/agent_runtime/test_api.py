@@ -919,3 +919,69 @@ async def test_kol_detail_coexists_with_active_session_analyst_run(
     )
     assert resp.status_code == 201
     assert resp.json()["run_id"] == existing
+
+
+# ---------------------------------------------------------------------------
+# 7. 取消待处理孤儿 Run 收口后的会话解锁（I1 集成断言）
+# ---------------------------------------------------------------------------
+
+
+async def test_cancel_orphan_settle_unblocks_new_message(
+    agent_client_factory, db_session
+) -> None:
+    """崩溃残留的取消孤儿（running + cancel_requested + 过期租约）阻塞会话
+    后续消息（409 active_run_in_progress）；恢复收口 cancelled 后，同一会话
+    可正常创建新 Run——单活动 Run 约束不再被孤儿阻塞。"""
+    from contextlib import asynccontextmanager
+
+    from app.agent_runtime.executor import AgentRunExecutor
+
+    executor = FakeExecutor()
+    alice, _ = await agent_client_factory("13600000095", executor=executor)
+    session_id = await _create_session(alice)
+    user_id = await _me_id(alice)
+    now = utc_now()
+    orphan = await _add_run(
+        db_session,
+        user_id,
+        session_id,
+        status="running",
+        started_at=now,
+        lease_owner="dead-worker",
+        lease_expires_at=now - timedelta(seconds=10),
+        cancel_requested=True,
+    )
+
+    # 孤儿仍算活动 Run：后续消息被单活动约束拒绝
+    blocked = await _post_message(alice, session_id, "取消后我想继续分析")
+    assert blocked.status_code == 409
+    assert blocked.json()["detail"] == "active_run_in_progress"
+
+    # 恢复循环的取消收口路径（engine 不得被调用：孤儿不恢复模型执行）
+    @asynccontextmanager
+    async def _shared_session():
+        yield db_session
+
+    def engine_factory(db, worker_id, channel_permissions=()):
+        raise AssertionError("cancel orphan must not execute engine")
+
+    settle_executor = AgentRunExecutor(
+        session_factory=_shared_session,
+        engine_factory=engine_factory,
+        worker_id="recovery-worker",
+        claim_interval_seconds=0.01,
+    )
+    assert await settle_executor.settle_cancel_requested(orphan.id) is True
+    fresh_orphan = await db_session.get(AgentRun, orphan.id)
+    assert fresh_orphan.status == "cancelled"
+
+    # 收口后会话解锁：新消息正常创建新 Run
+    resp = await _post_message(alice, session_id, "取消后我想继续分析")
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["status"] == "queued"
+    assert body["run_id"] != orphan.id
+    assert executor.submitted == [body["run_id"]]
+    new_run = await db_session.get(AgentRun, body["run_id"])
+    assert new_run is not None
+    assert new_run.session_id == session_id

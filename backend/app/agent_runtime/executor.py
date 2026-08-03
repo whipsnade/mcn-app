@@ -20,6 +20,11 @@ approve 的 Review Item 不重审，pending/revise 继续，完成后走原子�
 **优雅关闭**：``stop()`` 置停止信号，循环只在下一次迭代开始前检查，因此当前
 in-flight Run 会在事务安全点自然完成；超时则取消循环任务，留下的 running Run
 由恢复循环在租约过期后接管。
+
+**取消待处理孤儿收口**（I1）：``cancel_requested`` 且租约过期/为空的
+running/reviewing Run 是"API 写入取消后进程崩溃"的残留——不恢复模型执行，
+直接释放 Draft working head 并经终态事务边界收口 cancelled（恰好一个
+``run.cancelled``），避免永久卡在中间态并阻塞会话后续任务。
 """
 
 from __future__ import annotations
@@ -37,7 +42,8 @@ from app.agent_runtime.events import AgentEventBroker, AgentEventStream
 from app.agent_runtime.models import AgentRun, AgentRunAttempt
 from app.agent_runtime.profiles import get_profile
 from app.agent_runtime.repository import AgentRunRepository, utc_now
-from app.agent_runtime.state import RunStatus
+from app.agent_runtime.reviewer import release_run_drafts
+from app.agent_runtime.state import TERMINAL_RUN_STATUSES, RunStatus
 from app.agent_runtime.tools.factory import load_channel_permissions
 from app.agent_runtime.transcript import RunTranscriptLoader
 
@@ -142,16 +148,25 @@ class AgentRunExecutor:
     async def claim_and_process_one(self) -> str | None:
         """领取一个可执行 Run 并驱动引擎执行到终态；无可领取时返回 None。
 
-        已停止（``stop`` 后）的 executor 不再领取任何新 Run。
+        没有可执行 Run 时再检查取消待处理孤儿（``cancel_requested`` 且租约
+        过期/为空的 running/reviewing Run，I1）：不恢复模型执行，直接收口
+        cancelled 并返回其 run_id。已停止（``stop`` 后）的 executor 不再
+        领取任何新 Run。
         """
         if self._stop.is_set():
             return None
         async with self._session_factory() as db:
             run_id = await self._find_claimable_id(db)
-            if run_id is None:
+            if run_id is not None:
+                await self._process_run(db, run_id, self._worker_id)
+                return run_id
+            cancel_pending_id = await self._find_cancel_pending_id(db)
+            if cancel_pending_id is None:
                 return None
-            await self._process_run(db, run_id, self._worker_id)
-        return run_id
+            run = await db.get(AgentRun, cancel_pending_id)
+            if run is not None and await self._settle_cancel_requested(db, run):
+                return cancel_pending_id
+            return None
 
     async def process_run(
         self, run_id: str, *, worker_id: str | None = None
@@ -244,6 +259,31 @@ class AgentRunExecutor:
             .limit(1)
         )
 
+    async def _find_cancel_pending_id(self, db: AsyncSession) -> str | None:
+        """返回一个取消待处理孤儿 Run id（I1）：``cancel_requested`` 且租约
+        过期/为空的 running/reviewing Run。
+
+        这类 Run 的原 worker 已崩溃，永远不会再走到引擎的取消检查点；必须由
+        执行器/恢复循环收口，否则永久停在 running/reviewing 并阻塞会话后续
+        任务（单活动 Run 约束把它算作活动）。租约仍活跃的不在此列——在途
+        worker 的取消检查点会自行收口，本扫描不抢（A4 语义）。
+        """
+        now = utc_now()
+        return await db.scalar(
+            select(AgentRun.id)
+            .where(
+                AgentRun.run_kind == "user",
+                AgentRun.status.in_((RunStatus.RUNNING, RunStatus.REVIEWING)),
+                AgentRun.cancel_requested.is_(True),
+                or_(
+                    AgentRun.lease_expires_at.is_(None),
+                    AgentRun.lease_expires_at <= now,
+                ),
+            )
+            .order_by(AgentRun.id.asc())
+            .limit(1)
+        )
+
     async def _claim_and_prepare(
         self, db: AsyncSession, repo: AgentRunRepository, run_id: str, worker_id: str
     ) -> tuple[AgentRun, AgentRunAttempt, str | None] | None:
@@ -257,6 +297,9 @@ class AgentRunExecutor:
         if run is None:
             return None
         if run.cancel_requested:
+            # I1：扫描与领取间隙到达的取消（或恢复循环 process_run 直传的取消
+            # 孤儿）：不恢复模型执行，直接经终态事务边界收口 cancelled。
+            await self._settle_cancel_requested(db, run)
             return None
         status = RunStatus(run.status)
         if status == RunStatus.QUEUED:
@@ -320,6 +363,42 @@ class AgentRunExecutor:
     # ------------------------------------------------------------------ #
     # 收口
     # ------------------------------------------------------------------ #
+
+    async def settle_cancel_requested(self, run_id: str) -> bool:
+        """取消待处理孤儿 Run 的收口入口（恢复循环调用，I1）。
+
+        返回 ``True`` 表示本次完成收口（迁移 cancelled 并发恰好一个
+        ``run.cancelled`` 终态事件）；``False`` 表示无需/不应由本实例收口
+        （Run 不存在、取消信号消失、已终态、已有终态事件被并发收口，或租约
+        被他人活跃持有——在途 worker 的取消检查点会自行收口，不抢）。
+        """
+        async with self._session_factory() as db:
+            run = await db.get(AgentRun, run_id)
+            if run is None or not run.cancel_requested:
+                return False
+            return await self._settle_cancel_requested(db, run)
+
+    async def _settle_cancel_requested(self, db: AsyncSession, run: AgentRun) -> bool:
+        """取消待处理孤儿 Run 的收口（I1）：释放 Draft working head（idle）后
+        经 H1 终态事务边界迁移 cancelled，发恰好一个 ``run.cancelled`` 终态事件。
+
+        与引擎 ``_settle_cancelled`` 同一语义、同一终态路径
+        （``AgentEventStream.settle_terminal``，不新造终态出口）：行锁串行化
+        保证与 API/引擎的并发取消收口恰好一个终态事件，后到者幂等返回。
+        租约仍被他人活跃持有时不抢（A4 语义），返回 ``False`` 交给在途 worker。
+        reviewing 孤儿沿用在线取消口径：Draft 置 idle 释放，不套用 reject 的
+        整批 failed 清理（与引擎 ``_settle_cancelled`` 一致）。
+        """
+        if RunStatus(run.status) in TERMINAL_RUN_STATUSES:
+            return False
+        now = utc_now()
+        if run.lease_expires_at is not None and run.lease_expires_at > now:
+            return False
+        await release_run_drafts(db, run.id, outcome="idle")
+        event = await AgentEventStream(db, self._broker).settle_terminal(
+            run.id, run.user_id, RunStatus.CANCELLED, {}
+        )
+        return event is not None
 
     async def _finalize_failed(
         self, db: AsyncSession, run_id: str, worker_id: str

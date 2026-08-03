@@ -788,3 +788,77 @@ async def test_takeover_feeds_transcript_user_question_to_memory_header(
     header = json.loads(gateway.calls[0]["messages"][0].content)
     assert header["current_user_message"] == "帮我分析品牌"
     assert "tool_result" not in header["current_user_message"]
+
+
+# ---------------------------------------------------------------------------
+# 6. 取消待处理孤儿 Run 收口（I1：executor 不执行、直接 settle cancelled）
+# ---------------------------------------------------------------------------
+
+
+async def test_executor_settles_cancel_pending_orphan_without_executing(
+    db_session, user_factory
+) -> None:
+    """running + cancel_requested + 租约过期的孤儿 Run：executor 领取扫描遇到
+    时不恢复模型执行，直接经终态事务边界收口 cancelled，发恰好一个
+    run.cancelled，open Attempt 以 cancelled 收口。"""
+    run, _, _ = await _make_session(db_session, user_factory)
+    repo = AgentRunRepository(db_session)
+    attempt1 = await repo.begin_attempt(run.id)
+    assert await repo.claim_lease(run.id, "dead-worker", 300)
+    row = await db_session.get(AgentRun, run.id)
+    row.lease_expires_at = utc_now() - timedelta(seconds=10)
+    row.cancel_requested = True
+    await db_session.flush()
+    gateway = FakeAgentGateway([Complete(action="complete", text="不应执行")])
+    executor = _build_executor(db_session, gateway=gateway)
+
+    run_id = await executor.claim_and_process_one()
+
+    assert run_id == run.id
+    fresh = await db_session.get(AgentRun, run.id)
+    assert fresh.status == RunStatus.CANCELLED
+    assert fresh.completed_at is not None
+    assert fresh.lease_owner is None
+    # 不恢复模型执行：引擎/模型从未被调用
+    assert gateway.calls == []
+    rows = await _run_events(db_session, run.id)
+    terminal = [
+        row
+        for row in rows
+        if row.event_type in ("run.completed", "run.failed", "run.cancelled")
+    ]
+    assert [row.event_type for row in terminal] == ["run.cancelled"]
+    attempts = await _attempts(db_session, run.id)
+    assert [attempt.attempt for attempt in attempts] == [1]
+    assert attempts[0].id == attempt1.id
+    assert attempts[0].outcome == "cancelled"
+    assert attempts[0].ended_at is not None
+
+
+async def test_executor_skips_cancel_pending_run_with_active_lease(
+    db_session, user_factory
+) -> None:
+    """cancel_requested 但租约仍被活跃持有：在途 worker 的取消检查点会自行
+    收口，executor 不抢（A4 语义）——不领取、不迁移、不发终态事件。"""
+    run, _, _ = await _make_session(db_session, user_factory)
+    repo = AgentRunRepository(db_session)
+    await repo.begin_attempt(run.id)
+    assert await repo.claim_lease(run.id, "worker-a", 300)
+    row = await db_session.get(AgentRun, run.id)
+    row.cancel_requested = True
+    await db_session.flush()
+    gateway = FakeAgentGateway([])
+    executor = _build_executor(db_session, gateway=gateway, worker="worker-b")
+
+    assert await executor.claim_and_process_one() is None
+
+    fresh = await db_session.get(AgentRun, run.id)
+    assert fresh.status == RunStatus.RUNNING
+    assert fresh.lease_owner == "worker-a"
+    assert gateway.calls == []
+    rows = await _run_events(db_session, run.id)
+    assert [
+        row
+        for row in rows
+        if row.event_type in ("run.completed", "run.failed", "run.cancelled")
+    ] == []

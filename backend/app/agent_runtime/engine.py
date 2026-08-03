@@ -116,7 +116,7 @@ from app.agent_runtime.repository import (
     AgentRunRepository,
     utc_now,
 )
-from app.agent_runtime.reviewer import ReviewBatchDraftSetMismatch, ReviewerDriver
+from app.agent_runtime.reviewer import ReviewBatchDraftSetMismatch, ReviewerDriver, release_run_drafts
 from app.agent_runtime.schemas import FOUR_ACTIONS
 from app.agent_runtime.state import InvalidRunTransition, RunStatus
 from app.agent_runtime.thinking import AgentEventThinkingSink
@@ -1094,19 +1094,10 @@ class AgentEngine:
 
         ask_user/complete/paused/cancelled 出口用 ``idle``，failed 出口用
         ``failed``——任何非发布出口都不得让 Artifact 永久 artifact_busy。
+        实现与执行器/恢复循环的取消孤儿收口（I1）共享
+        :func:`app.agent_runtime.reviewer.release_run_drafts`。
         """
-        drafts = (
-            await self._db.scalars(
-                select(ArtifactDraft).where(ArtifactDraft.owner_run_id == run.id)
-            )
-        ).all()
-        if not drafts:
-            return
-        await self._reviewer.cancel_reviewing(
-            run_id=run.id,
-            draft_ids=[draft.id for draft in drafts],
-            outcome=outcome,
-        )
+        await release_run_drafts(self._db, run.id, outcome=outcome)
 
     async def _batch_draft_ids(self, batch: ArtifactReviewBatch) -> list[str]:
         """Batch 全部 Item 对应的 Draft id 列表（release/abort 用）。"""

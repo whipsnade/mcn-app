@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from contextlib import asynccontextmanager
 from datetime import timedelta
@@ -25,9 +26,14 @@ from uuid import uuid4
 from sqlalchemy import select
 
 from app.agent_runtime.engine import AgentEngine
-from app.agent_runtime.events import AgentEventBroker, AgentEventStream
+from app.agent_runtime.events import (
+    AgentEventBroker,
+    AgentEventStream,
+    is_terminal_event,
+)
 from app.agent_runtime.executor import AgentRunExecutor
 from app.agent_runtime.models import (
+    AgentEvent,
     AgentRun,
     AgentRunAttempt,
     AgentSession,
@@ -37,7 +43,7 @@ from app.agent_runtime.models import (
     EvidenceItem,
 )
 from app.agent_runtime.recovery import RecoveryLoop
-from app.agent_runtime.repository import utc_now
+from app.agent_runtime.repository import AgentRunRepository, utc_now
 from app.agent_runtime.reviewer import ReviewerDriver
 from app.agent_runtime.schemas import Complete
 from app.agent_runtime.state import RunStatus
@@ -205,8 +211,11 @@ def _make_recovery(db_session, *, executor, transport: FakeMcpTransport, stuck_s
     )
 
 
-async def _make_executor(db_session, *, worker: str = "exec-worker") -> AgentRunExecutor:
-    gateway = FakeAgentGateway([Complete(action="complete", text="恢复完成")])
+async def _make_executor(
+    db_session, *, worker: str = "exec-worker", gateway: FakeAgentGateway | None = None
+) -> AgentRunExecutor:
+    if gateway is None:
+        gateway = FakeAgentGateway([Complete(action="complete", text="恢复完成")])
     broker = AgentEventBroker()
     events = AgentEventStream(db_session, broker)
     reviewer = ReviewerDriver(db_session, _FakeReviewerGateway(), worker_id=worker)
@@ -930,3 +939,205 @@ async def test_stuck_running_call_recovers_via_committed_sessions(
             assert (wallet.balance, wallet.reserved) == (990, 0)
     finally:
         await _cleanup_committed_user(user_id, call_id)
+
+
+# ---------------------------------------------------------------------------
+# 8. 取消待处理孤儿 Run 收口（I1：崩溃时取消待处理的恢复收口）
+# ---------------------------------------------------------------------------
+
+
+async def _terminal_event_types(db_session, run_id: str) -> list[str]:
+    rows = (
+        await db_session.scalars(
+            select(AgentEvent)
+            .where(AgentEvent.run_id == run_id)
+            .order_by(AgentEvent.sequence)
+        )
+    ).all()
+    return [row.event_type for row in rows if is_terminal_event(row.event_type)]
+
+
+async def test_recovery_settles_cancel_requested_orphan_running(
+    db_session, user_factory
+) -> None:
+    """running + cancel_requested + 租约过期（API 写入取消后进程崩溃）：
+    恢复循环不恢复模型执行，直接收口 cancelled 并发恰好一个 run.cancelled。
+    """
+    user = await _funded_user(db_session, user_factory)
+    session, run, step = await _make_chain(db_session, user.id)
+    row = await db_session.get(AgentRun, run.id)
+    row.cancel_requested = True
+    row.lease_owner = "dead-worker"
+    row.lease_expires_at = utc_now() - timedelta(seconds=10)
+    await db_session.flush()
+    gateway = FakeAgentGateway([Complete(action="complete", text="不应执行")])
+    executor = await _make_executor(db_session, gateway=gateway)
+    recovery = _make_recovery(db_session, executor=executor, transport=FakeMcpTransport())
+
+    reclaimed = await recovery.reclaim_expired_runs()
+
+    assert run.id in reclaimed
+    fresh = await db_session.get(AgentRun, run.id)
+    assert fresh.status == RunStatus.CANCELLED
+    assert fresh.completed_at is not None
+    assert fresh.lease_owner is None
+    assert fresh.lease_expires_at is None
+    # 不恢复模型执行：引擎/模型从未被调用
+    assert gateway.calls == []
+    # 恰好一个 run.cancelled 终态事件
+    assert await _terminal_event_types(db_session, run.id) == ["run.cancelled"]
+    # open Attempt 以 cancelled 收口（不遗留 running attempt）
+    attempt = await db_session.scalar(
+        select(AgentRunAttempt).where(AgentRunAttempt.run_id == run.id)
+    )
+    assert attempt is not None
+    assert attempt.outcome == "cancelled"
+    assert attempt.ended_at is not None
+
+
+async def test_recovery_settles_cancel_requested_orphan_reviewing_releases_draft(
+    db_session, user_factory
+) -> None:
+    """reviewing + cancel_requested + 租约过期（复核期间取消后崩溃）：
+    收口 cancelled，同时释放本 Run 持有的 Draft working head（idle），
+    不遗留 artifact_busy；Review Batch 保持取消口径的既有语义（不整批 failed）。
+    """
+    from app.agent_artifacts.models import ArtifactDraft, ArtifactReviewBatch
+
+    from tests.agent_runtime.test_engine import _make_draft
+
+    user = await _funded_user(db_session, user_factory)
+    session, run, step = await _make_chain(db_session, user.id)
+    service, draft, _revision = await _make_draft(db_session, run)
+    reviewer = ReviewerDriver(db_session, _FakeReviewerGateway(), worker_id="dead-worker")
+    batch = await reviewer.create_batch(
+        parent_run_id=run.id, draft_ids=(draft.id,), completion_text="分析完成"
+    )
+    row = await db_session.get(AgentRun, run.id)
+    row.status = RunStatus.REVIEWING
+    row.cancel_requested = True
+    row.lease_owner = "dead-worker"
+    row.lease_expires_at = utc_now() - timedelta(seconds=10)
+    await db_session.flush()
+    gateway = FakeAgentGateway([Complete(action="complete", text="不应执行")])
+    executor = await _make_executor(db_session, gateway=gateway)
+    recovery = _make_recovery(db_session, executor=executor, transport=FakeMcpTransport())
+
+    reclaimed = await recovery.reclaim_expired_runs()
+
+    assert run.id in reclaimed
+    fresh = await db_session.get(AgentRun, run.id)
+    assert fresh.status == RunStatus.CANCELLED
+    assert gateway.calls == []
+    assert await _terminal_event_types(db_session, run.id) == ["run.cancelled"]
+    # Draft working head 释放（idle + owner 清空），后续 Run 可立即接管
+    fresh_draft = await db_session.get(ArtifactDraft, draft.id)
+    assert fresh_draft.status == "idle"
+    assert fresh_draft.owner_run_id is None
+    # 取消口径与在线路径一致：不套用 reject 的整批 failed 清理
+    fresh_batch = await db_session.get(ArtifactReviewBatch, batch.id)
+    assert fresh_batch.status == "pending"
+
+
+async def test_recovery_skips_cancel_requested_run_with_active_lease(
+    db_session, user_factory
+) -> None:
+    """cancel_requested 但租约仍被活跃持有：在途 worker 的取消检查点会自行
+    收口，恢复循环不抢（A4 语义）——不迁移、不发终态事件。"""
+    user = await _funded_user(db_session, user_factory)
+    session, run, step = await _make_chain(db_session, user.id)
+    row = await db_session.get(AgentRun, run.id)
+    row.cancel_requested = True
+    row.lease_owner = "worker-a"
+    row.lease_expires_at = utc_now() + timedelta(seconds=300)
+    await db_session.flush()
+    gateway = FakeAgentGateway([Complete(action="complete", text="不应执行")])
+    executor = await _make_executor(db_session, gateway=gateway)
+    recovery = _make_recovery(db_session, executor=executor, transport=FakeMcpTransport())
+
+    reclaimed = await recovery.reclaim_expired_runs()
+
+    assert run.id not in reclaimed
+    fresh = await db_session.get(AgentRun, run.id)
+    assert fresh.status == RunStatus.RUNNING
+    assert fresh.lease_owner == "worker-a"
+    assert gateway.calls == []
+    assert await _terminal_event_types(db_session, run.id) == []
+
+
+async def test_concurrent_api_and_recovery_cancel_emit_exactly_one_event(
+    monkeypatch,
+) -> None:
+    """API/引擎取消收口与恢复循环孤儿收口并发：行锁串行化——恰好一个
+    run.cancelled 终态事件，后到者幂等成功（不是 IntegrityError）。
+
+    门控 ``_terminal_event_locked`` 让恢复侧在持锁后暂停，强制 API 侧走到
+    行锁等待，确定性覆盖"先查后写"竞态窗口。
+    """
+    from tests.agent_runtime.test_events import _create_committed_run, _purge_committed
+
+    user_id, session_id, run_id = await _create_committed_run()
+    # 崩溃残留孤儿：running + 过期租约 + cancel_requested（独立已提交事务）。
+    async with SessionFactory() as db:
+        repo = AgentRunRepository(db)
+        await repo.begin_attempt(run_id)
+        assert await repo.claim_lease(run_id, "dead-worker", 300)
+        run = await db.get(AgentRun, run_id)
+        run.lease_expires_at = utc_now() - timedelta(seconds=10)
+        run.cancel_requested = True
+        await db.commit()
+
+    a_holds_lock = asyncio.Event()
+    release_a = asyncio.Event()
+    original = AgentEventStream._terminal_event_locked
+    gate = {"armed": True}
+
+    async def gated(self, rid: str):
+        # 只门控第一个到达者（恢复侧先启动，必然先持锁）。
+        if gate["armed"]:
+            gate["armed"] = False
+            a_holds_lock.set()
+            await release_a.wait()
+        return await original(self, rid)
+
+    monkeypatch.setattr(AgentEventStream, "_terminal_event_locked", gated)
+    try:
+
+        def engine_factory(db, worker_id, channel_permissions=()):
+            raise AssertionError("cancel orphan must not execute engine")
+
+        executor = AgentRunExecutor(
+            session_factory=SessionFactory,
+            engine_factory=engine_factory,
+            worker_id="recovery-worker",
+            claim_interval_seconds=0.01,
+        )
+        task_a = asyncio.create_task(executor.settle_cancel_requested(run_id))
+        await asyncio.wait_for(a_holds_lock.wait(), timeout=5)
+        async with SessionFactory() as db_b:
+            # API/引擎侧并发收口同一 Run（同一 settle_terminal 事务边界）。
+            stream_b = AgentEventStream(db_b, AgentEventBroker())
+            task_b = asyncio.create_task(
+                stream_b.settle_terminal(run_id, user_id, RunStatus.CANCELLED, {})
+            )
+            await asyncio.sleep(0.3)
+            assert not task_b.done()  # B 被 Run 行锁串行化，等待 A 提交
+            release_a.set()
+            event_b = await task_b
+        settled_a = await task_a
+
+        assert settled_a is True
+        assert event_b is None  # 后到者幂等，不是唯一键异常
+
+        async with SessionFactory() as db:
+            rows = list(
+                (
+                    await db.scalars(select(AgentEvent).where(AgentEvent.run_id == run_id))
+                ).all()
+            )
+            terminal = [row for row in rows if is_terminal_event(row.event_type)]
+            assert [row.event_type for row in terminal] == ["run.cancelled"]
+            run = await db.get(AgentRun, run_id)
+            assert run.status == RunStatus.CANCELLED
+    finally:
+        await _purge_committed(user_id, session_id, run_id)

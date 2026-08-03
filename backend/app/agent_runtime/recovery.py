@@ -4,7 +4,10 @@
 
 1. **过期租约 Run**：running/reviewing 且租约已过期的 Run 重新提交给
    :class:`AgentRunExecutor`（新 worker 领取 + 新建/沿用 Attempt + 引擎继续），
-   避免进程崩溃后卡死；reviewing Run 由引擎继续未完成的复核（§5.5）；
+   避免进程崩溃后卡死；reviewing Run 由引擎继续未完成的复核（§5.5）。
+   其中 ``cancel_requested=True`` 的 Run 是"API 写入取消后进程崩溃"的孤儿
+   （I1）：**不恢复模型执行**，直接经执行器取消收口路径落 cancelled 终态
+   （恰好一个 ``run.cancelled``），否则永久卡在中间态并阻塞会话后续任务；
 2. **stuck running/reserved MCP 调用**：超过受控时间（``stuck_seconds``，配置
    ``AGENT_TOOL_CALL_STUCK_SECONDS``）仍处于 ``running``/``reserved`` 的调用，
    先**迁移为 unknown**（保留预留，绝不直接释放或重新外发，§5.4），再交给
@@ -113,8 +116,8 @@ class RecoveryLoop:
     async def run_once(self) -> tuple[
         tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...]
     ]:
-        """执行一轮恢复；返回 ``(已领取重建的 run_ids, stuck 迁移 logical_call_ids,
-        已核对 logical_call_ids, 运维告警 ids)``。"""
+        """执行一轮恢复；返回 ``(已接管重建/取消收口的 run_ids, stuck 迁移
+        logical_call_ids, 已核对 logical_call_ids, 运维告警 ids)``。"""
         reclaimed = await self.reclaim_expired_runs()
         stuck = await self.migrate_stuck_tool_calls()
         reconciled, warnings = await self.reconcile_unknown_calls()
@@ -125,13 +128,23 @@ class RecoveryLoop:
     # ------------------------------------------------------------------ #
 
     async def reclaim_expired_runs(self) -> tuple[str, ...]:
-        """扫描可接管的 running/reviewing Run，重新提交给执行器。
+        """扫描可接管的 running/reviewing Run，重新提交给执行器；并收口取消
+        待处理孤儿 Run（I1）。
 
         与执行器 ``_find_claimable_id`` 一致：租约过期或无租约（NULL）的
         running Run 都可接管——NULL 租约是 API resume 经
         ``begin_attempt(resumed=True)`` 留下的状态，执行器停止时若恢复循环
         也不接管会永久卡在 running。租约过期的 reviewing Run（复核期间崩溃，
         §5.5）同样接管，由引擎继续未完成的复核。
+
+        I1：``cancel_requested=True`` 且租约过期/为空的 Run 不交给执行器
+        恢复模型执行——其原 worker 已崩溃、永远不会走到取消检查点；直接经
+        执行器的取消收口路径（释放 Draft + ``settle_terminal`` CANCELLED）
+        落 cancelled 终态与恰好一个 ``run.cancelled``，避免永久卡在
+        running/reviewing 并阻塞会话后续任务。租约仍活跃的不在本扫描内
+        （在途 worker 的取消检查点会自行收口，不抢）。
+
+        返回本轮处理的 run_ids（接管重建 + 取消收口）。
         """
         reclaimed: list[str] = []
         async with self._session_factory() as db:
@@ -151,6 +164,22 @@ class RecoveryLoop:
                     .limit(_SCAN_LIMIT)
                 )
             ).all()
+            cancel_pending = (
+                await db.scalars(
+                    select(AgentRun.id)
+                    .where(
+                        AgentRun.run_kind == "user",
+                        AgentRun.status.in_((RunStatus.RUNNING, RunStatus.REVIEWING)),
+                        AgentRun.cancel_requested.is_(True),
+                        or_(
+                            AgentRun.lease_expires_at.is_(None),
+                            AgentRun.lease_expires_at <= self._clock(),
+                        ),
+                    )
+                    .order_by(AgentRun.id.asc())
+                    .limit(_SCAN_LIMIT)
+                )
+            ).all()
         for run_id in expired:
             try:
                 # 使用恢复循环自己的 worker id：与原 worker 租约隔离，避免同一
@@ -161,6 +190,15 @@ class RecoveryLoop:
                 raise
             except Exception:
                 logger.exception("recovery reclaim failed for run %s", run_id)
+        for run_id in cancel_pending:
+            try:
+                # 取消孤儿：不恢复模型执行，直接 settle cancelled（I1）。
+                if await self._executor.settle_cancel_requested(run_id):
+                    reclaimed.append(run_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("recovery cancel-settle failed for run %s", run_id)
         return tuple(reclaimed)
 
     # ------------------------------------------------------------------ #

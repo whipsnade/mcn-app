@@ -127,6 +127,38 @@ def _utcnow() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
 
 
+async def release_run_drafts(db: AsyncSession, run_id: str, *, outcome: str = "idle") -> None:
+    """释放某 Run 持有的全部 Draft working head，保留不可变 Revision（§5.7）。
+
+    与 :meth:`ReviewerDriver.cancel_reviewing` 同一语义（已释放幂等跳过、他人
+    持有抛 ``ArtifactBusy``），Draft 集合按 ``owner_run_id`` 自动发现——引擎的
+    非发布出口（ask_user/complete/paused/cancelled/failed）与执行器/恢复循环
+    的取消孤儿收口（I1）共用本函数，任何非发布出口都不得让 Artifact 永久
+    ``artifact_busy``。
+    """
+    if outcome not in ("idle", "failed"):
+        raise ValueError(f"invalid cancel outcome: {outcome!r}")
+    service = ArtifactService(db)
+    draft_ids = list(
+        (
+            await db.scalars(
+                select(ArtifactDraft.id).where(ArtifactDraft.owner_run_id == run_id)
+            )
+        ).all()
+    )
+    for draft_id in draft_ids:
+        draft = await db.get(ArtifactDraft, draft_id)
+        if draft is None or draft.owner_run_id is None:
+            continue  # 已释放，幂等
+        if draft.owner_run_id != run_id:
+            raise ArtifactBusy(
+                draft.artifact_id,
+                draft_id=draft.id,
+                owner_run_id=draft.owner_run_id,
+            )
+        await service.release_draft(draft.id, outcome=outcome)
+
+
 class ReviewerDriver:
     """Reviewer 生命周期驱动：批次创建 + 单 Item 复核 + 整批发布前复核。
 
@@ -525,4 +557,5 @@ __all__ = [
     "ReviewLimitExceeded",
     "ReviewOwnershipError",
     "ReviewerDriver",
+    "release_run_drafts",
 ]
