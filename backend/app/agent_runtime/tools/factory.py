@@ -11,8 +11,10 @@
   审核内部名暴露工具，remote_name 一律取内部名，见 main.py 原注释 /
   2026-08-02-agent-runtime-uat.md Incident）。
 
-工具执行前的实时目录复核保持 :class:`ToolRegistry` 既有语义
-（``visible_tools`` / ``execute`` 复查 review_status/is_enabled）。
+工具执行前的实时目录复核（G2，修复设计 §5.1）：``build`` 注入
+``catalog_lookup``，``execute`` 每次 dispatch MCP 工具前按内部名单行查询
+目录（存在 / approved / enabled / 签名 digest 与装配时一致），复核在积分
+预留之前失败即拒绝；``visible_tools`` 语义不变，仍用装配时缓存。
 
 :func:`load_channel_permissions` 是用户渠道权限的唯一查询入口：Engine 创建时
 按 ``user_id`` 注入；默认空权限只能隐藏受限工具，不能作为生产用户的永久配置。
@@ -40,8 +42,9 @@ from app.agent_runtime.tools.history import (
     ReadToolResultTool,
     SearchEvidenceTool,
 )
-from app.agent_runtime.tools.mcp import AgentMcpTool
-from app.agent_runtime.tools.registry import CatalogRow, ToolRegistry
+from app.agent_runtime.tools.mcp import AgentMcpTool, SessionFactoryLike
+from app.agent_runtime.tools.registry import CatalogRow, McpCatalogEntry, ToolRegistry
+from app.db.session import SessionFactory
 from app.identity.models import UserChannelPermission
 from app.mcp_gateway.contracts import DataTapService
 from app.mcp_gateway.models import McpToolCatalog
@@ -82,6 +85,9 @@ class AgentToolRegistryFactory:
     （``circuit_scope="none"`` + 禁止 possibly-sent 自动重试，设计 §5.3）。
     ``breaker`` 为进程级共享细粒度熔断器，生产必须由 main 装配注入；为 None
     时每个 MCP 工具实例各建独立熔断器（仅测试便利，失败计数不跨实例累积）。
+    ``session_factory`` 供执行前实时复核目录行使用：独立会话短事务，读到
+    的是最新已提交状态（不复用 Engine 会话，避免 REPEATABLE READ 快照下
+    看不到装配后管理员提交的撤销/隔离/禁用）；测试可注入共享会话。
     """
 
     def __init__(
@@ -89,15 +95,18 @@ class AgentToolRegistryFactory:
         *,
         transport_getter: Callable[[], McpTransport] = get_agent_mcp_transport,
         breaker: FineGrainedCircuitBreaker | None = None,
+        session_factory: SessionFactoryLike = SessionFactory,
     ) -> None:
         self._transport_getter = transport_getter
         self._breaker = breaker
+        self._session_factory = session_factory
 
     def build(self, db: AsyncSession) -> ToolRegistry:
         """构建注册齐内部工具并接入 MCP 审核目录的 ToolRegistry。"""
         registry = ToolRegistry(
             catalog_source=lambda: self._load_catalog(db),
             mcp_executor_factory=lambda row: self._make_mcp_tool(db, row),
+            catalog_lookup=self._lookup_catalog_row,
         )
         registry.register(ReadArtifactTool(db), category=HISTORY_TOOLS)
         registry.register(SearchEvidenceTool(db), category=HISTORY_TOOLS)
@@ -113,6 +122,29 @@ class AgentToolRegistryFactory:
 
     async def _load_catalog(self, db: AsyncSession):
         return (await db.scalars(select(McpToolCatalog))).all()
+
+    async def _lookup_catalog_row(self, internal_tool_name: str) -> McpCatalogEntry | None:
+        """按内部名实时查询目录行（G2）：独立会话单行查询，返回内存快照。
+
+        快照在会话内取出，避免 ORM 行脱离会话后的懒加载问题。
+        """
+        async with self._session_factory() as db:
+            row = await db.scalar(
+                select(McpToolCatalog).where(
+                    McpToolCatalog.internal_tool_name == internal_tool_name
+                )
+            )
+            if row is None:
+                return None
+            return McpCatalogEntry(
+                internal_tool_name=row.internal_tool_name,
+                service_slug=row.service_slug,
+                reviewed_description=row.reviewed_description,
+                input_schema_json=row.input_schema_json,
+                review_status=row.review_status,
+                is_enabled=row.is_enabled,
+                discovery_digest=row.discovery_digest,
+            )
 
     def _make_mcp_tool(self, db: AsyncSession, row: CatalogRow) -> AgentMcpTool | None:
         """目录行 → AgentMcpTool（未在 allowlist 内不挂执行器，工具不可调用）。"""

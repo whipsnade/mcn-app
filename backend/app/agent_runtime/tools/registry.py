@@ -8,7 +8,10 @@
    ``mcp_tool_allowlist``（如 kol_detail_v1 的达人详情/热帖名单，设计
    §5.1），此时 MCP 工具进一步按内部名名单过滤；
 2. **实时审核状态**：MCP 工具来自 ``mcp_tool_catalog``（通过注入的目录源），
-   只有 ``review_status == "approved"`` 且 ``is_enabled`` 可见；
+   只有 ``review_status == "approved"`` 且 ``is_enabled`` 可见；执行路径
+   另经注入的 ``catalog_lookup`` 在 dispatch 前按行实时复核（存在 /
+   approved / enabled / 签名 digest 与装配时一致），装配后管理员撤销、
+   隔离、禁用或签名漂移都会被拦截（修复设计 §5.1）；
 3. **用户渠道权限**：MCP 工具按其服务对应渠道，与用户的渠道权限求交。
 
 执行时服务端上下文（``user_id/session_id/run_id/profile_name``）通过
@@ -54,6 +57,7 @@ class CatalogRow(Protocol):
     input_schema_json: dict[str, Any]
     review_status: str
     is_enabled: bool
+    discovery_digest: str
 
 
 @dataclass(frozen=True)
@@ -66,6 +70,8 @@ class McpCatalogEntry:
     input_schema_json: dict[str, Any]
     review_status: str
     is_enabled: bool
+    # 实时发现签名；缺省空串仅为兼容旧测试构造，生产行（NOT NULL 列）必有值。
+    discovery_digest: str = ""
 
 
 @dataclass(frozen=True)
@@ -75,7 +81,9 @@ class RegisteredTool:
     - ``category``：TOOL_CATEGORIES 词汇表分类（§五）；
     - ``channel``：MCP 工具所需渠道权限，``None`` 表示跨平台/无渠道门槛；
     - ``tool``：可执行对象；目录来源的 MCP 工具在 Task 8 接入执行器前为 ``None``；
-    - ``review_status`` / ``is_enabled``：仅目录来源的 MCP 工具携带。
+    - ``review_status`` / ``is_enabled`` / ``discovery_digest``：仅目录来源的
+      MCP 工具携带；``discovery_digest`` 是装配时的实时发现签名，执行前复核
+      用于检测签名漂移。
     """
 
     internal_name: str
@@ -88,6 +96,7 @@ class RegisteredTool:
     tool: TrustedTool | None = None
     review_status: str | None = None
     is_enabled: bool = True
+    discovery_digest: str | None = None
     # 模型可见的输入 JSON Schema（§九/§10：模型需要看到 Schema 才能构造合法参数）。
     # 静态工具取 ``input_model.model_json_schema()``；目录 MCP 工具取实时发现并
     # 封闭后的 ``input_schema_json``。
@@ -165,12 +174,19 @@ class ToolRegistry:
             | None
         ) = None,
         mcp_executor_factory: Callable[[CatalogRow], TrustedTool | None] | None = None,
+        catalog_lookup: (
+            Callable[[str], CatalogRow | None | Awaitable[CatalogRow | None]] | None
+        ) = None,
     ) -> None:
         self._entries: dict[str, RegisteredTool] = {}
         self._catalog_source = catalog_source
         # Task 8：目录来源的 MCP 工具在注册时经该工厂挂上 AgentMcpTool 执行器；
         # 引擎在接线时注入（内部名 → service/remote/schema 由 mcp_gateway 解析）。
         self._mcp_executor_factory = mcp_executor_factory
+        # G2：执行前按 internal_tool_name 实时查询目录行（轻量单行查询），
+        # 复核装配后管理员是否撤销/隔离/禁用或签名漂移；为 None 时跳过复核，
+        # 保持纯内存装配（单测）既有语义。
+        self._catalog_lookup = catalog_lookup
         self._catalog_loaded = False
 
     def register(self, tool: TrustedTool, *, category: str) -> RegisteredTool:
@@ -256,6 +272,11 @@ class ToolRegistry:
         （§16），实际身份始终来自服务端注入的 ``ToolContext``。
         Task 7 硬化 (b)：执行前重新校验工具对当前 Profile 可见（Profile 分类 +
         实时审核状态 + 用户渠道权限求交），防止审核撤销后仍被执行。
+        G2：MCP 工具在 dispatch 前再经 ``catalog_lookup`` 实时复核目录行
+        （存在 / approved / enabled / 签名与装配时一致）——装配缓存可能被
+        管理员事后变更绕过，实时复核在 ``entry.tool.execute``（AgentMcpTool
+        的 prepare/积分预留）之前执行，复核失败抛 :class:`UnknownToolError`
+        （与静态检查同一出口），不产生任何预留，无需释放。
         """
         await self._ensure_catalog()
         entry = self._entries.get(internal_name)
@@ -274,6 +295,7 @@ class ToolRegistry:
                 raise UnknownToolError(f"tool is not approved or enabled: {internal_name!r}")
             if entry.channel is not None and entry.channel not in frozenset(channel_permissions):
                 raise UnknownToolError(f"tool requires channel: {entry.channel!r}")
+            await self._recheck_mcp_catalog_row(entry)
         scrubbed = {
             key: value for key, value in arguments.items() if key not in SERVER_RESERVED_KEYS
         }
@@ -290,6 +312,32 @@ class ToolRegistry:
             step_id=step_id,
         )
         return await entry.tool.execute(context, parsed)
+
+    async def _recheck_mcp_catalog_row(self, entry: RegisteredTool) -> None:
+        """执行前实时复核 MCP 目录行（G2，修复设计 §5.1）。
+
+        注入 ``catalog_lookup`` 时按 internal_tool_name 做一次轻量单行查询，
+        复核：行仍存在、``review_status == "approved"``、``is_enabled``、实时
+        签名 ``discovery_digest`` 与装配时一致（防止签名漂移后继续调用）。
+        未注入（纯内存装配）时跳过，保持既有语义。
+        """
+        if self._catalog_lookup is None:
+            return
+        live = self._catalog_lookup(entry.internal_name)
+        if inspect.isawaitable(live):
+            live = await live
+        if live is None:
+            raise UnknownToolError(
+                f"tool catalog row missing at execution time: {entry.internal_name!r}"
+            )
+        if live.review_status != "approved" or not live.is_enabled:
+            raise UnknownToolError(
+                f"tool not approved/enabled at execution time: {entry.internal_name!r}"
+            )
+        if live.discovery_digest != entry.discovery_digest:
+            raise UnknownToolError(
+                f"tool signature drifted since assembly: {entry.internal_name!r}"
+            )
 
     async def reload_catalog(self) -> None:
         """重读目录源并替换 MCP 条目，审核状态不被无限期缓存（Task 7 硬化 a）。
@@ -337,6 +385,7 @@ class ToolRegistry:
             tool=executor,
             review_status=row.review_status,
             is_enabled=row.is_enabled,
+            discovery_digest=row.discovery_digest,
             input_schema=close_input_schema(row.input_schema_json),
         )
 

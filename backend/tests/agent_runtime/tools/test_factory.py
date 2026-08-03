@@ -13,10 +13,12 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from uuid import uuid4
 
 import pytest
+from sqlalchemy import select
 
 from app.agent_runtime.profiles import (
     ARTIFACT_TOOLS,
@@ -274,3 +276,170 @@ async def test_main_engine_factory_assembles_full_registry(db_session) -> None:
     names = {entry.internal_name for entry in visible}
     assert _INTERNAL_HISTORY | _INTERNAL_CALCULATION | _INTERNAL_ARTIFACT <= names
     assert "query_analysis_data" in names
+
+
+# ---------------------------------------------------------------------------
+# 7. 执行前实时复核目录行（G2）
+# ---------------------------------------------------------------------------
+
+
+@asynccontextmanager
+async def _shared_session(db_session):
+    """与测试夹具共享同一会话的 session_factory（同连接内可见未提交行）。"""
+    yield db_session
+
+
+def _build_live_recheck_registry(db_session):
+    return AgentToolRegistryFactory(
+        session_factory=lambda: _shared_session(db_session)
+    ).build(db_session)
+
+
+async def _get_catalog_row(db_session, internal_name: str) -> McpToolCatalog:
+    row = await db_session.scalar(
+        select(McpToolCatalog).where(McpToolCatalog.internal_tool_name == internal_name)
+    )
+    assert row is not None
+    return row
+
+
+async def test_factory_execute_rejected_after_review_revoked(db_session) -> None:
+    await _add_catalog_row(db_session, internal_name="query_analysis_data")
+    registry = _build_live_recheck_registry(db_session)
+    await registry.visible_tools(session_analyst)  # 装配（缓存 approved 快照）
+
+    # 装配后管理员隔离：执行路径实时复核必须拒绝。query_analysis_data 在审核
+    # allowlist 内（挂了真实 AgentMcpTool），若复核缺失会跌入 prepare 抛
+    # ValueError 而不是 UnknownToolError——该断言同时证明复核在预留之前。
+    row = await _get_catalog_row(db_session, "query_analysis_data")
+    row.review_status = "quarantined"
+    await db_session.flush()
+
+    with pytest.raises(UnknownToolError):
+        await registry.execute(
+            internal_name="query_analysis_data",
+            arguments={},
+            user_id="u",
+            session_id="s",
+            run_id="r",
+            profile=session_analyst,
+        )
+
+
+async def test_factory_execute_rejected_after_disabled(db_session) -> None:
+    await _add_catalog_row(db_session, internal_name="query_analysis_data")
+    registry = _build_live_recheck_registry(db_session)
+    await registry.visible_tools(session_analyst)
+
+    row = await _get_catalog_row(db_session, "query_analysis_data")
+    row.is_enabled = False
+    await db_session.flush()
+
+    with pytest.raises(UnknownToolError):
+        await registry.execute(
+            internal_name="query_analysis_data",
+            arguments={},
+            user_id="u",
+            session_id="s",
+            run_id="r",
+            profile=session_analyst,
+        )
+
+
+async def test_factory_execute_rejected_on_signature_drift(db_session) -> None:
+    await _add_catalog_row(db_session, internal_name="query_analysis_data")
+    registry = _build_live_recheck_registry(db_session)
+    await registry.visible_tools(session_analyst)
+
+    row = await _get_catalog_row(db_session, "query_analysis_data")
+    row.discovery_digest = "e" * 64
+    await db_session.flush()
+
+    with pytest.raises(UnknownToolError):
+        await registry.execute(
+            internal_name="query_analysis_data",
+            arguments={},
+            user_id="u",
+            session_id="s",
+            run_id="r",
+            profile=session_analyst,
+        )
+
+
+async def test_factory_execute_rejected_when_catalog_row_deleted(db_session) -> None:
+    await _add_catalog_row(db_session, internal_name="query_analysis_data")
+    registry = _build_live_recheck_registry(db_session)
+    await registry.visible_tools(session_analyst)
+
+    row = await _get_catalog_row(db_session, "query_analysis_data")
+    await db_session.delete(row)
+    await db_session.flush()
+
+    with pytest.raises(UnknownToolError):
+        await registry.execute(
+            internal_name="query_analysis_data",
+            arguments={},
+            user_id="u",
+            session_id="s",
+            run_id="r",
+            profile=session_analyst,
+        )
+
+
+async def test_factory_visible_tools_cached_while_execute_rechecks_live(db_session) -> None:
+    # visible_tools 语义不变：仍用装配缓存；实时复核只加在执行路径。
+    await _add_catalog_row(db_session, internal_name="query_analysis_data")
+    registry = _build_live_recheck_registry(db_session)
+    visible_before = await registry.visible_tools(session_analyst)
+    assert "query_analysis_data" in {entry.internal_name for entry in visible_before}
+
+    row = await _get_catalog_row(db_session, "query_analysis_data")
+    row.review_status = "quarantined"
+    await db_session.flush()
+
+    visible_after = await registry.visible_tools(session_analyst)
+    assert "query_analysis_data" in {entry.internal_name for entry in visible_after}
+
+    with pytest.raises(UnknownToolError):
+        await registry.execute(
+            internal_name="query_analysis_data",
+            arguments={},
+            user_id="u",
+            session_id="s",
+            run_id="r",
+            profile=session_analyst,
+        )
+
+
+async def test_factory_kol_detail_allowlist_stacks_with_live_recheck(db_session) -> None:
+    await _add_catalog_row(
+        db_session, internal_name="kol_detail", service_slug="social-grow-mcp"
+    )
+    await _add_catalog_row(db_session, internal_name="query_analysis_data")
+    registry = _build_live_recheck_registry(db_session)
+    await registry.visible_tools(kol_detail_profile)
+
+    # allowlist 外：实时行健康也被 Profile 名单拒绝。
+    with pytest.raises(UnknownToolError):
+        await registry.execute(
+            internal_name="query_analysis_data",
+            arguments={},
+            user_id="u",
+            session_id="s",
+            run_id="r",
+            profile=kol_detail_profile,
+        )
+
+    # allowlist 内但事后被隔离：实时复核拒绝。
+    row = await _get_catalog_row(db_session, "kol_detail")
+    row.review_status = "quarantined"
+    await db_session.flush()
+    with pytest.raises(UnknownToolError):
+        await registry.execute(
+            internal_name="kol_detail",
+            arguments={},
+            user_id="u",
+            session_id="s",
+            run_id="r",
+            profile=kol_detail_profile,
+        )

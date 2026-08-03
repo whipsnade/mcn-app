@@ -5,6 +5,7 @@
 渠道权限过滤、ToolContext 传播。
 """
 
+import dataclasses
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
@@ -485,3 +486,251 @@ async def test_failed_result_propagates_error_type() -> None:
     assert result.status == "failed"
     assert result.error_type == "definitely_not_sent"
     assert result.evidence_id is None
+
+
+# ---------------------------------------------------------------------------
+# 8. MCP 工具执行前实时复核目录行（G2）
+# ---------------------------------------------------------------------------
+
+
+def _live_catalog_entry(
+    *,
+    internal_name: str = "general_search",
+    service_slug: str = "bilibili-mcp",
+    review_status: str = "approved",
+    is_enabled: bool = True,
+    discovery_digest: str = "d" * 64,
+) -> McpCatalogEntry:
+    return McpCatalogEntry(
+        internal_tool_name=internal_name,
+        service_slug=service_slug,
+        reviewed_description=f"{internal_name} 描述",
+        input_schema_json={"type": "object"},
+        review_status=review_status,
+        is_enabled=is_enabled,
+        discovery_digest=discovery_digest,
+    )
+
+
+def _live_recheck_registry(
+    entries: list[McpCatalogEntry],
+    tools: dict[str, FakeTool],
+    live_rows: dict[str, McpCatalogEntry | None],
+    lookup_calls: list[str] | None = None,
+) -> ToolRegistry:
+    """装配时目录快照 + 执行期实时查询。
+
+    ``live_rows`` 是可变的"当前数据库"：装配后改它即模拟管理员事后
+    隔离/禁用/删行/签名漂移；装配缓存（catalog_source 快照）保持不变。
+    """
+
+    async def _lookup(internal_name: str) -> McpCatalogEntry | None:
+        if lookup_calls is not None:
+            lookup_calls.append(internal_name)
+        return live_rows.get(internal_name)
+
+    return ToolRegistry(
+        catalog_source=list(entries),
+        mcp_executor_factory=lambda row: tools[row.internal_tool_name],
+        catalog_lookup=_lookup,
+    )
+
+
+async def _assert_execute_rejected_without_dispatch(
+    registry: ToolRegistry,
+    tool: FakeTool,
+    *,
+    internal_name: str = "general_search",
+    channel_permissions: frozenset[str] = frozenset({"bilibili"}),
+) -> None:
+    calls_before = len(tool.calls)
+    with pytest.raises(UnknownToolError):
+        await registry.execute(
+            internal_name=internal_name,
+            arguments={},
+            user_id="u",
+            session_id="s",
+            run_id="r",
+            profile=session_analyst,
+            channel_permissions=channel_permissions,
+        )
+    # 复核位于 entry.tool.execute（AgentMcpTool 的 prepare/积分预留）之前：
+    # 被拒时执行器零调用 → 不产生预留，也无需释放，账本无噪声。
+    assert len(tool.calls) == calls_before
+
+
+async def test_execute_live_recheck_allows_healthy_row() -> None:
+    entry = _live_catalog_entry()
+    tool = FakeTool("general_search")
+    registry = _live_recheck_registry(
+        [entry], {"general_search": tool}, {"general_search": entry}
+    )
+
+    result = await registry.execute(
+        internal_name="general_search",
+        arguments={"keyword": "美妆"},
+        user_id="u",
+        session_id="s",
+        run_id="r",
+        profile=session_analyst,
+        channel_permissions={"bilibili"},
+    )
+
+    assert result.status == "success"
+    assert len(tool.calls) == 1
+
+
+async def test_execute_rejected_after_review_revoked() -> None:
+    entry = _live_catalog_entry()
+    live_rows: dict[str, McpCatalogEntry | None] = {"general_search": entry}
+    tool = FakeTool("general_search")
+    registry = _live_recheck_registry([entry], {"general_search": tool}, live_rows)
+    await registry.visible_tools(session_analyst)  # 触发装配（缓存 approved 快照）
+
+    # 管理员事后隔离：装配缓存不变，执行路径实时复核必须拒绝。
+    live_rows["general_search"] = dataclasses.replace(entry, review_status="quarantined")
+    await _assert_execute_rejected_without_dispatch(registry, tool)
+
+
+async def test_execute_rejected_after_disabled() -> None:
+    entry = _live_catalog_entry()
+    live_rows: dict[str, McpCatalogEntry | None] = {"general_search": entry}
+    tool = FakeTool("general_search")
+    registry = _live_recheck_registry([entry], {"general_search": tool}, live_rows)
+    await registry.visible_tools(session_analyst)
+
+    live_rows["general_search"] = dataclasses.replace(entry, is_enabled=False)
+    await _assert_execute_rejected_without_dispatch(registry, tool)
+
+
+async def test_execute_rejected_on_signature_drift() -> None:
+    entry = _live_catalog_entry()
+    live_rows: dict[str, McpCatalogEntry | None] = {"general_search": entry}
+    tool = FakeTool("general_search")
+    registry = _live_recheck_registry([entry], {"general_search": tool}, live_rows)
+    await registry.visible_tools(session_analyst)
+
+    # 实时签名与装配时不一致（供应商改了 Schema 被重新发现）：拒绝继续调用。
+    live_rows["general_search"] = dataclasses.replace(entry, discovery_digest="e" * 64)
+    await _assert_execute_rejected_without_dispatch(registry, tool)
+
+
+async def test_execute_rejected_when_catalog_row_deleted() -> None:
+    entry = _live_catalog_entry()
+    live_rows: dict[str, McpCatalogEntry | None] = {"general_search": entry}
+    tool = FakeTool("general_search")
+    registry = _live_recheck_registry([entry], {"general_search": tool}, live_rows)
+    await registry.visible_tools(session_analyst)
+
+    live_rows["general_search"] = None
+    await _assert_execute_rejected_without_dispatch(registry, tool)
+
+
+async def test_execute_without_catalog_lookup_keeps_cached_only_semantics() -> None:
+    # 未注入实时查询时保持既有行为（仅装配缓存），纯内存装配的调用方不受影响。
+    entry = _live_catalog_entry()
+    tool = FakeTool("general_search")
+    registry = ToolRegistry(
+        catalog_source=[entry],
+        mcp_executor_factory=lambda row: tool,
+    )
+
+    result = await registry.execute(
+        internal_name="general_search",
+        arguments={},
+        user_id="u",
+        session_id="s",
+        run_id="r",
+        profile=session_analyst,
+        channel_permissions={"bilibili"},
+    )
+    assert result.status == "success"
+    assert len(tool.calls) == 1
+
+
+async def test_live_recheck_queries_once_per_mcp_execute_and_skips_static_tools() -> None:
+    entry = _live_catalog_entry()
+    tool = FakeTool("general_search")
+    lookup_calls: list[str] = []
+    registry = _live_recheck_registry(
+        [entry], {"general_search": tool}, {"general_search": entry}, lookup_calls
+    )
+    registry.register(FakeTool("calculate_expression"), category=CALCULATION_TOOLS)
+
+    # 静态工具执行不触发目录查询。
+    await registry.execute(
+        internal_name="calculate_expression",
+        arguments={"expression": "1 + 1"},
+        user_id="u",
+        session_id="s",
+        run_id="r",
+        profile=session_analyst,
+    )
+    assert lookup_calls == []
+
+    # 每次 MCP 执行恰好一次按名单元查询（不做全表重载）。
+    await registry.execute(
+        internal_name="general_search",
+        arguments={},
+        user_id="u",
+        session_id="s",
+        run_id="r",
+        profile=session_analyst,
+        channel_permissions={"bilibili"},
+    )
+    assert lookup_calls == ["general_search"]
+
+
+async def test_kol_detail_allowlist_stacks_with_live_recheck() -> None:
+    kol_entry = _live_catalog_entry(internal_name="kol_detail", service_slug="social-grow-mcp")
+    other_entry = _live_catalog_entry(
+        internal_name="query_analysis_data", service_slug="insight-cube-mcp"
+    )
+    live_rows: dict[str, McpCatalogEntry | None] = {
+        "kol_detail": kol_entry,
+        "query_analysis_data": other_entry,
+    }
+    kol_tool = FakeTool("kol_detail")
+    other_tool = FakeTool("query_analysis_data")
+    registry = _live_recheck_registry(
+        [kol_entry, other_entry],
+        {"kol_detail": kol_tool, "query_analysis_data": other_tool},
+        live_rows,
+    )
+
+    # allowlist 外：实时行健康也被 Profile 名单先拒绝，且不触发执行器。
+    with pytest.raises(UnknownToolError):
+        await registry.execute(
+            internal_name="query_analysis_data",
+            arguments={},
+            user_id="u",
+            session_id="s",
+            run_id="r",
+            profile=kol_detail,
+        )
+    assert other_tool.calls == []
+
+    # allowlist 内 + 实时行健康：放行。
+    result = await registry.execute(
+        internal_name="kol_detail",
+        arguments={},
+        user_id="u",
+        session_id="s",
+        run_id="r",
+        profile=kol_detail,
+    )
+    assert result.status == "success"
+    assert len(kol_tool.calls) == 1
+
+    # allowlist 内但事后被隔离：实时复核拒绝，且不再 dispatch。
+    live_rows["kol_detail"] = dataclasses.replace(kol_entry, review_status="quarantined")
+    with pytest.raises(UnknownToolError):
+        await registry.execute(
+            internal_name="kol_detail",
+            arguments={},
+            user_id="u",
+            session_id="s",
+            run_id="r",
+            profile=kol_detail,
+        )
+    assert len(kol_tool.calls) == 1
