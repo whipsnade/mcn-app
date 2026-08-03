@@ -146,6 +146,30 @@ class AgentEventStream:
         await self.broker.publish(event)
         return event
 
+    async def append_terminal_once(
+        self, run_id: str, user_id: str, event_type: str, payload: dict[str, Any] | None
+    ) -> AgentEvent | None:
+        """终态事件统一出口（§5.8/G1）：同一 Run 全局恰好一个终态事件。
+
+        所有使 Run 进入终态的路径（complete / 原子发布 / Reviewer reject /
+        系统失败 / 取消 / executor 异常收口）都经本方法发
+        ``run.completed|failed|cancelled``——它必须是该 Run 最后一条用户可见
+        事件，送达后 SSE 流收口。该 Run 已存在终态事件（如引擎已收口、
+        executor 兜底重入）时幂等返回 ``None``，绝不重复发送；非终态类型
+        抛 ``ValueError``（调用方编排错误，不应静默）。
+        """
+        if not is_terminal_event(event_type):
+            raise ValueError(f"not a terminal event: {event_type!r}")
+        existing = await self.db.scalar(
+            select(func.count(AgentEvent.id)).where(
+                AgentEvent.run_id == run_id,
+                AgentEvent.event_type.in_(tuple(sorted(TERMINAL_EVENT_TYPES))),
+            )
+        )
+        if existing:
+            return None
+        return await self.append(run_id, user_id, event_type, payload)
+
     async def stream(
         self, run_id: str, user_id: str, last_event_id: int
     ) -> AsyncIterator[AgentEvent]:

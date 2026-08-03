@@ -141,6 +141,55 @@ describe('reduceRunEvent', () => {
     expect(state.messageCompleted).toBe(true);
   });
 
+  it('tracks artifact payload fields and bumps artifactsVersion only on artifact/review events', () => {
+    let state = initialRunRuntime('run-1');
+    state = reduceRunEvent(state, event('thinking.delta', 1, { text: 'x' }));
+    state = reduceRunEvent(state, event('tool.started', 2, { internal_tool_name: 't' }));
+    expect(state.artifactsVersion).toBe(0);
+
+    // §15.3：draft 事件带 artifact_id/module/parent_artifact_id/status（+version 草稿修订号）
+    state = reduceRunEvent(state, event('artifact.draft.created', 3, {
+      artifact_id: 'art-1',
+      module: 'kol-detail',
+      parent_artifact_id: 'art-parent',
+      status: 'draft',
+      version: 1,
+    }));
+    expect(state.artifactsVersion).toBe(1);
+    expect(state.drafts[0]).toMatchObject({
+      artifactId: 'art-1',
+      module: 'kol-detail',
+      parentArtifactId: 'art-parent',
+      status: 'draft',
+      version: 1,
+    });
+
+    state = reduceRunEvent(state, event('artifact.draft.updated', 4, {
+      artifact_id: 'art-1',
+      module: 'kol-detail',
+      parent_artifact_id: 'art-parent',
+      status: 'draft',
+      version: 2,
+    }));
+    expect(state.artifactsVersion).toBe(2);
+    expect(state.drafts).toHaveLength(1);
+    expect(state.drafts[0]).toMatchObject({ version: 2, parentArtifactId: 'art-parent' });
+
+    state = reduceRunEvent(state, event('review.started', 5, { review_batch_id: 'b-1' }));
+    expect(state.artifactsVersion).toBe(3);
+
+    // 发布事件另带 version（发布版本号）
+    state = reduceRunEvent(state, event('artifact.published', 6, {
+      artifact_id: 'art-1',
+      module: 'kol-detail',
+      parent_artifact_id: 'art-parent',
+      status: 'published',
+      version: 1,
+    }));
+    expect(state.artifactsVersion).toBe(4);
+    expect(state.drafts[0].status).toBe('published');
+  });
+
   it('folds thinking on thinking.completed and marks interrupted on thinking.failed', () => {
     let state = initialRunRuntime('run-1');
     state = reduceRunEvent(state, event('thinking.started', 1, { attempt: 1 }));

@@ -108,6 +108,8 @@ def create_agent_runtime(*, stuck_seconds: float | None = None) -> tuple[
         engine_factory=engine_factory,
         worker_id=executor_worker_id,
         lease_seconds=AGENT_LEASE_SECONDS,
+        # G1：executor 异常收口补发的 run.failed 经共享 broker 即时送达 SSE 订阅方。
+        broker=broker,
     )
     recovery = RecoveryLoop(
         executor=executor,

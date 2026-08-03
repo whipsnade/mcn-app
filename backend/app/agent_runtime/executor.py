@@ -33,6 +33,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_runtime.engine import AgentEngine
+from app.agent_runtime.events import AgentEventBroker, AgentEventStream
 from app.agent_runtime.models import AgentRun, AgentRunAttempt
 from app.agent_runtime.profiles import get_profile
 from app.agent_runtime.repository import AgentRunRepository, utc_now
@@ -62,6 +63,7 @@ class AgentRunExecutor:
         worker_id: str,
         lease_seconds: int = 300,
         claim_interval_seconds: float = 1.0,
+        broker: AgentEventBroker | None = None,
     ) -> None:
         if lease_seconds <= 0:
             raise ValueError("lease_seconds_must_be_positive")
@@ -70,6 +72,10 @@ class AgentRunExecutor:
         self._worker_id = worker_id
         self._lease_seconds = lease_seconds
         self._claim_interval_seconds = claim_interval_seconds
+        # 终态事件广播（G1）：生产必须注入与 API 共享的进程级 broker，同进程
+        # SSE 订阅才能即时收到 executor 补发的 run.failed；缺省独立 broker
+        # （测试注入）时事件仍持久化，跨实例 reader 靠 DB 轮询兜底。
+        self._broker = broker if broker is not None else AgentEventBroker()
         self._stop = asyncio.Event()
         self._wake = asyncio.Event()
         self._loop_task: asyncio.Task[None] | None = None
@@ -313,14 +319,39 @@ class AgentRunExecutor:
     async def _finalize_failed(
         self, db: AsyncSession, repo: AgentRunRepository, run_id: str, worker_id: str
     ) -> None:
-        """执行器错误收口：持有租约经 transition，否则回退系统级 force_fail。"""
+        """执行器错误收口：持有租约经 transition，否则回退系统级 force_fail。
+
+        只有本 worker 真实把 Run 置 failed（transition 成功或 force_fail 确认
+        无其他活跃持有者）才发 run.failed 终态事件（稳定
+        ``error_code=executor_error``，§5.8/G1）——引擎在 decide 之外崩溃时
+        没人发终态事件，SSE 流会因此不结束、前端 Run 卡停在中间态。
+        已是终态（引擎已自行收口，含已发 run.failed）或租约被他人活跃持有
+        （已接管，终态事件由接管方负责，A4 闸门）时跳过，绝不重复发送。
+        """
         try:
             await repo.transition(run_id, RunStatus.FAILED, worker_id=worker_id)
+            failed = True
         except InvalidRunTransition:
             try:
-                await repo.force_fail(run_id, error_code="executor_error")
+                failed = await repo.force_fail(run_id, error_code="executor_error")
             except Exception:
                 logger.exception("force_fail failed for run %s", run_id)
+                failed = False
+        if not failed:
+            return
+        run = await db.get(AgentRun, run_id)
+        if run is None:  # pragma: no cover - 刚收口的 Run 必然存在
+            return
+        try:
+            await AgentEventStream(db, self._broker).append_terminal_once(
+                run_id,
+                run.user_id,
+                "run.failed",
+                {"outcome": "failed", "error_code": "executor_error"},
+            )
+        except Exception:
+            # 事件补发失败不改变已落库的 failed 终态；恢复/重读仍以 DB 为准。
+            logger.exception("run.failed event append failed for run %s", run_id)
 
 
 __all__ = ["AgentRunExecutor"]

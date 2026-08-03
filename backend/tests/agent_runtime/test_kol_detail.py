@@ -34,6 +34,7 @@ from app.agent_runtime.evidence import EvidenceWriter
 from app.agent_runtime.events import AgentEventBroker, AgentEventStream
 from app.agent_runtime.kol_detail import KolDetailRunService
 from app.agent_runtime.models import (
+    AgentEvent,
     AgentRun,
     AgentRunAttempt,
     AgentSession,
@@ -434,6 +435,52 @@ async def test_fresh_run_receives_thinking_sink(db_session, user_factory) -> Non
         isinstance(call["thinking_sink"], AgentEventThinkingSink)
         for call in gateway.calls
     )
+
+
+async def test_fresh_run_emits_artifact_events_and_terminal_event(
+    db_session, user_factory
+) -> None:
+    """kol_detail Run 的产物事件同样接入统一 Run SSE（G1/§15.3）：
+
+    artifact.draft.created → artifact.published（message.completed 之前）→
+    run.completed 终态事件收尾，前端据此实时刷新右侧 BI。
+    """
+    user = await user_factory()
+    session = await _make_session(db_session, user.id)
+    evidence = await _make_evidence(db_session, user.id, session.id)
+    gateway, service = _make_service(
+        db_session,
+        actions=_make_actions(db_session, evidence, _cache_state()),
+        evidence=evidence,
+        now_fn=lambda: T0,
+    )
+
+    summary = await service.create(user.id, session.id, PLATFORM, KOL_UID)
+
+    assert summary.cached is False
+    assert summary.run_id is not None
+    rows = (
+        await db_session.scalars(
+            select(AgentEvent)
+            .where(AgentEvent.run_id == summary.run_id)
+            .order_by(AgentEvent.sequence)
+        )
+    ).all()
+    types = [row.event_type for row in rows]
+    assert "artifact.draft.created" in types
+    assert types.count("artifact.published") == 1
+    assert types.index("artifact.draft.created") < types.index("artifact.published")
+    assert types.index("artifact.published") < types.index("message.completed")
+    assert types[-1] == "run.completed"
+    published = rows[types.index("artifact.published")]
+    assert published.payload_json["artifact_id"] == summary.artifact_id
+    assert published.payload_json["module"] == "kol-detail"
+    assert published.payload_json["status"] == "published"
+    assert published.payload_json["version"] == 1
+    created = rows[types.index("artifact.draft.created")]
+    assert created.payload_json["artifact_id"] == summary.artifact_id
+    assert created.payload_json["module"] == "kol-detail"
+    assert created.payload_json["status"] == "draft"
 
 
 # ---------------------------------------------------------------------------

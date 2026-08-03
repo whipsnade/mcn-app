@@ -315,3 +315,32 @@ async def test_stream_polls_committed_events_from_other_session() -> None:
         await _purge_committed(user_id, session_id, run_id)
 
     assert result == ["run.started", "thinking.delta", "run.completed"]
+
+
+async def test_append_terminal_once_emits_exactly_one_terminal_event(
+    db_session, user_factory
+) -> None:
+    """终态事件统一出口（G1/§5.8）：同一 Run 全局恰好一个终态事件；
+    已有终态事件时幂等返回 None，非终态类型被拒绝。"""
+    user_id, run_id = await _create_run(db_session, user_factory)
+    stream = AgentEventStream(db_session, AgentEventBroker())
+
+    first = await stream.append_terminal_once(
+        run_id, user_id, "run.completed", {"outcome": "completed"}
+    )
+    assert first is not None
+    assert first.event_type == "run.completed"
+    assert first.payload_json["run_id"] == run_id
+
+    second = await stream.append_terminal_once(
+        run_id, user_id, "run.failed", {"outcome": "failed"}
+    )
+    assert second is None
+
+    rows = list(
+        (await db_session.scalars(select(AgentEvent).where(AgentEvent.run_id == run_id))).all()
+    )
+    assert [row.event_type for row in rows] == ["run.completed"]
+
+    with pytest.raises(ValueError, match="not a terminal event"):
+        await stream.append_terminal_once(run_id, user_id, "run.started", {})

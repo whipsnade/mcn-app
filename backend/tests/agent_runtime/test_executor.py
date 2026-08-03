@@ -22,6 +22,7 @@ from app.agent_runtime.engine import AgentEngine
 from app.agent_runtime.events import AgentEventBroker, AgentEventStream
 from app.agent_runtime.executor import AgentRunExecutor
 from app.agent_runtime.models import (
+    AgentEvent,
     AgentMessage,
     AgentRun,
     AgentRunAttempt,
@@ -499,3 +500,191 @@ async def test_executor_injects_user_channel_permissions(db_session, user_factor
 
     assert run_id == run.id
     assert frozenset(captured["channel_permissions"]) == {"bilibili"}
+
+
+# ---------------------------------------------------------------------------
+# 5. G1：executor 异常收口的终态事件（§5.8：恰好一个终态事件且最后）
+# ---------------------------------------------------------------------------
+
+
+class BrokenContextBuilder:
+    """build 直接抛错的上下文构建器：模拟引擎在 decide 之外的系统崩溃。"""
+
+    async def build(self, **kwargs: Any) -> Any:
+        raise RuntimeError("context build exploded")
+
+
+def _build_crashing_executor(
+    db_session,
+    *,
+    worker: str = "worker",
+    broker: AgentEventBroker | None = None,
+) -> AgentRunExecutor:
+    broker = broker or AgentEventBroker()
+    events = AgentEventStream(db_session, broker)
+    gateway = FakeAgentGateway([Complete(action="complete", text="不应到达")])
+    reviewer = ReviewerDriver(db_session, _FakeReviewerGateway(), worker_id=worker)
+
+    def engine_factory(db, worker_id, channel_permissions=()):
+        return AgentEngine(
+            db,
+            gateway=gateway,
+            registry=ToolRegistry(),
+            events=events,
+            reviewer=reviewer,
+            worker_id=worker_id,
+            context_builder=BrokenContextBuilder(),
+        )
+
+    return AgentRunExecutor(
+        session_factory=lambda: _shared_session(db_session),
+        engine_factory=engine_factory,
+        worker_id=worker,
+        claim_interval_seconds=0.01,
+    )
+
+
+async def _run_events(db_session, run_id: str):
+    return list(
+        (
+            await db_session.scalars(
+                select(AgentEvent)
+                .where(AgentEvent.run_id == run_id)
+                .order_by(AgentEvent.sequence)
+            )
+        ).all()
+    )
+
+
+async def test_engine_crash_emits_run_failed_terminal_event(
+    db_session, user_factory
+) -> None:
+    """引擎在 decide 之外崩溃（上下文构建抛错）：executor 异常收口必须发
+    run.failed 终态事件（带稳定 error_code），否则 SSE 流不结束（G1/P0）。"""
+    run, _, _ = await _make_session(db_session, user_factory)
+    executor = _build_crashing_executor(db_session)
+
+    run_id = await executor.claim_and_process_one()
+
+    assert run_id == run.id
+    fresh = await db_session.get(AgentRun, run.id)
+    assert fresh.status == RunStatus.FAILED
+    rows = await _run_events(db_session, run.id)
+    types = [row.event_type for row in rows]
+    assert types[-1] == "run.failed"
+    terminal = [
+        row
+        for row in rows
+        if row.event_type in ("run.completed", "run.failed", "run.cancelled")
+    ]
+    assert len(terminal) == 1
+    assert terminal[0].payload_json["error_code"] == "executor_error"
+
+
+async def test_finalize_failed_does_not_emit_second_terminal_event(
+    db_session, user_factory
+) -> None:
+    """引擎已自行收口 failed（decide 异常，引擎发 run.failed）后，executor
+    兜底不得重复发终态事件——同一 Run 全局恰好一个（G1）。"""
+    run, _, _ = await _make_session(db_session, user_factory)
+    # actions 为空：decide 抛 AssertionError，引擎自己 _fail_run 收口并发 run.failed
+    gateway = FakeAgentGateway([])
+    executor = _build_executor(db_session, gateway=gateway)
+
+    run_id = await executor.claim_and_process_one()
+
+    assert run_id == run.id
+    fresh = await db_session.get(AgentRun, run.id)
+    assert fresh.status == RunStatus.FAILED
+    # 模拟 executor 兜底再调一次（如引擎收口后又抛异常）：不得出现第二个终态事件
+    repo = AgentRunRepository(db_session)
+    await executor._finalize_failed(db_session, repo, run.id, "worker")
+    rows = await _run_events(db_session, run.id)
+    terminal = [
+        row
+        for row in rows
+        if row.event_type in ("run.completed", "run.failed", "run.cancelled")
+    ]
+    assert len(terminal) == 1
+    assert terminal[0].event_type == "run.failed"
+    assert terminal[0].payload_json["error_code"] == "model_error"
+
+
+async def test_finalize_failed_skips_when_lease_held_by_other_worker(
+    db_session, user_factory
+) -> None:
+    """租约被其他 worker 活跃持有（已接管）：旧 worker 的 executor 兜底既不改写
+    Run 状态也不发终态事件——终态由接管方负责（A4 租约闸门，G1 保持）。"""
+    run, _, _ = await _make_session(db_session, user_factory)
+    repo = AgentRunRepository(db_session)
+    await repo.begin_attempt(run.id)
+    assert await repo.claim_lease(run.id, "worker-a", 300)
+
+    gateway = FakeAgentGateway([])
+    executor = _build_executor(db_session, gateway=gateway, worker="worker-b")
+    await executor._finalize_failed(db_session, repo, run.id, "worker-b")
+
+    fresh = await db_session.get(AgentRun, run.id)
+    assert fresh.status == RunStatus.RUNNING
+    assert fresh.lease_owner == "worker-a"
+    rows = await _run_events(db_session, run.id)
+    assert [
+        row
+        for row in rows
+        if row.event_type in ("run.completed", "run.failed", "run.cancelled")
+    ] == []
+
+
+async def test_live_stream_executor_crash_ends_with_run_failed() -> None:
+    """跨会话在线消费（reader 独立会话）：executor 异常收口路径的 SSE 流以
+    run.failed 终态事件收口——流必须结束（§5.8/G1 P0）。"""
+    from app.db.session import SessionFactory
+
+    from tests.agent_runtime.test_engine import (
+        _create_committed_agent_run,
+        _purge_committed_agent_run,
+    )
+
+    user_id, session_id, run_id = await _create_committed_agent_run()
+    broker = AgentEventBroker()
+
+    def engine_factory(db, worker_id, channel_permissions=()):
+        return AgentEngine(
+            db,
+            gateway=FakeAgentGateway([Complete(action="complete", text="不应到达")]),
+            registry=ToolRegistry(),
+            events=AgentEventStream(db, broker),
+            reviewer=ReviewerDriver(db, _FakeReviewerGateway(), worker_id=worker_id),
+            worker_id=worker_id,
+            context_builder=BrokenContextBuilder(),
+        )
+
+    executor = AgentRunExecutor(
+        session_factory=SessionFactory,
+        engine_factory=engine_factory,
+        worker_id="worker",
+        lease_seconds=300,
+        claim_interval_seconds=0.01,
+    )
+    try:
+        received: list[str] = []
+
+        async def consume() -> None:
+            async with SessionFactory() as reader:
+                stream = AgentEventStream(reader, broker)
+                async for event in stream.stream(run_id, user_id, last_event_id=0):
+                    received.append(event.event_type)
+
+        consumer = asyncio.create_task(consume())
+        await asyncio.sleep(0.05)  # reader 完成重放并进入 broker 等待
+        processed = await executor.claim_and_process_one()
+        assert processed == run_id
+        # executor 修复前：流永远等不到终态事件，这里会超时失败
+        await asyncio.wait_for(consumer, timeout=5)
+    finally:
+        await _purge_committed_agent_run(user_id, session_id, run_id)
+
+    assert received[-1] == "run.failed"
+    assert sum(
+        1 for t in received if t in ("run.completed", "run.failed", "run.cancelled")
+    ) == 1

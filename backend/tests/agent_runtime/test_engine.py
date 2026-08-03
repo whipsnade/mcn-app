@@ -24,9 +24,14 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy import delete, func, select
 
 from app.agent_artifacts.models import (
+    AgentArtifact,
     AgentArtifactVersion,
     ArtifactDraft,
+    ArtifactDraftRevision,
+    ArtifactEvent,
+    ArtifactReviewAttempt,
     ArtifactReviewBatch,
+    ArtifactReviewItem,
 )
 from app.agent_artifacts.service import ArtifactService
 from app.agent_runtime.engine import MAX_INVALID_ACTIONS, AgentEngine, RunOutcome
@@ -49,6 +54,7 @@ from app.agent_runtime.reviewer import ReviewDecision, ReviewIssue, ReviewerDriv
 from app.agent_runtime.schemas import AskUser, CallTool, Complete, SubmitReview
 from app.agent_runtime.state import InvalidRunTransition, RunStatus
 from app.agent_runtime.thinking import AgentEventThinkingSink
+from app.agent_runtime.tools.artifacts import CreateDraftTool, UpdateDraftTool
 from app.agent_runtime.tools.contracts import ToolResult
 from app.agent_runtime.tools.calculation import CalculateExpressionTool
 from app.agent_runtime.tools.mcp import AgentMcpTool
@@ -2134,3 +2140,561 @@ async def test_live_stream_delivers_message_completed_before_run_completed() -> 
     assert received[-1] == "run.completed"
     assert "message.completed" in received
     assert received.index("message.completed") < received.index("run.completed")
+
+
+# ---------------------------------------------------------------------------
+# 9. G1：终态事件统一收口（§5.8：恰好一个终态事件，且为该 Run 最后一条
+#    用户可见事件）+ artifact 事件接入统一 Run SSE（§15.3）
+# ---------------------------------------------------------------------------
+
+_TERMINAL_TYPES = ("run.completed", "run.failed", "run.cancelled")
+
+
+async def _terminal_events(db_session, run_id: str) -> list[AgentEvent]:
+    return [
+        row
+        for row in (
+            await db_session.scalars(
+                select(AgentEvent)
+                .where(AgentEvent.run_id == run_id)
+                .order_by(AgentEvent.sequence)
+            )
+        ).all()
+        if row.event_type in _TERMINAL_TYPES
+    ]
+
+
+async def test_submit_review_reject_emits_run_failed_as_last_event(
+    db_session, user_factory
+) -> None:
+    """Reviewer reject：review.rejected 之后必须发 run.failed 终态事件（G1/P0）。
+
+    终态事件是该 Run 最后一条用户可见事件；缺失会让 SSE 流不结束、前端
+    Run 卡停在中间态。reject 前 Run 已被 Reviewer 迁移 failed，事件由引擎补发。
+    """
+    run, attempt, _, _ = await _setup_run(db_session, user_factory)
+    _, draft, _ = await _make_draft(db_session, run)
+    engine, _, _ = _make_engine(
+        db_session,
+        actions=[
+            SubmitReview(
+                action="submit_review",
+                artifact_draft_ids=(draft.id,),
+                completion_text="分析",
+                summary="瑞幸品牌分析",
+            ),
+        ],
+        decisions=[
+            ReviewDecision(
+                decision="reject",
+                issues=[ReviewIssue(code="untrusted", message="数字无法追溯")],
+            )
+        ],
+    )
+    outcome = await engine.run(
+        run=run,
+        attempt_id=attempt.id,
+        profile=get_profile("session_analyst_v1"),
+        messages=[ChatMessage(role="user", content="分析瑞幸品牌")],
+    )
+    assert outcome.status == RunStatus.FAILED
+    types = await _event_types(db_session, run.id)
+    assert types[-1] == "run.failed"
+    assert types.index("review.rejected") < types.index("run.failed")
+    terminal = await _terminal_events(db_session, run.id)
+    assert len(terminal) == 1
+    assert terminal[0].payload_json["error_code"] == "review_rejected"
+
+
+async def test_third_revise_mapped_to_reject_emits_run_failed(
+    db_session, user_factory
+) -> None:
+    """第 3 次 revise 按 reject 处理：同样以 run.failed 终态事件收尾（G1/P0）。"""
+    run, attempt, _, _ = await _setup_run(db_session, user_factory)
+    _, draft, _ = await _make_draft(db_session, run)
+    engine, _, _ = _make_engine(
+        db_session,
+        actions=[
+            SubmitReview(
+                action="submit_review",
+                artifact_draft_ids=(draft.id,),
+                completion_text="分析",
+                summary="瑞幸品牌分析",
+            ),
+            SubmitReview(
+                action="submit_review",
+                artifact_draft_ids=(draft.id,),
+                completion_text="分析",
+                summary="瑞幸品牌分析",
+            ),
+            SubmitReview(
+                action="submit_review",
+                artifact_draft_ids=(draft.id,),
+                completion_text="分析",
+                summary="瑞幸品牌分析",
+            ),
+        ],
+        decisions=[
+            ReviewDecision(
+                decision="revise",
+                issues=[ReviewIssue(code="missing_data", message="需要补查")],
+            ),
+            ReviewDecision(
+                decision="revise",
+                issues=[ReviewIssue(code="missing_data", message="仍需补查")],
+            ),
+            ReviewDecision(
+                decision="revise",
+                issues=[ReviewIssue(code="missing_data", message="仍未补查")],
+            ),
+        ],
+    )
+    outcome = await engine.run(
+        run=run,
+        attempt_id=attempt.id,
+        profile=get_profile("session_analyst_v1"),
+        messages=[ChatMessage(role="user", content="分析瑞幸品牌")],
+    )
+    assert outcome.status == RunStatus.FAILED
+    types = await _event_types(db_session, run.id)
+    assert types[-1] == "run.failed"
+    assert types.index("review.rejected") < types.index("run.failed")
+    terminal = await _terminal_events(db_session, run.id)
+    assert len(terminal) == 1
+    assert terminal[0].payload_json["error_code"] == "review_rejected"
+
+
+async def test_publish_failure_emits_run_failed_with_error_code(
+    db_session, user_factory, monkeypatch
+) -> None:
+    """publish_batch 异常：run.failed 终态事件带稳定 error_code=publish_error（G1）。"""
+    from app.agent_artifacts.service import PublishBlocked
+
+    run, attempt, _, _ = await _setup_run(db_session, user_factory)
+    _, draft, _ = await _make_draft(db_session, run)
+
+    async def boom(self, review_batch_id: str, *, worker_id: str):
+        raise PublishBlocked("publish exploded")
+
+    monkeypatch.setattr(ArtifactService, "publish_batch", boom)
+
+    engine, _, _ = _make_engine(
+        db_session,
+        actions=[
+            SubmitReview(
+                action="submit_review",
+                artifact_draft_ids=(draft.id,),
+                completion_text="分析",
+                summary="瑞幸品牌分析",
+            ),
+        ],
+        decisions=[ReviewDecision(decision="approve")],
+    )
+    outcome = await engine.run(
+        run=run,
+        attempt_id=attempt.id,
+        profile=get_profile("session_analyst_v1"),
+        messages=[ChatMessage(role="user", content="分析瑞幸品牌")],
+    )
+    assert outcome.status == RunStatus.FAILED
+    types = await _event_types(db_session, run.id)
+    assert types[-1] == "run.failed"
+    terminal = await _terminal_events(db_session, run.id)
+    assert len(terminal) == 1
+    assert terminal[0].payload_json["error_code"] == "publish_error"
+
+
+async def test_reviewer_exception_emits_run_failed_with_error_code(
+    db_session, user_factory
+) -> None:
+    """Reviewer 调用异常：run.failed 终态事件带稳定 error_code=review_error（G1）。"""
+    run, attempt, _, _ = await _setup_run(db_session, user_factory)
+    _, draft, _ = await _make_draft(db_session, run)
+    # decisions 为空：FakeReviewerGateway 抛 AssertionError，走 _abort_review 收口
+    engine, _, _ = _make_engine(
+        db_session,
+        actions=[
+            SubmitReview(
+                action="submit_review",
+                artifact_draft_ids=(draft.id,),
+                completion_text="分析",
+                summary="瑞幸品牌分析",
+            ),
+        ],
+        decisions=[],
+    )
+    outcome = await engine.run(
+        run=run,
+        attempt_id=attempt.id,
+        profile=get_profile("session_analyst_v1"),
+        messages=[ChatMessage(role="user", content="分析瑞幸品牌")],
+    )
+    assert outcome.status == RunStatus.FAILED
+    types = await _event_types(db_session, run.id)
+    assert types[-1] == "run.failed"
+    terminal = await _terminal_events(db_session, run.id)
+    assert len(terminal) == 1
+    assert terminal[0].payload_json["error_code"] == "review_error"
+
+
+async def test_decide_exception_emits_run_failed_with_error_code(
+    db_session, user_factory
+) -> None:
+    """decide 系统异常：run.failed 终态事件带稳定 error_code=model_error（G1）。"""
+    run, attempt, _, _ = await _setup_run(db_session, user_factory)
+    # actions 为空：FakeAgentGateway 抛 AssertionError，按系统错误收口
+    engine, _, _ = _make_engine(db_session, actions=[], decisions=[])
+    outcome = await engine.run(
+        run=run,
+        attempt_id=attempt.id,
+        profile=get_profile("session_analyst_v1"),
+        messages=[ChatMessage(role="user", content="开始")],
+    )
+    assert outcome.status == RunStatus.FAILED
+    types = await _event_types(db_session, run.id)
+    assert types[-1] == "run.failed"
+    terminal = await _terminal_events(db_session, run.id)
+    assert len(terminal) == 1
+    assert terminal[0].payload_json["error_code"] == "model_error"
+
+
+async def test_max_invalid_actions_emits_run_failed_with_error_code(
+    db_session, user_factory
+) -> None:
+    """连续无效动作达上限：run.failed 带 error_code=max_invalid_actions（G1）。"""
+    run, attempt, _, _ = await _setup_run(db_session, user_factory)
+    engine, _, _ = _make_engine(
+        db_session,
+        actions=[
+            SimpleNamespace(action="teleport"),
+            SimpleNamespace(action="teleport"),
+            SimpleNamespace(action="teleport"),
+        ],
+        decisions=[],
+    )
+    outcome = await engine.run(
+        run=run,
+        attempt_id=attempt.id,
+        profile=get_profile("session_analyst_v1"),
+        messages=[ChatMessage(role="user", content="开始")],
+    )
+    assert outcome.status == RunStatus.FAILED
+    terminal = await _terminal_events(db_session, run.id)
+    assert len(terminal) == 1
+    assert terminal[0].event_type == "run.failed"
+    assert terminal[0].payload_json["error_code"] == "max_invalid_actions"
+
+
+# ---------------------------------------------------------------------------
+# 9b. G1：artifact 事件接入统一 Run SSE（§15.3）
+# ---------------------------------------------------------------------------
+
+
+async def test_create_draft_tool_emits_artifact_draft_created_event(
+    db_session, user_factory
+) -> None:
+    """create_draft 工具成功：tool 流程中发 artifact.draft.created（G1/P1）。
+
+    payload 带 artifact_id/module/parent_artifact_id/status（§15.3），
+    顺序在 tool.succeeded 之后、message.completed 之前。
+    """
+    run, attempt, _, _ = await _setup_run(db_session, user_factory)
+    registry = ToolRegistry()
+    registry.register(CreateDraftTool(db_session), category="artifact")
+    engine, _, _ = _make_engine(
+        db_session,
+        actions=[
+            CallTool(
+                action="call_tool",
+                internal_tool_name="create_draft",
+                arguments={
+                    "module": "insight",
+                    "schema_version": "insight_board_v1",
+                    "artifact_type": "insight_board_v1",
+                    "business_fields": {
+                        "parent_artifact_version_id": "pv-1",
+                        "question": "瑞幸",
+                    },
+                    "payload": PAYLOAD_V1,
+                    "evidence_refs": [],
+                },
+                rationale="创建洞察 Draft",
+            ),
+            Complete(action="complete", text="完成"),
+        ],
+        decisions=[],
+        registry=registry,
+    )
+    outcome = await engine.run(
+        run=run,
+        attempt_id=attempt.id,
+        profile=get_profile("session_analyst_v1"),
+        messages=[ChatMessage(role="user", content="分析瑞幸")],
+    )
+    assert outcome.status == RunStatus.COMPLETED
+    rows = (
+        await db_session.scalars(
+            select(AgentEvent)
+            .where(AgentEvent.run_id == run.id)
+            .order_by(AgentEvent.sequence)
+        )
+    ).all()
+    types = [row.event_type for row in rows]
+    assert "artifact.draft.created" in types
+    assert types.index("tool.succeeded") < types.index("artifact.draft.created")
+    assert types.index("artifact.draft.created") < types.index("message.completed")
+    created = rows[types.index("artifact.draft.created")]
+    artifact = await db_session.scalar(
+        select(AgentArtifact).where(AgentArtifact.session_id == run.session_id)
+    )
+    assert artifact is not None
+    payload = created.payload_json
+    assert payload["artifact_id"] == artifact.id
+    assert payload["module"] == "insight"
+    assert payload["parent_artifact_id"] is None
+    assert payload["status"] == "draft"
+    assert payload["version"] == 1
+    assert payload["run_id"] == run.id
+
+
+async def test_update_draft_tool_emits_artifact_draft_updated_event(
+    db_session, user_factory
+) -> None:
+    """update_draft 工具成功：发 artifact.draft.updated，version 为新 revision（G1/P1）。"""
+    run, attempt, _, _ = await _setup_run(db_session, user_factory)
+    _, draft, _ = await _make_draft(db_session, run)
+    registry = ToolRegistry()
+    registry.register(UpdateDraftTool(db_session), category="artifact")
+    engine, _, _ = _make_engine(
+        db_session,
+        actions=[
+            CallTool(
+                action="call_tool",
+                internal_tool_name="update_draft",
+                arguments={
+                    "draft_id": draft.id,
+                    "payload": PAYLOAD_V1,
+                    "evidence_refs": [],
+                },
+                rationale="更新洞察 Draft",
+            ),
+            Complete(action="complete", text="完成"),
+        ],
+        decisions=[],
+        registry=registry,
+    )
+    outcome = await engine.run(
+        run=run,
+        attempt_id=attempt.id,
+        profile=get_profile("session_analyst_v1"),
+        messages=[ChatMessage(role="user", content="分析瑞幸")],
+    )
+    assert outcome.status == RunStatus.COMPLETED
+    rows = (
+        await db_session.scalars(
+            select(AgentEvent)
+            .where(AgentEvent.run_id == run.id)
+            .order_by(AgentEvent.sequence)
+        )
+    ).all()
+    types = [row.event_type for row in rows]
+    assert "artifact.draft.updated" in types
+    assert types.index("tool.succeeded") < types.index("artifact.draft.updated")
+    assert types.index("artifact.draft.updated") < types.index("message.completed")
+    updated = rows[types.index("artifact.draft.updated")]
+    payload = updated.payload_json
+    assert payload["artifact_id"] == draft.artifact_id
+    assert payload["module"] == "insight"
+    assert payload["status"] == "draft"
+    assert payload["version"] == 2
+
+
+async def test_approve_publish_emits_artifact_published_before_message_completed(
+    db_session, user_factory
+) -> None:
+    """原子发布成功：每个发布的 Artifact 发一条 artifact.published（G1/P1）。
+
+    顺序：review.approved → artifact.published → message.completed → run.completed；
+    payload 带 artifact_id/module/parent_artifact_id/status/version（§15.3）。
+    """
+    run, attempt, _, _ = await _setup_run(db_session, user_factory)
+    _, draft, _ = await _make_draft(db_session, run)
+    engine, _, _ = _make_engine(
+        db_session,
+        actions=[
+            SubmitReview(
+                action="submit_review",
+                artifact_draft_ids=(draft.id,),
+                completion_text="品牌分析完成",
+                summary="瑞幸品牌分析",
+            ),
+        ],
+        decisions=[ReviewDecision(decision="approve")],
+    )
+    outcome = await engine.run(
+        run=run,
+        attempt_id=attempt.id,
+        profile=get_profile("session_analyst_v1"),
+        messages=[ChatMessage(role="user", content="分析瑞幸品牌")],
+    )
+    assert outcome.status == RunStatus.COMPLETED
+    rows = (
+        await db_session.scalars(
+            select(AgentEvent)
+            .where(AgentEvent.run_id == run.id)
+            .order_by(AgentEvent.sequence)
+        )
+    ).all()
+    types = [row.event_type for row in rows]
+    assert types.count("artifact.published") == 1
+    assert types.index("review.approved") < types.index("artifact.published")
+    assert types.index("artifact.published") < types.index("message.completed")
+    assert types[-1] == "run.completed"
+    published = rows[types.index("artifact.published")]
+    payload = published.payload_json
+    assert payload["artifact_id"] == draft.artifact_id
+    assert payload["module"] == "insight"
+    assert payload["parent_artifact_id"] is None
+    assert payload["status"] == "published"
+    assert payload["version"] == 1
+    terminal = await _terminal_events(db_session, run.id)
+    assert len(terminal) == 1
+
+
+async def _purge_committed_review_run(
+    user_id: str, session_id: str, run_id: str
+) -> None:
+    """删除 review 路径跨会话测试提交的行（含 review/artifact 链与内部 Run）。"""
+    async with db_engine.begin() as conn:
+        run_ids = select(AgentRun.id).where(AgentRun.session_id == session_id)
+        batch_ids = select(ArtifactReviewBatch.id).where(
+            ArtifactReviewBatch.parent_run_id == run_id
+        )
+        item_ids = select(ArtifactReviewItem.id).where(
+            ArtifactReviewItem.batch_id.in_(batch_ids)
+        )
+        await conn.execute(
+            delete(ArtifactReviewAttempt).where(
+                ArtifactReviewAttempt.review_item_id.in_(item_ids)
+            )
+        )
+        await conn.execute(
+            delete(ArtifactReviewItem).where(ArtifactReviewItem.batch_id.in_(batch_ids))
+        )
+        await conn.execute(
+            delete(ArtifactReviewBatch).where(
+                ArtifactReviewBatch.parent_run_id == run_id
+            )
+        )
+        await conn.execute(
+            delete(ArtifactEvent).where(ArtifactEvent.session_id == session_id)
+        )
+        draft_ids = select(ArtifactDraft.id).where(ArtifactDraft.session_id == session_id)
+        await conn.execute(
+            delete(ArtifactDraftRevision).where(
+                ArtifactDraftRevision.draft_id.in_(draft_ids)
+            )
+        )
+        await conn.execute(
+            delete(ArtifactDraft).where(ArtifactDraft.session_id == session_id)
+        )
+        await conn.execute(
+            delete(AgentArtifact).where(AgentArtifact.session_id == session_id)
+        )
+        await conn.execute(delete(AgentEvent).where(AgentEvent.run_id.in_(run_ids)))
+        await conn.execute(
+            delete(AgentMessage).where(AgentMessage.session_id == session_id)
+        )
+        await conn.execute(delete(AgentStep).where(AgentStep.run_id.in_(run_ids)))
+        await conn.execute(
+            delete(AgentRunAttempt).where(AgentRunAttempt.run_id.in_(run_ids))
+        )
+        # agent_runs.parent_run_id 自引用：先删 Reviewer 内部子 Run，再删父 Run
+        # （InnoDB 单语句多行删除自引用 RESTRICT 会失败）。
+        await conn.execute(delete(AgentRun).where(AgentRun.parent_run_id == run_id))
+        await conn.execute(delete(AgentRun).where(AgentRun.session_id == session_id))
+        await conn.execute(delete(AgentSession).where(AgentSession.id == session_id))
+        await conn.execute(delete(User).where(User.id == user_id))
+
+
+async def test_live_stream_reject_ends_with_run_failed() -> None:
+    """跨会话在线消费（reader 独立会话）：reject 路径的 SSE 流以 run.failed
+    终态事件收口——流必须结束，不能让前端停在中间态（§5.8/G1 P0）。"""
+    user_id, session_id, run_id = await _create_committed_agent_run()
+    broker = AgentEventBroker()
+    try:
+        async with SessionFactory() as writer:
+            repo = AgentRunRepository(writer)
+            attempt = await repo.begin_attempt(run_id)
+            assert await repo.claim_lease(run_id, "worker", 300)
+            run = await writer.get(AgentRun, run_id)
+            assert run is not None
+            _, draft, _ = await ArtifactService(writer).create_or_get_draft(
+                session_id=session_id,
+                user_id=user_id,
+                run_id=run_id,
+                module="insight",
+                business_fields={"parent_artifact_version_id": "pv-1", "question": "瑞幸"},
+                schema_version="insight_board_v1",
+                payload=PAYLOAD_V1,
+                evidence_refs=None,
+                artifact_type="insight_board_v1",
+            )
+            await writer.commit()
+            engine = AgentEngine(
+                writer,
+                gateway=FakeAgentGateway(
+                    [
+                        SubmitReview(
+                            action="submit_review",
+                            artifact_draft_ids=(draft.id,),
+                            completion_text="分析",
+                            summary="瑞幸品牌分析",
+                        )
+                    ]
+                ),
+                registry=ToolRegistry(),
+                events=AgentEventStream(writer, broker),
+                reviewer=ReviewerDriver(
+                    writer,
+                    FakeReviewerGateway(
+                        [
+                            ReviewDecision(
+                                decision="reject",
+                                issues=[
+                                    ReviewIssue(code="untrusted", message="数字无法追溯")
+                                ],
+                            )
+                        ]
+                    ),
+                    worker_id="worker",
+                ),
+                worker_id="worker",
+            )
+
+            received: list[str] = []
+
+            async def consume() -> None:
+                async with SessionFactory() as reader:
+                    stream = AgentEventStream(reader, broker)
+                    async for event in stream.stream(run_id, user_id, last_event_id=0):
+                        received.append(event.event_type)
+
+            consumer = asyncio.create_task(consume())
+            await asyncio.sleep(0.05)  # reader 完成重放并进入 broker 等待
+            outcome = await engine.run(
+                run=run,
+                attempt_id=attempt.id,
+                profile=get_profile("session_analyst_v1"),
+                messages=[ChatMessage(role="user", content="分析瑞幸品牌")],
+            )
+            assert outcome.status == RunStatus.FAILED
+            # reject 修复前：流永远等不到终态事件，这里会超时失败
+            await asyncio.wait_for(consumer, timeout=5)
+    finally:
+        await _purge_committed_review_run(user_id, session_id, run_id)
+
+    assert received[-1] == "run.failed"
+    assert "review.rejected" in received
+    assert received.index("review.rejected") < received.index("run.failed")
+    assert sum(1 for t in received if t in _TERMINAL_TYPES) == 1
