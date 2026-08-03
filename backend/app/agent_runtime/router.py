@@ -31,6 +31,7 @@ from app.agent_runtime.models import AgentMessage, AgentRun, AgentSession
 from app.agent_runtime.repository import AgentRunRepository, utc_now
 from app.agent_runtime.sse import sse_event_chunks
 from app.agent_runtime.state import InvalidRunTransition
+from app.agent_runtime.tools.factory import load_channel_permissions
 from app.core.config import get_settings
 from app.db.session import get_db
 from app.identity.dependencies import CurrentUser
@@ -155,20 +156,23 @@ def get_agent_event_broker(request: Request) -> AgentEventBroker:
     return request.app.state.agent_event_broker
 
 
-def get_kol_detail_service(
+async def get_kol_detail_service(
     db: Annotated[AsyncSession, Depends(get_db)],
     request: Request,
+    user: CurrentUser,
 ) -> KolDetailRunService:
     """构建绑定请求会话的 KolDetailRunService；引擎来自进程级 engine_factory。
 
     worker_id 与引擎构造时一致，保证 ``_start_fresh_run`` 中 claim 的租约能由
-    同一引擎 transition（Test kol_detail 装配约定）。
+    同一引擎 transition（Test kol_detail 装配约定）。渠道权限按当前用户查询
+    注入（设计 §5.1），平台型 MCP 工具只对已授权渠道可见。
     """
     engine = None
     factory = getattr(request.app.state, "agent_engine_factory", None)
     worker_id = "api-kol-detail"
     if factory is not None:
-        engine = factory(db, worker_id=worker_id)
+        channel_permissions = await load_channel_permissions(db, user.id)
+        engine = factory(db, worker_id=worker_id, channel_permissions=channel_permissions)
     return KolDetailRunService(db, engine=engine, worker_id=worker_id)
 
 
@@ -324,7 +328,9 @@ async def get_session(
                     AgentRun.session_id == session_id,
                     AgentRun.visibility == "user",
                 )
-                .order_by(AgentRun.id)
+                # 稳定排序（§6.4）：created_at 升序 + id tie-break；前端取最后一
+                # 个用户可见 Run 作为恢复锚点，不再受随机 uuid 顺序影响。
+                .order_by(AgentRun.created_at, AgentRun.id)
             )
         ).all()
     )

@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
@@ -104,7 +105,7 @@ class AgentEngine:
         worker_id: str,
         repo: AgentRunRepository | None = None,
         context_builder: SessionContextBuilder | None = None,
-        channel_permissions: Any = (),
+        channel_permissions: Iterable[str] = (),
         lease_seconds: int = 300,
     ) -> None:
         self._db = db

@@ -207,7 +207,7 @@ async def _make_executor(db_session, *, worker: str = "exec-worker") -> AgentRun
     events = AgentEventStream(db_session, broker)
     reviewer = ReviewerDriver(db_session, _FakeReviewerGateway(), worker_id=worker)
 
-    def engine_factory(db, worker_id):
+    def engine_factory(db, worker_id, channel_permissions=()):
         return AgentEngine(
             db, gateway=gateway, registry=ToolRegistry(), events=events,
             reviewer=reviewer, worker_id=worker_id,
@@ -632,7 +632,7 @@ async def test_recovery_reclaim_uses_distinct_worker_id(db_session, user_factory
     await db_session.flush()
     seen_worker_ids: list[str] = []
 
-    def engine_factory(db, worker_id):
+    def engine_factory(db, worker_id, channel_permissions=()):
         seen_worker_ids.append(worker_id)
         gateway = FakeAgentGateway([Complete(action="complete", text="恢复完成")])
         broker = AgentEventBroker()

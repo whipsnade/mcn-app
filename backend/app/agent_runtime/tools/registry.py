@@ -4,7 +4,9 @@
 
 1. **Profile 分类**：工具按分类（MCP / history / calculation / artifact /
    kol_detail，见 profiles.TOOL_CATEGORIES）注册，只有 Profile
-   ``allowed_tool_categories`` 允许的分类可见；
+   ``allowed_tool_categories`` 允许的分类可见；Profile 还可声明
+   ``mcp_tool_allowlist``（如 kol_detail_v1 的达人详情/热帖名单，设计
+   §5.1），此时 MCP 工具进一步按内部名名单过滤；
 2. **实时审核状态**：MCP 工具来自 ``mcp_tool_catalog``（通过注入的目录源），
    只有 ``review_status == "approved"`` 且 ``is_enabled`` 可见；
 3. **用户渠道权限**：MCP 工具按其服务对应渠道，与用户的渠道权限求交。
@@ -225,6 +227,10 @@ class ToolRegistry:
             if entry.category not in profile.allowed_tool_categories:
                 continue
             if entry.category == MCP_TOOLS:
+                if profile.mcp_tool_allowlist is not None and (
+                    entry.internal_name not in profile.mcp_tool_allowlist
+                ):
+                    continue
                 if entry.review_status != "approved" or not entry.is_enabled:
                     continue
                 if entry.channel is not None and entry.channel not in granted:
@@ -258,6 +264,12 @@ class ToolRegistry:
         if entry.category not in profile.allowed_tool_categories:
             raise UnknownToolError(f"tool is not allowed by profile: {internal_name!r}")
         if entry.category == MCP_TOOLS:
+            if profile.mcp_tool_allowlist is not None and (
+                entry.internal_name not in profile.mcp_tool_allowlist
+            ):
+                raise UnknownToolError(
+                    f"tool is not in profile mcp allowlist: {internal_name!r}"
+                )
             if entry.review_status != "approved" or not entry.is_enabled:
                 raise UnknownToolError(f"tool is not approved or enabled: {internal_name!r}")
             if entry.channel is not None and entry.channel not in frozenset(channel_permissions):

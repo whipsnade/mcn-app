@@ -1,10 +1,9 @@
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.router import api_router
@@ -14,62 +13,17 @@ from app.agent_runtime.executor import AgentRunExecutor
 from app.agent_runtime.model_gateway import AgentModelGateway
 from app.agent_runtime.recovery import RecoveryLoop
 from app.agent_runtime.reviewer import ReviewerDriver
+from app.agent_runtime.tools.factory import AgentToolRegistryFactory, resolve_allowlist_entry
 from app.agent_runtime.tools.mcp import AgentMcpTool
-from app.agent_runtime.tools.registry import ToolRegistry
 from app.core.config import get_settings
 from app.db.session import SessionFactory
 from app.mcp_gateway.contracts import DataTapService
-from app.mcp_gateway.models import McpToolCatalog
-from app.mcp_gateway.registry import DYNAMIC_TOOL_ALLOWLIST
 from app.model.dependencies import get_model_adapter
-from app.mcp_gateway.service import (
-    get_mcp_transport,
-    refresh_approved_datatap_tools,
-)
+from app.mcp_gateway.service import get_mcp_transport, refresh_approved_datatap_tools
 
 # 新 Agent 运行时默认租约时长 / 恢复扫描间隔（Task 15）。
 AGENT_LEASE_SECONDS = 300
 RECOVERY_INTERVAL_SECONDS = 30
-
-
-def _resolve_remote_entry(service: DataTapService, internal_tool_name: str):
-    """从审核 allowlist 解析 (remote_name, description, output_schema)；未收录返回 None。
-
-    UAT 发现：实时 DataTap 网关以审核内部名（allowlist key，如 ``match_best_tag``）
-    暴露 MCP 工具，allowlist 值里的旧式 remote_name（``datatap.insight.*.v1``）已与
-    网关不同步，直接调用会返回 ``Unknown tool``。因此 remote_name 一律取内部名，
-    与实际网关工具名保持一致（见 2026-08-02-agent-runtime-uat.md Incident）。
-    """
-    entry = DYNAMIC_TOOL_ALLOWLIST.get(service, {}).get(internal_tool_name)
-    if entry is None:
-        return None
-    _stale_remote_name, description, output_schema = entry
-    return (internal_tool_name, description, output_schema)
-
-
-async def _load_catalog(db):
-    return (await db.scalars(select(McpToolCatalog))).all()
-
-
-def _make_mcp_tool(db, row) -> AgentMcpTool | None:
-    """目录行 → AgentMcpTool（未在 allowlist 内不挂执行器，工具不可调用）。"""
-    try:
-        service = DataTapService(row.service_slug)
-    except ValueError:
-        return None
-    entry = _resolve_remote_entry(service, row.internal_tool_name)
-    if entry is None:
-        return None
-    remote_name, _description, output_schema = entry
-    return AgentMcpTool(
-        internal_name=row.internal_tool_name,
-        service=service,
-        remote_name=remote_name,
-        input_schema=row.input_schema_json,
-        output_schema=output_schema,
-        db_session=db,
-        transport=get_mcp_transport(),
-    )
 
 
 def _make_recovery_tool(db, call) -> AgentMcpTool | None:
@@ -78,7 +32,7 @@ def _make_recovery_tool(db, call) -> AgentMcpTool | None:
         service = DataTapService(call.service)
     except ValueError:
         return None
-    entry = _resolve_remote_entry(service, call.internal_tool_name)
+    entry = resolve_allowlist_entry(service, call.internal_tool_name)
     if entry is None:
         return None
     remote_name, _description, output_schema = entry
@@ -94,7 +48,7 @@ def _make_recovery_tool(db, call) -> AgentMcpTool | None:
 
 
 def create_agent_runtime() -> tuple[
-    AgentRunExecutor, RecoveryLoop, AgentEventBroker, Callable[[AsyncSession, str], AgentEngine]
+    AgentRunExecutor, RecoveryLoop, AgentEventBroker, Callable[..., AgentEngine]
 ]:
     """构建进程级 Agent 执行器 + 恢复循环（共享一个事件 broker）。
 
@@ -106,17 +60,22 @@ def create_agent_runtime() -> tuple[
     额外返回 ``broker`` 与 ``engine_factory``：Task 19 API 的 SSE 路由共享
     broker（同进程事件即时唤醒），kol-details 路由用 ``engine_factory`` 构建
     绑定请求会话的 ``AgentEngine`` 驱动 ``KolDetailRunService``。
+
+    ``engine_factory`` 的 ToolRegistry 由 ``AgentToolRegistryFactory``（设计
+    §5.1 生产工具装配唯一入口）构建：注册 history/calculation/artifact 内部
+    工具并接入审核 MCP 目录；``channel_permissions`` 由调用方（executor 按 Run
+    用户、kol-details 路由按当前用户）查询注入。
     """
     executor_worker_id = f"agent-{os.getpid()}"
     recovery_worker_id = f"recovery-{os.getpid()}"
     broker = AgentEventBroker()
+    tool_registry_factory = AgentToolRegistryFactory()
 
-    def engine_factory(db: AsyncSession, worker_id: str) -> AgentEngine:
+    def engine_factory(
+        db: AsyncSession, worker_id: str, channel_permissions: Iterable[str] = ()
+    ) -> AgentEngine:
         gateway = AgentModelGateway(get_model_adapter(), db=db)
-        registry = ToolRegistry(
-            catalog_source=lambda: _load_catalog(db),
-            mcp_executor_factory=lambda row: _make_mcp_tool(db, row),
-        )
+        registry = tool_registry_factory.build(db)
         return AgentEngine(
             db,
             gateway=gateway,
@@ -124,6 +83,7 @@ def create_agent_runtime() -> tuple[
             events=AgentEventStream(db, broker),
             reviewer=ReviewerDriver(db, gateway, worker_id=worker_id),
             worker_id=worker_id,
+            channel_permissions=channel_permissions,
         )
 
     executor = AgentRunExecutor(

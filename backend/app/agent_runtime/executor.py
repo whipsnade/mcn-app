@@ -30,6 +30,7 @@ from app.agent_runtime.models import AgentMessage, AgentRun, AgentRunAttempt
 from app.agent_runtime.profiles import get_profile
 from app.agent_runtime.repository import AgentRunRepository, utc_now
 from app.agent_runtime.state import InvalidRunTransition, RunStatus
+from app.agent_runtime.tools.factory import load_channel_permissions
 from app.model.contracts import ChatMessage
 
 logger = logging.getLogger(__name__)
@@ -40,16 +41,17 @@ class AgentRunExecutor:
 
     ``session_factory`` 必须是一个可异步上下文管理的会话工厂
     （``async with session_factory() as db`` 产生 :class:`AsyncSession`）；
-    ``engine_factory`` 接收 ``(会话, worker_id)`` 并返回绑定该会话与租约
-    worker 的 :class:`AgentEngine`。测试可注入
-    ``lambda: <共享 AsyncSession 的上下文管理器>``。
+    ``engine_factory`` 接收 ``(会话, worker_id, channel_permissions=...)`` 并
+    返回绑定该会话、租约 worker 与用户渠道权限的 :class:`AgentEngine`
+    （渠道权限由执行器按 Run 的 ``user_id`` 实时查询注入，设计 §5.1）。
+    测试可注入 ``lambda: <共享 AsyncSession 的上下文管理器>``。
     """
 
     def __init__(
         self,
         *,
         session_factory: Callable[[], AbstractAsyncContextManager[AsyncSession]],
-        engine_factory: Callable[[AsyncSession, str], AgentEngine],
+        engine_factory: Callable[..., AgentEngine],
         worker_id: str,
         lease_seconds: int = 300,
         claim_interval_seconds: float = 1.0,
@@ -159,7 +161,10 @@ class AgentRunExecutor:
         run, attempt = prepared
         try:
             messages = await self._build_messages(db, run)
-            engine = self._engine_factory(db, worker_id)
+            channel_permissions = await load_channel_permissions(db, run.user_id)
+            engine = self._engine_factory(
+                db, worker_id, channel_permissions=channel_permissions
+            )
             outcome = await engine.run(
                 run=run,
                 attempt_id=attempt.id,

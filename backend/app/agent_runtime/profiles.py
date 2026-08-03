@@ -23,6 +23,12 @@ TOOL_CATEGORIES: frozenset[str] = frozenset(
     {MCP_TOOLS, HISTORY_TOOLS, CALCULATION_TOOLS, ARTIFACT_TOOLS, KOL_DETAIL_TOOLS}
 )
 
+# kol_detail_v1 可用的 MCP 工具明确名单（设计 §5.1）：达人详情 + 原帖/热帖查询。
+# 名字对齐 mcp_gateway.registry.DYNAMIC_TOOL_ALLOWLIST 的审核内部名：
+# - kol_detail（social-grow-mcp）：指定平台达人详情与趋势画像；
+# - query_raw_posts（insight-cube-mcp）：社媒原帖明细检索。
+KOL_DETAIL_MCP_TOOL_ALLOWLIST: frozenset[str] = frozenset({"kol_detail", "query_raw_posts"})
+
 
 @dataclass(frozen=True)
 class AgentProfile:
@@ -31,6 +37,9 @@ class AgentProfile:
     ``allowed_actions`` 必须是四种动作协议（schemas.FOUR_ACTIONS）的子集。
     ``allowed_tool_categories`` 必须是 TOOL_CATEGORIES 词汇表的子集，且是集合
     而非有序序列——Profile 仍不编码任何固定工具调用顺序。
+    ``mcp_tool_allowlist`` 是可选的 MCP 内部工具名明确名单：为 None 时整个
+    MCP_TOOLS 分类按审核/渠道过滤放行；非 None 时 Registry 只放行名单内的
+    MCP 工具（设计 §5.1，kol_detail_v1 的达人详情/热帖名单）。
     ``output_schema`` 是短描述符：``agent_actions``（四种动作协议）/
     ``review_decision``（approve/revise/reject，独立于动作协议）/
     ``utility_json``（对应强类型 Utility 输出）。
@@ -44,6 +53,7 @@ class AgentProfile:
     max_context_budget: int
     output_schema: str
     system_prompt_key: str
+    mcp_tool_allowlist: frozenset[str] | None = None
 
     def __post_init__(self) -> None:
         if not self.allowed_actions.issubset(FOUR_ACTIONS):
@@ -71,6 +81,7 @@ def _make_profile(
     requires_reviewer: bool,
     max_context_budget: int,
     output_schema: str,
+    mcp_tool_allowlist: frozenset[str] | None = None,
 ) -> AgentProfile:
     return AgentProfile(
         name=name,
@@ -81,6 +92,7 @@ def _make_profile(
         max_context_budget=max_context_budget,
         output_schema=output_schema,
         system_prompt_key=f"{name}_{version}",
+        mcp_tool_allowlist=mcp_tool_allowlist,
     )
 
 
@@ -109,16 +121,20 @@ PROFILES: dict[str, AgentProfile] = {
             max_context_budget=32_000,
             output_schema="review_decision",
         ),
-        # 点击圈选达人的轻量 Run：缓存/MCP 读详情后发布 kol_detail_v2。
-        # 点击触发的无澄清交互，故不允许 ask_user。
+        # 点击圈选达人的轻量 Run：缓存未命中时经明确 allowlist 的 MCP 工具
+        # （KOL_DETAIL_MCP_TOOL_ALLOWLIST：达人详情 kol_detail + 原帖/热帖
+        # query_raw_posts，非整个 MCP_TOOLS 分类）抓取真实数据，构建
+        # kol_detail_v2 提交 Reviewer 发布；KOL_DETAIL_TOOLS 分类保留给
+        # 只读缓存/详情内部工具。点击触发的无澄清交互，故不允许 ask_user。
         _make_profile(
             name="kol_detail",
             version="v1",
             allowed_actions=frozenset({"call_tool", "submit_review", "complete"}),
-            allowed_tool_categories=frozenset({KOL_DETAIL_TOOLS, ARTIFACT_TOOLS}),
+            allowed_tool_categories=frozenset({MCP_TOOLS, KOL_DETAIL_TOOLS, ARTIFACT_TOOLS}),
             requires_reviewer=True,
             max_context_budget=32_000,
             output_schema="agent_actions",
+            mcp_tool_allowlist=KOL_DETAIL_MCP_TOOL_ALLOWLIST,
         ),
         # 标题、Run 摘要、建议等后台轻量任务：只输出受控结构，不需要 Reviewer。
         _make_profile(
@@ -147,6 +163,7 @@ __all__ = [
     "AgentProfile",
     "CALCULATION_TOOLS",
     "HISTORY_TOOLS",
+    "KOL_DETAIL_MCP_TOOL_ALLOWLIST",
     "KOL_DETAIL_TOOLS",
     "MCP_TOOLS",
     "PROFILES",

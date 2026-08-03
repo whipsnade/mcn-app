@@ -13,6 +13,7 @@ from app.agent_runtime.profiles import (
     ARTIFACT_TOOLS,
     CALCULATION_TOOLS,
     HISTORY_TOOLS,
+    KOL_DETAIL_MCP_TOOL_ALLOWLIST,
     KOL_DETAIL_TOOLS,
     MCP_TOOLS,
     TOOL_CATEGORIES,
@@ -29,6 +30,7 @@ EXPECTED_FIELDS = {
     "version",
     "allowed_actions",
     "allowed_tool_categories",
+    "mcp_tool_allowlist",
     "requires_reviewer",
     "max_context_budget",
     "output_schema",
@@ -103,7 +105,19 @@ def test_artifact_reviewer_has_no_tools() -> None:
 
 def test_kol_detail_tool_categories() -> None:
     profile = PROFILES["kol_detail_v1"]
-    assert profile.allowed_tool_categories == frozenset({KOL_DETAIL_TOOLS, ARTIFACT_TOOLS})
+    assert profile.allowed_tool_categories == frozenset(
+        {MCP_TOOLS, KOL_DETAIL_TOOLS, ARTIFACT_TOOLS}
+    )
+
+
+def test_kol_detail_mcp_allowlist_is_explicit() -> None:
+    # kol_detail_v1 的 MCP 访问是明确名单（达人详情 + 原帖/热帖），不是整个分类。
+    profile = PROFILES["kol_detail_v1"]
+    assert profile.mcp_tool_allowlist == KOL_DETAIL_MCP_TOOL_ALLOWLIST
+    assert "kol_detail" in profile.mcp_tool_allowlist
+    assert "query_raw_posts" in profile.mcp_tool_allowlist
+    # 其他 Profile 不受名单限制。
+    assert PROFILES["session_analyst_v1"].mcp_tool_allowlist is None
 
 
 def test_utility_has_no_tools() -> None:

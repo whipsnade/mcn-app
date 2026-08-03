@@ -177,7 +177,7 @@ def _build_executor(
     reviewer = ReviewerDriver(db_session, _FakeReviewerGateway(), worker_id=worker)
     registry = registry or ToolRegistry()
 
-    def engine_factory(db, worker_id):
+    def engine_factory(db, worker_id, channel_permissions=()):
         return AgentEngine(
             db,
             gateway=gateway,
@@ -421,3 +421,64 @@ async def test_graceful_shutdown_stops_claiming_new_runs(db_session, user_factor
     assert await executor.claim_and_process_one() is None
     fresh = await db_session.get(AgentRun, run.id)
     assert fresh.status == RunStatus.QUEUED
+
+
+# ---------------------------------------------------------------------------
+# 4. 渠道权限注入（设计 §5.1）：executor 按 Run 用户查询并传给 engine_factory
+# ---------------------------------------------------------------------------
+
+
+async def test_executor_injects_user_channel_permissions(db_session, user_factory) -> None:
+    from app.identity.models import UserChannelPermission
+
+    run, _, user = await _make_session(db_session, user_factory)
+    now = utc_now()
+    db_session.add(
+        UserChannelPermission(
+            id=str(uuid4()),
+            user_id=user.id,
+            channel="bilibili",
+            is_enabled=True,
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    db_session.add(
+        UserChannelPermission(
+            id=str(uuid4()),
+            user_id=user.id,
+            channel="douyin",
+            is_enabled=False,  # 禁用渠道不得注入
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    await db_session.flush()
+
+    captured: dict[str, Any] = {}
+    gateway = FakeAgentGateway([Complete(action="complete", text="完成")])
+
+    def engine_factory(db, worker_id, channel_permissions=()):
+        captured["channel_permissions"] = channel_permissions
+        broker = AgentEventBroker()
+        events = AgentEventStream(db, broker)
+        reviewer = ReviewerDriver(db, _FakeReviewerGateway(), worker_id=worker_id)
+        return AgentEngine(
+            db,
+            gateway=gateway,
+            registry=ToolRegistry(),
+            events=events,
+            reviewer=reviewer,
+            worker_id=worker_id,
+        )
+
+    executor = AgentRunExecutor(
+        session_factory=lambda: _shared_session(db_session),
+        engine_factory=engine_factory,
+        worker_id="worker",
+        claim_interval_seconds=0.01,
+    )
+    run_id = await executor.claim_and_process_one()
+
+    assert run_id == run.id
+    assert frozenset(captured["channel_permissions"]) == {"bilibili"}
