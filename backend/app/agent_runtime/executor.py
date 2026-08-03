@@ -185,6 +185,9 @@ class AgentRunExecutor:
                 attempt_id=attempt.id,
                 profile=get_profile(run.profile_name),
                 messages=transcript.messages,
+                # G3：显式用户问题锚点（触发消息 / prompt_snapshot 触发上下文），
+                # 引擎不再从消息列表尾部反推（尾部是 tool_result 回放）。
+                user_question=transcript.user_question,
                 # §5.8/§10.5：用户可见 Run 注入 thinking sink，主 Agent 真实
                 # thinking 实时 SSE；内部 Run（Reviewer/Utility）为 None 不注入。
                 thinking_sink=engine.thinking_sink_for(run),

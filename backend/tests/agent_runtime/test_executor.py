@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from typing import Any
@@ -688,3 +689,52 @@ async def test_live_stream_executor_crash_ends_with_run_failed() -> None:
     assert sum(
         1 for t in received if t in ("run.completed", "run.failed", "run.cancelled")
     ) == 1
+
+
+async def test_takeover_feeds_transcript_user_question_to_memory_header(
+    db_session, user_factory
+) -> None:
+    """接管恢复（G3）：transcript 的显式用户问题锚点经执行器传给引擎——
+    恢复后 Memory Header 的 current_user_message 是触发消息，而不是会话尾部
+    tool_result 回放 JSON（role="user"）。"""
+    run, _, _ = await _make_session(db_session, user_factory)
+    repo = AgentRunRepository(db_session)
+    attempt1 = await repo.begin_attempt(run.id)
+    await repo.claim_lease(run.id, "worker-a", 300)
+    # 崩溃残留：一个已完成 tool_call Step；回放后对话尾部是 tool_result 用户消息。
+    db_session.add(
+        AgentStep(
+            id=str(uuid4()),
+            run_id=run.id,
+            attempt_id=attempt1.id,
+            sequence=1,
+            step_type="tool_call",
+            input_json={"internal_tool_name": "noop_calc", "arguments": {}},
+            output_json={
+                "status": "success",
+                "safe_summary": "noop ok",
+                "evidence_id": None,
+                "cursor": None,
+                "truncated": False,
+                "error_type": None,
+            },
+            status="completed",
+            visibility="user",
+            created_at=utc_now(),
+        )
+    )
+    await db_session.flush()
+    # 租约过期 → worker-b 接管。
+    run.lease_expires_at = utc_now() - timedelta(seconds=1)
+    await db_session.flush()
+
+    gateway = FakeAgentGateway([Complete(action="complete", text="继续分析完成")])
+    executor = _build_executor(db_session, gateway=gateway)
+
+    outcome = await executor.process_run(run.id, worker_id="worker-b")
+
+    assert outcome == RunStatus.COMPLETED
+    assert gateway.calls
+    header = json.loads(gateway.calls[0]["messages"][0].content)
+    assert header["current_user_message"] == "帮我分析品牌"
+    assert "tool_result" not in header["current_user_message"]

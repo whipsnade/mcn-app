@@ -223,6 +223,7 @@ class AgentEngine:
         thinking_sink: Any = None,
         resume_step: AgentStep | None = None,
         resumed_by: str | None = None,
+        user_question: str | None = None,
     ) -> RunOutcome:
         """执行一次用户 Run：直到终态 / clarification / paused / cancelled。
 
@@ -231,9 +232,16 @@ class AgentEngine:
         ``logical_call_id``，协调器幂等回放，绝不重发、不重复扣费）。
         ``resumed_by`` 区分本次执行是首次启动（None）、用户主动 resume
         （``"user"``）还是系统接管（``"system"``），供 run.resumed 事件归因。
+        ``user_question`` 是显式用户问题锚点（G3）：恢复路径由
+        ``RunTranscriptLoader`` 从触发消息（或 prompt_snapshot 触发上下文）
+        显式给出——恢复后的会话尾部是 tool_result 回放（``role="user"``），
+        从消息列表反推会把结构化工具结果误当用户问题（Memory Header /
+        Reviewer 上下文被污染）。缺省时兼容反推消息列表最后一条 user 消息
+        （首次启动路径：触发消息本身就是唯一 user 消息）。
         """
         conversation = list(messages)
-        user_question = self._current_user_question(conversation)
+        if user_question is None:
+            user_question = self._current_user_question(conversation)
         next_sequence = await self._next_step_sequence(run.id)
         assistant_message_id: str | None = None
 
@@ -902,8 +910,17 @@ class AgentEngine:
         return fresh.status == RunStatus.RUNNING
 
     async def _cancel_requested(self, run: AgentRun) -> bool:
-        fresh = await self._repo.lock_run(run.id)
-        return bool(fresh.cancel_requested)
+        # 纯读检查点（列查询，不经 identity map）：不加行锁。事件 append 是引擎
+        # 的提交点（见 AgentEventStream.append），提交后 REPEATABLE-READ 快照已
+        # 刷新，纯读即可见到 API 侧已提交的取消标记；若用 FOR UPDATE，会在
+        # tool.started 提交后重新持有 Run 行 X 锁（未提交），阻塞 MCP 协调器
+        # 独立会话 INSERT agent_tool_calls 的外键父行 S 锁检查（50s 锁等待超时，
+        # 基线回归 0a66fa9 引入，G3 真实并发验证暴露）。
+        return bool(
+            await self._db.scalar(
+                select(AgentRun.cancel_requested).where(AgentRun.id == run.id)
+            )
+        )
 
     async def _guard_attempt_limits(self, run: AgentRun, attempt_id: str) -> bool:
         """Attempt 保护（§七）：50 决策 / 30 分钟达阈值 → paused，返回 True。"""

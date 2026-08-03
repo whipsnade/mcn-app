@@ -14,10 +14,12 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
+import pytest
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import func, select
 
@@ -32,16 +34,24 @@ from app.agent_artifacts.payloads.kol_detail import KolDetailV2
 from app.agent_runtime.engine import AgentEngine
 from app.agent_runtime.evidence import EvidenceWriter
 from app.agent_runtime.events import AgentEventBroker, AgentEventStream
-from app.agent_runtime.kol_detail import KolDetailRunService
+from app.agent_runtime.kol_detail import (
+    KolDetailRunFailed,
+    KolDetailRunService,
+    build_kol_detail_prompt_snapshot,
+    kol_detail_trigger_content,
+)
 from app.agent_runtime.models import (
     AgentEvent,
+    AgentMessage,
     AgentRun,
     AgentRunAttempt,
     AgentSession,
     AgentStep,
     AgentToolCall,
+    EvidenceItem,
 )
-from app.agent_runtime.repository import utc_now
+from app.agent_runtime.profiles import get_profile
+from app.agent_runtime.repository import AgentRunRepository, utc_now
 from app.agent_runtime.reviewer import ReviewDecision, ReviewerDriver
 from app.agent_runtime.schemas import CallTool, SubmitReview
 from app.agent_runtime.state import RunStatus
@@ -49,6 +59,7 @@ from app.agent_runtime.thinking import AgentEventThinkingSink
 from app.agent_runtime.tools.artifacts import CreateDraftTool
 from app.agent_runtime.tools.contracts import ToolResult
 from app.agent_runtime.tools.registry import ToolRegistry
+from app.agent_runtime.transcript import RunTranscriptLoader
 
 PLATFORM = "xiaohongshu"
 KOL_UID = "k1"
@@ -936,3 +947,338 @@ def test_builder_rejects_empty_host_http_url() -> None:
         lim["code"] for lim in build.payload["limitations"]
     }
     KolDetailV2.model_validate(build.payload)
+
+
+# ---------------------------------------------------------------------------
+# 6. 请求协调（G3）：prompt_snapshot 触发上下文 / 失败收口 / 崩溃接管锚点
+# ---------------------------------------------------------------------------
+
+
+async def test_create_persists_kol_detail_prompt_snapshot(db_session, user_factory) -> None:
+    """kol_detail Run 创建时持久化 platform/kol_uid 触发上下文（G3 恢复锚点）。"""
+    user = await user_factory()
+    session = await _make_session(db_session, user.id)
+    evidence = await _make_evidence(db_session, user.id, session.id)
+    gateway, service = _make_service(
+        db_session,
+        actions=_make_actions(db_session, evidence, _cache_state()),
+        evidence=evidence,
+        now_fn=lambda: T0,
+    )
+
+    summary = await service.create(user.id, session.id, PLATFORM, KOL_UID)
+
+    assert summary.cached is False
+    run_row = await db_session.get(AgentRun, summary.run_id)
+    assert run_row is not None
+    snapshot = run_row.prompt_snapshot_json or {}
+    trigger = snapshot.get("kol_detail") or {}
+    assert trigger.get("platform") == PLATFORM
+    assert trigger.get("kol_uid") == KOL_UID
+
+
+async def test_engine_failure_commits_terminal_state_and_releases_working_head(
+    db_session, user_factory
+) -> None:
+    """引擎失败收口（G3 协调行已提交后）：Run 落 failed 终态、working head 释放、
+    Artifact 身份保留——下一次 create 直接接管，不撞 artifact_busy。"""
+    user = await user_factory()
+    session = await _make_session(db_session, user.id)
+    evidence = await _make_evidence(db_session, user.id, session.id)
+    gateway, service = _make_service(
+        db_session,
+        actions=[],  # decide 立即耗尽抛错 → 引擎 model_error 收口
+        evidence=evidence,
+        now_fn=lambda: T0,
+    )
+
+    with pytest.raises(KolDetailRunFailed):
+        await service.create(user.id, session.id, PLATFORM, KOL_UID)
+
+    run_row = await db_session.scalar(
+        select(AgentRun).where(
+            AgentRun.session_id == session.id,
+            AgentRun.profile_name == "kol_detail_v1",
+        )
+    )
+    assert run_row is not None
+    assert run_row.status == RunStatus.FAILED
+    assert run_row.lease_owner is None
+    artifact = await db_session.scalar(
+        select(AgentArtifact).where(AgentArtifact.session_id == session.id)
+    )
+    assert artifact is not None
+    draft = await db_session.scalar(
+        select(ArtifactDraft).where(ArtifactDraft.artifact_id == artifact.id)
+    )
+    assert draft is not None
+    assert draft.owner_run_id is None  # working head 已释放
+    assert draft.status == "failed"
+    failed_event = await db_session.scalar(
+        select(AgentEvent).where(
+            AgentEvent.run_id == run_row.id,
+            AgentEvent.event_type == "run.failed",
+        )
+    )
+    assert failed_event is not None
+
+    # 失败后可接管：下一次 create 新建 Run 并成功发布。
+    gateway.actions = _make_actions(db_session, evidence, _cache_state())
+    summary = await service.create(user.id, session.id, PLATFORM, KOL_UID)
+    assert summary.cached is False
+    assert summary.run_id is not None
+    assert summary.run_id != run_row.id
+    assert summary.detail is not None
+
+
+async def test_engine_exception_settles_run_failed_and_releases_working_head(
+    db_session, user_factory, monkeypatch
+) -> None:
+    """引擎抛出未捕获异常（G3）：协调行已提交不能整单回滚——服务把 Run 置
+    failed、释放 working head 并提交，再把原异常抛给上层（不遮蔽）。"""
+    user = await user_factory()
+    session = await _make_session(db_session, user.id)
+    # 服务的异常路径会 rollback（会话内全部 ORM 对象过期）：先把 id 取到局部变量。
+    user_id, session_id = user.id, session.id
+    evidence = await _make_evidence(db_session, user_id, session_id)
+    evidence_id = evidence.id
+    _, service = _make_service(
+        db_session,
+        actions=_make_actions(db_session, evidence, _cache_state()),
+        evidence=evidence,
+        now_fn=lambda: T0,
+    )
+
+    async def _boom(**kwargs):
+        raise RuntimeError("engine exploded")
+
+    monkeypatch.setattr(service._engine, "run", _boom)
+
+    with pytest.raises(RuntimeError, match="engine exploded"):
+        await service.create(user_id, session_id, PLATFORM, KOL_UID)
+
+    run_row = await db_session.scalar(
+        select(AgentRun).where(
+            AgentRun.session_id == session_id,
+            AgentRun.profile_name == "kol_detail_v1",
+        )
+    )
+    assert run_row is not None
+    assert run_row.status == RunStatus.FAILED
+    draft = await db_session.scalar(
+        select(ArtifactDraft).where(ArtifactDraft.session_id == session_id)
+    )
+    assert draft is not None
+    assert draft.owner_run_id is None
+    assert draft.status == "failed"
+    failed_event = await db_session.scalar(
+        select(AgentEvent).where(
+            AgentEvent.run_id == run_row.id,
+            AgentEvent.event_type == "run.failed",
+        )
+    )
+    assert failed_event is not None
+
+    # 异常收口后新服务实例可正常接管（rollback 已过期旧 ORM 对象，重新查询）。
+    fresh_evidence = await db_session.get(EvidenceItem, evidence_id)
+    gateway2, service2 = _make_service(
+        db_session,
+        actions=_make_actions(db_session, fresh_evidence, _cache_state()),
+        evidence=fresh_evidence,
+        now_fn=lambda: T0,
+    )
+    summary = await service2.create(user_id, session_id, PLATFORM, KOL_UID)
+    assert summary.cached is False
+    assert summary.run_id != run_row.id
+    assert summary.detail is not None
+
+
+async def test_takeover_restores_kol_detail_trigger_context(db_session, user_factory) -> None:
+    """崩溃接管（G3）：会话里先有一条无关用户消息，kol_detail Run 崩溃后被
+    接管时发给模型的触发上下文仍指向正确的 platform/kol_uid（经
+    transcript 显式锚点 + prompt_snapshot，不拿会话最近消息顶替）。"""
+    user = await user_factory()
+    session = await _make_session(db_session, user.id)
+    now = utc_now()
+    # 会话里先有一条无关普通用户消息（绝不可被当作 kol_detail 的触发上下文）。
+    db_session.add(
+        AgentMessage(
+            id=str(uuid4()),
+            session_id=session.id,
+            run_id=None,
+            role="user",
+            content="给我看看上个月的品牌声量",
+            metadata_json=None,
+            sequence=1,
+            created_at=now,
+        )
+    )
+    await db_session.flush()
+    evidence = await _make_evidence(db_session, user.id, session.id)
+
+    # 崩溃残留的 kol_detail Run：running + 过期租约 + prompt_snapshot 触发
+    # 上下文 + 协调行（Artifact/Draft owner）+ 一个已完成的抓取 Step。
+    run = AgentRun(
+        id=str(uuid4()),
+        session_id=session.id,
+        user_id=user.id,
+        input_message_id=None,
+        run_kind="user",
+        visibility="user",
+        profile_name="kol_detail_v1",
+        profile_version="v1",
+        model="test-model",
+        prompt_snapshot_json=build_kol_detail_prompt_snapshot(
+            platform=PLATFORM,
+            kol_uid=KOL_UID,
+            selection_artifact_id=None,
+            selection_version=None,
+        ),
+        status="running",
+        decision_count=0,
+        review_count=0,
+        revision_count=0,
+        started_at=now,
+        lease_owner="dead-worker",
+        lease_expires_at=now - timedelta(seconds=1),
+    )
+    db_session.add(run)
+    await db_session.flush()
+    attempt1 = AgentRunAttempt(
+        id=str(uuid4()), run_id=run.id, attempt=1, started_at=now, outcome="running"
+    )
+    db_session.add(attempt1)
+    await db_session.flush()
+    artifact = AgentArtifact(
+        id=str(uuid4()),
+        session_id=session.id,
+        user_id=user.id,
+        module="kol-detail",
+        artifact_type="kol_detail_v2",
+        artifact_key=f"kol-detail:{PLATFORM}:{KOL_UID}",
+        status="draft",
+        latest_version=0,
+        activity_sequence=0,
+        created_at=now,
+        updated_at=now,
+    )
+    db_session.add(artifact)
+    await db_session.flush()
+    db_session.add(
+        ArtifactDraft(
+            id=str(uuid4()),
+            artifact_id=artifact.id,
+            session_id=session.id,
+            owner_run_id=run.id,
+            current_revision=0,
+            status="drafting",
+            review_count=0,
+            revision_count=0,
+            updated_at=now,
+        )
+    )
+    db_session.add(
+        AgentStep(
+            id=str(uuid4()),
+            run_id=run.id,
+            attempt_id=attempt1.id,
+            sequence=1,
+            step_type="tool_call",
+            input_json={
+                "internal_tool_name": "kol_detail_fetch",
+                "arguments": {"platform": PLATFORM, "kol_uid": KOL_UID},
+            },
+            output_json={
+                "status": "success",
+                "safe_summary": "kol detail fetched",
+                "evidence_id": evidence.id,
+                "cursor": None,
+                "truncated": False,
+                "error_type": None,
+            },
+            status="completed",
+            visibility="user",
+            created_at=now,
+        )
+    )
+    await db_session.flush()
+
+    # 接管（与 executor 的过期租约路径一致）：领取 → pause 旧 Attempt →
+    # begin_attempt(resumed) → 重新领取；transcript 重建上下文。
+    repo = AgentRunRepository(db_session)
+    transcript = await RunTranscriptLoader(db_session).load(run)
+    assert transcript.user_question == kol_detail_trigger_content(PLATFORM, KOL_UID)
+    assert transcript.resume_step is None  # 抓取 Step 已完成，无需复用
+    assert await repo.claim_lease(run.id, "worker", 300)
+    assert await repo.pause(run.id, "worker")
+    attempt2 = await repo.begin_attempt(run.id, resumed=True)
+    assert await repo.claim_lease(run.id, "worker", 300)
+
+    # 恢复后不重新抓取：直接 create_draft（复用既有 working head）→ submit。
+    build = build_kol_detail_draft(
+        platform=PLATFORM,
+        kol_uid=KOL_UID,
+        selection_artifact_id=None,
+        selection_version=None,
+        detail=DETAIL,
+        evidence_id=evidence.id,
+        cache_state=_cache_state(),
+    )
+
+    async def submit(resumed_run):
+        draft = await db_session.scalar(
+            select(ArtifactDraft).where(ArtifactDraft.owner_run_id == resumed_run.id)
+        )
+        assert draft is not None
+        return SubmitReview(
+            action="submit_review",
+            artifact_draft_ids=(draft.id,),
+            completion_text="达人详情已完成",
+            summary="达人详情",
+        )
+
+    actions = [
+        CallTool(
+            action="call_tool",
+            internal_tool_name="create_draft",
+            arguments={
+                "module": build.module,
+                "schema_version": build.schema_version,
+                "artifact_type": build.artifact_type,
+                "business_fields": build.business_fields,
+                "payload": build.payload,
+                "evidence_refs": build.evidence_refs,
+            },
+            rationale="创建达人详情 Draft",
+        ),
+        submit,
+    ]
+    gateway, service = _make_service(
+        db_session, actions=actions, evidence=evidence, now_fn=lambda: T0
+    )
+
+    outcome = await service._engine.run(
+        run=run,
+        attempt_id=attempt2.id,
+        profile=get_profile("kol_detail_v1"),
+        messages=transcript.messages,
+        thinking_sink=service._engine.thinking_sink_for(run),
+        resume_step=transcript.resume_step,
+        user_question=transcript.user_question,
+    )
+
+    assert outcome.status == RunStatus.COMPLETED
+    # 发给模型的触发上下文：messages[0] 是 kol_detail 触发消息（含正确
+    # platform/kol_uid），Memory Header 的 current_user_message 同锚点——
+    # 都不是会话里那条无关用户消息。
+    first_context = gateway.calls[0]["messages"]
+    assert first_context[1].content == kol_detail_trigger_content(PLATFORM, KOL_UID)
+    assert "品牌声量" not in first_context[1].content
+    header = json.loads(first_context[0].content)
+    assert header["current_user_message"] == kol_detail_trigger_content(PLATFORM, KOL_UID)
+    assert "品牌声量" not in header["current_user_message"]
+    # 已发布 kol_detail_v2。
+    version = await db_session.scalar(
+        select(AgentArtifactVersion).where(AgentArtifactVersion.source_run_id == run.id)
+    )
+    assert version is not None

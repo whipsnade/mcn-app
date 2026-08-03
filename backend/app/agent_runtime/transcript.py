@@ -1,4 +1,4 @@
-"""Run 对话 transcript 重建（v3 加固 §5.4 / A4）。
+"""Run 对话 transcript 重建（v3 加固 §5.4 / A4 / Gate A G3）。
 
 恢复接管后模型必须看到本 Run 已完成的工具调用与结果，否则必然重复调用已
 settled 的 MCP 工具 → 重复扣费。``RunTranscriptLoader`` 从触发消息 + 本 Run
@@ -14,7 +14,13 @@ settled 的 MCP 工具 → 重复扣费。``RunTranscriptLoader`` 从触发消�
   相同调用时复用该 Step（同一 ``logical_call_id``，协调器幂等回放，绝不
   重发、不重复扣费）——防重不依赖模型记忆；
 - 恢复从最后一个完整 Step 的下一 sequence 继续（引擎 ``_next_step_sequence``
-  取全部 Step 最大 sequence + 1，语义不变）。
+  取全部 Step 最大 sequence + 1，语义不变）；
+- **显式用户问题锚点（G3）**：tool_result 回放同样是 ``role="user"`` 消息，
+  引擎若从消息列表尾部反推「当前用户问题」会把结构化工具结果误当用户意图
+  （Memory Header / Reviewer 上下文被污染）。``RunTranscript.user_question``
+  显式携带触发消息内容，引擎必须优先使用它；kol_detail 等无
+  ``input_message_id`` 的 Run 从 ``prompt_snapshot_json`` 的触发上下文
+  （platform/kol_uid）恢复，绝不回退到会话最近一条普通用户消息。
 """
 
 from __future__ import annotations
@@ -27,6 +33,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_runtime.evidence import EvidenceWriter
+from app.agent_runtime.kol_detail import (
+    KOL_DETAIL_SNAPSHOT_KEY,
+    kol_detail_trigger_content,
+)
 from app.agent_runtime.models import (
     AgentMessage,
     AgentRun,
@@ -40,10 +50,13 @@ from app.model.contracts import ChatMessage
 
 @dataclass(frozen=True)
 class RunTranscript:
-    """一个 Run 的重建上下文：初始 messages + 待复用的崩溃残留 Step。"""
+    """一个 Run 的重建上下文：初始 messages + 待复用的崩溃残留 Step + 锚点。"""
 
     messages: list[ChatMessage]
     resume_step: AgentStep | None
+    # 显式用户问题锚点（G3）：触发消息内容（role="user" 时，否则空串）。
+    # 引擎优先使用它，不再从消息列表尾部反推（尾部可能是 tool_result 回放）。
+    user_question: str
 
 
 class RunTranscriptLoader:
@@ -54,7 +67,8 @@ class RunTranscriptLoader:
 
     async def load(self, run: AgentRun) -> RunTranscript:
         """重建本 Run 的对话上下文（只读，不修改任何持久状态）。"""
-        messages = [await self._trigger_message(run)]
+        trigger = await self._trigger_message(run)
+        messages = [trigger]
         steps = (
             await self._db.scalars(
                 select(AgentStep)
@@ -76,18 +90,26 @@ class RunTranscriptLoader:
                 result = dict(step.output_json or {})
             messages.append(self._action_message(step))
             messages.append(self._result_message(result))
-        return RunTranscript(messages=messages, resume_step=resume_step)
+        return RunTranscript(
+            messages=messages,
+            resume_step=resume_step,
+            user_question=trigger.content if trigger.role == "user" else "",
+        )
 
     # ------------------------------------------------------------------ #
     # 触发消息
     # ------------------------------------------------------------------ #
 
     async def _trigger_message(self, run: AgentRun) -> ChatMessage:
-        """优先取 Run 关联的输入消息，回退到会话最近一条用户消息。"""
+        """优先级：Run 关联输入消息 → ``prompt_snapshot_json`` 触发上下文
+        （kol_detail 等无输入消息 Run 的 G3 恢复锚点）→ 会话最近一条用户消息。"""
         if run.input_message_id is not None:
             message = await self._db.get(AgentMessage, run.input_message_id)
             if message is not None:
                 return ChatMessage(role=message.role, content=message.content)
+        snapshot_trigger = self._snapshot_trigger_message(run)
+        if snapshot_trigger is not None:
+            return snapshot_trigger
         latest = await self._db.scalar(
             select(AgentMessage)
             .where(
@@ -100,6 +122,29 @@ class RunTranscriptLoader:
         if latest is not None:
             return ChatMessage(role="user", content=latest.content)
         return ChatMessage(role="user", content="")
+
+    @staticmethod
+    def _snapshot_trigger_message(run: AgentRun) -> ChatMessage | None:
+        """从 ``prompt_snapshot_json`` 恢复 kol_detail 触发上下文（platform/kol_uid）。
+
+        kol_detail Run 由点击触发、没有 ``input_message_id``：触发上下文在
+        创建时持久化到 ``prompt_snapshot_json``（G3），崩溃接管按它恢复，
+        绝不回退到会话最近一条普通用户消息（可能是完全无关的意图）。
+        """
+        snapshot = run.prompt_snapshot_json
+        if not isinstance(snapshot, dict):
+            return None
+        trigger = snapshot.get(KOL_DETAIL_SNAPSHOT_KEY)
+        if not isinstance(trigger, dict):
+            return None
+        platform = trigger.get("platform")
+        kol_uid = trigger.get("kol_uid")
+        if not platform or not kol_uid:
+            return None
+        return ChatMessage(
+            role="user",
+            content=kol_detail_trigger_content(str(platform), str(kol_uid)),
+        )
 
     # ------------------------------------------------------------------ #
     # 崩溃残留 Step 的回放结果

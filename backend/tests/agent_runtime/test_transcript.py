@@ -17,6 +17,10 @@ import json
 from uuid import uuid4
 
 from app.agent_runtime.evidence import EvidenceWriter
+from app.agent_runtime.kol_detail import (
+    build_kol_detail_prompt_snapshot,
+    kol_detail_trigger_content,
+)
 from app.agent_runtime.models import (
     AgentMessage,
     AgentRun,
@@ -439,3 +443,76 @@ async def test_trigger_message_falls_back_to_latest_user_message(
     transcript = await RunTranscriptLoader(db_session).load(run)
 
     assert transcript.messages[0].content == "换个角度再分析一次"
+
+
+# ---------------------------------------------------------------------------
+# 显式用户问题锚点（G3）
+# ---------------------------------------------------------------------------
+
+
+async def test_user_question_anchor_is_trigger_message_not_tool_result(
+    db_session, user_factory
+) -> None:
+    """transcript 显式携带触发消息作为 ``user_question`` 锚点（G3）：tool_result
+    回放消息同样是 role="user"，引擎不得再从消息列表尾部反推用户问题。"""
+    _, _, run, attempt, _ = await _make_chain(db_session, user_factory)
+    step = _tool_step(
+        run,
+        attempt,
+        sequence=1,
+        status="completed",
+        output={
+            "status": "success",
+            "safe_summary": "声量预览文本",
+            "evidence_id": "ev-1",
+            "cursor": None,
+            "truncated": False,
+            "error_type": None,
+        },
+    )
+    db_session.add(step)
+    await db_session.flush()
+
+    transcript = await RunTranscriptLoader(db_session).load(run)
+
+    # 锚点是触发消息，而不是最后一条 user 角色的 tool_result 回放 JSON。
+    assert transcript.user_question == "帮我分析品牌"
+    assert transcript.messages[0].content == "帮我分析品牌"
+    assert transcript.messages[-1].role == "user"
+    assert "tool_result" in transcript.messages[-1].content
+
+
+async def test_kol_detail_run_trigger_restored_from_prompt_snapshot(
+    db_session, user_factory
+) -> None:
+    """kol_detail Run（无 ``input_message_id``）：从 ``prompt_snapshot_json``
+    恢复 platform/kol_uid 触发上下文（G3），不回退到会话最近一条普通用户消息。"""
+    _, session, run, _, _ = await _make_chain(db_session, user_factory)
+    run.input_message_id = None
+    run.profile_name = "kol_detail_v1"
+    run.prompt_snapshot_json = build_kol_detail_prompt_snapshot(
+        platform="xiaohongshu",
+        kol_uid="k1",
+        selection_artifact_id=None,
+        selection_version=None,
+    )
+    unrelated = AgentMessage(
+        id=str(uuid4()),
+        session_id=session.id,
+        run_id=None,
+        role="user",
+        content="给我看看上个月的品牌声量",
+        metadata_json=None,
+        sequence=2,
+        created_at=utc_now(),
+    )
+    db_session.add(unrelated)
+    await db_session.flush()
+
+    transcript = await RunTranscriptLoader(db_session).load(run)
+
+    expected = kol_detail_trigger_content("xiaohongshu", "k1")
+    assert transcript.messages[0].role == "user"
+    assert transcript.messages[0].content == expected
+    assert "品牌声量" not in transcript.messages[0].content
+    assert transcript.user_question == expected

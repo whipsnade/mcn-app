@@ -2698,3 +2698,93 @@ async def test_live_stream_reject_ends_with_run_failed() -> None:
     assert "review.rejected" in received
     assert received.index("review.rejected") < received.index("run.failed")
     assert sum(1 for t in received if t in _TERMINAL_TYPES) == 1
+
+
+# ---------------------------------------------------------------------------
+# 显式用户问题锚点（G3）
+# ---------------------------------------------------------------------------
+
+
+async def test_explicit_user_question_anchor_wins_over_tool_result_tail(
+    db_session, user_factory
+) -> None:
+    """恢复后的对话尾部是 tool_result 回放（role="user"）：显式 ``user_question``
+    锚点优先于消息列表反推，Memory Header 拿到真实用户问题（G3）。"""
+    run, attempt, _, _ = await _setup_run(db_session, user_factory)
+    engine, gateway, _ = _make_engine(
+        db_session,
+        actions=[Complete(action="complete", text="继续分析完成")],
+        decisions=[],
+    )
+    tool_result_tail = ChatMessage(
+        role="user",
+        content=json.dumps(
+            {"tool_result": {"status": "success", "summary": "声量预览文本"}},
+            ensure_ascii=False,
+        ),
+    )
+    conversation = [
+        ChatMessage(role="user", content="分析瑞幸品牌"),
+        ChatMessage(
+            role="assistant",
+            content=json.dumps({"action": "call_tool", "internal_tool_name": "noop"}),
+        ),
+        tool_result_tail,
+    ]
+
+    outcome = await engine.run(
+        run=run,
+        attempt_id=attempt.id,
+        profile=get_profile("session_analyst_v1"),
+        messages=conversation,
+        user_question="分析瑞幸品牌",
+    )
+
+    assert outcome.status == RunStatus.COMPLETED
+    header = json.loads(gateway.calls[0]["messages"][0].content)
+    # 反推路径会拿到尾部的 tool_result JSON：显式锚点必须覆盖它。
+    assert header["current_user_message"] == "分析瑞幸品牌"
+    assert header["current_user_message"] != tool_result_tail.content
+
+
+async def test_explicit_user_question_anchor_flows_to_reviewer(
+    db_session, user_factory
+) -> None:
+    """显式 ``user_question`` 锚点同步进入 Reviewer 评审上下文（G3）。"""
+    run, attempt, _, _ = await _setup_run(db_session, user_factory)
+    _, draft, _ = await _make_draft(db_session, run)
+    engine, _, reviewer_gateway = _make_engine(
+        db_session,
+        actions=[
+            SubmitReview(
+                action="submit_review",
+                artifact_draft_ids=(draft.id,),
+                completion_text="品牌分析完成",
+                summary="瑞幸品牌分析",
+            ),
+        ],
+        decisions=[ReviewDecision(decision="approve")],
+    )
+    conversation = [
+        ChatMessage(role="user", content="分析瑞幸品牌"),
+        ChatMessage(
+            role="user",
+            content=json.dumps(
+                {"tool_result": {"status": "success", "summary": "声量预览文本"}},
+                ensure_ascii=False,
+            ),
+        ),
+    ]
+
+    outcome = await engine.run(
+        run=run,
+        attempt_id=attempt.id,
+        profile=get_profile("session_analyst_v1"),
+        messages=conversation,
+        user_question="分析瑞幸品牌",
+    )
+
+    assert outcome.status == RunStatus.COMPLETED
+    assert reviewer_gateway.calls
+    review_context = json.loads(reviewer_gateway.calls[0]["messages"][-1].content)
+    assert review_context["user_question"] == "分析瑞幸品牌"

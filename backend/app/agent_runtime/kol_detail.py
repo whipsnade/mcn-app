@@ -21,14 +21,24 @@
 而不是后台异步返回。这是 Task 17 的设计决策：响应直接携带可渲染的 detail
 （cache hit）或 ``run_id`` + ``artifact_id``（fresh run）。前端应为此连接持有等待。
 
-并发与恢复硬化（Code Review Fix 1/2）：
+并发与恢复硬化（Code Review Fix 1/2 + Gate A G3）：
 - 幂等检查对 working head 行 ``with_for_update`` 串行化并发 create，持有锁后
   重查缓存（并发写入者可能刚填好），避免重复创建 Run 造成重复 MCP/模型消耗；
 - 只有「活动」（queued/running/reviewing）owner 才阻塞；paused/终态 owner
   无继续/恢复价值，释放 working head 让新 Run 接管，避免用户被卡死；
-- 首次 create（artifact/draft 尚不存在）的并发窗口在无迁移下无法完全封闭，
-  由 ``(session_id, artifact_key)`` 唯一约束 + 引擎 ArtifactBusy +
-  ``set_cached_detail`` 的 IntegrityError 恢复共同兜底；
+- **请求协调（G3）**：缓存未命中后、任何模型/MCP 调用发生**之前**，先在
+  数据库建立 kol-detail 的 Artifact 身份 + working head（owner=新 Run）并
+  立即提交（协调事务）。``(session_id, artifact_key)`` 唯一约束串行化同窗口
+  并发：后到者的 INSERT 等待先到者提交后撞 IntegrityError，回滚自身协调事务
+  并重读，幂等返回先到者的活动 Run（或其已回填的缓存）——两个真实并发
+  create 最多一个进入引擎，MCP 抓取与积分扣费至多一次，首次 create 的并发
+  窗口由此封闭（此前只能靠唯一约束 + ArtifactBusy + 缓存回填兜底）；
+- 协调事务提交的 Run 处于 running + 本 worker 活跃租约：executor/recovery
+  不会重复领取；崩溃超时后由恢复循环接管，transcript 经
+  ``prompt_snapshot_json`` 的 platform/kol_uid 触发上下文恢复（G3 锚点）；
+- 引擎失败收口：协调行已提交不能整单回滚——引擎正常收口（failed/paused/
+  cancelled）时提交其终态；引擎抛出未捕获异常时尽力把 Run 置 failed、释放
+  working head 并提交（不遮蔽原异常），下一次 create 立即可接管；
 - 缓存 payload 损坏时驱逐缓存行并刷新，而不是 500。
 
 builder 的角色：``build_kol_detail_draft``（Task 17）不是运行时强制接线——
@@ -41,6 +51,7 @@ TTL 默认 24h，由 ``KOL_DETAIL_CACHE_TTL_HOURS`` 配置；测试可注入 ``n
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any, Callable
@@ -61,13 +72,48 @@ from app.agent_artifacts.models import (
 from app.agent_artifacts.payloads.kol_detail import KolDetailV2
 from app.agent_artifacts.service import ArtifactService
 from app.agent_runtime.engine import AgentEngine
+from app.agent_runtime.events import AgentEventBroker, AgentEventStream
 from app.agent_runtime.models import AgentRun
 from app.agent_runtime.profiles import get_profile
 from app.agent_runtime.repository import AgentRunRepository, utc_now
-from app.agent_runtime.state import RunStatus
+from app.agent_runtime.state import InvalidRunTransition, RunStatus
 from app.model.contracts import ChatMessage
 
+logger = logging.getLogger(__name__)
+
 SCHEMA_VERSION = "kol_detail_v2"
+
+# ``prompt_snapshot_json`` 中 kol_detail 触发上下文的命名空间键（G3 恢复锚点）；
+# 与 router 用于幂等的 ``idempotency_key``/``content_hash`` 顶层键互不冲突。
+KOL_DETAIL_SNAPSHOT_KEY = "kol_detail"
+
+
+def kol_detail_trigger_content(platform: str, kol_uid: str) -> str:
+    """kol_detail Run 的触发消息文本：首次启动与崩溃恢复共用同一锚点（G3）。"""
+    return f"查看达人详情：platform={platform}, kol_uid={kol_uid}"
+
+
+def build_kol_detail_prompt_snapshot(
+    *,
+    platform: str,
+    kol_uid: str,
+    selection_artifact_id: str | None,
+    selection_version: str | None,
+) -> dict[str, Any]:
+    """持久化 kol_detail Run 的触发上下文（无 input_message_id 时的恢复锚点）。
+
+    kol_detail Run 由点击触发、没有 ``input_message_id``；崩溃接管时
+    ``RunTranscriptLoader`` 从该快照恢复 platform/kol_uid 触发上下文，绝不
+    回退到会话最近一条普通用户消息（可能是完全无关的意图）。
+    """
+    return {
+        KOL_DETAIL_SNAPSHOT_KEY: {
+            "platform": platform,
+            "kol_uid": kol_uid,
+            "selection_artifact_id": selection_artifact_id,
+            "selection_version": selection_version,
+        }
+    }
 
 # 已暂停/终态的 owner 不再视为「活动」：不再阻塞新 Run，允许其接管 working head。
 _NON_ACTIVE_OWNER_STATUSES = frozenset(
@@ -99,6 +145,23 @@ class KolDetailRunSummary:
     cached: bool
     version_id: str | None = None
     artifact_id: str | None = None
+
+
+@dataclass(frozen=True)
+class _ClaimResult:
+    """``_claim_working_head`` 的协调结果（G3）。
+
+    - ``run_id``/``attempt_id`` 非空：本请求赢得协调权，Run + working head
+      owner 已在协调事务提交，可进入引擎事务；
+    - ``existing_run_id`` 非空：锁内发现活动 owner（TOCTOU 后到者），幂等返回；
+    - ``lost_race``：同窗口并发撞 ``(session_id, artifact_key)`` 唯一约束，
+      自身协调事务已整体回滚，调用方重读先到者状态后再决策。
+    """
+
+    run_id: str | None = None
+    attempt_id: str | None = None
+    existing_run_id: str | None = None
+    lost_race: bool = False
 
 
 def _iso(value: Any) -> Any:
@@ -251,32 +314,60 @@ class KolDetailRunService:
         selection_artifact_id: str | None = None,
         selection_version: str | None = None,
     ) -> KolDetailRunSummary:
-        """缓存优先；未命中/过期才创建 kol_detail_v1 轻量 Run（§13.2）。"""
+        """缓存优先；未命中/过期才创建 kol_detail_v1 轻量 Run（§13.2）。
+
+        并发协调（G3）：缓存未命中后、任何模型/MCP 调用发生**之前**，先在
+        数据库建立/认领 kol-detail 的 working head（协调事务，立即提交）。
+        两个真实并发 create 最多一个赢得协调权进入引擎——MCP 抓取与积分
+        扣费至多一次；后到者幂等返回先到者的活动 Run（或其已回填的缓存）。
+        """
         cached = await self.get_cached_detail(user_id, session_id, platform, kol_uid)
         hit = await self._try_cache_hit(cached)
         if hit is not None:
             return hit
 
-        # 幂等 + 串行化：锁住 working head（with_for_update），并发 create 在此串行。
-        existing = await self._active_kol_detail_run(session_id, platform, kol_uid)
-        if existing is not None:
-            # 同一 (platform, kol_uid) 已有活动 kol-detail Run：幂等返回，不重复创建。
-            return KolDetailRunSummary(run_id=existing, detail=None, cached=False)
+        # 协调循环：正常路径一轮完成。撞唯一约束（同窗口并发先到者已提交协调
+        # 行）时重读——看到先到者的活动 Run / 它回填的缓存 / 它失败释放后的
+        # 空 working head（此时由本请求接管，重新竞争）。
+        for _ in range(2):
+            # 幂等 + 串行化：锁住 working head（with_for_update），并发 create 在此串行。
+            existing = await self._active_kol_detail_run(session_id, platform, kol_uid)
+            if existing is not None:
+                # 同一 (platform, kol_uid) 已有活动 kol-detail Run：幂等返回，不重复创建。
+                return KolDetailRunSummary(run_id=existing, detail=None, cached=False)
 
-        # 持有锁后重查缓存：并发写入者可能已填好缓存，避免重复抓取/模型消耗。
-        cached = await self.get_cached_detail(user_id, session_id, platform, kol_uid)
-        hit = await self._try_cache_hit(cached)
-        if hit is not None:
-            return hit
+            # 持有锁后重查缓存：并发写入者可能已填好缓存，避免重复抓取/模型消耗。
+            cached = await self.get_cached_detail(user_id, session_id, platform, kol_uid)
+            hit = await self._try_cache_hit(cached)
+            if hit is not None:
+                return hit
 
-        return await self._start_fresh_run(
-            user_id,
-            session_id,
-            platform,
-            kol_uid,
-            selection_artifact_id=selection_artifact_id,
-            selection_version=selection_version,
-        )
+            # 只有新建 Run 的路径才需要引擎（缓存命中/幂等返回不需要）。
+            if self._engine is None:
+                raise KolDetailRunFailed("no engine wired for kol_detail_v1 run")
+
+            claim = await self._claim_working_head(
+                user_id,
+                session_id,
+                platform,
+                kol_uid,
+                selection_artifact_id=selection_artifact_id,
+                selection_version=selection_version,
+            )
+            if claim.lost_race:
+                continue
+            if claim.existing_run_id is not None:
+                return KolDetailRunSummary(
+                    run_id=claim.existing_run_id, detail=None, cached=False
+                )
+            if claim.run_id is not None and claim.attempt_id is not None:
+                return await self._drive_fresh_run(
+                    claim.run_id,
+                    claim.attempt_id,
+                    platform=platform,
+                    kol_uid=kol_uid,
+                )
+        raise KolDetailRunFailed("kol_detail coordination could not be established")
 
     # ------------------------------------------------------------------ #
     # 内部
@@ -354,7 +445,7 @@ class KolDetailRunService:
             return False
         return RunStatus(run.status) not in _NON_ACTIVE_OWNER_STATUSES
 
-    async def _start_fresh_run(
+    async def _claim_working_head(
         self,
         user_id: str,
         session_id: str,
@@ -363,11 +454,68 @@ class KolDetailRunService:
         *,
         selection_artifact_id: str | None,
         selection_version: str | None,
-    ) -> KolDetailRunSummary:
-        """创建 kol_detail_v1 用户 Run，驱动引擎至发布，发布成功后回填缓存。"""
-        if self._engine is None:
-            raise KolDetailRunFailed("no engine wired for kol_detail_v1 run")
-        now = self.now_fn()
+    ) -> _ClaimResult:
+        """协调事务（G3）：建立/认领 kol-detail 的 working head 并**立即提交**。
+
+        - Artifact 身份不存在时创建：``(session_id, artifact_key)`` 唯一约束
+          串行化同窗口并发——后到者的 INSERT 等待先到者提交后撞
+          ``IntegrityError``，整体回滚自身协调事务（其 Run 一并消失），由
+          调用方重读幂等返回先到者的活动 Run；
+        - Artifact 已存在时只对 working head 行 ``with_for_update``（**不显式
+          锁 Artifact 行**：``publish_batch`` 的加锁顺序是 Draft → Artifact，
+          反向加锁会与之死锁）——锁内重判 owner：活动 owner 幂等返回；非活动
+          owner 释放后由本请求接管（与 Fix 2 同语义）；
+        - 赢得协调权：同事务创建 queued Run（含 ``prompt_snapshot_json`` 触发
+          上下文，G3 恢复锚点）→ ``begin_attempt``（→running）→ ``claim_lease``
+          → working head owner 置为该 Run，一次提交。提交后 Run 处于
+          running + 本 worker 活跃租约：executor/recovery 不会重复领取；
+          进程崩溃超时后由恢复循环接管（transcript 经 prompt_snapshot 恢复
+          触发上下文）。
+        """
+        artifact_key = build_artifact_key("kol-detail", platform=platform, kol_uid=kol_uid)
+        now = utc_now()
+        artifact = await self.db.scalar(
+            select(AgentArtifact).where(
+                AgentArtifact.session_id == session_id,
+                AgentArtifact.artifact_key == artifact_key,
+            )
+        )
+        if artifact is None:
+            artifact = AgentArtifact(
+                session_id=session_id,
+                user_id=user_id,
+                module="kol-detail",
+                artifact_type=SCHEMA_VERSION,
+                artifact_key=artifact_key,
+                status="draft",
+                latest_version=0,
+                activity_sequence=0,
+                created_at=now,
+                updated_at=now,
+            )
+            self.db.add(artifact)
+            try:
+                await self.db.flush()
+            except IntegrityError:
+                # 同窗口并发：先到者已提交协调行。整体回滚自身协调事务（新建
+                # 的 Run 一并消失），调用方重读幂等返回先到者的活动 Run。
+                await self.db.rollback()
+                return _ClaimResult(lost_race=True)
+
+        draft = await self.db.scalar(
+            select(ArtifactDraft)
+            .where(ArtifactDraft.artifact_id == artifact.id)
+            .with_for_update()
+        )
+        if draft is not None and draft.owner_run_id is not None:
+            if await self._owner_is_active(draft.owner_run_id):
+                # 锁内权威判定：已有活动 owner（TOCTOU 后到的并发请求），幂等返回。
+                await self.db.commit()
+                return _ClaimResult(existing_run_id=draft.owner_run_id)
+            # 非活动 owner（paused/终态/消失）：释放 working head 后接管（Fix 2 同语义）。
+            await self._service.release_draft(draft.id, outcome="failed")
+            await self.db.flush()
+
         run = AgentRun(
             id=str(uuid4()),
             session_id=session_id,
@@ -377,6 +525,12 @@ class KolDetailRunService:
             profile_name="kol_detail_v1",
             profile_version="v1",
             model=self._model,
+            prompt_snapshot_json=build_kol_detail_prompt_snapshot(
+                platform=platform,
+                kol_uid=kol_uid,
+                selection_artifact_id=selection_artifact_id,
+                selection_version=selection_version,
+            ),
             status="queued",
             decision_count=0,
             review_count=0,
@@ -384,27 +538,78 @@ class KolDetailRunService:
         )
         self.db.add(run)
         await self.db.flush()
-
         repo = AgentRunRepository(self.db)
         attempt = await repo.begin_attempt(run.id)
         if not await repo.claim_lease(run.id, self._worker_id, self._lease_seconds):
+            # pragma: no cover - 新建 Run 无租约必然可领取；防御性整体回滚。
+            await self.db.rollback()
             raise KolDetailRunFailed("kol_detail run could not acquire lease")
-
-        messages = [
-            ChatMessage(
-                role="user",
-                content=f"查看达人详情：platform={platform}, kol_uid={kol_uid}",
+        if draft is None:
+            draft = ArtifactDraft(
+                artifact_id=artifact.id,
+                session_id=session_id,
+                owner_run_id=run.id,
+                current_revision=0,
+                status="drafting",
+                review_count=0,
+                revision_count=0,
+                updated_at=now,
             )
-        ]
-        outcome = await self._engine.run(
-            run=run,
-            attempt_id=attempt.id,
-            profile=get_profile("kol_detail_v1"),
-            messages=messages,
-            # §5.8/§10.5：kol_detail Run 是用户可见 Run，注入 thinking sink。
-            thinking_sink=self._engine.thinking_sink_for(run),
-        )
+            self.db.add(draft)
+        else:
+            draft.owner_run_id = run.id
+            draft.status = "drafting"
+            draft.updated_at = now
+        await self.db.flush()
+        await self.db.commit()
+        return _ClaimResult(run_id=run.id, attempt_id=attempt.id)
+
+    async def _drive_fresh_run(
+        self,
+        run_id: str,
+        attempt_id: str,
+        *,
+        platform: str,
+        kol_uid: str,
+    ) -> KolDetailRunSummary:
+        """驱动已持有协调行的 Run 至发布，发布成功后回填缓存。
+
+        引擎在每个事件 append 处增量提交（``AgentEventStream.append`` 是提交
+        点），协调行（Run/Artifact/Draft）更已在协调事务提交——失败收口不能
+        依赖整体回滚：引擎正常收口（failed/paused/cancelled）时提交其终态；
+        引擎抛出未捕获异常时尽力把 Run 置 failed、释放 working head 并提交
+        （不遮蔽原异常），保证下一次 create 能立即接管、绝不 artifact_busy。
+        """
+        engine = self._engine
+        if engine is None:  # pragma: no cover - create 已先行校验；防御与类型收窄。
+            raise KolDetailRunFailed("no engine wired for kol_detail_v1 run")
+        run = await self.db.get(AgentRun, run_id)
+        if run is None:  # pragma: no cover - 协调事务刚提交必然可读
+            raise KolDetailRunFailed("kol_detail run not readable after claim")
+        now = self.now_fn()
+        trigger = kol_detail_trigger_content(platform, kol_uid)
+        messages = [ChatMessage(role="user", content=trigger)]
+        try:
+            outcome = await engine.run(
+                run=run,
+                attempt_id=attempt_id,
+                profile=get_profile("kol_detail_v1"),
+                messages=messages,
+                # §5.8/§10.5：kol_detail Run 是用户可见 Run，注入 thinking sink。
+                thinking_sink=engine.thinking_sink_for(run),
+                # G3：显式用户问题锚点，不经消息列表反推。
+                user_question=trigger,
+            )
+        except Exception:
+            await self.db.rollback()
+            await self._settle_failed_run(run_id)
+            raise
         if outcome.status != RunStatus.COMPLETED:
+            # 引擎出口已自行收口（failed/paused/cancelled：迁移终态、释放
+            # Draft、清租约）——提交这些收尾，避免已提交的协调行悬挂在
+            # running（否则会被恢复循环误接管重放）。
+            await self._release_working_head_if_owned(run_id)
+            await self.db.commit()
             raise KolDetailRunFailed(f"kol_detail_v1 run ended with status {outcome.status}")
 
         version = await self.db.scalar(
@@ -424,8 +629,8 @@ class KolDetailRunService:
             raise KolDetailRunFailed(f"invalid published kol_detail_v2 payload: {exc}") from exc
 
         await self.set_cached_detail(
-            user_id=user_id,
-            session_id=session_id,
+            user_id=run.user_id,
+            session_id=run.session_id,
             platform=platform,
             kol_uid=kol_uid,
             payload=payload,
@@ -441,5 +646,58 @@ class KolDetailRunService:
             artifact_id=version.artifact_id,
         )
 
+    async def _release_working_head_if_owned(self, run_id: str) -> None:
+        """防御性释放：working head 仍挂在该 Run 名下时置 failed 并释放 owner。"""
+        drafts = (
+            await self.db.scalars(
+                select(ArtifactDraft).where(ArtifactDraft.owner_run_id == run_id)
+            )
+        ).all()
+        for draft in drafts:
+            await self._service.release_draft(draft.id, outcome="failed")
 
-__all__ = ["KolDetailRunFailed", "KolDetailRunService", "KolDetailRunSummary"]
+    async def _settle_failed_run(self, run_id: str) -> None:
+        """引擎抛出未捕获异常后的尽力收口（不遮蔽原异常，G3）。
+
+        协调行（Run/Artifact/Draft）已在协调事务提交：把 Run 置 failed、
+        释放 working head、补发 ``run.failed`` 终态事件并提交，下一次
+        create 立即可接管。收口本身失败时只记日志——Run 保持 running +
+        租约，恢复循环在租约过期后接管自愈（transcript 经
+        ``prompt_snapshot_json`` 的 platform/kol_uid 触发上下文恢复）。
+        """
+        try:
+            repo = AgentRunRepository(self.db)
+            try:
+                await repo.transition(run_id, RunStatus.FAILED, worker_id=self._worker_id)
+                failed = True
+            except InvalidRunTransition:
+                # 租约过期/被接管或已是终态：系统级收口（他人活跃持有时返回
+                # False，终态事件由接管方负责，A4 闸门同语义）。
+                failed = await repo.force_fail(run_id, error_code="kol_detail_error")
+            if failed:
+                await self._release_working_head_if_owned(run_id)
+                run = await self.db.get(AgentRun, run_id)
+                if run is not None:
+                    # 一次性 broker 仅为持久化终态事件（罕见系统异常路径，实时
+                    # 推送缺失由 HTTP 500 与重连重放兜底）。
+                    await AgentEventStream(
+                        self.db, AgentEventBroker()
+                    ).append_terminal_once(
+                        run_id,
+                        run.user_id,
+                        "run.failed",
+                        {"outcome": "failed", "error_code": "kol_detail_error"},
+                    )
+            await self.db.commit()
+        except Exception:
+            logger.exception("kol_detail run %s failure settlement failed", run_id)
+
+
+__all__ = [
+    "KOL_DETAIL_SNAPSHOT_KEY",
+    "KolDetailRunFailed",
+    "KolDetailRunService",
+    "KolDetailRunSummary",
+    "build_kol_detail_prompt_snapshot",
+    "kol_detail_trigger_content",
+]
