@@ -9,6 +9,11 @@ broker 只承担"有新事件"的唤醒信号。
 - Artifact 事件带 ``artifact_id/module/parent_artifact_id/status``；
 - Review 事件带 ``review_batch_id/artifact_id/draft_revision_id``。
 ``append`` 会自动把 ``run_id`` 合入 payload，调用方无需重复携带。
+
+终态收口（H1/§5.8）：``settle_terminal`` 是唯一事务边界——Run 状态迁移
+与终态事件在同一 ``SELECT ... FOR UPDATE`` 加锁事务内提交，恰好一个
+``run.completed|failed|cancelled``；``append_terminal_once`` 共享同一
+持锁复核，只做事件补发（不迁移状态）。
 """
 
 import asyncio
@@ -23,6 +28,12 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_runtime.models import AgentEvent, AgentRun
+from app.agent_runtime.repository import AgentRunRepository
+from app.agent_runtime.state import (
+    InvalidRunTransition,
+    RunStatus,
+    TERMINAL_RUN_STATUSES,
+)
 
 
 class AgentEventType(StrEnum):
@@ -149,26 +160,163 @@ class AgentEventStream:
     async def append_terminal_once(
         self, run_id: str, user_id: str, event_type: str, payload: dict[str, Any] | None
     ) -> AgentEvent | None:
-        """终态事件统一出口（§5.8/G1）：同一 Run 全局恰好一个终态事件。
+        """终态事件补发出口（G1/§5.8）：同一 Run 全局恰好一个终态事件。
 
-        所有使 Run 进入终态的路径（complete / 原子发布 / Reviewer reject /
-        系统失败 / 取消 / executor 异常收口）都经本方法发
-        ``run.completed|failed|cancelled``——它必须是该 Run 最后一条用户可见
-        事件，送达后 SSE 流收口。该 Run 已存在终态事件（如引擎已收口、
-        executor 兜底重入）时幂等返回 ``None``，绝不重复发送；非终态类型
-        抛 ``ValueError``（调用方编排错误，不应静默）。
+        复核与插入在 Run 行锁内完成（与 :meth:`settle_terminal` 共享同一持锁
+        边界）：并发写者被行锁串行化，后到者看到已有终态事件幂等返回
+        ``None``，绝不重复发送、不抛唯一键异常；非终态类型抛 ``ValueError``
+        （调用方编排错误，不应静默）。本方法只补发事件、不迁移 Run 状态——
+        Run 状态迁移由 :meth:`settle_terminal` 负责。
         """
         if not is_terminal_event(event_type):
             raise ValueError(f"not a terminal event: {event_type!r}")
-        existing = await self.db.scalar(
-            select(func.count(AgentEvent.id)).where(
+        run = await self._lock_run_for_update(run_id)
+        if run.user_id != user_id:
+            raise RunEventForbidden("run_not_owned")
+        if await self._terminal_event_locked(run_id) is not None:
+            await self.db.commit()
+            return None
+        event = await self._insert_terminal_locked(run, event_type, payload)
+        await self.db.commit()
+        await self.broker.publish(event)
+        return event
+
+    async def settle_terminal(
+        self,
+        run_id: str,
+        user_id: str,
+        outcome: RunStatus,
+        payload: dict[str, Any] | None,
+        *,
+        worker_id: str | None = None,
+    ) -> AgentEvent | None:
+        """Run 终态收口唯一事务边界（H1/§5.8）：状态迁移与终态事件同一加锁事务。
+
+        事务内：``SELECT ... FOR UPDATE`` 锁 Run 行（串行化所有并发写者）→
+        当前读复核终态事件（已存在则幂等返回 ``None``）→ Run 未终态则按
+        ``outcome`` 迁移 → 插入终态事件（sequence=max+1）→ 提交 → broker 广播。
+        任何中途异常整体回滚——不存在"Run 已终态但无终态事件"的提交窗口；
+        并发后到者被行锁串行化后看到已有终态，幂等返回而非唯一键异常。
+
+        ``worker_id`` 语义：COMPLETED 必须由持活跃租约的 worker 迁移（否则抛
+        ``run_lease_not_held``）；FAILED 持租约走状态机、无租约走系统级
+        force_fail（他人活跃持有时返回 ``None``，终态交接管方，A4 闸门）；
+        CANCELLED 是用户取消跨切面语义（任意非终态 → cancelled，不看租约）。
+        Run 已是终态但缺终态事件（旧窗口残留）时按实际终态补发事件，不再迁移。
+        幂等与闸门路径同样提交：调用方在本事务内可能已 flush 需要落库的写入
+        （如 _fail_run 的 transition / Draft 释放），本方法是统一提交点。
+        """
+        if outcome not in TERMINAL_RUN_STATUSES:
+            raise ValueError(f"not a terminal outcome: {outcome!r}")
+        run = await self._lock_run_for_update(run_id)
+        if run.user_id != user_id:
+            raise RunEventForbidden("run_not_owned")
+        if await self._terminal_event_locked(run_id) is not None:
+            await self.db.commit()
+            return None
+        current = RunStatus(run.status)
+        if current in TERMINAL_RUN_STATUSES:
+            # 旧窗口残留（Run 已终态、无终态事件）：按实际终态补发，不再迁移。
+            event_type = f"run.{current.value}"
+        else:
+            migrated = await self._migrate_terminal_locked(run, outcome, worker_id, payload)
+            if not migrated:
+                await self.db.commit()
+                return None
+            event_type = f"run.{outcome.value}"
+        event = await self._insert_terminal_locked(run, event_type, payload)
+        await self.db.commit()
+        await self.broker.publish(event)
+        return event
+
+    async def _lock_run_for_update(self, run_id: str) -> AgentRun:
+        """持锁读 Run 行并刷新 identity map（populate_existing）。
+
+        行锁是终态收口的串行化点：所有终态写者先过此锁；locking read 不受
+        REPEATABLE-READ 快照限制，读到的是最新已提交状态。
+        """
+        run = await self.db.scalar(
+            select(AgentRun)
+            .where(AgentRun.id == run_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if run is None:
+            raise RunEventForbidden("run_not_found")
+        return run
+
+    async def _terminal_event_locked(self, run_id: str) -> AgentEvent | None:
+        """当前读复核已有终态事件（调用方必须已持 Run 行锁）。
+
+        ``FOR UPDATE`` 当前读绕开事务快照：并发写者的终态事件（其提交必然
+        先于本事务获锁）不会被旧快照遮蔽——这是"先查后写"竞态的根治。
+        """
+        return await self.db.scalar(
+            select(AgentEvent)
+            .where(
                 AgentEvent.run_id == run_id,
                 AgentEvent.event_type.in_(tuple(sorted(TERMINAL_EVENT_TYPES))),
             )
+            .order_by(AgentEvent.sequence)
+            .limit(1)
+            .with_for_update()
         )
-        if existing:
-            return None
-        return await self.append(run_id, user_id, event_type, payload)
+
+    async def _insert_terminal_locked(
+        self, run: AgentRun, event_type: str, payload: dict[str, Any] | None
+    ) -> AgentEvent:
+        """在持锁事务内插入终态事件（sequence=max+1）并 flush（不 commit）。
+
+        max 查询用当前读：调用方会话若在持锁前已有一致性读快照（如路由层
+        归属查询），旧快照可能漏掉持锁前并发提交的非终态事件，导致 sequence
+        撞唯一键；当前读保证看到的是获锁后的最新数据。
+        """
+        max_sequence = await self.db.scalar(
+            select(func.max(AgentEvent.sequence))
+            .where(AgentEvent.run_id == run.id)
+            .with_for_update()
+        )
+        event = AgentEvent(
+            id=str(uuid4()),
+            run_id=run.id,
+            user_id=run.user_id,
+            sequence=(max_sequence or 0) + 1,
+            event_type=event_type,
+            # 服务端 run_id 强制覆盖，payload 里的同名键不能伪造
+            payload_json={**(payload or {}), "run_id": run.id},
+            created_at=utc_now(),
+        )
+        self.db.add(event)
+        await self.db.flush()
+        return event
+
+    async def _migrate_terminal_locked(
+        self,
+        run: AgentRun,
+        outcome: RunStatus,
+        worker_id: str | None,
+        payload: dict[str, Any] | None,
+    ) -> bool:
+        """持锁状态下按 outcome 迁移 Run 终态（不 commit）。
+
+        返回 ``False`` 表示租约被其他 worker 活跃持有（A4 闸门）：本 worker
+        不迁移、不发事件，终态交接管方。repo 方法内的 lock_run 是同事务
+        重入行锁（立即成功），且 identity map 对象已被持锁读刷新。
+        """
+        repo = AgentRunRepository(self.db)
+        if outcome == RunStatus.CANCELLED:
+            # 用户取消跨切面：任意非终态 → cancelled，不看租约。
+            return await repo.cancel(run.id, run.user_id)
+        if outcome == RunStatus.COMPLETED:
+            if worker_id is None or not AgentRunRepository.owns_active_lease(run, worker_id):
+                raise InvalidRunTransition("run_lease_not_held")
+            await repo.transition(run.id, RunStatus.COMPLETED, worker_id=worker_id)
+            return True
+        # FAILED：持租约走状态机；无租约/过期走系统级 force_fail（error_code 落 Run 行）。
+        if worker_id is not None and AgentRunRepository.owns_active_lease(run, worker_id):
+            await repo.transition(run.id, RunStatus.FAILED, worker_id=worker_id)
+            return True
+        return await repo.force_fail(run.id, error_code=(payload or {}).get("error_code"))
 
     async def stream(
         self, run_id: str, user_id: str, last_event_id: int

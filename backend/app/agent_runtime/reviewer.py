@@ -13,7 +13,9 @@ Profile=``artifact_reviewer_v1`` 的子 ``agent_runs``，``parent_run_id`` 指�
 - 前两次可返回 approve/revise/reject；
 - 第 3 次仍输出 revise 时运行时按 reject 处理；
 - reject 必须以 Artifact failed、Run failed 收口，整个 batch 失败且不产生部分
-  发布；只有 approve 可以发布。
+  发布；只有 approve 可以发布。整批/Artifact 的清理由 Reviewer 完成，父 Run
+  的终态迁移由引擎经终态事务边界（``AgentEventStream.settle_terminal``）
+  与终态事件一体提交（H1）。
 
 Reviewer 调用不计入父 Run 的 Attempt 决策阈值；只累计 review/revision 审计值。
 """
@@ -50,7 +52,6 @@ from app.agent_runtime.model_gateway import AgentModelGateway
 from app.agent_runtime.models import AgentRun
 from app.agent_runtime.profiles import get_profile
 from app.agent_runtime.repository import AgentRunRepository
-from app.agent_runtime.state import RunStatus
 from app.model.contracts import ChatMessage
 
 # 单个 Item 最多三次 Reviewer 调用（§12.3：最多两次 revise）。
@@ -131,10 +132,10 @@ class ReviewerDriver:
 
     内部 Run 的创建模式与 AgentRun 一致（含 Attempt / Step / token 审计），
     但 Reviewer 永不调用工具，因此不会产生任何 ``agent_tool_calls`` 行。
-    ``worker_id`` 是**必填**参数：它用于把父 Run 状态迁移到 reviewing→
-    completed/failed，必须与父 Run 租约持有者一致（引擎传入自己的 worker id），
-    否则 ``transition()`` 会抛 ``run_lease_not_held``——与其在运行期暴露不一致，
-    不如让缺失在调用点成为编译期错误。
+    ``worker_id`` 是**必填**参数：它标识父 Run 租约持有者（引擎传入自己的
+    worker id）——复核/发布流程中的状态一致性以租约为准；父 Run 的终态
+    迁移（reviewing→completed/failed）由引擎经终态事务边界完成（H1），
+    worker 不一致会在迁移时抛 ``run_lease_not_held``。
     """
 
     def __init__(
@@ -226,7 +227,8 @@ class ReviewerDriver:
 
         - Draft 已修改（Item 绑定旧 Revision）时先改绑当前 Revision，旧 approve 失效；
         - 第 3 次调用仍输出 revise → 按 reject 处理；
-        - reject → 整批 failed、全部 Draft/Artifact failed、父 Run failed。
+        - reject → 整批 failed、全部 Draft/Artifact failed；父 Run 的终态迁移
+          由引擎经终态事务边界完成（H1），不在本方法内。
         """
         now = _utcnow()
         batch = await self.db.get(ArtifactReviewBatch, item.batch_id)
@@ -486,7 +488,13 @@ class ReviewerDriver:
     async def _finalize_reject(
         self, *, parent_run: AgentRun, batch: ArtifactReviewBatch
     ) -> None:
-        """reject 收口：整批 failed、全部 Draft/Artifact failed、父 Run failed。"""
+        """reject 收口：整批 failed、全部 Draft/Artifact failed。
+
+        父 Run 的终态迁移不在此处——由引擎经终态事务边界
+        （``AgentEventStream.settle_terminal``）与 run.failed 事件一体提交
+        （H1：消除"已终态无事件"窗口）；本方法的清理随引擎随后的
+        ``review.rejected`` 事件 append 一起提交。
+        """
         now = _utcnow()
         batch.status = "failed"
         batch.completed_at = now
@@ -505,9 +513,6 @@ class ReviewerDriver:
             if artifact is not None:
                 artifact.status = "failed"
                 artifact.updated_at = now
-        await self._repo.transition(
-            parent_run.id, RunStatus.FAILED, worker_id=self.worker_id
-        )
 
 
 __all__ = [

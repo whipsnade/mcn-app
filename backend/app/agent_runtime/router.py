@@ -526,15 +526,15 @@ async def cancel_run(
     恰好一个 ``run.cancelled`` 终态事件；running/reviewing 只写
     ``cancel_requested``，由 Engine 在下一个安全点（外发前 / 模型返回后 /
     Reviewer 返回后 / 循环顶）收口。终态幂等返回。
+    H1：立即取消的迁移与终态事件由 settle_terminal 同一加锁事务提交。
     """
     run = await _get_owned_run(db, user.id, run_id)
     repo = AgentRunRepository(db)
     current = RunStatus(run.status)
     if current in _IMMEDIATE_CANCEL_STATUSES:
-        if await repo.cancel(run.id, user.id):
-            await AgentEventStream(db, broker).append(
-                run.id, user.id, "run.cancelled", {}
-            )
+        await AgentEventStream(db, broker).settle_terminal(
+            run.id, user.id, RunStatus.CANCELLED, {}
+        )
     elif current in _REQUEST_CANCEL_STATUSES:
         await repo.request_cancel(run.id, user.id)
     await db.commit()

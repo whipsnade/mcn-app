@@ -59,7 +59,7 @@ from app.agent_artifacts.validation import (
 )
 from app.agent_runtime.models import AgentMessage, AgentRun
 from app.agent_runtime.repository import AgentRunRepository
-from app.agent_runtime.state import RunStatus
+from app.agent_runtime.state import InvalidRunTransition, RunStatus
 
 # 已暂停/终态的 Draft owner 不再视为「活动」：不阻塞新 Run 接管 working head
 # （与 kol_detail 的 _NON_ACTIVE_OWNER_STATUSES 模式对齐，§5.7）。
@@ -416,9 +416,12 @@ class ArtifactService:
     ) -> list[AgentArtifactVersion]:
         """原子发布一个 Review Batch（设计 §8.1 / §12.3）。
 
-        ``worker_id`` 是**必填**参数：它把父 Run 从 reviewing 迁移到 completed，
-        必须与父 Run 租约持有者一致（引擎传入自己的 worker id），否则
-        ``transition()`` 抛 ``run_lease_not_held`` 会连带整批发布回滚。
+        ``worker_id`` 是**必填**参数：发布收尾时复核父 Run 租约仍属本 worker
+        （§5.5），必须与父 Run 租约持有者一致（引擎传入自己的 worker id），
+        否则抛 ``run_lease_not_held`` 连带整批发布回滚。父 Run 的终态迁移
+        （reviewing→completed）不在本事务内——由终态事务边界
+        （``AgentEventStream.settle_terminal``）与 run.completed 事件一体提交
+        （H1：消除"已终态无事件"窗口）。
 
         单事务内：锁定 Batch + 全部 Item + Draft + Artifact；先校验所有 Item 都在
         **当前** Revision 上 approve（任一不满足即抛 ``PublishBlocked``、整批回滚，
@@ -427,7 +430,7 @@ class ArtifactService:
         全部通过后才一次性插入全部 ``agent_artifact_versions``、更新
         ``agent_artifacts.latest_version/status``、把 Draft working head 置回
         ``idle`` 并释放 owner、追加 ``published`` 事件、写入 assistant 消息
-        （``completion_text``），最后把父 Run 迁移到 completed。
+        （``completion_text``），最后复核父 Run 租约。
         """
         now = _utcnow()
         batch = await self.db.scalar(
@@ -567,10 +570,15 @@ class ArtifactService:
             content=batch.completion_text,
         )
 
-        # 5) 父 Run reviewing → completed。
-        await AgentRunRepository(self.db).transition(
-            batch.parent_run_id, RunStatus.COMPLETED, worker_id=worker_id
-        )
+        # 5) 发布前租约复核（§5.5/H1）：父 Run 的终态迁移（reviewing→completed）
+        # 由终态事务边界（AgentEventStream.settle_terminal）与 run.completed
+        # 事件一体提交；此处只复核租约仍属本 worker——丢失则抛
+        # run_lease_not_held 连带整批发布回滚（不发布、不写终态，交还接管方）。
+        parent_run = await self.db.get(AgentRun, batch.parent_run_id)
+        if parent_run is None or not AgentRunRepository.owns_active_lease(
+            parent_run, worker_id
+        ):
+            raise InvalidRunTransition("run_lease_not_held")
         await self.db.flush()
         return versions
 

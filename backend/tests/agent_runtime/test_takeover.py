@@ -819,6 +819,99 @@ async def test_reviewing_takeover_is_idempotent_no_duplicate_versions_or_events(
     assert event_types.count("run.completed") == 1
 
 
+async def test_reviewing_takeover_after_publish_commit_settles_completed(
+    db_session, user_factory
+) -> None:
+    """H1 窗口：原子发布已提交（batch completed + Version 落库）但终态事务
+    （Run 迁移 + run.completed）未完成的崩溃——接管方幂等补齐发布后续事件
+    并收口 completed：不重复发布、不重复发事件。"""
+    run, _, _ = await _make_session(db_session, user_factory)
+    await _start_attempt(db_session, run, worker="worker-a")
+    batch, _, _ = await _make_reviewing_scene(
+        db_session, run, brands=("瑞幸",), approved_count=1
+    )
+    # 发布已提交、Run 未迁移的崩溃现场（H1 后发布不再迁移 Run 终态）。
+    service = ArtifactService(db_session)
+    versions = await service.publish_batch(batch.id, worker_id="worker-a")
+    assert len(versions) == 1
+    _expire_lease(await db_session.get(AgentRun, run.id))
+    await db_session.flush()
+
+    reviewer_gateway = FakeReviewerGateway([])
+    gateway = FakeAgentGateway([])
+    executor = _build_executor(
+        db_session, gateway=gateway, reviewer_gateway=reviewer_gateway
+    )
+    recovery = _build_recovery(db_session, executor=executor)
+
+    reclaimed = await recovery.reclaim_expired_runs()
+
+    assert run.id in reclaimed
+    assert reviewer_gateway.calls == []  # 已发布，不重审
+    assert (await db_session.get(AgentRun, run.id)).status == RunStatus.COMPLETED
+    all_versions = (
+        await db_session.scalars(
+            select(AgentArtifactVersion).where(
+                AgentArtifactVersion.source_run_id == run.id
+            )
+        )
+    ).all()
+    assert len(all_versions) == 1  # 不重复发布
+    event_types = [event.event_type for event in await _events(db_session, run.id)]
+    assert event_types.count("artifact.published") == 1
+    assert event_types.count("message.completed") == 1
+    assert event_types.count("run.completed") == 1
+
+
+async def test_reviewing_takeover_after_reject_commit_settles_failed(
+    db_session, user_factory
+) -> None:
+    """H1 窗口：reject 清理已提交（batch failed + Draft/Artifact failed）但
+    Run 迁移与 run.failed 未完成的崩溃——接管方补齐 review.rejected 并以
+    error_code=review_rejected 收口 failed，恰好一个终态事件。"""
+    run, _, _ = await _make_session(db_session, user_factory)
+    await _start_attempt(db_session, run, worker="worker-a")
+    batch, _, drafts = await _make_reviewing_scene(
+        db_session, run, brands=("瑞幸",), approved_count=1
+    )
+    # reject 清理已提交、Run 未迁移的崩溃现场。
+    row = await db_session.get(AgentRun, run.id)
+    row.status = RunStatus.REVIEWING
+    fresh_batch = await db_session.get(ArtifactReviewBatch, batch.id)
+    fresh_batch.status = "failed"
+    fresh_batch.completed_at = utc_now()
+    for draft in drafts:
+        draft.status = "failed"
+        draft.owner_run_id = None
+    _expire_lease(row)
+    await db_session.flush()
+
+    reviewer_gateway = FakeReviewerGateway([])
+    gateway = FakeAgentGateway([])
+    executor = _build_executor(
+        db_session, gateway=gateway, reviewer_gateway=reviewer_gateway
+    )
+    recovery = _build_recovery(db_session, executor=executor)
+
+    reclaimed = await recovery.reclaim_expired_runs()
+
+    assert run.id in reclaimed
+    assert reviewer_gateway.calls == []
+    assert (await db_session.get(AgentRun, run.id)).status == RunStatus.FAILED
+    events = await _events(db_session, run.id)
+    event_types = [event.event_type for event in events]
+    assert event_types.count("review.rejected") == 1
+    terminal = [
+        event
+        for event in events
+        if event.event_type in ("run.completed", "run.failed", "run.cancelled")
+    ]
+    assert len(terminal) == 1
+    assert terminal[0].event_type == "run.failed"
+    assert terminal[0].payload_json["error_code"] == "review_rejected"
+    assert event_types.index("review.rejected") < event_types.index("run.failed")
+
+
 async def test_reviewing_run_with_unexpired_lease_is_not_reclaimed(
     db_session, user_factory
 ) -> None:

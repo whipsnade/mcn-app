@@ -25,6 +25,7 @@ from app.agent_artifacts.models import (
     ArtifactReviewItem,
 )
 from app.agent_artifacts.service import ArtifactService
+from app.agent_runtime.events import AgentEventBroker, AgentEventStream
 from app.agent_runtime.model_gateway import AgentModelGateway
 from app.agent_runtime.models import AgentMessage, AgentRun
 from app.agent_runtime.repository import AgentRunRepository
@@ -221,6 +222,16 @@ async def test_batch_publishes_all_versions_atomically_when_all_approved(
     assert msg.run_id == run.id
 
     assert batch.status == "completed"
+    # H1：发布不再迁移 Run——终态迁移与 run.completed 由终态事务边界一体完成。
+    assert run.status == "reviewing"
+    event = await AgentEventStream(db_session, AgentEventBroker()).settle_terminal(
+        run.id,
+        run.user_id,
+        RunStatus.COMPLETED,
+        {"outcome": "completed"},
+        worker_id="worker",
+    )
+    assert event is not None and event.event_type == "run.completed"
     assert run.status == "completed"
 
 
@@ -252,13 +263,24 @@ async def test_batch_reject_publishes_nothing_and_run_fails(
     for item in items:
         await driver.review_item(parent_run=run, item=item, user_question="分析")
 
-    # 任一 reject → 整批失败，不产生部分发布
-    assert run.status == "failed"
+    # 任一 reject → 整批失败，不产生部分发布；H1：Run 终态迁移由终态事务边界完成。
+    assert run.status == "reviewing"
     assert batch.status == "failed"
     assert len((await db_session.scalars(select(AgentArtifactVersion))).all()) == 0
     assert artifact_a.status == "failed"
     draft_b_row = await db_session.get(type(draft_b), draft_b.id)
     assert draft_b_row is not None and draft_b_row.status == "failed"
+
+    # 终态事务边界：迁移 failed + run.failed 一体提交（引擎 reject 分支同款收口）。
+    event = await AgentEventStream(db_session, AgentEventBroker()).settle_terminal(
+        run.id,
+        run.user_id,
+        RunStatus.FAILED,
+        {"outcome": "failed", "error_code": "review_rejected"},
+        worker_id="worker",
+    )
+    assert event is not None and event.event_type == "run.failed"
+    assert run.status == "failed"
 
     # publish 被阻止且仍无任何版本
     with pytest.raises(Exception):
@@ -315,7 +337,8 @@ async def test_revised_draft_re_reviewed_and_prior_approval_reused(
 
     versions = await service.publish_batch(batch.id, worker_id="worker")
     assert len(versions) == 2
-    assert run.status == "completed"
+    # H1：发布不再迁移 Run——终态迁移由终态事务边界完成。
+    assert run.status == "reviewing"
 
 
 async def test_modified_approved_draft_must_be_re_reviewed(

@@ -30,6 +30,7 @@ from app.agent_artifacts.models import (
     ArtifactReviewItem,
 )
 from app.agent_artifacts.service import ArtifactBusy, ArtifactService
+from app.agent_runtime.events import AgentEventBroker, AgentEventStream
 from app.agent_runtime.model_gateway import AgentModelGateway
 from app.agent_runtime.models import (
     AgentMessage,
@@ -338,6 +339,16 @@ async def test_approve_on_first_call_then_publish(
     assert msg.content == "完成"
     assert msg.run_id == run.id
 
+    # H1：发布不再迁移 Run——终态迁移与 run.completed 由终态事务边界一体完成。
+    assert run.status == "reviewing"
+    event = await AgentEventStream(db_session, AgentEventBroker()).settle_terminal(
+        run.id,
+        run.user_id,
+        RunStatus.COMPLETED,
+        {"outcome": "completed"},
+        worker_id="worker",
+    )
+    assert event is not None and event.event_type == "run.completed"
     assert run.status == "completed"
 
 
@@ -434,13 +445,24 @@ async def test_third_revise_is_treated_as_reject_and_run_fails(
     assert r3.draft_revision_id == revision3.id
     assert item.status == "rejected"
 
-    # reject 收口：Run failed、Draft failed、Batch failed、无任何版本
-    assert run.status == "failed"
+    # reject 收口：Batch/Draft failed、无任何版本；H1：Run 终态迁移由终态
+    # 事务边界完成（引擎 reject 分支收口为 run.failed）。
+    assert run.status == "reviewing"
     assert batch.status == "failed"
     draft_row = await db_session.get(type(draft), draft.id)
     assert draft_row is not None
     assert draft_row.status == "failed"
     assert len((await db_session.scalars(select(AgentArtifactVersion))).all()) == 0
+
+    event = await AgentEventStream(db_session, AgentEventBroker()).settle_terminal(
+        run.id,
+        run.user_id,
+        RunStatus.FAILED,
+        {"outcome": "failed", "error_code": "review_rejected"},
+        worker_id="worker",
+    )
+    assert event is not None and event.event_type == "run.failed"
+    assert run.status == "failed"
 
     with pytest.raises(Exception):
         await service.publish_batch(batch.id, worker_id="worker")

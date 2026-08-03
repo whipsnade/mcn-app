@@ -115,6 +115,24 @@ class _FakeReviewerGateway:
         raise AssertionError("reviewer gateway should not be called")
 
 
+class _FailOnceEventStream(AgentEventStream):
+    """第一次终态事件插入时注入崩溃（H1：模拟进程在终态事务中途宕机）。
+
+    崩溃点位于"Run 状态已迁移、终态事件未写"的窗口——改造后该窗口在
+    同一事务内，异常必须整体回滚（Run 保持非终态、无终态事件残留）。
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.crashes_left = 1
+
+    async def _insert_terminal_locked(self, run, event_type, payload):
+        if self.crashes_left > 0:
+            self.crashes_left -= 1
+            raise RuntimeError("injected terminal-transaction crash")
+        return await super()._insert_terminal_locked(run, event_type, payload)
+
+
 @asynccontextmanager
 async def _shared_session(db_session):
     """把测试的共享 AsyncSession 当作可复用的会话上下文（退出不关闭）。"""
@@ -174,9 +192,10 @@ def _build_executor(
     registry: ToolRegistry | None = None,
     lease_seconds: int = 300,
     claim_interval_seconds: float = 0.01,
+    events: AgentEventStream | None = None,
 ) -> AgentRunExecutor:
     broker = AgentEventBroker()
-    events = AgentEventStream(db_session, broker)
+    events = events or AgentEventStream(db_session, broker)
     reviewer = ReviewerDriver(db_session, _FakeReviewerGateway(), worker_id=worker)
     registry = registry or ToolRegistry()
 
@@ -598,8 +617,7 @@ async def test_finalize_failed_does_not_emit_second_terminal_event(
     fresh = await db_session.get(AgentRun, run.id)
     assert fresh.status == RunStatus.FAILED
     # 模拟 executor 兜底再调一次（如引擎收口后又抛异常）：不得出现第二个终态事件
-    repo = AgentRunRepository(db_session)
-    await executor._finalize_failed(db_session, repo, run.id, "worker")
+    await executor._finalize_failed(db_session, run.id, "worker")
     rows = await _run_events(db_session, run.id)
     terminal = [
         row
@@ -623,7 +641,7 @@ async def test_finalize_failed_skips_when_lease_held_by_other_worker(
 
     gateway = FakeAgentGateway([])
     executor = _build_executor(db_session, gateway=gateway, worker="worker-b")
-    await executor._finalize_failed(db_session, repo, run.id, "worker-b")
+    await executor._finalize_failed(db_session, run.id, "worker-b")
 
     fresh = await db_session.get(AgentRun, run.id)
     assert fresh.status == RunStatus.RUNNING
@@ -634,6 +652,38 @@ async def test_finalize_failed_skips_when_lease_held_by_other_worker(
         for row in rows
         if row.event_type in ("run.completed", "run.failed", "run.cancelled")
     ] == []
+
+
+async def test_terminal_settle_crash_rolls_back_and_executor_settles_failed(
+    db_session, user_factory
+) -> None:
+    """H1 崩溃注入：complete 的终态事务（Run 迁移 + run.completed 事件）中途
+    崩溃——整体回滚，Run 保持非终态且无 run.completed 残留；executor 兜底
+    以恰好一个 run.failed 终态事件收口（message.completed 顺序不变）。"""
+    run, _, _ = await _make_session(db_session, user_factory)
+    events = _FailOnceEventStream(db_session, AgentEventBroker())
+    gateway = FakeAgentGateway([Complete(action="complete", text="分析完成")])
+    executor = _build_executor(db_session, gateway=gateway, events=events)
+
+    run_id = await executor.claim_and_process_one()
+
+    assert run_id == run.id
+    fresh = await db_session.get(AgentRun, run.id)
+    assert fresh.status == RunStatus.FAILED
+    rows = await _run_events(db_session, run.id)
+    types = [row.event_type for row in rows]
+    terminal = [
+        row
+        for row in rows
+        if row.event_type in ("run.completed", "run.failed", "run.cancelled")
+    ]
+    # 第一次终态事务整体回滚：无 run.completed 残留、终态事件恰好一个。
+    assert len(terminal) == 1
+    assert terminal[0].event_type == "run.failed"
+    assert terminal[0].payload_json["error_code"] == "executor_error"
+    # message.completed 在终态事务之前已提交（顺序不变），回滚不波及。
+    assert "message.completed" in types
+    assert types.index("message.completed") < types.index("run.failed")
 
 
 async def test_live_stream_executor_crash_ends_with_run_failed() -> None:

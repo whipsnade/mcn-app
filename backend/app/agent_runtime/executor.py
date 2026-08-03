@@ -37,7 +37,7 @@ from app.agent_runtime.events import AgentEventBroker, AgentEventStream
 from app.agent_runtime.models import AgentRun, AgentRunAttempt
 from app.agent_runtime.profiles import get_profile
 from app.agent_runtime.repository import AgentRunRepository, utc_now
-from app.agent_runtime.state import InvalidRunTransition, RunStatus
+from app.agent_runtime.state import RunStatus
 from app.agent_runtime.tools.factory import load_channel_permissions
 from app.agent_runtime.transcript import RunTranscriptLoader
 
@@ -201,7 +201,9 @@ class AgentRunExecutor:
             raise
         except Exception:
             logger.exception("agent run %s failed in executor", run_id)
-            await self._finalize_failed(db, repo, run_id, worker_id)
+            # 回滚引擎崩溃现场的半提交写入，兜底收口在干净状态上进行（H1）。
+            await db.rollback()
+            await self._finalize_failed(db, run_id, worker_id)
             await db.commit()
             return RunStatus.FAILED
 
@@ -320,41 +322,32 @@ class AgentRunExecutor:
     # ------------------------------------------------------------------ #
 
     async def _finalize_failed(
-        self, db: AsyncSession, repo: AgentRunRepository, run_id: str, worker_id: str
+        self, db: AsyncSession, run_id: str, worker_id: str
     ) -> None:
-        """执行器错误收口：持有租约经 transition，否则回退系统级 force_fail。
+        """执行器错误收口：经 settle_terminal 事务边界把 Run 置 failed 并发
+        恰好一个 run.failed 终态事件（稳定 ``error_code=executor_error``，
+        §5.8/G1）——引擎在 decide 之外崩溃时没人发终态事件，SSE 流会因此
+        不结束、前端 Run 卡停在中间态。
 
-        只有本 worker 真实把 Run 置 failed（transition 成功或 force_fail 确认
-        无其他活跃持有者）才发 run.failed 终态事件（稳定
-        ``error_code=executor_error``，§5.8/G1）——引擎在 decide 之外崩溃时
-        没人发终态事件，SSE 流会因此不结束、前端 Run 卡停在中间态。
-        已是终态（引擎已自行收口，含已发 run.failed）或租约被他人活跃持有
-        （已接管，终态事件由接管方负责，A4 闸门）时跳过，绝不重复发送。
+        迁移与事件在同一加锁事务提交（H1）：持租约走状态机、无租约走系统级
+        force_fail；已是终态（引擎已自行收口，含已发 run.failed）或租约被
+        他人活跃持有（已接管，终态事件由接管方负责，A4 闸门）时幂等返回，
+        绝不重复发送。收口本身失败只记日志——Run 保持 running + 租约，
+        恢复循环在租约过期后接管自愈。
         """
         try:
-            await repo.transition(run_id, RunStatus.FAILED, worker_id=worker_id)
-            failed = True
-        except InvalidRunTransition:
-            try:
-                failed = await repo.force_fail(run_id, error_code="executor_error")
-            except Exception:
-                logger.exception("force_fail failed for run %s", run_id)
-                failed = False
-        if not failed:
-            return
-        run = await db.get(AgentRun, run_id)
-        if run is None:  # pragma: no cover - 刚收口的 Run 必然存在
-            return
-        try:
-            await AgentEventStream(db, self._broker).append_terminal_once(
+            run = await db.get(AgentRun, run_id)
+            if run is None:  # pragma: no cover - Run 必然存在
+                return
+            await AgentEventStream(db, self._broker).settle_terminal(
                 run_id,
                 run.user_id,
-                "run.failed",
+                RunStatus.FAILED,
                 {"outcome": "failed", "error_code": "executor_error"},
+                worker_id=worker_id,
             )
         except Exception:
-            # 事件补发失败不改变已落库的 failed 终态；恢复/重读仍以 DB 为准。
-            logger.exception("run.failed event append failed for run %s", run_id)
+            logger.exception("run %s terminal settlement failed in executor", run_id)
 
 
 __all__ = ["AgentRunExecutor"]

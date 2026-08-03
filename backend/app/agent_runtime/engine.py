@@ -52,11 +52,13 @@ G1 收口（§5.8/§15.3）的两条事件契约：
 
 - **终态事件统一收口**：所有使 Run 进入终态的路径（complete / 原子发布 /
   Reviewer reject（含第 3 次 revise 映射）/ 系统失败 ``_fail_run`` / 取消 /
-  executor 异常兜底）都经 ``AgentEventStream.append_terminal_once`` 发恰好
-  一个终态事件；失败路径携带稳定 ``error_code``（review_rejected /
-  review_error / publish_error / model_error / max_invalid_actions /
-  run_lease_lost / review_batch_missing / executor_error）。租约已丢失的
-  旧 worker 不发终态事件（A4 闸门，接管方负责）；
+  executor 异常兜底）都经 ``AgentEventStream.settle_terminal`` 事务边界
+  收口——Run 状态迁移与恰好一个终态事件在同一加锁事务内提交（H1），
+  失败路径携带稳定 ``error_code``（review_rejected / review_error /
+  publish_error / model_error / max_invalid_actions / run_lease_lost /
+  review_batch_missing / executor_error）。租约已丢失的旧 worker 不发终态
+  事件（A4 闸门，接管方负责）；publish_batch / Reviewer reject 不再迁移
+  Run——迁移一律由终态事务边界完成，消除"已终态无事件"窗口；
 - **artifact 事件接入统一 Run SSE**：Draft 工具成功发
   ``artifact.draft.created``/``artifact.draft.updated``，原子发布成功为每个
   Artifact 发 ``artifact.published``（``message.completed`` 之前），payload
@@ -87,6 +89,7 @@ from app.agent_artifacts.lineage import (
 )
 from app.agent_artifacts.models import (
     AgentArtifact,
+    AgentArtifactVersion,
     ArtifactDraft,
     ArtifactDraftRevision,
     ArtifactReviewAttempt,
@@ -99,6 +102,7 @@ from app.agent_runtime.events import AgentEventStream
 from app.agent_runtime.heartbeat import RunLeaseHeartbeat
 from app.agent_runtime.model_gateway import InvalidModelOutput
 from app.agent_runtime.models import (
+    AgentEvent,
     AgentMessage,
     AgentRun,
     AgentRunAttempt,
@@ -756,7 +760,7 @@ class AgentEngine:
                 ArtifactReviewBatch.parent_run_id == run.id
             )
         )
-        if batch is None or batch.status in ("completed", "failed"):
+        if batch is None:
             # 不变量破坏：reviewing 但无可复核 Batch——按系统错误干净收口，
             # 绝不卡在 reviewing。
             logger.error(
@@ -764,12 +768,79 @@ class AgentEngine:
             )
             await self._fail_run(run, error_code="review_batch_missing")
             return "failed", None
+        if batch.status == "completed":
+            # H1 窗口：原子发布已提交（Version 落库）但终态事务未完成——幂等
+            # 补齐发布后续事件（不重复发布、不重复发事件）并收口 completed。
+            return await self._settle_published_takeover(run)
+        if batch.status == "failed":
+            # H1 窗口：reject 整批清理已提交但 Run 迁移未完成——补齐
+            # review.rejected 并以 review_rejected 收口 failed。
+            types, _ = await self._emitted_event_index(run.id)
+            if "review.rejected" not in types:
+                await self._events.append(
+                    run.id, run.user_id, "review.rejected", {"review_batch_id": batch.id}
+                )
+            await self._events.settle_terminal(
+                run.id,
+                run.user_id,
+                RunStatus.FAILED,
+                {"outcome": "failed", "error_code": "review_rejected"},
+                worker_id=self._worker_id,
+            )
+            return "rejected", None
         return await self._settle_review(
             run=run,
             batch=batch,
             conversation=conversation,
             user_question=user_question,
         )
+
+    async def _settle_published_takeover(self, run: AgentRun) -> tuple[str, str | None]:
+        """「发布已提交、终态事务未完成」的接管收口（H1 崩溃窗口）。
+
+        按 source_run_id 找到已发布 Version，幂等补齐 artifact.published
+        （按 artifact_id 去重）与 message.completed，再经终态事务边界收口
+        completed——绝不重复发布、不重复发已提交过的事件。
+        """
+        versions = list(
+            (
+                await self._db.scalars(
+                    select(AgentArtifactVersion).where(
+                        AgentArtifactVersion.source_run_id == run.id
+                    )
+                )
+            ).all()
+        )
+        types, published_ids = await self._emitted_event_index(run.id)
+        missing = [v for v in versions if v.artifact_id not in published_ids]
+        await self._emit_artifact_published(run, missing)
+        if "message.completed" not in types:
+            await self._events.append(
+                run.id, run.user_id, "message.completed", {"type": "completion"}
+            )
+        await self._events.settle_terminal(
+            run.id,
+            run.user_id,
+            RunStatus.COMPLETED,
+            {"outcome": "completed"},
+            worker_id=self._worker_id,
+        )
+        published = await self._latest_assistant_message(run.id)
+        return "approved", (published.id if published is not None else None)
+
+    async def _emitted_event_index(self, run_id: str) -> tuple[set[str], set[str]]:
+        """该 Run 已提交事件的类型集合 + artifact.published 的 artifact_id 集合
+        （接管幂等去重用）。"""
+        rows = (
+            await self._db.scalars(select(AgentEvent).where(AgentEvent.run_id == run_id))
+        ).all()
+        types = {row.event_type for row in rows}
+        published_ids = {
+            (row.payload_json or {}).get("artifact_id")
+            for row in rows
+            if row.event_type == "artifact.published"
+        }
+        return types, {pid for pid in published_ids if pid is not None}
 
     async def _settle_review(
         self,
@@ -812,14 +883,16 @@ class AgentEngine:
                 "review.rejected",
                 {"review_batch_id": batch.id},
             )
-            # G1/§5.8：reject 已由 Reviewer 把 Run 迁移 failed（_finalize_reject），
-            # 必须补发 run.failed 终态事件——它是该 Run 最后一条用户可见事件，
-            # 缺失会让 SSE 流不结束、前端 Run 卡停在中间态。
-            await self._events.append_terminal_once(
+            # G1/§5.8 + H1：reject 的整批清理由 Reviewer 完成（_finalize_reject，
+            # 随 review.rejected 提交），Run 迁移与 run.failed 由终态事务边界
+            # 一体提交——它是该 Run 最后一条用户可见事件，缺失会让 SSE 流不
+            # 结束、前端 Run 卡停在中间态。
+            await self._events.settle_terminal(
                 run.id,
                 run.user_id,
-                "run.failed",
+                RunStatus.FAILED,
                 {"outcome": "failed", "error_code": "review_rejected"},
+                worker_id=self._worker_id,
             )
             return "rejected", None
         if any(result.decision == "revise" for result in results):
@@ -868,8 +941,14 @@ class AgentEngine:
         await self._events.append(
             run.id, run.user_id, "message.completed", {"type": "completion"}
         )
-        await self._events.append_terminal_once(
-            run.id, run.user_id, "run.completed", {"outcome": "completed"}
+        # H1：Run 迁移（reviewing→completed）与 run.completed 由终态事务边界
+        # 一体提交；publish_batch 不再迁移 Run（消除"已终态无事件"窗口）。
+        await self._events.settle_terminal(
+            run.id,
+            run.user_id,
+            RunStatus.COMPLETED,
+            {"outcome": "completed"},
+            worker_id=self._worker_id,
         )
         published = await self._latest_assistant_message(run.id)
         return "approved", (published.id if published is not None else None)
@@ -880,6 +959,8 @@ class AgentEngine:
         §5.7：非发布出口释放本 Run 持有的 Draft working head（保留不可变
         Revision），不得永久 artifact_busy。
         §5.8 事件顺序：message.completed 先于 run.completed，终态事件最后。
+        H1：Run 迁移与 run.completed 由 settle_terminal 同一加锁事务提交，
+        消除"已终态无事件"窗口。
         """
         metadata = {"type": "completion", "suggestions": action.suggestions}
         message = await self._append_message(
@@ -890,14 +971,15 @@ class AgentEngine:
             metadata=metadata,
         )
         await self._release_owned_drafts(run)
-        await self._repo.transition(
-            run.id, RunStatus.COMPLETED, worker_id=self._worker_id
-        )
         await self._events.append(
             run.id, run.user_id, "message.completed", {"type": "completion"}
         )
-        await self._events.append_terminal_once(
-            run.id, run.user_id, "run.completed", {"outcome": "completed"}
+        await self._events.settle_terminal(
+            run.id,
+            run.user_id,
+            RunStatus.COMPLETED,
+            {"outcome": "completed"},
+            worker_id=self._worker_id,
         )
         return message
 
@@ -943,6 +1025,7 @@ class AgentEngine:
         收口成功（含 force_fail 确认无其他活跃持有者）后释放本 Run 持有的
         Draft working head（§5.7 failed 出口，保留不可变 Revision）。
         已是终态（幂等）或租约被他人活跃持有（接管方负责）时不发事件。
+        H1：迁移只是 flush，与 run.failed 事件由 settle_terminal 同一事务提交。
         """
         try:
             await self._repo.transition(
@@ -956,11 +1039,12 @@ class AgentEngine:
             failed = await self._repo.force_fail(run.id, error_code=error_code)
         if failed:
             await self._release_owned_drafts(run, outcome="failed")
-            await self._events.append_terminal_once(
+            await self._events.settle_terminal(
                 run.id,
                 run.user_id,
-                "run.failed",
+                RunStatus.FAILED,
                 {"outcome": "failed", "error_code": error_code},
+                worker_id=self._worker_id,
             )
 
     async def _renew_lease(self, run: AgentRun) -> bool:
@@ -991,8 +1075,8 @@ class AgentEngine:
         await self._fail_run(run, error_code=error_code)
 
     async def _settle_cancelled(self, run: AgentRun) -> None:
-        """取消收口：释放本 Run 持有的 Draft（idle）→ 迁移 cancelled → 发恰好一个
-        run.cancelled 终态事件。
+        """取消收口：释放本 Run 持有的 Draft（idle）→ 终态事务边界迁移 cancelled
+        并发恰好一个 run.cancelled 终态事件。
 
         已被收口（API 立即取消路径或其他 worker）时幂等跳过——同一 Run 全
         局恰好一个 ``run.cancelled`` 事件。
@@ -1001,9 +1085,9 @@ class AgentEngine:
         if RunStatus(fresh.status) == RunStatus.CANCELLED:
             return
         await self._release_owned_drafts(run)
-        cancelled = await self._repo.cancel(run.id, run.user_id)
-        if cancelled:
-            await self._events.append_terminal_once(run.id, run.user_id, "run.cancelled", {})
+        await self._events.settle_terminal(
+            run.id, run.user_id, RunStatus.CANCELLED, {}, worker_id=self._worker_id
+        )
 
     async def _release_owned_drafts(self, run: AgentRun, *, outcome: str = "idle") -> None:
         """释放本 Run 持有的全部 Draft working head，保留不可变 Revision（§5.7）。
