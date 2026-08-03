@@ -47,6 +47,7 @@ echo "[UAT] 真实模型 + 真实 DataTap MCP，连接 test DB；每次 MCP 调�
 cd "${BACKEND_DIR}"
 "${BACKEND_DIR}/.venv/bin/python" -m pytest \
   tests/integration/test_agent_runtime_real.py \
+  tests/integration/test_real_providers.py \
   -m real_services \
   -q \
   -p no:cacheprovider

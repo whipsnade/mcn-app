@@ -1,3 +1,5 @@
+import os
+
 import pytest
 from pydantic import BaseModel, ConfigDict
 
@@ -7,6 +9,10 @@ from app.mcp_gateway.datatap import DataTapTransport
 from app.model.contracts import ChatMessage, StructuredModelRequest
 from app.model.tencent_plan import TencentPlanAdapter
 
+# 真实服务探针：命中真实模型/DataTap，默认跳过（结果受供应商行为影响，不宜在
+# 默认套件中造成非确定性红）；仅 RUN_REAL_SERVICES=1 + -m real_services 时运行。
+_REAL_SERVICES_SKIP_REASON = "真实服务探针需要 RUN_REAL_SERVICES=1（scripts/run_real_agent_uat.sh）"
+
 
 class ProbeResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -15,6 +21,10 @@ class ProbeResult(BaseModel):
 
 
 @pytest.mark.asyncio
+@pytest.mark.real_services
+@pytest.mark.skipif(
+    os.environ.get("RUN_REAL_SERVICES") != "1", reason=_REAL_SERVICES_SKIP_REASON
+)
 async def test_real_datatap_lists_social_grow_tools() -> None:
     transport = DataTapTransport(token=get_settings().datatap_mcp_token)
     try:
@@ -34,6 +44,10 @@ def test_real_tencent_adapter_uses_confirmed_model() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.real_services
+@pytest.mark.skipif(
+    os.environ.get("RUN_REAL_SERVICES") != "1", reason=_REAL_SERVICES_SKIP_REASON
+)
 async def test_real_tencent_adapter_recovers_from_json_schema_incompatibility() -> None:
     adapter = TencentPlanAdapter.from_settings(get_settings())
     try:
