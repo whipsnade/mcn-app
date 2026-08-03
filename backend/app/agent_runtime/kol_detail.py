@@ -4,11 +4,14 @@
 1. 先读取 Session 级 24h 缓存（``kol_detail_cache``，唯一
    ``(user_id, session_id, platform, kol_uid)``）；命中则零积分、零模型/MCP
    调用地重建 ``kol_detail_v2``（``data.cache.hit=true``）；
-2. 未命中/过期才创建 ``run_kind=user``、``visibility=user``、
-   ``profile=kol_detail_v1`` 的轻量 Run：模型经 Task 14 引擎（复用同一
-   ``AgentEngine``，仅换 Profile）抓取 KOL 详情/热帖、构建 Draft、经 Reviewer
-   发布 ``kol_detail_v2``，发布成功后回填缓存（payload + evidence refs +
-   fetched_at/expires_at）。
+2. 缓存 miss 时回退最新已发布 ``kol_detail_v2`` Version（H2）：仍在 TTL
+   内则由该 Version 的 payload + evidence refs 重建/刷新缓存行并按缓存
+   命中返回（等价缓存命中，零模型/MCP/积分）；
+3. 缓存与 Version 回退都不可用（过期/不存在/损坏）才创建
+   ``run_kind=user``、``visibility=user``、``profile=kol_detail_v1`` 的
+   轻量 Run：模型经 Task 14 引擎（复用同一 ``AgentEngine``，仅换 Profile）
+   抓取 KOL 详情/热帖、构建 Draft、经 Reviewer 发布 ``kol_detail_v2``，
+   发布成功后回填缓存（payload + evidence refs + fetched_at/expires_at）。
 
 并发车道：同一 Session 的 ``session_analyst_v1`` 与 ``kol_detail_v1`` 互不阻塞
 （不同 artifact_key）；同一 ``(platform, kol_uid)`` 已存在活动 kol-detail Run
@@ -39,6 +42,13 @@
 - 引擎失败收口：协调行已提交不能整单回滚——引擎正常收口（failed/paused/
   cancelled）时提交其终态；引擎抛出未捕获异常时尽力把 Run 置 failed、释放
   working head 并提交（不遮蔽原异常），下一次 create 立即可接管；
+- **已发布 Version 回退（H2）**：发布时 ``publish_batch`` 先释放 working
+  head 并提交 Version，缓存要等引擎返回后才回填——落在该窗口内的第二请求，
+  以及 executor 崩溃恢复发布（不回填缓存）后的下一次点击，都会看到
+  「Version 已发布 + 缓存为空」。缓存 miss 时改查最新已发布 Version：TTL
+  内则由它重建缓存并按命中返回（零模型/MCP/积分），不再新建第二个 Run；
+  Version 过期/不存在才走协调事务创建新 Run；payload 经
+  ``KolDetailV2.model_validate`` 守卫，损坏则跳过回退走新 Run（不 500）；
 - 缓存 payload 损坏时驱逐缓存行并刷新，而不是 500。
 
 builder 的角色：``build_kol_detail_draft``（Task 17）不是运行时强制接线——
@@ -314,15 +324,22 @@ class KolDetailRunService:
         selection_artifact_id: str | None = None,
         selection_version: str | None = None,
     ) -> KolDetailRunSummary:
-        """缓存优先；未命中/过期才创建 kol_detail_v1 轻量 Run（§13.2）。
+        """缓存优先；已发布 Version 回退其次；都不可用才创建 kol_detail_v1
+        轻量 Run（§13.2 + H2）。
 
-        并发协调（G3）：缓存未命中后、任何模型/MCP 调用发生**之前**，先在
-        数据库建立/认领 kol-detail 的 working head（协调事务，立即提交）。
-        两个真实并发 create 最多一个赢得协调权进入引擎——MCP 抓取与积分
-        扣费至多一次；后到者幂等返回先到者的活动 Run（或其已回填的缓存）。
+        并发协调（G3）：缓存/Version 都未命中后、任何模型/MCP 调用发生
+        **之前**，先在数据库建立/认领 kol-detail 的 working head（协调事务，
+        立即提交）。两个真实并发 create 最多一个赢得协调权进入引擎——MCP
+        抓取与积分扣费至多一次；后到者幂等返回先到者的活动 Run（或其已
+        回填的缓存/刚发布的 Version）。
         """
         cached = await self.get_cached_detail(user_id, session_id, platform, kol_uid)
         hit = await self._try_cache_hit(cached)
+        if hit is not None:
+            return hit
+        # H2：缓存 miss 先回退最新已发布 Version（TTL 内等价缓存命中）——封闭
+        # 「working head 已释放、缓存未回填」窗口与恢复发布不回填的重复扣费。
+        hit = await self._try_published_version_hit(user_id, session_id, platform, kol_uid)
         if hit is not None:
             return hit
 
@@ -336,9 +353,13 @@ class KolDetailRunService:
                 # 同一 (platform, kol_uid) 已有活动 kol-detail Run：幂等返回，不重复创建。
                 return KolDetailRunSummary(run_id=existing, detail=None, cached=False)
 
-            # 持有锁后重查缓存：并发写入者可能已填好缓存，避免重复抓取/模型消耗。
+            # 持有锁后重查：并发写入者可能已填好缓存或刚发布 Version（H2），
+            # 避免重复抓取/模型/积分消耗。
             cached = await self.get_cached_detail(user_id, session_id, platform, kol_uid)
             hit = await self._try_cache_hit(cached)
+            if hit is not None:
+                return hit
+            hit = await self._try_published_version_hit(user_id, session_id, platform, kol_uid)
             if hit is not None:
                 return hit
 
@@ -403,6 +424,69 @@ class KolDetailRunService:
             await self.db.delete(cached)
             await self.db.flush()
             return None
+
+    async def _try_published_version_hit(
+        self, user_id: str, session_id: str, platform: str, kol_uid: str
+    ) -> KolDetailRunSummary | None:
+        """已发布 Version 回退（H2）：缓存 miss 时，最新已发布 ``kol_detail_v2``
+        Version 仍在 TTL 内 → 由其 payload + evidence refs 重建缓存行并返回
+        缓存命中摘要（等价缓存命中：零模型/MCP/积分，fetched_at/expires_at
+        与 Version 发布时间对齐，语义同引擎回填）。
+
+        封闭两个重复扣费窗口：
+        - 发布窗口竞态：``publish_batch`` 先释放 working head 并提交 Version，
+          缓存要等引擎返回后才回填——落在窗口内的第二请求直接命中刚发布的
+          Version，不再新建第二个 Run；
+        - 恢复不回填：executor 接管发布后不回填缓存，下次点击由 Version 重建。
+
+        归属校验不放松：Artifact 按 session_id + artifact_key 查询（现有归属
+        模式）；payload 形状沿用 ``KolDetailV2.model_validate`` 守卫。Version
+        不存在/已过期/payload 损坏 → 返回 None 走新 Run 路径（不得 500）。
+        """
+        artifact_key = build_artifact_key("kol-detail", platform=platform, kol_uid=kol_uid)
+        artifact = await self.db.scalar(
+            select(AgentArtifact).where(
+                AgentArtifact.session_id == session_id,
+                AgentArtifact.artifact_key == artifact_key,
+            )
+        )
+        if artifact is None:
+            return None
+        version = await self.db.scalar(
+            select(AgentArtifactVersion)
+            .where(AgentArtifactVersion.artifact_id == artifact.id)
+            .order_by(AgentArtifactVersion.version.desc())
+            .limit(1)
+        )
+        if version is None:
+            return None
+        fetched_at = version.created_at
+        expires_at = fetched_at + timedelta(hours=self.cache_ttl_hours)
+        if expires_at <= self.now_fn():
+            return None
+        payload = version.payload_json or {}
+        try:
+            KolDetailV2.model_validate(payload)
+        except ValidationError:
+            # 发布边界有强类型校验，损坏 Version 不应存在；防御性跳过回退走新
+            # Run（不 500），绝不把坏 payload 写进缓存。
+            logger.warning(
+                "kol_detail published version %s failed payload validation; "
+                "skipping version fallback",
+                version.id,
+            )
+            return None
+        row = await self.set_cached_detail(
+            user_id=user_id,
+            session_id=session_id,
+            platform=platform,
+            kol_uid=kol_uid,
+            payload=payload,
+            evidence_refs=version.evidence_refs_json or [],
+            fetched_at=fetched_at,
+            expires_at=expires_at,
+        )
+        return self._summary_from_cache(row)
 
     async def _active_kol_detail_run(
         self, session_id: str, platform: str, kol_uid: str

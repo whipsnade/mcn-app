@@ -12,7 +12,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
@@ -562,5 +562,105 @@ async def test_concurrent_create_fetches_and_charges_exactly_once() -> None:
         assert any(
             summary.detail is not None or summary.cached for summary in summaries
         )
+    finally:
+        await _teardown(user_id, session_id)
+
+
+# ---------------------------------------------------------------------------
+# 已发布 Version 回退（H2）：发布窗口 / 恢复不回填下零重复扣费
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_published_version_fallback_serves_without_recharge() -> None:
+    """已发布 Version 回退（H2）：Version 已发布 + 缓存为空（发布窗口 /
+    executor 恢复不回填的真实提交状态）→ 第二个 create 由 Version 重建缓存
+    并命中——零新 Run、零 MCP 外发、钱包不变。
+    """
+    user_id = str(uuid4())
+    session_id = str(uuid4())
+    now = _now()
+    async with SessionFactory.begin() as setup:
+        setup.add(
+            User(
+                id=user_id,
+                nickname="Version 回退测试用户",
+                role="user",
+                status="active",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        await setup.flush()
+        setup.add(
+            Wallet(user_id=user_id, balance=1000, reserved=0, version=0, updated_at=now)
+        )
+        setup.add(
+            AgentSession(
+                id=session_id,
+                user_id=user_id,
+                title="Version 回退会话",
+                status="active",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+
+    transport = OneShotMcpTransport()
+    try:
+        # 第一次 create：真实 Run 抓取 + 发布 + 回填缓存（与路由层一致提交）。
+        async with SessionFactory() as db:
+            gateway = ScriptedGateway(_actions_for(db))
+            service = _make_service(db, gateway=gateway, transport=transport, worker="worker-a")
+            summary1 = await service.create(user_id, session_id, PLATFORM, KOL_UID)
+            await db.commit()
+        assert summary1.cached is False
+        assert summary1.run_id is not None
+        assert len(transport.calls) == 1
+
+        # 模拟发布窗口 / 恢复不回填：Version 已发布、working head 已释放、缓存为空。
+        async with SessionFactory.begin() as db:
+            await db.execute(
+                delete(KolDetailCache).where(KolDetailCache.session_id == session_id)
+            )
+
+        # 第二次 create：命中最新已发布 Version（等价缓存命中）。gateway 不编排
+        # 任何动作——任何 decide 都会耗尽报错；transport 二次外发同样断言失败。
+        async with SessionFactory() as db:
+            gateway2 = ScriptedGateway([])
+            service2 = _make_service(db, gateway=gateway2, transport=transport, worker="worker-b")
+            summary2 = await service2.create(user_id, session_id, PLATFORM, KOL_UID)
+            await db.commit()
+        assert summary2.cached is True
+        assert summary2.run_id is None
+        assert summary2.detail is not None
+        assert summary2.detail["data"]["cache"]["hit"] is True
+
+        async with SessionFactory() as verify:
+            # 零新 Run / 零新 MCP 外发 / 钱包不变（绝不重复扣费）。
+            run_count = await verify.scalar(
+                select(func.count(AgentRun.id)).where(
+                    AgentRun.session_id == session_id,
+                    AgentRun.profile_name == "kol_detail_v1",
+                )
+            )
+            assert run_count == 1
+            assert len(transport.calls) == 1
+            wallet = await verify.get(Wallet, user_id)
+            assert wallet is not None
+            assert (wallet.balance, wallet.reserved) == (1000 - MCP_POINTS_COST, 0)
+            # 缓存行已由 Version 重建：fetched_at/expires_at 与 Version 发布时间对齐。
+            version = await verify.scalar(
+                select(AgentArtifactVersion).where(
+                    AgentArtifactVersion.source_run_id == summary1.run_id
+                )
+            )
+            assert version is not None
+            cache_row = await verify.scalar(
+                select(KolDetailCache).where(KolDetailCache.session_id == session_id)
+            )
+            assert cache_row is not None
+            assert cache_row.fetched_at == version.created_at
+            assert cache_row.expires_at == version.created_at + timedelta(hours=24)
     finally:
         await _teardown(user_id, session_id)

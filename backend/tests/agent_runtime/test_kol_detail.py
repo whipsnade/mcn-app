@@ -544,8 +544,18 @@ async def test_cache_expiry_allows_refresh(db_session, user_factory) -> None:
     assert summary1.cached is False
     calls_before = len(gateway.calls)
 
-    # 注入时钟越过 expires_at → 缓存过期，模型可重新抓取（创建新 Run）。
+    # 注入时钟越过 expires_at → 缓存过期；已发布 Version 同样回放到 TTL 之外
+    # （H2：缓存与 Version 两层新鲜度都过期才创建新 Run，否则 Version 回退命中）。
     service.now_fn = lambda: T0 + timedelta(hours=25)
+    version = await db_session.scalar(
+        select(AgentArtifactVersion).where(
+            AgentArtifactVersion.source_run_id == summary1.run_id
+        )
+    )
+    assert version is not None
+    version.created_at = T0
+    await db_session.flush()
+
     gateway.actions = _make_actions(db_session, evidence, _cache_state())
     summary2 = await service.create(user.id, session.id, PLATFORM, KOL_UID)
     assert summary2.cached is False
@@ -779,8 +789,9 @@ async def test_paused_owner_does_not_block_fresh_run(db_session, user_factory) -
     assert cache_row is not None
 
 
-async def test_corrupt_cache_evicted_and_refreshed(db_session, user_factory) -> None:
-    """损坏的缓存 payload：驱逐并刷新，而不是对用户 500（Fix minor）。"""
+async def test_corrupt_cache_evicted_and_rebuilt_from_version(db_session, user_factory) -> None:
+    """损坏的缓存 payload：驱逐该行（不对用户 500）后，由最新已发布 Version
+    （TTL 内）重建有效缓存——H2 回退让这次刷新零模型调用、零重复扣费。"""
     user = await user_factory()
     session = await _make_session(db_session, user.id)
     evidence = await _make_evidence(db_session, user.id, session.id)
@@ -792,6 +803,7 @@ async def test_corrupt_cache_evicted_and_refreshed(db_session, user_factory) -> 
     )
     summary1 = await service.create(user.id, session.id, PLATFORM, KOL_UID)
     assert summary1.cached is False
+    calls_after_first = len(gateway.calls)
 
     cache_row = await db_session.scalar(
         select(KolDetailCache).where(KolDetailCache.session_id == session.id)
@@ -804,18 +816,21 @@ async def test_corrupt_cache_evicted_and_refreshed(db_session, user_factory) -> 
     }
     await db_session.flush()
 
-    gateway.actions = _make_actions(db_session, evidence, _cache_state())
     summary2 = await service.create(user.id, session.id, PLATFORM, KOL_UID)
-    assert summary2.cached is False
-    assert summary2.run_id is not None
-    assert summary2.run_id != summary1.run_id
-    # 旧缓存行已被驱逐，只留下新回填的一行。
+    assert summary2.cached is True
+    assert summary2.run_id is None
+    assert summary2.detail is not None
+    assert summary2.detail["data"]["cache"]["hit"] is True
+    assert len(gateway.calls) == calls_after_first  # 无新模型调用
+    # 损坏行被驱逐后由 Version 重建，仍只有一行有效缓存。
     rows = (
         await db_session.scalars(
             select(KolDetailCache).where(KolDetailCache.session_id == session.id)
         )
     ).all()
     assert len(rows) == 1
+    assert rows[0].payload_json is not None
+    KolDetailV2.model_validate(rows[0].payload_json)  # 重建行 payload 有效
 
 
 # ---------------------------------------------------------------------------
@@ -1282,3 +1297,225 @@ async def test_takeover_restores_kol_detail_trigger_context(db_session, user_fac
         select(AgentArtifactVersion).where(AgentArtifactVersion.source_run_id == run.id)
     )
     assert version is not None
+
+
+# ---------------------------------------------------------------------------
+# 7. 已发布 Version 回退（H2）：发布窗口竞态 + 恢复不回填
+# ---------------------------------------------------------------------------
+
+
+async def test_recovery_without_backfill_hits_published_version(
+    db_session, user_factory
+) -> None:
+    """恢复不回填（H2）：Version 已发布、缓存为空（executor 接管发布后不回填
+    缓存）→ create 由最新已发布 Version 重建缓存并命中，零模型/MCP/积分。"""
+    user = await user_factory()
+    session = await _make_session(db_session, user.id)
+    evidence = await _make_evidence(db_session, user.id, session.id)
+    gateway, service = _make_service(
+        db_session,
+        actions=_make_actions(db_session, evidence, _cache_state()),
+        evidence=evidence,
+        now_fn=lambda: T0,
+    )
+
+    summary1 = await service.create(user.id, session.id, PLATFORM, KOL_UID)
+    assert summary1.cached is False
+    calls_after_first = len(gateway.calls)
+    version = await db_session.scalar(
+        select(AgentArtifactVersion).where(
+            AgentArtifactVersion.source_run_id == summary1.run_id
+        )
+    )
+    assert version is not None
+
+    # 模拟恢复路径发布后不回填：Version 在、缓存行不存在。
+    cache_row = await db_session.scalar(
+        select(KolDetailCache).where(KolDetailCache.session_id == session.id)
+    )
+    assert cache_row is not None
+    await db_session.delete(cache_row)
+    await db_session.flush()
+
+    summary2 = await service.create(user.id, session.id, PLATFORM, KOL_UID)
+
+    assert summary2.cached is True
+    assert summary2.run_id is None
+    assert summary2.detail is not None
+    assert summary2.detail["data"]["cache"]["hit"] is True
+    assert len(gateway.calls) == calls_after_first  # 零模型/MCP 调用
+    # 缓存行已由 Version 重建：fetched_at/expires_at 与 Version 发布时间对齐。
+    rebuilt = await db_session.scalar(
+        select(KolDetailCache).where(KolDetailCache.session_id == session.id)
+    )
+    assert rebuilt is not None
+    assert rebuilt.fetched_at == version.created_at
+    assert rebuilt.expires_at == version.created_at + timedelta(hours=24)
+    # 没有新建 Run（零扣费）。
+    count = await db_session.scalar(
+        select(func.count(AgentRun.id)).where(
+            AgentRun.session_id == session.id,
+            AgentRun.profile_name == "kol_detail_v1",
+        )
+    )
+    assert count == 1
+
+
+async def test_publish_window_second_request_hits_published_version(
+    db_session, user_factory, monkeypatch
+) -> None:
+    """发布窗口竞态（H2）：working head 已释放 + Version 已发布 + 缓存尚未
+    回填的窗口内，第二个 create 直接命中 Version——不新建第二个 Run。
+
+    窗口模拟：拦截首次 create 的缓存回填，在回填写入前（此刻 Version 已
+    发布、working head 已释放、缓存为空）用第二个服务实例发起 create；
+    第二实例 engine=None——回退命中发生在需要引擎之前，进一步证明零引擎
+    参与。
+    """
+    user = await user_factory()
+    session = await _make_session(db_session, user.id)
+    evidence = await _make_evidence(db_session, user.id, session.id)
+    gateway, service = _make_service(
+        db_session,
+        actions=_make_actions(db_session, evidence, _cache_state()),
+        evidence=evidence,
+        now_fn=lambda: T0,
+    )
+    second = KolDetailRunService(
+        db_session,
+        engine=None,
+        worker_id="worker",
+        cache_ttl_hours=24,
+        model="test-model",
+        now_fn=lambda: T0,
+    )
+
+    window_result = None
+    original_backfill = service.set_cached_detail
+
+    async def _interleaved_backfill(**kwargs):
+        nonlocal window_result
+        # 窗口内状态：Version 已发布、working head 已释放、缓存尚未写入。
+        window_result = await second.create(user.id, session.id, PLATFORM, KOL_UID)
+        return await original_backfill(**kwargs)
+
+    monkeypatch.setattr(service, "set_cached_detail", _interleaved_backfill)
+
+    summary1 = await service.create(user.id, session.id, PLATFORM, KOL_UID)
+    assert summary1.cached is False
+
+    # 窗口内的第二请求：命中刚发布的 Version（等价缓存命中），engine=None 也无需引擎。
+    assert window_result is not None
+    assert window_result.cached is True
+    assert window_result.run_id is None
+    assert window_result.detail is not None
+    assert window_result.detail["data"]["cache"]["hit"] is True
+    # 恰好一个 kol_detail Run；窗口回填与外层回填同键 upsert，仍只有一行缓存。
+    count = await db_session.scalar(
+        select(func.count(AgentRun.id)).where(
+            AgentRun.session_id == session.id,
+            AgentRun.profile_name == "kol_detail_v1",
+        )
+    )
+    assert count == 1
+    rows = (
+        await db_session.scalars(
+            select(KolDetailCache).where(KolDetailCache.session_id == session.id)
+        )
+    ).all()
+    assert len(rows) == 1
+    assert len(gateway.calls) == 3  # 仅首次 Run 的 fetch + create_draft + submit
+
+
+async def test_expired_published_version_starts_new_run(db_session, user_factory) -> None:
+    """Version 已过期（H2）：缓存与最新已发布 Version 都越过 TTL → 回退不适用，
+    走现有协调事务创建新 Run（路径不回归）。"""
+    user = await user_factory()
+    session = await _make_session(db_session, user.id)
+    evidence = await _make_evidence(db_session, user.id, session.id)
+    gateway, service = _make_service(
+        db_session,
+        actions=_make_actions(db_session, evidence, _cache_state()),
+        evidence=evidence,
+        now_fn=lambda: T0,
+    )
+    summary1 = await service.create(user.id, session.id, PLATFORM, KOL_UID)
+    assert summary1.cached is False
+    calls_after_first = len(gateway.calls)
+
+    # 缓存与 Version 都过期：时钟越过缓存 expires_at，Version 发布时间回放到
+    # TTL 之外（测试内改写；生产 Version 不可变，此处仅为构造过期状态）。
+    service.now_fn = lambda: T0 + timedelta(hours=25)
+    version = await db_session.scalar(
+        select(AgentArtifactVersion).where(
+            AgentArtifactVersion.source_run_id == summary1.run_id
+        )
+    )
+    assert version is not None
+    version.created_at = T0
+    await db_session.flush()
+
+    gateway.actions = _make_actions(db_session, evidence, _cache_state())
+    summary2 = await service.create(user.id, session.id, PLATFORM, KOL_UID)
+    assert summary2.cached is False
+    assert summary2.run_id is not None
+    assert summary2.run_id != summary1.run_id
+    assert len(gateway.calls) > calls_after_first
+
+
+async def test_corrupt_published_version_skips_fallback_and_starts_new_run(
+    db_session, user_factory
+) -> None:
+    """Version payload 损坏（H2 守卫）：``KolDetailV2`` 校验失败 → 跳过回退
+    走新 Run（不得 500）；新 Run 发布成为最新 Version 并回填缓存。"""
+    user = await user_factory()
+    session = await _make_session(db_session, user.id)
+    evidence = await _make_evidence(db_session, user.id, session.id)
+    gateway, service = _make_service(
+        db_session,
+        actions=_make_actions(db_session, evidence, _cache_state()),
+        evidence=evidence,
+        now_fn=lambda: T0,
+    )
+    summary1 = await service.create(user.id, session.id, PLATFORM, KOL_UID)
+    assert summary1.cached is False
+    calls_after_first = len(gateway.calls)
+
+    # 缓存为空 + 最新 Version payload 损坏（测试内改写；生产发布边界有强类型
+    # 校验，损坏 payload 无法落库，此处验证防御兜底）。
+    cache_row = await db_session.scalar(
+        select(KolDetailCache).where(KolDetailCache.session_id == session.id)
+    )
+    assert cache_row is not None
+    await db_session.delete(cache_row)
+    version = await db_session.scalar(
+        select(AgentArtifactVersion).where(
+            AgentArtifactVersion.source_run_id == summary1.run_id
+        )
+    )
+    assert version is not None
+    version.payload_json = {
+        "schema_version": "kol_detail_v2",
+        "data": {"cache": {"hit": False}},
+    }
+    await db_session.flush()
+
+    gateway.actions = _make_actions(db_session, evidence, _cache_state())
+    summary2 = await service.create(user.id, session.id, PLATFORM, KOL_UID)
+    assert summary2.cached is False
+    assert summary2.run_id is not None
+    assert summary2.run_id != summary1.run_id
+    assert len(gateway.calls) > calls_after_first
+    # 新 Run 发布 v2 成为最新 Version 并回填缓存。
+    latest = await db_session.scalar(
+        select(AgentArtifactVersion)
+        .where(AgentArtifactVersion.artifact_id == version.artifact_id)
+        .order_by(AgentArtifactVersion.version.desc())
+        .limit(1)
+    )
+    assert latest is not None
+    assert latest.version == version.version + 1
+    rebuilt = await db_session.scalar(
+        select(KolDetailCache).where(KolDetailCache.session_id == session.id)
+    )
+    assert rebuilt is not None
