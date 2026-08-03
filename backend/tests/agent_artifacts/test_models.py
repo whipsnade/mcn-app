@@ -15,7 +15,7 @@ def test_artifact_tables_are_registered() -> None:
         "artifact_review_attempts",
         "agent_artifact_versions",
         "artifact_events",
-        "artifact_read_states",
+        "agent_artifact_read_states",
         "kol_detail_cache",
     }
     assert expected.issubset(Base.metadata.tables)
@@ -48,8 +48,8 @@ def test_artifact_events_session_sequence_unique() -> None:
     )
 
 
-def test_artifact_read_states_has_new_schema_columns_and_unique() -> None:
-    states = Base.metadata.tables["artifact_read_states"]
+def test_agent_artifact_read_states_has_schema_columns_and_unique() -> None:
+    states = Base.metadata.tables["agent_artifact_read_states"]
     assert "module" in states.c
     assert "last_seen_sequence" in states.c
     assert "updated_at" in states.c
@@ -61,9 +61,17 @@ def test_artifact_read_states_has_new_schema_columns_and_unique() -> None:
     )
 
 
-def test_artifact_read_states_session_id_foreign_key() -> None:
-    states = Base.metadata.tables["artifact_read_states"]
-    assert {fk.target_fullname for fk in states.c.session_id.foreign_keys} == {"sessions.id"}
+def test_agent_artifact_read_states_session_id_foreign_key() -> None:
+    states = Base.metadata.tables["agent_artifact_read_states"]
+    assert {fk.target_fullname for fk in states.c.session_id.foreign_keys} == {
+        "agent_sessions.id"
+    }
+
+
+def test_agent_artifact_versions_has_lineage_snapshot_column() -> None:
+    versions = Base.metadata.tables["agent_artifact_versions"]
+    assert "lineage_snapshot_json" in versions.c
+    assert versions.c.lineage_snapshot_json.nullable is True
 
 
 def test_immutable_tables_have_no_updated_at() -> None:

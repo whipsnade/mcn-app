@@ -15,10 +15,6 @@ from sqlalchemy.dialects.mysql import MEDIUMTEXT
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
-# The legacy app.artifacts.models.ArtifactReadState owns the `artifact_read_states`
-# table name; it must be registered first so AgentArtifactReadState can extend the
-# existing table (extend_existing) rather than collide with it.
-import app.artifacts.models  # noqa: F401
 
 
 class AgentArtifact(Base):
@@ -209,6 +205,9 @@ class AgentArtifactVersion(Base):
     schema_version: Mapped[str] = mapped_column(String(32), nullable=False)
     payload_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     evidence_refs_json: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
+    # 发布时冻结的 Evidence 传递闭包审计快照（设计 §5.6）；旧 Version 为 NULL，
+    # 写入逻辑由后续任务落地。evidence_refs_json 仍记录模型直接引用。
+    lineage_snapshot_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     review_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     data_status: Mapped[str] = mapped_column(String(32), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
@@ -247,21 +246,21 @@ class ArtifactEvent(Base):
 
 
 class AgentArtifactReadState(Base):
-    """Spec §8.1 read cursor (module/last_seen_sequence) for the BI unread dots.
+    """Agent 会话的模块已读水位（设计 §8.1 read cursor，驱动 BI 未读圆点）。
 
-    Coexists with the legacy ArtifactReadState (module_key/seen_at) on the same
-    table via extend_existing; the migration step reconciles the two column sets.
+    独立新表（迁移 0028）：session_id FK 指向 ``agent_sessions.id``。遗留
+    ``artifact_read_states``（app.artifacts.models.ArtifactReadState，FK 指向旧
+    ``sessions``）保持不动，仅供旧应用版本回滚使用，新代码路径不再读写。
     """
 
-    __tablename__ = "artifact_read_states"
+    __tablename__ = "agent_artifact_read_states"
     __table_args__ = (
         UniqueConstraint(
             "user_id",
             "session_id",
             "module",
-            name="uq_artifact_read_states_user_session_module_v2",
+            name="uq_agent_artifact_read_states_user_session_module",
         ),
-        {"extend_existing": True},
     )
 
     id: Mapped[str] = mapped_column(
@@ -269,7 +268,7 @@ class AgentArtifactReadState(Base):
     )
     user_id: Mapped[str] = mapped_column(String(36), nullable=False)
     session_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("sessions.id", ondelete="CASCADE"), nullable=False
+        String(36), ForeignKey("agent_sessions.id", ondelete="CASCADE"), nullable=False
     )
     module: Mapped[str] = mapped_column(String(32), nullable=False)
     last_seen_sequence: Mapped[int] = mapped_column(Integer, nullable=False)

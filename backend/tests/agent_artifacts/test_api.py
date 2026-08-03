@@ -15,7 +15,6 @@ from io import BytesIO
 from uuid import uuid4
 
 from openpyxl import load_workbook
-from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_artifacts.models import (
@@ -45,31 +44,6 @@ async def _create_session(client) -> str:
     resp = await client.post("/api/v1/agent/sessions", json={})
     assert resp.status_code == 201, resp.text
     return resp.json()["id"]
-
-
-async def _insert_legacy_session(db: AsyncSession, user_id: str, session_id: str) -> None:
-    """artifact_read_states.session_id 的 FK 目标仍是遗留 sessions.id（设计 §8.1）。"""
-    now = utc_now()
-    await db.execute(
-        text(
-            "INSERT INTO sessions "
-            "(id, user_id, title, brand, status, platforms, target_audience, "
-            "filters_snapshot, is_starred, last_accessed_at, created_at, updated_at) "
-            "VALUES (:id, :uid, :title, :brand, :status, :platforms, :audience, "
-            ":filters, 0, :now, :now, :now)"
-        ),
-        {
-            "id": session_id,
-            "uid": user_id,
-            "title": "测试会话",
-            "brand": "瑞幸",
-            "status": "active",
-            "platforms": "[]",
-            "audience": "",
-            "filters": "{}",
-            "now": now,
-        },
-    )
 
 
 async def _make_published_artifact(
@@ -268,7 +242,6 @@ async def test_read_state_monotonic_max_and_sequence_validation(
     client = await auth_client_factory("13700000003")
     session_id = await _create_session(client)
     user_id = await _me_id(client)
-    await _insert_legacy_session(db_session, user_id, session_id)
     artifact = await _make_published_artifact(db_session, user_id, session_id)
     # Session 级 artifact sequence 当前为 3
     await _add_artifact_event(db_session, user_id, session_id, artifact.id, 1)
@@ -379,7 +352,6 @@ async def test_artifact_ownership_isolation_returns_404(
     bob = await auth_client_factory("13700000008")
     session_id = await _create_session(alice)
     alice_id = await _me_id(alice)
-    bob_id = await _me_id(bob)
     artifact = await _make_published_artifact(
         db_session, alice_id, session_id, payload=build_brand_dict()
     )
@@ -395,8 +367,7 @@ async def test_artifact_ownership_isolation_returns_404(
         await bob.get(f"/api/v1/agent/artifacts/{artifact.id}/export")
     ).status_code == 404
 
-    # read-state 归属失败 → 404（先为 Bob 准备会话 + 遗留行）
-    await _insert_legacy_session(db_session, bob_id, session_id)
+    # read-state 归属失败 → 404（不泄露会话存在）
     assert (
         await bob.put(
             f"/api/v1/agent/sessions/{session_id}/artifact-read-state",

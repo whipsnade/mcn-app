@@ -21,7 +21,7 @@ def test_migration_chain_has_single_head() -> None:
     config = Config(str(backend_dir / "alembic.ini"))
     config.set_main_option("script_location", str(backend_dir / "migrations"))
     heads = ScriptDirectory.from_config(config).get_heads()
-    assert heads == ["0027_agent_runtime_v3"]
+    assert heads == ["0028_agent_artifact_read_states"]
 
 
 async def test_phase_two_unique_constraints() -> None:
@@ -552,6 +552,56 @@ async def test_0027_agent_runtime_v3_schema() -> None:
         assert column in read_state_by_name
     for column in ("module_key", "last_seen_artifact_id", "seen_at"):
         assert column in read_state_by_name
+
+
+async def test_0028_agent_artifact_read_states_schema() -> None:
+    """迁移 0028：agent_artifact_read_states 独立新表 + versions 增 lineage_snapshot_json。
+
+    旧 artifact_read_states 表保持不动（保留旧应用版本回滚能力），不迁移旧水位。
+    """
+    async with engine.connect() as connection:
+        table_names = await connection.run_sync(lambda sync: inspect(sync).get_table_names())
+        read_state_constraints = await connection.run_sync(
+            lambda sync: inspect(sync).get_unique_constraints("agent_artifact_read_states")
+        )
+        read_state_foreign_keys = await connection.run_sync(
+            lambda sync: inspect(sync).get_foreign_keys("agent_artifact_read_states")
+        )
+        read_state_columns = await connection.run_sync(
+            lambda sync: inspect(sync).get_columns("agent_artifact_read_states")
+        )
+        version_columns = await connection.run_sync(
+            lambda sync: inspect(sync).get_columns("agent_artifact_versions")
+        )
+        legacy_constraints = await connection.run_sync(
+            lambda sync: inspect(sync).get_unique_constraints("artifact_read_states")
+        )
+
+    assert "agent_artifact_read_states" in table_names
+    # 旧表保留不动
+    assert "artifact_read_states" in table_names
+    legacy_names = {item["name"] for item in legacy_constraints}
+    assert "uq_artifact_read_states_user_session_module" in legacy_names
+    assert "uq_artifact_read_states_user_session_module_v2" in legacy_names
+
+    constraint_by_name = {item["name"]: item for item in read_state_constraints}
+    new_unique = constraint_by_name["uq_agent_artifact_read_states_user_session_module"]
+    assert new_unique["column_names"] == ["user_id", "session_id", "module"]
+
+    fk_targets = {
+        tuple(item["constrained_columns"]): item["referred_table"]
+        for item in read_state_foreign_keys
+    }
+    assert fk_targets[("session_id",)] == "agent_sessions"
+
+    columns_by_name = {item["name"]: item for item in read_state_columns}
+    for column in ("id", "user_id", "session_id", "module", "last_seen_sequence", "updated_at"):
+        assert column in columns_by_name
+        assert columns_by_name[column]["nullable"] is False
+
+    version_by_name = {item["name"]: item for item in version_columns}
+    assert "lineage_snapshot_json" in version_by_name
+    assert version_by_name["lineage_snapshot_json"]["nullable"] is True
 
 
 def _run_alembic(*args: str) -> None:

@@ -10,14 +10,15 @@
    owner 释放（publish/fail）后新 Run 才能接管；
 4. Session 级 artifact sequence：每次创建/更新 Draft 递增 ``artifact_events.sequence``，
    事件携带 ``draft_revision`` 与稳定 ``artifact_id``；
-5. 未读水位：``artifact_read_states`` 按 (user, session, module) 记录
+5. 未读水位：``agent_artifact_read_states`` 按 (user, session, module) 记录
    ``last_seen_sequence``，只前进到前端已渲染的 sequence（max(old, new)），
    绝不后退。
 
 ``mark_draft_reviewing`` / ``release_draft`` 是 Task 13（Reviewer + 原子发布）的
 状态钩子：本任务只负责状态与 owner 释放，发布事务与版本写入由 Task 13 完成。
-``artifact_read_states`` 与遗留 ``ArtifactReadState`` 共用一张表，旧列
-（``module_key`` / ``seen_at``）为 NOT NULL，写新列时必须同时填旧列以兼容。
+已读水位自迁移 0028 起读写独立的 ``agent_artifact_read_states``
+（session FK → agent_sessions）；遗留 ``artifact_read_states``
+（``app.artifacts.models.ArtifactReadState``）保持不动，仅供旧应用版本回滚。
 """
 
 from __future__ import annotations
@@ -28,7 +29,7 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -554,53 +555,35 @@ class ArtifactService:
     ) -> int:
         """水位只前进：``new = max(old, sequence)``，绝不后退。返回新的水位。
 
-        兼容两种 key 形状：新列 ``(user_id, session_id, module)`` 与遗留列
-        ``(user_id, session_id, module_key)``。遗留写入方（app/artifacts/service）
-        留下的行 ``module`` 为 NULL，按新形状查不到，必须再按 ``module_key`` 查询，
-        命中后更新同一行而非 INSERT，避免撞遗留唯一约束产生 DuplicateKey。
-        并发首插竞争（另一事务已插入同一行）时捕获 IntegrityError 后重读并更新。
+        读写独立的 ``agent_artifact_read_states``（迁移 0028 起，session FK 指向
+        ``agent_sessions``，不再需要遗留 ``sessions`` 行）。并发首插竞争（另一事务
+        已插入同一行）时捕获 IntegrityError 后重读并更新。
         """
         now = _utcnow()
         table = AgentArtifactReadState.__table__
 
-        async def _load(predicate: Any) -> Any:
+        async def _load() -> Any:
             row = await self.db.execute(
-                select(table.c.id, table.c.last_seen_sequence, table.c.module)
-                .where(predicate)
+                select(table.c.id, table.c.last_seen_sequence)
+                .where(
+                    and_(
+                        table.c.user_id == user_id,
+                        table.c.session_id == session_id,
+                        table.c.module == module,
+                    )
+                )
                 .with_for_update()
             )
             return row.first()
 
-        existing = await _load(
-            and_(
-                table.c.user_id == user_id,
-                table.c.session_id == session_id,
-                table.c.module == module,
-            )
-        )
-        if existing is None:
-            existing = await _load(
-                and_(
-                    table.c.user_id == user_id,
-                    table.c.session_id == session_id,
-                    table.c.module_key == module,
-                )
-            )
-
+        existing = await _load()
         if existing is not None:
-            # 遗留行的 last_seen_sequence 可能为 NULL，按 0 处理。
-            new_sequence = max(existing.last_seen_sequence or 0, sequence)
-            # 命中遗留行时 module 为 NULL，即使水位未变也要补齐新列。
-            if new_sequence != (existing.last_seen_sequence or 0) or existing.module is None:
+            new_sequence = max(existing.last_seen_sequence, sequence)
+            if new_sequence != existing.last_seen_sequence:
                 await self.db.execute(
                     table.update()
                     .where(table.c.id == existing.id)
-                    .values(
-                        module=module,
-                        last_seen_sequence=new_sequence,
-                        updated_at=now,
-                        seen_at=now,
-                    )
+                    .values(last_seen_sequence=new_sequence, updated_at=now)
                 )
             return new_sequence
 
@@ -613,40 +596,19 @@ class ArtifactService:
                     module=module,
                     last_seen_sequence=sequence,
                     updated_at=now,
-                    # 旧 schema 的 NOT NULL 列：写同值以兼容遗留写入方。
-                    module_key=module,
-                    seen_at=now,
                 )
             )
         except IntegrityError:
-            # 并发首插竞争：另一事务先插入了同一 (module) 或 (module_key) 行 →
-            # 重读并更新，而不是把 DuplicateKey 抛给上层。
-            existing = await _load(
-                or_(
-                    and_(
-                        table.c.user_id == user_id,
-                        table.c.session_id == session_id,
-                        table.c.module == module,
-                    ),
-                    and_(
-                        table.c.user_id == user_id,
-                        table.c.session_id == session_id,
-                        table.c.module_key == module,
-                    ),
-                )
-            )
+            # 并发首插竞争：另一事务先插入了同一行 → 重读并更新，而不是把
+            # DuplicateKey 抛给上层。
+            existing = await _load()
             if existing is None:  # pragma: no cover - 竞态窗口内行必然已存在
                 raise
-            new_sequence = max(existing.last_seen_sequence or 0, sequence)
+            new_sequence = max(existing.last_seen_sequence, sequence)
             await self.db.execute(
                 table.update()
                 .where(table.c.id == existing.id)
-                .values(
-                    module=module,
-                    last_seen_sequence=new_sequence,
-                    updated_at=now,
-                    seen_at=now,
-                )
+                .values(last_seen_sequence=new_sequence, updated_at=now)
             )
             return new_sequence
         return sequence

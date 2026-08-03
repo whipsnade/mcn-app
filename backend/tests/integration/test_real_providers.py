@@ -26,8 +26,11 @@ async def test_real_datatap_lists_social_grow_tools() -> None:
 
 
 def test_real_tencent_adapter_uses_confirmed_model() -> None:
-    adapter = TencentPlanAdapter.from_settings(get_settings())
-    assert adapter.model == "deepseek-v4-pro"
+    settings = get_settings()
+    adapter = TencentPlanAdapter.from_settings(settings)
+    # 不断言具体模型名：TENCENT_PLAN_MODEL 随部署配置（.env）漂移，只校验适配器
+    # 使用当前 settings 生效的模型。
+    assert adapter.model == settings.tencent_plan_model
 
 
 @pytest.mark.asyncio

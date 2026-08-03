@@ -54,6 +54,7 @@ def test_agent_runtime_tables_are_registered() -> None:
         "agent_artifact_versions",
         "artifact_events",
         "artifact_read_states",
+        "agent_artifact_read_states",
         "kol_detail_cache",
     }.issubset(Base.metadata.tables)
 
