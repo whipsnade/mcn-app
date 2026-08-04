@@ -5,6 +5,8 @@ import hashlib
 import json
 import logging
 import random
+
+import httpx
 import re
 import time
 from collections.abc import Awaitable, Callable, MutableMapping
@@ -693,6 +695,12 @@ class TencentPlanAdapter:
                 "MODEL_NETWORK_ERROR",
                 retryable=True,
                 request_id=request_id,
+            )
+        if isinstance(exc, httpx.HTTPError):
+            # 流式迭代中泄漏的原始 httpx 传输错误（openai SDK 只包装 request 阶段）：
+            # RemoteProtocolError/ReadError/ConnectError 等连接层问题，可安全重试。
+            return ModelAdapterError(
+                "MODEL_NETWORK_ERROR", retryable=True, request_id=request_id
             )
         if isinstance(exc, APIError):
             # 供应商在 response_format 生成中途自我中止（如 glm 的

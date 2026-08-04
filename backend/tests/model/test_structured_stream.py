@@ -278,6 +278,23 @@ def test_map_error_treats_provider_generation_abort_as_retryable() -> None:
     assert mapped.retryable is True
 
 
+def test_map_error_treats_raw_httpx_stream_errors_as_retryable_network() -> None:
+    """流式迭代中泄漏的原始 httpx 传输错误按可重试网络错误分类。"""
+    import httpx
+
+    adapter = TencentPlanAdapter(
+        client=FakeCompletions([]), log_writer=_CaptureWriter(), stream_support_cache={}
+    )
+    exc = httpx.RemoteProtocolError(
+        "peer closed connection without sending complete message body"
+    )
+
+    mapped = adapter._map_error(exc)
+
+    assert mapped.code == "MODEL_NETWORK_ERROR"
+    assert mapped.retryable is True
+
+
 @pytest.mark.asyncio
 async def test_complete_json_does_not_downgrade_for_unsupported_upstream_model() -> None:
     sink = CaptureThinkingSink()
