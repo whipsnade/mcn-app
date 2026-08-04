@@ -38,6 +38,7 @@ from app.agent_artifacts.builders.raw_rows import (
     AGGREGATE_PLATFORM_NAMES,
     PLATFORM_KEYS,
     canon_platform,
+    join_source_path,
     num,
     text,
     valid_url,
@@ -549,35 +550,39 @@ def _derivation(call_id: str | None, method: str, input_path: str) -> dict[str, 
 
 
 def _identity_source(
-    evidence_id: str, raw_index: int, raw: dict[str, Any], keymap: dict[str, str]
+    evidence_id: str, base: str, raw: dict[str, Any], keymap: dict[str, str]
 ) -> dict[str, Any]:
-    """稳定身份引用：平台/uid 原始行键优先，推断值兜底到行内首个键。"""
+    """稳定身份引用：平台/uid 原始行键优先，推断值兜底到行内首个键。
+
+    ``base`` 是行在 Evidence raw payload 内的基准 JSON Pointer（含容器键
+    前缀，如 ``/KOL 列表/52``；``{"result": "<json>"}`` 包装时为 ``/result``）。
+    """
     for field in ("platform", "kol_uid"):
         raw_key = keymap.get(field)
         if raw_key is not None and raw_key in raw:
-            return _ev(evidence_id, f"/{raw_index}/{raw_key}")
-    return _ev(evidence_id, f"/{raw_index}/{next(iter(raw))}")
+            return _ev(evidence_id, join_source_path(base, raw_key))
+    return _ev(evidence_id, join_source_path(base, next(iter(raw))))
 
 
 def _score_sources(
-    evidence_id: str, raw_index: int, raw: dict[str, Any], keymap: dict[str, str]
+    evidence_id: str, base: str, raw: dict[str, Any], keymap: dict[str, str]
 ) -> list[dict[str, Any]]:
     if isinstance(raw.get("score_inputs"), dict):
-        return [_ev(evidence_id, f"/{raw_index}/score_inputs")]
-    return [_identity_source(evidence_id, raw_index, raw, keymap)]
+        return [_ev(evidence_id, join_source_path(base, "score_inputs"))]
+    return [_identity_source(evidence_id, base, raw, keymap)]
 
 
 def _dim_source(
     evidence_id: str,
-    raw_index: int,
+    base: str,
     raw: dict[str, Any],
     keymap: dict[str, str],
     input_key: str,
 ) -> dict[str, Any]:
     score_inputs = raw.get("score_inputs")
     if isinstance(score_inputs, dict) and input_key in score_inputs:
-        return _ev(evidence_id, f"/{raw_index}/score_inputs/{input_key}")
-    return _score_sources(evidence_id, raw_index, raw, keymap)[0]
+        return _ev(evidence_id, join_source_path(base, "score_inputs", input_key))
+    return _score_sources(evidence_id, base, raw, keymap)[0]
 
 
 def _summary_lineage(
@@ -586,6 +591,7 @@ def _summary_lineage(
     raw_items: list[dict[str, Any]],
     raw_mapping: list[int],
     keymaps: list[dict[str, str]],
+    bases: list[str],
     call_id: str | None,
 ) -> list[dict[str, Any]]:
     refs: list[dict[str, Any]] = []
@@ -594,7 +600,7 @@ def _summary_lineage(
         return refs
     summary = payload["data"]["summary"]
     representative = _identity_source(
-        evidence_id, raw_mapping[0], raw_items[raw_mapping[0]], keymaps[raw_mapping[0]]
+        evidence_id, bases[raw_mapping[0]], raw_items[raw_mapping[0]], keymaps[raw_mapping[0]]
     )
 
     for field in ("candidate_count", "selected_count"):
@@ -616,7 +622,7 @@ def _summary_lineage(
         source = (
             _identity_source(
                 evidence_id,
-                raw_mapping[source_index],
+                bases[raw_mapping[source_index]],
                 raw_items[raw_mapping[source_index]],
                 keymaps[raw_mapping[source_index]],
             )
@@ -645,7 +651,7 @@ def _summary_lineage(
         source = (
             _identity_source(
                 evidence_id,
-                raw_mapping[source_index],
+                bases[raw_mapping[source_index]],
                 raw_items[raw_mapping[source_index]],
                 keymaps[raw_mapping[source_index]],
             )
@@ -672,6 +678,7 @@ def _build_lineage(
     raw_items: list[dict[str, Any]],
     raw_mapping: list[int],
     keymaps: list[dict[str, str]],
+    bases: list[str],
     call_id: str | None,
 ) -> list[dict[str, Any]]:
     refs: list[dict[str, Any]] = []
@@ -681,9 +688,11 @@ def _build_lineage(
         raw_index = raw_mapping[index]
         raw = raw_items[raw_index]
         keymap = keymaps[raw_index]
+        base = bases[raw_index]
 
         # 展示/排序数字：直接复制自 Evidence；lineage 指向原始行键（中文别名
-        # 归一的字段指向真实存在的中文键，而非归一后的契约键）。
+        # 归一的字段指向真实存在的中文键，而非归一后的契约键）。路径 = 行的
+        # 基准指针（含容器键前缀）+ 原始行键。
         for field in _DISPLAY_NUMERIC_FIELDS:
             value = item.get(field)
             raw_key = keymap.get(field)
@@ -692,13 +701,13 @@ def _build_lineage(
             refs.append(
                 {
                     "artifact_path": f"/data/items/{index}/{field}",
-                    "sources": [_ev(evidence_id, f"/{raw_index}/{raw_key}")],
+                    "sources": [_ev(evidence_id, join_source_path(base, raw_key))],
                     "derivation": None,
                 }
             )
 
         # rank 由 engagement_total 降序排序得出；来源兜底到稳定身份字段。
-        rank_source = _score_sources(evidence_id, raw_index, raw, keymap)[0]
+        rank_source = _score_sources(evidence_id, base, raw, keymap)[0]
         refs.append(
             {
                 "artifact_path": f"/data/items/{index}/rank",
@@ -710,7 +719,7 @@ def _build_lineage(
         )
 
         # 派生评分数字 → settled rank_kols 调用。
-        score_sources = _score_sources(evidence_id, raw_index, raw, keymap)
+        score_sources = _score_sources(evidence_id, base, raw, keymap)
         for field in ("total", "rating", "stars", "data_completeness"):
             refs.append(
                 {
@@ -724,7 +733,7 @@ def _build_lineage(
 
         # 每个维度：原始输入引用 Evidence，派生结果引用 rank_kols。
         for dim in SCORE_DIMENSIONS:
-            source = _dim_source(evidence_id, raw_index, raw, keymap, DIM_RAW_INPUT[dim])
+            source = _dim_source(evidence_id, base, raw, keymap, DIM_RAW_INPUT[dim])
             source_path = source["source_path"]
             for suffix in ("raw_score", "weighted_score"):
                 refs.append(
@@ -738,7 +747,7 @@ def _build_lineage(
                 )
 
     refs.extend(
-        _summary_lineage(payload, evidence_id, raw_items, raw_mapping, keymaps, call_id)
+        _summary_lineage(payload, evidence_id, raw_items, raw_mapping, keymaps, bases, call_id)
     )
     return refs
 
@@ -757,17 +766,33 @@ async def build_kol_selection_draft(
     db: AsyncSession | None = None,
     data_as_of: datetime | None = None,
     source_names: tuple[str, ...] = ("kol_evidence",),
+    row_source_paths: list[str] | None = None,
 ) -> DraftBuildResult:
     """把模型选定的 KOL 列表 Evidence 转换为 ``kol_selection_v3`` Draft。
 
     评分委托 ``rank_kols``（严格复用 ``kol_score_v2``），默认跨平台 Top20 按
     ``engagement_total`` 降序；数据不足时产出 restricted。
+
+    ``row_source_paths``：与 ``items`` 等长平行的行基准 JSON Pointer（行在
+    Evidence raw payload 内的位置，含容器键前缀，通常取
+    ``extract_rows`` 的 ``RowRef.field_base``）。缺省按顶层数组 ``/{index}``
+    处理（兼容直接传行的调用方）；长度不一致直接 fail-fast，不静默错位。
     """
     parsed_scope = KolSelectionScope.model_validate(scope)
     scope_dict = parsed_scope.model_dump()
 
     if not items:
         return _restricted_draft(scope_dict, data_as_of, source_names)
+
+    if row_source_paths is None:
+        bases = [f"/{index}" for index in range(len(items))]
+    else:
+        if len(row_source_paths) != len(items):
+            raise DraftBuildError(
+                "row_source_paths must be parallel to items "
+                f"({len(row_source_paths)} != {len(items)})"
+            )
+        bases = list(row_source_paths)
 
     # 真实 Evidence 行归一：中文原始键 → 契约键，平台恒为字符串（缺失时取
     # scope 唯一平台，再缺省 unknown）；keymap 供 lineage 指向原始行键。
@@ -827,6 +852,7 @@ async def build_kol_selection_draft(
         raw_items=items,
         raw_mapping=raw_mapping,
         keymaps=keymaps,
+        bases=bases,
         call_id=call_id,
     )
 

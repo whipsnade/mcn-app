@@ -18,11 +18,23 @@ from typing import Any, NamedTuple
 
 
 class RowRef(NamedTuple):
-    """一行可归因的原始记录：Evidence id + 行在 raw payload 内的 JSON Pointer + 行。"""
+    """一行可归因的原始记录：Evidence id + 行在 raw payload 内的 JSON Pointer + 行。
+
+    ``base_path`` 是行作为「字段路径基准」的 JSON Pointer：绝大多数形态与
+    ``source_path`` 相同（指向行本身）；单行 dict 兜底时 ``source_path`` 指向
+    首个键（``min_length=1`` 约束），而字段基准必须是根 ``""``，否则
+    ``base + 字段名`` 拼出的路径不可解析。``None`` 表示与 ``source_path`` 相同。
+    """
 
     evidence_id: str
     source_path: str
     row: dict[str, Any]
+    base_path: str | None = None
+
+    @property
+    def field_base(self) -> str:
+        """拼字段级 source_path 的基准指针（见 ``join_source_path``）。"""
+        return self.source_path if self.base_path is None else self.base_path
 
 
 # ---------------------------------------------------------------------------
@@ -101,6 +113,20 @@ def _escape(token: str) -> str:
     return token.replace("~", "~0").replace("/", "~1")
 
 
+def join_source_path(base: str, *tokens: str) -> str:
+    """在行的基准 JSON Pointer 上追加字段 token（RFC 6901 转义）。
+
+    - ``base=""``（根）：返回 ``/{token...}``；
+    - ``base="/result"``（``{"result": "<json 字符串>"}`` 包装）：指针无法下钻
+      到字符串内部，统一返回 ``"/result"`` 粗粒度引用（仍可解析、可审计）；
+    - 其余（如 ``/KOL 列表/0``）：``base + "/" + 转义后的字段名``。
+    """
+    if base == "/result":
+        return "/result"
+    suffix = "/".join(_escape(token) for token in tokens)
+    return f"{base}/{suffix}" if suffix else base
+
+
 def unwrap_payload(raw_payload: Any) -> tuple[Any, str]:
     """解开 ``{"result": "<json 字符串>"}`` 包装；返回 (解析后的值, 基路径)。
 
@@ -154,11 +180,12 @@ def extract_rows(evidence_id: str, raw_payload: Any) -> list[RowRef]:
                         rows.append(RowRef(evidence_id, _path(key, str(index)), item))
                 return rows
         # 单行 dict（如一次 overview 查询的聚合结果）：根指针 "" 非合法
-        # source_path（min_length=1），退而指向首个键，仍可解析可审计。
+        # source_path（min_length=1），退而指向首个键，仍可解析可审计；
+        # 但字段路径基准必须是根 ""（base_path），否则 base+字段名 不可解析。
         if base == "/result":
             return [RowRef(evidence_id, "/result", parsed)]
         first_key = next(iter(parsed))
-        return [RowRef(evidence_id, f"/{_escape(str(first_key))}", parsed)]
+        return [RowRef(evidence_id, f"/{_escape(str(first_key))}", parsed, base_path="")]
     return []
 
 
@@ -377,6 +404,7 @@ __all__ = [
     "extract_rows",
     "first",
     "has_any",
+    "join_source_path",
     "num",
     "parse_date",
     "parse_datetime",

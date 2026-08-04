@@ -414,8 +414,8 @@ class BuildKolSelectionDraftTool(_BuilderToolBase):
         item = await self._load_evidence(context, args.evidence_id)
         if isinstance(item, ToolResult):
             return item
-        items = [ref.row for ref in extract_rows(item.id, item.raw_payload_json)]
-        if not items:
+        row_refs = extract_rows(item.id, item.raw_payload_json)
+        if not row_refs:
             return _failed(
                 DRAFT_BUILD_ERROR,
                 f"evidence {args.evidence_id!r} does not contain a KOL item list",
@@ -424,10 +424,14 @@ class BuildKolSelectionDraftTool(_BuilderToolBase):
             result = await build_kol_selection_draft(
                 scope=args.scope,
                 evidence_id=item.id,
-                items=items,
+                items=[ref.row for ref in row_refs],
                 context=context,
                 db=self._db,
                 source_names=(item.source_name,),
+                # 行的完整基准路径（含容器键前缀）——lineage source_path 必须在
+                # Evidence raw payload 内可解析（H1：中文容器键缺前缀导致
+                # evidence_source_path_not_found）。
+                row_source_paths=[ref.field_base for ref in row_refs],
             )
         except DraftBuildError as exc:
             return _failed(DRAFT_BUILD_ERROR, str(exc))
@@ -565,7 +569,7 @@ class BuildKolDetailDraftTool(_BuilderToolBase):
         item = await self._load_evidence(context, args.evidence_id)
         if isinstance(item, ToolResult):
             return item
-        detail, _base = unwrap_payload(item.raw_payload_json)
+        detail, base = unwrap_payload(item.raw_payload_json)
         if not isinstance(detail, dict):
             return _failed(
                 DRAFT_BUILD_ERROR,
@@ -581,6 +585,9 @@ class BuildKolDetailDraftTool(_BuilderToolBase):
                 selection_artifact_id=args.selection_artifact_id,
                 selection_version=args.selection_version,
                 source_names=(item.source_name,),
+                # {"result": "<json>"} 包装时基路径为 /result，lineage 粗粒度
+                # 指向整个串（指针无法下钻字符串，但必须可解析）。
+                source_base=base,
             )
         except DraftBuildError as exc:
             return _failed(DRAFT_BUILD_ERROR, str(exc))

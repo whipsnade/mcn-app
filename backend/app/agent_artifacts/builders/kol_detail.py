@@ -32,6 +32,7 @@ from app.agent_artifacts.builders.common import (
     DraftBuildResult,
     methodology_dict,
 )
+from app.agent_artifacts.builders.raw_rows import join_source_path
 from app.agent_artifacts.payloads.kol_detail import KolDetailV2
 
 SCHEMA_VERSION = "kol_detail_v2"
@@ -303,9 +304,15 @@ def _escape(token: str) -> str:
     return token.replace("~", "~0").replace("/", "~1")
 
 
-def _lineage_refs(payload: dict[str, Any], evidence_id: str) -> list[dict[str, Any]]:
+def _lineage_refs(
+    payload: dict[str, Any], evidence_id: str, source_base: str = ""
+) -> list[dict[str, Any]]:
     """data 下每个非空数值叶子的 Evidence 引用；source_path 与 Evidence 结构一一对应。
 
+    ``source_base`` 是 detail 在 Evidence raw payload 内的基准 JSON Pointer
+    （``unwrap_payload`` 的基路径）：顶层对象为 ``""``（字段级路径如
+    ``/metrics/followers``）；``{"result": "<json 字符串>"}`` 包装为
+    ``"/result"``——指针无法下钻字符串，统一粗粒度指向整个串（仍可解析）。
     ``data.cache`` 是运行时元数据（hit 布尔 + 时间戳），无 Evidence 基座，跳过。
     """
     data = payload["data"]
@@ -328,8 +335,7 @@ def _lineage_refs(payload: dict[str, Any], evidence_id: str) -> list[dict[str, A
                         {
                             "source_type": "evidence",
                             "evidence_id": evidence_id,
-                            "source_path": "/"
-                            + "/".join(_escape(part) for part in parts[1:]),
+                            "source_path": join_source_path(source_base, *parts[1:]),
                         }
                     ],
                     "derivation": None,
@@ -351,12 +357,15 @@ def build_kol_detail_draft(
     selection_version: str | None = None,
     data_as_of: datetime | None = None,
     source_names: tuple[str, ...] = ("kol_evidence",),
+    source_base: str = "",
 ) -> DraftBuildResult:
     """把已抓取的 KOL 详情 Evidence 转换为 ``kol_detail_v2`` Draft。
 
     ``cache_state`` 提供 ``hit/fetched_at/expires_at``（运行时元数据）；
     ``detail`` 的嵌套结构与 kol_detail_v2 的 ``data`` 章节一致，供 lineage
-    的 source_path 一一对应。
+    的 source_path 一一对应。``source_base`` 为 ``detail`` 在 Evidence raw
+    payload 内的基准 JSON Pointer（``unwrap_payload`` 基路径；``{"result":
+    "<json 字符串>"}`` 包装时为 ``"/result"``，lineage 粗粒度指向整个串）。
     """
     data = _build_data(detail, cache_state)
     plan = _section_plan(data)
@@ -412,7 +421,7 @@ def build_kol_detail_draft(
         artifact_type=SCHEMA_VERSION,
         business_fields={"platform": platform, "kol_uid": kol_uid},
         payload=payload,
-        evidence_refs=_lineage_refs(payload, evidence_id),
+        evidence_refs=_lineage_refs(payload, evidence_id, source_base),
     )
 
 
