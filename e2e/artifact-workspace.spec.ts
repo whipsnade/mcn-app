@@ -314,6 +314,8 @@ interface ArtifactWorkspaceRoutes {
   /** 可选：会话附带 Run 的 SSE 事件体（未提供则 Run 不存在）。 */
   runEvents?: () => string;
   runId?: string;
+  /** 可选：服务端已读水位（未提供则空表 = 各模块零水位）。 */
+  readStates?: () => Array<{ module: string; last_seen_sequence: number }>;
 }
 
 async function installArtifactRoutes(page: Page, opts: ArtifactWorkspaceRoutes) {
@@ -338,6 +340,9 @@ async function installArtifactRoutes(page: Page, opts: ArtifactWorkspaceRoutes) 
   await page.route(`**/api/v1/agent/sessions/${sessionId}/artifacts`, route => route.fulfill({ json: opts.artifacts() }));
   await page.route(`**/api/v1/agent/sessions/${sessionId}/artifact-read-state`, route => route.fulfill({
     json: { module: 'brand', last_seen_sequence: 0 },
+  }));
+  await page.route(`**/api/v1/agent/sessions/${sessionId}/artifact-read-states`, route => route.fulfill({
+    json: opts.readStates ? opts.readStates() : [],
   }));
   await page.route(`**/api/v1/agent/sessions/${sessionId}/kol-details`, route => route.fulfill({
     status: 201,
@@ -485,6 +490,8 @@ test('shows an unread dot on a module with a newer artifact and clears it when s
     artifactMeta: id => artifactMeta(id, 'brand', 'brand_report_v3', null, 1, 20),
     runId,
     runEvents,
+    // 服务端水位：brand 已读到 10（brandArt1 已查看），离线期间的更高 seq 才打点。
+    readStates: () => [{ module: 'brand', last_seen_sequence: 10 }],
   });
 
   await login(page, phone);
@@ -493,9 +500,9 @@ test('shows an unread dot on a module with a newer artifact and clears it when s
   const brandTab = page.getByRole('tab', { name: '品牌分析' });
   const unreadDot = brandTab.getByTestId('unread-dot');
 
-  // 首屏先进入品牌分析，等 brandArt1（seq 10）渲染完成：此时模块水位初始化为 10，
-  // 避免「首屏产物拉取与 phase 翻转竞态」导致水位被更高 sequence 的 brandArt2 覆盖
-  //（桌面端首屏拉取晚于翻转时可复现——水位 20 则永不出圆点）。
+  // 首屏先进入品牌分析，等 brandArt1（seq 10）渲染完成：服务端水位 10 = 当前
+  // 最大 seq，首屏不打点；也避免「首屏产物拉取与 phase 翻转竞态」导致本地水位
+  // 被更高 sequence 的 brandArt2 覆盖（点击上报会把水位推到 20 则永不出圆点）。
   await brandTab.click();
   await expect(page.getByText('概览', { exact: true }).first()).toBeVisible();
 
@@ -546,7 +553,7 @@ test('renders a child insight under its parent artifact', async ({ page }) => {
 
 test('opens the KOL detail dialog from the selection list', async ({ page }) => {
   const phone = `138${Date.now().toString().slice(-8)}`;
-  const kolSelArt = artifactMeta('kol-sel-art', 'kol', 'kol_selection_v3', null, 1, 8);
+  const kolSelArt = artifactMeta('kol-sel-art', 'kol-selection', 'kol_selection_v3', null, 1, 8);
 
   await installArtifactRoutes(page, {
     sessionId: 's-kol',
@@ -556,7 +563,7 @@ test('opens the KOL detail dialog from the selection list', async ({ page }) => 
       ? kolDetailPayload()
       : kolSelectionPayload(),
     artifactMeta: id => id === 'kol-detail-art'
-      ? artifactMeta('kol-detail-art', 'kol', 'kol_detail_v2', null, 1, 9)
+      ? artifactMeta('kol-detail-art', 'kol-detail', 'kol_detail_v2', null, 1, 9)
       : kolSelArt,
   });
 
@@ -584,33 +591,48 @@ test('opens the KOL detail dialog from the selection list', async ({ page }) => 
 });
 
 // --------------------------------------------------------------------------- //
-// 6. 品牌 Excel 导出走新 artifact export 路由
+// 6. 品牌 Excel 导出：BI 视图导出按钮 → 新 artifact export 路由（按查看版本）
 // --------------------------------------------------------------------------- //
 
-test('exports a published artifact via the new artifact export route', async ({ page }) => {
+test('exports the viewed version of a published artifact via the UI button', async ({ page }) => {
   const phone = `138${Date.now().toString().slice(-8)}`;
-  const brandArt = artifactMeta('brand-art', 'brand', 'brand_report_v3', null, 1, 10);
+  const brandArt = artifactMeta('brand-art', 'brand', 'brand_report_v3', null, 2, 10);
 
   await installArtifactRoutes(page, {
     sessionId: 's-export',
     sessionTitle: '导出会话',
     artifacts: () => [brandArt],
-    versionPayload: () => brandPayloadComplete(),
+    versionPayload: (artifactId, version) => version === 2 ? brandPayloadRestricted() : brandPayloadComplete(),
     artifactMeta: () => brandArt,
+  });
+  // 导出路由单独覆盖（后注册优先于 installArtifactRoutes 的通配），记录查询参数
+  // 以断言「导出版本 = 界面当前查看版本」。
+  let exportSearch = '';
+  await page.route('**/api/v1/agent/artifacts/brand-art/export*', route => {
+    exportSearch = new URL(route.request().url()).search;
+    return route.fulfill({
+      status: 200,
+      body: Buffer.from('xlsx'),
+      headers: {
+        'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(EXPORT_FILENAME)}`,
+      },
+    });
   });
 
   await login(page, phone);
   await ensureBiPane(page);
 
-  // UI 尚无导出入口（新视图未接线），直接调用客户端 exportArtifact 验证
-  // 新 export 路由 + Content-Disposition 解码（沿用旧品牌导出的价值断言）。
-  // moduleUrl 以参数传入：browser 在 Vite 源服务下动态 import，tsc 不做模块解析。
-  const moduleUrl = '/src/api/agentArtifacts.ts';
+  await page.getByRole('tab', { name: '品牌分析' }).click();
+  await expect(page.getByText('概览', { exact: true }).first()).toBeVisible();
+
+  // 切到历史版本 v1，再点「导出 Excel」：导出与界面查看版本一致（version=1）。
+  await page.getByRole('combobox', { name: '版本选择' }).selectOption('1');
+  await expect(page.getByText('品牌整体声量健康').first()).toBeVisible();
+
   const downloadPromise = page.waitForEvent('download');
-  await page.evaluate(async (url: string) => {
-    const mod = await import(url);
-    await mod.exportArtifact('brand-art');
-  }, moduleUrl);
+  await page.getByRole('button', { name: '导出 Excel' }).click();
   const download = await downloadPromise;
   expect(download.suggestedFilename()).toBe(EXPORT_FILENAME);
+  expect(exportSearch).toContain('version=1');
 });

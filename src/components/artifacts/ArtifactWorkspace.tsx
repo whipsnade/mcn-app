@@ -1,4 +1,4 @@
-import { ChevronDown, Layers, Loader2 } from 'lucide-react';
+import { ChevronDown, Download, Layers, Loader2 } from 'lucide-react';
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import type {
@@ -13,9 +13,11 @@ import type {
   KolSelectionItem,
 } from '../../api/agentArtifacts';
 import {
+  exportArtifact,
   getAgentArtifactPayload,
   getArtifact,
   getArtifactVersion,
+  listArtifactReadStates,
 } from '../../api/agentArtifacts';
 import { useAgentRun } from '../../hooks/useAgentRun';
 import { isTerminalRunStatus } from '../../state/agentEvents';
@@ -30,10 +32,12 @@ import KolSelectionArtifactView from './KolSelectionArtifactView';
 type TopTabId = 'brand' | 'campaign' | 'kol';
 type KolSubTabId = 'analysis' | 'selection';
 
-const TOP_TABS: Array<{ id: TopTabId; label: string; module: string }> = [
-  { id: 'brand', label: '品牌分析', module: 'brand' },
-  { id: 'campaign', label: '活动分析', module: 'campaign' },
-  { id: 'kol', label: '达人', module: 'kol' },
+// 一级 Tab → 后端 Artifact 模块名。达人 Tab 聚合 kol-selection / kol-analysis
+// 两个模块（任一有未读即点亮）；kol-detail 走详情弹层，其更新不点亮主圆点。
+const TOP_TABS: Array<{ id: TopTabId; label: string; modules: string[] }> = [
+  { id: 'brand', label: '品牌分析', modules: ['brand'] },
+  { id: 'campaign', label: '活动分析', modules: ['campaign'] },
+  { id: 'kol', label: '达人', modules: ['kol-selection', 'kol-analysis'] },
 ];
 
 const KOL_SUB_TABS: Array<{ id: KolSubTabId; label: string; artifactType: string }> = [
@@ -41,7 +45,8 @@ const KOL_SUB_TABS: Array<{ id: KolSubTabId; label: string; artifactType: string
   { id: 'selection', label: '圈选达人', artifactType: 'kol_selection_v3' },
 ];
 
-const MODULES = ['brand', 'campaign', 'kol'] as const;
+// 支持 Excel 导出的产物类型（对齐后端 exporters 分派表）。
+const EXPORTABLE_TYPES = new Set(['brand_report_v3', 'kol_selection_v3']);
 
 export interface ArtifactWorkspaceProps {
   sessionId?: string;
@@ -109,10 +114,11 @@ export default function ArtifactWorkspace({
   const [topTab, setTopTab] = useState<TopTabId>('kol');
   const [kolSubTab, setKolSubTab] = useState<KolSubTabId>('analysis');
   const [lastSeen, setLastSeen] = useState<Record<string, number>>({});
-  const initRef = useRef<Set<string>>(new Set());
+  const [readStatesReady, setReadStatesReady] = useState(false);
   const [selectedVersion, setSelectedVersion] = useState<Record<string, number>>({});
   const [payload, setPayload] = useState<AgentArtifactPayload>();
   const [payloadLoading, setPayloadLoading] = useState(false);
+  const [exporting, setExporting] = useState(false);
 
   // KOL 详情弹层：createKolDetail → 订阅辅助 Run → 解析 kol_detail_v2 payload。
   const [pendingDetail, setPendingDetail] = useState<{
@@ -168,37 +174,49 @@ export default function ArtifactWorkspace({
     return sequences.length ? Math.max(...sequences) : null;
   }, [artifacts]);
 
-  // 切换会话时重置未读水位与初始化标记：组件跨会话复用不卸载，旧会话的
-  // 高水位若不清零会抑制新会话的未读圆点。本 effect 声明在下方初始化
-  // effect 之前，同一渲染批次内先重置、再按新会话产物重新初始化。
+  // 切换会话时重置本地水位并从服务端拉取已读水位初始化（C2）：刷新/切换
+  // 会话不再吞掉离线期间的未读。组件跨会话复用不卸载，旧会话水位必须清零。
+  // 服务端无记录的模块按零水位（未查看过即全部未读）；拉取失败同样按零水位，
+  // 宁可多打圆点也不吞未读。水位就绪前不打点，避免先全亮再熄灭的闪烁。
   useEffect(() => {
-    initRef.current = new Set();
     setLastSeen({});
+    if (!sessionId) {
+      setReadStatesReady(true);
+      return;
+    }
+    setReadStatesReady(false);
+    let cancelled = false;
+    listArtifactReadStates(sessionId)
+      .then(states => {
+        if (cancelled) return;
+        const next: Record<string, number> = {};
+        for (const state of states) next[state.module] = state.last_seen_sequence;
+        setLastSeen(next);
+        setReadStatesReady(true);
+      })
+      .catch(() => {
+        if (!cancelled) setReadStatesReady(true);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [sessionId]);
 
-  // 模块首次出现时把水位初始化为当前最大 sequence：已有产物不标未读，
-  // 之后更高的 Draft/发布才显示圆点。
-  useEffect(() => {
-    for (const module of MODULES) {
-      if (initRef.current.has(module)) continue;
+  const unread = (modules: string[]): boolean => {
+    if (!readStatesReady) return false;
+    return modules.some(module => {
       const max = maxSeq(module);
-      if (max !== null) {
-        initRef.current.add(module);
-        setLastSeen(previous => ({ ...previous, [module]: max }));
-      }
-    }
-  }, [maxSeq]);
-
-  const unread = (module: string): boolean => {
-    const max = maxSeq(module);
-    return max !== null && max > (lastSeen[module] ?? 0);
+      return max !== null && max > (lastSeen[module] ?? 0);
+    });
   };
 
+  // 点击 Tab 按实际模块名逐个上报水位（服务端 max(旧, 新) 语义）。
   const selectTopTab = (tab: TopTabId) => {
     setTopTab(tab);
-    const module = TOP_TABS.find(item => item.id === tab)!.module;
-    const max = maxSeq(module);
-    if (max !== null) {
+    const modules = TOP_TABS.find(item => item.id === tab)!.modules;
+    for (const module of modules) {
+      const max = maxSeq(module);
+      if (max === null) continue;
       setLastSeen(previous => ({ ...previous, [module]: max }));
       markArtifactSeen(module, max);
     }
@@ -207,6 +225,22 @@ export default function ArtifactWorkspace({
   const versionNumber = activeArtifact
     ? selectedVersion[activeArtifact.id] ?? activeArtifact.latest_version
     : undefined;
+
+  // Excel 导出（C2）：仅 published 且后端支持的类型（restricted 也可导出，沿用
+  // 后端语义）；导出版本与当前下拉查看版本一致。
+  const canExport = activeArtifact !== undefined
+    && activeArtifact.status === 'published'
+    && EXPORTABLE_TYPES.has(activeArtifact.artifact_type)
+    && versionNumber !== undefined;
+
+  const handleExport = () => {
+    if (!activeArtifact || versionNumber === undefined || exporting) return;
+    setExporting(true);
+    // 导出失败恢复可重试态；低频操作，错误细节由控制台/网络面板兜底。
+    void exportArtifact(activeArtifact.id, versionNumber)
+      .catch(() => undefined)
+      .finally(() => setExporting(false));
+  };
 
   // 选中产物版本 → 拉取 payload（按 schema_version 收窄渲染）。
   useEffect(() => {
@@ -336,7 +370,7 @@ export default function ArtifactWorkspace({
   return (
     <aside className="flex h-full w-full shrink-0 flex-col overflow-hidden border-l border-slate-200 bg-white shadow-sm xl:w-[420px]">
       <div role="tablist" aria-label="分析报告" className="flex h-11 shrink-0 border-b border-slate-200 bg-white px-4">
-        {TOP_TABS.map(({ id, label, module }) => (
+        {TOP_TABS.map(({ id, label, modules }) => (
           <button
             key={id}
             type="button"
@@ -350,7 +384,7 @@ export default function ArtifactWorkspace({
             {label}
             {/* 注（review M3）：未读圆点按模块聚合且仅用颜色区分，无独立可访问名称；
                 已在 data-testid 上留查询锚点，无障碍优化列为后续打磨项。 */}
-            {unread(module) && <span data-testid="unread-dot" className="h-1.5 w-1.5 rounded-full bg-rose-500" />}
+            {unread(modules) && <span data-testid="unread-dot" className="h-1.5 w-1.5 rounded-full bg-rose-500" />}
           </button>
         ))}
       </div>
@@ -378,24 +412,39 @@ export default function ArtifactWorkspace({
         {activeArtifact && (
           <div className="mb-3 flex items-center justify-between gap-2 px-1">
             <ArtifactStatus status={activeArtifact.status} dataStatus={payload?.data_status} />
-            {activeArtifact.latest_version > 1 && (
-              <select
-                aria-label="版本选择"
-                value={versionNumber !== undefined ? String(versionNumber) : ''}
-                onChange={event => {
-                  if (!activeArtifact) return;
-                  setSelectedVersion(previous => ({
-                    ...previous,
-                    [activeArtifact.id]: Number(event.target.value),
-                  }));
-                }}
-                className="shrink-0 rounded-lg border border-slate-200 bg-white px-2 py-1 text-[10px] font-semibold text-slate-600 shadow-sm"
-              >
-                {Array.from({ length: activeArtifact.latest_version }, (_, index) => index + 1).map(version => (
-                  <option key={version} value={version}>v{version}</option>
-                ))}
-              </select>
-            )}
+            <div className="flex shrink-0 items-center gap-2">
+              {canExport && (
+                <button
+                  type="button"
+                  onClick={handleExport}
+                  disabled={exporting}
+                  className="flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-2 py-1 text-[10px] font-semibold text-slate-600 shadow-sm transition hover:bg-slate-50 disabled:opacity-50"
+                >
+                  {exporting
+                    ? <Loader2 className="h-3 w-3 animate-spin" aria-hidden="true" />
+                    : <Download className="h-3 w-3" aria-hidden="true" />}
+                  导出 Excel
+                </button>
+              )}
+              {activeArtifact.latest_version > 1 && (
+                <select
+                  aria-label="版本选择"
+                  value={versionNumber !== undefined ? String(versionNumber) : ''}
+                  onChange={event => {
+                    if (!activeArtifact) return;
+                    setSelectedVersion(previous => ({
+                      ...previous,
+                      [activeArtifact.id]: Number(event.target.value),
+                    }));
+                  }}
+                  className="shrink-0 rounded-lg border border-slate-200 bg-white px-2 py-1 text-[10px] font-semibold text-slate-600 shadow-sm"
+                >
+                  {Array.from({ length: activeArtifact.latest_version }, (_, index) => index + 1).map(version => (
+                    <option key={version} value={version}>v{version}</option>
+                  ))}
+                </select>
+              )}
+            </div>
           </div>
         )}
 

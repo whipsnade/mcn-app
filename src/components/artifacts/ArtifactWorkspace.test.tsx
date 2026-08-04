@@ -11,7 +11,7 @@ import type {
   KolDetailPayload,
   KolSelectionPayload,
 } from '../../api/agentArtifacts';
-import { getArtifact, getArtifactVersion } from '../../api/agentArtifacts';
+import { exportArtifact, getArtifact, getArtifactVersion, listArtifactReadStates } from '../../api/agentArtifacts';
 import { useAgentRun } from '../../hooks/useAgentRun';
 import { initialRunRuntime } from '../../state/agentEvents';
 import type { RunRuntimeState } from '../../state/agentEvents';
@@ -21,8 +21,10 @@ vi.mock('../../api/agentArtifacts', async importOriginal => {
   const actual = await importOriginal<typeof import('../../api/agentArtifacts')>();
   return {
     ...actual,
+    exportArtifact: vi.fn(),
     getArtifact: vi.fn(),
     getArtifactVersion: vi.fn(),
+    listArtifactReadStates: vi.fn(),
     markArtifactRead: vi.fn(),
   };
 });
@@ -271,6 +273,11 @@ describe('ArtifactWorkspace', () => {
       return factory(version);
     });
     vi.mocked(useAgentRun).mockReset();
+    vi.mocked(exportArtifact).mockReset();
+    vi.mocked(exportArtifact).mockResolvedValue(undefined);
+    // 默认服务端无任何已读水位（零水位）：存在产物的模块一律视为未读。
+    vi.mocked(listArtifactReadStates).mockReset();
+    vi.mocked(listArtifactReadStates).mockResolvedValue([]);
   });
 
   function renderWorkspace(artifacts: ApiAgentArtifact[], createKolDetail = vi.fn(), markArtifactSeen = vi.fn()) {
@@ -297,7 +304,9 @@ describe('ArtifactWorkspace', () => {
     expect(screen.getByRole('tab', { name: '圈选达人' })).toBeVisible();
   });
 
-  it('Draft 更新只显示未读圆点，不自动切换 Tab', () => {
+  it('Draft 更新只显示未读圆点，不自动切换 Tab', async () => {
+    // 服务端水位已到 brand 当前最大 seq 5：既有产物不打点。
+    vi.mocked(listArtifactReadStates).mockResolvedValue([{ module: 'brand', last_seen_sequence: 5 }]);
     const { rerender } = renderWorkspace([brandArtifact()]);
     expect(screen.getByRole('tab', { name: '达人' })).toHaveAttribute('aria-selected', 'true');
 
@@ -321,7 +330,7 @@ describe('ArtifactWorkspace', () => {
     expect(screen.getByRole('tab', { name: '达人' })).toHaveAttribute('aria-selected', 'true');
     // 品牌 Tab 出现未读圆点。
     const brandTab = screen.getByRole('tab', { name: '品牌分析' });
-    expect(within(brandTab).getByTestId('unread-dot')).toBeVisible();
+    await waitFor(() => expect(within(brandTab).getByTestId('unread-dot')).toBeVisible());
   });
 
   it('已发布产物显示历史版本选择器，可切换历史版本', async () => {
@@ -374,7 +383,7 @@ describe('ArtifactWorkspace', () => {
   it('点击圈选名单中的 KOL 通过 createKolDetail 订阅辅助 Run 并打开详情弹层', async () => {
     const kolArtifact: ApiAgentArtifact = {
       id: 'kol-selection-1',
-      module: 'kol',
+      module: 'kol-selection',
       artifact_type: 'kol_selection_v3',
       parent_artifact_id: null,
       artifact_key: 'kol-selection:hash',
@@ -395,12 +404,12 @@ describe('ArtifactWorkspace', () => {
       status: 'completed',
       connection: 'closed',
       artifactsVersion: 1,
-      drafts: [{ artifactId: 'art-detail', module: 'kol', version: 1, status: 'published' }],
+      drafts: [{ artifactId: 'art-detail', module: 'kol-detail', version: 1, status: 'published' }],
     };
     vi.mocked(useAgentRun).mockImplementation(runId => (runId ? completedRun : undefined));
     vi.mocked(getArtifact).mockResolvedValue({
       id: 'art-detail',
-      module: 'kol',
+      module: 'kol-detail',
       artifact_type: 'kol_detail_v2',
       parent_artifact_id: null,
       artifact_key: 'kol-detail:xiaohongshu:kol-1',
@@ -445,7 +454,13 @@ describe('ArtifactWorkspace', () => {
   });
 
   it('切换会话后未读水位重新初始化，旧会话高水位不抑制新会话圆点', async () => {
-    // 会话 s1：brand 模块已推进到水位 9。
+    // 服务端水位按会话区分：s1 已读到 9，s2 只读到 5。
+    vi.mocked(listArtifactReadStates).mockImplementation(async sessionId => (
+      sessionId === 's1'
+        ? [{ module: 'brand', last_seen_sequence: 9 }]
+        : [{ module: 'brand', last_seen_sequence: 5 }]
+    ));
+    // 会话 s1：brand 模块服务端水位 9 = 当前最大 seq，无未读圆点。
     const { rerender } = render(
       <ArtifactWorkspace
         sessionId="s1"
@@ -454,10 +469,9 @@ describe('ArtifactWorkspace', () => {
         createKolDetail={vi.fn()}
       />,
     );
-    // 初始化水位为 9：无未读圆点。
-    await waitFor(() => expect(screen.queryAllByTestId('unread-dot')).toHaveLength(0));
+    await waitFor(() => expect(listArtifactReadStates).toHaveBeenCalledWith('s1'));
 
-    // 切换到会话 s2（组件不卸载）：新会话 brand 当前最大 seq 5。
+    // 切换到会话 s2（组件不卸载）：新会话 brand 服务端水位 5 = 当前最大 seq 5。
     const s2Published = brandArtifact({ id: 'brand-s2', activity_sequence: 5 });
     rerender(
       <ArtifactWorkspace
@@ -467,9 +481,9 @@ describe('ArtifactWorkspace', () => {
         createKolDetail={vi.fn()}
       />,
     );
-    await waitFor(() => expect(screen.queryAllByTestId('unread-dot')).toHaveLength(0));
+    await waitFor(() => expect(listArtifactReadStates).toHaveBeenCalledWith('s2'));
 
-    // s2 随后到达 seq 7 的 Draft：若旧水位 9 未重置，7 > 9 不成立，圆点被吞掉。
+    // s2 随后到达 seq 7 的 Draft：若沿用 s1 的旧水位 9，7 > 9 不成立，圆点被吞掉。
     const s2Draft = brandArtifact({
       id: 'brand-s2-draft',
       status: 'draft',
@@ -493,7 +507,7 @@ describe('ArtifactWorkspace', () => {
   it('辅助 Run 失败且无已发布产物时展示错误态而非无限加载', async () => {
     const kolArtifact: ApiAgentArtifact = {
       id: 'kol-selection-1',
-      module: 'kol',
+      module: 'kol-selection',
       artifact_type: 'kol_selection_v3',
       parent_artifact_id: null,
       artifact_key: 'kol-selection:hash',
@@ -526,5 +540,201 @@ describe('ArtifactWorkspace', () => {
 
     expect(await screen.findByRole('alert')).toHaveTextContent(/达人详情生成失败/);
     expect(screen.queryByText('正在生成达人详情…')).not.toBeInTheDocument();
+  });
+
+  // ----------------------------------------------------------------------- //
+  // 未读水位：服务端初始化 + 离线未读 + 点击上报（C2）
+  // ----------------------------------------------------------------------- //
+
+  it('按服务端已读水位初始化：离线期间的新产物打点，点击 Tab 后上报并清除', async () => {
+    // 服务端水位 brand=5：当前最大 seq 5 的既有产物不打点。
+    vi.mocked(listArtifactReadStates).mockResolvedValue([{ module: 'brand', last_seen_sequence: 5 }]);
+    const markArtifactSeen = vi.fn();
+    const { rerender } = render(
+      <ArtifactWorkspace
+        sessionId="s1"
+        artifacts={[brandArtifact()]}
+        markArtifactSeen={markArtifactSeen}
+        createKolDetail={vi.fn()}
+      />,
+    );
+
+    // 等品牌内容渲染完成（此时水位已就绪），确认无未读圆点。
+    fireEvent.click(screen.getByRole('tab', { name: '品牌分析' }));
+    await screen.findByText('海底捞');
+    expect(markArtifactSeen).toHaveBeenCalledWith('brand', 5);
+    expect(screen.queryAllByTestId('unread-dot')).toHaveLength(0);
+
+    // 离线期间发布的新产物（seq 7 > 服务端水位 5）→ 刷新后圆点出现。
+    const offlinePublished = brandArtifact({
+      id: 'brand-offline',
+      activity_sequence: 7,
+      updated_at: '2026-08-01T11:00:00',
+    });
+    rerender(
+      <ArtifactWorkspace
+        sessionId="s1"
+        artifacts={[brandArtifact(), offlinePublished]}
+        markArtifactSeen={markArtifactSeen}
+        createKolDetail={vi.fn()}
+      />,
+    );
+    const brandTab = screen.getByRole('tab', { name: '品牌分析' });
+    await waitFor(() => expect(within(brandTab).getByTestId('unread-dot')).toBeVisible());
+
+    // 点击 Tab 后按 max(旧, 新) 上报并清除圆点。
+    fireEvent.click(brandTab);
+    expect(markArtifactSeen).toHaveBeenCalledWith('brand', 7);
+    await waitFor(() => expect(within(brandTab).queryByTestId('unread-dot')).toBeNull());
+  });
+
+  it('达人 Tab 圆点聚合 kol-selection / kol-analysis 任一模块的未读', async () => {
+    const kolAnalysis: ApiAgentArtifact = {
+      id: 'kol-analysis-1',
+      module: 'kol-analysis',
+      artifact_type: 'kol_analysis_v2',
+      parent_artifact_id: null,
+      artifact_key: 'kol-analysis:hash',
+      status: 'published',
+      latest_version: 1,
+      activity_sequence: 8,
+      created_at: '2026-08-01T12:00:00',
+      updated_at: '2026-08-01T12:00:00',
+    };
+    // 零水位（服务端无记录）：kol-analysis 有产物即未读。
+    renderWorkspace([kolAnalysis]);
+
+    const kolTab = screen.getByRole('tab', { name: '达人' });
+    await waitFor(() => expect(within(kolTab).getByTestId('unread-dot')).toBeVisible());
+  });
+
+  it('kol-detail 产物更新不点亮达人 Tab 主圆点', async () => {
+    const kolDetail: ApiAgentArtifact = {
+      id: 'kol-detail-1',
+      module: 'kol-detail',
+      artifact_type: 'kol_detail_v2',
+      parent_artifact_id: null,
+      artifact_key: 'kol-detail:xiaohongshu:kol-1',
+      status: 'published',
+      latest_version: 1,
+      activity_sequence: 9,
+      created_at: '2026-08-01T12:00:00',
+      updated_at: '2026-08-01T12:00:00',
+    };
+    // 同场放一个 brand 未读产物作为「水位已就绪」信号：brand 打点而达人不打点。
+    renderWorkspace([kolDetail, brandArtifact()]);
+
+    const brandTab = screen.getByRole('tab', { name: '品牌分析' });
+    await waitFor(() => expect(within(brandTab).getByTestId('unread-dot')).toBeVisible());
+    const kolTab = screen.getByRole('tab', { name: '达人' });
+    expect(within(kolTab).queryByTestId('unread-dot')).toBeNull();
+  });
+
+  it('点击达人 Tab 按 kol-selection / kol-analysis 实际模块分别上报水位', async () => {
+    const markArtifactSeen = vi.fn();
+    const kolSelection: ApiAgentArtifact = {
+      id: 'kol-selection-1',
+      module: 'kol-selection',
+      artifact_type: 'kol_selection_v3',
+      parent_artifact_id: null,
+      artifact_key: 'kol-selection:hash',
+      status: 'published',
+      latest_version: 1,
+      activity_sequence: 8,
+      created_at: '2026-08-01T12:00:00',
+      updated_at: '2026-08-01T12:00:00',
+    };
+    const kolAnalysis: ApiAgentArtifact = {
+      id: 'kol-analysis-1',
+      module: 'kol-analysis',
+      artifact_type: 'kol_analysis_v2',
+      parent_artifact_id: null,
+      artifact_key: 'kol-analysis:hash',
+      status: 'published',
+      latest_version: 1,
+      activity_sequence: 6,
+      created_at: '2026-08-01T12:00:00',
+      updated_at: '2026-08-01T12:00:00',
+    };
+    renderWorkspace([kolSelection, kolAnalysis], vi.fn(), markArtifactSeen);
+
+    const kolTab = screen.getByRole('tab', { name: '达人' });
+    await waitFor(() => expect(within(kolTab).getByTestId('unread-dot')).toBeVisible());
+    fireEvent.click(kolTab);
+
+    expect(markArtifactSeen).toHaveBeenCalledWith('kol-selection', 8);
+    expect(markArtifactSeen).toHaveBeenCalledWith('kol-analysis', 6);
+    await waitFor(() => expect(within(kolTab).queryByTestId('unread-dot')).toBeNull());
+  });
+
+  // ----------------------------------------------------------------------- //
+  // Excel 导出按钮（C2）
+  // ----------------------------------------------------------------------- //
+
+  it('已发布品牌产物显示导出按钮，并按当前下拉查看的版本导出', async () => {
+    renderWorkspace([brandArtifact()]);
+    fireEvent.click(screen.getByRole('tab', { name: '品牌分析' }));
+
+    const exportButton = await screen.findByRole('button', { name: '导出 Excel' });
+    expect(exportButton).toBeEnabled();
+
+    // 切到历史版本 v1 后导出：导出版本与界面查看版本一致。
+    fireEvent.change(screen.getByRole('combobox', { name: '版本选择' }), { target: { value: '1' } });
+    await waitFor(() => expect(getArtifactVersion).toHaveBeenCalledWith('brand-1', 1));
+
+    fireEvent.click(exportButton);
+    await waitFor(() => expect(exportArtifact).toHaveBeenCalledWith('brand-1', 1));
+  });
+
+  it('已发布圈选达人产物显示导出按钮', async () => {
+    const kolSelection: ApiAgentArtifact = {
+      id: 'kol-selection-1',
+      module: 'kol-selection',
+      artifact_type: 'kol_selection_v3',
+      parent_artifact_id: null,
+      artifact_key: 'kol-selection:hash',
+      status: 'published',
+      latest_version: 1,
+      activity_sequence: 8,
+      created_at: '2026-08-01T12:00:00',
+      updated_at: '2026-08-01T12:00:00',
+    };
+    renderWorkspace([kolSelection]);
+    fireEvent.click(screen.getByRole('tab', { name: '圈选达人' }));
+    await screen.findByText('达人甲');
+
+    const exportButton = screen.getByRole('button', { name: '导出 Excel' });
+    fireEvent.click(exportButton);
+    await waitFor(() => expect(exportArtifact).toHaveBeenCalledWith('kol-selection-1', 1));
+  });
+
+  it('不支持导出的类型（campaign）不显示导出按钮', async () => {
+    const campaign: ApiAgentArtifact = {
+      id: 'campaign-1',
+      module: 'campaign',
+      artifact_type: 'campaign_report_v2',
+      parent_artifact_id: null,
+      artifact_key: 'campaign:hash',
+      status: 'published',
+      latest_version: 1,
+      activity_sequence: 4,
+      created_at: '2026-08-01T12:00:00',
+      updated_at: '2026-08-01T12:00:00',
+    };
+    renderWorkspace([campaign]);
+    fireEvent.click(screen.getByRole('tab', { name: '活动分析' }));
+
+    // 等版本拉取动作发生（payload 因无 fixture 落空），确认无导出按钮。
+    await waitFor(() => expect(getArtifactVersion).toHaveBeenCalledWith('campaign-1', 1));
+    expect(screen.queryByRole('button', { name: '导出 Excel' })).toBeNull();
+  });
+
+  it('Draft（非 published）产物不显示导出按钮', async () => {
+    const draft = brandArtifact({ status: 'draft', latest_version: 1 });
+    renderWorkspace([draft]);
+    fireEvent.click(screen.getByRole('tab', { name: '品牌分析' }));
+
+    await waitFor(() => expect(getArtifactVersion).toHaveBeenCalledWith('brand-1', 1));
+    expect(screen.queryByRole('button', { name: '导出 Excel' })).toBeNull();
   });
 });

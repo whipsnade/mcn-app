@@ -558,9 +558,20 @@ export function markArtifactRead(
   );
 }
 
+/** 会话全部模块的服务端已读水位：供 BI 未读圆点初始化（刷新/切换会话不吞离线未读）。 */
+export function listArtifactReadStates(sessionId: string): Promise<ApiAgentArtifactReadState[]> {
+  return request<ApiAgentArtifactReadState[]>(
+    `/api/v1/agent/sessions/${encodeURIComponent(sessionId)}/artifact-read-states`,
+  );
+}
+
 // xlsx 是二进制下载，不能走 request 的 JSON 路径（模式同 reports.ts 的 downloadBrandReport）。
-export async function exportArtifact(artifactId: string): Promise<void> {
-  const response = await authorizedFetch(`/api/v1/agent/artifacts/${encodeURIComponent(artifactId)}/export`);
+// version 缺省导出最新版本；显式传入时与界面当前查看版本一致（文件名由后端带 _v{N}）。
+export async function exportArtifact(artifactId: string, version?: number): Promise<void> {
+  const suffix = version !== undefined ? `?version=${version}` : '';
+  const response = await authorizedFetch(
+    `/api/v1/agent/artifacts/${encodeURIComponent(artifactId)}/export${suffix}`,
+  );
   if (!response.ok) {
     const body = (await response.json().catch(() => null)) as { detail?: string } | null;
     throw new Error(body?.detail ?? `HTTP_${response.status}`);

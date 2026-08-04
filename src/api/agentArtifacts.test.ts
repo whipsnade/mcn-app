@@ -15,6 +15,7 @@ import {
   getArtifact,
   getArtifactVersion,
   isAgentArtifactPayload,
+  listArtifactReadStates,
   listArtifacts,
   markArtifactRead,
 } from './agentArtifacts';
@@ -323,6 +324,16 @@ describe('agent artifacts api', () => {
     expect(result.last_seen_sequence).toBe(12);
   });
 
+  it('lists server-side artifact read states for session init', async () => {
+    const { request } = await import('./client');
+    vi.mocked(request).mockResolvedValue([{ module: 'brand', last_seen_sequence: 12 }]);
+
+    const result = await listArtifactReadStates('s1');
+
+    expect(request).toHaveBeenCalledWith('/api/v1/agent/sessions/s1/artifact-read-states');
+    expect(result).toEqual([{ module: 'brand', last_seen_sequence: 12 }]);
+  });
+
   it('exports an artifact as a downloaded xlsx blob', async () => {
     const { authorizedFetch } = await import('./client');
     vi.mocked(authorizedFetch).mockResolvedValue(new Response(new Blob(['xlsx']), {
@@ -343,6 +354,23 @@ describe('agent artifacts api', () => {
     expect(authorizedFetch).toHaveBeenCalledWith('/api/v1/agent/artifacts/art-1/export');
     expect(clicked).toEqual([{ href: 'blob:mock-download', download: 'brand_report_v3.xlsx' }]);
     expect(document.querySelector('a[download]')).toBeNull();
+  });
+
+  it('exports the explicitly viewed version via the version query param', async () => {
+    const { authorizedFetch } = await import('./client');
+    vi.mocked(authorizedFetch).mockResolvedValue(new Response(new Blob(['xlsx']), {
+      status: 200,
+      headers: { 'Content-Disposition': 'attachment; filename="brand_report_v3_v1.xlsx"' },
+    }));
+    vi.stubGlobal('URL', Object.assign(URL, {
+      createObjectURL: vi.fn(() => 'blob:mock-download'),
+      revokeObjectURL: vi.fn(),
+    }));
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined);
+
+    await exportArtifact('art-1', 1);
+
+    expect(authorizedFetch).toHaveBeenCalledWith('/api/v1/agent/artifacts/art-1/export?version=1');
   });
 
   it('narrows the payload union by schema_version with the type guard', () => {
