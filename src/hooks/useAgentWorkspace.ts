@@ -26,6 +26,7 @@ import { getWallet } from '../api/wallet';
 import { isTerminalRunStatus } from '../state/agentEvents';
 import type { RunRuntimeState } from '../state/agentEvents';
 import { useAgentRun } from './useAgentRun';
+import { NO_RUNS, useRunHistoryReplay } from './useRunHistoryReplay';
 
 
 export interface AgentWorkspaceSession {
@@ -128,6 +129,14 @@ export function useAgentWorkspace(userId?: string) {
   const activeSession = useMemo(
     () => sessions.find(session => session.id === activeSessionId),
     [activeSessionId, sessions],
+  );
+
+  // 历史 Run 回放（C3）：终态且非活动的 Run 从 events 端点全量回放一次，
+  // 补齐步骤/工具/thinking；活动 Run 仍走上面的实时订阅。
+  const runHistory = useRunHistoryReplay(
+    activeSession?.id,
+    activeSession?.runs ?? NO_RUNS,
+    activeRunId,
   );
 
   const load = useCallback(async (generation: number) => {
@@ -467,6 +476,7 @@ export function useAgentWorkspace(userId?: string) {
     activeSessionId,
     activeRunId,
     run,
+    runHistory,
     artifacts,
     wallet,
     loading,

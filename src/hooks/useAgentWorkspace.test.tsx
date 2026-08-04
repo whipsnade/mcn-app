@@ -24,6 +24,7 @@ vi.mock('../api/agent', async importOriginal => {
     cancelRun: vi.fn(),
     resumeRun: vi.fn(),
     createKolDetailRun: vi.fn(),
+    fetchRunEvents: vi.fn(),
   };
 });
 
@@ -572,5 +573,55 @@ describe('useAgentWorkspace', () => {
       rerender();
     });
     expect(agentArtifactsApi.listArtifacts).toHaveBeenCalledTimes(2);
+  });
+
+  it('replays terminal non-anchor runs into full history cards after session load', async () => {
+    // 会话详情只带 Run 元数据；终态且非锚点的历史 Run 由 runHistory 事件回放
+    // 补齐步骤/工具/thinking（C3）。
+    const detail: ApiAgentSessionDetail = {
+      ...s1,
+      messages: [],
+      runs: [makeRun('run-old', 'completed'), makeRun('run-latest', 'completed')],
+    };
+    vi.mocked(agentApi.listSessions).mockResolvedValue([s1]);
+    vi.mocked(agentApi.getSession).mockResolvedValue(detail);
+    vi.mocked(agentApi.fetchRunEvents).mockImplementation(async (runId, _lastEventId, _signal, onEvent) => {
+      onEvent({ id: 1, runId, type: 'run.started', payload: {} });
+      onEvent({ id: 2, runId, type: 'thinking.delta', payload: { text: '复盘第一轮分析' } });
+      onEvent({ id: 3, runId, type: 'tool.started', payload: { internal_tool_name: 'brand_search' } });
+      onEvent({ id: 4, runId, type: 'tool.succeeded', payload: { internal_tool_name: 'brand_search' } });
+      onEvent({ id: 5, runId, type: 'run.completed', payload: {} });
+    });
+
+    const { result } = renderHook(() => useAgentWorkspace('user-1'));
+    await waitFor(() => expect(result.current.activeRunId).toBe('run-latest'));
+
+    await waitFor(() => expect(result.current.runHistory['run-old'].toolCalls).toHaveLength(1));
+    expect(result.current.runHistory['run-old']).toMatchObject({
+      status: 'completed',
+      hasThinking: true,
+      thinking: '复盘第一轮分析',
+    });
+    expect(result.current.runHistory['run-old'].steps.length).toBeGreaterThan(0);
+  });
+
+  it('keeps the active run on the live subscription without an extra replay fetch', async () => {
+    // 全部终态时锚点 = 最后一个 Run（走 useAgentRun 实时订阅恢复）；它不得再被
+    // runHistory 回放重复拉取，只有更早的历史 Run 才回放。
+    const detail: ApiAgentSessionDetail = {
+      ...s1,
+      messages: [],
+      runs: [makeRun('run-old', 'completed'), makeRun('run-latest', 'completed')],
+    };
+    vi.mocked(agentApi.listSessions).mockResolvedValue([s1]);
+    vi.mocked(agentApi.getSession).mockResolvedValue(detail);
+    vi.mocked(agentApi.fetchRunEvents).mockResolvedValue(undefined);
+
+    const { result } = renderHook(() => useAgentWorkspace('user-1'));
+    await waitFor(() => expect(result.current.activeRunId).toBe('run-latest'));
+    await waitFor(() => expect(agentApi.fetchRunEvents).toHaveBeenCalledTimes(1));
+
+    expect(vi.mocked(agentApi.fetchRunEvents).mock.calls[0][0]).toBe('run-old');
+    expect(vi.mocked(useAgentRun).mock.calls.at(-1)?.[0]).toBe('run-latest');
   });
 });

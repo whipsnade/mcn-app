@@ -56,6 +56,8 @@ const REVIEW_LABELS: Record<RunReviewStatus, string> = {
  * - thinking 实时展示、完成后折叠；
  * - 工具步骤只显示安全名称/状态/耗时/积分；
  * - paused 显示继续按钮；clarification_requested 显示问题与选项 chips。
+ * - 历史 Run 的完整状态由 useRunHistoryReplay 事件回放补齐；回放失败时
+ *   退化为元数据空壳卡（「历史执行记录」）。
  *
  * React.memo：历史 Run 卡（run/澄清/回调 props 稳定）跳过每次 SSE 增量引发的
  * 整树重渲染，只有活跃卡跟随实时状态更新。
@@ -87,8 +89,8 @@ export function AgentRunCardImpl({
   const stepCount = run.steps.length;
   const canPause = (run.status === 'running' || run.status === 'reviewing') && onPause !== undefined;
 
-  // 终态折叠：一行可展开摘要。历史 Run（未回放步骤）不渲染“共 0 步”的误导文案，
-  // 改用「历史执行记录」；后续可在此按 runId 回放 SSE 以展示完整步骤（见 buildRunHistory 注释）。
+  // 终态折叠：一行可展开摘要。回放失败/无步骤的历史 Run 不渲染“共 0 步”的
+  // 误导文案，保留「历史执行记录」降级标识（回放见 useRunHistoryReplay）。
   if (collapsed) {
     const summaryLabel = terminal && stepCount === 0
       ? '历史执行记录'
@@ -157,7 +159,7 @@ export function AgentRunCardImpl({
           <AgentThinking text={run.thinking} hasThinking={run.hasThinking} status={run.thinkingStatus} />
         )}
         <AgentRunSteps toolCalls={run.toolCalls} />
-        {/* 历史 Run 未回放步骤时的展开说明（避免展开后空白误导）。 */}
+        {/* 历史 Run 回放失败/无步骤时的展开说明（避免展开后空白误导）。 */}
         {terminal && stepCount === 0 && (
           <p className="rounded-lg bg-slate-50 px-3 py-2 text-[10px] leading-4 text-slate-400">
             该历史执行详情暂未回放

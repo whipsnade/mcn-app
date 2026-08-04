@@ -238,6 +238,47 @@ describe('ChatArea', () => {
     expect(screen.getByText('Run 加载中…')).toBeVisible();
   });
 
+  it('renders a replayed historical run card with tool steps and collapsed thinking', () => {
+    // C3：历史 Run 经事件回放补齐完整 runtime 后，执行卡展开可回看工具步骤，
+    // thinking 以「已思考」折叠区呈现。
+    render(
+      <ChatArea
+        session={{
+          ...session,
+          messages: [{ id: 'm1', sender: 'user', text: '历史分析', timestamp: '10:00', runId: 'run-h' }],
+        }}
+        onSendMessage={vi.fn()}
+        isAnalyzing={false}
+        isMockMode={false}
+        runHistory={{
+          'run-h': runtime('run-h', {
+            status: 'completed',
+            connection: 'closed',
+            hasThinking: true,
+            thinking: '正在检索品牌声量',
+            thinkingStatus: 'completed',
+            steps: [
+              { id: 'run', label: '开始执行', status: 'succeeded' },
+              { id: 'tool-5', label: '查询brand_search', status: 'succeeded' },
+              { id: 'terminal-7', label: '分析完成', status: 'succeeded' },
+            ],
+            toolCalls: [{ id: 'tool-5', name: 'brand_search', status: 'succeeded' }],
+          }),
+        }}
+      />,
+    );
+
+    // 终态折叠摘要带真实步数（回放成功不再是「历史执行记录」空壳）。
+    const collapsed = screen.getByRole('button', { name: /执行卡 · 共 3 步\s*· 分析完成/ });
+    fireEvent.click(collapsed);
+
+    const card = screen.getByLabelText('执行卡');
+    expect(within(card).getByText('brand_search')).toBeVisible();
+    // thinking 折叠展示，展开后可读。
+    fireEvent.click(within(card).getByRole('button', { name: '已思考' }));
+    expect(within(card).getByText('正在检索品牌声量')).toBeVisible();
+  });
+
   it('wires clarification chips and pause/resume through ChatArea', async () => {
     const onSendMessage = vi.fn().mockResolvedValue(undefined);
     const onCancelRun = vi.fn().mockResolvedValue(undefined);

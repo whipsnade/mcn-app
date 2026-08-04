@@ -82,6 +82,7 @@ function workspaceValue() {
     activeSessionId: workspaceRef.current.activeSessionId,
     activeRunId: undefined,
     run: undefined,
+    runHistory: {},
     artifacts: [],
     wallet: undefined,
     loading: false,
@@ -184,6 +185,39 @@ describe('App 集成：一次性切换到统一 Agent 工作区', () => {
     };
     expect(props.session.messages[0].sender).toBe('ai');
     expect(props.session.messages[0].suggestions).toEqual(['对比一下竞品的投放节奏']);
+  });
+
+  it('把 workspace 的历史 Run 回放结果透传给 ChatArea 的 runHistory', () => {
+    const replayed = {
+      'run-1': {
+        runId: 'run-1',
+        lastEventId: 7,
+        connection: 'closed',
+        status: 'completed',
+        steps: [{ id: 'run', label: '开始执行', status: 'succeeded' }],
+        toolCalls: [{ id: 'tool-5', name: 'brand_search', status: 'succeeded' }],
+        thinking: '正在检索品牌声量',
+        hasThinking: true,
+        thinkingStatus: 'completed',
+        drafts: [],
+        messageCompleted: true,
+        artifactsVersion: 0,
+      },
+    };
+    workspaceRef.current = {
+      sessions: [AGENT_SESSION],
+      activeSession: AGENT_SESSION,
+      activeSessionId: 's1',
+    };
+    mockUseAgentWorkspace.mockImplementation(() => ({
+      ...workspaceValue(),
+      runHistory: replayed,
+    }) as never);
+
+    render(<App />);
+
+    const props = chatAreaPropsRef.current as { runHistory: Record<string, { toolCalls: unknown[] }> };
+    expect(props.runHistory['run-1'].toolCalls).toHaveLength(1);
   });
 
   it('收藏保留：无会话时展示保存的快照与「新建会话后刷新」，不回退旧 Quick API', async () => {

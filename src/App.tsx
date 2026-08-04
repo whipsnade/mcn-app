@@ -16,7 +16,7 @@ import SessionList from './components/SessionList';
 import { WorkspaceTabs, type WorkspaceTab } from './components/WorkspaceTabs';
 import { useAgentWorkspace, type AgentWorkspaceSession } from './hooks/useAgentWorkspace';
 import { useKolDetailFlow } from './hooks/useKolDetailFlow';
-import { isTerminalRunStatus, type RunRuntimeState } from './state/agentEvents';
+import { isTerminalRunStatus } from './state/agentEvents';
 import type { Message, QuickKolSelection, Session } from './types';
 
 
@@ -58,29 +58,6 @@ function toChatSession(source: AgentWorkspaceSession): Session {
   };
 }
 
-// 历史 Run 的终态冻结快照：当前无历史 Run 的 SSE 回放，先用会话内 Run 元数据
-// 生成最简终态卡（无步骤/工具明细），避免历史消息下的执行卡永久停留在「加载中」。
-// 后续任务可在此按 runId 挂载 useAgentRun 回放 SSE，以渲染完整步骤/工具/思考。
-function buildRunHistory(session: AgentWorkspaceSession | undefined): Record<string, RunRuntimeState> {
-  const history: Record<string, RunRuntimeState> = {};
-  for (const run of session?.runs ?? []) {
-    history[run.id] = {
-      runId: run.id,
-      lastEventId: 0,
-      connection: 'closed',
-      status: run.status as RunRuntimeState['status'],
-      steps: [],
-      toolCalls: [],
-      thinking: '',
-      hasThinking: false,
-      drafts: [],
-      messageCompleted: false,
-      artifactsVersion: 0,
-    };
-  }
-  return history;
-}
-
 export default function App() {
   const { user, status: authStatus, logout } = useAuth();
   const workspace = useAgentWorkspace(authStatus === 'authenticated' ? user?.id : undefined);
@@ -105,10 +82,9 @@ export default function App() {
     () => (workspace.activeSession ? toChatSession(workspace.activeSession) : undefined),
     [workspace.activeSession],
   );
-  const runHistory = useMemo(
-    () => buildRunHistory(workspace.activeSession),
-    [workspace.activeSession],
-  );
+  // 历史 Run 完整执行卡由 useAgentWorkspace 的 runHistory 回放提供（C3）；
+  // 回放未完成的窗口期 / 回放失败时是该 Run 的元数据空壳卡。
+  const runHistory = workspace.runHistory ?? {};
   const runStatus = workspace.run?.status;
   // 执行中 / 审核中视为分析中，禁止发送；澄清等待（clarification_requested）需用户作答，不阻塞输入。
   const isAnalyzing = workspace.busy || Boolean(

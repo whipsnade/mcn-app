@@ -215,9 +215,14 @@ test('shows an independent run card with thinking, tools, review and publish', a
   await page.getByRole('button', { name: '收起' }).first().click();
   await page.getByPlaceholder(/输入消息并向 AI 分析师提问/).fill('再分析抖音渠道');
   await page.getByRole('button', { name: '发送', exact: true }).click();
-  await expect(page.getByRole('button', {
-    name: /执行卡 · 共 \d+ 步 · 分析完成|历史执行记录 · 分析完成/,
-  })).toHaveCount(2);
+  // C3：run-1 转为历史后经事件回放补齐步骤，两张卡都带真实步数（不再是空壳卡）。
+  const collapsedCards = page.getByRole('button', { name: /执行卡 · 共 \d+ 步 · 分析完成/ });
+  await expect(collapsedCards).toHaveCount(2);
+
+  // 展开历史卡（第一张，锚定在第一轮消息下）可回看回放出的工具步骤。
+  await collapsedCards.first().click();
+  const historyCard = page.getByRole('region', { name: '执行卡' }).first();
+  await expect(historyCard.getByText('brand_search', { exact: true })).toBeVisible();
 });
 
 // --------------------------------------------------------------------------- //
@@ -548,6 +553,73 @@ test('restores the session list after reload', async ({ page }) => {
   await page.reload();
   await expect(page.getByTitle('新建分析会话')).toBeVisible();
   await expect(page.getByRole('button', { name: /选择会话 恢复会话/ })).toBeVisible();
+});
+
+// C3：刷新/重进后历史 Run 不再是空壳终态卡——锚点 Run 走实时订阅恢复，
+// 更早的历史 Run 经 events 端点一次性回放补齐步骤与 thinking。
+test('restores historical run cards with replayed steps after reload', async ({ page }) => {
+  const phone = await uniquePhone();
+  const sessionId = 's-history';
+  const session = sessionJson(sessionId, '多轮历史会话');
+  const run1 = 'run-h1';
+  const run2 = 'run-h2';
+  const detail = {
+    ...session,
+    messages: [
+      messageJson('m-user-1', 'user', '分析品牌声量', 1, run1),
+      messageJson('m-ai-1', 'assistant', '品牌声量分析完成', 2, run1),
+      messageJson('m-user-2', 'user', '再圈选一波达人', 3, run2),
+      messageJson('m-ai-2', 'assistant', '圈选完成', 4, run2),
+    ],
+    runs: [runJson(run1, sessionId, 'completed'), runJson(run2, sessionId, 'completed')],
+  };
+  const run1Events: SseEvent[] = [
+    { seq: 1, event: 'run.started', payload: { run_kind: 'user' } },
+    { seq: 2, event: 'thinking.started', payload: { attempt: 1 } },
+    { seq: 3, event: 'thinking.delta', payload: { text: '复盘品牌声量' } },
+    { seq: 4, event: 'thinking.completed' },
+    { seq: 5, event: 'tool.started', payload: { internal_tool_name: 'brand_search' } },
+    { seq: 6, event: 'tool.succeeded', payload: { internal_tool_name: 'brand_search', duration_ms: 900, points: 10 } },
+    { seq: 7, event: 'run.completed', payload: { outcome: 'completed' } },
+  ];
+  const run2Events: SseEvent[] = [
+    { seq: 1, event: 'run.started', payload: { run_kind: 'user' } },
+    { seq: 2, event: 'tool.started', payload: { internal_tool_name: 'kol_search' } },
+    { seq: 3, event: 'tool.succeeded', payload: { internal_tool_name: 'kol_search', duration_ms: 700, points: 10 } },
+    { seq: 4, event: 'run.completed', payload: { outcome: 'completed' } },
+  ];
+
+  await mockWalletAndFavorites(page);
+  await page.route('**/api/v1/agent/sessions', route => route.fulfill({ json: [session] }));
+  await page.route(`**/api/v1/agent/sessions/${sessionId}`, route => route.fulfill({ json: detail }));
+  await mockArtifactsEmpty(page, sessionId);
+  await page.route(`**/api/v1/agent/runs/${run1}/events`, route => route.fulfill({
+    status: 200,
+    contentType: 'text/event-stream',
+    body: sseBody(run1, run1Events),
+  }));
+  await page.route(`**/api/v1/agent/runs/${run2}/events`, route => route.fulfill({
+    status: 200,
+    contentType: 'text/event-stream',
+    body: sseBody(run2, run2Events),
+  }));
+
+  await login(page, phone);
+  await ensureChatPane(page);
+
+  // 两张历史执行卡都带真实步数：run-h2（锚点）走实时订阅恢复，run-h1 走事件回放。
+  const collapsedCards = page.getByRole('button', { name: /执行卡 · 共 \d+ 步 · 分析完成/ });
+  await expect(collapsedCards).toHaveCount(2);
+
+  // reload 后两张历史卡仍完整：步骤可见、thinking 折叠可回看。
+  await page.reload();
+  await ensureChatPane(page);
+  await expect(page.getByRole('button', { name: /执行卡 · 共 \d+ 步 · 分析完成/ })).toHaveCount(2);
+  await page.getByRole('button', { name: /执行卡 · 共 \d+ 步 · 分析完成/ }).first().click();
+  const historyCard = page.getByRole('region', { name: '执行卡' }).first();
+  await expect(historyCard.getByText('brand_search', { exact: true })).toBeVisible();
+  await historyCard.getByRole('button', { name: '已思考' }).click();
+  await expect(historyCard.getByText('复盘品牌声量', { exact: true })).toBeVisible();
 });
 
 test('soft-deletes a session and switches to the remaining one', async ({ page }) => {
