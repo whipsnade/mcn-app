@@ -3,8 +3,6 @@ import { Loader2, Pause, Send, Sparkles, ShieldAlert } from 'lucide-react';
 import { Session } from '../types';
 import type { FollowupSuggestion } from '../api/contracts';
 import { isTerminalRunStatus, type RunRuntimeState } from '../state/agentEvents';
-import type { TaskFlowNode } from '../state/taskEvents';
-import type { TaskFlowReplay } from '../hooks/useTaskFlows';
 import AgentRunCard, { type RunClarification } from './agent/AgentRunCard';
 
 /** 空白会话（无消息、无 followup 建议）展示的默认圈选建议，点击填入输入框。 */
@@ -41,20 +39,6 @@ interface ChatAreaProps {
   followupSuggestions?: FollowupSuggestion[];
   followupError?: string;
   onRetryFollowups?: () => Promise<unknown>;
-
-  // —— 以下旧任务流 props 已被 Run 卡取代，仅为 Task 23 一次性切换前保持 App 编译而保留。 ——
-  /** @deprecated 由 run/runHistory 取代。 */
-  flowTaskId?: string;
-  /** @deprecated 由 run 取代。 */
-  flowNodes?: TaskFlowNode[];
-  /** @deprecated 由 run.status 取代。 */
-  flowTerminal?: boolean;
-  /** @deprecated 由 run.status 取代。 */
-  flowTerminalLabel?: string;
-  /** @deprecated 由 runHistory 取代。 */
-  taskFlows?: Record<string, TaskFlowReplay>;
-  /** @deprecated Run 卡不渲染 assistant 草稿。 */
-  assistantDraft?: string;
 }
 
 export default function ChatArea({

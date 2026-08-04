@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_db
 from app.favorites.schemas import FavoriteCreate, FavoriteRead
-from app.favorites.service import FavoritesService, serialize_selection_item
+from app.favorites.service import FavoritesService
 from app.identity.dependencies import CurrentUser
 from app.reporting.models import Kol, KolSnapshot, UserKolFavorite
 
@@ -78,33 +78,6 @@ async def list_favorites(
         nickname = await _latest_kol_nickname(db, kol.id)
         result.append(favorite_read(favorite, kol, nickname))
     return result
-
-
-@router.get("/favorites/kol-selection-ref")
-async def get_favorite_kol_selection_ref(
-    user: CurrentUser,
-    db: Annotated[AsyncSession, Depends(get_db)],
-    platform: Annotated[str, Query(min_length=1, max_length=32)],
-    kol_uid: Annotated[str, Query(min_length=1, max_length=128)],
-) -> dict:
-    """把收藏达人解析到其最新圈选名单条目，供前端复用圈选详情弹窗与版本缓存。
-
-    收藏本身不绑定名单；按 user_id+platform+kol_uid 取最新 selection set 中的条目。
-    该达人不在任何圈选名单（如快捷推荐里收藏的）时返回 404，前端回退快捷详情。
-    """
-    try:
-        selection_set, item = await FavoritesService(db).resolve_selection_ref(
-            user.id, platform=platform, kol_uid=kol_uid
-        )
-    except LookupError as error:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail=str(error)
-        ) from error
-    return {
-        "session_id": selection_set.session_id,
-        "set_id": selection_set.id,
-        "item": serialize_selection_item(item),
-    }
 
 
 @router.post("/favorites", response_model=FavoriteRead, status_code=status.HTTP_201_CREATED)

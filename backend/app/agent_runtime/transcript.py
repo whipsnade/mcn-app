@@ -125,7 +125,8 @@ class RunTranscriptLoader:
 
     @staticmethod
     def _snapshot_trigger_message(run: AgentRun) -> ChatMessage | None:
-        """从 ``prompt_snapshot_json`` 恢复 kol_detail 触发上下文（platform/kol_uid）。
+        """从 ``prompt_snapshot_json`` 恢复 kol_detail 触发上下文（platform/kol_uid
+        及经归属校验的名单引用，§6.4）。
 
         kol_detail Run 由点击触发、没有 ``input_message_id``：触发上下文在
         创建时持久化到 ``prompt_snapshot_json``（G3），崩溃接管按它恢复，
@@ -143,7 +144,12 @@ class RunTranscriptLoader:
             return None
         return ChatMessage(
             role="user",
-            content=kol_detail_trigger_content(str(platform), str(kol_uid)),
+            content=kol_detail_trigger_content(
+                str(platform),
+                str(kol_uid),
+                selection_artifact_id=trigger.get("selection_artifact_id"),
+                selection_version=trigger.get("selection_version"),
+            ),
         )
 
     # ------------------------------------------------------------------ #

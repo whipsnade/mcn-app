@@ -1,7 +1,7 @@
-"""收藏服务：user_kol_favorites 旧表上的读/写/幂等 upsert 与圈选名单解析。
+"""收藏服务：user_kol_favorites 旧表上的读/写/幂等 upsert。
 
-从旧 reporting.service 拆出，只依赖保留的 legacy ORM（reporting/tasks/workspace/
-selection 的 models.py）。收藏继续使用 /api/v1/favorites 契约与 user_kol_favorites
+从旧 reporting.service 拆出，只依赖保留的 legacy ORM（reporting/tasks/workspace
+的 models.py）。收藏继续使用 /api/v1/favorites 契约与 user_kol_favorites
 旧表。
 """
 
@@ -11,34 +11,17 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import desc, func, select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.mysql import insert as mysql_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.reporting.models import Kol, TaskCandidate, UserKolFavorite
-from app.selection.models import KolSelectionItem, KolSelectionSet, SessionKolSelection
 from app.tasks.models import AnalysisTask
 from app.workspace.models import WorkspaceSession
 
 
 def _now() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
-
-
-def serialize_selection_item(
-    row: SessionKolSelection | KolSelectionItem,
-) -> dict[str, Any]:
-    """端点 item DTO：session_kol_selections 与 kol_selection_items 行形状一致。"""
-    return {
-        "platform": row.platform,
-        "kol_uid": row.kol_uid,
-        "nickname": row.nickname,
-        "followers": row.followers,
-        "city": row.city,
-        "profile_url": row.profile_url,
-        "fields": row.fields_json,
-        "score": row.score_json,
-    }
 
 
 class FavoritesService:
@@ -183,28 +166,6 @@ class FavoritesService:
                 raise LookupError("favorite_not_found")
             await self._db.delete(favorite)
             await self._db.flush()
-
-    async def resolve_selection_ref(
-        self, user_id: str, *, platform: str, kol_uid: str
-    ) -> tuple[KolSelectionSet, KolSelectionItem]:
-        """解析收藏达人的最新圈选名单条目（无则 LookupError）。"""
-        row = (
-            await self._db.execute(
-                select(KolSelectionItem, KolSelectionSet)
-                .join(KolSelectionSet, KolSelectionItem.selection_set_id == KolSelectionSet.id)
-                .where(
-                    KolSelectionItem.user_id == user_id,
-                    KolSelectionItem.platform == platform,
-                    KolSelectionItem.kol_uid == kol_uid,
-                )
-                .order_by(desc(KolSelectionSet.created_at))
-                .limit(1)
-            )
-        ).first()
-        if row is None:
-            raise LookupError("selection_ref_not_found")
-        item, selection_set = row
-        return selection_set, item
 
     async def _owned_task(self, user_id: str, task_id: str) -> AnalysisTask:
         task = await self._db.scalar(

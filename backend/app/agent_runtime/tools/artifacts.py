@@ -17,6 +17,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_artifacts.service import ArtifactBusy, ArtifactService
 from app.agent_artifacts.validation import ArtifactPayloadInvalid, SCHEMA_VERSION_BY_MODULE
+from app.agent_runtime.kol_detail import KOL_DETAIL_SNAPSHOT_KEY
+from app.agent_runtime.models import AgentRun
 from app.agent_runtime.tools.contracts import ToolContext, ToolResult
 
 
@@ -78,12 +80,42 @@ class CreateDraftTool:
     def __init__(self, db_session: AsyncSession | None = None) -> None:
         self._db = db_session
 
+    async def _kol_detail_selection_parent(
+        self, context: ToolContext
+    ) -> tuple[str | None, str | None]:
+        """kol-detail Draft 的 parent 权威绑定（§6.4）。
+
+        名单引用在 ``KolDetailRunService`` 归属校验后持久化到 Run 的
+        ``prompt_snapshot_json``（含已发布名单 Version 行 id）。创建
+        kol-detail Draft 时以快照为准覆盖模型传参——稳定行只记
+        ``parent_artifact_id``，版本绑定写 Revision/Version 的
+        ``parent_artifact_version_id``（沿用 ArtifactService 既有模式）。
+        无名单引用时返回 ``(None, None)``，调用方保持模型原参数。
+        """
+        run = await self._db.get(AgentRun, context.run_id)
+        snapshot = run.prompt_snapshot_json if run is not None else None
+        trigger = (
+            snapshot.get(KOL_DETAIL_SNAPSHOT_KEY) if isinstance(snapshot, dict) else None
+        )
+        if not isinstance(trigger, dict):
+            return None, None
+        version_id = trigger.get("selection_version_id")
+        if not version_id:
+            return None, None
+        return trigger.get("selection_artifact_id"), str(version_id)
+
     async def execute(self, context: ToolContext, arguments: BaseModel) -> ToolResult:
         args = CreateDraftArgs.model_validate(arguments)
         if self._db is None:
             return ToolResult(
                 status="failed", safe_summary="create_draft requires a database session"
             )
+        parent_artifact_id = args.parent_artifact_id
+        parent_artifact_version_id = args.parent_artifact_version_id
+        if args.module == "kol-detail":
+            snapshot_parent = await self._kol_detail_selection_parent(context)
+            if snapshot_parent[1] is not None:
+                parent_artifact_id, parent_artifact_version_id = snapshot_parent
         try:
             artifact, draft, revision = await ArtifactService(self._db).create_or_get_draft(
                 session_id=context.session_id,
@@ -95,8 +127,8 @@ class CreateDraftTool:
                 payload=args.payload,
                 evidence_refs=args.evidence_refs,
                 artifact_type=args.artifact_type,
-                parent_artifact_id=args.parent_artifact_id,
-                parent_artifact_version_id=args.parent_artifact_version_id,
+                parent_artifact_id=parent_artifact_id,
+                parent_artifact_version_id=parent_artifact_version_id,
             )
         except ArtifactBusy as exc:
             return ToolResult(status="failed", safe_summary=str(exc), error_type=exc.code)

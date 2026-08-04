@@ -895,6 +895,29 @@ async def test_kol_detail_rejects_client_profile_and_bad_ownership(
     assert foreign.status_code == 404
 
 
+async def test_kol_detail_invalid_selection_ref_returns_404(
+    agent_client_factory, db_session
+) -> None:
+    """selection 引用归属校验（§6.4）：不存在/跨 Session 的 selection_artifact_id
+    统一 404，不泄漏资源存在性。"""
+    alice, _ = await agent_client_factory(
+        "13600000085",
+        kol_detail_service=KolDetailRunService(db_session, engine=None),
+    )
+    session_id = await _create_session(alice)
+
+    resp = await alice.post(
+        f"/api/v1/agent/sessions/{session_id}/kol-details",
+        json={
+            "platform": "xiaohongshu",
+            "kol_uid": "k1",
+            "selection_artifact_id": str(uuid4()),
+            "selection_version": "1",
+        },
+    )
+    assert resp.status_code == 404
+
+
 async def test_kol_detail_coexists_with_active_session_analyst_run(
     agent_client_factory, db_session
 ) -> None:

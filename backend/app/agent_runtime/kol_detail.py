@@ -98,9 +98,27 @@ SCHEMA_VERSION = "kol_detail_v2"
 KOL_DETAIL_SNAPSHOT_KEY = "kol_detail"
 
 
-def kol_detail_trigger_content(platform: str, kol_uid: str) -> str:
-    """kol_detail Run 的触发消息文本：首次启动与崩溃恢复共用同一锚点（G3）。"""
-    return f"查看达人详情：platform={platform}, kol_uid={kol_uid}"
+def kol_detail_trigger_content(
+    platform: str,
+    kol_uid: str,
+    *,
+    selection_artifact_id: str | None = None,
+    selection_version: str | None = None,
+) -> str:
+    """kol_detail Run 的触发消息文本：首次启动与崩溃恢复共用同一锚点（G3）。
+
+    携带名单引用（§6.4，先经归属校验）时把名单上下文写进触发消息：模型
+    知道该达人来自本会话哪一份圈选名单的哪一版，可结合名单圈选条件与
+    评分解读详情。
+    """
+    content = f"查看达人详情：platform={platform}, kol_uid={kol_uid}"
+    if selection_artifact_id and selection_version:
+        content += (
+            f"；该达人来自本会话圈选名单（kol_selection_v3 Artifact "
+            f"{selection_artifact_id} 第 {selection_version} 版），"
+            "请结合该名单的圈选条件与评分上下文解读达人详情"
+        )
+    return content
 
 
 def build_kol_detail_prompt_snapshot(
@@ -109,12 +127,17 @@ def build_kol_detail_prompt_snapshot(
     kol_uid: str,
     selection_artifact_id: str | None,
     selection_version: str | None,
+    selection_version_id: str | None = None,
 ) -> dict[str, Any]:
     """持久化 kol_detail Run 的触发上下文（无 input_message_id 时的恢复锚点）。
 
     kol_detail Run 由点击触发、没有 ``input_message_id``；崩溃接管时
     ``RunTranscriptLoader`` 从该快照恢复 platform/kol_uid 触发上下文，绝不
     回退到会话最近一条普通用户消息（可能是完全无关的意图）。
+
+    ``selection_version_id`` 是经归属校验解析出的已发布名单 Version 行 id
+    （§6.4）：Draft 工具据此把 kol-detail Draft Revision 的
+    ``parent_artifact_version_id`` 权威绑定到该 Version（不信任模型传参）。
     """
     return {
         KOL_DETAIL_SNAPSHOT_KEY: {
@@ -122,6 +145,7 @@ def build_kol_detail_prompt_snapshot(
             "kol_uid": kol_uid,
             "selection_artifact_id": selection_artifact_id,
             "selection_version": selection_version,
+            "selection_version_id": selection_version_id,
         }
     }
 
@@ -138,6 +162,15 @@ _NON_ACTIVE_OWNER_STATUSES = frozenset(
 
 class KolDetailRunFailed(RuntimeError):
     """kol_detail_v1 Run 未成功产出 kol_detail_v2（未发布 / 状态异常 / 缺引擎）。"""
+
+
+class KolDetailSelectionRefNotFound(LookupError):
+    """selection 引用归属校验失败（§6.4）。
+
+    名单引用必须指向**当前 Session** 内已发布 Version 的 ``kol_selection_v3``
+    Artifact；任何校验失败（不存在 / 跨 Session / 类型不符 / Version 未发布 /
+    引用不完整）统一按归属失败处理——API 层映射 404，不泄漏资源存在性（§7）。
+    """
 
 
 @dataclass(frozen=True)
@@ -332,7 +365,16 @@ class KolDetailRunService:
         立即提交）。两个真实并发 create 最多一个赢得协调权进入引擎——MCP
         抓取与积分扣费至多一次；后到者幂等返回先到者的活动 Run（或其已
         回填的缓存/刚发布的 Version）。
+
+        selection 引用（§6.4）：无论命中缓存与否都先做归属校验——名单
+        Artifact 必须属于当前 Session 且为 ``kol_selection_v3``，
+        ``selection_version`` 必须指向其已发布 Version；失败抛
+        ``KolDetailSelectionRefNotFound``（API 层 404）。校验通过的引用
+        进入 prompt_snapshot、Artifact parent 与模型触发消息。
         """
+        selection_ref = await self._resolve_selection_ref(
+            session_id, selection_artifact_id, selection_version
+        )
         cached = await self.get_cached_detail(user_id, session_id, platform, kol_uid)
         hit = await self._try_cache_hit(cached)
         if hit is not None:
@@ -374,6 +416,7 @@ class KolDetailRunService:
                 kol_uid,
                 selection_artifact_id=selection_artifact_id,
                 selection_version=selection_version,
+                selection_version_id=selection_ref.id if selection_ref is not None else None,
             )
             if claim.lost_race:
                 continue
@@ -393,6 +436,49 @@ class KolDetailRunService:
     # ------------------------------------------------------------------ #
     # 内部
     # ------------------------------------------------------------------ #
+
+    async def _resolve_selection_ref(
+        self,
+        session_id: str,
+        selection_artifact_id: str | None,
+        selection_version: str | None,
+    ) -> AgentArtifactVersion | None:
+        """归属校验（§6.4）：把名单引用解析为当前 Session 内 kol_selection_v3
+        Artifact 的已发布 Version 行；未携带引用返回 None。
+
+        校验规则（任一失败抛 ``KolDetailSelectionRefNotFound``，API 层 404）：
+        - 两个字段必须成对出现（引用不完整即非法）；
+        - Artifact 必须属于当前 Session 且 ``artifact_type == kol_selection_v3``
+          （跨 Session / 不存在 / 类型不符同一路径，不泄漏存在性，§7）；
+        - ``selection_version`` 必须是该 Artifact 已发布 Version 的版本号
+          （Version 行只在发布时创建，存在即已发布）。
+        """
+        if selection_artifact_id is None and selection_version is None:
+            return None
+        if not selection_artifact_id or not selection_version:
+            raise KolDetailSelectionRefNotFound("kol_selection_not_found")
+        artifact = await self.db.scalar(
+            select(AgentArtifact).where(
+                AgentArtifact.id == selection_artifact_id,
+                AgentArtifact.session_id == session_id,
+                AgentArtifact.artifact_type == "kol_selection_v3",
+            )
+        )
+        if artifact is None:
+            raise KolDetailSelectionRefNotFound("kol_selection_not_found")
+        try:
+            version_no = int(selection_version)
+        except (TypeError, ValueError) as exc:
+            raise KolDetailSelectionRefNotFound("kol_selection_not_found") from exc
+        version = await self.db.scalar(
+            select(AgentArtifactVersion).where(
+                AgentArtifactVersion.artifact_id == artifact.id,
+                AgentArtifactVersion.version == version_no,
+            )
+        )
+        if version is None:
+            raise KolDetailSelectionRefNotFound("kol_selection_not_found")
+        return version
 
     def _summary_from_cache(self, cached: KolDetailCache) -> KolDetailRunSummary:
         """从缓存 payload 重建 kol_detail_v2：``data.cache.hit=true``，零模型/MCP 调用。"""
@@ -538,6 +624,7 @@ class KolDetailRunService:
         *,
         selection_artifact_id: str | None,
         selection_version: str | None,
+        selection_version_id: str | None = None,
     ) -> _ClaimResult:
         """协调事务（G3）：建立/认领 kol-detail 的 working head 并**立即提交**。
 
@@ -586,6 +673,13 @@ class KolDetailRunService:
                 await self.db.rollback()
                 return _ClaimResult(lost_race=True)
 
+        # §6.4：稳定行只记 parent_artifact_id（版本级绑定写 Draft Revision /
+        # Version 的 parent_artifact_version_id，由 Draft 工具按快照权威注入）。
+        # 已校验的名单引用指向当前 Session 的 kol_selection_v3 Artifact；刷新
+        # Run 携带新引用时同步更新稳定行指针。
+        if selection_artifact_id is not None:
+            artifact.parent_artifact_id = selection_artifact_id
+
         draft = await self.db.scalar(
             select(ArtifactDraft)
             .where(ArtifactDraft.artifact_id == artifact.id)
@@ -614,6 +708,7 @@ class KolDetailRunService:
                 kol_uid=kol_uid,
                 selection_artifact_id=selection_artifact_id,
                 selection_version=selection_version,
+                selection_version_id=selection_version_id,
             ),
             status="queued",
             decision_count=0,
@@ -671,7 +766,16 @@ class KolDetailRunService:
         if run is None:  # pragma: no cover - 协调事务刚提交必然可读
             raise KolDetailRunFailed("kol_detail run not readable after claim")
         now = self.now_fn()
-        trigger = kol_detail_trigger_content(platform, kol_uid)
+        # 名单上下文（§6.4）以协调事务持久化的快照为准：首次启动与崩溃恢复
+        # （transcript 从同一快照重建触发消息）看到一致的名单引用。
+        snapshot = run.prompt_snapshot_json or {}
+        trigger_ctx = snapshot.get(KOL_DETAIL_SNAPSHOT_KEY) or {}
+        trigger = kol_detail_trigger_content(
+            platform,
+            kol_uid,
+            selection_artifact_id=trigger_ctx.get("selection_artifact_id"),
+            selection_version=trigger_ctx.get("selection_version"),
+        )
         messages = [ChatMessage(role="user", content=trigger)]
         try:
             outcome = await engine.run(
@@ -782,6 +886,7 @@ __all__ = [
     "KolDetailRunFailed",
     "KolDetailRunService",
     "KolDetailRunSummary",
+    "KolDetailSelectionRefNotFound",
     "build_kol_detail_prompt_snapshot",
     "kol_detail_trigger_content",
 ]
