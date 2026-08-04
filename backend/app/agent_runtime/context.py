@@ -4,7 +4,7 @@
 每轮 assistant 动作 + 工具结果）交给 ``decide()``。本构建器在对话消息前
 拼一个由 Task 9 ``MemoryContextBuilder`` 组装的分层记忆头（当前用户消息、
 最近消息、Session Summary、历史 Run 摘要、Artifact 紧凑目录、可用工具与
-成本、钱包余额），构成模型可见的默认上下文。
+成本、钱包余额、去敏成功示例），构成模型可见的默认上下文。
 
 不注入完整 Evidence / 完整历史报告 payload；模型按需通过历史读取工具钻取。
 """

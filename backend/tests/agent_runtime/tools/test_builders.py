@@ -720,3 +720,139 @@ async def test_builder_tools_visible_to_analyst_and_kol_detail_profiles(db_sessi
         entry.internal_name for entry in await registry.visible_tools(kol_detail_profile)
     }
     assert BUILDER_TOOL_NAMES <= kol_detail_visible
+
+
+# ---------------------------------------------------------------------------
+# kol Detail Builder 的 parent 权威绑定（B3：与 CreateDraftTool 等价，§6.4）
+# ---------------------------------------------------------------------------
+
+
+async def test_build_kol_detail_draft_tool_parent_overridden_by_run_snapshot(
+    db_session, user_factory
+) -> None:
+    """Run 快照携带名单引用时，模型传错的 selection 参数被服务端权威纠正。"""
+    from app.agent_runtime.kol_detail import build_kol_detail_prompt_snapshot
+
+    user = await user_factory()
+    session = await _make_session(db_session, user.id)
+    run, step = await _make_run(db_session, session.id, user.id)
+    # 名单引用的 parent 有外键约束：经名单 Builder 落真实的 kol-selection
+    # Artifact + 已发布 Version 行（与 test_build_kol_analysis_draft_tool 同法）。
+    kol_evidence_id = await _write_evidence(
+        db_session,
+        session_id=session.id,
+        run_id=run.id,
+        step_id=step.id,
+        payload=_kol_items(),
+    )
+    selection_result = await BuildKolSelectionDraftTool(db_session).execute(
+        _ctx(user.id, session.id, run.id, step.id),
+        {"scope": KOL_SCOPE, "evidence_id": kol_evidence_id},
+    )
+    assert selection_result.status == "success", selection_result.safe_summary
+    selection_summary = json.loads(selection_result.safe_summary)
+    sel_revision = await db_session.get(
+        ArtifactDraftRevision, selection_summary["revision_id"]
+    )
+    sel_artifact = await db_session.get(AgentArtifact, selection_summary["artifact_id"])
+    assert sel_revision is not None and sel_artifact is not None
+    sel_version = AgentArtifactVersion(
+        id=str(uuid4()),
+        artifact_id=sel_artifact.id,
+        version=1,
+        source_run_id=run.id,
+        source_draft_revision_id=sel_revision.id,
+        schema_version=sel_revision.schema_version,
+        payload_json=sel_revision.payload_json,
+        evidence_refs_json=sel_revision.evidence_refs_json,
+        data_status=sel_revision.payload_json["data_status"],
+        created_at=_now(),
+    )
+    db_session.add(sel_version)
+    sel_artifact.latest_version = 1
+    sel_artifact.status = "published"
+    run.prompt_snapshot_json = build_kol_detail_prompt_snapshot(
+        platform="xiaohongshu",
+        kol_uid="1",
+        selection_artifact_id=sel_artifact.id,
+        selection_version="1",
+        selection_version_id=sel_version.id,
+    )
+    await db_session.flush()
+    evidence_id = await _write_evidence(
+        db_session,
+        session_id=session.id,
+        run_id=run.id,
+        step_id=step.id,
+        payload=_kol_detail_payload(),
+    )
+
+    tool = BuildKolDetailDraftTool(db_session)
+    result = await tool.execute(
+        _ctx(user.id, session.id, run.id, step.id),
+        {
+            "platform": "xiaohongshu",
+            "kol_uid": "1",
+            "evidence_id": evidence_id,
+            "cache_state": {
+                "hit": False,
+                "fetched_at": "2026-08-01T00:00:00",
+                "expires_at": "2026-08-02T00:00:00",
+            },
+            # 模型传错的名单引用：parent 绑定必须以 Run 快照为准。
+            "selection_artifact_id": "evil-artifact",
+            "selection_version": "99",
+        },
+    )
+    assert result.status == "success", result.safe_summary
+    summary = json.loads(result.safe_summary)
+
+    # 稳定行 parent 与 Revision 版本绑定都来自快照，而非模型传参。
+    artifact = await db_session.get(AgentArtifact, summary["artifact_id"])
+    assert artifact is not None
+    assert artifact.parent_artifact_id == sel_artifact.id
+    revision = await db_session.get(ArtifactDraftRevision, summary["revision_id"])
+    assert revision is not None
+    assert revision.parent_artifact_version_id == sel_version.id
+
+
+async def test_build_kol_detail_draft_tool_without_snapshot_has_no_parent(
+    db_session, user_factory
+) -> None:
+    """无名单引用的 Run：模型自报的 selection 参数不产生 parent 绑定。"""
+    user = await user_factory()
+    session = await _make_session(db_session, user.id)
+    run, step = await _make_run(db_session, session.id, user.id)
+    evidence_id = await _write_evidence(
+        db_session,
+        session_id=session.id,
+        run_id=run.id,
+        step_id=step.id,
+        payload=_kol_detail_payload(),
+    )
+
+    tool = BuildKolDetailDraftTool(db_session)
+    result = await tool.execute(
+        _ctx(user.id, session.id, run.id, step.id),
+        {
+            "platform": "xiaohongshu",
+            "kol_uid": "1",
+            "evidence_id": evidence_id,
+            "cache_state": {
+                "hit": False,
+                "fetched_at": "2026-08-01T00:00:00",
+                "expires_at": "2026-08-02T00:00:00",
+            },
+            "selection_artifact_id": "self-reported-artifact",
+            "selection_version": "1",
+        },
+    )
+    assert result.status == "success", result.safe_summary
+    summary = json.loads(result.safe_summary)
+    artifact = await db_session.get(AgentArtifact, summary["artifact_id"])
+    assert artifact is not None
+    # parent 绑定只能来自经归属校验的 Run 快照；模型自报参数不参与绑定。
+    assert artifact.parent_artifact_id is None
+    revision = await db_session.get(ArtifactDraftRevision, summary["revision_id"])
+    assert revision is not None
+    assert revision.parent_artifact_version_id is None

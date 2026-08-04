@@ -2,7 +2,7 @@
 
 Session Agent 每轮默认获得：当前用户消息、最近有限条消息、Session Summary、
 历史 Run 摘要、紧凑 Artifact 目录（类型/版本/范围/父子关系/数据状态）、
-可用工具与成本、钱包余额。
+可用工具与成本、钱包余额，以及 1-2 个去敏成功示例（§6.2 exemplars）。
 
 **默认上下文绝不注入完整 Evidence 或完整历史报告 payload**；模型按需调用
 历史读取工具（read_artifact / search_evidence / read_tool_result）钻取。
@@ -11,6 +11,7 @@ Session Agent 每轮默认获得：当前用户消息、最近有限条消息、
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable
 from typing import Any
 
@@ -22,11 +23,16 @@ from app.agent_runtime.models import AgentMessage, AgentSession, MemoryEntry
 from app.agent_runtime.profiles import AgentProfile
 from app.agent_runtime.tools.registry import ToolRegistry
 from app.billing.service import WalletService
+from app.model.exemplars import find_success_exemplars
+
+logger = logging.getLogger(__name__)
 
 # 默认最近消息窗口大小（§九「最近有限条消息」）。
 DEFAULT_RECENT_MESSAGE_WINDOW = 8
 # 默认历史 Run 摘要上限：与最近消息窗口一致，防止长 Session 摘要无限增长。
 DEFAULT_RUN_SUMMARY_LIMIT = 20
+# 成功示例注入上限（§6.2「1 至 2 个去敏成功示例」）。
+DEFAULT_EXEMPLAR_LIMIT = 2
 
 
 class MemorySessionNotFound(LookupError):
@@ -91,7 +97,23 @@ class MemoryContextBuilder:
                 for entry in tools
             ],
             "wallet": await self._wallet_balance(user_id),
+            # §6.2：1-2 个去敏成功示例（模型动作协议调用的 purpose 统一是
+            # agent_loop）；best-effort，检索失败降级为空列表不阻塞主流程。
+            "exemplars": await self._success_exemplars(user_id),
         }
+
+    async def _success_exemplars(self, user_id: str) -> list[dict[str, Any]]:
+        """检索当前用户同类场景的去敏成功示例；异常只记 warning。"""
+        try:
+            return await find_success_exemplars(
+                self._db,
+                purpose="agent_loop",
+                user_id=user_id,
+                limit=DEFAULT_EXEMPLAR_LIMIT,
+            )
+        except Exception:
+            logger.warning("failed to load success exemplars", exc_info=True)
+            return []
 
     async def _recent_messages(self, session_id: str, window: int) -> list[dict[str, Any]]:
         rows = (
@@ -195,6 +217,7 @@ class MemoryContextBuilder:
 
 
 __all__ = [
+    "DEFAULT_EXEMPLAR_LIMIT",
     "DEFAULT_RECENT_MESSAGE_WINDOW",
     "DEFAULT_RUN_SUMMARY_LIMIT",
     "MemoryContextBuilder",

@@ -17,6 +17,7 @@ Evidence 不足 / ID 无效 / 归属失败 / payload 不过审都是结构化错
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -40,6 +41,7 @@ from app.agent_artifacts.models import AgentArtifact, AgentArtifactVersion
 from app.agent_artifacts.service import ArtifactBusy, ArtifactService
 from app.agent_artifacts.validation import ArtifactPayloadInvalid
 from app.agent_runtime.models import AgentSession, EvidenceItem
+from app.agent_runtime.tools.artifacts import kol_detail_snapshot_selection_parent
 from app.agent_runtime.tools.contracts import ToolContext, ToolResult
 
 NOT_FOUND = "not_found"
@@ -438,7 +440,13 @@ class BuildKolDetailDraftArgs(BaseModel):
 
 
 class BuildKolDetailDraftTool(_BuilderToolBase):
-    """把已抓取的达人详情 Evidence 转换为 kol_detail_v2 Draft。"""
+    """把已抓取的达人详情 Evidence 转换为 kol_detail_v2 Draft。
+
+    parent 权威绑定（§6.4，B3 与 ``CreateDraftTool`` 补齐一致）：Run 快照
+    携带经归属校验的名单引用（``selection_version_id``）时，以快照为准
+    覆盖 Draft 的 ``parent_artifact_id`` / ``parent_artifact_version_id``，
+    不信任模型传参；模型传入的 selection 参数只进入 payload scope。
+    """
 
     description = (
         "把达人详情 Evidence（identity/metrics/audience/trend/latest_posts 结构）"
@@ -481,6 +489,15 @@ class BuildKolDetailDraftTool(_BuilderToolBase):
             )
         except DraftBuildError as exc:
             return _failed(DRAFT_BUILD_ERROR, str(exc))
+        # §6.4 parent 权威绑定：Run 快照携带名单引用时覆盖 parent（不信任
+        # 模型传参），与 CreateDraftTool 的 kol-detail 路径同一语义。
+        snapshot_parent = await kol_detail_snapshot_selection_parent(self._db, context.run_id)
+        if snapshot_parent[1] is not None:
+            result = replace(
+                result,
+                parent_artifact_id=snapshot_parent[0],
+                parent_artifact_version_id=snapshot_parent[1],
+            )
         return await self._persist(context, result)
 
 

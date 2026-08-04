@@ -35,6 +35,32 @@ class CreateDraftArgs(BaseModel):
     parent_artifact_version_id: str | None = None
 
 
+async def kol_detail_snapshot_selection_parent(
+    db: AsyncSession, run_id: str
+) -> tuple[str | None, str | None]:
+    """kol-detail Draft 的 parent 权威绑定（§6.4）。
+
+    名单引用在 ``KolDetailRunService`` 归属校验后持久化到 Run 的
+    ``prompt_snapshot_json``（含已发布名单 Version 行 id）。创建
+    kol-detail Draft 时以快照为准覆盖模型传参——稳定行只记
+    ``parent_artifact_id``，版本绑定写 Revision/Version 的
+    ``parent_artifact_version_id``（沿用 ArtifactService 既有模式）。
+    无名单引用时返回 ``(None, None)``，调用方保持模型原参数。
+
+    ``CreateDraftTool`` 与 ``BuildKolDetailDraftTool``（B3 补齐）共用本函数，
+    两条 Draft 路径的 parent 绑定语义一致。
+    """
+    run = await db.get(AgentRun, run_id)
+    snapshot = run.prompt_snapshot_json if run is not None else None
+    trigger = snapshot.get(KOL_DETAIL_SNAPSHOT_KEY) if isinstance(snapshot, dict) else None
+    if not isinstance(trigger, dict):
+        return None, None
+    version_id = trigger.get("selection_version_id")
+    if not version_id:
+        return None, None
+    return trigger.get("selection_artifact_id"), str(version_id)
+
+
 _ARTIFACT_FIELD_HINTS: dict[str, dict[str, str]] = {
     "brand": {"brand": "品牌名"},
     "campaign": {"brand": "品牌名", "campaign": "活动名"},
@@ -83,26 +109,8 @@ class CreateDraftTool:
     async def _kol_detail_selection_parent(
         self, context: ToolContext
     ) -> tuple[str | None, str | None]:
-        """kol-detail Draft 的 parent 权威绑定（§6.4）。
-
-        名单引用在 ``KolDetailRunService`` 归属校验后持久化到 Run 的
-        ``prompt_snapshot_json``（含已发布名单 Version 行 id）。创建
-        kol-detail Draft 时以快照为准覆盖模型传参——稳定行只记
-        ``parent_artifact_id``，版本绑定写 Revision/Version 的
-        ``parent_artifact_version_id``（沿用 ArtifactService 既有模式）。
-        无名单引用时返回 ``(None, None)``，调用方保持模型原参数。
-        """
-        run = await self._db.get(AgentRun, context.run_id)
-        snapshot = run.prompt_snapshot_json if run is not None else None
-        trigger = (
-            snapshot.get(KOL_DETAIL_SNAPSHOT_KEY) if isinstance(snapshot, dict) else None
-        )
-        if not isinstance(trigger, dict):
-            return None, None
-        version_id = trigger.get("selection_version_id")
-        if not version_id:
-            return None, None
-        return trigger.get("selection_artifact_id"), str(version_id)
+        """委托模块级共享函数（与 BuildKolDetailDraftTool 同一语义）。"""
+        return await kol_detail_snapshot_selection_parent(self._db, context.run_id)
 
     async def execute(self, context: ToolContext, arguments: BaseModel) -> ToolResult:
         args = CreateDraftArgs.model_validate(arguments)
@@ -213,4 +221,5 @@ __all__ = [
     "CreateDraftTool",
     "UpdateDraftArgs",
     "UpdateDraftTool",
+    "kol_detail_snapshot_selection_parent",
 ]

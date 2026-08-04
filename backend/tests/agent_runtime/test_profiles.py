@@ -179,5 +179,7 @@ def test_all_profiles_have_versioned_prompts() -> None:
     for key, profile in PROFILES.items():
         prompt = get_system_prompt(profile.system_prompt_key)
         assert prompt.name == key
-        assert prompt.version == profile.version
+        # prompt 版本随内容修订独立递增（B3 起与 Profile 能力版本解耦：
+        # Profile 不变、prompt 内容成熟时只递增 prompt.version）。
+        assert prompt.version
         assert prompt.text.strip()

@@ -215,7 +215,11 @@ async def test_default_context_contains_only_bounded_sections(db_session, user_f
         "artifact_directory",
         "available_tools",
         "wallet",
+        # §6.2：1-2 个去敏成功示例（无历史成功记录时为空列表）。
+        "exemplars",
     }
+    # 测试用户无历史成功调用记录：示例为空但键必须存在。
+    assert context["exemplars"] == []
     assert context["current_user_message"] == "继续分析"
     assert context["session_summary"] == "用户关注美妆品牌声量，已产出品牌声量分析。"
     assert len(context["run_summaries"]) == 1
@@ -442,3 +446,158 @@ async def test_artifact_directory_does_not_load_payload_columns(db_session, user
     for sql in version_selects:
         assert "payload_json" not in sql
         assert "evidence_refs_json" not in sql
+
+
+# ---------------------------------------------------------------------------
+# 工具输入 Schema 注入（§6.2：模型必须看到完整 input_schema 才能构造合法参数）
+# ---------------------------------------------------------------------------
+
+
+async def test_context_injects_builder_tool_input_schemas(db_session, user_factory) -> None:
+    """生产装配的 Builder 工具在上下文中带完整 input_schema / 成本 / 输入契约描述。"""
+    from app.agent_runtime.tools.factory import AgentToolRegistryFactory
+
+    user = await user_factory()
+    session = await _seed_session(db_session, user.id)
+    registry = AgentToolRegistryFactory().build(db_session)
+    builder = MemoryContextBuilder(db_session, registry)
+
+    context = await builder.build(
+        user_id=user.id,
+        session_id=session.id,
+        profile=session_analyst,
+        current_user_message="继续分析",
+    )
+    tools = {t["internal_name"]: t for t in context["available_tools"]}
+
+    brand = tools["build_brand_report_draft"]
+    # 输入 Schema 可见：scope / evidence 分组 / narrative 都在 properties 里。
+    properties = brand["input_schema"]["properties"]
+    assert {"scope", "evidence", "narrative"} <= set(properties)
+    assert brand["points_cost"] == 0
+    # 工具描述写清 Evidence ID 分组与叙事字段（模型据此组装 Builder 入参）。
+    assert "overview_current" in brand["description"]
+    assert "executive_summary" in brand["description"]
+
+    selection = tools["build_kol_selection_draft"]
+    assert "evidence_id" in selection["input_schema"]["properties"]
+    assert "kol_score_v2" in selection["description"]
+
+    detail = tools["build_kol_detail_draft"]
+    detail_properties = detail["input_schema"]["properties"]
+    assert {"platform", "kol_uid", "evidence_id", "cache_state"} <= set(detail_properties)
+    # 缺链接披露契约写进描述。
+    assert "不伪造" in detail["description"]
+
+
+# ---------------------------------------------------------------------------
+# 成功示例注入（§6.2：1-2 个去敏成功示例；失败 best-effort 不阻塞）
+# ---------------------------------------------------------------------------
+
+
+async def _seed_prompt_log(
+    db_session,
+    *,
+    user_id: str,
+    status: str = "success",
+    response: dict | None = None,
+) -> None:
+    import json as _json
+
+    from app.model.models import ModelPromptLog
+
+    db_session.add(
+        ModelPromptLog(
+            id=str(uuid4()),
+            user_id=user_id,
+            session_id=None,
+            task_id=None,
+            purpose="agent_loop",
+            tags=[],
+            model="test-model",
+            messages=_json.dumps(
+                [{"role": "user", "content": "{\"current_user_message\": \"圈选达人\"}"}],
+                ensure_ascii=False,
+            ),
+            response=_json.dumps(
+                response
+                or {
+                    "action": "call_tool",
+                    "internal_tool_name": "kol_detail",
+                    "arguments": {
+                        "platform": "xiaohongshu",
+                        "api_key": "SECRET-TOKEN-123",
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            status=status,
+            created_at=_now(),
+        )
+    )
+    await db_session.flush()
+
+
+async def test_context_injects_pruned_success_exemplars(db_session, user_factory) -> None:
+    """同类成功记录进入 exemplars：剔除 key/token 字段，保留工具名与参数写法。"""
+    user = await user_factory()
+    session = await _seed_session(db_session, user.id)
+    await _seed_prompt_log(db_session, user_id=user.id)
+    builder = MemoryContextBuilder(db_session, _registry(db_session))
+
+    context = await builder.build(
+        user_id=user.id,
+        session_id=session.id,
+        profile=session_analyst,
+        current_user_message="继续分析",
+    )
+    exemplars = context["exemplars"]
+    assert len(exemplars) == 1
+    excerpt = exemplars[0]["excerpt"]
+    assert "kol_detail" in excerpt
+    # 去敏：含 key 特征的字段与其值绝不进入上下文。
+    assert "SECRET-TOKEN-123" not in excerpt
+    assert "api_key" not in excerpt
+
+
+async def test_context_exemplars_isolated_by_user_and_status(db_session, user_factory) -> None:
+    """他人日志与失败日志不注入当前用户上下文。"""
+    user = await user_factory()
+    other = await user_factory()
+    session = await _seed_session(db_session, user.id)
+    await _seed_prompt_log(db_session, user_id=other.id)
+    await _seed_prompt_log(db_session, user_id=user.id, status="failed")
+    builder = MemoryContextBuilder(db_session, _registry(db_session))
+
+    context = await builder.build(
+        user_id=user.id,
+        session_id=session.id,
+        profile=session_analyst,
+        current_user_message="继续分析",
+    )
+    assert context["exemplars"] == []
+
+
+async def test_context_exemplar_lookup_failure_is_best_effort(
+    db_session, user_factory, monkeypatch
+) -> None:
+    """示例检索异常只记 warning 并降级为空列表，绝不阻塞上下文组装。"""
+
+    async def _boom(*args, **kwargs):
+        raise RuntimeError("prompt log store down")
+
+    monkeypatch.setattr(
+        "app.agent_runtime.memory.find_success_exemplars", _boom
+    )
+    user = await user_factory()
+    session = await _seed_session(db_session, user.id)
+    builder = MemoryContextBuilder(db_session, _registry(db_session))
+
+    context = await builder.build(
+        user_id=user.id,
+        session_id=session.id,
+        profile=session_analyst,
+        current_user_message="继续分析",
+    )
+    assert context["exemplars"] == []
+    assert context["available_tools"]
