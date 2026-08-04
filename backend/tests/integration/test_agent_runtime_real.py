@@ -886,14 +886,29 @@ _KOL_ANSWERS = (
 async def test_uat_kol_selection_and_analysis_real() -> None:
     record = await _run_scenario(
         scenario="kol_selection",
-        prompt="请为瑞幸咖啡圈选Top20达人，并分析其中前5位达人的核心价值。",
+        prompt="请为瑞幸咖啡圈选Top20达人。",
     )
     record = await _answer_clarifications(
         record, scenario="kol_selection", answers=_KOL_ANSWERS
     )
     await _assert_ledger(record)
     _require_published(record, "kol_selection_v3")
-    _require_published(record, "kol_analysis_v2")
+
+    # kol_analysis_v2 必须绑定已发布的名单 Version（设计 §9），而一个 Run 只能提交
+    # 一个 review batch（§六）——分析只能由同会话的下一条用户消息驱动（生产语义）。
+    analysis_record = await _run_scenario(
+        scenario="kol_analysis",
+        prompt="请基于刚才发布的圈选名单，分析其中前5位达人的核心价值。",
+        user_id=record.user_id,
+        agent_session_id=record.session_id,
+    )
+    analysis_record = await _answer_clarifications(
+        analysis_record,
+        scenario="kol_analysis",
+        answers=("直接基于最新发布的名单分析前5位达人，无需再澄清。",),
+    )
+    await _assert_ledger(analysis_record)
+    _require_published(analysis_record, "kol_analysis_v2")
 
 
 # --------------------------------------------------------------------------- #
