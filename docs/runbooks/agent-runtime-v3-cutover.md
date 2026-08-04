@@ -16,7 +16,7 @@
 | 检查项 | 状态 |
 |---|---|
 | 代码与测试（迁移 0027 + 运行时 + 前端 + E2E） | ✅ 已完成，全量验证矩阵通过（见 §4） |
-| 真实模型 + 真实 DataTap UAT（Task 26） | ⚠️ 已执行，运行时机制部分验证；**存在 2 个阻断项**（见 §1） |
+| 真实模型 + 真实 DataTap UAT（Task 26） | ⚠️ 已执行，运行时机制部分验证；阻断项 1 已修复待复核，**仍存 1 个阻断项**（见 §1） |
 | 生产切档 | ⛔ **禁止**——阻断项未解决前不得执行 §3 步骤 |
 
 ---
@@ -26,14 +26,31 @@
 来源：`docs/qa/2026-08-02-agent-runtime-uat.md`「未决问题 / 切换阻断项」。
 任一未解决，**不得执行切档**。
 
-### 阻断项 1：真实 DataTap 传输层无可靠超时/取消（Incident #8）—— 必须解决后才能切档
+### 阻断项 1：真实 DataTap 传输层无可靠超时/取消（Incident #8）—— ✅ 已修复（运行时墙钟收口），待真实 UAT 复核
 
 - **现象**：真实品牌/活动/圈选场景中，DataTap 某些统计查询长时间持续返回数据，`transport.call_tool`
   挂起数十分钟；`asyncio.wait_for` 无法打断 httpx C 层阻塞（`PossiblySentTimeout` 分类正确但取消不生效）。
   一个慢查询即可让整个 Run 挂死，是真实 UAT 场景 2/3/4 无法跑完的直接原因。
 - **判定标准**：同一服务同一工具的长查询必须在受控超时窗口内以 `result_unknown` 分类收口、
   保持预留并让 Run 继续其他工具；已发出但未知的请求经恢复核对，绝不重复扣费或重复请求。
-- **修复方向**：进程级 watchdog，或对长查询工具设置独立可取消超时。**未修复**。
+- **修复（2026-08-04，B8）**：`DataTapTransport` 新增外发阶段墙钟上限 `call_timeout_seconds`，
+  Agent 传输（`get_agent_mcp_transport`）经配置项 **`AGENT_MCP_CALL_TIMEOUT_SECONDS`**（默认 150s；
+  须小于 `AGENT_TOOL_CALL_STUCK_SECONDS`）启用，legacy 传输缺省不启用、行为不变。
+  - 机制：拿到 per-service 队列许可后开始计时（队列等待不耗预算）；超时即取消底层任务，
+    宽限 `cancel_grace_seconds`（默认 5s）内等待其真正退出——不用 `asyncio.wait_for`
+    （它超时后会无限期等待被取消任务退出，底层不可取消时依旧挂死）；宽限过后仍不死则
+    **隔离悬挂任务**（保留引用防 GC、完成时吞噬异常并记录 warning），运行时侧按时收口。
+  - 收口语义：超时抛 `PossiblySentTimeout`（可能已发送），`AgentMcpTool` 按既有分类落
+    `result_unknown`——保留 10 积分预留、写 `agent_tool_calls.status="unknown"`、
+    计细粒度熔断失败（同参数反复超时会被熔断）、Run 继续后续工具；恢复循环 stuck 扫描与
+    unknown 只读核对对该类行照常生效，核对确认后 settle/release 幂等、绝不重复扣费或重放。
+  - 调查结论：挂起发生在 MCP SDK `streamable_http_client` + `ClientSession.call_tool`
+    的流式等待层；httpx `read_timeout` 是"无活动"超时，trickle 数据持续到达时被不断
+    重置，故 60s 读超时永不触发。
+  - 测试：`tests/mcp_gateway/test_call_timeout.py`（挂起 trickle/吞取消顽固层/快调用/
+    队列等待不计预算/分类保持/缺省不启用）、`tests/agent_runtime/tools/test_mcp.py` §8
+    （真实传输挂起 → unknown 收口、熔断计数、核对只读不重放 + 结算/释放幂等）。
+    **仍待真实 UAT 复跑（`scripts/run_real_agent_uat.sh`）复核场景 2/3/4。**
 
 ### 阻断项 2：真实模型无法在 Attempt 预算内可靠产出 lineage 有效正式 Artifact —— 必须解决后才能切档
 

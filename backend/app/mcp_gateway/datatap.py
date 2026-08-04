@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import time
 from collections.abc import Callable, Mapping
 from contextlib import AbstractAsyncContextManager
@@ -32,6 +33,8 @@ from app.mcp_gateway.transport import (
     RemoteToolResult,
     ServiceNotAllowedError,
 )
+
+logger = logging.getLogger(__name__)
 
 
 _DATATAP_ORIGIN = "https://datatap.deepminer.com.cn"
@@ -88,6 +91,16 @@ class DataTapTransport:
         #   §5.3/§11.1 禁止自动重放；明确的连接前失败交由模型决定是否重新尝试。
         # "transient_once"：legacy 策略，瞬时上游错误自动重试一次。
         retry_policy: Literal["transient_once", "never"] = "never",
+        # 外发阶段墙钟上限（秒，不含 per-service 队列等待）：None（默认）不启用，
+        #   legacy 行为不变；Agent 传输经 AGENT_MCP_CALL_TIMEOUT_SECONDS 注入。
+        #   DataTap 统计查询可能持续 trickle 返回数据，httpx read_timeout 是
+        #   "无活动"超时会被不断重置（UAT Incident #8：一次慢查询挂死整个 Run）。
+        #   超时按 PossiblySentTimeout（可能已发送）收口，由上层分类为
+        #   result_unknown（保留预留、进恢复核对），Run 继续后续工具。
+        call_timeout_seconds: float | None = None,
+        # 取消宽限：墙钟超时后取消底层任务并等待其退出的上限；仍不死则隔离
+        #   悬挂任务（保留引用防 GC、完成时吞噬异常），运行时侧按时收口。
+        cancel_grace_seconds: float = 5.0,
     ) -> None:
         secret = token.get_secret_value()
         if not secret.strip():
@@ -102,6 +115,10 @@ class DataTapTransport:
             raise ValueError("circuit_scope must be 'service' or 'none'")
         if retry_policy not in ("transient_once", "never"):
             raise ValueError("retry_policy must be 'transient_once' or 'never'")
+        if call_timeout_seconds is not None and call_timeout_seconds <= 0:
+            raise ValueError("call_timeout_seconds must be positive")
+        if cancel_grace_seconds <= 0:
+            raise ValueError("cancel_grace_seconds must be positive")
         self.circuit_scope = circuit_scope
         self.retry_policy = retry_policy
 
@@ -113,6 +130,10 @@ class DataTapTransport:
         self._circuit_reset_seconds = circuit_reset_seconds
         self._queue_timeout_seconds = queue_timeout_seconds
         self._read_timeout_seconds = read_timeout_seconds
+        self._call_timeout_seconds = call_timeout_seconds
+        self._cancel_grace_seconds = cancel_grace_seconds
+        # 墙钟超时后取消仍不死的悬挂任务：保留引用防 GC，完成时吞噬异常。
+        self._abandoned: set[asyncio.Task[Any]] = set()
         self._clock = clock
         self._session_opener = session_opener
         self._session_factory = session_factory
@@ -303,7 +324,7 @@ class DataTapTransport:
         try:
             epoch = await self._enter_circuit(state)
             try:
-                result = await operation()
+                result = await self._dispatch_with_wall_clock(operation)
             except Exception as exc:
                 await self._record_failure(state, epoch)
                 if isinstance(exc, PossiblySentTimeout):
@@ -323,6 +344,59 @@ class DataTapTransport:
             return result
         finally:
             state.semaphore.release()
+
+    async def _dispatch_with_wall_clock(self, operation: Callable[[], Any]):
+        """外发阶段墙钟上限（``call_timeout_seconds``，仅 Agent 传输启用）。
+
+        超时即按 :class:`PossiblySentTimeout`（可能已发送）收口——取消底层
+        任务并在 ``cancel_grace_seconds`` 宽限内等待其真正退出；仍不死
+        （某层吞掉取消）则隔离悬挂任务，运行时侧按时收口，绝不挂死调用方。
+        外层被取消（引擎停机/租约让渡）时同样取消并隔离内层任务，避免
+        悬挂请求在后台静默完成后无人收口。
+
+        不使用 ``asyncio.wait_for``：它在超时后会无限期等待被取消任务退出，
+        底层不可取消时依旧挂死（UAT Incident #8 的教训）。
+        """
+        if self._call_timeout_seconds is None:
+            return await operation()
+        task = asyncio.ensure_future(operation())
+        try:
+            done, _pending = await asyncio.wait({task}, timeout=self._call_timeout_seconds)
+            if done:
+                return task.result()  # 异常原样上抛，保持既有故障分类
+            task.cancel()
+            done, _pending = await asyncio.wait({task}, timeout=self._cancel_grace_seconds)
+            if not done:
+                logger.warning(
+                    "MCP dispatch survived cancellation after wall-clock timeout; "
+                    "abandoning hung task (outcome unconfirmed)"
+                )
+            raise PossiblySentTimeout("MCP call exceeded wall-clock timeout")
+        finally:
+            if not task.done():
+                task.cancel()
+                self._track_abandoned(task)
+
+    def _track_abandoned(self, task: asyncio.Task[Any]) -> None:
+        """隔离悬挂任务：保留引用防 GC，完成时吞噬异常并记录，绝不影响后续调用。"""
+        if task in self._abandoned:
+            return
+        self._abandoned.add(task)
+
+        def _consume(finished: asyncio.Task[Any]) -> None:
+            self._abandoned.discard(finished)
+            if finished.cancelled():
+                return
+            exc = finished.exception()
+            if exc is not None:
+                logger.warning("abandoned MCP dispatch finished with error: %r", exc)
+            else:
+                logger.warning(
+                    "abandoned MCP dispatch finished after the caller was cut off; "
+                    "result discarded (reservation stays with recovery reconcile)"
+                )
+
+        task.add_done_callback(_consume)
 
     async def _enter_circuit(self, state: _ServiceState) -> int:
         if self.circuit_scope == "none":

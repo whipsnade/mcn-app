@@ -94,3 +94,13 @@ def test_app_state_wires_agent_tool_reconciler() -> None:
     assert reconciler is not None
     # 接线到 Agent 传输的只读核对方法（与 Agent 调用共享 _recent_results 缓存）
     assert reconciler == get_agent_mcp_transport().reconcile_tool_call
+
+
+def test_agent_transport_enables_wall_clock_timeout() -> None:
+    """cutover 阻断项 1：Agent 传输启用外发墙钟上限；legacy 传输保持缺省（不启用）。"""
+    from app.core.config import get_settings
+    from app.mcp_gateway.service import get_mcp_transport
+
+    agent = get_agent_mcp_transport()
+    assert agent._call_timeout_seconds == get_settings().agent_mcp_call_timeout_seconds
+    assert get_mcp_transport()._call_timeout_seconds is None

@@ -42,6 +42,11 @@ class Settings(BaseSettings):
     datatap_mcp_token: SecretStr
     # DataTap 查询级读取超时：统计类查询通常一分钟内返回，超时按失败释放积分。
     datatap_read_timeout_seconds: float = Field(default=60.0, gt=0)
+    # Agent 路径单次 MCP 调用外发墙钟上限（不含队列等待）：DataTap 统计查询可能
+    # 持续 trickle 返回数据，httpx 读取超时（无活动超时）被不断重置而永不触发
+    # （UAT Incident #8）。超过该上限按 result_unknown 收口：保留预留、进恢复
+    # 核对、Run 继续后续工具。须小于 agent_tool_call_stuck_seconds。
+    agent_mcp_call_timeout_seconds: float = Field(default=150.0, gt=0)
     mcp_call_points: int = 10
     mcp_unknown_reconcile_seconds: int = Field(default=300, gt=0)
     # Agent 工具调用 stuck 阈值：超过该时长仍处于 running/reserved 的调用由恢复

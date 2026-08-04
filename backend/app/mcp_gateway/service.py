@@ -69,7 +69,11 @@ def get_agent_mcp_transport() -> DataTapTransport:
       ``agent_runtime.circuit_breaker`` 的 service+tool+args-hash 细粒度熔断
       单独负责，禁止两层叠加；
     - ``retry_policy="never"``：504、5xx、协议中断与 PossiblySentTimeout 都属
-      "可能已发送"，禁止自动重放，由上层故障分类收口。
+      "可能已发送"，禁止自动重放，由上层故障分类收口；
+    - ``call_timeout_seconds``：外发墙钟上限（cutover 阻断项 1 / UAT
+      Incident #8）——持续 trickle 的长查询不再依赖会被重置的 httpx
+      read_timeout，超时按 PossiblySentTimeout 收口为 result_unknown，
+      保留预留并让 Run 继续后续工具。
     """
     settings = get_settings()
     return DataTapTransport(
@@ -77,6 +81,7 @@ def get_agent_mcp_transport() -> DataTapTransport:
         read_timeout_seconds=settings.datatap_read_timeout_seconds,
         circuit_scope="none",
         retry_policy="never",
+        call_timeout_seconds=settings.agent_mcp_call_timeout_seconds,
     )
 
 

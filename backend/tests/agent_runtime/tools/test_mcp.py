@@ -23,14 +23,16 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import time
 from collections.abc import Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Mapping
 from uuid import uuid4
 
 import pytest
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, SecretStr
 from sqlalchemy import select
 
 from app.agent_runtime.circuit_breaker import FineGrainedCircuitBreaker
@@ -57,6 +59,7 @@ from app.billing.service import WalletService
 from app.db.session import SessionFactory
 from app.identity.models import User
 from app.mcp_gateway.contracts import DataTapService
+from app.mcp_gateway.datatap import DataTapTransport
 from app.mcp_gateway.transport import (
     McpConnectionTimeout,
     McpGatewayTimeout,
@@ -958,5 +961,191 @@ async def test_insufficient_balance_leaves_no_dangling_row_and_retry_proceeds() 
         assert len(transport.calls) == 1
         row = await _only_row(chain.run_id)
         assert row.status == "settled"
+    finally:
+        await _teardown_chain(chain)
+
+
+# ---------------------------------------------------------------------------
+# 8. 墙钟超时：真实传输挂起 → result_unknown 收口（cutover 阻断项 1 / UAT Incident #8）
+# ---------------------------------------------------------------------------
+
+
+class _HangingProtocolSession:
+    """持续 trickle 的 DataTap 统计查询：永不返回结果，直到任务被取消。"""
+
+    call_count = 0
+
+    def __init__(self, read_stream, write_stream, **_kwargs) -> None:
+        self.service = read_stream
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args) -> None:
+        return None
+
+    async def initialize(self) -> None:
+        return None
+
+    async def call_tool(self, _name, _arguments):
+        type(self).call_count += 1
+        await asyncio.Event().wait()  # read timeout 被 trickle 不断重置，永不触发
+        raise AssertionError("unreachable")
+
+
+def _hanging_datatap_transport() -> DataTapTransport:
+    """与生产 Agent 传输同策略（circuit_scope=none / 不重试）+ 小墙钟的真实传输。"""
+
+    @asynccontextmanager
+    async def opener(url: str, **_kwargs):
+        service = next(item for item in DataTapService if item.value in url)
+        yield service, object(), lambda: "session-1"
+
+    return DataTapTransport(
+        token=SecretStr("unit-test-token"),
+        session_opener=opener,
+        session_factory=_HangingProtocolSession,
+        circuit_scope="none",
+        retry_policy="never",
+        call_timeout_seconds=0.3,
+        cancel_grace_seconds=0.3,
+    )
+
+
+@pytest.mark.asyncio
+async def test_wall_clock_timeout_closes_result_unknown_and_keeps_reservation() -> None:
+    """挂起调用在墙钟上限内按 result_unknown 收口：保留预留、Run 不被挂死。"""
+    chain = await _setup_chain()
+    try:
+        _HangingProtocolSession.call_count = 0
+        transport = _hanging_datatap_transport()
+        bridge = _bridge(transport)
+
+        started = time.monotonic()
+        result = await bridge.execute(_context(chain), {"keyword": "美妆"})
+        elapsed = time.monotonic() - started
+
+        assert result.status == "unknown"
+        assert result.error_type == RESULT_UNKNOWN
+        assert elapsed < 3.0  # 受控窗口内收口，而不是挂起数十分钟
+        assert _HangingProtocolSession.call_count == 1
+
+        row = await _only_row(chain.run_id)
+        assert row.status == "unknown"
+        assert row.error_type == RESULT_UNKNOWN
+        assert row.points_reserved == MCP_POINTS_COST
+        assert row.points_settled == 0
+        wallet = await _wallet(chain.user_id)
+        assert (wallet.balance, wallet.reserved) == (990, 10)
+    finally:
+        await _teardown_chain(chain)
+
+
+@pytest.mark.asyncio
+async def test_wall_clock_timeout_counts_toward_fine_grained_breaker() -> None:
+    """超时计细粒度熔断失败：同参数反复超时后相同调用被熔断、不再外发。"""
+    chain = await _setup_chain(steps=4)
+    try:
+        _HangingProtocolSession.call_count = 0
+        transport = _hanging_datatap_transport()
+        breaker = FineGrainedCircuitBreaker(failure_threshold=3, reset_seconds=60)
+        bridge = _bridge(transport, breaker=breaker)
+
+        # 同一熔断键（service+工具+参数）经不同 step 连续 3 次墙钟超时
+        for index in range(3):
+            result = await bridge.execute(
+                _context(chain, chain.step_ids[index]), {"keyword": "美妆"}
+            )
+            assert result.error_type == RESULT_UNKNOWN
+        assert _HangingProtocolSession.call_count == 3
+
+        # 第 4 次相同调用被熔断拦截：不外发、不计费
+        blocked = await bridge.execute(
+            _context(chain, chain.step_ids[3]), {"keyword": "美妆"}
+        )
+        assert blocked.status == "failed"
+        assert blocked.error_type == "definitely_not_sent"
+        assert _HangingProtocolSession.call_count == 3
+        wallet = await _wallet(chain.user_id)
+        assert (wallet.balance, wallet.reserved) == (970, 30)
+    finally:
+        await _teardown_chain(chain)
+
+
+@pytest.mark.asyncio
+async def test_wall_clock_timeout_unknown_reconciles_and_settles_or_releases_once() -> None:
+    """超时收口的 unknown：恢复核对只读不重放；确认成功结算 / 确认失败释放，均幂等。"""
+    chain = await _setup_chain(steps=2)
+    try:
+        _HangingProtocolSession.call_count = 0
+        transport = _hanging_datatap_transport()
+        bridge = _bridge(transport)
+
+        # 调用 1：墙钟超时 → unknown（无 upstream_request_id）
+        result = await bridge.execute(
+            _context(chain, chain.step_ids[0]), {"keyword": "美妆"}
+        )
+        assert result.error_type == RESULT_UNKNOWN
+        first = (await _rows(chain.run_id))[0]
+
+        # 恢复核对：只读探测，绝不重放；无 upstream_request_id → keep_unknown + 审计
+        probe = await bridge.reconcile(first.logical_call_id)
+        assert probe.status == "unknown"
+        assert _HangingProtocolSession.call_count == 1
+        reconciliation = await _reconciliation(first.id)
+        assert reconciliation is not None
+        assert reconciliation.decision == "keep_unknown"
+        wallet = await _wallet(chain.user_id)
+        assert (wallet.balance, wallet.reserved) == (990, 10)
+
+        # 上游稍后确认（管理员/恢复核对原语）：结算 10 分 + 补写 Evidence
+        snapshot = await bridge._coordinator.load_call(first.logical_call_id)
+        assert snapshot is not None
+        evidence_id = await bridge._coordinator.confirm_success(
+            snapshot,
+            validated_payload=OK_PAYLOAD,
+            upstream_request_id="req-late",
+            note="late outcome confirmed",
+        )
+        assert evidence_id is not None
+        wallet = await _wallet(chain.user_id)
+        assert (wallet.balance, wallet.reserved) == (990, 0)
+
+        # 幂等：再次确认成功不重复扣费；重入同一 logical_call_id 只回放不重发
+        again = await bridge._coordinator.confirm_success(
+            snapshot,
+            validated_payload=OK_PAYLOAD,
+            upstream_request_id="req-late",
+            note="duplicate confirm",
+        )
+        assert again == evidence_id
+        wallet = await _wallet(chain.user_id)
+        assert (wallet.balance, wallet.reserved) == (990, 0)
+        replay = await bridge.execute(
+            _context(chain, chain.step_ids[0]), {"keyword": "美妆"}
+        )
+        assert replay.status == "success"
+        assert _HangingProtocolSession.call_count == 1
+
+        # 调用 2（另一 step）：同样超时收口；确认失败 → 释放预留，钱包回到 settled 基线
+        second = await bridge.execute(
+            _context(chain, chain.step_ids[1]), {"keyword": "美妆"}
+        )
+        assert second.error_type == RESULT_UNKNOWN
+        wallet = await _wallet(chain.user_id)
+        assert (wallet.balance, wallet.reserved) == (980, 10)
+        second_row = [
+            row for row in await _rows(chain.run_id) if row.id != first.id
+        ][0]
+        snapshot2 = await bridge._coordinator.load_call(second_row.logical_call_id)
+        assert snapshot2 is not None
+        await bridge._coordinator.confirm_failure(
+            snapshot2, message="upstream confirmed failure", note="late failure confirmed"
+        )
+        wallet = await _wallet(chain.user_id)
+        assert (wallet.balance, wallet.reserved) == (990, 0)
+        final = [row for row in await _rows(chain.run_id) if row.id == second_row.id][0]
+        assert final.status == "failed"
+        assert final.error_type == FAILED_CONFIRMED
     finally:
         await _teardown_chain(chain)
