@@ -11,9 +11,34 @@
 
 from typing import Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 ToolStatus = Literal["success", "failed", "unknown"]
+
+# 工具执行前参数校验失败的结构化错误分类（registry 统一回喂）。语义与 MCP 侧
+# definitely_not_sent 对齐：校验在 dispatch 之前失败，工具零副作用、零计费，
+# 模型拿字段级明细自愈后重试。
+TOOL_ARGUMENTS_INVALID = "tool_arguments_invalid"
+
+# 结构化错误回喂的长度上限：字段级明细足够模型定位问题即可，绝不撑爆上下文。
+ERROR_SUMMARY_LIMIT = 2000
+
+
+def truncate_summary(text: str, limit: int = ERROR_SUMMARY_LIMIT) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "...(truncated)"
+
+
+def format_validation_error(
+    exc: ValidationError, *, prefix: str, limit: int = ERROR_SUMMARY_LIMIT
+) -> str:
+    """Pydantic 校验失败 → 字段级明细（``loc: msg [type]``），截断到上限。"""
+    parts: list[str] = []
+    for error in exc.errors():
+        loc = ".".join(str(part) for part in error.get("loc", ())) or "(root)"
+        parts.append(f"{loc}: {error.get('msg')} [{error.get('type')}]")
+    return truncate_summary(prefix + "; ".join(parts), limit)
 
 
 class ToolResult(BaseModel):
@@ -71,9 +96,13 @@ class TrustedTool(Protocol):
 
 
 __all__ = [
+    "ERROR_SUMMARY_LIMIT",
     "SERVER_RESERVED_KEYS",
+    "TOOL_ARGUMENTS_INVALID",
     "ToolContext",
     "ToolResult",
     "ToolStatus",
     "TrustedTool",
+    "format_validation_error",
+    "truncate_summary",
 ]

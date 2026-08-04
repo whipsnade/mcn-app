@@ -31,7 +31,7 @@ from app.agent_artifacts.payloads.brand import BrandReportV3
 from app.agent_artifacts.payloads.campaign import CampaignReportV2
 from app.agent_artifacts.payloads.kol_analysis import KolAnalysisV2
 from app.agent_artifacts.payloads.kol_detail import KolDetailV2
-from app.agent_artifacts.payloads.kol_selection import KolSelectionV3
+from app.agent_artifacts.payloads.kol_selection import KolSelectionNarrative, KolSelectionV3
 from app.agent_runtime.evidence import EvidenceWriter
 from app.agent_runtime.models import (
     AgentRun,
@@ -42,10 +42,15 @@ from app.agent_runtime.models import (
 )
 from app.agent_runtime.profiles import ARTIFACT_TOOLS, PROFILES
 from app.agent_runtime.tools.builders import (
+    BuildBrandReportDraftArgs,
     BuildBrandReportDraftTool,
+    BuildCampaignReportDraftArgs,
     BuildCampaignReportDraftTool,
+    BuildKolAnalysisDraftArgs,
     BuildKolAnalysisDraftTool,
+    BuildKolDetailDraftArgs,
     BuildKolDetailDraftTool,
+    BuildKolSelectionDraftArgs,
     BuildKolSelectionDraftTool,
 )
 from app.agent_runtime.tools.contracts import ToolContext
@@ -808,6 +813,148 @@ async def test_builder_tool_structured_error_truncated(db_session, user_factory)
     assert result.status == "failed"
     assert result.error_type == "draft_build_error"
     assert len(result.safe_summary) <= 2100
+
+
+# ---------------------------------------------------------------------------
+# kol_selection Builder 叙事字段（H3，设计 §6.1：Builder 输入必须包含模型
+# 提供的叙事字段；kol_selection_v3 narrative 契约见 payloads/kol_selection.py）
+# ---------------------------------------------------------------------------
+
+KOL_NARRATIVE = {
+    "selection_summary": "围绕美食品类圈选 1 位高互动达人。",
+    "fit_findings": [
+        {
+            "text": "达人1 平均互动 100，契合美食受众。",
+            "kol_uid": "1",
+            "supporting_paths": ["data.items.0.engagement_total"],
+        }
+    ],
+    "risk_notes": [],
+    "usage_advice": [
+        {
+            "text": "优先合作评分头部达人。",
+            "supporting_paths": ["data.items.0.score_snapshot.total"],
+        }
+    ],
+}
+
+
+async def test_build_kol_selection_draft_tool_model_narrative_written_to_draft(
+    db_session, user_factory
+) -> None:
+    """模型按契约提供 narrative → Draft 采用模型叙事且过 kol_selection_v3 强校验。"""
+    user = await user_factory()
+    session = await _make_session(db_session, user.id)
+    run, step = await _make_run(db_session, session.id, user.id)
+    evidence_id = await _write_evidence(
+        db_session,
+        session_id=session.id,
+        run_id=run.id,
+        step_id=step.id,
+        payload=_kol_items(),
+    )
+
+    tool = BuildKolSelectionDraftTool(db_session)
+    result = await tool.execute(
+        _ctx(user.id, session.id, run.id, step.id),
+        {"scope": KOL_SCOPE, "evidence_id": evidence_id, "narrative": KOL_NARRATIVE},
+    )
+    assert result.status == "success", result.safe_summary
+    summary = json.loads(result.safe_summary)
+
+    payload = await _latest_revision_payload(db_session, summary["artifact_id"])
+    KolSelectionV3.model_validate(payload)
+    assert payload["narrative"]["selection_summary"] == KOL_NARRATIVE["selection_summary"]
+    assert payload["narrative"]["fit_findings"][0]["kol_uid"] == "1"
+    assert payload["narrative"]["usage_advice"][0]["text"] == "优先合作评分头部达人。"
+
+
+async def test_build_kol_selection_draft_tool_narrative_missing_required_field(
+    db_session, user_factory
+) -> None:
+    """narrative 缺必填 selection_summary → 结构化 draft_build_error 字段级明细。"""
+    user = await user_factory()
+    session = await _make_session(db_session, user.id)
+    run, step = await _make_run(db_session, session.id, user.id)
+    evidence_id = await _write_evidence(
+        db_session,
+        session_id=session.id,
+        run_id=run.id,
+        step_id=step.id,
+        payload=_kol_items(),
+    )
+
+    tool = BuildKolSelectionDraftTool(db_session)
+    result = await tool.execute(
+        _ctx(user.id, session.id, run.id, step.id),
+        {
+            "scope": KOL_SCOPE,
+            "evidence_id": evidence_id,
+            "narrative": {"fit_findings": []},
+        },
+    )
+    assert result.status == "failed"
+    assert result.error_type == "draft_build_error"
+    assert "selection_summary" in result.safe_summary
+
+
+async def test_build_kol_selection_draft_tool_narrative_supporting_path_must_resolve(
+    db_session, user_factory
+) -> None:
+    """narrative 的 supporting_paths 指向 data 内不存在的路径 → payload 校验拒绝，
+    结构化 draft_build_error 回喂（叙事不得引用不存在的数据）。"""
+    user = await user_factory()
+    session = await _make_session(db_session, user.id)
+    run, step = await _make_run(db_session, session.id, user.id)
+    evidence_id = await _write_evidence(
+        db_session,
+        session_id=session.id,
+        run_id=run.id,
+        step_id=step.id,
+        payload=_kol_items(),
+    )
+    bad_narrative = {
+        **KOL_NARRATIVE,
+        "fit_findings": [
+            {"text": "幻觉引用。", "supporting_paths": ["data.items.99.engagement_total"]}
+        ],
+    }
+
+    tool = BuildKolSelectionDraftTool(db_session)
+    result = await tool.execute(
+        _ctx(user.id, session.id, run.id, step.id),
+        {"scope": KOL_SCOPE, "evidence_id": evidence_id, "narrative": bad_narrative},
+    )
+    assert result.status == "failed"
+    assert result.error_type == "draft_build_error"
+    assert "supporting_path" in result.safe_summary
+
+
+def test_builder_args_narrative_contract_matrix() -> None:
+    """五个 Builder 的叙事契约核对结论（H3）：
+
+    - brand / campaign / kol_selection：Args 接受模型叙事（可空，缺省由
+      builder 确定性生成兜底），字段契约与各自 payload 的 narrative 模型一致；
+    - kol_analysis / kol_detail：叙事由 builder 内部确定性生成，Args 不收
+      narrative（描述与实现自洽）；
+    - kol_selection 的叙事嵌套模型直接复用 kol_selection_v3 payload 的
+      KolSelectionNarrative（同源，不可能漂移）。
+    """
+    assert "narrative" in BuildBrandReportDraftArgs.model_fields
+    assert "narrative" in BuildCampaignReportDraftArgs.model_fields
+    assert "narrative" in BuildKolSelectionDraftArgs.model_fields
+    assert "narrative" not in BuildKolAnalysisDraftArgs.model_fields
+    assert "narrative" not in BuildKolDetailDraftArgs.model_fields
+
+    # kol_selection 叙事契约与 payload 强类型契约同源（同一模型类渲染进 Schema）。
+    schema = BuildKolSelectionDraftArgs.model_json_schema()
+    assert "KolSelectionNarrative" in schema.get("$defs", {})
+    assert set(KolSelectionNarrative.model_fields) == {
+        "selection_summary",
+        "fit_findings",
+        "risk_notes",
+        "usage_advice",
+    }
 
 
 # ---------------------------------------------------------------------------

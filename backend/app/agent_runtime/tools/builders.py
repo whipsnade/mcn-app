@@ -41,18 +41,24 @@ from app.agent_artifacts.builders.kol_detail import build_kol_detail_draft
 from app.agent_artifacts.builders.kol_selection import build_kol_selection_draft
 from app.agent_artifacts.builders.raw_rows import extract_rows, unwrap_payload
 from app.agent_artifacts.models import AgentArtifact, AgentArtifactVersion
+from app.agent_artifacts.payloads.kol_selection import KolSelectionNarrative
 from app.agent_artifacts.service import ArtifactBusy, ArtifactService
 from app.agent_artifacts.validation import ArtifactPayloadInvalid
 from app.agent_runtime.models import AgentSession, EvidenceItem
 from app.agent_runtime.tools.artifacts import kol_detail_snapshot_selection_parent
-from app.agent_runtime.tools.contracts import ToolContext, ToolResult
+from app.agent_runtime.tools.contracts import (
+    ToolContext,
+    ToolResult,
+    format_validation_error,
+    truncate_summary,
+)
 
 NOT_FOUND = "not_found"
 FORBIDDEN = "forbidden"
 EVIDENCE_NOT_FOUND = "evidence_not_found"
 DRAFT_BUILD_ERROR = "draft_build_error"
 
-# 结构化错误回喂的长度上限：字段级明细足够模型定位问题即可，绝不撑爆上下文。
+# 结构化错误回喂的长度上限（与 contracts.ERROR_SUMMARY_LIMIT 同源）。
 _ERROR_SUMMARY_LIMIT = 2000
 
 
@@ -61,18 +67,12 @@ def _failed(error_type: str, message: str) -> ToolResult:
 
 
 def _truncate(text: str, limit: int = _ERROR_SUMMARY_LIMIT) -> str:
-    if len(text) <= limit:
-        return text
-    return text[:limit] + "...(truncated)"
+    return truncate_summary(text, limit)
 
 
 def _format_validation_error(exc: ValidationError) -> str:
     """Pydantic 校验失败 → 字段级明细（``loc: msg [type]``），截断到上限。"""
-    parts: list[str] = []
-    for error in exc.errors():
-        loc = ".".join(str(part) for part in error.get("loc", ())) or "(root)"
-        parts.append(f"{loc}: {error.get('msg')} [{error.get('type')}]")
-    return _truncate("invalid builder arguments: " + "; ".join(parts))
+    return format_validation_error(exc, prefix="invalid builder arguments: ")
 
 
 def _draft_summary(
@@ -375,6 +375,10 @@ class BuildKolSelectionDraftArgs(BaseModel):
 
     scope: dict[str, Any]
     evidence_id: str = Field(min_length=1)
+    # 模型叙事（设计 §6.1：Builder 输入必须包含模型提供的叙事字段）。嵌套模型
+    # 直接复用 kol_selection_v3 payload 的 KolSelectionNarrative，契约同源不漂移；
+    # 可空——缺省时由 builder 按评分结果确定性生成兜底叙事。
+    narrative: KolSelectionNarrative | None = None
 
 
 class BuildKolSelectionDraftTool(_BuilderToolBase):
@@ -389,16 +393,26 @@ class BuildKolSelectionDraftTool(_BuilderToolBase):
         "如 平台/账号ID (kwUid)/昵称/粉丝数/平均互动 会自动归一，无需手工改写）。"
         "评分由确定性 "
         "rank_kols（kol_score_v2 八维）完成，默认跨平台 Top20 按互动量降序。"
+        "narrative 可选（selection_summary 必填 + fit_findings[]/risk_notes[]/"
+        "usage_advice[]，条目为 {text, kol_uid 可空, supporting_paths[]}；"
+        "supporting_paths 必须指向 data 内真实存在的点分路径，如 "
+        "data.items.0.score_snapshot.total；缺省时由工具按评分结果确定性生成）。"
         "输出只含 artifact_id/draft_id/revision_id/schema_version 与受限摘要。"
         "输入契约示例："
         'scope={"brand":null,"category":"美食","campaign":null,"platforms":["小红书"],'
         '"audience":{"regions":["上海"],"age_ranges":["18-24"],"interests":["美食"]},'
         '"filters":{"budget_min":null,"budget_max":100000,"follower_min":10000,'
         '"follower_max":null}}；'
-        'evidence_id="<当前会话 KOL 列表证据 id>"。'
+        'evidence_id="<当前会话 KOL 列表证据 id>"；'
+        'narrative={"selection_summary":"...","fit_findings":[{"text":"...",'
+        '"kol_uid":"123","supporting_paths":["data.items.0.score_snapshot.total"]}],'
+        '"risk_notes":[],"usage_advice":[{"text":"...","supporting_paths":'
+        '["data.items.0.engagement_total"]}]}。'
         "注意：audience 与 filters 必填；filters 只有 budget_min/budget_max/"
-        "follower_min/follower_max 四个字段（不存在 follower_threshold 等其他字段），"
-        "多传或错传字段返回 draft_build_error 字段级明细，按明细修正后重试。"
+        "follower_min/follower_max 四个字段（不存在 follower_threshold 等其他字段）。"
+        "数字纪律：narrative 中的每个数字都必须能在 supporting_paths 指向的 data "
+        "位置找到同值，找不到就不要写这个数字。多传或错传字段返回 draft_build_error "
+        "字段级明细，按明细修正后重试。"
     )
 
     name = "build_kol_selection_draft"
@@ -428,6 +442,11 @@ class BuildKolSelectionDraftTool(_BuilderToolBase):
                 context=context,
                 db=self._db,
                 source_names=(item.source_name,),
+                narrative=(
+                    args.narrative.model_dump(mode="json")
+                    if args.narrative is not None
+                    else None
+                ),
                 # 行的完整基准路径（含容器键前缀）——lineage source_path 必须在
                 # Evidence raw payload 内可解析（H1：中文容器键缺前缀导致
                 # evidence_source_path_not_found）。

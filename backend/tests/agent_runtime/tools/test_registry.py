@@ -24,6 +24,7 @@ from app.agent_runtime.profiles import (
 )
 from app.agent_runtime.tools.contracts import (
     SERVER_RESERVED_KEYS,
+    TOOL_ARGUMENTS_INVALID,
     ToolContext,
     ToolResult,
 )
@@ -312,6 +313,81 @@ async def test_execute_unknown_tool_raises() -> None:
             run_id="r",
             profile=session_analyst,
         )
+
+
+# ---------------------------------------------------------------------------
+# 3.1 执行前参数校验失败 → 结构化回喂（H3）
+# ---------------------------------------------------------------------------
+
+
+async def test_execute_hallucinated_argument_returns_structured_feedback() -> None:
+    """模型编造字段（extra=forbid）→ tool_arguments_invalid 字段级回喂，工具零 dispatch。
+
+    真实 UAT 故障：模型给 build_kol_selection_draft 传 narrative 被
+    input_model 拒绝，ValidationError 冒泡为 engine 级「failed unexpectedly」，
+    模型拿不到字段明细盲重试烧光决策预算。校验失败必须转为结构化 ToolResult
+    （语义同 MCP 侧 definitely_not_sent：未 dispatch、零副作用）。
+    """
+    registry = ToolRegistry()
+    tool = FakeTool("calculate_expression")
+    registry.register(tool, category=CALCULATION_TOOLS)
+
+    result = await registry.execute(
+        internal_name="calculate_expression",
+        arguments={"expression": "1 + 1", "narrative": {"selection_summary": "幻觉字段"}},
+        user_id="u",
+        session_id="s",
+        run_id="r",
+        profile=session_analyst,
+    )
+
+    assert result.status == "failed"
+    assert result.error_type == TOOL_ARGUMENTS_INVALID
+    # 字段级明细：违规字段名必须出现在回喂摘要里，模型据此自愈。
+    assert "narrative" in result.safe_summary
+    # 校验在 dispatch 之前：执行器零调用，绝无副作用。
+    assert tool.calls == []
+
+
+async def test_execute_missing_required_argument_returns_structured_feedback() -> None:
+    registry = ToolRegistry()
+    tool = FakeTool("calculate_expression")
+    registry.register(tool, category=CALCULATION_TOOLS)
+
+    result = await registry.execute(
+        internal_name="calculate_expression",
+        arguments={},
+        user_id="u",
+        session_id="s",
+        run_id="r",
+        profile=session_analyst,
+    )
+
+    assert result.status == "failed"
+    assert result.error_type == TOOL_ARGUMENTS_INVALID
+    assert "expression" in result.safe_summary
+    assert tool.calls == []
+
+
+async def test_execute_invalid_arguments_summary_truncated() -> None:
+    """大量校验错误时回喂摘要截断到合理长度，不撑爆模型上下文。"""
+    registry = ToolRegistry()
+    tool = FakeTool("calculate_expression")
+    registry.register(tool, category=CALCULATION_TOOLS)
+
+    result = await registry.execute(
+        internal_name="calculate_expression",
+        arguments={"expression": "1", **{f"bogus_field_{i}": i for i in range(200)}},
+        user_id="u",
+        session_id="s",
+        run_id="r",
+        profile=session_analyst,
+    )
+
+    assert result.status == "failed"
+    assert result.error_type == TOOL_ARGUMENTS_INVALID
+    assert len(result.safe_summary) <= 2100
+    assert tool.calls == []
 
 
 # ---------------------------------------------------------------------------

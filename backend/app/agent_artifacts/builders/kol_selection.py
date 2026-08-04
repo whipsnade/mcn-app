@@ -396,6 +396,7 @@ def _build_payload(
     data_as_of: datetime | None,
     source_names: tuple[str, ...],
     sort_missing: bool = False,
+    narrative: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """组装名单 payload；``sort_missing`` 时按互动量排序不可用 → restricted。
 
@@ -405,6 +406,10 @@ def _build_payload(
     §6.3 递归 null 治理：``items[]`` 的 Optional 展示数值（followers/
     quoted_price 等）出现 null 时同样必须受限披露（items partial +
     limitation），不得谎称 complete。
+
+    ``narrative``：模型提供的叙事（设计 §6.1），缺省时由 ``_narrative``
+    按评分结果确定性生成兜底；模型叙事的 supporting_paths 是否指向 data
+    内真实路径由下游 ``KolSelectionV3.model_validate`` 统一校验。
     """
     selected_count = len(items)
     null_display = [
@@ -463,7 +468,9 @@ def _build_payload(
                 ),
             },
         },
-        "narrative": _narrative(items, candidate_count, sort_missing=sort_missing),
+        "narrative": narrative
+        if narrative is not None
+        else _narrative(items, candidate_count, sort_missing=sort_missing),
     }
 
 
@@ -767,11 +774,18 @@ async def build_kol_selection_draft(
     data_as_of: datetime | None = None,
     source_names: tuple[str, ...] = ("kol_evidence",),
     row_source_paths: list[str] | None = None,
+    narrative: dict[str, Any] | None = None,
 ) -> DraftBuildResult:
     """把模型选定的 KOL 列表 Evidence 转换为 ``kol_selection_v3`` Draft。
 
     评分委托 ``rank_kols``（严格复用 ``kol_score_v2``），默认跨平台 Top20 按
     ``engagement_total`` 降序；数据不足时产出 restricted。
+
+    ``narrative``：模型提供的叙事（设计 §6.1），写入 payload 前经
+    ``KolSelectionV3.model_validate`` 强校验（含 supporting_paths 必须指向
+    data 内真实路径）；缺省时按评分结果确定性生成兜底叙事。无候选的
+    restricted 路径恒用 builder 自己的受限披露叙事（此时无 data 可引用，
+    不采用模型叙事）。
 
     ``row_source_paths``：与 ``items`` 等长平行的行基准 JSON Pointer（行在
     Evidence raw payload 内的位置，含容器键前缀，通常取
@@ -840,6 +854,7 @@ async def build_kol_selection_draft(
         data_as_of=data_as_of,
         source_names=source_names,
         sort_missing=sort_missing,
+        narrative=narrative,
     )
     try:
         KolSelectionV3.model_validate(payload)  # fail-fast：builder 输出必须合法。

@@ -25,14 +25,16 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from app.agent_runtime.profiles import AgentProfile, MCP_TOOLS, TOOL_CATEGORIES
 from app.agent_runtime.tools.contracts import (
     SERVER_RESERVED_KEYS,
+    TOOL_ARGUMENTS_INVALID,
     ToolContext,
     ToolResult,
     TrustedTool,
+    format_validation_error,
 )
 from app.mcp_gateway.registry import close_input_schema
 
@@ -277,6 +279,9 @@ class ToolRegistry:
         管理员事后变更绕过，实时复核在 ``entry.tool.execute``（AgentMcpTool
         的 prepare/积分预留）之前执行，复核失败抛 :class:`UnknownToolError`
         （与静态检查同一出口），不产生任何预留，无需释放。
+        H3：``input_model`` 参数校验失败（模型编造字段/缺必填项）不冒泡，
+        统一转为 ``tool_arguments_invalid`` 结构化回喂（字段级明细、截断到
+        上限），校验在 dispatch 之前，工具零副作用。
         """
         await self._ensure_catalog()
         entry = self._entries.get(internal_name)
@@ -301,7 +306,20 @@ class ToolRegistry:
         }
         parsed: BaseModel | Mapping[str, Any]
         if entry.input_model is not None:
-            parsed = entry.input_model.model_validate(scrubbed)
+            try:
+                parsed = entry.input_model.model_validate(scrubbed)
+            except ValidationError as exc:
+                # H3：参数校验失败必须结构化回喂模型（字段级明细），而不是冒泡为
+                # engine 级「failed unexpectedly」——语义同 MCP 侧
+                # definitely_not_sent：校验在 dispatch 之前，工具零副作用零计费，
+                # 模型按明细修正参数后重试即可自愈。
+                return ToolResult(
+                    status="failed",
+                    safe_summary=format_validation_error(
+                        exc, prefix=f"invalid arguments for tool {internal_name!r}: "
+                    ),
+                    error_type=TOOL_ARGUMENTS_INVALID,
+                )
         else:
             parsed = scrubbed
         context = ToolContext(
