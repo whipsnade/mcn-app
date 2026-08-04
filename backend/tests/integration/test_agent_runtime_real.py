@@ -8,6 +8,15 @@
 - 强制隔离：conftest 的 test 环境变量把本测试约束在 ``kol_insight_test``；脚本还会
   FORCE-override APP_ENV/MYSQL_*/AUTH_MODE，绝不触碰 dev DB。
 - 安全：所有记录都不含密钥、DSN、完整原始 prompt 或原始 MCP payload。
+- 生产装配（D1 修复）：工具注册表由 ``AgentToolRegistryFactory`` 构建（与 main.py
+  engine_factory 同一入口，含五类 Builder 工具与执行前实时目录复核），传输固定
+  ``get_agent_mcp_transport``（circuit none + retry never + 150s 墙钟），渠道权限
+  按测试用户真实行注入——2026-08-02 轮 UAT 因手工注册表缺 Builder + legacy
+  传输（服务级熔断连锁 definitely_not_sent）导致结果无效。
+- Gate B 口径断言（§8.4/§十）：核心业务场景必须 completed 且发布对应正式
+  Artifact（允许 restricted，但必须有 Artifact + lineage_ok）；模型澄清时测试
+  以预设回答追发新 Run 继续推进；paused/failed/零 Artifact/停在澄清一律 FAIL
+  并说明卡在哪个环节。
 - 计费断言：每个 settled 调用恰好 10 分；failed_confirmed/definitely_not_sent 释放
   预留；unknown 被恢复核对（或保持预留并留有审计行）。
 - 证据断言：已发布 Artifact 的每个正式数值字段都有有效 lineage。
@@ -20,13 +29,14 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_artifacts.lineage import (
@@ -36,6 +46,7 @@ from app.agent_artifacts.lineage import (
     validate_and_freeze_lineage,
 )
 from app.agent_artifacts.models import AgentArtifactVersion
+from app.agent_runtime.circuit_breaker import FineGrainedCircuitBreaker
 from app.agent_runtime.engine import AgentEngine
 from app.agent_runtime.events import AgentEventBroker, AgentEventStream
 from app.agent_runtime.model_gateway import AgentModelGateway
@@ -51,27 +62,16 @@ from app.agent_runtime.profiles import get_profile
 from app.agent_runtime.repository import AgentRunRepository, utc_now
 from app.agent_runtime.reviewer import ReviewDecision, ReviewerDriver
 from app.agent_runtime.state import RunStatus
-from app.agent_runtime.tools.artifacts import CreateDraftTool, UpdateDraftTool
-from app.agent_runtime.tools.calculation import (
-    AggregateMetricsTool,
-    CalculateExpressionTool,
-    CalculatePeriodComparisonTool,
-    NormalizeSentimentTool,
-    RankKolsTool,
-)
-from app.agent_runtime.tools.history import ReadArtifactTool, ReadToolResultTool, SearchEvidenceTool
-from app.agent_runtime.tools.mcp import AgentMcpTool
+from app.agent_runtime.tools.factory import AgentToolRegistryFactory, load_channel_permissions
 from app.agent_runtime.tools.registry import ToolRegistry
 from app.billing.models import Wallet, WalletTransaction
+from app.core.config import get_settings
 from app.db.session import SessionFactory
-from app.identity.models import User
+from app.identity.models import User, UserChannelPermission
 from app.model.contracts import ChatMessage
 from app.model.dependencies import get_model_adapter
-from app.mcp_gateway.contracts import DataTapService
 from app.mcp_gateway.datatap import DataTapTransport
-from app.mcp_gateway.models import McpToolCatalog
-from app.mcp_gateway.registry import DYNAMIC_TOOL_ALLOWLIST
-from app.mcp_gateway.service import get_mcp_transport, refresh_approved_datatap_tools
+from app.mcp_gateway.service import get_agent_mcp_transport, refresh_approved_datatap_tools
 from app.mcp_gateway.transport import (
     McpGatewayTimeout,
     McpTransport,
@@ -137,6 +137,9 @@ class ScenarioRecord:
     decision_count: int
     points_before: int
     points_after: int
+    # 运行身份（澄清回答需要复用同一 user/session 追发新 Run）。
+    user_id: str = ""
+    session_id: str = ""
     wallet_tx_summary: list[dict[str, Any]] = field(default_factory=list)
     calls: list[CallRecord] = field(default_factory=list)
     steps: list[dict[str, Any]] = field(default_factory=list)
@@ -155,6 +158,8 @@ class ScenarioRecord:
             "decision_count": self.decision_count,
             "points_before": self.points_before,
             "points_after": self.points_after,
+            "user_id": self.user_id,
+            "session_id": self.session_id,
             "wallet_tx_summary": self.wallet_tx_summary,
             "calls": [c.to_dict() for c in self.calls],
             "steps": self.steps,
@@ -188,9 +193,16 @@ def _dump_results() -> None:
 
 @pytest.fixture(scope="session", autouse=True)
 async def _uat_catalog_ready() -> None:
-    """一次性刷新 test DB 的已审核 MCP 目录（真实 discovery，零计费）。"""
+    """一次性刷新 test DB 的已审核 MCP 目录（真实 discovery，零计费）。
+
+    会话前后各清理一次 ``uat-*`` 用户全链数据：UAT 场景真实提交
+    user/session/run/artifact/账本/prompt 日志行，普通套件按全局计数断言，
+    残留提交会让其失败。
+    """
+    await _cleanup_uat_data()
     await refresh_approved_datatap_tools()
     yield
+    await _cleanup_uat_data()
 
 
 @pytest.fixture(autouse=True)
@@ -200,56 +212,121 @@ def _uat_dump_after_each() -> None:
     _dump_results()
 
 
+# UAT 数据清理（子表先行，users 兜底）：只碰 nickname LIKE 'uat-%' 的隔离用户。
+_UAT_CLEANUP_STATEMENTS = (
+    "DELETE ra FROM artifact_review_attempts ra "
+    "JOIN artifact_review_items ri ON ra.review_item_id = ri.id "
+    "JOIN artifact_review_batches rb ON ri.batch_id = rb.id "
+    "JOIN agent_runs ru ON rb.parent_run_id = ru.id "
+    "JOIN users u ON ru.user_id = u.id WHERE u.nickname LIKE 'uat-%'",
+    "DELETE ri FROM artifact_review_items ri "
+    "JOIN artifact_review_batches rb ON ri.batch_id = rb.id "
+    "JOIN agent_runs ru ON rb.parent_run_id = ru.id "
+    "JOIN users u ON ru.user_id = u.id WHERE u.nickname LIKE 'uat-%'",
+    "DELETE rb FROM artifact_review_batches rb "
+    "JOIN agent_runs ru ON rb.parent_run_id = ru.id "
+    "JOIN users u ON ru.user_id = u.id WHERE u.nickname LIKE 'uat-%'",
+    "DELETE rc FROM agent_tool_call_reconciliations rc "
+    "JOIN agent_tool_calls c ON rc.tool_call_id = c.id "
+    "JOIN agent_runs ru ON c.run_id = ru.id "
+    "JOIN users u ON ru.user_id = u.id WHERE u.nickname LIKE 'uat-%'",
+    "DELETE e FROM evidence_items e "
+    "JOIN agent_sessions s ON e.session_id = s.id "
+    "JOIN users u ON s.user_id = u.id WHERE u.nickname LIKE 'uat-%'",
+    "DELETE ev FROM agent_events ev "
+    "JOIN agent_runs ru ON ev.run_id = ru.id "
+    "JOIN users u ON ru.user_id = u.id WHERE u.nickname LIKE 'uat-%'",
+    "DELETE c FROM agent_tool_calls c "
+    "JOIN agent_runs ru ON c.run_id = ru.id "
+    "JOIN users u ON ru.user_id = u.id WHERE u.nickname LIKE 'uat-%'",
+    "DELETE st FROM agent_steps st "
+    "JOIN agent_runs ru ON st.run_id = ru.id "
+    "JOIN users u ON ru.user_id = u.id WHERE u.nickname LIKE 'uat-%'",
+    "DELETE att FROM agent_run_attempts att "
+    "JOIN agent_runs ru ON att.run_id = ru.id "
+    "JOIN users u ON ru.user_id = u.id WHERE u.nickname LIKE 'uat-%'",
+    "DELETE m FROM agent_messages m "
+    "JOIN agent_sessions s ON m.session_id = s.id "
+    "JOIN users u ON s.user_id = u.id WHERE u.nickname LIKE 'uat-%'",
+    "DELETE me FROM memory_entries me "
+    "JOIN agent_sessions s ON me.session_id = s.id "
+    "JOIN users u ON s.user_id = u.id WHERE u.nickname LIKE 'uat-%'",
+    "DELETE ae FROM artifact_events ae "
+    "JOIN agent_sessions s ON ae.session_id = s.id "
+    "JOIN users u ON s.user_id = u.id WHERE u.nickname LIKE 'uat-%'",
+    "DELETE av FROM agent_artifact_versions av "
+    "JOIN agent_artifacts ar ON av.artifact_id = ar.id "
+    "JOIN agent_sessions s ON ar.session_id = s.id "
+    "JOIN users u ON s.user_id = u.id WHERE u.nickname LIKE 'uat-%'",
+    "DELETE dr FROM artifact_draft_revisions dr "
+    "JOIN artifact_drafts d ON dr.draft_id = d.id "
+    "JOIN agent_sessions s ON d.session_id = s.id "
+    "JOIN users u ON s.user_id = u.id WHERE u.nickname LIKE 'uat-%'",
+    "DELETE d FROM artifact_drafts d "
+    "JOIN agent_sessions s ON d.session_id = s.id "
+    "JOIN users u ON s.user_id = u.id WHERE u.nickname LIKE 'uat-%'",
+    "DELETE k FROM kol_detail_cache k "
+    "JOIN agent_sessions s ON k.session_id = s.id "
+    "JOIN users u ON s.user_id = u.id WHERE u.nickname LIKE 'uat-%'",
+    "DELETE ars FROM agent_artifact_read_states ars "
+    "JOIN agent_sessions s ON ars.session_id = s.id "
+    "JOIN users u ON s.user_id = u.id WHERE u.nickname LIKE 'uat-%'",
+    "DELETE ar FROM agent_artifacts ar "
+    "JOIN agent_sessions s ON ar.session_id = s.id "
+    "JOIN users u ON s.user_id = u.id WHERE u.nickname LIKE 'uat-%'",
+    "DELETE ru FROM agent_runs ru "
+    "JOIN users u ON ru.user_id = u.id WHERE u.nickname LIKE 'uat-%'",
+    "DELETE s FROM agent_sessions s "
+    "JOIN users u ON s.user_id = u.id WHERE u.nickname LIKE 'uat-%'",
+    "DELETE wt FROM wallet_transactions wt "
+    "JOIN users u ON wt.user_id = u.id WHERE u.nickname LIKE 'uat-%'",
+    "DELETE w FROM wallets w "
+    "JOIN users u ON w.user_id = u.id WHERE u.nickname LIKE 'uat-%'",
+    "DELETE mpl FROM model_prompt_logs mpl "
+    "JOIN users u ON mpl.user_id = u.id WHERE u.nickname LIKE 'uat-%'",
+    "DELETE p FROM user_channel_permissions p "
+    "JOIN users u ON p.user_id = u.id WHERE u.nickname LIKE 'uat-%'",
+    "DELETE FROM users WHERE nickname LIKE 'uat-%'",
+    # 目录行由会话开始的 refresh 真实 discovery 重建；残留提交会与 registry/factory
+    # 测试自建同名行撞唯一键（UAT 刷新是提交落库的）。
+    "DELETE FROM mcp_tool_catalog",
+)
+
+
+async def _cleanup_uat_data() -> None:
+    """清除 UAT 场景提交落库的 ``uat-*`` 用户全链数据（真实提交，子表先行）。"""
+    db = SessionFactory()
+    try:
+        async with db as session:
+            for statement in _UAT_CLEANUP_STATEMENTS:
+                await session.execute(text(statement))
+            await session.commit()
+    finally:
+        await db.close()
+
+
 # --------------------------------------------------------------------------- #
 # 工具注册表 / 引擎装配
 # --------------------------------------------------------------------------- #
 
 
-def _resolve_remote_entry(service: DataTapService, internal_tool_name: str):
-    return DYNAMIC_TOOL_ALLOWLIST.get(service, {}).get(internal_tool_name)
-
-
-async def _load_catalog(db: AsyncSession) -> list[McpToolCatalog]:
-    return list((await db.scalars(select(McpToolCatalog))).all())
-
-
-def _make_mcp_tool(db: AsyncSession, row: McpToolCatalog, *, transport: McpTransport):
-    try:
-        service = DataTapService(row.service_slug)
-    except ValueError:
-        return None
-    entry = _resolve_remote_entry(service, row.internal_tool_name)
-    if entry is None:
-        return None
-    _remote, _description, output_schema = entry
-    return AgentMcpTool(
-        internal_name=row.internal_tool_name,
-        service=service,
-        remote_name=row.internal_tool_name,  # 实时网关以内部名暴露工具
-        input_schema=row.input_schema_json,
-        output_schema=output_schema,
-        db_session=db,
-        transport=transport,
-    )
+# 与生产 main.py 一致：进程级共享一个细粒度熔断器，失败计数跨 Engine 实例累积。
+_UAT_BREAKER = FineGrainedCircuitBreaker()
 
 
 def _build_registry(db: AsyncSession, *, transport: McpTransport | None = None) -> ToolRegistry:
-    transport = transport or get_mcp_transport()
-    registry = ToolRegistry(
-        catalog_source=lambda: _load_catalog(db),
-        mcp_executor_factory=lambda row: _make_mcp_tool(db, row, transport=transport),
+    """生产装配（D1）：与 main.py engine_factory 同一入口 ``AgentToolRegistryFactory``。
+
+    含 history/calculation/artifact 内部工具、五类 Builder 工具、审核 MCP 目录接入
+    与执行前实时目录复核（G2）；默认传输为 Agent 专用 ``get_agent_mcp_transport``
+    （circuit none + retry never + 150s 墙钟）。``transport`` 仅供故障注入场景
+    包装替换。
+    """
+    factory = AgentToolRegistryFactory(
+        transport_getter=(lambda: transport) if transport is not None else get_agent_mcp_transport,
+        breaker=_UAT_BREAKER,
     )
-    registry.register(CalculateExpressionTool(db), category="calculation")
-    registry.register(AggregateMetricsTool(db), category="calculation")
-    registry.register(CalculatePeriodComparisonTool(db), category="calculation")
-    registry.register(NormalizeSentimentTool(db), category="calculation")
-    registry.register(RankKolsTool(db), category="calculation")
-    registry.register(ReadArtifactTool(db), category="history")
-    registry.register(SearchEvidenceTool(db), category="history")
-    registry.register(ReadToolResultTool(db), category="history")
-    registry.register(CreateDraftTool(db), category="artifact")
-    registry.register(UpdateDraftTool(db), category="artifact")
-    return registry
+    return factory.build(db)
 
 
 def _build_engine(
@@ -259,10 +336,13 @@ def _build_engine(
     gateway: AgentModelGateway,
     reviewer_gateway: AgentModelGateway | None = None,
     worker_id: str = WORKER_ID,
+    channel_permissions: Iterable[str] = (),
 ) -> AgentEngine:
     reviewer = ReviewerDriver(db, reviewer_gateway or gateway, worker_id=worker_id)
     broker = AgentEventBroker()
     events = AgentEventStream(db, broker)
+    # 不注入 session_factory：UAT 在单一未提交事务内创建 Run，租约心跳必须
+    # 复用同一会话（独立会话看不到未提交的 Run 行，会误判租约丢失）。
     return AgentEngine(
         db,
         gateway=gateway,
@@ -270,6 +350,7 @@ def _build_engine(
         events=events,
         reviewer=reviewer,
         worker_id=worker_id,
+        channel_permissions=channel_permissions,
     )
 
 
@@ -293,8 +374,14 @@ class ScriptedReviewerGateway:
 
 
 async def _new_user_session_wallet(
-    db: AsyncSession, *, scenario: str, balance: int
+    db: AsyncSession,
+    *,
+    scenario: str,
+    balance: int,
+    channels: tuple[str, ...] = ("xiaohongshu", "douyin"),
 ) -> tuple[User, AgentSession, Wallet]:
+    """创建隔离的 user/session/wallet；默认授予小红书+抖音渠道权限（kol_*_search
+    等渠道门槛工具对无权限用户不可见，圈选场景需要真实授权）。"""
     now = utc_now()
     user = User(
         id=str(uuid4()),
@@ -318,6 +405,17 @@ async def _new_user_session_wallet(
     await db.flush()
     wallet = Wallet(user_id=user.id, balance=balance, reserved=0, version=0, updated_at=now)
     db.add(wallet)
+    for channel in channels:
+        db.add(
+            UserChannelPermission(
+                id=str(uuid4()),
+                user_id=user.id,
+                channel=channel,
+                is_enabled=True,
+                created_at=now,
+                updated_at=now,
+            )
+        )
     await db.flush()
     return user, agent_session, wallet
 
@@ -330,13 +428,27 @@ async def _run_scenario(
     profile_name: str = "session_analyst_v1",
     transport: McpTransport | None = None,
     reviewer_gateway: AgentModelGateway | None = None,
+    user_id: str | None = None,
+    agent_session_id: str | None = None,
 ) -> ScenarioRecord:
-    """创建独立 user/session/wallet + Run，驱动真实引擎执行一次场景，收集证据并提交。"""
+    """创建独立 user/session/wallet + Run，驱动真实引擎执行一次场景，收集证据并提交。
+
+    传入 ``user_id`` + ``agent_session_id`` 时复用既有身份追发新 Run（生产语义：
+    用户回答澄清 = 同会话新消息 → 新 Run；会话 Memory 由上下文组装器注入，
+    新 Run 能看到前一轮澄清）。此时 ``balance`` 忽略，钱包为同一用户的真实余额。
+    """
     db = SessionFactory()
     async with db as session:
-        user, agent_session, _wallet = await _new_user_session_wallet(
-            session, scenario=scenario, balance=balance
-        )
+        if user_id is not None and agent_session_id is not None:
+            user = await session.get(User, user_id)
+            agent_session = await session.get(AgentSession, agent_session_id)
+            if user is None or agent_session is None:
+                raise AssertionError("follow-up identity must exist")
+            wallet = await session.scalar(select(Wallet).where(Wallet.user_id == user.id))
+        else:
+            user, agent_session, wallet = await _new_user_session_wallet(
+                session, scenario=scenario, balance=balance
+            )
         repo = AgentRunRepository(session)
         run = AgentRun(
             id=str(uuid4()),
@@ -346,7 +458,7 @@ async def _run_scenario(
             visibility="user",
             profile_name=profile_name,
             profile_version="v1",
-            model="glm-5.2",
+            model=get_settings().tencent_plan_model,
             status="queued",
             decision_count=0,
             review_count=0,
@@ -364,6 +476,7 @@ async def _run_scenario(
             registry=registry,
             gateway=gateway,
             reviewer_gateway=reviewer_gateway,
+            channel_permissions=await load_channel_permissions(session, user.id),
         )
         # 先登记 run_id（status=running）并立即落盘：即使真实 DataTap 查询挂起
         # 导致 engine.run 无法返回，JSON 仍保留该场景的 run_id（Fix 5）。
@@ -374,8 +487,10 @@ async def _run_scenario(
             run_id=run.id,
             status="running",
             decision_count=0,
-            points_before=balance,
-            points_after=balance,
+            points_before=wallet.balance if wallet is not None else balance,
+            points_after=wallet.balance if wallet is not None else balance,
+            user_id=user.id,
+            session_id=agent_session.id,
         )
         _ALL_RECORDS.append(record)
         _dump_results()
@@ -394,6 +509,59 @@ async def _run_scenario(
         await _collect_run_record(session, run.id, record)
         await session.commit()
         return record
+
+
+async def _answer_clarifications(
+    record: ScenarioRecord, *, scenario: str, answers: tuple[str, ...]
+) -> ScenarioRecord:
+    """模型 ask_user 时以预设回答追发新 Run 继续推进（Gate B：停在澄清不算交付）。
+
+    预设回答耗尽后模型仍澄清，按未交付 FAIL 并说明。
+    """
+    for index, answer in enumerate(answers, start=1):
+        if record.status != RunStatus.CLARIFICATION_REQUESTED.value:
+            return record
+        record = await _run_scenario(
+            scenario=f"{scenario}_answer{index}",
+            prompt=answer,
+            user_id=record.user_id,
+            agent_session_id=record.session_id,
+        )
+    if record.status == RunStatus.CLARIFICATION_REQUESTED.value:
+        pytest.fail(
+            f"{scenario}: 预设澄清回答（{len(answers)} 轮）耗尽后模型仍在澄清，"
+            "无法推进到交付"
+        )
+    return record
+
+
+def _require_published(record: ScenarioRecord, schema_version: str) -> dict[str, Any]:
+    """Gate B 口径：Run 必须 completed 且发布指定 schema 的 Version（允许 restricted）。
+
+    paused/failed/零 Artifact/lineage 无效一律 FAIL，信息说明卡在哪个环节。
+    """
+    if record.status != RunStatus.COMPLETED.value:
+        pytest.fail(
+            f"{record.scenario}: Run 未 completed（status={record.status}, "
+            f"decisions={record.decision_count}, limitations={record.limitations}）"
+        )
+    matches = [
+        version
+        for version in record.artifact_versions
+        if version["schema_version"] == schema_version
+    ]
+    if not matches:
+        pytest.fail(
+            f"{record.scenario}: completed 但未发布 {schema_version} Artifact "
+            f"（已发布={record.artifact_versions}）"
+        )
+    for version in matches:
+        if not version["lineage_ok"]:
+            pytest.fail(
+                f"{record.scenario}: {schema_version} lineage 校验失败："
+                f"{version.get('lineage_error')}"
+            )
+    return matches[-1]
 
 
 async def _collect_run_record(db: AsyncSession, run_id: str, record: ScenarioRecord) -> None:
@@ -639,18 +807,14 @@ async def test_uat_clarification_when_info_insufficient() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# 场景 2：品牌分析 → brand_report_v3
+# 场景 2：品牌分析 → brand_report_v3（Gate B：completed + 发布 + lineage_ok）
 # --------------------------------------------------------------------------- #
 
 
-# 真实模型能驱动 MCP 调用，但受当前 prompt 工程限制可能陷入 draft lineage 反复
-# 修订并触发 Attempt 保护暂停（50 决策）——这是真实行为，如实记录为 PAUSED。
-_REAL_MODEL_TERMINAL = {
-    RunStatus.COMPLETED.value,
-    RunStatus.CLARIFICATION_REQUESTED.value,
-    RunStatus.FAILED.value,
-    RunStatus.PAUSED.value,
-}
+_BRAND_ANSWERS = (
+    "品牌：瑞幸咖啡；时间范围：最近30天；平台：小红书、抖音。"
+    "信息已足够，请直接开始分析并产出正式品牌报告。",
+)
 
 
 async def test_uat_brand_analysis_real() -> None:
@@ -658,13 +822,22 @@ async def test_uat_brand_analysis_real() -> None:
         scenario="brand_analysis",
         prompt="请分析最近一个月瑞幸咖啡的品牌声量和情感表现，并产出正式分析报告。",
     )
+    record = await _answer_clarifications(
+        record, scenario="brand_analysis", answers=_BRAND_ANSWERS
+    )
     await _assert_ledger(record)
-    assert record.status in _REAL_MODEL_TERMINAL
+    _require_published(record, "brand_report_v3")
 
 
 # --------------------------------------------------------------------------- #
-# 场景 3：活动分析（campaign）
+# 场景 3：活动分析（campaign_report_v2，澄清时回答并继续）
 # --------------------------------------------------------------------------- #
+
+
+_CAMPAIGN_ANSWERS = (
+    "活动：瑞幸咖啡「9.9咖啡节」；时间范围：最近30天；平台：小红书、抖音。"
+    "请直接执行分析并产出正式活动报告。",
+)
 
 
 async def test_uat_campaign_analysis_real() -> None:
@@ -672,8 +845,11 @@ async def test_uat_campaign_analysis_real() -> None:
         scenario="campaign_analysis",
         prompt="瑞幸咖啡最近有‘9.9咖啡节’活动，请分析这个活动在社交媒体的传播效果。",
     )
+    record = await _answer_clarifications(
+        record, scenario="campaign_analysis", answers=_CAMPAIGN_ANSWERS
+    )
     await _assert_ledger(record)
-    assert record.status in _REAL_MODEL_TERMINAL
+    _require_published(record, "campaign_report_v2")
 
 
 # --------------------------------------------------------------------------- #
@@ -681,13 +857,23 @@ async def test_uat_campaign_analysis_real() -> None:
 # --------------------------------------------------------------------------- #
 
 
+_KOL_ANSWERS = (
+    "品牌：瑞幸咖啡；平台：小红书；领域：咖啡/美食饮品；预算不限。"
+    "请直接圈选Top20达人并分析前5位。",
+)
+
+
 async def test_uat_kol_selection_and_analysis_real() -> None:
     record = await _run_scenario(
         scenario="kol_selection",
         prompt="请为瑞幸咖啡圈选Top20达人，并分析其中前5位达人的核心价值。",
     )
+    record = await _answer_clarifications(
+        record, scenario="kol_selection", answers=_KOL_ANSWERS
+    )
     await _assert_ledger(record)
-    assert record.status in _REAL_MODEL_TERMINAL
+    _require_published(record, "kol_selection_v3")
+    _require_published(record, "kol_analysis_v2")
 
 
 # --------------------------------------------------------------------------- #
@@ -700,25 +886,30 @@ async def test_uat_insight_drilldown_real() -> None:
         scenario="brand_analysis_parent",
         prompt="请分析最近一个月瑞幸咖啡的品牌声量和情感表现，并产出正式分析报告。",
     )
-    parent_version_id = None
-    if parent_record.artifact_versions:
-        parent_version_id = parent_record.artifact_versions[0]["artifact_id"]
-        # 需父 Version id 而非 artifact id；读取 DB 以获取实际 version id。
+    parent_record = await _answer_clarifications(
+        parent_record, scenario="brand_analysis_parent", answers=_BRAND_ANSWERS
+    )
+    await _assert_ledger(parent_record)
+    # Gate B：父品牌报告必须真实交付（不再允许 skip 通过）。
+    parent_artifact = _require_published(parent_record, "brand_report_v3")
+
+    # 需父 Version id 而非 artifact id；读取 DB 以获取实际 version id。
     db = SessionFactory()
     try:
         async with db:
-            if parent_version_id:
-                version_row = await db.scalar(
-                    select(AgentArtifactVersion)
-                    .where(AgentArtifactVersion.artifact_id == parent_version_id)
-                    .order_by(AgentArtifactVersion.version.desc())
-                )
-                parent_version_id = version_row.id if version_row else None
+            version_row = await db.scalar(
+                select(AgentArtifactVersion)
+                .where(AgentArtifactVersion.artifact_id == parent_artifact["artifact_id"])
+                .order_by(AgentArtifactVersion.version.desc())
+            )
+            parent_version_id = version_row.id if version_row else None
     finally:
         await db.close()
-
     if not parent_version_id:
-        pytest.skip("父品牌分析未发布 Artifact，无法执行钻取场景")
+        pytest.fail(
+            f"insight_drilldown: 父 Artifact {parent_artifact['artifact_id']} "
+            "已登记但读不到 Version 行"
+        )
 
     record = await _run_scenario(
         scenario="insight_drilldown",
@@ -727,22 +918,136 @@ async def test_uat_insight_drilldown_real() -> None:
             "按平台和情感维度做一次钻取，关注声量峰值的平台分布与正面情感占比。"
         ),
     )
+    record = await _answer_clarifications(
+        record,
+        scenario="insight_drilldown",
+        answers=("基于父报告数据直接钻取，平台维度按小红书/抖音拆分，请直接产出洞察看板。",),
+    )
     await _assert_ledger(record)
-    assert record.status in _REAL_MODEL_TERMINAL
+    _require_published(record, "insight_board_v1")
 
 
 # --------------------------------------------------------------------------- #
-# 场景 6：达人详情缓存、主页和 5 条热帖（kol_detail_v2 + cache）
+# 场景 6：达人详情真实 fetch（kol_detail_v2 发布 + 缓存回填）与缓存命中
 # --------------------------------------------------------------------------- #
+
+
+async def test_uat_kol_detail_real_fetch() -> None:
+    """真实 fetch 路径（Gate B §8.4.6）：缓存未命中 → kol_detail_v1 Run 真实抓取
+    → 发布 kol_detail_v2 → 回填缓存；同会话再次请求必须命中缓存且零新增调用。
+
+    引擎与生产 kol-details 路由同一装配（``AgentToolRegistryFactory`` + Agent 传输 +
+    按用户真实渠道权限注入）。DataTap 无法解析该达人或 Run 未交付时，按卡点
+    显式 FAIL，不放宽为缓存合成路径。
+    """
+    from app.agent_runtime.kol_detail import KolDetailRunFailed, KolDetailRunService
+
+    platform, kol_uid = "xiaohongshu", "李佳琦Austin"
+    db = SessionFactory()
+    try:
+        async with db as session:
+            user, agent_session, _wallet = await _new_user_session_wallet(
+                session, scenario="kol_detail_fetch", balance=1000
+            )
+            await session.commit()  # 服务内部协调事务会自行提交，主体行先行持久化
+            engine = _build_engine(
+                session,
+                registry=_build_registry(session),
+                gateway=AgentModelGateway(get_model_adapter(), db=session),
+                channel_permissions=await load_channel_permissions(session, user.id),
+            )
+            service = KolDetailRunService(session, engine=engine, worker_id=WORKER_ID)
+
+            record = ScenarioRecord(
+                scenario="kol_detail_fetch",
+                prompt_tag=f"真实 fetch {platform}/{kol_uid}",
+                profile="kol_detail_v1",
+                run_id="",
+                status="running",
+                decision_count=0,
+                points_before=1000,
+                points_after=1000,
+                user_id=user.id,
+                session_id=agent_session.id,
+            )
+            _ALL_RECORDS.append(record)
+            _dump_results()
+
+            try:
+                summary = await service.create(user.id, agent_session.id, platform, kol_uid)
+            except KolDetailRunFailed as exc:
+                run_id = await session.scalar(
+                    select(AgentRun.id)
+                    .where(AgentRun.session_id == agent_session.id)
+                    .order_by(AgentRun.created_at.desc())
+                    .limit(1)
+                )
+                if run_id is not None:
+                    record.run_id = run_id
+                    run_row = await session.get(AgentRun, run_id)
+                    record.status = str(run_row.status) if run_row else "undelivered"
+                    await _collect_run_record(session, run_id, record)
+                record.points_after = (await session.get(Wallet, user.id)).balance
+                await session.commit()
+                pytest.fail(
+                    f"kol_detail 真实 fetch 未交付 kol_detail_v2（{platform}/{kol_uid}）：{exc}"
+                )
+
+            run_row = await session.get(AgentRun, summary.run_id)
+            record.run_id = summary.run_id or ""
+            record.status = str(run_row.status) if run_row else "unknown"
+            record.decision_count = run_row.decision_count if run_row else 0
+            record.points_after = (await session.get(Wallet, user.id)).balance
+
+            # 必须是缓存未命中的真实抓取：返回新 Run 且 detail 标记 hit=false。
+            assert summary.cached is False, "期望真实 fetch，实际命中缓存"
+            assert summary.run_id is not None
+            assert summary.detail is not None
+            assert summary.detail["data"]["cache"]["hit"] is False
+
+            await _collect_run_record(session, summary.run_id, record)
+
+            # 真实 MCP 抓取必须发生：kol_detail 工具至少一次 settled（10 分）。
+            mcp_calls = [call for call in record.calls if call.service != "internal"]
+            assert mcp_calls, "kol_detail 真实 fetch 未发生任何 MCP 调用"
+            assert any(
+                call.internal_tool_name == "kol_detail" and call.status == "settled"
+                for call in mcp_calls
+            ), f"kol_detail MCP 工具未成功抓取（calls={[c.to_dict() for c in mcp_calls]}）"
+            await _assert_ledger(record)
+            _require_published(record, "kol_detail_v2")
+
+            # 缓存回填：同会话再次请求命中缓存，且零新增工具调用。
+            session_call_count = await session.scalar(
+                select(func.count(AgentToolCall.id)).where(
+                    AgentToolCall.run_id.in_(
+                        select(AgentRun.id).where(AgentRun.session_id == agent_session.id)
+                    )
+                )
+            )
+            second = await service.create(user.id, agent_session.id, platform, kol_uid)
+            assert second.cached is True, "真实 fetch 后缓存未回填"
+            assert second.detail is not None
+            assert second.detail["data"]["cache"]["hit"] is True
+            assert second.run_id is None, "缓存命中不应创建新 Run"
+            session_call_count_after = await session.scalar(
+                select(func.count(AgentToolCall.id)).where(
+                    AgentToolCall.run_id.in_(
+                        select(AgentRun.id).where(AgentRun.session_id == agent_session.id)
+                    )
+                )
+            )
+            assert session_call_count_after == session_call_count, "缓存命中产生了新调用"
+            await session.commit()
+    finally:
+        await db.close()
 
 
 async def test_uat_kol_detail_cache_real() -> None:
-    """达人详情缓存：确定性验证 24h Session 级缓存命中。
+    """达人详情缓存：确定性验证 24h Session 级缓存命中（合成 payload，不调模型/MCP）。
 
-    限制说明（真实 fetch 路径）：``kol_detail_v1`` Profile 只允许
-    ``{KOL_DETAIL_TOOLS, ARTIFACT_TOOLS}``，而真实 ``kol_detail`` MCP 工具以
-    ``MCP_TOOLS`` 分类注册，因此生产接线无法让 kol_detail_v1 触达该 MCP 工具
-    （见 test_profiles.test_kol_detail_tool_categories）——此差异如实记录为 limitation。
+    真实 fetch 路径由 ``test_uat_kol_detail_real_fetch`` 覆盖；本用例只确定性
+    验证缓存命中重建语义（``data.cache.hit=true``、payload 原样还原）。
     """
     from app.agent_artifacts.builders.kol_detail import build_kol_detail_draft
     from app.agent_runtime.kol_detail import KolDetailRunService
@@ -817,9 +1122,8 @@ async def test_uat_kol_detail_cache_real() -> None:
                 decision_count=0,
                 points_before=1000,
                 points_after=(await session.get(Wallet, user.id)).balance,
-            )
-            record.limitations.append(
-                "kol_detail_v1 Profile 未允许 MCP_TOOLS，生产接线无法触达真实 kol_detail MCP 工具"
+                user_id=user.id,
+                session_id=agent_session.id,
             )
             _ALL_RECORDS.append(record)
             await session.commit()
@@ -840,7 +1144,9 @@ async def test_uat_tool_failure_does_not_stop_run() -> None:
     """
     from app.agent_runtime.schemas import CallTool, Complete
 
-    injected = FaultInjectingTransport(get_mcp_transport(), fail_tool="social_statistic_trend")
+    injected = FaultInjectingTransport(
+        get_agent_mcp_transport(), fail_tool="social_statistic_trend"
+    )
 
     class ScriptedTrendGateway:
         def __init__(self) -> None:
@@ -884,7 +1190,7 @@ async def test_uat_tool_failure_does_not_stop_run() -> None:
                 visibility="user",
                 profile_name="session_analyst_v1",
                 profile_version="v1",
-                model="glm-5.2",
+                model=get_settings().tencent_plan_model,
                 status="queued",
                 decision_count=0,
                 review_count=0,
@@ -1117,7 +1423,7 @@ async def test_uat_reviewer_revise_then_fix() -> None:
                 visibility="user",
                 profile_name="session_analyst_v1",
                 profile_version="v1",
-                model="glm-5.2",
+                model=get_settings().tencent_plan_model,
                 status="queued",
                 decision_count=0,
                 review_count=0,
