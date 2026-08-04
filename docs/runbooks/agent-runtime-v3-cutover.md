@@ -15,7 +15,7 @@
 
 | 检查项 | 状态 |
 |---|---|
-| 代码与测试（迁移 0027 + 运行时 + 前端 + E2E） | ✅ 已完成，全量验证矩阵通过（见 §4） |
+| 代码与测试（迁移 0027–0029 + 运行时 + 前端 + E2E） | ✅ 已完成，全量验证矩阵通过（见 §4） |
 | 真实模型 + 真实 DataTap UAT（Task 26） | ⚠️ 已执行，运行时机制部分验证；阻断项 1 已修复待复核，**仍存 1 个阻断项**（见 §1） |
 | 生产切档 | ⛔ **禁止**——阻断项未解决前不得执行 §3 步骤 |
 
@@ -94,7 +94,9 @@
 > 前置：§1 两个阻断项已解决并复跑真实 UAT 通过；设计 §19 阻断条件逐条核实无命中。
 
 1. **测试库迁移**：在独立测试库（`kol_insight_test`）执行
-   `cd backend && APP_ENV=test .venv/bin/alembic upgrade head`，确认到 `0027_agent_runtime_v3`；
+   `cd backend && APP_ENV=test .venv/bin/alembic upgrade head`，确认到 head
+   `0029_agent_run_created_at`（v3 迁移链 0027_agent_runtime_v3 → 0028_agent_artifact_read_states
+   → 0029 顺序应用）；
    全量 pytest（含 `test_legacy_routes_removed.py` 的旧路由 404 断言）通过。
 2. **生产备份**：切换前对生产库执行完整备份（含全部旧表——它们要在回滚时恢复读取），
    并记录备份文件路径与时间戳；同时备份 `/home/kol_insight/` 下的 `backend/.env`。
@@ -119,7 +121,9 @@
   重启服务（旧执行路由随之恢复）→ 旧 Agent 新表保留用于排障但不再写入 → 运行只读健康检查
   与 focused 回归（租约、积分、版本门控）→ 开放任务。
 - 数据库迁移只按 Alembic 的可逆 downgrade 执行；**不要**手工删除账本、调用记录、Evidence、
-  Artifact 或会话历史。新表未被写入时可直接 downgrade 0027；已写入则保留新表、仅回滚应用版本，
+  Artifact 或会话历史。新表未被写入时可直接整体回滚 v3 迁移链——
+  `alembic downgrade 0026_brand_report_v2_payload`（逐版本回滚 0029 → 0028 → 0027，
+  回到 v3 之前的 0026）；已写入则保留新表、仅回滚应用版本，
   由后续排障决定清理。
 - 稳定运行并经用户单独批准后，才可另立**清理迁移**物理删除旧会话、任务、Goal、报告、旧 Artifact、
   旧 MCP/Quick 状态表。清理前必须再次备份并列出准确表名，**不得**在首次切换迁移中隐式删除。

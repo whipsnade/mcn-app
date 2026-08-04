@@ -15,6 +15,7 @@ from io import BytesIO
 from uuid import uuid4
 
 from openpyxl import load_workbook
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_artifacts.models import (
@@ -164,6 +165,58 @@ async def _add_artifact_event(
     await db.flush()
 
 
+async def _add_published_version(
+    db: AsyncSession, artifact: AgentArtifact, *, version: int, payload: dict
+) -> AgentArtifactVersion:
+    """给已有 Artifact 追加一个已发布 Version（新 revision + version，latest_version 前进）。"""
+    payload = _json_safe(payload)
+    now = utc_now()
+    first = await db.scalar(
+        select(AgentArtifactVersion).where(
+            AgentArtifactVersion.artifact_id == artifact.id,
+            AgentArtifactVersion.version == 1,
+        )
+    )
+    assert first is not None
+    draft = await db.scalar(
+        select(ArtifactDraft).where(ArtifactDraft.artifact_id == artifact.id)
+    )
+    assert draft is not None
+    revision = ArtifactDraftRevision(
+        id=str(uuid4()),
+        draft_id=draft.id,
+        artifact_id=artifact.id,
+        run_id=first.source_run_id,
+        revision=version,
+        schema_version=artifact.artifact_type,
+        payload_json=payload,
+        evidence_refs_json=[],
+        parent_artifact_version_id=first.id,
+        payload_hash="h",
+        created_at=now,
+    )
+    db.add(revision)
+    await db.flush()  # revision 先落库，version.source_draft_revision_id 才有目标
+    row = AgentArtifactVersion(
+        id=str(uuid4()),
+        artifact_id=artifact.id,
+        version=version,
+        source_run_id=first.source_run_id,
+        source_draft_revision_id=revision.id,
+        parent_artifact_version_id=first.id,
+        schema_version=artifact.artifact_type,
+        payload_json=payload,
+        evidence_refs_json=[],
+        review_json=None,
+        data_status="complete",
+        created_at=now,
+    )
+    db.add(row)
+    artifact.latest_version = version
+    await db.flush()
+    return row
+
+
 # ---------------------------------------------------------------------------
 # 列表 / 详情 / 版本
 # ---------------------------------------------------------------------------
@@ -271,6 +324,43 @@ async def test_read_state_monotonic_max_and_sequence_validation(
     assert overshoot.status_code == 422
 
 
+async def test_get_read_states_returns_current_user_watermarks(
+    auth_client_factory, db_session
+) -> None:
+    """GET artifact-read-states 返回该会话当前用户全部模块水位（含空会话/跨会话隔离）。"""
+    client = await auth_client_factory("13700000013")
+    session_id = await _create_session(client)
+    other_session_id = await _create_session(client)
+    user_id = await _me_id(client)
+    artifact = await _make_published_artifact(db_session, user_id, session_id)
+    await _add_artifact_event(db_session, user_id, session_id, artifact.id, 1)
+    await _add_artifact_event(db_session, user_id, session_id, artifact.id, 2)
+
+    # 空会话（无任何水位写入）→ 空列表
+    empty = await client.get(f"/api/v1/agent/sessions/{other_session_id}/artifact-read-states")
+    assert empty.status_code == 200
+    assert empty.json() == []
+
+    await client.put(
+        f"/api/v1/agent/sessions/{session_id}/artifact-read-state",
+        json={"module": "brand", "last_seen_sequence": 2},
+    )
+    await client.put(
+        f"/api/v1/agent/sessions/{session_id}/artifact-read-state",
+        json={"module": "kol", "last_seen_sequence": 1},
+    )
+    # 同用户另一会话的水位不应混入
+    await client.put(
+        f"/api/v1/agent/sessions/{other_session_id}/artifact-read-state",
+        json={"module": "campaign", "last_seen_sequence": 0},
+    )
+
+    resp = await client.get(f"/api/v1/agent/sessions/{session_id}/artifact-read-states")
+    assert resp.status_code == 200
+    states = {item["module"]: item["last_seen_sequence"] for item in resp.json()}
+    assert states == {"brand": 2, "kol": 1}
+
+
 # ---------------------------------------------------------------------------
 # 导出
 # ---------------------------------------------------------------------------
@@ -293,6 +383,83 @@ async def test_export_supported_type_returns_xlsx(auth_client_factory, db_sessio
     assert resp.content[:2] == b"PK"
     wb = load_workbook(BytesIO(resp.content))
     assert "综合概览" in wb.sheetnames
+
+
+async def test_export_explicit_version_returns_that_version(
+    auth_client_factory, db_session
+) -> None:
+    """?version=N 导出指定历史版本；不传时保持最新版本语义。"""
+    client = await auth_client_factory("13700000014")
+    session_id = await _create_session(client)
+    user_id = await _me_id(client)
+
+    payload_v1 = build_brand_dict()
+    payload_v1["scope"]["brand"] = "旧品牌"
+    artifact = await _make_published_artifact(
+        db_session, user_id, session_id, payload=payload_v1
+    )
+    payload_v2 = build_brand_dict()
+    payload_v2["scope"]["brand"] = "新品牌"
+    await _add_published_version(db_session, artifact, version=2, payload=payload_v2)
+
+    # 不传 version → 最新版本（v2）
+    latest = await client.get(f"/api/v1/agent/artifacts/{artifact.id}/export")
+    assert latest.status_code == 200
+    assert "_v2.xlsx" in latest.headers["content-disposition"]
+    assert "新品牌" in load_workbook(BytesIO(latest.content))["综合概览"]["A1"].value
+
+    # 显式 version=1 → 历史版本内容
+    historical = await client.get(
+        f"/api/v1/agent/artifacts/{artifact.id}/export", params={"version": 1}
+    )
+    assert historical.status_code == 200
+    assert "_v1.xlsx" in historical.headers["content-disposition"]
+    assert "旧品牌" in load_workbook(BytesIO(historical.content))["综合概览"]["A1"].value
+
+    # 显式 version=2 → 与最新一致
+    explicit = await client.get(
+        f"/api/v1/agent/artifacts/{artifact.id}/export", params={"version": 2}
+    )
+    assert explicit.status_code == 200
+    assert "新品牌" in load_workbook(BytesIO(explicit.content))["综合概览"]["A1"].value
+
+
+async def test_export_unknown_version_returns_404(auth_client_factory, db_session) -> None:
+    """导出指定版本不存在 → 404（沿用归属失败统一 404 惯例，不区分归属/版本缺失）。"""
+    client = await auth_client_factory("13700000015")
+    session_id = await _create_session(client)
+    user_id = await _me_id(client)
+    artifact = await _make_published_artifact(
+        db_session, user_id, session_id, payload=build_brand_dict()
+    )
+
+    resp = await client.get(
+        f"/api/v1/agent/artifacts/{artifact.id}/export", params={"version": 99}
+    )
+    assert resp.status_code == 404
+
+
+async def test_export_unsupported_type_with_explicit_version_still_conflicts(
+    auth_client_factory, db_session
+) -> None:
+    """显式版本存在但类型不支持导出 → 仍为 409 ARTIFACT_EXPORT_UNSUPPORTED。"""
+    client = await auth_client_factory("13700000016")
+    session_id = await _create_session(client)
+    user_id = await _me_id(client)
+    unsupported = await _make_published_artifact(
+        db_session,
+        user_id,
+        session_id,
+        module="kol",
+        artifact_type="kol_detail_v2",
+        artifact_key="kol-detail:x:v",
+    )
+
+    resp = await client.get(
+        f"/api/v1/agent/artifacts/{unsupported.id}/export", params={"version": 1}
+    )
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == "ARTIFACT_EXPORT_UNSUPPORTED"
 
 
 async def test_export_unsupported_type_conflicts(auth_client_factory, db_session) -> None:
@@ -384,6 +551,11 @@ async def test_artifact_ownership_isolation_returns_404(
     assert (
         await bob.get(f"/api/v1/agent/artifacts/{artifact.id}/export")
     ).status_code == 404
+    assert (
+        await bob.get(
+            f"/api/v1/agent/artifacts/{artifact.id}/export", params={"version": 1}
+        )
+    ).status_code == 404
 
     # read-state 归属失败 → 404（不泄露会话存在）
     assert (
@@ -391,6 +563,10 @@ async def test_artifact_ownership_isolation_returns_404(
             f"/api/v1/agent/sessions/{session_id}/artifact-read-state",
             json={"module": "brand", "last_seen_sequence": 1},
         )
+    ).status_code == 404
+    # 水位查询归属失败 → 404（不泄露会话存在与其他用户水位）
+    assert (
+        await bob.get(f"/api/v1/agent/sessions/{session_id}/artifact-read-states")
     ).status_code == 404
 
 

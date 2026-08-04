@@ -18,7 +18,12 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_artifacts.exporters import ArtifactExportUnsupported, export_artifact
-from app.agent_artifacts.models import AgentArtifact, AgentArtifactVersion, ArtifactEvent
+from app.agent_artifacts.models import (
+    AgentArtifact,
+    AgentArtifactReadState,
+    AgentArtifactVersion,
+    ArtifactEvent,
+)
 from app.agent_artifacts.service import ArtifactService
 from app.agent_runtime.models import AgentSession
 from app.db.session import get_db
@@ -210,6 +215,33 @@ async def set_artifact_read_state(
     return ArtifactReadStateRead(module=payload.module, last_seen_sequence=new_sequence)
 
 
+@router.get(
+    "/sessions/{session_id}/artifact-read-states",
+    response_model=list[ArtifactReadStateRead],
+)
+async def list_artifact_read_states(
+    session_id: str,
+    user: CurrentUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> list[ArtifactReadStateRead]:
+    """返回该会话当前用户的全部模块已读水位，供前端初始化（刷新/切换会话）。"""
+    await _get_owned_session(db, user.id, session_id)
+    rows = (
+        await db.scalars(
+            select(AgentArtifactReadState)
+            .where(
+                AgentArtifactReadState.user_id == user.id,
+                AgentArtifactReadState.session_id == session_id,
+            )
+            .order_by(AgentArtifactReadState.module)
+        )
+    ).all()
+    return [
+        ArtifactReadStateRead(module=row.module, last_seen_sequence=row.last_seen_sequence)
+        for row in rows
+    ]
+
+
 # --------------------------------------------------------------------------- #
 # 导出
 # --------------------------------------------------------------------------- #
@@ -220,27 +252,40 @@ async def export_artifact_xlsx(
     artifact_id: str,
     user: CurrentUser,
     db: Annotated[AsyncSession, Depends(get_db)],
+    version: int | None = Query(default=None, ge=1),
 ) -> StreamingResponse:
     # 导出器在内存中构建整个 .xlsx bytes（export_artifact 返回 bytes）再以
     # StreamingResponse 单块下发；对超大 payload 会占内存，但导出是低频表现层能力。
     artifact = await _get_owned_artifact(db, user.id, artifact_id)
-    version = await db.scalar(
-        select(AgentArtifactVersion)
-        .where(AgentArtifactVersion.artifact_id == artifact.id)
-        .order_by(AgentArtifactVersion.version.desc())
-        .limit(1)
-    )
     if version is None:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT, detail="ARTIFACT_EXPORT_UNSUPPORTED"
+        # 缺省保持最新版本语义
+        version_row = await db.scalar(
+            select(AgentArtifactVersion)
+            .where(AgentArtifactVersion.artifact_id == artifact.id)
+            .order_by(AgentArtifactVersion.version.desc())
+            .limit(1)
         )
+        if version_row is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail="ARTIFACT_EXPORT_UNSUPPORTED"
+            )
+    else:
+        # 显式版本：不存在 → 404（与 get_artifact_version 一致，不区分归属/版本缺失）
+        version_row = await db.scalar(
+            select(AgentArtifactVersion).where(
+                AgentArtifactVersion.artifact_id == artifact.id,
+                AgentArtifactVersion.version == version,
+            )
+        )
+        if version_row is None:
+            raise _not_found("artifact_version_not_found")
     try:
-        content = export_artifact(version)
+        content = export_artifact(version_row)
     except ArtifactExportUnsupported as error:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail=error.code
         ) from error
-    filename = f"{_sanitize_filename(artifact.artifact_type)}_v{version.version}.xlsx"
+    filename = f"{_sanitize_filename(artifact.artifact_type)}_v{version_row.version}.xlsx"
     return StreamingResponse(
         iter([content]),
         media_type=_XLSX_MEDIA_TYPE,
