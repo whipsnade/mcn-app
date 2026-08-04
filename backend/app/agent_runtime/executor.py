@@ -25,6 +25,12 @@ in-flight Run 会在事务安全点自然完成；超时则取消循环任务，
 running/reviewing Run 是"API 写入取消后进程崩溃"的残留——不恢复模型执行，
 直接释放 Draft working head 并经终态事务边界收口 cancelled（恰好一个
 ``run.cancelled``），避免永久卡在中间态并阻塞会话后续任务。
+
+**Utility 终态触发**（§6.4）：用户主 Run（session_analyst_v1）到达终态/
+澄清等待（completed/failed/cancelled/clarification_requested）且 settle
+成功后，异步 best-effort 触发 run_summary + suggestions（fire-and-forget，
+不侵入 settle_terminal 事务边界，失败不影响 Run 状态与事件流）；内部 Run
+与 kol_detail_v1 等辅助 Run 不触发。
 """
 
 from __future__ import annotations
@@ -46,8 +52,23 @@ from app.agent_runtime.reviewer import release_run_drafts
 from app.agent_runtime.state import TERMINAL_RUN_STATUSES, RunStatus
 from app.agent_runtime.tools.factory import load_channel_permissions
 from app.agent_runtime.transcript import RunTranscriptLoader
+from app.agent_runtime.utility import UtilityDispatcher
 
 logger = logging.getLogger(__name__)
+
+# 会话主分析 Run 的 Profile：Task 19 messages 建 Run 与 Utility 终态触发都用
+# 它识别「用户主 Run」；kol_detail_v1 等辅助 Profile 不算。
+SESSION_ANALYST_PROFILE = "session_analyst_v1"
+
+# Utility 触发状态（§6.4）：终态 + 澄清等待；paused 不触发（Run 未收口）。
+_UTILITY_TRIGGER_STATUSES = frozenset(
+    {
+        RunStatus.COMPLETED,
+        RunStatus.FAILED,
+        RunStatus.CANCELLED,
+        RunStatus.CLARIFICATION_REQUESTED,
+    }
+)
 
 
 class AgentRunExecutor:
@@ -70,6 +91,7 @@ class AgentRunExecutor:
         lease_seconds: int = 300,
         claim_interval_seconds: float = 1.0,
         broker: AgentEventBroker | None = None,
+        utility_dispatcher: UtilityDispatcher | None = None,
     ) -> None:
         if lease_seconds <= 0:
             raise ValueError("lease_seconds_must_be_positive")
@@ -82,6 +104,8 @@ class AgentRunExecutor:
         # SSE 订阅才能即时收到 executor 补发的 run.failed；缺省独立 broker
         # （测试注入）时事件仍持久化，跨实例 reader 靠 DB 轮询兜底。
         self._broker = broker if broker is not None else AgentEventBroker()
+        # §6.4：Run 终态后的 best-effort utility 触发器；None（窄装配）时跳过。
+        self._utility_dispatcher = utility_dispatcher
         self._stop = asyncio.Event()
         self._wake = asyncio.Event()
         self._loop_task: asyncio.Task[None] | None = None
@@ -210,6 +234,9 @@ class AgentRunExecutor:
                 resumed_by=resumed_by,
             )
             await db.commit()
+            # §6.4：settle 已成功提交后再异步触发 utility（summary/suggestions），
+            # 不侵入 settle_terminal 事务边界。
+            self._schedule_run_utilities(run, outcome.status)
             return outcome.status
         except asyncio.CancelledError:
             # 关闭/取消：不强行收口，交给恢复循环在租约过期后接管。
@@ -220,6 +247,11 @@ class AgentRunExecutor:
             await db.rollback()
             await self._finalize_failed(db, run_id, worker_id)
             await db.commit()
+            # 兜底收口成功（或引擎已自行收口终态）时同样触发 utility；收口被
+            # 他人租约拦截（A4）时 Run 仍非终态，门控自然跳过。
+            settled = await db.get(AgentRun, run_id)
+            if settled is not None:
+                self._schedule_run_utilities(settled, RunStatus(settled.status))
             return RunStatus.FAILED
 
     async def _find_claimable_id(self, db: AsyncSession) -> str | None:
@@ -398,7 +430,28 @@ class AgentRunExecutor:
         event = await AgentEventStream(db, self._broker).settle_terminal(
             run.id, run.user_id, RunStatus.CANCELLED, {}
         )
+        if event is not None:
+            # §6.4：取消收口成功后 best-effort 触发 utility（幂等后到者不触发）。
+            self._schedule_run_utilities(run, RunStatus.CANCELLED)
         return event is not None
+
+    def _schedule_run_utilities(self, run: AgentRun, status: RunStatus) -> None:
+        """Run 终态后的 best-effort utility 触发（§6.4）：run_summary + suggestions。
+
+        只触发用户主分析 Run（run_kind/visibility=user 且
+        profile=session_analyst_v1）：内部 Run（Utility/Reviewer）与
+        kol_detail_v1 等辅助 Run 不触发。触发是 fire-and-forget 异步任务，
+        任何失败不影响 Run 状态与事件流。
+        """
+        if self._utility_dispatcher is None or status not in _UTILITY_TRIGGER_STATUSES:
+            return
+        if (
+            run.run_kind != "user"
+            or run.visibility != "user"
+            or run.profile_name != SESSION_ANALYST_PROFILE
+        ):
+            return
+        self._utility_dispatcher.schedule_run_followups(run_id=run.id)
 
     async def _finalize_failed(
         self, db: AsyncSession, run_id: str, worker_id: str

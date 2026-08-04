@@ -25,13 +25,14 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_runtime.events import AgentEventBroker, AgentEventStream
-from app.agent_runtime.executor import AgentRunExecutor
-from app.agent_runtime.kol_detail import KolDetailRunService
+from app.agent_runtime.executor import SESSION_ANALYST_PROFILE, AgentRunExecutor
+from app.agent_runtime.kol_detail import KolDetailRunService, KolDetailSelectionRefNotFound
 from app.agent_runtime.models import AgentMessage, AgentRun, AgentSession
 from app.agent_runtime.repository import AgentRunRepository, utc_now
 from app.agent_runtime.sse import sse_event_chunks
 from app.agent_runtime.state import InvalidRunTransition, RunStatus
 from app.agent_runtime.tools.factory import load_channel_permissions
+from app.agent_runtime.utility import UtilityDispatcher
 from app.core.config import get_settings
 from app.db.session import get_db
 from app.identity.dependencies import CurrentUser
@@ -48,8 +49,6 @@ _IMMEDIATE_CANCEL_STATUSES = frozenset(
     {RunStatus.QUEUED, RunStatus.PAUSED, RunStatus.CLARIFICATION_REQUESTED}
 )
 _REQUEST_CANCEL_STATUSES = frozenset({RunStatus.RUNNING, RunStatus.REVIEWING})
-
-SESSION_ANALYST_PROFILE = "session_analyst_v1"
 
 
 # --------------------------------------------------------------------------- #
@@ -162,6 +161,11 @@ def get_agent_executor(request: Request) -> AgentRunExecutor:
 
 def get_agent_event_broker(request: Request) -> AgentEventBroker:
     return request.app.state.agent_event_broker
+
+
+def get_utility_dispatcher(request: Request) -> UtilityDispatcher | None:
+    """Utility 触发器（§6.4）；窄装配未注册 app.state 时返回 None，触发跳过。"""
+    return getattr(request.app.state, "agent_utility_dispatcher", None)
 
 
 async def get_kol_detail_service(
@@ -404,6 +408,7 @@ async def append_message(
     user: CurrentUser,
     db: Annotated[AsyncSession, Depends(get_db)],
     executor: Annotated[AgentRunExecutor, Depends(get_agent_executor)],
+    utility_dispatcher: Annotated[UtilityDispatcher | None, Depends(get_utility_dispatcher)],
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> MessageRunResponse:
     # 以「锁 Session 行」串行化同一 Session 的并发 messages：MySQL 没有部分唯一
@@ -492,6 +497,11 @@ async def append_message(
 
     await db.commit()
     executor.submit(run.id)
+    # §6.4：会话首条用户消息（此前会话无任何消息）提交并成功建 Run 后
+    # best-effort 生成标题；重命名保护在 UtilityRunner 内（只覆盖系统默认
+    # 「新会话N」标题），失败只记 warning，不影响本响应。
+    if max_sequence is None and utility_dispatcher is not None:
+        utility_dispatcher.schedule_session_title(session_id=session_id, user_id=user.id)
     return MessageRunResponse(
         run_id=run.id,
         session_id=session_id,
@@ -521,6 +531,7 @@ async def cancel_run(
     user: CurrentUser,
     db: Annotated[AsyncSession, Depends(get_db)],
     broker: Annotated[AgentEventBroker, Depends(get_agent_event_broker)],
+    utility_dispatcher: Annotated[UtilityDispatcher | None, Depends(get_utility_dispatcher)],
 ) -> AgentRunRead:
     """取消 Run（§5.5）：queued/paused/clarification 立即迁移 cancelled 并写
     恰好一个 ``run.cancelled`` 终态事件；running/reviewing 只写
@@ -531,13 +542,24 @@ async def cancel_run(
     run = await _get_owned_run(db, user.id, run_id)
     repo = AgentRunRepository(db)
     current = RunStatus(run.status)
+    settled_immediately = False
     if current in _IMMEDIATE_CANCEL_STATUSES:
         await AgentEventStream(db, broker).settle_terminal(
             run.id, user.id, RunStatus.CANCELLED, {}
         )
+        settled_immediately = True
     elif current in _REQUEST_CANCEL_STATUSES:
         await repo.request_cancel(run.id, user.id)
     await db.commit()
+    # §6.4：立即取消不经过 executor，主分析 Run 的终态 utility（run_summary +
+    # suggestions）在这里 best-effort 触发；kol_detail_v1 等辅助 Run 不触发；
+    # running/reviewing 的 request_cancel 由 Engine/executor 收口时在那一侧触发。
+    if (
+        settled_immediately
+        and utility_dispatcher is not None
+        and run.profile_name == SESSION_ANALYST_PROFILE
+    ):
+        utility_dispatcher.schedule_run_followups(run_id=run.id)
     return AgentRunRead.model_validate(run)
 
 
@@ -623,14 +645,18 @@ async def create_kol_detail(
     service: Annotated[KolDetailRunService, Depends(get_kol_detail_service)],
 ) -> KolDetailResponse:
     await _get_owned_session(db, user.id, session_id)
-    summary = await service.create(
-        user.id,
-        session_id,
-        payload.platform,
-        payload.kol_uid,
-        selection_artifact_id=payload.selection_artifact_id,
-        selection_version=payload.selection_version,
-    )
+    try:
+        summary = await service.create(
+            user.id,
+            session_id,
+            payload.platform,
+            payload.kol_uid,
+            selection_artifact_id=payload.selection_artifact_id,
+            selection_version=payload.selection_version,
+        )
+    except KolDetailSelectionRefNotFound as error:
+        # §6.4/§7：selection 引用归属校验失败统一 404，不泄漏资源存在性。
+        raise _not_found("kol_selection_not_found") from error
     await db.commit()
     return KolDetailResponse(
         run_id=summary.run_id,

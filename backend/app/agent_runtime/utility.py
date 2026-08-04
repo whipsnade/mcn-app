@@ -12,17 +12,27 @@
 
 Utility 是 best-effort 后台任务：任何失败只把内部 Run 收口为 failed 并记日志，
 绝不改变父 Run 的状态 / outcome。
+
+生产接线（§6.4）由 ``UtilityDispatcher`` 承担：``POST messages`` 首条用户消息
+提交后触发 ``schedule_session_title``；executor 在用户主 Run 终态 settle 成功
+后触发 ``schedule_run_followups``。每个触发是 fire-and-forget 的 asyncio 任务
+（独立 DB Session），与 executor 同一生命周期语义：``start`` 前 schedule 安全
+空转（窄装配/测试不启动，绝不泄露真实模型调用），``stop`` 拒绝新触发并等待
+在途任务完成。
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+from collections.abc import Callable
+from contextlib import AbstractAsyncContextManager
 from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, RootModel, TypeAdapter, model_validator
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_artifacts.models import AgentArtifact, AgentArtifactVersion
@@ -104,7 +114,16 @@ class UtilityRunner:
     async def generate_session_title(
         self, *, session_id: str, user_id: str
     ) -> str | None:
-        """生成会话标题并写入 ``agent_sessions.title``。"""
+        """生成会话标题并写入 ``agent_sessions.title``。
+
+        重命名保护（§6.4）：只覆盖系统默认标题（``新会话%``）；标题已被用户
+        改过（或创建时自定义）时直接返回 ``None``，不浪费模型调用。写入用
+        条件 UPDATE 原子复核当前标题仍是默认值，模型调用期间发生的并发
+        重命名不会被覆盖。
+        """
+        session = await self._db.get(AgentSession, session_id)
+        if session is None or not session.title.startswith("新会话"):
+            return None
         try:
             decision = await self._run_utility(
                 task="session_title", session_id=session_id, user_id=user_id, parent_run=None
@@ -114,10 +133,14 @@ class UtilityRunner:
             return None
         if decision is None or not decision.title:
             return None
-        session = await self._db.get(AgentSession, session_id)
-        if session is None:
+        result = await self._db.execute(
+            update(AgentSession)
+            .where(AgentSession.id == session_id, AgentSession.title.like("新会话%"))
+            .values(title=decision.title, updated_at=utc_now())
+        )
+        if result.rowcount == 0:
+            # 并发重命名竞态：标题已不再是默认值，放弃覆盖。
             return None
-        session.title = decision.title
         await self._db.flush()
         return decision.title
 
@@ -366,6 +389,97 @@ class UtilityRunner:
         ]
 
 
+class UtilityDispatcher:
+    """Utility 后台任务的 best-effort 触发器（§6.4 生产接线）。
+
+    接线点：``POST /agent/sessions/{id}/messages`` 首条用户消息提交后触发
+    ``schedule_session_title``；executor 在用户主 Run（session_analyst_v1）
+    终态 settle 成功后触发 ``schedule_run_followups``（run_summary +
+    suggestions）。
+
+    每个触发是 fire-and-forget 的 asyncio 任务：独立 DB Session 打开/提交，
+    任何失败只记日志，绝不侵入 ``settle_terminal`` 事务边界、不影响父 Run
+    状态与事件流。与 executor 同一生命周期语义：``start`` 之前 schedule
+    安全空转（窄路由测试不启动 dispatcher，不会泄露真实模型/DB 调用）；
+    ``stop`` 拒绝新触发并等待在途任务完成。
+    """
+
+    def __init__(
+        self,
+        *,
+        session_factory: Callable[[], AbstractAsyncContextManager[AsyncSession]],
+        runner_factory: Callable[[AsyncSession], UtilityRunner],
+    ) -> None:
+        self._session_factory = session_factory
+        self._runner_factory = runner_factory
+        self._started = False
+        self._tasks: set[asyncio.Task[None]] = set()
+
+    def start(self) -> None:
+        """开始接受触发（幂等；生产在 lifespan 启动时调用）。"""
+        self._started = True
+
+    async def stop(self) -> None:
+        """拒绝新触发并等待在途任务完成（优雅关闭）。"""
+        self._started = False
+        await self.wait_idle()
+
+    def schedule_session_title(
+        self, *, session_id: str, user_id: str
+    ) -> asyncio.Task[None] | None:
+        """首条用户消息提交后触发标题生成；未启动时安全空转返回 None。"""
+        if not self._started:
+            return None
+        return self._spawn(self._session_title_job(session_id=session_id, user_id=user_id))
+
+    def schedule_run_followups(self, *, run_id: str) -> asyncio.Task[None] | None:
+        """用户主 Run 终态后触发 run_summary + suggestions；未启动时安全空转。"""
+        if not self._started:
+            return None
+        return self._spawn(self._run_followups_job(run_id=run_id))
+
+    async def wait_idle(self) -> None:
+        """等待当前所有已触发任务完成（测试与优雅关闭用）。"""
+        while self._tasks:
+            await asyncio.gather(*list(self._tasks), return_exceptions=True)
+
+    def _spawn(self, coro: Any) -> asyncio.Task[None]:
+        task = asyncio.create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._on_done)
+        return task
+
+    def _on_done(self, task: asyncio.Task[None]) -> None:
+        self._tasks.discard(task)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:  # 防御：job 内部已兜底，理论上不可达
+            logger.warning("utility background task failed: %s", error)
+
+    async def _session_title_job(self, *, session_id: str, user_id: str) -> None:
+        try:
+            async with self._session_factory() as db:
+                runner = self._runner_factory(db)
+                await runner.generate_session_title(session_id=session_id, user_id=user_id)
+                await db.commit()
+        except Exception:
+            logger.exception("utility session_title job failed for session %s", session_id)
+
+    async def _run_followups_job(self, *, run_id: str) -> None:
+        try:
+            async with self._session_factory() as db:
+                run = await db.get(AgentRun, run_id)
+                if run is None:
+                    return
+                runner = self._runner_factory(db)
+                await runner.generate_run_summary(run=run)
+                await runner.generate_suggestions(run=run)
+                await db.commit()
+        except Exception:
+            logger.exception("utility run followups job failed for run %s", run_id)
+
+
 __all__ = [
     "DEFAULT_ARTIFACT_DIRECTORY_CAP",
     "DEFAULT_MAX_CONTEXT_CHARS",
@@ -374,5 +488,6 @@ __all__ = [
     "UTILITY_DECISION_ROOT",
     "UTILITY_PROFILE_NAME",
     "UtilityDecision",
+    "UtilityDispatcher",
     "UtilityRunner",
 ]

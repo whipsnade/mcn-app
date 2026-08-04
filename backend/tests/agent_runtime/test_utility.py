@@ -53,7 +53,7 @@ async def _make_session_with_messages(db_session, user_factory, *, message_count
     session = AgentSession(
         id=str(uuid4()),
         user_id=user.id,
-        title="默认标题",
+        title="新会话1",
         status="active",
         created_at=now,
         updated_at=now,
@@ -203,6 +203,24 @@ async def test_session_title_updates_session(db_session, user_factory) -> None:
     assert internal.run_kind == "internal"
     assert internal.visibility == "internal"
     assert internal.profile_name == UTILITY_PROFILE_NAME
+
+
+async def test_session_title_not_overwritten_after_user_rename(db_session, user_factory) -> None:
+    """重命名保护（§6.4）：标题已不是系统默认「新会话N」时不得覆盖，
+    且不浪费模型调用（提前返回，不建内部 Run）。"""
+    session, user = await _make_session_with_messages(db_session, user_factory)
+    session.title = "用户自己改的名字"
+    await db_session.flush()
+    gateway = FakeUtilityGateway([{"task": "session_title", "title": "模型起的标题"}])
+    runner = _make_runner(db_session, gateway)
+
+    result = await runner.generate_session_title(session_id=session.id, user_id=user.id)
+
+    assert result is None
+    fresh = await db_session.get(AgentSession, session.id)
+    assert fresh.title == "用户自己改的名字"
+    assert gateway.calls == []
+    assert await _internal_run(db_session, parent_run_id=None) is None
 
 
 # ---------------------------------------------------------------------------
