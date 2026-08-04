@@ -359,14 +359,17 @@ async def test_create_draft_tool_returns_structured_invalid_result(
     )
     registry = ToolRegistry()
     registry.register(CreateDraftTool(db_session), category="artifact")
+    # H2 起五类强类型 schema 直写在更前置的 typed_artifact_requires_builder
+    # 护栏被拦（见 tests/agent_runtime/tools/test_artifacts.py）；本用例用
+    # insight_board_v1 继续覆盖 ArtifactPayloadInvalid → 结构化回喂路径。
     result = await registry.execute(
         internal_name="create_draft",
         arguments={
-            "module": "brand",
-            "schema_version": "brand_report_v3",
-            "artifact_type": "brand_report_v3",
-            "business_fields": {"brand": "瑞幸"},
-            "payload": {"data": {"overview": {"total_volume": 100}}},
+            "module": "insight",
+            "schema_version": "insight_board_v1",
+            "artifact_type": "insight_board_v1",
+            "business_fields": {"parent_artifact_version_id": "pv-1", "question": "为什么"},
+            "payload": {"bogus": True},
             "evidence_refs": [],
         },
         user_id=user.id,

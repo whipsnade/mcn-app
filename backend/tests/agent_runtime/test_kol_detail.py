@@ -56,7 +56,7 @@ from app.agent_runtime.reviewer import ReviewDecision, ReviewerDriver
 from app.agent_runtime.schemas import CallTool, SubmitReview
 from app.agent_runtime.state import RunStatus
 from app.agent_runtime.thinking import AgentEventThinkingSink
-from app.agent_runtime.tools.artifacts import CreateDraftTool
+from app.agent_runtime.tools.builders import BuildKolDetailDraftTool
 from app.agent_runtime.tools.contracts import ToolResult
 from app.agent_runtime.tools.registry import ToolRegistry
 from app.agent_runtime.transcript import RunTranscriptLoader
@@ -287,24 +287,11 @@ async def _make_evidence(db, user_id: str, session_id: str):
 
 
 def _make_actions(db, evidence, cache_state: dict[str, Any]) -> list[Any]:
-    """脚本化 kol_detail_v1 动作：抓取 → 创建 Draft（真实 builder）→ 提交复核。"""
-    build = build_kol_detail_draft(
-        platform=PLATFORM,
-        kol_uid=KOL_UID,
-        selection_artifact_id=None,
-        selection_version=None,
-        detail=DETAIL,
-        evidence_id=evidence.id,
-        cache_state=cache_state,
-    )
-    create_args = {
-        "module": build.module,
-        "schema_version": build.schema_version,
-        "artifact_type": build.artifact_type,
-        "business_fields": build.business_fields,
-        "payload": build.payload,
-        "evidence_refs": build.evidence_refs,
-    }
+    """脚本化 kol_detail_v1 动作：抓取 → build_kol_detail_draft → 提交复核。
+
+    H2 起 create_draft 对 kol_detail_v2 直写被 typed_artifact_requires_builder
+    护栏拒绝，脚本与生产语义一致走 Builder 工具。
+    """
 
     async def submit(run):
         draft = await db.scalar(
@@ -327,8 +314,13 @@ def _make_actions(db, evidence, cache_state: dict[str, Any]) -> list[Any]:
         ),
         CallTool(
             action="call_tool",
-            internal_tool_name="create_draft",
-            arguments=create_args,
+            internal_tool_name="build_kol_detail_draft",
+            arguments={
+                "platform": PLATFORM,
+                "kol_uid": KOL_UID,
+                "evidence_id": evidence.id,
+                "cache_state": cache_state,
+            },
             rationale="创建达人详情 Draft",
         ),
         submit,
@@ -339,7 +331,7 @@ def _make_service(db, *, actions: list[Any], evidence, now_fn, worker: str = "wo
     gateway = KolDetailFakeGateway(actions)
     registry = ToolRegistry()
     registry.register(FakeKolDetailFetchTool(evidence.id), category="kol_detail")
-    registry.register(CreateDraftTool(db), category="artifact")
+    registry.register(BuildKolDetailDraftTool(db), category="artifact")
     reviewer_gateway = ApprovingReviewerGateway()
     broker = AgentEventBroker()
     events = AgentEventStream(db, broker)
@@ -1229,17 +1221,8 @@ async def test_takeover_restores_kol_detail_trigger_context(db_session, user_fac
     attempt2 = await repo.begin_attempt(run.id, resumed=True)
     assert await repo.claim_lease(run.id, "worker", 300)
 
-    # 恢复后不重新抓取：直接 create_draft（复用既有 working head）→ submit。
-    build = build_kol_detail_draft(
-        platform=PLATFORM,
-        kol_uid=KOL_UID,
-        selection_artifact_id=None,
-        selection_version=None,
-        detail=DETAIL,
-        evidence_id=evidence.id,
-        cache_state=_cache_state(),
-    )
-
+    # 恢复后不重新抓取：直接 build_kol_detail_draft（复用既有 working head）→ submit。
+    # （H2：create_draft 对 kol_detail_v2 直写已被护栏拒绝，走 Builder 工具。）
     async def submit(resumed_run):
         draft = await db_session.scalar(
             select(ArtifactDraft).where(ArtifactDraft.owner_run_id == resumed_run.id)
@@ -1255,14 +1238,12 @@ async def test_takeover_restores_kol_detail_trigger_context(db_session, user_fac
     actions = [
         CallTool(
             action="call_tool",
-            internal_tool_name="create_draft",
+            internal_tool_name="build_kol_detail_draft",
             arguments={
-                "module": build.module,
-                "schema_version": build.schema_version,
-                "artifact_type": build.artifact_type,
-                "business_fields": build.business_fields,
-                "payload": build.payload,
-                "evidence_refs": build.evidence_refs,
+                "platform": PLATFORM,
+                "kol_uid": KOL_UID,
+                "evidence_id": evidence.id,
+                "cache_state": _cache_state(),
             },
             rationale="创建达人详情 Draft",
         ),

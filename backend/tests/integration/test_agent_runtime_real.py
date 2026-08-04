@@ -927,6 +927,11 @@ async def test_uat_insight_drilldown_real() -> None:
             f"基于已发布的品牌分析报告（parent_artifact_version_id={parent_version_id}），"
             "按平台和情感维度做一次钻取，关注声量峰值的平台分布与正面情感占比。"
         ),
+        # 生产语义：用户在同一会话里追问钻取——复用父场景的 user/session，
+        # 否则钻取 Run 在全新 session 里看不到父品牌报告（artifact 按 session
+        # 隔离），模型只能反复澄清「找不到您所指的父报告」（第四轮 UAT 取证）。
+        user_id=parent_record.user_id,
+        agent_session_id=parent_record.session_id,
     )
     record = await _answer_clarifications(
         record,

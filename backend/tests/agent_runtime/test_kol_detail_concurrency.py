@@ -20,7 +20,6 @@ import pytest
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import delete, func, select
 
-from app.agent_artifacts.builders.kol_detail import build_kol_detail_draft
 from app.agent_artifacts.models import (
     AgentArtifact,
     AgentArtifactVersion,
@@ -45,7 +44,7 @@ from app.agent_runtime.models import (
 )
 from app.agent_runtime.reviewer import ReviewDecision, ReviewerDriver
 from app.agent_runtime.schemas import CallTool, SubmitReview
-from app.agent_runtime.tools.artifacts import CreateDraftTool
+from app.agent_runtime.tools.builders import BuildKolDetailDraftTool
 from app.agent_runtime.tools.mcp import MCP_POINTS_COST, AgentMcpTool
 from app.agent_runtime.tools.registry import McpCatalogEntry, ToolRegistry
 from app.billing.models import Wallet
@@ -282,32 +281,25 @@ class ApprovingReviewerGateway:
 
 
 def _actions_for(db) -> list[Any]:
-    """kol_detail_v1 脚本：MCP 抓取 → 创建 Draft（运行时取 Evidence）→ 提交复核。"""
+    """kol_detail_v1 脚本：MCP 抓取 → build_kol_detail_draft（运行时取 Evidence）→ 提交复核。
+
+    H2 起 create_draft 对 kol_detail_v2 直写被 typed_artifact_requires_builder
+    护栏拒绝，脚本与生产语义一致走 Builder 工具。
+    """
 
     async def create_draft(run):
         evidence = await db.scalar(
             select(EvidenceItem).where(EvidenceItem.run_id == run.id)
         )
         assert evidence is not None
-        build = build_kol_detail_draft(
-            platform=PLATFORM,
-            kol_uid=KOL_UID,
-            selection_artifact_id=None,
-            selection_version=None,
-            detail=DETAIL,
-            evidence_id=evidence.id,
-            cache_state=CACHE_STATE,
-        )
         return CallTool(
             action="call_tool",
-            internal_tool_name="create_draft",
+            internal_tool_name="build_kol_detail_draft",
             arguments={
-                "module": build.module,
-                "schema_version": build.schema_version,
-                "artifact_type": build.artifact_type,
-                "business_fields": build.business_fields,
-                "payload": build.payload,
-                "evidence_refs": build.evidence_refs,
+                "platform": PLATFORM,
+                "kol_uid": KOL_UID,
+                "evidence_id": evidence.id,
+                "cache_state": CACHE_STATE,
             },
             rationale="创建达人详情 Draft",
         )
@@ -356,7 +348,7 @@ def _make_service(db, *, gateway: ScriptedGateway, transport, worker: str):
             transport=transport,
         ),
     )
-    registry.register(CreateDraftTool(db), category="artifact")
+    registry.register(BuildKolDetailDraftTool(db), category="artifact")
     broker = AgentEventBroker()
     events = AgentEventStream(db, broker)
     reviewer = ReviewerDriver(db, ApprovingReviewerGateway(), worker_id=worker)

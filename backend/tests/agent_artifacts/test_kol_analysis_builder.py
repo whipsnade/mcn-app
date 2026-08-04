@@ -24,7 +24,7 @@ import pytest
 from pydantic import ValidationError
 from sqlalchemy import select
 
-from app.agent_artifacts.builders.common import DraftBuildError, DraftBuildResult
+from app.agent_artifacts.builders.common import DraftBuildError
 from app.agent_artifacts.builders.kol_analysis import build_kol_analysis_draft
 from app.agent_artifacts.keys import build_artifact_key
 from app.agent_artifacts.lineage import (
@@ -43,6 +43,10 @@ from app.agent_artifacts.payloads.kol_analysis import KolAnalysisV2
 from app.agent_artifacts.service import ArtifactService
 from app.agent_runtime.profiles import ARTIFACT_TOOLS, PROFILES
 from app.agent_runtime.tools.artifacts import CreateDraftArgs, CreateDraftTool, UpdateDraftTool
+from app.agent_runtime.tools.builders import (
+    BuildKolAnalysisDraftArgs,
+    BuildKolAnalysisDraftTool,
+)
 from app.agent_runtime.tools.contracts import ToolContext
 from app.agent_runtime.tools.registry import ToolRegistry
 
@@ -234,19 +238,6 @@ def _selection_refs(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         }
     )
     return refs
-
-
-def _draft_args(build: DraftBuildResult) -> dict[str, Any]:
-    return {
-        "module": build.module,
-        "schema_version": build.schema_version,
-        "artifact_type": build.artifact_type,
-        "business_fields": build.business_fields,
-        "payload": build.payload,
-        "evidence_refs": build.evidence_refs,
-        "parent_artifact_id": build.parent_artifact_id,
-        "parent_artifact_version_id": build.parent_artifact_version_id,
-    }
 
 
 class MemoryLoader:
@@ -470,7 +461,7 @@ async def test_analysis_lineage_recurses_to_selection_evidence() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 2. 稳定身份复用 + 旧版本 parent 绑定不可变（经 create_draft 工具）
+# 2. 稳定身份复用 + 旧版本 parent 绑定不可变（经 build_kol_analysis_draft 工具）
 # ---------------------------------------------------------------------------
 
 
@@ -487,7 +478,9 @@ async def test_stable_identity_reuse_keeps_old_parent_binding(
         profile_name="session_analyst_v1",
     )
     service = ArtifactService(db_session)
-    tool = CreateDraftTool(db_session)
+    # H2：kol_analysis_v2 直写 create_draft 已被 typed_artifact_requires_builder
+    # 护栏拒绝，parent 绑定链路改经 Builder 工具验证（同一 create_or_get 语义）。
+    tool = BuildKolAnalysisDraftTool(db_session)
 
     # 先建名单 Artifact + 已发布 version V1（作为分析的不可变父版本）。
     selection_payload_v1 = _selection_payload([_selection_item("1")])
@@ -516,7 +509,8 @@ async def test_stable_identity_reuse_keeps_old_parent_binding(
         source_draft_revision_id=sel_rev.id,
         schema_version="kol_selection_v3",
         payload_json=selection_payload_v1,
-        evidence_refs_json=[],
+        # Builder 要求名单 Version 自带 lineage refs（分析 Draft 的 lineage 来源）。
+        evidence_refs_json=_selection_refs(selection_payload_v1["data"]["items"]),
         review_json=None,
         data_status="complete",
         created_at=_now(),
@@ -525,14 +519,12 @@ async def test_stable_identity_reuse_keeps_old_parent_binding(
     await db_session.flush()
 
     # 第一份分析：parent 固定到 V1。
-    build1 = build_kol_analysis_draft(
-        selection_artifact_id=sel_artifact.id,
-        selection_payload=selection_payload_v1,
-        parent_artifact_version_id=version_v1.id,
-        selection_version="1",
-        selection_refs=_selection_refs([_selection_item("1")]),
+    result1 = await tool.execute(
+        ctx,
+        BuildKolAnalysisDraftArgs(
+            selection_artifact_id=sel_artifact.id, selection_version=1
+        ),
     )
-    result1 = await tool.execute(ctx, CreateDraftArgs(**{**_draft_args(build1), "module": "kol-analysis"}))
     data1 = json.loads(result1.safe_summary)
     assert result1.status == "success"
     assert data1["artifact_key"] == f"kol-analysis:{sel_artifact.id}"
@@ -571,7 +563,7 @@ async def test_stable_identity_reuse_keeps_old_parent_binding(
         source_draft_revision_id=sel_rev.id,
         schema_version="kol_selection_v3",
         payload_json=selection_payload_v2,
-        evidence_refs_json=[],
+        evidence_refs_json=_selection_refs(selection_payload_v2["data"]["items"]),
         review_json=None,
         data_status="complete",
         created_at=_now(),
@@ -580,14 +572,12 @@ async def test_stable_identity_reuse_keeps_old_parent_binding(
     await db_session.flush()
 
     # 后一批名单 → 复用同一稳定身份，但固定到 V2。
-    build2 = build_kol_analysis_draft(
-        selection_artifact_id=sel_artifact.id,
-        selection_payload=selection_payload_v2,
-        parent_artifact_version_id=version_v2.id,
-        selection_version="2",
-        selection_refs=_selection_refs(selection_payload_v2["data"]["items"]),
+    result2 = await tool.execute(
+        ctx,
+        BuildKolAnalysisDraftArgs(
+            selection_artifact_id=sel_artifact.id, selection_version=2
+        ),
     )
-    result2 = await tool.execute(ctx, CreateDraftArgs(**{**_draft_args(build2), "module": "kol-analysis"}))
     data2 = json.loads(result2.safe_summary)
     assert result2.status == "success"
     assert data2["artifact_id"] == data1["artifact_id"]
@@ -702,14 +692,16 @@ async def test_create_and_update_draft_tools_persist_through_service(
     ) == 2
 
 
-async def test_analysis_create_draft_writes_parent_binding(
+async def test_analysis_builder_writes_parent_binding(
     db_session, user_factory, session_factory, run_factory,
 ) -> None:
     user = await user_factory()
     session = await session_factory(user.id)
     run = await run_factory(session.id, user.id)
     service = ArtifactService(db_session)
-    tool = CreateDraftTool(db_session)
+    # H2：kol_analysis_v2 直写 create_draft 已被护栏拒绝，Builder 是唯一落
+    # 分析 Draft 的工具路径（parent 绑定语义不变）。
+    tool = BuildKolAnalysisDraftTool(db_session)
     ctx = ToolContext(
         user_id=user.id,
         session_id=session.id,
@@ -743,7 +735,8 @@ async def test_analysis_create_draft_writes_parent_binding(
         source_draft_revision_id=sel_rev.id,
         schema_version="kol_selection_v3",
         payload_json=selection_payload,
-        evidence_refs_json=[],
+        # Builder 要求名单 Version 自带 lineage refs（分析 Draft 的 lineage 来源）。
+        evidence_refs_json=_selection_refs(selection_payload["data"]["items"]),
         review_json=None,
         data_status="complete",
         created_at=_now(),
@@ -751,14 +744,12 @@ async def test_analysis_create_draft_writes_parent_binding(
     db_session.add(parent_version)
     await db_session.flush()
 
-    build = build_kol_analysis_draft(
-        selection_artifact_id=sel_artifact.id,
-        selection_payload=selection_payload,
-        parent_artifact_version_id=parent_version.id,
-        selection_version="1",
-        selection_refs=_selection_refs(selection_payload["data"]["items"]),
+    result = await tool.execute(
+        ctx,
+        BuildKolAnalysisDraftArgs(
+            selection_artifact_id=sel_artifact.id, selection_version=1
+        ),
     )
-    result = await tool.execute(ctx, CreateDraftArgs(**{**_draft_args(build), "module": "kol-analysis"}))
     assert result.status == "success"
     data = json.loads(result.safe_summary)
 
