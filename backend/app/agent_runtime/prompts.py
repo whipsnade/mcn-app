@@ -51,6 +51,7 @@ Builder 输出只含 artifact_id / draft_id / revision_id / schema_version 与�
 # Evidence 与数字纪律
 - 产物中的每个数字都必须来自本会话 Evidence 或计算工具结果；不得编造、不得外推、不得把缺失当 0。
 - 叙事条目的 supporting_paths 必须指向 data 内真实存在的点分路径（如 data.overview.total_volume）。
+- narrative 中的每个数字都必须能在 data 的 supporting_paths 指向的位置找到同值；找不到就不要写这个数字。正确：data.overview.total_volume=295614 时写「本期总声量 295614」并以 supporting_paths 指向它；错误：data.comparisons.mom.metrics 全为 null 时在 narrative 写「环比增长 54.9%」——对比数据缺失就不得给出任何涨跌幅数字，只能如实说明对比数据不可用。
 
 # 失败处理
 - 工具失败：阅读 error_type 与摘要，换参数、换工具重试，或先继续其他维度；不要原样重放同一失败调用。
@@ -67,7 +68,7 @@ _ARTIFACT_REVIEWER_TEXT = """你是正式 Artifact 的独立审核员（artifact
 1. 回答完整性：payload 是否回应了用户问题，scope 与用户确认的范围一致，必需章节齐全。
 2. 数字可追溯：data 下每个业务数值都有有效 lineage（Evidence 或确定性计算工具），没有凭空出现的数字；缺失保持 null 而非 0。
 3. 引用有效：evidence_refs 的 artifact_path 指向 payload 内真实路径，来源指向当前会话的证据或计算调用。
-4. 结论不冲突：narrative 与 data 一致，条目 supporting_paths 指向真实数据路径，结论之间不互相矛盾。
+4. 结论不冲突：narrative 与 data 一致，条目 supporting_paths 指向真实数据路径，结论之间不互相矛盾。逐条核对 narrative 中出现的每个数字：它必须能在该条目 supporting_paths 指向的 data 位置找到同值；data 对应位置为 null（如 comparisons.mom.metrics 全 null）而 narrative 给出具体数字（涨跌幅、绝对量等）的，按数据编造处理。
 5. 限制披露充分：data_status 与 availability 一致——complete 当且仅当全部必需章节 complete；restricted 必须对应真实受限章节，limitations 齐全且 affected_paths 准确。
 
 # 决策语义
@@ -105,12 +106,12 @@ _UTILITY_TEXT = """你是后台轻量任务 Agent（utility_v1）。一次调用
 _PROMPTS: dict[str, AgentPrompt] = {
     "session_analyst_v1": AgentPrompt(
         name="session_analyst_v1",
-        version="v2",
+        version="v3",
         text=_SESSION_ANALYST_TEXT,
     ),
     "artifact_reviewer_v1": AgentPrompt(
         name="artifact_reviewer_v1",
-        version="v2",
+        version="v3",
         text=_ARTIFACT_REVIEWER_TEXT,
     ),
     "kol_detail_v1": AgentPrompt(

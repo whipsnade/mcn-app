@@ -4,7 +4,9 @@
 
 - 情感：行级极性映射（``polarity``，阈值与 normalize_sentiment 工具一致），
   每行计数取声量值、缺失按 1 计；summary/by_platform 的 count/share 全部由
-  代码计算，share 保留 4 位；
+  代码计算，share 保留 4 位；合计行（全部/合计/总计，或无平台键但携带声量
+  的汇总行）与具名平台行并存时只保留具名行防双计（与 overview 的 named
+  优先口径一致），仅有合计行时归入 ``all`` 平台；
 - 热帖：剔除显式标注非品牌相关的行；缺 post_id 或发布时间的行无法构成合法
   TopPost（必填字段），跳过并计数披露；互动量优先取互动字段，缺失时按
   赞/评/转求和；按互动量降序（缺失排后），同量按平台序 + post_id 保证
@@ -19,6 +21,7 @@ from typing import Any
 
 from app.agent_artifacts.builders.common import LineageCollector
 from app.agent_artifacts.builders.raw_rows import (
+    AGGREGATE_PLATFORM_NAMES,
     AUTHOR_KEYS,
     COMMENT_KEYS,
     ENGAGEMENT_KEYS,
@@ -55,6 +58,21 @@ def _int_if_integral(value: float | None) -> int | float | None:
     return int(value) if float(value).is_integer() else value
 
 
+def _is_aggregate_sentiment_row(row: dict[str, Any]) -> bool:
+    """合计行判定（防双计，与 overview 的 named 优先口径一致）。
+
+    显式合计/全部平台行恒为合计行；无平台键但携带声量值的行也是合计行
+    （DataTap 跨平台汇总行常省略平台字段）。帖子级明细行按 1 计数、不带
+    声量字段，不会被误判为合计行。
+    """
+    raw_platform = first(row, PLATFORM_KEYS)
+    if canon_platform(raw_platform) not in AGGREGATE_PLATFORM_NAMES:
+        return False
+    if raw_platform is not None:
+        return True
+    return num(first(row, VOLUME_KEYS)) is not None
+
+
 def build_sentiment_section(
     rows: list[RowRef], collector: LineageCollector, *, path: str = "/data/sentiment"
 ) -> tuple[dict[str, Any], bool]:
@@ -63,12 +81,20 @@ def build_sentiment_section(
     返回 ``(section, has_rows)``；无行情感时 summary 三桶 count/share 全 None
     （由调用方按 unavailable 披露）。
     """
+    sentiment_rows = [
+        ref for ref in rows if polarity(first(ref.row, SENTIMENT_KEYS)) is not None
+    ]
+    named_rows = [ref for ref in sentiment_rows if not _is_aggregate_sentiment_row(ref.row)]
+    # 合计行与具名平台行并存时只用具名行——合计行是同一批数据的汇总，一并计入
+    # 会让 summary 双计（真实 UAT 回归）；仅有合计行时归入 all 平台兜底。
+    chosen = named_rows if named_rows else sentiment_rows
+
     bucket_rows: dict[str, list[RowRef]] = {name: [] for name in _POLARITIES}
     bucket_counts: dict[str, float] = {name: 0.0 for name in _POLARITIES}
     platform_rows: dict[str, dict[str, list[RowRef]]] = {}
     platform_counts: dict[str, dict[str, float]] = {}
 
-    for ref in rows:
+    for ref in chosen:
         label = polarity(first(ref.row, SENTIMENT_KEYS))
         if label is None:
             continue
@@ -85,12 +111,6 @@ def build_sentiment_section(
     if not has_rows:
         empty = {name: {"count": None, "share": None} for name in _POLARITIES}
         return {"summary": empty, "by_platform": []}, False
-
-    # 真实零值桶（如无任何负面行）的证据基座是全部情感行——零由「这些行里
-    # 没有该极性」推出，sources 不得为空（LineageRef.sources 至少 1 条）。
-    sentiment_rows = [
-        ref for ref in rows if polarity(first(ref.row, SENTIMENT_KEYS)) is not None
-    ]
 
     total = sum(bucket_counts.values())
     summary: dict[str, Any] = {}

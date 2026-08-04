@@ -24,18 +24,24 @@ import re
 from app.agent_runtime.profiles import PROFILES
 from app.agent_runtime.prompts import get_system_prompt
 
-PROMPT_VERSION = "v2"
+# 各 Profile 的当前 prompt 版本（内容修订独立递增；本次为叙事防编造强化）。
+PROMPT_VERSIONS = {
+    "session_analyst_v1": "v3",
+    "artifact_reviewer_v1": "v3",
+    "kol_detail_v1": "v2",
+    "utility_v1": "v2",
+}
 
 
 def _text(name: str) -> str:
     return get_system_prompt(name).text
 
 
-def test_all_prompts_bumped_to_v2_with_content() -> None:
+def test_all_prompts_versioned_with_content() -> None:
     for key in PROFILES:
         prompt = get_system_prompt(key)
         assert prompt.name == key
-        assert prompt.version == PROMPT_VERSION
+        assert prompt.version == PROMPT_VERSIONS[key]
         assert len(prompt.text.strip()) > 200  # 正式 prompt，非骨架
 
 
@@ -109,6 +115,13 @@ def test_session_analyst_prompt_mentions_exemplars() -> None:
     assert "exemplars" in text
 
 
+def test_session_analyst_prompt_narrative_anti_fabrication_rule() -> None:
+    """叙事防编造：每个数字必须能在 supporting_paths 指向的 data 位置找到同值。"""
+    text = _text("session_analyst_v1")
+    assert "supporting_paths 指向" in text
+    assert "找不到就不要写这个数字" in text
+
+
 def test_session_analyst_prompt_has_no_fixed_stages_or_tool_order() -> None:
     """设计红线：不规定固定业务阶段或固定工具顺序（显式自主声明 + 无阶段编号）。"""
     text = _text("session_analyst_v1")
@@ -143,6 +156,14 @@ def test_artifact_reviewer_prompt_restricted_pass_condition() -> None:
     assert "restricted" in text
     # 放行条件：缺口如实披露可 approve；隐瞒缺口必须 revise/reject。
     assert "放行" in text
+
+
+def test_artifact_reviewer_prompt_narrative_number_consistency_check() -> None:
+    """narrative 数字与 data 一致性是审核重点：找不到同值按编造处理。"""
+    text = _text("artifact_reviewer_v1")
+    assert "narrative" in text
+    assert "同值" in text
+    assert "编造" in text
 
 
 # ---------------------------------------------------------------------------

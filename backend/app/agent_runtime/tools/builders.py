@@ -243,7 +243,12 @@ class BuildBrandReportDraftTool(_BuilderToolBase):
         '"action":"...","rationale":"...","supporting_paths":["data.topics"]}]}。'
         "注意：findings 条目字段是 title/detail（不是 description）；recommendations "
         "条目必须含 title/action/rationale；supporting_paths 是 data 下真实存在的"
-        "点分路径（data. 前缀可省略）。参数或 scope 校验失败返回 draft_build_error "
+        "点分路径（data. 前缀可省略）。数字纪律：narrative 中的每个数字都必须能在 "
+        "data 的 supporting_paths 指向的位置找到同值，找不到就不要写这个数字。"
+        "正确：data.overview.total_volume=295614 时 findings 写「本期总声量 295614」"
+        "并以 supporting_paths 指向它；错误：data.comparisons.mom.metrics 全为 null "
+        "时在 narrative 写「环比增长 54.9%」——对比数据缺失就不得给出任何涨跌幅数字。"
+        "参数或 scope 校验失败返回 draft_build_error "
         "字段级明细，按明细修正后重试。"
     )
 
@@ -318,7 +323,12 @@ class BuildCampaignReportDraftTool(_BuilderToolBase):
         '"action":"...","rationale":"...","supporting_paths":["data.top_posts"]}]}。'
         "注意：phase_review 条目为 {phase, detail, supporting_paths}；findings 条目字段是 "
         "title/detail（不是 description）；recommendations 条目必须含 title/action/rationale；"
-        "supporting_paths 是 data 下真实存在的点分路径。校验失败返回 draft_build_error "
+        "supporting_paths 是 data 下真实存在的点分路径。数字纪律：narrative 中的每个数字"
+        "都必须能在 data 的 supporting_paths 指向的位置找到同值，找不到就不要写这个数字。"
+        "正确：data.overview.total_engagement=365 时 findings 写「合计互动 365」并以 "
+        "supporting_paths 指向它；错误：data.overview.total_engagement 为 null 时在 "
+        "narrative 写「互动量破百万」——数据缺失就不得给出任何具体数字。"
+        "校验失败返回 draft_build_error "
         "字段级明细，按明细修正后重试。"
     )
 
@@ -375,7 +385,9 @@ class BuildKolSelectionDraftTool(_BuilderToolBase):
         "scope 为圈选条件对象（brand/category/campaign 可空、platforms[]、"
         "audience{regions[],age_ranges[],interests[]}、filters 预算/粉丝门槛）；"
         "evidence_id 为当前会话的 KOL 列表证据（列表行含 platform/kol_uid/"
-        "nickname/followers/engagement_total/score_inputs 等）。评分由确定性 "
+        "nickname/followers/engagement_total/score_inputs 等；MCP 原始中文行"
+        "如 平台/账号ID (kwUid)/昵称/粉丝数/平均互动 会自动归一，无需手工改写）。"
+        "评分由确定性 "
         "rank_kols（kol_score_v2 八维）完成，默认跨平台 Top20 按互动量降序。"
         "输出只含 artifact_id/draft_id/revision_id/schema_version 与受限摘要。"
         "输入契约示例："

@@ -65,6 +65,8 @@ _PLATFORM_ALIASES = {
     "xhs": "xiaohongshu",
     "抖音": "douyin",
     "douyin": "douyin",
+    # DataTap datasource「短视频」即抖音（如 hot_user 行的平台字段）。
+    "短视频": "douyin",
     "微博": "weibo",
     "weibo": "weibo",
     "微信": "wechat",
@@ -137,6 +139,15 @@ def extract_rows(evidence_id: str, raw_payload: Any) -> list[RowRef]:
             return []
         for key in _ROW_CONTAINER_KEYS:
             value = parsed.get(key)
+            if isinstance(value, list) and any(isinstance(item, dict) for item in value):
+                for index, item in enumerate(value):
+                    if isinstance(item, dict):
+                        rows.append(RowRef(evidence_id, _path(key, str(index)), item))
+                return rows
+        # 已知容器键未命中：扫描首个「dict 列表」值兜底——真实 MCP 结果常用
+        # 中文容器键（如 kol_xiaohongshu_search 的「KOL 列表」），整包不能
+        # 退化成单行，否则下游按行读取的字段全部缺失。
+        for key, value in parsed.items():
             if isinstance(value, list) and any(isinstance(item, dict) for item in value):
                 for index, item in enumerate(value):
                     if isinstance(item, dict):

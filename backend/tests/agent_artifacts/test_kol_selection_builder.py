@@ -22,6 +22,7 @@ from pydantic import ValidationError
 
 from app.agent_artifacts.builders.common import DraftBuildError
 from app.agent_artifacts.builders.kol_selection import build_kol_selection_draft
+from app.agent_artifacts.builders.raw_rows import extract_rows
 from app.agent_artifacts.lineage import (
     DbLineageLoader,
     LineageOwner,
@@ -455,3 +456,143 @@ async def test_selection_builder_wraps_payload_validation_error() -> None:
                 items=[_kol_item(uid="1", engagement_total=100)],
                 context=LIGHT_CTX,
             )
+
+
+# ---------------------------------------------------------------------------
+# 5. 真实 Evidence 行形态归一（第三轮 UAT 回归）
+# ---------------------------------------------------------------------------
+
+
+def _xhs_search_payload() -> dict[str, Any]:
+    """真实 kol_xiaohongshu_search Evidence 形态：中文容器键「KOL 列表」+
+    全中文字段的行（无 platform/kol_uid 英文契约键）。"""
+    return {
+        "KOL 列表": [
+            {
+                "账号ID (kwUid)": "5ff26b060000000001003a8d",
+                "平台": "xiaohongshu",
+                "昵称": "哈尔滨日报冰城+",
+                "头像": "https://example.com/avatar.webp",
+                "主页": "https://www.xiaohongshu.com/user/profile/5ff26b060000000001003a8d",
+                "粉丝数": 773129,
+                "有效粉丝数": 617697,
+                "有效粉丝率": 0.799,
+                "平均互动": 2503.76,
+                "平均点赞": 2046.54,
+                "平均评论": 112.15,
+                "平均转发": 228.15,
+                "周粉丝增长率": 0.0156,
+                "预估报价-图文": 105979.0,
+                "预估报价-视频": 125168.0,
+            },
+            {
+                "账号ID (kwUid)": "63365127000000001901cbe3",
+                "平台": "xiaohongshu",
+                "昵称": "封面新闻",
+                "粉丝数": 1323695,
+                "平均互动": 2271.82,
+            },
+        ],
+        "分页信息": {"页码": 1, "总数": 100},
+    }
+
+
+def _hot_user_rows() -> list[dict[str, Any]]:
+    """真实 social_statistic_hot_user Evidence 行形态：裸列表、中文字段、
+    平台值为 datasource 名「短视频」（= 抖音）。"""
+    return [
+        {
+            "用户id": "98164646773",
+            "用户昵称": "闪电新闻",
+            "用户头像": "https://example.com/avatar.jpeg",
+            "用户主页链接": "https://www.iesdouyin.com/share/user/98164646773/",
+            "平台": "短视频",
+            "粉丝数": 10590610,
+            "互动数": 683294,
+        },
+        {
+            "用户id": "3035066871318807",
+            "用户昵称": "潘的人生碎片",
+            "平台": "短视频",
+            "粉丝数": 107071,
+            "互动数": 325641,
+        },
+    ]
+
+
+def test_extract_rows_recognizes_chinese_container_key() -> None:
+    """extract_rows 必须识别中文容器键（KOL 列表），不得把整包当单行。"""
+    rows = extract_rows("ev-xhs", _xhs_search_payload())
+    assert len(rows) == 2
+    assert rows[0].row["昵称"] == "哈尔滨日报冰城+"
+    assert rows[0].source_path.startswith("/KOL 列表/")
+
+
+async def test_real_xiaohongshu_search_rows_normalize_to_contract() -> None:
+    """真实 xhs 搜索行：platform/kol_uid 恒为字符串，不再产出 None（UAT 报错根因）。"""
+    rows = [ref.row for ref in extract_rows("ev-xhs", _xhs_search_payload())]
+    scope = {**SCOPE, "platforms": ["xiaohongshu"]}
+    build = await build_kol_selection_draft(
+        scope=scope, evidence_id="ev-xhs", items=rows, context=LIGHT_CTX
+    )
+    payload = build.payload
+    KolSelectionV3.model_validate(payload)
+
+    items = payload["data"]["items"]
+    assert len(items) == 2
+    for item in items:
+        assert item["platform"] == "xiaohongshu"
+        assert isinstance(item["platform"], str)
+        assert isinstance(item["kol_uid"], str) and item["kol_uid"]
+    first = next(item for item in items if item["kol_uid"] == "5ff26b060000000001003a8d")
+    assert first["nickname"] == "哈尔滨日报冰城+"
+    assert first["followers"] == 773129
+    assert first["active_followers"] == 617697
+    assert first["active_follower_rate"] == pytest.approx(0.799)
+    assert first["engagement_total"] == 2503  # 平均互动 2503.76 → int
+    assert first["growth_rate"] == pytest.approx(0.0156)
+    assert first["quoted_price"] == 105979
+    assert first["homepage_url"] is not None
+
+
+async def test_real_hot_user_rows_platform_short_video_maps_to_douyin() -> None:
+    """hot_user 行：平台「短视频」归一为 douyin；uid/昵称/粉丝数走中文别名。"""
+    build = await build_kol_selection_draft(
+        scope=SCOPE,
+        evidence_id="ev-hot",
+        items=_hot_user_rows(),
+        context=LIGHT_CTX,
+    )
+    payload = build.payload
+    KolSelectionV3.model_validate(payload)
+    items = payload["data"]["items"]
+    assert {item["platform"] for item in items} == {"douyin"}
+    top = items[0]  # 互动量降序：闪电新闻 683294 第一
+    assert top["kol_uid"] == "98164646773"
+    assert top["nickname"] == "闪电新闻"
+    assert top["followers"] == 10590610
+    assert top["engagement_total"] == 683294
+
+
+async def test_missing_platform_infers_from_single_platform_scope() -> None:
+    """行无平台字段：scope 只有一个平台时按 scope 推断；多平台时明确标 unknown。"""
+    row = {"用户id": "u-1", "用户昵称": "达人甲", "粉丝数": 1000, "互动数": 500}
+
+    single = await build_kol_selection_draft(
+        scope={**SCOPE, "platforms": ["xiaohongshu"]},
+        evidence_id="ev-1",
+        items=[dict(row)],
+        context=LIGHT_CTX,
+    )
+    assert single.payload["data"]["items"][0]["platform"] == "xiaohongshu"
+
+    multi = await build_kol_selection_draft(
+        scope={**SCOPE, "platforms": ["xiaohongshu", "douyin"]},
+        evidence_id="ev-1",
+        items=[dict(row)],
+        context=LIGHT_CTX,
+    )
+    platform = multi.payload["data"]["items"][0]["platform"]
+    assert platform == "unknown"
+    assert isinstance(platform, str)
+    KolSelectionV3.model_validate(multi.payload)

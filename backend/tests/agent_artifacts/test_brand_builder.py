@@ -364,6 +364,49 @@ def test_sentiment_falls_back_to_overview_split() -> None:
     BrandReportV3.model_validate(payload)
 
 
+def test_sentiment_aggregate_rows_not_double_counted() -> None:
+    """真实 UAT 行形态：具名平台行 + 无平台键合计行并存时 summary 不得双计。
+
+    brand 与 campaign 共用 build_sentiment_section；此处锁定 brand 侧口径：
+    summary 等于具名平台行之和，by_platform 不出现 all 伪平台，平台
+    sentiment_score 与 overview.sentiment_score 同步按修正后口径计算。
+    """
+    evidence = _full_evidence()
+    evidence["sentiment"] = [
+        (
+            "ev-sent",
+            [
+                {"内容情感": "中性", "平台": "短视频-抖音", "声量": 101577},
+                {"内容情感": "中性", "平台": "小红书", "声量": 59609},
+                {"内容情感": "正面", "平台": "短视频-抖音", "声量": 95036},
+                {"内容情感": "正面", "平台": "小红书", "声量": 20404},
+                {"内容情感": "负面", "平台": "小红书", "声量": 12341},
+                {"内容情感": "负面", "平台": "短视频-抖音", "声量": 6647},
+                # 无平台键的跨平台合计行（恰为具名行之和）。
+                {"内容情感": "中性", "声量": 161186},
+                {"内容情感": "正面", "声量": 115440},
+                {"内容情感": "负面", "声量": 18988},
+            ],
+        )
+    ]
+    build = build_brand_report_draft(scope=SCOPE, evidence=evidence, narrative=None)
+    payload = build.payload
+    BrandReportV3.model_validate(payload)
+    sentiment = payload["data"]["sentiment"]
+
+    assert sentiment["summary"]["positive"]["count"] == 115440
+    assert sentiment["summary"]["neutral"]["count"] == 161186
+    assert sentiment["summary"]["negative"]["count"] == 18988
+    assert {row["platform"] for row in sentiment["by_platform"]} == {
+        "xiaohongshu",
+        "douyin",
+    }
+    # 净情感指数按修正后 summary：(115440 - 18988) / 295614 * 100 ≈ 32.63。
+    assert payload["data"]["overview"]["sentiment_score"] == pytest.approx(
+        round((115440 - 18988) / 295614 * 100, 2)
+    )
+
+
 # ---------------------------------------------------------------------------
 # 2. restricted 路径
 # ---------------------------------------------------------------------------

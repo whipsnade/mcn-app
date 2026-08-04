@@ -232,6 +232,86 @@ def test_kol_contributions_capped_at_20() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 1b. 情感合计行防双计（真实 UAT 行形态回归）
+# ---------------------------------------------------------------------------
+
+
+def _real_sentiment_rows() -> list[dict[str, Any]]:
+    """第三轮真实 UAT 的 query_analysis_data 情感 Evidence 行形态。
+
+    具名平台明细行（短视频-抖音/小红书 × 正/中/负）+ 无平台键的跨平台合计行
+    （声量恰为具名行之和）并存于同一 Evidence。
+    """
+    return [
+        {"内容情感": "中性", "平台": "短视频-抖音", "声量": 101577, "互动数": 6518228},
+        {"内容情感": "中性", "平台": "小红书", "声量": 59609, "互动数": 1033549},
+        {"内容情感": "正面", "平台": "短视频-抖音", "声量": 95036, "互动数": 5978432},
+        {"内容情感": "正面", "平台": "小红书", "声量": 20404, "互动数": 308520},
+        {"内容情感": "负面", "平台": "小红书", "声量": 12341, "互动数": 520196},
+        {"内容情感": "负面", "平台": "短视频-抖音", "声量": 6647, "互动数": 677708},
+        {"内容情感": "中性", "声量": 161186, "互动数": 7551777},
+        {"内容情感": "正面", "声量": 115440, "互动数": 6286952},
+        {"内容情感": "负面", "声量": 18988, "互动数": 1197904},
+    ]
+
+
+def test_sentiment_aggregate_rows_not_double_counted() -> None:
+    """具名平台行 + 合计行并存：summary 必须等于具名行之和（即合计行口径），
+    不得把合计行再计入（真实 UAT 曾 2 倍双计）；by_platform 不出现 all 伪平台。"""
+    build = build_campaign_report_draft(
+        scope=SCOPE,
+        evidence={
+            "posts": [("ev-posts", _post_rows())],
+            "sentiment": [("ev-sent", _real_sentiment_rows())],
+        },
+        narrative=None,
+    )
+    payload = build.payload
+    CampaignReportV2.model_validate(payload)
+    sentiment = payload["data"]["sentiment"]
+
+    assert sentiment["summary"]["positive"]["count"] == 115440
+    assert sentiment["summary"]["neutral"]["count"] == 161186
+    assert sentiment["summary"]["negative"]["count"] == 18988
+
+    by_platform = {row["platform"]: row for row in sentiment["by_platform"]}
+    assert set(by_platform) == {"xiaohongshu", "douyin"}
+    assert by_platform["xiaohongshu"]["positive"]["count"] == 20404
+    assert by_platform["douyin"]["neutral"]["count"] == 101577
+    # summary 恒等于各平台行之和。
+    for name in ("positive", "neutral", "negative"):
+        assert sentiment["summary"][name]["count"] == sum(
+            row[name]["count"] for row in sentiment["by_platform"]
+        )
+    # share 按修正后总量归一。
+    total = 115440 + 161186 + 18988
+    assert sentiment["summary"]["positive"]["share"] == pytest.approx(
+        round(115440 / total, 4)
+    )
+
+
+def test_sentiment_aggregate_only_rows_fall_back_to_all_platform() -> None:
+    """上游只返回合计行（无平台拆分）时不丢数据：归入 all 平台，summary 即合计。"""
+    aggregate_rows = [
+        {"内容情感": "正面", "声量": 115440},
+        {"内容情感": "中性", "声量": 161186},
+        {"内容情感": "负面", "声量": 18988},
+    ]
+    build = build_campaign_report_draft(
+        scope=SCOPE,
+        evidence={
+            "posts": [("ev-posts", _post_rows())],
+            "sentiment": [("ev-sent", aggregate_rows)],
+        },
+        narrative=None,
+    )
+    sentiment = build.payload["data"]["sentiment"]
+    assert sentiment["summary"]["positive"]["count"] == 115440
+    assert [row["platform"] for row in sentiment["by_platform"]] == ["all"]
+    assert sentiment["by_platform"][0]["neutral"]["count"] == 161186
+
+
+# ---------------------------------------------------------------------------
 # 2. restricted 路径
 # ---------------------------------------------------------------------------
 

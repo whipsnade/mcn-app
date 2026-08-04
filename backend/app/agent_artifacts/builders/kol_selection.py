@@ -10,8 +10,12 @@
 - 缺失/无效维度记 0 分且不重分配权重；``growth_rate``/``quoted_price`` 只展示；
 - 默认跨平台 Top20，按 ``engagement_total`` 降序；
 - 数据不足时产出 ``restricted`` 产物（§12.1：数据不足必须 restricted）；
+- 真实 Evidence 行（中英混合键，如 kol_xiaohongshu_search 的「KOL 列表」行）
+  先经 :func:`_normalize_kol_row` 归一为契约键：平台恒为字符串（缺失取 scope
+  唯一平台，再缺省 ``unknown``），uid 缺失回退昵称，数值字段按别名解析；
 - 每个维度的原始输入引用 Evidence，派生评分（raw_score/weighted_score/total/
-  rating/stars/data_completeness）引用已 settled 的 ``rank_kols`` 调用。
+  rating/stars/data_completeness）引用已 settled 的 ``rank_kols`` 调用；
+  归一字段的 lineage 指向 Evidence 行内真实存在的原始键。
 """
 
 from __future__ import annotations
@@ -29,6 +33,15 @@ from app.agent_artifacts.builders.common import (
     DraftBuildResult,
     distribution,
     methodology_dict,
+)
+from app.agent_artifacts.builders.raw_rows import (
+    AGGREGATE_PLATFORM_NAMES,
+    PLATFORM_KEYS,
+    canon_platform,
+    num,
+    text,
+    valid_url,
+    whole,
 )
 from app.agent_artifacts.payloads.kol_selection import (
     SCORE_DIMENSIONS,
@@ -71,6 +84,44 @@ _DISPLAY_NUMERIC_FIELDS = (
     "quoted_price",
 )
 
+# 真实 Evidence 行的中英字段别名（kol_xiaohongshu_search / social_statistic_hot_user
+# 等 MCP 结果的原始行键）；英文契约键在首位，已归一的项原样通过。
+_KOL_UID_KEYS = (
+    "kol_uid",
+    "账号ID (kwUid)",
+    "账号ID",
+    "kwUid",
+    "达人ID",
+    "author_id",
+    "uid",
+    "用户ID",
+    "用户id",
+    "小红书id",
+)
+_NICKNAME_KEYS = ("nickname", "昵称", "用户昵称", "达人昵称", "作者", "author")
+_FOLLOWERS_KEYS = ("followers", "粉丝数")
+_ACTIVE_FOLLOWERS_KEYS = ("active_followers", "有效粉丝数")
+_ACTIVE_FOLLOWER_RATE_KEYS = ("active_follower_rate", "有效粉丝率")
+_ENGAGEMENT_TOTAL_KEYS = (
+    "engagement_total",
+    "平均互动",
+    "互动数",
+    "互动量",
+    "互动",
+    "engagement",
+    "interactions",
+)
+_AVG_ENGAGEMENT_KEYS = ("avg_engagement", "平均互动")
+_GROWTH_RATE_KEYS = ("growth_rate", "周粉丝增长率", "月粉丝增长率")
+_QUOTED_PRICE_KEYS = ("quoted_price", "预估报价-图文", "预估报价-视频", "报价")
+_LIKES_KEYS = ("likes", "平均点赞", "点赞数", "点赞")
+_COMMENTS_KEYS = ("comments", "平均评论", "评论数", "评论")
+_SHARES_KEYS = ("shares", "平均转发", "分享数", "转发数", "转发", "分享")
+_AVATAR_URL_KEYS = ("avatar_url", "头像", "用户头像")
+_HOMEPAGE_URL_KEYS = ("homepage_url", "主页", "用户主页链接", "主页链接")
+
+_UNKNOWN_PLATFORM = "unknown"
+
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
@@ -97,6 +148,113 @@ def _rank_context(scope: dict[str, Any]) -> dict[str, Any]:
         "regions": list(audience.get("regions") or ()),
         "age_ranges": list(audience.get("age_ranges") or ()),
     }
+
+
+def _first_present(row: dict[str, Any], keys: tuple[str, ...]) -> tuple[str | None, Any]:
+    for key in keys:
+        if key in row and row[key] is not None and row[key] != "":
+            return key, row[key]
+    return None, None
+
+
+def _normalize_kol_row(
+    row: dict[str, Any], *, default_platform: str | None
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """真实 Evidence 行（中英混合键）→ builder 契约键。
+
+    返回 ``(归一项, 契约字段 → 原始行键)``：归一项保留原行全部键并写入契约
+    键；keymap 供 lineage 指向 Evidence 行内真实存在的键。平台恒为字符串：
+    平台字段缺失或非字符串时取 scope 唯一平台，再缺省 ``"unknown"``——绝不
+    产出 None/非字符串（第三轮 UAT 的 items.platform 校验失败根因）。
+    """
+    item = dict(row)
+    keymap: dict[str, str] = {}
+
+    def _adopt_text(field: str, keys: tuple[str, ...]) -> str | None:
+        existing = item.get(field)
+        if isinstance(existing, str) and existing.strip():
+            keymap[field] = field
+            return existing.strip()
+        raw_key, raw_value = _first_present(row, keys)
+        # 非标量（dict/list/bool）不字符串化，按缺失处理。
+        if raw_key is None or not isinstance(raw_value, (str, int, float)):
+            return None
+        if isinstance(raw_value, bool):
+            return None
+        rendered = text(raw_value)
+        if rendered is None:
+            return None
+        keymap[field] = raw_key
+        return rendered
+
+    def _adopt_number(field: str, keys: tuple[str, ...], *, integer: bool) -> Any:
+        existing = num(item.get(field))
+        if existing is not None:
+            keymap[field] = field
+            return whole(existing) if integer else existing
+        raw_key, raw_value = _first_present(row, keys)
+        parsed = num(raw_value)
+        if raw_key is None or parsed is None:
+            return None
+        keymap[field] = raw_key
+        return whole(parsed) if integer else parsed
+
+    def _adopt_url(field: str, keys: tuple[str, ...]) -> str | None:
+        existing = valid_url(item.get(field))
+        if existing is not None:
+            keymap[field] = field
+            return existing
+        raw_key, raw_value = _first_present(row, keys)
+        url = valid_url(raw_value)
+        if raw_key is None or url is None:
+            return None
+        keymap[field] = raw_key
+        return url
+
+    platform_text = _adopt_text("platform", PLATFORM_KEYS)
+    platform = canon_platform(platform_text) if platform_text else ""
+    if not platform or platform in AGGREGATE_PLATFORM_NAMES:
+        # 平台缺失/合计值：从 scope 唯一平台推断，无法推断明确标 unknown；
+        # 推断值不指向任何原始行键，lineage 不登记。
+        platform = default_platform or _UNKNOWN_PLATFORM
+        keymap.pop("platform", None)
+    item["platform"] = platform
+
+    kol_uid = _adopt_text("kol_uid", _KOL_UID_KEYS)
+    nickname = _adopt_text("nickname", _NICKNAME_KEYS)
+    if kol_uid is None:
+        # uid 缺失回退昵称作身份（与 campaign kol_contributions 口径一致）。
+        kol_uid = nickname or ""
+        if nickname is not None:
+            keymap["kol_uid"] = keymap["nickname"]
+    item["kol_uid"] = kol_uid
+    item["nickname"] = nickname if nickname is not None else kol_uid
+
+    for field, keys, integer in (
+        ("followers", _FOLLOWERS_KEYS, True),
+        ("active_followers", _ACTIVE_FOLLOWERS_KEYS, True),
+        ("active_follower_rate", _ACTIVE_FOLLOWER_RATE_KEYS, False),
+        ("growth_rate", _GROWTH_RATE_KEYS, False),
+        ("engagement_total", _ENGAGEMENT_TOTAL_KEYS, True),
+        ("avg_engagement", _AVG_ENGAGEMENT_KEYS, False),
+        ("likes", _LIKES_KEYS, True),
+        ("comments", _COMMENTS_KEYS, True),
+        ("shares", _SHARES_KEYS, True),
+        ("quoted_price", _QUOTED_PRICE_KEYS, True),
+    ):
+        value = _adopt_number(field, keys, integer=integer)
+        if value is not None:
+            item[field] = value
+
+    for field, keys in (
+        ("avatar_url", _AVATAR_URL_KEYS),
+        ("homepage_url", _HOMEPAGE_URL_KEYS),
+    ):
+        url = _adopt_url(field, keys)
+        if url is not None:
+            item[field] = url
+
+    return item, keymap
 
 
 def _rank_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -390,26 +548,44 @@ def _derivation(call_id: str | None, method: str, input_path: str) -> dict[str, 
     return {"tool_call_id": call_id, "method": method, "input_paths": [input_path]}
 
 
-def _score_sources(evidence_id: str, raw_index: int, raw: dict[str, Any]) -> list[dict[str, Any]]:
+def _identity_source(
+    evidence_id: str, raw_index: int, raw: dict[str, Any], keymap: dict[str, str]
+) -> dict[str, Any]:
+    """稳定身份引用：平台/uid 原始行键优先，推断值兜底到行内首个键。"""
+    for field in ("platform", "kol_uid"):
+        raw_key = keymap.get(field)
+        if raw_key is not None and raw_key in raw:
+            return _ev(evidence_id, f"/{raw_index}/{raw_key}")
+    return _ev(evidence_id, f"/{raw_index}/{next(iter(raw))}")
+
+
+def _score_sources(
+    evidence_id: str, raw_index: int, raw: dict[str, Any], keymap: dict[str, str]
+) -> list[dict[str, Any]]:
     if isinstance(raw.get("score_inputs"), dict):
         return [_ev(evidence_id, f"/{raw_index}/score_inputs")]
-    # 兜底：平台是稳定身份字符串，必然存在于 Evidence 项内。
-    return [_ev(evidence_id, f"/{raw_index}/platform")]
+    return [_identity_source(evidence_id, raw_index, raw, keymap)]
 
 
 def _dim_source(
-    evidence_id: str, raw_index: int, raw: dict[str, Any], input_key: str
+    evidence_id: str,
+    raw_index: int,
+    raw: dict[str, Any],
+    keymap: dict[str, str],
+    input_key: str,
 ) -> dict[str, Any]:
     score_inputs = raw.get("score_inputs")
     if isinstance(score_inputs, dict) and input_key in score_inputs:
         return _ev(evidence_id, f"/{raw_index}/score_inputs/{input_key}")
-    return _score_sources(evidence_id, raw_index, raw)[0]
+    return _score_sources(evidence_id, raw_index, raw, keymap)[0]
 
 
 def _summary_lineage(
     payload: dict[str, Any],
     evidence_id: str,
+    raw_items: list[dict[str, Any]],
     raw_mapping: list[int],
+    keymaps: list[dict[str, str]],
     call_id: str | None,
 ) -> list[dict[str, Any]]:
     refs: list[dict[str, Any]] = []
@@ -417,7 +593,9 @@ def _summary_lineage(
     if not items:
         return refs
     summary = payload["data"]["summary"]
-    representative = _ev(evidence_id, f"/{raw_mapping[0]}/platform")
+    representative = _identity_source(
+        evidence_id, raw_mapping[0], raw_items[raw_mapping[0]], keymaps[raw_mapping[0]]
+    )
 
     for field in ("candidate_count", "selected_count"):
         refs.append(
@@ -436,7 +614,12 @@ def _summary_lineage(
     for j, entry in enumerate(summary.get("platform_distribution") or ()):
         source_index = bucket_first.get(entry["key"])
         source = (
-            _ev(evidence_id, f"/{raw_mapping[source_index]}/platform")
+            _identity_source(
+                evidence_id,
+                raw_mapping[source_index],
+                raw_items[raw_mapping[source_index]],
+                keymaps[raw_mapping[source_index]],
+            )
             if source_index is not None
             else representative
         )
@@ -460,7 +643,12 @@ def _summary_lineage(
         source_index = bucket_first.get(entry["key"])
         # rating 由评分派生，Evidence 项无 score_snapshot；引用稳定平台身份即可。
         source = (
-            _ev(evidence_id, f"/{raw_mapping[source_index]}/platform")
+            _identity_source(
+                evidence_id,
+                raw_mapping[source_index],
+                raw_items[raw_mapping[source_index]],
+                keymaps[raw_mapping[source_index]],
+            )
             if source_index is not None
             else representative
         )
@@ -483,6 +671,7 @@ def _build_lineage(
     evidence_id: str,
     raw_items: list[dict[str, Any]],
     raw_mapping: list[int],
+    keymaps: list[dict[str, str]],
     call_id: str | None,
 ) -> list[dict[str, Any]]:
     refs: list[dict[str, Any]] = []
@@ -491,22 +680,25 @@ def _build_lineage(
     for index, item in enumerate(items):
         raw_index = raw_mapping[index]
         raw = raw_items[raw_index]
+        keymap = keymaps[raw_index]
 
-        # 展示/排序数字：直接复制自 Evidence。
+        # 展示/排序数字：直接复制自 Evidence；lineage 指向原始行键（中文别名
+        # 归一的字段指向真实存在的中文键，而非归一后的契约键）。
         for field in _DISPLAY_NUMERIC_FIELDS:
             value = item.get(field)
-            if value is None or field not in raw:
+            raw_key = keymap.get(field)
+            if value is None or raw_key is None or raw_key not in raw:
                 continue
             refs.append(
                 {
                     "artifact_path": f"/data/items/{index}/{field}",
-                    "sources": [_ev(evidence_id, f"/{raw_index}/{field}")],
+                    "sources": [_ev(evidence_id, f"/{raw_index}/{raw_key}")],
                     "derivation": None,
                 }
             )
 
         # rank 由 engagement_total 降序排序得出；来源兜底到稳定身份字段。
-        rank_source = _score_sources(evidence_id, raw_index, raw)[0]
+        rank_source = _score_sources(evidence_id, raw_index, raw, keymap)[0]
         refs.append(
             {
                 "artifact_path": f"/data/items/{index}/rank",
@@ -518,7 +710,7 @@ def _build_lineage(
         )
 
         # 派生评分数字 → settled rank_kols 调用。
-        score_sources = _score_sources(evidence_id, raw_index, raw)
+        score_sources = _score_sources(evidence_id, raw_index, raw, keymap)
         for field in ("total", "rating", "stars", "data_completeness"):
             refs.append(
                 {
@@ -532,7 +724,7 @@ def _build_lineage(
 
         # 每个维度：原始输入引用 Evidence，派生结果引用 rank_kols。
         for dim in SCORE_DIMENSIONS:
-            source = _dim_source(evidence_id, raw_index, raw, DIM_RAW_INPUT[dim])
+            source = _dim_source(evidence_id, raw_index, raw, keymap, DIM_RAW_INPUT[dim])
             source_path = source["source_path"]
             for suffix in ("raw_score", "weighted_score"):
                 refs.append(
@@ -545,7 +737,9 @@ def _build_lineage(
                     }
                 )
 
-    refs.extend(_summary_lineage(payload, evidence_id, raw_mapping, call_id))
+    refs.extend(
+        _summary_lineage(payload, evidence_id, raw_items, raw_mapping, keymaps, call_id)
+    )
     return refs
 
 
@@ -574,6 +768,18 @@ async def build_kol_selection_draft(
 
     if not items:
         return _restricted_draft(scope_dict, data_as_of, source_names)
+
+    # 真实 Evidence 行归一：中文原始键 → 契约键，平台恒为字符串（缺失时取
+    # scope 唯一平台，再缺省 unknown）；keymap 供 lineage 指向原始行键。
+    scope_platforms = list(scope_dict.get("platforms") or ())
+    default_platform = canon_platform(scope_platforms[0]) if len(scope_platforms) == 1 else None
+    normalized_items: list[dict[str, Any]] = []
+    keymaps: list[dict[str, str]] = []
+    for row in items:
+        normalized_row, keymap = _normalize_kol_row(row, default_platform=default_platform)
+        normalized_items.append(normalized_row)
+        keymaps.append(keymap)
+    items = normalized_items
 
     args = RankKolsArgs(
         items=_rank_items(items),
@@ -620,6 +826,7 @@ async def build_kol_selection_draft(
         evidence_id=evidence_id,
         raw_items=items,
         raw_mapping=raw_mapping,
+        keymaps=keymaps,
         call_id=call_id,
     )
 
