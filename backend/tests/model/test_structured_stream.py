@@ -255,6 +255,29 @@ async def test_complete_json_falls_back_when_stream_is_not_supported() -> None:
     assert sink.terminal == ("completed", 1)
 
 
+def test_map_error_treats_provider_generation_abort_as_retryable() -> None:
+    """供应商 response_format 生成中途自我中止（glm "became abnormal"）按可重试分类。"""
+    import httpx
+    from openai import APIError
+
+    adapter = TencentPlanAdapter(
+        client=FakeCompletions([]), log_writer=_CaptureWriter(), stream_support_cache={}
+    )
+    exc = APIError(
+        "<400> InternalError.Algo.InvalidParameter: Model output became abnormal while "
+        "generating a JSON response for response_format. The generation was aborted "
+        "because the partial output may be incomplete or invalid JSON. Please retry "
+        "the request or adjust your prompt or JSON schema.",
+        request=httpx.Request("POST", "https://example.com/v1/chat/completions"),
+        body=None,
+    )
+
+    mapped = adapter._map_error(exc)
+
+    assert mapped.code == "MODEL_UPSTREAM_ERROR"
+    assert mapped.retryable is True
+
+
 @pytest.mark.asyncio
 async def test_complete_json_does_not_downgrade_for_unsupported_upstream_model() -> None:
     sink = CaptureThinkingSink()

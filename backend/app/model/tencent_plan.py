@@ -10,7 +10,7 @@ import time
 from collections.abc import Awaitable, Callable, MutableMapping
 from typing import Any
 
-from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI
+from openai import APIConnectionError, APIError, APIStatusError, APITimeoutError, AsyncOpenAI
 from pydantic import ValidationError
 
 from app.core.config import Settings
@@ -695,6 +695,17 @@ class TencentPlanAdapter:
                 retryable=True,
                 request_id=request_id,
             )
+        if isinstance(exc, APIError):
+            # 供应商在 response_format 生成中途自我中止（如 glm 的
+            # "Model output became abnormal ... Please retry the request"）：
+            # 非客户端参数错误，按其指引可安全重试。
+            message = str(exc).lower()
+            if "became abnormal" in message or (
+                "invalidparameter" in message and "response_format" in message
+            ):
+                return ModelAdapterError(
+                    "MODEL_UPSTREAM_ERROR", retryable=True, request_id=request_id
+                )
         return ModelAdapterError("MODEL_UPSTREAM_ERROR", retryable=False, request_id=request_id)
 
     def _is_schema_unsupported(self, exc: Exception) -> bool:
