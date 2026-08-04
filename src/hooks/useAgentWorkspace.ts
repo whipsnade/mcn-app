@@ -91,6 +91,19 @@ function isSettledRunStatus(status: string | undefined): boolean {
     || status === 'clarification_requested';
 }
 
+// utility 建议在 Run 终态 settle 后异步落库（fire-and-forget 模型调用），即时回拉
+// 通常早于 suggestions 写入；缺失时补一次延迟回拉（一次性，此后等下次自然刷新）。
+const SUGGESTIONS_REFETCH_DELAY_MS = 5_000;
+
+// utility 建议落父 Run 最新 assistant 消息的 metadata.suggestions（§6.4）。
+function hasRunSuggestions(detail: ApiAgentSessionDetail, runId: string): boolean {
+  return detail.messages.some(message => (
+    message.run_id === runId
+    && message.role === 'assistant'
+    && (message.metadata?.suggestions?.length ?? 0) > 0
+  ));
+}
+
 export function useAgentWorkspace(userId?: string) {
   const [sessions, setSessions] = useState<AgentWorkspaceSession[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string>();
@@ -107,6 +120,8 @@ export function useAgentWorkspace(userId?: string) {
   const deletedSessionIdsRef = useRef(new Set<string>());
   // Run 稳定态回拉会话详情去重键：(sessionId, runId, status) 相同不再重复拉取。
   const lastSessionRefetchRef = useRef<{ sessionId?: string; runId?: string; status?: string }>({});
+  // utility 建议延迟补拉定时器：组件卸载 / 用户切换时清理，避免悬挂回调。
+  const suggestionRetryTimerRef = useRef<ReturnType<typeof setTimeout>>();
 
   const run: RunRuntimeState | undefined = useAgentRun(activeRunId);
 
@@ -156,6 +171,10 @@ export function useAgentWorkspace(userId?: string) {
     if (userId) void load(generation);
     return () => {
       if (generationRef.current === generation) generationRef.current += 1;
+      if (suggestionRetryTimerRef.current) {
+        clearTimeout(suggestionRetryTimerRef.current);
+        suggestionRetryTimerRef.current = undefined;
+      }
     };
   }, [load, userId]);
 
@@ -392,12 +411,30 @@ export function useAgentWorkspace(userId?: string) {
     lastSessionRefetchRef.current = { sessionId: activeSessionId, runId: run.runId, status };
     const generation = generationRef.current;
     const requestedSessionId = activeSessionId;
+    const requestedRunId = run.runId;
+    const applyDetail = (detail: ApiAgentSessionDetail) => {
+      const session = toWorkspaceSession(detail);
+      sessionsRef.current = replaceSession(sessionsRef.current, session);
+      setSessions(sessionsRef.current);
+    };
     void getSession(requestedSessionId)
       .then(detail => {
         if (generationRef.current !== generation) return;
-        const session = toWorkspaceSession(detail);
-        sessionsRef.current = replaceSession(sessionsRef.current, session);
-        setSessions(sessionsRef.current);
+        applyDetail(detail);
+        // utility 建议异步落库：即时回拉通常早于 suggestions 写入，缺失时补一次
+        // 延迟回拉（一次性）；卸载/切会话由 generation 与 activeSessionIdRef 兜底。
+        if (hasRunSuggestions(detail, requestedRunId)) return;
+        if (suggestionRetryTimerRef.current) clearTimeout(suggestionRetryTimerRef.current);
+        suggestionRetryTimerRef.current = setTimeout(() => {
+          suggestionRetryTimerRef.current = undefined;
+          void getSession(requestedSessionId)
+            .then(latest => {
+              if (generationRef.current !== generation) return;
+              if (activeSessionIdRef.current !== requestedSessionId) return;
+              applyDetail(latest);
+            })
+            .catch(() => undefined);
+        }, SUGGESTIONS_REFETCH_DELAY_MS);
       })
       .catch(() => undefined);
   }, [activeSessionId, run, userId]);

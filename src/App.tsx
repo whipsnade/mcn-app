@@ -22,7 +22,9 @@ import type { Message, QuickKolSelection, Session } from './types';
 
 // 把 agent 会话消息（ApiAgentMessage）适配为 ChatArea/SessionList 期望的 Message。
 // ask_user 澄清的 metadata（type=clarification + options）映射到 Message.clarify，
-// 供 ChatArea 的 clarificationByRun 为 Run 卡渲染澄清问题与选项 chips（§13.1）。
+// 供 ChatArea 的 clarificationByRun 为 Run 卡渲染澄清问题与选项 chips（§13.1）；
+// Run 终态 utility 建议（metadata.suggestions）映射到 Message.suggestions，
+// 由 ChatArea 在该 assistant 消息下方渲染追问建议 chips。
 function toChatMessage(message: ApiAgentMessage): Message {
   return {
     id: message.id,
@@ -33,6 +35,7 @@ function toChatMessage(message: ApiAgentMessage): Message {
     clarify: message.metadata?.type === 'clarification'
       ? { options: message.metadata.options ?? [] }
       : undefined,
+    suggestions: message.metadata?.suggestions?.length ? message.metadata.suggestions : undefined,
   };
 }
 
@@ -204,9 +207,10 @@ export default function App() {
             favoriteCount={favorites.length}
           />
           {chatSession && workspaceTab === 'chat' ? (
-            // 注（代码审查 I3）：agent 运行时用 Run 稳定态后的建议（Task 14 complete）承载
-            // 进一步分析，resume 取代旧的 message retry；RunRuntimeState 尚未暴露 suggestions，
-            // 故 ChatArea 的 followup 区与「再次执行」暂不接线，留待 Run 回放 suggestions 后接入。
+            // 注（代码审查 I3）：agent 运行时用 Run 稳定态后的建议承载进一步分析，
+            // resume 取代旧的 message retry；追问建议走 assistant 消息 metadata.suggestions
+            // （toChatMessage 映射为 Message.suggestions，由 ChatArea 渲染 chips），
+            // 旧任务流的 followup props 与「再次执行」保持不接线。
             <ChatArea
               session={chatSession}
               onSendMessage={text => workspace.sendMessage(chatSession.id, text)}

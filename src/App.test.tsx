@@ -24,7 +24,13 @@ vi.mock('./hooks/useAgentWorkspace', () => ({
 
 // App 集成测试：真实渲染 WorkspaceTabs / SessionList / FavoritesPanel / ArtifactWorkspace，
 // 其余重组件替身化，避免牵扯会话流、报告等无关模块。
-vi.mock('./components/ChatArea', () => ({ default: () => <div>会话区</div> }));
+const chatAreaPropsRef = vi.hoisted(() => ({ current: undefined as unknown }));
+vi.mock('./components/ChatArea', () => ({
+  default: (props: unknown) => {
+    chatAreaPropsRef.current = props;
+    return <div>会话区</div>;
+  },
+}));
 vi.mock('./components/MobileWorkspaceNav', () => ({ default: () => null }));
 vi.mock('./components/artifacts/KolDetailArtifactDialog', () => ({ default: () => null }));
 vi.mock('./components/RechargeModal', () => ({ default: () => null }));
@@ -150,6 +156,34 @@ describe('App 集成：一次性切换到统一 Agent 工作区', () => {
     expect(screen.getByRole('tab', { name: '品牌分析' })).toBeVisible();
     expect(screen.getByRole('tab', { name: '活动分析' })).toBeVisible();
     expect(screen.getByRole('tab', { name: '达人' })).toBeVisible();
+  });
+
+  it('把 assistant 消息 metadata.suggestions 映射为 ChatArea 消息的 suggestions', () => {
+    const sessionWithSuggestions = {
+      ...AGENT_SESSION,
+      messages: [{
+        id: 'm-ai',
+        role: 'assistant',
+        content: '分析完成',
+        sequence: 1,
+        run_id: 'run-1',
+        created_at: '2026-08-01T10:00:01',
+        metadata: { suggestions: ['对比一下竞品的投放节奏'] },
+      }],
+    };
+    workspaceRef.current = {
+      sessions: [sessionWithSuggestions],
+      activeSession: sessionWithSuggestions,
+      activeSessionId: 's1',
+    };
+
+    render(<App />);
+
+    const props = chatAreaPropsRef.current as {
+      session: { messages: { sender: string; suggestions?: string[] }[] };
+    };
+    expect(props.session.messages[0].sender).toBe('ai');
+    expect(props.session.messages[0].suggestions).toEqual(['对比一下竞品的投放节奏']);
   });
 
   it('收藏保留：无会话时展示保存的快照与「新建会话后刷新」，不回退旧 Quick API', async () => {

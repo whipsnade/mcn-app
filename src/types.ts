@@ -63,6 +63,8 @@ export interface Message {
   runId?: string;
   brainstorm?: import('./api/contracts').BrainstormMetadata;
   clarify?: import('./api/contracts').ClarifyMetadata;
+  /** Run 终态后 utility 生成的追问建议（assistant 消息 metadata.suggestions）。 */
+  suggestions?: string[];
   thinking?: ThinkingMetadata;
 }
 

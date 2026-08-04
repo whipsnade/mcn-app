@@ -345,6 +345,63 @@ describe('ChatArea', () => {
       .toBe('请进一步分析粉丝地域分布');
   });
 
+  it('renders utility suggestion chips under the assistant message and fills the input without sending', async () => {
+    const onSendMessage = vi.fn().mockResolvedValue(undefined);
+    render(
+      <ChatArea
+        session={{
+          ...session,
+          messages: [
+            { id: 'm1', sender: 'user', text: '帮我分析品牌', timestamp: '10:00', runId: 'run-1' },
+            {
+              id: 'a1',
+              sender: 'ai',
+              text: '分析完成，共圈选 12 位达人。',
+              timestamp: '10:01',
+              runId: 'run-1',
+              suggestions: ['对比一下竞品的投放节奏', '按预算重新排序达人名单'],
+            },
+          ],
+        }}
+        onSendMessage={onSendMessage}
+        isAnalyzing={false}
+        isMockMode={false}
+        runHistory={{ 'run-1': runtime('run-1', { status: 'completed' }) }}
+      />,
+    );
+
+    const region = screen.getByLabelText('追问建议');
+    const chip = within(region).getByRole('button', { name: '对比一下竞品的投放节奏' });
+    expect(within(region).getByRole('button', { name: '按预算重新排序达人名单' })).toBeVisible();
+    await act(async () => {
+      fireEvent.click(chip);
+    });
+    // 点击只填入输入框并聚焦，不自动提交。
+    expect(onSendMessage).not.toHaveBeenCalled();
+    const input = screen.getByPlaceholderText(/输入消息并向 AI 分析师提问/) as HTMLTextAreaElement;
+    expect(input.value).toBe('对比一下竞品的投放节奏');
+    expect(document.activeElement).toBe(input);
+  });
+
+  it('does not render suggestion chips when the assistant message has no suggestions', () => {
+    render(
+      <ChatArea
+        session={{
+          ...session,
+          messages: [
+            { id: 'a1', sender: 'ai', text: '第一轮分析完成。', timestamp: '10:01', runId: 'run-1' },
+            { id: 'a2', sender: 'ai', text: '第二轮分析完成。', timestamp: '10:02', runId: 'run-2', suggestions: [] },
+          ],
+        }}
+        onSendMessage={vi.fn()}
+        isAnalyzing={false}
+        isMockMode={false}
+      />,
+    );
+
+    expect(screen.queryByLabelText('追问建议')).toBeNull();
+  });
+
   it('keeps a long message history inside the fixed workspace column', () => {
     const messages = Array.from({ length: 30 }, (_, index) => ({
       id: `message-${index}`,

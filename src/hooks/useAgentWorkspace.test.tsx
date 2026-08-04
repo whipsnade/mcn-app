@@ -374,6 +374,166 @@ describe('useAgentWorkspace', () => {
     expect(agentApi.getSession).toHaveBeenCalledTimes(2);
   });
 
+  it('surfaces utility suggestions from the settled-run refetch without an extra delayed retry', async () => {
+    const assistantReply: ApiAgentMessage = {
+      id: 'm-ai',
+      role: 'assistant',
+      content: '已完成分析',
+      sequence: 2,
+      run_id: 'run-2',
+      created_at: '2026-08-02T10:00:01',
+      metadata: { suggestions: ['对比一下竞品的投放节奏'] },
+    };
+    const settledDetail: ApiAgentSessionDetail = {
+      ...s1,
+      messages: [assistantReply],
+      runs: [run1, { ...run1, id: 'run-2', status: 'completed', completed_at: '2026-08-02T10:00:01' }],
+    };
+    vi.mocked(agentApi.listSessions).mockResolvedValue([s1]);
+    vi.mocked(agentApi.getSession)
+      .mockResolvedValueOnce(s1Detail)
+      .mockResolvedValue(settledDetail);
+    vi.mocked(agentApi.sendMessage).mockResolvedValue({
+      run_id: 'run-2',
+      session_id: 's1',
+      message_id: 'm2',
+      status: 'queued',
+      reused: false,
+    });
+    // clearAllMocks 不清实现：显式复位，避免上一条测试的 useAgentRun 返回值
+    // 让稳定态 effect 在初始加载时提前触发并被去重键拦截。
+    vi.mocked(useAgentRun).mockReturnValue(undefined);
+
+    const { rerender, result } = renderHook(() => useAgentWorkspace('user-1'));
+    await waitFor(() => expect(result.current.activeSessionId).toBe('s1'));
+
+    await act(async () => {
+      await result.current.sendMessage('s1', '帮我分析品牌');
+    });
+    vi.mocked(useAgentRun).mockReturnValue({
+      ...initialRunRuntime('run-2'),
+      status: 'completed',
+      connection: 'closed',
+    });
+    await act(async () => {
+      rerender();
+    });
+
+    // 稳定态回拉带上 suggestions：消息流直接可见，无需延迟补拉。
+    await waitFor(() => {
+      expect(result.current.activeSession?.messages[0]?.metadata?.suggestions)
+        .toEqual(['对比一下竞品的投放节奏']);
+    });
+    expect(agentApi.getSession).toHaveBeenCalledTimes(2);
+  });
+
+  it('refetches once more after a delay when utility suggestions land after the terminal settle', async () => {
+    // utility 建议在 settle 后异步落库：终态即时回拉通常早于 suggestions 写入，
+    // hook 补一次延迟回拉把建议带入消息流。
+    const assistantReply: ApiAgentMessage = {
+      id: 'm-ai',
+      role: 'assistant',
+      content: '已完成分析',
+      sequence: 2,
+      run_id: 'run-2',
+      created_at: '2026-08-02T10:00:01',
+    };
+    const settledWithout: ApiAgentSessionDetail = {
+      ...s1,
+      messages: [assistantReply],
+      runs: [run1, { ...run1, id: 'run-2', status: 'completed', completed_at: '2026-08-02T10:00:01' }],
+    };
+    const settledWith: ApiAgentSessionDetail = {
+      ...settledWithout,
+      messages: [{ ...assistantReply, metadata: { suggestions: ['按预算重新排序达人名单'] } }],
+    };
+    vi.mocked(agentApi.listSessions).mockResolvedValue([s1]);
+    vi.mocked(agentApi.getSession)
+      .mockResolvedValueOnce(s1Detail)
+      .mockResolvedValueOnce(settledWithout)
+      .mockResolvedValue(settledWith);
+    vi.mocked(agentApi.sendMessage).mockResolvedValue({
+      run_id: 'run-2',
+      session_id: 's1',
+      message_id: 'm2',
+      status: 'queued',
+      reused: false,
+    });
+    // clearAllMocks 不清实现：显式复位，避免上一条测试的 useAgentRun 返回值
+    // 让稳定态 effect 在初始加载时提前触发并被去重键拦截。
+    vi.mocked(useAgentRun).mockReturnValue(undefined);
+
+    const { rerender, result } = renderHook(() => useAgentWorkspace('user-1'));
+    await waitFor(() => expect(result.current.activeSessionId).toBe('s1'));
+    await act(async () => {
+      await result.current.sendMessage('s1', '帮我分析品牌');
+    });
+
+    vi.useFakeTimers();
+    try {
+      vi.mocked(useAgentRun).mockReturnValue({
+        ...initialRunRuntime('run-2'),
+        status: 'completed',
+        connection: 'closed',
+      });
+      await act(async () => {
+        rerender();
+      });
+      // 即时回拉已完成，但建议尚未落库。
+      expect(agentApi.getSession).toHaveBeenCalledTimes(2);
+      expect(result.current.activeSession?.messages[0]?.metadata?.suggestions).toBeUndefined();
+
+      await act(async () => {
+        vi.advanceTimersByTime(5_000);
+      });
+      expect(agentApi.getSession).toHaveBeenCalledTimes(3);
+      expect(result.current.activeSession?.messages[0]?.metadata?.suggestions)
+        .toEqual(['按预算重新排序达人名单']);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps suggestions scoped to their own session when switching sessions', async () => {
+    const s1Assistant: ApiAgentMessage = {
+      id: 'm-ai-1',
+      role: 'assistant',
+      content: '会话一分析完成',
+      sequence: 1,
+      run_id: 'run-1',
+      created_at: '2026-08-01T10:00:01',
+      metadata: { suggestions: ['会话一的追问'] },
+    };
+    const s2Assistant: ApiAgentMessage = {
+      id: 'm-ai-2',
+      role: 'assistant',
+      content: '会话二分析完成',
+      sequence: 1,
+      run_id: null,
+      created_at: '2026-08-01T11:00:01',
+      metadata: { suggestions: ['会话二的追问'] },
+    };
+    vi.mocked(agentApi.listSessions).mockResolvedValue([s1, s2]);
+    vi.mocked(agentApi.getSession).mockImplementation(async id => (
+      id === 's1'
+        ? { ...s1, messages: [s1Assistant], runs: [run1] }
+        : { ...s2, messages: [s2Assistant], runs: [] }
+    ));
+
+    const { result } = renderHook(() => useAgentWorkspace('user-1'));
+    await waitFor(() => expect(result.current.activeSessionId).toBe('s1'));
+    expect(result.current.activeSession?.messages[0]?.metadata?.suggestions).toEqual(['会话一的追问']);
+
+    await act(async () => {
+      await result.current.selectSession('s2');
+    });
+
+    // 切换后建议跟随新会话；旧会话仍保留自己的建议。
+    expect(result.current.activeSession?.messages[0]?.metadata?.suggestions).toEqual(['会话二的追问']);
+    expect(result.current.sessions.find(session => session.id === 's1')?.messages[0]?.metadata?.suggestions)
+      .toEqual(['会话一的追问']);
+  });
+
   it('refetches artifacts only when artifact-relevant run events arrive, not on thinking deltas', async () => {
     vi.mocked(agentApi.listSessions).mockResolvedValue([s1]);
     vi.mocked(agentApi.getSession).mockResolvedValue(s1Detail);

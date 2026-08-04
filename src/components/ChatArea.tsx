@@ -335,6 +335,28 @@ export default function ChatArea({
                       )}
                     </div>
                   )}
+                  {/* Run 终态追问建议 chips（utility suggestions，§13.1）：每个 Run 的
+                      assistant 消息各自携带，点击填入输入框并聚焦，不自动提交。 */}
+                  {isAI && msg.suggestions && msg.suggestions.length > 0 && (
+                    <div className="mt-2 flex flex-wrap gap-1.5" aria-label="追问建议">
+                      {msg.suggestions.map(suggestion => (
+                        <button
+                          key={suggestion}
+                          type="button"
+                          disabled={isAnalyzing}
+                          onClick={() => {
+                            if (!isAnalyzing) fillInput(suggestion);
+                          }}
+                          className={`rounded-lg border px-2.5 py-1.5 text-[10px] font-semibold transition active:scale-95 ${isAnalyzing
+                            ? 'cursor-not-allowed border-slate-100 bg-slate-50 text-slate-300'
+                            : 'border-indigo-100 bg-white text-indigo-700 hover:border-indigo-300 hover:bg-indigo-50'
+                          }`}
+                        >
+                          {suggestion}
+                        </button>
+                      ))}
+                    </div>
+                  )}
                 </div>
               </div>
               {/* 每个 Run 一张独立执行卡，锚定在触发它的用户消息下方；终态收缩保留可回看 */}

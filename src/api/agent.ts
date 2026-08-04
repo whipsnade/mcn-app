@@ -17,11 +17,14 @@ export interface ApiAgentSession {
   updated_at: string;
 }
 
-/** assistant 消息 metadata（镜像 backend ask_user 澄清 metadata：type/question/options）。 */
+/** assistant 消息 metadata（镜像 backend ask_user 澄清 metadata：type/question/options；
+ *  Run 终态后 utility 追问建议写入 suggestions）。 */
 export interface ApiAgentMessageMetadata {
   type?: string;
   question?: string;
   options?: string[];
+  /** utility 生成的后续追问建议（父 Run 最新 assistant 消息，best-effort 可缺失）。 */
+  suggestions?: string[];
 }
 
 export interface ApiAgentMessage {
