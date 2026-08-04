@@ -15,13 +15,15 @@ Every payload is a frozen Pydantic contract with `extra="forbid"`:
 
 from __future__ import annotations
 
+import types
 from datetime import date, datetime
-from typing import Annotated, Any, ClassVar, Literal, Sequence
+from typing import Annotated, Any, ClassVar, Iterator, Literal, Sequence, Union, get_args, get_origin
 from urllib.parse import urlsplit
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, model_validator
 
 _MISSING = object()
+_NONE_TYPE = type(None)
 
 
 def _check_url(value: str | None) -> str | None:
@@ -96,10 +98,17 @@ class ContentTypeItem(BaseModel):
 
 
 class SentimentBucket(BaseModel):
+    """情感桶（§6.3）：count/share 可空。
+
+    情感数据缺失时唯一合法表达是 null + 章节 partial/unavailable + 覆盖
+    limitation，不得伪造 0；真实零值只在 Evidence 明确返回 0 时写入，
+    作为数值叶子需要 lineage。
+    """
+
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    count: int
-    share: float
+    count: int | None
+    share: float | None
 
 
 class SentimentSummary(BaseModel):
@@ -229,6 +238,66 @@ def _has_section_limitation(limitations: tuple[Limitation, ...], section: str) -
     return False
 
 
+def _is_optional_numeric(annotation: Any) -> tuple[bool, Any]:
+    """``(True, None)`` if the annotation is exactly ``int | None`` / ``float | None``
+    (bool excluded); otherwise ``(False, inner)`` with ``inner`` the single
+    non-None member of an Optional union, or None when not an Optional union."""
+    origin = get_origin(annotation)
+    if origin is not Union and origin is not types.UnionType:
+        return False, None
+    args = get_args(annotation)
+    if _NONE_TYPE not in args:
+        return False, None
+    non_none = tuple(arg for arg in args if arg is not _NONE_TYPE)
+    if len(non_none) != 1:
+        return False, None
+    inner = non_none[0]
+    if inner is int or inner is float:
+        return True, None
+    return False, inner
+
+
+def iter_null_numeric_paths(annotation: Any, value: Any, path: str) -> Iterator[str]:
+    """Yield dotted paths of every None Optional-numeric leaf under ``value``.
+
+    ``annotation`` is the Pydantic field annotation describing ``value``; the
+    walk recurses through nested models, arrays (indexed path segments) and
+    dict values. Only leaves typed exactly ``int | None`` / ``float | None``
+    are governed — dates, enums, stable identities, versions, display order,
+    plain-text labels and runtime metadata are exempt (§12.1/§6.3), as are
+    non-optional numerics (they can never be None by contract).
+    """
+    is_numeric, inner = _is_optional_numeric(annotation)
+    if is_numeric:
+        if value is None:
+            yield path
+        return
+    if inner is not None:
+        # Optional 非数值叶子（OptionalHttpUrl、Period | None 等）：豁免；
+        # 非 None 的可空嵌套模型继续向下遍历。
+        if value is not None:
+            yield from iter_null_numeric_paths(inner, value, path)
+        return
+    origin = get_origin(annotation)
+    if origin in (list, tuple, set, frozenset):
+        args = get_args(annotation)
+        if args and value:
+            for index, item in enumerate(value):
+                yield from iter_null_numeric_paths(args[0], item, f"{path}.{index}")
+        return
+    if origin is dict:
+        args = get_args(annotation)
+        if len(args) == 2 and value:
+            for key, item in value.items():
+                yield from iter_null_numeric_paths(args[1], item, f"{path}.{key}")
+        return
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        for name, field in annotation.model_fields.items():
+            yield from iter_null_numeric_paths(
+                field.annotation, getattr(value, name, None), f"{path}.{name}"
+            )
+
+
 def validate_unique(items: Sequence[Any], key_fields: Sequence[str], label: str) -> None:
     """Reject duplicate stable-business keys within a sequence of items.
 
@@ -266,8 +335,10 @@ class ArtifactPayloadBase(BaseModel):
     Concrete subclasses declare their own `scope`, `data` and `narrative`
     models, plus class metadata:
     - `REQUIRED_SECTIONS`: sections that must be complete for data_status=complete.
-    - `SECTION_NUMERIC_PATHS`: section name -> data paths whose None-ness is
-      governed by that section's availability.
+    - `GOVERNED_SECTIONS`: business section roots (same-named top-level `data`
+      fields) whose Optional numeric leaves are null-governed (§6.3). The
+      validator derives the leaves recursively from the Pydantic schema —
+      array elements included — instead of a hand-maintained path list.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -280,7 +351,7 @@ class ArtifactPayloadBase(BaseModel):
     methodology: Methodology
 
     REQUIRED_SECTIONS: ClassVar[frozenset[str]] = frozenset()
-    SECTION_NUMERIC_PATHS: ClassVar[dict[str, tuple[str, ...]]] = {}
+    GOVERNED_SECTIONS: ClassVar[frozenset[str]] = frozenset()
 
     @model_validator(mode="after")
     def _validate_aggregate_and_limitations(self) -> ArtifactPayloadBase:
@@ -323,19 +394,31 @@ class ArtifactPayloadBase(BaseModel):
                 )
 
         # null business numeric is allowed only when its section is partial/unavailable
-        # AND a limitation covers it; the null must never be coerced to 0.
-        for section, paths in self.SECTION_NUMERIC_PATHS.items():
-            entry = availability.get(section)
-            for path in paths:
-                if _resolve_path(data_dict, path) is not None:
-                    continue
-                if entry is None or entry.status == "complete":
-                    raise ValueError(
-                        f"null value at data.{path} requires section {section!r} "
-                        "to be partial/unavailable"
-                    )
-                if not _has_covering_limitation(self.limitations, path):
-                    raise ValueError(f"null value at data.{path} requires a covering limitation")
+        # AND a limitation covers it (generic, section-level, or the exact leaf
+        # path); the null must never be coerced to 0. Leaves are derived
+        # recursively from the schema — array elements included (§6.3).
+        data_model = type(self.data)
+        if self.GOVERNED_SECTIONS and issubclass(data_model, BaseModel):
+            for section in sorted(self.GOVERNED_SECTIONS):
+                field = data_model.model_fields.get(section)
+                if field is None:
+                    continue  # 声明漂移由契约测试拦截（GOVERNED_SECTIONS ⊆ data 字段）
+                entry = availability.get(section)
+                for path in iter_null_numeric_paths(
+                    field.annotation, getattr(self.data, section), section
+                ):
+                    if entry is None or entry.status == "complete":
+                        raise ValueError(
+                            f"null value at data.{path} requires section {section!r} "
+                            "to be partial/unavailable"
+                        )
+                    if not (
+                        _has_covering_limitation(self.limitations, path)
+                        or _has_section_limitation(self.limitations, section)
+                    ):
+                        raise ValueError(
+                            f"null value at data.{path} requires a covering limitation"
+                        )
 
         # narrative may only cite data via supporting_paths; each must resolve.
         for supporting_path in _collect_supporting_paths(self.narrative):

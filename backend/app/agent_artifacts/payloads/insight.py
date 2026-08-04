@@ -190,4 +190,3 @@ class InsightBoardV1(ArtifactPayloadBase):
     data: tuple[InsightBlock, ...] = Field(default_factory=tuple, max_length=50)
 
     REQUIRED_SECTIONS = frozenset({"blocks"})
-    SECTION_NUMERIC_PATHS = {}

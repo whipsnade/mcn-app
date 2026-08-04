@@ -38,6 +38,18 @@ _SUMMARY_FIELDS = (
     "avg_score",
 )
 
+# §6.3 递归 null 治理：kol_trend/top_kols 数组元素内的 Optional 数值叶子同样
+# 受治理——出现 null 时对应章节必须 partial + limitation，不得谎称 complete。
+_TREND_FIELDS = (
+    "followers",
+    "active_followers",
+    "engagement_total",
+    "avg_engagement",
+    "growth_rate",
+    "score",
+)
+_TOP_KOL_FIELDS = ("score", "engagement_total")
+
 
 def _is_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
@@ -395,48 +407,51 @@ def build_kol_analysis_draft(
 
     analysis_data = _analysis_data(items)
     narrative = _analysis_narrative(items, analysis_data)
-    null_summary = [
-        f"summary.{field}" for field in _SUMMARY_FIELDS if analysis_data["summary"][field] is None
+
+    # 分章节收集 null Optional 数值叶子；任一章节有 null 即 partial + limitation。
+    section_nulls: dict[str, list[str]] = {
+        "summary": [
+            f"summary.{field}"
+            for field in _SUMMARY_FIELDS
+            if analysis_data["summary"][field] is None
+        ],
+        "kol_trend": [
+            f"kol_trend.{index}.{field}"
+            for index, row in enumerate(analysis_data["kol_trend"])
+            for field in _TREND_FIELDS
+            if row.get(field) is None
+        ],
+        "top_kols": [
+            f"top_kols.{index}.{field}"
+            for index, row in enumerate(analysis_data["top_kols"])
+            for field in _TOP_KOL_FIELDS
+            if row.get(field) is None
+        ],
+    }
+    restricted = any(section_nulls.values())
+    availability = {
+        section: {
+            "status": "partial" if nulls else "complete",
+            "reason_codes": ["insufficient_kol_data"] if nulls else [],
+        }
+        for section, nulls in section_nulls.items()
+    }
+    limitations = [
+        {
+            "code": "insufficient_kol_data",
+            "message": "名单部分数值缺失，KOL 分析受限披露",
+            "affected_paths": nulls,
+        }
+        for nulls in section_nulls.values()
+        if nulls
     ]
-
-    if null_summary:
-        payload = _assemble_payload(
-            scope=scope,
-            data=analysis_data,
-            narrative=narrative,
-            data_status="restricted",
-            limitations=[
-                {
-                    "code": "insufficient_kol_data",
-                    "message": "名单部分数值缺失，KOL 分析受限披露",
-                    "affected_paths": null_summary,
-                }
-            ],
-            availability={
-                "summary": {"status": "partial", "reason_codes": ["insufficient_kol_data"]},
-                "kol_trend": {"status": "complete", "reason_codes": []},
-                "top_kols": {"status": "complete", "reason_codes": []},
-            },
-            data_as_of=data_as_of,
-            source_names=source_names,
-        )
-        try:
-            KolAnalysisV2.model_validate(payload)
-        except ValidationError as exc:
-            raise DraftBuildError(f"invalid kol_analysis_v2 payload: {exc}") from exc
-        return _result(payload, _analysis_lineage(payload, parent_artifact_version_id, covered, items))
-
     payload = _assemble_payload(
         scope=scope,
         data=analysis_data,
         narrative=narrative,
-        data_status="complete",
-        limitations=[],
-        availability={
-            "summary": {"status": "complete", "reason_codes": []},
-            "kol_trend": {"status": "complete", "reason_codes": []},
-            "top_kols": {"status": "complete", "reason_codes": []},
-        },
+        data_status="restricted" if restricted else "complete",
+        limitations=limitations,
+        availability=availability,
         data_as_of=data_as_of,
         source_names=source_names,
     )

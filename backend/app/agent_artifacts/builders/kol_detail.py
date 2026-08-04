@@ -61,14 +61,31 @@ _AUDIENCE_FIELDS = (
 # 必需章节：任一非 complete 都必须 restricted 并披露 limitation（§12.1 聚合规则）。
 _REQUIRED_SECTIONS = ("identity", "metrics", "audience", "trend", "latest_posts")
 
+# 数组元素内受 §6.3 递归 null 治理的 Optional 数值字段。
+_AUDIENCE_ITEM_NUMERICS = ("value", "share")
+_TREND_ITEM_NUMERICS = ("followers", "engagement", "posts")
+_POST_ITEM_NUMERICS = ("likes", "comments", "shares", "engagement")
+
+
+def _array_null_paths(section: str, items: list[dict[str, Any]], fields: tuple[str, ...]) -> list[str]:
+    """数组元素内为 None 的 Optional 数值叶子路径（``section.index.field``）。"""
+    return [
+        f"{section}.{index}.{field}"
+        for index, item in enumerate(items)
+        for field in fields
+        if item.get(field) is None
+    ]
+
 _LIMITATION_MESSAGE = {
     "homepage_url_missing": "未获取到达人主页链接，前端展示不可用",
     "metric_data_missing": "达人部分核心指标缺失，数据受限披露",
     "audience_missing": "未获取到达人受众画像，数据受限披露",
     "audience_partial": "达人部分受众分布缺失，数据受限披露",
     "trend_missing": "未获取到达人趋势数据，数据受限披露",
+    "trend_partial": "达人部分趋势数值缺失，数据受限披露",
     "latest_posts_missing": "未获取到达人最新热帖，数据受限披露",
     "post_url_missing": "部分热帖缺少原帖链接，前端展示不可用",
+    "post_metric_missing": "部分热帖互动数值缺失，数据受限披露",
 }
 
 
@@ -163,65 +180,73 @@ def _build_data(detail: dict[str, Any], cache_state: dict[str, Any]) -> dict[str
     }
 
 
-def _section_plan(data: dict[str, Any]) -> dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]]:
-    """返回 {必需章节: (status, reason_codes, affected_paths)}。"""
-    plan: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = {}
+def _section_plan(data: dict[str, Any]) -> dict[str, tuple[str, tuple[tuple[str, tuple[str, ...]], ...]]]:
+    """返回 {必需章节: (status, ((limitation_code, affected_paths), ...))}。"""
+    plan: dict[str, tuple[str, tuple[tuple[str, tuple[str, ...]], ...]]] = {}
 
     identity = data["identity"]
     if identity.get("homepage_url") is None:
-        plan["identity"] = ("partial", ("homepage_url_missing",), ("identity.homepage_url",))
+        plan["identity"] = ("partial", (("homepage_url_missing", ("identity.homepage_url",)),))
     else:
-        plan["identity"] = ("complete", (), ())
+        plan["identity"] = ("complete", ())
 
     metrics = data["metrics"]
     null_fields = [field for field in _METRIC_FIELDS if metrics.get(field) is None]
     if len(null_fields) == len(_METRIC_FIELDS):
         plan["metrics"] = (
             "unavailable",
-            ("metric_data_missing",),
-            tuple(f"metrics.{field}" for field in _METRIC_FIELDS),
+            (("metric_data_missing", tuple(f"metrics.{field}" for field in _METRIC_FIELDS)),),
         )
     elif null_fields:
         plan["metrics"] = (
             "partial",
-            ("metric_data_missing",),
-            tuple(f"metrics.{field}" for field in null_fields),
+            (("metric_data_missing", tuple(f"metrics.{field}" for field in null_fields)),),
         )
     else:
-        plan["metrics"] = ("complete", (), ())
+        plan["metrics"] = ("complete", ())
 
     non_empty = [field for field in _AUDIENCE_FIELDS if data["audience"].get(field)]
     if not non_empty:
-        plan["audience"] = ("unavailable", ("audience_missing",), ())
-    elif len(non_empty) < len(_AUDIENCE_FIELDS):
-        # 部分受众分布缺失：partial 披露，避免把「缺失」当「完整」。
-        missing = [field for field in _AUDIENCE_FIELDS if not data["audience"].get(field)]
-        plan["audience"] = (
-            "partial",
-            ("audience_partial",),
-            tuple(f"audience.{field}" for field in missing),
-        )
+        plan["audience"] = ("unavailable", (("audience_missing", ()),))
     else:
-        plan["audience"] = ("complete", (), ())
+        issues: list[tuple[str, tuple[str, ...]]] = []
+        if len(non_empty) < len(_AUDIENCE_FIELDS):
+            # 部分受众分布缺失：partial 披露，避免把「缺失」当「完整」。
+            missing = [field for field in _AUDIENCE_FIELDS if not data["audience"].get(field)]
+            issues.append(("audience_partial", tuple(f"audience.{field}" for field in missing)))
+        # §6.3：分布项内的 value/share 为 null 同样必须披露。
+        for field in _AUDIENCE_FIELDS:
+            null_paths = _array_null_paths(
+                f"audience.{field}", data["audience"].get(field) or [], _AUDIENCE_ITEM_NUMERICS
+            )
+            if null_paths:
+                issues.append(("audience_partial", tuple(null_paths)))
+        plan["audience"] = ("partial", tuple(issues)) if issues else ("complete", ())
 
-    if data["trend"]:
-        plan["trend"] = ("complete", (), ())
+    if not data["trend"]:
+        plan["trend"] = ("unavailable", (("trend_missing", ()),))
     else:
-        plan["trend"] = ("unavailable", ("trend_missing",), ())
+        null_paths = _array_null_paths("trend", data["trend"], _TREND_ITEM_NUMERICS)
+        plan["trend"] = (
+            ("partial", (("trend_partial", tuple(null_paths)),)) if null_paths else ("complete", ())
+        )
 
     posts = data["latest_posts"]
     if not posts:
-        plan["latest_posts"] = ("unavailable", ("latest_posts_missing",), ())
+        plan["latest_posts"] = ("unavailable", (("latest_posts_missing", ()),))
     else:
+        post_issues: list[tuple[str, tuple[str, ...]]] = []
         missing_urls = tuple(i for i, post in enumerate(posts) if post.get("url") is None)
         if missing_urls:
-            plan["latest_posts"] = (
-                "partial",
-                ("post_url_missing",),
-                tuple(f"latest_posts.{i}.url" for i in missing_urls),
+            post_issues.append(
+                ("post_url_missing", tuple(f"latest_posts.{i}.url" for i in missing_urls))
             )
-        else:
-            plan["latest_posts"] = ("complete", (), ())
+        null_paths = _array_null_paths("latest_posts", posts, _POST_ITEM_NUMERICS)
+        if null_paths:
+            post_issues.append(("post_metric_missing", tuple(null_paths)))
+        plan["latest_posts"] = (
+            ("partial", tuple(post_issues)) if post_issues else ("complete", ())
+        )
 
     return plan
 
@@ -339,13 +364,12 @@ def build_kol_detail_draft(
     availability: dict[str, Any] = {}
     limitations: list[dict[str, Any]] = []
     for section in _REQUIRED_SECTIONS:
-        status, reasons, paths = plan[section]
+        status, issues = plan[section]
         availability[section] = {
             "status": status,
-            "reason_codes": list(reasons),
+            "reason_codes": [code for code, _ in issues],
         }
-        if status != "complete":
-            code = reasons[0]
+        for code, paths in issues:
             limitations.append(
                 {
                     "code": code,
@@ -357,7 +381,7 @@ def build_kol_detail_draft(
 
     data_status = (
         "restricted"
-        if any(status != "complete" for status, _, _ in plan.values())
+        if any(status != "complete" for status, _ in plan.values())
         else "complete"
     )
     scope = {

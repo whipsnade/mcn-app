@@ -177,19 +177,18 @@ class BrandReportV3(ArtifactPayloadBase):
     narrative: BrandNarrative
 
     REQUIRED_SECTIONS = frozenset({"overview", "sentiment", "daily_trend", "topics", "top_posts"})
-    SECTION_NUMERIC_PATHS = {
-        "overview": (
-            "overview.total_volume",
-            "overview.total_engagement",
-            "overview.total_posts",
-            "overview.sentiment_score",
-        ),
-        "sentiment": (
-            "sentiment.summary.positive.count",
-            "sentiment.summary.positive.share",
-            "sentiment.summary.neutral.count",
-            "sentiment.summary.neutral.share",
-            "sentiment.summary.negative.count",
-            "sentiment.summary.negative.share",
-        ),
-    }
+    # §6.3：全部业务章节根纳入递归 null 治理（含数组元素内的 Optional 数值叶子）。
+    GOVERNED_SECTIONS = frozenset(
+        {
+            "overview",
+            "comparisons",
+            "sentiment",
+            "daily_trend",
+            "content_types",
+            "creator_tiers",
+            "organic_vs_paid",
+            "regions",
+            "topics",
+            "top_posts",
+        }
+    )

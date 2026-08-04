@@ -79,19 +79,24 @@ export interface AgentArtifactContentTypeItem {
   engagement: number | null;
 }
 
+export interface AgentArtifactSentimentBucket {
+  count: number | null;
+  share: number | null;
+}
+
 export interface AgentArtifactSentimentSummary {
-  positive: { count: number; share: number };
-  neutral: { count: number; share: number };
-  negative: { count: number; share: number };
+  positive: AgentArtifactSentimentBucket;
+  neutral: AgentArtifactSentimentBucket;
+  negative: AgentArtifactSentimentBucket;
 }
 
 export interface AgentArtifactSentiment {
   summary: AgentArtifactSentimentSummary;
   by_platform: Array<{
     platform: string;
-    positive: { count: number; share: number };
-    neutral: { count: number; share: number };
-    negative: { count: number; share: number };
+    positive: AgentArtifactSentimentBucket;
+    neutral: AgentArtifactSentimentBucket;
+    negative: AgentArtifactSentimentBucket;
   }>;
 }
 

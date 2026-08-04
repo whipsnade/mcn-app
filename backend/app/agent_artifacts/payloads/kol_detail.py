@@ -133,16 +133,5 @@ class KolDetailV2(ArtifactPayloadBase):
     narrative: KolDetailNarrative
 
     REQUIRED_SECTIONS = frozenset({"identity", "metrics", "audience", "trend", "latest_posts"})
-    SECTION_NUMERIC_PATHS = {
-        "metrics": (
-            "metrics.followers",
-            "metrics.following",
-            "metrics.posts",
-            "metrics.likes",
-            "metrics.active_followers",
-            "metrics.active_follower_rate",
-            "metrics.growth_rate",
-            "metrics.engagement_total",
-            "metrics.avg_engagement",
-        ),
-    }
+    # §6.3：cache 是运行时元数据（hit/fetched_at/expires_at），不要求治理。
+    GOVERNED_SECTIONS = frozenset({"identity", "metrics", "audience", "trend", "latest_posts"})

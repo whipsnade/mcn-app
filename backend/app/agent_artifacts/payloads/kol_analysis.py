@@ -97,12 +97,15 @@ class KolAnalysisV2(ArtifactPayloadBase):
     narrative: KolAnalysisNarrative
 
     REQUIRED_SECTIONS = frozenset({"summary", "kol_trend", "top_kols"})
-    SECTION_NUMERIC_PATHS = {
-        "summary": (
-            "summary.kol_count",
-            "summary.total_followers",
-            "summary.total_active_followers",
-            "summary.total_engagement",
-            "summary.avg_score",
-        ),
-    }
+    GOVERNED_SECTIONS = frozenset(
+        {
+            "summary",
+            "platform_distribution",
+            "rating_distribution",
+            "follower_distribution",
+            "engagement_distribution",
+            "region_distribution",
+            "kol_trend",
+            "top_kols",
+        }
+    )

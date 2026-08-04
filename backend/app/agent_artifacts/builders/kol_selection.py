@@ -242,31 +242,54 @@ def _build_payload(
 
     数据存在但排序键（``engagement_total``）完全缺失时，rank_kols 只能按稳定
     输入顺序输出（任意顺序），不得声称「按互动量降序」——必须受限披露。
+
+    §6.3 递归 null 治理：``items[]`` 的 Optional 展示数值（followers/
+    quoted_price 等）出现 null 时同样必须受限披露（items partial +
+    limitation），不得谎称 complete。
     """
     selected_count = len(items)
+    null_display = [
+        f"items.{index}.{field}"
+        for index, item in enumerate(items)
+        for field in _DISPLAY_NUMERIC_FIELDS
+        if item.get(field) is None
+    ]
+    items_restricted = sort_missing or bool(null_display)
+    reason_codes: list[str] = []
+    if sort_missing:
+        reason_codes.append("sort_key_missing")
+    if null_display:
+        reason_codes.append("metric_data_missing")
+    limitations: list[dict[str, Any]] = []
+    if sort_missing:
+        limitations.append(
+            {
+                "code": "sort_key_missing",
+                "message": "候选 KOL 缺少互动量数据，无法按互动量排序，名单按原始顺序展示",
+                "affected_paths": ["items"],
+            }
+        )
+    if null_display:
+        limitations.append(
+            {
+                "code": "metric_data_missing",
+                "message": "部分达人展示指标缺失，数据受限披露",
+                "affected_paths": null_display,
+            }
+        )
     return {
         "schema_version": SCHEMA_VERSION,
         "module": "kol",
-        "data_status": "restricted" if sort_missing else "complete",
+        "data_status": "restricted" if items_restricted else "complete",
         "availability": {
             "scoring": {"status": "complete", "reason_codes": []},
             "items": {
-                "status": "partial" if sort_missing else "complete",
-                "reason_codes": ["sort_key_missing"] if sort_missing else [],
+                "status": "partial" if items_restricted else "complete",
+                "reason_codes": reason_codes,
             },
             "summary": {"status": "complete", "reason_codes": []},
         },
-        "limitations": (
-            [
-                {
-                    "code": "sort_key_missing",
-                    "message": "候选 KOL 缺少互动量数据，无法按互动量排序，名单按原始顺序展示",
-                    "affected_paths": ["items"],
-                }
-            ]
-            if sort_missing
-            else []
-        ),
+        "limitations": limitations,
         "methodology": methodology_dict(data_as_of=data_as_of, source_names=source_names),
         "scope": scope,
         "data": {

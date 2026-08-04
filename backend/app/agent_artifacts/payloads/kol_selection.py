@@ -175,6 +175,4 @@ class KolSelectionV3(ArtifactPayloadBase):
     narrative: KolSelectionNarrative
 
     REQUIRED_SECTIONS = frozenset({"scoring", "items", "summary"})
-    SECTION_NUMERIC_PATHS = {
-        "summary": ("summary.candidate_count", "summary.selected_count"),
-    }
+    GOVERNED_SECTIONS = frozenset({"scoring", "items", "summary"})
