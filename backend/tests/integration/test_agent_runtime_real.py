@@ -274,6 +274,11 @@ _UAT_CLEANUP_STATEMENTS = (
     "DELETE ar FROM agent_artifacts ar "
     "JOIN agent_sessions s ON ar.session_id = s.id "
     "JOIN users u ON s.user_id = u.id WHERE u.nickname LIKE 'uat-%'",
+    # 先删内部子 Run（Reviewer/Utility，parent_run_id 自引用 agent_runs），
+    # 否则删除父 Run 时触发 FK 1451（RESTRICT）。
+    "DELETE child FROM agent_runs child "
+    "JOIN agent_runs parent ON child.parent_run_id = parent.id "
+    "JOIN users u ON parent.user_id = u.id WHERE u.nickname LIKE 'uat-%'",
     "DELETE ru FROM agent_runs ru "
     "JOIN users u ON ru.user_id = u.id WHERE u.nickname LIKE 'uat-%'",
     "DELETE s FROM agent_sessions s "
@@ -668,15 +673,20 @@ async def _collect_run_record(db: AsyncSession, run_id: str, record: ScenarioRec
             }
         )
 
-    versions = list(
+    # 两段查询避免 MySQL 排序缓冲区溢出（1038）：payload/lineage 快照是大 JSON 列，
+    # 整行 ORDER BY 会撑爆默认 sort_buffer_size——先只排序取 id，再按 id 取整行。
+    version_ids = list(
         (
             await db.scalars(
-                select(AgentArtifactVersion)
+                select(AgentArtifactVersion.id)
                 .where(AgentArtifactVersion.source_run_id == run_id)
                 .order_by(AgentArtifactVersion.created_at)
             )
         ).all()
     )
+    versions = [
+        await db.get(AgentArtifactVersion, version_id) for version_id in version_ids
+    ]
     for version in versions:
         lineage_ok, lineage_err = await _verify_version_lineage(db, version, user_id, session_id)
         record.artifact_versions.append(
