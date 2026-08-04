@@ -1,0 +1,379 @@
+"""Evidence 原始行归一（brand/campaign builder 共用，B2）。
+
+把 DataTap MCP 结果的多种包装形态（``{"result": "<json str>"}`` / ``{"rows": [...]}`` /
+裸 list / 裸 dict）提取为 ``(evidence 内路径, 行 dict)`` 序列，并提供中/英文字段
+别名、万/亿单位解析、平台名归一、情感极性映射、日期/URL 清洗等纯函数。
+
+口径移植自已删除的旧 ``reporting/brand_assembler.py``（git 历史 ``d54bc06^``）的
+确定性归一部分；不包含任何模型调用。source_path 指向 Evidence raw payload 内的
+实际行位置（RFC 6901），供字段级 lineage 引用。
+"""
+
+from __future__ import annotations
+
+import json
+import math
+from datetime import date, datetime
+from typing import Any, NamedTuple
+
+
+class RowRef(NamedTuple):
+    """一行可归因的原始记录：Evidence id + 行在 raw payload 内的 JSON Pointer + 行。"""
+
+    evidence_id: str
+    source_path: str
+    row: dict[str, Any]
+
+
+# ---------------------------------------------------------------------------
+# 字段别名（防御式归一，与旧 assembler 一致）
+# ---------------------------------------------------------------------------
+
+PLATFORM_KEYS = ("平台", "platform", "媒体", "媒介", "datasource", "数据源")
+VOLUME_KEYS = ("声量", "品牌声量", "品牌提及量", "brand_mentions", "volume", "mentions")
+ENGAGEMENT_KEYS = ("互动数", "互动量", "互动", "interactions", "engagement")
+POSTS_KEYS = ("发帖数", "帖子数", "笔记数", "posts", "notes")
+POSITIVE_KEYS = ("正面声量数", "正面声量", "正面", "positive")
+NEUTRAL_KEYS = ("中性声量数", "中性声量", "中性", "neutral")
+NEGATIVE_KEYS = ("负面声量数", "负面声量", "负面", "negative")
+DATE_KEYS = ("日期", "时间", "date", "published_at")
+SENTIMENT_KEYS = ("情感", "内容情感", "情绪", "sentiment")
+REGION_KEYS = ("地区", "省份", "地域", "region", "province")
+REGION_MAP_KEYS = ("地域分布", "省份分布", "地区分布")
+CONTENT_TYPE_KEYS = ("内容类型", "内容形式", "类型", "content_type")
+TIER_KEYS = ("达人层级", "创作者层级", "粉丝层级", "creator_tier", "tier")
+COMMERCIAL_KEYS = ("是否商单", "商业属性", "内容属性", "是否广告", "is_commercial")
+TOPIC_KEYS = ("话题", "话题名称", "topic", "hashtag", "标签名称", "标签名", "tag")
+POST_ID_KEYS = ("帖子ID", "帖子id", "笔记ID", "视频ID", "作品ID", "post_id", "aweme_id")
+TITLE_KEYS = ("标题", "笔记标题", "内容", "title")
+AUTHOR_KEYS = ("昵称", "作者", "用户昵称", "达人昵称", "author")
+AUTHOR_ID_KEYS = ("用户ID", "用户id", "uid", "author_id", "kol_uid", "达人ID")
+POST_DATE_KEYS = ("发布时间", "采集时间", "publish_time", "published_at", "collected_at")
+LIKE_KEYS = ("点赞数", "点赞", "likes", "like_count")
+COMMENT_KEYS = ("评论数", "评论", "comments", "comment_count")
+COLLECT_KEYS = ("收藏数", "收藏", "collects", "collect_count")
+SHARE_KEYS = ("分享数", "转发数", "转发", "分享", "shares", "share_count")
+URL_KEYS = ("帖子链接", "原帖链接", "链接", "url")
+RELEVANCE_KEYS = ("品牌相关", "是否相关", "is_brand_related")
+
+# 合计/汇总平台行（归一后）：overview 聚合时存在具名平台行则跳过，防双计。
+AGGREGATE_PLATFORM_NAMES = frozenset({"all", "全部", "合计", "总计"})
+
+_PLATFORM_ALIASES = {
+    "小红书": "xiaohongshu",
+    "xiaohongshu": "xiaohongshu",
+    "xhs": "xiaohongshu",
+    "抖音": "douyin",
+    "douyin": "douyin",
+    "微博": "weibo",
+    "weibo": "weibo",
+    "微信": "wechat",
+    "wechat": "wechat",
+    "b站": "bilibili",
+    "哔哩哔哩": "bilibili",
+    "bilibili": "bilibili",
+}
+_PLATFORM_ORDER = ("xiaohongshu", "douyin", "weibo", "wechat", "bilibili")
+
+_POSITIVE_LABELS = frozenset(
+    {"正面", "正", "积极", "正向", "好评", "满意", "positive", "pos", "up"}
+)
+_NEGATIVE_LABELS = frozenset(
+    {"负面", "负", "消极", "差评", "不满意", "negative", "neg", "down"}
+)
+_NEUTRAL_LABELS = frozenset({"中性", "中", "一般", "neutral", "neu"})
+
+_PAID_TERMS = ("商单", "广告", "是", "commercial", "paid", "true")
+_ORGANIC_TERMS = ("自然", "否", "非商单", "organic", "false")
+
+# 行容器键：dict 形态 Evidence 的行列表所在键（首个命中生效）。
+_ROW_CONTAINER_KEYS = ("rows", "list", "items", "data", "posts", "records")
+
+
+# ---------------------------------------------------------------------------
+# 行提取
+# ---------------------------------------------------------------------------
+
+
+def _escape(token: str) -> str:
+    return token.replace("~", "~0").replace("/", "~1")
+
+
+def unwrap_payload(raw_payload: Any) -> tuple[Any, str]:
+    """解开 ``{"result": "<json 字符串>"}`` 包装；返回 (解析后的值, 基路径)。
+
+    字符串无法解析为 JSON 时返回 ``(None, "/result")``——base 仍可用于
+    lineage 粗粒度引用（指向整个字符串），但提取不到任何行。
+    """
+    if isinstance(raw_payload, dict):
+        result = raw_payload.get("result")
+        if isinstance(result, str):
+            try:
+                return json.loads(result), "/result"
+            except (TypeError, ValueError):
+                return None, "/result"
+    return raw_payload, ""
+
+
+def extract_rows(evidence_id: str, raw_payload: Any) -> list[RowRef]:
+    """从 Evidence raw payload 提取行序列；每行携带可解析的 source_path。"""
+    parsed, base = unwrap_payload(raw_payload)
+    rows: list[RowRef] = []
+
+    def _path(*tokens: str) -> str:
+        if base == "/result":
+            # result 是 JSON 字符串：指针无法下钻到字符串内部，粗粒度指向整个串。
+            return "/result"
+        parts = [token for token in (base, *tokens) if token]
+        return "/" + "/".join(_escape(token) for token in parts)
+
+    if isinstance(parsed, list):
+        for index, item in enumerate(parsed):
+            if isinstance(item, dict):
+                rows.append(RowRef(evidence_id, _path(str(index)), item))
+        return rows
+    if isinstance(parsed, dict):
+        if not parsed:
+            return []
+        for key in _ROW_CONTAINER_KEYS:
+            value = parsed.get(key)
+            if isinstance(value, list) and any(isinstance(item, dict) for item in value):
+                for index, item in enumerate(value):
+                    if isinstance(item, dict):
+                        rows.append(RowRef(evidence_id, _path(key, str(index)), item))
+                return rows
+        # 单行 dict（如一次 overview 查询的聚合结果）：根指针 "" 非合法
+        # source_path（min_length=1），退而指向首个键，仍可解析可审计。
+        if base == "/result":
+            return [RowRef(evidence_id, "/result", parsed)]
+        first_key = next(iter(parsed))
+        return [RowRef(evidence_id, f"/{_escape(str(first_key))}", parsed)]
+    return []
+
+
+# ---------------------------------------------------------------------------
+# 值解析
+# ---------------------------------------------------------------------------
+
+
+def first(row: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        if key in row and row[key] is not None and row[key] != "":
+            return row[key]
+    return None
+
+
+def has_any(row: dict[str, Any], keys: tuple[str, ...]) -> bool:
+    return first(row, keys) is not None
+
+
+def text(value: Any) -> str | None:
+    if value is None:
+        return None
+    rendered = str(value).strip()
+    return rendered or None
+
+
+def num(value: Any) -> float | None:
+    """非负有限数值解析；支持 万/亿 中文单位与千分位字符串。"""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+    elif isinstance(value, str):
+        rendered = value.strip().replace(",", "").replace(" ", "")
+        multiplier = 1.0
+        if rendered.endswith("万"):
+            multiplier, rendered = 1e4, rendered[:-1]
+        elif rendered.endswith("亿"):
+            multiplier, rendered = 1e8, rendered[:-1]
+        if not rendered:
+            return None
+        try:
+            number = float(rendered) * multiplier
+        except ValueError:
+            return None
+    else:
+        return None
+    if not math.isfinite(number) or number < 0:
+        return None
+    return number
+
+
+def whole(value: Any) -> int | None:
+    """数值 → int（可整除的 float 取整）；非数值返回 None。"""
+    number = num(value)
+    if number is None:
+        return None
+    return int(number)
+
+
+def parse_date(value: Any) -> date | None:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if not isinstance(value, str):
+        return None
+    rendered = (
+        value.strip().replace("/", "-").replace("年", "-").replace("月", "-").replace("日", "")
+    )
+    rendered = rendered[:10]
+    try:
+        return date.fromisoformat(rendered)
+    except ValueError:
+        return None
+
+
+def parse_datetime(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, date):
+        return datetime(value.year, value.month, value.day)
+    if not isinstance(value, str):
+        return None
+    rendered = value.strip().replace("/", "-").replace("年", "-").replace("月", "-")
+    rendered = rendered.replace("日", "").replace("T", " ")
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(rendered, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def canon_platform(value: Any) -> str:
+    rendered = str(value or "").strip().casefold()
+    if not rendered:
+        return "all"
+    for alias, platform in _PLATFORM_ALIASES.items():
+        if alias in rendered:
+            return platform
+    return rendered
+
+
+def platform_sort_key(platform: Any) -> tuple[int, str]:
+    name = str(platform)
+    try:
+        return (_PLATFORM_ORDER.index(name), name)
+    except ValueError:
+        return (len(_PLATFORM_ORDER), name)
+
+
+def valid_url(value: Any) -> str | None:
+    """仅接受 http(s) 绝对 URL；其余一律 None（缺失披露，不伪造链接）。"""
+    rendered = text(value)
+    if rendered is None:
+        return None
+    if rendered.startswith("http://") or rendered.startswith("https://"):
+        return rendered
+    return None
+
+
+def polarity(value: Any) -> str | None:
+    """情感值 → positive/neutral/negative；阈值与 normalize_sentiment 工具一致。
+
+    数值：[-1, 1] 区间 >0.2 正面 / <-0.2 负面；[0, 100] 区间 >60 正面 / <40 负面。
+    文本：已知标签直取，未知标签保守归中性。无法解析返回 None（该行不进情感统计）。
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+        if -1 <= number <= 1:
+            if number > 0.2:
+                return "positive"
+            if number < -0.2:
+                return "negative"
+            return "neutral"
+        if 0 <= number <= 100:
+            if number > 60:
+                return "positive"
+            if number < 40:
+                return "negative"
+            return "neutral"
+        return None
+    if isinstance(value, str):
+        import unicodedata
+
+        key = unicodedata.normalize("NFKC", value.strip()).casefold()
+        if not key:
+            return None
+        if key in _POSITIVE_LABELS:
+            return "positive"
+        if key in _NEGATIVE_LABELS:
+            return "negative"
+        # 未知标签保守归为中性（与 normalize_sentiment 一致）。
+        return "neutral"
+    return None
+
+
+def commercial_kind(value: Any) -> str | None:
+    """是否商单 → organic/paid；无法识别返回 None。"""
+    rendered = text(value)
+    if rendered is None:
+        return None
+    lowered = rendered.casefold()
+    if any(term in lowered for term in _ORGANIC_TERMS):
+        return "organic"
+    if any(term in lowered for term in _PAID_TERMS):
+        return "paid"
+    return None
+
+
+def sentiment_score(positive: float | None, neutral: float | None, negative: float | None) -> float | None:
+    """净情感指数：(正面 - 负面) / 总量 * 100，保留 2 位；无构成返回 None。"""
+    known = [value for value in (positive, neutral, negative) if value is not None]
+    if not known:
+        return None
+    total = sum(known)
+    if not total:
+        return None
+    return round((((positive or 0.0) - (negative or 0.0)) / total) * 100, 2)
+
+
+__all__ = [
+    "AGGREGATE_PLATFORM_NAMES",
+    "AUTHOR_ID_KEYS",
+    "AUTHOR_KEYS",
+    "COLLECT_KEYS",
+    "COMMENT_KEYS",
+    "COMMERCIAL_KEYS",
+    "CONTENT_TYPE_KEYS",
+    "DATE_KEYS",
+    "ENGAGEMENT_KEYS",
+    "LIKE_KEYS",
+    "NEGATIVE_KEYS",
+    "NEUTRAL_KEYS",
+    "PLATFORM_KEYS",
+    "POSITIVE_KEYS",
+    "POSTS_KEYS",
+    "POST_DATE_KEYS",
+    "POST_ID_KEYS",
+    "REGION_KEYS",
+    "REGION_MAP_KEYS",
+    "RELEVANCE_KEYS",
+    "RowRef",
+    "SENTIMENT_KEYS",
+    "SHARE_KEYS",
+    "TIER_KEYS",
+    "TITLE_KEYS",
+    "TOPIC_KEYS",
+    "URL_KEYS",
+    "VOLUME_KEYS",
+    "canon_platform",
+    "commercial_kind",
+    "extract_rows",
+    "first",
+    "has_any",
+    "num",
+    "parse_date",
+    "parse_datetime",
+    "platform_sort_key",
+    "polarity",
+    "sentiment_score",
+    "text",
+    "unwrap_payload",
+    "valid_url",
+    "whole",
+]

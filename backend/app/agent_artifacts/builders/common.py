@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -72,3 +73,60 @@ def distribution(values: list[Any]) -> list[dict[str, Any]]:
         {"key": key, "label": key, "count": count, "share": round(count / total, 4)}
         for key, count in sorted(counts.items())
     ]
+
+
+class LineageCollector:
+    """字段级 lineage 收集器：``artifact_path`` → 贡献该值的 Evidence 行集合。
+
+    brand/campaign builder 在聚合时逐字段登记贡献行（``(evidence_id,
+    source_path)``），``build()`` 输出 ``evidence_refs_json`` 形状的引用列表
+    （``derivation=None``：值由 builder 确定性聚合，来源直接是 Evidence，
+    与 kol_detail builder 的既有契约一致）。
+
+    单字段来源超过 ``MAX_SOURCES_PER_REF`` 时按 Evidence 折叠到其最短
+    source_path（粒度降级但指针仍可解析），防止大证据集产生超长引用。
+    """
+
+    MAX_SOURCES_PER_REF = 12
+
+    def __init__(self) -> None:
+        self._refs: dict[str, list[tuple[str, str]]] = {}
+
+    def add(self, artifact_path: str, rows: Iterable[Any]) -> None:
+        # 空来源不登记（LineageRef.sources 至少 1 条）；调用方必须用全量行
+        # 兜底零值桶。漏登记会由 builder 的必选 numeric 覆盖自检暴露。
+        sources = list(rows)
+        if not sources:
+            return
+        bucket = self._refs.setdefault(artifact_path, [])
+        for row in sources:
+            source = (row.evidence_id, row.source_path)
+            if source not in bucket:
+                bucket.append(source)
+
+    def build(self) -> list[dict[str, Any]]:
+        refs: list[dict[str, Any]] = []
+        for artifact_path in sorted(self._refs):
+            sources = self._refs[artifact_path]
+            if len(sources) > self.MAX_SOURCES_PER_REF:
+                shortest: dict[str, str] = {}
+                for evidence_id, source_path in sources:
+                    current = shortest.get(evidence_id)
+                    if current is None or len(source_path) < len(current):
+                        shortest[evidence_id] = source_path
+                sources = sorted(shortest.items())
+            refs.append(
+                {
+                    "artifact_path": artifact_path,
+                    "sources": [
+                        {
+                            "source_type": "evidence",
+                            "evidence_id": evidence_id,
+                            "source_path": source_path,
+                        }
+                        for evidence_id, source_path in sources
+                    ],
+                    "derivation": None,
+                }
+            )
+        return refs
