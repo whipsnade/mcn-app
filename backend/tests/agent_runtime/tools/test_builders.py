@@ -695,6 +695,122 @@ async def test_builder_tool_requires_db_session() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 结构化错误回喂（F1）：可预期的校验失败一律 draft_build_error，绝不冒泡为
+# engine 级「failed unexpectedly」——模型要能拿字段明细自愈。
+# ---------------------------------------------------------------------------
+
+
+async def test_builder_tool_hallucinated_top_level_argument_structured_error(
+    db_session, user_factory
+) -> None:
+    """模型编造顶层参数（extra=forbid）→ 结构化错误含违规字段名。"""
+    user = await user_factory()
+    session = await _make_session(db_session, user.id)
+    run, step = await _make_run(db_session, session.id, user.id)
+
+    tool = BuildBrandReportDraftTool(db_session)
+    result = await tool.execute(
+        _ctx(user.id, session.id, run.id, step.id),
+        {
+            "scope": BRAND_SCOPE,
+            "evidence": {"overview_current": ["ev-1"]},
+            "narratives": {"executive_summary": "编造的字段"},
+        },
+    )
+    assert result.status == "failed"
+    assert result.error_type == "draft_build_error"
+    assert "narratives" in result.safe_summary
+
+
+async def test_build_kol_selection_draft_tool_hallucinated_filter_field_structured_error(
+    db_session, user_factory
+) -> None:
+    """真实 UAT 故障：filters.follower_threshold 不存在 → Pydantic 校验失败
+    必须转为 draft_build_error（含字段明细），不能冒泡为 engine 级失败。"""
+    user = await user_factory()
+    session = await _make_session(db_session, user.id)
+    run, step = await _make_run(db_session, session.id, user.id)
+    evidence_id = await _write_evidence(
+        db_session,
+        session_id=session.id,
+        run_id=run.id,
+        step_id=step.id,
+        payload=_kol_items(),
+    )
+    bad_scope = {
+        **KOL_SCOPE,
+        "filters": {"follower_threshold": 10000},
+    }
+
+    tool = BuildKolSelectionDraftTool(db_session)
+    result = await tool.execute(
+        _ctx(user.id, session.id, run.id, step.id),
+        {"scope": bad_scope, "evidence_id": evidence_id},
+    )
+    assert result.status == "failed"
+    assert result.error_type == "draft_build_error"
+    assert "follower_threshold" in result.safe_summary
+    assert "filters" in result.safe_summary
+
+
+async def test_build_brand_report_draft_tool_narrative_shape_error_has_field_detail(
+    db_session, user_factory
+) -> None:
+    """narrative 形态错误（findings 用 description 而非 detail）→ 结构化错误
+    带字段级明细，模型可据此修正后重试。"""
+    user = await user_factory()
+    session = await _make_session(db_session, user.id)
+    run, step = await _make_run(db_session, session.id, user.id)
+    groups = _brand_evidence_rows()
+    evidence_args = {}
+    for group, rows in groups.items():
+        evidence_args[group] = [
+            await _write_evidence(
+                db_session,
+                session_id=session.id,
+                run_id=run.id,
+                step_id=step.id,
+                payload=rows,
+            )
+        ]
+
+    tool = BuildBrandReportDraftTool(db_session)
+    result = await tool.execute(
+        _ctx(user.id, session.id, run.id, step.id),
+        {
+            "scope": BRAND_SCOPE,
+            "evidence": evidence_args,
+            "narrative": {
+                "executive_summary": "概览。",
+                "findings": [{"title": "发现", "description": "写错了字段名"}],
+                "recommendations": [],
+            },
+        },
+    )
+    assert result.status == "failed"
+    assert result.error_type == "draft_build_error"
+    assert "detail" in result.safe_summary
+
+
+async def test_builder_tool_structured_error_truncated(db_session, user_factory) -> None:
+    """大量校验错误时 safe_summary 截断到合理长度，不撑爆模型上下文。"""
+    user = await user_factory()
+    session = await _make_session(db_session, user.id)
+    run, step = await _make_run(db_session, session.id, user.id)
+    bad_args = {f"bogus_field_{index}": index for index in range(200)}
+    bad_args["scope"] = BRAND_SCOPE
+
+    tool = BuildBrandReportDraftTool(db_session)
+    result = await tool.execute(
+        _ctx(user.id, session.id, run.id, step.id),
+        bad_args,
+    )
+    assert result.status == "failed"
+    assert result.error_type == "draft_build_error"
+    assert len(result.safe_summary) <= 2100
+
+
+# ---------------------------------------------------------------------------
 # 工厂装配
 # ---------------------------------------------------------------------------
 

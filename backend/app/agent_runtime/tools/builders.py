@@ -11,7 +11,10 @@
 可经 ``read_artifact``/Draft 查询按需读取。
 
 工具只做转换与持久化：不选择 MCP 工具、不发起外部查询、不改变用户目标。
-Evidence 不足 / ID 无效 / 归属失败 / payload 不过审都是结构化错误回喂模型。
+Evidence 不足 / ID 无效 / 归属失败 / payload 不过审都是结构化错误回喂模型；
+参数或 scope 的 Pydantic 校验失败（含模型编造字段）由基座 ``execute``
+统一转为 ``draft_build_error`` 字段级明细（截断到上限），只有未知异常才
+冒泡为 engine 级失败。
 """
 
 from __future__ import annotations
@@ -20,7 +23,7 @@ import json
 from dataclasses import replace
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -49,9 +52,27 @@ FORBIDDEN = "forbidden"
 EVIDENCE_NOT_FOUND = "evidence_not_found"
 DRAFT_BUILD_ERROR = "draft_build_error"
 
+# 结构化错误回喂的长度上限：字段级明细足够模型定位问题即可，绝不撑爆上下文。
+_ERROR_SUMMARY_LIMIT = 2000
+
 
 def _failed(error_type: str, message: str) -> ToolResult:
     return ToolResult(status="failed", safe_summary=message, error_type=error_type)
+
+
+def _truncate(text: str, limit: int = _ERROR_SUMMARY_LIMIT) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "...(truncated)"
+
+
+def _format_validation_error(exc: ValidationError) -> str:
+    """Pydantic 校验失败 → 字段级明细（``loc: msg [type]``），截断到上限。"""
+    parts: list[str] = []
+    for error in exc.errors():
+        loc = ".".join(str(part) for part in error.get("loc", ())) or "(root)"
+        parts.append(f"{loc}: {error.get('msg')} [{error.get('type')}]")
+    return _truncate("invalid builder arguments: " + "; ".join(parts))
 
 
 def _draft_summary(
@@ -90,13 +111,30 @@ def _draft_summary(
 
 
 class _BuilderToolBase:
-    """Builder 工具共享基座：DB 归属校验、Evidence 读取、Draft 持久化。"""
+    """Builder 工具共享基座：DB 归属校验、Evidence 读取、Draft 持久化。
+
+    ``execute`` 统一把可预期失败（参数/scope 的 ``ValidationError``、builder
+    领域异常 ``DraftBuildError``）转为结构化 ``draft_build_error`` 回喂模型
+    （字段级明细、截断到上限）——模型据此修正参数自愈；只有未知异常才冒泡
+    为 engine 级 ``failed unexpectedly``。子类实现 ``_execute``。
+    """
 
     points_cost = 0
     external_side_effect = True
 
     def __init__(self, db_session: AsyncSession | None = None) -> None:
         self._db = db_session
+
+    async def execute(self, context: ToolContext, arguments: BaseModel) -> ToolResult:
+        try:
+            return await self._execute(context, arguments)
+        except ValidationError as exc:
+            return _failed(DRAFT_BUILD_ERROR, _format_validation_error(exc))
+        except DraftBuildError as exc:
+            return _failed(DRAFT_BUILD_ERROR, _truncate(str(exc)))
+
+    async def _execute(self, context: ToolContext, arguments: BaseModel) -> ToolResult:
+        raise NotImplementedError
 
     async def _check_session(self, context: ToolContext) -> ToolResult | None:
         session = await self._db.get(AgentSession, context.session_id)
@@ -195,12 +233,24 @@ class BuildBrandReportDraftTool(_BuilderToolBase):
         "（executive_summary/findings[]/recommendations[]，条目的 "
         "supporting_paths 必须指向 data 内路径）。输出只含 "
         "artifact_id/draft_id/revision_id/schema_version 与受限摘要。"
+        "输入契约示例："
+        'scope={"brand":"瑞幸咖啡","period":{"start":"2026-07-01","end":"2026-07-31",'
+        '"timezone":"Asia/Shanghai"},"platforms":["xiaohongshu"],"keywords":["瑞幸"],'
+        '"comparison_mode":"none"}；'
+        'evidence={"overview_current":["ev-1"],"sentiment":["ev-2"]}；'
+        'narrative={"executive_summary":"...","findings":[{"title":"...","detail":"...",'
+        '"supporting_paths":["data.overview.total_volume"]}],"recommendations":[{"title":"...",'
+        '"action":"...","rationale":"...","supporting_paths":["data.topics"]}]}。'
+        "注意：findings 条目字段是 title/detail（不是 description）；recommendations "
+        "条目必须含 title/action/rationale；supporting_paths 是 data 下真实存在的"
+        "点分路径（data. 前缀可省略）。参数或 scope 校验失败返回 draft_build_error "
+        "字段级明细，按明细修正后重试。"
     )
 
     name = "build_brand_report_draft"
     input_model = BuildBrandReportDraftArgs
 
-    async def execute(self, context: ToolContext, arguments: BaseModel) -> ToolResult:
+    async def _execute(self, context: ToolContext, arguments: BaseModel) -> ToolResult:
         args = BuildBrandReportDraftArgs.model_validate(arguments)
         if self._db is None:
             return _failed(DRAFT_BUILD_ERROR, "build_brand_report_draft requires a database session")
@@ -257,12 +307,25 @@ class BuildCampaignReportDraftTool(_BuilderToolBase):
         "phase_review[]/findings[]/recommendations[]，supporting_paths 必须指向"
         " data 内路径）。输出只含 artifact_id/draft_id/revision_id/schema_version"
         " 与受限摘要。"
+        "输入契约示例："
+        'scope={"brand":"瑞幸咖啡","campaign":"生椰拿铁上新","period":{"start":"2026-07-01",'
+        '"end":"2026-07-31","timezone":"Asia/Shanghai"},"platforms":["xiaohongshu"],'
+        '"keywords":["生椰拿铁"]}；'
+        'evidence={"posts":["ev-1"],"sentiment":["ev-2"]}；'
+        'narrative={"executive_summary":"...","phase_review":[{"phase":"预热期","detail":"...",'
+        '"supporting_paths":["data.daily_trend"]}],"findings":[{"title":"...","detail":"...",'
+        '"supporting_paths":["data.overview.total_engagement"]}],"recommendations":[{"title":"...",'
+        '"action":"...","rationale":"...","supporting_paths":["data.top_posts"]}]}。'
+        "注意：phase_review 条目为 {phase, detail, supporting_paths}；findings 条目字段是 "
+        "title/detail（不是 description）；recommendations 条目必须含 title/action/rationale；"
+        "supporting_paths 是 data 下真实存在的点分路径。校验失败返回 draft_build_error "
+        "字段级明细，按明细修正后重试。"
     )
 
     name = "build_campaign_report_draft"
     input_model = BuildCampaignReportDraftArgs
 
-    async def execute(self, context: ToolContext, arguments: BaseModel) -> ToolResult:
+    async def _execute(self, context: ToolContext, arguments: BaseModel) -> ToolResult:
         args = BuildCampaignReportDraftArgs.model_validate(arguments)
         if self._db is None:
             return _failed(DRAFT_BUILD_ERROR, "build_campaign_report_draft requires a database session")
@@ -315,12 +378,21 @@ class BuildKolSelectionDraftTool(_BuilderToolBase):
         "nickname/followers/engagement_total/score_inputs 等）。评分由确定性 "
         "rank_kols（kol_score_v2 八维）完成，默认跨平台 Top20 按互动量降序。"
         "输出只含 artifact_id/draft_id/revision_id/schema_version 与受限摘要。"
+        "输入契约示例："
+        'scope={"brand":null,"category":"美食","campaign":null,"platforms":["小红书"],'
+        '"audience":{"regions":["上海"],"age_ranges":["18-24"],"interests":["美食"]},'
+        '"filters":{"budget_min":null,"budget_max":100000,"follower_min":10000,'
+        '"follower_max":null}}；'
+        'evidence_id="<当前会话 KOL 列表证据 id>"。'
+        "注意：audience 与 filters 必填；filters 只有 budget_min/budget_max/"
+        "follower_min/follower_max 四个字段（不存在 follower_threshold 等其他字段），"
+        "多传或错传字段返回 draft_build_error 字段级明细，按明细修正后重试。"
     )
 
     name = "build_kol_selection_draft"
     input_model = BuildKolSelectionDraftArgs
 
-    async def execute(self, context: ToolContext, arguments: BaseModel) -> ToolResult:
+    async def _execute(self, context: ToolContext, arguments: BaseModel) -> ToolResult:
         args = BuildKolSelectionDraftArgs.model_validate(arguments)
         if self._db is None:
             return _failed(DRAFT_BUILD_ERROR, "build_kol_selection_draft requires a database session")
@@ -372,12 +444,17 @@ class BuildKolAnalysisDraftTool(_BuilderToolBase):
         "Artifact id；selection_version 缺省取最新已发布版本。分析数据引用"
         "名单 Version 并递归追溯其 Evidence。输出只含 "
         "artifact_id/draft_id/revision_id/schema_version 与受限摘要。"
+        "输入契约示例："
+        '{"selection_artifact_id":"<名单 Artifact id>","selection_version":1,'
+        '"analysis_period":"2026-07"}（后两个参数可省略）。'
+        "名单未发布或 Artifact 不属于当前会话返回 not_found；其他校验失败返回 "
+        "draft_build_error 字段级明细，按明细修正后重试。"
     )
 
     name = "build_kol_analysis_draft"
     input_model = BuildKolAnalysisDraftArgs
 
-    async def execute(self, context: ToolContext, arguments: BaseModel) -> ToolResult:
+    async def _execute(self, context: ToolContext, arguments: BaseModel) -> ToolResult:
         args = BuildKolAnalysisDraftArgs.model_validate(arguments)
         if self._db is None:
             return _failed(DRAFT_BUILD_ERROR, "build_kol_analysis_draft requires a database session")
@@ -455,12 +532,18 @@ class BuildKolDetailDraftTool(_BuilderToolBase):
         "为缓存元数据（首次抓取 hit=false，时间取抓取/过期时刻）。主页/原帖链接"
         "缺失会披露限制，不伪造链接。输出只含 "
         "artifact_id/draft_id/revision_id/schema_version 与受限摘要。"
+        "输入契约示例："
+        '{"platform":"xiaohongshu","kol_uid":"12345","evidence_id":"<详情证据 id>",'
+        '"cache_state":{"hit":false,"fetched_at":"2026-08-01T10:00:00",'
+        '"expires_at":"2026-08-02T10:00:00"}}（selection_artifact_id/selection_version '
+        "为可选名单归属参数，无名单上下文时省略）。校验失败返回 draft_build_error "
+        "字段级明细，按明细修正后重试。"
     )
 
     name = "build_kol_detail_draft"
     input_model = BuildKolDetailDraftArgs
 
-    async def execute(self, context: ToolContext, arguments: BaseModel) -> ToolResult:
+    async def _execute(self, context: ToolContext, arguments: BaseModel) -> ToolResult:
         args = BuildKolDetailDraftArgs.model_validate(arguments)
         if self._db is None:
             return _failed(DRAFT_BUILD_ERROR, "build_kol_detail_draft requires a database session")

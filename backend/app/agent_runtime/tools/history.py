@@ -1,8 +1,11 @@
 """历史读取工具（设计文档 §九 / §10.2「大结果处理」）。
 
 三个 TrustedTool（HISTORY_TOOLS 分类）：
-- ``read_artifact(artifact_id, version?, section?)``：读取已发布 Artifact
-  的 payload（或某个 section）；
+- ``read_artifact(artifact_id, version?, section?)``：读取 Artifact 的
+  payload（或某个 section）——默认读最新已发布 Version（``status="published"``）；
+  Artifact 有活动 Draft（drafting/reviewing，如 Builder 刚产出待审核）时读
+  当前 Draft Revision（``status="draft"`` + revision 号），显式 ``version``
+  恒读已发布 Version；
 - ``search_evidence(query, artifact_id?, run_id?, filters?)``：按当前用户 +
   Session 范围搜索 evidence_items；
 - ``read_tool_result(evidence_id, cursor?, limit?)``：按游标分片读取 Evidence
@@ -21,7 +24,12 @@ from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agent_artifacts.models import AgentArtifact, AgentArtifactVersion
+from app.agent_artifacts.models import (
+    AgentArtifact,
+    AgentArtifactVersion,
+    ArtifactDraft,
+    ArtifactDraftRevision,
+)
 from app.agent_runtime.models import AgentSession, EvidenceItem
 from app.agent_runtime.tools.contracts import ToolContext, ToolResult
 
@@ -94,6 +102,33 @@ def _dig(payload: Any, path: str) -> Any:
     return current
 
 
+# Draft section 切片缺失哨兵（None 是合法 payload 值，不能当缺失用）。
+_MISSING = object()
+
+# 活动 Draft 状态：发布收尾后 release_draft 复位为 idle/failed，不再视为活动。
+_ACTIVE_DRAFT_STATUSES = frozenset({"drafting", "reviewing"})
+
+
+def _resolve_pointer(payload: Any, pointer: str) -> Any:
+    """按 RFC6901 JSON Pointer 切片（``/data/overview``）；缺失返回 ``_MISSING``。"""
+    if not pointer.startswith("/"):
+        return _MISSING
+    current = payload
+    for raw_part in pointer.split("/")[1:]:
+        part = raw_part.replace("~1", "/").replace("~0", "~")
+        if isinstance(current, dict):
+            if part not in current:
+                return _MISSING
+            current = current[part]
+        elif isinstance(current, list):
+            if not part.isdigit() or int(part) >= len(current):
+                return _MISSING
+            current = current[int(part)]
+        else:
+            return _MISSING
+    return current
+
+
 # --------------------------------------------------------------------------- #
 # read_artifact
 # --------------------------------------------------------------------------- #
@@ -106,7 +141,15 @@ class ReadArtifactArgs(BaseModel):
 
 
 class ReadArtifactTool:
-    """读取已发布 Artifact payload 或其 section（只读、零积分）。"""
+    """读取 Artifact payload（已发布 Version 或活动 Draft；只读、零积分）。
+
+    - 默认读最新已发布 Version（``status="published"``）；Artifact 有活动
+      Draft（drafting/reviewing，如 Builder 刚产出待审核）时读当前 Draft
+      Revision（``status="draft"`` + revision 号），显式 ``version`` 恒读
+      已发布 Version；
+    - ``section``：Draft 按 RFC6901（``/data/overview``）切片，已发布
+      Version 按点分路径（``data.overview``）切片。
+    """
 
     name = "read_artifact"
     input_model = ReadArtifactArgs
@@ -130,6 +173,11 @@ class ReadArtifactTool:
         if artifact.user_id != context.user_id:
             return _failed(FORBIDDEN, "artifact_forbidden")
 
+        if args.version is None:
+            draft_result = await self._try_read_draft(context, artifact, args.section)
+            if draft_result is not None:
+                return draft_result
+
         version = args.version if args.version is not None else artifact.latest_version
         version_row = await self._db.scalar(
             select(AgentArtifactVersion).where(
@@ -151,8 +199,54 @@ class ReadArtifactTool:
         summary = json.dumps(
             {
                 "artifact_id": artifact.id,
+                "status": "published",
                 "version": version,
                 "section": section,
+                "payload": payload,
+            },
+            ensure_ascii=False,
+        )
+        return ToolResult(status="success", safe_summary=summary)
+
+    async def _try_read_draft(
+        self, context: ToolContext, artifact: AgentArtifact, section: str | None
+    ) -> ToolResult | None:
+        """活动 Draft 存在时读当前 Draft Revision；否则返回 None 走已发布路径。"""
+        draft = await self._db.scalar(
+            select(ArtifactDraft).where(ArtifactDraft.artifact_id == artifact.id)
+        )
+        if (
+            draft is None
+            or draft.session_id != context.session_id
+            or draft.status not in _ACTIVE_DRAFT_STATUSES
+            or draft.current_revision < 1
+        ):
+            return None
+        revision = await self._db.scalar(
+            select(ArtifactDraftRevision).where(
+                ArtifactDraftRevision.draft_id == draft.id,
+                ArtifactDraftRevision.revision == draft.current_revision,
+            )
+        )
+        if revision is None:
+            return None
+
+        payload: Any = revision.payload_json if revision.payload_json is not None else {}
+        section_out: str | None = None
+        if section:
+            payload = _resolve_pointer(payload, section)
+            if payload is _MISSING:
+                return _failed(NOT_FOUND, "artifact_section_not_found")
+            section_out = section
+
+        summary = json.dumps(
+            {
+                "artifact_id": artifact.id,
+                "status": "draft",
+                "draft_id": draft.id,
+                "revision": revision.revision,
+                "schema_version": revision.schema_version,
+                "section": section_out,
                 "payload": payload,
             },
             ensure_ascii=False,

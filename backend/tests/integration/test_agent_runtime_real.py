@@ -420,6 +420,17 @@ async def _new_user_session_wallet(
     return user, agent_session, wallet
 
 
+async def _fresh_wallet_balance(db: AsyncSession, user_id: str) -> int:
+    """结束当前事务的 REPEATABLE READ 快照后读钱包余额（当前读）。
+
+    计费结算发生在引擎内部的独立事务；复用同一 Session 的旧快照会读到
+    过时余额（第二轮 UAT 的 points_after 失真即源于此），误导结果分析。
+    """
+    await db.commit()
+    wallet = await db.get(Wallet, user_id)
+    return wallet.balance if wallet is not None else 0
+
+
 async def _run_scenario(
     *,
     scenario: str,
@@ -502,10 +513,9 @@ async def _run_scenario(
             messages=[ChatMessage(role="user", content=prompt)],
         )
 
-        wallet_row = await session.get(Wallet, user.id)
         record.status = str(outcome.status)
         record.decision_count = outcome.decision_count
-        record.points_after = wallet_row.balance if wallet_row is not None else 0
+        record.points_after = await _fresh_wallet_balance(session, user.id)
         await _collect_run_record(session, run.id, record)
         await session.commit()
         return record
@@ -987,7 +997,7 @@ async def test_uat_kol_detail_real_fetch() -> None:
                     run_row = await session.get(AgentRun, run_id)
                     record.status = str(run_row.status) if run_row else "undelivered"
                     await _collect_run_record(session, run_id, record)
-                record.points_after = (await session.get(Wallet, user.id)).balance
+                record.points_after = await _fresh_wallet_balance(session, user.id)
                 await session.commit()
                 pytest.fail(
                     f"kol_detail 真实 fetch 未交付 kol_detail_v2（{platform}/{kol_uid}）：{exc}"
@@ -997,7 +1007,7 @@ async def test_uat_kol_detail_real_fetch() -> None:
             record.run_id = summary.run_id or ""
             record.status = str(run_row.status) if run_row else "unknown"
             record.decision_count = run_row.decision_count if run_row else 0
-            record.points_after = (await session.get(Wallet, user.id)).balance
+            record.points_after = await _fresh_wallet_balance(session, user.id)
 
             # 必须是缓存未命中的真实抓取：返回新 Run 且 detail 标记 hit=false。
             assert summary.cached is False, "期望真实 fetch，实际命中缓存"
@@ -1121,7 +1131,7 @@ async def test_uat_kol_detail_cache_real() -> None:
                 status="completed",
                 decision_count=0,
                 points_before=1000,
-                points_after=(await session.get(Wallet, user.id)).balance,
+                points_after=await _fresh_wallet_balance(session, user.id),
                 user_id=user.id,
                 session_id=agent_session.id,
             )
@@ -1229,7 +1239,7 @@ async def test_uat_tool_failure_does_not_stop_run() -> None:
                 status=str(outcome.status),
                 decision_count=outcome.decision_count,
                 points_before=1000,
-                points_after=(await session.get(Wallet, user.id)).balance,
+                points_after=await _fresh_wallet_balance(session, user.id),
             )
             await _collect_run_record(session, run.id, record)
             _ALL_RECORDS.append(record)
@@ -1517,7 +1527,7 @@ async def test_uat_reviewer_revise_then_fix() -> None:
                 status=str(outcome.status),
                 decision_count=outcome.decision_count,
                 points_before=1000,
-                points_after=(await session.get(Wallet, user.id)).balance,
+                points_after=await _fresh_wallet_balance(session, user.id),
             )
             await _collect_run_record(session, run.id, record)
             _ALL_RECORDS.append(record)

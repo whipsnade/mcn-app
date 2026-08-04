@@ -331,6 +331,194 @@ async def test_read_artifact_cross_user_forbidden(db_session, user_factory) -> N
 
 
 # ---------------------------------------------------------------------------
+# read_artifact 读取未发布 Draft（F1）：Builder 产出 Draft 后模型需要验证内容；
+# 活动 Draft（drafting/reviewing）优先于已发布 Version，发布语义不变。
+# ---------------------------------------------------------------------------
+
+
+async def _make_draft_only_artifact(
+    db_session,
+    user_id: str,
+    session: AgentSession,
+    run: AgentRun,
+    *,
+    payload: dict,
+    draft_status: str = "drafting",
+    artifact_id: str | None = None,
+) -> tuple[AgentArtifact, ArtifactDraft, ArtifactDraftRevision]:
+    """落一个只有活动 Draft（无已发布 Version）的 Artifact。"""
+    now = _now()
+    artifact = AgentArtifact(
+        id=artifact_id or str(uuid4()),
+        session_id=session.id,
+        user_id=user_id,
+        module="brand",
+        artifact_type="brand_report_v3",
+        parent_artifact_id=None,
+        artifact_key="brand/draft-only",
+        status="draft",
+        latest_version=0,
+        activity_sequence=0,
+        created_at=now,
+        updated_at=now,
+    )
+    db_session.add(artifact)
+    await db_session.flush()
+    draft = ArtifactDraft(
+        id=str(uuid4()),
+        artifact_id=artifact.id,
+        session_id=session.id,
+        owner_run_id=run.id,
+        current_revision=1,
+        status=draft_status,
+        updated_at=now,
+    )
+    db_session.add(draft)
+    await db_session.flush()
+    revision = ArtifactDraftRevision(
+        id=str(uuid4()),
+        draft_id=draft.id,
+        artifact_id=artifact.id,
+        run_id=run.id,
+        revision=1,
+        schema_version="brand_report_v3",
+        payload_json=payload,
+        payload_hash="h" * 64,
+        created_at=now,
+    )
+    db_session.add(revision)
+    await db_session.flush()
+    return artifact, draft, revision
+
+
+async def test_read_artifact_reads_active_draft(db_session, user_factory) -> None:
+    """Builder 刚落 Draft（尚无已发布 Version）→ read_artifact 读 Draft 并标注。"""
+    user = await user_factory()
+    session, run, _step, _call = await _make_chain(db_session, user.id)
+    payload = {"title": "品牌报告草稿", "data": {"overview": {"total_volume": 100}}}
+    artifact, draft, _revision = await _make_draft_only_artifact(
+        db_session, user.id, session, run, payload=payload
+    )
+    context = ToolContext(user_id=user.id, session_id=session.id, run_id=run.id, profile_name="session_analyst_v1")
+
+    tool = ReadArtifactTool(db_session)
+    result = await tool.execute(context, type(tool).input_model(artifact_id=artifact.id))
+    data = _summary(result)
+    assert data["status"] == "draft"
+    assert data["revision"] == 1
+    assert data["draft_id"] == draft.id
+    assert data["payload"] == payload
+
+
+async def test_read_artifact_draft_section_rfc6901_slice(db_session, user_factory) -> None:
+    """Draft 的 section 参数按 RFC6901 切片（supporting_paths 同形路径）。"""
+    user = await user_factory()
+    session, run, _step, _call = await _make_chain(db_session, user.id)
+    payload = {"title": "草稿", "data": {"overview": {"total_volume": 100}}}
+    artifact, _draft, _revision = await _make_draft_only_artifact(
+        db_session, user.id, session, run, payload=payload
+    )
+    context = ToolContext(user_id=user.id, session_id=session.id, run_id=run.id, profile_name="session_analyst_v1")
+
+    tool = ReadArtifactTool(db_session)
+    result = await tool.execute(
+        context,
+        type(tool).input_model(artifact_id=artifact.id, section="/data/overview"),
+    )
+    data = _summary(result)
+    assert data["status"] == "draft"
+    assert data["section"] == "/data/overview"
+    assert data["payload"] == {"total_volume": 100}
+
+    missing = await tool.execute(
+        context,
+        type(tool).input_model(artifact_id=artifact.id, section="/data/nonexistent"),
+    )
+    assert missing.status == "failed"
+    assert missing.error_type == NOT_FOUND
+
+
+async def test_read_artifact_draft_cross_session_not_found(db_session, user_factory) -> None:
+    """他人 Session 的活动 Draft 不泄漏存在性（与已发布 Version 同一语义）。"""
+    owner = await user_factory()
+    other = await user_factory()
+    session, run, _step, _call = await _make_chain(db_session, owner.id)
+    artifact, _draft, _revision = await _make_draft_only_artifact(
+        db_session, owner.id, session, run, payload={"title": "私有草稿"}
+    )
+    other_session, other_run, _s2, _c2 = await _make_chain(db_session, other.id)
+    context = ToolContext(
+        user_id=other.id,
+        session_id=other_session.id,
+        run_id=other_run.id,
+        profile_name="session_analyst_v1",
+    )
+
+    tool = ReadArtifactTool(db_session)
+    result = await tool.execute(context, type(tool).input_model(artifact_id=artifact.id))
+    assert result.status == "failed"
+    assert result.error_type == NOT_FOUND
+
+
+async def test_read_artifact_draft_preferred_then_published_after_release(
+    db_session, user_factory,
+) -> None:
+    """发布前后状态标注：活动中（reviewing）读 Draft；Draft 释放回 idle 后
+    回到已发布 Version（status=published），显式 version 恒读已发布。"""
+    user = await user_factory()
+    session, run, _step, _call = await _make_chain(db_session, user.id)
+    published_payload = {"title": "已发布", "data": {"overview": {"total_volume": 1}}}
+    artifact = await _make_artifact(
+        db_session, user.id, session, run, payload=published_payload
+    )
+    context = ToolContext(user_id=user.id, session_id=session.id, run_id=run.id, profile_name="session_analyst_v1")
+    tool = ReadArtifactTool(db_session)
+
+    # 进入新一轮 drafting：current_revision 指向新草稿 Revision。
+    draft = await db_session.scalar(
+        select(ArtifactDraft).where(ArtifactDraft.artifact_id == artifact.id)
+    )
+    assert draft is not None
+    draft.status = "reviewing"
+    draft.current_revision = 1
+    draft_payload = {"title": "修订中", "data": {"overview": {"total_volume": 2}}}
+    db_session.add(
+        ArtifactDraftRevision(
+            id=str(uuid4()),
+            draft_id=draft.id,
+            artifact_id=artifact.id,
+            run_id=run.id,
+            revision=1,
+            schema_version="v1",
+            payload_json=draft_payload,
+            payload_hash="h" * 64,
+            created_at=_now(),
+        )
+    )
+    await db_session.flush()
+
+    draft_read = _summary(await tool.execute(context, type(tool).input_model(artifact_id=artifact.id)))
+    assert draft_read["status"] == "draft"
+    assert draft_read["payload"] == draft_payload
+
+    # 显式 version 恒读已发布 Version（语义不变）。
+    versioned = _summary(
+        await tool.execute(context, type(tool).input_model(artifact_id=artifact.id, version=1))
+    )
+    assert versioned["status"] == "published"
+    assert versioned["payload"] == published_payload
+
+    # Draft 释放（发布完成回 idle）后回到已发布 Version。
+    draft.status = "idle"
+    await db_session.flush()
+    published_read = _summary(
+        await tool.execute(context, type(tool).input_model(artifact_id=artifact.id))
+    )
+    assert published_read["status"] == "published"
+    assert published_read["payload"] == published_payload
+
+
+# ---------------------------------------------------------------------------
 # search_evidence
 # ---------------------------------------------------------------------------
 
