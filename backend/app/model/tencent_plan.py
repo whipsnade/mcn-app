@@ -469,11 +469,10 @@ class TencentPlanAdapter:
                 if not partial_output_received and self._is_stream_unsupported(exc):
                     raise _StreamUnsupported(_request_id(exc) or request_id) from exc
                 mapped = self._map_error(exc)
-                if (
-                    mapped.retryable
-                    and not partial_output_received
-                    and create_attempt + 1 < self._max_attempts
-                ):
+                # 模型调用无外部副作用，可重试错误（网络中断、供应商生成中止）
+                # 即使已收到部分输出也可安全整体重试——供应商对生成中止类错误
+                # 明确建议 retry。
+                if mapped.retryable and create_attempt + 1 < self._max_attempts:
                     await self._backoff(create_attempt)
                     create_attempt += 1
                     continue

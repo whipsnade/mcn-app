@@ -325,6 +325,42 @@ async def test_complete_json_fallback_publishes_think_before_repairing_invalid_j
 
 
 @pytest.mark.asyncio
+async def test_complete_json_retries_provider_generation_abort_mid_stream() -> None:
+    """供应商 response_format 生成中途自我中止（已收到部分输出）也可安全重试。"""
+    import httpx
+    from openai import APIError
+
+    async def abort_stream() -> Any:
+        yield SimpleNamespace(
+            choices=[SimpleNamespace(delta=SimpleNamespace(content='{"value": 4'), finish_reason=None)],
+            usage=None,
+            _request_id="req-abort",
+        )
+        raise APIError(
+            "<400> InternalError.Algo.InvalidParameter: Model output became abnormal "
+            "while generating a JSON response for response_format. Please retry.",
+            request=httpx.Request("POST", "https://example.com/v1/chat/completions"),
+            body=None,
+        )
+
+    sink = CaptureThinkingSink()
+    client = FakeCompletions(
+        [
+            abort_stream(),
+            stream_chunks(
+                content_chunks=['{"value": 4}'], reasoning_chunks=[None], finished=True
+            ),
+        ]
+    )
+    adapter = TencentPlanAdapter(client=client, log_writer=_CaptureWriter(), stream_support_cache={})
+
+    result = await adapter.complete_json(_request(thinking_sink=sink))
+
+    assert result.value.value == 4
+    assert len(client.calls) == 2
+
+
+@pytest.mark.asyncio
 async def test_complete_json_stream_interrupt_after_visible_output_does_not_replay() -> None:
     sink = CaptureThinkingSink()
     client = FakeCompletions(
