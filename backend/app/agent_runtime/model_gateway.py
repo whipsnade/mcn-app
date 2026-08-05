@@ -202,6 +202,11 @@ class AgentModelGateway:
         )
         self._db.add(step)
         await self._db.flush()
+        # 决策 Step 在调用供应商前必须提交（设计 §七"每次模型决策前持久化"）：
+        # flush 不提交会让本事务在长达数分钟的模型调用期间持有 agent_runs 父行
+        # 的 FK 共享锁，心跳续租（独立连接的 FOR UPDATE）将被阻塞至 InnoDB 锁
+        # 等待超时，误报租约丢失并杀死 Run（真实 UAT kol_detail/钻取事故）。
+        await self._db.commit()
 
         # 2) 复用适配器调用：有真实 sink 走流式（只转发供应商暴露的
         #    thinking），无 sink 走非流式；JSON 修复与 Schema 严格校验都在
