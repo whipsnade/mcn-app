@@ -1,6 +1,6 @@
-"""历史读取工具（设计文档 §九 / §10.2「大结果处理」）。
+"""历史读取工具（设计文档 §九 / §10.2「大结果处理」）与范围记忆工具。
 
-三个 TrustedTool（HISTORY_TOOLS 分类）：
+三个只读 TrustedTool（HISTORY_TOOLS 分类）：
 - ``read_artifact(artifact_id, version?, section?)``：读取 Artifact 的
   payload（或某个 section）——默认读最新已发布 Version（``status="published"``）；
   Artifact 有活动 Draft（drafting/reviewing，如 Builder 刚产出待审核）时读
@@ -11,18 +11,24 @@
 - ``read_tool_result(evidence_id, cursor?, limit?)``：按游标分片读取 Evidence
   原始结果，绝不整页返回。
 
-每个工具都校验 Evidence/Artifact 属于当前用户和 Session：缺失返回
+写入侧仅有 ``remember_scope``（同为 HISTORY_TOOLS）：把用户已确认的范围条件
+持久化为 ``confirmed_scope`` 记忆条目，同 domain+field 的旧 active 条目被
+supersede；Context Builder 只注入未 supersede 条目。
+
+每个工具都校验 Evidence/Artifact/Session 属于当前用户和 Session：缺失返回
 ``not_found``，跨用户返回 ``forbidden``（Router 层统一映射为 404）。
 """
 
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Literal
+from uuid import uuid4
 
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from typing_extensions import TypeAliasType
 
 from app.agent_artifacts.models import (
     AgentArtifact,
@@ -30,8 +36,16 @@ from app.agent_artifacts.models import (
     ArtifactDraft,
     ArtifactDraftRevision,
 )
-from app.agent_runtime.models import AgentSession, EvidenceItem
+from app.agent_runtime.models import AgentSession, EvidenceItem, MemoryEntry
+from app.agent_runtime.repository import utc_now
 from app.agent_runtime.tools.contracts import ToolContext, ToolResult
+
+# 与 mcp_gateway.transport.JsonValue 同义，但用 TypeAliasType 声明：py311 下
+# pydantic 无法为 typing.TypeAlias 的隐式递归别名生成 Schema（RecursionError）。
+JsonValue = TypeAliasType(
+    "JsonValue",
+    "None | bool | int | float | str | list[JsonValue] | dict[str, JsonValue]",
+)
 
 # 结构化错误类型；Router 层把两者都映射为 404（§九「跨 Session 返回 404」）。
 NOT_FOUND = "not_found"
@@ -449,6 +463,87 @@ class ReadToolResultTool:
         return [raw], 1
 
 
+# --------------------------------------------------------------------------- #
+# remember_scope
+# --------------------------------------------------------------------------- #
+
+
+class RememberScopeArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    domain: Literal["brand", "campaign", "kol"]
+    values: dict[str, JsonValue]
+    source_message_id: str
+    explicit: bool = True
+
+
+class RememberScopeTool:
+    """持久化用户已确认的范围条件（``confirmed_scope`` 记忆；零积分）。
+
+    按 ``values`` 的每个 field 落一条 ``confirmed_scope`` MemoryEntry；同
+    domain+field 的旧 active 条目在同一事务里被 supersede（保留审计历史），
+    Context Builder 只注入未 supersede 条目。
+    """
+
+    name = "remember_scope"
+    input_model = RememberScopeArgs
+    points_cost = 0
+    external_side_effect = False
+
+    def __init__(self, db_session: AsyncSession) -> None:
+        self._db = db_session
+
+    async def execute(self, context: ToolContext, arguments: BaseModel) -> ToolResult:
+        args, parse_error = _parse_args(RememberScopeArgs, arguments)
+        if parse_error is not None:
+            return parse_error
+        _session, error = await _owned_session(self._db, context)
+        if error is not None:
+            return _failed(error, "session_" + error)
+
+        now = utc_now()
+        superseded = 0
+        for field, value in args.values.items():
+            previous = await self._db.scalars(
+                select(MemoryEntry).where(
+                    MemoryEntry.session_id == context.session_id,
+                    MemoryEntry.memory_type == "confirmed_scope",
+                    MemoryEntry.superseded_at.is_(None),
+                    MemoryEntry.content_json["domain"].as_string() == args.domain,
+                    MemoryEntry.content_json["field"].as_string() == field,
+                )
+            )
+            for entry in previous:
+                entry.superseded_at = now
+                superseded += 1
+            self._db.add(
+                MemoryEntry(
+                    id=str(uuid4()),
+                    session_id=context.session_id,
+                    source_run_id=context.run_id,
+                    memory_type="confirmed_scope",
+                    content_json={
+                        "domain": args.domain,
+                        "field": field,
+                        "value": value,
+                        "source_message_id": args.source_message_id,
+                        "explicit": args.explicit,
+                    },
+                    created_at=now,
+                )
+            )
+        await self._db.flush()
+        summary = json.dumps(
+            {
+                "domain": args.domain,
+                "remembered": dict(args.values),
+                "superseded": superseded,
+            },
+            ensure_ascii=False,
+        )
+        return ToolResult(status="success", safe_summary=summary)
+
+
 __all__ = [
     "FORBIDDEN",
     "INVALID_ARGUMENTS",
@@ -457,6 +552,8 @@ __all__ = [
     "ReadArtifactTool",
     "ReadToolResultArgs",
     "ReadToolResultTool",
+    "RememberScopeArgs",
+    "RememberScopeTool",
     "SearchEvidenceArgs",
     "SearchEvidenceTool",
 ]

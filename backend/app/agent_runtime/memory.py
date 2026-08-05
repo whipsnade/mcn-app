@@ -1,8 +1,9 @@
 """分层记忆上下文构建器（设计文档 §九）。
 
 Session Agent 每轮默认获得：当前用户消息、最近有限条消息、Session Summary、
-历史 Run 摘要、紧凑 Artifact 目录（类型/版本/范围/父子关系/数据状态）、
-可用工具与成本、钱包余额，以及 1-2 个去敏成功示例（§6.2 exemplars）。
+历史 Run 摘要、分域已确认范围（``confirmed_scope``，只含未被 supersede 的
+条目）、紧凑 Artifact 目录（类型/版本/范围/父子关系/数据状态）、可用工具与
+成本、钱包余额，以及 1-2 个去敏成功示例（§6.2 exemplars）。
 
 **默认上下文绝不注入完整 Evidence 或完整历史报告 payload**；模型按需调用
 历史读取工具（read_artifact / search_evidence / read_tool_result）钻取。
@@ -76,6 +77,7 @@ class MemoryContextBuilder:
 
         recent = await self._recent_messages(session_id, recent_message_window)
         run_summaries = await self._run_summaries(session_id, run_summary_limit)
+        confirmed_scopes = await self._confirmed_scopes(session_id)
         artifact_directory = await self._artifact_directory(session_id)
         tools = await self._registry.visible_tools(profile, channel_permissions=channel_permissions)
 
@@ -87,6 +89,8 @@ class MemoryContextBuilder:
             "recent_messages": recent,
             "session_summary": session.session_summary,
             "run_summaries": run_summaries,
+            # 分域已确认范围（条件优先级 §5.3「当前 Session 分域确认条件」）。
+            "confirmed_scopes": confirmed_scopes,
             "artifact_directory": artifact_directory,
             "available_tools": [
                 {
@@ -165,6 +169,35 @@ class MemoryContextBuilder:
             content["source_run_id"] = entry.source_run_id
             summaries.append(content)
         return summaries
+
+    async def _confirmed_scopes(self, session_id: str) -> list[dict[str, Any]]:
+        """当前 Session 未被 supersede 的 confirmed_scope 条目（时间正序）。"""
+        entries = (
+            await self._db.scalars(
+                select(MemoryEntry)
+                .where(
+                    MemoryEntry.session_id == session_id,
+                    MemoryEntry.memory_type == "confirmed_scope",
+                    MemoryEntry.superseded_at.is_(None),
+                )
+                .order_by(MemoryEntry.created_at.asc(), MemoryEntry.id.asc())
+            )
+        ).all()
+        scopes: list[dict[str, Any]] = []
+        for entry in entries:
+            content = dict(entry.content_json or {})
+            scopes.append(
+                {
+                    "memory_id": entry.id,
+                    "domain": content.get("domain"),
+                    "field": content.get("field"),
+                    "value": content.get("value"),
+                    "explicit": content.get("explicit", True),
+                    "source_message_id": content.get("source_message_id"),
+                    "source_run_id": entry.source_run_id,
+                }
+            )
+        return scopes
 
     async def _artifact_directory(self, session_id: str) -> list[dict[str, Any]]:
         artifacts = (

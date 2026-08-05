@@ -214,6 +214,8 @@ async def test_default_context_contains_only_bounded_sections(db_session, user_f
         "recent_messages",
         "session_summary",
         "run_summaries",
+        # 分域已确认范围（confirmed_scope 记忆，只含未被 supersede 的条目）。
+        "confirmed_scopes",
         "artifact_directory",
         "available_tools",
         "wallet",
@@ -222,6 +224,8 @@ async def test_default_context_contains_only_bounded_sections(db_session, user_f
     }
     # 测试用户无历史成功调用记录：示例为空但键必须存在。
     assert context["exemplars"] == []
+    # 无 confirmed_scope 记忆时为空列表但键必须存在。
+    assert context["confirmed_scopes"] == []
     assert context["current_user_message"] == "继续分析"
     assert context["session_summary"] == "用户关注美妆品牌声量，已产出品牌声量分析。"
     assert len(context["run_summaries"]) == 1
@@ -603,3 +607,64 @@ async def test_context_exemplar_lookup_failure_is_best_effort(
     )
     assert context["exemplars"] == []
     assert context["available_tools"]
+
+
+# ---------------------------------------------------------------------------
+# confirmed_scope 注入：只注入未 supersede 的分域已确认范围
+# ---------------------------------------------------------------------------
+
+
+async def test_context_injects_only_active_confirmed_scopes(db_session, user_factory) -> None:
+    user = await user_factory()
+    session = await _seed_session(db_session, user.id)
+    now = _now()
+    db_session.add(
+        MemoryEntry(
+            id=str(uuid4()),
+            session_id=session.id,
+            source_run_id=None,
+            memory_type="confirmed_scope",
+            content_json={
+                "domain": "brand",
+                "field": "period",
+                "value": "近30天",
+                "source_message_id": "m-1",
+                "explicit": True,
+            },
+            created_at=now,
+        )
+    )
+    db_session.add(
+        MemoryEntry(
+            id=str(uuid4()),
+            session_id=session.id,
+            source_run_id=None,
+            memory_type="confirmed_scope",
+            content_json={
+                "domain": "brand",
+                "field": "period",
+                "value": "近7天",
+                "source_message_id": "m-0",
+                "explicit": True,
+            },
+            created_at=now,
+            superseded_at=now,
+        )
+    )
+    await db_session.flush()
+    builder = MemoryContextBuilder(db_session, _registry(db_session))
+
+    context = await builder.build(
+        user_id=user.id,
+        session_id=session.id,
+        profile=session_analyst,
+        current_user_message="继续分析",
+    )
+    scopes = context["confirmed_scopes"]
+    # 只注入未 supersede 的条目：旧值「近7天」不出现。
+    assert [(s["domain"], s["field"], s["value"]) for s in scopes] == [
+        ("brand", "period", "近30天")
+    ]
+    assert scopes[0]["explicit"] is True
+    assert scopes[0]["source_message_id"] == "m-1"
+    assert scopes[0]["memory_id"]

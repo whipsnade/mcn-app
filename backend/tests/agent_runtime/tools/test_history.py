@@ -27,6 +27,7 @@ from app.agent_runtime.models import (
     AgentSession,
     AgentStep,
     AgentToolCall,
+    MemoryEntry,
 )
 from app.agent_runtime.tools.contracts import ToolContext
 from app.agent_runtime.tools.history import (
@@ -35,6 +36,8 @@ from app.agent_runtime.tools.history import (
     NOT_FOUND,
     ReadArtifactTool,
     ReadToolResultTool,
+    RememberScopeArgs,
+    RememberScopeTool,
     SearchEvidenceTool,
 )
 
@@ -696,3 +699,131 @@ async def test_search_evidence_does_not_load_raw_payload_columns(db_session, use
     assert search_selects
     for sql in search_selects:
         assert "raw_payload_json" not in sql
+
+
+# ---------------------------------------------------------------------------
+# remember_scope
+# ---------------------------------------------------------------------------
+
+
+async def _scope_entries(db_session, session_id: str) -> list[MemoryEntry]:
+    return list(
+        (
+            await db_session.scalars(
+                select(MemoryEntry)
+                .where(
+                    MemoryEntry.session_id == session_id,
+                    MemoryEntry.memory_type == "confirmed_scope",
+                )
+                .order_by(MemoryEntry.created_at, MemoryEntry.id)
+            )
+        ).all()
+    )
+
+
+async def test_remember_scope_writes_confirmed_scope_entries(db_session, user_factory) -> None:
+    user = await user_factory()
+    session, run, _step, _call = await _make_chain(db_session, user.id)
+    context = ToolContext(
+        user_id=user.id, session_id=session.id, run_id=run.id, profile_name="session_analyst_v1"
+    )
+
+    tool = RememberScopeTool(db_session)
+    result = await tool.execute(
+        context,
+        RememberScopeArgs(
+            domain="brand",
+            values={"period": "近30天", "platform": "小红书"},
+            source_message_id="m-1",
+        ),
+    )
+    data = _summary(result)
+    assert data["domain"] == "brand"
+    assert data["remembered"] == {"period": "近30天", "platform": "小红书"}
+
+    entries = await _scope_entries(db_session, session.id)
+    assert len(entries) == 2
+    by_field = {entry.content_json["field"]: entry for entry in entries}
+    assert by_field["period"].content_json["value"] == "近30天"
+    assert by_field["platform"].content_json["value"] == "小红书"
+    for entry in entries:
+        assert entry.content_json["domain"] == "brand"
+        assert entry.content_json["explicit"] is True
+        assert entry.content_json["source_message_id"] == "m-1"
+        assert entry.source_run_id == run.id
+        assert entry.superseded_at is None
+
+
+async def test_remember_scope_supersedes_same_domain_field(db_session, user_factory) -> None:
+    """同 domain+field 的旧 active 条目被 supersede；其他 field / domain 不受影响。"""
+    user = await user_factory()
+    session, run, _step, _call = await _make_chain(db_session, user.id)
+    context = ToolContext(
+        user_id=user.id, session_id=session.id, run_id=run.id, profile_name="session_analyst_v1"
+    )
+    tool = RememberScopeTool(db_session)
+
+    first = await tool.execute(
+        context,
+        RememberScopeArgs(
+            domain="brand",
+            values={"period": "近30天", "platform": "小红书"},
+            source_message_id="m-1",
+        ),
+    )
+    assert first.status == "success"
+    second = await tool.execute(
+        context,
+        RememberScopeArgs(
+            domain="brand", values={"period": "近90天"}, source_message_id="m-2"
+        ),
+    )
+    data = _summary(second)
+    assert data["superseded"] == 1
+
+    entries = await _scope_entries(db_session, session.id)
+    active = {
+        entry.content_json["field"]: entry.content_json["value"]
+        for entry in entries
+        if entry.superseded_at is None
+    }
+    # period 被新值替代，platform 保持 active。
+    assert active == {"period": "近90天", "platform": "小红书"}
+    superseded = [entry for entry in entries if entry.superseded_at is not None]
+    assert len(superseded) == 1
+    assert superseded[0].content_json["value"] == "近30天"
+
+
+async def test_remember_scope_invalid_domain_rejected(db_session, user_factory) -> None:
+    user = await user_factory()
+    session, run, _step, _call = await _make_chain(db_session, user.id)
+    context = ToolContext(
+        user_id=user.id, session_id=session.id, run_id=run.id, profile_name="session_analyst_v1"
+    )
+    tool = RememberScopeTool(db_session)
+    result = await tool.execute(
+        context,
+        {"domain": "product", "values": {"period": "近30天"}, "source_message_id": "m-1"},
+    )
+    assert result.status == "failed"
+    assert result.error_type == INVALID_ARGUMENTS
+    assert await _scope_entries(db_session, session.id) == []
+
+
+async def test_remember_scope_cross_user_forbidden(db_session, user_factory) -> None:
+    owner = await user_factory()
+    other = await user_factory()
+    session, run, _step, _call = await _make_chain(db_session, owner.id)
+    context = ToolContext(
+        user_id=other.id, session_id=session.id, run_id=run.id, profile_name="session_analyst_v1"
+    )
+    tool = RememberScopeTool(db_session)
+    result = await tool.execute(
+        context,
+        RememberScopeArgs(
+            domain="kol", values={"platform": "抖音"}, source_message_id="m-1"
+        ),
+    )
+    assert result.status == "failed"
+    assert result.error_type == FORBIDDEN
+    assert await _scope_entries(db_session, session.id) == []

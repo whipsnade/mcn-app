@@ -24,10 +24,17 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agent_artifacts.models import AgentArtifact, AgentArtifactVersion
 from app.agent_runtime.events import AgentEventBroker, AgentEventStream
 from app.agent_runtime.executor import SESSION_ANALYST_PROFILE, AgentRunExecutor
 from app.agent_runtime.kol_detail import KolDetailRunService, KolDetailSelectionRefNotFound
-from app.agent_runtime.models import AgentMessage, AgentRun, AgentSession
+from app.agent_runtime.models import (
+    AgentMessage,
+    AgentRun,
+    AgentSession,
+    EvidenceItem,
+    MemoryEntry,
+)
 from app.agent_runtime.repository import AgentRunRepository, utc_now
 from app.agent_runtime.sse import sse_event_chunks
 from app.agent_runtime.state import InvalidRunTransition, RunStatus
@@ -124,6 +131,10 @@ class AgentMessageCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     content: str = Field(min_length=1, max_length=20000)
+    # 父 Run 只表达澄清/钻取来源，不代表复用执行状态；每条消息仍创建新 Run。
+    parent_run_id: str | None = None
+    # 用户确认引用的已发布 Artifact Version（§5.4 历史复用），最多 10 个。
+    artifact_version_ids: tuple[str, ...] = Field(default_factory=tuple, max_length=10)
 
 
 class MessageRunResponse(BaseModel):
@@ -246,6 +257,80 @@ async def _find_idempotent_run(
             AgentRun.prompt_snapshot_json["idempotency_key"].as_string() == key,
         )
     )
+
+
+async def _resolve_parent_run_id(
+    db: AsyncSession, user_id: str, session_id: str, requested: str | None
+) -> str | None:
+    """解析新 Run 的父链接。
+
+    显式 ``parent_run_id`` 必须属本用户、同 Session 且用户可见——任何归属失败
+    统一 404，不泄漏存在性；未显式给出时，回答活动 pending_question 的消息自动
+    以其来源 Run 为父（澄清回答 Run 保留父链接）。父链接只表达澄清/钻取来源，
+    不代表复用执行状态。
+    """
+    if requested is not None:
+        parent = await db.scalar(
+            select(AgentRun.id).where(
+                AgentRun.id == requested,
+                AgentRun.user_id == user_id,
+                AgentRun.session_id == session_id,
+                AgentRun.visibility == "user",
+            )
+        )
+        if parent is None:
+            raise _not_found("parent_run_not_found")
+        return requested
+    pending = await db.scalar(
+        select(MemoryEntry)
+        .where(
+            MemoryEntry.session_id == session_id,
+            MemoryEntry.memory_type == "pending_question",
+            MemoryEntry.superseded_at.is_(None),
+        )
+        .order_by(MemoryEntry.created_at.desc())
+        .limit(1)
+    )
+    return pending.source_run_id if pending is not None else None
+
+
+async def _supersede_pending_questions(db: AsyncSession, session_id: str) -> None:
+    """新用户消息到达即视为回答了悬挂问题：supersede 活动 pending_question。"""
+    pendings = await db.scalars(
+        select(MemoryEntry).where(
+            MemoryEntry.session_id == session_id,
+            MemoryEntry.memory_type == "pending_question",
+            MemoryEntry.superseded_at.is_(None),
+        )
+    )
+    now = utc_now()
+    for entry in pendings:
+        entry.superseded_at = now
+
+
+async def _validate_artifact_version_ids(
+    db: AsyncSession, user_id: str, session_id: str, version_ids: tuple[str, ...]
+) -> list[str]:
+    """校验引用的 Artifact Version 属本用户、同 Session 且已发布（§5.4：
+    草稿、失败产物和其他用户数据不可被引用）；任何失败统一 404。按入参
+    顺序去重后返回。
+    """
+    validated: list[str] = []
+    for version_id in dict.fromkeys(version_ids):
+        row = await db.scalar(
+            select(AgentArtifactVersion.id)
+            .join(AgentArtifact, AgentArtifactVersion.artifact_id == AgentArtifact.id)
+            .where(
+                AgentArtifactVersion.id == version_id,
+                AgentArtifact.user_id == user_id,
+                AgentArtifact.session_id == session_id,
+                AgentArtifact.status == "published",
+            )
+        )
+        if row is None:
+            raise _not_found("artifact_version_not_found")
+        validated.append(version_id)
+    return validated
 
 
 def _resolve_last_event_id(header_value: str | None, query_value: str | None) -> int:
@@ -437,6 +522,13 @@ async def append_message(
                 reused=True,
             )
 
+    # 引用校验（建 Run 前）：父 Run 与 Artifact Version 必须属本用户、同 Session
+    # 且 Version 已发布；任何归属失败统一 404，不泄漏存在性。
+    parent_run_id = await _resolve_parent_run_id(db, user.id, session_id, payload.parent_run_id)
+    artifact_version_ids = await _validate_artifact_version_ids(
+        db, user.id, session_id, payload.artifact_version_ids
+    )
+
     # 活动并发：同一 Session 只允许一个活动 session_analyst_v1 Run。
     # 用 FOR UPDATE（锁定读）而不是普通一致读：请求事务的 REPEATABLE-READ 快照
     # 在鉴权阶段就已建立，普通 SELECT 看不到另一个并发请求已提交的 Run；锁定读
@@ -479,6 +571,7 @@ async def append_message(
         session_id=session_id,
         user_id=user.id,
         input_message_id=message.id,
+        parent_run_id=parent_run_id,
         run_kind="user",
         visibility="user",
         profile_name=SESSION_ANALYST_PROFILE,
@@ -489,11 +582,24 @@ async def append_message(
         review_count=0,
         revision_count=0,
     )
+    # 引用快照：幂等键 / 父链接 / 引用的已发布 Version 随 Run 冻结，
+    # 供 Context Builder 以 run_references 注入模型上下文。
+    snapshot: dict[str, Any] = {}
     if idempotency_key is not None:
-        run.prompt_snapshot_json = {"idempotency_key": idempotency_key, "content_hash": content_hash}
+        snapshot["idempotency_key"] = idempotency_key
+        snapshot["content_hash"] = content_hash
+    if parent_run_id is not None:
+        snapshot["parent_run_id"] = parent_run_id
+    if artifact_version_ids:
+        snapshot["artifact_version_ids"] = artifact_version_ids
+    if snapshot:
+        run.prompt_snapshot_json = snapshot
     db.add(run)
     await db.flush()
     message.run_id = run.id
+    # 本条消息回答了悬挂澄清：supersede 活动 pending_question，避免后续
+    # 消息继续被自动挂到旧澄清 Run 下。
+    await _supersede_pending_questions(db, session_id)
 
     await db.commit()
     executor.submit(run.id)
@@ -604,6 +710,99 @@ async def resume_run(
     await db.commit()
     executor.submit(run.id)
     return AgentRunRead.model_validate(run)
+
+
+@router.post("/runs/{run_id}/retry", response_model=MessageRunResponse, status_code=201)
+async def retry_run(
+    run_id: str,
+    user: CurrentUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    executor: Annotated[AgentRunExecutor, Depends(get_agent_executor)],
+) -> MessageRunResponse:
+    """重试 failed/paused Run：创建新的 user-visible Child Run（parent_run_id
+    指向原 Run），把仍有效的 Evidence / 已发布 Artifact Version 引用冻结到新
+    Run 的 ``prompt_snapshot_json``；绝不修改或重开原 Run。
+    """
+    run = await _get_owned_run(db, user.id, run_id)
+    if run.status not in (RunStatus.FAILED, RunStatus.PAUSED):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="run_not_retryable"
+        )
+    # 单活动主 Run 约束：与 messages/resume 同一车道语义，锁 Session 行后检查。
+    await _get_owned_session(db, user.id, run.session_id, for_update=True)
+    active = await db.scalar(
+        select(AgentRun.id)
+        .where(
+            AgentRun.session_id == run.session_id,
+            AgentRun.user_id == user.id,
+            AgentRun.profile_name == SESSION_ANALYST_PROFILE,
+            AgentRun.status.in_(tuple(_ACTIVE_RUN_STATUSES)),
+        )
+        .with_for_update()
+        .limit(1)
+    )
+    if active is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="active_run_in_progress"
+        )
+
+    # 冻结仍有效的引用：available Evidence + 原 Run 产出且仍 published 的 Version。
+    evidence_ids = list(
+        (
+            await db.scalars(
+                select(EvidenceItem.id)
+                .where(
+                    EvidenceItem.run_id == run.id,
+                    EvidenceItem.availability_status == "available",
+                )
+                .order_by(EvidenceItem.collected_at, EvidenceItem.id)
+            )
+        ).all()
+    )
+    version_ids = list(
+        (
+            await db.scalars(
+                select(AgentArtifactVersion.id)
+                .join(AgentArtifact, AgentArtifactVersion.artifact_id == AgentArtifact.id)
+                .where(
+                    AgentArtifactVersion.source_run_id == run.id,
+                    AgentArtifact.status == "published",
+                )
+                .order_by(AgentArtifactVersion.created_at, AgentArtifactVersion.id)
+            )
+        ).all()
+    )
+
+    retried = AgentRun(
+        id=str(uuid4()),
+        session_id=run.session_id,
+        user_id=user.id,
+        input_message_id=run.input_message_id,
+        parent_run_id=run.id,
+        run_kind="user",
+        visibility="user",
+        profile_name=run.profile_name,
+        profile_version=run.profile_version,
+        model=get_settings().tencent_plan_model,
+        status="queued",
+        decision_count=0,
+        review_count=0,
+        revision_count=0,
+        prompt_snapshot_json={
+            "retry_of": run.id,
+            "evidence_ids": evidence_ids,
+            "artifact_version_ids": version_ids,
+        },
+    )
+    db.add(retried)
+    await db.commit()
+    executor.submit(retried.id)
+    return MessageRunResponse(
+        run_id=retried.id,
+        session_id=retried.session_id,
+        message_id=run.input_message_id or "",
+        status="queued",
+    )
 
 
 @router.get("/runs/{run_id}/events")

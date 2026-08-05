@@ -7,11 +7,16 @@
 成本、钱包余额、去敏成功示例），构成模型可见的默认上下文。
 
 不注入完整 Evidence / 完整历史报告 payload；模型按需通过历史读取工具钻取。
+
+若 Run 携带引用快照（``prompt_snapshot_json`` 中的父 Run / Artifact Version /
+retry 冻结的 Evidence 引用），以 ``run_references`` 键并入记忆头，模型据此
+理解本轮的澄清/钻取来源；幂等键等控制字段不进入上下文。
 """
 
 from __future__ import annotations
 
 import json
+from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -24,6 +29,9 @@ from app.agent_runtime.models import AgentRun
 from app.agent_runtime.profiles import AgentProfile
 from app.agent_runtime.tools.registry import ToolRegistry
 from app.model.contracts import ChatMessage
+
+# Run 引用快照中进入模型上下文的键（idempotency_key/content_hash 属控制字段，排除）。
+_REFERENCE_SNAPSHOT_KEYS = ("parent_run_id", "artifact_version_ids", "retry_of", "evidence_ids")
 
 
 class SessionContextBuilder:
@@ -60,8 +68,19 @@ class SessionContextBuilder:
             recent_message_window=self._recent_message_window,
             run_summary_limit=self._run_summary_limit,
         )
+        references = self._run_references(run)
+        if references:
+            memory["run_references"] = references
         header = json.dumps(memory, ensure_ascii=False, default=str)
         return [ChatMessage(role="user", content=header), *conversation]
+
+    @staticmethod
+    def _run_references(run: AgentRun) -> dict[str, Any]:
+        """从 Run 引用快照提取模型可见的父 Run / Artifact / Evidence 引用。"""
+        snapshot = run.prompt_snapshot_json or {}
+        return {
+            key: snapshot[key] for key in _REFERENCE_SNAPSHOT_KEYS if key in snapshot
+        }
 
 
 __all__ = ["SessionContextBuilder"]

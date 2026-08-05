@@ -18,9 +18,14 @@ from uuid import uuid4
 
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, func, select, update
 
-from app.agent_artifacts.models import AgentArtifact, ArtifactDraft
+from app.agent_artifacts.models import (
+    AgentArtifact,
+    AgentArtifactVersion,
+    ArtifactDraft,
+    ArtifactDraftRevision,
+)
 from app.agent_runtime.events import AgentEventStream
 from app.agent_runtime.kol_detail import KolDetailRunService
 from app.agent_runtime.models import (
@@ -29,6 +34,10 @@ from app.agent_runtime.models import (
     AgentRun,
     AgentRunAttempt,
     AgentSession,
+    AgentStep,
+    AgentToolCall,
+    EvidenceItem,
+    MemoryEntry,
 )
 from app.agent_runtime.repository import AgentRunRepository, utc_now
 from app.core.security import create_access_token
@@ -1008,3 +1017,380 @@ async def test_cancel_orphan_settle_unblocks_new_message(
     new_run = await db_session.get(AgentRun, body["run_id"])
     assert new_run is not None
     assert new_run.session_id == session_id
+
+
+# ---------------------------------------------------------------------------
+# 8. 父 Run / Artifact 引用 / retry（直接发布 Run 生命周期 Task 5）
+# ---------------------------------------------------------------------------
+
+
+async def _add_clarification_run(db_session, user_id: str, session_id: str) -> AgentRun:
+    """clarification_requested 的 Run + 一条活动 pending_question 记忆。"""
+    run = await _add_run(db_session, user_id, session_id, status="clarification_requested")
+    db_session.add(
+        MemoryEntry(
+            id=str(uuid4()),
+            session_id=session_id,
+            source_run_id=run.id,
+            memory_type="pending_question",
+            content_json={"question": "分析哪个周期？", "options": ["近30天", "近90天"]},
+            created_at=utc_now(),
+        )
+    )
+    await db_session.flush()
+    return run
+
+
+async def _add_artifact_version(
+    db_session,
+    user_id: str,
+    session_id: str,
+    run_id: str,
+    *,
+    artifact_status: str = "published",
+) -> AgentArtifactVersion:
+    """创建 Artifact + Draft Revision + 一个 Version 行；artifact_status 控制发布态。"""
+    now = utc_now()
+    artifact = AgentArtifact(
+        id=str(uuid4()),
+        session_id=session_id,
+        user_id=user_id,
+        module="brand",
+        artifact_type="brand_report_v2",
+        parent_artifact_id=None,
+        artifact_key=f"brand/report-{uuid4().hex[:8]}",
+        status=artifact_status,
+        latest_version=1,
+        activity_sequence=0,
+        created_at=now,
+        updated_at=now,
+    )
+    db_session.add(artifact)
+    await db_session.flush()
+    draft = ArtifactDraft(
+        id=str(uuid4()),
+        artifact_id=artifact.id,
+        session_id=session_id,
+        owner_run_id=run_id,
+        current_revision=0,
+        status="idle",
+        review_count=0,
+        revision_count=0,
+        updated_at=now,
+    )
+    db_session.add(draft)
+    await db_session.flush()
+    revision = ArtifactDraftRevision(
+        id=str(uuid4()),
+        draft_id=draft.id,
+        artifact_id=artifact.id,
+        run_id=run_id,
+        revision=0,
+        schema_version="v2",
+        payload_json={"title": "品牌报告"},
+        payload_hash="h" * 64,
+        created_at=now,
+    )
+    db_session.add(revision)
+    await db_session.flush()
+    version = AgentArtifactVersion(
+        id=str(uuid4()),
+        artifact_id=artifact.id,
+        version=1,
+        source_run_id=run_id,
+        source_draft_revision_id=revision.id,
+        schema_version="v2",
+        payload_json={"title": "品牌报告"},
+        data_status="complete",
+        created_at=now,
+    )
+    db_session.add(version)
+    await db_session.flush()
+    return version
+
+
+async def _add_evidence(
+    db_session, session_id: str, run_id: str, *, availability: str = "available"
+) -> str:
+    """为 run 造一条 Evidence（attempt/step/call 链）；返回 evidence_id。
+
+    attempt / step sequence 取当前最大值 +1，允许同一 run 挂多条 Evidence。
+    """
+    now = utc_now()
+    attempt_no = (
+        await db_session.scalar(
+            select(func.max(AgentRunAttempt.attempt)).where(AgentRunAttempt.run_id == run_id)
+        )
+        or 0
+    ) + 1
+    step_sequence = (
+        await db_session.scalar(
+            select(func.max(AgentStep.sequence)).where(AgentStep.run_id == run_id)
+        )
+        or 0
+    ) + 1
+    attempt = AgentRunAttempt(
+        id=str(uuid4()), run_id=run_id, attempt=attempt_no, started_at=now, ended_at=now,
+        decision_count=0, outcome="failed",
+    )
+    db_session.add(attempt)
+    step = AgentStep(
+        id=str(uuid4()), run_id=run_id, attempt_id=attempt.id, sequence=step_sequence,
+        step_type="tool_call", status="settled", created_at=now,
+    )
+    db_session.add(step)
+    call = AgentToolCall(
+        id=str(uuid4()), run_id=run_id, step_id=step.id, logical_call_id=str(uuid4()),
+        service="internal", internal_tool_name="seed", arguments_json={},
+        arguments_hash="h" * 64, status="settled",
+    )
+    db_session.add(call)
+    await db_session.flush()
+    evidence = EvidenceItem(
+        id=str(uuid4()), session_id=session_id, run_id=run_id, tool_call_id=call.id,
+        source_type="mcp", source_name="seed", scope_json=None, period_json=None,
+        raw_payload_json={"rows": []}, normalized_preview_json=None,
+        payload_hash="h" * 64, collected_at=now, availability_status=availability,
+    )
+    db_session.add(evidence)
+    await db_session.flush()
+    return evidence.id
+
+
+async def test_clarification_reply_creates_child_run(agent_client_factory, db_session) -> None:
+    """显式 parent_run_id：澄清回答消息创建 Child Run，父链接落库并快照。"""
+    executor = FakeExecutor()
+    alice, _ = await agent_client_factory("13700000001", executor=executor)
+    session_id = await _create_session(alice)
+    user_id = await _me_id(alice)
+    clarification = await _add_clarification_run(db_session, user_id, session_id)
+
+    resp = await alice.post(
+        f"/api/v1/agent/sessions/{session_id}/messages",
+        json={
+            "content": "选择近30天",
+            "parent_run_id": clarification.id,
+            "artifact_version_ids": [],
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    run = await db_session.get(AgentRun, resp.json()["run_id"])
+    assert run is not None
+    assert run.id != clarification.id
+    assert run.parent_run_id == clarification.id
+    assert run.prompt_snapshot_json["parent_run_id"] == clarification.id
+    assert executor.submitted == [run.id]
+
+
+async def test_pending_question_reply_auto_links_parent(agent_client_factory, db_session) -> None:
+    """未显式传 parent_run_id：活动 pending_question 的来源 Run 自动成为父 Run，
+    且该 pending question 在回答建 Run 时被 supersede（不再影响后续消息）。"""
+    executor = FakeExecutor()
+    alice, _ = await agent_client_factory("13700000002", executor=executor)
+    session_id = await _create_session(alice)
+    user_id = await _me_id(alice)
+    clarification = await _add_clarification_run(db_session, user_id, session_id)
+
+    resp = await _post_message(alice, session_id, "近30天")
+    assert resp.status_code == 201, resp.text
+    run = await db_session.get(AgentRun, resp.json()["run_id"])
+    assert run.parent_run_id == clarification.id
+
+    pendings = (
+        await db_session.scalars(
+            select(MemoryEntry).where(
+                MemoryEntry.session_id == session_id,
+                MemoryEntry.memory_type == "pending_question",
+            )
+        )
+    ).all()
+    assert len(pendings) == 1
+    assert pendings[0].superseded_at is not None
+
+
+async def test_parent_run_ownership_and_session_validated(
+    agent_client_factory, db_session
+) -> None:
+    """parent Run 必须属本用户且同 Session：不存在/跨用户/跨 Session 统一 404。"""
+    alice, _ = await agent_client_factory("13700000003")
+    bob, _ = await agent_client_factory("13700000004")
+    alice_session = await _create_session(alice)
+    bob_session = await _create_session(bob)
+    bob_id = await _me_id(bob)
+    bob_run = await _add_run(db_session, bob_id, bob_session, status="completed")
+
+    # 不存在的 parent
+    missing = await alice.post(
+        f"/api/v1/agent/sessions/{alice_session}/messages",
+        json={"content": "继续", "parent_run_id": str(uuid4())},
+    )
+    assert missing.status_code == 404
+
+    # 跨用户的 parent
+    foreign = await alice.post(
+        f"/api/v1/agent/sessions/{alice_session}/messages",
+        json={"content": "继续", "parent_run_id": bob_run.id},
+    )
+    assert foreign.status_code == 404
+
+    # 同用户但跨 Session 的 parent
+    other_session = await _create_session(alice)
+    alice_id = await _me_id(alice)
+    other_run = await _add_run(db_session, alice_id, other_session, status="completed")
+    cross_session = await alice.post(
+        f"/api/v1/agent/sessions/{alice_session}/messages",
+        json={"content": "继续", "parent_run_id": other_run.id},
+    )
+    assert cross_session.status_code == 404
+
+
+async def test_cross_user_artifact_reference_is_404(agent_client_factory, db_session) -> None:
+    """引用其他用户的 Artifact Version → 404，不泄漏存在性。"""
+    alice, _ = await agent_client_factory("13700000005")
+    bob, _ = await agent_client_factory("13700000006")
+    alice_session = await _create_session(alice)
+    bob_session = await _create_session(bob)
+    bob_id = await _me_id(bob)
+    bob_run = await _add_run(db_session, bob_id, bob_session, status="completed")
+    foreign_version = await _add_artifact_version(db_session, bob_id, bob_session, bob_run.id)
+
+    resp = await alice.post(
+        f"/api/v1/agent/sessions/{alice_session}/messages",
+        json={"content": "基于这份报告分析", "artifact_version_ids": [foreign_version.id]},
+    )
+    assert resp.status_code == 404
+
+
+async def test_unpublished_or_cross_session_version_reference_is_404(
+    agent_client_factory, db_session
+) -> None:
+    """草稿（未发布）产物与同用户跨 Session 的 Version 都不可引用（§5.4）。"""
+    alice, _ = await agent_client_factory("13700000007")
+    session_id = await _create_session(alice)
+    user_id = await _me_id(alice)
+    run = await _add_run(db_session, user_id, session_id, status="completed")
+    draft_version = await _add_artifact_version(
+        db_session, user_id, session_id, run.id, artifact_status="draft"
+    )
+    other_session = await _create_session(alice)
+    other_version = await _add_artifact_version(db_session, user_id, other_session, run.id)
+
+    for version_id in (draft_version.id, other_version.id, str(uuid4())):
+        resp = await alice.post(
+            f"/api/v1/agent/sessions/{session_id}/messages",
+            json={"content": "基于这份报告分析", "artifact_version_ids": [version_id]},
+        )
+        assert resp.status_code == 404
+
+
+async def test_artifact_reference_snapshot_frozen_into_run(
+    agent_client_factory, db_session
+) -> None:
+    """合法引用：已发布 Version 可引用，引用快照写入新 Run 的 prompt_snapshot_json。"""
+    executor = FakeExecutor()
+    alice, _ = await agent_client_factory("13700000008", executor=executor)
+    session_id = await _create_session(alice)
+    user_id = await _me_id(alice)
+    source_run = await _add_run(db_session, user_id, session_id, status="completed")
+    version = await _add_artifact_version(db_session, user_id, session_id, source_run.id)
+
+    resp = await alice.post(
+        f"/api/v1/agent/sessions/{session_id}/messages",
+        json={"content": "基于这份报告分析", "artifact_version_ids": [version.id]},
+    )
+    assert resp.status_code == 201, resp.text
+    run = await db_session.get(AgentRun, resp.json()["run_id"])
+    assert run.prompt_snapshot_json["artifact_version_ids"] == [version.id]
+
+
+async def test_retry_creates_new_run_without_reopening_failed_run(
+    agent_client_factory, db_session
+) -> None:
+    """retry failed Run：创建新的 user-visible Child Run（parent 指向原 Run），
+    冻结仍有效的 Evidence / 已发布 Artifact 引用；原 Run 保持 failed 不被重开。"""
+    executor = FakeExecutor()
+    alice, _ = await agent_client_factory("13700000009", executor=executor)
+    session_id = await _create_session(alice)
+    user_id = await _me_id(alice)
+    failed = await _add_run(
+        db_session,
+        user_id,
+        session_id,
+        status="failed",
+        error_code="ALL_ARTIFACTS_FAILED",
+        completed_at=utc_now(),
+    )
+    available = await _add_evidence(db_session, session_id, failed.id, availability="available")
+    await _add_evidence(db_session, session_id, failed.id, availability="expired")
+    version = await _add_artifact_version(db_session, user_id, session_id, failed.id)
+
+    resp = await alice.post(f"/api/v1/agent/runs/{failed.id}/retry")
+    assert resp.status_code == 201, resp.text
+    retried = await db_session.get(AgentRun, resp.json()["run_id"])
+    assert retried is not None
+    assert retried.id != failed.id
+    assert retried.parent_run_id == failed.id
+    assert retried.status == "queued"
+    assert retried.visibility == "user"
+    assert retried.profile_name == failed.profile_name
+    assert executor.submitted == [retried.id]
+
+    # 冻结的引用快照：只含仍 available 的 Evidence 与已发布 Version。
+    snapshot = retried.prompt_snapshot_json
+    assert snapshot["retry_of"] == failed.id
+    assert snapshot["evidence_ids"] == [available]
+    assert snapshot["artifact_version_ids"] == [version.id]
+
+    # 原 Run 绝不修改或重开。
+    original = await db_session.get(AgentRun, failed.id)
+    assert original.status == "failed"
+    assert original.error_code == "ALL_ARTIFACTS_FAILED"
+
+
+async def test_retry_accepts_paused_run(agent_client_factory, db_session) -> None:
+    executor = FakeExecutor()
+    alice, _ = await agent_client_factory("13700000010", executor=executor)
+    session_id = await _create_session(alice)
+    user_id = await _me_id(alice)
+    paused = await _add_paused_run(db_session, user_id, session_id)
+
+    resp = await alice.post(f"/api/v1/agent/runs/{paused.id}/retry")
+    assert resp.status_code == 201, resp.text
+    retried = await db_session.get(AgentRun, resp.json()["run_id"])
+    assert retried.parent_run_id == paused.id
+    assert (await db_session.get(AgentRun, paused.id)).status == "paused"
+
+
+async def test_retry_rejects_non_terminal_run(agent_client_factory, db_session) -> None:
+    """retry 只接受 failed/paused：queued/completed/cancelled 一律 409。"""
+    alice, _ = await agent_client_factory("13700000011")
+    session_id = await _create_session(alice)
+    user_id = await _me_id(alice)
+    for status_value in ("queued", "completed", "cancelled"):
+        run = await _add_run(db_session, user_id, session_id, status=status_value)
+        resp = await alice.post(f"/api/v1/agent/runs/{run.id}/retry")
+        assert resp.status_code == 409
+        assert resp.json()["detail"] == "run_not_retryable"
+
+
+async def test_retry_cross_user_is_404(agent_client_factory, db_session) -> None:
+    alice, _ = await agent_client_factory("13700000012")
+    bob, _ = await agent_client_factory("13700000013")
+    session_id = await _create_session(alice)
+    user_id = await _me_id(alice)
+    failed = await _add_run(db_session, user_id, session_id, status="failed")
+
+    assert (await bob.post(f"/api/v1/agent/runs/{failed.id}/retry")).status_code == 404
+
+
+async def test_retry_blocked_by_other_active_run(agent_client_factory, db_session) -> None:
+    """retry 遵守单活动主 Run 约束：同 Session 已有活动 Run 时 409。"""
+    alice, _ = await agent_client_factory("13700000014")
+    session_id = await _create_session(alice)
+    user_id = await _me_id(alice)
+    failed = await _add_run(db_session, user_id, session_id, status="failed")
+    await _add_run(db_session, user_id, session_id, status="running", started_at=utc_now())
+
+    resp = await alice.post(f"/api/v1/agent/runs/{failed.id}/retry")
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == "active_run_in_progress"

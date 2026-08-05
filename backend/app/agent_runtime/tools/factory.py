@@ -2,7 +2,8 @@
 
 :class:`AgentToolRegistryFactory` 为每个 Engine 构建完整的 :class:`ToolRegistry`：
 
-- history：``read_artifact`` / ``search_evidence`` / ``read_tool_result``；
+- history：``read_artifact`` / ``search_evidence`` / ``read_tool_result`` /
+  ``remember_scope``（confirmed_scope 范围记忆写入）；
 - calculation：``calculate_expression`` / ``aggregate_metrics`` /
   ``calculate_period_comparison`` / ``normalize_sentiment`` / ``rank_kols``；
 - artifact：``create_draft`` / ``update_draft`` / ``abandon_draft`` 与六个
@@ -51,6 +52,7 @@ from app.agent_runtime.tools.calculation import (
 from app.agent_runtime.tools.history import (
     ReadArtifactTool,
     ReadToolResultTool,
+    RememberScopeTool,
     SearchEvidenceTool,
 )
 from app.agent_runtime.tools.mcp import AgentMcpTool, SessionFactoryLike
@@ -122,6 +124,7 @@ class AgentToolRegistryFactory:
         registry.register(ReadArtifactTool(db), category=HISTORY_TOOLS)
         registry.register(SearchEvidenceTool(db), category=HISTORY_TOOLS)
         registry.register(ReadToolResultTool(db), category=HISTORY_TOOLS)
+        registry.register(RememberScopeTool(db), category=HISTORY_TOOLS)
         registry.register(CalculateExpressionTool(db), category=CALCULATION_TOOLS)
         registry.register(AggregateMetricsTool(db), category=CALCULATION_TOOLS)
         registry.register(CalculatePeriodComparisonTool(db), category=CALCULATION_TOOLS)
