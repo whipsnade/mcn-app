@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Iterable
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy import select
@@ -80,6 +81,9 @@ class MemoryContextBuilder:
 
         return {
             "current_user_message": current_user_message,
+            # 当前日期时间（含时区）：模型推断"最近一个月/近30天"等相对
+            # 时间窗的唯一基准，缺失会导致模型反复向用户追问日期。
+            "current_datetime": datetime.now().astimezone().isoformat(timespec="seconds"),
             "recent_messages": recent,
             "session_summary": session.session_summary,
             "run_summaries": run_summaries,

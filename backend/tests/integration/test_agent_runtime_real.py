@@ -351,12 +351,13 @@ def _build_engine(
     reviewer_gateway: AgentModelGateway | None = None,
     worker_id: str = WORKER_ID,
     channel_permissions: Iterable[str] = (),
+    session_factory: Any = None,
 ) -> AgentEngine:
     reviewer = ReviewerDriver(db, reviewer_gateway or gateway, worker_id=worker_id)
     broker = AgentEventBroker()
     events = AgentEventStream(db, broker)
-    # 不注入 session_factory：UAT 在单一未提交事务内创建 Run，租约心跳必须
-    # 复用同一会话（独立会话看不到未提交的 Run 行，会误判租约丢失）。
+    # 场景数据已提交，注入真实 SessionFactory（生产同款）：心跳用独立连接续租，
+    # 不与引擎共享会话（共享会在长调用期间并发冲突）。
     return AgentEngine(
         db,
         gateway=gateway,
@@ -365,6 +366,7 @@ def _build_engine(
         reviewer=reviewer,
         worker_id=worker_id,
         channel_permissions=channel_permissions,
+        session_factory=session_factory,
     )
 
 
@@ -496,12 +498,17 @@ async def _run_scenario(
 
         registry = _build_registry(session, transport=transport)
         gateway = AgentModelGateway(get_model_adapter(), db=session)
+        # 心跳需要独立会话：先提交 Run/Attempt/租约，引擎内后续提交不受影响；
+        # 注入真实 SessionFactory，心跳用独立连接续租（生产同款接线），
+        # 避免与引擎共享会话并发冲突（"concurrent operations are not permitted"）。
+        await session.commit()
         engine = _build_engine(
             session,
             registry=registry,
             gateway=gateway,
             reviewer_gateway=reviewer_gateway,
             channel_permissions=await load_channel_permissions(session, user.id),
+            session_factory=SessionFactory,
         )
         # 先登记 run_id（status=running）并立即落盘：即使真实 DataTap 查询挂起
         # 导致 engine.run 无法返回，JSON 仍保留该场景的 run_id（Fix 5）。
@@ -1004,6 +1011,7 @@ async def test_uat_kol_detail_real_fetch() -> None:
                 registry=_build_registry(session),
                 gateway=AgentModelGateway(get_model_adapter(), db=session),
                 channel_permissions=await load_channel_permissions(session, user.id),
+                session_factory=SessionFactory,
             )
             service = KolDetailRunService(session, engine=engine, worker_id=WORKER_ID)
 

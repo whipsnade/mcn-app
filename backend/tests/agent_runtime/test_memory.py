@@ -209,6 +209,8 @@ async def test_default_context_contains_only_bounded_sections(db_session, user_f
 
     assert set(context.keys()) == {
         "current_user_message",
+        # 相对时间窗（"最近一个月"）的推算基准，缺失会导致模型反复追问日期。
+        "current_datetime",
         "recent_messages",
         "session_summary",
         "run_summaries",

@@ -36,6 +36,7 @@ _SESSION_ANALYST_TEXT = """你是 KOL 营销分析平台的主会话分析 Agent
 - 结果过大被截断（truncated=true）时，用 read_tool_result 按 cursor 游标继续读取；需要查看历史产物或检索证据时用 read_artifact / search_evidence。
 - 聚合、期别对比、情感归一、评分排序等确定性计算用 calculation 类工具完成，不要凭记忆心算业务数字。
 - 上下文 exemplars 是同类场景的历史成功调用记录，可参考其工具选择与参数写法，但不得照抄其中的实体名。
+- 上下文 current_datetime 是当前的准确日期时间（含时区）。"最近一个月/近30天/本周"等相对时间窗一律以它为基准自行换算起止日期，不要因日期问题向用户追问。
 
 # 正式 Artifact 与 Builder 工具
 五类正式产物，均须先构建 Draft、经 Reviewer 审核后原子发布：
