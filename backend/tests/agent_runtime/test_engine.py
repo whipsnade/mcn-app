@@ -1,10 +1,11 @@
-"""统一 Session Agent Engine 集成测试（设计文档 §四 / §4.1 / §七 / §11.3 / Task 14）。
+"""统一 Session Agent Engine 集成测试（设计文档 §四 / §4.1 / §七 / §11.3 / Task 14；
+直接发布改造 Task 4）。
 
-用脚本化 ``AgentAction`` 的 fake 网关驱动引擎，使循环确定性；Reviewer 决策用
-脚本化 ``ReviewDecision`` 驱动。覆盖：
+用脚本化 ``AgentAction`` 的 fake 网关驱动引擎，使循环确定性。覆盖：
 
-1. 四种动作循环：ask_user / call_tool（计算 + MCP 桥 + 余额不足）/ submit_review
-   （approve / revise / reject）/ complete；
+1. 四种动作循环：ask_user / call_tool（计算 + MCP 桥 + 余额不足）/
+   publish_artifacts（直接发布：成功 / validation_failed / 逐项失败回喂）/
+   complete（活动 Draft 闸门 + 终态聚合 completed/completed_with_warnings）；
 2. 保护：50 决策暂停 + 恢复、取消信号、非法动作安全阈值；
 3. 新鲜 Run：每条消息独立 Run，只有 paused 才能被 resume。
 """
@@ -29,10 +30,9 @@ from app.agent_artifacts.models import (
     ArtifactDraft,
     ArtifactDraftRevision,
     ArtifactEvent,
-    ArtifactReviewAttempt,
-    ArtifactReviewBatch,
-    ArtifactReviewItem,
+    ArtifactPublishAttempt,
 )
+from app.agent_artifacts.publishing import ArtifactPublicationService
 from app.agent_artifacts.service import ArtifactService
 from app.agent_runtime.engine import MAX_INVALID_ACTIONS, AgentEngine, RunOutcome
 from app.agent_runtime.events import AgentEventBroker, AgentEventStream
@@ -50,11 +50,10 @@ from app.agent_runtime.models import (
 )
 from app.agent_runtime.profiles import get_profile
 from app.agent_runtime.repository import AgentRunRepository, utc_now
-from app.agent_runtime.reviewer import ReviewDecision, ReviewIssue, ReviewerDriver
-from app.agent_runtime.schemas import AskUser, CallTool, Complete, SubmitReview
+from app.agent_runtime.schemas import AskUser, CallTool, Complete, PublishArtifacts
 from app.agent_runtime.state import InvalidRunTransition, RunStatus
 from app.agent_runtime.thinking import AgentEventThinkingSink
-from app.agent_runtime.tools.artifacts import UpdateDraftTool
+from app.agent_runtime.tools.artifacts import AbandonDraftTool, UpdateDraftTool
 from app.agent_runtime.tools.builders import BuildInsightDraftTool
 from app.agent_runtime.tools.contracts import ToolResult
 from app.agent_runtime.tools.calculation import CalculateExpressionTool
@@ -105,7 +104,11 @@ PAYLOAD_V1 = insight_payload()
 
 
 class FakeAgentGateway:
-    """返回脚本化 AgentAction；记录每次 decide 收到的消息。"""
+    """返回脚本化 AgentAction；记录每次 decide 收到的消息。
+
+    动作可以是 callable：``async (run) -> AgentAction``，在运行时解析
+    （如解析本 Run 持有的 draft id 组装 publish_artifacts）。
+    """
 
     def __init__(self, actions: list[Any], *, on_decide: Any = None) -> None:
         self.actions = list(actions)
@@ -129,23 +132,10 @@ class FakeAgentGateway:
             await self.on_decide(run, len(self.calls))
         if not self.actions:
             raise AssertionError("fake agent gateway exhausted")
-        return self.actions.pop(0)
-
-
-class FakeReviewerGateway:
-    """返回脚本化 ReviewDecision。"""
-
-    def __init__(self, decisions: list[ReviewDecision]) -> None:
-        self.decisions = list(decisions)
-        self.calls: list[dict[str, Any]] = []
-
-    async def decide(
-        self, *, run, attempt_id, profile, messages, thinking_sink=None, **kwargs
-    ) -> Any:
-        self.calls.append({"run_id": run.id, "messages": list(messages), **kwargs})
-        if not self.decisions:
-            raise AssertionError("fake reviewer gateway exhausted")
-        return self.decisions.pop(0)
+        action = self.actions.pop(0)
+        if callable(action):
+            action = await action(run)
+        return action
 
 
 class NoopArgs(BaseModel):
@@ -292,26 +282,22 @@ def _make_engine(
     db_session,
     *,
     actions: list[Any],
-    decisions: list[ReviewDecision],
     registry: ToolRegistry | None = None,
     on_decide: Any = None,
     worker: str = "worker",
-) -> tuple[AgentEngine, FakeAgentGateway, FakeReviewerGateway]:
+) -> tuple[AgentEngine, FakeAgentGateway]:
     gateway = FakeAgentGateway(actions, on_decide=on_decide)
-    reviewer_gateway = FakeReviewerGateway(decisions)
     registry = registry or ToolRegistry()
     broker = AgentEventBroker()
     events = AgentEventStream(db_session, broker)
-    reviewer = ReviewerDriver(db_session, reviewer_gateway, worker_id=worker)
     engine = AgentEngine(
         db_session,
         gateway=gateway,
         registry=registry,
         events=events,
-        reviewer=reviewer,
         worker_id=worker,
     )
-    return engine, gateway, reviewer_gateway
+    return engine, gateway
 
 
 async def _make_draft(
@@ -342,16 +328,34 @@ async def _make_draft(
 # ---------------------------------------------------------------------------
 
 
+def _publish_owned_draft(db_session, *, summary: str = "发布"):
+    """运行时解析本 Run 持有的全部 Draft 并组装 publish_artifacts 动作（callable 脚本）。"""
+
+    async def resolve(run):
+        drafts = (
+            await db_session.scalars(
+                select(ArtifactDraft).where(ArtifactDraft.owner_run_id == run.id)
+            )
+        ).all()
+        assert drafts
+        return PublishArtifacts(
+            action="publish_artifacts",
+            artifact_draft_ids=tuple(draft.id for draft in drafts),
+            summary=summary,
+        )
+
+    return resolve
+
+
 async def test_ask_user_ends_clarification_with_pending_memory(
     db_session, user_factory
 ) -> None:
     run, attempt, _, _ = await _setup_run(db_session, user_factory)
-    engine, _, _ = _make_engine(
+    engine, _ = _make_engine(
         db_session,
         actions=[
             AskUser(action="ask_user", question="需要确认分析品牌", options=["瑞幸", "蜜雪冰城"]),
         ],
-        decisions=[],
     )
     outcome = await engine.run(
         run=run,
@@ -385,10 +389,9 @@ async def test_complete_writes_assistant_message_with_suggestions(
     db_session, user_factory
 ) -> None:
     run, attempt, _, _ = await _setup_run(db_session, user_factory)
-    engine, _, _ = _make_engine(
+    engine, _ = _make_engine(
         db_session,
         actions=[Complete(action="complete", text="分析完成", suggestions=["继续看竞品"])],
-        decisions=[],
     )
     outcome = await engine.run(
         run=run,
@@ -410,7 +413,7 @@ async def test_complete_writes_assistant_message_with_suggestions(
 
 async def test_call_tool_feeds_result_back_and_zero_cost_calc(db_session, user_factory) -> None:
     run, attempt, _, _ = await _setup_run(db_session, user_factory)
-    engine, gateway, _ = _make_engine(
+    engine, gateway = _make_engine(
         db_session,
         actions=[
             CallTool(
@@ -421,7 +424,6 @@ async def test_call_tool_feeds_result_back_and_zero_cost_calc(db_session, user_f
             ),
             Complete(action="complete", text="结果是 2"),
         ],
-        decisions=[],
         registry=_calc_registry(db_session),
     )
     outcome = await engine.run(
@@ -476,7 +478,7 @@ async def test_mcp_tool_through_bridge_settles_points(db_session, user_factory) 
             session_factory=lambda: _shared_session(db_session),
         ),
     )
-    engine, _, _ = _make_engine(
+    engine, _ = _make_engine(
         db_session,
         actions=[
             CallTool(
@@ -487,7 +489,6 @@ async def test_mcp_tool_through_bridge_settles_points(db_session, user_factory) 
             ),
             Complete(action="complete", text="查询完成"),
         ],
-        decisions=[],
         registry=registry,
     )
     outcome = await engine.run(
@@ -523,7 +524,7 @@ async def test_insufficient_balance_is_structured_tool_error_and_restricted_comp
     )
     await db_session.flush()
     registry = _mcp_registry(db_session, executor_factory=lambda row: RaisingMcpTool())
-    engine, gateway, _ = _make_engine(
+    engine, gateway = _make_engine(
         db_session,
         actions=[
             CallTool(
@@ -534,7 +535,6 @@ async def test_insufficient_balance_is_structured_tool_error_and_restricted_comp
             ),
             Complete(action="complete", text="余额不足，仅能基于已有证据给出受限结论"),
         ],
-        decisions=[],
         registry=registry,
     )
     outcome = await engine.run(
@@ -560,24 +560,140 @@ async def test_insufficient_balance_is_structured_tool_error_and_restricted_comp
 
 
 # ---------------------------------------------------------------------------
-# submit_review：approve / revise / reject
+# publish_artifacts：确定性直接发布（非终态动作）
 # ---------------------------------------------------------------------------
 
 
-async def test_submit_review_approve_publishes(db_session, user_factory) -> None:
+async def test_publish_artifacts_returns_to_decision_loop(db_session, user_factory) -> None:
+    """publish_artifacts 是非终态动作：逐项发布 + 逐项事件后回到决策循环。
+
+    全部发布成功后 complete：终态 completed；事件顺序保持
+    artifact.published → artifact.publish.completed → message.completed → run.completed。
+    """
     run, attempt, _, _ = await _setup_run(db_session, user_factory)
-    _, draft, _ = await _make_draft(db_session, run)
-    engine, _, _ = _make_engine(
+    _, draft_a, _ = await _make_draft(db_session, run, brand="瑞幸")
+    _, draft_b, _ = await _make_draft(db_session, run, brand="库迪")
+    engine, gateway = _make_engine(
         db_session,
         actions=[
-            SubmitReview(
-                action="submit_review",
-                artifact_draft_ids=(draft.id,),
-                completion_text="品牌分析完成",
-                summary="瑞幸品牌分析",
+            PublishArtifacts(
+                action="publish_artifacts",
+                artifact_draft_ids=(draft_a.id, draft_b.id),
+                summary="发布",
             ),
+            Complete(action="complete", text="已完成"),
         ],
-        decisions=[ReviewDecision(decision="approve")],
+    )
+    outcome = await engine.run(
+        run=run,
+        attempt_id=attempt.id,
+        profile=get_profile("session_analyst_v1"),
+        messages=[ChatMessage(role="user", content="分析瑞幸和库迪")],
+    )
+    assert outcome.status == RunStatus.COMPLETED
+    assert run.status == RunStatus.COMPLETED
+    assert len(gateway.calls) == 2  # 发布后回到决策循环
+
+    versions = (
+        await db_session.scalars(
+            select(AgentArtifactVersion).where(AgentArtifactVersion.source_run_id == run.id)
+        )
+    ).all()
+    assert len(versions) == 2
+    # 发布结果回喂进第二次 decide
+    assert any("publish_results" in m.content for m in gateway.calls[1]["messages"])
+    # Draft working head 已随发布释放
+    for draft in (draft_a, draft_b):
+        draft_row = await db_session.get(ArtifactDraft, draft.id)
+        assert draft_row is not None
+        assert draft_row.owner_run_id is None
+
+    types = await _event_types(db_session, run.id)
+    assert types.count("artifact.published") == 2
+    assert types.count("artifact.publish.completed") == 1
+    assert types.index("artifact.published") < types.index("artifact.publish.completed")
+    assert types.index("artifact.publish.completed") < types.index("message.completed")
+    assert types[-1] == "run.completed"
+
+
+async def test_validation_failed_then_abandon_completes_with_warnings(
+    db_session, user_factory
+) -> None:
+    """发布校验失败（缺 lineage）→ 逐项结果回喂 → 模型 abandon_draft →
+    complete 按发布/失败项聚合为 completed_with_warnings 终态。"""
+    run, attempt, _, _ = await _setup_run(db_session, user_factory)
+    # 必需数字叶子缺 lineage：确定性校验判 validation_failed（§10.3）。
+    _, draft, _ = await _make_draft(db_session, run, payload=insight_metric_payload(value=100))
+    registry = ToolRegistry()
+    registry.register(AbandonDraftTool(db_session), category="artifact")
+    engine, gateway = _make_engine(
+        db_session,
+        actions=[
+            PublishArtifacts(
+                action="publish_artifacts",
+                artifact_draft_ids=(draft.id,),
+                summary="发布",
+            ),
+            CallTool(
+                action="call_tool",
+                internal_tool_name="abandon_draft",
+                arguments={
+                    "draft_id": draft.id,
+                    "reason_code": "unfixable_lineage",
+                    "reason": "无法补齐数据来源",
+                },
+                rationale="放弃无法修复的 Draft",
+            ),
+            Complete(action="complete", text="已完成（部分产物未发布）"),
+        ],
+        registry=registry,
+    )
+    outcome = await engine.run(
+        run=run,
+        attempt_id=attempt.id,
+        profile=get_profile("session_analyst_v1"),
+        messages=[ChatMessage(role="user", content="分析瑞幸品牌")],
+    )
+    assert outcome.status == RunStatus.COMPLETED_WITH_WARNINGS
+    assert run.status == RunStatus.COMPLETED_WITH_WARNINGS
+    # validation_failed 逐项结果回喂给模型
+    assert any("validation_failed" in m.content for m in gateway.calls[1]["messages"])
+    # 未产生任何 Version；Draft 已放弃（failed）
+    assert (
+        await db_session.scalar(
+            select(func.count(AgentArtifactVersion.id)).where(
+                AgentArtifactVersion.source_run_id == run.id
+            )
+        )
+    ) == 0
+    draft_row = await db_session.get(ArtifactDraft, draft.id)
+    assert draft_row is not None
+    assert draft_row.status == "failed"
+    assert draft_row.owner_run_id is None
+    # 终态事件：恰好一个 run.completed_with_warnings 且为最后一条
+    types = await _event_types(db_session, run.id)
+    assert types[-1] == "run.completed_with_warnings"
+    terminal = await _terminal_events(db_session, run.id)
+    assert len(terminal) == 1
+    assert terminal[0].event_type == "run.completed_with_warnings"
+
+
+async def test_publish_all_success_completes_without_warnings(
+    db_session, user_factory
+) -> None:
+    """全部 Draft 发布成功：complete 终态为 completed（非 completed_with_warnings）。"""
+    run, attempt, _, _ = await _setup_run(db_session, user_factory)
+    _, draft, _ = await _make_draft(db_session, run)
+    engine, _ = _make_engine(
+        db_session,
+        actions=[
+            PublishArtifacts(
+                action="publish_artifacts",
+                artifact_draft_ids=(draft.id,),
+                summary="发布",
+            ),
+            Complete(action="complete", text="品牌分析完成"),
+        ],
     )
     outcome = await engine.run(
         run=run,
@@ -586,233 +702,80 @@ async def test_submit_review_approve_publishes(db_session, user_factory) -> None
         messages=[ChatMessage(role="user", content="分析瑞幸品牌")],
     )
     assert outcome.status == RunStatus.COMPLETED
-    assert run.status == RunStatus.COMPLETED
-
     msg = await db_session.scalar(
         select(AgentMessage).where(AgentMessage.session_id == run.session_id)
     )
     assert msg is not None
     assert msg.role == "assistant"
     assert msg.content == "品牌分析完成"
-    assert msg.run_id == run.id
-    # 发布路径的 assistant 消息 id 回传进 RunOutcome（与 ask_user/complete 一致）
     assert outcome.assistant_message_id == msg.id
 
-    version = await db_session.scalar(
-        select(AgentArtifactVersion).where(AgentArtifactVersion.source_run_id == run.id)
-    )
-    assert version is not None
 
-    batch = await db_session.scalar(
-        select(ArtifactReviewBatch).where(ArtifactReviewBatch.parent_run_id == run.id)
-    )
-    assert batch is not None
-    assert batch.status == "completed"
-    draft_row = await db_session.get(ArtifactDraft, draft.id)
-    assert draft_row is not None
-    assert draft_row.status == "idle"
-    assert draft_row.owner_run_id is None
-
-    # 发布后也发出 message.completed 事件（与 complete 路径一致）
-    event_types = {
-        row.event_type
-        for row in (
-            await db_session.scalars(
-                select(AgentEvent).where(AgentEvent.run_id == run.id)
-            )
-        ).all()
-    }
-    assert "message.completed" in event_types
-
-
-async def test_submit_review_revise_then_approve(db_session, user_factory) -> None:
-    run, attempt, _, _ = await _setup_run(db_session, user_factory)
-    _, draft, _ = await _make_draft(db_session, run)
-    engine, gateway, _ = _make_engine(
-        db_session,
-        actions=[
-            SubmitReview(
-                action="submit_review",
-                artifact_draft_ids=(draft.id,),
-                completion_text="品牌分析完成",
-                summary="瑞幸品牌分析",
-            ),
-            SubmitReview(
-                action="submit_review",
-                artifact_draft_ids=(draft.id,),
-                completion_text="品牌分析完成",
-                summary="瑞幸品牌分析",
-            ),
-        ],
-        decisions=[
-            ReviewDecision(
-                decision="revise",
-                issues=[ReviewIssue(code="missing_data", message="需要补查声量数据")],
-            ),
-            ReviewDecision(decision="approve"),
-        ],
-    )
-    outcome = await engine.run(
-        run=run,
-        attempt_id=attempt.id,
-        profile=get_profile("session_analyst_v1"),
-        messages=[ChatMessage(role="user", content="分析瑞幸品牌")],
-    )
-    assert outcome.status == RunStatus.COMPLETED
-    # 一个用户 Run 只存在一条 batch（复用，不重复创建）
-    batches = (
-        await db_session.scalars(
-            select(ArtifactReviewBatch).where(ArtifactReviewBatch.parent_run_id == run.id)
-        )
-    ).all()
-    assert len(batches) == 1
-    assert batches[0].status == "completed"
-    # revise 的问题回喂给了模型（第二次 decide 前可见）
-    assert len(gateway.calls) == 2
-    assert any(
-        "review_revision_requested" in m.content
-        for m in gateway.calls[1]["messages"]
-    )
-    version = await db_session.scalar(
-        select(AgentArtifactVersion).where(AgentArtifactVersion.source_run_id == run.id)
-    )
-    assert version is not None
-
-
-async def test_submit_review_reject_fails_run(db_session, user_factory) -> None:
-    run, attempt, _, _ = await _setup_run(db_session, user_factory)
-    _, draft, _ = await _make_draft(db_session, run)
-    engine, _, _ = _make_engine(
-        db_session,
-        actions=[
-            SubmitReview(
-                action="submit_review",
-                artifact_draft_ids=(draft.id,),
-                completion_text="分析",
-                summary="瑞幸品牌分析",
-            ),
-        ],
-        decisions=[
-            ReviewDecision(
-                decision="reject",
-                issues=[ReviewIssue(code="untrusted", message="数字无法追溯")],
-            )
-        ],
-    )
-    outcome = await engine.run(
-        run=run,
-        attempt_id=attempt.id,
-        profile=get_profile("session_analyst_v1"),
-        messages=[ChatMessage(role="user", content="分析瑞幸品牌")],
-    )
-    assert outcome.status == RunStatus.FAILED
-    assert run.status == RunStatus.FAILED
-    batch = await db_session.scalar(
-        select(ArtifactReviewBatch).where(ArtifactReviewBatch.parent_run_id == run.id)
-    )
-    assert batch is not None
-    assert batch.status == "failed"
-    draft_row = await db_session.get(ArtifactDraft, draft.id)
-    assert draft_row is not None
-    assert draft_row.status == "failed"
-    assert (
-        await db_session.scalar(
-            select(func.count(AgentArtifactVersion.id)).where(
-                AgentArtifactVersion.source_run_id == run.id
-            )
-        )
-    ) == 0
-
-
-async def test_submit_review_with_invalid_lineage_fed_back_as_structured_error(
-    db_session, user_factory
-) -> None:
-    """必需数字叶子的 Draft 缺 lineage：拒绝进入 Review，回喂模型修正（§10.4）。"""
-    run, attempt, _, _ = await _setup_run(db_session, user_factory)
-    payload = insight_metric_payload(value=100)
-    _, draft, _ = await _make_draft(db_session, run, payload=payload)
-    engine, gateway, _ = _make_engine(
-        db_session,
-        actions=[
-            SubmitReview(
-                action="submit_review",
-                artifact_draft_ids=(draft.id,),
-                completion_text="分析",
-                summary="瑞幸品牌分析",
-            ),
-            Complete(action="complete", text="需要补全数据来源"),
-        ],
-        decisions=[],
-    )
-    outcome = await engine.run(
-        run=run,
-        attempt_id=attempt.id,
-        profile=get_profile("session_analyst_v1"),
-        messages=[ChatMessage(role="user", content="分析瑞幸品牌")],
-    )
-    assert outcome.status == RunStatus.COMPLETED
-    assert run.status == RunStatus.COMPLETED
-    # lineage 失败作为结构化 lineage_error 回喂，且不进入 Review
-    assert len(gateway.calls) == 2
-    assert any(
-        "lineage_error" in m.content for m in gateway.calls[1]["messages"]
-    )
-    assert (
-        await db_session.scalar(
-            select(func.count(ArtifactReviewBatch.id)).where(
-                ArtifactReviewBatch.parent_run_id == run.id
-            )
-        )
-    ) == 0
-
-
-async def test_submit_review_publish_failure_fails_run_and_releases_drafts(
+async def test_publish_unexpected_exception_fed_back_as_failed_item(
     db_session, user_factory, monkeypatch
 ) -> None:
-    """publish_batch 抛异常：不把 Run 卡在 reviewing，释放 Draft 并收口 failed。"""
-    from app.agent_artifacts.service import ArtifactService, PublishBlocked
-
+    """单项发布意外异常：不静默崩掉决策循环——该项按 failed 结构化回喂，
+    其余 Draft 正常发布；模型放弃坏 Draft 后 complete 收口 warnings。"""
     run, attempt, _, _ = await _setup_run(db_session, user_factory)
-    _, draft, _ = await _make_draft(db_session, run)
+    _, draft_a, _ = await _make_draft(db_session, run, brand="瑞幸")
+    _, draft_b, _ = await _make_draft(db_session, run, brand="库迪")
 
-    async def boom(self, review_batch_id: str, *, worker_id: str):
-        raise PublishBlocked("publish exploded")
+    original = ArtifactPublicationService._publish_one
+    # 引擎在异常项上 rollback 会让共享会话里的 ORM 实例过期：快照 draft 标量，
+    # 避免 fake/断言里惰性重载触发 MissingGreenlet。
+    draft_a_id = draft_a.id
+    draft_b_artifact_id = draft_b.artifact_id
 
-    monkeypatch.setattr(ArtifactService, "publish_batch", boom)
+    async def flaky(self, *, run_id, draft_id):
+        if draft_id == draft_a_id:
+            raise RuntimeError("publish exploded")
+        return await original(self, run_id=run_id, draft_id=draft_id)
 
-    engine, _, _ = _make_engine(
+    monkeypatch.setattr(ArtifactPublicationService, "_publish_one", flaky)
+
+    registry = ToolRegistry()
+    registry.register(AbandonDraftTool(db_session), category="artifact")
+    engine, gateway = _make_engine(
         db_session,
         actions=[
-            SubmitReview(
-                action="submit_review",
-                artifact_draft_ids=(draft.id,),
-                completion_text="分析",
-                summary="瑞幸品牌分析",
+            PublishArtifacts(
+                action="publish_artifacts",
+                artifact_draft_ids=(draft_a.id, draft_b.id),
+                summary="发布",
             ),
+            CallTool(
+                action="call_tool",
+                internal_tool_name="abandon_draft",
+                arguments={
+                    "draft_id": draft_a.id,
+                    "reason_code": "publish_broken",
+                    "reason": "发布通道异常",
+                },
+                rationale="放弃发布异常的 Draft",
+            ),
+            Complete(action="complete", text="已完成（部分产物未发布）"),
         ],
-        decisions=[ReviewDecision(decision="approve")],
+        registry=registry,
     )
     outcome = await engine.run(
         run=run,
         attempt_id=attempt.id,
         profile=get_profile("session_analyst_v1"),
-        messages=[ChatMessage(role="user", content="分析瑞幸品牌")],
+        messages=[ChatMessage(role="user", content="分析两个品牌")],
     )
-    assert outcome.status == RunStatus.FAILED
-    assert run.status == RunStatus.FAILED
-    # working head 已释放（不是卡在 reviewing 持有者）
-    draft_row = await db_session.get(ArtifactDraft, draft.id)
-    assert draft_row is not None
-    assert draft_row.status == "failed"
-    assert draft_row.owner_run_id is None
-    # 未产生任何版本（部分发布被拒绝）
-    assert (
-        await db_session.scalar(
-            select(func.count(AgentArtifactVersion.id)).where(
-                AgentArtifactVersion.source_run_id == run.id
-            )
+    assert outcome.status == RunStatus.COMPLETED_WITH_WARNINGS
+    # 异常项作为 failed 结果回喂（稳定 publish_error 码），不整 Run 崩溃
+    assert any("publish_error" in m.content for m in gateway.calls[1]["messages"])
+    # 其余 Draft 正常发布
+    versions = (
+        await db_session.scalars(
+            select(AgentArtifactVersion).where(AgentArtifactVersion.source_run_id == run.id)
         )
-    ) == 0
+    ).all()
+    assert len(versions) == 1
+    assert versions[0].artifact_id == draft_b_artifact_id
+    types = await _event_types(db_session, run.id)
+    assert types.count("artifact.published") == 1
 
 
 # ---------------------------------------------------------------------------
@@ -831,8 +794,8 @@ async def test_pause_at_decision_limit_and_resume(db_session, user_factory) -> N
         )
         for index in range(50)
     ]
-    engine, _, _ = _make_engine(
-        db_session, actions=actions, decisions=[], registry=_noop_registry()
+    engine, _ = _make_engine(
+        db_session, actions=actions, registry=_noop_registry()
     )
     outcome = await engine.run(
         run=run,
@@ -855,8 +818,8 @@ async def test_pause_at_decision_limit_and_resume(db_session, user_factory) -> N
     assert attempt2.attempt == 2
     assert attempt2.decision_count == 0
 
-    engine2, _, _ = _make_engine(
-        db_session, actions=[Complete(action="complete", text="恢复完成")], decisions=[]
+    engine2, _ = _make_engine(
+        db_session, actions=[Complete(action="complete", text="恢复完成")]
     )
     outcome2 = await engine2.run(
         run=run,
@@ -879,8 +842,8 @@ async def test_expired_lease_fails_run_cleanly(db_session, user_factory) -> None
     run_row.lease_expires_at = utc_now() - timedelta(seconds=1)
     await db_session.flush()
 
-    engine, _, _ = _make_engine(
-        db_session, actions=[Complete(action="complete", text="完成")], decisions=[]
+    engine, _ = _make_engine(
+        db_session, actions=[Complete(action="complete", text="完成")]
     )
     outcome = await engine.run(
         run=run,
@@ -911,7 +874,7 @@ async def test_cancel_requested_stops_new_calls_and_settles_inflight(
         if index == 2:
             await repo.request_cancel(run.id, run.user_id)
 
-    engine, _, _ = _make_engine(
+    engine, _ = _make_engine(
         db_session,
         actions=[
             CallTool(
@@ -923,7 +886,6 @@ async def test_cancel_requested_stops_new_calls_and_settles_inflight(
                 internal_tool_name="counting_tool", arguments={"value": "b"}, rationale="x"
             ),
         ],
-        decisions=[],
         registry=registry,
         on_decide=on_decide,
     )
@@ -974,7 +936,7 @@ async def test_cancel_between_decide_and_dispatch_blocks_tool_call(
         if index == 1:
             await repo.request_cancel(run.id, run.user_id)
 
-    engine, _, _ = _make_engine(
+    engine, _ = _make_engine(
         db_session,
         actions=[
             CallTool(
@@ -984,7 +946,6 @@ async def test_cancel_between_decide_and_dispatch_blocks_tool_call(
                 rationale="x",
             ),
         ],
-        decisions=[],
         registry=registry,
         on_decide=on_decide,
     )
@@ -1022,14 +983,13 @@ async def test_invalid_actions_reach_threshold_and_fail_run(
     db_session, user_factory
 ) -> None:
     run, attempt, _, _ = await _setup_run(db_session, user_factory)
-    engine, gateway, _ = _make_engine(
+    engine, gateway = _make_engine(
         db_session,
         actions=[
             SimpleNamespace(action="teleport"),
             SimpleNamespace(action="teleport"),
             SimpleNamespace(action="teleport"),
         ],
-        decisions=[],
     )
     outcome = await engine.run(
         run=run,
@@ -1049,13 +1009,12 @@ async def test_invalid_actions_reach_threshold_and_fail_run(
 
 async def test_invalid_action_then_valid_recovers(db_session, user_factory) -> None:
     run, attempt, _, _ = await _setup_run(db_session, user_factory)
-    engine, gateway, _ = _make_engine(
+    engine, gateway = _make_engine(
         db_session,
         actions=[
             SimpleNamespace(action="teleport"),
             Complete(action="complete", text="恢复完成"),
         ],
-        decisions=[],
     )
     outcome = await engine.run(
         run=run,
@@ -1077,8 +1036,8 @@ async def test_fresh_run_per_message_and_only_paused_resumes(
     db_session, user_factory
 ) -> None:
     run_a, attempt_a, user, session = await _setup_run(db_session, user_factory)
-    engine_a, _, _ = _make_engine(
-        db_session, actions=[Complete(action="complete", text="A 完成")], decisions=[]
+    engine_a, _ = _make_engine(
+        db_session, actions=[Complete(action="complete", text="A 完成")]
     )
     outcome_a = await engine_a.run(
         run=run_a,
@@ -1092,8 +1051,8 @@ async def test_fresh_run_per_message_and_only_paused_resumes(
     run_b, attempt_b = await _new_run(
         db_session, user_id=user.id, session_id=session.id
     )
-    engine_b, _, _ = _make_engine(
-        db_session, actions=[Complete(action="complete", text="B 完成")], decisions=[]
+    engine_b, _ = _make_engine(
+        db_session, actions=[Complete(action="complete", text="B 完成")]
     )
     outcome_b = await engine_b.run(
         run=run_b,
@@ -1123,40 +1082,25 @@ async def test_fresh_run_per_message_and_only_paused_resumes(
 
 
 # ---------------------------------------------------------------------------
-# 4. A5：Review Batch 集合冻结 / 幻觉 draft_id 回喂 / Draft 全出口释放
+# 4. 活动 Draft completion 闸门 / 幻觉 draft_id 回喂 / Draft 全出口释放
 # ---------------------------------------------------------------------------
 
 
-async def test_review_batch_draft_set_mismatch_added_draft(
-    db_session, user_factory
-) -> None:
-    """首次 submit 冻结 Batch 集合后，新增 Draft 提交 → 结构化 mismatch 回喂，
-    不建/不改 Batch，模型可继续（§5.7）。"""
+async def test_complete_with_active_draft_is_fed_back(db_session, user_factory) -> None:
+    """complete 不得留下本 Run 拥有的活动 Draft：回喂结构化错误
+    ``ACTIVE_DRAFTS_REMAIN``，Run 不结束；模型发布后即可正常 complete。"""
     run, attempt, _, _ = await _setup_run(db_session, user_factory)
-    _, draft_a, _ = await _make_draft(db_session, run, brand="瑞幸")
-    _, draft_b, _ = await _make_draft(db_session, run, brand="库迪")
-    engine, gateway, _ = _make_engine(
+    _, draft, _ = await _make_draft(db_session, run)
+    engine, gateway = _make_engine(
         db_session,
         actions=[
-            SubmitReview(
-                action="submit_review",
-                artifact_draft_ids=(draft_a.id,),
-                completion_text="品牌分析完成",
-                summary="分析",
+            Complete(action="complete", text="完成"),
+            PublishArtifacts(
+                action="publish_artifacts",
+                artifact_draft_ids=(draft.id,),
+                summary="发布",
             ),
-            SubmitReview(
-                action="submit_review",
-                artifact_draft_ids=(draft_a.id, draft_b.id),
-                completion_text="品牌分析完成",
-                summary="分析",
-            ),
-            Complete(action="complete", text="结束"),
-        ],
-        decisions=[
-            ReviewDecision(
-                decision="revise",
-                issues=[ReviewIssue(code="missing_data", message="需要补查")],
-            ),
+            Complete(action="complete", text="已完成"),
         ],
     )
     outcome = await engine.run(
@@ -1166,181 +1110,31 @@ async def test_review_batch_draft_set_mismatch_added_draft(
         messages=[ChatMessage(role="user", content="分析瑞幸品牌")],
     )
     assert outcome.status == RunStatus.COMPLETED
-    # 只有一条 Batch，且未被改动（仍 pending 等原集合复审）
-    batches = (
-        await db_session.scalars(
-            select(ArtifactReviewBatch).where(ArtifactReviewBatch.parent_run_id == run.id)
-        )
-    ).all()
-    assert len(batches) == 1
-    assert batches[0].status == "pending"
-    # mismatch 回喂进第三次 decide 的消息
     assert len(gateway.calls) == 3
-    assert any(
-        "review_batch_draft_set_mismatch" in m.content for m in gateway.calls[2]["messages"]
-    )
+    # 第一次 complete 被闸门拦截：结构化回喂 ACTIVE_DRAFTS_REMAIN
+    feedback = gateway.calls[1]["messages"][-1]
+    assert feedback.role == "user"
+    payload = json.loads(feedback.content)
+    assert payload["error_code"] == "ACTIVE_DRAFTS_REMAIN"
+    assert payload["active_draft_ids"] == [draft.id]
 
 
-async def test_review_batch_draft_set_mismatch_missing_draft(
+async def test_publish_with_nonexistent_draft_id_fed_back_as_failed_item(
     db_session, user_factory
 ) -> None:
-    """遗漏冻结集合中的 Draft → mismatch 回喂。"""
+    """幻觉 draft_id（不存在）：逐项 failed（draft_not_found）回喂，不整 Run 崩溃；
+    模型随后可正常完成。"""
     run, attempt, _, _ = await _setup_run(db_session, user_factory)
-    _, draft_a, _ = await _make_draft(db_session, run, brand="瑞幸")
-    _, draft_b, _ = await _make_draft(db_session, run, brand="库迪")
-    engine, gateway, _ = _make_engine(
+    engine, gateway = _make_engine(
         db_session,
         actions=[
-            SubmitReview(
-                action="submit_review",
-                artifact_draft_ids=(draft_a.id, draft_b.id),
-                completion_text="完成",
-                summary="分析",
-            ),
-            SubmitReview(
-                action="submit_review",
-                artifact_draft_ids=(draft_a.id,),
-                completion_text="完成",
-                summary="分析",
-            ),
-            Complete(action="complete", text="结束"),
-        ],
-        decisions=[
-            ReviewDecision(
-                decision="revise",
-                issues=[ReviewIssue(code="missing_data", message="需要补查")],
-            ),
-            ReviewDecision(
-                decision="revise",
-                issues=[ReviewIssue(code="missing_data", message="需要补查")],
-            ),
-        ],
-    )
-    outcome = await engine.run(
-        run=run,
-        attempt_id=attempt.id,
-        profile=get_profile("session_analyst_v1"),
-        messages=[ChatMessage(role="user", content="分析两个品牌")],
-    )
-    assert outcome.status == RunStatus.COMPLETED
-    assert any(
-        "review_batch_draft_set_mismatch" in m.content for m in gateway.calls[2]["messages"]
-    )
-
-
-async def test_review_batch_draft_set_mismatch_replaced_draft(
-    db_session, user_factory
-) -> None:
-    """替换 Draft（放弃原 Draft 新建）→ mismatch 回喂，原 Batch 不受影响。"""
-    run, attempt, _, _ = await _setup_run(db_session, user_factory)
-    _, draft_a, _ = await _make_draft(db_session, run, brand="瑞幸")
-    _, draft_b, _ = await _make_draft(db_session, run, brand="库迪")
-    engine, gateway, _ = _make_engine(
-        db_session,
-        actions=[
-            SubmitReview(
-                action="submit_review",
-                artifact_draft_ids=(draft_a.id,),
-                completion_text="完成",
-                summary="分析",
-            ),
-            SubmitReview(
-                action="submit_review",
-                artifact_draft_ids=(draft_b.id,),
-                completion_text="完成",
-                summary="分析",
-            ),
-            Complete(action="complete", text="结束"),
-        ],
-        decisions=[
-            ReviewDecision(
-                decision="revise",
-                issues=[ReviewIssue(code="missing_data", message="需要补查")],
-            ),
-        ],
-    )
-    outcome = await engine.run(
-        run=run,
-        attempt_id=attempt.id,
-        profile=get_profile("session_analyst_v1"),
-        messages=[ChatMessage(role="user", content="分析瑞幸品牌")],
-    )
-    assert outcome.status == RunStatus.COMPLETED
-    batches = (
-        await db_session.scalars(
-            select(ArtifactReviewBatch).where(ArtifactReviewBatch.parent_run_id == run.id)
-        )
-    ).all()
-    assert len(batches) == 1
-    assert any(
-        "review_batch_draft_set_mismatch" in m.content for m in gateway.calls[2]["messages"]
-    )
-
-
-async def test_review_batch_mismatch_counts_as_invalid_and_fails_run(
-    db_session, user_factory
-) -> None:
-    """连续 mismatch 计入无效动作：达到上限后 Run failed，不无限循环。"""
-    run, attempt, _, _ = await _setup_run(db_session, user_factory)
-    _, draft_a, _ = await _make_draft(db_session, run, brand="瑞幸")
-    _, draft_b, _ = await _make_draft(db_session, run, brand="库迪")
-    engine, gateway, _ = _make_engine(
-        db_session,
-        actions=[
-            SubmitReview(
-                action="submit_review",
-                artifact_draft_ids=(draft_a.id,),
-                completion_text="完成",
-                summary="分析",
-            ),
-            *[
-                SubmitReview(
-                    action="submit_review",
-                    artifact_draft_ids=(draft_b.id,),
-                    completion_text="完成",
-                    summary="分析",
-                )
-                for _ in range(MAX_INVALID_ACTIONS)
-            ],
-        ],
-        decisions=[
-            ReviewDecision(
-                decision="revise",
-                issues=[ReviewIssue(code="missing_data", message="需要补查")],
-            ),
-        ],
-    )
-    outcome = await engine.run(
-        run=run,
-        attempt_id=attempt.id,
-        profile=get_profile("session_analyst_v1"),
-        messages=[ChatMessage(role="user", content="分析瑞幸品牌")],
-    )
-    assert outcome.status == RunStatus.FAILED
-    assert len(gateway.calls) == 1 + MAX_INVALID_ACTIONS
-    assert any(
-        "review_batch_draft_set_mismatch" in m.content for m in gateway.calls[-1]["messages"]
-    )
-
-
-async def test_submit_review_with_nonexistent_draft_id_fed_back_as_validation_error(
-    db_session, user_factory
-) -> None:
-    """幻觉 draft_id（不存在）：结构化 validation_error 回喂并计入无效动作，
-    不整 Run 崩溃；模型随后可正常完成。"""
-    run, attempt, _, _ = await _setup_run(db_session, user_factory)
-    engine, gateway, _ = _make_engine(
-        db_session,
-        actions=[
-            SubmitReview(
-                action="submit_review",
+            PublishArtifacts(
+                action="publish_artifacts",
                 artifact_draft_ids=("ghost-draft-id",),
-                completion_text="完成",
-                summary="分析",
+                summary="发布",
             ),
             Complete(action="complete", text="改为直接回答"),
         ],
-        decisions=[],
     )
     outcome = await engine.run(
         run=run,
@@ -1350,39 +1144,27 @@ async def test_submit_review_with_nonexistent_draft_id_fed_back_as_validation_er
     )
     assert outcome.status == RunStatus.COMPLETED
     assert len(gateway.calls) == 2
-    assert any(
-        "draft_not_found" in m.content for m in gateway.calls[1]["messages"]
-    )
-    # 未创建任何 Review Batch
-    assert (
-        await db_session.scalar(
-            select(func.count(ArtifactReviewBatch.id)).where(
-                ArtifactReviewBatch.parent_run_id == run.id
-            )
-        )
-    ) == 0
+    assert any("draft_not_found" in m.content for m in gateway.calls[1]["messages"])
 
 
-async def test_submit_review_with_foreign_draft_id_fed_back_as_artifact_busy(
+async def test_publish_with_foreign_draft_id_fed_back_as_artifact_busy(
     db_session, user_factory
 ) -> None:
-    """幻觉 draft_id（属于其他活动 Run）：结构化 artifact_busy 回喂，
-    他人的 Draft 不被误标 reviewing、不建 Batch。"""
+    """幻觉 draft_id（属于其他活动 Run）：逐项 failed（artifact_busy）回喂，
+    他人的 Draft 不发布、owner 不变。"""
     run, attempt, user, session = await _setup_run(db_session, user_factory)
     run_b, _ = await _new_run(db_session, user_id=user.id, session_id=session.id)
     _, draft_b, _ = await _make_draft(db_session, run_b, brand="瑞幸")
-    engine, gateway, _ = _make_engine(
+    engine, gateway = _make_engine(
         db_session,
         actions=[
-            SubmitReview(
-                action="submit_review",
+            PublishArtifacts(
+                action="publish_artifacts",
                 artifact_draft_ids=(draft_b.id,),
-                completion_text="完成",
-                summary="分析",
+                summary="发布",
             ),
             Complete(action="complete", text="改为直接回答"),
         ],
-        decisions=[],
     )
     outcome = await engine.run(
         run=run,
@@ -1391,18 +1173,16 @@ async def test_submit_review_with_foreign_draft_id_fed_back_as_artifact_busy(
         messages=[ChatMessage(role="user", content="分析瑞幸品牌")],
     )
     assert outcome.status == RunStatus.COMPLETED
-    assert any(
-        "artifact_busy" in m.content for m in gateway.calls[1]["messages"]
-    )
-    # 他人 Draft 不受影响：owner 不变、状态不进入 reviewing
+    assert any("artifact_busy" in m.content for m in gateway.calls[1]["messages"])
+    # 他人 Draft 不受影响：owner 不变、不发布
     draft_row = await db_session.get(ArtifactDraft, draft_b.id)
     assert draft_row is not None
     assert draft_row.owner_run_id == run_b.id
     assert draft_row.status == "drafting"
     assert (
         await db_session.scalar(
-            select(func.count(ArtifactReviewBatch.id)).where(
-                ArtifactReviewBatch.parent_run_id == run.id
+            select(func.count(AgentArtifactVersion.id)).where(
+                AgentArtifactVersion.source_run_id == run_b.id
             )
         )
     ) == 0
@@ -1415,12 +1195,11 @@ async def test_ask_user_releases_owned_drafts_and_new_run_can_take_over(
     新 Run 同 key 可立即接管（§5.7）。"""
     run, attempt, user, session = await _setup_run(db_session, user_factory)
     service, draft, _ = await _make_draft(db_session, run, brand="瑞幸")
-    engine, _, _ = _make_engine(
+    engine, _ = _make_engine(
         db_session,
         actions=[
             AskUser(action="ask_user", question="确认分析方向", options=["声量", "情感"]),
         ],
-        decisions=[],
     )
     outcome = await engine.run(
         run=run,
@@ -1452,28 +1231,6 @@ async def test_ask_user_releases_owned_drafts_and_new_run_can_take_over(
     assert revision_b.revision == 2
 
 
-async def test_complete_releases_owned_drafts(db_session, user_factory) -> None:
-    """complete 出口（无正式产物）释放本 Run 持有的 Draft（§5.7）。"""
-    run, attempt, _, _ = await _setup_run(db_session, user_factory)
-    _, draft, _ = await _make_draft(db_session, run, brand="瑞幸")
-    engine, _, _ = _make_engine(
-        db_session,
-        actions=[Complete(action="complete", text="直接回答完毕")],
-        decisions=[],
-    )
-    outcome = await engine.run(
-        run=run,
-        attempt_id=attempt.id,
-        profile=get_profile("session_analyst_v1"),
-        messages=[ChatMessage(role="user", content="随便聊聊")],
-    )
-    assert outcome.status == RunStatus.COMPLETED
-    draft_row = await db_session.get(ArtifactDraft, draft.id)
-    assert draft_row is not None
-    assert draft_row.owner_run_id is None
-    assert draft_row.status == "idle"
-
-
 async def test_pause_releases_owned_drafts(db_session, user_factory) -> None:
     """paused 出口释放本 Run 持有的 Draft（§5.7）。"""
     run, attempt, _, _ = await _setup_run(db_session, user_factory)
@@ -1487,8 +1244,8 @@ async def test_pause_releases_owned_drafts(db_session, user_factory) -> None:
         )
         for index in range(50)
     ]
-    engine, _, _ = _make_engine(
-        db_session, actions=actions, decisions=[], registry=_noop_registry()
+    engine, _ = _make_engine(
+        db_session, actions=actions, registry=_noop_registry()
     )
     outcome = await engine.run(
         run=run,
@@ -1513,10 +1270,9 @@ async def test_run_failure_releases_owned_drafts_as_failed(
     async def boom(_run, _index) -> None:
         raise RuntimeError("model exploded")
 
-    engine, _, _ = _make_engine(
+    engine, _ = _make_engine(
         db_session,
         actions=[Complete(action="complete", text="不会到达")],
-        decisions=[],
         on_decide=boom,
     )
     outcome = await engine.run(
@@ -1532,35 +1288,6 @@ async def test_run_failure_releases_owned_drafts_as_failed(
     assert draft_row.status == "failed"
 
 
-async def test_reviewer_calls_use_artifact_reviewer_purpose(
-    db_session, user_factory
-) -> None:
-    """Reviewer 调用的审计 purpose 是 artifact_reviewer（不再误标 agent_loop）。"""
-    run, attempt, _, _ = await _setup_run(db_session, user_factory)
-    _, draft, _ = await _make_draft(db_session, run)
-    engine, _, reviewer_gateway = _make_engine(
-        db_session,
-        actions=[
-            SubmitReview(
-                action="submit_review",
-                artifact_draft_ids=(draft.id,),
-                completion_text="品牌分析完成",
-                summary="瑞幸品牌分析",
-            ),
-        ],
-        decisions=[ReviewDecision(decision="approve")],
-    )
-    outcome = await engine.run(
-        run=run,
-        attempt_id=attempt.id,
-        profile=get_profile("session_analyst_v1"),
-        messages=[ChatMessage(role="user", content="分析瑞幸品牌")],
-    )
-    assert outcome.status == RunStatus.COMPLETED
-    assert len(reviewer_gateway.calls) == 1
-    assert reviewer_gateway.calls[0]["purpose"] == "artifact_reviewer"
-
-
 # ---------------------------------------------------------------------------
 # 5. A6：Profile allowed_actions 运行时强制（§5.8）
 # ---------------------------------------------------------------------------
@@ -1572,13 +1299,12 @@ async def test_disallowed_action_fed_back_as_validation_error_and_recovers(
     """kol_detail_v1 不允许 ask_user：结构化 validation_error 回喂并计入无效动作，
     不分发、不写澄清消息/ pending Memory；模型随后合法 complete 正常收尾（§5.8）。"""
     run, attempt, _, _ = await _setup_run(db_session, user_factory)
-    engine, gateway, _ = _make_engine(
+    engine, gateway = _make_engine(
         db_session,
         actions=[
             AskUser(action="ask_user", question="需要确认详情范围", options=["概览", "全量"]),
             Complete(action="complete", text="直接给出达人详情"),
         ],
-        decisions=[],
     )
     outcome = await engine.run(
         run=run,
@@ -1616,13 +1342,12 @@ async def test_disallowed_action_reaches_threshold_and_fails_run(
 ) -> None:
     """连续输出 Profile 不允许的动作：达到统一无效动作上限后 Run failed（§5.8）。"""
     run, attempt, _, _ = await _setup_run(db_session, user_factory)
-    engine, gateway, _ = _make_engine(
+    engine, gateway = _make_engine(
         db_session,
         actions=[
             AskUser(action="ask_user", question=f"问题{index}", options=["是", "否"])
             for index in range(MAX_INVALID_ACTIONS)
         ],
-        decisions=[],
     )
     outcome = await engine.run(
         run=run,
@@ -1650,7 +1375,7 @@ async def test_disallowed_action_count_resets_after_valid_interaction(
 ) -> None:
     """不允许动作与合法动作交替：有效交互清零计数，两次间隔的违规不致 Run 失败。"""
     run, attempt, _, _ = await _setup_run(db_session, user_factory)
-    engine, gateway, _ = _make_engine(
+    engine, gateway = _make_engine(
         db_session,
         actions=[
             AskUser(action="ask_user", question="违规1", options=["是", "否"]),
@@ -1663,7 +1388,6 @@ async def test_disallowed_action_count_resets_after_valid_interaction(
             AskUser(action="ask_user", question="违规2", options=["是", "否"]),
             Complete(action="complete", text="完成"),
         ],
-        decisions=[],
         registry=_noop_registry(),
     )
     outcome = await engine.run(
@@ -1773,13 +1497,11 @@ def _make_engine_with_real_gateway(
     gateway = _RecordingGateway(AgentModelGateway(adapter, db=db_session))
     broker = AgentEventBroker()
     events = AgentEventStream(db_session, broker)
-    reviewer = ReviewerDriver(db_session, FakeReviewerGateway([]), worker_id="worker")
     engine = AgentEngine(
         db_session,
         gateway=gateway,
         registry=ToolRegistry(),
         events=events,
-        reviewer=reviewer,
         worker_id="worker",
     )
     return engine, gateway
@@ -1966,7 +1688,7 @@ async def test_thinking_sink_for_internal_run_returns_none(
 ) -> None:
     """Reviewer/Utility 内部 Run 不注入 thinking sink（visibility != user）。"""
     run, attempt, _, _ = await _setup_run(db_session, user_factory)
-    engine, _, _ = _make_engine(db_session, actions=[], decisions=[])
+    engine, _ = _make_engine(db_session, actions=[])
     assert engine.thinking_sink_for(run) is not None
     run.visibility = "internal"
     assert engine.thinking_sink_for(run) is None
@@ -1995,10 +1717,9 @@ async def test_complete_emits_message_completed_before_run_completed(
 ) -> None:
     """complete 路径：message.completed 先于 run.completed，终态事件最后（§5.8）。"""
     run, attempt, _, _ = await _setup_run(db_session, user_factory)
-    engine, _, _ = _make_engine(
+    engine, _ = _make_engine(
         db_session,
         actions=[Complete(action="complete", text="分析完成")],
-        decisions=[],
     )
     outcome = await engine.run(
         run=run,
@@ -2011,23 +1732,22 @@ async def test_complete_emits_message_completed_before_run_completed(
     assert types[-2:] == ["message.completed", "run.completed"]
 
 
-async def test_approve_publish_emits_message_completed_before_run_completed(
+async def test_publish_then_complete_emits_message_completed_before_run_completed(
     db_session, user_factory
 ) -> None:
-    """approve 发布路径：review/artifact 事件 → message.completed → run.completed。"""
+    """直接发布路径：artifact 事件 → message.completed → run.completed（§5.8）。"""
     run, attempt, _, _ = await _setup_run(db_session, user_factory)
     _, draft, _ = await _make_draft(db_session, run)
-    engine, _, _ = _make_engine(
+    engine, _ = _make_engine(
         db_session,
         actions=[
-            SubmitReview(
-                action="submit_review",
+            PublishArtifacts(
+                action="publish_artifacts",
                 artifact_draft_ids=(draft.id,),
-                completion_text="品牌分析完成",
                 summary="瑞幸品牌分析",
             ),
+            Complete(action="complete", text="品牌分析完成"),
         ],
-        decisions=[ReviewDecision(decision="approve")],
     )
     outcome = await engine.run(
         run=run,
@@ -2038,7 +1758,7 @@ async def test_approve_publish_emits_message_completed_before_run_completed(
     assert outcome.status == RunStatus.COMPLETED
     types = await _event_types(db_session, run.id)
     assert types[-2:] == ["message.completed", "run.completed"]
-    assert types.index("review.approved") < types.index("message.completed")
+    assert types.index("artifact.published") < types.index("message.completed")
 
 
 async def _create_committed_agent_run() -> tuple[str, str, str]:
@@ -2114,9 +1834,6 @@ async def test_live_stream_delivers_message_completed_before_run_completed() -> 
                 gateway=FakeAgentGateway([Complete(action="complete", text="完成")]),
                 registry=ToolRegistry(),
                 events=AgentEventStream(writer, broker),
-                reviewer=ReviewerDriver(
-                    writer, FakeReviewerGateway([]), worker_id="worker"
-                ),
                 worker_id="worker",
             )
             run = await writer.get(AgentRun, run_id)
@@ -2154,7 +1871,12 @@ async def test_live_stream_delivers_message_completed_before_run_completed() -> 
 #    用户可见事件）+ artifact 事件接入统一 Run SSE（§15.3）
 # ---------------------------------------------------------------------------
 
-_TERMINAL_TYPES = ("run.completed", "run.failed", "run.cancelled")
+_TERMINAL_TYPES = (
+    "run.completed",
+    "run.completed_with_warnings",
+    "run.failed",
+    "run.cancelled",
+)
 
 
 async def _terminal_events(db_session, run_id: str) -> list[AgentEvent]:
@@ -2171,186 +1893,13 @@ async def _terminal_events(db_session, run_id: str) -> list[AgentEvent]:
     ]
 
 
-async def test_submit_review_reject_emits_run_failed_as_last_event(
-    db_session, user_factory
-) -> None:
-    """Reviewer reject：review.rejected 之后必须发 run.failed 终态事件（G1/P0）。
-
-    终态事件是该 Run 最后一条用户可见事件；缺失会让 SSE 流不结束、前端
-    Run 卡停在中间态。reject 前 Run 已被 Reviewer 迁移 failed，事件由引擎补发。
-    """
-    run, attempt, _, _ = await _setup_run(db_session, user_factory)
-    _, draft, _ = await _make_draft(db_session, run)
-    engine, _, _ = _make_engine(
-        db_session,
-        actions=[
-            SubmitReview(
-                action="submit_review",
-                artifact_draft_ids=(draft.id,),
-                completion_text="分析",
-                summary="瑞幸品牌分析",
-            ),
-        ],
-        decisions=[
-            ReviewDecision(
-                decision="reject",
-                issues=[ReviewIssue(code="untrusted", message="数字无法追溯")],
-            )
-        ],
-    )
-    outcome = await engine.run(
-        run=run,
-        attempt_id=attempt.id,
-        profile=get_profile("session_analyst_v1"),
-        messages=[ChatMessage(role="user", content="分析瑞幸品牌")],
-    )
-    assert outcome.status == RunStatus.FAILED
-    types = await _event_types(db_session, run.id)
-    assert types[-1] == "run.failed"
-    assert types.index("review.rejected") < types.index("run.failed")
-    terminal = await _terminal_events(db_session, run.id)
-    assert len(terminal) == 1
-    assert terminal[0].payload_json["error_code"] == "review_rejected"
-
-
-async def test_third_revise_mapped_to_reject_emits_run_failed(
-    db_session, user_factory
-) -> None:
-    """第 3 次 revise 按 reject 处理：同样以 run.failed 终态事件收尾（G1/P0）。"""
-    run, attempt, _, _ = await _setup_run(db_session, user_factory)
-    _, draft, _ = await _make_draft(db_session, run)
-    engine, _, _ = _make_engine(
-        db_session,
-        actions=[
-            SubmitReview(
-                action="submit_review",
-                artifact_draft_ids=(draft.id,),
-                completion_text="分析",
-                summary="瑞幸品牌分析",
-            ),
-            SubmitReview(
-                action="submit_review",
-                artifact_draft_ids=(draft.id,),
-                completion_text="分析",
-                summary="瑞幸品牌分析",
-            ),
-            SubmitReview(
-                action="submit_review",
-                artifact_draft_ids=(draft.id,),
-                completion_text="分析",
-                summary="瑞幸品牌分析",
-            ),
-        ],
-        decisions=[
-            ReviewDecision(
-                decision="revise",
-                issues=[ReviewIssue(code="missing_data", message="需要补查")],
-            ),
-            ReviewDecision(
-                decision="revise",
-                issues=[ReviewIssue(code="missing_data", message="仍需补查")],
-            ),
-            ReviewDecision(
-                decision="revise",
-                issues=[ReviewIssue(code="missing_data", message="仍未补查")],
-            ),
-        ],
-    )
-    outcome = await engine.run(
-        run=run,
-        attempt_id=attempt.id,
-        profile=get_profile("session_analyst_v1"),
-        messages=[ChatMessage(role="user", content="分析瑞幸品牌")],
-    )
-    assert outcome.status == RunStatus.FAILED
-    types = await _event_types(db_session, run.id)
-    assert types[-1] == "run.failed"
-    assert types.index("review.rejected") < types.index("run.failed")
-    terminal = await _terminal_events(db_session, run.id)
-    assert len(terminal) == 1
-    assert terminal[0].payload_json["error_code"] == "review_rejected"
-
-
-async def test_publish_failure_emits_run_failed_with_error_code(
-    db_session, user_factory, monkeypatch
-) -> None:
-    """publish_batch 异常：run.failed 终态事件带稳定 error_code=publish_error（G1）。"""
-    from app.agent_artifacts.service import PublishBlocked
-
-    run, attempt, _, _ = await _setup_run(db_session, user_factory)
-    _, draft, _ = await _make_draft(db_session, run)
-
-    async def boom(self, review_batch_id: str, *, worker_id: str):
-        raise PublishBlocked("publish exploded")
-
-    monkeypatch.setattr(ArtifactService, "publish_batch", boom)
-
-    engine, _, _ = _make_engine(
-        db_session,
-        actions=[
-            SubmitReview(
-                action="submit_review",
-                artifact_draft_ids=(draft.id,),
-                completion_text="分析",
-                summary="瑞幸品牌分析",
-            ),
-        ],
-        decisions=[ReviewDecision(decision="approve")],
-    )
-    outcome = await engine.run(
-        run=run,
-        attempt_id=attempt.id,
-        profile=get_profile("session_analyst_v1"),
-        messages=[ChatMessage(role="user", content="分析瑞幸品牌")],
-    )
-    assert outcome.status == RunStatus.FAILED
-    types = await _event_types(db_session, run.id)
-    assert types[-1] == "run.failed"
-    terminal = await _terminal_events(db_session, run.id)
-    assert len(terminal) == 1
-    assert terminal[0].payload_json["error_code"] == "publish_error"
-
-
-async def test_reviewer_exception_emits_run_failed_with_error_code(
-    db_session, user_factory
-) -> None:
-    """Reviewer 调用异常：run.failed 终态事件带稳定 error_code=review_error（G1）。"""
-    run, attempt, _, _ = await _setup_run(db_session, user_factory)
-    _, draft, _ = await _make_draft(db_session, run)
-    # decisions 为空：FakeReviewerGateway 抛 AssertionError，走 _abort_review 收口
-    engine, _, _ = _make_engine(
-        db_session,
-        actions=[
-            SubmitReview(
-                action="submit_review",
-                artifact_draft_ids=(draft.id,),
-                completion_text="分析",
-                summary="瑞幸品牌分析",
-            ),
-        ],
-        decisions=[],
-    )
-    outcome = await engine.run(
-        run=run,
-        attempt_id=attempt.id,
-        profile=get_profile("session_analyst_v1"),
-        messages=[ChatMessage(role="user", content="分析瑞幸品牌")],
-    )
-    assert outcome.status == RunStatus.FAILED
-    types = await _event_types(db_session, run.id)
-    assert types[-1] == "run.failed"
-    terminal = await _terminal_events(db_session, run.id)
-    assert len(terminal) == 1
-    assert terminal[0].payload_json["error_code"] == "review_error"
-
-
 async def test_decide_exception_emits_run_failed_with_error_code(
     db_session, user_factory
 ) -> None:
     """decide 系统异常：run.failed 终态事件带稳定 error_code=model_error（G1）。"""
     run, attempt, _, _ = await _setup_run(db_session, user_factory)
     # actions 为空：FakeAgentGateway 抛 AssertionError，按系统错误收口
-    engine, _, _ = _make_engine(db_session, actions=[], decisions=[])
+    engine, _ = _make_engine(db_session, actions=[])
     outcome = await engine.run(
         run=run,
         attempt_id=attempt.id,
@@ -2370,14 +1919,13 @@ async def test_max_invalid_actions_emits_run_failed_with_error_code(
 ) -> None:
     """连续无效动作达上限：run.failed 带 error_code=max_invalid_actions（G1）。"""
     run, attempt, _, _ = await _setup_run(db_session, user_factory)
-    engine, _, _ = _make_engine(
+    engine, _ = _make_engine(
         db_session,
         actions=[
             SimpleNamespace(action="teleport"),
             SimpleNamespace(action="teleport"),
             SimpleNamespace(action="teleport"),
         ],
-        decisions=[],
     )
     outcome = await engine.run(
         run=run,
@@ -2430,7 +1978,7 @@ async def test_build_insight_draft_tool_emits_artifact_draft_created_event(
 
     registry = ToolRegistry()
     registry.register(BuildInsightDraftTool(db_session), category="artifact")
-    engine, _, _ = _make_engine(
+    engine, _ = _make_engine(
         db_session,
         actions=[
             CallTool(
@@ -2447,9 +1995,9 @@ async def test_build_insight_draft_tool_emits_artifact_draft_created_event(
                 },
                 rationale="创建钻取看板 Draft",
             ),
+            _publish_owned_draft(db_session),
             Complete(action="complete", text="完成"),
         ],
-        decisions=[],
         registry=registry,
     )
     outcome = await engine.run(
@@ -2493,7 +2041,7 @@ async def test_update_draft_tool_guard_blocks_insight_direct_write(
     _, draft, _ = await _make_draft(db_session, run)
     registry = ToolRegistry()
     registry.register(UpdateDraftTool(db_session), category="artifact")
-    engine, _, _ = _make_engine(
+    engine, _ = _make_engine(
         db_session,
         actions=[
             CallTool(
@@ -2506,9 +2054,9 @@ async def test_update_draft_tool_guard_blocks_insight_direct_write(
                 },
                 rationale="更新洞察 Draft",
             ),
+            _publish_owned_draft(db_session),
             Complete(action="complete", text="完成"),
         ],
-        decisions=[],
         registry=registry,
     )
     outcome = await engine.run(
@@ -2533,27 +2081,26 @@ async def test_update_draft_tool_guard_blocks_insight_direct_write(
     assert draft.current_revision == 1
 
 
-async def test_approve_publish_emits_artifact_published_before_message_completed(
+async def test_publish_emits_artifact_published_before_message_completed(
     db_session, user_factory
 ) -> None:
-    """原子发布成功：每个发布的 Artifact 发一条 artifact.published（G1/P1）。
+    """直接发布成功：每个发布的 Artifact 发一条 artifact.published（G1/P1）。
 
-    顺序：review.approved → artifact.published → message.completed → run.completed；
-    payload 带 artifact_id/module/parent_artifact_id/status/version（§15.3）。
+    顺序：artifact.published → artifact.publish.completed → message.completed →
+    run.completed；payload 带 artifact_id/module/parent_artifact_id/status/version（§15.3）。
     """
     run, attempt, _, _ = await _setup_run(db_session, user_factory)
     _, draft, _ = await _make_draft(db_session, run)
-    engine, _, _ = _make_engine(
+    engine, _ = _make_engine(
         db_session,
         actions=[
-            SubmitReview(
-                action="submit_review",
+            PublishArtifacts(
+                action="publish_artifacts",
                 artifact_draft_ids=(draft.id,),
-                completion_text="品牌分析完成",
                 summary="瑞幸品牌分析",
             ),
+            Complete(action="complete", text="品牌分析完成"),
         ],
-        decisions=[ReviewDecision(decision="approve")],
     )
     outcome = await engine.run(
         run=run,
@@ -2571,8 +2118,8 @@ async def test_approve_publish_emits_artifact_published_before_message_completed
     ).all()
     types = [row.event_type for row in rows]
     assert types.count("artifact.published") == 1
-    assert types.index("review.approved") < types.index("artifact.published")
-    assert types.index("artifact.published") < types.index("message.completed")
+    assert types.index("artifact.published") < types.index("artifact.publish.completed")
+    assert types.index("artifact.publish.completed") < types.index("message.completed")
     assert types[-1] == "run.completed"
     published = rows[types.index("artifact.published")]
     payload = published.payload_json
@@ -2585,29 +2132,15 @@ async def test_approve_publish_emits_artifact_published_before_message_completed
     assert len(terminal) == 1
 
 
-async def _purge_committed_review_run(
+async def _purge_committed_artifact_run(
     user_id: str, session_id: str, run_id: str
 ) -> None:
-    """删除 review 路径跨会话测试提交的行（含 review/artifact 链与内部 Run）。"""
+    """删除直接发布路径跨会话测试提交的行（含 artifact/publish 链）。"""
     async with db_engine.begin() as conn:
         run_ids = select(AgentRun.id).where(AgentRun.session_id == session_id)
-        batch_ids = select(ArtifactReviewBatch.id).where(
-            ArtifactReviewBatch.parent_run_id == run_id
-        )
-        item_ids = select(ArtifactReviewItem.id).where(
-            ArtifactReviewItem.batch_id.in_(batch_ids)
-        )
         await conn.execute(
-            delete(ArtifactReviewAttempt).where(
-                ArtifactReviewAttempt.review_item_id.in_(item_ids)
-            )
-        )
-        await conn.execute(
-            delete(ArtifactReviewItem).where(ArtifactReviewItem.batch_id.in_(batch_ids))
-        )
-        await conn.execute(
-            delete(ArtifactReviewBatch).where(
-                ArtifactReviewBatch.parent_run_id == run_id
+            delete(ArtifactPublishAttempt).where(
+                ArtifactPublishAttempt.run_id.in_(run_ids)
             )
         )
         await conn.execute(
@@ -2622,6 +2155,14 @@ async def _purge_committed_review_run(
         await conn.execute(
             delete(ArtifactDraft).where(ArtifactDraft.session_id == session_id)
         )
+        artifact_ids = select(AgentArtifact.id).where(
+            AgentArtifact.session_id == session_id
+        )
+        await conn.execute(
+            delete(AgentArtifactVersion).where(
+                AgentArtifactVersion.artifact_id.in_(artifact_ids)
+            )
+        )
         await conn.execute(
             delete(AgentArtifact).where(AgentArtifact.session_id == session_id)
         )
@@ -2633,17 +2174,15 @@ async def _purge_committed_review_run(
         await conn.execute(
             delete(AgentRunAttempt).where(AgentRunAttempt.run_id.in_(run_ids))
         )
-        # agent_runs.parent_run_id 自引用：先删 Reviewer 内部子 Run，再删父 Run
-        # （InnoDB 单语句多行删除自引用 RESTRICT 会失败）。
         await conn.execute(delete(AgentRun).where(AgentRun.parent_run_id == run_id))
         await conn.execute(delete(AgentRun).where(AgentRun.session_id == session_id))
         await conn.execute(delete(AgentSession).where(AgentSession.id == session_id))
         await conn.execute(delete(User).where(User.id == user_id))
 
 
-async def test_live_stream_reject_ends_with_run_failed() -> None:
-    """跨会话在线消费（reader 独立会话）：reject 路径的 SSE 流以 run.failed
-    终态事件收口——流必须结束，不能让前端停在中间态（§5.8/G1 P0）。"""
+async def test_live_stream_completed_with_warnings_ends_stream() -> None:
+    """跨会话在线消费（reader 独立会话）：completed_with_warnings 路径的 SSE 流
+    以 run.completed_with_warnings 终态事件收口——流必须结束（§5.8/G1）。"""
     user_id, session_id, run_id = await _create_committed_agent_run()
     broker = AgentEventBroker()
     try:
@@ -2665,34 +2204,27 @@ async def test_live_stream_reject_ends_with_run_failed() -> None:
                 artifact_type="insight_board_v1",
             )
             await writer.commit()
+            registry = ToolRegistry()
+            registry.register(AbandonDraftTool(writer), category="artifact")
             engine = AgentEngine(
                 writer,
                 gateway=FakeAgentGateway(
                     [
-                        SubmitReview(
-                            action="submit_review",
-                            artifact_draft_ids=(draft.id,),
-                            completion_text="分析",
-                            summary="瑞幸品牌分析",
-                        )
+                        CallTool(
+                            action="call_tool",
+                            internal_tool_name="abandon_draft",
+                            arguments={
+                                "draft_id": draft.id,
+                                "reason_code": "unfixable",
+                                "reason": "无法修复",
+                            },
+                            rationale="放弃无法修复的 Draft",
+                        ),
+                        Complete(action="complete", text="已完成（部分产物未发布）"),
                     ]
                 ),
-                registry=ToolRegistry(),
+                registry=registry,
                 events=AgentEventStream(writer, broker),
-                reviewer=ReviewerDriver(
-                    writer,
-                    FakeReviewerGateway(
-                        [
-                            ReviewDecision(
-                                decision="reject",
-                                issues=[
-                                    ReviewIssue(code="untrusted", message="数字无法追溯")
-                                ],
-                            )
-                        ]
-                    ),
-                    worker_id="worker",
-                ),
                 worker_id="worker",
             )
 
@@ -2712,15 +2244,17 @@ async def test_live_stream_reject_ends_with_run_failed() -> None:
                 profile=get_profile("session_analyst_v1"),
                 messages=[ChatMessage(role="user", content="分析瑞幸品牌")],
             )
-            assert outcome.status == RunStatus.FAILED
-            # reject 修复前：流永远等不到终态事件，这里会超时失败
+            assert outcome.status == RunStatus.COMPLETED_WITH_WARNINGS
+            # 若 completed_with_warnings 不是终态事件，流永不结束，这里会超时失败
             await asyncio.wait_for(consumer, timeout=5)
     finally:
-        await _purge_committed_review_run(user_id, session_id, run_id)
+        await _purge_committed_artifact_run(user_id, session_id, run_id)
 
-    assert received[-1] == "run.failed"
-    assert "review.rejected" in received
-    assert received.index("review.rejected") < received.index("run.failed")
+    assert received[-1] == "run.completed_with_warnings"
+    assert "message.completed" in received
+    assert received.index("message.completed") < received.index(
+        "run.completed_with_warnings"
+    )
     assert sum(1 for t in received if t in _TERMINAL_TYPES) == 1
 
 
@@ -2735,10 +2269,9 @@ async def test_explicit_user_question_anchor_wins_over_tool_result_tail(
     """恢复后的对话尾部是 tool_result 回放（role="user"）：显式 ``user_question``
     锚点优先于消息列表反推，Memory Header 拿到真实用户问题（G3）。"""
     run, attempt, _, _ = await _setup_run(db_session, user_factory)
-    engine, gateway, _ = _make_engine(
+    engine, gateway = _make_engine(
         db_session,
         actions=[Complete(action="complete", text="继续分析完成")],
-        decisions=[],
     )
     tool_result_tail = ChatMessage(
         role="user",
@@ -2769,46 +2302,3 @@ async def test_explicit_user_question_anchor_wins_over_tool_result_tail(
     # 反推路径会拿到尾部的 tool_result JSON：显式锚点必须覆盖它。
     assert header["current_user_message"] == "分析瑞幸品牌"
     assert header["current_user_message"] != tool_result_tail.content
-
-
-async def test_explicit_user_question_anchor_flows_to_reviewer(
-    db_session, user_factory
-) -> None:
-    """显式 ``user_question`` 锚点同步进入 Reviewer 评审上下文（G3）。"""
-    run, attempt, _, _ = await _setup_run(db_session, user_factory)
-    _, draft, _ = await _make_draft(db_session, run)
-    engine, _, reviewer_gateway = _make_engine(
-        db_session,
-        actions=[
-            SubmitReview(
-                action="submit_review",
-                artifact_draft_ids=(draft.id,),
-                completion_text="品牌分析完成",
-                summary="瑞幸品牌分析",
-            ),
-        ],
-        decisions=[ReviewDecision(decision="approve")],
-    )
-    conversation = [
-        ChatMessage(role="user", content="分析瑞幸品牌"),
-        ChatMessage(
-            role="user",
-            content=json.dumps(
-                {"tool_result": {"status": "success", "summary": "声量预览文本"}},
-                ensure_ascii=False,
-            ),
-        ),
-    ]
-
-    outcome = await engine.run(
-        run=run,
-        attempt_id=attempt.id,
-        profile=get_profile("session_analyst_v1"),
-        messages=conversation,
-        user_question="分析瑞幸品牌",
-    )
-
-    assert outcome.status == RunStatus.COMPLETED
-    assert reviewer_gateway.calls
-    review_context = json.loads(reviewer_gateway.calls[0]["messages"][-1].content)
-    assert review_context["user_question"] == "分析瑞幸品牌"

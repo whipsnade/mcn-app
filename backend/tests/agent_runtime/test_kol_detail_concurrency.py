@@ -26,6 +26,7 @@ from app.agent_artifacts.models import (
     ArtifactDraft,
     ArtifactDraftRevision,
     ArtifactEvent,
+    ArtifactPublishAttempt,
     ArtifactReviewBatch,
     ArtifactReviewItem,
     KolDetailCache,
@@ -42,8 +43,7 @@ from app.agent_runtime.models import (
     EvidenceItem,
     MemoryEntry,
 )
-from app.agent_runtime.reviewer import ReviewDecision, ReviewerDriver
-from app.agent_runtime.schemas import CallTool, SubmitReview
+from app.agent_runtime.schemas import CallTool, Complete, PublishArtifacts
 from app.agent_runtime.tools.builders import BuildKolDetailDraftTool
 from app.agent_runtime.tools.mcp import MCP_POINTS_COST, AgentMcpTool
 from app.agent_runtime.tools.registry import McpCatalogEntry, ToolRegistry
@@ -270,21 +270,18 @@ class ScriptedGateway:
         return action
 
 
-class ApprovingReviewerGateway:
-    async def decide(self, **kwargs: Any) -> ReviewDecision:
-        return ReviewDecision(decision="approve")
-
-
 # ---------------------------------------------------------------------------
 # 装配
 # ---------------------------------------------------------------------------
 
 
 def _actions_for(db) -> list[Any]:
-    """kol_detail_v1 脚本：MCP 抓取 → build_kol_detail_draft（运行时取 Evidence）→ 提交复核。
+    """kol_detail_v1 脚本：MCP 抓取 → build_kol_detail_draft（运行时取 Evidence）→
+    直接发布 → complete。
 
     H2 起 create_draft 对 kol_detail_v2 直写被 typed_artifact_requires_builder
-    护栏拒绝，脚本与生产语义一致走 Builder 工具。
+    护栏拒绝，脚本与生产语义一致走 Builder 工具；直接发布改造后由
+    publish_artifacts（确定性校验，无模型 Reviewer）发布。
     """
 
     async def create_draft(run):
@@ -304,15 +301,14 @@ def _actions_for(db) -> list[Any]:
             rationale="创建达人详情 Draft",
         )
 
-    async def submit(run):
+    async def publish(run):
         draft = await db.scalar(
             select(ArtifactDraft).where(ArtifactDraft.owner_run_id == run.id)
         )
         assert draft is not None
-        return SubmitReview(
-            action="submit_review",
+        return PublishArtifacts(
+            action="publish_artifacts",
             artifact_draft_ids=(draft.id,),
-            completion_text="达人详情已完成",
             summary="达人详情",
         )
 
@@ -324,7 +320,8 @@ def _actions_for(db) -> list[Any]:
             rationale="抓取达人详情",
         ),
         create_draft,
-        submit,
+        publish,
+        Complete(action="complete", text="达人详情已完成"),
     ]
 
 
@@ -351,13 +348,11 @@ def _make_service(db, *, gateway: ScriptedGateway, transport, worker: str):
     registry.register(BuildKolDetailDraftTool(db), category="artifact")
     broker = AgentEventBroker()
     events = AgentEventStream(db, broker)
-    reviewer = ReviewerDriver(db, ApprovingReviewerGateway(), worker_id=worker)
     engine = AgentEngine(
         db,
         gateway=gateway,
         registry=registry,
         events=events,
-        reviewer=reviewer,
         worker_id=worker,
     )
     return KolDetailRunService(
@@ -419,6 +414,13 @@ async def _teardown(user_id: str, session_id: str) -> None:
             await db.execute(
                 delete(ArtifactReviewBatch).where(
                     ArtifactReviewBatch.parent_run_id.in_(run_ids)
+                )
+            )
+        # 直接发布留痕（FK 引用 run/artifact/revision/version）：先于版本与草稿删除。
+        if all_run_ids:
+            await db.execute(
+                delete(ArtifactPublishAttempt).where(
+                    ArtifactPublishAttempt.run_id.in_(all_run_ids)
                 )
             )
         # artifact_events.artifact_version_id FK → versions：先删事件再删版本。

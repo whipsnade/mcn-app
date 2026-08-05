@@ -85,6 +85,21 @@ async def test_recovery_tool_factory_shares_breaker_and_agent_transport(db_sessi
     assert recovery_tool._transport is engine_tool._transport
 
 
+async def test_engine_factory_does_not_wire_model_reviewer(db_session) -> None:
+    """直接发布改造（Task 4）：engine_factory 不再构造 ReviewerDriver——
+
+    新执行路径不创建 Reviewer Run、不进入 reviewing；发布由确定性
+    ``ArtifactPublicationService`` 完成。``artifact_reviewer_v1`` Profile
+    注册仅保留供历史代码导入，不得出现在新 Runtime wiring。
+    """
+    from app.main import create_agent_runtime
+
+    _executor, _recovery, _broker, engine_factory, _utility = create_agent_runtime()
+    engine = engine_factory(db_session, "worker-a", channel_permissions=())
+
+    assert not hasattr(engine, "_reviewer")
+
+
 def test_app_state_wires_agent_tool_reconciler() -> None:
     from app.main import create_app
 

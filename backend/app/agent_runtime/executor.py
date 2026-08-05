@@ -13,9 +13,10 @@ running Run 可被新 worker 领取。领取后先 ``pause`` 收口旧 Attempt
 sequence 不归零；``RunTranscriptLoader``（§5.4）重建的对话上下文包含此前
 工具结果，模型不会重复调用已 settled 的 MCP 工具。
 
-**reviewing 接管**（§5.5）：复核期间崩溃的 reviewing Run（租约过期）沿用
-open Attempt 被领取，保持 reviewing 状态交给引擎继续未完成的复核——已
-approve 的 Review Item 不重审，pending/revise 继续，完成后走原子发布。
+**历史 reviewing Run 收口**（直接发布改造 Task 4）：部署前复核期间崩溃的
+reviewing Run（租约过期）沿用 open Attempt 被领取后交给引擎，引擎入口直接
+收口 failed（``LEGACY_REVIEWING_UNSUPPORTED``），保留 Draft，不再启动
+Reviewer。
 
 **优雅关闭**：``stop()`` 置停止信号，循环只在下一次迭代开始前检查，因此当前
 in-flight Run 会在事务安全点自然完成；超时则取消循环任务，留下的 running Run
@@ -64,6 +65,7 @@ SESSION_ANALYST_PROFILE = "session_analyst_v1"
 _UTILITY_TRIGGER_STATUSES = frozenset(
     {
         RunStatus.COMPLETED,
+        RunStatus.COMPLETED_WITH_WARNINGS,
         RunStatus.FAILED,
         RunStatus.CANCELLED,
         RunStatus.CLARIFICATION_REQUESTED,
@@ -260,8 +262,9 @@ class AgentRunExecutor:
         无租约 RUNNING（``lease_expires_at`` 为 NULL）是 API resume 经
         ``begin_attempt(resumed=True)`` 或 begin_attempt 后崩溃留下的状态：
         当前 Attempt 已就绪、无活跃 worker 持有，必须可被领取，否则恢复后
-        的 Run 会永久卡在 running。租约过期的 REVIEWING Run（复核期间崩溃，
-        §5.5）同样可领取，由引擎继续未完成的复核。
+        的 Run 会永久卡在 running。租约过期的 REVIEWING Run（直接发布改造前
+        复核期间崩溃的历史遗留）同样可领取——由引擎收口 failed
+        （LEGACY_REVIEWING_UNSUPPORTED），不再继续复核。
         """
         now = utc_now()
         queued = await db.scalar(
@@ -365,10 +368,10 @@ class AgentRunExecutor:
                 return None
             return run, attempt, "system"
         if status == RunStatus.REVIEWING:
-            # reviewing 接管（§5.5 复核期间崩溃）：沿用 open Attempt 并保持
-            # reviewing 状态，引擎继续未完成的复核（已 approve 的 Item 不重审）。
-            # transition→reviewing 不收口 Attempt，open Attempt 必然存在；
-            # 缺失属不变量破坏，记日志跳过（不静默重建破坏复核审计）。
+            # 历史 reviewing Run（直接发布改造前复核期间崩溃，§5.5 遗留）：
+            # Reviewer 已下线——沿用 open Attempt 领取后交给引擎，引擎入口直接
+            # 收口 failed（LEGACY_REVIEWING_UNSUPPORTED），保留 Draft，不再
+            # 启动 Reviewer。open Attempt 必然存在；缺失属不变量破坏，记日志跳过。
             if not await repo.claim_lease(run_id, worker_id, self._lease_seconds):
                 return None
             attempt = await self._current_open_attempt(db, run_id)

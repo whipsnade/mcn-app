@@ -13,7 +13,6 @@ from app.agent_runtime.events import AgentEventBroker, AgentEventStream
 from app.agent_runtime.executor import AgentRunExecutor
 from app.agent_runtime.model_gateway import AgentModelGateway
 from app.agent_runtime.recovery import RecoveryLoop
-from app.agent_runtime.reviewer import ReviewerDriver
 from app.agent_runtime.tools.factory import AgentToolRegistryFactory, resolve_allowlist_entry
 from app.agent_runtime.tools.mcp import AgentMcpTool
 from app.agent_runtime.utility import UtilityDispatcher, UtilityRunner
@@ -99,11 +98,10 @@ def create_agent_runtime(*, stuck_seconds: float | None = None) -> tuple[
             gateway=gateway,
             registry=registry,
             events=AgentEventStream(db, broker),
-            reviewer=ReviewerDriver(db, gateway, worker_id=worker_id),
             worker_id=worker_id,
             channel_permissions=channel_permissions,
-            # 租约心跳（§5.5）：独立 Session 真实提交续租，覆盖 decide/MCP/
-            # Reviewer 长调用；缺省共享会话只用于测试注入。
+            # 租约心跳（§5.5）：独立 Session 真实提交续租，覆盖 decide/MCP
+            # 长调用；缺省共享会话只用于测试注入。
             session_factory=SessionFactory,
         )
 

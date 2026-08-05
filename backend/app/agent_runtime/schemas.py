@@ -9,8 +9,7 @@ Artifact 创建、更新、历史读取和计算统一通过 ``call_tool`` 走�
 
 直接发布协议：``publish_artifacts`` 取代旧的 ``submit_review``——不再创建
 Reviewer Run，由确定性发布服务逐 Draft 校验并发布；``publish_artifacts``
-是非终态动作，发布结果回喂后模型继续决策循环。``SubmitReview`` 类仅保留
-供历史代码/测试导入，不在动作联合中。
+是非终态动作，发布结果回喂后模型继续决策循环。
 """
 
 from typing import Annotated, Any, Literal
@@ -65,32 +64,6 @@ class PublishArtifacts(BaseModel):
     summary: str = Field(min_length=1, max_length=2000)
 
 
-class SubmitReview(BaseModel):
-    """（遗留）提交 Draft 给 Reviewer 的旧动作模型。
-
-    已从动作联合与 ``FOUR_ACTIONS`` 移除：新执行路径不再创建 Reviewer Run。
-    类定义仅保留供历史代码/测试导入，引擎 rewiring（Task 4）完成后可删除。
-
-    ``artifact_draft_ids`` 用 tuple 而非 list：不可变且天然带去重语义，
-    配合 validator 保证非空且唯一，且每项为至少 1 字符的非空字符串。
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    action: Literal["submit_review"]
-    artifact_draft_ids: tuple[Annotated[str, Field(min_length=1)], ...] = Field(min_length=1)
-    # Reviewer 全部 approve 并原子发布后才写入 assistant 消息。
-    completion_text: str = Field(min_length=1, max_length=4000)
-    summary: str = Field(min_length=1, max_length=2000)
-
-    @field_validator("artifact_draft_ids")
-    @classmethod
-    def _unique_ids(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        if len(set(value)) != len(value):
-            raise ValueError("artifact_draft_ids must not contain duplicates")
-        return value
-
-
 class Complete(BaseModel):
     """无正式 Artifact 时结束 Run；回复用户文本，可附可选后续建议。"""
 
@@ -118,5 +91,4 @@ __all__ = [
     "Complete",
     "FOUR_ACTIONS",
     "PublishArtifacts",
-    "SubmitReview",
 ]

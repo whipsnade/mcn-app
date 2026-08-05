@@ -41,6 +41,7 @@ class AgentEventType(StrEnum):
     RUN_PAUSED = "run.paused"
     RUN_RESUMED = "run.resumed"
     RUN_COMPLETED = "run.completed"
+    RUN_COMPLETED_WITH_WARNINGS = "run.completed_with_warnings"
     RUN_FAILED = "run.failed"
     RUN_CANCELLED = "run.cancelled"
     THINKING_STARTED = "thinking.started"
@@ -65,6 +66,7 @@ class AgentEventType(StrEnum):
 TERMINAL_EVENT_TYPES = frozenset(
     {
         AgentEventType.RUN_COMPLETED,
+        AgentEventType.RUN_COMPLETED_WITH_WARNINGS,
         AgentEventType.RUN_FAILED,
         AgentEventType.RUN_CANCELLED,
     }
@@ -198,9 +200,9 @@ class AgentEventStream:
         任何中途异常整体回滚——不存在"Run 已终态但无终态事件"的提交窗口；
         并发后到者被行锁串行化后看到已有终态，幂等返回而非唯一键异常。
 
-        ``worker_id`` 语义：COMPLETED 必须由持活跃租约的 worker 迁移（否则抛
-        ``run_lease_not_held``）；FAILED 持租约走状态机、无租约走系统级
-        force_fail（他人活跃持有时返回 ``None``，终态交接管方，A4 闸门）；
+        ``worker_id`` 语义：COMPLETED/COMPLETED_WITH_WARNINGS 必须由持活跃租约的
+        worker 迁移（否则抛 ``run_lease_not_held``）；FAILED 持租约走状态机、无租约
+        走系统级 force_fail（他人活跃持有时返回 ``None``，终态交接管方，A4 闸门）；
         CANCELLED 是用户取消跨切面语义（任意非终态 → cancelled，不看租约）。
         Run 已是终态但缺终态事件（旧窗口残留）时按实际终态补发事件，不再迁移。
         幂等与闸门路径同样提交：调用方在本事务内可能已 flush 需要落库的写入
@@ -307,10 +309,10 @@ class AgentEventStream:
         if outcome == RunStatus.CANCELLED:
             # 用户取消跨切面：任意非终态 → cancelled，不看租约。
             return await repo.cancel(run.id, run.user_id)
-        if outcome == RunStatus.COMPLETED:
+        if outcome in (RunStatus.COMPLETED, RunStatus.COMPLETED_WITH_WARNINGS):
             if worker_id is None or not AgentRunRepository.owns_active_lease(run, worker_id):
                 raise InvalidRunTransition("run_lease_not_held")
-            await repo.transition(run.id, RunStatus.COMPLETED, worker_id=worker_id)
+            await repo.transition(run.id, outcome, worker_id=worker_id)
             return True
         # FAILED：持租约走状态机；无租约/过期走系统级 force_fail（error_code 落 Run 行）。
         if worker_id is not None and AgentRunRepository.owns_active_lease(run, worker_id):

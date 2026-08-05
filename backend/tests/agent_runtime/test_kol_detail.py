@@ -52,8 +52,7 @@ from app.agent_runtime.models import (
 )
 from app.agent_runtime.profiles import get_profile
 from app.agent_runtime.repository import AgentRunRepository, utc_now
-from app.agent_runtime.reviewer import ReviewDecision, ReviewerDriver
-from app.agent_runtime.schemas import CallTool, SubmitReview
+from app.agent_runtime.schemas import CallTool, Complete, PublishArtifacts
 from app.agent_runtime.state import RunStatus
 from app.agent_runtime.thinking import AgentEventThinkingSink
 from app.agent_runtime.tools.builders import BuildKolDetailDraftTool
@@ -159,7 +158,7 @@ class FakeKolDetailFetchTool:
 class KolDetailFakeGateway:
     """脚本化动作网关；支持可调用动作（工厂）在运行时解析 draft id。
 
-    ``interleave``：在首次 submit_review 被分发前注入一次并发 ``create()``，
+    ``interleave``：在首次 publish_artifacts 被分发前注入一次并发 ``create()``，
     模拟 TOCTOU 窗口（第二个 create 撞上正在进行的 Run）。
     """
 
@@ -188,21 +187,10 @@ class KolDetailFakeGateway:
         if (
             self.interleave is not None
             and self.interleave_result is None
-            and isinstance(action, SubmitReview)
+            and isinstance(action, PublishArtifacts)
         ):
             self.interleave_result = await self.interleave()
         return action
-
-
-class ApprovingReviewerGateway:
-    """每次都 approve 的 Reviewer 网关，供多条 run 复用（不消费决策）。"""
-
-    def __init__(self) -> None:
-        self.calls: list[dict[str, Any]] = []
-
-    async def decide(self, *, run, attempt_id, profile, messages, thinking_sink=None, **kwargs):
-        self.calls.append({"run_id": run.id, **kwargs})
-        return ReviewDecision(decision="approve")
 
 
 # ---------------------------------------------------------------------------
@@ -287,21 +275,21 @@ async def _make_evidence(db, user_id: str, session_id: str):
 
 
 def _make_actions(db, evidence, cache_state: dict[str, Any]) -> list[Any]:
-    """脚本化 kol_detail_v1 动作：抓取 → build_kol_detail_draft → 提交复核。
+    """脚本化 kol_detail_v1 动作：抓取 → build_kol_detail_draft → 直接发布 → complete。
 
     H2 起 create_draft 对 kol_detail_v2 直写被 typed_artifact_requires_builder
-    护栏拒绝，脚本与生产语义一致走 Builder 工具。
+    护栏拒绝，脚本与生产语义一致走 Builder 工具；直接发布改造后由
+    publish_artifacts（确定性校验，无模型 Reviewer）发布。
     """
 
-    async def submit(run):
+    async def publish(run):
         draft = await db.scalar(
             select(ArtifactDraft).where(ArtifactDraft.owner_run_id == run.id)
         )
         assert draft is not None
-        return SubmitReview(
-            action="submit_review",
+        return PublishArtifacts(
+            action="publish_artifacts",
             artifact_draft_ids=(draft.id,),
-            completion_text="达人详情已完成",
             summary="达人详情",
         )
 
@@ -323,7 +311,8 @@ def _make_actions(db, evidence, cache_state: dict[str, Any]) -> list[Any]:
             },
             rationale="创建达人详情 Draft",
         ),
-        submit,
+        publish,
+        Complete(action="complete", text="达人详情已完成"),
     ]
 
 
@@ -332,16 +321,13 @@ def _make_service(db, *, actions: list[Any], evidence, now_fn, worker: str = "wo
     registry = ToolRegistry()
     registry.register(FakeKolDetailFetchTool(evidence.id), category="kol_detail")
     registry.register(BuildKolDetailDraftTool(db), category="artifact")
-    reviewer_gateway = ApprovingReviewerGateway()
     broker = AgentEventBroker()
     events = AgentEventStream(db, broker)
-    reviewer = ReviewerDriver(db, reviewer_gateway, worker_id=worker)
     engine = AgentEngine(
         db,
         gateway=gateway,
         registry=registry,
         events=events,
-        reviewer=reviewer,
         worker_id=worker,
     )
     service = KolDetailRunService(
@@ -378,7 +364,7 @@ async def test_cache_hit_serves_without_new_model_call(db_session, user_factory)
     assert summary1.detail is not None
     assert summary1.detail["data"]["cache"]["hit"] is False
     calls_after_first = len(gateway.calls)
-    assert calls_after_first == 3  # fetch + create_draft + submit_review
+    assert calls_after_first == 4  # fetch + create_draft + publish + complete
 
     # 轻量 Run 形状：run_kind=user / visibility=user / profile=kol_detail_v1。
     run_row = await db_session.get(AgentRun, summary1.run_id)
@@ -1221,17 +1207,17 @@ async def test_takeover_restores_kol_detail_trigger_context(db_session, user_fac
     attempt2 = await repo.begin_attempt(run.id, resumed=True)
     assert await repo.claim_lease(run.id, "worker", 300)
 
-    # 恢复后不重新抓取：直接 build_kol_detail_draft（复用既有 working head）→ submit。
-    # （H2：create_draft 对 kol_detail_v2 直写已被护栏拒绝，走 Builder 工具。）
-    async def submit(resumed_run):
+    # 恢复后不重新抓取：直接 build_kol_detail_draft（复用既有 working head）→
+    # publish → complete。（H2：create_draft 对 kol_detail_v2 直写已被护栏拒绝，
+    # 走 Builder 工具。）
+    async def publish(resumed_run):
         draft = await db_session.scalar(
             select(ArtifactDraft).where(ArtifactDraft.owner_run_id == resumed_run.id)
         )
         assert draft is not None
-        return SubmitReview(
-            action="submit_review",
+        return PublishArtifacts(
+            action="publish_artifacts",
             artifact_draft_ids=(draft.id,),
-            completion_text="达人详情已完成",
             summary="达人详情",
         )
 
@@ -1247,7 +1233,8 @@ async def test_takeover_restores_kol_detail_trigger_context(db_session, user_fac
             },
             rationale="创建达人详情 Draft",
         ),
-        submit,
+        publish,
+        Complete(action="complete", text="达人详情已完成"),
     ]
     gateway, service = _make_service(
         db_session, actions=actions, evidence=evidence, now_fn=lambda: T0
@@ -1405,7 +1392,7 @@ async def test_publish_window_second_request_hits_published_version(
         )
     ).all()
     assert len(rows) == 1
-    assert len(gateway.calls) == 3  # 仅首次 Run 的 fetch + create_draft + submit
+    assert len(gateway.calls) == 4  # 仅首次 Run 的 fetch + create_draft + publish + complete
 
 
 async def test_expired_published_version_starts_new_run(db_session, user_factory) -> None:

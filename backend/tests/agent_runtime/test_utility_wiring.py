@@ -34,7 +34,6 @@ from app.agent_runtime.models import (
     MemoryEntry,
 )
 from app.agent_runtime.repository import utc_now
-from app.agent_runtime.reviewer import ReviewerDriver
 from app.agent_runtime.schemas import AskUser, Complete
 from app.agent_runtime.state import RunStatus
 from app.agent_runtime.tools.registry import ToolRegistry
@@ -93,11 +92,6 @@ class BoomUtilityGateway:
         raise RuntimeError("utility model call failed")
 
 
-class _FakeReviewerGateway:
-    async def decide(self, **kwargs: Any) -> Any:
-        raise AssertionError("reviewer gateway should not be called")
-
-
 class FakeExecutor:
     """API 测试用假执行器：Run 停留 queued，只记录 submit。"""
 
@@ -123,7 +117,6 @@ def _build_executor(
 ) -> AgentRunExecutor:
     broker = AgentEventBroker()
     events = AgentEventStream(db_session, broker)
-    reviewer = ReviewerDriver(db_session, _FakeReviewerGateway(), worker_id=worker)
 
     def engine_factory(db, worker_id, channel_permissions=()):
         return AgentEngine(
@@ -131,7 +124,6 @@ def _build_executor(
             gateway=agent_gateway,
             registry=ToolRegistry(),
             events=events,
-            reviewer=reviewer,
             worker_id=worker_id,
         )
 

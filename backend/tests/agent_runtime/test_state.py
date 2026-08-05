@@ -16,14 +16,16 @@ def test_run_status_values_are_frozen() -> None:
         "clarification_requested",
         "paused",
         "completed",
+        "completed_with_warnings",
         "failed",
         "cancelled",
     }
 
 
-def test_terminal_run_statuses_are_completed_failed_cancelled() -> None:
+def test_terminal_run_statuses_include_completed_with_warnings() -> None:
     assert TERMINAL_RUN_STATUSES == {
         RunStatus.COMPLETED,
+        RunStatus.COMPLETED_WITH_WARNINGS,
         RunStatus.FAILED,
         RunStatus.CANCELLED,
     }
@@ -37,6 +39,7 @@ def test_terminal_run_statuses_are_completed_failed_cancelled() -> None:
         (RunStatus.RUNNING, RunStatus.CLARIFICATION_REQUESTED),  # ask_user
         (RunStatus.RUNNING, RunStatus.REVIEWING),  # submit_review
         (RunStatus.RUNNING, RunStatus.COMPLETED),  # complete，无正式产物
+        (RunStatus.RUNNING, RunStatus.COMPLETED_WITH_WARNINGS),  # complete 但发布/放弃有失败项
         (RunStatus.RUNNING, RunStatus.PAUSED),  # 30 分钟或 50 决策
         (RunStatus.RUNNING, RunStatus.CANCELLED),  # 用户取消
         (RunStatus.RUNNING, RunStatus.FAILED),  # 不可恢复系统错误
@@ -78,10 +81,19 @@ def test_terminal_completed_rejects_all_transitions(target: RunStatus) -> None:
         ensure_transition(RunStatus.COMPLETED, target)
 
 
+@pytest.mark.parametrize("target", tuple(RunStatus))
+def test_terminal_completed_with_warnings_rejects_all_transitions(
+    target: RunStatus,
+) -> None:
+    with pytest.raises(InvalidRunTransition):
+        ensure_transition(RunStatus.COMPLETED_WITH_WARNINGS, target)
+
+
 @pytest.mark.parametrize(
     "terminal",
     [
         RunStatus.COMPLETED,
+        RunStatus.COMPLETED_WITH_WARNINGS,
         RunStatus.FAILED,
         RunStatus.CANCELLED,
     ],

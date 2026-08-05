@@ -60,7 +60,6 @@ from app.agent_runtime.models import (
 )
 from app.agent_runtime.profiles import get_profile
 from app.agent_runtime.repository import AgentRunRepository, utc_now
-from app.agent_runtime.reviewer import ReviewDecision, ReviewerDriver
 from app.agent_runtime.state import RunStatus
 from app.agent_runtime.tools.factory import AgentToolRegistryFactory, load_channel_permissions
 from app.agent_runtime.tools.registry import ToolRegistry
@@ -450,12 +449,10 @@ def _build_engine(
     *,
     registry: ToolRegistry,
     gateway: AgentModelGateway,
-    reviewer_gateway: AgentModelGateway | None = None,
     worker_id: str = WORKER_ID,
     channel_permissions: Iterable[str] = (),
     session_factory: Any = None,
 ) -> AgentEngine:
-    reviewer = ReviewerDriver(db, reviewer_gateway or gateway, worker_id=worker_id)
     broker = AgentEventBroker()
     events = AgentEventStream(db, broker)
     # 场景数据已提交，注入真实 SessionFactory（生产同款）：心跳用独立连接续租，
@@ -465,25 +462,10 @@ def _build_engine(
         gateway=gateway,
         registry=registry,
         events=events,
-        reviewer=reviewer,
         worker_id=worker_id,
         channel_permissions=channel_permissions,
         session_factory=session_factory,
     )
-
-
-class ScriptedReviewerGateway:
-    """脚本化 Reviewer 决策（approve/revise/reject），供确定性场景。"""
-
-    def __init__(self, decisions: list[ReviewDecision]) -> None:
-        self.decisions = list(decisions)
-        self.calls = 0
-
-    async def decide(self, *, run, attempt_id, profile, messages, thinking_sink=None, **kwargs):
-        self.calls += 1
-        if not self.decisions:
-            raise AssertionError("scripted reviewer gateway exhausted")
-        return self.decisions.pop(0)
 
 
 # --------------------------------------------------------------------------- #
@@ -556,7 +538,6 @@ async def _run_scenario(
     balance: int = 1000,
     profile_name: str = "session_analyst_v1",
     transport: McpTransport | None = None,
-    reviewer_gateway: AgentModelGateway | None = None,
     user_id: str | None = None,
     agent_session_id: str | None = None,
 ) -> ScenarioRecord:
@@ -608,7 +589,6 @@ async def _run_scenario(
             session,
             registry=registry,
             gateway=gateway,
-            reviewer_gateway=reviewer_gateway,
             channel_permissions=await load_channel_permissions(session, user.id),
             session_factory=SessionFactory,
         )
@@ -1649,20 +1629,20 @@ async def test_uat_wallet_insufficient_restricted_delivery() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# 场景 9：Reviewer revise 后补查或修订
+# 场景 9：发布校验失败后修订重发（直接发布协议）
 # --------------------------------------------------------------------------- #
 
 
-async def test_uat_reviewer_revise_then_fix() -> None:
-    """确定性验证 Reviewer revise → 修正 → 复审 → 原子发布闭环，并校验 lineage。
+async def test_uat_publish_validation_failure_then_fix() -> None:
+    """确定性验证 publish_artifacts → validation_failed → 修订 → 重发 → 发布闭环。
 
-    agent 主循环决策脚本化（create_draft → submit_review → update_draft → submit），
-    Reviewer 决策脚本化（revise 一次 + 反馈问题，随后 approve），保证 revise 分支可
-    稳定触发。Draft 携带数值字段与指向真实 Evidence 的 lineage ref，发布后校验
-    ``validate_and_freeze_lineage`` 不抛错。
+    agent 主循环决策脚本化（create_draft 缺 lineage refs → publish 校验失败 →
+    update_draft 补齐 refs → 重新 publish → complete）。Draft 携带数值字段与指向
+    真实 Evidence 的 lineage ref，发布后校验 ``validate_and_freeze_lineage``
+    不抛错。
     """
     from app.agent_runtime.evidence import EvidenceWriter
-    from app.agent_runtime.schemas import CallTool, Complete, SubmitReview
+    from app.agent_runtime.schemas import CallTool, Complete, PublishArtifacts
 
     def _parse_draft_id(messages) -> str | None:
         """从最近一条 tool_result 成功摘要解析 draft_id。"""
@@ -1682,7 +1662,7 @@ async def test_uat_reviewer_revise_then_fix() -> None:
         return None
 
     class ScriptedAgentGateway:
-        """脚本化 agent 决策：create_draft → submit_review → update_draft → submit → complete。"""
+        """脚本化 agent 决策：create_draft → publish → update_draft → publish → complete。"""
 
         def __init__(self, evidence_id: str) -> None:
             self.calls = 0
@@ -1731,6 +1711,7 @@ async def test_uat_reviewer_revise_then_fix() -> None:
             if self.draft_id is None:
                 self.draft_id = _parse_draft_id(messages)
             if self.calls == 1:
+                # 首轮故意不带 lineage refs：发布门禁判 validation_failed。
                 return CallTool(
                     action="call_tool",
                     internal_tool_name="create_draft",
@@ -1743,19 +1724,18 @@ async def test_uat_reviewer_revise_then_fix() -> None:
                             "question": "瑞幸声量如何",
                         },
                         "payload": self._payload,
-                        "evidence_refs": self._refs,
+                        "evidence_refs": [],
                     },
                     rationale="创建品牌 Draft",
                 )
             if self.calls == 2:
-                return SubmitReview(
-                    action="submit_review",
+                return PublishArtifacts(
+                    action="publish_artifacts",
                     artifact_draft_ids=[self.draft_id] if self.draft_id else [],
-                    completion_text="品牌分析报告已完成",
                     summary="瑞幸品牌声量分析",
                 )
             if self.calls == 3:
-                # 收到 revise 反馈（review_revision_requested）→ 补查后 update_draft。
+                # 收到 validation_failed 逐项结果 → 补齐 lineage refs 后 update_draft。
                 if self.draft_id is None:
                     self.draft_id = _parse_draft_id(messages)
                 return CallTool(
@@ -1766,13 +1746,12 @@ async def test_uat_reviewer_revise_then_fix() -> None:
                         "payload": self._payload,
                         "evidence_refs": self._refs,
                     },
-                    rationale="按 Reviewer 反馈补查并修订",
+                    rationale="按发布校验结果补齐 lineage refs",
                 )
             if self.calls == 4:
-                return SubmitReview(
-                    action="submit_review",
+                return PublishArtifacts(
+                    action="publish_artifacts",
                     artifact_draft_ids=[self.draft_id] if self.draft_id else [],
-                    completion_text="品牌分析报告已完成",
                     summary="瑞幸品牌声量分析（修订版）",
                 )
             return Complete(action="complete", text="完成", suggestions=None)
@@ -1781,7 +1760,7 @@ async def test_uat_reviewer_revise_then_fix() -> None:
     try:
         async with db as session:
             user, agent_session, _wallet = await _new_user_session_wallet(
-                session, scenario="reviewer_revise", balance=1000
+                session, scenario="publish_fix", balance=1000
             )
             repo = AgentRunRepository(session)
             run = AgentRun(
@@ -1848,12 +1827,6 @@ async def test_uat_reviewer_revise_then_fix() -> None:
             await session.flush()
 
             scripted_agent = ScriptedAgentGateway(evidence.id)
-            scripted_reviewer = ScriptedReviewerGateway(
-                [
-                    ReviewDecision(decision="revise", issues=[]),
-                    ReviewDecision(decision="approve", issues=[]),
-                ]
-            )
 
             class _MainGateway:
                 async def decide(self, *, run, attempt_id, profile, messages, thinking_sink=None, **kwargs):
@@ -1868,7 +1841,6 @@ async def test_uat_reviewer_revise_then_fix() -> None:
                 session,
                 registry=registry,
                 gateway=real_gateway,
-                reviewer_gateway=scripted_reviewer,
             )
             engine._gateway = _MainGateway()  # noqa: SLF001 - 测试专用替换
 
@@ -1879,8 +1851,8 @@ async def test_uat_reviewer_revise_then_fix() -> None:
                 messages=[ChatMessage(role="user", content="分析瑞幸品牌声量并出报告")],
             )
             record = ScenarioRecord(
-                scenario="reviewer_revise",
-                prompt_tag="submit_review → revise → fix → approve → publish",
+                scenario="publish_fix",
+                prompt_tag="publish → validation_failed → fix → republish → complete",
                 profile="session_analyst_v1",
                 run_id=run.id,
                 status=str(outcome.status),
@@ -1892,8 +1864,6 @@ async def test_uat_reviewer_revise_then_fix() -> None:
             _ALL_RECORDS.append(record)
             await session.commit()
 
-            fresh = await session.get(AgentRun, run.id)
-            assert fresh.revision_count >= 1, "Reviewer revise 分支未触发"
             assert record.status == RunStatus.COMPLETED.value
             published = list(
                 (
@@ -1904,7 +1874,7 @@ async def test_uat_reviewer_revise_then_fix() -> None:
                     )
                 ).all()
             )
-            assert published, "revise→fix→approve 后未发布任何 Artifact"
+            assert published, "validation_failed→fix→republish 后未发布任何 Artifact"
             # 发布的 brand_report_v3 数值字段必须全部有有效 lineage。
             for version in record.artifact_versions:
                 assert version["lineage_ok"] is True, version.get("lineage_error")

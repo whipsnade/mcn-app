@@ -17,8 +17,10 @@ from typing import Any
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import select
+from sqlalchemy import func, select
 
+from app.agent_artifacts.models import AgentArtifactVersion, ArtifactDraft
+from app.agent_artifacts.service import ArtifactService
 from app.agent_runtime.engine import AgentEngine
 from app.agent_runtime.events import AgentEventBroker, AgentEventStream
 from app.agent_runtime.executor import AgentRunExecutor
@@ -31,12 +33,13 @@ from app.agent_runtime.models import (
     AgentStep,
 )
 from app.agent_runtime.repository import AgentRunRepository, utc_now
-from app.agent_runtime.reviewer import ReviewerDriver
 from app.agent_runtime.schemas import CallTool, Complete
 from app.agent_runtime.state import RunStatus
 from app.agent_runtime.thinking import AgentEventThinkingSink
 from app.agent_runtime.tools.contracts import ToolResult
 from app.agent_runtime.tools.registry import ToolRegistry
+
+from tests.agent_artifacts.payload_fixtures import insight_payload
 
 
 # ---------------------------------------------------------------------------
@@ -106,13 +109,6 @@ class NoopTool:
 
     async def execute(self, context: Any, arguments: BaseModel) -> ToolResult:
         return ToolResult(status="success", safe_summary="noop ok")
-
-
-class _FakeReviewerGateway:
-    """executor 测试不触发 review；仅满足 ReviewerDriver 构造签名。"""
-
-    async def decide(self, **kwargs: Any) -> Any:
-        raise AssertionError("reviewer gateway should not be called")
 
 
 class _FailOnceEventStream(AgentEventStream):
@@ -196,7 +192,6 @@ def _build_executor(
 ) -> AgentRunExecutor:
     broker = AgentEventBroker()
     events = events or AgentEventStream(db_session, broker)
-    reviewer = ReviewerDriver(db_session, _FakeReviewerGateway(), worker_id=worker)
     registry = registry or ToolRegistry()
 
     def engine_factory(db, worker_id, channel_permissions=()):
@@ -205,7 +200,6 @@ def _build_executor(
             gateway=gateway,
             registry=registry,
             events=events,
-            reviewer=reviewer,
             worker_id=worker_id,
             lease_seconds=lease_seconds,
         )
@@ -500,13 +494,11 @@ async def test_executor_injects_user_channel_permissions(db_session, user_factor
         captured["channel_permissions"] = channel_permissions
         broker = AgentEventBroker()
         events = AgentEventStream(db, broker)
-        reviewer = ReviewerDriver(db, _FakeReviewerGateway(), worker_id=worker_id)
         return AgentEngine(
             db,
             gateway=gateway,
             registry=ToolRegistry(),
             events=events,
-            reviewer=reviewer,
             worker_id=worker_id,
         )
 
@@ -543,7 +535,6 @@ def _build_crashing_executor(
     broker = broker or AgentEventBroker()
     events = AgentEventStream(db_session, broker)
     gateway = FakeAgentGateway([Complete(action="complete", text="不应到达")])
-    reviewer = ReviewerDriver(db_session, _FakeReviewerGateway(), worker_id=worker)
 
     def engine_factory(db, worker_id, channel_permissions=()):
         return AgentEngine(
@@ -551,7 +542,6 @@ def _build_crashing_executor(
             gateway=gateway,
             registry=ToolRegistry(),
             events=events,
-            reviewer=reviewer,
             worker_id=worker_id,
             context_builder=BrokenContextBuilder(),
         )
@@ -705,7 +695,6 @@ async def test_live_stream_executor_crash_ends_with_run_failed() -> None:
             gateway=FakeAgentGateway([Complete(action="complete", text="不应到达")]),
             registry=ToolRegistry(),
             events=AgentEventStream(db, broker),
-            reviewer=ReviewerDriver(db, _FakeReviewerGateway(), worker_id=worker_id),
             worker_id=worker_id,
             context_builder=BrokenContextBuilder(),
         )
@@ -862,3 +851,73 @@ async def test_executor_skips_cancel_pending_run_with_active_lease(
         for row in rows
         if row.event_type in ("run.completed", "run.failed", "run.cancelled")
     ] == []
+
+
+# ---------------------------------------------------------------------------
+# 7. 历史 reviewing Run 收口（直接发布改造 Task 4：Reviewer 已下线）
+# ---------------------------------------------------------------------------
+
+
+async def test_legacy_reviewing_run_settles_failed_without_reviewer(
+    db_session, user_factory
+) -> None:
+    """部署前仍处于 reviewing 的历史 Run（复核期间崩溃 + 租约过期）：
+
+    executor 扫描领取后收口为 failed（error_code=LEGACY_REVIEWING_UNSUPPORTED），
+    保留 Draft（不释放、不重建），不再启动模型/Reviewer。
+    """
+    run, session, user = await _make_session(db_session, user_factory)
+    repo = AgentRunRepository(db_session)
+    await repo.begin_attempt(run.id)
+    assert await repo.claim_lease(run.id, "dead-worker", 300)
+    # 遗留现场：复核期间崩溃，Draft 仍由该 Run 持有并处于 reviewing。
+    _, draft, _ = await ArtifactService(db_session).create_or_get_draft(
+        session_id=session.id,
+        user_id=user.id,
+        run_id=run.id,
+        module="insight",
+        business_fields={"parent_artifact_version_id": "pv-1", "question": "瑞幸"},
+        schema_version="insight_board_v1",
+        payload=insight_payload(),
+        artifact_type="insight_board_v1",
+    )
+    draft.status = "reviewing"
+    row = await db_session.get(AgentRun, run.id)
+    row.status = RunStatus.REVIEWING
+    row.lease_expires_at = utc_now() - timedelta(seconds=10)
+    await db_session.flush()
+
+    gateway = FakeAgentGateway([Complete(action="complete", text="不应执行")])
+    executor = _build_executor(db_session, gateway=gateway)
+
+    run_id = await executor.claim_and_process_one()
+
+    assert run_id == run.id
+    # 不启动模型/Reviewer：零次 decide
+    assert gateway.calls == []
+    fresh = await db_session.get(AgentRun, run.id)
+    assert fresh.status == RunStatus.FAILED
+    assert fresh.error_code == "LEGACY_REVIEWING_UNSUPPORTED"
+    # Draft 保留：owner 与 reviewing 状态不变
+    fresh_draft = await db_session.get(ArtifactDraft, draft.id)
+    assert fresh_draft.owner_run_id == run.id
+    assert fresh_draft.status == "reviewing"
+    # 恰好一个 run.failed 终态事件，error_code 稳定
+    rows = await _run_events(db_session, run.id)
+    terminal = [
+        row
+        for row in rows
+        if row.event_type
+        in ("run.completed", "run.completed_with_warnings", "run.failed", "run.cancelled")
+    ]
+    assert len(terminal) == 1
+    assert terminal[0].event_type == "run.failed"
+    assert terminal[0].payload_json["error_code"] == "LEGACY_REVIEWING_UNSUPPORTED"
+    # 不产生任何 Version
+    assert (
+        await db_session.scalar(
+            select(func.count(AgentArtifactVersion.id)).where(
+                AgentArtifactVersion.source_run_id == run.id
+            )
+        )
+    ) == 0

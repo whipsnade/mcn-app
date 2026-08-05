@@ -204,7 +204,14 @@ class AgentRunRepository:
             run.completed_at = run.completed_at or now
             run.lease_owner = None
             run.lease_expires_at = None
-            await self._end_open_attempt(run_id, target.value, now)
+            # ck_agent_run_attempts_outcome 只接受 running/paused/completed/failed/
+            # cancelled：completed_with_warnings 终态的 Attempt 以 completed 收尾。
+            attempt_outcome = (
+                "completed"
+                if target == RunStatus.COMPLETED_WITH_WARNINGS
+                else target.value
+            )
+            await self._end_open_attempt(run_id, attempt_outcome, now)
         elif target == RunStatus.PAUSED:
             run.paused_at = now
             run.lease_owner = None

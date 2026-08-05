@@ -1,14 +1,16 @@
-"""崩溃注入接管 / reviewing 恢复 / 租约心跳 / 取消收口测试（v3 加固 §5.4/§5.5 / A4）。
+"""崩溃注入接管 / 历史 reviewing 收口 / 租约心跳 / 取消收口测试（v3 加固 §5.4/§5.5 / A4；
+直接发布改造 Task 4）。
 
-崩溃注入点覆盖：decide 后、MCP 外发后、settle 前（Step 未更新）、Reviewer 复核中。
+崩溃注入点覆盖：decide 后、MCP 外发后、settle 前（Step 未更新）、publish 前。
 接管后必须满足：
 
 - transcript 含此前工具结果（settled 回放 evidence_id + 结构化预览）；
 - 绝不重复外发（transport 零新调用）、绝不重复扣费（钱包/预留不变）；
 - 模型重发相同调用时复用原 Step（同一 logical_call_id 幂等回放）；
-- reviewing 接管：已 approve 的 Item 不重审，pending 继续，原子发布幂等；
-- 长 decide/MCP/Reviewer 期间心跳续租；租约被接管后旧 worker 不发布、不写终态；
-- 取消在 decide 后 / Reviewer 返回后收口为恰好一个 run.cancelled 事件；
+- 历史 reviewing Run（部署前复核期间崩溃）：恢复扫描收口 failed
+  （LEGACY_REVIEWING_UNSUPPORTED），保留 Draft，不再启动 Reviewer；
+- 长 decide/MCP 期间心跳续租；租约被接管后旧 worker 不发布、不写终态；
+- 取消在 decide 后 / publish 后收口为恰好一个 run.cancelled 事件；
 - run.resumed 事件区分 resumed_by（system 接管 / user 主动恢复）。
 """
 
@@ -28,8 +30,6 @@ from sqlalchemy import func, select
 from app.agent_artifacts.models import (
     AgentArtifactVersion,
     ArtifactDraft,
-    ArtifactReviewBatch,
-    ArtifactReviewItem,
 )
 from app.agent_artifacts.service import ArtifactService
 from app.agent_runtime.engine import AgentEngine
@@ -47,8 +47,7 @@ from app.agent_runtime.models import (
 from app.agent_runtime.profiles import get_profile
 from app.agent_runtime.recovery import RecoveryLoop
 from app.agent_runtime.repository import AgentRunRepository, utc_now
-from app.agent_runtime.reviewer import ReviewDecision, ReviewerDriver
-from app.agent_runtime.schemas import AskUser, CallTool, Complete, SubmitReview
+from app.agent_runtime.schemas import AskUser, CallTool, Complete, PublishArtifacts
 from app.agent_runtime.state import RunStatus
 from app.agent_runtime.tools.mcp import AgentMcpTool, logical_call_id_for
 from app.agent_runtime.tools.registry import McpCatalogEntry, ToolRegistry
@@ -123,21 +122,6 @@ class BlockingGateway:
         if not self.actions:
             raise AssertionError("blocking gateway exhausted")
         return self.actions.pop(0)
-
-
-class FakeReviewerGateway:
-    def __init__(self, decisions: list[ReviewDecision], *, on_decide: Any = None) -> None:
-        self.decisions = list(decisions)
-        self.calls: list[dict[str, Any]] = []
-        self.on_decide = on_decide
-
-    async def decide(self, *, run, attempt_id, profile, messages, thinking_sink=None, **kwargs) -> Any:
-        self.calls.append({"run_id": run.id, "messages": list(messages)})
-        if self.on_decide is not None:
-            await self.on_decide(run)
-        if not self.decisions:
-            raise AssertionError("fake reviewer gateway exhausted")
-        return self.decisions.pop(0)
 
 
 class FakeMcpTransport:
@@ -256,15 +240,11 @@ def _build_executor(
     *,
     gateway: Any,
     registry: ToolRegistry | None = None,
-    reviewer_gateway: Any = None,
     worker: str = "worker-b",
     lease_seconds: int = 300,
 ) -> AgentRunExecutor:
     broker = AgentEventBroker()
     events = AgentEventStream(db_session, broker)
-    reviewer = ReviewerDriver(
-        db_session, reviewer_gateway or FakeReviewerGateway([]), worker_id=worker
-    )
 
     def engine_factory(db, worker_id, channel_permissions=()):
         return AgentEngine(
@@ -272,7 +252,6 @@ def _build_executor(
             gateway=gateway,
             registry=registry or ToolRegistry(),
             events=events,
-            reviewer=reviewer,
             worker_id=worker_id,
             lease_seconds=lease_seconds,
         )
@@ -673,32 +652,21 @@ async def test_user_resume_marks_resumed_by_user(db_session, user_factory) -> No
 
 
 # ---------------------------------------------------------------------------
-# 3. reviewing 恢复：已 approve 不重审、pending 继续、发布幂等
+# 3. 历史 reviewing Run 收口（直接发布改造：Reviewer 已下线，不再继续复核）
 # ---------------------------------------------------------------------------
 
 
-async def _make_reviewing_scene(
+async def _make_legacy_reviewing_scene(
     db_session,
     run: AgentRun,
     *,
     brands: tuple[str, ...] = ("瑞幸", "蜜雪冰城"),
-    approved_count: int = 1,
-) -> tuple[ArtifactReviewBatch, list[ArtifactReviewItem], list[ArtifactDraft]]:
-    """reviewing 崩溃现场：batch pending + 部分 Item 已 approve + drafts reviewing。"""
+) -> list[ArtifactDraft]:
+    """部署前复核期间崩溃的历史现场：run reviewing + Draft 仍由该 Run 持有。"""
     service = ArtifactService(db_session)
-    batch = ArtifactReviewBatch(
-        id=str(uuid4()),
-        parent_run_id=run.id,
-        status="pending",
-        completion_text="品牌分析完成",
-        created_at=utc_now(),
-    )
-    db_session.add(batch)
-    await db_session.flush()
-    items: list[ArtifactReviewItem] = []
     drafts: list[ArtifactDraft] = []
-    for index, brand in enumerate(brands):
-        _, draft, revision = await service.create_or_get_draft(
+    for brand in brands:
+        _, draft, _ = await service.create_or_get_draft(
             session_id=run.session_id,
             user_id=run.user_id,
             run_id=run.id,
@@ -709,102 +677,43 @@ async def _make_reviewing_scene(
             artifact_type="insight_board_v1",
         )
         draft.status = "reviewing"
-        item = ArtifactReviewItem(
-            id=str(uuid4()),
-            batch_id=batch.id,
-            artifact_id=draft.artifact_id,
-            draft_revision_id=revision.id,
-            status="approved" if index < approved_count else "pending",
-        )
-        db_session.add(item)
-        items.append(item)
         drafts.append(draft)
     row = await db_session.get(AgentRun, run.id)
     row.status = RunStatus.REVIEWING
     await db_session.flush()
-    return batch, items, drafts
+    return drafts
 
 
-async def test_reviewing_takeover_skips_approved_items_and_publishes(
+async def test_legacy_reviewing_takeover_settles_failed_and_keeps_drafts(
     db_session, user_factory
 ) -> None:
-    """reviewing 崩溃接管：已 approve 的 Item 不重审（Reviewer 只调一次），
-    pending 继续复核，全部 approve 后走原有原子发布。
+    """历史 reviewing Run（部署前复核期间崩溃、租约过期）：恢复扫描收口 failed
+    （error_code=LEGACY_REVIEWING_UNSUPPORTED），保留 Draft，不再启动 Reviewer。
     """
-    run, _, user = await _make_session(db_session, user_factory)
+    run, _, _ = await _make_session(db_session, user_factory)
     await _start_attempt(db_session, run, worker="worker-a")
-    batch, items, drafts = await _make_reviewing_scene(db_session, run, approved_count=1)
+    drafts = await _make_legacy_reviewing_scene(db_session, run)
     _expire_lease(await db_session.get(AgentRun, run.id))
     await db_session.flush()
 
-    reviewer_gateway = FakeReviewerGateway([ReviewDecision(decision="approve")])
     gateway = FakeAgentGateway([])
-    executor = _build_executor(
-        db_session, gateway=gateway, reviewer_gateway=reviewer_gateway
-    )
+    executor = _build_executor(db_session, gateway=gateway)
     recovery = _build_recovery(db_session, executor=executor)
 
     reclaimed = await recovery.reclaim_expired_runs()
 
     assert run.id in reclaimed
-    # Reviewer 只复核 pending 的 item2；已 approve 的 item1 不重审
-    assert len(reviewer_gateway.calls) == 1
-    # 原子发布：两个 Artifact 各一个 Version，batch completed，Run completed
-    versions = (
-        await db_session.scalars(
-            select(AgentArtifactVersion).where(
-                AgentArtifactVersion.source_run_id == run.id
-            )
-        )
-    ).all()
-    assert len(versions) == 2
-    fresh_batch = await db_session.get(ArtifactReviewBatch, batch.id)
-    assert fresh_batch.status == "completed"
-    assert (await db_session.get(AgentRun, run.id)).status == RunStatus.COMPLETED
+    # 不启动模型/Reviewer：零次 decide
+    assert gateway.calls == []
+    fresh = await db_session.get(AgentRun, run.id)
+    assert fresh.status == RunStatus.FAILED
+    assert fresh.error_code == "LEGACY_REVIEWING_UNSUPPORTED"
+    # Draft 保留：owner 与 reviewing 状态不变
     for draft in drafts:
         fresh_draft = await db_session.get(ArtifactDraft, draft.id)
-        assert fresh_draft.status == "idle"
-        assert fresh_draft.owner_run_id is None
-    # 系统接管事件可区分
-    resumed = [event for event in await _events(db_session, run.id) if event.event_type == "run.resumed"]
-    assert len(resumed) == 1
-    assert resumed[0].payload_json["resumed_by"] == "system"
-
-
-async def test_reviewing_takeover_is_idempotent_no_duplicate_versions_or_events(
-    db_session, user_factory
-) -> None:
-    """崩溃在 review.approved 已发、publish 未做的窗口：全部 Item 已 approve。
-
-    重复接管必须幂等：不重复发 review.approved、不产生重复 Version，
-    直接完成原子发布。
-    """
-    run, _, _ = await _make_session(db_session, user_factory)
-    await _start_attempt(db_session, run, worker="worker-a")
-    batch, items, drafts = await _make_reviewing_scene(
-        db_session, run, brands=("瑞幸",), approved_count=1
-    )
-    # 第一次复核已发 review.approved（随后崩溃，publish 未做）
-    broker = AgentEventBroker()
-    await AgentEventStream(db_session, broker).append(
-        run.id, run.user_id, "review.approved", {"review_batch_id": batch.id}
-    )
-    _expire_lease(await db_session.get(AgentRun, run.id))
-    await db_session.flush()
-
-    # Reviewer 不应再被调用（无 pending Item）
-    reviewer_gateway = FakeReviewerGateway([])
-    gateway = FakeAgentGateway([])
-    executor = _build_executor(
-        db_session, gateway=gateway, reviewer_gateway=reviewer_gateway
-    )
-    recovery = _build_recovery(db_session, executor=executor)
-
-    reclaimed = await recovery.reclaim_expired_runs()
-
-    assert run.id in reclaimed
-    assert reviewer_gateway.calls == []
-    assert (await db_session.get(AgentRun, run.id)).status == RunStatus.COMPLETED
+        assert fresh_draft.owner_run_id == run.id
+        assert fresh_draft.status == "reviewing"
+    # 不产生任何 Version；恰好一个 run.failed 终态事件
     versions = (
         await db_session.scalars(
             select(AgentArtifactVersion).where(
@@ -812,104 +721,17 @@ async def test_reviewing_takeover_is_idempotent_no_duplicate_versions_or_events(
             )
         )
     ).all()
-    assert len(versions) == 1
-    # review.approved 仍只有第一次那一条，run.completed 恰好一条
-    event_types = [event.event_type for event in await _events(db_session, run.id)]
-    assert event_types.count("review.approved") == 1
-    assert event_types.count("run.completed") == 1
-
-
-async def test_reviewing_takeover_after_publish_commit_settles_completed(
-    db_session, user_factory
-) -> None:
-    """H1 窗口：原子发布已提交（batch completed + Version 落库）但终态事务
-    （Run 迁移 + run.completed）未完成的崩溃——接管方幂等补齐发布后续事件
-    并收口 completed：不重复发布、不重复发事件。"""
-    run, _, _ = await _make_session(db_session, user_factory)
-    await _start_attempt(db_session, run, worker="worker-a")
-    batch, _, _ = await _make_reviewing_scene(
-        db_session, run, brands=("瑞幸",), approved_count=1
-    )
-    # 发布已提交、Run 未迁移的崩溃现场（H1 后发布不再迁移 Run 终态）。
-    service = ArtifactService(db_session)
-    versions = await service.publish_batch(batch.id, worker_id="worker-a")
-    assert len(versions) == 1
-    _expire_lease(await db_session.get(AgentRun, run.id))
-    await db_session.flush()
-
-    reviewer_gateway = FakeReviewerGateway([])
-    gateway = FakeAgentGateway([])
-    executor = _build_executor(
-        db_session, gateway=gateway, reviewer_gateway=reviewer_gateway
-    )
-    recovery = _build_recovery(db_session, executor=executor)
-
-    reclaimed = await recovery.reclaim_expired_runs()
-
-    assert run.id in reclaimed
-    assert reviewer_gateway.calls == []  # 已发布，不重审
-    assert (await db_session.get(AgentRun, run.id)).status == RunStatus.COMPLETED
-    all_versions = (
-        await db_session.scalars(
-            select(AgentArtifactVersion).where(
-                AgentArtifactVersion.source_run_id == run.id
-            )
-        )
-    ).all()
-    assert len(all_versions) == 1  # 不重复发布
-    event_types = [event.event_type for event in await _events(db_session, run.id)]
-    assert event_types.count("artifact.published") == 1
-    assert event_types.count("message.completed") == 1
-    assert event_types.count("run.completed") == 1
-
-
-async def test_reviewing_takeover_after_reject_commit_settles_failed(
-    db_session, user_factory
-) -> None:
-    """H1 窗口：reject 清理已提交（batch failed + Draft/Artifact failed）但
-    Run 迁移与 run.failed 未完成的崩溃——接管方补齐 review.rejected 并以
-    error_code=review_rejected 收口 failed，恰好一个终态事件。"""
-    run, _, _ = await _make_session(db_session, user_factory)
-    await _start_attempt(db_session, run, worker="worker-a")
-    batch, _, drafts = await _make_reviewing_scene(
-        db_session, run, brands=("瑞幸",), approved_count=1
-    )
-    # reject 清理已提交、Run 未迁移的崩溃现场。
-    row = await db_session.get(AgentRun, run.id)
-    row.status = RunStatus.REVIEWING
-    fresh_batch = await db_session.get(ArtifactReviewBatch, batch.id)
-    fresh_batch.status = "failed"
-    fresh_batch.completed_at = utc_now()
-    for draft in drafts:
-        draft.status = "failed"
-        draft.owner_run_id = None
-    _expire_lease(row)
-    await db_session.flush()
-
-    reviewer_gateway = FakeReviewerGateway([])
-    gateway = FakeAgentGateway([])
-    executor = _build_executor(
-        db_session, gateway=gateway, reviewer_gateway=reviewer_gateway
-    )
-    recovery = _build_recovery(db_session, executor=executor)
-
-    reclaimed = await recovery.reclaim_expired_runs()
-
-    assert run.id in reclaimed
-    assert reviewer_gateway.calls == []
-    assert (await db_session.get(AgentRun, run.id)).status == RunStatus.FAILED
+    assert versions == []
     events = await _events(db_session, run.id)
-    event_types = [event.event_type for event in events]
-    assert event_types.count("review.rejected") == 1
     terminal = [
         event
         for event in events
-        if event.event_type in ("run.completed", "run.failed", "run.cancelled")
+        if event.event_type
+        in ("run.completed", "run.completed_with_warnings", "run.failed", "run.cancelled")
     ]
     assert len(terminal) == 1
     assert terminal[0].event_type == "run.failed"
-    assert terminal[0].payload_json["error_code"] == "review_rejected"
-    assert event_types.index("review.rejected") < event_types.index("run.failed")
+    assert terminal[0].payload_json["error_code"] == "LEGACY_REVIEWING_UNSUPPORTED"
 
 
 async def test_reviewing_run_with_unexpired_lease_is_not_reclaimed(
@@ -918,7 +740,7 @@ async def test_reviewing_run_with_unexpired_lease_is_not_reclaimed(
     """reviewing 且租约未过期：恢复循环与执行器都不得接管。"""
     run, _, _ = await _make_session(db_session, user_factory)
     await _start_attempt(db_session, run, worker="worker-a")
-    await _make_reviewing_scene(db_session, run, approved_count=1)
+    await _make_legacy_reviewing_scene(db_session, run)
     # 租约仍有效（_start_attempt 已 claim 300s）
 
     gateway = FakeAgentGateway([])
@@ -955,13 +777,11 @@ async def test_heartbeat_covers_long_decide_and_run_completes(
     )
     broker = AgentEventBroker()
     events = AgentEventStream(db_session, broker)
-    reviewer = ReviewerDriver(db_session, FakeReviewerGateway([]), worker_id="worker")
     engine = AgentEngine(
         db_session,
         gateway=gateway,
         registry=ToolRegistry(),
         events=events,
-        reviewer=reviewer,
         worker_id="worker",
         lease_seconds=1,  # 心跳间隔 = 1/3 秒
     )
@@ -1005,13 +825,11 @@ async def test_old_worker_stops_after_lease_takeover_without_terminal_write(
     )
     broker = AgentEventBroker()
     events = AgentEventStream(db_session, broker)
-    reviewer = ReviewerDriver(db_session, FakeReviewerGateway([]), worker_id="worker")
     engine = AgentEngine(
         db_session,
         gateway=gateway,
         registry=ToolRegistry(),
         events=events,
-        reviewer=reviewer,
         worker_id="worker",
         lease_seconds=300,
     )
@@ -1052,11 +870,11 @@ async def test_old_worker_stops_after_lease_takeover_without_terminal_write(
     assert assistant_count == 0
 
 
-async def test_publish_is_skipped_when_lease_lost_before_publish(
+async def test_publish_is_skipped_when_lease_lost_before_dispatch(
     db_session, user_factory
 ) -> None:
-    """Reviewer 复核期间租约被接管：发布前再次确认租约——旧 worker 不得发布
-    Artifact、不得写 run.completed。
+    """decide 返回 publish_artifacts 后租约被接管：分发前闸门拦截——旧 worker
+    不发布 Artifact、不发 artifact 事件、不写终态，安静交还接管方（§5.5）。
     """
     run, _, _ = await _make_session(db_session, user_factory)
     repo = AgentRunRepository(db_session)
@@ -1074,7 +892,7 @@ async def test_publish_is_skipped_when_lease_lost_before_publish(
         artifact_type="insight_board_v1",
     )
 
-    async def steal_lease(_run) -> None:
+    async def steal_lease(_run, _index) -> None:
         row = await db_session.get(AgentRun, run.id)
         row.lease_owner = "worker-b"
         row.lease_expires_at = utc_now() + timedelta(seconds=300)
@@ -1082,26 +900,21 @@ async def test_publish_is_skipped_when_lease_lost_before_publish(
 
     gateway = FakeAgentGateway(
         [
-            SubmitReview(
-                action="submit_review",
+            PublishArtifacts(
+                action="publish_artifacts",
                 artifact_draft_ids=(draft.id,),
-                completion_text="品牌分析完成",
                 summary="瑞幸品牌分析",
             )
-        ]
-    )
-    reviewer_gateway = FakeReviewerGateway(
-        [ReviewDecision(decision="approve")], on_decide=steal_lease
+        ],
+        on_decide=steal_lease,
     )
     broker = AgentEventBroker()
     events = AgentEventStream(db_session, broker)
-    reviewer = ReviewerDriver(db_session, reviewer_gateway, worker_id="worker")
     engine = AgentEngine(
         db_session,
         gateway=gateway,
         registry=ToolRegistry(),
         events=events,
-        reviewer=reviewer,
         worker_id="worker",
         lease_seconds=300,
     )
@@ -1115,7 +928,7 @@ async def test_publish_is_skipped_when_lease_lost_before_publish(
         messages=[ChatMessage(role="user", content="分析瑞幸品牌")],
     )
 
-    # 未发布、未写终态；Run 保持 reviewing 等待接管方恢复
+    # 未发布、未写终态；Run 保持 running 等待接管方恢复
     assert (
         await db_session.scalar(
             select(func.count(AgentArtifactVersion.id)).where(
@@ -1124,15 +937,17 @@ async def test_publish_is_skipped_when_lease_lost_before_publish(
         )
     ) == 0
     fresh = await db_session.get(AgentRun, run.id)
-    assert fresh.status == RunStatus.REVIEWING
+    assert fresh.status == RunStatus.RUNNING
     assert fresh.lease_owner == "worker-b"
     event_types = [event.event_type for event in await _events(db_session, run.id)]
+    assert "artifact.published" not in event_types
+    assert "artifact.publish.completed" not in event_types
     assert "run.completed" not in event_types
     assert "run.failed" not in event_types
 
 
 # ---------------------------------------------------------------------------
-# 5. 取消语义：decide 后 / Reviewer 返回后收口，恰好一个 run.cancelled
+# 5. 取消语义：decide 后 / publish 后收口，恰好一个 run.cancelled
 # ---------------------------------------------------------------------------
 
 
@@ -1140,21 +955,16 @@ def _make_engine(
     db_session,
     *,
     gateway: Any,
-    reviewer_gateway: Any = None,
     registry: ToolRegistry | None = None,
     worker: str = "worker",
 ) -> AgentEngine:
     broker = AgentEventBroker()
     events = AgentEventStream(db_session, broker)
-    reviewer = ReviewerDriver(
-        db_session, reviewer_gateway or FakeReviewerGateway([]), worker_id=worker
-    )
     return AgentEngine(
         db_session,
         gateway=gateway,
         registry=registry or ToolRegistry(),
         events=events,
-        reviewer=reviewer,
         worker_id=worker,
     )
 
@@ -1239,11 +1049,11 @@ async def test_cancel_after_decide_suppresses_assistant_message_on_ask_user(
     assert event_types.count("run.cancelled") == 1
 
 
-async def test_cancel_after_reviewer_return_releases_drafts_and_cancels(
+async def test_cancel_after_publish_suppresses_complete_and_cancels(
     db_session, user_factory
 ) -> None:
-    """Reviewer 复核期间用户取消：Reviewer 返回后不发布——释放 Draft（idle）、
-    收口 cancelled，恰好一个 run.cancelled 事件。
+    """publish_artifacts 发布后、complete 分发前收到取消：不落 assistant 消息、
+    不写 run.completed；已发布 Artifact 保留，收口恰好一个 run.cancelled。
     """
     run, _, _ = await _make_session(db_session, user_factory)
     repo = AgentRunRepository(db_session)
@@ -1261,25 +1071,22 @@ async def test_cancel_after_reviewer_return_releases_drafts_and_cancels(
         artifact_type="insight_board_v1",
     )
 
-    async def cancel_on_review(_run) -> None:
-        await repo.request_cancel(run.id, run.user_id)
+    async def cancel_on_second_decide(_run, index) -> None:
+        if index == 2:
+            await repo.request_cancel(run.id, run.user_id)
 
     gateway = FakeAgentGateway(
         [
-            SubmitReview(
-                action="submit_review",
+            PublishArtifacts(
+                action="publish_artifacts",
                 artifact_draft_ids=(draft.id,),
-                completion_text="不应发布",
                 summary="瑞幸品牌分析",
-            )
-        ]
+            ),
+            Complete(action="complete", text="不应落库的回复"),
+        ],
+        on_decide=cancel_on_second_decide,
     )
-    reviewer_gateway = FakeReviewerGateway(
-        [ReviewDecision(decision="approve")], on_decide=cancel_on_review
-    )
-    engine = _make_engine(
-        db_session, gateway=gateway, reviewer_gateway=reviewer_gateway
-    )
+    engine = _make_engine(db_session, gateway=gateway)
 
     from app.model.contracts import ChatMessage
 
@@ -1291,17 +1098,22 @@ async def test_cancel_after_reviewer_return_releases_drafts_and_cancels(
     )
 
     assert outcome.status == RunStatus.CANCELLED
-    # 不发布、Draft 释放为 idle（新 Run 可接管，不永久 artifact_busy）
+    # 取消前已完成的发布不回滚（发布是逐项独立提交的）
     assert (
         await db_session.scalar(
             select(func.count(AgentArtifactVersion.id)).where(
                 AgentArtifactVersion.source_run_id == run.id
             )
         )
-    ) == 0
-    fresh_draft = await db_session.get(ArtifactDraft, draft.id)
-    assert fresh_draft.status == "idle"
-    assert fresh_draft.owner_run_id is None
+    ) == 1
+    # complete 被分发前闸门拦截：不落 assistant 消息
+    assistant_count = await db_session.scalar(
+        select(func.count(AgentMessage.id)).where(
+            AgentMessage.run_id == run.id, AgentMessage.role == "assistant"
+        )
+    )
+    assert assistant_count == 0
     event_types = [event.event_type for event in await _events(db_session, run.id)]
     assert event_types.count("run.cancelled") == 1
     assert "run.completed" not in event_types
+    assert "message.completed" not in event_types
