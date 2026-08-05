@@ -345,6 +345,8 @@ async def test_failed_confirmed_releases_reservation() -> None:
 
         assert result.status == "failed"
         assert result.error_type == "failed_confirmed"
+        # 上游错误文本（脱敏截断后）必须回喂模型，供其修正参数
+        assert "达人不存在" in result.safe_summary
         wallet = await _wallet(chain.user_id)
         assert (wallet.balance, wallet.reserved) == (1000, 0)
         row = await _only_row(chain.run_id)

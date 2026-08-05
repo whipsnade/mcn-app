@@ -713,15 +713,20 @@ class AgentMcpTool:
             self._breaker.record_success(
                 service=self._service.value, internal_tool_name=self.name, arguments=normalized
             )
+            upstream_message = safe_upstream_text(result.error_text)
             await self._coordinator.finalize_release(
                 logical_call_id=logical_call_id,
                 user_id=context.user_id,
                 error_type=FAILED_CONFIRMED,
-                message=safe_upstream_text(result.error_text) or "MCP call failed",
+                message=upstream_message or "MCP call failed",
                 upstream_request_id=result.upstream_request_id,
             )
+            # 上游业务错误文本（已脱敏截断）必须回喂模型——"不支持的维度/
+            # 不支持的平台"这类信息是模型修正参数的唯一依据，只存库不回喂
+            # 会导致模型用同样错误参数反复调用（真实 UAT 已观察到该模式）。
             return ToolResult(
-                status="failed", safe_summary="upstream reported a business error",
+                status="failed",
+                safe_summary=upstream_message or "upstream reported a business error",
                 error_type=FAILED_CONFIRMED,
             )
 
