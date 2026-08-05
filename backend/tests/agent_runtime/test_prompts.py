@@ -4,9 +4,10 @@
 prompt 的关键指引片段：
 
 - session_analyst_v1：四动作协议、澄清时机、工具使用准则（MCP 采集
-  Evidence → 历史读取/计算 → Builder 构建 → submit_review）、五类 Artifact
-  选择指引、Evidence ID 与游标读取、失败处理（unknown 不重放、余额不足
-  受限交付）、Builder 优先于手写 payload、restricted 诚实披露；
+  Evidence → 历史读取/计算 → Builder 构建 → publish_artifacts 直接发布）、
+  五类 Artifact 选择指引、Evidence ID 与游标读取、失败处理（unknown 不重放、
+  余额不足受限交付）、Builder 优先于手写 payload、restricted 诚实披露、
+  发布失败修订或 abandon_draft、complete 前不留活动 Draft；
 - artifact_reviewer_v1：审核清单、approve/revise/reject 语义、restricted
   放行条件；
 - kol_detail_v1：缓存优先、MCP allowlist、最多 5 条热帖、URL 不伪造、
@@ -24,11 +25,11 @@ import re
 from app.agent_runtime.profiles import PROFILES
 from app.agent_runtime.prompts import get_system_prompt
 
-# 各 Profile 的当前 prompt 版本（内容修订独立递增；本次为叙事防编造强化）。
+# 各 Profile 的当前 prompt 版本（内容修订独立递增；本次为直接发布协议替换 Reviewer）。
 PROMPT_VERSIONS = {
-    "session_analyst_v1": "v3",
+    "session_analyst_v1": "v4",
     "artifact_reviewer_v1": "v3",
-    "kol_detail_v1": "v2",
+    "kol_detail_v1": "v3",
     "utility_v1": "v2",
 }
 
@@ -52,11 +53,28 @@ def test_all_prompts_versioned_with_content() -> None:
 
 def test_session_analyst_prompt_four_action_protocol() -> None:
     text = _text("session_analyst_v1")
-    for action in ("ask_user", "call_tool", "submit_review", "complete"):
+    for action in ("ask_user", "call_tool", "publish_artifacts", "complete"):
         assert action in text
     # 澄清时机：信息不足主动问，一次一问，2-4 个选项。
     assert "2-4" in text
     assert "澄清" in text
+
+
+def test_session_analyst_prompt_direct_publish_semantics() -> None:
+    """直接发布协议：publish_artifacts 非终态、失败修订或 abandon_draft、
+    complete 前不得留下活动 Draft；Reviewer 指引从新执行路径 prompt 中删除。"""
+    text = _text("session_analyst_v1")
+    # publish_artifacts 非终态：发布结果返回后继续决策循环。
+    assert "非终态" in text
+    # 发布失败：按结构化问题修订（重新调用 Builder）或 abandon_draft 放弃。
+    assert "abandon_draft" in text
+    # complete 前不得留下活动 Draft。
+    assert "活动 Draft" in text
+    # Reviewer 指引已删除（新 Runtime wiring 的 prompt 不得再出现）。
+    assert "submit_review" not in text
+    assert "Reviewer" not in text
+    # 送审措辞随 Reviewer 一并移除。
+    assert "送审" not in text
 
 
 def test_session_analyst_prompt_tool_usage_guidance() -> None:
@@ -186,6 +204,10 @@ def test_kol_detail_prompt_contract() -> None:
     assert "伪造" in text
     # 无 ask_user。
     assert "ask_user" in text
+    # 直接发布协议：publish_artifacts 替代 submit_review，无 Reviewer 指引。
+    assert "publish_artifacts" in text
+    assert "submit_review" not in text
+    assert "Reviewer" not in text
 
 
 # ---------------------------------------------------------------------------

@@ -23,7 +23,7 @@ from app.agent_runtime.profiles import (
 )
 from app.agent_runtime.prompts import get_system_prompt
 
-FOUR_ACTIONS = frozenset({"ask_user", "call_tool", "submit_review", "complete"})
+FOUR_ACTIONS = frozenset({"ask_user", "call_tool", "publish_artifacts", "complete"})
 
 EXPECTED_FIELDS = {
     "name",
@@ -66,11 +66,13 @@ def test_each_profile_has_exact_name_and_version(key: str, name: str, version: s
 def test_session_analyst_allows_all_four_actions() -> None:
     profile = PROFILES["session_analyst_v1"]
     assert profile.allowed_actions == FOUR_ACTIONS
-    assert profile.requires_reviewer is True
+    # 新执行路径直接发布，无 Reviewer。
+    assert profile.requires_reviewer is False
 
 
 def test_artifact_reviewer_outputs_review_decision_and_no_tools() -> None:
     profile = PROFILES["artifact_reviewer_v1"]
+    # Reviewer 已从新执行路径下线；Profile 仅保留供历史代码导入。
     # 审核决策（approve/revise/reject）是独立类型，不属于四种动作协议。
     assert profile.allowed_actions == frozenset()
     assert "call_tool" not in profile.allowed_actions
@@ -78,11 +80,11 @@ def test_artifact_reviewer_outputs_review_decision_and_no_tools() -> None:
     assert profile.requires_reviewer is False
 
 
-def test_kol_detail_actions_and_requires_reviewer() -> None:
+def test_kol_detail_actions_and_no_reviewer() -> None:
     profile = PROFILES["kol_detail_v1"]
     assert profile.allowed_actions <= FOUR_ACTIONS
-    assert profile.allowed_actions == frozenset({"call_tool", "submit_review", "complete"})
-    assert profile.requires_reviewer is True
+    assert profile.allowed_actions == frozenset({"call_tool", "publish_artifacts", "complete"})
+    assert profile.requires_reviewer is False
 
 
 def test_utility_complete_only_no_reviewer() -> None:

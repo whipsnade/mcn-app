@@ -6,6 +6,11 @@
 
 Artifact 创建、更新、历史读取和计算统一通过 ``call_tool`` 走受控内部工具，
 不在顶层动作中增加业务特例。
+
+直接发布协议：``publish_artifacts`` 取代旧的 ``submit_review``——不再创建
+Reviewer Run，由确定性发布服务逐 Draft 校验并发布；``publish_artifacts``
+是非终态动作，发布结果回喂后模型继续决策循环。``SubmitReview`` 类仅保留
+供历史代码/测试导入，不在动作联合中。
 """
 
 from typing import Annotated, Any, Literal
@@ -13,7 +18,7 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator
 
 # 四种动作的权威集合；Profile 的 allowed_actions 必须是它的子集。
-FOUR_ACTIONS: frozenset[str] = frozenset({"ask_user", "call_tool", "submit_review", "complete"})
+FOUR_ACTIONS: frozenset[str] = frozenset({"ask_user", "call_tool", "publish_artifacts", "complete"})
 
 
 class AskUser(BaseModel):
@@ -45,8 +50,26 @@ class CallTool(BaseModel):
     rationale: str = Field(min_length=1, max_length=2000)
 
 
+class PublishArtifacts(BaseModel):
+    """把本 Run 已构建完成的正式 Draft 直接发布给用户（非终态动作）。
+
+    发布由确定性发布服务逐 Draft 校验执行，无模型 Reviewer；逐项结果
+    （published / validation_failed / failed + 结构化错误）回喂后模型继续
+    决策循环：修订后重新发布，或用 abandon_draft 工具放弃无法修复的 Draft。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    action: Literal["publish_artifacts"]
+    artifact_draft_ids: tuple[Annotated[str, Field(min_length=1)], ...] = Field(min_length=1)
+    summary: str = Field(min_length=1, max_length=2000)
+
+
 class SubmitReview(BaseModel):
-    """提交本 Run 待发布的全部正式 Draft 给 Reviewer，整批原子发布。
+    """（遗留）提交 Draft 给 Reviewer 的旧动作模型。
+
+    已从动作联合与 ``FOUR_ACTIONS`` 移除：新执行路径不再创建 Reviewer Run。
+    类定义仅保留供历史代码/测试导入，引擎 rewiring（Task 4）完成后可删除。
 
     ``artifact_draft_ids`` 用 tuple 而非 list：不可变且天然带去重语义，
     配合 validator 保证非空且唯一，且每项为至少 1 字符的非空字符串。
@@ -79,7 +102,7 @@ class Complete(BaseModel):
 
 
 AgentAction = Annotated[
-    AskUser | CallTool | SubmitReview | Complete,
+    AskUser | CallTool | PublishArtifacts | Complete,
     Field(discriminator="action"),
 ]
 
@@ -94,5 +117,6 @@ __all__ = [
     "CallTool",
     "Complete",
     "FOUR_ACTIONS",
+    "PublishArtifacts",
     "SubmitReview",
 ]

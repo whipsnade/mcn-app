@@ -12,7 +12,7 @@ from app.agent_runtime.schemas import (
     AskUser,
     CallTool,
     Complete,
-    SubmitReview,
+    PublishArtifacts,
 )
 
 
@@ -84,40 +84,38 @@ def test_call_tool_missing_rationale_rejected() -> None:
         )
 
 
-def test_submit_review_valid() -> None:
+def test_publish_artifacts_action_accepts_unique_non_empty_ids() -> None:
     action = AGENT_ACTION_ADAPTER.validate_python(
         {
-            "action": "submit_review",
+            "action": "publish_artifacts",
             "artifact_draft_ids": ["draft-1", "draft-2"],
-            "completion_text": "已完成分析",
-            "summary": "品牌与活动分析",
+            "summary": "品牌报告和达人名单已准备发布",
         }
     )
-    assert isinstance(action, SubmitReview)
-    assert action.action == "submit_review"
+    assert isinstance(action, PublishArtifacts)
+    assert action.action == "publish_artifacts"
     assert tuple(action.artifact_draft_ids) == ("draft-1", "draft-2")
 
 
-def test_submit_review_empty_draft_ids_rejected() -> None:
+def test_publish_artifacts_empty_draft_ids_rejected() -> None:
     with pytest.raises(ValidationError):
         AGENT_ACTION_ADAPTER.validate_python(
             {
-                "action": "submit_review",
+                "action": "publish_artifacts",
                 "artifact_draft_ids": [],
-                "completion_text": "done",
                 "summary": "summary",
             }
         )
 
 
-def test_submit_review_duplicate_draft_ids_rejected() -> None:
+def test_submit_review_is_no_longer_an_action() -> None:
     with pytest.raises(ValidationError):
         AGENT_ACTION_ADAPTER.validate_python(
             {
                 "action": "submit_review",
-                "artifact_draft_ids": ["draft-1", "draft-1"],
+                "artifact_draft_ids": ["draft-1"],
                 "completion_text": "done",
-                "summary": "summary",
+                "summary": "done",
             }
         )
 
@@ -158,9 +156,8 @@ def test_each_action_carries_its_literal() -> None:
             "rationale": "r",
         },
         {
-            "action": "submit_review",
+            "action": "publish_artifacts",
             "artifact_draft_ids": ["d"],
-            "completion_text": "c",
             "summary": "s",
         },
         {"action": "complete", "text": "t"},

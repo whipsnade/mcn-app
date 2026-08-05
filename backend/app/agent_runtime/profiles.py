@@ -1,9 +1,13 @@
 """Agent Profile 注册表（设计文档 §五）。
 
-Profile 只限定 Agent 的能力边界：允许动作、是否要求 Reviewer、输出 Schema、
-最大上下文预算、system prompt 引用。**Profile 不包含任何业务调用顺序或固定
-阶段清单**——这是结构性保证：字段集合即唯一能力描述载体，见 test_profiles.py
+Profile 只限定 Agent 的能力边界：允许动作、输出 Schema、最大上下文预算、
+system prompt 引用。**Profile 不包含任何业务调用顺序或固定阶段清单**——
+这是结构性保证：字段集合即唯一能力描述载体，见 test_profiles.py
 对字段名的断言。
+
+直接发布协议：新执行路径不再使用模型 Reviewer，所有在役 Profile 的
+``requires_reviewer`` 恒为 False；字段与 ``artifact_reviewer_v1`` 注册仅
+保留供历史代码导入。
 """
 
 from dataclasses import dataclass
@@ -41,8 +45,8 @@ class AgentProfile:
     MCP_TOOLS 分类按审核/渠道过滤放行；非 None 时 Registry 只放行名单内的
     MCP 工具（设计 §5.1，kol_detail_v1 的达人详情/热帖名单）。
     ``output_schema`` 是短描述符：``agent_actions``（四种动作协议）/
-    ``review_decision``（approve/revise/reject，独立于动作协议）/
-    ``utility_json``（对应强类型 Utility 输出）。
+    ``review_decision``（approve/revise/reject，独立于动作协议；遗留，
+    仅 artifact_reviewer_v1 使用）/ ``utility_json``（对应强类型 Utility 输出）。
     """
 
     name: str
@@ -99,19 +103,22 @@ def _make_profile(
 PROFILES: dict[str, AgentProfile] = {
     profile.full_name: profile
     for profile in [
-        # 所有普通会话消息的入口：全部四种动作，正式产物需 Reviewer 把关。
+        # 所有普通会话消息的入口：全部四种动作，正式产物由 publish_artifacts
+        # 直接发布（确定性发布服务校验，无模型 Reviewer）。
         _make_profile(
             name="session_analyst",
             version="v1",
-            allowed_actions=frozenset({"ask_user", "call_tool", "submit_review", "complete"}),
+            allowed_actions=frozenset({"ask_user", "call_tool", "publish_artifacts", "complete"}),
             allowed_tool_categories=frozenset(
                 {MCP_TOOLS, HISTORY_TOOLS, CALCULATION_TOOLS, ARTIFACT_TOOLS}
             ),
-            requires_reviewer=True,
+            requires_reviewer=False,
             max_context_budget=128_000,
             output_schema="agent_actions",
         ),
-        # 正式 Artifact 提交复核：只读，输出 approve/revise/reject，禁用工具。
+        # （遗留）正式 Artifact 提交复核：只读，输出 approve/revise/reject，
+        # 禁用工具。Reviewer 已从新执行路径下线，本 Profile 仅保留供历史
+        # 代码导入，不得出现在新 Runtime wiring 中。
         _make_profile(
             name="artifact_reviewer",
             version="v1",
@@ -124,14 +131,15 @@ PROFILES: dict[str, AgentProfile] = {
         # 点击圈选达人的轻量 Run：缓存未命中时经明确 allowlist 的 MCP 工具
         # （KOL_DETAIL_MCP_TOOL_ALLOWLIST：达人详情 kol_detail + 原帖/热帖
         # query_raw_posts，非整个 MCP_TOOLS 分类）抓取真实数据，构建
-        # kol_detail_v2 提交 Reviewer 发布；KOL_DETAIL_TOOLS 分类保留给
-        # 只读缓存/详情内部工具。点击触发的无澄清交互，故不允许 ask_user。
+        # kol_detail_v2 后由 publish_artifacts 直接发布；KOL_DETAIL_TOOLS
+        # 分类保留给只读缓存/详情内部工具。点击触发的无澄清交互，故不允许
+        # ask_user。
         _make_profile(
             name="kol_detail",
             version="v1",
-            allowed_actions=frozenset({"call_tool", "submit_review", "complete"}),
+            allowed_actions=frozenset({"call_tool", "publish_artifacts", "complete"}),
             allowed_tool_categories=frozenset({MCP_TOOLS, KOL_DETAIL_TOOLS, ARTIFACT_TOOLS}),
-            requires_reviewer=True,
+            requires_reviewer=False,
             max_context_budget=32_000,
             output_schema="agent_actions",
             mcp_tool_allowlist=KOL_DETAIL_MCP_TOOL_ALLOWLIST,
