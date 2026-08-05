@@ -41,6 +41,7 @@ from app.agent_artifacts.builders.kol_detail import build_kol_detail_draft
 from app.agent_artifacts.builders.kol_selection import build_kol_selection_draft
 from app.agent_artifacts.builders.raw_rows import extract_rows, unwrap_payload
 from app.agent_artifacts.models import AgentArtifact, AgentArtifactVersion
+from app.agent_artifacts.payloads.kol_analysis import KolAnalysisNarrative
 from app.agent_artifacts.payloads.kol_selection import KolSelectionNarrative
 from app.agent_artifacts.service import ArtifactBusy, ArtifactService
 from app.agent_artifacts.validation import ArtifactPayloadInvalid
@@ -468,6 +469,11 @@ class BuildKolAnalysisDraftArgs(BaseModel):
     selection_artifact_id: str = Field(min_length=1)
     selection_version: int | None = Field(default=None, ge=1)
     analysis_period: str | None = None
+    # 模型叙事（设计 §6.1；H4——Reviewer 可要求逐人分析，确定性组合级模板叙事
+    # 无法满足，Args 不收 narrative 会造成契约死锁）。嵌套模型直接复用
+    # kol_analysis_v2 payload 的 KolAnalysisNarrative，契约同源不漂移；可空——
+    # 缺省时由 builder 按名单数据确定性生成兜底叙事。
+    narrative: KolAnalysisNarrative | None = None
 
 
 class BuildKolAnalysisDraftTool(_BuilderToolBase):
@@ -477,12 +483,25 @@ class BuildKolAnalysisDraftTool(_BuilderToolBase):
         "对已发布的圈选名单（kol_selection_v3 Version）做组合分析，产出 "
         "kol_analysis_v2 Draft。selection_artifact_id 为当前会话的名单 "
         "Artifact id；selection_version 缺省取最新已发布版本。分析数据引用"
-        "名单 Version 并递归追溯其 Evidence。输出只含 "
+        "名单 Version 并递归追溯其 Evidence。narrative 可选（executive_summary "
+        "必填 + portfolio_findings[]/mix_recommendations[]/risk_notes[]，条目为 "
+        "{title, detail, supporting_paths[]}；supporting_paths 必须指向 data 内"
+        "真实存在的点分路径，如 data.top_kols.0.score、data.summary.avg_score；"
+        "缺省时由工具按名单数据确定性生成组合级兜底叙事）。Reviewer 会核对 "
+        "narrative 与 scope.selection_version 对应名单的 top_kols 覆盖度——"
+        "Reviewer 要求逐人分析时，在 portfolio_findings 中为头部达人逐一给出"
+        "核心价值条目并以 supporting_paths 指向该达人 data.top_kols 下的真实"
+        "字段。输出只含 "
         "artifact_id/draft_id/revision_id/schema_version 与受限摘要。"
         "输入契约示例："
         '{"selection_artifact_id":"<名单 Artifact id>","selection_version":1,'
-        '"analysis_period":"2026-07"}（后两个参数可省略）。'
-        "名单未发布或 Artifact 不属于当前会话返回 not_found；其他校验失败返回 "
+        '"analysis_period":"2026-07","narrative":{"executive_summary":"...",'
+        '"portfolio_findings":[{"title":"达人A 核心价值","detail":"...",'
+        '"supporting_paths":["data.top_kols.0.score"]}],"mix_recommendations":[],'
+        '"risk_notes":[]}}（selection_version/analysis_period/narrative 均可省略）。'
+        "数字纪律：narrative 中的每个数字都必须能在 supporting_paths 指向的 data "
+        "位置找到同值，找不到就不要写这个数字。名单未发布或 Artifact 不属于当前"
+        "会话返回 not_found；其他校验失败返回 "
         "draft_build_error 字段级明细，按明细修正后重试。"
     )
 
@@ -529,6 +548,11 @@ class BuildKolAnalysisDraftTool(_BuilderToolBase):
                 analysis_period=args.analysis_period,
                 selection_refs=version.evidence_refs_json or [],
                 source_names=("kol_selection_v3",),
+                narrative=(
+                    args.narrative.model_dump(mode="json")
+                    if args.narrative is not None
+                    else None
+                ),
             )
         except DraftBuildError as exc:
             return _failed(DRAFT_BUILD_ERROR, str(exc))

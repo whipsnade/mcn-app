@@ -419,6 +419,83 @@ def test_top_kols_and_kol_trend_capped_at_20() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 3.1 模型叙事（H4，设计 §6.1）：Reviewer 要求逐人分析，确定性组合级模板
+# 叙事无法满足；模型叙事经 KolAnalysisV2 强校验后写入 payload。
+# ---------------------------------------------------------------------------
+
+
+def test_analysis_builder_model_narrative_passthrough() -> None:
+    """模型叙事替代确定性兜底，写入 payload 且过强校验。"""
+    items = [_selection_item("1")]
+    narrative = {
+        "executive_summary": "名单 1 位达人，价值集中。",
+        "portfolio_findings": [
+            {
+                "title": "达人1 核心价值",
+                "detail": "评分与互动量头部。",
+                "supporting_paths": ["data.top_kols.0.score"],
+            }
+        ],
+        "mix_recommendations": [],
+        "risk_notes": [],
+    }
+    build = build_kol_analysis_draft(
+        selection_artifact_id="A",
+        selection_payload=_selection_payload(items),
+        parent_artifact_version_id="V1",
+        selection_version="1",
+        selection_refs=_selection_refs(items),
+        narrative=narrative,
+    )
+    assert build.payload["narrative"]["executive_summary"] == "名单 1 位达人，价值集中。"
+    assert build.payload["narrative"]["portfolio_findings"][0]["title"] == "达人1 核心价值"
+    KolAnalysisV2.model_validate(build.payload)
+
+
+def test_analysis_builder_model_narrative_invalid_supporting_path_raises() -> None:
+    """模型叙事的 supporting_paths 指向 data 内不存在的路径 → DraftBuildError
+    （工具层转 draft_build_error 结构化回喂）。"""
+    items = [_selection_item("1")]
+    narrative = {
+        "executive_summary": "概览。",
+        "portfolio_findings": [
+            {"title": "幻觉", "detail": "引用不存在。", "supporting_paths": ["data.top_kols.99.score"]}
+        ],
+        "mix_recommendations": [],
+        "risk_notes": [],
+    }
+    with pytest.raises(DraftBuildError):
+        build_kol_analysis_draft(
+            selection_artifact_id="A",
+            selection_payload=_selection_payload(items),
+            parent_artifact_version_id="V1",
+            selection_version="1",
+            selection_refs=_selection_refs(items),
+            narrative=narrative,
+        )
+
+
+def test_analysis_builder_model_narrative_ignored_when_selection_empty() -> None:
+    """无候选的 restricted 路径恒用 builder 受限披露叙事（此时无 data 可引用，
+    不采用模型叙事）。"""
+    build = build_kol_analysis_draft(
+        selection_artifact_id="A",
+        selection_payload=_selection_payload([]),
+        parent_artifact_version_id="V1",
+        selection_version="1",
+        narrative={
+            "executive_summary": "模型叙事不应生效。",
+            "portfolio_findings": [],
+            "mix_recommendations": [],
+            "risk_notes": [],
+        },
+    )
+    assert build.payload["data_status"] == "restricted"
+    assert build.payload["narrative"]["executive_summary"] == "名单数据不足，无法完成 KOL 分析。"
+    KolAnalysisV2.model_validate(build.payload)
+
+
+# ---------------------------------------------------------------------------
 # 4. Lineage 递归到名单 Evidence
 # ---------------------------------------------------------------------------
 

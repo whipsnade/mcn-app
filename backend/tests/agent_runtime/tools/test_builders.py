@@ -29,7 +29,7 @@ from app.agent_artifacts.models import (
 )
 from app.agent_artifacts.payloads.brand import BrandReportV3
 from app.agent_artifacts.payloads.campaign import CampaignReportV2
-from app.agent_artifacts.payloads.kol_analysis import KolAnalysisV2
+from app.agent_artifacts.payloads.kol_analysis import KolAnalysisNarrative, KolAnalysisV2
 from app.agent_artifacts.payloads.kol_detail import KolDetailV2
 from app.agent_artifacts.payloads.kol_selection import KolSelectionNarrative, KolSelectionV3
 from app.agent_runtime.evidence import EvidenceWriter
@@ -930,30 +930,205 @@ async def test_build_kol_selection_draft_tool_narrative_supporting_path_must_res
     assert "supporting_path" in result.safe_summary
 
 
-def test_builder_args_narrative_contract_matrix() -> None:
-    """五个 Builder 的叙事契约核对结论（H3）：
+# ---------------------------------------------------------------------------
+# kol_analysis Builder 叙事字段（H4：Reviewer revise 要求「narrative 逐人分析
+# 核心价值」，builder 确定性组合级模板叙事无法满足，Args 不收 narrative 造成
+# 契约死锁——模型照做被拒 tool_arguments_invalid 后只能诚实收尾）
+# ---------------------------------------------------------------------------
 
-    - brand / campaign / kol_selection：Args 接受模型叙事（可空，缺省由
-      builder 确定性生成兜底），字段契约与各自 payload 的 narrative 模型一致；
-    - kol_analysis / kol_detail：叙事由 builder 内部确定性生成，Args 不收
-      narrative（描述与实现自洽）；
-    - kol_selection 的叙事嵌套模型直接复用 kol_selection_v3 payload 的
-      KolSelectionNarrative（同源，不可能漂移）。
+KOL_ANALYSIS_NARRATIVE = {
+    "executive_summary": "名单共 1 位达人，头部价值集中。",
+    "portfolio_findings": [
+        {
+            "title": "达人1 核心价值",
+            "detail": "综合评分与互动量均为名单头部，契合美食品类投放。",
+            "supporting_paths": ["data.top_kols.0.score", "data.top_kols.0.engagement_total"],
+        }
+    ],
+    "mix_recommendations": [
+        {
+            "title": "平台集中",
+            "detail": "名单集中单一平台，建议保持聚焦投放。",
+            "supporting_paths": ["data.platform_distribution.0.count"],
+        }
+    ],
+    "risk_notes": [],
+}
+
+
+async def _publish_kol_selection(db_session, ctx: ToolContext) -> AgentArtifact:
+    """经名单 Builder 落名单 Draft 并登记已发布 Version 1（供分析 Builder 消费）。"""
+    evidence_id = await _write_evidence(
+        db_session,
+        session_id=ctx.session_id,
+        run_id=ctx.run_id,
+        step_id=ctx.step_id,
+        payload=_kol_items(),
+    )
+    selection_tool = BuildKolSelectionDraftTool(db_session)
+    result = await selection_tool.execute(
+        ctx, {"scope": KOL_SCOPE, "evidence_id": evidence_id}
+    )
+    assert result.status == "success", result.safe_summary
+    selection_summary = json.loads(result.safe_summary)
+    revision = await db_session.get(ArtifactDraftRevision, selection_summary["revision_id"])
+    artifact = await db_session.get(AgentArtifact, selection_summary["artifact_id"])
+    assert revision is not None and artifact is not None
+    version = AgentArtifactVersion(
+        id=str(uuid4()),
+        artifact_id=artifact.id,
+        version=1,
+        source_run_id=ctx.run_id,
+        source_draft_revision_id=revision.id,
+        schema_version=revision.schema_version,
+        payload_json=revision.payload_json,
+        evidence_refs_json=revision.evidence_refs_json,
+        data_status=revision.payload_json["data_status"],
+        created_at=_now(),
+    )
+    db_session.add(version)
+    artifact.latest_version = 1
+    artifact.status = "published"
+    await db_session.flush()
+    return artifact
+
+
+async def test_build_kol_analysis_draft_tool_model_narrative_written_to_draft(
+    db_session, user_factory
+) -> None:
+    """模型按契约提供 narrative（逐人分析）→ Draft 采用模型叙事且过
+    kol_analysis_v2 强校验；条目 supporting_paths 指向 top_kols 真实路径。"""
+    user = await user_factory()
+    session = await _make_session(db_session, user.id)
+    run, step = await _make_run(db_session, session.id, user.id)
+    ctx = _ctx(user.id, session.id, run.id, step.id)
+    artifact = await _publish_kol_selection(db_session, ctx)
+
+    tool = BuildKolAnalysisDraftTool(db_session)
+    result = await tool.execute(
+        ctx,
+        {"selection_artifact_id": artifact.id, "narrative": KOL_ANALYSIS_NARRATIVE},
+    )
+    assert result.status == "success", result.safe_summary
+    summary = json.loads(result.safe_summary)
+
+    payload = await _latest_revision_payload(db_session, summary["artifact_id"])
+    KolAnalysisV2.model_validate(payload)
+    narrative = payload["narrative"]
+    assert narrative["executive_summary"] == KOL_ANALYSIS_NARRATIVE["executive_summary"]
+    finding = narrative["portfolio_findings"][0]
+    assert finding["title"] == "达人1 核心价值"
+    # 逐人分析条目 supporting_paths 指向 top_kols 路径（payload 校验已保证可解析）。
+    assert finding["supporting_paths"] == [
+        "data.top_kols.0.score",
+        "data.top_kols.0.engagement_total",
+    ]
+
+
+async def test_build_kol_analysis_draft_tool_narrative_missing_required_field(
+    db_session, user_factory
+) -> None:
+    """narrative 缺必填 executive_summary → 结构化 draft_build_error 字段级明细。"""
+    user = await user_factory()
+    session = await _make_session(db_session, user.id)
+    run, step = await _make_run(db_session, session.id, user.id)
+    ctx = _ctx(user.id, session.id, run.id, step.id)
+    artifact = await _publish_kol_selection(db_session, ctx)
+
+    tool = BuildKolAnalysisDraftTool(db_session)
+    result = await tool.execute(
+        ctx,
+        {
+            "selection_artifact_id": artifact.id,
+            "narrative": {"portfolio_findings": []},
+        },
+    )
+    assert result.status == "failed"
+    assert result.error_type == "draft_build_error"
+    assert "executive_summary" in result.safe_summary
+
+
+async def test_build_kol_analysis_draft_tool_narrative_supporting_path_must_resolve(
+    db_session, user_factory
+) -> None:
+    """narrative 的 supporting_paths 指向 data 内不存在的路径 → payload 校验拒绝，
+    结构化 draft_build_error 回喂（叙事不得引用不存在的数据）。"""
+    user = await user_factory()
+    session = await _make_session(db_session, user.id)
+    run, step = await _make_run(db_session, session.id, user.id)
+    ctx = _ctx(user.id, session.id, run.id, step.id)
+    artifact = await _publish_kol_selection(db_session, ctx)
+    bad_narrative = {
+        **KOL_ANALYSIS_NARRATIVE,
+        "portfolio_findings": [
+            {"title": "幻觉", "detail": "引用不存在的达人。", "supporting_paths": ["data.top_kols.99.score"]}
+        ],
+    }
+
+    tool = BuildKolAnalysisDraftTool(db_session)
+    result = await tool.execute(
+        ctx,
+        {"selection_artifact_id": artifact.id, "narrative": bad_narrative},
+    )
+    assert result.status == "failed"
+    assert result.error_type == "draft_build_error"
+    assert "supporting_path" in result.safe_summary
+
+
+async def test_build_kol_analysis_draft_tool_default_narrative_fallback(
+    db_session, user_factory
+) -> None:
+    """缺省不传 narrative → 沿用 builder 确定性组合级兜底叙事（行为不变）。"""
+    user = await user_factory()
+    session = await _make_session(db_session, user.id)
+    run, step = await _make_run(db_session, session.id, user.id)
+    ctx = _ctx(user.id, session.id, run.id, step.id)
+    artifact = await _publish_kol_selection(db_session, ctx)
+
+    tool = BuildKolAnalysisDraftTool(db_session)
+    result = await tool.execute(ctx, {"selection_artifact_id": artifact.id})
+    assert result.status == "success", result.safe_summary
+    summary = json.loads(result.safe_summary)
+
+    payload = await _latest_revision_payload(db_session, summary["artifact_id"])
+    KolAnalysisV2.model_validate(payload)
+    assert "组合分析" in payload["narrative"]["executive_summary"]
+
+
+def test_builder_args_narrative_contract_matrix() -> None:
+    """五个 Builder 的叙事契约核对结论（H3 + H4）：
+
+    - brand / campaign / kol_selection / kol_analysis：Args 接受模型叙事（可空，
+      缺省由 builder 确定性生成兜底），字段契约与各自 payload 的 narrative
+      模型一致；
+    - kol_detail：叙事由 builder 内部确定性生成（单达人事实型详情，无逐人
+      分析类质量维度），Args 不收 narrative（描述与实现自洽）；
+    - kol_selection / kol_analysis 的叙事嵌套模型直接复用各自 payload 的
+      Narrative 契约模型（同源，不可能漂移）。
     """
     assert "narrative" in BuildBrandReportDraftArgs.model_fields
     assert "narrative" in BuildCampaignReportDraftArgs.model_fields
     assert "narrative" in BuildKolSelectionDraftArgs.model_fields
-    assert "narrative" not in BuildKolAnalysisDraftArgs.model_fields
+    assert "narrative" in BuildKolAnalysisDraftArgs.model_fields
     assert "narrative" not in BuildKolDetailDraftArgs.model_fields
 
-    # kol_selection 叙事契约与 payload 强类型契约同源（同一模型类渲染进 Schema）。
-    schema = BuildKolSelectionDraftArgs.model_json_schema()
-    assert "KolSelectionNarrative" in schema.get("$defs", {})
+    # kol_selection / kol_analysis 叙事契约与 payload 强类型契约同源（同一模型类
+    # 渲染进 Schema）。
+    selection_schema = BuildKolSelectionDraftArgs.model_json_schema()
+    assert "KolSelectionNarrative" in selection_schema.get("$defs", {})
     assert set(KolSelectionNarrative.model_fields) == {
         "selection_summary",
         "fit_findings",
         "risk_notes",
         "usage_advice",
+    }
+    analysis_schema = BuildKolAnalysisDraftArgs.model_json_schema()
+    assert "KolAnalysisNarrative" in analysis_schema.get("$defs", {})
+    assert set(KolAnalysisNarrative.model_fields) == {
+        "executive_summary",
+        "portfolio_findings",
+        "mix_recommendations",
+        "risk_notes",
     }
 
 

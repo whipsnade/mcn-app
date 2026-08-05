@@ -329,11 +329,19 @@ def build_kol_analysis_draft(
     selection_refs: list[dict[str, Any]] | None = None,
     source_names: tuple[str, ...] = ("kol_evidence",),
     data_as_of: datetime | None = None,
+    narrative: dict[str, Any] | None = None,
 ) -> DraftBuildResult:
     """对不可变名单 Version 构建 ``kol_analysis_v2`` Draft。
 
     ``parent_artifact_version_id`` 固定到当时分析的名单 Version；稳定身份复用
     ``kol-analysis:{selection_artifact_id}``。
+
+    ``narrative``：模型提供的叙事（设计 §6.1；H4——Reviewer 可要求逐人分析，
+    确定性组合级模板叙事无法满足），写入 payload 前经
+    ``KolAnalysisV2.model_validate`` 强校验（含 supporting_paths 必须指向
+    data 内真实路径）；缺省时按名单数据确定性生成兜底叙事。无候选的
+    restricted 路径恒用 builder 自己的受限披露叙事（此时无 data 可引用，
+    不采用模型叙事）。
     """
     scope = {
         "selection_artifact_id": selection_artifact_id,
@@ -406,7 +414,9 @@ def build_kol_analysis_draft(
     covered = {ref.get("artifact_path") for ref in selection_refs}
 
     analysis_data = _analysis_data(items)
-    narrative = _analysis_narrative(items, analysis_data)
+    resolved_narrative = (
+        narrative if narrative is not None else _analysis_narrative(items, analysis_data)
+    )
 
     # 分章节收集 null Optional 数值叶子；任一章节有 null 即 partial + limitation。
     section_nulls: dict[str, list[str]] = {
@@ -448,7 +458,7 @@ def build_kol_analysis_draft(
     payload = _assemble_payload(
         scope=scope,
         data=analysis_data,
-        narrative=narrative,
+        narrative=resolved_narrative,
         data_status="restricted" if restricted else "complete",
         limitations=limitations,
         availability=availability,
