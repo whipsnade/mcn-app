@@ -139,7 +139,75 @@
 - 稳定运行并经用户单独批准后，才可另立**清理迁移**物理删除旧会话、任务、Goal、报告、旧 Artifact、
   旧 MCP/Quick 状态表。清理前必须再次备份并列出准确表名，**不得**在首次切换迁移中隐式删除。
 
-## 5. 参考
+## 5. 直接发布 Runtime 修订（Gate A，迁移 0030）
+
+来源：设计 `docs/superpowers/specs/2026-08-05-marketing-report-runtime-revision-design.md`
+§四/§十；实施计划 `docs/superpowers/plans/2026-08-05-direct-publish-run-lifecycle.md`
+（Tasks 1–6）。本节是 v3 切档之上的一次**增量修订**，删除新执行链的模型 Reviewer，
+改由确定性发布门禁逐 Artifact 发布 Version。旧 Review 表与 `reviewing` 状态**首期保留
+只读兼容，不物理删除**。
+
+### 5.1 部署前清零活动 `reviewing` Run
+
+- 直接发布改造（Task 4）后，引擎不再启动 `artifact_reviewer_v1`，也不再进入 `reviewing`。
+- 部署前**必须等待所有活动 `reviewing` Run 清零**：旧代码下进入 `reviewing` 且租约过期
+  的历史 Run，在新代码恢复扫描中被**直接收口为 `failed`**（`error_code="LEGACY_REVIEWING_UNSUPPORTED"`），
+  Draft 保留、不删除、不启动 Reviewer。切档前清零可避免这类 Run 在切档瞬间被新代码批量收口。
+- 校验：`SELECT id FROM agent_runs WHERE status='reviewing'` 应为空；非空时先在旧代码下
+  让其自然结束或人工标记终态，再切档。
+
+### 5.2 升级迁移 0030
+
+- 迁移链固定 `0029_agent_run_created_at → 0030_direct_publish_runtime`；
+  `cd backend && .venv/bin/alembic upgrade head` 应到 head `0030_direct_publish_runtime`，
+  `alembic heads` 只剩一个 head。
+- 0030 只**新增**对象，downgrade 只移除本迁移创建的对象，**不触碰 Review/Reviewer 相关表**：
+  - 新表 `artifact_publish_attempts`（`idempotency_key` 唯一幂等；状态
+    `validating/published/validation_failed/failed`；FK→`agent_runs/agent_artifacts/
+    artifact_draft_revisions/agent_artifact_versions`）；
+  - `agent_artifact_versions` 新增 nullable JSON `validation_json`（新 Version 的
+    `review_json=None`）；
+  - `memory_entries` 类型 Check Constraint 重建加入 `confirmed_scope`。
+
+### 5.3 新动作协议（FOUR_ACTIONS）
+
+- 模型每轮只输出四种动作：`ask_user / call_tool / publish_artifacts / complete`
+  （`FOUR_ACTIONS`）；**`submit_review` 已不再是合法动作**，模型输出会被协议拒绝。
+- `publish_artifacts` 是**非终态**动作：调用 `ArtifactPublicationService` 逐 Artifact
+  事务发布，结果回喂主模型，模型可继续生成下游产物或调用 `complete`。
+- 无法修复的 Draft 由受控工具 `abandon_draft`（经 `call_tool`）标记 failed 并写一条
+  `artifact_publish_attempts(status="failed")` 保存结构化原因，**不得用 `complete`
+  静默遗留活动 Draft**。
+- `complete` 前引擎查询当前 Run 拥有的 Draft 状态：若仍有未发布且未 failed/abandoned 的
+  Draft，回喂 `error_code="ACTIVE_DRAFTS_REMAIN"` 让模型继续，**不直接终态**。
+- 终态聚合：全部预期产物成功 → `completed`；至少一个成功且存在失败/放弃 →
+  `completed_with_warnings`；无成功且无法继续 → `failed`。零发布产物收口为 `failed`
+  （Task 4 收口补丁）。
+
+### 5.4 直接发布事件顺序
+
+每个发布成功的 Artifact 发一条 `artifact.published`（逐项即时发，缩小崩溃窗口），
+`publish_artifacts` 动作处理完所有项后发一条汇总事件 `artifact.publish.completed`
+（payload 带 `artifact_id/module/parent_artifact_id/status`，发布项另带 `version`），
+均**在 `message.completed` 之前**。终态事件（`run.completed`/
+`run.completed_with_warnings`/`run.failed`/`run.cancelled`）由
+`AgentEventStream.settle_terminal` 在统一事务边界收口，是该 Run 最后一条用户可见事件。
+发布循环中崩溃、接管后直接 `complete` 的窗口由 complete 前缺失事件幂等补发兜底。
+发布同一 Draft Revision 幂等（`idempotency_key`），不生成重复 Version；已发布 Version
+永不更新；一个 Draft 发布失败**不回滚**其他成功项。
+
+### 5.5 旧 Review 表只读保留与回滚约束
+
+- `artifact_reviews`、`artifact_review_batches/items/attempts`、`agent_artifact_versions.review_json`、
+  `agent_runs.review_count` 等旧 Reviewer 表/字段**首期保留**，新执行路径停止写入但
+  不删除，用于回滚读取。
+- 回滚到旧代码前**不得删除 Review 表**：回滚应用版本后旧系统仍需读取这些表恢复
+  Reviewer 能力。新表（`artifact_publish_attempts`、`validation_json` 列）未被新代码写入时
+  可随 0030 downgrade 整体回滚；已写入则保留新表、仅回滚应用版本。
+- `reviewing` 仅为历史兼容状态：新 Run 不再进入；`completed_with_warnings` 视为终态，
+  纳入终态集合、租约、取消、暂停和 executor 扫描。
+
+## 6. 参考
 
 - 真实 UAT 记录与账本验证：`docs/qa/2026-08-02-agent-runtime-uat.md`（结构化结果
   `outputs/agent-runtime-uat-results.json`，不提交 Git）；逐轮历史追加记录
