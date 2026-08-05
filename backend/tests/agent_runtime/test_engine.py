@@ -5,7 +5,7 @@
 
 1. 四种动作循环：ask_user / call_tool（计算 + MCP 桥 + 余额不足）/
    publish_artifacts（直接发布：成功 / validation_failed / 逐项失败回喂）/
-   complete（活动 Draft 闸门 + 终态聚合 completed/completed_with_warnings）；
+   complete（活动 Draft 闸门 + 终态聚合 completed/completed_with_warnings/failed）；
 2. 保护：50 决策暂停 + 恢复、取消信号、非法动作安全阈值；
 3. 新鲜 Run：每条消息独立 Run，只有 paused 才能被 resume。
 """
@@ -616,11 +616,13 @@ async def test_publish_artifacts_returns_to_decision_loop(db_session, user_facto
     assert types[-1] == "run.completed"
 
 
-async def test_validation_failed_then_abandon_completes_with_warnings(
+async def test_zero_published_with_failures_settles_failed(
     db_session, user_factory
 ) -> None:
-    """发布校验失败（缺 lineage）→ 逐项结果回喂 → 模型 abandon_draft →
-    complete 按发布/失败项聚合为 completed_with_warnings 终态。"""
+    """零发布成功 + 有失败项（设计 §4.2）：发布校验失败（缺 lineage）→
+    逐项结果回喂 → 模型 abandon_draft → complete 时无任何产物发布成功，
+    Run 收口 failed（error_code=ALL_ARTIFACTS_FAILED），不是 completed_with_warnings
+    （后者要求至少一个产物发布成功）。"""
     run, attempt, _, _ = await _setup_run(db_session, user_factory)
     # 必需数字叶子缺 lineage：确定性校验判 validation_failed（§10.3）。
     _, draft, _ = await _make_draft(db_session, run, payload=insight_metric_payload(value=100))
@@ -654,8 +656,9 @@ async def test_validation_failed_then_abandon_completes_with_warnings(
         profile=get_profile("session_analyst_v1"),
         messages=[ChatMessage(role="user", content="分析瑞幸品牌")],
     )
-    assert outcome.status == RunStatus.COMPLETED_WITH_WARNINGS
-    assert run.status == RunStatus.COMPLETED_WITH_WARNINGS
+    assert outcome.status == RunStatus.FAILED
+    assert run.status == RunStatus.FAILED
+    assert run.error_code == "ALL_ARTIFACTS_FAILED"
     # validation_failed 逐项结果回喂给模型
     assert any("validation_failed" in m.content for m in gateway.calls[1]["messages"])
     # 未产生任何 Version；Draft 已放弃（failed）
@@ -670,7 +673,70 @@ async def test_validation_failed_then_abandon_completes_with_warnings(
     assert draft_row is not None
     assert draft_row.status == "failed"
     assert draft_row.owner_run_id is None
-    # 终态事件：恰好一个 run.completed_with_warnings 且为最后一条
+    # 恰好一个 run.failed 终态事件且为最后一条（与其他 failed 路径同一事件通道）
+    types = await _event_types(db_session, run.id)
+    assert types[-1] == "run.failed"
+    terminal = await _terminal_events(db_session, run.id)
+    assert len(terminal) == 1
+    assert terminal[0].event_type == "run.failed"
+    assert terminal[0].payload_json["error_code"] == "ALL_ARTIFACTS_FAILED"
+
+
+async def test_mixed_publish_and_abandon_completes_with_warnings(
+    db_session, user_factory
+) -> None:
+    """≥1 发布成功 + ≥1 失败/放弃项（设计 §4.2）：complete 聚合为
+    completed_with_warnings 终态。"""
+    run, attempt, _, _ = await _setup_run(db_session, user_factory)
+    _, draft_ok, _ = await _make_draft(db_session, run, brand="瑞幸")
+    # 必需数字叶子缺 lineage：确定性校验判 validation_failed（§10.3）。
+    _, draft_bad, _ = await _make_draft(
+        db_session, run, brand="库迪", payload=insight_metric_payload(value=100)
+    )
+    registry = ToolRegistry()
+    registry.register(AbandonDraftTool(db_session), category="artifact")
+    engine, _ = _make_engine(
+        db_session,
+        actions=[
+            PublishArtifacts(
+                action="publish_artifacts",
+                artifact_draft_ids=(draft_ok.id, draft_bad.id),
+                summary="发布",
+            ),
+            CallTool(
+                action="call_tool",
+                internal_tool_name="abandon_draft",
+                arguments={
+                    "draft_id": draft_bad.id,
+                    "reason_code": "unfixable_lineage",
+                    "reason": "无法补齐数据来源",
+                },
+                rationale="放弃无法修复的 Draft",
+            ),
+            Complete(action="complete", text="已完成（部分产物未发布）"),
+        ],
+        registry=registry,
+    )
+    outcome = await engine.run(
+        run=run,
+        attempt_id=attempt.id,
+        profile=get_profile("session_analyst_v1"),
+        messages=[ChatMessage(role="user", content="分析瑞幸和库迪")],
+    )
+    assert outcome.status == RunStatus.COMPLETED_WITH_WARNINGS
+    assert run.status == RunStatus.COMPLETED_WITH_WARNINGS
+    # 成功项发布、失败项放弃
+    versions = (
+        await db_session.scalars(
+            select(AgentArtifactVersion).where(AgentArtifactVersion.source_run_id == run.id)
+        )
+    ).all()
+    assert len(versions) == 1
+    assert versions[0].artifact_id == draft_ok.artifact_id
+    draft_row = await db_session.get(ArtifactDraft, draft_bad.id)
+    assert draft_row is not None
+    assert draft_row.status == "failed"
+    # 恰好一个 run.completed_with_warnings 终态事件且为最后一条
     types = await _event_types(db_session, run.id)
     assert types[-1] == "run.completed_with_warnings"
     terminal = await _terminal_events(db_session, run.id)
@@ -2147,6 +2213,15 @@ async def _purge_committed_artifact_run(
             delete(ArtifactEvent).where(ArtifactEvent.session_id == session_id)
         )
         draft_ids = select(ArtifactDraft.id).where(ArtifactDraft.session_id == session_id)
+        artifact_ids = select(AgentArtifact.id).where(
+            AgentArtifact.session_id == session_id
+        )
+        # FK 顺序：versions 引用 draft revisions，先删版本再删 Revision。
+        await conn.execute(
+            delete(AgentArtifactVersion).where(
+                AgentArtifactVersion.artifact_id.in_(artifact_ids)
+            )
+        )
         await conn.execute(
             delete(ArtifactDraftRevision).where(
                 ArtifactDraftRevision.draft_id.in_(draft_ids)
@@ -2154,14 +2229,6 @@ async def _purge_committed_artifact_run(
         )
         await conn.execute(
             delete(ArtifactDraft).where(ArtifactDraft.session_id == session_id)
-        )
-        artifact_ids = select(AgentArtifact.id).where(
-            AgentArtifact.session_id == session_id
-        )
-        await conn.execute(
-            delete(AgentArtifactVersion).where(
-                AgentArtifactVersion.artifact_id.in_(artifact_ids)
-            )
         )
         await conn.execute(
             delete(AgentArtifact).where(AgentArtifact.session_id == session_id)
@@ -2192,7 +2259,10 @@ async def test_live_stream_completed_with_warnings_ends_stream() -> None:
             assert await repo.claim_lease(run_id, "worker", 300)
             run = await writer.get(AgentRun, run_id)
             assert run is not None
-            _, draft, _ = await ArtifactService(writer).create_or_get_draft(
+            # 混合场景（设计 §4.2）：一个 Draft 发布成功、另一个放弃 →
+            # completed_with_warnings（≥1 发布成功 + ≥1 失败项）。
+            artifact_service = ArtifactService(writer)
+            _, draft_ok, _ = await artifact_service.create_or_get_draft(
                 session_id=session_id,
                 user_id=user_id,
                 run_id=run_id,
@@ -2203,6 +2273,17 @@ async def test_live_stream_completed_with_warnings_ends_stream() -> None:
                 evidence_refs=None,
                 artifact_type="insight_board_v1",
             )
+            _, draft_bad, _ = await artifact_service.create_or_get_draft(
+                session_id=session_id,
+                user_id=user_id,
+                run_id=run_id,
+                module="insight",
+                business_fields={"parent_artifact_version_id": "pv-1", "question": "库迪"},
+                schema_version="insight_board_v1",
+                payload=insight_payload(title="库迪"),
+                evidence_refs=None,
+                artifact_type="insight_board_v1",
+            )
             await writer.commit()
             registry = ToolRegistry()
             registry.register(AbandonDraftTool(writer), category="artifact")
@@ -2210,11 +2291,16 @@ async def test_live_stream_completed_with_warnings_ends_stream() -> None:
                 writer,
                 gateway=FakeAgentGateway(
                     [
+                        PublishArtifacts(
+                            action="publish_artifacts",
+                            artifact_draft_ids=(draft_ok.id,),
+                            summary="发布",
+                        ),
                         CallTool(
                             action="call_tool",
                             internal_tool_name="abandon_draft",
                             arguments={
-                                "draft_id": draft.id,
+                                "draft_id": draft_bad.id,
                                 "reason_code": "unfixable",
                                 "reason": "无法修复",
                             },

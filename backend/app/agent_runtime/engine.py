@@ -20,9 +20,10 @@ GoalPolicy；模型决定一切业务流程。代码只保留能力边界、状�
   结果回喂，剩余 Draft 继续处理；
 - ``complete`` 有活动 Draft 闸门：本 Run 仍持有 Draft 时回喂结构化错误
   ``ACTIVE_DRAFTS_REMAIN`` 并继续循环，不得留下活动 Draft；
-- 终态聚合：任一 Artifact 存在未最终发布的失败/放弃记录 →
-  ``completed_with_warnings``（终态，租约/取消/暂停/executor 扫描一致
-  对待），否则 ``completed``；
+- 终态聚合（设计 §4.2）：至少一个产物发布成功且存在未最终发布的失败/放弃
+  记录 → ``completed_with_warnings``（终态，租约/取消/暂停/executor 扫描
+  一致对待）；零产物成功且存在失败/放弃项 → ``failed``
+  （``ALL_ARTIFACTS_FAILED``）；否则 ``completed``；
 - 历史 ``reviewing`` Run（部署前复核期间崩溃）进入引擎时直接收口 failed
   （``LEGACY_REVIEWING_UNSUPPORTED``），保留 Draft，不再启动 Reviewer；
   新执行不创建 Reviewer Run、不写 Review 表、不进入 reviewing。
@@ -845,13 +846,15 @@ class AgentEngine:
         return types, {pid for pid in published_ids if pid is not None}
 
     async def _handle_complete(self, run: AgentRun, action: Any) -> AgentMessage:
-        """complete：写 assistant 消息，按发布/失败项聚合终态。
+        """complete：写 assistant 消息，按发布/失败项聚合终态（设计 §4.2）。
 
         调用前主循环已过活动 Draft 闸门（本 Run 无持有 Draft）。
-        终态聚合：任一 Artifact 存在未最终发布的失败/放弃记录 →
-        ``completed_with_warnings``（终态），否则 ``completed``。
+        终态聚合：有产物发布成功且存在未最终发布的失败/放弃项 →
+        ``completed_with_warnings``；零产物成功且存在失败/放弃项 →
+        ``failed``（``error_code=ALL_ARTIFACTS_FAILED``，与其他失败路径共用
+        ``run.failed`` 终态事件通道）；无失败项 → ``completed``。
         §5.8 事件顺序：缺失的 artifact.published（崩溃窗口兜底）→
-        message.completed → run.completed / run.completed_with_warnings。
+        message.completed → run.completed / run.completed_with_warnings / run.failed。
         H1：Run 迁移与终态事件由 settle_terminal 同一加锁事务提交，
         消除"已终态无事件"窗口。
         """
@@ -867,8 +870,18 @@ class AgentEngine:
         await self._events.append(
             run.id, run.user_id, "message.completed", {"type": "completion"}
         )
-        warning_artifact_ids = await self._unpublished_failure_artifact_ids(run)
-        if warning_artifact_ids:
+        published_ids, warning_artifact_ids = await self._publish_outcome_artifact_ids(run)
+        if warning_artifact_ids and not published_ids:
+            # 零发布成功 + 有失败/放弃项：complete 交付为空，按失败收口。
+            run.error_code = "ALL_ARTIFACTS_FAILED"
+            await self._events.settle_terminal(
+                run.id,
+                run.user_id,
+                RunStatus.FAILED,
+                {"outcome": "failed", "error_code": "ALL_ARTIFACTS_FAILED"},
+                worker_id=self._worker_id,
+            )
+        elif warning_artifact_ids:
             await self._events.settle_terminal(
                 run.id,
                 run.user_id,
@@ -927,12 +940,12 @@ class AgentEngine:
             )
         )
 
-    async def _unpublished_failure_artifact_ids(self, run: AgentRun) -> set[str]:
-        """终态聚合：存在失败/放弃发布记录且最终未发布的 Artifact id 集合。
+    async def _publish_outcome_artifact_ids(self, run: AgentRun) -> tuple[set[str], set[str]]:
+        """终态聚合：``(已发布 artifact ids, 最终失败的 artifact ids)``。
 
-        同一 Artifact 先 validation_failed 后修订发布成功（存在 published
-        Attempt）不计 warning；幻觉/他人 draft_id 的 failed 结果不落
-        Attempt，不参与聚合。
+        最终失败 = 存在 validation_failed/failed Attempt 且无 published Attempt
+        （同一 Artifact 先 validation_failed 后修订发布成功不计 warning）；
+        幻觉/他人 draft_id 的 failed 结果不落 Attempt，不参与聚合。
         """
         attempts = (
             await self._db.scalars(
@@ -949,7 +962,7 @@ class AgentEngine:
         published = {
             attempt.artifact_id for attempt in attempts if attempt.status == "published"
         }
-        return failed - published
+        return published, failed - published
 
     # ------------------------------------------------------------------ #
     # 循环守卫
