@@ -74,6 +74,17 @@
 - **`test_real_providers.py::test_real_tencent_adapter_uses_confirmed_model`** 与本环境不符
   （断言 `deepseek-v4-pro`，`backend/.env` 为 `glm-5.2`）——历史遗留，非本次引入。
 
+### Gate 口径说明：DataTap 供应商 SLA 观察项（与产品代码 Gate 区分）
+
+- `kol_detail` 与趋势类端点（`social_statistic_trend` 等）在供应商侧的稳定性问题
+  （如外发 >150s 触发墙钟收口、供应商 5xx/超时）**单独列为供应商 SLA 观察项**，UAT
+  记录中以 `DATATAP_SLA` 字样标注（逐轮记录见 `docs/qa/agent-runtime-uat-rounds.md`），
+  **不计入产品代码 Gate 阻断项**——这类失败升级给 DataTap 渠道跟进，不阻塞 §2 的
+  切档判定；产品 bug（错误参数、契约违反、计费/证据错误）仍按 Gate 处理。
+- 产品侧策略不变：Agent 传输 150s 外发墙钟（`AGENT_MCP_CALL_TIMEOUT_SECONDS`）超时按
+  `result_unknown` 收口、保留 10 积分预留、Run 继续后续工具；**unknown 绝不自动重放**，
+  由恢复循环只读核对后幂等 settle/release。
+
 ---
 
 ## 2. 发布阻断条件（设计 §19）
@@ -131,7 +142,8 @@
 ## 5. 参考
 
 - 真实 UAT 记录与账本验证：`docs/qa/2026-08-02-agent-runtime-uat.md`（结构化结果
-  `outputs/agent-runtime-uat-results.json`，不提交 Git）。
+  `outputs/agent-runtime-uat-results.json`，不提交 Git）；逐轮历史追加记录
+  `docs/qa/agent-runtime-uat-rounds.md`（每轮 UAT 收尾自动追加，不覆盖）。
 - 运行/恢复/账务排查：`docs/runbooks/phase-2-runtime.md`。
 - 架构设计与 §19 发布阻断条件：`docs/superpowers/specs/2026-08-02-model-led-agent-runtime-design.md`。
 - 真实 UAT 复跑入口：`cd backend && ./scripts/run_real_agent_uat.sh`（Task 26 已执行，本次切档前须复跑）。

@@ -45,7 +45,7 @@ from app.agent_artifacts.lineage import (
     LineageOwner,
     validate_and_freeze_lineage,
 )
-from app.agent_artifacts.models import AgentArtifactVersion
+from app.agent_artifacts.models import AgentArtifact, AgentArtifactVersion
 from app.agent_runtime.circuit_breaker import FineGrainedCircuitBreaker
 from app.agent_runtime.engine import AgentEngine
 from app.agent_runtime.events import AgentEventBroker, AgentEventStream
@@ -70,11 +70,15 @@ from app.db.session import SessionFactory
 from app.identity.models import User, UserChannelPermission
 from app.model.contracts import ChatMessage
 from app.model.dependencies import get_model_adapter
+from app.mcp_gateway.contracts import DataTapService
 from app.mcp_gateway.datatap import DataTapTransport
 from app.mcp_gateway.service import get_agent_mcp_transport, refresh_approved_datatap_tools
 from app.mcp_gateway.transport import (
+    McpConnectionError,
+    McpConnectionTimeout,
     McpGatewayTimeout,
     McpTransport,
+    PossiblySentTimeout,
 )
 
 pytestmark = [
@@ -89,6 +93,11 @@ MCP_POINTS_COST = 10
 WORKER_ID = "uat-worker"
 RESULTS_DIR = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "..", "..", "outputs")
+)
+QA_ROUNDS_LOG = os.path.normpath(
+    os.path.join(
+        os.path.dirname(__file__), "..", "..", "..", "docs", "qa", "agent-runtime-uat-rounds.md"
+    )
 )
 
 
@@ -173,7 +182,15 @@ class ScenarioRecord:
 _ALL_RECORDS: list[ScenarioRecord] = []
 
 
-def _dump_results() -> None:
+def _dump_results(*, round_complete: bool = False) -> None:
+    """落盘本轮 UAT 结果。
+
+    - 每次都重写 ``outputs/agent-runtime-uat-results.json``（仅保留最新一轮，
+      供自动化分析消费）；
+    - ``round_complete=True``（pytest session 收尾时）把本轮全部 scenario 摘要
+      追加到 ``docs/qa/agent-runtime-uat-rounds.md``——追加不覆盖，逐轮保留
+      历史（K2：此前只有每轮覆盖的 JSON，多轮历史丢失）。
+    """
     if not _ALL_RECORDS:
         return
     os.makedirs(RESULTS_DIR, exist_ok=True)
@@ -189,6 +206,88 @@ def _dump_results() -> None:
     }
     with open(path, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
+    if round_complete:
+        _append_round_qa_log()
+
+
+def _calls_brief(record: ScenarioRecord) -> str:
+    if not record.calls:
+        return "无调用"
+    parts = []
+    for call in record.calls:
+        brief = f"{call.internal_tool_name}:{call.status}"
+        if call.error_type:
+            brief += f"/{call.error_type}"
+        if call.status == "settled":
+            brief += f"({call.points_settled}分)"
+        parts.append(brief)
+    return "；".join(parts)
+
+
+def _artifacts_brief(record: ScenarioRecord) -> str:
+    if not record.artifact_versions:
+        return "—"
+    parts = []
+    for version in record.artifact_versions:
+        brief = (
+            f"{version['schema_version']} v{version['version']} {version['data_status']}"
+        )
+        if version["lineage_ok"]:
+            brief += " lineage_ok"
+        else:
+            brief += f" lineage失败({version.get('lineage_error')})"
+        parts.append(brief)
+    return "；".join(parts)
+
+
+def _failures_brief(record: ScenarioRecord) -> str:
+    """失败阶段与错误码：未 settled 的调用 + limitations（供应商超时含 DATATAP_SLA 字样）。"""
+    notes = [
+        f"{call.internal_tool_name}:{call.status}/{call.error_type or '无错误码'}"
+        for call in record.calls
+        if call.status != "settled"
+    ]
+    notes.extend(record.limitations)
+    return "；".join(notes) if notes else "—"
+
+
+def _append_round_qa_log() -> None:
+    """把本轮（pytest session）scenario 摘要追加写入逐轮 QA 记录（不覆盖历史轮次）。"""
+    os.makedirs(os.path.dirname(QA_ROUNDS_LOG), exist_ok=True)
+    lines: list[str] = []
+    if not os.path.exists(QA_ROUNDS_LOG):
+        lines.extend(
+            [
+                "# Agent Runtime 真实 UAT 逐轮记录",
+                "",
+                "> 由 `backend/tests/integration/test_agent_runtime_real.py` 在每轮 UAT 的",
+                "> pytest session 收尾时自动追加（追加不覆盖）。结构化结果见",
+                "> `outputs/agent-runtime-uat-results.json`（每轮覆盖，仅保留最新一轮）。",
+                "",
+            ]
+        )
+    stamp = _utcnow().isoformat(timespec="seconds")
+    lines.append(f"## {stamp} · UAT 轮次")
+    lines.append("")
+    lines.append(
+        "- 环境："
+        f"APP_ENV={os.environ.get('APP_ENV')} / "
+        f"DB={os.environ.get('MYSQL_DATABASE')} / "
+        f"AUTH_MODE={os.environ.get('AUTH_MODE')}；场景数={len(_ALL_RECORDS)}"
+    )
+    lines.append("")
+    lines.append("| 场景 | 状态 | 决策数 | 积分前→后 | 参数摘要 | 调用 | Artifact | 失败阶段/错误码 |")
+    lines.append("|---|---|---|---|---|---|---|---|")
+    for record in _ALL_RECORDS:
+        lines.append(
+            f"| {record.scenario} | {record.status} | {record.decision_count} "
+            f"| {record.points_before}→{record.points_after} "
+            f"| {record.prompt_tag} | {_calls_brief(record)} "
+            f"| {_artifacts_brief(record)} | {_failures_brief(record)} |"
+        )
+    lines.append("")
+    with open(QA_ROUNDS_LOG, "a", encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + "\n")
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -202,6 +301,9 @@ async def _uat_catalog_ready() -> None:
     await _cleanup_uat_data()
     await refresh_approved_datatap_tools()
     yield
+    # 本轮 QA 逐轮记录必须在清理前落盘（记录全在内存，顺序其实无关，但保持
+    # 「先留痕、后清理」的直觉顺序）；追加写 docs/qa/agent-runtime-uat-rounds.md。
+    _dump_results(round_complete=True)
     await _cleanup_uat_data()
 
 
@@ -988,23 +1090,195 @@ async def test_uat_insight_drilldown_real() -> None:
 # --------------------------------------------------------------------------- #
 
 
+# kol_detail 工具（datatap.social.grow.kol.detail.v1）契约支持的平台取值。
+_KOL_DETAIL_PLATFORMS = frozenset({"xiaohongshu", "douyin", "weibo", "wechat", "bilibili"})
+
+
+@dataclass
+class _KolDetailTarget:
+    """kol_detail 真实 fetch 的输入目标（真实平台账号 ID，非昵称）。
+
+    DataTap kol_detail 契约要求 ``kwUidList`` 为真实平台账号 ID；此前场景硬编码
+    昵称「李佳琦Austin」当 uid 用，成败取决于供应商能否恰好解析昵称，不是有效
+    产品路径（K2 修复）。
+    """
+
+    platform: str
+    kol_uid: str
+    source: str  # "selection_v3"（名单归属绑定）/ "search_fallback"（降级取数）
+    user_id: str | None = None
+    session_id: str | None = None
+    selection_artifact_id: str | None = None
+    selection_version: str | None = None
+
+
+async def _find_selection_kol_target(db: AsyncSession) -> _KolDetailTarget | None:
+    """从 DB 最新发布的 kol_selection_v3 Version 取第一条可用达人的真实身份。
+
+    优先产品路径：用户在圈选名单上点「查看详情」。selection 归属校验（§6.4）
+    要求名单 Artifact 与详情请求同 Session，因此目标挂在名单所属 Session 上，
+    真实 fetch 复用该 Session 的 user（生产语义）。取最近 10 个已发布名单
+    Version 中第一条 platform 受 kol_detail 支持且 kol_uid 非空的 item；
+    builder 缺 kwUid 时会以昵称兜底，故优先 kol_uid ≠ nickname 的项。
+    """
+    version_ids = list(
+        (
+            await db.scalars(
+                select(AgentArtifactVersion.id)
+                .join(AgentArtifact, AgentArtifactVersion.artifact_id == AgentArtifact.id)
+                .where(AgentArtifact.artifact_type == "kol_selection_v3")
+                .order_by(AgentArtifactVersion.created_at.desc())
+                .limit(10)
+            )
+        ).all()
+    )
+    for version_id in version_ids:
+        version = await db.get(AgentArtifactVersion, version_id)
+        if version is None:
+            continue
+        items = ((version.payload_json or {}).get("data") or {}).get("items") or []
+        chosen: dict[str, Any] | None = None
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            platform = str(item.get("platform") or "")
+            kol_uid = str(item.get("kol_uid") or "")
+            if platform not in _KOL_DETAIL_PLATFORMS or not kol_uid:
+                continue
+            if kol_uid != str(item.get("nickname") or ""):
+                chosen = item
+                break
+            if chosen is None:
+                chosen = item
+        if chosen is None:
+            continue
+        artifact = await db.get(AgentArtifact, version.artifact_id)
+        if artifact is None:
+            continue
+        agent_session = await db.get(AgentSession, artifact.session_id)
+        if agent_session is None:
+            continue
+        return _KolDetailTarget(
+            platform=str(chosen["platform"]),
+            kol_uid=str(chosen["kol_uid"]),
+            source="selection_v3",
+            user_id=agent_session.user_id,
+            session_id=agent_session.id,
+            selection_artifact_id=artifact.id,
+            selection_version=str(version.version),
+        )
+    return None
+
+
+async def _search_fallback_kol_target() -> _KolDetailTarget:
+    """降级路径：DB 无可用名单时，直接驱动一次 kol_xiaohongshu_search 拿真实 uid。
+
+    成本评估（K2）：复用完整 ``_run_scenario("kol_selection")`` 需模型多轮决策 +
+    Reviewer + 多次 MCP 调用（分钟级、数十至上百积分）；本场景只需要一个真实
+    kwUid 作为 kol_detail 输入，单次 search 传输调用（秒级、一次供应商调用、
+    不经账本）即可满足，故选精简路径。供应商超时/错误一律 DATATAP_SLA 显式
+    FAIL，与产品 bug 区分。
+    """
+    transport = get_agent_mcp_transport()
+    try:
+        result = await transport.call_tool(
+            DataTapService.SOCIAL_GROW,
+            "datatap.xiaohongshu.kol.search.v1",
+            {"request": {"page": 1, "size": 5, "sumpostMin": 1, "textContentWord": "瑞幸咖啡"}},
+        )
+    except (
+        PossiblySentTimeout,
+        McpGatewayTimeout,
+        McpConnectionTimeout,
+        McpConnectionError,
+    ) as exc:
+        pytest.fail(
+            "DATATAP_SLA: 降级取数 kol_xiaohongshu_search 供应商超时/连接失败"
+            f"（{type(exc).__name__}: {exc}）——供应商侧问题，非产品 bug"
+        )
+    if result.is_error:
+        pytest.fail(
+            "DATATAP_SLA: 降级取数 kol_xiaohongshu_search 返回供应商错误："
+            f"{result.error_text}"
+        )
+    raw = (result.structured_content or {}).get("result")
+    payload: Any = None
+    if isinstance(raw, str):
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            payload = None
+    candidates = payload.get("KOL 列表") if isinstance(payload, dict) else None
+    if not isinstance(candidates, list):
+        pytest.fail("kol_detail 降级取数失败：kol_xiaohongshu_search 返回结构不含 KOL 列表")
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        uid = candidate.get("账号ID (kwUid)")
+        if isinstance(uid, str) and uid:
+            return _KolDetailTarget(
+                platform="xiaohongshu", kol_uid=uid, source="search_fallback"
+            )
+    pytest.fail("kol_detail 降级取数失败：kol_xiaohongshu_search 候选均无 kwUid")
+
+
+async def _ensure_channel_permission(db: AsyncSession, user_id: str, channel: str) -> None:
+    """复用名单场景用户时补齐目标平台渠道权限（kol_detail 工具按渠道授权可见）。"""
+    granted = await db.scalar(
+        select(func.count(UserChannelPermission.id)).where(
+            UserChannelPermission.user_id == user_id,
+            UserChannelPermission.channel == channel,
+            UserChannelPermission.is_enabled.is_(True),
+        )
+    )
+    if granted:
+        return
+    now = utc_now()
+    db.add(
+        UserChannelPermission(
+            id=str(uuid4()),
+            user_id=user_id,
+            channel=channel,
+            is_enabled=True,
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    await db.flush()
+
+
 async def test_uat_kol_detail_real_fetch() -> None:
     """真实 fetch 路径（Gate B §8.4.6）：缓存未命中 → kol_detail_v1 Run 真实抓取
     → 发布 kol_detail_v2 → 回填缓存；同会话再次请求必须命中缓存且零新增调用。
 
-    引擎与生产 kol-details 路由同一装配（``AgentToolRegistryFactory`` + Agent 传输 +
-    按用户真实渠道权限注入）。DataTap 无法解析该达人或 Run 未交付时，按卡点
-    显式 FAIL，不放宽为缓存合成路径。
+    真实 UID 来源（K2）：优先取本 pytest 会话（或更早轮次残留前已被清理，故
+    实际为本会话）已发布 kol_selection_v3 名单的第一条达人真实 platform +
+    kol_uid，并把 ``selection_artifact_id + selection_version`` 传入
+    ``KolDetailRunService.create`` 走归属校验与 parent 绑定；无名单（如
+    ``-k kol_detail_real_fetch`` 单跑）时降级为直接一次 kol_xiaohongshu_search
+    拿真实 uid（不做 selection 绑定）。引擎与生产 kol-details 路由同一装配
+    （``AgentToolRegistryFactory`` + Agent 传输 + 按用户真实渠道权限注入）。
+    DataTap 无法解析该达人或 Run 未交付时，带真实 uid 的错误码/阶段信息显式
+    FAIL；供应商超时标注 DATATAP_SLA，与产品 bug 区分。
     """
     from app.agent_runtime.kol_detail import KolDetailRunFailed, KolDetailRunService
 
-    platform, kol_uid = "xiaohongshu", "李佳琦Austin"
     db = SessionFactory()
     try:
         async with db as session:
-            user, agent_session, _wallet = await _new_user_session_wallet(
-                session, scenario="kol_detail_fetch", balance=1000
-            )
+            target = await _find_selection_kol_target(session)
+            if target is not None and target.user_id and target.session_id:
+                # 复用名单所属 user/session（selection 归属校验要求同 Session）。
+                user = await session.get(User, target.user_id)
+                agent_session = await session.get(AgentSession, target.session_id)
+                if user is None or agent_session is None:
+                    raise AssertionError("selection identity must exist")
+                await _ensure_channel_permission(session, user.id, target.platform)
+            else:
+                target = await _search_fallback_kol_target()
+                user, agent_session, _wallet = await _new_user_session_wallet(
+                    session, scenario="kol_detail_fetch", balance=1000
+                )
             await session.commit()  # 服务内部协调事务会自行提交，主体行先行持久化
             engine = _build_engine(
                 session,
@@ -1015,23 +1289,44 @@ async def test_uat_kol_detail_real_fetch() -> None:
             )
             service = KolDetailRunService(session, engine=engine, worker_id=WORKER_ID)
 
+            points_before = await _fresh_wallet_balance(session, user.id)
+            selection_note = (
+                f"，selection={target.selection_artifact_id} v{target.selection_version}"
+                if target.selection_artifact_id
+                else ""
+            )
             record = ScenarioRecord(
                 scenario="kol_detail_fetch",
-                prompt_tag=f"真实 fetch {platform}/{kol_uid}",
+                prompt_tag=(
+                    f"真实 fetch {target.platform}/{target.kol_uid}"
+                    f"（来源={target.source}{selection_note}）"
+                ),
                 profile="kol_detail_v1",
                 run_id="",
                 status="running",
                 decision_count=0,
-                points_before=1000,
-                points_after=1000,
+                points_before=points_before,
+                points_after=points_before,
                 user_id=user.id,
                 session_id=agent_session.id,
             )
+            if target.source == "search_fallback":
+                record.limitations.append(
+                    "DB 无已发布 kol_selection_v3 名单：kol_uid 来自降级 "
+                    "kol_xiaohongshu_search 单次取数，无 selection 归属绑定"
+                )
             _ALL_RECORDS.append(record)
             _dump_results()
 
             try:
-                summary = await service.create(user.id, agent_session.id, platform, kol_uid)
+                summary = await service.create(
+                    user.id,
+                    agent_session.id,
+                    target.platform,
+                    target.kol_uid,
+                    selection_artifact_id=target.selection_artifact_id,
+                    selection_version=target.selection_version,
+                )
             except KolDetailRunFailed as exc:
                 run_id = await session.scalar(
                     select(AgentRun.id)
@@ -1046,8 +1341,18 @@ async def test_uat_kol_detail_real_fetch() -> None:
                     await _collect_run_record(session, run_id, record)
                 record.points_after = await _fresh_wallet_balance(session, user.id)
                 await session.commit()
+                # 供应商超时（kol_detail 调用超时收口为 result_unknown、保留预留）
+                # 标注 DATATAP_SLA，与产品代码 bug 区分；其余按真实 uid 的失败
+                # 阶段与错误码显式 FAIL。
+                sla = any(
+                    call.internal_tool_name == "kol_detail" and call.status == "unknown"
+                    for call in record.calls
+                )
+                marker = "DATATAP_SLA: " if sla else ""
                 pytest.fail(
-                    f"kol_detail 真实 fetch 未交付 kol_detail_v2（{platform}/{kol_uid}）：{exc}"
+                    f"{marker}kol_detail 真实 fetch 未交付 kol_detail_v2"
+                    f"（{target.platform}/{target.kol_uid}，来源={target.source}）：{exc}；"
+                    f"调用={_calls_brief(record)}"
                 )
 
             run_row = await session.get(AgentRun, summary.run_id)
@@ -1082,7 +1387,14 @@ async def test_uat_kol_detail_real_fetch() -> None:
                     )
                 )
             )
-            second = await service.create(user.id, agent_session.id, platform, kol_uid)
+            second = await service.create(
+                user.id,
+                agent_session.id,
+                target.platform,
+                target.kol_uid,
+                selection_artifact_id=target.selection_artifact_id,
+                selection_version=target.selection_version,
+            )
             assert second.cached is True, "真实 fetch 后缓存未回填"
             assert second.detail is not None
             assert second.detail["data"]["cache"]["hit"] is True
