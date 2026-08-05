@@ -359,16 +359,16 @@ async def test_create_draft_tool_returns_structured_invalid_result(
     )
     registry = ToolRegistry()
     registry.register(CreateDraftTool(db_session), category="artifact")
-    # H2 起五类强类型 schema 直写在更前置的 typed_artifact_requires_builder
-    # 护栏被拦（见 tests/agent_runtime/tools/test_artifacts.py）；本用例用
-    # insight_board_v1 继续覆盖 ArtifactPayloadInvalid → 结构化回喂路径。
+    # H2/H5 起六类强类型 schema 直写都在更前置的 typed_artifact_requires_builder
+    # 护栏被拦（见 tests/agent_runtime/tools/test_artifacts.py）；本用例用未注册
+    # 的 module 继续覆盖 ArtifactPayloadInvalid → 结构化回喂路径。
     result = await registry.execute(
         internal_name="create_draft",
         arguments={
-            "module": "insight",
-            "schema_version": "insight_board_v1",
-            "artifact_type": "insight_board_v1",
-            "business_fields": {"parent_artifact_version_id": "pv-1", "question": "为什么"},
+            "module": "legacy_freeform",
+            "schema_version": "legacy_freeform_v1",
+            "artifact_type": "legacy_freeform_v1",
+            "business_fields": {},
             "payload": {"bogus": True},
             "evidence_refs": [],
         },
@@ -384,20 +384,44 @@ async def test_create_draft_tool_returns_structured_invalid_result(
 async def test_update_draft_tool_returns_structured_invalid_result(
     db_session, user_factory, session_factory, run_factory
 ) -> None:
-    user, session, run, service = await _setup(
+    user, session, run, _service = await _setup(
         db_session, user_factory, session_factory, run_factory
     )
-    _, draft, _ = await service.create_or_get_draft(
+    # H5 起 insight 等六类强类型 Draft 的 update_draft 直写被前置护栏拦截；
+    # 用未注册 module 的 ORM 行继续覆盖 ArtifactPayloadInvalid → 结构化回喂路径。
+    from datetime import UTC, datetime
+    from uuid import uuid4
+
+    now = datetime.now(UTC).replace(tzinfo=None)
+    artifact = AgentArtifact(
+        id=str(uuid4()),
         session_id=session.id,
         user_id=user.id,
-        run_id=run.id,
-        module="insight",
-        business_fields={"parent_artifact_version_id": "pv-1", "question": "为什么"},
-        schema_version="insight_board_v1",
-        payload=insight_payload(),
-        evidence_refs=[],
-        artifact_type="insight_board_v1",
+        module="legacy_freeform",
+        artifact_type="legacy_freeform_v1",
+        artifact_key=f"legacy-{uuid4()}",
+        status="draft",
+        latest_version=0,
+        activity_sequence=0,
+        created_at=now,
+        updated_at=now,
     )
+    db_session.add(artifact)
+    await db_session.flush()
+    draft = ArtifactDraft(
+        id=str(uuid4()),
+        artifact_id=artifact.id,
+        session_id=session.id,
+        owner_run_id=run.id,
+        current_revision=0,
+        status="drafting",
+        review_count=0,
+        revision_count=0,
+        updated_at=now,
+    )
+    db_session.add(draft)
+    await db_session.flush()
+
     tool = UpdateDraftTool(db_session)
     result = await tool.execute(
         ToolContext(

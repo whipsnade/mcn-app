@@ -5,10 +5,10 @@
 - history：``read_artifact`` / ``search_evidence`` / ``read_tool_result``；
 - calculation：``calculate_expression`` / ``aggregate_metrics`` /
   ``calculate_period_comparison`` / ``normalize_sentiment`` / ``rank_kols``；
-- artifact：``create_draft`` / ``update_draft`` 与五个 Builder 工具
+- artifact：``create_draft`` / ``update_draft`` 与六个 Builder 工具
   （``build_brand_report_draft`` / ``build_campaign_report_draft`` /
   ``build_kol_selection_draft`` / ``build_kol_analysis_draft`` /
-  ``build_kol_detail_draft``，v3 加固 §6.1）；
+  ``build_kol_detail_draft`` / ``build_insight_draft``，v3 加固 §6.1 + H5）；
 - MCP：目录中当前仍 approved、enabled 且签名未变的工具，且仅审核 allowlist
   （``DYNAMIC_TOOL_ALLOWLIST``）内的目录行才挂执行器（UAT 发现：实时网关以
   审核内部名暴露工具，remote_name 一律取内部名，见 main.py 原注释 /
@@ -36,6 +36,7 @@ from app.agent_runtime.tools.artifacts import CreateDraftTool, UpdateDraftTool
 from app.agent_runtime.tools.builders import (
     BuildBrandReportDraftTool,
     BuildCampaignReportDraftTool,
+    BuildInsightDraftTool,
     BuildKolAnalysisDraftTool,
     BuildKolDetailDraftTool,
     BuildKolSelectionDraftTool,
@@ -136,6 +137,7 @@ class AgentToolRegistryFactory:
         registry.register(BuildKolSelectionDraftTool(db), category=ARTIFACT_TOOLS)
         registry.register(BuildKolAnalysisDraftTool(db), category=ARTIFACT_TOOLS)
         registry.register(BuildKolDetailDraftTool(db), category=ARTIFACT_TOOLS)
+        registry.register(BuildInsightDraftTool(db), category=ARTIFACT_TOOLS)
         return registry
 
     async def _load_catalog(self, db: AsyncSession):

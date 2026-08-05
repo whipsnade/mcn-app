@@ -139,8 +139,8 @@ _TOOL_EVENT_BY_STATUS = {
 }
 
 # Draft 工具 → Run SSE 产物事件（§15.3/G1）：Draft 创建/更新接入统一 Run 事件流，
-# 前端据此驱动 artifactsVersion 增长刷新右侧 BI 与未读圆点。五个 Builder 工具
-# 与 create_draft 同为「建 Draft」语义（H2 起强类型 Artifact 只能走 Builder，
+# 前端据此驱动 artifactsVersion 增长刷新右侧 BI 与未读圆点。六个 Builder 工具
+# 与 create_draft 同为「建 Draft」语义（H2/H5 起强类型 Artifact 只能走 Builder，
 # 产物事件必须同样接入，否则前端丢失草稿就绪信号）。
 _DRAFT_EVENT_BY_TOOL = {
     "create_draft": "artifact.draft.created",
@@ -150,6 +150,7 @@ _DRAFT_EVENT_BY_TOOL = {
     "build_kol_selection_draft": "artifact.draft.created",
     "build_kol_analysis_draft": "artifact.draft.created",
     "build_kol_detail_draft": "artifact.draft.created",
+    "build_insight_draft": "artifact.draft.created",
 }
 
 

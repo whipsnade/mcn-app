@@ -224,7 +224,7 @@ async def test_kol_detail_profile_sees_only_allowlisted_mcp_tools(db_session) ->
     registry = AgentToolRegistryFactory().build(db_session)
     visible = await registry.visible_tools(kol_detail_profile)
     names = {entry.internal_name for entry in visible}
-    # kol_detail_v1 保留 Artifact Builder/发布能力（修复设计 §5.1）：五个
+    # kol_detail_v1 保留 Artifact Builder/发布能力（修复设计 §5.1）：六个
     # Builder 工具与 create/update_draft 同属 ARTIFACT_TOOLS 分类。
     builder_tools = {
         "build_brand_report_draft",
@@ -232,6 +232,7 @@ async def test_kol_detail_profile_sees_only_allowlisted_mcp_tools(db_session) ->
         "build_kol_selection_draft",
         "build_kol_analysis_draft",
         "build_kol_detail_draft",
+        "build_insight_draft",
     }
     assert names == {
         "kol_detail",

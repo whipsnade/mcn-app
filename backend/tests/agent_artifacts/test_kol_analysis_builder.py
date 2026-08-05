@@ -10,7 +10,8 @@ Builder 覆盖：
 
 Draft 工具覆盖（经 ToolRegistry，Task 7）：
 - create_draft / update_draft 注册为 ARTIFACT_TOOLS、零积分、external_side_effect；
-- create/update 调用经 ArtifactService 落 Draft，payload + evidence_refs 原样持久化。
+- H2/H5 强类型护栏：六类强类型（含 insight_board_v1）直写一律
+  typed_artifact_requires_builder 并回指对应 Builder。
 """
 
 from __future__ import annotations
@@ -26,7 +27,6 @@ from sqlalchemy import select
 
 from app.agent_artifacts.builders.common import DraftBuildError
 from app.agent_artifacts.builders.kol_analysis import build_kol_analysis_draft
-from app.agent_artifacts.keys import build_artifact_key
 from app.agent_artifacts.lineage import (
     ArtifactVersionRecord,
     EvidenceRecord,
@@ -695,9 +695,11 @@ def test_artifact_tools_registration_contract() -> None:
     assert {e.internal_name for e in registry.registered_tools} == {"create_draft", "update_draft"}
 
 
-async def test_create_and_update_draft_tools_persist_through_service(
+async def test_create_and_update_draft_tools_guard_insight_through_registry(
     db_session, user_factory, session_factory, run_factory,
 ) -> None:
+    """H5 起 insight_board_v1 也属强类型护栏：create/update_draft 直写经
+    ToolRegistry 一律 typed_artifact_requires_builder 并回指 build_insight_draft。"""
     user = await user_factory()
     session = await session_factory(user.id)
     run = await run_factory(session.id, user.id)
@@ -706,15 +708,6 @@ async def test_create_and_update_draft_tools_persist_through_service(
     registry.register(CreateDraftTool(db_session), category=ARTIFACT_TOOLS)
     registry.register(UpdateDraftTool(db_session), category=ARTIFACT_TOOLS)
 
-    payload_v1 = insight_payload(title="初稿")
-    evidence_refs = [
-        {
-            "artifact_path": "/data/0/title",
-            "sources": [{"source_type": "evidence", "evidence_id": "e-1", "source_path": "/0/x"}],
-            "derivation": None,
-        }
-    ]
-
     result = await registry.execute(
         internal_name="create_draft",
         arguments={
@@ -722,51 +715,41 @@ async def test_create_and_update_draft_tools_persist_through_service(
             "schema_version": "insight_board_v1",
             "artifact_type": "insight_board_v1",
             "business_fields": {"parent_artifact_version_id": "pv-1", "question": "为什么"},
-            "payload": payload_v1,
-            "evidence_refs": evidence_refs,
+            "payload": insight_payload(title="初稿"),
+            "evidence_refs": [],
         },
         user_id=user.id,
         session_id=session.id,
         run_id=run.id,
         profile=session_analyst,
     )
-    assert result.status == "success"
-    created = json.loads(result.safe_summary)
-    assert created["artifact_key"] == build_artifact_key(
-        "insight", parent_artifact_version_id="pv-1", question="为什么"
+    assert result.status == "failed"
+    assert result.error_type == "typed_artifact_requires_builder"
+    assert "build_insight_draft" in result.safe_summary
+
+    # update_draft 直写 insight Draft 同样被拦（经 ArtifactService 落的合法
+    # insight Draft 也不放行——修订一律重调 Builder）。
+    _, draft, _ = await ArtifactService(db_session).create_or_get_draft(
+        session_id=session.id,
+        user_id=user.id,
+        run_id=run.id,
+        module="insight",
+        business_fields={"parent_artifact_version_id": "pv-1", "question": "为什么"},
+        schema_version="insight_board_v1",
+        artifact_type="insight_board_v1",
+        payload=insight_payload(title="初稿"),
     )
-
-    rev = await db_session.get(ArtifactDraftRevision, created["revision_id"])
-    assert rev is not None
-    assert rev.payload_json == payload_v1
-    assert rev.evidence_refs_json == evidence_refs
-    assert rev.schema_version == "insight_board_v1"
-
-    # update_draft 追加不可变新 Revision。
-    payload_v2 = insight_payload(title="修订")
     updated = await registry.execute(
         internal_name="update_draft",
-        arguments={"draft_id": created["draft_id"], "payload": payload_v2, "evidence_refs": evidence_refs},
+        arguments={"draft_id": draft.id, "payload": insight_payload(title="修订")},
         user_id=user.id,
         session_id=session.id,
         run_id=run.id,
         profile=session_analyst,
     )
-    assert updated.status == "success"
-    upd = json.loads(updated.safe_summary)
-    assert upd["revision"] == 2
-    assert upd["current_revision"] == 2
-
-    rev2 = await db_session.get(ArtifactDraftRevision, upd["revision_id"])
-    assert rev2.payload_json == payload_v2
-    # 旧 Revision 不可变保留。
-    assert len(
-        (
-            await db_session.scalars(
-                select(ArtifactDraftRevision).where(ArtifactDraftRevision.draft_id == created["draft_id"])
-            )
-        ).all()
-    ) == 2
+    assert updated.status == "failed"
+    assert updated.error_type == "typed_artifact_requires_builder"
+    assert "build_insight_draft" in updated.safe_summary
 
 
 async def test_analysis_builder_writes_parent_binding(

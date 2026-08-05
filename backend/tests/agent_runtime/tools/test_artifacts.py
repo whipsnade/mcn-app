@@ -1,13 +1,13 @@
-"""create_draft / update_draft 强类型直写护栏（H2，第四轮 UAT 回归）。
+"""create_draft / update_draft 强类型直写护栏（H2 + H5，第四轮 UAT 回归）。
 
 第四轮 UAT 取证：kol_detail_v1 Run 用 ``create_draft`` 手写了一份形态错误的
-kol_detail_v2 payload，连续 3 次 ``artifact_payload_invalid`` 后放弃交付。
-设计 §6.1 明确五类强类型正式 Artifact（brand_report_v3 / campaign_report_v2 /
-kol_selection_v3 / kol_analysis_v2 / kol_detail_v2）必须走对应 ``build_*``
-Builder——直写在工具层直接拒绝并回指 Builder，不再让模型在手写 payload 上
-消耗重试。``insight_board_v1`` 不受影响（create_draft/update_draft 的唯一
-合法直写场景）；Builder 路径（含 create_or_get 再构建 = 追加新 Revision）
-不被护栏拦截。
+kol_detail_v2 payload，连续 3 次 ``artifact_payload_invalid`` 后放弃交付；
+开放式钻取场景模型手写 insight_board_v1 同样连续失败（字段级错误回喂也收敛
+不了）。设计 §6.1 明确六类强类型正式 Artifact（brand_report_v3 /
+campaign_report_v2 / kol_selection_v3 / kol_analysis_v2 / kol_detail_v2 /
+insight_board_v1）必须走对应 ``build_*`` Builder——直写在工具层直接拒绝并
+回指 Builder，不再让模型在手写 payload 上消耗重试。Builder 路径（含
+create_or_get 再构建 = 追加新 Revision）不被护栏拦截。
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ from tests.agent_runtime.tools.test_builders import (
 
 GUARD_ERROR_TYPE = "typed_artifact_requires_builder"
 
-# 五类强类型：module → (schema_version, business_fields, 应回指的 Builder 工具)。
+# 六类强类型：module → (schema_version, business_fields, 应回指的 Builder 工具)。
 _TYPED_CASES = (
     ("brand", "brand_report_v3", {"brand": "瑞幸咖啡"}, "build_brand_report_draft"),
     (
@@ -68,6 +68,12 @@ _TYPED_CASES = (
         {"platform": "xiaohongshu", "kol_uid": "kol-1"},
         "build_kol_detail_draft",
     ),
+    (
+        "insight",
+        "insight_board_v1",
+        {"parent_artifact_version_id": "pv-1", "question": "按平台钻取？"},
+        "build_insight_draft",
+    ),
 )
 
 _INSIGHT_BUSINESS_FIELDS = {"parent_artifact_version_id": "pv-1", "question": "按平台钻取？"}
@@ -81,7 +87,7 @@ _INSIGHT_BUSINESS_FIELDS = {"parent_artifact_version_id": "pv-1", "question": "�
 async def test_create_draft_rejects_typed_schemas(
     db_session, user_factory, module, schema_version, business_fields, builder_name
 ) -> None:
-    """五类强类型 schema 直写 create_draft：结构化拒绝并点名对应 Builder。"""
+    """六类强类型 schema 直写 create_draft：结构化拒绝并点名对应 Builder。"""
     user = await user_factory()
     session = await _make_session(db_session, user.id)
     run, step = await _make_run(db_session, session.id, user.id)
@@ -109,8 +115,8 @@ async def test_create_draft_rejects_typed_schemas(
     assert artifact_count == 0
 
 
-async def test_create_draft_allows_insight_board(db_session, user_factory) -> None:
-    """insight_board_v1 是 create_draft 的合法直写场景，不受护栏影响。"""
+async def test_create_draft_rejects_insight_board(db_session, user_factory) -> None:
+    """insight_board_v1 同样禁止裸写（H5）：护栏回指 build_insight_draft。"""
     user = await user_factory()
     session = await _make_session(db_session, user.id)
     run, step = await _make_run(db_session, session.id, user.id)
@@ -127,9 +133,10 @@ async def test_create_draft_allows_insight_board(db_session, user_factory) -> No
         ),
     )
 
-    assert result.status == "success", result.safe_summary
-    summary = json.loads(result.safe_summary)
-    assert summary["revision"] == 1
+    assert result.status == "failed"
+    assert result.error_type == GUARD_ERROR_TYPE
+    assert "build_insight_draft" in result.safe_summary
+    assert "insight_board_v1" in result.safe_summary
 
 
 @pytest.mark.parametrize(
@@ -140,7 +147,7 @@ async def test_create_draft_allows_insight_board(db_session, user_factory) -> No
 async def test_update_draft_rejects_typed_drafts(
     db_session, user_factory, module, schema_version, business_fields, builder_name
 ) -> None:
-    """五类 typed Draft 的 update_draft 直写同样被拦截（修订走 Builder 重建）。"""
+    """六类 typed Draft 的 update_draft 直写同样被拦截（修订走 Builder 重建）。"""
     user = await user_factory()
     session = await _make_session(db_session, user.id)
     run, step = await _make_run(db_session, session.id, user.id)
@@ -188,8 +195,8 @@ async def test_update_draft_rejects_typed_drafts(
     assert builder_name in result.safe_summary
 
 
-async def test_update_draft_allows_insight_board(db_session, user_factory) -> None:
-    """insight_board_v1 Draft 的受控修订（Reviewer 打回后）走 update_draft 正常。"""
+async def test_update_draft_rejects_insight_board(db_session, user_factory) -> None:
+    """insight_board_v1 Draft 的修订同样禁止裸写（H5）：护栏回指 build_insight_draft。"""
     user = await user_factory()
     session = await _make_session(db_session, user.id)
     run, step = await _make_run(db_session, session.id, user.id)
@@ -211,9 +218,9 @@ async def test_update_draft_allows_insight_board(db_session, user_factory) -> No
         UpdateDraftArgs(draft_id=draft.id, payload=insight_payload(title="钻取修订")),
     )
 
-    assert result.status == "success", result.safe_summary
-    summary = json.loads(result.safe_summary)
-    assert summary["current_revision"] == 2
+    assert result.status == "failed"
+    assert result.error_type == GUARD_ERROR_TYPE
+    assert "build_insight_draft" in result.safe_summary
 
 
 async def test_typed_draft_builder_rebuild_not_blocked(db_session, user_factory) -> None:

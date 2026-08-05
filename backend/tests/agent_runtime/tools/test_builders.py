@@ -65,6 +65,7 @@ BUILDER_TOOL_NAMES = {
     "build_kol_selection_draft",
     "build_kol_analysis_draft",
     "build_kol_detail_draft",
+    "build_insight_draft",
 }
 
 BRAND_SCOPE = {

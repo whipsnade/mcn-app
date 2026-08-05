@@ -84,16 +84,17 @@ def test_session_analyst_prompt_artifact_builder_guidance() -> None:
         "insight_board_v1",
     ):
         assert schema in text
-    # 正式四类的 Builder 工具名。
+    # 正式六类的 Builder 工具名（含 insight 钻取看板，H5）。
     for tool in (
         "build_brand_report_draft",
         "build_campaign_report_draft",
         "build_kol_selection_draft",
         "build_kol_analysis_draft",
+        "build_insight_draft",
     ):
         assert tool in text
     # 正式产物必须用 Builder，不手写整份 payload；create_draft/update_draft
-    # 仅用于 insight_board_v1 与受控修订。
+    # 不允许直写任何强类型正式 payload（含 insight_board_v1）。
     assert "create_draft" in text
     assert "update_draft" in text
     assert "不要手写" in text or "不得手写" in text

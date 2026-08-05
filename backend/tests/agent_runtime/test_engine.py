@@ -54,7 +54,8 @@ from app.agent_runtime.reviewer import ReviewDecision, ReviewIssue, ReviewerDriv
 from app.agent_runtime.schemas import AskUser, CallTool, Complete, SubmitReview
 from app.agent_runtime.state import InvalidRunTransition, RunStatus
 from app.agent_runtime.thinking import AgentEventThinkingSink
-from app.agent_runtime.tools.artifacts import CreateDraftTool, UpdateDraftTool
+from app.agent_runtime.tools.artifacts import UpdateDraftTool
+from app.agent_runtime.tools.builders import BuildInsightDraftTool
 from app.agent_runtime.tools.contracts import ToolResult
 from app.agent_runtime.tools.calculation import CalculateExpressionTool
 from app.agent_runtime.tools.mcp import AgentMcpTool
@@ -2396,35 +2397,55 @@ async def test_max_invalid_actions_emits_run_failed_with_error_code(
 # ---------------------------------------------------------------------------
 
 
-async def test_create_draft_tool_emits_artifact_draft_created_event(
+async def test_build_insight_draft_tool_emits_artifact_draft_created_event(
     db_session, user_factory
 ) -> None:
-    """create_draft 工具成功：tool 流程中发 artifact.draft.created（G1/P1）。
+    """build_insight_draft 工具成功：tool 流程中发 artifact.draft.created（G1/P1）。
 
-    payload 带 artifact_id/module/parent_artifact_id/status（§15.3），
+    H5 起 insight_board_v1 也只能走 Builder（create_draft 直写被护栏拒绝），
+    Builder 与 create_draft 同为「建 Draft」语义，产物事件同样接入统一 Run
+    事件流：payload 带 artifact_id/module/parent_artifact_id/status（§15.3），
     顺序在 tool.succeeded 之后、message.completed 之前。
     """
     run, attempt, _, _ = await _setup_run(db_session, user_factory)
+    # 父级：一个已发布的 insight Version（markdown 看板，无必需 lineage）。
+    _, parent_draft, parent_revision = await _make_draft(db_session, run)
+    parent_artifact = await db_session.get(AgentArtifact, parent_draft.artifact_id)
+    parent_version = AgentArtifactVersion(
+        id=str(uuid4()),
+        artifact_id=parent_artifact.id,
+        version=1,
+        source_run_id=run.id,
+        source_draft_revision_id=parent_revision.id,
+        schema_version=parent_revision.schema_version,
+        payload_json=parent_revision.payload_json,
+        evidence_refs_json=parent_revision.evidence_refs_json,
+        data_status=parent_revision.payload_json["data_status"],
+        created_at=utc_now(),
+    )
+    db_session.add(parent_version)
+    parent_artifact.latest_version = 1
+    parent_artifact.status = "published"
+    await db_session.flush()
+
     registry = ToolRegistry()
-    registry.register(CreateDraftTool(db_session), category="artifact")
+    registry.register(BuildInsightDraftTool(db_session), category="artifact")
     engine, _, _ = _make_engine(
         db_session,
         actions=[
             CallTool(
                 action="call_tool",
-                internal_tool_name="create_draft",
+                internal_tool_name="build_insight_draft",
                 arguments={
-                    "module": "insight",
-                    "schema_version": "insight_board_v1",
-                    "artifact_type": "insight_board_v1",
-                    "business_fields": {
-                        "parent_artifact_version_id": "pv-1",
-                        "question": "瑞幸",
-                    },
-                    "payload": PAYLOAD_V1,
-                    "evidence_refs": [],
+                    "parent_artifact_version_id": parent_version.id,
+                    "question": "为什么声量集中在小红书？",
+                    "title": "平台集中钻取",
+                    "scope": {"summary": "钻取平台集中度"},
+                    "blocks": [
+                        {"type": "markdown", "title": "结论", "content": "声量集中在小红书。"}
+                    ],
                 },
-                rationale="创建洞察 Draft",
+                rationale="创建钻取看板 Draft",
             ),
             Complete(action="complete", text="完成"),
         ],
@@ -2451,22 +2472,23 @@ async def test_create_draft_tool_emits_artifact_draft_created_event(
     assert types.index("artifact.draft.created") < types.index("message.completed")
     created = rows[types.index("artifact.draft.created")]
     artifact = await db_session.scalar(
-        select(AgentArtifact).where(AgentArtifact.session_id == run.session_id)
+        select(AgentArtifact).where(AgentArtifact.parent_artifact_id == parent_artifact.id)
     )
     assert artifact is not None
     payload = created.payload_json
     assert payload["artifact_id"] == artifact.id
     assert payload["module"] == "insight"
-    assert payload["parent_artifact_id"] is None
+    assert payload["parent_artifact_id"] == parent_artifact.id
     assert payload["status"] == "draft"
     assert payload["version"] == 1
     assert payload["run_id"] == run.id
 
 
-async def test_update_draft_tool_emits_artifact_draft_updated_event(
+async def test_update_draft_tool_guard_blocks_insight_direct_write(
     db_session, user_factory
 ) -> None:
-    """update_draft 工具成功：发 artifact.draft.updated，version 为新 revision（G1/P1）。"""
+    """update_draft 直写 insight Draft：H5 护栏拒绝（回指 build_insight_draft），
+    不发 artifact.draft.updated，Run 继续走完。"""
     run, attempt, _, _ = await _setup_run(db_session, user_factory)
     _, draft, _ = await _make_draft(db_session, run)
     registry = ToolRegistry()
@@ -2504,15 +2526,11 @@ async def test_update_draft_tool_emits_artifact_draft_updated_event(
         )
     ).all()
     types = [row.event_type for row in rows]
-    assert "artifact.draft.updated" in types
-    assert types.index("tool.succeeded") < types.index("artifact.draft.updated")
-    assert types.index("artifact.draft.updated") < types.index("message.completed")
-    updated = rows[types.index("artifact.draft.updated")]
-    payload = updated.payload_json
-    assert payload["artifact_id"] == draft.artifact_id
-    assert payload["module"] == "insight"
-    assert payload["status"] == "draft"
-    assert payload["version"] == 2
+    assert "tool.failed" in types
+    assert "artifact.draft.updated" not in types
+    # Draft 未被推进：仍是初稿 revision。
+    await db_session.refresh(draft)
+    assert draft.current_revision == 1
 
 
 async def test_approve_publish_emits_artifact_published_before_message_completed(

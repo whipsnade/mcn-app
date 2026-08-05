@@ -1,10 +1,12 @@
-"""Artifact Builder 工具（v3 加固 §3.3/§6.1，B2）。
+"""Artifact Builder 工具（v3 加固 §3.3/§6.1，B2；H5 增 insight）。
 
-五个 Builder 工具把「模型手写带 lineage 的大型正式 payload」替换为确定性
+六个 Builder 工具把「模型手写带 lineage 的大型正式 payload」替换为确定性
 转换：模型只提供用户确认的 scope、Evidence ID（按章节分组）与叙事字段；
 工具按 ID 读取当前 Session 的 Evidence（归属校验，跨 Session 一律
 ``evidence_not_found`` 不泄漏存在性）、调用 ``agent_artifacts.builders``
-的确定性 Builder、经 :class:`ArtifactService` 落 Draft。
+的确定性 Builder、经 :class:`ArtifactService` 落 Draft。insight 钻取看板
+（H5）更进一步：模型连数值都不填，只给板块结构与每个数字的 value_ref
+引用，工具解析引用并复制真实值后由 Builder 组装。
 
 输出契约（§6.1）：只回 ``artifact_id/draft_id/revision_id/schema_version``
 + 受限章节/limitation 摘要，**不把完整 payload 回灌模型上下文**——payload
@@ -36,16 +38,41 @@ from app.agent_artifacts.builders.campaign import (
 )
 from app.agent_artifacts.builders.campaign import build_campaign_report_draft
 from app.agent_artifacts.builders.common import DraftBuildError, DraftBuildResult
+from app.agent_artifacts.builders.insight import (
+    BarChartBlockSpec,
+    BlockSpec,
+    CalculationValueRef,
+    EvidenceValueRef,
+    LineChartBlockSpec,
+    MarkdownBlockSpec,
+    MetricGridBlockSpec,
+    PieChartBlockSpec,
+    ReferencesBlockSpec,
+    ResolvedBlock,
+    ResolvedLineage,
+    TableBlockSpec,
+    TableCellRef,
+    TimelineBlockSpec,
+    ValueRef,
+    build_insight_draft,
+)
 from app.agent_artifacts.builders.kol_analysis import build_kol_analysis_draft
 from app.agent_artifacts.builders.kol_detail import build_kol_detail_draft
 from app.agent_artifacts.builders.kol_selection import build_kol_selection_draft
 from app.agent_artifacts.builders.raw_rows import extract_rows, unwrap_payload
+from app.agent_artifacts.lineage import PointerError, resolve_pointer
 from app.agent_artifacts.models import AgentArtifact, AgentArtifactVersion
 from app.agent_artifacts.payloads.kol_analysis import KolAnalysisNarrative
 from app.agent_artifacts.payloads.kol_selection import KolSelectionNarrative
 from app.agent_artifacts.service import ArtifactBusy, ArtifactService
 from app.agent_artifacts.validation import ArtifactPayloadInvalid
-from app.agent_runtime.models import AgentSession, EvidenceItem
+from app.agent_runtime.models import (
+    AgentRun,
+    AgentSession,
+    AgentStep,
+    AgentToolCall,
+    EvidenceItem,
+)
 from app.agent_runtime.tools.artifacts import kol_detail_snapshot_selection_parent
 from app.agent_runtime.tools.contracts import (
     ToolContext,
@@ -646,11 +673,455 @@ class BuildKolDetailDraftTool(_BuilderToolBase):
         return await self._persist(context, result)
 
 
+# ---------------------------------------------------------------------------
+# build_insight_draft（H5：开放式钻取看板收口）
+# ---------------------------------------------------------------------------
+
+
+class BuildInsightDraftArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    parent_artifact_version_id: str = Field(min_length=1)
+    question: str = Field(min_length=1)
+    title: str = Field(min_length=1)
+    scope: dict[str, Any] = Field(default_factory=dict)
+    blocks: list[BlockSpec] = Field(min_length=1, max_length=50)
+    narrative: dict[str, Any] | None = None
+
+
+# 父 Artifact module → payload module（ArtifactPayloadBase 三值字面量）。
+_PAYLOAD_MODULE_BY_PARENT = {"brand": "brand", "campaign": "campaign"}
+
+
+class BuildInsightDraftTool(_BuilderToolBase):
+    """对已发布父 Version 构建钻取看板 Draft（insight_board_v1）。
+
+    与其他 Builder 的差别：模型连数值都不填——板块规格里每个数字都是
+    ``value_ref`` 引用（evidence / artifact / calculation 三来源），本工具
+    解析引用、复制真实值并做归属校验（跨 Session 一律拒绝），再由
+    ``builders.insight`` 确定性组装 payload 与数字级 lineage。
+    """
+
+    name = "build_insight_draft"
+    input_model = BuildInsightDraftArgs
+
+    description = (
+        "对已发布的父 Artifact Version 做一次开放式钻取，产出 insight_board_v1 "
+        "看板 Draft。你决定钻取问题、数据和图表结构；Builder 只做确定性组装"
+        "（取值、lineage、强类型校验）。parent_artifact_version_id 为当前会话"
+        "已发布 Version 的 id（brand/campaign/kol_selection/kol_analysis/"
+        "kol_detail/insight 均可作父级，可用 read_artifact 查到）；question 为"
+        "用户本轮钻取问题；title/scope 为看板标题与范围（scope 字段仅限 "
+        "summary/period{start,end,timezone}/platforms[]/brand/campaign/kol_uid）。"
+        "blocks 为板块规格数组（1-50 块，判别字段 type，共 8 种）：\n"
+        '1) {"type":"metric_grid","title":"...","cards":[{"key":"total_volume",'
+        '"label":"声量","value_ref":{...},"unit":"条"}]}（cards≤16，path 可选）；\n'
+        '2) {"type":"table","title":"...","columns":["平台","声量"],"rows":[["小红书",'
+        '{"value_ref":{...}}]]}（文本单元格直接给字符串，数值单元格必须是 '
+        '{"value_ref":{...}}，columns 不重复）；\n'
+        '3) {"type":"bar_chart","title":"...","categories":["小红书"],"series":'
+        '[{"name":"声量","values":[{...value_ref...}]}]}；\n'
+        '4) {"type":"line_chart","title":"...","x_labels":["2026-07-01"],"series":'
+        '[{"name":"声量","values":[{...value_ref...}]}]}；\n'
+        '5) {"type":"pie_chart","title":"...","slices":[{"name":"正面","value_ref":{...}}]}；\n'
+        '6) {"type":"markdown","title":"...","content":"...markdown 文本..."}；\n'
+        '7) {"type":"timeline","title":"...","items":[{"date":"2026-07-01","title":"上新",'
+        '"description":"可选"}]}；\n'
+        '8) {"type":"references","title":"...","items":[{"label":"原帖",'
+        '"url":"https://..."}]}。\n'
+        "数字纪律（硬性）：metric 值、series 数值、pie 值、table 数字单元格一律"
+        "用 value_ref 引用，不允许直接填写数值字面值；裸数字会被拒绝。value_ref "
+        "三选一：\n"
+        '- {"source_type":"evidence","evidence_id":"<本会话证据 id>",'
+        '"source_path":"/行/字段"}（RFC6901 指向证据 raw payload 内的字段）；\n'
+        '- {"source_type":"artifact","artifact_version_id":"<本会话已发布 Version id>",'
+        '"source_path":"/data/..."}（指向该 Version payload 内的字段）；\n'
+        '- {"source_type":"calculation","tool_call_id":"<已 settled 计算调用 id>",'
+        '"result_path":"/value","input_refs":[{"source_type":"evidence","evidence_id":"...",'
+        '"source_path":"/..."}]}（指向 calculate_expression 等内部计算工具的结果字段；'
+        "input_refs≥1，是该计算的输入来源，作为 lineage 基座）。\n"
+        "source_path/result_path 必须真实可解析，evidence/artifact/计算调用都必须属于"
+        "当前会话；引用失败返回 draft_build_error 并指明出错的板块位置（如 "
+        "blocks.0.cards.0），按明细修正后重试。narrative 可选（{summary, findings[]"
+        "{title,detail,supporting_paths[]}}，supporting_paths 指向 data 内真实路径，"
+        "如 data.0.cards.0.value；缺省时工具按 question 生成兜底叙事）。输出只含 "
+        "artifact_id/draft_id/revision_id/schema_version 与受限摘要；同一父 Version "
+        "上的同一 question 复用同一 Artifact，Reviewer 打回后重调本工具追加新 Revision。"
+    )
+
+    async def _execute(self, context: ToolContext, arguments: BaseModel) -> ToolResult:
+        args = BuildInsightDraftArgs.model_validate(arguments)
+        if self._db is None:
+            return _failed(DRAFT_BUILD_ERROR, "build_insight_draft requires a database session")
+        session_error = await self._check_session(context)
+        if session_error is not None:
+            return session_error
+
+        # 父 Version 归属校验：Version 行只在发布时产生（存在即已发布）；
+        # 不存在或跨 Session 一律 not_found，不泄漏存在性。
+        row = (
+            await self._db.execute(
+                select(AgentArtifactVersion, AgentArtifact)
+                .join(AgentArtifact, AgentArtifact.id == AgentArtifactVersion.artifact_id)
+                .where(AgentArtifactVersion.id == args.parent_artifact_version_id)
+            )
+        ).first()
+        if row is None:
+            return _failed(NOT_FOUND, "parent_artifact_version_not_found")
+        parent_version, parent_artifact = row
+        if parent_artifact.session_id != context.session_id:
+            return _failed(NOT_FOUND, "parent_artifact_version_not_found")
+
+        errors: list[str] = []
+        resolved_blocks: list[ResolvedBlock] = []
+        for index, spec in enumerate(args.blocks):
+            resolved_blocks.append(await self._resolve_block(context, index, spec, errors))
+        if errors:
+            return _failed(DRAFT_BUILD_ERROR, _truncate("; ".join(errors)))
+
+        try:
+            result = build_insight_draft(
+                question=args.question,
+                title=args.title,
+                module=_PAYLOAD_MODULE_BY_PARENT.get(parent_artifact.module, "kol"),
+                scope=args.scope,
+                parent_artifact_id=parent_artifact.id,
+                parent_artifact_version_id=parent_version.id,
+                blocks=resolved_blocks,
+                narrative=args.narrative,
+                source_names=("insight_evidence",),
+            )
+        except DraftBuildError as exc:
+            return _failed(DRAFT_BUILD_ERROR, _truncate(str(exc)))
+        return await self._persist(context, result)
+
+    # ------------------------------------------------------------------ 取值
+
+    async def _resolve_block(
+        self, context: ToolContext, index: int, spec: BlockSpec, errors: list[str]
+    ) -> ResolvedBlock:
+        """把板块规格解析为「已取值的 payload block + 数字级 lineage」。"""
+        where = f"blocks.{index}"
+        lineage: list[ResolvedLineage] = []
+
+        if isinstance(spec, MetricGridBlockSpec):
+            cards: list[dict[str, Any]] = []
+            for j, card in enumerate(spec.cards):
+                resolved = await self._resolve_ref(
+                    context, card.value_ref, f"{where}.cards.{j}.value_ref", False, errors
+                )
+                if resolved is None:
+                    continue
+                value, sources, derivation = resolved
+                entry: dict[str, Any] = {"key": card.key, "label": card.label, "value": value}
+                if card.unit is not None:
+                    entry["unit"] = card.unit
+                if card.path is not None:
+                    entry["path"] = card.path
+                cards.append(entry)
+                lineage.append(
+                    ResolvedLineage(f"/data/{index}/cards/{j}/value", sources, derivation)
+                )
+            block = {"block_type": "metric_grid", "title": spec.title, "cards": cards}
+
+        elif isinstance(spec, TableBlockSpec):
+            rows: list[list[Any]] = []
+            for r, row_cells in enumerate(spec.rows):
+                out_row: list[Any] = []
+                for c, cell in enumerate(row_cells):
+                    if isinstance(cell, str):
+                        out_row.append(cell)
+                        continue
+                    assert isinstance(cell, TableCellRef)
+                    resolved = await self._resolve_ref(
+                        context, cell.value_ref, f"{where}.rows.{r}.{c}", False, errors
+                    )
+                    if resolved is None:
+                        continue
+                    value, sources, derivation = resolved
+                    out_row.append(value)
+                    lineage.append(
+                        ResolvedLineage(f"/data/{index}/rows/{r}/{c}", sources, derivation)
+                    )
+                rows.append(out_row)
+            block = {
+                "block_type": "table",
+                "title": spec.title,
+                "columns": list(spec.columns),
+                "rows": rows,
+            }
+
+        elif isinstance(spec, (BarChartBlockSpec, LineChartBlockSpec)):
+            series: list[dict[str, Any]] = []
+            for s, series_spec in enumerate(spec.series):
+                values: list[Any] = []
+                for v, ref in enumerate(series_spec.values):
+                    resolved = await self._resolve_ref(
+                        context, ref, f"{where}.series.{s}.values.{v}", True, errors
+                    )
+                    if resolved is None:
+                        continue
+                    value, sources, derivation = resolved
+                    values.append(value)
+                    lineage.append(
+                        ResolvedLineage(
+                            f"/data/{index}/series/{s}/values/{v}", sources, derivation
+                        )
+                    )
+                series.append({"name": series_spec.name, "values": values})
+            if isinstance(spec, BarChartBlockSpec):
+                block = {
+                    "block_type": "bar_chart",
+                    "title": spec.title,
+                    "categories": list(spec.categories),
+                    "series": series,
+                }
+            else:
+                block = {
+                    "block_type": "line_chart",
+                    "title": spec.title,
+                    "x_labels": list(spec.x_labels),
+                    "series": series,
+                }
+
+        elif isinstance(spec, PieChartBlockSpec):
+            slices: list[dict[str, Any]] = []
+            for s, slice_spec in enumerate(spec.slices):
+                resolved = await self._resolve_ref(
+                    context, slice_spec.value_ref, f"{where}.slices.{s}.value_ref", True, errors
+                )
+                if resolved is None:
+                    continue
+                value, sources, derivation = resolved
+                slices.append({"name": slice_spec.name, "value": value})
+                lineage.append(
+                    ResolvedLineage(f"/data/{index}/slices/{s}/value", sources, derivation)
+                )
+            block = {"block_type": "pie_chart", "title": spec.title, "slices": slices}
+
+        elif isinstance(spec, MarkdownBlockSpec):
+            block = {"block_type": "markdown", "title": spec.title, "content": spec.content}
+
+        elif isinstance(spec, TimelineBlockSpec):
+            block = {
+                "block_type": "timeline",
+                "title": spec.title,
+                "items": [
+                    {
+                        "date": item.date.isoformat(),
+                        "title": item.title,
+                        "description": item.description,
+                    }
+                    for item in spec.items
+                ],
+            }
+
+        elif isinstance(spec, ReferencesBlockSpec):
+            block = {
+                "block_type": "references",
+                "title": spec.title,
+                "items": [{"label": item.label, "url": item.url} for item in spec.items],
+            }
+
+        else:  # pragma: no cover - 判别联合已穷尽 8 型
+            raise DraftBuildError(f"unsupported block spec: {type(spec).__name__}")
+
+        return ResolvedBlock(block=block, lineage=lineage)
+
+    async def _resolve_ref(
+        self,
+        context: ToolContext,
+        ref: ValueRef,
+        where: str,
+        expect_numeric: bool,
+        errors: list[str],
+    ) -> tuple[Any, list[dict[str, Any]], dict[str, Any] | None] | None:
+        """解析一个 value_ref：复制真实值并产出 lineage 来源/推导。
+
+        失败时向 ``errors`` 追加带板块位置的明细并返回 None（继续解析其余
+        引用，一次性回喂全部错误）。
+        """
+        if isinstance(ref, EvidenceValueRef):
+            resolved = await self._resolve_evidence_source(
+                context, ref.evidence_id, ref.source_path, where, errors
+            )
+            if resolved is None:
+                return None
+            value, source = resolved
+            sources = [source]
+            derivation = None
+        elif isinstance(ref, CalculationValueRef):
+            outcome = await self._resolve_calculation(context, ref, where, errors)
+            if outcome is None:
+                return None
+            value, sources, derivation = outcome
+        else:  # ArtifactValueRef
+            resolved = await self._resolve_artifact_source(
+                context, ref.artifact_version_id, ref.source_path, where, errors
+            )
+            if resolved is None:
+                return None
+            value, source = resolved
+            sources = [source]
+            derivation = None
+
+        if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+            errors.append(
+                f"{where}: resolved value must be a scalar (string/number), "
+                f"got {type(value).__name__}"
+            )
+            return None
+        if expect_numeric and not isinstance(value, (int, float)):
+            errors.append(
+                f"{where}: chart values must resolve to a number, got {value!r}"
+            )
+            return None
+        return value, sources, derivation
+
+    async def _resolve_evidence_source(
+        self, context: ToolContext, evidence_id: str, source_path: str, where: str, errors: list[str]
+    ) -> tuple[Any, dict[str, Any]] | None:
+        item = await self._load_evidence(context, evidence_id)
+        if isinstance(item, ToolResult):
+            errors.append(f"{where}: {item.safe_summary}")
+            return None
+        try:
+            value = resolve_pointer(item.raw_payload_json, source_path)
+        except PointerError as exc:
+            errors.append(f"{where}: {exc}")
+            return None
+        return value, {
+            "source_type": "evidence",
+            "evidence_id": item.id,
+            "source_path": source_path,
+        }
+
+    async def _resolve_artifact_source(
+        self,
+        context: ToolContext,
+        artifact_version_id: str,
+        source_path: str,
+        where: str,
+        errors: list[str],
+    ) -> tuple[Any, dict[str, Any]] | None:
+        row = (
+            await self._db.execute(
+                select(AgentArtifactVersion, AgentArtifact.session_id)
+                .join(AgentArtifact, AgentArtifact.id == AgentArtifactVersion.artifact_id)
+                .where(AgentArtifactVersion.id == artifact_version_id)
+            )
+        ).first()
+        if row is None:
+            errors.append(
+                f"{where}: artifact version not found in current session: "
+                f"{artifact_version_id!r}"
+            )
+            return None
+        version, session_id = row
+        if session_id != context.session_id:
+            errors.append(
+                f"{where}: artifact version not found in current session: "
+                f"{artifact_version_id!r}"
+            )
+            return None
+        try:
+            value = resolve_pointer(version.payload_json, source_path)
+        except PointerError as exc:
+            errors.append(f"{where}: {exc}")
+            return None
+        return value, {
+            "source_type": "artifact",
+            "artifact_version_id": artifact_version_id,
+            "source_path": source_path,
+        }
+
+    async def _resolve_calculation(
+        self, context: ToolContext, ref: CalculationValueRef, where: str, errors: list[str]
+    ) -> tuple[Any, list[dict[str, Any]], dict[str, Any]] | None:
+        """解析计算来源：已 settled 内部计算调用结果字段 + input_refs 基座。"""
+        row = (
+            await self._db.execute(
+                select(AgentToolCall, AgentRun.session_id, AgentStep.output_json)
+                .join(AgentRun, AgentRun.id == AgentToolCall.run_id)
+                .join(AgentStep, AgentStep.id == AgentToolCall.step_id)
+                .where(AgentToolCall.id == ref.tool_call_id)
+            )
+        ).first()
+        if row is None:
+            errors.append(
+                f"{where}: calculation tool call not found in current session: "
+                f"{ref.tool_call_id!r}"
+            )
+            return None
+        call, session_id, output_json = row
+        if session_id != context.session_id:
+            errors.append(
+                f"{where}: calculation tool call not found in current session: "
+                f"{ref.tool_call_id!r}"
+            )
+            return None
+        if call.status != "settled":
+            errors.append(
+                f"{where}: calculation tool call {ref.tool_call_id!r} status "
+                f"{call.status!r} is not settled"
+            )
+            return None
+        if call.service != "internal":
+            errors.append(
+                f"{where}: calculation tool call {ref.tool_call_id!r} service "
+                f"{call.service!r} is not internal"
+            )
+            return None
+        summary = output_json.get("safe_summary") if isinstance(output_json, dict) else None
+        try:
+            result_payload = json.loads(summary) if isinstance(summary, str) else None
+        except json.JSONDecodeError:
+            result_payload = None
+        if result_payload is None:
+            errors.append(
+                f"{where}: calculation tool call {ref.tool_call_id!r} result payload "
+                "unavailable"
+            )
+            return None
+        try:
+            value = resolve_pointer(result_payload, ref.result_path)
+        except PointerError as exc:
+            errors.append(f"{where}: {exc}")
+            return None
+
+        # input_refs 是 derivation 的输入基座：必须同属当前 Session 且可解析。
+        sources: list[dict[str, Any]] = []
+        for input_ref in ref.input_refs:
+            if isinstance(input_ref, EvidenceValueRef):
+                resolved = await self._resolve_evidence_source(
+                    context, input_ref.evidence_id, input_ref.source_path, where, errors
+                )
+            else:
+                resolved = await self._resolve_artifact_source(
+                    context,
+                    input_ref.artifact_version_id,
+                    input_ref.source_path,
+                    where,
+                    errors,
+                )
+            if resolved is None:
+                return None
+            sources.append(resolved[1])
+        derivation = {
+            "tool_call_id": call.id,
+            "method": call.internal_tool_name,
+            "input_paths": [input_ref.source_path for input_ref in ref.input_refs],
+        }
+        return value, sources, derivation
+
+
 __all__ = [
     "BuildBrandReportDraftArgs",
     "BuildBrandReportDraftTool",
     "BuildCampaignReportDraftArgs",
     "BuildCampaignReportDraftTool",
+    "BuildInsightDraftArgs",
+    "BuildInsightDraftTool",
     "BuildKolAnalysisDraftArgs",
     "BuildKolAnalysisDraftTool",
     "BuildKolDetailDraftArgs",

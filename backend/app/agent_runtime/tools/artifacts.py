@@ -6,12 +6,13 @@
 业务内容——payload / evidence_refs 由 builders 生成，Draft 身份由服务端
 ``build_artifact_key`` 稳定生成。
 
-强类型直写护栏（§6.1，H2）：五类强类型正式 Artifact（brand_report_v3 /
-campaign_report_v2 / kol_selection_v3 / kol_analysis_v2 / kol_detail_v2）
-不允许经 ``create_draft`` / ``update_draft`` 直写 payload——创建与修订一律
-走对应 ``build_*`` Builder（Builder 的 create_or_get 语义已覆盖「再构建即
-追加新 Revision」）。直写在工具层以 ``typed_artifact_requires_builder``
-结构化拒绝并回指 Builder；``insight_board_v1`` 不受限制。
+强类型直写护栏（§6.1，H2 + H5）：六类强类型正式 Artifact（brand_report_v3 /
+campaign_report_v2 / kol_selection_v3 / kol_analysis_v2 / kol_detail_v2 /
+insight_board_v1）不允许经 ``create_draft`` / ``update_draft`` 直写 payload——
+创建与修订一律走对应 ``build_*`` Builder（Builder 的 create_or_get 语义已覆盖
+「再构建即追加新 Revision」）。直写在工具层以 ``typed_artifact_requires_builder``
+结构化拒绝并回指 Builder；insight_board_v1 自 H5 起由 build_insight_draft
+收口（模型手写看板 payload 在 UAT 中连续失败）。
 """
 
 from __future__ import annotations
@@ -43,18 +44,19 @@ def _payload_error_summary(exc: ArtifactPayloadInvalid) -> str:
         parts.append(f"{loc}: {error.get('msg')} [{error.get('type')}]")
     return truncate_summary(f"{exc}; " + "; ".join(parts) if parts else str(exc))
 
-# 五类强类型正式 Artifact 的直写护栏：schema_version → 应使用的 Builder 工具名。
+# 六类强类型正式 Artifact 的直写护栏：schema_version → 应使用的 Builder 工具名。
 _TYPED_BUILDER_BY_SCHEMA: dict[str, str] = {
     "brand_report_v3": "build_brand_report_draft",
     "campaign_report_v2": "build_campaign_report_draft",
     "kol_selection_v3": "build_kol_selection_draft",
     "kol_analysis_v2": "build_kol_analysis_draft",
     "kol_detail_v2": "build_kol_detail_draft",
+    "insight_board_v1": "build_insight_draft",
 }
 
 
 def _typed_builder_guard(schema_version: str) -> ToolResult | None:
-    """schema_version 属于五类强类型时返回结构化拒绝（回指 Builder），否则 None。"""
+    """schema_version 属于六类强类型时返回结构化拒绝（回指 Builder），否则 None。"""
     builder = _TYPED_BUILDER_BY_SCHEMA.get(schema_version)
     if builder is None:
         return None
@@ -62,8 +64,8 @@ def _typed_builder_guard(schema_version: str) -> ToolResult | None:
         status="failed",
         safe_summary=(
             f"{schema_version} 是强类型正式 Artifact，不允许用 create_draft / "
-            f"update_draft 直写 payload；请改用 {builder}（提供 scope + evidence_id "
-            "+ narrative，由 Builder 完成确定性聚合、字段级 lineage 与强类型校验；"
+            f"update_draft 直写 payload；请改用 {builder}（按该工具描述提供结构化"
+            "输入，由 Builder 完成确定性组装、字段级 lineage 与强类型校验；"
             f"修订同样重新调用 {builder}，会在同一 Artifact 上追加新 Revision）。"
         ),
         error_type=TYPED_ARTIFACT_REQUIRES_BUILDER,
@@ -117,23 +119,20 @@ class CreateDraftTool:
     不能直接指定数据库 key（设计 §8.1）。子 Artifact（如 kol_analysis_v2）通过
     ``parent_artifact_version_id`` 固定到当时的父 Version。
 
-    强类型护栏（H2）：五类强类型正式 Artifact（brand/campaign/kol-selection/
-    kol-analysis/kol-detail）直写一律拒绝并回指对应 Builder，本工具实际只服务
-    ``insight_board_v1`` 的创建与受控修订。
+    强类型护栏（H2 + H5）：六类强类型正式 Artifact（brand/campaign/
+    kol-selection/kol-analysis/kol-detail/insight）直写一律拒绝并回指对应
+    Builder——全部正式产物都经 Builder 构建，本工具不再承接任何强类型 payload。
     """
 
     description = (
         "持久化一个 Artifact Draft（正式产物，提交后经 Reviewer 审核发布）。"
-        "限制：五类强类型正式 Artifact（brand_report_v3 / campaign_report_v2 / "
-        "kol_selection_v3 / kol_analysis_v2 / kol_detail_v2）不允许用本工具直写，"
-        "必须调用对应 build_* Builder 工具（brand→build_brand_report_draft、"
-        "campaign→build_campaign_report_draft、kol-selection→build_kol_selection_draft、"
-        "kol-analysis→build_kol_analysis_draft、kol-detail→build_kol_detail_draft），"
-        "直写会被拒绝并回指 Builder；本工具仅用于 insight_board_v1 洞察看板。"
-        "insight 的 business_fields=(parent_artifact_version_id, question)。"
-        "artifact_type 与 schema_version 相同。payload 必须满足对应 schema；"
-        "payload 中 data 下的每个业务数值都必须有一条 evidence_refs 条目（LineageRef："
-        "artifact_path 为 RFC6901 JSON Pointer，sources 指向当前会话 evidence_id 的字段）。"
+        "限制：六类强类型正式 Artifact（brand_report_v3 / campaign_report_v2 / "
+        "kol_selection_v3 / kol_analysis_v2 / kol_detail_v2 / insight_board_v1）"
+        "不允许用本工具直写，必须调用对应 build_* Builder 工具"
+        "（brand→build_brand_report_draft、campaign→build_campaign_report_draft、"
+        "kol-selection→build_kol_selection_draft、kol-analysis→build_kol_analysis_draft、"
+        "kol-detail→build_kol_detail_draft、insight→build_insight_draft），"
+        "直写会被拒绝并回指 Builder。"
     )
 
     name = "create_draft"
@@ -205,9 +204,9 @@ class UpdateDraftTool:
     只有 working head 当前 owner（当前 Run）才能更新；他人抢占返回结构化
     ``artifact_busy``，不覆盖、不静默丢写。
 
-    强类型护栏（H2）：目标 Draft 属于五类强类型正式 Artifact 时拒绝直写并
-    回指对应 Builder（修订 = 重新调用 Builder 追加新 Revision）；仅
-    ``insight_board_v1`` 允许本工具修订。
+    强类型护栏（H2 + H5）：目标 Draft 属于六类强类型正式 Artifact 时拒绝直写
+    并回指对应 Builder（修订 = 重新调用 Builder 追加新 Revision），含
+    ``insight_board_v1``（H5 起由 build_insight_draft 收口）。
     """
 
     name = "update_draft"
@@ -216,11 +215,11 @@ class UpdateDraftTool:
     external_side_effect = True
 
     description = (
-        "乐观更新 Draft：追加不可变新 Revision。限制：五类强类型正式 Artifact "
+        "乐观更新 Draft：追加不可变新 Revision。限制：六类强类型正式 Artifact "
         "（brand_report_v3 / campaign_report_v2 / kol_selection_v3 / "
-        "kol_analysis_v2 / kol_detail_v2）的 Draft 不允许用本工具直写修订，"
-        "修订需重新调用对应 build_* Builder（会在同一 Artifact 上追加新 Revision），"
-        "直写会被拒绝并回指 Builder；本工具仅用于 insight_board_v1 的受控修订。"
+        "kol_analysis_v2 / kol_detail_v2 / insight_board_v1）的 Draft 不允许用"
+        "本工具直写修订，修订需重新调用对应 build_* Builder（会在同一 Artifact "
+        "上追加新 Revision），直写会被拒绝并回指 Builder。"
     )
 
     def __init__(self, db_session: AsyncSession | None = None) -> None:
