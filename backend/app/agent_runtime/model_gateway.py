@@ -5,7 +5,9 @@
 
 - 思考流：只转发供应商实际暴露的 ``reasoning_content`` / ``<think>``，通过
   ``_GatedThinkingSink`` 延迟补发 ``started``，供应商无思考时后端不产生任何
-  ``thinking.*`` 事件（spec §10.5）；
+  ``thinking.*`` 事件（spec §10.5）；只有真实用户可见 sink 才走流式路径，
+  无 sink（Reviewer/Utility/内部 Run）直接走非流式，不暴露在流式故障面下，
+  思考审计由适配器 ``StructuredResult.thinking_text`` 回填；
 - 动作解析：把动作/输出 Schema（默认是 Task 5 的 ``AgentAction`` 判别联合）
   作为输出 Schema 交给适配器严格校验与修复，返回适配器已校验的 payload，
   网关不再重复解析；自定义输出 Schema 的 Profile（Reviewer/Utility）通过
@@ -179,8 +181,11 @@ class AgentModelGateway:
         decision_adapter: TypeAdapter[_DecisionT] | None = None,
     ) -> _DecisionT:
         full_messages = self._prepend_system_prompt(profile, messages)
-        # 总是带 gated sink：内部 Run 传 None 时仍走流式路径以捕获思考审计。
-        gated = _GatedThinkingSink(thinking_sink)
+        # 只有真实用户可见 sink 才走流式（thinking.* 事件只发给真实 sink）；
+        # Reviewer/Utility/内部 Run 无 sink，直接走非流式 complete_json——
+        # 不暴露在流式故障面下，思考审计改由 StructuredResult.thinking_text
+        # 回填（适配器从 <think> 内容解析，跨修复尝试累积）。
+        gated = _GatedThinkingSink(thinking_sink) if thinking_sink is not None else None
 
         # 1) 调用前先落 running Step（input_json = 发送给模型的消息）。
         step = AgentStep(
@@ -198,8 +203,9 @@ class AgentModelGateway:
         self._db.add(step)
         await self._db.flush()
 
-        # 2) 复用适配器流式调用：只转发供应商暴露的 thinking，JSON 修复与
-        #    Schema 严格校验都在适配器内。log_context 供 prompt 学习日志归属。
+        # 2) 复用适配器调用：有真实 sink 走流式（只转发供应商暴露的
+        #    thinking），无 sink 走非流式；JSON 修复与 Schema 严格校验都在
+        #    适配器内。log_context 供 prompt 学习日志归属。
         started = time.monotonic()
         request = StructuredModelRequest(
             purpose=purpose,
@@ -239,7 +245,9 @@ class AgentModelGateway:
             await self._mark_step_failed(step, started, gated)
             raise
 
-        # 4) 补齐 Step：输出、用量、请求 ID、脱敏 thinking。
+        # 4) 补齐 Step：输出、用量、请求 ID、脱敏 thinking。流式路径由 gated
+        #    sink delta 累积（含失败尝试的部分思考）；非流式路径由适配器从
+        #    <think> 内容解析后经 StructuredResult.thinking_text 回填。
         step.status = "completed"
         step.duration_ms = _elapsed_ms(started)
         step.output_json = _output_json(decision)
@@ -247,7 +255,9 @@ class AgentModelGateway:
             result.usage.model_dump() if result.usage is not None else None
         )
         step.model_request_id = result.request_id
-        step.thinking_text = self._finalize_thinking(gated)
+        step.thinking_text = self._finalize_thinking(
+            "".join(gated.parts) if gated is not None else result.thinking_text
+        )
         await self._db.flush()
         return decision
 
@@ -259,20 +269,21 @@ class AgentModelGateway:
         system_text = get_system_prompt(profile.system_prompt_key).text
         return [ChatMessage(role="system", content=system_text), *messages]
 
-    def _finalize_thinking(self, gated: _GatedThinkingSink) -> str | None:
-        if not gated.parts:
+    def _finalize_thinking(self, thinking: str | None) -> str | None:
+        if not thinking:
             return None
-        joined = "".join(gated.parts)
         # spec §10.5：与 Prompt 日志相同的密钥/token 脱敏，再截断到 64 KiB。
-        return self._sanitize_thinking(joined)[:MAX_THINKING_TEXT_CHARS]
+        return self._sanitize_thinking(thinking)[:MAX_THINKING_TEXT_CHARS]
 
     async def _mark_step_failed(
-        self, step: AgentStep, started: float, gated: _GatedThinkingSink
+        self, step: AgentStep, started: float, gated: _GatedThinkingSink | None
     ) -> None:
         step.status = "failed"
         step.duration_ms = _elapsed_ms(started)
         try:
-            step.thinking_text = self._finalize_thinking(gated)
+            step.thinking_text = self._finalize_thinking(
+                "".join(gated.parts) if gated is not None else None
+            )
             await self._db.flush()
         except Exception:
             logger.exception("failed to finalize failed agent step")

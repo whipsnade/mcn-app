@@ -1742,6 +1742,15 @@ def _stream_chunks(
     return stream()
 
 
+def _json_response(content: str) -> Any:
+    """非流式（无真实 thinking sink）响应。"""
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=content), finish_reason="stop")],
+        usage=None,
+        _request_id="req-non-stream",
+    )
+
+
 class _RecordingGateway:
     """记录 decide 入参后委托真实网关（回喂内容断言用）。"""
 
@@ -1787,9 +1796,9 @@ async def test_unrepairable_model_output_counted_and_run_recovers(
     writer = _CaptureLogWriter()
     client = _FakeCompletions(
         [
-            _stream_chunks(content_chunks=[_BROKEN_JSON], reasoning_chunks=[None]),
-            _stream_chunks(content_chunks=[_BROKEN_JSON], reasoning_chunks=[None]),
-            _stream_chunks(content_chunks=[_COMPLETE_JSON], reasoning_chunks=[None]),
+            _json_response(_BROKEN_JSON),
+            _json_response(_BROKEN_JSON),
+            _json_response(_COMPLETE_JSON),
         ]
     )
     engine, gateway = _make_engine_with_real_gateway(db_session, client, writer)
@@ -1820,10 +1829,7 @@ async def test_unrepairable_model_output_three_times_fails_run(
     run, attempt, _, _ = await _setup_run(db_session, user_factory)
     writer = _CaptureLogWriter()
     client = _FakeCompletions(
-        [
-            _stream_chunks(content_chunks=[_BROKEN_JSON], reasoning_chunks=[None])
-            for _ in range(MAX_INVALID_ACTIONS * 2)
-        ]
+        [_json_response(_BROKEN_JSON) for _ in range(MAX_INVALID_ACTIONS * 2)]
     )
     engine, gateway = _make_engine_with_real_gateway(db_session, client, writer)
     outcome = await engine.run(

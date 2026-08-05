@@ -98,6 +98,10 @@ class StructuredResult(BaseModel, Generic[T]):
     usage: TokenUsage | None
     request_id: str | None
     regeneration_count: int
+    # 供应商暴露的思考文本（reasoning_content / <think>），跨修复尝试累积；
+    # 无思考输出时为 None。供无 sink 的非流式决策写 Step 审计（agent_steps
+    # .thinking_text），流式路径由 ThinkingSink delta 累积，不读该字段。
+    thinking_text: str | None = None
 
 
 class ModelRequestMetadata(BaseModel):

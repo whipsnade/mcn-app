@@ -127,6 +127,21 @@ def stream_chunks(
     return stream()
 
 
+def json_response(content: str) -> Any:
+    """非流式（无真实 sink）响应：思考经 <think> 标签内联在 content 中。"""
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=content), finish_reason="stop")],
+        usage=SimpleNamespace(
+            prompt_tokens=3,
+            completion_tokens=2,
+            total_tokens=5,
+            prompt_tokens_details=None,
+            completion_tokens_details=None,
+        ),
+        _request_id="req-stream",
+    )
+
+
 async def _get_step(db_session, run_id: str) -> AgentStep | None:
     return await db_session.scalar(select(AgentStep).where(AgentStep.run_id == run_id))
 
@@ -244,9 +259,7 @@ async def test_decide_without_thinking_emits_no_thinking_events(
 async def test_decide_repairs_broken_json_tail(db_session, user_factory) -> None:
     run, attempt = await _create_run(db_session, user_factory)
     broken = '{"action":"complete","text":"it\'s a "great" day"}'
-    gateway = _make_gateway(
-        db_session, [stream_chunks(content_chunks=[broken], reasoning_chunks=[None])]
-    )
+    gateway = _make_gateway(db_session, [json_response(broken)])
 
     action = await gateway.decide(
         run=run,
@@ -270,10 +283,7 @@ async def test_decide_unrepairable_json_returns_invalid_model_output(
     truncated = '{"action":"complete","text":"unterminated'
     gateway = _make_gateway(
         db_session,
-        [
-            stream_chunks(content_chunks=[truncated], reasoning_chunks=[None]),
-            stream_chunks(content_chunks=[truncated], reasoning_chunks=[None]),
-        ],
+        [json_response(truncated), json_response(truncated)],
     )
 
     decision = await gateway.decide(
@@ -306,10 +316,7 @@ async def test_decide_unrepairable_json_custom_root_still_raises(
     truncated = '{"tag":"unterminated'
     gateway = _make_gateway(
         db_session,
-        [
-            stream_chunks(content_chunks=[truncated], reasoning_chunks=[None]),
-            stream_chunks(content_chunks=[truncated], reasoning_chunks=[None]),
-        ],
+        [json_response(truncated), json_response(truncated)],
     )
 
     with pytest.raises(ModelPlanInvalidError):
@@ -354,12 +361,7 @@ async def test_decide_persists_audit_step(db_session, user_factory) -> None:
     run, attempt = await _create_run(db_session, user_factory)
     gateway = _make_gateway(
         db_session,
-        [
-            stream_chunks(
-                content_chunks=[None, _COMPLETE],
-                reasoning_chunks=["分析品牌", None],
-            )
-        ],
+        [json_response(f"<think>分析品牌</think>{_COMPLETE}")],
     )
 
     action = await gateway.decide(
@@ -401,46 +403,24 @@ async def test_decide_step_transitions_running_to_completed(
     run, attempt = await _create_run(db_session, user_factory)
     release = asyncio.Event()
 
-    async def gated_stream() -> Any:
-        yield SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    delta=SimpleNamespace(content=None, reasoning_content="先想"),
-                    finish_reason=None,
-                )
-            ],
-            usage=None,
-            _request_id="req-stream",
-        )
-        await release.wait()
-        yield SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    delta=SimpleNamespace(content=_COMPLETE, reasoning_content=None),
-                    finish_reason=None,
-                )
-            ],
-            usage=None,
-            _request_id="req-stream",
-        )
-        yield SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    delta=SimpleNamespace(content=None, reasoning_content=None),
-                    finish_reason="stop",
-                )
-            ],
-            usage=SimpleNamespace(
-                prompt_tokens=3,
-                completion_tokens=2,
-                total_tokens=5,
-                prompt_tokens_details=None,
-                completion_tokens_details=None,
-            ),
-            _request_id="req-stream",
-        )
+    class _GatedCompletions:
+        """非流式 create 阻塞到 release：模拟长决策期间的 running 快照。"""
 
-    gateway = _make_gateway(db_session, [gated_stream()])
+        def __init__(self) -> None:
+            self.calls: list[dict[str, Any]] = []
+
+        async def create(self, **kwargs: Any) -> Any:
+            self.calls.append(kwargs)
+            await release.wait()
+            return json_response(_COMPLETE)
+
+    client = _GatedCompletions()
+    adapter = TencentPlanAdapter(
+        client=client,
+        log_writer=_CaptureWriter(),
+        stream_support_cache={},
+    )
+    gateway = AgentModelGateway(adapter, db=db_session)
     decision_task = asyncio.create_task(
         gateway.decide(
             run=run,
@@ -476,12 +456,7 @@ async def test_decide_truncates_thinking_text_to_64kib(db_session, user_factory)
     huge = "x" * 80_000
     gateway = _make_gateway(
         db_session,
-        [
-            stream_chunks(
-                content_chunks=[None, _COMPLETE],
-                reasoning_chunks=[huge, None],
-            )
-        ],
+        [json_response(f"<think>{huge}</think>{_COMPLETE}")],
     )
 
     await gateway.decide(
@@ -503,12 +478,7 @@ async def test_decide_sanitizes_thinking_text(db_session, user_factory) -> None:
     run, attempt = await _create_run(db_session, user_factory)
     gateway = _make_gateway(
         db_session,
-        [
-            stream_chunks(
-                content_chunks=[None, _COMPLETE],
-                reasoning_chunks=["secret sk-abc123def456", None],
-            )
-        ],
+        [json_response(f"<think>secret sk-abc123def456</think>{_COMPLETE}")],
     )
 
     await gateway.decide(
@@ -529,12 +499,7 @@ async def test_decide_uses_injected_sanitizer(db_session, user_factory) -> None:
     run, attempt = await _create_run(db_session, user_factory)
     adapter = TencentPlanAdapter(
         client=FakeCompletions(
-            [
-                stream_chunks(
-                    content_chunks=[None, _COMPLETE],
-                    reasoning_chunks=["敏感内容", None],
-                )
-            ]
+            [json_response(f"<think>敏感内容</think>{_COMPLETE}")]
         ),
         log_writer=_CaptureWriter(),
         stream_support_cache={},
@@ -563,12 +528,7 @@ async def test_decide_internal_run_audits_thinking_as_internal(
     run, attempt = await _create_run(db_session, user_factory, visibility="internal")
     gateway = _make_gateway(
         db_session,
-        [
-            stream_chunks(
-                content_chunks=[None, _COMPLETE],
-                reasoning_chunks=["内部思考", None],
-            )
-        ],
+        [json_response(f"<think>内部思考</think>{_COMPLETE}")],
     )
     # 内部 Run 不产生用户可见思考事件：调用方不传 thinking_sink，
     # 思考仍落库到 internal Step 审计。
@@ -593,7 +553,7 @@ async def test_decide_user_run_marks_step_user_visibility(
     run, attempt = await _create_run(db_session, user_factory, visibility="user")
     gateway = _make_gateway(
         db_session,
-        [stream_chunks(content_chunks=[_COMPLETE], reasoning_chunks=[None])],
+        [json_response(_COMPLETE)],
     )
 
     await gateway.decide(
@@ -622,7 +582,7 @@ async def test_decide_accepts_custom_decision_root_and_adapter(
     run, attempt = await _create_run(db_session, user_factory)
     gateway = _make_gateway(
         db_session,
-        [stream_chunks(content_chunks=['{"tag":"hello"}'], reasoning_chunks=[None])],
+        [json_response('{"tag":"hello"}')],
     )
 
     decision = await gateway.decide(
@@ -647,9 +607,7 @@ async def test_decide_passes_log_context_to_prompt_log(db_session, user_factory)
     run, attempt = await _create_run(db_session, user_factory)
     writer = _CaptureWriter()
     adapter = TencentPlanAdapter(
-        client=FakeCompletions(
-            [stream_chunks(content_chunks=[_COMPLETE], reasoning_chunks=[None])]
-        ),
+        client=FakeCompletions([json_response(_COMPLETE)]),
         log_writer=writer,
         stream_support_cache={},
     )
@@ -669,3 +627,66 @@ async def test_decide_passes_log_context_to_prompt_log(db_session, user_factory)
     assert entry.user_id == run.user_id
     assert entry.session_id == run.session_id
     assert entry.task_id == run.id
+
+
+async def test_decide_without_sink_uses_non_stream_path(db_session, user_factory) -> None:
+    """无真实用户可见 sink（Reviewer/Utility/内部 Run）：直接走非流式，
+    不暴露在流式故障面下；思考审计由 StructuredResult.thinking_text 回填。"""
+    run, attempt = await _create_run(db_session, user_factory)
+    client = FakeCompletions([json_response(f"<think>内部推理</think>{_COMPLETE}")])
+    adapter = TencentPlanAdapter(
+        client=client,
+        log_writer=_CaptureWriter(),
+        stream_support_cache={},
+    )
+    gateway = AgentModelGateway(adapter, db=db_session)
+
+    action = await gateway.decide(
+        run=run,
+        attempt_id=attempt.id,
+        profile=_PROFILE,
+        messages=[ChatMessage(role="user", content="hi")],
+        thinking_sink=None,
+        step_sequence=1,
+    )
+
+    assert action.action == "complete"
+    assert [call["stream"] for call in client.calls] == [False]
+    step = await _get_step(db_session, run.id)
+    assert step is not None
+    assert step.status == "completed"
+    assert step.thinking_text == "内部推理"
+
+
+async def test_decide_with_sink_uses_streaming_path(db_session, user_factory) -> None:
+    """有真实用户可见 sink：走流式路径并转发 thinking 事件。"""
+    run, attempt = await _create_run(db_session, user_factory)
+    sink = CaptureThinkingSink()
+    client = FakeCompletions(
+        [
+            stream_chunks(
+                content_chunks=[None, _COMPLETE],
+                reasoning_chunks=["逐步分析", None],
+            )
+        ]
+    )
+    adapter = TencentPlanAdapter(
+        client=client,
+        log_writer=_CaptureWriter(),
+        stream_support_cache={},
+    )
+    gateway = AgentModelGateway(adapter, db=db_session)
+
+    action = await gateway.decide(
+        run=run,
+        attempt_id=attempt.id,
+        profile=_PROFILE,
+        messages=[ChatMessage(role="user", content="hi")],
+        thinking_sink=sink,
+        step_sequence=1,
+    )
+
+    assert action.action == "complete"
+    assert [call["stream"] for call in client.calls] == [True]
+    assert sink.deltas == [(1, "逐步分析")]
+    assert sink.terminal == ("completed", 1)

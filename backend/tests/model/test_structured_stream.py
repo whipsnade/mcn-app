@@ -95,6 +95,10 @@ class FakeCompletions:
         return outcome
 
 
+async def _no_backoff(_: float) -> None:
+    return None
+
+
 class _StreamUnsupportedError(Exception):
     status_code = 400
     body = {"error": {"message": "stream is not supported", "param": "stream"}}
@@ -378,18 +382,28 @@ async def test_complete_json_retries_provider_generation_abort_mid_stream() -> N
 
 
 @pytest.mark.asyncio
-async def test_complete_json_stream_interrupt_after_visible_output_does_not_replay() -> None:
+async def test_complete_json_stream_interrupt_retries_within_budget_then_fails() -> None:
+    """流结束无 finish_reason：预算内整体重试，预算耗尽才明确失败。"""
     sink = CaptureThinkingSink()
     client = FakeCompletions(
-        [stream_chunks(content_chunks=["<think>分析"], reasoning_chunks=[None], finished=False)]
+        [
+            stream_chunks(content_chunks=["<think>分析"], reasoning_chunks=[None], finished=False)
+            for _ in range(3)
+        ]
     )
-    adapter = TencentPlanAdapter(client=client, log_writer=_CaptureWriter(), stream_support_cache={})
+    adapter = TencentPlanAdapter(
+        client=client,
+        log_writer=_CaptureWriter(),
+        stream_support_cache={},
+        sleep=_no_backoff,
+    )
 
     with pytest.raises(Exception, match="MODEL_STREAM_INTERRUPTED"):
         await adapter.complete_json(_request(thinking_sink=sink))
 
-    assert len(client.calls) == 1
-    assert sink.deltas == [(1, "分析")]
+    assert len(client.calls) == 3
+    # 整体重试会重放该次尝试的部分思考 delta（与生成中止重试一致的取舍）。
+    assert sink.deltas == [(1, "分析"), (1, "分析"), (1, "分析")]
     assert sink.terminal == ("failed", 1)
 
 

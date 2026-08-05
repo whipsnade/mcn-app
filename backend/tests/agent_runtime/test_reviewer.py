@@ -79,44 +79,19 @@ def utc_now() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
 
 
-def stream_chunks(*, content_chunks: list[str | None], reasoning_chunks: list[str | None]) -> Any:
-    chunks = [
-        SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    delta=SimpleNamespace(content=content, reasoning_content=reasoning),
-                    finish_reason=None,
-                )
-            ],
-            usage=None,
-            _request_id="req-review",
-        )
-        for content, reasoning in zip(content_chunks, reasoning_chunks, strict=True)
-    ]
-    chunks.append(
-        SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    delta=SimpleNamespace(content=None, reasoning_content=None),
-                    finish_reason="stop",
-                )
-            ],
-            usage=SimpleNamespace(
-                prompt_tokens=3,
-                completion_tokens=2,
-                total_tokens=5,
-                prompt_tokens_details=None,
-                completion_tokens_details=None,
-            ),
-            _request_id="req-review",
-        )
+def json_response(content: str) -> Any:
+    """Reviewer 决策走非流式（无真实 thinking sink）：思考经 <think> 内联。"""
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=content), finish_reason="stop")],
+        usage=SimpleNamespace(
+            prompt_tokens=3,
+            completion_tokens=2,
+            total_tokens=5,
+            prompt_tokens_details=None,
+            completion_tokens_details=None,
+        ),
+        _request_id="req-review",
     )
-
-    async def stream() -> Any:
-        for chunk in chunks:
-            yield chunk
-
-    return stream()
 
 
 class FakeCompletions:
@@ -138,9 +113,7 @@ class _CaptureWriter:
 
 
 def _make_gateway(db_session, decision_jsons: list[str]) -> tuple[AgentModelGateway, FakeCompletions]:
-    client = FakeCompletions(
-        [stream_chunks(content_chunks=[j], reasoning_chunks=[None]) for j in decision_jsons]
-    )
+    client = FakeCompletions([json_response(j) for j in decision_jsons])
     adapter = TencentPlanAdapter(
         client=client,
         log_writer=_CaptureWriter(),

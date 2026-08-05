@@ -39,6 +39,13 @@ class Settings(BaseSettings):
     # provider can take longer than the default HTTP timeout to produce a
     # valid structured plan, so keep this configurable but use a safe default.
     model_timeout_seconds: float = Field(default=180.0, gt=0)
+    # 单次模型决策的整次墙钟上限（每次 create 尝试，含整个流消费）：
+    # model_timeout_seconds 是 httpx 读/写/连接级超时，流持续 trickle 时永不触发，
+    # 一次决策可能长期挂死（UAT 中决策挂 3 分钟+）。该墙钟超时即取消本次尝试、
+    # 按可重试 MODEL_TIMEOUT 在重试预算内重试。与 Run 租约（AGENT_LEASE_SECONDS
+    # 300s、心跳每 lease/3 续租）的关系：决策有上界后心跳不再因单决策挂死而丢失，
+    # 默认值 240s 须保持小于租约时长，使单次尝试在租约周期内必然收口。
+    model_decision_timeout_seconds: float = Field(default=240.0, gt=0)
     datatap_mcp_token: SecretStr
     # DataTap 查询级读取超时：统计类查询通常一分钟内返回，超时按失败释放积分。
     datatap_read_timeout_seconds: float = Field(default=60.0, gt=0)
