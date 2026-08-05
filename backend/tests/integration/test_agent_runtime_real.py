@@ -300,12 +300,20 @@ _UAT_CLEANUP_STATEMENTS = (
 
 
 async def _cleanup_uat_data() -> None:
-    """清除 UAT 场景提交落库的 ``uat-*`` 用户全链数据（真实提交，子表先行）。"""
+    """清除 UAT 场景提交落库的 ``uat-*`` 用户全链数据（真实提交，子表先行）。
+
+    ``agent_artifact_versions.source_draft_revision_id`` 与
+    ``artifact_draft_revisions.parent_artifact_version_id`` 互为外键（循环引用），
+    任何删除顺序都无法同时满足两侧约束——测试库为一次性专用库，清理期间
+    临时关闭 FK 检查（仅限本会话），清完立即恢复。
+    """
     db = SessionFactory()
     try:
         async with db as session:
+            await session.execute(text("SET SESSION FOREIGN_KEY_CHECKS=0"))
             for statement in _UAT_CLEANUP_STATEMENTS:
                 await session.execute(text(statement))
+            await session.execute(text("SET SESSION FOREIGN_KEY_CHECKS=1"))
             await session.commit()
     finally:
         await db.close()
