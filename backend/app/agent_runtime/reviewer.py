@@ -52,7 +52,7 @@ from app.agent_runtime.model_gateway import AgentModelGateway
 from app.agent_runtime.models import AgentRun
 from app.agent_runtime.profiles import get_profile
 from app.agent_runtime.repository import AgentRunRepository
-from app.model.contracts import ChatMessage
+from app.model.contracts import ChatMessage, ModelPlanInvalidError
 
 # 单个 Item 最多三次 Reviewer 调用（§12.3：最多两次 revise）。
 MAX_REVIEW_ATTEMPTS = 3
@@ -315,17 +315,33 @@ class ReviewerDriver:
         context = await self._build_context(parent_run, current_rev, user_question)
         review_run.prompt_snapshot_json = context
 
-        decision = await self.gateway.decide(
-            run=review_run,
-            attempt_id=review_attempt.id,
-            profile=get_profile("artifact_reviewer_v1"),
-            messages=[ChatMessage(role="user", content=json.dumps(context, ensure_ascii=False))],
-            thinking_sink=None,
-            step_sequence=1,
-            purpose="artifact_reviewer",
-            template_name="artifact_reviewer_v1",
-            decision_root=REVIEW_DECISION_ROOT,
-        )
+        # 瞬时生成失败（如推理模型在大上下文复核时输出不可解析）在适配器
+        # 内部重生成之外再做有限整体重试：不占用复核次数额度（§12.3 的
+        # 三次上限针对真实复核结论，不含模型输出失败）。step_sequence 逐次
+        # 递增以维持 (run_id, sequence) 唯一。
+        decision = None
+        last_invalid: ModelPlanInvalidError | None = None
+        for retry_index in range(3):
+            try:
+                decision = await self.gateway.decide(
+                    run=review_run,
+                    attempt_id=review_attempt.id,
+                    profile=get_profile("artifact_reviewer_v1"),
+                    messages=[
+                        ChatMessage(role="user", content=json.dumps(context, ensure_ascii=False))
+                    ],
+                    thinking_sink=None,
+                    step_sequence=1 + retry_index,
+                    purpose="artifact_reviewer",
+                    template_name="artifact_reviewer_v1",
+                    decision_root=REVIEW_DECISION_ROOT,
+                )
+                break
+            except ModelPlanInvalidError as exc:
+                last_invalid = exc
+                continue
+        if decision is None:
+            raise last_invalid  # type: ignore[misc]
 
         # 内部子 Run 收口（一次性调用，不参与用户可见状态机）。
         review_run.status = "completed"
