@@ -1,10 +1,14 @@
-"""Artifact Draft 工具（设计 §12.3 / Task 16）。
+"""Artifact Draft 工具（设计 §12.3 / Task 16；直接发布改造 Task 3）。
 
 ``create_draft`` / ``update_draft`` 通过 :class:`ArtifactService`（Task 12）
 持久化模型产物（builder 输出）生成的强类型 Draft：零积分、``external_side_effect``
 为 True、注册进 ToolRegistry 的 ``ARTIFACT_TOOLS`` 分类。工具只持久化，不决定
 业务内容——payload / evidence_refs 由 builders 生成，Draft 身份由服务端
-``build_artifact_key`` 稳定生成。
+``build_artifact_key`` 稳定生成。``abandon_draft``（Task 3 起）让 owner Run
+放弃无法修复的未发布 Draft：Draft 置 failed、结构化原因落
+``ArtifactPublishAttempt(status="failed")`` 并追加 ``failed`` 事件；
+发布本身不走工具，由 ``publish_artifacts`` 动作经
+``ArtifactPublicationService`` 确定性发布（无模型 Reviewer）。
 
 强类型直写护栏（§6.1，H2 + H5）：六类强类型正式 Artifact（brand_report_v3 /
 campaign_report_v2 / kol_selection_v3 / kol_analysis_v2 / kol_detail_v2 /
@@ -24,6 +28,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_artifacts.models import AgentArtifact, ArtifactDraft
+from app.agent_artifacts.publishing import ArtifactPublicationService, DraftAlreadyPublished
 from app.agent_artifacts.service import ArtifactBusy, ArtifactService
 from app.agent_artifacts.validation import ArtifactPayloadInvalid, SCHEMA_VERSION_BY_MODULE
 from app.agent_runtime.kol_detail import KOL_DETAIL_SNAPSHOT_KEY
@@ -125,7 +130,7 @@ class CreateDraftTool:
     """
 
     description = (
-        "持久化一个 Artifact Draft（正式产物，提交后经 Reviewer 审核发布）。"
+        "持久化一个 Artifact Draft（正式产物，经 publish_artifacts 动作确定性发布）。"
         "限制：六类强类型正式 Artifact（brand_report_v3 / campaign_report_v2 / "
         "kol_selection_v3 / kol_analysis_v2 / kol_detail_v2 / insight_board_v1）"
         "不允许用本工具直写，必须调用对应 build_* Builder 工具"
@@ -275,7 +280,76 @@ class UpdateDraftTool:
         )
 
 
+class AbandonDraftArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    draft_id: str = Field(min_length=1)
+    # 结构化放弃原因：机器可分类的稳定码 + 给模型/用户看的说明。
+    reason_code: str = Field(min_length=1, max_length=64)
+    reason: str = Field(min_length=1, max_length=2000)
+
+
+class AbandonDraftTool:
+    """放弃一个无法修复的未发布 Draft（直接发布改造 Task 3；设计 §4.4）。
+
+    只有 working head 当前 owner（当前 Run）能放弃：Draft 置 failed 并释放
+    owner，结构化原因记入 ``ArtifactPublishAttempt(status="failed",
+    error_code=reason_code)``，追加 ``failed`` artifact 事件；不为 Draft 表
+    临时增加错误列。已发布 Draft 结构化拒绝（``draft_already_published``），
+    非 owner 拒绝（``artifact_busy``）。
+    """
+
+    name = "abandon_draft"
+    input_model = AbandonDraftArgs
+    points_cost = 0
+    external_side_effect = True
+
+    description = (
+        "放弃一个无法修复的未发布 Artifact Draft：仅当前 Run 拥有的 Draft 可放弃；"
+        "放弃后 Draft 置 failed（不可再发布/修订），必须给出结构化原因"
+        "（reason_code 稳定错误码 + reason 说明）。发布校验反复失败且无法通过"
+        "修订解决时使用；已发布的 Draft 不能放弃。"
+    )
+
+    def __init__(self, db_session: AsyncSession | None = None) -> None:
+        self._db = db_session
+
+    async def execute(self, context: ToolContext, arguments: BaseModel) -> ToolResult:
+        args = AbandonDraftArgs.model_validate(arguments)
+        if self._db is None:
+            return ToolResult(
+                status="failed", safe_summary="abandon_draft requires a database session"
+            )
+        try:
+            attempt = await ArtifactPublicationService(self._db).abandon_draft(
+                run_id=context.run_id,
+                draft_id=args.draft_id,
+                reason_code=args.reason_code,
+                reason=args.reason,
+            )
+        except KeyError as exc:
+            return ToolResult(status="failed", safe_summary=str(exc))
+        except ArtifactBusy as exc:
+            return ToolResult(status="failed", safe_summary=str(exc), error_type=exc.code)
+        except DraftAlreadyPublished as exc:
+            return ToolResult(status="failed", safe_summary=str(exc), error_type=exc.code)
+        return ToolResult(
+            status="success",
+            safe_summary=json.dumps(
+                {
+                    "artifact_id": attempt.artifact_id,
+                    "draft_id": args.draft_id,
+                    "status": "failed",
+                    "error_code": attempt.error_code,
+                },
+                ensure_ascii=False,
+            ),
+        )
+
+
 __all__ = [
+    "AbandonDraftArgs",
+    "AbandonDraftTool",
     "CreateDraftArgs",
     "CreateDraftTool",
     "UpdateDraftArgs",

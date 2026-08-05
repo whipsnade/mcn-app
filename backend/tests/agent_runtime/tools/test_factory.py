@@ -2,7 +2,7 @@
 
 覆盖：
 1. ``AgentToolRegistryFactory`` 注册全部内部工具（history 3 + calculation 5
-   + artifact 2），且分类正确、可执行；
+   + artifact 3），且分类正确、可执行；
 2. MCP 目录行按审核状态过滤（approved + enabled 才可见；不在审核 allowlist
    的目录行不挂执行器）；
 3. ``load_channel_permissions`` 只返回启用中的渠道；
@@ -47,7 +47,7 @@ _INTERNAL_CALCULATION = {
     "normalize_sentiment",
     "rank_kols",
 }
-_INTERNAL_ARTIFACT = {"create_draft", "update_draft"}
+_INTERNAL_ARTIFACT = {"create_draft", "update_draft", "abandon_draft"}
 
 
 async def _add_catalog_row(
@@ -225,7 +225,7 @@ async def test_kol_detail_profile_sees_only_allowlisted_mcp_tools(db_session) ->
     visible = await registry.visible_tools(kol_detail_profile)
     names = {entry.internal_name for entry in visible}
     # kol_detail_v1 保留 Artifact Builder/发布能力（修复设计 §5.1）：六个
-    # Builder 工具与 create/update_draft 同属 ARTIFACT_TOOLS 分类。
+    # Builder 工具与 create/update_draft、abandon_draft 同属 ARTIFACT_TOOLS 分类。
     builder_tools = {
         "build_brand_report_draft",
         "build_campaign_report_draft",
@@ -239,6 +239,7 @@ async def test_kol_detail_profile_sees_only_allowlisted_mcp_tools(db_session) ->
         "query_raw_posts",
         "create_draft",
         "update_draft",
+        "abandon_draft",
         *builder_tools,
     }
 

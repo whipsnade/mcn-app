@@ -141,6 +141,32 @@ class ArtifactPayloadValidator:
             ) from exc
         return instance.model_dump(mode="json")
 
+    @staticmethod
+    def validate_revision_payload_collecting(
+        *,
+        module: str,
+        schema_version: str,
+        artifact_type: str,
+        payload: Any,
+    ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+        """收集式 Revision 校验：不抛异常，返回 ``(标准化 payload | None, 错误列表)``。
+
+        直接发布服务（``agent_artifacts.publishing``）用它在不中断逐项循环的
+        前提下拿到结构化失败明细，固化进 ``validation_json`` 校验快照；语义与
+        :meth:`validate_revision_payload` 完全一致，只是失败改由返回值表达。
+        """
+        try:
+            normalized = ArtifactPayloadValidator.validate_revision_payload(
+                module=module,
+                schema_version=schema_version,
+                artifact_type=artifact_type,
+                payload=payload,
+            )
+        except ArtifactPayloadInvalid as exc:
+            errors = exc.errors or [{"loc": [], "msg": str(exc), "type": exc.code}]
+            return None, errors
+        return normalized, []
+
 
 __all__ = [
     "ArtifactPayloadInvalid",

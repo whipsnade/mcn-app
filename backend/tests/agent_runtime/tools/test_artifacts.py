@@ -19,9 +19,18 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import func, select
 
-from app.agent_artifacts.models import AgentArtifact, ArtifactDraft
+from app.agent_artifacts.models import (
+    AgentArtifact,
+    ArtifactDraft,
+    ArtifactEvent,
+    ArtifactPublishAttempt,
+)
+from app.agent_artifacts.publishing import ArtifactPublicationService
 from app.agent_artifacts.service import ArtifactService
+from app.agent_runtime.repository import AgentRunRepository
 from app.agent_runtime.tools.artifacts import (
+    AbandonDraftArgs,
+    AbandonDraftTool,
     CreateDraftArgs,
     CreateDraftTool,
     UpdateDraftArgs,
@@ -259,3 +268,152 @@ async def test_typed_draft_builder_rebuild_not_blocked(db_session, user_factory)
     assert second["artifact_id"] == first["artifact_id"]
     assert second["draft_id"] == first["draft_id"]
     assert second["revision"] == first["revision"] + 1
+
+
+# ---------------------------------------------------------------------------
+# abandon_draft：owner Run 放弃无法修复的 Draft（直接发布改造 Task 3）
+# ---------------------------------------------------------------------------
+
+
+async def test_abandon_draft_marks_failed_with_structured_reason(
+    db_session, user_factory
+) -> None:
+    """owner Run 放弃未发布 Draft：Draft 置 failed 并释放 owner，结构化原因落
+    ArtifactPublishAttempt(status=failed)，追加 failed 事件；不给 Draft 加错误列。"""
+    user = await user_factory()
+    session = await _make_session(db_session, user.id)
+    run, step = await _make_run(db_session, session.id, user.id)
+    artifact, draft, revision = await ArtifactService(db_session).create_or_get_draft(
+        session_id=session.id,
+        user_id=user.id,
+        run_id=run.id,
+        module="insight",
+        business_fields=dict(_INSIGHT_BUSINESS_FIELDS),
+        schema_version="insight_board_v1",
+        artifact_type="insight_board_v1",
+        payload=insight_payload(title="放弃初稿"),
+    )
+
+    tool = AbandonDraftTool(db_session)
+    result = await tool.execute(
+        _ctx(user.id, session.id, run.id, step.id),
+        AbandonDraftArgs(
+            draft_id=draft.id,
+            reason_code="unfixable_data_gap",
+            reason="关键平台数据持续不可用，受限构建也无法补齐",
+        ),
+    )
+
+    assert result.status == "success"
+    summary = json.loads(result.safe_summary)
+    assert summary["draft_id"] == draft.id
+    assert summary["status"] == "failed"
+    assert summary["error_code"] == "unfixable_data_gap"
+
+    assert draft.status == "failed"
+    assert draft.owner_run_id is None
+
+    attempt = await db_session.scalar(
+        select(ArtifactPublishAttempt).where(
+            ArtifactPublishAttempt.draft_revision_id == revision.id
+        )
+    )
+    assert attempt is not None
+    assert attempt.status == "failed"
+    assert attempt.error_code == "unfixable_data_gap"
+    assert attempt.run_id == run.id
+    assert attempt.artifact_id == artifact.id
+    assert attempt.completed_at is not None
+    assert attempt.validation_json["reason_code"] == "unfixable_data_gap"
+    assert "受限构建" in attempt.validation_json["reason"]
+
+    failed_event = await db_session.scalar(
+        select(ArtifactEvent).where(
+            ArtifactEvent.artifact_id == artifact.id,
+            ArtifactEvent.event_type == "failed",
+        )
+    )
+    assert failed_event is not None
+    assert failed_event.draft_revision == revision.revision
+
+
+async def test_abandon_draft_rejects_non_owner(db_session, user_factory) -> None:
+    """只有 working head 当前 owner Run 能放弃；他人调用结构化拒绝且不改状态。"""
+    user = await user_factory()
+    session = await _make_session(db_session, user.id)
+    run, step = await _make_run(db_session, session.id, user.id)
+    other_run, other_step = await _make_run(db_session, session.id, user.id)
+    _artifact, draft, revision = await ArtifactService(db_session).create_or_get_draft(
+        session_id=session.id,
+        user_id=user.id,
+        run_id=run.id,
+        module="insight",
+        business_fields=dict(_INSIGHT_BUSINESS_FIELDS),
+        schema_version="insight_board_v1",
+        artifact_type="insight_board_v1",
+        payload=insight_payload(title="归属初稿"),
+    )
+
+    tool = AbandonDraftTool(db_session)
+    result = await tool.execute(
+        _ctx(user.id, session.id, other_run.id, other_step.id),
+        AbandonDraftArgs(draft_id=draft.id, reason_code="unfixable_data_gap", reason="越权"),
+    )
+
+    assert result.status == "failed"
+    assert result.error_type == "artifact_busy"
+    assert draft.status == "drafting"
+    assert draft.owner_run_id == run.id
+    attempt_count = await db_session.scalar(
+        select(func.count(ArtifactPublishAttempt.id)).where(
+            ArtifactPublishAttempt.draft_revision_id == revision.id
+        )
+    )
+    assert attempt_count == 0
+
+
+async def test_abandon_draft_rejects_already_published(db_session, user_factory) -> None:
+    """已发布 Draft 不可放弃：当前 Revision 已有 published Attempt 时结构化拒绝。"""
+    user = await user_factory()
+    session = await _make_session(db_session, user.id)
+    run, step = await _make_run(db_session, session.id, user.id)
+    _artifact, draft, _revision = await ArtifactService(db_session).create_or_get_draft(
+        session_id=session.id,
+        user_id=user.id,
+        run_id=run.id,
+        module="insight",
+        business_fields=dict(_INSIGHT_BUSINESS_FIELDS),
+        schema_version="insight_board_v1",
+        artifact_type="insight_board_v1",
+        payload=insight_payload(title="已发布初稿"),
+    )
+    claimed = await AgentRunRepository(db_session).claim_lease(run.id, "worker-1", 300)
+    assert claimed
+    published = await ArtifactPublicationService(db_session).publish(
+        run_id=run.id, draft_ids=(draft.id,), worker_id="worker-1"
+    )
+    assert published[0].status == "published"
+
+    tool = AbandonDraftTool(db_session)
+    result = await tool.execute(
+        _ctx(user.id, session.id, run.id, step.id),
+        AbandonDraftArgs(draft_id=draft.id, reason_code="unfixable_data_gap", reason="反悔"),
+    )
+
+    assert result.status == "failed"
+    assert result.error_type == "draft_already_published"
+
+
+async def test_abandon_draft_unknown_draft_fails(db_session, user_factory) -> None:
+    user = await user_factory()
+    session = await _make_session(db_session, user.id)
+    run, step = await _make_run(db_session, session.id, user.id)
+
+    tool = AbandonDraftTool(db_session)
+    result = await tool.execute(
+        _ctx(user.id, session.id, run.id, step.id),
+        AbandonDraftArgs(
+            draft_id="missing-draft", reason_code="unfixable_data_gap", reason="不存在"
+        ),
+    )
+    assert result.status == "failed"

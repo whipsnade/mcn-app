@@ -5,8 +5,8 @@
 - history：``read_artifact`` / ``search_evidence`` / ``read_tool_result``；
 - calculation：``calculate_expression`` / ``aggregate_metrics`` /
   ``calculate_period_comparison`` / ``normalize_sentiment`` / ``rank_kols``；
-- artifact：``create_draft`` / ``update_draft`` 与六个 Builder 工具
-  （``build_brand_report_draft`` / ``build_campaign_report_draft`` /
+- artifact：``create_draft`` / ``update_draft`` / ``abandon_draft`` 与六个
+  Builder 工具（``build_brand_report_draft`` / ``build_campaign_report_draft`` /
   ``build_kol_selection_draft`` / ``build_kol_analysis_draft`` /
   ``build_kol_detail_draft`` / ``build_insight_draft``，v3 加固 §6.1 + H5）；
 - MCP：目录中当前仍 approved、enabled 且签名未变的工具，且仅审核 allowlist
@@ -32,7 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_runtime.profiles import ARTIFACT_TOOLS, CALCULATION_TOOLS, HISTORY_TOOLS
 from app.agent_runtime.circuit_breaker import FineGrainedCircuitBreaker
-from app.agent_runtime.tools.artifacts import CreateDraftTool, UpdateDraftTool
+from app.agent_runtime.tools.artifacts import AbandonDraftTool, CreateDraftTool, UpdateDraftTool
 from app.agent_runtime.tools.builders import (
     BuildBrandReportDraftTool,
     BuildCampaignReportDraftTool,
@@ -129,6 +129,7 @@ class AgentToolRegistryFactory:
         registry.register(RankKolsTool(db), category=CALCULATION_TOOLS)
         registry.register(CreateDraftTool(db), category=ARTIFACT_TOOLS)
         registry.register(UpdateDraftTool(db), category=ARTIFACT_TOOLS)
+        registry.register(AbandonDraftTool(db), category=ARTIFACT_TOOLS)
         # §6.1 Builder 工具：Evidence → 正式 Artifact 的确定性转换，与 Draft
         # 创建/更新同属 artifact 分类（信任层级与可见 Profile 完全一致，不另设
         # BUILDER_TOOLS 词汇）。

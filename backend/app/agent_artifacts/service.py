@@ -22,7 +22,10 @@
 ``publish_batch`` 是发布事务：锁定 Batch/Item/Draft/Artifact 后先做发布边界校验
 （强类型二次校验 + ``ArtifactLineageFreezer`` 冻结 lineage 传递闭包写入
 ``lineage_snapshot_json``，``evidence_refs_json`` 原样保留模型直接引用），
-全部通过才一次性插入全部不可变 Version。
+全部通过才一次性插入全部不可变 Version。插入 Version、释放 working head、
+追加 published 事件与更新稳定身份的收尾序列抽在 ``finalize_published_version``
+（单 Draft helper），供旧 Review Batch 路径与新的确定性直接发布服务
+（``agent_artifacts.publishing.ArtifactPublicationService``）共用。
 已读水位自迁移 0028 起读写独立的 ``agent_artifact_read_states``
 （session FK → agent_sessions）；遗留 ``artifact_read_states``
 （``app.artifacts.models.ArtifactReadState``）保持不动，仅供旧应用版本回滚。
@@ -130,7 +133,7 @@ class ArtifactService:
         )
         return (current or 0) + 1
 
-    async def _emit_event(
+    async def emit_event(
         self,
         *,
         session_id: str,
@@ -269,7 +272,7 @@ class ArtifactService:
         draft.revision_count += 1
         draft.updated_at = now
 
-        event = await self._emit_event(
+        event = await self.emit_event(
             session_id=session_id,
             user_id=user_id,
             module=module,
@@ -348,7 +351,7 @@ class ArtifactService:
         draft.revision_count += 1
         draft.updated_at = now
 
-        event = await self._emit_event(
+        event = await self.emit_event(
             session_id=draft.session_id,
             user_id=artifact.user_id,
             module=artifact.module,
@@ -408,6 +411,65 @@ class ArtifactService:
         draft.updated_at = _utcnow()
         await self.db.flush()
         return draft
+
+    # -- 单 Draft 发布收尾（publish_batch 与直接发布服务共用）--------------------------
+
+    async def finalize_published_version(
+        self,
+        *,
+        artifact: AgentArtifact,
+        draft: ArtifactDraft,
+        revision: ArtifactDraftRevision,
+        validated_payload: dict[str, Any],
+        lineage_snapshot: dict[str, Any],
+        source_run_id: str,
+        review_json: dict[str, Any] | None,
+        validation_json: dict[str, Any] | None = None,
+    ) -> AgentArtifactVersion:
+        """单 Draft 发布收尾：插入不可变 Version → 释放 working head → published 事件
+        → 更新稳定身份（``latest_version``/``status``/activity 水位）。
+
+        调用方负责前置校验（payload 强类型 + lineage 冻结）与外层事务边界；
+        复制 Revision 的 ``parent_artifact_version_id``，``evidence_refs_json``
+        原样保留模型直接引用，``lineage_snapshot_json`` 存冻结闭包。
+        直接发布路径（无 Reviewer）传 ``review_json=None`` 与确定性
+        ``validation_json`` 校验快照。
+        """
+        now = _utcnow()
+        version = AgentArtifactVersion(
+            id=str(uuid4()),
+            artifact_id=artifact.id,
+            version=artifact.latest_version + 1,
+            source_run_id=source_run_id,
+            source_draft_revision_id=revision.id,
+            parent_artifact_version_id=revision.parent_artifact_version_id,
+            schema_version=revision.schema_version,
+            payload_json=validated_payload,
+            evidence_refs_json=revision.evidence_refs_json,
+            lineage_snapshot_json=lineage_snapshot,
+            review_json=review_json,
+            validation_json=validation_json,
+            data_status=validated_payload["data_status"],
+            created_at=now,
+        )
+        self.db.add(version)
+        await self.db.flush()
+
+        await self.release_draft(draft.id, outcome="idle")
+        event = await self.emit_event(
+            session_id=artifact.session_id,
+            user_id=artifact.user_id,
+            module=artifact.module,
+            artifact_id=artifact.id,
+            event_type="published",
+            draft_revision=revision.revision,
+            artifact_version_id=version.id,
+        )
+        artifact.latest_version = version.version
+        artifact.status = "published"
+        artifact.activity_sequence = event.sequence
+        artifact.updated_at = now
+        return version
 
     # -- 批量原子发布（Task 13）------------------------------------------------------
 
@@ -519,49 +581,23 @@ class ArtifactService:
                 (item, draft, current_rev, artifact, validated_payload, lineage_snapshot)
             )
 
-        # 2) 一次性插入全部不可变 Version（复制 Revision 的 parent_artifact_version_id；
-        # evidence_refs_json 原样保留模型直接引用，lineage_snapshot_json 存冻结闭包）。
+        # 2) 逐项落地不可变 Version 并收尾（单 Draft helper 与直接发布服务共用）：
+        # 插入 Version → 释放 working head → 追加 published 事件 → 更新稳定身份。
         versions: list[AgentArtifactVersion] = []
-        for _item, _draft, current_rev, artifact, validated_payload, lineage_snapshot in plans:
-            version = AgentArtifactVersion(
-                id=str(uuid4()),
-                artifact_id=artifact.id,
-                version=artifact.latest_version + 1,
+        for item, draft, current_rev, artifact, validated_payload, lineage_snapshot in plans:
+            version = await self.finalize_published_version(
+                artifact=artifact,
+                draft=draft,
+                revision=current_rev,
+                validated_payload=validated_payload,
+                lineage_snapshot=lineage_snapshot,
                 source_run_id=batch.parent_run_id,
-                source_draft_revision_id=current_rev.id,
-                parent_artifact_version_id=current_rev.parent_artifact_version_id,
-                schema_version=current_rev.schema_version,
-                payload_json=validated_payload,
-                evidence_refs_json=current_rev.evidence_refs_json,
-                lineage_snapshot_json=lineage_snapshot,
-                review_json=await self._review_json_for_item(_item.id),
-                data_status=validated_payload["data_status"],
-                created_at=now,
+                review_json=await self._review_json_for_item(item.id),
             )
-            self.db.add(version)
             versions.append(version)
         await self.db.flush()
 
-        # 3) 释放 working head、更新稳定身份、追加 published 事件。
-        for (_item, draft, current_rev, artifact, _payload, _snapshot), version in zip(
-            plans, versions, strict=True
-        ):
-            await self.release_draft(draft.id, outcome="idle")
-            event = await self._emit_event(
-                session_id=artifact.session_id,
-                user_id=artifact.user_id,
-                module=artifact.module,
-                artifact_id=artifact.id,
-                event_type="published",
-                draft_revision=current_rev.revision,
-                artifact_version_id=version.id,
-            )
-            artifact.latest_version = version.version
-            artifact.status = "published"
-            artifact.activity_sequence = event.sequence
-            artifact.updated_at = now
-
-        # 4) Batch 完成 + 写 assistant 消息（completion_text 只在整批发布后落地）。
+        # 3) Batch 完成 + 写 assistant 消息（completion_text 只在整批发布后落地）。
         batch.status = "completed"
         batch.completed_at = now
         await self._write_assistant_message(
@@ -570,7 +606,7 @@ class ArtifactService:
             content=batch.completion_text,
         )
 
-        # 5) 发布前租约复核（§5.5/H1）：父 Run 的终态迁移（reviewing→completed）
+        # 4) 发布前租约复核（§5.5/H1）：父 Run 的终态迁移（reviewing→completed）
         # 由终态事务边界（AgentEventStream.settle_terminal）与 run.completed
         # 事件一体提交；此处只复核租约仍属本 worker——丢失则抛
         # run_lease_not_held 连带整批发布回滚（不发布、不写终态，交还接管方）。
