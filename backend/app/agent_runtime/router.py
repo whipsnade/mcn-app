@@ -724,7 +724,15 @@ async def retry_run(
     Run 的 ``prompt_snapshot_json``；绝不修改或重开原 Run。
     """
     run = await _get_owned_run(db, user.id, run_id)
-    if run.status not in (RunStatus.FAILED, RunStatus.PAUSED):
+    # 仅限 session_analyst 主 Run：kol_detail 等辅助 Run 的触发上下文在
+    # KOL_DETAIL_SNAPSHOT_KEY 且无 input_message_id，整体覆盖快照的 retry 会让
+    # transcript 回退到会话最近一条用户消息而锚定错误意图；其重试必须走
+    # KolDetailRunService 自己的缓存/回退车道。Run 已确属本人（无存在性泄漏），
+    # 与错误状态同语义，统一 409 run_not_retryable。
+    if run.profile_name != SESSION_ANALYST_PROFILE or run.status not in (
+        RunStatus.FAILED,
+        RunStatus.PAUSED,
+    ):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail="run_not_retryable"
         )

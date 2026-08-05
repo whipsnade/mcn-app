@@ -121,13 +121,14 @@ async def _post_message(
 
 async def _add_run(db_session, user_id: str, session_id: str, **overrides) -> AgentRun:
     status_value = overrides.pop("status", "queued")
+    profile_name = overrides.pop("profile_name", "session_analyst_v1")
     run = AgentRun(
         id=str(uuid4()),
         session_id=session_id,
         user_id=user_id,
         run_kind="user",
         visibility="user",
-        profile_name="session_analyst_v1",
+        profile_name=profile_name,
         profile_version="v1",
         model="test-model",
         status=status_value,
@@ -1394,3 +1395,38 @@ async def test_retry_blocked_by_other_active_run(agent_client_factory, db_sessio
     resp = await alice.post(f"/api/v1/agent/runs/{failed.id}/retry")
     assert resp.status_code == 409
     assert resp.json()["detail"] == "active_run_in_progress"
+
+
+async def test_retry_rejects_non_session_analyst_profile(
+    agent_client_factory, db_session
+) -> None:
+    """retry 仅限 session_analyst_v1 主 Run：kol_detail_v1 辅助 Run 即使
+    failed 也不可经此端点重试（409 run_not_retryable）。
+
+    kol_detail Run 的触发上下文在 KOL_DETAIL_SNAPSHOT_KEY（platform/kol_uid），
+    且无 input_message_id——整体覆盖 prompt_snapshot_json 的 retry 会让
+    transcript 回退到会话最近一条用户消息，锚定错误意图；重试必须走
+    KolDetailRunService 自己的缓存/回退车道。
+    """
+    alice, _ = await agent_client_factory("13700000015")
+    session_id = await _create_session(alice)
+    user_id = await _me_id(alice)
+    kol_detail_run = await _add_run(
+        db_session,
+        user_id,
+        session_id,
+        status="failed",
+        profile_name="kol_detail_v1",
+    )
+
+    resp = await alice.post(f"/api/v1/agent/runs/{kol_detail_run.id}/retry")
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == "run_not_retryable"
+    # 原 Run 不受影响，且未创建任何 Child Run。
+    assert (await db_session.get(AgentRun, kol_detail_run.id)).status == "failed"
+    children = (
+        await db_session.scalars(
+            select(AgentRun).where(AgentRun.parent_run_id == kol_detail_run.id)
+        )
+    ).all()
+    assert children == []
