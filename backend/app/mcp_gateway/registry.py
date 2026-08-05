@@ -61,6 +61,13 @@ _DATATAP_RESULT_SCHEMA: dict[str, Any] = {
 # B站等不遵循 DataTap {result: string} 包装的服务使用宽松输出契约。
 _PERMISSIVE_OUTPUT_SCHEMA: dict[str, Any] = {}
 
+# datasource 参数的平台枚举提示（上游校验原文）：模型常误写"抖音"等站点名作为
+# 平台，被上游判 failed_confirmed。凡 schema 含 datasource 的工具描述都附此提示。
+_DATASOURCE_HINT = (
+    "datasource 的平台取值仅限：小红书/短视频/微博/微信/视频/电商/博客；"
+    "站点名跟在平台后用 __ 连接，如 短视频__抖音、视频__B站；"
+    "不要直接把「抖音」「B站」当平台值。"
+)
 # These names are reviewed product capabilities, not an open-ended remote
 # discovery list. Their live input schemas are still checked and quarantined
 # when the provider changes, while the stable descriptions keep untrusted
@@ -69,16 +76,16 @@ _PERMISSIVE_OUTPUT_SCHEMA: dict[str, Any] = {}
 DYNAMIC_TOOL_ALLOWLIST: dict[DataTapService, dict[str, tuple[str, str, dict[str, Any]]]] = {
     DataTapService.INSIGHT_CUBE: {
         "match_best_tag": ("datatap.insight.match.best.tag.v1", "品牌与品类标准标签匹配", _DATATAP_RESULT_SCHEMA),
-        "query_analysis_data": ("datatap.insight.query.analysis.v1", "品牌声量、互动、情感和平台维度统计", _DATATAP_RESULT_SCHEMA),
-        "social_statistic_trend": ("datatap.insight.social.statistic.trend.v1", "品牌或关键词跨平台声量趋势", _DATATAP_RESULT_SCHEMA),
-        "social_statistic_user_profile": ("datatap.insight.social.statistic.user.profile.v1", "品牌受众年龄、性别和地域画像", _DATATAP_RESULT_SCHEMA),
-        "social_statistic_hot_user": ("datatap.insight.social.statistic.hot.user.v1", "品牌相关热门用户和传播达人", _DATATAP_RESULT_SCHEMA),
-        "social_statistic_overview": ("datatap.insight.social.statistic.overview.v1", "品牌或关键词社交搜索整体概览", _DATATAP_RESULT_SCHEMA),
-        "social_statistic_hot_topic": ("datatap.insight.social.statistic.hot.topic.v1", "品牌相关热门话题和声量聚类", _DATATAP_RESULT_SCHEMA),
-        "social_statistic_category_rank": ("datatap.insight.social.statistic.category.rank.v1", "品类及子品类市场表现与声量排行", _DATATAP_RESULT_SCHEMA),
-        "query_raw_posts": ("datatap.insight.query.raw.posts.v1", "社媒原帖明细检索", _DATATAP_RESULT_SCHEMA),
-        "social_statistic_brand_activity": ("datatap.insight.social.statistic.brand.activity.v1", "品牌相关活动列表与互动数据", _DATATAP_RESULT_SCHEMA),
-        "query_rank_list": ("datatap.insight.query.rank.list.v1", "社媒榜单数据查询", _DATATAP_RESULT_SCHEMA),
+        "query_analysis_data": ("datatap.insight.query.analysis.v1", "品牌声量、互动、情感和平台维度统计。" + _DATASOURCE_HINT, _DATATAP_RESULT_SCHEMA),
+        "social_statistic_trend": ("datatap.insight.social.statistic.trend.v1", "品牌或关键词跨平台声量趋势。" + _DATASOURCE_HINT, _DATATAP_RESULT_SCHEMA),
+        "social_statistic_user_profile": ("datatap.insight.social.statistic.user.profile.v1", "品牌受众年龄、性别和地域画像。" + _DATASOURCE_HINT, _DATATAP_RESULT_SCHEMA),
+        "social_statistic_hot_user": ("datatap.insight.social.statistic.hot.user.v1", "品牌相关热门用户和传播达人。" + _DATASOURCE_HINT, _DATATAP_RESULT_SCHEMA),
+        "social_statistic_overview": ("datatap.insight.social.statistic.overview.v1", "品牌或关键词社交搜索整体概览。" + _DATASOURCE_HINT, _DATATAP_RESULT_SCHEMA),
+        "social_statistic_hot_topic": ("datatap.insight.social.statistic.hot.topic.v1", "品牌相关热门话题和声量聚类。" + _DATASOURCE_HINT, _DATATAP_RESULT_SCHEMA),
+        "social_statistic_category_rank": ("datatap.insight.social.statistic.category.rank.v1", "品类及子品类市场表现与声量排行。" + _DATASOURCE_HINT, _DATATAP_RESULT_SCHEMA),
+        "query_raw_posts": ("datatap.insight.query.raw.posts.v1", "社媒原帖明细检索。" + _DATASOURCE_HINT, _DATATAP_RESULT_SCHEMA),
+        "social_statistic_brand_activity": ("datatap.insight.social.statistic.brand.activity.v1", "品牌相关活动列表与互动数据。" + _DATASOURCE_HINT, _DATATAP_RESULT_SCHEMA),
+        "query_rank_list": ("datatap.insight.query.rank.list.v1", "社媒榜单数据查询。" + _DATASOURCE_HINT, _DATATAP_RESULT_SCHEMA),
         "analysis_target_search": ("datatap.insight.analysis.target.search.v1", "分析对象规则检索", _DATATAP_RESULT_SCHEMA),
     },
     DataTapService.SOCIAL_GROW: {
