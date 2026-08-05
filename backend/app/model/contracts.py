@@ -66,7 +66,7 @@ class StructuredModelRequest(Generic[T]):
     template_name: str
     messages: tuple[ChatMessage, ...]
     output_model: type[T]
-    max_tokens: int = 4096
+    max_tokens: int = 16384
     # prompt 学习日志上下文（user_id/session_id/task_id/tags），不写进 prompt。
     log_context: dict[str, Any] | None = field(default=None, compare=False)
     thinking_sink: ThinkingSink | None = field(default=None, compare=False)
