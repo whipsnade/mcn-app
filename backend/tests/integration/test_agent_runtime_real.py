@@ -254,13 +254,14 @@ _UAT_CLEANUP_STATEMENTS = (
     "DELETE ae FROM artifact_events ae "
     "JOIN agent_sessions s ON ae.session_id = s.id "
     "JOIN users u ON s.user_id = u.id WHERE u.nickname LIKE 'uat-%'",
-    "DELETE av FROM agent_artifact_versions av "
-    "JOIN agent_artifacts ar ON av.artifact_id = ar.id "
-    "JOIN agent_sessions s ON ar.session_id = s.id "
-    "JOIN users u ON s.user_id = u.id WHERE u.nickname LIKE 'uat-%'",
+    # draft revisions 经 parent_artifact_version_id 引用 versions，必须先删 revisions。
     "DELETE dr FROM artifact_draft_revisions dr "
     "JOIN artifact_drafts d ON dr.draft_id = d.id "
     "JOIN agent_sessions s ON d.session_id = s.id "
+    "JOIN users u ON s.user_id = u.id WHERE u.nickname LIKE 'uat-%'",
+    "DELETE av FROM agent_artifact_versions av "
+    "JOIN agent_artifacts ar ON av.artifact_id = ar.id "
+    "JOIN agent_sessions s ON ar.session_id = s.id "
     "JOIN users u ON s.user_id = u.id WHERE u.nickname LIKE 'uat-%'",
     "DELETE d FROM artifact_drafts d "
     "JOIN agent_sessions s ON d.session_id = s.id "
