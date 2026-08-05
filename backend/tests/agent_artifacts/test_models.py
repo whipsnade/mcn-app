@@ -1,4 +1,4 @@
-from sqlalchemy import UniqueConstraint
+from sqlalchemy import CheckConstraint, UniqueConstraint
 
 from app.db.base import Base
 import app.agent_runtime.models  # noqa: F401
@@ -17,6 +17,7 @@ def test_artifact_tables_are_registered() -> None:
         "artifact_events",
         "agent_artifact_read_states",
         "kol_detail_cache",
+        "artifact_publish_attempts",
     }
     assert expected.issubset(Base.metadata.tables)
 
@@ -72,6 +73,30 @@ def test_agent_artifact_versions_has_lineage_snapshot_column() -> None:
     versions = Base.metadata.tables["agent_artifact_versions"]
     assert "lineage_snapshot_json" in versions.c
     assert versions.c.lineage_snapshot_json.nullable is True
+
+
+def test_agent_artifact_versions_has_validation_json_column() -> None:
+    versions = Base.metadata.tables["agent_artifact_versions"]
+    assert "validation_json" in versions.c
+    assert versions.c.validation_json.nullable is True
+
+
+def test_artifact_publish_attempts_constraints() -> None:
+    attempts = Base.metadata.tables["artifact_publish_attempts"]
+    assert any(
+        tuple(column.name for column in constraint.columns) == ("idempotency_key",)
+        for constraint in attempts.constraints
+        if isinstance(constraint, UniqueConstraint)
+    )
+    checks = {
+        constraint.name: constraint.sqltext.text
+        for constraint in attempts.constraints
+        if isinstance(constraint, CheckConstraint)
+    }
+    assert (
+        checks["ck_artifact_publish_attempts_status"]
+        == "status IN ('validating','published','validation_failed','failed')"
+    )
 
 
 def test_immutable_tables_have_no_updated_at() -> None:

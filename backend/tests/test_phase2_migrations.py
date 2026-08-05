@@ -21,7 +21,7 @@ def test_migration_chain_has_single_head() -> None:
     config = Config(str(backend_dir / "alembic.ini"))
     config.set_main_option("script_location", str(backend_dir / "migrations"))
     heads = ScriptDirectory.from_config(config).get_heads()
-    assert heads == ["0029_agent_run_created_at"]
+    assert heads == ["0030_direct_publish_runtime"]
 
 
 async def test_phase_two_unique_constraints() -> None:
@@ -602,6 +602,58 @@ async def test_0028_agent_artifact_read_states_schema() -> None:
     version_by_name = {item["name"]: item for item in version_columns}
     assert "lineage_snapshot_json" in version_by_name
     assert version_by_name["lineage_snapshot_json"]["nullable"] is True
+
+
+async def column_names(table: str) -> set[str]:
+    async with engine.connect() as connection:
+        return {
+            item["name"]
+            for item in await connection.run_sync(
+                lambda sync: inspect(sync).get_columns(table)
+            )
+        }
+
+
+async def test_0030_direct_publish_schema() -> None:
+    """迁移 0030：直接发布尝试表 + versions.validation_json + confirmed_scope 记忆类型。"""
+    columns = await column_names("artifact_publish_attempts")
+    assert {
+        "id",
+        "run_id",
+        "artifact_id",
+        "draft_revision_id",
+        "status",
+        "idempotency_key",
+        "validation_json",
+        "error_code",
+        "published_version_id",
+        "created_at",
+        "completed_at",
+    } <= columns
+    assert "validation_json" in await column_names("agent_artifact_versions")
+
+    async with engine.connect() as connection:
+        unique_constraints = await connection.run_sync(
+            lambda sync: inspect(sync).get_unique_constraints("artifact_publish_attempts")
+        )
+        check_constraints = await connection.run_sync(
+            lambda sync: inspect(sync).get_check_constraints("artifact_publish_attempts")
+        )
+        memory_checks = await connection.run_sync(
+            lambda sync: inspect(sync).get_check_constraints("memory_entries")
+        )
+
+    assert "uq_artifact_publish_attempts_idempotency" in {
+        item["name"] for item in unique_constraints
+    }
+    checks = {item["name"]: item["sqltext"] for item in check_constraints}
+    status_check = checks["ck_artifact_publish_attempts_status"]
+    for status in ("validating", "published", "validation_failed", "failed"):
+        assert status in status_check
+    memory_check = {item["name"]: item["sqltext"] for item in memory_checks}[
+        "ck_memory_entries_type"
+    ]
+    assert "confirmed_scope" in memory_check
 
 
 def _run_alembic(*args: str) -> None:

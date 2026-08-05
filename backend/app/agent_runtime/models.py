@@ -288,7 +288,7 @@ class MemoryEntry(Base):
     __tablename__ = "memory_entries"
     __table_args__ = (
         CheckConstraint(
-            "memory_type IN ('run_summary','artifact_index','pending_question')",
+            "memory_type IN ('run_summary','artifact_index','pending_question','confirmed_scope')",
             name="ck_memory_entries_type",
         ),
     )

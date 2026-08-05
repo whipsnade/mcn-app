@@ -87,3 +87,16 @@ def test_agent_tool_calls_logical_call_id_unique() -> None:
         for constraint in tool_calls.constraints
         if isinstance(constraint, UniqueConstraint)
     )
+
+
+def test_confirmed_scope_is_valid_memory_type() -> None:
+    from app.agent_runtime.models import MemoryEntry
+
+    entry = MemoryEntry(memory_type="confirmed_scope", content_json={"domain": "brand"})
+    assert entry.memory_type == "confirmed_scope"
+    checks = {
+        constraint.name: constraint.sqltext.text
+        for constraint in MemoryEntry.__table__.constraints
+        if isinstance(constraint, CheckConstraint)
+    }
+    assert "confirmed_scope" in checks["ck_memory_entries_type"]

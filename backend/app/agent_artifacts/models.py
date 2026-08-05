@@ -209,8 +209,47 @@ class AgentArtifactVersion(Base):
     # 写入逻辑由后续任务落地。evidence_refs_json 仍记录模型直接引用。
     lineage_snapshot_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     review_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    # 直接发布时冻结的确定性校验快照（迁移 0030）；旧 Version 为 NULL。
+    validation_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     data_status: Mapped[str] = mapped_column(String(32), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class ArtifactPublishAttempt(Base):
+    """Immutable per-publish-attempt record (direct publish, no reviewer model)."""
+
+    __tablename__ = "artifact_publish_attempts"
+    __table_args__ = (
+        UniqueConstraint(
+            "idempotency_key", name="uq_artifact_publish_attempts_idempotency"
+        ),
+        CheckConstraint(
+            "status IN ('validating','published','validation_failed','failed')",
+            name="ck_artifact_publish_attempts_status",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid4())
+    )
+    run_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("agent_runs.id"), nullable=False
+    )
+    artifact_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("agent_artifacts.id"), nullable=False
+    )
+    draft_revision_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("artifact_draft_revisions.id"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(String(24), nullable=False, default="validating")
+    idempotency_key: Mapped[str] = mapped_column(String(191), nullable=False)
+    validation_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    published_version_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("agent_artifact_versions.id"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
 class ArtifactEvent(Base):
