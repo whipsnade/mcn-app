@@ -36,7 +36,11 @@ from app.agent_artifacts.models import (
     ArtifactDraft,
     ArtifactDraftRevision,
 )
-from app.agent_runtime.evidence import bound_model_value, build_model_evidence_view
+from app.agent_runtime.evidence import (
+    bound_model_value,
+    build_model_evidence_view,
+    unwrap_evidence_payload,
+)
 from app.agent_runtime.models import (
     AgentMessage,
     AgentSession,
@@ -64,6 +68,11 @@ _SEARCH_SCAN_LIMIT = 500
 # read_tool_result 默认页大小与页大小上限（§10.2：绝不整页返回大结果）。
 _TOOL_RESULT_DEFAULT_LIMIT = 20
 _TOOL_RESULT_MAX_LIMIT = 200
+# 模型可见工具响应的总字符预算（Gate B P1-3）：200 个最大 item 合并可达 40MB，
+# 必须按总预算逐项构建页面，任何响应都 ≤ 该预算。
+_MAX_TOOL_RESULT_TOTAL_CHARS = 50_000
+# read_tool_result 解包后支持的行容器键。
+_SEQUENCE_CONTAINER_KEYS = ("rows", "list", "items", "data", "posts", "records")
 # search_evidence filters 支持的等值列。
 _FILTER_COLUMNS: dict[str, Any] = {
     "source_type": EvidenceItem.source_type,
@@ -332,24 +341,46 @@ class SearchEvidenceTool:
         rows = result.all()
         matches = [item for item in rows if self._matches(item, args.query or "")]
         total = len(matches)
-        page = matches[:_SEARCH_MATCH_LIMIT]
+        # 按总字符预算逐项加入 match（20 × 50KB ≈ 1MB 不可接受），超预算停止。
+        fixed = len(
+            json.dumps(
+                {
+                    "query": args.query,
+                    "total_matches": total,
+                    "returned_matches": _SEARCH_MATCH_LIMIT,
+                    "has_more": False,
+                    "truncated": False,
+                    "matches": [],
+                },
+                ensure_ascii=False,
+            )
+        )
+        matches_budget = max(_MAX_TOOL_RESULT_TOTAL_CHARS - fixed, 1)
+        page: list[dict[str, Any]] = []
+        for item in matches[:_SEARCH_MATCH_LIMIT]:
+            match = {
+                "evidence_id": item.id,
+                "source_type": item.source_type,
+                "source_name": item.source_name,
+                "run_id": item.run_id,
+                "collected_at": item.collected_at.isoformat() if item.collected_at else None,
+                # 统一有界模型视图（Gate B：不返回完整 5000 行）。
+                "view": build_model_evidence_view(item),
+            }
+            candidate = [*page, match]
+            if len(json.dumps(candidate, ensure_ascii=False)) > matches_budget:
+                break
+            page = candidate
+        returned = len(page)
+        has_more = returned < total
         summary = json.dumps(
             {
                 "query": args.query,
                 "total_matches": total,
-                "truncated": total > _SEARCH_MATCH_LIMIT,
-                "matches": [
-                    {
-                        "evidence_id": item.id,
-                        "source_type": item.source_type,
-                        "source_name": item.source_name,
-                        "run_id": item.run_id,
-                        "collected_at": item.collected_at.isoformat() if item.collected_at else None,
-                        # 统一有界模型视图（Gate B P1）：不返回完整 5000 行。
-                        "view": build_model_evidence_view(item),
-                    }
-                    for item in page
-                ],
+                "returned_matches": returned,
+                "has_more": has_more,
+                "truncated": has_more,
+                "matches": page,
             },
             ensure_ascii=False,
         )
@@ -440,16 +471,52 @@ class ReadToolResultTool:
         offset = max(args.cursor or 0, 0)
         # 防御性钳制：即使未来字段放宽，页大小也绝不超过上限。
         limit = min(max(args.limit, 1), _TOOL_RESULT_MAX_LIMIT)
-        page = sequence[offset : offset + limit]
-        next_offset = offset + limit
-        next_cursor = str(next_offset) if next_offset < total else None
-        truncated = next_cursor is not None
         view = build_model_evidence_view(evidence)
+        # 固定开销（元数据 + 统一诊断）用最保守占位测量，items_budget 为剩余预算。
+        fixed = len(
+            json.dumps(
+                {
+                    "evidence_id": evidence.id,
+                    "items": [],
+                    "total": total,
+                    "next_cursor": str(total),
+                    "truncated": False,
+                    "normalization_status": view["normalization_status"],
+                    "field_mapping": view["field_mapping"],
+                    "unmapped_fields": view["unmapped_fields"],
+                },
+                ensure_ascii=False,
+            )
+        )
+        items_budget = max(_MAX_TOOL_RESULT_TOTAL_CHARS - fixed, 1)
+        # 逐项构建页面：加入 candidate 后超过总预算即停止；cursor 按实际消费的
+        # 源数据行数推进（被字符预算截掉的行走源 index，绝不丢失）。
+        items: list[Any] = []
+        source_index = offset
+        item_truncated_any = False
+        while source_index < total and len(items) < limit:
+            bounded_item, item_truncated = bound_model_value(sequence[source_index])
+            item_truncated_any = item_truncated_any or item_truncated
+            candidate = [*items, bounded_item]
+            if len(json.dumps(candidate, ensure_ascii=False)) > items_budget:
+                if not items:
+                    # 单个超大 item：返回合法占位并把 cursor 前进一行，避免同一
+                    # 超大 item 造成无限循环。
+                    items = [
+                        {"__truncated__": True, "__reason__": "item_exceeds_model_budget"}
+                    ]
+                    source_index += 1
+                    item_truncated_any = True
+                    break
+                break
+            items = candidate
+            source_index += 1
+        next_cursor = str(source_index) if source_index < total else None
+        truncated = next_cursor is not None or item_truncated_any
         summary = json.dumps(
             {
                 "evidence_id": evidence.id,
-                # 分页 items 也做有界截断（Gate B P1：绝不返回超大原始行）。
-                "items": [bound_model_value(item) for item in page],
+                "items": items,
                 "total": total,
                 "next_cursor": next_cursor,
                 "truncated": truncated,
@@ -469,13 +536,21 @@ class ReadToolResultTool:
 
     @staticmethod
     def _sequence(raw: Any) -> tuple[list[Any], int]:
-        """把原始结果归一到可分片的序列。"""
-        if isinstance(raw, list):
-            return raw, len(raw)
-        if isinstance(raw, dict) and isinstance(raw.get("rows"), list):
-            rows = raw["rows"]
-            return rows, len(rows)
-        return [raw], 1
+        """把原始结果（含 DataTap ``{result: "<json>"}`` 包装）归一到可分片序列。
+
+        用共享 ``unwrap_evidence_payload`` 解包后支持顶层 list / rows / list /
+        items / data / posts / records；容器值不是 list 时不伪造分页，按单个
+        有界结果返回；JSON 字符串解析失败返回受控单项结果，绝不抛 500。
+        """
+        unwrapped = unwrap_evidence_payload(raw)
+        if isinstance(unwrapped, list):
+            return unwrapped, len(unwrapped)
+        if isinstance(unwrapped, dict):
+            for key in _SEQUENCE_CONTAINER_KEYS:
+                value = unwrapped.get(key)
+                if isinstance(value, list):
+                    return value, len(value)
+        return [unwrapped], 1
 
 
 # --------------------------------------------------------------------------- #

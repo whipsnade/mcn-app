@@ -40,6 +40,7 @@ from app.agent_runtime.tools.history import (
     RememberScopeArgs,
     RememberScopeTool,
     SearchEvidenceTool,
+    _MAX_TOOL_RESULT_TOTAL_CHARS,
 )
 
 CTX = ToolContext(
@@ -1052,3 +1053,158 @@ async def test_search_evidence_upload_source_no_storage_path(
     assert "secret-dir" not in rendered
     assert "storage_key" not in rendered
     assert "agent-uploads" not in rendered
+
+
+# ---------------------------------------------------------------------------
+# P1-2/P1-3: DataTap 真实包装分页 + 总响应字符预算
+# ---------------------------------------------------------------------------
+
+
+async def _read_all_rows(db_session, context, tool, evidence_id, limit=100) -> list[dict]:
+    """按 cursor 遍历全部源 items，返回合并后的行列表。"""
+    all_rows: list[dict] = []
+    cursor = None
+    while True:
+        args = {"evidence_id": evidence_id, "limit": limit}
+        if cursor is not None:
+            args["cursor"] = int(cursor)
+        data = _summary(await tool.execute(context, type(tool).input_model(**args)))
+        all_rows.extend(data["items"])
+        cursor = data["next_cursor"]
+        if cursor is None:
+            return all_rows, data
+
+
+async def test_read_tool_result_paginates_wrapped_datatap_300_rows(
+    db_session, user_factory
+) -> None:
+    """DataTap {result: '<json>'} 包装：300 行正确分页，could 不丢行不重复。"""
+    user = await user_factory()
+    session, run, _step, call = await _make_chain(db_session, user.id)
+    payload = {"result": json.dumps({"rows": [{"volume": i} for i in range(300)]})}
+    evidence_id = await _make_evidence(db_session, session, run, call, raw_payload=payload)
+    context = ToolContext(user_id=user.id, session_id=session.id, run_id=run.id, profile_name="session_analyst_v1")
+    tool = ReadToolResultTool(db_session)
+
+    # 第一页
+    first = _summary(await tool.execute(context, type(tool).input_model(evidence_id=evidence_id, limit=100)))
+    assert first["total"] == 300
+    assert first["next_cursor"] is not None
+    assert len(first["items"]) == 100
+    assert first["items"][0]["volume"] == 0
+    assert first["items"][-1]["volume"] == 99
+
+    # 中间页
+    middle = _summary(await tool.execute(context, type(tool).input_model(evidence_id=evidence_id, cursor=100, limit=100)))
+    assert middle["items"][0]["volume"] == 100
+    assert middle["items"][-1]["volume"] == 199
+
+    # 最后一页
+    last = _summary(await tool.execute(context, type(tool).input_model(evidence_id=evidence_id, cursor=200, limit=100)))
+    assert len(last["items"]) == 100
+    assert last["items"][0]["volume"] == 200
+    assert last["items"][-1]["volume"] == 299
+    assert last["next_cursor"] is None
+
+    # 全部 300 行不丢、不重复
+    all_rows, _end = await _read_all_rows(db_session, context, tool, evidence_id, limit=100)
+    assert len(all_rows) == 300
+    assert len({row["volume"] for row in all_rows}) == 300
+    assert sorted(row["volume"] for row in all_rows) == list(range(300))
+    # 每页响应都合法 JSON
+    for start in (0, 100, 200):
+        page = _summary(await tool.execute(context, type(tool).input_model(evidence_id=evidence_id, cursor=start, limit=100)))
+        json.loads(json.dumps(page))
+
+
+async def test_read_tool_result_supports_other_container_keys(db_session, user_factory) -> None:
+    """解包后支持 list/items/data/posts/records 等容器键。"""
+    user = await user_factory()
+    session, run, _step, call = await _make_chain(db_session, user.id)
+    for key in ("list", "items", "data", "posts", "records"):
+        payload = {key: [{"v": i} for i in range(5)]}
+        evidence_id = await _make_evidence(db_session, session, run, call, raw_payload=payload)
+        context = ToolContext(user_id=user.id, session_id=session.id, run_id=run.id, profile_name="session_analyst_v1")
+        data = _summary(await ReadToolResultTool(db_session).execute(
+            context, ReadToolResultTool.input_model(evidence_id=evidence_id, limit=10)
+        ))
+        assert data["total"] == 5, key
+        assert len(data["items"]) == 5, key
+
+
+async def test_read_tool_result_malformed_wrapped_payload_controlled(db_session, user_factory) -> None:
+    """JSON 字符串解析失败返回受控单项结果，不抛 500。"""
+    user = await user_factory()
+    session, run, _step, call = await _make_chain(db_session, user.id)
+    payload = {"result": "not-valid-json{{{"}
+    evidence_id = await _make_evidence(db_session, session, run, call, raw_payload=payload)
+    context = ToolContext(user_id=user.id, session_id=session.id, run_id=run.id, profile_name="session_analyst_v1")
+    tool = ReadToolResultTool(db_session)
+    data = _summary(await tool.execute(context, type(tool).input_model(evidence_id=evidence_id)))
+    assert data["total"] == 1
+    assert len(data["items"]) == 1
+    json.loads(json.dumps(data))
+
+
+async def test_read_tool_result_total_budget_caps_items_and_cursor_advances(
+    db_session, user_factory
+) -> None:
+    """200 个近最大 item 合并超预算：逐页返回、cursor 精确推进、最终能遍历全部。"""
+    user = await user_factory()
+    session, run, _step, call = await _make_chain(db_session, user.id)
+    payload = {"rows": [{"idx": i, "text": "x" * 900} for i in range(200)]}
+    evidence_id = await _make_evidence(db_session, session, run, call, raw_payload=payload)
+    context = ToolContext(user_id=user.id, session_id=session.id, run_id=run.id, profile_name="session_analyst_v1")
+    tool = ReadToolResultTool(db_session)
+
+    first = _summary(await tool.execute(context, type(tool).input_model(evidence_id=evidence_id, limit=200)))
+    # 预算截断：不可能一次返回全部 200 个近最大 item。
+    assert len(first["items"]) < 200
+    assert len(json.dumps(first)) <= _MAX_TOOL_RESULT_TOTAL_CHARS
+    assert first["next_cursor"] is not None
+
+    # 遍历全部源 items，不丢不重。
+    all_rows, _end = await _read_all_rows(db_session, context, tool, evidence_id, limit=200)
+    assert len(all_rows) == 200
+    assert len({row["idx"] for row in all_rows}) == 200
+    assert sorted(row["idx"] for row in all_rows) == list(range(200))
+
+
+async def test_read_tool_result_single_oversized_item_placeholder(db_session, user_factory) -> None:
+    """单个超大 item（有界后仍超预算）返回占位并推进 cursor，不无限循环。"""
+    user = await user_factory()
+    session, run, _step, call = await _make_chain(db_session, user.id)
+    # 200 字段 × 2000 字符长字符串 → 有界后仍 ~200KB，超过 50KB 总预算。
+    huge = {f"k{i}": "长" * 2000 for i in range(200)}
+    payload = {"rows": [huge]}
+    evidence_id = await _make_evidence(db_session, session, run, call, raw_payload=payload)
+    context = ToolContext(user_id=user.id, session_id=session.id, run_id=run.id, profile_name="session_analyst_v1")
+    tool = ReadToolResultTool(db_session)
+
+    data = _summary(await tool.execute(context, type(tool).input_model(evidence_id=evidence_id, limit=10)))
+    assert data["items"] == [{"__truncated__": True, "__reason__": "item_exceeds_model_budget"}]
+    assert data["truncated"] is True
+    # cursor 已越过该超大 item（total=1 → 无下一页），不会无限循环。
+    assert data["next_cursor"] is None
+    assert len(json.dumps(data)) <= _MAX_TOOL_RESULT_TOTAL_CHARS
+
+
+async def test_search_evidence_total_budget_limits_large_views(db_session, user_factory) -> None:
+    """search_evidence 多个大 view 仍满足总预算，超预算截断并标记。"""
+    user = await user_factory()
+    session, run, _step, call = await _make_chain(db_session, user.id)
+    for _ in range(10):
+        big_payload = {"rows": [{"idx": j, "text": "x" * 800} for j in range(200)]}
+        await _make_evidence(db_session, session, run, call, raw_payload=big_payload)
+    context = ToolContext(user_id=user.id, session_id=session.id, run_id=run.id, profile_name="session_analyst_v1")
+    tool = SearchEvidenceTool(db_session)
+    result = await tool.execute(context, type(tool).input_model(query=""))
+    data = _summary(result)
+    assert data["total_matches"] == 10
+    # 与真实响应同构（ensure_ascii=False）测量总字符。
+    assert len(json.dumps(data, ensure_ascii=False)) <= _MAX_TOOL_RESULT_TOTAL_CHARS
+    assert data["returned_matches"] <= 10
+    assert data["returned_matches"] < data["total_matches"]
+    assert data["has_more"] == (data["returned_matches"] < data["total_matches"])
+    assert data["truncated"] == data["has_more"]
+    json.loads(json.dumps(data, ensure_ascii=False))
