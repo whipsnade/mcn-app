@@ -1190,21 +1190,142 @@ async def test_read_tool_result_single_oversized_item_placeholder(db_session, us
 
 
 async def test_search_evidence_total_budget_limits_large_views(db_session, user_factory) -> None:
-    """search_evidence 多个大 view 仍满足总预算，超预算截断并标记。"""
+    """search_evidence 多个大 view 仍满足总预算；超匹配上限时截断并标记；
+    完整 view 放不下的 match 退化为最小 match（含 evidence_id）。"""
     user = await user_factory()
     session, run, _step, call = await _make_chain(db_session, user.id)
-    for _ in range(10):
+    for _ in range(25):
         big_payload = {"rows": [{"idx": j, "text": "x" * 800} for j in range(200)]}
         await _make_evidence(db_session, session, run, call, raw_payload=big_payload)
     context = ToolContext(user_id=user.id, session_id=session.id, run_id=run.id, profile_name="session_analyst_v1")
     tool = SearchEvidenceTool(db_session)
     result = await tool.execute(context, type(tool).input_model(query=""))
     data = _summary(result)
-    assert data["total_matches"] == 10
+    assert data["total_matches"] == 25
     # 与真实响应同构（ensure_ascii=False）测量总字符。
     assert len(json.dumps(data, ensure_ascii=False)) <= _MAX_TOOL_RESULT_TOTAL_CHARS
-    assert data["returned_matches"] <= 10
-    assert data["returned_matches"] < data["total_matches"]
+    # 匹配上限 20：返回 20 个（完整 view 放不下的退化为最小 match），其余标记 has_more。
+    assert data["returned_matches"] == 20
+    assert data["has_more"] is True
+    assert data["truncated"] is True
+    # 每个 match 都有 evidence_id，模型可 read_tool_result 钻取。
+    assert all(m.get("evidence_id") for m in data["matches"])
+    json.loads(json.dumps(data, ensure_ascii=False))
+
+
+# ---------------------------------------------------------------------------
+# P1 硬预算：read_tool_result / search_evidence 整个响应 <= 50KB
+# ---------------------------------------------------------------------------
+
+
+async def _make_evidence_with_diagnostics(
+    db_session, session, run, call, *, rows: list[dict], mapping: dict, unmapped: list
+) -> str:
+    """写入带超大诊断字段的 Evidence（field_mapping/unmapped_fields 巨大）。"""
+    from app.agent_runtime.normalization import NormalizationResult
+
+    writer = EvidenceWriter(db_session)
+    normalization = NormalizationResult(
+        version="normalization_v1",
+        status="normalized",
+        preview={"rows": rows, "row_count": len(rows), "truncated": False},
+        field_mapping=mapping,
+        unmapped_fields=tuple(unmapped),
+        truncated=False,
+    )
+    item = await writer.write(
+        session_id=session.id,
+        run_id=run.id,
+        tool_call_id=call.id,
+        source_type="mcp",
+        source_name="query_analysis_data",
+        scope_json=None,
+        period_json=None,
+        raw_payload={"rows": rows},
+        normalization=normalization,
+    )
+    return item.id
+
+
+async def test_read_tool_result_huge_diagnostics_within_budget(
+    db_session, user_factory
+) -> None:
+    """Evidence 诊断字段本身超过预算：safe_summary <= 50KB、JSON 合法、
+    多页遍历无丢行、无重复、cursor 单调前进。"""
+    user = await user_factory()
+    session, run, _step, call = await _make_chain(db_session, user.id)
+    rows = [{"volume": i} for i in range(50)]
+    evidence_id = await _make_evidence_with_diagnostics(
+        db_session, session, run, call,
+        rows=rows,
+        mapping={f"col{i}": "x" * 900 for i in range(200)},
+        unmapped=["x" * 900] * 300,
+    )
+    context = ToolContext(user_id=user.id, session_id=session.id, run_id=run.id, profile_name="session_analyst_v1")
+    tool = ReadToolResultTool(db_session)
+
+    first = _summary(await tool.execute(context, type(tool).input_model(evidence_id=evidence_id, limit=20)))
+    assert len(json.dumps(first, ensure_ascii=False)) <= _MAX_TOOL_RESULT_TOTAL_CHARS
+    json.loads(json.dumps(first, ensure_ascii=False))
+
+    all_rows: list[int] = [
+        item["volume"] for item in first["items"] if isinstance(item, dict) and "volume" in item
+    ]
+    cursor = first["next_cursor"]
+    prev_cursor = 0
+    while cursor is not None:
+        page = _summary(await tool.execute(
+            context, type(tool).input_model(evidence_id=evidence_id, cursor=int(cursor), limit=20)
+        ))
+        assert len(json.dumps(page, ensure_ascii=False)) <= _MAX_TOOL_RESULT_TOTAL_CHARS
+        json.loads(json.dumps(page, ensure_ascii=False))
+        # 提取实际数据行（跳过截断占位）。
+        all_rows.extend(item["volume"] for item in page["items"] if isinstance(item, dict) and "volume" in item)
+        assert int(cursor) > prev_cursor  # cursor 单调前进
+        prev_cursor = int(cursor)
+        cursor = page["next_cursor"]
+    assert len(all_rows) == 50
+    assert len(set(all_rows)) == 50
+    assert sorted(all_rows) == list(range(50))
+
+
+async def test_search_evidence_long_query_structured_invalid(
+    db_session, user_factory
+) -> None:
+    """超长 query 返回结构化 invalid_arguments，不能 500、不能原样回显 60KB。"""
+    user = await user_factory()
+    session, run, _step, call = await _make_chain(db_session, user.id)
+    await _make_evidence(db_session, session, run, call, raw_payload={"rows": [{"k": 1}]})
+    context = ToolContext(user_id=user.id, session_id=session.id, run_id=run.id, profile_name="session_analyst_v1")
+    tool = SearchEvidenceTool(db_session)
+    # 以 dict 传入，让 execute 内 _parse_args 走校验（构造 input_model 会提前抛）。
+    result = await tool.execute(context, {"query": "x" * 60_000})
+    assert result.status == "failed"
+    assert result.error_type == INVALID_ARGUMENTS
+    assert len(result.safe_summary) < 1000  # 不原样回显 60KB
+
+
+async def test_search_evidence_minimal_match_when_view_too_big(
+    db_session, user_factory
+) -> None:
+    """完整 view 放不下时返回含 evidence_id 的最小 match，模型仍可 read_tool_result。"""
+    user = await user_factory()
+    session, run, _step, call = await _make_chain(db_session, user.id)
+    evidence_id = await _make_evidence_with_diagnostics(
+        db_session, session, run, call,
+        rows=[{"volume": i} for i in range(3)],
+        mapping={f"col{i}": "x" * 900 for i in range(200)},
+        unmapped=["x" * 900] * 300,
+    )
+    context = ToolContext(user_id=user.id, session_id=session.id, run_id=run.id, profile_name="session_analyst_v1")
+    tool = SearchEvidenceTool(db_session)
+    result = await tool.execute(context, type(tool).input_model(query=""))
+    data = _summary(result)
+    assert data["total_matches"] == 1
+    assert len(json.dumps(data, ensure_ascii=False)) <= _MAX_TOOL_RESULT_TOTAL_CHARS
+    assert data["returned_matches"] >= 1
+    # 至少一个 match 含 evidence_id，可被 read_tool_result 使用。
+    assert any(m.get("evidence_id") == evidence_id for m in data["matches"])
     assert data["has_more"] == (data["returned_matches"] < data["total_matches"])
     assert data["truncated"] == data["has_more"]
     json.loads(json.dumps(data, ensure_ascii=False))

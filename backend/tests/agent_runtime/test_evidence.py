@@ -454,3 +454,70 @@ def test_build_preview_caps_row_count_and_fields() -> None:
     assert "payload_hash" in preview
     assert preview["row_count"] == 100
     assert preview["truncated"] is True
+
+
+# ---------------------------------------------------------------------------
+# P1 硬预算：preview/field_mapping/unmapped_fields 共同参与 50KB 总预算
+# ---------------------------------------------------------------------------
+
+_EXPECTED_VIEW_KEYS = {
+    "evidence_id",
+    "preview",
+    "normalization_status",
+    "field_mapping",
+    "unmapped_fields",
+    "row_count",
+    "truncated",
+    "source_name",
+    "source_type",
+}
+
+
+def test_model_view_hard_budget_large_diagnostics_all_fixed_keys() -> None:
+    """大 preview + 大 field_mapping + 大 unmapped_fields：固定键全部存在、
+    truncated=true、总序列化 <= 50KB。"""
+    stored = {
+        "preview": {f"k{i}": "x" * 900 for i in range(200)},
+        "field_mapping": {f"col{i}": "x" * 900 for i in range(200)},
+        "unmapped_fields": ["x" * 900] * 300,
+        "row_count": 5000,
+        "truncated": False,
+    }
+    view = _view_for(stored)
+    assert set(view.keys()) == _EXPECTED_VIEW_KEYS
+    assert view["truncated"] is True
+    assert len(json.dumps(view, ensure_ascii=False)) <= 50_000
+    json.loads(json.dumps(view, ensure_ascii=False))
+
+
+def test_model_view_hard_budget_small_preview_huge_diagnostics() -> None:
+    """preview 很小但 field_mapping/unmapped_fields 巨大：诊断字段也必须被压缩。"""
+    stored = {
+        "preview": {"k": 1},
+        "field_mapping": {f"col{i}": "x" * 900 for i in range(200)},
+        "unmapped_fields": ["x" * 900] * 300,
+        "row_count": 10,
+        "truncated": False,
+    }
+    view = _view_for(stored)
+    assert set(view.keys()) == _EXPECTED_VIEW_KEYS
+    assert len(json.dumps(view, ensure_ascii=False)) <= 50_000
+    json.loads(json.dumps(view, ensure_ascii=False))
+
+
+def test_model_view_hard_budget_degrade_order_keeps_minimum_shape() -> None:
+    """极端超预算（preview+诊断全部巨大）时仍保持最小固定形状且合法。"""
+    stored = {
+        "preview": {f"k{i}": "x" * 900 for i in range(200)},
+        "field_mapping": {f"col{i}": "x" * 900 for i in range(200)},
+        "unmapped_fields": ["x" * 900] * 300,
+        "row_count": 5000,
+        "truncated": False,
+    }
+    view = _view_for(stored)
+    serialized = json.dumps(view, ensure_ascii=False)
+    assert len(serialized) <= 50_000
+    parsed = json.loads(serialized)
+    assert set(parsed.keys()) == _EXPECTED_VIEW_KEYS
+    # 降级顺序：preview 优先变哨兵，诊断随后按字符预算压缩或清空。
+    assert parsed["preview"] == {"__truncated__": True} or parsed["preview"] != stored["preview"]

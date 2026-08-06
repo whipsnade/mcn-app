@@ -578,3 +578,66 @@ async def test_p1_worksheet_dimension_error_code_persisted(upload_client, db_ses
     assert upload is not None
     assert upload.status == "failed"
     assert upload.error_code == "worksheet_dimensions_exceeded"
+
+
+# ---------------------------------------------------------------------------
+# P2: 窄表按实际工作表宽度迭代（不再固定 1000 列）
+# ---------------------------------------------------------------------------
+
+
+def test_p2_two_column_narrow_table_parses_two_columns() -> None:
+    """两列窄表解析结果仍为两列（不因 max_col 上限膨胀列名）。"""
+    columns, rows = _parse_xlsx(_xlsx_bytes(), max_rows=50000)
+    assert len(columns) == 2
+    assert columns == ["平台", "声量"]
+    assert len(rows) == 2
+
+
+def test_p2_iter_rows_uses_effective_width(monkeypatch) -> None:
+    """iter_rows 的 max_col 使用实际工作表宽度（2 列窄表按 2 迭代，而非 1000）。"""
+    from openpyxl.worksheet._read_only import ReadOnlyWorksheet
+
+    captured: list[int | None] = []
+    original = ReadOnlyWorksheet.iter_rows
+
+    def _spy(self, *args, **kwargs):
+        captured.append(kwargs.get("max_col"))
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(ReadOnlyWorksheet, "iter_rows", _spy)
+    columns, rows = _parse_xlsx(_xlsx_bytes(), max_rows=50000)
+    assert captured
+    assert all(max_col == 2 for max_col in captured)
+    assert len(columns) == 2
+    assert len(rows) == 2
+
+
+def test_p2_many_row_narrow_table_parses_all_rows() -> None:
+    """多行窄表（2000 行 × 2 列）解析全部数据行，不被误拒绝。"""
+    from openpyxl import Workbook
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.append(["平台", "声量"])
+    for i in range(2000):
+        sheet.append([f"平台{i}", i])
+    buffer = io.BytesIO()
+    workbook.save(buffer)
+    columns, rows = _parse_xlsx(buffer.getvalue(), max_rows=50000)
+    assert len(columns) == 2
+    assert len(rows) == 2000
+    assert rows[0] == {"平台": "平台0", "声量": 0}
+    assert rows[-1] == {"平台": "平台1999", "声量": 1999}
+
+
+def test_p2_no_dimension_huge_row_r_bounded(monkeypatch) -> None:
+    """dimension 缺失、row r 极大：迭代有界、不无限循环、不抛 CPU 异常。"""
+    sheet = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<worksheet {_WORKSHEET_NS}><sheetData>'
+        '<row r="1"><c r="A1" t="inlineStr"><is><t>平台</t></is></c></row>'
+        '<row r="1048576"><c r="A1048576" t="inlineStr"><is><t>x</t></is></c></row>'
+        "</sheetData></worksheet>"
+    )
+    columns, rows = _parse_xlsx(_custom_xlsx(sheet), max_rows=10)
+    assert len(rows) <= 10  # 有界，不迭代到 1048576 行
