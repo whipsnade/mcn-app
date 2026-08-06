@@ -9,7 +9,7 @@ from uuid import uuid4
 import pytest
 from alembic.config import Config
 from alembic.script import ScriptDirectory
-from sqlalchemy import Integer, func, inspect, select
+from sqlalchemy import Integer, func, inspect, select, text
 
 from app.db.base import Base
 import app.db.models  # noqa: F401
@@ -945,3 +945,71 @@ async def test_phase_two_migration_table_boundaries_restore_head() -> None:
         assert phase_two_tables.issubset(tables_at_head)
     finally:
         _run_alembic("upgrade", "head")
+
+
+async def test_0034_dispatch_count_reversible() -> None:
+    """0034 数据级 upgrade → downgrade → upgrade：dispatch_count 列可逆。"""
+    from app.agent_runtime.models import AgentRun, AgentRunAttempt, AgentSession, AgentStep, AgentToolCall
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    async def has_dispatch_count() -> bool:
+        async with engine.connect() as connection:
+            return "dispatch_count" in {
+                item["name"]
+                for item in await connection.run_sync(
+                    lambda sync: inspect(sync).get_columns("agent_tool_calls")
+                )
+            }
+
+    # 创建一条调用行做数据级测试
+    user_id = str(uuid4())
+    session_id = str(uuid4())
+    now = datetime.now(UTC).replace(tzinfo=None)
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        from app.identity.models import User
+        user = User(id=user_id, nickname="dispatch-test", role="user", status="active",
+                    industries=["美食"], created_at=now, updated_at=now)
+        ag_session = AgentSession(id=session_id, user_id=user_id, title="dispatch",
+                                   status="active", created_at=now, updated_at=now)
+        session.add(user)
+        await session.flush()
+        session.add(ag_session)
+        await session.flush()
+        run = AgentRun(id=str(uuid4()), session_id=session_id, user_id=user_id,
+                       run_kind="user", visibility="user", profile_name="session_analyst_v1",
+                       profile_version="v1", model="test", status="running", decision_count=0,
+                       review_count=0, revision_count=0, started_at=now)
+        session.add(run)
+        await session.flush()
+        attempt = AgentRunAttempt(id=str(uuid4()), run_id=run.id, attempt=1, started_at=now)
+        session.add(attempt)
+        await session.flush()
+        step = AgentStep(id=str(uuid4()), run_id=run.id, attempt_id=attempt.id, sequence=1,
+                         step_type="tool_call", status="running", visibility="user", created_at=now)
+        session.add(step)
+        await session.flush()
+        call = AgentToolCall(id=str(uuid4()), run_id=run.id, step_id=step.id,
+                             logical_call_id="test-dispatch-" + str(uuid4()),
+                             service="insight-cube-mcp", internal_tool_name="query_analysis_data",
+                             arguments_json={}, arguments_hash="a"*64, status="settled",
+                             points_reserved=0, points_settled=10, dispatch_count=1)
+        session.add(call)
+        await session.commit()
+
+    try:
+        assert await has_dispatch_count() is True
+        # downgrade → 0033：dispatch_count 列消失
+        _run_alembic("downgrade", "0033_safe_error_msg_text")
+        assert await has_dispatch_count() is False
+        # upgrade → head：dispatch_count 列恢复
+        _run_alembic("upgrade", "head")
+        assert await has_dispatch_count() is True
+    finally:
+        # 清理测试数据
+        async with engine.begin() as conn:
+            await conn.execute(text(f"DELETE FROM agent_tool_calls WHERE run_id = '{run.id}'"))
+            await conn.execute(text(f"DELETE FROM agent_steps WHERE run_id = '{run.id}'"))
+            await conn.execute(text(f"DELETE FROM agent_run_attempts WHERE run_id = '{run.id}'"))
+            await conn.execute(text(f"DELETE FROM agent_runs WHERE id = '{run.id}'"))
+            await conn.execute(text(f"DELETE FROM agent_sessions WHERE id = '{session_id}'"))
+            await conn.execute(text(f"DELETE FROM users WHERE id = '{user_id}'"))
