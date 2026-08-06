@@ -53,7 +53,7 @@ from app.agent_artifacts.payloads.kol_selection import (
 from app.agent_runtime.models import AgentToolCall
 from app.agent_runtime.tools.calculation import RankKolsArgs, RankKolsTool
 from app.agent_runtime.tools.contracts import ToolContext
-from app.agent_runtime.tools.mcp import arguments_hash, logical_call_id_for
+from app.agent_runtime.tools.contracts import arguments_hash, logical_call_id_for
 from app.selection.scoring_v2 import SCORE_VERSION_V2
 
 SCHEMA_VERSION = "kol_selection_v3"

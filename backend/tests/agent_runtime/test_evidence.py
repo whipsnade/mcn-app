@@ -24,6 +24,7 @@ from app.agent_runtime.models import (
     AgentToolCall,
     EvidenceItem,
 )
+from app.agent_runtime.normalization import NormalizationRegistry
 from app.mcp_gateway.validation import canonical_json_bytes
 
 FULL_PAYLOAD = {
@@ -130,6 +131,60 @@ async def test_evidence_inserts_row_with_hash_and_preview(db_session, user_facto
     assert row.normalized_preview_json != FULL_PAYLOAD
     assert row.availability_status == "available"
     assert row.collected_at is not None
+
+
+@pytest.mark.asyncio
+async def test_evidence_write_persists_normalization_diagnostics(
+    db_session, user_factory
+) -> None:
+    """EvidenceWriter 同一事务保存归一化诊断（Gate B：字段映射随 Evidence 落库）。"""
+    user = await user_factory()
+    session, run, step, call = await _make_chain(db_session, user.id)
+    writer = EvidenceWriter(db_session)
+    normalization = NormalizationRegistry().normalize(
+        "query_analysis_data",
+        {"data": [{"日": "2026-08-01", "声量": 12}]},
+    )
+    item = await writer.write(
+        session_id=session.id,
+        run_id=run.id,
+        tool_call_id=call.id,
+        source_type="mcp",
+        source_name="query_analysis_data",
+        scope_json=None,
+        period_json=None,
+        raw_payload={"data": [{"日": "2026-08-01", "声量": 12}]},
+        collected_at=_now(),
+        normalization=normalization,
+    )
+    assert item.normalization_version == normalization.version
+    assert item.normalization_status == "normalized"
+    assert item.field_mapping_json == normalization.field_mapping
+    assert item.unmapped_fields_json == list(normalization.unmapped_fields)
+    assert item.normalization_error_code is None
+
+
+@pytest.mark.asyncio
+async def test_evidence_write_without_normalization_keeps_diagnostic_columns_null(
+    db_session, user_factory
+) -> None:
+    user = await user_factory()
+    session, run, step, call = await _make_chain(db_session, user.id)
+    writer = EvidenceWriter(db_session)
+    item = await writer.write(
+        session_id=session.id,
+        run_id=run.id,
+        tool_call_id=call.id,
+        source_type="mcp",
+        source_name="query_analysis_data",
+        scope_json=None,
+        period_json=None,
+        raw_payload=FULL_PAYLOAD,
+        collected_at=_now(),
+    )
+    assert item.normalization_version is None
+    assert item.normalization_status is None
+    assert item.normalization_error_code is None
 
 
 @pytest.mark.asyncio

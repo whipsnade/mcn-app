@@ -49,6 +49,9 @@ POSITIVE_KEYS = ("正面声量数", "正面声量", "正面", "positive")
 NEUTRAL_KEYS = ("中性声量数", "中性声量", "中性", "neutral")
 NEGATIVE_KEYS = ("负面声量数", "负面声量", "负面", "negative")
 DATE_KEYS = ("日期", "时间", "date", "published_at")
+# Gate B：趋势时间键统一别名（含「日」「周」），brand builder 与
+# NormalizationRegistry 共用同一常量，DataTap 返回日/周列时不丢数据。
+TIME_KEYS = ("日期", "日", "周", "时间", "date", "published_at")
 SENTIMENT_KEYS = ("情感", "内容情感", "情绪", "sentiment")
 REGION_KEYS = ("地区", "省份", "地域", "region", "province")
 REGION_MAP_KEYS = ("地域分布", "省份分布", "地区分布")
@@ -395,6 +398,7 @@ __all__ = [
     "SENTIMENT_KEYS",
     "SHARE_KEYS",
     "TIER_KEYS",
+    "TIME_KEYS",
     "TITLE_KEYS",
     "TOPIC_KEYS",
     "URL_KEYS",

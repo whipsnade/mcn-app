@@ -9,9 +9,14 @@
 剥离，见 :data:`SERVER_RESERVED_KEYS`。
 """
 
-from typing import Literal, Protocol
+from __future__ import annotations
+
+import hashlib
+from typing import Any, Literal, Mapping, Protocol
 
 from pydantic import BaseModel, ConfigDict, ValidationError
+
+from app.mcp_gateway.validation import canonical_json_bytes
 
 ToolStatus = Literal["success", "failed", "unknown"]
 
@@ -78,6 +83,19 @@ class ToolContext(BaseModel):
 SERVER_RESERVED_KEYS: frozenset[str] = frozenset(
     {"user_id", "session_id", "run_id", "step_id"}
 )
+
+
+def arguments_hash(normalized_arguments: Mapping[str, Any]) -> str:
+    """参数先按工具 Schema 归一化，再 canonical JSON + SHA-256。"""
+    return hashlib.sha256(canonical_json_bytes(normalized_arguments)).hexdigest()
+
+
+def logical_call_id_for(
+    run_id: str, step_id: str, internal_tool_name: str, arguments_hash: str
+) -> str:
+    """确定性派生全局唯一 logical_call_id（§8.1）。"""
+    raw = "\x00".join((run_id, step_id, internal_tool_name, arguments_hash))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 class TrustedTool(Protocol):

@@ -13,7 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from sqlalchemy import select
@@ -21,6 +21,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_runtime.models import EvidenceItem
 from app.mcp_gateway.validation import canonical_json_bytes
+
+if TYPE_CHECKING:
+    # 仅类型检查用：运行时 write() 对 normalization 鸭子类型访问，避免
+    # evidence → normalization → builders 包 → tools → mcp → evidence
+    # 的循环导入（builders/__init__ 与 tools/__init__ 均 eager import）。
+    from app.agent_runtime.normalization import NormalizationResult
 
 # 预览截断上限（§10.2：返回模型的是受控预览而非原始全文）。
 _MAX_PREVIEW_STRING = 2_000
@@ -145,6 +151,7 @@ class EvidenceWriter:
         raw_payload: Any,
         collected_at: datetime | None = None,
         availability_status: str = "available",
+        normalization: NormalizationResult | None = None,
     ) -> EvidenceItem:
         preview = build_preview(raw_payload)
         item = EvidenceItem(
@@ -161,6 +168,14 @@ class EvidenceWriter:
             payload_hash=preview["payload_hash"],
             collected_at=collected_at or _now(),
             availability_status=availability_status,
+            truncated=bool(preview["truncated"] or (normalization.truncated if normalization else False)),
+            normalization_version=normalization.version if normalization else None,
+            normalization_status=normalization.status if normalization else None,
+            field_mapping_json=normalization.field_mapping if normalization else None,
+            unmapped_fields_json=(
+                list(normalization.unmapped_fields) if normalization else None
+            ),
+            normalization_error_code=normalization.error_code if normalization else None,
         )
         self._db.add(item)
         await self._db.flush()

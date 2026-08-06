@@ -40,7 +40,6 @@ from app.agent_artifacts.builders.raw_rows import (
     AGGREGATE_PLATFORM_NAMES,
     COMMERCIAL_KEYS,
     CONTENT_TYPE_KEYS,
-    DATE_KEYS,
     ENGAGEMENT_KEYS,
     NEGATIVE_KEYS,
     NEUTRAL_KEYS,
@@ -51,6 +50,7 @@ from app.agent_artifacts.builders.raw_rows import (
     REGION_MAP_KEYS,
     SENTIMENT_KEYS,
     TIER_KEYS,
+    TIME_KEYS,
     TOPIC_KEYS,
     VOLUME_KEYS,
     RowRef,
@@ -373,7 +373,7 @@ def _build_daily_trend(
 ) -> tuple[list[dict[str, Any]], bool]:
     buckets: dict[tuple[date, str], dict[str, Any]] = {}
     for ref in rows:
-        day = parse_date(first(ref.row, DATE_KEYS))
+        day = parse_date(first(ref.row, TIME_KEYS))
         if day is None:
             continue  # 无日期行（常为合计行）按旧口径静默跳过
         platform = canon_platform(first(ref.row, PLATFORM_KEYS))

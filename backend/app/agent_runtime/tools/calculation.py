@@ -26,8 +26,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_runtime.models import AgentToolCall
-from app.agent_runtime.tools.contracts import ToolContext, ToolResult
-from app.agent_runtime.tools.mcp import arguments_hash, logical_call_id_for
+from app.agent_runtime.tools.contracts import (
+    ToolContext,
+    ToolResult,
+    arguments_hash,
+    logical_call_id_for,
+)
 from app.mcp_gateway.validation import McpValidationError
 from app.selection.scoring_v2 import (
     SCORE_VERSION_V2,

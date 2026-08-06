@@ -25,7 +25,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 from collections.abc import Callable, Mapping
 from contextlib import AbstractAsyncContextManager
@@ -41,13 +40,19 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_runtime.circuit_breaker import FineGrainedCircuitBreaker
 from app.agent_runtime.evidence import EvidenceWriter
+from app.agent_runtime.normalization import NormalizationRegistry
 from app.agent_runtime.models import (
     AgentRun,
     AgentStep,
     AgentToolCall,
     AgentToolCallReconciliation,
 )
-from app.agent_runtime.tools.contracts import ToolContext, ToolResult
+from app.agent_runtime.tools.contracts import (
+    ToolContext,
+    ToolResult,
+    arguments_hash,
+    logical_call_id_for,
+)
 from app.billing.service import InsufficientPointsError, WalletService
 from app.db.session import SessionFactory
 from app.mcp_gateway.contracts import DataTapService
@@ -66,7 +71,6 @@ from app.mcp_gateway.transport import (
 )
 from app.mcp_gateway.validation import (
     McpValidationError,
-    canonical_json_bytes,
     validate_input,
     validate_output,
 )
@@ -106,19 +110,6 @@ SessionFactoryLike = Callable[[], AbstractAsyncContextManager[AsyncSession]]
 
 def _now() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
-
-
-def arguments_hash(normalized_arguments: Mapping[str, Any]) -> str:
-    """参数先按工具 Schema 归一化，再 canonical JSON + SHA-256。"""
-    return hashlib.sha256(canonical_json_bytes(normalized_arguments)).hexdigest()
-
-
-def logical_call_id_for(
-    run_id: str, step_id: str, internal_tool_name: str, arguments_hash: str
-) -> str:
-    """确定性派生全局唯一 logical_call_id（§8.1）。"""
-    raw = "\x00".join((run_id, step_id, internal_tool_name, arguments_hash))
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def _extract_scope_period(arguments: Mapping[str, Any]) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
@@ -339,6 +330,9 @@ class DurableToolCallCoordinator:
                 scope_json=scope,
                 period_json=period,
                 raw_payload=validated_payload,
+                normalization=NormalizationRegistry().normalize(
+                    self._internal_tool_name, validated_payload
+                ),
             )
             row.upstream_request_id = upstream_request_id
             await AgentMcpAccounting(db).settle(user_id, row)
@@ -497,6 +491,9 @@ class DurableToolCallCoordinator:
                     scope_json=scope,
                     period_json=period,
                     raw_payload=validated_payload,
+                    normalization=NormalizationRegistry().normalize(
+                        self._internal_tool_name, validated_payload
+                    ),
                 )
                 evidence_id = evidence.id
             if upstream_request_id:

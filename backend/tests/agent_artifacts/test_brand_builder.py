@@ -260,6 +260,34 @@ def test_complete_payload_deterministic_aggregation() -> None:
     assert payload["narrative"]["findings"][0]["title"] == "抖音贡献主要声量"
 
 
+def test_daily_trend_accepts_chinese_day_column() -> None:
+    trend_rows = [
+        {
+            "日": "2026-07-01",
+            "平台": "小红书",
+            "声量": 10,
+            "互动数": 100,
+            "正面": 6,
+            "中性": 3,
+            "负面": 1,
+        },
+    ]
+    evidence = {
+        "overview_current": [("ev-ov", _overview_rows())],
+        "overview_mom": [("ev-mom", _mom_rows())],
+        "sentiment": [("ev-sent", _sentiment_rows())],
+        "daily_trend": [("ev-trend", trend_rows)],
+        "topics": [("ev-topics", _topic_rows())],
+        "top_posts": [("ev-posts", _post_rows())],
+    }
+    build = build_brand_report_draft(
+        scope=SCOPE, evidence=evidence, narrative=NARRATIVE
+    )
+    trend = build.payload["data"]["daily_trend"]
+    assert [item["date"] for item in trend] == ["2026-07-01"]
+    assert trend[0]["volume"] == 10
+
+
 def test_comparison_mom_windows_and_rates() -> None:
     build = build_brand_report_draft(
         scope=SCOPE, evidence=_full_evidence(), narrative=NARRATIVE
