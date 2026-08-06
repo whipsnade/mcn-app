@@ -168,6 +168,18 @@ class UploadService:
                 message=f"file exceeds {self._max_rows} data rows",
             )
 
+        # 上传列映射诊断：所有列都是用户自定义 schema，不映射 MCP 规范键，
+        # 全部列为 unmapped_fields 供模型参考（不误报失败）。
+        from app.agent_runtime.normalization import NormalizationResult
+
+        upload_normalization = NormalizationResult(
+            version="upload_v1",
+            status="not_applicable",
+            preview={"columns": columns, "row_count": len(rows)},
+            field_mapping={},
+            unmapped_fields=tuple(columns),
+            truncated=len(rows) > _PREVIEW_ROW_CAP,
+        )
         await EvidenceWriter(self._db).write(
             session_id=session_id,
             run_id=None,
@@ -182,6 +194,7 @@ class UploadService:
                 "rows": rows,
                 "truncated": len(rows) > _PREVIEW_ROW_CAP,
             },
+            normalization=upload_normalization,
         )
         upload.status = "parsed"
         upload.completed_at = _now()

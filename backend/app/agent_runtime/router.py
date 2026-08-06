@@ -990,6 +990,10 @@ async def retry_run(
     }
     if original_snapshot.get("parent_run_id") is not None:
         retried_snapshot["parent_run_id"] = original_snapshot["parent_run_id"]
+    # 继承原 Run 的上传引用（Gate B 审查：retry 丢失 upload_ids 导致模型无法
+    # 钻取已上传文件）。
+    if original_snapshot.get("upload_ids"):
+        retried_snapshot["upload_ids"] = original_snapshot["upload_ids"]
     retried = AgentRun(
         id=str(uuid4()),
         session_id=run.session_id,

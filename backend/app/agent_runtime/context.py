@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_runtime.memory import (
@@ -25,12 +26,11 @@ from app.agent_runtime.memory import (
     DEFAULT_RUN_SUMMARY_LIMIT,
     MemoryContextBuilder,
 )
-from app.agent_runtime.models import AgentRun
+from app.agent_runtime.models import AgentRun, EvidenceItem
 from app.agent_runtime.profiles import AgentProfile
 from app.agent_runtime.tools.registry import ToolRegistry
 from app.model.contracts import ChatMessage
 
-# Run 引用快照中进入模型上下文的键（idempotency_key/content_hash 属控制字段，排除）。
 _REFERENCE_SNAPSHOT_KEYS = ("parent_run_id", "artifact_version_ids", "retry_of", "evidence_ids")
 
 
@@ -45,6 +45,7 @@ class SessionContextBuilder:
         recent_message_window: int = DEFAULT_RECENT_MESSAGE_WINDOW,
         run_summary_limit: int = DEFAULT_RUN_SUMMARY_LIMIT,
     ) -> None:
+        self._db = db
         self._memory = MemoryContextBuilder(db, registry)
         self._recent_message_window = recent_message_window
         self._run_summary_limit = run_summary_limit
@@ -58,7 +59,6 @@ class SessionContextBuilder:
         current_user_message: str = "",
         channel_permissions: tuple[str, ...] = (),
     ) -> list[ChatMessage]:
-        """返回发送给模型的完整消息列表（不含 system prompt，网关会前插）。"""
         memory = await self._memory.build(
             user_id=run.user_id,
             session_id=run.session_id,
@@ -68,19 +68,34 @@ class SessionContextBuilder:
             recent_message_window=self._recent_message_window,
             run_summary_limit=self._run_summary_limit,
         )
-        references = self._run_references(run)
+        references = await self._run_references(run)
         if references:
             memory["run_references"] = references
         header = json.dumps(memory, ensure_ascii=False, default=str)
         return [ChatMessage(role="user", content=header), *conversation]
 
-    @staticmethod
-    def _run_references(run: AgentRun) -> dict[str, Any]:
-        """从 Run 引用快照提取模型可见的父 Run / Artifact / Evidence 引用。"""
+    async def _run_references(self, run: AgentRun) -> dict[str, Any]:
+        """从 Run 引用快照提取模型可见的父 Run / Artifact / Evidence / 上传引用。
+
+        upload_ids 解析为对应 evidence_id 列表（模型按 evidence_id 钻取，
+        不直接持有 upload_id）；幂等键等控制字段不进入上下文。
+        """
         snapshot = run.prompt_snapshot_json or {}
-        return {
+        refs = {
             key: snapshot[key] for key in _REFERENCE_SNAPSHOT_KEYS if key in snapshot
         }
+        upload_ids = snapshot.get("upload_ids")
+        if upload_ids:
+            rows = await self._db.scalars(
+                select(EvidenceItem.id)
+                .where(
+                    EvidenceItem.session_id == run.session_id,
+                    EvidenceItem.upload_id.in_(upload_ids),
+                )
+                .order_by(EvidenceItem.collected_at.desc())
+            )
+            refs["upload_evidence_ids"] = list(rows)
+        return refs
 
 
 __all__ = ["SessionContextBuilder"]

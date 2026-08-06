@@ -15,7 +15,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Callable, Literal
 
-from app.agent_artifacts.builders.raw_rows import TIME_KEYS, VOLUME_KEYS, num, text
+from app.agent_artifacts.builders.raw_rows import TIME_KEYS, VOLUME_KEYS, num, text, unwrap_payload
 
 logger = logging.getLogger(__name__)
 
@@ -42,12 +42,13 @@ class NormalizationResult:
 
 
 def _extract_rows(payload: JsonValue) -> list[dict[str, Any]] | None:
-    """从 DataTap payload 提取行列表；无行容器返回 None。"""
-    if isinstance(payload, list):
-        return [item for item in payload if isinstance(item, dict)]
-    if isinstance(payload, dict):
+    """从 DataTap payload 提取行列表；先解 {"result":"<json>"} 包装。"""
+    unwrapped, _ = unwrap_payload(payload)
+    if isinstance(unwrapped, list):
+        return [item for item in unwrapped if isinstance(item, dict)]
+    if isinstance(unwrapped, dict):
         for key in _ROW_CONTAINER_KEYS:
-            value = payload.get(key)
+            value = unwrapped.get(key)
             if isinstance(value, list):
                 return [item for item in value if isinstance(item, dict)]
     return None

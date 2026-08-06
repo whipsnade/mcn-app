@@ -806,7 +806,15 @@ class AgentMcpTool:
                 suggested_actions=["调整查询参数获取结构化结果，或继续其他章节"],
                 upstream_reason="upstream returned no structured content",
             )
-        summary = json.dumps(preview, ensure_ascii=False)
+        normalization = NormalizationRegistry().normalize(self.name, validated)
+        summary = json.dumps(
+            {
+                "preview": preview,
+                "normalization_status": normalization.status,
+                "unmapped_fields": list(normalization.unmapped_fields),
+            },
+            ensure_ascii=False,
+        )
         return ToolResult(
             status="success",
             safe_summary=summary[:1_000],
