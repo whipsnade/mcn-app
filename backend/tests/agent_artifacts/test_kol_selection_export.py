@@ -15,7 +15,6 @@ from openpyxl import load_workbook
 from app.agent_artifacts.exporters import ArtifactExportUnsupported, export_artifact
 
 from tests.agent_artifacts.test_payloads import (
-    build_campaign_dict,
     build_insight_dict,
     build_kol_analysis_dict,
     build_kol_detail_dict,
@@ -143,7 +142,6 @@ def test_invalid_published_kol_payload_raises_unsupported() -> None:
 
 def test_other_artifact_types_raise_unsupported() -> None:
     for schema, factory in (
-        ("campaign_report_v2", build_campaign_dict),
         ("kol_analysis_v2", build_kol_analysis_dict),
         ("kol_detail_v2", build_kol_detail_dict),
         ("insight_board_v1", build_insight_dict),

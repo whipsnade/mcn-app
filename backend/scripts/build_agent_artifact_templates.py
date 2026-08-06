@@ -125,6 +125,65 @@ def build_kol(source: Path, output_dir: Path) -> Path:
     return target
 
 
+def build_campaign(output_dir: Path) -> Path:
+    """程序化生成活动模板（9 基础 Sheet；ROI Sheet 由导出器按数据条件插入）。
+
+    视觉规范：标题 #1F4E79、交替行 #D6E4F0、微软雅黑、统一打印区。
+    """
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+
+    TITLE_FONT = Font(name="微软雅黑", bold=True, size=14, color="1F4E79")
+    SECTION_FONT = Font(name="微软雅黑", bold=True, size=11, color="1F4E79")
+    HEADER_FILL = PatternFill("solid", fgColor="D9E2F3")
+    HEADER_FONT = Font(name="微软雅黑", bold=True, size=10)
+    THIN = Side(style="thin", color="B0B0B0")
+    HEADER_BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+    ALTERNATE_FILL = PatternFill("solid", fgColor="D6E4F0")
+    CENTER = Alignment(horizontal="center", vertical="center")
+
+    wb = Workbook()
+    wb.remove(wb.active)
+
+    sheet_specs = [
+        ("活动综合概览", 6),
+        ("周期对比与趋势", 6),
+        ("平台表现", 6),
+        ("情感与内容分析", 6),
+        ("热门帖子TOP", 8),
+        ("达人投放表现", 6),
+        ("自然传播与受众", 6),
+        ("洞察与建议", 4),
+        ("方法论", 4),
+    ]
+    for name, columns in sheet_specs:
+        ws = wb.create_sheet(name)
+        for column in range(1, columns + 1):
+            ws.column_dimensions[chr(64 + column)].width = 16
+        ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=columns)
+        title_cell = ws.cell(1, 1)
+        title_cell.value = name
+        title_cell.font = TITLE_FONT
+        ws.sheet_view.showGridLines = False
+        ws.print_options.horizontalCentered = True
+        ws.page_setup.fitToWidth = 1
+        ws.page_setup.orientation = "landscape"
+
+    # 表头样式（各 Sheet 第 3 行：渲染器重写内容但保留样式锚点）。
+    for ws in wb.worksheets:
+        for column in range(1, 9):
+            cell = ws.cell(3, column)
+            cell.font = HEADER_FONT
+            cell.fill = HEADER_FILL
+            cell.border = HEADER_BORDER
+            cell.alignment = CENTER
+
+    _write_template_metadata(wb, "活动综合概览")
+    target = output_dir / "campaign_report_v2.xlsx"
+    wb.save(target)
+    return target
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="清洗来源模板为受控导出模板")
     parser.add_argument("--brand-source", required=True, help="品牌模板来源 xlsx")
@@ -136,8 +195,10 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     brand = build_brand(Path(args.brand_source), output_dir)
     kol = build_kol(Path(args.kol_source), output_dir)
+    campaign = build_campaign(output_dir)
     print(brand)
     print(kol)
+    print(campaign)
 
 
 if __name__ == "__main__":

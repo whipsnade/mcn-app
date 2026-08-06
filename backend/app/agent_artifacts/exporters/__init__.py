@@ -16,6 +16,7 @@ from __future__ import annotations
 from pydantic import ValidationError
 
 from app.agent_artifacts.exporters.brand import render_brand_workbook
+from app.agent_artifacts.exporters.campaign import render_campaign_workbook
 from app.agent_artifacts.exporters.kol_selection import render_kol_selection_workbook
 
 
@@ -36,6 +37,7 @@ class ArtifactExportUnsupported(Exception):
 _SUPPORTED_EXPORTERS = {
     "brand_report_v3": render_brand_workbook,
     "kol_selection_v3": render_kol_selection_workbook,
+    "campaign_report_v2": render_campaign_workbook,
 }
 
 
@@ -71,5 +73,6 @@ __all__ = [
     "ArtifactExportUnsupported",
     "export_artifact",
     "render_brand_workbook",
+    "render_campaign_workbook",
     "render_kol_selection_workbook",
 ]
