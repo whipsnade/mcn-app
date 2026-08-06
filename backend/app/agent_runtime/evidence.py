@@ -158,6 +158,13 @@ class EvidenceWriter:
         if (tool_call_id is None) == (upload_id is None):
             raise ValueError("exactly one of tool_call_id/upload_id is required")
         preview = build_preview(raw_payload)
+        # 统一模型视图：raw preview + normalization 诊断合并为单个 JSON，
+        # 模型经 read_tool_result / search_evidence / Transcript 恢复消费同一视图。
+        if normalization is not None:
+            preview["normalization_status"] = normalization.status
+            preview["normalization_preview"] = normalization.preview
+            preview["field_mapping"] = normalization.field_mapping
+            preview["unmapped_fields"] = list(normalization.unmapped_fields)
         item = EvidenceItem(
             id=str(uuid4()),
             session_id=session_id,

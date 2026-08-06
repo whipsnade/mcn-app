@@ -391,27 +391,38 @@ async def _validate_artifact_version_ids(
 
 async def _validate_upload_ids(
     db: AsyncSession, user_id: str, session_id: str, upload_ids: tuple[str, ...]
-) -> list[str]:
-    """校验引用的上传属当前用户且属于本 Session、状态为 parsed（Gate B）。
+) -> list[dict[str, Any]]:
+    """校验上传归属 + parsed 状态，冻结精确引用（upload_id + evidence_id + filename + sha256）。
 
-    归属失败统一 404（不泄漏存在性）；未 parsed 视为不可用同样 404。按入参
-    顺序去重后返回。未被本轮引用的 Session 上传不会混入模型上下文。
+    归属失败统一 404；未 parsed 同样 404。按入参顺序去重后返回 upload_refs 列表。
+    未被本轮引用的 Session 上传不会混入模型上下文。
     """
     if not upload_ids:
         return []
+    unique_ids = tuple(dict.fromkeys(upload_ids))
     rows = await db.scalars(
-        select(AgentUpload).where(AgentUpload.id.in_(tuple(dict.fromkeys(upload_ids))))
+        select(AgentUpload).where(AgentUpload.id.in_(unique_ids))
     )
     by_id = {row.id: row for row in rows}
-    validated: list[str] = []
-    for upload_id in dict.fromkeys(upload_ids):
+    refs: list[dict[str, Any]] = []
+    for upload_id in unique_ids:
         upload = by_id.get(upload_id)
         if upload is None or upload.user_id != user_id or upload.session_id != session_id:
             raise _not_found("upload_not_found")
         if upload.status != "parsed":
             raise _not_found("upload_not_available")
-        validated.append(upload_id)
-    return validated
+        evidence = await db.scalar(
+            select(EvidenceItem).where(EvidenceItem.upload_id == upload_id)
+        )
+        if evidence is None:
+            raise _not_found("upload_evidence_missing")
+        refs.append({
+            "upload_id": upload_id,
+            "evidence_id": evidence.id,
+            "filename": upload.original_filename,
+            "sha256": upload.sha256,
+        })
+    return refs
 
 
 def _resolve_last_event_id(header_value: str | None, query_value: str | None) -> int:
@@ -577,7 +588,7 @@ async def create_upload(
 ) -> UploadRead:
     await _get_owned_session(db, user.id, session_id)
     # 限制读取量：防止超大文件耗尽内存（Gate B 审查：原无上限 read）
-    max_bytes = uploads._max_bytes
+    max_bytes = uploads.max_bytes
     content = await file.read(max_bytes + 1)
     if len(content) > max_bytes:
         raise HTTPException(status_code=413, detail="upload_too_large")
@@ -590,6 +601,9 @@ async def create_upload(
             content=content,
         )
     except UploadRejectedError as error:
+        # 提交失败上传记录（AgentUpload status=failed + error_code），不能因
+        # HTTPException 导致事务 rollback 后消失（Gate B 审查：失败审计）。
+        await db.commit()
         raise HTTPException(
             status_code=error.status_code,
             detail=error.error_code,
@@ -684,7 +698,7 @@ async def append_message(
     artifact_version_ids = await _validate_artifact_version_ids(
         db, user.id, payload.artifact_version_ids
     )
-    upload_ids = await _validate_upload_ids(
+    upload_refs = await _validate_upload_ids(
         db, user.id, session_id, payload.upload_ids
     )
 
@@ -751,8 +765,8 @@ async def append_message(
         snapshot["parent_run_id"] = parent_run_id
     if artifact_version_ids:
         snapshot["artifact_version_ids"] = artifact_version_ids
-    if upload_ids:
-        snapshot["upload_ids"] = upload_ids
+    if upload_refs:
+        snapshot["upload_refs"] = upload_refs
     if snapshot:
         run.prompt_snapshot_json = snapshot
     db.add(run)
@@ -994,10 +1008,8 @@ async def retry_run(
     }
     if original_snapshot.get("parent_run_id") is not None:
         retried_snapshot["parent_run_id"] = original_snapshot["parent_run_id"]
-    # 继承原 Run 的上传引用（Gate B 审查：retry 丢失 upload_ids 导致模型无法
-    # 钻取已上传文件）。
-    if original_snapshot.get("upload_ids"):
-        retried_snapshot["upload_ids"] = original_snapshot["upload_ids"]
+    if original_snapshot.get("upload_refs"):
+        retried_snapshot["upload_refs"] = original_snapshot["upload_refs"]
     retried = AgentRun(
         id=str(uuid4()),
         session_id=run.session_id,

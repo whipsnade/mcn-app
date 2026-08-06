@@ -1561,7 +1561,7 @@ async def test_retry_rejects_non_session_analyst_profile(
 async def _seed_upload(
     db_session, user_id: str, session_id: str, *, status: str = "parsed"
 ) -> str:
-    from app.agent_runtime.models import AgentUpload
+    from app.agent_runtime.models import AgentUpload, EvidenceItem
 
     upload = AgentUpload(
         id=str(uuid4()),
@@ -1578,6 +1578,23 @@ async def _seed_upload(
     )
     db_session.add(upload)
     await db_session.flush()
+    if status == "parsed":
+        evidence = EvidenceItem(
+            id=str(uuid4()),
+            session_id=session_id,
+            run_id=None,
+            tool_call_id=None,
+            upload_id=upload.id,
+            source_type="user_upload",
+            source_name="user_upload",
+            raw_payload_json={"columns": ["平台"], "rows": []},
+            normalized_preview_json={"preview": {}, "row_count": 0, "truncated": False},
+            payload_hash="b" * 64,
+            collected_at=utc_now(),
+            availability_status="available",
+        )
+        db_session.add(evidence)
+        await db_session.flush()
     return upload.id
 
 
@@ -1596,7 +1613,12 @@ async def test_message_with_upload_ids_writes_snapshot(
     assert resp.status_code == 201, resp.text
     run = await db_session.get(AgentRun, resp.json()["run_id"])
     assert run is not None
-    assert (run.prompt_snapshot_json or {}).get("upload_ids") == [upload_id]
+    assert "upload_refs" in (run.prompt_snapshot_json or {})
+    refs = (run.prompt_snapshot_json or {})["upload_refs"]
+    assert len(refs) == 1
+    assert refs[0]["upload_id"] == upload_id
+    assert "evidence_id" in refs[0]
+    assert refs[0]["filename"] == "投放数据.csv"
 
 
 async def test_message_upload_ids_must_belong_to_session(

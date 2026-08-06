@@ -17,6 +17,8 @@ import asyncio
 import csv
 import hashlib
 import io
+import json
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -28,6 +30,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agent_runtime.evidence import EvidenceWriter
 from app.agent_runtime.models import AgentUpload
 from app.core.config import get_settings
+
+logger = logging.getLogger(__name__)
 
 _ALLOWED_EXTENSIONS = (".csv", ".xlsx")
 _MIME_BY_EXTENSION = {
@@ -70,11 +74,17 @@ def _parse_xlsx(content: bytes, *, max_rows: int) -> tuple[list[str], list[dict[
 
     from openpyxl import load_workbook
 
-    # 拒绝含宏部件的 xlsx（即使扩展名不是 .xlsm）
+    # 拒绝含宏部件或外部链接的 xlsx（即使扩展名不是 .xlsm）
     with zipfile.ZipFile(io.BytesIO(content)) as zf:
-        if any("vbaProject" in name for name in zf.namelist()):
+        names = zf.namelist()
+        if any("vbaProject" in name for name in names):
             raise UploadRejectedError(
                 status_code=415, error_code="macro_detected", message="file contains macro parts"
+            )
+        if any(name.startswith("xl/externalLinks/") for name in names):
+            raise UploadRejectedError(
+                status_code=415, error_code="external_links_detected",
+                message="file contains external links",
             )
     workbook = load_workbook(
         io.BytesIO(content),
@@ -122,6 +132,14 @@ class UploadService:
         self._storage_dir = Path(storage_dir or settings.agent_upload_storage_dir)
         self._max_bytes = max_bytes or settings.agent_upload_max_bytes
         self._max_rows = max_rows or settings.agent_upload_max_rows
+
+    @property
+    def max_bytes(self) -> int:
+        return self._max_bytes
+
+    @property
+    def max_rows(self) -> int:
+        return self._max_rows
 
     async def create_and_parse(
         self,
@@ -246,7 +264,7 @@ class UploadService:
         try:
             path.unlink(missing_ok=True)
         except OSError:
-            pass
+            logger.warning("failed to delete upload file %s", storage_key, exc_info=True)
 
     def _parse(self, extension: str, content: bytes, max_rows: int) -> tuple[list[str], list[dict[str, Any]]]:
         if extension == ".csv":

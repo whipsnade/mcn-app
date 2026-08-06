@@ -77,24 +77,17 @@ class SessionContextBuilder:
     async def _run_references(self, run: AgentRun) -> dict[str, Any]:
         """从 Run 引用快照提取模型可见的父 Run / Artifact / Evidence / 上传引用。
 
-        upload_ids 解析为对应 evidence_id 列表（模型按 evidence_id 钻取，
-        不直接持有 upload_id）；幂等键等控制字段不进入上下文。
+        upload_refs 在 Run 创建时冻结（upload_id + evidence_id + filename + sha256），
+        每轮只读快照，不动态搜索该 upload 的 Evidence——本轮未引用的 Session 上传
+        不得进入模型上下文。幂等键等控制字段不进入上下文。
         """
         snapshot = run.prompt_snapshot_json or {}
         refs = {
             key: snapshot[key] for key in _REFERENCE_SNAPSHOT_KEYS if key in snapshot
         }
-        upload_ids = snapshot.get("upload_ids")
-        if upload_ids:
-            rows = await self._db.scalars(
-                select(EvidenceItem.id)
-                .where(
-                    EvidenceItem.session_id == run.session_id,
-                    EvidenceItem.upload_id.in_(upload_ids),
-                )
-                .order_by(EvidenceItem.collected_at.desc())
-            )
-            refs["upload_evidence_ids"] = list(rows)
+        upload_refs = snapshot.get("upload_refs")
+        if upload_refs:
+            refs["upload_refs"] = upload_refs
         return refs
 
 
