@@ -39,6 +39,9 @@ from app.agent_artifacts.models import (
 from app.agent_runtime.evidence import (
     bound_model_value,
     build_model_evidence_view,
+    fit_dict_by_chars,
+    fit_list_by_chars,
+    model_response_size,
     unwrap_evidence_payload,
 )
 from app.agent_runtime.models import (
@@ -291,7 +294,8 @@ class ReadArtifactTool:
 
 
 class SearchEvidenceArgs(BaseModel):
-    query: str = ""
+    # query 有界：响应中原样回显，60KB query 会让整个响应超预算（Gate B P1）。
+    query: str = Field(default="", max_length=500)
     artifact_id: str | None = None
     filters: dict[str, Any] | None = None
 
@@ -341,7 +345,7 @@ class SearchEvidenceTool:
         rows = result.all()
         matches = [item for item in rows if self._matches(item, args.query or "")]
         total = len(matches)
-        # 按总字符预算逐项加入 match（20 × 50KB ≈ 1MB 不可接受），超预算停止。
+        # 固定字段 + matches + 每个 view 共同参与 50KB 总预算（20 × 50KB 不可接受）。
         fixed = len(
             json.dumps(
                 {
@@ -358,7 +362,7 @@ class SearchEvidenceTool:
         matches_budget = max(_MAX_TOOL_RESULT_TOTAL_CHARS - fixed, 1)
         page: list[dict[str, Any]] = []
         for item in matches[:_SEARCH_MATCH_LIMIT]:
-            match = {
+            full_match = {
                 "evidence_id": item.id,
                 "source_type": item.source_type,
                 "source_name": item.source_name,
@@ -367,23 +371,36 @@ class SearchEvidenceTool:
                 # 统一有界模型视图（Gate B：不返回完整 5000 行）。
                 "view": build_model_evidence_view(item),
             }
-            candidate = [*page, match]
-            if len(json.dumps(candidate, ensure_ascii=False)) > matches_budget:
-                break
-            page = candidate
+            if model_response_size([*page, full_match]) <= matches_budget:
+                page.append(full_match)
+                continue
+            # 完整 view 放不下：退回最小 match（含 evidence_id，模型仍可
+            # read_tool_result 钻取原始数据）。
+            minimal_match = {key: value for key, value in full_match.items() if key != "view"}
+            if model_response_size([*page, minimal_match]) <= matches_budget:
+                page.append(minimal_match)
+                continue
+            break
         returned = len(page)
         has_more = returned < total
-        summary = json.dumps(
-            {
-                "query": args.query,
-                "total_matches": total,
-                "returned_matches": returned,
-                "has_more": has_more,
-                "truncated": has_more,
-                "matches": page,
-            },
-            ensure_ascii=False,
-        )
+        summary_payload = {
+            "query": args.query,
+            "total_matches": total,
+            "returned_matches": returned,
+            "has_more": has_more,
+            "truncated": has_more,
+            "matches": page,
+        }
+        # 最终硬预算校验：超预算从末尾剔除 match（最小 match 极小，不会全部丢失）。
+        while (
+            summary_payload["matches"]
+            and model_response_size(summary_payload) > _MAX_TOOL_RESULT_TOTAL_CHARS
+        ):
+            summary_payload["matches"] = summary_payload["matches"][:-1]
+            summary_payload["returned_matches"] = len(summary_payload["matches"])
+            summary_payload["has_more"] = len(summary_payload["matches"]) < total
+            summary_payload["truncated"] = len(summary_payload["matches"]) < total
+        summary = json.dumps(summary_payload, ensure_ascii=False)
         return ToolResult(status="success", safe_summary=summary)
 
     @staticmethod
@@ -472,6 +489,17 @@ class ReadToolResultTool:
         # 防御性钳制：即使未来字段放宽，页大小也绝不超过上限。
         limit = min(max(args.limit, 1), _TOOL_RESULT_MAX_LIMIT)
         view = build_model_evidence_view(evidence)
+        # 诊断字段（field_mapping/unmapped_fields）来自统一视图，但最多占用预算的
+        # 固定份额，保证 items 始终有可用空间（固定元数据与 items 同一总预算）。
+        diagnostics_budget = _MAX_TOOL_RESULT_TOTAL_CHARS // 5
+        field_mapping, mapping_truncated = fit_dict_by_chars(
+            view["field_mapping"], max_chars=diagnostics_budget
+        )
+        remaining_diag = max(diagnostics_budget - model_response_size(field_mapping), 0)
+        unmapped_fields, unmapped_truncated = fit_list_by_chars(
+            view["unmapped_fields"], max_chars=remaining_diag
+        )
+        diagnostics_truncated = mapping_truncated or unmapped_truncated
         # 固定开销（元数据 + 统一诊断）用最保守占位测量，items_budget 为剩余预算。
         fixed = len(
             json.dumps(
@@ -482,8 +510,8 @@ class ReadToolResultTool:
                     "next_cursor": str(total),
                     "truncated": False,
                     "normalization_status": view["normalization_status"],
-                    "field_mapping": view["field_mapping"],
-                    "unmapped_fields": view["unmapped_fields"],
+                    "field_mapping": field_mapping,
+                    "unmapped_fields": unmapped_fields,
                 },
                 ensure_ascii=False,
             )
@@ -498,7 +526,7 @@ class ReadToolResultTool:
             bounded_item, item_truncated = bound_model_value(sequence[source_index])
             item_truncated_any = item_truncated_any or item_truncated
             candidate = [*items, bounded_item]
-            if len(json.dumps(candidate, ensure_ascii=False)) > items_budget:
+            if model_response_size(candidate) > items_budget:
                 if not items:
                     # 单个超大 item：返回合法占位并把 cursor 前进一行，避免同一
                     # 超大 item 造成无限循环。
@@ -512,21 +540,51 @@ class ReadToolResultTool:
             items = candidate
             source_index += 1
         next_cursor = str(source_index) if source_index < total else None
-        truncated = next_cursor is not None or item_truncated_any
-        summary = json.dumps(
-            {
-                "evidence_id": evidence.id,
-                "items": items,
-                "total": total,
-                "next_cursor": next_cursor,
-                "truncated": truncated,
-                # 统一 normalization 诊断（恢复/即时返回/钻取一致）。
-                "normalization_status": view["normalization_status"],
-                "field_mapping": view["field_mapping"],
-                "unmapped_fields": view["unmapped_fields"],
-            },
-            ensure_ascii=False,
-        )
+        truncated = next_cursor is not None or item_truncated_any or diagnostics_truncated
+        summary_payload = {
+            "evidence_id": evidence.id,
+            "items": items,
+            "total": total,
+            "next_cursor": next_cursor,
+            "truncated": truncated,
+            # 统一 normalization 诊断（恢复/即时返回/钻取一致，有界份额）。
+            "normalization_status": view["normalization_status"],
+            "field_mapping": field_mapping,
+            "unmapped_fields": unmapped_fields,
+        }
+        # 最终硬预算校验：超预算时诊断字段让位给 items（压缩到剩余预算，绝不
+        # 截断 JSON 字符串本身）。
+        if model_response_size(summary_payload) > _MAX_TOOL_RESULT_TOTAL_CHARS:
+            base = {
+                key: value
+                for key, value in summary_payload.items()
+                if key not in ("field_mapping", "unmapped_fields")
+            }
+            remaining = _MAX_TOOL_RESULT_TOTAL_CHARS - model_response_size(base)
+            if remaining < 0:
+                summary_payload = {
+                    "evidence_id": evidence.id,
+                    "items": [],
+                    "total": total,
+                    "next_cursor": next_cursor,
+                    "truncated": True,
+                    "normalization_status": None,
+                    "field_mapping": {},
+                    "unmapped_fields": [],
+                }
+            else:
+                half = remaining // 2
+                fitted_mapping, _ = fit_dict_by_chars(
+                    field_mapping, max_chars=max(half, 0)
+                )
+                rest = max(remaining - model_response_size(fitted_mapping), 0)
+                fitted_unmapped, _ = fit_list_by_chars(
+                    unmapped_fields, max_chars=rest
+                )
+                summary_payload["field_mapping"] = fitted_mapping
+                summary_payload["unmapped_fields"] = fitted_unmapped
+                summary_payload["truncated"] = True
+        summary = json.dumps(summary_payload, ensure_ascii=False)
         return ToolResult(
             status="success",
             safe_summary=summary,

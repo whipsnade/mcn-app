@@ -173,15 +173,50 @@ def bound_model_value(value: Any) -> tuple[Any, bool]:
     return _bound_model_value(value)
 
 
+def model_response_size(value: Any) -> int:
+    """模型可见负载的序列化字符数（所有硬预算检查共用的测量入口）。"""
+    return len(json.dumps(value, ensure_ascii=False, default=str))
+
+
+def fit_dict_by_chars(mapping: Any, *, max_chars: int) -> tuple[Any, bool]:
+    """按序列化字符预算逐条保留 dict 条目（保持顺序）；返回 (值, 是否截断)。"""
+    if not isinstance(mapping, dict):
+        return mapping, False
+    result: dict[str, Any] = {}
+    truncated = False
+    for key, child in mapping.items():
+        candidate = {**result, key: child}
+        if model_response_size(candidate) > max_chars:
+            truncated = True
+            break
+        result = candidate
+    return result, truncated
+
+
+def fit_list_by_chars(values: Any, *, max_chars: int) -> tuple[Any, bool]:
+    """按序列化字符预算逐条保留 list 元素（保持顺序）；返回 (值, 是否截断)。"""
+    if not isinstance(values, list):
+        return values, False
+    result: list[Any] = []
+    truncated = False
+    for item in values:
+        candidate = [*result, item]
+        if model_response_size(candidate) > max_chars:
+            truncated = True
+            break
+        result.append(item)
+    return result, truncated
+
+
 def build_model_evidence_view(evidence: EvidenceItem) -> dict[str, Any]:
     """统一模型可见视图——**唯一**模型视图入口。
 
     从已持久化的 ``normalized_preview_json`` 构建**有界**视图，绝不重新归一化；
     预览优先级：``normalization_preview`` 优先，否则回退 raw ``preview``。preview
-    与 field_mapping/unmapped_fields 都做有界截断，并显式聚合截断状态到
-    ``truncated``。最终序列化总字符数受 ``_MAX_MODEL_TOTAL_CHARS`` 约束，超预算时
-    降级为**固定形状**（含 ``field_mapping``/``unmapped_fields``，绝不删除），任何
-    情况下都能 ``json.loads()``。
+    与 field_mapping/unmapped_fields **共同参与** 50KB 总预算：先各自递归裁剪，
+    仍超预算则按顺序降级（preview 截断哨兵 → 诊断按字符预算保留部分 → 诊断清空），
+    truncated=true 明确数据被裁剪。**始终保留全部 9 个固定键**，任何情况下都能
+    ``json.loads()``。
     """
     stored = evidence.normalized_preview_json or {}
     normalization_preview = stored.get("normalization_preview")
@@ -192,35 +227,48 @@ def build_model_evidence_view(evidence: EvidenceItem) -> dict[str, Any]:
     preview, preview_truncated = _bound_model_value(source_preview)
     field_mapping, mapping_truncated = _bound_model_value(stored.get("field_mapping"))
     unmapped_fields, unmapped_truncated = _bound_model_value(stored.get("unmapped_fields"))
-    view: dict[str, Any] = {
-        "evidence_id": evidence.id,
-        "preview": preview,
-        "normalization_status": stored.get("normalization_status"),
-        "field_mapping": field_mapping,
-        "unmapped_fields": unmapped_fields,
-        "row_count": stored.get("row_count", 0),
-        "truncated": bool(
-            stored.get("truncated")
-            or preview_truncated
-            or mapping_truncated
-            or unmapped_truncated
-        ),
-        "source_name": evidence.source_name,
-        "source_type": evidence.source_type,
-    }
-    if len(json.dumps(view, ensure_ascii=False, default=str)) > _MAX_MODEL_TOTAL_CHARS:
+    base_truncated = bool(
+        stored.get("truncated")
+        or preview_truncated
+        or mapping_truncated
+        or unmapped_truncated
+    )
+
+    def _view(preview_value: Any, mapping_value: Any, unmapped_value: Any, truncated: bool) -> dict[str, Any]:
         return {
             "evidence_id": evidence.id,
-            "preview": {"__truncated__": True},
+            "preview": preview_value,
             "normalization_status": stored.get("normalization_status"),
-            "field_mapping": field_mapping,
-            "unmapped_fields": unmapped_fields,
+            "field_mapping": mapping_value,
+            "unmapped_fields": unmapped_value,
             "row_count": stored.get("row_count", 0),
-            "truncated": True,
+            "truncated": truncated,
             "source_name": evidence.source_name,
             "source_type": evidence.source_type,
         }
-    return view
+
+    view = _view(preview, field_mapping, unmapped_fields, base_truncated)
+    if model_response_size(view) <= _MAX_MODEL_TOTAL_CHARS:
+        return view
+
+    # 降级 1：preview 改截断哨兵（truncated=true 明确数据被裁剪）。
+    view = _view({"__truncated__": True}, field_mapping, unmapped_fields, True)
+    if model_response_size(view) <= _MAX_MODEL_TOTAL_CHARS:
+        return view
+
+    # 降级 2：field_mapping/unmapped_fields 按剩余字符预算保留部分内容。
+    base_without_diag = _view({"__truncated__": True}, {}, [], True)
+    remaining = _MAX_MODEL_TOTAL_CHARS - model_response_size(base_without_diag)
+    half = max(remaining // 2, 0)
+    fitted_mapping, _ = fit_dict_by_chars(field_mapping, max_chars=half)
+    rest = max(remaining - model_response_size(fitted_mapping), 0)
+    fitted_unmapped, _ = fit_list_by_chars(unmapped_fields, max_chars=rest)
+    view = _view({"__truncated__": True}, fitted_mapping, fitted_unmapped, True)
+    if model_response_size(view) <= _MAX_MODEL_TOTAL_CHARS:
+        return view
+
+    # 降级 3：诊断清空（truncated=true 明确数据被裁剪）；最小固定形状必然 <= 预算。
+    return _view({"__truncated__": True}, {}, [], True)
 
 
 class EvidenceWriter:
@@ -298,5 +346,8 @@ __all__ = [
     "bound_model_value",
     "build_model_evidence_view",
     "build_preview",
+    "fit_dict_by_chars",
+    "fit_list_by_chars",
+    "model_response_size",
     "unwrap_evidence_payload",
 ]
