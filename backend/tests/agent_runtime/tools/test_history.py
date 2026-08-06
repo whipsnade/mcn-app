@@ -725,6 +725,76 @@ async def test_search_evidence_does_not_load_raw_payload_columns(db_session, use
 
 
 # ---------------------------------------------------------------------------
+# P1-2: search_evidence / read_tool_result 消费统一有界模型视图
+# ---------------------------------------------------------------------------
+
+
+async def test_search_evidence_bounds_preview_not_full_5000_rows(
+    db_session, user_factory
+) -> None:
+    """search_evidence 的 match 视图不得返回完整 5000 行（统一有界视图）。"""
+    from app.agent_runtime.normalization import NormalizationRegistry
+
+    user = await user_factory()
+    session, run, _step, call = await _make_chain(db_session, user.id)
+    rows = [{"关键词": f"美妆{i}", "声量": i} for i in range(5000)]
+    payload = {"result": json.dumps({"rows": rows, "total": 5000})}
+    writer = EvidenceWriter(db_session)
+    await writer.write(
+        session_id=session.id,
+        run_id=run.id,
+        tool_call_id=call.id,
+        source_type="mcp",
+        source_name="query_analysis_data",
+        scope_json=None,
+        period_json=None,
+        raw_payload=payload,
+        normalization=NormalizationRegistry().normalize("query_analysis_data", payload),
+    )
+    context = ToolContext(user_id=user.id, session_id=session.id, run_id=run.id, profile_name="session_analyst_v1")
+    tool = SearchEvidenceTool(db_session)
+    result = await tool.execute(context, type(tool).input_model(query="美妆0"))
+    data = _summary(result)
+    assert data["total_matches"] >= 1
+    view = data["matches"][0]["view"]
+    # 归一化 preview 只有 200 行（_MAX_MODEL_ARRAY_ROWS），绝不含 5000 行。
+    assert len(view["preview"]["rows"]) <= 200
+
+
+async def test_read_tool_result_returns_pagination_and_unified_diagnostics(
+    db_session, user_factory
+) -> None:
+    """read_tool_result 同时返回分页 items（有界）与统一 normalization 诊断。"""
+    from app.agent_runtime.normalization import NormalizationRegistry
+
+    user = await user_factory()
+    session, run, _step, call = await _make_chain(db_session, user.id)
+    payload = {"rows": [{"关键词": "美妆", "声量": i} for i in range(10)]}
+    writer = EvidenceWriter(db_session)
+    item = await writer.write(
+        session_id=session.id,
+        run_id=run.id,
+        tool_call_id=call.id,
+        source_type="mcp",
+        source_name="query_analysis_data",
+        scope_json=None,
+        period_json=None,
+        raw_payload=payload,
+        normalization=NormalizationRegistry().normalize("query_analysis_data", payload),
+    )
+    context = ToolContext(user_id=user.id, session_id=session.id, run_id=run.id, profile_name="session_analyst_v1")
+    tool = ReadToolResultTool(db_session)
+    data = _summary(await tool.execute(context, type(tool).input_model(evidence_id=item.id, limit=200)))
+    # 分页 items 返回原始行（有界），且长度受限。
+    assert data["total"] == 10
+    assert len(data["items"]) == 10
+    assert data["items"][0]["关键词"] == "美妆"
+    # 统一诊断来自模型视图。
+    assert data["normalization_status"] == "incomplete"
+    assert data["unmapped_fields"] == ["关键词"]
+
+
+# ---------------------------------------------------------------------------
 # remember_scope
 # ---------------------------------------------------------------------------
 

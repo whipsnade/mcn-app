@@ -124,29 +124,51 @@ def build_preview(raw_payload: Any) -> dict[str, Any]:
     }
 
 
-def model_view(item: EvidenceItem) -> dict[str, Any]:
-    """模型可见视图：只暴露 evidence_id + 受限预览，绝不含完整原始 payload。"""
-    return {
-        "evidence_id": item.id,
-        "preview": item.normalized_preview_json,
-    }
+# 模型视图严格有界（§10.2 / Gate B P1）：所有消费方（MCP 即时/Transcript 恢复/
+# search_evidence/read_tool_result/upload 钻取）共用同一视图，绝不重新归一化。
+_MAX_MODEL_DEPTH = 6
+_MAX_MODEL_ARRAY_ROWS = 200
+_MAX_MODEL_OBJECT_FIELDS = 200
+_MAX_MODEL_STR_LEN = 1000
+_MAX_MODEL_TOTAL_CHARS = 50_000
 
 
-# 模型可见 preview 的严格上限（Gate B P1）：归一化最多 5000 行不能全进上下文。
-_MAX_PREVIEW_ROWS = 200
-_MAX_PREVIEW_STR_LEN = 1000
+def _bound_model_value(value: Any, *, depth: int = 0) -> Any:
+    """递归有界截断：限制层级/数组行数/对象字段数/字符串长度，保持 JSON 合法。"""
+    if depth > _MAX_MODEL_DEPTH:
+        return {"__truncated__": True}
+    if isinstance(value, str):
+        return value if len(value) <= _MAX_MODEL_STR_LEN else value[:_MAX_MODEL_STR_LEN]
+    if isinstance(value, list):
+        return [
+            _bound_model_value(item, depth=depth + 1)
+            for item in value[:_MAX_MODEL_ARRAY_ROWS]
+        ]
+    if isinstance(value, dict):
+        return {
+            key: _bound_model_value(child, depth=depth + 1)
+            for key, child in list(value.items())[:_MAX_MODEL_OBJECT_FIELDS]
+        }
+    return value
 
 
 def build_model_evidence_view(evidence: EvidenceItem) -> dict[str, Any]:
-    """统一模型可见视图（Gate B P1）：所有消费方（MCP 即时/Transcript 恢复/
-    search_evidence/read_tool_result/upload 钻取）共用同一持久化视图。
+    """统一模型可见视图（Gate B P1）——**唯一**模型视图入口。
 
     从已持久化的 ``normalized_preview_json`` 构建**有界**视图，绝不重新归一化；
-    严格限制行数与字符数，且保证 JSON 合法（不截断字符串中途）。
+    预览优先级：``normalization_preview`` 优先，否则回退 raw ``preview``。最终
+    序列化总字符数受 ``_MAX_MODEL_TOTAL_CHARS`` 约束，超预算时降级为合法 JSON
+    （``preview={"__truncated__": True}, truncated=true``），任何情况下都能
+    ``json.loads()``。
     """
     stored = evidence.normalized_preview_json or {}
-    preview = _bound_preview(stored.get("preview", stored.get("normalization_preview", {})))
-    return {
+    normalization_preview = stored.get("normalization_preview")
+    raw_preview = stored.get("preview")
+    source_preview = (
+        normalization_preview if normalization_preview is not None else raw_preview
+    )
+    preview = _bound_model_value(source_preview)
+    view: dict[str, Any] = {
         "evidence_id": evidence.id,
         "preview": preview,
         "normalization_status": stored.get("normalization_status"),
@@ -157,21 +179,20 @@ def build_model_evidence_view(evidence: EvidenceItem) -> dict[str, Any]:
         "source_name": evidence.source_name,
         "source_type": evidence.source_type,
     }
-
-
-def _bound_preview(value: Any, *, row_limit: int = _MAX_PREVIEW_ROWS) -> Any:
-    """递归有界截断：限制数组行数与字符串长度，保持 JSON 结构完整。"""
-    if isinstance(value, list):
-        bounded = [_bound_preview(item, row_limit=row_limit) for item in value[:row_limit]]
-        return bounded
-    if isinstance(value, dict):
+    if len(json.dumps(view, ensure_ascii=False, default=str)) > _MAX_MODEL_TOTAL_CHARS:
         return {
-            key: _bound_preview(child, row_limit=row_limit)
-            for key, child in list(value.items())[:_MAX_PREVIEW_STR_LEN]
+            "evidence_id": evidence.id,
+            "preview": {"__truncated__": True},
+            "normalization_status": stored.get("normalization_status"),
+            "row_count": stored.get("row_count", 0),
+            "truncated": True,
         }
-    if isinstance(value, str) and len(value) > _MAX_PREVIEW_STR_LEN:
-        return value[:_MAX_PREVIEW_STR_LEN]
-    return value
+    return view
+
+
+def bound_model_value(value: Any) -> Any:
+    """对任意值做模型可见的有界截断（read_tool_result 分页 items 复用）。"""
+    return _bound_model_value(value)
 
 
 class EvidenceWriter:
@@ -246,7 +267,7 @@ class EvidenceWriter:
 
 __all__ = [
     "EvidenceWriter",
+    "bound_model_value",
     "build_model_evidence_view",
     "build_preview",
-    "model_view",
 ]

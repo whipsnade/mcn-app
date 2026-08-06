@@ -36,7 +36,7 @@ from app.agent_artifacts.models import (
     ArtifactDraft,
     ArtifactDraftRevision,
 )
-from app.agent_runtime.evidence import build_model_evidence_view
+from app.agent_runtime.evidence import bound_model_value, build_model_evidence_view
 from app.agent_runtime.models import (
     AgentMessage,
     AgentSession,
@@ -345,7 +345,8 @@ class SearchEvidenceTool:
                         "source_name": item.source_name,
                         "run_id": item.run_id,
                         "collected_at": item.collected_at.isoformat() if item.collected_at else None,
-                        "preview": item.normalized_preview_json,
+                        # 统一有界模型视图（Gate B P1）：不返回完整 5000 行。
+                        "view": build_model_evidence_view(item),
                     }
                     for item in page
                 ],
@@ -447,11 +448,12 @@ class ReadToolResultTool:
         summary = json.dumps(
             {
                 "evidence_id": evidence.id,
-                "items": page,
+                # 分页 items 也做有界截断（Gate B P1：绝不返回超大原始行）。
+                "items": [bound_model_value(item) for item in page],
                 "total": total,
                 "next_cursor": next_cursor,
                 "truncated": truncated,
-                # 统一 normalization 诊断（Gate B P1：恢复/即时返回/钻取一致）。
+                # 统一 normalization 诊断（恢复/即时返回/钻取一致）。
                 "normalization_status": view["normalization_status"],
                 "field_mapping": view["field_mapping"],
                 "unmapped_fields": view["unmapped_fields"],

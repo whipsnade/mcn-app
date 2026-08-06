@@ -15,7 +15,12 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import select
 
-from app.agent_runtime.evidence import EvidenceWriter, build_preview, model_view
+from app.agent_runtime.evidence import (
+    EvidenceWriter,
+    bound_model_value,
+    build_model_evidence_view,
+    build_preview,
+)
 from app.agent_runtime.models import (
     AgentRun,
     AgentRunAttempt,
@@ -234,14 +239,133 @@ async def test_evidence_preview_is_limited_not_full_payload(db_session, user_fac
 async def test_model_only_sees_evidence_id_and_preview(db_session, user_factory) -> None:
     item, _session, _run = await _write(db_session, user_factory)
 
-    view = model_view(item)
+    view = build_model_evidence_view(item)
     assert view["evidence_id"] == item.id
-    # 模型可见视图只包含证据 id 与预览
+    # 模型可见视图只包含证据 id 与受限预览，绝不含完整原始 payload。
     assert "evidence_id" in view and "preview" in view
     assert "raw_payload_json" not in view
     assert "payload_hash" not in view
-    assert view["preview"] == item.normalized_preview_json
     assert view["preview"] != FULL_PAYLOAD
+
+
+@pytest.mark.asyncio
+async def test_model_view_priority_normalization_preview_over_raw(
+    db_session, user_factory
+) -> None:
+    """normalization_preview 存在时优先于 raw preview（Gate B P1）。"""
+    user = await user_factory()
+    session, run, step, call = await _make_chain(db_session, user.id)
+    writer = EvidenceWriter(db_session)
+    normalization = NormalizationRegistry().normalize(
+        "query_analysis_data",
+        {"result": json.dumps({"rows": [{"keyword": "美妆", "volume": 12}], "total": 1})},
+    )
+    item = await writer.write(
+        session_id=session.id,
+        run_id=run.id,
+        tool_call_id=call.id,
+        source_type="mcp",
+        source_name="query_analysis_data",
+        scope_json=None,
+        period_json=None,
+        raw_payload={"result": json.dumps({"rows": [{"keyword": "美妆", "volume": 12}], "total": 1})},
+        collected_at=_now(),
+        normalization=normalization,
+    )
+    view = build_model_evidence_view(item)
+    # normalization_preview 是归一化后的 {rows:[{volume}]}；raw preview 是原始行。
+    assert view["preview"] == {"rows": [{"volume": 12}], "row_count": 1, "truncated": False}
+    assert view["normalization_status"] == "incomplete"
+    assert view["field_mapping"] == {"volume": "volume"}
+    assert view["unmapped_fields"] == ["keyword"]
+
+
+@pytest.mark.asyncio
+async def test_model_view_falls_back_to_raw_preview_without_normalization(
+    db_session, user_factory
+) -> None:
+    """没有归一化时回退 raw preview（Gate B P1）。"""
+    item, _session, _run = await _write(db_session, user_factory)
+    view = build_model_evidence_view(item)
+    assert view["normalization_status"] is None
+    assert view["row_count"] == 50
+    assert view["preview"]["rows"][0] == {"keyword": "美妆", "volume": 123456}
+    assert len(view["preview"]["rows"]) == 50
+
+
+def test_model_view_bounds_large_array() -> None:
+    """大数组被截断到 _MAX_MODEL_ARRAY_ROWS。"""
+    stored = {
+        "preview": {"rows": [{"k": f"v{i}"} for i in range(500)], "row_count": 500},
+        "row_count": 500,
+        "truncated": True,
+    }
+    item = EvidenceItem(
+        id="ev-big-array",
+        session_id="s",
+        source_type="mcp",
+        source_name="tool",
+        normalized_preview_json=stored,
+    )
+    view = build_model_evidence_view(item)
+    assert len(view["preview"]["rows"]) == 200
+    assert json.loads(json.dumps(view, ensure_ascii=False))["preview"]["rows"][0] == {"k": "v0"}
+
+
+def test_model_view_bounds_large_string() -> None:
+    """大字符串被截断到 _MAX_MODEL_STR_LEN。"""
+    item = EvidenceItem(
+        id="ev-big-str",
+        session_id="s",
+        source_type="mcp",
+        source_name="tool",
+        normalized_preview_json={"preview": {"note": "x" * 5000}},
+    )
+    view = build_model_evidence_view(item)
+    assert len(view["preview"]["note"]) == 1000
+
+
+def test_model_view_bounds_large_object() -> None:
+    """大对象字段数被截断到 _MAX_MODEL_OBJECT_FIELDS。"""
+    big = {f"k{i}": i for i in range(500)}
+    item = EvidenceItem(
+        id="ev-big-obj",
+        session_id="s",
+        source_type="mcp",
+        source_name="tool",
+        normalized_preview_json={"preview": big},
+    )
+    view = build_model_evidence_view(item)
+    assert len(view["preview"]) == 200
+    assert "k0" in view["preview"]
+    assert "k499" not in view["preview"]
+
+
+def test_model_view_total_budget_degrades_to_valid_json() -> None:
+    """最终序列化总字符数超预算 → 降级为合法 JSON（始终能 json.loads）。"""
+    # preview 由 200 个对象字段 * 长字符串拼出，远超 50k 总预算。
+    huge = {f"k{i}": "长" * 2000 for i in range(200)}
+    item = EvidenceItem(
+        id="ev-over-budget",
+        session_id="s",
+        source_type="mcp",
+        source_name="tool",
+        normalized_preview_json={"preview": huge, "row_count": 5000, "truncated": True},
+    )
+    view = build_model_evidence_view(item)
+    assert view["preview"] == {"__truncated__": True}
+    assert view["truncated"] is True
+    assert view["row_count"] == 5000
+    # 必须能反序列化（合法 JSON）。
+    parsed = json.loads(json.dumps(view, ensure_ascii=False))
+    assert parsed["preview"] == {"__truncated__": True}
+
+
+def test_bound_model_value_bounds_recursively() -> None:
+    value = {"a": [{"b": "x" * 5000} for _ in range(300)], "c": {"d": {"e": 1}}}
+    bounded = bound_model_value(value)
+    assert len(bounded["a"]) == 200
+    assert len(bounded["a"][0]["b"]) == 1000
 
 
 def test_build_preview_caps_row_count_and_fields() -> None:

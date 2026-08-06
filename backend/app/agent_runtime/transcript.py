@@ -32,7 +32,7 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agent_runtime.evidence import EvidenceWriter
+from app.agent_runtime.evidence import EvidenceWriter, build_model_evidence_view
 from app.agent_runtime.kol_detail import (
     KOL_DETAIL_SNAPSHOT_KEY,
     kol_detail_trigger_content,
@@ -183,8 +183,8 @@ class RunTranscriptLoader:
                 return {
                     "status": "success",
                     "safe_summary": json.dumps(
-                        evidence.normalized_preview_json, ensure_ascii=False
-                    )[:1_000],
+                        build_model_evidence_view(evidence), ensure_ascii=False
+                    ),
                     "evidence_id": evidence.id,
                 }
             return {

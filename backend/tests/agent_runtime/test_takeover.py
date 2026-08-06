@@ -392,7 +392,8 @@ async def test_takeover_after_settle_replays_evidence_and_never_redispatches(
     assert len(tool_results) == 1
     assert tool_results[0]["status"] == "success"
     assert tool_results[0]["evidence_id"] == result.evidence_id
-    assert "美妆" in tool_results[0]["summary"]
+    # 统一模型视图：归一化预览含 volume 数据（keyword 进入 unmapped_fields）。
+    assert "volume" in tool_results[0]["summary"]
     # 接管后零新外发、零新扣费
     assert (await WalletService(db_session).get_wallet(user.id)).balance == 990
     calls = (
