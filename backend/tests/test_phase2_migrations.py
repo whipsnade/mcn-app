@@ -642,9 +642,16 @@ async def test_0030_direct_publish_schema() -> None:
         memory_checks = await connection.run_sync(
             lambda sync: inspect(sync).get_check_constraints("memory_entries")
         )
+        attempt_indexes = await connection.run_sync(
+            lambda sync: inspect(sync).get_indexes("artifact_publish_attempts")
+        )
 
     assert "uq_artifact_publish_attempts_idempotency" in {
         item["name"] for item in unique_constraints
+    }
+    # run_id 索引支撑终态聚合按 run_id 扫描（Gate A 审查：缺少索引）。
+    assert "ix_artifact_publish_attempts_run_id" in {
+        item["name"] for item in attempt_indexes
     }
     checks = {item["name"]: item["sqltext"] for item in check_constraints}
     status_check = checks["ck_artifact_publish_attempts_status"]
@@ -654,6 +661,98 @@ async def test_0030_direct_publish_schema() -> None:
         "ck_memory_entries_type"
     ]
     assert "confirmed_scope" in memory_check
+
+
+@pytest.mark.skipif(
+    "PYTEST_XDIST_WORKER" in os.environ,
+    reason="schema migration boundary test is intentionally serial",
+)
+async def test_0030_direct_publish_migration_is_reversible_with_confirmed_scope() -> None:
+    """0030 downgrade 必须先清除已落库的 confirmed_scope 行（Gate A 审查修复）。
+
+    MySQL 重建 ``ck_memory_entries_type`` CHECK 约束时会校验既有行，残留的
+    confirmed_scope 行会让 downgrade 失败。本测试先落一条 confirmed_scope
+    记忆，再 downgrade 到 0029，确认成功且 0030 新增对象消失，最后回到 head。
+    """
+
+    async def has_publish_attempts_table() -> bool:
+        async with engine.connect() as connection:
+            return "artifact_publish_attempts" in await connection.run_sync(
+                lambda sync: inspect(sync).get_table_names()
+            )
+
+    async def has_validation_json_column() -> bool:
+        async with engine.connect() as connection:
+            return "validation_json" in {
+                item["name"]
+                for item in await connection.run_sync(
+                    lambda sync: inspect(sync).get_columns("agent_artifact_versions")
+                )
+            }
+
+    # 落一条 confirmed_scope 记忆（需要 user + session 满足 FK）。
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from app.identity.models import User
+    from app.agent_runtime.models import AgentSession, MemoryEntry
+
+    user_id = str(uuid4())
+    session_id = str(uuid4())
+    now = datetime.now(UTC).replace(tzinfo=None)
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        user = User(
+            id=user_id,
+            nickname="reversibility-probe",
+            role="user",
+            status="active",
+            industries=["美食"],
+            created_at=now,
+            updated_at=now,
+        )
+        agent_session = AgentSession(
+            id=session_id,
+            user_id=user.id,
+            title="reversibility",
+            status="active",
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(user)
+        await session.flush()
+        session.add(agent_session)
+        await session.flush()
+        session.add(
+            MemoryEntry(
+                id=str(uuid4()),
+                session_id=agent_session.id,
+                source_run_id=None,
+                memory_type="confirmed_scope",
+                content_json={"domain": "brand", "field": "period", "value": "近30天"},
+                created_at=now,
+            )
+        )
+        await session.commit()
+
+    try:
+        assert await has_publish_attempts_table()
+        assert await has_validation_json_column()
+        # downgrade 必须成功：confirmed_scope 行已被迁移先清除。
+        _run_alembic("downgrade", "0029_agent_run_created_at")
+        assert not await has_publish_attempts_table()
+        assert not await has_validation_json_column()
+        _run_alembic("upgrade", "head")
+        assert await has_publish_attempts_table()
+        assert await has_validation_json_column()
+    finally:
+        _run_alembic("upgrade", "head")
+        # 清理测试插入的 user/session 行，避免残留污染后续用例。
+        from sqlalchemy import delete
+
+        async with engine.begin() as connection:
+            await connection.execute(
+                delete(AgentSession).where(AgentSession.id == session_id)
+            )
+            await connection.execute(delete(User).where(User.id == user_id))
 
 
 def _run_alembic(*args: str) -> None:

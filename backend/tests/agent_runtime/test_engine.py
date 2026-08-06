@@ -1188,8 +1188,9 @@ async def test_complete_with_active_draft_is_fed_back(db_session, user_factory) 
 async def test_publish_with_nonexistent_draft_id_fed_back_as_failed_item(
     db_session, user_factory
 ) -> None:
-    """幻觉 draft_id（不存在）：逐项 failed（draft_not_found）回喂，不整 Run 崩溃；
-    模型随后可正常完成。"""
+    """幻觉 draft_id（不存在）：逐项 failed（draft_not_found）回喂且持久化拒绝
+    记录；随后 complete 聚合失败项 → ALL_ARTIFACTS_FAILED，Run 不得被错误标记
+    completed（Gate A 审查修复）。"""
     run, attempt, _, _ = await _setup_run(db_session, user_factory)
     engine, gateway = _make_engine(
         db_session,
@@ -1208,16 +1209,29 @@ async def test_publish_with_nonexistent_draft_id_fed_back_as_failed_item(
         profile=get_profile("session_analyst_v1"),
         messages=[ChatMessage(role="user", content="分析瑞幸品牌")],
     )
-    assert outcome.status == RunStatus.COMPLETED
+    assert outcome.status == RunStatus.FAILED
+    assert run.error_code == "ALL_ARTIFACTS_FAILED"
     assert len(gateway.calls) == 2
     assert any("draft_not_found" in m.content for m in gateway.calls[1]["messages"])
+    rejected = (
+        await db_session.scalars(
+            select(ArtifactPublishAttempt).where(
+                ArtifactPublishAttempt.run_id == run.id,
+                ArtifactPublishAttempt.error_code == "draft_not_found",
+            )
+        )
+    ).all()
+    assert len(rejected) == 1
+    assert rejected[0].artifact_id is None
+    assert rejected[0].validation_json["rejected_draft_id"] == "ghost-draft-id"
 
 
-async def test_publish_with_foreign_draft_id_fed_back_as_artifact_busy(
+async def test_publish_with_foreign_draft_id_fed_back_as_not_found(
     db_session, user_factory
 ) -> None:
-    """幻觉 draft_id（属于其他活动 Run）：逐项 failed（artifact_busy）回喂，
-    他人的 Draft 不发布、owner 不变。"""
+    """幻觉 draft_id（属于其他活动 Run）：逐项 failed（draft_not_found）回喂且
+    持久化拒绝记录；随后 complete 聚合失败项 → ALL_ARTIFACTS_FAILED（Gate A
+    审查修复）。他人的 Draft 不发布、owner 不变。"""
     run, attempt, user, session = await _setup_run(db_session, user_factory)
     run_b, _ = await _new_run(db_session, user_id=user.id, session_id=session.id)
     _, draft_b, _ = await _make_draft(db_session, run_b, brand="瑞幸")
@@ -1238,8 +1252,13 @@ async def test_publish_with_foreign_draft_id_fed_back_as_artifact_busy(
         profile=get_profile("session_analyst_v1"),
         messages=[ChatMessage(role="user", content="分析瑞幸品牌")],
     )
-    assert outcome.status == RunStatus.COMPLETED
-    assert any("artifact_busy" in m.content for m in gateway.calls[1]["messages"])
+    assert outcome.status == RunStatus.FAILED
+    assert run.error_code == "ALL_ARTIFACTS_FAILED"
+    # 统一 not_found：不暴露 artifact_busy / owner_run_id。
+    fed = gateway.calls[1]["messages"]
+    assert any("draft_not_found" in m.content for m in fed)
+    assert not any("artifact_busy" in m.content for m in fed)
+    assert not any("owner_run_id" in m.content for m in fed)
     # 他人 Draft 不受影响：owner 不变、不发布
     draft_row = await db_session.get(ArtifactDraft, draft_b.id)
     assert draft_row is not None
@@ -1252,6 +1271,167 @@ async def test_publish_with_foreign_draft_id_fed_back_as_artifact_busy(
             )
         )
     ) == 0
+
+
+async def test_publish_mixed_success_and_missing_draft_completes_with_warnings(
+    db_session, user_factory
+) -> None:
+    """≥1 发布成功 + 引用不存在的 Draft（missing/foreign）：complete 聚合为
+    completed_with_warnings（Gate A 审查：发布失败项必须进入终态聚合，不得
+    因部分成功而错误标记 completed）。"""
+    run, attempt, _, _ = await _setup_run(db_session, user_factory)
+    _, draft_ok, _ = await _make_draft(db_session, run, brand="瑞幸")
+    engine, gateway = _make_engine(
+        db_session,
+        actions=[
+            PublishArtifacts(
+                action="publish_artifacts",
+                artifact_draft_ids=(draft_ok.id, "ghost-draft-id"),
+                summary="发布",
+            ),
+            Complete(action="complete", text="已完成（含一条失败项）"),
+        ],
+    )
+    outcome = await engine.run(
+        run=run,
+        attempt_id=attempt.id,
+        profile=get_profile("session_analyst_v1"),
+        messages=[ChatMessage(role="user", content="分析瑞幸品牌")],
+    )
+    assert outcome.status == RunStatus.COMPLETED_WITH_WARNINGS
+    assert run.status == RunStatus.COMPLETED_WITH_WARNINGS
+    # 成功项发布、ghost draft 拒绝记录落库（不保存外部 Artifact 身份）。
+    versions = (
+        await db_session.scalars(
+            select(AgentArtifactVersion).where(AgentArtifactVersion.source_run_id == run.id)
+        )
+    ).all()
+    assert len(versions) == 1
+    assert versions[0].artifact_id == draft_ok.artifact_id
+    rejected = (
+        await db_session.scalars(
+            select(ArtifactPublishAttempt).where(
+                ArtifactPublishAttempt.run_id == run.id,
+                ArtifactPublishAttempt.error_code == "draft_not_found",
+            )
+        )
+    ).all()
+    assert len(rejected) == 1
+    assert rejected[0].artifact_id is None
+    assert rejected[0].validation_json["rejected_draft_id"] == "ghost-draft-id"
+    # 终态事件为 completed_with_warnings 且为最后一条。
+    terminal = await _terminal_events(db_session, run.id)
+    assert len(terminal) == 1
+    assert terminal[0].event_type == "run.completed_with_warnings"
+    # 聚合键带域：拒绝项以 ("rejected_draft", draft_id) 标识。
+    assert ["rejected_draft", "ghost-draft-id"] in terminal[0].payload_json["warning_artifact_ids"]
+
+
+async def test_published_draft_replayed_by_other_run_emits_no_external_events(
+    db_session, user_factory
+) -> None:
+    """其他 Run 重放已发布 Draft：不得复用原 Run 的 published Attempt（泄漏
+    外部 Artifact 身份），统一 draft_not_found 回喂；引擎不发任何外部
+    artifact.published 事件（Gate A 三审）。"""
+    run_a, attempt_a, user, session = await _setup_run(db_session, user_factory)
+    _, draft, _ = await _make_draft(db_session, run_a, brand="瑞幸")
+    engine_a, _ = _make_engine(
+        db_session,
+        actions=[
+            PublishArtifacts(
+                action="publish_artifacts",
+                artifact_draft_ids=(draft.id,),
+                summary="发布",
+            ),
+            Complete(action="complete", text="完成"),
+        ],
+    )
+    outcome_a = await engine_a.run(
+        run=run_a,
+        attempt_id=attempt_a.id,
+        profile=get_profile("session_analyst_v1"),
+        messages=[ChatMessage(role="user", content="分析瑞幸品牌")],
+    )
+    # run_a 正常完成且 Version 已落（发布成功释放 owner）。
+    assert outcome_a.status == RunStatus.COMPLETED
+    assert (
+        await db_session.scalar(
+            select(func.count(AgentArtifactVersion.id)).where(
+                AgentArtifactVersion.source_run_id == run_a.id
+            )
+        )
+    ) == 1
+
+    # 新 Run（同 session）重放同一 draft_id：只回喂 draft_not_found。
+    run_b, attempt_b = await _new_run(db_session, user_id=user.id, session_id=session.id)
+    engine_b, gateway_b = _make_engine(
+        db_session,
+        actions=[
+            PublishArtifacts(
+                action="publish_artifacts",
+                artifact_draft_ids=(draft.id,),
+                summary="发布",
+            ),
+            Complete(action="complete", text="完成"),
+        ],
+    )
+    outcome_b = await engine_b.run(
+        run=run_b,
+        attempt_id=attempt_b.id,
+        profile=get_profile("session_analyst_v1"),
+        messages=[ChatMessage(role="user", content="分析瑞幸品牌")],
+    )
+    # 重放被拒：零发布成功 + 拒绝项 → ALL_ARTIFACTS_FAILED。
+    assert outcome_b.status == RunStatus.FAILED
+    fed = gateway_b.calls[1]["messages"]
+    assert any("draft_not_found" in m.content for m in fed)
+    # 引擎不给 run_b 发任何 artifact.published 事件（外部 Artifact 不进入本 Run
+    # 事件流；身份不泄漏由服务层断言 artifact_id/version 为空覆盖——memory
+    # header 的 Artifact 目录天然含本 Session artifact_id，不在回喂层断言）。
+    run_b_types = await _event_types(db_session, run_b.id)
+    assert "artifact.published" not in run_b_types
+
+
+async def test_publish_artifact_id_confused_as_draft_id_keeps_warning(
+    db_session, user_factory
+) -> None:
+    """模型把已成功发布的 artifact_id 误当 draft_id 再提交：拒绝项与 published
+    项同 ID 但不同域（artifact/rejected_draft），失败项不被错误消除——终态为
+    completed_with_warnings 而非 completed（Gate A 三审：聚合键带域）。"""
+    run, attempt, _, _ = await _setup_run(db_session, user_factory)
+    _, draft_ok, _ = await _make_draft(db_session, run, brand="瑞幸")
+    engine, _ = _make_engine(
+        db_session,
+        actions=[
+            PublishArtifacts(
+                action="publish_artifacts",
+                artifact_draft_ids=(draft_ok.id,),
+                summary="发布",
+            ),
+            PublishArtifacts(
+                action="publish_artifacts",
+                artifact_draft_ids=(draft_ok.artifact_id,),  # 混淆：传 artifact_id 而非 draft_id
+                summary="再次发布",
+            ),
+            Complete(action="complete", text="完成"),
+        ],
+    )
+    outcome = await engine.run(
+        run=run,
+        attempt_id=attempt.id,
+        profile=get_profile("session_analyst_v1"),
+        messages=[ChatMessage(role="user", content="分析瑞幸品牌")],
+    )
+    # 一次发布成功 + 一次 rejected（draft_not_found）→ completed_with_warnings。
+    assert outcome.status == RunStatus.COMPLETED_WITH_WARNINGS
+    assert run.status == RunStatus.COMPLETED_WITH_WARNINGS
+    terminal = await _terminal_events(db_session, run.id)
+    assert len(terminal) == 1
+    assert terminal[0].event_type == "run.completed_with_warnings"
+    keys = terminal[0].payload_json["warning_artifact_ids"]
+    # 拒绝项保留（rejected_draft 域），不被 artifact 域 published 消除。
+    assert ["rejected_draft", draft_ok.artifact_id] in keys
+    assert ["artifact", draft_ok.artifact_id] not in keys
 
 
 async def test_ask_user_releases_owned_drafts_and_new_run_can_take_over(

@@ -24,6 +24,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -82,6 +83,68 @@ def _abandon_idempotency_key(draft_revision_id: str) -> str:
     return f"abandon:{draft_revision_id}"
 
 
+def _reject_idempotency_key(run_id: str, draft_id: str) -> str:
+    """引用失败（draft 不存在 / revision 缺失 / 他人持有）的拒绝记录幂等键。
+
+    命名空间与 publish/abandon 隔离：拒绝记录不阻塞同一 Revision 后续真 owner
+    发布；前缀 run_id 保证不同 Run 幻觉同一 draft_id 不撞唯一约束；draft_id 为
+    模型幻觉输入（任意长度），键内哈希固定长度避免超 String(191) 列宽；同 Run
+    重复幻觉同一 draft_id 幂等复用已有记录。
+    """
+    return f"reject:{run_id}:{_reject_draft_hash(draft_id)}"
+
+
+def _reject_draft_hash(draft_id: str) -> str:
+    return hashlib.sha256(draft_id.encode("utf-8")).hexdigest()
+
+
+async def _record_rejection(
+    db: AsyncSession,
+    *,
+    run_id: str,
+    draft_id: str,
+    code: str,
+    message: str,
+) -> PublishItemResult:
+    """把引用失败持久化为 failed Attempt（Gate A 审查修复）。
+
+    失败记录同样参与终态聚合（engine._publish_outcome_artifact_ids），Run
+    不会在存在失败发布项时被错误标记为 completed。**拒绝记录不保存外部
+    Artifact 身份**（``artifact_id``/``draft_revision_id`` 恒为 NULL，避免
+    泄漏他人 Artifact 存在性），仅存模型自报的 ``draft_id`` 供终态聚合标识；
+    已有同幂等键记录（同 Run 重复幻觉同一 draft_id）直接复用，不重复落行。
+    """
+    result = _failure_result(draft_id, code, message)
+    existing = await db.scalar(
+        select(ArtifactPublishAttempt).where(
+            ArtifactPublishAttempt.idempotency_key == _reject_idempotency_key(run_id, draft_id)
+        )
+    )
+    if existing is not None:
+        return result
+    now = _utcnow()
+    db.add(
+        ArtifactPublishAttempt(
+            id=str(uuid4()),
+            run_id=run_id,
+            artifact_id=None,
+            draft_revision_id=None,
+            status="failed",
+            idempotency_key=_reject_idempotency_key(run_id, draft_id),
+            validation_json={
+                "rejected_draft_id": draft_id,
+                "reject_code": code,
+                "reject_message": message,
+            },
+            error_code=code,
+            created_at=now,
+            completed_at=now,
+        )
+    )
+    await db.commit()
+    return result
+
+
 def _failure_result(draft_id: str, code: str, message: str) -> PublishItemResult:
     return PublishItemResult(
         draft_id=draft_id,
@@ -126,7 +189,14 @@ class ArtifactPublicationService:
             select(ArtifactDraft).where(ArtifactDraft.id == draft_id).with_for_update()
         )
         if draft is None:
-            return _failure_result(draft_id, DRAFT_NOT_FOUND, f"draft {draft_id!r} not found")
+            # 引用不存在的 Draft：持久化拒绝记录（参与终态聚合），不崩溃。
+            return await _record_rejection(
+                self.db,
+                run_id=run_id,
+                draft_id=draft_id,
+                code=DRAFT_NOT_FOUND,
+                message=f"draft {draft_id!r} not found",
+            )
         revision = await self.db.scalar(
             select(ArtifactDraftRevision).where(
                 ArtifactDraftRevision.draft_id == draft.id,
@@ -134,44 +204,66 @@ class ArtifactPublicationService:
             )
         )
         if revision is None:  # pragma: no cover - create_or_get 恒先写首个 Revision
-            return _failure_result(
-                draft_id,
-                DRAFT_NOT_FOUND,
-                f"current revision {draft.current_revision} for draft {draft_id!r} not found",
+            return await _record_rejection(
+                self.db,
+                run_id=run_id,
+                draft_id=draft_id,
+                code=DRAFT_NOT_FOUND,
+                message=f"current revision {draft.current_revision} for draft {draft_id!r} not found",
             )
 
-        # 幂等重放（先于 owner 校验：发布成功会释放 owner，重放必须仍命中）：
-        # 同一 Revision 已落终态 Attempt 时直接返回已存结果，不产生重复行。
+        # 幂等重放：同一 Revision 由**本 Run**已落终态 Attempt 时直接返回已存
+        # 结果（不产生重复行）。他人 Run 的 Attempt（published/validation_failed/
+        # validating/failed）一律不得复用——published 会泄漏外部 Artifact 身份、
+        # validation_failed 会泄漏原错误快照——统一落入下方 not_found 拒绝
+        # （Gate A 三审：幂等重放必须先过归属校验）。
         attempt = await self.db.scalar(
             select(ArtifactPublishAttempt).where(
                 ArtifactPublishAttempt.idempotency_key == _publish_idempotency_key(revision.id)
             )
         )
-        if attempt is not None and attempt.status == "published":
-            version = await self.db.get(AgentArtifactVersion, attempt.published_version_id)
-            return PublishItemResult(
-                draft_id=draft_id,
-                status="published",
-                artifact_id=attempt.artifact_id,
-                artifact_version_id=attempt.published_version_id,
-                version=version.version if version is not None else None,
-            )
-        if attempt is not None and attempt.status == "validation_failed":
-            snapshot = attempt.validation_json or {}
-            return PublishItemResult(
-                draft_id=draft_id,
-                status="validation_failed",
-                artifact_id=attempt.artifact_id,
-                artifact_version_id=None,
-                version=None,
-                errors=tuple(snapshot.get("errors") or ()),
-            )
+        if attempt is not None and attempt.run_id == run_id:
+            if attempt.status == "published":
+                version = await self.db.get(AgentArtifactVersion, attempt.published_version_id)
+                return PublishItemResult(
+                    draft_id=draft_id,
+                    status="published",
+                    artifact_id=attempt.artifact_id,
+                    artifact_version_id=attempt.published_version_id,
+                    version=version.version if version is not None else None,
+                )
+            if attempt.status == "validation_failed":
+                snapshot = attempt.validation_json or {}
+                return PublishItemResult(
+                    draft_id=draft_id,
+                    status="validation_failed",
+                    artifact_id=attempt.artifact_id,
+                    artifact_version_id=None,
+                    version=None,
+                    errors=tuple(snapshot.get("errors") or ()),
+                )
 
         if draft.owner_run_id != run_id:
-            return _failure_result(
-                draft_id,
-                ARTIFACT_BUSY,
-                f"draft {draft_id!r} is owned by run {draft.owner_run_id!r}",
+            # 他人持有的 Draft：统一返回 not_found，不暴露 draft 存在性 / 归属
+            # Run（Gate A 审查：不泄漏外部 Artifact 身份）；拒绝记录不保存外部
+            # artifact_id，仅结构化回喂模型。
+            return await _record_rejection(
+                self.db,
+                run_id=run_id,
+                draft_id=draft_id,
+                code=DRAFT_NOT_FOUND,
+                message=f"draft {draft_id!r} not found",
+            )
+
+        if attempt is not None and attempt.run_id != run_id:
+            # 防御：Attempt 属他人 Run 但 owner 已落本 Run（异常状态）——不得
+            # 重置/复用他人记录，统一 not_found 拒绝。
+            return await _record_rejection(
+                self.db,
+                run_id=run_id,
+                draft_id=draft_id,
+                code=DRAFT_NOT_FOUND,
+                message=f"draft {draft_id!r} not found",
             )
 
         now = _utcnow()
@@ -201,6 +293,10 @@ class ArtifactPublicationService:
             .with_for_update()
         )
         if artifact is None:  # pragma: no cover - FK 保证稳定身份存在
+            attempt.status = "failed"
+            attempt.error_code = DRAFT_NOT_FOUND
+            attempt.completed_at = now
+            await self.db.commit()
             return _failure_result(
                 draft_id, DRAFT_NOT_FOUND, f"artifact {draft.artifact_id!r} not found"
             )

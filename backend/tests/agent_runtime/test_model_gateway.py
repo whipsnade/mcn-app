@@ -402,15 +402,23 @@ async def test_decide_step_transitions_running_to_completed(
 ) -> None:
     run, attempt = await _create_run(db_session, user_factory)
     release = asyncio.Event()
+    entered = asyncio.Event()
 
     class _GatedCompletions:
-        """非流式 create 阻塞到 release：模拟长决策期间的 running 快照。"""
+        """非流式 create 阻塞到 release：模拟长决策期间的 running 快照。
+
+        ``entered`` 在模型调用真正进入阻塞前 set——此时网关已把 running Step
+        commit（``decide`` 在调用前持久化 Step 并提交），测试等该事件后再读
+        Step，避免轮询查询与网关事务并发使用同一 AsyncSession（prepared
+        state 竞态，Gate A 回归偶发失败）。
+        """
 
         def __init__(self) -> None:
             self.calls: list[dict[str, Any]] = []
 
         async def create(self, **kwargs: Any) -> Any:
             self.calls.append(kwargs)
+            entered.set()
             await release.wait()
             return json_response(_COMPLETE)
 
@@ -432,23 +440,28 @@ async def test_decide_step_transitions_running_to_completed(
         )
     )
 
-    running_step = None
-    for _ in range(200):
+    # 等模型调用真正进入阻塞态（running Step 已 commit，网关不再持有活跃
+    # 事务）后再读 Step，确定性取到 running 快照；wait_for 兜底：任务在调用
+    # provider 前失败时让测试以超时失败而非永久挂起。
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
         running_step = await _get_step(db_session, run.id)
-        if running_step is not None and running_step.status == "running":
-            break
-        await asyncio.sleep(0.001)
-    assert running_step is not None
-    assert running_step.status == "running"
-    assert running_step.thinking_text is None
+        assert running_step is not None
+        assert running_step.status == "running"
+        assert running_step.thinking_text is None
 
-    release.set()
-    action = await decision_task
-    assert action.action == "complete"
+        release.set()
+        action = await decision_task
+        assert action.action == "complete"
 
-    step = await _get_step(db_session, run.id)
-    assert step is not None
-    assert step.status == "completed"
+        step = await _get_step(db_session, run.id)
+        assert step is not None
+        assert step.status == "completed"
+    finally:
+        release.set()
+        if not decision_task.done():
+            decision_task.cancel()
+            await asyncio.gather(decision_task, return_exceptions=True)
 
 
 async def test_decide_truncates_thinking_text_to_64kib(db_session, user_factory) -> None:

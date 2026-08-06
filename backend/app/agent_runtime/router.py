@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import datetime
 from typing import Annotated, Any
 from uuid import uuid4
@@ -204,8 +205,27 @@ async def get_kol_detail_service(
 # --------------------------------------------------------------------------- #
 
 
-def _content_hash(content: str) -> str:
-    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+def _content_hash(
+    content: str,
+    parent_run_id: str | None,
+    artifact_version_ids: tuple[str, ...],
+) -> str:
+    """幂等 payload 哈希：文本 + 父 Run + 引用的 Artifact Version（排序）。
+
+    只哈希文本会让「相同文本切换报告版本/父 Run」复用错误 Run（Gate A
+    审查修复）；引用顺序不影响同一逻辑 payload，排序后哈希。
+    """
+    canonical = json.dumps(
+        {
+            "content": content,
+            "parent_run_id": parent_run_id,
+            # 去重 + 排序：重复/乱序引用是同一逻辑 payload，幂等哈希应一致。
+            "artifact_version_ids": sorted(set(artifact_version_ids)),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _not_found(detail: str) -> HTTPException:
@@ -309,10 +329,11 @@ async def _supersede_pending_questions(db: AsyncSession, session_id: str) -> Non
 
 
 async def _validate_artifact_version_ids(
-    db: AsyncSession, user_id: str, session_id: str, version_ids: tuple[str, ...]
+    db: AsyncSession, user_id: str, version_ids: tuple[str, ...]
 ) -> list[str]:
-    """校验引用的 Artifact Version 属本用户、同 Session 且已发布（§5.4：
-    草稿、失败产物和其他用户数据不可被引用）；任何失败统一 404。按入参
+    """校验引用的 Artifact Version 属本用户且已发布（§5.4：草稿、失败产物和
+    其他用户数据不可被引用；设计 §0 数据隔离——跨 Session 可复用当前用户
+    的已发布 Artifact，故无需 Session 限制）；任何失败统一 404。按入参
     顺序去重后返回。
     """
     validated: list[str] = []
@@ -323,7 +344,6 @@ async def _validate_artifact_version_ids(
             .where(
                 AgentArtifactVersion.id == version_id,
                 AgentArtifact.user_id == user_id,
-                AgentArtifact.session_id == session_id,
                 AgentArtifact.status == "published",
             )
         )
@@ -502,7 +522,7 @@ async def append_message(
     # 先 FOR UPDATE 锁住 Session 行（同 kol_detail working-head 锁），后续请求在
     # 前一个请求提交后才拿到锁，此时 active 检查能看到已提交的 Run → 409。
     await _get_owned_session(db, user.id, session_id, for_update=True)
-    content_hash = _content_hash(payload.content)
+    content_hash = _content_hash(payload.content, payload.parent_run_id, payload.artifact_version_ids)
 
     # 幂等优先：同 key + 同 payload → 复用同一 Run；不同 payload → 409。
     if idempotency_key is not None:
@@ -522,11 +542,11 @@ async def append_message(
                 reused=True,
             )
 
-    # 引用校验（建 Run 前）：父 Run 与 Artifact Version 必须属本用户、同 Session
-    # 且 Version 已发布；任何归属失败统一 404，不泄漏存在性。
+    # 引用校验（建 Run 前）：父 Run 必须属本用户同 Session；Artifact Version
+    # 必须属本用户且已发布（跨 Session 可复用）；任何归属失败统一 404。
     parent_run_id = await _resolve_parent_run_id(db, user.id, session_id, payload.parent_run_id)
     artifact_version_ids = await _validate_artifact_version_ids(
-        db, user.id, session_id, payload.artifact_version_ids
+        db, user.id, payload.artifact_version_ids
     )
 
     # 活动并发：同一 Session 只允许一个活动 session_analyst_v1 Run。
@@ -754,33 +774,85 @@ async def retry_run(
             status_code=status.HTTP_409_CONFLICT, detail="active_run_in_progress"
         )
 
-    # 冻结仍有效的引用：available Evidence + 原 Run 产出且仍 published 的 Version。
-    evidence_ids = list(
-        (
-            await db.scalars(
-                select(EvidenceItem.id)
-                .where(
-                    EvidenceItem.run_id == run.id,
-                    EvidenceItem.availability_status == "available",
-                )
-                .order_by(EvidenceItem.collected_at, EvidenceItem.id)
-            )
-        ).all()
+    # 冻结仍有效的引用：原 Run 的输入引用（父 Run / 用户引用 Version /
+    # 上游冻结 Evidence）与产出 Evidence/Version 合并后，逐条重新验证
+    # 归属与可用/已发布状态——失效引用（Evidence 不再 available、Version
+    # 不再 published、或其他用户/会话的）一律丢弃，避免重试引用陈旧数据。
+    original_snapshot = run.prompt_snapshot_json or {}
+    inherited_evidence = original_snapshot.get("evidence_ids") or []
+    inherited_versions = original_snapshot.get("artifact_version_ids") or []
+    candidate_evidence = list(
+        dict.fromkeys(
+            [
+                *inherited_evidence,
+                *(
+                    await db.scalars(
+                        select(EvidenceItem.id)
+                        .where(
+                            EvidenceItem.run_id == run.id,
+                            EvidenceItem.availability_status == "available",
+                        )
+                        .order_by(EvidenceItem.collected_at, EvidenceItem.id)
+                    )
+                ).all(),
+            ]
+        )
     )
-    version_ids = list(
-        (
-            await db.scalars(
-                select(AgentArtifactVersion.id)
-                .join(AgentArtifact, AgentArtifactVersion.artifact_id == AgentArtifact.id)
-                .where(
-                    AgentArtifactVersion.source_run_id == run.id,
-                    AgentArtifact.status == "published",
-                )
-                .order_by(AgentArtifactVersion.created_at, AgentArtifactVersion.id)
-            )
-        ).all()
+    candidate_versions = list(
+        dict.fromkeys(
+            [
+                *inherited_versions,
+                *(
+                    await db.scalars(
+                        select(AgentArtifactVersion.id)
+                        .join(AgentArtifact, AgentArtifactVersion.artifact_id == AgentArtifact.id)
+                        .where(
+                            AgentArtifactVersion.source_run_id == run.id,
+                            AgentArtifact.status == "published",
+                        )
+                        .order_by(AgentArtifactVersion.created_at, AgentArtifactVersion.id)
+                    )
+                ).all(),
+            ]
+        )
     )
 
+    # 重新验证候选引用：Evidence 必须仍 available 且本用户会话；Version 必须
+    # 仍 published 且本用户。只保留验证通过的，避免重试引用已失效/越权数据。
+    # 用 IN 查询校验存在性后按候选顺序重建，保证引用顺序稳定。
+    valid_evidence_rows = (
+        await db.scalars(
+            select(EvidenceItem.id).where(
+                EvidenceItem.id.in_(candidate_evidence),
+                EvidenceItem.session_id == run.session_id,
+                EvidenceItem.availability_status == "available",
+            )
+        )
+    ).all()
+    valid_evidence_set = set(valid_evidence_rows)
+    evidence_ids = [eid for eid in candidate_evidence if eid in valid_evidence_set]
+
+    valid_version_rows = (
+        await db.scalars(
+            select(AgentArtifactVersion.id)
+            .join(AgentArtifact, AgentArtifactVersion.artifact_id == AgentArtifact.id)
+            .where(
+                AgentArtifactVersion.id.in_(candidate_versions),
+                AgentArtifact.user_id == run.user_id,
+                AgentArtifact.status == "published",
+            )
+        )
+    ).all()
+    valid_version_set = set(valid_version_rows)
+    version_ids = [vid for vid in candidate_versions if vid in valid_version_set]
+
+    retried_snapshot: dict[str, Any] = {
+        "retry_of": run.id,
+        "evidence_ids": evidence_ids,
+        "artifact_version_ids": version_ids,
+    }
+    if original_snapshot.get("parent_run_id") is not None:
+        retried_snapshot["parent_run_id"] = original_snapshot["parent_run_id"]
     retried = AgentRun(
         id=str(uuid4()),
         session_id=run.session_id,
@@ -796,11 +868,7 @@ async def retry_run(
         decision_count=0,
         review_count=0,
         revision_count=0,
-        prompt_snapshot_json={
-            "retry_of": run.id,
-            "evidence_ids": evidence_ids,
-            "artifact_version_ids": version_ids,
-        },
+        prompt_snapshot_json=retried_snapshot,
     )
     db.add(retried)
     await db.commit()

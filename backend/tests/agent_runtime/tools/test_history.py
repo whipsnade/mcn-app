@@ -22,6 +22,7 @@ from app.agent_artifacts.models import (
 )
 from app.agent_runtime.evidence import EvidenceWriter
 from app.agent_runtime.models import (
+    AgentMessage,
     AgentRun,
     AgentRunAttempt,
     AgentSession,
@@ -333,6 +334,28 @@ async def test_read_artifact_cross_user_forbidden(db_session, user_factory) -> N
     assert result.error_type == FORBIDDEN
 
 
+async def test_read_artifact_cross_session_published_allowed(db_session, user_factory) -> None:
+    """同用户跨 Session 可读已发布 Version（§5.4 历史复用）；活动 Draft 仍限
+    本 Session，跨 Session 时走已发布路径。"""
+    user = await user_factory()
+    session_a, run_a, _step_a, _call_a = await _make_chain(db_session, user.id)
+    session_b, run_b, _step_b, _call_b = await _make_chain(db_session, user.id)
+    artifact = await _make_artifact(
+        db_session, user.id, session_a, run_a, payload={"title": "跨会话报告"}
+    )
+    # 当前 Run 在 session_b，读 session_a 的已发布 Artifact。
+    context = ToolContext(
+        user_id=user.id, session_id=session_b.id, run_id=run_b.id, profile_name="session_analyst_v1"
+    )
+
+    tool = ReadArtifactTool(db_session)
+    result = await tool.execute(context, type(tool).input_model(artifact_id=artifact.id))
+    assert result.status == "success"
+    data = json.loads(result.safe_summary)
+    assert data["status"] == "published"
+    assert data["payload"]["title"] == "跨会话报告"
+
+
 # ---------------------------------------------------------------------------
 # read_artifact 读取未发布 Draft（F1）：Builder 产出 Draft 后模型需要验证内容；
 # 活动 Draft（drafting/reviewing）优先于已发布 Version，发布语义不变。
@@ -442,16 +465,16 @@ async def test_read_artifact_draft_section_rfc6901_slice(db_session, user_factor
 
 
 async def test_read_artifact_draft_cross_session_not_found(db_session, user_factory) -> None:
-    """他人 Session 的活动 Draft 不泄漏存在性（与已发布 Version 同一语义）。"""
-    owner = await user_factory()
-    other = await user_factory()
-    session, run, _step, _call = await _make_chain(db_session, owner.id)
+    """同用户其他 Session 的活动 Draft 不泄漏存在性：跨 Session 只读已发布
+    Version，活动 Draft 限本 Session，读不到即 not_found（与已发布路径一致）。"""
+    user = await user_factory()
+    session, run, _step, _call = await _make_chain(db_session, user.id)
     artifact, _draft, _revision = await _make_draft_only_artifact(
-        db_session, owner.id, session, run, payload={"title": "私有草稿"}
+        db_session, user.id, session, run, payload={"title": "私有草稿"}
     )
-    other_session, other_run, _s2, _c2 = await _make_chain(db_session, other.id)
+    other_session, other_run, _s2, _c2 = await _make_chain(db_session, user.id)
     context = ToolContext(
-        user_id=other.id,
+        user_id=user.id,
         session_id=other_session.id,
         run_id=other_run.id,
         profile_name="session_analyst_v1",
@@ -721,9 +744,25 @@ async def _scope_entries(db_session, session_id: str) -> list[MemoryEntry]:
     )
 
 
+async def _add_user_message(db_session, session_id: str, run_id: str, content: str) -> AgentMessage:
+    message = AgentMessage(
+        id=str(uuid4()),
+        session_id=session_id,
+        run_id=run_id,
+        role="user",
+        content=content,
+        sequence=1,
+        created_at=_now(),
+    )
+    db_session.add(message)
+    await db_session.flush()
+    return message
+
+
 async def test_remember_scope_writes_confirmed_scope_entries(db_session, user_factory) -> None:
     user = await user_factory()
     session, run, _step, _call = await _make_chain(db_session, user.id)
+    message = await _add_user_message(db_session, session.id, run.id, "分析近30天小红书")
     context = ToolContext(
         user_id=user.id, session_id=session.id, run_id=run.id, profile_name="session_analyst_v1"
     )
@@ -734,7 +773,7 @@ async def test_remember_scope_writes_confirmed_scope_entries(db_session, user_fa
         RememberScopeArgs(
             domain="brand",
             values={"period": "近30天", "platform": "小红书"},
-            source_message_id="m-1",
+            source_message_id=message.id,
         ),
     )
     data = _summary(result)
@@ -749,7 +788,7 @@ async def test_remember_scope_writes_confirmed_scope_entries(db_session, user_fa
     for entry in entries:
         assert entry.content_json["domain"] == "brand"
         assert entry.content_json["explicit"] is True
-        assert entry.content_json["source_message_id"] == "m-1"
+        assert entry.content_json["source_message_id"] == message.id
         assert entry.source_run_id == run.id
         assert entry.superseded_at is None
 
@@ -758,6 +797,7 @@ async def test_remember_scope_supersedes_same_domain_field(db_session, user_fact
     """同 domain+field 的旧 active 条目被 supersede；其他 field / domain 不受影响。"""
     user = await user_factory()
     session, run, _step, _call = await _make_chain(db_session, user.id)
+    message = await _add_user_message(db_session, session.id, run.id, "分析近30天小红书")
     context = ToolContext(
         user_id=user.id, session_id=session.id, run_id=run.id, profile_name="session_analyst_v1"
     )
@@ -768,14 +808,14 @@ async def test_remember_scope_supersedes_same_domain_field(db_session, user_fact
         RememberScopeArgs(
             domain="brand",
             values={"period": "近30天", "platform": "小红书"},
-            source_message_id="m-1",
+            source_message_id=message.id,
         ),
     )
     assert first.status == "success"
     second = await tool.execute(
         context,
         RememberScopeArgs(
-            domain="brand", values={"period": "近90天"}, source_message_id="m-2"
+            domain="brand", values={"period": "近90天"}, source_message_id=message.id
         ),
     )
     data = _summary(second)
@@ -810,10 +850,68 @@ async def test_remember_scope_invalid_domain_rejected(db_session, user_factory) 
     assert await _scope_entries(db_session, session.id) == []
 
 
+async def test_remember_scope_empty_values_rejected(db_session, user_factory) -> None:
+    """空 values（无字段可确认）是模型幻觉：结构化失败，不落任何记忆。"""
+    user = await user_factory()
+    session, run, _step, _call = await _make_chain(db_session, user.id)
+    message = await _add_user_message(db_session, session.id, run.id, "分析小红书")
+    context = ToolContext(
+        user_id=user.id, session_id=session.id, run_id=run.id, profile_name="session_analyst_v1"
+    )
+    tool = RememberScopeTool(db_session)
+    result = await tool.execute(
+        context,
+        {"domain": "brand", "values": {}, "source_message_id": message.id},
+    )
+    assert result.status == "failed"
+    assert result.error_type == INVALID_ARGUMENTS
+    assert await _scope_entries(db_session, session.id) == []
+
+
+async def test_remember_scope_source_message_ownership_validated(
+    db_session, user_factory
+) -> None:
+    """source_message_id 必须存在、属本 Session 且为用户消息（Gate A 审查：
+    不存在的消息、其他 Session 的消息、assistant 消息一律 not_found）。"""
+    user = await user_factory()
+    session, run, _step, _call = await _make_chain(db_session, user.id)
+    other_session, other_run, _s2, _c2 = await _make_chain(db_session, user.id)
+    other_message = await _add_user_message(
+        db_session, other_session.id, other_run.id, "别的会话"
+    )
+    assistant = AgentMessage(
+        id=str(uuid4()),
+        session_id=session.id,
+        run_id=run.id,
+        role="assistant",
+        content="请确认周期",
+        sequence=2,
+        created_at=_now(),
+    )
+    db_session.add(assistant)
+    await db_session.flush()
+    context = ToolContext(
+        user_id=user.id, session_id=session.id, run_id=run.id, profile_name="session_analyst_v1"
+    )
+    tool = RememberScopeTool(db_session)
+
+    for bad_id in (str(uuid4()), other_message.id, assistant.id):
+        result = await tool.execute(
+            context,
+            RememberScopeArgs(
+                domain="brand", values={"period": "近30天"}, source_message_id=bad_id
+            ),
+        )
+        assert result.status == "failed"
+        assert result.error_type == NOT_FOUND
+    assert await _scope_entries(db_session, session.id) == []
+
+
 async def test_remember_scope_cross_user_forbidden(db_session, user_factory) -> None:
     owner = await user_factory()
     other = await user_factory()
     session, run, _step, _call = await _make_chain(db_session, owner.id)
+    message = await _add_user_message(db_session, session.id, run.id, "分析抖音")
     context = ToolContext(
         user_id=other.id, session_id=session.id, run_id=run.id, profile_name="session_analyst_v1"
     )
@@ -821,7 +919,7 @@ async def test_remember_scope_cross_user_forbidden(db_session, user_factory) -> 
     result = await tool.execute(
         context,
         RememberScopeArgs(
-            domain="kol", values={"platform": "抖音"}, source_message_id="m-1"
+            domain="kol", values={"platform": "抖音"}, source_message_id=message.id
         ),
     )
     assert result.status == "failed"

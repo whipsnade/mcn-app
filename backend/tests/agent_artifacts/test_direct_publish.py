@@ -371,7 +371,8 @@ async def test_publish_requires_run_lease(
 async def test_publish_foreign_owned_draft_fails_without_blocking_others(
     publication_service, publish_env, run_factory, valid_draft
 ):
-    """他人持有的 Draft 逐项 failed（artifact_busy），同一调用中自己的 Draft 照常发布。"""
+    """他人持有的 Draft 统一返回 not_found（不暴露 draft 存在性/归属），
+    同一调用中自己的 Draft 照常发布；拒绝记录不保存外部 Artifact 身份。"""
     other_run = await run_factory(publish_env.session.id, publish_env.user.id)
     other_env = PublishEnv(
         db=publish_env.db, user=publish_env.user, session=publish_env.session, run=other_run
@@ -385,9 +386,24 @@ async def test_publish_foreign_owned_draft_fails_without_blocking_others(
     )
     assert [item.status for item in results] == ["failed", "published"]
     assert results[0].draft_id == foreign.id
-    assert any(error.get("code") == "artifact_busy" for error in results[0].errors)
-    # 归属失败不写 PublishAttempt（未进入校验），他人 Draft 不受影响。
-    assert await _attempts_for(publish_env.db, foreign.revision_id) == []
+    # 统一 not_found：不暴露 artifact_busy / owner_run_id。
+    assert any(error.get("code") == "draft_not_found" for error in results[0].errors)
+    assert "owner_run_id" not in ",".join(e.get("msg", "") for e in results[0].errors)
+    # 归属失败持久化为 rejected failed Attempt（Gate A 审查：参与终态聚合），
+    # 不保存外部 Artifact 身份（artifact_id/draft_revision_id 为 NULL）。
+    rejected = (
+        await publication_service.db.scalars(
+            select(ArtifactPublishAttempt).where(
+                ArtifactPublishAttempt.run_id == valid_draft.run_id,
+                ArtifactPublishAttempt.error_code == "draft_not_found",
+            )
+        )
+    ).all()
+    assert len(rejected) == 1
+    assert rejected[0].status == "failed"
+    assert rejected[0].artifact_id is None
+    assert rejected[0].draft_revision_id is None
+    assert rejected[0].validation_json["rejected_draft_id"] == foreign.id
     foreign_draft = await publish_env.db.get(ArtifactDraft, foreign.id)
     assert foreign_draft is not None
     assert foreign_draft.owner_run_id == other_run.id
@@ -405,3 +421,149 @@ async def test_publish_unknown_draft_is_per_item_failure(
     assert results[0].draft_id == "missing-draft-id"
     assert results[0].artifact_version_id is None
     assert any(error.get("code") == "draft_not_found" for error in results[0].errors)
+    # 引用不存在的 Draft：持久化拒绝记录（artifact_id/draft_revision_id 为 NULL），
+    # 参与终态聚合；幂等复用不重复落行。
+    rejected = (
+        await publication_service.db.scalars(
+            select(ArtifactPublishAttempt).where(
+                ArtifactPublishAttempt.run_id == valid_draft.run_id,
+                ArtifactPublishAttempt.error_code == "draft_not_found",
+            )
+        )
+    ).all()
+    assert len(rejected) == 1
+    assert rejected[0].artifact_id is None
+    assert rejected[0].draft_revision_id is None
+    assert rejected[0].validation_json["rejected_draft_id"] == "missing-draft-id"
+    replay = await publication_service.publish(
+        run_id=valid_draft.run_id,
+        draft_ids=("missing-draft-id",),
+        worker_id=WORKER,
+    )
+    assert replay[0].status == "failed"
+    assert (
+        await publication_service.db.scalar(
+            select(func.count(ArtifactPublishAttempt.id)).where(
+                ArtifactPublishAttempt.run_id == valid_draft.run_id,
+                ArtifactPublishAttempt.error_code == "draft_not_found",
+            )
+        )
+    ) == 1
+
+
+async def test_published_draft_replay_by_other_run_is_not_found(
+    publication_service, publish_env, run_factory
+):
+    """已发布 Draft 被其他 Run（同用户跨 Run）重放：不得复用原 Run 的 published
+    Attempt（会泄漏外部 artifact_id/version），统一 not_found + 拒绝记录（Gate A
+    三审：幂等重放必须先过归属校验）。"""
+    draft = await _make_draft(publish_env, question="已发布")
+    first = await publication_service.publish(
+        run_id=publish_env.run.id,
+        draft_ids=(draft.id,),
+        worker_id=WORKER,
+    )
+    assert first[0].status == "published"
+
+    other_run = await run_factory(publish_env.session.id, publish_env.user.id)
+    claimed = await AgentRunRepository(publish_env.db).claim_lease(other_run.id, WORKER, 300)
+    assert claimed
+    replayed = await publication_service.publish(
+        run_id=other_run.id,
+        draft_ids=(draft.id,),
+        worker_id=WORKER,
+    )
+    # 不返回 published 结果（不泄漏 artifact_id/version），统一 draft_not_found。
+    assert replayed[0].status == "failed"
+    assert replayed[0].artifact_id == ""
+    assert replayed[0].artifact_version_id is None
+    assert any(error.get("code") == "draft_not_found" for error in replayed[0].errors)
+    # 拒绝记录落库且不保存外部 Artifact 身份。
+    rejected = (
+        await publication_service.db.scalars(
+            select(ArtifactPublishAttempt).where(
+                ArtifactPublishAttempt.run_id == other_run.id,
+                ArtifactPublishAttempt.error_code == "draft_not_found",
+            )
+        )
+    ).all()
+    assert len(rejected) == 1
+    assert rejected[0].artifact_id is None
+
+
+async def test_published_draft_replay_by_other_user_is_not_found(
+    publication_service, publish_env, run_factory, user_factory, session_factory
+):
+    """已发布 Draft 被其他用户 Run 重放：跨用户同样统一 not_found，不泄漏
+    外部 Artifact 身份（Gate A 三审）。"""
+    draft = await _make_draft(publish_env, question="跨用户已发布")
+    first = await publication_service.publish(
+        run_id=publish_env.run.id,
+        draft_ids=(draft.id,),
+        worker_id=WORKER,
+    )
+    assert first[0].status == "published"
+
+    other_user = await user_factory()
+    other_session = await session_factory(other_user.id)
+    other_run = await run_factory(other_session.id, other_user.id)
+    claimed = await AgentRunRepository(publish_env.db).claim_lease(other_run.id, WORKER, 300)
+    assert claimed
+    replayed = await publication_service.publish(
+        run_id=other_run.id,
+        draft_ids=(draft.id,),
+        worker_id=WORKER,
+    )
+    assert replayed[0].status == "failed"
+    assert replayed[0].artifact_id == ""
+    assert any(error.get("code") == "draft_not_found" for error in replayed[0].errors)
+    rejected = (
+        await publication_service.db.scalars(
+            select(ArtifactPublishAttempt).where(
+                ArtifactPublishAttempt.run_id == other_run.id,
+                ArtifactPublishAttempt.error_code == "draft_not_found",
+            )
+        )
+    ).all()
+    assert len(rejected) == 1
+    assert rejected[0].artifact_id is None
+
+
+async def test_validation_failed_draft_replay_by_other_run_is_not_found(
+    publication_service, publish_env, run_factory
+):
+    """validation_failed Draft 被其他 Run 重放：不得复用原 Attempt 的错误快照
+    （Pydantic 错误可能含非法输入值），统一 not_found + 拒绝记录（Gate A 三审）。"""
+    # 必需数字叶子缺 lineage：确定性校验判 validation_failed（§10.3）。
+    draft = await _make_draft(
+        publish_env, question="非法", payload=insight_metric_payload(value=100)
+    )
+    first = await publication_service.publish(
+        run_id=publish_env.run.id,
+        draft_ids=(draft.id,),
+        worker_id=WORKER,
+    )
+    assert first[0].status == "validation_failed"
+
+    other_run = await run_factory(publish_env.session.id, publish_env.user.id)
+    claimed = await AgentRunRepository(publish_env.db).claim_lease(other_run.id, WORKER, 300)
+    assert claimed
+    replayed = await publication_service.publish(
+        run_id=other_run.id,
+        draft_ids=(draft.id,),
+        worker_id=WORKER,
+    )
+    # 不返回原错误快照，统一 draft_not_found；拒绝记录不保存外部身份。
+    assert replayed[0].status == "failed"
+    assert replayed[0].artifact_id == ""
+    assert replayed[0].errors == ({"code": "draft_not_found", "msg": f"draft {draft.id!r} not found"},)
+    rejected = (
+        await publication_service.db.scalars(
+            select(ArtifactPublishAttempt).where(
+                ArtifactPublishAttempt.run_id == other_run.id,
+                ArtifactPublishAttempt.error_code == "draft_not_found",
+            )
+        )
+    ).all()
+    assert len(rejected) == 1
+    assert rejected[0].artifact_id is None

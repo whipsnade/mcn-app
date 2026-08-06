@@ -36,7 +36,12 @@ from app.agent_artifacts.models import (
     ArtifactDraft,
     ArtifactDraftRevision,
 )
-from app.agent_runtime.models import AgentSession, EvidenceItem, MemoryEntry
+from app.agent_runtime.models import (
+    AgentMessage,
+    AgentSession,
+    EvidenceItem,
+    MemoryEntry,
+)
 from app.agent_runtime.repository import utc_now
 from app.agent_runtime.tools.contracts import ToolContext, ToolResult
 
@@ -182,10 +187,12 @@ class ReadArtifactTool:
             return _failed(error, "session_" + error)
 
         artifact = await self._db.get(AgentArtifact, args.artifact_id)
-        if artifact is None or artifact.session_id != context.session_id:
+        if artifact is None:
             return _failed(NOT_FOUND, "artifact_not_found")
         if artifact.user_id != context.user_id:
             return _failed(FORBIDDEN, "artifact_forbidden")
+        # 跨 Session 只允许读已发布 Version（§5.4 历史复用）；活动 Draft 仍限本
+        # Session，由 _try_read_draft 的 session 校验兜底，跨 Session 走已发布路径。
 
         if args.version is None:
             draft_result = await self._try_read_draft(context, artifact, args.section)
@@ -472,8 +479,9 @@ class RememberScopeArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     domain: Literal["brand", "campaign", "kol"]
-    values: dict[str, JsonValue]
-    source_message_id: str
+    # 拒绝空 values：无字段可确认的调用是模型幻觉，直接结构化失败（Gate A 审查）。
+    values: dict[str, JsonValue] = Field(min_length=1)
+    source_message_id: str = Field(min_length=1)
     explicit: bool = True
 
 
@@ -483,6 +491,9 @@ class RememberScopeTool:
     按 ``values`` 的每个 field 落一条 ``confirmed_scope`` MemoryEntry；同
     domain+field 的旧 active 条目在同一事务里被 supersede（保留审计历史），
     Context Builder 只注入未 supersede 条目。
+
+    ``source_message_id`` 必须存在且属于当前 Session 的用户消息（Gate A
+    审查：校验来源消息归属，不允许引用他人/他 Session 消息）。
     """
 
     name = "remember_scope"
@@ -500,6 +511,19 @@ class RememberScopeTool:
         _session, error = await _owned_session(self._db, context)
         if error is not None:
             return _failed(error, "session_" + error)
+
+        source = await self._db.scalar(
+            select(AgentMessage.id).where(
+                AgentMessage.id == args.source_message_id,
+                AgentMessage.session_id == context.session_id,
+                AgentMessage.role == "user",
+            )
+        )
+        if source is None:
+            return _failed(
+                NOT_FOUND,
+                f"source message {args.source_message_id!r} not found in this session",
+            )
 
         now = utc_now()
         superseded = 0

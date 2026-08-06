@@ -355,6 +355,81 @@ async def test_idempotency_key_reuse_and_payload_conflict(
     assert len(runs) == 1
 
 
+async def test_idempotency_payload_includes_parent_and_version_refs(
+    agent_client_factory, db_session
+) -> None:
+    """幂等 payload 哈希含 parent_run_id 与 artifact_version_ids：同文本但引用
+    不同的请求复用同 key 必须 409，不得复用错误 Run（Gate A 审查修复）。"""
+    executor = FakeExecutor()
+    alice, _ = await agent_client_factory("13600000022", executor=executor)
+    session_id = await _create_session(alice)
+    user_id = await _me_id(alice)
+    run = await _add_run(db_session, user_id, session_id, status="completed")
+    version = await _add_artifact_version(db_session, user_id, session_id, run.id)
+
+    headers = {"Idempotency-Key": "k-refs"}
+    first = await alice.post(
+        f"/api/v1/agent/sessions/{session_id}/messages",
+        json={"content": "基于这份报告分析", "artifact_version_ids": [version.id]},
+        headers=headers,
+    )
+    assert first.status_code == 201
+
+    # 同文本 + 同 key + 不同引用 → 409（payload 不同）。
+    conflict = await alice.post(
+        f"/api/v1/agent/sessions/{session_id}/messages",
+        json={"content": "基于这份报告分析", "artifact_version_ids": []},
+        headers=headers,
+    )
+    assert conflict.status_code == 409
+
+
+async def test_idempotency_hash_normalizes_version_refs(
+    agent_client_factory, db_session
+) -> None:
+    """幂等哈希对 Version 引用去重 + 排序归一再哈希：乱序、重复 ID 是同一逻辑
+    payload，复用同 key 应幂等返回同一 Run；parent 变化则视为不同 payload。"""
+    executor = FakeExecutor()
+    alice, _ = await agent_client_factory("13600000023", executor=executor)
+    session_id = await _create_session(alice)
+    user_id = await _me_id(alice)
+    run = await _add_run(db_session, user_id, session_id, status="completed")
+    v1 = await _add_artifact_version(db_session, user_id, session_id, run.id)
+    v2 = await _add_artifact_version(db_session, user_id, session_id, run.id)
+
+    # 原始请求：乱序 + 重复 ID。
+    headers = {"Idempotency-Key": "k-normalize"}
+    first = await alice.post(
+        f"/api/v1/agent/sessions/{session_id}/messages",
+        json={"content": "复用报告", "artifact_version_ids": [v2.id, v1.id, v2.id]},
+        headers=headers,
+    )
+    assert first.status_code == 201
+    run_id = first.json()["run_id"]
+
+    # 乱序/重复归一到同一哈希 → 复用同一 Run。
+    replay = await alice.post(
+        f"/api/v1/agent/sessions/{session_id}/messages",
+        json={"content": "复用报告", "artifact_version_ids": [v1.id, v1.id, v2.id]},
+        headers=headers,
+    )
+    assert replay.status_code == 201
+    assert replay.json()["run_id"] == run_id
+
+    # parent 变化 → 不同 payload → 409（同 key 不得复用错误 Run）。
+    parent_run = await _add_run(db_session, user_id, session_id, status="completed")
+    parent_change = await alice.post(
+        f"/api/v1/agent/sessions/{session_id}/messages",
+        json={
+            "content": "复用报告",
+            "parent_run_id": parent_run.id,
+            "artifact_version_ids": [v1.id, v2.id],
+        },
+        headers=headers,
+    )
+    assert parent_change.status_code == 409
+
+
 async def test_second_active_run_is_rejected(agent_client_factory, db_session) -> None:
     executor = FakeExecutor()
     alice, _ = await agent_client_factory("13600000031", executor=executor)
@@ -1262,10 +1337,10 @@ async def test_cross_user_artifact_reference_is_404(agent_client_factory, db_ses
     assert resp.status_code == 404
 
 
-async def test_unpublished_or_cross_session_version_reference_is_404(
+async def test_unpublished_or_foreign_version_reference_is_404(
     agent_client_factory, db_session
 ) -> None:
-    """草稿（未发布）产物与同用户跨 Session 的 Version 都不可引用（§5.4）。"""
+    """草稿（未发布）产物与不存在的 Version 不可引用（§5.4）。"""
     alice, _ = await agent_client_factory("13700000007")
     session_id = await _create_session(alice)
     user_id = await _me_id(alice)
@@ -1273,15 +1348,35 @@ async def test_unpublished_or_cross_session_version_reference_is_404(
     draft_version = await _add_artifact_version(
         db_session, user_id, session_id, run.id, artifact_status="draft"
     )
-    other_session = await _create_session(alice)
-    other_version = await _add_artifact_version(db_session, user_id, other_session, run.id)
 
-    for version_id in (draft_version.id, other_version.id, str(uuid4())):
+    for version_id in (draft_version.id, str(uuid4())):
         resp = await alice.post(
             f"/api/v1/agent/sessions/{session_id}/messages",
             json={"content": "基于这份报告分析", "artifact_version_ids": [version_id]},
         )
         assert resp.status_code == 404
+
+
+async def test_cross_session_published_version_reference_allowed(
+    agent_client_factory, db_session
+) -> None:
+    """同用户跨 Session 的已发布 Version 可引用（§5.4 / §0 数据隔离：
+    跨 Session 可复用当前用户的已发布 Artifact，草稿与其他用户数据除外）。"""
+    executor = FakeExecutor()
+    alice, _ = await agent_client_factory("13700000007", executor=executor)
+    session_id = await _create_session(alice)
+    user_id = await _me_id(alice)
+    run = await _add_run(db_session, user_id, session_id, status="completed")
+    other_session = await _create_session(alice)
+    other_version = await _add_artifact_version(db_session, user_id, other_session, run.id)
+
+    resp = await alice.post(
+        f"/api/v1/agent/sessions/{session_id}/messages",
+        json={"content": "基于这份报告分析", "artifact_version_ids": [other_version.id]},
+    )
+    assert resp.status_code == 201, resp.text
+    new_run = await db_session.get(AgentRun, resp.json()["run_id"])
+    assert new_run.prompt_snapshot_json["artifact_version_ids"] == [other_version.id]
 
 
 async def test_artifact_reference_snapshot_frozen_into_run(
@@ -1308,11 +1403,26 @@ async def test_retry_creates_new_run_without_reopening_failed_run(
     agent_client_factory, db_session
 ) -> None:
     """retry failed Run：创建新的 user-visible Child Run（parent 指向原 Run），
-    冻结仍有效的 Evidence / 已发布 Artifact 引用；原 Run 保持 failed 不被重开。"""
+    继承原 Run 的输入引用（父链 / 输入 Version / 冻结 Evidence）并冻结仍有效的
+    产出（available Evidence / 已发布 Version）；失效引用（过期 Evidence、未发布
+    Version、不存在的 ID）被重新验证丢弃；原 Run 保持 failed 不被重开。"""
     executor = FakeExecutor()
     alice, _ = await agent_client_factory("13700000009", executor=executor)
     session_id = await _create_session(alice)
     user_id = await _me_id(alice)
+    parent = await _add_run(db_session, user_id, session_id, status="completed")
+    # 输入引用：真实存在的已发布 Version 与 available Evidence。
+    input_version = await _add_artifact_version(db_session, user_id, session_id, parent.id)
+    input_evidence = await _add_evidence(
+        db_session, session_id, parent.id, availability="available"
+    )
+    # 失效引用：expired Evidence、draft（未发布）Version、不存在的 ID。
+    expired_input = await _add_evidence(
+        db_session, session_id, parent.id, availability="expired"
+    )
+    draft_version = await _add_artifact_version(
+        db_session, user_id, session_id, parent.id, artifact_status="draft"
+    )
     failed = await _add_run(
         db_session,
         user_id,
@@ -1320,6 +1430,12 @@ async def test_retry_creates_new_run_without_reopening_failed_run(
         status="failed",
         error_code="ALL_ARTIFACTS_FAILED",
         completed_at=utc_now(),
+        parent_run_id=parent.id,
+        prompt_snapshot_json={
+            "parent_run_id": parent.id,
+            "artifact_version_ids": [input_version.id, draft_version.id, "ghost-version"],
+            "evidence_ids": [input_evidence, expired_input, "ghost-evidence"],
+        },
     )
     available = await _add_evidence(db_session, session_id, failed.id, availability="available")
     await _add_evidence(db_session, session_id, failed.id, availability="expired")
@@ -1336,11 +1452,16 @@ async def test_retry_creates_new_run_without_reopening_failed_run(
     assert retried.profile_name == failed.profile_name
     assert executor.submitted == [retried.id]
 
-    # 冻结的引用快照：只含仍 available 的 Evidence 与已发布 Version。
+    # 冻结的引用快照：仍有效的输入引用 + 产出引用，去重保序；失效引用被丢弃。
     snapshot = retried.prompt_snapshot_json
     assert snapshot["retry_of"] == failed.id
-    assert snapshot["evidence_ids"] == [available]
-    assert snapshot["artifact_version_ids"] == [version.id]
+    assert snapshot["parent_run_id"] == parent.id
+    assert snapshot["evidence_ids"] == [input_evidence, available]
+    assert "expired_input" not in snapshot["evidence_ids"]
+    assert "ghost-evidence" not in snapshot["evidence_ids"]
+    assert snapshot["artifact_version_ids"] == [input_version.id, version.id]
+    assert draft_version.id not in snapshot["artifact_version_ids"]
+    assert "ghost-version" not in snapshot["artifact_version_ids"]
 
     # 原 Run 绝不修改或重开。
     original = await db_session.get(AgentRun, failed.id)

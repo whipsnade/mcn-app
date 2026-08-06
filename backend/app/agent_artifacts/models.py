@@ -7,6 +7,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     String,
     UniqueConstraint,
@@ -220,6 +221,8 @@ class ArtifactPublishAttempt(Base):
 
     __tablename__ = "artifact_publish_attempts"
     __table_args__ = (
+        # 终态聚合按 run_id 扫描（engine._publish_outcome_artifact_ids）。
+        Index("ix_artifact_publish_attempts_run_id", "run_id"),
         UniqueConstraint(
             "idempotency_key", name="uq_artifact_publish_attempts_idempotency"
         ),
@@ -235,11 +238,13 @@ class ArtifactPublishAttempt(Base):
     run_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("agent_runs.id"), nullable=False
     )
-    artifact_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("agent_artifacts.id"), nullable=False
+    # 引用失败（draft 不存在等）无法确定 artifact_id/draft_revision_id，
+    # 允许 NULL；正常发布与拒绝记录都落此表参与终态聚合。
+    artifact_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("agent_artifacts.id"), nullable=True
     )
-    draft_revision_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("artifact_draft_revisions.id"), nullable=False
+    draft_revision_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("artifact_draft_revisions.id"), nullable=True
     )
     status: Mapped[str] = mapped_column(String(24), nullable=False, default="validating")
     idempotency_key: Mapped[str] = mapped_column(String(191), nullable=False)

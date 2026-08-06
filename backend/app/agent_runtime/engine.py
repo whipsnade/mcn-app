@@ -940,12 +940,19 @@ class AgentEngine:
             )
         )
 
-    async def _publish_outcome_artifact_ids(self, run: AgentRun) -> tuple[set[str], set[str]]:
-        """终态聚合：``(已发布 artifact ids, 最终失败的 artifact ids)``。
+    async def _publish_outcome_artifact_ids(
+        self, run: AgentRun
+    ) -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
+        """终态聚合：``(已发布键, 最终失败的键)``，键带域。
 
-        最终失败 = 存在 validation_failed/failed Attempt 且无 published Attempt
-        （同一 Artifact 先 validation_failed 后修订发布成功不计 warning）；
-        幻觉/他人 draft_id 的 failed 结果不落 Attempt，不参与聚合。
+        最终失败 = 存在 validation_failed/failed Attempt 且无同域 published
+        Attempt（同一 Artifact 先 validation_failed 后修订发布成功不计 warning）；
+        引用失败（draft 不存在等拒绝记录，``artifact_id`` 为 NULL）同样参与
+        聚合——Run 不得在存在失败发布项时被错误标记为 completed（Gate A
+        审查修复）。**键显式区分域**：真实 Artifact 用 ``("artifact", id)``、
+        拒绝记录用 ``("rejected_draft", draft_id)``——模型把已发布的
+        artifact_id 误当 draft_id 提交时（现实输入错误），拒绝项不会与
+        published 项同键而错误消除失败项（Gate A 三审）。
         """
         attempts = (
             await self._db.scalars(
@@ -954,13 +961,23 @@ class AgentEngine:
                 )
             )
         ).all()
+
+        def _artifact_key(attempt: ArtifactPublishAttempt) -> tuple[str, str]:
+            if attempt.artifact_id is not None:
+                return ("artifact", attempt.artifact_id)
+            rejected = (attempt.validation_json or {}).get("rejected_draft_id")
+            key = rejected if isinstance(rejected, str) and rejected else attempt.id
+            return ("rejected_draft", key)
+
         failed = {
-            attempt.artifact_id
+            _artifact_key(attempt)
             for attempt in attempts
             if attempt.status in ("validation_failed", "failed")
         }
         published = {
-            attempt.artifact_id for attempt in attempts if attempt.status == "published"
+            _artifact_key(attempt)
+            for attempt in attempts
+            if attempt.status == "published"
         }
         return published, failed - published
 
