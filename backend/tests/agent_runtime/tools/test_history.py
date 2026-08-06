@@ -1525,3 +1525,30 @@ async def test_search_evidence_invalid_cursor_structured_failure(
     )
     assert foreign.status == "failed"
     assert foreign.error_type in (NOT_FOUND, FORBIDDEN)
+
+
+async def test_search_evidence_tampered_cursor_rejected(
+    db_session, user_factory
+) -> None:
+    """合法 cursor 追加 !! 后必须 invalid_arguments（严格 Base64 + 重新编码校验）。"""
+    user = await user_factory()
+    session, run, _step, call = await _make_chain(db_session, user.id)
+    await _seed_many_evidence(db_session, session, run, call, 600)
+    context = ToolContext(user_id=user.id, session_id=session.id, run_id=run.id, profile_name="session_analyst_v1")
+    tool = SearchEvidenceTool(db_session)
+
+    first = _summary(await tool.execute(context, type(tool).input_model(query="")))
+    assert first["next_cursor"] is not None
+    valid_cursor = first["next_cursor"]
+
+    # 追加 '!!'：lenient base64 会忽略，严格校验必须拒绝。
+    tampered = valid_cursor + "!!"
+    result = await tool.execute(context, {"query": "", "cursor": tampered})
+    assert result.status == "failed"
+    assert result.error_type == INVALID_ARGUMENTS
+
+    # 追加合法 base64 字符（仍改变原始载荷）也必须拒绝（重新编码不一致）。
+    tampered2 = valid_cursor + "AA"
+    result2 = await tool.execute(context, {"query": "", "cursor": tampered2})
+    assert result2.status == "failed"
+    assert result2.error_type == INVALID_ARGUMENTS
