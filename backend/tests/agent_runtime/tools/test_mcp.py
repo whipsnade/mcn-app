@@ -1376,3 +1376,268 @@ async def test_m1_succeeded_empty_no_evidence_and_consistent_replay() -> None:
         assert (wallet.balance, wallet.reserved) == (990, 0)
     finally:
         await _teardown_chain(chain)
+
+
+# ---------------------------------------------------------------------------
+# P0: dispatch retry 积分幂等状态机（Gate B：账务幂等键按 dispatch attempt 区分）
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_p0_dnr_retry_success_settles_once_and_creates_evidence() -> None:
+    """DNR → retry success：两次真实派发，最终钱包 available=初始-10、reserved=0，生成 Evidence。"""
+    chain = await _setup_chain(steps=3)
+    try:
+        transport = FakeMcpTransport([
+            McpConnectionTimeout("connect timeout"),
+            _ok_result(),
+        ])
+        bridge = _bridge(transport)
+
+        # 第一次派发：connection 错误 → definitely_not_sent
+        r1 = await bridge.execute(_context(chain, chain.step_ids[0]), {"keyword": "美妆"})
+        assert r1.error_type == DEFINITELY_NOT_SENT
+        w1 = await _wallet(chain.user_id)
+        assert (w1.balance, w1.reserved) == (1000, 0)
+
+        # 第二次派发（重试）：成功 → 结算
+        r2 = await bridge.execute(_context(chain, chain.step_ids[1]), {"keyword": "美妆"})
+        assert r2.status == "success"
+        assert len(transport.calls) == 2
+
+        # 钱包：available=990（扣 10）、reserved=0
+        w2 = await _wallet(chain.user_id)
+        assert (w2.balance, w2.reserved) == (990, 0)
+
+        # 调用行：settled，points_reserved=0，points_settled=10
+        row = await _only_row(chain.run_id)
+        assert row.status == "settled"
+        assert row.points_reserved == 0
+        assert row.points_settled == 10
+
+        # 生成 Evidence
+        async with SessionFactory() as db:
+            evidence = await EvidenceWriter(db).get_by_tool_call_id(row.id)
+            assert evidence is not None
+    finally:
+        await _teardown_chain(chain)
+
+
+@pytest.mark.asyncio
+async def test_p0_dnr_retry_unknown_reserves_and_reconciles() -> None:
+    """DNR → retry unknown：第二次真实预留 10 分，调用行与钱包一致，reconcile 可 settle。"""
+    chain = await _setup_chain(steps=3)
+    try:
+        transport = FakeMcpTransport([
+            McpConnectionTimeout("connect timeout"),
+            McpGatewayTimeout("gw timeout"),
+        ])
+        bridge = _bridge(transport)
+
+        r1 = await bridge.execute(_context(chain, chain.step_ids[0]), {"keyword": "美妆"})
+        assert r1.error_type == DEFINITELY_NOT_SENT
+        w1 = await _wallet(chain.user_id)
+        assert (w1.balance, w1.reserved) == (1000, 0)
+
+        r2 = await bridge.execute(_context(chain, chain.step_ids[1]), {"keyword": "美妆"})
+        assert r2.error_type == RESULT_UNKNOWN
+        w2 = await _wallet(chain.user_id)
+        assert (w2.balance, w2.reserved) == (990, 10)
+
+        row = await _only_row(chain.run_id)
+        assert row.status == "unknown"
+        assert row.points_reserved == 10
+        assert row.points_settled == 0
+
+        # reconcile 确认成功 → settle
+        snapshot = await bridge._coordinator.load_call(row.logical_call_id)
+        assert snapshot is not None
+        await bridge._coordinator.confirm_success(
+            snapshot, validated_payload=OK_PAYLOAD, upstream_request_id="req-late", note="ok"
+        )
+        w3 = await _wallet(chain.user_id)
+        assert (w3.balance, w3.reserved) == (990, 0)
+    finally:
+        await _teardown_chain(chain)
+
+
+@pytest.mark.asyncio
+async def test_p0_dnr_retry_succeeded_empty_settles_no_evidence() -> None:
+    """DNR → retry succeeded_empty：第二次正常预留并结算，不生成 Evidence。"""
+    chain = await _setup_chain(steps=3)
+    try:
+        transport = FakeMcpTransport([
+            McpConnectionTimeout("connect timeout"),
+            RemoteToolResult(structured_content=None, is_error=False, upstream_request_id="req-empty"),
+        ])
+        bridge = _bridge(transport)
+
+        r1 = await bridge.execute(_context(chain, chain.step_ids[0]), {"keyword": "美妆"})
+        assert r1.error_type == DEFINITELY_NOT_SENT
+
+        r2 = await bridge.execute(_context(chain, chain.step_ids[1]), {"keyword": "美妆"})
+        assert r2.status == "failed"
+        assert r2.error_type == "succeeded_empty"
+        w2 = await _wallet(chain.user_id)
+        assert (w2.balance, w2.reserved) == (990, 0)
+
+        row = await _only_row(chain.run_id)
+        assert row.status == "failed"
+        assert row.error_type == "succeeded_empty"
+        assert row.points_reserved == 0
+        assert row.points_settled == 10  # 结算
+
+        async with SessionFactory() as db:
+            evidence = await EvidenceWriter(db).get_by_tool_call_id(row.id)
+            assert evidence is None
+
+        # 回放一致：第三次跨 Step → failed + succeeded_empty
+        r3 = await bridge.execute(_context(chain, chain.step_ids[2]), {"keyword": "美妆"})
+        assert r3.status == "failed"
+        assert r3.error_type == "succeeded_empty"
+    finally:
+        await _teardown_chain(chain)
+
+
+@pytest.mark.asyncio
+async def test_p0_dnr_retry_insufficient_balance_no_dispatch() -> None:
+    """DNR → retry 前余额不足：prepare 检查余额失败，不发送第二次 MCP 请求。"""
+    chain = await _setup_chain(balance=20, steps=3)
+    try:
+        transport = FakeMcpTransport([McpConnectionTimeout("connect timeout")])
+        bridge = _bridge(transport)
+
+        r1 = await bridge.execute(_context(chain, chain.step_ids[0]), {"keyword": "美妆"})
+        assert r1.error_type == DEFINITELY_NOT_SENT
+        w1 = await _wallet(chain.user_id)
+        assert (w1.balance, w1.reserved) == (20, 0)
+
+        # 用真实 WalletService 消耗余额（新增一个独立预留），使重试时余额不足
+        async with SessionFactory.begin() as db:
+            from app.billing.service import WalletService
+            await WalletService(db).reserve(
+                chain.user_id, 15, "drain-for-retry-test", "drain-1",
+                reference_type="agent_tool_call",
+            )
+        w_drained = await _wallet(chain.user_id)
+        assert (w_drained.balance, w_drained.reserved) == (5, 15)
+
+        # 第二次 retry：balance=5 < 10 → 不派发
+        r2 = await bridge.execute(_context(chain, chain.step_ids[1]), {"keyword": "美妆"})
+        assert r2.status == "failed"
+        assert r2.error_type == DEFINITELY_NOT_SENT
+        assert len(transport.calls) == 1  # 未派发第二次
+        w2 = await _wallet(chain.user_id)
+        assert (w2.balance, w2.reserved) == (5, 15)
+    finally:
+        await _teardown_chain(chain)
+
+
+@pytest.mark.asyncio
+async def test_p0_same_dispatch_settle_is_idempotent() -> None:
+    """同一 dispatch attempt 重复 settle 保持幂等：不重复扣费、调用行一致。"""
+    chain = await _setup_chain(steps=2)
+    try:
+        transport = FakeMcpTransport([_ok_result()])
+        bridge = _bridge(transport)
+
+        r = await bridge.execute(_context(chain, chain.step_ids[0]), {"keyword": "美妆"})
+        assert r.status == "success"
+        row = await _only_row(chain.run_id)
+        assert row.status == "settled"
+
+        # 幂等重入 finalize_success：不重复扣费
+        evidence_id, _ = await bridge._coordinator.finalize_success(
+            logical_call_id=row.logical_call_id,
+            user_id=chain.user_id,
+            session_id=chain.session_id,
+            validated_payload=OK_PAYLOAD,
+            upstream_request_id="req-dup",
+        )
+        assert evidence_id is not None
+        w = await _wallet(chain.user_id)
+        assert (w.balance, w.reserved) == (990, 0)
+    finally:
+        await _teardown_chain(chain)
+
+
+@pytest.mark.asyncio
+async def test_p0_same_dispatch_release_is_idempotent() -> None:
+    """同一 dispatch attempt 重复 release 保持幂等：不重复释放、调用行一致。"""
+    chain = await _setup_chain(steps=2)
+    try:
+        transport = FakeMcpTransport([McpConnectionTimeout("connect timeout")])
+        bridge = _bridge(transport)
+
+        r = await bridge.execute(_context(chain, chain.step_ids[0]), {"keyword": "美妆"})
+        assert r.error_type == DEFINITELY_NOT_SENT
+        row = await _only_row(chain.run_id)
+
+        # 幂等重入 finalize_release：不重复释放（钱包不变）
+        await bridge._coordinator.finalize_release(
+            logical_call_id=row.logical_call_id,
+            user_id=chain.user_id,
+            error_type=DEFINITELY_NOT_SENT,
+            message="dup",
+        )
+        w = await _wallet(chain.user_id)
+        assert (w.balance, w.reserved) == (1000, 0)
+    finally:
+        await _teardown_chain(chain)
+
+
+@pytest.mark.asyncio
+async def test_p1_retry_updates_step_ownership() -> None:
+    """第二次派发后调用行 step_id 更新为当前 Step（恢复/Evidence 归属正确）。"""
+    chain = await _setup_chain(steps=3)
+    try:
+        transport = FakeMcpTransport([
+            McpConnectionTimeout("connect timeout"),
+            _ok_result(),
+        ])
+        bridge = _bridge(transport)
+
+        r1 = await bridge.execute(_context(chain, chain.step_ids[0]), {"keyword": "美妆"})
+        assert r1.error_type == DEFINITELY_NOT_SENT
+
+        r2 = await bridge.execute(_context(chain, chain.step_ids[1]), {"keyword": "美妆"})
+        assert r2.status == "success"
+
+        row = await _only_row(chain.run_id)
+        assert row.step_id == chain.step_ids[1]  # 归属当前 Step
+        assert row.dispatch_count == 2
+    finally:
+        await _teardown_chain(chain)
+
+
+@pytest.mark.asyncio
+async def test_p0_concurrent_retry_only_one_dispatch_wins() -> None:
+    """并发恢复：两个并发同指纹重试，FOR UPDATE 锁保证只有一个获得第二次派发权。"""
+    chain = await _setup_chain(steps=3)
+    try:
+        transport = FakeMcpTransport([
+            McpConnectionTimeout("connect timeout"),
+            _ok_result(),
+        ])
+        bridge = _bridge(transport)
+
+        # 第一次派发失败
+        r1 = await bridge.execute(_context(chain, chain.step_ids[0]), {"keyword": "美妆"})
+        assert r1.error_type == DEFINITELY_NOT_SENT
+
+        # 两个并发重试（step 1 和 step 2 同时）
+        results = await asyncio.gather(
+            bridge.execute(_context(chain, chain.step_ids[1]), {"keyword": "美妆"}),
+            bridge.execute(_context(chain, chain.step_ids[2]), {"keyword": "美妆"}),
+        )
+
+        # 只有一个派发（+1 外发），另一个被防重回放
+        # 顺序不定，但 transport.calls 总数 = 2（首次 + 一次重试）
+        assert len(transport.calls) == 2
+        # 至少一个是 success，另一个可能是 success 回放或 failed
+        assert any(r.status == "success" for r in results)
+        # 钱包只结算一次（不可重复扣费）
+        w = await _wallet(chain.user_id)
+        assert (w.balance, w.reserved) == (990, 0)
+    finally:
+        await _teardown_chain(chain)

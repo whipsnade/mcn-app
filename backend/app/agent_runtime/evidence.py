@@ -132,6 +132,48 @@ def model_view(item: EvidenceItem) -> dict[str, Any]:
     }
 
 
+# 模型可见 preview 的严格上限（Gate B P1）：归一化最多 5000 行不能全进上下文。
+_MAX_PREVIEW_ROWS = 200
+_MAX_PREVIEW_STR_LEN = 1000
+
+
+def build_model_evidence_view(evidence: EvidenceItem) -> dict[str, Any]:
+    """统一模型可见视图（Gate B P1）：所有消费方（MCP 即时/Transcript 恢复/
+    search_evidence/read_tool_result/upload 钻取）共用同一持久化视图。
+
+    从已持久化的 ``normalized_preview_json`` 构建**有界**视图，绝不重新归一化；
+    严格限制行数与字符数，且保证 JSON 合法（不截断字符串中途）。
+    """
+    stored = evidence.normalized_preview_json or {}
+    preview = _bound_preview(stored.get("preview", stored.get("normalization_preview", {})))
+    return {
+        "evidence_id": evidence.id,
+        "preview": preview,
+        "normalization_status": stored.get("normalization_status"),
+        "field_mapping": stored.get("field_mapping"),
+        "unmapped_fields": stored.get("unmapped_fields"),
+        "row_count": stored.get("row_count", 0),
+        "truncated": stored.get("truncated", False),
+        "source_name": evidence.source_name,
+        "source_type": evidence.source_type,
+    }
+
+
+def _bound_preview(value: Any, *, row_limit: int = _MAX_PREVIEW_ROWS) -> Any:
+    """递归有界截断：限制数组行数与字符串长度，保持 JSON 结构完整。"""
+    if isinstance(value, list):
+        bounded = [_bound_preview(item, row_limit=row_limit) for item in value[:row_limit]]
+        return bounded
+    if isinstance(value, dict):
+        return {
+            key: _bound_preview(child, row_limit=row_limit)
+            for key, child in list(value.items())[:_MAX_PREVIEW_STR_LEN]
+        }
+    if isinstance(value, str) and len(value) > _MAX_PREVIEW_STR_LEN:
+        return value[:_MAX_PREVIEW_STR_LEN]
+    return value
+
+
 class EvidenceWriter:
     """不可变 Evidence 写入器：仅插入（append-only），不提供更新路径。"""
 
@@ -204,6 +246,7 @@ class EvidenceWriter:
 
 __all__ = [
     "EvidenceWriter",
+    "build_model_evidence_view",
     "build_preview",
     "model_view",
 ]

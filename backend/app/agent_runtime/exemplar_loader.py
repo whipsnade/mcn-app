@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -57,11 +57,20 @@ class _CuratedStrategyStage(BaseModel):
     fallback: str = Field(min_length=1)
 
 
+class _CompletionContract(BaseModel):
+    """completion_contract 的嵌套 Schema（Gate B P2：非开放 dict）。"""
+    model_config = ConfigDict(extra="forbid")
+    no_current_period_evidence: str = Field(min_length=1)
+    core_evidence_with_missing_sections: str = Field(min_length=1)
+    all_required_checks_pass: str = Field(min_length=1)
+    final_outputs: list[str] = Field(min_length=1)
+
+
 class _CuratedExemplar(BaseModel):
-    """受控 exemplar 的强类型契约（Gate B M5：嵌套 Schema 校验）。"""
+    """受控 exemplar 的强类型契约（Gate B M5/P2：嵌套 Schema + 版本锁定）。"""
     model_config = ConfigDict(extra="forbid")
     exemplar_id: str = Field(min_length=1)
-    version: int
+    version: Literal[1]
     purpose: str = Field(min_length=1)
     domain: str = Field(min_length=1)
     language: str = Field(min_length=1)
@@ -71,7 +80,7 @@ class _CuratedExemplar(BaseModel):
     successful_strategy: list[_CuratedStrategyStage] = Field(min_length=1)
     decision_rules: list[str] = Field(min_length=1)
     coverage_targets: list[str] = Field(min_length=1)
-    completion_contract: dict[str, Any] = Field(default_factory=dict)
+    completion_contract: _CompletionContract
     forbidden_copy_values: list[str] = Field(default_factory=list)
 
 

@@ -144,11 +144,22 @@ class AgentMcpAccounting:
         self._db = db_session
         self._wallets = WalletService(db_session)
 
+    @staticmethod
+    def _key(call: AgentToolCall, op: str) -> str:
+        """账务幂等键：按 dispatch attempt 区分（Gate B P0）。
+
+        第一次派发（dispatch_count=1）保留旧键兼容既有账本；
+        第二次及以后按 dispatch:{dispatch_count} 区分，保证每次真实预留/结算。
+        """
+        if call.dispatch_count is None or call.dispatch_count <= 1:
+            return f"agent-mcp:{call.logical_call_id}:{op}"
+        return f"agent-mcp:{call.logical_call_id}:dispatch:{call.dispatch_count}:{op}"
+
     async def reserve(self, user_id: str, call: AgentToolCall) -> None:
         await self._wallets.reserve(
             user_id,
             self.MCP_COST,
-            f"agent-mcp:{call.logical_call_id}:reserve",
+            self._key(call, "reserve"),
             call.id,
             reference_type="agent_tool_call",
         )
@@ -165,7 +176,7 @@ class AgentMcpAccounting:
         await self._wallets.settle(
             user_id,
             self.MCP_COST,
-            f"agent-mcp:{call.logical_call_id}:settle",
+            self._key(call, "settle"),
             call.id,
             reference_type="agent_tool_call",
         )
@@ -186,7 +197,7 @@ class AgentMcpAccounting:
         await self._wallets.release(
             user_id,
             self.MCP_COST,
-            f"agent-mcp:{call.logical_call_id}:release",
+            self._key(call, "release"),
             call.id,
             reference_type="agent_tool_call",
         )
@@ -264,6 +275,9 @@ class DurableToolCallCoordinator:
                         and existing.error_type == DEFINITELY_NOT_SENT
                         and existing.dispatch_count < 2
                     ):
+                        # 归属更新为当前 Step：第二次派发外的恢复/Evidence/lineage
+                        # 必须指向本次实际派发的 Step（Gate B P1）。
+                        existing.step_id = context.step_id
                         existing.status = "running"
                         existing.dispatch_count += 1
                         existing.error_type = None

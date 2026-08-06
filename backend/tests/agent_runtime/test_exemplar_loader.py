@@ -11,7 +11,7 @@ import json
 
 import pytest
 
-from app.agent_runtime.exemplar_loader import load_curated_exemplars
+from app.agent_runtime.exemplar_loader import _CuratedExemplar, load_curated_exemplars
 
 
 def test_curated_brand_exemplar_is_parameterized_and_compact() -> None:
@@ -59,3 +59,65 @@ def test_curated_exemplar_loader_failure_degrades_to_empty(monkeypatch: pytest.M
         "app.agent_runtime.exemplar_loader._read_curated_exemplar", _boom
     )
     assert load_curated_exemplars(purpose="agent_loop", limit=1) == []
+
+
+# ---------------------------------------------------------------------------
+# P2: Exemplar 契约版本锁定（Literal[1] + completion_contract 嵌套 Schema）
+# ---------------------------------------------------------------------------
+
+
+def test_p2_rejects_wrong_version() -> None:
+    with pytest.raises(Exception):
+        _CuratedExemplar.model_validate(
+            {"exemplar_id": "x", "version": 2, "purpose": "agent_loop",
+             "domain": "brand", "language": "zh-CN", "applicable_when": ["x"],
+             "parameters": {}, "objective": "x",
+             "successful_strategy": [], "decision_rules": ["x"],
+             "coverage_targets": ["x"],
+             "completion_contract": {"no_current_period_evidence": "a",
+                                     "core_evidence_with_missing_sections": "b",
+                                     "all_required_checks_pass": "c",
+                                     "final_outputs": ["d"]}}
+        )
+
+
+def test_p2_rejects_string_version() -> None:
+    with pytest.raises(Exception):
+        _CuratedExemplar.model_validate(
+            {"exemplar_id": "x", "version": "1", "purpose": "agent_loop",
+             "domain": "brand", "language": "zh-CN", "applicable_when": ["x"],
+             "parameters": {}, "objective": "x",
+             "successful_strategy": [], "decision_rules": ["x"],
+             "coverage_targets": ["x"],
+             "completion_contract": {"no_current_period_evidence": "a",
+                                     "core_evidence_with_missing_sections": "b",
+                                     "all_required_checks_pass": "c",
+                                     "final_outputs": ["d"]}}
+        )
+
+
+def test_p2_rejects_unknown_nested_field() -> None:
+    with pytest.raises(Exception):
+        _CuratedExemplar.model_validate(
+            {"exemplar_id": "x", "version": 1, "purpose": "agent_loop",
+             "domain": "brand", "language": "zh-CN", "applicable_when": ["x"],
+             "parameters": {}, "objective": "x",
+             "successful_strategy": [{"stage": "s", "goal": "g", "preferred_capability": "p",
+                                      "success_signal": "ok", "fallback": "f", "extra_col": 1}],
+             "decision_rules": ["x"], "coverage_targets": ["x"],
+             "completion_contract": {"no_current_period_evidence": "a",
+                                     "core_evidence_with_missing_sections": "b",
+                                     "all_required_checks_pass": "c",
+                                     "final_outputs": ["d"]}}
+        )
+
+
+def test_p2_rejects_wrong_contract_type() -> None:
+    with pytest.raises(Exception):
+        _CuratedExemplar.model_validate(
+            {"exemplar_id": "x", "version": 1, "purpose": "agent_loop",
+             "domain": "brand", "language": "zh-CN", "applicable_when": ["x"],
+             "parameters": {}, "objective": "x",
+             "successful_strategy": [], "decision_rules": ["x"],
+             "coverage_targets": ["x"], "completion_contract": {"bad": "shape"}}
+        )

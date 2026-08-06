@@ -36,6 +36,7 @@ from app.agent_artifacts.models import (
     ArtifactDraft,
     ArtifactDraftRevision,
 )
+from app.agent_runtime.evidence import build_model_evidence_view
 from app.agent_runtime.models import (
     AgentMessage,
     AgentSession,
@@ -442,6 +443,7 @@ class ReadToolResultTool:
         next_offset = offset + limit
         next_cursor = str(next_offset) if next_offset < total else None
         truncated = next_cursor is not None
+        view = build_model_evidence_view(evidence)
         summary = json.dumps(
             {
                 "evidence_id": evidence.id,
@@ -449,6 +451,10 @@ class ReadToolResultTool:
                 "total": total,
                 "next_cursor": next_cursor,
                 "truncated": truncated,
+                # 统一 normalization 诊断（Gate B P1：恢复/即时返回/钻取一致）。
+                "normalization_status": view["normalization_status"],
+                "field_mapping": view["field_mapping"],
+                "unmapped_fields": view["unmapped_fields"],
             },
             ensure_ascii=False,
         )

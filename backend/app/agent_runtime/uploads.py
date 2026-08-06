@@ -41,6 +41,12 @@ _MIME_BY_EXTENSION = {
 # upload Evidence preview 行上限（raw payload 不受影响，仍完整落库）。
 _PREVIEW_ROW_CAP = 5000
 
+# XLSX ZIP 安全检查阈值（Gate B P1：集中常量，不散落魔法数字）。
+_MAX_ZIP_ENTRIES = 2000
+_MAX_TOTAL_UNCOMPRESSED = 100 * 1024 * 1024  # 100 MiB
+_MAX_SINGLE_ENTRY = 50 * 1024 * 1024  # 50 MiB
+_MAX_COMPRESSION_RATIO = 100
+
 
 class UploadRejectedError(Exception):
     """上传被拒绝（大小/格式/行数）；携带 HTTP 状态码与结构化错误码。"""
@@ -73,18 +79,61 @@ def _parse_xlsx(content: bytes, *, max_rows: int) -> tuple[list[str], list[dict[
 
     from openpyxl import load_workbook
 
-    # 拒绝含宏部件或外部链接的 xlsx（即使扩展名不是 .xlsm）
+    # 拒绝含宏部件或外部链接的 xlsx（即使扩展名不是 .xlsm），并做 ZIP bomb 防护。
     with zipfile.ZipFile(io.BytesIO(content)) as zf:
-        names = zf.namelist()
-        if any("vbaProject" in name for name in names):
+        infos = zf.infolist()
+        if len(infos) > _MAX_ZIP_ENTRIES:
             raise UploadRejectedError(
-                status_code=415, error_code="macro_detected", message="file contains macro parts"
+                status_code=400, error_code="zip_too_many_entries",
+                message=f"zip exceeds {_MAX_ZIP_ENTRIES} entries",
             )
-        if any(name.startswith("xl/externalLinks/") for name in names):
-            raise UploadRejectedError(
-                status_code=415, error_code="external_links_detected",
-                message="file contains external links",
-            )
+        total_uncompressed = 0
+        for info in infos:
+            name = info.filename
+            if "vbaProject" in name:
+                raise UploadRejectedError(
+                    status_code=415, error_code="macro_detected", message="file contains macro parts"
+                )
+            if name.startswith("xl/externalLinks/") or name.startswith("xl/worksheets/_rels/"):
+                raise UploadRejectedError(
+                    status_code=415, error_code="external_links_detected",
+                    message="file contains external links",
+                )
+            if info.file_size > _MAX_SINGLE_ENTRY:
+                raise UploadRejectedError(
+                    status_code=400, error_code="zip_entry_too_large",
+                    message=f"single zip entry exceeds {_MAX_SINGLE_ENTRY} bytes",
+                )
+            if info.compress_size == 0 and info.file_size > 0:
+                raise UploadRejectedError(
+                    status_code=400, error_code="zip_suspicious_ratio",
+                    message="zip entry has zero compressed size with non-empty content",
+                )
+            if info.file_size > 0 and info.compress_size > 0:
+                ratio = info.file_size / info.compress_size
+                if ratio > _MAX_COMPRESSION_RATIO:
+                    raise UploadRejectedError(
+                        status_code=400, error_code="zip_compression_ratio",
+                        message=f"zip compression ratio exceeds {_MAX_COMPRESSION_RATIO}",
+                    )
+            total_uncompressed += info.file_size
+            if total_uncompressed > _MAX_TOTAL_UNCOMPRESSED:
+                raise UploadRejectedError(
+                    status_code=400, error_code="zip_total_too_large",
+                    message=f"total uncompressed size exceeds {_MAX_TOTAL_UNCOMPRESSED} bytes",
+                )
+        # .rels 中 TargetMode="External" 拒绝（外部引用）
+        for info in infos:
+            if info.filename.endswith(".rels"):
+                try:
+                    rels = zf.read(info.filename).decode("utf-8", errors="ignore")
+                    if "TargetMode=\"External\"" in rels:
+                        raise UploadRejectedError(
+                            status_code=415, error_code="external_links_detected",
+                            message="file contains external relationships",
+                        )
+                except KeyError:
+                    continue
     workbook = load_workbook(
         io.BytesIO(content),
         read_only=True,
@@ -189,10 +238,10 @@ class UploadService:
             columns, rows = await asyncio.to_thread(
                 self._parse, extension, content, self._max_rows
             )
-        except UploadRejectedError:
+        except UploadRejectedError as exc:
             await asyncio.to_thread(self._delete_file, storage_key)
             upload.status = "failed"
-            upload.error_code = "macro_detected"
+            upload.error_code = exc.error_code
             upload.completed_at = _now()
             await self._db.flush()
             raise

@@ -1008,8 +1008,17 @@ async def retry_run(
     }
     if original_snapshot.get("parent_run_id") is not None:
         retried_snapshot["parent_run_id"] = original_snapshot["parent_run_id"]
-    if original_snapshot.get("upload_refs"):
-        retried_snapshot["upload_refs"] = original_snapshot["upload_refs"]
+    # 重新验证并冻结 upload_refs（Gate B P1）：不复制旧快照，重新调用同一
+    # 冻结函数，剔除失效/越权/不可用引用；无有效引用则不带 upload_refs。
+    original_upload_refs = original_snapshot.get("upload_refs") or []
+    if original_upload_refs:
+        upload_ids = tuple(ref["upload_id"] for ref in original_upload_refs)
+        try:
+            fresh_refs = await _validate_upload_ids(db, user.id, run.session_id, upload_ids)
+        except HTTPException:
+            fresh_refs = []
+        if fresh_refs:
+            retried_snapshot["upload_refs"] = fresh_refs
     retried = AgentRun(
         id=str(uuid4()),
         session_id=run.session_id,

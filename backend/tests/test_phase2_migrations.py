@@ -1013,3 +1013,65 @@ async def test_0034_dispatch_count_reversible() -> None:
             await conn.execute(text(f"DELETE FROM agent_runs WHERE id = '{run.id}'"))
             await conn.execute(text(f"DELETE FROM agent_sessions WHERE id = '{session_id}'"))
             await conn.execute(text(f"DELETE FROM users WHERE id = '{user_id}'"))
+
+
+async def test_0034_dangerous_downgrade_refused() -> None:
+    """存在 dispatch_count != 1 的调用行时，0034 downgrade 被拒绝（防状态丢失）。"""
+    from app.agent_runtime.models import AgentRun, AgentRunAttempt, AgentSession, AgentStep, AgentToolCall
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    user_id = str(uuid4())
+    session_id = str(uuid4())
+    now = datetime.now(UTC).replace(tzinfo=None)
+    run_id = str(uuid4())
+    async with AsyncSession(engine, expire_on_commit=False) as session:
+        from app.identity.models import User
+        user = User(id=user_id, nickname="danger-downgrade", role="user", status="active",
+                    industries=["美食"], created_at=now, updated_at=now)
+        ag_session = AgentSession(id=session_id, user_id=user_id, title="danger",
+                                   status="active", created_at=now, updated_at=now)
+        session.add(user)
+        await session.flush()
+        session.add(ag_session)
+        await session.flush()
+        run = AgentRun(id=run_id, session_id=session_id, user_id=user_id,
+                       run_kind="user", visibility="user", profile_name="session_analyst_v1",
+                       profile_version="v1", model="test", status="running", decision_count=0,
+                       review_count=0, revision_count=0, started_at=now)
+        session.add(run)
+        await session.flush()
+        attempt = AgentRunAttempt(id=str(uuid4()), run_id=run_id, attempt=1, started_at=now)
+        session.add(attempt)
+        await session.flush()
+        step = AgentStep(id=str(uuid4()), run_id=run_id, attempt_id=attempt.id, sequence=1,
+                         step_type="tool_call", status="running", visibility="user", created_at=now)
+        session.add(step)
+        await session.flush()
+        call = AgentToolCall(id=str(uuid4()), run_id=run_id, step_id=step.id,
+                             logical_call_id="danger-" + str(uuid4()),
+                             service="insight-cube-mcp", internal_tool_name="query_analysis_data",
+                             arguments_json={}, arguments_hash="c"*64, status="failed",
+                             points_reserved=0, points_settled=0, dispatch_count=2,
+                             error_type="definitely_not_sent")
+        session.add(call)
+        await session.commit()
+
+    try:
+        with pytest.raises(subprocess.CalledProcessError):
+            _run_alembic("downgrade", "0033_safe_error_msg_text")
+        # 调用行未丢失
+        async with engine.connect() as conn:
+            remaining = (await conn.execute(
+                text("SELECT COUNT(*) FROM agent_tool_calls WHERE run_id = :rid"),
+                {"rid": run_id},
+            )).scalar()
+            assert remaining == 1
+    finally:
+        _run_alembic("upgrade", "head")
+        async with engine.begin() as conn:
+            await conn.execute(text(f"DELETE FROM agent_tool_calls WHERE run_id = '{run_id}'"))
+            await conn.execute(text(f"DELETE FROM agent_steps WHERE run_id = '{run_id}'"))
+            await conn.execute(text(f"DELETE FROM agent_run_attempts WHERE run_id = '{run_id}'"))
+            await conn.execute(text(f"DELETE FROM agent_runs WHERE id = '{run_id}'"))
+            await conn.execute(text(f"DELETE FROM agent_sessions WHERE id = '{session_id}'"))
+            await conn.execute(text(f"DELETE FROM users WHERE id = '{user_id}'"))
