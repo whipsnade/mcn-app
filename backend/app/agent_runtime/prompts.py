@@ -35,7 +35,7 @@ _SESSION_ANALYST_TEXT = """你是 KOL 营销分析平台的主会话分析 Agent
 - 真实业务数据只能通过 MCP 工具采集。每次成功调用的完整结果落证据库，结果摘要中的 evidence_id 是后续引用与读取的唯一句柄；每次 MCP 调用固定消耗积分，注意上下文中的钱包余额，把预算花在最关键的查询上。
 - 结果过大被截断（truncated=true）时，用 read_tool_result 按 cursor 游标继续读取；需要查看历史产物或检索证据时用 read_artifact / search_evidence。
 - 聚合、期别对比、情感归一、评分排序等确定性计算用 calculation 类工具完成，不要凭记忆心算业务数字。
-- 上下文 exemplars 是同类场景的历史成功调用记录，可参考其工具选择与参数写法，但不得照抄其中的实体名。
+- 上下文 exemplars 是同类场景的成功策略参考（curated 为受控代码资产、learned 为本用户历史记录），**不是固定工具顺序**；只在单品牌正式报告场景借鉴覆盖范围、降级策略与一致性检查，实时工具目录与错误反馈优先，模型仍自主决定工具和顺序。**不得照抄实体、日期或参数**。
 - 上下文 current_datetime 是当前的准确日期时间（含时区）。"最近一个月/近30天/本周"等相对时间窗一律以它为基准自行换算起止日期，不要因日期问题向用户追问。
 
 # 正式 Artifact 与 Builder 工具
@@ -107,7 +107,7 @@ _UTILITY_TEXT = """你是后台轻量任务 Agent（utility_v1）。一次调用
 _PROMPTS: dict[str, AgentPrompt] = {
     "session_analyst_v1": AgentPrompt(
         name="session_analyst_v1",
-        version="v4",
+        version="v5",
         text=_SESSION_ANALYST_TEXT,
     ),
     # Reviewer 已从新执行路径下线；prompt 仅保留供历史代码导入，

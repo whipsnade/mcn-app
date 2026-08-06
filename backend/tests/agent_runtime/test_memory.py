@@ -219,11 +219,11 @@ async def test_default_context_contains_only_bounded_sections(db_session, user_f
         "artifact_directory",
         "available_tools",
         "wallet",
-        # §6.2：1-2 个去敏成功示例（无历史成功记录时为空列表）。
+        # §6.2：1 个受控策略案例 + 至多 1 个本用户去敏成功示例。
         "exemplars",
     }
-    # 测试用户无历史成功调用记录：示例为空但键必须存在。
-    assert context["exemplars"] == []
+    # 测试用户无历史成功调用记录：只注入受控策略案例（curated_strategy）。
+    assert [item["kind"] for item in context["exemplars"]] == ["curated_strategy"]
     # 无 confirmed_scope 记忆时为空列表但键必须存在。
     assert context["confirmed_scopes"] == []
     assert context["current_user_message"] == "继续分析"
@@ -299,10 +299,11 @@ async def test_default_context_does_not_inject_evidence(db_session, user_factory
         current_user_message="继续分析",
     )
     serialized = json.dumps(context, ensure_ascii=False)
-    # 无任何 evidence / 原始报告数据。
-    assert "evidence" not in serialized
+    # 无任何 Evidence 数据 / 原始报告数据（curated exemplar 中的 "evidence"
+    # 是策略字段名，如 core_evidence_with_missing_sections，不是 Evidence 数据）。
     assert "raw_payload" not in serialized
     assert "normalized_preview" not in serialized
+    assert BIG_PAYLOAD_MARKER not in serialized
 
 
 async def test_context_includes_tool_catalog_and_wallet(db_session, user_factory) -> None:
@@ -558,8 +559,12 @@ async def test_context_injects_pruned_success_exemplars(db_session, user_factory
         current_user_message="继续分析",
     )
     exemplars = context["exemplars"]
-    assert len(exemplars) == 1
-    excerpt = exemplars[0]["excerpt"]
+    assert [item["kind"] for item in exemplars] == [
+        "curated_strategy",
+        "learned_prompt_log",
+    ]
+    learned = exemplars[1]
+    excerpt = learned["excerpt"]
     assert "kol_detail" in excerpt
     # 去敏：含 key 特征的字段与其值绝不进入上下文。
     assert "SECRET-TOKEN-123" not in excerpt
@@ -567,7 +572,7 @@ async def test_context_injects_pruned_success_exemplars(db_session, user_factory
 
 
 async def test_context_exemplars_isolated_by_user_and_status(db_session, user_factory) -> None:
-    """他人日志与失败日志不注入当前用户上下文。"""
+    """他人日志与失败日志不注入当前用户上下文（受控策略案例仍注入）。"""
     user = await user_factory()
     other = await user_factory()
     session = await _seed_session(db_session, user.id)
@@ -581,13 +586,13 @@ async def test_context_exemplars_isolated_by_user_and_status(db_session, user_fa
         profile=session_analyst,
         current_user_message="继续分析",
     )
-    assert context["exemplars"] == []
+    assert [item["kind"] for item in context["exemplars"]] == ["curated_strategy"]
 
 
 async def test_context_exemplar_lookup_failure_is_best_effort(
     db_session, user_factory, monkeypatch
 ) -> None:
-    """示例检索异常只记 warning 并降级为空列表，绝不阻塞上下文组装。"""
+    """动态示例检索异常只记 warning 并降级（受控案例仍注入），绝不阻塞上下文组装。"""
 
     async def _boom(*args, **kwargs):
         raise RuntimeError("prompt log store down")
@@ -605,8 +610,29 @@ async def test_context_exemplar_lookup_failure_is_best_effort(
         profile=session_analyst,
         current_user_message="继续分析",
     )
-    assert context["exemplars"] == []
+    assert [item["kind"] for item in context["exemplars"]] == ["curated_strategy"]
     assert context["available_tools"]
+
+
+async def test_memory_combines_curated_and_user_success_exemplars(
+    db_session, user_factory
+) -> None:
+    """受控策略案例（curated_strategy）与当前用户动态成功日志（learned_prompt_log）合并。"""
+    user = await user_factory()
+    session = await _seed_session(db_session, user.id)
+    await _seed_prompt_log(db_session, user_id=user.id)
+    builder = MemoryContextBuilder(db_session, _registry(db_session))
+
+    context = await builder.build(
+        user_id=user.id,
+        session_id=session.id,
+        profile=session_analyst,
+        current_user_message="继续分析",
+    )
+    exemplars = context["exemplars"]
+    assert exemplars[0]["kind"] == "curated_strategy"
+    assert exemplars[1]["kind"] == "learned_prompt_log"
+    assert exemplars[0]["exemplar_id"] == "brand_analysis_success_v1"
 
 
 # ---------------------------------------------------------------------------

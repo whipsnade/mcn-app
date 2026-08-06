@@ -27,7 +27,7 @@ from app.agent_runtime.prompts import get_system_prompt
 
 # 各 Profile 的当前 prompt 版本（内容修订独立递增；本次为直接发布协议替换 Reviewer）。
 PROMPT_VERSIONS = {
-    "session_analyst_v1": "v4",
+    "session_analyst_v1": "v5",
     "artifact_reviewer_v1": "v3",
     "kol_detail_v1": "v3",
     "utility_v1": "v2",
@@ -132,6 +132,13 @@ def test_session_analyst_prompt_failure_handling() -> None:
 def test_session_analyst_prompt_mentions_exemplars() -> None:
     text = _text("session_analyst_v1")
     assert "exemplars" in text
+
+
+def test_session_analyst_prompt_says_exemplar_is_not_a_fixed_tool_sequence() -> None:
+    """exemplar 是策略参考不是固定工具顺序；禁止照抄实体、日期或参数。"""
+    text = _text("session_analyst_v1")
+    assert "不是固定工具顺序" in text
+    assert "不得照抄实体、日期或参数" in text
 
 
 def test_session_analyst_prompt_narrative_anti_fabrication_rule() -> None:

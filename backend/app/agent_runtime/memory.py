@@ -21,6 +21,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_artifacts.models import AgentArtifact, AgentArtifactVersion
+from app.agent_runtime.exemplar_loader import load_curated_exemplars
 from app.agent_runtime.models import AgentMessage, AgentSession, MemoryEntry
 from app.agent_runtime.profiles import AgentProfile
 from app.agent_runtime.tools.registry import ToolRegistry
@@ -33,8 +34,6 @@ logger = logging.getLogger(__name__)
 DEFAULT_RECENT_MESSAGE_WINDOW = 8
 # 默认历史 Run 摘要上限：与最近消息窗口一致，防止长 Session 摘要无限增长。
 DEFAULT_RUN_SUMMARY_LIMIT = 20
-# 成功示例注入上限（§6.2「1 至 2 个去敏成功示例」）。
-DEFAULT_EXEMPLAR_LIMIT = 2
 
 
 class MemorySessionNotFound(LookupError):
@@ -111,17 +110,25 @@ class MemoryContextBuilder:
         }
 
     async def _success_exemplars(self, user_id: str) -> list[dict[str, Any]]:
-        """检索当前用户同类场景的去敏成功示例；异常只记 warning。"""
+        """最多 1 个受控策略案例 + 1 个当前用户动态成功日志（§6.2 双来源）。
+
+        curated 案例对所有 Session 可见但只是只读代码资产；动态案例严格按
+        user_id 隔离。两者任一加载失败都只记 warning 并降级，不阻塞上下文。
+        """
+        curated = load_curated_exemplars(purpose="agent_loop", limit=1)
+        learned: list[dict[str, Any]] = []
         try:
-            return await find_success_exemplars(
+            learned = await find_success_exemplars(
                 self._db,
                 purpose="agent_loop",
                 user_id=user_id,
-                limit=DEFAULT_EXEMPLAR_LIMIT,
+                limit=1,
             )
+            for item in learned:
+                item.setdefault("kind", "learned_prompt_log")
         except Exception:
             logger.warning("failed to load success exemplars", exc_info=True)
-            return []
+        return [*curated, *learned]
 
     async def _recent_messages(self, session_id: str, window: int) -> list[dict[str, Any]]:
         rows = (
@@ -254,7 +261,6 @@ class MemoryContextBuilder:
 
 
 __all__ = [
-    "DEFAULT_EXEMPLAR_LIMIT",
     "DEFAULT_RECENT_MESSAGE_WINDOW",
     "DEFAULT_RUN_SUMMARY_LIMIT",
     "MemoryContextBuilder",
