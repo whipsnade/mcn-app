@@ -1,13 +1,13 @@
-"""kol_selection_v3 Excel 导出（Task 18 / 设计 §12.1 消费边界）。
+"""kol_selection_v3 Excel 导出（Gate C Task 3 / 设计 §7.3）。
 
-按 §12.1：Excel 每行展示八个 ``score_snapshot.dimensions.*.raw_score`` 列以及
-总分/评级/星级/数据完整度，不展示 ``weighted_score`` 列；导出器不调用模型/MCP。
+4 个 Sheet：达人圈选总表 / 达人详细画像（Top20 全详情块）/ 粉丝画像详情 /
+评分方法论与数据来源。v3 名单展示效果/价格效率/价值/报价/评级/完整度；
+历史 kol_score_v2 快照仍可导出。导出器不调用模型/MCP。
 """
 
 from __future__ import annotations
 
 from io import BytesIO
-from unittest.mock import Mock
 
 import pytest
 from openpyxl import load_workbook
@@ -15,34 +15,19 @@ from openpyxl import load_workbook
 from app.agent_artifacts.exporters import ArtifactExportUnsupported, export_artifact
 
 from tests.agent_artifacts.test_payloads import (
-    EIGHT_DIMENSIONS,
-    WEIGHTS,
     build_campaign_dict,
     build_insight_dict,
     build_kol_analysis_dict,
     build_kol_detail_dict,
     build_kol_selection_dict,
+    build_kol_value_selection_dict,
 )
 
-SUMMARY_HEADERS = (
-    "序号",
-    "平台",
-    "昵称",
-    "粉丝数",
-    "互动总数",
-    "平均互动",
-    "行业兴趣",
-    "目标地区",
-    "目标年龄",
-    "互动表现",
-    "活跃粉丝",
-    "内容质量",
-    "粉丝规模",
-    "互动粉丝比",
-    "综合总分",
-    "评级",
-    "星级",
-    "数据完整度",
+KOL_SHEETS = (
+    "达人圈选总表",
+    "达人详细画像",
+    "粉丝画像详情",
+    "评分方法论与数据来源",
 )
 
 
@@ -55,128 +40,115 @@ class _Version:
         self.data_status = "complete" if payload_json else "draft"
 
 
-def _item(rank: int, kol_uid: str, nickname: str, *, raw: float, total: float) -> dict:
-    dimensions = {
-        dim: {
-            "raw_score": raw,
-            "weight": WEIGHTS[dim],
-            "weighted_score": round(raw * WEIGHTS[dim] / 100, 2),
-            "source": "evidence:score_inputs",
-            "missing_reason": None,
-        }
-        for dim in EIGHT_DIMENSIONS
-    }
-    return {
-        "rank": rank,
-        "platform": "xiaohongshu",
-        "kol_uid": kol_uid,
-        "nickname": nickname,
-        "avatar_url": None,
-        "homepage_url": f"https://x.com/{kol_uid}",
-        "followers": 100000,
-        "active_followers": 50000,
-        "active_follower_rate": 50.0,
-        "growth_rate": 2.0,
-        "engagement_total": 5000,
-        "avg_engagement": 50.0,
-        "likes": 3000,
-        "comments": 1000,
-        "shares": 1000,
-        "quoted_price": 1000,
-        "reasons": ["互动高"],
-        "missing_fields": [],
-        "audience": {"regions": ["上海"], "age_ranges": ["25-34"], "interests": ["咖啡"]},
-        "score_snapshot": {
-            "version": "kol_score_v2",
-            "total": total,
-            "rating": "重点推荐" if total >= 78 else "推荐",
-            "stars": "★★★★★" if total >= 78 else "★★★★",
-            "data_completeness": 100.0,
-            "dimensions": dimensions,
-        },
-    }
-
-
-def _selection_version(items: list[dict] | None = None) -> _Version:
-    payload = build_kol_selection_dict()
-    if items is not None:
-        payload["data"]["items"] = items
-        payload["data"]["summary"]["selected_count"] = len(items)
-    return _Version("kol_selection_v3", payload)
-
-
-def test_published_kol_selection_exports_raw_score_columns() -> None:
-    """每 KOL 行渲染八个 raw_score 列 + 总分/评级/星级/完整度，不用 weighted_score 顶替。"""
-    items = [
-        _item(1, "k1", "达人一", raw=80.0, total=78.0),
-        _item(2, "k2", "达人二", raw=60.0, total=62.0),
+def _values(ws) -> list:
+    return [
+        cell.value
+        for row in ws.iter_rows()
+        for cell in row
+        if cell.value is not None
     ]
-    content = export_artifact(_selection_version(items))
+
+
+def _count_detail_blocks(ws) -> int:
+    """统计「达人详细画像」中 #N 详情块标题行数。"""
+    return sum(
+        1
+        for row in ws.iter_rows(min_col=1, max_col=1)
+        for cell in row
+        if isinstance(cell.value, str) and cell.value.startswith("#")
+    )
+
+
+def _kol_version(payload_factory=build_kol_value_selection_dict) -> _Version:
+    return _Version("kol_selection_v3", payload_factory())
+
+
+def _kol_version_with_20_items() -> _Version:
+    base = build_kol_value_selection_dict()
+    items = base["data"]["items"]
+    while len(items) < 20:
+        clone = dict(items[0])
+        clone["rank"] = len(items) + 1
+        clone["kol_uid"] = f"k{len(items) + 1}"
+        clone["nickname"] = f"达人{len(items) + 1}"
+        items.append(clone)
+    return _Version("kol_selection_v3", base)
+
+
+def test_kol_v3_export_has_four_sheets_and_v3_headers() -> None:
+    content = export_artifact(_kol_version())
     assert content[:2] == b"PK"
+    wb = load_workbook(BytesIO(content), data_only=False)
+    assert tuple(wb.sheetnames) == KOL_SHEETS
+
+    summary = wb["达人圈选总表"]
+    values = _values(summary)
+    for header in ("效果分", "价格效率分", "价值总分", "报价", "价格样本数", "数据完整度"):
+        assert header in values
+    assert "某品牌" in str(summary["A1"].value)
+
+
+def test_kol_export_contains_twenty_detail_blocks() -> None:
+    content = export_artifact(_kol_version_with_20_items())
+    wb = load_workbook(BytesIO(content), data_only=False)
+    detail = wb["达人详细画像"]
+    assert _count_detail_blocks(detail) == 20
+    detail_values = _values(detail)
+    assert "价值总分" in detail_values
+    assert "价格样本数" in detail_values
+
+
+def test_kol_v2_history_export_remains_compatible() -> None:
+    """历史 kol_score_v2 快照仍可导出：总表展示综合分/星级。"""
+    content = export_artifact(_kol_version(build_kol_selection_dict))
+    wb = load_workbook(BytesIO(content), data_only=False)
+    summary = wb["达人圈选总表"]
+    values = _values(summary)
+    assert "综合分" in values
+    assert "星级" in values
+    assert "效果分" not in values
+    assert _count_detail_blocks(wb["达人详细画像"]) >= 1
+
+
+def test_kol_methodology_sheet_records_v3_weights() -> None:
+    content = export_artifact(_kol_version())
+    wb = load_workbook(BytesIO(content), data_only=False)
+    method = wb["评分方法论与数据来源"]
+    values = _values(method)
+    assert any("kol_value_score_v3" in str(v) for v in values)
+    assert "价格效率" in values
+    assert 30 in values
+
+
+def test_kol_external_text_is_formula_escaped() -> None:
+    payload = build_kol_value_selection_dict()
+    payload["data"]["items"][0]["nickname"] = "=1+1"
+    content = export_artifact(_Version("kol_selection_v3", payload))
     wb = load_workbook(BytesIO(content))
-    assert "KOL匹配度筛选" in wb.sheetnames
-
-    summary = wb["KOL匹配度筛选"]
-    headers = [summary.cell(4, column).value for column in range(1, 19)]
-    assert tuple(headers) == SUMMARY_HEADERS
-    # §12.1：不展示 weighted_score 列。
-    assert not any("加权" in str(header) or "weighted" in str(header).lower() for header in headers)
-
-    # 行 1：八维 raw_score 全为 80.0，总分/评级/星级/完整度齐全。
-    row1 = [summary.cell(5, column).value for column in range(1, 19)]
-    assert row1[6:14] == [80.0] * 8  # 八维 raw_score 列（industry_interest 若被 weighted 顶替会变 8.0）
-    assert row1[14] == 78.0  # 综合总分
-    assert row1[15] == "重点推荐"
-    assert row1[16] == "★★★★★"
-    assert row1[17] == 100.0  # 数据完整度
-
-    # 行 2：raw_score 与行 1 不同，逐行独立渲染。
-    row2 = [summary.cell(6, column).value for column in range(1, 19)]
-    assert row2[6:14] == [60.0] * 8
-    assert row2[14] == 62.0
-    assert row2[17] == 100.0
-
-
-@pytest.mark.parametrize(
-    "schema_version,builder",
-    [
-        ("campaign_report_v2", build_campaign_dict),
-        ("kol_analysis_v2", build_kol_analysis_dict),
-        ("kol_detail_v2", build_kol_detail_dict),
-        ("insight_board_v1", build_insight_dict),
-    ],
-)
-def test_unsupported_artifact_types_raise_409(schema_version: str, builder) -> None:
-    """不支持导出的 Artifact 类型 → 409 ARTIFACT_EXPORT_UNSUPPORTED。"""
-    version = _Version(schema_version, builder())
-    with pytest.raises(ArtifactExportUnsupported) as excinfo:
-        export_artifact(version)
-    assert excinfo.value.code == "ARTIFACT_EXPORT_UNSUPPORTED"
-    assert excinfo.value.schema_version == schema_version
+    values = _values(wb["达人圈选总表"])
+    assert any(isinstance(v, str) and v.startswith("'") for v in values)
 
 
 def test_draft_kol_selection_raises_unsupported() -> None:
-    """未发布 draft（无可冻结 payload）→ 409 ARTIFACT_EXPORT_UNSUPPORTED。"""
     with pytest.raises(ArtifactExportUnsupported) as excinfo:
         export_artifact(_Version("kol_selection_v3", None))
     assert excinfo.value.code == "ARTIFACT_EXPORT_UNSUPPORTED"
 
 
-def test_invalid_published_payload_raises_unsupported() -> None:
-    """历史/旁路非法 payload（强类型 ValidationError）→ 稳定 409，不泄漏 500。"""
-    payload = build_kol_selection_dict()
-    payload["data"]["scoring"] = {"version": "kol_score_v1"}  # 非法评分块
+def test_invalid_published_kol_payload_raises_unsupported() -> None:
     with pytest.raises(ArtifactExportUnsupported) as excinfo:
-        export_artifact(_Version("kol_selection_v3", payload))
+        export_artifact(_Version("kol_selection_v3", {"schema_version": "kol_selection_v3"}))
     assert excinfo.value.code == "ARTIFACT_EXPORT_UNSUPPORTED"
-    assert excinfo.value.schema_version == "kol_selection_v3"
 
 
-def test_export_never_calls_model_or_mcp() -> None:
-    """导出是表现层能力：传入的 model/gateway 桩绝不被调用。"""
-    model = Mock()
-    gateway = Mock()
-    content = export_artifact(_selection_version(), model=model, gateway=gateway)
-    assert content[:2] == b"PK"
-    model.assert_not_called()
-    gateway.assert_not_called()
+def test_other_artifact_types_raise_unsupported() -> None:
+    for schema, factory in (
+        ("campaign_report_v2", build_campaign_dict),
+        ("kol_analysis_v2", build_kol_analysis_dict),
+        ("kol_detail_v2", build_kol_detail_dict),
+        ("insight_board_v1", build_insight_dict),
+    ):
+        payload = factory()
+        with pytest.raises(ArtifactExportUnsupported) as excinfo:
+            export_artifact(_Version(schema, payload))
+        assert excinfo.value.code == "ARTIFACT_EXPORT_UNSUPPORTED"

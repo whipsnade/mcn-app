@@ -1,42 +1,28 @@
-"""brand_report_v3 Excel 导出渲染器（设计 §12.1 消费边界 / Task 18）。
+"""brand_report_v3 Excel 导出渲染器（Gate C Task 3 / 设计 §12.1）。
 
-渲染器只读已发布不可变 Version 的 payload（校验为强类型 ``BrandReportV3``），
-按受控模板 ``templates/brand_report_v3.xlsx`` 填充各章节。空章节保留列头并写
-「数据受限/未采集」说明，绝不因空数据画误导性图表；受限章节通过
-``availability``/``limitations`` 披露。任何异常向上抛（Task 19 路由映射），
-绝不输出半截文件。
+渲染器只读已发布不可变 Version 的 payload（强类型 ``BrandReportV3``），按受控
+模板 ``templates/brand_report_v3.xlsx`` 填充 8 个 Sheet（综合概览/情感分析/
+日趋势/内容类型与达人/地域分布/热门帖子TOP/舆情洞察/方法论）。模板由
+``scripts/build_agent_artifact_templates.py`` 从用户来源模板清洗生成：只保留
+版式，样例数据与图表被清除，图表由本渲染器现场重建。
 
-模板行号契约（与 ``scripts/build_agent_artifact_templates.py`` 一一对应，
-改模板布局必须同步改两处并更新测试）：
-- 综合概览：``A1``(合并)/``A2``(合并)/``A3``(合并) 为标题/周期/来源锚点；
-  ``核心指标`` 标题@4、表头@5、指标行@6-9；``clear_rows(11, 60, 6)`` 后
-  平台表现与对比分析由渲染器自 11 行起动态排布。
-- 情感分析/内容与达人/洞察与建议：标题@1，其余自第 3 行起渲染器完全接管。
-- 日趋势：标题@1，表头@3（模板固定），数据自 4 行起；折线图数值引用
-   ``min_row=3``（表头作系列名）+ 分类轴 ``min_row=4``。
-- 地域与话题：标题@1；``write_table`` 布局为 标题@3/表头@4/数据@5+；
-  柱状图数值引用 ``min_row=4``（表头作系列名）+ 分类轴 ``min_row=5``，
-  锚定在话题表之后。
-- 热门帖子TOP：表头@3（渲染器重写），数据自 4 行起。
-- 方法论：表头@3（模板固定），数据自 4 行起。
+空章节保留表头并写「数据受限/未采集」说明，绝不因空数据画误导性图表；
+受限章节经 ``availability``/``limitations`` 披露。URL 仅 http/https（payload
+已校验），所有第三方可控文本经 ``cell_value`` 防公式注入。
 """
 
 from __future__ import annotations
 
-from datetime import datetime
 from io import BytesIO
 from pathlib import Path
-from typing import Any
-from urllib.parse import urlparse
 
 from openpyxl import load_workbook
 from openpyxl.chart import BarChart, LineChart, Reference
-from openpyxl.styles import Alignment, Font
 
 from app.agent_artifacts.exporters._common import (
     MISSING,
     cell_value,
-    clear_rows,
+    clear_rows_unmerged,
     empty_note,
     platform_label,
     write_value,
@@ -51,10 +37,10 @@ SHEET_ORDER = (
     "综合概览",
     "情感分析",
     "日趋势",
-    "内容与达人",
-    "地域与话题",
+    "内容类型与达人",
+    "地域分布",
     "热门帖子TOP",
-    "洞察与建议",
+    "舆情洞察",
     "方法论",
 )
 
@@ -66,10 +52,10 @@ def render_brand_workbook(payload: dict) -> bytes:
     _render_overview(workbook["综合概览"], report)
     _render_sentiment(workbook["情感分析"], report)
     _render_daily_trend(workbook["日趋势"], report)
-    _render_content_creators(workbook["内容与达人"], report)
-    _render_regions_topics(workbook["地域与话题"], report)
+    _render_content_creators(workbook["内容类型与达人"], report)
+    _render_regions(workbook["地域分布"], report)
     _render_top_posts(workbook["热门帖子TOP"], report)
-    _render_insights(workbook["洞察与建议"], report)
+    _render_insights(workbook["舆情洞察"], report)
     _render_methodology(workbook["方法论"], report)
     output = BytesIO()
     workbook.save(output)
@@ -82,162 +68,121 @@ def render_brand_workbook(payload: dict) -> bytes:
 def _render_overview(sheet, report) -> None:
     scope = report.scope
     sheet["A1"] = cell_value(f"{scope.brand} 品牌社交媒体表现分析报告")
-    sheet["A2"] = (
+    sheet["B2"] = cell_value(
         f"{scope.period.start} 至 {scope.period.end}（数据截至 {report.methodology.data_as_of:%Y-%m-%d}）"
     )
     platforms = "、".join(platform_label(name) for name in scope.platforms) or MISSING
-    sheet["A3"] = f"平台：{platforms}；关键词：{'、'.join(scope.keywords) or MISSING}"
+    sheet["B3"] = cell_value(f"平台：{platforms}")
+    sheet["B4"] = cell_value(f"关键词：{'、'.join(scope.keywords) or MISSING}")
 
+    # 平台列头：按 payload 平台写 B/C/D…，列数不足用「未采集」占位。
     overview = report.data.overview
-    metrics = (
-        ("声量", overview.total_volume),
-        ("互动", overview.total_engagement),
-        ("发帖", overview.total_posts),
-        ("情感分", overview.sentiment_score),
-    )
-    for offset, (label, value) in enumerate(metrics):
-        sheet.cell(6 + offset, 1).value = label
-        write_value(sheet.cell(6 + offset, 2), value)
+    platform_entries = list(overview.platforms)
+    for index, entry in enumerate(platform_entries[:3]):
+        sheet.cell(6, 2 + index).value = cell_value(platform_label(entry.platform))
+    for index in range(len(platform_entries[:3]), 3):
+        sheet.cell(6, 2 + index).value = MISSING
 
-    clear_rows(sheet, 11, 60, 6)
-    row = write_table(
-        sheet,
-        11,
-        "平台表现",
-        ["平台", "声量", "互动", "发帖", "声量占比", "情感分"],
-        [
-            [
-                platform_label(item.platform),
-                item.volume,
-                item.engagement,
-                item.posts,
-                item.share_of_voice,
-                item.sentiment_score,
-            ]
-            for item in overview.platforms
-        ],
-        columns=6,
-        pct_columns=(5,),
-    )
-    # 对比分析：mom/yoy 指标按名称合并，同指标并列环比/同比变化率。
-    metrics_by_name: dict[str, dict[str, Any]] = {}
-    for comparison, label in (
-        (report.data.comparisons.mom, "mom"),
-        (report.data.comparisons.yoy, "yoy"),
-    ):
-        for metric in comparison.metrics:
-            entry = metrics_by_name.setdefault(metric.metric, {"current": metric.current})
-            entry[f"{label}_rate"] = metric.rate
-    comparison_rows = [
-        [name, entry["current"], entry.get("mom_rate"), entry.get("yoy_rate")]
-        for name, entry in metrics_by_name.items()
+    metric_rows = [
+        ("声量(帖数)", [entry.volume for entry in platform_entries], overview.total_volume),
+        ("互动数", [entry.engagement for entry in platform_entries], overview.total_engagement),
+        ("发帖数", [entry.posts for entry in platform_entries], overview.total_posts),
+        ("情感分", [None for _ in platform_entries], overview.sentiment_score),
     ]
-    write_table(
-        sheet,
-        row + 1,
-        "对比分析",
-        ["指标", "当前值", "环比变化率", "同比变化率"],
-        comparison_rows,
-        columns=6,
-        pct_columns=(3, 4),
-    )
+    for offset, (label, per_platform, total) in enumerate(metric_rows):
+        row = 7 + offset
+        sheet.cell(row, 1).value = label
+        for index, value in enumerate(per_platform[:3]):
+            write_value(sheet.cell(row, 2 + index), value)
+        write_value(sheet.cell(row, 5), total)
 
 
 def _render_sentiment(sheet, report) -> None:
-    clear_rows(sheet, 3, 60, 7)
-    summary = report.data.sentiment.summary
-    buckets = (
-        ("正面", summary.positive),
-        ("中性", summary.neutral),
-        ("负面", summary.negative),
-    )
-    row = write_table(
-        sheet,
-        3,
-        None,
-        ["情感", "计数", "占比"],
-        [[label, bucket.count, bucket.share] for label, bucket in buckets],
-        columns=7,
-        pct_columns=(3,),
-    )
-    by_platform_rows = []
+    clear_rows_unmerged(sheet, 4, 60, 5)
+    rows = []
     for item in report.data.sentiment.by_platform:
-        by_platform_rows.append(
-            [
-                platform_label(item.platform),
-                item.positive.count,
-                item.positive.share,
-                item.neutral.count,
-                item.neutral.share,
-                item.negative.count,
-                item.negative.share,
-            ]
-        )
+        for bucket_label, bucket in (
+            ("正面", item.positive),
+            ("中性", item.neutral),
+            ("负面", item.negative),
+        ):
+            rows.append(
+                [
+                    platform_label(item.platform),
+                    bucket_label,
+                    bucket.count,
+                    None,  # 互动数无对应字段
+                    bucket.share,
+                ]
+            )
     write_table(
         sheet,
-        row + 1,
-        "平台情感分布",
-        ["平台", "正面计数", "正面占比", "中性计数", "中性占比", "负面计数", "负面占比"],
-        by_platform_rows,
-        columns=7,
-        pct_columns=(3, 5, 7),
+        4,
+        None,
+        ["平台", "情感", "声量", "互动数", "占比"],
+        rows,
+        columns=5,
+        pct_columns=(5,),
+        note=empty_note(report, "sentiment"),
     )
 
 
 def _render_daily_trend(sheet, report) -> None:
     points = report.data.daily_trend
-    clear_rows(sheet, 4, 100, 7)
+    clear_rows_unmerged(sheet, 4, 100, 4)
     sheet._charts = []
     if not points:
-        # 空章节：保留列头，写受限/未采集说明，不建误导性图表。
-        sheet.merge_cells("A4:G4")
+        sheet.merge_cells("A4:D4")
         sheet["A4"] = empty_note(report, "daily_trend")
         return
     for index, point in enumerate(points):
         row = 4 + index
         sheet.cell(row, 1).value = point.date
-        # 平台名是第三方可控文本，经 cell_value 转义防止公式注入。
-        sheet.cell(row, 2).value = cell_value(platform_label(point.platform))
-        sheet.cell(row, 3).value = point.volume
-        sheet.cell(row, 4).value = point.engagement
-        sheet.cell(row, 5).value = point.positive
-        sheet.cell(row, 6).value = point.neutral
-        sheet.cell(row, 7).value = point.negative
+        sheet.cell(row, 2).value = point.volume
+        sheet.cell(row, 3).value = point.engagement
+        sheet.cell(row, 4).value = cell_value(platform_label(point.platform))
     last_data_row = 3 + len(points)
     chart = LineChart()
     chart.title = "每日声量与互动趋势"
     chart.add_data(
-        Reference(sheet, min_col=3, min_row=3, max_row=last_data_row), titles_from_data=True
+        Reference(sheet, min_col=2, min_row=3, max_row=last_data_row), titles_from_data=True
     )
     chart.add_data(
-        Reference(sheet, min_col=4, min_row=3, max_row=last_data_row), titles_from_data=True
+        Reference(sheet, min_col=3, min_row=3, max_row=last_data_row), titles_from_data=True
     )
     chart.set_categories(Reference(sheet, min_col=1, min_row=4, max_row=last_data_row))
-    chart.height = 8
-    chart.width = 16
-    sheet.add_chart(chart, f"A{last_data_row + 2}")
+    chart.height = 9
+    chart.width = 17
+    sheet.add_chart(chart, f"F{last_data_row + 2}")
 
 
 def _render_content_creators(sheet, report) -> None:
-    clear_rows(sheet, 3, 80, 6)
-    data = report.data
-    row = write_table(
-        sheet,
-        3,
-        "内容类型",
-        ["平台", "类型", "发帖", "声量", "互动"],
+    clear_rows_unmerged(sheet, 4, 60, 4)
+    rows = [
         [
-            [platform_label(item.platform), item.type, item.posts, item.volume, item.engagement]
-            for item in data.content_types
-        ],
-        columns=6,
+            item.type,
+            item.volume,
+            item.engagement,
+            item.posts,
+        ]
+        for item in report.data.content_types
+    ]
+    write_table(
+        sheet,
+        4,
+        None,
+        ["内容类型", "声量", "互动数", "发帖数"],
+        rows,
+        columns=4,
         note=empty_note(report, "content_types"),
     )
-    row = write_table(
+    # 达人分层与付费/自然：并入同一 Sheet 下方（来源模板单表）。
+    row = 4 + len(rows)
+    write_table(
         sheet,
         row + 1,
-        "达人层级分布",
-        ["平台", "层级", "达人数量", "发帖", "声量", "互动"],
+        "达人分层",
+        ["平台", "层级", "达人数量", "发帖数", "声量", "互动数"],
         [
             [
                 platform_label(item.platform),
@@ -247,206 +192,126 @@ def _render_content_creators(sheet, report) -> None:
                 item.volume,
                 item.engagement,
             ]
-            for item in data.creator_tiers
+            for item in report.data.creator_tiers
         ],
-        columns=6,
+        columns=4,
         note=empty_note(report, "creator_tiers"),
     )
+
+
+def _render_regions(sheet, report) -> None:
+    regions = report.data.regions
+    clear_rows_unmerged(sheet, 4, 60, 4)
+    sheet._charts = []
+    if not regions:
+        sheet.merge_cells("A4:D4")
+        sheet["A4"] = empty_note(report, "regions")
+        return
+    rows = [
+        [item.region, item.volume, item.share] for item in regions
+    ]
+    write_table(
+        sheet,
+        4,
+        None,
+        ["省份", "声量", "互动数", "声量占比"],
+        [[row[0], row[1], None, row[2]] for row in rows],
+        columns=4,
+        pct_columns=(4,),
+    )
+    last_data_row = 4 + len(rows)
+    chart = BarChart()
+    chart.title = "发帖用户地域分布"
+    chart.add_data(
+        Reference(sheet, min_col=2, min_row=5, max_row=last_data_row), titles_from_data=False
+    )
+    chart.set_categories(Reference(sheet, min_col=1, min_row=5, max_row=last_data_row))
+    chart.height = 8
+    chart.width = 16
+    sheet.add_chart(chart, f"F{last_data_row + 2}")
+
+
+def _render_top_posts(sheet, report) -> None:
+    posts = report.data.top_posts
+    clear_rows_unmerged(sheet, 4, 100, 8)
+    rows = [
+        [
+            index,
+            platform_label(post.platform),
+            post.title,
+            post.author,
+            post.engagement,
+            None,  # 阅读数无对应字段
+            post.likes,
+            post.comments,
+        ]
+        for index, post in enumerate(posts, start=1)
+    ]
+    write_table(
+        sheet,
+        4,
+        None,
+        ["排名", "平台", "标题", "用户昵称", "互动数", "阅读数", "点赞", "评论"],
+        rows,
+        columns=8,
+        note=empty_note(report, "top_posts"),
+    )
+
+
+def _render_insights(sheet, report) -> None:
+    clear_rows_unmerged(sheet, 4, 60, 4)
+    findings = [
+        [finding.title, finding.detail, None]
+        for finding in report.narrative.findings
+    ]
+    write_table(
+        sheet,
+        4,
+        None,
+        ["洞察维度", "具体表现", "代表特征"],
+        findings,
+        columns=4,
+        note=empty_note(report, "narrative"),
+    )
+    topics = report.data.topics
+    row = 4 + len(findings)
     write_table(
         sheet,
         row + 1,
-        "商单 vs 自然内容",
-        ["平台", "类型", "发帖", "声量", "互动"],
-        [
-            [platform_label(item.platform), item.kind, item.posts, item.volume, item.engagement]
-            for item in data.organic_vs_paid
-        ],
-        columns=6,
-        note=empty_note(report, "organic_vs_paid"),
-    )
-
-
-def _render_regions_topics(sheet, report) -> None:
-    clear_rows(sheet, 3, 80, 4)
-    sheet._charts = []
-    regions = report.data.regions
-    row = write_table(
-        sheet,
-        3,
-        "地域分布",
-        ["地域", "声量", "占比", "情感分"],
-        [
-            [item.region, item.volume, item.share, item.sentiment_score]
-            for item in regions
-        ],
-        columns=4,
-        pct_columns=(3,),
-        note=empty_note(report, "regions"),
-    )
-    chart: BarChart | None = None
-    if regions:
-        # write_table 布局：标题@3 / 表头@4 / 数据@5+。图表数值引用必须落在
-        # 真实数据行（5..4+len(regions)）：表头行 4 只作为系列名（titles_from_data），
-        # 分类轴从数据首行 5 开始——绝不把表头/合并标题混进数据，也不丢末行。
-        chart = BarChart()
-        chart.type = "col"
-        chart.title = "发帖用户地域声量分布"
-        chart.add_data(
-            Reference(sheet, min_col=2, min_row=4, max_row=4 + len(regions)),
-            titles_from_data=True,
-        )
-        chart.set_categories(
-            Reference(sheet, min_col=1, min_row=5, max_row=4 + len(regions))
-        )
-        chart.height = 8
-        chart.width = 16
-    row = write_table(
-        sheet,
-        row + 1,
-        "话题分布",
-        ["话题", "声量", "互动", "情感分"],
+        "内容主题",
+        ["主题", "声量", "互动数", "情感分"],
         [
             [item.topic, item.volume, item.engagement, item.sentiment_score]
-            for item in report.data.topics
+            for item in topics
         ],
         columns=4,
         note=empty_note(report, "topics"),
     )
-    if chart is not None:
-        # 图表锚定在两张表之后，避免与数据/后续表格重叠。
-        sheet.add_chart(chart, f"A{row + 1}")
-
-
-def _render_top_posts(sheet, report) -> None:
-    clear_rows(sheet, 4, 60, 10)
-    posts = report.data.top_posts
-    if not posts:
-        sheet.merge_cells("A4:J4")
-        sheet["A4"] = empty_note(report, "top_posts")
-        return
-    headers = ("排名", "平台", "标题", "作者", "发布时间", "点赞", "评论", "转发", "互动", "链接")
-    for column, header in enumerate(headers, start=1):
-        sheet.cell(3, column).value = header
-    for index, post in enumerate(posts):
-        row = 4 + index
-        values = (
-            index + 1,
-            platform_label(post.platform),
-            post.title,
-            post.author,
-            _naive_datetime(post.published_at),
-            post.likes,
-            post.comments,
-            post.shares,
-            post.engagement,
-        )
-        for column, value in enumerate(values, start=1):
-            write_value(sheet.cell(row, column), value)
-        url_cell = sheet.cell(row, 10)
-        if post.url and _is_valid_url(post.url):
-            url_cell.value = post.url
-            url_cell.hyperlink = post.url
-            url_cell.font = Font(color="0563C1", underline="single")
-        else:
-            url_cell.value = MISSING
-
-
-def _render_insights(sheet, report) -> None:
-    clear_rows(sheet, 3, 80, 4)
-    narrative = report.narrative
-    row = _write_paragraph(sheet, 3, "执行摘要", narrative.executive_summary)
-    row = write_table(
-        sheet,
-        row + 1,
-        "关键发现",
-        ["标题", "详情", "支撑路径"],
-        [
-            [finding.title, finding.detail, _paths_text(finding.supporting_paths)]
-            for finding in narrative.findings
-        ],
-        columns=4,
-        note=MISSING,
-    )
-    write_table(
-        sheet,
-        row + 1,
-        "行动建议",
-        ["标题", "行动", "理由", "支撑路径"],
-        [
-            [
-                recommendation.title,
-                recommendation.action,
-                recommendation.rationale,
-                _paths_text(recommendation.supporting_paths),
-            ]
-            for recommendation in narrative.recommendations
-        ],
-        columns=4,
-        note=MISSING,
-    )
 
 
 def _render_methodology(sheet, report) -> None:
-    clear_rows(sheet, 4, 60, 2)
-    scope = report.scope
+    clear_rows_unmerged(sheet, 4, 60, 2)
     methodology = report.methodology
-    limited = [
-        f"{label}：{entry.status}"
-        for label, entry in sorted(report.availability.items())
-        if entry.status != "complete"
+    rows = [
+        ["数据来源", "、".join(methodology.source_names) or MISSING],
+        ["数据截至", f"{methodology.data_as_of:%Y-%m-%d %H:%M}"],
+        [
+            "分析周期",
+            f"{report.scope.period.start} 至 {report.scope.period.end}",
+        ],
+        ["平台", "、".join(platform_label(p) for p in report.scope.platforms) or MISSING],
+        ["关键词", "、".join(report.scope.keywords) or MISSING],
     ]
-    rows = (
-        ("分析品牌", scope.brand or MISSING),
-        ("时间范围", f"{scope.period.start} 至 {scope.period.end}"),
-        ("平台", "、".join(platform_label(name) for name in scope.platforms) or MISSING),
-        ("关键词", "、".join(scope.keywords) or MISSING),
-        ("对比口径", scope.comparison_mode),
-        ("数据来源", "、".join(methodology.source_names) or MISSING),
-        ("数据截至", f"{methodology.data_as_of:%Y-%m-%d %H:%M}"),
-        ("章节可用性", "；".join(limited) if limited else "全部章节数据完整"),
-        ("局限性", _limitations_text(report)),
+    for note in methodology.notes:
+        rows.append(["说明", note])
+    write_table(
+        sheet,
+        4,
+        None,
+        ["项目", "说明"],
+        rows,
+        columns=2,
     )
-    for index, (label, text) in enumerate(rows):
-        sheet.cell(4 + index, 1).value = label
-        write_value(sheet.cell(4 + index, 2), text)
-
-
-# ---------- 取值辅助 ----------
-
-
-def _naive_datetime(value):
-    """Excel 不支持带时区的 datetime：去掉 tzinfo 再写单元格。"""
-    if isinstance(value, datetime) and value.tzinfo is not None:
-        return value.replace(tzinfo=None)
-    return value
-
-
-def _paths_text(paths) -> str:
-    return "、".join(paths) or MISSING
-
-
-def _limitations_text(report) -> str:
-    if not report.limitations:
-        return "无"
-    return "；".join(f"{item.code}：{item.message}" for item in report.limitations)
-
-
-def _write_paragraph(sheet, start_row: int, title: str, text: str) -> int:
-    sheet.merge_cells(start_row=start_row, start_column=1, end_row=start_row, end_column=4)
-    title_cell = sheet.cell(start_row, 1)
-    title_cell.value = title
-    title_cell.font = Font(name="微软雅黑", bold=True, size=11, color="1F4E79")
-    row = start_row + 1
-    sheet.merge_cells(start_row=row, start_column=1, end_row=row, end_column=4)
-    text_cell = sheet.cell(row, 1)
-    text_cell.value = cell_value(text)
-    text_cell.alignment = Alignment(wrap_text=True, vertical="top")
-    return row + 1
-
-
-def _is_valid_url(url: str) -> bool:
-    parsed = urlparse(url)
-    return parsed.scheme in ("http", "https") and bool(parsed.netloc)
 
 
 __all__ = [

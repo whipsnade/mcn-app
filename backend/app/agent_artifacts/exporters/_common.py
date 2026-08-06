@@ -63,6 +63,14 @@ def clear_rows(sheet: Any, start: int, end: int, columns: int) -> None:
                 cell.value = None
 
 
+def clear_rows_unmerged(sheet: Any, start: int, end: int, columns: int) -> None:
+    """解除与数据区重叠的合并区域后再清值（模板数据区可能残留合并）。"""
+    for merged in list(sheet.merged_cells.ranges):
+        if merged.min_row >= start and merged.min_row <= end:
+            sheet.unmerge_cells(str(merged))
+    clear_rows(sheet, start, end, columns)
+
+
 def write_table(
     sheet: Any,
     start_row: int,
