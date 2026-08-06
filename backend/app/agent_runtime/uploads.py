@@ -18,6 +18,7 @@ import csv
 import hashlib
 import io
 import logging
+import re
 import xml.etree.ElementTree as ElementTree
 import zipfile
 from dataclasses import dataclass
@@ -90,31 +91,28 @@ class WorksheetBounds:
     max_column: int
 
 
-def _column_index_from_ref(ref: str) -> int:
-    """把单元格引用（如 B2/XFD1）解析为列号（A=1）；非法引用抛受控错误。"""
-    letters: list[str] = []
-    digits: list[str] = []
-    seen_digit = False
-    for ch in ref:
-        if ch.isalpha() and not seen_digit:
-            letters.append(ch)
-        elif ch.isdigit():
-            seen_digit = True
-            digits.append(ch)
-        else:
-            raise UploadRejectedError(
-                status_code=400, error_code="invalid_worksheet_coordinate",
-                message=f"invalid cell reference: {ref!r}",
-            )
-    if not letters or not digits:
+# cell 引用严格格式：列字母 + 行号（行号 >= 1、无前导零）。
+_CELL_REF_RE = re.compile(r"([A-Za-z]+)([1-9]\d*)\Z")
+_ROW_R_RE = re.compile(r"[1-9]\d*\Z")
+
+
+def _column_index_from_ref(ref: str) -> tuple[int, int]:
+    """把单元格引用（如 B2/XFD1048576）解析为 (列号, 行号)；A=1、行号 >= 1。
+
+    非法引用（A0/A01/B2X/缺列或缺行号）抛受控错误；行号只做格式与正数校验，
+    上限由调用方按 max_rows 检查。
+    """
+    match = _CELL_REF_RE.fullmatch(ref)
+    if match is None:
         raise UploadRejectedError(
             status_code=400, error_code="invalid_worksheet_coordinate",
             message=f"invalid cell reference: {ref!r}",
         )
+    letters, row_str = match.groups()
     column = 0
     for ch in letters:
         column = column * 26 + (ord(ch.upper()) - ord("A") + 1)
-    return column
+    return column, int(row_str)
 
 
 def _resolve_active_worksheet_path(zf: zipfile.ZipFile, workbook: Any) -> str:
@@ -148,18 +146,21 @@ def _resolve_active_worksheet_path(zf: zipfile.ZipFile, workbook: Any) -> str:
 def _scan_worksheet_coordinates(zf: zipfile.ZipFile, path: str, *, max_rows: int) -> WorksheetBounds:
     """流式扫描活动 worksheet XML 的真实坐标（禁止 zf.read 整包加载）。
 
-    start 事件中统计 row 元素数量、最大 row r 坐标与最大 cell 列号；XML 解析错误
-    与非法坐标一律映射为受控 UploadRejectedError。物理行数超过上限时提前中止，
-    避免恶意文件触发整表扫描。
+    start 事件中统计 row 元素数量、最大行坐标（row r 与 cell 引用中的行号）与
+    最大列号；省略 ``c@r`` 的合法单元格按当前 row 内顺序推导隐式列号。XML 解析
+    错误与非法坐标一律映射为受控 UploadRejectedError；物理行数超过上限时提前
+    中止，避免恶意文件触发整表扫描。
     """
     physical_rows = 0
     max_row_coordinate = 0
     actual_max_column = 0
+    cell_index = 0
     try:
         with zf.open(path) as stream:
             for _event, element in ElementTree.iterparse(stream, events=("start",)):
                 local = element.tag.rsplit("}", 1)[-1]
                 if local == "row":
+                    cell_index = 0
                     physical_rows += 1
                     if physical_rows > max_rows + 1:
                         raise UploadRejectedError(
@@ -168,21 +169,26 @@ def _scan_worksheet_coordinates(zf: zipfile.ZipFile, path: str, *, max_rows: int
                         )
                     raw_r = element.attrib.get("r")
                     if raw_r is not None:
-                        try:
-                            row_no = int(raw_r)
-                        except ValueError:
+                        if _ROW_R_RE.fullmatch(raw_r) is None:
                             raise UploadRejectedError(
                                 status_code=400, error_code="invalid_worksheet_coordinate",
                                 message=f"invalid row coordinate: {raw_r!r}",
                             )
+                        row_no = int(raw_r)
                         if row_no > max_row_coordinate:
                             max_row_coordinate = row_no
                 elif local == "c":
+                    cell_index += 1
                     ref = element.attrib.get("r")
                     if ref:
-                        column = _column_index_from_ref(ref)
-                        if column > actual_max_column:
-                            actual_max_column = column
+                        column, cell_row = _column_index_from_ref(ref)
+                        if cell_row > max_row_coordinate:
+                            max_row_coordinate = cell_row
+                    else:
+                        # 合法省略 c@r：按当前 row 内单元格顺序推导隐式列号。
+                        column = cell_index
+                    if column > actual_max_column:
+                        actual_max_column = column
                 element.clear()
     except UploadRejectedError:
         raise

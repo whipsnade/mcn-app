@@ -314,23 +314,36 @@ def _encode_search_cursor(collected_at: datetime, evidence_id: str) -> str:
 
 
 def _decode_search_cursor(raw: str) -> tuple[datetime, str] | None:
-    """解析 cursor；任何格式错误返回 None（调用方映射 invalid_arguments）。"""
+    """严格解析 cursor；任何格式/篡改/变体返回 None（调用方映射 invalid_arguments）。
+
+    校验链：严格 Base64（validate=True 拒绝附加字符）→ JSON 只含 t/i 两键 →
+    t 为无时区 ISO 时间、i 非空 → 重新编码必须与输入完全一致（拒绝填充/别名/
+    附加字节等非规范变体）。
+    """
     try:
-        payload = json.loads(
-            base64.urlsafe_b64decode(raw.encode("ascii")).decode("utf-8")
-        )
-    except (ValueError, UnicodeDecodeError, binascii.Error):
+        decoded = base64.b64decode(raw.encode("ascii"), altchars=b"-_", validate=True)
+    except (ValueError, binascii.Error, UnicodeEncodeError):
         return None
-    if not isinstance(payload, dict):
+    try:
+        payload = json.loads(decoded.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(payload, dict) or set(payload.keys()) != {"t", "i"}:
         return None
     raw_t = payload.get("t")
     raw_id = payload.get("i")
     if not isinstance(raw_t, str) or not isinstance(raw_id, str) or not raw_id:
         return None
     try:
-        return datetime.fromisoformat(raw_t), raw_id
+        t = datetime.fromisoformat(raw_t)
     except ValueError:
         return None
+    if t.tzinfo is not None:
+        # 游标时间必须是无时区 UTC（与库内 naive collected_at 一致）。
+        return None
+    if _encode_search_cursor(t, raw_id) != raw:
+        return None
+    return t, raw_id
 
 
 class SearchEvidenceTool:
