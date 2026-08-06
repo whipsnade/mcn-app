@@ -536,7 +536,7 @@ async def _recorded_rank_kols_call_id(
     if db is None or context.step_id is None:
         return None
     args_hash = arguments_hash(args.model_dump())
-    logical = logical_call_id_for(context.run_id, context.step_id, RankKolsTool.name, args_hash)
+    logical = logical_call_id_for(context.run_id, RankKolsTool.name, args_hash)
     row = await db.scalar(select(AgentToolCall).where(AgentToolCall.logical_call_id == logical))
     return row.id if row is not None else None
 

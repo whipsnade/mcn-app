@@ -159,7 +159,7 @@ async def _make_unknown_call(
     db_session, user_id: str, run: AgentRun, step: AgentStep, *, upstream_request_id: str
 ) -> tuple[str, AgentToolCall]:
     args_hash = hashlib.sha256(canonical_json_bytes({"keyword": "美妆"})).hexdigest()
-    logical_id = logical_call_id_for(run.id, step.id, INTERNAL_NAME, args_hash)
+    logical_id = logical_call_id_for(run.id, INTERNAL_NAME, args_hash)
     now = utc_now()
     call = AgentToolCall(
         id=str(uuid4()),
@@ -499,7 +499,7 @@ async def _setup_call_committed(
         db.add(step)
         await db.flush()
         args_hash = hashlib.sha256(canonical_json_bytes({"keyword": "美妆"})).hexdigest()
-        logical_id = logical_call_id_for(run.id, step.id, INTERNAL_NAME, args_hash)
+        logical_id = logical_call_id_for(run.id, INTERNAL_NAME, args_hash)
         call = AgentToolCall(
             id=str(uuid4()),
             run_id=run.id,
@@ -707,7 +707,7 @@ async def _make_call(
 ) -> tuple[str, AgentToolCall]:
     """任意状态的调用行 + 10 分预留（模拟 prepare 已提交后的各种崩溃残留）。"""
     args_hash = hashlib.sha256(canonical_json_bytes({"keyword": "美妆"})).hexdigest()
-    logical_id = logical_call_id_for(run.id, step.id, INTERNAL_NAME, args_hash)
+    logical_id = logical_call_id_for(run.id, INTERNAL_NAME, args_hash)
     call = AgentToolCall(
         id=str(uuid4()),
         run_id=run.id,

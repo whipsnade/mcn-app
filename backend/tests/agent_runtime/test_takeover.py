@@ -422,7 +422,7 @@ async def _seed_unknown_call(
         id=str(uuid4()),
         run_id=run.id,
         step_id=step.id,
-        logical_call_id=logical_call_id_for(run.id, step.id, INTERNAL_NAME, args_hash),
+        logical_call_id=logical_call_id_for(run.id, INTERNAL_NAME, args_hash),
         service=DataTapService.INSIGHT_CUBE.value,
         internal_tool_name=INTERNAL_NAME,
         arguments_json={"keyword": "美妆"},

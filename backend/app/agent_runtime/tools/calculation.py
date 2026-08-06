@@ -225,8 +225,7 @@ async def _record_settled_call(
     except McpValidationError:
         return
     logical_call_id = logical_call_id_for(
-        context.run_id, context.step_id, internal_tool_name, args_hash
-    )
+        context.run_id, internal_tool_name, args_hash)    
     existing = await db.scalar(
         select(AgentToolCall.id).where(AgentToolCall.logical_call_id == logical_call_id)
     )

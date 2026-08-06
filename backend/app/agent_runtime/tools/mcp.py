@@ -671,8 +671,7 @@ class AgentMcpTool:
 
         args_hash = arguments_hash(normalized)
         logical_call_id = logical_call_id_for(
-            context.run_id, context.step_id, self.name, args_hash
-        )
+            context.run_id, self.name, args_hash)        
 
         # 细粒度熔断：只封锁相同 service+tool+参数（§11.2）。
         if not self._breaker.allow(

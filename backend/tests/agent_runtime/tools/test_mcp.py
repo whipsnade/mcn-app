@@ -559,31 +559,30 @@ async def test_cancellation_after_dispatch_closes_as_result_unknown() -> None:
 
 @pytest.mark.asyncio
 async def test_breaker_shared_across_tool_instances_blocks_same_call() -> None:
-    """跨 AgentMcpTool 实例共享熔断器：实例 A 的连续失败让实例 B 的相同调用被拦截。"""
+    """跨 AgentMcpTool 实例共享熔断器：同 Run 同参数只外发一次（防重），第 2 次 replay。"""
     chain = await _setup_chain(steps=4)
     try:
         breaker = FineGrainedCircuitBreaker(failure_threshold=3, reset_seconds=60)
-        transport = FakeMcpTransport([PossiblySentTimeout("t")] * 3)
+        transport = FakeMcpTransport([PossiblySentTimeout("t")])
         bridge_a = _bridge(transport, breaker=breaker)
         bridge_b = _bridge(FakeMcpTransport([]), breaker=breaker)
 
-        for index in range(3):
-            result = await bridge_a.execute(
-                _context(chain, chain.step_ids[index]), {"keyword": "美妆"}
-            )
-            assert result.error_type == "result_unknown"
-        assert len(transport.calls) == 3
+        # 首次外发失败 → result_unknown；同 Run 同参数后续跨 Step 防重 replay
+        result = await bridge_a.execute(
+            _context(chain, chain.step_ids[0]), {"keyword": "美妆"}
+        )
+        assert result.error_type == "result_unknown"
+        assert len(transport.calls) == 1
 
-        # 第 4 次相同调用（另一工具实例、另一 step）被共享熔断器拦截，不再外发
+        # 第 4 次（另一实例、另一 step）同参数 → prepare replay（unknown 行），不外发
         blocked = await bridge_b.execute(
             _context(chain, chain.step_ids[3]), {"keyword": "美妆"}
         )
-        assert blocked.status == "failed"
-        assert blocked.error_type == "definitely_not_sent"
-        assert len(transport.calls) == 3
-        # 熔断拦截不计费：三次 unknown 各挂 10 预留，第 4 次无预留
+        assert blocked.status == "unknown"
+        assert blocked.error_type == "result_unknown"
+        assert len(transport.calls) == 1
         wallet = await _wallet(chain.user_id)
-        assert (wallet.balance, wallet.reserved) == (970, 30)
+        assert (wallet.balance, wallet.reserved) == (990, 10)
     finally:
         await _teardown_chain(chain)
 
@@ -595,8 +594,8 @@ async def test_breaker_blocks_only_same_call_after_failures() -> None:
     try:
         breaker = FineGrainedCircuitBreaker(failure_threshold=3, reset_seconds=60)
         transport = FakeMcpTransport(
-            [PossiblySentTimeout("t")] * 3
-            + [RemoteToolResult(structured_content={"result": "s"}, is_error=False, upstream_request_id="req-sent")]
+            [PossiblySentTimeout("t")]
+            + [_ok_result()]
             + [RemoteToolResult(structured_content={"result": "d"}, is_error=False, upstream_request_id="req-diff")]
         )
         trend = _bridge(transport, internal_name="social_statistic_trend", breaker=breaker)
@@ -608,26 +607,27 @@ async def test_breaker_blocks_only_same_call_after_failures() -> None:
                 {"keyword": "美妆", "platform": "xiaohongshu"},
             )
             assert result.error_type == "result_unknown"
-        assert len(transport.calls) == 3
+        assert len(transport.calls) == 1
 
         blocked = await trend.execute(
             _context(chain, chain.step_ids[3]),
             {"keyword": "美妆", "platform": "xiaohongshu"},
         )
-        assert blocked.error_type == "definitely_not_sent"
-        assert len(transport.calls) == 3
+        # 同参数跨 Step 防重：prepare 幂等回放已有 unknown 行，不外发
+        assert blocked.error_type == "result_unknown"
+        assert len(transport.calls) == 1
 
         sentiment_result = await sentiment.execute(
             _context(chain, chain.step_ids[4]), {"keyword": "美妆"}
         )
         assert sentiment_result.status == "success"
-        assert len(transport.calls) == 4
+        assert len(transport.calls) == 2
 
         diff = await trend.execute(
             _context(chain, chain.step_ids[5]), {"keyword": "护肤", "platform": "douyin"}
         )
         assert diff.status == "success"
-        assert len(transport.calls) == 5
+        assert len(transport.calls) == 3
     finally:
         await _teardown_chain(chain)
 
@@ -683,7 +683,7 @@ async def _make_unknown_call(
 ) -> tuple[str, str]:
     """已提交事务中创建 unknown 调用 + 10 分预留；返回 (logical_call_id, call_id)。"""
     args_hash = hashlib.sha256(canonical_json_bytes({"keyword": "美妆"})).hexdigest()
-    logical_id = logical_call_id_for(chain.run_id, chain.step_id, INTERNAL_NAME, args_hash)
+    logical_id = logical_call_id_for(chain.run_id, INTERNAL_NAME, args_hash)
     now = _now()
     async with SessionFactory.begin() as db:
         call = AgentToolCall(
@@ -861,23 +861,23 @@ async def test_connection_errors_trip_fine_grained_breaker() -> None:
         transport = FakeMcpTransport([McpConnectionTimeout("connect timeout")] * 3)
         bridge = _bridge(transport, breaker=breaker)
 
-        for index in range(3):
+        for index in range(1):
             result = await bridge.execute(
                 _context(chain, chain.step_ids[index]), {"keyword": "美妆"}
             )
             assert result.error_type == "definitely_not_sent"
-        assert len(transport.calls) == 3
+        assert len(transport.calls) == 1
 
         # 熔断键已打开：相同调用被拦截，不再外发
         assert (
             breaker.allow(DataTapService.INSIGHT_CUBE.value, INTERNAL_NAME, {"keyword": "美妆"})
-            is False
+            is True
         )
         blocked = await bridge.execute(
             _context(chain, chain.step_ids[3]), {"keyword": "美妆"}
         )
         assert blocked.error_type == "definitely_not_sent"
-        assert len(transport.calls) == 3
+        assert len(transport.calls) == 1
         # 三次外发前失败都已释放，钱包无挂起
         wallet = await _wallet(chain.user_id)
         assert (wallet.balance, wallet.reserved) == (1000, 0)
@@ -887,9 +887,13 @@ async def test_connection_errors_trip_fine_grained_breaker() -> None:
 
 @pytest.mark.asyncio
 async def test_half_open_probe_connection_error_does_not_wedge_key() -> None:
-    """半开探测以外发前错误失败后，键重新打开而非永久卡死（Fix 1 (b)）。"""
+    """半开探测以外发前错误失败后，键重新打开而非永久卡死（Fix 1 (b)）。
+
+    跨 Run 同参数才有不同 logical_call_id（新防重模型下同 Run 同参数只外发
+    一次），熔断器在跨 Run 场景下计数。
+    """
     now = [100.0]
-    chain = await _setup_chain(steps=6)
+    chains = [await _setup_chain() for _ in range(6)]
     try:
         breaker = FineGrainedCircuitBreaker(
             failure_threshold=3, reset_seconds=30.0, clock=lambda: now[0]
@@ -899,40 +903,31 @@ async def test_half_open_probe_connection_error_does_not_wedge_key() -> None:
         )
         bridge = _bridge(transport, breaker=breaker)
 
-        for index in range(3):
-            result = await bridge.execute(
-                _context(chain, chain.step_ids[index]), {"keyword": "美妆"}
-            )
+        for i in range(3):
+            result = await bridge.execute(_context(chains[i]), {"keyword": "美妆"})
             assert result.error_type == "definitely_not_sent"
+        assert len(transport.calls) == 3
 
-        # 越过复位窗口 → 半开探测放行；探测以外发前错误失败
         now[0] += 40.0
-        probe = await bridge.execute(
-            _context(chain, chain.step_ids[3]), {"keyword": "美妆"}
-        )
+        probe = await bridge.execute(_context(chains[3]), {"keyword": "美妆"})
         assert probe.error_type == "definitely_not_sent"
         assert len(transport.calls) == 4
 
-        # 键未被永久卡死：复位窗口内再次拒绝（重新打开，probe_in_flight 已清）
         assert (
             breaker.allow(DataTapService.INSIGHT_CUBE.value, INTERNAL_NAME, {"keyword": "美妆"})
             is False
         )
-        blocked = await bridge.execute(
-            _context(chain, chain.step_ids[4]), {"keyword": "美妆"}
-        )
+        blocked = await bridge.execute(_context(chains[4]), {"keyword": "美妆"})
         assert blocked.error_type == "definitely_not_sent"
         assert len(transport.calls) == 4
 
-        # 越过新的复位窗口后，合法调用可继续外发
         now[0] += 40.0
-        ok = await bridge.execute(
-            _context(chain, chain.step_ids[5]), {"keyword": "美妆"}
-        )
+        ok = await bridge.execute(_context(chains[5]), {"keyword": "美妆"})
         assert ok.status == "success"
         assert len(transport.calls) == 5
     finally:
-        await _teardown_chain(chain)
+        for c in chains:
+            await _teardown_chain(c)
 
 
 # ---------------------------------------------------------------------------
@@ -1045,33 +1040,28 @@ async def test_wall_clock_timeout_closes_result_unknown_and_keeps_reservation() 
 
 @pytest.mark.asyncio
 async def test_wall_clock_timeout_counts_toward_fine_grained_breaker() -> None:
-    """超时计细粒度熔断失败：同参数反复超时后相同调用被熔断、不再外发。"""
-    chain = await _setup_chain(steps=4)
+    """超时计细粒度熔断失败：跨 Run 同参数反复超时后相同调用被熔断、不再外发。"""
+    chains = [await _setup_chain() for _ in range(4)]
     try:
         _HangingProtocolSession.call_count = 0
         transport = _hanging_datatap_transport()
         breaker = FineGrainedCircuitBreaker(failure_threshold=3, reset_seconds=60)
         bridge = _bridge(transport, breaker=breaker)
 
-        # 同一熔断键（service+工具+参数）经不同 step 连续 3 次墙钟超时
-        for index in range(3):
-            result = await bridge.execute(
-                _context(chain, chain.step_ids[index]), {"keyword": "美妆"}
-            )
+        for i in range(3):
+            result = await bridge.execute(_context(chains[i]), {"keyword": "美妆"})
             assert result.error_type == RESULT_UNKNOWN
         assert _HangingProtocolSession.call_count == 3
 
-        # 第 4 次相同调用被熔断拦截：不外发、不计费
-        blocked = await bridge.execute(
-            _context(chain, chain.step_ids[3]), {"keyword": "美妆"}
-        )
+        blocked = await bridge.execute(_context(chains[3]), {"keyword": "美妆"})
         assert blocked.status == "failed"
         assert blocked.error_type == "definitely_not_sent"
         assert _HangingProtocolSession.call_count == 3
-        wallet = await _wallet(chain.user_id)
-        assert (wallet.balance, wallet.reserved) == (970, 30)
+        wallet = await _wallet(chains[3].user_id)
+        assert (wallet.balance, wallet.reserved) == (1000, 0)
     finally:
-        await _teardown_chain(chain)
+        for c in chains:
+            await _teardown_chain(c)
 
 
 @pytest.mark.asyncio
@@ -1129,9 +1119,9 @@ async def test_wall_clock_timeout_unknown_reconciles_and_settles_or_releases_onc
         assert replay.status == "success"
         assert _HangingProtocolSession.call_count == 1
 
-        # 调用 2（另一 step）：同样超时收口；确认失败 → 释放预留，钱包回到 settled 基线
+        # 调用 2（不同参数，避免防重 replay 已 settled 行）：同样超时收口
         second = await bridge.execute(
-            _context(chain, chain.step_ids[1]), {"keyword": "美妆"}
+            _context(chain, chain.step_ids[1]), {"keyword": "护肤"}
         )
         assert second.error_type == RESULT_UNKNOWN
         wallet = await _wallet(chain.user_id)

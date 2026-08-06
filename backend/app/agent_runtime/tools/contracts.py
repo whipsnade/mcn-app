@@ -91,10 +91,16 @@ def arguments_hash(normalized_arguments: Mapping[str, Any]) -> str:
 
 
 def logical_call_id_for(
-    run_id: str, step_id: str, internal_tool_name: str, arguments_hash: str
+    run_id: str, internal_tool_name: str, arguments_hash: str
 ) -> str:
-    """确定性派生全局唯一 logical_call_id（§8.1）。"""
-    raw = "\x00".join((run_id, step_id, internal_tool_name, arguments_hash))
+    """确定性派生全局唯一 logical_call_id（§8.1）。
+
+    不含 ``step_id``：同一 Run 内相同工具 + 参数无论发起自哪个 Step 都产生
+    同一 logical_call_id，使 ``prepare`` 幂等命中已有行、拦截跨 Step 重放
+    （Gate B 审查 Critical：原含 ``step_id`` 时换 Step 可绕过防重，
+    ``result_unknown`` 会被再次外发并重复预留积分）。
+    """
+    raw = "\x00".join((run_id, internal_tool_name, arguments_hash))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
