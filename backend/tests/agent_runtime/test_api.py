@@ -16,6 +16,7 @@ import asyncio
 from datetime import timedelta
 from uuid import uuid4
 
+import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import delete, func, select, update
@@ -1950,3 +1951,71 @@ async def test_retry_context_only_frozen_evidence(agent_client_factory, db_sessi
     assert context_refs
     # Context 只含新快照冻结的 Evidence。
     assert {ref["evidence_id"] for ref in context_refs} == frozen_evidence_ids
+
+
+# ---------------------------------------------------------------------------
+# P2: upload_refs 容器本身校验（非 list 不 500，合法元素保留）
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "bad_container",
+    [
+        123,
+        {},
+        "bad",
+        None,
+    ],
+)
+async def test_retry_upload_refs_non_list_container_no_500(
+    agent_client_factory, db_session, bad_container
+) -> None:
+    """upload_refs 为 123/{}/'bad'/null 时 retry 不抛 500，合法上传仍冻结。"""
+    alice, _ = await agent_client_factory("13600000301")
+    session_id = await _create_session(alice)
+    user_id = await _me_id(alice)
+    failed = await _add_run(
+        db_session,
+        user_id,
+        session_id,
+        status="failed",
+        prompt_snapshot_json={"upload_refs": bad_container},
+    )
+
+    resp = await alice.post(f"/api/v1/agent/runs/{failed.id}/retry")
+    assert resp.status_code == 201, resp.text
+    retried = await db_session.get(AgentRun, resp.json()["run_id"])
+    refs = (retried.prompt_snapshot_json or {}).get("upload_refs")
+    # 非 list 容器被剔除，但合法上传我们单独验证（见下测）；此处无有效引用则不冻结。
+    assert refs is None or refs == []
+
+
+async def test_retry_upload_refs_mixed_damaged_and_valid_container(
+    agent_client_factory, db_session
+) -> None:
+    """upload_refs=[损坏元素, 合法元素] 不 500，合法元素保留。"""
+    alice, _ = await agent_client_factory("13600000302")
+    session_id = await _create_session(alice)
+    user_id = await _me_id(alice)
+    valid_upload = await _seed_upload(db_session, user_id, session_id)
+    failed = await _add_run(
+        db_session,
+        user_id,
+        session_id,
+        status="failed",
+        prompt_snapshot_json={
+            "upload_refs": [
+                "corrupt-str",
+                {"bad": 1},
+                None,
+                {"upload_id": valid_upload, "evidence_id": "e1", "filename": "a.csv", "sha256": "a"},
+            ]
+        },
+    )
+
+    resp = await alice.post(f"/api/v1/agent/runs/{failed.id}/retry")
+    assert resp.status_code == 201, resp.text
+    retried = await db_session.get(AgentRun, resp.json()["run_id"])
+    refs = (retried.prompt_snapshot_json or {}).get("upload_refs")
+    assert refs is not None
+    assert [ref["upload_id"] for ref in refs] == [valid_upload]

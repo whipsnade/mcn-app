@@ -1032,8 +1032,10 @@ async def retry_run(
         retried_snapshot["parent_run_id"] = original_snapshot["parent_run_id"]
     # 重新验证并冻结 upload_refs（Gate B P1）：不复制旧快照，重新调用同一
     # 冻结函数，剔除失效/越权/不可用引用；无有效引用则不带 upload_refs。
-    # 先解析旧快照（损坏引用只剔除，不抛 KeyError），再逐条 drop 校验。
-    original_upload_refs = original_snapshot.get("upload_refs") or []
+    # 先校验容器本身是 list（upload_refs=123/{} 等非 list 只剔除，不抛 TypeError），
+    # 再逐条校验元素（损坏引用只剔除，不抛 KeyError），最后逐条 drop 校验。
+    raw_upload_refs = original_snapshot.get("upload_refs")
+    original_upload_refs = raw_upload_refs if isinstance(raw_upload_refs, list) else []
     valid_original_ids: list[str] = []
     for ref in original_upload_refs:
         if (
