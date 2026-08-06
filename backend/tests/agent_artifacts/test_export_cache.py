@@ -6,6 +6,9 @@
 
 from __future__ import annotations
 
+import asyncio
+from datetime import UTC, datetime
+from uuid import uuid4
 
 import pytest
 from sqlalchemy import select
@@ -16,6 +19,10 @@ from app.agent_artifacts.models import ArtifactExport
 from app.agent_artifacts.router import ExportCacheService as _  # noqa: F401
 
 from tests.agent_artifacts.test_payloads import build_brand_dict, build_kol_selection_dict
+
+
+def _now() -> datetime:
+    return datetime.now(UTC).replace(tzinfo=None)
 
 
 class _CountingRenderer:
@@ -205,3 +212,306 @@ def test_sanitize_filename_strips_unsafe_chars() -> None:
     assert sanitize_filename("a/b\\c:d?.xlsx") == "a_b_c_d_.xlsx"
     assert sanitize_filename("brand_report_v1.xlsx") == "brand_report_v1.xlsx"
     assert sanitize_filename("...") == "artifact"
+
+
+# ---------------------------------------------------------------------------
+# Gate C 审核修复 A5：真实并发 / 取消接管 / stale 恢复 / 文件校验
+# ---------------------------------------------------------------------------
+
+
+async def _make_version_committed(payload: dict) -> tuple[str, str]:
+    """用真实 SessionFactory 提交完整 version 链；返回 (version.id, user.id)。"""
+    import json as _json
+    from datetime import UTC, datetime
+    from uuid import uuid4
+
+    from app.agent_artifacts.models import (
+        AgentArtifact,
+        AgentArtifactVersion,
+        ArtifactDraft,
+        ArtifactDraftRevision,
+    )
+    from app.agent_runtime.models import AgentRun, AgentSession
+    from app.identity.models import User
+    from app.db.session import SessionFactory
+
+    now = datetime.now(UTC).replace(tzinfo=None)
+    payload_json = _json.loads(_json.dumps(payload, default=str))
+    async with SessionFactory.begin() as db:
+        user = User(id=str(uuid4()), nickname="cache-conc", role="user", status="active",
+                    created_at=now, updated_at=now)
+        db.add(user)
+        await db.flush()
+        session = AgentSession(id=str(uuid4()), user_id=user.id, title="缓存并发",
+                               status="active", created_at=now, updated_at=now)
+        db.add(session)
+        await db.flush()
+        run = AgentRun(id=str(uuid4()), session_id=session.id, user_id=user.id,
+                       run_kind="user", visibility="user", profile_name="session_analyst_v1",
+                       profile_version="v1", model="t", status="running", started_at=now)
+        db.add(run)
+        await db.flush()
+        artifact = AgentArtifact(
+            id=str(uuid4()), session_id=session.id, user_id=user.id, module="brand",
+            artifact_type="brand_report_v3", parent_artifact_id=None,
+            artifact_key="brand/x-c", status="published", latest_version=1,
+            activity_sequence=0, created_at=now, updated_at=now,
+        )
+        db.add(artifact)
+        await db.flush()
+        draft = ArtifactDraft(
+            id=str(uuid4()), artifact_id=artifact.id, session_id=session.id,
+            owner_run_id=run.id, current_revision=1, status="idle",
+            review_count=0, revision_count=1, updated_at=now,
+        )
+        db.add(draft)
+        await db.flush()
+        revision = ArtifactDraftRevision(
+            id=str(uuid4()), draft_id=draft.id, artifact_id=artifact.id,
+            run_id=run.id, revision=1, schema_version="brand_report_v3",
+            payload_json=payload_json, payload_hash="h" * 64, created_at=now,
+        )
+        db.add(revision)
+        await db.flush()
+        version = AgentArtifactVersion(
+            id=str(uuid4()), artifact_id=artifact.id, version=1,
+            source_run_id=run.id, source_draft_revision_id=revision.id,
+            schema_version="brand_report_v3", payload_json=payload_json,
+            data_status="complete", created_at=now,
+        )
+        db.add(version)
+        await db.flush()
+        return version.id, user.id
+
+
+async def test_real_concurrent_sessions_render_once(tmp_path) -> None:
+    """两个独立 SessionFactory 连接并发：只渲染一次。"""
+    from app.db.session import SessionFactory
+
+
+    payload = build_brand_dict()
+    version_id, user_id = await _make_version_committed(payload)
+    renderer = _CountingRenderer(payload)
+
+    async def _build():
+        async with SessionFactory() as db:
+            service = ExportCacheService(
+                db, storage_dir=str(tmp_path), renderer=renderer
+            )
+            return await service.get_or_build(
+                artifact_version_id=version_id, schema_version="brand_report_v3",
+                payload=payload, filename="a.xlsx",
+            )
+
+    results = await asyncio.gather(_build(), _build())
+    assert results[0].sha256 == results[1].sha256
+    assert renderer.call_count == 1
+    await _purge_committed(user_id)
+
+
+async def test_cancelled_owner_then_takeover(tmp_path) -> None:
+    """owner 任务取消后，后续请求能接管并成功。"""
+    from app.db.session import SessionFactory
+
+
+    payload = build_brand_dict()
+    version_id, user_id = await _make_version_committed(payload)
+
+    def _hanging_renderer(payload):
+        import time
+
+        time.sleep(10)  # 阻塞线程挂起（to_thread 等待点可被取消）
+        return b"never"
+
+    async def _owner():
+        async with SessionFactory() as db:
+            service = ExportCacheService(
+                db, storage_dir=str(tmp_path), renderer=_hanging_renderer,
+                lease_seconds=60,
+            )
+            await service.get_or_build(
+                artifact_version_id=version_id, schema_version="brand_report_v3",
+                payload=payload, filename="a.xlsx",
+            )
+
+    owner_task = asyncio.create_task(_owner())
+    await asyncio.sleep(0.4)  # owner 进入渲染（building 行已提交）
+    owner_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await owner_task
+
+    # 后续请求接管（cancelled → failed 或 stale building 均可恢复）。
+    renderer = _CountingRenderer(payload)
+    async with SessionFactory() as db:
+        service = ExportCacheService(
+            db, storage_dir=str(tmp_path), renderer=renderer, lease_seconds=0.01
+        )
+        result = await service.get_or_build(
+            artifact_version_id=version_id, schema_version="brand_report_v3",
+            payload=payload, filename="a.xlsx",
+        )
+    assert result.content == b"PK-export-content"
+    await _purge_committed(user_id)
+
+
+async def test_stale_building_row_is_taken_over(tmp_path) -> None:
+    """预置过期 building 行，后续请求能够恢复。"""
+    from datetime import timedelta
+
+    from app.db.session import SessionFactory
+
+
+    payload = build_brand_dict()
+    version_id, user_id = await _make_version_committed(payload)
+    # 预置 600 秒前的 building 行（超出租约）。
+    from app.agent_artifacts.export_cache import _now as cache_now
+
+    async with SessionFactory.begin() as db:
+        db.add(ArtifactExport(
+            id=str(uuid4()), artifact_version_id=version_id,
+            template_version="brand_report_v3", status="building",
+            created_at=cache_now() - timedelta(seconds=600),
+        ))
+    renderer = _CountingRenderer(payload)
+    async with SessionFactory() as db:
+        service = ExportCacheService(
+            db, storage_dir=str(tmp_path), renderer=renderer, lease_seconds=60
+        )
+        result = await service.get_or_build(
+            artifact_version_id=version_id, schema_version="brand_report_v3",
+            payload=payload, filename="a.xlsx",
+        )
+    assert result.content == b"PK-export-content"
+    assert renderer.call_count == 1
+    await _purge_committed(user_id)
+
+
+async def test_ready_file_deleted_rebuilds(tmp_path) -> None:
+    """ready 文件被删除后可重新生成。"""
+    from app.db.session import SessionFactory
+
+
+    payload = build_brand_dict()
+    version_id, user_id = await _make_version_committed(payload)
+    renderer = _CountingRenderer(payload)
+    async with SessionFactory() as db:
+        service = ExportCacheService(db, storage_dir=str(tmp_path), renderer=renderer)
+        await service.get_or_build(
+            artifact_version_id=version_id, schema_version="brand_report_v3",
+            payload=payload, filename="a.xlsx",
+        )
+    # 删除缓存文件（模拟存储丢失）。
+    for path in tmp_path.glob("*.xlsx"):
+        path.unlink()
+    async with SessionFactory() as db:
+        service = ExportCacheService(db, storage_dir=str(tmp_path), renderer=renderer)
+        second = await service.get_or_build(
+            artifact_version_id=version_id, schema_version="brand_report_v3",
+            payload=payload, filename="a.xlsx",
+        )
+    assert second.content == b"PK-export-content"
+    assert renderer.call_count == 2  # 文件丢失 → 重建
+    await _purge_committed(user_id)
+
+
+async def test_cache_hit_does_not_call_renderer(tmp_path) -> None:
+    """缓存命中不调用 renderer。"""
+    from app.db.session import SessionFactory
+
+
+    payload = build_brand_dict()
+    version_id, user_id = await _make_version_committed(payload)
+    renderer = _CountingRenderer(payload)
+    async with SessionFactory() as db:
+        service = ExportCacheService(db, storage_dir=str(tmp_path), renderer=renderer)
+        await service.get_or_build(
+            artifact_version_id=version_id, schema_version="brand_report_v3",
+            payload=payload, filename="a.xlsx",
+        )
+        assert renderer.call_count == 1
+        await service.get_or_build(
+            artifact_version_id=version_id, schema_version="brand_report_v3",
+            payload=payload, filename="a.xlsx",
+        )
+        assert renderer.call_count == 1  # 命中不渲染
+    await _purge_committed(user_id)
+
+
+async def _purge_committed(user_id: str) -> None:
+    """按 FK 顺序清理真实提交的测试链（export_cache 并发测试专用）。"""
+    from app.agent_artifacts.models import (
+        AgentArtifact,
+        AgentArtifactVersion,
+        ArtifactDraft,
+        ArtifactDraftRevision,
+    )
+    from app.agent_runtime.models import AgentRun, AgentSession
+    from app.identity.models import User
+    from app.db.session import SessionFactory
+
+    async with SessionFactory() as db:
+        artifact_ids = list(
+            (
+                await db.scalars(
+                    select(AgentArtifact.id).where(AgentArtifact.user_id == user_id)
+                )
+            ).all()
+        )
+        version_ids = list(
+            (
+                await db.scalars(
+                    select(AgentArtifactVersion.id).where(
+                        AgentArtifactVersion.artifact_id.in_(artifact_ids)
+                    )
+                )
+            ).all()
+        )
+        if version_ids:
+            for row in (
+                await db.scalars(
+                    select(ArtifactExport).where(
+                        ArtifactExport.artifact_version_id.in_(version_ids)
+                    )
+                )
+            ).all():
+                await db.delete(row)
+            for row in (
+                await db.scalars(
+                    select(AgentArtifactVersion).where(
+                        AgentArtifactVersion.artifact_id.in_(artifact_ids)
+                    )
+                )
+            ).all():
+                await db.delete(row)
+        for row in (
+            await db.scalars(
+                select(ArtifactDraftRevision).where(
+                    ArtifactDraftRevision.artifact_id.in_(artifact_ids)
+                )
+            )
+        ).all():
+            await db.delete(row)
+        for row in (
+            await db.scalars(
+                select(ArtifactDraft).where(ArtifactDraft.artifact_id.in_(artifact_ids))
+            )
+        ).all():
+            await db.delete(row)
+        for row in (
+            await db.scalars(
+                select(AgentArtifact).where(AgentArtifact.user_id == user_id)
+            )
+        ).all():
+            await db.delete(row)
+        for row in (
+            await db.scalars(select(AgentRun).where(AgentRun.user_id == user_id))
+        ).all():
+            await db.delete(row)
+        for row in (
+            await db.scalars(select(AgentSession).where(AgentSession.user_id == user_id))
+        ).all():
+            await db.delete(row)
+        user = await db.get(User, user_id)
+        if user is not None:
+            await db.delete(user)
+        await db.commit()

@@ -1,12 +1,17 @@
-"""Excel 导出缓存服务（Gate C Task 6 / 设计 §11.5）。
+"""Excel 导出缓存服务（Gate C Task 6 / 审核修复 A5）。
 
 同一 ``(artifact_version_id, template_version)`` 只构建一次：
 
 - ``get_or_build`` 用行锁 + 唯一约束串行化并发（后到者等待先到者提交后读到
   ready 行直接复用）；
-- 渲染在线程执行（openpyxl 同步 CPU 密集），先写临时文件再原子 rename；
-- 失败行落 ``failed`` + error_code，可安全重试（重试覆盖为 building）；
-- 导出失败绝不调用模型/MCP（渲染器是纯表现层）；
+- **building 租约**：超过 ``_BUILD_LEASE_SECONDS`` 未完成的 building 行视为
+  stale，后续请求在行锁下接管重建（构建请求被取消/线程异常/写文件失败/
+  _mark_ready 失败都不会永久卡住）；
+- ``asyncio.CancelledError`` 安全收尾（标记 failed 可接管）后重新抛出；
+- ready 行对应文件丢失或 hash 不匹配 → 标记失效并重建；
+- 每次循环前 ``expire_all()``，等待方重新从数据库读最新状态；
+- 文件写入成功但数据库更新失败 → 清理孤儿文件并标记 failed（可恢复）；
+- 失败重试只重做 Excel 导出，绝不调用模型/MCP；
 - 只暴露 filename/sha256/size，不暴露 storage_key。
 """
 
@@ -23,7 +28,7 @@ from typing import Any
 from uuid import uuid4
 
 from sqlalchemy import select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_artifacts.exporters import ArtifactExportUnsupported, export_artifact
@@ -32,6 +37,10 @@ from app.core.config import get_settings
 
 # 导出文件名清洗：只保留安全字符，防止路径穿越/注入。
 _FILENAME_UNSAFE = re.compile(r"[^0-9A-Za-z._\-]")
+# building 租约：超过该时长视为 stale，可被接管重建。
+_BUILD_LEASE_SECONDS = 300.0
+# 等待 building 完成的重试间隔。
+_WAIT_RETRY_SECONDS = 0.05
 
 
 def sanitize_filename(name: str) -> str:
@@ -67,11 +76,13 @@ class ExportCacheService:
         *,
         storage_dir: str | None = None,
         renderer: Any | None = None,
+        lease_seconds: float | None = None,
     ) -> None:
         settings = get_settings()
         self._db = db_session
         self._storage_dir = Path(storage_dir or settings.agent_export_storage_dir)
         self._renderer = renderer  # 测试注入渲染桩；None 用 export_artifact
+        self._lease_seconds = lease_seconds if lease_seconds is not None else _BUILD_LEASE_SECONDS
 
     async def get_or_build(
         self,
@@ -85,29 +96,56 @@ class ExportCacheService:
         template_version = _template_version_for(schema_version)
         self._storage_dir.mkdir(parents=True, exist_ok=True)
         while True:
-            row = await self._db.scalar(
-                select(ArtifactExport)
-                .where(
-                    ArtifactExport.artifact_version_id == artifact_version_id,
-                    ArtifactExport.template_version == template_version,
+            # 等待方必须重新读取最新状态（identity map 旧对象会永久卡住）；
+            # 用 populate_existing 强制重读 ArtifactExport 行，不波及调用方
+            # 持有的其他 ORM 对象。
+            try:
+                row = await self._db.scalar(
+                    select(ArtifactExport)
+                    .where(
+                        ArtifactExport.artifact_version_id == artifact_version_id,
+                        ArtifactExport.template_version == template_version,
+                    )
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
                 )
-                .with_for_update()
-            )
-            if row is not None and row.status == "ready" and row.sha256 and row.filename:
-                content = await asyncio.to_thread(
-                    self._read_file, self._storage_dir / row.storage_key
-                )
-                return ExportedFile(
-                    filename=row.filename,
-                    sha256=row.sha256,
-                    size_bytes=row.size_bytes or 0,
-                    content=content,
-                )
-            if row is not None and row.status == "building":
-                await self._db.commit()  # 释放行锁，等待构建方提交后重读。
-                await asyncio.sleep(0.05)
+            except OperationalError:
+                # 并发 gap-lock 死锁：回滚后重试。
+                await self._db.rollback()
                 continue
-            if row is None:
+            now = _now()
+            if row is not None and row.status == "ready" and row.sha256 and row.filename:
+                path = self._storage_dir / row.storage_key
+                if path.exists():
+                    content = await asyncio.to_thread(self._read_file, path)
+                    if hashlib.sha256(content).hexdigest() == row.sha256:
+                        return ExportedFile(
+                            filename=row.filename,
+                            sha256=row.sha256,
+                            size_bytes=row.size_bytes or 0,
+                            content=content,
+                        )
+                # 文件丢失或 hash 不匹配：标记失效，重建。
+                row.status = "building"
+                row.error_code = None
+                row.sha256 = None
+                row.storage_key = None
+                row.size_bytes = None
+                row.completed_at = None
+                row.created_at = now
+                await self._db.commit()
+            elif row is not None and row.status == "building":
+                stale_seconds = (now - row.created_at).total_seconds()
+                if stale_seconds < self._lease_seconds:
+                    # 租约内：等待构建方完成。
+                    await self._db.commit()
+                    await asyncio.sleep(_WAIT_RETRY_SECONDS)
+                    continue
+                # stale building：接管重建（刷新租约）。
+                row.created_at = now
+                row.completed_at = None
+                await self._db.commit()
+            elif row is None:
                 row = ArtifactExport(
                     id=str(uuid4()),
                     artifact_version_id=artifact_version_id,
@@ -118,7 +156,7 @@ class ExportCacheService:
                     sha256=None,
                     size_bytes=None,
                     error_code=None,
-                    created_at=_now(),
+                    created_at=now,
                 )
                 self._db.add(row)
                 try:
@@ -126,24 +164,34 @@ class ExportCacheService:
                 except IntegrityError:
                     await self._db.rollback()  # 并发撞唯一约束 → 重读 ready。
                     continue
+                except OperationalError:
+                    await self._db.rollback()  # 并发死锁 → 重试。
+                    continue
             else:
-                # failed 行：覆盖为 building 重试。
+                # failed 行：覆盖为 building 重试（刷新租约）。
                 row.status = "building"
                 row.error_code = None
                 row.filename = None
                 row.storage_key = None
                 row.sha256 = None
                 row.size_bytes = None
-                row.created_at = _now()
+                row.created_at = now
                 row.completed_at = None
                 await self._db.commit()
 
-            # 本调用负责渲染（已持有 building 行）。
+            # 本调用负责渲染（已持有 building 行 + 有效租约）。
             try:
                 content = await asyncio.to_thread(
                     self._render, schema_version, payload, filename
                 )
-            except (ArtifactExportUnsupported, Exception) as exc:
+            except asyncio.CancelledError:
+                # 取消必须安全收尾（标记 failed 可接管）后重新抛出。
+                await self._db.rollback()
+                await self._mark_failed(
+                    artifact_version_id, template_version, error_code="export_cancelled"
+                )
+                raise
+            except Exception as exc:
                 await self._db.rollback()
                 await self._mark_failed(
                     artifact_version_id,
@@ -153,18 +201,29 @@ class ExportCacheService:
                 raise
             safe_name = sanitize_filename(filename)
             storage_key = f"{artifact_version_id[:8]}-{uuid4().hex[:12]}.xlsx"
-            await asyncio.to_thread(
-                self._write_atomic,
-                self._storage_dir / storage_key,
-                content,
-            )
-            await self._mark_ready(
-                artifact_version_id,
-                template_version,
-                filename=safe_name,
-                storage_key=storage_key,
-                content=content,
-            )
+            path = self._storage_dir / storage_key
+            try:
+                await asyncio.to_thread(self._write_atomic, path, content)
+            except Exception:
+                await self._mark_failed(
+                    artifact_version_id, template_version, error_code="export_write_failed"
+                )
+                raise
+            try:
+                await self._mark_ready(
+                    artifact_version_id,
+                    template_version,
+                    filename=safe_name,
+                    storage_key=storage_key,
+                    content=content,
+                )
+            except Exception:
+                # 文件已写但 DB 更新失败：清理孤儿文件，标记 failed（可恢复）。
+                await asyncio.to_thread(self._delete_file, path)
+                await self._mark_failed(
+                    artifact_version_id, template_version, error_code="export_db_failed"
+                )
+                raise
             return ExportedFile(
                 filename=safe_name,
                 sha256=hashlib.sha256(content).hexdigest(),
@@ -189,10 +248,12 @@ class ExportCacheService:
         self, artifact_version_id: str, template_version: str, *, error_code: str
     ) -> None:
         row = await self._db.scalar(
-            select(ArtifactExport).where(
+            select(ArtifactExport)
+            .where(
                 ArtifactExport.artifact_version_id == artifact_version_id,
                 ArtifactExport.template_version == template_version,
             )
+            .execution_options(populate_existing=True)
         )
         if row is not None:
             row.status = "failed"
@@ -210,10 +271,12 @@ class ExportCacheService:
         content: bytes,
     ) -> None:
         row = await self._db.scalar(
-            select(ArtifactExport).where(
+            select(ArtifactExport)
+            .where(
                 ArtifactExport.artifact_version_id == artifact_version_id,
                 ArtifactExport.template_version == template_version,
             )
+            .execution_options(populate_existing=True)
         )
         if row is not None:
             row.status = "ready"
@@ -233,6 +296,13 @@ class ExportCacheService:
         temp = path.with_suffix(".tmp")
         temp.write_bytes(content)
         os.replace(temp, path)
+
+    @staticmethod
+    def _delete_file(path: Path) -> None:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 class _VersionLike:
