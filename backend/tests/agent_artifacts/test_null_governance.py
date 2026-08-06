@@ -84,6 +84,12 @@ def test_governed_sections_are_known_data_fields() -> None:
             "content_types",
             "sentiment",
             "top_posts",
+            "comparisons",
+            "attribution",
+            "organic_summary",
+            "audience_regions",
+            "internal_metrics",
+            "roi",
         },
         KolSelectionV3: {"scoring", "items", "summary"},
         KolAnalysisV2: {

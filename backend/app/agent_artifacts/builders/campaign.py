@@ -48,8 +48,10 @@ from app.agent_artifacts.builders.raw_rows import (
     LIKE_KEYS,
     PLATFORM_KEYS,
     POST_DATE_KEYS,
+    REGION_KEYS,
     SENTIMENT_KEYS,
     SHARE_KEYS,
+    VOLUME_KEYS,
     RowRef,
     canon_platform,
     extract_rows,
@@ -74,11 +76,26 @@ from app.agent_artifacts.payloads.common import iter_null_numeric_paths
 
 SCHEMA_VERSION = "campaign_report_v2"
 
-# Evidence 分组键（工具入参 evidence 的合法键）。
+# Evidence 分组键（工具入参 evidence 的合法键）。posts/sentiment 为既有分组；
+# Gate C Task 4 增加 current/baseline/post（周期对比）/ social（社媒）/ upload
+# （用户补充资料：成本/转化/内部指标）。
 GROUP_POSTS = "posts"
 GROUP_SENTIMENT = "sentiment"
+GROUP_CURRENT = "current"
+GROUP_BASELINE = "baseline"
+GROUP_POST = "post"
+GROUP_SOCIAL = "social"
+GROUP_UPLOAD = "upload"
 
-EVIDENCE_GROUPS = (GROUP_POSTS, GROUP_SENTIMENT)
+EVIDENCE_GROUPS = (
+    GROUP_POSTS,
+    GROUP_SENTIMENT,
+    GROUP_CURRENT,
+    GROUP_BASELINE,
+    GROUP_POST,
+    GROUP_SOCIAL,
+    GROUP_UPLOAD,
+)
 
 _SECTION_ORDER = (
     "overview",
@@ -88,9 +105,23 @@ _SECTION_ORDER = (
     "content_types",
     "sentiment",
     "top_posts",
+    "comparisons",
+    "attribution",
+    "organic_summary",
+    "audience_regions",
+    "internal_metrics",
+    "roi",
 )
 
 _KOL_LIMIT = 20
+
+# 用户补充资料（upload）行的成本/转化/内部指标键。
+SPEND_KEYS = ("投放金额", "花费", "消耗", "成本", "spend", "cost")
+IMPRESSION_KEYS = ("曝光", "曝光数", "展示", "impressions", "views")
+CONVERSION_KEYS = ("转化", "转化数", "转化量", "成交数", "conversions", "conversion")
+REVENUE_KEYS = ("销售额", "销售金额", "收入", "GMV", "revenue", "sales")
+# 帖子的付费/自然归属键。
+ATTRIBUTION_KEYS = ("归属", "是否付费", "投放类型", "付费/自然", "attribution")
 
 
 def _extract_group(pairs: list[tuple[str, Any]] | None) -> list[RowRef]:
@@ -439,6 +470,256 @@ def _assemble_availability(
 
 
 # ---------------------------------------------------------------------------
+# Gate C Task 4：对比/归属/自然传播/受众/内部指标/ROI 章节
+# ---------------------------------------------------------------------------
+
+
+def _group_totals(rows: list[RowRef]) -> dict[str, int | None]:
+    """按行聚合 volume/engagement/posts/creators 四指标（社媒口径）。"""
+    totals = {"volume": 0, "engagement": 0, "posts": 0}
+    creator_ids: set[str] = set()
+    for ref in rows:
+        row = ref.row
+        volume = whole(first(row, VOLUME_KEYS))
+        engagement = whole(first(row, ENGAGEMENT_KEYS))
+        if volume is not None:
+            totals["volume"] += volume
+        if engagement is not None:
+            totals["engagement"] += engagement
+        totals["posts"] += 1
+        author_id = _row_author_id(row)
+        if author_id is not None:
+            creator_ids.add(author_id)
+    return {"volume": totals["volume"], "engagement": totals["engagement"], "posts": totals["posts"], "creators": len(creator_ids)}
+
+
+def _rate_change(current: float | None, baseline: float | None) -> float | None:
+    if current is None or baseline is None or baseline == 0:
+        return None
+    return round((current - baseline) / baseline, 4)
+
+
+def _comparison_series(
+    metric: str, current: int | None, baseline: int | None
+) -> dict[str, Any]:
+    return {
+        "metric": metric,
+        "current": current,
+        "baseline": baseline,
+        "delta": round(current - baseline, 2) if current is not None and baseline is not None else None,
+        "rate": _rate_change(current, baseline),
+    }
+
+
+def _build_comparisons(
+    current_rows: list[RowRef],
+    baseline_rows: list[RowRef],
+    post_rows: list[RowRef],
+    collector: LineageCollector,
+) -> tuple[dict[str, Any], bool]:
+    """活动期 vs 活动前（current_baseline）/ 活动后观察期（current_post）。
+
+    current 分组缺省时回退 posts/social（DataTap 口径）；对比只在对应分组有
+    行时生成，绝不估算。
+    """
+    current_totals = _group_totals(current_rows)
+    baseline_totals = _group_totals(baseline_rows)
+    post_totals = _group_totals(post_rows)
+    has_rows = bool(current_rows or baseline_rows or post_rows)
+    metrics = ("volume", "engagement", "posts", "creators")
+
+    def _series_rows(metric: str, rows: list[RowRef]) -> list[RowRef]:
+        return rows
+
+    current_baseline = [
+        _comparison_series(metric, current_totals[metric], baseline_totals[metric])
+        for metric in metrics
+    ]
+    current_post = [
+        _comparison_series(metric, current_totals[metric], post_totals[metric])
+        for metric in metrics
+    ]
+    # lineage 只登记 payload 真实叶子（current/baseline/delta/rate）；空系列不登记。
+    for series_name, series, rows in (
+        ("current_baseline", current_baseline, baseline_rows),
+        ("current_post", current_post, post_rows),
+    ):
+        if not rows:
+            continue
+        for index, entry in enumerate(series):
+            for field in ("current", "baseline", "delta", "rate"):
+                value = entry[field]
+                if value is None:
+                    continue
+                collector.add(
+                    f"/data/comparisons/{series_name}/{index}/{field}",
+                    _series_rows(metrics[index], rows) or current_rows,
+                )
+    return {
+        "current_baseline": current_baseline if baseline_rows else [],
+        "current_post": current_post if post_rows else [],
+    }, has_rows
+
+
+def _build_attribution(
+    post_rows: list[RowRef], collector: LineageCollector
+) -> tuple[dict[str, Any], bool]:
+    """内容归属：paid_confirmed/organic/unknown。
+
+    无归属字段的帖计入 unknown（没有证据不得自动认定付费投放）。
+    """
+    counts = {"paid_confirmed": 0, "organic": 0, "unknown": 0}
+    for ref in post_rows:
+        raw = text(first(ref.row, ATTRIBUTION_KEYS))
+        folded = (raw or "").casefold()
+        if any(word in folded for word in ("付费", "商单", "paid", "ad")):
+            counts["paid_confirmed"] += 1
+        elif any(word in folded for word in ("自然", "organic", "非商单")):
+            counts["organic"] += 1
+        else:
+            counts["unknown"] += 1
+    total = sum(counts.values())
+    if post_rows:
+        for field in ("paid_confirmed", "organic", "unknown"):
+            collector.add(f"/data/attribution/{field}", post_rows)
+        collector.add("/data/attribution/paid_confirmed_share", post_rows)
+    return {
+        "paid_confirmed": counts["paid_confirmed"] if post_rows else None,
+        "organic": counts["organic"] if post_rows else None,
+        "unknown": counts["unknown"] if post_rows else None,
+        "paid_confirmed_share": round(counts["paid_confirmed"] / total, 4) if post_rows and total else None,
+    }, bool(post_rows)
+
+
+def _build_organic_summary(
+    post_rows: list[RowRef], collector: LineageCollector
+) -> tuple[dict[str, Any], bool]:
+    if not post_rows:
+        return {}, False
+    volume = sum(
+        whole(first(ref.row, VOLUME_KEYS)) or 0 for ref in post_rows
+    )
+    engagement = sum(
+        whole(first(ref.row, ENGAGEMENT_KEYS)) or 0 for ref in post_rows
+    )
+    if volume:
+        collector.add("/data/organic_summary/volume", post_rows)
+    if engagement:
+        collector.add("/data/organic_summary/engagement", post_rows)
+    collector.add("/data/organic_summary/posts", post_rows)
+    return {
+        "volume": volume or None,
+        "engagement": engagement or None,
+        "posts": len(post_rows),
+        "share_of_volume": None,  # 无自然/总声量对比数据时不估算
+    }, True
+
+
+def _build_audience_regions(
+    post_rows: list[RowRef], collector: LineageCollector
+) -> tuple[list[dict[str, Any]], bool]:
+    """按发帖用户地区聚合（REGION_KEYS）；无地区字段返回空。"""
+    buckets: dict[str, dict[str, int]] = {}
+    for ref in post_rows:
+        region = text(first(ref.row, REGION_KEYS))
+        if region is None:
+            continue
+        bucket = buckets.setdefault(region, {"volume": 0})
+        volume = whole(first(ref.row, VOLUME_KEYS))
+        if volume is not None:
+            bucket["volume"] += volume
+        collector.add("/data/audience_regions", [ref])
+    if not buckets:
+        return [], False
+    total_volume = sum(bucket["volume"] for bucket in buckets.values()) or 1
+    regions = [
+        {
+            "region": region,
+            "volume": bucket["volume"] or None,
+            "share": round(bucket["volume"] / total_volume, 4),
+        }
+        for region, bucket in buckets.items()
+    ]
+    for index, entry in enumerate(regions):
+        for field in ("volume", "share"):
+            if entry[field] is not None:
+                collector.add(
+                    f"/data/audience_regions/{index}/{field}", post_rows
+                )
+    return regions, True
+
+
+def _first_number(rows: list[RowRef], keys: tuple[str, ...]) -> int | None:
+    for ref in rows:
+        value = whole(first(ref.row, keys))
+        if value is not None:
+            return value
+    return None
+
+
+def _build_internal_metrics(
+    upload_rows: list[RowRef], collector: LineageCollector
+) -> tuple[dict[str, Any], bool]:
+    """成本/转化以 upload 为准；无 upload 时不估算。"""
+    if not upload_rows:
+        return {}, False
+    spend = _first_number(upload_rows, SPEND_KEYS)
+    impressions = _first_number(upload_rows, IMPRESSION_KEYS)
+    conversions = _first_number(upload_rows, CONVERSION_KEYS)
+    revenue = _first_number(upload_rows, REVENUE_KEYS)
+    if spend is not None:
+        collector.add("/data/internal_metrics/spend", upload_rows)
+    if impressions is not None:
+        collector.add("/data/internal_metrics/impressions", upload_rows)
+    if conversions is not None:
+        collector.add("/data/internal_metrics/conversions", upload_rows)
+    if revenue is not None:
+        collector.add("/data/internal_metrics/revenue", upload_rows)
+    cpc = round(spend / conversions, 2) if spend is not None and conversions else None
+    cpm = (
+        round(spend / impressions * 1000, 2)
+        if spend is not None and impressions
+        else None
+    )
+    if cpc is not None:
+        collector.add("/data/internal_metrics/cpc", upload_rows)
+    if cpm is not None:
+        collector.add("/data/internal_metrics/cpm", upload_rows)
+    return {
+        "spend": spend,
+        "impressions": impressions,
+        "conversions": conversions,
+        "revenue": revenue,
+        "cpc": cpc,
+        "cpm": cpm,
+    }, any(v is not None for v in (spend, impressions, conversions, revenue))
+
+
+def _build_roi(
+    scope: dict[str, Any], internal_metrics: dict[str, Any]
+) -> dict[str, Any] | None:
+    """ROI 只在 spend + conversion/revenue + 归因窗口齐全时生成；否则 None。"""
+    spend = internal_metrics.get("spend")
+    revenue = internal_metrics.get("revenue")
+    conversions = internal_metrics.get("conversions")
+    attribution_rules = list(scope.get("attribution_rules") or ())
+    comparison_mode = scope.get("comparison_mode")
+    window = "、".join(attribution_rules) if attribution_rules else (comparison_mode or "")
+    if spend is None or not window or (revenue is None and conversions is None):
+        return None
+    roi = round((revenue - spend) / spend, 4) if revenue is not None else None
+    roas = round(revenue / spend, 4) if revenue is not None else None
+    return {
+        "spend": spend,
+        "revenue": revenue,
+        "conversions": conversions,
+        "attribution_window": window,
+        "roi": roi,
+        "roas": roas,
+    }
+
+
+# ---------------------------------------------------------------------------
 # 公开入口
 # ---------------------------------------------------------------------------
 
@@ -472,6 +753,42 @@ def build_campaign_report_draft(
 
     collector = LineageCollector()
     post_rows = _group_posts(groups[GROUP_POSTS])
+    # Gate C Task 4：社媒指标以 DataTap 为主（post/social/posts 分组合并去重），
+    # 成本/转化以 upload 为主；冲突值双保留并生成 limitation。
+    social_rows = _group_posts([*groups[GROUP_POSTS], *groups[GROUP_SOCIAL]])
+    upload_rows = groups[GROUP_UPLOAD]
+    current_rows = _group_posts([*groups[GROUP_CURRENT], *groups[GROUP_POSTS]])
+    baseline_rows = _group_posts(groups[GROUP_BASELINE])
+    post_period_rows = _group_posts(groups[GROUP_POST])
+
+    # 社媒冲突检测：upload 行若同时携带声量/互动且与 DataTap 不同，双值保留。
+    social_conflicts: list[dict[str, Any]] = []
+    upload_volume = _first_number(upload_rows, VOLUME_KEYS)
+    upload_engagement = _first_number(upload_rows, ENGAGEMENT_KEYS)
+    datatap_volume = sum(whole(first(ref.row, VOLUME_KEYS)) or 0 for ref in social_rows)
+    datatap_engagement = sum(whole(first(ref.row, ENGAGEMENT_KEYS)) or 0 for ref in social_rows)
+    if upload_volume is not None and datatap_volume > 0 and upload_volume != datatap_volume:
+        social_conflicts.append(
+            {
+                "code": "social_metric_conflict",
+                "message": (
+                    f"声量冲突双值保留：DataTap {datatap_volume} / 用户资料 "
+                    f"{upload_volume}，未静默覆盖"
+                ),
+                "affected_paths": ["overview.total_volume", "internal_metrics.spend"],
+            }
+        )
+    if upload_engagement is not None and datatap_engagement > 0 and upload_engagement != datatap_engagement:
+        social_conflicts.append(
+            {
+                "code": "social_metric_conflict",
+                "message": (
+                    f"互动数冲突双值保留：DataTap {datatap_engagement} / 用户资料 "
+                    f"{upload_engagement}，未静默覆盖"
+                ),
+                "affected_paths": ["overview.total_engagement", "internal_metrics.spend"],
+            }
+        )
 
     # ---- sentiment：明细分组优先，缺失时回退 posts 行情感字段（每帖计 1） ----
     sentiment_source = groups[GROUP_SENTIMENT]
@@ -507,6 +824,27 @@ def build_campaign_report_draft(
         post_rows, collector, limit=min(max(top_posts_limit, 1), 20)
     )
 
+    # Gate C Task 4 章节。
+    comparisons, comparisons_has_rows = _build_comparisons(
+        current_rows, baseline_rows, post_period_rows, collector
+    )
+    attribution, attribution_has_rows = _build_attribution(social_rows, collector)
+    organic_summary, organic_summary_has_rows = _build_organic_summary(
+        social_rows, collector
+    )
+    audience_regions, audience_regions_has_rows = _build_audience_regions(
+        social_rows, collector
+    )
+    internal_metrics, internal_metrics_has_rows = _build_internal_metrics(
+        upload_rows, collector
+    )
+    internal_metrics = internal_metrics or None
+    roi = _build_roi(scope_model.model_dump(), internal_metrics or {})
+    if roi is not None:
+        for field in ("spend", "revenue", "conversions", "roi", "roas"):
+            if roi[field] is not None:
+                collector.add(f"/data/roi/{field}", upload_rows)
+
     force_partial: set[str] = set()
     extra_limitations: dict[str, list[dict[str, Any]]] = {}
     if posts_meta["skipped"]:
@@ -536,6 +874,12 @@ def build_campaign_report_draft(
         "content_types": content_types,
         "sentiment": sentiment,
         "top_posts": top_posts,
+        "comparisons": comparisons,
+        "attribution": attribution,
+        "organic_summary": organic_summary,
+        "audience_regions": audience_regions,
+        "internal_metrics": internal_metrics,
+        "roi": roi,
     }
     try:
         data_model = CampaignData.model_validate(data)
@@ -550,6 +894,12 @@ def build_campaign_report_draft(
         "content_types": content_has_rows,
         "sentiment": sentiment_has_rows,
         "top_posts": bool(top_posts),
+        "comparisons": comparisons_has_rows,
+        "attribution": attribution_has_rows,
+        "organic_summary": organic_summary_has_rows,
+        "audience_regions": audience_regions_has_rows,
+        "internal_metrics": internal_metrics_has_rows,
+        "roi": roi is not None,
     }
     data_status, availability, limitations = _assemble_availability(
         data_model,
@@ -557,6 +907,13 @@ def build_campaign_report_draft(
         extra=extra_limitations,
         force_partial=force_partial,
     )
+    for conflict in social_conflicts:
+        limitations.append(conflict)
+        force_partial.add("overview")
+        availability["overview"]["status"] = "partial"
+        if "social_metric_conflict" not in availability["overview"]["reason_codes"]:
+            availability["overview"]["reason_codes"].append("social_metric_conflict")
+        data_status = "restricted"
 
     payload = {
         "schema_version": SCHEMA_VERSION,

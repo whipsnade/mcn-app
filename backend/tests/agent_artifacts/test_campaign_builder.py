@@ -458,3 +458,118 @@ async def test_lineage_freeze_passes_with_db_evidence(
         if ref.artifact_path == "/data/overview/total_engagement"
     )
     assert {source.evidence_id for source in overview_ref.sources} == {item.id}
+
+
+# ---------------------------------------------------------------------------
+# Gate C Task 4：对比/归属/内部指标/ROI
+# ---------------------------------------------------------------------------
+
+
+def test_campaign_builder_merges_social_and_upload_evidence() -> None:
+    """社媒指标以 DataTap 为主、成本/转化以 upload 为主；ROI 齐全时生成。"""
+    evidence = {
+        "posts": [("ev-posts", _post_rows())],
+        "baseline": [("ev-baseline", [dict(_post_rows()[0], 互动数=80)])],
+        "upload": [
+            (
+                "ev-upload",
+                [
+                    {
+                        "平台": "合计",
+                        "投放金额": 100000,
+                        "曝光": 2000000,
+                        "转化": 5000,
+                        "销售额": 300000,
+                    }
+                ],
+            )
+        ],
+    }
+    scope = {**SCOPE, "attribution_rules": ["最后点击 7 天"]}
+    build = build_campaign_report_draft(scope=scope, evidence=evidence)
+    payload = build.payload
+    CampaignReportV2.model_validate(payload)
+
+    assert payload["data"]["internal_metrics"]["spend"] == 100000
+    assert payload["data"]["internal_metrics"]["conversions"] == 5000
+    assert payload["data"]["internal_metrics"]["cpc"] == 20
+    # ROI 生成：spend + 转化/销售 + 归因窗口齐全。
+    roi = payload["data"]["roi"]
+    assert roi is not None
+    assert roi["spend"] == 100000
+    assert roi["roas"] == pytest.approx(3.0)
+    assert roi["roi"] == pytest.approx(2.0)
+    # 周期对比：baseline 有行 → current_baseline 系列存在。
+    assert payload["data"]["comparisons"]["current_baseline"]
+    assert payload["data"]["comparisons"]["current_baseline"][0]["metric"] == "volume"
+
+
+def test_roi_section_is_absent_without_cost_and_conversion() -> None:
+    """无成本/转化数据：roi=null，绝不估算或编造。"""
+    evidence = {"posts": [("ev-posts", _post_rows())]}
+    build = build_campaign_report_draft(scope=SCOPE, evidence=evidence)
+    payload = build.payload
+    CampaignReportV2.model_validate(payload)
+    assert payload["data"]["roi"] is None
+    assert payload["data"]["internal_metrics"] is None
+
+
+def test_roi_absent_without_attribution_window() -> None:
+    """有 spend 但无归因窗口：roi 仍为 null。"""
+    evidence = {
+        "posts": [("ev-posts", _post_rows())],
+        "upload": [("ev-upload", [{"投放金额": 100000, "销售额": 300000}])],
+    }
+    build = build_campaign_report_draft(scope=SCOPE, evidence=evidence)
+    payload = build.payload
+    assert payload["data"]["internal_metrics"]["spend"] == 100000
+    assert payload["data"]["roi"] is None
+
+
+def test_campaign_builder_attribution_and_organic_summary() -> None:
+    """归属：付费/自然/未知计数与占比；organic_summary 汇总自然传播。"""
+    posts = _post_rows()
+    posts[0]["归属"] = "付费商单"
+    posts[1]["归属"] = "自然内容"
+    evidence = {"posts": [("ev-posts", posts)]}
+    build = build_campaign_report_draft(scope=SCOPE, evidence=evidence)
+    payload = build.payload
+    CampaignReportV2.model_validate(payload)
+    attribution = payload["data"]["attribution"]
+    assert attribution["paid_confirmed"] == 1
+    assert attribution["organic"] == 1
+    assert attribution["unknown"] == 1
+    assert attribution["paid_confirmed_share"] == pytest.approx(1 / 3, abs=0.001)
+    organic = payload["data"]["organic_summary"]
+    assert organic["posts"] == 3
+    assert organic["engagement"] == 420
+
+
+def test_campaign_builder_conflict_keeps_both_values_with_limitation() -> None:
+    """社媒指标冲突：双值保留并生成 limitation，不静默覆盖。"""
+    evidence = {
+        "posts": [("ev-posts", _post_rows())],
+        "upload": [
+            (
+                "ev-upload",
+                [
+                    {
+                        "平台": "合计",
+                        "投放金额": 100000,
+                        "声量": 999999,
+                        "互动数": 888888,
+                        "销售额": 300000,
+                    }
+                ],
+            )
+        ],
+    }
+    build = build_campaign_report_draft(
+        scope={**SCOPE, "attribution_rules": ["最后点击 7 天"]},
+        evidence=evidence,
+    )
+    payload = build.payload
+    assert payload["data_status"] == "restricted"
+    conflicts = [limit for limit in payload["limitations"] if limit["code"] == "social_metric_conflict"]
+    assert len(conflicts) == 1
+    assert "DataTap 420" in conflicts[0]["message"]  # 互动冲突消息保留双值

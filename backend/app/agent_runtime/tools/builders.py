@@ -332,19 +332,25 @@ class BuildCampaignReportDraftTool(_BuilderToolBase):
 
     description = (
         "把已采集的原始帖 Evidence 确定性聚合为活动报告 Draft（campaign_report_v2）。"
-        "scope={brand, campaign, period{start,end,timezone}, platforms[], keywords[]}；"
+        "scope={brand, campaign, period{start,end,timezone}, platforms[], keywords[], "
+        "exclusions[], official_accounts[], comparison_mode, attribution_rules[], "
+        "upload_ids[]}；"
         "evidence 分组（键："
         + "/".join(CAMPAIGN_EVIDENCE_GROUPS)
         + "）：posts 为原始帖行（必需章节主数据源），sentiment 为可选情感明细行"
-        "（缺失时用 posts 行情感字段）。narrative 可选（executive_summary/"
+        "（缺失时用 posts 行情感字段）；current/baseline/post 为活动期/活动前/"
+        "活动后观察期行（周期对比）；social 为社媒补充行（与 posts 同口径，"
+        "DataTap 为主）；upload 为用户补充资料行（成本/转化/内部指标优先取用）。"
+        "narrative 可选（executive_summary/"
         "phase_review[]/findings[]/recommendations[]，supporting_paths 必须指向"
         " data 内路径）。输出只含 artifact_id/draft_id/revision_id/schema_version"
         " 与受限摘要。"
         "输入契约示例："
         'scope={"brand":"瑞幸咖啡","campaign":"生椰拿铁上新","period":{"start":"2026-07-01",'
         '"end":"2026-07-31","timezone":"Asia/Shanghai"},"platforms":["xiaohongshu"],'
-        '"keywords":["生椰拿铁"]}；'
-        'evidence={"posts":["ev-1"],"sentiment":["ev-2"]}；'
+        '"keywords":["生椰拿铁"],"attribution_rules":["最后点击 7 天"]}；'
+        'evidence={"posts":["ev-1"],"sentiment":["ev-2"],"baseline":["ev-3"],'
+        '"upload":["ev-4"]}；'
         'narrative={"executive_summary":"...","phase_review":[{"phase":"预热期","detail":"...",'
         '"supporting_paths":["data.daily_trend"]}],"findings":[{"title":"...","detail":"...",'
         '"supporting_paths":["data.overview.total_engagement"]}],"recommendations":[{"title":"...",'
