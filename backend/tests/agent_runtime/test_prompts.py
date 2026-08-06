@@ -141,6 +141,14 @@ def test_session_analyst_prompt_says_exemplar_is_not_a_fixed_tool_sequence() -> 
     assert "不得照抄实体、日期或参数" in text
 
 
+def test_session_analyst_prompt_failure_recovery_options() -> None:
+    """失败处理指引明确可拆平台、改周期、换工具或继续其他章节（Gate B Task 6）。"""
+    text = _text("session_analyst_v1")
+    assert "拆平台" in text
+    assert "改周期" in text
+    assert "继续其他章节" in text
+
+
 def test_session_analyst_prompt_narrative_anti_fabrication_rule() -> None:
     """叙事防编造：每个数字必须能在 supporting_paths 指向的 data 位置找到同值。"""
     text = _text("session_analyst_v1")

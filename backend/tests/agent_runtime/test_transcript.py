@@ -516,3 +516,60 @@ async def test_kol_detail_run_trigger_restored_from_prompt_snapshot(
     assert transcript.messages[0].content == expected
     assert "品牌声量" not in transcript.messages[0].content
     assert transcript.user_question == expected
+
+
+async def test_failed_row_replay_keeps_structured_feedback(
+    db_session, user_factory
+) -> None:
+    """崩溃恢复回放同一结构化失败反馈（Gate B Task 6：safe summary 一致）。
+
+    failed 行的 safe_error_message 存 ToolFailureFeedback JSON；resume 回放
+    时原样透传（same_fingerprint_retry_allowed 保留），模型拿到与首次失败
+    相同的决策依据。
+    """
+    _, session, run, attempt, _ = await _make_chain(db_session, user_factory)
+    step = _tool_step(run, attempt, sequence=1, status="running")
+    db_session.add(step)
+    await db_session.flush()
+    feedback = {
+        "tool": "query_analysis_data",
+        "arguments_summary": {"keyword": "美妆"},
+        "error_type": "definitely_not_sent",
+        "upstream_code": None,
+        "upstream_reason": "connect timeout",
+        "request_state": "failed",
+        "points_state": "released",
+        "same_fingerprint_retry_allowed": False,
+        "normalization_status": None,
+        "suggested_actions": ["修改参数或拆分平台后重试", "继续其他章节"],
+    }
+    args_hash = hashlib.sha256(canonical_json_bytes({"keyword": "美妆"})).hexdigest()
+    call = AgentToolCall(
+        id=str(uuid4()),
+        run_id=run.id,
+        step_id=step.id,
+        logical_call_id=logical_call_id_for(run.id, step.id, INTERNAL_NAME, args_hash),
+        service=DataTapService.INSIGHT_CUBE.value,
+        internal_tool_name=INTERNAL_NAME,
+        arguments_json={"keyword": "美妆"},
+        arguments_hash=args_hash,
+        status="failed",
+        points_reserved=10,
+        points_settled=0,
+        error_type="definitely_not_sent",
+        safe_error_message=json.dumps(feedback, ensure_ascii=False),
+        started_at=utc_now(),
+    )
+    db_session.add(call)
+    await db_session.flush()
+
+    transcript = await RunTranscriptLoader(db_session).load(run)
+
+    results = _tool_results(transcript.messages)
+    assert len(results) == 1
+    assert results[0]["status"] == "failed"
+    assert results[0]["error_type"] == "definitely_not_sent"
+    replayed = json.loads(results[0]["summary"])
+    assert replayed["same_fingerprint_retry_allowed"] is False
+    assert replayed["points_state"] == "released"
+    assert replayed["suggested_actions"] == feedback["suggested_actions"]

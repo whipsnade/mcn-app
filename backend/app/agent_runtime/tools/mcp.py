@@ -30,7 +30,7 @@ from collections.abc import Callable, Mapping
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, TypedDict
 from uuid import uuid4
 
 from pydantic import BaseModel
@@ -522,6 +522,20 @@ class DurableToolCallCoordinator:
                 return ToolResult(status="success", safe_summary="already settled", evidence_id=evidence.id)
             return ToolResult(status="success", safe_summary="already settled")
         if row.status == "failed":
+            feedback = _parse_feedback(row.safe_error_message)
+            if feedback is not None:
+                # 同指纹重试（幂等回放已有失败行）：同参数不再允许，明确告知。
+                feedback["same_fingerprint_retry_allowed"] = False
+                if "已尝试过相同参数" not in "".join(feedback.get("suggested_actions", [])):
+                    feedback["suggested_actions"] = [
+                        "已尝试过相同参数：修改参数、拆分平台或更换工具后重试",
+                        *feedback.get("suggested_actions", []),
+                    ]
+                return ToolResult(
+                    status="failed",
+                    safe_summary=json.dumps(feedback, ensure_ascii=False),
+                    error_type=row.error_type or FAILED_CONFIRMED,
+                )
             return ToolResult(
                 status="failed",
                 safe_summary=row.safe_error_message or "tool call failed",
@@ -645,10 +659,14 @@ class AgentMcpTool:
         try:
             normalized = validate_input(raw, self._input_schema)
         except McpValidationError:
-            return ToolResult(
-                status="failed",
-                safe_summary="tool arguments failed schema validation",
+            return _feedback_result(
+                tool=self.name,
+                normalized=raw,
                 error_type=DEFINITELY_NOT_SENT,
+                request_state="not_created",
+                points_state="released",
+                retry_allowed=True,
+                suggested_actions=["按 input_schema 修正参数后重试"],
             )
 
         args_hash = arguments_hash(normalized)
@@ -660,10 +678,14 @@ class AgentMcpTool:
         if not self._breaker.allow(
             service=self._service.value, internal_tool_name=self.name, arguments=normalized
         ):
-            return ToolResult(
-                status="failed",
-                safe_summary="circuit open for this exact tool call",
+            return _feedback_result(
+                tool=self.name,
+                normalized=normalized,
                 error_type=DEFINITELY_NOT_SENT,
+                request_state="blocked",
+                points_state="released",
+                retry_allowed=False,
+                suggested_actions=["熔断封锁相同参数：修改参数、拆分平台或稍后重试"],
             )
 
         # durable-before-send：行 + 预留 commit 之后才允许外发（§2.1/§5.3）。
@@ -695,15 +717,15 @@ class AgentMcpTool:
                 raise
         except _UNCONFIRMED_ERRORS as exc:
             return await self._finalize_unknown(
-                logical_call_id, normalized, message=self._error_message(exc)
+                logical_call_id, normalized, message=_error_message(exc)
             )
         except _PRE_CONNECTION_ERRORS as exc:
             return await self._finalize_definitely_not_sent(
-                context, logical_call_id, normalized, message=self._error_message(exc)
+                context, logical_call_id, normalized, message=_error_message(exc)
             )
         except Exception as exc:
             return await self._finalize_unknown(
-                logical_call_id, normalized, message=self._error_message(exc)
+                logical_call_id, normalized, message=_error_message(exc)
             )
 
         if result.is_error:
@@ -711,21 +733,28 @@ class AgentMcpTool:
                 service=self._service.value, internal_tool_name=self.name, arguments=normalized
             )
             upstream_message = safe_upstream_text(result.error_text)
+            feedback = _feedback_result(
+                tool=self.name,
+                normalized=normalized,
+                error_type=FAILED_CONFIRMED,
+                request_state="failed",
+                points_state="released",
+                retry_allowed=False,
+                suggested_actions=["调整参数、拆分平台或更换工具；或继续其他章节"],
+                upstream_code=result.upstream_request_id,
+                upstream_reason=upstream_message or "upstream reported a business error",
+            )
             await self._coordinator.finalize_release(
                 logical_call_id=logical_call_id,
                 user_id=context.user_id,
                 error_type=FAILED_CONFIRMED,
-                message=upstream_message or "MCP call failed",
+                message=feedback.safe_summary,
                 upstream_request_id=result.upstream_request_id,
             )
             # 上游业务错误文本（已脱敏截断）必须回喂模型——"不支持的维度/
             # 不支持的平台"这类信息是模型修正参数的唯一依据，只存库不回喂
             # 会导致模型用同样错误参数反复调用（真实 UAT 已观察到该模式）。
-            return ToolResult(
-                status="failed",
-                safe_summary=upstream_message or "upstream reported a business error",
-                error_type=FAILED_CONFIRMED,
-            )
+            return feedback
 
         if result.structured_content is not None:
             try:
@@ -734,17 +763,24 @@ class AgentMcpTool:
                 self._breaker.record_success(
                     service=self._service.value, internal_tool_name=self.name, arguments=normalized
                 )
+                feedback = _feedback_result(
+                    tool=self.name,
+                    normalized=normalized,
+                    error_type=FAILED_CONFIRMED,
+                    request_state="failed",
+                    points_state="released",
+                    retry_allowed=False,
+                    suggested_actions=["查询结果未通过输出 Schema：调整查询维度后重试"],
+                    upstream_reason="output validation failed",
+                )
                 await self._coordinator.finalize_release(
                     logical_call_id=logical_call_id,
                     user_id=context.user_id,
                     error_type=FAILED_CONFIRMED,
-                    message="output validation failed",
+                    message=feedback.safe_summary,
                     upstream_request_id=result.upstream_request_id,
                 )
-                return ToolResult(
-                    status="failed", safe_summary="output validation failed",
-                    error_type=FAILED_CONFIRMED,
-                )
+                return feedback
         else:
             validated = None
 
@@ -758,6 +794,19 @@ class AgentMcpTool:
             validated_payload=validated,
             upstream_request_id=result.upstream_request_id,
         )
+        if validated is None:
+            # 成功但无结构化结果（succeeded_empty）：已结算，但同参数重放只会
+            # 命中幂等回放，不允许原样重试获取数据。
+            return _feedback_result(
+                tool=self.name,
+                normalized=normalized,
+                error_type="succeeded_empty",
+                request_state="settled",
+                points_state="settled",
+                retry_allowed=False,
+                suggested_actions=["调整查询参数获取结构化结果，或继续其他章节"],
+                upstream_reason="upstream returned no structured content",
+            )
         summary = json.dumps(preview, ensure_ascii=False)
         return ToolResult(
             status="success",
@@ -856,10 +905,20 @@ class AgentMcpTool:
         self._breaker.record_failure(
             service=self._service.value, internal_tool_name=self.name, arguments=normalized
         )
-        await self._coordinator.finalize_unknown(
-            logical_call_id=logical_call_id, message=message
+        feedback = _feedback_result(
+            tool=self.name,
+            normalized=normalized,
+            error_type=RESULT_UNKNOWN,
+            request_state="unknown",
+            points_state="reserved",
+            retry_allowed=False,
+            suggested_actions=["禁止重放同一调用；继续其他工作，结果将自动核对"],
+            upstream_reason=message,
         )
-        return ToolResult(status="unknown", safe_summary=message, error_type=RESULT_UNKNOWN)
+        await self._coordinator.finalize_unknown(
+            logical_call_id=logical_call_id, message=feedback.safe_summary
+        )
+        return feedback
 
     async def _finalize_definitely_not_sent(
         self,
@@ -876,17 +935,100 @@ class AgentMcpTool:
         self._breaker.record_failure(
             service=self._service.value, internal_tool_name=self.name, arguments=normalized
         )
+        feedback = _feedback_result(
+            tool=self.name,
+            normalized=normalized,
+            error_type=DEFINITELY_NOT_SENT,
+            request_state="failed",
+            points_state="released",
+            retry_allowed=True,
+            suggested_actions=["可对相同参数重试一次；仍失败则调整参数、拆分平台或继续其他章节"],
+            upstream_reason=message,
+        )
         await self._coordinator.finalize_release(
             logical_call_id=logical_call_id,
             user_id=context.user_id,
             error_type=DEFINITELY_NOT_SENT,
-            message=message,
+            message=feedback.safe_summary,
         )
-        return ToolResult(status="failed", safe_summary=message, error_type=DEFINITELY_NOT_SENT)
+        return feedback
 
-    @staticmethod
-    def _error_message(exc: BaseException) -> str:
-        return str(exc) or exc.__class__.__name__
+
+def _error_message(exc: BaseException) -> str:
+    return str(exc) or exc.__class__.__name__
+
+
+# --------------------------------------------------------------------------- #
+# 结构化失败反馈（Gate B Task 6）：模型拿到的统一决策依据
+# --------------------------------------------------------------------------- #
+
+
+class ToolFailureFeedback(TypedDict):
+    tool: str
+    arguments_summary: dict[str, Any]
+    error_type: str
+    upstream_code: str | None
+    upstream_reason: str | None
+    request_state: str
+    points_state: str
+    same_fingerprint_retry_allowed: bool
+    normalization_status: str | None
+    suggested_actions: list[str]
+
+
+def _arguments_summary(normalized: Mapping[str, Any]) -> dict[str, Any]:
+    """参数摘要：截断长值/深结构，只保留模型可读的键值（绝不回灌敏感值）。"""
+    summary: dict[str, Any] = {}
+    for key, value in normalized.items():
+        rendered = json.dumps(value, ensure_ascii=False, default=str)
+        summary[key] = rendered if len(rendered) <= 200 else rendered[:200] + "..."
+    return summary
+
+
+def _feedback_result(
+    *,
+    tool: str,
+    normalized: Mapping[str, Any],
+    error_type: str,
+    request_state: str,
+    points_state: str,
+    retry_allowed: bool,
+    suggested_actions: list[str],
+    upstream_code: str | None = None,
+    upstream_reason: str | None = None,
+    normalization_status: str | None = None,
+) -> ToolResult:
+    feedback: ToolFailureFeedback = {
+        "tool": tool,
+        "arguments_summary": _arguments_summary(normalized),
+        "error_type": error_type,
+        "upstream_code": upstream_code,
+        "upstream_reason": upstream_reason,
+        "request_state": request_state,
+        "points_state": points_state,
+        "same_fingerprint_retry_allowed": retry_allowed,
+        "normalization_status": normalization_status,
+        "suggested_actions": suggested_actions,
+    }
+    status = "unknown" if error_type == RESULT_UNKNOWN else "failed"
+    return ToolResult(
+        status=status,
+        safe_summary=json.dumps(feedback, ensure_ascii=False),
+        error_type=error_type,
+    )
+
+
+def _parse_feedback(safe_error_message: str | None) -> dict[str, Any] | None:
+    """尝试解析已持久化的反馈 JSON；非 JSON（旧数据/普通文本）返回 None。"""
+    if not safe_error_message:
+        return None
+    try:
+        parsed = json.loads(safe_error_message)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(parsed, dict) or "error_type" not in parsed:
+        return None
+    return parsed
 
 
 __all__ = [

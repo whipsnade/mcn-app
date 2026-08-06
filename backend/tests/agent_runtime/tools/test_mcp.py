@@ -1151,3 +1151,91 @@ async def test_wall_clock_timeout_unknown_reconciles_and_settles_or_releases_onc
         assert final.error_type == FAILED_CONFIRMED
     finally:
         await _teardown_chain(chain)
+
+
+# ---------------------------------------------------------------------------
+# 结构化失败反馈矩阵（Gate B Task 6）
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("error_type", "retry_allowed", "points_state", "transport_outcome"),
+    [
+        (
+            "definitely_not_sent",
+            True,
+            "released",
+            McpConnectionTimeout("connect timeout"),
+        ),
+        (
+            "failed_confirmed",
+            False,
+            "released",
+            RemoteToolResult(
+                structured_content=ERR_PAYLOAD,
+                is_error=True,
+                upstream_request_id="req-err-matrix",
+            ),
+        ),
+        (
+            "result_unknown",
+            False,
+            "reserved",
+            McpGatewayTimeout("gateway timeout"),
+        ),
+        (
+            "succeeded_empty",
+            False,
+            "settled",
+            RemoteToolResult(
+                structured_content=None,
+                is_error=False,
+                upstream_request_id="req-empty-matrix",
+            ),
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_feedback_matrix(
+    error_type: str, retry_allowed: bool, points_state: str, transport_outcome: Any
+) -> None:
+    """五类结果矩阵：反馈携带同指纹重试许可与积分状态（Gate B Task 6）。"""
+    chain = await _setup_chain()
+    try:
+        transport = FakeMcpTransport([transport_outcome])
+        bridge = _bridge(transport)
+
+        result = await bridge.execute(_context(chain), {"keyword": "美妆"})
+        feedback = json.loads(result.safe_summary)
+        assert feedback["error_type"] == error_type
+        assert feedback["same_fingerprint_retry_allowed"] is retry_allowed
+        assert feedback["points_state"] == points_state
+        assert feedback["tool"] == INTERNAL_NAME
+        assert isinstance(feedback["suggested_actions"], list)
+        assert feedback["suggested_actions"]
+    finally:
+        await _teardown_chain(chain)
+
+
+@pytest.mark.asyncio
+async def test_same_fingerprint_retry_is_rejected_on_replay() -> None:
+    """definitely_not_sent 后同参数重试：prepare 幂等回放 failed 行，
+    反馈标记 same_fingerprint_retry_allowed=False（不重发、不重复扣费）。"""
+    chain = await _setup_chain()
+    try:
+        transport = FakeMcpTransport([McpConnectionTimeout("connect timeout")])
+        bridge = _bridge(transport)
+        context = _context(chain)
+
+        first = await bridge.execute(context, {"keyword": "美妆"})
+        assert json.loads(first.safe_summary)["same_fingerprint_retry_allowed"] is True
+
+        second = await bridge.execute(context, {"keyword": "美妆"})
+        assert second.error_type == "definitely_not_sent"
+        feedback = json.loads(second.safe_summary)
+        assert feedback["same_fingerprint_retry_allowed"] is False
+        assert len(transport.calls) == 1  # 未重发
+        wallet = await _wallet(chain.user_id)
+        assert (wallet.balance, wallet.reserved) == (1000, 0)
+    finally:
+        await _teardown_chain(chain)

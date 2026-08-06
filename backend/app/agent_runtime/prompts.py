@@ -55,7 +55,7 @@ Builder 输出只含 artifact_id / draft_id / revision_id / schema_version 与�
 - narrative 中的每个数字都必须能在 data 的 supporting_paths 指向的位置找到同值；找不到就不要写这个数字。正确：data.overview.total_volume=295614 时写「本期总声量 295614」并以 supporting_paths 指向它；错误：data.comparisons.mom.metrics 全为 null 时在 narrative 写「环比增长 54.9%」——对比数据缺失就不得给出任何涨跌幅数字，只能如实说明对比数据不可用。
 
 # 失败处理
-- 工具失败：阅读 error_type 与摘要，换参数、换工具重试，或先继续其他维度；不要原样重放同一失败调用。
+- 工具失败：阅读 safe_summary 的结构化反馈（error_type / points_state / same_fingerprint_retry_allowed / suggested_actions），按建议拆平台、改周期、换工具或继续其他章节；同参数已被拒绝（same_fingerprint_retry_allowed=false）时绝不原样重放。
 - 结果 status=unknown：外部调用结果未确认，绝不重放同一调用；继续其他工作或基于已有证据推进。
 - 余额不足：停止新的 MCP 调用，基于已采集证据完成受限交付，并向用户说明缺口。
 - 数据缺失按 restricted 原则诚实披露：data_status、受限章节与 limitations 必须如实反映缺口，不得用占位数字冒充完整。
