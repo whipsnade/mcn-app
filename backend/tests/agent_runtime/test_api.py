@@ -1598,6 +1598,53 @@ async def _seed_upload(
     return upload.id
 
 
+async def _seed_upload_with_evidences(
+    db_session, user_id: str, session_id: str, *, evidences: list[tuple[str, str]]
+) -> str:
+    """造一个 upload + 多条 upload Evidence；evidences 为 (availability, collected_at) 列表。
+
+    返回 upload_id。用于"不可用 Evidence 不可冻结 / reparse 后取最新 available"。
+    """
+    from app.agent_runtime.models import AgentUpload, EvidenceItem
+
+    upload_id = str(uuid4())
+    db_session.add(
+        AgentUpload(
+            id=upload_id,
+            user_id=user_id,
+            session_id=session_id,
+            original_filename="投放数据.csv",
+            mime_type="text/csv",
+            size_bytes=100,
+            sha256="c" * 64,
+            storage_key=f"{user_id}/{uuid4()}.csv",
+            status="parsed",
+            created_at=utc_now(),
+            completed_at=utc_now(),
+        )
+    )
+    await db_session.flush()
+    for availability, collected_at in evidences:
+        db_session.add(
+            EvidenceItem(
+                id=str(uuid4()),
+                session_id=session_id,
+                run_id=None,
+                tool_call_id=None,
+                upload_id=upload_id,
+                source_type="user_upload",
+                source_name="user_upload",
+                raw_payload_json={"columns": ["平台"], "rows": []},
+                normalized_preview_json={"preview": {}, "row_count": 0, "truncated": False},
+                payload_hash="c" * 64,
+                collected_at=collected_at,
+                availability_status=availability,
+            )
+        )
+    await db_session.flush()
+    return upload_id
+
+
 async def test_message_with_upload_ids_writes_snapshot(
     agent_client_factory, db_session
 ) -> None:
@@ -1711,3 +1758,195 @@ async def test_message_upload_ids_participate_in_idempotency_hash(
     )
     assert conflict.status_code == 409
     assert conflict.json()["detail"] == "idempotency_payload_mismatch"
+
+
+# ---------------------------------------------------------------------------
+# P1-3: upload_refs 重验证（availability 过滤 / 最新可选 / retry 逐条剔除）
+# ---------------------------------------------------------------------------
+
+
+async def test_message_upload_unavailable_evidence_is_404(
+    agent_client_factory, db_session
+) -> None:
+    """首次创建时 upload Evidence 非 available 不可冻结 → 404。"""
+    alice, _ = await agent_client_factory("13600000201")
+    session_id = await _create_session(alice)
+    user_id = await _me_id(alice)
+    upload_id = await _seed_upload_with_evidences(
+        db_session, user_id, session_id,
+        evidences=[("expired", utc_now())],
+    )
+
+    resp = await alice.post(
+        f"/api/v1/agent/sessions/{session_id}/messages",
+        json={"content": "分析", "upload_ids": [upload_id]},
+    )
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["detail"] in ("upload_evidence_missing", "upload_not_available")
+
+
+async def test_upload_reparse_selects_latest_available_evidence(
+    agent_client_factory, db_session
+) -> None:
+    """reparse（append-only）后冻结应选最新 available Evidence，不任意选旧行。"""
+    alice, _ = await agent_client_factory("13600000202")
+    session_id = await _create_session(alice)
+    user_id = await _me_id(alice)
+    base = utc_now()
+    upload_id = await _seed_upload_with_evidences(
+        db_session, user_id, session_id,
+        evidences=[
+            ("available", base),  # 旧 available
+            ("expired", base),  # 旧 unavailable
+            ("available", base + timedelta(seconds=1)),  # 最新 available
+        ],
+    )
+
+    resp = await alice.post(
+        f"/api/v1/agent/sessions/{session_id}/messages",
+        json={"content": "分析", "upload_ids": [upload_id]},
+    )
+    assert resp.status_code == 201, resp.text
+    run = await db_session.get(AgentRun, resp.json()["run_id"])
+    refs = (run.prompt_snapshot_json or {})["upload_refs"]
+    assert len(refs) == 1
+    # 取最新 available Evidence（collected_at 最大者）。
+    evidence = await db_session.scalar(
+        select(EvidenceItem)
+        .where(EvidenceItem.upload_id == upload_id)
+        .order_by(EvidenceItem.collected_at.desc(), EvidenceItem.id.desc())
+        .limit(1)
+    )
+    assert evidence is not None
+    assert evidence.availability_status == "available"
+    assert refs[0]["evidence_id"] == evidence.id
+
+
+async def test_retry_drops_invalid_upload_ref_keeps_valid(
+    agent_client_factory, db_session
+) -> None:
+    """retry 中一个失效 upload 引用被剔除，其他有效引用保留（不整体清空）。"""
+    alice, _ = await agent_client_factory("13600000203")
+    session_id = await _create_session(alice)
+    user_id = await _me_id(alice)
+    valid_upload = await _seed_upload(db_session, user_id, session_id)
+    invalid_upload = await _seed_upload_with_evidences(
+        db_session, user_id, session_id, evidences=[("expired", utc_now())]
+    )
+    failed = await _add_run(
+        db_session,
+        user_id,
+        session_id,
+        status="failed",
+        prompt_snapshot_json={
+            "upload_refs": [
+                {"upload_id": valid_upload, "evidence_id": "e1", "filename": "a.csv", "sha256": "a"},
+                {"upload_id": invalid_upload, "evidence_id": "e2", "filename": "b.csv", "sha256": "b"},
+            ]
+        },
+    )
+
+    resp = await alice.post(f"/api/v1/agent/runs/{failed.id}/retry")
+    assert resp.status_code == 201, resp.text
+    retried = await db_session.get(AgentRun, resp.json()["run_id"])
+    refs = (retried.prompt_snapshot_json or {}).get("upload_refs")
+    assert refs is not None
+    ids = [ref["upload_id"] for ref in refs]
+    assert valid_upload in ids
+    assert invalid_upload not in ids
+
+
+async def test_retry_corrupt_upload_snapshot_no_500(
+    agent_client_factory, db_session
+) -> None:
+    """retry 遇到损坏快照（非 dict / 缺 upload_id）只剔除，不抛 KeyError/500。"""
+    alice, _ = await agent_client_factory("13600000204")
+    session_id = await _create_session(alice)
+    user_id = await _me_id(alice)
+    valid_upload = await _seed_upload(db_session, user_id, session_id)
+    failed = await _add_run(
+        db_session,
+        user_id,
+        session_id,
+        status="failed",
+        prompt_snapshot_json={
+            "upload_refs": [
+                {"upload_id": valid_upload, "evidence_id": "e1", "filename": "a.csv", "sha256": "a"},
+                "corrupt-string",
+                {"bad": 123},
+                None,
+                {"upload_id": ""},
+            ]
+        },
+    )
+
+    resp = await alice.post(f"/api/v1/agent/runs/{failed.id}/retry")
+    assert resp.status_code == 201, resp.text
+    retried = await db_session.get(AgentRun, resp.json()["run_id"])
+    refs = (retried.prompt_snapshot_json or {}).get("upload_refs")
+    assert refs is not None
+    assert [ref["upload_id"] for ref in refs] == [valid_upload]
+
+
+async def test_retry_upload_refs_order_stable(agent_client_factory, db_session) -> None:
+    """retry 生成的新 upload_refs 顺序稳定（按入参首次出现顺序，去重）。"""
+    alice, _ = await agent_client_factory("13600000205")
+    session_id = await _create_session(alice)
+    user_id = await _me_id(alice)
+    u2 = await _seed_upload(db_session, user_id, session_id)
+    u1 = await _seed_upload(db_session, user_id, session_id)
+    failed = await _add_run(
+        db_session,
+        user_id,
+        session_id,
+        status="failed",
+        prompt_snapshot_json={
+            "upload_refs": [
+                {"upload_id": u2, "evidence_id": "e2", "filename": "b.csv", "sha256": "b"},
+                {"upload_id": u1, "evidence_id": "e1", "filename": "a.csv", "sha256": "a"},
+                {"upload_id": u2, "evidence_id": "e2", "filename": "b.csv", "sha256": "b"},
+            ]
+        },
+    )
+
+    resp = await alice.post(f"/api/v1/agent/runs/{failed.id}/retry")
+    assert resp.status_code == 201, resp.text
+    retried = await db_session.get(AgentRun, resp.json()["run_id"])
+    refs = (retried.prompt_snapshot_json or {}).get("upload_refs")
+    assert [ref["upload_id"] for ref in refs] == [u2, u1]
+
+
+async def test_retry_context_only_frozen_evidence(agent_client_factory, db_session) -> None:
+    """Context 只能看到新快照中冻结的 Evidence（不混入失效 upload 的 Evidence）。"""
+    from app.agent_runtime.context import SessionContextBuilder
+    from app.agent_runtime.tools.registry import ToolRegistry
+
+    alice, _ = await agent_client_factory("13600000206")
+    session_id = await _create_session(alice)
+    user_id = await _me_id(alice)
+    valid_upload = await _seed_upload(db_session, user_id, session_id)
+    failed = await _add_run(
+        db_session,
+        user_id,
+        session_id,
+        status="failed",
+        prompt_snapshot_json={
+            "upload_refs": [
+                {"upload_id": valid_upload, "evidence_id": "e1", "filename": "a.csv", "sha256": "a"},
+            ]
+        },
+    )
+
+    resp = await alice.post(f"/api/v1/agent/runs/{failed.id}/retry")
+    assert resp.status_code == 201, resp.text
+    retried = await db_session.get(AgentRun, resp.json()["run_id"])
+    refs = (retried.prompt_snapshot_json or {}).get("upload_refs")
+    assert refs is not None
+    frozen_evidence_ids = {ref["evidence_id"] for ref in refs}
+
+    builder = SessionContextBuilder(db_session, ToolRegistry())
+    references = await builder._run_references(retried)
+    context_refs = references.get("upload_refs") or []
+    assert context_refs
+    # Context 只含新快照冻结的 Evidence。
+    assert {ref["evidence_id"] for ref in context_refs} == frozen_evidence_ids

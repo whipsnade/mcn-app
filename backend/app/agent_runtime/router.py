@@ -16,7 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import datetime
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from uuid import uuid4
 
 from fastapi import (
@@ -390,12 +390,20 @@ async def _validate_artifact_version_ids(
 
 
 async def _validate_upload_ids(
-    db: AsyncSession, user_id: str, session_id: str, upload_ids: tuple[str, ...]
+    db: AsyncSession,
+    user_id: str,
+    session_id: str,
+    upload_ids: tuple[str, ...],
+    *,
+    invalid_policy: Literal["raise", "drop"] = "raise",
 ) -> list[dict[str, Any]]:
     """校验上传归属 + parsed 状态，冻结精确引用（upload_id + evidence_id + filename + sha256）。
 
-    归属失败统一 404；未 parsed 同样 404。按入参顺序去重后返回 upload_refs 列表。
-    未被本轮引用的 Session 上传不会混入模型上下文。
+    - ``raise``（首次创建 Run）：任一非法/越权/不可用引用整体 404；
+    - ``drop``（retry）：逐个剔除失效/越权/不可用引用，保留其他有效引用。
+    按入参顺序去重后返回 upload_refs；未被本轮引用的 Session 上传不混入模型上下文。
+    Evidence 只选当前 Session 最新 available 的 upload Evidence（appendix-only，
+    reparse 后稳定取最新一条），绝不任意选择旧 Evidence。
     """
     if not upload_ids:
         return []
@@ -408,14 +416,28 @@ async def _validate_upload_ids(
     for upload_id in unique_ids:
         upload = by_id.get(upload_id)
         if upload is None or upload.user_id != user_id or upload.session_id != session_id:
-            raise _not_found("upload_not_found")
+            if invalid_policy == "raise":
+                raise _not_found("upload_not_found")
+            continue
         if upload.status != "parsed":
-            raise _not_found("upload_not_available")
+            if invalid_policy == "raise":
+                raise _not_found("upload_not_available")
+            continue
         evidence = await db.scalar(
-            select(EvidenceItem).where(EvidenceItem.upload_id == upload_id)
+            select(EvidenceItem)
+            .where(
+                EvidenceItem.upload_id == upload_id,
+                EvidenceItem.session_id == session_id,
+                EvidenceItem.source_type == "user_upload",
+                EvidenceItem.availability_status == "available",
+            )
+            .order_by(EvidenceItem.collected_at.desc(), EvidenceItem.id.desc())
+            .limit(1)
         )
         if evidence is None:
-            raise _not_found("upload_evidence_missing")
+            if invalid_policy == "raise":
+                raise _not_found("upload_evidence_missing")
+            continue
         refs.append({
             "upload_id": upload_id,
             "evidence_id": evidence.id,
@@ -1010,13 +1032,20 @@ async def retry_run(
         retried_snapshot["parent_run_id"] = original_snapshot["parent_run_id"]
     # 重新验证并冻结 upload_refs（Gate B P1）：不复制旧快照，重新调用同一
     # 冻结函数，剔除失效/越权/不可用引用；无有效引用则不带 upload_refs。
+    # 先解析旧快照（损坏引用只剔除，不抛 KeyError），再逐条 drop 校验。
     original_upload_refs = original_snapshot.get("upload_refs") or []
-    if original_upload_refs:
-        upload_ids = tuple(ref["upload_id"] for ref in original_upload_refs)
-        try:
-            fresh_refs = await _validate_upload_ids(db, user.id, run.session_id, upload_ids)
-        except HTTPException:
-            fresh_refs = []
+    valid_original_ids: list[str] = []
+    for ref in original_upload_refs:
+        if (
+            isinstance(ref, dict)
+            and isinstance(ref.get("upload_id"), str)
+            and ref["upload_id"]
+        ):
+            valid_original_ids.append(ref["upload_id"])
+    if valid_original_ids:
+        fresh_refs = await _validate_upload_ids(
+            db, user.id, run.session_id, tuple(valid_original_ids), invalid_policy="drop"
+        )
         if fresh_refs:
             retried_snapshot["upload_refs"] = fresh_refs
     retried = AgentRun(
