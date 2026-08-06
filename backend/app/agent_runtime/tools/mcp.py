@@ -39,7 +39,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_runtime.circuit_breaker import FineGrainedCircuitBreaker
-from app.agent_runtime.evidence import EvidenceWriter
+from app.agent_runtime.evidence import EvidenceWriter, build_model_evidence_view
 from app.agent_runtime.normalization import NormalizationRegistry
 from app.agent_runtime.models import (
     AgentRun,
@@ -338,9 +338,11 @@ class DurableToolCallCoordinator:
         validated_payload: Any,
         upstream_request_id: str | None,
     ) -> tuple[str, dict[str, Any] | None]:
-        """成功收口：写 Evidence + settle 10 分，返回 (evidence_id, preview)。
+        """成功收口：写 Evidence + settle 10 分，返回 (evidence_id, 统一模型视图)。
 
         幂等：已 settled 的调用直接回放既有 Evidence（重入不重复写、不重复扣费）。
+        返回的视图来自 :func:`build_model_evidence_view`（有界、合法 JSON），
+        调用方不得再次执行归一化。
         """
         async with self._session_factory() as db:
             row = await self._require_call(db, logical_call_id, for_update=True)
@@ -348,7 +350,7 @@ class DurableToolCallCoordinator:
                 evidence = await EvidenceWriter(db).get_by_tool_call_id(row.id)
                 if evidence is None:
                     raise LookupError("evidence_missing_for_settled_call")
-                return evidence.id, evidence.normalized_preview_json
+                return evidence.id, build_model_evidence_view(evidence)
             if row.status == "failed":
                 raise RuntimeError("agent_tool_call_already_failed")
             scope, period = _extract_scope_period(row.arguments_json or {})
@@ -368,7 +370,7 @@ class DurableToolCallCoordinator:
             row.upstream_request_id = upstream_request_id
             await AgentMcpAccounting(db).settle(user_id, row)
             await db.commit()
-            return evidence.id, evidence.normalized_preview_json
+            return evidence.id, build_model_evidence_view(evidence)
 
     async def finalize_release(
         self,
@@ -378,10 +380,14 @@ class DurableToolCallCoordinator:
         error_type: str,
         message: str,
         upstream_request_id: str | None = None,
+        retry_exhausted_message: str | None = None,
     ) -> int:
         """失败收口（definitely_not_sent / failed_confirmed）：释放预留。
 
-        返回更新后行的 dispatch_count，供调用方判断是否还允许重试。
+        在持有调用行锁时读取 ``dispatch_count``，同一事务内决定最终持久化消息：
+        ``dispatch_count >= 2`` 且提供了 ``retry_exhausted_message`` 时持久化后者
+        （重试已用完的最终反馈），否则持久化 ``message``——保证数据库与实际返回
+        一致，绝不提交后再只修正返回对象。返回更新后行的 dispatch_count。
         """
         async with self._session_factory() as db:
             row = await self._require_call(db, logical_call_id, for_update=True)
@@ -389,8 +395,11 @@ class DurableToolCallCoordinator:
                 return row.dispatch_count
             if upstream_request_id:
                 row.upstream_request_id = upstream_request_id
+            persist_message = message
+            if retry_exhausted_message is not None and row.dispatch_count >= 2:
+                persist_message = retry_exhausted_message
             await AgentMcpAccounting(db).release(
-                user_id, row, error_type=error_type, message=message
+                user_id, row, error_type=error_type, message=persist_message
             )
             await db.commit()
             return row.dispatch_count
@@ -581,7 +590,13 @@ class DurableToolCallCoordinator:
         if row.status == "settled":
             evidence = await EvidenceWriter(db).get_by_tool_call_id(row.id)
             if evidence is not None:
-                return ToolResult(status="success", safe_summary="already settled", evidence_id=evidence.id)
+                return ToolResult(
+                    status="success",
+                    safe_summary=json.dumps(
+                        build_model_evidence_view(evidence), ensure_ascii=False
+                    ),
+                    evidence_id=evidence.id,
+                )
             return ToolResult(status="success", safe_summary="already settled")
         if row.status == "failed":
             feedback = _parse_feedback(row.safe_error_message)
@@ -868,26 +883,20 @@ class AgentMcpTool:
                 upstream_request_id=result.upstream_request_id,
             )
             return feedback
-        evidence_id, preview = await self._coordinator.finalize_success(
+        evidence_id, view = await self._coordinator.finalize_success(
             logical_call_id=logical_call_id,
             user_id=context.user_id,
             session_id=context.session_id,
             validated_payload=validated,
             upstream_request_id=result.upstream_request_id,
         )
-        normalization = NormalizationRegistry().normalize(self.name, validated)
-        summary = json.dumps(
-            {
-                "preview": preview,
-                "normalization_status": normalization.status,
-                "unmapped_fields": list(normalization.unmapped_fields),
-            },
-            ensure_ascii=False,
-        )
+        # 统一模型视图（有界、合法 JSON）已含 normalization 诊断；不重复归一化、
+        # 不中途截断 safe_summary。
         return ToolResult(
             status="success",
-            safe_summary=summary[:1_000],
+            safe_summary=json.dumps(view, ensure_ascii=False),
             evidence_id=evidence_id,
+            truncated=bool(view.get("truncated")),
         )
 
     # ------------------------------------------------------------------ #
@@ -1017,24 +1026,27 @@ class AgentMcpTool:
             suggested_actions=["可对相同参数重试一次；仍失败则调整参数、拆分平台或继续其他章节"],
             upstream_reason=message,
         )
+        # 第二次 DNR 的最终反馈（retry_allowed=false）在 finalize_release 内与
+        # dispatch_count 同锁读取、同事务持久化，保证 DB 与返回一致。
+        exhausted = _feedback_result(
+            tool=self.name,
+            normalized=normalized,
+            error_type=DEFINITELY_NOT_SENT,
+            request_state="failed",
+            points_state="released",
+            retry_allowed=False,
+            suggested_actions=["已用完一次重试：修改参数、拆分平台或更换工具后重试"],
+            upstream_reason=message,
+        )
         dispatch_count = await self._coordinator.finalize_release(
             logical_call_id=logical_call_id,
             user_id=context.user_id,
             error_type=DEFINITELY_NOT_SENT,
             message=feedback.safe_summary,
+            retry_exhausted_message=exhausted.safe_summary,
         )
-        # dispatch_count >= 2 时不再允许重试，修正反馈中的 retry_allowed
         if dispatch_count >= 2:
-            fb_dict = json.loads(feedback.safe_summary)
-            fb_dict["same_fingerprint_retry_allowed"] = False
-            fb_dict["suggested_actions"] = [
-                "已用完一次重试：修改参数、拆分平台或更换工具后重试",
-            ]
-            return ToolResult(
-                status="failed",
-                safe_summary=json.dumps(fb_dict, ensure_ascii=False),
-                error_type=DEFINITELY_NOT_SENT,
-            )
+            return exhausted
         return feedback
 
 

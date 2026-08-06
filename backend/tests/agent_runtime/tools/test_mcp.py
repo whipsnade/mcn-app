@@ -56,6 +56,7 @@ from app.agent_runtime.tools.mcp import (
 )
 from app.agent_runtime.tools.registry import ToolRegistry
 from app.agent_runtime.evidence import EvidenceWriter
+from app.agent_runtime.transcript import RunTranscriptLoader
 from app.billing.models import Wallet
 from app.billing.service import WalletService
 from app.db.session import SessionFactory
@@ -298,6 +299,21 @@ async def _reconciliation(call_id: str) -> AgentToolCallReconciliation | None:
                 AgentToolCallReconciliation.tool_call_id == call_id
             )
         )
+
+
+def _transcript_tool_results(messages) -> list[dict]:
+    """抽出 transcript 中全部 user 角色 tool_result 负载。"""
+    results = []
+    for message in messages:
+        if message.role != "user":
+            continue
+        try:
+            payload = json.loads(message.content)
+        except ValueError:
+            continue
+        if isinstance(payload, dict) and "tool_result" in payload:
+            results.append(payload["tool_result"])
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -1639,5 +1655,181 @@ async def test_p0_concurrent_retry_only_one_dispatch_wins() -> None:
         # 钱包只结算一次（不可重复扣费）
         w = await _wallet(chain.user_id)
         assert (w.balance, w.reserved) == (990, 0)
+    finally:
+        await _teardown_chain(chain)
+
+
+# ---------------------------------------------------------------------------
+# P1-2: MCP 首次返回 / Transcript 恢复消费同一统一有界模型视图
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_p1_mcp_first_return_matches_transcript_recovery() -> None:
+    """MCP 首次成功返回的 safe_summary 与 Transcript 崩溃恢复回放完全一致。"""
+    chain = await _setup_chain()
+    try:
+        transport = FakeMcpTransport([_ok_result()])
+        bridge = _bridge(transport)
+
+        result = await bridge.execute(_context(chain), {"keyword": "美妆"})
+        assert result.status == "success"
+        first_view = result.safe_summary
+
+        # 崩溃后接管：Transcript 回放 settled 调用 → 同一统一模型视图。
+        async with SessionFactory() as db:
+            run = await db.get(AgentRun, chain.run_id)
+            transcript = await RunTranscriptLoader(db).load(run)
+        results = _transcript_tool_results(transcript.messages)
+        assert len(results) == 1
+        assert results[0]["status"] == "success"
+        assert results[0]["summary"] == first_view
+        # 都必须是合法 JSON。
+        json.loads(first_view)
+        json.loads(results[0]["summary"])
+    finally:
+        await _teardown_chain(chain)
+
+
+@pytest.mark.asyncio
+async def test_p1_mcp_immediate_path_does_not_repeat_normalization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MCP 即时成功路径只执行一次归一化（不经调用方二次 normalize）。"""
+    from app.agent_runtime.normalization import NormalizationRegistry
+
+    chain = await _setup_chain()
+    calls = {"count": 0}
+    original = NormalizationRegistry.normalize
+
+    def counting(self, tool_name, payload):
+        calls["count"] += 1
+        return original(self, tool_name, payload)
+
+    monkeypatch.setattr(NormalizationRegistry, "normalize", counting)
+    try:
+        transport = FakeMcpTransport([_ok_result()])
+        bridge = _bridge(transport)
+        result = await bridge.execute(_context(chain), {"keyword": "美妆"})
+        assert result.status == "success"
+        # 仅 finalize_success 内写 Evidence 时归一化一次；调用方不再二次执行。
+        assert calls["count"] == 1
+    finally:
+        await _teardown_chain(chain)
+
+
+# ---------------------------------------------------------------------------
+# P1-4: 第二次 DNR 最终反馈原子持久化（DB 与返回一致，崩溃后 Transcript 仍 false）
+# ---------------------------------------------------------------------------
+
+
+async def _db_row_safe_feedback(run_id: str) -> dict:
+    row = await _only_row(run_id)
+    assert row.safe_error_message is not None
+    return json.loads(row.safe_error_message)
+
+
+@pytest.mark.asyncio
+async def test_p1_first_dnr_db_and_return_both_retry_allowed() -> None:
+    """第一次 DNR：数据库与返回均为 retry_allowed=true。"""
+    chain = await _setup_chain()
+    try:
+        transport = FakeMcpTransport([McpConnectionTimeout("t1")])
+        bridge = _bridge(transport)
+
+        result = await bridge.execute(_context(chain), {"keyword": "美妆"})
+        assert result.error_type == DEFINITELY_NOT_SENT
+        assert json.loads(result.safe_summary)["same_fingerprint_retry_allowed"] is True
+        # DB 持久化与返回一致。
+        persisted = await _db_row_safe_feedback(chain.run_id)
+        assert persisted["same_fingerprint_retry_allowed"] is True
+        assert persisted["suggested_actions"] == [
+            "可对相同参数重试一次；仍失败则调整参数、拆分平台或继续其他章节"
+        ]
+    finally:
+        await _teardown_chain(chain)
+
+
+@pytest.mark.asyncio
+async def test_p1_second_dnr_db_and_return_both_exhausted() -> None:
+    """第二次 DNR：数据库与返回均为 retry_allowed=false（exhausted 反馈原子持久化）。"""
+    chain = await _setup_chain(steps=3)
+    try:
+        transport = FakeMcpTransport([
+            McpConnectionTimeout("t1"),
+            McpConnectionTimeout("t2"),
+        ])
+        bridge = _bridge(transport)
+
+        r1 = await bridge.execute(_context(chain, chain.step_ids[0]), {"keyword": "美妆"})
+        assert json.loads(r1.safe_summary)["same_fingerprint_retry_allowed"] is True
+
+        r2 = await bridge.execute(_context(chain, chain.step_ids[1]), {"keyword": "美妆"})
+        assert r2.error_type == DEFINITELY_NOT_SENT
+        returned = json.loads(r2.safe_summary)
+        assert returned["same_fingerprint_retry_allowed"] is False
+        assert returned["suggested_actions"] == [
+            "已用完一次重试：修改参数、拆分平台或更换工具后重试"
+        ]
+        # DB 持久化与返回完全相同。
+        persisted = await _db_row_safe_feedback(chain.run_id)
+        assert persisted == returned
+        assert persisted["same_fingerprint_retry_allowed"] is False
+    finally:
+        await _teardown_chain(chain)
+
+
+@pytest.mark.asyncio
+async def test_p1_second_dnr_crash_before_step_output_transcript_still_false() -> None:
+    """第二次 finalize 后、Step output 写入前崩溃：Transcript 恢复仍为 false。"""
+    chain = await _setup_chain(steps=2)
+    try:
+        transport = FakeMcpTransport([
+            McpConnectionTimeout("t1"),
+            McpConnectionTimeout("t2"),
+        ])
+        bridge = _bridge(transport)
+
+        r1 = await bridge.execute(_context(chain, chain.step_ids[0]), {"keyword": "美妆"})
+        assert json.loads(r1.safe_summary)["same_fingerprint_retry_allowed"] is True
+        r2 = await bridge.execute(_context(chain, chain.step_ids[1]), {"keyword": "美妆"})
+        assert json.loads(r2.safe_summary)["same_fingerprint_retry_allowed"] is False
+        # 此时 Step.output_json 尚未写入（协调器不更新 Step），模拟崩溃后接管。
+
+        async with SessionFactory() as db:
+            run = await db.get(AgentRun, chain.run_id)
+            transcript = await RunTranscriptLoader(db).load(run)
+        results = _transcript_tool_results(transcript.messages)
+        # 最后一个 DNR（第二次派发所在的 Step）回放必须仍是 false。
+        assert results[-1]["status"] == "failed"
+        replayed = json.loads(results[-1]["summary"])
+        assert replayed["same_fingerprint_retry_allowed"] is False
+    finally:
+        await _teardown_chain(chain)
+
+
+@pytest.mark.asyncio
+async def test_p1_third_same_fingerprint_not_dispatched_and_wallet_unchanged() -> None:
+    """第三次相同指纹不外发；两次 DNR 均释放，钱包最终状态不变。"""
+    chain = await _setup_chain(steps=4)
+    try:
+        transport = FakeMcpTransport([
+            McpConnectionTimeout("t1"),
+            McpConnectionTimeout("t2"),
+        ])
+        bridge = _bridge(transport)
+
+        for step_id in chain.step_ids[:2]:
+            result = await bridge.execute(_context(chain, step_id), {"keyword": "美妆"})
+            assert result.error_type == DEFINITELY_NOT_SENT
+        assert len(transport.calls) == 2
+
+        r3 = await bridge.execute(_context(chain, chain.step_ids[3]), {"keyword": "美妆"})
+        assert r3.error_type == DEFINITELY_NOT_SENT
+        assert json.loads(r3.safe_summary)["same_fingerprint_retry_allowed"] is False
+        assert len(transport.calls) == 2  # 第三次不外发
+
+        wallet = await _wallet(chain.user_id)
+        assert (wallet.balance, wallet.reserved) == (1000, 0)
     finally:
         await _teardown_chain(chain)
