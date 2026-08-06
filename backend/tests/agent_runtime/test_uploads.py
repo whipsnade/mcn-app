@@ -848,3 +848,76 @@ def test_p2_mixed_r_and_implicit_cells_keep_columns() -> None:
     columns, rows = _parse_xlsx(_custom_xlsx(sheet), max_rows=50000)
     assert columns == ["A", "B"]
     assert rows == [{"A": 1, "B": 2}]
+
+
+# ---------------------------------------------------------------------------
+# Stage 0 补充: cell/row 坐标冲突、row 无 r 推导、非 ASCII、1001 隐式列
+# ---------------------------------------------------------------------------
+
+
+def test_p2_cell_row_conflicts_with_enclosing_row_rejected() -> None:
+    """cell 行号与所属 row r 明显冲突（row r=2 内出现 A5）：受控错误。"""
+    sheet = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<worksheet {_WORKSHEET_NS}><dimension ref="A1:A6"/><sheetData>'
+        '<row r="2"><c r="A5"><v>9</v></c></row>'
+        "</sheetData></worksheet>"
+    )
+    with pytest.raises(UploadRejectedError) as exc_info:
+        _parse_xlsx(_custom_xlsx(sheet), max_rows=50000)
+    assert exc_info.value.error_code == "invalid_worksheet_coordinate"
+
+
+def test_p2_non_ascii_column_reference_rejected() -> None:
+    """非 ASCII（全角）列引用被拒绝：invalid_worksheet_coordinate。"""
+    sheet = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<worksheet {_WORKSHEET_NS}><sheetData>'
+        '<row r="1"><c r="Ａ1"><v>1</v></c></row>'
+        "</sheetData></worksheet>"
+    )
+    with pytest.raises(UploadRejectedError) as exc_info:
+        _parse_xlsx(_custom_xlsx(sheet), max_rows=50000)
+    assert exc_info.value.error_code == "invalid_worksheet_coordinate"
+
+
+def test_p2_negative_row_coordinate_rejected() -> None:
+    """负数行坐标被拒绝：invalid_worksheet_coordinate。"""
+    sheet = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<worksheet {_WORKSHEET_NS}><sheetData>'
+        '<row r="-1"><c r="A1"><v>1</v></c></row>'
+        "</sheetData></worksheet>"
+    )
+    with pytest.raises(UploadRejectedError) as exc_info:
+        _parse_xlsx(_custom_xlsx(sheet), max_rows=50000)
+    assert exc_info.value.error_code == "invalid_worksheet_coordinate"
+
+
+def test_p2_rows_without_r_derive_safe_row_numbers() -> None:
+    """row 无 r：按物理位置安全推导行号，不影响正常解析。"""
+    sheet = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<worksheet {_WORKSHEET_NS}><sheetData>'
+        '<row><c r="A1" t="inlineStr"><is><t>A</t></is></c>'
+        '<c r="B1" t="inlineStr"><is><t>B</t></is></c></row>'
+        '<row><c r="A2"><v>1</v></c><c r="B2"><v>2</v></c></row>'
+        "</sheetData></worksheet>"
+    )
+    columns, rows = _parse_xlsx(_custom_xlsx(sheet), max_rows=50000)
+    assert columns == ["A", "B"]
+    assert rows == [{"A": 1, "B": 2}]
+
+
+def test_p2_implicit_columns_over_1000_rejected() -> None:
+    """省略 r 的单元格超过 1000 列：worksheet_columns_exceeded。"""
+    cells = "".join(f'<c><v>{i}</v></c>' for i in range(1001))
+    sheet = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<worksheet {_WORKSHEET_NS}><sheetData>'
+        f'<row r="1">{cells}</row>'
+        "</sheetData></worksheet>"
+    )
+    with pytest.raises(UploadRejectedError) as exc_info:
+        _parse_xlsx(_custom_xlsx(sheet), max_rows=50000)
+    assert exc_info.value.error_code == "worksheet_columns_exceeded"

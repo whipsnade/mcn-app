@@ -155,12 +155,14 @@ def _scan_worksheet_coordinates(zf: zipfile.ZipFile, path: str, *, max_rows: int
     max_row_coordinate = 0
     actual_max_column = 0
     cell_index = 0
+    current_row_r: int | None = None
     try:
         with zf.open(path) as stream:
             for _event, element in ElementTree.iterparse(stream, events=("start",)):
                 local = element.tag.rsplit("}", 1)[-1]
                 if local == "row":
                     cell_index = 0
+                    current_row_r = None
                     physical_rows += 1
                     if physical_rows > max_rows + 1:
                         raise UploadRejectedError(
@@ -174,14 +176,31 @@ def _scan_worksheet_coordinates(zf: zipfile.ZipFile, path: str, *, max_rows: int
                                 status_code=400, error_code="invalid_worksheet_coordinate",
                                 message=f"invalid row coordinate: {raw_r!r}",
                             )
-                        row_no = int(raw_r)
-                        if row_no > max_row_coordinate:
-                            max_row_coordinate = row_no
+                        current_row_r = int(raw_r)
+                    # row 无 r 时按物理位置安全推导行号（与物理行数上限一致）。
+                    row_no = current_row_r if current_row_r is not None else physical_rows
+                    if row_no > max_row_coordinate:
+                        max_row_coordinate = row_no
                 elif local == "c":
                     cell_index += 1
                     ref = element.attrib.get("r")
                     if ref:
                         column, cell_row = _column_index_from_ref(ref)
+                        if cell_row > max_rows + 1:
+                            # cell 行号超限优先拒绝（与 row 坐标语义一致）。
+                            raise UploadRejectedError(
+                                status_code=400, error_code="worksheet_dimensions_exceeded",
+                                message=f"cell row {cell_row} exceeds {max_rows + 1}",
+                            )
+                        if (
+                            current_row_r is not None
+                            and cell_row != current_row_r
+                        ):
+                            # cell 行号与所属 row r 明显冲突：受控拒绝。
+                            raise UploadRejectedError(
+                                status_code=400, error_code="invalid_worksheet_coordinate",
+                                message=f"cell row {cell_row} conflicts with row {current_row_r}",
+                            )
                         if cell_row > max_row_coordinate:
                             max_row_coordinate = cell_row
                     else:
