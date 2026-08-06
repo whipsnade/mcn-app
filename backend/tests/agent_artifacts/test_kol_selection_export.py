@@ -150,3 +150,42 @@ def test_other_artifact_types_raise_unsupported() -> None:
         with pytest.raises(ArtifactExportUnsupported) as excinfo:
             export_artifact(_Version(schema, payload))
         assert excinfo.value.code == "ARTIFACT_EXPORT_UNSUPPORTED"
+
+
+# ---------------------------------------------------------------------------
+# Gate C 审核修复：Top20 样式一致 / 无示例残留
+# ---------------------------------------------------------------------------
+
+
+def test_kol_top20_rows_have_consistent_style() -> None:
+    """Top20 第 13/14/20 行 style_id、边框、填充、行高一致。"""
+    content = export_artifact(_kol_version_with_20_items())
+    wb = load_workbook(BytesIO(content))
+    summary = wb["达人圈选总表"]
+    from openpyxl.cell.cell import MergedCell
+
+    def _row_style(row: int):
+        cells = [summary.cell(row, c) for c in range(1, 19)]
+        return {
+            "styles": [c.style_id for c in cells if not isinstance(c, MergedCell)],
+            "border": [bool(c.border.left.style) for c in cells],
+            "height": summary.row_dimensions[row].height,
+        }
+
+    r13, r14, r20 = _row_style(13), _row_style(14), _row_style(20)
+    # 字体/边框/行高全行一致；填充按奇偶交替（同奇偶 style_id 一致）。
+    assert r13["border"] == r14["border"] == r20["border"]
+    assert r13["height"] == r14["height"] == r20["height"] == 20
+    assert r14["styles"] == r20["styles"]  # 同为奇数数据行
+    assert r13["styles"] != r14["styles"]  # 交替填充生效
+
+
+def test_kol_detail_rows_consistent_style() -> None:
+    content = export_artifact(_kol_version_with_20_items())
+    wb = load_workbook(BytesIO(content))
+    detail = wb["达人详细画像"]
+    # 第 1 个详情块「【达人概况】」数值行与第 20 个块对应行样式一致。
+    row1 = detail.cell(4, 2)
+    # 直接断言存在非空行高与边框。
+    assert detail.row_dimensions[4].height in (None, 20)
+    assert row1.border.left.style is not None

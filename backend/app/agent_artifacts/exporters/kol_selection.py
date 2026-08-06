@@ -18,7 +18,7 @@ from io import BytesIO
 from pathlib import Path
 
 from openpyxl import load_workbook
-from openpyxl.styles import Font
+from openpyxl.styles import Alignment, Border, Font, Side
 
 from app.agent_artifacts.exporters._common import (
     cell_value,
@@ -115,6 +115,7 @@ def _summary_values(item) -> tuple[list[str], list[object]]:
 
 def _render_summary(sheet, selection) -> None:
     scope = selection.scope
+    clear_rows_unmerged(sheet, 1, 200, 19)
     brand = scope.brand or "KOL"
     sheet["A1"] = cell_value(f"{brand} KOL 圈选名单")
     platforms = "、".join(platform_label(name) for name in scope.platforms) or "未指定"
@@ -123,7 +124,6 @@ def _render_summary(sheet, selection) -> None:
         f"平台: {platforms} | 候选: {present(summary.candidate_count)} | "
         f"圈选: {present(summary.selected_count)} | 评分: {selection.data.scoring.version}"
     )
-    clear_rows_unmerged(sheet, 4, 200, 19)
     items = list(selection.data.items)
     extra_headers, _ = _summary_values(items[0]) if items else ([], [])
     headers = list(_SUMMARY_HEADER_PREFIX) + extra_headers
@@ -212,9 +212,26 @@ def _write_detail_block(sheet, start_row: int, item) -> int:
                 ["数据完整度", snapshot.data_completeness],
             ]
         )
+    _DATA_FONT = Font(name="微软雅黑", size=10)
+    _DATA_BORDER = Border(
+        left=Side(style="thin", color="D9D9D9"),
+        right=Side(style="thin", color="D9D9D9"),
+        top=Side(style="thin", color="D9D9D9"),
+        bottom=Side(style="thin", color="D9D9D9"),
+    )
+    _DATA_ALIGNMENT = Alignment(vertical="center")
     for label, value in overview_rows:
-        sheet.cell(row, 1).value = label
-        write_value(sheet.cell(row, 2), value)
+        label_cell = sheet.cell(row, 1)
+        label_cell.value = label
+        label_cell.font = _DATA_FONT
+        label_cell.border = _DATA_BORDER
+        label_cell.alignment = _DATA_ALIGNMENT
+        value_cell = sheet.cell(row, 2)
+        write_value(value_cell, value)
+        value_cell.font = _DATA_FONT
+        value_cell.border = _DATA_BORDER
+        value_cell.alignment = _DATA_ALIGNMENT
+        sheet.row_dimensions[row].height = 20
         row += 1
 
     row = _section(row + 1, "【评分维度】")
@@ -226,6 +243,12 @@ def _write_detail_block(sheet, start_row: int, item) -> int:
         sheet.cell(row, 3).value = entry.weighted_score
         write_value(sheet.cell(row, 4), "缺失" if entry.missing_reason else "完整")
         write_value(sheet.cell(row, 5), present(entry.missing_reason))
+        for column in range(1, 6):
+            cell = sheet.cell(row, column)
+            cell.font = _DATA_FONT
+            cell.border = _DATA_BORDER
+            cell.alignment = _DATA_ALIGNMENT
+        sheet.row_dimensions[row].height = 20
         row += 1
     return row + 1  # 块后空一行
 

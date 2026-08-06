@@ -49,6 +49,15 @@ def render_campaign_workbook(payload: dict) -> bytes:
     """把已发布 campaign_report_v2 payload 渲染为 .xlsx bytes（同步 CPU 密集）。"""
     report = CampaignReportV2.model_validate(payload)
     workbook = load_workbook(TEMPLATE_PATH)
+    _write_title(workbook["活动综合概览"], f"{report.scope.brand}「{report.scope.campaign}」活动分析报告")
+    _write_title(workbook["周期对比与趋势"], "周期对比与趋势")
+    _write_title(workbook["平台表现"], "平台表现")
+    _write_title(workbook["情感与内容分析"], "情感与内容分析")
+    _write_title(workbook["热门帖子TOP"], "热门帖子 TOP")
+    _write_title(workbook["达人投放表现"], "达人投放表现")
+    _write_title(workbook["自然传播与受众"], "自然传播与受众")
+    _write_title(workbook["洞察与建议"], "洞察与建议")
+    _write_title(workbook["方法论"], "数据说明与方法论")
     _render_overview(workbook["活动综合概览"], report)
     _render_comparisons(workbook["周期对比与趋势"], report)
     _render_platforms(workbook["平台表现"], report)
@@ -58,12 +67,19 @@ def render_campaign_workbook(payload: dict) -> bytes:
     _render_organic_audience(workbook["自然传播与受众"], report)
     _render_insights(workbook["洞察与建议"], report)
     _render_methodology(workbook["方法论"], report)
-    if report.data.roi is not None:
-        roi_sheet = workbook.create_sheet(ROI_SHEET)
+    # ROI Sheet 来自受控模板（带视觉结构）；无 ROI 时移除，不暗示。
+    roi_sheet = workbook[ROI_SHEET]
+    if report.data.roi is None:
+        workbook.remove(roi_sheet)
+    else:
         _render_roi(roi_sheet, report)
     output = BytesIO()
     workbook.save(output)
     return output.getvalue()
+
+
+def _write_title(sheet, text: str) -> None:
+    sheet["A1"] = cell_value(text)
 
 
 def _sheet_headers(sheet, headers: list[str], row: int = 3, columns: int = 8) -> None:
@@ -100,7 +116,8 @@ def _render_overview(sheet, report) -> None:
 
 
 def _render_comparisons(sheet, report) -> None:
-    clear_rows_unmerged(sheet, 4, 100, 6)
+    clear_rows_unmerged(sheet, 2, 100, 6)
+    sheet._charts = []
     comparisons = report.data.comparisons
     rows = []
     for series in comparisons.current_baseline:
@@ -123,6 +140,20 @@ def _render_comparisons(sheet, report) -> None:
         pct_columns=(5,),
         note=empty_note(report, "comparisons"),
     )
+    if rows:
+        last = 4 + len(rows)
+        chart = BarChart()
+        chart.title = "活动期 vs 活动前"
+        chart.add_data(
+            Reference(sheet, min_col=2, min_row=5, max_row=last), titles_from_data=False
+        )
+        chart.add_data(
+            Reference(sheet, min_col=3, min_row=5, max_row=last), titles_from_data=False
+        )
+        chart.set_categories(Reference(sheet, min_col=1, min_row=5, max_row=last))
+        chart.height = 8
+        chart.width = 15
+        sheet.add_chart(chart, f"F{last + 2}")
 
 
 def _render_platforms(sheet, report) -> None:
@@ -150,13 +181,14 @@ def _render_platforms(sheet, report) -> None:
         note=empty_note(report, "platform_contributions"),
     )
     if rows:
-        last = 3 + len(rows)
+        # 数据自第 5 行起（表头@4）：图表引用也必须从第 5 行开始。
+        last = 4 + len(rows)
         chart = BarChart()
         chart.title = "平台声量分布"
         chart.add_data(
-            Reference(sheet, min_col=2, min_row=4, max_row=last), titles_from_data=False
+            Reference(sheet, min_col=2, min_row=5, max_row=last), titles_from_data=True
         )
-        chart.set_categories(Reference(sheet, min_col=1, min_row=4, max_row=last))
+        chart.set_categories(Reference(sheet, min_col=1, min_row=5, max_row=last))
         chart.height = 8
         chart.width = 15
         sheet.add_chart(chart, f"F{last + 2}")
@@ -171,6 +203,7 @@ def _render_sentiment_content(sheet, report) -> None:
         ["中性", summary.neutral.count, summary.neutral.share],
         ["负面", summary.negative.count, summary.negative.share],
     ]
+    sheet._charts = []
     row = write_table(
         sheet,
         4,
@@ -181,6 +214,17 @@ def _render_sentiment_content(sheet, report) -> None:
         pct_columns=(3,),
         note=empty_note(report, "sentiment"),
     )
+    if summary.positive.count is not None or summary.negative.count is not None:
+        chart = BarChart()
+        chart.title = "情感分布"
+        chart.add_data(
+            Reference(sheet, min_col=2, min_row=5, max_row=4 + len(rows)),
+            titles_from_data=True,
+        )
+        chart.set_categories(Reference(sheet, min_col=1, min_row=5, max_row=4 + len(rows)))
+        chart.height = 8
+        chart.width = 14
+        sheet.add_chart(chart, f"F{4 + len(rows) + 2}")
     write_table(
         sheet,
         row + 1,
@@ -196,29 +240,29 @@ def _render_sentiment_content(sheet, report) -> None:
 
 
 def _render_top_posts(sheet, report) -> None:
-    clear_rows_unmerged(sheet, 4, 100, 8)
-    rows = [
-        [
-            index,
-            platform_label(post.platform),
-            post.title,
-            post.author,
-            post.engagement,
-            post.likes,
-            post.comments,
-            post.shares,
-        ]
-        for index, post in enumerate(report.data.top_posts, start=1)
-    ]
-    write_table(
-        sheet,
-        4,
-        None,
-        ["排名", "平台", "标题", "作者", "互动数", "点赞", "评论", "分享"],
-        rows,
-        columns=8,
-        note=empty_note(report, "top_posts"),
-    )
+    posts = report.data.top_posts
+    clear_rows_unmerged(sheet, 2, 100, 8)
+    for column, header in enumerate(
+        ("排名", "平台", "标题", "作者", "互动数", "点赞", "评论", "分享"), start=1
+    ):
+        sheet.cell(3, column).value = header
+    if not posts:
+        sheet.merge_cells("A4:H4")
+        sheet["A4"] = empty_note(report, "top_posts")
+        return
+    for index, post in enumerate(posts, start=1):
+        row = 3 + index
+        sheet.cell(row, 1).value = index
+        sheet.cell(row, 2).value = cell_value(platform_label(post.platform))
+        title_cell = sheet.cell(row, 3)
+        title_cell.value = cell_value(post.title)
+        if post.url is not None:
+            title_cell.hyperlink = post.url
+        sheet.cell(row, 4).value = cell_value(post.author)
+        sheet.cell(row, 5).value = post.engagement
+        sheet.cell(row, 6).value = post.likes
+        sheet.cell(row, 7).value = post.comments
+        sheet.cell(row, 8).value = post.shares
 
 
 def _render_kols(sheet, report) -> None:
@@ -247,7 +291,8 @@ def _render_kols(sheet, report) -> None:
 
 
 def _render_organic_audience(sheet, report) -> None:
-    clear_rows_unmerged(sheet, 4, 100, 6)
+    clear_rows_unmerged(sheet, 2, 100, 6)
+    sheet._charts = []
     organic = report.data.organic_summary
     rows = []
     if organic is not None:
@@ -279,6 +324,39 @@ def _render_organic_audience(sheet, report) -> None:
         pct_columns=(3,),
         note=empty_note(report, "audience_regions"),
     )
+    # 归属分布图（自然/付费/未知）。
+    attribution = report.data.attribution
+    if attribution is not None and any(
+        v is not None for v in (attribution.paid_confirmed, attribution.organic, attribution.unknown)
+    ):
+        attr_rows = [
+            ["付费确认", attribution.paid_confirmed],
+            ["自然", attribution.organic],
+            ["未知", attribution.unknown],
+        ]
+        attr_start = 4 + len(rows)
+        write_table(
+            sheet,
+            attr_start,
+            "内容归属",
+            ["归属", "帖数"],
+            attr_rows,
+            columns=2,
+            note=empty_note(report, "attribution"),
+        )
+        if any(v is not None for _, v in attr_rows):
+            chart = BarChart()
+            chart.title = "内容归属"
+            chart.add_data(
+                Reference(sheet, min_col=2, min_row=attr_start + 2, max_row=attr_start + 1 + len(attr_rows)),
+                titles_from_data=False,
+            )
+            chart.set_categories(
+                Reference(sheet, min_col=1, min_row=attr_start + 2, max_row=attr_start + 1 + len(attr_rows))
+            )
+            chart.height = 8
+            chart.width = 14
+            sheet.add_chart(chart, f"D{attr_start + 1 + len(attr_rows) + 2}")
 
 
 def _render_insights(sheet, report) -> None:

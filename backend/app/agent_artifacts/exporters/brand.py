@@ -45,10 +45,22 @@ SHEET_ORDER = (
 )
 
 
+def _write_title(sheet, text: str, columns: int = 8) -> None:
+    sheet["A1"] = cell_value(text)
+
+
 def render_brand_workbook(payload: dict) -> bytes:
     """把已发布 brand_report_v3 payload 渲染为 .xlsx bytes（同步 CPU 密集）。"""
     report = BrandReportV3.model_validate(payload)
     workbook = load_workbook(TEMPLATE_PATH)
+    _write_title(workbook["综合概览"], f"{report.scope.brand} 品牌社交媒体表现分析报告")
+    _write_title(workbook["情感分析"], "内容情感分布")
+    _write_title(workbook["日趋势"], "每日声量与互动趋势")
+    _write_title(workbook["内容类型与达人"], "内容类型与达人分布")
+    _write_title(workbook["地域分布"], "发帖用户地域分布")
+    _write_title(workbook["热门帖子TOP"], "热门帖子 TOP")
+    _write_title(workbook["舆情洞察"], "舆情洞察与内容主题分析")
+    _write_title(workbook["方法论"], "数据说明与方法论")
     _render_overview(workbook["综合概览"], report)
     _render_sentiment(workbook["情感分析"], report)
     _render_daily_trend(workbook["日趋势"], report)
@@ -67,7 +79,6 @@ def render_brand_workbook(payload: dict) -> bytes:
 
 def _render_overview(sheet, report) -> None:
     scope = report.scope
-    sheet["A1"] = cell_value(f"{scope.brand} 品牌社交媒体表现分析报告")
     sheet["B2"] = cell_value(
         f"{scope.period.start} 至 {scope.period.end}（数据截至 {report.methodology.data_as_of:%Y-%m-%d}）"
     )
@@ -129,15 +140,19 @@ def _render_sentiment(sheet, report) -> None:
 
 def _render_daily_trend(sheet, report) -> None:
     points = report.data.daily_trend
-    clear_rows_unmerged(sheet, 4, 100, 4)
+    clear_rows_unmerged(sheet, 2, 100, 4)
     sheet._charts = []
+    # 表头由 exporter 写（系列名来自表头，避免 Series 1/Series 2）。
+    for column, header in enumerate(("日期", "声量", "互动数", "备注"), start=1):
+        sheet.cell(3, column).value = header
     if not points:
         sheet.merge_cells("A4:D4")
         sheet["A4"] = empty_note(report, "daily_trend")
         return
     for index, point in enumerate(points):
         row = 4 + index
-        sheet.cell(row, 1).value = point.date
+        # 日期写文本（ISO），避免 Excel 日期序列号。
+        sheet.cell(row, 1).value = point.date.isoformat()
         sheet.cell(row, 2).value = point.volume
         sheet.cell(row, 3).value = point.engagement
         sheet.cell(row, 4).value = cell_value(platform_label(point.platform))
@@ -233,29 +248,28 @@ def _render_regions(sheet, report) -> None:
 
 def _render_top_posts(sheet, report) -> None:
     posts = report.data.top_posts
-    clear_rows_unmerged(sheet, 4, 100, 8)
-    rows = [
-        [
-            index,
-            platform_label(post.platform),
-            post.title,
-            post.author,
-            post.engagement,
-            None,  # 阅读数无对应字段
-            post.likes,
-            post.comments,
-        ]
-        for index, post in enumerate(posts, start=1)
-    ]
-    write_table(
-        sheet,
-        4,
-        None,
-        ["排名", "平台", "标题", "用户昵称", "互动数", "阅读数", "点赞", "评论"],
-        rows,
-        columns=8,
-        note=empty_note(report, "top_posts"),
-    )
+    clear_rows_unmerged(sheet, 2, 100, 8)
+    for column, header in enumerate(
+        ("排名", "平台", "标题", "用户昵称", "互动数", "阅读数", "点赞", "评论"), start=1
+    ):
+        sheet.cell(3, column).value = header
+    if not posts:
+        sheet.merge_cells("A4:H4")
+        sheet["A4"] = empty_note(report, "top_posts")
+        return
+    for index, post in enumerate(posts, start=1):
+        row = 3 + index
+        sheet.cell(row, 1).value = index
+        sheet.cell(row, 2).value = cell_value(platform_label(post.platform))
+        title_cell = sheet.cell(row, 3)
+        title_cell.value = cell_value(post.title)
+        if post.url is not None:
+            title_cell.hyperlink = post.url  # 仅 http/https（payload 已校验）
+        sheet.cell(row, 4).value = cell_value(post.author)
+        sheet.cell(row, 5).value = post.engagement
+        sheet.cell(row, 6).value = None  # 阅读数无对应字段
+        sheet.cell(row, 7).value = post.likes
+        sheet.cell(row, 8).value = post.comments
 
 
 def _render_insights(sheet, report) -> None:

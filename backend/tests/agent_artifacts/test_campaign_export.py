@@ -110,3 +110,64 @@ def test_campaign_invalid_payload_raises_unsupported() -> None:
     with pytest.raises(ArtifactExportUnsupported) as excinfo:
         export_artifact(_Version("campaign_report_v2", {"schema_version": "campaign_report_v2"}))
     assert excinfo.value.code == "ARTIFACT_EXPORT_UNSUPPORTED"
+
+
+# ---------------------------------------------------------------------------
+# Gate C 审核修复：图表真实引用 / ROI 模板 Sheet / used range
+# ---------------------------------------------------------------------------
+
+
+def test_campaign_platform_chart_refs_start_at_row_5() -> None:
+    payload = build_campaign_dict()
+    content = export_artifact(_Version("campaign_report_v2", payload))
+    wb = load_workbook(BytesIO(content), data_only=False)
+    platforms = wb["平台表现"]
+    charts = [c for c in platforms._charts if c is not None]
+    assert charts, "平台表现必须有真实图表"
+    refs = [ser.val.numRef.f for chart in charts for ser in chart.ser]
+    assert any("$B$5" in ref for ref in refs), refs
+
+
+def test_campaign_trend_chart_rebuilt() -> None:
+    payload = build_campaign_dict()
+    payload["data"]["comparisons"] = {
+        "current_baseline": [
+            {"metric": "volume", "current": 1200, "baseline": 800, "delta": 400, "rate": 0.5},
+            {"metric": "engagement", "current": 5000, "baseline": 3000, "delta": 2000, "rate": 0.67},
+        ],
+        "current_post": [],
+    }
+    content = export_artifact(_Version("campaign_report_v2", payload))
+    wb = load_workbook(BytesIO(content), data_only=False)
+    trend = wb["周期对比与趋势"]
+    assert trend._charts, "周期对比必须重建图表"
+    refs = [ser.val.numRef.f for chart in trend._charts for ser in chart.ser]
+    assert any("$B$5" in ref for ref in refs), refs
+
+
+def test_campaign_used_range_not_extended_to_1000() -> None:
+    content = export_artifact(_campaign_version_roi())
+    wb = load_workbook(BytesIO(content), data_only=False)
+    for ws in wb.worksheets:
+        assert ws.max_row < 100, f"{ws.title} max_row={ws.max_row}"
+
+
+def _campaign_version_roi() -> _Version:
+    payload = build_campaign_dict()
+    payload["data"]["internal_metrics"] = {
+        "spend": 100000,
+        "impressions": 2000000,
+        "conversions": 5000,
+        "revenue": 300000,
+        "cpc": 20.0,
+        "cpm": 50.0,
+    }
+    payload["data"]["roi"] = {
+        "spend": 100000,
+        "revenue": 300000,
+        "conversions": 5000,
+        "attribution_window": "最后点击 7 天",
+        "roi": 2.0,
+        "roas": 3.0,
+    }
+    return _Version("campaign_report_v2", payload)

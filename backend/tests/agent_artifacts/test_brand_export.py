@@ -190,3 +190,47 @@ def test_restricted_brand_discloses_restricted_sections() -> None:
     assert "数据源暂不可用" in str(_values(trend))
     assert trend._charts == []  # 空章节不建图
     assert 1000 in _values(wb["综合概览"])
+
+
+# ---------------------------------------------------------------------------
+# Gate C 审核修复：模板无示例残留 / 图表真实引用 / used range
+# ---------------------------------------------------------------------------
+
+
+def test_no_fixed_sample_values_in_exported_workbook() -> None:
+    """来源模板的固定品牌/日期/「小红书 TOP15」标题不得出现在最终文件。"""
+    content = export_artifact(_brand_version())
+    wb = load_workbook(BytesIO(content), data_only=False)
+    blob = "\n".join(
+        str(cell.value)
+        for ws in wb.worksheets
+        for row in ws.iter_rows()
+        for cell in row
+        if cell.value is not None
+    )
+    assert "昊来了" not in blob
+    assert "2026-06-30" not in blob
+    assert "TOP 15" not in blob
+    assert "某品牌" in blob  # 动态标题存在
+
+
+def test_daily_trend_series_names_and_date_text() -> None:
+    """趋势图系列名来自表头（非 Series N）；日期轴为文本而非 Excel 序列号。"""
+    content = export_artifact(_brand_version_multi())
+    wb = load_workbook(BytesIO(content), data_only=False)
+    sheet = wb["日趋势"]
+    assert sheet["B3"].value == "声量"
+    assert sheet["C3"].value == "互动数"
+    assert sheet["A4"].value == "2026-01-01"  # 日期文本
+    assert len(sheet._charts) == 1
+    chart = sheet._charts[0]
+    refs = [ser.val.numRef.f for ser in chart.ser]
+    assert "'日趋势'!$B$4:$B$6" in refs
+    assert "'日趋势'!$C$4:$C$6" in refs
+
+
+def test_used_range_not_extended_to_row_1000() -> None:
+    content = export_artifact(_brand_version_multi())
+    wb = load_workbook(BytesIO(content), data_only=False)
+    for ws in wb.worksheets:
+        assert ws.max_row < 100, f"{ws.title} max_row={ws.max_row}"

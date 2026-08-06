@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import Any, Sequence
 
 from openpyxl.cell.cell import MergedCell
-from openpyxl.styles import Font
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
 MISSING = "未采集"
 PCT_FORMAT = "0.00%"
@@ -21,6 +21,17 @@ _PLATFORM_LABELS = {
     "weibo": "微博",
     "wechat": "微信",
 }
+
+_DATA_FONT = Font(name="微软雅黑", size=10)
+_DATA_BORDER = Border(
+    left=Side(style="thin", color="D9D9D9"),
+    right=Side(style="thin", color="D9D9D9"),
+    top=Side(style="thin", color="D9D9D9"),
+    bottom=Side(style="thin", color="D9D9D9"),
+)
+_ALTERNATE_FILL = PatternFill("solid", fgColor="D6E4F0")
+_DATA_ALIGNMENT = Alignment(vertical="center", wrap_text=False)
+_DATA_ROW_HEIGHT = 20
 
 
 def present(value: Any) -> Any:
@@ -81,10 +92,14 @@ def write_table(
     columns: int,
     pct_columns: Sequence[int] = (),
     note: str | None = None,
+    alternate_fill: bool = True,
+    row_height: int | None = _DATA_ROW_HEIGHT,
 ) -> int:
     """写一个 [可选标题 + 表头 + 数据行] 小节，返回下一空行行号。
 
     空数据行保留标题与表头，并在数据区写受限/未采集说明；绝不伪造数据。
+    Gate C 审核：动态数据行统一应用 font/border/alignment/交替填充与行高，
+    保证 Top20 等长名单样式一致。
     """
     row = start_row
     if title is not None:
@@ -102,7 +117,7 @@ def write_table(
         sheet.merge_cells(start_row=row, start_column=1, end_row=row, end_column=columns)
         sheet.cell(row, 1).value = note or MISSING
         return row + 1
-    for values in rows:
+    for index, values in enumerate(rows):
         for column, value in enumerate(values, start=1):
             cell = sheet.cell(row, column)
             if column in pct_columns:
@@ -112,6 +127,14 @@ def write_table(
                     write_pct(cell, None)
             else:
                 write_value(cell, value)
+            # Gate C 审核：数据行统一样式（字体/边框/对齐/交替填充/行高）。
+            cell.font = _DATA_FONT
+            cell.border = _DATA_BORDER
+            cell.alignment = _DATA_ALIGNMENT
+            if alternate_fill and index % 2 == 1:
+                cell.fill = _ALTERNATE_FILL
+        if row_height is not None:
+            sheet.row_dimensions[row].height = row_height
         row += 1
     return row
 

@@ -40,24 +40,15 @@ TEMPLATE_VERSION = "gate-c-v1"
 DEFAULT_OUT = BACKEND / "app" / "agent_artifacts" / "templates"
 
 # 每个 brand Sheet 的数据清理起点：保留标题@1 与（如适用）固定表头行。
-BRAND_CLEAR_FROM = {
-    "综合概览": 5,  # 保留标题/周期/来源/搜索方式锚点，清 5 行起
-    "情感分析": 2,
-    "日趋势": 2,
-    "内容类型与达人": 2,
-    "地域分布": 2,
-    "热门帖子TOP": 2,
-    "舆情洞察": 2,
-    "方法论": 2,
-}
+# 清理起点全部为 1：业务标题/固定日期/示例达人等全部清除（由导出器动态写）。
+BRAND_CLEAR_FROM = {name: 1 for name in (
+    "综合概览", "情感分析", "日趋势", "内容类型与达人", "地域分布",
+    "热门帖子TOP", "舆情洞察", "方法论",
+)}
 
-# kol Sheet 清理起点（首表重命名后处理）。
-KOL_CLEAR_FROM = {
-    "达人圈选总表": 3,  # 保留标题/元数据，清 3 行起（表头@4 由渲染器重写）
-    "达人详细画像": 1,
-    "粉丝画像详情": 1,  # 表头@1 由渲染器重写
-    "评分方法论与数据来源": 5,  # 保留标题/章节/表头@4
-}
+KOL_CLEAR_FROM = {name: 1 for name in (
+    "达人圈选总表", "达人详细画像", "粉丝画像详情", "评分方法论与数据来源",
+)}
 
 
 def _strip_art(ws: Worksheet) -> None:
@@ -76,14 +67,14 @@ def _clear_data(ws: Worksheet, start_row: int) -> None:
 
 
 def _write_template_metadata(wb, sheet_name: str) -> None:
-    """隐藏 metadata：定义名 TEMPLATE_VERSION 指向首表 A1000。"""
-    ws = wb[sheet_name]
-    ws.cell(1000, 1).value = TEMPLATE_VERSION
-    ws.cell(1000, 2).value = "template_version"
-    from openpyxl.workbook.defined_name import DefinedName
+    """模板版本写入文档自定义属性（不扩大任何业务 Sheet 的 used range）。"""
+    del sheet_name
+    from openpyxl.packaging.custom import StringProperty
 
-    wb.defined_names["TEMPLATE_VERSION"] = DefinedName(
-        "TEMPLATE_VERSION", attr_text=f"'{sheet_name}'!$A$1000"
+    if wb.custom_doc_props is None:
+        wb.custom_doc_props = []
+    wb.custom_doc_props.append(
+        StringProperty(name="TEMPLATE_VERSION", value=TEMPLATE_VERSION)
     )
 
 
@@ -155,6 +146,7 @@ def build_campaign(output_dir: Path) -> Path:
         ("自然传播与受众", 6),
         ("洞察与建议", 4),
         ("方法论", 4),
+        ("ROI与转化", 6),
     ]
     for name, columns in sheet_specs:
         ws = wb.create_sheet(name)
