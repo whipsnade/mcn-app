@@ -31,7 +31,6 @@ from app.agent_runtime.tools.calculation import (
     RankKolsTool,
 )
 from app.agent_runtime.tools.contracts import ToolContext
-from app.selection.scoring_v2 import SCORE_VERSION_V2
 
 CTX = ToolContext(
     user_id="u-1",
@@ -330,11 +329,22 @@ async def test_normalize_sentiment_labels() -> None:
 
 
 # ---------------------------------------------------------------------------
-# rank_kols：严格复用 kol_score_v2
+# rank_kols：严格复用 kol_value_score_v3（效果 70 + 价格效率 30）
 # ---------------------------------------------------------------------------
 
+V3_EXPECTED_WEIGHTS = {
+    "average_interactions": 14,
+    "active_follower": 10,
+    "engagement_follower_ratio": 10,
+    "content_match": 10,
+    "followers": 7,
+    "industry_interest": 7,
+    "target_region": 6,
+    "target_age": 6,
+}
 
-async def test_rank_kols_uses_strict_scorer_with_exact_weights() -> None:
+
+async def test_rank_kols_uses_strict_v3_snapshot_with_exact_weights() -> None:
     tool = RankKolsTool()
     result = await tool.execute(
         CTX,
@@ -347,18 +357,21 @@ async def test_rank_kols_uses_strict_scorer_with_exact_weights() -> None:
     assert data["total"] == 1
     item = data["items"][0]
     snapshot = item["score_snapshot"]
-    assert snapshot["version"] == SCORE_VERSION_V2
-    assert snapshot["weights"] == EXPECTED_WEIGHTS
-    assert set(snapshot["dimensions"].keys()) == set(EXPECTED_WEIGHTS.keys())
-    # 每维 raw_score/weight/weighted_score 齐全，weighted_score 由 raw*weight/100 计算。
+    assert snapshot["version"] == "kol_value_score_v3"
+    assert set(snapshot["dimensions"].keys()) == set(V3_EXPECTED_WEIGHTS.keys())
     for name, dimension in snapshot["dimensions"].items():
-        assert dimension["weight"] == EXPECTED_WEIGHTS[name]
+        assert dimension["weight"] == V3_EXPECTED_WEIGHTS[name]
         assert dimension["weighted_score"] == pytest.approx(
-            round(dimension["raw_score"] * EXPECTED_WEIGHTS[name] / 100, 2)
+            round(dimension["raw_score"] * V3_EXPECTED_WEIGHTS[name] / 100, 2)
         )
-    assert snapshot["total"] == pytest.approx(
+    # 效果 70 + 价格效率 30 = 价值总分。
+    assert snapshot["effect_score"] == pytest.approx(
         sum(d["weighted_score"] for d in snapshot["dimensions"].values())
     )
+    assert snapshot["value_score"] == pytest.approx(
+        snapshot["effect_score"] + snapshot["price_efficiency_score"]
+    )
+    assert snapshot["price_sample_size"] >= 0
 
 
 async def test_rank_kols_missing_dimension_is_zero_no_redistribution() -> None:
@@ -372,20 +385,22 @@ async def test_rank_kols_missing_dimension_is_zero_no_redistribution() -> None:
     )
     data = _summary(result)
     snapshot = data["items"][0]["score_snapshot"]
-    # 仅 content_score=80 → 15 分维度有效：weighted=12，其余维度 0，无权重重分配。
-    assert snapshot["dimensions"]["content"]["raw_score"] == 80
-    assert snapshot["dimensions"]["engagement"]["raw_score"] == 0
-    assert snapshot["dimensions"]["engagement"]["missing_reason"] == "missing_average_interactions"
-    assert snapshot["total"] == 12
-    assert snapshot["data_completeness"] == 15
+    # 仅 content_match=80 → 10 分维度有效：weighted=8，其余维度 0，无权重重分配。
+    assert snapshot["dimensions"]["content_match"]["raw_score"] == 80
+    assert snapshot["dimensions"]["average_interactions"]["raw_score"] == 0
+    assert snapshot["dimensions"]["average_interactions"]["missing_reason"] == "missing_average_interactions"
+    assert snapshot["effect_score"] == pytest.approx(8.0)
+    assert snapshot["data_completeness"] == pytest.approx(10 / 70 * 100, abs=0.01)
 
 
-async def test_rank_kols_default_top20_engagement_total_desc() -> None:
+async def test_rank_kols_default_top20_sorted_by_value_with_stable_tiebreak() -> None:
     tool = RankKolsTool()
+    # d1 互动/粉丝最高 → 效果与价值最高；其余同输入 → 稳定 tie-break。
     items = [
         _kol_item(uid=f"{i}", engagement_total=float(200 - i * 10)) for i in range(5)
     ]
-    # 打乱顺序以验证排序。
+    items[0]["score_inputs"]["average_interactions"] = 200_000
+    items[0]["score_inputs"]["followers"] = 5_000_000
     items.reverse()
     result = await tool.execute(
         CTX,
@@ -395,29 +410,80 @@ async def test_rank_kols_default_top20_engagement_total_desc() -> None:
         ),
     )
     data = _summary(result)
-    assert [item["kol_uid"] for item in data["items"]] == ["0", "1", "2", "3", "4"]
+    assert data["items"][0]["kol_uid"] == "0"
     assert [item["rank"] for item in data["items"]] == [1, 2, 3, 4, 5]
     assert data["truncated"] is False
 
 
-async def test_rank_kols_missing_engagement_total_sorted_last_and_limit() -> None:
+async def test_rank_kols_preference_only_changes_order_not_scores() -> None:
     tool = RankKolsTool()
     items = [
-        _kol_item(uid="a", engagement_total=None),
-        _kol_item(uid="b", engagement_total=10),
-        _kol_item(uid="c", engagement_total=5),
+        _kol_item(uid="a", engagement_total=100, quoted_price=1000),
+        _kol_item(uid="b", engagement_total=100, quoted_price=800),
+        _kol_item(uid="c", engagement_total=100, quoted_price=600),
+    ]
+    balanced = _summary(await tool.execute(
+        CTX, type(tool).input_model(items=items, context={"industry": "美食"},
+                                   preference="balanced")))
+    effect = _summary(await tool.execute(
+        CTX, type(tool).input_model(items=items, context={"industry": "美食"},
+                                   preference="effect")))
+    scores = {
+        item["kol_uid"]: (item["score_snapshot"]["effect_score"],
+                          item["score_snapshot"]["price_efficiency_score"],
+                          item["score_snapshot"]["value_score"])
+        for item in balanced["items"]
+    }
+    for rows in (balanced, effect):
+        for item in rows["items"]:
+            uid = item["kol_uid"]
+            assert (item["score_snapshot"]["effect_score"],
+                    item["score_snapshot"]["price_efficiency_score"],
+                    item["score_snapshot"]["value_score"]) == scores[uid]
+    # price 模式下最低报价（最高性价比）排第一。
+    price = _summary(await tool.execute(
+        CTX, type(tool).input_model(items=items, context={"industry": "美食"},
+                                   preference="price")))
+    assert price["items"][0]["kol_uid"] == "c"
+
+
+async def test_rank_kols_price_needs_three_valid_quotes_and_missing_quote_last() -> None:
+    tool = RankKolsTool()
+    unpriced = _kol_item(uid="u", engagement_total=200, quoted_price=None,
+                         score_inputs={"average_interactions": 200_000, "followers": 5_000_000})
+    items = [
+        unpriced,
+        _kol_item(uid="p1", engagement_total=100, quoted_price=1000),
+        _kol_item(uid="p2", engagement_total=100, quoted_price=800),
     ]
     result = await tool.execute(
         CTX,
         type(tool).input_model(
-            items=items,
-            context={"industry": "美食", "regions": ["上海"], "age_ranges": ["18-24"]},
-            limit=2,
+            items=items, context={"industry": "美食"}, limit=10
         ),
     )
     data = _summary(result)
-    # 有 engagement_total 的排前面；limit=2 截断，None 项不进入前 2。
-    assert [item["kol_uid"] for item in data["items"]] == ["b", "c"]
+    assert data["items"][-1]["kol_uid"] == "u"  # 报价缺失置后
+    assert data["items"][-1]["score_snapshot"]["price_efficiency_score"] == 0
+    assert data["items"][-1]["score_snapshot"]["quoted_price"] is None
+    # 有效报价 2 个 < 3 → 全部价格效率 0。
+    assert all(item["score_snapshot"]["price_efficiency_score"] == 0 for item in data["items"])
+    assert data["items"][0]["score_snapshot"]["price_sample_size"] == 2
+
+
+async def test_rank_kols_limit_truncates_and_marks_truncated() -> None:
+    tool = RankKolsTool()
+    items = [
+        _kol_item(uid=f"{i}", engagement_total=float(200 - i * 10)) for i in range(5)
+    ]
+    result = await tool.execute(
+        CTX,
+        type(tool).input_model(
+            items=items, context={"industry": "美食"}, limit=2
+        ),
+    )
+    data = _summary(result)
+    assert len(data["items"]) == 2
     assert data["truncated"] is True
 
 

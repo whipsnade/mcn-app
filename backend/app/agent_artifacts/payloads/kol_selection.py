@@ -1,14 +1,13 @@
-"""kol_selection_v3: 圈选达人强类型 payload (spec §12.1).
+"""kol_selection_v3: 圈选达人强类型 payload (spec §12.1 / Gate C §7.2).
 
-The scoring block is the strictest contract: `scoring.version="kol_score_v2"`,
-`method="weighted_sum"`, weights exactly the eight-dimension set summing to 100,
-and every `items[].score_snapshot` must freeze total/rating/stars/
-data_completeness plus all eight dimensions with every sub-field.
+The scoring block is a strict contract. ``score_snapshot`` is a discriminated
+union keyed on ``version``: historical ``kol_score_v2`` stays readable, new
+builds produce ``kol_value_score_v3`` (effect 70 + price efficiency 30).
 """
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -19,12 +18,16 @@ from app.agent_artifacts.payloads.common import (
     UniqueKeyValidator,
 )
 from app.selection.scoring_v2 import WEIGHTS_V2
+from app.selection.scoring_v3 import EFFECT_WEIGHTS_V3
 
 # kol_score_v2 八维权重/维度的单一事实来源是 selection/scoring_v2.WEIGHTS_V2
 # （评分器唯一真源）。payload 派生自它，避免双表漂移导致「评分块声称的权重」
 # 与实际评分使用的权重不一致。
 SCORE_DIMENSIONS = tuple(WEIGHTS_V2)
 WEIGHTS = dict(WEIGHTS_V2)
+# kol_value_score_v3 的效果维度权重/维度单一事实来源是 scoring_v3.EFFECT_WEIGHTS_V3。
+V3_DIMENSIONS = tuple(EFFECT_WEIGHTS_V3)
+V3_WEIGHTS = dict(EFFECT_WEIGHTS_V3)
 
 
 class AudienceFilter(BaseModel):
@@ -53,9 +56,11 @@ class KolSelectionScope(BaseModel):
     platforms: tuple[str, ...] = Field(default_factory=tuple)
     audience: AudienceFilter
     filters: SelectionFilters
+    # 用户确认的内容形式（报价有效性约束；缺省不限制）。
+    content_formats: tuple[str, ...] = Field(default_factory=tuple)
 
 
-class ScoringConfig(BaseModel):
+class ScoringConfigV2(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     version: Literal["kol_score_v2"]
@@ -64,13 +69,37 @@ class ScoringConfig(BaseModel):
     missing_value_policy: Literal["missing_as_zero"]
 
     @model_validator(mode="after")
-    def _validate_weights(self) -> ScoringConfig:
+    def _validate_weights(self) -> ScoringConfigV2:
         if dict(self.weights) != WEIGHTS:
             raise ValueError(
                 "weights must match exactly the eight kol_score_v2 dimensions "
                 "summing to 100"
             )
         return self
+
+
+class ScoringConfigV3(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    version: Literal["kol_value_score_v3"]
+    method: Literal["effect_plus_price_efficiency"]
+    weights: dict[str, int]
+    missing_value_policy: Literal["missing_as_zero"]
+
+    @model_validator(mode="after")
+    def _validate_weights(self) -> ScoringConfigV3:
+        if dict(self.weights) != V3_WEIGHTS:
+            raise ValueError(
+                "weights must match exactly the eight kol_value_score_v3 effect "
+                "dimensions summing to 70"
+            )
+        return self
+
+
+ScoringConfig = Annotated[
+    ScoringConfigV2 | ScoringConfigV3,
+    Field(discriminator="version"),
+]
 
 
 class ScoreDimension(BaseModel):
@@ -83,7 +112,7 @@ class ScoreDimension(BaseModel):
     missing_reason: str | None
 
 
-class ScoreSnapshot(BaseModel):
+class KolScoreSnapshotV2(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     version: Literal["kol_score_v2"]
@@ -94,13 +123,47 @@ class ScoreSnapshot(BaseModel):
     dimensions: dict[str, ScoreDimension]
 
     @model_validator(mode="after")
-    def _validate_dimensions(self) -> ScoreSnapshot:
+    def _validate_dimensions(self) -> KolScoreSnapshotV2:
         if set(self.dimensions) != set(SCORE_DIMENSIONS):
             raise ValueError(
                 "score_snapshot dimensions must contain exactly the eight "
                 "kol_score_v2 dimensions"
             )
         return self
+
+
+class KolValueScoreSnapshotV3(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    version: Literal["kol_value_score_v3"]
+    effect_score: float
+    price_efficiency_score: float
+    value_score: float
+    quoted_price: float | None
+    price_sample_size: int
+    raw_price_efficiency: float | None
+    price_efficiency_percentile: float | None
+    rating: str
+    data_completeness: float
+    dimensions: dict[str, ScoreDimension]
+
+    @model_validator(mode="after")
+    def _validate_dimensions(self) -> KolValueScoreSnapshotV3:
+        if set(self.dimensions) != set(V3_DIMENSIONS):
+            raise ValueError(
+                "score_snapshot dimensions must contain exactly the eight "
+                "kol_value_score_v3 effect dimensions"
+            )
+        for name, dimension in self.dimensions.items():
+            if dimension.weight != V3_WEIGHTS[name]:
+                raise ValueError(f"dimension {name} weight must be {V3_WEIGHTS[name]}")
+        return self
+
+
+ScoreSnapshot = Annotated[
+    KolScoreSnapshotV2 | KolValueScoreSnapshotV3,
+    Field(discriminator="version"),
+]
 
 
 class KolSelectionItem(BaseModel):

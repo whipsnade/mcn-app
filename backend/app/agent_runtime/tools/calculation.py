@@ -5,9 +5,10 @@ calculate_period_comparison / normalize_sentiment / rank_kols。它们只计算�
 校验，绝不决定业务步骤。关键数值进入 Artifact 时通过 settled 的 tool call
 行（``lineage.derivation.tool_call_id``）建立字段级来源链。
 
-``rank_kols`` 严格复用 ``selection.scoring_v2`` 的八维 ``kol_score_v2``：
-任一维度缺失/无效记 0 分且不重分配权重；默认跨平台按 ``engagement_total``
-降序取 Top20。``growth_rate`` 与 ``quoted_price`` 只展示/筛选，不进入总分。
+``rank_kols`` 复用 ``selection.scoring_v3`` 的 ``kol_value_score_v3``（效果 70 +
+价格效率 30）：缺失维度记 0 分且不重分配权重；默认跨平台按价值分降序取 Top20；
+``preference`` 只改排序主键。``growth_rate`` 与 ``quoted_price`` 只展示，不进入
+效果总分（报价参与价格效率）。
 """
 
 from __future__ import annotations
@@ -33,11 +34,11 @@ from app.agent_runtime.tools.contracts import (
     logical_call_id_for,
 )
 from app.mcp_gateway.validation import McpValidationError
-from app.selection.scoring_v2 import (
-    SCORE_VERSION_V2,
-    ScoreContextV2,
-    ScoreInputsV2,
-    score_candidate_v2,
+from app.selection.scoring_v3 import (
+    CandidateInputV3,
+    CandidateScoreV3,
+    ScoreContextV3,
+    score_and_rank_candidates_v3,
 )
 
 # rank_kols 默认跨平台 Top20（§9.3：跨平台合计最多 20）。
@@ -409,15 +410,19 @@ class RankKolsArgs(BaseModel):
     items: list[dict[str, Any]] = Field(min_length=1)
     context: dict[str, Any] | None = None
     limit: int = Field(default=_RANK_DEFAULT_LIMIT, ge=1, le=_RANK_MAX_LIMIT)
-    order_by: str = "engagement_total"
+    # v3：preference 只改排序主键（balanced=value / effect=effect / price=price）。
+    preference: Literal["effect", "balanced", "price"] = "balanced"
+    # 用户确认的内容形式：报价必须匹配其一才计为有效报价。
+    content_formats: list[str] = Field(default_factory=list)
+    order_by: str = "value_score"
     desc: bool = True
 
 
 class RankKolsTool:
-    """KOL 排序：严格复用 kol_score_v2 八维评分，默认 engagement_total Top20。
+    """KOL 排序：严格复用 kol_value_score_v3（效果 70 + 价格效率 30）。
 
-    score_inputs 是评分的唯一来源；顶层的 followers / engagement_total /
-    growth_rate / quoted_price 只作展示与排序，不进入总分（spec 口径）。
+    score_inputs 是效果维度的唯一来源；顶层 followers / engagement_total /
+    growth_rate / quoted_price 只作展示，quoted_price 参与价格效率。
     """
 
     name = "rank_kols"
@@ -430,36 +435,20 @@ class RankKolsTool:
 
     async def execute(self, context: ToolContext, arguments: BaseModel) -> ToolResult:
         args = RankKolsArgs.model_validate(arguments)
-        score_context = _score_context(args.context)
+        score_context = _score_context_v3(args.context, args.content_formats)
+        candidates = [_score_inputs_v3(item, score_context) for item in args.items]
+        ranked = score_and_rank_candidates_v3(
+            score_context, candidates, args.preference
+        )
         scored: list[dict[str, Any]] = []
-        for item in args.items:
-            snapshot = score_candidate_v2(score_context, _score_inputs(item))
-            scored.append(
-                {
-                    "platform": item.get("platform"),
-                    "kol_uid": item.get("kol_uid"),
-                    "nickname": item.get("nickname"),
-                    "followers": item.get("followers"),
-                    "engagement_total": item.get("engagement_total"),
-                    "growth_rate": item.get("growth_rate"),
-                    "quoted_price": item.get("quoted_price"),
-                    "score_snapshot": snapshot,
-                    "missing_fields": [
-                        name
-                        for name, dimension in snapshot["dimensions"].items()
-                        if dimension["missing_reason"] is not None
-                    ],
-                }
-            )
-        ordered = _sort_entries(scored, args.order_by, args.desc)
-        page = ordered[: args.limit]
-        for index, entry in enumerate(page, start=1):
-            entry["rank"] = index
+        for result in ranked:
+            scored.append(_rank_entry(result))
+        page = scored[: args.limit]
         await _record_settled_call(self._db, context, self.name, args)
         return ToolResult(
             status="success",
             safe_summary=json.dumps(
-                {"items": page, "total": len(ordered), "truncated": len(ordered) > args.limit},
+                {"items": page, "total": len(scored), "truncated": len(scored) > args.limit},
                 ensure_ascii=False,
             ),
         )
@@ -574,34 +563,118 @@ def _normalize_sentiment(raw: Any) -> tuple[str, int]:
     raise ValueError("sentiment must be numeric or text")
 
 
-def _score_context(context: Mapping[str, Any] | None) -> ScoreContextV2:
+def _score_context_v3(
+    context: Mapping[str, Any] | None, content_formats: list[str] | None = None
+) -> ScoreContextV3:
     if not context:
-        return ScoreContextV2(industry="", regions=(), age_ranges=())
+        return ScoreContextV3(industry="", regions=(), age_ranges=())
     regions = tuple(
         item for item in context.get("regions") or [] if isinstance(item, str) and item.strip()
     )
     ages = tuple(
         item for item in context.get("age_ranges") or [] if isinstance(item, str) and item.strip()
     )
-    return ScoreContextV2(
-        industry=context.get("industry") or "", regions=regions, age_ranges=ages
+    formats = tuple(
+        item for item in content_formats or [] if isinstance(item, str) and item.strip()
+    )
+    return ScoreContextV3(
+        industry=context.get("industry") or "",
+        regions=regions,
+        age_ranges=ages,
+        content_formats=formats,
     )
 
 
-def _score_inputs(item: Mapping[str, Any]) -> ScoreInputsV2:
-    """评分输入只来自 ``score_inputs``；顶层字段仅展示/排序（spec 口径）。"""
+def _distribution_score_for(
+    raw: Mapping[str, Any], key: str, fallback_key: str, targets: tuple[str, ...]
+) -> float | None:
+    """直接 0–100 分数优先；否则回退到 v2 分布口径（复用 scoring_v2 的
+    _distribution_score，不复制公式）。"""
+    direct = _number(raw.get(key))
+    if direct is not None:
+        return direct
+    from app.selection.scoring_v2 import _distribution_score
+
+    return _distribution_score(_number_distribution(raw.get(fallback_key)), targets)
+
+
+def _score_inputs_v3(item: Mapping[str, Any], context: ScoreContextV3) -> CandidateInputV3:
+    """评分输入只来自 ``score_inputs``（+ 顶层身份/报价）；缺失字段保持 None。"""
     raw = item.get("score_inputs") or {}
-    return ScoreInputsV2(
-        audience_interests=_number_distribution(raw.get("audience_interests")),
-        audience_regions=_number_distribution(raw.get("audience_regions")),
-        audience_age=_number_distribution(raw.get("audience_age")),
-        average_interactions=_number(raw.get("average_interactions")),
-        effective_follower_rate=_number(raw.get("effective_follower_rate")),
-        active_follower_count=_whole(raw.get("active_follower_count")),
-        content_score=_number(raw.get("content_score")),
-        followers=_whole(raw.get("followers")),
-        interaction_follower_ratio=_number(raw.get("interaction_follower_ratio")),
+    followers = _whole(raw.get("followers"))
+    average_interactions = _number(raw.get("average_interactions"))
+    ratio = _number(raw.get("interaction_follower_ratio")) or _number(
+        raw.get("engagement_follower_ratio")
     )
+    if ratio is None and average_interactions is not None and followers:
+        ratio = average_interactions / followers * 100
+    active = _number(raw.get("active_follower_rate")) or _number(
+        raw.get("effective_follower_rate")
+    )
+    if active is None and _whole(raw.get("active_follower_count")) is not None and followers:
+        active = _whole(raw.get("active_follower_count")) / followers * 100
+    return CandidateInputV3(
+        platform=str(item.get("platform") or ""),
+        kol_uid=str(item.get("kol_uid") or ""),
+        nickname=str(item.get("nickname") or ""),
+        average_interactions=average_interactions,
+        active_follower_rate=active,
+        engagement_follower_ratio=ratio,
+        content_match=_number(raw.get("content_score")),
+        followers=followers,
+        industry_interest=_distribution_score_for(
+            raw, "industry_interest", "audience_interests", (context.industry,)
+        ),
+        target_region=_distribution_score_for(
+            raw, "target_region", "audience_regions", context.regions
+        ),
+        target_age=_distribution_score_for(
+            raw, "target_age", "audience_age", context.age_ranges
+        ),
+        quoted_price=_number(item.get("quoted_price")),
+        content_format=str(item.get("content_format") or "") or None,
+    )
+
+
+def _rank_entry(result: CandidateScoreV3) -> dict[str, Any]:
+    """把 v3 评分结果映射为 rank_kols 输出条目（含 payload 冻结快照形状）。"""
+    return {
+        "platform": result.platform,
+        "kol_uid": result.kol_uid,
+        "nickname": result.nickname,
+        "followers": None,
+        "engagement_total": None,
+        "growth_rate": None,
+        "quoted_price": result.quoted_price,
+        "rank": result.rank,
+        "score_snapshot": {
+            "version": "kol_value_score_v3",
+            "effect_score": result.effect_score,
+            "price_efficiency_score": result.price_efficiency_score,
+            "value_score": result.value_score,
+            "quoted_price": result.quoted_price,
+            "price_sample_size": result.price_sample_size,
+            "raw_price_efficiency": result.raw_price_efficiency,
+            "price_efficiency_percentile": result.price_efficiency_percentile,
+            "rating": result.rating,
+            "data_completeness": result.data_completeness,
+            "dimensions": {
+                name: {
+                    "raw_score": dim.raw_score,
+                    "weight": dim.weight,
+                    "weighted_score": dim.weighted_score,
+                    "source": dim.source,
+                    "missing_reason": dim.missing_reason,
+                }
+                for name, dim in result.dimensions.items()
+            },
+        },
+        "missing_fields": [
+            name
+            for name, dim in result.dimensions.items()
+            if dim.missing_reason is not None
+        ],
+    }
 
 
 def _sort_entries(entries: list[dict[str, Any]], order_by: str, desc: bool) -> list[dict[str, Any]]:
@@ -626,6 +699,5 @@ __all__ = [
     "NormalizeSentimentTool",
     "RankKolsArgs",
     "RankKolsTool",
-    "SCORE_VERSION_V2",
     "evaluate_expression",
 ]

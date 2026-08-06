@@ -410,30 +410,32 @@ class BuildKolSelectionDraftArgs(BaseModel):
 
 
 class BuildKolSelectionDraftTool(_BuilderToolBase):
-    """构建 KOL 圈选名单 Draft（kol_selection_v3；评分委托 rank_kols/kol_score_v2）。"""
+    """构建 KOL 圈选名单 Draft（kol_selection_v3；评分委托 rank_kols/kol_value_score_v3）。"""
 
     description = (
         "把 KOL 列表 Evidence 确定性转换为圈选名单 Draft（kol_selection_v3）。"
         "scope 为圈选条件对象（brand/category/campaign 可空、platforms[]、"
-        "audience{regions[],age_ranges[],interests[]}、filters 预算/粉丝门槛）；"
+        "audience{regions[],age_ranges[],interests[]}、filters 预算/粉丝门槛、"
+        "content_formats[] 用户确认的内容形式——报价须匹配其一才计有效）；"
         "evidence_id 为当前会话的 KOL 列表证据（列表行含 platform/kol_uid/"
         "nickname/followers/engagement_total/score_inputs 等；MCP 原始中文行"
         "如 平台/账号ID (kwUid)/昵称/粉丝数/平均互动 会自动归一，无需手工改写）。"
         "评分由确定性 "
-        "rank_kols（kol_score_v2 八维）完成，默认跨平台 Top20 按互动量降序。"
+        "rank_kols（kol_value_score_v3：效果与匹配度 70 + 价格效率 30）完成，"
+        "默认跨平台 Top20 按价值总分降序。"
         "narrative 可选（selection_summary 必填 + fit_findings[]/risk_notes[]/"
         "usage_advice[]，条目为 {text, kol_uid 可空, supporting_paths[]}；"
         "supporting_paths 必须指向 data 内真实存在的点分路径，如 "
-        "data.items.0.score_snapshot.total；缺省时由工具按评分结果确定性生成）。"
+        "data.items.0.score_snapshot.value_score；缺省时由工具按评分结果确定性生成）。"
         "输出只含 artifact_id/draft_id/revision_id/schema_version 与受限摘要。"
         "输入契约示例："
         'scope={"brand":null,"category":"美食","campaign":null,"platforms":["小红书"],'
         '"audience":{"regions":["上海"],"age_ranges":["18-24"],"interests":["美食"]},'
         '"filters":{"budget_min":null,"budget_max":100000,"follower_min":10000,'
-        '"follower_max":null}}；'
+        '"follower_max":null},"content_formats":["视频","图文"]}；'
         'evidence_id="<当前会话 KOL 列表证据 id>"；'
         'narrative={"selection_summary":"...","fit_findings":[{"text":"...",'
-        '"kol_uid":"123","supporting_paths":["data.items.0.score_snapshot.total"]}],'
+        '"kol_uid":"123","supporting_paths":["data.items.0.score_snapshot.value_score"]}],'
         '"risk_notes":[],"usage_advice":[{"text":"...","supporting_paths":'
         '["data.items.0.engagement_total"]}]}。'
         "注意：audience 与 filters 必填；filters 只有 budget_min/budget_max/"

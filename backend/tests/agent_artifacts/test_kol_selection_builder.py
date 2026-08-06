@@ -1,13 +1,13 @@
-"""kol_selection_v3 Draft builder tests（设计 §12.1 / Task 16）。
+"""kol_selection_v3 Draft builder tests（设计 §12.1 / Gate C §7.2）。
 
 覆盖：
-1. 严格评分复用：builder 委托 rank_kols → kol_score_v2 八维加权；缺失维度记 0
-   且不重分配权重；growth_rate/quoted_price 只展示不进总分；
-2. 完整 score_snapshot 冻结：8 个维度每项 {raw_score,weight,weighted_score,
-   source,missing_reason}；缺维度的 snapshot 被 Schema 拒绝；
-3. 默认 Top20 + engagement_total 降序；数据不足产出 restricted 产物；
-4. lineage：维度原始输入引用 Evidence，评分派生引用已 settled 的 rank_kols
-   调用，Task 11 校验器接受 builder 输出。
+1. 严格评分复用：builder 委托 rank_kols → kol_value_score_v3（效果 70 + 价格
+   效率 30）；缺失维度记 0 且不重分配权重；growth_rate 只展示不进效果总分；
+2. 完整 score_snapshot 冻结：8 个效果维度每项 {raw_score,weight,weighted_score,
+   source,missing_reason} + 价格/价值字段；缺维度的 snapshot 被 Schema 拒绝；
+3. 默认 Top20（价值总分降序）+ 有效报价不足 3 个时 restricted 披露；
+4. lineage：维度原始输入引用 Evidence，评分/价格/排名派生引用已 settled 的
+   rank_kols 调用（derivation.method=kol_value_score_v3）。
 """
 
 from __future__ import annotations
@@ -29,9 +29,9 @@ from app.agent_artifacts.lineage import (
     validate_and_freeze_lineage,
 )
 from app.agent_artifacts.payloads.kol_selection import (
-    SCORE_DIMENSIONS,
-    ScoreSnapshot,
+    V3_DIMENSIONS,
     KolSelectionV3,
+    KolValueScoreSnapshotV3,
 )
 from app.agent_runtime.evidence import EvidenceWriter
 from app.agent_runtime.models import (
@@ -42,12 +42,13 @@ from app.agent_runtime.models import (
     AgentToolCall,
 )
 from app.agent_runtime.tools.contracts import ToolContext
-from app.selection.scoring_v2 import (
-    SCORE_VERSION_V2,
-    ScoreContextV2,
-    ScoreInputsV2,
-    score_candidate_v2,
+from app.selection.scoring_v3 import (
+    EFFECT_WEIGHTS_V3,
+    ScoreContextV3,
+    score_and_rank_candidates_v3,
 )
+
+SCORE_VERSION_V3 = "kol_value_score_v3"
 
 SCOPE = {
     "category": "美食",
@@ -157,8 +158,8 @@ async def _make_chain(db_session, user_id: str) -> tuple[AgentSession, AgentRun,
 # ---------------------------------------------------------------------------
 
 
-async def test_builder_delegates_to_strict_kol_score_v2() -> None:
-    # content 维度缺失 → raw_score=0 且不重分配权重；其余 7 维保留权重。
+async def test_builder_delegates_to_strict_kol_value_score_v3() -> None:
+    # content_match 维度缺失 → raw_score=0 且不重分配权重；其余 7 维保留权重。
     score_inputs = {
         "audience_interests": {"美食": 80},
         "audience_regions": {"上海": 50},
@@ -185,39 +186,63 @@ async def test_builder_delegates_to_strict_kol_score_v2() -> None:
     item_out = payload["data"]["items"][0]
     snapshot = item_out["score_snapshot"]
 
-    assert snapshot["version"] == SCORE_VERSION_V2
-    content = snapshot["dimensions"]["content"]
+    assert snapshot["version"] == SCORE_VERSION_V3
+    content = snapshot["dimensions"]["content_match"]
     assert content["raw_score"] == 0
-    assert content["weight"] == 15
+    assert content["weight"] == 10
     assert content["weighted_score"] == 0
-    assert content["missing_reason"] == "missing_content_score"
+    assert content["missing_reason"] == "missing_content_match"
     assert content["source"] is None
-    # 缺失维度记 0，不重分配权重：其余维度权重不变，权重和仍为 100。
-    assert snapshot["dimensions"]["engagement"]["weight"] == 20
-    assert snapshot["dimensions"]["followers"]["weight"] == 10
-    assert sum(d["weight"] for d in snapshot["dimensions"].values()) == 100
-    assert snapshot["total"] == pytest.approx(
+    # 缺失维度记 0，不重分配权重：其余维度权重不变，效果权重和仍为 70。
+    assert snapshot["dimensions"]["average_interactions"]["weight"] == 14
+    assert snapshot["dimensions"]["followers"]["weight"] == 7
+    assert sum(d["weight"] for d in snapshot["dimensions"].values()) == 70
+    assert snapshot["effect_score"] == pytest.approx(
         sum(d["weighted_score"] for d in snapshot["dimensions"].values())
     )
 
-    # 与严格 kol_score_v2 逐维度一致（builder 委托 rank_kols 复用同一评分器）。
-    expected = score_candidate_v2(
-        ScoreContextV2(industry="美食", regions=("上海", "杭州"), age_ranges=("18-24", "25-34")),
-        ScoreInputsV2(**score_inputs),
-    )
-    assert snapshot["total"] == pytest.approx(expected["total"])
-    for dim in SCORE_DIMENSIONS:
+    # 与严格 kol_value_score_v3 逐维度一致（builder 委托 rank_kols 复用同一评分器）。
+    candidate = score_and_rank_candidates_v3(
+        ScoreContextV3(industry="美食", regions=("上海", "杭州"), age_ranges=("18-24", "25-34")),
+        [
+            _to_v3_candidate(item),
+        ],
+        "balanced",
+    )[0]
+    assert snapshot["effect_score"] == pytest.approx(candidate.effect_score)
+    for dim in V3_DIMENSIONS:
         assert snapshot["dimensions"][dim]["raw_score"] == pytest.approx(
-            expected["dimensions"][dim]["raw_score"]
+            candidate.dimensions[dim].raw_score
         )
         assert snapshot["dimensions"][dim]["weighted_score"] == pytest.approx(
-            expected["dimensions"][dim]["weighted_score"]
+            candidate.dimensions[dim].weighted_score
         )
 
-    # growth_rate / quoted_price 是展示字段，绝不进入 v2 总分。
+    # growth_rate / quoted_price 是展示字段，绝不进入效果总分。
     assert item_out["growth_rate"] == 999
-    assert item_out["quoted_price"] == 999_999
-    assert snapshot["total"] == pytest.approx(expected["total"])
+    assert snapshot["quoted_price"] == 999_999
+    assert snapshot["effect_score"] == pytest.approx(candidate.effect_score)
+
+
+def _to_v3_candidate(item: dict[str, Any]):
+    from app.selection.scoring_v3 import CandidateInputV3
+
+    raw = item.get("score_inputs") or {}
+    return CandidateInputV3(
+        platform=item.get("platform") or "",
+        kol_uid=item.get("kol_uid") or "",
+        nickname=item.get("nickname") or "",
+        average_interactions=raw.get("average_interactions"),
+        active_follower_rate=raw.get("effective_follower_rate"),
+        engagement_follower_ratio=raw.get("interaction_follower_ratio"),
+        content_match=raw.get("content_score"),
+        followers=raw.get("followers"),
+        industry_interest=80.0 if raw.get("audience_interests") else None,
+        target_region=50.0 if raw.get("audience_regions") else None,
+        target_age=40.0 if raw.get("audience_age") else None,
+        quoted_price=item.get("quoted_price"),
+        content_format=item.get("content_format"),
+    )
 
 
 async def test_builder_uses_scoring_weights_block_exactly() -> None:
@@ -226,19 +251,10 @@ async def test_builder_uses_scoring_weights_block_exactly() -> None:
         scope=SCOPE, evidence_id="ev-1", items=[item], context=LIGHT_CTX
     )
     scoring = build.payload["data"]["scoring"]
-    assert scoring["version"] == SCORE_VERSION_V2
-    assert scoring["method"] == "weighted_sum"
+    assert scoring["version"] == SCORE_VERSION_V3
+    assert scoring["method"] == "effect_plus_price_efficiency"
     assert scoring["missing_value_policy"] == "missing_as_zero"
-    assert scoring["weights"] == {
-        "industry_interest": 10,
-        "target_region": 8,
-        "target_age": 8,
-        "engagement": 20,
-        "active_follower": 15,
-        "content": 15,
-        "followers": 10,
-        "engagement_follower_ratio": 14,
-    }
+    assert scoring["weights"] == dict(EFFECT_WEIGHTS_V3)
 
 
 # ---------------------------------------------------------------------------
@@ -257,17 +273,22 @@ async def test_score_snapshot_freezes_full_dimension_set() -> None:
     payload = build.payload
     for item_out in payload["data"]["items"]:
         snapshot = item_out["score_snapshot"]
-        assert snapshot["version"] == SCORE_VERSION_V2
+        assert snapshot["version"] == SCORE_VERSION_V3
         assert set(snapshot) == {
             "version",
-            "total",
+            "effect_score",
+            "price_efficiency_score",
+            "value_score",
+            "quoted_price",
+            "price_sample_size",
+            "raw_price_efficiency",
+            "price_efficiency_percentile",
             "rating",
-            "stars",
             "data_completeness",
             "dimensions",
         }
-        assert set(snapshot["dimensions"]) == set(SCORE_DIMENSIONS)
-        for dim in SCORE_DIMENSIONS:
+        assert set(snapshot["dimensions"]) == set(V3_DIMENSIONS)
+        for dim in V3_DIMENSIONS:
             entry = snapshot["dimensions"][dim]
             assert set(entry) == {"raw_score", "weight", "weighted_score", "source", "missing_reason"}
             assert isinstance(entry["raw_score"], float)
@@ -279,28 +300,47 @@ async def test_score_snapshot_freezes_full_dimension_set() -> None:
 
 def test_score_snapshot_rejects_missing_dimension() -> None:
     partial = {
-        dim: {"raw_score": 1.0, "weight": 10, "weighted_score": 0.1, "source": "x", "missing_reason": None}
-        for dim in list(SCORE_DIMENSIONS)[:-1]
+        dim: {"raw_score": 1.0, "weight": EFFECT_WEIGHTS_V3[dim], "weighted_score": 0.1, "source": "x", "missing_reason": None}
+        for dim in list(V3_DIMENSIONS)[:-1]
     }
     with pytest.raises(ValidationError):
-        ScoreSnapshot(
-            version=SCORE_VERSION_V2,
-            total=1.0,
+        KolValueScoreSnapshotV3(
+            version=SCORE_VERSION_V3,
+            effect_score=1.0,
+            price_efficiency_score=0.0,
+            value_score=1.0,
+            quoted_price=None,
+            price_sample_size=0,
+            raw_price_efficiency=None,
+            price_efficiency_percentile=None,
             rating="观察",
-            stars="★★",
             data_completeness=10.0,
             dimensions=partial,
         )
 
 
 # ---------------------------------------------------------------------------
-# 3. 默认 Top20 + engagement_total 降序；数据不足 → restricted
+# 3. 默认 Top20 + 价值分降序；有效报价不足 → restricted
 # ---------------------------------------------------------------------------
 
 
-async def test_default_top20_ordered_by_engagement_total_desc() -> None:
+async def test_default_top20_sorted_by_value_score() -> None:
     items = [
-        _kol_item(uid=str(i), engagement_total=float(200 - i * 5), platform="小红书" if i % 2 else "抖音")
+        _kol_item(
+            uid=str(i),
+            engagement_total=float(200 - i * 5),
+            platform="小红书",
+            score_inputs={
+                "average_interactions": 200_000 - i * 10_000,
+                "active_follower_rate": 90.0,
+                "interaction_follower_ratio": 8.0,
+                "content_score": 95.0,
+                "followers": 3_000_000 - i * 100_000,
+                "industry_interest": 95.0,
+                "target_region": 90.0,
+                "target_age": 90.0,
+            },
+        )
         for i in range(25)
     ]
     build = await build_kol_selection_draft(
@@ -309,8 +349,10 @@ async def test_default_top20_ordered_by_engagement_total_desc() -> None:
     payload = build.payload
     assert payload["data_status"] == "complete"
     assert len(payload["data"]["items"]) == 20
-    totals = [item_out["engagement_total"] for item_out in payload["data"]["items"]]
-    assert totals == sorted(totals, reverse=True)
+    # 同平台池内互动/粉丝最高者价值分第一；其余按价值分严格降序。
+    assert payload["data"]["items"][0]["kol_uid"] == "0"
+    values = [item_out["score_snapshot"]["value_score"] for item_out in payload["data"]["items"]]
+    assert values == sorted(values, reverse=True)
     assert [item_out["rank"] for item_out in payload["data"]["items"]] == list(range(1, 21))
     assert payload["data"]["summary"]["candidate_count"] == 25
     assert payload["data"]["summary"]["selected_count"] == 20
@@ -330,24 +372,25 @@ async def test_sparse_data_produces_restricted_artifact() -> None:
     KolSelectionV3.model_validate(payload)
 
 
-async def test_all_engagement_total_null_produces_restricted() -> None:
-    """排序键完全缺失时顺序无业务含义：必须 restricted 披露，不得声称按互动量降序。"""
+async def test_insufficient_price_sample_produces_restricted() -> None:
+    """有效报价不足 3 个时价格效率分为 0：评分章节 restricted 披露。"""
     items = [
-        _kol_item(uid="1", engagement_total=None),
-        _kol_item(uid="2", engagement_total=None),
+        _kol_item(uid="1", engagement_total=100),
+        _kol_item(uid="2", engagement_total=50),
     ]
     build = await build_kol_selection_draft(
         scope=SCOPE, evidence_id="ev-1", items=items, context=LIGHT_CTX
     )
     payload = build.payload
     assert payload["data_status"] == "restricted"
-    assert payload["limitations"]
-    assert payload["limitations"][0]["code"] == "sort_key_missing"
-    assert payload["availability"]["items"]["status"] == "partial"
-    # 不得声称「（按互动量降序）」；须披露无法排序。
-    assert "（按互动量降序）" not in payload["narrative"]["selection_summary"]
-    assert "无法按互动量降序" in payload["narrative"]["selection_summary"]
-    assert len(payload["data"]["items"]) == 2
+    assert any(limit["code"] == "price_sample_insufficient" for limit in payload["limitations"])
+    assert payload["availability"]["scoring"]["status"] == "partial"
+    assert "price_sample_insufficient" in payload["availability"]["scoring"]["reason_codes"]
+    assert all(
+        item["score_snapshot"]["price_efficiency_score"] == 0
+        for item in payload["data"]["items"]
+    )
+    assert "价格效率" in payload["narrative"]["selection_summary"]
     KolSelectionV3.model_validate(payload)
 
 
@@ -422,22 +465,28 @@ async def test_lineage_references_evidence_and_settled_rank_kols(
 
     # 维度原始输入引用 Evidence；派生评分引用 settled rank_kols 调用。
     raw_ref = next(
-        r for r in frozen.refs if r.artifact_path == "/data/items/0/score_snapshot/dimensions/engagement/raw_score"
+        r for r in frozen.refs if r.artifact_path == "/data/items/0/score_snapshot/dimensions/average_interactions/raw_score"
     )
     assert raw_ref.sources[0].evidence_id == evidence.id
     assert raw_ref.derivation is not None
     assert raw_ref.derivation.tool_call_id == build.rank_kols_call_id
-    assert raw_ref.derivation.method == "kol_score_v2:engagement"
+    assert raw_ref.derivation.method == "kol_value_score_v3:average_interactions"
 
     weighted_ref = next(
-        r for r in frozen.refs if r.artifact_path == "/data/items/0/score_snapshot/dimensions/content/weighted_score"
+        r for r in frozen.refs if r.artifact_path == "/data/items/0/score_snapshot/dimensions/content_match/weighted_score"
     )
     assert weighted_ref.derivation is not None
     assert weighted_ref.derivation.tool_call_id == build.rank_kols_call_id
 
-    total_ref = next(r for r in frozen.refs if r.artifact_path == "/data/items/0/score_snapshot/total")
-    assert total_ref.derivation is not None
-    assert total_ref.derivation.tool_call_id == build.rank_kols_call_id
+    value_ref = next(r for r in frozen.refs if r.artifact_path == "/data/items/0/score_snapshot/value_score")
+    assert value_ref.derivation is not None
+    assert value_ref.derivation.tool_call_id == build.rank_kols_call_id
+    assert value_ref.derivation.method == "kol_value_score_v3"
+
+    # rank 也指向 settled rank_kols 调用（确定性排序）。
+    rank_ref = next(r for r in frozen.refs if r.artifact_path == "/data/items/0/rank")
+    assert rank_ref.derivation is not None
+    assert rank_ref.derivation.tool_call_id == build.rank_kols_call_id
 
     # 全部必选 numeric 都被覆盖（missing_lineage 不会触发，校验已成功）。
     assert len(frozen.refs) >= 20
@@ -556,7 +605,10 @@ async def test_real_xiaohongshu_search_rows_normalize_to_contract() -> None:
 
 
 async def test_real_hot_user_rows_platform_short_video_maps_to_douyin() -> None:
-    """hot_user 行：平台「短视频」归一为 douyin；uid/昵称/粉丝数走中文别名。"""
+    """hot_user 行：平台「短视频」归一为 douyin；uid/昵称/粉丝数走中文别名。
+
+    行无 score_inputs → 效果维全缺失计 0（观察组），名单仍稳定产出。
+    """
     build = await build_kol_selection_draft(
         scope=SCOPE,
         evidence_id="ev-hot",
@@ -567,11 +619,14 @@ async def test_real_hot_user_rows_platform_short_video_maps_to_douyin() -> None:
     KolSelectionV3.model_validate(payload)
     items = payload["data"]["items"]
     assert {item["platform"] for item in items} == {"douyin"}
-    top = items[0]  # 互动量降序：闪电新闻 683294 第一
-    assert top["kol_uid"] == "98164646773"
+    by_uid = {item["kol_uid"]: item for item in items}
+    top = by_uid["98164646773"]
     assert top["nickname"] == "闪电新闻"
     assert top["followers"] == 10590610
     assert top["engagement_total"] == 683294
+    # 无评分输入：效果维缺失计 0 → 观察评级，数据完整度 0。
+    assert top["score_snapshot"]["effect_score"] == 0
+    assert top["score_snapshot"]["rating"] == "观察"
 
 
 async def test_missing_platform_infers_from_single_platform_scope() -> None:

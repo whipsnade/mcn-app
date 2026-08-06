@@ -1086,3 +1086,107 @@ def test_brand_comparison_not_requested_without_metrics_passes() -> None:
     assert inst.data.comparisons.yoy.status == "not_requested"
     assert inst.data.comparisons.yoy.metrics == ()
     assert len(inst.data.comparisons.mom.metrics) == 1
+
+
+# ---------------------------------------------------------------- kol_selection_v3 v3 评分
+
+V3_EFFECT_WEIGHTS = {
+    "average_interactions": 14,
+    "active_follower": 10,
+    "engagement_follower_ratio": 10,
+    "content_match": 10,
+    "followers": 7,
+    "industry_interest": 7,
+    "target_region": 6,
+    "target_age": 6,
+}
+
+
+def _v3_snapshot() -> dict:
+    return {
+        "version": "kol_value_score_v3",
+        "effect_score": 60.0,
+        "price_efficiency_score": 15.0,
+        "value_score": 75.0,
+        "quoted_price": 5000,
+        "price_sample_size": 5,
+        "raw_price_efficiency": 0.012,
+        "price_efficiency_percentile": 50.0,
+        "rating": "推荐",
+        "data_completeness": 100.0,
+        "dimensions": {
+            dim: {
+                "raw_score": 80.0,
+                "weight": V3_EFFECT_WEIGHTS[dim],
+                "weighted_score": round(80.0 * V3_EFFECT_WEIGHTS[dim] / 100, 2),
+                "source": "evidence:score_inputs",
+                "missing_reason": None,
+            }
+            for dim in V3_EFFECT_WEIGHTS
+        },
+    }
+
+
+def build_kol_value_selection_dict() -> dict:
+    """合法 kol_value_score_v3 名单 payload（v3 scoring + v3 snapshot）。"""
+    d = build_kol_selection_dict()
+    d["data"]["scoring"] = {
+        "version": "kol_value_score_v3",
+        "method": "effect_plus_price_efficiency",
+        "weights": dict(V3_EFFECT_WEIGHTS),
+        "missing_value_policy": "missing_as_zero",
+    }
+    d["data"]["items"][0]["score_snapshot"] = _v3_snapshot()
+    # v3 快照无 total/stars：叙事引用改为 value_score。
+    for note in d.get("narrative", {}).get("fit_findings") or []:
+        note["supporting_paths"] = [
+            path.replace("score_snapshot.total", "score_snapshot.value_score")
+            for path in note.get("supporting_paths") or []
+        ]
+    for note in d.get("narrative", {}).get("usage_advice") or []:
+        note["supporting_paths"] = [
+            path.replace("score_snapshot.total", "score_snapshot.value_score")
+            for path in note.get("supporting_paths") or []
+        ]
+    return d
+
+
+def test_kol_selection_accepts_v2_history_and_v3_new_data() -> None:
+    v2 = KolSelectionV3.model_validate(build_kol_selection_dict())
+    assert v2.data.items[0].score_snapshot.version == "kol_score_v2"
+    v3 = KolSelectionV3.model_validate(build_kol_value_selection_dict())
+    assert v3.data.items[0].score_snapshot.version == "kol_value_score_v3"
+
+
+def test_v3_scoring_weights_must_match_effect_70() -> None:
+    bad = build_kol_value_selection_dict()
+    bad["data"]["scoring"]["weights"] = dict(V3_EFFECT_WEIGHTS)
+    bad["data"]["scoring"]["weights"]["followers"] = 8
+    with pytest.raises(ValidationError):
+        KolSelectionV3.model_validate(bad)
+
+
+def test_v3_snapshot_requires_effect_dimensions_and_frozen_fields() -> None:
+    d = build_kol_value_selection_dict()
+    snap = d["data"]["items"][0]["score_snapshot"]
+    assert set(snap["dimensions"]) == set(V3_EFFECT_WEIGHTS)
+    for field in (
+        "effect_score",
+        "price_efficiency_score",
+        "value_score",
+        "quoted_price",
+        "price_sample_size",
+        "rating",
+        "data_completeness",
+    ):
+        assert field in snap
+
+    drop = build_kol_value_selection_dict()
+    del drop["data"]["items"][0]["score_snapshot"]["dimensions"]["content_match"]
+    with pytest.raises(ValidationError):
+        KolSelectionV3.model_validate(drop)
+
+    bad_weight = build_kol_value_selection_dict()
+    bad_weight["data"]["items"][0]["score_snapshot"]["dimensions"]["followers"]["weight"] = 8
+    with pytest.raises(ValidationError):
+        KolSelectionV3.model_validate(bad_weight)

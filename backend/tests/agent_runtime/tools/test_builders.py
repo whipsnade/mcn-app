@@ -834,7 +834,7 @@ KOL_NARRATIVE = {
     "usage_advice": [
         {
             "text": "优先合作评分头部达人。",
-            "supporting_paths": ["data.items.0.score_snapshot.total"],
+            "supporting_paths": ["data.items.0.score_snapshot.value_score"],
         }
     ],
 }

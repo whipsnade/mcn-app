@@ -1,21 +1,19 @@
-"""``kol_selection_v3`` Draft builder（设计 §12.1 / Task 16）。
+"""``kol_selection_v3`` Draft builder（设计 §12.1 / Gate C §7.2）。
 
 把模型已选定的 Evidence（KOL 列表数据）+ 查询范围转换为强类型
-``kol_selection_v3`` Draft：评分委托给确定性 ``rank_kols`` 计算工具（Task 9），
-它严格复用 ``selection.scoring_v2`` 的八维 ``kol_score_v2``。
+``kol_selection_v3`` Draft：评分委托给确定性 ``rank_kols`` 计算工具，它严格
+复用 ``selection.scoring_v3`` 的 ``kol_value_score_v3``（效果 70 + 价格效率 30）。
 
 关键不变量：
-- ``score_snapshot`` 冻结 version/total/rating/stars/data_completeness 与全部
-  八个维度，每项 ``{raw_score, weight, weighted_score, source, missing_reason}``；
-- 缺失/无效维度记 0 分且不重分配权重；``growth_rate``/``quoted_price`` 只展示；
-- 默认跨平台 Top20，按 ``engagement_total`` 降序；
+- ``score_snapshot`` 冻结 version/effect_score/price_efficiency_score/value_score/
+  quoted_price/price_sample_size/rating/data_completeness 与全部八个效果维度，
+  每项 ``{raw_score, weight, weighted_score, source, missing_reason}``；
+- 缺失/无效维度记 0 分且不重分配权重；``growth_rate`` 只展示；
+- 默认跨平台 Top20，按价值分降序（preference 可改主键）；
+- 有效报价不足 3 个时价格效率分为 0，评分章节 restricted 披露；
 - 数据不足时产出 ``restricted`` 产物（§12.1：数据不足必须 restricted）；
-- 真实 Evidence 行（中英混合键，如 kol_xiaohongshu_search 的「KOL 列表」行）
-  先经 :func:`_normalize_kol_row` 归一为契约键：平台恒为字符串（缺失取 scope
-  唯一平台，再缺省 ``unknown``），uid 缺失回退昵称，数值字段按别名解析；
-- 每个维度的原始输入引用 Evidence，派生评分（raw_score/weighted_score/total/
-  rating/stars/data_completeness）引用已 settled 的 ``rank_kols`` 调用；
-  归一字段的 lineage 指向 Evidence 行内真实存在的原始键。
+- 每个维度的原始输入引用 Evidence，派生评分（含价格分与排名）引用已 settled
+  的 ``rank_kols`` 调用（derivation.method=kol_value_score_v3）。
 """
 
 from __future__ import annotations
@@ -45,8 +43,7 @@ from app.agent_artifacts.builders.raw_rows import (
     whole,
 )
 from app.agent_artifacts.payloads.kol_selection import (
-    SCORE_DIMENSIONS,
-    WEIGHTS,
+    V3_DIMENSIONS,
     KolSelectionScope,
     KolSelectionV3,
 )
@@ -54,24 +51,25 @@ from app.agent_runtime.models import AgentToolCall
 from app.agent_runtime.tools.calculation import RankKolsArgs, RankKolsTool
 from app.agent_runtime.tools.contracts import ToolContext
 from app.agent_runtime.tools.contracts import arguments_hash, logical_call_id_for
-from app.selection.scoring_v2 import SCORE_VERSION_V2
+from app.selection.scoring_v3 import EFFECT_WEIGHTS_V3, MIN_PRICE_SAMPLE
 
 SCHEMA_VERSION = "kol_selection_v3"
 DEFAULT_LIMIT = 20
+SCORE_VERSION_V3 = "kol_value_score_v3"
 
-# 每个评分维度在 Evidence 项 ``score_inputs`` 里的原始输入键（spec §12.1）。
+# 每个评分维度在 Evidence 项 ``score_inputs`` 里的原始输入键（Gate C §7.2）。
 DIM_RAW_INPUT = {
-    "industry_interest": "audience_interests",
-    "target_region": "audience_regions",
-    "target_age": "audience_age",
-    "engagement": "average_interactions",
-    "active_follower": "effective_follower_rate",
-    "content": "content_score",
-    "followers": "followers",
+    "average_interactions": "average_interactions",
+    "active_follower": "active_follower_rate",
     "engagement_follower_ratio": "interaction_follower_ratio",
+    "content_match": "content_score",
+    "followers": "followers",
+    "industry_interest": "industry_interest",
+    "target_region": "target_region",
+    "target_age": "target_age",
 }
 
-# 展示/排序用的数字字段：从 Evidence 原样复制，不进入 v2 总分。
+# 展示用的数字字段：从 Evidence 原样复制，不进入效果总分。
 _DISPLAY_NUMERIC_FIELDS = (
     "followers",
     "active_followers",
@@ -134,20 +132,22 @@ def _is_number(value: Any) -> bool:
 
 def _scoring_block() -> dict[str, Any]:
     return {
-        "version": SCORE_VERSION_V2,
-        "method": "weighted_sum",
-        "weights": dict(WEIGHTS),
+        "version": SCORE_VERSION_V3,
+        "method": "effect_plus_price_efficiency",
+        "weights": dict(EFFECT_WEIGHTS_V3),
         "missing_value_policy": "missing_as_zero",
     }
 
 
 def _rank_context(scope: dict[str, Any]) -> dict[str, Any]:
-    """rank_kols 评分上下文：industry 取 category，region/age 取 audience 过滤。"""
+    """rank_kols 评分上下文：industry 取 category，region/age 取 audience 过滤，
+    content_formats 取 scope 确认的内容形式（报价有效性约束）。"""
     audience = scope.get("audience") or {}
     return {
         "industry": scope.get("category"),
         "regions": list(audience.get("regions") or ()),
         "age_ranges": list(audience.get("age_ranges") or ()),
+        "content_formats": list(scope.get("content_formats") or ()),
     }
 
 
@@ -261,8 +261,9 @@ def _normalize_kol_row(
 def _rank_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """把 Evidence 项投影为 rank_kols 消费的形状。
 
-    只有 ``score_inputs`` 进入评分；顶层 followers/engagement_total/growth_rate/
-    quoted_price 只用于展示与排序，绝不进入 v2 总分（spec 口径）。
+    只有 ``score_inputs`` 进入效果评分；顶层 followers/engagement_total/
+    growth_rate 只用于展示，quoted_price 参与价格效率，content_format 约束
+    报价有效性。
     """
     projected: list[dict[str, Any]] = []
     for item in items:
@@ -275,6 +276,7 @@ def _rank_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "engagement_total": item.get("engagement_total"),
                 "growth_rate": item.get("growth_rate"),
                 "quoted_price": item.get("quoted_price"),
+                "content_format": item.get("content_format"),
                 "score_inputs": item.get("score_inputs") or {},
             }
         )
@@ -282,7 +284,7 @@ def _rank_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _build_item(entry: dict[str, Any], raw: dict[str, Any]) -> dict[str, Any]:
-    """合并 rank_kols 排序结果与 Evidence 展示字段为单个名单项。"""
+    """合并 rank_kols 排序结果与 Evidence 展示字段为单个名单项（v3 快照）。"""
     snapshot = entry["score_snapshot"]
     audience = raw.get("audience") or {}
     return {
@@ -292,16 +294,16 @@ def _build_item(entry: dict[str, Any], raw: dict[str, Any]) -> dict[str, Any]:
         "nickname": entry.get("nickname") or raw.get("kol_uid") or "",
         "avatar_url": raw.get("avatar_url"),
         "homepage_url": raw.get("homepage_url"),
-        "followers": entry.get("followers"),
+        "followers": raw.get("followers"),
         "active_followers": raw.get("active_followers"),
         "active_follower_rate": raw.get("active_follower_rate"),
-        "growth_rate": entry.get("growth_rate"),
-        "engagement_total": entry.get("engagement_total"),
+        "growth_rate": raw.get("growth_rate"),
+        "engagement_total": raw.get("engagement_total"),
         "avg_engagement": raw.get("avg_engagement"),
         "likes": raw.get("likes"),
         "comments": raw.get("comments"),
         "shares": raw.get("shares"),
-        "quoted_price": entry.get("quoted_price"),
+        "quoted_price": snapshot.get("quoted_price") or entry.get("quoted_price"),
         "reasons": list(raw.get("reasons") or ()),
         "missing_fields": list(entry.get("missing_fields") or ()),
         "audience": {
@@ -310,10 +312,15 @@ def _build_item(entry: dict[str, Any], raw: dict[str, Any]) -> dict[str, Any]:
             "interests": list(audience.get("interests") or ()),
         },
         "score_snapshot": {
-            "version": SCORE_VERSION_V2,
-            "total": snapshot["total"],
+            "version": SCORE_VERSION_V3,
+            "effect_score": snapshot["effect_score"],
+            "price_efficiency_score": snapshot["price_efficiency_score"],
+            "value_score": snapshot["value_score"],
+            "quoted_price": snapshot.get("quoted_price"),
+            "price_sample_size": snapshot["price_sample_size"],
+            "raw_price_efficiency": snapshot.get("raw_price_efficiency"),
+            "price_efficiency_percentile": snapshot.get("price_efficiency_percentile"),
             "rating": snapshot["rating"],
-            "stars": snapshot["stars"],
             "data_completeness": snapshot["data_completeness"],
             "dimensions": {
                 dim: {
@@ -330,26 +337,25 @@ def _build_item(entry: dict[str, Any], raw: dict[str, Any]) -> dict[str, Any]:
 
 
 def _narrative(
-    items: list[dict[str, Any]], candidate_count: int, *, sort_missing: bool = False
+    items: list[dict[str, Any]], candidate_count: int, *, price_restricted: bool = False
 ) -> dict[str, Any]:
     selected_count = len(items)
-    if sort_missing:
-        selection_summary = (
-            f"基于 {candidate_count} 位候选 KOL，按 kol_score_v2 八维加权评分圈选 "
-            f"Top{selected_count}；候选缺少互动量数据，无法按互动量降序，名单按原始"
-            f"顺序展示（数据受限）。"
-        )
-    else:
-        selection_summary = (
-            f"基于 {candidate_count} 位候选 KOL，按 kol_score_v2 八维加权评分"
-            f"圈选 Top{selected_count} 名单（按互动量降序）。"
-        )
+    price_note = (
+        "有效报价不足 3 个，价格效率分为 0（样本过小）；"
+        if price_restricted
+        else ""
+    )
+    selection_summary = (
+        f"基于 {candidate_count} 位候选 KOL，按 kol_value_score_v3（效果与匹配度 70 + "
+        f"价格效率 30）圈选 Top{selected_count} 名单（默认按价值总分降序）。"
+        f"{price_note}"
+    )
     fit_findings = [
         {
-            "text": f"第 {item['rank']} 名 {item['nickname']} 综合评分 "
-            f"{item['score_snapshot']['total']}（{item['score_snapshot']['rating']}）",
+            "text": f"第 {item['rank']} 名 {item['nickname']} 价值总分 "
+            f"{item['score_snapshot']['value_score']}（{item['score_snapshot']['rating']}）",
             "kol_uid": item["kol_uid"],
-            "supporting_paths": [f"data.items.{index}.score_snapshot.total"],
+            "supporting_paths": [f"data.items.{index}.score_snapshot.value_score"],
         }
         for index, item in enumerate(items[:3])
     ]
@@ -362,19 +368,19 @@ def _narrative(
         for index, item in enumerate(items)
         if item["missing_fields"]
     ]
-    if sort_missing:
+    if price_restricted:
         risk_notes.append(
             {
-                "text": "所有候选均缺少互动量数据，名单排序不代表互动量高低。",
+                "text": "有效报价不足 3 个，价格效率分为 0，名单排序未考虑性价比。",
                 "kol_uid": None,
-                "supporting_paths": ["data.items.0.engagement_total"],
+                "supporting_paths": ["data.items.0.score_snapshot.price_sample_size"],
             }
         )
     usage_advice = (
         [
             {
-                "text": "优先合作评分与互动量双高的头部达人。",
-                "supporting_paths": ["data.items.0.score_snapshot.total"],
+                "text": "优先合作价值总分与效果分双高的头部达人。",
+                "supporting_paths": ["data.items.0.score_snapshot.value_score"],
             }
         ]
         if items
@@ -395,17 +401,14 @@ def _build_payload(
     candidate_count: int,
     data_as_of: datetime | None,
     source_names: tuple[str, ...],
-    sort_missing: bool = False,
+    price_restricted: bool = False,
     narrative: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """组装名单 payload；``sort_missing`` 时按互动量排序不可用 → restricted。
+    """组装名单 payload；``price_restricted`` 时评分章节 restricted 披露。
 
-    数据存在但排序键（``engagement_total``）完全缺失时，rank_kols 只能按稳定
-    输入顺序输出（任意顺序），不得声称「按互动量降序」——必须受限披露。
-
-    §6.3 递归 null 治理：``items[]`` 的 Optional 展示数值（followers/
-    quoted_price 等）出现 null 时同样必须受限披露（items partial +
-    limitation），不得谎称 complete。
+    §7.2：有效报价不足 3 个时价格效率分为 0——评分章节标记 restricted 并写
+    limitation，不得谎称完整价格对比。§6.3 递归 null 治理：``items[]`` 的
+    Optional 展示数值出现 null 时同样必须受限披露。
 
     ``narrative``：模型提供的叙事（设计 §6.1），缺省时由 ``_narrative``
     按评分结果确定性生成兜底；模型叙事的 supporting_paths 是否指向 data
@@ -418,21 +421,11 @@ def _build_payload(
         for field in _DISPLAY_NUMERIC_FIELDS
         if item.get(field) is None
     ]
-    items_restricted = sort_missing or bool(null_display)
+    items_restricted = bool(null_display)
     reason_codes: list[str] = []
-    if sort_missing:
-        reason_codes.append("sort_key_missing")
     if null_display:
         reason_codes.append("metric_data_missing")
     limitations: list[dict[str, Any]] = []
-    if sort_missing:
-        limitations.append(
-            {
-                "code": "sort_key_missing",
-                "message": "候选 KOL 缺少互动量数据，无法按互动量排序，名单按原始顺序展示",
-                "affected_paths": ["items"],
-            }
-        )
     if null_display:
         limitations.append(
             {
@@ -441,12 +434,33 @@ def _build_payload(
                 "affected_paths": null_display,
             }
         )
+    scoring_reason_codes: list[str] = []
+    scoring_status = "complete"
+    if price_restricted:
+        scoring_status = "partial"
+        scoring_reason_codes.append("price_sample_insufficient")
+        limitations.append(
+            {
+                "code": "price_sample_insufficient",
+                "message": "有效报价不足 3 个，价格效率分为 0，名单未做性价比对比",
+                "affected_paths": [
+                    "data.scoring",
+                    *(
+                        f"data.items.{index}.score_snapshot.price_efficiency_score"
+                        for index in range(selected_count)
+                    ),
+                ],
+            }
+        )
     return {
         "schema_version": SCHEMA_VERSION,
         "module": "kol",
-        "data_status": "restricted" if items_restricted else "complete",
+        "data_status": "restricted" if (items_restricted or price_restricted) else "complete",
         "availability": {
-            "scoring": {"status": "complete", "reason_codes": []},
+            "scoring": {
+                "status": scoring_status,
+                "reason_codes": scoring_reason_codes,
+            },
             "items": {
                 "status": "partial" if items_restricted else "complete",
                 "reason_codes": reason_codes,
@@ -470,7 +484,7 @@ def _build_payload(
         },
         "narrative": narrative
         if narrative is not None
-        else _narrative(items, candidate_count, sort_missing=sort_missing),
+        else _narrative(items, candidate_count, price_restricted=price_restricted),
     }
 
 
@@ -713,33 +727,41 @@ def _build_lineage(
                 }
             )
 
-        # rank 由 engagement_total 降序排序得出；来源兜底到稳定身份字段。
+        # rank 由价值分排序得出；来源兜底到稳定身份字段。
         rank_source = _score_sources(evidence_id, base, raw, keymap)[0]
         refs.append(
             {
                 "artifact_path": f"/data/items/{index}/rank",
                 "sources": [rank_source],
                 "derivation": _derivation(
-                    call_id, "rank_kols:engagement_total_desc", rank_source["source_path"]
+                    call_id, "kol_value_score_v3:rank", rank_source["source_path"]
                 ),
             }
         )
 
-        # 派生评分数字 → settled rank_kols 调用。
+        # 派生评分数字 → settled rank_kols 调用（derivation.method 固定 v3）。
         score_sources = _score_sources(evidence_id, base, raw, keymap)
-        for field in ("total", "rating", "stars", "data_completeness"):
+        for field in (
+            "effect_score",
+            "price_efficiency_score",
+            "value_score",
+            "quoted_price",
+            "price_sample_size",
+            "rating",
+            "data_completeness",
+        ):
             refs.append(
                 {
                     "artifact_path": f"/data/items/{index}/score_snapshot/{field}",
                     "sources": score_sources,
                     "derivation": _derivation(
-                        call_id, "kol_score_v2", score_sources[0]["source_path"]
+                        call_id, SCORE_VERSION_V3, score_sources[0]["source_path"]
                     ),
                 }
             )
 
         # 每个维度：原始输入引用 Evidence，派生结果引用 rank_kols。
-        for dim in SCORE_DIMENSIONS:
+        for dim in V3_DIMENSIONS:
             source = _dim_source(evidence_id, base, raw, keymap, DIM_RAW_INPUT[dim])
             source_path = source["source_path"]
             for suffix in ("raw_score", "weighted_score"):
@@ -749,7 +771,9 @@ def _build_lineage(
                             f"/data/items/{index}/score_snapshot/dimensions/{dim}/{suffix}"
                         ),
                         "sources": [source],
-                        "derivation": _derivation(call_id, f"kol_score_v2:{dim}", source_path),
+                        "derivation": _derivation(
+                            call_id, f"{SCORE_VERSION_V3}:{dim}", source_path
+                        ),
                     }
                 )
 
@@ -824,6 +848,8 @@ async def build_kol_selection_draft(
         items=_rank_items(items),
         context=_rank_context(scope_dict),
         limit=DEFAULT_LIMIT,
+        preference="balanced",
+        content_formats=list(scope_dict.get("content_formats") or ()),
     )
     result = await RankKolsTool(db).execute(context, args)
     if result.status != "success":
@@ -842,10 +868,10 @@ async def build_kol_selection_draft(
         raw_mapping.append(raw_index)
         payload_items.append(_build_item(entry, items[raw_index]))
 
-    # 排序键（engagement_total）完全缺失时，rank_kols 只能按稳定输入顺序输出，
-    # 顺序不具业务含义——必须受限披露，且与分析 builder（total_engagement 为 None
-    # 即 restricted）行为一致。
-    sort_missing = not any(_is_number(item.get("engagement_total")) for item in items)
+    # §7.2：有效报价不足 3 个 → 价格效率分为 0，评分章节 restricted 披露。
+    price_restricted = bool(payload_items) and min(
+        item["score_snapshot"]["price_sample_size"] for item in payload_items
+    ) < MIN_PRICE_SAMPLE
 
     payload = _build_payload(
         scope=scope_dict,
@@ -853,7 +879,7 @@ async def build_kol_selection_draft(
         candidate_count=len(items),
         data_as_of=data_as_of,
         source_names=source_names,
-        sort_missing=sort_missing,
+        price_restricted=price_restricted,
         narrative=narrative,
     )
     try:
