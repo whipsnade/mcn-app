@@ -19,6 +19,8 @@ import hashlib
 import io
 import logging
 import xml.etree.ElementTree as ElementTree
+import zipfile
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -79,9 +81,143 @@ def _parse_csv(content: bytes, *, max_rows: int) -> tuple[list[str], list[dict[s
     return (reader.fieldnames or []), rows
 
 
-def _parse_xlsx(content: bytes, *, max_rows: int) -> tuple[list[str], list[dict[str, Any]]]:
-    import zipfile
+@dataclass(frozen=True)
+class WorksheetBounds:
+    """活动 worksheet 的真实物理边界（来自 row/cell 坐标预检，dimension 不可信）。"""
 
+    physical_rows: int
+    max_row: int
+    max_column: int
+
+
+def _column_index_from_ref(ref: str) -> int:
+    """把单元格引用（如 B2/XFD1）解析为列号（A=1）；非法引用抛受控错误。"""
+    letters: list[str] = []
+    digits: list[str] = []
+    seen_digit = False
+    for ch in ref:
+        if ch.isalpha() and not seen_digit:
+            letters.append(ch)
+        elif ch.isdigit():
+            seen_digit = True
+            digits.append(ch)
+        else:
+            raise UploadRejectedError(
+                status_code=400, error_code="invalid_worksheet_coordinate",
+                message=f"invalid cell reference: {ref!r}",
+            )
+    if not letters or not digits:
+        raise UploadRejectedError(
+            status_code=400, error_code="invalid_worksheet_coordinate",
+            message=f"invalid cell reference: {ref!r}",
+        )
+    column = 0
+    for ch in letters:
+        column = column * 26 + (ord(ch.upper()) - ord("A") + 1)
+    return column
+
+
+def _resolve_active_worksheet_path(zf: zipfile.ZipFile, workbook: Any) -> str:
+    """返回活动 worksheet 在 ZIP 内的路径；路径缺失/越界返回受控错误。
+
+    使用 openpyxl read_only 提供的 worksheet path（``_worksheet_path``），并校验
+    它存在于包内且属于 ``xl/worksheets/``——不让外部路径进入 ZIP 读取。
+    """
+    sheet = workbook.active
+    raw = getattr(sheet, "_worksheet_path", None)
+    if not isinstance(raw, str) or not raw:
+        raise UploadRejectedError(
+            status_code=400, error_code="invalid_worksheet_coordinate",
+            message="cannot resolve active worksheet path",
+        )
+    path = raw.lstrip("/")
+    if not path.casefold().startswith("xl/worksheets/"):
+        raise UploadRejectedError(
+            status_code=400, error_code="invalid_worksheet_coordinate",
+            message="active worksheet path outside xl/worksheets/",
+        )
+    names = {name.casefold() for name in zf.namelist()}
+    if path.casefold() not in names:
+        raise UploadRejectedError(
+            status_code=400, error_code="invalid_worksheet_coordinate",
+            message="active worksheet path missing in package",
+        )
+    return path
+
+
+def _scan_worksheet_coordinates(zf: zipfile.ZipFile, path: str, *, max_rows: int) -> WorksheetBounds:
+    """流式扫描活动 worksheet XML 的真实坐标（禁止 zf.read 整包加载）。
+
+    start 事件中统计 row 元素数量、最大 row r 坐标与最大 cell 列号；XML 解析错误
+    与非法坐标一律映射为受控 UploadRejectedError。物理行数超过上限时提前中止，
+    避免恶意文件触发整表扫描。
+    """
+    physical_rows = 0
+    max_row_coordinate = 0
+    actual_max_column = 0
+    try:
+        with zf.open(path) as stream:
+            for _event, element in ElementTree.iterparse(stream, events=("start",)):
+                local = element.tag.rsplit("}", 1)[-1]
+                if local == "row":
+                    physical_rows += 1
+                    if physical_rows > max_rows + 1:
+                        raise UploadRejectedError(
+                            status_code=400, error_code="worksheet_dimensions_exceeded",
+                            message=f"worksheet has more than {max_rows + 1} rows",
+                        )
+                    raw_r = element.attrib.get("r")
+                    if raw_r is not None:
+                        try:
+                            row_no = int(raw_r)
+                        except ValueError:
+                            raise UploadRejectedError(
+                                status_code=400, error_code="invalid_worksheet_coordinate",
+                                message=f"invalid row coordinate: {raw_r!r}",
+                            )
+                        if row_no > max_row_coordinate:
+                            max_row_coordinate = row_no
+                elif local == "c":
+                    ref = element.attrib.get("r")
+                    if ref:
+                        column = _column_index_from_ref(ref)
+                        if column > actual_max_column:
+                            actual_max_column = column
+                element.clear()
+    except UploadRejectedError:
+        raise
+    except ElementTree.ParseError:
+        raise UploadRejectedError(
+            status_code=400, error_code="invalid_worksheet_coordinate",
+            message="worksheet XML is not well-formed",
+        )
+    return WorksheetBounds(
+        physical_rows=physical_rows,
+        max_row=max_row_coordinate,
+        max_column=actual_max_column,
+    )
+
+
+def _validate_worksheet_bounds(bounds: WorksheetBounds, *, max_rows: int) -> None:
+    """按真实坐标校验物理边界：行数/行坐标/列坐标任一超限立即拒绝。"""
+    if bounds.physical_rows > max_rows + 1:
+        raise UploadRejectedError(
+            status_code=400, error_code="worksheet_dimensions_exceeded",
+            message=f"worksheet has more than {max_rows + 1} rows",
+        )
+    if bounds.max_row > max_rows + 1:
+        raise UploadRejectedError(
+            status_code=400, error_code="worksheet_dimensions_exceeded",
+            message=f"worksheet max row {bounds.max_row} exceeds {max_rows + 1}",
+        )
+    if bounds.max_column > _MAX_XLSX_COLUMNS:
+        raise UploadRejectedError(
+            status_code=400, error_code="worksheet_columns_exceeded",
+            message=f"worksheet max column {bounds.max_column} exceeds {_MAX_XLSX_COLUMNS}",
+        )
+
+
+def _parse_xlsx(content: bytes, *, max_rows: int) -> tuple[list[str], list[dict[str, Any]]]:
     from openpyxl import load_workbook
 
     # 拒绝含宏部件或外部链接的 xlsx（即使扩展名不是 .xlsm），并做 ZIP bomb 防护。
@@ -166,9 +302,8 @@ def _parse_xlsx(content: bytes, *, max_rows: int) -> tuple[list[str], list[dict[
     )
     try:
         sheet = workbook.active
-        # 物理维度防护（Gate B P1-4）：在 iter_rows 前检查声明的 max_row/max_column，
-        # 超大维度/列坐标立即拒绝，避免 openpyxl 为中间空行持续迭代（含表头，行
-        # 上限 = max_rows + 1）。
+        # 物理维度快速拒绝（保留）：声明的 dimension 超限立即拒绝，但 dimension
+        # 不再作为实际解析宽度的唯一来源（可缺失/可伪造）。
         if sheet.max_row is not None and sheet.max_row > max_rows + 1:
             raise UploadRejectedError(
                 status_code=400, error_code="worksheet_dimensions_exceeded",
@@ -179,13 +314,19 @@ def _parse_xlsx(content: bytes, *, max_rows: int) -> tuple[list[str], list[dict[
                 status_code=400, error_code="worksheet_columns_exceeded",
                 message=f"worksheet exceeds {_MAX_XLSX_COLUMNS} columns",
             )
+        # 坐标预检：真实 row/cell 坐标确定物理边界与实际宽度（流式 iterparse，
+        # 不整包加载 worksheet XML）。
+        with zipfile.ZipFile(io.BytesIO(content)) as zf:
+            worksheet_path = _resolve_active_worksheet_path(zf, workbook)
+            bounds = _scan_worksheet_coordinates(zf, worksheet_path, max_rows=max_rows)
+        _validate_worksheet_bounds(bounds, max_rows=max_rows)
+        # 解析宽度 = 真实 cell 坐标得到的最大列号（dimension 缺失/比真实小/比真实
+        # 大都以实际坐标为准），并确保不超上限。
+        effective_max_col = min(max(bounds.max_column, 1), _MAX_XLSX_COLUMNS)
         rows: list[dict[str, Any]] = []
         columns: list[str] = []
-        # 基于已验证的实际工作表宽度迭代，而非固定 1000 列（两列窄表不按每行
-        # 1000 个位置迭代）；dimension 缺失时退化为 1 列，保持有界。
-        effective_max_col = min(max(sheet.max_column or 1, 1), _MAX_XLSX_COLUMNS)
-        # 即使 dimension 合法也显式传递迭代边界，不依赖工作簿自身声明的范围；
-        # 空白行也计入迭代次数（max_row 上限），不能只统计非空数据行。
+        # 显式传递迭代边界，不依赖工作簿自身声明的范围；空白行也计入迭代次数
+        # （max_row 上限），不能只统计非空数据行。
         for index, row in enumerate(
             sheet.iter_rows(
                 values_only=True,
@@ -196,17 +337,7 @@ def _parse_xlsx(content: bytes, *, max_rows: int) -> tuple[list[str], list[dict[
             if row is None or all(cell is None for cell in row):
                 continue
             if index == 0:
-                # max_col 上限会把行填充到 effective_max_col 列；按工作表实际宽度
-                # （sheet.max_column，缺失时回退到最后非空列）截断，保留原解析语义。
-                if sheet.max_column is not None and sheet.max_column > 0:
-                    width = min(sheet.max_column, _MAX_XLSX_COLUMNS)
-                else:
-                    width = effective_max_col
-                    for cell_index in range(len(row) - 1, -1, -1):
-                        if row[cell_index] not in (None, ""):
-                            width = cell_index + 1
-                            break
-                columns = [str(cell) if cell is not None else "" for cell in row[:width]]
+                columns = [str(cell) if cell is not None else "" for cell in row]
                 continue
             rows.append(
                 {
