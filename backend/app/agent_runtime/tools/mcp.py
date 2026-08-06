@@ -255,9 +255,26 @@ class DurableToolCallCoordinator:
                 step = await db.get(AgentStep, context.step_id)
                 if step is None or step.run_id != run.id:
                     raise ValueError("agent_step_context_mismatch")
-                # 2. 计算并锁定 logical_call_id：已存在则幂等回放（绝不重发）。
+                # 2. 查找已有行：幂等回放或 definitely_not_sent 重试。
                 existing = await self._by_logical_call_id(db, logical_call_id, for_update=True)
                 if existing is not None:
+                    # definitely_not_sent 允许一次真实重试（dispatch_count < 2）。
+                    if (
+                        existing.status == "failed"
+                        and existing.error_type == DEFINITELY_NOT_SENT
+                        and existing.dispatch_count < 2
+                    ):
+                        existing.status = "running"
+                        existing.dispatch_count += 1
+                        existing.error_type = None
+                        existing.safe_error_message = None
+                        existing.completed_at = None
+                        existing.started_at = _now()
+                        accounting = AgentMcpAccounting(db)
+                        await accounting.reserve(context.user_id, existing)
+                        await accounting.mark_running(existing)
+                        await db.commit()
+                        return None
                     return await self._replay(db, existing)
                 # 3-5. 行 + 预留 + running 同一事务提交。
                 row = AgentToolCall(
@@ -347,18 +364,22 @@ class DurableToolCallCoordinator:
         error_type: str,
         message: str,
         upstream_request_id: str | None = None,
-    ) -> None:
-        """失败收口（definitely_not_sent / failed_confirmed）：释放预留。"""
+    ) -> int:
+        """失败收口（definitely_not_sent / failed_confirmed）：释放预留。
+
+        返回更新后行的 dispatch_count，供调用方判断是否还允许重试。
+        """
         async with self._session_factory() as db:
             row = await self._require_call(db, logical_call_id, for_update=True)
             if row.status in ("settled", "failed"):
-                return  # 已终态：幂等跳过，不重复触碰钱包
+                return row.dispatch_count
             if upstream_request_id:
                 row.upstream_request_id = upstream_request_id
             await AgentMcpAccounting(db).release(
                 user_id, row, error_type=error_type, message=message
             )
             await db.commit()
+            return row.dispatch_count
 
     async def finalize_unknown(
         self,
@@ -376,6 +397,33 @@ class DurableToolCallCoordinator:
                 row.upstream_request_id = upstream_request_id
             row.status = "unknown"
             row.error_type = RESULT_UNKNOWN
+            row.safe_error_message = message
+            row.completed_at = _now()
+            await db.commit()
+
+    async def finalize_succeeded_empty(
+        self,
+        *,
+        logical_call_id: str,
+        user_id: str,
+        message: str,
+        upstream_request_id: str | None = None,
+    ) -> None:
+        """succeeded_empty 收口：结算积分 + 标记 failed+succeeded_empty，不写 Evidence。
+
+        上游返回成功但无结构化内容：调用确实成功（结算 10 分），但产物不可用
+        （标记 failed + error_type=succeeded_empty），绝不创建内容为 None 的 Evidence。
+        回放时返回 failed+succeeded_empty（不变成 success/already settled）。
+        """
+        async with self._session_factory() as db:
+            row = await self._require_call(db, logical_call_id, for_update=True)
+            if row.status in ("settled", "failed"):
+                return
+            if upstream_request_id:
+                row.upstream_request_id = upstream_request_id
+            await AgentMcpAccounting(db).settle(user_id, row)
+            row.status = "failed"
+            row.error_type = "succeeded_empty"
             row.safe_error_message = message
             row.completed_at = _now()
             await db.commit()
@@ -786,17 +834,10 @@ class AgentMcpTool:
         self._breaker.record_success(
             service=self._service.value, internal_tool_name=self.name, arguments=normalized
         )
-        evidence_id, preview = await self._coordinator.finalize_success(
-            logical_call_id=logical_call_id,
-            user_id=context.user_id,
-            session_id=context.session_id,
-            validated_payload=validated,
-            upstream_request_id=result.upstream_request_id,
-        )
+        # succeeded_empty：成功但无结构化内容 → 结算 + failed+succeeded_empty，
+        # 不创建 None Evidence，不调 finalize_success（Gate B 最终审核 M1）。
         if validated is None:
-            # 成功但无结构化结果（succeeded_empty）：已结算，但同参数重放只会
-            # 命中幂等回放，不允许原样重试获取数据。
-            return _feedback_result(
+            feedback = _feedback_result(
                 tool=self.name,
                 normalized=normalized,
                 error_type="succeeded_empty",
@@ -806,6 +847,20 @@ class AgentMcpTool:
                 suggested_actions=["调整查询参数获取结构化结果，或继续其他章节"],
                 upstream_reason="upstream returned no structured content",
             )
+            await self._coordinator.finalize_succeeded_empty(
+                logical_call_id=logical_call_id,
+                user_id=context.user_id,
+                message=feedback.safe_summary,
+                upstream_request_id=result.upstream_request_id,
+            )
+            return feedback
+        evidence_id, preview = await self._coordinator.finalize_success(
+            logical_call_id=logical_call_id,
+            user_id=context.user_id,
+            session_id=context.session_id,
+            validated_payload=validated,
+            upstream_request_id=result.upstream_request_id,
+        )
         normalization = NormalizationRegistry().normalize(self.name, validated)
         summary = json.dumps(
             {
@@ -935,10 +990,6 @@ class AgentMcpTool:
         *,
         message: str,
     ) -> ToolResult:
-        # 外发前失败同样是上游健康信号：记录到细粒度熔断键，避免对同一调用反复
-        # 撞入断连。半开探测失败时 record_failure 会重新打开并清掉 probe_in_flight，
-        # 该键不会被永久卡死（见 circuit_breaker.allow 的 half-open 语义）。
-        # 注意：熔断打开与余额不足两条路径都提前 return，不会走到这里。
         self._breaker.record_failure(
             service=self._service.value, internal_tool_name=self.name, arguments=normalized
         )
@@ -952,12 +1003,24 @@ class AgentMcpTool:
             suggested_actions=["可对相同参数重试一次；仍失败则调整参数、拆分平台或继续其他章节"],
             upstream_reason=message,
         )
-        await self._coordinator.finalize_release(
+        dispatch_count = await self._coordinator.finalize_release(
             logical_call_id=logical_call_id,
             user_id=context.user_id,
             error_type=DEFINITELY_NOT_SENT,
             message=feedback.safe_summary,
         )
+        # dispatch_count >= 2 时不再允许重试，修正反馈中的 retry_allowed
+        if dispatch_count >= 2:
+            fb_dict = json.loads(feedback.safe_summary)
+            fb_dict["same_fingerprint_retry_allowed"] = False
+            fb_dict["suggested_actions"] = [
+                "已用完一次重试：修改参数、拆分平台或更换工具后重试",
+            ]
+            return ToolResult(
+                status="failed",
+                safe_summary=json.dumps(fb_dict, ensure_ascii=False),
+                error_type=DEFINITELY_NOT_SENT,
+            )
         return feedback
 
 

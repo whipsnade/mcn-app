@@ -47,6 +47,7 @@ from app.agent_runtime.models import (
 )
 from app.agent_runtime.tools.contracts import ToolContext, ToolResult
 from app.agent_runtime.tools.mcp import (
+    DEFINITELY_NOT_SENT,
     FAILED_CONFIRMED,
     MCP_POINTS_COST,
     RESULT_UNKNOWN,
@@ -54,6 +55,7 @@ from app.agent_runtime.tools.mcp import (
     logical_call_id_for,
 )
 from app.agent_runtime.tools.registry import ToolRegistry
+from app.agent_runtime.evidence import EvidenceWriter
 from app.billing.models import Wallet
 from app.billing.service import WalletService
 from app.db.session import SessionFactory
@@ -854,31 +856,34 @@ async def test_reconcile_payload_failing_output_validation_does_not_write_eviden
 
 @pytest.mark.asyncio
 async def test_connection_errors_trip_fine_grained_breaker() -> None:
-    """外发前错误（connection）必须计入细粒度熔断键，否则相同调用会反复撞入断连。"""
+    """外发前错误（connection）计入细粒度熔断键；definitely_not_sent 允许一次重试。"""
     chain = await _setup_chain(steps=4)
     try:
         breaker = FineGrainedCircuitBreaker(failure_threshold=3, reset_seconds=60)
         transport = FakeMcpTransport([McpConnectionTimeout("connect timeout")] * 3)
         bridge = _bridge(transport, breaker=breaker)
 
-        for index in range(1):
-            result = await bridge.execute(
-                _context(chain, chain.step_ids[index]), {"keyword": "美妆"}
-            )
-            assert result.error_type == "definitely_not_sent"
+        # 首次外发前失败
+        result = await bridge.execute(
+            _context(chain, chain.step_ids[0]), {"keyword": "美妆"}
+        )
+        assert result.error_type == "definitely_not_sent"
         assert len(transport.calls) == 1
 
-        # 熔断键已打开：相同调用被拦截，不再外发
-        assert (
-            breaker.allow(DataTapService.INSIGHT_CUBE.value, INTERNAL_NAME, {"keyword": "美妆"})
-            is True
+        # 第二次同参数：definitely_not_sent 允许重试一次 → 真实外发
+        retry = await bridge.execute(
+            _context(chain, chain.step_ids[1]), {"keyword": "美妆"}
         )
+        assert retry.error_type == "definitely_not_sent"
+        assert len(transport.calls) == 2
+
+        # 第三次同参数：已达上限（dispatch_count=2）→ 防重阻止，不外发
         blocked = await bridge.execute(
             _context(chain, chain.step_ids[3]), {"keyword": "美妆"}
         )
         assert blocked.error_type == "definitely_not_sent"
-        assert len(transport.calls) == 1
-        # 三次外发前失败都已释放，钱包无挂起
+        assert len(transport.calls) == 2
+        # 两次失败都释放积分，无挂起
         wallet = await _wallet(chain.user_id)
         assert (wallet.balance, wallet.reserved) == (1000, 0)
     finally:
@@ -1209,23 +1214,165 @@ async def test_feedback_matrix(
 
 @pytest.mark.asyncio
 async def test_same_fingerprint_retry_is_rejected_on_replay() -> None:
-    """definitely_not_sent 后同参数重试：prepare 幂等回放 failed 行，
-    反馈标记 same_fingerprint_retry_allowed=False（不重发、不重复扣费）。"""
-    chain = await _setup_chain()
+    """definitely_not_sent 后同参数跨 Step：允许一次重试，第二次失败后阻止。"""
+    chain = await _setup_chain(steps=3)
     try:
-        transport = FakeMcpTransport([McpConnectionTimeout("connect timeout")])
+        transport = FakeMcpTransport([
+            McpConnectionTimeout("connect timeout 1"),
+            McpConnectionTimeout("connect timeout 2"),
+        ])
         bridge = _bridge(transport)
-        context = _context(chain)
 
-        first = await bridge.execute(context, {"keyword": "美妆"})
+        first = await bridge.execute(_context(chain, chain.step_ids[0]), {"keyword": "美妆"})
         assert json.loads(first.safe_summary)["same_fingerprint_retry_allowed"] is True
 
-        second = await bridge.execute(context, {"keyword": "美妆"})
-        assert second.error_type == "definitely_not_sent"
+        second = await bridge.execute(_context(chain, chain.step_ids[1]), {"keyword": "美妆"})
+        assert second.error_type == DEFINITELY_NOT_SENT
         feedback = json.loads(second.safe_summary)
         assert feedback["same_fingerprint_retry_allowed"] is False
-        assert len(transport.calls) == 1  # 未重发
+        assert len(transport.calls) == 2
+
+        third = await bridge.execute(_context(chain, chain.step_ids[2]), {"keyword": "美妆"})
+        assert json.loads(third.safe_summary)["same_fingerprint_retry_allowed"] is False
+        assert len(transport.calls) == 2
         wallet = await _wallet(chain.user_id)
         assert (wallet.balance, wallet.reserved) == (1000, 0)
+    finally:
+        await _teardown_chain(chain)
+
+
+# ---------------------------------------------------------------------------
+# M1: MCP fingerprint 状态机（Gate B 最终审核：跨 Step 防重 + definitely_not_sent 重试）
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_m1_unknown_cross_step_only_dispatched_once() -> None:
+    """result_unknown 跨 Step 只外发一次，第二次回放 unknown 状态。"""
+    chain = await _setup_chain(steps=3)
+    try:
+        transport = FakeMcpTransport([McpGatewayTimeout("gw timeout")])
+        bridge = _bridge(transport)
+
+        # Step 1: 外发 → result_unknown
+        r1 = await bridge.execute(_context(chain, chain.step_ids[0]), {"keyword": "美妆"})
+        assert r1.error_type == RESULT_UNKNOWN
+        assert len(transport.calls) == 1
+
+        # Step 2: 同参数不同 Step → 防重回放，不外发
+        r2 = await bridge.execute(_context(chain, chain.step_ids[1]), {"keyword": "美妆"})
+        assert r2.error_type == RESULT_UNKNOWN
+        assert len(transport.calls) == 1
+        # 回放的 feedback 标记 same_fingerprint_retry_allowed=False
+        fb2 = json.loads(r2.safe_summary)
+        assert fb2["same_fingerprint_retry_allowed"] is False
+
+        # 钱包：一次 unknown 挂 10 预留
+        wallet = await _wallet(chain.user_id)
+        assert (wallet.balance, wallet.reserved) == (990, 10)
+    finally:
+        await _teardown_chain(chain)
+
+
+@pytest.mark.asyncio
+async def test_m1_failed_confirmed_cross_step_only_dispatched_once() -> None:
+    """failed_confirmed 跨 Step 只外发一次，第二次回放结构化失败。"""
+    chain = await _setup_chain(steps=3)
+    try:
+        transport = FakeMcpTransport([
+            RemoteToolResult(structured_content=ERR_PAYLOAD, is_error=True, upstream_request_id="req-err"),
+        ])
+        bridge = _bridge(transport)
+
+        r1 = await bridge.execute(_context(chain, chain.step_ids[0]), {"keyword": "美妆"})
+        assert r1.error_type == FAILED_CONFIRMED
+        assert len(transport.calls) == 1
+
+        r2 = await bridge.execute(_context(chain, chain.step_ids[1]), {"keyword": "美妆"})
+        assert r2.error_type == FAILED_CONFIRMED
+        assert len(transport.calls) == 1
+        fb2 = json.loads(r2.safe_summary)
+        assert fb2["same_fingerprint_retry_allowed"] is False
+
+        # failed_confirmed 释放积分
+        wallet = await _wallet(chain.user_id)
+        assert (wallet.balance, wallet.reserved) == (1000, 0)
+    finally:
+        await _teardown_chain(chain)
+
+
+@pytest.mark.asyncio
+async def test_m1_definitely_not_sent_allows_one_retry() -> None:
+    """definitely_not_sent 第一次失败后允许真实重试一次，第三次阻止。总外发=2。"""
+    chain = await _setup_chain(steps=4)
+    try:
+        transport = FakeMcpTransport([
+            McpConnectionTimeout("connect timeout 1"),
+            McpConnectionTimeout("connect timeout 2"),
+        ])
+        bridge = _bridge(transport)
+
+        # Step 1: 首次外发 → connection error → definitely_not_sent
+        r1 = await bridge.execute(_context(chain, chain.step_ids[0]), {"keyword": "美妆"})
+        assert r1.error_type == DEFINITELY_NOT_SENT
+        fb1 = json.loads(r1.safe_summary)
+        assert fb1["same_fingerprint_retry_allowed"] is True
+        assert len(transport.calls) == 1
+
+        # Step 2: 同参数不同 Step → 允许重试（第二次真实外发）
+        r2 = await bridge.execute(_context(chain, chain.step_ids[1]), {"keyword": "美妆"})
+        assert r2.error_type == DEFINITELY_NOT_SENT
+        assert len(transport.calls) == 2
+
+        # Step 3: 同参数 → 第三次阻止（已达上限 2）
+        r3 = await bridge.execute(_context(chain, chain.step_ids[2]), {"keyword": "美妆"})
+        assert r3.error_type == DEFINITELY_NOT_SENT
+        assert len(transport.calls) == 2
+        fb3 = json.loads(r3.safe_summary)
+        assert fb3["same_fingerprint_retry_allowed"] is False
+
+        # 两次失败都释放积分，无残留
+        wallet = await _wallet(chain.user_id)
+        assert (wallet.balance, wallet.reserved) == (1000, 0)
+    finally:
+        await _teardown_chain(chain)
+
+
+@pytest.mark.asyncio
+async def test_m1_succeeded_empty_no_evidence_and_consistent_replay() -> None:
+    """succeeded_empty 不创建 Evidence，跨 Step 回放一致返回 failed+succeeded_empty。"""
+    chain = await _setup_chain(steps=3)
+    try:
+        transport = FakeMcpTransport([
+            RemoteToolResult(structured_content=None, is_error=False, upstream_request_id="req-empty"),
+        ])
+        bridge = _bridge(transport)
+
+        # Step 1: 成功但无结构化内容 → succeeded_empty
+        r1 = await bridge.execute(_context(chain, chain.step_ids[0]), {"keyword": "美妆"})
+        assert r1.status == "failed"
+        assert r1.error_type == "succeeded_empty"
+        assert len(transport.calls) == 1
+
+        # 不应创建 Evidence
+        rows = await _rows(chain.run_id)
+        assert len(rows) == 1
+        row = rows[0]
+        assert row.status == "failed"
+        assert row.error_type == "succeeded_empty"
+        # 无 Evidence 行
+        async with SessionFactory() as db:
+            evidence = await EvidenceWriter(db).get_by_tool_call_id(row.id)
+            assert evidence is None
+
+        # Step 2: 同参数不同 Step → 回放 succeeded_empty（不是 success/already settled）
+        r2 = await bridge.execute(_context(chain, chain.step_ids[1]), {"keyword": "美妆"})
+        assert r2.status == "failed"
+        assert r2.error_type == "succeeded_empty"
+        assert len(transport.calls) == 1
+
+        # 钱包：succeeded_empty 结算（非释放）
+        wallet = await _wallet(chain.user_id)
+        assert (wallet.balance, wallet.reserved) == (990, 0)
     finally:
         await _teardown_chain(chain)

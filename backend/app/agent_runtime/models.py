@@ -195,6 +195,7 @@ class AgentToolCall(Base):
     internal_tool_name: Mapped[str] = mapped_column(String(128), nullable=False)
     arguments_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     arguments_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    dispatch_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
     status: Mapped[str] = mapped_column(String(24), nullable=False, default="planned")
     points_reserved: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     points_settled: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
