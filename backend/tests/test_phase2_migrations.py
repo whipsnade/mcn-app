@@ -21,7 +21,7 @@ def test_migration_chain_has_single_head() -> None:
     config = Config(str(backend_dir / "alembic.ini"))
     config.set_main_option("script_location", str(backend_dir / "migrations"))
     heads = ScriptDirectory.from_config(config).get_heads()
-    assert heads == ["0030_direct_publish_runtime"]
+    assert heads == ["0031_evidence_uploads"]
 
 
 async def test_phase_two_unique_constraints() -> None:
@@ -602,6 +602,62 @@ async def test_0028_agent_artifact_read_states_schema() -> None:
     version_by_name = {item["name"]: item for item in version_columns}
     assert "lineage_snapshot_json" in version_by_name
     assert version_by_name["lineage_snapshot_json"]["nullable"] is True
+
+
+async def test_0031_upload_and_evidence_schema() -> None:
+    """迁移 0031：agent_uploads 表 + evidence_items 上传/归一化诊断列。"""
+    assert {
+        "id",
+        "user_id",
+        "session_id",
+        "run_id",
+        "original_filename",
+        "mime_type",
+        "size_bytes",
+        "sha256",
+        "storage_key",
+        "status",
+        "error_code",
+        "created_at",
+        "completed_at",
+    } <= await column_names("agent_uploads")
+
+    evidence = await column_names("evidence_items")
+    assert {
+        "upload_id",
+        "normalization_version",
+        "normalization_status",
+        "field_mapping_json",
+        "unmapped_fields_json",
+        "truncated",
+        "normalization_error_code",
+    } <= evidence
+
+    async with engine.connect() as connection:
+        check_constraints = await connection.run_sync(
+            lambda sync: inspect(sync).get_check_constraints("evidence_items")
+        )
+        evidence_indexes = await connection.run_sync(
+            lambda sync: inspect(sync).get_indexes("evidence_items")
+        )
+        upload_columns = await connection.run_sync(
+            lambda sync: inspect(sync).get_columns("agent_uploads")
+        )
+
+    checks = {item["name"]: item["sqltext"] for item in check_constraints}
+    assert "ck_evidence_items_tool_call_xor_upload" in checks
+    xor_text = checks["ck_evidence_items_tool_call_xor_upload"].lower()
+    assert "tool_call_id" in xor_text and "upload_id" in xor_text and "null" in xor_text
+
+    index_names = {item["name"] for item in evidence_indexes}
+    assert "ix_evidence_items_session_collected_at" in index_names
+    assert "ix_evidence_items_upload_id" in index_names
+
+    column_by_name = {item["name"]: item for item in upload_columns}
+    assert column_by_name["run_id"]["nullable"] is True
+    assert column_by_name["error_code"]["nullable"] is True
+    assert column_by_name["completed_at"]["nullable"] is True
+    assert column_by_name["status"]["nullable"] is False
 
 
 async def column_names(table: str) -> set[str]:

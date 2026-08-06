@@ -204,8 +204,34 @@
 - 回滚到旧代码前**不得删除 Review 表**：回滚应用版本后旧系统仍需读取这些表恢复
   Reviewer 能力。新表（`artifact_publish_attempts`、`validation_json` 列）未被新代码写入时
   可随 0030 downgrade 整体回滚；已写入则保留新表、仅回滚应用版本。
+- 0030 downgrade 会先 `DELETE FROM memory_entries WHERE memory_type='confirmed_scope'`
+  再重建 `ck_memory_entries_type` CHECK 约束——MySQL 重建 CHECK 会校验既有行，
+  残留 confirmed_scope 行会让 downgrade 失败，故必须先清行。已验证 downgrade/upgrade
+  往返（含落库 confirmed_scope 行的场景）。
 - `reviewing` 仅为历史兼容状态：新 Run 不再进入；`completed_with_warnings` 视为终态，
   纳入终态集合、租约、取消、暂停和 executor 扫描。
+
+### 5.6 Gate A 审查修复（2026-08-06）
+
+Gate A 审查发现的 5 项必修 + 2 项次要问题，已在同一迁移/代码批次修复，切档前核对：
+
+- **跨 Session 引用已发布报告**：`_validate_artifact_version_ids` 不再要求 Version
+  同 Session，恢复设计 §0/§5.4「跨 Session 可复用当前用户已发布 Artifact」；跨用户、
+  草稿、不存在的 Version 仍 404。
+- **Retry 继承输入引用**：`retry_run` 从原 Run `prompt_snapshot_json` 继承输入
+  Evidence / Artifact Version / parent_run_id，与原 Run 产出合并冻结到新 Run，避免
+  重试重新查 MCP 或结果漂移。
+- **发布失败进入终态聚合**：引用失败（draft 不存在 / 他人持有）持久化为 failed
+  `ArtifactPublishAttempt`（`artifact_id`/`draft_revision_id` 可为 NULL），
+  `_publish_outcome_artifact_ids` 用 `rejected_draft_id` 聚合——Run 不会在存在
+  失败发布项时被错误标记 completed，统一收口 `ALL_ARTIFACTS_FAILED`。
+- **0030 downgrade 清 confirmed_scope**：见 §5.5。
+- **幂等哈希含引用**：消息幂等 payload 哈希纳入 `parent_run_id` + 排序后的
+  `artifact_version_ids`，同文本切换报告版本/父 Run 复用同 key 返回 409，不复用错误 Run。
+- **次要：发布尝试表 run_id 索引**：`ix_artifact_publish_attempts_run_id` 支撑终态聚合
+  按 run_id 扫描。
+- **次要：remember_scope 校验来源消息**：`source_message_id` 必须存在、属本 Session
+  且为 user 消息；空 values 拒绝。
 
 ## 6. 参考
 
