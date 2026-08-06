@@ -125,13 +125,22 @@ class FrozenDerivationRef(BaseModel):
 
 
 class FrozenEvidenceSource(BaseModel):
-    """闭包快照中的证据叶子。Evidence 不可变，故引用永不失效、快照不陈旧。"""
+    """闭包快照中的证据叶子。Evidence 不可变，故引用永不失效、快照不陈旧。
+
+    MCP Evidence 保留 ``tool_call_id``；upload Evidence（用户上传文件）保存
+    upload id、文件哈希、文件名与上传时间（Gate B：可追溯到源文件）。
+    """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     evidence_id: str
     source_path: str
     payload_hash: str
+    tool_call_id: str | None = None
+    upload_id: str | None = None
+    upload_sha256: str | None = None
+    upload_filename: str | None = None
+    uploaded_at: str | None = None
 
 
 class FrozenLineageRef(BaseModel):

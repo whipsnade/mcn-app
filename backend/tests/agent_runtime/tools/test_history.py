@@ -925,3 +925,60 @@ async def test_remember_scope_cross_user_forbidden(db_session, user_factory) -> 
     assert result.status == "failed"
     assert result.error_type == FORBIDDEN
     assert await _scope_entries(db_session, session.id) == []
+
+
+async def test_search_evidence_upload_source_no_storage_path(
+    db_session, user_factory
+) -> None:
+    """upload Evidence 可搜索且不泄漏本地存储路径（Gate B Task 4）。
+
+    matches 带 source_type=user_upload；safe_summary 绝不包含 storage_key
+    或本地目录信息（storage path 只存在于服务端 agent_uploads 行）。
+    """
+    from app.agent_runtime.models import AgentUpload
+
+    user = await user_factory()
+    session, run, _step, call = await _make_chain(db_session, user.id)
+    now = _now()
+    upload = AgentUpload(
+        id=str(uuid4()),
+        user_id=user.id,
+        session_id=session.id,
+        original_filename="投放数据.csv",
+        mime_type="text/csv",
+        size_bytes=120,
+        sha256="u" * 64,
+        storage_key=f"secret-dir/{user.id}/abcd-{('u' * 16)}.csv",
+        status="parsed",
+        created_at=now,
+        completed_at=now,
+    )
+    db_session.add(upload)
+    await db_session.flush()
+    writer = EvidenceWriter(db_session)
+    item = await writer.write(
+        session_id=session.id,
+        run_id=None,
+        tool_call_id=None,
+        upload_id=upload.id,
+        source_type="user_upload",
+        source_name="user_upload",
+        scope_json=None,
+        period_json=None,
+        raw_payload={"columns": ["平台", "声量"], "rows": [{"平台": "小红书", "声量": 100}]},
+        collected_at=now,
+    )
+    context = ToolContext(
+        user_id=user.id, session_id=session.id, run_id=run.id, profile_name="session_analyst_v1"
+    )
+
+    tool = SearchEvidenceTool(db_session)
+    result = await tool.execute(context, type(tool).input_model(query="小红书"))
+    data = _summary(result)
+    matches = {m["evidence_id"]: m for m in data["matches"]}
+    assert item.id in matches
+    assert matches[item.id]["source_type"] == "user_upload"
+    rendered = json.dumps(data, ensure_ascii=False)
+    assert "secret-dir" not in rendered
+    assert "storage_key" not in rendered
+    assert "agent-uploads" not in rendered

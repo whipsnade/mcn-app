@@ -272,11 +272,23 @@ async def test_publish_freezes_lineage_closure_into_version(
         ("e-1", "/0/声量"),
         ("e-2", "/0/互动"),
     ]
-    # 闭包自包含：来源只剩 evidence 叶子（payload_hash 一并冻结）。
+    # 闭包自包含：来源只剩 evidence 叶子（payload_hash 一并冻结）；Gate B 起
+    # MCP 快照带 tool_call_id、upload 快照带源文件信息（此处 MCP 全为空值）。
     for ref in snapshot["refs"]:
         for source in ref["sources"]:
-            assert set(source) == {"evidence_id", "source_path", "payload_hash"}
+            assert set(source) == {
+                "evidence_id",
+                "source_path",
+                "payload_hash",
+                "tool_call_id",
+                "upload_id",
+                "upload_sha256",
+                "upload_filename",
+                "uploaded_at",
+            }
             assert source["payload_hash"] == "beef"
+            assert source["tool_call_id"] is not None
+            assert source["upload_id"] is None
 
 
 async def test_publish_revalidates_payload_and_blocks_legacy_invalid_draft(

@@ -41,7 +41,7 @@ from app.agent_artifacts.schemas import (
     LineageRef,
 )
 
-from app.agent_runtime.models import AgentRun, AgentToolCall, EvidenceItem
+from app.agent_runtime.models import AgentRun, AgentToolCall, AgentUpload, EvidenceItem
 
 # Artifact 递归展开的最大深度：超过即报 ``lineage_too_deep``，防止深链/组合爆炸
 # 拖垮校验请求（菱形共享子图已由 memo 消除重复查询）。
@@ -73,6 +73,10 @@ class EvidenceRecord:
     session_id: str
     raw_payload: Any
     payload_hash: str
+    # MCP Evidence 的 tool_call_id（upload Evidence 为 None）。
+    tool_call_id: str | None = None
+    # upload Evidence 的来源文件信息（MCP Evidence 为 None；Gate B）。
+    upload: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -225,6 +229,9 @@ class _ResolvedEvidence:
     evidence_id: str
     source_path: str
     payload_hash: str
+    # 来源 Evidence 的归属信息：MCP 的 tool_call_id / upload 的文件信息。
+    tool_call_id: str | None = None
+    upload: dict[str, Any] | None = None
 
 
 def _parse_refs(raw: Any) -> list[LineageRef]:
@@ -267,6 +274,8 @@ async def _resolve_source(
                 evidence_id=record.id,
                 source_path=source.source_path,
                 payload_hash=record.payload_hash,
+                tool_call_id=record.tool_call_id,
+                upload=record.upload,
             )
         ], record.raw_payload
 
@@ -421,6 +430,11 @@ async def validate_and_freeze_lineage(
                         evidence_id=leaf.evidence_id,
                         source_path=leaf.source_path,
                         payload_hash=leaf.payload_hash,
+                        tool_call_id=leaf.tool_call_id,
+                        upload_id=(leaf.upload or {}).get("upload_id"),
+                        upload_sha256=(leaf.upload or {}).get("sha256"),
+                        upload_filename=(leaf.upload or {}).get("original_filename"),
+                        uploaded_at=(leaf.upload or {}).get("uploaded_at"),
                     )
                     for leaf in leaves
                 ),
@@ -454,14 +468,33 @@ class DbLineageLoader:
         self._db = db
 
     async def load_evidence(self, evidence_id: str) -> EvidenceRecord | None:
-        row = await self._db.get(EvidenceItem, evidence_id)
+        stmt = (
+            select(EvidenceItem, AgentUpload)
+            .outerjoin(AgentUpload, EvidenceItem.upload_id == AgentUpload.id)
+            .where(EvidenceItem.id == evidence_id)
+        )
+        result = await self._db.execute(stmt)
+        row = result.first()
         if row is None:
             return None
+        evidence, upload = row
+        upload_info = None
+        if upload is not None:
+            upload_info = {
+                "upload_id": upload.id,
+                "sha256": upload.sha256,
+                "original_filename": upload.original_filename,
+                "uploaded_at": (
+                    upload.completed_at.isoformat() if upload.completed_at else None
+                ),
+            }
         return EvidenceRecord(
-            id=row.id,
-            session_id=row.session_id,
-            raw_payload=row.raw_payload_json,
-            payload_hash=row.payload_hash,
+            id=evidence.id,
+            session_id=evidence.session_id,
+            raw_payload=evidence.raw_payload_json,
+            payload_hash=evidence.payload_hash,
+            tool_call_id=evidence.tool_call_id,
+            upload=upload_info,
         )
 
     async def load_artifact_version(self, version_id: str) -> ArtifactVersionRecord | None:

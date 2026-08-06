@@ -26,6 +26,7 @@ from pydantic import ValidationError
 
 from app.agent_artifacts.lineage import (
     MAX_ARTIFACT_DEPTH,
+    ArtifactLineageFreezer,
     ArtifactVersionRecord,
     DbLineageLoader,
     EvidenceRecord,
@@ -982,3 +983,70 @@ async def test_db_loader_resolves_evidence_and_tool_call(db_session, user_factor
     assert frozen.refs[0].sources[0].evidence_id == evidence.id
     assert frozen.refs[0].sources[0].payload_hash == "evidence-hash"
     assert frozen.refs[0].derivation is not None
+
+
+async def test_publish_freezes_upload_hash(db_session, user_factory) -> None:
+    """upload Evidence 的冻结快照携带上传文件哈希（Gate B：可追溯到源文件）。
+
+    MCP Evidence 的 tool_call_id 在快照中保留；upload Evidence 的
+    tool_call_id 为 NULL，upload_id/sha256/文件名/上传时间随冻结闭包固化。
+    """
+    from app.agent_runtime.models import AgentUpload
+
+    user = await user_factory()
+    session, run, step = await _make_db_chain(db_session, user.id)
+    now = datetime.now(UTC).replace(tzinfo=None)
+    upload = AgentUpload(
+        id=str(uuid4()),
+        user_id=user.id,
+        session_id=session.id,
+        original_filename="投放数据.csv",
+        mime_type="text/csv",
+        size_bytes=120,
+        sha256="u" * 64,
+        storage_key=f"{user.id}/abcd1234-{('u' * 16)}.csv",
+        status="parsed",
+        created_at=now,
+        completed_at=now,
+    )
+    db_session.add(upload)
+    await db_session.flush()
+    evidence = EvidenceItem(
+        id=str(uuid4()),
+        session_id=session.id,
+        run_id=None,
+        tool_call_id=None,
+        upload_id=upload.id,
+        source_type="user_upload",
+        source_name="user_upload",
+        raw_payload_json={"columns": ["平台", "声量"], "rows": [{"平台": "小红书", "声量": 100}]},
+        payload_hash="upload-evidence-hash",
+        collected_at=now,
+        availability_status="available",
+    )
+    db_session.add(evidence)
+    await db_session.flush()
+
+    freezer = ArtifactLineageFreezer(db_session)
+    snapshot = await freezer.freeze(
+        payload={"schema_version": "insight_board_v1", "data": {"total_volume": 100}},
+        refs=[
+            {
+                "artifact_path": "/data/total_volume",
+                "sources": [
+                    {
+                        "source_type": "evidence",
+                        "evidence_id": evidence.id,
+                        "source_path": "/rows/0/声量",
+                    }
+                ],
+            }
+        ],
+        owner=LineageOwner(user_id=user.id, session_id=session.id),
+    )
+    source = snapshot["refs"][0]["sources"][0]
+    assert source["evidence_id"] == evidence.id
+    assert source["upload_sha256"] == upload.sha256
+    assert source["upload_id"] == upload.id
+    assert source["upload_filename"] == "投放数据.csv"
+    assert source["tool_call_id"] is None
