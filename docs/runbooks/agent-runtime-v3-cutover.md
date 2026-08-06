@@ -290,3 +290,19 @@ Gate A 审查发现的 5 项必修 + 2 项次要问题，已在同一迁移/代�
 - 运行/恢复/账务排查：`docs/runbooks/phase-2-runtime.md`。
 - 架构设计与 §19 发布阻断条件：`docs/superpowers/specs/2026-08-02-model-led-agent-runtime-design.md`。
 - 真实 UAT 复跑入口：`cd backend && ./scripts/run_real_agent_uat.sh`（Task 26 已执行，本次切档前须复跑）。
+
+### 5.9 Gate C：三类报告、KOL 评分与 Excel（2026-08-06）
+
+- **KOL 评分升级为 kol_value_score_v3**：效果与匹配度 70 + 价格效率 30；历史
+  `kol_score_v2` 快照仍可读取（score_snapshot 判别联合）。有效报价 ≥3 才计算
+  价格效率（不足时价格章节 restricted）；报价缺失置后；效果 <35/70 最高「观察」。
+  指标称「投放性价比指数」，不称 ROI。
+- **导出缓存（迁移 0035）**：`artifact_exports` 唯一 `(artifact_version_id,
+  template_version)`，同一 Version 只构建一次；渲染失败可安全重试；导出绝不调用
+  模型/MCP。存储目录 `AGENT_EXPORT_STORAGE_DIR`（默认 `.data/agent-exports`）。
+- **Excel 契约**：品牌 8 Sheet、达人 4 Sheet（Top20 全详情块）、活动 9/10 Sheet
+  （ROI 数据可靠时才生成第 10 个）。模板由 `scripts/build_agent_artifact_templates.py`
+  从用户来源模板清洗（删样例数据与图表、隐藏 TEMPLATE_VERSION 元数据）；
+  图表由导出器现场重建；空章节保留表头写受限说明、不画误导图表。
+- **0035 回滚**：`artifact_exports` 为纯新增表，downgrade 直接 drop 表与索引，
+  不影响 0034 的 dispatch_count 语义。
