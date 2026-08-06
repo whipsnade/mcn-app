@@ -30,4 +30,17 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # 危险降级保护（Gate B P1）：若存在 dispatch_count != 1 的调用行（发生过
+    # 重试），直接 drop 列会静默重置计数，再次 upgrade 后可能允许第三次外发。
+    bind = op.get_bind()
+    unusual = bind.scalar(
+        sa.text(
+            "SELECT COUNT(*) FROM agent_tool_calls WHERE dispatch_count != 1"
+        )
+    )
+    if unusual:
+        raise AssertionError(
+            f"refusing dangerous downgrade: {unusual} agent_tool_calls have "
+            "dispatch_count != 1 (retried). Drain/terminate active runs before downgrade."
+        )
     op.drop_column("agent_tool_calls", "dispatch_count")
