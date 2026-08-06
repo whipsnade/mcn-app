@@ -598,20 +598,34 @@ def _distribution_score_for(
     return _distribution_score(_number_distribution(raw.get(fallback_key)), targets)
 
 
+def _percentage_0_100(value: float | None) -> float | None:
+    """百分比统一 0–100 口径：0.799 → 79.9；79.9 不重复乘 100。"""
+    if value is None:
+        return None
+    if 0 < value <= 1:
+        return round(value * 100, 4)
+    return value
+
+
 def _score_inputs_v3(item: Mapping[str, Any], context: ScoreContextV3) -> CandidateInputV3:
-    """评分输入只来自 ``score_inputs``（+ 顶层身份/报价）；缺失字段保持 None。"""
+    """评分输入只来自 ``score_inputs``（+ 顶层身份/报价）；缺失字段保持 None。
+
+    合法 0 值用显式 None 判断（``a or b`` 会把 0 当缺失）。
+    """
     raw = item.get("score_inputs") or {}
     followers = _whole(raw.get("followers"))
     average_interactions = _number(raw.get("average_interactions"))
-    ratio = _number(raw.get("interaction_follower_ratio")) or _number(
-        raw.get("engagement_follower_ratio")
-    )
-    if ratio is None and average_interactions is not None and followers:
+    ratio = _number(raw.get("interaction_follower_ratio"))
+    if ratio is None:
+        ratio = _number(raw.get("engagement_follower_ratio"))
+    if ratio is None and average_interactions is not None and followers is not None and followers > 0:
         ratio = average_interactions / followers * 100
-    active = _number(raw.get("active_follower_rate")) or _number(
-        raw.get("effective_follower_rate")
+    active = _percentage_0_100(
+        _number(raw.get("active_follower_rate"))
+        if raw.get("active_follower_rate") is not None
+        else _number(raw.get("effective_follower_rate"))
     )
-    if active is None and _whole(raw.get("active_follower_count")) is not None and followers:
+    if active is None and _whole(raw.get("active_follower_count")) is not None and followers is not None and followers > 0:
         active = _whole(raw.get("active_follower_count")) / followers * 100
     return CandidateInputV3(
         platform=str(item.get("platform") or ""),

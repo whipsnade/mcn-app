@@ -597,7 +597,7 @@ async def test_real_xiaohongshu_search_rows_normalize_to_contract() -> None:
     assert first["nickname"] == "哈尔滨日报冰城+"
     assert first["followers"] == 773129
     assert first["active_followers"] == 617697
-    assert first["active_follower_rate"] == pytest.approx(0.799)
+    assert first["active_follower_rate"] == pytest.approx(79.9)  # 0.799 → 0–100 口径
     assert first["engagement_total"] == 2503  # 平均互动 2503.76 → int
     assert first["growth_rate"] == pytest.approx(0.0156)
     assert first["quoted_price"] == 105979
@@ -624,8 +624,8 @@ async def test_real_hot_user_rows_platform_short_video_maps_to_douyin() -> None:
     assert top["nickname"] == "闪电新闻"
     assert top["followers"] == 10590610
     assert top["engagement_total"] == 683294
-    # 无评分输入：效果维缺失计 0 → 观察评级，数据完整度 0。
-    assert top["score_snapshot"]["effect_score"] == 0
+    # 真实字段（粉丝数/互动数）进入评分：效果分 > 0；无报价 → 价格分 0。
+    assert top["score_snapshot"]["effect_score"] > 0
     assert top["score_snapshot"]["rating"] == "观察"
 
 
@@ -651,3 +651,83 @@ async def test_missing_platform_infers_from_single_platform_scope() -> None:
     assert platform == "unknown"
     assert isinstance(platform, str)
     KolSelectionV3.model_validate(multi.payload)
+
+
+# ---------------------------------------------------------------------------
+# Gate C 审核修复：真实 DataTap 中文字段直接进入评分
+# ---------------------------------------------------------------------------
+
+
+def _xhs_real_row(*, uid: str = "5ff26b060000000001003a8d", nickname: str = "哈尔滨日报冰城+",
+                  followers: int = 773129, avg_interactions: float = 2503.76,
+                  active_followers: int = 617697, active_rate: float = 0.799,
+                  figure_quote: float = 105979.0, video_quote: float = 125168.0) -> dict:
+    return {
+        "账号ID (kwUid)": uid,
+        "平台": "xiaohongshu",
+        "昵称": nickname,
+        "粉丝数": followers,
+        "有效粉丝数": active_followers,
+        "有效粉丝率": active_rate,
+        "平均互动": avg_interactions,
+        "预估报价-图文": figure_quote,
+        "预估报价-视频": video_quote,
+    }
+
+
+async def test_real_datatap_row_scores_from_evidence_fields() -> None:
+    """真实小红书中文行：粉丝/互动/有效粉丝/比例直接进入八维评分，效果分 > 0。"""
+    scope = {**SCOPE, "platforms": ["xiaohongshu"], "content_formats": ["视频"]}
+    build = await build_kol_selection_draft(
+        scope=scope, evidence_id="ev-1", items=[_xhs_real_row()], context=LIGHT_CTX
+    )
+    payload = build.payload
+    KolSelectionV3.model_validate(payload)
+    item = payload["data"]["items"][0]
+    snapshot = item["score_snapshot"]
+    assert snapshot["quoted_price"] == 125168  # 视频报价随 content_formats 选择
+    assert snapshot["effect_score"] > 0
+    for dim in ("followers", "average_interactions", "active_follower", "engagement_follower_ratio"):
+        assert snapshot["dimensions"][dim]["missing_reason"] is None, dim
+
+
+async def test_real_datatap_row_figure_quote_selected() -> None:
+    """content_formats=['图文'] 时选择图文报价 105979。"""
+    scope = {**SCOPE, "platforms": ["xiaohongshu"], "content_formats": ["图文"]}
+    build = await build_kol_selection_draft(
+        scope=scope, evidence_id="ev-1", items=[_xhs_real_row()], context=LIGHT_CTX
+    )
+    snapshot = build.payload["data"]["items"][0]["score_snapshot"]
+    assert snapshot["quoted_price"] == 105979
+
+
+async def test_real_datatap_active_rate_percentage_normalized() -> None:
+    """有效粉丝率 0.799 → 79.9（0–100 口径）；已是 79.9 不重复乘 100。"""
+    scope = {**SCOPE, "platforms": ["xiaohongshu"], "content_formats": ["视频"]}
+    build = await build_kol_selection_draft(
+        scope=scope, evidence_id="ev-1",
+        items=[_xhs_real_row(uid="a"), _xhs_real_row(uid="b", active_rate=79.9)],
+        context=LIGHT_CTX,
+    )
+    by_uid = {item["kol_uid"]: item for item in build.payload["data"]["items"]}
+    assert by_uid["a"]["score_snapshot"]["dimensions"]["active_follower"]["raw_score"] == pytest.approx(79.9)
+    assert by_uid["b"]["score_snapshot"]["dimensions"]["active_follower"]["raw_score"] == pytest.approx(79.9)
+
+
+async def test_real_datatap_three_quotes_price_efficiency_and_order() -> None:
+    """至少 3 个有效报价：price_sample_size=3、价格效率按性价比分位、排序生效。"""
+    rows = [
+        _xhs_real_row(uid="a", video_quote=60_000),
+        _xhs_real_row(uid="b", video_quote=120_000),
+        _xhs_real_row(uid="c", video_quote=180_000),
+    ]
+    scope = {**SCOPE, "platforms": ["xiaohongshu"], "content_formats": ["视频"]}
+    build = await build_kol_selection_draft(
+        scope=scope, evidence_id="ev-1", items=rows, context=LIGHT_CTX
+    )
+    payload = build.payload
+    items = payload["data"]["items"]
+    assert all(item["score_snapshot"]["price_sample_size"] == 3 for item in items)
+    # 效果相近时最低报价（最高性价比）价值总分最高 → 排第一。
+    assert items[0]["kol_uid"] == "a"
+    assert items[0]["score_snapshot"]["value_score"] > items[2]["score_snapshot"]["value_score"]

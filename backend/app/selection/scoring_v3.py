@@ -127,7 +127,7 @@ def _mid_rank_percentile(pool: list[float], value: float) -> float:
     """mid-rank percentile（0–100）；全部相同 → 50；单值 → 50。
 
     先对池做异常值截断（winsorize 到中位数的固定倍数），候选值同样截断后再
-    参与排名，保证极端值不会碾压同平台其余候选。
+    参与排名，保证极端值不会碾压同平台其余候选（用于绝对效果量）。
     """
     if not pool:
         return 0.0
@@ -139,6 +139,22 @@ def _mid_rank_percentile(pool: list[float], value: float) -> float:
     n = len(winsorized)
     first = winsorized.index(target) + 1
     last = n - winsorized[::-1].index(target)
+    mid = (first + last) / 2
+    return round((mid - 0.5) / n * 100, 2)
+
+
+def _mid_rank_percentile_raw(pool: list[float], value: float) -> float:
+    """无 winsorize 的 mid-rank percentile（价格效率用）。
+
+    Gate C 审核：effect/quote 的价格效率分位必须使用有效候选池的原始值，
+    不做面向绝对效果量的异常值截断。
+    """
+    if not pool:
+        return 0.0
+    ordered = sorted(pool)
+    n = len(ordered)
+    first = ordered.index(float(value)) + 1
+    last = n - ordered[::-1].index(float(value))
     mid = (first + last) / 2
     return round((mid - 0.5) / n * 100, 2)
 
@@ -265,10 +281,15 @@ def score_and_rank_candidates_v3(
         )
 
     # 2. 价格效率（0–30）：有效样本 ≥3 才对 effect/quote 做全候选 mid-rank 分位。
+    #    Gate C 审核：使用原始价格效率池（无 winsorize）。
     price_sample_size = len(valid_quotes)
     price_pool: dict[str, float] = {}
     if price_sample_size >= MIN_PRICE_SAMPLE:
-        price_pool = {key: _mid_rank_percentile(list(raw_by_key.values()), raw) for key, raw in raw_by_key.items()}
+        raw_values = list(raw_by_key.values())
+        price_pool = {
+            key: _mid_rank_percentile_raw(raw_values, raw)
+            for key, raw in raw_by_key.items()
+        }
 
     # 3. 分组与排序（preference 只改主键；platform+kol_uid 稳定 tie-breaker）。
     groups = {"priced_qualified": 0, "unpriced_qualified": 1, "below_floor": 2}

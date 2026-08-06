@@ -113,6 +113,23 @@ _ENGAGEMENT_TOTAL_KEYS = (
 _AVG_ENGAGEMENT_KEYS = ("avg_engagement", "平均互动")
 _GROWTH_RATE_KEYS = ("growth_rate", "周粉丝增长率", "月粉丝增长率")
 _QUOTED_PRICE_KEYS = ("quoted_price", "预估报价-图文", "预估报价-视频", "报价")
+# 内容形式 → 报价键优先级（Gate C 审核：先按用户确认形式选择报价，不得先选
+# 图文报价再因形式不匹配清空）。
+_VIDEO_QUOTE_KEYS = ("预估报价-视频", "官方报价-视频", "视频报价", "quoted_price")
+_FIGURE_QUOTE_KEYS = ("预估报价-图文", "官方报价-图文", "图文报价", "quoted_price")
+_FORMAT_QUOTE_KEYS: dict[str, tuple[str, ...]] = {
+    "视频": _VIDEO_QUOTE_KEYS,
+    "图文": _FIGURE_QUOTE_KEYS,
+}
+
+
+def _percentage_0_100(value: float | None) -> float | None:
+    """百分比统一为 0–100 口径：0.799 → 79.9；已是 79.9 不重复乘 100。"""
+    if value is None:
+        return None
+    if 0 < value <= 1:
+        return round(value * 100, 4)
+    return value
 _LIKES_KEYS = ("likes", "平均点赞", "点赞数", "点赞")
 _COMMENTS_KEYS = ("comments", "平均评论", "评论数", "评论")
 _SHARES_KEYS = ("shares", "平均转发", "分享数", "转发数", "转发", "分享")
@@ -159,7 +176,7 @@ def _first_present(row: dict[str, Any], keys: tuple[str, ...]) -> tuple[str | No
 
 
 def _normalize_kol_row(
-    row: dict[str, Any], *, default_platform: str | None
+    row: dict[str, Any], *, default_platform: str | None, content_formats: tuple[str, ...] = ()
 ) -> tuple[dict[str, Any], dict[str, str]]:
     """真实 Evidence 行（中英混合键）→ builder 契约键。
 
@@ -167,6 +184,10 @@ def _normalize_kol_row(
     键；keymap 供 lineage 指向 Evidence 行内真实存在的键。平台恒为字符串：
     平台字段缺失或非字符串时取 scope 唯一平台，再缺省 ``"unknown"``——绝不
     产出 None/非字符串（第三轮 UAT 的 items.platform 校验失败根因）。
+
+    ``content_formats``：用户确认的内容形式（Gate C 审核）。报价按确认形式
+    选择（视频→预估报价-视频；图文→预估报价-图文），并把所选形式写入
+    ``content_format`` 契约键；无确认形式时按既有顺序取第一个报价。
     """
     item = dict(row)
     keymap: dict[str, str] = {}
@@ -241,11 +262,37 @@ def _normalize_kol_row(
         ("likes", _LIKES_KEYS, True),
         ("comments", _COMMENTS_KEYS, True),
         ("shares", _SHARES_KEYS, True),
-        ("quoted_price", _QUOTED_PRICE_KEYS, True),
     ):
         value = _adopt_number(field, keys, integer=integer)
         if value is not None:
             item[field] = value
+        if field == "active_follower_rate" and value is not None:
+            # 百分比统一 0–100：0.799 → 79.9。
+            item[field] = _percentage_0_100(float(value))
+
+    # 报价：先按用户确认内容形式选择对应报价键，再回退任意报价。
+    confirmed = {name.casefold() for name in content_formats if name}
+    quote_key: str | None = None
+    quote_value: Any = None
+    if confirmed:
+        for fmt, keys in _FORMAT_QUOTE_KEYS.items():
+            if fmt.casefold() not in confirmed:
+                continue
+            found_key, found_value = _first_present(row, keys)
+            if found_key is not None:
+                parsed = num(found_value)
+                if parsed is not None:
+                    quote_key, quote_value = found_key, whole(parsed)
+                    item["content_format"] = fmt
+                    break
+    if quote_key is None:
+        raw_key, raw_value = _first_present(row, _QUOTED_PRICE_KEYS)
+        parsed = num(raw_value)
+        if raw_key is not None and parsed is not None:
+            quote_key, quote_value = raw_key, whole(parsed)
+    if quote_key is not None and quote_value is not None:
+        item["quoted_price"] = quote_value
+        keymap["quoted_price"] = quote_key
 
     for field, keys in (
         ("avatar_url", _AVATAR_URL_KEYS),
@@ -258,12 +305,45 @@ def _normalize_kol_row(
     return item, keymap
 
 
+def _derive_score_inputs(item: dict[str, Any]) -> dict[str, Any]:
+    """把真实 Evidence 契约字段确定性映射为 score_inputs（Gate C 审核）。
+
+    粉丝数→followers、平均互动→average_interactions、有效粉丝率→
+    active_follower_rate（0–100）、有效粉丝数→active_follower_count；平均互动/
+    粉丝数可推导 interaction_follower_ratio。模型已提供的 score_inputs 字段
+    优先，绝不覆盖。合法 0 值用显式 None 判断，不得被 ``or`` 吞掉。
+    """
+    score_inputs = dict(item.get("score_inputs") or {})
+    followers = item.get("followers")
+    if followers is not None and score_inputs.get("followers") is None:
+        score_inputs["followers"] = followers
+    avg_interactions = item.get("avg_engagement")
+    if avg_interactions is not None and score_inputs.get("average_interactions") is None:
+        score_inputs["average_interactions"] = avg_interactions
+    active_rate = item.get("active_follower_rate")
+    if active_rate is not None and score_inputs.get("active_follower_rate") is None:
+        score_inputs["active_follower_rate"] = _percentage_0_100(float(active_rate))
+    active_count = item.get("active_followers")
+    if active_count is not None and score_inputs.get("active_follower_count") is None:
+        score_inputs["active_follower_count"] = active_count
+    if (
+        score_inputs.get("interaction_follower_ratio") is None
+        and avg_interactions is not None
+        and followers is not None
+        and followers > 0
+    ):
+        score_inputs["interaction_follower_ratio"] = round(
+            float(avg_interactions) / float(followers) * 100, 6
+        )
+    return score_inputs
+
+
 def _rank_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """把 Evidence 项投影为 rank_kols 消费的形状。
 
-    只有 ``score_inputs`` 进入效果评分；顶层 followers/engagement_total/
-    growth_rate 只用于展示，quoted_price 参与价格效率，content_format 约束
-    报价有效性。
+    score_inputs 由真实字段确定性派生（含互动/粉丝/有效粉丝/比例）；顶层
+    followers/engagement_total/growth_rate 只用于展示，quoted_price 参与价格
+    效率，content_format 约束报价有效性。
     """
     projected: list[dict[str, Any]] = []
     for item in items:
@@ -277,7 +357,7 @@ def _rank_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "growth_rate": item.get("growth_rate"),
                 "quoted_price": item.get("quoted_price"),
                 "content_format": item.get("content_format"),
-                "score_inputs": item.get("score_inputs") or {},
+                "score_inputs": _derive_score_inputs(item),
             }
         )
     return projected
@@ -606,6 +686,19 @@ def _dim_source(
     return _score_sources(evidence_id, base, raw, keymap)[0]
 
 
+def _quote_source(
+    evidence_id: str,
+    base: str,
+    raw: dict[str, Any],
+    keymap: dict[str, str],
+) -> dict[str, Any]:
+    """报价引用真实行键（keymap 指向所选报价的中文键，如「预估报价-视频」）。"""
+    raw_key = keymap.get("quoted_price")
+    if raw_key is not None and raw_key in raw:
+        return _ev(evidence_id, join_source_path(base, raw_key))
+    return _score_sources(evidence_id, base, raw, keymap)[0]
+
+
 def _summary_lineage(
     payload: dict[str, Any],
     evidence_id: str,
@@ -741,11 +834,12 @@ def _build_lineage(
 
         # 派生评分数字 → settled rank_kols 调用（derivation.method 固定 v3）。
         score_sources = _score_sources(evidence_id, base, raw, keymap)
+        # Gate C 审核：quoted_price/价格效率引用真实报价行键（keymap 指向
+        # 所选报价的中文键），而非统一 score_inputs。
+        quote_source = _quote_source(evidence_id, base, raw, keymap)
         for field in (
             "effect_score",
-            "price_efficiency_score",
             "value_score",
-            "quoted_price",
             "price_sample_size",
             "rating",
             "data_completeness",
@@ -756,6 +850,16 @@ def _build_lineage(
                     "sources": score_sources,
                     "derivation": _derivation(
                         call_id, SCORE_VERSION_V3, score_sources[0]["source_path"]
+                    ),
+                }
+            )
+        for field in ("quoted_price", "price_efficiency_score", "raw_price_efficiency", "price_efficiency_percentile"):
+            refs.append(
+                {
+                    "artifact_path": f"/data/items/{index}/score_snapshot/{field}",
+                    "sources": [quote_source],
+                    "derivation": _derivation(
+                        call_id, SCORE_VERSION_V3, quote_source["source_path"]
                     ),
                 }
             )
@@ -836,10 +940,13 @@ async def build_kol_selection_draft(
     # scope 唯一平台，再缺省 unknown）；keymap 供 lineage 指向原始行键。
     scope_platforms = list(scope_dict.get("platforms") or ())
     default_platform = canon_platform(scope_platforms[0]) if len(scope_platforms) == 1 else None
+    confirmed_formats = tuple(str(item) for item in scope_dict.get("content_formats") or ())
     normalized_items: list[dict[str, Any]] = []
     keymaps: list[dict[str, str]] = []
     for row in items:
-        normalized_row, keymap = _normalize_kol_row(row, default_platform=default_platform)
+        normalized_row, keymap = _normalize_kol_row(
+            row, default_platform=default_platform, content_formats=confirmed_formats
+        )
         normalized_items.append(normalized_row)
         keymaps.append(keymap)
     items = normalized_items
