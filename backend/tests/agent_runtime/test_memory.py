@@ -488,7 +488,7 @@ async def test_context_injects_builder_tool_input_schemas(db_session, user_facto
 
     selection = tools["build_kol_selection_draft"]
     assert "evidence_id" in selection["input_schema"]["properties"]
-    assert "kol_score_v2" in selection["description"]
+    assert "kol_value_score_v3" in selection["description"]
 
     detail = tools["build_kol_detail_draft"]
     detail_properties = detail["input_schema"]["properties"]
