@@ -14,6 +14,8 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
 logger = logging.getLogger(__name__)
 
 # allowlist：只允许包内受控文件，用户路径一律拒绝。
@@ -45,6 +47,34 @@ _MAX_INJECTION_CHARS = 6000
 _EXPECTED_VERSION = 1
 
 
+class _CuratedStrategyStage(BaseModel):
+    """成功策略的每个阶段（嵌套校验）。"""
+    model_config = ConfigDict(extra="forbid")
+    stage: str = Field(min_length=1)
+    goal: str = Field(min_length=1)
+    preferred_capability: str = Field(min_length=1)
+    success_signal: str = Field(min_length=1)
+    fallback: str = Field(min_length=1)
+
+
+class _CuratedExemplar(BaseModel):
+    """受控 exemplar 的强类型契约（Gate B M5：嵌套 Schema 校验）。"""
+    model_config = ConfigDict(extra="forbid")
+    exemplar_id: str = Field(min_length=1)
+    version: int
+    purpose: str = Field(min_length=1)
+    domain: str = Field(min_length=1)
+    language: str = Field(min_length=1)
+    applicable_when: list[str] = Field(min_length=1)
+    parameters: dict[str, str] = Field(default_factory=dict)
+    objective: str = Field(min_length=1)
+    successful_strategy: list[_CuratedStrategyStage] = Field(min_length=1)
+    decision_rules: list[str] = Field(min_length=1)
+    coverage_targets: list[str] = Field(min_length=1)
+    completion_contract: dict[str, Any] = Field(default_factory=dict)
+    forbidden_copy_values: list[str] = Field(default_factory=list)
+
+
 def _read_curated_exemplar(filename: str) -> dict[str, Any]:
     if filename not in _ALLOWED_FILES:
         raise ValueError(f"curated exemplar not in allowlist: {filename}")
@@ -55,15 +85,17 @@ def _read_curated_exemplar(filename: str) -> dict[str, Any]:
     data = json.loads(raw)
     if not isinstance(data, dict):
         raise ValueError(f"curated exemplar is not an object: {filename}")
-    missing = [key for key in _REQUIRED_KEYS if key not in data]
-    if missing:
-        raise ValueError(f"curated exemplar missing keys {missing}: {filename}")
-    if data.get("version") != _EXPECTED_VERSION:
-        raise ValueError(
-            f"curated exemplar version mismatch: {filename} "
-            f"expected {_EXPECTED_VERSION} got {data.get('version')}"
-        )
-    return data
+    # 强类型 Pydantic 校验：嵌套结构 + extra=forbid + 必填项 + 版本
+    # source 字段不在 schema 中 → extra=forbid 会拒绝（需 pop 再 validate）
+    source = data.pop("source", None)
+    try:
+        validated = _CuratedExemplar.model_validate(data)
+    except ValidationError as exc:
+        raise ValueError(f"curated exemplar schema validation failed: {filename}: {exc}") from exc
+    # 恢复 source 供投影使用（不进入模型上下文）
+    if source is not None:
+        data["source"] = source
+    return validated.model_dump() | ({"source": source} if source else {})
 
 
 def load_curated_exemplars(purpose: str, limit: int = 1) -> list[dict[str, Any]]:
