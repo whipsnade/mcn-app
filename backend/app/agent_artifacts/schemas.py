@@ -137,6 +137,9 @@ class FrozenEvidenceSource(BaseModel):
     source_path: str
     payload_hash: str
     tool_call_id: str | None = None
+    tool_name: str | None = None
+    service: str | None = None
+    arguments_hash: str | None = None
     upload_id: str | None = None
     upload_sha256: str | None = None
     upload_filename: str | None = None

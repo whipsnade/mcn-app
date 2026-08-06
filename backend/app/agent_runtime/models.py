@@ -200,7 +200,7 @@ class AgentToolCall(Base):
     points_settled: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     upstream_request_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     error_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    safe_error_message: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    safe_error_message: Mapped[str | None] = mapped_column(MEDIUMTEXT, nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 

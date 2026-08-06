@@ -41,6 +41,8 @@ _REQUIRED_KEYS = (
 )
 
 _MAX_JSON_BYTES = 64 * 1024
+_MAX_INJECTION_CHARS = 6000
+_EXPECTED_VERSION = 1
 
 
 def _read_curated_exemplar(filename: str) -> dict[str, Any]:
@@ -56,6 +58,11 @@ def _read_curated_exemplar(filename: str) -> dict[str, Any]:
     missing = [key for key in _REQUIRED_KEYS if key not in data]
     if missing:
         raise ValueError(f"curated exemplar missing keys {missing}: {filename}")
+    if data.get("version") != _EXPECTED_VERSION:
+        raise ValueError(
+            f"curated exemplar version mismatch: {filename} "
+            f"expected {_EXPECTED_VERSION} got {data.get('version')}"
+        )
     return data
 
 
@@ -75,6 +82,22 @@ def load_curated_exemplars(purpose: str, limit: int = 1) -> list[dict[str, Any]]
         }
         projection["exemplar_id"] = exemplar["exemplar_id"]
         projection["kind"] = "curated_strategy"
+        # 通用 forbidden 值扫描：投影文本不得含来源实体/日期/真实数值
+        forbidden = exemplar.get("forbidden_copy_values") or []
+        serialized = json.dumps(projection, ensure_ascii=False)
+        if any(isinstance(v, str) and v in serialized for v in forbidden):
+            logger.warning(
+                "curated exemplar %s contains forbidden value in projection; skipping",
+                filename,
+            )
+            continue
+        if len(serialized) > _MAX_INJECTION_CHARS:
+            logger.warning(
+                "curated exemplar %s exceeds injection size %d; skipping",
+                filename,
+                _MAX_INJECTION_CHARS,
+            )
+            continue
         results.append(projection)
         if len(results) >= limit:
             break

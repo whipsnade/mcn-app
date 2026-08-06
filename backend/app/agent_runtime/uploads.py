@@ -52,20 +52,30 @@ def _now() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
 
 
-def _parse_csv(content: bytes) -> tuple[list[str], list[dict[str, Any]]]:
+def _parse_csv(content: bytes, *, max_rows: int) -> tuple[list[str], list[dict[str, Any]]]:
     text = content.decode("utf-8-sig")
     reader = csv.DictReader(io.StringIO(text))
-    rows = [
-        {key: value for key, value in row.items() if key is not None}
-        for row in reader
-        if any(value not in (None, "") for value in row.values())
-    ]
+    rows: list[dict[str, Any]] = []
+    for row in reader:
+        if not any(v not in (None, "") for v in row.values()):
+            continue
+        rows.append({k: v for k, v in row.items() if k is not None})
+        if len(rows) > max_rows:
+            break
     return (reader.fieldnames or []), rows
 
 
-def _parse_xlsx(content: bytes) -> tuple[list[str], list[dict[str, Any]]]:
+def _parse_xlsx(content: bytes, *, max_rows: int) -> tuple[list[str], list[dict[str, Any]]]:
+    import zipfile
+
     from openpyxl import load_workbook
 
+    # 拒绝含宏部件的 xlsx（即使扩展名不是 .xlsm）
+    with zipfile.ZipFile(io.BytesIO(content)) as zf:
+        if any("vbaProject" in name for name in zf.namelist()):
+            raise UploadRejectedError(
+                status_code=415, error_code="macro_detected", message="file contains macro parts"
+            )
     workbook = load_workbook(
         io.BytesIO(content),
         read_only=True,
@@ -89,6 +99,8 @@ def _parse_xlsx(content: bytes) -> tuple[list[str], list[dict[str, Any]]]:
                     if cell_index < len(columns)
                 }
             )
+            if len(rows) > max_rows:
+                break
         return columns, rows
     finally:
         workbook.close()
@@ -156,8 +168,31 @@ class UploadService:
         self._db.add(upload)
         await self._db.flush()
 
-        columns, rows = await asyncio.to_thread(self._parse, extension, content)
+        try:
+            columns, rows = await asyncio.to_thread(
+                self._parse, extension, content, self._max_rows
+            )
+        except UploadRejectedError:
+            await asyncio.to_thread(self._delete_file, storage_key)
+            upload.status = "failed"
+            upload.error_code = "macro_detected"
+            upload.completed_at = _now()
+            await self._db.flush()
+            raise
+        except Exception:
+            await asyncio.to_thread(self._delete_file, storage_key)
+            upload.status = "failed"
+            upload.error_code = "parse_failed"
+            upload.completed_at = _now()
+            await self._db.flush()
+            raise UploadRejectedError(
+                status_code=400,
+                error_code="parse_failed",
+                message="file could not be parsed",
+            ) from None
+
         if len(rows) > self._max_rows:
+            await asyncio.to_thread(self._delete_file, storage_key)
             upload.status = "failed"
             upload.error_code = "rows_exceeded"
             upload.completed_at = _now()
@@ -206,10 +241,17 @@ class UploadService:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(content)
 
-    def _parse(self, extension: str, content: bytes) -> tuple[list[str], list[dict[str, Any]]]:
+    def _delete_file(self, storage_key: str) -> None:
+        path = self._storage_dir / storage_key
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _parse(self, extension: str, content: bytes, max_rows: int) -> tuple[list[str], list[dict[str, Any]]]:
         if extension == ".csv":
-            return _parse_csv(content)
-        return _parse_xlsx(content)
+            return _parse_csv(content, max_rows=max_rows)
+        return _parse_xlsx(content, max_rows=max_rows)
 
     async def get_owned(self, *, user_id: str, upload_id: str) -> AgentUpload | None:
         return await self._db.scalar(

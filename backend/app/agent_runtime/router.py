@@ -576,7 +576,11 @@ async def create_upload(
     file: UploadFile = File(...),
 ) -> UploadRead:
     await _get_owned_session(db, user.id, session_id)
-    content = await file.read()
+    # 限制读取量：防止超大文件耗尽内存（Gate B 审查：原无上限 read）
+    max_bytes = uploads._max_bytes
+    content = await file.read(max_bytes + 1)
+    if len(content) > max_bytes:
+        raise HTTPException(status_code=413, detail="upload_too_large")
     try:
         upload = await uploads.create_and_parse(
             user_id=user.id,

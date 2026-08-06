@@ -157,6 +157,10 @@ def downgrade() -> None:
         "evidence_items",
         type_="check",
     )
+    # 删除所有 upload Evidence（upload_id IS NOT NULL），否则后续
+    # tool_call_id 改回 NOT NULL 时 NULL 行校验失败。合法 upload Evidence
+    # 可带非空 run_id，0032 downgrade 只删 run_id IS NULL 不够（Gate B 审查）。
+    op.execute("DELETE FROM evidence_items WHERE upload_id IS NOT NULL")
     # 先删 FK 再删索引与列：ix_evidence_items_upload_id 支撑 FK，列上残留
     # 外键时 MySQL 拒绝 drop column。
     op.drop_constraint(

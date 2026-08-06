@@ -75,6 +75,10 @@ class EvidenceRecord:
     payload_hash: str
     # MCP Evidence 的 tool_call_id（upload Evidence 为 None）。
     tool_call_id: str | None = None
+    # MCP 调用来源快照（Gate B：可独立审计精确调用）。
+    tool_name: str | None = None
+    service: str | None = None
+    arguments_hash: str | None = None
     # upload Evidence 的来源文件信息（MCP Evidence 为 None；Gate B）。
     upload: dict[str, Any] | None = None
 
@@ -229,8 +233,10 @@ class _ResolvedEvidence:
     evidence_id: str
     source_path: str
     payload_hash: str
-    # 来源 Evidence 的归属信息：MCP 的 tool_call_id / upload 的文件信息。
     tool_call_id: str | None = None
+    tool_name: str | None = None
+    service: str | None = None
+    arguments_hash: str | None = None
     upload: dict[str, Any] | None = None
 
 
@@ -275,6 +281,9 @@ async def _resolve_source(
                 source_path=source.source_path,
                 payload_hash=record.payload_hash,
                 tool_call_id=record.tool_call_id,
+                tool_name=record.tool_name,
+                service=record.service,
+                arguments_hash=record.arguments_hash,
                 upload=record.upload,
             )
         ], record.raw_payload
@@ -431,6 +440,9 @@ async def validate_and_freeze_lineage(
                         source_path=leaf.source_path,
                         payload_hash=leaf.payload_hash,
                         tool_call_id=leaf.tool_call_id,
+                        tool_name=leaf.tool_name,
+                        service=leaf.service,
+                        arguments_hash=leaf.arguments_hash,
                         upload_id=(leaf.upload or {}).get("upload_id"),
                         upload_sha256=(leaf.upload or {}).get("sha256"),
                         upload_filename=(leaf.upload or {}).get("original_filename"),
@@ -469,15 +481,16 @@ class DbLineageLoader:
 
     async def load_evidence(self, evidence_id: str) -> EvidenceRecord | None:
         stmt = (
-            select(EvidenceItem, AgentUpload)
+            select(EvidenceItem, AgentUpload, AgentToolCall)
             .outerjoin(AgentUpload, EvidenceItem.upload_id == AgentUpload.id)
+            .outerjoin(AgentToolCall, EvidenceItem.tool_call_id == AgentToolCall.id)
             .where(EvidenceItem.id == evidence_id)
         )
         result = await self._db.execute(stmt)
         row = result.first()
         if row is None:
             return None
-        evidence, upload = row
+        evidence, upload, tool_call = row
         upload_info = None
         if upload is not None:
             upload_info = {
@@ -494,6 +507,9 @@ class DbLineageLoader:
             raw_payload=evidence.raw_payload_json,
             payload_hash=evidence.payload_hash,
             tool_call_id=evidence.tool_call_id,
+            tool_name=tool_call.internal_tool_name if tool_call else None,
+            service=tool_call.service if tool_call else None,
+            arguments_hash=tool_call.arguments_hash if tool_call else None,
             upload=upload_info,
         )
 

@@ -962,7 +962,8 @@ class AgentMcpTool:
 
 
 def _error_message(exc: BaseException) -> str:
-    return str(exc) or exc.__class__.__name__
+    """异常文本经脱敏：绝不把含凭证/密钥的原始异常文本回喂模型或持久化。"""
+    return safe_upstream_text(str(exc) or exc.__class__.__name__)
 
 
 # --------------------------------------------------------------------------- #
@@ -1018,9 +1019,17 @@ def _feedback_result(
         "suggested_actions": suggested_actions,
     }
     status = "unknown" if error_type == RESULT_UNKNOWN else "failed"
+    safe = json.dumps(feedback, ensure_ascii=False)
+    # 防止 MEDIUMTEXT 溢出（参数过多/过长时截断建议而非丢弃反馈）
+    if len(safe) > 60_000:
+        feedback["suggested_actions"] = feedback["suggested_actions"][:2]
+        feedback["arguments_summary"] = {
+            k: v[:100] for k, v in feedback["arguments_summary"].items()
+        }
+        safe = json.dumps(feedback, ensure_ascii=False)[:60_000]
     return ToolResult(
         status=status,
-        safe_summary=json.dumps(feedback, ensure_ascii=False),
+        safe_summary=safe,
         error_type=error_type,
     )
 
