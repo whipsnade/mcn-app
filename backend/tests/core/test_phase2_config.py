@@ -49,6 +49,19 @@ def test_goal_planner_shadow_defaults_off() -> None:
     assert settings().goal_planner_shadow_enabled is False
 
 
+def test_agent_upload_defaults() -> None:
+    config = settings()
+    assert config.agent_upload_storage_dir == ".data/agent-uploads"
+    assert config.agent_upload_max_bytes == 20971520
+    assert config.agent_upload_max_rows == 50000
+
+
+def test_agent_upload_limits_can_be_tightened() -> None:
+    config = settings(agent_upload_max_bytes=1048576, agent_upload_max_rows=1000)
+    assert config.agent_upload_max_bytes == 1048576
+    assert config.agent_upload_max_rows == 1000
+
+
 def test_goal_planner_shadow_can_be_enabled() -> None:
     assert settings(goal_planner_shadow_enabled=True).goal_planner_shadow_enabled is True
 

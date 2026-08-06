@@ -61,6 +61,11 @@ class Settings(BaseSettings):
     agent_tool_call_stuck_seconds: float = Field(default=900.0, gt=0)
     # 达人详情 Session 级缓存 TTL（设计 §8.1 kol_detail_cache）：默认 24 小时。
     kol_detail_cache_ttl_hours: int = Field(default=24, ge=1)
+    # 用户上传存储目录与限制：仅 .csv/.xlsx，文件 20 MiB / 数据行 50,000 上限
+    # （Gate B：安全上传与解析）。storage_key 由服务生成，绝不拼接用户文件名。
+    agent_upload_storage_dir: str = ".data/agent-uploads"
+    agent_upload_max_bytes: int = Field(default=20971520, gt=0)
+    agent_upload_max_rows: int = Field(default=50000, gt=0)
     task_lease_seconds: int = Field(default=60, gt=0)
     goal_planner_shadow_enabled: bool = False
     goal_planner_enforce_enabled: bool = False

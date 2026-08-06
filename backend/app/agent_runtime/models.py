@@ -205,10 +205,54 @@ class AgentToolCall(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 
+class AgentUpload(Base):
+    """用户上传文件的可审计元数据；文件本体按 storage_key 存本地目录。
+
+    原始上传不可变：重新解析产生新 Evidence，不覆盖来源。status 白名单
+    uploaded/parsed/failed 由 ck_agent_uploads_status 强制。
+    """
+
+    __tablename__ = "agent_uploads"
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid4())
+    )
+    user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id"), nullable=False
+    )
+    session_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("agent_sessions.id"), nullable=False
+    )
+    run_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("agent_runs.id"), nullable=True
+    )
+    original_filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    mime_type: Mapped[str] = mapped_column(String(128), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    storage_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+
 class EvidenceItem(Base):
     """Immutable evidence captured from read-only tools; models only obtain it via tools."""
 
     __tablename__ = "evidence_items"
+    __table_args__ = (
+        CheckConstraint(
+            "((tool_call_id IS NULL) <> (upload_id IS NULL))",
+            name="ck_evidence_items_tool_call_xor_upload",
+        ),
+        Index(
+            "ix_evidence_items_session_collected_at",
+            "session_id",
+            "collected_at",
+        ),
+        Index("ix_evidence_items_upload_id", "upload_id"),
+    )
 
     id: Mapped[str] = mapped_column(
         String(36), primary_key=True, default=lambda: str(uuid4())
@@ -219,8 +263,11 @@ class EvidenceItem(Base):
     run_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("agent_runs.id", ondelete="CASCADE"), nullable=False
     )
-    tool_call_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("agent_tool_calls.id", ondelete="CASCADE"), nullable=False
+    tool_call_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("agent_tool_calls.id", ondelete="CASCADE"), nullable=True
+    )
+    upload_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("agent_uploads.id", ondelete="CASCADE"), nullable=True
     )
     source_type: Mapped[str] = mapped_column(String(32), nullable=False)
     source_name: Mapped[str] = mapped_column(String(128), nullable=False)
@@ -231,6 +278,12 @@ class EvidenceItem(Base):
     payload_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     collected_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     availability_status: Mapped[str] = mapped_column(String(32), nullable=False, default="available")
+    normalization_version: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    normalization_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    field_mapping_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    unmapped_fields_json: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
+    truncated: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    normalization_error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
 
 class AgentEvent(Base):

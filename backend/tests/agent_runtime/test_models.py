@@ -100,3 +100,64 @@ def test_confirmed_scope_is_valid_memory_type() -> None:
         if isinstance(constraint, CheckConstraint)
     }
     assert "confirmed_scope" in checks["ck_memory_entries_type"]
+
+
+def test_agent_uploads_table_is_registered() -> None:
+    from app.agent_runtime.models import AgentUpload
+
+    table = AgentUpload.__table__
+    assert table.name == "agent_uploads"
+    required = {
+        "id",
+        "user_id",
+        "session_id",
+        "run_id",
+        "original_filename",
+        "mime_type",
+        "size_bytes",
+        "sha256",
+        "storage_key",
+        "status",
+        "error_code",
+        "created_at",
+        "completed_at",
+    }
+    assert required.issubset(set(table.c.keys()))
+    assert table.c.run_id.nullable is True
+    assert table.c.error_code.nullable is True
+    assert table.c.completed_at.nullable is True
+    assert table.c.status.nullable is False
+
+
+def test_evidence_items_upload_id_xor_tool_call_id() -> None:
+    from app.agent_runtime.models import EvidenceItem
+
+    table = EvidenceItem.__table__
+    assert "upload_id" in table.c
+    assert "normalization_version" in table.c
+    assert "normalization_status" in table.c
+    assert "field_mapping_json" in table.c
+    assert "unmapped_fields_json" in table.c
+    assert "truncated" in table.c
+    assert "normalization_error_code" in table.c
+    assert table.c.tool_call_id.nullable is True
+    assert table.c.upload_id.nullable is True
+
+    xor_checks = [
+        constraint.sqltext.text
+        for constraint in table.constraints
+        if isinstance(constraint, CheckConstraint)
+        and constraint.name == "ck_evidence_items_tool_call_xor_upload"
+    ]
+    assert xor_checks, "missing ck_evidence_items_tool_call_xor_upload"
+    xor_text = xor_checks[0]
+    assert "tool_call_id" in xor_text and "upload_id" in xor_text and "NULL" in xor_text
+
+    assert any(
+        tuple(column.name for column in index.columns) == ("session_id", "collected_at")
+        for index in table.indexes
+    )
+    assert any(
+        tuple(column.name for column in index.columns) == ("upload_id",)
+        for index in table.indexes
+    )
