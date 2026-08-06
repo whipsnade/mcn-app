@@ -18,7 +18,6 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_runtime.memory import (
@@ -26,7 +25,7 @@ from app.agent_runtime.memory import (
     DEFAULT_RUN_SUMMARY_LIMIT,
     MemoryContextBuilder,
 )
-from app.agent_runtime.models import AgentRun, EvidenceItem
+from app.agent_runtime.models import AgentRun
 from app.agent_runtime.profiles import AgentProfile
 from app.agent_runtime.tools.registry import ToolRegistry
 from app.model.contracts import ChatMessage

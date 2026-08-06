@@ -17,7 +17,6 @@ import asyncio
 import csv
 import hashlib
 import io
-import json
 import logging
 from datetime import UTC, datetime
 from pathlib import Path
