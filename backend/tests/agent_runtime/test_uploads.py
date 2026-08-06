@@ -94,6 +94,45 @@ def _repo_root() -> Path:
     return Path(__file__).resolve().parents[3]
 
 
+def _custom_xlsx(sheet_xml: str) -> bytes:
+    """构造最小合法 xlsx（自定义 worksheet XML），用于物理维度攻击夹具。"""
+    cts = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        "</Types>"
+    )
+    rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+        "</Relationships>"
+    )
+    wbrels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+        "</Relationships>"
+    )
+    wb = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        '<sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>'
+    )
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
+        zout.writestr("[Content_Types].xml", cts)
+        zout.writestr("_rels/.rels", rels)
+        zout.writestr("xl/_rels/workbook.xml.rels", wbrels)
+        zout.writestr("xl/workbook.xml", wb)
+        zout.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+    return out.getvalue()
+
+
 @pytest_asyncio.fixture
 async def upload_client(db_session):
     """带鉴权头的测试客户端；上传服务注入临时目录。"""
@@ -440,3 +479,102 @@ async def test_p1_external_relationship_error_code_persisted(
     assert upload is not None
     assert upload.status == "failed"
     assert upload.error_code == "external_links_detected"
+
+
+# ---------------------------------------------------------------------------
+# P1-4: 工作表物理维度防护（超大 dimension / 极大 row r / 超大列坐标 / 行边界）
+# ---------------------------------------------------------------------------
+
+_WORKSHEET_NS = "xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\""
+
+
+def test_p1_huge_dimension_rejected_quickly() -> None:
+    """声明 A1:XFD1048576 的几 KB XLSX 被快速拒绝。"""
+    sheet = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<worksheet {_WORKSHEET_NS}><dimension ref="A1:XFD1048576"/><sheetData/></worksheet>'
+    )
+    with pytest.raises(UploadRejectedError) as exc_info:
+        _parse_xlsx(_custom_xlsx(sheet), max_rows=50000)
+    assert exc_info.value.error_code == "worksheet_dimensions_exceeded"
+
+
+def test_p1_huge_row_r_rejected() -> None:
+    """第二个 row 的 r 设为极大值（配合超大 dimension 触发）被拒绝。"""
+    sheet = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<worksheet {_WORKSHEET_NS}><dimension ref="A1:A1048576"/><sheetData>'
+        '<row r="1"><c r="A1" t="inlineStr"><is><t>平台</t></is></c></row>'
+        '<row r="1048576"><c r="A1048576" t="inlineStr"><is><t>x</t></is></c></row>'
+        "</sheetData></worksheet>"
+    )
+    with pytest.raises(UploadRejectedError) as exc_info:
+        _parse_xlsx(_custom_xlsx(sheet), max_rows=50000)
+    assert exc_info.value.error_code == "worksheet_dimensions_exceeded"
+
+
+def test_p1_huge_column_coordinate_rejected() -> None:
+    """超大列坐标（XFD）被拒绝。"""
+    sheet = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<worksheet {_WORKSHEET_NS}><dimension ref="A1:XFD10"/><sheetData/></worksheet>'
+    )
+    with pytest.raises(UploadRejectedError) as exc_info:
+        _parse_xlsx(_custom_xlsx(sheet), max_rows=10)
+    assert exc_info.value.error_code == "worksheet_columns_exceeded"
+
+
+def test_p1_row_count_boundary() -> None:
+    """max_rows=5 时：声明 6 行（含表头）通过，7 行拒绝。"""
+    ok_sheet = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<worksheet {_WORKSHEET_NS}><dimension ref="A1:A6"/><sheetData/></worksheet>'
+    )
+    columns, rows = _parse_xlsx(_custom_xlsx(ok_sheet), max_rows=5)
+    assert rows == []
+
+    over_sheet = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<worksheet {_WORKSHEET_NS}><dimension ref="A1:A7"/><sheetData/></worksheet>'
+    )
+    with pytest.raises(UploadRejectedError) as exc_info:
+        _parse_xlsx(_custom_xlsx(over_sheet), max_rows=5)
+    assert exc_info.value.error_code == "worksheet_dimensions_exceeded"
+
+
+def test_p1_brand_template_still_passes() -> None:
+    """合法品牌模板继续通过（物理维度在允许范围内）。"""
+    columns, rows = _parse_xlsx(
+        (_repo_root() / "brand_report.xlsx").read_bytes(), max_rows=10000
+    )
+    assert rows
+
+
+async def test_p1_worksheet_dimension_error_code_persisted(upload_client, db_session) -> None:
+    """超大 dimension 上传经 UploadRejectedError 路径：失败记录 error_code 持久化。"""
+    client, _app = await upload_client("13800000888")
+    session_id = await _create_session(client)
+    sheet = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<worksheet {_WORKSHEET_NS}><dimension ref="A1:XFD1048576"/><sheetData/></worksheet>'
+    )
+    response = await client.post(
+        f"/api/v1/agent/sessions/{session_id}/uploads",
+        files={
+            "file": (
+                "恶意.xlsx",
+                _custom_xlsx(sheet),
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+    assert response.status_code == 400, response.text
+    assert response.json()["detail"] == "worksheet_dimensions_exceeded"
+    upload = await db_session.scalar(
+        select(AgentUpload)
+        .where(AgentUpload.session_id == session_id)
+        .order_by(AgentUpload.created_at.desc())
+    )
+    assert upload is not None
+    assert upload.status == "failed"
+    assert upload.error_code == "worksheet_dimensions_exceeded"

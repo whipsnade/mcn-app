@@ -47,6 +47,10 @@ _MAX_ZIP_ENTRIES = 2000
 _MAX_TOTAL_UNCOMPRESSED = 100 * 1024 * 1024  # 100 MiB
 _MAX_SINGLE_ENTRY = 50 * 1024 * 1024  # 50 MiB
 _MAX_COMPRESSION_RATIO = 100
+# 工作表物理维度上限（Gate B P1-4）：恶意 XLSX 可声明
+# <dimension ref="A1:XFD1048576"/> 或把下一条 row 的 r 设为极大值，让 openpyxl
+# 为中间空行持续迭代。列数上限 1000；行数上限由 max_rows+1（含表头）决定。
+_MAX_XLSX_COLUMNS = 1000
 
 
 class UploadRejectedError(Exception):
@@ -162,13 +166,44 @@ def _parse_xlsx(content: bytes, *, max_rows: int) -> tuple[list[str], list[dict[
     )
     try:
         sheet = workbook.active
+        # 物理维度防护（Gate B P1-4）：在 iter_rows 前检查声明的 max_row/max_column，
+        # 超大维度/列坐标立即拒绝，避免 openpyxl 为中间空行持续迭代（含表头，行
+        # 上限 = max_rows + 1）。
+        if sheet.max_row is not None and sheet.max_row > max_rows + 1:
+            raise UploadRejectedError(
+                status_code=400, error_code="worksheet_dimensions_exceeded",
+                message=f"worksheet declares more than {max_rows + 1} rows",
+            )
+        if sheet.max_column is not None and sheet.max_column > _MAX_XLSX_COLUMNS:
+            raise UploadRejectedError(
+                status_code=400, error_code="worksheet_columns_exceeded",
+                message=f"worksheet exceeds {_MAX_XLSX_COLUMNS} columns",
+            )
         rows: list[dict[str, Any]] = []
         columns: list[str] = []
-        for index, row in enumerate(sheet.iter_rows(values_only=True)):
+        # 即使 dimension 合法也显式传递迭代边界，不依赖工作簿自身声明的范围；
+        # 空白行也计入迭代次数（max_row 上限），不能只统计非空数据行。
+        for index, row in enumerate(
+            sheet.iter_rows(
+                values_only=True,
+                max_row=max_rows + 1,
+                max_col=_MAX_XLSX_COLUMNS,
+            )
+        ):
             if row is None or all(cell is None for cell in row):
                 continue
             if index == 0:
-                columns = [str(cell) if cell is not None else "" for cell in row]
+                # max_col 上限会把行填充到 _MAX_XLSX_COLUMNS 列；按工作表实际宽度
+                # （sheet.max_column，缺失时回退到最后非空列）截断，保留原解析语义。
+                if sheet.max_column is not None and sheet.max_column > 0:
+                    width = min(sheet.max_column, _MAX_XLSX_COLUMNS)
+                else:
+                    width = _MAX_XLSX_COLUMNS
+                    for cell_index in range(len(row) - 1, -1, -1):
+                        if row[cell_index] not in (None, ""):
+                            width = cell_index + 1
+                            break
+                columns = [str(cell) if cell is not None else "" for cell in row[:width]]
                 continue
             rows.append(
                 {
@@ -177,7 +212,7 @@ def _parse_xlsx(content: bytes, *, max_rows: int) -> tuple[list[str], list[dict[
                     if cell_index < len(columns)
                 }
             )
-            if len(rows) > max_rows:
+            if len(rows) >= max_rows:
                 break
         return columns, rows
     finally:
