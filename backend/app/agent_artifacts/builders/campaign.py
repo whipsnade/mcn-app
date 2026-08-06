@@ -561,6 +561,24 @@ def _build_comparisons(
     }, has_rows
 
 
+_ORGANIC_MARKERS = ("非商单", "自然", "organic", "unpaid")
+_PAID_MARKERS = ("付费", "商单", "paid", "ad")
+
+
+def _attribution_kind(ref: RowRef) -> str | None:
+    """归属分类：先判否定/自然语义（非商单/unpaid 必须先于商单/paid）。
+
+    返回 paid_confirmed / organic / unknown；无法确认返回 unknown。
+    """
+    raw = text(first(ref.row, ATTRIBUTION_KEYS))
+    folded = (raw or "").casefold()
+    if any(marker in folded for marker in _ORGANIC_MARKERS):
+        return "organic"
+    if any(marker in folded for marker in _PAID_MARKERS):
+        return "paid_confirmed"
+    return "unknown"
+
+
 def _build_attribution(
     post_rows: list[RowRef], collector: LineageCollector
 ) -> tuple[dict[str, Any], bool]:
@@ -570,14 +588,7 @@ def _build_attribution(
     """
     counts = {"paid_confirmed": 0, "organic": 0, "unknown": 0}
     for ref in post_rows:
-        raw = text(first(ref.row, ATTRIBUTION_KEYS))
-        folded = (raw or "").casefold()
-        if any(word in folded for word in ("付费", "商单", "paid", "ad")):
-            counts["paid_confirmed"] += 1
-        elif any(word in folded for word in ("自然", "organic", "非商单")):
-            counts["organic"] += 1
-        else:
-            counts["unknown"] += 1
+        counts[_attribution_kind(ref)] += 1
     total = sum(counts.values())
     if post_rows:
         for field in ("paid_confirmed", "organic", "unknown"):
@@ -594,23 +605,25 @@ def _build_attribution(
 def _build_organic_summary(
     post_rows: list[RowRef], collector: LineageCollector
 ) -> tuple[dict[str, Any], bool]:
-    if not post_rows:
+    """organic_summary 只聚合确认归为 organic 的行（Gate C 审核）。"""
+    organic_rows = [ref for ref in post_rows if _attribution_kind(ref) == "organic"]
+    if not organic_rows:
         return {}, False
     volume = sum(
-        whole(first(ref.row, VOLUME_KEYS)) or 0 for ref in post_rows
+        whole(first(ref.row, VOLUME_KEYS)) or 0 for ref in organic_rows
     )
     engagement = sum(
-        whole(first(ref.row, ENGAGEMENT_KEYS)) or 0 for ref in post_rows
+        whole(first(ref.row, ENGAGEMENT_KEYS)) or 0 for ref in organic_rows
     )
     if volume:
-        collector.add("/data/organic_summary/volume", post_rows)
+        collector.add("/data/organic_summary/volume", organic_rows)
     if engagement:
-        collector.add("/data/organic_summary/engagement", post_rows)
-    collector.add("/data/organic_summary/posts", post_rows)
+        collector.add("/data/organic_summary/engagement", organic_rows)
+    collector.add("/data/organic_summary/posts", organic_rows)
     return {
         "volume": volume or None,
         "engagement": engagement or None,
-        "posts": len(post_rows),
+        "posts": len(organic_rows),
         "share_of_volume": None,  # 无自然/总声量对比数据时不估算
     }, True
 
@@ -649,32 +662,44 @@ def _build_audience_regions(
     return regions, True
 
 
-def _first_number(rows: list[RowRef], keys: tuple[str, ...]) -> int | None:
+def _sum_number(rows: list[RowRef], keys: tuple[str, ...]) -> int | None:
+    """对行集合的数值求和；全部缺失返回 None。"""
+    total: int | None = None
     for ref in rows:
         value = whole(first(ref.row, keys))
         if value is not None:
-            return value
-    return None
+            total = (total or 0) + value
+    return total
 
 
 def _build_internal_metrics(
     upload_rows: list[RowRef], collector: LineageCollector
 ) -> tuple[dict[str, Any], bool]:
-    """成本/转化以 upload 为准；无 upload 时不估算。"""
+    """成本/转化以 upload 为准；无 upload 时不估算（Gate C 审核）。
+
+    存在明确「合计」行时优先采用合计行，否则聚合平台/KOL 明细行；绝不同时
+    累加合计行和明细行造成重复。
+    """
     if not upload_rows:
         return {}, False
-    spend = _first_number(upload_rows, SPEND_KEYS)
-    impressions = _first_number(upload_rows, IMPRESSION_KEYS)
-    conversions = _first_number(upload_rows, CONVERSION_KEYS)
-    revenue = _first_number(upload_rows, REVENUE_KEYS)
+    total_rows = [
+        ref
+        for ref in upload_rows
+        if "合计" in (text(first(ref.row, PLATFORM_KEYS)) or "")
+    ]
+    source_rows = total_rows if total_rows else upload_rows
+    spend = _sum_number(source_rows, SPEND_KEYS)
+    impressions = _sum_number(source_rows, IMPRESSION_KEYS)
+    conversions = _sum_number(source_rows, CONVERSION_KEYS)
+    revenue = _sum_number(source_rows, REVENUE_KEYS)
     if spend is not None:
-        collector.add("/data/internal_metrics/spend", upload_rows)
+        collector.add("/data/internal_metrics/spend", source_rows)
     if impressions is not None:
-        collector.add("/data/internal_metrics/impressions", upload_rows)
+        collector.add("/data/internal_metrics/impressions", source_rows)
     if conversions is not None:
-        collector.add("/data/internal_metrics/conversions", upload_rows)
+        collector.add("/data/internal_metrics/conversions", source_rows)
     if revenue is not None:
-        collector.add("/data/internal_metrics/revenue", upload_rows)
+        collector.add("/data/internal_metrics/revenue", source_rows)
     cpc = round(spend / conversions, 2) if spend is not None and conversions else None
     cpm = (
         round(spend / impressions * 1000, 2)
@@ -682,9 +707,9 @@ def _build_internal_metrics(
         else None
     )
     if cpc is not None:
-        collector.add("/data/internal_metrics/cpc", upload_rows)
+        collector.add("/data/internal_metrics/cpc", source_rows)
     if cpm is not None:
-        collector.add("/data/internal_metrics/cpm", upload_rows)
+        collector.add("/data/internal_metrics/cpm", source_rows)
     return {
         "spend": spend,
         "impressions": impressions,
@@ -698,17 +723,33 @@ def _build_internal_metrics(
 def _build_roi(
     scope: dict[str, Any], internal_metrics: dict[str, Any]
 ) -> dict[str, Any] | None:
-    """ROI 只在 spend + conversion/revenue + 归因窗口齐全时生成；否则 None。"""
+    """ROI 门禁（Gate C 审核）：spend>0 + 明确归因口径 + 曝光 + 转化 + 收入
+    全部齐全才生成；comparison_mode 只是周期比较方式，绝不能作为归因窗口；
+    任一条件不满足 → None；spend=0 不除零。"""
     spend = internal_metrics.get("spend")
-    revenue = internal_metrics.get("revenue")
+    impressions = internal_metrics.get("impressions")
     conversions = internal_metrics.get("conversions")
-    attribution_rules = list(scope.get("attribution_rules") or ())
-    comparison_mode = scope.get("comparison_mode")
-    window = "、".join(attribution_rules) if attribution_rules else (comparison_mode or "")
-    if spend is None or not window or (revenue is None and conversions is None):
+    revenue = internal_metrics.get("revenue")
+    attribution_rules = [
+        str(item)
+        for item in scope.get("attribution_rules") or ()
+        if isinstance(item, str) and item.strip()
+    ]
+    if (
+        spend is None
+        or spend <= 0
+        or not attribution_rules
+        or impressions is None
+        or impressions <= 0
+        or conversions is None
+        or conversions <= 0
+        or revenue is None
+    ):
         return None
-    roi = round((revenue - spend) / spend, 4) if revenue is not None else None
-    roas = round(revenue / spend, 4) if revenue is not None else None
+    window = "、".join(attribution_rules)
+    # spend > 0 已显式校验，分母安全。
+    roi = round((revenue - spend) / spend, 4)
+    roas = round(revenue / spend, 4)
     return {
         "spend": spend,
         "revenue": revenue,
@@ -763,8 +804,8 @@ def build_campaign_report_draft(
 
     # 社媒冲突检测：upload 行若同时携带声量/互动且与 DataTap 不同，双值保留。
     social_conflicts: list[dict[str, Any]] = []
-    upload_volume = _first_number(upload_rows, VOLUME_KEYS)
-    upload_engagement = _first_number(upload_rows, ENGAGEMENT_KEYS)
+    upload_volume = _sum_number(upload_rows, VOLUME_KEYS)
+    upload_engagement = _sum_number(upload_rows, ENGAGEMENT_KEYS)
     datatap_volume = sum(whole(first(ref.row, VOLUME_KEYS)) or 0 for ref in social_rows)
     datatap_engagement = sum(whole(first(ref.row, ENGAGEMENT_KEYS)) or 0 for ref in social_rows)
     if upload_volume is not None and datatap_volume > 0 and upload_volume != datatap_volume:

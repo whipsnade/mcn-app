@@ -541,8 +541,9 @@ def test_campaign_builder_attribution_and_organic_summary() -> None:
     assert attribution["unknown"] == 1
     assert attribution["paid_confirmed_share"] == pytest.approx(1 / 3, abs=0.001)
     organic = payload["data"]["organic_summary"]
-    assert organic["posts"] == 3
-    assert organic["engagement"] == 420
+    # Gate C 审核：organic_summary 只统计确认自然行（1 行「自然内容」）。
+    assert organic["posts"] == 1
+    assert organic["engagement"] == 55
 
 
 def test_campaign_builder_conflict_keeps_both_values_with_limitation() -> None:
@@ -573,3 +574,169 @@ def test_campaign_builder_conflict_keeps_both_values_with_limitation() -> None:
     conflicts = [limit for limit in payload["limitations"] if limit["code"] == "social_metric_conflict"]
     assert len(conflicts) == 1
     assert "DataTap 420" in conflicts[0]["message"]  # 互动冲突消息保留双值
+
+
+# ---------------------------------------------------------------------------
+# Gate C 审核修复：归因否定语义 / organic 只统计自然 / 去重 / 合计行优先
+# ---------------------------------------------------------------------------
+
+
+def test_attribution_negation_organic_before_paid() -> None:
+    """「非商单」含「商单」、「unpaid」含「paid」：必须先判自然语义。"""
+    posts = _post_rows()
+    posts[0]["归属"] = "非商单"
+    posts[1]["归属"] = "付费商单"
+    # posts[2] 无归属字段 → unknown
+    build = build_campaign_report_draft(scope=SCOPE, evidence={"posts": [("ev-1", posts)]})
+    attribution = build.payload["data"]["attribution"]
+    assert attribution["paid_confirmed"] == 1
+    assert attribution["organic"] == 1
+    assert attribution["unknown"] == 1
+
+
+def test_attribution_unpaid_is_not_paid() -> None:
+    posts = [_post_rows()[0]]
+    posts[0]["归属"] = "unpaid"
+    build = build_campaign_report_draft(scope=SCOPE, evidence={"posts": [("ev-1", posts)]})
+    attribution = build.payload["data"]["attribution"]
+    assert attribution["paid_confirmed"] == 0
+    assert attribution["organic"] == 1
+
+
+def test_organic_summary_only_counts_organic_rows() -> None:
+    """organic_summary 只聚合确认自然行；付费与未知不得进入自然指标。"""
+    posts = _post_rows()
+    posts[0]["归属"] = "付费商单"
+    posts[1]["归属"] = "自然"
+    posts[2]["归属"] = "organic"
+    build = build_campaign_report_draft(scope=SCOPE, evidence={"posts": [("ev-1", posts)]})
+    organic = build.payload["data"]["organic_summary"]
+    assert organic["posts"] == 2  # 只有 2 行自然
+    assert organic["engagement"] == 55 + 250  # 自然行互动
+
+
+def test_duplicate_evidence_rows_not_double_counted() -> None:
+    """同一 Evidence 行（同 evidence_id + source_path）合并去重，不重复计算。"""
+    posts = _post_rows()
+    evidence = {
+        "posts": [("ev-1", posts)],
+        "social": [("ev-1", posts)],  # 同 evidence 重复出现
+    }
+    build = build_campaign_report_draft(scope=SCOPE, evidence=evidence)
+    payload = build.payload
+    assert payload["data"]["overview"]["total_posts"] == 3  # 不是 6
+
+
+def test_upload_detail_rows_aggregated_across_platforms() -> None:
+    """多平台上传明细行正确汇总（无合计行时逐行聚合）。"""
+    upload = [
+        {"平台": "小红书", "投放金额": 40000, "曝光": 800000, "转化": 2000, "销售额": 120000},
+        {"平台": "抖音", "投放金额": 60000, "曝光": 1200000, "转化": 3000, "销售额": 180000},
+    ]
+    build = build_campaign_report_draft(
+        scope={**SCOPE, "attribution_rules": ["最后点击 7 天"]},
+        evidence={"posts": [("ev-1", _post_rows())], "upload": [("ev-2", upload)]},
+    )
+    metrics = build.payload["data"]["internal_metrics"]
+    assert metrics["spend"] == 100000
+    assert metrics["impressions"] == 2000000
+    assert metrics["conversions"] == 5000
+    assert metrics["revenue"] == 300000
+
+
+def test_upload_total_row_not_double_counted_with_details() -> None:
+    """合计行与明细行同时存在：优先合计行，不重复累计。"""
+    upload = [
+        {"平台": "合计", "投放金额": 100000, "曝光": 2000000, "转化": 5000, "销售额": 300000},
+        {"平台": "小红书", "投放金额": 40000, "曝光": 800000, "转化": 2000, "销售额": 120000},
+        {"平台": "抖音", "投放金额": 60000, "曝光": 1200000, "转化": 3000, "销售额": 180000},
+    ]
+    build = build_campaign_report_draft(
+        scope={**SCOPE, "attribution_rules": ["最后点击 7 天"]},
+        evidence={"posts": [("ev-1", _post_rows())], "upload": [("ev-2", upload)]},
+    )
+    metrics = build.payload["data"]["internal_metrics"]
+    assert metrics["spend"] == 100000  # 合计行，不是 200000
+    assert metrics["impressions"] == 2000000
+
+
+# ---------------------------------------------------------------------------
+# Gate C 审核修复：ROI 门禁（spend>0 + attribution_rules + 曝光 + 转化 + 收入）
+# ---------------------------------------------------------------------------
+
+
+def test_roi_null_with_comparison_mode_but_no_attribution_rules() -> None:
+    """comparison_mode=mom 只是周期比较方式，绝不能作为归因窗口。"""
+    evidence = {
+        "posts": [("ev-1", _post_rows())],
+        "upload": [("ev-2", [{"投放金额": 100000, "曝光": 2000000, "转化": 5000, "销售额": 300000}])],
+    }
+    build = build_campaign_report_draft(
+        scope={**SCOPE, "comparison_mode": "mom"},
+        evidence=evidence,
+    )
+    assert build.payload["data"]["roi"] is None
+
+
+def test_roi_null_when_impressions_missing() -> None:
+    evidence = {
+        "posts": [("ev-1", _post_rows())],
+        "upload": [("ev-2", [{"投放金额": 100000, "转化": 5000, "销售额": 300000}])],
+    }
+    build = build_campaign_report_draft(
+        scope={**SCOPE, "attribution_rules": ["最后点击 7 天"]},
+        evidence=evidence,
+    )
+    assert build.payload["data"]["roi"] is None
+
+
+def test_roi_null_when_conversions_missing() -> None:
+    evidence = {
+        "posts": [("ev-1", _post_rows())],
+        "upload": [("ev-2", [{"投放金额": 100000, "曝光": 2000000, "销售额": 300000}])],
+    }
+    build = build_campaign_report_draft(
+        scope={**SCOPE, "attribution_rules": ["最后点击 7 天"]},
+        evidence=evidence,
+    )
+    assert build.payload["data"]["roi"] is None
+
+
+def test_roi_null_when_revenue_missing() -> None:
+    evidence = {
+        "posts": [("ev-1", _post_rows())],
+        "upload": [("ev-2", [{"投放金额": 100000, "曝光": 2000000, "转化": 5000}])],
+    }
+    build = build_campaign_report_draft(
+        scope={**SCOPE, "attribution_rules": ["最后点击 7 天"]},
+        evidence=evidence,
+    )
+    assert build.payload["data"]["roi"] is None
+
+
+def test_roi_null_and_no_crash_when_spend_zero() -> None:
+    evidence = {
+        "posts": [("ev-1", _post_rows())],
+        "upload": [("ev-2", [{"投放金额": 0, "曝光": 2000000, "转化": 5000, "销售额": 300000}])],
+    }
+    build = build_campaign_report_draft(
+        scope={**SCOPE, "attribution_rules": ["最后点击 7 天"]},
+        evidence=evidence,
+    )
+    assert build.payload["data"]["roi"] is None
+
+
+def test_roi_generated_only_with_all_conditions() -> None:
+    evidence = {
+        "posts": [("ev-1", _post_rows())],
+        "upload": [("ev-2", [{"投放金额": 100000, "曝光": 2000000, "转化": 5000, "销售额": 300000}])],
+    }
+    build = build_campaign_report_draft(
+        scope={**SCOPE, "attribution_rules": ["最后点击 7 天"]},
+        evidence=evidence,
+    )
+    roi = build.payload["data"]["roi"]
+    assert roi is not None
+    assert roi["attribution_window"] == "最后点击 7 天"
+    assert roi["roas"] == pytest.approx(3.0)
+    assert roi["roi"] == pytest.approx(2.0)
