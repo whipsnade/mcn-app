@@ -21,7 +21,7 @@ def test_migration_chain_has_single_head() -> None:
     config = Config(str(backend_dir / "alembic.ini"))
     config.set_main_option("script_location", str(backend_dir / "migrations"))
     heads = ScriptDirectory.from_config(config).get_heads()
-    assert heads == ["0034_dispatch_count"]
+    assert heads == ["0035_artifact_exports"]
 
 
 async def test_phase_two_unique_constraints() -> None:
@@ -945,6 +945,34 @@ async def test_phase_two_migration_table_boundaries_restore_head() -> None:
         assert phase_two_tables.issubset(tables_at_head)
     finally:
         _run_alembic("upgrade", "head")
+
+
+async def test_0035_artifact_exports_schema() -> None:
+    async with engine.connect() as connection:
+        columns = await connection.run_sync(
+            lambda sync: {
+                row["name"]: row["type"] for row in inspect(sync).get_columns("artifact_exports")
+            }
+        )
+    assert {
+        "id",
+        "artifact_version_id",
+        "template_version",
+        "status",
+        "filename",
+        "storage_key",
+        "sha256",
+        "size_bytes",
+        "error_code",
+        "created_at",
+        "completed_at",
+    } <= set(columns)
+    async with engine.connect() as connection:
+        constraints = await connection.run_sync(
+            lambda sync: inspect(sync).get_unique_constraints("artifact_exports")
+        )
+    names = {item["name"] for item in constraints}
+    assert "uq_artifact_exports_version_template" in names
 
 
 async def test_0034_dispatch_count_reversible() -> None:

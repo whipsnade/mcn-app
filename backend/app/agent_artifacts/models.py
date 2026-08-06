@@ -3,6 +3,7 @@ from typing import Any
 from uuid import uuid4
 
 from sqlalchemy import (
+    BigInteger,
     JSON,
     CheckConstraint,
     DateTime,
@@ -347,3 +348,38 @@ class KolDetailCache(Base):
     evidence_refs_json: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
     fetched_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class ArtifactExport(Base):
+    """Excel 导出缓存行（Gate C Task 6）：同一 Version+模板只构建一次。
+
+    status: building/ready/failed；唯一约束 (artifact_version_id,
+    template_version) 串行化并发；失败行可安全重试（覆盖为 building）。
+    """
+
+    __tablename__ = "artifact_exports"
+    __table_args__ = (
+        UniqueConstraint(
+            "artifact_version_id",
+            "template_version",
+            name="uq_artifact_exports_version_template",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=lambda: str(uuid4())
+    )
+    artifact_version_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("agent_artifact_versions.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    template_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    filename: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    storage_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    size_bytes: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

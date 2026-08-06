@@ -17,7 +17,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agent_artifacts.exporters import ArtifactExportUnsupported, export_artifact
+from app.agent_artifacts.export_cache import ExportCacheService
+from app.agent_artifacts.exporters import ArtifactExportUnsupported
 from app.agent_artifacts.models import (
     AgentArtifact,
     AgentArtifactReadState,
@@ -280,14 +281,21 @@ async def export_artifact_xlsx(
         if version_row is None:
             raise _not_found("artifact_version_not_found")
     try:
-        content = export_artifact(version_row)
+        cache_service = ExportCacheService(db)
+        exported = await cache_service.get_or_build(
+            artifact_version_id=version_row.id,
+            schema_version=version_row.schema_version,
+            payload=version_row.payload_json,
+            filename=f"{_sanitize_filename(artifact.artifact_type)}_v{version_row.version}.xlsx",
+        )
     except ArtifactExportUnsupported as error:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail=error.code
         ) from error
-    filename = f"{_sanitize_filename(artifact.artifact_type)}_v{version_row.version}.xlsx"
     return StreamingResponse(
-        iter([content]),
+        iter([exported.content]),
         media_type=_XLSX_MEDIA_TYPE,
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={
+            "Content-Disposition": f'attachment; filename="{exported.filename}"'
+        },
     )

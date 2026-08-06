@@ -64,6 +64,7 @@ class Settings(BaseSettings):
     # 用户上传存储目录与限制：仅 .csv/.xlsx，文件 20 MiB / 数据行 50,000 上限
     # （Gate B：安全上传与解析）。storage_key 由服务生成，绝不拼接用户文件名。
     agent_upload_storage_dir: str = ".data/agent-uploads"
+    agent_export_storage_dir: str = ".data/agent-exports"
     agent_upload_max_bytes: int = Field(default=20971520, gt=0)
     agent_upload_max_rows: int = Field(default=50000, gt=0)
     task_lease_seconds: int = Field(default=60, gt=0)
