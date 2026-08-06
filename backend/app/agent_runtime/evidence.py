@@ -71,20 +71,10 @@ def _truncate_value(value: Any, *, depth: int = 0) -> tuple[Any, bool]:
     return value, False
 
 
-def _parsed_result(payload: Any) -> Any:
-    """DataTap 结果常为 {result: "<json 字符串>"}；尝试解析出内部结构。"""
-    if isinstance(payload, dict):
-        result = payload.get("result")
-        if isinstance(result, str):
-            try:
-                return json.loads(result)
-            except (TypeError, ValueError):
-                return None
-    return None
-
-
 def _row_count(payload: Any) -> int:
-    parsed = _parsed_result(payload)
+    parsed = unwrap_evidence_payload(payload)
+    if isinstance(parsed, list):
+        return len(parsed)
     if isinstance(parsed, dict):
         rows = parsed.get("rows")
         if isinstance(rows, list):
@@ -98,7 +88,7 @@ def _row_count(payload: Any) -> int:
 
 
 def _available_fields(payload: Any) -> list[str]:
-    parsed = _parsed_result(payload)
+    parsed = unwrap_evidence_payload(payload)
     if isinstance(parsed, dict):
         return sorted(parsed.keys())
     if isinstance(payload, dict):
@@ -109,11 +99,10 @@ def _available_fields(payload: Any) -> list[str]:
 def build_preview(raw_payload: Any) -> dict[str, Any]:
     """构造受限结构化预览（§10.2：预览 + 行数 + 截断标记 + 可用字段）。
 
-    DataTap 结果常为 ``{result: "<json 字符串>"}``：解析内部结构后做截断，
-    让行数/字段与预览基于同一份真实数据。
+    DataTap 结果常为 ``{result: "<json 字符串>"}``：用共享 ``unwrap_evidence_payload``
+    解析内部结构后做截断，让行数/字段与预览基于同一份真实数据。
     """
-    parsed = _parsed_result(raw_payload)
-    target = parsed if parsed is not None else raw_payload
+    target = unwrap_evidence_payload(raw_payload)
     preview, truncated = _truncate_value(target)
     return {
         "preview": preview,
@@ -124,7 +113,7 @@ def build_preview(raw_payload: Any) -> dict[str, Any]:
     }
 
 
-# 模型视图严格有界（§10.2 / Gate B P1）：所有消费方（MCP 即时/Transcript 恢复/
+# 模型视图严格有界（§10.2 / Gate B）：所有消费方（MCP 即时/Transcript 恢复/
 # search_evidence/read_tool_result/upload 钻取）共用同一视图，绝不重新归一化。
 _MAX_MODEL_DEPTH = 6
 _MAX_MODEL_ARRAY_ROWS = 200
@@ -133,33 +122,66 @@ _MAX_MODEL_STR_LEN = 1000
 _MAX_MODEL_TOTAL_CHARS = 50_000
 
 
-def _bound_model_value(value: Any, *, depth: int = 0) -> Any:
-    """递归有界截断：限制层级/数组行数/对象字段数/字符串长度，保持 JSON 合法。"""
+def unwrap_evidence_payload(payload: Any) -> Any:
+    """解包 DataTap 常见 ``{result: "<json 字符串>"}`` 包装；解析失败返回原值。
+
+    build_preview 与 read_tool_result 的 _sequence 使用同一入口，避免各自写一套
+    不一致的 unwrap 逻辑。
+    """
+    if isinstance(payload, dict) and isinstance(payload.get("result"), str):
+        try:
+            return json.loads(payload["result"])
+        except (TypeError, ValueError):
+            return payload
+    return payload
+
+
+def _bound_model_value(value: Any, *, depth: int = 0) -> tuple[Any, bool]:
+    """递归有界截断；返回 (值, 是否截断)。截断显式向上传递，调用方据此置
+    ``truncated=true``，绝不静默裁剪。"""
     if depth > _MAX_MODEL_DEPTH:
-        return {"__truncated__": True}
+        return {"__truncated__": True}, True
     if isinstance(value, str):
-        return value if len(value) <= _MAX_MODEL_STR_LEN else value[:_MAX_MODEL_STR_LEN]
+        if len(value) > _MAX_MODEL_STR_LEN:
+            return value[:_MAX_MODEL_STR_LEN], True
+        return value, False
     if isinstance(value, list):
-        return [
-            _bound_model_value(item, depth=depth + 1)
-            for item in value[:_MAX_MODEL_ARRAY_ROWS]
-        ]
+        truncated = len(value) > _MAX_MODEL_ARRAY_ROWS
+        items: list[Any] = []
+        for index, item in enumerate(value):
+            if index >= _MAX_MODEL_ARRAY_ROWS:
+                break
+            child, child_truncated = _bound_model_value(item, depth=depth + 1)
+            items.append(child)
+            truncated = truncated or child_truncated
+        return items, truncated
     if isinstance(value, dict):
-        return {
-            key: _bound_model_value(child, depth=depth + 1)
-            for key, child in list(value.items())[:_MAX_MODEL_OBJECT_FIELDS]
-        }
-    return value
+        truncated = len(value) > _MAX_MODEL_OBJECT_FIELDS
+        result: dict[str, Any] = {}
+        for index, (key, child) in enumerate(value.items()):
+            if index >= _MAX_MODEL_OBJECT_FIELDS:
+                break
+            bounded_child, child_truncated = _bound_model_value(child, depth=depth + 1)
+            result[key] = bounded_child
+            truncated = truncated or child_truncated
+        return result, truncated
+    return value, False
+
+
+def bound_model_value(value: Any) -> tuple[Any, bool]:
+    """对任意值做模型可见的有界截断；返回 (值, 是否截断)。"""
+    return _bound_model_value(value)
 
 
 def build_model_evidence_view(evidence: EvidenceItem) -> dict[str, Any]:
-    """统一模型可见视图（Gate B P1）——**唯一**模型视图入口。
+    """统一模型可见视图——**唯一**模型视图入口。
 
     从已持久化的 ``normalized_preview_json`` 构建**有界**视图，绝不重新归一化；
-    预览优先级：``normalization_preview`` 优先，否则回退 raw ``preview``。最终
-    序列化总字符数受 ``_MAX_MODEL_TOTAL_CHARS`` 约束，超预算时降级为合法 JSON
-    （``preview={"__truncated__": True}, truncated=true``），任何情况下都能
-    ``json.loads()``。
+    预览优先级：``normalization_preview`` 优先，否则回退 raw ``preview``。preview
+    与 field_mapping/unmapped_fields 都做有界截断，并显式聚合截断状态到
+    ``truncated``。最终序列化总字符数受 ``_MAX_MODEL_TOTAL_CHARS`` 约束，超预算时
+    降级为**固定形状**（含 ``field_mapping``/``unmapped_fields``，绝不删除），任何
+    情况下都能 ``json.loads()``。
     """
     stored = evidence.normalized_preview_json or {}
     normalization_preview = stored.get("normalization_preview")
@@ -167,15 +189,22 @@ def build_model_evidence_view(evidence: EvidenceItem) -> dict[str, Any]:
     source_preview = (
         normalization_preview if normalization_preview is not None else raw_preview
     )
-    preview = _bound_model_value(source_preview)
+    preview, preview_truncated = _bound_model_value(source_preview)
+    field_mapping, mapping_truncated = _bound_model_value(stored.get("field_mapping"))
+    unmapped_fields, unmapped_truncated = _bound_model_value(stored.get("unmapped_fields"))
     view: dict[str, Any] = {
         "evidence_id": evidence.id,
         "preview": preview,
         "normalization_status": stored.get("normalization_status"),
-        "field_mapping": stored.get("field_mapping"),
-        "unmapped_fields": stored.get("unmapped_fields"),
+        "field_mapping": field_mapping,
+        "unmapped_fields": unmapped_fields,
         "row_count": stored.get("row_count", 0),
-        "truncated": stored.get("truncated", False),
+        "truncated": bool(
+            stored.get("truncated")
+            or preview_truncated
+            or mapping_truncated
+            or unmapped_truncated
+        ),
         "source_name": evidence.source_name,
         "source_type": evidence.source_type,
     }
@@ -184,15 +213,14 @@ def build_model_evidence_view(evidence: EvidenceItem) -> dict[str, Any]:
             "evidence_id": evidence.id,
             "preview": {"__truncated__": True},
             "normalization_status": stored.get("normalization_status"),
+            "field_mapping": field_mapping,
+            "unmapped_fields": unmapped_fields,
             "row_count": stored.get("row_count", 0),
             "truncated": True,
+            "source_name": evidence.source_name,
+            "source_type": evidence.source_type,
         }
     return view
-
-
-def bound_model_value(value: Any) -> Any:
-    """对任意值做模型可见的有界截断（read_tool_result 分页 items 复用）。"""
-    return _bound_model_value(value)
 
 
 class EvidenceWriter:
@@ -270,4 +298,5 @@ __all__ = [
     "bound_model_value",
     "build_model_evidence_view",
     "build_preview",
+    "unwrap_evidence_payload",
 ]

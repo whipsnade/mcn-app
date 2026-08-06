@@ -361,11 +361,87 @@ def test_model_view_total_budget_degrades_to_valid_json() -> None:
     assert parsed["preview"] == {"__truncated__": True}
 
 
-def test_bound_model_value_bounds_recursively() -> None:
+def test_bound_model_value_returns_value_and_truncation() -> None:
     value = {"a": [{"b": "x" * 5000} for _ in range(300)], "c": {"d": {"e": 1}}}
-    bounded = bound_model_value(value)
+    bounded, truncated = bound_model_value(value)
     assert len(bounded["a"]) == 200
     assert len(bounded["a"][0]["b"]) == 1000
+    assert truncated is True
+
+
+# ---------------------------------------------------------------------------
+# P1-1: 截断必须显式传递（truncated=true），降级视图保持固定形状
+# ---------------------------------------------------------------------------
+
+
+def _view_for(stored: dict) -> dict:
+    return build_model_evidence_view(
+        EvidenceItem(
+            id="ev-trunc",
+            session_id="s",
+            source_type="mcp",
+            source_name="tool",
+            normalized_preview_json=stored,
+        )
+    )
+
+
+def test_model_view_truncated_flag_large_array() -> None:
+    """300 行裁成 200 行时 truncated is True。"""
+    view = _view_for({"preview": {"rows": [{"k": i} for i in range(300)]}})
+    assert len(view["preview"]["rows"]) == 200
+    assert view["truncated"] is True
+
+
+def test_model_view_truncated_flag_large_object() -> None:
+    """300 字段裁成 200 字段时 truncated is True。"""
+    view = _view_for({"preview": {f"k{i}": i for i in range(300)}})
+    assert len(view["preview"]) == 200
+    assert view["truncated"] is True
+
+
+def test_model_view_truncated_flag_large_string() -> None:
+    """长字符串裁剪后 truncated is True。"""
+    view = _view_for({"preview": {"note": "x" * 5000}})
+    assert len(view["preview"]["note"]) == 1000
+    assert view["truncated"] is True
+
+
+def test_model_view_truncated_flag_depth() -> None:
+    """深度超过上限后 truncated is True。"""
+    view = _view_for({"preview": {"a": {"b": {"c": {"d": {"e": {"f": {"g": 1}}}}}}}})
+    assert view["truncated"] is True
+    assert json.loads(json.dumps(view, ensure_ascii=False))
+
+
+def test_model_view_truncated_flag_from_stored() -> None:
+    """persisted stored.truncated=True 也向上传递。"""
+    view = _view_for({"preview": {}, "truncated": True})
+    assert view["truncated"] is True
+
+
+def test_model_view_budget_degrades_with_all_fixed_fields() -> None:
+    """超 50KB 降级仍包含全部固定字段（不删除 field_mapping/unmapped_fields）。"""
+    huge = {f"k{i}": "长" * 2000 for i in range(200)}
+    view = _view_for(
+        {
+            "preview": huge,
+            "field_mapping": {"volume": "volume"},
+            "unmapped_fields": ["keyword"],
+            "row_count": 5000,
+            "truncated": True,
+        }
+    )
+    assert view["preview"] == {"__truncated__": True}
+    assert view["truncated"] is True
+    assert view["row_count"] == 5000
+    assert view["field_mapping"] == {"volume": "volume"}
+    assert view["unmapped_fields"] == ["keyword"]
+    assert view["normalization_status"] is None
+    assert view["source_name"] == "tool"
+    assert view["source_type"] == "mcp"
+    # 固定形状必须始终合法 JSON。
+    json.loads(json.dumps(view, ensure_ascii=False))
 
 
 def test_build_preview_caps_row_count_and_fields() -> None:
