@@ -268,6 +268,20 @@ Gate A 审查发现的 5 项必修 + 2 项次要问题，已在同一迁移/代�
 - **归一化配置**：`AGENT_UPLOAD_STORAGE_DIR` / `AGENT_UPLOAD_MAX_BYTES` /
   `AGENT_UPLOAD_MAX_ROWS`（`.env.example` 已同步）。
 
+### 5.8 Gate B：`dispatch_count` 指纹计数与 0034 降级约束（2026-08-06）
+
+- `agent_tool_calls.dispatch_count`（迁移 0034，默认 1）追踪每个 `logical_call_id`
+  的真实外发次数：`definitely_not_sent` 允许同指纹真实重试一次（总外发 ≤ 2），
+  其余终态禁止重发；第二次 DNR 的最终反馈（`same_fingerprint_retry_allowed=false`）
+  在 `finalize_release` 持有调用行锁时与 `dispatch_count` 同事务持久化，数据库与
+  返回给模型的反馈完全一致（崩溃后 Transcript 恢复仍为 false）。
+- **0034 downgrade 不可逆**：一旦产生过 `dispatch_count != 1` 的历史调用行，
+  downgrade 会拒绝执行（`AssertionError`）。该计数是**不可逆的历史事实**——
+  drain/terminate active runs 只能消除在飞调用，无法消除已落库的
+  `dispatch_count=2` 行；把历史 count 改回 1 再降级是**禁止的**（会静默重置计数，
+  upgrade 后可能允许第三次外发）。如必须降级，需单独设计状态备份/恢复迁移，
+  不能重置计数。
+
 ## 6. 参考
 
 - 真实 UAT 记录与账本验证：`docs/qa/2026-08-02-agent-runtime-uat.md`（结构化结果

@@ -30,8 +30,11 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    # 危险降级保护（Gate B P1）：若存在 dispatch_count != 1 的调用行（发生过
-    # 重试），直接 drop 列会静默重置计数，再次 upgrade 后可能允许第三次外发。
+    # 危险降级保护（Gate B P1）：一旦产生过 dispatch_count != 1 的历史调用行，
+    # 直接 drop 列会静默重置计数，再次 upgrade 后可能允许第三次外发。该计数是
+    # 不可逆的历史事实：drain/terminate active runs 只能消除在飞调用，无法消除
+    # 已落库的 dispatch_count=2 行。如必须降级，需单独设计状态备份/恢复迁移，
+    # 不能把历史 count 改回 1 来强行通过本次检查。
     bind = op.get_bind()
     unusual = bind.scalar(
         sa.text(
@@ -41,6 +44,7 @@ def downgrade() -> None:
     if unusual:
         raise AssertionError(
             f"refusing dangerous downgrade: {unusual} agent_tool_calls have "
-            "dispatch_count != 1 (retried). Drain/terminate active runs before downgrade."
+            "dispatch_count != 1 (retried). 0034 is not reversible once such "
+            "history exists; design a dedicated backup/restore migration instead."
         )
     op.drop_column("agent_tool_calls", "dispatch_count")

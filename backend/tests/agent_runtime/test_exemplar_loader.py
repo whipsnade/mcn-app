@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 
 import pytest
+from pydantic import ValidationError
 
 from app.agent_runtime.exemplar_loader import _CuratedExemplar, load_curated_exemplars
 
@@ -66,58 +67,81 @@ def test_curated_exemplar_loader_failure_degrades_to_empty(monkeypatch: pytest.M
 # ---------------------------------------------------------------------------
 
 
-def test_p2_rejects_wrong_version() -> None:
-    with pytest.raises(Exception):
-        _CuratedExemplar.model_validate(
-            {"exemplar_id": "x", "version": 2, "purpose": "agent_loop",
-             "domain": "brand", "language": "zh-CN", "applicable_when": ["x"],
-             "parameters": {}, "objective": "x",
-             "successful_strategy": [], "decision_rules": ["x"],
-             "coverage_targets": ["x"],
-             "completion_contract": {"no_current_period_evidence": "a",
-                                     "core_evidence_with_missing_sections": "b",
-                                     "all_required_checks_pass": "c",
-                                     "final_outputs": ["d"]}}
-        )
+def _valid_exemplar_payload() -> dict:
+    """完全合法的 exemplar payload fixture（每个用例只改一个待验证字段）。"""
+    return {
+        "exemplar_id": "brand_analysis_success_v1",
+        "version": 1,
+        "purpose": "agent_loop",
+        "domain": "brand",
+        "language": "zh-CN",
+        "applicable_when": ["品牌分析"],
+        "parameters": {},
+        "objective": "分析品牌声量",
+        "successful_strategy": [
+            {
+                "stage": "s1",
+                "goal": "g1",
+                "preferred_capability": "p1",
+                "success_signal": "正常返回体积",
+                "fallback": "f1",
+            }
+        ],
+        "decision_rules": ["rule1"],
+        "coverage_targets": ["coverage1"],
+        "completion_contract": {
+            "no_current_period_evidence": "a",
+            "core_evidence_with_missing_sections": "b",
+            "all_required_checks_pass": "c",
+            "final_outputs": ["最终报告"],
+        },
+        "forbidden_copy_values": [],
+    }
+
+
+def test_p2_valid_payload_passes() -> None:
+    """完全合法 payload 必须通过校验。"""
+    _CuratedExemplar.model_validate(_valid_exemplar_payload())
+
+
+def test_p2_rejects_version_2() -> None:
+    payload = _valid_exemplar_payload()
+    payload["version"] = 2
+    with pytest.raises(ValidationError) as exc_info:
+        _CuratedExemplar.model_validate(payload)
+    assert ("version",) in [error["loc"] for error in exc_info.value.errors()]
 
 
 def test_p2_rejects_string_version() -> None:
-    with pytest.raises(Exception):
-        _CuratedExemplar.model_validate(
-            {"exemplar_id": "x", "version": "1", "purpose": "agent_loop",
-             "domain": "brand", "language": "zh-CN", "applicable_when": ["x"],
-             "parameters": {}, "objective": "x",
-             "successful_strategy": [], "decision_rules": ["x"],
-             "coverage_targets": ["x"],
-             "completion_contract": {"no_current_period_evidence": "a",
-                                     "core_evidence_with_missing_sections": "b",
-                                     "all_required_checks_pass": "c",
-                                     "final_outputs": ["d"]}}
-        )
+    payload = _valid_exemplar_payload()
+    payload["version"] = "1"
+    with pytest.raises(ValidationError) as exc_info:
+        _CuratedExemplar.model_validate(payload)
+    assert ("version",) in [error["loc"] for error in exc_info.value.errors()]
 
 
-def test_p2_rejects_unknown_nested_field() -> None:
-    with pytest.raises(Exception):
-        _CuratedExemplar.model_validate(
-            {"exemplar_id": "x", "version": 1, "purpose": "agent_loop",
-             "domain": "brand", "language": "zh-CN", "applicable_when": ["x"],
-             "parameters": {}, "objective": "x",
-             "successful_strategy": [{"stage": "s", "goal": "g", "preferred_capability": "p",
-                                      "success_signal": "ok", "fallback": "f", "extra_col": 1}],
-             "decision_rules": ["x"], "coverage_targets": ["x"],
-             "completion_contract": {"no_current_period_evidence": "a",
-                                     "core_evidence_with_missing_sections": "b",
-                                     "all_required_checks_pass": "c",
-                                     "final_outputs": ["d"]}}
-        )
+def test_p2_rejects_completion_contract_missing_field() -> None:
+    payload = _valid_exemplar_payload()
+    del payload["completion_contract"]["final_outputs"]
+    with pytest.raises(ValidationError) as exc_info:
+        _CuratedExemplar.model_validate(payload)
+    locs = [error["loc"] for error in exc_info.value.errors()]
+    assert ("completion_contract", "final_outputs") in locs
 
 
-def test_p2_rejects_wrong_contract_type() -> None:
-    with pytest.raises(Exception):
-        _CuratedExemplar.model_validate(
-            {"exemplar_id": "x", "version": 1, "purpose": "agent_loop",
-             "domain": "brand", "language": "zh-CN", "applicable_when": ["x"],
-             "parameters": {}, "objective": "x",
-             "successful_strategy": [], "decision_rules": ["x"],
-             "coverage_targets": ["x"], "completion_contract": {"bad": "shape"}}
-        )
+def test_p2_rejects_completion_contract_extra_field() -> None:
+    payload = _valid_exemplar_payload()
+    payload["completion_contract"]["unknown_field"] = "x"
+    with pytest.raises(ValidationError) as exc_info:
+        _CuratedExemplar.model_validate(payload)
+    locs = [error["loc"] for error in exc_info.value.errors()]
+    assert any(loc and loc[0] == "completion_contract" for loc in locs)
+
+
+def test_p2_rejects_strategy_extra_field() -> None:
+    payload = _valid_exemplar_payload()
+    payload["successful_strategy"][0]["extra_col"] = 1
+    with pytest.raises(ValidationError) as exc_info:
+        _CuratedExemplar.model_validate(payload)
+    locs = [error["loc"] for error in exc_info.value.errors()]
+    assert any(loc and loc[0] == "successful_strategy" for loc in locs)
