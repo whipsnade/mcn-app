@@ -71,6 +71,8 @@ DIM_RAW_INPUT = {
 
 # score_inputs 键 → 派生它的契约字段（按优先级）。行无显式 score_inputs 时，
 # lineage 据此精确指向被派生字段在原始行内的真实键（keymap），而非笼统身份键。
+# Gate C 第三轮：lineage 不再登记静态候选列表里所有可能来源，改为只引用
+# ``_score_input_selection`` 复现的「实际选中」字段。
 _SCORE_INPUT_SOURCE_FIELDS = {
     "followers": ("followers",),
     "average_interactions": ("avg_engagement", "engagement_total"),
@@ -351,6 +353,48 @@ def _derive_score_inputs(item: dict[str, Any]) -> dict[str, Any]:
             float(avg_interactions) / float(followers) * 100, 6
         )
     return score_inputs
+
+
+def _score_input_selection(item: dict[str, Any], input_key: str) -> list[str]:
+    """复现 ``_derive_score_inputs``/评分器的实际选择，供 lineage 精确引用。
+
+    返回实际被选中的契约字段（顺序即优先级）；显式 ``score_inputs`` 已提供该
+    键时返回空列表（由调用方指向 ``score_inputs/{input_key}``）。与
+    ``_SCORE_INPUT_SOURCE_FIELDS`` 静态候选不同，这里只包含实际参与计算的
+    字段：avg_engagement 优先于 engagement_total（只取其一）；比例类键同时
+    覆盖分子与分母；active_follower_rate 缺失时回退 count + followers。
+    """
+    score_inputs = item.get("score_inputs")
+    if isinstance(score_inputs, dict) and input_key in score_inputs:
+        return []
+    followers = item.get("followers")
+    if input_key == "followers":
+        return ["followers"] if followers is not None else []
+    if input_key == "average_interactions":
+        if item.get("avg_engagement") is not None:
+            return ["avg_engagement"]
+        if item.get("engagement_total") is not None:
+            return ["engagement_total"]
+        return []
+    if input_key == "interaction_follower_ratio":
+        if item.get("avg_engagement") is not None:
+            numerator = ["avg_engagement"]
+        elif item.get("engagement_total") is not None:
+            numerator = ["engagement_total"]
+        else:
+            numerator = []
+        if numerator and followers is not None and followers > 0:
+            return [*numerator, "followers"]
+        return []
+    if input_key == "active_follower_rate":
+        if item.get("active_follower_rate") is not None:
+            return ["active_follower_rate"]
+        if item.get("active_followers") is not None and followers is not None and followers > 0:
+            return ["active_followers", "followers"]
+        return []
+    if input_key == "active_follower_count":
+        return ["active_followers"] if item.get("active_followers") is not None else []
+    return []
 
 
 def _rank_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -659,10 +703,10 @@ def _ev(evidence_id: str, path: str) -> dict[str, Any]:
     return {"source_type": "evidence", "evidence_id": evidence_id, "source_path": path}
 
 
-def _derivation(call_id: str | None, method: str, input_path: str) -> dict[str, Any] | None:
+def _derivation(call_id: str | None, method: str, *input_paths: str) -> dict[str, Any] | None:
     if call_id is None:
         return None
-    return {"tool_call_id": call_id, "method": method, "input_paths": [input_path]}
+    return {"tool_call_id": call_id, "method": method, "input_paths": list(input_paths)}
 
 
 def _identity_source(
@@ -695,20 +739,28 @@ def _dim_sources(
     keymap: dict[str, str],
     input_key: str,
 ) -> list[dict[str, Any]]:
-    """维度原始输入来源（Gate C 复审：精确 lineage）。
+    """维度原始输入来源（Gate C 第三轮：精确 lineage）。
 
-    行带显式 score_inputs → 指向 ``score_inputs/{input_key}``；否则 score_inputs
-    由真实契约字段确定性派生（_derive_score_inputs），lineage 精确指向被派生字段
-    在原始行内的真实键（keymap，如 互动数/粉丝数），绝不退回笼统身份键。
+    行带显式 score_inputs → 指向 ``score_inputs/{input_key}``；否则按
+    ``_score_input_selection`` 复现的实际选择，把被选中字段在原始行内的
+    真实键（keymap，如 互动数/粉丝数/有效粉丝数）逐一登记，按
+    (evidence_id, source_path) 去重保序，绝不登记未参与计算的候选字段。
     """
     score_inputs = raw.get("score_inputs")
     if isinstance(score_inputs, dict) and input_key in score_inputs:
         return [_ev(evidence_id, join_source_path(base, "score_inputs", input_key))]
     sources: list[dict[str, Any]] = []
-    for field in _SCORE_INPUT_SOURCE_FIELDS.get(input_key, ()):
+    seen: set[tuple[str, str]] = set()
+    for field in _score_input_selection(raw, input_key):
         raw_key = keymap.get(field)
-        if raw_key is not None and raw_key in raw:
-            sources.append(_ev(evidence_id, join_source_path(base, raw_key)))
+        if raw_key is None or raw_key not in raw:
+            continue
+        source = _ev(evidence_id, join_source_path(base, raw_key))
+        key = (source["evidence_id"], source["source_path"])
+        if key in seen:
+            continue
+        seen.add(key)
+        sources.append(source)
     if sources:
         return sources
     return _score_sources(evidence_id, base, raw, keymap)
@@ -895,7 +947,7 @@ def _build_lineage(
         # 每个维度：原始输入引用 Evidence，派生结果引用 rank_kols。
         for dim in V3_DIMENSIONS:
             dim_sources = _dim_sources(evidence_id, base, raw, keymap, DIM_RAW_INPUT[dim])
-            source_path = dim_sources[0]["source_path"]
+            input_paths = [source["source_path"] for source in dim_sources]
             for suffix in ("raw_score", "weighted_score"):
                 refs.append(
                     {
@@ -904,7 +956,7 @@ def _build_lineage(
                         ),
                         "sources": dim_sources,
                         "derivation": _derivation(
-                            call_id, f"{SCORE_VERSION_V3}:{dim}", source_path
+                            call_id, f"{SCORE_VERSION_V3}:{dim}", *input_paths
                         ),
                     }
                 )

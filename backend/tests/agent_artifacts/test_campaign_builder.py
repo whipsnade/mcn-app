@@ -874,3 +874,391 @@ def test_conversions_zero_is_valid_data_not_missing() -> None:
     assert roi["conversions"] == 0
     assert roi["roas"] == pytest.approx(3.0)
     assert roi["roi"] == pytest.approx(2.0)
+
+
+# ---------------------------------------------------------------------------
+# Gate C 第三轮：缺失与真实零治理（observed 显式跟踪，0 不是 None）
+#
+# 规则：字段出现且合计为 0 → 保留 0；字段完全没出现 → None。数值为 0 时
+# 同样必须登记 lineage（禁止 truthiness 判断）。organic_summary /
+# audience_regions / _group_totals（comparison）/ social conflict detection
+# 共用同一规则。
+# ---------------------------------------------------------------------------
+
+
+_MISSING = object()
+
+
+def _minimal_row(
+    *,
+    pid: str,
+    volume: Any = _MISSING,
+    engagement: Any = _MISSING,
+    author: Any = _MISSING,
+    **extra: Any,
+) -> dict[str, Any]:
+    """只带平台/帖子身份的可控行；默认不带任何数值/作者字段。"""
+    row: dict[str, Any] = {
+        "平台": "小红书",
+        "帖子ID": pid,
+        "发布时间": "2026-07-03 09:00:00",
+    }
+    if volume is not _MISSING:
+        row["声量"] = volume
+    if engagement is not _MISSING:
+        row["互动数"] = engagement
+    if author is not _MISSING:
+        row["作者"] = author
+    row.update(extra)
+    return row
+
+
+def _refs(rows: list[dict[str, Any]]):
+    from app.agent_artifacts.builders.raw_rows import RowRef
+
+    return [RowRef("ev-1", f"/{index}", row) for index, row in enumerate(rows)]
+
+
+def test_group_totals_missing_vs_real_zero() -> None:
+    """_group_totals：字段出现合计 0 → 保留 0；完全没出现 → None。"""
+    from app.agent_artifacts.builders.campaign import _group_totals
+
+    only_zero = _group_totals(_refs([_minimal_row(pid="p1", volume=0, engagement=0)]))
+    assert only_zero["volume"] == 0
+    assert only_zero["engagement"] == 0
+    assert only_zero["posts"] == 1
+    assert only_zero["creators"] is None  # 无作者字段 → 未观测
+
+    missing = _group_totals(_refs([_minimal_row(pid="p1", author="a"), _minimal_row(pid="p2", author="b")]))
+    assert missing["volume"] is None  # 声量字段完全没出现
+    assert missing["engagement"] is None  # 互动字段完全没出现
+    assert missing["posts"] == 2
+    assert missing["creators"] == 2
+
+
+def test_comparison_missing_metric_is_none_not_zero() -> None:
+    """baseline 行没有声量/互动/作者字段：comparison 系列必须是 None，不是 0。"""
+    current = [_minimal_row(pid="p1", volume=2, engagement=10, author="a")]
+    baseline = [_minimal_row(pid="b1")]  # 只有帖子身份，无任何数值字段
+    build = build_campaign_report_draft(
+        scope=SCOPE,
+        evidence={"posts": [("ev-current", current)], "baseline": [("ev-baseline", baseline)]},
+    )
+    payload = build.payload
+    CampaignReportV2.model_validate(payload)
+    series = {s["metric"]: s for s in payload["data"]["comparisons"]["current_baseline"]}
+    assert series["volume"]["current"] == 2
+    assert series["volume"]["baseline"] is None
+    assert series["volume"]["delta"] is None
+    assert series["volume"]["rate"] is None
+    assert series["engagement"]["baseline"] is None
+    assert series["creators"]["baseline"] is None
+
+
+def test_comparison_real_zero_kept_and_lineaged() -> None:
+    """baseline 声量字段出现但合计 0：baseline=0 保留，且 lineage 必须登记 0 值。"""
+    current = [_minimal_row(pid="p1", volume=2, engagement=10, author="a")]
+    baseline = [_minimal_row(pid="b1", volume=0, engagement=0, author="b")]
+    build = build_campaign_report_draft(
+        scope=SCOPE,
+        evidence={"posts": [("ev-current", current)], "baseline": [("ev-baseline", baseline)]},
+    )
+    series = {s["metric"]: s for s in build.payload["data"]["comparisons"]["current_baseline"]}
+    assert series["volume"]["baseline"] == 0
+    assert series["engagement"]["baseline"] == 0
+    refs = {ref["artifact_path"] for ref in build.evidence_refs}
+    assert "/data/comparisons/current_baseline/0/baseline" in refs
+    assert "/data/comparisons/current_baseline/1/baseline" in refs
+    required = required_numeric_pointers(build.payload)
+    assert required <= refs
+
+
+def test_organic_summary_zero_volume_kept_and_lineaged() -> None:
+    """organic 行声量字段出现但合计 0：volume=0 保留且 lineage 登记；
+    声量字段完全没出现 → volume=None（不因 or 0 伪造 0，也不因 truthiness 丢 lineage）。"""
+    posts = [
+        {**_minimal_row(pid="p1", volume=0, engagement=0, author="a"), "归属": "自然"},
+        {**_minimal_row(pid="p2", volume=0, engagement=0, author="b"), "归属": "自然"},
+    ]
+    build = build_campaign_report_draft(scope=SCOPE, evidence={"posts": [("ev-1", posts)]})
+    organic = build.payload["data"]["organic_summary"]
+    assert organic["volume"] == 0
+    assert organic["engagement"] == 0
+    refs = {ref["artifact_path"] for ref in build.evidence_refs}
+    assert "/data/organic_summary/volume" in refs
+    assert "/data/organic_summary/engagement" in refs
+
+    missing = build_campaign_report_draft(
+        scope=SCOPE,
+        evidence={"posts": [("ev-1", [{**_minimal_row(pid="p1", author="a"), "归属": "自然"}])]},
+    )
+    organic = missing.payload["data"]["organic_summary"]
+    assert organic["volume"] is None
+    assert organic["engagement"] is None
+
+
+def test_audience_regions_zero_total_no_fake_share() -> None:
+    """地域声量字段出现但全部为 0：volume=0 保留；总声量为 0 时 share=None，绝不伪造 share=0。"""
+    posts = [
+        {**_minimal_row(pid="p1", volume=0, author="a"), "地区": "上海"},
+        {**_minimal_row(pid="p2", volume=0, author="b"), "地区": "北京"},
+    ]
+    build = build_campaign_report_draft(scope=SCOPE, evidence={"posts": [("ev-1", posts)]})
+    regions = {r["region"]: r for r in build.payload["data"]["audience_regions"]}
+    assert regions["上海"]["volume"] == 0
+    assert regions["北京"]["volume"] == 0
+    assert regions["上海"]["share"] is None
+    assert regions["北京"]["share"] is None
+    CampaignReportV2.model_validate(build.payload)
+
+
+def test_audience_regions_missing_volume_is_none() -> None:
+    """地域行没有声量字段：volume=None、share=None，不得伪造 0。"""
+    posts = [
+        {**_minimal_row(pid="p1", author="a"), "地区": "上海"},
+        {**_minimal_row(pid="p2", author="b"), "地区": "北京"},
+    ]
+    build = build_campaign_report_draft(scope=SCOPE, evidence={"posts": [("ev-1", posts)]})
+    regions = {r["region"]: r for r in build.payload["data"]["audience_regions"]}
+    assert regions["上海"]["volume"] is None
+    assert regions["上海"]["share"] is None
+    CampaignReportV2.model_validate(build.payload)
+
+
+def test_social_conflict_uses_observed_volume() -> None:
+    """social 行声量字段出现但合计 0（观测值）vs upload 999 → 真实冲突保留双值；
+    social 行无声量字段（未观测）→ 不产生声量冲突。"""
+    observed_zero = [
+        {**_minimal_row(pid="p1", volume=0, author="a")},
+        {**_minimal_row(pid="p2", volume=0, author="b")},
+    ]
+    build = build_campaign_report_draft(
+        scope=SCOPE,
+        evidence={
+            "posts": [("ev-1", observed_zero)],
+            "upload": [("ev-2", [{"平台": "合计", "声量": 999, "投放金额": 100}])],
+        },
+    )
+    conflicts = [lim for lim in build.payload["limitations"] if lim["code"] == "social_metric_conflict"]
+    assert any("声量" in lim["message"] for lim in conflicts)
+
+    not_observed = [_minimal_row(pid="p1", author="a")]
+    build = build_campaign_report_draft(
+        scope=SCOPE,
+        evidence={
+            "posts": [("ev-1", not_observed)],
+            "upload": [("ev-2", [{"平台": "合计", "声量": 999, "投放金额": 100}])],
+        },
+    )
+    conflicts = [lim for lim in build.payload["limitations"] if lim["code"] == "social_metric_conflict"]
+    assert not any("声量" in lim["message"] for lim in conflicts)
+
+
+def test_overview_zero_engagement_kept_and_lineaged() -> None:
+    """overview：互动字段出现但合计 0 → total_engagement=0 保留且 lineage 登记。"""
+    posts = [_minimal_row(pid="p1", engagement=0, author="a"), _minimal_row(pid="p2", engagement=0, author="b")]
+    build = build_campaign_report_draft(scope=SCOPE, evidence={"posts": [("ev-1", posts)]})
+    overview = build.payload["data"]["overview"]
+    assert overview["total_engagement"] == 0
+    refs = {ref["artifact_path"] for ref in build.evidence_refs}
+    assert "/data/overview/total_engagement" in refs
+
+
+# ---------------------------------------------------------------------------
+# Gate C 第三轮：活动归属字段语义
+#
+# 「是否付费」是布尔语义字段：值直接表达 是/否、true/false、1/0、yes/no；
+# 「归属/投放类型/付费自然/attribution」继续用标准化文本 token。归属判定
+# 必须保留命中的字段名，非付费/非商单/unpaid 优先归 organic，未知值保持
+# unknown（绝不默认付费）。
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("是", "paid_confirmed"),
+        ("true", "paid_confirmed"),
+        ("TRUE", "paid_confirmed"),
+        ("1", "paid_confirmed"),
+        ("yes", "paid_confirmed"),
+        ("否", "organic"),
+        ("false", "organic"),
+        ("0", "organic"),
+        ("no", "organic"),
+    ],
+)
+def test_attribution_boolean_field_value_mapping(value: str, expected: str) -> None:
+    """「是否付费」布尔字段：是/否、true/false、1/0、yes/no 精确映射。"""
+    from app.agent_artifacts.builders.campaign import _attribution_kind
+
+    ref = _refs([{"是否付费": value}])[0]
+    kind, field = _attribution_kind(ref)
+    assert kind == expected
+    assert field == "是否付费"
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected"),
+    [
+        ("归属", "付费商单", "paid_confirmed"),
+        ("归属", "自然", "organic"),
+        ("归属", "非付费", "organic"),
+        ("归属", "非商单", "organic"),
+        ("归属", "unpaid", "organic"),
+        ("归属", "其他", "unknown"),
+        ("投放类型", "广告投放", "paid_confirmed"),
+        ("投放类型", "非投放", "organic"),
+        ("付费/自然", "自然流量", "organic"),
+        ("attribution", "paid", "paid_confirmed"),
+        ("attribution", "sponsored", "paid_confirmed"),
+    ],
+)
+def test_attribution_text_field_token_mapping(field: str, value: str, expected: str) -> None:
+    """文本语义字段（归属/投放类型/付费自然/attribution）：标准化 token 匹配，
+    且返回命中的字段名。"""
+    from app.agent_artifacts.builders.campaign import _attribution_kind
+
+    ref = _refs([{field: value}])[0]
+    kind, matched = _attribution_kind(ref)
+    assert kind == expected
+    assert matched == field
+
+
+def test_attribution_unknown_and_missing_never_default_paid() -> None:
+    """未知值保持 unknown、缺字段 unknown；绝不默认付费。"""
+    from app.agent_artifacts.builders.campaign import _attribution_kind
+
+    assert _attribution_kind(_refs([{"归属": "不清楚"}])[0]) == ("unknown", "归属")
+    assert _attribution_kind(_refs([{"是否付费": "也许"}])[0]) == ("unknown", "是否付费")
+    assert _attribution_kind(_refs([{"平台": "小红书"}])[0]) == ("unknown", None)
+
+
+def test_attribution_boolean_field_counts_in_builder() -> None:
+    """builder 集成：「是否付费」= 是/否/true 正确进入 paid/organic 计数。"""
+    posts = [
+        {**_minimal_row(pid="p1", engagement=10, author="a"), "是否付费": "是"},
+        {**_minimal_row(pid="p2", engagement=20, author="b"), "是否付费": "否"},
+        {**_minimal_row(pid="p3", engagement=30, author="c"), "是否付费": "true"},
+    ]
+    build = build_campaign_report_draft(scope=SCOPE, evidence={"posts": [("ev-1", posts)]})
+    attribution = build.payload["data"]["attribution"]
+    assert attribution["paid_confirmed"] == 2
+    assert attribution["organic"] == 1
+    assert attribution["unknown"] == 0
+
+
+def test_attribution_boolean_organic_feeds_organic_summary() -> None:
+    """「是否付费」= 否 的行计入 organic_summary（布尔字段与自然聚合联动）。"""
+    posts = [
+        {**_minimal_row(pid="p1", volume=5, engagement=10, author="a"), "是否付费": "否"},
+        {**_minimal_row(pid="p2", volume=3, engagement=20, author="b"), "是否付费": "是"},
+    ]
+    build = build_campaign_report_draft(scope=SCOPE, evidence={"posts": [("ev-1", posts)]})
+    organic = build.payload["data"]["organic_summary"]
+    assert organic["posts"] == 1
+    assert organic["volume"] == 5
+    assert organic["engagement"] == 10
+
+
+# ---------------------------------------------------------------------------
+# Gate C 第三轮 P1-2：活动对比指标 lineage 来源精确归期
+#
+# current_baseline/current_post 的 current/baseline/delta/rate 必须引用各自的
+# 期别行集合：current 只引用 current_rows；baseline 按系列引用 baseline_rows
+# （current_baseline）或 post_rows（current_post）；delta/rate 同时引用两期；
+# sources 按 (evidence_id, source_path) 去重保序；真实 0 仍登记 lineage，
+# None 不登记；三组 Evidence 不得混淆。
+# ---------------------------------------------------------------------------
+
+
+def _comparison_evidence() -> dict[str, list[tuple[str, Any]]]:
+    """三组不同 evidence_id 的对比行：ev-current / ev-baseline / ev-post。"""
+    return {
+        "current": [("ev-current", [_minimal_row(pid="c1", volume=10, engagement=100, author="a")])],
+        "baseline": [("ev-baseline", [_minimal_row(pid="b1", volume=8, engagement=80, author="b")])],
+        "post": [("ev-post", [_minimal_row(pid="p1", volume=12, engagement=120, author="c")])],
+    }
+
+
+def _comparison_ref(build, series: str, metric_index: int, field: str) -> dict[str, Any]:
+    artifact_path = f"/data/comparisons/{series}/{metric_index}/{field}"
+    refs = [ref for ref in build.evidence_refs if ref["artifact_path"] == artifact_path]
+    assert len(refs) == 1, artifact_path
+    return refs[0]
+
+
+def test_comparison_lineage_current_only_from_current_evidence() -> None:
+    """current 值只引用 ev-current；baseline 只引用 ev-baseline；绝不混入对方。"""
+    build = build_campaign_report_draft(scope=SCOPE, evidence=_comparison_evidence())
+    CampaignReportV2.model_validate(build.payload)
+
+    current_ref = _comparison_ref(build, "current_baseline", 0, "current")
+    assert [s["evidence_id"] for s in current_ref["sources"]] == ["ev-current"]
+    assert [s["source_path"] for s in current_ref["sources"]] == ["/0"]
+
+    baseline_ref = _comparison_ref(build, "current_baseline", 0, "baseline")
+    assert [s["evidence_id"] for s in baseline_ref["sources"]] == ["ev-baseline"]
+
+
+def test_comparison_lineage_delta_rate_cover_both_periods() -> None:
+    """delta/rate 同时包含正确的两期 evidence_id，source_path 正确、无重复。"""
+    build = build_campaign_report_draft(scope=SCOPE, evidence=_comparison_evidence())
+    CampaignReportV2.model_validate(build.payload)
+
+    for field in ("delta", "rate"):
+        ref = _comparison_ref(build, "current_baseline", 0, field)
+        pairs = [(s["evidence_id"], s["source_path"]) for s in ref["sources"]]
+        assert pairs == [("ev-current", "/0"), ("ev-baseline", "/0")]
+        assert len(pairs) == len(set(pairs))  # 无重复
+
+
+def test_comparison_lineage_current_post_baseline_from_post_evidence() -> None:
+    """current_post 系列的 baseline 字段装的是 post 期值：只引用 ev-post；
+    delta/rate 引用 ev-current + ev-post。"""
+    build = build_campaign_report_draft(scope=SCOPE, evidence=_comparison_evidence())
+    CampaignReportV2.model_validate(build.payload)
+
+    post_value_ref = _comparison_ref(build, "current_post", 0, "baseline")
+    assert [s["evidence_id"] for s in post_value_ref["sources"]] == ["ev-post"]
+
+    current_ref = _comparison_ref(build, "current_post", 0, "current")
+    assert [s["evidence_id"] for s in current_ref["sources"]] == ["ev-current"]
+
+    delta_ref = _comparison_ref(build, "current_post", 0, "delta")
+    pairs = [(s["evidence_id"], s["source_path"]) for s in delta_ref["sources"]]
+    assert pairs == [("ev-current", "/0"), ("ev-post", "/0")]
+
+
+def test_comparison_lineage_all_metrics_keep_period_ownership() -> None:
+    """四个指标（volume/engagement/posts/creators）的 current 都只引用 ev-current，
+    baseline 都只引用 ev-baseline（任何指标都不混入对方 Evidence）。"""
+    build = build_campaign_report_draft(scope=SCOPE, evidence=_comparison_evidence())
+    CampaignReportV2.model_validate(build.payload)
+
+    for index in range(4):
+        current_ref = _comparison_ref(build, "current_baseline", index, "current")
+        assert {s["evidence_id"] for s in current_ref["sources"]} == {"ev-current"}
+        baseline_ref = _comparison_ref(build, "current_baseline", index, "baseline")
+        assert {s["evidence_id"] for s in baseline_ref["sources"]} == {"ev-baseline"}
+
+
+def test_comparison_zero_baseline_kept_and_lineaged() -> None:
+    """baseline=0（真实 0）：baseline=0 保留、lineage 登记；delta 引用两期。"""
+    evidence = {
+        "current": [("ev-current", [_minimal_row(pid="c1", volume=10, author="a")])],
+        "baseline": [("ev-baseline", [_minimal_row(pid="b1", volume=0, author="b")])],
+    }
+    build = build_campaign_report_draft(scope=SCOPE, evidence=evidence)
+    CampaignReportV2.model_validate(build.payload)
+    series = {s["metric"]: s for s in build.payload["data"]["comparisons"]["current_baseline"]}
+    assert series["volume"]["baseline"] == 0
+
+    baseline_ref = _comparison_ref(build, "current_baseline", 0, "baseline")
+    assert [s["evidence_id"] for s in baseline_ref["sources"]] == ["ev-baseline"]
+    delta_ref = _comparison_ref(build, "current_baseline", 0, "delta")
+    assert [s["evidence_id"] for s in delta_ref["sources"]] == ["ev-current", "ev-baseline"]
+    # baseline=0 时 rate 无定义（不登记 lineage），required 覆盖仍完整。
+    required = required_numeric_pointers(build.payload)
+    covered = {ref["artifact_path"] for ref in build.evidence_refs}
+    assert required <= covered

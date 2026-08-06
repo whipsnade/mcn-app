@@ -123,6 +123,12 @@ CONVERSION_KEYS = ("转化", "转化数", "转化量", "成交数", "conversions
 REVENUE_KEYS = ("销售额", "销售金额", "收入", "GMV", "revenue", "sales")
 # 帖子的付费/自然归属键。
 ATTRIBUTION_KEYS = ("归属", "是否付费", "投放类型", "付费/自然", "attribution")
+# 归属语义字段分流（Gate C 第三轮）：布尔字段的值直接表达付费与否
+# （是/否、true/false、1/0、yes/no）；文本字段的值用标准化 token 匹配。
+_BOOLEAN_ATTRIBUTION_KEYS = ("是否付费",)
+_TEXT_ATTRIBUTION_KEYS = ("归属", "投放类型", "付费/自然", "attribution")
+_PAID_BOOL_VALUES = frozenset({"是", "true", "1", "yes"})
+_ORGANIC_BOOL_VALUES = frozenset({"否", "false", "0", "no"})
 
 
 def _extract_group(pairs: list[tuple[str, Any]] | None) -> list[RowRef]:
@@ -493,8 +499,13 @@ def _assemble_availability(
 
 
 def _group_totals(rows: list[RowRef]) -> dict[str, int | None]:
-    """按行聚合 volume/engagement/posts/creators 四指标（社媒口径）。"""
+    """按行聚合 volume/engagement/posts/creators 四指标（社媒口径）。
+
+    observed 显式跟踪（Gate C 第三轮）：字段至少出现一次 → 真实合计（含 0）；
+    字段完全没出现 → None，绝不把缺失当 0，也绝不把真实 0 当缺失。
+    """
     totals = {"volume": 0, "engagement": 0, "posts": 0}
+    observed = {"volume": False, "engagement": False}
     creator_ids: set[str] = set()
     for ref in rows:
         row = ref.row
@@ -502,13 +513,20 @@ def _group_totals(rows: list[RowRef]) -> dict[str, int | None]:
         engagement = whole(first(row, ENGAGEMENT_KEYS))
         if volume is not None:
             totals["volume"] += volume
+            observed["volume"] = True
         if engagement is not None:
             totals["engagement"] += engagement
+            observed["engagement"] = True
         totals["posts"] += 1
         author_id = _row_author_id(row)
         if author_id is not None:
             creator_ids.add(author_id)
-    return {"volume": totals["volume"], "engagement": totals["engagement"], "posts": totals["posts"], "creators": len(creator_ids)}
+    return {
+        "volume": totals["volume"] if observed["volume"] else None,
+        "engagement": totals["engagement"] if observed["engagement"] else None,
+        "posts": totals["posts"],
+        "creators": len(creator_ids) if creator_ids else None,
+    }
 
 
 def _rate_change(current: float | None, baseline: float | None) -> float | None:
@@ -539,15 +557,18 @@ def _build_comparisons(
 
     current 分组缺省时回退 posts/social（DataTap 口径）；对比只在对应分组有
     行时生成，绝不估算。
+
+    lineage 归期（P1-2）：current 只引用 current_rows；baseline 按系列引用
+    baseline_rows（current_baseline）或 post_rows（current_post，该字段装的是
+    post 期值）；delta/rate 同时引用 current_rows 与对应对比期行集合，按
+    (evidence_id, source_path) 去重保序；真实 0 登记、None 不登记，三组
+    Evidence 绝不混淆。
     """
     current_totals = _group_totals(current_rows)
     baseline_totals = _group_totals(baseline_rows)
     post_totals = _group_totals(post_rows)
     has_rows = bool(current_rows or baseline_rows or post_rows)
     metrics = ("volume", "engagement", "posts", "creators")
-
-    def _series_rows(metric: str, rows: list[RowRef]) -> list[RowRef]:
-        return rows
 
     current_baseline = [
         _comparison_series(metric, current_totals[metric], baseline_totals[metric])
@@ -558,20 +579,26 @@ def _build_comparisons(
         for metric in metrics
     ]
     # lineage 只登记 payload 真实叶子（current/baseline/delta/rate）；空系列不登记。
-    for series_name, series, rows in (
+    for series_name, series, comparison_rows in (
         ("current_baseline", current_baseline, baseline_rows),
         ("current_post", current_post, post_rows),
     ):
-        if not rows:
+        if not comparison_rows:
             continue
         for index, entry in enumerate(series):
             for field in ("current", "baseline", "delta", "rate"):
                 value = entry[field]
                 if value is None:
                     continue
+                if field == "current":
+                    sources = current_rows
+                elif field == "baseline":
+                    sources = comparison_rows
+                else:
+                    sources = _dedup_rows([*current_rows, *comparison_rows])
                 collector.add(
                     f"/data/comparisons/{series_name}/{index}/{field}",
-                    _series_rows(metrics[index], rows) or current_rows,
+                    sources,
                 )
     return {
         "current_baseline": current_baseline if baseline_rows else [],
@@ -603,30 +630,44 @@ def _contains_token(folded: str, token: str) -> bool:
     return token in folded
 
 
-def _attribution_kind(ref: RowRef) -> str | None:
-    """归属分类（字段语义 + 标准化 token 集合）。
+def _attribution_kind(ref: RowRef) -> tuple[str, str | None]:
+    """归属分类；返回 ``(kind, 命中的归属字段名)``。
 
-    1. 命中自然 token（含「非付费/非商单/unpaid」否定合成词）→ organic；
-    2. 否定前缀 + 付费 token（「非X」「unX」）→ organic；
-    3. 命中付费 token → paid_confirmed；
-    4. 无法确认 → unknown（没有证据不得默认认定付费投放）。
+    按 ATTRIBUTION_KEYS 顺序取第一个有非空值的字段（Gate C 第三轮保留
+    命中的字段名）：
+    1. 「是否付费」布尔字段：是/true/1/yes → paid_confirmed；否/false/0/no
+       → organic；其余值 → unknown（不得默认付费）；
+    2. 文本字段（归属/投放类型/付费自然/attribution）：自然 token（含
+       非付费/非商单/unpaid）优先 → organic；否定前缀+付费 token → organic；
+       付费 token → paid_confirmed；其余 → unknown。
+    无归属字段或字段值为空 → ``(unknown, None)``。
     """
-    raw = text(first(ref.row, ATTRIBUTION_KEYS))
-    if raw is None:
-        return "unknown"
-    folded = raw.casefold().strip()
-    if not folded:
-        return "unknown"
-    if any(_contains_token(folded, token) for token in _ORGANIC_TOKENS):
-        return "organic"
-    for prefix in _NEGATION_PREFIXES:
-        if folded.startswith(prefix):
-            rest = folded[len(prefix) :].strip("-–· ")
-            if rest and any(_contains_token(rest, token) for token in _PAID_TOKENS):
-                return "organic"
-    if any(_contains_token(folded, token) for token in _PAID_TOKENS):
-        return "paid_confirmed"
-    return "unknown"
+    for key in ATTRIBUTION_KEYS:
+        if key not in ref.row:
+            continue
+        raw = ref.row[key]
+        if raw is None:
+            continue
+        folded = str(raw).strip().casefold()
+        if not folded:
+            continue
+        if key in _BOOLEAN_ATTRIBUTION_KEYS:
+            if folded in _PAID_BOOL_VALUES:
+                return "paid_confirmed", key
+            if folded in _ORGANIC_BOOL_VALUES:
+                return "organic", key
+            return "unknown", key
+        if any(_contains_token(folded, token) for token in _ORGANIC_TOKENS):
+            return "organic", key
+        for prefix in _NEGATION_PREFIXES:
+            if folded.startswith(prefix):
+                rest = folded[len(prefix) :].strip("-–· ")
+                if rest and any(_contains_token(rest, token) for token in _PAID_TOKENS):
+                    return "organic", key
+        if any(_contains_token(folded, token) for token in _PAID_TOKENS):
+            return "paid_confirmed", key
+        return "unknown", key
+    return "unknown", None
 
 
 def _build_attribution(
@@ -638,7 +679,7 @@ def _build_attribution(
     """
     counts = {"paid_confirmed": 0, "organic": 0, "unknown": 0}
     for ref in post_rows:
-        counts[_attribution_kind(ref)] += 1
+        counts[_attribution_kind(ref)[0]] += 1
     total = sum(counts.values())
     if post_rows:
         for field in ("paid_confirmed", "organic", "unknown"):
@@ -655,24 +696,24 @@ def _build_attribution(
 def _build_organic_summary(
     post_rows: list[RowRef], collector: LineageCollector
 ) -> tuple[dict[str, Any], bool]:
-    """organic_summary 只聚合确认归为 organic 的行（Gate C 审核）。"""
-    organic_rows = [ref for ref in post_rows if _attribution_kind(ref) == "organic"]
+    """organic_summary 只聚合确认归为 organic 的行（Gate C 审核）。
+
+    observed 规则（Gate C 第三轮）：声量/互动字段出现且合计为 0 → 保留 0 并
+    登记 lineage；字段完全没出现 → None，绝不用 truthiness 判断。
+    """
+    organic_rows = [ref for ref in post_rows if _attribution_kind(ref)[0] == "organic"]
     if not organic_rows:
         return {}, False
-    volume = sum(
-        whole(first(ref.row, VOLUME_KEYS)) or 0 for ref in organic_rows
-    )
-    engagement = sum(
-        whole(first(ref.row, ENGAGEMENT_KEYS)) or 0 for ref in organic_rows
-    )
-    if volume:
+    volume = _sum_number(organic_rows, VOLUME_KEYS)
+    engagement = _sum_number(organic_rows, ENGAGEMENT_KEYS)
+    if volume is not None:
         collector.add("/data/organic_summary/volume", organic_rows)
-    if engagement:
+    if engagement is not None:
         collector.add("/data/organic_summary/engagement", organic_rows)
     collector.add("/data/organic_summary/posts", organic_rows)
     return {
-        "volume": volume or None,
-        "engagement": engagement or None,
+        "volume": volume,
+        "engagement": engagement,
         "posts": len(organic_rows),
         "share_of_volume": None,  # 无自然/总声量对比数据时不估算
     }, True
@@ -681,34 +722,39 @@ def _build_organic_summary(
 def _build_audience_regions(
     post_rows: list[RowRef], collector: LineageCollector
 ) -> tuple[list[dict[str, Any]], bool]:
-    """按发帖用户地区聚合（REGION_KEYS）；无地区字段返回空。"""
-    buckets: dict[str, dict[str, int]] = {}
+    """按发帖用户地区聚合（REGION_KEYS）；无地区字段返回空。
+
+    observed 规则（Gate C 第三轮）：地域声量字段出现 → 真实合计（含 0）；
+    完全没出现 → None。地域总声量为 0 时 share=None，绝不伪造 share=0。
+    """
+    buckets: dict[str, dict[str, Any]] = {}
     for ref in post_rows:
         region = text(first(ref.row, REGION_KEYS))
         if region is None:
             continue
-        bucket = buckets.setdefault(region, {"volume": 0})
+        bucket = buckets.setdefault(region, {"volume": 0, "observed": False})
         volume = whole(first(ref.row, VOLUME_KEYS))
         if volume is not None:
             bucket["volume"] += volume
+            bucket["observed"] = True
         collector.add("/data/audience_regions", [ref])
     if not buckets:
         return [], False
-    total_volume = sum(bucket["volume"] for bucket in buckets.values()) or 1
-    regions = [
-        {
-            "region": region,
-            "volume": bucket["volume"] or None,
-            "share": round(bucket["volume"] / total_volume, 4),
-        }
-        for region, bucket in buckets.items()
-    ]
-    for index, entry in enumerate(regions):
-        for field in ("volume", "share"):
-            if entry[field] is not None:
-                collector.add(
-                    f"/data/audience_regions/{index}/{field}", post_rows
-                )
+    total_volume = sum(bucket["volume"] for bucket in buckets.values())
+    total_observed = any(bucket["observed"] for bucket in buckets.values())
+    regions: list[dict[str, Any]] = []
+    for region, bucket in buckets.items():
+        index = len(regions)
+        volume = bucket["volume"] if bucket["observed"] else None
+        share = (
+            round(bucket["volume"] / total_volume, 4)
+            if total_observed and total_volume > 0
+            else None
+        )
+        regions.append({"region": region, "volume": volume, "share": share})
+        for field, value in (("volume", volume), ("share", share)):
+            if value is not None:
+                collector.add(f"/data/audience_regions/{index}/{field}", post_rows)
     return regions, True
 
 
@@ -860,12 +906,14 @@ def build_campaign_report_draft(
     post_period_rows = _dedup_rows(_group_posts(groups[GROUP_POST]))
 
     # 社媒冲突检测：upload 行若同时携带声量/互动且与 DataTap 不同，双值保留。
+    # observed 规则（Gate C 第三轮）：DataTap 侧字段出现合计 0（观测值）vs
+    # upload 非 0 是真实冲突；DataTap 字段完全没出现（未观测）不参与比较。
     social_conflicts: list[dict[str, Any]] = []
     upload_volume = _sum_number(upload_rows, VOLUME_KEYS)
     upload_engagement = _sum_number(upload_rows, ENGAGEMENT_KEYS)
-    datatap_volume = sum(whole(first(ref.row, VOLUME_KEYS)) or 0 for ref in social_rows)
-    datatap_engagement = sum(whole(first(ref.row, ENGAGEMENT_KEYS)) or 0 for ref in social_rows)
-    if upload_volume is not None and datatap_volume > 0 and upload_volume != datatap_volume:
+    datatap_volume = _sum_number(social_rows, VOLUME_KEYS)
+    datatap_engagement = _sum_number(social_rows, ENGAGEMENT_KEYS)
+    if upload_volume is not None and datatap_volume is not None and upload_volume != datatap_volume:
         social_conflicts.append(
             {
                 "code": "social_metric_conflict",
@@ -876,7 +924,7 @@ def build_campaign_report_draft(
                 "affected_paths": ["overview.total_volume", "internal_metrics.spend"],
             }
         )
-    if upload_engagement is not None and datatap_engagement > 0 and upload_engagement != datatap_engagement:
+    if upload_engagement is not None and datatap_engagement is not None and upload_engagement != datatap_engagement:
         social_conflicts.append(
             {
                 "code": "social_metric_conflict",

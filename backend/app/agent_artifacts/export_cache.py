@@ -41,11 +41,40 @@ _FILENAME_UNSAFE = re.compile(r"[^0-9A-Za-z._\-]")
 _BUILD_LEASE_SECONDS = 300.0
 # 等待 building 完成的重试间隔。
 _WAIT_RETRY_SECONDS = 0.05
+# MySQL 可重试错误（死锁 1213 / 锁等待超时 1205）的有限重试预算与指数退避基值。
+_MAX_DB_RETRY_ATTEMPTS = 5
+_DB_RETRY_BASE_SECONDS = 0.05
+_MYSQL_RETRYABLE_CODES = frozenset({1205, 1213})
 
 
 def sanitize_filename(name: str) -> str:
     cleaned = _FILENAME_UNSAFE.sub("_", name).strip("._")
     return cleaned or "artifact"
+
+
+def _mysql_error_code(exc: OperationalError) -> int | None:
+    """提取 MySQL 错误码（asyncmy 的 orig.args[0] 为 int code）。"""
+    orig = getattr(exc, "orig", None)
+    if orig is None:
+        return None
+    args = getattr(orig, "args", None)
+    if args and isinstance(args[0], int):
+        return args[0]
+    return None
+
+
+def _is_mysql_retryable(exc: OperationalError) -> bool:
+    """只对 MySQL 可重试的死锁/锁等待做退避；连接断开等错误直接抛出。"""
+    code = _mysql_error_code(exc)
+    if code is not None:
+        return code in _MYSQL_RETRYABLE_CODES
+    message = str(exc).casefold()
+    return "deadlock" in message or "lock wait timeout" in message
+
+
+def _retry_backoff(attempt_index: int) -> float:
+    """第 attempt_index 次重试（0 起）的指数退避时长。"""
+    return _DB_RETRY_BASE_SECONDS * (2**attempt_index)
 
 
 def _now() -> datetime:
@@ -95,6 +124,7 @@ class ExportCacheService:
         """构建并返回缓存文件；并发下只渲染一次。"""
         template_version = _template_version_for(schema_version)
         self._storage_dir.mkdir(parents=True, exist_ok=True)
+        retry_budget = _MAX_DB_RETRY_ATTEMPTS
         while True:
             # 等待方必须重新读取最新状态（identity map 旧对象会永久卡住）；
             # 用 populate_existing 强制重读 ArtifactExport 行，不波及调用方
@@ -109,23 +139,41 @@ class ExportCacheService:
                     .with_for_update()
                     .execution_options(populate_existing=True)
                 )
-            except OperationalError:
-                # 并发 gap-lock 死锁：回滚后重试。
+            except OperationalError as exc:
+                # 只对 MySQL 死锁/锁等待做有限次数指数退避；连接断开等直接抛。
                 await self._db.rollback()
+                if not _is_mysql_retryable(exc) or retry_budget <= 0:
+                    raise
+                retry_budget -= 1
+                await asyncio.sleep(_retry_backoff(_MAX_DB_RETRY_ATTEMPTS - retry_budget - 1))
                 continue
             now = _now()
-            if row is not None and row.status == "ready" and row.sha256 and row.filename:
+            if (
+                row is not None
+                and row.status == "ready"
+                and row.filename
+                and row.storage_key
+                and row.sha256
+                and row.size_bytes
+            ):
+                # ready 命中必须同时校验 filename/storage_key/sha256/size_bytes；
+                # 任一元数据不完整、文件缺失、hash/size 不匹配都统一失效重建。
                 path = self._storage_dir / row.storage_key
                 if path.exists():
                     content = await asyncio.to_thread(self._read_file, path)
-                    if hashlib.sha256(content).hexdigest() == row.sha256:
+                    if (
+                        hashlib.sha256(content).hexdigest() == row.sha256
+                        and len(content) == row.size_bytes
+                    ):
                         return ExportedFile(
                             filename=row.filename,
                             sha256=row.sha256,
-                            size_bytes=row.size_bytes or 0,
+                            size_bytes=row.size_bytes,
                             content=content,
                         )
-                # 文件丢失或 hash 不匹配：标记失效，重建（换新 claim_token）。
+                    # hash/size 不匹配：先删除旧损坏文件再重建。
+                    await asyncio.to_thread(self._delete_file, path)
+                # 元数据不完整/文件缺失/hash 不匹配：标记失效，重建（换新 token）。
                 row.status = "building"
                 row.error_code = None
                 row.sha256 = None
@@ -167,8 +215,12 @@ class ExportCacheService:
                 except IntegrityError:
                     await self._db.rollback()  # 并发撞唯一约束 → 重读 ready。
                     continue
-                except OperationalError:
-                    await self._db.rollback()  # 并发死锁 → 重试。
+                except OperationalError as exc:
+                    await self._db.rollback()
+                    if not _is_mysql_retryable(exc) or retry_budget <= 0:
+                        raise
+                    retry_budget -= 1
+                    await asyncio.sleep(_retry_backoff(_MAX_DB_RETRY_ATTEMPTS - retry_budget - 1))
                     continue
             else:
                 # failed 行：覆盖为 building 重试（换新 claim_token）。
@@ -211,8 +263,30 @@ class ExportCacheService:
             safe_name = sanitize_filename(filename)
             storage_key = f"{artifact_version_id[:8]}-{uuid4().hex[:12]}.xlsx"
             path = self._storage_dir / storage_key
+            # 后台写入包装为可跟踪 Task 并用 shield 隔离外层取消：取消
+            # to_thread 的 await 不会终止后台写线程，若直接删除文件返回，
+            # 线程随后 os.replace 会重新生成未登记的孤儿文件（P1-1）。
+            # 取消后必须等待写任务真正结束，再清理本 owner 的 .xlsx/.tmp。
+            write_task = asyncio.create_task(
+                asyncio.to_thread(self._write_atomic, path, content)
+            )
             try:
-                await asyncio.to_thread(self._write_atomic, path, content)
+                await asyncio.shield(write_task)
+            except asyncio.CancelledError:
+                # 外层取消：shield 保证写入任务继续运行，等待它真正结束。
+                await asyncio.gather(write_task, return_exceptions=True)
+                # 后台写入结束后清理本 owner 生成的最终文件与半写临时文件；
+                # storage_key 是本 owner 的 uuid，不会误删接管方文件。
+                await asyncio.to_thread(self._delete_file, path)
+                await asyncio.to_thread(self._delete_file, path.with_suffix(".tmp"))
+                await self._db.rollback()
+                await self._mark_failed(
+                    artifact_version_id,
+                    template_version,
+                    error_code="export_cancelled",
+                    claim_token=claim_token,
+                )
+                raise
             except Exception:
                 await self._mark_failed(
                     artifact_version_id,
@@ -230,6 +304,34 @@ class ExportCacheService:
                     content=content,
                     claim_token=claim_token,
                 )
+            except asyncio.CancelledError:
+                # mark_ready 阶段取消：可能已提交也可能未提交，重读确认。
+                await self._db.rollback()
+                current = await self._db.scalar(
+                    select(ArtifactExport).where(
+                        ArtifactExport.artifact_version_id == artifact_version_id,
+                        ArtifactExport.template_version == template_version,
+                    )
+                )
+                committed = (
+                    current is not None
+                    and current.status == "ready"
+                    and current.storage_key == storage_key
+                    and current.claim_token == claim_token
+                )
+                if committed:
+                    await self._db.commit()  # 已生效：文件保留，他人可复用。
+                else:
+                    # 未生效：清理自己的文件（mark_failed 仍带 token fence，
+                    # 丢失租约的 owner 不能更新缓存行）。
+                    await asyncio.to_thread(self._delete_file, path)
+                    await self._mark_failed(
+                        artifact_version_id,
+                        template_version,
+                        error_code="export_cancelled",
+                        claim_token=claim_token,
+                    )
+                raise
             except Exception:
                 # 文件已写但 DB 更新失败：清理孤儿文件，标记 failed（可恢复）。
                 await asyncio.to_thread(self._delete_file, path)

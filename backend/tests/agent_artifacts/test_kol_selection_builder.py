@@ -734,3 +734,161 @@ async def test_real_datatap_three_quotes_price_efficiency_and_order() -> None:
     # 效果相近时最低报价（最高性价比）价值总分最高 → 排第一。
     assert items[0]["kol_uid"] == "a"
     assert items[0]["score_snapshot"]["value_score"] > items[2]["score_snapshot"]["value_score"]
+
+
+# ---------------------------------------------------------------------------
+# Gate C 第三轮：KOL 精确 lineage
+#
+# lineage 只引用实际选中的输入（不再通过静态候选列表登记所有可能来源）：
+# average_interactions 引用 avg_engagement（优先）否则 engagement_total；
+# interaction_follower_ratio 引用实际选中的互动输入 + followers；
+# active_follower_rate 直接存在引用 rate，否则引用 active_follower_count +
+# followers；sources 按 evidence_id + source_path 去重保序；派生比例的
+# derivation.input_paths 覆盖实际分子和分母。
+# ---------------------------------------------------------------------------
+
+
+def _ref_for(build, artifact_path: str) -> dict[str, Any]:
+    refs = [ref for ref in build.evidence_refs if ref["artifact_path"] == artifact_path]
+    assert len(refs) == 1, artifact_path
+    return refs[0]
+
+
+def _source_paths(ref: dict[str, Any]) -> list[str]:
+    return [s["source_path"] for s in ref["sources"]]
+
+
+async def _db_context(db_session, user_factory, session_factory, run_factory) -> ToolContext:
+    """真实 db 链：让 rank_kols 调用落库，derivation.tool_call_id 非 None。"""
+    user = await user_factory()
+    session = await session_factory(user.id)
+    run = await run_factory(session.id, user.id)
+    _, _, step = await _make_chain(db_session, user.id)
+    return ToolContext(
+        user_id=user.id,
+        session_id=session.id,
+        run_id=run.id,
+        profile_name="session_analyst_v1",
+        step_id=step.id,
+    )
+
+
+async def test_lineage_average_interactions_prefers_avg_engagement(
+    db_session, user_factory, session_factory, run_factory,
+) -> None:
+    """行同时有 avg_engagement 与 engagement_total：average_interactions 只引用
+    avg_engagement，不得把 engagement_total 一起列上（静态候选列表已废除）。"""
+    rows = [
+        {
+            "kol_uid": "u1", "platform": "xiaohongshu", "nickname": "达人1",
+            "followers": 100_000, "avg_engagement": 200.0, "engagement_total": 300,
+            "active_followers": 50_000, "active_follower_rate": 50.0,
+        }
+    ]
+    ctx = await _db_context(db_session, user_factory, session_factory, run_factory)
+    build = await build_kol_selection_draft(
+        scope=SCOPE, evidence_id="ev-1", items=rows, context=ctx, db=db_session
+    )
+    assert build.rank_kols_call_id is not None
+    ref = _ref_for(
+        build, "/data/items/0/score_snapshot/dimensions/average_interactions/raw_score"
+    )
+    assert _source_paths(ref) == ["/0/avg_engagement"]
+    # 派生比例的分子只引用实际选中的互动输入，分母是 followers。
+    ratio_ref = _ref_for(
+        build, "/data/items/0/score_snapshot/dimensions/engagement_follower_ratio/raw_score"
+    )
+    assert _source_paths(ratio_ref) == ["/0/avg_engagement", "/0/followers"]
+    # derivation.input_paths 覆盖实际分子和分母，不是单个代表路径。
+    assert ratio_ref["derivation"]["input_paths"] == ["/0/avg_engagement", "/0/followers"]
+
+
+async def test_lineage_hot_user_interaction_total_as_source(
+    db_session, user_factory, session_factory, run_factory,
+) -> None:
+    """hot_user 行只有「互动数」（无平均互动）：average_interactions 引用互动数；
+    interaction_follower_ratio 引用互动数 + 粉丝数。"""
+    rows = [
+        {"用户id": "u2", "用户昵称": "达人2", "平台": "短视频", "粉丝数": 100_000, "互动数": 5_000}
+    ]
+    ctx = await _db_context(db_session, user_factory, session_factory, run_factory)
+    build = await build_kol_selection_draft(
+        scope=SCOPE, evidence_id="ev-hot", items=rows, context=ctx, db=db_session
+    )
+    assert build.rank_kols_call_id is not None
+    avg_ref = _ref_for(
+        build, "/data/items/0/score_snapshot/dimensions/average_interactions/raw_score"
+    )
+    assert _source_paths(avg_ref) == ["/0/互动数"]
+    ratio_ref = _ref_for(
+        build, "/data/items/0/score_snapshot/dimensions/engagement_follower_ratio/raw_score"
+    )
+    assert _source_paths(ratio_ref) == ["/0/互动数", "/0/粉丝数"]
+    assert ratio_ref["derivation"]["input_paths"] == ["/0/互动数", "/0/粉丝数"]
+
+
+async def test_lineage_active_follower_rate_falls_back_to_count_and_followers(
+    db_session, user_factory, session_factory, run_factory,
+) -> None:
+    """无「有效粉丝率」但有「有效粉丝数」：active_follower 维度引用
+    有效粉丝数 + 粉丝数（评分器由 count/followers 推导 rate）。"""
+    rows = [
+        {
+            "账号ID (kwUid)": "u3", "平台": "xiaohongshu", "昵称": "达人3",
+            "粉丝数": 100_000, "互动数": 3_000, "有效粉丝数": 60_000,
+        }
+    ]
+    ctx = await _db_context(db_session, user_factory, session_factory, run_factory)
+    build = await build_kol_selection_draft(
+        scope=SCOPE, evidence_id="ev-1", items=rows, context=ctx, db=db_session
+    )
+    assert build.rank_kols_call_id is not None
+    active_ref = _ref_for(
+        build, "/data/items/0/score_snapshot/dimensions/active_follower/raw_score"
+    )
+    assert _source_paths(active_ref) == ["/0/有效粉丝数", "/0/粉丝数"]
+    assert active_ref["derivation"]["input_paths"] == ["/0/有效粉丝数", "/0/粉丝数"]
+
+
+async def test_lineage_active_follower_rate_direct_reference(
+    db_session, user_factory, session_factory, run_factory,
+) -> None:
+    """「有效粉丝率」直接存在：active_follower 维度只引用 rate，不引用 count。"""
+    rows = [
+        {
+            "账号ID (kwUid)": "u4", "平台": "xiaohongshu", "昵称": "达人4",
+            "粉丝数": 100_000, "互动数": 3_000, "有效粉丝数": 60_000,
+            "有效粉丝率": 0.6,
+        }
+    ]
+    ctx = await _db_context(db_session, user_factory, session_factory, run_factory)
+    build = await build_kol_selection_draft(
+        scope=SCOPE, evidence_id="ev-1", items=rows, context=ctx, db=db_session
+    )
+    assert build.rank_kols_call_id is not None
+    active_ref = _ref_for(
+        build, "/data/items/0/score_snapshot/dimensions/active_follower/raw_score"
+    )
+    assert _source_paths(active_ref) == ["/0/有效粉丝率"]
+
+
+async def test_lineage_sources_dedup_preserves_order(
+    db_session, user_factory, session_factory, run_factory,
+) -> None:
+    """sources 按 evidence_id + source_path 去重保序（同一原始键不重复登记）。"""
+    rows = [
+        {
+            "kol_uid": "u5", "platform": "xiaohongshu", "nickname": "达人5",
+            "followers": 100_000, "avg_engagement": 200.0, "engagement_total": 200,
+        }
+    ]
+    ctx = await _db_context(db_session, user_factory, session_factory, run_factory)
+    build = await build_kol_selection_draft(
+        scope=SCOPE, evidence_id="ev-1", items=rows, context=ctx, db=db_session
+    )
+    ratio_ref = _ref_for(
+        build, "/data/items/0/score_snapshot/dimensions/engagement_follower_ratio/raw_score"
+    )
+    paths = _source_paths(ratio_ref)
+    assert len(paths) == len(set(paths))
+    assert paths == ["/0/avg_engagement", "/0/followers"]
