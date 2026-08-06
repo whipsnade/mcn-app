@@ -19,7 +19,18 @@ from datetime import datetime
 from typing import Annotated, Any
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    UploadFile,
+    status,
+)
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import func, select
@@ -33,6 +44,7 @@ from app.agent_runtime.models import (
     AgentMessage,
     AgentRun,
     AgentSession,
+    AgentUpload,
     EvidenceItem,
     MemoryEntry,
 )
@@ -40,6 +52,7 @@ from app.agent_runtime.repository import AgentRunRepository, utc_now
 from app.agent_runtime.sse import sse_event_chunks
 from app.agent_runtime.state import InvalidRunTransition, RunStatus
 from app.agent_runtime.tools.factory import load_channel_permissions
+from app.agent_runtime.uploads import UploadRejectedError, UploadService
 from app.agent_runtime.utility import UtilityDispatcher
 from app.core.config import get_settings
 from app.db.session import get_db
@@ -136,6 +149,20 @@ class AgentMessageCreate(BaseModel):
     parent_run_id: str | None = None
     # 用户确认引用的已发布 Artifact Version（§5.4 历史复用），最多 10 个。
     artifact_version_ids: tuple[str, ...] = Field(default_factory=tuple, max_length=10)
+    # 用户确认引用的本 Session 已解析上传（upload Evidence），最多 10 个。
+    upload_ids: tuple[str, ...] = Field(default_factory=tuple, max_length=10)
+
+
+class UploadRead(BaseModel):
+    id: str
+    original_filename: str
+    mime_type: str
+    size_bytes: int
+    sha256: str
+    status: str
+    error_code: str | None = None
+    created_at: datetime
+    completed_at: datetime | None = None
 
 
 class MessageRunResponse(BaseModel):
@@ -180,6 +207,13 @@ def get_utility_dispatcher(request: Request) -> UtilityDispatcher | None:
     return getattr(request.app.state, "agent_utility_dispatcher", None)
 
 
+def get_upload_service(
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> UploadService:
+    """绑定请求会话的 UploadService；测试可覆写注入临时存储目录。"""
+    return UploadService(db)
+
+
 async def get_kol_detail_service(
     db: Annotated[AsyncSession, Depends(get_db)],
     request: Request,
@@ -209,10 +243,11 @@ def _content_hash(
     content: str,
     parent_run_id: str | None,
     artifact_version_ids: tuple[str, ...],
+    upload_ids: tuple[str, ...],
 ) -> str:
-    """幂等 payload 哈希：文本 + 父 Run + 引用的 Artifact Version（排序）。
+    """幂等 payload 哈希：文本 + 父 Run + 引用的 Artifact Version + 上传（排序）。
 
-    只哈希文本会让「相同文本切换报告版本/父 Run」复用错误 Run（Gate A
+    只哈希文本会让「相同文本切换报告版本/父 Run/上传」复用错误 Run（Gate A
     审查修复）；引用顺序不影响同一逻辑 payload，排序后哈希。
     """
     canonical = json.dumps(
@@ -221,6 +256,7 @@ def _content_hash(
             "parent_run_id": parent_run_id,
             # 去重 + 排序：重复/乱序引用是同一逻辑 payload，幂等哈希应一致。
             "artifact_version_ids": sorted(set(artifact_version_ids)),
+            "upload_ids": sorted(set(upload_ids)),
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -350,6 +386,31 @@ async def _validate_artifact_version_ids(
         if row is None:
             raise _not_found("artifact_version_not_found")
         validated.append(version_id)
+    return validated
+
+
+async def _validate_upload_ids(
+    db: AsyncSession, user_id: str, session_id: str, upload_ids: tuple[str, ...]
+) -> list[str]:
+    """校验引用的上传属当前用户且属于本 Session、状态为 parsed（Gate B）。
+
+    归属失败统一 404（不泄漏存在性）；未 parsed 视为不可用同样 404。按入参
+    顺序去重后返回。未被本轮引用的 Session 上传不会混入模型上下文。
+    """
+    if not upload_ids:
+        return []
+    rows = await db.scalars(
+        select(AgentUpload).where(AgentUpload.id.in_(tuple(dict.fromkeys(upload_ids))))
+    )
+    by_id = {row.id: row for row in rows}
+    validated: list[str] = []
+    for upload_id in dict.fromkeys(upload_ids):
+        upload = by_id.get(upload_id)
+        if upload is None or upload.user_id != user_id or upload.session_id != session_id:
+            raise _not_found("upload_not_found")
+        if upload.status != "parsed":
+            raise _not_found("upload_not_available")
+        validated.append(upload_id)
     return validated
 
 
@@ -502,6 +563,71 @@ async def delete_session(
 
 
 # --------------------------------------------------------------------------- #
+# 上传：POST 解析为 upload Evidence；GET 归属读取（Gate B Task 3）
+# --------------------------------------------------------------------------- #
+
+
+@router.post("/sessions/{session_id}/uploads", response_model=UploadRead, status_code=201)
+async def create_upload(
+    session_id: str,
+    user: CurrentUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    uploads: Annotated[UploadService, Depends(get_upload_service)],
+    file: UploadFile = File(...),
+) -> UploadRead:
+    await _get_owned_session(db, user.id, session_id)
+    content = await file.read()
+    try:
+        upload = await uploads.create_and_parse(
+            user_id=user.id,
+            session_id=session_id,
+            filename=file.filename or "upload",
+            mime_type=file.content_type or "",
+            content=content,
+        )
+    except UploadRejectedError as error:
+        raise HTTPException(
+            status_code=error.status_code,
+            detail=error.error_code,
+        ) from error
+    await db.commit()
+    return UploadRead(
+        id=upload.id,
+        original_filename=upload.original_filename,
+        mime_type=upload.mime_type,
+        size_bytes=upload.size_bytes,
+        sha256=upload.sha256,
+        status=upload.status,
+        error_code=upload.error_code,
+        created_at=upload.created_at,
+        completed_at=upload.completed_at,
+    )
+
+
+@router.get("/uploads/{upload_id}", response_model=UploadRead)
+async def get_upload(
+    upload_id: str,
+    user: CurrentUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    uploads: Annotated[UploadService, Depends(get_upload_service)],
+) -> UploadRead:
+    upload = await uploads.get_owned(user_id=user.id, upload_id=upload_id)
+    if upload is None:
+        raise _not_found("upload_not_found")
+    return UploadRead(
+        id=upload.id,
+        original_filename=upload.original_filename,
+        mime_type=upload.mime_type,
+        size_bytes=upload.size_bytes,
+        sha256=upload.sha256,
+        status=upload.status,
+        error_code=upload.error_code,
+        created_at=upload.created_at,
+        completed_at=upload.completed_at,
+    )
+
+
+# --------------------------------------------------------------------------- #
 # messages → Run
 # --------------------------------------------------------------------------- #
 
@@ -522,7 +648,12 @@ async def append_message(
     # 先 FOR UPDATE 锁住 Session 行（同 kol_detail working-head 锁），后续请求在
     # 前一个请求提交后才拿到锁，此时 active 检查能看到已提交的 Run → 409。
     await _get_owned_session(db, user.id, session_id, for_update=True)
-    content_hash = _content_hash(payload.content, payload.parent_run_id, payload.artifact_version_ids)
+    content_hash = _content_hash(
+        payload.content,
+        payload.parent_run_id,
+        payload.artifact_version_ids,
+        payload.upload_ids,
+    )
 
     # 幂等优先：同 key + 同 payload → 复用同一 Run；不同 payload → 409。
     if idempotency_key is not None:
@@ -543,10 +674,14 @@ async def append_message(
             )
 
     # 引用校验（建 Run 前）：父 Run 必须属本用户同 Session；Artifact Version
-    # 必须属本用户且已发布（跨 Session 可复用）；任何归属失败统一 404。
+    # 必须属本用户且已发布（跨 Session 可复用）；上传必须属本用户同 Session
+    # 且已解析；任何归属失败统一 404。
     parent_run_id = await _resolve_parent_run_id(db, user.id, session_id, payload.parent_run_id)
     artifact_version_ids = await _validate_artifact_version_ids(
         db, user.id, payload.artifact_version_ids
+    )
+    upload_ids = await _validate_upload_ids(
+        db, user.id, session_id, payload.upload_ids
     )
 
     # 活动并发：同一 Session 只允许一个活动 session_analyst_v1 Run。
@@ -612,6 +747,8 @@ async def append_message(
         snapshot["parent_run_id"] = parent_run_id
     if artifact_version_ids:
         snapshot["artifact_version_ids"] = artifact_version_ids
+    if upload_ids:
+        snapshot["upload_ids"] = upload_ids
     if snapshot:
         run.prompt_snapshot_json = snapshot
     db.add(run)

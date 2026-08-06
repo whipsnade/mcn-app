@@ -260,8 +260,9 @@ class EvidenceItem(Base):
     session_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("agent_sessions.id", ondelete="CASCADE"), nullable=False
     )
-    run_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("agent_runs.id", ondelete="CASCADE"), nullable=False
+    # 可空：upload Evidence 在 Run 创建前落库（迁移 0032）；MCP Evidence 必带。
+    run_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("agent_runs.id", ondelete="CASCADE"), nullable=True
     )
     tool_call_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("agent_tool_calls.id", ondelete="CASCADE"), nullable=True

@@ -142,8 +142,9 @@ class EvidenceWriter:
         self,
         *,
         session_id: str,
-        run_id: str,
-        tool_call_id: str,
+        run_id: str | None,
+        tool_call_id: str | None = None,
+        upload_id: str | None = None,
         source_type: str,
         source_name: str,
         scope_json: dict[str, Any] | None,
@@ -153,12 +154,16 @@ class EvidenceWriter:
         availability_status: str = "available",
         normalization: NormalizationResult | None = None,
     ) -> EvidenceItem:
+        # Evidence 必须且只能关联 tool_call_id 或 upload_id 之一（DB XOR 约束）。
+        if (tool_call_id is None) == (upload_id is None):
+            raise ValueError("exactly one of tool_call_id/upload_id is required")
         preview = build_preview(raw_payload)
         item = EvidenceItem(
             id=str(uuid4()),
             session_id=session_id,
             run_id=run_id,
             tool_call_id=tool_call_id,
+            upload_id=upload_id,
             source_type=source_type,
             source_name=source_name,
             scope_json=scope_json,

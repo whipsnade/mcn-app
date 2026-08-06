@@ -1551,3 +1551,141 @@ async def test_retry_rejects_non_session_analyst_profile(
         )
     ).all()
     assert children == []
+
+
+# ---------------------------------------------------------------------------
+# messages upload_ids：引用本 Session 的 parsed 上传，写入 Run 快照
+# ---------------------------------------------------------------------------
+
+
+async def _seed_upload(
+    db_session, user_id: str, session_id: str, *, status: str = "parsed"
+) -> str:
+    from app.agent_runtime.models import AgentUpload
+
+    upload = AgentUpload(
+        id=str(uuid4()),
+        user_id=user_id,
+        session_id=session_id,
+        original_filename="投放数据.csv",
+        mime_type="text/csv",
+        size_bytes=100,
+        sha256="b" * 64,
+        storage_key=f"{user_id}/{uuid4()}.csv",
+        status=status,
+        created_at=utc_now(),
+        completed_at=utc_now() if status == "parsed" else None,
+    )
+    db_session.add(upload)
+    await db_session.flush()
+    return upload.id
+
+
+async def test_message_with_upload_ids_writes_snapshot(
+    agent_client_factory, db_session
+) -> None:
+    alice, _ = await agent_client_factory("13600000101")
+    session_id = await _create_session(alice)
+    user_id = await _me_id(alice)
+    upload_id = await _seed_upload(db_session, user_id, session_id)
+
+    resp = await alice.post(
+        f"/api/v1/agent/sessions/{session_id}/messages",
+        json={"content": "分析这份投放数据", "upload_ids": [upload_id]},
+    )
+    assert resp.status_code == 201, resp.text
+    run = await db_session.get(AgentRun, resp.json()["run_id"])
+    assert run is not None
+    assert (run.prompt_snapshot_json or {}).get("upload_ids") == [upload_id]
+
+
+async def test_message_upload_ids_must_belong_to_session(
+    agent_client_factory, db_session
+) -> None:
+    alice, _ = await agent_client_factory("13600000102")
+    bob, _ = await agent_client_factory("13600000103")
+    session_a = await _create_session(alice)
+    session_b = await _create_session(bob)
+    user_a = await _me_id(alice)
+    user_b = await _me_id(bob)
+
+    # 跨用户：B 的 upload 引用进 A 的消息 → 404（归属失败不泄漏）。
+    upload_b = await _seed_upload(db_session, user_b, session_b)
+    resp = await alice.post(
+        f"/api/v1/agent/sessions/{session_a}/messages",
+        json={"content": "分析", "upload_ids": [upload_b]},
+    )
+    assert resp.status_code == 404, resp.text
+
+    # 跨 Session：A 自己的 upload 引用进 B 的 Session → 404。
+    upload_a = await _seed_upload(db_session, user_a, session_a)
+    resp = await bob.post(
+        f"/api/v1/agent/sessions/{session_b}/messages",
+        json={"content": "分析", "upload_ids": [upload_a]},
+    )
+    assert resp.status_code == 404, resp.text
+
+
+async def test_message_upload_ids_must_be_parsed(
+    agent_client_factory, db_session
+) -> None:
+    alice, _ = await agent_client_factory("13600000104")
+    session_id = await _create_session(alice)
+    user_id = await _me_id(alice)
+    upload_id = await _seed_upload(db_session, user_id, session_id, status="failed")
+
+    resp = await alice.post(
+        f"/api/v1/agent/sessions/{session_id}/messages",
+        json={"content": "分析", "upload_ids": [upload_id]},
+    )
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["detail"] == "upload_not_available"
+
+
+async def test_message_upload_ids_at_most_ten(agent_client_factory, db_session) -> None:
+    alice, _ = await agent_client_factory("13600000105")
+    session_id = await _create_session(alice)
+    user_id = await _me_id(alice)
+    upload_ids = [
+        await _seed_upload(db_session, user_id, session_id) for _ in range(11)
+    ]
+
+    resp = await alice.post(
+        f"/api/v1/agent/sessions/{session_id}/messages",
+        json={"content": "分析", "upload_ids": upload_ids},
+    )
+    assert resp.status_code == 422, resp.text
+
+
+async def test_message_upload_ids_participate_in_idempotency_hash(
+    agent_client_factory, db_session
+) -> None:
+    """幂等哈希包含 upload_ids：同文本不同上传不误复用同一 Run（Gate A 教训）。"""
+    alice, _ = await agent_client_factory("13600000106")
+    session_id = await _create_session(alice)
+    user_id = await _me_id(alice)
+    upload_a = await _seed_upload(db_session, user_id, session_id)
+    upload_b = await _seed_upload(db_session, user_id, session_id)
+
+    first = await alice.post(
+        f"/api/v1/agent/sessions/{session_id}/messages",
+        json={"content": "分析这份数据", "upload_ids": [upload_a]},
+        headers={"Idempotency-Key": "same-key"},
+    )
+    assert first.status_code == 201, first.text
+    # 同 key 同 payload → 复用；同 key 不同 upload_ids → 409 payload mismatch。
+    reused = await alice.post(
+        f"/api/v1/agent/sessions/{session_id}/messages",
+        json={"content": "分析这份数据", "upload_ids": [upload_a]},
+        headers={"Idempotency-Key": "same-key"},
+    )
+    assert reused.status_code == 201
+    assert reused.json()["reused"] is True
+
+    conflict = await alice.post(
+        f"/api/v1/agent/sessions/{session_id}/messages",
+        json={"content": "分析这份数据", "upload_ids": [upload_b]},
+        headers={"Idempotency-Key": "same-key"},
+    )
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"] == "idempotency_payload_mismatch"

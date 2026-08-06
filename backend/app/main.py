@@ -1,6 +1,7 @@
 import os
 from collections.abc import Callable, Iterable
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -157,6 +158,8 @@ def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         await refresh_approved_datatap_tools()
+        # 上传存储目录（Gate B）：服务启动即确保目录存在（路径由服务生成）。
+        Path(settings.agent_upload_storage_dir).mkdir(parents=True, exist_ok=True)
         app.state.agent_executor = agent_executor
         app.state.agent_recovery = agent_recovery
         app.state.agent_event_broker = agent_broker
