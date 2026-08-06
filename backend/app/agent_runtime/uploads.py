@@ -18,6 +18,7 @@ import csv
 import hashlib
 import io
 import logging
+import xml.etree.ElementTree as ElementTree
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -90,11 +91,13 @@ def _parse_xlsx(content: bytes, *, max_rows: int) -> tuple[list[str], list[dict[
         total_uncompressed = 0
         for info in infos:
             name = info.filename
-            if "vbaProject" in name:
+            # ZIP 部件名比较一律 casefold（宏部件/外部链接目录名大小写不敏感）。
+            folded = name.casefold()
+            if "vbaproject" in folded:
                 raise UploadRejectedError(
                     status_code=415, error_code="macro_detected", message="file contains macro parts"
                 )
-            if name.startswith("xl/externalLinks/") or name.startswith("xl/worksheets/_rels/"):
+            if folded.startswith("xl/externallinks/"):
                 raise UploadRejectedError(
                     status_code=415, error_code="external_links_detected",
                     message="file contains external links",
@@ -122,18 +125,35 @@ def _parse_xlsx(content: bytes, *, max_rows: int) -> tuple[list[str], list[dict[
                     status_code=400, error_code="zip_total_too_large",
                     message=f"total uncompressed size exceeds {_MAX_TOTAL_UNCOMPRESSED} bytes",
                 )
-        # .rels 中 TargetMode="External" 拒绝（外部引用）
+        # 所有 .rels 用 XML 解析，仅当 Relationship 的 TargetMode == "external"
+        # 才拒绝。xl/worksheets/_rels/ 下的 worksheet→drawing/chart 等是合法
+        # 内部关系，必须接受；字符串搜索（如 'TargetMode="External"'）会被单
+        # 引号、属性顺序与空白绕过，故用 XML 解析遍历 Relationship 节点。
         for info in infos:
-            if info.filename.endswith(".rels"):
-                try:
-                    rels = zf.read(info.filename).decode("utf-8", errors="ignore")
-                    if "TargetMode=\"External\"" in rels:
-                        raise UploadRejectedError(
-                            status_code=415, error_code="external_links_detected",
-                            message="file contains external relationships",
-                        )
-                except KeyError:
+            if not info.filename.casefold().endswith(".rels"):
+                continue
+            try:
+                rels_bytes = zf.read(info.filename)
+            except KeyError:
+                continue
+            try:
+                root = ElementTree.fromstring(rels_bytes)
+            except ElementTree.ParseError:
+                raise UploadRejectedError(
+                    status_code=415, error_code="invalid_relationships_xml",
+                    message="file contains invalid relationships XML",
+                )
+            for relationship in root.iter():
+                # Relationship 元素带默认命名空间（tag 形如 {ns}Relationship），
+                # 按本地名匹配，避免命名空间差异导致漏检。
+                if relationship.tag.rsplit("}", 1)[-1] != "Relationship":
                     continue
+                target_mode = relationship.attrib.get("TargetMode", "").casefold()
+                if target_mode == "external":
+                    raise UploadRejectedError(
+                        status_code=415, error_code="external_links_detected",
+                        message="file contains external relationships",
+                    )
     workbook = load_workbook(
         io.BytesIO(content),
         read_only=True,

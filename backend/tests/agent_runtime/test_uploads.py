@@ -8,14 +8,18 @@ NULL、upload_id 有值）；xlsm/未知扩展名 415；超 20 MiB 413；超 50,
 from __future__ import annotations
 
 import io
+import zipfile
 from datetime import UTC, datetime
+from pathlib import Path
 from uuid import uuid4
 
+import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import select
 
-from app.agent_runtime.models import EvidenceItem
+from app.agent_runtime.models import AgentUpload, EvidenceItem
+from app.agent_runtime.uploads import UploadRejectedError, _parse_xlsx
 from app.db.session import get_db
 from app.main import create_app
 
@@ -45,6 +49,49 @@ def _xlsx_bytes() -> bytes:
     buffer = io.BytesIO()
     workbook.save(buffer)
     return buffer.getvalue()
+
+
+def _with_rels(base: bytes, rels: dict[str, bytes]) -> bytes:
+    """在合法 xlsx 基础上新增/覆盖指定 ZIP 部件（用于构造 .rels 测试夹具）。"""
+    out = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(base)) as zin, zipfile.ZipFile(
+        out, "w", zipfile.ZIP_DEFLATED
+    ) as zout:
+        for info in zin.infolist():
+            zout.writestr(info, zin.read(info.filename))
+        for name, content in rels.items():
+            zout.writestr(name, content)
+    return out.getvalue()
+
+
+def _repack_with_override(base: bytes, path: str, content: bytes) -> bytes:
+    """把 zip 中某个条目替换为 content（同名覆盖）。"""
+    out = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(base)) as zin, zipfile.ZipFile(
+        out, "w", zipfile.ZIP_DEFLATED
+    ) as zout:
+        for info in zin.infolist():
+            if info.filename == path:
+                continue
+            zout.writestr(info, zin.read(info.filename))
+        zout.writestr(path, content)
+    return out.getvalue()
+
+
+# OOXML relationships 命名空间与合法内部 drawing 关系。
+_RELS_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+_INTERNAL_DRAWING_RELS = (
+    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+    f'<Relationships xmlns="{_RELS_NS}">'
+    '<Relationship Id="rId1" '
+    'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/drawing" '
+    'Target="../drawings/drawing1.xml"/>'
+    "</Relationships>"
+).encode("utf-8")
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[3]
 
 
 @pytest_asyncio.fixture
@@ -258,3 +305,138 @@ async def test_get_upload_owned(upload_client, db_session) -> None:
     assert fetched.status_code == 200, fetched.text
     assert fetched.json()["id"] == upload_id
     assert fetched.json()["status"] == "parsed"
+
+
+# ---------------------------------------------------------------------------
+# P1-1: XLSX 合法内部关系不被误判（XML 解析 TargetMode=external 才拒绝）
+# ---------------------------------------------------------------------------
+
+
+def test_p1_brand_report_xlsx_is_accepted() -> None:
+    """仓库品牌模板含 charts/drawings 内部关系，必须能正常解析。"""
+    columns, rows = _parse_xlsx(
+        (_repo_root() / "brand_report.xlsx").read_bytes(), max_rows=10000
+    )
+    assert isinstance(columns, list)
+    assert isinstance(rows, list)
+    assert rows
+
+
+def test_p1_internal_drawing_relationship_is_accepted() -> None:
+    """worksheet→drawing 是合法内部关系（TargetMode 缺失），不得拒绝。"""
+    content = _with_rels(
+        _xlsx_bytes(),
+        {"xl/worksheets/_rels/sheet1.xml.rels": _INTERNAL_DRAWING_RELS},
+    )
+    columns, rows = _parse_xlsx(content, max_rows=100)
+    assert rows
+
+
+@pytest.mark.parametrize(
+    "rels_xml",
+    [
+        # 双引号 external
+        (
+            '<?xml version="1.0"?>'
+            f'<Relationships xmlns="{_RELS_NS}">'
+            '<Relationship Id="r1" '
+            'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink" '
+            'Target="https://example.com" TargetMode="External"/>'
+            "</Relationships>"
+        ),
+        # 单引号 external（字符串搜索会被绕过）
+        (
+            "<?xml version=\"1.0\"?>"
+            f"<Relationships xmlns=\"{_RELS_NS}\">"
+            "<Relationship Id=\"r1\" "
+            "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink\" "
+            "Target=\"https://example.com\" TargetMode='External'/>"
+            "</Relationships>"
+        ),
+        # 属性顺序变化（TargetMode 后置）仍被拒绝
+        (
+            "<?xml version=\"1.0\"?>"
+            f"<Relationships xmlns=\"{_RELS_NS}\">"
+            "<Relationship Id=\"r1\" Target=\"https://example.com\" "
+            "Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/hyperlink\" "
+            "TargetMode=\"external\"/>"
+            "</Relationships>"
+        ),
+    ],
+)
+def test_p1_external_relationship_is_rejected(rels_xml: str) -> None:
+    content = _with_rels(
+        _xlsx_bytes(),
+        {"xl/worksheets/_rels/sheet1.xml.rels": rels_xml.encode("utf-8")},
+    )
+    with pytest.raises(UploadRejectedError) as exc_info:
+        _parse_xlsx(content, max_rows=100)
+    assert exc_info.value.error_code == "external_links_detected"
+
+
+def test_p1_xl_external_links_directory_is_rejected() -> None:
+    """xl/externalLinks/ 目录存在即拒绝（外部引用部件）。"""
+    content = _with_rels(
+        _xlsx_bytes(),
+        {"xl/externalLinks/externalLink1.xml": b"<externalLink/>"},
+    )
+    with pytest.raises(UploadRejectedError) as exc_info:
+        _parse_xlsx(content, max_rows=100)
+    assert exc_info.value.error_code == "external_links_detected"
+
+
+def test_p1_macro_part_inside_xlsx_is_rejected() -> None:
+    """xlsx 内嵌 vbaProject 宏部件（即使扩展名不是 .xlsm）也必须拒绝。"""
+    content = _with_rels(_xlsx_bytes(), {"xl/vbaProject.bin": b"\x01\x02VBA"})
+    with pytest.raises(UploadRejectedError) as exc_info:
+        _parse_xlsx(content, max_rows=100)
+    assert exc_info.value.error_code == "macro_detected"
+
+
+def test_p1_invalid_relationships_xml_is_rejected() -> None:
+    """.rels 不是合法 XML 时按 invalid_relationships_xml 拒绝，不能忽略。"""
+    content = _with_rels(
+        _xlsx_bytes(),
+        {"xl/worksheets/_rels/sheet1.xml.rels": b"<Relationships><unclosed"},
+    )
+    with pytest.raises(UploadRejectedError) as exc_info:
+        _parse_xlsx(content, max_rows=100)
+    assert exc_info.value.error_code == "invalid_relationships_xml"
+
+
+async def test_p1_external_relationship_error_code_persisted(
+    upload_client, db_session
+) -> None:
+    """拒绝的外部引用 xlsx 上传后，失败记录的 error_code 正确持久化。"""
+    client, _app = await upload_client("13800000999")
+    session_id = await _create_session(client)
+    rels_xml = (
+        '<?xml version="1.0"?>'
+        f'<Relationships xmlns="{_RELS_NS}">'
+        '<Relationship Id="r1" Target="https://example.com" TargetMode="External"/>'
+        "</Relationships>"
+    )
+    content = _with_rels(
+        _xlsx_bytes(),
+        {"xl/worksheets/_rels/sheet1.xml.rels": rels_xml.encode("utf-8")},
+    )
+    response = await client.post(
+        f"/api/v1/agent/sessions/{session_id}/uploads",
+        files={
+            "file": (
+                "恶意.xlsx",
+                content,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        },
+    )
+    assert response.status_code == 415, response.text
+    assert response.json()["detail"] == "external_links_detected"
+    upload = await db_session.scalar(
+        select(AgentUpload)
+        .where(AgentUpload.session_id == session_id)
+        .order_by(AgentUpload.created_at.desc())
+    )
+    assert upload is not None
+    assert upload.status == "failed"
+    assert upload.error_code == "external_links_detected"
