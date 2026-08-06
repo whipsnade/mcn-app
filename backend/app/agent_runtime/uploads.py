@@ -181,24 +181,27 @@ def _parse_xlsx(content: bytes, *, max_rows: int) -> tuple[list[str], list[dict[
             )
         rows: list[dict[str, Any]] = []
         columns: list[str] = []
+        # 基于已验证的实际工作表宽度迭代，而非固定 1000 列（两列窄表不按每行
+        # 1000 个位置迭代）；dimension 缺失时退化为 1 列，保持有界。
+        effective_max_col = min(max(sheet.max_column or 1, 1), _MAX_XLSX_COLUMNS)
         # 即使 dimension 合法也显式传递迭代边界，不依赖工作簿自身声明的范围；
         # 空白行也计入迭代次数（max_row 上限），不能只统计非空数据行。
         for index, row in enumerate(
             sheet.iter_rows(
                 values_only=True,
                 max_row=max_rows + 1,
-                max_col=_MAX_XLSX_COLUMNS,
+                max_col=effective_max_col,
             )
         ):
             if row is None or all(cell is None for cell in row):
                 continue
             if index == 0:
-                # max_col 上限会把行填充到 _MAX_XLSX_COLUMNS 列；按工作表实际宽度
+                # max_col 上限会把行填充到 effective_max_col 列；按工作表实际宽度
                 # （sheet.max_column，缺失时回退到最后非空列）截断，保留原解析语义。
                 if sheet.max_column is not None and sheet.max_column > 0:
                     width = min(sheet.max_column, _MAX_XLSX_COLUMNS)
                 else:
-                    width = _MAX_XLSX_COLUMNS
+                    width = effective_max_col
                     for cell_index in range(len(row) - 1, -1, -1):
                         if row[cell_index] not in (None, ""):
                             width = cell_index + 1
