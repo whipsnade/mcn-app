@@ -233,6 +233,41 @@ Gate A 审查发现的 5 项必修 + 2 项次要问题，已在同一迁移/代�
 - **次要：remember_scope 校验来源消息**：`source_message_id` 必须存在、属本 Session
   且为 user 消息；空 values 拒绝。
 
+### 5.7 Gate B：Evidence 上传与归一化诊断（2026-08-06，迁移 0031/0032）
+
+上传、归一化诊断与结构化失败反馈已落地，切档后核对：
+
+- **用户上传**：`POST /api/v1/agent/sessions/{id}/uploads`（multipart），仅 `.csv` /
+  `.xlsx`（拒绝 `.xlsm` 等宏格式 415）；单文件 ≤ 20 MiB（413）、数据行 ≤ 50,000
+  （400 `rows_exceeded`）。文件按 SHA-256 命名存本地 `AGENT_UPLOAD_STORAGE_DIR`
+  （默认 `.data/agent-uploads`，服务启动自动创建），路径只由服务生成、绝不拼接
+  用户文件名；上传行落 `agent_uploads`（不可变元数据），解析结果写 upload
+  Evidence（`source_type=user_upload`、`tool_call_id` 为 NULL、`upload_id` 有值，
+  `evidence_items` XOR 约束保证二者必居其一；upload Evidence 的 `run_id` 为 NULL，
+  迁移 0032 将其改可空）。
+- **上传目录运维**：目录属应用私有数据，须纳入备份（含 sha256 与
+  `agent_uploads` 行一致核对）；删除文件时同步删除对应 `agent_uploads` 行与
+  upload Evidence（当前无删除端点，仅备份/清理指引）。
+- **消息引用上传**：`POST .../messages` 的 `upload_ids`（≤ 10）必须属当前用户 +
+  当前 Session 且状态 `parsed`，否则 404（`upload_not_found` /
+  `upload_not_available`）；引用写入 Run `prompt_snapshot_json.upload_ids` 并参与
+  幂等哈希；未被引用的 Session 上传不混入模型上下文。
+- **归一化诊断**：DataTap 成功 payload 的字段映射（`NormalizationRegistry`）随
+  Evidence 落库（`normalization_status` / `field_mapping_json` /
+  `unmapped_fields_json` / `truncated`）；时间键统一 `TIME_KEYS`（含「日」「周」），
+  DataTap 返回日/周列时不丢数据；未识别业务字段是 `incomplete` 诊断而非无 Evidence。
+- **MCP 结构化失败反馈**：所有失败/空结果回喂 `ToolFailureFeedback` JSON
+  （`error_type` / `points_state` / `same_fingerprint_retry_allowed` /
+  `suggested_actions` 等），并持久化到 `agent_tool_calls.safe_error_message`；
+  `definitely_not_sent` 同参数只允许重试一次（幂等回放 failed 行时
+  `same_fingerprint_retry_allowed=false`）；`result_unknown` 保持预留并等待恢复
+  核对（禁止自动重放）；崩溃恢复（Transcript）回放同一结构化反馈。
+- **Lineage 冻结**：`FrozenEvidenceSource` 快照新增 `tool_call_id`（MCP）与
+  `upload_id` / `upload_sha256` / `upload_filename` / `uploaded_at`（上传）字段，
+  已发布 Version 可追溯到源文件哈希。
+- **归一化配置**：`AGENT_UPLOAD_STORAGE_DIR` / `AGENT_UPLOAD_MAX_BYTES` /
+  `AGENT_UPLOAD_MAX_ROWS`（`.env.example` 已同步）。
+
 ## 6. 参考
 
 - 真实 UAT 记录与账本验证：`docs/qa/2026-08-02-agent-runtime-uat.md`（结构化结果
