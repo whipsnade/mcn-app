@@ -30,6 +30,7 @@ from app.agent_runtime.models import (
     AgentToolCall,
     MemoryEntry,
 )
+from app.agent_runtime.repository import utc_now
 from app.agent_runtime.tools.contracts import ToolContext
 from app.agent_runtime.tools.history import (
     FORBIDDEN,
@@ -710,7 +711,7 @@ async def test_search_evidence_does_not_load_raw_payload_columns(db_session, use
         tool = SearchEvidenceTool(db_session)
         result = await tool.execute(context, type(tool).input_model(query="美妆"))
         assert result.status == "success"
-        assert json.loads(result.safe_summary)["total_matches"] == 1
+        assert json.loads(result.safe_summary)["returned_matches"] == 1
     finally:
         event.remove(engine.sync_engine, "before_execute", _capture)
 
@@ -756,7 +757,7 @@ async def test_search_evidence_bounds_preview_not_full_5000_rows(
     tool = SearchEvidenceTool(db_session)
     result = await tool.execute(context, type(tool).input_model(query="美妆0"))
     data = _summary(result)
-    assert data["total_matches"] >= 1
+    assert data["returned_matches"] >= 1
     view = data["matches"][0]["view"]
     # 归一化 preview 只有 200 行（_MAX_MODEL_ARRAY_ROWS），绝不含 5000 行。
     assert len(view["preview"]["rows"]) <= 200
@@ -1201,13 +1202,13 @@ async def test_search_evidence_total_budget_limits_large_views(db_session, user_
     tool = SearchEvidenceTool(db_session)
     result = await tool.execute(context, type(tool).input_model(query=""))
     data = _summary(result)
-    assert data["total_matches"] == 25
     # 与真实响应同构（ensure_ascii=False）测量总字符。
     assert len(json.dumps(data, ensure_ascii=False)) <= _MAX_TOOL_RESULT_TOTAL_CHARS
     # 匹配上限 20：返回 20 个（完整 view 放不下的退化为最小 match），其余标记 has_more。
     assert data["returned_matches"] == 20
     assert data["has_more"] is True
     assert data["truncated"] is True
+    assert data["scanned_count"] >= 20
     # 每个 match 都有 evidence_id，模型可 read_tool_result 钻取。
     assert all(m.get("evidence_id") for m in data["matches"])
     json.loads(json.dumps(data, ensure_ascii=False))
@@ -1305,27 +1306,222 @@ async def test_search_evidence_long_query_structured_invalid(
     assert len(result.safe_summary) < 1000  # 不原样回显 60KB
 
 
-async def test_search_evidence_minimal_match_when_view_too_big(
+# ---------------------------------------------------------------------------
+# 阻断 1: search_evidence keyset 分页（超过 500 条的 Session 可继续搜索）
+# ---------------------------------------------------------------------------
+
+
+async def _seed_many_evidence(
+    db_session, session, run, call, count: int, *, target_index: int | None = None
+) -> str:
+    """写入 count 条 Evidence（collected_at 递增）；target_index 处 source_name 为
+    target_tool（其余 other_tool）。返回 target evidence_id 或 ""。"""
+    from datetime import timedelta
+
+    base = utc_now() - timedelta(days=count)
+    target_id = ""
+    for i in range(count):
+        source_name = "target_tool" if i == target_index else "other_tool"
+        item = await EvidenceWriter(db_session).write(
+            session_id=session.id,
+            run_id=run.id,
+            tool_call_id=call.id,
+            source_type="mcp",
+            source_name=source_name,
+            scope_json={"brand": "美妆"},
+            period_json=None,
+            raw_payload={"rows": [{"keyword": source_name, "volume": i}]},
+            collected_at=base + timedelta(minutes=i),
+        )
+        if i == target_index:
+            target_id = item.id
+    return target_id
+
+
+async def test_search_evidence_paginates_beyond_500(
     db_session, user_factory
 ) -> None:
-    """完整 view 放不下时返回含 evidence_id 的最小 match，模型仍可 read_tool_result。"""
+    """600 条 Evidence、目标只在第 501 条之后：第一页 returned=0 + has_more，
+    使用 next_cursor 后能找到目标。"""
     user = await user_factory()
     session, run, _step, call = await _make_chain(db_session, user.id)
-    evidence_id = await _make_evidence_with_diagnostics(
+    target_id = await _seed_many_evidence(db_session, session, run, call, 600, target_index=0)
+    assert target_id
+    context = ToolContext(user_id=user.id, session_id=session.id, run_id=run.id, profile_name="session_analyst_v1")
+    tool = SearchEvidenceTool(db_session)
+
+    first = _summary(await tool.execute(context, type(tool).input_model(query="target_tool")))
+    assert first["returned_matches"] == 0
+    assert first["has_more"] is True
+    assert first["next_cursor"] is not None
+    assert first["scanned_count"] == 500
+
+    second = _summary(await tool.execute(
+        context, type(tool).input_model(query="target_tool", cursor=first["next_cursor"])
+    ))
+    assert second["returned_matches"] == 1
+    assert second["matches"][0]["evidence_id"] == target_id
+    assert second["has_more"] is False
+
+
+async def test_search_evidence_paginates_all_600_no_loss(
+    db_session, user_factory
+) -> None:
+    """600 条全部匹配：逐页遍历覆盖全部，id 不丢不重，cursor 单调推进。"""
+    user = await user_factory()
+    session, run, _step, call = await _make_chain(db_session, user.id)
+    await _seed_many_evidence(db_session, session, run, call, 600)
+    context = ToolContext(user_id=user.id, session_id=session.id, run_id=run.id, profile_name="session_analyst_v1")
+    tool = SearchEvidenceTool(db_session)
+
+    all_ids: list[str] = []
+    cursor: str | None = None
+    pages = 0
+    while True:
+        args: dict = {"query": ""}
+        if cursor is not None:
+            args["cursor"] = cursor
+        data = _summary(await tool.execute(context, type(tool).input_model(**args)))
+        assert len(json.dumps(data, ensure_ascii=False)) <= _MAX_TOOL_RESULT_TOTAL_CHARS
+        all_ids.extend(m["evidence_id"] for m in data["matches"])
+        pages += 1
+        assert pages <= 200  # 防死循环
+        if data["next_cursor"] is None:
+            break
+        assert data["next_cursor"] != cursor  # cursor 单调推进
+        cursor = data["next_cursor"]
+    assert len(all_ids) == 600
+    assert len(set(all_ids)) == 600
+
+
+async def test_search_evidence_empty_page_has_more_and_advances(
+    db_session, user_factory
+) -> None:
+    """页面没有匹配但后面仍有数据：returned=0、has_more=true、cursor 仍推进。"""
+    user = await user_factory()
+    session, run, _step, call = await _make_chain(db_session, user.id)
+    await _seed_many_evidence(db_session, session, run, call, 600)
+    context = ToolContext(user_id=user.id, session_id=session.id, run_id=run.id, profile_name="session_analyst_v1")
+    tool = SearchEvidenceTool(db_session)
+
+    first = _summary(await tool.execute(context, type(tool).input_model(query="zzz-no-match")))
+    assert first["returned_matches"] == 0
+    assert first["has_more"] is True
+    assert first["next_cursor"] is not None
+
+    second = _summary(await tool.execute(
+        context, type(tool).input_model(query="zzz-no-match", cursor=first["next_cursor"])
+    ))
+    assert second["returned_matches"] == 0
+    assert second["has_more"] is False
+    assert second["next_cursor"] is None
+
+
+async def test_search_evidence_budget_stop_does_not_skip_matches(
+    db_session, user_factory
+) -> None:
+    """响应预算在某个 match 前耗尽：next_cursor 不能越过未返回 match，下一页能
+    返回该 match（逐页遍历 40 个中等 view 全部无丢失）。"""
+    user = await user_factory()
+    session, run, _step, call = await _make_chain(db_session, user.id)
+    for i in range(40):
+        payload = {"rows": [{"idx": j, "text": "x" * 100} for j in range(60)]}
+        await _make_evidence(db_session, session, run, call, raw_payload=payload, source_name=f"mid{i}")
+    context = ToolContext(user_id=user.id, session_id=session.id, run_id=run.id, profile_name="session_analyst_v1")
+    tool = SearchEvidenceTool(db_session)
+
+    all_ids: list[str] = []
+    cursor: str | None = None
+    pages = 0
+    first_returned: int | None = None
+    while True:
+        args: dict = {"query": ""}
+        if cursor is not None:
+            args["cursor"] = cursor
+        data = _summary(await tool.execute(context, type(tool).input_model(**args)))
+        assert len(json.dumps(data, ensure_ascii=False)) <= _MAX_TOOL_RESULT_TOTAL_CHARS
+        if first_returned is None:
+            first_returned = data["returned_matches"]
+        all_ids.extend(m["evidence_id"] for m in data["matches"])
+        pages += 1
+        assert pages <= 100
+        if data["next_cursor"] is None:
+            break
+        assert data["next_cursor"] != cursor
+        cursor = data["next_cursor"]
+    # 第一页受预算限制未返回全部，但遍历后 40 条全部出现且不重复。
+    assert first_returned is not None and first_returned < 40
+    assert len(all_ids) == 40
+    assert len(set(all_ids)) == 40
+
+
+async def test_search_evidence_minimal_match_marks_view_omitted(
+    db_session, user_factory
+) -> None:
+    """完整 view 降级为最小 stub：view_omitted=true、view_truncated=true、
+    truncated=true；has_more 只表示是否还有未扫描 Evidence。"""
+    from datetime import timedelta
+
+    user = await user_factory()
+    session, run, _step, call = await _make_chain(db_session, user.id)
+    huge_id = await _make_evidence_with_diagnostics(
         db_session, session, run, call,
         rows=[{"volume": i} for i in range(3)],
         mapping={f"col{i}": "x" * 900 for i in range(200)},
         unmapped=["x" * 900] * 300,
     )
+    # small 显式更新（collected_at 更晚 → DESC 顺序在前），让 huge 的完整 view
+    # 因预算放不下而退化为最小 stub。
+    small = await EvidenceWriter(db_session).write(
+        session_id=session.id,
+        run_id=run.id,
+        tool_call_id=call.id,
+        source_type="mcp",
+        source_name="query_analysis_data",
+        scope_json=None,
+        period_json=None,
+        raw_payload={"rows": [{"k": 1}]},
+        collected_at=utc_now() + timedelta(seconds=1),
+    )
+    small_id = small.id
     context = ToolContext(user_id=user.id, session_id=session.id, run_id=run.id, profile_name="session_analyst_v1")
     tool = SearchEvidenceTool(db_session)
-    result = await tool.execute(context, type(tool).input_model(query=""))
-    data = _summary(result)
-    assert data["total_matches"] == 1
+    data = _summary(await tool.execute(context, type(tool).input_model(query="")))
+    assert data["returned_matches"] == 2
+    matches_by_id = {m["evidence_id"]: m for m in data["matches"]}
+    # 小 view 完整返回；大 view 因预算降级为最小 stub。
+    assert "view" in matches_by_id[small_id]
+    huge = matches_by_id[huge_id]
+    assert huge["view_omitted"] is True
+    assert "view" not in huge
+    for key in ("evidence_id", "source_type", "source_name", "run_id", "collected_at"):
+        assert key in huge
+    assert data["view_truncated"] is True
+    assert data["truncated"] is True
+    assert data["has_more"] is False  # 只有 2 条，没有未扫描 Evidence
     assert len(json.dumps(data, ensure_ascii=False)) <= _MAX_TOOL_RESULT_TOTAL_CHARS
-    assert data["returned_matches"] >= 1
-    # 至少一个 match 含 evidence_id，可被 read_tool_result 使用。
-    assert any(m.get("evidence_id") == evidence_id for m in data["matches"])
-    assert data["has_more"] == (data["returned_matches"] < data["total_matches"])
-    assert data["truncated"] == data["has_more"]
-    json.loads(json.dumps(data, ensure_ascii=False))
+
+
+async def test_search_evidence_invalid_cursor_structured_failure(
+    db_session, user_factory
+) -> None:
+    """非法/超长 cursor：invalid_arguments，不抛 500，不泄露其他 Session 数据。"""
+    user = await user_factory()
+    session, run, _step, call = await _make_chain(db_session, user.id)
+    await _make_evidence(db_session, session, run, call, raw_payload={"rows": [{"k": 1}]})
+    context = ToolContext(user_id=user.id, session_id=session.id, run_id=run.id, profile_name="session_analyst_v1")
+    tool = SearchEvidenceTool(db_session)
+
+    for bad_cursor in ("garbage!!", "not-a-cursor", "x" * 500):
+        result = await tool.execute(context, {"query": "", "cursor": bad_cursor})
+        assert result.status == "failed"
+        assert result.error_type == INVALID_ARGUMENTS, bad_cursor
+
+    # 跨用户伪造 cursor：会话归属校验先于 cursor 解析，仍 404（不泄露存在性）。
+    other = await user_factory()
+    foreign = await tool.execute(
+        ToolContext(user_id=other.id, session_id=session.id, run_id="r", profile_name="session_analyst_v1"),
+        {"query": "", "cursor": "garbage"},
+    )
+    assert foreign.status == "failed"
+    assert foreign.error_type in (NOT_FOUND, FORBIDDEN)

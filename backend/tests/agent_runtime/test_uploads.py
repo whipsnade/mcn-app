@@ -630,8 +630,8 @@ def test_p2_many_row_narrow_table_parses_all_rows() -> None:
     assert rows[-1] == {"平台": "平台1999", "声量": 1999}
 
 
-def test_p2_no_dimension_huge_row_r_bounded(monkeypatch) -> None:
-    """dimension 缺失、row r 极大：迭代有界、不无限循环、不抛 CPU 异常。"""
+def test_p2_dimension_missing_huge_row_r_rejected() -> None:
+    """dimension 缺失、row r=1048576：快速返回 worksheet_dimensions_exceeded。"""
     sheet = (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
         f'<worksheet {_WORKSHEET_NS}><sheetData>'
@@ -639,5 +639,123 @@ def test_p2_no_dimension_huge_row_r_bounded(monkeypatch) -> None:
         '<row r="1048576"><c r="A1048576" t="inlineStr"><is><t>x</t></is></c></row>'
         "</sheetData></worksheet>"
     )
-    columns, rows = _parse_xlsx(_custom_xlsx(sheet), max_rows=10)
-    assert len(rows) <= 10  # 有界，不迭代到 1048576 行
+    with pytest.raises(UploadRejectedError) as exc_info:
+        _parse_xlsx(_custom_xlsx(sheet), max_rows=10)
+    assert exc_info.value.error_code == "worksheet_dimensions_exceeded"
+
+
+# ---------------------------------------------------------------------------
+# 阻断 2: worksheet 坐标预检（dimension 不再作为实际宽度唯一来源）
+# ---------------------------------------------------------------------------
+
+
+def _two_col_sheet(*, dimension: str | None = None, extra_rows: str = "") -> str:
+    """两列（A/B）工作表 XML；dimension 可选（可缺失或伪造为单列）。"""
+    dim = f'<dimension ref="{dimension}"/>' if dimension else ""
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<worksheet {_WORKSHEET_NS}>{dim}<sheetData>'
+        '<row r="1"><c r="A1" t="inlineStr"><is><t>A</t></is></c>'
+        '<c r="B1" t="inlineStr"><is><t>B</t></is></c></row>'
+        '<row r="2"><c r="A2"><v>1</v></c><c r="B2"><v>2</v></c></row>'
+        f"{extra_rows}"
+        "</sheetData></worksheet>"
+    )
+
+
+def test_p2_dimension_missing_keeps_both_columns() -> None:
+    """dimension 缺失、实际 A/B 两列：columns == [A, B]，数据含 A、B。"""
+    columns, rows = _parse_xlsx(_custom_xlsx(_two_col_sheet()), max_rows=50000)
+    assert columns == ["A", "B"]
+    assert rows == [{"A": 1, "B": 2}]
+
+
+def test_p2_forged_dimension_small_keeps_both_columns() -> None:
+    """dimension 伪造为 A1:A2、实际 A/B 两列：B 列不能丢失。"""
+    columns, rows = _parse_xlsx(_custom_xlsx(_two_col_sheet(dimension="A1:A2")), max_rows=50000)
+    assert columns == ["A", "B"]
+    assert rows == [{"A": 1, "B": 2}]
+
+
+def test_p2_forged_dimension_row_r_over_limit_rejected() -> None:
+    """dimension 伪造为 A1:A2，但真实 row r 超限：worksheet_dimensions_exceeded。"""
+    extra = '<row r="50002"><c r="A50002"><v>3</v></c></row>'
+    sheet = _two_col_sheet(dimension="A1:A2", extra_rows=extra)
+    with pytest.raises(UploadRejectedError) as exc_info:
+        _parse_xlsx(_custom_xlsx(sheet), max_rows=50000)
+    assert exc_info.value.error_code == "worksheet_dimensions_exceeded"
+
+
+def test_p2_forged_dimension_cell_xfd_rejected() -> None:
+    """dimension 伪造为 A1:A2，但真实 cell 为 XFD2：worksheet_columns_exceeded。"""
+    extra = '<row r="2"><c r="XFD2"><v>9</v></c></row>'
+    sheet = _two_col_sheet(dimension="A1:A2", extra_rows=extra)
+    with pytest.raises(UploadRejectedError) as exc_info:
+        _parse_xlsx(_custom_xlsx(sheet), max_rows=50000)
+    assert exc_info.value.error_code == "worksheet_columns_exceeded"
+
+
+def test_p2_invalid_cell_coordinate_rejected() -> None:
+    """非法 cell 坐标：invalid_worksheet_coordinate，不抛 500/未处理异常。"""
+    sheet = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<worksheet {_WORKSHEET_NS}><sheetData>'
+        '<row r="1"><c r="A1" t="inlineStr"><is><t>A</t></is></c>'
+        '<c r="B2X"><v>9</v></c></row>'
+        "</sheetData></worksheet>"
+    )
+    with pytest.raises(UploadRejectedError) as exc_info:
+        _parse_xlsx(_custom_xlsx(sheet), max_rows=50000)
+    assert exc_info.value.error_code == "invalid_worksheet_coordinate"
+
+
+def test_p2_invalid_row_coordinate_rejected() -> None:
+    """非法 row 坐标：invalid_worksheet_coordinate。"""
+    sheet = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<worksheet {_WORKSHEET_NS}><sheetData>'
+        '<row r="abc"><c r="A1"><v>1</v></c></row>'
+        "</sheetData></worksheet>"
+    )
+    with pytest.raises(UploadRejectedError) as exc_info:
+        _parse_xlsx(_custom_xlsx(sheet), max_rows=50000)
+    assert exc_info.value.error_code == "invalid_worksheet_coordinate"
+
+
+def test_p2_two_column_many_rows_uses_actual_width(monkeypatch) -> None:
+    """两列 × 多行窄表：iter_rows 的 max_col 为 2，所有数据正常解析。"""
+    from openpyxl.worksheet._read_only import ReadOnlyWorksheet
+
+    captured: list[int | None] = []
+    original = ReadOnlyWorksheet.iter_rows
+
+    def _spy(self, *args, **kwargs):
+        captured.append(kwargs.get("max_col"))
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(ReadOnlyWorksheet, "iter_rows", _spy)
+    sheet = _two_col_sheet(dimension="A1:A2") + ""  # 伪造单列 dimension
+    columns, rows = _parse_xlsx(_custom_xlsx(sheet), max_rows=50000)
+    assert captured
+    assert all(max_col == 2 for max_col in captured)
+    assert columns == ["A", "B"]
+    assert rows == [{"A": 1, "B": 2}]
+
+
+def test_p2_dimension_larger_than_actual_uses_actual_width(monkeypatch) -> None:
+    """dimension 比实际范围大但仍在限制内：使用 actual_max_column 避免空列迭代。"""
+    from openpyxl.worksheet._read_only import ReadOnlyWorksheet
+
+    captured: list[int | None] = []
+    original = ReadOnlyWorksheet.iter_rows
+
+    def _spy(self, *args, **kwargs):
+        captured.append(kwargs.get("max_col"))
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(ReadOnlyWorksheet, "iter_rows", _spy)
+    columns, rows = _parse_xlsx(_custom_xlsx(_two_col_sheet(dimension="A1:Z2")), max_rows=50000)
+    assert captured
+    assert all(max_col == 2 for max_col in captured)
+    assert columns == ["A", "B"]
+    assert rows == [{"A": 1, "B": 2}]
