@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Sequence
 
 from openpyxl.cell.cell import MergedCell
@@ -21,6 +22,21 @@ _PLATFORM_LABELS = {
     "weibo": "微博",
     "wechat": "微信",
 }
+
+@dataclass(frozen=True)
+class TableLayout:
+    """write_table 写出的小节版式：供图表引用真实数据行与后续小节级联定位。"""
+
+    title_row: int | None
+    header_row: int
+    data_start: int
+    data_end: int
+    next_row: int
+
+    @property
+    def has_data(self) -> bool:
+        return self.data_end >= self.data_start
+
 
 _DATA_FONT = Font(name="微软雅黑", size=10)
 _DATA_BORDER = Border(
@@ -94,29 +110,34 @@ def write_table(
     note: str | None = None,
     alternate_fill: bool = True,
     row_height: int | None = _DATA_ROW_HEIGHT,
-) -> int:
-    """写一个 [可选标题 + 表头 + 数据行] 小节，返回下一空行行号。
+) -> TableLayout:
+    """写一个 [可选标题 + 表头 + 数据行] 小节，返回 :class:`TableLayout`。
 
     空数据行保留标题与表头，并在数据区写受限/未采集说明；绝不伪造数据。
     Gate C 审核：动态数据行统一应用 font/border/alignment/交替填充与行高，
-    保证 Top20 等长名单样式一致。
+    保证 Top20 等长名单样式一致。返回的版式供图表引用真实表头/数据行，
+    以及后续小节按 ``next_row`` 级联定位（绝不手算行号造成重叠）。
     """
     row = start_row
+    title_row: int | None = None
     if title is not None:
+        title_row = row
         sheet.merge_cells(start_row=row, start_column=1, end_row=row, end_column=columns)
         title_cell = sheet.cell(row, 1)
         title_cell.value = title
         title_cell.font = Font(name="微软雅黑", bold=True, size=11, color="1F4E79")
         row += 1
+    header_row = row
     for column, header in enumerate(headers, start=1):
         header_cell = sheet.cell(row, column)
         header_cell.value = header
         header_cell.font = Font(name="微软雅黑", bold=True, size=10)
     row += 1
+    data_start = row
     if not rows:
         sheet.merge_cells(start_row=row, start_column=1, end_row=row, end_column=columns)
         sheet.cell(row, 1).value = note or MISSING
-        return row + 1
+        return TableLayout(title_row, header_row, data_start, data_start - 1, row + 1)
     for index, values in enumerate(rows):
         for column, value in enumerate(values, start=1):
             cell = sheet.cell(row, column)
@@ -136,7 +157,7 @@ def write_table(
         if row_height is not None:
             sheet.row_dimensions[row].height = row_height
         row += 1
-    return row
+    return TableLayout(title_row, header_row, data_start, row - 1, row)
 
 
 def _limitation_covers(limitation: Any, section: str) -> bool:

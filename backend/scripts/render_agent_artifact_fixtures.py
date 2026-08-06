@@ -116,20 +116,36 @@ def _check_workbook(name: str, content: bytes, expected_sheets: list[str], *, de
     return problems
 
 
+def _find_soffice() -> str | None:
+    for name in ("soffice", "libreoffice"):
+        path = shutil.which(name)
+        if path is not None:
+            return path
+    mac_default = Path("/Applications/LibreOffice.app/Contents/MacOS/soffice")
+    return str(mac_default) if mac_default.exists() else None
+
+
 def _render_pngs(workbook_path: Path, output_dir: Path) -> list[Path]:
-    """用 LibreOffice headless 把每个 Sheet 转 PNG；无 soffice 时跳过。"""
-    soffice = shutil.which("soffice") or shutil.which("libreoffice")
+    """用 LibreOffice headless 逐 Sheet 转 PNG（每 Sheet 一张，绝不重复首 Sheet）。
+
+    LibreOffice PNG 导出只绘制工作簿的第一个表，设置 active sheet 并不可靠；
+    因此为每个 Sheet 生成仅含该 Sheet 的单表工作簿再转换，物理保证每张 PNG
+    就是目标 Sheet。无 soffice 时跳过（结构核对仍完成）。
+    """
+    soffice = _find_soffice()
     if soffice is None:
         print("WARN: soffice 不可用，跳过 PNG 渲染（结构核对仍完成）")
         return []
     sheet_pngs: list[Path] = []
     wb = load_workbook(workbook_path, data_only=False)
-    for ws in wb.worksheets:
-        temp = output_dir / f"{workbook_path.stem}-{ws.title}.xlsx"
-        wb2 = load_workbook(workbook_path)
-        wb2.active = wb2.sheetnames.index(ws.title)
-        wb2.save(temp)
-        png = output_dir / f"{workbook_path.stem}-{ws.title}.png"
+    for title in wb.sheetnames:
+        single = load_workbook(workbook_path)
+        for other in list(single.sheetnames):
+            if other != title:
+                single.remove(single[other])
+        temp = output_dir / f"{workbook_path.stem}-{title}.xlsx"
+        single.save(temp)
+        png = output_dir / f"{workbook_path.stem}-{title}.png"
         subprocess.run(
             [
                 soffice,

@@ -86,7 +86,10 @@ def _render_overview(sheet, report) -> None:
     sheet["B3"] = cell_value(f"平台：{platforms}")
     sheet["B4"] = cell_value(f"关键词：{'、'.join(scope.keywords) or MISSING}")
 
-    # 平台列头：按 payload 平台写 B/C/D…，列数不足用「未采集」占位。
+    # 指标表固定标签：A6=指标（行名列）、E6=总计（合计列）；平台列头写 B/C/D…，
+    # 列数不足用「未采集」占位。
+    sheet.cell(6, 1).value = "指标"
+    sheet.cell(6, 5).value = "总计"
     overview = report.data.overview
     platform_entries = list(overview.platforms)
     for index, entry in enumerate(platform_entries[:3]):
@@ -172,7 +175,7 @@ def _render_daily_trend(sheet, report) -> None:
 
 
 def _render_content_creators(sheet, report) -> None:
-    clear_rows_unmerged(sheet, 4, 60, 4)
+    clear_rows_unmerged(sheet, 4, 60, 6)
     rows = [
         [
             item.type,
@@ -182,7 +185,7 @@ def _render_content_creators(sheet, report) -> None:
         ]
         for item in report.data.content_types
     ]
-    write_table(
+    content_layout = write_table(
         sheet,
         4,
         None,
@@ -191,11 +194,10 @@ def _render_content_creators(sheet, report) -> None:
         columns=4,
         note=empty_note(report, "content_types"),
     )
-    # 达人分层与付费/自然：并入同一 Sheet 下方（来源模板单表）。
-    row = 4 + len(rows)
+    # 达人分层 6 列（平台/层级/达人数量/发帖数/声量/互动数），接在内容类型表后。
     write_table(
         sheet,
-        row + 1,
+        content_layout.next_row + 1,
         "达人分层",
         ["平台", "层级", "达人数量", "发帖数", "声量", "互动数"],
         [
@@ -209,7 +211,7 @@ def _render_content_creators(sheet, report) -> None:
             ]
             for item in report.data.creator_tiers
         ],
-        columns=4,
+        columns=6,
         note=empty_note(report, "creator_tiers"),
     )
 

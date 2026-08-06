@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -125,7 +125,7 @@ class ExportCacheService:
                             size_bytes=row.size_bytes or 0,
                             content=content,
                         )
-                # 文件丢失或 hash 不匹配：标记失效，重建。
+                # 文件丢失或 hash 不匹配：标记失效，重建（换新 claim_token）。
                 row.status = "building"
                 row.error_code = None
                 row.sha256 = None
@@ -133,6 +133,7 @@ class ExportCacheService:
                 row.size_bytes = None
                 row.completed_at = None
                 row.created_at = now
+                row.claim_token = uuid4().hex
                 await self._db.commit()
             elif row is not None and row.status == "building":
                 stale_seconds = (now - row.created_at).total_seconds()
@@ -141,9 +142,10 @@ class ExportCacheService:
                     await self._db.commit()
                     await asyncio.sleep(_WAIT_RETRY_SECONDS)
                     continue
-                # stale building：接管重建（刷新租约）。
+                # stale building：接管重建（换新 claim_token，旧 owner 被 fence）。
                 row.created_at = now
                 row.completed_at = None
+                row.claim_token = uuid4().hex
                 await self._db.commit()
             elif row is None:
                 row = ArtifactExport(
@@ -157,6 +159,7 @@ class ExportCacheService:
                     size_bytes=None,
                     error_code=None,
                     created_at=now,
+                    claim_token=uuid4().hex,
                 )
                 self._db.add(row)
                 try:
@@ -168,7 +171,7 @@ class ExportCacheService:
                     await self._db.rollback()  # 并发死锁 → 重试。
                     continue
             else:
-                # failed 行：覆盖为 building 重试（刷新租约）。
+                # failed 行：覆盖为 building 重试（换新 claim_token）。
                 row.status = "building"
                 row.error_code = None
                 row.filename = None
@@ -177,9 +180,11 @@ class ExportCacheService:
                 row.size_bytes = None
                 row.created_at = now
                 row.completed_at = None
+                row.claim_token = uuid4().hex
                 await self._db.commit()
 
-            # 本调用负责渲染（已持有 building 行 + 有效租约）。
+            # 本调用负责渲染（已持有 building 行 + 有效租约 + 本次 claim_token）。
+            claim_token = row.claim_token
             try:
                 content = await asyncio.to_thread(
                     self._render, schema_version, payload, filename
@@ -188,7 +193,10 @@ class ExportCacheService:
                 # 取消必须安全收尾（标记 failed 可接管）后重新抛出。
                 await self._db.rollback()
                 await self._mark_failed(
-                    artifact_version_id, template_version, error_code="export_cancelled"
+                    artifact_version_id,
+                    template_version,
+                    error_code="export_cancelled",
+                    claim_token=claim_token,
                 )
                 raise
             except Exception as exc:
@@ -197,6 +205,7 @@ class ExportCacheService:
                     artifact_version_id,
                     template_version,
                     error_code=getattr(exc, "code", "export_failed"),
+                    claim_token=claim_token,
                 )
                 raise
             safe_name = sanitize_filename(filename)
@@ -206,24 +215,37 @@ class ExportCacheService:
                 await asyncio.to_thread(self._write_atomic, path, content)
             except Exception:
                 await self._mark_failed(
-                    artifact_version_id, template_version, error_code="export_write_failed"
+                    artifact_version_id,
+                    template_version,
+                    error_code="export_write_failed",
+                    claim_token=claim_token,
                 )
                 raise
             try:
-                await self._mark_ready(
+                marked = await self._mark_ready(
                     artifact_version_id,
                     template_version,
                     filename=safe_name,
                     storage_key=storage_key,
                     content=content,
+                    claim_token=claim_token,
                 )
             except Exception:
                 # 文件已写但 DB 更新失败：清理孤儿文件，标记 failed（可恢复）。
                 await asyncio.to_thread(self._delete_file, path)
                 await self._mark_failed(
-                    artifact_version_id, template_version, error_code="export_db_failed"
+                    artifact_version_id,
+                    template_version,
+                    error_code="export_db_failed",
+                    claim_token=claim_token,
                 )
                 raise
+            if not marked:
+                # 渲染期间被接管（claim_token 已换）：本次结果被 fence，清理
+                # 孤儿文件后重读新 owner 状态，绝不覆盖接管方。
+                await asyncio.to_thread(self._delete_file, path)
+                await self._db.commit()
+                continue
             return ExportedFile(
                 filename=safe_name,
                 sha256=hashlib.sha256(content).hexdigest(),
@@ -245,21 +267,28 @@ class ExportCacheService:
         )
 
     async def _mark_failed(
-        self, artifact_version_id: str, template_version: str, *, error_code: str
-    ) -> None:
-        row = await self._db.scalar(
-            select(ArtifactExport)
+        self,
+        artifact_version_id: str,
+        template_version: str,
+        *,
+        error_code: str,
+        claim_token: str | None,
+    ) -> bool:
+        """条件更新 owner fencing：仅 claim_token 匹配的当前 owner 能落 failed。
+
+        返回是否命中（rowcount>0）；被接管的僵尸构建方影响 0 行。
+        """
+        result = await self._db.execute(
+            update(ArtifactExport)
             .where(
                 ArtifactExport.artifact_version_id == artifact_version_id,
                 ArtifactExport.template_version == template_version,
+                ArtifactExport.claim_token == claim_token,
             )
-            .execution_options(populate_existing=True)
+            .values(status="failed", error_code=error_code, completed_at=_now())
         )
-        if row is not None:
-            row.status = "failed"
-            row.error_code = error_code
-            row.completed_at = _now()
-            await self._db.commit()
+        await self._db.commit()
+        return bool(result.rowcount)
 
     async def _mark_ready(
         self,
@@ -269,23 +298,31 @@ class ExportCacheService:
         filename: str,
         storage_key: str,
         content: bytes,
-    ) -> None:
-        row = await self._db.scalar(
-            select(ArtifactExport)
+        claim_token: str | None,
+    ) -> bool:
+        """条件更新 owner fencing：仅 claim_token 匹配的当前 owner 能落 ready。
+
+        返回是否命中（rowcount>0）；渲染期间被接管则返回 False，调用方清理
+        孤儿文件并重读新 owner 状态，绝不覆盖接管方结果。
+        """
+        result = await self._db.execute(
+            update(ArtifactExport)
             .where(
                 ArtifactExport.artifact_version_id == artifact_version_id,
                 ArtifactExport.template_version == template_version,
+                ArtifactExport.claim_token == claim_token,
             )
-            .execution_options(populate_existing=True)
+            .values(
+                status="ready",
+                filename=filename,
+                storage_key=storage_key,
+                sha256=hashlib.sha256(content).hexdigest(),
+                size_bytes=len(content),
+                completed_at=_now(),
+            )
         )
-        if row is not None:
-            row.status = "ready"
-            row.filename = filename
-            row.storage_key = storage_key
-            row.sha256 = hashlib.sha256(content).hexdigest()
-            row.size_bytes = len(content)
-            row.completed_at = _now()
-            await self._db.commit()
+        await self._db.commit()
+        return bool(result.rowcount)
 
     @staticmethod
     def _read_file(path: Path) -> bytes:

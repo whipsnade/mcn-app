@@ -21,7 +21,7 @@ def test_migration_chain_has_single_head() -> None:
     config = Config(str(backend_dir / "alembic.ini"))
     config.set_main_option("script_location", str(backend_dir / "migrations"))
     heads = ScriptDirectory.from_config(config).get_heads()
-    assert heads == ["0035_artifact_exports"]
+    assert heads == ["0036_export_claim_token"]
 
 
 async def test_phase_two_unique_constraints() -> None:
@@ -973,6 +973,30 @@ async def test_0035_artifact_exports_schema() -> None:
         )
     names = {item["name"] for item in constraints}
     assert "uq_artifact_exports_version_template" in names
+
+
+async def test_0036_export_claim_token_reversible() -> None:
+    """0036 upgrade → downgrade → upgrade：claim_token 列可逆（加列/删列不丢表）。"""
+
+    async def export_columns() -> set[str]:
+        async with engine.connect() as connection:
+            return {
+                item["name"]
+                for item in await connection.run_sync(
+                    lambda sync: inspect(sync).get_columns("artifact_exports")
+                )
+            }
+
+    assert "claim_token" in await export_columns()
+    try:
+        _run_alembic("downgrade", "0035_artifact_exports")
+        assert "claim_token" not in await export_columns()
+        # 既有表与唯一约束仍在（downgrade 只删列，不删表）。
+        assert {"id", "status", "created_at"} <= await export_columns()
+        _run_alembic("upgrade", "head")
+        assert "claim_token" in await export_columns()
+    finally:
+        _run_alembic("upgrade", "head")
 
 
 async def test_0034_dispatch_count_reversible() -> None:

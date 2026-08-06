@@ -603,6 +603,43 @@ def test_attribution_unpaid_is_not_paid() -> None:
     assert attribution["organic"] == 1
 
 
+def test_attribution_negated_paid_phrase_is_organic() -> None:
+    """「非付费」含子串「付费」，但语义是否定：绝不允许包含关系命中付费。"""
+    posts = [_post_rows()[0]]
+    posts[0]["归属"] = "非付费"
+    build = build_campaign_report_draft(scope=SCOPE, evidence={"posts": [("ev-1", posts)]})
+    attribution = build.payload["data"]["attribution"]
+    assert attribution["paid_confirmed"] == 0
+    assert attribution["organic"] == 1
+
+
+def test_attribution_standardized_tokens_not_arbitrary_substring() -> None:
+    """标准化 token 集合：付费/商单/广告命中付费；无关词不因包含子串误判。"""
+    def _kind(value: str) -> str:
+        posts = [_post_rows()[0]]
+        posts[0]["归属"] = value
+        build = build_campaign_report_draft(
+            scope=SCOPE, evidence={"posts": [("ev-1", posts)]}
+        )
+        attribution = build.payload["data"]["attribution"]
+        if attribution["paid_confirmed"] == 1:
+            return "paid"
+        if attribution["organic"] == 1:
+            return "organic"
+        return "unknown"
+
+    assert _kind("付费") == "paid"
+    assert _kind("商单") == "paid"
+    assert _kind("付费商单") == "paid"
+    assert _kind("自然") == "organic"
+    assert _kind("自然内容") == "organic"
+    assert _kind("非商单") == "organic"
+    assert _kind("非付费") == "organic"
+    assert _kind("unpaid") == "organic"
+    # 无归属语义 → unknown，不得默认付费。
+    assert _kind("其他") == "unknown"
+
+
 def test_organic_summary_only_counts_organic_rows() -> None:
     """organic_summary 只聚合确认自然行；付费与未知不得进入自然指标。"""
     posts = _post_rows()
@@ -658,6 +695,78 @@ def test_upload_total_row_not_double_counted_with_details() -> None:
     metrics = build.payload["data"]["internal_metrics"]
     assert metrics["spend"] == 100000  # 合计行，不是 200000
     assert metrics["impressions"] == 2000000
+
+
+# ---------------------------------------------------------------------------
+# Gate C 复审：Evidence 去重必须覆盖 attribution/organic/audience/comparison/lineage
+# ---------------------------------------------------------------------------
+
+
+def _dedup_rows() -> list[dict[str, Any]]:
+    return [
+        {
+            "平台": "小红书",
+            "帖子ID": "p1",
+            "作者": "达人A",
+            "用户ID": "u1",
+            "发布时间": "2026-07-03 09:00:00",
+            "声量": 1,
+            "互动数": 100,
+            "归属": "非商单",
+            "地区": "上海",
+        },
+        {
+            "平台": "小红书",
+            "帖子ID": "p2",
+            "作者": "达人B",
+            "用户ID": "u2",
+            "发布时间": "2026-07-04 09:00:00",
+            "声量": 1,
+            "互动数": 50,
+            "归属": "付费商单",
+            "地区": "北京",
+        },
+    ]
+
+
+def test_dedup_covers_attribution_organic_audience_comparison_lineage() -> None:
+    """同一 (evidence_id, source_path) 行被 posts/social/current 多分组引用时，
+    attribution/organic/audience/comparison 只计一次，lineage 来源不重复。"""
+    rows = _dedup_rows()
+    evidence = {
+        "posts": [("ev-1", rows)],
+        "social": [("ev-1", rows)],
+        "current": [("ev-1", rows)],
+        "baseline": [("ev-baseline", [dict(rows[0], 互动数=10)])],
+    }
+    build = build_campaign_report_draft(scope=SCOPE, evidence=evidence)
+    payload = build.payload
+    CampaignReportV2.model_validate(payload)
+
+    attribution = payload["data"]["attribution"]
+    assert attribution["organic"] == 1
+    assert attribution["paid_confirmed"] == 1
+    assert attribution["unknown"] == 0
+
+    organic = payload["data"]["organic_summary"]
+    assert organic["posts"] == 1
+    assert organic["engagement"] == 100
+
+    regions = {r["region"]: r for r in payload["data"]["audience_regions"]}
+    assert set(regions) == {"上海", "北京"}
+    assert regions["上海"]["volume"] == 1
+    assert regions["北京"]["volume"] == 1
+
+    current_baseline = payload["data"]["comparisons"]["current_baseline"]
+    posts_metric = next(s for s in current_baseline if s["metric"] == "posts")
+    assert posts_metric["current"] == 2
+    volume_metric = next(s for s in current_baseline if s["metric"] == "volume")
+    assert volume_metric["current"] == 2
+
+    refs = {ref["artifact_path"]: ref for ref in build.evidence_refs}
+    organic_ref = refs["/data/organic_summary/posts"]
+    sources = {(s["evidence_id"], s["source_path"]) for s in organic_ref["sources"]}
+    assert sources == {("ev-1", "/0")}
 
 
 # ---------------------------------------------------------------------------
@@ -738,5 +847,30 @@ def test_roi_generated_only_with_all_conditions() -> None:
     roi = build.payload["data"]["roi"]
     assert roi is not None
     assert roi["attribution_window"] == "最后点击 7 天"
+    assert roi["roas"] == pytest.approx(3.0)
+    assert roi["roi"] == pytest.approx(2.0)
+
+
+def test_conversions_zero_is_valid_data_not_missing() -> None:
+    """conversions=0 是有效数据：保留为 0；CPC 无定义置 None；ROI/ROAS 与 CPC 分别处理。"""
+    evidence = {
+        "posts": [("ev-1", _post_rows())],
+        "upload": [("ev-2", [{"投放金额": 100000, "曝光": 2000000, "转化": 0, "销售额": 300000}])],
+    }
+    build = build_campaign_report_draft(
+        scope={**SCOPE, "attribution_rules": ["最后点击 7 天"]},
+        evidence=evidence,
+    )
+    metrics = build.payload["data"]["internal_metrics"]
+    # 真实 0 保留为 0，绝不退化为 None/缺失。
+    assert metrics["conversions"] == 0
+    # CPC = spend/conversions：conversions=0 无定义 → None，但这是真实 0 而非缺失。
+    assert metrics["cpc"] is None
+    # CPM 与 conversions 无关，正常计算。
+    assert metrics["cpm"] == pytest.approx(50.0)
+    # ROI/ROAS 只依赖 spend+revenue+归因窗口（+曝光齐全），conversions=0 不阻断。
+    roi = build.payload["data"]["roi"]
+    assert roi is not None
+    assert roi["conversions"] == 0
     assert roi["roas"] == pytest.approx(3.0)
     assert roi["roi"] == pytest.approx(2.0)

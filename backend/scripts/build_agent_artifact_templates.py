@@ -125,12 +125,10 @@ def build_campaign(output_dir: Path) -> Path:
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
     TITLE_FONT = Font(name="微软雅黑", bold=True, size=14, color="1F4E79")
-    SECTION_FONT = Font(name="微软雅黑", bold=True, size=11, color="1F4E79")
     HEADER_FILL = PatternFill("solid", fgColor="D9E2F3")
     HEADER_FONT = Font(name="微软雅黑", bold=True, size=10)
     THIN = Side(style="thin", color="B0B0B0")
     HEADER_BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
-    ALTERNATE_FILL = PatternFill("solid", fgColor="D6E4F0")
     CENTER = Alignment(horizontal="center", vertical="center")
 
     wb = Workbook()

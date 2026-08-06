@@ -19,6 +19,7 @@ from openpyxl.styles import PatternFill
 
 from app.agent_artifacts.exporters._common import (
     MISSING,
+    TableLayout,
     cell_value,
     clear_rows_unmerged,
     empty_note,
@@ -43,6 +44,33 @@ SHEET_ORDER = (
 )
 ROI_SHEET = "ROI与转化"
 ALTERNATE_FILL = PatternFill("solid", fgColor="D6E4F0")
+
+
+def _bar_chart(
+    sheet,
+    layout: TableLayout,
+    *,
+    data_cols: tuple[int, ...],
+    cat_col: int,
+    title: str,
+    width: int = 15,
+    height: int = 8,
+) -> BarChart:
+    """按 write_table 返回的真实版式建图：系列名取表头单元格（中文），
+    数值/类别区间严格等于数据行（data_start..data_end），绝不手算行号。"""
+    chart = BarChart()
+    chart.title = title
+    for col in data_cols:
+        chart.add_data(
+            Reference(sheet, min_col=col, min_row=layout.header_row, max_row=layout.data_end),
+            titles_from_data=True,
+        )
+    chart.set_categories(
+        Reference(sheet, min_col=cat_col, min_row=layout.data_start, max_row=layout.data_end)
+    )
+    chart.height = height
+    chart.width = width
+    return chart
 
 
 def render_campaign_workbook(payload: dict) -> bytes:
@@ -119,41 +147,51 @@ def _render_comparisons(sheet, report) -> None:
     clear_rows_unmerged(sheet, 2, 100, 6)
     sheet._charts = []
     comparisons = report.data.comparisons
-    rows = []
-    for series in comparisons.current_baseline:
-        rows.append(
-            [
-                series.metric,
-                series.current,
-                series.baseline,
-                series.delta,
-                series.rate,
-            ]
+    cursor = 4
+    chart_row = 4
+    for title, series in (
+        ("活动期 vs 活动前", comparisons.current_baseline),
+        ("活动期 vs 活动后观察期", comparisons.current_post),
+    ):
+        rows = [[s.metric, s.current, s.baseline, s.delta, s.rate] for s in series]
+        layout = write_table(
+            sheet,
+            cursor,
+            title,
+            ["指标", "当前", "对比期", "差值", "变化率"],
+            rows,
+            columns=6,
+            pct_columns=(5,),
+            note=empty_note(report, "comparisons"),
         )
-    write_table(
+        if layout.has_data:
+            sheet.add_chart(
+                _bar_chart(sheet, layout, data_cols=(2, 3), cat_col=1, title=title),
+                f"H{chart_row}",
+            )
+            chart_row += 16
+        cursor = layout.next_row + 1
+    timeline = report.data.timeline
+    timeline_rows = [
+        [item.date, platform_label(item.platform), item.volume, item.engagement, item.posts]
+        for item in timeline
+    ]
+    timeline_layout = write_table(
         sheet,
-        4,
-        "活动期 vs 活动前",
-        ["指标", "当前", "对比期", "差值", "变化率"],
-        rows,
-        columns=6,
-        pct_columns=(5,),
-        note=empty_note(report, "comparisons"),
+        cursor,
+        "时间线趋势",
+        ["日期", "平台", "声量", "互动", "发帖"],
+        timeline_rows,
+        columns=5,
+        note=empty_note(report, "timeline"),
     )
-    if rows:
-        last = 4 + len(rows)
-        chart = BarChart()
-        chart.title = "活动期 vs 活动前"
-        chart.add_data(
-            Reference(sheet, min_col=2, min_row=5, max_row=last), titles_from_data=False
+    if timeline_layout.has_data:
+        sheet.add_chart(
+            _bar_chart(
+                sheet, timeline_layout, data_cols=(3,), cat_col=1, title="时间线趋势"
+            ),
+            f"H{chart_row}",
         )
-        chart.add_data(
-            Reference(sheet, min_col=3, min_row=5, max_row=last), titles_from_data=False
-        )
-        chart.set_categories(Reference(sheet, min_col=1, min_row=5, max_row=last))
-        chart.height = 8
-        chart.width = 15
-        sheet.add_chart(chart, f"F{last + 2}")
 
 
 def _render_platforms(sheet, report) -> None:
@@ -170,7 +208,7 @@ def _render_platforms(sheet, report) -> None:
         ]
         for item in report.data.platform_contributions
     ]
-    write_table(
+    layout = write_table(
         sheet,
         4,
         None,
@@ -180,18 +218,11 @@ def _render_platforms(sheet, report) -> None:
         pct_columns=(6,),
         note=empty_note(report, "platform_contributions"),
     )
-    if rows:
-        # 数据自第 5 行起（表头@4）：图表引用也必须从第 5 行开始。
-        last = 4 + len(rows)
-        chart = BarChart()
-        chart.title = "平台声量分布"
-        chart.add_data(
-            Reference(sheet, min_col=2, min_row=5, max_row=last), titles_from_data=True
+    if layout.has_data:
+        sheet.add_chart(
+            _bar_chart(sheet, layout, data_cols=(2,), cat_col=1, title="平台声量分布"),
+            f"A{layout.next_row + 1}",
         )
-        chart.set_categories(Reference(sheet, min_col=1, min_row=5, max_row=last))
-        chart.height = 8
-        chart.width = 15
-        sheet.add_chart(chart, f"F{last + 2}")
 
 
 def _render_sentiment_content(sheet, report) -> None:
@@ -204,7 +235,7 @@ def _render_sentiment_content(sheet, report) -> None:
         ["负面", summary.negative.count, summary.negative.share],
     ]
     sheet._charts = []
-    row = write_table(
+    layout = write_table(
         sheet,
         4,
         "情感分布",
@@ -214,20 +245,18 @@ def _render_sentiment_content(sheet, report) -> None:
         pct_columns=(3,),
         note=empty_note(report, "sentiment"),
     )
-    if summary.positive.count is not None or summary.negative.count is not None:
-        chart = BarChart()
-        chart.title = "情感分布"
-        chart.add_data(
-            Reference(sheet, min_col=2, min_row=5, max_row=4 + len(rows)),
-            titles_from_data=True,
+    if layout.has_data and (
+        summary.positive.count is not None or summary.negative.count is not None
+    ):
+        sheet.add_chart(
+            _bar_chart(
+                sheet, layout, data_cols=(2,), cat_col=1, title="情感分布", width=14
+            ),
+            f"E{layout.title_row or layout.header_row}",
         )
-        chart.set_categories(Reference(sheet, min_col=1, min_row=5, max_row=4 + len(rows)))
-        chart.height = 8
-        chart.width = 14
-        sheet.add_chart(chart, f"F{4 + len(rows) + 2}")
     write_table(
         sheet,
-        row + 1,
+        layout.next_row + 1,
         "内容类型",
         ["内容类型", "发帖", "声量", "互动"],
         [
@@ -302,7 +331,7 @@ def _render_organic_audience(sheet, report) -> None:
             ["自然帖数", organic.posts],
             ["自然声量占比", organic.share_of_volume],
         ]
-    row = write_table(
+    organic_layout = write_table(
         sheet,
         4,
         "自然传播",
@@ -311,9 +340,9 @@ def _render_organic_audience(sheet, report) -> None:
         columns=2,
         note=empty_note(report, "organic_summary"),
     )
-    write_table(
+    audience_layout = write_table(
         sheet,
-        row + 1,
+        organic_layout.next_row + 1,
         "受众地域",
         ["地区", "声量", "占比"],
         [
@@ -324,39 +353,32 @@ def _render_organic_audience(sheet, report) -> None:
         pct_columns=(3,),
         note=empty_note(report, "audience_regions"),
     )
-    # 归属分布图（自然/付费/未知）。
     attribution = report.data.attribution
-    if attribution is not None and any(
+    if attribution is None or not any(
         v is not None for v in (attribution.paid_confirmed, attribution.organic, attribution.unknown)
     ):
-        attr_rows = [
-            ["付费确认", attribution.paid_confirmed],
-            ["自然", attribution.organic],
-            ["未知", attribution.unknown],
-        ]
-        attr_start = 4 + len(rows)
-        write_table(
-            sheet,
-            attr_start,
-            "内容归属",
-            ["归属", "帖数"],
-            attr_rows,
-            columns=2,
-            note=empty_note(report, "attribution"),
+        return
+    attr_rows = [
+        ["付费确认", attribution.paid_confirmed],
+        ["自然", attribution.organic],
+        ["未知", attribution.unknown],
+    ]
+    attr_layout = write_table(
+        sheet,
+        audience_layout.next_row + 1,
+        "内容归属",
+        ["归属", "帖数"],
+        attr_rows,
+        columns=2,
+        note=empty_note(report, "attribution"),
+    )
+    if attr_layout.has_data:
+        sheet.add_chart(
+            _bar_chart(
+                sheet, attr_layout, data_cols=(2,), cat_col=1, title="内容归属", width=14
+            ),
+            f"D{attr_layout.title_row or attr_layout.header_row}",
         )
-        if any(v is not None for _, v in attr_rows):
-            chart = BarChart()
-            chart.title = "内容归属"
-            chart.add_data(
-                Reference(sheet, min_col=2, min_row=attr_start + 2, max_row=attr_start + 1 + len(attr_rows)),
-                titles_from_data=False,
-            )
-            chart.set_categories(
-                Reference(sheet, min_col=1, min_row=attr_start + 2, max_row=attr_start + 1 + len(attr_rows))
-            )
-            chart.height = 8
-            chart.width = 14
-            sheet.add_chart(chart, f"D{attr_start + 1 + len(attr_rows) + 2}")
 
 
 def _render_insights(sheet, report) -> None:

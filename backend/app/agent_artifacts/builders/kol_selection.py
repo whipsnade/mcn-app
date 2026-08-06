@@ -69,6 +69,16 @@ DIM_RAW_INPUT = {
     "target_age": "target_age",
 }
 
+# score_inputs 键 → 派生它的契约字段（按优先级）。行无显式 score_inputs 时，
+# lineage 据此精确指向被派生字段在原始行内的真实键（keymap），而非笼统身份键。
+_SCORE_INPUT_SOURCE_FIELDS = {
+    "followers": ("followers",),
+    "average_interactions": ("avg_engagement", "engagement_total"),
+    "interaction_follower_ratio": ("avg_engagement", "engagement_total", "followers"),
+    "active_follower_rate": ("active_follower_rate",),
+    "active_follower_count": ("active_followers",),
+}
+
 # 展示用的数字字段：从 Evidence 原样复制，不进入效果总分。
 _DISPLAY_NUMERIC_FIELDS = (
     "followers",
@@ -318,6 +328,11 @@ def _derive_score_inputs(item: dict[str, Any]) -> dict[str, Any]:
     if followers is not None and score_inputs.get("followers") is None:
         score_inputs["followers"] = followers
     avg_interactions = item.get("avg_engagement")
+    if avg_interactions is None:
+        # hot_user 等只有「互动数」（总量）而无「平均互动」的真实行：互动总量
+        # 是该行唯一可用的互动输入，作为 average_interactions 参与评分，绝不因
+        # 缺少平均字段而整维缺失。合法 0 用 is None 判断，不被 or 吞掉。
+        avg_interactions = item.get("engagement_total")
     if avg_interactions is not None and score_inputs.get("average_interactions") is None:
         score_inputs["average_interactions"] = avg_interactions
     active_rate = item.get("active_follower_rate")
@@ -673,17 +688,30 @@ def _score_sources(
     return [_identity_source(evidence_id, base, raw, keymap)]
 
 
-def _dim_source(
+def _dim_sources(
     evidence_id: str,
     base: str,
     raw: dict[str, Any],
     keymap: dict[str, str],
     input_key: str,
-) -> dict[str, Any]:
+) -> list[dict[str, Any]]:
+    """维度原始输入来源（Gate C 复审：精确 lineage）。
+
+    行带显式 score_inputs → 指向 ``score_inputs/{input_key}``；否则 score_inputs
+    由真实契约字段确定性派生（_derive_score_inputs），lineage 精确指向被派生字段
+    在原始行内的真实键（keymap，如 互动数/粉丝数），绝不退回笼统身份键。
+    """
     score_inputs = raw.get("score_inputs")
     if isinstance(score_inputs, dict) and input_key in score_inputs:
-        return _ev(evidence_id, join_source_path(base, "score_inputs", input_key))
-    return _score_sources(evidence_id, base, raw, keymap)[0]
+        return [_ev(evidence_id, join_source_path(base, "score_inputs", input_key))]
+    sources: list[dict[str, Any]] = []
+    for field in _SCORE_INPUT_SOURCE_FIELDS.get(input_key, ()):
+        raw_key = keymap.get(field)
+        if raw_key is not None and raw_key in raw:
+            sources.append(_ev(evidence_id, join_source_path(base, raw_key)))
+    if sources:
+        return sources
+    return _score_sources(evidence_id, base, raw, keymap)
 
 
 def _quote_source(
@@ -866,15 +894,15 @@ def _build_lineage(
 
         # 每个维度：原始输入引用 Evidence，派生结果引用 rank_kols。
         for dim in V3_DIMENSIONS:
-            source = _dim_source(evidence_id, base, raw, keymap, DIM_RAW_INPUT[dim])
-            source_path = source["source_path"]
+            dim_sources = _dim_sources(evidence_id, base, raw, keymap, DIM_RAW_INPUT[dim])
+            source_path = dim_sources[0]["source_path"]
             for suffix in ("raw_score", "weighted_score"):
                 refs.append(
                     {
                         "artifact_path": (
                             f"/data/items/{index}/score_snapshot/dimensions/{dim}/{suffix}"
                         ),
-                        "sources": [source],
+                        "sources": dim_sources,
                         "derivation": _derivation(
                             call_id, f"{SCORE_VERSION_V3}:{dim}", source_path
                         ),

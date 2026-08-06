@@ -27,6 +27,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from pydantic import ValidationError
@@ -166,6 +167,23 @@ def _row_author_name(row: dict[str, Any]) -> str:
 def _group_posts(rows: list[RowRef]) -> list[RowRef]:
     """参与统计的帖子行：至少要能识别为一篇帖子（id/标题/链接/作者/互动任一）。"""
     return rows
+
+
+def _dedup_rows(rows: list[RowRef]) -> list[RowRef]:
+    """按 (evidence_id, source_path) 去重保序。
+
+    同一 Evidence 行被 posts/social/current 等多个分组引用时只参与一次聚合，
+    attribution/organic/audience/comparison 绝不重复计算（Gate C 复审）。
+    """
+    seen: set[tuple[str, str]] = set()
+    unique: list[RowRef] = []
+    for ref in rows:
+        key = (ref.evidence_id, ref.source_path)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(ref)
+    return unique
 
 
 def _build_overview(
@@ -561,20 +579,52 @@ def _build_comparisons(
     }, has_rows
 
 
-_ORGANIC_MARKERS = ("非商单", "自然", "organic", "unpaid")
-_PAID_MARKERS = ("付费", "商单", "paid", "ad")
+# 归属语义标准化 token（字段语义，绝不用宽泛子串包含）。
+_PAID_TOKENS = ("付费", "商单", "广告", "投放", "paid", "ad", "commercial", "sponsored", "推广")
+_ORGANIC_TOKENS = (
+    "自然",
+    "免费",
+    "自来水",
+    "organic",
+    "unpaid",
+    "非付费",
+    "非商单",
+    "非广告",
+    "非投放",
+)
+# 否定前缀：紧邻付费 token 之前时整体表达自然语义（「非付费」不得命中付费）。
+_NEGATION_PREFIXES = ("非", "不", "无", "未", "non", "un", "not", "in")
+
+
+def _contains_token(folded: str, token: str) -> bool:
+    """ASCII token 用词边界匹配（避免 ad 命中 upload/head 等），中文 token 直接包含。"""
+    if token.isascii():
+        return re.search(rf"(?<![a-z0-9]){re.escape(token)}(?![a-z0-9])", folded) is not None
+    return token in folded
 
 
 def _attribution_kind(ref: RowRef) -> str | None:
-    """归属分类：先判否定/自然语义（非商单/unpaid 必须先于商单/paid）。
+    """归属分类（字段语义 + 标准化 token 集合）。
 
-    返回 paid_confirmed / organic / unknown；无法确认返回 unknown。
+    1. 命中自然 token（含「非付费/非商单/unpaid」否定合成词）→ organic；
+    2. 否定前缀 + 付费 token（「非X」「unX」）→ organic；
+    3. 命中付费 token → paid_confirmed；
+    4. 无法确认 → unknown（没有证据不得默认认定付费投放）。
     """
     raw = text(first(ref.row, ATTRIBUTION_KEYS))
-    folded = (raw or "").casefold()
-    if any(marker in folded for marker in _ORGANIC_MARKERS):
+    if raw is None:
+        return "unknown"
+    folded = raw.casefold().strip()
+    if not folded:
+        return "unknown"
+    if any(_contains_token(folded, token) for token in _ORGANIC_TOKENS):
         return "organic"
-    if any(marker in folded for marker in _PAID_MARKERS):
+    for prefix in _NEGATION_PREFIXES:
+        if folded.startswith(prefix):
+            rest = folded[len(prefix) :].strip("-–· ")
+            if rest and any(_contains_token(rest, token) for token in _PAID_TOKENS):
+                return "organic"
+    if any(_contains_token(folded, token) for token in _PAID_TOKENS):
         return "paid_confirmed"
     return "unknown"
 
@@ -723,9 +773,15 @@ def _build_internal_metrics(
 def _build_roi(
     scope: dict[str, Any], internal_metrics: dict[str, Any]
 ) -> dict[str, Any] | None:
-    """ROI 门禁（Gate C 审核）：spend>0 + 明确归因口径 + 曝光 + 转化 + 收入
-    全部齐全才生成；comparison_mode 只是周期比较方式，绝不能作为归因窗口；
-    任一条件不满足 → None；spend=0 不除零。"""
+    """ROI 门禁（Gate C 审核）：spend>0 + 明确归因口径 + 曝光 + 收入齐全才生成；
+    comparison_mode 只是周期比较方式，绝不能作为归因窗口；任一条件不满足 → None；
+    spend=0 不除零。
+
+    Gate C 复审：ROI/ROAS 与 CPC 分别处理。ROI/ROAS 只依赖 spend+revenue+归因窗口，
+    与转化数无关；``conversions=0`` 是有效数据（不阻断 ROI/ROAS），只有转化字段
+    完全缺失（None）才视为数据不可用。CPC 需要 ``conversions>0`` 作分母，在
+    internal_metrics 侧单独处理（conversions=0 → CPC=None）。
+    """
     spend = internal_metrics.get("spend")
     impressions = internal_metrics.get("impressions")
     conversions = internal_metrics.get("conversions")
@@ -742,7 +798,6 @@ def _build_roi(
         or impressions is None
         or impressions <= 0
         or conversions is None
-        or conversions <= 0
         or revenue is None
     ):
         return None
@@ -793,14 +848,16 @@ def build_campaign_report_draft(
         )
 
     collector = LineageCollector()
-    post_rows = _group_posts(groups[GROUP_POSTS])
+    post_rows = _dedup_rows(_group_posts(groups[GROUP_POSTS]))
     # Gate C Task 4：社媒指标以 DataTap 为主（post/social/posts 分组合并去重），
     # 成本/转化以 upload 为主；冲突值双保留并生成 limitation。
-    social_rows = _group_posts([*groups[GROUP_POSTS], *groups[GROUP_SOCIAL]])
-    upload_rows = groups[GROUP_UPLOAD]
-    current_rows = _group_posts([*groups[GROUP_CURRENT], *groups[GROUP_POSTS]])
-    baseline_rows = _group_posts(groups[GROUP_BASELINE])
-    post_period_rows = _group_posts(groups[GROUP_POST])
+    # Gate C 复审：合并行列表按 (evidence_id, source_path) 去重，同一 Evidence
+    # 行被多分组引用时只计一次。
+    social_rows = _dedup_rows(_group_posts([*groups[GROUP_POSTS], *groups[GROUP_SOCIAL]]))
+    upload_rows = _dedup_rows(groups[GROUP_UPLOAD])
+    current_rows = _dedup_rows(_group_posts([*groups[GROUP_CURRENT], *groups[GROUP_POSTS]]))
+    baseline_rows = _dedup_rows(_group_posts(groups[GROUP_BASELINE]))
+    post_period_rows = _dedup_rows(_group_posts(groups[GROUP_POST]))
 
     # 社媒冲突检测：upload 行若同时携带声量/互动且与 DataTap 不同，双值保留。
     social_conflicts: list[dict[str, Any]] = []

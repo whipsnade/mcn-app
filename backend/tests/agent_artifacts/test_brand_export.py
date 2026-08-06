@@ -234,3 +234,40 @@ def test_used_range_not_extended_to_row_1000() -> None:
     wb = load_workbook(BytesIO(content), data_only=False)
     for ws in wb.worksheets:
         assert ws.max_row < 100, f"{ws.title} max_row={ws.max_row}"
+
+
+# ---------------------------------------------------------------------------
+# Gate C 复审：品牌 6 列达人分层表 / 概览固定标签
+# ---------------------------------------------------------------------------
+
+
+def test_creator_tiers_table_uses_six_columns() -> None:
+    """达人分层表必须 6 列（平台/层级/达人数量/发帖数/声量/互动数），标题合并跨 6 列。"""
+    payload = build_brand_dict()
+    payload["data"]["creator_tiers"] = [
+        {"platform": "xiaohongshu", "tier": "头部", "creator_count": 3, "posts": 30, "volume": 600, "engagement": 3000},
+        {"platform": "xiaohongshu", "tier": "腰部", "creator_count": 5, "posts": 50, "volume": 400, "engagement": 2000},
+    ]
+    content = export_artifact(_Version("brand_report_v3", payload))
+    wb = load_workbook(BytesIO(content), data_only=False)
+    ws = wb["内容类型与达人"]
+    values = _values(ws)
+    for header in ("平台", "层级", "达人数量", "发帖数", "声量", "互动数"):
+        assert header in values, header
+    # 达人分层标题合并必须跨到第 6 列（互动数），不得只跨 4 列。
+    tier_rows = [cell.row for row in ws.iter_rows() for cell in row if cell.value == "达人分层"]
+    assert tier_rows
+    tier_row = tier_rows[0]
+    merges = [r for r in ws.merged_cells.ranges if r.min_row == tier_row]
+    assert merges and any(r.max_col >= 6 for r in merges), [str(r) for r in merges]
+    # 第 6 列互动数数据真实落位。
+    assert 3000 in values and 2000 in values
+
+
+def test_overview_has_fixed_metric_and_total_labels() -> None:
+    """概览指标表固定标签：A6=指标（行名列）、E6=总计（合计列）。"""
+    content = export_artifact(_brand_version())
+    wb = load_workbook(BytesIO(content), data_only=False)
+    overview = wb["综合概览"]
+    assert overview["A6"].value == "指标"
+    assert overview["E6"].value == "总计"

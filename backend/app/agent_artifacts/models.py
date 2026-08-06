@@ -383,3 +383,7 @@ class ArtifactExport(Base):
     error_code: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Gate C 复审：owner fencing。认领 building 行时写入唯一 claim_token，
+    # 完成/失败用「WHERE claim_token 匹配」的条件更新，被接管的僵尸构建方
+    # 持旧 token 的更新影响 0 行，绝不覆盖新 owner。
+    claim_token: Mapped[str | None] = mapped_column(String(64), nullable=True)

@@ -607,7 +607,8 @@ async def test_real_xiaohongshu_search_rows_normalize_to_contract() -> None:
 async def test_real_hot_user_rows_platform_short_video_maps_to_douyin() -> None:
     """hot_user 行：平台「短视频」归一为 douyin；uid/昵称/粉丝数走中文别名。
 
-    行无 score_inputs → 效果维全缺失计 0（观察组），名单仍稳定产出。
+    行无 score_inputs，但真实字段（粉丝数/互动数）必须确定性派生
+    average_interactions 与互动粉丝比，两者绝不缺失（不允许只断言 effect_score>0）。
     """
     build = await build_kol_selection_draft(
         scope=SCOPE,
@@ -624,9 +625,11 @@ async def test_real_hot_user_rows_platform_short_video_maps_to_douyin() -> None:
     assert top["nickname"] == "闪电新闻"
     assert top["followers"] == 10590610
     assert top["engagement_total"] == 683294
-    # 真实字段（粉丝数/互动数）进入评分：效果分 > 0；无报价 → 价格分 0。
-    assert top["score_snapshot"]["effect_score"] > 0
-    assert top["score_snapshot"]["rating"] == "观察"
+    snapshot = top["score_snapshot"]
+    assert snapshot["effect_score"] > 0
+    # 互动数→average_interactions、互动数/粉丝数→互动粉丝比：精确断言不缺失。
+    assert snapshot["dimensions"]["average_interactions"]["missing_reason"] is None
+    assert snapshot["dimensions"]["engagement_follower_ratio"]["missing_reason"] is None
 
 
 async def test_missing_platform_infers_from_single_platform_scope() -> None:

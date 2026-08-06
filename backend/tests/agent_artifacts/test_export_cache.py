@@ -437,6 +437,114 @@ async def test_cache_hit_does_not_call_renderer(tmp_path) -> None:
     await _purge_committed(user_id)
 
 
+# ---------------------------------------------------------------------------
+# Gate C 复审：claim_token owner fencing（条件更新完成/接管）
+# ---------------------------------------------------------------------------
+
+
+async def test_mark_ready_fenced_by_claim_token_mismatch(
+    db_session, tmp_path, user_factory
+) -> None:
+    """条件更新 owner fencing：claim_token 不匹配的完成更新不得生效。
+
+    僵尸构建方（租约超时被接管后才回来提交）持有的旧 claim_token 与行上当前
+    owner 不符 → mark_ready 影响 0 行，绝不覆盖新 owner 的状态。
+    """
+    user = await user_factory()
+    payload = build_brand_dict()
+    version_id = await _make_version(db_session, payload, user_id=user.id)
+    db_session.add(
+        ArtifactExport(
+            id=str(uuid4()),
+            artifact_version_id=version_id,
+            template_version="brand_report_v3",
+            status="building",
+            claim_token="owner-B",
+            created_at=_now(),
+        )
+    )
+    await db_session.commit()
+    service = ExportCacheService(db_session, storage_dir=str(tmp_path))
+
+    fenced = await service._mark_ready(
+        version_id,
+        "brand_report_v3",
+        filename="zombie.xlsx",
+        storage_key="zombie.xlsx",
+        content=b"zombie",
+        claim_token="owner-A",
+    )
+    assert fenced is False
+    row = await db_session.scalar(
+        select(ArtifactExport)
+        .where(ArtifactExport.artifact_version_id == version_id)
+        .execution_options(populate_existing=True)
+    )
+    assert row.status == "building"
+    assert row.claim_token == "owner-B"
+
+    owner_ok = await service._mark_ready(
+        version_id,
+        "brand_report_v3",
+        filename="owner.xlsx",
+        storage_key="owner.xlsx",
+        content=b"owner-content",
+        claim_token="owner-B",
+    )
+    assert owner_ok is True
+    row = await db_session.scalar(
+        select(ArtifactExport)
+        .where(ArtifactExport.artifact_version_id == version_id)
+        .execution_options(populate_existing=True)
+    )
+    assert row.status == "ready"
+    assert row.filename == "owner.xlsx"
+
+
+async def test_stale_takeover_reassigns_claim_token(tmp_path) -> None:
+    """接管 stale building 行必须换新 claim_token，旧 owner 被 fence 出局。"""
+    from datetime import timedelta
+
+    from app.agent_artifacts.export_cache import _now as cache_now
+    from app.db.session import SessionFactory
+
+    payload = build_brand_dict()
+    version_id, user_id = await _make_version_committed(payload)
+    async with SessionFactory.begin() as db:
+        db.add(
+            ArtifactExport(
+                id=str(uuid4()),
+                artifact_version_id=version_id,
+                template_version="brand_report_v3",
+                status="building",
+                claim_token="stale-old-owner",
+                created_at=cache_now() - timedelta(seconds=600),
+            )
+        )
+    renderer = _CountingRenderer(payload)
+    async with SessionFactory() as db:
+        service = ExportCacheService(
+            db, storage_dir=str(tmp_path), renderer=renderer, lease_seconds=60
+        )
+        result = await service.get_or_build(
+            artifact_version_id=version_id,
+            schema_version="brand_report_v3",
+            payload=payload,
+            filename="a.xlsx",
+        )
+    assert result.content == b"PK-export-content"
+    async with SessionFactory() as db:
+        row = await db.scalar(
+            select(ArtifactExport).where(
+                ArtifactExport.artifact_version_id == version_id
+            )
+        )
+        assert row.status == "ready"
+        assert row.claim_token is not None
+        assert row.claim_token != "stale-old-owner"
+    await _purge_committed(user_id)
+
+
 async def _purge_committed(user_id: str) -> None:
     """按 FK 顺序清理真实提交的测试链（export_cache 并发测试专用）。"""
     from app.agent_artifacts.models import (
