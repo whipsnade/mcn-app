@@ -21,12 +21,15 @@ supersede；Context Builder 只注入未 supersede 条目。
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
+from datetime import datetime
 from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing_extensions import TypeAliasType
 
@@ -298,6 +301,36 @@ class SearchEvidenceArgs(BaseModel):
     query: str = Field(default="", max_length=500)
     artifact_id: str | None = None
     filters: dict[str, Any] | None = None
+    # keyset 游标（受控 base64 格式）；超长/无法解析返回 invalid_arguments。
+    cursor: str | None = Field(default=None, max_length=200)
+
+
+def _encode_search_cursor(collected_at: datetime, evidence_id: str) -> str:
+    """把最后一个已消费 Evidence 的 (collected_at, id) 编码为受控 cursor。"""
+    payload = json.dumps(
+        {"t": collected_at.isoformat(), "i": evidence_id}, separators=(",", ":")
+    )
+    return base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii")
+
+
+def _decode_search_cursor(raw: str) -> tuple[datetime, str] | None:
+    """解析 cursor；任何格式错误返回 None（调用方映射 invalid_arguments）。"""
+    try:
+        payload = json.loads(
+            base64.urlsafe_b64decode(raw.encode("ascii")).decode("utf-8")
+        )
+    except (ValueError, UnicodeDecodeError, binascii.Error):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    raw_t = payload.get("t")
+    raw_id = payload.get("i")
+    if not isinstance(raw_t, str) or not isinstance(raw_id, str) or not raw_id:
+        return None
+    try:
+        return datetime.fromisoformat(raw_t), raw_id
+    except ValueError:
+        return None
 
 
 class SearchEvidenceTool:
@@ -333,35 +366,54 @@ class SearchEvidenceTool:
                 column = _FILTER_COLUMNS.get(key)
                 if column is not None:
                     conditions.append(column == value)
+        # keyset 游标：保持 collected_at DESC, id DESC 顺序，只取该游标之后（更旧）
+        # 的 Evidence；伪造 cursor 只能得到受控 invalid_arguments，绝不跨 Session。
+        if args.cursor is not None:
+            decoded = _decode_search_cursor(args.cursor)
+            if decoded is None:
+                return _failed(INVALID_ARGUMENTS, "invalid search cursor")
+            cursor_collected_at, cursor_id = decoded
+            conditions.append(
+                or_(
+                    EvidenceItem.collected_at < cursor_collected_at,
+                    and_(
+                        EvidenceItem.collected_at == cursor_collected_at,
+                        EvidenceItem.id < cursor_id,
+                    ),
+                )
+            )
 
-        # 只投影匹配/展示所需列（不加载大字段 raw_payload_json），并加 SQL LIMIT
-        # 限制单次扫描量，避免长 Session 无限加载。
+        # 只投影匹配/展示所需列（不加载大字段 raw_payload_json）；固定扫描窗口
+        # 500+1：第 501 条仅用于探测后面是否还有数据，绝不一次加载整个 Session。
         result = await self._db.execute(
             select(*_EVIDENCE_MATCH_COLUMNS)
             .where(*conditions)
             .order_by(EvidenceItem.collected_at.desc(), EvidenceItem.id.desc())
-            .limit(_SEARCH_SCAN_LIMIT)
+            .limit(_SEARCH_SCAN_LIMIT + 1)
         )
         rows = result.all()
-        matches = [item for item in rows if self._matches(item, args.query or "")]
-        total = len(matches)
+
         # 固定字段 + matches + 每个 view 共同参与 50KB 总预算（20 × 50KB 不可接受）。
-        fixed = len(
-            json.dumps(
-                {
-                    "query": args.query,
-                    "total_matches": total,
-                    "returned_matches": _SEARCH_MATCH_LIMIT,
-                    "has_more": False,
-                    "truncated": False,
-                    "matches": [],
-                },
-                ensure_ascii=False,
-            )
+        fixed = model_response_size(
+            {
+                "query": args.query,
+                "scanned_count": _SEARCH_SCAN_LIMIT,
+                "returned_matches": _SEARCH_MATCH_LIMIT,
+                "next_cursor": "x" * 200,
+                "has_more": False,
+                "view_truncated": False,
+                "truncated": False,
+                "matches": [],
+            }
         )
         matches_budget = max(_MAX_TOOL_RESULT_TOTAL_CHARS - fixed, 1)
         page: list[dict[str, Any]] = []
-        for item in matches[:_SEARCH_MATCH_LIMIT]:
+        consumed = 0
+        view_truncated = False
+        for item in rows[:_SEARCH_SCAN_LIMIT]:
+            if not self._matches(item, args.query or ""):
+                consumed += 1
+                continue
             full_match = {
                 "evidence_id": item.id,
                 "source_type": item.source_type,
@@ -373,33 +425,48 @@ class SearchEvidenceTool:
             }
             if model_response_size([*page, full_match]) <= matches_budget:
                 page.append(full_match)
-                continue
-            # 完整 view 放不下：退回最小 match（含 evidence_id，模型仍可
-            # read_tool_result 钻取原始数据）。
-            minimal_match = {key: value for key, value in full_match.items() if key != "view"}
-            if model_response_size([*page, minimal_match]) <= matches_budget:
-                page.append(minimal_match)
-                continue
-            break
-        returned = len(page)
-        has_more = returned < total
+                consumed += 1
+            else:
+                # 完整 view 放不下：退回最小 match（含 evidence_id，模型仍可
+                # read_tool_result 钻取原始数据）。
+                minimal_match = {
+                    "evidence_id": item.id,
+                    "source_type": item.source_type,
+                    "source_name": item.source_name,
+                    "run_id": item.run_id,
+                    "collected_at": item.collected_at.isoformat() if item.collected_at else None,
+                    "view_omitted": True,
+                }
+                if model_response_size([*page, minimal_match]) <= matches_budget:
+                    page.append(minimal_match)
+                    view_truncated = True
+                    consumed += 1
+                else:
+                    # 预算连最小 stub 都放不下：**不消费**该 Evidence，下一页重新
+                    # 出现（next_cursor 只能指向已消费项，绝不跳过未返回 match）。
+                    break
+            if len(page) >= _SEARCH_MATCH_LIMIT:
+                break
+
+        # cursor 只按实际消费的源 Evidence 推进（scanned_count 个），不允许直接
+        # 推进到 SQL 批次末尾——预算截掉的行必须在下页重新出现。
+        has_more = consumed < len(rows)
+        next_cursor: str | None = None
+        if has_more and consumed > 0:
+            last = rows[consumed - 1]
+            if last.collected_at is not None:
+                next_cursor = _encode_search_cursor(last.collected_at, last.id)
         summary_payload = {
             "query": args.query,
-            "total_matches": total,
-            "returned_matches": returned,
+            "scanned_count": consumed,
+            "returned_matches": len(page),
+            "next_cursor": next_cursor,
             "has_more": has_more,
-            "truncated": has_more,
+            "view_truncated": view_truncated,
+            "truncated": has_more or view_truncated,
             "matches": page,
         }
-        # 最终硬预算校验：超预算从末尾剔除 match（最小 match 极小，不会全部丢失）。
-        while (
-            summary_payload["matches"]
-            and model_response_size(summary_payload) > _MAX_TOOL_RESULT_TOTAL_CHARS
-        ):
-            summary_payload["matches"] = summary_payload["matches"][:-1]
-            summary_payload["returned_matches"] = len(summary_payload["matches"])
-            summary_payload["has_more"] = len(summary_payload["matches"]) < total
-            summary_payload["truncated"] = len(summary_payload["matches"]) < total
+        # 逐项预算校验保证整个响应 <= 50KB（占位测量固定字段为最保守值）。
         summary = json.dumps(summary_payload, ensure_ascii=False)
         return ToolResult(status="success", safe_summary=summary)
 
