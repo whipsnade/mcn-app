@@ -23,8 +23,10 @@ from app.agent_artifacts.models import AgentArtifact, AgentArtifactVersion
 from app.agent_runtime.events import AgentEventBroker, AgentEventStream
 from app.agent_runtime.executor import SESSION_ANALYST_PROFILE, AgentRunExecutor
 from app.agent_runtime.models import AgentRun, AgentSession, AgentToolCall, EvidenceItem
+from app.billing.models import Wallet
 from app.core.config import Settings
-from app.identity.models import User
+from app.identity.models import User, UserChannelPermission
+from app.identity.service import IdentityService
 from app.pi_runtime_poc.rpc import PiRpcClient, PiRpcConfig
 from app.pi_runtime_poc.runner import PiClientFactory, PiPocRunner
 
@@ -70,9 +72,22 @@ class RuntimeCaseExecutor(Protocol):
 class PocCaseFactory:
     """为每个 runtime/case 建立独立、可审计且同内容的 POC Run。"""
 
-    def __init__(self, session_factory: async_sessionmaker[AsyncSession], *, round_id: str) -> None:
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        *,
+        round_id: str,
+        model_name: str,
+        current_wallet_balance: int = 10_000,
+    ) -> None:
+        if not model_name:
+            raise ValueError("poc_model_name_required")
+        if current_wallet_balance <= 0:
+            raise ValueError("poc_current_wallet_balance_required")
         self._session_factory = session_factory
         self._round_id = round_id
+        self._model_name = model_name
+        self._current_wallet_balance = current_wallet_balance
 
     async def create(self, case: PocCase, runtime: RuntimeName) -> str:
         now = datetime.now(UTC).replace(tzinfo=None)
@@ -86,6 +101,29 @@ class PocCaseFactory:
                 created_at=now,
                 updated_at=now,
             )
+            db.add(user)
+            await db.flush()
+            for channel in IdentityService.default_channels:
+                db.add(
+                    UserChannelPermission(
+                        id=str(uuid4()),
+                        user_id=user.id,
+                        channel=channel,
+                        is_enabled=True,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+            if runtime == "current":
+                db.add(
+                    Wallet(
+                        user_id=user.id,
+                        balance=self._current_wallet_balance,
+                        reserved=0,
+                        version=0,
+                        updated_at=now,
+                    )
+                )
             session = AgentSession(
                 id=str(uuid4()),
                 user_id=user.id,
@@ -103,8 +141,8 @@ class PocCaseFactory:
                 run_kind="user",
                 visibility="user",
                 profile_name=SESSION_ANALYST_PROFILE,
-                profile_version="1",
-                model="runtime-config-snapshot",
+                profile_version="v1",
+                model=self._model_name,
                 status="queued",
                 prompt_snapshot_json={
                     "pi_runtime_poc": {
@@ -112,6 +150,9 @@ class PocCaseFactory:
                         "case_id": case.case_id,
                         "runtime": runtime,
                         "date_anchor": case.date_anchor,
+                        "billing_mode": "native_isolated_wallet"
+                        if runtime == "current"
+                        else "disabled",
                     }
                 },
                 created_at=now,
@@ -128,7 +169,7 @@ class PocCaseFactory:
                 created_at=now,
             )
             run.input_message_id = message.id
-            db.add_all((user, session, run, message))
+            db.add_all((session, run, message))
             await db.commit()
             return run.id
 
@@ -439,6 +480,16 @@ async def _collect_case_result(
             .select_from(AgentToolCall)
             .where(AgentToolCall.run_id == run_id, AgentToolCall.status == "settled")
         )
+        points_settled = await db.scalar(
+            select(func.coalesce(func.sum(AgentToolCall.points_settled), 0)).where(
+                AgentToolCall.run_id == run_id
+            )
+        )
+        points_reserved = await db.scalar(
+            select(func.coalesce(func.sum(AgentToolCall.points_reserved), 0)).where(
+                AgentToolCall.run_id == run_id
+            )
+        )
         value = outcome.value if hasattr(outcome, "value") else outcome
         outcome_text = str(value if value is not None else run.status)
         report_case = case.expected_behavior == _REPORT_BEHAVIOR
@@ -473,6 +524,8 @@ async def _collect_case_result(
                 "mcp_parameter_validity": (call_settled or 0) / (call_total or 1),
                 "artifact_completeness": int(bool(versions)) if report_case else 1,
                 "human_readability": None,
+                "points_settled": int(points_settled or 0),
+                "points_reserved": int(points_reserved or 0),
             },
             diagnostic_path=str(output_root / case.case_id / f"{runtime}.json"),
             hard_checks=hard_checks,

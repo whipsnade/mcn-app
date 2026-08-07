@@ -61,3 +61,30 @@
 `"1"`，Run model 写成占位值。新增计划 Task 8A 要求按 TDD 修复这些测试前置数据，不修改
 Current 计费代码。Task 8A 通过后允许重新执行一次真实 Task 9；此前状态保持
 **Gate A BLOCKED / NOT RUN**。
+
+---
+
+## Task 8A（2026-08-07）— Current 隔离基线已解除预检阻断
+
+### 修复与隔离核对
+
+- `PocCaseFactory` 为每个 Current 案例仅在 `kol_insight_pi_poc` 中创建一次性 Wallet：
+  `balance=10000`、`reserved=0`；Pi 案例不创建任何 Wallet。
+- 两侧用户均预置 `IdentityService.default_channels` 的渠道权限，Run 固定使用配置的真实模型名与
+  `profile_version="v1"`。
+- Current 仍走原生 `AgentMcpAccounting → WalletService`；没有增加 POC 旁路。积分字段只保留为
+  Task 9 诊断数据，`assess_gate_a` 不以积分判定效果。
+- 测试与迁移仅访问精确库 `kol_insight_pi_poc`；未连接 `kol_insight` 或 `kol_insight_test`。
+
+### 验证结果
+
+- `pytest -q tests/pi_runtime_poc/test_comparison.py tests/agent_runtime/tools/test_mcp.py` →
+  **55 passed**。
+- `pytest -q tests/pi_runtime_poc` → **64 passed**。
+- `ruff check app/pi_runtime_poc tests/pi_runtime_poc scripts/run_pi_runtime_poc.py` →
+  **All checks passed**。
+
+### 后续
+
+- Task 8A 已满足重启条件；尚未启动真实模型或 DataTap 六场景。
+- 下一步只能运行一次修订后的 Task 9；完成后按实际证据写 Gate A PASS 或 FAIL，并停止在方案 A。

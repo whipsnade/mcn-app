@@ -4,11 +4,24 @@ import json
 from pathlib import Path
 
 import pytest
+import pytest_asyncio
 from pydantic import SecretStr
+from sqlalchemy import select
+from sqlalchemy.dialects.mysql import MEDIUMTEXT
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.compiler import compiles
+from sqlalchemy.pool import StaticPool
 
+import app.db.models  # 注册所有 FK 目标供 SQLite POC fixture 建表
+from app.agent_runtime.models import AgentRun
+from app.billing.models import Wallet
 from app.core.config import Settings
+from app.db.base import Base
+from app.identity.models import UserChannelPermission
+from app.identity.service import IdentityService
 from app.pi_runtime_poc.comparison import (
     PocCase,
+    PocCaseFactory,
     PocCaseResult,
     assess_gate_a,
     begin_round,
@@ -18,6 +31,24 @@ from app.pi_runtime_poc.comparison import (
     write_round_summary,
 )
 from app.pi_runtime_poc.server import app
+
+
+@compiles(MEDIUMTEXT, "sqlite")
+def _mediumtext_sqlite(element, compiler, **kwargs) -> str:
+    return "TEXT"
+
+
+@pytest_asyncio.fixture
+async def db_session_factory() -> async_sessionmaker[AsyncSession]:
+    engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        poolclass=StaticPool,
+        connect_args={"check_same_thread": False},
+    )
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    yield async_sessionmaker(engine, expire_on_commit=False)
+    await engine.dispose()
 
 
 def _result(
@@ -157,3 +188,93 @@ def test_settings_accepts_blank_legacy_endpoint_but_requires_explicit_endpoint_m
 
     assert settings.datatap_mcp_url is None
     assert str(settings.datatap_mcp_urls["insight-cube-mcp"]) == "https://datatap.example.test/insight/mcp"
+
+
+async def test_case_factory_keeps_current_billing_and_pi_wallet_free(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    case = PocCase(
+        case_id="brand-research-v1",
+        user_question="分析最近一个月的品牌声量和情感",
+        date_anchor="2026-08-07",
+        expected_behavior="report",
+        required_artifact_type="brand_report_v3",
+    )
+    factory = PocCaseFactory(
+        db_session_factory,
+        round_id="round-restart",
+        model_name="deepseek-v4-pro",
+        current_wallet_balance=10_000,
+    )
+    current_run_id = await factory.create(case, "current")
+    pi_run_id = await factory.create(case, "pi")
+
+    async with db_session_factory() as db:
+        current = await db.get(AgentRun, current_run_id)
+        pi = await db.get(AgentRun, pi_run_id)
+        assert current is not None
+        assert pi is not None
+        current_wallet = await db.get(Wallet, current.user_id)
+        pi_wallet = await db.get(Wallet, pi.user_id)
+        current_channels = set(
+            (
+                await db.scalars(
+                    select(UserChannelPermission.channel).where(
+                        UserChannelPermission.user_id == current.user_id
+                    )
+                )
+            ).all()
+        )
+        pi_channels = set(
+            (
+                await db.scalars(
+                    select(UserChannelPermission.channel).where(
+                        UserChannelPermission.user_id == pi.user_id
+                    )
+                )
+            ).all()
+        )
+
+    assert current_wallet is not None
+    assert current_wallet.balance == 10_000
+    assert current_wallet.reserved == 0
+    assert current_wallet.version == 0
+    assert pi_wallet is None
+    assert current_channels == pi_channels == set(IdentityService.default_channels)
+    assert current.profile_version == pi.profile_version == "v1"
+    assert current.model == pi.model == "deepseek-v4-pro"
+    assert current.prompt_snapshot_json["pi_runtime_poc"]["billing_mode"] == "native_isolated_wallet"
+    assert pi.prompt_snapshot_json["pi_runtime_poc"]["billing_mode"] == "disabled"
+
+
+def test_gate_ignores_wallet_diagnostics_when_effect_metrics_are_equal() -> None:
+    cases = (
+        PocCase("brand-research-v1", "q", "2026-08-01", "report", "brand_report_v3"),
+        PocCase("campaign-evaluation-v1", "q", "2026-08-01", "report", "campaign_report_v2"),
+        PocCase("kol-selection-v1", "q", "2026-08-01", "report", "kol_selection_v3"),
+    )
+    results = []
+    for case in cases:
+        current = _result(case.case_id, "current")
+        pi = _result(case.case_id, "pi")
+        results.extend(
+            (
+                PocCaseResult(
+                    **{
+                        **current.__dict__,
+                        "metrics": {**current.metrics, "points_settled": 30, "points_reserved": 0},
+                    }
+                ),
+                PocCaseResult(
+                    **{
+                        **pi.__dict__,
+                        "metrics": {**pi.metrics, "points_settled": 0, "points_reserved": 0},
+                    }
+                ),
+            )
+        )
+
+    summary = assess_gate_a(cases, tuple(results))
+
+    assert summary["improved_metric_count"] == 0
+    assert "points_settled" not in summary["hard_checks"]

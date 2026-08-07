@@ -41,7 +41,12 @@ async def main() -> int:
     round_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     output_root = root / "outputs" / "pi-runtime-poc"
     round_dir = begin_round(output_root, round_id)
-    factory = PocCaseFactory(SessionFactory, round_id=round_id)
+    factory = PocCaseFactory(
+        SessionFactory,
+        round_id=round_id,
+        model_name=settings.tencent_plan_model,
+        current_wallet_balance=10_000,
+    )
     results = []
     # Current Runtime 也只使用主配置指向的真实 DataTap 工具目录；发现失败即让本轮失败，
     # 不以 fixture/mock 继续。
