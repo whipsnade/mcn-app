@@ -143,3 +143,30 @@ FAIL。本次没有启动案例，因而不消耗唯一真实 round 授权；完
 ### 后续
 
 - Task 8B 完成后，下一次 `--case all --runtime both` 才是第一轮真实对比；此前没有真实案例执行。
+
+---
+
+## Task 9 启动尝试（2026-08-07，Task 8B 后）— BLOCKED / NOT RUN
+
+### 已通过前置条件
+
+- DataTap 四服务 mapping 已按 Shell → `DATATAP_MCP_URLS` → Settings → Pi factory 链路通过本地预检；
+  迁移为 head、8000 端口空闲、无含数据的历史 round。
+- 真实启动入口只使用临时进程内的连接 token 与 endpoint mapping，未写入文件或输出。
+
+### 阻断与证据
+
+- 启动在 Current 的第一个案例调用 `PocCaseFactory.create()` 时失败，错误为
+  `agent_messages.session_id → agent_sessions` MySQL 外键约束失败。
+- 根因是 factory 在同一个 pending flush 中写入 `AgentSession`、`AgentRun` 和 `AgentMessage`，但没有
+  在 Message 前显式 flush 已被其标量外键引用的 Session/Run。事务已整体回滚。
+- 本次新增空目录 `outputs/pi-runtime-poc/20260807T123431Z/`，其中没有文件；它由修复后的
+  `begin_round()` 在 executor 构建成功后创建。精确 POC 库计数为 `AGENT_RUNS=0`、`TOOL_CALLS=0`、
+  `AGENT_SESSIONS=0`、`AGENT_MESSAGES=0`、`WALLETS=0`。
+- 未调用模型、DataTap MCP、Pi 子进程或钱包会计；没有形成真实 six-case round。
+
+### Gate A 结论
+
+**Gate A BLOCKED / NOT RUN**，不是 Pi 效果 FAIL。为避免重复真实 UAT，本会话不再运行；若要恢复，
+需先确认新的最小 Task 修复 factory 的 MySQL 持久化顺序并补真实 MySQL 回归测试，再重新授权首轮
+真实对比。方案 B/C 均未进入。
