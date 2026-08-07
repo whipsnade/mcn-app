@@ -88,3 +88,32 @@ Current 计费代码。Task 8A 通过后允许重新执行一次真实 Task 9；
 
 - Task 8A 已满足重启条件；尚未启动真实模型或 DataTap 六场景。
 - 下一步只能运行一次修订后的 Task 9；完成后按实际证据写 Gate A PASS 或 FAIL，并停止在方案 A。
+
+---
+
+## Task 9 重启尝试（2026-08-07）— BLOCKED / NOT RUN
+
+### 启动前核验
+
+- `APP_ENV=test`、`MYSQL_DATABASE=kol_insight_pi_poc`、`PI_RUNTIME_POC_ENABLED=true`，迁移为
+  `0036_export_claim_token (head)`；模型凭证与 DataTap token 均只确认存在。
+- DataTap 连接配置有效，包含 `bilibili-mcp`、`insight-cube-mcp`、
+  `social-grow-content-mcp`、`social-grow-mcp` 四个服务。token 与 endpoint 仅在本次子进程环境中
+  存在，未写入文件、输出或本记录。
+- 8000 端口空闲、无 POC 进程；Task 8A 提交 `3cc227f` 已确认。
+
+### 阻断与证据
+
+- 唯一一次 `bash scripts/run_pi_runtime_poc.sh --case all --runtime both` 启动尝试在创建任一案例前
+  fail-closed，错误为 `pi_poc_datatap_endpoint_mapping_required`。
+- 根因：启动脚本只将临时多服务映射导出为 `DATATAP_MCP_ENDPOINTS_JSON`，而 `Settings` 的
+  `datatap_mcp_urls` 使用 Pydantic 字段环境名 `DATATAP_MCP_URLS`；因此映射没有进入 Settings。
+  纯本地示例映射验证确认后者可被正确读取。
+- 输出目录仅有既有 `.gitkeep`；`kol_insight_pi_poc` 中 `AGENT_RUNS=0`、`TOOL_CALLS=0`；未调用
+  模型、DataTap MCP、Pi 进程或钱包，也未产生真实 round。
+
+### Gate A 结论
+
+**Gate A BLOCKED / NOT RUN**。本次阻断发生在真实六场景之前，不能评价 Pi 效果，不能写 PASS 或
+FAIL。按“只运行一轮、不以重跑掩盖波动”的规则，本轮不重跑，方案 A 到此停止；不得进入方案 B
+或方案 C。
