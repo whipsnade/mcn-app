@@ -70,6 +70,15 @@ class Settings(BaseSettings):
     task_lease_seconds: int = Field(default=60, gt=0)
     goal_planner_shadow_enabled: bool = False
     goal_planner_enforce_enabled: bool = False
+    # Pi RPC POC 必须显式开启，并且仅可配合隔离数据库运行。
+    pi_runtime_poc_enabled: bool = False
+    pi_runtime_poc_internal_secret: SecretStr | None = None
+    pi_runtime_poc_base_url: AnyHttpUrl = AnyHttpUrl(
+        "http://127.0.0.1:8000/api/v1/internal/pi-poc"
+    )
+    pi_runtime_poc_run_timeout_seconds: int = Field(default=1800, gt=0)
+    pi_runtime_poc_mcp_timeout_seconds: int = Field(default=180, gt=0)
+    pi_runtime_poc_max_decisions: int = Field(default=50, gt=0)
 
     @property
     def database_url(self) -> str:
