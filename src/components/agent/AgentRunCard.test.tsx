@@ -67,7 +67,7 @@ describe('AgentRunCard', () => {
     expect(cards[1]).toHaveTextContent('共 3 步');
   });
 
-  it('expands live thinking while streaming and collapses it on completion', () => {
+  it('keeps live thinking folded until the user expands it', () => {
     const { rerender } = render(
       <AgentRunCard
         run={run({
@@ -78,9 +78,12 @@ describe('AgentRunCard', () => {
         })}
       />,
     );
-    expect(screen.getByText('正在检索品牌数据')).toBeVisible();
+    const thinkingToggle = screen.getByRole('button', { name: '思考中' });
+    expect(thinkingToggle).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByText('正在检索品牌数据')).toBeNull();
 
-    // thinking 增量继续流式，保持展开。
+    // 用户展开后，后续 thinking 增量不得擅自切换展开状态。
+    fireEvent.click(thinkingToggle);
     rerender(
       <AgentRunCard
         run={run({
@@ -93,7 +96,7 @@ describe('AgentRunCard', () => {
     );
     expect(screen.getByText('正在检索品牌数据，再交叉匹配达人')).toBeVisible();
 
-    // 完成后 Run 卡与思考区自动折叠。
+    // Run 卡可按原有终态规则收起；Thinking 的用户选择不由状态变化改写。
     rerender(
       <AgentRunCard
         run={run({
@@ -233,23 +236,28 @@ describe('AgentRunCard', () => {
     expect(screen.queryByText(/s3cr3t/i)).toBeNull();
   });
 
-  it.each([
-    ['running', '质量复核中'],
-    ['revision_requested', '需要补充'],
-    ['approved', '已通过'],
-    ['rejected', '未通过'],
-  ] as const)('shows only the reviewer status for %s', (reviewStatus, label) => {
+  it('shows independent artifact publication outcomes and ignores legacy review state', () => {
     render(
       <AgentRunCard
         run={run({
-          status: 'reviewing',
-          review: { artifactIds: ['artifact-1'], status: reviewStatus, revisions: 0 },
+          status: 'completed_with_warnings',
+          drafts: [
+            { artifactId: 'brand', module: 'brand', version: 1, status: 'draft' },
+            { artifactId: 'campaign', module: 'campaign', version: 1, status: 'published' },
+            { artifactId: 'kol', module: 'kol', version: 1, status: 'validation_failed' },
+            { artifactId: 'detail', module: 'kol', version: 1, status: 'failed' },
+          ],
+          steps: [{ id: 'terminal', label: '分析完成（部分发布失败）', status: 'succeeded' }],
+          review: { artifactIds: ['brand'], status: 'running', revisions: 0 },
         })}
       />,
     );
-    expect(screen.getByText(`质量复核：${label}`)).toBeVisible();
-    // 不展示 Reviewer 内部思考。
-    expect(screen.queryByText(/审核意见|内部判断|confidence/i)).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: /执行卡/ }));
+    expect(screen.getByText('品牌报告准备中')).toBeVisible();
+    expect(screen.getByText('活动报告已发布')).toBeVisible();
+    expect(screen.getByText('达人名单发布校验失败')).toBeVisible();
+    expect(screen.getByText('达人名单发布失败')).toBeVisible();
+    expect(screen.queryByText(/审核|复核|Reviewer/i)).toBeNull();
   });
 
   it('shows a pause button for a running run and calls onPause', () => {

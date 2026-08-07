@@ -1,9 +1,9 @@
 import { memo, useEffect, useRef, useState } from 'react';
-import { ChevronDown, ChevronRight, Pause, Play, ShieldCheck, Workflow } from 'lucide-react';
+import { ChevronDown, ChevronRight, Pause, Play, Workflow } from 'lucide-react';
 
 import {
   isTerminalRunStatus,
-  type RunReviewStatus,
+  type RunArtifactDraft,
   type RunRuntimeState,
 } from '../../state/agentEvents';
 import AgentClarification from './AgentClarification';
@@ -34,26 +34,39 @@ export interface AgentRunCardProps {
 const STATUS_META: Record<string, { label: string; dot: string }> = {
   queued: { label: '排队中', dot: 'bg-slate-400' },
   running: { label: '执行中', dot: 'bg-indigo-500 animate-pulse' },
-  reviewing: { label: '审核中', dot: 'bg-amber-500 animate-pulse' },
+  reviewing: { label: '历史执行状态', dot: 'bg-slate-400' },
   paused: { label: '已暂停', dot: 'bg-slate-400' },
   clarification_requested: { label: '等待补充信息', dot: 'bg-amber-500' },
   completed: { label: '分析完成', dot: 'bg-emerald-500' },
+  completed_with_warnings: { label: '部分完成', dot: 'bg-amber-500' },
   failed: { label: '运行失败', dot: 'bg-rose-500' },
   cancelled: { label: '已取消', dot: 'bg-slate-400' },
 };
 
-/** Reviewer 只显示状态，不展示 Reviewer 内部思考。 */
-const REVIEW_LABELS: Record<RunReviewStatus, string> = {
-  running: '质量复核中',
-  revision_requested: '需要补充',
-  approved: '已通过',
-  rejected: '未通过',
+const ARTIFACT_MODULE_LABELS: Record<string, string> = {
+  brand: '品牌报告',
+  campaign: '活动报告',
+  kol: '达人名单',
+  insight: '洞察看板',
 };
+
+const ARTIFACT_STATUS_LABELS: Record<string, string> = {
+  draft: '准备中',
+  preparing: '准备中',
+  published: '已发布',
+  validation_failed: '发布校验失败',
+  failed: '发布失败',
+};
+
+function artifactPublicationLabel(draft: RunArtifactDraft): string {
+  const moduleLabel = ARTIFACT_MODULE_LABELS[draft.module] ?? '分析产物';
+  return `${moduleLabel}${ARTIFACT_STATUS_LABELS[draft.status] ?? '处理中'}`;
+}
 
 /**
  * 每个 Run 一张独立执行卡（design §13.1）：
  * - 已完成 Run 不被后续消息复用，卡片锚定在触发消息下方；
- * - thinking 实时展示、完成后折叠；
+ * - Thinking 首次折叠，仅响应用户手动展开；
  * - 工具步骤只显示安全名称/状态/耗时/积分；
  * - paused 显示继续按钮；clarification_requested 显示问题与选项 chips。
  * - 历史 Run 的完整状态由 useRunHistoryReplay 事件回放补齐；回放失败时
@@ -87,7 +100,7 @@ export function AgentRunCardImpl({
 
   const statusMeta = STATUS_META[run.status ?? ''] ?? { label: '执行中', dot: 'bg-indigo-500 animate-pulse' };
   const stepCount = run.steps.length;
-  const canPause = (run.status === 'running' || run.status === 'reviewing') && onPause !== undefined;
+  const canPause = run.status === 'running' && onPause !== undefined;
 
   // 终态折叠：一行可展开摘要。回放失败/无步骤的历史 Run 不渲染“共 0 步”的
   // 误导文案，保留「历史执行记录」降级标识（回放见 useRunHistoryReplay）。
@@ -153,7 +166,7 @@ export function AgentRunCardImpl({
         </div>
       </div>
 
-      {/* 内容区：思考 + 工具步骤 + Reviewer + 澄清 + 错误 */}
+      {/* 内容区：思考 + 工具步骤 + 逐项发布结果 + 澄清 + 错误 */}
       <div className="space-y-2.5 px-3.5 py-3">
         {(run.hasThinking || !terminal) && (
           <AgentThinking text={run.thinking} hasThinking={run.hasThinking} status={run.thinkingStatus} />
@@ -165,13 +178,14 @@ export function AgentRunCardImpl({
             该历史执行详情暂未回放
           </p>
         )}
-        {run.review && (
-          <div className="flex items-center gap-1.5">
-            <ShieldCheck className="h-3.5 w-3.5 shrink-0 text-indigo-500" aria-hidden="true" />
-            <span className="text-[11px] font-medium text-slate-600">
-              质量复核：{REVIEW_LABELS[run.review.status] ?? run.review.status}
-            </span>
-          </div>
+        {run.drafts.length > 0 && (
+          <ul className="space-y-1" aria-label="产物发布状态">
+            {run.drafts.map(draft => (
+              <li key={draft.artifactId} className="text-[11px] font-medium text-slate-600">
+                {artifactPublicationLabel(draft)}
+              </li>
+            ))}
+          </ul>
         )}
         {run.status === 'clarification_requested' && clarification && (
           <AgentClarification

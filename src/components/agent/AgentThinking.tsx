@@ -1,7 +1,7 @@
-import { useEffect, useId, useRef, useState } from 'react';
+import { useId, useState } from 'react';
 import { ChevronRight, Loader2 } from 'lucide-react';
 
-/** Agent Run 的思考块（design §13.1：thinking 实时展示，完成后默认折叠）。 */
+/** Agent Run 的思考块（design §13.1：首次渲染默认折叠，由用户决定是否展开）。 */
 export interface AgentThinkingProps {
   /** 已累积的思考文本；收到 thinking.* 事件后由 reducer 追加。 */
   text: string;
@@ -18,28 +18,12 @@ const TITLE: Record<NonNullable<AgentThinkingProps['status']>, string> = {
 };
 
 /**
- * 思考区：流式期间自动展开实时展示，结束后自动折叠；
+ * 思考区：首次渲染默认折叠，后续 delta 和状态变化均不覆盖用户的展开选择；
  * 完全没有 thinking 事件时只渲染一个不可展开的「正在处理」状态行。
  */
 export default function AgentThinking({ text, hasThinking, status }: AgentThinkingProps) {
-  const [expanded, setExpanded] = useState(status === 'running');
-  const previousRunningRef = useRef(status === 'running');
-  const terminalCollapsedRef = useRef(false);
+  const [expanded, setExpanded] = useState(false);
   const contentId = useId();
-
-  // 运行 → 完成/中断：自动折叠；恢复为运行：重新展开。
-  useEffect(() => {
-    const wasRunning = previousRunningRef.current;
-    const isRunning = status === 'running';
-    if (isRunning && !wasRunning) {
-      terminalCollapsedRef.current = false;
-      setExpanded(true);
-    } else if (!isRunning && wasRunning && !terminalCollapsedRef.current) {
-      terminalCollapsedRef.current = true;
-      setExpanded(false);
-    }
-    previousRunningRef.current = isRunning;
-  }, [status]);
 
   // 无 thinking 事件：运行中渲染不可展开的「正在处理」，避免编造推理；
   // 已完成的思考流（completed/interrupted）不再显示旋转占位，改标为「未生成思考」。

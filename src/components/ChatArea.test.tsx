@@ -211,7 +211,8 @@ describe('ChatArea', () => {
     expect(collapsed).toHaveTextContent('分析完成');
     expect(collapsed).toHaveTextContent('共 2 步');
     expect(screen.getByText('kol_feed')).toBeVisible();
-    expect(screen.getByText('正在交叉匹配达人')).toBeVisible();
+    expect(screen.getByRole('button', { name: '思考中' })).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByText('正在交叉匹配达人')).toBeNull();
     // 活跃 Run 已锚定到消息，底部不再重复渲染执行卡。
     expect(screen.getAllByLabelText('执行卡')).toHaveLength(1);
     // 历史卡锚定在第一轮消息之后、第二轮消息之前；活跃卡在第二轮消息之后。
