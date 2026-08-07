@@ -170,3 +170,26 @@ FAIL。本次没有启动案例，因而不消耗唯一真实 round 授权；完
 **Gate A BLOCKED / NOT RUN**，不是 Pi 效果 FAIL。为避免重复真实 UAT，本会话不再运行；若要恢复，
 需先确认新的最小 Task 修复 factory 的 MySQL 持久化顺序并补真实 MySQL 回归测试，再重新授权首轮
 真实对比。方案 B/C 均未进入。
+
+---
+
+## Task 8C（2026-08-07）— MySQL fixture 持久化顺序修复
+
+### 修复与隔离核对
+
+- 新增显式 opt-in 的 `kol_insight_pi_poc` MySQL 回归测试；默认测试不运行它，绝不连接
+  `kol_insight` 或 `kol_insight_test`。
+- `PocCaseFactory` 现在严格按 `AgentSession → flush → AgentRun → flush → AgentMessage` 持久化，
+  最后回填 `input_message_id`。未修改表结构、计费、Wallet、DataTap Hook 或 Pi。
+- 初始红灯复现 Message FK；首次最小修复暴露 Run FK；逐层 flush 后在真实 MySQL 通过，表明根因是
+  无 ORM relationship 的标量 FK 同批 flush 顺序，而非供应商或 Pi 行为。
+
+### 验证结果
+
+- `RUN_PI_POC_MYSQL_TESTS=1 pytest -q tests/pi_runtime_poc/test_task8c_mysql.py` → **1 passed**。
+- 清理后 `AGENT_RUNS=0`、`TOOL_CALLS=0`、`AGENT_SESSIONS=0`、`AGENT_MESSAGES=0`、`WALLETS=0`。
+- 未调用模型、DataTap MCP、Pi 或钱包会计；没有创建新 round。
+
+### 后续
+
+- Task 8C 提交后，重新执行 Task 9 前必须重做脱敏预检；下一次才允许启动首轮真实 six-case 对比。

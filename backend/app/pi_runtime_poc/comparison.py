@@ -157,6 +157,12 @@ class PocCaseFactory:
                 },
                 created_at=now,
             )
+            # 三层均为标量 FK、没有 ORM relationship：严格按 Session → Run → Message 刷新，
+            # 最后再回填 Run.input_message_id，避免 MySQL 任一层被提前插入。
+            db.add(session)
+            await db.flush()
+            db.add(run)
+            await db.flush()
             from app.agent_runtime.models import AgentMessage
 
             message = AgentMessage(
@@ -169,7 +175,7 @@ class PocCaseFactory:
                 created_at=now,
             )
             run.input_message_id = message.id
-            db.add_all((session, run, message))
+            db.add(message)
             await db.commit()
             return run.id
 
