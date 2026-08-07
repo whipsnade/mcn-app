@@ -34,7 +34,9 @@
 - 所有报告数值必须具有 Evidence lineage；缺失数据允许 `partial`，不允许编造。
 - MySQL 是唯一事实来源；Pi Session 只是单 Run 的临时执行上下文。
 - 每条用户消息创建新 Run；同一业务会话可以跨 Run 复用历史 Artifact 和 Evidence。
-- POC 不考虑积分；生产化后才恢复 License、配额和透明预留结算。
+- POC 不把积分作为评价指标，也不接触真实用户钱包。Pi 路径不接钱包；用于同轮基线对比
+  的 Current Runtime 保持原生产计费路径，并只使用 POC 独立库中的一次性测试钱包。
+  生产化后才为 Pi 路径增加 License、配额和透明预留结算。
 - 首期禁用 Pi 的 Shell、read/write/edit 等内建工具，只开放审核过的营销工具。
 
 ## 3. 总体架构
@@ -101,8 +103,12 @@ Hook 禁止修改请求、隐藏业务字段、提前归一化模型视图、选
 或注入业务路由。DataTap token 只进入子进程内存或环境变量，不进入 Prompt、Skill、
 事件、Artifact、日志和前端。
 
-POC 不使用钱包、积分预留或结算，也不因余额阻断调用。方案 B 中 Hook 才在外发前增加
-License/配额校验和积分预留，调用后结算或释放；这一控制不改变 MCP 请求和响应。
+POC 的 **Pi 路径**不使用钱包、积分预留或结算，也不因余额阻断调用。用于效果基线的
+Current Runtime 不得绕过或修改既有 `WalletService` 计费路径：Harness 在
+`kol_insight_pi_poc` 中为每个 Current 案例创建一次性测试钱包和充足余额，让原 Runtime
+正常执行 reserve/settle/release；这些积分只属于隔离测试数据，不进入比较指标，也不影响
+真实用户。方案 B 中 Pi Hook 才在外发前增加 License/配额校验和积分预留，调用后结算或
+释放；这一控制不改变 MCP 请求和响应。
 
 ## 5. 报告闭环
 
@@ -175,6 +181,8 @@ Skill 名、版本和 digest。管理端首期只能选择启用的版本集合�
 - 每个 Run 启动一个 `pi --mode rpc --no-session --no-builtin-tools` 子进程；显式加载本项目
   Extension 与 Skills，并禁用未审核的自动发现资源。
 - POC 串行，并发为 1；单 Run 最多 30 分钟、50 次模型决策。
+- 每个 runtime/case 使用独立一次性用户；两侧具有相同默认渠道权限。仅 Current 用户创建
+  POC 测试钱包，Pi 用户没有钱包。Current 的钱包流水只作基线真实性审计，不参与 Gate。
 - Run 完成、失败、取消或超时后结束子进程；记录严格 JSONL RPC 轨迹。
 - Pi CLI/SDK 包名与版本必须在技术探针中以官方当前发行版确认并锁定。官方仓库已从
   `badlogic/pi-mono` 跳转到 `earendil-works/pi`，不得依赖浮动的 `latest`。
@@ -242,7 +250,8 @@ Runtime 保留一个稳定发布周期作为回滚，不在本次集成中删除
 
 - 不让 Pi 直接写 MySQL、Excel 文件或前端状态。
 - 不开放 Shell、文件编辑、任意 HTTP 或第三方未审核 Extension。
-- 不在 POC 开发积分、License、管理端或高并发。
+- 不在 POC 为 Pi 开发积分能力，也不开发 License、管理端或高并发；Current Runtime 仅
+  复用原有计费代码和隔离测试钱包，不属于新增积分功能。
 - 不同时研究第二个模型；current 与 Pi 只使用同一模型。
 - 不支持多品牌合并调研；单一品牌和单独竞品调研沿用当前产品约束。
 - 不实施方案 C Marketing MCP Gateway。

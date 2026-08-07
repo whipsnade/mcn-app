@@ -36,7 +36,9 @@
   实施方案 C Marketing MCP Gateway。
 - POC 数据库必须精确为 kol_insight_pi_poc；任何其他数据库名立即 fail closed。不得读写
   kol_insight 或 kol_insight_test。
-- POC 完全不处理积分：不查询钱包、不预留、不扣减、不结算。
+- 积分不属于 POC 评价指标，也不能接触真实用户钱包。Pi 路径不创建钱包、不预留、不扣减、
+  不结算；Current 基线路径必须保持原生 WalletService reserve/settle/release，并仅使用
+  kol_insight_pi_poc 中每案例独立的一次性测试钱包。不得修改或绕过 Current 计费代码。
 - Current Runtime 与 Pi 必须使用完全相同的 provider、model、thinking level、用户输入、
   会话历史、日期窗口和 DataTap 凭证；同模型无法在 Pi 使用时 Gate 直接失败，不得替换模型。
 - Pi 每个 Run 使用独立临时 Session/进程，--mode rpc --no-session --no-builtin-tools
@@ -63,9 +65,12 @@
    JSONL、Extension、Skill、tool flags，并验证 Pi 能使用当前 Runtime 的同一模型。
 3. 按 Task 2–8 完成隔离门禁、RPC client、DataTap Extension、Evidence 旁路、内部工具、
    Skills、Run/Event 适配和对比 Harness。
-4. Tasks 1–8 的单元/集成测试全部通过后，执行 Task 9 一轮真实六场景 current/pi 对比。
+4. Tasks 1–8 的单元/集成测试全部通过后，先执行修订后的 Task 8A：给 Current fixture 补齐
+   隔离钱包、默认渠道权限、真实 model 和 profile_version=v1，同时保持 Pi 无钱包；通过后
+   才执行 Task 9 一轮真实六场景 current/pi 对比。
 5. 运行计划列出的后端、pi-runtime、前端全量回归；真实服务结果不因失败而反复重跑。
-6. 按硬门槛写出明确 Gate A PASS 或 FAIL。只要一个硬门槛失败就是 FAIL，并列出证据路径。
+6. 只有真实六场景至少启动并创建 round 后才能写 Gate A PASS 或 FAIL；若在真实调用前因
+   配置或基础设施阻断，只能写 Gate A BLOCKED / NOT RUN。一个效果硬门槛失败才是 FAIL。
 7. Gate A 结束后停止。不要自行进入方案 B。提醒用户：通过后应基于实测 Pi API 新建方案 B
    详细计划；Pi 链路稳定一个发布周期后再提醒评估方案 C。
 

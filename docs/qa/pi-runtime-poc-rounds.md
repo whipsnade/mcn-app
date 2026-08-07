@@ -8,6 +8,9 @@
 
 ## Gate A 预检（2026-08-07）— FAIL，未创建真实 round
 
+> 后续设计方复核已将本记录重分类为 `BLOCKED / NOT RUN`；保留本标题和原文仅用于审计，
+> 当前有效结论见文末“设计方复核”。
+
 ### 执行范围
 
 - 仅执行配置/数据库门禁、DataTap 接入结构检查、单次只读 MCP `initialize` 探针和静态调用链审查。
@@ -41,3 +44,20 @@
   禁止任何积分处理”的冲突，并形成新的确认计划；不能自行添加无积分 Current Runtime 分支。
 - 仅当后续 Gate A 通过，才基于实测 Pi API 新建方案 B 详细计划；Pi 链路稳定一个发布周期后再
   评估方案 C。
+
+---
+
+## 设计方复核（2026-08-07）— 重分类为 BLOCKED / NOT RUN
+
+原预检事实保留，但“Gate A FAIL”结论经设计方复核后不作为 Pi 效果失败：该轮没有调用模型、
+没有运行六案例、没有创建真实 round，无法评价 Pi 或 Current 的报告效果。
+
+根因是旧计划把用户确认的“POC 不考虑积分”错误扩大为“Current 基线也禁止读取和写入隔离
+钱包”。正确边界是：积分不参与 POC 评价、不接触真实用户钱包；Pi 路径无钱包；Current
+路径必须保持生产原生 `AgentMcpAccounting → WalletService`，但只使用
+`kol_insight_pi_poc` 中每案例独立的一次性测试钱包。
+
+代码复核同时发现 Current fixture 尚缺 Wallet、默认渠道权限，`profile_version` 错写为
+`"1"`，Run model 写成占位值。新增计划 Task 8A 要求按 TDD 修复这些测试前置数据，不修改
+Current 计费代码。Task 8A 通过后允许重新执行一次真实 Task 9；此前状态保持
+**Gate A BLOCKED / NOT RUN**。
