@@ -16,6 +16,11 @@ from typing import Any
 
 _STDERR_TAIL_BYTES = 64 * 1024
 _CLOSE_GRACE_SECONDS = 5.0
+_ABORT_GRACE_SECONDS = 2.0
+_TERMINATE_GRACE_SECONDS = 2.0
+_MAX_RPC_RECORD_BYTES = 1024 * 1024
+# 仅这些非敏感变量从宿主环境放行；其余宿主环境绝不整体继承进 Pi 子进程。
+_ENV_ALLOWLIST = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "LANGUAGE", "TMPDIR", "HOME")
 _END = object()
 
 
@@ -83,16 +88,7 @@ class PiRpcClient:
             raise ValueError("pi_timeout_must_be_positive")
 
         agent_dir = Path(tempfile.mkdtemp(prefix="kol-insight-pi-rpc-"))
-        environment = os.environ.copy()
-        if config.environment is not None:
-            environment.update(config.environment)
-        environment.update(
-            {
-                "PI_CODING_AGENT_DIR": str(agent_dir),
-                "PI_OFFLINE": "1",
-                "PI_SKIP_VERSION_CHECK": "1",
-            }
-        )
+        environment = _pi_environment(agent_dir, config.environment)
         args = _command_args(config)
         try:
             process = await asyncio.create_subprocess_exec(
@@ -141,14 +137,32 @@ class PiRpcClient:
             yield item
 
     async def abort(self) -> None:
-        """请求 Pi abort，并等待 Pi 退出，避免遗留孤儿子进程。"""
+        """请求 Pi abort，并确保本 Run 的精确子进程有限时退出，避免遗留孤儿进程。"""
 
         if self._closed or self._process.returncode is not None:
             return
         self._abort_requested = True
         await self._write({"id": _request_id(), "type": "abort"})
-        if self._wait_task is not None:
+        if self._wait_task is None:
+            return
+        # 1) 短暂宽限让 Pi 自主处理 abort 后退出
+        await self._await_exit_within(_ABORT_GRACE_SECONDS)
+        # 2) 仍未退出：仅操作当前精确 PID 的 terminate
+        if self._process.returncode is None:
+            self._process.terminate()
+            await self._await_exit_within(_TERMINATE_GRACE_SECONDS)
+        # 3) 仍未退出：仅操作当前精确 PID 的 kill
+        if self._process.returncode is None:
+            self._process.kill()
             await self._wait_task
+
+    async def _await_exit_within(self, seconds: float) -> None:
+        if self._wait_task is None or self._process.returncode is not None:
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(self._wait_task), timeout=seconds)
+        except TimeoutError:
+            pass
 
     async def close(self) -> None:
         """终止仍在运行的子进程并清理此 Run 的临时资源目录。"""
@@ -202,6 +216,9 @@ class PiRpcClient:
         try:
             while chunk := await self._process.stdout.read(4096):
                 buffer.extend(chunk)
+                if len(buffer) > _MAX_RPC_RECORD_BYTES:
+                    await self._fail(PiRpcProtocolError("rpc_record_too_large"))
+                    return
                 while (line_end := buffer.find(b"\n")) >= 0:
                     line = bytes(buffer[:line_end])
                     del buffer[: line_end + 1]
@@ -260,6 +277,28 @@ class PiRpcClient:
 
     def _stderr_text(self) -> str:
         return bytes(self._stderr_tail).decode("utf-8", errors="replace")
+
+
+def _pi_environment(
+    agent_dir: Path,
+    explicit: Mapping[str, str] | None,
+) -> dict[str, str]:
+    """构造 Pi 子进程环境：仅 allowlist 宿主非敏感变量 + 显式配置 + Pi 必需键。
+
+    绝不整体继承宿主环境，避免数据库密码、DataTap token、模型 key、
+    内部签名 secret 等因环境继承进入 Pi。
+    """
+    env = {key: os.environ[key] for key in _ENV_ALLOWLIST if key in os.environ}
+    if explicit:
+        env.update(explicit)
+    env.update(
+        {
+            "PI_CODING_AGENT_DIR": str(agent_dir),
+            "PI_OFFLINE": "1",
+            "PI_SKIP_VERSION_CHECK": "1",
+        }
+    )
+    return env
 
 
 def _command_args(config: PiRpcConfig) -> list[str]:
