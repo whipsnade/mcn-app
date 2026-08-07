@@ -1,6 +1,6 @@
 # Pi-only Gate A 修订设计
 
-> 状态：已确认，待实施计划
+> 状态：已确认，实施计划已生成
 >
 > 日期：2026-08-08
 >
@@ -47,8 +47,8 @@ Harness 以 `(case_id, runtime=pi)` 为独立结果单元。任何案例失败�
 
 产物钻取仅依赖 Pi 品牌报告：若品牌 Artifact 不可用，钻取写入
 `status=skipped_dependency` 和稳定原因 `poc_dependency_artifact_unavailable`，但范围澄清与
-非营销拒答仍必须执行。无论成功、失败或跳过，round 都必须在 `finally` 中生成完整
-`summary.json`，并列出全部六个案例的状态；不得因异常只留下半轮目录。
+非营销拒答仍必须执行。无论成功、失败或跳过，执行器都必须在 `finally` 中生成完整且不可变的
+`execution.json`，并列出全部六个案例的状态；不得因异常只留下半轮目录。
 
 ### 2.3 Pi-only Harness
 
@@ -80,7 +80,7 @@ Run、输出目录或外部调用创建前 fail-closed。历史 Current/Pi round
 
 ### 4.1 硬门槛
 
-- `summary.json` 含六个且仅六个 Pi 案例结果。
+- `execution.json` 和最终 `summary.json` 均含六个且仅六个 Pi 案例结果。
 - 三个主报告均成功发布所需 Artifact Version；对应 Excel 可由 `openpyxl` 打开，必需 Sheet、关键
   数据类型、图表对象和 Artifact id/version 元数据正确；BI 与 Excel 消费同一 Version。
 - 所有已发布数值可追溯到 available Evidence；`partial` 明确披露缺失和限制。
@@ -115,8 +115,11 @@ Run、输出目录或外部调用创建前 fail-closed。历史 Current/Pi round
 
 ## 6. 输出与后续
 
-每个案例只生成 `pi.json`；round 的 `summary.json` 记录案例状态、Artifact Version、Evidence、
-ToolCall、数据覆盖、质量评分和 Gate 状态。QA 与 changelog 只记录脱敏事实。
+每个案例只生成 `pi.json`；执行器在 `finally` 中一次性写 `execution.json`，记录案例状态、
+Artifact Version、Evidence、ToolCall 和数据覆盖。若状态为 `BLOCKED` 或 `INFRA_FAILED`，可据此
+直接一次性生成最终 `summary.json`。六场景技术执行完整时，人工评审另写不含供应商原始内容的
+`human-review.json`，再由零模型、零 MCP 的 finalizer 一次性生成 `summary.json`，写入四项评分和
+最终 `EVALUATED_FAIL` 或 `PASS`；三个文件均不得覆盖或改写。QA 与 changelog 只记录脱敏事实。
 
 只有 Pi-only Gate A `PASS` 才进入方案 B 详细计划。方案 B 仍保留租户级灰度与 Current Runtime
 回滚能力；待 Pi 链路稳定一个发布周期后，再提醒用户评估已单独记录的方案 C Marketing MCP
