@@ -50,6 +50,17 @@ export class PiPocHttpClient {
     await this.request(`/runs/${this.runId}/tool-calls/${callId}/fail`, { error });
   }
 
+  async executeInternalTool(
+    toolName: string,
+    argumentsValue: Record<string, unknown>,
+  ): Promise<unknown> {
+    const body = await this.request(`/runs/${this.runId}/internal-tools`, {
+      tool_name: toolName,
+      arguments: argumentsValue,
+    });
+    return body.result;
+  }
+
   private async request(path: string, body: unknown): Promise<Record<string, unknown>> {
     const response = await fetch(`${this.baseUrl}${path}`, {
       method: "POST",

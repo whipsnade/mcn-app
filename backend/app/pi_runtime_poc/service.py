@@ -25,8 +25,14 @@ from app.agent_runtime.models import (
     AgentToolCall,
     EvidenceItem,
 )
+from app.agent_runtime.repository import AgentRunRepository
+from app.agent_runtime.tools.registry import UnknownToolError
 from app.core.config import Settings
 from app.pi_runtime_poc.auth import verify_run_token
+from app.pi_runtime_poc.internal_tools import (
+    PIPOC_PROFILE,
+    build_pi_internal_registry,
+)
 from app.pi_runtime_poc.schemas import (
     PiToolFailed,
     PiToolSettled,
@@ -55,12 +61,52 @@ def _arguments_hash(arguments: dict[str, Any]) -> str:
 
 
 class PiEvidenceIngestService:
-    """零积分 Evidence 旁路状态机（仅 POC 内部使用）。"""
+    """零积分 Evidence 旁路状态机 + 受控内部工具桥（仅 POC 内部使用）。"""
 
-    def __init__(self, *, db: AsyncSession, events: AgentEventStream, settings: Settings) -> None:
+    def __init__(
+        self,
+        *,
+        db: AsyncSession,
+        events: AgentEventStream,
+        settings: Settings,
+        worker_id: str = "pi-poc",
+    ) -> None:
         self._db = db
         self._events = events
         self._settings = settings
+        self._worker_id = worker_id
+
+    async def execute_internal_tool(
+        self, *, token: str, run_id: str, tool_name: str, arguments: dict[str, Any]
+    ) -> dict[str, Any]:
+        """执行白名单内部工具；身份一律来自 token 对应 Run，伪造字段被 Registry 剥离。
+
+        publish_artifacts 前确保当前 worker 持有 Run 活跃租约（发布前置条件）。
+        """
+        verify_run_token(token, run_id, settings=self._settings)
+        run = await self._db.get(AgentRun, run_id)
+        if run is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "pi_run_not_found")
+        registry = build_pi_internal_registry(db=self._db, worker_id=self._worker_id)
+        if tool_name == "publish_artifacts":
+            repo = AgentRunRepository(self._db)
+            if not await repo.holds_lease(run_id, self._worker_id):
+                await repo.claim_lease(
+                    run_id, self._worker_id, self._settings.pi_runtime_poc_run_timeout_seconds
+                )
+        try:
+            result = await registry.execute(
+                internal_name=tool_name,
+                arguments=arguments,
+                user_id=run.user_id,
+                session_id=run.session_id,
+                run_id=run.id,
+                profile=PIPOC_PROFILE,
+                channel_permissions=(),
+            )
+        except UnknownToolError:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "pi_internal_tool_not_found")
+        return result.model_dump(mode="json")
 
     async def start_tool(
         self, *, token: str, run_id: str, request: PiToolStarted

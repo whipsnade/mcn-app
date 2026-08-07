@@ -10,6 +10,8 @@ from app.core.config import Settings, get_settings
 from app.db.session import get_db
 from app.pi_runtime_poc.auth import PiPocSettingsGuard
 from app.pi_runtime_poc.schemas import (
+    PiInternalToolRequest,
+    PiInternalToolResponse,
     PiToolFailed,
     PiToolSettled,
     PiToolSettledResponse,
@@ -80,3 +82,19 @@ async def fail_tool(
         token=_bearer_token(request), run_id=run_id, call_id=call_id, request=body
     )
     return {"ok": True}
+
+
+@router.post("/{run_id}/internal-tools", response_model=PiInternalToolResponse)
+async def execute_internal_tool(
+    run_id: str,
+    body: PiInternalToolRequest,
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> PiInternalToolResponse:
+    result = await _service(request, db).execute_internal_tool(
+        token=_bearer_token(request),
+        run_id=run_id,
+        tool_name=body.tool_name,
+        arguments=body.arguments,
+    )
+    return PiInternalToolResponse(result=result)
