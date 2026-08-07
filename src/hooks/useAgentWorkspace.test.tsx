@@ -305,7 +305,9 @@ describe('useAgentWorkspace', () => {
       runId = await result.current.sendMessage('s1', '帮我分析品牌');
     });
 
-    expect(agentApi.sendMessage).toHaveBeenCalledWith('s1', '帮我分析品牌');
+    expect(agentApi.sendMessage).toHaveBeenCalledWith('s1', '帮我分析品牌', expect.objectContaining({
+      idempotencyKey: expect.any(String),
+    }));
     expect(runId).toBe('run-2');
     expect(result.current.activeRunId).toBe('run-2');
     expect(vi.mocked(useAgentRun).mock.calls.at(-1)?.[0]).toBe('run-2');

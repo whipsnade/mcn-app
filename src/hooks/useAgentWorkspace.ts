@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type {
   AgentKolDetailResponse,
   AgentKolDetailSelectionRef,
+  AgentMessageOptions,
   ApiAgentMessage,
   ApiAgentRun,
   ApiAgentSession,
@@ -17,6 +18,7 @@ import {
   listSessions,
   patchSession as patchSessionRequest,
   resumeRun as resumeRunRequest,
+  retryRun as retryRunRequest,
   sendMessage as sendMessageRequest,
 } from '../api/agent';
 import type { ApiAgentArtifact } from '../api/agentArtifacts';
@@ -293,7 +295,7 @@ export function useAgentWorkspace(userId?: string) {
     }
   }, [selectSession, userId]);
 
-  const sendMessage = useCallback(async (sessionId: string, content: string): Promise<string> => {
+  const sendMessage = useCallback(async (sessionId: string, content: string, options?: AgentMessageOptions): Promise<string> => {
     if (!userId) throw new Error('AUTH_EXPIRED');
     const generation = generationRef.current;
     setBusy(true);
@@ -317,7 +319,7 @@ export function useAgentWorkspace(userId?: string) {
     };
     patchMessages(sessionId, messages => [...messages, optimisticMessage]);
     try {
-      const response = await sendMessageRequest(sessionId, content);
+      const response = await sendMessageRequest(sessionId, content, { ...options, idempotencyKey: crypto.randomUUID() });
       if (generationRef.current !== generation) throw new Error('STALE_WORKSPACE_REQUEST');
       // 回填 run_id：执行卡锚定到触发它的用户消息下方。
       patchMessages(sessionId, messages => messages.map(message => message.id === optimisticId
@@ -336,6 +338,24 @@ export function useAgentWorkspace(userId?: string) {
       if (generationRef.current === generation) setBusy(false);
     }
   }, [userId]);
+
+  const retryRun = useCallback(async (runId: string): Promise<string> => {
+    const generation = generationRef.current;
+    const response = await retryRunRequest(runId);
+    if (generationRef.current !== generation) throw new Error('STALE_WORKSPACE_REQUEST');
+    if (activeSessionIdRef.current === response.session_id) setActiveRunId(response.run_id);
+    try {
+      const detail = await getSession(response.session_id);
+      if (generationRef.current === generation) {
+        const session = toWorkspaceSession(detail);
+        sessionsRef.current = replaceSession(sessionsRef.current, session);
+        setSessions(sessionsRef.current);
+      }
+    } catch {
+      // 新 Run 已由 response 确认；详情回拉失败不回滚旧终态或复用旧 Run。
+    }
+    return response.run_id;
+  }, []);
 
   const cancelActiveRun = useCallback(async () => {
     if (!activeRunId) return;
@@ -488,6 +508,7 @@ export function useAgentWorkspace(userId?: string) {
     renameSession,
     deleteSession,
     sendMessage,
+    retryRun,
     cancelActiveRun,
     resumeActiveRun,
     createKolDetail,

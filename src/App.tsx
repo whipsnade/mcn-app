@@ -189,13 +189,14 @@ export default function App() {
             // 旧任务流的 followup props 与「再次执行」保持不接线。
             <ChatArea
               session={chatSession}
-              onSendMessage={text => workspace.sendMessage(chatSession.id, text)}
+              onSendMessage={(text, options) => workspace.sendMessage(chatSession.id, text, options)}
               isAnalyzing={isAnalyzing}
               isMockMode={false}
               run={workspace.run}
               runHistory={runHistory}
               onResumeRun={() => workspace.resumeActiveRun()}
               onCancelRun={() => workspace.cancelActiveRun()}
+              onRetryRun={runId => workspace.retryRun(runId)}
             />
           ) : workspaceTab === 'favorites' ? (
             <FavoritesPanel

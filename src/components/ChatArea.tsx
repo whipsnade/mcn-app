@@ -2,8 +2,10 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Loader2, Pause, Send, Sparkles, ShieldAlert } from 'lucide-react';
 import { Session } from '../types';
 import type { FollowupSuggestion } from '../api/contracts';
+import { uploadAgentFile, type AgentMessageOptions, type ApiAgentUpload } from '../api/agent';
 import { isTerminalRunStatus, type RunRuntimeState } from '../state/agentEvents';
 import AgentRunCard, { type RunClarification } from './agent/AgentRunCard';
+import AgentUploadComposer from './agent/AgentUploadComposer';
 
 /** 空白会话（无消息、无 followup 建议）展示的默认圈选建议，点击填入输入框。 */
 const DEFAULT_SUGGESTIONS: { title: string; prompt: string }[] = [
@@ -17,7 +19,7 @@ const NEAR_BOTTOM_THRESHOLD_PX = 48;
 
 interface ChatAreaProps {
   session: Session;
-  onSendMessage: (text: string) => Promise<unknown>;
+  onSendMessage: (text: string, options?: AgentMessageOptions) => Promise<unknown>;
   isAnalyzing: boolean;
   /** 是否处于 brainstorm 澄清等待中（loading 文案区分于任务分析）。 */
   isClarifying?: boolean;
@@ -34,6 +36,8 @@ interface ChatAreaProps {
   onCancelRun?: () => Promise<unknown>;
   /** 兜底取消（旧任务流 App 仍传 onCancelTask；Task 23 切换到 onCancelRun 后移除）。 */
   onCancelTask?: () => Promise<unknown>;
+  /** 失败/中断的历史 Run 重试：服务端创建新的 Child Run，旧卡保持终态。 */
+  onRetryRun?: (runId: string) => Promise<unknown>;
   onRetryMessage?: (messageId: string) => Promise<unknown>;
   followupStatus?: 'pending' | 'completed' | 'failed';
   followupSuggestions?: FollowupSuggestion[];
@@ -53,6 +57,7 @@ export default function ChatArea({
   onResumeRun,
   onCancelRun,
   onCancelTask,
+  onRetryRun,
   onRetryMessage,
   followupStatus,
   followupSuggestions = [],
@@ -61,6 +66,7 @@ export default function ChatArea({
 }: ChatAreaProps) {
   const [inputText, setInputText] = useState('');
   const [selectedOptions, setSelectedOptions] = useState<string[]>([]);
+  const [uploads, setUploads] = useState<ApiAgentUpload[]>([]);
   const chatEndRef = useRef<HTMLDivElement>(null);
   const chatLogRef = useRef<HTMLDivElement>(null);
   const isNearBottomRef = useRef(true);
@@ -100,6 +106,7 @@ export default function ChatArea({
 
   useEffect(() => {
     isNearBottomRef.current = true;
+    setUploads([]);
   }, [session.id]);
 
   // 仅在用户仍靠近底部时跟随新消息。
@@ -121,8 +128,9 @@ export default function ChatArea({
     if (!inputText.trim() || isAnalyzing) return;
     const draft = inputText.trim();
     try {
-      await onSendMessage(draft);
+      await onSendMessage(draft, { uploadIds: uploads.filter(upload => upload.status === 'parsed').map(upload => upload.id) });
       setInputText(current => current.trim() === draft ? '' : current);
+      setUploads([]);
     } catch {
       // The workspace error banner explains the persistence failure; keep the draft for retry.
     }
@@ -237,6 +245,7 @@ export default function ChatArea({
             : [];
           // 仅 brainstorm 显式标记 multi=true 走多选；clarify 与存量无 multi 消息保持单选。
           const isMultiSelect = brainstormOptions.length > 0 && msg.brainstorm?.multi === true;
+          const messageRun = msg.runId === run?.runId ? run : msg.runId ? runHistory[msg.runId] : undefined;
 
           return (
             <React.Fragment key={msg.id}>
@@ -280,6 +289,15 @@ export default function ChatArea({
                         className="mt-2 rounded-lg border border-indigo-200 bg-white px-2.5 py-1 text-[10px] font-semibold text-indigo-600 transition hover:bg-indigo-50"
                       >
                         再次执行
+                      </button>
+                    )}
+                    {!isAI && msg.runId && messageRun && isTerminalRunStatus(messageRun.status) && onRetryRun && !isAnalyzing && (
+                      <button
+                        type="button"
+                        onClick={() => void onRetryRun(msg.runId!).catch(() => undefined)}
+                        className="mt-2 rounded-lg border border-indigo-200 bg-white px-2.5 py-1 text-[10px] font-semibold text-indigo-600 transition hover:bg-indigo-50"
+                      >
+                        重试此 Run
                       </button>
                     )}
                   </div>
@@ -362,7 +380,7 @@ export default function ChatArea({
               {/* 每个 Run 一张独立执行卡，锚定在触发它的用户消息下方；终态收缩保留可回看 */}
               {!isAI && msg.runId && (() => {
                 const isActiveRun = msg.runId === run?.runId;
-                const runtime = isActiveRun ? run : runHistory[msg.runId];
+                const runtime = messageRun;
                 if (!runtime) {
                   return (
                     <div className="mr-auto ml-11 w-[calc(85%-2.75rem)] max-w-[85%]">
@@ -430,6 +448,18 @@ export default function ChatArea({
 
       {/* Input panel container */}
       <div className="shrink-0 p-4 bg-white border-t border-slate-100 space-y-2.5">
+
+        <AgentUploadComposer
+          uploads={uploads}
+          disabled={isAnalyzing}
+          onUpload={file => {
+            if (!['csv', 'xlsx'].includes(file.name.split('.').pop()?.toLowerCase() ?? '')) return;
+            const pending: ApiAgentUpload = { id: `local-${Date.now()}`, original_filename: file.name, mime_type: file.type, size_bytes: file.size, sha256: '', status: 'uploaded', error_code: null, created_at: '', completed_at: null };
+            setUploads(current => [...current, pending]);
+            void uploadAgentFile(session.id, file).then(upload => setUploads(current => current.map(item => item.id === pending.id ? upload : item))).catch(() => setUploads(current => current.map(item => item.id === pending.id ? { ...item, status: 'failed' } : item)));
+          }}
+          onRemove={id => setUploads(current => current.filter(upload => upload.id !== id))}
+        />
 
         {!followupStatus && session.messages.length === 0 && (
           <section aria-label="开始圈选建议" className="rounded-xl border border-indigo-100 bg-indigo-50/40 px-3 py-2.5">
