@@ -24,6 +24,7 @@ export const PI_INTERNAL_TOOL_NAMES = [
   "build_kol_detail_draft",
   "build_insight_draft",
   "publish_artifacts",
+  "request_clarification",
 ] as const;
 
 export type PiInternalToolName = (typeof PI_INTERNAL_TOOL_NAMES)[number];

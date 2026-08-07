@@ -59,6 +59,7 @@ describe("isAllowedInternalTool", () => {
       "build_kol_detail_draft",
       "build_insight_draft",
       "publish_artifacts",
+      "request_clarification",
     ]);
     for (const name of PI_INTERNAL_TOOL_NAMES) {
       expect(isAllowedInternalTool(name)).toBe(true);

@@ -55,6 +55,7 @@ _BUILDER_TOOL_NAMES = frozenset(
         "build_insight_draft",
     }
 )
+_LEASE_GATED_TOOL_NAMES = frozenset({"publish_artifacts", "request_clarification"})
 _MAX_FEEDBACK_SECTIONS = 50
 _MAX_FEEDBACK_REFS = 100
 _MAX_FEEDBACK_SOURCES_PER_REF = 20
@@ -177,14 +178,14 @@ class PiEvidenceIngestService:
     ) -> dict[str, Any]:
         """执行白名单内部工具；身份一律来自 token 对应 Run，伪造字段被 Registry 剥离。
 
-        publish_artifacts 前确保当前 worker 持有 Run 活跃租约（发布前置条件）。
+        发布或澄清前确保当前 worker 持有 Run 活跃租约。
         """
         verify_run_token(token, run_id, settings=self._settings)
         run = await self._db.get(AgentRun, run_id)
         if run is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "pi_run_not_found")
         registry = build_pi_internal_registry(db=self._db, worker_id=self._worker_id)
-        if tool_name == "publish_artifacts":
+        if tool_name in _LEASE_GATED_TOOL_NAMES:
             repo = AgentRunRepository(self._db)
             if not await repo.holds_lease(run_id, self._worker_id):
                 raise HTTPException(status.HTTP_409_CONFLICT, "pi_run_lease_not_held")
@@ -202,6 +203,13 @@ class PiEvidenceIngestService:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "pi_internal_tool_not_found")
         if tool_name in _BUILDER_TOOL_NAMES and result.status == "success":
             result = await self._project_builder_feedback(run, result)
+        if tool_name == "request_clarification" and result.status == "success":
+            await self._events.append(
+                run.id,
+                run.user_id,
+                "message.completed",
+                {"type": "clarification"},
+            )
         return result.model_dump(mode="json")
 
     async def _project_builder_feedback(self, run: AgentRun, result: ToolResult) -> ToolResult:

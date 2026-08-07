@@ -8,19 +8,24 @@ DataTap 由 Task 4 Extension 直连，本 Registry 不注册 ``AgentMcpTool``。
 """
 
 import json
+from datetime import UTC, datetime
+from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_artifacts.models import AgentArtifactVersion
 from app.agent_artifacts.publishing import ArtifactPublicationService
-from app.agent_runtime.models import AgentRun, AgentSession, EvidenceItem
+from app.agent_runtime.models import AgentMessage, AgentRun, AgentSession, EvidenceItem, MemoryEntry
 from app.agent_runtime.profiles import (
     ARTIFACT_TOOLS,
     HISTORY_TOOLS,
     AgentProfile,
 )
+from app.agent_runtime.repository import AgentRunRepository
+from app.agent_runtime.reviewer import release_run_drafts
+from app.agent_runtime.state import RunStatus
 from app.agent_runtime.tools.builders import (
     BuildBrandReportDraftTool,
     BuildCampaignReportDraftTool,
@@ -51,6 +56,7 @@ PI_POC_ALLOWED_TOOLS: frozenset[str] = frozenset(
         "build_kol_detail_draft",
         "build_insight_draft",
         "publish_artifacts",
+        "request_clarification",
     }
 )
 
@@ -81,6 +87,7 @@ def build_pi_internal_registry(*, db: AsyncSession, worker_id: str) -> ToolRegis
     registry.register(BuildKolDetailDraftTool(db), category=ARTIFACT_TOOLS)
     registry.register(BuildInsightDraftTool(db), category=ARTIFACT_TOOLS)
     registry.register(PublishArtifactsTool(db, worker_id=worker_id), category=ARTIFACT_TOOLS)
+    registry.register(RequestClarificationTool(db, worker_id=worker_id), category=HISTORY_TOOLS)
     return registry
 
 
@@ -182,10 +189,87 @@ class PublishArtifactsTool:
         return ToolResult(status="success", safe_summary=json.dumps(payload, ensure_ascii=False))
 
 
+class RequestClarificationArgs(BaseModel):
+    """Pi 唯一可用的范围澄清出口。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    question: str = Field(min_length=1, max_length=1000)
+    options: list[str] | None = None
+
+    @field_validator("options")
+    @classmethod
+    def _options_length(cls, value: list[str] | None) -> list[str] | None:
+        if value is not None and not 2 <= len(value) <= 4:
+            raise ValueError("options must contain 2-4 items when present")
+        return value
+
+
+class RequestClarificationTool:
+    """仅写既有澄清消息/Memory 并迁移状态；不调用外部服务或创建 Artifact。"""
+
+    name = "request_clarification"
+    input_model = RequestClarificationArgs
+    points_cost = 0
+    external_side_effect = False
+
+    def __init__(self, db_session: AsyncSession, *, worker_id: str) -> None:
+        self._db = db_session
+        self._worker_id = worker_id
+
+    async def execute(self, context: ToolContext, arguments: BaseModel) -> ToolResult:
+        args = RequestClarificationArgs.model_validate(arguments)
+        run = await self._db.get(AgentRun, context.run_id)
+        if run is None or run.user_id != context.user_id or run.session_id != context.session_id:
+            return ToolResult(status="failed", safe_summary="run_not_found", error_type="not_found")
+        repository = AgentRunRepository(self._db)
+        if not await repository.holds_lease(run.id, self._worker_id):
+            return ToolResult(
+                status="failed", safe_summary="pi_run_lease_not_held", error_type="lease_not_held"
+            )
+        sequence = await self._db.scalar(
+            select(func.max(AgentMessage.sequence)).where(AgentMessage.session_id == run.session_id)
+        )
+        now = datetime.now(UTC).replace(tzinfo=None)
+        self._db.add(
+            AgentMessage(
+                id=str(uuid4()),
+                session_id=run.session_id,
+                run_id=run.id,
+                role="assistant",
+                content=args.question,
+                metadata_json={
+                    "type": "clarification",
+                    "question": args.question,
+                    "options": args.options,
+                },
+                sequence=(sequence or 0) + 1,
+                created_at=now,
+            )
+        )
+        self._db.add(
+            MemoryEntry(
+                id=str(uuid4()),
+                session_id=run.session_id,
+                source_run_id=run.id,
+                memory_type="pending_question",
+                content_json={"question": args.question, "options": args.options},
+                created_at=now,
+            )
+        )
+        await release_run_drafts(self._db, run.id)
+        await repository.transition(run.id, RunStatus.CLARIFICATION_REQUESTED, worker_id=self._worker_id)
+        return ToolResult(
+            status="success",
+            safe_summary=json.dumps({"clarification_requested": True}, ensure_ascii=False),
+        )
+
+
 __all__ = [
     "PIPOC_PROFILE",
     "PI_POC_ALLOWED_TOOLS",
     "GetSessionContextTool",
     "PublishArtifactsTool",
+    "RequestClarificationTool",
     "build_pi_internal_registry",
 ]

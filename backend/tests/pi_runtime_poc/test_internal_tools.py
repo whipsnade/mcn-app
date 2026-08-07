@@ -34,6 +34,7 @@ from app.agent_artifacts.exporters import export_artifact
 from app.agent_artifacts.models import AgentArtifactVersion
 from app.agent_runtime.events import AgentEventBroker, AgentEventStream
 from app.agent_runtime.models import (
+    AgentMessage,
     AgentRun,
     AgentRunAttempt,
     AgentSession,
@@ -272,6 +273,49 @@ async def test_unknown_internal_tool_404(
             token=token, run_id=run_id, tool_name="bash", arguments={}
         )
     assert error.value.status_code == 404
+
+
+async def test_request_clarification_requires_lease_and_uses_existing_run_state_machine(
+    svc: PiEvidenceIngestService, settings: Settings, seeded: dict[str, Any]
+) -> None:
+    run_id = seeded["run"].id
+    token = issue_run_token(run_id, settings=settings)
+    arguments = {
+        "question": "请确认要分析的品牌和时间范围。",
+        "options": ["指定品牌和近30天", "指定品牌和近90天"],
+    }
+
+    with pytest.raises(HTTPException) as error:
+        await svc.execute_internal_tool(
+            token=token,
+            run_id=run_id,
+            tool_name="request_clarification",
+            arguments=arguments,
+        )
+    assert error.value.status_code == 409
+    assert error.value.detail == "pi_run_lease_not_held"
+
+    await _claim_run_lease(svc, run_id)
+    result = await svc.execute_internal_tool(
+        token=token,
+        run_id=run_id,
+        tool_name="request_clarification",
+        arguments=arguments,
+    )
+
+    assert result["status"] == "success"
+    run = await svc._db.get(AgentRun, run_id)
+    assert run is not None and run.status == "clarification_requested"
+    message = await svc._db.scalar(
+        select(AgentMessage).where(AgentMessage.run_id == run_id, AgentMessage.role == "assistant")
+    )
+    assert message is not None
+    assert message.content == arguments["question"]
+    assert message.metadata_json == {
+        "type": "clarification",
+        "question": arguments["question"],
+        "options": arguments["options"],
+    }
 
 
 async def test_search_evidence_returns_seeded_rows(

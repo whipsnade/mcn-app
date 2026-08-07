@@ -133,6 +133,11 @@ class PiPocRunner:
                             {"error_code": "pi_rpc_error"},
                         )
                         return RunStatus.FAILED.value
+                if await self._clarification_requested(run_id):
+                    # 澄清工具已通过既有状态机释放租约并结束 Attempt；本 Run 不应
+                    # 伪造终态事件或继续让 Pi 调用任何工具。
+                    await client.abort()
+                    return RunStatus.CLARIFICATION_REQUESTED.value
                 if event.get("type") == "agent_start" and not await self._count_decision(
                     run_id, attempt_id
                 ):
@@ -291,6 +296,10 @@ class PiPocRunner:
     async def _cancel_requested(self, run_id: str) -> bool:
         run = await self._db.get(AgentRun, run_id, populate_existing=True)
         return run is not None and run.cancel_requested
+
+    async def _clarification_requested(self, run_id: str) -> bool:
+        run = await self._db.get(AgentRun, run_id, populate_existing=True)
+        return run is not None and run.status == RunStatus.CLARIFICATION_REQUESTED
 
     async def _attempt_timed_out(self, attempt_id: str) -> bool:
         attempt = await self._db.get(AgentRunAttempt, attempt_id, populate_existing=True)

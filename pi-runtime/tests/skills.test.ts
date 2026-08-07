@@ -54,6 +54,10 @@ describe("Pi 营销 Skills", () => {
     }
   });
 
+  it("营销总则把信息不足显式收口到受控澄清工具", () => {
+    expect(skillText("social-marketing-analyst")).toContain("request_clarification");
+  });
+
   it("Skill 与案例引用不含密钥、来源案例固定值或固定工具顺序", () => {
     const documents = [
       ...skills.map(skillText),

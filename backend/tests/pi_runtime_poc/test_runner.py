@@ -22,6 +22,8 @@ from app.agent_runtime.models import (
     AgentRunAttempt,
     AgentSession,
 )
+from app.agent_runtime.repository import AgentRunRepository
+from app.agent_runtime.state import RunStatus
 from app.core.config import Settings
 from app.identity.models import User
 from app.pi_runtime_poc.runner import PiPocRunner
@@ -175,6 +177,36 @@ async def test_runner_does_not_complete_on_low_level_agent_end_without_settled(
         select(AgentEvent).where(AgentEvent.run_id == queued_run.id, AgentEvent.event_type == "run.failed")
     )
     assert event is not None and event.payload_json["error_code"] == "pi_rpc_unsettled_exit"
+
+
+async def test_runner_stops_at_controlled_clarification_without_terminal_or_artifact(
+    db: AsyncSession, settings: Settings, queued_run: AgentRun
+) -> None:
+    class ClarifyingClient(FakePiClient):
+        async def events(self) -> AsyncIterator[dict[str, Any]]:
+            yield {"type": "agent_start"}
+            await AgentRunRepository(db).transition(
+                queued_run.id,
+                RunStatus.CLARIFICATION_REQUESTED,
+                worker_id="pi-poc-test",
+            )
+            await db.commit()
+            yield {
+                "type": "tool_execution_end",
+                "toolCallId": "clarify-1",
+                "toolName": "request_clarification",
+                "isError": False,
+            }
+
+    client = ClarifyingClient()
+    outcome = await make_runner(db, settings, client).run(queued_run.id)
+
+    assert outcome == "clarification_requested"
+    assert client.aborted
+    events = (await db.scalars(select(AgentEvent).where(AgentEvent.run_id == queued_run.id))).all()
+    assert any(event.event_type == "tool.succeeded" for event in events)
+    assert not any(event.event_type.startswith("run.") and event.event_type != "run.started" for event in events)
+    assert not any(event.event_type == "artifact.published" for event in events)
 
 
 async def test_runner_fails_on_pi_error_record_without_leaking_error_text(
