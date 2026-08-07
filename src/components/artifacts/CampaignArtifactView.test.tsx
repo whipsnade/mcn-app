@@ -62,6 +62,28 @@ function campaignPayload(): CampaignReportPayload {
 }
 
 describe('CampaignArtifactView', () => {
+  it('仅在 ROI 数据真实可用时显示第十个 ROI 章节', () => {
+    const base = campaignPayload();
+    const withRoi: CampaignReportPayload = {
+      ...base,
+      data: {
+        ...base.data,
+        comparisons: { current_baseline: [], current_post: [] },
+        attribution: { paid_confirmed: 9, organic: 3, unknown: 1, paid_confirmed_share: 0.69 },
+        organic_summary: { volume: 30, engagement: 12, posts: 3, share_of_volume: 0.25 },
+        audience_regions: [{ region: '上海', volume: 8, share: 0.4 }],
+        internal_metrics: { spend: 1000, impressions: 20000, conversions: 20, revenue: 3000, cpc: 50, cpm: 50 },
+        roi: { spend: 1000, revenue: 3000, conversions: 20, attribution_window: '7 天', roi: 2, roas: 3 },
+      },
+    };
+    const { rerender } = render(<CampaignArtifactView payload={withRoi} />);
+    expect(screen.getByText('归属、自然传播与受众')).toBeVisible();
+    expect(screen.getByText('ROI 与转化')).toBeVisible();
+
+    rerender(<CampaignArtifactView payload={base} />);
+    expect(screen.queryByText('ROI 与转化')).toBeNull();
+  });
+
   it('http/https 热帖渲染为可点链接', () => {
     render(<CampaignArtifactView payload={campaignPayload()} />);
 

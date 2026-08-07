@@ -101,6 +101,43 @@ function payload(): KolSelectionPayload {
 }
 
 describe('KolSelectionArtifactView', () => {
+  it('v3 价值评分展示投放性价比指数，不为 v2 历史快照伪造价格分', () => {
+    const base = payload();
+    const valuePayload: KolSelectionPayload = {
+      ...base,
+      data: {
+        ...base.data,
+        scoring: {
+          version: 'kol_value_score_v3',
+          method: 'effect_plus_price_efficiency',
+          weights: { effect_score: 70, price_efficiency_score: 30 },
+          missing_value_policy: 'missing_as_zero',
+        },
+        items: base.data.items.map(item => ({
+          ...item,
+          score_snapshot: {
+            version: 'kol_value_score_v3',
+            effect_score: 62,
+            price_efficiency_score: 21,
+            value_score: 83,
+            quoted_price: item.quoted_price,
+            price_sample_size: 4,
+            raw_price_efficiency: 0.005,
+            price_efficiency_percentile: 0.7,
+            rating: item.score_snapshot.rating,
+            data_completeness: item.score_snapshot.data_completeness,
+            dimensions: item.score_snapshot.dimensions,
+          },
+        })),
+      },
+    };
+    render(<KolSelectionArtifactView payload={valuePayload} onOpenDetail={vi.fn()} />);
+
+    expect(screen.getAllByText('投放性价比指数').length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/效果与匹配度 70/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/价格效率 30/).length).toBeGreaterThan(0);
+  });
+
   it('Top20 名单渲染，每张达人卡展示 score_snapshot 的 total/rating/stars/data_completeness', () => {
     render(<KolSelectionArtifactView payload={payload()} onOpenDetail={vi.fn()} />);
 

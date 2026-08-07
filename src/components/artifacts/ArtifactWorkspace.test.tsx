@@ -708,7 +708,7 @@ describe('ArtifactWorkspace', () => {
     await waitFor(() => expect(exportArtifact).toHaveBeenCalledWith('kol-selection-1', 1));
   });
 
-  it('不支持导出的类型（campaign）不显示导出按钮', async () => {
+  it('已发布活动产物也按当前精确版本提供 Excel 导出', async () => {
     const campaign: ApiAgentArtifact = {
       id: 'campaign-1',
       module: 'campaign',
@@ -724,9 +724,10 @@ describe('ArtifactWorkspace', () => {
     renderWorkspace([campaign]);
     fireEvent.click(screen.getByRole('tab', { name: '活动分析' }));
 
-    // 等版本拉取动作发生（payload 因无 fixture 落空），确认无导出按钮。
+    // 即便 payload 尚在加载，导出身份仍绑定当前 Artifact + Version。
     await waitFor(() => expect(getArtifactVersion).toHaveBeenCalledWith('campaign-1', 1));
-    expect(screen.queryByRole('button', { name: '导出 Excel' })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: '导出 Excel' }));
+    await waitFor(() => expect(exportArtifact).toHaveBeenCalledWith('campaign-1', 1));
   });
 
   it('Draft（非 published）产物不显示导出按钮', async () => {

@@ -268,6 +268,50 @@ export default function CampaignArtifactView({ payload }: { payload: CampaignRep
         </Card>
       </section>
 
+      <section data-chapter="attribution_audience">
+        <Card title="归属、自然传播与受众" icon={<Users className="h-4 w-4" />}>
+          <div className="grid gap-3 md:grid-cols-2">
+            <div>
+              <p className="mb-1.5 text-[11px] font-semibold text-slate-600">内容归属</p>
+              {data.attribution ? (
+                <div className="space-y-1 text-[11px] text-slate-500">
+                  <p>确认投放 {restrictedScore(data.attribution.paid_confirmed)}</p>
+                  <p>自然传播 {restrictedScore(data.attribution.organic)}</p>
+                  <p>待确认 {restrictedScore(data.attribution.unknown)}</p>
+                </div>
+              ) : <Missing label="数据受限/未提供" />}
+            </div>
+            <div>
+              <p className="mb-1.5 text-[11px] font-semibold text-slate-600">自然传播与受众</p>
+              {data.organic_summary ? (
+                <p className="text-[11px] text-slate-500">
+                  自然声量 {restrictedCount(data.organic_summary.volume)} · 互动 {restrictedScore(data.organic_summary.engagement)}
+                </p>
+              ) : <Missing label="数据受限/未提供" />}
+              {data.audience_regions && data.audience_regions.length > 0 && (
+                <p className="mt-1 text-[11px] text-slate-500">
+                  主要地区：{data.audience_regions.map(item => `${item.region} ${restrictedRatio(item.share)}`).join('、')}
+                </p>
+              )}
+            </div>
+          </div>
+        </Card>
+      </section>
+
+      {data.roi != null && (
+        <section data-chapter="roi">
+          <Card title="ROI 与转化" icon={<Activity className="h-4 w-4" />}>
+            <div className="grid grid-cols-2 gap-2.5 md:grid-cols-4">
+              <Metric label="投放金额" value={restrictedScore(data.roi.spend)} />
+              <Metric label="转化" value={restrictedScore(data.roi.conversions)} />
+              <Metric label="ROI" value={restrictedRatio(data.roi.roi)} />
+              <Metric label="ROAS" value={restrictedRatio(data.roi.roas)} />
+            </div>
+            <p className="mt-2 text-[10px] text-slate-400">归因窗口：{data.roi.attribution_window}</p>
+          </Card>
+        </section>
+      )}
+
       <section data-chapter="narrative">
         <Card title="执行摘要" icon={<Sparkles className="h-4 w-4" />}>
           <p className="whitespace-pre-wrap text-[12px] leading-5 text-slate-600">{narrative.executive_summary}</p>

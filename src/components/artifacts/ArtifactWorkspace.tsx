@@ -46,7 +46,7 @@ const KOL_SUB_TABS: Array<{ id: KolSubTabId; label: string; artifactType: string
 ];
 
 // 支持 Excel 导出的产物类型（对齐后端 exporters 分派表）。
-const EXPORTABLE_TYPES = new Set(['brand_report_v3', 'kol_selection_v3']);
+const EXPORTABLE_TYPES = new Set(['brand_report_v3', 'campaign_report_v2', 'kol_selection_v3']);
 
 export interface ArtifactWorkspaceProps {
   sessionId?: string;
@@ -384,7 +384,12 @@ export default function ArtifactWorkspace({
             {label}
             {/* 注（review M3）：未读圆点按模块聚合且仅用颜色区分，无独立可访问名称；
                 已在 data-testid 上留查询锚点，无障碍优化列为后续打磨项。 */}
-            {unread(modules) && <span data-testid="unread-dot" className="h-1.5 w-1.5 rounded-full bg-rose-500" />}
+            {unread(modules) && (
+              <span className="flex items-center gap-1" aria-hidden="true">
+                <span className="text-[9px] font-semibold text-rose-500">更新</span>
+                <span data-testid="unread-dot" className="h-1.5 w-1.5 rounded-full bg-rose-500" />
+              </span>
+            )}
           </button>
         ))}
       </div>

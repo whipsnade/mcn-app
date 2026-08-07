@@ -31,7 +31,8 @@ const SCORE_DIMENSION_LABELS = [
 function KolCard({ item, onOpenDetail }: { item: KolSelectionItem; onOpenDetail?: (item: KolSelectionItem) => void }) {
   const nickname = item.nickname || '未知达人';
   const snapshot = item.score_snapshot;
-  // kol_score_v2 专属字段（v3 快照无 stars/total）：判别收窄；v3 价值分渲染属 Task 3。
+  const isValueScore = snapshot.version === 'kol_value_score_v3';
+  // kol_score_v2 专属字段：历史只读降级，不为缺失的价格维度伪造数值。
   const legacyStars = snapshot.version === 'kol_score_v2' ? snapshot.stars : undefined;
   const legacyTotal = snapshot.version === 'kol_score_v2' ? snapshot.total : undefined;
   const followers = item.followers != null ? formatExposure(item.followers) : '数据受限';
@@ -57,7 +58,9 @@ function KolCard({ item, onOpenDetail }: { item: KolSelectionItem; onOpenDetail?
         </div>
         <div className="shrink-0 text-right">
           <p className="text-[12px] font-bold text-slate-800">
-            <span className="mr-1 text-[10px] font-normal text-slate-400">综合评分</span>{legacyTotal != null ? formatNumber(legacyTotal) : '—'}
+            <span className="mr-1 text-[10px] font-normal text-slate-400">
+              {isValueScore ? '投放性价比指数' : '综合评分'}
+            </span>{isValueScore ? formatNumber(snapshot.value_score) : legacyTotal != null ? formatNumber(legacyTotal) : '—'}
           </p>
           {snapshot.rating && (
             <span className="mt-1 inline-block rounded-full bg-indigo-50 px-2 py-0.5 text-[10px] font-semibold text-indigo-600">
@@ -73,6 +76,11 @@ function KolCard({ item, onOpenDetail }: { item: KolSelectionItem; onOpenDetail?
         {item.quoted_price != null && (
           <span className="rounded-lg bg-slate-100 px-2 py-0.5 text-[10px] font-semibold text-slate-600">
             报价 ¥{formatNumber(item.quoted_price)}
+          </span>
+        )}
+        {isValueScore && (
+          <span className="rounded-lg bg-indigo-50 px-2 py-0.5 text-[10px] font-semibold text-indigo-600">
+            效果 {formatNumber(snapshot.effect_score)} · 价格效率 {formatNumber(snapshot.price_efficiency_score)}
           </span>
         )}
         {item.reasons.length > 0 && (
@@ -110,6 +118,7 @@ export default function KolSelectionArtifactView({ payload, onOpenDetail }: KolS
   const items = [...data.items].sort((a, b) => a.rank - b.rank).slice(0, 20);
   const topItem = items[0];
   const weights = data.scoring.weights;
+  const isValueScore = data.scoring.version === 'kol_value_score_v3';
 
   return (
     <div className="space-y-3">
@@ -124,7 +133,9 @@ export default function KolSelectionArtifactView({ payload, onOpenDetail }: KolS
 
       <section data-chapter="items">
         <Card title="圈选达人" icon={<ListChecks className="h-4 w-4" />}>
-          <p className="mb-2.5 text-[10px] text-slate-400">按综合评分展示 Top 20 · 点击达人查看详情</p>
+          <p className="mb-2.5 text-[10px] text-slate-400">
+            按{isValueScore ? '投放性价比指数' : '综合评分'}展示 Top 20 · 点击达人查看详情
+          </p>
           <div className="space-y-2">
             {items.map(item => (
               <Fragment key={`${item.platform}-${item.kol_uid}`}>
@@ -139,7 +150,9 @@ export default function KolSelectionArtifactView({ payload, onOpenDetail }: KolS
       <section data-chapter="score_guide">
         <Card title="评分说明" icon={<Star className="h-4 w-4" />}>
           <p className="mb-2 text-[10px] text-slate-400">
-            八维加权评分（kol_score_v2）· 缺失/无效/无法匹配的维度记 0 分，不做估算
+            {isValueScore
+              ? '投放性价比指数：效果与匹配度 70 + 价格效率 30；缺失维度记 0 分，不做估算'
+              : '历史 kol_score_v2：仅只读展示既有八维评分，不伪造价格效率指标'}
           </p>
           {topItem ? (
             <div className="space-y-1.5">
