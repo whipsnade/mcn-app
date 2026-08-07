@@ -31,6 +31,14 @@ from app.pi_runtime_poc.runner import PiClientFactory, PiPocRunner
 RuntimeName = Literal["current", "pi"]
 _SECRET_PATTERN = re.compile(r"(?:sk-[A-Za-z0-9._-]+|Bearer\s+\S+)", re.IGNORECASE)
 _REPORT_BEHAVIOR = "report"
+_DATATAP_SERVICE_SLUGS = frozenset(
+    {
+        "insight-cube-mcp",
+        "social-grow-mcp",
+        "social-grow-content-mcp",
+        "bilibili-mcp",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -325,8 +333,8 @@ def build_real_pi_client_factory(settings: Settings) -> Callable[[AgentRun, str]
     调用者必须先以真实配置初始化 ``Settings``，并将数据库显式覆写为 POC 库。
     任一缺失项直接失败，不以 mock 或替代模型继续。
     """
-    if settings.datatap_mcp_url is None:
-        raise RuntimeError("pi_poc_datatap_mcp_url_required")
+    if set(settings.datatap_mcp_urls) != _DATATAP_SERVICE_SLUGS:
+        raise RuntimeError("pi_poc_datatap_endpoint_mapping_required")
     thinking = settings.tencent_plan_reasoning_effort
     if thinking is None:
         raise RuntimeError("pi_poc_same_thinking_required")
@@ -369,7 +377,10 @@ def build_real_pi_client_factory(settings: Settings) -> Callable[[AgentRun, str]
         environment = {
             "TENCENT_PLAN_API_KEY": settings.tencent_plan_api_key.get_secret_value(),
             "DATATAP_MCP_TOKEN": settings.datatap_mcp_token.get_secret_value(),
-            "DATATAP_MCP_URL": str(settings.datatap_mcp_url),
+            "DATATAP_MCP_ENDPOINTS_JSON": json.dumps(
+                {slug: str(settings.datatap_mcp_urls[slug]) for slug in sorted(_DATATAP_SERVICE_SLUGS)},
+                separators=(",", ":"),
+            ),
             "PI_RUNTIME_POC_BASE_URL": str(settings.pi_runtime_poc_base_url),
             "PI_RUNTIME_POC_RUN_ID": run.id,
             "PI_RUNTIME_POC_TOKEN": token,

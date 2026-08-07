@@ -4,7 +4,9 @@ import json
 from pathlib import Path
 
 import pytest
+from pydantic import SecretStr
 
+from app.core.config import Settings
 from app.pi_runtime_poc.comparison import (
     PocCase,
     PocCaseResult,
@@ -141,3 +143,17 @@ def test_poc_internal_server_only_exposes_pi_callback_routes_without_main_lifesp
         == "/api/v1/internal/pi-poc/runs/test-run/internal-tools"
     )
     assert not hasattr(app.state, "agent_executor")
+
+
+def test_settings_accepts_blank_legacy_endpoint_but_requires_explicit_endpoint_mapping() -> None:
+    settings = Settings(
+        mysql_password=SecretStr("test-only-password"),
+        jwt_secret=SecretStr("test-only-jwt-secret-at-least-32-characters"),
+        tencent_plan_api_key=SecretStr("test-only-model-key"),
+        datatap_mcp_token=SecretStr("test-only-datatap-token"),
+        datatap_mcp_url="",
+        datatap_mcp_urls={"insight-cube-mcp": "https://datatap.example.test/insight/mcp"},
+    )
+
+    assert settings.datatap_mcp_url is None
+    assert str(settings.datatap_mcp_urls["insight-cube-mcp"]) == "https://datatap.example.test/insight/mcp"

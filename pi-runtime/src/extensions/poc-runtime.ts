@@ -24,7 +24,7 @@ import { PiPocHttpClient } from "../http/client.js";
 import { redact } from "../redaction.js";
 
 export interface PlayerRuntimeConfig {
-  datatapUrl: string;
+  datatapEndpoints: Record<string, string>;
   datatapToken: string;
   baseUrl: string;
   runId: string;
@@ -32,8 +32,9 @@ export interface PlayerRuntimeConfig {
 }
 
 export function readRuntimeConfigFromEnv(env: NodeJS.ProcessEnv = process.env): PlayerRuntimeConfig {
+  const datatapEndpoints = parseDatatapEndpoints(env.DATATAP_MCP_ENDPOINTS_JSON);
   return {
-    datatapUrl: env.DATATAP_MCP_URL ?? "",
+    datatapEndpoints,
     datatapToken: env.DATATAP_MCP_TOKEN ?? "",
     baseUrl: env.PI_RUNTIME_POC_BASE_URL ?? "",
     runId: env.PI_RUNTIME_POC_RUN_ID ?? "",
@@ -41,9 +42,11 @@ export function readRuntimeConfigFromEnv(env: NodeJS.ProcessEnv = process.env): 
   };
 }
 
-export function createDatatapMcpClient(opts: PlayerRuntimeConfig): McpToolClient {
-  const transport = new StreamableHTTPClientTransport(new URL(opts.datatapUrl), {
-    requestInit: { headers: { Authorization: `Bearer ${opts.datatapToken}` } },
+export function createDatatapMcpClient(url: string, token: string): McpToolClient {
+  const transport = new StreamableHTTPClientTransport(new URL(url), {
+    // DataTap 接入链接的 generic MCP 配置明确以 DATATAP_TOKEN 作为 bearer 凭证；
+    // token 仅由调用进程临时注入，绝不进入工具参数、审计或输出。
+    requestInit: { headers: { Authorization: `Bearer ${token}` } },
   });
   const client = new Client({ name: "kol_insight_pi_poc", version: "0.0.0" });
 
@@ -71,11 +74,9 @@ export function createDatatapMcpClient(opts: PlayerRuntimeConfig): McpToolClient
 
 export default async function (pi: ExtensionAPI): Promise<void> {
   const env = readRuntimeConfigFromEnv();
-  if (!env.datatapUrl || !env.datatapToken) {
+  if (!env.datatapToken) {
     throw new Error("pi_poc_missing_datatap_config");
   }
-  const mcp = createDatatapMcpClient(env);
-
   const audit = new PiPocHttpClient({
     baseUrl: env.baseUrl,
     runId: env.runId,
@@ -83,28 +84,62 @@ export default async function (pi: ExtensionAPI): Promise<void> {
   });
   registerInternalTools(pi, new PiInternalToolsClient(audit));
 
-  const tools = await discoverDatatapTools(mcp);
-  for (const tool of tools) {
-    pi.registerTool({
-      name: tool.name,
-      label: tool.name,
-      description: tool.description ?? "",
-      parameters: Type.Object({}, { additionalProperties: Type.Unknown() }),
-      execute: async (toolCallId, params) => {
-        const { payload } = await callDatatapTransparent({
-          mcp,
-          audit,
-          toolCallId,
-          toolName: tool.name,
-          arguments: (params ?? {}) as Record<string, unknown>,
-          redactAudit: (value) => redact(value, [env.datatapToken, env.runToken]),
-        });
-        return {
-          content: [{ type: "text", text: JSON.stringify(payload) }],
-          details: {},
-        };
-      },
-    });
+  const registeredToolNames = new Set<string>();
+  for (const url of Object.values(env.datatapEndpoints)) {
+    const mcp = createDatatapMcpClient(url, env.datatapToken);
+    const tools = await discoverDatatapTools(mcp);
+    for (const tool of tools) {
+      // 不允许以 service 前缀重命名或意图路由来掩盖冲突；重名即让整个 Run 失败关闭。
+      if (registeredToolNames.has(tool.name)) {
+        throw new Error("pi_poc_duplicate_datatap_tool_name");
+      }
+      registeredToolNames.add(tool.name);
+      pi.registerTool({
+        name: tool.name,
+        label: tool.name,
+        description: tool.description ?? "",
+        parameters: Type.Object({}, { additionalProperties: Type.Unknown() }),
+        execute: async (toolCallId, params) => {
+          const { payload } = await callDatatapTransparent({
+            mcp,
+            audit,
+            toolCallId,
+            toolName: tool.name,
+            arguments: (params ?? {}) as Record<string, unknown>,
+            redactAudit: (value) => redact(value, [env.datatapToken, env.runToken]),
+          });
+          return {
+            content: [{ type: "text", text: JSON.stringify(payload) }],
+            details: {},
+          };
+        },
+      });
+    }
+  }
+}
+
+function parseDatatapEndpoints(value: string | undefined): Record<string, string> {
+  if (!value) {
+    throw new Error("pi_poc_invalid_datatap_endpoints");
+  }
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("invalid");
+    }
+    const entries = Object.entries(parsed);
+    if (entries.length === 0 || entries.some(([slug, url]) => !slug || typeof url !== "string")) {
+      throw new Error("invalid");
+    }
+    for (const [, url] of entries) {
+      const parsedUrl = new URL(url as string);
+      if (parsedUrl.protocol !== "https:" && parsedUrl.protocol !== "http:") {
+        throw new Error("invalid");
+      }
+    }
+    return Object.fromEntries(entries) as Record<string, string>;
+  } catch {
+    throw new Error("pi_poc_invalid_datatap_endpoints");
   }
 }
 

@@ -8,6 +8,10 @@ ROOT_DIR="$(cd "${BACKEND_DIR}/.." && pwd)"
 # 工作树或写入输出。也允许调用者显式指定主工作树路径。
 MAIN_ROOT="${PI_RUNTIME_POC_MAIN_ROOT:-$(git -C "${ROOT_DIR}" worktree list --porcelain | sed -n '1s/^worktree //p')}"
 [[ -n "${MAIN_ROOT}" && -d "${MAIN_ROOT}" ]] || exit 2
+# 接入链接解析出的 token/endpoint mapping 只能在本次进程内存在；主工作树的 .env
+# 仅作为常规运行时配置回退，不能覆盖调用方刚解析出的 DataTap 连接凭证。
+CONNECT_DATATAP_TOKEN="${DATATAP_MCP_TOKEN:-}"
+CONNECT_DATATAP_ENDPOINTS_JSON="${DATATAP_MCP_ENDPOINTS_JSON:-}"
 
 for env_file in "${MAIN_ROOT}/.env" "${MAIN_ROOT}/backend/.env"; do
   if [[ -f "${env_file}" ]]; then
@@ -17,6 +21,13 @@ for env_file in "${MAIN_ROOT}/.env" "${MAIN_ROOT}/backend/.env"; do
     set +a
   fi
 done
+
+if [[ -n "${CONNECT_DATATAP_TOKEN}" ]]; then
+  export DATATAP_MCP_TOKEN="${CONNECT_DATATAP_TOKEN}"
+fi
+if [[ -n "${CONNECT_DATATAP_ENDPOINTS_JSON}" ]]; then
+  export DATATAP_MCP_ENDPOINTS_JSON="${CONNECT_DATATAP_ENDPOINTS_JSON}"
+fi
 
 export APP_ENV=test
 export AUTH_MODE=mock
@@ -28,7 +39,7 @@ export RUN_REAL_SERVICES=1
 [[ "${APP_ENV}" == "test" ]] || exit 2
 [[ "${MYSQL_DATABASE}" == "kol_insight_pi_poc" ]] || exit 2
 [[ "${PI_RUNTIME_POC_ENABLED}" == "true" ]] || exit 2
-[[ -n "${DATATAP_MCP_URL:-}" ]] || exit 2
+[[ -n "${DATATAP_MCP_ENDPOINTS_JSON:-}" ]] || exit 2
 [[ -n "${TENCENT_PLAN_API_KEY:-}" ]] || exit 2
 
 cd "${BACKEND_DIR}"

@@ -2,7 +2,7 @@ from functools import lru_cache
 from typing import Literal
 from urllib.parse import quote_plus
 
-from pydantic import AnyHttpUrl, Field, SecretStr, model_validator
+from pydantic import AnyHttpUrl, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.mcp_gateway.contracts import DataTapService
@@ -50,6 +50,9 @@ class Settings(BaseSettings):
     # 方案 A Pi Extension 只能连接一个经显式配置的 DataTap MCP endpoint；不从
     # 宿主环境隐式继承或由代码猜测服务类型。
     datatap_mcp_url: AnyHttpUrl | None = None
+    # DataTap 接入链接返回多服务 endpoint；只接受显式 slug → URL 映射，Pi 不在运行时
+    # 猜测、拼接或发现服务 URL。旧的单 endpoint 留作兼容读取，POC 一律使用此映射。
+    datatap_mcp_urls: dict[str, AnyHttpUrl] = Field(default_factory=dict)
     # DataTap 查询级读取超时：统计类查询通常一分钟内返回，超时按失败释放积分。
     datatap_read_timeout_seconds: float = Field(default=60.0, gt=0)
     # Agent 路径单次 MCP 调用外发墙钟上限（不含队列等待）：DataTap 统计查询可能
@@ -90,6 +93,14 @@ class Settings(BaseSettings):
             f"mysql+asyncmy://{self.mysql_user}:{password}@"
             f"{self.mysql_host}:{self.mysql_port}/{self.mysql_database}?charset=utf8mb4"
         )
+
+    @field_validator("datatap_mcp_url", mode="before")
+    @classmethod
+    def empty_datatap_endpoint_is_none(cls, value: object) -> object:
+        """未配置的旧单 endpoint 不能让 POC 配置解析提前崩溃。"""
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
 
     def datatap_endpoint(self, service: DataTapService) -> AnyHttpUrl:
         if not isinstance(service, DataTapService):
