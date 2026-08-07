@@ -99,10 +99,10 @@ async function ensureChatPane(page: Page) {
 }
 
 // --------------------------------------------------------------------------- //
-// 1. 独立 Run 卡：thinking / 工具步骤 / Draft→Review→Published / 终态折叠
+// 1. 独立 Run 卡：thinking / 工具步骤 / 直接发布 / 部分成功 / 终态折叠
 // --------------------------------------------------------------------------- //
 
-test('shows an independent run card with thinking, tools, review and publish', async ({ page }) => {
+test('keeps two direct-publish runs independent and exposes partial publication failures', async ({ page }) => {
   const phone = await uniquePhone();
   const sessionId = 's-new';
   const newSession = sessionJson(sessionId, '新会话1');
@@ -120,24 +120,32 @@ test('shows an independent run card with thinking, tools, review and publish', a
       : [],
   });
 
-  // run-1 SSE 分两阶段：先停在 reviewing（观察「审核中」），再推进到终态。
-  let phase: 'reviewing' | 'full' = 'reviewing';
-  const baseEvents: SseEvent[] = [
+  // run-1 直接发布：品牌报告成功，活动报告校验失败，Run 以部分完成收尾。
+  // fixture 中刻意没有 review.*，防止旧 Reviewer 流程被悄然接回。
+  const run1Events: SseEvent[] = [
     { seq: 1, event: 'run.started', payload: { run_kind: 'user' } },
     { seq: 2, event: 'thinking.started', payload: { attempt: 1 } },
     { seq: 3, event: 'thinking.delta', payload: { text: '正在检索品牌声量…' } },
     { seq: 4, event: 'thinking.completed' },
     { seq: 5, event: 'tool.started', payload: { internal_tool_name: 'brand_search' } },
     { seq: 6, event: 'tool.succeeded', payload: { internal_tool_name: 'brand_search', duration_ms: 1200, points: 10 } },
-    { seq: 7, event: 'artifact.draft.created', payload: { artifact_id: 'art-1', module: 'brand', version: 1, status: 'draft', title: '品牌报告 v1' } },
-    { seq: 8, event: 'review.started', payload: { review_batch_id: 'batch-1', artifact_ids: ['art-1'] } },
-  ];
-  const run1Events = (): SseEvent[] => phase === 'reviewing' ? baseEvents : [
-    ...baseEvents,
-    { seq: 9, event: 'review.approved', payload: { review_batch_id: 'batch-1', artifact_ids: ['art-1'] } },
-    { seq: 10, event: 'artifact.published', payload: { artifact_id: 'art-1', module: 'brand' } },
-    { seq: 11, event: 'run.completed', payload: { outcome: 'completed' } },
-    { seq: 12, event: 'message.completed', payload: { type: 'completion', content: '已完成品牌分析' } },
+    { seq: 7, event: 'artifact.draft.created', payload: { artifact_id: 'art-brand', module: 'brand', version: 1, status: 'draft', title: '品牌报告 v1' } },
+    { seq: 8, event: 'artifact.draft.created', payload: { artifact_id: 'draft-campaign', module: 'campaign', version: 1, status: 'draft', title: '活动报告 v1' } },
+    {
+      seq: 9,
+      event: 'artifact.publish.completed',
+      payload: {
+        published: 1,
+        validation_failed: 1,
+        failed: 0,
+        items: [
+          { artifact_id: 'art-brand', version: 1, status: 'published' },
+          { draft_id: 'draft-campaign', version: 1, status: 'validation_failed' },
+        ],
+      },
+    },
+    { seq: 10, event: 'run.completed_with_warnings', payload: { outcome: 'completed_with_warnings' } },
+    { seq: 11, event: 'message.completed', payload: { type: 'completion', content: '品牌完成，活动报告待修复' } },
   ];
   // run-2：独立终态序列，不得吸收 run-1 的事件。
   const run2Events: SseEvent[] = [
@@ -173,7 +181,7 @@ test('shows an independent run card with thinking, tools, review and publish', a
   await page.route(`**/api/v1/agent/runs/${run1}/events`, route => route.fulfill({
     status: 200,
     contentType: 'text/event-stream',
-    body: sseBody(run1, run1Events()),
+    body: sseBody(run1, run1Events),
   }));
   await page.route(`**/api/v1/agent/runs/${run2}/events`, route => route.fulfill({
     status: 200,
@@ -188,35 +196,32 @@ test('shows an independent run card with thinking, tools, review and publish', a
   await page.getByPlaceholder(/输入消息并向 AI 分析师提问/).fill(question);
   await page.getByRole('button', { name: '发送', exact: true }).click();
 
-  // Run 卡出现在触发消息下方，先进入「审核中」。
-  const runCard = page.getByRole('region', { name: '执行卡' }).first();
-  await expect(runCard).toBeVisible();
-  await expect(runCard.getByText('审核中', { exact: true })).toBeVisible();
-
-  // 推进到终态：Run 卡折叠为一行摘要，标注步数与「分析完成」。
-  phase = 'full';
-  const collapsed = page.getByRole('button', { name: /执行卡 · 共 \d+ 步 · 分析完成/ });
+  // Run 直接进入终态摘要；不出现任何 Reviewer 状态。
+  const collapsed = page.getByRole('button', { name: /执行卡 · 共 \d+ 步 · 部分完成/ });
   await expect(collapsed).toBeVisible();
   await collapsed.click();
 
-  // 展开后可回看 thinking / 工具 / Reviewer / 发布。
+  // 展开后可回看 thinking / 工具 / 每项发布结果；思考默认收起。
   const expanded = page.getByRole('region', { name: '执行卡' }).first();
-  await expect(expanded.getByText('已思考', { exact: true })).toBeVisible();
-  await expanded.getByRole('button', { name: '已思考' }).click();
+  const thinking = expanded.getByRole('button', { name: '已思考' });
+  await expect(thinking).toHaveAttribute('aria-expanded', 'false');
+  await thinking.click();
   await expect(expanded.getByText('正在检索品牌声量…', { exact: true })).toBeVisible();
 
   await expect(expanded.getByText('brand_search', { exact: true })).toBeVisible();
   await expect(expanded.getByText('成功', { exact: true })).toBeVisible();
   await expect(expanded.getByText('1.2 秒', { exact: true })).toBeVisible();
   await expect(expanded.getByText('10 积分', { exact: true })).toBeVisible();
-  await expect(expanded.getByText('质量复核：已通过', { exact: true })).toBeVisible();
+  await expect(expanded.getByText('品牌报告已发布', { exact: true })).toBeVisible();
+  await expect(expanded.getByText('活动报告发布校验失败', { exact: true })).toBeVisible();
+  await expect(expanded.getByText(/审核|复核/, { exact: false })).toHaveCount(0);
 
   // 收起第一张卡后，再次发送产生第二条消息与第二张卡（完成 Run 不吸收下一轮事件）。
   await page.getByRole('button', { name: '收起' }).first().click();
   await page.getByPlaceholder(/输入消息并向 AI 分析师提问/).fill('再分析抖音渠道');
   await page.getByRole('button', { name: '发送', exact: true }).click();
   // C3：run-1 转为历史后经事件回放补齐步骤，两张卡都带真实步数（不再是空壳卡）。
-  const collapsedCards = page.getByRole('button', { name: /执行卡 · 共 \d+ 步 · 分析完成/ });
+  const collapsedCards = page.getByRole('button', { name: /执行卡 · 共 \d+ 步 · (部分完成|分析完成)/ });
   await expect(collapsedCards).toHaveCount(2);
 
   // 展开历史卡（第一张，锚定在第一轮消息下）可回看回放出的工具步骤。
@@ -229,11 +234,12 @@ test('shows an independent run card with thinking, tools, review and publish', a
 // 2. 澄清：ask_user 收尾 Run，展示问题与「等待补充信息」
 // --------------------------------------------------------------------------- //
 
-test('ask_user clarification shows the question and waiting status', async ({ page }) => {
+test('asks clarification for a fuzzy request without MCP, then creates a child run from the answer', async ({ page }) => {
   const phone = await uniquePhone();
   const sessionId = 's-clarify';
   const newSession = sessionJson(sessionId, '澄清会话');
   const runId = 'run-clarify';
+  const childRunId = 'run-clarify-child';
   const question = '想分析哪个平台？';
   const options = ['小红书', '抖音'];
 
@@ -241,7 +247,14 @@ test('ask_user clarification shows the question and waiting status', async ({ pa
   const detail = () => ({
     ...newSession,
     messages: sentMessages,
-    runs: sentMessages.length ? [runJson(runId, sessionId, 'clarification_requested')] : [],
+    runs: sentMessages.length === 0
+      ? []
+      : sentMessages.length <= 2
+        ? [runJson(runId, sessionId, 'clarification_requested')]
+        : [
+          runJson(runId, sessionId, 'clarification_requested'),
+          { ...runJson(childRunId, sessionId, 'completed'), parent_run_id: runId },
+        ],
   });
 
   // 澄清为 message.completed + type=clarification，SSE 不关闭（等待用户回答）。
@@ -249,6 +262,12 @@ test('ask_user clarification shows the question and waiting status', async ({ pa
     { seq: 1, event: 'run.started', payload: { run_kind: 'user' } },
     { seq: 2, event: 'message.completed', payload: { type: 'clarification', question, options } },
   ];
+  const childEvents: SseEvent[] = [
+    { seq: 1, event: 'run.started', payload: { run_kind: 'user', parent_run_id: runId } },
+    { seq: 2, event: 'run.completed', payload: { outcome: 'completed' } },
+    { seq: 3, event: 'message.completed', payload: { type: 'completion', content: '已按小红书继续分析' } },
+  ];
+  let mcpRequestCount = 0;
 
   await mockWalletAndFavorites(page);
   await page.route('**/api/v1/agent/sessions', route => {
@@ -257,26 +276,54 @@ test('ask_user clarification shows the question and waiting status', async ({ pa
   });
   await page.route(`**/api/v1/agent/sessions/${sessionId}`, route => route.fulfill({ json: detail() }));
   await mockArtifactsEmpty(page, sessionId);
+  await page.route('**/mcp/**', route => {
+    mcpRequestCount += 1;
+    return route.fulfill({ status: 500, json: { detail: 'MCP 不应在澄清阶段被调用' } });
+  });
+  let messageCount = 0;
   await page.route(`**/api/v1/agent/sessions/${sessionId}/messages`, route => {
     const body = route.request().postDataJSON() as { content: string };
+    messageCount += 1;
     // settle 回拉后带 assistant 澄清消息（问题文本 + metadata），供 Run 卡澄清区展示。
-    sentMessages = [
-      messageJson('m-user-1', 'user', body.content, 1, runId),
-      messageJson('m-ai-1', 'assistant', question, 2, runId, {
-        type: 'clarification',
-        question,
-        options,
-      }),
-    ];
+    sentMessages = messageCount === 1
+      ? [
+        messageJson('m-user-1', 'user', body.content, 1, runId),
+        messageJson('m-ai-1', 'assistant', question, 2, runId, {
+          type: 'clarification',
+          question,
+          options,
+        }),
+      ]
+      : [
+        messageJson('m-user-1', 'user', '帮我圈选达人', 1, runId),
+        messageJson('m-ai-1', 'assistant', question, 2, runId, {
+          type: 'clarification',
+          question,
+          options,
+        }),
+        messageJson('m-user-2', 'user', body.content, 3, childRunId),
+        messageJson('m-ai-2', 'assistant', '已按小红书继续分析', 4, childRunId),
+      ];
     return route.fulfill({
       status: 201,
-      json: { run_id: runId, session_id: sessionId, message_id: 'm-user-1', status: 'queued', reused: false },
+      json: {
+        run_id: messageCount === 1 ? runId : childRunId,
+        session_id: sessionId,
+        message_id: `m-user-${messageCount}`,
+        status: 'queued',
+        reused: false,
+      },
     });
   });
   await page.route(`**/api/v1/agent/runs/${runId}/events`, route => route.fulfill({
     status: 200,
     contentType: 'text/event-stream',
     body: sseBody(runId, events),
+  }));
+  await page.route(`**/api/v1/agent/runs/${childRunId}/events`, route => route.fulfill({
+    status: 200,
+    contentType: 'text/event-stream',
+    body: sseBody(childRunId, childEvents),
   }));
 
   await login(page, phone);
@@ -299,10 +346,94 @@ test('ask_user clarification shows the question and waiting status', async ({ pa
   await expect(optionChip).toBeVisible();
   await optionChip.click();
   await expect(page.getByPlaceholder(/输入消息并向 AI 分析师提问/)).toHaveValue(options[0]);
+  await page.getByRole('button', { name: '发送', exact: true }).click();
+
+  // 澄清回答只创建子 Run；本轮澄清事件不含工具调用，浏览器也不应请求 MCP。
+  await expect(page.getByRole('button', { name: /执行卡 · 共 \d+ 步 · 分析完成/ })).toBeVisible();
+  await expect.poll(() => mcpRequestCount).toBe(0);
 });
 
 // --------------------------------------------------------------------------- //
-// 3. 无 thinking 事件：不可展开的「正在处理」
+// 3. 证据上传：仅已解析文件进入新 Run 的 upload_ids
+// --------------------------------------------------------------------------- //
+
+test('attaches a parsed CSV evidence upload to the new analysis run', async ({ page }) => {
+  const phone = await uniquePhone();
+  const sessionId = 's-upload';
+  const runId = 'run-upload';
+  const session = sessionJson(sessionId, '资料会话');
+  let sent = false;
+  let messageBody: Record<string, unknown> | undefined;
+  let uploadRequestCount = 0;
+
+  await mockWalletAndFavorites(page);
+  await page.route('**/api/v1/agent/sessions', route => {
+    if (route.request().method() === 'POST') return route.fulfill({ status: 201, json: session });
+    return route.fulfill({ json: [] });
+  });
+  await page.route(`**/api/v1/agent/sessions/${sessionId}`, route => route.fulfill({
+    json: {
+      ...session,
+      messages: sent ? [messageJson('m-upload', 'user', '基于资料分析', 1, runId)] : [],
+      runs: sent ? [runJson(runId, sessionId, 'completed')] : [],
+    },
+  }));
+  await mockArtifactsEmpty(page, sessionId);
+  await page.route(`**/api/v1/agent/sessions/${sessionId}/uploads`, route => {
+    uploadRequestCount += 1;
+    expect(route.request().headers()['content-type']).toContain('multipart/form-data');
+    return route.fulfill({
+      status: 201,
+      json: {
+        id: 'upload-1',
+        original_filename: 'evidence.csv',
+        mime_type: 'text/csv',
+        size_bytes: 20,
+        sha256: 'hash',
+        status: 'parsed',
+        error_code: null,
+        created_at: BASE_TIMESTAMP,
+        completed_at: BASE_TIMESTAMP,
+      },
+    });
+  });
+  await page.route(`**/api/v1/agent/sessions/${sessionId}/messages`, route => {
+    messageBody = route.request().postDataJSON() as Record<string, unknown>;
+    sent = true;
+    return route.fulfill({
+      status: 201,
+      json: { run_id: runId, session_id: sessionId, message_id: 'm-upload', status: 'queued', reused: false },
+    });
+  });
+  await page.route(`**/api/v1/agent/runs/${runId}/events`, route => route.fulfill({
+    status: 200,
+    contentType: 'text/event-stream',
+    body: sseBody(runId, [
+      { seq: 1, event: 'run.started', payload: { run_kind: 'user' } },
+      { seq: 2, event: 'run.completed', payload: { outcome: 'completed' } },
+    ]),
+  }));
+
+  await login(page, phone);
+  await page.getByTitle('新建分析会话').click();
+  await expect(page.getByRole('heading', { name: '资料会话' })).toBeVisible();
+  await page.getByRole('button', { name: '上传资料' }).setInputFiles({
+    name: 'evidence.csv',
+    mimeType: 'text/csv',
+    buffer: Buffer.from('name,value\n声量,100\n'),
+  });
+  await expect.poll(() => uploadRequestCount).toBe(1);
+  const parsedUpload = page.getByText(/evidence\.csv · 已解析/);
+  await expect(parsedUpload).toBeVisible();
+
+  await page.getByPlaceholder(/输入消息并向 AI 分析师提问/).fill('基于资料分析');
+  await page.getByRole('button', { name: '发送', exact: true }).click();
+  await expect.poll(() => messageBody?.upload_ids).toEqual(['upload-1']);
+  await expect(parsedUpload).toHaveCount(0);
+});
+
+// --------------------------------------------------------------------------- //
+// 4. 无 thinking 事件：不可展开的「正在处理」
 // --------------------------------------------------------------------------- //
 
 test('without thinking events renders a non-expandable processing row', async ({ page }) => {

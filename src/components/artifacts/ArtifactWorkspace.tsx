@@ -292,7 +292,17 @@ export default function ArtifactWorkspace({
     detailLoadedRef.current = false;
     try {
       const result = await createKolDetail(sessionId, platform, kolUid, selectionRef);
-      if (result.artifact_id) {
+      if (result.detail) {
+        // 服务端详情缓存命中时直接返回 kol_detail_v2 payload，无需创建/订阅辅助 Run。
+        // 与收藏详情的 useKolDetailFlow 保持同一优先级，避免缓存路径落入无限加载。
+        detailLoadedRef.current = true;
+        const payload = result.detail as unknown as AgentArtifactPayload;
+        if (payload.schema_version === 'kol_detail_v2') {
+          setKolDetailPayload(payload);
+        } else {
+          setDetailError('达人详情数据不可用，请稍后重试');
+        }
+      } else if (result.artifact_id) {
         detailLoadedRef.current = true;
         void loadArtifactDetail(result.artifact_id);
       } else if (result.run_id) {

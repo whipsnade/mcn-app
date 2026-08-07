@@ -24,8 +24,9 @@ export default defineConfig({
   reporter: 'list',
   use: {
     baseURL: 'http://127.0.0.1:5173',
-    trace: 'retain-on-failure',
-    screenshot: 'only-on-failure',
+    // Gate D 只验 DOM/ARIA、网络/SSE 与下载契约；不产生视觉验收工件。
+    trace: 'off',
+    screenshot: 'off',
   },
   projects: [
     {

@@ -509,6 +509,10 @@ test('shows an unread dot on a module with a newer artifact and clears it when s
   // 目录出现更高 sequence（20）的产物 → 圆点出现（20 > 水位 10）。
   phase = 'published';
   await expect(unreadDot).toHaveCount(1);
+  // 新产物只提示更新，不得抢占用户当前正在查看的品牌 Tab。
+  await expect(brandTab).toHaveAttribute('aria-selected', 'true');
+  await expect(page.getByRole('tab', { name: '活动分析' })).toHaveAttribute('aria-selected', 'false');
+  await expect(page.getByRole('tab', { name: '达人', exact: true })).toHaveAttribute('aria-selected', 'false');
 
   // 再次点击品牌分析 Tab → 圆点清除。
   await brandTab.click();
@@ -551,7 +555,7 @@ test('renders a child insight under its parent artifact', async ({ page }) => {
 // 5. 达人详情：点击圈选列表中的达人打开详情弹窗
 // --------------------------------------------------------------------------- //
 
-test('opens the KOL detail dialog from the selection list', async ({ page }) => {
+test('opens a cached KOL detail dialog from the selection list without starting a helper run', async ({ page }) => {
   const phone = `138${Date.now().toString().slice(-8)}`;
   const kolSelArt = artifactMeta('kol-sel-art', 'kol-selection', 'kol_selection_v3', null, 1, 8);
 
@@ -566,6 +570,16 @@ test('opens the KOL detail dialog from the selection list', async ({ page }) => 
       ? artifactMeta('kol-detail-art', 'kol-detail', 'kol_detail_v2', null, 1, 9)
       : kolSelArt,
   });
+  let cachedDetailRequests = 0;
+  // 后注册的精确路由覆盖通用 helper-run fixture：命中缓存时后端直接返回 payload，
+  // UI 不应再订阅 Run 或拉取另一个 artifact 版本。
+  await page.route('**/api/v1/agent/sessions/s-kol/kol-details', route => {
+    cachedDetailRequests += 1;
+    return route.fulfill({
+      status: 201,
+      json: { run_id: null, artifact_id: null, cached: true, detail: kolDetailPayload() },
+    });
+  });
 
   await login(page, phone);
   await ensureBiPane(page);
@@ -579,7 +593,7 @@ test('opens the KOL detail dialog from the selection list', async ({ page }) => 
   await expect(kolCard).toBeVisible();
   await expect(page.getByText('美食小A', { exact: true }).first()).toBeVisible();
 
-  // 点击打开详情弹窗：经 kol-details → artifact detail/version → kol_detail_v2。
+  // 点击打开详情弹窗：缓存命中 payload 直接渲染，不走 helper Run。
   await kolCard.click();
   const dialog = page.getByRole('dialog', { name: '美食小A达人详情' });
   await expect(dialog).toBeVisible();
@@ -588,6 +602,7 @@ test('opens the KOL detail dialog from the selection list', async ({ page }) => 
   await expect(dialog.getByText('粉丝趋势', { exact: true })).toBeVisible();
   await expect(dialog.getByText('最新热帖', { exact: true })).toBeVisible();
   await expect(dialog.getByText('上海宝藏美食合集', { exact: true })).toBeVisible();
+  expect(cachedDetailRequests).toBe(1);
 });
 
 // --------------------------------------------------------------------------- //
@@ -635,4 +650,58 @@ test('exports the viewed version of a published artifact via the UI button', asy
   const download = await downloadPromise;
   expect(download.suggestedFilename()).toBe(EXPORT_FILENAME);
   expect(exportSearch).toContain('version=1');
+});
+
+// --------------------------------------------------------------------------- //
+// 7. 活动、达人 Excel 导出：三个可导出模块均使用当前 published version
+// --------------------------------------------------------------------------- //
+
+test('exports published campaign and KOL artifacts through their fixed BI tabs', async ({ page }) => {
+  const phone = `138${Date.now().toString().slice(-8)}`;
+  const campaignArt = artifactMeta('campaign-art', 'campaign', 'campaign_report_v2', null, 1, 12);
+  const kolArt = artifactMeta('kol-art', 'kol-selection', 'kol_selection_v3', null, 1, 13);
+  const exportPaths: string[] = [];
+
+  await installArtifactRoutes(page, {
+    sessionId: 's-export-other-modules',
+    sessionTitle: '多模块导出会话',
+    artifacts: () => [campaignArt, kolArt],
+    // 活动 payload 无需参与本用例的视觉渲染；导出能力由已发布类型与版本决定。
+    versionPayload: artifactId => artifactId === 'kol-art' ? kolSelectionPayload() : {},
+    artifactMeta: artifactId => artifactId === 'campaign-art' ? campaignArt : kolArt,
+  });
+  const fulfillExport = (route: import('@playwright/test').Route) => {
+    exportPaths.push(new URL(route.request().url()).pathname + new URL(route.request().url()).search);
+    return route.fulfill({
+      status: 200,
+      body: Buffer.from('xlsx'),
+      headers: {
+        'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(EXPORT_FILENAME)}`,
+      },
+    });
+  };
+  await page.route('**/api/v1/agent/artifacts/campaign-art/export*', fulfillExport);
+  await page.route('**/api/v1/agent/artifacts/kol-art/export*', fulfillExport);
+
+  await login(page, phone);
+  await ensureBiPane(page);
+
+  await page.getByRole('tab', { name: '活动分析' }).click();
+  await expect(page.getByRole('button', { name: '导出 Excel' })).toBeVisible();
+  let downloadPromise = page.waitForEvent('download');
+  await page.getByRole('button', { name: '导出 Excel' }).click();
+  expect((await downloadPromise).suggestedFilename()).toBe(EXPORT_FILENAME);
+
+  await page.getByRole('tab', { name: '达人', exact: true }).click();
+  await page.getByRole('tab', { name: '圈选达人' }).click();
+  await expect(page.getByRole('button', { name: '导出 Excel' })).toBeVisible();
+  downloadPromise = page.waitForEvent('download');
+  await page.getByRole('button', { name: '导出 Excel' }).click();
+  expect((await downloadPromise).suggestedFilename()).toBe(EXPORT_FILENAME);
+
+  expect(exportPaths).toEqual([
+    '/api/v1/agent/artifacts/campaign-art/export?version=1',
+    '/api/v1/agent/artifacts/kol-art/export?version=1',
+  ]);
 });
