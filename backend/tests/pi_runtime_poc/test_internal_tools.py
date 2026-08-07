@@ -7,21 +7,10 @@ Evidence 拒绝）、publish_artifacts（租约 + 幂等 + 发布后 Excel 渲�
 """
 
 import json
-import os
 import secrets
 from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
-
-# 本测试的 import 链会到达 app.agent_runtime.tools.mcp（模块级读 Settings 建
-# engine，lazy 不连接）；在 import app 之前提供非敏感占位配置，避免加载失败。
-os.environ.setdefault("APP_ENV", "test")
-os.environ.setdefault("MYSQL_DATABASE", "kol_insight_pi_poc")
-os.environ.setdefault("MYSQL_USER", "pi")
-os.environ.setdefault("MYSQL_PASSWORD", "pi")
-os.environ.setdefault("JWT_SECRET", "test-secret-at-least-32-characters-12345678")
-os.environ.setdefault("TENCENT_PLAN_API_KEY", "placeholder")
-os.environ.setdefault("DATATAP_MCP_TOKEN", "placeholder")
 
 import pytest
 import pytest_asyncio
@@ -49,6 +38,7 @@ from app.agent_runtime.models import (
     AgentRunAttempt,
     AgentSession,
 )
+from app.agent_runtime.repository import AgentRunRepository
 from app.core.config import Settings
 from app.db.base import Base
 from app.identity.models import User
@@ -206,6 +196,15 @@ async def _seed_evidence(
     return settled.evidence_id
 
 
+async def _claim_run_lease(svc: PiEvidenceIngestService, run_id: str) -> None:
+    claimed = await AgentRunRepository(svc._db).claim_lease(
+        run_id,
+        "pi-poc-test",
+        svc._settings.pi_runtime_poc_run_timeout_seconds,
+    )
+    assert claimed
+
+
 async def test_internal_registry_exposes_only_allowed_tools(
     db: AsyncSession,
 ) -> None:
@@ -312,6 +311,17 @@ async def test_build_brand_report_draft_succeeds_with_limited_feedback(
     assert summary["schema_version"] == "brand_report_v3"
     assert summary["draft_id"]
     assert "limitations" in summary
+    assert "overview" in summary["availability"]
+    covered_sections = (
+        summary["coverage"]["complete_sections"]
+        + summary["coverage"]["restricted_sections"]
+    )
+    assert "overview" in covered_sections
+    assert any(
+        source["evidence_id"] == evidence_id
+        for reference in summary["evidence_refs"]
+        for source in reference["sources"]
+    )
     # Builder 反馈必须是受限摘要：不包含完整原始 Evidence/Excel。
     assert "result" not in json.dumps(summary) or "小红书" not in json.dumps(summary)
 
@@ -337,6 +347,93 @@ async def test_build_brand_report_draft_rejects_foreign_evidence(
     assert result["error_type"] == "evidence_not_found"
 
 
+async def test_build_brand_report_draft_rejects_existing_evidence_from_another_user(
+    svc: PiEvidenceIngestService,
+    settings: Settings,
+    seeded: dict[str, Any],
+) -> None:
+    now = _now()
+    foreign_user = User(
+        id=str(uuid4()),
+        nickname="foreign",
+        role="user",
+        status="active",
+        created_at=now,
+        updated_at=now,
+    )
+    svc._db.add(foreign_user)
+    await svc._db.flush()
+    foreign_session = AgentSession(
+        id=str(uuid4()),
+        user_id=foreign_user.id,
+        title="foreign",
+        status="active",
+        summary_version=0,
+        created_at=now,
+        updated_at=now,
+    )
+    foreign_run = AgentRun(
+        id=str(uuid4()),
+        session_id=foreign_session.id,
+        user_id=foreign_user.id,
+        run_kind="user",
+        visibility="user",
+        profile_name="session_analyst_v1",
+        profile_version="1",
+        model="test",
+        status="running",
+    )
+    svc._db.add_all([foreign_session, foreign_run])
+    await svc._db.flush()
+    foreign_evidence_id = await _seed_evidence(
+        svc,
+        settings,
+        {"run": foreign_run},
+        payload=_BRAND_OVERVIEW,
+    )
+
+    run_id = seeded["run"].id
+    token = issue_run_token(run_id, settings=settings)
+    result = await svc.execute_internal_tool(
+        token=token,
+        run_id=run_id,
+        tool_name="build_brand_report_draft",
+        arguments={
+            "scope": _BRAND_SCOPE,
+            "evidence": {"overview_current": [foreign_evidence_id]},
+        },
+    )
+
+    assert result["status"] == "failed"
+    assert result["error_type"] == "evidence_not_found"
+
+
+async def test_publish_artifacts_requires_existing_active_run_lease(
+    svc: PiEvidenceIngestService, settings: Settings, seeded: dict[str, Any]
+) -> None:
+    evidence_id = await _seed_evidence(svc, settings, seeded, payload=_BRAND_OVERVIEW)
+    run_id = seeded["run"].id
+    token = issue_run_token(run_id, settings=settings)
+    built = await svc.execute_internal_tool(
+        token=token,
+        run_id=run_id,
+        tool_name="build_brand_report_draft",
+        arguments={"scope": _BRAND_SCOPE, "evidence": {"overview_current": [evidence_id]}},
+    )
+    draft_id = json.loads(built["safe_summary"])["draft_id"]
+
+    with pytest.raises(HTTPException) as error:
+        await svc.execute_internal_tool(
+            token=token,
+            run_id=run_id,
+            tool_name="publish_artifacts",
+            arguments={"draft_ids": [draft_id]},
+        )
+
+    assert error.value.status_code == 409
+    assert error.value.detail == "pi_run_lease_not_held"
+
+
 async def test_publish_artifacts_publishes_and_renders_excel_same_version(
     svc: PiEvidenceIngestService, settings: Settings, seeded: dict[str, Any]
 ) -> None:
@@ -350,6 +447,7 @@ async def test_publish_artifacts_publishes_and_renders_excel_same_version(
         arguments={"scope": _BRAND_SCOPE, "evidence": {"overview_current": [evidence_id]}},
     )
     draft_id = json.loads(built["safe_summary"])["draft_id"]
+    await _claim_run_lease(svc, run_id)
 
     published = await svc.execute_internal_tool(
         token=token,
@@ -387,6 +485,7 @@ async def test_publish_artifacts_is_idempotent(
         arguments={"scope": _BRAND_SCOPE, "evidence": {"overview_current": [evidence_id]}},
     )
     draft_id = json.loads(built["safe_summary"])["draft_id"]
+    await _claim_run_lease(svc, run_id)
 
     first = await svc.execute_internal_tool(
         token=token,
