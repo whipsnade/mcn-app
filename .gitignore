@@ -19,6 +19,9 @@ test-results/
 playwright-report/
 output/playwright/
 outputs/
+!outputs/pi-runtime-poc/
+outputs/pi-runtime-poc/*
+!outputs/pi-runtime-poc/.gitkeep
 changelog/
 output/ppt/gen_pptx.py
 output/ppt/KOL-Insight-AI-产品介绍.pptx

@@ -47,6 +47,9 @@ class Settings(BaseSettings):
     # 默认值 240s 须保持小于租约时长，使单次尝试在租约周期内必然收口。
     model_decision_timeout_seconds: float = Field(default=240.0, gt=0)
     datatap_mcp_token: SecretStr
+    # 方案 A Pi Extension 只能连接一个经显式配置的 DataTap MCP endpoint；不从
+    # 宿主环境隐式继承或由代码猜测服务类型。
+    datatap_mcp_url: AnyHttpUrl | None = None
     # DataTap 查询级读取超时：统计类查询通常一分钟内返回，超时按失败释放积分。
     datatap_read_timeout_seconds: float = Field(default=60.0, gt=0)
     # Agent 路径单次 MCP 调用外发墙钟上限（不含队列等待）：DataTap 统计查询可能

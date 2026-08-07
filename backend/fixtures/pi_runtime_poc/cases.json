@@ -1,0 +1,44 @@
+[
+  {
+    "case_id": "brand-research-v1",
+    "user_question": "请完成一个品牌社媒调研并给出营销建议。",
+    "date_anchor": "2026-08-01",
+    "expected_behavior": "report",
+    "required_artifact_type": "brand_report_v3"
+  },
+  {
+    "case_id": "campaign-evaluation-v1",
+    "user_question": "请评估一个营销活动的社媒表现并给出改进建议。",
+    "date_anchor": "2026-08-01",
+    "expected_behavior": "report",
+    "required_artifact_type": "campaign_report_v2"
+  },
+  {
+    "case_id": "kol-selection-v1",
+    "user_question": "请按目标受众筛选合适的达人并说明依据。",
+    "date_anchor": "2026-08-01",
+    "expected_behavior": "report",
+    "required_artifact_type": "kol_selection_v3"
+  },
+  {
+    "case_id": "artifact-drilldown-v1",
+    "user_question": "请基于已发布版本解释其中一项结论，不要重新进行完整调研。",
+    "date_anchor": "2026-08-01",
+    "expected_behavior": "drilldown",
+    "required_artifact_type": null
+  },
+  {
+    "case_id": "scope-clarification-v1",
+    "user_question": "帮我做一个营销报告。",
+    "date_anchor": "2026-08-01",
+    "expected_behavior": "clarify",
+    "required_artifact_type": null
+  },
+  {
+    "case_id": "non-marketing-v1",
+    "user_question": "请解释量子纠缠。",
+    "date_anchor": "2026-08-01",
+    "expected_behavior": "refuse",
+    "required_artifact_type": null
+  }
+]

@@ -53,6 +53,9 @@ class PiRpcConfig:
     # 仅由调用方生成的非敏感 Agent 配置（目前仅 models.json）；写入本 Run 的
     # 临时目录，进程退出后随目录删除。不得把 API key 写入这里。
     agent_files: Mapping[str, str] | None = None
+    provider: str | None = None
+    model: str | None = None
+    thinking: str | None = None
     cwd: str | None = None
 
 
@@ -336,6 +339,12 @@ def _command_args(config: PiRpcConfig) -> list[str]:
     args.append("--no-skills")
     for skill in config.skills:
         args.extend(("--skill", skill))
+    if config.provider is not None:
+        args.extend(("--provider", config.provider))
+    if config.model is not None:
+        args.extend(("--model", config.model))
+    if config.thinking is not None:
+        args.extend(("--thinking", config.thinking))
     return args
 
 

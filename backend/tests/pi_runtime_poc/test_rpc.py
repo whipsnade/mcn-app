@@ -177,6 +177,28 @@ async def test_start_writes_only_explicit_agent_files_inside_per_run_directory(
     assert not agent_dir.exists()
 
 
+async def test_spawn_passes_explicit_same_provider_model_and_thinking_flags(
+    fake_process: tuple[FakeProcess, list[tuple[Any, ...]], list[dict[str, Any]]],
+) -> None:
+    """同模型契约必须成为 Pi CLI 的显式参数，不能隐式回退默认值。"""
+    process, calls, _ = fake_process
+    client = await PiRpcClient.start(
+        _config(provider="runtime-provider", model="deepseek-v4-pro", thinking="high")
+    )
+
+    assert calls[0][-6:] == (
+        "--provider",
+        "runtime-provider",
+        "--model",
+        "deepseek-v4-pro",
+        "--thinking",
+        "high",
+    )
+
+    await client.close()
+    assert process.terminated
+
+
 async def test_events_frame_split_crlf_and_literal_u2028_without_readline(
     fake_process: tuple[FakeProcess, list[tuple[Any, ...]], list[dict[str, Any]]],
 ) -> None:
