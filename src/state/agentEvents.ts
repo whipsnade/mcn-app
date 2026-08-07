@@ -255,6 +255,7 @@ function withDrafts(state: RunRuntimeState, event: RunEvent): RunRuntimeState {
   if (event.type === 'artifact.draft.created' || event.type === 'artifact.draft.updated') {
     const artifactId = valueOf(event.payload, 'artifactId', 'artifact_id');
     if (artifactId === undefined || artifactId === null) return state;
+    const draftIdValue = valueOf(event.payload, 'draftId', 'draft_id');
     const version = Number(valueOf(event.payload, 'version', 'version') ?? 0);
     const parentValue = valueOf(event.payload, 'parentArtifactId', 'parent_artifact_id');
     const draft: RunArtifactDraft = {
@@ -264,8 +265,12 @@ function withDrafts(state: RunRuntimeState, event: RunEvent): RunRuntimeState {
       status: String(event.payload.status ?? 'draft'),
       title: event.payload.title !== undefined ? String(event.payload.title) : undefined,
       parentArtifactId: parentValue != null ? String(parentValue) : undefined,
+      draftId: draftIdValue != null ? String(draftIdValue) : undefined,
     };
-    const index = state.drafts.findIndex(item => item.artifactId === draft.artifactId);
+    const index = state.drafts.findIndex(item => (
+      item.artifactId === draft.artifactId
+      || (draft.draftId !== undefined && item.draftId === draft.draftId)
+    ));
     if (index === -1) return { ...state, drafts: [...state.drafts, draft] };
     const drafts = [...state.drafts];
     drafts[index] = { ...drafts[index], ...draft, version: Math.max(drafts[index].version, version) };
@@ -303,7 +308,10 @@ function withDrafts(state: RunRuntimeState, event: RunEvent): RunRuntimeState {
       const status = String(item.status ?? '');
       const versionValue = Number(item.version);
       const version = Number.isFinite(versionValue) && versionValue > 0 ? versionValue : 0;
-      const index = drafts.findIndex(entry => entry.artifactId === key);
+      const index = drafts.findIndex(entry => (
+        entry.artifactId === key
+        || (draftId !== undefined && entry.draftId === draftId)
+      ));
       if (index === -1) {
         drafts = [...drafts, {
           artifactId: key,

@@ -617,7 +617,7 @@ class AgentEngine:
         ``artifact.draft.created``（复用已有身份继续写时 revision > 1，与
         artifact_events 表口径一致记为 ``artifact.draft.updated``）、
         update_draft 发 ``artifact.draft.updated``。
-        payload 带 ``artifact_id/module/parent_artifact_id/status``；``version``
+        payload 带 ``artifact_id/draft_id/module/parent_artifact_id/status``；``version``
         为 Draft revision 号，前端据此归并草稿版本并驱动 artifactsVersion 增长。
         工具结果摘要是本仓库自有 JSON 契约（CreateDraftTool/UpdateDraftTool 与
         Builder 工具的 ``_draft_summary`` 输出同构）。
@@ -631,6 +631,9 @@ class AgentEngine:
             return
         artifact_id = summary.get("artifact_id")
         if not isinstance(artifact_id, str) or not artifact_id:
+            return
+        draft_id = summary.get("draft_id")
+        if not isinstance(draft_id, str) or not draft_id:
             return
         artifact = await self._db.get(AgentArtifact, artifact_id)
         if artifact is None:
@@ -647,6 +650,7 @@ class AgentEngine:
             event_type,
             {
                 "artifact_id": artifact.id,
+                "draft_id": draft_id,
                 "module": artifact.module,
                 "parent_artifact_id": artifact.parent_artifact_id,
                 "status": artifact.status,

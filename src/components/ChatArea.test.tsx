@@ -364,6 +364,38 @@ describe('ChatArea', () => {
     expect(onRetryMessage).toHaveBeenCalledWith('message-1');
   });
 
+  it('only exposes run retry for failed runs', async () => {
+    const onRetryRun = vi.fn().mockResolvedValue(undefined);
+    const message = { id: 'message-1', sender: 'user' as const, text: '重跑这条', timestamp: '10:00', runId: 'run-1' };
+    const { rerender } = render(
+      <ChatArea
+        session={{ ...session, messages: [message] }}
+        onSendMessage={vi.fn()}
+        isAnalyzing={false}
+        isMockMode={false}
+        run={runtime('run-1', { status: 'completed' })}
+        onRetryRun={onRetryRun}
+      />,
+    );
+
+    expect(screen.queryByRole('button', { name: '重试此 Run' })).toBeNull();
+
+    rerender(
+      <ChatArea
+        session={{ ...session, messages: [message] }}
+        onSendMessage={vi.fn()}
+        isAnalyzing={false}
+        isMockMode={false}
+        run={runtime('run-1', { status: 'failed' })}
+        onRetryRun={onRetryRun}
+      />,
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '重试此 Run' }));
+    });
+    expect(onRetryRun).toHaveBeenCalledWith('run-1');
+  });
+
   it('shows ready follow-up suggestions and fills the input with the clicked prompt without sending', async () => {
     const onSendMessage = vi.fn().mockResolvedValue(undefined);
     render(

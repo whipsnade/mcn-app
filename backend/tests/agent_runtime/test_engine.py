@@ -2271,6 +2271,8 @@ async def test_build_insight_draft_tool_emits_artifact_draft_created_event(
     assert artifact is not None
     payload = created.payload_json
     assert payload["artifact_id"] == artifact.id
+    assert isinstance(payload["draft_id"], str)
+    assert payload["draft_id"]
     assert payload["module"] == "insight"
     assert payload["parent_artifact_id"] == parent_artifact.id
     assert payload["status"] == "draft"

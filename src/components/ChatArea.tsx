@@ -291,7 +291,7 @@ export default function ChatArea({
                         再次执行
                       </button>
                     )}
-                    {!isAI && msg.runId && messageRun && isTerminalRunStatus(messageRun.status) && onRetryRun && !isAnalyzing && (
+                    {!isAI && msg.runId && messageRun?.status === 'failed' && onRetryRun && !isAnalyzing && (
                       <button
                         type="button"
                         onClick={() => void onRetryRun(msg.runId!).catch(() => undefined)}

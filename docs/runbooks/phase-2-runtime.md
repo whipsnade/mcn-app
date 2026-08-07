@@ -35,8 +35,14 @@ cd backend
 - `unknown` MCP 调用（请求已发出但结果未知，如网关 504）保持预留、禁止自动重放，只能经恢复核对（`agent_tool_call_reconciliations`）确认成功/失败/保持 unknown，必要时管理员走 `POST /api/v1/admin/agent-tool-calls/{call_id}/reconcile` 人工核对。禁止凭猜测重复请求。
 - 账务排查以 `wallet_ledger` 与 `agent_tool_calls` 状态为准，核对每次成功 DataTap 调用 10 积分（`points_settled == 10`）；发现差异先冻结新任务，再导出账本与调用证据处理。
 - 每条用户消息创建一个独立 Run（`session_analyst_v1`），SSE 事件流按 Run sequence 幂等续传（Last-Event-ID）。每个 Run Attempt 上限 30 分钟或 50 次模型决策，触发后 Run 以 `paused` 结束，用户显式 `POST /agent/runs/{run_id}/resume` 创建新 Attempt 继续。余额不足（`InsufficientPointsError`）作为结构化工具错误回喂模型，不直接失败。
-- 正式 Artifact 必须经 Reviewer（`artifact_reviewer_v1`）复核后原子发布为不可变 Version；Reviewer 最多打回两次，第三次只能 approve/reject。发布前做字段级 lineage 完整性校验，缺失或失效引用拒绝进入 review。
-- **已知风险（UAT 阻断项，见 cutover 清单）**：真实 DataTap 某些长查询在传输层无法可靠超时/取消，可挂死 Run；真实模型在 Attempt 预算内可能无法可靠产出 lineage 有效的正式 Artifact。修复完成前不应执行生产切档。
+- 正式 Artifact 走确定性字段级 lineage 门禁后逐项直接发布为不可变 Version；新 Run 不得启动 Reviewer。
+  发布汇总以 `artifact.publish.completed` 表达逐项 `published/validation_failed/failed`，至少一项
+  成功且存在失败时 Run 为 `completed_with_warnings`。旧 Review 表只读保留，供历史回滚读取。
+- 当前唯一迁移 head 为 `0036_export_claim_token`。部署顺序：备份数据库和上传目录 → drain Run /
+  清零历史 `reviewing` → 后端代码与 `alembic upgrade head` → 同批前端 `dist/` → 单 worker 重启 →
+  权限、账本、SSE、三类导出冒烟。详情与回滚限制见 cutover §5.10。
+- **已知风险（UAT 阻断项，见 cutover 清单）**：2026-08-07 真实 UAT 的品牌场景成功（restricted
+  lineage_ok），但活动回答 child Run 因模型供应商持续重连被中断；未完成真实全场景验收前不得生产切档。
 
 ## UAT 部署
 

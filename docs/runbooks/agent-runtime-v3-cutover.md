@@ -15,8 +15,8 @@
 
 | 检查项 | 状态 |
 |---|---|
-| 代码与测试（迁移 0027–0029 + 运行时 + 前端 + E2E） | ✅ 已完成，全量验证矩阵通过（见 §4） |
-| 真实模型 + 真实 DataTap UAT（Task 26） | ⚠️ 已执行，运行时机制部分验证；阻断项 1 已修复待复核，**仍存 1 个阻断项**（见 §1） |
+| 代码与测试（迁移 0027–0036 + 运行时 + 前端 + E2E） | ✅ Gate D 非视觉自动化已通过；最终矩阵见 §5.10 |
+| 真实模型 + 真实 DataTap UAT（Gate E） | ⛔ 2026-08-07 仅完成澄清/品牌与活动首轮；活动 child Run 被供应商重连中断，**不得视为通过**（见 §5.10） |
 | 生产切档 | ⛔ **禁止**——阻断项未解决前不得执行 §3 步骤 |
 
 ---
@@ -96,7 +96,7 @@
 3. 跨用户 Session、Evidence、Artifact 或达人详情越权；
 4. 任一强类型 Artifact 无法被对应 BI 消费，或声明支持 Excel 的 Artifact 无法导出；
 5. Run 恢复导致步骤重放、当前 Attempt 保护计数未重置或新消息复用旧执行卡；
-6. Reviewer 可以被主 Agent 绕过，或多 Artifact 发生部分发布；
+6. 新 Run 写入 Reviewer Driver/Review Batch/Item/Attempt，或多 Artifact 的逐项发布/部分完成聚合失真；
 7. 四个旧快捷入口、API 或缓存仍可从新系统触达；
 8. 前后端无法在同一发布批次完成契约切换。
 
@@ -105,9 +105,8 @@
 > 前置：§1 两个阻断项已解决并复跑真实 UAT 通过；设计 §19 阻断条件逐条核实无命中。
 
 1. **测试库迁移**：在独立测试库（`kol_insight_test`）执行
-   `cd backend && APP_ENV=test .venv/bin/alembic upgrade head`，确认到 head
-   `0029_agent_run_created_at`（v3 迁移链 0027_agent_runtime_v3 → 0028_agent_artifact_read_states
-   → 0029 顺序应用）；
+   `cd backend && APP_ENV=test .venv/bin/alembic upgrade head`，确认到唯一 head
+   `0036_export_claim_token`（0027–0036 顺序应用）；
    全量 pytest（含 `test_legacy_routes_removed.py` 的旧路由 404 断言）通过。
 2. **生产备份**：切换前对生产库执行完整备份（含全部旧表——它们要在回滚时恢复读取），
    并记录备份文件路径与时间戳；同时备份 `/home/kol_insight/` 下的 `backend/.env`。
@@ -117,8 +116,9 @@
 4. **路由冒烟**：确认旧执行入口不可达——`/api/v1/quick/*`、`/api/v1/sessions/{id}/brainstorm`、
    `/api/v1/sessions/{id}/tasks`、手动 `/kol-analysis` 均返回 404；新 `/api/v1/agent/*` 可用；
    `GET /healthz` 返回 ok，`GET /api/v1/agent/sessions` 公网期望 401。
-5. **功能冒烟**：真实账号完成 会话 → 澄清 → 品牌/活动/圈选 → Reviewer 发布 → BI 展示 →
-   达人详情 → 品牌/圈选 Excel 导出 的冒烟；确认三个 BI Tab / 两个达人子 Tab 正常，快捷四入口消失。
+5. **功能冒烟**：真实账号完成 会话 → 澄清 → 品牌/活动/圈选 → 直接发布 → BI 展示 →
+   达人详情 → 品牌/活动/圈选三类 Excel 导出的冒烟；确认三个 BI Tab / 两个达人子 Tab
+   仅显示更新、不自动跳转，快捷四入口消失。
 6. **积分抽查**：核对每笔 settled DataTap 调用 `points_settled == 10`、`points_reserved == 0`，
    与 `wallet_ledger` 一致；制造一个 504/超时验证 `result_unknown` 保持预留且不重放；
    `unknown` 经恢复核对或管理员 reconcile 后正确结算/释放。
@@ -188,7 +188,8 @@
 
 每个发布成功的 Artifact 发一条 `artifact.published`（逐项即时发，缩小崩溃窗口），
 `publish_artifacts` 动作处理完所有项后发一条汇总事件 `artifact.publish.completed`
-（payload 带 `artifact_id/module/parent_artifact_id/status`，发布项另带 `version`），
+（Draft 事件带 `artifact_id/draft_id/module/parent_artifact_id/status`，发布汇总项带
+`draft_id`、状态及可选 `artifact_id`/`version`），
 均**在 `message.completed` 之前**。终态事件（`run.completed`/
 `run.completed_with_warnings`/`run.failed`/`run.cancelled`）由
 `AgentEventStream.settle_terminal` 在统一事务边界收口，是该 Run 最后一条用户可见事件。
@@ -306,3 +307,28 @@ Gate A 审查发现的 5 项必修 + 2 项次要问题，已在同一迁移/代�
   图表由导出器现场重建；空章节保留表头写受限说明、不画误导图表。
 - **0035 回滚**：`artifact_exports` 为纯新增表，downgrade 直接 drop 表与索引，
   不影响 0034 的 dispatch_count 语义。
+
+### 5.10 Gate D/E：直接发布前端、上传与 UAT 状态（2026-08-07）
+
+- **当前迁移头与部署顺序**：唯一 Alembic head 是 `0036_export_claim_token`。先备份生产库和
+  应用私有上传目录，再 drain 活跃 Run / 确认 `reviewing` 为零；部署后端代码与迁移 0027–0036，
+  再部署同批前端 `dist/`，最后重启单 worker 服务。不得只发布一侧。
+- **权限与数据边界**：上传 `upload_ids` 必须同用户同 Session 且为 `parsed`；Artifact Version
+  引用只允许同用户已发布版本；导出/达人详情均按当前用户和会话归属校验，404 不泄漏资源存在。
+  上传目录、`agent_uploads` 与 upload Evidence 进入备份范围，禁止手工按原文件名拼路径。
+- **直接发布与监控**：新 Run 不得创建 Reviewer Driver、Batch、Item 或 Attempt；逐项监控
+  `artifact.publish.completed`（published/validation_failed/failed）、Run 的
+  `completed_with_warnings`、`agent_tool_calls` 的 `unknown`/`failed_confirmed`、预留积分、
+  `artifact_exports` claim token，以及上传解析失败。unknown 保留预留，只能核对，禁止自动重放。
+  前端须以 `draft_id` 归并空 `artifact_id` 的失败发布项，不能额外生成“准备中”草稿卡。
+- **人工验收边界**：BI 查看历史 Version、未读“更新”、重试 child Run、达人缓存命中与三类导出
+  必须以 DOM/ARIA、网络/SSE、下载版本做验收；本批明确未做像素/截图视觉验收。
+- **真实 UAT 状态**：2026-08-07 测试库 UAT 验证了零 MCP 的澄清和
+  `brand_report_v3` restricted lineage_ok；活动回答 child Run 被真实模型供应商重连阻断并
+  SIGINT 收尾。记录见 `docs/qa/agent-runtime-uat-rounds.md` 与最新
+  `outputs/agent-runtime-uat-results.json`。未完成所有场景、unknown 恢复核对和 Reviewer 零写入
+  证明前，生产切档仍为 **禁止**。
+- **回滚**：若冒烟、权限、账本或发布监控异常，立即关闭新任务，回滚后端与前端应用版本；
+  不删除 Review/Artifact/Evidence/账本/上传文件。迁移只按明确的 Alembic downgrade 执行，
+  且先检查 0034 dispatch_count 的不可逆约束与 0030 confirmed_scope 清理要求；已写入数据时
+  仅回滚应用版本并保留表用于排障。

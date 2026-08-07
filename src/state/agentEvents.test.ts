@@ -305,6 +305,32 @@ describe('reduceRunEvent', () => {
     ]);
   });
 
+  it('merges an empty-artifact publish failure into the draft created earlier in the run', () => {
+    let state = initialRunRuntime('run-1');
+    state = reduceRunEvent(state, event('artifact.draft.created', 1, {
+      artifact_id: 'art-1',
+      draft_id: 'draft-1',
+      module: 'brand',
+      status: 'draft',
+      version: 1,
+    }));
+    state = reduceRunEvent(state, event('artifact.publish.completed', 2, {
+      published: 0,
+      validation_failed: 0,
+      failed: 1,
+      items: [{ draft_id: 'draft-1', status: 'failed', artifact_id: '', version: null }],
+    }));
+
+    expect(state.drafts).toHaveLength(1);
+    expect(state.drafts[0]).toMatchObject({
+      artifactId: 'art-1',
+      draftId: 'draft-1',
+      module: 'brand',
+      version: 1,
+      status: 'failed',
+    });
+  });
+
   it('ignores unknown historical events via the default branch', () => {
     let state = initialRunRuntime('run-1');
     state = reduceRunEvent(state, event('run.started', 1, {}));

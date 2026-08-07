@@ -129,8 +129,8 @@ test('keeps two direct-publish runs independent and exposes partial publication 
     { seq: 4, event: 'thinking.completed' },
     { seq: 5, event: 'tool.started', payload: { internal_tool_name: 'brand_search' } },
     { seq: 6, event: 'tool.succeeded', payload: { internal_tool_name: 'brand_search', duration_ms: 1200, points: 10 } },
-    { seq: 7, event: 'artifact.draft.created', payload: { artifact_id: 'art-brand', module: 'brand', version: 1, status: 'draft', title: '品牌报告 v1' } },
-    { seq: 8, event: 'artifact.draft.created', payload: { artifact_id: 'draft-campaign', module: 'campaign', version: 1, status: 'draft', title: '活动报告 v1' } },
+    { seq: 7, event: 'artifact.draft.created', payload: { artifact_id: 'art-brand', draft_id: 'draft-brand', module: 'brand', version: 1, status: 'draft', title: '品牌报告 v1' } },
+    { seq: 8, event: 'artifact.draft.created', payload: { artifact_id: 'art-campaign', draft_id: 'draft-campaign', module: 'campaign', version: 1, status: 'draft', title: '活动报告 v1' } },
     {
       seq: 9,
       event: 'artifact.publish.completed',
@@ -139,21 +139,21 @@ test('keeps two direct-publish runs independent and exposes partial publication 
         validation_failed: 1,
         failed: 0,
         items: [
-          { artifact_id: 'art-brand', version: 1, status: 'published' },
-          { draft_id: 'draft-campaign', version: 1, status: 'validation_failed' },
+          { artifact_id: 'art-brand', draft_id: 'draft-brand', version: 1, status: 'published' },
+          { artifact_id: 'art-campaign', draft_id: 'draft-campaign', version: 1, status: 'validation_failed' },
         ],
       },
     },
-    { seq: 10, event: 'run.completed_with_warnings', payload: { outcome: 'completed_with_warnings' } },
-    { seq: 11, event: 'message.completed', payload: { type: 'completion', content: '品牌完成，活动报告待修复' } },
+    { seq: 10, event: 'message.completed', payload: { type: 'completion', content: '品牌完成，活动报告待修复' } },
+    { seq: 11, event: 'run.completed_with_warnings', payload: { outcome: 'completed_with_warnings' } },
   ];
   // run-2：独立终态序列，不得吸收 run-1 的事件。
   const run2Events: SseEvent[] = [
     { seq: 1, event: 'run.started', payload: { run_kind: 'user' } },
     { seq: 2, event: 'tool.started', payload: { internal_tool_name: 'douyin_search' } },
     { seq: 3, event: 'tool.succeeded', payload: { internal_tool_name: 'douyin_search', duration_ms: 800, points: 10 } },
-    { seq: 4, event: 'run.completed', payload: { outcome: 'completed' } },
-    { seq: 5, event: 'message.completed', payload: { type: 'completion', content: '已完成抖音渠道分析' } },
+    { seq: 4, event: 'message.completed', payload: { type: 'completion', content: '已完成抖音渠道分析' } },
+    { seq: 5, event: 'run.completed', payload: { outcome: 'completed' } },
   ];
 
   await mockWalletAndFavorites(page);
