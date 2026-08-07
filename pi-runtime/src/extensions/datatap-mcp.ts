@@ -59,6 +59,7 @@ export async function callDatatapTransparent(opts: {
   toolCallId: string;
   toolName: string;
   arguments: Record<string, unknown>;
+  redactAudit?: (value: unknown) => unknown;
 }): Promise<{ payload: unknown; metadata: RuntimeMetadata }> {
   const { mcp, audit, toolCallId, toolName } = opts;
   const argumentsValue = opts.arguments;
@@ -70,7 +71,14 @@ export async function callDatatapTransparent(opts: {
   });
   const trackedCallId = started.trackedCallId;
 
-  const outcome = await mcp.callTool(toolName, argumentsValue);
+  const redactAudit = opts.redactAudit ?? ((value: unknown) => value);
+  let outcome: McpCallOutcome;
+  try {
+    outcome = await mcp.callTool(toolName, argumentsValue);
+  } catch (error) {
+    await audit.failToolCall(trackedCallId, redactAudit({ error }));
+    throw error;
+  }
 
   const base: RuntimeMetadata = {
     toolCallId,
@@ -82,7 +90,7 @@ export async function callDatatapTransparent(opts: {
   if (outcome.isError) {
     const error = outcome.error ?? String(outcome.content);
     base.error = error;
-    await audit.failToolCall(trackedCallId, { error });
+    await audit.failToolCall(trackedCallId, redactAudit({ error }));
     return { payload: withRuntimeMetadata(outcome.content, base), metadata: base };
   }
 

@@ -139,6 +139,30 @@ describe("callDatatapTransparent", () => {
     expect(audit.settleToolCall).not.toHaveBeenCalled();
   });
 
+  it("MCP 抛异常时先旁路登记 failed，再原样抛回 Pi", async () => {
+    const upstream = new Error("gateway_timeout: upstream slow");
+    const mcp = makeMcp({ callTool: vi.fn(async () => { throw upstream; }) });
+    const audit = makeAudit();
+
+    await expect(callDatatapTransparent({
+      mcp, audit, toolCallId: "pi-tc-1", toolName: "kol_platform_search", arguments: {},
+    })).rejects.toBe(upstream);
+    expect(audit.failToolCall).toHaveBeenCalledWith("tracked-1", { error: upstream });
+  });
+
+  it("只脱敏审计错误，返回 Pi 的原始错误对象不变", async () => {
+    const raw = { message: "token=abc123" };
+    const mcp = makeMcp({ callTool: vi.fn(async () => ({ content: raw, isError: true, error: raw.message })) });
+    const audit = makeAudit();
+
+    const result = await callDatatapTransparent({
+      mcp, audit, toolCallId: "pi-tc-1", toolName: "kol_platform_search", arguments: {},
+      redactAudit: (value) => JSON.parse(JSON.stringify(value).replaceAll("abc123", "***")),
+    });
+    expect(audit.failToolCall).toHaveBeenCalledWith("tracked-1", { error: "token=***" });
+    expect(result.payload).toMatchObject({ message: "token=abc123" });
+  });
+
   it("token 不进入 audit body（审计只收业务输入，token 只在 HTTP Authorization）", async () => {
     const mcp = makeMcp();
     const audit = makeAudit();

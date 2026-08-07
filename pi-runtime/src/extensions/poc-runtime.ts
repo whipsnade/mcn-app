@@ -20,6 +20,7 @@ import {
   type McpToolClient,
 } from "./datatap-mcp.js";
 import { PiPocHttpClient } from "../http/client.js";
+import { redact } from "../redaction.js";
 
 export interface PlayerRuntimeConfig {
   datatapUrl: string;
@@ -94,6 +95,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
           toolCallId,
           toolName: tool.name,
           arguments: (params ?? {}) as Record<string, unknown>,
+          redactAudit: (value) => redact(value, [env.datatapToken, env.runToken]),
         });
         return {
           content: [{ type: "text", text: JSON.stringify(payload) }],
