@@ -64,3 +64,71 @@ API key 只以 `$TENCENT_PLAN_API_KEY` 环境变量引用，不写入文件、�
 
 结论：Pi 0.84.1 能以当前 Runtime 完全相同的 endpoint/model/thinking 完成最小 RPC
 请求；没有换用其他模型。
+
+## Fix round 1：可审计 opt-in 探针
+
+`npm run probe:rpc` 默认不随测试执行。它创建并删除独立临时目录，其中同时放置有效的
+自动发现与显式资源 fixture：
+
+- `PI_CODING_AGENT_DIR/extensions/poc-auto-extension.mjs` 与
+  `PI_CODING_AGENT_DIR/skills/poc-auto-skill/SKILL.md` 是**不得加载**的自动发现资源。
+- `-e <临时 explicit extension>` 与 `--skill <临时 SKILL.md>` 是唯一允许加载的资源。
+- 两个 `SKILL.md` 都使用有效 Agent Skills YAML frontmatter（含 `name` 与 `description`）；
+  Pi 0.84.1 在 `description` 缺失时只产生日志诊断而不会加载该 Skill。
+
+该脚本使用 `--mode rpc --no-session --no-builtin-tools --no-context-files --no-extensions -e …`
+和 `--no-skills --skill …`，向 stdin 发送以下完整的非敏感协议请求：
+
+```json
+{"id":"poc-get-state","type":"get_state"}
+{"id":"poc-get-commands","type":"get_commands"}
+{"id":"poc-abort","type":"abort"}
+```
+
+实测摘要：
+
+```json
+{
+  "stdoutJsonlOnly": true,
+  "responseIds": ["poc-get-state", "poc-get-commands", "poc-abort"],
+  "explicitResources": ["poc-explicit-extension", "skill:poc-explicit-skill"],
+  "resourceShape": [
+    {"name":"poc-explicit-extension","source":"extension"},
+    {"name":"skill:poc-explicit-skill","source":"skill"}
+  ],
+  "automaticResourcesAbsent": true,
+  "responseShape": [
+    {"type":"response","id":"poc-get-state","command":"get_state","success":true},
+    {"type":"response","id":"poc-get-commands","command":"get_commands","success":true},
+    {"type":"response","id":"poc-abort","command":"abort","success":true}
+  ],
+  "stderrBytes": 0
+}
+```
+
+`npm run probe:model` 也是默认 opt-in。调用者在单个已授权 shell 中提供当前 Runtime 环境变量；
+脚本不读取或复制 `.env`。它把 `baseUrl`、精确 model 与 thinking 写入权限为 `0600` 的临时
+`models.json`，其中 key 始终仅为 `$TENCENT_PLAN_API_KEY` 引用，结束时删除整个临时目录。
+它不发送 prompt，只用 `get_state` 与 `abort` 断言实际 provider/model/thinking：
+
+```json
+{
+  "actualProvider": "kol_insight_pi_poc",
+  "actualModel": "model:deepseek-v4-flash",
+  "actualThinking": "high",
+  "responseShape": [
+    {"type":"response","id":"poc-model-state","command":"get_state","success":true},
+    {"type":"response","id":"poc-model-abort","command":"abort","success":true}
+  ],
+  "stdoutJsonlOnly": true,
+  "stderrBytes": 0
+}
+```
+
+两个 opt-in probe 都为 Pi 子进程设置 **10 秒硬超时**；超时会发送 `SIGTERM` 并以
+`pi_rpc_probe_timeout` 或 `pi_model_probe_timeout` 失败，从而不会等待模型或进程无限返回。
+`probe:model` 本身不发送 prompt，只执行本地 `get_state` 与 `abort`。
+
+覆盖测试扩展为 8 项：增加损坏 JSON、缺少 `type`、response 关联 id/成功形状、自动资源泄漏、
+显式资源缺失、伪装资源 source，以及不带 key 值的临时模型配置验证。`npm test && npm run typecheck`
+通过。
