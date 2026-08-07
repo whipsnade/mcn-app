@@ -79,6 +79,36 @@ export interface AgentKolDetailSelectionRef {
   version?: string;
 }
 
+/** 发送消息的引用选项（Gate D Task 1）：父 Run / 已发布 Artifact Version /
+ * 本 Session 已解析上传，按后端 AgentMessageCreate 映射为 snake_case。 */
+export interface AgentMessageOptions {
+  /** 幂等键：映射为 ``Idempotency-Key`` 请求头（后端按哈希幂等）。 */
+  idempotencyKey?: string;
+  /** 澄清/钻取来源 Run（只表达来源，不复用执行状态）。 */
+  parentRunId?: string;
+  /** 用户确认引用的已发布 Artifact Version id（≤10）。 */
+  artifactVersionIds?: string[];
+  /** 用户确认引用的本 Session 已解析上传 id（≤10）。 */
+  uploadIds?: string[];
+}
+
+/** 上传状态（镜像后端 UploadRead/数据库约束：uploaded/parsed/failed）。 */
+export type AgentUploadStatus = 'uploaded' | 'parsed' | 'failed';
+
+/** 上传 DTO（镜像 backend AgentMessageCreate 同文件的 UploadRead：
+ * id/original_filename/mime_type/size_bytes/sha256/status/error_code/created_at/completed_at）。 */
+export interface ApiAgentUpload {
+  id: string;
+  original_filename: string;
+  mime_type: string;
+  size_bytes: number;
+  sha256: string;
+  status: AgentUploadStatus;
+  error_code: string | null;
+  created_at: string;
+  completed_at: string | null;
+}
+
 function noSlash(value: string): string {
   return value.replace(/^\/+/, '');
 }
@@ -118,12 +148,58 @@ export function sendMessage(
   sessionId: string,
   content: string,
   idempotencyKey?: string,
+): Promise<AgentMessageRunResponse>;
+export function sendMessage(
+  sessionId: string,
+  content: string,
+  options?: AgentMessageOptions,
+): Promise<AgentMessageRunResponse>;
+export function sendMessage(
+  sessionId: string,
+  content: string,
+  optionsOrKey: AgentMessageOptions | string = {},
 ): Promise<AgentMessageRunResponse> {
-  const init: RequestInit = { method: 'POST', body: JSON.stringify({ content }) };
-  if (idempotencyKey) init.headers = { 'Idempotency-Key': idempotencyKey };
+  // 归一化历史 string 幂等键与新的 options 对象：字符串绝不能被当作 options
+  // 静默丢弃（旧签名 sendMessage(id, content, idempotencyKey?: string)）。
+  const options = typeof optionsOrKey === 'string'
+    ? { idempotencyKey: optionsOrKey }
+    : optionsOrKey;
+  const body: Record<string, unknown> = { content };
+  // 只发送非空引用：无 options 的历史调用保持 ``{content}`` 兼容。
+  if (options.parentRunId) body.parent_run_id = options.parentRunId;
+  if (options.artifactVersionIds?.length) body.artifact_version_ids = options.artifactVersionIds;
+  if (options.uploadIds?.length) body.upload_ids = options.uploadIds;
+  const init: RequestInit = { method: 'POST', body: JSON.stringify(body) };
+  if (options.idempotencyKey) init.headers = { 'Idempotency-Key': options.idempotencyKey };
   return request<AgentMessageRunResponse>(
     `/api/v1/agent/sessions/${encodeURIComponent(noSlash(sessionId))}/messages`,
     init,
+  );
+}
+
+/** 上传资料文件（multipart 字段名 ``file``，镜像后端 UploadFile）；只能走
+ * ``authorizedFetch``——request() 会强制 JSON Content-Type，multipart boundary
+ * 必须由浏览器生成。返回 ``ApiAgentUpload``（镜像后端 UploadRead）。 */
+export async function uploadAgentFile(sessionId: string, file: File): Promise<ApiAgentUpload> {
+  const form = new FormData();
+  form.append('file', file);
+  const response = await authorizedFetch(
+    `/api/v1/agent/sessions/${encodeURIComponent(noSlash(sessionId))}/uploads`,
+    { method: 'POST', body: form },
+  );
+  if (!response.ok) {
+    const body = await response.json().catch(() => null) as { detail?: string } | null;
+    throw new Error(body?.detail ?? `HTTP_${response.status}`);
+  }
+  return response.json() as Promise<ApiAgentUpload>;
+}
+
+/** 重试 failed/paused Run：后端创建新的 user-visible Child Run，返回
+ * ``MessageRunResponse``（镜像 POST /runs/{id}/retry）。 */
+export function retryRun(runId: string): Promise<AgentMessageRunResponse> {
+  return request<AgentMessageRunResponse>(
+    `/api/v1/agent/runs/${encodeURIComponent(noSlash(runId))}/retry`,
+    { method: 'POST' },
   );
 }
 

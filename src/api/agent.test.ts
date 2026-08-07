@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import type { ApiAgentRun, ApiAgentSession } from './agent';
+import type { ApiAgentRun, ApiAgentSession, ApiAgentUpload } from './agent';
 import {
   cancelRun,
   createKolDetailRun,
@@ -11,7 +11,9 @@ import {
   listSessions,
   patchSession,
   resumeRun,
+  retryRun,
   sendMessage,
+  uploadAgentFile,
 } from './agent';
 
 vi.mock('./client', () => ({
@@ -118,6 +120,175 @@ describe('agent api', () => {
       body: JSON.stringify({ content: '帮我分析品牌' }),
     });
     expect(result.run_id).toBe('run-1');
+  });
+
+  it('sends parent run, artifact version and upload references via options', async () => {
+    const { request } = await import('./client');
+    vi.mocked(request).mockResolvedValue({
+      run_id: 'run-2',
+      session_id: 's1',
+      message_id: 'm2',
+      status: 'queued',
+      reused: false,
+    });
+
+    await sendMessage('s1', '分析活动效果', {
+      parentRunId: 'run-1',
+      artifactVersionIds: ['version-1', 'version-2'],
+      uploadIds: ['upload-1'],
+    });
+    expect(request).toHaveBeenCalledWith('/api/v1/agent/sessions/s1/messages', {
+      method: 'POST',
+      body: JSON.stringify({
+        content: '分析活动效果',
+        parent_run_id: 'run-1',
+        artifact_version_ids: ['version-1', 'version-2'],
+        upload_ids: ['upload-1'],
+      }),
+    });
+  });
+
+  it('sends the idempotency key header via options', async () => {
+    const { request } = await import('./client');
+    vi.mocked(request).mockResolvedValue({
+      run_id: 'run-3',
+      session_id: 's1',
+      message_id: 'm3',
+      status: 'queued',
+      reused: false,
+    });
+
+    await sendMessage('s1', '内容', { idempotencyKey: 'key-1' });
+    expect(request).toHaveBeenCalledWith('/api/v1/agent/sessions/s1/messages', {
+      method: 'POST',
+      body: JSON.stringify({ content: '内容' }),
+      headers: { 'Idempotency-Key': 'key-1' },
+    });
+  });
+
+  it('keeps the legacy positional call compatible when options are absent', async () => {
+    const { request } = await import('./client');
+    vi.mocked(request).mockResolvedValue({
+      run_id: 'run-4',
+      session_id: 's1',
+      message_id: 'm4',
+      status: 'queued',
+      reused: false,
+    });
+
+    await sendMessage('s1', '只发文本');
+    expect(request).toHaveBeenCalledWith('/api/v1/agent/sessions/s1/messages', {
+      method: 'POST',
+      body: JSON.stringify({ content: '只发文本' }),
+    });
+  });
+
+  it('maps a legacy string idempotency key to the Idempotency-Key header', async () => {
+    // 历史签名 sendMessage(sessionId, content, idempotencyKey?: string)：
+    // 字符串第三参数不得被当作 options 对象静默丢弃。
+    const { request } = await import('./client');
+    vi.mocked(request).mockResolvedValue({
+      run_id: 'run-5',
+      session_id: 's1',
+      message_id: 'm5',
+      status: 'queued',
+      reused: false,
+    });
+
+    await sendMessage('s1', '内容', 'legacy-key');
+    expect(request).toHaveBeenCalledWith('/api/v1/agent/sessions/s1/messages', {
+      method: 'POST',
+      body: JSON.stringify({ content: '内容' }),
+      headers: { 'Idempotency-Key': 'legacy-key' },
+    });
+  });
+
+  it('keeps empty arrays out of the message body', async () => {
+    const { request } = await import('./client');
+    vi.mocked(request).mockResolvedValue({
+      run_id: 'run-6',
+      session_id: 's1',
+      message_id: 'm6',
+      status: 'queued',
+      reused: false,
+    });
+
+    await sendMessage('s1', '内容', { artifactVersionIds: [], uploadIds: [] });
+    expect(request).toHaveBeenCalledWith('/api/v1/agent/sessions/s1/messages', {
+      method: 'POST',
+      body: JSON.stringify({ content: '内容' }),
+    });
+  });
+
+  it('uploads a parsed file and returns the upload DTO', async () => {
+    const { authorizedFetch } = await import('./client');
+    // fixture 显式标注 satisfies：status 必须是 'uploaded' | 'parsed' | 'failed'，
+    // 防止被自动推断成普通 string。
+    const upload = {
+      id: 'upload-1',
+      original_filename: '投放数据.csv',
+      mime_type: 'text/csv',
+      size_bytes: 1024,
+      sha256: 'abc123',
+      status: 'parsed',
+      error_code: null,
+      created_at: '2026-08-01T10:00:00',
+      completed_at: '2026-08-01T10:00:01',
+    } satisfies ApiAgentUpload;
+    vi.mocked(authorizedFetch).mockResolvedValue(
+      new Response(JSON.stringify(upload), {
+        status: 201,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+
+    const file = new File(['csv'], '投放数据.csv', { type: 'text/csv' });
+    const result = await uploadAgentFile('s1', file);
+
+    expect(result).toEqual(upload);
+    expect(result.status).toBe('parsed');
+    const [url, init] = vi.mocked(authorizedFetch).mock.calls[0];
+    expect(url).toBe('/api/v1/agent/sessions/s1/uploads');
+    expect(init?.method).toBe('POST');
+    expect(init?.body).toBeInstanceOf(FormData);
+    // multipart boundary 由浏览器生成：不得手动设置 Content-Type。
+    expect(init?.headers).toBeUndefined();
+  });
+
+  it('rejects upload statuses outside the backend union at type level', () => {
+    // 后端 UploadRead 实际状态只有 uploaded/parsed/failed：非法字面量必须被
+    // 类型系统拒绝（@ts-expect-error 在类型放开时会报 unused，防止假绿）。
+    const parsed: ApiAgentUpload = {
+      id: 'upload-1',
+      original_filename: '投放数据.csv',
+      mime_type: 'text/csv',
+      size_bytes: 1024,
+      sha256: 'abc123',
+      status: 'parsed',
+      error_code: null,
+      created_at: '2026-08-01T10:00:00',
+      completed_at: null,
+    };
+    // @ts-expect-error - status 只能是 'uploaded' | 'parsed' | 'failed'
+    const invalid: ApiAgentUpload = { ...parsed, status: 'drafting' };
+    expect(invalid.status).toBe('drafting');
+  });
+
+  it('retries a failed run and returns the new run response', async () => {
+    const { request } = await import('./client');
+    vi.mocked(request).mockResolvedValue({
+      run_id: 'run-new',
+      session_id: 's1',
+      message_id: 'm5',
+      status: 'queued',
+      reused: false,
+    });
+
+    const result = await retryRun('run-old');
+    expect(request).toHaveBeenCalledWith('/api/v1/agent/runs/run-old/retry', {
+      method: 'POST',
+    });
+    expect(result.run_id).toBe('run-new');
   });
 
   it('cancels and resumes a run', async () => {

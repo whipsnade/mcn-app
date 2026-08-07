@@ -31,6 +31,9 @@ const SCORE_DIMENSION_LABELS = [
 function KolCard({ item, onOpenDetail }: { item: KolSelectionItem; onOpenDetail?: (item: KolSelectionItem) => void }) {
   const nickname = item.nickname || '未知达人';
   const snapshot = item.score_snapshot;
+  // kol_score_v2 专属字段（v3 快照无 stars/total）：判别收窄；v3 价值分渲染属 Task 3。
+  const legacyStars = snapshot.version === 'kol_score_v2' ? snapshot.stars : undefined;
+  const legacyTotal = snapshot.version === 'kol_score_v2' ? snapshot.total : undefined;
   const followers = item.followers != null ? formatExposure(item.followers) : '数据受限';
   return (
     <section className="rounded-xl border border-slate-100 bg-white p-3 shadow-sm">
@@ -46,7 +49,7 @@ function KolCard({ item, onOpenDetail }: { item: KolSelectionItem; onOpenDetail?
         <div className="min-w-0 flex-1">
           <p className="flex items-center gap-1.5">
             <span className="truncate text-[12px] font-semibold text-slate-800">{nickname}</span>
-            {snapshot.stars && <span className="shrink-0 text-[10px] text-amber-500">{snapshot.stars}</span>}
+            {legacyStars && <span className="shrink-0 text-[10px] text-amber-500">{legacyStars}</span>}
           </p>
           <p className="mt-0.5 truncate text-[10px] text-slate-400">
             {platformName(item.platform)} · 粉丝 {followers}
@@ -54,7 +57,7 @@ function KolCard({ item, onOpenDetail }: { item: KolSelectionItem; onOpenDetail?
         </div>
         <div className="shrink-0 text-right">
           <p className="text-[12px] font-bold text-slate-800">
-            <span className="mr-1 text-[10px] font-normal text-slate-400">综合评分</span>{formatNumber(snapshot.total)}
+            <span className="mr-1 text-[10px] font-normal text-slate-400">综合评分</span>{legacyTotal != null ? formatNumber(legacyTotal) : '—'}
           </p>
           {snapshot.rating && (
             <span className="mt-1 inline-block rounded-full bg-indigo-50 px-2 py-0.5 text-[10px] font-semibold text-indigo-600">

@@ -23,6 +23,7 @@ export type RunStatus =
   | 'paused'
   | 'clarification_requested'
   | 'completed'
+  | 'completed_with_warnings'
   | 'failed'
   | 'cancelled';
 
@@ -61,6 +62,8 @@ export interface RunArtifactDraft {
   status: string;
   title?: string;
   parentArtifactId?: string;
+  /** 发布汇总事件中失败项的 Draft 身份（成功项以 artifactId 匹配）。 */
+  draftId?: string;
 }
 
 export type RunReviewStatus =
@@ -119,7 +122,10 @@ export function initialRunRuntime(runId: string): RunRuntimeState {
 }
 
 export function isTerminalRunStatus(status: string | undefined): boolean {
-  return status === 'completed' || status === 'failed' || status === 'cancelled';
+  return status === 'completed'
+    || status === 'completed_with_warnings'
+    || status === 'failed'
+    || status === 'cancelled';
 }
 
 function valueOf(payload: Record<string, unknown>, camelName: string, snakeName: string): unknown {
@@ -155,6 +161,14 @@ function withRunStatus(state: RunRuntimeState, event: RunEvent): RunRuntimeState
       return { ...state, status: 'running', activity: '恢复执行' };
     case 'run.completed':
       return { ...state, status: 'completed', connection: 'closed', activity: '分析完成' };
+    case 'run.completed_with_warnings':
+      // 有产物发布成功但存在失败/放弃项：终态，流同样关闭（后端 TERMINAL）。
+      return {
+        ...state,
+        status: 'completed_with_warnings',
+        connection: 'closed',
+        activity: '分析完成（部分产物发布失败）',
+      };
     case 'run.failed':
       return {
         ...state,
@@ -267,6 +281,61 @@ function withDrafts(state: RunRuntimeState, event: RunEvent): RunRuntimeState {
     ));
     return { ...state, drafts };
   }
+  if (event.type === 'artifact.publish.completed') {
+    // 真实后端汇总事件：{published, validation_failed, failed,
+    // items: [{draft_id, status, artifact_id, version}]}。成功项带
+    // artifact_id（与 draft.created 条目匹配）；校验失败/失败项 artifact_id
+    // 为空串、以 draft_id 标识。逐项独立 upsert：一个失败不得覆盖其他项。
+    const rawItems = Array.isArray(event.payload.items) ? event.payload.items : [];
+    let drafts = state.drafts;
+    for (const raw of rawItems) {
+      const item = (typeof raw === 'object' && raw !== null)
+        ? raw as Record<string, unknown>
+        : {};
+      const artifactIdRaw = valueOf(item, 'artifactId', 'artifact_id');
+      const artifactId = artifactIdRaw != null && String(artifactIdRaw) !== ''
+        ? String(artifactIdRaw)
+        : undefined;
+      const draftIdRaw = valueOf(item, 'draftId', 'draft_id');
+      const draftId = draftIdRaw != null ? String(draftIdRaw) : undefined;
+      const key = artifactId ?? draftId;
+      if (!key) continue;
+      const status = String(item.status ?? '');
+      const versionValue = Number(item.version);
+      const version = Number.isFinite(versionValue) && versionValue > 0 ? versionValue : 0;
+      const index = drafts.findIndex(entry => entry.artifactId === key);
+      if (index === -1) {
+        drafts = [...drafts, {
+          artifactId: key,
+          module: '',
+          version: version || 0,
+          status,
+          draftId,
+        }];
+      } else {
+        const copy = [...drafts];
+        copy[index] = {
+          ...copy[index],
+          status,
+          draftId: draftId ?? copy[index].draftId,
+          version: version || copy[index].version,
+        };
+        drafts = copy;
+      }
+    }
+    // 兼容顶层 artifact_id/status 形式的历史/示例变体（无 items 时兜底）。
+    if (rawItems.length === 0) {
+      const artifactId = valueOf(event.payload, 'artifactId', 'artifact_id');
+      if (artifactId != null) {
+        drafts = drafts.map(item => (
+          item.artifactId === String(artifactId)
+            ? { ...item, status: String(event.payload.status ?? item.status) }
+            : item
+        ));
+      }
+    }
+    return { ...state, drafts };
+  }
   return state;
 }
 
@@ -341,6 +410,8 @@ function withSteps(state: RunRuntimeState, event: RunEvent): RunRuntimeState {
       return { ...state, steps: pushStep(steps, { id: `published-${event.id}`, label: '产物已发布', status: 'succeeded' }) };
     case 'run.completed':
       return { ...state, steps: pushStep(steps, { id: `terminal-${event.id}`, label: '分析完成', status: 'succeeded' }) };
+    case 'run.completed_with_warnings':
+      return { ...state, steps: pushStep(steps, { id: `terminal-${event.id}`, label: '分析完成（部分发布失败）', status: 'succeeded' }) };
     case 'run.failed':
       return {
         ...state,
@@ -374,6 +445,7 @@ function withMessage(state: RunRuntimeState, event: RunEvent): RunRuntimeState {
 function isArtifactRelevantEvent(event: RunEvent): boolean {
   return event.type.startsWith('artifact.draft.')
     || event.type === 'artifact.published'
+    || event.type === 'artifact.publish.completed'
     || event.type.startsWith('review.');
 }
 

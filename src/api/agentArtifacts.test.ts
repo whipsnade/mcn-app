@@ -141,6 +141,11 @@ const campaignFixture: CampaignReportPayload = {
     period: { start: '2026-07-01', end: '2026-07-31', timezone: 'Asia/Shanghai' },
     platforms: ['xiaohongshu'],
     keywords: [],
+    exclusions: ['竞品词'],
+    official_accounts: [],
+    comparison_mode: 'mom',
+    attribution_rules: ['最后点击 7 天'],
+    upload_ids: ['upload-1'],
   },
   data: {
     overview: { total_volume: 500, total_engagement: 200, total_posts: 40, total_creators: 5, sentiment_score: 0.6 },
@@ -157,6 +162,64 @@ const campaignFixture: CampaignReportPayload = {
       by_platform: [],
     },
     top_posts: [],
+    comparisons: {
+      current_baseline: [
+        { metric: 'volume', current: 500, baseline: 420, delta: 80, rate: 0.1905 },
+      ],
+      current_post: [],
+    },
+    attribution: { paid_confirmed: 30, organic: 8, unknown: 2, paid_confirmed_share: 0.75 },
+    organic_summary: { volume: 160, engagement: 90, posts: 8, share_of_volume: null },
+    audience_regions: [{ region: '上海', volume: 200, share: 0.4 }],
+    internal_metrics: {
+      spend: 100000,
+      impressions: 2000000,
+      conversions: 5000,
+      revenue: 300000,
+      cpc: 20,
+      cpm: 50,
+    },
+    roi: { spend: 100000, revenue: 300000, conversions: 5000, attribution_window: '最后点击 7 天', roi: 2, roas: 3 },
+  },
+  narrative: { executive_summary: '活动总结', phase_review: [], findings: [], recommendations: [] },
+};
+
+// Golden fixture：活动 ROI 可选章节为 null（数据不足时后端输出 None）。
+const campaignRoiNullFixture: CampaignReportPayload = {
+  schema_version: 'campaign_report_v2',
+  module: 'campaign',
+  data_status: 'restricted',
+  availability: { overview: { status: 'complete', reason_codes: [] } },
+  limitations: [{ code: 'roi_missing', message: 'ROI 数据不足', affected_paths: ['roi'] }],
+  methodology: emptyMethodology,
+  scope: {
+    brand: '测试品牌',
+    campaign: '无 ROI 活动',
+    period: { start: '2026-07-01', end: '2026-07-31', timezone: 'Asia/Shanghai' },
+    platforms: ['xiaohongshu'],
+    keywords: [],
+  },
+  data: {
+    overview: { total_volume: 500, total_engagement: 200, total_posts: 40, total_creators: 5, sentiment_score: 0.6 },
+    platform_contributions: [],
+    timeline: [],
+    kol_contributions: [],
+    content_types: [],
+    sentiment: {
+      summary: {
+        positive: { count: 30, share: 0.6 },
+        neutral: { count: 10, share: 0.2 },
+        negative: { count: 10, share: 0.2 },
+      },
+      by_platform: [],
+    },
+    top_posts: [],
+    comparisons: { current_baseline: [], current_post: [] },
+    attribution: null,
+    organic_summary: null,
+    audience_regions: [],
+    internal_metrics: null,
+    roi: null,
   },
   narrative: { executive_summary: '活动总结', phase_review: [], findings: [], recommendations: [] },
 };
@@ -202,6 +265,7 @@ const kolSelectionFixture: KolSelectionPayload = {
       quoted_price: 100,
       reasons: [],
       missing_fields: [],
+      audience: { regions: ['上海'], age_ranges: ['18-24'], interests: ['美食'] },
       score_snapshot: {
         version: 'kol_score_v2',
         total: 85,
@@ -216,6 +280,86 @@ const kolSelectionFixture: KolSelectionPayload = {
     summary: { candidate_count: 10, selected_count: 1, platform_distribution: [], rating_distribution: [] },
   },
   narrative: { selection_summary: '圈选说明', fit_findings: [], risk_notes: [], usage_advice: [] },
+};
+
+const v3Dimension = (rawScore: number, weight: number) => ({
+  raw_score: rawScore,
+  weight,
+  weighted_score: Math.round(rawScore * weight) / 100,
+  source: null,
+  missing_reason: null,
+});
+
+// Golden fixture：kol_value_score_v3 判别联合分支（Gate C Task 1/2 新契约）。
+const kolValueV3Fixture: KolSelectionPayload = {
+  schema_version: 'kol_selection_v3',
+  module: 'kol',
+  data_status: 'complete',
+  availability: { items: { status: 'complete', reason_codes: [] } },
+  limitations: [],
+  methodology: emptyMethodology,
+  scope: {
+    brand: null,
+    category: '美食',
+    campaign: null,
+    platforms: ['xiaohongshu'],
+    audience: { regions: ['上海'], age_ranges: [], interests: [] },
+    filters: { budget_min: null, budget_max: null, follower_min: null, follower_max: null },
+    content_formats: ['视频'],
+  },
+  data: {
+    scoring: {
+      version: 'kol_value_score_v3',
+      method: 'effect_plus_price_efficiency',
+      weights: { average_interactions: 14 },
+      missing_value_policy: 'missing_as_zero',
+    },
+    items: [{
+      rank: 1,
+      platform: 'xiaohongshu',
+      kol_uid: 'kol-1',
+      nickname: '达人甲',
+      avatar_url: null,
+      homepage_url: null,
+      followers: 500000,
+      active_followers: 300000,
+      active_follower_rate: 60,
+      growth_rate: 0.3,
+      engagement_total: 20000,
+      avg_engagement: 20,
+      likes: 50,
+      comments: 30,
+      shares: 20,
+      quoted_price: 800,
+      reasons: [],
+      missing_fields: [],
+      audience: { regions: ['上海'], age_ranges: ['18-24'], interests: ['美食'] },
+      score_snapshot: {
+        version: 'kol_value_score_v3',
+        effect_score: 52.3,
+        price_efficiency_score: 18.6,
+        value_score: 70.9,
+        quoted_price: 800,
+        price_sample_size: 5,
+        raw_price_efficiency: 0.62,
+        price_efficiency_percentile: 62,
+        rating: '推荐',
+        data_completeness: 0.9,
+        dimensions: {
+          average_interactions: v3Dimension(80, 14),
+          active_follower: v3Dimension(70, 10),
+          engagement_follower_ratio: v3Dimension(75, 10),
+          content_match: v3Dimension(90, 10),
+          followers: v3Dimension(60, 7),
+          industry_interest: v3Dimension(85, 7),
+          target_region: v3Dimension(50, 6),
+          target_age: v3Dimension(40, 6),
+        },
+      },
+    }],
+    summary: { candidate_count: 20, selected_count: 1, platform_distribution: [], rating_distribution: [] },
+  },
+  narrative: { selection_summary: 'v3 圈选说明', fit_findings: [], risk_notes: [], usage_advice: [] },
 };
 
 const kolAnalysisFixture: KolAnalysisPayload = {
@@ -415,7 +559,9 @@ describe('agent artifacts api', () => {
     const fixtures = [
       brandFixture,
       campaignFixture,
+      campaignRoiNullFixture,
       kolSelectionFixture,
+      kolValueV3Fixture,
       kolAnalysisFixture,
       kolDetailFixture,
       insightBoardFixture,
@@ -436,12 +582,14 @@ describe('agent artifacts api', () => {
           break;
         case 'campaign_report_v2':
           expect(fixture.data.overview.total_creators).toBe(5);
-          expect(fixture.scope.campaign).toBe('夏季活动');
+          expect(fixture.scope.campaign).toBeTypeOf('string');
           break;
         case 'kol_selection_v3':
-          expect(fixture.data.scoring.version).toBe('kol_score_v2');
-          expect(fixture.data.items[0].score_snapshot.dimensions.fans.weighted_score).toBeCloseTo(13.5);
+          // 循环断言只做版本无关检查；判别分支的精确断言在
+          // kol_value_score_v3 / kol_score_v2 两个专项测试里。
+          expect(fixture.data.items).toBeInstanceOf(Array);
           expect(fixture.data.summary.selected_count).toBe(1);
+          expect(fixture.data.items[0].audience.regions).toBeInstanceOf(Array);
           break;
         case 'kol_analysis_v2':
           expect(fixture.data.summary.kol_count).toBe(5);
@@ -460,5 +608,67 @@ describe('agent artifacts api', () => {
           break;
       }
     }
+  });
+
+  it('parses kol_value_score_v3 snapshots with effect/price/completeness/dimensions', () => {
+    expect(isAgentArtifactPayload(kolValueV3Fixture)).toBe(true);
+    if (kolValueV3Fixture.schema_version !== 'kol_selection_v3') throw new Error('unreachable');
+    expect(kolValueV3Fixture.data.scoring.version).toBe('kol_value_score_v3');
+    expect(kolValueV3Fixture.data.scoring.method).toBe('effect_plus_price_efficiency');
+    // 本次圈选确认的内容形式（决定图文/视频报价选择）：新契约必填、旧版可缺失。
+    expect(kolValueV3Fixture.scope.content_formats).toEqual(['视频']);
+
+    const snapshot = kolValueV3Fixture.data.items[0].score_snapshot;
+    expect(snapshot.version).toBe('kol_value_score_v3');
+    if (snapshot.version === 'kol_value_score_v3') {
+      expect(snapshot.effect_score).toBe(52.3);
+      expect(snapshot.price_efficiency_score).toBe(18.6);
+      expect(snapshot.value_score).toBe(70.9);
+      expect(snapshot.quoted_price).toBe(800);
+      expect(snapshot.price_sample_size).toBe(5);
+      expect(snapshot.rating).toBe('推荐');
+      expect(snapshot.data_completeness).toBe(0.9);
+      expect(snapshot.dimensions.average_interactions.raw_score).toBe(80);
+      expect(snapshot.dimensions.target_age.weight).toBe(6);
+    }
+  });
+
+  it('keeps legacy kol_score_v2 snapshots readable', () => {
+    expect(isAgentArtifactPayload(kolSelectionFixture)).toBe(true);
+    if (kolSelectionFixture.schema_version !== 'kol_selection_v3') throw new Error('unreachable');
+    // 旧 Version 的 scope 无 content_formats：可选字段必须仍可读取（undefined 兜底）。
+    expect(kolSelectionFixture.scope.content_formats).toBeUndefined();
+    const snapshot = kolSelectionFixture.data.items[0].score_snapshot;
+    expect(snapshot.version).toBe('kol_score_v2');
+    if (snapshot.version === 'kol_score_v2') {
+      expect(snapshot.total).toBe(85);
+      expect(snapshot.rating).toBe('S');
+      expect(snapshot.stars).toBe('5');
+      expect(snapshot.dimensions.fans.weighted_score).toBeCloseTo(13.5);
+    }
+  });
+
+  it('reads campaign comparisons/attribution/organic/audience/internal/roi sections', () => {
+    if (campaignFixture.schema_version !== 'campaign_report_v2') throw new Error('unreachable');
+    expect(campaignFixture.scope.attribution_rules).toEqual(['最后点击 7 天']);
+    expect(campaignFixture.scope.comparison_mode).toBe('mom');
+    expect(campaignFixture.scope.upload_ids).toEqual(['upload-1']);
+    expect(campaignFixture.data.comparisons.current_baseline[0]).toEqual({
+      metric: 'volume', current: 500, baseline: 420, delta: 80, rate: 0.1905,
+    });
+    expect(campaignFixture.data.attribution?.paid_confirmed).toBe(30);
+    expect(campaignFixture.data.organic_summary?.posts).toBe(8);
+    expect(campaignFixture.data.audience_regions[0]).toEqual({ region: '上海', volume: 200, share: 0.4 });
+    expect(campaignFixture.data.internal_metrics?.cpm).toBe(50);
+    expect(campaignFixture.data.roi?.roas).toBe(3);
+  });
+
+  it('parses campaign payloads with roi null (data insufficient)', () => {
+    if (campaignRoiNullFixture.schema_version !== 'campaign_report_v2') throw new Error('unreachable');
+    expect(campaignRoiNullFixture.data.roi).toBeNull();
+    expect(campaignRoiNullFixture.data.internal_metrics).toBeNull();
+    expect(campaignRoiNullFixture.data.organic_summary).toBeNull();
+    expect(campaignRoiNullFixture.data.attribution).toBeNull();
+    expect(campaignRoiNullFixture.data_status).toBe('restricted');
   });
 });

@@ -223,6 +223,52 @@ export interface BrandReportPayload extends AgentArtifactPayloadBase {
 
 // ---- campaign_report_v2 ----
 
+export interface CampaignComparisonSeries {
+  metric: string;
+  current: number | null;
+  baseline: number | null;
+  delta: number | null;
+  rate: number | null;
+}
+
+export interface CampaignAttribution {
+  paid_confirmed: number | null;
+  organic: number | null;
+  unknown: number | null;
+  paid_confirmed_share: number | null;
+}
+
+export interface CampaignOrganicSummary {
+  volume: number | null;
+  engagement: number | null;
+  posts: number | null;
+  share_of_volume: number | null;
+}
+
+export interface CampaignAudienceRegion {
+  region: string;
+  volume: number | null;
+  share: number | null;
+}
+
+export interface CampaignInternalMetrics {
+  spend: number | null;
+  impressions: number | null;
+  conversions: number | null;
+  revenue: number | null;
+  cpc: number | null;
+  cpm: number | null;
+}
+
+export interface CampaignRoi {
+  spend: number;
+  revenue: number | null;
+  conversions: number | null;
+  attribution_window: string;
+  roi: number | null;
+  roas: number | null;
+}
+
 export interface CampaignReportPayload extends AgentArtifactPayloadBase {
   schema_version: 'campaign_report_v2';
   module: 'campaign';
@@ -232,6 +278,12 @@ export interface CampaignReportPayload extends AgentArtifactPayloadBase {
     period: AgentArtifactPeriod | null;
     platforms: string[];
     keywords: string[];
+    /** Gate C Task 4：排除规则/官方账号/对比模式/归属规则/用户补充资料（历史 Version 可缺失）。 */
+    exclusions?: string[];
+    official_accounts?: string[];
+    comparison_mode?: string | null;
+    attribution_rules?: string[];
+    upload_ids?: string[];
   };
   data: {
     overview: {
@@ -268,6 +320,17 @@ export interface CampaignReportPayload extends AgentArtifactPayloadBase {
     content_types: AgentArtifactContentTypeItem[];
     sentiment: AgentArtifactSentiment;
     top_posts: AgentArtifactTopPost[];
+    /** Gate C Task 4 章节（历史 Version 可缺失；attribution/organic_summary/
+     * internal_metrics/roi 后端可输出 null）。 */
+    comparisons?: {
+      current_baseline: CampaignComparisonSeries[];
+      current_post: CampaignComparisonSeries[];
+    };
+    attribution?: CampaignAttribution | null;
+    organic_summary?: CampaignOrganicSummary | null;
+    audience_regions?: CampaignAudienceRegion[];
+    internal_metrics?: CampaignInternalMetrics | null;
+    roi?: CampaignRoi | null;
   };
   narrative: {
     executive_summary: string;
@@ -287,7 +350,8 @@ export interface KolSelectionScoreDimension {
   missing_reason: string | null;
 }
 
-export interface KolSelectionScoreSnapshot {
+/** 旧版评分快照（只读兼容历史 Version）。 */
+export interface KolScoreV2Snapshot {
   version: 'kol_score_v2';
   total: number;
   rating: string;
@@ -295,6 +359,38 @@ export interface KolSelectionScoreSnapshot {
   data_completeness: number;
   dimensions: Record<string, KolSelectionScoreDimension>;
 }
+
+/** v3 价值评分快照（镜像 backend KolValueScoreSnapshotV3：效果 70 + 价格效率 30）。 */
+export interface KolValueScoreV3Snapshot {
+  version: 'kol_value_score_v3';
+  effect_score: number;
+  price_efficiency_score: number;
+  value_score: number;
+  quoted_price: number | null;
+  price_sample_size: number;
+  raw_price_efficiency: number | null;
+  price_efficiency_percentile: number | null;
+  rating: string;
+  data_completeness: number;
+  dimensions: Record<string, KolSelectionScoreDimension>;
+}
+
+export type KolSelectionScoreSnapshot = KolScoreV2Snapshot | KolValueScoreV3Snapshot;
+
+/** 评分配置判别联合（镜像 backend ScoringConfigV2 | ScoringConfigV3）。 */
+export type KolScoringConfig =
+  | {
+      version: 'kol_score_v2';
+      method: 'weighted_sum';
+      weights: Record<string, number>;
+      missing_value_policy: 'missing_as_zero';
+    }
+  | {
+      version: 'kol_value_score_v3';
+      method: 'effect_plus_price_efficiency';
+      weights: Record<string, number>;
+      missing_value_policy: 'missing_as_zero';
+    };
 
 export interface KolSelectionItem {
   rank: number;
@@ -315,6 +411,8 @@ export interface KolSelectionItem {
   quoted_price: number | null;
   reasons: string[];
   missing_fields: string[];
+  /** 后端必填 AudienceFilter；历史 Version 可能缺失该键，故前端可选宽松解析。 */
+  audience?: { regions: string[]; age_ranges: string[]; interests: string[] };
   score_snapshot: KolSelectionScoreSnapshot;
 }
 
@@ -333,14 +431,11 @@ export interface KolSelectionPayload extends AgentArtifactPayloadBase {
       follower_min: number | null;
       follower_max: number | null;
     };
+    /** 本次圈选确认的内容形式（决定图文/视频报价选择）；新版本恒返回，历史版本可能缺失。 */
+    content_formats?: string[];
   };
   data: {
-    scoring: {
-      version: 'kol_score_v2';
-      method: 'weighted_sum';
-      weights: Record<string, number>;
-      missing_value_policy: 'missing_as_zero';
-    };
+    scoring: KolScoringConfig;
     items: KolSelectionItem[];
     summary: {
       candidate_count: number | null;
