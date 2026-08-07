@@ -1,0 +1,303 @@
+"""Pi POC Runner 的 Run/Attempt 生命周期测试（SQLite 内存库）。"""
+
+from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
+from typing import Any
+from uuid import uuid4
+
+import pytest_asyncio
+from sqlalchemy import select
+from sqlalchemy.dialects.mysql import MEDIUMTEXT
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.compiler import compiles
+from sqlalchemy.pool import StaticPool
+
+import app.db.models  # noqa: F401
+from app.agent_artifacts.models import AgentArtifact, AgentArtifactVersion
+from app.agent_runtime.events import AgentEventBroker, AgentEventStream
+from app.agent_runtime.models import (
+    AgentEvent,
+    AgentMessage,
+    AgentRun,
+    AgentRunAttempt,
+    AgentSession,
+)
+from app.core.config import Settings
+from app.identity.models import User
+from app.pi_runtime_poc.runner import PiPocRunner
+
+
+@compiles(MEDIUMTEXT, "sqlite")
+def _mediumtext_sqlite(element: Any, compiler: Any, **kw: Any) -> str:
+    return "TEXT"
+
+
+def _now() -> datetime:
+    return datetime.now(UTC).replace(tzinfo=None)
+
+
+class FakePiClient:
+    def __init__(self, records: list[dict[str, Any]] | None = None, error: Exception | None = None) -> None:
+        self.records = records or []
+        self.error = error
+        self.prompts: list[str] = []
+        self.aborted = False
+        self.closed = False
+
+    async def prompt(self, message: str) -> str:
+        self.prompts.append(message)
+        return "prompt-1"
+
+    async def events(self) -> AsyncIterator[dict[str, Any]]:
+        for record in self.records:
+            yield record
+        if self.error is not None:
+            raise self.error
+
+    async def abort(self) -> None:
+        self.aborted = True
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+@pytest_asyncio.fixture
+async def db() -> AsyncSession:
+    engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        poolclass=StaticPool,
+        connect_args={"check_same_thread": False},
+    )
+    from app.db.base import Base
+
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    async with factory() as session:
+        yield session
+    await engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def queued_run(db: AsyncSession) -> AgentRun:
+    now = _now()
+    user = User(id=str(uuid4()), nickname="poc", role="user", status="active", created_at=now, updated_at=now)
+    session = AgentSession(
+        id=str(uuid4()), user_id=user.id, title="poc", status="active", summary_version=0,
+        created_at=now, updated_at=now,
+    )
+    run = AgentRun(
+        id=str(uuid4()), session_id=session.id, user_id=user.id, run_kind="user", visibility="user",
+        profile_name="pi_poc", profile_version="v1", model="test", status="queued",
+    )
+    message = AgentMessage(
+        id=str(uuid4()), session_id=session.id, run_id=run.id, role="user", content="请解释现有报告",
+        sequence=1, created_at=now,
+    )
+    run.input_message_id = message.id
+    db.add_all([user, session, run, message])
+    await db.commit()
+    return run
+
+
+def make_runner(db: AsyncSession, settings: Settings, client: FakePiClient) -> PiPocRunner:
+    return PiPocRunner(
+        db=db,
+        events=AgentEventStream(db, AgentEventBroker()),
+        settings=settings,
+        worker_id="pi-poc-test",
+        client_factory=lambda _run, _token: client,
+    )
+
+
+async def test_runner_completes_non_marketing_reply_with_one_terminal_event(
+    db: AsyncSession, settings: Settings, queued_run: AgentRun
+) -> None:
+    client = FakePiClient(
+        [
+            {"type": "agent_start"},
+            {"type": "message_update", "assistantMessageEvent": {"type": "text_delta", "delta": "仅处理社媒营销。"}},
+            {"type": "agent_settled"},
+        ]
+    )
+
+    outcome = await make_runner(db, settings, client).run(queued_run.id)
+
+    assert outcome == "completed"
+    assert client.closed
+    assert client.prompts
+    events = (await db.scalars(select(AgentEvent).where(AgentEvent.run_id == queued_run.id))).all()
+    assert [event.event_type for event in events].count("run.completed") == 1
+    assert any(event.event_type == "message.completed" for event in events)
+
+
+async def test_runner_cancels_after_persisted_cancel_request(
+    db: AsyncSession, settings: Settings, queued_run: AgentRun
+) -> None:
+    client = FakePiClient([{"type": "agent_start"}, {"type": "agent_settled"}])
+    queued_run.cancel_requested = True
+    await db.commit()
+
+    outcome = await make_runner(db, settings, client).run(queued_run.id)
+
+    assert outcome == "cancelled"
+    # 已持久化取消的 queued Run 不得启动 Pi 子进程，因此无需发送 abort RPC。
+    assert not client.aborted
+    assert not client.prompts
+    event = await db.scalar(
+        select(AgentEvent).where(AgentEvent.run_id == queued_run.id, AgentEvent.event_type == "run.cancelled")
+    )
+    assert event is not None
+
+
+async def test_runner_marks_rpc_crash_failed(
+    db: AsyncSession, settings: Settings, queued_run: AgentRun
+) -> None:
+    client = FakePiClient(error=RuntimeError("rpc disconnected"))
+
+    outcome = await make_runner(db, settings, client).run(queued_run.id)
+
+    assert outcome == "failed"
+    run = await db.get(AgentRun, queued_run.id)
+    assert run is not None and run.status == "failed"
+    assert client.closed
+
+
+async def test_runner_does_not_complete_on_low_level_agent_end_without_settled(
+    db: AsyncSession, settings: Settings, queued_run: AgentRun
+) -> None:
+    client = FakePiClient([{"type": "agent_start"}, {"type": "agent_end"}])
+
+    outcome = await make_runner(db, settings, client).run(queued_run.id)
+
+    assert outcome == "failed"
+    event = await db.scalar(
+        select(AgentEvent).where(AgentEvent.run_id == queued_run.id, AgentEvent.event_type == "run.failed")
+    )
+    assert event is not None and event.payload_json["error_code"] == "pi_rpc_unsettled_exit"
+
+
+async def test_runner_fails_on_pi_error_record_without_leaking_error_text(
+    db: AsyncSession, settings: Settings, queued_run: AgentRun
+) -> None:
+    client = FakePiClient(
+        [{"type": "error", "message": "Bearer must-not-reach-product-events"}]
+    )
+
+    outcome = await make_runner(db, settings, client).run(queued_run.id)
+
+    assert outcome == "failed"
+    events = (await db.scalars(select(AgentEvent).where(AgentEvent.run_id == queued_run.id))).all()
+    error_event = next(event for event in events if event.event_type == "thinking.failed")
+    assert error_event.payload_json == {
+        "code": "pi_rpc_error",
+        "collapsed": True,
+        "run_id": queued_run.id,
+    }
+    assert all("must-not-reach" not in str(event.payload_json) for event in events)
+
+
+async def test_runner_emits_only_persisted_published_artifact_and_marks_partial_warning(
+    db: AsyncSession, settings: Settings, queued_run: AgentRun
+) -> None:
+    now = _now()
+    artifact = AgentArtifact(
+        id=str(uuid4()),
+        session_id=queued_run.session_id,
+        user_id=queued_run.user_id,
+        module="brand",
+        artifact_type="brand_report",
+        artifact_key="pi-poc-brand",
+        status="published",
+        latest_version=1,
+        activity_sequence=1,
+        created_at=now,
+        updated_at=now,
+    )
+    version = AgentArtifactVersion(
+        id=str(uuid4()),
+        artifact_id=artifact.id,
+        version=1,
+        source_run_id=queued_run.id,
+        source_draft_revision_id=str(uuid4()),
+        schema_version="brand_report_v3",
+        payload_json={"data_status": "partial"},
+        evidence_refs_json=[],
+        lineage_snapshot_json={},
+        review_json={},
+        validation_json={},
+        data_status="partial",
+        created_at=now,
+    )
+    db.add_all([artifact, version])
+    await db.commit()
+    client = FakePiClient(
+        [
+            {"type": "agent_start"},
+            {
+                "type": "message_update",
+                "assistantMessageEvent": {"type": "text_delta", "delta": "数据受限，已披露限制。"},
+            },
+            {"type": "agent_settled"},
+        ]
+    )
+
+    outcome = await make_runner(db, settings, client).run(queued_run.id)
+
+    assert outcome == "completed_with_warnings"
+    artifact_event = await db.scalar(
+        select(AgentEvent).where(
+            AgentEvent.run_id == queued_run.id,
+            AgentEvent.event_type == "artifact.published",
+        )
+    )
+    assert artifact_event is not None
+    assert artifact_event.payload_json == {
+        "artifact_id": artifact.id,
+        "artifact_version_id": version.id,
+        "version": 1,
+        "module": "brand",
+        "run_id": queued_run.id,
+    }
+
+
+async def test_runner_fails_and_aborts_after_fifty_decisions(
+    db: AsyncSession, settings: Settings, queued_run: AgentRun
+) -> None:
+    client = FakePiClient([{"type": "agent_start"}] * 51)
+
+    outcome = await make_runner(db, settings, client).run(queued_run.id)
+
+    assert outcome == "failed"
+    assert client.aborted
+    event = await db.scalar(
+        select(AgentEvent).where(AgentEvent.run_id == queued_run.id, AgentEvent.event_type == "run.failed")
+    )
+    assert event is not None and event.payload_json["error_code"] == "pi_decision_limit"
+
+
+async def test_runner_fails_and_aborts_after_attempt_wall_clock_timeout(
+    db: AsyncSession, settings: Settings, queued_run: AgentRun
+) -> None:
+    class TimeoutClient(FakePiClient):
+        async def events(self) -> AsyncIterator[dict[str, Any]]:
+            yield {"type": "agent_start"}
+            attempt = await db.scalar(
+                select(AgentRunAttempt).where(AgentRunAttempt.run_id == queued_run.id)
+            )
+            assert attempt is not None
+            attempt.started_at = _now() - timedelta(
+                seconds=settings.pi_runtime_poc_run_timeout_seconds + 1
+            )
+            await db.commit()
+            yield {"type": "message_update", "assistantMessageEvent": {"type": "text_delta", "delta": "晚到"}}
+
+    client = TimeoutClient()
+    outcome = await make_runner(db, settings, client).run(queued_run.id)
+
+    assert outcome == "failed"
+    assert client.aborted
+    event = await db.scalar(
+        select(AgentEvent).where(AgentEvent.run_id == queued_run.id, AgentEvent.event_type == "run.failed")
+    )
+    assert event is not None and event.payload_json["error_code"] == "pi_run_timeout"

@@ -163,6 +163,20 @@ async def test_prompt_uses_correlation_id_and_strict_isolated_command(
     assert not agent_dir.exists()
 
 
+async def test_start_writes_only_explicit_agent_files_inside_per_run_directory(
+    fake_process: tuple[FakeProcess, list[tuple[Any, ...]], list[dict[str, Any]]],
+) -> None:
+    _, _, kwargs_calls = fake_process
+    client = await PiRpcClient.start(
+        _config(agent_files={"models.json": '{"providers":{}}'})
+    )
+    agent_dir = Path(kwargs_calls[0]["env"]["PI_CODING_AGENT_DIR"])
+
+    assert (agent_dir / "models.json").read_text(encoding="utf-8") == '{"providers":{}}'
+    await client.close()
+    assert not agent_dir.exists()
+
+
 async def test_events_frame_split_crlf_and_literal_u2028_without_readline(
     fake_process: tuple[FakeProcess, list[tuple[Any, ...]], list[dict[str, Any]]],
 ) -> None:

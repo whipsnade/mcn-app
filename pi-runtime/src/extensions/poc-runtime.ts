@@ -19,6 +19,7 @@ import {
   type McpCallOutcome,
   type McpToolClient,
 } from "./datatap-mcp.js";
+import { PiInternalToolsClient, registerInternalTools } from "./internal-tools.js";
 import { PiPocHttpClient } from "../http/client.js";
 import { redact } from "../redaction.js";
 
@@ -80,6 +81,7 @@ export default async function (pi: ExtensionAPI): Promise<void> {
     runId: env.runId,
     token: env.runToken,
   });
+  registerInternalTools(pi, new PiInternalToolsClient(audit));
 
   const tools = await discoverDatatapTools(mcp);
   for (const tool of tools) {

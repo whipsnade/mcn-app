@@ -4,6 +4,7 @@ import {
   PI_INTERNAL_TOOL_NAMES,
   PiInternalToolsClient,
   isAllowedInternalTool,
+  registerInternalTools,
 } from "../src/extensions/internal-tools";
 
 function mockFetchOnce(ok: boolean, body: unknown, status = ok ? 200 : 404) {
@@ -143,5 +144,26 @@ describe("PiInternalToolsClient.execute", () => {
     const sent = JSON.parse(String(init.body));
     expect(sent.tool_name).toBe("search_evidence");
     expect(String(init.body)).not.toContain("top-secret-run-token");
+  });
+});
+
+describe("registerInternalTools", () => {
+  it("只向 Pi 注册受控白名单，并将返回值原样封装为工具文本", async () => {
+    const registered: Array<{
+      name: string;
+      execute: (toolCallId: string, args: Record<string, unknown>) => Promise<unknown>;
+    }> = [];
+    const pi = { registerTool: (tool: (typeof registered)[number]) => registered.push(tool) };
+    const http = { executeInternalTool: vi.fn(async () => ({ draft_id: "draft-1" })) };
+
+    registerInternalTools(pi as never, new PiInternalToolsClient(http as never));
+
+    expect(registered.map((tool) => tool.name)).toEqual(PI_INTERNAL_TOOL_NAMES);
+    const result = await registered[0]!.execute("pi-call-1", { ignored: false });
+    expect(http.executeInternalTool).toHaveBeenCalledWith("get_session_context", { ignored: false });
+    expect(result).toEqual({
+      content: [{ type: "text", text: '{"draft_id":"draft-1"}' }],
+      details: {},
+    });
   });
 });

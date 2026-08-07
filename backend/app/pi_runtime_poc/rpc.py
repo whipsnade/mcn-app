@@ -50,6 +50,9 @@ class PiRpcConfig:
     skills: Sequence[str] = ()
     timeout_seconds: float = 30 * 60
     environment: Mapping[str, str] | None = None
+    # 仅由调用方生成的非敏感 Agent 配置（目前仅 models.json）；写入本 Run 的
+    # 临时目录，进程退出后随目录删除。不得把 API key 写入这里。
+    agent_files: Mapping[str, str] | None = None
     cwd: str | None = None
 
 
@@ -88,9 +91,10 @@ class PiRpcClient:
             raise ValueError("pi_timeout_must_be_positive")
 
         agent_dir = Path(tempfile.mkdtemp(prefix="kol-insight-pi-rpc-"))
-        environment = _pi_environment(agent_dir, config.environment)
-        args = _command_args(config)
         try:
+            _write_agent_files(agent_dir, config.agent_files)
+            environment = _pi_environment(agent_dir, config.environment)
+            args = _command_args(config)
             process = await asyncio.create_subprocess_exec(
                 *args,
                 stdin=asyncio.subprocess.PIPE,
@@ -299,6 +303,22 @@ def _pi_environment(
         }
     )
     return env
+
+
+def _write_agent_files(agent_dir: Path, files: Mapping[str, str] | None) -> None:
+    """只在本 Run 临时 Agent 目录写入显式、非敏感配置文件。"""
+    for relative_name, content in (files or {}).items():
+        path = Path(relative_name)
+        if (
+            not isinstance(content, str)
+            or path.is_absolute()
+            or ".." in path.parts
+            or len(path.parts) != 1
+        ):
+            raise ValueError("invalid_pi_agent_file")
+        target = agent_dir / path
+        target.write_text(content, encoding="utf-8")
+        target.chmod(0o600)
 
 
 def _command_args(config: PiRpcConfig) -> list[str]:

@@ -19,6 +19,7 @@ broker 只承担"有新事件"的唤醒信号。
 import asyncio
 from collections import defaultdict
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
@@ -30,10 +31,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agent_runtime.models import AgentEvent, AgentRun
 from app.agent_runtime.repository import AgentRunRepository
 from app.agent_runtime.state import (
+    TERMINAL_RUN_STATUSES,
     InvalidRunTransition,
     RunStatus,
-    TERMINAL_RUN_STATUSES,
 )
+from app.core.redaction import redact_for_log
 
 
 class AgentEventType(StrEnum):
@@ -59,6 +61,7 @@ class AgentEventType(StrEnum):
     REVIEW_APPROVED = "review.approved"
     REVIEW_REJECTED = "review.rejected"
     ARTIFACT_PUBLISHED = "artifact.published"
+    MESSAGE_DELTA = "message.delta"
     MESSAGE_COMPLETED = "message.completed"
 
 
@@ -75,6 +78,69 @@ TERMINAL_EVENT_TYPES = frozenset(
 
 def is_terminal_event(event_type: str) -> bool:
     return event_type in TERMINAL_EVENT_TYPES
+
+
+@dataclass(frozen=True)
+class PiRpcMappedEvent:
+    """Pi 原始 RPC 事件的最小产品投影；不携带参数、原始结果或凭证。"""
+
+    event_type: AgentEventType
+    payload: dict[str, Any]
+
+
+def map_pi_rpc_event(event: dict[str, Any]) -> PiRpcMappedEvent | None:
+    """把已验证的 Pi RPC 事件映射为稳定产品事件。
+
+    未识别事件仅由 Runner 写入 Step 审计，绝不作为前端产品事件；工具参数和原始结果
+    同样只留在 Pi/DataTap 的受控审计链路，不进入事件 payload。
+    """
+    event_type = event.get("type")
+    if event_type == "agent_start":
+        return PiRpcMappedEvent(AgentEventType.THINKING_STARTED, {"collapsed": True})
+    if event_type == "agent_end":
+        return PiRpcMappedEvent(AgentEventType.THINKING_COMPLETED, {"collapsed": True})
+    if event_type == "error":
+        # Pi 的原始错误全文仅保留在 Step 审计；SSE 只暴露稳定分类，避免供应商
+        # 诊断、Authorization 或其他敏感片段进入产品事件。
+        return PiRpcMappedEvent(
+            AgentEventType.THINKING_FAILED,
+            {"code": "pi_rpc_error", "collapsed": True},
+        )
+    if event_type == "message_update":
+        update = event.get("assistantMessageEvent")
+        if not isinstance(update, dict):
+            return None
+        delta_type = update.get("type")
+        delta = update.get("delta")
+        if not isinstance(delta, str) or not delta:
+            return None
+        if delta_type == "thinking_delta":
+            return PiRpcMappedEvent(
+                AgentEventType.THINKING_DELTA,
+                {"text": redact_for_log(delta), "collapsed": True},
+            )
+        if delta_type == "text_delta":
+            return PiRpcMappedEvent(
+                AgentEventType.MESSAGE_DELTA,
+                {"text": redact_for_log(delta)},
+            )
+        return None
+    if event_type in ("tool_execution_start", "tool_execution_end"):
+        call_id = event.get("toolCallId")
+        tool_name = event.get("toolName")
+        if not isinstance(call_id, str) or not isinstance(tool_name, str):
+            return None
+        if event_type == "tool_execution_start":
+            product_type = AgentEventType.TOOL_STARTED
+        elif event.get("isError") is True:
+            product_type = AgentEventType.TOOL_FAILED
+        else:
+            product_type = AgentEventType.TOOL_SUCCEEDED
+        return PiRpcMappedEvent(
+            product_type,
+            {"call_id": call_id, "tool_name": redact_for_log(tool_name)},
+        )
+    return None
 
 
 def utc_now() -> datetime:
