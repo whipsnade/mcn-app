@@ -109,11 +109,37 @@ Current 计费代码。Task 8A 通过后允许重新执行一次真实 Task 9；
 - 根因：启动脚本只将临时多服务映射导出为 `DATATAP_MCP_ENDPOINTS_JSON`，而 `Settings` 的
   `datatap_mcp_urls` 使用 Pydantic 字段环境名 `DATATAP_MCP_URLS`；因此映射没有进入 Settings。
   纯本地示例映射验证确认后者可被正确读取。
-- 输出目录仅有既有 `.gitkeep`；`kol_insight_pi_poc` 中 `AGENT_RUNS=0`、`TOOL_CALLS=0`；未调用
-  模型、DataTap MCP、Pi 进程或钱包，也未产生真实 round。
+- 更正：输出根目录除既有 `.gitkeep` 外，还存在空目录 `20260807T120735Z/`。该目录由
+  `begin_round()` 在四服务 Settings 校验前创建；目录中没有案例、模型、DataTap MCP 或 Pi 数据。
+  `kol_insight_pi_poc` 中 `AGENT_RUNS=0`、`TOOL_CALLS=0`，未调用模型、DataTap MCP、Pi 进程或
+  钱包，也未产生真实 six-case round。
 
 ### Gate A 结论
 
 **Gate A BLOCKED / NOT RUN**。本次阻断发生在真实六场景之前，不能评价 Pi 效果，不能写 PASS 或
-FAIL。按“只运行一轮、不以重跑掩盖波动”的规则，本轮不重跑，方案 A 到此停止；不得进入方案 B
-或方案 C。
+FAIL。本次没有启动案例，因而不消耗唯一真实 round 授权；完成 Task 8B 后的下一次运行才是第一轮
+真实对比。不得进入方案 B 或方案 C。
+
+---
+
+## Task 8B（2026-08-07）— 配置桥接与 round 创建顺序修复
+
+### 修复与隔离核对
+
+- 外部 `DATATAP_MCP_ENDPOINTS_JSON` 只在启动进程中经 Shell helper 规范化为
+  `DATATAP_MCP_URLS`；Python Settings 解析后，Pi factory 再从已校验四服务 mapping 重建
+  `DATATAP_MCP_ENDPOINTS_JSON`。
+- `begin_round()` 移至 DataTap catalog 刷新、Current executor 与 Pi executor 全部构建成功之后；
+  预检失败不再创建空 round。历史 `20260807T120735Z/` 空目录保留，未删除或覆盖。
+- 未改动 Current 计费、Wallet、DataTap 透明 Hook 或 Pi Extension 的工具边界。
+
+### 验证结果
+
+- Shell→Settings→Pi 端到端映射测试与“预检失败不调用 begin_round”测试通过。
+- `pytest -q tests/pi_runtime_poc/test_comparison.py tests/pi_runtime_poc/test_task8b_bridge.py
+  tests/agent_runtime/tools/test_mcp.py` → **58 passed**。
+- `pytest -q tests/pi_runtime_poc` → **67 passed**；Task 范围 ruff 与 `bash -n` 通过。
+
+### 后续
+
+- Task 8B 完成后，下一次 `--case all --runtime both` 才是第一轮真实对比；此前没有真实案例执行。

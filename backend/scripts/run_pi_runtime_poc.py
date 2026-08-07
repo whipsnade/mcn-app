@@ -40,7 +40,7 @@ async def main() -> int:
         raise ValueError("poc_case_not_found")
     round_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     output_root = root / "outputs" / "pi-runtime-poc"
-    round_dir = begin_round(output_root, round_id)
+    round_dir = output_root / round_id
     factory = PocCaseFactory(
         SessionFactory,
         round_id=round_id,
@@ -67,6 +67,8 @@ async def main() -> int:
         client_factory=build_real_pi_client_factory(settings),
         output_root=round_dir,
     )
+    # 本地配置和两个 executor 都构建成功前绝不创建 round；阻断不应伪装成真实轮次。
+    round_dir = begin_round(output_root, round_id)
     for index, case in enumerate(selected):
         order = (current_executor, pi_executor) if index % 2 == 0 else (pi_executor, current_executor)
         for executor in order:

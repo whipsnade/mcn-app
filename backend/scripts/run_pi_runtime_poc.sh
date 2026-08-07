@@ -28,6 +28,8 @@ fi
 if [[ -n "${CONNECT_DATATAP_ENDPOINTS_JSON}" ]]; then
   export DATATAP_MCP_ENDPOINTS_JSON="${CONNECT_DATATAP_ENDPOINTS_JSON}"
 fi
+source "${BACKEND_DIR}/scripts/pi_runtime_poc_env.sh"
+pi_poc_normalize_datatap_mapping
 
 export APP_ENV=test
 export AUTH_MODE=mock
@@ -40,6 +42,7 @@ export RUN_REAL_SERVICES=1
 [[ "${MYSQL_DATABASE}" == "kol_insight_pi_poc" ]] || exit 2
 [[ "${PI_RUNTIME_POC_ENABLED}" == "true" ]] || exit 2
 [[ -n "${DATATAP_MCP_ENDPOINTS_JSON:-}" ]] || exit 2
+[[ -n "${DATATAP_MCP_URLS:-}" ]] || exit 2
 [[ -n "${TENCENT_PLAN_API_KEY:-}" ]] || exit 2
 
 cd "${BACKEND_DIR}"
