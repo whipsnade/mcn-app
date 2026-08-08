@@ -1,158 +1,219 @@
 /**
- * Pi POC Runtime 组合入口（薄壳）。
+ * Pi POC 项目扩展：只负责内部工具与 DataTap MCP 代理调用的审计旁路。
  *
- * 职责：连接 DataTap MCP → 原样发现工具目录 → 逐个注册为 Pi 工具；每个工具
- * execute 时经 `callDatatapTransparent` 做透明转发 + 内部审计旁路。不持有任何
- * token，token 由调用进程以环境变量注入（Task 7 runner 负责显式注入，本模块
- * 只读取 process.env，绝不把 token 写入任何输出）。
+ * DataTap 的连接、发现、代理调用均由显式加载的 pi-mcp-adapter 处理；本文件
+ * 不导入 MCP SDK、不注册 DataTap 工具、不修改 Pi 的业务输入/输出。
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
-import { Type } from "typebox";
+import type { ExtensionAPI, ToolCallEvent, ToolResultEvent } from "@earendil-works/pi-coding-agent";
 
-import {
-  callDatatapTransparent,
-  discoverDatatapTools,
-  type DatatapToolDescriptor,
-  type McpCallOutcome,
-  type McpToolClient,
-} from "./datatap-mcp.js";
 import { PiInternalToolsClient, registerInternalTools } from "./internal-tools.js";
-import { PiPocHttpClient } from "../http/client.js";
-import { redact } from "../redaction.js";
+import { PiPocHttpClient, type PiExtensionDiagnostic } from "../http/client.js";
 
-export interface PlayerRuntimeConfig {
-  datatapEndpoints: Record<string, string>;
-  datatapToken: string;
+const REQUIRED_DATATAP_URLS = [
+  "DATATAP_INSIGHT_CUBE_MCP_URL",
+  "DATATAP_SOCIAL_GROW_MCP_URL",
+  "DATATAP_SOCIAL_GROW_CONTENT_MCP_URL",
+  "DATATAP_AKTOOLS_MCP_URL",
+] as const;
+
+const SERVICE_SLUGS: Record<string, string> = {
+  "insight-cube": "insight-cube-mcp",
+  "social-grow": "social-grow-mcp",
+  "social-grow-content": "social-grow-content-mcp",
+  aktools: "bilibili-mcp",
+};
+
+type AuditClient = Pick<
+  PiPocHttpClient,
+  "startToolCall" | "settleToolCall" | "failToolCall" | "recordExtensionDiagnostic"
+>;
+
+type TrackedCall = {
+  requestedToolName: string;
+  arguments: Record<string, unknown>;
+  requestedServiceName?: string;
+};
+
+export interface PocAuditRuntimeConfig {
   baseUrl: string;
   runId: string;
   runToken: string;
 }
 
-export function readRuntimeConfigFromEnv(env: NodeJS.ProcessEnv = process.env): PlayerRuntimeConfig {
-  const datatapEndpoints = parseDatatapEndpoints(env.DATATAP_MCP_ENDPOINTS_JSON);
-  return {
-    datatapEndpoints,
-    datatapToken: env.DATATAP_MCP_TOKEN ?? "",
-    baseUrl: env.PI_RUNTIME_POC_BASE_URL ?? "",
-    runId: env.PI_RUNTIME_POC_RUN_ID ?? "",
-    runToken: env.PI_RUNTIME_POC_TOKEN ?? "",
-  };
-}
-
-export function createDatatapMcpClient(url: string, token: string): McpToolClient {
-  const transport = new StreamableHTTPClientTransport(new URL(url), {
-    // DataTap 接入链接的 generic MCP 配置明确以 DATATAP_TOKEN 作为 bearer 凭证；
-    // token 仅由调用进程临时注入，绝不进入工具参数、审计或输出。
-    requestInit: { headers: { Authorization: `Bearer ${token}` } },
-  });
-  const client = new Client({ name: "kol_insight_pi_poc", version: "0.0.0" });
-
-  return {
-    async listTools(): Promise<DatatapToolDescriptor[]> {
-      await client.connect(transport);
-      const result = await client.listTools();
-      return result.tools.map((tool) => ({
-        name: tool.name,
-        description: tool.description,
-        inputSchema: tool.inputSchema,
-      }));
-    },
-    async callTool(name: string, args: Record<string, unknown>): Promise<McpCallOutcome> {
-      const result = await client.callTool({ name, arguments: args });
-      const isError = result.isError === true;
-      return {
-        content: result.content,
-        isError,
-        error: isError ? extractErrorText(result.content) : undefined,
-      };
-    },
-  };
-}
-
-export default async function (pi: ExtensionAPI): Promise<void> {
-  const env = readRuntimeConfigFromEnv();
-  if (!env.datatapToken) {
-    throw new Error("pi_poc_missing_datatap_config");
+export function readRuntimeConfigFromEnv(env: NodeJS.ProcessEnv = process.env): PocAuditRuntimeConfig {
+  for (const key of REQUIRED_DATATAP_URLS) {
+    const value = env[key]?.trim();
+    if (!value || !isHttpUrl(value)) throw new Error("pi_poc_adapter_datatap_url_required");
   }
-  const audit = new PiPocHttpClient({
-    baseUrl: env.baseUrl,
-    runId: env.runId,
-    token: env.runToken,
-  });
-  registerInternalTools(pi, new PiInternalToolsClient(audit));
+  if (!env.DATATAP_MCP_TOKEN?.trim()) throw new Error("pi_poc_missing_datatap_config");
+  const baseUrl = env.PI_RUNTIME_POC_BASE_URL?.trim();
+  const runId = env.PI_RUNTIME_POC_RUN_ID?.trim();
+  const runToken = env.PI_RUNTIME_POC_TOKEN?.trim();
+  if (!baseUrl || !isHttpUrl(baseUrl) || !runId || !runToken) {
+    throw new Error("pi_poc_audit_config_required");
+  }
+  return { baseUrl, runId, runToken };
+}
 
-  const registeredToolNames = new Set<string>();
-  for (const url of Object.values(env.datatapEndpoints)) {
-    const mcp = createDatatapMcpClient(url, env.datatapToken);
-    const tools = await discoverDatatapTools(mcp);
-    for (const tool of tools) {
-      // 不允许以 service 前缀重命名或意图路由来掩盖冲突；重名即让整个 Run 失败关闭。
-      if (registeredToolNames.has(tool.name)) {
-        throw new Error("pi_poc_duplicate_datatap_tool_name");
-      }
-      registeredToolNames.add(tool.name);
-      pi.registerTool({
-        name: tool.name,
-        label: tool.name,
-        description: tool.description ?? "",
-        parameters: Type.Object({}, { additionalProperties: Type.Unknown() }),
-        execute: async (toolCallId, params) => {
-          const { payload } = await callDatatapTransparent({
-            mcp,
-            audit,
-            toolCallId,
-            toolName: tool.name,
-            arguments: (params ?? {}) as Record<string, unknown>,
-            redactAudit: (value) => redact(value, [env.datatapToken, env.runToken]),
-          });
-          return {
-            content: [{ type: "text", text: JSON.stringify(payload) }],
-            details: {},
-          };
-        },
+export default async function pocRuntime(pi: ExtensionAPI): Promise<void> {
+  let config: PocAuditRuntimeConfig;
+  const provisionalAudit = new PiPocHttpClient({
+    baseUrl: process.env.PI_RUNTIME_POC_BASE_URL ?? "",
+    runId: process.env.PI_RUNTIME_POC_RUN_ID ?? "",
+    token: process.env.PI_RUNTIME_POC_TOKEN ?? "",
+  });
+  try {
+    config = readRuntimeConfigFromEnv();
+  } catch (error) {
+    await reportDiagnostic(provisionalAudit, failureDiagnostic("config", error));
+    throw error;
+  }
+
+  const audit = new PiPocHttpClient({ baseUrl: config.baseUrl, runId: config.runId, token: config.runToken });
+  try {
+    registerInternalTools(pi, new PiInternalToolsClient(audit));
+  } catch (error) {
+    await reportDiagnostic(audit, failureDiagnostic("tool_register", error));
+    throw error;
+  }
+  installPocAuditExtension(pi, audit);
+}
+
+/** 安装不可变审计旁路；仅在 adapter 的单一真实 mcp 调用上记录。 */
+export function installPocAuditExtension(pi: ExtensionAPI, audit: AuditClient): void {
+  const tracked = new Map<string, TrackedCall>();
+
+  pi.on("tool_call", async (event: ToolCallEvent) => {
+    const call = extractMcpCall(event);
+    if (!call) return undefined;
+    tracked.set(event.toolCallId, call);
+    return undefined;
+  });
+
+  pi.on("tool_result", async (event: ToolResultEvent) => {
+    const call = tracked.get(event.toolCallId);
+    if (!call) return undefined;
+    tracked.delete(event.toolCallId);
+    const adapterResult = parseAdapterResult(event, call);
+    if (adapterResult === null) return undefined;
+    if (adapterResult.errorCode) {
+      await reportDiagnostic(audit, {
+        stage: "mcp_call",
+        serviceSlug: adapterResult.serviceSlug,
+        toolName: call.requestedToolName,
+        errorCode: adapterResult.errorCode,
       });
     }
-  }
+    if (!adapterResult.mcpResult || !adapterResult.originalToolName || !adapterResult.serviceName) {
+      return undefined;
+    }
+    try {
+      await reportDiagnostic(audit, {
+        stage: "mcp_call", serviceSlug: adapterResult.serviceSlug, toolName: adapterResult.originalToolName,
+      });
+      const started = await audit.startToolCall({
+        toolCallId: event.toolCallId,
+        toolName: adapterResult.originalToolName,
+        requestedToolName: call.requestedToolName,
+        serviceName: adapterResult.serviceName,
+        arguments: call.arguments,
+      });
+      await reportDiagnostic(audit, {
+        stage: "audit_start", serviceSlug: adapterResult.serviceSlug, toolName: adapterResult.originalToolName,
+      });
+      if (adapterResult.errorCode || event.isError) {
+        await audit.failToolCall(started.trackedCallId, adapterResult.mcpResult);
+        return undefined;
+      }
+      await audit.settleToolCall(started.trackedCallId, adapterResult.mcpResult);
+      await reportDiagnostic(audit, {
+        stage: "audit_settle", serviceSlug: adapterResult.serviceSlug, toolName: adapterResult.originalToolName,
+      });
+    } catch (error) {
+      await reportDiagnostic(
+        audit,
+        failureDiagnostic("audit_settle", error, adapterResult.serviceSlug, adapterResult.originalToolName),
+      );
+    }
+    return undefined;
+  });
 }
 
-function parseDatatapEndpoints(value: string | undefined): Record<string, string> {
-  if (!value) {
-    throw new Error("pi_poc_invalid_datatap_endpoints");
-  }
+function extractMcpCall(event: ToolCallEvent): TrackedCall | null {
+  if (event.toolName !== "mcp") return null;
+  const input = event.input as Record<string, unknown>;
+  const requestedToolName = typeof input.tool === "string" ? input.tool.trim() : "";
+  if (!requestedToolName) return null;
+  const args = input.args;
+  return {
+    requestedToolName,
+    arguments: args !== null && typeof args === "object" && !Array.isArray(args) ? args as Record<string, unknown> : {},
+    requestedServiceName: typeof input.server === "string" ? input.server : undefined,
+  };
+}
+
+function parseAdapterResult(
+  event: ToolResultEvent,
+  call: TrackedCall,
+): {
+  mcpResult?: unknown;
+  originalToolName?: string;
+  serviceName?: string;
+  serviceSlug?: string;
+  errorCode?: string;
+} | null {
+  const details = event.details;
+  if (details === null || typeof details !== "object") return null;
+  const record = details as Record<string, unknown>;
+  if (record.mode !== "call") return null;
+  const serviceName = typeof record.server === "string" ? record.server : call.requestedServiceName;
+  const originalToolName = typeof record.tool === "string" ? record.tool : undefined;
+  const errorCode = typeof record.error === "string" && /^[a-z0-9_:-]{1,120}$/i.test(record.error)
+    ? record.error.toLowerCase()
+    : undefined;
+  return {
+    ...("mcpResult" in record ? { mcpResult: record.mcpResult } : {}),
+    ...(originalToolName ? { originalToolName } : {}),
+    ...(serviceName ? { serviceName, serviceSlug: SERVICE_SLUGS[serviceName] } : {}),
+    ...(errorCode ? { errorCode } : {}),
+  };
+}
+
+async function reportDiagnostic(audit: AuditClient, diagnostic: PiExtensionDiagnostic): Promise<void> {
   try {
-    const parsed: unknown = JSON.parse(value);
-    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-      throw new Error("invalid");
-    }
-    const entries = Object.entries(parsed);
-    if (entries.length === 0 || entries.some(([slug, url]) => !slug || typeof url !== "string")) {
-      throw new Error("invalid");
-    }
-    for (const [, url] of entries) {
-      const parsedUrl = new URL(url as string);
-      if (parsedUrl.protocol !== "https:" && parsedUrl.protocol !== "http:") {
-        throw new Error("invalid");
-      }
-    }
-    return Object.fromEntries(entries) as Record<string, string>;
+    await audit.recordExtensionDiagnostic(diagnostic);
   } catch {
-    throw new Error("pi_poc_invalid_datatap_endpoints");
+    // 诊断绝不改变原 MCP 调用的成功/失败语义。
   }
 }
 
-function extractErrorText(content: unknown): string | undefined {
-  if (Array.isArray(content)) {
-    for (const part of content) {
-      if (part && typeof part === "object" && (part as { type?: unknown }).type === "text") {
-        const text = (part as { text?: unknown }).text;
-        if (typeof text === "string" && text) {
-          return text;
-        }
-      }
-    }
+function failureDiagnostic(
+  stage: PiExtensionDiagnostic["stage"],
+  error: unknown,
+  serviceSlug?: string,
+  toolName?: string,
+): PiExtensionDiagnostic {
+  const message = error instanceof Error ? error.message : "";
+  return {
+    stage,
+    serviceSlug,
+    toolName,
+    exceptionType: safeExceptionType(error),
+    errorCode: /^[a-z0-9_:-]{1,120}$/i.test(message) ? message.toLowerCase() : "extension_stage_failed",
+  };
+}
+
+function safeExceptionType(error: unknown): string {
+  const name = error instanceof Error ? error.name : "Error";
+  return /^[A-Za-z_][A-Za-z0-9_]{0,120}$/.test(name) ? name : "Error";
+}
+
+function isHttpUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === "http:" || url.protocol === "https:";
+  } catch {
+    return false;
   }
-  return undefined;
 }

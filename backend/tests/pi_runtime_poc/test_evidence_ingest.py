@@ -7,6 +7,8 @@ available Evidence、事件 tool.started/succeeded/failed/unknown、原始 paylo
 """
 
 import hashlib
+import json
+import logging
 import secrets
 from datetime import UTC, datetime
 from typing import Any
@@ -18,6 +20,7 @@ from fastapi import HTTPException
 from pydantic import SecretStr
 from sqlalchemy import select
 from sqlalchemy.dialects.mysql import MEDIUMTEXT
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.pool import StaticPool
@@ -43,8 +46,15 @@ from app.core.config import Settings
 from app.db.base import Base
 from app.identity.models import User
 from app.mcp_gateway.validation import canonical_json_bytes
+from app.pi_runtime_poc.audit import PiRunAuditWriter
 from app.pi_runtime_poc.auth import issue_run_token
-from app.pi_runtime_poc.schemas import PiToolFailed, PiToolSettled, PiToolStarted
+from app.pi_runtime_poc.schemas import (
+    PiExtensionDiagnostic,
+    PiSmokeRunFailed,
+    PiToolFailed,
+    PiToolSettled,
+    PiToolStarted,
+)
 from app.pi_runtime_poc.service import PiEvidenceIngestService
 
 
@@ -185,6 +195,79 @@ async def test_start_creates_zero_point_step_and_tool_call(
     assert await _event_types(svc._db, run_id) == ["tool.started"]
 
 
+async def test_start_persists_adapter_requested_and_original_tool_names(
+    svc: PiEvidenceIngestService, settings: Settings, seeded: dict[str, Any]
+) -> None:
+    run_id = seeded["run"].id
+    response = await svc.start_tool(
+        token=issue_run_token(run_id, settings=settings),
+        run_id=run_id,
+        request=PiToolStarted(
+            call_id="adapter-call-1",
+            tool_name="hotwords_xiaohongshu_dictionary",
+            requested_tool_name="social_grow_content_hotwords_xiaohongshu_dictionary",
+            service_name="social-grow-content",
+            arguments={},
+        ),
+    )
+
+    call = await svc._db.get(AgentToolCall, response.call_id)
+    assert call is not None
+    assert call.internal_tool_name == "hotwords_xiaohongshu_dictionary"
+    step = await svc._db.get(AgentStep, call.step_id)
+    assert step is not None
+    assert step.input_json == {
+        "internal_tool_name": "hotwords_xiaohongshu_dictionary",
+        "requested_tool_name": "social_grow_content_hotwords_xiaohongshu_dictionary",
+        "service_name": "social-grow-content",
+        "arguments": {},
+    }
+
+
+async def test_start_database_failure_logs_only_safe_audit_start_diagnostic(
+    svc: PiEvidenceIngestService,
+    settings: Settings,
+    seeded: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """数据库异常不得把 SQL/参数写进 HTTP 错误或诊断日志。"""
+
+    class _Deadlock(Exception):
+        errno = 1213
+
+        def __str__(self) -> str:
+            return "for key 'uq_agent_steps_run_sequence'; Bearer disallowed-value"
+
+    async def fail_start(*args: object, **kwargs: object) -> str:
+        del args, kwargs
+        raise OperationalError("INSERT secret_sql", {"token": "disallowed-value"}, _Deadlock())
+
+    monkeypatch.setattr(PiRunAuditWriter, "start_tool", fail_start)
+    with caplog.at_level(logging.WARNING, logger="pi_runtime_poc.diagnostics"), pytest.raises(
+        HTTPException
+    ) as error:
+        await svc.start_tool(
+            token=issue_run_token(seeded["run"].id, settings=settings),
+            run_id=seeded["run"].id,
+            request=PiToolStarted(call_id="pi-db-failure", tool_name="kol_platform_search", arguments={}),
+        )
+
+    assert error.value.status_code == 500
+    assert error.value.detail == "pi_poc_audit_start_failed"
+    messages = [json.loads(record.message) for record in caplog.records if record.name == "pi_runtime_poc.diagnostics"]
+    assert messages == [
+        {
+            "constraint": "uq_agent_steps_run_sequence",
+            "exception_type": "OperationalError",
+            "mysql_errno": 1213,
+            "stage": "audit_start",
+        }
+    ]
+    assert "INSERT" not in str(messages)
+    assert "Bearer" not in str(messages)
+
+
 async def test_start_idempotent_for_same_pi_call_id(
     svc: PiEvidenceIngestService, settings: Settings, seeded: dict[str, Any]
 ) -> None:
@@ -198,6 +281,62 @@ async def test_start_idempotent_for_same_pi_call_id(
     assert first.call_id == second.call_id
     rows = await svc._db.scalars(select(AgentToolCall).where(AgentToolCall.run_id == run_id))
     assert len(list(rows)) == 1
+
+
+async def test_extension_diagnostic_persists_only_safe_stage_fields(
+    svc: PiEvidenceIngestService, settings: Settings, seeded: dict[str, Any]
+) -> None:
+    run_id = seeded["run"].id
+    await svc.record_extension_diagnostic(
+        token=issue_run_token(run_id, settings=settings),
+        run_id=run_id,
+        diagnostic=PiExtensionDiagnostic(
+            stage="audit_start",
+            service_slug="insight-cube-mcp",
+            tool_name="brand_search",
+            exception_type="Error",
+            error_code="fake_audit_start",
+        ),
+    )
+
+    step = await svc._db.scalar(
+        select(AgentStep).where(
+            AgentStep.run_id == run_id,
+            AgentStep.step_type == "pi_extension_diagnostic",
+        )
+    )
+    assert step is not None
+    assert step.input_json == {
+        "diagnostic": {
+            "stage": "audit_start",
+            "service_slug": "insight-cube-mcp",
+            "tool_name": "brand_search",
+            "exception_type": "Error",
+            "error_code": "fake_audit_start",
+        }
+    }
+
+
+async def test_single_tool_smoke_failure_closes_owned_running_run(
+    svc: PiEvidenceIngestService, settings: Settings, seeded: dict[str, Any]
+) -> None:
+    run_id = seeded["run"].id
+    run = await svc._db.get(AgentRun, run_id)
+    assert run is not None
+    run.prompt_snapshot_json = {"pi_runtime_poc": {"round_id": "single-datatap-smoke"}}
+    run.lease_owner = "pi-poc-smoke"
+    run.lease_expires_at = _now().replace(year=2099)
+    await svc._db.commit()
+
+    await svc.fail_single_tool_smoke(
+        token=issue_run_token(run_id, settings=settings),
+        run_id=run_id,
+        request=PiSmokeRunFailed(code="pi_poc_smoke_tool_error"),
+    )
+
+    closed = await svc._db.get(AgentRun, run_id)
+    assert closed is not None and closed.status == "failed"
+    assert await _event_types(svc._db, run_id) == ["run.failed"]
 
 
 async def test_settle_writes_evidence_and_zero_points(

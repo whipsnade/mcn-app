@@ -19,14 +19,16 @@ from app.pi_runtime_poc.rpc import (
 class FakeReader:
     """只实现 read，确保客户端不依赖 readline 的缓冲语义。"""
 
-    def __init__(self) -> None:
+    def __init__(self, *, hangs_after_process_exit: bool = False) -> None:
         self._chunks: asyncio.Queue[bytes | None] = asyncio.Queue()
+        self._hangs_after_process_exit = hangs_after_process_exit
 
     def feed(self, value: bytes) -> None:
         self._chunks.put_nowait(value)
 
     def finish(self) -> None:
-        self._chunks.put_nowait(None)
+        if not self._hangs_after_process_exit:
+            self._chunks.put_nowait(None)
 
     async def read(self, _size: int = -1) -> bytes:
         value = await self._chunks.get()
@@ -34,9 +36,10 @@ class FakeReader:
 
 
 class FakeStdin:
-    def __init__(self) -> None:
+    def __init__(self, *, hangs_on_close: bool = False) -> None:
         self.writes: list[bytes] = []
         self.closed = False
+        self._hangs_on_close = hangs_on_close
 
     def write(self, value: bytes) -> None:
         self.writes.append(value)
@@ -48,14 +51,21 @@ class FakeStdin:
         self.closed = True
 
     async def wait_closed(self) -> None:
-        return None
+        if self._hangs_on_close:
+            await asyncio.Event().wait()
 
 
 class FakeProcess:
-    def __init__(self, *, stubborn: bool = False) -> None:
-        self.stdin = FakeStdin()
-        self.stdout = FakeReader()
-        self.stderr = FakeReader()
+    def __init__(
+        self,
+        *,
+        stubborn: bool = False,
+        readers_hang_after_process_exit: bool = False,
+        stdin_hangs_on_close: bool = False,
+    ) -> None:
+        self.stdin = FakeStdin(hangs_on_close=stdin_hangs_on_close)
+        self.stdout = FakeReader(hangs_after_process_exit=readers_hang_after_process_exit)
+        self.stderr = FakeReader(hangs_after_process_exit=readers_hang_after_process_exit)
         self.returncode: int | None = None
         self.terminated = False
         self.killed = False
@@ -210,7 +220,7 @@ async def test_events_frame_split_crlf_and_literal_u2028_without_readline(
     process.stdout.feed(record[14:].encode("utf-8") + b"\r")
     process.stdout.feed(b"\n")
 
-    assert await _next_event(client) == {"type": "message", "text": "甲\u2028乙"}
+    assert await _next_event(client) == {"type": "message"}
     await client.close()
 
 
@@ -237,8 +247,59 @@ async def test_non_json_stdout_fails_immediately_as_protocol_error(
 
     process.stdout.feed(b"not rpc json\n")
 
-    with pytest.raises(PiRpcProtocolError):
+    with pytest.raises(PiRpcProtocolError) as error:
         await _next_event(client)
+    assert error.value.code == "pi_rpc_invalid_record"
+    await client.close()
+
+
+async def test_agent_end_over_one_mebibyte_is_projected_before_entering_event_queue(
+    fake_process: tuple[FakeProcess, list[tuple[Any, ...]], list[dict[str, Any]]],
+) -> None:
+    """Pi 0.79 的大终态只以计数投影进入客户端队列，绝不携带完整 messages。"""
+    process, _, _ = fake_process
+    client = await PiRpcClient.start(_config())
+    record = {
+        "type": "agent_end",
+        "willRetry": False,
+        "messages": [{"role": "assistant", "content": "x" * (2 * 1024 * 1024)}],
+    }
+
+    process.stdout.feed(json.dumps(record).encode("utf-8") + b"\n")
+
+    assert await _next_event(client) == {
+        "type": "agent_end",
+        "willRetry": False,
+        "messageCount": 1,
+    }
+    await client.close()
+
+
+async def test_message_update_drops_full_message_snapshot_before_audit_boundary(
+    fake_process: tuple[FakeProcess, list[tuple[Any, ...]], list[dict[str, Any]]],
+) -> None:
+    """逐 token 更新只保留 delta，不能把 partial/message 快照带入 Queue 或审计。"""
+    process, _, _ = fake_process
+    client = await PiRpcClient.start(_config())
+    process.stdout.feed(
+        json.dumps(
+            {
+                "type": "message_update",
+                "message": {"content": "snapshot-must-not-survive"},
+                "assistantMessageEvent": {
+                    "type": "text_delta",
+                    "delta": "保留的增量",
+                    "partial": {"content": "partial-must-not-survive"},
+                },
+            }
+        ).encode("utf-8")
+        + b"\n"
+    )
+
+    assert await _next_event(client) == {
+        "type": "message_update",
+        "assistantMessageEvent": {"type": "text_delta", "delta": "保留的增量"},
+    }
     await client.close()
 
 
@@ -283,6 +344,27 @@ async def test_close_terminates_process_and_cleans_per_run_directory(
     assert process.terminated
     assert process.stdin.closed
     assert not agent_dir.exists()
+
+
+async def test_close_has_bounded_process_reader_and_stdin_waits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """reader 或 stdin 关闭挂起时，close 必须有限时返回且仅操作当前进程。"""
+    monkeypatch.setattr(rpc_module, "_CLOSE_GRACE_SECONDS", 0.01)
+    monkeypatch.setattr(rpc_module, "_CLOSE_READER_GRACE_SECONDS", 0.01)
+    monkeypatch.setattr(rpc_module, "_CLOSE_STDIN_GRACE_SECONDS", 0.01)
+    process = FakeProcess(readers_hang_after_process_exit=True, stdin_hangs_on_close=True)
+
+    async def spawn(*args: Any, **kwargs: Any) -> FakeProcess:
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+    client = await PiRpcClient.start(_config())
+
+    await asyncio.wait_for(client.close(), timeout=1.0)
+
+    assert process.terminated
+    assert process.stdin.closed
 
 
 # --- Fix round 1：环境最小 allowlist（Critical） ---
@@ -420,6 +502,7 @@ async def test_unterminated_record_over_max_bytes_fails_protocol(
 
     process.stdout.feed(b"x" * 4096)
 
-    with pytest.raises(PiRpcProtocolError, match="rpc_record_too_large"):
+    with pytest.raises(PiRpcProtocolError) as error:
         await _next_event(client)
+    assert error.value.code == "pi_rpc_record_too_large"
     await client.close()

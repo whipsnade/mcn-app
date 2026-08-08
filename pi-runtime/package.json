@@ -7,11 +7,14 @@
     "test": "vitest run --config vitest.config.ts",
     "typecheck": "tsc --noEmit",
     "probe:rpc": "tsx scripts/rpc-audit-probe.ts",
-    "probe:model": "tsx scripts/model-state-probe.ts"
+    "probe:model": "tsx scripts/model-state-probe.ts",
+    "smoke:datatap": "tsx scripts/datatap-single-tool-smoke.ts"
   },
   "dependencies": {
-    "@earendil-works/pi-coding-agent": "0.84.1",
-    "@modelcontextprotocol/sdk": "1.30.0",
+    "@earendil-works/pi-ai": "0.74.2",
+    "@earendil-works/pi-coding-agent": "0.79.10",
+    "@earendil-works/pi-tui": "0.74.2",
+    "pi-mcp-adapter": "2.20.1",
     "typebox": "1.3.11"
   },
   "devDependencies": {

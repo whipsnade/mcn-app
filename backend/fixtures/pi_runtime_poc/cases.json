@@ -1,21 +1,21 @@
 [
   {
     "case_id": "brand-research-v1",
-    "user_question": "请完成一个品牌社媒调研并给出营销建议。",
+    "user_question": "请分析小米在抖音和小红书于2026-07-01至2026-07-31的社媒表现，目标受众为18至35岁科技兴趣人群，并生成品牌研究报告与营销建议。",
     "date_anchor": "2026-08-01",
     "expected_behavior": "report",
     "required_artifact_type": "brand_report_v3"
   },
   {
     "case_id": "campaign-evaluation-v1",
-    "user_question": "请评估一个营销活动的社媒表现并给出改进建议。",
+    "user_question": "请评估小米2026年7月新品发布活动在抖音和小红书于2026-07-01至2026-07-31的社媒表现，目标为提升18至35岁科技兴趣人群互动，并生成活动评估报告。",
     "date_anchor": "2026-08-01",
     "expected_behavior": "report",
     "required_artifact_type": "campaign_report_v2"
   },
   {
     "case_id": "kol-selection-v1",
-    "user_question": "请按目标受众筛选合适的达人并说明依据。",
+    "user_question": "请为小米在抖音和小红书筛选面向18至35岁科技兴趣人群的数码类达人，预算10万元，窗口为2026-07-01至2026-07-31，并生成达人筛选报告。",
     "date_anchor": "2026-08-01",
     "expected_behavior": "report",
     "required_artifact_type": "kol_selection_v3"
@@ -25,7 +25,8 @@
     "user_question": "请基于已发布版本解释其中一项结论，不要重新进行完整调研。",
     "date_anchor": "2026-08-01",
     "expected_behavior": "drilldown",
-    "required_artifact_type": null
+    "required_artifact_type": null,
+    "depends_on_case_id": "brand-research-v1"
   },
   {
     "case_id": "scope-clarification-v1",

@@ -8,6 +8,8 @@
 export interface StartToolCallRequest {
   toolCallId: string;
   toolName: string;
+  requestedToolName: string;
+  serviceName: string;
   arguments: Record<string, unknown>;
 }
 
@@ -17,6 +19,24 @@ export interface StartToolCallResponse {
 
 export interface SettleToolCallResponse {
   evidenceId?: string;
+}
+
+export type PiExtensionStage =
+  | "config"
+  | "connect"
+  | "tools_list"
+  | "schema_validate"
+  | "tool_register"
+  | "audit_start"
+  | "mcp_call"
+  | "audit_settle";
+
+export interface PiExtensionDiagnostic {
+  stage: PiExtensionStage;
+  serviceSlug?: string;
+  toolName?: string;
+  exceptionType?: string;
+  errorCode?: string;
 }
 
 export class PiPocHttpClient {
@@ -34,6 +54,8 @@ export class PiPocHttpClient {
     const body = await this.request(`/runs/${this.runId}/tool-calls/start`, {
       call_id: req.toolCallId,
       tool_name: req.toolName,
+      requested_tool_name: req.requestedToolName,
+      service_name: req.serviceName,
       arguments: req.arguments,
     });
     return { trackedCallId: String(body.call_id) };
@@ -48,6 +70,24 @@ export class PiPocHttpClient {
 
   async failToolCall(callId: string, error: unknown): Promise<void> {
     await this.request(`/runs/${this.runId}/tool-calls/${callId}/fail`, { error });
+  }
+
+  async recordExtensionDiagnostic(diagnostic: PiExtensionDiagnostic): Promise<void> {
+    await this.request(`/runs/${this.runId}/diagnostics`, {
+      stage: diagnostic.stage,
+      service_slug: diagnostic.serviceSlug,
+      tool_name: diagnostic.toolName,
+      exception_type: diagnostic.exceptionType,
+      error_code: diagnostic.errorCode,
+    });
+  }
+
+  async failSingleToolSmoke(code: string): Promise<void> {
+    await this.request(`/runs/${this.runId}/smoke-failed`, { code });
+  }
+
+  async completeSingleToolSmoke(): Promise<void> {
+    await this.request(`/runs/${this.runId}/smoke-succeeded`, {});
   }
 
   async executeInternalTool(
@@ -71,8 +111,7 @@ export class PiPocHttpClient {
       body: JSON.stringify(body),
     });
     if (!response.ok) {
-      const detail = await response.text().catch(() => "");
-      throw new Error(`pi_poc_http:${response.status}:${detail}`);
+      throw new Error(`pi_poc_http:${response.status}`);
     }
     const json = (await response.json()) as unknown;
     if (json === null || typeof json !== "object" || Array.isArray(json)) {

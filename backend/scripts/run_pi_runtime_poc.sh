@@ -48,8 +48,11 @@ chmod 600 "${PI_RUNTIME_POC_DIAGNOSTIC_LOG}"
 [[ "${APP_ENV}" == "test" ]] || exit 2
 [[ "${MYSQL_DATABASE}" == "kol_insight_pi_poc" ]] || exit 2
 [[ "${PI_RUNTIME_POC_ENABLED}" == "true" ]] || exit 2
-[[ -n "${DATATAP_MCP_ENDPOINTS_JSON:-}" ]] || exit 2
 [[ -n "${DATATAP_MCP_URLS:-}" ]] || exit 2
+[[ -n "${DATATAP_INSIGHT_CUBE_MCP_URL:-}" ]] || exit 2
+[[ -n "${DATATAP_SOCIAL_GROW_MCP_URL:-}" ]] || exit 2
+[[ -n "${DATATAP_SOCIAL_GROW_CONTENT_MCP_URL:-}" ]] || exit 2
+[[ -n "${DATATAP_AKTOOLS_MCP_URL:-}" ]] || exit 2
 [[ -n "${TENCENT_PLAN_API_KEY:-}" ]] || exit 2
 
 cd "${BACKEND_DIR}"

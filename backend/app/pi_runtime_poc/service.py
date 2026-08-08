@@ -6,36 +6,33 @@ EvidenceItem，fail/unknown 不产生 available Evidence。不接入 DataTap、P
 正式 Runtime 或积分。
 """
 
-import hashlib
 import json
-from datetime import UTC, datetime
+import logging
 from typing import Any
-from uuid import uuid4
 
 from fastapi import HTTPException, status
-from sqlalchemy import func, select
+from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_artifacts.models import ArtifactDraft, ArtifactDraftRevision
 from app.agent_runtime.events import AgentEventStream
-from app.agent_runtime.evidence import EvidenceWriter
-from app.agent_runtime.models import (
-    AgentRun,
-    AgentRunAttempt,
-    AgentStep,
-    AgentToolCall,
-    EvidenceItem,
-)
+from app.agent_runtime.models import AgentRun
 from app.agent_runtime.repository import AgentRunRepository
+from app.agent_runtime.state import RunStatus
 from app.agent_runtime.tools.contracts import ToolResult
 from app.agent_runtime.tools.registry import UnknownToolError
 from app.core.config import Settings
+from app.pi_runtime_poc.audit import PiRunAuditWriter
 from app.pi_runtime_poc.auth import verify_run_token
+from app.pi_runtime_poc.diagnostics import safe_db_diagnostic
 from app.pi_runtime_poc.internal_tools import (
     PIPOC_PROFILE,
     build_pi_internal_registry,
 )
 from app.pi_runtime_poc.schemas import (
+    PiExtensionDiagnostic,
+    PiSmokeRunFailed,
     PiToolFailed,
     PiToolSettled,
     PiToolSettledResponse,
@@ -43,8 +40,6 @@ from app.pi_runtime_poc.schemas import (
     PiToolStartedResponse,
 )
 
-_SERVICE_NAME = "pi_poc_datatap"
-_STEP_TYPE = "tool_call"
 _BUILDER_TOOL_NAMES = frozenset(
     {
         "build_brand_report_draft",
@@ -61,21 +56,7 @@ _MAX_FEEDBACK_REFS = 100
 _MAX_FEEDBACK_SOURCES_PER_REF = 20
 _MAX_FEEDBACK_REASON_CODES = 20
 _MAX_FEEDBACK_TEXT = 500
-
-
-def _now() -> datetime:
-    return datetime.now(UTC).replace(tzinfo=None)
-
-
-def _logical_call_id(run_id: str, pi_call_id: str) -> str:
-    """logical_call_id = run + Pi call id；不把参数 hash 当业务熔断键。"""
-    return hashlib.sha256(f"{run_id}\x00{pi_call_id}".encode()).hexdigest()
-
-
-def _arguments_hash(arguments: dict[str, Any]) -> str:
-    return hashlib.sha256(
-        json.dumps(arguments, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    ).hexdigest()
+_diagnostic_logger = logging.getLogger("pi_runtime_poc.diagnostics")
 
 
 def _bounded_text(value: Any) -> str:
@@ -260,151 +241,122 @@ class PiEvidenceIngestService:
         self, *, token: str, run_id: str, request: PiToolStarted
     ) -> PiToolStartedResponse:
         verify_run_token(token, run_id, settings=self._settings)
+        try:
+            call_id = await PiRunAuditWriter(db=self._db, events=self._events).start_tool(
+                run_id=run_id,
+                pi_call_id=request.call_id,
+                tool_name=request.tool_name,
+                requested_tool_name=request.requested_tool_name,
+                service_name=request.service_name,
+                arguments=request.arguments,
+            )
+        except LookupError as error:
+            if str(error) != "pi_run_not_found":
+                raise
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "pi_run_not_found") from error
+        except SQLAlchemyError as error:
+            await self._db.rollback()
+            _diagnostic_logger.warning(
+                json.dumps(
+                    {"stage": "audit_start", **safe_db_diagnostic(error)},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            raise HTTPException(
+                status.HTTP_500_INTERNAL_SERVER_ERROR,
+                "pi_poc_audit_start_failed",
+            ) from None
+        return PiToolStartedResponse(call_id=call_id)
+
+    async def record_extension_diagnostic(
+        self, *, token: str, run_id: str, diagnostic: PiExtensionDiagnostic
+    ) -> None:
+        """仅落安全阶段字段，供 Node Extension 在启动/注册失败时定位边界。"""
+        verify_run_token(token, run_id, settings=self._settings)
+        try:
+            await PiRunAuditWriter(db=self._db, events=self._events).write_extension_diagnostic(
+                run_id=run_id,
+                diagnostic=diagnostic.model_dump(),
+            )
+        except LookupError as error:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "pi_run_not_found") from error
+
+    async def fail_single_tool_smoke(
+        self, *, token: str, run_id: str, request: PiSmokeRunFailed
+    ) -> None:
+        """只允许受控单工具冒烟 Run 在异常时自行收口，避免残留 running/queued。"""
+        verify_run_token(token, run_id, settings=self._settings)
         run = await self._db.get(AgentRun, run_id)
         if run is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "pi_run_not_found")
-
-        logical_call_id = _logical_call_id(run_id, request.call_id)
-        existing = await self._db.scalar(
-            select(AgentToolCall).where(AgentToolCall.logical_call_id == logical_call_id)
-        )
-        if existing is not None:
-            return PiToolStartedResponse(call_id=existing.id)
-
-        attempt = await self._ensure_attempt(run.id)
-        step_sequence = await self._next_step_sequence(run.id)
-        step = AgentStep(
-            id=str(uuid4()),
-            run_id=run.id,
-            attempt_id=attempt.id,
-            sequence=step_sequence,
-            step_type=_STEP_TYPE,
-            input_json={"internal_tool_name": request.tool_name, "arguments": request.arguments},
-            status="running",
-            visibility=run.visibility,
-            created_at=_now(),
-        )
-        self._db.add(step)
-        await self._db.flush()
-
-        call = AgentToolCall(
-            id=str(uuid4()),
-            run_id=run.id,
-            step_id=step.id,
-            logical_call_id=logical_call_id,
-            service=_SERVICE_NAME,
-            internal_tool_name=request.tool_name,
-            arguments_json=request.arguments,
-            arguments_hash=_arguments_hash(request.arguments),
-            status="running",
-            points_reserved=0,
-            points_settled=0,
-        )
-        self._db.add(call)
-        await self._db.flush()
-
-        await self._events.append(
+        snapshot = run.prompt_snapshot_json or {}
+        poc_snapshot = snapshot.get("pi_runtime_poc") if isinstance(snapshot, dict) else None
+        if not isinstance(poc_snapshot, dict) or poc_snapshot.get("round_id") != "single-datatap-smoke":
+            raise HTTPException(status.HTTP_409_CONFLICT, "pi_smoke_run_not_allowed")
+        event = await self._events.settle_terminal(
             run.id,
             run.user_id,
-            "tool.started",
-            {"tool_name": request.tool_name, "call_id": call.id},
+            RunStatus.FAILED,
+            {"error_code": request.code},
+            worker_id="pi-poc-smoke",
         )
-        return PiToolStartedResponse(call_id=call.id)
+        if event is None and run.status not in (RunStatus.FAILED.value,):
+            raise HTTPException(status.HTTP_409_CONFLICT, "pi_smoke_run_not_owned")
+
+    async def complete_single_tool_smoke(self, *, token: str, run_id: str) -> None:
+        """只允许受控单工具冒烟 Run 在成功后收口，避免遗留 queued/running。"""
+        verify_run_token(token, run_id, settings=self._settings)
+        run = await self._db.get(AgentRun, run_id)
+        if run is None:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "pi_run_not_found")
+        snapshot = run.prompt_snapshot_json or {}
+        poc_snapshot = snapshot.get("pi_runtime_poc") if isinstance(snapshot, dict) else None
+        if not isinstance(poc_snapshot, dict) or poc_snapshot.get("round_id") != "single-datatap-smoke":
+            raise HTTPException(status.HTTP_409_CONFLICT, "pi_smoke_run_not_allowed")
+        event = await self._events.settle_terminal(
+            run.id,
+            run.user_id,
+            RunStatus.COMPLETED,
+            {"result_code": "single_datatap_smoke_succeeded"},
+            worker_id="pi-poc-smoke",
+        )
+        if event is None and run.status not in (RunStatus.COMPLETED.value,):
+            raise HTTPException(status.HTTP_409_CONFLICT, "pi_smoke_run_not_owned")
 
     async def settle_tool(
         self, *, token: str, run_id: str, call_id: str, request: PiToolSettled
     ) -> PiToolSettledResponse:
         verify_run_token(token, run_id, settings=self._settings)
-        call = await self._require_owned_call(run_id, call_id)
-
-        if call.status == "settled":
-            evidence = await self._db.scalar(
-                select(EvidenceItem).where(EvidenceItem.tool_call_id == call.id)
+        try:
+            evidence_id = await PiRunAuditWriter(db=self._db, events=self._events).settle_tool(
+                run_id=run_id,
+                call_id=call_id,
+                raw_payload=request.raw_payload,
             )
-            return PiToolSettledResponse(evidence_id=evidence.id if evidence else None)
-        if call.status not in ("running", "planned"):
-            raise HTTPException(status.HTTP_409_CONFLICT, "pi_tool_call_not_settleable")
-
-        run = await self._db.get(AgentRun, run_id)
-        assert run is not None
-        writer = EvidenceWriter(self._db)
-        evidence = await writer.write(
-            session_id=run.session_id,
-            run_id=run.id,
-            tool_call_id=call.id,
-            source_type="datatap_mcp",
-            source_name=call.internal_tool_name,
-            scope_json=None,
-            period_json=None,
-            raw_payload=request.raw_payload,
-            availability_status="available",
-        )
-        call.status = "settled"
-        call.completed_at = _now()
-        await self._db.flush()
-        await self._events.append(
-            run.id,
-            run.user_id,
-            "tool.succeeded",
-            {"tool_name": call.internal_tool_name, "call_id": call.id, "evidence_id": evidence.id},
-        )
-        return PiToolSettledResponse(evidence_id=evidence.id)
+        except LookupError as error:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "pi_tool_call_not_found") from error
+        except ValueError as error:
+            if str(error) != "pi_tool_call_not_settleable":
+                raise
+            raise HTTPException(status.HTTP_409_CONFLICT, "pi_tool_call_not_settleable") from error
+        return PiToolSettledResponse(evidence_id=evidence_id)
 
     async def fail_tool(
         self, *, token: str, run_id: str, call_id: str, request: PiToolFailed
     ) -> None:
         verify_run_token(token, run_id, settings=self._settings)
-        call = await self._require_owned_call(run_id, call_id)
-        if call.status in ("settled", "failed", "unknown"):
-            return
-        run = await self._db.get(AgentRun, run_id)
-        assert run is not None
-        call.status = request.status
-        call.error_type = f"pi_poc_{request.status}"
-        call.safe_error_message = (
+        safe_error_message = (
             json.dumps(request.error, ensure_ascii=False, default=str)
             if request.error is not None
             else None
         )
-        call.completed_at = _now()
-        await self._db.flush()
-        event_type = "tool.failed" if request.status == "failed" else "tool.unknown"
-        await self._events.append(
-            run.id,
-            run.user_id,
-            event_type,
-            {"tool_name": call.internal_tool_name, "call_id": call.id},
-        )
-
-    async def _require_owned_call(self, run_id: str, call_id: str) -> AgentToolCall:
-        call = await self._db.get(AgentToolCall, call_id)
-        if call is None or call.run_id != run_id:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "pi_tool_call_not_found")
-        return call
-
-    async def _ensure_attempt(self, run_id: str) -> AgentRunAttempt:
-        attempt = await self._db.scalar(
-            select(AgentRunAttempt)
-            .where(AgentRunAttempt.run_id == run_id)
-            .order_by(AgentRunAttempt.attempt.desc())
-            .limit(1)
-        )
-        if attempt is not None:
-            return attempt
-        attempt = AgentRunAttempt(
-            id=str(uuid4()),
-            run_id=run_id,
-            attempt=1,
-            started_at=_now(),
-            decision_count=0,
-            outcome="running",
-        )
-        self._db.add(attempt)
-        await self._db.flush()
-        return attempt
-
-    async def _next_step_sequence(self, run_id: str) -> int:
-        max_sequence = await self._db.scalar(
-            select(func.max(AgentStep.sequence)).where(AgentStep.run_id == run_id)
-        )
-        return (max_sequence or 0) + 1
+        try:
+            await PiRunAuditWriter(db=self._db, events=self._events).fail_tool(
+                run_id=run_id,
+                call_id=call_id,
+                status=request.status,
+                safe_error_message=safe_error_message,
+            )
+        except LookupError as error:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "pi_tool_call_not_found") from error

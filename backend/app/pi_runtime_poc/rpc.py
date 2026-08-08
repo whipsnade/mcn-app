@@ -16,9 +16,11 @@ from typing import Any
 
 _STDERR_TAIL_BYTES = 64 * 1024
 _CLOSE_GRACE_SECONDS = 5.0
+_CLOSE_READER_GRACE_SECONDS = 2.0
+_CLOSE_STDIN_GRACE_SECONDS = 2.0
 _ABORT_GRACE_SECONDS = 2.0
 _TERMINATE_GRACE_SECONDS = 2.0
-_MAX_RPC_RECORD_BYTES = 1024 * 1024
+_MAX_RPC_RECORD_BYTES = 16 * 1024 * 1024
 # 仅这些非敏感变量从宿主环境放行；其余宿主环境绝不整体继承进 Pi 子进程。
 _ENV_ALLOWLIST = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "LANGUAGE", "TMPDIR", "HOME")
 _END = object()
@@ -26,6 +28,10 @@ _END = object()
 
 class PiRpcProtocolError(RuntimeError):
     """Pi stdout 违反严格 JSONL RPC 契约。"""
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
 
 
 class PiRpcTimeout(RuntimeError):
@@ -81,6 +87,7 @@ class PiRpcClient:
         self._terminal_sent = False
         self._stdout_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
+        self._process_wait_task: asyncio.Task[int] | None = None
         self._wait_task: asyncio.Task[None] | None = None
         self._deadline_task: asyncio.Task[None] | None = None
 
@@ -118,6 +125,7 @@ class PiRpcClient:
         client = cls(process=process, agent_dir=agent_dir, timeout_seconds=config.timeout_seconds)
         client._stdout_task = asyncio.create_task(client._read_stdout())
         client._stderr_task = asyncio.create_task(client._read_stderr())
+        client._process_wait_task = asyncio.create_task(process.wait())
         client._wait_task = asyncio.create_task(client._wait_for_exit())
         client._deadline_task = asyncio.create_task(client._enforce_deadline())
         return client
@@ -161,13 +169,13 @@ class PiRpcClient:
         # 3) 仍未退出：仅操作当前精确 PID 的 kill
         if self._process.returncode is None:
             self._process.kill()
-            await self._wait_task
+            await self._await_exit_within(_TERMINATE_GRACE_SECONDS)
 
     async def _await_exit_within(self, seconds: float) -> None:
-        if self._wait_task is None or self._process.returncode is not None:
+        if self._process_wait_task is None or self._process.returncode is not None:
             return
         try:
-            await asyncio.wait_for(asyncio.shield(self._wait_task), timeout=seconds)
+            await asyncio.wait_for(asyncio.shield(self._process_wait_task), timeout=seconds)
         except TimeoutError:
             pass
 
@@ -181,22 +189,57 @@ class PiRpcClient:
         if self._deadline_task is not None and self._deadline_task is not current_task:
             self._deadline_task.cancel()
 
-        if self._process.returncode is None:
-            self._process.terminate()
-        if self._wait_task is not None and self._wait_task is not current_task:
-            try:
-                await asyncio.wait_for(asyncio.shield(self._wait_task), timeout=_CLOSE_GRACE_SECONDS)
-            except TimeoutError:
-                if self._process.returncode is None:
-                    self._process.kill()
-                await self._wait_task
+        try:
+            if self._process.returncode is None:
+                self._process.terminate()
+            await self._await_exit_within(_CLOSE_GRACE_SECONDS)
+            if self._process.returncode is None:
+                self._process.kill()
+                await self._await_exit_within(_CLOSE_GRACE_SECONDS)
 
-        if self._process.stdin is not None:
-            self._process.stdin.close()
-            wait_closed = getattr(self._process.stdin, "wait_closed", None)
-            if wait_closed is not None:
-                await wait_closed()
-        shutil.rmtree(self._agent_dir, ignore_errors=True)
+            await self._close_task_within(self._stdout_task, _CLOSE_READER_GRACE_SECONDS, current_task)
+            await self._close_task_within(self._stderr_task, _CLOSE_READER_GRACE_SECONDS, current_task)
+            await self._close_task_within(self._wait_task, _CLOSE_READER_GRACE_SECONDS, current_task)
+            await self._close_stdin_within(current_task)
+        finally:
+            shutil.rmtree(self._agent_dir, ignore_errors=True)
+
+    async def _close_task_within(
+        self,
+        task: asyncio.Task[Any] | None,
+        timeout_seconds: float,
+        current_task: asyncio.Task[Any] | None,
+    ) -> None:
+        if task is None or task is current_task or task.done():
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=timeout_seconds)
+            return
+        except TimeoutError:
+            task.cancel()
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=timeout_seconds)
+        except (TimeoutError, asyncio.CancelledError):
+            return
+
+    async def _close_stdin_within(self, current_task: asyncio.Task[Any] | None) -> None:
+        if self._process.stdin is None:
+            return
+        self._process.stdin.close()
+        wait_closed = getattr(self._process.stdin, "wait_closed", None)
+        if wait_closed is None:
+            return
+        task = asyncio.ensure_future(wait_closed())
+        if task is current_task:
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=_CLOSE_STDIN_GRACE_SECONDS)
+        except TimeoutError:
+            task.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=_CLOSE_STDIN_GRACE_SECONDS)
+            except (TimeoutError, asyncio.CancelledError):
+                return
 
     async def _write(self, payload: dict[str, Any]) -> None:
         if self._fatal is not None:
@@ -224,7 +267,7 @@ class PiRpcClient:
             while chunk := await self._process.stdout.read(4096):
                 buffer.extend(chunk)
                 if len(buffer) > _MAX_RPC_RECORD_BYTES:
-                    await self._fail(PiRpcProtocolError("rpc_record_too_large"))
+                    await self._fail(PiRpcProtocolError("pi_rpc_record_too_large"))
                     return
                 while (line_end := buffer.find(b"\n")) >= 0:
                     line = bytes(buffer[:line_end])
@@ -233,13 +276,13 @@ class PiRpcClient:
                         line = line[:-1]
                     await self._events.put(_parse_record(line))
             if buffer:
-                await self._fail(PiRpcProtocolError("unterminated_rpc_record"))
+                await self._fail(PiRpcProtocolError("pi_rpc_unterminated_record"))
         except asyncio.CancelledError:
             raise
         except PiRpcProtocolError as exc:
             await self._fail(exc)
         except UnicodeDecodeError:
-            await self._fail(PiRpcProtocolError("invalid_rpc_utf8"))
+            await self._fail(PiRpcProtocolError("pi_rpc_invalid_utf8"))
             raise
 
     async def _read_stderr(self) -> None:
@@ -250,7 +293,9 @@ class PiRpcClient:
                 del self._stderr_tail[: len(self._stderr_tail) - _STDERR_TAIL_BYTES]
 
     async def _wait_for_exit(self) -> None:
-        exit_code = await self._process.wait()
+        if self._process_wait_task is None:
+            raise RuntimeError("pi_rpc_process_wait_task_missing")
+        exit_code = await self._process_wait_task
         if self._stdout_task is not None:
             await self._stdout_task
         if self._stderr_task is not None:
@@ -350,14 +395,55 @@ def _command_args(config: PiRpcConfig) -> list[str]:
 
 def _parse_record(line: bytes) -> dict[str, Any]:
     if not line.strip():
-        raise PiRpcProtocolError("empty_rpc_record")
+        raise PiRpcProtocolError("pi_rpc_invalid_record")
     try:
         value = json.loads(line.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise PiRpcProtocolError("invalid_rpc_record") from exc
+        raise PiRpcProtocolError("pi_rpc_invalid_record") from exc
     if not isinstance(value, dict) or not isinstance(value.get("type"), str):
-        raise PiRpcProtocolError("invalid_rpc_record")
-    return value
+        raise PiRpcProtocolError("pi_rpc_invalid_record")
+    return _project_rpc_event(value)
+
+
+def _project_rpc_event(event: dict[str, Any]) -> dict[str, Any]:
+    """在 Queue 前丢弃 Pi 的累积消息快照和供应商内容。"""
+    event_type = event["type"]
+    if event_type == "agent_end":
+        messages = event.get("messages")
+        will_retry = event.get("willRetry")
+        return {
+            "type": "agent_end",
+            "willRetry": will_retry if isinstance(will_retry, bool) else None,
+            "messageCount": len(messages) if isinstance(messages, list) else 0,
+        }
+    if event_type == "message_update":
+        update = event.get("assistantMessageEvent")
+        if not isinstance(update, dict):
+            return {"type": "message_update"}
+        projected: dict[str, Any] = {"type": update.get("type")}
+        delta = update.get("delta")
+        if isinstance(delta, str):
+            projected["delta"] = delta
+        return {"type": "message_update", "assistantMessageEvent": projected}
+    if event_type in {"tool_execution_start", "tool_execution_end", "tool_execution_update"}:
+        return {
+            "type": event_type,
+            "toolCallId": event.get("toolCallId"),
+            "toolName": event.get("toolName"),
+            "isError": event.get("isError") is True,
+        }
+    if event_type == "response":
+        projected = {
+            "type": "response",
+            "command": event.get("command"),
+            "success": event.get("success") is True,
+        }
+        if isinstance(event.get("id"), str):
+            projected["id"] = event["id"]
+        return projected
+    if event_type in {"agent_start", "turn_start", "turn_end", "message_start", "message_end", "error"}:
+        return {"type": event_type}
+    return {"type": event_type}
 
 
 def _request_id() -> str:

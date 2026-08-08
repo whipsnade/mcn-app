@@ -10,8 +10,10 @@ from app.core.config import Settings, get_settings
 from app.db.session import get_db
 from app.pi_runtime_poc.auth import PiPocSettingsGuard
 from app.pi_runtime_poc.schemas import (
+    PiExtensionDiagnostic,
     PiInternalToolRequest,
     PiInternalToolResponse,
+    PiSmokeRunFailed,
     PiToolFailed,
     PiToolSettled,
     PiToolSettledResponse,
@@ -55,6 +57,44 @@ async def start_tool(
     return await _service(request, db).start_tool(
         token=_bearer_token(request), run_id=run_id, request=body
     )
+
+
+@router.post("/{run_id}/diagnostics")
+async def record_extension_diagnostic(
+    run_id: str,
+    body: PiExtensionDiagnostic,
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> dict[str, bool]:
+    await _service(request, db).record_extension_diagnostic(
+        token=_bearer_token(request), run_id=run_id, diagnostic=body
+    )
+    return {"ok": True}
+
+
+@router.post("/{run_id}/smoke-failed")
+async def fail_single_tool_smoke(
+    run_id: str,
+    body: PiSmokeRunFailed,
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> dict[str, bool]:
+    await _service(request, db).fail_single_tool_smoke(
+        token=_bearer_token(request), run_id=run_id, request=body
+    )
+    return {"ok": True}
+
+
+@router.post("/{run_id}/smoke-succeeded")
+async def complete_single_tool_smoke(
+    run_id: str,
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> dict[str, bool]:
+    await _service(request, db).complete_single_tool_smoke(
+        token=_bearer_token(request), run_id=run_id
+    )
+    return {"ok": True}
 
 
 @router.post("/{run_id}/tool-calls/{call_id}/settle", response_model=PiToolSettledResponse)

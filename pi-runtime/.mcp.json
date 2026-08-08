@@ -1,0 +1,31 @@
+{
+  "settings": {
+    "hostConfigDiscovery": "off",
+    "scriptMode": false,
+    "directTools": false,
+    "requestTimeoutMs": 180000,
+    "outputGuard": false
+  },
+  "mcpServers": {
+    "insight-cube": {
+      "url": "${DATATAP_INSIGHT_CUBE_MCP_URL}",
+      "headers": { "Authorization": "Bearer ${DATATAP_MCP_TOKEN}" },
+      "lifecycle": "lazy"
+    },
+    "social-grow": {
+      "url": "${DATATAP_SOCIAL_GROW_MCP_URL}",
+      "headers": { "Authorization": "Bearer ${DATATAP_MCP_TOKEN}" },
+      "lifecycle": "lazy"
+    },
+    "social-grow-content": {
+      "url": "${DATATAP_SOCIAL_GROW_CONTENT_MCP_URL}",
+      "headers": { "Authorization": "Bearer ${DATATAP_MCP_TOKEN}" },
+      "lifecycle": "lazy"
+    },
+    "aktools": {
+      "url": "${DATATAP_AKTOOLS_MCP_URL}",
+      "headers": { "Authorization": "Bearer ${DATATAP_MCP_TOKEN}" },
+      "lifecycle": "lazy"
+    }
+  }
+}

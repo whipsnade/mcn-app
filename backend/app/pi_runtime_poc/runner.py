@@ -6,12 +6,12 @@ Pi 只负责临时研究循环；Run/Attempt、租约、产品事件与终态始
 
 import inspect
 import json
+import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any, Protocol
-from uuid import uuid4
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_artifacts.models import AgentArtifact, AgentArtifactVersion
@@ -22,14 +22,15 @@ from app.agent_runtime.models import (
     AgentRun,
     AgentRunAttempt,
     AgentSession,
-    AgentStep,
     EvidenceItem,
 )
 from app.agent_runtime.repository import AgentRunRepository
 from app.agent_runtime.state import RunStatus
 from app.core.config import Settings
-from app.core.redaction import redact_for_log
+from app.pi_runtime_poc.audit import PiRunAuditWriter
 from app.pi_runtime_poc.auth import PiPocSettingsGuard, issue_run_token
+from app.pi_runtime_poc.diagnostics import safe_db_diagnostic
+from app.pi_runtime_poc.rpc import PiRpcProtocolError, _project_rpc_event
 
 
 class PiRpcSession(Protocol):
@@ -45,6 +46,8 @@ class PiRpcSession(Protocol):
 PiClientFactory = Callable[
     [AgentRun, str], PiRpcSession | Awaitable[PiRpcSession]
 ]
+_THINKING_CHUNK_BYTES = 1024
+_DIAGNOSTICS_LOGGER = logging.getLogger("pi_runtime_poc.diagnostics")
 
 
 class PiPocRunner:
@@ -64,6 +67,8 @@ class PiPocRunner:
         self._settings = settings
         self._worker_id = worker_id
         self._client_factory = client_factory
+        self._thinking_parts: list[str] = []
+        self._thinking_bytes = 0
 
     async def run(self, run_id: str) -> str | None:
         """领取、运行并用 ``settle_terminal`` 原子收口一个 queued Run。"""
@@ -72,7 +77,6 @@ class PiPocRunner:
         if run is None:
             return None
         user_id = run.user_id
-        visibility = run.visibility
         if run.cancel_requested:
             await self._settle(run_id, user_id, RunStatus.CANCELLED, {"reason": "cancel_requested"})
             return RunStatus.CANCELLED.value
@@ -100,15 +104,18 @@ class PiPocRunner:
             created = self._client_factory(current_run, token)
             client = await created if inspect.isawaitable(created) else created
             await client.prompt(await self._build_start_message(run_id))
-            async for event in client.events():
+            async for raw_event in client.events():
+                event = _project_rpc_event(raw_event)
                 if await self._cancel_requested(run_id):
                     await client.abort()
+                    await self._flush_thinking(run_id)
                     await self._settle(
                         run_id, user_id, RunStatus.CANCELLED, {"reason": "cancel_requested"}
                     )
                     return RunStatus.CANCELLED.value
                 if await self._attempt_timed_out(attempt_id):
                     await client.abort()
+                    await self._flush_thinking(run_id)
                     await self._settle(
                         run_id,
                         user_id,
@@ -116,16 +123,22 @@ class PiPocRunner:
                         {"error_code": "pi_run_timeout"},
                     )
                     return RunStatus.FAILED.value
-                await self._audit_event(run_id, visibility, attempt_id, event)
                 mapped = map_pi_rpc_event(event)
+                if mapped is not None and mapped.event_type.value == "thinking.delta":
+                    self._buffer_thinking(str(mapped.payload["text"]))
+                    if self._thinking_bytes >= _THINKING_CHUNK_BYTES:
+                        await self._flush_thinking(run_id)
+                    continue
+                await self._flush_thinking(run_id)
+                await self._audit_event(run_id, event)
                 if mapped is not None:
-                    await self._events.append(run_id, user_id, mapped.event_type, mapped.payload)
                     if mapped.event_type.value == "message.delta":
                         text = mapped.payload.get("text")
                         if isinstance(text, str):
                             assistant_parts.append(text)
                     if mapped.event_type.value == "thinking.failed":
                         await client.abort()
+                        await self._flush_thinking(run_id)
                         await self._settle(
                             run_id,
                             user_id,
@@ -142,6 +155,7 @@ class PiPocRunner:
                     run_id, attempt_id
                 ):
                     await client.abort()
+                    await self._flush_thinking(run_id)
                     await self._settle(
                         run_id,
                         user_id,
@@ -149,11 +163,12 @@ class PiPocRunner:
                         {"error_code": "pi_decision_limit"},
                     )
                     return RunStatus.FAILED.value
-                if event.get("type") == "agent_settled":
+                if event.get("type") == "agent_end" and event.get("willRetry") is False:
                     return await self._complete_settled_run(run_id, user_id, assistant_parts)
 
             # Pi RPC 在已接受 prompt 后异常退出会由 PiRpcClient 抛出；这里收到自然
             # EOF 则同样不能把未确认 settled 的工作当成成功。
+            await self._flush_thinking(run_id)
             await self._settle(
                 run_id,
                 user_id,
@@ -163,16 +178,40 @@ class PiPocRunner:
             return RunStatus.FAILED.value
         except Exception as exc:  # noqa: BLE001 - subprocess/RPC 边界必须收口为唯一失败终态。
             await self._db.rollback()
+            _DIAGNOSTICS_LOGGER.warning(
+                "pi_poc_run_failure=%s",
+                json.dumps(safe_db_diagnostic(exc), ensure_ascii=False, sort_keys=True),
+            )
+            await self._flush_thinking(run_id)
             await self._settle(
                 run_id,
                 user_id,
                 RunStatus.FAILED,
-                {"error_code": type(exc).__name__},
+                {
+                    "error_code": exc.code
+                    if isinstance(exc, PiRpcProtocolError)
+                    else type(exc).__name__
+                },
             )
             return RunStatus.FAILED.value
         finally:
             if client is not None:
                 await client.close()
+
+    def _buffer_thinking(self, text: str) -> None:
+        self._thinking_parts.append(text)
+        self._thinking_bytes += len(text.encode("utf-8"))
+
+    async def _flush_thinking(self, run_id: str) -> None:
+        if not self._thinking_parts:
+            return
+        text = "".join(self._thinking_parts)
+        await PiRunAuditWriter(db=self._db, events=self._events).write_thinking_chunk(
+            run_id=run_id,
+            text=text,
+        )
+        self._thinking_parts.clear()
+        self._thinking_bytes = 0
 
     async def _build_start_message(self, run_id: str) -> str:
         """重建受控上下文，不注入凭证、原始 Evidence 或业务工具路由。"""
@@ -261,26 +300,11 @@ class PiPocRunner:
         }
         return json.dumps(context, ensure_ascii=False)
 
-    async def _audit_event(
-        self, run_id: str, visibility: str, attempt_id: str, event: dict[str, Any]
-    ) -> None:
-        sequence = await self._db.scalar(
-            select(func.max(AgentStep.sequence)).where(AgentStep.run_id == run_id)
+    async def _audit_event(self, run_id: str, event: dict[str, Any]) -> None:
+        await PiRunAuditWriter(db=self._db, events=self._events).write_rpc_event(
+            run_id=run_id,
+            event=event,
         )
-        self._db.add(
-            AgentStep(
-                id=str(uuid4()),
-                run_id=run_id,
-                attempt_id=attempt_id,
-                sequence=(sequence or 0) + 1,
-                step_type="pi_rpc_event",
-                input_json={"event": redact_for_log(event)},
-                status="completed",
-                visibility=visibility,
-                created_at=datetime.now(UTC).replace(tzinfo=None),
-            )
-        )
-        await self._db.commit()
 
     async def _count_decision(self, run_id: str, attempt_id: str) -> bool:
         locked = await AgentRunRepository(self._db).lock_run(run_id)
@@ -311,7 +335,7 @@ class PiPocRunner:
     async def _complete_settled_run(
         self, run_id: str, user_id: str, assistant_parts: list[str]
     ) -> str:
-        """仅 Pi 明确 ``agent_settled`` 后才允许走完成终态。"""
+        """仅 Pi 0.79 明确 ``agent_end/willRetry=false`` 后才允许走完成终态。"""
         text = "".join(assistant_parts).strip()
         if text:
             await self._events.append(run_id, user_id, "message.completed", {"text": text})

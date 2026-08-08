@@ -456,9 +456,10 @@ def build_real_pi_client_factory(settings: Settings) -> Callable[[AgentRun, str]
     root = Path(__file__).parents[3]
     pi_root = root / "pi-runtime"
     executable = pi_root / "node_modules" / ".bin" / "pi"
+    adapter_extension = pi_root / "node_modules" / "pi-mcp-adapter" / "index.ts"
     extension = pi_root / "src" / "extensions" / "poc-runtime.ts"
     skills = tuple(str(path) for path in sorted((pi_root / "skills").glob("*/SKILL.md")))
-    if not executable.is_file() or not extension.is_file() or len(skills) != 6:
+    if not executable.is_file() or not adapter_extension.is_file() or not extension.is_file() or len(skills) != 6:
         raise RuntimeError("pi_poc_runtime_resources_missing")
     provider = "kol_insight_pi_poc"
     models_json = json.dumps(
@@ -492,10 +493,13 @@ def build_real_pi_client_factory(settings: Settings) -> Callable[[AgentRun, str]
         environment = {
             "TENCENT_PLAN_API_KEY": settings.tencent_plan_api_key.get_secret_value(),
             "DATATAP_MCP_TOKEN": settings.datatap_mcp_token.get_secret_value(),
-            "DATATAP_MCP_ENDPOINTS_JSON": json.dumps(
-                {slug: str(settings.datatap_mcp_urls[slug]) for slug in sorted(_DATATAP_SERVICE_SLUGS)},
-                separators=(",", ":"),
+            "DATATAP_INSIGHT_CUBE_MCP_URL": str(settings.datatap_mcp_urls["insight-cube-mcp"]),
+            "DATATAP_SOCIAL_GROW_MCP_URL": str(settings.datatap_mcp_urls["social-grow-mcp"]),
+            "DATATAP_SOCIAL_GROW_CONTENT_MCP_URL": str(
+                settings.datatap_mcp_urls["social-grow-content-mcp"]
             ),
+            # adapter 项目配置中的 aktools 是代理名称；受控 DataTap mapping 的实际服务为 bilibili。
+            "DATATAP_AKTOOLS_MCP_URL": str(settings.datatap_mcp_urls["bilibili-mcp"]),
             "PI_RUNTIME_POC_BASE_URL": str(settings.pi_runtime_poc_base_url),
             "PI_RUNTIME_POC_RUN_ID": run.id,
             "PI_RUNTIME_POC_TOKEN": token,
@@ -503,11 +507,17 @@ def build_real_pi_client_factory(settings: Settings) -> Callable[[AgentRun, str]
         return PiRpcClient.start(
             PiRpcConfig(
                 executable=str(executable),
-                extensions=(str(extension),),
+                extensions=(str(adapter_extension), str(extension)),
                 skills=skills,
                 timeout_seconds=settings.pi_runtime_poc_run_timeout_seconds,
                 environment=environment,
-                agent_files={"models.json": models_json},
+                # adapter 在临时 agent dir 缺少 metadata cache 时会 bootstrap 四个服务，
+                # 与单工具 smoke 的一次 tools/list 边界冲突。空 cache 不含 endpoint、token 或工具数据，
+                # 仅阻止 bootstrap；首次指定 server 的 mcp proxy call 仍按需 discovery。
+                agent_files={
+                    "models.json": models_json,
+                    "mcp-cache.json": '{"version":1,"servers":{}}',
+                },
                 provider=provider,
                 model=settings.tencent_plan_model,
                 thinking=thinking,

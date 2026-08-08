@@ -132,7 +132,7 @@ describe("PiInternalToolsClient.execute", () => {
     const http = new PiPocHttpClient({
       baseUrl: "http://127.0.0.1:8000/api/v1/internal/pi-poc",
       runId: "run-9",
-      token: "top-secret-run-token",
+      token: "run-credential",
     });
 
     await http.executeInternalTool("search_evidence", { query: "咖啡" });
@@ -140,11 +140,11 @@ describe("PiInternalToolsClient.execute", () => {
     const { input, init } = callOf(fetchMock);
     expect(String(input)).toContain("/runs/run-9/internal-tools");
     expect((init.headers as Record<string, string> | undefined)?.Authorization).toBe(
-      "Bearer top-secret-run-token",
+      "Bearer run-credential",
     );
     const sent = JSON.parse(String(init.body));
     expect(sent.tool_name).toBe("search_evidence");
-    expect(String(init.body)).not.toContain("top-secret-run-token");
+    expect(String(init.body)).not.toContain("run-credential");
   });
 });
 
@@ -152,6 +152,8 @@ describe("registerInternalTools", () => {
   it("只向 Pi 注册受控白名单，并将返回值原样封装为工具文本", async () => {
     const registered: Array<{
       name: string;
+      description: string;
+      parameters: { required?: string[] };
       execute: (toolCallId: string, args: Record<string, unknown>) => Promise<unknown>;
     }> = [];
     const pi = { registerTool: (tool: (typeof registered)[number]) => registered.push(tool) };
@@ -166,5 +168,24 @@ describe("registerInternalTools", () => {
       content: [{ type: "text", text: '{"draft_id":"draft-1"}' }],
       details: {},
     });
+  });
+
+  it("为需要定位对象的内部工具注册精确参数契约与独立说明", () => {
+    const registered: Array<{
+      name: string;
+      description: string;
+      parameters: { required?: string[] };
+      execute: (toolCallId: string, args: Record<string, unknown>) => Promise<unknown>;
+    }> = [];
+    const pi = { registerTool: (tool: (typeof registered)[number]) => registered.push(tool) };
+    const http = { executeInternalTool: vi.fn() };
+
+    registerInternalTools(pi as never, new PiInternalToolsClient(http as never));
+
+    const byName = (name: string) => registered.find((tool) => tool.name === name)!;
+    expect(byName("request_clarification").parameters.required).toEqual(["question"]);
+    expect(byName("read_artifact").parameters.required).toEqual(["artifact_id"]);
+    expect(byName("read_tool_result").parameters.required).toEqual(["evidence_id"]);
+    expect(new Set(registered.map((tool) => tool.description)).size).toBeGreaterThan(1);
   });
 });

@@ -57,7 +57,11 @@ def test_shell_normalizes_external_endpoint_json_for_python_settings() -> None:
             (
                 'set -euo pipefail; export DATATAP_MCP_ENDPOINTS_JSON="$1"; source "$2"; '
                 'pi_poc_normalize_datatap_mapping; test "$DATATAP_MCP_URLS" = "$1"; '
-                'test "$DATATAP_MCP_ENDPOINTS_JSON" = "$1"'
+                'test "$DATATAP_INSIGHT_CUBE_MCP_URL" = "https://datatap.example.test/insight/mcp"; '
+                'test "$DATATAP_SOCIAL_GROW_MCP_URL" = "https://datatap.example.test/social/mcp"; '
+                'test "$DATATAP_SOCIAL_GROW_CONTENT_MCP_URL" = "https://datatap.example.test/content/mcp"; '
+                'test "$DATATAP_AKTOOLS_MCP_URL" = "https://datatap.example.test/bilibili/mcp"; '
+                'test -z "${DATATAP_MCP_ENDPOINTS_JSON+x}"'
             ),
             "bash",
             external_mapping,
@@ -71,7 +75,7 @@ def test_shell_normalizes_external_endpoint_json_for_python_settings() -> None:
     assert result.returncode == 0, result.stderr
 
 
-def test_settings_mapping_is_forwarded_to_pi_as_endpoint_json(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_settings_mapping_is_forwarded_to_pi_adapter_as_explicit_urls(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = _settings(monkeypatch)
     captured = []
     monkeypatch.setattr(comparison.PiRpcClient, "start", lambda config: captured.append(config) or object())
@@ -80,8 +84,31 @@ def test_settings_mapping_is_forwarded_to_pi_as_endpoint_json(monkeypatch: pytes
     factory(cast(AgentRun, SimpleNamespace(id="run-task8b")), "test-run-token")
 
     assert len(captured) == 1
-    assert json.loads(captured[0].environment["DATATAP_MCP_ENDPOINTS_JSON"]) == _SERVICE_MAPPING
-    assert "DATATAP_MCP_URLS" not in captured[0].environment
+    environment = captured[0].environment
+    assert environment["DATATAP_INSIGHT_CUBE_MCP_URL"] == _SERVICE_MAPPING["insight-cube-mcp"]
+    assert environment["DATATAP_SOCIAL_GROW_MCP_URL"] == _SERVICE_MAPPING["social-grow-mcp"]
+    assert environment["DATATAP_SOCIAL_GROW_CONTENT_MCP_URL"] == _SERVICE_MAPPING["social-grow-content-mcp"]
+    assert environment["DATATAP_AKTOOLS_MCP_URL"] == _SERVICE_MAPPING["bilibili-mcp"]
+    assert "DATATAP_MCP_ENDPOINTS_JSON" not in environment
+    assert len(captured[0].extensions) == 2
+    assert captured[0].extensions[0].endswith("node_modules/pi-mcp-adapter/index.ts")
+    assert captured[0].extensions[1].endswith("src/extensions/poc-runtime.ts")
+    assert captured[0].agent_files["mcp-cache.json"] == '{"version":1,"servers":{}}'
+
+
+def test_task9_shell_preflight_checks_adapter_urls_after_legacy_mapping_is_cleared() -> None:
+    script = (Path(__file__).parents[2] / "scripts" / "run_pi_runtime_poc.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert '[[ -n "${DATATAP_MCP_ENDPOINTS_JSON:-}" ]] || exit 2' not in script
+    for key in (
+        "DATATAP_INSIGHT_CUBE_MCP_URL",
+        "DATATAP_SOCIAL_GROW_MCP_URL",
+        "DATATAP_SOCIAL_GROW_CONTENT_MCP_URL",
+        "DATATAP_AKTOOLS_MCP_URL",
+    ):
+        assert f'[[ -n "${{{key}:-}}" ]] || exit 2' in script
 
 
 async def test_local_preflight_failure_does_not_create_round_directory(

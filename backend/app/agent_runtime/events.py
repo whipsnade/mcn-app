@@ -97,7 +97,7 @@ def map_pi_rpc_event(event: dict[str, Any]) -> PiRpcMappedEvent | None:
     event_type = event.get("type")
     if event_type == "agent_start":
         return PiRpcMappedEvent(AgentEventType.THINKING_STARTED, {"collapsed": True})
-    if event_type == "agent_end":
+    if event_type == "agent_end" and event.get("willRetry") is False:
         return PiRpcMappedEvent(AgentEventType.THINKING_COMPLETED, {"collapsed": True})
     if event_type == "error":
         # Pi 的原始错误全文仅保留在 Step 审计；SSE 只暴露稳定分类，避免供应商
