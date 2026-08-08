@@ -28,11 +28,13 @@ from app.db.base import Base
 from app.identity.models import UserChannelPermission
 from app.identity.service import IdentityService
 from app.pi_runtime_poc.comparison import (
+    HumanReview,
     PiRuntimeCaseExecutor,
     PocCase,
     PocCaseFactory,
     PocCaseResult,
     _is_datatap_audit_service,
+    assess_gate_a,
     begin_round,
     load_cases,
     write_append_only_round,
@@ -82,6 +84,57 @@ def _result(
         diagnostic_path=f"outputs/{case_id}/pi.json",
         hard_checks=hard_checks or {},
     )
+
+
+def _gate_cases() -> tuple[PocCase, ...]:
+    return load_cases(Path(__file__).parents[2] / "fixtures" / "pi_runtime_poc" / "cases.json")
+
+
+def _review(score: int = 3) -> HumanReview:
+    item = {"score": score, "reason": "已基于可审计证据复核。"}
+    return HumanReview.model_validate({
+        "reviewer": "hanxiang", "reviewed_at": "2026-08-08T18:00:00+08:00",
+        "reports": {case_id: {key: item for key in ("factuality", "insight", "actionability", "limitations")}
+                    for case_id in ("brand-research-v1", "campaign-evaluation-v1", "kol-selection-v1")},
+    })
+
+
+def _gate_results(cases: tuple[PocCase, ...]) -> tuple[PocCaseResult, ...]:
+    return tuple(_result(case.case_id, outcome="clarification_requested" if case.expected_behavior == "clarify" else "completed", hard_checks={"absolute": True}) for case in cases)
+
+
+@pytest.mark.parametrize("status", ["failed", "not_run"])
+def test_gate_is_infra_failed_when_any_case_is_not_evaluable(status: str) -> None:
+    cases = _gate_cases()
+    results = list(_gate_results(cases))
+    results[0] = PocCaseResult(**{**results[0].__dict__, "status": status})
+    assert assess_gate_a(cases, tuple(results))["gate"] == "INFRA_FAILED"
+
+
+@pytest.mark.parametrize("mutate", ["missing", "duplicate", "runtime"])
+def test_gate_requires_exactly_six_pi_cases(mutate: str) -> None:
+    cases = _gate_cases()
+    results = list(_gate_results(cases))
+    if mutate == "missing": results.pop()
+    elif mutate == "duplicate": results[-1] = PocCaseResult(**{**results[-1].__dict__, "case_id": results[0].case_id})
+    else: results[0] = PocCaseResult(**{**results[0].__dict__, "runtime": "current"})  # type: ignore[arg-type]
+    assert assess_gate_a(cases, tuple(results))["gate"] == "INFRA_FAILED"
+
+
+def test_gate_evaluated_fail_and_pass_for_absolute_checks_and_scores() -> None:
+    cases, results = _gate_cases(), _gate_results(_gate_cases())
+    assert assess_gate_a(cases, results, _review(2))["gate"] == "EVALUATED_FAIL"
+    bad = list(results); bad[0] = PocCaseResult(**{**bad[0].__dict__, "hard_checks": {"absolute": False}})
+    assert assess_gate_a(cases, tuple(bad), _review())["gate"] == "EVALUATED_FAIL"
+    assert assess_gate_a(cases, results, _review())["gate"] == "PASS"
+
+
+@pytest.mark.parametrize("review", [
+    {"reviewer": "x", "reviewed_at": "x", "reports": {}},
+    {"reviewer": "x", "reviewed_at": "x", "reports": {"brand-research-v1": {"factuality": {"score": 6, "reason": "x"}}}},
+])
+def test_human_review_is_strict(review: dict[str, object]) -> None:
+    with pytest.raises(ValueError): HumanReview.model_validate(review)
 
 
 def test_load_cases_contains_six_versioned_scenarios_without_provider_output_or_secrets() -> None:

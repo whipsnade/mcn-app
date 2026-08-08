@@ -1,6 +1,8 @@
 """Task 9 Pi-only 六案例隔离编排回归。"""
 
 import importlib.util
+import json
+import socket
 import sys
 from pathlib import Path
 
@@ -20,6 +22,16 @@ FIXTURE = Path(__file__).parents[2] / "fixtures" / "pi_runtime_poc" / "cases.jso
 def _load_runner_module():
     script = Path(__file__).parents[2] / "scripts" / "run_pi_runtime_poc.py"
     spec = importlib.util.spec_from_file_location("pi_runtime_poc_task9_runner", script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_finalizer_module():
+    script = Path(__file__).parents[2] / "scripts" / "finalize_pi_runtime_poc.py"
+    spec = importlib.util.spec_from_file_location("pi_runtime_poc_finalizer", script)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
@@ -95,3 +107,40 @@ async def test_brand_failure_only_skips_drilldown_and_keeps_later_cases_running(
         "scope-clarification-v1",
         "non-marketing-v1",
     ]
+
+
+def _finalizer_round(tmp_path: Path, *, failed: bool = False) -> tuple[object, Path, tuple[PocCase, ...]]:
+    finalizer = _load_finalizer_module()
+    root = tmp_path / "outputs" / "pi-runtime-poc"
+    round_dir = begin_round(root, "round-finalize")
+    cases = load_cases(FIXTURE)
+    results = [_result(case.case_id) for case in cases]
+    if failed:
+        results[0] = PocCaseResult(**{**results[0].__dict__, "status": "failed"})
+    write_execution_manifest(round_dir, cases, tuple(results))
+    finalizer._output_root = lambda: root
+    return finalizer, round_dir, cases
+
+
+def test_finalizer_allows_infra_without_human_review_and_preserves_exact_manifest(tmp_path: Path) -> None:
+    finalizer, round_dir, cases = _finalizer_round(tmp_path, failed=True)
+    summary = finalizer.finalize_round(round_dir, FIXTURE)
+    assert json.loads(summary.read_text(encoding="utf-8"))["gate"]["gate"] == "INFRA_FAILED"
+    execution = json.loads((round_dir / "execution.json").read_text(encoding="utf-8"))
+    assert execution["runtime"] == "pi"
+    assert [item["case_id"] for item in execution["results"]] == [case.case_id for case in cases]
+
+
+def test_finalizer_requires_review_rejects_secrets_and_never_overwrites(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    finalizer, round_dir, _ = _finalizer_round(tmp_path)
+    with pytest.raises(ValueError, match="poc_human_review_required"):
+        finalizer.finalize_round(round_dir, FIXTURE)
+    (round_dir / "leak.json").write_text('{"value":"sk-test"}', encoding="utf-8")
+    with pytest.raises(ValueError, match="poc_output_contains_secret"):
+        finalizer.finalize_round(round_dir, FIXTURE)
+    (round_dir / "leak.json").unlink()
+    (round_dir / "summary.json").write_text("original", encoding="utf-8")
+    monkeypatch.setattr(socket, "create_connection", lambda *args, **kwargs: pytest.fail("network"))
+    with pytest.raises(FileExistsError):
+        finalizer.finalize_round(round_dir, FIXTURE)
+    assert (round_dir / "summary.json").read_text(encoding="utf-8") == "original"

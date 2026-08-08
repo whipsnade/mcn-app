@@ -15,6 +15,7 @@ from typing import Literal, Protocol
 from uuid import uuid4
 
 from openpyxl import load_workbook
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -82,6 +83,45 @@ class PocCaseResult:
     metrics: dict[str, float | int | bool | None]
     diagnostic_path: str
     hard_checks: dict[str, bool]
+
+
+class ScoreWithReason(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    score: int = Field(ge=1, le=5)
+    reason: str
+
+    @field_validator("reason")
+    @classmethod
+    def validate_reason(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("poc_review_reason_required")
+        return value
+
+
+class ReportReview(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    factuality: ScoreWithReason
+    insight: ScoreWithReason
+    actionability: ScoreWithReason
+    limitations: ScoreWithReason
+
+
+class HumanReview(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reviewer: str
+    reviewed_at: str
+    reports: dict[str, ReportReview]
+
+    @field_validator("reports")
+    @classmethod
+    def validate_reports(cls, value: dict[str, ReportReview]) -> dict[str, ReportReview]:
+        expected = {"brand-research-v1", "campaign-evaluation-v1", "kol-selection-v1"}
+        if set(value) != expected:
+            raise ValueError("poc_review_reports_must_be_exact")
+        return value
 
 
 class RuntimeCaseExecutor(Protocol):
@@ -272,77 +312,29 @@ def load_cases(path: Path) -> tuple[PocCase, ...]:
     return cases
 
 
-def assess_gate_a(cases: tuple[PocCase, ...], results: tuple[PocCaseResult, ...]) -> dict[str, object]:
-    """以硬门槛优先计算 Gate A；人工可读性仍留给 Task 9 人工填写。"""
-    by_case: dict[str, dict[RuntimeName, PocCaseResult]] = {}
-    for result in results:
-        by_case.setdefault(result.case_id, {})[result.runtime] = result
-
-    hard_check_values: dict[str, list[bool]] = {}
-    for result in results:
-        for key, value in result.hard_checks.items():
-            hard_check_values.setdefault(key, []).append(value)
-    hard_checks = {key: bool(values) and all(values) for key, values in hard_check_values.items()}
-
-    behavior_checks: list[bool] = []
-    report_checks: list[bool] = []
-    non_marketing_datatap_checks: list[bool] = []
-    for case in cases:
-        pair = by_case.get(case.case_id, {})
-        if set(pair) != {"current", "pi"}:
-            behavior_checks.append(False)
-            if case.expected_behavior == _REPORT_BEHAVIOR:
-                report_checks.append(False)
-            continue
-        for result in pair.values():
-            if case.expected_behavior == "clarify":
-                behavior_checks.append(
-                    result.outcome == "clarification_requested" and not result.artifact_versions
-                )
-            elif case.expected_behavior == "refuse":
-                behavior_checks.append(result.outcome == "completed" and not result.artifact_versions)
-                non_marketing_datatap_checks.append(result.metrics.get("datatap_tool_calls", 0) == 0)
-            else:
-                behavior_checks.append(result.outcome in {"completed", "completed_with_warnings"})
-        if case.expected_behavior == _REPORT_BEHAVIOR:
-            report_checks.append(all(bool(result.artifact_versions) for result in pair.values()))
-
-    for key, value in {
-        "three_reports_published": len(report_checks) == 3 and all(report_checks),
-        "behavior_correct": bool(behavior_checks) and all(behavior_checks),
-        "non_marketing_has_no_datatap_calls": bool(non_marketing_datatap_checks)
-        and all(non_marketing_datatap_checks),
-    }.items():
-        hard_checks[key] = value
-
-    coverage_not_lower = all(
-        pair["pi"].metrics.get("coverage", 0) >= pair["current"].metrics.get("coverage", 0)
-        for pair in by_case.values()
-        if set(pair) == {"current", "pi"}
-    ) and len(by_case) == len(cases)
-    hard_checks["coverage_not_lower"] = coverage_not_lower
-
-    improved = 0
-    for metric in ("mcp_parameter_validity", "artifact_completeness", "human_readability"):
-        current_values = [
-            pair["current"].metrics.get(metric)
-            for pair in by_case.values()
-            if set(pair) == {"current", "pi"}
-        ]
-        pi_values = [
-            pair["pi"].metrics.get(metric)
-            for pair in by_case.values()
-            if set(pair) == {"current", "pi"}
-        ]
-        if (
-            current_values
-            and all(isinstance(value, (int, float)) for value in current_values)
-            and all(isinstance(value, (int, float)) for value in pi_values)
-            and sum(pi_values) / len(pi_values) > sum(current_values) / len(current_values)
-        ):
-            improved += 1
-    passed = bool(hard_checks) and all(hard_checks.values()) and improved >= 2
-    return {"gate": "PASS" if passed else "FAIL", "hard_checks": hard_checks, "improved_metric_count": improved}
+def assess_gate_a(
+    cases: tuple[PocCase, ...],
+    results: tuple[PocCaseResult, ...],
+    human_review: HumanReview | None = None,
+) -> dict[str, object]:
+    """按 Pi-only 绝对事实分类，不计算任何 Current 相对指标。"""
+    expected_ids = [case.case_id for case in cases]
+    exact = len(cases) == 6 and len(results) == 6 and [result.case_id for result in results] == expected_ids
+    if not exact or any(result.runtime != "pi" or result.status in {"failed", "not_run"} for result in results):
+        return {"gate": "INFRA_FAILED", "hard_checks": {"exact_pi_cases": exact}}
+    if any(result.status != "completed" or result.outcome is None for result in results):
+        return {"gate": "INFRA_FAILED", "hard_checks": {"cases_evaluable": False}}
+    if human_review is None:
+        raise ValueError("poc_human_review_required")
+    check_values = [value for result in results for value in result.hard_checks.values()]
+    checks = {f"case:{result.case_id}:{key}": value for result in results for key, value in result.hard_checks.items()}
+    scores = [
+        score.score
+        for report in human_review.reports.values()
+        for score in (report.factuality, report.insight, report.actionability, report.limitations)
+    ]
+    passed = bool(check_values) and all(check_values) and all(score >= 3 for score in scores)
+    return {"gate": "PASS" if passed else "EVALUATED_FAIL", "hard_checks": checks}
 
 
 def write_append_only_round(
@@ -446,7 +438,8 @@ def _write_safe_json(path: Path, payload: object) -> None:
     if _SECRET_PATTERN.search(serialized):
         raise ValueError("poc_output_contains_secret")
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    with path.open("x", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
 
 
 def build_real_pi_client_factory(settings: Settings) -> Callable[[AgentRun, str], object]:
