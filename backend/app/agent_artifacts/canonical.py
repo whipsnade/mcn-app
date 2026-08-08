@@ -57,21 +57,27 @@ def unit_for_path(path: str, *, module: str | None = None, data: dict[str, Any] 
     suffix = path.rsplit("/", 1)[-1]
     if suffix in {"rate", "share", "share_of_voice", "contribution_share"}:
         return "ratio"
-    if module == "campaign":
-        if suffix in {"total_volume", "volume", "total_posts", "posts"}:
-            return "posts"
-        if suffix in {"current", "baseline", "delta"} and data is not None:
-            metric = _metric_for_comparison_path(path, data)
-            if metric in {"total_volume", "total_posts", "volume", "posts"}:
-                return "posts"
-            if metric == "total_engagement":
-                return "interactions"
+    if suffix in {"current", "baseline", "delta"} and data is not None:
+        metric = _metric_for_comparison_path(path, data)
+        comparison_units = {
+            "total_volume": "mentions" if module == "brand" else "posts",
+            "total_engagement": "interactions",
+            "total_posts": "posts",
+            "volume": "posts" if module == "campaign" else "mentions",
+            "engagement": "interactions",
+            "posts": "posts",
+            "creators": "count",
+        }
+        if metric in comparison_units:
+            return comparison_units[metric]
+    if module == "campaign" and suffix in {"total_volume", "volume", "total_posts", "posts"}:
+        return "posts"
     return _UNIT_BY_SUFFIX.get(suffix)
 
 
 def _metric_for_comparison_path(path: str, data: dict[str, Any]) -> str | None:
     """取比较指标同级 ``metric``，路径不完整或不存在时保持无单位。"""
-    parts = path.split("/")[1:-1]
+    parts = path.removeprefix("/data/").split("/")[:-1]
     current: Any = data
     try:
         for token in parts:

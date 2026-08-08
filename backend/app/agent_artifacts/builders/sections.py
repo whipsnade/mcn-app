@@ -122,7 +122,10 @@ def build_sentiment_section(
         }
         sources = bucket_rows[name] or sentiment_rows
         collector.add(f"{path}/summary/{name}/count", sources)
-        collector.add(f"{path}/summary/{name}/share", sources)
+        collector.add(
+            f"{path}/summary/{name}/share",
+            [ref for label in _POLARITIES for ref in bucket_rows[label]],
+        )
 
     by_platform: list[dict[str, Any]] = []
     for platform in sorted(platform_rows, key=platform_sort_key):
@@ -140,7 +143,10 @@ def build_sentiment_section(
             }
             sources = platform_rows[platform][name] or platform_sentiment_rows
             collector.add(f"{path}/by_platform/{index}/{name}/count", sources)
-            collector.add(f"{path}/by_platform/{index}/{name}/share", sources)
+            collector.add(
+                f"{path}/by_platform/{index}/{name}/share",
+                platform_sentiment_rows,
+            )
         by_platform.append(entry)
 
     return {"summary": summary, "by_platform": by_platform}, True

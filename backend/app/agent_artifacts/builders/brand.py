@@ -216,12 +216,11 @@ def _metric_rows(slots: dict[str, dict[str, Any]], metric: str) -> list[RowRef]:
     return [ref for slot in slots.values() for ref in slot[f"{metric}_rows"]]
 
 
-def _overview_split(rows: list[RowRef]) -> tuple[dict[str, Any], list[RowRef]]:
+def _overview_split(rows: list[RowRef]) -> tuple[dict[str, Any], dict[str, list[RowRef]]]:
     """overview 行携带的正/中/负构成汇总（情感兜底数据源）。"""
     split: dict[str, Any] = {"positive": None, "neutral": None, "negative": None}
-    contributing: list[RowRef] = []
+    contributors: dict[str, list[RowRef]] = {"positive": [], "neutral": [], "negative": []}
     for ref in rows:
-        used = False
         for name, keys in (
             ("positive", POSITIVE_KEYS),
             ("neutral", NEUTRAL_KEYS),
@@ -230,10 +229,8 @@ def _overview_split(rows: list[RowRef]) -> tuple[dict[str, Any], list[RowRef]]:
             value = num(first(ref.row, keys))
             if value is not None:
                 split[name] = (split[name] or 0.0) + value
-                used = True
-        if used:
-            contributing.append(ref)
-    return split, contributing
+                contributors[name].append(ref)
+    return split, contributors
 
 
 def _build_overview(
@@ -473,10 +470,15 @@ def _build_topics(
                 "positive": None,
                 "neutral": None,
                 "negative": None,
-                "rows": [],
+                "identity_rows": [],
+                "volume_rows": [],
+                "engagement_rows": [],
+                "positive_rows": [],
+                "neutral_rows": [],
+                "negative_rows": [],
             },
         )
-        slot["rows"].append(ref)
+        slot["identity_rows"].append(ref)
         for field_name, keys in (
             ("volume", VOLUME_KEYS),
             ("engagement", ENGAGEMENT_KEYS),
@@ -487,6 +489,7 @@ def _build_topics(
             value = num(first(ref.row, keys))
             if value is not None:
                 slot[field_name] = (slot[field_name] or 0.0) + value
+                slot[f"{field_name}_rows"].append(ref)
 
     ordered = sorted(
         merged.items(),
@@ -499,9 +502,16 @@ def _build_topics(
         for field_name in ("volume", "engagement"):
             value = _as_int(slot[field_name])
             if value is not None:
-                collector.add(f"/data/topics/{index}/{field_name}", slot["rows"])
+                collector.add(f"/data/topics/{index}/{field_name}", slot[f"{field_name}_rows"])
         if score is not None:
-            collector.add(f"/data/topics/{index}/sentiment_score", slot["rows"])
+            collector.add(
+                f"/data/topics/{index}/sentiment_score",
+                [
+                    ref
+                    for field_name in ("positive", "neutral", "negative")
+                    for ref in slot[f"{field_name}_rows"]
+                ],
+            )
         items.append(
             {
                 "topic": topic,
@@ -529,11 +539,11 @@ def _build_dimension_rows(
             continue
         platform = canon_platform(first(ref.row, PLATFORM_KEYS))
         key = (platform, label)
-        slot = merged.setdefault(key, {"volume": None, "rows": []})
-        slot["rows"].append(ref)
+        slot = merged.setdefault(key, {"volume": None, "volume_rows": []})
         value = num(first(ref.row, VOLUME_KEYS))
         if value is not None:
             slot["volume"] = (slot["volume"] or 0.0) + value
+            slot["volume_rows"].append(ref)
 
     items: list[dict[str, Any]] = []
     for (platform, label), slot in sorted(
@@ -541,7 +551,7 @@ def _build_dimension_rows(
     ):
         index = len(items)
         if slot["volume"] is not None:
-            collector.add(f"/data/{section}/{index}/volume", slot["rows"])
+            collector.add(f"/data/{section}/{index}/volume", slot["volume_rows"])
         item = {"platform": platform, label_field: label, "volume": _as_int(slot["volume"])}
         for field_name in extra_fields:
             item[field_name] = None
@@ -762,7 +772,8 @@ def build_brand_report_draft(
     ]
 
     # overview 行情感构成（兜底 + overview.sentiment_score 数据源）。
-    overview_split, split_rows = _overview_split(groups[GROUP_OVERVIEW_CURRENT])
+    overview_split, split_rows_by_bucket = _overview_split(groups[GROUP_OVERVIEW_CURRENT])
+    split_rows = [ref for rows in split_rows_by_bucket.values() for ref in rows]
 
     if not sentiment_has_rows and any(
         value is not None for value in overview_split.values()
@@ -788,8 +799,14 @@ def build_brand_report_draft(
         )
         for name in ("positive", "neutral", "negative"):
             if summary[name]["count"] is not None:
-                collector.add(f"/data/sentiment/summary/{name}/count", split_rows)
-                collector.add(f"/data/sentiment/summary/{name}/share", split_rows)
+                collector.add(
+                    f"/data/sentiment/summary/{name}/count",
+                    split_rows_by_bucket[name],
+                )
+                collector.add(
+                    f"/data/sentiment/summary/{name}/share",
+                    split_rows,
+                )
 
     # 情感计分来源行：明细优先，兜底用 overview 构成行。
     if not sentiment_score_rows:

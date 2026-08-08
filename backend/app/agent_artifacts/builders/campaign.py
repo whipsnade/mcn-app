@@ -201,7 +201,8 @@ def _build_overview(
     total_engagement = (
         sum(value for _, value in engagements if value is not None) if engagement_rows else None
     )
-    authors = {_row_author_id(ref.row) for ref in rows}
+    creator_rows = [ref for ref in rows if _row_author_id(ref.row) is not None]
+    authors = {_row_author_id(ref.row) for ref in creator_rows}
     authors.discard(None)
     total_creators = len(authors) if authors else None
 
@@ -211,7 +212,7 @@ def _build_overview(
     if total_engagement is not None:
         collector.add("/data/overview/total_engagement", engagement_rows)
     if total_creators is not None:
-        collector.add("/data/overview/total_creators", rows)
+        collector.add("/data/overview/total_creators", creator_rows)
     if score is not None:
         collector.add("/data/overview/sentiment_score", score_rows)
 
@@ -246,7 +247,8 @@ def _build_platform_contributions(
             if engagement_rows
             else None
         )
-        authors = {_row_author_id(ref.row) for ref in bucket}
+        creator_rows = [ref for ref in bucket if _row_author_id(ref.row) is not None]
+        authors = {_row_author_id(ref.row) for ref in creator_rows}
         authors.discard(None)
         creators = len(authors) if authors else None
         share = round(len(bucket) / total, 4) if total else None
@@ -258,7 +260,7 @@ def _build_platform_contributions(
         if engagement is not None:
             collector.add(f"{base}/engagement", engagement_rows)
         if creators is not None:
-            collector.add(f"{base}/creators", bucket)
+            collector.add(f"{base}/creators", creator_rows)
         if share is not None:
             collector.add(f"{base}/share", rows)
         items.append(
@@ -326,9 +328,12 @@ def _build_kol_contributions(
             continue
         platform = canon_platform(first(ref.row, PLATFORM_KEYS))
         slot = buckets.setdefault(
-            (platform, uid), {"rows": [], "nickname": _row_author_name(ref.row)}
+            (platform, uid),
+            {"rows": [], "engagement_rows": [], "nickname": _row_author_name(ref.row)},
         )
         slot["rows"].append(ref)
+        if _row_engagement(ref.row) is not None:
+            slot["engagement_rows"].append(ref)
 
     def _engagement(bucket: list[RowRef]) -> int | None:
         values = [_row_engagement(ref.row) for ref in bucket]
@@ -364,11 +369,11 @@ def _build_kol_contributions(
         collector.add(f"{base}/posts", slot["rows"])
         collector.add(f"{base}/volume", slot["rows"])
         if engagement is not None:
-            collector.add(f"{base}/engagement", slot["rows"])
+            collector.add(f"{base}/engagement", slot["engagement_rows"])
         if share is not None:
             collector.add(
                 f"{base}/contribution_share",
-                [ref for entry in buckets.values() for ref in entry["rows"]],
+                [ref for entry in buckets.values() for ref in entry["engagement_rows"]],
             )
         items.append(
             {
@@ -496,13 +501,15 @@ def _assemble_availability(
 # ---------------------------------------------------------------------------
 
 
-def _group_totals(rows: list[RowRef]) -> dict[str, int | None]:
+def _group_totals(rows: list[RowRef]) -> dict[str, dict[str, Any]]:
     """按行聚合 volume/engagement/posts/creators 四指标（社媒口径）。
 
     observed 显式跟踪（Gate C 第三轮）：字段至少出现一次 → 真实合计（含 0）；
     字段完全没出现 → None，绝不把缺失当 0，也绝不把真实 0 当缺失。
     """
     totals = {"volume": 0, "engagement": 0, "posts": 0}
+    contributors: dict[str, list[RowRef]] = {key: [] for key in totals}
+    contributors["creators"] = []
     observed = {"volume": False, "engagement": False}
     creator_ids: set[str] = set()
     for ref in rows:
@@ -512,19 +519,25 @@ def _group_totals(rows: list[RowRef]) -> dict[str, int | None]:
         if volume is not None:
             totals["volume"] += volume
             observed["volume"] = True
+            contributors["volume"].append(ref)
         if engagement is not None:
             totals["engagement"] += engagement
             observed["engagement"] = True
+            contributors["engagement"].append(ref)
         totals["posts"] += 1
+        contributors["posts"].append(ref)
         author_id = _row_author_id(row)
         if author_id is not None:
             creator_ids.add(author_id)
-    return {
+            contributors["creators"].append(ref)
+    values = {
         "volume": totals["volume"] if observed["volume"] else None,
         "engagement": totals["engagement"] if observed["engagement"] else None,
         "posts": totals["posts"],
         "creators": len(creator_ids) if creator_ids else None,
     }
+    # 保留既有内部读取面，新增结构让 value 与 contributors 不会分别猜测。
+    return {**values, "values": values, "contributors": contributors}
 
 
 def _rate_change(current: float | None, baseline: float | None) -> float | None:
@@ -569,11 +582,11 @@ def _build_comparisons(
     metrics = ("volume", "engagement", "posts", "creators")
 
     current_baseline = [
-        _comparison_series(metric, current_totals[metric], baseline_totals[metric])
+        _comparison_series(metric, current_totals["values"][metric], baseline_totals["values"][metric])
         for metric in metrics
     ]
     current_post = [
-        _comparison_series(metric, current_totals[metric], post_totals[metric])
+        _comparison_series(metric, current_totals["values"][metric], post_totals["values"][metric])
         for metric in metrics
     ]
     # lineage 只登记 payload 真实叶子（current/baseline/delta/rate）；空系列不登记。
@@ -589,11 +602,19 @@ def _build_comparisons(
                 if value is None:
                     continue
                 if field == "current":
-                    sources = current_rows
+                    sources = current_totals["contributors"][entry["metric"]]
                 elif field == "baseline":
-                    sources = comparison_rows
+                    sources = (
+                        baseline_totals if series_name == "current_baseline" else post_totals
+                    )["contributors"][entry["metric"]]
                 else:
-                    sources = _dedup_rows([*current_rows, *comparison_rows])
+                    other = baseline_totals if series_name == "current_baseline" else post_totals
+                    sources = _dedup_rows(
+                        [
+                            *current_totals["contributors"][entry["metric"]],
+                            *other["contributors"][entry["metric"]],
+                        ]
+                    )
                 collector.add(
                     f"/data/comparisons/{series_name}/{index}/{field}",
                     sources,
@@ -676,12 +697,19 @@ def _build_attribution(
     无归属字段的帖计入 unknown（没有证据不得自动认定付费投放）。
     """
     counts = {"paid_confirmed": 0, "organic": 0, "unknown": 0}
+    contributors = {key: [] for key in counts}
     for ref in post_rows:
-        counts[_attribution_kind(ref)[0]] += 1
+        kind = _attribution_kind(ref)[0]
+        counts[kind] += 1
+        contributors[kind].append(ref)
     total = sum(counts.values())
     if post_rows:
         for field in ("paid_confirmed", "organic", "unknown"):
-            collector.add(f"/data/attribution/{field}", post_rows)
+            # 显式 0 由全量分类集合共同证明（而非无来源）；非零只保留命中该类别的行。
+            collector.add(
+                f"/data/attribution/{field}",
+                contributors[field] or post_rows,
+            )
         collector.add("/data/attribution/paid_confirmed_share", post_rows)
     return {
         "paid_confirmed": counts["paid_confirmed"] if post_rows else None,
@@ -702,12 +730,14 @@ def _build_organic_summary(
     organic_rows = [ref for ref in post_rows if _attribution_kind(ref)[0] == "organic"]
     if not organic_rows:
         return {}, False
-    volume = _sum_number(organic_rows, VOLUME_KEYS)
-    engagement = _sum_number(organic_rows, ENGAGEMENT_KEYS)
+    volume_rows = [ref for ref in organic_rows if whole(first(ref.row, VOLUME_KEYS)) is not None]
+    engagement_rows = [ref for ref in organic_rows if _row_engagement(ref.row) is not None]
+    volume = _sum_number(volume_rows, VOLUME_KEYS)
+    engagement = sum(_row_engagement(ref.row) for ref in engagement_rows) if engagement_rows else None
     if volume is not None:
-        collector.add("/data/organic_summary/volume", organic_rows)
+        collector.add("/data/organic_summary/volume", volume_rows)
     if engagement is not None:
-        collector.add("/data/organic_summary/engagement", organic_rows)
+        collector.add("/data/organic_summary/engagement", engagement_rows)
     collector.add("/data/organic_summary/posts", organic_rows)
     return {
         "volume": volume,
@@ -730,16 +760,17 @@ def _build_audience_regions(
         region = text(first(ref.row, REGION_KEYS))
         if region is None:
             continue
-        bucket = buckets.setdefault(region, {"volume": 0, "observed": False})
+        bucket = buckets.setdefault(region, {"volume": 0, "observed": False, "volume_rows": []})
         volume = whole(first(ref.row, VOLUME_KEYS))
         if volume is not None:
             bucket["volume"] += volume
             bucket["observed"] = True
-        collector.add("/data/audience_regions", [ref])
+            bucket["volume_rows"].append(ref)
     if not buckets:
         return [], False
     total_volume = sum(bucket["volume"] for bucket in buckets.values())
     total_observed = any(bucket["observed"] for bucket in buckets.values())
+    total_volume_rows = [ref for bucket in buckets.values() for ref in bucket["volume_rows"]]
     regions: list[dict[str, Any]] = []
     for region, bucket in buckets.items():
         index = len(regions)
@@ -752,7 +783,10 @@ def _build_audience_regions(
         regions.append({"region": region, "volume": volume, "share": share})
         for field, value in (("volume", volume), ("share", share)):
             if value is not None:
-                collector.add(f"/data/audience_regions/{index}/{field}", post_rows)
+                collector.add(
+                    f"/data/audience_regions/{index}/{field}",
+                    bucket["volume_rows"] if field == "volume" else total_volume_rows,
+                )
     return regions, True
 
 
@@ -766,6 +800,19 @@ def _sum_number(rows: list[RowRef], keys: tuple[str, ...]) -> int | None:
     return total
 
 
+def _internal_source_rows(upload_rows: list[RowRef]) -> list[RowRef]:
+    total_rows = [
+        ref
+        for ref in upload_rows
+        if "合计" in (text(first(ref.row, PLATFORM_KEYS)) or "")
+    ]
+    return total_rows or upload_rows
+
+
+def _rows_with_metric(rows: list[RowRef], keys: tuple[str, ...]) -> list[RowRef]:
+    return [ref for ref in rows if whole(first(ref.row, keys)) is not None]
+
+
 def _build_internal_metrics(
     upload_rows: list[RowRef], collector: LineageCollector
 ) -> tuple[dict[str, Any], bool]:
@@ -776,24 +823,25 @@ def _build_internal_metrics(
     """
     if not upload_rows:
         return {}, False
-    total_rows = [
-        ref
-        for ref in upload_rows
-        if "合计" in (text(first(ref.row, PLATFORM_KEYS)) or "")
-    ]
-    source_rows = total_rows if total_rows else upload_rows
-    spend = _sum_number(source_rows, SPEND_KEYS)
-    impressions = _sum_number(source_rows, IMPRESSION_KEYS)
-    conversions = _sum_number(source_rows, CONVERSION_KEYS)
-    revenue = _sum_number(source_rows, REVENUE_KEYS)
+    source_rows = _internal_source_rows(upload_rows)
+    metric_rows = {
+        "spend": _rows_with_metric(source_rows, SPEND_KEYS),
+        "impressions": _rows_with_metric(source_rows, IMPRESSION_KEYS),
+        "conversions": _rows_with_metric(source_rows, CONVERSION_KEYS),
+        "revenue": _rows_with_metric(source_rows, REVENUE_KEYS),
+    }
+    spend = _sum_number(metric_rows["spend"], SPEND_KEYS)
+    impressions = _sum_number(metric_rows["impressions"], IMPRESSION_KEYS)
+    conversions = _sum_number(metric_rows["conversions"], CONVERSION_KEYS)
+    revenue = _sum_number(metric_rows["revenue"], REVENUE_KEYS)
     if spend is not None:
-        collector.add("/data/internal_metrics/spend", source_rows)
+        collector.add("/data/internal_metrics/spend", metric_rows["spend"])
     if impressions is not None:
-        collector.add("/data/internal_metrics/impressions", source_rows)
+        collector.add("/data/internal_metrics/impressions", metric_rows["impressions"])
     if conversions is not None:
-        collector.add("/data/internal_metrics/conversions", source_rows)
+        collector.add("/data/internal_metrics/conversions", metric_rows["conversions"])
     if revenue is not None:
-        collector.add("/data/internal_metrics/revenue", source_rows)
+        collector.add("/data/internal_metrics/revenue", metric_rows["revenue"])
     cpc = round(spend / conversions, 2) if spend is not None and conversions else None
     cpm = (
         round(spend / impressions * 1000, 2)
@@ -801,9 +849,9 @@ def _build_internal_metrics(
         else None
     )
     if cpc is not None:
-        collector.add("/data/internal_metrics/cpc", source_rows)
+        collector.add("/data/internal_metrics/cpc", [*metric_rows["spend"], *metric_rows["conversions"]])
     if cpm is not None:
-        collector.add("/data/internal_metrics/cpm", source_rows)
+        collector.add("/data/internal_metrics/cpm", [*metric_rows["spend"], *metric_rows["impressions"]])
     return {
         "spend": spend,
         "impressions": impressions,
@@ -997,9 +1045,19 @@ def build_campaign_report_draft(
     internal_metrics = internal_metrics or None
     roi = _build_roi(scope_model.model_dump(), internal_metrics or {})
     if roi is not None:
-        for field in ("spend", "revenue", "conversions", "roi", "roas"):
+        source_rows = _internal_source_rows(upload_rows)
+        spend_rows = _rows_with_metric(source_rows, SPEND_KEYS)
+        revenue_rows = _rows_with_metric(source_rows, REVENUE_KEYS)
+        conversion_rows = _rows_with_metric(source_rows, CONVERSION_KEYS)
+        for field, sources in (
+            ("spend", spend_rows),
+            ("revenue", revenue_rows),
+            ("conversions", conversion_rows),
+            ("roi", [*spend_rows, *revenue_rows]),
+            ("roas", [*spend_rows, *revenue_rows]),
+        ):
             if roi[field] is not None:
-                collector.add(f"/data/roi/{field}", upload_rows)
+                collector.add(f"/data/roi/{field}", sources)
 
     force_partial: set[str] = set()
     extra_limitations: dict[str, list[dict[str, Any]]] = {}
