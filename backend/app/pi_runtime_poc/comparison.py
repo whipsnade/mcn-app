@@ -258,7 +258,6 @@ class PiRuntimeCaseExecutor:
         result = await _collect_case_result(
             self._session_factory, case, run_id, outcome, self._output_root
         )
-        write_case_result(self._output_root, result)
         return result
 
 
@@ -389,6 +388,56 @@ def write_case_result(round_dir: Path, result: PocCaseResult) -> Path:
     if not round_dir.is_dir() or path.exists():
         raise FileExistsError(path)
     _write_safe_json(path, asdict(result))
+    return path
+
+
+def make_non_executed_result(
+    round_dir: Path,
+    case: PocCase,
+    *,
+    status: Literal["failed", "skipped_dependency", "not_run"],
+    error_code: str,
+) -> PocCaseResult:
+    """构造不泄漏异常详情的稳定未执行案例结果。"""
+    return PocCaseResult(
+        case_id=case.case_id,
+        runtime="pi",
+        run_id=None,
+        status=status,
+        error_code=error_code,
+        outcome=None,
+        artifact_versions=(),
+        evidence_ids=(),
+        metrics={
+            "datatap_tool_calls": 0,
+            "points_reserved": 0,
+            "points_settled": 0,
+            "wallet_rows": 0,
+            "wallet_transactions": 0,
+            "hanging_tool_calls": 0,
+        },
+        diagnostic_path=str(round_dir / case.case_id / "pi.json"),
+        hard_checks={},
+    )
+
+
+def write_execution_manifest(
+    round_dir: Path,
+    cases: tuple[PocCase, ...],
+    results: tuple[PocCaseResult, ...],
+) -> Path:
+    """一次性写入完整 Pi-only 执行事实；拒绝缺案例或重复写。"""
+    expected = [case.case_id for case in cases]
+    actual = [result.case_id for result in results]
+    if actual != expected or len(results) != 6 or any(result.runtime != "pi" for result in results):
+        raise ValueError("poc_execution_requires_exact_cases")
+    path = round_dir / "execution.json"
+    if not round_dir.is_dir() or path.exists():
+        raise FileExistsError(path)
+    _write_safe_json(
+        path,
+        {"round_id": round_dir.name, "runtime": "pi", "results": [asdict(result) for result in results]},
+    )
     return path
 
 
@@ -596,7 +645,9 @@ __all__ = [
     "begin_round",
     "build_real_pi_client_factory",
     "load_cases",
+    "make_non_executed_result",
     "write_append_only_round",
     "write_case_result",
+    "write_execution_manifest",
     "write_round_summary",
 ]

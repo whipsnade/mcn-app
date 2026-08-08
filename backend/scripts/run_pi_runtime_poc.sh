@@ -38,6 +38,13 @@ export PI_RUNTIME_POC_ENABLED=true
 export PI_RUNTIME_POC_INTERNAL_SECRET="${PI_RUNTIME_POC_INTERNAL_SECRET:-$(openssl rand -hex 32)}"
 export RUN_REAL_SERVICES=1
 
+DIAGNOSTIC_DIR="${ROOT_DIR}/outputs/pi-runtime-poc/diagnostics"
+mkdir -p "${DIAGNOSTIC_DIR}"
+chmod 700 "${DIAGNOSTIC_DIR}"
+export PI_RUNTIME_POC_DIAGNOSTIC_LOG="${DIAGNOSTIC_DIR}/server-$$.log"
+touch "${PI_RUNTIME_POC_DIAGNOSTIC_LOG}"
+chmod 600 "${PI_RUNTIME_POC_DIAGNOSTIC_LOG}"
+
 [[ "${APP_ENV}" == "test" ]] || exit 2
 [[ "${MYSQL_DATABASE}" == "kol_insight_pi_poc" ]] || exit 2
 [[ "${PI_RUNTIME_POC_ENABLED}" == "true" ]] || exit 2
@@ -55,15 +62,23 @@ if curl -fsS --max-time 1 http://127.0.0.1:8000/healthz >/dev/null 2>&1; then
 fi
 # 只能启动 Pi POC 内部回调服务，禁止启动主应用的后台 Current Runtime 领取循环。
 "${BACKEND_DIR}/.venv/bin/uvicorn" app.pi_runtime_poc.server:app --host 127.0.0.1 --port 8000 \
-  --timeout-graceful-shutdown 5 >/dev/null 2>&1 &
+  --timeout-graceful-shutdown 5 --no-access-log --log-level critical \
+  >/dev/null 2>/dev/null &
 SERVER_PID=$!
-cleanup() { kill "${SERVER_PID}" >/dev/null 2>&1 || true; }
+cleanup() {
+  kill "${SERVER_PID}" >/dev/null 2>&1 || true
+  printf 'pi-poc diagnostic log: %s\n' "${PI_RUNTIME_POC_DIAGNOSTIC_LOG}" >&2
+}
 trap cleanup EXIT
-for _ in $(seq 1 30); do
+# 中央模型注册会让冷启动超过旧的 30 秒窗口；未 ready 前不得创建真实 round。
+for _ in $(seq 1 60); do
   if curl -fsS --max-time 1 http://127.0.0.1:8000/healthz >/dev/null 2>&1; then
     break
   fi
   sleep 1
 done
 curl -fsS --max-time 1 http://127.0.0.1:8000/healthz >/dev/null
+if [[ "$#" -eq 0 ]]; then
+  set -- --case all --runtime pi
+fi
 "${BACKEND_DIR}/.venv/bin/python" scripts/run_pi_runtime_poc.py "$@"

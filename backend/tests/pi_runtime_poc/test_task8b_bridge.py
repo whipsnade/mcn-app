@@ -12,7 +12,6 @@ from typing import cast
 import pytest
 from pydantic import SecretStr
 
-from app import main as app_main
 from app.agent_runtime.models import AgentRun
 from app.core.config import Settings
 from app.pi_runtime_poc import comparison
@@ -93,15 +92,10 @@ async def test_local_preflight_failure_does_not_create_round_directory(
     case = comparison.PocCase("brand-research-v1", "q", "2026-08-07", "report", "brand_report_v3")
     begin_calls: list[tuple[Path, str]] = []
 
-    async def refresh_catalog() -> None:
-        return None
-
-    monkeypatch.setattr(runner, "parse_args", lambda: argparse.Namespace(case="all", runtime="both"))
+    monkeypatch.setattr(runner, "parse_args", lambda: argparse.Namespace(case="all", runtime="pi"))
     monkeypatch.setattr(runner, "get_settings", lambda: settings)
     monkeypatch.setattr(runner.PiPocSettingsGuard, "assert_safe", lambda _settings: None)
     monkeypatch.setattr(runner, "load_cases", lambda _path: (case,))
-    monkeypatch.setattr(runner, "refresh_approved_datatap_tools", refresh_catalog)
-    monkeypatch.setattr(app_main, "create_agent_runtime", lambda: (object(), None, None, None, None))
     monkeypatch.setattr(
         runner,
         "build_real_pi_client_factory",
@@ -117,3 +111,13 @@ async def test_local_preflight_failure_does_not_create_round_directory(
         await runner.main()
 
     assert begin_calls == []
+
+
+def test_task9_runner_has_no_current_runtime_import_or_call() -> None:
+    script = (Path(__file__).parents[2] / "scripts" / "run_pi_runtime_poc.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "CurrentRuntimeCaseExecutor" not in script
+    assert "create_agent_runtime" not in script
+    assert "refresh_approved_datatap_tools" not in script
