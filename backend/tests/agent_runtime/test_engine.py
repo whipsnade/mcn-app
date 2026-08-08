@@ -55,8 +55,8 @@ from app.agent_runtime.state import InvalidRunTransition, RunStatus
 from app.agent_runtime.thinking import AgentEventThinkingSink
 from app.agent_runtime.tools.artifacts import AbandonDraftTool, UpdateDraftTool
 from app.agent_runtime.tools.builders import BuildInsightDraftTool
-from app.agent_runtime.tools.contracts import ToolResult
 from app.agent_runtime.tools.calculation import CalculateExpressionTool
+from app.agent_runtime.tools.contracts import ToolResult
 from app.agent_runtime.tools.mcp import AgentMcpTool
 from app.agent_runtime.tools.registry import McpCatalogEntry, ToolRegistry
 from app.billing.models import Wallet
@@ -69,7 +69,6 @@ from app.mcp_gateway.transport import RemoteToolResult
 from app.model.contracts import ChatMessage
 from app.model.prompt_logs import PromptLogEntry
 from app.model.tencent_plan import TencentPlanAdapter
-
 from tests.agent_artifacts.payload_fixtures import insight_metric_payload, insight_payload
 
 INPUT_SCHEMA = {
@@ -378,7 +377,10 @@ async def test_ask_user_ends_clarification_with_pending_memory(
     assert msg.metadata_json["options"] == ["瑞幸", "蜜雪冰城"]
 
     memory = await db_session.scalar(
-        select(MemoryEntry).where(MemoryEntry.memory_type == "pending_question")
+        select(MemoryEntry).where(
+            MemoryEntry.session_id == run.session_id,
+            MemoryEntry.memory_type == "pending_question",
+        )
     )
     assert memory is not None
     assert memory.source_run_id == run.id
@@ -1281,7 +1283,7 @@ async def test_publish_mixed_success_and_missing_draft_completes_with_warnings(
     因部分成功而错误标记 completed）。"""
     run, attempt, _, _ = await _setup_run(db_session, user_factory)
     _, draft_ok, _ = await _make_draft(db_session, run, brand="瑞幸")
-    engine, gateway = _make_engine(
+    engine, _gateway = _make_engine(
         db_session,
         actions=[
             PublishArtifacts(
@@ -1461,7 +1463,7 @@ async def test_ask_user_releases_owned_drafts_and_new_run_can_take_over(
 
     # 新 Run 同 key 可接管（不再 artifact_busy），Revision 在历史之上递增。
     run_b, _ = await _new_run(db_session, user_id=user.id, session_id=session.id)
-    artifact_b, draft_b, revision_b = await service.create_or_get_draft(
+    _artifact_b, draft_b, revision_b = await service.create_or_get_draft(
         session_id=session.id,
         user_id=user.id,
         run_id=run_b.id,
@@ -1577,6 +1579,7 @@ async def test_disallowed_action_fed_back_as_validation_error_and_recovers(
     assert (
         await db_session.scalar(
             select(func.count(MemoryEntry.id)).where(
+                MemoryEntry.session_id == run.session_id,
                 MemoryEntry.memory_type == "pending_question"
             )
         )
@@ -1933,7 +1936,7 @@ async def test_thinking_sink_for_internal_run_returns_none(
     db_session, user_factory
 ) -> None:
     """Reviewer/Utility 内部 Run 不注入 thinking sink（visibility != user）。"""
-    run, attempt, _, _ = await _setup_run(db_session, user_factory)
+    run, _attempt, _, _ = await _setup_run(db_session, user_factory)
     engine, _ = _make_engine(db_session, actions=[])
     assert engine.thinking_sink_for(run) is not None
     run.visibility = "internal"

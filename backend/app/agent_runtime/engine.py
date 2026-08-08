@@ -1300,10 +1300,17 @@ class AgentEngine:
         )
 
     async def _next_step_sequence(self, run_id: str) -> int:
+        run = await self._db.scalar(
+            select(AgentRun).where(AgentRun.id == run_id).with_for_update()
+        )
+        if run is None:
+            raise LookupError("run_not_found")
         current = await self._db.scalar(
-            select(func.max(AgentStep.sequence)).where(AgentStep.run_id == run_id)
+            select(func.max(AgentStep.sequence))
+            .where(AgentStep.run_id == run_id)
+            .with_for_update()
         )
         return (current or 0) + 1
 
 
-__all__ = ["AgentEngine", "MAX_INVALID_ACTIONS", "RunOutcome"]
+__all__ = ["MAX_INVALID_ACTIONS", "AgentEngine", "RunOutcome"]

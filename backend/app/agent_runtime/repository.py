@@ -6,8 +6,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_runtime.models import AgentRun, AgentRunAttempt
 from app.agent_runtime.state import (
-    InvalidRunTransition,
     TERMINAL_RUN_STATUSES,
+    InvalidRunTransition,
     RunStatus,
     ensure_transition,
 )
@@ -61,9 +61,9 @@ class AgentRunRepository:
         ensure_transition(current, RunStatus.RUNNING)
         now = utc_now()
         max_attempt = await self.db.scalar(
-            select(func.max(AgentRunAttempt.attempt)).where(
-                AgentRunAttempt.run_id == run_id
-            )
+            select(func.max(AgentRunAttempt.attempt))
+            .where(AgentRunAttempt.run_id == run_id)
+            .with_for_update()
         )
         attempt = AgentRunAttempt(
             id=str(uuid4()),

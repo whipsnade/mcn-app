@@ -206,24 +206,37 @@ class AgentEventStream:
             raise RunEventForbidden("run_not_found")
         if run.user_id != user_id:
             raise RunEventForbidden("run_not_owned")
+        event = await self.append_locked(run, event_type, payload)
+        await self.commit_and_publish(event)
+        return event
+
+    async def append_locked(
+        self, run: AgentRun, event_type: str, payload: dict[str, Any] | None
+    ) -> AgentEvent:
+        """在调用方已锁定 Run 行的事务中写入 Event，但不提交或广播。"""
         max_sequence = await self.db.scalar(
-            select(func.max(AgentEvent.sequence)).where(AgentEvent.run_id == run_id)
+            select(func.max(AgentEvent.sequence))
+            .where(AgentEvent.run_id == run.id)
+            .with_for_update()
         )
         event = AgentEvent(
             id=str(uuid4()),
-            run_id=run_id,
-            user_id=user_id,
+            run_id=run.id,
+            user_id=run.user_id,
             sequence=(max_sequence or 0) + 1,
             event_type=event_type,
             # 服务端 run_id 强制覆盖，payload 里的同名键不能伪造
-            payload_json={**(payload or {}), "run_id": run_id},
+            payload_json={**(payload or {}), "run_id": run.id},
             created_at=utc_now(),
         )
         self.db.add(event)
         await self.db.flush()
+        return event
+
+    async def commit_and_publish(self, event: AgentEvent) -> None:
+        """提交由 :meth:`append_locked` 写入的事件，并在提交后唤醒订阅者。"""
         await self.db.commit()
         await self.broker.publish(event)
-        return event
 
     async def append_terminal_once(
         self, run_id: str, user_id: str, event_type: str, payload: dict[str, Any] | None
