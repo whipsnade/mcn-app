@@ -183,6 +183,55 @@ def test_loader_permits_ordinary_token_and_endpoint_words(tmp_path: Path) -> Non
     assert CapabilityPackLoader(tmp_path).load_manifest("marketing-v1").root_policy == policy
 
 
+@pytest.mark.parametrize(
+    ("field", "credential"),
+    [
+        ("builder_versions", "sk-abcdefghijk"),
+        ("pack_version", "postgresql://user:password@db.example.invalid:5432/app"),
+        ("exporter_versions", "Bearer abcdefghijk"),
+        ("pack_version", "https://example.invalid/v1?token=abcdefgh"),
+    ],
+)
+def test_loader_rejects_credentials_in_manifest_values_without_echoing_content(
+    tmp_path: Path, field: str, credential: str
+) -> None:
+    pack = _write_pack(tmp_path)
+    manifest_path = pack / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if field in {"builder_versions", "exporter_versions"}:
+        manifest[field]["brand_report_v3"] = credential
+    else:
+        manifest[field] = credential
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(CapabilityPackError, match="manifest_sensitive_content") as error:
+        CapabilityPackLoader(tmp_path).load_manifest("marketing-v1")
+    assert credential not in str(error.value)
+
+
+def test_loader_permits_ordinary_token_and_endpoint_in_manifest_value(tmp_path: Path) -> None:
+    pack = _write_pack(tmp_path)
+    manifest_path = pack / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["builder_versions"]["brand_report_v3"] = "token 与 endpoint 是普通说明文字"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    assert CapabilityPackLoader(tmp_path).load_manifest("marketing-v1").builder_versions[
+        "brand_report_v3"
+    ] == "token 与 endpoint 是普通说明文字"
+
+
+def test_loader_rejects_unsupported_runtime_contract(tmp_path: Path) -> None:
+    pack = _write_pack(tmp_path)
+    manifest_path = pack / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["runtime_contract_version"] = "marketing_runtime_v0"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(CapabilityPackError, match="manifest_runtime_contract_unsupported"):
+        CapabilityPackLoader(tmp_path).load_manifest("marketing-v1")
+
+
 def test_loader_rejects_missing_duplicate_or_wrong_contracts(tmp_path: Path) -> None:
     pack = _write_pack(tmp_path)
     manifest_path = pack / "manifest.json"

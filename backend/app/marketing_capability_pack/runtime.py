@@ -8,7 +8,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
-from .loader import CapabilityPackLoader
+from .loader import MARKETING_RUNTIME_CONTRACT_VERSION, CapabilityPackLoader
 
 
 class MarketingSkillSnapshot(BaseModel):
@@ -47,6 +47,8 @@ class MarketingRunCapability(BaseModel):
 
     @model_validator(mode="after")
     def verify_root_policy(self) -> MarketingRunCapability:
+        if self.runtime_contract_version != MARKETING_RUNTIME_CONTRACT_VERSION:
+            raise ValueError("marketing_runtime_contract_unsupported")
         if _digest(self.root_policy) != self.root_policy_digest:
             raise ValueError("marketing_root_policy_digest_mismatch")
         if len({skill.name for skill in self.skills}) != len(self.skills):

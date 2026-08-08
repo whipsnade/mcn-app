@@ -27,6 +27,7 @@ _SENSITIVE_CONTENT_PATTERNS = (
 _EXPECTED_CONTRACT_TYPES = frozenset(
     {"brand_report_v3", "campaign_report_v3", "kol_selection_v3"}
 )
+MARKETING_RUNTIME_CONTRACT_VERSION = "marketing_runtime_v1"
 _MANIFEST_KEYS = {
     "pack_name",
     "pack_version",
@@ -54,6 +55,8 @@ class CapabilityPackLoader:
         self._validate_manifest_shape(payload)
         if payload["pack_name"] != "marketing":
             raise CapabilityPackError("pack_name_invalid")
+        if payload["runtime_contract_version"] != MARKETING_RUNTIME_CONTRACT_VERSION:
+            raise CapabilityPackError("manifest_runtime_contract_unsupported")
         root_policy = payload["root_policy"]
         if not isinstance(root_policy, dict):
             raise CapabilityPackError("manifest_root_policy_invalid")
@@ -135,6 +138,8 @@ class CapabilityPackLoader:
     def _validate_manifest_shape(payload: dict[str, Any]) -> None:
         if _contains_sensitive_key(payload):
             raise CapabilityPackError("manifest_sensitive_field")
+        if _contains_sensitive_value(payload):
+            raise CapabilityPackError("manifest_sensitive_content")
         if set(payload) != _MANIFEST_KEYS:
             raise CapabilityPackError("manifest_fields_invalid")
         for key in ("skills", "artifact_contracts"):
@@ -226,4 +231,14 @@ def _contains_sensitive_key(value: Any) -> bool:
         )
     if isinstance(value, list):
         return any(_contains_sensitive_key(item) for item in value)
+    return False
+
+
+def _contains_sensitive_value(value: Any) -> bool:
+    if isinstance(value, str):
+        return any(pattern.search(value) for pattern in _SENSITIVE_CONTENT_PATTERNS)
+    if isinstance(value, dict):
+        return any(_contains_sensitive_value(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_sensitive_value(item) for item in value)
     return False

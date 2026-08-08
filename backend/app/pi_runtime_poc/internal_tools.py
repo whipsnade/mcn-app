@@ -179,6 +179,7 @@ class LoadMarketingSkillTool:
                 AgentRun.user_id == context.user_id,
                 AgentRun.session_id == context.session_id,
             )
+            .execution_options(populate_existing=True)
             .with_for_update()
         )
         if run is None:

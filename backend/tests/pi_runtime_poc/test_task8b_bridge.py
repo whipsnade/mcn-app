@@ -112,6 +112,30 @@ def test_settings_mapping_is_forwarded_to_pi_adapter_as_explicit_urls(monkeypatc
     assert captured[0].append_system_prompt is not None
 
 
+def test_pi_factory_rejects_tampered_capability_snapshot_without_echoing_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(monkeypatch)
+    factory = comparison.build_real_pi_client_factory(settings)
+    snapshot = build_marketing_run_capability(model_version=settings.tencent_plan_model).model_dump(
+        mode="json"
+    )
+    snapshot["runtime_contract_version"] = "marketing_runtime_v0-sk-abcdefghijk"
+
+    with pytest.raises(ValueError, match="pi_marketing_capability_snapshot_invalid") as error:
+        factory(
+            cast(
+                AgentRun,
+                SimpleNamespace(
+                    id="run-tampered",
+                    prompt_snapshot_json={"marketing_capability_pack": snapshot},
+                ),
+            ),
+            "test-run-token",
+        )
+    assert "sk-abcdefghijk" not in str(error.value)
+
+
 def test_task9_shell_preflight_checks_adapter_urls_after_legacy_mapping_is_cleared() -> None:
     script = (Path(__file__).parents[2] / "scripts" / "run_pi_runtime_poc.sh").read_text(
         encoding="utf-8"

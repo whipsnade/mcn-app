@@ -63,3 +63,11 @@ def test_snapshot_rejects_cross_run_or_tampered_skill_digest() -> None:
 
     with pytest.raises(ValueError, match="marketing_skill_digest_mismatch"):
         MarketingRunCapability.model_validate(tampered)
+
+
+def test_snapshot_rejects_unsupported_runtime_contract() -> None:
+    tampered = build_marketing_run_capability().model_dump()
+    tampered["runtime_contract_version"] = "marketing_runtime_v0"
+
+    with pytest.raises(ValueError, match="marketing_runtime_contract_unsupported"):
+        MarketingRunCapability.model_validate(tampered)
