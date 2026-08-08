@@ -33,6 +33,7 @@ from tests.agent_artifacts.test_payloads import (
     build_kol_analysis_dict,
     build_kol_detail_dict,
     build_kol_selection_dict,
+    refresh_fixture_canonical,
 )
 from app.agent_artifacts.builders.kol_analysis import build_kol_analysis_draft
 from app.agent_artifacts.builders.kol_detail import build_kol_detail_draft
@@ -220,6 +221,7 @@ def test_brand_daily_trend_null_allowed_with_partial_and_section_limitation() ->
     d = build_brand_dict()
     d["data"]["daily_trend"][0]["volume"] = None
     _restrict(d, "daily_trend", "daily_trend")  # 章节级 limitation 覆盖数组内 null
+    refresh_fixture_canonical(d, module="brand")
     inst = BrandReportV3.model_validate(d)
     assert inst.data.daily_trend[0].volume is None  # null 不得被当 0
 
@@ -228,6 +230,7 @@ def test_brand_daily_trend_null_allowed_with_exact_path_limitation() -> None:
     d = build_brand_dict()
     d["data"]["daily_trend"][0]["engagement"] = None
     _restrict(d, "daily_trend", "daily_trend.0.engagement")
+    refresh_fixture_canonical(d, module="brand")
     inst = BrandReportV3.model_validate(d)
     assert inst.data.daily_trend[0].engagement is None
 
@@ -297,6 +300,7 @@ def test_sentiment_null_rejected_when_section_complete(build, model) -> None:
 def test_sentiment_null_allowed_with_partial_and_limitation(build, model) -> None:
     d = _null_sentiment(build())
     _restrict(d, "sentiment", "sentiment")
+    refresh_fixture_canonical(d, module=d["module"])
     inst = model.model_validate(d)
     assert inst.data.sentiment.summary.positive.count is None
     assert inst.data.sentiment.summary.positive.share is None
@@ -317,6 +321,7 @@ def test_sentiment_by_platform_null_also_governed() -> None:
     with pytest.raises(ValidationError):
         BrandReportV3.model_validate(d)
     _restrict(d, "sentiment", "sentiment")
+    refresh_fixture_canonical(d, module="brand")
     inst = BrandReportV3.model_validate(d)
     assert inst.data.sentiment.by_platform[0].negative.count is None
 
@@ -329,6 +334,7 @@ def test_sentiment_real_zero_requires_lineage_pointer() -> None:
     null 叶子不产生 lineage 指针（由 partial + limitation 治理），两者不冲突。"""
     zeroed = build_brand_dict()
     zeroed["data"]["sentiment"]["summary"]["negative"] = {"count": 0, "share": 0.0}
+    refresh_fixture_canonical(zeroed, module="brand")
     payload = BrandReportV3.model_validate(zeroed).model_dump(mode="json")
     pointers = required_numeric_pointers(payload)
     assert "/data/sentiment/summary/negative/count" in pointers
@@ -336,6 +342,7 @@ def test_sentiment_real_zero_requires_lineage_pointer() -> None:
 
     nulled = _null_sentiment(build_brand_dict())
     _restrict(nulled, "sentiment", "sentiment")
+    refresh_fixture_canonical(nulled, module="brand")
     payload = BrandReportV3.model_validate(nulled).model_dump(mode="json")
     pointers = required_numeric_pointers(payload)
     assert "/data/sentiment/summary/positive/count" not in pointers

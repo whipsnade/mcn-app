@@ -60,6 +60,7 @@ from app.agent_artifacts.builders.raw_rows import (
     parse_date,
     platform_coverage_incomplete,
     platform_sort_key,
+    reject_exclusive_group_evidence_reuse,
     sentiment_score,
     text,
     whole,
@@ -68,7 +69,7 @@ from app.agent_artifacts.builders.sections import (
     build_sentiment_section,
     build_top_posts,
 )
-from app.agent_artifacts.canonical import publish_canonical
+from app.agent_artifacts.canonical import publish_canonical, walk_data_leaves
 from app.agent_artifacts.lineage import required_numeric_pointers
 from app.agent_artifacts.payloads.campaign import (
     CampaignData,
@@ -171,7 +172,7 @@ def _group_posts(rows: list[RowRef]) -> list[RowRef]:
 
 
 def _dedup_rows(rows: list[RowRef]) -> list[RowRef]:
-    """按 (evidence_id, source_path) 去重保序。
+    """按 (evidence_id, row_identity) 去重保序。
 
     同一 Evidence 行被 posts/social/current 等多个分组引用时只参与一次聚合，
     attribution/organic/audience/comparison 绝不重复计算（Gate C 复审）。
@@ -179,7 +180,7 @@ def _dedup_rows(rows: list[RowRef]) -> list[RowRef]:
     seen: set[tuple[str, str]] = set()
     unique: list[RowRef] = []
     for ref in rows:
-        key = (ref.evidence_id, ref.source_path)
+        key = (ref.evidence_id, ref.row_identity)
         if key in seen:
             continue
         seen.add(key)
@@ -297,6 +298,8 @@ def _build_timeline(
         )
         index = len(items)
         base = f"/data/timeline/{index}"
+        collector.add(f"{base}/date", bucket)
+        collector.add(f"{base}/platform", bucket)
         collector.add(f"{base}/volume", bucket)
         collector.add(f"{base}/posts", bucket)
         if engagement is not None:
@@ -454,7 +457,7 @@ def _assemble_availability(
             )
         )
         section_limitations = list(extra.get(section) or ())
-        if not has_rows.get(section, False):
+        if not has_rows.get(section, False) and section not in force_partial:
             status = "unavailable"
             reason_codes = ["no_evidence"]
             section_limitations.append(
@@ -881,6 +884,12 @@ def build_campaign_report_draft(
         scope_model = CampaignScope.model_validate(scope)
     except ValidationError as exc:
         raise DraftBuildError(f"invalid campaign scope: {exc}") from exc
+    try:
+        reject_exclusive_group_evidence_reuse(
+            evidence, (GROUP_CURRENT, GROUP_BASELINE, GROUP_POST)
+        )
+    except ValueError as exc:
+        raise DraftBuildError(str(exc)) from exc
 
     canonical = canonicalize_marketing_evidence(
         {group: evidence.get(group, []) for group in EVIDENCE_GROUPS}
@@ -907,6 +916,7 @@ def build_campaign_report_draft(
     # observed 规则（Gate C 第三轮）：DataTap 侧字段出现合计 0（观测值）vs
     # upload 非 0 是真实冲突；DataTap 字段完全没出现（未观测）不参与比较。
     social_conflicts: list[dict[str, Any]] = []
+    conflict_partial_paths: set[str] = set()
     upload_volume = _sum_number(upload_rows, VOLUME_KEYS)
     upload_engagement = _sum_number(upload_rows, ENGAGEMENT_KEYS)
     datatap_volume = _sum_number(social_rows, VOLUME_KEYS)
@@ -922,6 +932,7 @@ def build_campaign_report_draft(
                 "affected_paths": ["overview.total_volume", "internal_metrics.spend"],
             }
         )
+        conflict_partial_paths.add("/data/overview/total_volume")
     if upload_engagement is not None and datatap_engagement is not None and upload_engagement != datatap_engagement:
         social_conflicts.append(
             {
@@ -933,6 +944,7 @@ def build_campaign_report_draft(
                 "affected_paths": ["overview.total_engagement", "internal_metrics.spend"],
             }
         )
+        conflict_partial_paths.add("/data/overview/total_engagement")
 
     # ---- sentiment：明细分组优先，缺失时回退 posts 行情感字段（每帖计 1） ----
     sentiment_source = groups[GROUP_SENTIMENT]
@@ -1000,6 +1012,15 @@ def build_campaign_report_draft(
                 "affected_paths": ["top_posts"],
             }
         )
+    if posts_meta["missing_platform"]:
+        force_partial.add("top_posts")
+        extra_limitations.setdefault("top_posts", []).append(
+            {
+                "code": "post_platform_missing",
+                "message": "部分热帖缺少平台，已跳过以避免伪造 all 平台",
+                "affected_paths": ["top_posts"],
+            }
+        )
     if posts_meta["missing_url"]:
         force_partial.add("top_posts")
         extra_limitations.setdefault("top_posts", []).append(
@@ -1009,6 +1030,19 @@ def build_campaign_report_draft(
                 "affected_paths": ["top_posts"],
             }
         )
+    for key, code, label in (
+        ("missing_title", "post_title_missing", "标题"),
+        ("missing_author", "post_author_missing", "作者"),
+    ):
+        if posts_meta[key]:
+            force_partial.add("top_posts")
+            extra_limitations.setdefault("top_posts", []).append(
+                {
+                    "code": code,
+                    "message": f"部分热帖缺少{label}，已保留为不可用字段",
+                    "affected_paths": ["top_posts"],
+                }
+            )
 
     data = {
         "overview": overview,
@@ -1029,6 +1063,7 @@ def build_campaign_report_draft(
         data_model = CampaignData.model_validate(data)
     except ValidationError as exc:
         raise DraftBuildError(f"invalid campaign data: {exc}") from exc
+    data = data_model.model_dump(mode="json")
 
     has_rows = {
         "overview": overview_has_rows,
@@ -1045,28 +1080,59 @@ def build_campaign_report_draft(
         "internal_metrics": internal_metrics_has_rows,
         "roi": roi is not None,
     }
-    # ---- 平台覆盖率（Task 3R）：scope 声明平台未被 posts Evidence 覆盖 → partial ----
+    # ---- 平台覆盖率：按章节实际 Evidence 判断，不把已观测原始值误标 partial ----
     partial_paths: set[str] = set()
-    coverage_partial = overview_has_rows and platform_coverage_incomplete(
-        scope_model.platforms, post_rows
-    )
-    if coverage_partial:
-        force_partial.add("overview")
-        partial_paths.update(
-            {
-                "/data/overview/total_volume",
-                "/data/overview/total_engagement",
-                "/data/overview/total_posts",
-                "/data/overview/total_creators",
-            }
-        )
-        extra_limitations.setdefault("overview", []).append(
+    def mark_coverage_partial(
+        section: str, rows: list[RowRef], *, paths: list[str] | None = None
+    ) -> bool:
+        if not has_rows.get(section, False) or not platform_coverage_incomplete(
+            scope_model.platforms, rows
+        ):
+            return False
+        force_partial.add(section)
+        partial_paths.update(paths or ())
+        extra_limitations.setdefault(section, []).append(
             {
                 "code": "platform_coverage_incomplete",
-                "message": "scope 声明的部分平台没有覆盖，聚合指标按可得平台披露",
-                "affected_paths": ["overview"],
+                "message": "scope 声明的部分平台没有覆盖，按可得平台数据受限披露",
+                "affected_paths": [section],
             }
         )
+        return True
+
+    mark_coverage_partial(
+        "overview",
+        post_rows,
+        paths=[
+            "/data/overview/total_volume",
+            "/data/overview/total_engagement",
+            "/data/overview/total_posts",
+            "/data/overview/total_creators",
+        ],
+    )
+    mark_coverage_partial(
+        "platform_contributions",
+        post_rows,
+        paths=[
+            path
+            for path, value in walk_data_leaves(data)
+            if path.startswith("/data/platform_contributions/")
+            and path.rsplit("/", 1)[-1] == "share"
+            and value is not None
+        ],
+    )
+    mark_coverage_partial(
+        "sentiment",
+        sentiment_source,
+        paths=[
+            path
+            for path, value in walk_data_leaves(data)
+            if path.startswith("/data/sentiment/summary/") and value is not None
+        ],
+    )
+    mark_coverage_partial("timeline", post_rows)
+    mark_coverage_partial("top_posts", post_rows)
+    partial_paths.update(conflict_partial_paths)
 
     data_status, availability, limitations = _assemble_availability(
         data_model,
@@ -1081,16 +1147,17 @@ def build_campaign_report_draft(
         if "social_metric_conflict" not in availability["overview"]["reason_codes"]:
             availability["overview"]["reason_codes"].append("social_metric_conflict")
         data_status = "restricted"
-    if coverage_partial:
-        availability["overview"]["status"] = "partial"
-        if "platform_coverage_incomplete" not in availability["overview"]["reason_codes"]:
-            availability["overview"]["reason_codes"].append("platform_coverage_incomplete")
-        data_status = "restricted"
+    for section, section_limitations in extra_limitations.items():
+        if any(item["code"] == "platform_coverage_incomplete" for item in section_limitations):
+            availability[section]["reason_codes"] = [
+                *availability[section]["reason_codes"],
+                "platform_coverage_incomplete",
+            ]
 
     refs = collector.build()
     try:
         canonical_fields, field_lineage = publish_canonical(
-            data, refs, partial_paths=frozenset(partial_paths)
+            data, refs, partial_paths=frozenset(partial_paths), module="campaign"
         )
     except ValidationError as exc:
         raise DraftBuildError(f"invalid campaign canonical publication: {exc}") from exc

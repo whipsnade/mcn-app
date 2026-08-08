@@ -14,7 +14,7 @@ from openpyxl import load_workbook
 
 from app.agent_artifacts.exporters import ArtifactExportUnsupported, export_artifact
 
-from tests.agent_artifacts.test_payloads import build_brand_dict
+from tests.agent_artifacts.test_payloads import build_brand_dict, refresh_fixture_canonical
 
 BRAND_SHEETS = (
     "综合概览",
@@ -33,6 +33,8 @@ class _Version:
 
     def __init__(self, schema_version: str, payload_json: dict | None) -> None:
         self.schema_version = schema_version
+        if isinstance(payload_json, dict) and "data" in payload_json:
+            refresh_fixture_canonical(payload_json, module="brand")
         self.payload_json = payload_json
         self.data_status = "complete" if payload_json else "draft"
 

@@ -153,9 +153,10 @@ def build_top_posts(
     limit: int = 20,
     path: str = "/data/top_posts",
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """热帖章节：返回 ``(items, meta)``；meta 携带 skipped/missing_url 供披露。"""
+    """热帖章节：返回 ``(items, meta)``；meta 记录跳过与缺失字段供披露。"""
     candidates: list[dict[str, Any]] = []
     skipped = 0
+    missing_platform = 0
     for ref in rows:
         row = ref.row
         if not has_any(row, POST_ID_KEYS + TITLE_KEYS + URL_KEYS):
@@ -165,8 +166,12 @@ def build_top_posts(
             continue  # 显式标注非品牌相关：剔除
         post_id = text(first(row, POST_ID_KEYS))
         published = parse_datetime(first(row, POST_DATE_KEYS))
+        platform = text(first(row, PLATFORM_KEYS))
         if post_id is None or published is None:
             skipped += 1
+            continue
+        if platform is None:
+            missing_platform += 1
             continue
         likes = whole(first(row, LIKE_KEYS))
         comments = whole(first(row, COMMENT_KEYS))
@@ -177,7 +182,7 @@ def build_top_posts(
             engagement = sum(parts) if parts else None
         candidates.append(
             {
-                "platform": canon_platform(first(row, PLATFORM_KEYS)),
+                "platform": canon_platform(platform),
                 "post_id": post_id,
                 "title": text(first(row, TITLE_KEYS)),
                 "url": valid_url(first(row, URL_KEYS)),
@@ -212,11 +217,17 @@ def build_top_posts(
     items = items[:limit]
 
     missing_url = 0
+    missing_title = 0
+    missing_author = 0
     output: list[dict[str, Any]] = []
     for index, item in enumerate(items):
         ref = item.pop("_ref")
         if item["url"] is None:
             missing_url += 1
+        if item["title"] is None:
+            missing_title += 1
+        if item["author"] is None:
+            missing_author += 1
         # 全部叶子字段（含文本）都登记贡献行，canonical 发布时才能拿到证据。
         for field_name in ("platform", "post_id", "title", "url", "author", "published_at"):
             if item[field_name] is not None:
@@ -226,7 +237,13 @@ def build_top_posts(
                 collector.add(f"{path}/{index}/{field_name}", [ref])
         output.append(item)
 
-    return output, {"skipped": skipped, "missing_url": missing_url}
+    return output, {
+        "skipped": skipped,
+        "missing_platform": missing_platform,
+        "missing_url": missing_url,
+        "missing_title": missing_title,
+        "missing_author": missing_author,
+    }
 
 
 __all__ = ["build_sentiment_section", "build_top_posts"]

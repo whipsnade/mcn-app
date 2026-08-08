@@ -35,11 +35,17 @@ class RowRef(NamedTuple):
     source_path: str
     row: dict[str, Any]
     base_path: str | None = None
+    logical_path: str | None = None
 
     @property
     def field_base(self) -> str:
         """拼字段级 source_path 的基准指针（见 ``join_source_path``）。"""
         return self.source_path if self.base_path is None else self.base_path
+
+    @property
+    def row_identity(self) -> str:
+        """内部行 identity；wrapped ``result`` 保持可审计路径但不压扁多行。"""
+        return self.source_path if self.logical_path is None else self.logical_path
 
 
 # ---------------------------------------------------------------------------
@@ -163,10 +169,23 @@ def extract_rows(evidence_id: str, raw_payload: Any) -> list[RowRef]:
         parts = [token for token in (base, *tokens) if token]
         return "/" + "/".join(_escape(token) for token in parts)
 
+    def _logical_path(*tokens: str) -> str:
+        if base != "/result":
+            return _path(*tokens)
+        suffix = "/".join(_escape(token) for token in tokens)
+        return f"/result/{suffix}" if suffix else "/result"
+
     if isinstance(parsed, list):
         for index, item in enumerate(parsed):
             if isinstance(item, dict):
-                rows.append(RowRef(evidence_id, _path(str(index)), item))
+                rows.append(
+                    RowRef(
+                        evidence_id,
+                        _path(str(index)),
+                        item,
+                        logical_path=_logical_path(str(index)),
+                    )
+                )
         return rows
     if isinstance(parsed, dict):
         if not parsed:
@@ -176,7 +195,14 @@ def extract_rows(evidence_id: str, raw_payload: Any) -> list[RowRef]:
             if isinstance(value, list) and any(isinstance(item, dict) for item in value):
                 for index, item in enumerate(value):
                     if isinstance(item, dict):
-                        rows.append(RowRef(evidence_id, _path(key, str(index)), item))
+                        rows.append(
+                            RowRef(
+                                evidence_id,
+                                _path(key, str(index)),
+                                item,
+                                logical_path=_logical_path(key, str(index)),
+                            )
+                        )
                 return rows
         # 已知容器键未命中：扫描首个「dict 列表」值兜底——真实 MCP 结果常用
         # 中文容器键（如 kol_xiaohongshu_search 的「KOL 列表」），整包不能
@@ -185,7 +211,14 @@ def extract_rows(evidence_id: str, raw_payload: Any) -> list[RowRef]:
             if isinstance(value, list) and any(isinstance(item, dict) for item in value):
                 for index, item in enumerate(value):
                     if isinstance(item, dict):
-                        rows.append(RowRef(evidence_id, _path(key, str(index)), item))
+                        rows.append(
+                            RowRef(
+                                evidence_id,
+                                _path(key, str(index)),
+                                item,
+                                logical_path=_logical_path(key, str(index)),
+                            )
+                        )
                 return rows
         # 单行 dict（如一次 overview 查询的聚合结果）：根指针 "" 非合法
         # source_path（min_length=1），退而指向首个键，仍可解析可审计；
@@ -325,6 +358,18 @@ def platform_coverage_incomplete(
     return not set(scope_platforms).issubset(covered)
 
 
+def reject_exclusive_group_evidence_reuse(
+    evidence: Mapping[str, list[tuple[str, Any]]], exclusive_groups: tuple[str, ...]
+) -> None:
+    """互斥期别不能复用同一 Evidence ID，避免由同源数据伪造 period delta。"""
+    owners: dict[str, str] = {}
+    for group in exclusive_groups:
+        for evidence_id, _raw_payload in evidence.get(group, []):
+            owner = owners.setdefault(evidence_id, group)
+            if owner != group:
+                raise ValueError("evidence_period_reuse")
+
+
 def valid_url(value: Any) -> str | None:
     """仅接受 http(s) 绝对 URL；其余一律 None（缺失披露，不伪造链接）。"""
     rendered = text(value)
@@ -457,7 +502,7 @@ def canonicalize_marketing_evidence(
     """从原始 Evidence shape 提取内部规范化行，给 Builder 提供标准化 rows。
 
     Builder 此后只读取返回的 rows；原始 payload 只在本函数内解包和字段别名匹配。
-    同一 ``(evidence_id, source_path)`` 在 group 内重复（或跨 group 重复）只保留
+    同一 ``(evidence_id, row_identity)`` 在 group 内重复（或跨 group 重复）只保留
     一行，防双计；对外 canonical 字段由 ``canonical.publish_canonical`` 从最终
     data 生成，本层不产出 canonical path。
     """
@@ -467,9 +512,9 @@ def canonicalize_marketing_evidence(
         seen_sources: set[tuple[str, str]] = set()
         for evidence_id, raw_payload in pairs:
             for ref in extract_rows(evidence_id, raw_payload):
-                key = (ref.evidence_id, ref.source_path)
+                key = (ref.evidence_id, ref.row_identity)
                 if key in seen_sources:
-                    continue  # (evidence_id, source_path) 行级去重
+                    continue  # (evidence_id, row_identity) 行级去重
                 normalized: dict[str, Any] = {}
                 for canonical_name, aliases, _unit in _CANONICAL_ROW_FIELDS:
                     source_key = next(
@@ -482,7 +527,13 @@ def canonicalize_marketing_evidence(
                 if normalized:
                     seen_sources.add(key)
                     normalized_rows.append(
-                        RowRef(ref.evidence_id, ref.source_path, normalized, ref.base_path)
+                        RowRef(
+                            ref.evidence_id,
+                            ref.source_path,
+                            normalized,
+                            ref.base_path,
+                            ref.logical_path,
+                        )
                     )
         rows_by_group[group] = tuple(normalized_rows)
     return CanonicalEvidence(rows_by_group=rows_by_group)
@@ -532,6 +583,7 @@ __all__ = [
     "platform_coverage_incomplete",
     "platform_sort_key",
     "polarity",
+    "reject_exclusive_group_evidence_reuse",
     "sentiment_score",
     "text",
     "unwrap_payload",

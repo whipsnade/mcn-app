@@ -16,8 +16,17 @@ Every payload is a frozen Pydantic contract with `extra="forbid"`:
 from __future__ import annotations
 
 import types
+from collections.abc import Iterator, Sequence
 from datetime import date, datetime
-from typing import Annotated, Any, ClassVar, Iterator, Literal, Sequence, Union, get_args, get_origin
+from typing import (
+    Annotated,
+    Any,
+    ClassVar,
+    Literal,
+    Union,
+    get_args,
+    get_origin,
+)
 from urllib.parse import urlsplit
 
 from pydantic import AfterValidator, BaseModel, ConfigDict, model_validator

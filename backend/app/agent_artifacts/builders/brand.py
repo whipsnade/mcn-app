@@ -63,6 +63,7 @@ from app.agent_artifacts.builders.raw_rows import (
     parse_date,
     platform_coverage_incomplete,
     platform_sort_key,
+    reject_exclusive_group_evidence_reuse,
     sentiment_score,
     text,
 )
@@ -70,7 +71,7 @@ from app.agent_artifacts.builders.sections import (
     build_sentiment_section,
     build_top_posts,
 )
-from app.agent_artifacts.canonical import publish_canonical
+from app.agent_artifacts.canonical import publish_canonical, walk_data_leaves
 from app.agent_artifacts.lineage import required_numeric_pointers
 from app.agent_artifacts.payloads.brand import BrandData, BrandReportV3, BrandScope
 from app.agent_artifacts.payloads.common import iter_null_numeric_paths
@@ -162,8 +163,8 @@ def _overview_platforms(
 ) -> tuple[dict[str, dict[str, Any]], list[RowRef]]:
     """按平台合并 overview 行；返回 (平台槽位, 参与行)。
 
-    槽位：``{volume, engagement, posts, rows}``，同平台多行数值累加，缺失保持
-    None。合计行在存在具名平台行时跳过；只有聚合行时归入 ``all``。
+    槽位为每个指标分别保留参与行，避免总指标把无关 Evidence 纳入 lineage。
+    合计行在存在具名平台行时跳过；只有聚合行时归入 ``all``。
     """
     named: list[RowRef] = []
     aggregate: list[RowRef] = []
@@ -178,7 +179,16 @@ def _overview_platforms(
     for ref in chosen:
         platform = canon_platform(first(ref.row, PLATFORM_KEYS))
         slot = slots.setdefault(
-            platform, {"volume": None, "engagement": None, "posts": None, "rows": []}
+            platform,
+            {
+                "volume": None,
+                "engagement": None,
+                "posts": None,
+                "rows": [],
+                "volume_rows": [],
+                "engagement_rows": [],
+                "posts_rows": [],
+            },
         )
         slot["rows"].append(ref)
         for field_name, keys in (
@@ -189,6 +199,7 @@ def _overview_platforms(
             value = num(first(ref.row, keys))
             if value is not None:
                 slot[field_name] = (slot[field_name] or 0.0) + value
+                slot[f"{field_name}_rows"].append(ref)
     return slots, chosen
 
 
@@ -198,6 +209,11 @@ def _slot_totals(slots: dict[str, dict[str, Any]]) -> dict[str, Any]:
         values = [slot[field_name] for slot in slots.values() if slot[field_name] is not None]
         totals[field_name] = _as_int(sum(values)) if values else None
     return totals
+
+
+def _metric_rows(slots: dict[str, dict[str, Any]], metric: str) -> list[RowRef]:
+    """按指标保序收集真实参与聚合的 Evidence 行。"""
+    return [ref for slot in slots.values() for ref in slot[f"{metric}_rows"]]
 
 
 def _overview_split(rows: list[RowRef]) -> tuple[dict[str, Any], list[RowRef]]:
@@ -224,7 +240,8 @@ def _build_overview(
     rows: list[RowRef],
     platform_scores: dict[str, float | None],
     overall_score: float | None,
-    score_rows: list[RowRef],
+    score_rows_by_platform: dict[str, list[RowRef]],
+    overall_score_rows: list[RowRef],
     collector: LineageCollector,
 ) -> tuple[dict[str, Any], bool]:
     slots, chosen = _overview_platforms(rows)
@@ -244,13 +261,27 @@ def _build_overview(
         for field_name in ("volume", "engagement", "posts"):
             value = _as_int(slot[field_name])
             if value is not None:
-                collector.add(f"/data/overview/platforms/{index}/{field_name}", slot["rows"])
+                collector.add(
+                    f"/data/overview/platforms/{index}/{field_name}",
+                    slot[f"{field_name}_rows"],
+                )
+        platform_rows = [
+            ref
+            for field_name in ("volume", "engagement", "posts")
+            for ref in slot[f"{field_name}_rows"]
+        ]
+        if platform_rows:
+            collector.add(f"/data/overview/platforms/{index}/platform", platform_rows)
         if share is not None:
-            collector.add(f"/data/overview/platforms/{index}/share_of_voice", chosen)
+            collector.add(
+                f"/data/overview/platforms/{index}/share_of_voice",
+                _metric_rows(slots, "volume"),
+            )
         platform_score = platform_scores.get(platform)
         if platform_score is not None:
             collector.add(
-                f"/data/overview/platforms/{index}/sentiment_score", score_rows
+                f"/data/overview/platforms/{index}/sentiment_score",
+                score_rows_by_platform.get(platform, []),
             )
         platforms.append(
             {
@@ -269,9 +300,9 @@ def _build_overview(
         ("total_posts", "posts"),
     ):
         if totals[key] is not None:
-            collector.add(f"/data/overview/{field_name}", chosen)
+            collector.add(f"/data/overview/{field_name}", _metric_rows(slots, key))
     if overall_score is not None:
-        collector.add("/data/overview/sentiment_score", score_rows)
+        collector.add("/data/overview/sentiment_score", overall_score_rows)
 
     overview = {
         "total_volume": totals["volume"],
@@ -295,7 +326,7 @@ def _build_comparison(
     baseline_window: tuple[date, date] | None,
     timezone: str,
     current_totals: dict[str, Any],
-    current_rows: list[RowRef],
+    current_slots: dict[str, dict[str, Any]],
     baseline_rows: list[RowRef],
     collector: LineageCollector,
 ) -> dict[str, Any]:
@@ -321,6 +352,8 @@ def _build_comparison(
     ):
         current = current_totals[key]
         baseline = baseline_totals[key]
+        current_rows = _metric_rows(current_slots, key)
+        baseline_metric_rows = _metric_rows(baseline_slots, key)
         delta = None
         rate = None
         if current is not None and baseline is not None:
@@ -330,11 +363,11 @@ def _build_comparison(
         if current is not None:
             collector.add(f"{base}/current", current_rows)
         if baseline is not None:
-            collector.add(f"{base}/baseline", baseline_chosen)
+            collector.add(f"{base}/baseline", baseline_metric_rows)
         if delta is not None:
-            collector.add(f"{base}/delta", [*current_rows, *baseline_chosen])
+            collector.add(f"{base}/delta", [*current_rows, *baseline_metric_rows])
         if rate is not None:
-            collector.add(f"{base}/rate", [*current_rows, *baseline_chosen])
+            collector.add(f"{base}/rate", [*current_rows, *baseline_metric_rows])
         metrics.append(
             {
                 "metric": metric,
@@ -380,10 +413,15 @@ def _build_daily_trend(
                 "positive": None,
                 "neutral": None,
                 "negative": None,
-                "rows": [],
+                "identity_rows": [],
+                "volume_rows": [],
+                "engagement_rows": [],
+                "positive_rows": [],
+                "neutral_rows": [],
+                "negative_rows": [],
             },
         )
-        used = False
+        slot["identity_rows"].append(ref)
         for field_name, keys in (
             ("volume", VOLUME_KEYS),
             ("engagement", ENGAGEMENT_KEYS),
@@ -394,18 +432,21 @@ def _build_daily_trend(
             value = num(first(ref.row, keys))
             if value is not None:
                 slot[field_name] = (slot[field_name] or 0.0) + value
-                used = True
-        if used:
-            slot["rows"].append(ref)
+                slot[f"{field_name}_rows"].append(ref)
 
     items: list[dict[str, Any]] = []
     for day, platform in sorted(buckets, key=lambda key: (key[0], platform_sort_key(key[1]))):
         slot = buckets[(day, platform)]
         index = len(items)
+        collector.add(f"/data/daily_trend/{index}/date", slot["identity_rows"])
+        collector.add(f"/data/daily_trend/{index}/platform", slot["identity_rows"])
         for field_name in ("volume", "engagement", "positive", "neutral", "negative"):
             value = _as_int(slot[field_name])
             if value is not None:
-                collector.add(f"/data/daily_trend/{index}/{field_name}", slot["rows"])
+                collector.add(
+                    f"/data/daily_trend/{index}/{field_name}",
+                    slot[f"{field_name}_rows"],
+                )
         items.append(
             {
                 "date": day.isoformat(),
@@ -628,7 +669,7 @@ def _assemble_availability(
             )
         )
         section_limitations = list(extra.get(section) or ())
-        if not has_rows.get(section, False):
+        if not has_rows.get(section, False) and section not in force_partial:
             status = "unavailable"
             reason_codes = ["no_evidence"]
             section_limitations.append(
@@ -689,6 +730,13 @@ def build_brand_report_draft(
         scope_model = BrandScope.model_validate(scope)
     except ValidationError as exc:
         raise DraftBuildError(f"invalid brand scope: {exc}") from exc
+    try:
+        reject_exclusive_group_evidence_reuse(
+            evidence,
+            (GROUP_OVERVIEW_CURRENT, GROUP_OVERVIEW_MOM, GROUP_OVERVIEW_YOY),
+        )
+    except ValueError as exc:
+        raise DraftBuildError(str(exc)) from exc
 
     canonical = canonicalize_marketing_evidence(
         {group: evidence.get(group, []) for group in EVIDENCE_GROUPS}
@@ -746,6 +794,7 @@ def build_brand_report_draft(
     # 情感计分来源行：明细优先，兜底用 overview 构成行。
     if not sentiment_score_rows:
         sentiment_score_rows = split_rows
+    sentiment_coverage_rows = groups[GROUP_SENTIMENT] or split_rows
 
     summary_counts = sentiment["summary"]
     overall_score = sentiment_score(
@@ -754,6 +803,10 @@ def build_brand_report_draft(
         summary_counts["negative"]["count"],
     ) if sentiment_has_rows else None
     platform_scores: dict[str, float | None] = {}
+    platform_score_rows: dict[str, list[RowRef]] = {}
+    for ref in sentiment_score_rows:
+        if first(ref.row, SENTIMENT_KEYS) is not None:
+            platform_score_rows.setdefault(canon_platform(first(ref.row, PLATFORM_KEYS)), []).append(ref)
     for entry in sentiment["by_platform"]:
         platform_scores[entry["platform"]] = sentiment_score(
             entry["positive"]["count"], entry["neutral"]["count"], entry["negative"]["count"]
@@ -764,10 +817,11 @@ def build_brand_report_draft(
         groups[GROUP_OVERVIEW_CURRENT],
         platform_scores,
         overall_score,
+        platform_score_rows,
         sentiment_score_rows,
         collector,
     )
-    overview_slots, overview_chosen = _overview_platforms(groups[GROUP_OVERVIEW_CURRENT])
+    overview_slots, _overview_chosen = _overview_platforms(groups[GROUP_OVERVIEW_CURRENT])
     current_totals = _slot_totals(overview_slots)
 
     # ---- comparisons ----
@@ -785,7 +839,7 @@ def build_brand_report_draft(
             baseline_window=windows.get(kind),
             timezone=scope_model.period.timezone,
             current_totals=current_totals,
-            current_rows=overview_chosen,
+            current_slots=overview_slots,
             baseline_rows=groups[GROUP_OVERVIEW_MOM if kind == "mom" else GROUP_OVERVIEW_YOY],
             collector=collector,
         )
@@ -807,6 +861,15 @@ def build_brand_report_draft(
                 "affected_paths": ["top_posts"],
             }
         )
+    if posts_meta["missing_platform"]:
+        force_partial.add("top_posts")
+        extra_limitations.setdefault("top_posts", []).append(
+            {
+                "code": "post_platform_missing",
+                "message": "部分热帖缺少平台，已跳过以避免伪造 all 平台",
+                "affected_paths": ["top_posts"],
+            }
+        )
     if posts_meta["missing_url"]:
         force_partial.add("top_posts")
         extra_limitations.setdefault("top_posts", []).append(
@@ -816,6 +879,19 @@ def build_brand_report_draft(
                 "affected_paths": ["top_posts"],
             }
         )
+    for key, code, label in (
+        ("missing_title", "post_title_missing", "标题"),
+        ("missing_author", "post_author_missing", "作者"),
+    ):
+        if posts_meta[key]:
+            force_partial.add("top_posts")
+            extra_limitations.setdefault("top_posts", []).append(
+                {
+                    "code": code,
+                    "message": f"部分热帖缺少{label}，已保留为不可用字段",
+                    "affected_paths": ["top_posts"],
+                }
+            )
 
     content_types, content_has_rows = _build_dimension_rows(
         groups[GROUP_DIMENSIONS],
@@ -854,6 +930,7 @@ def build_brand_report_draft(
         data_model = BrandData.model_validate(data)
     except ValidationError as exc:
         raise DraftBuildError(f"invalid brand data: {exc}") from exc
+    data = data_model.model_dump(mode="json")
 
     has_rows = {
         "overview": overview_has_rows,
@@ -868,26 +945,57 @@ def build_brand_report_draft(
         "topics": topics_has_rows,
         "top_posts": bool(top_posts),
     }
-    # ---- 平台覆盖率（Task 3R）：scope 声明平台未被 Evidence 覆盖 → partial ----
+    # ---- 平台覆盖率：按章节实际 Evidence 判断，不把已观测原始值误标 partial ----
     partial_paths: set[str] = set()
-    coverage_partial = overview_has_rows and platform_coverage_incomplete(
-        scope_model.platforms, groups[GROUP_OVERVIEW_CURRENT]
-    )
-    if coverage_partial:
-        force_partial.add("overview")
-        partial_paths.update(
-            {
-                "/data/overview/total_volume",
-                "/data/overview/total_engagement",
-                "/data/overview/total_posts",
-            }
-        )
-        extra_limitations.setdefault("overview", []).append(
+    def mark_coverage_partial(
+        section: str, rows: list[RowRef], *, paths: list[str] | None = None
+    ) -> bool:
+        if not has_rows.get(section, False) or not platform_coverage_incomplete(
+            scope_model.platforms, rows
+        ):
+            return False
+        force_partial.add(section)
+        partial_paths.update(paths or ())
+        extra_limitations.setdefault(section, []).append(
             {
                 "code": "platform_coverage_incomplete",
-                "message": "scope 声明的部分平台没有覆盖，聚合指标按可得平台披露",
-                "affected_paths": ["overview"],
+                "message": "scope 声明的部分平台没有覆盖，按可得平台数据受限披露",
+                "affected_paths": [section],
             }
+        )
+        return True
+
+    mark_coverage_partial(
+        "overview",
+        groups[GROUP_OVERVIEW_CURRENT],
+        paths=[
+            "/data/overview/total_volume",
+            "/data/overview/total_engagement",
+            "/data/overview/total_posts",
+        ],
+    )
+    mark_coverage_partial(
+        "sentiment",
+        sentiment_coverage_rows,
+        paths=[
+            path
+            for path, value in walk_data_leaves(data)
+            if path.startswith("/data/sentiment/summary/") and value is not None
+        ],
+    )
+    mark_coverage_partial("daily_trend", groups[GROUP_DAILY_TREND])
+    mark_coverage_partial("top_posts", groups[GROUP_TOP_POSTS])
+    if mode != "none":
+        mark_coverage_partial(
+            "comparisons",
+            groups[GROUP_OVERVIEW_CURRENT],
+            paths=[
+                path
+                for path, value in walk_data_leaves(data)
+                if path.startswith("/data/comparisons/")
+                and path.rsplit("/", 1)[-1] in {"current", "delta", "rate"}
+                and value is not None
+            ],
         )
 
     data_status, availability, limitations = _assemble_availability(
@@ -896,18 +1004,17 @@ def build_brand_report_draft(
         extra=extra_limitations,
         force_partial=force_partial,
     )
-    if coverage_partial and (
-        "platform_coverage_incomplete" not in availability["overview"]["reason_codes"]
-    ):
-        availability["overview"]["reason_codes"] = [
-            *availability["overview"]["reason_codes"],
-            "platform_coverage_incomplete",
-        ]
+    for section, section_limitations in extra_limitations.items():
+        if any(item["code"] == "platform_coverage_incomplete" for item in section_limitations):
+            availability[section]["reason_codes"] = [
+                *availability[section]["reason_codes"],
+                "platform_coverage_incomplete",
+            ]
 
     refs = collector.build()
     try:
         canonical_fields, field_lineage = publish_canonical(
-            data, refs, partial_paths=frozenset(partial_paths)
+            data, refs, partial_paths=frozenset(partial_paths), module="brand"
         )
     except ValidationError as exc:
         raise DraftBuildError(f"invalid brand canonical publication: {exc}") from exc

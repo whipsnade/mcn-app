@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
 CanonicalAvailability = Literal["complete", "partial", "unavailable"]
 
@@ -52,9 +52,34 @@ _UNIT_BY_SUFFIX: dict[str, str] = {
 }
 
 
-def unit_for_path(path: str) -> str | None:
-    """按 Artifact 路径末段推断单位；未知段返回 None。"""
-    return _UNIT_BY_SUFFIX.get(path.rsplit("/", 1)[-1])
+def unit_for_path(path: str, *, module: str | None = None, data: dict[str, Any] | None = None) -> str | None:
+    """按 module、章节与指标推导单位，不把 Campaign 帖数误标为声量。"""
+    suffix = path.rsplit("/", 1)[-1]
+    if suffix in {"rate", "share", "share_of_voice", "contribution_share"}:
+        return "ratio"
+    if module == "campaign":
+        if suffix in {"total_volume", "volume", "total_posts", "posts"}:
+            return "posts"
+        if suffix in {"current", "baseline", "delta"} and data is not None:
+            metric = _metric_for_comparison_path(path, data)
+            if metric in {"total_volume", "total_posts", "volume", "posts"}:
+                return "posts"
+            if metric == "total_engagement":
+                return "interactions"
+    return _UNIT_BY_SUFFIX.get(suffix)
+
+
+def _metric_for_comparison_path(path: str, data: dict[str, Any]) -> str | None:
+    """取比较指标同级 ``metric``，路径不完整或不存在时保持无单位。"""
+    parts = path.split("/")[1:-1]
+    current: Any = data
+    try:
+        for token in parts:
+            current = current[int(token)] if isinstance(current, list) else current[token]
+    except (IndexError, KeyError, TypeError, ValueError):
+        return None
+    metric = current.get("metric") if isinstance(current, dict) else None
+    return metric if isinstance(metric, str) else None
 
 
 def _is_number(value: Any) -> bool:
@@ -120,7 +145,35 @@ class CanonicalPayloadMixin(BaseModel):
                 raise ValueError(
                     f"field_lineage[{key!r}] must map only to its own canonical field, got {values!r}"
                 )
+        data = getattr(self, "data", None)
+        if data is None:
+            return self
+        data_leaves = dict(walk_data_leaves(_json_mode(data)))
+        canonical_values = {field.path: _json_mode(field.value) for field in self.canonical_data}
+        data_paths = set(data_leaves)
+        if set(canonical_values) != data_paths:
+            missing = sorted(data_paths - set(canonical_values))
+            extra = sorted(set(canonical_values) - data_paths)
+            raise ValueError(
+                "canonical paths must exactly match final data leaves"
+                + (f"; missing {missing}" if missing else "")
+                + (f"; extra {extra}" if extra else "")
+            )
+        for path, value in canonical_values.items():
+            if value != data_leaves[path]:
+                raise ValueError(f"canonical value does not match final data at {path!r}")
         return self
+
+
+def _json_mode(value: Any) -> Any:
+    """以 Pydantic JSON-mode 比较业务值，消除日期与 tuple 的内存形态差异。"""
+    if isinstance(value, BaseModel):
+        value = value.model_dump(mode="json")
+    return TypeAdapter(Any).dump_python(value, mode="json")
+
+
+def _escape_token(token: str) -> str:
+    return token.replace("~", "~0").replace("/", "~1")
 
 
 def walk_data_leaves(node: Any, prefix: str = "/data") -> list[tuple[str, Any]]:
@@ -130,7 +183,7 @@ def walk_data_leaves(node: Any, prefix: str = "/data") -> list[tuple[str, Any]]:
     def walk(current: Any, parts: list[str]) -> None:
         if isinstance(current, dict):
             for key, child in current.items():
-                walk(child, [*parts, key])
+                walk(child, [*parts, _escape_token(str(key))])
         elif isinstance(current, (list, tuple)):
             for index, child in enumerate(current):
                 walk(child, [*parts, str(index)])
@@ -162,6 +215,8 @@ def publish_canonical(
     data: dict[str, Any],
     refs: list[dict[str, Any]],
     partial_paths: frozenset[str] = frozenset(),
+    *,
+    module: str | None = None,
 ) -> tuple[list[CanonicalField], dict[str, tuple[str, ...]]]:
     """把最终业务 ``data`` 发布为 canonical 字段 + 恒等 field_lineage。
 
@@ -186,7 +241,7 @@ def publish_canonical(
                 value=value,
                 availability=availability,
                 evidence_ids=evidence_by_path.get(path, ()),
-                unit=unit_for_path(path),
+                unit=unit_for_path(path, module=module, data=data),
             )
         )
     lineage = {field.path: (field.path,) for field in fields}

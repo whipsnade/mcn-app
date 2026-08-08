@@ -330,7 +330,9 @@ def test_missing_posts_evidence_produces_restricted() -> None:
     for section in ("overview", "platform_contributions", "timeline", "top_posts"):
         assert payload["availability"][section]["status"] == "unavailable"
         assert "no_evidence" in payload["availability"][section]["reason_codes"]
-    assert payload["availability"]["sentiment"]["status"] == "complete"
+    # scope 配置小红书/抖音，但情感 Evidence 仅覆盖小红书；本轮 coverage
+    # 规则要求该章节受限披露，不能把单平台样本伪装成完整跨平台结论。
+    assert payload["availability"]["sentiment"]["status"] == "partial"
     assert payload["data"]["overview"]["total_posts"] is None
     CampaignReportV2.model_validate(payload)
 

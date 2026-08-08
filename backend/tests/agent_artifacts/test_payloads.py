@@ -10,6 +10,9 @@ from datetime import date, datetime, timezone
 import pytest
 from pydantic import ValidationError
 
+from app.agent_artifacts.canonical import publish_canonical, walk_data_leaves
+from app.agent_artifacts.payloads.brand import BrandData
+from app.agent_artifacts.payloads.campaign import CampaignData
 from app.agent_artifacts.payloads import (
     TYPED_PAYLOAD_BY_SCHEMA,
     BrandReportV3,
@@ -43,6 +46,35 @@ WEIGHTS = {
     "followers": 10,
     "engagement_follower_ratio": 14,
 }
+
+
+def refresh_fixture_canonical(payload: dict, *, module: str) -> dict:
+    """将 hand-written fixture 发布为完整 canonical payload。"""
+    data_model = BrandData if module == "brand" else CampaignData
+    payload["data"] = data_model.model_validate(payload["data"]).model_dump(mode="json")
+    refs = [
+        {
+            "artifact_path": path,
+            "sources": [
+                {
+                    "source_type": "evidence",
+                    "evidence_id": "fixture-evidence",
+                    "source_path": "/fixture",
+                }
+            ],
+            "derivation": None,
+        }
+        for path, _value in walk_data_leaves(payload["data"])
+    ]
+    fields, lineage = publish_canonical(payload["data"], refs, module=module)
+    # Fixture 也必须模拟发布后的 JSON 持久化形态；否则 json.dumps(default=str)
+    # 会把 Pydantic 对象变成 repr，反而绕开了真实的 payload 路径。
+    payload["canonical_data"] = [field.model_dump(mode="json") for field in fields]
+    payload["field_lineage"] = {
+        path: list(targets)
+        for path, targets in lineage.items()
+    }
+    return payload
 
 COMPLETE = {"status": "complete", "reason_codes": []}
 
@@ -105,7 +137,7 @@ def _snapshot() -> dict:
 
 
 def build_brand_dict() -> dict:
-    return {
+    payload = {
         "schema_version": "brand_report_v3",
         "module": "brand",
         "scope": {
@@ -195,10 +227,11 @@ def build_brand_dict() -> dict:
             "recommendations": [],
         },
     }
+    return refresh_fixture_canonical(payload, module="brand")
 
 
 def build_campaign_dict() -> dict:
-    return {
+    payload = {
         "schema_version": "campaign_report_v2",
         "module": "campaign",
         "scope": {
@@ -276,6 +309,7 @@ def build_campaign_dict() -> dict:
             "recommendations": [],
         },
     }
+    return refresh_fixture_canonical(payload, module="campaign")
 
 
 def build_kol_selection_dict() -> dict:
@@ -621,6 +655,7 @@ def test_brand_top_posts_capped_at_20() -> None:
         BrandReportV3.model_validate(d)
     ok = build_brand_dict()
     ok["data"]["top_posts"] = [_top_post(f"p{i}") for i in range(20)]
+    refresh_fixture_canonical(ok, module="brand")
     assert BrandReportV3.model_validate(ok).data.top_posts[19].post_id == "p19"
 
 
@@ -690,6 +725,7 @@ def test_brand_top_post_url_rejects_bad_schemes(bad: str) -> None:
 def test_brand_top_post_url_accepts_http_https(good: str) -> None:
     d = build_brand_dict()
     d["data"]["top_posts"][0]["url"] = good
+    refresh_fixture_canonical(d, module="brand")
     assert BrandReportV3.model_validate(d).data.top_posts[0].url == good
 
 
@@ -743,6 +779,7 @@ def test_brand_null_numeric_allowed_with_partial_and_limitation() -> None:
         }
     ]
     d["data"]["overview"]["total_volume"] = None
+    refresh_fixture_canonical(d, module="brand")
     inst = BrandReportV3.model_validate(d)
     # null must survive: never coerced to 0
     assert inst.data.overview.total_volume is None
@@ -996,6 +1033,7 @@ def test_brand_top_posts_duplicate_post_id_rejected() -> None:
 def test_brand_top_posts_distinct_pass() -> None:
     d = build_brand_dict()
     d["data"]["top_posts"] = [_top_post("p1"), _top_post("p2")]
+    refresh_fixture_canonical(d, module="brand")
     assert len(BrandReportV3.model_validate(d).data.top_posts) == 2
 
 
