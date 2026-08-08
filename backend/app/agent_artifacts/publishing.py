@@ -314,6 +314,7 @@ class ArtifactPublicationService:
                 schema_version=revision.schema_version,
                 artifact_type=artifact.artifact_type,
                 payload=revision.payload_json,
+                enforce_kol_publication_validity=True,
             )
         )
         lineage_snapshot: dict[str, Any] | None = None

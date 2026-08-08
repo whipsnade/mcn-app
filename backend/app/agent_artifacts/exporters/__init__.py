@@ -53,6 +53,12 @@ def export_artifact(version, *, model=None, gateway=None) -> bytes:
     """
     del model, gateway  # 表现层边界：永不调用模型/MCP
     schema_version = getattr(version, "schema_version", None)
+    version_status = getattr(version, "status", None)
+    if version_status is not None and version_status != "published":
+        raise ArtifactExportUnsupported(schema_version, reason="version is not published")
+    validation_snapshot = getattr(version, "validation_json", None)
+    if isinstance(validation_snapshot, dict) and validation_snapshot.get("valid") is False:
+        raise ArtifactExportUnsupported(schema_version, reason="version failed publication validity")
     exporter = _SUPPORTED_EXPORTERS.get(schema_version)
     if exporter is None:
         raise ArtifactExportUnsupported(schema_version)
@@ -63,7 +69,7 @@ def export_artifact(version, *, model=None, gateway=None) -> bytes:
         )
     try:
         return exporter(payload)
-    except ValidationError as exc:
+    except (ValidationError, ValueError) as exc:
         raise ArtifactExportUnsupported(
             schema_version, reason="published payload fails typed validation"
         ) from exc

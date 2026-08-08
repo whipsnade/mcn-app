@@ -578,6 +578,7 @@ class ArtifactService:
                 schema_version=current_rev.schema_version,
                 artifact_type=artifact.artifact_type,
                 payload=current_rev.payload_json,
+                enforce_kol_publication_validity=True,
             )
             # 冻结 lineage 传递闭包（菱形去重、跨层级展开），写入 Version 审计快照。
             lineage_snapshot = await freezer.freeze(

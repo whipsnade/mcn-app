@@ -44,13 +44,12 @@ from app.agent_artifacts.builders.raw_rows import (
 )
 from app.agent_artifacts.payloads.kol_selection import (
     V3_DIMENSIONS,
-    KolSelectionScope,
+    KolSelectionScopeV3,
     KolSelectionV3,
 )
 from app.agent_runtime.models import AgentToolCall
 from app.agent_runtime.tools.calculation import RankKolsArgs, RankKolsTool
-from app.agent_runtime.tools.contracts import ToolContext
-from app.agent_runtime.tools.contracts import arguments_hash, logical_call_id_for
+from app.agent_runtime.tools.contracts import ToolContext, arguments_hash, logical_call_id_for
 from app.selection.scoring_v3 import EFFECT_WEIGHTS_V3, MIN_PRICE_SAMPLE
 
 SCHEMA_VERSION = "kol_selection_v3"
@@ -257,12 +256,12 @@ def _normalize_kol_row(
     kol_uid = _adopt_text("kol_uid", _KOL_UID_KEYS)
     nickname = _adopt_text("nickname", _NICKNAME_KEYS)
     if kol_uid is None:
-        # uid 缺失回退昵称作身份（与 campaign kol_contributions 口径一致）。
-        kol_uid = nickname or ""
-        if nickname is not None:
-            keymap["kol_uid"] = keymap["nickname"]
-    item["kol_uid"] = kol_uid
-    item["nickname"] = nickname if nickname is not None else kol_uid
+        # uid 缺失保持空值；nickname 不是可验证稳定身份。
+        kol_uid = ""
+    # 缺失稳定 ID 保持缺失；不能用 nickname 冒充 kol_uid，否则发布门禁会把
+    # 非可验证身份误当成合法候选。
+    item["kol_uid"] = kol_uid or ""
+    item["nickname"] = nickname or ""
 
     for field, keys, integer in (
         ("followers", _FOLLOWERS_KEYS, True),
@@ -430,7 +429,8 @@ def _build_item(entry: dict[str, Any], raw: dict[str, Any]) -> dict[str, Any]:
         "rank": entry["rank"],
         "platform": entry.get("platform") or raw.get("platform"),
         "kol_uid": entry.get("kol_uid") or raw.get("kol_uid"),
-        "nickname": entry.get("nickname") or raw.get("kol_uid") or "",
+        # nickname 是独立展示字段，缺失时保持空值；稳定 ID 不能冒充昵称。
+        "nickname": entry.get("nickname") or raw.get("nickname") or "",
         "avatar_url": raw.get("avatar_url"),
         "homepage_url": raw.get("homepage_url"),
         "followers": raw.get("followers"),
@@ -442,7 +442,15 @@ def _build_item(entry: dict[str, Any], raw: dict[str, Any]) -> dict[str, Any]:
         "likes": raw.get("likes"),
         "comments": raw.get("comments"),
         "shares": raw.get("shares"),
-        "quoted_price": snapshot.get("quoted_price") or entry.get("quoted_price"),
+        "quoted_price": (
+            snapshot.get("quoted_price")
+            if snapshot.get("quoted_price") is not None
+            else (
+                entry.get("quoted_price")
+                if entry.get("quoted_price") is not None
+                else raw.get("quoted_price")
+            )
+        ),
         "reasons": list(raw.get("reasons") or ()),
         "missing_fields": list(entry.get("missing_fields") or ()),
         "audience": {
@@ -1000,8 +1008,24 @@ async def build_kol_selection_draft(
     ``extract_rows`` 的 ``RowRef.field_base``）。缺省按顶层数组 ``/{index}``
     处理（兼容直接传行的调用方）；长度不一致直接 fail-fast，不静默错位。
     """
-    parsed_scope = KolSelectionScope.model_validate(scope)
+    parsed_scope = KolSelectionScopeV3.model_validate(scope)
     scope_dict = parsed_scope.model_dump()
+    audience = scope_dict.get("audience") or {}
+    # builder 产生的新 payload 始终冻结完整范围；旧调用方传入的最小 scope
+    # 仍可构建，新增字段以确定性默认值补齐。
+    scope_dict["region"] = scope_dict.get("region") or tuple(audience.get("regions") or ())
+    scope_dict["age_range"] = scope_dict.get("age_range") or tuple(
+        audience.get("age_ranges") or ()
+    )
+    if scope_dict.get("budget") is None:
+        filters = scope_dict.get("filters") or {}
+        budget_min = filters.get("budget_min")
+        budget_max = filters.get("budget_max")
+        if budget_min is not None or budget_max is not None:
+            scope_dict["budget"] = {"min": budget_min, "max": budget_max}
+    scope_dict["ranking_mode"] = scope_dict.get("ranking_mode") or "balanced"
+    scope_dict["top_limit"] = scope_dict.get("top_limit") or DEFAULT_LIMIT
+    scope_dict["scoring_version"] = scope_dict.get("scoring_version") or SCORE_VERSION_V3
 
     if not items:
         return _restricted_draft(scope_dict, data_as_of, source_names)
@@ -1096,8 +1120,8 @@ async def build_kol_selection_draft(
 
 
 __all__ = [
-    "DIM_RAW_INPUT",
     "DEFAULT_LIMIT",
+    "DIM_RAW_INPUT",
     "SCHEMA_VERSION",
     "build_kol_selection_draft",
 ]

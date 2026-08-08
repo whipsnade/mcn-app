@@ -25,13 +25,14 @@ from app.agent_artifacts.exporters._common import (
     clear_rows_unmerged,
     platform_label,
     present,
-    write_value,
     write_table,
+    write_value,
 )
 from app.agent_artifacts.payloads.kol_selection import (
     V3_DIMENSIONS,
     KolSelectionV3,
 )
+from app.agent_artifacts.validation import validate_kol_candidates
 
 TEMPLATE_PATH = (
     Path(__file__).resolve().parents[1] / "templates" / "kol_selection_v3.xlsx"
@@ -73,6 +74,9 @@ _V2_SCORE_HEADERS = ("综合分", "星级", "数据完整度")
 def render_kol_selection_workbook(payload: dict) -> bytes:
     """把已发布 kol_selection_v3 payload 渲染为 .xlsx bytes（同步 CPU 密集）。"""
     selection = KolSelectionV3.model_validate(payload)
+    issues = validate_kol_candidates(selection)
+    if issues:
+        raise ValueError("kol selection failed publication validity")
     workbook = load_workbook(TEMPLATE_PATH)
     _render_summary(workbook[SUMMARY_SHEET], selection)
     _render_detail_blocks(workbook[DETAIL_SHEET], selection)
@@ -289,8 +293,10 @@ def _render_methodology(sheet, selection) -> None:
             [
                 labels.get(dim, dim),
                 weights[dim],
-                "同平台 mid-rank percentile（绝对量）/ 0–100 clamp（比例匹配）；"
-                "缺失计 0 不重分配",
+                (
+                    "同平台 mid-rank percentile（绝对量）/ 0–100 clamp（比例匹配）；"
+                    "缺失计 0 不重分配"
+                ),
                 "效果与匹配度合计 70 分",
             ]
             for dim in weights

@@ -15,6 +15,7 @@ from app.agent_artifacts.payloads.common import (
     ArtifactPayloadBase,
     DistributionItem,
     OptionalHttpUrl,
+    Period,
     UniqueKeyValidator,
 )
 from app.selection.scoring_v2 import WEIGHTS_V2
@@ -47,7 +48,7 @@ class SelectionFilters(BaseModel):
     follower_max: int | None = None
 
 
-class KolSelectionScope(BaseModel):
+class KolSelectionScopeV3(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     brand: str | None = None
@@ -58,6 +59,20 @@ class KolSelectionScope(BaseModel):
     filters: SelectionFilters
     # 用户确认的内容形式（报价有效性约束；缺省不限制）。
     content_formats: tuple[str, ...] = Field(default_factory=tuple)
+    # Task 5：完整冻结用户确认范围。新增字段使用兼容默认值，历史
+    # kol_selection_v3 payload 无需改写即可继续读取/导出。
+    region: str | tuple[str, ...] | None = None
+    age_range: str | tuple[str, ...] | None = None
+    period: Period | None = None
+    budget: float | dict[str, float | None] | None = None
+    ranking_mode: str | None = None
+    top_limit: int | None = Field(default=None, ge=1, le=20)
+    scoring_version: str | None = None
+
+
+# 旧名称是现有 builder/调用方的公开导入面；保留别名避免历史代码和快照
+# 发生 schema 迁移式破坏。
+KolSelectionScope = KolSelectionScopeV3
 
 
 class ScoringConfigV2(BaseModel):
@@ -233,7 +248,7 @@ class KolSelectionV3(ArtifactPayloadBase):
     schema_version: Literal["kol_selection_v3"] = "kol_selection_v3"
     module: Literal["kol"] = "kol"
 
-    scope: KolSelectionScope
+    scope: KolSelectionScopeV3
     data: KolSelectionData
     narrative: KolSelectionNarrative
 
