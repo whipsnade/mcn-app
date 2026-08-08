@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import date
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -194,6 +194,8 @@ class CampaignReportV2(ArtifactPayloadBase):
     scope: CampaignScope
     data: CampaignData
     narrative: CampaignNarrative
+    canonical_data: tuple[dict[str, Any], ...] = Field(default_factory=tuple)
+    field_lineage: dict[str, tuple[str, ...]] = Field(default_factory=dict)
 
     REQUIRED_SECTIONS = frozenset(
         {"overview", "platform_contributions", "timeline", "sentiment", "top_posts"}

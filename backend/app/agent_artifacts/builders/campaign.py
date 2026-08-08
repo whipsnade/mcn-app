@@ -55,7 +55,7 @@ from app.agent_artifacts.builders.raw_rows import (
     VOLUME_KEYS,
     RowRef,
     canon_platform,
-    extract_rows,
+    canonicalize_marketing_evidence,
     first,
     parse_date,
     platform_sort_key,
@@ -122,20 +122,13 @@ IMPRESSION_KEYS = ("曝光", "曝光数", "展示", "impressions", "views")
 CONVERSION_KEYS = ("转化", "转化数", "转化量", "成交数", "conversions", "conversion")
 REVENUE_KEYS = ("销售额", "销售金额", "收入", "GMV", "revenue", "sales")
 # 帖子的付费/自然归属键。
-ATTRIBUTION_KEYS = ("归属", "是否付费", "投放类型", "付费/自然", "attribution")
+ATTRIBUTION_KEYS = ("is_paid", "是否付费", "attribution", "归属", "投放类型", "付费/自然")
 # 归属语义字段分流（Gate C 第三轮）：布尔字段的值直接表达付费与否
 # （是/否、true/false、1/0、yes/no）；文本字段的值用标准化 token 匹配。
-_BOOLEAN_ATTRIBUTION_KEYS = ("是否付费",)
-_TEXT_ATTRIBUTION_KEYS = ("归属", "投放类型", "付费/自然", "attribution")
+_BOOLEAN_ATTRIBUTION_KEYS = ("is_paid", "是否付费")
+_TEXT_ATTRIBUTION_KEYS = ("attribution", "归属", "投放类型", "付费/自然")
 _PAID_BOOL_VALUES = frozenset({"是", "true", "1", "yes"})
 _ORGANIC_BOOL_VALUES = frozenset({"否", "false", "0", "no"})
-
-
-def _extract_group(pairs: list[tuple[str, Any]] | None) -> list[RowRef]:
-    rows: list[RowRef] = []
-    for evidence_id, raw_payload in pairs or ():
-        rows.extend(extract_rows(evidence_id, raw_payload))
-    return rows
 
 
 def _row_engagement(row: dict[str, Any]) -> int | None:
@@ -887,7 +880,10 @@ def build_campaign_report_draft(
     except ValidationError as exc:
         raise DraftBuildError(f"invalid campaign scope: {exc}") from exc
 
-    groups = {group: _extract_group(evidence.get(group)) for group in EVIDENCE_GROUPS}
+    canonical = canonicalize_marketing_evidence(
+        {group: evidence.get(group, []) for group in EVIDENCE_GROUPS}
+    )
+    groups = {group: canonical.rows(group) for group in EVIDENCE_GROUPS}
     if not any(groups.values()):
         raise DraftBuildError(
             "build_campaign_report_draft requires at least one usable evidence row"
@@ -1073,13 +1069,15 @@ def build_campaign_report_draft(
         "narrative": narrative
         if narrative is not None
         else _default_narrative(scope_model.brand, scope_model.campaign, data_status),
+        "canonical_data": canonical.serialized_fields(),
+        "field_lineage": {},
     }
+    refs = collector.build()
+    payload["field_lineage"] = canonical.field_lineage(refs)
     try:
         CampaignReportV2.model_validate(payload)  # fail-fast：builder 输出必须合法。
     except ValidationError as exc:
         raise DraftBuildError(f"invalid campaign_report_v2 payload: {exc}") from exc
-
-    refs = collector.build()
     missing = required_numeric_pointers(payload) - {ref["artifact_path"] for ref in refs}
     if missing:
         raise DraftBuildError(

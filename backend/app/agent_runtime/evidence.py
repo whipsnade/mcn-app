@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
@@ -33,6 +34,26 @@ _MAX_PREVIEW_STRING = 2_000
 _MAX_PREVIEW_ARRAY = 50
 _MAX_PREVIEW_PROPS = 200
 _MAX_PREVIEW_DEPTH = 6
+
+
+@dataclass(frozen=True)
+class CanonicalField:
+    """可追溯的营销业务字段；缺失值必须显式标记为 unavailable。"""
+
+    path: str
+    value: Any
+    availability: str
+    evidence_ids: tuple[str, ...]
+    unit: str | None
+
+    def model_dump(self) -> dict[str, Any]:
+        return {
+            "path": self.path,
+            "value": self.value,
+            "availability": self.availability,
+            "evidence_ids": list(self.evidence_ids),
+            "unit": self.unit,
+        }
 
 
 def _now() -> datetime:
@@ -342,6 +363,7 @@ class EvidenceWriter:
 
 
 __all__ = [
+    "CanonicalField",
     "EvidenceWriter",
     "bound_model_value",
     "build_model_evidence_view",

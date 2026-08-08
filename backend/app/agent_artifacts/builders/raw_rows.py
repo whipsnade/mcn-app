@@ -13,8 +13,12 @@ from __future__ import annotations
 
 import json
 import math
+from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any, NamedTuple
+
+from app.agent_runtime.evidence import CanonicalField
 
 
 class RowRef(NamedTuple):
@@ -373,6 +377,144 @@ def sentiment_score(positive: float | None, neutral: float | None, negative: flo
     return round((((positive or 0.0) - (negative or 0.0)) / total) * 100, 2)
 
 
+# ---------------------------------------------------------------------------
+# Task 3 canonical Evidence：唯一的原始 payload 消费入口
+# ---------------------------------------------------------------------------
+
+_CANONICAL_ROW_FIELDS: tuple[tuple[str, tuple[str, ...], str | None], ...] = (
+    ("platform", PLATFORM_KEYS, None),
+    ("volume", VOLUME_KEYS, "mentions"),
+    ("engagement", ENGAGEMENT_KEYS, "interactions"),
+    ("posts", POSTS_KEYS, "posts"),
+    ("positive", POSITIVE_KEYS, "mentions"),
+    ("neutral", NEUTRAL_KEYS, "mentions"),
+    ("negative", NEGATIVE_KEYS, "mentions"),
+    ("date", TIME_KEYS, "timestamp"),
+    ("sentiment", SENTIMENT_KEYS, None),
+    ("region", REGION_KEYS, None),
+    ("region_map", REGION_MAP_KEYS, None),
+    ("content_type", CONTENT_TYPE_KEYS, None),
+    ("tier", TIER_KEYS, None),
+    ("is_commercial", COMMERCIAL_KEYS, None),
+    ("topic", TOPIC_KEYS, None),
+    ("post_id", POST_ID_KEYS, None),
+    ("title", TITLE_KEYS, None),
+    ("author", AUTHOR_KEYS, None),
+    ("author_id", AUTHOR_ID_KEYS, None),
+    ("published_at", POST_DATE_KEYS, "timestamp"),
+    ("likes", LIKE_KEYS, "count"),
+    ("comments", COMMENT_KEYS, "count"),
+    ("collects", COLLECT_KEYS, "count"),
+    ("shares", SHARE_KEYS, "count"),
+    ("url", URL_KEYS, None),
+    ("is_brand_related", RELEVANCE_KEYS, None),
+    ("spend", ("投放金额", "花费", "消耗", "成本", "spend", "cost"), "currency"),
+    ("impressions", ("曝光", "曝光数", "展示", "impressions", "views"), "impressions"),
+    ("conversions", ("转化", "转化数", "转化量", "成交数", "conversions", "conversion"), "count"),
+    ("revenue", ("销售额", "销售金额", "收入", "GMV", "revenue", "sales"), "currency"),
+    ("is_paid", ("是否付费",), None),
+    ("attribution", ("归属", "投放类型", "付费/自然", "attribution"), None),
+)
+_EXPECTED_GROUP_FIELDS: dict[str, tuple[tuple[str, str | None], ...]] = {
+    "overview_current": (("volume", "mentions"), ("engagement", "interactions"), ("posts", "posts")),
+    "sentiment": (("sentiment", None), ("volume", "mentions")),
+    "daily_trend": (("date", "timestamp"), ("volume", "mentions"), ("engagement", "interactions")),
+    "top_posts": (("post_id", None), ("published_at", "timestamp"), ("engagement", "interactions")),
+    "topics": (("topic", None), ("volume", "mentions")),
+    "posts": (("post_id", None), ("published_at", "timestamp"), ("engagement", "interactions")),
+}
+
+
+@dataclass(frozen=True)
+class CanonicalEvidence:
+    fields: tuple[CanonicalField, ...]
+    rows_by_group: Mapping[str, tuple[RowRef, ...]]
+    source_index: Mapping[tuple[str, str], tuple[str, ...]]
+
+    def rows(self, group: str) -> list[RowRef]:
+        return list(self.rows_by_group.get(group, ()))
+
+    def serialized_fields(self) -> list[dict[str, Any]]:
+        return [field.model_dump() for field in self.fields]
+
+    def field_lineage(self, evidence_refs: list[dict[str, Any]]) -> dict[str, list[str]]:
+        lineage: dict[str, list[str]] = {}
+        for reference in evidence_refs:
+            paths: list[str] = []
+            for source in reference.get("sources", []):
+                evidence_id = source.get("evidence_id")
+                source_path = source.get("source_path")
+                if isinstance(evidence_id, str) and isinstance(source_path, str):
+                    paths.extend(self.source_index.get((evidence_id, source_path), ()))
+            if paths:
+                lineage[reference["artifact_path"]] = list(dict.fromkeys(paths))
+        return lineage
+
+
+def canonicalize_marketing_evidence(
+    evidence: Mapping[str, list[tuple[str, Any]]]
+) -> CanonicalEvidence:
+    """从原始 Evidence shape 提取 canonical fields，再给 Builder 提供标准化行。
+
+    Builder 此后只读取返回的 rows；原始 payload 只在本函数内解包和字段别名匹配。
+    """
+    fields: list[CanonicalField] = []
+    rows_by_group: dict[str, tuple[RowRef, ...]] = {}
+    source_index: dict[tuple[str, str], list[str]] = {}
+    for group, pairs in evidence.items():
+        normalized_rows: list[RowRef] = []
+        available_names: set[str] = set()
+        for evidence_id, raw_payload in pairs:
+            for ref in extract_rows(evidence_id, raw_payload):
+                normalized: dict[str, Any] = {}
+                paths: list[str] = []
+                for canonical_name, aliases, unit in _CANONICAL_ROW_FIELDS:
+                    source_key = next(
+                        (key for key in aliases if key in ref.row and ref.row[key] not in (None, "")),
+                        None,
+                    )
+                    if source_key is None:
+                        continue
+                    normalized[canonical_name] = ref.row[source_key]
+                    field_path = (
+                        f"/{_escape(group)}/{_escape(evidence_id)}{ref.field_base}/"
+                        f"{_escape(source_key)}"
+                    )
+                    fields.append(
+                        CanonicalField(
+                            path=field_path,
+                            value=ref.row[source_key],
+                            availability="available",
+                            evidence_ids=(evidence_id,),
+                            unit=unit,
+                        )
+                    )
+                    paths.append(field_path)
+                    available_names.add(canonical_name)
+                if normalized:
+                    normalized_rows.append(
+                        RowRef(ref.evidence_id, ref.source_path, normalized, ref.base_path)
+                    )
+                    source_index.setdefault((ref.evidence_id, ref.source_path), []).extend(paths)
+        for name, unit in _EXPECTED_GROUP_FIELDS.get(group, ()):
+            if name not in available_names:
+                fields.append(
+                    CanonicalField(
+                        path=f"/{_escape(group)}/{name}",
+                        value=None,
+                        availability="unavailable",
+                        evidence_ids=(),
+                        unit=unit,
+                    )
+                )
+        rows_by_group[group] = tuple(normalized_rows)
+    return CanonicalEvidence(
+        fields=tuple(fields),
+        rows_by_group=rows_by_group,
+        source_index={key: tuple(value) for key, value in source_index.items()},
+    )
+
+
 __all__ = [
     "AGGREGATE_PLATFORM_NAMES",
     "AUTHOR_ID_KEYS",
@@ -394,7 +536,6 @@ __all__ = [
     "REGION_KEYS",
     "REGION_MAP_KEYS",
     "RELEVANCE_KEYS",
-    "RowRef",
     "SENTIMENT_KEYS",
     "SHARE_KEYS",
     "TIER_KEYS",
@@ -403,7 +544,10 @@ __all__ = [
     "TOPIC_KEYS",
     "URL_KEYS",
     "VOLUME_KEYS",
+    "CanonicalEvidence",
+    "RowRef",
     "canon_platform",
+    "canonicalize_marketing_evidence",
     "commercial_kind",
     "extract_rows",
     "first",

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import date
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -175,6 +175,8 @@ class BrandReportV3(ArtifactPayloadBase):
     scope: BrandScope
     data: BrandData
     narrative: BrandNarrative
+    canonical_data: tuple[dict[str, Any], ...] = Field(default_factory=tuple)
+    field_lineage: dict[str, tuple[str, ...]] = Field(default_factory=dict)
 
     REQUIRED_SECTIONS = frozenset({"overview", "sentiment", "daily_trend", "topics", "top_posts"})
     # §6.3：全部业务章节根纳入递归 null 治理（含数组元素内的 Optional 数值叶子）。

@@ -12,10 +12,18 @@ volume 等），未识别字段进入 ``unmapped_fields`` 诊断。状态 ``inco
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable, Literal
+from typing import Any, Literal
 
-from app.agent_artifacts.builders.raw_rows import TIME_KEYS, VOLUME_KEYS, num, text, unwrap_payload
+from app.agent_artifacts.builders.raw_rows import (
+    TIME_KEYS,
+    VOLUME_KEYS,
+    canonicalize_marketing_evidence,
+    num,
+    text,
+    unwrap_payload,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -147,4 +155,5 @@ class NormalizationRegistry:
 __all__ = [
     "NormalizationRegistry",
     "NormalizationResult",
+    "canonicalize_marketing_evidence",
 ]
