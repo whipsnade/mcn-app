@@ -27,6 +27,7 @@ from app.agent_runtime.repository import AgentRunRepository
 from app.agent_runtime.state import RunStatus
 from app.core.config import Settings
 from app.identity.models import User
+from app.marketing_capability_pack.runtime import build_marketing_run_capability
 from app.pi_runtime_poc.rpc import PiRpcProtocolError
 from app.pi_runtime_poc.runner import PiPocRunner
 
@@ -93,6 +94,11 @@ async def queued_run(db: AsyncSession) -> AgentRun:
     run = AgentRun(
         id=str(uuid4()), session_id=session.id, user_id=user.id, run_kind="user", visibility="user",
         profile_name="pi_poc", profile_version="v1", model="test", status="queued",
+        prompt_snapshot_json={
+            "marketing_capability_pack": build_marketing_run_capability(
+                model_version="test"
+            ).model_dump(mode="json")
+        },
     )
     message = AgentMessage(
         id=str(uuid4()), session_id=session.id, run_id=run.id, role="user", content="请解释现有报告",
@@ -132,6 +138,8 @@ async def test_runner_completes_non_marketing_reply_with_one_terminal_event(
     assert outcome == "completed"
     assert client.closed
     assert client.prompts
+    assert "[MARKETING_ROOT_POLICY]" in client.prompts[0]
+    assert "非营销主题必须使用固定范围回复" in client.prompts[0]
     events = (await db.scalars(select(AgentEvent).where(AgentEvent.run_id == queued_run.id))).all()
     assert [event.event_type for event in events].count("run.completed") == 1
     assert any(event.event_type == "message.completed" for event in events)

@@ -27,6 +27,10 @@ from app.agent_runtime.models import (
 from app.agent_runtime.repository import AgentRunRepository
 from app.agent_runtime.state import RunStatus
 from app.core.config import Settings
+from app.marketing_capability_pack.runtime import (
+    MarketingRunCapability,
+    render_marketing_system_context,
+)
 from app.pi_runtime_poc.audit import PiRunAuditWriter
 from app.pi_runtime_poc.auth import PiPocSettingsGuard, issue_run_token
 from app.pi_runtime_poc.diagnostics import safe_db_diagnostic
@@ -298,7 +302,10 @@ class PiPocRunner:
                 "formal_outputs_require_builder_and_publish": True,
             },
         }
-        return json.dumps(context, ensure_ascii=False)
+        capability = MarketingRunCapability.model_validate(
+            (run.prompt_snapshot_json or {}).get("marketing_capability_pack")
+        )
+        return render_marketing_system_context(capability, context)
 
     async def _audit_event(self, run_id: str, event: dict[str, Any]) -> None:
         await PiRunAuditWriter(db=self._db, events=self._events).write_rpc_event(

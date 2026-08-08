@@ -14,6 +14,7 @@ import type { PiPocHttpClient } from "../http/client.js";
 
 export const PI_INTERNAL_TOOL_NAMES = [
   "get_session_context",
+  "load_marketing_skill",
   "search_evidence",
   "read_tool_result",
   "read_artifact",
@@ -38,6 +39,17 @@ export const INTERNAL_TOOL_DEFINITIONS = [
     name: "get_session_context",
     description: "读取当前 Run 的受限会话、已发布版本和 Evidence 索引。",
     parameters: Type.Object({}, { additionalProperties: false }),
+  },
+  {
+    name: "load_marketing_skill",
+    description: "从当前 Run 的营销能力包快照加载一个已启用专项 Skill 正文。",
+    parameters: Type.Object(
+      {
+        skill_name: Type.String({ minLength: 1, maxLength: 64, pattern: "^[a-z0-9][a-z0-9-]{0,63}$" }),
+        requested_version: Type.Optional(Type.String({ minLength: 1, maxLength: 64 })),
+      },
+      { additionalProperties: false },
+    ),
   },
   {
     name: "search_evidence",

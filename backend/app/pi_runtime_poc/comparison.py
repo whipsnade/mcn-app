@@ -33,6 +33,7 @@ from app.agent_runtime.models import (
 from app.core.config import Settings
 from app.identity.models import User, UserChannelPermission
 from app.identity.service import IdentityService
+from app.marketing_capability_pack.runtime import build_marketing_run_capability
 from app.mcp_gateway.contracts import DataTapService
 from app.pi_runtime_poc.rpc import PiRpcClient, PiRpcConfig
 from app.pi_runtime_poc.runner import PiClientFactory, PiPocRunner
@@ -236,6 +237,9 @@ class PocCaseFactory:
                 model=self._model_name,
                 status="queued",
                 prompt_snapshot_json={
+                    "marketing_capability_pack": build_marketing_run_capability(
+                        model_version=self._model_name
+                    ).model_dump(mode="json"),
                     "pi_runtime_poc": {
                         "round_id": self._round_id,
                         "case_id": case.case_id,

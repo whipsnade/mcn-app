@@ -49,6 +49,7 @@ describe("isAllowedInternalTool", () => {
   it("只允许设计白名单内的受控内部工具", () => {
     expect(PI_INTERNAL_TOOL_NAMES).toEqual([
       "get_session_context",
+      "load_marketing_skill",
       "search_evidence",
       "read_tool_result",
       "read_artifact",

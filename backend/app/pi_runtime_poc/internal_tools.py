@@ -41,11 +41,13 @@ from app.agent_runtime.tools.history import (
     SearchEvidenceTool,
 )
 from app.agent_runtime.tools.registry import ToolRegistry
+from app.marketing_capability_pack.runtime import MarketingRunCapability
 
 # Pi 可见内部工具白名单（设计 §方案 A Task 5；与前端 internal-tools.ts 镜像）。
 PI_POC_ALLOWED_TOOLS: frozenset[str] = frozenset(
     {
         "get_session_context",
+        "load_marketing_skill",
         "search_evidence",
         "read_tool_result",
         "read_artifact",
@@ -80,6 +82,7 @@ def build_pi_internal_registry(*, db: AsyncSession, worker_id: str) -> ToolRegis
     registry.register(SearchEvidenceTool(db), category=HISTORY_TOOLS)
     registry.register(ReadToolResultTool(db), category=HISTORY_TOOLS)
     registry.register(GetSessionContextTool(db), category=HISTORY_TOOLS)
+    registry.register(LoadMarketingSkillTool(db), category=HISTORY_TOOLS)
     registry.register(BuildBrandReportDraftTool(db), category=ARTIFACT_TOOLS)
     registry.register(BuildCampaignReportDraftTool(db), category=ARTIFACT_TOOLS)
     registry.register(BuildKolSelectionDraftTool(db), category=ARTIFACT_TOOLS)
@@ -147,6 +150,41 @@ class GetSessionContextTool:
             "evidence_count": evidence_count or 0,
         }
         return ToolResult(status="success", safe_summary=json.dumps(summary, ensure_ascii=False))
+
+
+class LoadMarketingSkillArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    skill_name: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{0,63}$")
+    requested_version: str | None = Field(default=None, max_length=64)
+
+
+class LoadMarketingSkillTool:
+    """仅从当前 Run 的已持久化 snapshot 返回专项 Skill，不接收路径。"""
+
+    name = "load_marketing_skill"
+    input_model = LoadMarketingSkillArgs
+    points_cost = 0
+    external_side_effect = False
+
+    def __init__(self, db_session: AsyncSession) -> None:
+        self._db = db_session
+
+    async def execute(self, context: ToolContext, arguments: BaseModel) -> ToolResult:
+        args = LoadMarketingSkillArgs.model_validate(arguments)
+        run = await self._db.get(AgentRun, context.run_id)
+        if run is None or run.user_id != context.user_id or run.session_id != context.session_id:
+            return ToolResult(status="failed", safe_summary="run_not_found", error_type="not_found")
+        try:
+            capability = MarketingRunCapability.model_validate(
+                (run.prompt_snapshot_json or {}).get("marketing_capability_pack")
+            )
+            loaded = capability.load_skill(args.skill_name, args.requested_version)
+        except ValueError as exc:
+            return ToolResult(
+                status="failed", safe_summary=str(exc), error_type="marketing_skill_not_enabled"
+            )
+        return ToolResult(status="success", safe_summary=json.dumps(loaded, ensure_ascii=False))
 
 
 class PublishArtifactsArgs(BaseModel):
