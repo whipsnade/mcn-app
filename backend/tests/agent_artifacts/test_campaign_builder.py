@@ -558,6 +558,7 @@ def test_campaign_builder_conflict_keeps_both_values_with_limitation() -> None:
                 [
                     {
                         "平台": "合计",
+                        "日期": "2026-07-15",
                         "投放金额": 100000,
                         "声量": 999999,
                         "互动数": 888888,
@@ -1038,7 +1039,12 @@ def test_social_conflict_uses_observed_volume() -> None:
         scope=SCOPE,
         evidence={
             "posts": [("ev-1", observed_zero)],
-            "upload": [("ev-2", [{"平台": "合计", "声量": 999, "投放金额": 100}])],
+            "upload": [
+                (
+                    "ev-2",
+                    [{"平台": "合计", "日期": "2026-07-15", "声量": 999, "投放金额": 100}],
+                )
+            ],
         },
     )
     conflicts = [lim for lim in build.payload["limitations"] if lim["code"] == "social_metric_conflict"]
@@ -1049,7 +1055,12 @@ def test_social_conflict_uses_observed_volume() -> None:
         scope=SCOPE,
         evidence={
             "posts": [("ev-1", not_observed)],
-            "upload": [("ev-2", [{"平台": "合计", "声量": 999, "投放金额": 100}])],
+            "upload": [
+                (
+                    "ev-2",
+                    [{"平台": "合计", "日期": "2026-07-15", "声量": 999, "投放金额": 100}],
+                )
+            ],
         },
     )
     conflicts = [lim for lim in build.payload["limitations"] if lim["code"] == "social_metric_conflict"]

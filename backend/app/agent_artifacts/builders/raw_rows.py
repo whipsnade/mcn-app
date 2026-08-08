@@ -54,6 +54,7 @@ class RowRef(NamedTuple):
 
 PLATFORM_KEYS = ("平台", "platform", "媒体", "媒介", "datasource", "数据源")
 VOLUME_KEYS = ("声量", "品牌声量", "品牌提及量", "brand_mentions", "volume", "mentions")
+UNIT_KEYS = ("单位", "unit", "metric_unit", "measurement_unit")
 ENGAGEMENT_KEYS = ("互动数", "互动量", "互动", "interactions", "engagement")
 POSTS_KEYS = ("发帖数", "帖子数", "笔记数", "posts", "notes")
 POSITIVE_KEYS = ("正面声量数", "正面声量", "正面", "positive")
@@ -529,6 +530,13 @@ def canonicalize_marketing_evidence(
                     if source_key is None:
                         continue
                     normalized[canonical_name] = ref.row[source_key]
+                if "volume" in normalized or "engagement" in normalized:
+                    unit_key = next(
+                        (key for key in UNIT_KEYS if key in ref.row and ref.row[key] not in (None, "")),
+                        None,
+                    )
+                    if unit_key is not None:
+                        normalized["unit"] = ref.row[unit_key]
                 if normalized:
                     seen_sources.add(key)
                     normalized_rows.append(
@@ -571,6 +579,7 @@ __all__ = [
     "TIME_KEYS",
     "TITLE_KEYS",
     "TOPIC_KEYS",
+    "UNIT_KEYS",
     "URL_KEYS",
     "VOLUME_KEYS",
     "CanonicalEvidence",

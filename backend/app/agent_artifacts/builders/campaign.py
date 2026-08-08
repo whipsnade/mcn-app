@@ -49,9 +49,14 @@ from app.agent_artifacts.builders.raw_rows import (
     LIKE_KEYS,
     PLATFORM_KEYS,
     POST_DATE_KEYS,
+    POST_ID_KEYS,
+    POSTS_KEYS,
     REGION_KEYS,
     SENTIMENT_KEYS,
     SHARE_KEYS,
+    TITLE_KEYS,
+    UNIT_KEYS,
+    URL_KEYS,
     VOLUME_KEYS,
     RowRef,
     canon_platform,
@@ -132,6 +137,12 @@ _BOOLEAN_ATTRIBUTION_KEYS = ("is_paid", "是否付费")
 _TEXT_ATTRIBUTION_KEYS = ("attribution", "归属", "投放类型", "付费/自然")
 _PAID_BOOL_VALUES = frozenset({"是", "true", "1", "yes"})
 _ORGANIC_BOOL_VALUES = frozenset({"否", "false", "0", "no"})
+_MENTION_UNITS = frozenset(
+    {"mention", "mentions", "声量", "品牌声量", "品牌提及量", "brand_mentions", "volume"}
+)
+_INTERACTION_UNITS = frozenset(
+    {"interaction", "interactions", "互动", "互动数", "engagement"}
+)
 
 
 def _row_engagement(row: dict[str, Any]) -> int | None:
@@ -195,6 +206,100 @@ def _has_explicit_platform(ref: RowRef) -> bool:
 
 def _platform_rows(rows: list[RowRef]) -> list[RowRef]:
     return [ref for ref in rows if _has_explicit_platform(ref)]
+
+
+def _has_platform_relevant_data(ref: RowRef) -> bool:
+    """判断无平台行是否携带会进入某个聚合的有效字段。
+
+    不能依赖 TopPost 的 id/title/url 候选判断：DataTap 可能只返回一列互动或
+    声量，仍然足以影响 overview、平台贡献或比较值。规范化入口已移除未知
+    与空值字段，因此任一非空 normalized row 都可能影响至少一个行数聚合。
+    """
+    return bool(ref.row)
+
+
+def _missing_platform_rows(rows: list[RowRef]) -> list[RowRef]:
+    return [
+        ref
+        for ref in rows
+        if not _has_explicit_platform(ref) and _has_platform_relevant_data(ref)
+    ]
+
+
+def _has_post_identity(row: dict[str, Any]) -> bool:
+    return any(
+        text(first(row, keys)) is not None
+        for keys in (POST_ID_KEYS, TITLE_KEYS, URL_KEYS)
+    ) or whole(first(row, POSTS_KEYS)) is not None
+
+
+def _missing_platform_impact_fields(rows: list[RowRef]) -> dict[str, set[str]]:
+    """返回被缺平台行影响的章节及数值叶子字段。
+
+    缺平台行仍被排除在聚合之外；这里仅把实际可能由该行提供的数值标记为
+    partial，避免把没有使用该字段的章节一并降级。
+    """
+    impacts: dict[str, set[str]] = {}
+    for ref in rows:
+        row = ref.row
+        is_post = _has_post_identity(row)
+        if is_post:
+            impacts.setdefault("overview", set()).update({"total_volume", "total_posts"})
+            impacts.setdefault("platform_contributions", set()).update(
+                {"volume", "posts", "share"}
+            )
+            impacts.setdefault("comparisons", set()).add("metric:posts")
+        attribution_kind = _attribution_kind(ref)[0]
+        if is_post:
+            impacts.setdefault("attribution", set()).add("paid_confirmed_share")
+            impacts["attribution"].add(attribution_kind)
+
+        engagement = _row_engagement(row) is not None
+        if engagement:
+            impacts.setdefault("overview", set()).add("total_engagement")
+            impacts.setdefault("platform_contributions", set()).add("engagement")
+            impacts.setdefault("comparisons", set()).add("metric:engagement")
+
+        if whole(first(row, VOLUME_KEYS)) is not None:
+            impacts.setdefault("comparisons", set()).add("metric:volume")
+
+        if _row_author_id(row) is not None:
+            impacts.setdefault("overview", set()).add("total_creators")
+            impacts.setdefault("platform_contributions", set()).add("creators")
+            impacts.setdefault("comparisons", set()).add("metric:creators")
+            impacts.setdefault("kol_contributions", set()).update(
+                {"posts", "volume"}
+            )
+            if engagement:
+                impacts["kol_contributions"].update({"engagement", "contribution_share"})
+
+        if parse_date(first(row, DATE_KEYS + POST_DATE_KEYS)) is not None:
+            impacts.setdefault("timeline", set()).update({"volume", "posts"})
+            if engagement:
+                impacts["timeline"].add("engagement")
+
+        if text(first(row, CONTENT_TYPE_KEYS)) is not None:
+            impacts.setdefault("content_types", set()).update({"posts", "volume"})
+            if engagement:
+                impacts["content_types"].add("engagement")
+
+        if text(first(row, SENTIMENT_KEYS)) is not None:
+            impacts.setdefault("sentiment", set()).update({"count", "share"})
+            impacts.setdefault("overview", set()).add("sentiment_score")
+
+        if (
+            text(first(row, REGION_KEYS)) is not None
+            and whole(first(row, VOLUME_KEYS)) is not None
+        ):
+            impacts.setdefault("audience_regions", set()).update({"volume", "share"})
+
+        if attribution_kind == "organic":
+            impacts.setdefault("organic_summary", set()).add("posts")
+            if whole(first(row, VOLUME_KEYS)) is not None:
+                impacts["organic_summary"].add("volume")
+            if engagement:
+                impacts["organic_summary"].add("engagement")
+    return impacts
 
 
 def _build_overview(
@@ -809,6 +914,42 @@ def _sum_number(rows: list[RowRef], keys: tuple[str, ...]) -> int | None:
     return total
 
 
+def _rows_in_scope_period(rows: list[RowRef], period: Any) -> list[RowRef] | None:
+    """只返回能证明属于当前 scope period 的行。
+
+    任一参与行缺少可解析日期时返回 ``None``，表示无法证明同周期；明确落在
+    scope 外的行被排除。调用方据此 fail-closed，不制造跨周期冲突。
+    """
+    if not rows:
+        return None
+    selected: list[RowRef] = []
+    for ref in rows:
+        day = parse_date(first(ref.row, DATE_KEYS + POST_DATE_KEYS))
+        if day is None:
+            return None
+        if period.start <= day <= period.end:
+            selected.append(ref)
+    return selected or None
+
+
+def _volume_units_are_mentions(rows: list[RowRef]) -> bool:
+    """VOLUME_KEYS 的默认语义是 mentions；显式不一致单位禁止比较。"""
+    for ref in rows:
+        unit = text(first(ref.row, UNIT_KEYS))
+        if unit is not None and unit.casefold() not in _MENTION_UNITS:
+            return False
+    return True
+
+
+def _interaction_units_are_compatible(rows: list[RowRef]) -> bool:
+    """互动字段默认是 interactions；显式 likes/shares 等单位禁止比较。"""
+    for ref in rows:
+        unit = text(first(ref.row, UNIT_KEYS))
+        if unit is not None and unit.casefold() not in _INTERACTION_UNITS:
+            return False
+    return True
+
+
 def _internal_source_rows(upload_rows: list[RowRef]) -> list[RowRef]:
     total_rows = [
         ref
@@ -960,6 +1101,7 @@ def build_campaign_report_draft(
     collector = LineageCollector()
     post_rows = _dedup_rows(_group_posts(groups[GROUP_POSTS]))
     post_metric_rows = _platform_rows(post_rows)
+    missing_platform_rows = _missing_platform_rows(post_rows)
     # Gate C Task 4：社媒指标以 DataTap 为主（post/social/posts 分组合并去重），
     # 成本/转化以 upload 为主；冲突值双保留并生成 limitation。
     # Gate C 复审：合并行列表按 (evidence_id, source_path) 去重，同一 Evidence
@@ -974,16 +1116,33 @@ def build_campaign_report_draft(
     baseline_rows = _platform_rows(_dedup_rows(_group_posts(groups[GROUP_BASELINE])))
     post_period_rows = _platform_rows(_dedup_rows(_group_posts(groups[GROUP_POST])))
 
-    # 社媒冲突检测：upload 行若同时携带声量/互动且与 DataTap 不同，双值保留。
+    # 社媒冲突检测：仅比较同一指标、同一 scope period 且单位可证明一致的行。
     # observed 规则（Gate C 第三轮）：DataTap 侧字段出现合计 0（观测值）vs
     # upload 非 0 是真实冲突；DataTap 字段完全没出现（未观测）不参与比较。
     social_conflicts: list[dict[str, Any]] = []
     conflict_partial_paths: set[str] = set()
-    upload_volume = _sum_number(upload_rows, VOLUME_KEYS)
-    upload_engagement = _sum_number(upload_rows, ENGAGEMENT_KEYS)
-    datatap_volume = _sum_number(social_rows, VOLUME_KEYS)
-    datatap_engagement = _sum_number(social_rows, ENGAGEMENT_KEYS)
-    if upload_volume is not None and datatap_volume is not None and upload_volume != datatap_volume:
+    upload_volume_rows = _rows_in_scope_period(
+        _rows_with_metric(upload_rows, VOLUME_KEYS), scope_model.period
+    )
+    social_volume_rows = _rows_in_scope_period(
+        _rows_with_metric(social_rows, VOLUME_KEYS), scope_model.period
+    )
+    upload_engagement_rows = _rows_in_scope_period(
+        _rows_with_metric(upload_rows, ENGAGEMENT_KEYS), scope_model.period
+    )
+    social_engagement_rows = _rows_in_scope_period(
+        _rows_with_metric(social_rows, ENGAGEMENT_KEYS), scope_model.period
+    )
+    upload_volume = _sum_number(upload_volume_rows or [], VOLUME_KEYS)
+    datatap_volume = _sum_number(social_volume_rows or [], VOLUME_KEYS)
+    upload_engagement = _sum_number(upload_engagement_rows or [], ENGAGEMENT_KEYS)
+    datatap_engagement = _sum_number(social_engagement_rows or [], ENGAGEMENT_KEYS)
+    if (
+        upload_volume is not None
+        and datatap_volume is not None
+        and upload_volume != datatap_volume
+        and _volume_units_are_mentions([*(upload_volume_rows or []), *(social_volume_rows or [])])
+    ):
         social_conflicts.append(
             {
                 "code": "social_metric_conflict",
@@ -991,10 +1150,17 @@ def build_campaign_report_draft(
                     f"声量冲突双值保留：DataTap {datatap_volume} / 用户资料 "
                     f"{upload_volume}，未静默覆盖"
                 ),
-                "affected_paths": ["social_volume"],
+                "affected_paths": [],
             }
         )
-    if upload_engagement is not None and datatap_engagement is not None and upload_engagement != datatap_engagement:
+    if (
+        upload_engagement is not None
+        and datatap_engagement is not None
+        and upload_engagement != datatap_engagement
+        and _interaction_units_are_compatible(
+            [*(upload_engagement_rows or []), *(social_engagement_rows or [])]
+        )
+    ):
         social_conflicts.append(
             {
                 "code": "social_metric_conflict",
@@ -1153,18 +1319,6 @@ def build_campaign_report_draft(
     }
     # ---- 平台覆盖率：按章节实际 Evidence 判断，不把已观测原始值误标 partial ----
     partial_paths: set[str] = set()
-    post_platform_sections = (
-        "overview",
-        "platform_contributions",
-        "timeline",
-        "kol_contributions",
-        "content_types",
-        "sentiment",
-        "comparisons",
-        "attribution",
-        "organic_summary",
-        "audience_regions",
-    )
     def mark_coverage_partial(
         section: str, rows: list[RowRef], *, paths: list[str] | None = None
     ) -> bool:
@@ -1215,21 +1369,38 @@ def build_campaign_report_draft(
     )
     mark_coverage_partial("timeline", post_metric_rows)
     mark_coverage_partial("top_posts", post_metric_rows)
-    if posts_meta["missing_platform"]:
-        for section in post_platform_sections:
-            if has_rows.get(section, False):
-                force_partial.add(section)
-                extra_limitations.setdefault(section, []).append(
-                    {
-                        "code": "post_platform_missing",
-                        "message": "部分帖子缺少平台，已从平台相关聚合中排除",
-                        "affected_paths": [section],
-                    }
-                )
+
+    missing_platform_impacts = _missing_platform_impact_fields(missing_platform_rows)
+    if not (baseline_rows or post_period_rows):
+        missing_platform_impacts.pop("comparisons", None)
+    for section, fields in missing_platform_impacts.items():
+        if not has_rows.get(section, False):
+            continue
+        force_partial.add(section)
+        extra_limitations.setdefault(section, []).append(
+            {
+                "code": "post_platform_missing",
+                "message": "部分帖子缺少平台，已从平台相关聚合中排除",
+                "affected_paths": [section],
+            }
+        )
         for path, value in walk_data_leaves(data):
-            if value is not None and any(
-                path.startswith(f"/data/{section}/") for section in post_platform_sections
-            ):
+            if value is None or not path.startswith(f"/data/{section}/"):
+                continue
+            if section == "comparisons":
+                parts = path.split("/")
+                metric_index = parts[-2] if len(parts) >= 2 else ""
+                metric_names = ("volume", "engagement", "posts", "creators")
+                numeric_fields = {"current", "baseline", "delta", "rate"}
+                if (
+                    parts[-1] in numeric_fields
+                    and metric_index.isdigit()
+                    and int(metric_index) < len(metric_names)
+                    and f"metric:{metric_names[int(metric_index)]}" in fields
+                ):
+                    partial_paths.add(path)
+                continue
+            if path.rsplit("/", 1)[-1] in fields:
                 partial_paths.add(path)
     partial_paths.update(conflict_partial_paths)
 
@@ -1241,11 +1412,12 @@ def build_campaign_report_draft(
     )
     for conflict in social_conflicts:
         limitations.append(conflict)
-        force_partial.add("overview")
-        availability["overview"]["status"] = "partial"
-        if "social_metric_conflict" not in availability["overview"]["reason_codes"]:
-            availability["overview"]["reason_codes"].append("social_metric_conflict")
-        data_status = "restricted"
+        if "overview.total_engagement" in conflict["affected_paths"]:
+            force_partial.add("overview")
+            availability["overview"]["status"] = "partial"
+            if "social_metric_conflict" not in availability["overview"]["reason_codes"]:
+                availability["overview"]["reason_codes"].append("social_metric_conflict")
+            data_status = "restricted"
     for section, section_limitations in extra_limitations.items():
         if any(item["code"] == "platform_coverage_incomplete" for item in section_limitations):
             availability[section]["reason_codes"] = [

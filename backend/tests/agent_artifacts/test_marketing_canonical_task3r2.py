@@ -322,7 +322,12 @@ def test_social_metric_conflict_only_marks_same_metric_canonical_field_partial()
         scope={**_CAMPAIGN_SCOPE, "platforms": ["xiaohongshu"]},
         evidence={
             "posts": [("ev-post", [_post("小红书", "p-1", 声量=10, 互动数=10)])],
-            "upload": [("ev-upload", [{"平台": "小红书", "声量": 20, "互动数": 30}])],
+            "upload": [
+                (
+                    "ev-upload",
+                    [{"平台": "小红书", "日期": "2026-07-15", "声量": 20, "互动数": 30}],
+                )
+            ],
         },
     ).payload
     fields = _by_path(payload)

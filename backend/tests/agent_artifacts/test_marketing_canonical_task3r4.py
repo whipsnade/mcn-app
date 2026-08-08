@@ -139,6 +139,239 @@ def test_campaign_missing_platform_posts_are_excluded_from_platform_sections() -
     assert any(item["code"] == "post_platform_missing" for item in payload["limitations"])
 
 
+def test_campaign_missing_platform_metric_row_is_disclosed_without_overdegrading() -> None:
+    """纯指标行也必须被识别，但不能影响没有使用该行的章节。"""
+    payload = build_campaign_report_draft(
+        scope={
+            "brand": "测试品牌",
+            "campaign": "测试活动",
+            "period": {"start": "2026-07-01", "end": "2026-07-31", "timezone": "Asia/Shanghai"},
+            "platforms": ["xiaohongshu"],
+            "keywords": [],
+        },
+        evidence={
+            "posts": [
+                (
+                    "ev-posts",
+                    [_campaign_post("xhs", "小红书"), {"互动数": 99}],
+                )
+            ]
+        },
+    ).payload
+
+    fields = {field.path: field for field in payload["canonical_data"]}
+    assert payload["data"]["overview"]["total_engagement"] == 10
+    assert payload["availability"]["overview"]["status"] == "partial"
+    assert payload["availability"]["platform_contributions"]["status"] == "partial"
+    assert payload["availability"]["timeline"]["status"] == "complete"
+    assert fields["/data/overview/total_volume"].availability == "complete"
+    assert fields["/data/overview/total_posts"].availability == "complete"
+    assert fields["/data/overview/total_engagement"].availability == "partial"
+    assert fields["/data/platform_contributions/0/volume"].availability == "complete"
+    assert fields["/data/platform_contributions/0/posts"].availability == "complete"
+    assert fields["/data/platform_contributions/0/share"].availability == "complete"
+    assert any(item["code"] == "post_platform_missing" for item in payload["limitations"])
+
+
+def test_campaign_explicit_aggregate_platform_is_not_treated_as_missing() -> None:
+    payload = build_campaign_report_draft(
+        scope={
+            "brand": "测试品牌",
+            "campaign": "测试活动",
+            "period": {"start": "2026-07-01", "end": "2026-07-31", "timezone": "Asia/Shanghai"},
+            "platforms": ["xiaohongshu"],
+            "keywords": [],
+        },
+        evidence={
+            "posts": [
+                (
+                    "ev-posts",
+                    [_campaign_post("xhs", "小红书"), {"平台": "合计", "互动数": 99}],
+                )
+            ]
+        },
+    ).payload
+
+    assert not any(item["code"] == "post_platform_missing" for item in payload["limitations"])
+    assert any(item["platform"] == "all" for item in payload["data"]["platform_contributions"])
+
+
+def test_campaign_missing_platform_metric_marks_only_comparison_metric() -> None:
+    payload = build_campaign_report_draft(
+        scope={
+            "brand": "测试品牌",
+            "campaign": "测试活动",
+            "period": {"start": "2026-07-01", "end": "2026-07-31", "timezone": "Asia/Shanghai"},
+            "platforms": ["xiaohongshu"],
+            "keywords": [],
+        },
+        evidence={
+            "posts": [
+                (
+                    "ev-current",
+                    [_campaign_post("current", "小红书"), {"互动数": 99}],
+                )
+            ],
+            "baseline": [
+                (
+                    "ev-baseline",
+                    [{**_campaign_post("baseline", "小红书"), "互动数": 5}],
+                )
+            ],
+        },
+    ).payload
+
+    fields = {field.path: field for field in payload["canonical_data"]}
+    for period in ("current", "baseline", "delta", "rate"):
+        assert fields[f"/data/comparisons/current_baseline/1/{period}"].availability == "partial"
+        assert fields[f"/data/comparisons/current_baseline/2/{period}"].availability == "complete"
+
+
+def test_social_volume_outside_scope_period_is_not_compared() -> None:
+    evidence = {
+        "posts": [
+            (
+                "ev-posts",
+                [{**_campaign_post("p1", "小红书"), "声量": 10}],
+            )
+        ],
+        "upload": [
+            (
+                "ev-upload",
+                [{"平台": "合计", "声量": 20, "日期": "2026-01-15"}],
+            )
+        ],
+    }
+    payload = build_campaign_report_draft(
+        scope={
+            "brand": "测试品牌",
+            "campaign": "测试活动",
+            "period": {"start": "2026-07-01", "end": "2026-07-31", "timezone": "Asia/Shanghai"},
+            "platforms": ["xiaohongshu"],
+            "keywords": [],
+        },
+        evidence=evidence,
+    ).payload
+    baseline = build_campaign_report_draft(
+        scope={
+            "brand": "测试品牌",
+            "campaign": "测试活动",
+            "period": {"start": "2026-07-01", "end": "2026-07-31", "timezone": "Asia/Shanghai"},
+            "platforms": ["xiaohongshu"],
+            "keywords": [],
+        },
+        evidence={"posts": evidence["posts"]},
+    ).payload
+
+    fields = {field.path: field for field in payload["canonical_data"]}
+    assert not any(item["code"] == "social_metric_conflict" for item in payload["limitations"])
+    assert payload["data_status"] == baseline["data_status"]
+    assert payload["availability"]["overview"] == baseline["availability"]["overview"]
+    assert fields["/data/overview/total_volume"].availability == "complete"
+
+
+def test_same_period_social_volume_conflict_only_discloses_source_metric() -> None:
+    evidence = {
+        "posts": [
+            (
+                "ev-posts",
+                [{**_campaign_post("p1", "小红书"), "声量": 10}],
+            )
+        ],
+        "upload": [
+            (
+                "ev-upload",
+                [{"平台": "合计", "声量": 20, "日期": "2026-07-15"}],
+            )
+        ],
+    }
+    payload = build_campaign_report_draft(
+        scope={
+            "brand": "测试品牌",
+            "campaign": "测试活动",
+            "period": {"start": "2026-07-01", "end": "2026-07-31", "timezone": "Asia/Shanghai"},
+            "platforms": ["xiaohongshu"],
+            "keywords": [],
+        },
+        evidence=evidence,
+    ).payload
+    baseline = build_campaign_report_draft(
+        scope={
+            "brand": "测试品牌",
+            "campaign": "测试活动",
+            "period": {"start": "2026-07-01", "end": "2026-07-31", "timezone": "Asia/Shanghai"},
+            "platforms": ["xiaohongshu"],
+            "keywords": [],
+        },
+        evidence={"posts": evidence["posts"]},
+    ).payload
+
+    fields = {field.path: field for field in payload["canonical_data"]}
+    conflicts = [item for item in payload["limitations"] if item["code"] == "social_metric_conflict"]
+    assert conflicts
+    assert all(item["affected_paths"] == [] for item in conflicts)
+    assert payload["data_status"] == baseline["data_status"]
+    assert payload["availability"]["overview"] == baseline["availability"]["overview"]
+    assert fields["/data/overview/total_volume"].availability == "complete"
+    assert not any("internal_metrics.spend" in item["affected_paths"] for item in conflicts)
+
+
+def test_social_volume_unit_mismatch_is_not_compared() -> None:
+    payload = build_campaign_report_draft(
+        scope={
+            "brand": "测试品牌",
+            "campaign": "测试活动",
+            "period": {"start": "2026-07-01", "end": "2026-07-31", "timezone": "Asia/Shanghai"},
+            "platforms": ["xiaohongshu"],
+            "keywords": [],
+        },
+        evidence={
+            "posts": [
+                (
+                    "ev-posts",
+                    [{**_campaign_post("p1", "小红书"), "声量": 10, "单位": "mentions"}],
+                )
+            ],
+            "upload": [
+                (
+                    "ev-upload",
+                    [{"平台": "合计", "声量": 20, "单位": "posts", "日期": "2026-07-15"}],
+                )
+            ],
+        },
+    ).payload
+
+    assert not any(item["code"] == "social_metric_conflict" for item in payload["limitations"])
+
+
+def test_social_engagement_unit_mismatch_is_not_compared() -> None:
+    payload = build_campaign_report_draft(
+        scope={
+            "brand": "测试品牌",
+            "campaign": "测试活动",
+            "period": {"start": "2026-07-01", "end": "2026-07-31", "timezone": "Asia/Shanghai"},
+            "platforms": ["xiaohongshu"],
+            "keywords": [],
+        },
+        evidence={
+            "posts": [
+                (
+                    "ev-posts",
+                    [{**_campaign_post("p1", "小红书"), "单位": "likes"}],
+                )
+            ],
+            "upload": [
+                (
+                    "ev-upload",
+                    [{"平台": "合计", "互动数": 20, "单位": "shares", "日期": "2026-07-15"}],
+                )
+            ],
+        },
+    ).payload
+
+    assert not any(item["code"] == "social_metric_conflict" for item in payload["limitations"])
+
+
 def test_social_volume_conflict_is_disclosed_without_mislabeling_post_or_spend_fields() -> None:
     payload = build_campaign_report_draft(
         scope={
@@ -149,8 +382,18 @@ def test_social_volume_conflict_is_disclosed_without_mislabeling_post_or_spend_f
             "keywords": [],
         },
         evidence={
-            "posts": [("ev-posts", [{"平台": "小红书", "帖子ID": "p1", "声量": 10, "互动数": 10}])],
-            "upload": [("ev-upload", [{"平台": "合计", "声量": 20, "互动数": 30}])],
+            "posts": [
+                (
+                    "ev-posts",
+                    [{"平台": "小红书", "帖子ID": "p1", "声量": 10, "互动数": 10, "日期": "2026-07-15"}],
+                )
+            ],
+            "upload": [
+                (
+                    "ev-upload",
+                    [{"平台": "合计", "声量": 20, "互动数": 30, "日期": "2026-07-15"}],
+                )
+            ],
         },
     ).payload
 
