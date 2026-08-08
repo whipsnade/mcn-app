@@ -15,6 +15,18 @@ _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _SENSITIVE_KEY = re.compile(
     r"(?:secret|token|api[_-]?key|endpoint|dsn|password)", re.IGNORECASE
 )
+_SENSITIVE_CONTENT_PATTERNS = (
+    re.compile(r"\bsk(?:-proj)?-[A-Za-z0-9_-]{8,}", re.IGNORECASE),
+    re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{8,}", re.IGNORECASE),
+    re.compile(r"[?&](?:token|api[_-]?key|key)=[^&\s]{1,}", re.IGNORECASE),
+    re.compile(
+        r"\b(?:mysql(?:\+[A-Za-z0-9_-]+)?|postgres(?:ql)?|mongodb|redis)://[^\s/@:]+:[^\s/@]+@",
+        re.IGNORECASE,
+    ),
+)
+_EXPECTED_CONTRACT_TYPES = frozenset(
+    {"brand_report_v3", "campaign_report_v3", "kol_selection_v3"}
+)
 _MANIFEST_KEYS = {
     "pack_name",
     "pack_version",
@@ -58,7 +70,7 @@ class CapabilityPackLoader:
             root_policy=policy,
             root_policy_digest=policy_digest,
             skills=skills,
-            artifact_contracts=tuple(self._string_map(value) for value in payload["artifact_contracts"]),
+            artifact_contracts=self._contracts(root, payload["artifact_contracts"]),
             builder_versions=self._string_map(payload["builder_versions"]),
             exporter_versions=self._string_map(payload["exporter_versions"]),
         )
@@ -121,9 +133,9 @@ class CapabilityPackLoader:
 
     @staticmethod
     def _validate_manifest_shape(payload: dict[str, Any]) -> None:
+        if _contains_sensitive_key(payload):
+            raise CapabilityPackError("manifest_sensitive_field")
         if set(payload) != _MANIFEST_KEYS:
-            if any(_SENSITIVE_KEY.search(key) for key in payload):
-                raise CapabilityPackError("manifest_sensitive_field")
             raise CapabilityPackError("manifest_fields_invalid")
         for key in ("skills", "artifact_contracts"):
             if not isinstance(payload[key], list):
@@ -138,7 +150,7 @@ class CapabilityPackLoader:
         }:
             raise CapabilityPackError("manifest_skill_invalid")
         path, digest = self._entry_path_and_digest(value)
-        self._safe_path(root, path)
+        self._read_checked(root, path, digest)
         tools = value["required_tools"]
         if not isinstance(tools, list) or not all(isinstance(tool, str) and tool for tool in tools):
             raise CapabilityPackError("manifest_skill_invalid")
@@ -150,6 +162,26 @@ class CapabilityPackLoader:
             required_tools=tuple(tools),
             artifact_contract=self._required_text(value, "artifact_contract"),
         )
+
+    def _contracts(self, root: Path, values: list[Any]) -> tuple[dict[str, str], ...]:
+        if len(values) != 3:
+            raise CapabilityPackError("manifest_contracts_invalid")
+        contracts: list[dict[str, str]] = []
+        for value in values:
+            if not isinstance(value, dict) or set(value) != {"artifact_type", "schema_version", "path", "digest"}:
+                raise CapabilityPackError("manifest_contracts_invalid")
+            path, digest = self._entry_path_and_digest(value)
+            content = self._read_checked(root, path, digest)
+            try:
+                contract = json.loads(content)
+            except json.JSONDecodeError as exc:
+                raise CapabilityPackError("manifest_contract_invalid") from exc
+            if not isinstance(contract, dict) or contract.get("artifact_type") != value["artifact_type"] or contract.get("schema_version") != value["schema_version"]:
+                raise CapabilityPackError("manifest_contract_invalid")
+            contracts.append({"artifact_type": value["artifact_type"], "schema_version": value["schema_version"], "digest": digest, "content": content})
+        if {item["artifact_type"] for item in contracts} != _EXPECTED_CONTRACT_TYPES:
+            raise CapabilityPackError("manifest_contracts_invalid")
+        return tuple(contracts)
 
     @staticmethod
     def _entry_path_and_digest(value: dict[str, Any]) -> tuple[str, str]:
@@ -176,9 +208,22 @@ class CapabilityPackLoader:
         content = self._safe_path(root, relative).read_text(encoding="utf-8")
         if hashlib.sha256(content.encode("utf-8")).hexdigest() != digest:
             raise CapabilityPackError("pack_digest_mismatch")
+        if any(pattern.search(content) for pattern in _SENSITIVE_CONTENT_PATTERNS):
+            raise CapabilityPackError("pack_sensitive_content")
         return content
 
 
 def _digest_json(value: dict[str, Any]) -> str:
     encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _contains_sensitive_key(value: Any) -> bool:
+    if isinstance(value, dict):
+        return any(
+            (isinstance(key, str) and _SENSITIVE_KEY.search(key)) or _contains_sensitive_key(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, list):
+        return any(_contains_sensitive_key(item) for item in value)
+    return False

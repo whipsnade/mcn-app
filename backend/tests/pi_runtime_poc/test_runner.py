@@ -138,8 +138,8 @@ async def test_runner_completes_non_marketing_reply_with_one_terminal_event(
     assert outcome == "completed"
     assert client.closed
     assert client.prompts
-    assert "[MARKETING_ROOT_POLICY]" in client.prompts[0]
-    assert "非营销主题必须使用固定范围回复" in client.prompts[0]
+    assert "[MARKETING_ROOT_POLICY]" not in client.prompts[0]
+    assert "非营销主题必须使用固定范围回复" not in client.prompts[0]
     events = (await db.scalars(select(AgentEvent).where(AgentEvent.run_id == queued_run.id))).all()
     assert [event.event_type for event in events].count("run.completed") == 1
     assert any(event.event_type == "message.completed" for event in events)

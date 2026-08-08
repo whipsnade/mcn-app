@@ -15,9 +15,9 @@
     {"name":"marketing-strategy","version":"1.0.0","path":"skills/marketing-strategy/SKILL.md","digest":"55f25f8abb39e4c56c6e661d691b91978712816c0b6ea0d588f5ec2e8f511174","required_tools":["read_artifact","search_evidence","request_clarification"],"artifact_contract":"strategy_advice_v1"}
   ],
   "artifact_contracts": [
-    {"artifact_type":"brand_report_v3","schema_version":"3"},
-    {"artifact_type":"campaign_report_v3","schema_version":"3"},
-    {"artifact_type":"kol_selection_v3","schema_version":"3"}
+    {"artifact_type":"brand_report_v3","schema_version":"3","path":"contracts/brand_report_v3.json","digest":"c7e75aea6090a686d73ee16e40f2cc6dd95baf84433c9cc9dbed24181511653d"},
+    {"artifact_type":"campaign_report_v3","schema_version":"3","path":"contracts/campaign_report_v3.json","digest":"51bca89c19bd5f20c48a3e3c0170701905d2c49a8f1fe4352b8365b81411065b"},
+    {"artifact_type":"kol_selection_v3","schema_version":"3","path":"contracts/kol_selection_v3.json","digest":"306ed5d672c7728399e51f2ba7e6ea693f7a2a279d13e022a75bb109b65300cf"}
   ],
   "builder_versions": {"brand_report_v3":"1.0.0","campaign_report_v3":"1.0.0","kol_selection_v3":"1.0.0"},
   "exporter_versions": {"brand_report_v3":"1.0.0","campaign_report_v3":"1.0.0","kol_selection_v3":"1.0.0"}

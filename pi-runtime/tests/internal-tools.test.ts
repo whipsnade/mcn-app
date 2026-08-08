@@ -74,10 +74,13 @@ describe("isAllowedInternalTool", () => {
       "read",
       "write",
       "edit",
+      "grep",
+      "find",
       "ls",
       "curl",
       "http",
       "fetch",
+      "file",
       "create_draft",
       "update_draft",
       "abandon_draft",
@@ -184,9 +187,33 @@ describe("registerInternalTools", () => {
     registerInternalTools(pi as never, new PiInternalToolsClient(http as never));
 
     const byName = (name: string) => registered.find((tool) => tool.name === name)!;
+    expect(byName("load_marketing_skill").parameters.required).toEqual(["skill_name"]);
     expect(byName("request_clarification").parameters.required).toEqual(["question"]);
     expect(byName("read_artifact").parameters.required).toEqual(["artifact_id"]);
     expect(byName("read_tool_result").parameters.required).toEqual(["evidence_id"]);
     expect(new Set(registered.map((tool) => tool.description)).size).toBeGreaterThan(1);
+  });
+
+  it("将 load_marketing_skill 的合法参数原样透传到内部 HTTP 客户端", async () => {
+    const registered: Array<{
+      name: string;
+      description: string;
+      parameters: { required?: string[] };
+      execute: (toolCallId: string, args: Record<string, unknown>) => Promise<unknown>;
+    }> = [];
+    const pi = { registerTool: (tool: (typeof registered)[number]) => registered.push(tool) };
+    const http = { executeInternalTool: vi.fn(async () => ({ ok: true })) };
+
+    registerInternalTools(pi as never, new PiInternalToolsClient(http as never));
+    const tool = registered.find((item) => item.name === "load_marketing_skill")!;
+    await tool.execute("pi-call-skill", {
+      skill_name: "brand-research-report",
+      requested_version: "1.0.0",
+    });
+
+    expect(http.executeInternalTool).toHaveBeenCalledWith("load_marketing_skill", {
+      skill_name: "brand-research-report",
+      requested_version: "1.0.0",
+    });
   });
 });

@@ -5,18 +5,28 @@ import pytest
 from app.marketing_capability_pack.runtime import (
     MarketingRunCapability,
     build_marketing_run_capability,
-    render_marketing_system_context,
+    render_marketing_system_prompt,
 )
 from app.pi_runtime_poc.internal_tools import PI_POC_ALLOWED_TOOLS
 
 
-def test_marketing_run_capability_forces_full_root_policy_into_system_context() -> None:
+def test_marketing_run_capability_forces_full_root_policy_into_system_prompt() -> None:
     capability = build_marketing_run_capability()
-    context = render_marketing_system_context(capability, {"user_question": "研究某品牌"})
+    prompt = render_marketing_system_prompt(capability)
 
-    assert capability.root_policy in context
-    assert "非营销主题必须使用固定范围回复" in context
+    assert capability.root_policy in prompt
+    assert "非营销主题必须使用固定范围回复" in prompt
     assert "root_policy" not in capability.enabled_skills
+
+
+def test_system_prompt_contains_only_root_policy_and_safe_skill_directory() -> None:
+    capability = build_marketing_run_capability()
+    prompt = render_marketing_system_prompt(capability)
+    directory = json.loads(prompt.split("[AVAILABLE_MARKETING_SKILLS]\n", 1)[1])
+
+    assert capability.root_policy in prompt
+    assert all(set(item) == {"name", "description", "version", "artifact_contract"} for item in directory)
+    assert all(skill.content not in prompt for skill in capability.skills)
 
 
 def test_capability_loads_only_enabled_skill_and_is_idempotent() -> None:

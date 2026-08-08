@@ -43,6 +43,7 @@ class MarketingRunCapability(BaseModel):
     exporter_versions: dict[str, str]
     model_version: str | None = None
     data_gateway_version: str = "datatap_gateway_v1"
+    loaded_skills: tuple[dict[str, str], ...] = ()
 
     @model_validator(mode="after")
     def verify_root_policy(self) -> MarketingRunCapability:
@@ -102,16 +103,20 @@ def build_marketing_run_capability(
     )
 
 
-def render_marketing_system_context(
-    capability: MarketingRunCapability, run_context: dict[str, object]
-) -> str:
-    return "\n\n".join(
-        (
-            "[MARKETING_ROOT_POLICY]\n" + capability.root_policy,
-            "[MARKETING_RUN_CONTEXT]\n"
-            + json.dumps(run_context, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
-        )
-    )
+def render_marketing_system_prompt(capability: MarketingRunCapability) -> str:
+    directory = [
+        {"name": skill.name, "description": _description(skill.content), "version": skill.version,
+         "artifact_contract": skill.artifact_contract}
+        for skill in capability.skills
+    ]
+    return capability.root_policy + "\n\n[AVAILABLE_MARKETING_SKILLS]\n" + json.dumps(directory, ensure_ascii=False)
+
+
+def _description(content: str) -> str:
+    for line in content.splitlines():
+        if line.startswith("description:"):
+            return line.removeprefix("description:").strip()
+    return ""
 
 
 def _digest(value: str) -> str:

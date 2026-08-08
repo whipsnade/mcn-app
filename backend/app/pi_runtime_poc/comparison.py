@@ -33,7 +33,11 @@ from app.agent_runtime.models import (
 from app.core.config import Settings
 from app.identity.models import User, UserChannelPermission
 from app.identity.service import IdentityService
-from app.marketing_capability_pack.runtime import build_marketing_run_capability
+from app.marketing_capability_pack.runtime import (
+    MarketingRunCapability,
+    build_marketing_run_capability,
+    render_marketing_system_prompt,
+)
 from app.mcp_gateway.contracts import DataTapService
 from app.pi_runtime_poc.rpc import PiRpcClient, PiRpcConfig
 from app.pi_runtime_poc.runner import PiClientFactory, PiPocRunner
@@ -462,8 +466,7 @@ def build_real_pi_client_factory(settings: Settings) -> Callable[[AgentRun, str]
     executable = pi_root / "node_modules" / ".bin" / "pi"
     adapter_extension = pi_root / "node_modules" / "pi-mcp-adapter" / "index.ts"
     extension = pi_root / "src" / "extensions" / "poc-runtime.ts"
-    skills = tuple(str(path) for path in sorted((pi_root / "skills").glob("*/SKILL.md")))
-    if not executable.is_file() or not adapter_extension.is_file() or not extension.is_file() or len(skills) != 6:
+    if not executable.is_file() or not adapter_extension.is_file() or not extension.is_file():
         raise RuntimeError("pi_poc_runtime_resources_missing")
     provider = "kol_insight_pi_poc"
     models_json = json.dumps(
@@ -494,6 +497,12 @@ def build_real_pi_client_factory(settings: Settings) -> Callable[[AgentRun, str]
     )
 
     def factory(run: AgentRun, token: str) -> object:
+        try:
+            capability = MarketingRunCapability.model_validate(
+                (run.prompt_snapshot_json or {}).get("marketing_capability_pack")
+            )
+        except ValueError as exc:
+            raise ValueError("pi_marketing_capability_snapshot_invalid") from exc
         environment = {
             "TENCENT_PLAN_API_KEY": settings.tencent_plan_api_key.get_secret_value(),
             "DATATAP_MCP_TOKEN": settings.datatap_mcp_token.get_secret_value(),
@@ -512,7 +521,8 @@ def build_real_pi_client_factory(settings: Settings) -> Callable[[AgentRun, str]
             PiRpcConfig(
                 executable=str(executable),
                 extensions=(str(adapter_extension), str(extension)),
-                skills=skills,
+                skills=(),
+                append_system_prompt=render_marketing_system_prompt(capability),
                 timeout_seconds=settings.pi_runtime_poc_run_timeout_seconds,
                 environment=environment,
                 # adapter 在临时 agent dir 缺少 metadata cache 时会 bootstrap 四个服务，

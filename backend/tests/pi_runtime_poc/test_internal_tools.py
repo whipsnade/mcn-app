@@ -43,6 +43,7 @@ from app.agent_runtime.repository import AgentRunRepository
 from app.core.config import Settings
 from app.db.base import Base
 from app.identity.models import User
+from app.marketing_capability_pack.runtime import build_marketing_run_capability
 from app.pi_runtime_poc.auth import issue_run_token
 from app.pi_runtime_poc.internal_tools import (
     PI_POC_ALLOWED_TOOLS,
@@ -116,6 +117,11 @@ async def seeded(db: AsyncSession) -> dict[str, Any]:
         profile_name="session_analyst_v1",
         profile_version="1",
         model="test",
+        prompt_snapshot_json={
+            "marketing_capability_pack": build_marketing_run_capability(
+                model_version="test"
+            ).model_dump(mode="json")
+        },
         status="running",
     )
     db.add(run)
@@ -217,6 +223,11 @@ async def test_internal_registry_exposes_only_allowed_tools(
         "read",
         "write",
         "edit",
+        "grep",
+        "find",
+        "ls",
+        "file",
+        "http",
         "create_draft",
         "update_draft",
         "abandon_draft",
@@ -226,6 +237,199 @@ async def test_internal_registry_exposes_only_allowed_tools(
         "rank_kols",
     ):
         assert forbidden not in names
+
+
+async def _seed_other_run(db: AsyncSession) -> dict[str, Any]:
+    now = _now()
+    user = User(id=str(uuid4()), nickname="other", role="user", status="active", created_at=now, updated_at=now)
+    db.add(user)
+    await db.flush()
+    session = AgentSession(
+        id=str(uuid4()),
+        user_id=user.id,
+        title="other",
+        status="active",
+        summary_version=0,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(session)
+    await db.flush()
+    run = AgentRun(
+        id=str(uuid4()),
+        session_id=session.id,
+        user_id=user.id,
+        run_kind="user",
+        visibility="user",
+        profile_name="session_analyst_v1",
+        profile_version="1",
+        model="test",
+        prompt_snapshot_json={
+            "marketing_capability_pack": build_marketing_run_capability(
+                model_version="test"
+            ).model_dump(mode="json")
+        },
+        status="running",
+        created_at=now,
+    )
+    db.add(run)
+    await db.commit()
+    return {"user": user, "session": session, "run": run}
+
+
+async def test_load_marketing_skill_service_registry_tool_records_idempotently(
+    svc: PiEvidenceIngestService, settings: Settings, seeded: dict[str, Any], db: AsyncSession
+) -> None:
+    """完整链路：Service → Registry → Tool → 当前 Run 的快照审计。"""
+    run_id = seeded["run"].id
+    token = issue_run_token(run_id, settings=settings)
+
+    first = await svc.execute_internal_tool(
+        token=token,
+        run_id=run_id,
+        tool_name="load_marketing_skill",
+        arguments={"skill_name": "brand-research-report"},
+    )
+    second = await svc.execute_internal_tool(
+        token=token,
+        run_id=run_id,
+        tool_name="load_marketing_skill",
+        arguments={"skill_name": "brand-research-report"},
+    )
+
+    for result in (first, second):
+        assert result["status"] == "success"
+        payload = json.loads(result["safe_summary"])
+        assert set(payload) == {
+            "name",
+            "version",
+            "digest",
+            "content",
+            "required_tools",
+            "artifact_contract",
+        }
+        assert payload["name"] == "brand-research-report"
+        assert payload["content"]
+        assert payload["required_tools"]
+
+    await db.refresh(seeded["run"])
+    pack = seeded["run"].prompt_snapshot_json["marketing_capability_pack"]
+    assert pack["loaded_skills"] == [{
+        "name": "brand-research-report",
+        "version": first_payload["version"] if (first_payload := json.loads(first["safe_summary"])) else "",
+        "digest": first_payload["digest"],
+    }]
+
+
+@pytest.mark.parametrize(
+    ("arguments", "expected_code"),
+    [
+        ({"skill_name": "brand-research-report", "requested_version": "9.9.9"}, "marketing_skill_not_enabled"),
+        ({"skill_name": "unknown-skill"}, "marketing_skill_not_enabled"),
+        ({"skill_name": "brand-research-report", "path": "skills/anything"}, "tool_arguments_invalid"),
+        ({"skill_name": "brand-research-report", "user_id": "forged", "session_id": "forged", "run_id": "forged"}, "tool_arguments_invalid"),
+    ],
+)
+async def test_load_marketing_skill_rejects_invalid_or_ignores_reserved_arguments(
+    svc: PiEvidenceIngestService,
+    settings: Settings,
+    seeded: dict[str, Any],
+    db: AsyncSession,
+    arguments: dict[str, str],
+    expected_code: str,
+) -> None:
+    run_id = seeded["run"].id
+    result = await svc.execute_internal_tool(
+        token=issue_run_token(run_id, settings=settings),
+        run_id=run_id,
+        tool_name="load_marketing_skill",
+        arguments=arguments,
+    )
+
+    assert result["error_type"] == expected_code
+    await db.refresh(seeded["run"])
+    loaded = seeded["run"].prompt_snapshot_json["marketing_capability_pack"]["loaded_skills"]
+    assert loaded == []
+    assert "完整技能正文" not in result["safe_summary"]
+    assert "skills/" not in result["safe_summary"]
+    assert "marketing_capability_pack" not in result["safe_summary"]
+
+
+async def test_load_marketing_skill_fails_closed_for_tampered_snapshot(
+    svc: PiEvidenceIngestService, settings: Settings, seeded: dict[str, Any], db: AsyncSession
+) -> None:
+    snapshot = dict(seeded["run"].prompt_snapshot_json or {})
+    pack = dict(snapshot["marketing_capability_pack"])
+    skills = list(pack["skills"])
+    skills[0] = {**skills[0], "digest": "0" * 64}
+    pack["skills"] = skills
+    snapshot["marketing_capability_pack"] = pack
+    seeded["run"].prompt_snapshot_json = snapshot
+    await db.commit()
+
+    result = await svc.execute_internal_tool(
+        token=issue_run_token(seeded["run"].id, settings=settings),
+        run_id=seeded["run"].id,
+        tool_name="load_marketing_skill",
+        arguments={"skill_name": "brand-research-report"},
+    )
+
+    assert result["status"] == "failed"
+    assert result["error_type"] == "marketing_skill_snapshot_invalid"
+    assert result["safe_summary"] == "marketing_skill_snapshot_invalid"
+    await db.refresh(seeded["run"])
+    assert seeded["run"].prompt_snapshot_json["marketing_capability_pack"]["loaded_skills"] == []
+
+
+async def test_load_marketing_skill_rejects_skill_removed_from_current_run_snapshot(
+    svc: PiEvidenceIngestService, settings: Settings, seeded: dict[str, Any], db: AsyncSession
+) -> None:
+    snapshot = dict(seeded["run"].prompt_snapshot_json or {})
+    pack = dict(snapshot["marketing_capability_pack"])
+    pack["skills"] = [
+        item for item in pack["skills"] if item["name"] != "brand-research-report"
+    ]
+    snapshot["marketing_capability_pack"] = pack
+    seeded["run"].prompt_snapshot_json = snapshot
+    await db.commit()
+
+    result = await svc.execute_internal_tool(
+        token=issue_run_token(seeded["run"].id, settings=settings),
+        run_id=seeded["run"].id,
+        tool_name="load_marketing_skill",
+        arguments={"skill_name": "brand-research-report"},
+    )
+
+    assert result["status"] == "failed"
+    assert result["error_type"] == "marketing_skill_not_enabled"
+    await db.refresh(seeded["run"])
+    assert seeded["run"].prompt_snapshot_json["marketing_capability_pack"]["loaded_skills"] == []
+
+
+async def test_load_marketing_skill_token_and_snapshot_are_isolated_by_run(
+    svc: PiEvidenceIngestService, settings: Settings, seeded: dict[str, Any], db: AsyncSession
+) -> None:
+    other = await _seed_other_run(db)
+    token_a = issue_run_token(seeded["run"].id, settings=settings)
+    before_b = other["run"].prompt_snapshot_json
+
+    with pytest.raises(HTTPException) as error:
+        await svc.execute_internal_tool(
+            token=token_a,
+            run_id=other["run"].id,
+            tool_name="load_marketing_skill",
+            arguments={"skill_name": "brand-research-report"},
+        )
+    assert error.value.status_code == 401
+
+    await svc.execute_internal_tool(
+        token=token_a,
+        run_id=seeded["run"].id,
+        tool_name="load_marketing_skill",
+        arguments={"skill_name": "brand-research-report"},
+    )
+    await db.refresh(other["run"])
+    assert other["run"].prompt_snapshot_json == before_b
 
 
 async def test_forged_identity_keys_are_ignored(

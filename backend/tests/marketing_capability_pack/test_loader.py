@@ -11,6 +11,7 @@ def _write_pack(root: Path, *, include_secret: bool = False) -> Path:
     pack = root / "marketing-v1"
     (pack / "policies").mkdir(parents=True)
     (pack / "skills" / "brand-research-report").mkdir(parents=True)
+    (pack / "contracts").mkdir()
     root_policy = "只处理社媒营销；非营销请求必须拒答。"
     skill = "---\nname: brand-research-report\ndescription: 生成品牌报告。\n---\n\n完整技能正文。\n"
     (pack / "policies" / "root-policy.md").write_text(root_policy, encoding="utf-8")
@@ -28,10 +29,17 @@ def _write_pack(root: Path, *, include_secret: bool = False) -> Path:
             "required_tools": ["build_brand_report_draft", "publish_artifacts"],
             "artifact_contract": "brand_report_v3",
         }],
-        "artifact_contracts": [{"artifact_type": "brand_report_v3", "schema_version": "3"}],
+        "artifact_contracts": [],
         "builder_versions": {"brand_report_v3": "1.0.0"},
         "exporter_versions": {"brand_report_v3": "1.0.0"},
     }
+    for artifact_type in ("brand_report_v3", "campaign_report_v3", "kol_selection_v3"):
+        content = json.dumps({"artifact_type": artifact_type, "schema_version": "3"})
+        path = f"contracts/{artifact_type}.json"
+        (pack / path).write_text(content, encoding="utf-8")
+        manifest["artifact_contracts"].append(
+            {"artifact_type": artifact_type, "schema_version": "3", "path": path, "digest": _digest(content)}
+        )
     if include_secret:
         manifest["api_key"] = "must-not-load"
     (pack / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
@@ -109,3 +117,109 @@ def test_repository_marketing_pack_declares_all_business_capabilities() -> None:
         "marketing-strategy",
     }
     assert snapshot.runtime_contract_version == "marketing_runtime_v1"
+
+
+@pytest.mark.parametrize("field", ["api_key", "token", "password", "secret", "endpoint", "dsn"])
+def test_loader_rejects_nested_sensitive_manifest_fields(tmp_path: Path, field: str) -> None:
+    pack = _write_pack(tmp_path)
+    manifest_path = pack / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["root_policy"]["nested"] = {"configuration": {field: "not-a-credential"}}
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(CapabilityPackError, match="manifest_sensitive_field"):
+        CapabilityPackLoader(tmp_path).load_manifest("marketing-v1")
+
+
+@pytest.mark.parametrize(
+    ("location", "credential"),
+    [
+        ("root_policy", "sk-abcdefghijk"),
+        ("skill", "sk-proj-abcdefghijk"),
+        ("contract", "Bearer abcdefghijk"),
+        ("root_policy", "https://example.invalid/v1?token=abcdefgh"),
+        ("skill", "postgresql://user:password@db.example.invalid:5432/app"),
+        ("contract", "mysql+asyncmy://user:password@db.example.invalid/app"),
+    ],
+)
+def test_loader_rejects_credential_patterns_without_echoing_content(
+    tmp_path: Path, location: str, credential: str
+) -> None:
+    pack = _write_pack(tmp_path)
+    manifest_path = pack / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if location == "root_policy":
+        path = pack / "policies" / "root-policy.md"
+        content = f"ordinary description\n{credential}\n"
+        manifest["root_policy"]["digest"] = _digest(content)
+    elif location == "skill":
+        path = pack / "skills" / "brand-research-report" / "SKILL.md"
+        content = path.read_text(encoding="utf-8") + credential + "\n"
+        manifest["skills"][0]["digest"] = _digest(content)
+    else:
+        path = pack / "contracts" / "brand_report_v3.json"
+        content = json.dumps(
+            {"artifact_type": "brand_report_v3", "schema_version": "3", "note": credential}
+        )
+        manifest["artifact_contracts"][0]["digest"] = _digest(content)
+    path.write_text(content, encoding="utf-8")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(CapabilityPackError, match="pack_sensitive_content") as error:
+        CapabilityPackLoader(tmp_path).load_manifest("marketing-v1")
+    assert credential not in str(error.value)
+
+
+def test_loader_permits_ordinary_token_and_endpoint_words(tmp_path: Path) -> None:
+    pack = _write_pack(tmp_path)
+    policy_path = pack / "policies" / "root-policy.md"
+    policy = "此说明中的 token 和 endpoint 只是普通术语，不包含凭证。"
+    policy_path.write_text(policy, encoding="utf-8")
+    manifest_path = pack / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["root_policy"]["digest"] = _digest(policy)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    assert CapabilityPackLoader(tmp_path).load_manifest("marketing-v1").root_policy == policy
+
+
+def test_loader_rejects_missing_duplicate_or_wrong_contracts(tmp_path: Path) -> None:
+    pack = _write_pack(tmp_path)
+    manifest_path = pack / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["artifact_contracts"] = manifest["artifact_contracts"][:2]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(CapabilityPackError, match="manifest_contracts_invalid"):
+        CapabilityPackLoader(tmp_path).load_manifest("marketing-v1")
+
+    manifest["artifact_contracts"] = [
+        *manifest["artifact_contracts"],
+        manifest["artifact_contracts"][0],
+    ]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(CapabilityPackError, match="manifest_contracts_invalid"):
+        CapabilityPackLoader(tmp_path).load_manifest("marketing-v1")
+
+
+def test_loader_rejects_contract_path_digest_and_schema_mismatch(tmp_path: Path) -> None:
+    pack = _write_pack(tmp_path)
+    manifest_path = pack / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["artifact_contracts"][0]["path"] = "../outside.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(CapabilityPackError, match="pack_path_invalid"):
+        CapabilityPackLoader(tmp_path).load_manifest("marketing-v1")
+
+    pack = _write_pack(tmp_path / "digest")
+    contract = pack / "contracts" / "brand_report_v3.json"
+    contract.write_text('{"artifact_type":"brand_report_v3","schema_version":"9"}', encoding="utf-8")
+    with pytest.raises(CapabilityPackError, match="pack_digest_mismatch"):
+        CapabilityPackLoader(tmp_path / "digest").load_manifest("marketing-v1")
+
+    manifest_path = pack / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    content = contract.read_text(encoding="utf-8")
+    manifest["artifact_contracts"][0]["digest"] = _digest(content)
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    with pytest.raises(CapabilityPackError, match="manifest_contract_invalid"):
+        CapabilityPackLoader(tmp_path / "digest").load_manifest("marketing-v1")

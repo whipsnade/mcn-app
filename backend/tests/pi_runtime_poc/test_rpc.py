@@ -112,7 +112,7 @@ def _config(**changes: Any) -> PiRpcConfig:
     values = {
         "executable": "/opt/pi/bin/pi",
         "extensions": ("/trusted/extensions/datap.mjs", "/trusted/extensions/events.mjs"),
-        "skills": ("/trusted/skills/brand/SKILL.md",),
+        "skills": (),
         "timeout_seconds": 30 * 60,
     }
     values.update(changes)
@@ -146,8 +146,6 @@ async def test_prompt_uses_correlation_id_and_strict_isolated_command(
             "-e",
             "/trusted/extensions/events.mjs",
             "--no-skills",
-            "--skill",
-            "/trusted/skills/brand/SKILL.md",
         )
     ]
     assert json.loads(process.stdin.writes[0]) == {
@@ -171,6 +169,23 @@ async def test_prompt_uses_correlation_id_and_strict_isolated_command(
 
     await client.close()
     assert not agent_dir.exists()
+
+
+async def test_command_places_root_policy_only_in_system_argument(
+    fake_process: tuple[FakeProcess, list[tuple[Any, ...]], list[dict[str, Any]]],
+) -> None:
+    _, calls, _ = fake_process
+    policy = "完整 Root Policy：非营销必须拒答"
+    client = await PiRpcClient.start(_config(append_system_prompt=policy))
+
+    assert calls[0][calls[0].index("--append-system-prompt") + 1] == policy
+    assert "--skill" not in calls[0]
+    await client.close()
+
+
+async def test_command_rejects_legacy_skill_paths() -> None:
+    with pytest.raises(ValueError, match="pi_rpc_skills_must_be_empty"):
+        await PiRpcClient.start(_config(skills=("/untrusted/skills",)))
 
 
 async def test_start_writes_only_explicit_agent_files_inside_per_run_directory(

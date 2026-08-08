@@ -11,7 +11,7 @@ import json
 from datetime import UTC, datetime
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -172,18 +172,44 @@ class LoadMarketingSkillTool:
 
     async def execute(self, context: ToolContext, arguments: BaseModel) -> ToolResult:
         args = LoadMarketingSkillArgs.model_validate(arguments)
-        run = await self._db.get(AgentRun, context.run_id)
-        if run is None or run.user_id != context.user_id or run.session_id != context.session_id:
+        run = await self._db.scalar(
+            select(AgentRun)
+            .where(
+                AgentRun.id == context.run_id,
+                AgentRun.user_id == context.user_id,
+                AgentRun.session_id == context.session_id,
+            )
+            .with_for_update()
+        )
+        if run is None:
             return ToolResult(status="failed", safe_summary="run_not_found", error_type="not_found")
         try:
             capability = MarketingRunCapability.model_validate(
                 (run.prompt_snapshot_json or {}).get("marketing_capability_pack")
             )
             loaded = capability.load_skill(args.skill_name, args.requested_version)
-        except ValueError as exc:
+        except ValidationError:
             return ToolResult(
-                status="failed", safe_summary=str(exc), error_type="marketing_skill_not_enabled"
+                status="failed",
+                safe_summary="marketing_skill_snapshot_invalid",
+                error_type="marketing_skill_snapshot_invalid",
             )
+        except ValueError:
+            return ToolResult(
+                status="failed",
+                safe_summary="marketing_skill_not_enabled",
+                error_type="marketing_skill_not_enabled",
+            )
+        snapshot = dict(run.prompt_snapshot_json or {})
+        pack = dict(snapshot.get("marketing_capability_pack") or {})
+        loaded_skills = list(pack.get("loaded_skills") or [])
+        record = {key: loaded[key] for key in ("name", "version", "digest")}
+        if record not in loaded_skills:
+            loaded_skills.append(record)
+        pack["loaded_skills"] = loaded_skills
+        snapshot["marketing_capability_pack"] = pack
+        run.prompt_snapshot_json = snapshot
+        await self._db.flush()
         return ToolResult(status="success", safe_summary=json.dumps(loaded, ensure_ascii=False))
 
 

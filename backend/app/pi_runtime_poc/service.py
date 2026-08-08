@@ -20,7 +20,11 @@ from app.agent_runtime.events import AgentEventStream
 from app.agent_runtime.models import AgentRun
 from app.agent_runtime.repository import AgentRunRepository
 from app.agent_runtime.state import RunStatus
-from app.agent_runtime.tools.contracts import ToolResult
+from app.agent_runtime.tools.contracts import (
+    SERVER_RESERVED_KEYS,
+    TOOL_ARGUMENTS_INVALID,
+    ToolResult,
+)
 from app.agent_runtime.tools.registry import UnknownToolError
 from app.core.config import Settings
 from app.pi_runtime_poc.audit import PiRunAuditWriter
@@ -165,6 +169,12 @@ class PiEvidenceIngestService:
         run = await self._db.get(AgentRun, run_id)
         if run is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "pi_run_not_found")
+        if tool_name == "load_marketing_skill" and SERVER_RESERVED_KEYS & arguments.keys():
+            return ToolResult(
+                status="failed",
+                safe_summary="marketing_skill_arguments_invalid",
+                error_type=TOOL_ARGUMENTS_INVALID,
+            ).model_dump(mode="json")
         registry = build_pi_internal_registry(db=self._db, worker_id=self._worker_id)
         if tool_name in _LEASE_GATED_TOOL_NAMES:
             repo = AgentRunRepository(self._db)

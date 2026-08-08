@@ -54,6 +54,7 @@ class PiRpcConfig:
     executable: str
     extensions: Sequence[str] = ()
     skills: Sequence[str] = ()
+    append_system_prompt: str | None = None
     timeout_seconds: float = 30 * 60
     environment: Mapping[str, str] | None = None
     # 仅由调用方生成的非敏感 Agent 配置（目前仅 models.json）；写入本 Run 的
@@ -382,8 +383,10 @@ def _command_args(config: PiRpcConfig) -> list[str]:
     for extension in config.extensions:
         args.extend(("-e", extension))
     args.append("--no-skills")
-    for skill in config.skills:
-        args.extend(("--skill", skill))
+    if config.skills:
+        raise ValueError("pi_rpc_skills_must_be_empty")
+    if config.append_system_prompt:
+        args.extend(("--append-system-prompt", config.append_system_prompt))
     if config.provider is not None:
         args.extend(("--provider", config.provider))
     if config.model is not None:

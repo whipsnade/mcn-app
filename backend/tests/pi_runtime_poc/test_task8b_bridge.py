@@ -14,6 +14,7 @@ from pydantic import SecretStr
 
 from app.agent_runtime.models import AgentRun
 from app.core.config import Settings
+from app.marketing_capability_pack.runtime import build_marketing_run_capability
 from app.pi_runtime_poc import comparison
 
 _SERVICE_MAPPING = {
@@ -81,7 +82,20 @@ def test_settings_mapping_is_forwarded_to_pi_adapter_as_explicit_urls(monkeypatc
     monkeypatch.setattr(comparison.PiRpcClient, "start", lambda config: captured.append(config) or object())
 
     factory = comparison.build_real_pi_client_factory(settings)
-    factory(cast(AgentRun, SimpleNamespace(id="run-task8b")), "test-run-token")
+    factory(
+        cast(
+            AgentRun,
+            SimpleNamespace(
+                id="run-task8b",
+                prompt_snapshot_json={
+                    "marketing_capability_pack": build_marketing_run_capability(
+                        model_version=settings.tencent_plan_model
+                    ).model_dump(mode="json")
+                },
+            ),
+        ),
+        "test-run-token",
+    )
 
     assert len(captured) == 1
     environment = captured[0].environment
@@ -94,6 +108,8 @@ def test_settings_mapping_is_forwarded_to_pi_adapter_as_explicit_urls(monkeypatc
     assert captured[0].extensions[0].endswith("node_modules/pi-mcp-adapter/index.ts")
     assert captured[0].extensions[1].endswith("src/extensions/poc-runtime.ts")
     assert captured[0].agent_files["mcp-cache.json"] == '{"version":1,"servers":{}}'
+    assert captured[0].skills == ()
+    assert captured[0].append_system_prompt is not None
 
 
 def test_task9_shell_preflight_checks_adapter_urls_after_legacy_mapping_is_cleared() -> None:
