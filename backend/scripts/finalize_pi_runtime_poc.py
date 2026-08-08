@@ -1,34 +1,35 @@
-"""只读 Pi-only execution.json 并一次性生成 Gate A summary。"""
+"""只读取 Pi execution manifest 并一次性写入本地 Gate summary。"""
 
 from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
+from typing import Any
 
-from app.pi_runtime_poc.comparison import (
-    _SECRET_PATTERN,
-    HumanReview,
-    PocCaseResult,
-    assess_gate_a,
-    load_cases,
-    write_round_summary,
-)
+from app.pi_runtime_poc.gate import finalize_execution, write_summary_append_once
+
+_SECRET_PATTERN = re.compile(r"(?:sk-[A-Za-z0-9._-]+|Bearer\s+\S+)", re.IGNORECASE)
 
 
-def _read_results(path: Path) -> tuple[PocCaseResult, ...]:
+def _read_execution(path: Path) -> dict[str, Any]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if payload.get("runtime") != "pi" or not isinstance(payload.get("results"), list):
         raise ValueError("poc_execution_manifest_invalid")
-    return tuple(PocCaseResult(**item) for item in payload["results"])
+    return payload
+
+
+def _read_results(path: Path) -> tuple[dict[str, Any], ...]:
+    return tuple(_read_execution(path)["results"])
 
 
 def _secret_paths(round_dir: Path) -> list[str]:
-    return [
-        str(path.relative_to(round_dir))
-        for path in sorted(round_dir.rglob("*.json"))
-        if _SECRET_PATTERN.search(path.read_text(encoding="utf-8"))
-    ]
+    paths: list[str] = []
+    for path in sorted(round_dir.rglob("*.json")):
+        if _SECRET_PATTERN.search(path.read_text(encoding="utf-8")):
+            paths.append(str(path.relative_to(round_dir)))
+    return paths
 
 
 def _output_root() -> Path:
@@ -38,21 +39,33 @@ def _output_root() -> Path:
 def finalize_round(round_dir: Path, fixture_path: Path, human_review_path: Path | None = None) -> Path:
     round_dir = round_dir.resolve()
     root = _output_root().resolve()
-    if root not in round_dir.parents or (round_dir / "summary.json").exists():
-        raise FileExistsError(round_dir / "summary.json")
-    results = _read_results(round_dir / "execution.json")
-    cases = load_cases(fixture_path)
+    summary_path = round_dir / "summary.json"
+    if root not in round_dir.parents or summary_path.exists():
+        raise FileExistsError(summary_path)
+
+    execution = _read_execution(round_dir / "execution.json")
+    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+    if not isinstance(fixture, list):
+        raise TypeError("poc_cases_must_be_array")
     secret_paths = _secret_paths(round_dir)
     if secret_paths:
         raise ValueError("poc_output_contains_secret")
     review = (
-        HumanReview.model_validate_json(human_review_path.read_text(encoding="utf-8"))
+        json.loads(human_review_path.read_text(encoding="utf-8"))
         if human_review_path is not None
         else None
     )
-    gate = assess_gate_a(cases, results, review)
-    gate["secret_paths"] = []
-    return write_round_summary(round_dir, results, gate)
+    summary = finalize_execution(execution, fixture, review)
+    payload = {
+        "round_id": round_dir.name,
+        "results": execution["results"],
+        "gate": {
+            "gate": summary.gate,
+            "hard_checks": summary.hard_checks,
+            "secret_paths": [],
+        },
+    }
+    return write_summary_append_once(summary_path, payload)
 
 
 def parse_args() -> argparse.Namespace:

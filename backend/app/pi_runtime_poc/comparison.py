@@ -39,6 +39,7 @@ from app.marketing_capability_pack.runtime import (
     render_marketing_system_prompt,
 )
 from app.mcp_gateway.contracts import DataTapService
+from app.pi_runtime_poc.gate import HARD_CHECKS, Summary, evaluate_case, finalize_execution
 from app.pi_runtime_poc.rpc import PiRpcClient, PiRpcConfig
 from app.pi_runtime_poc.runner import PiClientFactory, PiPocRunner
 
@@ -651,6 +652,7 @@ def _is_openable_excel(version: AgentArtifactVersion) -> bool:
 
 
 __all__ = [
+    "HARD_CHECKS",
     "CaseExecutionStatus",
     "PiRuntimeCaseExecutor",
     "PocCase",
@@ -658,9 +660,12 @@ __all__ = [
     "PocCaseResult",
     "RuntimeCaseExecutor",
     "RuntimeName",
+    "Summary",
     "assess_gate_a",
     "begin_round",
     "build_real_pi_client_factory",
+    "evaluate_case",
+    "finalize_execution",
     "load_cases",
     "make_non_executed_result",
     "write_append_only_round",
