@@ -619,7 +619,11 @@ class ArtifactService:
                 "stages": {
                     "payload": {"valid": True, "errors": []},
                     "lineage": {"valid": True, "errors": []},
-                    "structured_claims": {"valid": True, "errors": []},
+                    "structured_claims": {
+                        "status": "evaluated",
+                        "valid": True,
+                        "errors": [],
+                    },
                 },
             }
             plans.append(

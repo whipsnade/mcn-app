@@ -9,6 +9,7 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import func, select
 
+import app.agent_artifacts.publishing as publishing_module
 from app.agent_artifacts.canonical import walk_data_leaves
 from app.agent_artifacts.lineage import (
     EvidenceRecord,
@@ -19,6 +20,7 @@ from app.agent_artifacts.lineage import (
 )
 from app.agent_artifacts.models import (
     AgentArtifactVersion,
+    ArtifactPublishAttempt,
     ArtifactReviewBatch,
     ArtifactReviewItem,
 )
@@ -500,6 +502,102 @@ async def test_direct_publish_blocks_unavailable_narrative_claim(
 
     assert result[0].status == "validation_failed"
     assert await db_session.scalar(select(AgentArtifactVersion.id)) is None
+    attempt = await db_session.scalar(
+        select(ArtifactPublishAttempt).where(ArtifactPublishAttempt.draft_revision_id == _revision.id)
+    )
+    assert attempt is not None
+    structured_stage = attempt.validation_json["stages"]["structured_claims"]
+    assert structured_stage["status"] == "evaluated"
+    assert structured_stage["valid"] is False
+
+
+@pytest.mark.asyncio
+async def test_direct_publish_marks_structured_claims_not_evaluated_after_lineage_failure(
+    db_session, user_factory, session_factory, run_factory, monkeypatch
+) -> None:
+    user = await user_factory()
+    session = await session_factory(user.id)
+    run = await run_factory(session.id, user.id)
+    await AgentRunRepository(db_session).claim_lease(run.id, WORKER, 300)
+    payload = _legal_brand_payload()
+    evidence_id = await _write_evidence(db_session, run, payload["data"])
+    refs = _refs_for_numeric_leaves(payload, evidence_id)
+    # 删除一个最终 numeric leaf 的 lineage，令 freezer 先失败；canonical contract 仍完整。
+    refs.pop()
+    for field in payload["canonical_data"]:
+        if field["value"] is not None and isinstance(field["value"], (int, float)):
+            field["evidence_ids"] = [evidence_id]
+    _, draft, revision = await ArtifactService(db_session).create_or_get_draft(
+        session_id=session.id,
+        user_id=user.id,
+        run_id=run.id,
+        module="brand",
+        business_fields={"brand": "某品牌"},
+        schema_version="brand_report_v3",
+        artifact_type="brand_report_v3",
+        payload=payload,
+        evidence_refs=refs,
+    )
+    called = False
+
+    def fail_if_evaluated(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("structured claims must not run after lineage failure")
+
+    monkeypatch.setattr(publishing_module, "validate_structured_claims", fail_if_evaluated)
+    result = await ArtifactPublicationService(db_session).publish(
+        run_id=run.id, draft_ids=(draft.id,), worker_id=WORKER
+    )
+    assert result[0].status == "validation_failed"
+    assert called is False
+    attempt = await db_session.scalar(
+        select(ArtifactPublishAttempt).where(ArtifactPublishAttempt.draft_revision_id == revision.id)
+    )
+    assert attempt is not None
+    structured_stage = attempt.validation_json["stages"]["structured_claims"]
+    assert structured_stage["status"] == "not_evaluated"
+    assert structured_stage.get("valid") is not True
+
+
+@pytest.mark.asyncio
+async def test_direct_publish_uses_same_candidate_version_for_claims_and_persistence(
+    db_session, user_factory, session_factory, run_factory, monkeypatch
+) -> None:
+    user = await user_factory()
+    session = await session_factory(user.id)
+    run = await run_factory(session.id, user.id)
+    await AgentRunRepository(db_session).claim_lease(run.id, WORKER, 300)
+    payload = _legal_brand_payload()
+    evidence_id = await _write_evidence(db_session, run, payload["data"])
+    refs = _refs_for_numeric_leaves(payload, evidence_id)
+    for field in payload["canonical_data"]:
+        if field["value"] is not None and isinstance(field["value"], (int, float)):
+            field["evidence_ids"] = [evidence_id]
+    _, draft, _revision = await ArtifactService(db_session).create_or_get_draft(
+        session_id=session.id,
+        user_id=user.id,
+        run_id=run.id,
+        module="brand",
+        business_fields={"brand": "某品牌"},
+        schema_version="brand_report_v3",
+        artifact_type="brand_report_v3",
+        payload=payload,
+        evidence_refs=refs,
+    )
+    captured: list[str] = []
+    original = publishing_module.validate_structured_claims
+
+    def capture(candidate_payload, candidate_id, scope):
+        captured.append(candidate_id)
+        return original(candidate_payload, candidate_id, scope)
+
+    monkeypatch.setattr(publishing_module, "validate_structured_claims", capture)
+    result = await ArtifactPublicationService(db_session).publish(
+        run_id=run.id, draft_ids=(draft.id,), worker_id=WORKER
+    )
+    assert result[0].status == "published"
+    assert captured == [result[0].artifact_version_id]
 
 
 @pytest.mark.asyncio

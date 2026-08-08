@@ -370,10 +370,18 @@ class ArtifactPublicationService:
             "lineage": {"valid": not lineage_errors, "errors": lineage_errors},
         }
         if structured_enabled:
-            stages["structured_claims"] = {
-                "valid": not structured_errors,
-                "errors": structured_errors,
-            }
+            if payload_errors or lineage_errors:
+                stages["structured_claims"] = {
+                    "status": "not_evaluated",
+                    "valid": False,
+                    "errors": [],
+                }
+            else:
+                stages["structured_claims"] = {
+                    "status": "evaluated",
+                    "valid": not structured_errors,
+                    "errors": structured_errors,
+                }
         snapshot = {
             "module": artifact.module,
             "schema_version": revision.schema_version,

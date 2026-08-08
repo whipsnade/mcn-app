@@ -601,6 +601,8 @@ async def _resolve_source(
     depth: int,
     loader: LineageLoader,
     owner: LineageOwner,
+    *,
+    historical_artifact_context: bool = False,
 ) -> tuple[list[_ResolvedEvidence], Any]:
     """把一个来源解析为证据叶子列表，同时返回该来源的直接 payload（供 derivation
     ``input_paths`` 解析）。Artifact 来源递归展开到 Evidence。
@@ -633,14 +635,18 @@ async def _resolve_source(
                     "evidence_upload_not_owned",
                     f"evidence {source.evidence_id!r} upload is not in current session",
                 )
-            if owner.run_id is not None and upload_run_id not in {None, owner.run_id}:
+            if (
+                owner.run_id is not None
+                and not historical_artifact_context
+                and upload_run_id not in {None, owner.run_id}
+            ):
                 raise LineageError(
                     "evidence_run_not_owned",
                     f"evidence {source.evidence_id!r} upload is not in current run",
                 )
         # MCP Evidence 必须来自当前 Run；Run 创建前上传的 Evidence 保留
         # session/user 范围内的合法例外（upload 元数据非空）。
-        if owner.run_id is not None and (
+        if owner.run_id is not None and not historical_artifact_context and (
             (record.upload is None and record.run_id != owner.run_id)
             or (record.upload is not None and record.run_id not in {None, owner.run_id})
         ):
@@ -705,7 +711,13 @@ async def _resolve_source(
     next_stack = path_stack | {record.id}
     for sub_source in match.sources:
         sub_leaves, _ = await _resolve_source(
-            sub_source, next_stack, memo, depth + 1, loader, owner
+            sub_source,
+            next_stack,
+            memo,
+            depth + 1,
+            loader,
+            owner,
+            historical_artifact_context=True,
         )
         leaves.extend(sub_leaves)
     if not leaves:

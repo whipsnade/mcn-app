@@ -18,13 +18,14 @@ from typing import Any
 import pytest
 from sqlalchemy import func, select
 
+import app.agent_artifacts.service as artifact_service_module
 from app.agent_artifacts.models import (
     AgentArtifact,
     AgentArtifactVersion,
     ArtifactReviewAttempt,
     ArtifactReviewItem,
 )
-from app.agent_artifacts.service import ArtifactService
+from app.agent_artifacts.service import ArtifactService, PublishBlocked
 from app.agent_runtime.events import AgentEventBroker, AgentEventStream
 from app.agent_runtime.model_gateway import AgentModelGateway
 from app.agent_runtime.models import AgentMessage, AgentRun
@@ -33,7 +34,6 @@ from app.agent_runtime.reviewer import ReviewerDriver
 from app.agent_runtime.state import RunStatus
 from app.model.prompt_logs import PromptLogEntry
 from app.model.tencent_plan import TencentPlanAdapter
-
 from tests.agent_artifacts.payload_fixtures import insight_payload
 
 APPROVE_JSON = '{"decision":"approve","issues":[]}'
@@ -135,7 +135,7 @@ async def _items_for(db_session, batch_id: str) -> list[ArtifactReviewItem]:
 
 
 async def test_batch_publishes_all_versions_atomically_when_all_approved(
-    db_session, user_factory, session_factory, run_factory
+    db_session, user_factory, session_factory, run_factory, monkeypatch
 ) -> None:
     user = await user_factory()
     session = await session_factory(user.id)
@@ -165,10 +165,23 @@ async def test_batch_publishes_all_versions_atomically_when_all_approved(
         result = await driver.review_item(parent_run=run, item=item, user_question="分析")
         assert result.decision == "approve"
 
+    captured_candidates: list[str] = []
+    original_validate = artifact_service_module.validate_structured_claims
+
+    def capture_candidate(candidate_payload, candidate_id, scope):
+        captured_candidates.append(candidate_id)
+        return original_validate(candidate_payload, candidate_id, scope)
+
+    monkeypatch.setattr(
+        artifact_service_module, "validate_structured_claims", capture_candidate
+    )
     versions = await service.publish_batch(batch.id, worker_id="worker")
     assert len(versions) == 2
+    assert set(captured_candidates) == {version.id for version in versions}
+    for version in versions:
+        assert version.validation_json["stages"]["structured_claims"]["status"] == "evaluated"
     assert {v.artifact_id for v in versions} == {artifact_a.id, artifact_b.id}
-    assert {v.version for v in versions} == {1, 1}
+    assert {v.version for v in versions} == {1}
 
     # 稳定身份 latest_version/status 更新
     artifact_a_row = await db_session.get(AgentArtifact, artifact_a.id)
@@ -256,7 +269,7 @@ async def test_batch_reject_publishes_nothing_and_run_fails(
     assert run.status == "failed"
 
     # publish 被阻止且仍无任何版本
-    with pytest.raises(Exception):
+    with pytest.raises(PublishBlocked):
         await service.publish_batch(batch.id, worker_id="worker")
     assert len((await db_session.scalars(select(AgentArtifactVersion))).all()) == 0
 

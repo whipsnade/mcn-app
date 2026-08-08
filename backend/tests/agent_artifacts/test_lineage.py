@@ -89,11 +89,21 @@ class MemoryLoader:
         # 记录每个 artifact version 的查询次数，用于断言菱形展开去重。
         self.artifact_loads: dict[str, int] = {}
 
-    def add_evidence(self, evidence_id: str, session_id: str, payload: object) -> None:
+    def add_evidence(
+        self,
+        evidence_id: str,
+        session_id: str,
+        payload: object,
+        *,
+        run_id: str | None = None,
+        upload: dict | None = None,
+    ) -> None:
         self.evidence[evidence_id] = {
             "session_id": session_id,
             "payload": payload,
             "payload_hash": f"ph-{evidence_id}",
+            "run_id": run_id,
+            "upload": upload,
         }
 
     def add_artifact_version(
@@ -123,6 +133,8 @@ class MemoryLoader:
             session_id=row["session_id"],
             raw_payload=row["payload"],
             payload_hash=row["payload_hash"],
+            run_id=row["run_id"],
+            upload=row["upload"],
         )
 
     async def load_artifact_version(self, version_id: str) -> ArtifactVersionRecord | None:
@@ -336,6 +348,132 @@ async def test_artifact_source_expands_to_evidence() -> None:
     frozen = await validate_and_freeze_lineage(payload=payload, refs=refs, owner=OWNER, loader=loader)
     assert frozen.refs[0].sources == (
         FrozenEvidenceSource(evidence_id="ev-1", source_path="/0/声量", payload_hash="ph-ev-1"),
+    )
+
+
+async def test_direct_mcp_evidence_from_other_run_is_rejected() -> None:
+    loader = MemoryLoader()
+    loader.add_evidence("ev-old", "s-1", EVIDENCE_PAYLOAD, run_id="run-old")
+    payload = {"schema_version": "insight_board_v1", "data": {"total_volume": 100}}
+    refs = [
+        LineageRef(
+            artifact_path="/data/total_volume",
+            sources=(EvidenceSource(evidence_id="ev-old", source_path="/0/声量"),),
+        )
+    ]
+    with pytest.raises(LineageError) as exc_info:
+        await validate_and_freeze_lineage(
+            payload=payload,
+            refs=refs,
+            owner=LineageOwner(user_id="u-1", session_id="s-1", run_id="run-current"),
+            loader=loader,
+        )
+    assert exc_info.value.code == "evidence_run_not_owned"
+
+
+async def test_same_session_historical_artifact_allows_old_run_evidence() -> None:
+    loader = MemoryLoader()
+    loader.add_evidence("ev-old", "s-1", EVIDENCE_PAYLOAD, run_id="run-old")
+    loader.add_artifact_version(
+        "va-old",
+        "s-1",
+        {"data": {"overview": {"total_volume": 100}}},
+        [
+            {
+                "artifact_path": "/data/overview/total_volume",
+                "sources": [
+                    {
+                        "source_type": "evidence",
+                        "evidence_id": "ev-old",
+                        "source_path": "/0/声量",
+                    }
+                ],
+            }
+        ],
+    )
+    payload = {"schema_version": "insight_board_v1", "data": {"total_volume": 100}}
+    frozen = await validate_and_freeze_lineage(
+        payload=payload,
+        refs=[
+            LineageRef(
+                artifact_path="/data/total_volume",
+                sources=(
+                    ArtifactSource(
+                        artifact_version_id="va-old",
+                        source_path="/data/overview/total_volume",
+                    ),
+                ),
+            )
+        ],
+        owner=LineageOwner(user_id="u-1", session_id="s-1", run_id="run-current"),
+        loader=loader,
+    )
+    assert frozen.refs[0].sources == (
+        FrozenEvidenceSource(
+            evidence_id="ev-old", source_path="/0/声量", payload_hash="ph-ev-old"
+        ),
+    )
+    assert loader.tool_calls == {}
+
+
+async def test_historical_artifact_preserves_uploaded_evidence_snapshot() -> None:
+    loader = MemoryLoader()
+    loader.add_evidence(
+        "ev-upload-old",
+        "s-1",
+        [{"声量": 100}],
+        run_id="run-old",
+        upload={
+            "upload_id": "upload-old",
+            "sha256": "u" * 64,
+            "original_filename": "old.csv",
+            "uploaded_at": "2026-08-01T00:00:00",
+        },
+    )
+    loader.add_artifact_version(
+        "va-upload-old",
+        "s-1",
+        {"data": {"total_volume": 100}},
+        [
+            {
+                "artifact_path": "/data/total_volume",
+                "sources": [
+                    {
+                        "source_type": "evidence",
+                        "evidence_id": "ev-upload-old",
+                        "source_path": "/0/声量",
+                    }
+                ],
+            }
+        ],
+    )
+    frozen = await validate_and_freeze_lineage(
+        payload={"schema_version": "insight_board_v1", "data": {"total_volume": 100}},
+        refs=[
+            {
+                "artifact_path": "/data/total_volume",
+                "sources": [
+                    {
+                        "source_type": "artifact",
+                        "artifact_version_id": "va-upload-old",
+                        "source_path": "/data/total_volume",
+                    }
+                ],
+            }
+        ],
+        owner=LineageOwner(user_id="u-1", session_id="s-1", run_id="run-current"),
+        loader=loader,
+    )
+    assert frozen.refs[0].sources == (
+        FrozenEvidenceSource(
+            evidence_id="ev-upload-old",
+            source_path="/0/声量",
+            payload_hash="ph-ev-upload-old",
+            upload_id="upload-old",
+            upload_sha256="u" * 64,
+            upload_filename="old.csv",
+            uploaded_at="2026-08-01T00:00:00",
+        ),
     )
 
 
@@ -994,7 +1132,7 @@ async def test_publish_freezes_upload_hash(db_session, user_factory) -> None:
     from app.agent_runtime.models import AgentUpload
 
     user = await user_factory()
-    session, run, step = await _make_db_chain(db_session, user.id)
+    session, _run, _step = await _make_db_chain(db_session, user.id)
     now = datetime.now(UTC).replace(tzinfo=None)
     upload = AgentUpload(
         id=str(uuid4()),

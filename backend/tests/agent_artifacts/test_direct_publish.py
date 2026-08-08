@@ -40,7 +40,6 @@ from app.agent_runtime.models import AgentRun, AgentSession
 from app.agent_runtime.repository import AgentRunRepository
 from app.agent_runtime.state import InvalidRunTransition
 from app.identity.models import User
-
 from tests.agent_artifacts.payload_fixtures import insight_metric_payload, insight_payload
 
 WORKER = "worker-1"
