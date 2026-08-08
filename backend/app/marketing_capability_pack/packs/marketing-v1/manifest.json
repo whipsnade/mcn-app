@@ -1,0 +1,24 @@
+{
+  "pack_name": "marketing",
+  "pack_version": "1.0.0",
+  "runtime_contract_version": "marketing_runtime_v1",
+  "root_policy": {
+    "path": "policies/root-policy.md",
+    "digest": "53b934e26db9c0bf0386084cf2a992cbcdd2e07cd69000718179f15307a33ad4"
+  },
+  "skills": [
+    {"name":"social-marketing-analyst","version":"1.0.0","path":"skills/social-marketing-analyst/SKILL.md","digest":"f8e926527d8f44ae76056b1a3a5935f6d0bee866b8345c2fc1de1c68cad9fbb9","required_tools":["load_marketing_skill","request_clarification","publish_artifacts"],"artifact_contract":"marketing_root_v1"},
+    {"name":"brand-research-report","version":"1.0.0","path":"skills/brand-research-report/SKILL.md","digest":"52147a601bf6dc38e63b2bc2a8298fef53cd2e6c65f8bb8ab27c47ea25b19c1f","required_tools":["build_brand_report_draft","publish_artifacts"],"artifact_contract":"brand_report_v3"},
+    {"name":"campaign-evaluation-report","version":"1.0.0","path":"skills/campaign-evaluation-report/SKILL.md","digest":"9260037db0392f2c635dd94e34b58bb081a2a2c21ed0142226deccb5cb2bd5e3","required_tools":["build_campaign_report_draft","publish_artifacts"],"artifact_contract":"campaign_report_v3"},
+    {"name":"kol-selection-report","version":"1.0.0","path":"skills/kol-selection-report/SKILL.md","digest":"0315c3e83009f0a2dd54508c6da11434571eb97e77751bb393265e347889f210","required_tools":["build_kol_selection_draft","publish_artifacts"],"artifact_contract":"kol_selection_v3"},
+    {"name":"artifact-drilldown","version":"1.0.0","path":"skills/artifact-drilldown/SKILL.md","digest":"ced0550ed78f55edbcfff0a233f93ef9d20f0449ef054fd6ad70625dc9d2b7fb","required_tools":["read_artifact","build_insight_draft","publish_artifacts"],"artifact_contract":"insight_board_v1"},
+    {"name":"marketing-strategy","version":"1.0.0","path":"skills/marketing-strategy/SKILL.md","digest":"55f25f8abb39e4c56c6e661d691b91978712816c0b6ea0d588f5ec2e8f511174","required_tools":["read_artifact","search_evidence","request_clarification"],"artifact_contract":"strategy_advice_v1"}
+  ],
+  "artifact_contracts": [
+    {"artifact_type":"brand_report_v3","schema_version":"3"},
+    {"artifact_type":"campaign_report_v3","schema_version":"3"},
+    {"artifact_type":"kol_selection_v3","schema_version":"3"}
+  ],
+  "builder_versions": {"brand_report_v3":"1.0.0","campaign_report_v3":"1.0.0","kol_selection_v3":"1.0.0"},
+  "exporter_versions": {"brand_report_v3":"1.0.0","campaign_report_v3":"1.0.0","kol_selection_v3":"1.0.0"}
+}
