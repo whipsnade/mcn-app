@@ -24,6 +24,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from app.agent_artifacts.canonical import CanonicalPayloadMixin
 from app.agent_artifacts.payloads import TYPED_PAYLOAD_BY_SCHEMA
 
 
@@ -139,6 +140,20 @@ class ArtifactPayloadValidator:
                 f"payload fails {schema_version!r} contract: {exc.error_count()} error(s)",
                 errors=exc.errors(include_context=False),
             ) from exc
+        if isinstance(instance, CanonicalPayloadMixin):
+            try:
+                instance.require_canonical()
+            except ValueError as exc:
+                raise ArtifactPayloadInvalid(
+                    f"payload fails {schema_version!r} canonical publication contract",
+                    errors=[
+                        {
+                            "loc": ["canonical_data"],
+                            "msg": str(exc),
+                            "type": "value_error",
+                        }
+                    ],
+                ) from exc
         return instance.model_dump(mode="json")
 
     @staticmethod
@@ -169,7 +184,7 @@ class ArtifactPayloadValidator:
 
 
 __all__ = [
+    "SCHEMA_VERSION_BY_MODULE",
     "ArtifactPayloadInvalid",
     "ArtifactPayloadValidator",
-    "SCHEMA_VERSION_BY_MODULE",
 ]

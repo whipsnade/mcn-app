@@ -325,6 +325,8 @@ def canon_platform(value: Any) -> str:
     rendered = str(value or "").strip().casefold()
     if not rendered:
         return "all"
+    if rendered in AGGREGATE_PLATFORM_NAMES:
+        return "all"
     for alias, platform in _PLATFORM_ALIASES.items():
         if alias in rendered:
             return platform
@@ -345,13 +347,16 @@ def platform_coverage_incomplete(
     """scope 声明了平台但 Evidence 未覆盖全部平台时返回 True（部分覆盖）。
 
     合计行（全部/合计/总计/all）代表全部平台汇总，出现即视为覆盖完整；
-    无具名平台行时同理（DataTap 跨平台汇总行常省略平台字段）。
+    平台字段缺失不再默认为 aggregate，必须按未覆盖平台处理。
     """
     if not scope_platforms:
         return False
     covered: set[str] = set()
     for ref in rows:
-        platform = canon_platform(first(ref.row, PLATFORM_KEYS))
+        raw_platform = text(first(ref.row, PLATFORM_KEYS))
+        if raw_platform is None:
+            continue
+        platform = canon_platform(raw_platform)
         if platform in AGGREGATE_PLATFORM_NAMES:
             return False
         covered.add(platform)

@@ -188,6 +188,15 @@ def _dedup_rows(rows: list[RowRef]) -> list[RowRef]:
     return unique
 
 
+def _has_explicit_platform(ref: RowRef) -> bool:
+    """缺平台行不可伪造成 ``all``；只有明确 aggregate 才保留 all。"""
+    return text(first(ref.row, PLATFORM_KEYS)) is not None
+
+
+def _platform_rows(rows: list[RowRef]) -> list[RowRef]:
+    return [ref for ref in rows if _has_explicit_platform(ref)]
+
+
 def _build_overview(
     rows: list[RowRef],
     score: float | None,
@@ -950,15 +959,20 @@ def build_campaign_report_draft(
 
     collector = LineageCollector()
     post_rows = _dedup_rows(_group_posts(groups[GROUP_POSTS]))
+    post_metric_rows = _platform_rows(post_rows)
     # Gate C Task 4：社媒指标以 DataTap 为主（post/social/posts 分组合并去重），
     # 成本/转化以 upload 为主；冲突值双保留并生成 limitation。
     # Gate C 复审：合并行列表按 (evidence_id, source_path) 去重，同一 Evidence
     # 行被多分组引用时只计一次。
-    social_rows = _dedup_rows(_group_posts([*groups[GROUP_POSTS], *groups[GROUP_SOCIAL]]))
+    social_rows = _platform_rows(
+        _dedup_rows(_group_posts([*groups[GROUP_POSTS], *groups[GROUP_SOCIAL]]))
+    )
     upload_rows = _dedup_rows(groups[GROUP_UPLOAD])
-    current_rows = _dedup_rows(_group_posts([*groups[GROUP_CURRENT], *groups[GROUP_POSTS]]))
-    baseline_rows = _dedup_rows(_group_posts(groups[GROUP_BASELINE]))
-    post_period_rows = _dedup_rows(_group_posts(groups[GROUP_POST]))
+    current_rows = _platform_rows(
+        _dedup_rows(_group_posts([*groups[GROUP_CURRENT], *groups[GROUP_POSTS]]))
+    )
+    baseline_rows = _platform_rows(_dedup_rows(_group_posts(groups[GROUP_BASELINE])))
+    post_period_rows = _platform_rows(_dedup_rows(_group_posts(groups[GROUP_POST])))
 
     # 社媒冲突检测：upload 行若同时携带声量/互动且与 DataTap 不同，双值保留。
     # observed 规则（Gate C 第三轮）：DataTap 侧字段出现合计 0（观测值）vs
@@ -977,10 +991,9 @@ def build_campaign_report_draft(
                     f"声量冲突双值保留：DataTap {datatap_volume} / 用户资料 "
                     f"{upload_volume}，未静默覆盖"
                 ),
-                "affected_paths": ["overview.total_volume", "internal_metrics.spend"],
+                "affected_paths": ["social_volume"],
             }
         )
-        conflict_partial_paths.add("/data/overview/total_volume")
     if upload_engagement is not None and datatap_engagement is not None and upload_engagement != datatap_engagement:
         social_conflicts.append(
             {
@@ -989,16 +1002,16 @@ def build_campaign_report_draft(
                     f"互动数冲突双值保留：DataTap {datatap_engagement} / 用户资料 "
                     f"{upload_engagement}，未静默覆盖"
                 ),
-                "affected_paths": ["overview.total_engagement", "internal_metrics.spend"],
+                "affected_paths": ["overview.total_engagement"],
             }
         )
         conflict_partial_paths.add("/data/overview/total_engagement")
 
     # ---- sentiment：明细分组优先，缺失时回退 posts 行情感字段（每帖计 1） ----
-    sentiment_source = groups[GROUP_SENTIMENT]
+    sentiment_source = _platform_rows(groups[GROUP_SENTIMENT])
     if not sentiment_source:
         sentiment_source = [
-            ref for ref in post_rows if first(ref.row, SENTIMENT_KEYS) is not None
+            ref for ref in post_metric_rows if first(ref.row, SENTIMENT_KEYS) is not None
         ]
     sentiment, sentiment_has_rows = build_sentiment_section(sentiment_source, collector)
     score_rows = [
@@ -1016,14 +1029,14 @@ def build_campaign_report_draft(
     )
 
     overview, overview_has_rows = _build_overview(
-        post_rows, overall_score, score_rows, collector
+        post_metric_rows, overall_score, score_rows, collector
     )
     platform_contributions, contributions_has_rows = _build_platform_contributions(
-        post_rows, collector
+        post_metric_rows, collector
     )
-    timeline, timeline_has_rows = _build_timeline(post_rows, collector)
-    kol_contributions, kols_has_rows = _build_kol_contributions(post_rows, collector)
-    content_types, content_has_rows = _build_content_types(post_rows, collector)
+    timeline, timeline_has_rows = _build_timeline(post_metric_rows, collector)
+    kol_contributions, kols_has_rows = _build_kol_contributions(post_metric_rows, collector)
+    content_types, content_has_rows = _build_content_types(post_metric_rows, collector)
     top_posts, posts_meta = build_top_posts(
         post_rows, collector, limit=min(max(top_posts_limit, 1), 20)
     )
@@ -1140,6 +1153,18 @@ def build_campaign_report_draft(
     }
     # ---- 平台覆盖率：按章节实际 Evidence 判断，不把已观测原始值误标 partial ----
     partial_paths: set[str] = set()
+    post_platform_sections = (
+        "overview",
+        "platform_contributions",
+        "timeline",
+        "kol_contributions",
+        "content_types",
+        "sentiment",
+        "comparisons",
+        "attribution",
+        "organic_summary",
+        "audience_regions",
+    )
     def mark_coverage_partial(
         section: str, rows: list[RowRef], *, paths: list[str] | None = None
     ) -> bool:
@@ -1160,7 +1185,7 @@ def build_campaign_report_draft(
 
     mark_coverage_partial(
         "overview",
-        post_rows,
+        post_metric_rows,
         paths=[
             "/data/overview/total_volume",
             "/data/overview/total_engagement",
@@ -1170,7 +1195,7 @@ def build_campaign_report_draft(
     )
     mark_coverage_partial(
         "platform_contributions",
-        post_rows,
+        post_metric_rows,
         paths=[
             path
             for path, value in walk_data_leaves(data)
@@ -1188,8 +1213,24 @@ def build_campaign_report_draft(
             if path.startswith("/data/sentiment/summary/") and value is not None
         ],
     )
-    mark_coverage_partial("timeline", post_rows)
-    mark_coverage_partial("top_posts", post_rows)
+    mark_coverage_partial("timeline", post_metric_rows)
+    mark_coverage_partial("top_posts", post_metric_rows)
+    if posts_meta["missing_platform"]:
+        for section in post_platform_sections:
+            if has_rows.get(section, False):
+                force_partial.add(section)
+                extra_limitations.setdefault(section, []).append(
+                    {
+                        "code": "post_platform_missing",
+                        "message": "部分帖子缺少平台，已从平台相关聚合中排除",
+                        "affected_paths": [section],
+                    }
+                )
+        for path, value in walk_data_leaves(data):
+            if value is not None and any(
+                path.startswith(f"/data/{section}/") for section in post_platform_sections
+            ):
+                partial_paths.add(path)
     partial_paths.update(conflict_partial_paths)
 
     data_status, availability, limitations = _assemble_availability(

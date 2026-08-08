@@ -40,7 +40,10 @@ _UNIT_BY_SUFFIX: dict[str, str] = {
     "collects": "count",
     "creators": "count",
     "creator_count": "count",
+    "total_creators": "count",
+    "count": "count",
     "conversions": "count",
+    "sentiment_score": "score",
     "date": "timestamp",
     "published_at": "timestamp",
     "positive": "mentions",
@@ -49,6 +52,10 @@ _UNIT_BY_SUFFIX: dict[str, str] = {
     "spend": "currency",
     "revenue": "currency",
     "impressions": "impressions",
+    "cpc": "currency_per_conversion",
+    "cpm": "currency_per_thousand_impressions",
+    "roi": "ratio",
+    "roas": "ratio",
 }
 
 
@@ -132,6 +139,16 @@ class CanonicalPayloadMixin(BaseModel):
 
     @model_validator(mode="after")
     def _validate_canonical_contract(self) -> CanonicalPayloadMixin:
+        has_canonical = bool(self.canonical_data)
+        has_lineage = bool(self.field_lineage)
+        if has_canonical != has_lineage:
+            raise ValueError(
+                "canonical_data and field_lineage must be both present or both absent"
+            )
+        # 历史 Artifact 在 Task 3R 前没有这两个字段；读取和导出保持兼容。
+        # 新建/更新/发布由 require_canonical() 额外执行严格门禁。
+        if not has_canonical:
+            return self
         paths = [field.path for field in self.canonical_data]
         if len(set(paths)) != len(paths):
             raise ValueError(f"duplicate canonical path: {sorted({p for p in paths if paths.count(p) > 1})}")
@@ -168,6 +185,12 @@ class CanonicalPayloadMixin(BaseModel):
         for path, value in canonical_values.items():
             if value != data_leaves[path]:
                 raise ValueError(f"canonical value does not match final data at {path!r}")
+        return self
+
+    def require_canonical(self) -> CanonicalPayloadMixin:
+        """要求新建、更新或发布的 payload 携带完整 canonical 合同。"""
+        if not self.canonical_data or not self.field_lineage:
+            raise ValueError("canonical contract is required for new or published payloads")
         return self
 
 

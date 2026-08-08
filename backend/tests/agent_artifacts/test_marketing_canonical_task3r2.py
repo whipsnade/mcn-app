@@ -317,7 +317,7 @@ def test_campaign_platform_coverage_marks_each_affected_section_partial() -> Non
     assert _by_path(payload)["/data/platform_contributions/0/share"].availability == "partial"
 
 
-def test_social_metric_conflict_marks_affected_canonical_fields_partial() -> None:
+def test_social_metric_conflict_only_marks_same_metric_canonical_field_partial() -> None:
     payload = build_campaign_report_draft(
         scope={**_CAMPAIGN_SCOPE, "platforms": ["xiaohongshu"]},
         evidence={
@@ -327,7 +327,8 @@ def test_social_metric_conflict_marks_affected_canonical_fields_partial() -> Non
     ).payload
     fields = _by_path(payload)
 
-    assert fields["/data/overview/total_volume"].availability == "partial"
+    # 声量与活动帖子数不是同一 canonical 口径；冲突只做 limitation 披露。
+    assert fields["/data/overview/total_volume"].availability == "complete"
     assert fields["/data/overview/total_engagement"].availability == "partial"
 
 

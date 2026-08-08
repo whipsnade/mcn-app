@@ -293,9 +293,9 @@ def test_sentiment_aggregate_rows_not_double_counted() -> None:
 def test_sentiment_aggregate_only_rows_fall_back_to_all_platform() -> None:
     """上游只返回合计行（无平台拆分）时不丢数据：归入 all 平台，summary 即合计。"""
     aggregate_rows = [
-        {"内容情感": "正面", "声量": 115440},
-        {"内容情感": "中性", "声量": 161186},
-        {"内容情感": "负面", "声量": 18988},
+        {"平台": "合计", "内容情感": "正面", "声量": 115440},
+        {"平台": "合计", "内容情感": "中性", "声量": 161186},
+        {"平台": "合计", "内容情感": "负面", "声量": 18988},
     ]
     build = build_campaign_report_draft(
         scope=SCOPE,
