@@ -179,9 +179,9 @@ def build_top_posts(
             {
                 "platform": canon_platform(first(row, PLATFORM_KEYS)),
                 "post_id": post_id,
-                "title": text(first(row, TITLE_KEYS)) or "",
+                "title": text(first(row, TITLE_KEYS)),
                 "url": valid_url(first(row, URL_KEYS)),
-                "author": text(first(row, AUTHOR_KEYS)) or "",
+                "author": text(first(row, AUTHOR_KEYS)),
                 "published_at": published,
                 "likes": likes,
                 "comments": comments,
@@ -217,6 +217,10 @@ def build_top_posts(
         ref = item.pop("_ref")
         if item["url"] is None:
             missing_url += 1
+        # 全部叶子字段（含文本）都登记贡献行，canonical 发布时才能拿到证据。
+        for field_name in ("platform", "post_id", "title", "url", "author", "published_at"):
+            if item[field_name] is not None:
+                collector.add(f"{path}/{index}/{field_name}", [ref])
         for field_name in ("likes", "comments", "shares", "engagement"):
             if item[field_name] is not None:
                 collector.add(f"{path}/{index}/{field_name}", [ref])

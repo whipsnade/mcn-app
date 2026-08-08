@@ -140,9 +140,10 @@ class TopPost(BaseModel):
 
     platform: str
     post_id: str
-    title: str
+    # title/author 缺失时显式 None（不伪造空字符串，与 canonical unavailable 一致）。
+    title: str | None
     url: OptionalHttpUrl
-    author: str
+    author: str | None
     published_at: datetime
     likes: int | None
     comments: int | None

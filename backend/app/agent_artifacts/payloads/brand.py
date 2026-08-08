@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from datetime import date
-from typing import Any, Literal
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from app.agent_artifacts.canonical import CanonicalPayloadMixin
 from app.agent_artifacts.payloads.common import (
     ArtifactPayloadBase,
     ContentTypeItem,
@@ -168,15 +169,13 @@ class BrandNarrative(BaseModel):
     recommendations: tuple[NarrativeRecommendation, ...] = Field(default_factory=tuple)
 
 
-class BrandReportV3(ArtifactPayloadBase):
+class BrandReportV3(ArtifactPayloadBase, CanonicalPayloadMixin):
     schema_version: Literal["brand_report_v3"] = "brand_report_v3"
     module: Literal["brand"] = "brand"
 
     scope: BrandScope
     data: BrandData
     narrative: BrandNarrative
-    canonical_data: tuple[dict[str, Any], ...] = Field(default_factory=tuple)
-    field_lineage: dict[str, tuple[str, ...]] = Field(default_factory=dict)
 
     REQUIRED_SECTIONS = frozenset({"overview", "sentiment", "daily_trend", "topics", "top_posts"})
     # §6.3：全部业务章节根纳入递归 null 治理（含数组元素内的 Optional 数值叶子）。

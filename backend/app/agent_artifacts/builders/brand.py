@@ -61,6 +61,7 @@ from app.agent_artifacts.builders.raw_rows import (
     has_any,
     num,
     parse_date,
+    platform_coverage_incomplete,
     platform_sort_key,
     sentiment_score,
     text,
@@ -69,6 +70,7 @@ from app.agent_artifacts.builders.sections import (
     build_sentiment_section,
     build_top_posts,
 )
+from app.agent_artifacts.canonical import publish_canonical
 from app.agent_artifacts.lineage import required_numeric_pointers
 from app.agent_artifacts.payloads.brand import BrandData, BrandReportV3, BrandScope
 from app.agent_artifacts.payloads.common import iter_null_numeric_paths
@@ -866,12 +868,49 @@ def build_brand_report_draft(
         "topics": topics_has_rows,
         "top_posts": bool(top_posts),
     }
+    # ---- 平台覆盖率（Task 3R）：scope 声明平台未被 Evidence 覆盖 → partial ----
+    partial_paths: set[str] = set()
+    coverage_partial = overview_has_rows and platform_coverage_incomplete(
+        scope_model.platforms, groups[GROUP_OVERVIEW_CURRENT]
+    )
+    if coverage_partial:
+        force_partial.add("overview")
+        partial_paths.update(
+            {
+                "/data/overview/total_volume",
+                "/data/overview/total_engagement",
+                "/data/overview/total_posts",
+            }
+        )
+        extra_limitations.setdefault("overview", []).append(
+            {
+                "code": "platform_coverage_incomplete",
+                "message": "scope 声明的部分平台没有覆盖，聚合指标按可得平台披露",
+                "affected_paths": ["overview"],
+            }
+        )
+
     data_status, availability, limitations = _assemble_availability(
         data_model,
         has_rows=has_rows,
         extra=extra_limitations,
         force_partial=force_partial,
     )
+    if coverage_partial and (
+        "platform_coverage_incomplete" not in availability["overview"]["reason_codes"]
+    ):
+        availability["overview"]["reason_codes"] = [
+            *availability["overview"]["reason_codes"],
+            "platform_coverage_incomplete",
+        ]
+
+    refs = collector.build()
+    try:
+        canonical_fields, field_lineage = publish_canonical(
+            data, refs, partial_paths=frozenset(partial_paths)
+        )
+    except ValidationError as exc:
+        raise DraftBuildError(f"invalid brand canonical publication: {exc}") from exc
 
     payload = {
         "schema_version": SCHEMA_VERSION,
@@ -885,11 +924,9 @@ def build_brand_report_draft(
         "narrative": narrative if narrative is not None else _default_narrative(
             scope_model.brand, data_status
         ),
-        "canonical_data": canonical.serialized_fields(),
-        "field_lineage": {},
+        "canonical_data": tuple(canonical_fields),
+        "field_lineage": field_lineage,
     }
-    refs = collector.build()
-    payload["field_lineage"] = canonical.field_lineage(refs)
     try:
         BrandReportV3.model_validate(payload)  # fail-fast：builder 输出必须合法。
     except ValidationError as exc:

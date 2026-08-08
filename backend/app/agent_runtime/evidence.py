@@ -6,13 +6,15 @@ MCP 原始结果完整落 ``evidence_items.raw_payload_json``，并计算
 
 写入器只提供插入（append-only），**没有 update 路径**：Evidence 不可变，
 历史数字来源保持稳定。
+
+:class:`CanonicalField`（对外发布的 canonical 业务字段强类型契约）定义在
+``app.agent_artifacts.canonical``，此处仅为兼容再导出。
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
@@ -20,6 +22,7 @@ from uuid import uuid4
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agent_artifacts.canonical import CanonicalField
 from app.agent_runtime.models import EvidenceItem
 from app.mcp_gateway.validation import canonical_json_bytes
 
@@ -34,26 +37,6 @@ _MAX_PREVIEW_STRING = 2_000
 _MAX_PREVIEW_ARRAY = 50
 _MAX_PREVIEW_PROPS = 200
 _MAX_PREVIEW_DEPTH = 6
-
-
-@dataclass(frozen=True)
-class CanonicalField:
-    """可追溯的营销业务字段；缺失值必须显式标记为 unavailable。"""
-
-    path: str
-    value: Any
-    availability: str
-    evidence_ids: tuple[str, ...]
-    unit: str | None
-
-    def model_dump(self) -> dict[str, Any]:
-        return {
-            "path": self.path,
-            "value": self.value,
-            "availability": self.availability,
-            "evidence_ids": list(self.evidence_ids),
-            "unit": self.unit,
-        }
 
 
 def _now() -> datetime:

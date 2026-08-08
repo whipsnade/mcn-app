@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from datetime import date
-from typing import Any, Literal
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.agent_artifacts.canonical import CanonicalPayloadMixin
 from app.agent_artifacts.payloads.common import (
     ArtifactPayloadBase,
     ContentTypeItem,
@@ -187,15 +188,13 @@ class CampaignNarrative(BaseModel):
     recommendations: tuple[NarrativeRecommendation, ...] = Field(default_factory=tuple)
 
 
-class CampaignReportV2(ArtifactPayloadBase):
+class CampaignReportV2(ArtifactPayloadBase, CanonicalPayloadMixin):
     schema_version: Literal["campaign_report_v2"] = "campaign_report_v2"
     module: Literal["campaign"] = "campaign"
 
     scope: CampaignScope
     data: CampaignData
     narrative: CampaignNarrative
-    canonical_data: tuple[dict[str, Any], ...] = Field(default_factory=tuple)
-    field_lineage: dict[str, tuple[str, ...]] = Field(default_factory=dict)
 
     REQUIRED_SECTIONS = frozenset(
         {"overview", "platform_contributions", "timeline", "sentiment", "top_posts"}

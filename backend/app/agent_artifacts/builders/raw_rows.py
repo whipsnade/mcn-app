@@ -1,8 +1,11 @@
-"""Evidence 原始行归一（brand/campaign builder 共用，B2）。
+"""Evidence 原始行归一（brand/campaign builder 共用，B2 / Task 3R 分层）。
 
-把 DataTap MCP 结果的多种包装形态（``{"result": "<json str>"}`` / ``{"rows": [...]}`` /
-裸 list / 裸 dict）提取为 ``(evidence 内路径, 行 dict)`` 序列，并提供中/英文字段
-别名、万/亿单位解析、平台名归一、情感极性映射、日期/URL 清洗等纯函数。
+Task 3R 分层：本模块只负责**内部 normalized source rows**——把 DataTap MCP 结果
+的多种包装形态（``{"result": "<json str>"}`` / ``{"rows": [...]}`` / 裸 list /
+裸 dict）提取为 ``(evidence 内路径, 行 dict)`` 序列，按 ``_CANONICAL_ROW_FIELDS``
+统一字段别名，供 Builder 计算。对外发布的 :class:`CanonicalField` 与
+``field_lineage`` 由 ``app.agent_artifacts.canonical`` 从最终业务 data 生成，
+本模块不产出任何对外 canonical path。
 
 口径移植自已删除的旧 ``reporting/brand_assembler.py``（git 历史 ``d54bc06^``）的
 确定性归一部分；不包含任何模型调用。source_path 指向 Evidence raw payload 内的
@@ -17,8 +20,6 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any, NamedTuple
-
-from app.agent_runtime.evidence import CanonicalField
 
 
 class RowRef(NamedTuple):
@@ -305,6 +306,25 @@ def platform_sort_key(platform: Any) -> tuple[int, str]:
         return (len(_PLATFORM_ORDER), name)
 
 
+def platform_coverage_incomplete(
+    scope_platforms: tuple[str, ...], rows: list[RowRef]
+) -> bool:
+    """scope 声明了平台但 Evidence 未覆盖全部平台时返回 True（部分覆盖）。
+
+    合计行（全部/合计/总计/all）代表全部平台汇总，出现即视为覆盖完整；
+    无具名平台行时同理（DataTap 跨平台汇总行常省略平台字段）。
+    """
+    if not scope_platforms:
+        return False
+    covered: set[str] = set()
+    for ref in rows:
+        platform = canon_platform(first(ref.row, PLATFORM_KEYS))
+        if platform in AGGREGATE_PLATFORM_NAMES:
+            return False
+        covered.add(platform)
+    return not set(scope_platforms).issubset(covered)
+
+
 def valid_url(value: Any) -> str | None:
     """仅接受 http(s) 绝对 URL；其余一律 None（缺失披露，不伪造链接）。"""
     rendered = text(value)
@@ -378,7 +398,11 @@ def sentiment_score(positive: float | None, neutral: float | None, negative: flo
 
 
 # ---------------------------------------------------------------------------
-# Task 3 canonical Evidence：唯一的原始 payload 消费入口
+# Task 3R：内部 normalized source rows（唯一原始 payload 消费入口）
+#
+# 只产出供 Builder 计算用的规范化行（canonical source key + 原始值 + RowRef），
+# 不产出对外 canonical path。原始行去重键为 (evidence_id, source_path,
+# canonical source name)：同一 Evidence 行被多个 group 引用时只归一化一次。
 # ---------------------------------------------------------------------------
 
 _CANONICAL_ROW_FIELDS: tuple[tuple[str, tuple[str, ...], str | None], ...] = (
@@ -415,60 +439,39 @@ _CANONICAL_ROW_FIELDS: tuple[tuple[str, tuple[str, ...], str | None], ...] = (
     ("is_paid", ("是否付费",), None),
     ("attribution", ("归属", "投放类型", "付费/自然", "attribution"), None),
 )
-_EXPECTED_GROUP_FIELDS: dict[str, tuple[tuple[str, str | None], ...]] = {
-    "overview_current": (("volume", "mentions"), ("engagement", "interactions"), ("posts", "posts")),
-    "sentiment": (("sentiment", None), ("volume", "mentions")),
-    "daily_trend": (("date", "timestamp"), ("volume", "mentions"), ("engagement", "interactions")),
-    "top_posts": (("post_id", None), ("published_at", "timestamp"), ("engagement", "interactions")),
-    "topics": (("topic", None), ("volume", "mentions")),
-    "posts": (("post_id", None), ("published_at", "timestamp"), ("engagement", "interactions")),
-}
 
 
 @dataclass(frozen=True)
 class CanonicalEvidence:
-    fields: tuple[CanonicalField, ...]
+    """内部 normalized source rows：按 group 提供规范化行（只供 Builder 计算）。"""
+
     rows_by_group: Mapping[str, tuple[RowRef, ...]]
-    source_index: Mapping[tuple[str, str], tuple[str, ...]]
 
     def rows(self, group: str) -> list[RowRef]:
         return list(self.rows_by_group.get(group, ()))
-
-    def serialized_fields(self) -> list[dict[str, Any]]:
-        return [field.model_dump() for field in self.fields]
-
-    def field_lineage(self, evidence_refs: list[dict[str, Any]]) -> dict[str, list[str]]:
-        lineage: dict[str, list[str]] = {}
-        for reference in evidence_refs:
-            paths: list[str] = []
-            for source in reference.get("sources", []):
-                evidence_id = source.get("evidence_id")
-                source_path = source.get("source_path")
-                if isinstance(evidence_id, str) and isinstance(source_path, str):
-                    paths.extend(self.source_index.get((evidence_id, source_path), ()))
-            if paths:
-                lineage[reference["artifact_path"]] = list(dict.fromkeys(paths))
-        return lineage
 
 
 def canonicalize_marketing_evidence(
     evidence: Mapping[str, list[tuple[str, Any]]]
 ) -> CanonicalEvidence:
-    """从原始 Evidence shape 提取 canonical fields，再给 Builder 提供标准化行。
+    """从原始 Evidence shape 提取内部规范化行，给 Builder 提供标准化 rows。
 
     Builder 此后只读取返回的 rows；原始 payload 只在本函数内解包和字段别名匹配。
+    同一 ``(evidence_id, source_path)`` 在 group 内重复（或跨 group 重复）只保留
+    一行，防双计；对外 canonical 字段由 ``canonical.publish_canonical`` 从最终
+    data 生成，本层不产出 canonical path。
     """
-    fields: list[CanonicalField] = []
     rows_by_group: dict[str, tuple[RowRef, ...]] = {}
-    source_index: dict[tuple[str, str], list[str]] = {}
     for group, pairs in evidence.items():
         normalized_rows: list[RowRef] = []
-        available_names: set[str] = set()
+        seen_sources: set[tuple[str, str]] = set()
         for evidence_id, raw_payload in pairs:
             for ref in extract_rows(evidence_id, raw_payload):
+                key = (ref.evidence_id, ref.source_path)
+                if key in seen_sources:
+                    continue  # (evidence_id, source_path) 行级去重
                 normalized: dict[str, Any] = {}
-                paths: list[str] = []
-                for canonical_name, aliases, unit in _CANONICAL_ROW_FIELDS:
+                for canonical_name, aliases, _unit in _CANONICAL_ROW_FIELDS:
                     source_key = next(
                         (key for key in aliases if key in ref.row and ref.row[key] not in (None, "")),
                         None,
@@ -476,43 +479,13 @@ def canonicalize_marketing_evidence(
                     if source_key is None:
                         continue
                     normalized[canonical_name] = ref.row[source_key]
-                    field_path = (
-                        f"/{_escape(group)}/{_escape(evidence_id)}{ref.field_base}/"
-                        f"{_escape(source_key)}"
-                    )
-                    fields.append(
-                        CanonicalField(
-                            path=field_path,
-                            value=ref.row[source_key],
-                            availability="available",
-                            evidence_ids=(evidence_id,),
-                            unit=unit,
-                        )
-                    )
-                    paths.append(field_path)
-                    available_names.add(canonical_name)
                 if normalized:
+                    seen_sources.add(key)
                     normalized_rows.append(
                         RowRef(ref.evidence_id, ref.source_path, normalized, ref.base_path)
                     )
-                    source_index.setdefault((ref.evidence_id, ref.source_path), []).extend(paths)
-        for name, unit in _EXPECTED_GROUP_FIELDS.get(group, ()):
-            if name not in available_names:
-                fields.append(
-                    CanonicalField(
-                        path=f"/{_escape(group)}/{name}",
-                        value=None,
-                        availability="unavailable",
-                        evidence_ids=(),
-                        unit=unit,
-                    )
-                )
         rows_by_group[group] = tuple(normalized_rows)
-    return CanonicalEvidence(
-        fields=tuple(fields),
-        rows_by_group=rows_by_group,
-        source_index={key: tuple(value) for key, value in source_index.items()},
-    )
+    return CanonicalEvidence(rows_by_group=rows_by_group)
 
 
 __all__ = [
@@ -556,6 +529,7 @@ __all__ = [
     "num",
     "parse_date",
     "parse_datetime",
+    "platform_coverage_incomplete",
     "platform_sort_key",
     "polarity",
     "sentiment_score",
