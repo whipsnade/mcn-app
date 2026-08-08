@@ -218,6 +218,38 @@ FAIL。本次没有启动案例，因而不消耗唯一真实 round 授权；完
 按“不因失败重试”的约束，本会话已停止；修正启动器并通过本地测试后，须重新取得一次单工具真实
 DataTap 冒烟授权，才可继续。Task 9 与方案 B/C 均未进入。
 
+## B0 Task 7 离线 Marketing Capability Pack 回放（2026-08-08）— PASS（本地 synthetic only）
+
+### 范围与保全
+
+- 回放只读取 `backend/fixtures/pi_runtime_poc/marketing_b0/` 中的脱敏 cases、results 和
+  fake Pi events；`app/pi_runtime_poc/replay.py` 只返回确定性的 execution 值对象。
+- 没有创建数据库、模型、DataTap、钱包或积分客户端；没有启动真实 Pi、没有运行或修改
+  Task 9，也没有覆盖历史 round。此节不是 Gate A 真实业务结论。
+
+### 六案例证据
+
+- 品牌、活动和 KOL 三个报告案例分别带有期望 artifact type、Version、Evidence、scope
+  和结构化 lineage/叙事/limitations 标记；`evaluate_case` 的十项 hard checks 全部为真。
+- 钻取只绑定 `version-brand-b0`，不产生 Artifact 或 DataTap 调用；篡改绑定 Version 会
+  被本地回放和 Gate 拒绝。
+- 澄清和非营销拒答均为零 Artifact、零 DataTap，分别返回 clarification/refused 行为。
+- 事件顺序、案例顺序、报告 Version 去重和 fixture digest 均确定性；缺失/乱序事件与
+  重复报告 fail-closed。execution 与 hard-check summary 均可重复生成且不含人工评分；
+  fixture 不含密钥、Bearer、endpoint 或用户凭证。
+
+### 验证结果
+
+- Task 7 定向回放：**6 passed**。
+- 后端 `tests/pi_runtime_poc tests/agent_artifacts`：**709 passed、9 skipped**；范围
+  Ruff 与 `git diff --check`：通过。
+- Pi Runtime `npm test`：**47 passed（9 files）**；`npm run typecheck`：通过。
+
+### 结论
+
+本地 B0 回放 Gate 证据通过；它不授权真实 UAT 或 Task 9。Task 4R、Task 5、Task 6、Task 7
+完成后停止，不进入 B1–B7 或方案 C。
+
 ---
 
 ## Task 8D 单工具冒烟启动器本地修复（2026-08-07）— READY_FOR_REAL_SMOKE_AUTHORIZATION

@@ -1,0 +1,8 @@
+{
+  "brand-research-v1": ["run.started", "evidence.settled", "artifact.published", "run.completed"],
+  "campaign-evaluation-v1": ["run.started", "evidence.settled", "artifact.published", "run.completed"],
+  "kol-selection-v1": ["run.started", "evidence.settled", "artifact.published", "run.completed"],
+  "artifact-drilldown-v1": ["run.started", "artifact.read", "run.completed"],
+  "scope-clarification-v1": ["run.started", "clarification.requested", "run.completed"],
+  "non-marketing-v1": ["run.started", "refusal.completed", "run.completed"]
+}

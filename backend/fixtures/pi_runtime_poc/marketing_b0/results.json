@@ -1,0 +1,121 @@
+[
+  {
+    "case_id": "brand-research-v1",
+    "runtime": "pi",
+    "status": "completed",
+    "outcome": "completed",
+    "run_id": "offline-brand-run",
+    "artifact_versions": ["version-brand-b0"],
+    "evidence_ids": ["evidence-brand-volume", "evidence-brand-sentiment"],
+    "scope": {
+      "brand": "脱敏品牌",
+      "platforms": ["douyin", "xiaohongshu"]
+    },
+    "artifacts": [
+      {
+        "version_id": "version-brand-b0",
+        "artifact_type": "brand_report_v3",
+        "status": "published",
+        "validation_json": {"valid": true},
+        "availability": "complete",
+        "numeric_lineage_complete": true,
+        "narrative_grounded": true,
+        "partial_limitations_complete": true
+      }
+    ],
+    "metrics": {"datatap_tool_calls": 2}
+  },
+  {
+    "case_id": "campaign-evaluation-v1",
+    "runtime": "pi",
+    "status": "completed",
+    "outcome": "completed",
+    "run_id": "offline-campaign-run",
+    "artifact_versions": ["version-campaign-b0"],
+    "evidence_ids": ["evidence-campaign-volume", "evidence-campaign-engagement"],
+    "scope": {
+      "brand": "脱敏品牌",
+      "platforms": ["douyin", "xiaohongshu"]
+    },
+    "artifacts": [
+      {
+        "version_id": "version-campaign-b0",
+        "artifact_type": "campaign_report_v2",
+        "status": "published",
+        "validation_json": {"valid": true},
+        "availability": "complete",
+        "numeric_lineage_complete": true,
+        "narrative_grounded": true,
+        "partial_limitations_complete": true
+      }
+    ],
+    "metrics": {"datatap_tool_calls": 2}
+  },
+  {
+    "case_id": "kol-selection-v1",
+    "runtime": "pi",
+    "status": "completed",
+    "outcome": "completed",
+    "run_id": "offline-kol-run",
+    "artifact_versions": ["version-kol-b0"],
+    "evidence_ids": ["evidence-kol-profile", "evidence-kol-engagement"],
+    "scope": {
+      "brand": "脱敏品牌",
+      "platforms": ["douyin", "xiaohongshu"]
+    },
+    "artifacts": [
+      {
+        "version_id": "version-kol-b0",
+        "artifact_type": "kol_selection_v3",
+        "status": "published",
+        "validation_json": {"valid": true},
+        "availability": "complete",
+        "valid_candidates": true,
+        "numeric_lineage_complete": true,
+        "narrative_grounded": true,
+        "partial_limitations_complete": true
+      }
+    ],
+    "candidates": [
+      {
+        "nickname": "脱敏达人",
+        "platform": "douyin",
+        "kol_uid": "kol-redacted-001",
+        "score_inputs": {"followers": 0}
+      }
+    ],
+    "metrics": {"datatap_tool_calls": 1}
+  },
+  {
+    "case_id": "artifact-drilldown-v1",
+    "runtime": "pi",
+    "status": "completed",
+    "outcome": "completed",
+    "run_id": "offline-drilldown-run",
+    "artifact_versions": [],
+    "evidence_ids": [],
+    "drilldown_version_id": "version-brand-b0",
+    "drilldown_grounded": true,
+    "metrics": {"datatap_tool_calls": 0}
+  },
+  {
+    "case_id": "scope-clarification-v1",
+    "runtime": "pi",
+    "status": "completed",
+    "outcome": "clarification_requested",
+    "run_id": "offline-clarify-run",
+    "artifact_versions": [],
+    "evidence_ids": [],
+    "metrics": {"datatap_tool_calls": 0}
+  },
+  {
+    "case_id": "non-marketing-v1",
+    "runtime": "pi",
+    "status": "completed",
+    "outcome": "refused",
+    "run_id": "offline-refuse-run",
+    "artifact_versions": [],
+    "evidence_ids": [],
+    "metrics": {"datatap_tool_calls": 0}
+  }
+]
