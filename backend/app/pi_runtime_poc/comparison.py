@@ -21,16 +21,23 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.agent_artifacts.exporters import ArtifactExportUnsupported, export_artifact
 from app.agent_artifacts.models import AgentArtifact, AgentArtifactVersion
 from app.agent_runtime.events import AgentEventBroker, AgentEventStream
-from app.agent_runtime.executor import SESSION_ANALYST_PROFILE, AgentRunExecutor
-from app.agent_runtime.models import AgentRun, AgentSession, AgentToolCall, EvidenceItem
-from app.billing.models import Wallet
+from app.agent_runtime.executor import SESSION_ANALYST_PROFILE
+from app.agent_runtime.models import (
+    AgentMessage,
+    AgentRun,
+    AgentSession,
+    AgentToolCall,
+    EvidenceItem,
+)
 from app.core.config import Settings
 from app.identity.models import User, UserChannelPermission
 from app.identity.service import IdentityService
+from app.mcp_gateway.contracts import DataTapService
 from app.pi_runtime_poc.rpc import PiRpcClient, PiRpcConfig
 from app.pi_runtime_poc.runner import PiClientFactory, PiPocRunner
 
-RuntimeName = Literal["current", "pi"]
+RuntimeName = Literal["pi"]
+CaseExecutionStatus = Literal["completed", "failed", "skipped_dependency", "not_run"]
 _SECRET_PATTERN = re.compile(r"(?:sk-[A-Za-z0-9._-]+|Bearer\s+\S+)", re.IGNORECASE)
 _REPORT_BEHAVIOR = "report"
 _DATATAP_SERVICE_SLUGS = frozenset(
@@ -41,6 +48,15 @@ _DATATAP_SERVICE_SLUGS = frozenset(
         "bilibili-mcp",
     }
 )
+_PI_DATATAP_AUDIT_SERVICE = "pi_poc_datatap"
+_DATATAP_AUDIT_SERVICES = frozenset(
+    (*[service.value for service in DataTapService], _PI_DATATAP_AUDIT_SERVICE)
+)
+
+
+def _is_datatap_audit_service(service: str) -> bool:
+    """只把真实 DataTap transport 与 Pi 的直接 DataTap 旁路计入调用数。"""
+    return service in _DATATAP_AUDIT_SERVICES
 
 
 @dataclass(frozen=True)
@@ -50,14 +66,17 @@ class PocCase:
     date_anchor: str
     expected_behavior: Literal["report", "drilldown", "clarify", "refuse"]
     required_artifact_type: str | None
+    depends_on_case_id: str | None = None
 
 
 @dataclass(frozen=True)
 class PocCaseResult:
     case_id: str
     runtime: RuntimeName
-    run_id: str
-    outcome: str
+    run_id: str | None
+    status: CaseExecutionStatus
+    error_code: str | None
+    outcome: str | None
     artifact_versions: tuple[str, ...]
     evidence_ids: tuple[str, ...]
     metrics: dict[str, float | int | bool | None]
@@ -66,11 +85,11 @@ class PocCaseResult:
 
 
 class RuntimeCaseExecutor(Protocol):
-    async def execute(self, case: PocCase) -> PocCaseResult: ...
+    async def execute(self, case: PocCase, *, prior_run_id: str | None = None) -> PocCaseResult: ...
 
 
 class PocCaseFactory:
-    """为每个 runtime/case 建立独立、可审计且同内容的 POC Run。"""
+    """为每个 Pi case 建立独立、可审计且同内容的 POC Run。"""
 
     def __init__(
         self,
@@ -78,66 +97,98 @@ class PocCaseFactory:
         *,
         round_id: str,
         model_name: str,
-        current_wallet_balance: int = 10_000,
     ) -> None:
         if not model_name:
             raise ValueError("poc_model_name_required")
-        if current_wallet_balance <= 0:
-            raise ValueError("poc_current_wallet_balance_required")
         self._session_factory = session_factory
         self._round_id = round_id
         self._model_name = model_name
-        self._current_wallet_balance = current_wallet_balance
 
-    async def create(self, case: PocCase, runtime: RuntimeName) -> str:
+    async def create(self, case: PocCase, *, prior_run_id: str | None = None) -> str:
         now = datetime.now(UTC).replace(tzinfo=None)
         async with self._session_factory() as db:
-            user = User(
-                id=str(uuid4()),
-                nickname=f"pi-poc-{runtime}",
-                role="user",
-                status="active",
-                industries=["美食"],
-                created_at=now,
-                updated_at=now,
-            )
-            db.add(user)
-            await db.flush()
-            for channel in IdentityService.default_channels:
-                db.add(
-                    UserChannelPermission(
-                        id=str(uuid4()),
-                        user_id=user.id,
-                        channel=channel,
-                        is_enabled=True,
-                        created_at=now,
-                        updated_at=now,
-                    )
+            dependency: dict[str, object] | None = None
+            if prior_run_id is not None:
+                prior = await db.get(AgentRun, prior_run_id)
+                if prior is None:
+                    raise ValueError("poc_dependency_run_not_found")
+                prior_snapshot = (prior.prompt_snapshot_json or {}).get("pi_runtime_poc")
+                if (
+                    not isinstance(prior_snapshot, dict)
+                    or prior_snapshot.get("runtime") != "pi"
+                    or prior_snapshot.get("case_id") != case.depends_on_case_id
+                ):
+                    raise ValueError("poc_dependency_run_mismatch")
+                version_ids = tuple(
+                    (
+                        await db.scalars(
+                            select(AgentArtifactVersion.id)
+                            .join(AgentArtifact, AgentArtifact.id == AgentArtifactVersion.artifact_id)
+                            .where(
+                                AgentArtifactVersion.source_run_id == prior.id,
+                                AgentArtifact.session_id == prior.session_id,
+                                AgentArtifact.status == "published",
+                            )
+                        )
+                    ).all()
                 )
-            if runtime == "current":
-                db.add(
-                    Wallet(
-                        user_id=user.id,
-                        balance=self._current_wallet_balance,
-                        reserved=0,
-                        version=0,
-                        updated_at=now,
+                if not version_ids:
+                    raise ValueError("poc_dependency_artifact_required")
+                user_id = prior.user_id
+                session_id = prior.session_id
+                message_sequence = (
+                    await db.scalar(
+                        select(func.max(AgentMessage.sequence)).where(AgentMessage.session_id == session_id)
                     )
+                    or 0
+                ) + 1
+                dependency = {
+                    "case_id": case.depends_on_case_id,
+                    "artifact_version_ids": list(version_ids),
+                }
+            else:
+                user = User(
+                    id=str(uuid4()),
+                    nickname="pi-poc-pi",
+                    role="user",
+                    status="active",
+                    industries=["美食"],
+                    created_at=now,
+                    updated_at=now,
                 )
-            session = AgentSession(
-                id=str(uuid4()),
-                user_id=user.id,
-                title=f"Pi POC {case.case_id}",
-                status="active",
-                session_summary=f"date_anchor={case.date_anchor}; case_id={case.case_id}",
-                summary_version=1,
-                created_at=now,
-                updated_at=now,
-            )
+                db.add(user)
+                await db.flush()
+                for channel in IdentityService.default_channels:
+                    db.add(
+                        UserChannelPermission(
+                            id=str(uuid4()),
+                            user_id=user.id,
+                            channel=channel,
+                            is_enabled=True,
+                            created_at=now,
+                            updated_at=now,
+                        )
+                    )
+                session = AgentSession(
+                    id=str(uuid4()),
+                    user_id=user.id,
+                    title=f"Pi POC {case.case_id}",
+                    status="active",
+                    session_summary=f"date_anchor={case.date_anchor}; case_id={case.case_id}",
+                    summary_version=1,
+                    created_at=now,
+                    updated_at=now,
+                )
+                db.add(session)
+                await db.flush()
+                user_id = user.id
+                session_id = session.id
+                message_sequence = 1
+
             run = AgentRun(
                 id=str(uuid4()),
-                session_id=session.id,
-                user_id=user.id,
+                session_id=session_id,
+                user_id=user_id,
                 run_kind="user",
                 visibility="user",
                 profile_name=SESSION_ANALYST_PROFILE,
@@ -148,60 +199,31 @@ class PocCaseFactory:
                     "pi_runtime_poc": {
                         "round_id": self._round_id,
                         "case_id": case.case_id,
-                        "runtime": runtime,
+                        "runtime": "pi",
                         "date_anchor": case.date_anchor,
-                        "billing_mode": "native_isolated_wallet"
-                        if runtime == "current"
-                        else "disabled",
+                        "billing_mode": "disabled",
+                        **({"dependency": dependency} if dependency is not None else {}),
                     }
                 },
                 created_at=now,
             )
             # 三层均为标量 FK、没有 ORM relationship：严格按 Session → Run → Message 刷新，
             # 最后再回填 Run.input_message_id，避免 MySQL 任一层被提前插入。
-            db.add(session)
-            await db.flush()
             db.add(run)
             await db.flush()
-            from app.agent_runtime.models import AgentMessage
-
             message = AgentMessage(
                 id=str(uuid4()),
-                session_id=session.id,
+                session_id=session_id,
                 run_id=run.id,
                 role="user",
                 content=case.user_question,
-                sequence=1,
+                sequence=message_sequence,
                 created_at=now,
             )
             run.input_message_id = message.id
             db.add(message)
             await db.commit()
             return run.id
-
-
-class CurrentRuntimeCaseExecutor:
-    def __init__(
-        self,
-        *,
-        factory: PocCaseFactory,
-        executor: AgentRunExecutor,
-        session_factory: async_sessionmaker[AsyncSession],
-        output_root: Path,
-    ) -> None:
-        self._factory = factory
-        self._executor = executor
-        self._session_factory = session_factory
-        self._output_root = output_root
-
-    async def execute(self, case: PocCase) -> PocCaseResult:
-        run_id = await self._factory.create(case, "current")
-        outcome = await self._executor.process_run(run_id)
-        result = await _collect_case_result(
-            self._session_factory, case, "current", run_id, outcome, self._output_root
-        )
-        write_case_result(self._output_root, result)
-        return result
 
 
 class PiRuntimeCaseExecutor:
@@ -222,8 +244,8 @@ class PiRuntimeCaseExecutor:
         self._output_root = output_root
         self._worker_id = worker_id
 
-    async def execute(self, case: PocCase) -> PocCaseResult:
-        run_id = await self._factory.create(case, "pi")
+    async def execute(self, case: PocCase, *, prior_run_id: str | None = None) -> PocCaseResult:
+        run_id = await self._factory.create(case, prior_run_id=prior_run_id)
         async with self._session_factory() as db:
             runner = PiPocRunner(
                 db=db,
@@ -234,7 +256,7 @@ class PiRuntimeCaseExecutor:
             )
             outcome = await runner.run(run_id)
         result = await _collect_case_result(
-            self._session_factory, case, "pi", run_id, outcome, self._output_root
+            self._session_factory, case, run_id, outcome, self._output_root
         )
         write_case_result(self._output_root, result)
         return result
@@ -265,6 +287,7 @@ def assess_gate_a(cases: tuple[PocCase, ...], results: tuple[PocCaseResult, ...]
 
     behavior_checks: list[bool] = []
     report_checks: list[bool] = []
+    non_marketing_datatap_checks: list[bool] = []
     for case in cases:
         pair = by_case.get(case.case_id, {})
         if set(pair) != {"current", "pi"}:
@@ -279,6 +302,7 @@ def assess_gate_a(cases: tuple[PocCase, ...], results: tuple[PocCaseResult, ...]
                 )
             elif case.expected_behavior == "refuse":
                 behavior_checks.append(result.outcome == "completed" and not result.artifact_versions)
+                non_marketing_datatap_checks.append(result.metrics.get("datatap_tool_calls", 0) == 0)
             else:
                 behavior_checks.append(result.outcome in {"completed", "completed_with_warnings"})
         if case.expected_behavior == _REPORT_BEHAVIOR:
@@ -287,6 +311,8 @@ def assess_gate_a(cases: tuple[PocCase, ...], results: tuple[PocCaseResult, ...]
     for key, value in {
         "three_reports_published": len(report_checks) == 3 and all(report_checks),
         "behavior_correct": bool(behavior_checks) and all(behavior_checks),
+        "non_marketing_has_no_datatap_calls": bool(non_marketing_datatap_checks)
+        and all(non_marketing_datatap_checks),
     }.items():
         hard_checks[key] = value
 
@@ -453,7 +479,6 @@ def build_real_pi_client_factory(settings: Settings) -> Callable[[AgentRun, str]
 async def _collect_case_result(
     session_factory: async_sessionmaker[AsyncSession],
     case: PocCase,
-    runtime: RuntimeName,
     run_id: str,
     outcome: object,
     output_root: Path,
@@ -479,12 +504,21 @@ async def _collect_case_result(
             ).all()
         )
         call_total = await db.scalar(
-            select(func.count()).select_from(AgentToolCall).where(AgentToolCall.run_id == run_id)
+            select(func.count())
+            .select_from(AgentToolCall)
+            .where(
+                AgentToolCall.run_id == run_id,
+                AgentToolCall.service.in_(_DATATAP_AUDIT_SERVICES),
+            )
         )
         call_settled = await db.scalar(
             select(func.count())
             .select_from(AgentToolCall)
-            .where(AgentToolCall.run_id == run_id, AgentToolCall.status == "settled")
+            .where(
+                AgentToolCall.run_id == run_id,
+                AgentToolCall.service.in_(_DATATAP_AUDIT_SERVICES),
+                AgentToolCall.status == "settled",
+            )
         )
         points_settled = await db.scalar(
             select(func.coalesce(func.sum(AgentToolCall.points_settled), 0)).where(
@@ -520,8 +554,10 @@ async def _collect_case_result(
         }
         return PocCaseResult(
             case_id=case.case_id,
-            runtime=runtime,
+            runtime="pi",
             run_id=run_id,
+            status="completed",
+            error_code=None,
             outcome=outcome_text,
             artifact_versions=versions,
             evidence_ids=evidence,
@@ -530,10 +566,11 @@ async def _collect_case_result(
                 "mcp_parameter_validity": (call_settled or 0) / (call_total or 1),
                 "artifact_completeness": int(bool(versions)) if report_case else 1,
                 "human_readability": None,
+                "datatap_tool_calls": int(call_total or 0),
                 "points_settled": int(points_settled or 0),
                 "points_reserved": int(points_reserved or 0),
             },
-            diagnostic_path=str(output_root / case.case_id / f"{runtime}.json"),
+            diagnostic_path=str(output_root / case.case_id / "pi.json"),
             hard_checks=hard_checks,
         )
 
@@ -548,7 +585,7 @@ def _is_openable_excel(version: AgentArtifactVersion) -> bool:
 
 
 __all__ = [
-    "CurrentRuntimeCaseExecutor",
+    "CaseExecutionStatus",
     "PiRuntimeCaseExecutor",
     "PocCase",
     "PocCaseFactory",

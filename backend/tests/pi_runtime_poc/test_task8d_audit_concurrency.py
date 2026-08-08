@@ -78,7 +78,7 @@ async def test_long_lived_runner_reads_current_event_sequence_after_extension_co
         round_id="task8e-stale-event-snapshot",
         model_name=settings.tencent_plan_model,
     )
-    run_id = await factory.create(case, "pi")
+    run_id = await factory.create(case)
 
     try:
         async with SessionFactory() as runner_db:
@@ -154,7 +154,7 @@ async def test_begin_attempt_uses_current_max_after_other_session_commit() -> No
         round_id="task8e-stale-attempt-snapshot",
         model_name=settings.tencent_plan_model,
     )
-    run_id = await factory.create(case, "pi")
+    run_id = await factory.create(case)
 
     try:
         async with SessionFactory() as runner_db:
@@ -217,7 +217,7 @@ async def test_next_step_sequence_uses_current_max_after_other_session_commit() 
         round_id="task8e-stale-engine-step-snapshot",
         model_name=settings.tencent_plan_model,
     )
-    run_id = await factory.create(case, "pi")
+    run_id = await factory.create(case)
 
     try:
         async with SessionFactory() as runner_db:
@@ -282,7 +282,7 @@ async def test_long_lived_runner_reads_current_step_sequence_after_extension_com
         round_id="task8d-stale-step-snapshot",
         model_name=settings.tencent_plan_model,
     )
-    run_id = await factory.create(case, "pi")
+    run_id = await factory.create(case)
     user_id: str | None = None
 
     try:
@@ -379,7 +379,7 @@ async def test_same_run_rpc_audit_and_tool_start_are_serialized_in_mysql() -> No
         round_id="task8d-audit",
         model_name=settings.tencent_plan_model,
     )
-    run_id = await factory.create(case, "pi")
+    run_id = await factory.create(case)
     user_id: str | None = None
     barrier = asyncio.Barrier(2)
 
@@ -492,7 +492,7 @@ async def test_same_run_rpc_audit_and_tool_terminal_are_serialized_in_mysql(
         required_artifact_type=None,
     )
     factory = PocCaseFactory(SessionFactory, round_id="task8d-audit", model_name=settings.tencent_plan_model)
-    run_id = await factory.create(case, "pi")
+    run_id = await factory.create(case)
     user_id: str | None = None
     barrier = asyncio.Barrier(2)
     try:

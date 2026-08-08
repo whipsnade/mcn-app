@@ -39,7 +39,7 @@ async def test_case_factory_commits_session_run_and_message_in_mysql_poc_order()
     run_id: str | None = None
 
     try:
-        run_id = await factory.create(case, "current")
+        run_id = await factory.create(case)
         async with SessionFactory() as db:
             run = await db.get(AgentRun, run_id)
             assert run is not None
@@ -48,7 +48,7 @@ async def test_case_factory_commits_session_run_and_message_in_mysql_poc_order()
             assert message is not None
             assert message.session_id == run.session_id
             assert await db.get(AgentSession, run.session_id) is not None
-            assert await db.get(Wallet, user_id) is not None
+            assert await db.get(Wallet, user_id) is None
             assert (
                 await db.scalar(
                     select(UserChannelPermission.id).where(UserChannelPermission.user_id == user_id)
@@ -66,6 +66,5 @@ async def test_case_factory_commits_session_run_and_message_in_mysql_poc_order()
                     await db.execute(delete(AgentRun).where(AgentRun.id == run_id))
                     await db.execute(delete(AgentSession).where(AgentSession.user_id == user_id))
                 await db.execute(delete(UserChannelPermission).where(UserChannelPermission.user_id == user_id))
-                await db.execute(delete(Wallet).where(Wallet.user_id == user_id))
                 await db.execute(delete(User).where(User.id == user_id))
                 await db.commit()

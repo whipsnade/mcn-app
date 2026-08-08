@@ -1,7 +1,9 @@
-"""Pi POC 对比 Harness 的纯本地 Gate 测试。"""
+"""Pi-only POC Harness 的本地数据契约测试。"""
 
 import json
+from datetime import UTC, datetime
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 import pytest_asyncio
@@ -13,17 +15,24 @@ from sqlalchemy.ext.compiler import compiles
 from sqlalchemy.pool import StaticPool
 
 import app.db.models  # 注册所有 FK 目标供 SQLite POC fixture 建表
-from app.agent_runtime.models import AgentRun
+from app.agent_artifacts.models import (
+    AgentArtifact,
+    AgentArtifactVersion,
+    ArtifactDraft,
+    ArtifactDraftRevision,
+)
+from app.agent_runtime.models import AgentMessage, AgentRun
 from app.billing.models import Wallet
 from app.core.config import Settings
 from app.db.base import Base
 from app.identity.models import UserChannelPermission
 from app.identity.service import IdentityService
 from app.pi_runtime_poc.comparison import (
+    PiRuntimeCaseExecutor,
     PocCase,
     PocCaseFactory,
     PocCaseResult,
-    assess_gate_a,
+    _is_datatap_audit_service,
     begin_round,
     load_cases,
     write_append_only_round,
@@ -53,22 +62,25 @@ async def db_session_factory() -> async_sessionmaker[AsyncSession]:
 
 def _result(
     case_id: str,
-    runtime: str,
     *,
-    outcome: str = "completed",
-    artifacts: tuple[str, ...] = ("version-1",),
+    status: str = "completed",
+    outcome: str | None = "completed",
+    artifacts: tuple[str, ...] = (),
+    error_code: str | None = None,
     hard_checks: dict[str, bool] | None = None,
 ) -> PocCaseResult:
     return PocCaseResult(
         case_id=case_id,
-        runtime=runtime,  # type: ignore[arg-type]
-        run_id=f"{runtime}-{case_id}",
+        runtime="pi",
+        run_id=f"pi-{case_id}" if status != "skipped_dependency" else None,
+        status=status,  # type: ignore[arg-type]
+        error_code=error_code,
         outcome=outcome,
         artifact_versions=artifacts,
-        evidence_ids=("evidence-1",),
-        metrics={"coverage": 1.0, "mcp_parameter_validity": 1.0, "artifact_completeness": 1.0},
-        diagnostic_path=f"outputs/{case_id}/{runtime}.json",
-        hard_checks=hard_checks or {"no_secret": True, "lineage_complete": True},
+        evidence_ids=(),
+        metrics={"datatap_tool_calls": 0, "points_reserved": 0, "points_settled": 0},
+        diagnostic_path=f"outputs/{case_id}/pi.json",
+        hard_checks=hard_checks or {},
     )
 
 
@@ -91,59 +103,51 @@ def test_load_cases_contains_six_versioned_scenarios_without_provider_output_or_
     assert "raw_payload" not in fixture.read_text(encoding="utf-8")
 
 
-def test_gate_a_fails_when_any_hard_check_fails_even_if_metrics_are_better() -> None:
-    cases = (
-        PocCase("brand-research-v1", "q", "2026-08-01", "report", "brand_report_v3"),
-        PocCase("campaign-evaluation-v1", "q", "2026-08-01", "report", "campaign_report_v2"),
-        PocCase("kol-selection-v1", "q", "2026-08-01", "report", "kol_selection_v3"),
-    )
-    results = tuple(
-        _result(case.case_id, runtime, hard_checks={"no_secret": runtime == "current"})
-        for case in cases
-        for runtime in ("current", "pi")
+async def test_case_factory_creates_pi_run_without_wallet(
+    db_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    case = PocCase("brand-research-v1", "q", "2026-08-01", "report", "brand_report_v3")
+    factory = PocCaseFactory(
+        db_session_factory,
+        round_id="pi-only",
+        model_name="deepseek-v4-pro",
     )
 
-    summary = assess_gate_a(cases, results)
+    run_id = await factory.create(case)
 
-    assert summary["gate"] == "FAIL"
-    assert summary["hard_checks"]["no_secret"] is False
-
-
-def test_gate_a_passes_only_with_three_reports_and_two_improved_comparison_metrics() -> None:
-    cases = (
-        PocCase("brand-research-v1", "q", "2026-08-01", "report", "brand_report_v3"),
-        PocCase("campaign-evaluation-v1", "q", "2026-08-01", "report", "campaign_report_v2"),
-        PocCase("kol-selection-v1", "q", "2026-08-01", "report", "kol_selection_v3"),
-        PocCase("scope-clarification-v1", "q", "2026-08-01", "clarify", None),
-        PocCase("non-marketing-v1", "q", "2026-08-01", "refuse", None),
-    )
-    results = []
-    for case in cases:
-        outcome = "clarification_requested" if case.expected_behavior == "clarify" else "completed"
-        artifacts = () if case.expected_behavior in {"clarify", "refuse"} else ("version-1",)
-        current = _result(case.case_id, "current", outcome=outcome, artifacts=artifacts)
-        pi_metrics = dict(current.metrics)
-        pi_metrics["mcp_parameter_validity"] = 1.1
-        pi_metrics["artifact_completeness"] = 1.1
-        pi = PocCaseResult(
-            **{**current.__dict__, "runtime": "pi", "run_id": f"pi-{case.case_id}", "metrics": pi_metrics}
+    async with db_session_factory() as db:
+        run = await db.get(AgentRun, run_id)
+        assert run is not None
+        assert run.prompt_snapshot_json["pi_runtime_poc"]["runtime"] == "pi"
+        assert run.prompt_snapshot_json["pi_runtime_poc"]["billing_mode"] == "disabled"
+        assert await db.get(Wallet, run.user_id) is None
+        channels = set(
+            (
+                await db.scalars(
+                    select(UserChannelPermission.channel).where(
+                        UserChannelPermission.user_id == run.user_id
+                    )
+                )
+            ).all()
         )
-        results.extend((current, pi))
+    assert channels == set(IdentityService.default_channels)
 
-    summary = assess_gate_a(cases, tuple(results))
 
-    assert summary["gate"] == "PASS"
-    assert summary["improved_metric_count"] == 2
-    assert summary["hard_checks"]["coverage_not_lower"] is True
+def test_comparison_module_exports_only_pi_executor() -> None:
+    import app.pi_runtime_poc.comparison as module
+
+    assert PiRuntimeCaseExecutor is module.PiRuntimeCaseExecutor
+    assert "PiRuntimeCaseExecutor" in module.__all__
+    assert "CurrentRuntimeCaseExecutor" not in module.__all__
 
 
 def test_round_output_is_append_only_and_redacts_secret_like_strings(tmp_path: Path) -> None:
-    result = _result("brand-research-v1", "pi")
+    result = _result("brand-research-v1")
 
     summary_path = write_append_only_round(tmp_path, "round-001", (result,))
 
     payload = json.loads(summary_path.read_text(encoding="utf-8"))
-    assert payload["results"][0]["case_id"] == "brand-research-v1"
+    assert payload["results"][0]["runtime"] == "pi"
     with pytest.raises(FileExistsError):
         write_append_only_round(tmp_path, "round-001", (result,))
     leaking = PocCaseResult(**{**result.__dict__, "diagnostic_path": "sk-should-not-write"})
@@ -151,12 +155,12 @@ def test_round_output_is_append_only_and_redacts_secret_like_strings(tmp_path: P
         write_append_only_round(tmp_path, "round-002", (leaking,))
 
 
-def test_started_round_writes_one_case_per_runtime_then_one_summary(tmp_path: Path) -> None:
-    result = _result("brand-research-v1", "pi")
+def test_started_round_writes_one_pi_case_then_one_summary(tmp_path: Path) -> None:
+    result = _result("brand-research-v1")
     round_dir = begin_round(tmp_path, "round-003")
 
     case_path = write_case_result(round_dir, result)
-    summary_path = write_round_summary(round_dir, (result,), {"gate": "FAIL"})
+    summary_path = write_round_summary(round_dir, (result,), {"gate": "BLOCKED"})
 
     assert case_path == round_dir / "brand-research-v1" / "pi.json"
     assert case_path.exists()
@@ -190,91 +194,68 @@ def test_settings_accepts_blank_legacy_endpoint_but_requires_explicit_endpoint_m
     assert str(settings.datatap_mcp_urls["insight-cube-mcp"]) == "https://datatap.example.test/insight/mcp"
 
 
-async def test_case_factory_keeps_current_billing_and_pi_wallet_free(
+def test_datatap_call_count_ignores_internal_and_non_datatap_services() -> None:
+    assert _is_datatap_audit_service("insight-cube-mcp")
+    assert _is_datatap_audit_service("pi_poc_datatap")
+    assert not _is_datatap_audit_service("pi_internal_tool")
+    assert not _is_datatap_audit_service("artifact_publication")
+
+
+async def test_case_factory_reuses_dependency_run_session_and_exact_published_version(
     db_session_factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    case = PocCase(
-        case_id="brand-research-v1",
-        user_question="分析最近一个月的品牌声量和情感",
-        date_anchor="2026-08-07",
-        expected_behavior="report",
-        required_artifact_type="brand_report_v3",
+    report = PocCase("brand-research-v1", "完整品牌条件", "2026-08-01", "report", "brand_report_v3")
+    drilldown = PocCase(
+        "artifact-drilldown-v1",
+        "解释已发布版本的一项结论。",
+        "2026-08-01",
+        "drilldown",
+        None,
+        depends_on_case_id="brand-research-v1",
     )
-    factory = PocCaseFactory(
-        db_session_factory,
-        round_id="round-restart",
-        model_name="deepseek-v4-pro",
-        current_wallet_balance=10_000,
-    )
-    current_run_id = await factory.create(case, "current")
-    pi_run_id = await factory.create(case, "pi")
+    factory = PocCaseFactory(db_session_factory, round_id="round-dependency", model_name="deepseek-v4-pro")
+    parent_run_id = await factory.create(report)
+    now = datetime.now(UTC).replace(tzinfo=None)
 
     async with db_session_factory() as db:
-        current = await db.get(AgentRun, current_run_id)
-        pi = await db.get(AgentRun, pi_run_id)
-        assert current is not None
-        assert pi is not None
-        current_wallet = await db.get(Wallet, current.user_id)
-        pi_wallet = await db.get(Wallet, pi.user_id)
-        current_channels = set(
-            (
-                await db.scalars(
-                    select(UserChannelPermission.channel).where(
-                        UserChannelPermission.user_id == current.user_id
-                    )
-                )
-            ).all()
+        parent = await db.get(AgentRun, parent_run_id)
+        assert parent is not None
+        artifact = AgentArtifact(
+            id=str(uuid4()), session_id=parent.session_id, user_id=parent.user_id,
+            module="brand", artifact_type="brand_report_v3", artifact_key="task8d-brand",
+            status="published", latest_version=1, activity_sequence=1, created_at=now, updated_at=now,
         )
-        pi_channels = set(
-            (
-                await db.scalars(
-                    select(UserChannelPermission.channel).where(
-                        UserChannelPermission.user_id == pi.user_id
-                    )
-                )
-            ).all()
+        draft = ArtifactDraft(
+            id=str(uuid4()), artifact_id=artifact.id, session_id=parent.session_id,
+            owner_run_id=parent_run_id, current_revision=1, status="idle", review_count=0,
+            revision_count=0, updated_at=now,
         )
-
-    assert current_wallet is not None
-    assert current_wallet.balance == 10_000
-    assert current_wallet.reserved == 0
-    assert current_wallet.version == 0
-    assert pi_wallet is None
-    assert current_channels == pi_channels == set(IdentityService.default_channels)
-    assert current.profile_version == pi.profile_version == "v1"
-    assert current.model == pi.model == "deepseek-v4-pro"
-    assert current.prompt_snapshot_json["pi_runtime_poc"]["billing_mode"] == "native_isolated_wallet"
-    assert pi.prompt_snapshot_json["pi_runtime_poc"]["billing_mode"] == "disabled"
-
-
-def test_gate_ignores_wallet_diagnostics_when_effect_metrics_are_equal() -> None:
-    cases = (
-        PocCase("brand-research-v1", "q", "2026-08-01", "report", "brand_report_v3"),
-        PocCase("campaign-evaluation-v1", "q", "2026-08-01", "report", "campaign_report_v2"),
-        PocCase("kol-selection-v1", "q", "2026-08-01", "report", "kol_selection_v3"),
-    )
-    results = []
-    for case in cases:
-        current = _result(case.case_id, "current")
-        pi = _result(case.case_id, "pi")
-        results.extend(
-            (
-                PocCaseResult(
-                    **{
-                        **current.__dict__,
-                        "metrics": {**current.metrics, "points_settled": 30, "points_reserved": 0},
-                    }
-                ),
-                PocCaseResult(
-                    **{
-                        **pi.__dict__,
-                        "metrics": {**pi.metrics, "points_settled": 0, "points_reserved": 0},
-                    }
-                ),
-            )
+        revision = ArtifactDraftRevision(
+            id=str(uuid4()), draft_id=draft.id, artifact_id=artifact.id, run_id=parent_run_id,
+            revision=1, schema_version="brand_report_v3", payload_json={}, evidence_refs_json=[],
+            payload_hash="0" * 64, created_at=now,
         )
+        version = AgentArtifactVersion(
+            id=str(uuid4()), artifact_id=artifact.id, version=1, source_run_id=parent_run_id,
+            source_draft_revision_id=revision.id, schema_version="brand_report_v3", payload_json={},
+            evidence_refs_json=[], lineage_snapshot_json={}, validation_json={"valid": True},
+            data_status="complete", created_at=now,
+        )
+        db.add_all([artifact, draft, revision, version])
+        await db.commit()
 
-    summary = assess_gate_a(cases, tuple(results))
+    drilldown_run_id = await factory.create(drilldown, prior_run_id=parent_run_id)
 
-    assert summary["improved_metric_count"] == 0
-    assert "points_settled" not in summary["hard_checks"]
+    async with db_session_factory() as db:
+        parent = await db.get(AgentRun, parent_run_id)
+        drilldown_run = await db.get(AgentRun, drilldown_run_id)
+        assert parent is not None and drilldown_run is not None
+        message = await db.get(AgentMessage, drilldown_run.input_message_id)
+
+    assert message is not None
+    assert drilldown_run.user_id == parent.user_id
+    assert drilldown_run.session_id == parent.session_id
+    assert drilldown_run.prompt_snapshot_json["pi_runtime_poc"]["dependency"] == {
+        "case_id": "brand-research-v1",
+        "artifact_version_ids": [version.id],
+    }
