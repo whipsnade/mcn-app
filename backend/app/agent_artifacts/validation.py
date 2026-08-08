@@ -25,6 +25,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from app.agent_artifacts.canonical import CanonicalPayloadMixin
+from app.agent_artifacts.lineage import ValidationIssue, validate_structured_claims
 from app.agent_artifacts.payloads import TYPED_PAYLOAD_BY_SCHEMA
 
 
@@ -187,4 +188,6 @@ __all__ = [
     "SCHEMA_VERSION_BY_MODULE",
     "ArtifactPayloadInvalid",
     "ArtifactPayloadValidator",
+    "ValidationIssue",
+    "validate_structured_claims",
 ]

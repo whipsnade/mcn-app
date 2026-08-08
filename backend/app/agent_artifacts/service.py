@@ -44,7 +44,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_artifacts.keys import build_artifact_key
-from app.agent_artifacts.lineage import ArtifactLineageFreezer, LineageOwner
+from app.agent_artifacts.lineage import (
+    ArtifactLineageFreezer,
+    LineageOwner,
+    evidence_scope_from_snapshot,
+    validate_structured_claims,
+)
 from app.agent_artifacts.models import (
     AgentArtifact,
     AgentArtifactReadState,
@@ -56,8 +61,8 @@ from app.agent_artifacts.models import (
     ArtifactReviewBatch,
     ArtifactReviewItem,
 )
-from app.agent_artifacts.validation import (
-    ArtifactPayloadInvalid as ArtifactPayloadInvalid,
+from app.agent_artifacts.validation import (  # noqa: F401
+    ArtifactPayloadInvalid,
     ArtifactPayloadValidator,
 )
 from app.agent_runtime.models import AgentMessage, AgentRun
@@ -82,6 +87,10 @@ class PublishBlocked(Exception):
     任一 Item 未在当前 Revision 上 approve、或 Batch 已终态/无 Item 时抛出；
     调用方不得忽略——整批回滚、不产生任何部分 Version。
     """
+
+    def __init__(self, message: str, *, issues: list[dict[str, Any]] | None = None) -> None:
+        self.issues = issues or []
+        super().__init__(message)
 
 
 class ArtifactBusy(Exception):
@@ -425,6 +434,7 @@ class ArtifactService:
         source_run_id: str,
         review_json: dict[str, Any] | None,
         validation_json: dict[str, Any] | None = None,
+        artifact_version_id: str | None = None,
     ) -> AgentArtifactVersion:
         """单 Draft 发布收尾：插入不可变 Version → 释放 working head → published 事件
         → 更新稳定身份（``latest_version``/``status``/activity 水位）。
@@ -437,7 +447,7 @@ class ArtifactService:
         """
         now = _utcnow()
         version = AgentArtifactVersion(
-            id=str(uuid4()),
+            id=artifact_version_id or str(uuid4()),
             artifact_id=artifact.id,
             version=artifact.latest_version + 1,
             source_run_id=source_run_id,
@@ -525,6 +535,8 @@ class ArtifactService:
                 AgentArtifact,
                 dict[str, Any],
                 dict[str, Any],
+                str,
+                dict[str, Any],
             ]
         ] = []
         freezer = ArtifactLineageFreezer(self.db)
@@ -577,14 +589,65 @@ class ArtifactService:
                     run_id=batch.parent_run_id,
                 ),
             )
+            candidate_version_id = str(uuid4())
+            structured_issues = [
+                issue.as_dict()
+                for issue in validate_structured_claims(
+                    validated_payload,
+                    candidate_version_id,
+                    evidence_scope_from_snapshot(
+                        lineage_snapshot,
+                        owner=LineageOwner(
+                            user_id=artifact.user_id,
+                            session_id=artifact.session_id,
+                            run_id=batch.parent_run_id,
+                        ),
+                    ),
+                )
+            ]
+            if structured_issues:
+                raise PublishBlocked(
+                    f"artifact {artifact.id!r} structured claims validation failed",
+                    issues=structured_issues,
+                )
+            validation_snapshot = {
+                "module": artifact.module,
+                "schema_version": current_rev.schema_version,
+                "artifact_type": artifact.artifact_type,
+                "valid": True,
+                "errors": [],
+                "stages": {
+                    "payload": {"valid": True, "errors": []},
+                    "lineage": {"valid": True, "errors": []},
+                    "structured_claims": {"valid": True, "errors": []},
+                },
+            }
             plans.append(
-                (item, draft, current_rev, artifact, validated_payload, lineage_snapshot)
+                (
+                    item,
+                    draft,
+                    current_rev,
+                    artifact,
+                    validated_payload,
+                    lineage_snapshot,
+                    candidate_version_id,
+                    validation_snapshot,
+                )
             )
 
         # 2) 逐项落地不可变 Version 并收尾（单 Draft helper 与直接发布服务共用）：
         # 插入 Version → 释放 working head → 追加 published 事件 → 更新稳定身份。
         versions: list[AgentArtifactVersion] = []
-        for item, draft, current_rev, artifact, validated_payload, lineage_snapshot in plans:
+        for (
+            item,
+            draft,
+            current_rev,
+            artifact,
+            validated_payload,
+            lineage_snapshot,
+            candidate_version_id,
+            validation_snapshot,
+        ) in plans:
             version = await self.finalize_published_version(
                 artifact=artifact,
                 draft=draft,
@@ -593,6 +656,8 @@ class ArtifactService:
                 lineage_snapshot=lineage_snapshot,
                 source_run_id=batch.parent_run_id,
                 review_json=await self._review_json_for_item(item.id),
+                validation_json=validation_snapshot,
+                artifact_version_id=candidate_version_id,
             )
             versions.append(version)
         await self.db.flush()

@@ -21,13 +21,15 @@ loader 通过 ``LineageLoader`` 协议注入：测试可用内存 loader，生�
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agent_artifacts.canonical import walk_data_leaves
 from app.agent_artifacts.models import AgentArtifact, AgentArtifactVersion
 from app.agent_artifacts.schemas import (
     LINEAGE_REFS_ADAPTER,
@@ -40,7 +42,6 @@ from app.agent_artifacts.schemas import (
     FrozenLineageRef,
     LineageRef,
 )
-
 from app.agent_runtime.models import AgentRun, AgentToolCall, AgentUpload, EvidenceItem
 
 # Artifact 递归展开的最大深度：超过即报 ``lineage_too_deep``，防止深链/组合爆炸
@@ -55,6 +56,348 @@ class LineageError(Exception):
         super().__init__(message)
         self.code = code
         self.message = message
+
+
+@dataclass(frozen=True)
+class ValidationIssue:
+    """结构化发布门禁问题；不携带原始 Evidence/正文，便于安全回喂。"""
+
+    code: str
+    message: str
+    path: str | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        result: dict[str, Any] = {"code": self.code, "msg": self.message}
+        if self.path is not None:
+            result["path"] = self.path
+        return result
+
+
+@dataclass(frozen=True)
+class EvidenceScope:
+    """结构化 claims validator 使用的最小值对象。
+
+    ``evidence`` 的值可以是 ``EvidenceScopeEntry`` 或等价 mapping；发布服务
+    传入冻结 lineage 中的 Evidence ID，纯函数测试可传完整 user/session/run
+    归属信息。上传 Evidence 的 ``run_id=None`` 是 Run 创建前上传的合法例外。
+    """
+
+    user_id: str | None = None
+    session_id: str | None = None
+    run_id: str | None = None
+    evidence: Mapping[str, Any] = field(default_factory=dict)
+    allowed_artifact_version_ids: frozenset[str] = frozenset()
+    field_versions: Mapping[str, str] = field(default_factory=dict)
+    field_evidence_ids: Mapping[str, frozenset[str]] = field(default_factory=dict)
+
+
+def _scope_attr(scope: EvidenceScope | Mapping[str, Any] | Any, name: str, default: Any = None) -> Any:
+    if isinstance(scope, Mapping):
+        return scope.get(name, default)
+    return getattr(scope, name, default)
+
+
+def _normalise_scope(scope: EvidenceScope | Mapping[str, Any] | Any) -> EvidenceScope:
+    evidence = _scope_attr(scope, "evidence", None)
+    if evidence is None:
+        evidence = _scope_attr(scope, "evidence_by_id", None)
+    if evidence is None:
+        evidence_ids = _scope_attr(scope, "evidence_ids", None)
+        if evidence_ids is None:
+            evidence_ids = _scope_attr(scope, "allowed_evidence_ids", ()) or ()
+        evidence = {str(evidence_id): None for evidence_id in evidence_ids}
+    if isinstance(evidence, (list, tuple, set, frozenset)):
+        evidence = {str(evidence_id): None for evidence_id in evidence}
+    allowed_versions = _scope_attr(scope, "allowed_artifact_version_ids", ()) or ()
+    field_versions = _scope_attr(scope, "field_versions", None)
+    if field_versions is None:
+        field_versions = _scope_attr(scope, "canonical_versions", {}) or {}
+    field_evidence = _scope_attr(scope, "field_evidence_ids", None)
+    if field_evidence is None:
+        field_evidence = _scope_attr(scope, "lineage_by_path", {}) or {}
+    return EvidenceScope(
+        user_id=_scope_attr(scope, "user_id"),
+        session_id=_scope_attr(scope, "session_id"),
+        run_id=_scope_attr(scope, "run_id"),
+        evidence=evidence if isinstance(evidence, Mapping) else {},
+        allowed_artifact_version_ids=frozenset(str(item) for item in allowed_versions),
+        field_versions=(field_versions if isinstance(field_versions, Mapping) else {}),
+        field_evidence_ids={
+            str(path): frozenset(str(item) for item in ids)
+            for path, ids in (field_evidence.items() if isinstance(field_evidence, Mapping) else ())
+        },
+    )
+
+
+def _scope_entry(entry: Any, name: str, default: Any = None) -> Any:
+    if entry is None:
+        return default
+    if isinstance(entry, Mapping):
+        return entry.get(name, default)
+    return getattr(entry, name, default)
+
+
+def _json_pointer_from_dotted(path: Any) -> str | None:
+    if not isinstance(path, str) or not path:
+        return None
+    if path.startswith("/"):
+        return path
+    parts = path.split(".")
+    if parts[0] == "data":
+        parts = parts[1:]
+    if not parts or any(part == "" for part in parts):
+        return None
+    return "/data/" + "/".join(part.replace("~", "~0").replace("/", "~1") for part in parts)
+
+
+def _is_leaf(value: Any) -> bool:
+    return not isinstance(value, (dict, list, tuple))
+
+
+def _path_section(pointer: str) -> str | None:
+    parts = pointer.removeprefix("/data/").split("/")
+    return parts[0] if parts and parts[0] else None
+
+
+def _normalise_limitation_path(path: Any) -> str | None:
+    return _json_pointer_from_dotted(path)
+
+
+def _limitation_covers(limitations: list[Any], pointer: str) -> bool:
+    section = _path_section(pointer)
+    for limitation in limitations:
+        affected = _scope_entry(limitation, "affected_paths", ()) or ()
+        if not affected:
+            return True
+        for raw_path in affected:
+            candidate = _normalise_limitation_path(raw_path)
+            if candidate == pointer or (section and candidate == f"/data/{section}"):
+                return True
+    return False
+
+
+def _narrative_paths(narrative: Any) -> list[tuple[str | None, Any]]:
+    found: list[tuple[str | None, Any]] = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, Mapping):
+            if "supporting_paths" in node:
+                paths = node.get("supporting_paths")
+                if not isinstance(paths, (list, tuple)) or not paths:
+                    found.append(("supporting_path_missing", paths))
+                else:
+                    for path in paths:
+                        found.append((None, path))
+            elif (
+                ("title" in node and "detail" in node)
+                or ("phase" in node and "detail" in node)
+                or ("title" in node and "action" in node)
+            ):
+                found.append(("supporting_path_missing", None))
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, (list, tuple)):
+            for value in node:
+                walk(value)
+
+    walk(narrative)
+    return found
+
+
+def validate_structured_claims(
+    payload: Mapping[str, Any],
+    artifact_version_id: str,
+    evidence_scope: EvidenceScope | Mapping[str, Any] | Any,
+) -> list[ValidationIssue]:
+    """验证 canonical/lineage/narrative 的结构化发布门禁。
+
+    该函数只读取结构化字段，不解析 Markdown。非 canonical 历史模块保持兼容，
+    直接返回空问题列表；Brand/Campaign 新产物由强类型 validator 先保证完整
+    canonical 合同，本函数再做候选 Version、叙事路径与 Evidence scope 的闭环。
+    """
+    if hasattr(payload, "model_dump"):
+        payload = payload.model_dump(mode="json")
+    canonical = payload.get("canonical_data")
+    field_lineage = payload.get("field_lineage")
+    if not canonical and not field_lineage:
+        return []
+
+    issues: list[ValidationIssue] = []
+    if not isinstance(canonical, (list, tuple)) or not isinstance(field_lineage, Mapping):
+        return [ValidationIssue("canonical_contract_missing", "canonical_data and field_lineage are required")]
+
+    data = payload.get("data")
+    scope = _normalise_scope(evidence_scope)
+    if (
+        scope.allowed_artifact_version_ids
+        and artifact_version_id not in scope.allowed_artifact_version_ids
+    ):
+        issues.append(
+            ValidationIssue(
+                "canonical_version_mismatch",
+                "candidate Version is outside the publication scope",
+            )
+        )
+    canonical_by_path: dict[str, Mapping[str, Any]] = {}
+    for field_entry in canonical:
+        if not isinstance(field_entry, Mapping):
+            issues.append(ValidationIssue("canonical_field_invalid", "canonical field must be an object"))
+            continue
+        path = field_entry.get("path")
+        if not isinstance(path, str) or path in canonical_by_path:
+            issues.append(ValidationIssue("canonical_path_invalid", "canonical path must be unique"))
+            continue
+        if not path.startswith("/data/"):
+            issues.append(ValidationIssue("canonical_path_invalid", "canonical path must start with /data/", path))
+            continue
+        canonical_by_path[path] = field_entry
+        version = field_entry.get("artifact_version_id") or scope.field_versions.get(path)
+        if version is not None and version != artifact_version_id:
+            issues.append(
+                ValidationIssue("canonical_version_mismatch", "canonical field is not from candidate Version", path)
+            )
+
+    canonical_paths = set(canonical_by_path)
+    if set(field_lineage) != canonical_paths:
+        issues.append(ValidationIssue("field_lineage_mismatch", "field_lineage keys must match canonical paths"))
+    for path in canonical_paths & set(field_lineage):
+        targets = field_lineage.get(path)
+        if targets != [path] and targets != (path,):
+            issues.append(ValidationIssue("field_lineage_mismatch", "field_lineage must point to the same canonical path", path))
+
+    data_leaves = dict(walk_data_leaves(data)) if isinstance(data, (dict, list, tuple)) else {}
+    missing_canonical = set(data_leaves) - set(canonical_by_path)
+    extra_canonical = set(canonical_by_path) - set(data_leaves)
+    if missing_canonical or extra_canonical:
+        issues.append(
+            ValidationIssue(
+                "canonical_data_mismatch",
+                "canonical paths must exactly cover payload data leaves",
+            )
+        )
+    for path, field_entry in canonical_by_path.items():
+        try:
+            value = resolve_pointer(payload, path)
+        except (PointerError, TypeError):
+            issues.append(ValidationIssue("canonical_path_not_found", "canonical path does not resolve in data", path))
+            continue
+        if not _is_leaf(value):
+            issues.append(ValidationIssue("canonical_path_not_leaf", "canonical path must resolve to a data leaf", path))
+        if path in data_leaves and field_entry.get("value") != data_leaves[path]:
+            issues.append(ValidationIssue("canonical_value_mismatch", "canonical value differs from payload data", path))
+
+        status = field_entry.get("availability")
+        if status not in {"complete", "partial", "unavailable"}:
+            issues.append(ValidationIssue("canonical_availability_invalid", "invalid canonical availability", path))
+        if status == "unavailable" and field_entry.get("value") is not None:
+            issues.append(ValidationIssue("canonical_unavailable_value", "unavailable canonical field must be null", path))
+        if status == "partial" and not _limitation_covers(list(payload.get("limitations") or ()), path):
+            issues.append(ValidationIssue("partial_without_limitation", "partial canonical field lacks a covering limitation", path))
+
+        section = _path_section(path)
+        availability = payload.get("availability") or {}
+        section_entry = availability.get(section) if isinstance(availability, Mapping) and section else None
+        section_status = _scope_entry(section_entry, "status")
+        if status == "partial" and section_status == "complete":
+            issues.append(ValidationIssue("availability_mismatch", "canonical availability conflicts with complete section", path))
+
+        value = field_entry.get("value")
+        evidence_ids = field_entry.get("evidence_ids") or []
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and status != "unavailable":
+            if not evidence_ids:
+                issues.append(ValidationIssue("numeric_lineage_missing", "numeric canonical field has no Evidence lineage", path))
+            else:
+                expected_evidence = scope.field_evidence_ids.get(path)
+                if expected_evidence is not None and set(evidence_ids) != expected_evidence:
+                    issues.append(
+                        ValidationIssue(
+                            "evidence_lineage_mismatch",
+                            "canonical Evidence IDs do not match frozen field lineage",
+                            path,
+                        )
+                    )
+                for evidence_id in evidence_ids:
+                    entry = scope.evidence.get(evidence_id)
+                    if evidence_id not in scope.evidence:
+                        issues.append(ValidationIssue("evidence_not_in_scope", "Evidence is not in the publication scope", path))
+                        continue
+                    if entry is None:
+                        continue
+                    entry_user = _scope_entry(entry, "user_id")
+                    entry_session = _scope_entry(entry, "session_id")
+                    entry_run = _scope_entry(entry, "run_id")
+                    source_type = _scope_entry(entry, "source_type")
+                    if scope.user_id is not None and entry_user is not None and entry_user != scope.user_id:
+                        issues.append(ValidationIssue("evidence_user_mismatch", "Evidence user is outside scope", path))
+                    if scope.session_id is not None and entry_session is not None and entry_session != scope.session_id:
+                        issues.append(ValidationIssue("evidence_session_mismatch", "Evidence session is outside scope", path))
+                    is_upload = source_type in {"upload", "user_upload"} or _scope_entry(entry, "upload_id") is not None
+                    if scope.run_id is not None and entry_run != scope.run_id and not is_upload:
+                        issues.append(ValidationIssue("evidence_run_mismatch", "MCP Evidence is outside the allowed Run", path))
+                    if scope.run_id is not None and entry_run not in {None, scope.run_id} and is_upload:
+                        issues.append(ValidationIssue("evidence_run_mismatch", "uploaded Evidence is outside the allowed Run", path))
+
+    for marker, raw_path in _narrative_paths(payload.get("narrative")):
+        if marker is not None:
+            issues.append(ValidationIssue(marker, "narrative claim must include supporting_paths"))
+            continue
+        pointer = _json_pointer_from_dotted(raw_path)
+        if pointer is None:
+            issues.append(ValidationIssue("supporting_path_invalid", "supporting path must be a dotted path or JSON Pointer"))
+            continue
+        try:
+            value = resolve_pointer(payload, pointer)
+        except (PointerError, TypeError):
+            issues.append(ValidationIssue("supporting_path_not_found", "supporting path does not resolve in data", pointer))
+            continue
+        if not _is_leaf(value):
+            issues.append(ValidationIssue("supporting_path_not_leaf", "supporting path must resolve to a data leaf", pointer))
+            continue
+        field_entry = canonical_by_path.get(pointer)
+        if field_entry is None:
+            issues.append(ValidationIssue("canonical_field_missing", "supporting path has no canonical field", pointer))
+            continue
+        if field_entry.get("value") != value:
+            issues.append(ValidationIssue("canonical_value_mismatch", "supporting path value differs from canonical value", pointer))
+        if field_entry.get("availability") == "unavailable":
+            issues.append(ValidationIssue("supporting_path_unavailable", "narrative cannot cite unavailable canonical field", pointer))
+        targets = field_lineage.get(pointer)
+        if targets != [pointer] and targets != (pointer,):
+            issues.append(ValidationIssue("field_lineage_mismatch", "supporting path is not self-lineaged", pointer))
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and not field_entry.get("evidence_ids"):
+            issues.append(ValidationIssue("numeric_lineage_missing", "narrative numeric claim has no Evidence lineage", pointer))
+
+    return issues
+
+
+def evidence_scope_from_snapshot(
+    snapshot: Mapping[str, Any] | None, *, owner: LineageOwner
+) -> EvidenceScope:
+    """从已通过 ``ArtifactLineageFreezer`` 的闭包生成 claims scope。
+
+    Freezer 已完成 user/session/run 归属和工具状态校验；这里仅把闭包中的
+    Evidence ID 作为结构化 validator 的允许集合，避免再次暴露 DB/路径对象。
+    """
+    evidence_ids: set[str] = set()
+    field_evidence_ids: dict[str, set[str]] = {}
+    for ref in (snapshot or {}).get("refs", ()):
+        path = ref.get("artifact_path")
+        path_bucket = field_evidence_ids.setdefault(path, set()) if isinstance(path, str) else None
+        for source in ref.get("sources", ()):
+            evidence_id = source.get("evidence_id")
+            if isinstance(evidence_id, str):
+                evidence_ids.add(evidence_id)
+                if path_bucket is not None:
+                    path_bucket.add(evidence_id)
+    return EvidenceScope(
+        user_id=owner.user_id,
+        session_id=owner.session_id,
+        run_id=owner.run_id,
+        evidence={evidence_id: None for evidence_id in evidence_ids},
+        field_evidence_ids={
+            path: frozenset(ids) for path, ids in field_evidence_ids.items()
+        },
+    )
 
 
 @dataclass(frozen=True)
@@ -73,6 +416,7 @@ class EvidenceRecord:
     session_id: str
     raw_payload: Any
     payload_hash: str
+    run_id: str | None = None
     # MCP Evidence 的 tool_call_id（upload Evidence 为 None）。
     tool_call_id: str | None = None
     # MCP 调用来源快照（Gate B：可独立审计精确调用）。
@@ -97,6 +441,7 @@ class ToolCallRecord:
     session_id: str
     service: str
     status: str
+    run_id: str | None = None
 
 
 class LineageLoader(Protocol):
@@ -274,6 +619,35 @@ async def _resolve_source(
                 "evidence_not_owned",
                 f"evidence {source.evidence_id!r} does not belong to current session",
             )
+        if record.upload is not None:
+            upload_user_id = record.upload.get("_user_id")
+            upload_session_id = record.upload.get("_session_id")
+            upload_run_id = record.upload.get("_run_id")
+            if upload_user_id is not None and upload_user_id != owner.user_id:
+                raise LineageError(
+                    "evidence_upload_not_owned",
+                    f"evidence {source.evidence_id!r} upload is not owned by current user",
+                )
+            if upload_session_id is not None and upload_session_id != owner.session_id:
+                raise LineageError(
+                    "evidence_upload_not_owned",
+                    f"evidence {source.evidence_id!r} upload is not in current session",
+                )
+            if owner.run_id is not None and upload_run_id not in {None, owner.run_id}:
+                raise LineageError(
+                    "evidence_run_not_owned",
+                    f"evidence {source.evidence_id!r} upload is not in current run",
+                )
+        # MCP Evidence 必须来自当前 Run；Run 创建前上传的 Evidence 保留
+        # session/user 范围内的合法例外（upload 元数据非空）。
+        if owner.run_id is not None and (
+            (record.upload is None and record.run_id != owner.run_id)
+            or (record.upload is not None and record.run_id not in {None, owner.run_id})
+        ):
+            raise LineageError(
+                "evidence_run_not_owned",
+                f"evidence {source.evidence_id!r} does not belong to current run",
+            )
         _require_pointer(record.raw_payload, source.source_path, "evidence_source_path_not_found")
         return [
             _ResolvedEvidence(
@@ -367,6 +741,11 @@ async def _validate_derivation(
         raise LineageError(
             "derivation_tool_call_invalid",
             f"derivation tool_call {derivation.tool_call_id!r} is not in current session",
+        )
+    if owner.run_id is not None and tool.run_id != owner.run_id:
+        raise LineageError(
+            "derivation_run_not_owned",
+            f"derivation tool_call {derivation.tool_call_id!r} is not in current run",
         )
     if tool.status != "settled":
         raise LineageError(
@@ -497,6 +876,10 @@ class DbLineageLoader:
                 "upload_id": upload.id,
                 "sha256": upload.sha256,
                 "original_filename": upload.original_filename,
+                # 仅供发布前归属校验；冻结的公开 lineage 只保留上面的文件审计字段。
+                "_user_id": upload.user_id,
+                "_session_id": upload.session_id,
+                "_run_id": upload.run_id,
                 "uploaded_at": (
                     upload.completed_at.isoformat() if upload.completed_at else None
                 ),
@@ -506,6 +889,7 @@ class DbLineageLoader:
             session_id=evidence.session_id,
             raw_payload=evidence.raw_payload_json,
             payload_hash=evidence.payload_hash,
+            run_id=evidence.run_id,
             tool_call_id=evidence.tool_call_id,
             tool_name=tool_call.internal_tool_name if tool_call else None,
             service=tool_call.service if tool_call else None,
@@ -547,6 +931,7 @@ class DbLineageLoader:
             session_id=session_id,
             service=tool.service,
             status=tool.status,
+            run_id=tool.run_id,
         )
 
 
@@ -578,16 +963,20 @@ class ArtifactLineageFreezer:
 
 
 __all__ = [
+    "MAX_ARTIFACT_DEPTH",
     "ArtifactLineageFreezer",
     "ArtifactVersionRecord",
     "DbLineageLoader",
     "EvidenceRecord",
+    "EvidenceScope",
     "LineageError",
     "LineageLoader",
     "LineageOwner",
-    "MAX_ARTIFACT_DEPTH",
     "ToolCallRecord",
+    "ValidationIssue",
+    "evidence_scope_from_snapshot",
     "required_numeric_pointers",
     "resolve_pointer",
     "validate_and_freeze_lineage",
+    "validate_structured_claims",
 ]

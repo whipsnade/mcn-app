@@ -33,7 +33,13 @@ from uuid import uuid4
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agent_artifacts.lineage import ArtifactLineageFreezer, LineageError, LineageOwner
+from app.agent_artifacts.lineage import (
+    ArtifactLineageFreezer,
+    LineageError,
+    LineageOwner,
+    evidence_scope_from_snapshot,
+    validate_structured_claims,
+)
 from app.agent_artifacts.models import (
     AgentArtifact,
     AgentArtifactVersion,
@@ -326,29 +332,63 @@ class ArtifactPublicationService:
             except LineageError as exc:
                 lineage_errors = [{"stage": "lineage", "code": exc.code, "msg": exc.message}]
 
+        candidate_version_id = str(uuid4())
+        structured_errors: list[dict[str, Any]] = []
+        structured_enabled = bool(
+            validated_payload
+            and (
+                validated_payload.get("canonical_data")
+                or validated_payload.get("field_lineage")
+            )
+        )
+        if structured_enabled and not payload_errors and not lineage_errors:
+            structured_errors = [
+                {"stage": "structured_claims", **issue.as_dict()}
+                for issue in validate_structured_claims(
+                    validated_payload,
+                    candidate_version_id,
+                    evidence_scope_from_snapshot(
+                        lineage_snapshot,
+                        owner=LineageOwner(
+                            user_id=artifact.user_id,
+                            session_id=artifact.session_id,
+                            run_id=run_id,
+                        ),
+                    ),
+                )
+            ]
         flat_errors: list[dict[str, Any]] = [
             {"stage": "payload", **error} for error in payload_errors
-        ] + lineage_errors
+        ] + lineage_errors + structured_errors
         # JSON 归一（loc tuple → list 等）：快照、回喂与幂等重放共享同一形态。
         flat_errors = json.loads(json.dumps(flat_errors, ensure_ascii=False, default=str))
         payload_errors = [e for e in flat_errors if e.get("stage") == "payload"]
         lineage_errors = [e for e in flat_errors if e.get("stage") == "lineage"]
+        structured_errors = [e for e in flat_errors if e.get("stage") == "structured_claims"]
+        stages: dict[str, Any] = {
+            "payload": {"valid": not payload_errors, "errors": payload_errors},
+            "lineage": {"valid": not lineage_errors, "errors": lineage_errors},
+        }
+        if structured_enabled:
+            stages["structured_claims"] = {
+                "valid": not structured_errors,
+                "errors": structured_errors,
+            }
         snapshot = {
             "module": artifact.module,
             "schema_version": revision.schema_version,
             "artifact_type": artifact.artifact_type,
             "valid": not flat_errors,
             "errors": flat_errors,
-            "stages": {
-                "payload": {"valid": not payload_errors, "errors": payload_errors},
-                "lineage": {"valid": not lineage_errors, "errors": lineage_errors},
-            },
+            "stages": stages,
         }
 
         if flat_errors:
-            error_code = (
-                lineage_errors[0]["code"] if lineage_errors else "artifact_payload_invalid"
-            )
+            error_code = "artifact_payload_invalid"
+            if lineage_errors:
+                error_code = lineage_errors[0]["code"]
+            elif structured_errors:
+                error_code = structured_errors[0]["code"]
             attempt.status = "validation_failed"
             attempt.error_code = error_code
             attempt.validation_json = snapshot
@@ -372,6 +412,7 @@ class ArtifactPublicationService:
             source_run_id=run_id,
             review_json=None,
             validation_json=snapshot,
+            artifact_version_id=candidate_version_id,
         )
         attempt.status = "published"
         attempt.error_code = None
