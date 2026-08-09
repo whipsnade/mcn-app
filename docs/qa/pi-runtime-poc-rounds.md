@@ -218,13 +218,12 @@ FAIL。本次没有启动案例，因而不消耗唯一真实 round 授权；完
 按“不因失败重试”的约束，本会话已停止；修正启动器并通过本地测试后，须重新取得一次单工具真实
 DataTap 冒烟授权，才可继续。Task 9 与方案 B/C 均未进入。
 
-## B0 Task 7 离线 Marketing Capability Pack 回放（2026-08-08）— PASS（本地 synthetic only）
+## B0 Task 7 离线 Marketing Capability Pack 回放（2026-08-08）— 历史版本（R2 已重放）
 
 ### 范围与保全
 
-- 回放只读取 `backend/fixtures/pi_runtime_poc/marketing_b0/` 中的脱敏 cases、synthetic
-  Evidence 和对象化 fake Pi events；`app/pi_runtime_poc/replay.py` 由事件驱动确定性
-  Builder、Validator、Publication、Version、Exporter，再返回 execution 值对象。
+- 本节记录 R2 前的本地 synthetic 回放形状，已由下方 R2 重新执行覆盖；本节数字不作为当前
+  门禁证据。
 - 没有创建数据库、模型、DataTap、钱包或积分客户端；没有启动真实 Pi、没有运行或修改
   Task 9，也没有覆盖历史 round。此节不是 Gate A 真实业务结论。
 
@@ -242,17 +241,43 @@ DataTap 冒烟授权，才可继续。Task 9 与方案 B/C 均未进入。
 
 ### 验证结果
 
-- Task 7 定向回放：**6 passed**。
-- 后端 `tests/pi_runtime_poc tests/agent_artifacts`：**709 passed、9 skipped**；范围
-  Ruff 与 `git diff --check`：通过。
-- Pi Runtime `npm test`：**47 passed（9 files）**；`npm run typecheck`：通过。
+- 历史结果已被 R2 的新鲜定向与全量结果替代，避免把旧回放数字当作当前 Gate 证据。
 
 ### 结论
 
-本地 B0 回放 Gate 证据通过；它不授权真实 UAT 或 Task 9。Task 4R、Task 5、Task 6、Task 7
-完成后停止，不进入 B1–B7 或方案 C。
+本节不授权真实 UAT 或 Task 9；R2 的结论见下节。
 
 ---
+
+## B0 Gate 加固 R2（2026-08-09）— PASS（本地 synthetic only）
+
+### 范围与实现
+
+- Gate 删除对 Artifact 自报 hard-check 布尔值的信任，改由 published payload、canonical
+  fields、field lineage、结构化 claims、fixture Evidence manifest、Version/Run/Session、
+  availability 和 limitations 计算；缺失或篡改均 fail-closed。
+- Replay 只读取脱敏 cases/evidence/events，实际调用当前 Capability Pack snapshot、Brand/
+  Campaign/KOL 共享 Builder、`ArtifactPayloadValidator`、共享 publication validation、冻结
+  内存 Version 与正式 `export_artifact`；结果和 `hard_check_gate=PASS` 由执行过程生成。
+  Gate 还校验 KOL candidate/score 与 fixture Evidence、drilldown 前序 published source artifact
+  与 payload digest。导出摘要来自实际 renderer bytes 的稳定规范化表示，不是预制结果或输入摘要。
+- KOL v3 Gate 校验 payload 中的候选、合法平台 allowlist、唯一身份、top_limit、summary
+  计数、availability 三段结构、评分维度/权重和 lineage source path；历史导出兼容与新发布
+  严格门禁保持分离。
+
+### 新鲜验证结果
+
+- TDD 红灯：初始 R2 负向集在旧实现上为 **25 failed**；后续 availability、score/path
+  负向也均先红后绿；最终定向门禁/发布回归为 **112 passed**。
+- B0 后端全量 `tests/marketing_capability_pack tests/pi_runtime_poc tests/agent_artifacts`：
+  **806 passed、9 skipped**。
+- Pi Runtime：`npm test` **47 passed（9 files）**；`npm run typecheck` 通过；本提交全部
+  修改 Python 文件 Ruff 通过；`git diff --check` 通过。
+
+### 边界结论
+
+这是本地 B0 synthetic 回放证据，不等于真实 Gate A 或真实供应商效果结论；未调用模型、
+DataTap、钱包、积分，未运行或修改 Task 9，未进入 B1–B7 或方案 C。
 
 ## Task 8D 单工具冒烟启动器本地修复（2026-08-07）— READY_FOR_REAL_SMOKE_AUTHORIZATION
 

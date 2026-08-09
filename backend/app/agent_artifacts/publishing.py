@@ -47,8 +47,8 @@ from app.agent_artifacts.models import (
     ArtifactDraftRevision,
     ArtifactPublishAttempt,
 )
+from app.agent_artifacts.publication_core import validate_payload_for_publication
 from app.agent_artifacts.service import ArtifactBusy, ArtifactService, _utcnow
-from app.agent_artifacts.validation import ArtifactPayloadValidator
 from app.agent_runtime.models import AgentRun
 from app.agent_runtime.repository import AgentRunRepository
 from app.agent_runtime.state import InvalidRunTransition
@@ -308,14 +308,12 @@ class ArtifactPublicationService:
             )
 
         # 发布门禁（§10.3）：payload 强类型二次校验 + lineage 传递闭包冻结。
-        validated_payload, payload_errors = (
-            ArtifactPayloadValidator.validate_revision_payload_collecting(
-                module=artifact.module,
-                schema_version=revision.schema_version,
-                artifact_type=artifact.artifact_type,
-                payload=revision.payload_json,
-                enforce_kol_publication_validity=True,
-            )
+        validated_payload, payload_errors = validate_payload_for_publication(
+            module=artifact.module,
+            schema_version=revision.schema_version,
+            artifact_type=artifact.artifact_type,
+            payload=revision.payload_json,
+            enforce_kol_publication_validity=True,
         )
         lineage_snapshot: dict[str, Any] | None = None
         lineage_errors: list[dict[str, Any]] = []
@@ -343,21 +341,23 @@ class ArtifactPublicationService:
             )
         )
         if structured_enabled and not payload_errors and not lineage_errors:
-            structured_errors = [
-                {"stage": "structured_claims", **issue.as_dict()}
-                for issue in validate_structured_claims(
-                    validated_payload,
-                    candidate_version_id,
-                    evidence_scope_from_snapshot(
-                        lineage_snapshot,
-                        owner=LineageOwner(
-                            user_id=artifact.user_id,
-                            session_id=artifact.session_id,
-                            run_id=run_id,
-                        ),
+            validated_payload, structured_errors = validate_payload_for_publication(
+                module=artifact.module,
+                schema_version=revision.schema_version,
+                artifact_type=artifact.artifact_type,
+                payload=validated_payload,
+                evidence_scope=evidence_scope_from_snapshot(
+                    lineage_snapshot,
+                    owner=LineageOwner(
+                        user_id=artifact.user_id,
+                        session_id=artifact.session_id,
+                        run_id=run_id,
                     ),
-                )
-            ]
+                ),
+                artifact_version_id=candidate_version_id,
+                enforce_kol_publication_validity=True,
+                structured_validator=validate_structured_claims,
+            )
         flat_errors: list[dict[str, Any]] = [
             {"stage": "payload", **error} for error in payload_errors
         ] + lineage_errors + structured_errors

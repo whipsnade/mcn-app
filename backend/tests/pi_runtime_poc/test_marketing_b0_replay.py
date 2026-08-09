@@ -128,7 +128,7 @@ def test_replay_rejects_tampered_case_order_or_event_manifest(tmp_path: Path) ->
         ),
         (
             "events.json",
-            lambda payload: payload["brand-research-v1"][5].__setitem__("format", "xlsx"),
+            lambda payload: payload["brand-research-v1"][5].__setitem__("format", "json"),
         ),
     ],
 )
@@ -173,12 +173,98 @@ def test_generated_results_fail_closed_for_lineage_scope_and_candidate_tampering
     kol["candidates"][0]["nickname"] = ""
     assert not evaluate_case(kol, cases[2])["valid_candidates"]
 
+    kol = deepcopy(execution.results[2])
+    kol["artifacts"][0]["payload"]["data"]["items"][0]["score_snapshot"][
+        "value_score"
+    ] = 999
+    assert not evaluate_case(kol, cases[2])["valid_candidates"]
+
+    kol = deepcopy(execution.results[2])
+    snapshot = kol["artifacts"][0]["payload"]["data"]["items"][0]["score_snapshot"]
+    snapshot["dimensions"] = {"followers": snapshot["dimensions"]["followers"]}
+    snapshot["effect_score"] = snapshot["dimensions"]["followers"]["weighted_score"]
+    snapshot["value_score"] = snapshot["effect_score"] + snapshot["price_efficiency_score"]
+    assert not evaluate_case(kol, cases[2])["valid_candidates"]
+
+    kol = deepcopy(execution.results[2])
+    snapshot = kol["artifacts"][0]["payload"]["data"]["items"][0]["score_snapshot"]
+    snapshot["dimensions"]["followers"]["weight"] = 999
+    snapshot["dimensions"]["followers"]["weighted_score"] = 499.5
+    snapshot["effect_score"] = sum(
+        dimension["weighted_score"] for dimension in snapshot["dimensions"].values()
+    )
+    snapshot["value_score"] = snapshot["effect_score"] + snapshot["price_efficiency_score"]
+    assert not evaluate_case(kol, cases[2])["valid_candidates"]
+
+    kol = deepcopy(execution.results[2])
+    kol["artifacts"][0]["lineage_source_paths"]["/data/summary/selected_count"] = [
+        "/evil"
+    ]
+    assert not evaluate_case(kol, cases[2])["valid_candidates"]
+
+    kol = deepcopy(execution.results[2])
+    kol["artifacts"][0]["lineage_source_paths"][
+        "/data/items/0/score_snapshot/value_score"
+    ] = ["/evil"]
+    assert not evaluate_case(kol, cases[2])["valid_candidates"]
+
+    kol = deepcopy(execution.results[2])
+    scoring = kol["artifacts"][0]["payload"]["data"]["scoring"]
+    scoring["weights"] = {"foo": 70}
+    snapshot = kol["artifacts"][0]["payload"]["data"]["items"][0]["score_snapshot"]
+    follower_dimension = snapshot["dimensions"]["followers"]
+    snapshot["dimensions"] = {
+        "foo": {**follower_dimension, "weight": 70, "weighted_score": 35}
+    }
+    snapshot["effect_score"] = 35
+    snapshot["value_score"] = snapshot["effect_score"] + snapshot["price_efficiency_score"]
+    lineage_paths = kol["artifacts"][0]["lineage_source_paths"]
+    for path in list(lineage_paths):
+        if "/dimensions/" in path:
+            del lineage_paths[path]
+    lineage_paths.update(
+        {
+            "/data/items/0/score_snapshot/dimensions/foo/raw_score": ["/0/platform"],
+            "/data/items/0/score_snapshot/dimensions/foo/weighted_score": ["/0/platform"],
+        }
+    )
+    assert not evaluate_case(kol, cases[2])["valid_candidates"]
+
+    kol = deepcopy(execution.results[2])
+    kol["artifacts"][0]["limitations"] = [
+        {"affected_paths": ["/data/summary/selected_count"]}
+    ]
+    assert not evaluate_case(kol, cases[2])["partial_limitations_complete"]
+
     partial = deepcopy(execution.results[0])
-    field = partial["artifacts"][0]["canonical_data"]["data/overview/total_volume"]
+    field = next(
+        item
+        for item in partial["artifacts"][0]["canonical_data"]
+        if item["path"] == "/data/overview/total_volume"
+    )
     field["availability"] = "partial"
     partial["artifacts"][0]["availability"]["data/overview/total_volume"] = "partial"
     partial["artifacts"][0]["limitations"] = []
     assert not evaluate_case(partial, cases[0])["partial_limitations_complete"]
+
+
+@pytest.mark.parametrize("availability", [None, {}, {"items": "partial"}])
+def test_kol_gate_rejects_missing_or_malformed_availability(
+    availability: dict[str, object] | None,
+) -> None:
+    execution = run_offline_marketing_replay(FIXTURES)
+    cases = _load_cases()
+    kol = deepcopy(execution.results[2])
+    payload = kol["artifacts"][0]["payload"]
+    if availability is None:
+        payload.pop("availability", None)
+    else:
+        payload["availability"] = availability
+
+    checks = evaluate_case(kol, cases[2])
+    assert checks["numeric_lineage_complete"] is False
+    assert checks["narrative_grounded"] is False
+    assert checks["partial_limitations_complete"] is False
 
 
 def test_replay_rejects_self_consistent_evidence_and_event_value_tampering(tmp_path: Path) -> None:
@@ -196,3 +282,149 @@ def test_replay_rejects_self_consistent_evidence_and_event_value_tampering(tmp_p
 
     with pytest.raises(ValueError, match="offline_replay_"):
         run_offline_marketing_replay(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("filename", "mutate"),
+    [
+        (
+            "evidence.json",
+            lambda payload: payload["brand-research-v1"][0].__setitem__("unit", "CNY"),
+        ),
+        (
+            "events.json",
+            lambda payload: payload["brand-research-v1"][-1].__setitem__("outcome", "failed"),
+        ),
+        (
+            "events.json",
+            lambda payload: payload["scope-clarification-v1"][1].__setitem__("outcome", "refused"),
+        ),
+        (
+            "events.json",
+            lambda payload: payload["non-marketing-v1"][1].__setitem__("outcome", "clarification_requested"),
+        ),
+        (
+            "events.json",
+            lambda payload: payload["brand-research-v1"][4].update(
+                {"version_id": "other-version", "artifact_type": "campaign_report_v2"}
+            ),
+        ),
+        (
+            "events.json",
+            lambda payload: payload["brand-research-v1"][5].update(
+                {"version_id": "other-version", "artifact_type": "campaign_report_v2"}
+            ),
+        ),
+    ],
+)
+def test_replay_rejects_event_and_evidence_semantic_tampering(
+    tmp_path: Path, filename: str, mutate
+) -> None:
+    import json
+
+    for path in FIXTURES.iterdir():
+        (tmp_path / path.name).write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+    payload = json.loads((tmp_path / filename).read_text(encoding="utf-8"))
+    mutate(payload)
+    (tmp_path / filename).write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="offline_replay_"):
+        run_offline_marketing_replay(tmp_path)
+
+
+def test_replay_calls_shared_capability_pack_entry(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.marketing_capability_pack import runtime
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("shared_capability_entry_called")
+
+    monkeypatch.setattr(runtime, "build_marketing_run_capability", fail)
+    with pytest.raises(RuntimeError, match="shared_capability_entry_called"):
+        run_offline_marketing_replay(FIXTURES)
+
+
+@pytest.mark.parametrize(
+    ("module_name", "attribute", "error_code"),
+    (
+        (
+            "app.agent_artifacts.builders.brand",
+            "build_brand_report_draft",
+            "shared_brand_builder_called",
+        ),
+        (
+            "app.agent_artifacts.builders.campaign",
+            "build_campaign_report_draft",
+            "shared_campaign_builder_called",
+        ),
+        (
+            "app.agent_artifacts.builders.kol_selection",
+            "build_kol_selection_draft",
+            "shared_kol_builder_called",
+        ),
+        (
+            "app.agent_artifacts.validation",
+            "ArtifactPayloadValidator.validate_revision_payload_collecting",
+            "shared_validator_called",
+        ),
+        (
+            "app.agent_artifacts.publication_core",
+            "validate_payload_for_publication",
+            "shared_publication_called",
+        ),
+        (
+            "app.agent_artifacts.exporters",
+            "export_artifact",
+            "shared_exporter_called",
+        ),
+    ),
+)
+def test_replay_calls_shared_production_chain(
+    monkeypatch: pytest.MonkeyPatch, module_name: str, attribute: str, error_code: str
+) -> None:
+    import importlib
+
+    module = importlib.import_module(module_name)
+    target = module
+    parts = attribute.split(".")
+    for part in parts[:-1]:
+        target = getattr(target, part)
+
+    def fail(*args, **kwargs):
+        raise RuntimeError(error_code)
+
+    monkeypatch.setattr(target, parts[-1], fail)
+    with pytest.raises(RuntimeError, match=error_code):
+        run_offline_marketing_replay(FIXTURES)
+
+
+def test_replay_produces_complete_v3_kol_payload() -> None:
+    execution = run_offline_marketing_replay(FIXTURES)
+    payload = execution.results[2]["artifacts"][0]["payload"]
+    scope = payload["scope"]
+    assert {
+        "brand", "category", "platforms", "audience", "region", "age_range", "period",
+        "budget", "filters", "ranking_mode", "top_limit", "scoring_version",
+    } <= set(scope)
+    assert payload["schema_version"] == "kol_selection_v3"
+    assert payload["data"]["items"]
+    assert payload["data"]["summary"]["selected_count"] == len(payload["data"]["items"])
+
+
+def test_replay_export_digest_is_digest_of_exported_bytes() -> None:
+    import hashlib
+    from types import SimpleNamespace
+
+    from app.agent_artifacts.exporters import export_artifact
+    from app.agent_artifacts.offline_pipeline import _canonical_export_bytes
+
+    execution = run_offline_marketing_replay(FIXTURES)
+    artifact = execution.results[0]["artifacts"][0]
+    exported = export_artifact(
+        SimpleNamespace(
+            schema_version=artifact["artifact_type"],
+            payload_json=artifact["payload"],
+            status="published",
+            validation_json={"valid": True},
+        )
+    )
+    assert artifact["export_digest"] == hashlib.sha256(_canonical_export_bytes(exported)).hexdigest()

@@ -5,7 +5,7 @@
       "version_id": "version-brand-b0",
       "run_id": "offline-brand-run",
       "session_id": "offline-brand-session",
-      "source_path": "/data/overview/total_volume",
+      "source_path": "/platform",
       "value": 120,
       "unit": "mentions"
     }
@@ -16,8 +16,8 @@
       "version_id": "version-campaign-b0",
       "run_id": "offline-campaign-run",
       "session_id": "offline-campaign-session",
-      "source_path": "/data/overview/total_volume",
-      "value": 32,
+      "source_path": "/platform",
+      "value": 2,
       "unit": "posts"
     },
     {
@@ -25,7 +25,7 @@
       "version_id": "version-campaign-b0",
       "run_id": "offline-campaign-run",
       "session_id": "offline-campaign-session",
-      "source_path": "/data/overview/total_engagement",
+      "source_path": "/platform",
       "value": 480,
       "unit": "interactions"
     }
@@ -36,14 +36,24 @@
       "version_id": "version-kol-b0",
       "run_id": "offline-kol-run",
       "session_id": "offline-kol-session",
-      "source_path": "/data/selection/selected_count",
+      "source_path": "/data/summary/selected_count",
       "value": 1,
       "unit": "count",
       "candidate": {
         "nickname": "脱敏达人",
         "platform": "douyin",
         "kol_uid": "kol-redacted-001",
-        "score_inputs": {"followers": 0}
+        "quoted_price": 10000,
+        "score_inputs": {
+          "followers": 10000,
+          "average_interactions": 100,
+          "active_follower_rate": 50,
+          "interaction_follower_ratio": 1,
+          "content_score": 80,
+          "industry_interest": 80,
+          "target_region": 80,
+          "target_age": 80
+        }
       }
     }
   ],

@@ -80,6 +80,16 @@ def _report_result() -> dict:
                 ],
                 "availability": {"data/overview/total_volume": "complete"},
                 "limitations": [],
+                "evidence_manifest": [
+                    {
+                        "evidence_id": "evidence-brand",
+                        "version_id": "version-brand",
+                        "run_id": "run-brand",
+                        "session_id": "session-brand",
+                        "source_path": "/data/overview/total_volume",
+                        "value": 10,
+                    }
+                ],
             }
         ],
         "metrics": {"datatap_tool_calls": 1},
@@ -155,7 +165,7 @@ def test_drilldown_must_bind_exact_version_without_datatap() -> None:
     }
     checks = evaluate_case(result, fixture)
     assert checks["drilldown_bound_to_version"]
-    assert checks["drilldown_grounded"]
+    assert not checks["drilldown_grounded"]
 
     bad = deepcopy(result)
     bad["drilldown_version_id"] = "other-version"
@@ -241,8 +251,18 @@ def _structured_lineage_fixture() -> tuple[dict, dict]:
                 "run_id": "run-brand",
                 "session_id": "session-brand",
                 "source_path": "/data/overview/total_volume",
+                "value": 10,
+                "unit": "mentions",
             }
         ],
+        "expected_fields": {
+            "data/overview/total_volume": {
+                "value": 10,
+                "unit": "mentions",
+                "availability": "complete",
+                "evidence_ids": ["ev-volume"],
+            }
+        },
     }
     result = {
         "case_id": "brand-research-v1",
@@ -294,6 +314,17 @@ def _structured_lineage_fixture() -> tuple[dict, dict]:
                 ],
                 "availability": {"data/overview/total_volume": "complete"},
                 "limitations": [],
+                "evidence_manifest": [
+                    {
+                        "evidence_id": "ev-volume",
+                        "version_id": "version-brand",
+                        "run_id": "run-brand",
+                        "session_id": "session-brand",
+                        "source_path": "/data/overview/total_volume",
+                        "value": 10,
+                        "unit": "mentions",
+                    }
+                ],
             }
         ],
         "metrics": {"datatap_tool_calls": 1},
@@ -338,3 +369,249 @@ def test_gate_manifest_version_and_source_path_are_trusted_from_fixture_only() -
         duplicate_manifest["evidence_manifest"][0].copy()
     )
     assert evaluate_case(result, duplicate_manifest)["numeric_lineage_complete"] is False
+
+
+def test_numeric_lineage_rejects_canonical_unit_mismatch() -> None:
+    fixture, result = _structured_lineage_fixture()
+    result["artifacts"][0]["canonical_data"]["data/overview/total_volume"]["unit"] = "CNY"
+    assert evaluate_case(result, fixture)["numeric_lineage_complete"] is False
+
+
+def test_no_duplicate_report_checks_raw_artifacts_even_when_version_declared_once() -> None:
+    fixture, result = _structured_lineage_fixture()
+    result["artifacts"].append(deepcopy(result["artifacts"][0]))
+    assert evaluate_case(result, fixture)["no_duplicate_report"] is False
+
+
+def test_kol_candidates_are_read_from_published_payload_and_must_match_scope() -> None:
+    fixture = {
+        "case_id": "kol-selection-v1",
+        "expected_behavior": "report",
+        "required_artifact_type": "kol_selection_v3",
+        "scope": {"platforms": ["douyin", "xiaohongshu"]},
+    }
+    candidate = {
+        "nickname": "越界达人",
+        "platform": "bilibili",
+        "kol_uid": "kol-outside",
+        "score_snapshot": {
+            "dimensions": {"engagement": {"source": "evidence"}}
+        },
+    }
+    result = {
+        "case_id": "kol-selection-v1",
+        "runtime": "pi",
+        "status": "completed",
+        "outcome": "completed",
+        "scope": fixture["scope"],
+        "artifact_versions": ["version-kol"],
+        "evidence_ids": [],
+        "artifacts": [
+            {
+                "version_id": "version-kol",
+                "artifact_type": "kol_selection_v3",
+                "status": "published",
+                "payload": {"data": {"items": [candidate], "summary": {"selected_count": 1}}},
+            }
+        ],
+        # 不得信任这个与已发布 payload 不一致的副本。
+        "candidates": [
+            {"nickname": "合法副本", "platform": "douyin", "kol_uid": "kol-in-scope", "score_inputs": {"x": 1}}
+        ],
+        "metrics": {"datatap_tool_calls": 0},
+    }
+    assert evaluate_case(result, fixture)["valid_candidates"] is False
+
+
+def test_kol_hard_checks_reject_unpublished_self_reported_payload() -> None:
+    fixture = {
+        "case_id": "kol-selection-v1",
+        "expected_behavior": "report",
+        "required_artifact_type": "kol_selection_v3",
+        "published_version_id": "version-kol",
+        "scope": {"platforms": ["douyin"]},
+        "evidence_manifest": [
+            {
+                "evidence_id": "ev-kol",
+                "version_id": "version-kol",
+                "run_id": "run-kol",
+                "session_id": "session-kol",
+                "source_path": "/data/summary/selected_count",
+                "value": 1,
+                "unit": "count",
+                "candidate": {
+                    "nickname": "脱敏达人",
+                    "platform": "douyin",
+                    "kol_uid": "kol-1",
+                },
+            }
+        ],
+    }
+    result = {
+        "case_id": "kol-selection-v1",
+        "runtime": "pi",
+        "status": "completed",
+        "outcome": "completed",
+        "run_id": "run-kol",
+        "session_id": "session-kol",
+        "artifact_versions": ["version-kol"],
+        "evidence_ids": ["ev-kol"],
+        "scope": fixture["scope"],
+        "artifacts": [
+            {
+                "version_id": "version-kol",
+                "artifact_type": "kol_selection_v3",
+                "numeric_lineage_complete": True,
+                "narrative_grounded": True,
+                "partial_limitations_complete": True,
+                "payload": {
+                    "schema_version": "kol_selection_v3",
+                    "scope": {"platforms": ["douyin"], "top_limit": 1},
+                    "data": {
+                        "items": [
+                            {
+                                "nickname": "脱敏达人",
+                                "platform": "douyin",
+                                "kol_uid": "kol-1",
+                                "score_snapshot": {
+                                    "dimensions": {"followers": {"source": "evidence"}}
+                                },
+                            }
+                        ],
+                        "summary": {"selected_count": 1, "candidate_count": 1},
+                    },
+                },
+            }
+        ],
+        "metrics": {"datatap_tool_calls": 0},
+    }
+    checks = evaluate_case(result, fixture)
+    assert checks["valid_candidates"] is False
+    assert checks["numeric_lineage_complete"] is False
+    assert checks["narrative_grounded"] is False
+    assert checks["partial_limitations_complete"] is False
+
+
+def test_evidence_manifest_value_and_unit_are_bound_to_fixture_records() -> None:
+    fixture, result = _structured_lineage_fixture()
+    result["artifacts"][0]["evidence_manifest"] = [
+        {
+            "evidence_id": "ev-volume",
+            "version_id": "version-brand",
+            "run_id": "run-brand",
+            "session_id": "session-brand",
+            "source_path": "/data/overview/total_volume",
+            "value": 10,
+            "unit": "mentions",
+        }
+    ]
+    assert evaluate_case(result, fixture)["numeric_lineage_complete"] is True
+
+    tampered = deepcopy(result)
+    tampered["artifacts"][0]["evidence_manifest"][0]["value"] = 99
+    assert evaluate_case(tampered, fixture)["numeric_lineage_complete"] is False
+
+    tampered = deepcopy(result)
+    tampered["artifacts"][0]["evidence_manifest"][0]["unit"] = "CNY"
+    assert evaluate_case(tampered, fixture)["numeric_lineage_complete"] is False
+
+
+@pytest.mark.parametrize(
+    ("behavior", "check", "outcome"),
+    [
+        ("drilldown", "drilldown_grounded", "drilldown_completed"),
+        ("clarify", "clarification_no_tool_call", "clarification_requested"),
+        ("refuse", "non_marketing_refused", "refused"),
+    ],
+)
+@pytest.mark.parametrize("metrics", [None, {}, {"datatap_tool_calls": None}, {"datatap_tool_calls": True}, {"datatap_tool_calls": False}, {"datatap_tool_calls": -1}, {"datatap_tool_calls": 0.0}, {"datatap_tool_calls": "0"}, {"datatap_tool_calls": 0}])
+def test_zero_datatap_requires_explicit_non_bool_integer(
+    behavior: str, check: str, outcome: str, metrics: dict | None
+) -> None:
+    fixture = {
+        "case_id": {
+            "drilldown": "artifact-drilldown-v1",
+            "clarify": "scope-clarification-v1",
+            "refuse": "non-marketing-v1",
+        }[behavior],
+        "expected_behavior": behavior,
+        "published_version_id": "version-brand" if behavior == "drilldown" else None,
+    }
+    result = {
+        "case_id": fixture["case_id"],
+        "runtime": "pi",
+        "status": "completed",
+        "outcome": outcome,
+        "artifact_versions": [],
+        "drilldown_version_id": "version-brand" if behavior == "drilldown" else None,
+        "drilldown_grounded": True,
+        "metrics": metrics,
+    }
+    expected = (
+        isinstance(metrics, dict)
+        and type(metrics.get("datatap_tool_calls")) is int
+        and metrics.get("datatap_tool_calls") == 0
+        and behavior != "drilldown"
+    )
+    assert evaluate_case(result, fixture)[check] is expected
+
+
+def test_drilldown_grounding_requires_re_resolved_read_record_and_claim() -> None:
+    fixture = {
+        "case_id": "artifact-drilldown-v1",
+        "expected_behavior": "drilldown",
+        "published_version_id": "version-brand",
+        "published_payload_digest": "1887a8ffbd0f7ba0d685e6a6692b0e2fb1778e8f37584bc05393f79e6f709ba5",
+    }
+    source_payload = {"data": {"overview": {"total_volume": 10}}}
+    import hashlib
+    import json
+
+    digest = hashlib.sha256(json.dumps(source_payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    result = {
+        "case_id": "artifact-drilldown-v1",
+        "runtime": "pi",
+        "status": "completed",
+        "outcome": "drilldown_completed",
+        "artifact_versions": [],
+        "drilldown_version_id": "version-brand",
+        "drilldown_grounded": True,
+        "metrics": {"datatap_tool_calls": 0},
+        "source_version": {
+            "version_id": "version-brand",
+            "artifact_type": "brand_report_v3",
+            "payload": source_payload,
+            "payload_digest": digest,
+        },
+        "source_artifact": {
+            "version_id": "version-brand",
+            "artifact_type": "brand_report_v3",
+            "status": "published",
+            "validation_json": {"valid": True},
+            "payload": source_payload,
+        },
+        "read_record": {
+            "version_id": "version-brand",
+            "artifact_type": "brand_report_v3",
+            "payload_digest": digest,
+            "path": "/data/overview/total_volume",
+            "value": 10,
+        },
+        "claims": [
+            {
+                "path": "/data/overview/total_volume",
+                "value": 10,
+                "supporting_paths": ["/data/overview/total_volume"],
+            }
+        ],
+    }
+    assert evaluate_case(result, fixture)["drilldown_grounded"] is True
+
+    unpublished = deepcopy(result)
+    unpublished["source_artifact"]["status"] = "draft"
+    assert evaluate_case(unpublished, fixture)["drilldown_grounded"] is False
+    tampered = deepcopy(result)
+    tampered["drilldown_grounded"] = True
+    tampered.pop("read_record")
+    tampered.pop("claims")
+    assert evaluate_case(tampered, fixture)["drilldown_grounded"] is False

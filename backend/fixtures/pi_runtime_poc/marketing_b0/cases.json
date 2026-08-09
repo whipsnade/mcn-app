@@ -5,11 +5,20 @@
     "required_artifact_type": "brand_report_v3",
     "scope": {
       "brand": "脱敏品牌",
-      "platforms": ["douyin", "xiaohongshu"]
+      "period": {"start": "2026-01-01", "end": "2026-01-31", "timezone": "Asia/Shanghai"},
+      "platforms": ["douyin", "xiaohongshu"],
+      "comparison_mode": "none",
+      "keywords": []
     },
     "expected_scope": {
       "brand": "脱敏品牌",
-      "platforms": ["douyin", "xiaohongshu"]
+      "period": {"start": "2026-01-01", "end": "2026-01-31", "timezone": "Asia/Shanghai"},
+      "platforms": ["douyin", "xiaohongshu"],
+      "comparison_mode": "none",
+      "keywords": []
+    },
+    "expected_fields": {
+      "data/overview/total_volume": {"value": 120, "unit": "mentions", "availability": "partial", "evidence_ids": ["evidence-brand-volume"]}
     },
     "published_version_id": "version-brand-b0",
     "evidence_manifest": [
@@ -18,8 +27,9 @@
         "version_id": "version-brand-b0",
         "run_id": "offline-brand-run",
         "session_id": "offline-brand-session",
-        "source_path": "/data/overview/total_volume",
-        "value": 120
+        "source_path": "/platform",
+      "value": 120,
+      "unit": "mentions"
       }
     ]
   },
@@ -29,11 +39,23 @@
     "required_artifact_type": "campaign_report_v2",
     "scope": {
       "brand": "脱敏品牌",
-      "platforms": ["douyin", "xiaohongshu"]
+      "campaign": "脱敏活动",
+      "period": {"start": "2026-01-01", "end": "2026-01-31", "timezone": "Asia/Shanghai"},
+      "platforms": ["douyin", "xiaohongshu"],
+      "keywords": [],
+      "comparison_mode": "none"
     },
     "expected_scope": {
       "brand": "脱敏品牌",
-      "platforms": ["douyin", "xiaohongshu"]
+      "campaign": "脱敏活动",
+      "period": {"start": "2026-01-01", "end": "2026-01-31", "timezone": "Asia/Shanghai"},
+      "platforms": ["douyin", "xiaohongshu"],
+      "keywords": [],
+      "comparison_mode": "none"
+    },
+    "expected_fields": {
+      "data/overview/total_volume": {"value": 2, "unit": "posts", "availability": "partial", "evidence_ids": ["evidence-campaign-volume", "evidence-campaign-engagement"]},
+      "data/overview/total_engagement": {"value": 480, "unit": "interactions", "availability": "partial", "evidence_ids": ["evidence-campaign-engagement"]}
     },
     "published_version_id": "version-campaign-b0",
     "evidence_manifest": [
@@ -42,16 +64,18 @@
         "version_id": "version-campaign-b0",
         "run_id": "offline-campaign-run",
         "session_id": "offline-campaign-session",
-        "source_path": "/data/overview/total_volume",
-        "value": 32
+        "source_path": "/platform",
+      "value": 2,
+      "unit": "posts"
       },
       {
         "evidence_id": "evidence-campaign-engagement",
         "version_id": "version-campaign-b0",
         "run_id": "offline-campaign-run",
         "session_id": "offline-campaign-session",
-        "source_path": "/data/overview/total_engagement",
-        "value": 480
+        "source_path": "/platform",
+      "value": 480,
+      "unit": "interactions"
       }
     ]
   },
@@ -61,21 +85,65 @@
     "required_artifact_type": "kol_selection_v3",
     "scope": {
       "brand": "脱敏品牌",
-      "platforms": ["douyin", "xiaohongshu"]
+      "category": "美妆",
+      "platforms": ["douyin", "xiaohongshu"],
+      "audience": {"regions": ["全国"], "age_ranges": ["18-35"], "interests": ["美妆"]},
+      "region": ["全国"],
+      "age_range": ["18-35"],
+      "period": {"start": "2026-01-01", "end": "2026-01-31", "timezone": "Asia/Shanghai"},
+      "budget": {"min": 1000, "max": 100000},
+      "filters": {"budget_min": 1000, "budget_max": 100000},
+      "ranking_mode": "balanced",
+      "top_limit": 20,
+      "scoring_version": "kol_value_score_v3"
     },
     "expected_scope": {
       "brand": "脱敏品牌",
-      "platforms": ["douyin", "xiaohongshu"]
+      "category": "美妆",
+      "platforms": ["douyin", "xiaohongshu"],
+      "audience": {"regions": ["全国"], "age_ranges": ["18-35"], "interests": ["美妆"]},
+      "region": ["全国"],
+      "age_range": ["18-35"],
+      "period": {"start": "2026-01-01", "end": "2026-01-31", "timezone": "Asia/Shanghai"},
+      "budget": {"min": 1000, "max": 100000},
+      "filters": {"budget_min": 1000, "budget_max": 100000},
+      "ranking_mode": "balanced",
+      "top_limit": 20,
+      "scoring_version": "kol_value_score_v3"
     },
     "published_version_id": "version-kol-b0",
+    "expected_scoring": {
+      "version": "kol_value_score_v3",
+      "method": "effect_plus_price_efficiency",
+      "weights": {
+        "average_interactions": 14,
+        "active_follower": 10,
+        "engagement_follower_ratio": 10,
+        "content_match": 10,
+        "followers": 7,
+        "industry_interest": 7,
+        "target_region": 6,
+        "target_age": 6
+      },
+      "missing_value_policy": "missing_as_zero"
+    },
+    "expected_lineage_source_paths": {
+      "/data/summary/selected_count": ["/0/platform"]
+    },
     "evidence_manifest": [
       {
         "evidence_id": "evidence-kol-profile",
         "version_id": "version-kol-b0",
         "run_id": "offline-kol-run",
         "session_id": "offline-kol-session",
-        "source_path": "/data/selection/selected_count",
-        "value": 1
+        "source_path": "/data/summary/selected_count",
+      "value": 1,
+      "unit": "count",
+      "candidate": {
+        "nickname": "脱敏达人",
+        "platform": "douyin",
+        "kol_uid": "kol-redacted-001"
+      }
       }
     ]
   },
@@ -85,6 +153,7 @@
     "required_artifact_type": null,
     "depends_on_case_id": "brand-research-v1",
     "published_version_id": "version-brand-b0",
+    "published_payload_digest": "a8c7e3e8774825cfce3a00aa2d54aa02fa480741a04c9d1147347238d05eff52",
     "expected_scope": null
   },
   {
