@@ -98,7 +98,9 @@ export async function createProductionPiSession(
     });
     const listeners = new Set<(event: PiSdkEvent) => void>();
     const unsubscribeSdk = session.subscribe((event) => {
-      for (const listener of listeners) listener({ type: "sdk_event", eventType: event.type });
+      for (const listener of listeners) {
+        listener({ type: "sdk_event", eventType: event.type, event });
+      }
     });
     for (const listener of listeners) listener({ type: "session_start" });
     return {

@@ -61,7 +61,7 @@ class RuntimeConfigService:
         model: dict[str, Any],
         datatap: dict[str, Any],
         limits: dict[str, int | float],
-        billing: dict[str, int | str],
+        billing: dict[str, Any],
         secrets: RuntimeSecretBundle | None = None,
         runtime_contract_version: str = RUNTIME_CONTRACT_VERSION,
     ) -> RuntimeConfigVersion:
@@ -393,7 +393,7 @@ class RuntimeConfigService:
         model: dict[str, Any],
         datatap: dict[str, Any],
         limits: dict[str, int | float],
-        billing: dict[str, int | str],
+        billing: dict[str, Any],
     ) -> dict[str, Any]:
         if any(key not in {"name", "masked_origin", "provider"} for key in model):
             raise RuntimeConfigError("runtime_model_config_invalid")

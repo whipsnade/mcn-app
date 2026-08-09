@@ -50,6 +50,7 @@ from app.model.contracts import (
     ThinkingSink,
 )
 from app.model.tencent_plan import TencentPlanAdapter
+from app.pi_gateway.accounting import RuntimeUsageError, RuntimeUsageService
 
 
 logger = logging.getLogger(__name__)
@@ -264,6 +265,23 @@ class AgentModelGateway:
             "".join(gated.parts) if gated is not None else result.thinking_text
         )
         await self._db.flush()
+        try:
+            usage = result.usage.model_dump() if result.usage is not None else {}
+            await RuntimeUsageService(self._db).record_model_usage(
+                run,
+                attempt_id,
+                f"{attempt_id}:{step.sequence}",
+                {
+                    "input_tokens": usage.get("prompt_tokens"),
+                    "output_tokens": usage.get("completion_tokens"),
+                    "cache_read_tokens": usage.get("cached_tokens"),
+                    "upstream_request_id": result.request_id,
+                },
+            )
+        except RuntimeUsageError as exc:
+            # Usage is an append-only audit projection; it must never turn a
+            # successfully validated model decision into a business failure.
+            logger.warning("runtime usage projection rejected: %s", exc.code)
         return decision
 
     def _prepend_system_prompt(

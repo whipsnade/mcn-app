@@ -99,7 +99,11 @@ async def test_terminal_settles_with_gateway_worker_and_releases_session_slot(mo
         db,
         "lease-token",
     )
-    assert result == {"event_id": "event-1", "status": "completed"}
+    assert result == {
+        "event_id": "event-1",
+        "status": "completed",
+        "reconciliation_status": "unavailable",
+    }
     assert attempt.outcome == "completed"
     assert session.active_run_id is None
     assert run.gateway_id is None and run.lease_owner is None

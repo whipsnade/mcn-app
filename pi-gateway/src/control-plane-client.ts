@@ -173,6 +173,15 @@ export class ControlPlaneClient implements ControlPlaneTransport {
     return this.request("POST", `/runs/${encodeURIComponent(runId)}/events`, event, leaseToken);
   }
 
+  async sendUsage(
+    runId: string,
+    event: PiGatewaySourceEvent,
+    leaseToken: string,
+  ): Promise<unknown> {
+    if (event.event_type !== "usage") throw new Error("pi_usage_event_invalid");
+    return this.sendEvent(runId, event, leaseToken);
+  }
+
   async terminal(
     runId: string,
     attemptId: string,

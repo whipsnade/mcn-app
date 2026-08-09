@@ -28,6 +28,8 @@ from app.agent_runtime.tools.contracts import arguments_hash, logical_call_id_fo
 from app.agent_runtime.tools.mcp import DEFINITELY_NOT_SENT, RESULT_UNKNOWN, AgentMcpAccounting
 from app.pi_gateway.accounting import (
     McpPreflightContext,
+    RuntimeUsageError,
+    RuntimeUsageService,
     TenantAccountingError,
     TenantAccountingService,
 )
@@ -46,6 +48,7 @@ from .contracts import (
     PiGatewayMcpPermitResponse,
     PiGatewayMcpPreflightRequest,
 )
+from .events import normalize_usage_payload
 from .scheduler import PiRunScheduler
 
 
@@ -302,6 +305,20 @@ class PiGatewayService:
             now=self.now_fn().timestamp(),
         )
         return run
+
+    async def record_model_usage(
+        self,
+        run: AgentRun,
+        attempt_id: str,
+        source_event_id: str,
+        payload: dict[str, Any],
+    ):
+        """Persist a server-normalized model usage event without SSE emission."""
+
+        normalized = normalize_usage_payload(payload)
+        return await RuntimeUsageService(self.db).record_model_usage(
+            run, attempt_id, source_event_id, normalized
+        )
 
     async def preflight_mcp(
         self,
@@ -604,6 +621,7 @@ class PiGatewayRecoveryService:
             {"error_code": "pi_infrastructure_retry_exhausted"},
             before_commit=before_commit,
         )
+        await self._reconcile_after_terminal(run.id)
         return "failed" if event is not None or run.status == RunStatus.FAILED else "ignored"
 
     async def cancel_expired_run(self, run_id: str) -> bool:
@@ -660,7 +678,16 @@ class PiGatewayRecoveryService:
             {"code": "cancel_requested"},
             before_commit=before_commit,
         )
+        await self._reconcile_after_terminal(run.id)
         return event is not None
+
+    async def _reconcile_after_terminal(self, run_id: str) -> None:
+        try:
+            await RuntimeUsageService(self.db).reconcile_run(run_id)
+        except RuntimeUsageError:
+            # Recovery must not reopen or mutate a terminal Run because an
+            # audit-only reconciliation read is temporarily unavailable.
+            return
 
     async def _mark_attempt_tool_calls_unknown(
         self,

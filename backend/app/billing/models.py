@@ -3,10 +3,12 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import (
+    BigInteger,
     JSON,
     CheckConstraint,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     String,
@@ -171,12 +173,45 @@ class TenantUserQuotaUsage(Base):
 
 
 class RuntimeUsageRecord(Base):
-    """Task 8 usage table registered by the Task 7 migration only."""
+    """Append-only model/provider usage observation.
+
+    Usage rows are not business-point ledger entries.  The database constraints
+    make invalid negative counters and cross-attempt references fail closed;
+    pricing and reconciliation remain server-side service decisions.
+    """
 
     __tablename__ = "runtime_usage_records"
     __table_args__ = (
         UniqueConstraint(
             "run_id", "attempt_id", "source_event_id", "kind", name="uq_runtime_usage_event"
+        ),
+        UniqueConstraint(
+            "tenant_id", "kind", "upstream_request_id", name="uq_runtime_usage_upstream_request"
+        ),
+        CheckConstraint("kind IN ('model','mcp')", name="ck_runtime_usage_kind"),
+        CheckConstraint("backend IN ('current','pi')", name="ck_runtime_usage_backend"),
+        CheckConstraint(
+            "(input_tokens IS NULL OR input_tokens >= 0) AND "
+            "(output_tokens IS NULL OR output_tokens >= 0) AND "
+            "(cache_read_tokens IS NULL OR cache_read_tokens >= 0) AND "
+            "(cache_write_tokens IS NULL OR cache_write_tokens >= 0)",
+            name="ck_runtime_usage_tokens_nonnegative",
+        ),
+        CheckConstraint(
+            "cost_micros IS NULL OR cost_micros >= 0",
+            name="ck_runtime_usage_cost_nonnegative",
+        ),
+        CheckConstraint(
+            "usage_status IN ('available','unavailable')",
+            name="ck_runtime_usage_status",
+        ),
+        CheckConstraint(
+            "cost_status IN ('priced','unpriced','unavailable')",
+            name="ck_runtime_usage_cost_status",
+        ),
+        ForeignKeyConstraint(
+            ["attempt_id"], ["agent_run_attempts.id"], ondelete="CASCADE",
+            name="fk_runtime_usage_attempt",
         ),
         Index("ix_runtime_usage_tenant_observed", "tenant_id", "observed_at"),
         Index("ix_runtime_usage_run_kind", "run_id", "kind"),
@@ -198,11 +233,11 @@ class RuntimeUsageRecord(Base):
     backend: Mapped[str] = mapped_column(String(16), nullable=False)
     provider: Mapped[str | None] = mapped_column(String(64), nullable=True)
     model: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    cache_read_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    cache_write_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    cost_micros: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    input_tokens: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    output_tokens: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    cache_read_tokens: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    cache_write_tokens: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    cost_micros: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     currency: Mapped[str | None] = mapped_column(String(8), nullable=True)
     upstream_request_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     usage_status: Mapped[str] = mapped_column(String(24), nullable=False, default="unavailable")

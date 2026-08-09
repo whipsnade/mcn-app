@@ -4,13 +4,24 @@ import { fileURLToPath } from "node:url";
 import { createProductionPiSession } from "./pi-session.js";
 import { buildSecretEnv, clearSecretEnv } from "./secret-env.js";
 import type { McpAccountingControlPlane } from "./mcp-accounting-extension.js";
-import type { ClaimedRun, PiRunSession, PiSdkEvent, PiSessionFactory, SecretBundle } from "./protocol.js";
+import { PiSdkUsageProjector, projectPiSdkEvent } from "./event-projector.js";
+import type {
+  ClaimedRun,
+  PiGatewaySourceEvent,
+  PiRunSession,
+  PiSdkEvent,
+  PiSessionFactory,
+  SecretBundle,
+} from "./protocol.js";
 
 export interface WorkerOptions {
   sessionFactory?: PiSessionFactory;
   fakeProvider?: boolean;
   parentEnv?: NodeJS.ProcessEnv;
-  onEvent?: (event: PiSdkEvent) => void;
+  /** Projected, secret-free source events delivered to the Gateway buffer. */
+  onEvent?: (event: PiGatewaySourceEvent) => void;
+  /** Optional raw SDK audit hook; never send this payload to FastAPI. */
+  onSdkEvent?: (event: PiSdkEvent) => void;
   onReady?: () => void;
   mcpAccounting?: McpAccountingControlPlane;
 }
@@ -19,6 +30,12 @@ export interface IsolatedWorkerOptions {
   workerScript?: string;
   parentEnv?: NodeJS.ProcessEnv;
   execArgv?: string[];
+}
+
+export interface IsolatedWorkerProcess extends ChildProcess {
+  onEvent(listener: (event: PiGatewaySourceEvent) => void): () => void;
+  done: Promise<void>;
+  abort(): void;
 }
 
 export type WorkerFailureCode =
@@ -46,7 +63,7 @@ export function spawnIsolatedWorker(
   work: ClaimedRun,
   secrets: SecretBundle,
   options: IsolatedWorkerOptions = {},
-): ChildProcess {
+): IsolatedWorkerProcess {
   const childEnv = buildSecretEnv(secrets, options.parentEnv, work.runId);
   childEnv.PI_WORKER_CHILD = "1";
   const child = fork(options.workerScript ?? fileURLToPath(import.meta.url), [], {
@@ -55,9 +72,30 @@ export function spawnIsolatedWorker(
     stdio: ["ignore", "ignore", "ignore", "ipc"],
     serialization: "advanced",
   });
+  const listeners = new Set<(event: PiGatewaySourceEvent) => void>();
+  child.on("message", (message: unknown) => {
+    if (!message || typeof message !== "object" || !("type" in message) || message.type !== "event") return;
+    if (!("event" in message) || !message.event || typeof message.event !== "object") return;
+    for (const listener of listeners) listener(message.event as PiGatewaySourceEvent);
+  });
+  const done = new Promise<void>((resolve, reject) => {
+    child.once("close", (code, signal) => {
+      if (code === 0 && signal === null) resolve();
+      else reject(new Error(signal ? "worker_signaled" : "worker_exited"));
+    });
+  });
+  const handle = child as IsolatedWorkerProcess;
+  handle.onEvent = (listener) => {
+    listeners.add(listener);
+    return () => listeners.delete(listener);
+  };
+  handle.done = done;
+  handle.abort = () => {
+    if (!child.killed) child.kill("SIGTERM");
+  };
   clearSecretEnv(childEnv);
   child.send({ type: "run", work });
-  return child;
+  return handle;
 }
 
 /** Install idempotent SIGTERM/SIGINT cleanup without terminating the caller. */
@@ -86,6 +124,7 @@ export async function runSingleWorker(
   let session: PiRunSession | undefined;
   let unsubscribe: (() => void) | undefined;
   let workerSecrets: SecretBundle | undefined = secrets;
+  const usageProjector = new PiSdkUsageProjector(work.attemptId);
   let cleanupPromise: Promise<void> | undefined;
   const cleanup = (): Promise<void> => {
     if (cleanupPromise) return cleanupPromise;
@@ -116,7 +155,12 @@ export async function runSingleWorker(
       });
     workerSecrets = undefined;
     options.onReady?.();
-    unsubscribe = session.subscribe((event) => options.onEvent?.(event));
+    unsubscribe = session.subscribe((event) => {
+      options.onSdkEvent?.(event);
+      if (event.type !== "sdk_event") return;
+      const projected = projectPiSdkEvent(event.event ?? event, usageProjector);
+      if (projected) options.onEvent?.(projected);
+    });
     await session.prompt(work.userPrompt ?? "");
   } finally {
     try {
@@ -169,6 +213,7 @@ if (process.env.PI_WORKER_CHILD === "1" && process.send) {
     void runSingleWorker(message.work, readChildSecretBundle(process.env), {
       fakeProvider: message.work.runtimeSnapshot.model.api === "faux",
       onReady: () => process.send?.({ type: "ready", runId: message.work.runId }),
+      onEvent: (event) => process.send?.({ type: "event", runId: message.work.runId, event }),
     })
       .then(() => finishChildProcess({ type: "done", runId: message.work.runId }, 0))
       .catch((error) => finishChildProcess(

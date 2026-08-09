@@ -28,7 +28,7 @@ from .contracts import (
     PiGatewaySourceEvent,
     PiGatewayTerminalRequest,
 )
-from .accounting import TenantAccountingError
+from .accounting import RuntimeUsageError, RuntimeUsageService, TenantAccountingError
 from .internal_tools import ProductionInternalToolBridge
 from .models import PiGatewayRequestNonce
 from .service import PiGatewayClaimError, PiGatewayLeaseError, PiGatewayService
@@ -161,6 +161,23 @@ async def source_event(
     x_pi_run_lease: Annotated[str | None, Header()] = None,
 ) -> dict[str, object]:
     _gateway_id, run = await _leased(request, db, run_id, payload.source_event_id.split(":", 1)[0], x_pi_run_lease)
+    if payload.event_type == "usage":
+        try:
+            record = await _service(db, _gateway_id).record_model_usage(
+                run,
+                payload.source_event_id.split(":", 1)[0],
+                payload.source_event_id,
+                payload.payload,
+            )
+            await db.commit()
+        except RuntimeUsageError as exc:
+            await db.rollback()
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=exc.code) from exc
+        return {
+            "usage_record_id": record.id,
+            "sequence": payload.sequence,
+            "duplicate": False,
+        }
     existing = await db.scalar(
         select(AgentEvent).where(
             AgentEvent.run_id == run.id,
@@ -320,4 +337,17 @@ async def terminal(
     except InvalidRunTransition as exc:
         await db.rollback()
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="pi_gateway_terminal_rejected") from exc
-    return {"event_id": event.id if event else None, "status": outcome.value}
+    reconciliation_status: str | None = None
+    try:
+        reconciliation_status = (
+            await RuntimeUsageService(db).reconcile_run(run.id)
+        ).reconciliation_status
+    except Exception:
+        # Terminal state is already durable; a missing ledger row is an audit
+        # observation failure, never a reason to reopen or mutate the Run.
+        reconciliation_status = "unavailable"
+    return {
+        "event_id": event.id if event else None,
+        "status": outcome.value,
+        "reconciliation_status": reconciliation_status,
+    }

@@ -37,6 +37,37 @@ const secrets: SecretBundle = {
 };
 
 describe("single-run worker lifecycle", () => {
+  it("projects SDK usage into a secret-free source event before the Gateway callback", async () => {
+    const events: Array<Record<string, unknown>> = [];
+    const session: PiRunSession = {
+      prompt: async () => undefined,
+      subscribe: (listener) => {
+        listener({
+          type: "sdk_event",
+          eventType: "usage",
+          event: { type: "usage", usage: { input: 4, requestId: "worker-request" } },
+        });
+        return () => undefined;
+      },
+      abort: async () => undefined,
+      dispose: async () => undefined,
+      systemPrompt: () => "policy",
+      activeToolNames: () => [],
+      cwd: () => "/tmp/worker",
+    };
+    await runSingleWorker(work, secrets, {
+      sessionFactory: { create: async () => session },
+      onEvent: (event) => events.push(event as unknown as Record<string, unknown>),
+    });
+    expect(events).toEqual([
+      expect.objectContaining({
+        source_event_id: "attempt-worker:1",
+        event_type: "usage",
+        payload: expect.objectContaining({ input_tokens: 4, upstream_request_id: "worker-request" }),
+      }),
+    ]);
+  });
+
   it("orders abort, unsubscribe, dispose and clears child env on success", async () => {
     const order: string[] = [];
     const session: PiRunSession = {
@@ -134,15 +165,21 @@ describe("single-run worker lifecycle", () => {
       parentEnv: { PATH: process.env.PATH ?? "/usr/bin" },
     });
     const messages: Array<Record<string, unknown>> = [];
+    const projected: Array<Record<string, unknown>> = [];
+    child.onEvent((event) => projected.push(event as unknown as Record<string, unknown>));
     child.on("message", (message: Record<string, unknown>) => messages.push(message));
     await new Promise<void>((resolve, reject) => {
       child.once("error", reject);
       child.once("close", () => resolve());
     });
-    expect(messages).toEqual([
-      { type: "ready", runId: work.runId },
-      { type: "done", runId: work.runId },
-    ]);
+    expect(messages[0]).toEqual({ type: "ready", runId: work.runId });
+    expect(messages.at(-1)).toEqual({ type: "done", runId: work.runId });
+    expect(messages.filter((message) => message.type === "event")).toHaveLength(4);
+    expect(messages.find((message) => message.type === "event")).toMatchObject({
+      event: { source_event_id: "attempt-worker:1", event_type: "usage" },
+    });
+    expect(projected).toHaveLength(4);
+    expect(projected[0]).toMatchObject({ source_event_id: "attempt-worker:1" });
   });
 
   it("installs a signal cleanup hook exactly once", async () => {

@@ -19,12 +19,46 @@ class RuntimeConfigSnapshot(BaseModel):
     datatap: dict[str, object]
     capability_pack: dict[str, object]
     limits: dict[str, int | float]
-    billing: dict[str, int | str]
+    # ``price_table`` is a nested, public snapshot contract.  Secrets remain
+    # forbidden recursively; values are integer micros (or bounded labels).
+    billing: dict[str, int | str | dict[str, int | str]]
 
     @field_validator("model", "datatap", "capability_pack", "limits", "billing")
     @classmethod
     def copy_containers(cls, value):
         return dict(value)
+
+    @field_validator("billing")
+    @classmethod
+    def validate_billing(cls, value: dict[str, int | str | dict[str, int | str]]):
+        if set(value) - {"mcp_call_points", "price_table"}:
+            raise ValueError("runtime_billing_config_invalid")
+        table = value.get("price_table")
+        if table is not None:
+            if not isinstance(table, dict) or not table:
+                raise ValueError("runtime_price_table_invalid")
+            allowed = {
+                "version",
+                "currency",
+                "input_micros_per_million",
+                "output_micros_per_million",
+                "cache_read_micros_per_million",
+                "cache_write_micros_per_million",
+                "input_micros_per_token",
+                "output_micros_per_token",
+                "cache_read_micros_per_token",
+                "cache_write_micros_per_token",
+            }
+            if set(table) - allowed:
+                raise ValueError("runtime_price_table_invalid")
+            for key, item in table.items():
+                if key in {"version", "currency"}:
+                    max_length = 8 if key == "currency" else 32
+                    if not isinstance(item, str) or not item or len(item) > max_length:
+                        raise ValueError("runtime_price_table_invalid")
+                elif isinstance(item, bool) or not isinstance(item, int) or item < 0 or item > 10**12:
+                    raise ValueError("runtime_price_table_invalid")
+        return value
 
     @model_validator(mode="after")
     def reject_secret_fields(self) -> RuntimeConfigSnapshot:

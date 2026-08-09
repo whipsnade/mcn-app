@@ -58,3 +58,28 @@ def test_persisted_capability_snapshot_revalidates_runtime_contract_and_root_dig
     tampered["runtime_contract_version"] = "marketing_runtime_v0"
     with pytest.raises(ValidationError, match="marketing_runtime_contract_unsupported"):
         MarketingRunCapability.model_validate(tampered)
+
+
+def test_runtime_snapshot_accepts_versioned_public_price_table_only() -> None:
+    base = RuntimeConfigSnapshot(
+        config_version_id="cfg-price",
+        runtime_contract_version="marketing_runtime_v1",
+        runtime_backend="pi",
+        model={"name": "test", "masked_origin": "https://model.example"},
+        datatap={"service": "social", "schema_digest": "digest"},
+        capability_pack={"manifest_digest": "digest-pack"},
+        limits={"max_decisions": 50},
+        billing={
+            "mcp_call_points": 10,
+            "price_table": {
+                "version": "price-v1",
+                "currency": "USD",
+                "input_micros_per_million": 1_000_000,
+            },
+        },
+    )
+    assert isinstance(base.billing["price_table"], dict)
+    with pytest.raises(ValidationError):
+        RuntimeConfigSnapshot.model_validate(
+            {**base.model_dump(), "billing": {"price_table": {"api_key": "secret"}}}
+        )

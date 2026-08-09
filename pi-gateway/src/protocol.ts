@@ -180,6 +180,10 @@ const PAYLOAD_SENSITIVE_KEYS = new Set([
   "authorization", "api_key", "apikey", "password", "secret", "token", "environment",
   "tenant_id", "user_id", "session_id", "run_id", "attempt_id", "gateway_id", "lease_token",
 ]);
+const USAGE_PAYLOAD_KEYS = new Set([
+  "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
+  "upstream_request_id", "provider", "model", "usage_status",
+]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -223,6 +227,22 @@ export function parsePiGatewaySourceEvent(value: unknown): PiGatewaySourceEvent 
     for (const key of ["delta", "text"]) {
       if (typeof payload[key] === "string" && (payload[key] as string).length > 16_384) invalidProtocol();
     }
+  }
+  if (eventType === "usage") {
+    if (Object.keys(payload).some((key) => !USAGE_PAYLOAD_KEYS.has(key))) invalidProtocol();
+    for (const key of ["input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens"]) {
+      if (key in payload && (
+        typeof payload[key] !== "number" || !Number.isInteger(payload[key]) ||
+        (payload[key] as number) < 0 || (payload[key] as number) > 1e12
+      )) invalidProtocol();
+    }
+    if (
+      "upstream_request_id" in payload &&
+      (typeof payload.upstream_request_id !== "string" || payload.upstream_request_id.length < 1 || payload.upstream_request_id.length > 128)
+    ) invalidProtocol();
+    if (
+      "usage_status" in payload && payload.usage_status !== "available" && payload.usage_status !== "unavailable"
+    ) invalidProtocol();
   }
   return { source_event_id: sourceEventId, sequence: sequenceNumber, event_type: eventType, payload };
 }
@@ -276,7 +296,7 @@ export function parsePiGatewayClaimResponse(value: unknown): PiGatewayClaimRespo
 export type PiSdkEvent =
   | { type: "session_start" }
   | { type: "user_prompt"; content: string }
-  | { type: "sdk_event"; eventType: string }
+  | { type: "sdk_event"; eventType: string; event?: unknown }
   | { type: "session_end" }
   | { type: "error"; code: string };
 

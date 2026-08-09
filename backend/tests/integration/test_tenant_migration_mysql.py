@@ -12,7 +12,7 @@ def test_runtime_config_is_current_migration_head() -> None:
     backend_dir = Path(__file__).resolve().parents[2]
     config = Config(str(backend_dir / "alembic.ini"))
     config.set_main_option("script_location", str(backend_dir / "migrations"))
-    assert ScriptDirectory.from_config(config).get_heads() == ["0040_tenant_billing_usage"]
+    assert ScriptDirectory.from_config(config).get_heads() == ["0041_runtime_usage_constraints"]
 
 
 @pytest.mark.asyncio

@@ -7,8 +7,9 @@ containing the reservation has been committed by its caller.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import UTC, datetime
-from typing import Any, Literal, Mapping
+from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -17,12 +18,14 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.billing.models import (
+    RuntimeUsageRecord,
     TenantUserQuotaPolicy,
     TenantUserQuotaUsage,
     TenantWallet,
     TenantWalletTransaction,
     Wallet,
 )
+from app.agent_runtime.models import AgentRun, AgentRunAttempt, AgentToolCall
 from app.billing.service import InsufficientPointsError
 from app.tenancy.models import TenantMembership
 
@@ -37,6 +40,118 @@ class TenantAccountingError(ValueError):
     def __init__(self, code: str) -> None:
         self.code = code
         super().__init__(code)
+
+
+class RuntimeUsageError(ValueError):
+    """Stable, non-sensitive usage ingestion or reconciliation failure."""
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
+
+
+class UsageAggregate(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    tenant_id: str
+    user_id: str | None = None
+    run_id: str | None = None
+    day: str | None = None
+    record_count: int
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cache_read_tokens: int | None = None
+    cache_write_tokens: int | None = None
+    cost_micros: int | None = None
+    priced_cost_micros: int = 0
+    usage_unavailable_count: int = 0
+    unpriced_count: int = 0
+
+
+class UsageReconciliation(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    run_id: str
+    tenant_id: str
+    reconciliation_status: Literal["match", "mismatch"]
+    mismatch_codes: tuple[str, ...] = ()
+    mcp_settled_points: int = 0
+    run_reserved_points: int = 0
+    tenant_reserved_points: int = 0
+    unknown_reserved_points: int = 0
+
+
+def _usage_integer(payload: Mapping[str, Any], key: str) -> int | None:
+    value = payload.get(key)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0 or value > 10**12:
+        raise RuntimeUsageError("runtime_usage_value_invalid")
+    return value
+
+
+def _request_id(payload: Mapping[str, Any]) -> str | None:
+    value = payload.get("upstream_request_id", payload.get("request_id"))
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value or len(value) > 128:
+        raise RuntimeUsageError("runtime_usage_request_id_invalid")
+    return value
+
+
+def _source_sequence(attempt_id: str, source_event_id: str) -> int:
+    prefix = f"{attempt_id}:"
+    if not source_event_id.startswith(prefix):
+        raise RuntimeUsageError("runtime_usage_attempt_mismatch")
+    suffix = source_event_id[len(prefix) :]
+    if not suffix.isdigit() or int(suffix) < 1:
+        raise RuntimeUsageError("runtime_usage_source_event_invalid")
+    return int(suffix)
+
+
+def _price_table(snapshot: Mapping[str, Any]) -> Mapping[str, Any]:
+    billing = snapshot.get("billing")
+    if isinstance(billing, Mapping):
+        table = billing.get("price_table")
+        if isinstance(table, Mapping):
+            return table
+        return billing
+    table = snapshot.get("price_table")
+    return table if isinstance(table, Mapping) else {}
+
+
+def _rate(table: Mapping[str, Any], metric: str) -> int | None:
+    per_million_key = f"{metric}_micros_per_million"
+    per_token_key = f"{metric}_micros_per_token"
+    for key in (per_million_key, per_token_key):
+        value = table.get(key)
+        if value is not None:
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, int)
+                or value < 0
+                or value > (10**12 if key == per_million_key else 10**6)
+            ):
+                raise RuntimeUsageError("runtime_usage_price_invalid")
+            return value if key == per_million_key else value * 1_000_000
+    return None
+
+
+def _ceil_micros(tokens: int, micros_per_million: int) -> int:
+    return (tokens * micros_per_million + 999_999) // 1_000_000
+
+
+def _snapshot_model(run: AgentRun) -> tuple[str, str]:
+    snapshot = run.runtime_config_snapshot_json or {}
+    model = snapshot.get("model") if isinstance(snapshot, Mapping) else None
+    if not isinstance(model, Mapping):
+        model = {}
+    provider = model.get("provider")
+    name = model.get("name")
+    return (
+        provider if isinstance(provider, str) and provider else "unknown",
+        name if isinstance(name, str) and name else run.model,
+    )
 
 
 class TenantWalletInsufficientError(InsufficientPointsError, TenantAccountingError):
@@ -110,6 +225,327 @@ def _month_window(now: datetime) -> tuple[datetime, datetime]:
     else:
         end = start.replace(month=start.month + 1)
     return start, end
+
+
+class RuntimeUsageService:
+    """Persist immutable model usage and run read-only reconciliation results."""
+
+    _TOKEN_FIELDS = (
+        ("input_tokens", "input"),
+        ("output_tokens", "output"),
+        ("cache_read_tokens", "cache_read"),
+        ("cache_write_tokens", "cache_write"),
+    )
+
+    def __init__(self, db: AsyncSession, *, now_fn=utc_now) -> None:
+        self.db = db
+        self.now_fn = now_fn
+
+    async def record_model_usage(
+        self,
+        run: AgentRun,
+        attempt_id: str,
+        source_event_id: str,
+        payload: Mapping[str, Any],
+    ) -> RuntimeUsageRecord:
+        if run.runtime_backend not in {"pi", "current"} or not run.tenant_id or not run.user_id:
+            raise RuntimeUsageError("runtime_usage_run_invalid")
+        if not isinstance(payload, Mapping):
+            raise RuntimeUsageError("runtime_usage_payload_invalid")
+        _source_sequence(attempt_id, source_event_id)
+        attempt = await self.db.scalar(
+            select(AgentRunAttempt).where(
+                AgentRunAttempt.id == attempt_id,
+                AgentRunAttempt.run_id == run.id,
+            )
+        )
+        if attempt is None:
+            raise RuntimeUsageError("runtime_usage_attempt_mismatch")
+        values = {field: _usage_integer(payload, field) for field, _metric in self._TOKEN_FIELDS}
+        usage_available = any(value is not None for value in values.values())
+        upstream_request_id = _request_id(payload)
+        provider, model = _snapshot_model(run)
+        table = _price_table(run.runtime_config_snapshot_json or {})
+        currency = table.get("currency")
+        if currency is not None and (not isinstance(currency, str) or len(currency) > 8):
+            raise RuntimeUsageError("runtime_usage_currency_invalid")
+        rates = {metric: _rate(table, metric) for _field, metric in self._TOKEN_FIELDS}
+        if not usage_available:
+            cost_micros = None
+            cost_status = "unavailable"
+            usage_status = "unavailable"
+        elif any(
+            values[field] is not None and rates[metric] is None
+            for field, metric in self._TOKEN_FIELDS
+        ):
+            cost_micros = None
+            cost_status = "unpriced"
+            usage_status = "available"
+        else:
+            cost_micros = sum(
+                _ceil_micros(values[field], rates[metric])
+                for field, metric in self._TOKEN_FIELDS
+                if values[field] is not None and rates[metric] is not None
+            )
+            cost_status = "priced"
+            usage_status = "available"
+        unique_filter = (
+            RuntimeUsageRecord.run_id == run.id,
+            RuntimeUsageRecord.attempt_id == attempt_id,
+            RuntimeUsageRecord.source_event_id == source_event_id,
+            RuntimeUsageRecord.kind == "model",
+        )
+        existing = await self.db.scalar(select(RuntimeUsageRecord).where(*unique_filter))
+        if existing is not None:
+            if not self._same_usage(existing, values, provider, model, upstream_request_id):
+                raise RuntimeUsageError("runtime_usage_idempotency_conflict")
+            return existing
+        if upstream_request_id is not None:
+            request_existing = await self.db.scalar(
+                select(RuntimeUsageRecord).where(
+                    RuntimeUsageRecord.tenant_id == run.tenant_id,
+                    RuntimeUsageRecord.upstream_request_id == upstream_request_id,
+                    RuntimeUsageRecord.kind == "model",
+                )
+            )
+            if request_existing is not None:
+                raise RuntimeUsageError("runtime_usage_upstream_request_duplicate")
+        record = RuntimeUsageRecord(
+            id=str(uuid4()),
+            tenant_id=run.tenant_id,
+            user_id=run.user_id,
+            run_id=run.id,
+            attempt_id=attempt_id,
+            source_event_id=source_event_id,
+            kind="model",
+            backend=run.runtime_backend,
+            provider=provider,
+            model=model,
+            input_tokens=values["input_tokens"],
+            output_tokens=values["output_tokens"],
+            cache_read_tokens=values["cache_read_tokens"],
+            cache_write_tokens=values["cache_write_tokens"],
+            cost_micros=cost_micros,
+            currency=currency if isinstance(currency, str) else None,
+            upstream_request_id=upstream_request_id,
+            usage_status=usage_status,
+            cost_status=cost_status,
+            metadata_json=None,
+            observed_at=self.now_fn(),
+        )
+        try:
+            async with self.db.begin_nested():
+                self.db.add(record)
+                await self.db.flush()
+        except IntegrityError as exc:
+            existing = await self.db.scalar(select(RuntimeUsageRecord).where(*unique_filter))
+            if existing is not None:
+                if self._same_usage(existing, values, provider, model, upstream_request_id):
+                    return existing
+                raise RuntimeUsageError("runtime_usage_idempotency_conflict") from exc
+            if upstream_request_id is not None:
+                request_existing = await self.db.scalar(
+                    select(RuntimeUsageRecord).where(
+                        RuntimeUsageRecord.tenant_id == run.tenant_id,
+                        RuntimeUsageRecord.upstream_request_id == upstream_request_id,
+                        RuntimeUsageRecord.kind == "model",
+                    )
+                )
+                if request_existing is not None:
+                    raise RuntimeUsageError("runtime_usage_upstream_request_duplicate") from exc
+            raise RuntimeUsageError("runtime_usage_write_conflict") from exc
+        return record
+
+    async def record_usage(
+        self,
+        run: AgentRun,
+        attempt_id: str,
+        source_event_id: str,
+        payload: Mapping[str, Any],
+    ) -> RuntimeUsageRecord:
+        return await self.record_model_usage(run, attempt_id, source_event_id, payload)
+
+    @staticmethod
+    def _same_usage(
+        record: RuntimeUsageRecord,
+        values: Mapping[str, int | None],
+        provider: str,
+        model: str,
+        upstream_request_id: str | None,
+    ) -> bool:
+        return (
+            record.provider == provider
+            and record.model == model
+            and record.upstream_request_id == upstream_request_id
+            and all(getattr(record, field) == values[field] for field in values)
+        )
+
+    async def reconcile_run(self, run_id: str) -> UsageReconciliation:
+        run = await self.db.scalar(select(AgentRun).where(AgentRun.id == run_id))
+        if run is None or not run.tenant_id:
+            raise RuntimeUsageError("runtime_usage_run_not_found")
+        wallet = await self.db.scalar(
+            select(TenantWallet).where(TenantWallet.tenant_id == run.tenant_id)
+        )
+        if wallet is None:
+            raise RuntimeUsageError("runtime_usage_wallet_not_found")
+        transactions = list(
+            (
+                await self.db.scalars(
+                    select(TenantWalletTransaction).where(
+                        TenantWalletTransaction.tenant_id == run.tenant_id
+                    )
+                )
+            ).all()
+        )
+        tenant_reserved_points, _tenant_settled, _tenant_unknown = self._ledger_totals(transactions)
+        run_transactions = [row for row in transactions if row.run_id == run.id]
+        run_reserved_points, mcp_settled_points, unknown_reserved_points = self._ledger_totals(
+            run_transactions
+        )
+        mismatch_codes: list[str] = []
+        if wallet.reserved != tenant_reserved_points:
+            mismatch_codes.append("tenant_reserved_mismatch")
+        if run_reserved_points < unknown_reserved_points:
+            mismatch_codes.append("unknown_reserved_mismatch")
+        calls = list(
+            (
+                await self.db.scalars(
+                    select(AgentToolCall).where(AgentToolCall.run_id == run.id)
+                )
+            ).all()
+        )
+        # An empty ToolCall set is still a fact: any ledger settlement or
+        # unknown reservation for this Run is then an orphan and must be
+        # surfaced.  Do not skip this comparison merely because the caller
+        # row was deleted or never materialized.
+        settled_from_calls = sum(call.points_settled for call in calls)
+        unknown_from_calls = sum(10 for call in calls if call.status == "unknown")
+        if settled_from_calls != mcp_settled_points:
+            mismatch_codes.append("tool_call_settled_mismatch")
+        if unknown_from_calls != unknown_reserved_points:
+            mismatch_codes.append("tool_call_unknown_mismatch")
+        return UsageReconciliation(
+            run_id=run.id,
+            tenant_id=run.tenant_id,
+            reconciliation_status="mismatch" if mismatch_codes else "match",
+            mismatch_codes=tuple(mismatch_codes),
+            mcp_settled_points=mcp_settled_points,
+            run_reserved_points=run_reserved_points,
+            tenant_reserved_points=tenant_reserved_points,
+            unknown_reserved_points=unknown_reserved_points,
+        )
+
+    @staticmethod
+    def _ledger_totals(
+        rows: list[TenantWalletTransaction],
+    ) -> tuple[int, int, int]:
+        """Derive outstanding/settled/unknown from each reserve's terminal row.
+
+        A settled row has ``reserved_delta=-10`` while an unknown row keeps the
+        reservation at zero delta.  Computing the state per permit avoids
+        mistaking a settled call plus a separate unknown call for a zero net
+        reservation.
+        """
+
+        reserves = {row.tool_call_id or row.id: row for row in rows if row.kind == "reserve"}
+        terminals: dict[str, TenantWalletTransaction] = {}
+        for row in rows:
+            if row.kind in {"settle", "release", "unknown"}:
+                key = row.tool_call_id or row.reference_id
+                if key is not None:
+                    previous = terminals.get(key)
+                    if previous is None or row.created_at >= previous.created_at:
+                        terminals[key] = row
+        outstanding = settled = unknown = 0
+        for key in reserves:
+            terminal = terminals.get(key)
+            if terminal is None or terminal.kind == "unknown":
+                outstanding += MCP_POINTS_COST
+            if terminal is not None and terminal.kind == "settle":
+                settled += MCP_POINTS_COST
+            if terminal is not None and terminal.kind == "unknown":
+                unknown += MCP_POINTS_COST
+        return outstanding, settled, unknown
+
+    async def aggregate_usage(
+        self,
+        tenant_id: str,
+        *,
+        user_id: str | None = None,
+        run_id: str | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        group_by: Literal["tenant", "user", "run", "day"] = "day",
+    ) -> list[UsageAggregate]:
+        if group_by not in {"tenant", "user", "run", "day"}:
+            raise RuntimeUsageError("runtime_usage_group_invalid")
+        conditions = [RuntimeUsageRecord.tenant_id == tenant_id]
+        if user_id is not None:
+            conditions.append(RuntimeUsageRecord.user_id == user_id)
+        if run_id is not None:
+            conditions.append(RuntimeUsageRecord.run_id == run_id)
+        if start is not None:
+            conditions.append(RuntimeUsageRecord.observed_at >= start)
+        if end is not None:
+            conditions.append(RuntimeUsageRecord.observed_at < end)
+        records = list(
+            (
+                await self.db.scalars(
+                    select(RuntimeUsageRecord)
+                    .where(*conditions)
+                    .order_by(RuntimeUsageRecord.observed_at, RuntimeUsageRecord.id)
+                )
+            ).all()
+        )
+        groups: dict[tuple[object, ...], list[RuntimeUsageRecord]] = {}
+        for record in records:
+            if group_by == "tenant":
+                key = (record.tenant_id,)
+            elif group_by == "user":
+                key = (record.tenant_id, record.user_id)
+            elif group_by == "run":
+                key = (record.tenant_id, record.user_id, record.run_id)
+            else:
+                key = (record.tenant_id, record.observed_at.date().isoformat())
+            groups.setdefault(key, []).append(record)
+        result: list[UsageAggregate] = []
+        for key, rows in groups.items():
+            token_totals = {
+                field: self._sum_optional(rows, field)
+                for field, _metric in self._TOKEN_FIELDS
+            }
+            priced_cost = sum(
+                row.cost_micros for row in rows if row.cost_micros is not None
+            )
+            all_priced = bool(rows) and all(row.cost_status == "priced" for row in rows)
+            user_value = key[1] if group_by in {"user", "run"} else None
+            run_value = key[2] if group_by == "run" else None
+            day_value = key[1] if group_by == "day" else None
+            result.append(
+                UsageAggregate(
+                    tenant_id=str(key[0]),
+                    user_id=str(user_value) if user_value is not None else None,
+                    run_id=str(run_value) if run_value is not None else None,
+                    day=str(day_value) if day_value is not None else None,
+                    record_count=len(rows),
+                    **token_totals,
+                    cost_micros=priced_cost if all_priced else None,
+                    priced_cost_micros=priced_cost,
+                    usage_unavailable_count=sum(
+                        row.usage_status == "unavailable" for row in rows
+                    ),
+                    unpriced_count=sum(row.cost_status == "unpriced" for row in rows),
+                )
+            )
+        return result
+
+    @staticmethod
+    def _sum_optional(rows: list[RuntimeUsageRecord], field: str) -> int | None:
+        values = [getattr(row, field) for row in rows]
+        if not any(value is not None for value in values):
+            return None
+        return sum(value for value in values if value is not None)
 
 
 class TenantAccountingService:
@@ -670,7 +1106,11 @@ __all__ = [
     "McpPreflightContext",
     "MCP_POINTS_COST",
     "QuotaExceededError",
+    "RuntimeUsageError",
+    "RuntimeUsageService",
     "TenantAccountingError",
     "TenantAccountingService",
     "TenantWalletInsufficientError",
+    "UsageAggregate",
+    "UsageReconciliation",
 ]

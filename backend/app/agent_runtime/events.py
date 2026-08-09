@@ -17,6 +17,7 @@ broker 只承担"有新事件"的唤醒信号。
 """
 
 import asyncio
+import logging
 from collections import defaultdict
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
@@ -36,6 +37,9 @@ from app.agent_runtime.state import (
     RunStatus,
 )
 from app.core.redaction import redact_for_log
+
+
+logger = logging.getLogger(__name__)
 
 
 class AgentEventType(StrEnum):
@@ -297,6 +301,7 @@ class AgentEventStream:
             if before_commit is not None:
                 await before_commit(run)
             await self.db.commit()
+            await self._reconcile_terminal(run.id)
             return None
         current = RunStatus(run.status)
         if current in TERMINAL_RUN_STATUSES:
@@ -313,7 +318,36 @@ class AgentEventStream:
             await before_commit(run)
         await self.db.commit()
         await self.broker.publish(event)
+        await self._reconcile_terminal(run.id)
         return event
+
+    async def _reconcile_terminal(self, run_id: str) -> None:
+        """Run the read-only usage/ledger audit for every runtime backend.
+
+        The event stream is the shared terminal boundary for current, Pi and
+        historical POC runs.  Reconciliation is deliberately best-effort and
+        never reopens or mutates a terminal Run when a legacy fixture has no
+        tenant ledger yet.
+        """
+
+        try:
+            from app.pi_gateway.accounting import RuntimeUsageService
+
+            result = await RuntimeUsageService(self.db).reconcile_run(run_id)
+            if result.reconciliation_status == "mismatch":
+                logger.warning(
+                    "runtime usage reconciliation mismatch run=%s codes=%s",
+                    run_id,
+                    ",".join(result.mismatch_codes) or "unknown",
+                )
+        except Exception as exc:
+            code = getattr(exc, "code", None)
+            logger.warning(
+                "runtime usage reconciliation unavailable run=%s code=%s",
+                run_id,
+                code if isinstance(code, str) else "runtime_usage_reconciliation_failed",
+            )
+            return
 
     async def _lock_run_for_update(self, run_id: str) -> AgentRun:
         """持锁读 Run 行并刷新 identity map（populate_existing）。

@@ -91,3 +91,40 @@ def test_catalog_and_secret_envelope_are_bounded_and_strict() -> None:
                 "internal_tools": [],
             }
         )
+
+
+def test_usage_event_is_a_bounded_internal_projection() -> None:
+    event = PiGatewaySourceEvent.model_validate(
+        {
+            "source_event_id": "attempt-usage:1",
+            "sequence": 1,
+            "event_type": "usage",
+            "payload": {
+                "input_tokens": 12,
+                "output_tokens": 3,
+                "request_id": "provider-request",
+                "provider": "fake-provider",
+                "model": "fake-model",
+            },
+        }
+    )
+    assert event.payload["upstream_request_id"] == "provider-request"
+    assert event.payload["usage_status"] == "available"
+    with pytest.raises(ValidationError):
+        PiGatewaySourceEvent.model_validate(
+            {
+                "source_event_id": "attempt-usage:2",
+                "sequence": 2,
+                "event_type": "usage",
+                "payload": {"input_tokens": -1},
+            }
+        )
+    with pytest.raises(ValidationError):
+        PiGatewaySourceEvent.model_validate(
+            {
+                "source_event_id": "attempt-usage:3",
+                "sequence": 3,
+                "event_type": "usage",
+                "payload": {"input_tokens": 1, "raw_response": "secret"},
+            }
+        )

@@ -669,15 +669,15 @@ TenantAccountingService.fail_mcp_call(
   与账本 reserved 对齐、usage event 不重复；发现差异只报警和标记 `reconciliation_status=mismatch`，不
   自动改账。
 
-- [ ] **Step 1：红灯。** 覆盖 usage 重复事件、缺 usage、跨 Attempt、价格版本切换、MCP ledger mismatch、
+- [x] **Step 1：红灯。** 覆盖 usage 重复事件、缺 usage、跨 Attempt、价格版本切换、MCP ledger mismatch、
   unknown reserved 和跨租户汇总污染。
-- [ ] **Step 2：最小实现。** Node 只投影 Pi SDK 实际 usage；FastAPI 根据 snapshot 定价并持久化，
+- [x] **Step 2：最小实现。** Node 只投影 Pi SDK 实际 usage；FastAPI 根据 snapshot 定价并持久化，
   Gateway 不计算货币。
-- [ ] **Step 3：汇总。** 提供 tenant/user/run/day 查询服务，所有管理查询用整数 micros 累加，展示层再
+- [x] **Step 3：汇总。** 提供 tenant/user/run/day 查询服务，所有管理查询用整数 micros 累加，展示层再
   格式化；不使用 float 累计。
-- [ ] **Step 4：绿灯与回归。** 聚焦、billing 全量、pi-gateway Node 全量、Ruff/typecheck/build。
-- [ ] **Step 5：审查。** 同一 provider request 不可生成多条计费记录；usage 不进入用户 SSE/Prompt。
-- [ ] **Step 6：Commit。** `feat: record and reconcile pi runtime usage`。
+- [x] **Step 4：绿灯与回归。** 聚焦、billing 全量、pi-gateway Node 全量、Ruff/typecheck/build。
+- [x] **Step 5：审查。** 同一 provider request 不可生成多条计费记录；usage 不进入用户 SSE/Prompt。
+- [x] **Step 6：Commit。** `feat: record and reconcile pi runtime usage`。
 
 ---
 
