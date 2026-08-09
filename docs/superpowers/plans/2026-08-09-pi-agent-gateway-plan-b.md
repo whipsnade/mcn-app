@@ -794,18 +794,18 @@ TenantAccountingService.fail_mcp_call(
 - Run Diagnostics 仅呈现安全字段和事件时间线，unknown/reserved 有醒目标记；不得渲染 raw JSON 的
   未审计字段，不提供重放/改状态按钮。
 
-- [ ] **Step 1：API/类型红灯。** 用 compile-time fixture 与 MSW/fetch mock 覆盖所有 response/input、
+- [x] **Step 1：API/类型红灯。** 用 compile-time fixture 与 MSW/fetch mock 覆盖所有 response/input、
   Idempotency-Key、分页和错误码。
-- [ ] **Step 2：页面红灯。** 覆盖六模块导航、loading/empty/error、权限、确认、write-only secret、
+- [x] **Step 2：页面红灯。** 覆盖六模块导航、loading/empty/error、权限、确认、write-only secret、
   draining、unknown 诊断与窄屏；先运行定向 Vitest 确认失败。
-- [ ] **Step 3：最小实现。** 拆分 AdminPanel，保留现有用户管理行为和测试；图表仅用于 usage 时间序列，
+- [x] **Step 3：最小实现。** 拆分 AdminPanel，保留现有用户管理行为和测试；图表仅用于 usage 时间序列，
   其余使用表格/状态标签。
-- [ ] **Step 4：可访问性。** 对话框 focus trap、label、键盘关闭、状态色配文本、表格标题和移动端滚动
+- [x] **Step 4：可访问性。** 对话框 focus trap、label、键盘关闭、状态色配文本、表格标题和移动端滚动
   都有测试。
-- [ ] **Step 5：绿灯。** 定向 Vitest、`npm run test`、`npm run lint`、`npm run build`。
-- [ ] **Step 6：审查。** 浏览器 storage/network fixture 不出现 runtime secret、lease、HMAC 或其他租户
+- [x] **Step 5：绿灯。** 定向 Vitest、`npm run test`、`npm run lint`、`npm run build`。
+- [x] **Step 6：审查。** 浏览器 storage/network fixture 不出现 runtime secret、lease、HMAC 或其他租户
   的数据；Critical/Important=0。
-- [ ] **Step 7：Commit。** `feat: add pi gateway administration console`。
+- [x] **Step 7：Commit。** `feat: add pi gateway administration console`。
 
 ---
 
