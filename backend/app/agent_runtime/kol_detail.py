@@ -89,6 +89,9 @@ from app.agent_runtime.repository import AgentRunRepository, utc_now
 from app.agent_runtime.state import InvalidRunTransition, RunStatus
 from app.model.contracts import ChatMessage
 from app.licensing.service import LicenseService
+from app.runtime_config.crypto import RuntimeConfigError
+from app.runtime_config.schemas import RuntimeConfigSnapshot
+from app.runtime_config.service import RuntimeConfigService
 from app.tenancy.service import TenantService
 
 logger = logging.getLogger(__name__)
@@ -422,6 +425,12 @@ class KolDetailRunService:
             )
             if not license_decision.allowed:
                 raise PermissionError(license_decision.code)
+            try:
+                runtime_snapshot = await RuntimeConfigService(self.db).snapshot_for_new_run(
+                    tenant_context.tenant_id
+                )
+            except RuntimeConfigError as error:
+                raise PermissionError(str(error)) from error
 
             claim = await self._claim_working_head(
                 user_id,
@@ -432,6 +441,7 @@ class KolDetailRunService:
                 selection_artifact_id=selection_artifact_id,
                 selection_version=selection_version,
                 selection_version_id=selection_ref.id if selection_ref is not None else None,
+                runtime_snapshot=runtime_snapshot,
             )
             if claim.lost_race:
                 continue
@@ -641,6 +651,7 @@ class KolDetailRunService:
         selection_artifact_id: str | None,
         selection_version: str | None,
         selection_version_id: str | None = None,
+        runtime_snapshot: RuntimeConfigSnapshot,
     ) -> _ClaimResult:
         """协调事务（G3）：建立/认领 kol-detail 的 working head 并**立即提交**。
 
@@ -720,6 +731,10 @@ class KolDetailRunService:
             profile_name="kol_detail_v1",
             profile_version="v1",
             model=self._model,
+            runtime_backend=runtime_snapshot.runtime_backend,
+            runtime_config_version_id=runtime_snapshot.config_version_id,
+            runtime_config_snapshot_json=runtime_snapshot.model_dump(mode="json"),
+            queued_at=now,
             prompt_snapshot_json=build_kol_detail_prompt_snapshot(
                 platform=platform,
                 kol_uid=kol_uid,

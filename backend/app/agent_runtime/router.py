@@ -58,6 +58,8 @@ from app.core.config import get_settings
 from app.db.session import get_db
 from app.identity.dependencies import CurrentUser
 from app.licensing.service import LicenseService
+from app.runtime_config.crypto import RuntimeConfigError
+from app.runtime_config.service import RuntimeConfigService
 from app.tenancy.service import TenantService
 
 router = APIRouter()
@@ -763,6 +765,12 @@ async def append_message(
     )
     if not license_decision.allowed:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=license_decision.code)
+    try:
+        runtime_snapshot = await RuntimeConfigService(db).snapshot_for_new_run(
+            tenant_context.tenant_id
+        )
+    except RuntimeConfigError as error:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
 
     # 引用校验（建 Run 前）：父 Run 必须属本用户同 Session；Artifact Version
     # 必须属本用户且已发布（跨 Session 可复用）；上传必须属本用户同 Session
@@ -824,6 +832,10 @@ async def append_message(
         profile_name=SESSION_ANALYST_PROFILE,
         profile_version="v1",
         model=get_settings().tencent_plan_model,
+        runtime_backend=runtime_snapshot.runtime_backend,
+        runtime_config_version_id=runtime_snapshot.config_version_id,
+        runtime_config_snapshot_json=runtime_snapshot.model_dump(mode="json"),
+        queued_at=now,
         status="queued",
         decision_count=0,
         review_count=0,
@@ -932,6 +944,10 @@ async def resume_run(
     executor: Annotated[AgentRunExecutor, Depends(get_agent_executor)],
 ) -> AgentRunRead:
     run = await _get_owned_run(db, user.id, run_id)
+    try:
+        await RuntimeConfigService(db).snapshot_for_existing_run(run)
+    except RuntimeConfigError as error:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
     # 单活动主 Run 约束（§5.5）：锁 Session 行后检查同 Session 是否已有其他
     # 活动 session_analyst_v1 Run（queued/running/reviewing），存在则 409——
     # 与 messages 并发车道同一语义，防止 paused resume 绕过限制造成双主 Run。
@@ -1004,6 +1020,10 @@ async def retry_run(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail=license_decision.code
         )
+    try:
+        runtime_snapshot = await RuntimeConfigService(db).snapshot_for_existing_run(run)
+    except RuntimeConfigError as error:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
     # 单活动主 Run 约束：与 messages/resume 同一车道语义，锁 Session 行后检查。
     await _get_owned_session(db, user.id, run.session_id, for_update=True)
     active = await db.scalar(
@@ -1133,6 +1153,10 @@ async def retry_run(
         profile_name=run.profile_name,
         profile_version=run.profile_version,
         model=get_settings().tencent_plan_model,
+        runtime_backend=runtime_snapshot.runtime_backend,
+        runtime_config_version_id=runtime_snapshot.config_version_id,
+        runtime_config_snapshot_json=runtime_snapshot.model_dump(mode="json"),
+        queued_at=utc_now(),
         status="queued",
         decision_count=0,
         review_count=0,

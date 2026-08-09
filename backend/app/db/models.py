@@ -47,6 +47,7 @@ from app.reporting.models import (
     TaskCandidatePoolItem,
     UserKolFavorite,
 )
+from app.runtime_config.models import EncryptedRuntimeSecret, RuntimeConfigVersion
 from app.selection.models import KolSelectionItem, KolSelectionSet, SessionKolSelection
 from app.tenancy.models import Tenant, TenantMembership
 from app.tasks.models import AnalysisTask, TaskEvent
@@ -92,6 +93,8 @@ __all__ = [
     "ModelPromptLog",
     "ModelRun",
     "QuickMcpCall",
+    "EncryptedRuntimeSecret",
+    "RuntimeConfigVersion",
     "SessionKolSelection",
     "TaskArtifact",
     "TaskCandidate",

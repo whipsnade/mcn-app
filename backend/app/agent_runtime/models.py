@@ -79,7 +79,14 @@ class AgentRun(Base):
         CheckConstraint("run_kind IN ('user','internal')", name="ck_agent_runs_kind"),
         CheckConstraint("visibility IN ('user','internal')", name="ck_agent_runs_visibility"),
         Index("ix_agent_runs_status_lease", "status", "lease_expires_at"),
-        Index("ix_agent_runs_tenant_status_created", "tenant_id", "status", "created_at", "id"),
+        Index(
+            "ix_agent_runs_tenant_backend_status_queue",
+            "tenant_id",
+            "runtime_backend",
+            "status",
+            "queued_at",
+            "id",
+        ),
     )
 
     id: Mapped[str] = mapped_column(
@@ -95,6 +102,12 @@ class AgentRun(Base):
     tenant_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("tenants.id", ondelete="RESTRICT"), nullable=False
     )
+    runtime_backend: Mapped[str] = mapped_column(String(16), nullable=False, default="current")
+    runtime_config_version_id: Mapped[str] = mapped_column(
+        String(64), ForeignKey("runtime_config_versions.id", ondelete="RESTRICT"), nullable=False
+    )
+    runtime_config_snapshot_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    queued_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=_utc_now)
     input_message_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("agent_messages.id", use_alter=True), nullable=True
     )

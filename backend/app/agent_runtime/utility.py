@@ -41,6 +41,7 @@ from app.agent_runtime.profiles import get_profile
 from app.agent_runtime.repository import AgentRunRepository, utc_now
 from app.licensing.service import LicenseService
 from app.model.contracts import ChatMessage
+from app.runtime_config.service import RuntimeConfigService
 from app.tenancy.service import TenantService
 
 logger = logging.getLogger(__name__)
@@ -245,6 +246,11 @@ class UtilityRunner:
         )
         if not license_decision.allowed:
             raise PermissionError(license_decision.code)
+        runtime_service = RuntimeConfigService(self._db)
+        if parent_run is None:
+            runtime_snapshot = await runtime_service.snapshot_for_new_run(tenant_id)
+        else:
+            runtime_snapshot = await runtime_service.snapshot_for_existing_run(parent_run)
         internal_run = AgentRun(
             id=str(uuid4()),
             session_id=session_id,
@@ -256,6 +262,10 @@ class UtilityRunner:
             profile_name=self._profile.full_name,
             profile_version=self._profile.version,
             model=parent_run.model if parent_run is not None else self._model,
+            runtime_backend=runtime_snapshot.runtime_backend,
+            runtime_config_version_id=runtime_snapshot.config_version_id,
+            runtime_config_snapshot_json=runtime_snapshot.model_dump(mode="json"),
+            queued_at=utc_now(),
             prompt_snapshot_json=None,
             status="queued",
             decision_count=0,

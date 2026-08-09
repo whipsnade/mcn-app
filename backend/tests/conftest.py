@@ -28,6 +28,8 @@ from app.identity.models import User  # noqa: E402
 from app.main import create_app  # noqa: E402
 from app.agent_runtime.models import AgentRun, AgentSession  # noqa: E402
 from app.licensing.models import TenantLicense  # noqa: E402
+from app.runtime_config.models import RuntimeConfigVersion  # noqa: E402
+from app.runtime_config.service import LEGACY_RUNTIME_CONFIG_ID  # noqa: E402
 from app.tenancy.models import Tenant, TenantMembership  # noqa: E402
 from app.tenancy.service import TenantService  # noqa: E402
 
@@ -43,7 +45,17 @@ def _fill_legacy_test_tenant(session: Session, _flush_context, _instances) -> No
     历史纯单元 fixture 重写业务语义。带真实 tenant_id 的对象完全不改写。
     """
     pending = [item for item in session.new if isinstance(item, (AgentSession, AgentRun))]
-    if not any(getattr(item, "tenant_id", None) is None for item in pending):
+    needs_runtime_defaults = any(
+        isinstance(item, AgentRun)
+        and (
+            item.runtime_backend is None
+            or item.runtime_config_version_id is None
+            or item.runtime_config_snapshot_json is None
+            or item.queued_at is None
+        )
+        for item in pending
+    )
+    if not any(getattr(item, "tenant_id", None) is None for item in pending) and not needs_runtime_defaults:
         return
     tenant_by_user: dict[str, str] = {}
     pending_memberships = {
@@ -145,6 +157,53 @@ def _fill_legacy_test_tenant(session: Session, _flush_context, _instances) -> No
                 if parent_session is not None and parent_session.tenant_id is not None
                 else tenant_by_user[item.user_id]
             )
+
+    if needs_runtime_defaults:
+        with session.no_autoflush:
+            legacy_config = session.get(RuntimeConfigVersion, LEGACY_RUNTIME_CONFIG_ID)
+        if legacy_config is None:
+            now = datetime.now(UTC).replace(tzinfo=None)
+            session.connection().execute(
+                insert(RuntimeConfigVersion).values(
+                    id=LEGACY_RUNTIME_CONFIG_ID,
+                    scope="system",
+                    tenant_id=None,
+                    version=1,
+                    status="active",
+                    runtime_backend="current",
+                    runtime_contract_version="marketing_runtime_v1",
+                    config_json={
+                        "config_version_id": LEGACY_RUNTIME_CONFIG_ID,
+                        "runtime_contract_version": "marketing_runtime_v1",
+                        "runtime_backend": "current",
+                        "model": {"name": "legacy-test", "masked_origin": "test"},
+                        "datatap": {"service": "test", "schema_digest": "test"},
+                        "capability_pack": {"runtime_contract_version": "marketing_runtime_v1"},
+                        "limits": {"max_decisions": 50},
+                        "billing": {"mcp_call_points": 10},
+                    },
+                    secret_refs_json=[],
+                    created_by=None,
+                    created_at=now,
+                    activated_at=now,
+                )
+            )
+        for item in pending:
+            if not isinstance(item, AgentRun):
+                continue
+            item.runtime_backend = item.runtime_backend or "current"
+            item.runtime_config_version_id = item.runtime_config_version_id or LEGACY_RUNTIME_CONFIG_ID
+            item.runtime_config_snapshot_json = item.runtime_config_snapshot_json or {
+                "config_version_id": LEGACY_RUNTIME_CONFIG_ID,
+                "runtime_contract_version": "marketing_runtime_v1",
+                "runtime_backend": "current",
+                "model": {"name": "legacy-test", "masked_origin": "test"},
+                "datatap": {"service": "test", "schema_digest": "test"},
+                "capability_pack": {"runtime_contract_version": "marketing_runtime_v1"},
+                "limits": {"max_decisions": 50},
+                "billing": {"mcp_call_points": 10},
+            }
+            item.queued_at = item.queued_at or item.created_at or datetime.now(UTC).replace(tzinfo=None)
 
 
 @pytest_asyncio.fixture

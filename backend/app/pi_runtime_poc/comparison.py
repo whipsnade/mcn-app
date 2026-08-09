@@ -43,6 +43,8 @@ from app.mcp_gateway.contracts import DataTapService
 from app.pi_runtime_poc.gate import HARD_CHECKS, Summary, evaluate_case, finalize_execution
 from app.pi_runtime_poc.rpc import PiRpcClient, PiRpcConfig
 from app.pi_runtime_poc.runner import PiClientFactory, PiPocRunner
+from app.runtime_config.crypto import RuntimeConfigError
+from app.runtime_config.service import RuntimeConfigService
 
 RuntimeName = Literal["pi"]
 CaseExecutionStatus = Literal["completed", "failed", "skipped_dependency", "not_run"]
@@ -159,6 +161,10 @@ class PocCaseFactory:
                 prior = await db.get(AgentRun, prior_run_id)
                 if prior is None:
                     raise ValueError("poc_dependency_run_not_found")
+                try:
+                    runtime_snapshot = await RuntimeConfigService(db).snapshot_for_existing_run(prior)
+                except RuntimeConfigError as error:
+                    raise ValueError(str(error)) from error
                 prior_snapshot = (prior.prompt_snapshot_json or {}).get("pi_runtime_poc")
                 if (
                     not isinstance(prior_snapshot, dict)
@@ -197,6 +203,7 @@ class PocCaseFactory:
                     "artifact_version_ids": list(version_ids),
                 }
             else:
+                runtime_snapshot = RuntimeConfigService.poc_snapshot()
                 user = User(
                     id=str(uuid4()),
                     nickname="pi-poc-pi",
@@ -252,6 +259,10 @@ class PocCaseFactory:
                 profile_name=SESSION_ANALYST_PROFILE,
                 profile_version="v1",
                 model=self._model_name,
+                runtime_backend=runtime_snapshot.runtime_backend,
+                runtime_config_version_id=runtime_snapshot.config_version_id,
+                runtime_config_snapshot_json=runtime_snapshot.model_dump(mode="json"),
+                queued_at=now,
                 status="queued",
                 prompt_snapshot_json={
                     "marketing_capability_pack": build_marketing_run_capability(

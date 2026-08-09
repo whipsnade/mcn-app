@@ -53,6 +53,9 @@ from app.agent_runtime.models import AgentRun
 from app.agent_runtime.profiles import get_profile
 from app.agent_runtime.repository import AgentRunRepository
 from app.model.contracts import ChatMessage, ModelPlanInvalidError
+from app.runtime_config.crypto import RuntimeConfigError
+from app.runtime_config.schemas import RuntimeConfigSnapshot
+from app.runtime_config.service import RuntimeConfigService
 
 # 单个 Item 最多三次 Reviewer 调用（§12.3：最多两次 revise）。
 MAX_REVIEW_ATTEMPTS = 3
@@ -306,7 +309,15 @@ class ReviewerDriver:
             )
 
         # 创建独立 internal 子 Run（自己的 Attempt / Step / token 审计）。
-        review_run = self._new_review_run(parent_run, now)
+        try:
+            runtime_snapshot = await RuntimeConfigService(self.db).snapshot_for_existing_run(
+                parent_run
+            )
+        except RuntimeConfigError:
+            # Runtime snapshot tampering/missing configuration is a stable
+            # fail-closed reviewer failure; do not create a child Run.
+            raise
+        review_run = self._new_review_run(parent_run, now, runtime_snapshot)
         self.db.add(review_run)
         await self.db.flush()
         review_attempt = await self._repo.begin_attempt(review_run.id)
@@ -454,7 +465,12 @@ class ReviewerDriver:
 
     # -- 内部工具 -----------------------------------------------------------------
 
-    def _new_review_run(self, parent_run: AgentRun, now: datetime) -> AgentRun:
+    def _new_review_run(
+        self,
+        parent_run: AgentRun,
+        now: datetime,
+        runtime_snapshot: RuntimeConfigSnapshot,
+    ) -> AgentRun:
         return AgentRun(
             id=str(uuid4()),
             session_id=parent_run.session_id,
@@ -466,6 +482,10 @@ class ReviewerDriver:
             profile_name=get_profile("artifact_reviewer_v1").full_name,
             profile_version=get_profile("artifact_reviewer_v1").version,
             model=parent_run.model,
+            runtime_backend=runtime_snapshot.runtime_backend,
+            runtime_config_version_id=runtime_snapshot.config_version_id,
+            runtime_config_snapshot_json=runtime_snapshot.model_dump(mode="json"),
+            queued_at=now,
             prompt_snapshot_json=None,
             status="queued",
             decision_count=0,

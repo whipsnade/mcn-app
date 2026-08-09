@@ -30,6 +30,9 @@ class Tenant(Base):
     active_license_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("tenant_licenses.id", ondelete="SET NULL"), nullable=True
     )
+    active_runtime_config_id: Mapped[str | None] = mapped_column(
+        String(64), ForeignKey("runtime_config_versions.id", ondelete="SET NULL"), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 

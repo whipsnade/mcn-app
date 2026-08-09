@@ -47,6 +47,10 @@ class Settings(BaseSettings):
     # 默认值 240s 须保持小于租约时长，使单次尝试在租约周期内必然收口。
     model_decision_timeout_seconds: float = Field(default=240.0, gt=0)
     datatap_mcp_token: SecretStr
+    # 版本化 Runtime 配置的 AES-256-GCM master key ring；生产必须显式配置，
+    # development/test 不提供时由使用方自行注入测试 cipher。
+    runtime_secret_master_keys: SecretStr = SecretStr("")
+    runtime_secret_active_key_version: str = "v1"
     # 方案 A Pi Extension 只能连接一个经显式配置的 DataTap MCP endpoint；不从
     # 宿主环境隐式继承或由代码猜测服务类型。
     datatap_mcp_url: AnyHttpUrl | None = None

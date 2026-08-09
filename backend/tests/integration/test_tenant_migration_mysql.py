@@ -8,11 +8,11 @@ from sqlalchemy import inspect, text
 from app.db.session import engine
 
 
-def test_tenant_control_plane_is_next_migration() -> None:
+def test_runtime_config_is_current_migration_head() -> None:
     backend_dir = Path(__file__).resolve().parents[2]
     config = Config(str(backend_dir / "alembic.ini"))
     config.set_main_option("script_location", str(backend_dir / "migrations"))
-    assert ScriptDirectory.from_config(config).get_heads() == ["0037_tenant_control_plane"]
+    assert ScriptDirectory.from_config(config).get_heads() == ["0038_runtime_config_secrets"]
 
 
 @pytest.mark.asyncio
@@ -55,3 +55,41 @@ async def test_tenant_migration_backfills_distinct_legacy_rows_and_non_null_run_
     assert counts["users"] == counts["memberships"] == counts["licenses"]
     assert counts["tenants"] == counts["users"]
     assert run_session_mismatches == 0
+
+
+@pytest.mark.asyncio
+async def test_runtime_config_migration_backfills_immutable_run_snapshot_columns() -> None:
+    async with engine.connect() as connection:
+        run_columns = await connection.run_sync(
+            lambda sync: {
+                row["name"]: row["nullable"]
+                for row in inspect(sync).get_columns("agent_runs")
+                if row["name"]
+                in {
+                    "runtime_backend",
+                    "runtime_config_version_id",
+                    "runtime_config_snapshot_json",
+                    "queued_at",
+                }
+            }
+        )
+        config_count = await connection.scalar(
+            text(
+                "SELECT COUNT(*) FROM runtime_config_versions "
+                "WHERE id IN ('legacy-env-v1', 'poc-isolated-v1')"
+            )
+        )
+        legacy_runs = await connection.scalar(
+            text(
+                "SELECT COUNT(*) FROM agent_runs "
+                "WHERE runtime_config_version_id='legacy-env-v1'"
+            )
+        )
+    assert run_columns == {
+        "runtime_backend": False,
+        "runtime_config_version_id": False,
+        "runtime_config_snapshot_json": False,
+        "queued_at": False,
+    }
+    assert config_count == 2
+    assert legacy_runs is not None

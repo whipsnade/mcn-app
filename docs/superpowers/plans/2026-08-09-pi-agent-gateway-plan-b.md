@@ -334,18 +334,18 @@ RuntimeConfigService.resolve_secret_bundle(config_version_id: str, run_id: str) 
   version 并重新生成标明 parent 的不可变 snapshot；无父 Run 的内部任务按当前租户 active config 创建。
   POC 继续固定 `runtime_backend=pi` 与 POC 隔离 snapshot，不能读取生产 secret bundle。
 
-- [ ] **Step 1：红灯。** 覆盖密文随机 nonce、AAD 跨租户失败、key rotation 旧读新写、任何 API DTO
+- [x] **Step 1：红灯。** 覆盖密文随机 nonce、AAD 跨租户失败、key rotation 旧读新写、任何 API DTO
   无明文/Authorization/token/key、active config 唯一和历史版本不可改。
-- [ ] **Step 2：Run 红灯。** 覆盖租户从 current 切 pi 后旧幂等消息仍返回 current Run、新消息才选 pi；
+- [x] **Step 2：Run 红灯。** 覆盖租户从 current 切 pi 后旧幂等消息仍返回 current Run、新消息才选 pi；
   message/retry/utility/kol detail/legacy reviewer/POC 六类创建入口都具有正确 snapshot；缺 active config/
   pack digest/runtime contract 不兼容时建 Run 整体回滚。
-- [ ] **Step 3：最小实现与迁移。** 先扩表 nullable、回填、再改 non-null；索引
+- [x] **Step 3：最小实现与迁移。** 先扩表 nullable、回填、再改 non-null；索引
   `(tenant_id,runtime_backend,status,queued_at,id)`；不得修改旧迁移。
-- [ ] **Step 4：配置日志门禁。** `repr`/Pydantic dump/异常只包含 masked value 和 fingerprint；新增
+- [x] **Step 4：配置日志门禁。** `repr`/Pydantic dump/异常只包含 masked value 和 fingerprint；新增
   secret 扫描测试直接扫描 response、Run snapshot、admin audit detail 和日志 caplog。
-- [ ] **Step 5：绿灯与回归。** runtime_config + agent router + migration 测试、Ruff、diff check。
-- [ ] **Step 6：审查。** 确认只有 `resolve_secret_bundle()` 能调用 decrypt，且普通/管理 API 无调用者。
-- [ ] **Step 7：Commit。** `feat: snapshot encrypted tenant runtime config`。
+- [x] **Step 5：绿灯与回归。** runtime_config + agent router + migration 测试、Ruff、diff check。
+- [x] **Step 6：审查。** 确认只有 `resolve_secret_bundle()` 能调用 decrypt，且普通/管理 API 无调用者。
+- [x] **Step 7：Commit。** `feat: snapshot encrypted tenant runtime config`。
 
 ---
 
