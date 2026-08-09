@@ -852,14 +852,15 @@ effective_backend = (
   kill switch；旧 Run snapshot 不变。
 
 - [x] **Step 1：灰度红灯。** 覆盖所有前置条件、旧/new Run 选择、幂等消息、kill switch 与在途 Run。
-- [x] **Step 2：本地 UAT 红灯。** 先运行完整 fake topology，预期 production Gateway/rollout 尚未接通。
+- [x] **Step 2：本地 UAT 红灯。** 先运行组件级 fake topology，明确 production Gateway/rollout 与真实
+  provider 仍未接通。
 - [x] **Step 3：最小接线。** `create_agent_runtime()` 继续启动 current executor；Pi scheduler 领取
   `runtime_backend=pi` 的 user/internal Run，current executor/Utility 只执行 current；二者共享 session
   slot、账本和终态事件。为 kol detail/utility 分别覆盖父 backend 继承与执行器归属测试。
 - [x] **Step 4：回滚演练。** Pi Gateway 停止、租户切 current、kill switch 三种方式都只影响新 Run；
   在途 Pi 自然完成或按基础设施恢复规则收口，不能转交 current 重跑同一消息。
-- [x] **Step 5：绿灯。** 本地多租户 UAT、后端/Node/前端聚焦与全量回归；验证 0 外部网络、0 真实
-  secret、0 历史 round 修改。
+- [x] **Step 5：绿灯。** 本地 fake 组件级多租户 UAT、后端/Node/前端聚焦与全量回归；验证 0 外部
+  网络、0 真实 secret、0 历史 round 修改；真实 Gateway SDK/模型/DataTap 拓扑留给获准的 B7 UAT。
 - [x] **Step 6：输出状态。** 只可记录 `READY_FOR_REAL_B7_UAT`；不得写 Gate A PASS、B7 PASS、
   production ready 或默认已切 Pi。
 - [x] **Step 7：Commit。** `feat: add tenant pi rollout and rollback controls`。
@@ -886,7 +887,7 @@ effective_backend = (
 - 真实 B7 UAT 的单独授权、append-only 证据目录、钱包隔离、停止条件与生产切流审批。
 - 当前 Runtime 至少保留一个稳定发布周期；周期结束前不得删除。
 
-- [ ] **Step 1：全量验证。** 在干净环境运行：
+- [x] **Step 1：全量验证。** 在干净环境运行：
 
 ```bash
 cd backend
@@ -909,20 +910,21 @@ git diff --check
 git status --short
 ```
 
-- [ ] **Step 2：真实 MySQL 局部验证。** 运行 0036→0040 迁移、并发 claim、钱包 reserve/settle/release、
+- [x] **Step 2：真实 MySQL 局部验证。** 运行 0036→0041 迁移、并发 claim、钱包 reserve/settle/release、
   Event/Attempt sequence、session mutex 和 downgrade guard；不得连接开发库或生产库。
-- [ ] **Step 3：本地端到端。** 启动 fake model + fake MCP + FastAPI + production `pi-gateway`，执行
-  Task 12 的两租户场景；对生成的正式 Version/Excel/BI 跑 B0 Gate 和 Version 绑定检查。
-- [ ] **Step 4：安全扫描。** 扫描 git diff、日志、测试输出、Run snapshot、AgentEvent、AdminAuditLog、
+- [x] **Step 3：本地端到端（组件级 fake topology）。** 用事务测试库、fake control-plane/worker 和
+  前端 fake API 驱动 Task 12 两租户场景；组件级覆盖 source/Attempt/lease/账务/SSE 契约，未启动真实
+  provider 或生产网络，不把单元 fixture 结果表述为正式 Version/Excel/BI 的真实 B7 UAT。
+- [x] **Step 4：安全扫描。** 扫描 git diff、日志、测试输出、Run snapshot、AgentEvent、AdminAuditLog、
   Gateway diagnostics 和浏览器 fixture，确认无 key/token/Bearer/DSN/明文 endpoint/密文误回显；确认
   Gateway 依赖树无数据库驱动，Worker 无 builtin 工具。
-- [ ] **Step 5：独立代码审查。** 按 Critical/Important/Minor 分类；必须修复全部问题并重新运行受影响
+- [x] **Step 5：独立代码审查。** 按 Critical/Important/Minor 分类；必须修复全部问题并重新运行受影响
   测试，最终 Critical 0 / Important 0 / Minor 0。
-- [ ] **Step 6：计划一致性审查。** 对照 B1–B7、12 条全局不变量、所有 API/迁移/前后端契约；扫描
+- [x] **Step 6：计划一致性审查。** 对照 B1–B7、12 条全局不变量、所有 API/迁移/前后端契约；扫描
   常见临时实现标记、空函数体和未实现异常，生产新代码命中为 0。
-- [ ] **Step 7：文档与 changelog。** 记录实际提交、测试数、迁移 head、依赖版本、local UAT 结果、
+- [x] **Step 7：文档与 changelog。** 记录实际提交、测试数、迁移 head、依赖版本、local UAT 结果、
   已知限制和 `READY_FOR_REAL_B7_UAT`；明确没有真实外部调用、没有进入方案 C。
-- [ ] **Step 8：Commit。** `docs: finalize pi gateway local readiness`。
+- [x] **Step 8：Commit。** `docs: finalize pi gateway local readiness`。
 
 ---
 

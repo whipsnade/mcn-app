@@ -125,7 +125,7 @@ cd backend
 - `AUTH_MODE=mock` 只允许用于 `development` 和 `test`。后端在 `production` 环境检测到 mock 认证会拒绝启动。
 - 测试账户只能访问独立测试库，禁止赋予生产或开发库权限。
 - 普通用户的会话、消息、Run、Evidence、Artifact 和达人缓存查询必须始终带当前认证用户条件。
-- 运行、恢复、回滚与真实供应商授权步骤见 [第二阶段运行手册](docs/runbooks/phase-2-runtime.md)；一次性切换清单与发布阻断条件见 [Agent Runtime v3 切换清单](docs/runbooks/agent-runtime-v3-cutover.md)。
+- 运行、恢复、回滚与真实供应商授权步骤见 [第二阶段运行手册](docs/runbooks/phase-2-runtime.md)；Pi Gateway 的租户灰度、kill switch、账务/lease 诊断与真实 UAT 停止门见 [Pi Agent Gateway 运维手册](docs/runbooks/pi-agent-gateway.md)；一次性切换清单与发布阻断条件见 [Agent Runtime v3 切换清单](docs/runbooks/agent-runtime-v3-cutover.md)。
 
 ## 项目目录
 
