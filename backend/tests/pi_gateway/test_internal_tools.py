@@ -45,8 +45,11 @@ async def test_terminal_settles_with_gateway_worker_and_releases_session_slot(mo
     attempt = SimpleNamespace(id="attempt-1", run_id="run-1", outcome="running", ended_at=None)
     session = SimpleNamespace(id="session-1", active_run_id="run-1")
 
-    async def leased(*_args, **_kwargs):
-        return "gw-1", run
+    async def authenticate(*_args, **_kwargs):
+        return "gw-1"
+
+    async def leased_run(*_args, **_kwargs):
+        return run
 
     class FakeStream:
         def __init__(self, *_args, **_kwargs):
@@ -65,15 +68,30 @@ async def test_terminal_settles_with_gateway_worker_and_releases_session_slot(mo
 
         async def scalar(self, _statement):
             self.calls += 1
-            return attempt if self.calls == 1 else session
+            return {1: "session-1", 2: session, 3: attempt}[self.calls]
 
         async def commit(self):
             return None
 
-    monkeypatch.setattr(gateway_router, "_leased", leased)
+    monkeypatch.setattr(gateway_router, "_authenticate", authenticate)
+    monkeypatch.setattr(
+        gateway_router,
+        "_service",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            leased_run=leased_run,
+            scheduler=SimpleNamespace(release_run=lambda *_args, **_kwargs: _noop()),
+            now_fn=lambda: object(),
+        ),
+    )
     monkeypatch.setattr(gateway_router, "AgentEventStream", FakeStream)
     db = FakeDb()
-    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(agent_event_broker=object())))
+    async def body() -> bytes:
+        return b"{}"
+
+    request = SimpleNamespace(
+        body=body,
+        app=SimpleNamespace(state=SimpleNamespace(agent_event_broker=object())),
+    )
     result = await gateway_router.terminal(
         "run-1",
         request,
@@ -85,3 +103,7 @@ async def test_terminal_settles_with_gateway_worker_and_releases_session_slot(mo
     assert attempt.outcome == "completed"
     assert session.active_run_id is None
     assert run.gateway_id is None and run.lease_owner is None
+
+
+async def _noop() -> None:
+    return None

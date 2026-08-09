@@ -1,10 +1,10 @@
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agent_runtime.models import AgentRun, AgentRunAttempt
+from app.agent_runtime.models import AgentRun, AgentRunAttempt, AgentSession
 from app.agent_runtime.state import (
     TERMINAL_RUN_STATUSES,
     InvalidRunTransition,
@@ -48,6 +48,19 @@ class AgentRunRepository:
         新 Attempt 的 ``started_at`` / ``decision_count`` 从零开始；
         ``run.decision_count`` 与 ``run.started_at`` 保留累计审计值。
         """
+        session_id = await self.db.scalar(
+            select(AgentRun.session_id).where(AgentRun.id == run_id)
+        )
+        if session_id is None:
+            raise LookupError("run_not_found")
+        session = await self.db.scalar(
+            select(AgentSession)
+            .where(AgentSession.id == session_id)
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
+        if session is None:
+            raise LookupError("session_not_found")
         run = await self.lock_run(run_id)
         if run.cancel_requested:
             # 已请求取消的 Run 不得再启动/恢复 Attempt，避免卡在 running + open attempt。
@@ -78,6 +91,10 @@ class AgentRunRepository:
         run.status = RunStatus.RUNNING
         run.started_at = run.started_at or now
         run.paused_at = None
+        # 只有用户可见的主 Run 占用 Session 互斥槽。utility/reviewer 等内部
+        # 子 Run 与父 Run 共用 Session，不能覆盖主 Run 的 active_run_id。
+        if run.run_kind == "user" and run.visibility == "user":
+            await self._set_session_slot(run.session_id, run.id)
         await self.db.flush()
         return attempt
 
@@ -172,6 +189,7 @@ class AgentRunRepository:
         run.lease_owner = None
         run.lease_expires_at = None
         await self._end_open_attempt(run_id, "failed", now)
+        await self._clear_session_slot(run.session_id, run.id)
         await self.db.flush()
         return True
 
@@ -187,6 +205,7 @@ class AgentRunRepository:
         run.lease_owner = None
         run.lease_expires_at = None
         await self._end_open_attempt(run_id, "paused", now)
+        await self._clear_session_slot(run.session_id, run.id)
         await self.db.flush()
         return True
 
@@ -212,16 +231,19 @@ class AgentRunRepository:
                 else target.value
             )
             await self._end_open_attempt(run_id, attempt_outcome, now)
+            await self._clear_session_slot(run.session_id, run.id)
         elif target == RunStatus.PAUSED:
             run.paused_at = now
             run.lease_owner = None
             run.lease_expires_at = None
             await self._end_open_attempt(run_id, "paused", now)
+            await self._clear_session_slot(run.session_id, run.id)
         elif target == RunStatus.CLARIFICATION_REQUESTED:
             # 本 Run 以 clarification 结果完成等待用户，Attempt 以 completed 收尾。
             run.lease_owner = None
             run.lease_expires_at = None
             await self._end_open_attempt(run_id, "completed", now)
+            await self._clear_session_slot(run.session_id, run.id)
         elif target == RunStatus.RUNNING:
             run.started_at = run.started_at or now
             run.paused_at = None
@@ -244,6 +266,7 @@ class AgentRunRepository:
         run.lease_owner = None
         run.lease_expires_at = None
         await self._end_open_attempt(run_id, "cancelled", now)
+        await self._clear_session_slot(run.session_id, run.id)
         await self.db.flush()
         return True
 
@@ -273,6 +296,20 @@ class AgentRunRepository:
         if open_attempt is not None:
             open_attempt.ended_at = now
             open_attempt.outcome = outcome
+
+    async def _set_session_slot(self, session_id: str, run_id: str) -> None:
+        await self.db.execute(
+            update(AgentSession)
+            .where(AgentSession.id == session_id)
+            .values(active_run_id=run_id)
+        )
+
+    async def _clear_session_slot(self, session_id: str, run_id: str) -> None:
+        await self.db.execute(
+            update(AgentSession)
+            .where(AgentSession.id == session_id, AgentSession.active_run_id == run_id)
+            .values(active_run_id=None)
+        )
 
     @staticmethod
     def owns_active_lease(run: AgentRun, worker_id: str) -> bool:

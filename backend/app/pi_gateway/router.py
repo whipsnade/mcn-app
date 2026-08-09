@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError
 
 from app.agent_runtime.events import AgentEventStream
-from app.agent_runtime.models import AgentEvent, AgentRunAttempt, AgentSession
+from app.agent_runtime.models import AgentEvent, AgentRun, AgentRunAttempt, AgentSession
 from app.agent_runtime.state import InvalidRunTransition, RunStatus
 from app.db.session import get_db
 from app.core.config import get_settings
@@ -133,14 +133,19 @@ async def heartbeat(
     db: Annotated[AsyncSession, Depends(get_db)],
     x_pi_run_lease: Annotated[str | None, Header()] = None,
 ) -> dict[str, object]:
-    _gateway_id, run = await _leased(request, db, run_id, payload.attempt_id, x_pi_run_lease)
-    service = _service(db, _gateway_id)
-    now = service.now_fn()
-    run.heartbeat_at = now
-    run.gateway_lease_expires_at = now + timedelta(seconds=service.lease_seconds)
-    run.lease_expires_at = run.gateway_lease_expires_at
-    await db.commit()
-    return {"ok": True, "cancel_requested": bool(run.cancel_requested)}
+    if not x_pi_run_lease:
+        raise _auth_error()
+    gateway_id = await _authenticate(request, await request.body(), db)
+    try:
+        decision = await _service(db, gateway_id).scheduler.heartbeat(
+            run_id,
+            payload.attempt_id,
+            x_pi_run_lease,
+            gateway_id=gateway_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="pi_gateway_run_not_found") from exc
+    return {"ok": True, "cancel_requested": decision.cancel_requested}
 
 
 @router.post("/runs/{run_id}/events")
@@ -200,7 +205,28 @@ async def terminal(
     db: Annotated[AsyncSession, Depends(get_db)],
     x_pi_run_lease: Annotated[str | None, Header()] = None,
 ) -> dict[str, object]:
-    _gateway_id, run = await _leased(request, db, run_id, payload.attempt_id, x_pi_run_lease)
+    # Lock Session before the Run so terminal and message/scheduler paths share
+    # the Tenant → Session → Run → child lock order.  The run's session_id is
+    # immutable and is only used to acquire the mutex; leased_run then performs
+    # the authoritative gateway/attempt/lease validation under the Run lock.
+    if not x_pi_run_lease:
+        raise _auth_error()
+    _gateway_id = await _authenticate(request, await request.body(), db)
+    session_id = await db.scalar(select(AgentRun.session_id).where(AgentRun.id == run_id))
+    if not session_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="pi_gateway_run_not_found")
+    session = await db.scalar(
+        select(AgentSession)
+        .where(AgentSession.id == session_id)
+        .execution_options(populate_existing=True)
+        .with_for_update()
+    )
+    if session is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="pi_gateway_run_not_found")
+    try:
+        run = await _service(db, _gateway_id).leased_run(run_id, payload.attempt_id, x_pi_run_lease)
+    except PiGatewayLeaseError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="pi_gateway_run_not_found") from exc
     outcome = RunStatus(payload.outcome)
     stream = AgentEventStream(db, request.app.state.agent_event_broker)
 
@@ -213,10 +239,8 @@ async def terminal(
         if attempt is not None and attempt.outcome == "running":
             attempt.outcome = "completed" if outcome == RunStatus.COMPLETED_WITH_WARNINGS else outcome.value
             attempt.ended_at = _service(db, _gateway_id).now_fn()
-        session = await db.scalar(
-            select(AgentSession).where(AgentSession.id == locked_run.session_id).with_for_update()
-        )
-        if session is not None and session.active_run_id == locked_run.id:
+        await _service(db, _gateway_id).scheduler.release_run(locked_run)
+        if session.active_run_id == locked_run.id:
             session.active_run_id = None
         locked_run.gateway_lease_hash = None
         locked_run.gateway_lease_expires_at = None

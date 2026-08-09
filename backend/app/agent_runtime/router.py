@@ -33,7 +33,7 @@ from fastapi import (
 )
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_artifacts.models import AgentArtifact, AgentArtifactVersion
@@ -295,6 +295,36 @@ async def _get_owned_session(
     if session is None:
         raise _not_found("session_not_found")
     return session
+
+
+async def _assert_session_slot_integrity(
+    db: AsyncSession,
+    session: AgentSession,
+    *,
+    allow_run_id: str | None = None,
+) -> None:
+    """Reject unknown/terminal slots instead of silently overwriting history."""
+    if session.active_run_id is None:
+        return
+    slot_run = await db.scalar(
+        select(AgentRun)
+        .where(AgentRun.id == session.active_run_id)
+        .execution_options(populate_existing=True)
+        .with_for_update()
+    )
+    if (
+        slot_run is None
+        or slot_run.session_id != session.id
+        or slot_run.user_id != session.user_id
+        or slot_run.run_kind != "user"
+        or slot_run.visibility != "user"
+    ):
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="session_mutex_corrupt")
+    if slot_run.id == allow_run_id:
+        return
+    if slot_run.status in _ACTIVE_RUN_STATUSES:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="active_run_in_progress")
+    raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="session_mutex_corrupt")
 
 
 async def _get_owned_run(db: AsyncSession, user_id: str, run_id: str) -> AgentRun:
@@ -760,6 +790,10 @@ async def append_message(
                 reused=True,
             )
 
+    # Only a new Run must validate the historical mutex slot; a valid
+    # idempotency replay above is intentionally allowed to reuse its active Run.
+    await _assert_session_slot_integrity(db, session)
+
     license_decision = await LicenseService(db).authorize_run(
         tenant_context.tenant_id, user.id, SESSION_ANALYST_LICENSE_FEATURE
     )
@@ -857,6 +891,7 @@ async def append_message(
         run.prompt_snapshot_json = snapshot
     db.add(run)
     await db.flush()
+    session.active_run_id = run.id
     message.run_id = run.id
     # 本条消息回答了悬挂澄清：supersede 活动 pending_question，避免后续
     # 消息继续被自动挂到旧澄清 Run 下。
@@ -951,7 +986,8 @@ async def resume_run(
     # 单活动主 Run 约束（§5.5）：锁 Session 行后检查同 Session 是否已有其他
     # 活动 session_analyst_v1 Run（queued/running/reviewing），存在则 409——
     # 与 messages 并发车道同一语义，防止 paused resume 绕过限制造成双主 Run。
-    await _get_owned_session(db, user.id, run.session_id, for_update=True)
+    session = await _get_owned_session(db, user.id, run.session_id, for_update=True)
+    await _assert_session_slot_integrity(db, session, allow_run_id=run.id)
     active = await db.scalar(
         select(AgentRun.id)
         .where(
@@ -971,6 +1007,11 @@ async def resume_run(
     repo = AgentRunRepository(db)
     try:
         await repo.begin_attempt(run.id, resumed=True)
+        await db.execute(
+            update(AgentSession)
+            .where(AgentSession.id == run.session_id)
+            .values(active_run_id=run.id)
+        )
     except InvalidRunTransition as error:
         # 仅 paused 可恢复；已请求取消（cancel_requested）不得再启动 Attempt，需区分。
         if str(error) == "run_cancel_requested":
@@ -1025,7 +1066,8 @@ async def retry_run(
     except RuntimeConfigError as error:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
     # 单活动主 Run 约束：与 messages/resume 同一车道语义，锁 Session 行后检查。
-    await _get_owned_session(db, user.id, run.session_id, for_update=True)
+    session = await _get_owned_session(db, user.id, run.session_id, for_update=True)
+    await _assert_session_slot_integrity(db, session)
     active = await db.scalar(
         select(AgentRun.id)
         .where(
@@ -1164,6 +1206,12 @@ async def retry_run(
         prompt_snapshot_json=retried_snapshot,
     )
     db.add(retried)
+    await db.flush()
+    await db.execute(
+        update(AgentSession)
+        .where(AgentSession.id == run.session_id)
+        .values(active_run_id=retried.id)
+    )
     await db.commit()
     executor.submit(retried.id)
     return MessageRunResponse(

@@ -70,6 +70,37 @@ async def test_begin_attempt_creates_first_attempt_and_moves_queued_to_running(
     assert run.started_at is not None
 
 
+async def test_internal_attempt_does_not_take_over_session_slot(db_session, user_factory) -> None:
+    user_id, run_id = await _create_queued_run(db_session, user_factory)
+    parent = await db_session.get(AgentRun, run_id)
+    assert parent is not None
+    session = await db_session.get(AgentSession, parent.session_id)
+    assert session is not None
+    session.active_run_id = parent.id
+    internal = AgentRun(
+        id=str(uuid4()),
+        session_id=parent.session_id,
+        user_id=user_id,
+        tenant_id=parent.tenant_id,
+        run_kind="internal",
+        visibility="internal",
+        profile_name="utility_v1",
+        profile_version="v1",
+        model="test-model",
+        status="queued",
+        decision_count=0,
+        review_count=0,
+        revision_count=0,
+    )
+    db_session.add(internal)
+    await db_session.flush()
+
+    await AgentRunRepository(db_session).begin_attempt(internal.id)
+
+    await db_session.refresh(session)
+    assert session.active_run_id == parent.id
+
+
 async def test_begin_attempt_resumed_requires_paused_and_resets_attempt_counters(
     db_session, user_factory
 ) -> None:

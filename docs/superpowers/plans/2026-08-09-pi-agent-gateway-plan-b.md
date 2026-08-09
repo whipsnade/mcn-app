@@ -487,8 +487,14 @@ POST /api/v1/internal/pi-gateway/v1/runs/{run_id}/terminal
 - Create: `backend/app/pi_gateway/scheduler.py`
 - Modify: `backend/app/pi_gateway/{models.py,service.py,router.py}`
 - Modify: `backend/app/agent_runtime/{models.py,router.py,events.py}`
+- Create: `backend/migrations/versions/0039a_pi_session_mutex_backfill.py` (依赖 0039 的
+  `active_run_id`，对存量活动 Run 回填并对多活动 Session fail-closed)
+- Modify: `backend/app/agent_runtime/repository.py`
 - Create: `pi-gateway/src/{gateway.ts,worker-pool.ts,server.ts}`
 - Test: `backend/tests/pi_gateway/{test_scheduler.py,test_scheduler_concurrency.py,test_draining.py}`
+- Test: `backend/tests/{agent_runtime/test_repository.py,agent_runtime/test_utility_wiring.py,
+  pi_gateway/test_internal_tools.py,test_phase2_migrations.py}`
+- Modify/Test: `backend/tests/integration/test_tenant_migration_mysql.py`
 - Test: `backend/tests/integration/test_pi_gateway_mysql.py`
 - Test: `pi-gateway/tests/{gateway.test.ts,worker-pool.test.ts,shutdown.test.ts}`
 
@@ -512,17 +518,17 @@ PiRunScheduler.set_gateway_mode(gateway_id: str, mode: Literal["active", "draini
 - Gateway `desired_capacity` 下降或 mode=draining 时停止新 claim，现有 Worker 自然完成；关闭超时只
   abort 当前精确 Worker，Run 留给恢复，不直接改终态。容量上升不重启服务。
 
-- [ ] **Step 1：红灯。** 以租户 A 20 个、B 2 个、C 2 个 queued Run 验证前六次 claim 不饿死 B/C；
+- [x] **Step 1：红灯。** 以租户 A 20 个、B 2 个、C 2 个 queued Run 验证前六次 claim 不饿死 B/C；
   同租户 FIFO、优先级相同时用 `queued_at,id`；session/user/license/global limit 全覆盖。
-- [ ] **Step 2：互斥红灯。** 两个并发 `append_message` 同 Session 只能一个成功；终态与新消息竞态不
+- [x] **Step 2：互斥红灯。** 两个并发 `append_message` 同 Session 只能一个成功；终态与新消息竞态不
   清掉新 Run 的槽；current/pi 共用同一互斥。
-- [ ] **Step 3：最小实现。** 调度不按 UUID 排序；所有计数与 lease 变更在同一事务；claim 响应生成
+- [x] **Step 3：最小实现。** 调度不按 UUID 排序；所有计数与 lease 变更在同一事务；claim 响应生成
   失败时回滚 Attempt/active count，不把 Run 留在 running。
-- [ ] **Step 4：Node 容量池。** fake control plane 验证 capacity、backoff、有界 jitter、draining、
+- [x] **Step 4：Node 容量池。** fake control plane 验证 capacity、backoff、有界 jitter、draining、
   SIGTERM 和子 Worker 精确清理；无 unhandled rejection。
-- [ ] **Step 5：真实 MySQL 并发绿灯。** 至少 20 轮双 claim + heartbeat + terminal 竞态，断言无重复
+- [x] **Step 5：真实 MySQL 并发绿灯。** 至少 20 轮双 claim + heartbeat + terminal 竞态，断言无重复
   Attempt/Event sequence、无负 active count、无脏 session slot。
-- [ ] **Step 6：范围回归和审查。** agent router/executor/recovery 既有测试必须保持通过；审查锁顺序统一
+- [x] **Step 6：范围回归和审查。** agent router/executor/recovery 既有测试必须保持通过；审查锁顺序统一
   `Tenant → License/Wallet → Session → Run → child rows`，避免反向死锁。
 - [ ] **Step 7：Commit。** `feat: schedule pi runs fairly across tenants`。
 

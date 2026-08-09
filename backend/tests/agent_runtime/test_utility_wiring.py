@@ -273,6 +273,8 @@ async def test_first_message_triggers_session_title_only_once(db_session) -> Non
     run = await db_session.get(AgentRun, first.json()["run_id"])
     run.status = "completed"
     run.completed_at = utc_now()
+    session = await db_session.get(AgentSession, session_id)
+    session.active_run_id = None
     await db_session.flush()
     second = await client.post(
         f"/api/v1/agent/sessions/{session_id}/messages", json={"content": "继续深入"}

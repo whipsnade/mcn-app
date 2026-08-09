@@ -12,7 +12,7 @@ def test_runtime_config_is_current_migration_head() -> None:
     backend_dir = Path(__file__).resolve().parents[2]
     config = Config(str(backend_dir / "alembic.ini"))
     config.set_main_option("script_location", str(backend_dir / "migrations"))
-    assert ScriptDirectory.from_config(config).get_heads() == ["0038_runtime_config_secrets"]
+    assert ScriptDirectory.from_config(config).get_heads() == ["0039a_pi_session_mutex_backfill"]
 
 
 @pytest.mark.asyncio
