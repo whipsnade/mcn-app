@@ -89,6 +89,25 @@ class Settings(BaseSettings):
     pi_runtime_poc_run_timeout_seconds: int = Field(default=1800, gt=0)
     pi_runtime_poc_mcp_timeout_seconds: int = Field(default=180, gt=0)
     pi_runtime_poc_max_decisions: int = Field(default=50, gt=0)
+    # 生产 Pi Gateway 内部协议：未配置时不开放任何内部路由。
+    pi_gateway_internal_secret: SecretStr = SecretStr("")
+    pi_gateway_allowed_ids: list[str] = Field(default_factory=list)
+    pi_gateway_lease_seconds: int = Field(default=60, gt=0)
+    pi_gateway_control_plane_url: AnyHttpUrl | None = None
+
+    @field_validator("pi_gateway_allowed_ids", mode="before")
+    @classmethod
+    def parse_gateway_ids(cls, value: object) -> object:
+        if isinstance(value, str):
+            return [item.strip() for item in value.split(",") if item.strip()]
+        return value
+
+    @field_validator("pi_gateway_control_plane_url", mode="before")
+    @classmethod
+    def empty_gateway_url_is_none(cls, value: object) -> object:
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
 
     @property
     def database_url(self) -> str:
@@ -124,6 +143,13 @@ class Settings(BaseSettings):
             raise ValueError("DATATAP_MCP_TOKEN must not be blank")
         if self.app_env == "production" and self.auth_mode == "mock":
             raise ValueError("AUTH_MODE=mock is forbidden in production")
+        if self.pi_gateway_control_plane_url is not None:
+            url = self.pi_gateway_control_plane_url
+            loopback_hosts = {"localhost", "127.0.0.1", "::1"}
+            if url.scheme == "http" and (
+                self.app_env not in {"development", "test"} or url.host not in loopback_hosts
+            ):
+                raise ValueError("PI_GATEWAY_CONTROL_PLANE_URL must use HTTPS or loopback HTTP")
         return self
 
 

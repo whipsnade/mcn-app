@@ -42,6 +42,9 @@ class AgentSession(Base):
     tenant_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("tenants.id", ondelete="RESTRICT"), nullable=False
     )
+    active_run_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("agent_runs.id", ondelete="SET NULL"), nullable=True
+    )
     title: Mapped[str] = mapped_column(String(200), nullable=False)
     status: Mapped[str] = mapped_column(String(24), nullable=False, default="active")
     session_summary: Mapped[str | None] = mapped_column(MEDIUMTEXT, nullable=True)
@@ -135,6 +138,12 @@ class AgentRun(Base):
     lease_owner: Mapped[str | None] = mapped_column(String(64), nullable=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    gateway_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    gateway_lease_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    gateway_lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    infrastructure_retry_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
     # 会话详情 runs 的稳定排序键（迁移 0029）：按创建时刻升序、id tie-break，
     # 前端取列表最后一个即最新 Run，不再受随机 uuid 顺序影响。
     created_at: Mapped[datetime] = mapped_column(
@@ -315,6 +324,7 @@ class AgentEvent(Base):
     __tablename__ = "agent_events"
     __table_args__ = (
         UniqueConstraint("run_id", "sequence", name="uq_agent_events_run_sequence"),
+        UniqueConstraint("run_id", "source_event_id", name="uq_agent_events_run_source_event"),
     )
 
     id: Mapped[str] = mapped_column(
@@ -328,6 +338,7 @@ class AgentEvent(Base):
     )
     sequence: Mapped[int] = mapped_column(Integer, nullable=False)
     event_type: Mapped[str] = mapped_column(String(48), nullable=False)
+    source_event_id: Mapped[str | None] = mapped_column(String(160), nullable=True)
     payload_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 

@@ -140,6 +140,26 @@ async def test_settle_terminal_completed_migrates_and_emits_in_one_commit(
     assert [row.event_type for row in rows] == ["message.completed", "run.completed"]
 
 
+async def test_settle_terminal_runs_gateway_cleanup_before_commit(db_session, user_factory) -> None:
+    run = await _make_run(db_session, user_factory, start=True, worker="worker")
+    seen: list[str] = []
+
+    async def cleanup(locked_run: AgentRun) -> None:
+        seen.append(locked_run.id)
+
+    event = await AgentEventStream(db_session, AgentEventBroker()).settle_terminal(
+        run.id,
+        run.user_id,
+        RunStatus.COMPLETED,
+        {},
+        worker_id="worker",
+        before_commit=cleanup,
+    )
+
+    assert event is not None
+    assert seen == [run.id]
+
+
 async def test_settle_terminal_failed_with_lease_carries_error_code(
     db_session, user_factory
 ) -> None:

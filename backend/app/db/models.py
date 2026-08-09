@@ -48,6 +48,7 @@ from app.reporting.models import (
     UserKolFavorite,
 )
 from app.runtime_config.models import EncryptedRuntimeSecret, RuntimeConfigVersion
+from app.pi_gateway.models import PiGatewayInstance, PiGatewayRequestNonce, PiTenantQueueState
 from app.selection.models import KolSelectionItem, KolSelectionSet, SessionKolSelection
 from app.tenancy.models import Tenant, TenantMembership
 from app.tasks.models import AnalysisTask, TaskEvent
@@ -95,6 +96,9 @@ __all__ = [
     "QuickMcpCall",
     "EncryptedRuntimeSecret",
     "RuntimeConfigVersion",
+    "PiGatewayInstance",
+    "PiGatewayRequestNonce",
+    "PiTenantQueueState",
     "SessionKolSelection",
     "TaskArtifact",
     "TaskCandidate",

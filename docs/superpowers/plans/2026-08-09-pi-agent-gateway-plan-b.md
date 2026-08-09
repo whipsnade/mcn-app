@@ -417,6 +417,7 @@ export function createProductionPiSession(
 **Files**
 
 - Create: `backend/app/pi_gateway/{__init__.py,auth.py,contracts.py,models.py,internal_tools.py,service.py,router.py}`
+- Create: `backend/app/agent_runtime/tools/pi_internal_tools.py` (生产与 POC 共用的 B0 内部工具实现)
 - Create: `backend/migrations/versions/0039_pi_gateway_control_plane.py`
 - Modify: `backend/app/api/router.py`
 - Modify: `backend/app/core/config.py`
@@ -461,21 +462,21 @@ POST /api/v1/internal/pi-gateway/v1/runs/{run_id}/terminal
   lease 解析 tenant/user/session/run，不接受 body 中身份字段。`publish_artifacts`、
   `request_clarification` 保留租约门禁。
 
-- [ ] **Step 1：认证红灯。** 覆盖错误 method/path/body hash、旧时间、重复 nonce、未知 gateway、错 lease、
+- [x] **Step 1：认证红灯。** 覆盖错误 method/path/body hash、旧时间、重复 nonce、未知 gateway、错 lease、
   跨 tenant/run/attempt、非 HTTPS production URL、secret envelope 错 AAD/篡改和日志泄漏；统一返回
   安全 401/404/409。
-- [ ] **Step 2：协议镜像红灯。** 同一 JSON fixture 同时通过 Pydantic 与 TypeScript parser；额外字段、
+- [x] **Step 2：协议镜像红灯。** 同一 JSON fixture 同时通过 Pydantic 与 TypeScript parser；额外字段、
   超长 delta、伪造 tenant_id、未知事件全部拒绝。
-- [ ] **Step 3：迁移和最小服务。** 0039 一次性新增 `PiGatewayInstance`、nonce、
+- [x] **Step 3：迁移和最小服务。** 0039 一次性新增 `PiGatewayInstance`、nonce、
   `PiTenantQueueState`、`AgentSession.active_run_id`、AgentRun gateway lease/infra retry 字段和
   `AgentEvent.source_event_id`；`(run_id,source_event_id)` 唯一且 NULL 兼容旧事件。后续 Task 5/6 只
   启用这些字段，不回改已提交迁移。
-- [ ] **Step 4：内部工具桥。** 复用 B0 loader/Builder/Publication；生产 Gateway 不能调用 POC 的
+- [x] **Step 4：内部工具桥。** 复用 B0 loader/Builder/Publication；生产 Gateway 不能调用 POC 的
   `PiPocSettingsGuard`、零积分 audit 或 POC 数据库门禁。
-- [ ] **Step 5：Node client。** 只允许构造时注入的 FastAPI origin；禁止 3xx；请求超时、abort、重试规则
+- [x] **Step 5：Node client。** 只允许构造时注入的 FastAPI origin；禁止 3xx；请求超时、abort、重试规则
   明确：GET-like heartbeat 可按同 nonce 新请求重试一次，任何工具/终态写请求依赖幂等 id，不盲重发。
-- [ ] **Step 6：绿灯与回归。** Python/Node 聚焦测试、POC 全量回归、Ruff、typecheck、build、diff check。
-- [ ] **Step 7：Commit。** `feat: add authenticated pi gateway control protocol`。
+- [x] **Step 6：绿灯与回归。** Python/Node 聚焦测试、POC 全量回归、Ruff、typecheck、build、diff check。
+- [x] **Step 7：Commit。** `feat: add authenticated pi gateway control protocol`。
 
 ---
 

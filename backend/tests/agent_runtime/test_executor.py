@@ -853,6 +853,17 @@ async def test_executor_skips_cancel_pending_run_with_active_lease(
     ] == []
 
 
+async def test_current_executor_never_claims_pi_backend_run(db_session, user_factory) -> None:
+    run, _, _ = await _make_session(db_session, user_factory)
+    run.runtime_backend = "pi"
+    await db_session.flush()
+    gateway = FakeAgentGateway([Complete(action="complete", text="不应执行")])
+    executor = _build_executor(db_session, gateway=gateway)
+
+    assert await executor.claim_and_process_one() is None
+    assert gateway.calls == []
+
+
 # ---------------------------------------------------------------------------
 # 7. 历史 reviewing Run 收口（直接发布改造 Task 4：Reviewer 已下线）
 # ---------------------------------------------------------------------------

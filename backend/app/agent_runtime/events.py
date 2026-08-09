@@ -18,7 +18,7 @@ broker 只承担"有新事件"的唤醒信号。
 
 import asyncio
 from collections import defaultdict
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -270,6 +270,7 @@ class AgentEventStream:
         payload: dict[str, Any] | None,
         *,
         worker_id: str | None = None,
+        before_commit: Callable[[AgentRun], Awaitable[None]] | None = None,
     ) -> AgentEvent | None:
         """Run 终态收口唯一事务边界（H1/§5.8）：状态迁移与终态事件同一加锁事务。
 
@@ -293,6 +294,8 @@ class AgentEventStream:
         if run.user_id != user_id:
             raise RunEventForbidden("run_not_owned")
         if await self._terminal_event_locked(run_id) is not None:
+            if before_commit is not None:
+                await before_commit(run)
             await self.db.commit()
             return None
         current = RunStatus(run.status)
@@ -306,6 +309,8 @@ class AgentEventStream:
                 return None
             event_type = f"run.{outcome.value}"
         event = await self._insert_terminal_locked(run, event_type, payload)
+        if before_commit is not None:
+            await before_commit(run)
         await self.db.commit()
         await self.broker.publish(event)
         return event

@@ -1,3 +1,6 @@
+import { createDecipheriv, hkdfSync } from "node:crypto";
+
+import type { RuntimeSecretEnvelope } from "./protocol.js";
 import type { SecretBundle } from "./protocol.js";
 
 const SECRET_KEYS = new Set([
@@ -10,7 +13,7 @@ const SECRET_KEYS = new Set([
   "PI_DATATAP_URL_AKTOOLS",
 ]);
 
-const SAFE_PARENT_KEYS = new Set(["PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR"]);
+const SAFE_PARENT_KEYS = new Set(["PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ"]);
 
 /** Build only the child-process environment; never mutate process.env. */
 export function buildSecretEnv(
@@ -41,5 +44,39 @@ export function clearSecretEnv(env: Record<string, string>): void {
     if (SECRET_KEYS.has(key) || key.startsWith("PI_DATATAP_URL_") || key === "PI_RUN_ID") {
       delete env[key];
     }
+  }
+}
+
+export async function decryptSecretEnvelope(
+  envelope: RuntimeSecretEnvelope,
+  leaseToken: string,
+  binding: { runId: string; attemptId: string; configVersionId: string; gatewayId: string },
+): Promise<SecretBundle> {
+  try {
+    if (envelope.alg !== "AES-256-GCM") throw new Error("alg");
+    const aad = Buffer.from(`${binding.runId}:${binding.attemptId}:${binding.configVersionId}:${binding.gatewayId}`);
+    const key = Buffer.from(hkdfSync("sha256", Buffer.from(leaseToken), Buffer.from("pi-gateway-secret-v1"), Buffer.from(`lease:${aad.toString()}`), 32));
+    const ciphertext = Buffer.from(envelope.ciphertext, "base64");
+    if (ciphertext.length <= 16) throw new Error("ciphertext");
+    const decipher = createDecipheriv("aes-256-gcm", key, Buffer.from(envelope.nonce, "base64"));
+    decipher.setAAD(aad);
+    decipher.setAuthTag(ciphertext.subarray(-16));
+    const plaintext = Buffer.concat([decipher.update(ciphertext.subarray(0, -16)), decipher.final()]);
+    const value = JSON.parse(plaintext.toString("utf8")) as Record<string, unknown>;
+    if (!value || typeof value !== "object") throw new Error("payload");
+    const modelBaseUrl = value.model_base_url ?? value.modelBaseUrl;
+    const modelApiKey = value.model_api_key ?? value.modelApiKey;
+    const datatapToken = value.datatap_token ?? value.datatapToken;
+    const datatapUrls = value.datatap_urls ?? value.datatapUrls;
+    if (
+      typeof modelBaseUrl !== "string" ||
+      typeof modelApiKey !== "string" ||
+      typeof datatapToken !== "string" ||
+      !datatapUrls ||
+      typeof datatapUrls !== "object"
+    ) throw new Error("payload");
+    return { modelBaseUrl, modelApiKey, datatapToken, datatapUrls: datatapUrls as Record<string, string> };
+  } catch (error) {
+    throw new Error("pi_secret_envelope_invalid", { cause: error });
   }
 }

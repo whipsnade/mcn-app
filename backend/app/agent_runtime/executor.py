@@ -271,6 +271,7 @@ class AgentRunExecutor:
             select(AgentRun.id)
             .where(
                 AgentRun.run_kind == "user",
+                AgentRun.runtime_backend == "current",
                 AgentRun.status == RunStatus.QUEUED,
                 AgentRun.cancel_requested.is_(False),
             )
@@ -283,6 +284,7 @@ class AgentRunExecutor:
             select(AgentRun.id)
             .where(
                 AgentRun.run_kind == "user",
+                AgentRun.runtime_backend == "current",
                 AgentRun.status.in_((RunStatus.RUNNING, RunStatus.REVIEWING)),
                 AgentRun.cancel_requested.is_(False),
                 or_(
@@ -308,6 +310,7 @@ class AgentRunExecutor:
             select(AgentRun.id)
             .where(
                 AgentRun.run_kind == "user",
+                AgentRun.runtime_backend == "current",
                 AgentRun.status.in_((RunStatus.RUNNING, RunStatus.REVIEWING)),
                 AgentRun.cancel_requested.is_(True),
                 or_(
@@ -330,6 +333,10 @@ class AgentRunExecutor:
         """
         run = await db.get(AgentRun, run_id)
         if run is None:
+            return None
+        if run.runtime_backend != "current":
+            # Pi Runs are claimed only through the authenticated Gateway; the
+            # in-process current executor must never race that control plane.
             return None
         if run.cancel_requested:
             # I1：扫描与领取间隙到达的取消（或恢复循环 process_run 直传的取消
