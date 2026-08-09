@@ -29,6 +29,7 @@ from .contracts import (
     PiGatewayTerminalRequest,
 )
 from .accounting import RuntimeUsageError, RuntimeUsageService, TenantAccountingError
+from .events import PiGatewayEventError, parse_source_event_id
 from .internal_tools import ProductionInternalToolBridge
 from .models import PiGatewayRequestNonce
 from .service import PiGatewayClaimError, PiGatewayLeaseError, PiGatewayService
@@ -160,40 +161,30 @@ async def source_event(
     db: Annotated[AsyncSession, Depends(get_db)],
     x_pi_run_lease: Annotated[str | None, Header()] = None,
 ) -> dict[str, object]:
-    _gateway_id, run = await _leased(request, db, run_id, payload.source_event_id.split(":", 1)[0], x_pi_run_lease)
-    if payload.event_type == "usage":
-        try:
-            record = await _service(db, _gateway_id).record_model_usage(
-                run,
-                payload.source_event_id.split(":", 1)[0],
-                payload.source_event_id,
-                payload.payload,
-            )
-            await db.commit()
-        except RuntimeUsageError as exc:
-            await db.rollback()
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=exc.code) from exc
-        return {
-            "usage_record_id": record.id,
-            "sequence": payload.sequence,
-            "duplicate": False,
-        }
-    existing = await db.scalar(
-        select(AgentEvent).where(
-            AgentEvent.run_id == run.id,
-            AgentEvent.source_event_id == payload.source_event_id,
+    try:
+        attempt_id, _sequence = parse_source_event_id(payload.source_event_id)
+    except PiGatewayEventError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=exc.code) from exc
+    _gateway_id, run = await _leased(request, db, run_id, attempt_id, x_pi_run_lease)
+    try:
+        receipt = await _service(db, _gateway_id).ingest_source_event(
+            run,
+            attempt_id=attempt_id,
+            source_event_id=payload.source_event_id,
+            sequence=payload.sequence,
+            event_type=payload.event_type,
+            payload=payload.payload,
+            broker=request.app.state.agent_event_broker,
         )
-    )
-    if existing is not None:
         await db.commit()
-        return {"event_id": existing.id, "sequence": existing.sequence, "duplicate": True}
-    stream = AgentEventStream(db, request.app.state.agent_event_broker)
-    event = await stream.append_locked(
-        run, payload.event_type, {**payload.payload, "source_event_id": payload.source_event_id}
-    )
-    event.source_event_id = payload.source_event_id
-    await stream.commit_and_publish(event)
-    return {"event_id": event.id, "sequence": event.sequence, "duplicate": False}
+        if not receipt.get("duplicate") and receipt.get("event_id"):
+            event = await db.get(AgentEvent, receipt["event_id"])
+            if event is not None:
+                await request.app.state.agent_event_broker.publish(event)
+        return receipt
+    except (PiGatewayEventError, RuntimeUsageError) as exc:
+        await db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
 
 
 @router.post("/runs/{run_id}/internal-tools")

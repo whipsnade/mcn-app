@@ -710,18 +710,18 @@ TenantAccountingService.fail_mcp_call(
 - 前端继续用现有 `/api/v1/agent/runs/{id}/events` 与 `Last-Event-ID`；不出现 Gateway URL。断线从 DB
   sequence 恢复，终态后流结束。
 
-- [ ] **Step 1：红灯。** 真实 Pi 0.79 fake-provider event fixture 覆盖 token 级 delta 聚合、工具成功/
+- [x] **Step 1：红灯。** 真实 Pi 0.79 fake-provider event fixture 覆盖 token 级 delta 聚合、工具成功/
   失败/unknown、重复 batch、乱序/缺口、跨 Attempt、终态前 message、Last-Event-ID。
-- [ ] **Step 2：最小 Node 投影。** 未知 SDK 事件忽略并计安全 diagnostic counter；原始错误只映射稳定
+- [x] **Step 2：最小 Node 投影。** 未知 SDK 事件忽略并计安全 diagnostic counter；原始错误只映射稳定
   code。批量内保持顺序，发送失败保留有界队列并用相同 source ids 重试。
-- [ ] **Step 3：FastAPI 落库。** 锁 Run 当前读分配 Step/Event sequence；拒绝未来 attempt、旧 lease、
+- [x] **Step 3：FastAPI 落库。** 锁 Run 当前读分配 Step/Event sequence；拒绝未来 attempt、旧 lease、
   终态后的用户事件；terminal 继续调用现有 `settle_terminal()`。
-- [ ] **Step 4：前端。** 确认 thinking 默认折叠、工具安全摘要、cancel pending、completed_with_warnings、
+- [x] **Step 4：前端。** 确认 thinking 默认折叠、工具安全摘要、cancel pending、completed_with_warnings、
   重连不重复文本；不增加直连 Gateway 代码。
-- [ ] **Step 5：绿灯。** 后端事件/SSE、Node、前端聚焦测试；前端完整 test/lint/build；后端相关回归。
-- [ ] **Step 6：审查。** 终态是最后一条用户可见事件；每 Run 仅一条 assistant completion；55k token
+- [x] **Step 5：绿灯。** 后端事件/SSE、Node、前端聚焦测试；前端完整 test/lint/build；后端相关回归。
+- [x] **Step 6：审查。** 终态是最后一条用户可见事件；每 Run 仅一条 assistant completion；55k token
   事件 fixture 经聚合后数量有界且文本不丢失。
-- [ ] **Step 7：Commit。** `feat: stream pi gateway events through agent sse`。
+- [x] **Step 7：Commit。** `feat: stream pi gateway events through agent sse`。
 
 ---
 

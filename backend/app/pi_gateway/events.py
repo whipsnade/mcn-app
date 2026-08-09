@@ -12,6 +12,123 @@ from typing import Any
 
 from .accounting import RuntimeUsageError
 
+
+class PiGatewayEventError(ValueError):
+    """Stable, secret-free source event boundary error."""
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
+
+
+_EVENT_ALIASES = {
+    "agent.turn.start": "run.started",
+    "agent/turn/start": "run.started",
+    "agent.turn.end": "turn.completed",
+    "agent/turn/end": "turn.completed",
+    "message.start": "message.started",
+    "message/start": "message.started",
+    "message.delta": "message.delta",
+    "message/delta": "message.delta",
+    "message.end": "message.completed",
+    "message/end": "message.completed",
+    "text.delta": "message.delta",
+    "text/delta": "message.delta",
+    "thinking.start": "thinking.started",
+    "thinking/start": "thinking.started",
+    "thinking.delta": "thinking.delta",
+    "thinking/delta": "thinking.delta",
+    "thinking.end": "thinking.completed",
+    "thinking/end": "thinking.completed",
+    "tool.start": "tool.started",
+    "tool/start": "tool.started",
+    "tool_call.start": "tool.started",
+    "tool_call.end": "tool.completed",
+    "tool_call/end": "tool.completed",
+    "tool.end": "tool.completed",
+    "tool/end": "tool.completed",
+}
+
+_SOURCE_EVENT_ALLOWED_FIELDS = {
+    "run.started": set(),
+    "turn.completed": {"safe_summary"},
+    "message.started": {"message_id", "role"},
+    "message.delta": {"message_id", "delta", "text"},
+    "message.completed": {"message_id", "text", "type"},
+    "thinking.started": {"attempt"},
+    "thinking.delta": {"attempt", "delta", "text"},
+    "thinking.completed": {"attempt", "duration_ms"},
+    "tool.started": {"call_id", "internal_tool_name", "safe_summary"},
+    "tool.completed": {
+        "call_id", "internal_tool_name", "status", "safe_summary", "duration_ms", "points", "error_code"
+    },
+}
+
+
+def parse_source_event_id(source_event_id: str) -> tuple[str, int]:
+    """Parse the immutable ``{attempt_id}:{worker_sequence}`` identity."""
+
+    if not isinstance(source_event_id, str) or source_event_id.count(":") != 1:
+        raise PiGatewayEventError("pi_gateway_source_event_invalid")
+    attempt_id, raw_sequence = source_event_id.split(":", 1)
+    if not attempt_id or not raw_sequence.isdigit():
+        raise PiGatewayEventError("pi_gateway_source_event_invalid")
+    sequence = int(raw_sequence)
+    if sequence < 1 or sequence > 10_000_000:
+        raise PiGatewayEventError("pi_gateway_source_sequence_invalid")
+    return attempt_id, sequence
+
+
+def canonical_event_type(event_type: str, payload: Mapping[str, Any] | None = None) -> str:
+    """Map SDK aliases to the small product event vocabulary."""
+
+    canonical = _EVENT_ALIASES.get(event_type, event_type)
+    if canonical == "tool.completed":
+        status = str((payload or {}).get("status", "")).lower()
+        if status in {"unknown", "result_unknown"}:
+            return "tool.unknown"
+        if status in {"failed", "error", "failure"}:
+            return "tool.failed"
+        return "tool.succeeded"
+    return canonical
+
+
+def normalize_source_payload(event_type: str, payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Project an SDK payload to fields safe for AgentEvent/SSE."""
+
+    if not isinstance(payload, Mapping):
+        raise PiGatewayEventError("pi_gateway_event_payload_invalid")
+    canonical = canonical_event_type(event_type, payload)
+    allowed = _SOURCE_EVENT_ALLOWED_FIELDS.get(canonical)
+    if allowed is None:
+        raise PiGatewayEventError("pi_gateway_source_event_unknown")
+    unknown = set(payload) - allowed
+    if unknown:
+        raise PiGatewayEventError("pi_gateway_event_field_invalid")
+    result: dict[str, Any] = {}
+    for key, value in payload.items():
+        if key in {"delta", "text", "safe_summary"}:
+            if not isinstance(value, str) or len(value) > 64 * 1024:
+                raise PiGatewayEventError("pi_gateway_event_text_invalid")
+            result[key] = value
+        elif key in {"message_id", "call_id", "internal_tool_name", "error_code", "role", "type"}:
+            if not isinstance(value, str) or not value or len(value) > 128:
+                raise PiGatewayEventError("pi_gateway_event_field_invalid")
+            result[key] = value
+        elif key in {"attempt", "duration_ms", "points"}:
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0 or value > 10**9:
+                raise PiGatewayEventError("pi_gateway_event_number_invalid")
+            result[key] = value
+        elif key == "status":
+            if value not in {"succeeded", "failed", "unknown", "error", "result_unknown"}:
+                raise PiGatewayEventError("pi_gateway_event_status_invalid")
+            result[key] = value
+    if canonical in {"message.delta", "thinking.delta"}:
+        text = result.get("text", result.get("delta"))
+        if not isinstance(text, str) or not text:
+            raise PiGatewayEventError("pi_gateway_event_text_missing")
+    return result
+
 _USAGE_KEYS = {
     "input_tokens",
     "output_tokens",
@@ -68,4 +185,10 @@ def normalize_usage_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     return normalized
 
 
-__all__ = ["normalize_usage_payload"]
+__all__ = [
+    "PiGatewayEventError",
+    "canonical_event_type",
+    "normalize_source_payload",
+    "normalize_usage_payload",
+    "parse_source_event_id",
+]

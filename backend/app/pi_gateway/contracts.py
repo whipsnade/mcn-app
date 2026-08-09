@@ -7,7 +7,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from .events import normalize_usage_payload
+from .events import normalize_source_payload, normalize_usage_payload
 
 
 class _StrictModel(BaseModel):
@@ -162,6 +162,7 @@ class PiGatewaySourceEvent(_StrictModel):
         if self.event_type == "usage":
             self.payload = normalize_usage_payload(self.payload)
             return self
+        self.payload = normalize_source_payload(self.event_type, self.payload)
         if self.event_type in {"message.delta", "text.delta", "thinking.delta"}:
             for key in ("delta", "text"):
                 value = self.payload.get(key)

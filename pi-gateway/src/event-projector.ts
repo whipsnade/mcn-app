@@ -6,6 +6,7 @@ export interface UsageProjectorDiagnostics {
   unknownEvents: number;
   invalidUsage: number;
   duplicateUsage: number;
+  projectedEvents: number;
 }
 
 function isRecord(value: unknown): value is RecordValue {
@@ -55,6 +56,64 @@ function eventIdentity(event: RecordValue, usage: RecordValue): string | undefin
   return undefined;
 }
 
+function safeDelta(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 && value.length <= 16_384
+    ? value
+    : undefined;
+}
+
+function safeEventId(event: RecordValue): string | undefined {
+  for (const key of ["eventId", "event_id", "messageId", "message_id", "id"]) {
+    const value = safeString(event[key]);
+    if (value) return value;
+  }
+  return undefined;
+}
+
+function genericProjection(event: RecordValue): { event_type: string; payload: RecordValue; identity?: string } | undefined {
+  const type = event.type;
+  if (type === "agent_start" || type === "turn_start") {
+    return { event_type: "run.started", payload: {}, identity: safeEventId(event) };
+  }
+  if (type === "agent_end" || type === "turn_end") {
+    return { event_type: "turn.completed", payload: {}, identity: safeEventId(event) };
+  }
+  if (type === "message_update") {
+    const update = event.assistantMessageEvent;
+    if (!isRecord(update)) return undefined;
+    const delta = safeDelta(update.delta);
+    if (update.type === "thinking_delta" && delta) {
+      return { event_type: "thinking.delta", payload: { text: delta }, identity: safeEventId(event) };
+    }
+    if (update.type === "text_delta" && delta) {
+      return { event_type: "message.delta", payload: { text: delta }, identity: safeEventId(event) };
+    }
+    if (["done", "text_end", "error"].includes(String(update.type))) {
+      const text = safeDelta(update.text ?? update.content);
+      return { event_type: "message.completed", payload: text ? { text } : {}, identity: safeEventId(event) };
+    }
+    return undefined;
+  }
+  if (type === "message_start") return { event_type: "message.started", payload: {}, identity: safeEventId(event) };
+  if (type === "tool_execution_start" || type === "tool_call") {
+    const callId = safeString(event.toolCallId ?? event.callId ?? event.call_id);
+    const toolName = safeString(event.toolName ?? event.tool_name ?? event.name);
+    if (!callId || !toolName) return undefined;
+    return {
+      event_type: "tool.started",
+      payload: { call_id: callId, internal_tool_name: toolName },
+      identity: safeEventId(event),
+    };
+  }
+  if (type === "tool_execution_end" || type === "tool_result") {
+    const callId = safeString(event.toolCallId ?? event.callId ?? event.call_id);
+    if (!callId) return undefined;
+    const status = event.isError === true || event.status === "failed" ? "failed" : "succeeded";
+    return { event_type: `tool.${status}`, payload: { call_id: callId, status }, identity: safeEventId(event) };
+  }
+  return undefined;
+}
+
 export class PiSdkUsageProjector {
   private sequence = 1;
   private readonly seen = new Set<string>();
@@ -62,6 +121,7 @@ export class PiSdkUsageProjector {
     unknownEvents: 0,
     invalidUsage: 0,
     duplicateUsage: 0,
+    projectedEvents: 0,
   };
 
   constructor(private readonly attemptId: string) {
@@ -75,8 +135,24 @@ export class PiSdkUsageProjector {
     }
     const usage = usageObject(event);
     if (usage === undefined) {
-      this.diagnostics.unknownEvents += 1;
-      return undefined;
+      const generic = genericProjection(event);
+      if (!generic) {
+        this.diagnostics.unknownEvents += 1;
+        return undefined;
+      }
+      if (generic.identity && this.seen.has(`event:${generic.identity}`)) {
+        this.diagnostics.duplicateUsage += 1;
+        return undefined;
+      }
+      if (generic.identity) this.seen.add(`event:${generic.identity}`);
+      const sequence = this.sequence++;
+      this.diagnostics.projectedEvents += 1;
+      return {
+        source_event_id: `${this.attemptId}:${sequence}`,
+        sequence,
+        event_type: generic.event_type,
+        payload: generic.payload,
+      };
     }
     const requestId = safeString(usage.requestId ?? usage.upstream_request_id);
     const dedupeKey = eventIdentity(event, usage);

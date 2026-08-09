@@ -4,6 +4,24 @@ import { ControlPlaneClient } from "../src/control-plane-client.js";
 import { PiSdkUsageProjector, projectPiSdkEvent } from "../src/event-projector.js";
 
 describe("Pi SDK usage projector", () => {
+  it("projects only bounded run, thinking, text and tool fields in SDK order", () => {
+    const projector = new PiSdkUsageProjector("attempt-events");
+    const events = [
+      { type: "agent_start", eventId: "turn-1" },
+      { type: "message_update", eventId: "msg-1", assistantMessageEvent: { type: "thinking_delta", delta: "plan" } },
+      { type: "message_update", eventId: "msg-2", assistantMessageEvent: { type: "text_delta", delta: "answer" } },
+      { type: "tool_execution_start", toolCallId: "call-1", toolName: "load_marketing_skill", args: { token: "secret" } },
+      { type: "tool_execution_end", toolCallId: "call-1", isError: true, result: { password: "secret" } },
+    ].map((event) => projector.project(event));
+
+    expect(events.map((event) => event?.event_type)).toEqual([
+      "run.started", "thinking.delta", "message.delta", "tool.started", "tool.failed",
+    ]);
+    expect(events[3]?.payload).toEqual({ call_id: "call-1", internal_tool_name: "load_marketing_skill" });
+    expect(events[4]?.payload).toEqual({ call_id: "call-1", status: "failed" });
+    expect(JSON.stringify(events)).not.toContain("secret");
+  });
+
   it("projects provider usage with cache fields and stable source ids", () => {
     const projector = new PiSdkUsageProjector("attempt-1");
     const event = projector.project({

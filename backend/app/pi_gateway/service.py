@@ -16,13 +16,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agent_runtime.events import AgentEventBroker, AgentEventStream
 from app.agent_runtime.models import (
     AgentMessage,
+    AgentEvent,
     AgentRun,
     AgentRunAttempt,
     AgentSession,
     AgentStep,
     AgentToolCall,
 )
-from app.billing.models import TenantWalletTransaction
+from app.billing.models import RuntimeUsageRecord, TenantWalletTransaction
 from app.agent_runtime.state import RunStatus
 from app.agent_runtime.tools.contracts import arguments_hash, logical_call_id_for
 from app.agent_runtime.tools.mcp import DEFINITELY_NOT_SENT, RESULT_UNKNOWN, AgentMcpAccounting
@@ -48,7 +49,13 @@ from .contracts import (
     PiGatewayMcpPermitResponse,
     PiGatewayMcpPreflightRequest,
 )
-from .events import normalize_usage_payload
+from .events import (
+    PiGatewayEventError,
+    canonical_event_type,
+    normalize_source_payload,
+    normalize_usage_payload,
+    parse_source_event_id,
+)
 from .scheduler import PiRunScheduler
 
 
@@ -318,6 +325,166 @@ class PiGatewayService:
         normalized = normalize_usage_payload(payload)
         return await RuntimeUsageService(self.db).record_model_usage(
             run, attempt_id, source_event_id, normalized
+        )
+
+    async def ingest_source_event(
+        self,
+        run: AgentRun,
+        *,
+        attempt_id: str,
+        source_event_id: str,
+        sequence: int,
+        event_type: str,
+        payload: dict[str, Any],
+        broker: AgentEventBroker | None = None,
+    ) -> dict[str, object]:
+        """Persist one safe Gateway event with attempt/sequence idempotency.
+
+        The Run row is already locked by :meth:`leased_run`.  This method is
+        intentionally the only source-event write boundary: a duplicate source
+        id returns its original receipt, while a future sequence is rejected
+        before any user-visible event or message is written.
+        """
+        parsed_attempt, parsed_sequence = parse_source_event_id(source_event_id)
+        if parsed_attempt != attempt_id or parsed_sequence != sequence:
+            raise PiGatewayEventError("pi_gateway_source_event_attempt_mismatch")
+        attempt = await self.db.scalar(
+            select(AgentRunAttempt)
+            .where(AgentRunAttempt.id == attempt_id, AgentRunAttempt.run_id == run.id)
+            .with_for_update()
+        )
+        if attempt is None or attempt.outcome != "running":
+            raise PiGatewayEventError("pi_gateway_source_event_attempt_invalid")
+
+        existing = await self.db.scalar(
+            select(AgentEvent)
+            .where(AgentEvent.run_id == run.id, AgentEvent.source_event_id == source_event_id)
+        )
+        if existing is not None:
+            return {"event_id": existing.id, "sequence": existing.sequence, "duplicate": True}
+        usage_existing = await self.db.scalar(
+            select(RuntimeUsageRecord).where(
+                RuntimeUsageRecord.run_id == run.id,
+                RuntimeUsageRecord.source_event_id == source_event_id,
+            )
+        )
+        if usage_existing is not None:
+            return {
+                "usage_record_id": usage_existing.id,
+                "sequence": sequence,
+                "duplicate": True,
+            }
+
+        source_sequences: list[int] = []
+        for value in (
+            await self.db.scalars(
+                select(AgentEvent.source_event_id).where(
+                    AgentEvent.run_id == run.id,
+                    AgentEvent.source_event_id.is_not(None),
+                )
+            )
+        ).all():
+            try:
+                prior_attempt, prior_sequence = parse_source_event_id(value or "")
+            except PiGatewayEventError:
+                continue
+            if prior_attempt == attempt_id:
+                source_sequences.append(prior_sequence)
+        for value in (
+            await self.db.scalars(
+                select(RuntimeUsageRecord.source_event_id).where(
+                    RuntimeUsageRecord.run_id == run.id,
+                    RuntimeUsageRecord.source_event_id.is_not(None),
+                )
+            )
+        ).all():
+            try:
+                prior_attempt, prior_sequence = parse_source_event_id(value or "")
+            except PiGatewayEventError:
+                continue
+            if prior_attempt == attempt_id:
+                source_sequences.append(prior_sequence)
+        expected = max(source_sequences, default=0) + 1
+        if sequence != expected:
+            raise PiGatewayEventError(
+                "pi_gateway_source_sequence_gap" if sequence > expected
+                else "pi_gateway_source_sequence_replayed"
+            )
+
+        if event_type == "usage":
+            record = await self.record_model_usage(run, attempt_id, source_event_id, payload)
+            return {"usage_record_id": record.id, "sequence": sequence, "duplicate": False}
+
+        canonical = canonical_event_type(event_type, payload)
+        safe_payload = normalize_source_payload(event_type, payload)
+        stream = AgentEventStream(self.db, broker or AgentEventBroker())
+        event = await stream.append_locked(
+            run,
+            canonical,
+            {**safe_payload, "source_event_id": source_event_id},
+        )
+        event.source_event_id = source_event_id
+        if canonical == "message.completed":
+            await self._append_gateway_assistant_message(run, safe_payload)
+        await self.db.flush()
+        return {"event_id": event.id, "sequence": event.sequence, "duplicate": False}
+
+    async def _append_gateway_assistant_message(
+        self, run: AgentRun, payload: dict[str, Any]
+    ) -> None:
+        existing = list(
+            (
+                await self.db.scalars(
+                    select(AgentMessage).where(
+                        AgentMessage.run_id == run.id,
+                        AgentMessage.role == "assistant",
+                    )
+                )
+            ).all()
+        )
+        if existing:
+            raise PiGatewayEventError("pi_gateway_message_completion_duplicate")
+        delta_rows = list(
+            (
+                await self.db.scalars(
+                    select(AgentEvent)
+                    .where(
+                        AgentEvent.run_id == run.id,
+                        AgentEvent.event_type == "message.delta",
+                    )
+                    .order_by(AgentEvent.sequence)
+                )
+            ).all()
+        )
+        chunks: list[str] = []
+        for row in delta_rows:
+            item = row.payload_json or {}
+            value = item.get("text", item.get("delta"))
+            if isinstance(value, str):
+                chunks.append(value)
+        merged = "".join(chunks)
+        final_text = payload.get("text")
+        if isinstance(final_text, str) and final_text:
+            if not merged or final_text.startswith(merged):
+                merged = final_text
+            elif final_text not in merged:
+                merged += final_text
+        if len(merged) > 64 * 1024:
+            raise PiGatewayEventError("pi_gateway_message_too_large")
+        max_sequence = await self.db.scalar(
+            select(func.max(AgentMessage.sequence)).where(AgentMessage.session_id == run.session_id)
+        )
+        self.db.add(
+            AgentMessage(
+                id=str(uuid4()),
+                session_id=run.session_id,
+                run_id=run.id,
+                role="assistant",
+                content=merged,
+                metadata_json={"gateway_message": True},
+                sequence=(max_sequence or 0) + 1,
+                created_at=self.now_fn(),
+            )
         )
 
     async def preflight_mcp(
