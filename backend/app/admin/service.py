@@ -21,10 +21,11 @@ from app.agent_runtime.models import (
 )
 from app.agent_runtime.tools.factory import resolve_allowlist_entry
 from app.agent_runtime.tools.mcp import AgentMcpAccounting
-from app.billing.models import Wallet, WalletTransaction
+from app.billing.models import TenantWalletTransaction, Wallet, WalletTransaction
 from app.billing.service import WalletService
 from app.core.redaction import redact_for_log
 from app.identity.models import AuthIdentity, LoginSession, User, UserChannelPermission
+from app.tenancy.models import TenantMembership
 from app.tenancy.service import TenantService
 from app.mcp_gateway.contracts import DataTapService
 from app.mcp_gateway.models import McpCall
@@ -92,15 +93,34 @@ class AdminService:
         )
 
     async def _to_item(self, user: User) -> AdminUserItem:
-        wallet = await self.db.get(Wallet, user.id)
+        try:
+            wallet = await WalletService(self.db).get_wallet(user.id)
+        except LookupError:
+            # Admin lists may include a legacy/auth fixture user before its
+            # first wallet grant; preserve the old zero-valued projection.
+            wallet = None
+        tenant_id = await self.db.scalar(
+            select(TenantMembership.tenant_id).where(
+                TenantMembership.user_id == user.id,
+                TenantMembership.status == "active",
+            )
+        )
+        if wallet is not None:
+            available_points, reserved_points = await WalletService(self.db).quota_view(user.id)
+        else:
+            available_points, reserved_points = 0, 0
         return AdminUserItem(
             id=user.id,
+            tenant_id=tenant_id,
             nickname=user.nickname,
             role=user.role,
             status=user.status,
             phone=await self._phone_of(user.id),
-            points=wallet.balance if wallet is not None else 0,
-            reserved_points=wallet.reserved if wallet is not None else 0,
+            # Admin user rows show the member's quota intersection, not a
+            # duplicated tenant-pool balance.  ``tenant_id`` identifies the
+            # shared pool adjusted by the points endpoint.
+            points=available_points,
+            reserved_points=reserved_points,
             channels=await self._channels_of(user.id),
             industries=[str(item) for item in (user.industries or ["美食"])],
             created_at=user.created_at,
@@ -185,9 +205,14 @@ class AdminService:
         )
         self.db.add(user)
         await self.db.flush()
-        await TenantService(self.db).provision_personal_tenant(
+        tenant_context = await TenantService(self.db).provision_personal_tenant(
             user.id, name=payload.nickname, now=now
         )
+        from app.pi_gateway.accounting import TenantAccountingService
+
+        accounting = TenantAccountingService(self.db)
+        await accounting.ensure_tenant_wallet(tenant_context.tenant_id)
+        await accounting.ensure_user_quota(tenant_context.tenant_id, user.id)
         self.db.add(
             AuthIdentity(
                 id=str(uuid4()),
@@ -389,10 +414,16 @@ class AdminService:
         wallet_service = WalletService(self.db)
         if idempotency_key is not None:
             applied = await self.db.scalar(
-                select(WalletTransaction).where(
-                    WalletTransaction.idempotency_key == idempotency_key
+                select(TenantWalletTransaction).where(
+                    TenantWalletTransaction.idempotency_key == idempotency_key
                 )
             )
+            if applied is None:
+                applied = await self.db.scalar(
+                    select(WalletTransaction).where(
+                        WalletTransaction.idempotency_key == idempotency_key
+                    )
+                )
             if applied is not None:
                 return await wallet_service.get_wallet(user.id), applied
         audit = self._audit(
@@ -429,9 +460,11 @@ class AdminService:
         self, user_id: str, *, limit: int, offset: int
     ) -> tuple[list[PointsHistoryEntry], int]:
         await self._get_user(user_id)
-        statement = select(WalletTransaction).where(
-            WalletTransaction.user_id == user_id,
-            WalletTransaction.kind.in_(HISTORY_KINDS),
+        tenant_wallet = await WalletService(self.db)._tenant_wallet(user_id)
+        ledger_model = TenantWalletTransaction if tenant_wallet is not None else WalletTransaction
+        statement = select(ledger_model).where(
+            ledger_model.user_id == user_id,
+            ledger_model.kind.in_(HISTORY_KINDS),
         )
         total = await self.db.scalar(
             select(func.count()).select_from(statement.subquery())
@@ -440,7 +473,7 @@ class AdminService:
             (
                 await self.db.scalars(
                     statement.order_by(
-                        WalletTransaction.created_at.desc(), WalletTransaction.id
+                        ledger_model.created_at.desc(), ledger_model.id
                     )
                     .limit(limit)
                     .offset(offset)
@@ -448,11 +481,17 @@ class AdminService:
             ).all()
         )
         settle_ids = [tx.id for tx in transactions if tx.kind == "settle"]
+        settle_call_ids = [
+            tx.tool_call_id
+            for tx in transactions
+            if tx.kind == "settle" and getattr(tx, "tool_call_id", None)
+        ]
         context: dict[str, tuple[str | None, str | None]] = {}
-        if settle_ids:
+        if settle_ids or settle_call_ids:
             rows = (
                 await self.db.execute(
                     select(
+                        McpCall.id,
                         McpCall.settlement_transaction_id,
                         McpCall.service_slug,
                         WorkspaceSession.title,
@@ -460,12 +499,23 @@ class AdminService:
                     )
                     .join(AnalysisTask, McpCall.task_id == AnalysisTask.id)
                     .join(WorkspaceSession, AnalysisTask.session_id == WorkspaceSession.id)
-                    .where(McpCall.settlement_transaction_id.in_(settle_ids))
+                    .where(
+                        or_(
+                            McpCall.settlement_transaction_id.in_(settle_ids)
+                            if settle_ids
+                            else False,
+                            McpCall.id.in_(settle_call_ids)
+                            if settle_call_ids
+                            else False,
+                        )
+                    )
                 )
             ).all()
-            for tx_id, service_slug, title, platforms in rows:
+            for call_id, tx_id, service_slug, title, platforms in rows:
                 platform = platforms[0] if platforms else service_slug
-                context[tx_id] = (title, platform)
+                if tx_id is not None:
+                    context[tx_id] = (title, platform)
+                context[call_id] = (title, platform)
         quick_settle_ids = [
             tx.id
             for tx in transactions
@@ -495,8 +545,12 @@ class AdminService:
                 id=tx.id,
                 kind=tx.kind,
                 points=-tx.reserved_delta if tx.kind == "settle" else tx.balance_delta,
-                session_title=context.get(tx.id, (None, None))[0],
-                platform=context.get(tx.id, (None, None))[1],
+                session_title=context.get(
+                    tx.id, context.get(getattr(tx, "tool_call_id", None), (None, None))
+                )[0],
+                platform=context.get(
+                    tx.id, context.get(getattr(tx, "tool_call_id", None), (None, None))
+                )[1],
                 created_at=tx.created_at,
             )
             for tx in transactions

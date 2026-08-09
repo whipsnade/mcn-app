@@ -32,4 +32,28 @@ describe("production resource loader", () => {
     expect(config.mcpServers).toHaveProperty("insight-cube");
     expect(config.mcpServers).toHaveProperty("aktools");
   });
+
+  it("keeps multiple reviewed tools in one service without overwriting a server", () => {
+    const config = createMcpConfig([
+      { service: "insight-cube", adapterName: "query_one", remoteName: "remote_one", schemaDigest: "sha256:a" },
+      { service: "insight-cube", adapterName: "query_two", remoteName: "remote_two", schemaDigest: "sha256:b" },
+      { service: "social-grow", adapterName: "grow", remoteName: "grow", schemaDigest: "sha256:c" },
+      { service: "social-grow-content", adapterName: "content", remoteName: "content", schemaDigest: "sha256:d" },
+      { service: "aktools", adapterName: "ak", remoteName: "ak", schemaDigest: "sha256:e" },
+    ]);
+    expect(Object.keys(config.mcpServers)).toEqual([
+      "insight-cube",
+      "insight-cube__query_two",
+      "social-grow",
+      "social-grow-content",
+      "aktools",
+    ]);
+  });
+
+  it("allows a non-empty approved catalog when a service has no reviewed tools yet", () => {
+    const config = createMcpConfig([
+      { service: "social-grow", adapterName: "kol_search", remoteName: "kol_search", schemaDigest: "sha256:a" },
+    ]);
+    expect(Object.keys(config.mcpServers)).toEqual(["social-grow"]);
+  });
 });

@@ -634,17 +634,17 @@ TenantAccountingService.fail_mcp_call(
   根据 adapter `details.mode=call/mcpResult/error` 做 success/confirmed failure/unknown 收口，复用现有 output
   schema、Normalization、EvidenceWriter 和 reconciliation。
 
-- [ ] **Step 1：迁移/账务红灯。** 覆盖旧余额与预留精确复制、同租户多用户共享余额、用户月额度、并发
+- [x] **Step 1：迁移/账务红灯。** 覆盖旧余额与预留精确复制、同租户多用户共享余额、用户月额度、并发
   reserve、幂等 settle/release、负余额/负 reserved 不变量、旧表不再写。
-- [ ] **Step 2：hook 红灯。** fake adapter 断言调用顺序必为 preflight commit → MCP call → finalize；
+- [x] **Step 2：hook 红灯。** fake adapter 断言调用顺序必为 preflight commit → MCP call → finalize；
   preflight 401/409/余额不足/License 失效全部 0 MCP；search/list 0 计费。
-- [ ] **Step 3：最小实现。** 提取现有 `DurableToolCallCoordinator` 的账务端口，使 current/pi 共用状态机；
+- [x] **Step 3：最小实现。** 提取现有 `DurableToolCallCoordinator` 的账务端口，使 current/pi 共用状态机；
   不复制一套状态分类。积分固定从 Settings 校验为 10，不接受 Gateway body 报价。
-- [ ] **Step 4：unknown 与核对。** unknown 保留 tenant wallet + user quota reserved；自动/人工核对成功 settle，
+- [x] **Step 4：unknown 与核对。** unknown 保留 tenant wallet + user quota reserved；自动/人工核对成功 settle，
   确认失败 release，keep_unknown 不动账；审计 append-only。
-- [ ] **Step 5：绿灯。** billing、current MCP、Pi preflight、recovery、admin points、真实 MySQL并发测试，
+- [x] **Step 5：绿灯。** billing、current MCP、Pi preflight、recovery、admin points、真实 MySQL并发测试，
   再运行后端全量与 Node 测试。
-- [ ] **Step 6：审查。** 对所有 Wallet/WalletTransaction 写入口静态盘点，确认 B4 后除迁移与只读兼容外
+- [x] **Step 6：审查。** 对所有 Wallet/WalletTransaction 写入口静态盘点，确认 B4 后除迁移与只读兼容外
   为 0；检查所有外发 MCP 都有已提交 permit。
 - [ ] **Step 7：Commit。** `feat: bill all agent mcp calls from tenant wallet`。
 

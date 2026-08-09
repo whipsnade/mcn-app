@@ -2,7 +2,7 @@ import pytest
 from sqlalchemy import func, select
 
 from app.admin.models import AdminAuditLog
-from app.billing.models import WalletTransaction
+from app.billing.models import TenantWalletTransaction
 from app.billing.service import WalletService
 
 
@@ -31,9 +31,9 @@ async def test_adjust_points_updates_balance_and_ledger(
     kinds = list(
         (
             await db_session.scalars(
-                select(WalletTransaction.kind).where(
-                    WalletTransaction.user_id == user.id,
-                    WalletTransaction.kind == "admin_adjust",
+                select(TenantWalletTransaction.kind).where(
+                    TenantWalletTransaction.user_id == user.id,
+                    TenantWalletTransaction.kind == "admin_adjust",
                 )
             )
         ).all()
@@ -86,8 +86,8 @@ async def test_adjust_points_idempotency_key_replays_same_transaction(
     assert first.json()["points"] == replay.json()["points"] == 100
 
     count = await db_session.scalar(
-        select(func.count(WalletTransaction.id)).where(
-            WalletTransaction.user_id == user.id
+        select(func.count(TenantWalletTransaction.id)).where(
+            TenantWalletTransaction.user_id == user.id
         )
     )
     assert count == 1
@@ -109,6 +109,7 @@ async def test_adjust_points_writes_audit_log_with_masked_phone(
         json={"delta": 66, "reason": "审计验证"},
     )
     assert adjusted.status_code == 200
+    assert adjusted.json()["tenant_id"] is not None
 
     audit = await db_session.scalar(
         select(AdminAuditLog).where(
@@ -126,8 +127,8 @@ async def test_adjust_points_writes_audit_log_with_masked_phone(
 
     # 交易行的 reference_id 指向审计日志。
     transaction = await db_session.scalar(
-        select(WalletTransaction).where(
-            WalletTransaction.id == adjusted.json()["transaction_id"]
+        select(TenantWalletTransaction).where(
+            TenantWalletTransaction.id == adjusted.json()["transaction_id"]
         )
     )
     assert transaction.reference_type == "admin_adjust"

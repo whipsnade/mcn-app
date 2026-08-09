@@ -22,9 +22,13 @@ from .contracts import (
     PiGatewayClaimRequest,
     PiGatewayHeartbeatRequest,
     PiGatewayInternalToolRequest,
+    PiGatewayMcpFailRequest,
+    PiGatewayMcpFinalizeRequest,
+    PiGatewayMcpPreflightRequest,
     PiGatewaySourceEvent,
     PiGatewayTerminalRequest,
 )
+from .accounting import TenantAccountingError
 from .internal_tools import ProductionInternalToolBridge
 from .models import PiGatewayRequestNonce
 from .service import PiGatewayClaimError, PiGatewayLeaseError, PiGatewayService
@@ -195,6 +199,62 @@ async def internal_tool(
     )
     await db.commit()
     return result.model_dump(mode="json")
+
+
+@router.post("/runs/{run_id}/mcp/preflight")
+async def mcp_preflight(
+    run_id: str,
+    request: Request,
+    payload: PiGatewayMcpPreflightRequest,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    x_pi_run_lease: Annotated[str | None, Header()] = None,
+) -> dict[str, object]:
+    gateway_id, run = await _leased(request, db, run_id, None, x_pi_run_lease)
+    try:
+        permit = await _service(db, gateway_id).preflight_mcp(run, payload)
+        await db.commit()
+    except TenantAccountingError as exc:
+        await db.rollback()
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=exc.code) from exc
+    return permit.model_dump(mode="json")
+
+
+@router.post("/runs/{run_id}/mcp/finalize")
+async def mcp_finalize(
+    run_id: str,
+    request: Request,
+    payload: PiGatewayMcpFinalizeRequest,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    x_pi_run_lease: Annotated[str | None, Header()] = None,
+) -> dict[str, object]:
+    gateway_id, run = await _leased(request, db, run_id, None, x_pi_run_lease)
+    try:
+        result = await _service(db, gateway_id).finalize_mcp(run, payload)
+        await db.commit()
+    except (TenantAccountingError, ValueError) as exc:
+        await db.rollback()
+        code = getattr(exc, "code", str(exc))
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=code) from exc
+    return result
+
+
+@router.post("/runs/{run_id}/mcp/fail")
+async def mcp_fail(
+    run_id: str,
+    request: Request,
+    payload: PiGatewayMcpFailRequest,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    x_pi_run_lease: Annotated[str | None, Header()] = None,
+) -> dict[str, object]:
+    gateway_id, run = await _leased(request, db, run_id, None, x_pi_run_lease)
+    try:
+        await _service(db, gateway_id).fail_mcp(run, payload.permit_id, payload.classification)
+        await db.commit()
+    except (TenantAccountingError, ValueError) as exc:
+        await db.rollback()
+        code = getattr(exc, "code", str(exc))
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=code) from exc
+    return {"ok": True}
 
 
 @router.post("/runs/{run_id}/terminal")

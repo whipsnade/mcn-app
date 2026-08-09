@@ -219,6 +219,9 @@ class RuntimeConfigService:
         if not run.runtime_config_snapshot_json or not run.runtime_config_version_id:
             raise RuntimeConfigError("runtime_snapshot_missing")
         snapshot_payload = copy.deepcopy(run.runtime_config_snapshot_json)
+        adapter_catalog = snapshot_payload.pop("adapter_catalog", None)
+        if adapter_catalog is not None and not isinstance(adapter_catalog, list):
+            raise RuntimeConfigError("runtime_snapshot_invalid")
         capability_payload = snapshot_payload.get("capability_pack")
         legacy_minimal_capability = capability_payload == {
             "runtime_contract_version": RUNTIME_CONTRACT_VERSION

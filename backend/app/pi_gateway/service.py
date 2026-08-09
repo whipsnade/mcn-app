@@ -8,8 +8,9 @@ import secrets
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
+from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_runtime.events import AgentEventBroker, AgentEventStream
@@ -21,9 +22,18 @@ from app.agent_runtime.models import (
     AgentStep,
     AgentToolCall,
 )
+from app.billing.models import TenantWalletTransaction
 from app.agent_runtime.state import RunStatus
+from app.agent_runtime.tools.contracts import arguments_hash, logical_call_id_for
 from app.agent_runtime.tools.mcp import DEFINITELY_NOT_SENT, RESULT_UNKNOWN, AgentMcpAccounting
-from app.mcp_gateway.models import McpToolCatalog
+from app.pi_gateway.accounting import (
+    McpPreflightContext,
+    TenantAccountingError,
+    TenantAccountingService,
+)
+from app.mcp_gateway.models import McpToolCatalog, McpToolDiscovery
+from app.mcp_gateway.registry import close_input_schema
+from app.mcp_gateway.validation import McpValidationError, validate_input
 from app.runtime_config.schemas import RuntimeSecretBundle
 from app.runtime_config.service import RuntimeConfigService
 
@@ -32,6 +42,9 @@ from .contracts import (
     PiGatewayAdapterCatalogEntry,
     PiGatewayClaimRequest,
     PiGatewayClaimResponse,
+    PiGatewayMcpFinalizeRequest,
+    PiGatewayMcpPermitResponse,
+    PiGatewayMcpPreflightRequest,
 )
 from .scheduler import PiRunScheduler
 
@@ -94,6 +107,28 @@ class PiGatewayClaimError(ValueError):
     def __init__(self, code: str) -> None:
         self.code = code
         super().__init__(code)
+
+
+def _adapter_catalog_entry(
+    row: McpToolCatalog,
+    discovered_remote_name: str | None = None,
+) -> PiGatewayAdapterCatalogEntry:
+    """Build the server-owned catalog entry used by claim and preflight.
+
+    ``McpToolCatalog.internal_tool_name`` is the stable model-facing name.  A
+    live discovery row carries the remote name; falling back to the internal
+    name is only valid for the reviewed dynamic tools whose provider exposes
+    that name verbatim.  The gateway never receives an unreviewed caller value.
+    """
+    remote_name = discovered_remote_name or row.internal_tool_name
+    digest = row.discovery_digest
+    return PiGatewayAdapterCatalogEntry(
+        catalog_entry_id=row.id,
+        adapter_visible_name=row.internal_tool_name,
+        service=row.service_slug,
+        remote_name=remote_name,
+        input_schema_digest=digest if digest.startswith("sha256:") else f"sha256:{digest}",
+    )
 
 
 class PiGatewayService:
@@ -163,26 +198,34 @@ class PiGatewayService:
                 config_version_id=run.runtime_config_version_id,
                 gateway_id=self.gateway_id,
             )
-            rows = await self.db.scalars(
-                select(McpToolCatalog)
-                .where(McpToolCatalog.review_status == "approved", McpToolCatalog.is_enabled.is_(True))
-                .order_by(McpToolCatalog.internal_tool_name)
-                .limit(32)
-            )
-            adapter_catalog = [
-                PiGatewayAdapterCatalogEntry(
-                    catalog_entry_id=row.id,
-                    adapter_visible_name=row.internal_tool_name,
-                    service=row.service_slug,
-                    remote_name=row.internal_tool_name,
-                    input_schema_digest=(
-                        row.discovery_digest
-                        if row.discovery_digest.startswith("sha256:")
-                        else f"sha256:{row.discovery_digest}"
-                    ),
+            rows = (
+                await self.db.execute(
+                    select(McpToolCatalog, McpToolDiscovery.remote_name)
+                    .outerjoin(
+                        McpToolDiscovery,
+                        and_(
+                            McpToolDiscovery.service_slug == McpToolCatalog.service_slug,
+                            McpToolDiscovery.discovery_digest == McpToolCatalog.discovery_digest,
+                            McpToolDiscovery.review_status == "approved",
+                        ),
+                    )
+                    .where(
+                        McpToolCatalog.review_status == "approved",
+                        McpToolCatalog.is_enabled.is_(True),
+                    )
+                    .order_by(McpToolCatalog.internal_tool_name)
+                    .limit(32)
                 )
-                for row in rows
-            ]
+            ).all()
+            adapter_catalog = [_adapter_catalog_entry(row, remote_name) for row, remote_name in rows]
+            # Bind the adapter mapping into the claimed snapshot.  Preflight
+            # later re-reads the catalog and compares this exact projection;
+            # the Gateway cannot self-report a remote name or schema digest.
+            snapshot["adapter_catalog"] = [entry.model_dump(mode="json") for entry in adapter_catalog]
+            # The runtime config itself is immutable after claim; this is the
+            # claim-time catalog observation that binds adapter-visible names
+            # to the immutable Run snapshot used by preflight.
+            run.runtime_config_snapshot_json = snapshot
             messages = await self.db.scalars(
                 select(AgentMessage)
                 .where(AgentMessage.session_id == run.session_id)
@@ -259,6 +302,221 @@ class PiGatewayService:
             now=self.now_fn().timestamp(),
         )
         return run
+
+    async def preflight_mcp(
+        self,
+        run: AgentRun,
+        request: PiGatewayMcpPreflightRequest,
+    ) -> PiGatewayMcpPermitResponse:
+        """Validate the claimed catalog and commit a durable MCP reservation."""
+        if run.runtime_backend != "pi" or not run.tenant_id:
+            raise TenantAccountingError("pi_mcp_run_invalid")
+        catalog = await self.db.scalar(
+            select(McpToolCatalog).where(
+                McpToolCatalog.internal_tool_name == request.tool_name,
+                McpToolCatalog.service_slug == request.server,
+                McpToolCatalog.review_status == "approved",
+                McpToolCatalog.is_enabled.is_(True),
+            )
+        )
+        if catalog is None:
+            raise TenantAccountingError("mcp_tool_not_allowed")
+        try:
+            validate_input(request.args, close_input_schema(catalog.input_schema_json))
+        except (McpValidationError, TypeError, ValueError) as exc:
+            raise TenantAccountingError("mcp_arguments_invalid") from exc
+        snapshot_catalog = (run.runtime_config_snapshot_json or {}).get("adapter_catalog")
+        if not isinstance(snapshot_catalog, list):
+            raise TenantAccountingError("mcp_catalog_snapshot_invalid")
+        digest = catalog.discovery_digest
+        expected_digest = digest if digest.startswith("sha256:") else f"sha256:{digest}"
+        snapshot_entry = next(
+            (
+                entry
+                for entry in snapshot_catalog
+                if isinstance(entry, dict)
+                and entry.get("catalog_entry_id") == catalog.id
+                and entry.get("adapter_visible_name") == catalog.internal_tool_name
+                and entry.get("service") == catalog.service_slug
+            ),
+            None,
+        )
+        if snapshot_entry is None or snapshot_entry.get("input_schema_digest") != expected_digest:
+            raise TenantAccountingError("mcp_catalog_snapshot_digest_mismatch")
+        feature = _feature_for_profile(run.profile_name)
+        decision = await self._feature_allowed(run.tenant_id, run.user_id, feature)
+        if not decision:
+            raise TenantAccountingError("feature_disabled")
+        args_hash = arguments_hash(request.args)
+        logical_id = logical_call_id_for(run.id, catalog.internal_tool_name, args_hash)
+        call = await self.db.scalar(
+            select(AgentToolCall)
+            .where(AgentToolCall.logical_call_id == logical_id)
+            .with_for_update()
+        )
+        attempt = await self.db.scalar(
+            select(AgentRunAttempt)
+            .where(
+                AgentRunAttempt.run_id == run.id,
+                AgentRunAttempt.ended_at.is_(None),
+                AgentRunAttempt.outcome == "running",
+            )
+            .order_by(AgentRunAttempt.attempt.desc())
+            .with_for_update()
+        )
+        if attempt is None:
+            raise TenantAccountingError("pi_mcp_attempt_not_found")
+        if call is not None:
+            if call.run_id != run.id:
+                raise TenantAccountingError("mcp_call_run_mismatch")
+            # A repeated SDK hook must never turn a committed/unknown call into
+            # a second external dispatch.  Recovery owns unknown calls; a
+            # caller must wait for that state transition rather than retrying
+            # through the preflight boundary.
+            if call.status != "planned":
+                raise TenantAccountingError("mcp_call_already_started")
+        if call is None:
+            step = await self.db.scalar(
+                select(AgentStep)
+                .where(AgentStep.run_id == run.id, AgentStep.attempt_id == attempt.id)
+                .order_by(AgentStep.sequence.desc())
+                .with_for_update()
+            )
+            if step is None:
+                step = AgentStep(
+                    id=str(uuid4()),
+                    run_id=run.id,
+                    attempt_id=attempt.id,
+                    sequence=(
+                        await self.db.scalar(
+                            select(func.max(AgentStep.sequence)).where(AgentStep.run_id == run.id)
+                        )
+                        or 0
+                    )
+                    + 1,
+                    step_type="tool_call",
+                    status="running",
+                    visibility="internal",
+                    created_at=self.now_fn(),
+                )
+                self.db.add(step)
+                await self.db.flush()
+            call = AgentToolCall(
+                id=str(uuid4()),
+                run_id=run.id,
+                step_id=step.id,
+                logical_call_id=logical_id,
+                service=catalog.service_slug,
+                internal_tool_name=catalog.internal_tool_name,
+                arguments_json=request.args,
+                arguments_hash=args_hash,
+                status="planned",
+                points_reserved=0,
+                points_settled=0,
+            )
+            self.db.add(call)
+            await self.db.flush()
+        context = McpPreflightContext(
+            tenant_id=run.tenant_id,
+            user_id=run.user_id,
+            run_id=run.id,
+            tool_call_id=call.id,
+            internal_tool_name=catalog.internal_tool_name,
+            service_slug=catalog.service_slug,
+            arguments=request.args,
+            feature=feature,
+        )
+        permit = await TenantAccountingService(self.db).reserve_mcp_call(context)
+        call.points_reserved = permit.amount
+        call.status = "running"
+        call.started_at = call.started_at or self.now_fn()
+        await self.db.flush()
+        return PiGatewayMcpPermitResponse(
+            permit_id=permit.permit_id,
+            catalog_entry_id=catalog.id,
+        )
+
+    async def finalize_mcp(
+        self,
+        run: AgentRun,
+        request: PiGatewayMcpFinalizeRequest,
+    ) -> dict[str, object]:
+        permit_row = await self.db.scalar(
+            select(TenantWalletTransaction)
+            .where(TenantWalletTransaction.id == request.permit_id)
+            .with_for_update()
+        )
+        if (
+            permit_row is None
+            or permit_row.run_id != run.id
+            or permit_row.tenant_id != run.tenant_id
+            or permit_row.user_id != run.user_id
+        ):
+            raise TenantAccountingError("mcp_permit_run_mismatch")
+        details = request.details
+        mode = details.get("mode")
+        accounting = TenantAccountingService(self.db)
+        if mode in {"call", "mcpResult"}:
+            receipt = await accounting.settle_mcp_call(request.permit_id, details)
+            status = "settled"
+        elif mode == "error":
+            classification = details.get("classification", "result_unknown")
+            await accounting.fail_mcp_call(request.permit_id, str(classification))
+            receipt = None
+            status = str(classification)
+        else:
+            raise TenantAccountingError("mcp_result_mode_invalid")
+        await self._update_mcp_call_status(request.permit_id, status)
+        return {"permit_id": request.permit_id, "status": status, "receipt": receipt.model_dump(mode="json") if receipt else None}
+
+    async def fail_mcp(self, run: AgentRun, permit_id: str, classification: str) -> None:
+        permit = await self.db.scalar(
+            select(TenantWalletTransaction)
+            .where(TenantWalletTransaction.id == permit_id)
+            .with_for_update()
+        )
+        if (
+            permit is None
+            or permit.run_id != run.id
+            or permit.tenant_id != run.tenant_id
+            or permit.user_id != run.user_id
+        ):
+            raise TenantAccountingError("mcp_permit_run_mismatch")
+        await TenantAccountingService(self.db).fail_mcp_call(permit_id, classification)
+        await self._update_mcp_call_status(permit_id, classification)
+
+    async def _update_mcp_call_status(self, permit_id: str, status: str) -> None:
+        transaction = await self.db.scalar(
+            select(TenantWalletTransaction).where(TenantWalletTransaction.id == permit_id)
+        )
+        if transaction is None or not transaction.tool_call_id:
+            return
+        call = await self.db.scalar(
+            select(AgentToolCall)
+            .where(AgentToolCall.id == transaction.tool_call_id)
+            .with_for_update()
+        )
+        if call is None:
+            raise TenantAccountingError("mcp_tool_call_not_found")
+        if status == "settled":
+            call.status = "settled"
+            call.points_settled = 10
+            call.points_reserved = 0
+        elif status == "result_unknown":
+            call.status = "unknown"
+            call.error_type = RESULT_UNKNOWN
+        else:
+            call.status = "failed"
+            call.error_type = (
+                DEFINITELY_NOT_SENT if status == "definitely_not_sent" else "failed_confirmed"
+            )
+            call.points_reserved = 0
+        call.completed_at = self.now_fn()
+
+    async def _feature_allowed(self, tenant_id: str, user_id: str, feature: str) -> bool:
+        from app.licensing.service import LicenseService
+
+        return await LicenseService(self.db).authorize_feature(tenant_id, user_id, feature)
 
 
 class PiGatewayRecoveryService:
@@ -453,3 +711,16 @@ def _secret_bundle_dict(bundle: RuntimeSecretBundle) -> dict[str, Any]:
             key: value.get_secret_value() for key, value in bundle.datatap_urls.items()
         },
     }
+
+
+def _feature_for_profile(profile_name: str) -> str:
+    lowered = profile_name.lower()
+    if "brand" in lowered:
+        return "brand_analysis"
+    if "campaign" in lowered:
+        return "campaign_analysis"
+    if "detail" in lowered:
+        return "kol_detail"
+    if "utility" in lowered:
+        return "utility"
+    return "kol_selection"

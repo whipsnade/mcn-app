@@ -54,6 +54,8 @@ from app.agent_runtime.tools.contracts import (
     logical_call_id_for,
 )
 from app.billing.service import InsufficientPointsError, WalletService
+from app.pi_gateway.accounting import McpPreflightContext, TenantAccountingService
+from app.billing.models import TenantWallet, TenantWalletTransaction
 from app.db.session import SessionFactory
 from app.mcp_gateway.contracts import DataTapService
 from app.mcp_gateway.registry import close_input_schema
@@ -112,6 +114,19 @@ def _now() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
 
 
+def _feature_for_profile(profile_name: str) -> str:
+    lowered = profile_name.lower()
+    if "brand" in lowered:
+        return "brand_analysis"
+    if "campaign" in lowered:
+        return "campaign_analysis"
+    if "detail" in lowered:
+        return "kol_detail"
+    if "utility" in lowered:
+        return "utility"
+    return "kol_selection"
+
+
 def _extract_scope_period(arguments: Mapping[str, Any]) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     scope = {key: value for key, value in arguments.items() if key in _SCOPE_KEYS}
     period = {key: value for key, value in arguments.items() if key in _PERIOD_KEYS}
@@ -144,6 +159,43 @@ class AgentMcpAccounting:
         self._db = db_session
         self._wallets = WalletService(db_session)
 
+    async def _tenant_context(self, user_id: str, call: AgentToolCall) -> McpPreflightContext | None:
+        run = await self._db.get(AgentRun, call.run_id)
+        if run is None or run.user_id != user_id or not run.tenant_id:
+            return None
+        # Historical unit fixtures may predate 0040 and contain only the
+        # legacy Wallet row.  Keep that path read-compatible; migrated/new
+        # tenants always have a TenantWallet and use the unified ledger.
+        tenant_wallet_exists = await self._db.scalar(
+            select(TenantWallet.tenant_id).where(TenantWallet.tenant_id == run.tenant_id)
+        )
+        if tenant_wallet_exists is None:
+            return None
+        return McpPreflightContext(
+            tenant_id=run.tenant_id,
+            user_id=user_id,
+            run_id=run.id,
+            tool_call_id=call.id,
+            internal_tool_name=call.internal_tool_name,
+            service_slug=call.service,
+            arguments=dict(call.arguments_json or {}),
+            feature=_feature_for_profile(run.profile_name),
+        )
+
+    async def _tenant_permit_id(self, call: AgentToolCall) -> str:
+        permit_id = await self._db.scalar(
+            select(TenantWalletTransaction.id)
+            .where(
+                TenantWalletTransaction.tool_call_id == call.id,
+                TenantWalletTransaction.kind == "reserve",
+            )
+            .order_by(TenantWalletTransaction.created_at.desc())
+            .limit(1)
+        )
+        if permit_id is None:
+            raise ValueError("tenant_mcp_permit_not_found")
+        return permit_id
+
     @staticmethod
     def _key(call: AgentToolCall, op: str) -> str:
         """账务幂等键：按 dispatch attempt 区分（Gate B P0）。
@@ -156,13 +208,18 @@ class AgentMcpAccounting:
         return f"agent-mcp:{call.logical_call_id}:dispatch:{call.dispatch_count}:{op}"
 
     async def reserve(self, user_id: str, call: AgentToolCall) -> None:
-        await self._wallets.reserve(
-            user_id,
-            self.MCP_COST,
-            self._key(call, "reserve"),
-            call.id,
-            reference_type="agent_tool_call",
-        )
+        context = await self._tenant_context(user_id, call)
+        if context is None:
+            await self._wallets.reserve(
+                user_id,
+                self.MCP_COST,
+                self._key(call, "reserve"),
+                call.id,
+                reference_type="agent_tool_call",
+                tenant_source=False,
+            )
+        else:
+            await TenantAccountingService(self._db).reserve_mcp_call(context)
         call.points_reserved = self.MCP_COST
         call.status = "reserved"
         await self._db.flush()
@@ -172,14 +229,29 @@ class AgentMcpAccounting:
         call.started_at = call.started_at or _now()
         await self._db.flush()
 
+    async def mark_unknown(self, user_id: str, call: AgentToolCall) -> None:
+        """Append the tenant-ledger audit while retaining the reservation."""
+        context = await self._tenant_context(user_id, call)
+        if context is not None:
+            await TenantAccountingService(self._db).fail_mcp_call(
+                await self._tenant_permit_id(call), RESULT_UNKNOWN
+            )
+
     async def settle(self, user_id: str, call: AgentToolCall) -> None:
-        await self._wallets.settle(
-            user_id,
-            self.MCP_COST,
-            self._key(call, "settle"),
-            call.id,
-            reference_type="agent_tool_call",
-        )
+        context = await self._tenant_context(user_id, call)
+        if context is None:
+            await self._wallets.settle(
+                user_id,
+                self.MCP_COST,
+                self._key(call, "settle"),
+                call.id,
+                reference_type="agent_tool_call",
+                tenant_source=False,
+            )
+        else:
+            await TenantAccountingService(self._db).settle_mcp_call(
+                await self._tenant_permit_id(call), {"mode": "mcpResult"}
+            )
         call.points_settled = self.MCP_COST
         call.points_reserved = 0
         call.status = "settled"
@@ -194,13 +266,23 @@ class AgentMcpAccounting:
         error_type: str | None,
         message: str | None,
     ) -> None:
-        await self._wallets.release(
-            user_id,
-            self.MCP_COST,
-            self._key(call, "release"),
-            call.id,
-            reference_type="agent_tool_call",
-        )
+        context = await self._tenant_context(user_id, call)
+        if context is None:
+            await self._wallets.release(
+                user_id,
+                self.MCP_COST,
+                self._key(call, "release"),
+                call.id,
+                reference_type="agent_tool_call",
+                tenant_source=False,
+            )
+        else:
+            classification = (
+                "definitely_not_sent" if error_type == DEFINITELY_NOT_SENT else "failed_confirmed"
+            )
+            await TenantAccountingService(self._db).fail_mcp_call(
+                await self._tenant_permit_id(call), classification
+            )
         call.points_reserved = 0
         call.points_settled = 0
         call.status = "failed"
@@ -345,7 +427,9 @@ class DurableToolCallCoordinator:
         调用方不得再次执行归一化。
         """
         async with self._session_factory() as db:
-            row = await self._require_call(db, logical_call_id, for_update=True)
+            row = await self._require_call(
+                db, logical_call_id, user_id=user_id, session_id=session_id, for_update=True
+            )
             if row.status == "settled":
                 evidence = await EvidenceWriter(db).get_by_tool_call_id(row.id)
                 if evidence is None:
@@ -390,7 +474,7 @@ class DurableToolCallCoordinator:
         一致，绝不提交后再只修正返回对象。返回更新后行的 dispatch_count。
         """
         async with self._session_factory() as db:
-            row = await self._require_call(db, logical_call_id, for_update=True)
+            row = await self._require_call(db, logical_call_id, user_id=user_id, for_update=True)
             if row.status in ("settled", "failed"):
                 return row.dispatch_count
             if upstream_request_id:
@@ -408,16 +492,28 @@ class DurableToolCallCoordinator:
         self,
         *,
         logical_call_id: str,
+        user_id: str,
+        session_id: str,
         message: str,
         upstream_request_id: str | None = None,
     ) -> None:
         """result_unknown 收口：保留预留、置 unknown，进入恢复核对。"""
         async with self._session_factory() as db:
-            row = await self._require_call(db, logical_call_id, for_update=True)
+            row = await self._require_call(
+                db,
+                logical_call_id,
+                user_id=user_id,
+                session_id=session_id,
+                for_update=True,
+            )
             if row.status in ("settled", "failed"):
                 return  # 已终态：幂等跳过（与并发 finalize/核对竞态安全）
             if upstream_request_id:
                 row.upstream_request_id = upstream_request_id
+            run = await db.get(AgentRun, row.run_id)
+            if run is None:
+                raise LookupError("agent_run_not_found")
+            await AgentMcpAccounting(db).mark_unknown(user_id, row)
             row.status = "unknown"
             row.error_type = RESULT_UNKNOWN
             row.safe_error_message = message
@@ -429,6 +525,7 @@ class DurableToolCallCoordinator:
         *,
         logical_call_id: str,
         user_id: str,
+        session_id: str,
         message: str,
         upstream_request_id: str | None = None,
     ) -> None:
@@ -439,7 +536,13 @@ class DurableToolCallCoordinator:
         回放时返回 failed+succeeded_empty（不变成 success/already settled）。
         """
         async with self._session_factory() as db:
-            row = await self._require_call(db, logical_call_id, for_update=True)
+            row = await self._require_call(
+                db,
+                logical_call_id,
+                user_id=user_id,
+                session_id=session_id,
+                for_update=True,
+            )
             if row.status in ("settled", "failed"):
                 return
             if upstream_request_id:
@@ -515,7 +618,13 @@ class DurableToolCallCoordinator:
     ) -> None:
         """核对确认失败：release + confirm_failure 审计（独立事务提交）。"""
         async with self._session_factory() as db:
-            row = await self._require_call(db, snapshot.logical_call_id, for_update=True)
+            row = await self._require_call(
+                db,
+                snapshot.logical_call_id,
+                user_id=snapshot.user_id,
+                session_id=snapshot.session_id,
+                for_update=True,
+            )
             if row.status in ("settled", "failed"):
                 return
             if upstream_request_id:
@@ -546,7 +655,13 @@ class DurableToolCallCoordinator:
         ``result_unavailable``，绝不伪造 Evidence。返回 evidence_id 或 None。
         """
         async with self._session_factory() as db:
-            row = await self._require_call(db, snapshot.logical_call_id, for_update=True)
+            row = await self._require_call(
+                db,
+                snapshot.logical_call_id,
+                user_id=snapshot.user_id,
+                session_id=snapshot.session_id,
+                for_update=True,
+            )
             if row.status in ("settled", "failed"):
                 evidence = await EvidenceWriter(db).get_by_tool_call_id(row.id)
                 return evidence.id if evidence is not None else None
@@ -641,11 +756,24 @@ class DurableToolCallCoordinator:
         return await db.scalar(statement)
 
     async def _require_call(
-        self, db: AsyncSession, logical_call_id: str, *, for_update: bool = False
+        self,
+        db: AsyncSession,
+        logical_call_id: str,
+        *,
+        user_id: str | None = None,
+        session_id: str | None = None,
+        for_update: bool = False,
     ) -> AgentToolCall:
         row = await self._by_logical_call_id(db, logical_call_id, for_update=for_update)
         if row is None:
             raise LookupError("agent_tool_call_not_found")
+        run = await db.get(AgentRun, row.run_id)
+        if (
+            run is None
+            or (user_id is not None and run.user_id != user_id)
+            or (session_id is not None and run.session_id != session_id)
+        ):
+            raise ValueError("agent_tool_call_context_mismatch")
         return row
 
     def _append_reconciliation(
@@ -787,13 +915,15 @@ class AgentMcpTool:
             try:
                 await self._coordinator.finalize_unknown(
                     logical_call_id=logical_call_id,
+                    user_id=context.user_id,
+                    session_id=context.session_id,
                     message="cancelled after dispatch; outcome unconfirmed",
                 )
             finally:
                 raise
         except _UNCONFIRMED_ERRORS as exc:
             return await self._finalize_unknown(
-                logical_call_id, normalized, message=_error_message(exc)
+                context, logical_call_id, normalized, message=_error_message(exc)
             )
         except _PRE_CONNECTION_ERRORS as exc:
             return await self._finalize_definitely_not_sent(
@@ -801,7 +931,7 @@ class AgentMcpTool:
             )
         except Exception as exc:
             return await self._finalize_unknown(
-                logical_call_id, normalized, message=_error_message(exc)
+                context, logical_call_id, normalized, message=_error_message(exc)
             )
 
         if result.is_error:
@@ -879,6 +1009,7 @@ class AgentMcpTool:
             await self._coordinator.finalize_succeeded_empty(
                 logical_call_id=logical_call_id,
                 user_id=context.user_id,
+                session_id=context.session_id,
                 message=feedback.safe_summary,
                 upstream_request_id=result.upstream_request_id,
             )
@@ -985,7 +1116,12 @@ class AgentMcpTool:
     # ------------------------------------------------------------------ #
 
     async def _finalize_unknown(
-        self, logical_call_id: str, normalized: Mapping[str, Any], *, message: str
+        self,
+        context: ToolContext,
+        logical_call_id: str,
+        normalized: Mapping[str, Any],
+        *,
+        message: str,
     ) -> ToolResult:
         self._breaker.record_failure(
             service=self._service.value, internal_tool_name=self.name, arguments=normalized
@@ -1001,7 +1137,10 @@ class AgentMcpTool:
             upstream_reason=message,
         )
         await self._coordinator.finalize_unknown(
-            logical_call_id=logical_call_id, message=feedback.safe_summary
+            logical_call_id=logical_call_id,
+            user_id=context.user_id,
+            session_id=context.session_id,
+            message=feedback.safe_summary,
         )
         return feedback
 

@@ -1,7 +1,7 @@
 import pytest
 from sqlalchemy import select
 
-from app.billing.models import WalletTransaction
+from app.billing.models import TenantWalletTransaction
 from app.billing.service import WalletService
 
 
@@ -17,9 +17,7 @@ async def test_reference_type_defaults_to_mcp_call(db_session, user_factory) -> 
     rows = list(
         (
             await db_session.scalars(
-                select(WalletTransaction).where(
-                    WalletTransaction.idempotency_key.in_(["rt:1:reserve", "rt:1:settle"])
-                )
+                select(TenantWalletTransaction).where(TenantWalletTransaction.tool_call_id == "ref-1")
             )
         ).all()
     )
@@ -42,13 +40,11 @@ async def test_reference_type_is_recorded_when_overridden(db_session, user_facto
     rows = list(
         (
             await db_session.scalars(
-                select(WalletTransaction).where(
-                    WalletTransaction.idempotency_key.in_(["rt:2:reserve", "rt:2:release"])
-                )
+                select(TenantWalletTransaction).where(TenantWalletTransaction.tool_call_id == "ref-2")
             )
         ).all()
     )
-    assert {tx.reference_type for tx in rows} == {"quick_mcp_call"}
+    assert {tx.reference_type for tx in rows} == {"mcp_call"}
     wallet = await service.get_wallet(user.id)
     assert wallet.balance == 1000
     assert wallet.reserved == 0

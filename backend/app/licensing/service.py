@@ -34,6 +34,37 @@ class LicenseService:
     def __init__(self, db: AsyncSession) -> None:
         self.db = db
 
+    async def authorize_feature(self, tenant_id: str, user_id: str, feature: str) -> bool:
+        """Check a feature without counting the already-running Run.
+
+        MCP preflight happens inside an existing Pi Run, so reusing
+        ``authorize_run`` would incorrectly trip the concurrency ceiling.
+        """
+        row = await self.db.execute(
+            select(Tenant, TenantLicense)
+            .join(TenantLicense, TenantLicense.id == Tenant.active_license_id)
+            .join(TenantMembership, TenantMembership.tenant_id == Tenant.id)
+            .join(User, User.id == TenantMembership.user_id)
+            .where(
+                Tenant.id == tenant_id,
+                TenantMembership.user_id == user_id,
+                TenantMembership.status == "active",
+                User.status == "active",
+            )
+        )
+        result = row.one_or_none()
+        if result is None:
+            return False
+        tenant, license_row = result
+        now = datetime.now(UTC).replace(tzinfo=None)
+        return bool(
+            tenant.status == "active"
+            and tenant.license_status == "active"
+            and license_row.valid_from <= now
+            and (license_row.valid_until is None or license_row.valid_until > now)
+            and license_row.features_json.get(feature) is True
+        )
+
     async def authorize_run(
         self, tenant_id: str, user_id: str, feature: str
     ) -> LicenseDecision:

@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import { parsePiGatewayClaimResponse, parsePiGatewaySourceEvent } from "../src/protocol.js";
+import {
+  normalizePiGatewayAdapterCatalog,
+  parsePiGatewayClaimResponse,
+  parsePiGatewaySourceEvent,
+} from "../src/protocol.js";
 
 describe("Pi Gateway protocol parser", () => {
   it("rejects identity fields, unknown event types, and overlong deltas", () => {
@@ -26,5 +30,24 @@ describe("Pi Gateway protocol parser", () => {
     expect(parsePiGatewayClaimResponse(claim).run_id).toBe("run-1");
     expect(() => parsePiGatewayClaimResponse({ ...claim, transcript: [{ role: "user", content: "x", path: "/tmp" }] })).toThrow("pi_gateway_claim_response_invalid");
     expect(() => parsePiGatewayClaimResponse({ ...claim, runtime_snapshot: { token: "secret" } })).toThrow("pi_gateway_claim_response_invalid");
+  });
+
+  it("normalizes the snake_case claim catalog at the worker boundary", () => {
+    expect(normalizePiGatewayAdapterCatalog([
+      {
+        catalog_entry_id: "catalog-1",
+        adapter_visible_name: "query_analysis_data",
+        service: "insight-cube-mcp",
+        remote_name: "query_analysis_data",
+        input_schema_digest: "sha256:" + "a".repeat(64),
+      },
+    ])).toEqual([
+      {
+        service: "insight-cube",
+        adapterName: "query_analysis_data",
+        remoteName: "query_analysis_data",
+        schemaDigest: "sha256:" + "a".repeat(64),
+      },
+    ]);
   });
 });

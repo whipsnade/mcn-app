@@ -5,7 +5,16 @@ import type {
   PiGatewayClaimResponse,
   PiGatewaySourceEvent,
 } from "./protocol.js";
-import { parsePiGatewayClaimResponse, parsePiGatewaySourceEvent } from "./protocol.js";
+import type {
+  McpAccountingControlPlane,
+  McpPermit,
+  McpToolCallInput,
+} from "./mcp-accounting-extension.js";
+import {
+  normalizePiGatewayClaimResponse,
+  parsePiGatewayClaimResponse,
+  parsePiGatewaySourceEvent,
+} from "./protocol.js";
 
 export interface ControlPlaneClientOptions {
   origin: string;
@@ -22,6 +31,8 @@ export interface ControlPlaneTransport {
   executeInternalTool(toolName: string, args: Record<string, unknown>): Promise<unknown>;
 }
 
+export interface RunControlPlaneTransport extends ControlPlaneTransport, McpAccountingControlPlane {}
+
 /** Stable infrastructure classification; callers must leave the Run for recovery. */
 export class ControlPlaneUnavailableError extends Error {
   readonly code = "control_plane_unreachable" as const;
@@ -31,6 +42,13 @@ export class ControlPlaneUnavailableError extends Error {
     this.name = "ControlPlaneUnavailableError";
   }
 }
+
+const BACKEND_SERVICE_SLUGS: Readonly<Record<string, string>> = Object.freeze({
+  "insight-cube": "insight-cube-mcp",
+  "social-grow": "social-grow-mcp",
+  "social-grow-content": "social-grow-content-mcp",
+  aktools: "aktools-mcp",
+});
 
 export class ControlPlaneClient implements ControlPlaneTransport {
   private readonly origin: string;
@@ -71,7 +89,9 @@ export class ControlPlaneClient implements ControlPlaneTransport {
 
   async claim(payload: { capacity: number }): Promise<PiGatewayClaimResponse | undefined> {
     const response = await this.request("POST", "/claims", payload);
-    return response === undefined ? undefined : parsePiGatewayClaimResponse(response);
+    return response === undefined
+      ? undefined
+      : normalizePiGatewayClaimResponse(parsePiGatewayClaimResponse(response));
   }
 
   async heartbeat(runId: string, attemptId: string, leaseToken: string): Promise<unknown> {
@@ -94,10 +114,53 @@ export class ControlPlaneClient implements ControlPlaneTransport {
     );
   }
 
-  forRun(runId: string, attemptId: string, leaseToken: string): ControlPlaneTransport {
+  async preflightMcp(
+    runId: string,
+    input: McpToolCallInput,
+    leaseToken: string,
+  ): Promise<McpPermit> {
+    const result = await this.request<unknown>(
+      "POST",
+      `/runs/${encodeURIComponent(runId)}/mcp/preflight`,
+      {
+        tool_name: input.tool,
+        server: BACKEND_SERVICE_SLUGS[input.server.split("__", 1)[0]] ?? input.server,
+        args: input.args,
+      },
+      leaseToken,
+    );
+    if (!result || typeof result !== "object" || !("permit_id" in result) || typeof result.permit_id !== "string") {
+      throw new Error("mcp_permit_invalid");
+    }
+    return result as McpPermit;
+  }
+
+  async finalizeMcp(runId: string, permit: McpPermit, details: unknown, leaseToken: string): Promise<unknown> {
+    return this.request("POST", `/runs/${encodeURIComponent(runId)}/mcp/finalize`, {
+      permit_id: permit.permit_id,
+      details,
+    }, leaseToken);
+  }
+
+  async failMcp(
+    runId: string,
+    permit: McpPermit,
+    classification: "definitely_not_sent" | "failed_confirmed" | "result_unknown",
+    leaseToken: string,
+  ): Promise<unknown> {
+    return this.request("POST", `/runs/${encodeURIComponent(runId)}/mcp/fail`, {
+      permit_id: permit.permit_id,
+      classification,
+    }, leaseToken);
+  }
+
+  forRun(runId: string, attemptId: string, leaseToken: string): RunControlPlaneTransport {
     return {
       executeInternalTool: (toolName, args) =>
         this.executeInternalTool(toolName, args, runId, attemptId, leaseToken),
+      preflight: (input) => this.preflightMcp(runId, input, leaseToken),
+      finalize: (permit, details) => this.finalizeMcp(runId, permit, details, leaseToken),
+      fail: (permit, classification) => this.failMcp(runId, permit, classification, leaseToken),
     };
   }
 

@@ -7,7 +7,7 @@ import {
 
 import type { AdapterCatalogEntry, SkillCatalogEntry } from "./protocol.js";
 
-const REQUIRED_SERVICES = ["insight-cube", "social-grow", "social-grow-content", "aktools"] as const;
+const ALLOWED_SERVICES = ["insight-cube", "social-grow", "social-grow-content", "aktools"] as const;
 
 export interface ProductionResourceLoaderOptions {
   cwd: string;
@@ -56,15 +56,21 @@ export function createMcpConfig(catalog: readonly AdapterCatalogEntry[]): {
 } {
   const seen = new Set<string>();
   const mcpServers: Record<string, { command: string; args: string[]; env: Record<string, string> }> = {};
-  for (const entry of catalog) {
-    if (!REQUIRED_SERVICES.includes(entry.service as (typeof REQUIRED_SERVICES)[number]) || seen.has(entry.service)) {
+  for (const [index, entry] of catalog.entries()) {
+    if (!ALLOWED_SERVICES.includes(entry.service as (typeof ALLOWED_SERVICES)[number])) {
       throw new Error("pi_mcp_catalog_invalid");
     }
-    if (!entry.adapterName || !entry.remoteName || !/^sha256:[a-f0-9]{1,128}$/i.test(entry.schemaDigest)) {
+    if (
+      !entry.adapterName || !/^[A-Za-z0-9._:-]{1,128}$/.test(entry.adapterName) ||
+      !entry.remoteName || !/^[A-Za-z0-9._:-]{1,128}$/.test(entry.remoteName) ||
+      !/^sha256:[a-f0-9]{1,128}$/i.test(entry.schemaDigest)
+    ) {
       throw new Error("pi_mcp_catalog_invalid");
     }
+    const serverName = adapterServerName(entry, index, catalog);
+    if (mcpServers[serverName]) throw new Error("pi_mcp_catalog_invalid");
     seen.add(entry.service);
-    mcpServers[entry.service] = {
+    mcpServers[serverName] = {
       command: "pi-mcp-adapter",
       args: ["--service", entry.service, "--remote-tool", entry.remoteName],
       env: {
@@ -74,10 +80,20 @@ export function createMcpConfig(catalog: readonly AdapterCatalogEntry[]): {
       },
     };
   }
-  if (seen.size !== REQUIRED_SERVICES.length) {
+  if (seen.size === 0) {
     throw new Error("pi_mcp_catalog_incomplete");
   }
   return { mcpServers };
+}
+
+/** Stable server key for a catalog that contains multiple reviewed tools per service. */
+export function adapterServerName(
+  entry: AdapterCatalogEntry,
+  index: number,
+  catalog: readonly AdapterCatalogEntry[],
+): string {
+  const firstIndex = catalog.findIndex((item) => item.service === entry.service);
+  return firstIndex === index ? entry.service : `${entry.service}__${entry.adapterName}`;
 }
 
 async function noopExtension(): Promise<void> {

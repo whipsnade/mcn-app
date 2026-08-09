@@ -33,7 +33,7 @@ from app.agent_runtime.models import (
     AgentToolCallReconciliation,
     EvidenceItem,
 )
-from app.billing.models import WalletTransaction
+from app.billing.models import TenantWalletTransaction
 from app.billing.service import WalletService
 from app.core.security import create_access_token
 from app.db.session import get_db
@@ -359,8 +359,9 @@ async def test_reconcile_idempotent_replay_no_double_settle(
     # 只结算一次：幂等键阻止重复扣费
     settles = (
         await db_session.scalars(
-            select(WalletTransaction).where(
-                WalletTransaction.idempotency_key == f"agent-mcp:{LOGICAL_CALL_ID}:settle"
+            select(TenantWalletTransaction).where(
+                TenantWalletTransaction.idempotency_key
+                == f"tenant-mcp:{call.id}:settle"
             )
         )
     ).all()

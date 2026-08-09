@@ -1,7 +1,8 @@
 import pytest
 from sqlalchemy import func, select
 
-from app.billing.models import Wallet, WalletTransaction
+from app.billing.models import TenantWallet, TenantWalletTransaction
+from app.tenancy.models import TenantMembership
 from app.billing.service import (
     InsufficientPointsError,
     ReservationRequest,
@@ -14,7 +15,11 @@ async def test_batch_reservation_is_all_or_nothing(db_session, user_factory) -> 
     user = await user_factory()
     wallet_service = WalletService(db_session)
     await wallet_service.ensure_welcome_grant(user.id)
-    wallet = await db_session.get(Wallet, user.id)
+    membership = await db_session.scalar(
+        select(TenantMembership).where(TenantMembership.user_id == user.id)
+    )
+    assert membership is not None
+    wallet = await db_session.get(TenantWallet, membership.tenant_id)
     assert wallet is not None
     wallet.balance = 20
     wallet.reserved = 0
@@ -32,9 +37,9 @@ async def test_batch_reservation_is_all_or_nothing(db_session, user_factory) -> 
 
     wallet = await wallet_service.get_wallet(user.id)
     reserve_count = await db_session.scalar(
-        select(func.count(WalletTransaction.id)).where(
-            WalletTransaction.user_id == user.id,
-            WalletTransaction.kind == "reserve",
+        select(func.count(TenantWalletTransaction.id)).where(
+            TenantWalletTransaction.user_id == user.id,
+            TenantWalletTransaction.kind == "reserve",
         )
     )
     assert (wallet.balance, wallet.reserved) == (20, 0)

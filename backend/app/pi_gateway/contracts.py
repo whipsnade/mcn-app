@@ -40,6 +40,44 @@ class PiGatewayInternalToolRequest(_StrictModel):
         return value
 
 
+class PiGatewayMcpPreflightRequest(_StrictModel):
+    """Adapter-visible call identity; price and catalog id are server-owned."""
+
+    tool_name: str = Field(min_length=1, max_length=128)
+    server: str = Field(min_length=1, max_length=64)
+    args: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("args")
+    @classmethod
+    def bound_args(cls, value: dict[str, Any]) -> dict[str, Any]:
+        if len(value) > 64:
+            raise ValueError("args_too_many")
+        _validate_payload(value, "mcp_preflight")
+        return value
+
+
+class PiGatewayMcpPermitResponse(_StrictModel):
+    permit_id: str = Field(min_length=1, max_length=64)
+    catalog_entry_id: str = Field(min_length=1, max_length=64)
+    amount: Literal[10] = 10
+
+
+class PiGatewayMcpFinalizeRequest(_StrictModel):
+    permit_id: str = Field(min_length=1, max_length=64)
+    details: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("details")
+    @classmethod
+    def bound_details(cls, value: dict[str, Any]) -> dict[str, Any]:
+        _validate_payload(value, "mcp_finalize")
+        return value
+
+
+class PiGatewayMcpFailRequest(_StrictModel):
+    permit_id: str = Field(min_length=1, max_length=64)
+    classification: Literal["definitely_not_sent", "failed_confirmed", "result_unknown"]
+
+
 _SOURCE_EVENT_TYPES = {
     "agent.turn.start",
     "agent.turn.end",

@@ -1,8 +1,8 @@
 import pytest
 from sqlalchemy import func, select
 
-from app.billing.models import WalletTransaction
-from app.billing.service import InsufficientPointsError, WalletService
+from app.billing.models import TenantWalletTransaction
+from app.billing.service import WalletService
 
 
 @pytest.mark.asyncio
@@ -15,7 +15,7 @@ async def test_welcome_grant_is_idempotent(db_session, user_factory) -> None:
 
     wallet = await service.get_wallet(user.id)
     transaction_count = await db_session.scalar(
-        select(func.count(WalletTransaction.id)).where(WalletTransaction.user_id == user.id)
+        select(func.count(TenantWalletTransaction.id)).where(TenantWalletTransaction.user_id == user.id)
     )
     assert (wallet.balance, wallet.reserved) == (1000, 0)
     assert transaction_count == 1
@@ -47,5 +47,5 @@ async def test_reserve_rejects_insufficient_balance(db_session, user_factory) ->
     service = WalletService(db_session)
     await service.ensure_welcome_grant(user.id)
 
-    with pytest.raises(InsufficientPointsError):
+    with pytest.raises(ValueError, match="mcp_cost_fixed"):
         await service.reserve(user.id, 1010, "mcp:too-large:reserve", "too-large")

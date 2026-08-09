@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 
 import { createProductionPiSession } from "./pi-session.js";
 import { buildSecretEnv, clearSecretEnv } from "./secret-env.js";
+import type { McpAccountingControlPlane } from "./mcp-accounting-extension.js";
 import type { ClaimedRun, PiRunSession, PiSdkEvent, PiSessionFactory, SecretBundle } from "./protocol.js";
 
 export interface WorkerOptions {
@@ -11,6 +12,7 @@ export interface WorkerOptions {
   parentEnv?: NodeJS.ProcessEnv;
   onEvent?: (event: PiSdkEvent) => void;
   onReady?: () => void;
+  mcpAccounting?: McpAccountingControlPlane;
 }
 
 export interface IsolatedWorkerOptions {
@@ -108,7 +110,10 @@ export async function runSingleWorker(
   try {
     session = options.sessionFactory
       ? await options.sessionFactory.create(work, workerSecrets)
-      : await createProductionPiSession(work, workerSecrets, { fakeProvider: options.fakeProvider });
+      : await createProductionPiSession(work, workerSecrets, {
+        fakeProvider: options.fakeProvider,
+        mcpAccounting: options.mcpAccounting,
+      });
     workerSecrets = undefined;
     options.onReady?.();
     unsubscribe = session.subscribe((event) => options.onEvent?.(event));

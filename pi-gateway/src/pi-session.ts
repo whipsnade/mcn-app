@@ -17,7 +17,12 @@ import {
   type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
 
-import { createMcpConfig, createProductionResourceLoader } from "./resource-loader.js";
+import { adapterServerName, createMcpConfig, createProductionResourceLoader } from "./resource-loader.js";
+import {
+  createMcpAccountingExtensionFactory,
+  McpAccountingExtension,
+  type McpAccountingControlPlane,
+} from "./mcp-accounting-extension.js";
 import {
   assertCompletePiSdkContract,
   PI_ALLOWED_TOOL_NAMES,
@@ -29,6 +34,8 @@ import {
 
 export interface PiSessionOptions {
   fakeProvider?: boolean;
+  /** Optional control-plane bridge used by the MCP adapter hook. */
+  mcpAccounting?: McpAccountingControlPlane;
 }
 
 export async function createProductionPiSession(
@@ -48,6 +55,9 @@ export async function createProductionPiSession(
 
   let disposed = false;
   try {
+    const mcpAccounting = options.mcpAccounting
+      ? new McpAccountingExtension(options.mcpAccounting)
+      : undefined;
     const authStorage = AuthStorage.inMemory();
     authStorage.setRuntimeApiKey(work.runtimeSnapshot.model.provider, secrets.modelApiKey);
     const modelRegistry = ModelRegistry.inMemory(authStorage);
@@ -58,6 +68,13 @@ export async function createProductionPiSession(
       rootPolicy: work.runtimeSnapshot.rootPolicy,
       skillCatalog: work.runtimeSnapshot.skillCatalog,
       adapterCatalog: work.runtimeSnapshot.adapterCatalog,
+      extensionFactories: mcpAccounting
+        ? [createMcpAccountingExtensionFactory(mcpAccounting, work.runtimeSnapshot.adapterCatalog.map((entry, index, catalog) => ({
+          toolName: entry.adapterName,
+          server: adapterServerName(entry, index, catalog),
+          remoteName: entry.remoteName,
+        })))]
+        : undefined,
     });
     await loader.reload();
     const settingsManager = SettingsManager.inMemory({
@@ -116,6 +133,7 @@ export async function createProductionPiSession(
       systemPrompt: () => session.systemPrompt,
       activeToolNames: () => session.getActiveToolNames(),
       cwd: () => runDir,
+      mcpAccounting,
     };
   } catch (error) {
     await rm(runDir, { recursive: true, force: true });

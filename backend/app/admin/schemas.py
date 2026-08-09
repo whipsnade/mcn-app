@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 
 class AdminUserItem(BaseModel):
     id: str
+    tenant_id: str | None = None
     nickname: str
     role: str
     status: str
@@ -47,6 +48,7 @@ class PointsAdjustRequest(BaseModel):
 
 
 class PointsAdjustResponse(BaseModel):
+    tenant_id: str | None = None
     points: int
     reserved_points: int
     transaction_id: str

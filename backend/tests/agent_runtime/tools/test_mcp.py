@@ -723,6 +723,7 @@ async def _make_unknown_call(
         await WalletService(db).reserve(
             chain.user_id, MCP_POINTS_COST, f"agent-mcp:{logical_id}:reserve", call.id,
             reference_type="agent_tool_call",
+            tenant_source=False,
         )
         call_id = call.id
     return logical_id, call_id
@@ -1534,6 +1535,7 @@ async def test_p0_dnr_retry_insufficient_balance_no_dispatch() -> None:
             await WalletService(db).reserve(
                 chain.user_id, 15, "drain-for-retry-test", "drain-1",
                 reference_type="agent_tool_call",
+                tenant_source=False,
             )
         w_drained = await _wallet(chain.user_id)
         assert (w_drained.balance, w_drained.reserved) == (5, 15)

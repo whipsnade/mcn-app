@@ -56,6 +56,7 @@ from app.identity.models import User
 from app.mcp_gateway.contracts import DataTapService
 from app.mcp_gateway.transport import RemoteToolResult
 from app.mcp_gateway.validation import canonical_json_bytes
+from app.pi_gateway.accounting import McpPreflightContext, TenantAccountingService
 
 INPUT_SCHEMA = {
     "type": "object",
@@ -155,6 +156,22 @@ def _bridge(db_session, transport: FakeMcpTransport) -> AgentMcpTool:
     )
 
 
+async def _reserve_tenant_call(db_session, user_id: str, run: AgentRun, call: AgentToolCall) -> None:
+    """Create the real tenant permit for a funded recovery fixture."""
+    await TenantAccountingService(db_session).reserve_mcp_call(
+        McpPreflightContext(
+            tenant_id=run.tenant_id,
+            user_id=user_id,
+            run_id=run.id,
+            tool_call_id=call.id,
+            internal_tool_name=call.internal_tool_name,
+            service_slug=call.service,
+            arguments=dict(call.arguments_json or {}),
+            feature="session_analyst",
+        )
+    )
+
+
 async def _make_unknown_call(
     db_session, user_id: str, run: AgentRun, step: AgentStep, *, upstream_request_id: str
 ) -> tuple[str, AgentToolCall]:
@@ -176,10 +193,7 @@ async def _make_unknown_call(
         started_at=now,
     )
     db_session.add(call)
-    await WalletService(db_session).reserve(
-        user_id, MCP_POINTS_COST, f"agent-mcp:{logical_id}:reserve", call.id,
-        reference_type="agent_tool_call",
-    )
+    await _reserve_tenant_call(db_session, user_id, run, call)
     await db_session.flush()
     return logical_id, call
 
@@ -519,6 +533,7 @@ async def _setup_call_committed(
         await WalletService(db).reserve(
             user.id, MCP_POINTS_COST, f"agent-mcp:{logical_id}:reserve", call.id,
             reference_type="agent_tool_call",
+            tenant_source=False,
         )
         await db.flush()
         user_id, call_id = user.id, call.id
@@ -723,10 +738,7 @@ async def _make_call(
         started_at=started_at,
     )
     db_session.add(call)
-    await WalletService(db_session).reserve(
-        user_id, MCP_POINTS_COST, f"agent-mcp:{logical_id}:reserve", call.id,
-        reference_type="agent_tool_call",
-    )
+    await _reserve_tenant_call(db_session, user_id, run, call)
     await db_session.flush()
     return logical_id, call
 

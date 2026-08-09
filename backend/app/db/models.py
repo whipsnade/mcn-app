@@ -24,7 +24,15 @@ from app.agent_runtime.models import (
 )
 from app.admin.models import AdminAuditLog
 from app.artifacts.models import ArtifactReadState, TaskArtifact
-from app.billing.models import Wallet, WalletTransaction
+from app.billing.models import (
+    RuntimeUsageRecord,
+    TenantUserQuotaPolicy,
+    TenantUserQuotaUsage,
+    TenantWallet,
+    TenantWalletTransaction,
+    Wallet,
+    WalletTransaction,
+)
 from app.goals.models import TaskGoal
 from app.identity.models import (
     AuthIdentity,
@@ -115,5 +123,10 @@ __all__ = [
     "UserKolFavorite",
     "Wallet",
     "WalletTransaction",
+    "RuntimeUsageRecord",
+    "TenantUserQuotaPolicy",
+    "TenantUserQuotaUsage",
+    "TenantWallet",
+    "TenantWalletTransaction",
     "WorkspaceSession",
 ]

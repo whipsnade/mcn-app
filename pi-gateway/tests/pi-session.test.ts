@@ -62,4 +62,24 @@ describe("Pi SDK session factory", () => {
     await first.dispose();
     await other.dispose();
   });
+
+  it("exposes the MCP accounting hook without placing billing data in the SDK prompt", async () => {
+    const control = {
+      preflight: async () => ({ permit_id: "permit-1" }),
+      finalize: async () => undefined,
+      fail: async () => undefined,
+    };
+    const session = await createProductionPiSession(work, secrets, {
+      fakeProvider: true,
+      mcpAccounting: control,
+    });
+    expect(session.mcpAccounting).toBeDefined();
+    expect(await session.mcpAccounting?.beforeToolCall({
+      tool: "query_analysis_data",
+      server: "insight-cube-mcp",
+      args: { keyword: "美妆" },
+    })).toEqual({ permit_id: "permit-1" });
+    expect(session.systemPrompt()).not.toContain("permit-1");
+    await session.dispose();
+  });
 });

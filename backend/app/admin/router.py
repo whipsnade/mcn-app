@@ -2,6 +2,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 
 from app.admin.schemas import (
     AdminUserCreate,
@@ -19,6 +20,7 @@ from app.billing.service import InsufficientPointsError
 from app.core.errors import ErrorCode
 from app.db.session import get_db
 from app.identity.dependencies import AdminUser
+from app.tenancy.models import TenantMembership
 
 
 router = APIRouter()
@@ -125,7 +127,14 @@ async def adjust_points(
         ) from error
     except ValueError as error:
         raise invalid(error) from error
+    tenant_id = await db.scalar(
+        select(TenantMembership.tenant_id).where(
+            TenantMembership.user_id == user_id,
+            TenantMembership.status == "active",
+        )
+    )
     return PointsAdjustResponse(
+        tenant_id=tenant_id,
         points=wallet.balance,
         reserved_points=wallet.reserved,
         transaction_id=transaction.id,

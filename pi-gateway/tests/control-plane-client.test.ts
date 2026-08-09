@@ -55,4 +55,27 @@ describe("Pi Gateway control-plane client", () => {
       code: "control_plane_unreachable",
     });
   });
+
+  it("maps adapter service names back to the backend catalog slug", async () => {
+    let requestBody = "";
+    const client = new ControlPlaneClient({
+      origin: "https://control.invalid",
+      gatewayId: "gw-1",
+      internalSecret: "gateway-secret",
+      fetchImpl: async (_input, init) => {
+        requestBody = String(init?.body);
+        return new Response(JSON.stringify({ permit_id: "permit-1" }), { status: 200 });
+      },
+    });
+    await client.preflightMcp(
+      "run-1",
+      { tool: "query_analysis_data", server: "insight-cube", args: {} },
+      "lease-token-that-is-long-enough-123",
+    );
+    expect(JSON.parse(requestBody)).toEqual({
+      tool_name: "query_analysis_data",
+      server: "insight-cube-mcp",
+      args: {},
+    });
+  });
 });

@@ -6,6 +6,7 @@ import {
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
+import type { McpAccountingExtension } from "./mcp-accounting-extension.js";
 
 export const PI_DEPENDENCY_VERSIONS = Object.freeze({
   codingAgent: "0.79.10",
@@ -108,6 +109,62 @@ export interface PiGatewayClaimResponse {
   secret_envelope: RuntimeSecretEnvelope;
   adapter_catalog: PiGatewayAdapterCatalogEntry[];
   internal_tools: Array<Record<string, unknown>>;
+}
+
+const PI_ADAPTER_SERVICE_ALIASES: Readonly<Record<string, string>> = Object.freeze({
+  "insight-cube-mcp": "insight-cube",
+  "social-grow-mcp": "social-grow",
+  "social-grow-content-mcp": "social-grow-content",
+  "aktools-mcp": "aktools",
+  "bilibili-mcp": "aktools",
+});
+
+/**
+ * Convert the authenticated FastAPI wire catalog into the camelCase catalog
+ * consumed by the Pi resource loader.  The conversion is deliberately kept
+ * at this boundary: persisted/runtime snapshots remain the server-owned
+ * snake_case contract and are never guessed by the SDK session.
+ */
+export function normalizePiGatewayAdapterCatalog(
+  entries: readonly PiGatewayAdapterCatalogEntry[],
+): AdapterCatalogEntry[] {
+  const seen = new Set<string>();
+  return entries.map((entry) => {
+    const service = PI_ADAPTER_SERVICE_ALIASES[entry.service] ?? entry.service;
+    const key = `${service}\u0000${entry.adapter_visible_name}`;
+    if (!service || !entry.adapter_visible_name || seen.has(key)) {
+      throw new Error("pi_gateway_adapter_catalog_invalid");
+    }
+    seen.add(key);
+    if (!/^sha256:[0-9a-fA-F]{64}$/.test(entry.input_schema_digest)) {
+      throw new Error("pi_gateway_adapter_catalog_invalid");
+    }
+    return {
+      service,
+      adapterName: entry.adapter_visible_name,
+      remoteName: entry.remote_name,
+      schemaDigest: entry.input_schema_digest,
+    };
+  });
+}
+
+/**
+ * Keep the authenticated wire response immutable while attaching the
+ * normalized catalog used by the worker/session boundary.  The original
+ * snake_case fields remain available for audit/HTTP diagnostics; production
+ * code must read ``runtime_snapshot.adapterCatalog`` after this conversion.
+ */
+export function normalizePiGatewayClaimResponse(
+  response: PiGatewayClaimResponse,
+): PiGatewayClaimResponse {
+  const adapterCatalog = normalizePiGatewayAdapterCatalog(response.adapter_catalog);
+  return {
+    ...response,
+    runtime_snapshot: {
+      ...response.runtime_snapshot,
+      adapterCatalog,
+    },
+  };
 }
 
 const PI_GATEWAY_SOURCE_EVENT_TYPES = new Set([
@@ -231,6 +288,8 @@ export interface PiRunSession {
   systemPrompt(): string;
   activeToolNames(): readonly string[];
   cwd(): string;
+  /** Adapter-facing hook; the SDK session itself never receives wallet data. */
+  mcpAccounting?: McpAccountingExtension;
 }
 
 export interface PiSessionFactory {
