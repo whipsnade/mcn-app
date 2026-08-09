@@ -58,8 +58,16 @@ Playwright。
 
 在最终 B0 HEAD 上运行并保存输出摘要；任一失败就停止，不进入 Task 1：
 
+- `backend/.venv/bin/ruff --version` 必须满足 `>=0.9,<1`；禁止使用全局 Ruff。
+- 全仓 Ruff 门禁使用 `backend/pyproject.toml` 中显式的稳定规则
+  `[tool.ruff.lint].select = ["E4", "E7", "E9", "F"]` 及四个已确认的 POC 基线逐文件豁免，
+  不使用额外全局 `--ignore`、批量 `noqa` 或修改历史债务文件。
+- 先前全局 Ruff 0.3.3 的隐式默认规则扫描报告 335 项历史债务；这些不是方案 B 启动回归，
+  Task 0 仅稳定工具版本与规则，不清理这批无关历史代码。
+
 ```bash
 cd backend
+.venv/bin/ruff --version
 .venv/bin/pytest -q tests/marketing_capability_pack tests/pi_runtime_poc tests/agent_artifacts
 .venv/bin/ruff check app tests
 cd ../pi-runtime
