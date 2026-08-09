@@ -132,3 +132,25 @@ API key 只以 `$TENCENT_PLAN_API_KEY` 环境变量引用，不写入文件、�
 覆盖测试扩展为 8 项：增加损坏 JSON、缺少 `type`、response 关联 id/成功形状、自动资源泄漏、
 显式资源缺失、伪装资源 source，以及不带 key 值的临时模型配置验证。`npm test && npm run typecheck`
 通过。
+
+## 生产 Gateway 锁定组合（方案 B Task 3）
+
+生产 `pi-gateway` 使用已经在 POC 兼容性验证过的精确组合，不把迁移前探针版本当作升级依据：
+
+```text
+@earendil-works/pi-coding-agent 0.79.10
+@earendil-works/pi-ai             0.74.2
+@earendil-works/pi-tui            0.74.2
+pi-mcp-adapter                    2.20.1
+typebox                           1.3.11
+```
+
+Gateway 直接调用 `createAgentSession()`，每个 Run 使用
+`SessionManager.inMemory()`、`AuthStorage.inMemory()`、`ModelRegistry.inMemory()` 和
+`SettingsManager.inMemory()`；不会创建 `auth.json`、`models.json` 或 settings 文件。内置
+read/bash/edit/write/grep/find/ls 与 Pi 自动 Skills/context/Extension discovery 均关闭，只有
+受控的 adapter/internal-tool allowlist 可被启用。每个 Worker 使用权限为 `0700` 的临时 cwd/agentDir，
+结束时执行 abort、取消订阅、dispose 和递归清理。
+
+本节是生产锁定事实记录，保留上文 Pi `0.84.1` 历史探针，不修改历史探针结果，也不触发模型或
+DataTap 调用。

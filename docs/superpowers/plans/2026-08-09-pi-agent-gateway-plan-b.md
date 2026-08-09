@@ -397,18 +397,18 @@ export function createProductionPiSession(
   的 spawn env；子进程 ready 后父进程立即删除 secret bundle/env 引用。结束无论成功/异常/取消都执行
   `abort → unsubscribe → dispose → temp cleanup`。
 
-- [ ] **Step 1：SDK 契约红灯。** 从已安装 0.79.10 类型与运行时断言
+- [x] **Step 1：SDK 契约红灯。** 从已安装 0.79.10 类型与运行时断言
   `createAgentSession/SessionManager.inMemory/tool_call block/AgentSession abort+dispose` 的精确形状；测试不
   调模型。缺任一能力直接停止，不改用 CLI 或升级依赖。
-- [ ] **Step 2：Session 工厂红灯。** fake provider 下断言一个 Worker 一个内存 Session，两个租户的
+- [x] **Step 2：Session 工厂红灯。** fake provider 下断言一个 Worker 一个内存 Session，两个租户的
   system prompt、消息、工具状态、临时目录和 env 互不可见；异常与 SIGTERM 都清理。
-- [ ] **Step 3：最小实现。** 显式构建 model/auth/resource/session manager；禁止 Pi 内建工具和自动
+- [x] **Step 3：最小实现。** 显式构建 model/auth/resource/session manager；禁止 Pi 内建工具和自动
   discover；B0 root policy 作为真正 system 参数注入，普通 user prompt 不重复正文。
-- [ ] **Step 4：依赖审计。** `npm ls` 断言精确版本；静态扫描 production src 不出现
+- [x] **Step 4：依赖审计。** `npm ls` 断言精确版本；静态扫描 production src 不出现
   `child_process.exec`、shell 拼接、HOME 继承、MySQL driver、任意 fetch host。
-- [ ] **Step 5：绿灯。** `npm test`、`npm run typecheck`、`npm run build`。
-- [ ] **Step 6：文档校正。** 在版本探针追加“生产锁定组合”章节，保留历史 0.84.1 事实，不覆盖旧文。
-- [ ] **Step 7：Commit。** `feat: add isolated pi sdk gateway worker`。
+- [x] **Step 5：绿灯。** `npm test`、`npm run typecheck`、`npm run build`。
+- [x] **Step 6：文档校正。** 在版本探针追加“生产锁定组合”章节，保留历史 0.84.1 事实，不覆盖旧文。
+- [x] **Step 7：Commit。** `feat: add isolated pi sdk gateway worker`。
 
 ---
 
