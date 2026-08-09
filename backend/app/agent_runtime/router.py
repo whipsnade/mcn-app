@@ -57,8 +57,14 @@ from app.agent_runtime.utility import UtilityDispatcher
 from app.core.config import get_settings
 from app.db.session import get_db
 from app.identity.dependencies import CurrentUser
+from app.licensing.service import LicenseService
+from app.tenancy.service import TenantService
 
 router = APIRouter()
+
+# 当前生产 Session Analyst 仍是单一 KOL 圈选执行契约；品牌/活动 Goal
+# 尚未接管此消息入口，待后续 Planner 任务落地后再按实际 goal_type 授权。
+SESSION_ANALYST_LICENSE_FEATURE = "kol_selection"
 
 # 同一 Session 同时只允许一个活动 session_analyst_v1 Run（设计 Task 19）。
 _ACTIVE_RUN_STATUSES = frozenset({"queued", "running", "reviewing"})
@@ -271,9 +277,14 @@ def _not_found(detail: str) -> HTTPException:
 async def _get_owned_session(
     db: AsyncSession, user_id: str, session_id: str, *, for_update: bool = False
 ) -> AgentSession:
+    try:
+        tenant_context = await TenantService(db).resolve_user(user_id, for_update=for_update)
+    except PermissionError as error:
+        raise _not_found("session_not_found") from error
     statement = select(AgentSession).where(
         AgentSession.id == session_id,
         AgentSession.user_id == user_id,
+        AgentSession.tenant_id == tenant_context.tenant_id,
         AgentSession.archived_at.is_(None),
     )
     if for_update:
@@ -286,13 +297,19 @@ async def _get_owned_session(
 
 async def _get_owned_run(db: AsyncSession, user_id: str, run_id: str) -> AgentRun:
     """Run 归属 + 父 Session 软删除态校验（设计 §15.2「同时校验 Session 归属与软删除」）。"""
+    try:
+        tenant_context = await TenantService(db).resolve_user(user_id)
+    except PermissionError as error:
+        raise _not_found("run_not_found") from error
     run = await db.scalar(
         select(AgentRun)
         .join(AgentSession, AgentRun.session_id == AgentSession.id)
         .where(
             AgentRun.id == run_id,
             AgentRun.user_id == user_id,
+            AgentRun.tenant_id == tenant_context.tenant_id,
             AgentRun.visibility == "user",
+            AgentSession.tenant_id == tenant_context.tenant_id,
             AgentSession.archived_at.is_(None),
         )
     )
@@ -305,10 +322,15 @@ async def _find_idempotent_run(
     db: AsyncSession, user_id: str, session_id: str, key: str
 ) -> AgentRun | None:
     """按 Idempotency-Key（哈希存于 Run 的 prompt_snapshot_json）查既有 Run。"""
+    try:
+        tenant_context = await TenantService(db).resolve_user(user_id)
+    except PermissionError:
+        return None
     return await db.scalar(
         select(AgentRun).where(
             AgentRun.user_id == user_id,
             AgentRun.session_id == session_id,
+            AgentRun.tenant_id == tenant_context.tenant_id,
             AgentRun.visibility == "user",
             AgentRun.prompt_snapshot_json["idempotency_key"].as_string() == key,
         )
@@ -326,12 +348,20 @@ async def _resolve_parent_run_id(
     不代表复用执行状态。
     """
     if requested is not None:
+        try:
+            tenant_context = await TenantService(db).resolve_user(user_id)
+        except PermissionError as error:
+            raise _not_found("parent_run_not_found") from error
         parent = await db.scalar(
-            select(AgentRun.id).where(
+            select(AgentRun.id)
+            .join(AgentSession, AgentRun.session_id == AgentSession.id)
+            .where(
                 AgentRun.id == requested,
                 AgentRun.user_id == user_id,
                 AgentRun.session_id == session_id,
+                AgentRun.tenant_id == tenant_context.tenant_id,
                 AgentRun.visibility == "user",
+                AgentSession.tenant_id == tenant_context.tenant_id,
             )
         )
         if parent is None:
@@ -482,9 +512,14 @@ async def create_session(
     )
     title = payload.title or f"新会话{(count or 0) + 1}"
     now = utc_now()
+    try:
+        tenant_id = (await TenantService(db).resolve_user(user.id)).tenant_id
+    except PermissionError as error:
+        raise _not_found("session_not_found") from error
     session = AgentSession(
         id=str(uuid4()),
         user_id=user.id,
+        tenant_id=tenant_id,
         title=title,
         status="active",
         created_at=now,
@@ -500,12 +535,17 @@ async def list_sessions(
     user: CurrentUser,
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> list[AgentSessionRead]:
+    try:
+        tenant_context = await TenantService(db).resolve_user(user.id)
+    except PermissionError as error:
+        raise _not_found("session_not_found") from error
     sessions = list(
         (
             await db.scalars(
                 select(AgentSession)
                 .where(
                     AgentSession.user_id == user.id,
+                    AgentSession.tenant_id == tenant_context.tenant_id,
                     AgentSession.archived_at.is_(None),
                 )
                 .order_by(AgentSession.updated_at.desc())
@@ -537,6 +577,7 @@ async def get_session(
                 select(AgentRun)
                 .where(
                     AgentRun.session_id == session_id,
+                    AgentRun.tenant_id == session.tenant_id,
                     AgentRun.visibility == "user",
                 )
                 # 稳定排序（§6.4）：created_at 升序 + id tie-break；前端取最后一
@@ -687,7 +728,11 @@ async def append_message(
     # 建 Run（消息 sequence 也会竞态撞 uq_agent_messages_session_sequence → 500）。
     # 先 FOR UPDATE 锁住 Session 行（同 kol_detail working-head 锁），后续请求在
     # 前一个请求提交后才拿到锁，此时 active 检查能看到已提交的 Run → 409。
-    await _get_owned_session(db, user.id, session_id, for_update=True)
+    session = await _get_owned_session(db, user.id, session_id, for_update=True)
+    tenant_context = await TenantService(db).resolve_user(user.id, for_update=True)
+    if session.tenant_id is not None and session.tenant_id != tenant_context.tenant_id:
+        raise _not_found("session_not_found")
+    session.tenant_id = tenant_context.tenant_id
     content_hash = _content_hash(
         payload.content,
         payload.parent_run_id,
@@ -712,6 +757,12 @@ async def append_message(
                 status=existing.status,
                 reused=True,
             )
+
+    license_decision = await LicenseService(db).authorize_run(
+        tenant_context.tenant_id, user.id, SESSION_ANALYST_LICENSE_FEATURE
+    )
+    if not license_decision.allowed:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=license_decision.code)
 
     # 引用校验（建 Run 前）：父 Run 必须属本用户同 Session；Artifact Version
     # 必须属本用户且已发布（跨 Session 可复用）；上传必须属本用户同 Session
@@ -765,6 +816,7 @@ async def append_message(
         id=str(uuid4()),
         session_id=session_id,
         user_id=user.id,
+        tenant_id=tenant_context.tenant_id,
         input_message_id=message.id,
         parent_run_id=parent_run_id,
         run_kind="user",
@@ -843,6 +895,12 @@ async def cancel_run(
     H1：立即取消的迁移与终态事件由 settle_terminal 同一加锁事务提交。
     """
     run = await _get_owned_run(db, user.id, run_id)
+    try:
+        tenant_context = await TenantService(db).resolve_user(user.id, for_update=True)
+    except PermissionError as error:
+        raise _not_found("run_not_found") from error
+    if run.tenant_id is None or run.tenant_id != tenant_context.tenant_id:
+        raise _not_found("run_not_found")
     repo = AgentRunRepository(db)
     current = RunStatus(run.status)
     settled_immediately = False
@@ -921,6 +979,12 @@ async def retry_run(
     Run 的 ``prompt_snapshot_json``；绝不修改或重开原 Run。
     """
     run = await _get_owned_run(db, user.id, run_id)
+    try:
+        tenant_context = await TenantService(db).resolve_user(user.id, for_update=True)
+    except PermissionError as error:
+        raise _not_found("run_not_found") from error
+    if run.tenant_id is None or run.tenant_id != tenant_context.tenant_id:
+        raise _not_found("run_not_found")
     # 仅限 session_analyst 主 Run：kol_detail 等辅助 Run 的触发上下文在
     # KOL_DETAIL_SNAPSHOT_KEY 且无 input_message_id，整体覆盖快照的 retry 会让
     # transcript 回退到会话最近一条用户消息而锚定错误意图；其重试必须走
@@ -932,6 +996,13 @@ async def retry_run(
     ):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT, detail="run_not_retryable"
+        )
+    license_decision = await LicenseService(db).authorize_run(
+        tenant_context.tenant_id, user.id, SESSION_ANALYST_LICENSE_FEATURE
+    )
+    if not license_decision.allowed:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail=license_decision.code
         )
     # 单活动主 Run 约束：与 messages/resume 同一车道语义，锁 Session 行后检查。
     await _get_owned_session(db, user.id, run.session_id, for_update=True)
@@ -1054,6 +1125,7 @@ async def retry_run(
         id=str(uuid4()),
         session_id=run.session_id,
         user_id=user.id,
+        tenant_id=run.tenant_id,
         input_message_id=run.input_message_id,
         parent_run_id=run.id,
         run_kind="user",
@@ -1129,6 +1201,18 @@ async def create_kol_detail(
     except KolDetailSelectionRefNotFound as error:
         # §6.4/§7：selection 引用归属校验失败统一 404，不泄漏资源存在性。
         raise _not_found("kol_selection_not_found") from error
+    except PermissionError as error:
+        detail = str(error)
+        if detail in {
+            "license_inactive",
+            "license_not_started",
+            "license_expired",
+            "feature_disabled",
+            "tenant_concurrency_exceeded",
+            "user_concurrency_exceeded",
+        }:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=detail) from error
+        raise _not_found("kol_detail_not_found") from error
     await db.commit()
     return KolDetailResponse(
         run_id=summary.run_id,

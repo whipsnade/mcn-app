@@ -144,14 +144,69 @@ class FakeKolDetailFetchTool:
     points_cost = 0
     external_side_effect = False
 
-    def __init__(self, evidence_id: str) -> None:
-        self._evidence_id = evidence_id
+    def __init__(self, db, evidence_id: str) -> None:
+        self._db = db
+        self._source_evidence_id = evidence_id
+        self._evidence_by_run: dict[str, str] = {}
+
+    async def evidence_for_run(
+        self, *, run_id: str, session_id: str, step_id: str | None
+    ) -> str:
+        """为当前 Run 复制 fixture 响应，保持真实 MCP Evidence 归属契约。"""
+        existing = self._evidence_by_run.get(run_id)
+        if existing is not None:
+            return existing
+        source = await self._db.get(EvidenceItem, self._source_evidence_id)
+        if source is None:
+            raise AssertionError("fixture evidence disappeared")
+        if source.run_id == run_id:
+            self._evidence_by_run[run_id] = source.id
+            return source.id
+        if step_id is None:
+            raise AssertionError("fake fetch must run with a persisted step")
+        now = utc_now()
+        call = AgentToolCall(
+            id=str(uuid4()),
+            run_id=run_id,
+            step_id=step_id,
+            logical_call_id=f"fixture-detail-{uuid4().hex}",
+            service="mcp",
+            internal_tool_name=self.name,
+            arguments_json={},
+            arguments_hash="fixture",
+            status="settled",
+            points_reserved=0,
+            points_settled=0,
+            started_at=now,
+            completed_at=now,
+        )
+        self._db.add(call)
+        await self._db.flush()
+        copied = await EvidenceWriter(self._db).write(
+            session_id=session_id,
+            run_id=run_id,
+            tool_call_id=call.id,
+            source_type=source.source_type,
+            source_name=source.source_name,
+            scope_json=source.scope_json,
+            period_json=source.period_json,
+            raw_payload=source.raw_payload_json,
+            collected_at=now,
+            availability_status=source.availability_status,
+        )
+        self._evidence_by_run[run_id] = copied.id
+        return copied.id
 
     async def execute(self, context: Any, arguments: BaseModel) -> ToolResult:
+        evidence_id = await self.evidence_for_run(
+            run_id=context.run_id,
+            session_id=context.session_id,
+            step_id=context.step_id,
+        )
         return ToolResult(
             status="success",
             safe_summary="kol detail fetched",
-            evidence_id=self._evidence_id,
+            evidence_id=evidence_id,
         )
 
 
@@ -162,8 +217,10 @@ class KolDetailFakeGateway:
     模拟 TOCTOU 窗口（第二个 create 撞上正在进行的 Run）。
     """
 
-    def __init__(self, actions: list[Any]) -> None:
+    def __init__(self, actions: list[Any], *, db, fetch_tool: FakeKolDetailFetchTool) -> None:
         self.actions = list(actions)
+        self._db = db
+        self._fetch_tool = fetch_tool
         self.calls: list[dict[str, Any]] = []
         self.interleave = None
         self.interleave_result = None
@@ -184,6 +241,18 @@ class KolDetailFakeGateway:
         action = self.actions.pop(0)
         if callable(action):
             action = await action(run)
+        if isinstance(action, CallTool) and action.internal_tool_name == "build_kol_detail_draft":
+            step_id = await self._db.scalar(
+                select(AgentStep.id)
+                .where(AgentStep.run_id == run.id)
+                .order_by(AgentStep.sequence.desc())
+                .limit(1)
+            )
+            action.arguments["evidence_id"] = await self._fetch_tool.evidence_for_run(
+                run_id=run.id,
+                session_id=run.session_id,
+                step_id=step_id,
+            )
         if (
             self.interleave is not None
             and self.interleave_result is None
@@ -225,7 +294,7 @@ async def _make_evidence(db, user_id: str, session_id: str):
         profile_name="evidence_chain",
         profile_version="v1",
         model="test-model",
-        status="running",
+        status="completed",
         started_at=now,
     )
     db.add(run)
@@ -317,9 +386,10 @@ def _make_actions(db, evidence, cache_state: dict[str, Any]) -> list[Any]:
 
 
 def _make_service(db, *, actions: list[Any], evidence, now_fn, worker: str = "worker"):
-    gateway = KolDetailFakeGateway(actions)
+    fetch_tool = FakeKolDetailFetchTool(db, evidence.id)
+    gateway = KolDetailFakeGateway(actions, db=db, fetch_tool=fetch_tool)
     registry = ToolRegistry()
-    registry.register(FakeKolDetailFetchTool(evidence.id), category="kol_detail")
+    registry.register(fetch_tool, category="kol_detail")
     registry.register(BuildKolDetailDraftTool(db), category="artifact")
     broker = AgentEventBroker()
     events = AgentEventStream(db, broker)

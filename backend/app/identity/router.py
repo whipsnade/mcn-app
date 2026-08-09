@@ -23,6 +23,8 @@ from app.identity.schemas import (
     WechatLoginRequest,
 )
 from app.identity.service import IdentityService, LoginResult
+from app.tenancy.models import Tenant
+from app.tenancy.service import TenantService
 
 
 auth_router = APIRouter()
@@ -128,12 +130,29 @@ async def get_me(user: CurrentUser, db: Annotated[AsyncSession, Depends(get_db)]
             )
         ).all()
     )
+    tenant_id: str | None = None
+    tenant_name: str | None = None
+    membership_role: str | None = None
+    try:
+        tenant_context = await TenantService(db).resolve_user(user.id)
+    except PermissionError as error:
+        raise HTTPException(status_code=404, detail="user_not_found") from error
+    tenant_id = tenant_context.tenant_id
+    membership_role = tenant_context.membership_role
+    tenant_name = await db.scalar(
+        select(Tenant.name).where(Tenant.id == tenant_context.tenant_id)
+    )
+    if tenant_name is None:
+        raise HTTPException(status_code=404, detail="user_not_found")
     return UserRead(
         id=user.id,
         nickname=user.nickname,
         role=user.role,
         channels=channels,
         industries=[str(item) for item in (user.industries or ["美食"])],
+        tenant_id=tenant_id,
+        tenant_name=tenant_name,
+        membership_role=membership_role,
     )
 
 

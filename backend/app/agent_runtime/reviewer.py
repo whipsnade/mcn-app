@@ -459,6 +459,7 @@ class ReviewerDriver:
             id=str(uuid4()),
             session_id=parent_run.session_id,
             user_id=parent_run.user_id,
+            tenant_id=parent_run.tenant_id,
             parent_run_id=parent_run.id,
             run_kind="internal",
             visibility="internal",

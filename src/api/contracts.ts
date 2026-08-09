@@ -9,6 +9,9 @@ export interface ApiUser {
   role: 'user' | 'admin';
   channels: string[];
   industries: string[];
+  tenant_id: string | null;
+  tenant_name: string | null;
+  membership_role: 'owner' | 'admin' | 'member' | null;
 }
 
 export interface ApiWallet {
@@ -354,4 +357,3 @@ export interface ApiFavorite {
   source_task_id: string | null;
   created_at: string;
 }
-

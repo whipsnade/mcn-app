@@ -33,6 +33,7 @@ from app.agent_runtime.models import (
 from app.core.config import Settings
 from app.identity.models import User, UserChannelPermission
 from app.identity.service import IdentityService
+from app.tenancy.service import TenantService
 from app.marketing_capability_pack.runtime import (
     MarketingRunCapability,
     build_marketing_run_capability,
@@ -182,6 +183,9 @@ class PocCaseFactory:
                     raise ValueError("poc_dependency_artifact_required")
                 user_id = prior.user_id
                 session_id = prior.session_id
+                tenant_id = prior.tenant_id
+                if tenant_id is None:
+                    raise ValueError("poc_dependency_tenant_required")
                 message_sequence = (
                     await db.scalar(
                         select(func.max(AgentMessage.sequence)).where(AgentMessage.session_id == session_id)
@@ -204,6 +208,11 @@ class PocCaseFactory:
                 )
                 db.add(user)
                 await db.flush()
+                tenant_context = await TenantService(db).provision_personal_tenant(
+                    user.id,
+                    name=f"Pi POC {case.case_id}",
+                    now=now,
+                )
                 for channel in IdentityService.default_channels:
                     db.add(
                         UserChannelPermission(
@@ -218,6 +227,7 @@ class PocCaseFactory:
                 session = AgentSession(
                     id=str(uuid4()),
                     user_id=user.id,
+                    tenant_id=tenant_context.tenant_id,
                     title=f"Pi POC {case.case_id}",
                     status="active",
                     session_summary=f"date_anchor={case.date_anchor}; case_id={case.case_id}",
@@ -229,12 +239,14 @@ class PocCaseFactory:
                 await db.flush()
                 user_id = user.id
                 session_id = session.id
+                tenant_id = tenant_context.tenant_id
                 message_sequence = 1
 
             run = AgentRun(
                 id=str(uuid4()),
                 session_id=session_id,
                 user_id=user_id,
+                tenant_id=tenant_id,
                 run_kind="user",
                 visibility="user",
                 profile_name=SESSION_ANALYST_PROFILE,

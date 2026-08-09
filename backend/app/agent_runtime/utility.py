@@ -39,7 +39,9 @@ from app.agent_artifacts.models import AgentArtifact, AgentArtifactVersion
 from app.agent_runtime.models import AgentMessage, AgentRun, AgentRunAttempt, AgentSession, MemoryEntry
 from app.agent_runtime.profiles import get_profile
 from app.agent_runtime.repository import AgentRunRepository, utc_now
+from app.licensing.service import LicenseService
 from app.model.contracts import ChatMessage
+from app.tenancy.service import TenantService
 
 logger = logging.getLogger(__name__)
 
@@ -217,10 +219,37 @@ class UtilityRunner:
         parent_run: AgentRun | None,
     ) -> UtilityDecision | None:
         """创建 internal 子 Run、读短上下文、调网关、写强类型结果并收口。"""
+        session = await self._db.get(AgentSession, session_id)
+        if parent_run is None:
+            tenant_context = await TenantService(self._db).resolve_user(user_id)
+            if (
+                session is None
+                or session.user_id != user_id
+                or session.tenant_id != tenant_context.tenant_id
+            ):
+                raise PermissionError("session_not_found")
+            tenant_id = tenant_context.tenant_id
+        else:
+            if (
+                session is None
+                or parent_run.user_id != user_id
+                or parent_run.session_id != session_id
+                or parent_run.tenant_id is None
+                or session.user_id != user_id
+                or session.tenant_id != parent_run.tenant_id
+            ):
+                raise PermissionError("parent_run_not_owned")
+            tenant_id = parent_run.tenant_id
+        license_decision = await LicenseService(self._db).authorize_run(
+            tenant_id, user_id, "utility"
+        )
+        if not license_decision.allowed:
+            raise PermissionError(license_decision.code)
         internal_run = AgentRun(
             id=str(uuid4()),
             session_id=session_id,
             user_id=user_id,
+            tenant_id=tenant_id,
             parent_run_id=parent_run.id if parent_run is not None else None,
             run_kind="internal",
             visibility="internal",

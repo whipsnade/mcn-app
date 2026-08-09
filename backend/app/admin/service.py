@@ -25,6 +25,7 @@ from app.billing.models import Wallet, WalletTransaction
 from app.billing.service import WalletService
 from app.core.redaction import redact_for_log
 from app.identity.models import AuthIdentity, LoginSession, User, UserChannelPermission
+from app.tenancy.service import TenantService
 from app.mcp_gateway.contracts import DataTapService
 from app.mcp_gateway.models import McpCall
 from app.mcp_gateway.validation import McpValidationError, validate_output
@@ -184,6 +185,9 @@ class AdminService:
         )
         self.db.add(user)
         await self.db.flush()
+        await TenantService(self.db).provision_personal_tenant(
+            user.id, name=payload.nickname, now=now
+        )
         self.db.add(
             AuthIdentity(
                 id=str(uuid4()),

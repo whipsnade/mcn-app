@@ -6,6 +6,8 @@ from uuid import uuid4
 
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import event, insert, select, update
+from sqlalchemy.orm import Session
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -24,6 +26,125 @@ from app.db.session import engine  # noqa: E402
 from app.db.session import get_db  # noqa: E402
 from app.identity.models import User  # noqa: E402
 from app.main import create_app  # noqa: E402
+from app.agent_runtime.models import AgentRun, AgentSession  # noqa: E402
+from app.licensing.models import TenantLicense  # noqa: E402
+from app.tenancy.models import Tenant, TenantMembership  # noqa: E402
+from app.tenancy.service import TenantService  # noqa: E402
+
+
+_LEGACY_TEST_TENANT_ID = "00000000-0000-4000-8000-000000000037"
+
+
+@event.listens_for(Session, "before_flush")
+def _fill_legacy_test_tenant(session: Session, _flush_context, _instances) -> None:
+    """为旧单元测试直接构造的 Run/Session 提供显式测试租户。
+
+    生产创建器不依赖这个测试钩子；它只让迁移后的 NOT NULL tenant_id 不迫使
+    历史纯单元 fixture 重写业务语义。带真实 tenant_id 的对象完全不改写。
+    """
+    pending = [item for item in session.new if isinstance(item, (AgentSession, AgentRun))]
+    if not any(getattr(item, "tenant_id", None) is None for item in pending):
+        return
+    tenant_by_user: dict[str, str] = {}
+    pending_memberships = {
+        item.user_id: item.tenant_id
+        for item in session.new
+        if isinstance(item, TenantMembership)
+    }
+    for user_id in {
+        item.user_id for item in pending if getattr(item, "user_id", None) is not None
+    }:
+        if user_id in pending_memberships:
+            tenant_by_user[user_id] = pending_memberships[user_id]
+            continue
+        with session.no_autoflush:
+            existing_tenant_id = session.scalar(
+                select(TenantMembership.tenant_id).where(TenantMembership.user_id == user_id)
+            )
+        if existing_tenant_id is not None:
+            tenant_by_user[user_id] = existing_tenant_id
+            continue
+        known_tenant = any(
+            isinstance(item, Tenant) and item.id == _LEGACY_TEST_TENANT_ID
+            for item in (*session.new, *session.identity_map.values())
+        )
+        if not known_tenant:
+            with session.no_autoflush:
+                known_tenant = session.get(Tenant, _LEGACY_TEST_TENANT_ID) is not None
+        if not known_tenant:
+            now = datetime.now(UTC).replace(tzinfo=None)
+            session.connection().execute(
+                insert(Tenant).values(
+                    id=_LEGACY_TEST_TENANT_ID,
+                    slug="legacy-test-tenant",
+                    name="测试租户",
+                    status="active",
+                    is_internal=True,
+                    runtime_backend="current",
+                    license_status="active",
+                    active_license_id=None,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+        with session.no_autoflush:
+            test_tenant = session.get(Tenant, _LEGACY_TEST_TENANT_ID)
+        if test_tenant is not None and test_tenant.active_license_id is None:
+            now = datetime.now(UTC).replace(tzinfo=None).replace(microsecond=0)
+            license_id = str(uuid4())
+            session.connection().execute(
+                insert(TenantLicense).values(
+                    id=license_id,
+                    tenant_id=_LEGACY_TEST_TENANT_ID,
+                    version=1,
+                    valid_from=now,
+                    valid_until=None,
+                    features_json={
+                        "kol_selection": True,
+                        "brand_analysis": True,
+                        "campaign_analysis": True,
+                        "kol_detail": True,
+                        "utility": True,
+                    },
+                    max_concurrent_runs=4,
+                    max_user_concurrent_runs=2,
+                    created_by=user_id,
+                    created_at=now,
+                )
+            )
+            session.connection().execute(
+                update(Tenant)
+                .where(Tenant.id == _LEGACY_TEST_TENANT_ID)
+                .values(active_license_id=license_id)
+            )
+        session.add(
+            TenantMembership(
+                id=str(uuid4()),
+                tenant_id=_LEGACY_TEST_TENANT_ID,
+                user_id=user_id,
+                role="owner",
+                status="active",
+                created_at=datetime.now(UTC).replace(tzinfo=None),
+                updated_at=datetime.now(UTC).replace(tzinfo=None),
+            )
+        )
+        tenant_by_user[user_id] = _LEGACY_TEST_TENANT_ID
+    for item in pending:
+        if isinstance(item, AgentSession) and item.tenant_id is None:
+            item.tenant_id = tenant_by_user[item.user_id]
+    sessions_by_id = {
+        item.id: item
+        for item in (*session.new, *session.identity_map.values())
+        if isinstance(item, AgentSession)
+    }
+    for item in pending:
+        if isinstance(item, AgentRun) and item.tenant_id is None:
+            parent_session = sessions_by_id.get(item.session_id)
+            item.tenant_id = (
+                parent_session.tenant_id
+                if parent_session is not None and parent_session.tenant_id is not None
+                else tenant_by_user[item.user_id]
+            )
 
 
 @pytest_asyncio.fixture
@@ -58,6 +179,9 @@ async def user_factory(
         )
         db_session.add(user)
         await db_session.flush()
+        await TenantService(db_session).provision_personal_tenant(
+            user.id, name=user.nickname, now=now
+        )
         return user
 
     return create_user

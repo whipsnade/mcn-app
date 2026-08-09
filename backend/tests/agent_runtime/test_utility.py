@@ -28,6 +28,8 @@ from app.agent_runtime.models import (
 from app.agent_runtime.repository import utc_now
 from app.agent_runtime.utility import UTILITY_PROFILE_NAME, UtilityRunner
 from app.model.contracts import ChatMessage
+from app.tenancy.models import Tenant, TenantMembership
+from app.tenancy.service import TenantService
 
 
 class FakeUtilityGateway:
@@ -50,9 +52,11 @@ class BoomGateway:
 async def _make_session_with_messages(db_session, user_factory, *, message_count: int = 4):
     user = await user_factory()
     now = utc_now()
+    tenant_id = (await TenantService(db_session).resolve_user(user.id)).tenant_id
     session = AgentSession(
         id=str(uuid4()),
         user_id=user.id,
+        tenant_id=tenant_id,
         title="新会话1",
         status="active",
         created_at=now,
@@ -219,6 +223,29 @@ async def test_session_title_not_overwritten_after_user_rename(db_session, user_
     assert result is None
     fresh = await db_session.get(AgentSession, session.id)
     assert fresh.title == "用户自己改的名字"
+    assert gateway.calls == []
+    assert await _internal_run(db_session, parent_run_id=None) is None
+
+
+async def test_session_title_does_not_create_internal_run_when_utility_license_is_suspended(
+    db_session, user_factory
+) -> None:
+    session, user = await _make_session_with_messages(db_session, user_factory)
+    membership = await db_session.scalar(
+        select(TenantMembership).where(TenantMembership.user_id == user.id)
+    )
+    assert membership is not None
+    tenant = await db_session.get(Tenant, membership.tenant_id)
+    assert tenant is not None
+    tenant.license_status = "suspended"
+    await db_session.flush()
+
+    gateway = FakeUtilityGateway([{"task": "session_title", "title": "不应调用"}])
+    result = await _make_runner(db_session, gateway).generate_session_title(
+        session_id=session.id, user_id=user.id
+    )
+
+    assert result is None
     assert gateway.calls == []
     assert await _internal_run(db_session, parent_run_id=None) is None
 

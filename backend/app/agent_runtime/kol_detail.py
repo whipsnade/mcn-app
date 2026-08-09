@@ -83,11 +83,13 @@ from app.agent_artifacts.payloads.kol_detail import KolDetailV2
 from app.agent_artifacts.service import ArtifactService
 from app.agent_runtime.engine import AgentEngine
 from app.agent_runtime.events import AgentEventBroker, AgentEventStream
-from app.agent_runtime.models import AgentRun
+from app.agent_runtime.models import AgentRun, AgentSession
 from app.agent_runtime.profiles import get_profile
 from app.agent_runtime.repository import AgentRunRepository, utc_now
 from app.agent_runtime.state import InvalidRunTransition, RunStatus
 from app.model.contracts import ChatMessage
+from app.licensing.service import LicenseService
+from app.tenancy.service import TenantService
 
 logger = logging.getLogger(__name__)
 
@@ -375,6 +377,14 @@ class KolDetailRunService:
         selection_ref = await self._resolve_selection_ref(
             session_id, selection_artifact_id, selection_version
         )
+        tenant_context = await TenantService(self.db).resolve_user(user_id, for_update=True)
+        session = await self.db.get(AgentSession, session_id)
+        if (
+            session is None
+            or session.user_id != user_id
+            or session.tenant_id != tenant_context.tenant_id
+        ):
+            raise PermissionError("session_not_found")
         cached = await self.get_cached_detail(user_id, session_id, platform, kol_uid)
         hit = await self._try_cache_hit(cached)
         if hit is not None:
@@ -384,7 +394,6 @@ class KolDetailRunService:
         hit = await self._try_published_version_hit(user_id, session_id, platform, kol_uid)
         if hit is not None:
             return hit
-
         # 协调循环：正常路径一轮完成。撞唯一约束（同窗口并发先到者已提交协调
         # 行）时重读——看到先到者的活动 Run / 它回填的缓存 / 它失败释放后的
         # 空 working head（此时由本请求接管，重新竞争）。
@@ -408,12 +417,18 @@ class KolDetailRunService:
             # 只有新建 Run 的路径才需要引擎（缓存命中/幂等返回不需要）。
             if self._engine is None:
                 raise KolDetailRunFailed("no engine wired for kol_detail_v1 run")
+            license_decision = await LicenseService(self.db).authorize_run(
+                tenant_context.tenant_id, user_id, "kol_detail"
+            )
+            if not license_decision.allowed:
+                raise PermissionError(license_decision.code)
 
             claim = await self._claim_working_head(
                 user_id,
                 session_id,
                 platform,
                 kol_uid,
+                tenant_id=tenant_context.tenant_id,
                 selection_artifact_id=selection_artifact_id,
                 selection_version=selection_version,
                 selection_version_id=selection_ref.id if selection_ref is not None else None,
@@ -622,6 +637,7 @@ class KolDetailRunService:
         platform: str,
         kol_uid: str,
         *,
+        tenant_id: str,
         selection_artifact_id: str | None,
         selection_version: str | None,
         selection_version_id: str | None = None,
@@ -698,6 +714,7 @@ class KolDetailRunService:
             id=str(uuid4()),
             session_id=session_id,
             user_id=user_id,
+            tenant_id=tenant_id,
             run_kind="user",
             visibility="user",
             profile_name="kol_detail_v1",

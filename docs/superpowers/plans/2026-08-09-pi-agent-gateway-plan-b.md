@@ -256,20 +256,20 @@ LicenseService.authorize_run(tenant_id: str, user_id: str, feature: str) -> Lice
   固定租户，
   不能在构造器中猜默认租户。
 
-- [ ] **Step 1：红灯。** 写服务测试，覆盖跨租户用户、禁用 membership、过期/未开始/暂停 License、
+- [x] **Step 1：红灯。** 写服务测试，覆盖跨租户用户、禁用 membership、过期/未开始/暂停 License、
   feature 缺失、租户/用户并发边界和所有失败不泄漏其他租户；运行聚焦 pytest，预期模块不存在。
-- [ ] **Step 2：迁移红灯。** 用精确 MySQL 测试库从 0036 升到 0037，断言每个旧用户恰有一个不同
+- [x] **Step 2：迁移红灯。** 用精确 MySQL 测试库从 0036 升到 0037，断言每个旧用户恰有一个不同
   legacy tenant、membership 和 License；运行 downgrade 安全测试。
-- [ ] **Step 3：最小实现。** 所有时间比较使用 UTC naive 数据库时间；`features_json` 只接受固定
+- [x] **Step 3：最小实现。** 所有时间比较使用 UTC naive 数据库时间；`features_json` 只接受固定
   feature slug；并发统计只计算 queued/running/reviewing，且查询必须含 tenant_id。
-- [ ] **Step 4：接入身份 DTO 与所有 Run 创建器。** `GET /users/me` 增加 tenant id/name/membership
+- [x] **Step 4：接入身份 DTO 与所有 Run 创建器。** `GET /users/me` 增加 tenant id/name/membership
   role 并镜像前端类型；逐一覆盖 message、retry、utility、kol detail、历史 reviewer 与 POC Run，确保
   不存在 NULL 或从其他用户继承 tenant。
-- [ ] **Step 5：绿灯与回归。** 运行 tenancy/licensing/identity/admin 聚焦测试、迁移 upgrade/downgrade、
+- [x] **Step 5：绿灯与回归。** 运行 tenancy/licensing/identity/admin 聚焦测试、迁移 upgrade/downgrade、
   范围 Ruff、前端 API 聚焦 Vitest、`npm run lint` 和 `git diff --check`。
-- [ ] **Step 6：审查。** 检索所有新增 `select(Tenant*|TenantMembership*)`，确认非平台管理员路径都有
+- [x] **Step 6：审查。** 检索所有新增 `select(Tenant*|TenantMembership*)`，确认非平台管理员路径都有
   tenant 过滤；Critical/Important 必须为 0。
-- [ ] **Step 7：Commit。** `feat: add tenant and license control plane`。
+- [x] **Step 7：Commit。** `feat: add tenant and license control plane`。
 
 ---
 

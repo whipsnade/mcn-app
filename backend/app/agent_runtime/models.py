@@ -30,12 +30,17 @@ def _utc_now() -> datetime:
 
 class AgentSession(Base):
     __tablename__ = "agent_sessions"
+    __table_args__ = (Index("ix_agent_sessions_tenant_status", "tenant_id", "status"),)
 
     id: Mapped[str] = mapped_column(
         String(36), primary_key=True, default=lambda: str(uuid4())
     )
     user_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    # 0037 backfills historical sessions; all new production creators must set it.
+    tenant_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("tenants.id", ondelete="RESTRICT"), nullable=False
     )
     title: Mapped[str] = mapped_column(String(200), nullable=False)
     status: Mapped[str] = mapped_column(String(24), nullable=False, default="active")
@@ -74,6 +79,7 @@ class AgentRun(Base):
         CheckConstraint("run_kind IN ('user','internal')", name="ck_agent_runs_kind"),
         CheckConstraint("visibility IN ('user','internal')", name="ck_agent_runs_visibility"),
         Index("ix_agent_runs_status_lease", "status", "lease_expires_at"),
+        Index("ix_agent_runs_tenant_status_created", "tenant_id", "status", "created_at", "id"),
     )
 
     id: Mapped[str] = mapped_column(
@@ -84,6 +90,10 @@ class AgentRun(Base):
     )
     user_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    # 0037 backfills historical runs; all new production creators must set it.
+    tenant_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("tenants.id", ondelete="RESTRICT"), nullable=False
     )
     input_message_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("agent_messages.id", use_alter=True), nullable=True

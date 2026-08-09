@@ -33,6 +33,7 @@ from app.identity.models import (
     UserBrandProfile,
     UserChannelPermission,
 )
+from app.licensing.models import TenantLicense
 from app.mcp_gateway.models import McpCall, McpToolCatalog, McpToolDiscovery
 from app.model.models import ModelPromptLog, ModelRun
 from app.quick.models import QuickMcpCall
@@ -47,6 +48,7 @@ from app.reporting.models import (
     UserKolFavorite,
 )
 from app.selection.models import KolSelectionItem, KolSelectionSet, SessionKolSelection
+from app.tenancy.models import Tenant, TenantMembership
 from app.tasks.models import AnalysisTask, TaskEvent
 from app.workspace.models import Message, WorkspaceSession
 
@@ -97,6 +99,9 @@ __all__ = [
     "TaskCandidatePoolItem",
     "TaskEvent",
     "TaskGoal",
+    "Tenant",
+    "TenantLicense",
+    "TenantMembership",
     "User",
     "UserBrandProfile",
     "UserChannelPermission",

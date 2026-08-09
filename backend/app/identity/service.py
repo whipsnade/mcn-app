@@ -9,6 +9,7 @@ from app.billing.service import WalletService
 from app.core.config import get_settings
 from app.core.security import create_access_token, create_refresh_token, hash_refresh_token
 from app.identity.models import AuthIdentity, LoginSession, User, UserChannelPermission
+from app.tenancy.service import TenantService
 
 
 def utc_now() -> datetime:
@@ -86,6 +87,9 @@ class IdentityService:
         )
         self.db.add(user)
         await self.db.flush()
+        await TenantService(self.db).provision_personal_tenant(
+            user.id, name=nickname, now=now
+        )
         self.db.add(
             AuthIdentity(
                 id=str(uuid4()),
