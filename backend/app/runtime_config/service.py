@@ -18,6 +18,7 @@ from app.marketing_capability_pack.runtime import (
     build_marketing_run_capability,
 )
 from app.tenancy.models import Tenant
+from app.tenancy.service import effective_runtime_backend
 
 from .crypto import EncryptedSecretValue, RuntimeConfigError, SecretCipher
 from .models import EncryptedRuntimeSecret, RuntimeConfigVersion
@@ -180,8 +181,12 @@ class RuntimeConfigService:
         )
         if tenant is None:
             raise RuntimeConfigError("runtime_tenant_not_found")
+        effective_backend = effective_runtime_backend(
+            tenant.runtime_backend,
+            kill_switch=get_settings().pi_gateway_kill_switch,
+        )
         config = None
-        if tenant.active_runtime_config_id is not None:
+        if not get_settings().pi_gateway_kill_switch and tenant.active_runtime_config_id is not None:
             config = await self.db.get(RuntimeConfigVersion, tenant.active_runtime_config_id)
             if config is None or config.scope != "tenant" or config.tenant_id != tenant_id:
                 raise RuntimeConfigError("runtime_config_tenant_mismatch")
@@ -191,13 +196,14 @@ class RuntimeConfigService:
                 .where(
                     RuntimeConfigVersion.scope == "system",
                     RuntimeConfigVersion.status == "active",
+                    RuntimeConfigVersion.runtime_backend == effective_backend,
                 )
                 .order_by(RuntimeConfigVersion.version.desc())
                 .limit(1)
             )
         if config is None or config.status != "active":
             raise RuntimeConfigError("runtime_config_required")
-        if tenant.runtime_backend == "pi" and (
+        if effective_backend == "pi" and (
             config.scope != "tenant" or config.runtime_backend != "pi"
         ):
             raise RuntimeConfigError("runtime_config_required")
@@ -206,7 +212,7 @@ class RuntimeConfigService:
         if config.runtime_backend == "pi" and not config.secret_refs_json:
             raise RuntimeConfigError("runtime_config_required")
         snapshot = self._snapshot_from_config(config)
-        if snapshot.runtime_backend != tenant.runtime_backend and tenant.runtime_backend == "current":
+        if snapshot.runtime_backend != effective_backend:
             # A current tenant may use the legacy current fallback only.  An
             # explicit pi override must not silently switch the tenant back.
             raise RuntimeConfigError("runtime_config_backend_mismatch")

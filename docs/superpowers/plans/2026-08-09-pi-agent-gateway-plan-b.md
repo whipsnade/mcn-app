@@ -851,18 +851,18 @@ effective_backend = (
   Worker 崩溃一次恢复；二次失败；unknown 不重放；取消；SSE 续传；draining；current→pi→current；
   kill switch；旧 Run snapshot 不变。
 
-- [ ] **Step 1：灰度红灯。** 覆盖所有前置条件、旧/new Run 选择、幂等消息、kill switch 与在途 Run。
-- [ ] **Step 2：本地 UAT 红灯。** 先运行完整 fake topology，预期 production Gateway/rollout 尚未接通。
-- [ ] **Step 3：最小接线。** `create_agent_runtime()` 继续启动 current executor；Pi scheduler 领取
+- [x] **Step 1：灰度红灯。** 覆盖所有前置条件、旧/new Run 选择、幂等消息、kill switch 与在途 Run。
+- [x] **Step 2：本地 UAT 红灯。** 先运行完整 fake topology，预期 production Gateway/rollout 尚未接通。
+- [x] **Step 3：最小接线。** `create_agent_runtime()` 继续启动 current executor；Pi scheduler 领取
   `runtime_backend=pi` 的 user/internal Run，current executor/Utility 只执行 current；二者共享 session
   slot、账本和终态事件。为 kol detail/utility 分别覆盖父 backend 继承与执行器归属测试。
-- [ ] **Step 4：回滚演练。** Pi Gateway 停止、租户切 current、kill switch 三种方式都只影响新 Run；
+- [x] **Step 4：回滚演练。** Pi Gateway 停止、租户切 current、kill switch 三种方式都只影响新 Run；
   在途 Pi 自然完成或按基础设施恢复规则收口，不能转交 current 重跑同一消息。
-- [ ] **Step 5：绿灯。** 本地多租户 UAT、后端/Node/前端聚焦与全量回归；验证 0 外部网络、0 真实
+- [x] **Step 5：绿灯。** 本地多租户 UAT、后端/Node/前端聚焦与全量回归；验证 0 外部网络、0 真实
   secret、0 历史 round 修改。
-- [ ] **Step 6：输出状态。** 只可记录 `READY_FOR_REAL_B7_UAT`；不得写 Gate A PASS、B7 PASS、
+- [x] **Step 6：输出状态。** 只可记录 `READY_FOR_REAL_B7_UAT`；不得写 Gate A PASS、B7 PASS、
   production ready 或默认已切 Pi。
-- [ ] **Step 7：Commit。** `feat: add tenant pi rollout and rollback controls`。
+- [x] **Step 7：Commit。** `feat: add tenant pi rollout and rollback controls`。
 
 ---
 

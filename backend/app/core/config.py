@@ -94,6 +94,9 @@ class Settings(BaseSettings):
     pi_gateway_allowed_ids: list[str] = Field(default_factory=list)
     pi_gateway_lease_seconds: int = Field(default=60, gt=0)
     pi_gateway_control_plane_url: AnyHttpUrl | None = None
+    # Highest-priority local rollback switch: new Runs use current while
+    # existing Pi Runs retain their immutable snapshot.
+    pi_gateway_kill_switch: bool = False
 
     @field_validator("pi_gateway_allowed_ids", mode="before")
     @classmethod

@@ -171,7 +171,30 @@ class GatewayAdminService:
 
     async def update_tenant(self, admin: User, tenant_id: str, payload: AdminTenantUpdate, *, idempotency_key: str | None) -> AdminTenantItem:
         tenant = await self._tenant(tenant_id, for_update=True)
-        before = {"name": tenant.name, "status": tenant.status}
+        before = {"name": tenant.name, "status": tenant.status, "runtime_backend": tenant.runtime_backend}
+        if payload.runtime_backend == "pi" and tenant.runtime_backend != "pi":
+            if tenant.license_status != "active" or tenant.active_license_id is None:
+                raise GatewayAdminError("pi_rollout_license_required")
+            active_license = await self.db.get(TenantLicense, tenant.active_license_id)
+            feature_enabled = active_license if active_license is not None and active_license.features_json.get("kol_selection") is True else None
+            config = await self.db.scalar(
+                select(RuntimeConfigVersion.id).where(
+                    RuntimeConfigVersion.id == tenant.active_runtime_config_id,
+                    RuntimeConfigVersion.scope == "tenant",
+                    RuntimeConfigVersion.tenant_id == tenant.id,
+                    RuntimeConfigVersion.runtime_backend == "pi",
+                    RuntimeConfigVersion.status == "active",
+                )
+            )
+            healthy_gateway = await self.db.scalar(
+                select(PiGatewayInstance.id).where(
+                    PiGatewayInstance.status == "active",
+                    PiGatewayInstance.mode == "active",
+                    PiGatewayInstance.desired_capacity > 0,
+                ).limit(1)
+            )
+            if feature_enabled is None or config is None or healthy_gateway is None:
+                raise GatewayAdminError("pi_rollout_precondition_failed")
         if payload.status == "disabled":
             active = await self.db.scalar(
                 select(AgentRun.id).where(
@@ -190,9 +213,11 @@ class GatewayAdminService:
             tenant.name = payload.name
         if payload.status is not None:
             tenant.status = payload.status
+        if payload.runtime_backend is not None:
+            tenant.runtime_backend = payload.runtime_backend
         tenant.updated_at = _now()
         self._audit(admin.id, action="tenant.update", target_type="tenant", target_id=tenant.id,
-                    detail={"before": before, "after": {"name": tenant.name, "status": tenant.status}}, idempotency_key=idempotency_key)
+                    detail={"before": before, "after": {"name": tenant.name, "status": tenant.status, "runtime_backend": tenant.runtime_backend}}, idempotency_key=idempotency_key)
         members = int(await self.db.scalar(select(func.count()).select_from(TenantMembership).where(TenantMembership.tenant_id == tenant.id)) or 0)
         runs = int(await self.db.scalar(select(func.count()).select_from(AgentRun).where(AgentRun.tenant_id == tenant.id, AgentRun.status.in_(('queued','running','reviewing')))) or 0)
         return self._tenant_item(tenant, members, runs)

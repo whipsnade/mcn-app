@@ -10,6 +10,13 @@ from app.tenancy.models import Tenant, TenantMembership
 from app.tenancy.schemas import TenantContext
 
 
+def effective_runtime_backend(tenant_backend: str, *, kill_switch: bool) -> str:
+    """Select the backend for a new Run without mutating tenant/history state."""
+    if tenant_backend not in {"current", "pi"}:
+        raise ValueError("runtime_backend_invalid")
+    return "current" if kill_switch else tenant_backend
+
+
 class TenantService:
     def __init__(self, db: AsyncSession) -> None:
         self.db = db

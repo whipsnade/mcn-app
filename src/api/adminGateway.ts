@@ -46,7 +46,7 @@ export const listAdminTenants = (params: { limit?: number; offset?: number } = {
   request<{ items: AdminTenant[]; total: number }>(query('/api/v1/admin/tenants', params));
 export const createAdminTenant = (input: { slug: string; name: string; is_internal?: boolean }) =>
   request<AdminTenant>('/api/v1/admin/tenants', { method: 'POST', headers: key(), body: JSON.stringify(input) });
-export const updateAdminTenant = (id: string, input: { name?: string; status?: 'active' | 'disabled' }) =>
+export const updateAdminTenant = (id: string, input: { name?: string; status?: 'active' | 'disabled'; runtime_backend?: 'current' | 'pi' }) =>
   request<AdminTenant>(`/api/v1/admin/tenants/${encodeURIComponent(id)}`, { method: 'PATCH', headers: key(), body: JSON.stringify(input) });
 export const listAdminLicenses = (tenantId: string) => request<AdminLicense[]>(`/api/v1/admin/tenants/${encodeURIComponent(tenantId)}/license`);
 export const createAdminLicense = (tenantId: string, input: Omit<AdminLicense, 'id' | 'tenant_id' | 'version' | 'active' | 'created_at'>) =>

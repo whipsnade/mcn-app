@@ -120,6 +120,7 @@ class AdminTenantCreate(BaseModel):
 class AdminTenantUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=160)
     status: Literal["active", "disabled"] | None = None
+    runtime_backend: Literal["current", "pi"] | None = None
 
 
 class AdminTenantUserItem(BaseModel):
