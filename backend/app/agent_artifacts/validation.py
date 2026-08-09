@@ -113,6 +113,9 @@ _KOL_PLATFORM_ALIASES = {
     "b站": "bilibili",
 }
 _KOL_INVALID_PLATFORMS = {"unknown", "all", "aggregate", "合计", "全部", "未知", ""}
+_KOL_SUPPORTED_PLATFORMS = frozenset({"xiaohongshu", "douyin", "kuaishou", "bilibili"})
+_KOL_RANKING_MODES = frozenset({"balanced"})
+_KOL_SCORING_VERSIONS = frozenset({"kol_score_v2", "kol_value_score_v3"})
 
 
 def _kol_platform(value: Any) -> str:
@@ -124,6 +127,14 @@ def _kol_platform(value: Any) -> str:
 
 def _kol_nonempty(value: Any) -> bool:
     return isinstance(value, str) and bool(value.strip())
+
+
+def _kol_scope_present(value: Any) -> bool:
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, set, frozenset, Mapping)):
+        return bool(value)
+    return value is not None
 
 
 def _kol_budget_bounds(scope: Mapping[str, Any]) -> tuple[float | None, float | None]:
@@ -193,13 +204,21 @@ def _kol_observed_score(snapshot: Any) -> bool:
     return False
 
 
-def validate_kol_candidates(payload: Any) -> list[ValidationIssue]:
+def validate_kol_candidates(
+    payload: Any, *, require_v3_scope: bool = False
+) -> list[ValidationIssue]:
     """校验 KOL 名单是否具备可发布的候选与完整范围。
 
     这是发布前的纯值对象门禁：不访问数据库、不把缺失评分伪造成有效零值，
     也不把昵称当作稳定身份。历史 v2/v3 payload 的新增 scope 字段使用兼容
     默认值；旧 payload 仍需满足原有范围字段与候选基本身份约束。
     """
+    source_scope_fields: set[str] | None = None
+    source_scope = getattr(payload, "scope", None)
+    if source_scope is not None:
+        model_fields_set = getattr(source_scope, "model_fields_set", None)
+        if model_fields_set is not None:
+            source_scope_fields = set(model_fields_set)
     if hasattr(payload, "model_dump"):
         payload = payload.model_dump(mode="json")
     if not isinstance(payload, Mapping):
@@ -218,8 +237,18 @@ def validate_kol_candidates(payload: Any) -> list[ValidationIssue]:
                 "scope",
             )
         )
+    raw_data = payload.get("data")
+    raw_scoring = raw_data.get("scoring") if isinstance(raw_data, Mapping) else None
+    v3_scoring_payload = (
+        isinstance(raw_scoring, Mapping) and raw_scoring.get("version") == "kol_value_score_v3"
+    )
     present_v3_fields = [field for field in _KOL_SCOPE_V3_FIELDS if field in scope]
-    if present_v3_fields and len(present_v3_fields) != len(_KOL_SCOPE_V3_FIELDS):
+    if source_scope_fields is not None:
+        present_v3_fields = [field for field in _KOL_SCOPE_V3_FIELDS if field in source_scope_fields]
+    strict_v3_scope = require_v3_scope or bool(present_v3_fields)
+    if source_scope_fields is None:
+        strict_v3_scope = strict_v3_scope or v3_scoring_payload
+    if strict_v3_scope and len(present_v3_fields) != len(_KOL_SCOPE_V3_FIELDS):
         issues.append(
             ValidationIssue(
                 "kol_scope_incomplete",
@@ -229,6 +258,68 @@ def validate_kol_candidates(payload: Any) -> list[ValidationIssue]:
         )
 
     raw_allowed = scope.get("platforms")
+    if strict_v3_scope:
+        if not isinstance(raw_allowed, (list, tuple)) or not raw_allowed:
+            issues.append(
+                ValidationIssue(
+                    "kol_scope_platforms_missing",
+                    "new KOL selection scope requires a non-empty platform allowlist",
+                    "scope.platforms",
+                )
+            )
+        invalid_scope_platforms = [
+            item
+            for item in (raw_allowed if isinstance(raw_allowed, (list, tuple)) else ())
+            if _kol_platform(item) not in _KOL_SUPPORTED_PLATFORMS
+        ]
+        if invalid_scope_platforms:
+            issues.append(
+                ValidationIssue(
+                    "kol_scope_platform_invalid",
+                    "scope platforms must use the supported platform allowlist",
+                    "scope.platforms",
+                )
+            )
+        if not scope.get("ranking_mode") or scope.get("ranking_mode") not in _KOL_RANKING_MODES:
+            issues.append(
+                ValidationIssue(
+                    "kol_scope_v3_invalid",
+                    "scope ranking_mode is not a supported value",
+                    "scope.ranking_mode",
+                )
+            )
+        top_limit = scope.get("top_limit")
+        if (
+            not isinstance(top_limit, int)
+            or isinstance(top_limit, bool)
+            or not 1 <= top_limit <= 20
+        ):
+            issues.append(
+                ValidationIssue(
+                    "kol_scope_v3_invalid",
+                    "scope top_limit must be an integer from 1 to 20",
+                    "scope.top_limit",
+                )
+            )
+        scoring_version = scope.get("scoring_version")
+        if scoring_version not in _KOL_SCORING_VERSIONS:
+            issues.append(
+                ValidationIssue(
+                    "kol_scope_v3_invalid",
+                    "scope scoring_version is not supported",
+                    "scope.scoring_version",
+                )
+        )
+        for field in ("region", "age_range", "period"):
+            if not _kol_scope_present(scope.get(field)):
+                issues.append(
+                    ValidationIssue(
+                        "kol_scope_v3_invalid",
+                        f"scope {field} is required for a new v3 publication",
+                        f"scope.{field}",
+                    )
+                )
+
     allowed = {
         _kol_platform(item)
         for item in (raw_allowed if isinstance(raw_allowed, (list, tuple, set)) else ())
@@ -238,10 +329,9 @@ def validate_kol_candidates(payload: Any) -> list[ValidationIssue]:
     data = payload.get("data")
     items = data.get("items") if isinstance(data, Mapping) else None
     scoring = data.get("scoring") if isinstance(data, Mapping) else None
-    if (
-        scope.get("scoring_version")
-        and isinstance(scoring, Mapping)
-        and scope.get("scoring_version") != scoring.get("version")
+    if strict_v3_scope and (
+        not isinstance(scoring, Mapping)
+        or scope.get("scoring_version") != scoring.get("version")
     ):
         issues.append(
             ValidationIssue(
@@ -271,7 +361,12 @@ def validate_kol_candidates(payload: Any) -> list[ValidationIssue]:
         if not _kol_nonempty(nickname):
             issues.append(ValidationIssue("kol_nickname_missing", "candidate nickname is required", f"{path}.nickname"))
         platform = _kol_platform(item.get("platform"))
-        if platform in _KOL_INVALID_PLATFORMS or not platform or (allowed and platform not in allowed):
+        platform_invalid = platform in _KOL_INVALID_PLATFORMS or platform not in _KOL_SUPPORTED_PLATFORMS
+        if (
+            platform_invalid
+            or not platform
+            or ((strict_v3_scope or allowed) and platform not in allowed)
+        ):
             issues.append(ValidationIssue("kol_platform_invalid", "candidate platform is not allowed", f"{path}.platform"))
         identity = item.get("kol_uid")
         if not _kol_nonempty(identity):
@@ -324,6 +419,51 @@ def validate_kol_candidates(payload: Any) -> list[ValidationIssue]:
                 issues.append(ValidationIssue("kol_budget_untraceable", "candidate quote is below scope budget", f"{path}.quoted_price"))
             if maximum_budget is not None and quote > maximum_budget:
                 issues.append(ValidationIssue("kol_budget_untraceable", "candidate quote exceeds scope budget", f"{path}.quoted_price"))
+
+    if strict_v3_scope:
+        top_limit = scope.get("top_limit")
+        summary = data.get("summary") if isinstance(data, Mapping) else None
+        selected_count = summary.get("selected_count") if isinstance(summary, Mapping) else None
+        candidate_count = summary.get("candidate_count") if isinstance(summary, Mapping) else None
+        if isinstance(top_limit, int) and len(items) > top_limit:
+            issues.append(
+                ValidationIssue(
+                    "kol_top_limit_exceeded",
+                    "number of selected candidates exceeds scope top_limit",
+                    "data.items",
+                )
+            )
+        distribution = summary.get("platform_distribution") if isinstance(summary, Mapping) else None
+        distribution_counts = [
+            item.get("count")
+            for item in (distribution if isinstance(distribution, (list, tuple)) else ())
+            if isinstance(item, Mapping) and isinstance(item.get("count"), int)
+        ]
+        if (
+            not isinstance(top_limit, int)
+            or isinstance(top_limit, bool)
+            or not isinstance(selected_count, int)
+            or isinstance(selected_count, bool)
+            or selected_count < 0
+            or selected_count > top_limit
+            or (
+                isinstance(candidate_count, int)
+                and not isinstance(candidate_count, bool)
+                and selected_count > candidate_count
+            )
+            or (
+                distribution_counts
+                and sum(distribution_counts) != selected_count
+            )
+            or selected_count != len(items)
+        ):
+            issues.append(
+                ValidationIssue(
+                    "kol_summary_count_mismatch",
+                    "summary selected_count must match items and stay within scope top_limit",
+                    "data.summary.selected_count",
+                )
+            )
 
     narrative = payload.get("narrative")
     if isinstance(narrative, Mapping):
@@ -401,7 +541,7 @@ class ArtifactPayloadValidator:
                 errors=exc.errors(include_context=False),
             ) from exc
         if enforce_kol_publication_validity and schema_version == "kol_selection_v3":
-            kol_issues = validate_kol_candidates(instance)
+            kol_issues = validate_kol_candidates(instance, require_v3_scope=True)
             if kol_issues:
                 raise ArtifactPayloadInvalid(
                     "payload fails kol candidate publication validity",

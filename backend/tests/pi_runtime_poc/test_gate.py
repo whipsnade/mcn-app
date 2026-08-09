@@ -14,7 +14,18 @@ def _report_fixture() -> dict:
         "case_id": "brand-research-v1",
         "expected_behavior": "report",
         "required_artifact_type": "brand_report_v3",
+        "published_version_id": "version-brand",
         "scope": {"brand": "某品牌", "platforms": ["xiaohongshu"]},
+        "evidence_manifest": [
+            {
+                "evidence_id": "evidence-brand",
+                "version_id": "version-brand",
+                "run_id": "run-brand",
+                "session_id": "session-brand",
+                "source_path": "/data/overview/total_volume",
+                "value": 10,
+            }
+        ],
     }
 
 
@@ -25,6 +36,7 @@ def _report_result() -> dict:
         "status": "completed",
         "outcome": "completed",
         "run_id": "run-brand",
+        "session_id": "session-brand",
         "artifact_versions": ["version-brand"],
         "evidence_ids": ["evidence-brand"],
         "scope": {"brand": "某品牌", "platforms": ["xiaohongshu"]},
@@ -35,6 +47,39 @@ def _report_result() -> dict:
                 "numeric_lineage_complete": True,
                 "narrative_grounded": True,
                 "partial_limitations_complete": True,
+                "status": "published",
+                "validation_json": {"valid": True},
+                "payload": {"data": {"overview": {"total_volume": 10}}},
+                "canonical_data": {
+                    "data/overview/total_volume": {
+                        "path": "/data/overview/total_volume",
+                        "value": 10,
+                        "availability": "complete",
+                        "evidence_ids": ["evidence-brand"],
+                        "unit": "mentions",
+                    }
+                },
+                "field_lineage": {
+                    "data/overview/total_volume": {"evidence_ids": ["evidence-brand"]}
+                },
+                "structured_claims": [
+                    {
+                        "path": "/data/overview/total_volume",
+                        "value": 10,
+                        "supporting_paths": ["data/overview/total_volume"],
+                        "evidence_ids": ["evidence-brand"],
+                    }
+                ],
+                "narrative_claims": [
+                    {
+                        "path": "/data/overview/total_volume",
+                        "value": 10,
+                        "supporting_paths": ["data/overview/total_volume"],
+                        "evidence_ids": ["evidence-brand"],
+                    }
+                ],
+                "availability": {"data/overview/total_volume": "complete"},
+                "limitations": [],
             }
         ],
         "metrics": {"datatap_tool_calls": 1},
@@ -55,11 +100,13 @@ def test_each_hard_check_can_fail_closed(field: str) -> None:
     if field == "scope_preserved":
         result["scope"] = {"brand": "other"}
     elif field == "numeric_lineage_complete":
-        result["artifacts"][0]["numeric_lineage_complete"] = False
+        result["evidence_ids"] = ["does-not-exist"]
     elif field == "narrative_grounded":
-        result["artifacts"][0]["narrative_grounded"] = False
+        result["artifacts"][0]["narrative_claims"][0]["value"] = 99
     elif field == "partial_limitations_complete":
-        result["artifacts"][0]["partial_limitations_complete"] = False
+        result["artifacts"][0]["canonical_data"]["data/overview/total_volume"][
+            "availability"
+        ] = "partial"
     elif field == "no_duplicate_report":
         result["artifact_versions"] = ["version-brand", "version-brand"]
     else:
@@ -179,3 +226,115 @@ def test_finalize_execution_requires_review_only_after_cases_are_evaluable() -> 
     execution = {"runtime": "pi", "results": [_report_result()]}
     with pytest.raises(ValueError, match="poc_human_review_required"):
         finalize_execution(execution, [_report_fixture()], None)
+
+
+def _structured_lineage_fixture() -> tuple[dict, dict]:
+    fixture = {
+        "case_id": "brand-research-v1",
+        "expected_behavior": "report",
+        "required_artifact_type": "brand_report_v3",
+        "scope": {"brand": "某品牌", "platforms": ["xiaohongshu"]},
+        "evidence_manifest": [
+            {
+                "evidence_id": "ev-volume",
+                "version_id": "version-brand",
+                "run_id": "run-brand",
+                "session_id": "session-brand",
+                "source_path": "/data/overview/total_volume",
+            }
+        ],
+    }
+    result = {
+        "case_id": "brand-research-v1",
+        "runtime": "pi",
+        "status": "completed",
+        "outcome": "completed",
+        "run_id": "run-brand",
+        "session_id": "session-brand",
+        "artifact_versions": ["version-brand"],
+        "evidence_ids": ["ev-volume"],
+        "scope": {"brand": "某品牌", "platforms": ["xiaohongshu"]},
+        "artifacts": [
+            {
+                "version_id": "version-brand",
+                "artifact_type": "brand_report_v3",
+                "status": "published",
+                "validation_json": {"valid": True},
+                "numeric_lineage_complete": True,
+                "narrative_grounded": True,
+                "partial_limitations_complete": True,
+                "payload": {"data": {"overview": {"total_volume": 10}}},
+                "canonical_data": {
+                    "data/overview/total_volume": {
+                        "path": "/data/overview/total_volume",
+                        "value": 10,
+                        "availability": "complete",
+                        "evidence_ids": ["ev-volume"],
+                        "unit": "mentions",
+                    }
+                },
+                "field_lineage": {
+                    "data/overview/total_volume": {"evidence_ids": ["ev-volume"]}
+                },
+                "structured_claims": [
+                    {
+                        "path": "/data/overview/total_volume",
+                        "value": 10,
+                        "supporting_paths": ["data/overview/total_volume"],
+                        "evidence_ids": ["ev-volume"],
+                    }
+                ],
+                "narrative_claims": [
+                    {
+                        "path": "/data/overview/total_volume",
+                        "value": 10,
+                        "supporting_paths": ["data/overview/total_volume"],
+                        "evidence_ids": ["ev-volume"],
+                    }
+                ],
+                "availability": {"data/overview/total_volume": "complete"},
+                "limitations": [],
+            }
+        ],
+        "metrics": {"datatap_tool_calls": 1},
+    }
+    return fixture, result
+
+
+def test_structured_lineage_tampering_rejects_self_reported_true_flags() -> None:
+    fixture, result = _structured_lineage_fixture()
+    assert all(evaluate_case(result, fixture).values())
+
+    tampered = deepcopy(result)
+    tampered["evidence_ids"] = ["does-not-exist"]
+    tampered["artifacts"][0]["validation_json"] = {}
+    tampered["artifacts"][0]["narrative_claims"][0]["value"] = 99
+    checks = evaluate_case(tampered, fixture)
+
+    assert checks["numeric_lineage_complete"] is False
+    assert checks["narrative_grounded"] is False
+    assert checks["partial_limitations_complete"] is False
+
+
+def test_gate_manifest_version_and_source_path_are_trusted_from_fixture_only() -> None:
+    fixture = _report_fixture()
+    result = _report_result()
+
+    no_manifest = deepcopy(fixture)
+    no_manifest.pop("evidence_manifest")
+    assert evaluate_case(result, no_manifest)["numeric_lineage_complete"] is False
+
+    wrong_path = deepcopy(fixture)
+    wrong_path["evidence_manifest"][0]["source_path"] = "/data/overview/other"
+    assert evaluate_case(result, wrong_path)["numeric_lineage_complete"] is False
+
+    wrong_version = deepcopy(result)
+    wrong_version["artifact_versions"] = ["evil-version"]
+    wrong_version["artifacts"][0]["version_id"] = "evil-version"
+    assert evaluate_case(wrong_version, fixture)["numeric_lineage_complete"] is False
+
+    duplicate_manifest = deepcopy(fixture)
+    duplicate_manifest["evidence_manifest"].append(
+        duplicate_manifest["evidence_manifest"][0].copy()
+    )
+    assert evaluate_case(result, duplicate_manifest)["numeric_lineage_complete"] is False

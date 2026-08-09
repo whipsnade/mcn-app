@@ -28,6 +28,10 @@ from tests.agent_artifacts.test_payloads import (
 
 def _valid_payload() -> dict:
     payload = build_kol_value_selection_dict()
+    payload["data"]["summary"]["selected_count"] = len(payload["data"]["items"])
+    payload["data"]["summary"]["platform_distribution"] = [
+        {"key": "xhs", "label": "小红书", "count": len(payload["data"]["items"]), "share": 1.0}
+    ]
     payload["scope"].update(
         {
             "region": ["上海"],
@@ -107,6 +111,57 @@ def test_missing_scope_or_scope_field_is_rejected() -> None:
     payload = _valid_payload()
     payload["scope"].pop("platforms")
     assert "kol_scope_incomplete" in _codes(payload)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "code"),
+    [
+        ("platforms", [], "kol_scope_platforms_missing"),
+        ("ranking_mode", None, "kol_scope_v3_invalid"),
+        ("top_limit", None, "kol_scope_v3_invalid"),
+        ("scoring_version", None, "kol_scope_v3_invalid"),
+    ],
+)
+def test_new_v3_scope_requires_publishable_values(field: str, value: object, code: str) -> None:
+    payload = _valid_payload()
+    payload["scope"][field] = value
+    assert code in _codes(payload)
+
+
+def test_new_v3_scope_enforces_platform_allowlist_and_top_limit() -> None:
+    payload = _valid_payload()
+    payload["scope"]["platforms"] = ["douyin"]
+    payload["scope"]["top_limit"] = 1
+    second = dict(payload["data"]["items"][0])
+    second["kol_uid"] = "second-kol"
+    second["nickname"] = "第二达人"
+    second["platform"] = "xiaohongshu"
+    payload["data"]["items"].append(second)
+    payload["data"]["summary"]["selected_count"] = 2
+    codes = _codes(payload)
+    assert "kol_platform_invalid" in codes
+    assert "kol_top_limit_exceeded" in codes
+    assert "kol_summary_count_mismatch" in codes
+
+
+def test_new_v3_scope_rejects_omitted_fields_and_unknown_allowlist() -> None:
+    payload = _valid_payload()
+    for field in ("region", "age_range", "period", "budget", "ranking_mode", "top_limit", "scoring_version"):
+        payload["scope"].pop(field)
+    payload["scope"]["platforms"] = ["evil-platform"]
+    codes = _codes(payload)
+    assert "kol_scope_incomplete" in codes
+    assert "kol_scope_platform_invalid" in codes
+
+
+def test_new_v3_scope_checks_summary_against_items_even_with_distribution() -> None:
+    payload = _valid_payload()
+    payload["data"]["items"].append(dict(payload["data"]["items"][0]))
+    payload["data"]["items"][1]["kol_uid"] = "second-kol"
+    payload["data"]["items"][1]["nickname"] = "第二达人"
+    payload["data"]["summary"]["selected_count"] = 1
+    payload["data"]["summary"]["platform_distribution"][0]["count"] = 1
+    assert "kol_summary_count_mismatch" in _codes(payload)
 
 
 def test_narrative_cannot_name_outsider() -> None:
@@ -220,6 +275,13 @@ def test_exporter_accepts_published_legal_and_history_versions() -> None:
     assert export_artifact(_Version(build_kol_selection_dict()))[:2] == b"PK"
 
 
+def test_exporter_rejects_v3_scope_without_platform_allowlist() -> None:
+    payload = _valid_payload()
+    payload["scope"]["platforms"] = []
+    with pytest.raises(ArtifactExportUnsupported):
+        export_artifact(_Version(payload))
+
+
 async def _persist_kol_draft(db_session, user_id: str, session_id: str, run_id: str):
     payload = _valid_payload()
     return await ArtifactService(db_session).create_or_get_draft(
@@ -307,3 +369,72 @@ async def test_batch_publish_cannot_bypass_kol_candidate_gate(
             select(AgentArtifactVersion).where(AgentArtifactVersion.artifact_id == artifact.id)
         )
     )
+
+
+async def test_direct_publish_rejects_v3_scope_without_platform_allowlist(
+    db_session, user_factory, session_factory, run_factory
+) -> None:
+    user = await user_factory()
+    session = await session_factory(user.id)
+    run = await run_factory(session.id, user.id)
+    assert await AgentRunRepository(db_session).claim_lease(run.id, "worker", 300)
+    _artifact, draft, revision = await _persist_kol_draft(
+        db_session, user.id, session.id, run.id
+    )
+    payload = dict(revision.payload_json)
+    payload["scope"] = dict(payload["scope"])
+    payload["scope"]["platforms"] = []
+    revision.payload_json = payload
+    await db_session.flush()
+
+    results = await ArtifactPublicationService(db_session).publish(
+        run_id=run.id, draft_ids=(draft.id,), worker_id="worker"
+    )
+    assert results[0].status == "validation_failed"
+    assert any(error.get("code") == "kol_scope_platforms_missing" for error in results[0].errors)
+
+
+async def test_batch_publish_rejects_v3_scope_top_limit_overflow(
+    db_session, user_factory, session_factory, run_factory
+) -> None:
+    user = await user_factory()
+    session = await session_factory(user.id)
+    run = await run_factory(session.id, user.id)
+    assert await AgentRunRepository(db_session).claim_lease(run.id, "worker", 300)
+    artifact, _draft, revision = await _persist_kol_draft(
+        db_session, user.id, session.id, run.id
+    )
+    payload = dict(revision.payload_json)
+    payload["scope"] = dict(payload["scope"])
+    payload["scope"]["top_limit"] = 1
+    payload["data"] = dict(payload["data"])
+    payload["data"]["items"] = [
+        dict(payload["data"]["items"][0]),
+        dict(payload["data"]["items"][0]),
+    ]
+    payload["data"]["items"][1]["kol_uid"] = "second-kol"
+    payload["data"]["items"][1]["nickname"] = "第二达人"
+    payload["data"]["summary"] = dict(payload["data"]["summary"])
+    payload["data"]["summary"]["selected_count"] = 2
+    revision.payload_json = payload
+    now = datetime.now(UTC).replace(tzinfo=None)
+    batch = ArtifactReviewBatch(
+        id=str(uuid4()),
+        parent_run_id=run.id,
+        status="pending",
+        completion_text="完成",
+        created_at=now,
+    )
+    item = ArtifactReviewItem(
+        id=str(uuid4()),
+        batch_id=batch.id,
+        artifact_id=artifact.id,
+        draft_revision_id=revision.id,
+        status="approved",
+    )
+    db_session.add_all([batch, item])
+    await db_session.flush()
+
+    with pytest.raises(ArtifactPayloadInvalid) as excinfo:
+        await ArtifactService(db_session).publish_batch(batch.id, worker_id="worker")
+    assert any(error.get("code") == "kol_top_limit_exceeded" for error in excinfo.value.errors)

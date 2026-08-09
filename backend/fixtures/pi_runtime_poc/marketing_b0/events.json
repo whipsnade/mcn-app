@@ -1,8 +1,44 @@
 {
-  "brand-research-v1": ["run.started", "evidence.settled", "artifact.published", "run.completed"],
-  "campaign-evaluation-v1": ["run.started", "evidence.settled", "artifact.published", "run.completed"],
-  "kol-selection-v1": ["run.started", "evidence.settled", "artifact.published", "run.completed"],
-  "artifact-drilldown-v1": ["run.started", "artifact.read", "run.completed"],
-  "scope-clarification-v1": ["run.started", "clarification.requested", "run.completed"],
-  "non-marketing-v1": ["run.started", "refusal.completed", "run.completed"]
+  "brand-research-v1": [
+    {"type": "run.started", "run_id": "offline-brand-run", "session_id": "offline-brand-session"},
+    {"type": "evidence.settled", "evidence_ids": ["evidence-brand-volume"]},
+    {"type": "artifact.build", "artifact_type": "brand_report_v3", "version_id": "version-brand-b0", "path": "data/overview/total_volume", "value": 120},
+    {"type": "narrative.claim", "path": "/data/overview/total_volume", "value": 120},
+    {"type": "artifact.publish"},
+    {"type": "exporter.export", "format": "json"},
+    {"type": "run.completed", "outcome": "completed"}
+  ],
+  "campaign-evaluation-v1": [
+    {"type": "run.started", "run_id": "offline-campaign-run", "session_id": "offline-campaign-session"},
+    {"type": "evidence.settled", "evidence_ids": ["evidence-campaign-volume", "evidence-campaign-engagement"]},
+    {"type": "artifact.build", "artifact_type": "campaign_report_v2", "version_id": "version-campaign-b0", "path": "data/overview/total_volume", "value": 32},
+    {"type": "narrative.claim", "path": "/data/overview/total_volume", "value": 32},
+    {"type": "artifact.publish"},
+    {"type": "exporter.export", "format": "json"},
+    {"type": "run.completed", "outcome": "completed"}
+  ],
+  "kol-selection-v1": [
+    {"type": "run.started", "run_id": "offline-kol-run", "session_id": "offline-kol-session"},
+    {"type": "evidence.settled", "evidence_ids": ["evidence-kol-profile"]},
+    {"type": "artifact.build", "artifact_type": "kol_selection_v3", "version_id": "version-kol-b0", "path": "data/selection/selected_count", "value": 1},
+    {"type": "narrative.claim", "path": "/data/selection/selected_count", "value": 1},
+    {"type": "artifact.publish"},
+    {"type": "exporter.export", "format": "json"},
+    {"type": "run.completed", "outcome": "completed"}
+  ],
+  "artifact-drilldown-v1": [
+    {"type": "run.started", "run_id": "offline-drilldown-run", "session_id": "offline-drilldown-session"},
+    {"type": "artifact.read", "version_id": "version-brand-b0"},
+    {"type": "run.completed", "outcome": "drilldown_completed"}
+  ],
+  "scope-clarification-v1": [
+    {"type": "run.started", "run_id": "offline-clarify-run", "session_id": "offline-clarify-session"},
+    {"type": "clarification.requested"},
+    {"type": "run.completed", "outcome": "clarification_requested"}
+  ],
+  "non-marketing-v1": [
+    {"type": "run.started", "run_id": "offline-refuse-run", "session_id": "offline-refuse-session"},
+    {"type": "refusal.completed"},
+    {"type": "run.completed", "outcome": "refused"}
+  ]
 }

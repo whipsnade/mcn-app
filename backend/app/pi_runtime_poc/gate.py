@@ -130,6 +130,16 @@ def _artifact_versions(result: Any) -> list[str]:
     return versions
 
 
+def _declared_artifact_versions(result: Any) -> set[str]:
+    versions: set[str] = set()
+    for value in _as_list(_get(result, "artifact_versions", default=[])):
+        if isinstance(value, Mapping):
+            value = value.get("version_id") or value.get("id")
+        if value is not None:
+            versions.add(str(value))
+    return versions
+
+
 def _datatap_calls(result: Any) -> int:
     metrics = _get(result, "metrics", default={})
     value = _get(metrics, "datatap_tool_calls", "datatap_calls", default=0)
@@ -176,17 +186,22 @@ def _scope_preserved(result: Any, fixture: Any) -> bool:
 
 def _report_has_expected_artifact(result: Any, fixture: Any) -> bool:
     required = _get(fixture, "required_artifact_type", default=None)
+    expected_version = _get(fixture, "published_version_id", "expected_version_id", default=None)
     versions = _artifact_versions(result)
+    declared_versions = _declared_artifact_versions(result)
     if not versions:
         return False
-    if required is None:
-        return True
     artifacts = _artifacts(result)
     if not artifacts:
-        explicit = _get(result, "expected_artifact", default=None)
-        legacy = _get(_get(result, "hard_checks", default={}), "expected_artifact", default=None)
-        return explicit is True or legacy is True
-    return any(artifact.get("artifact_type") == required for artifact in artifacts)
+        return False
+    if required is None:
+        return bool(artifacts)
+    return any(
+        artifact.get("artifact_type") == required
+        and str(artifact.get("version_id") or "") in declared_versions
+        and (expected_version is None or str(artifact.get("version_id")) == str(expected_version))
+        for artifact in artifacts
+    )
 
 
 def _signal_from_artifacts(result: Any, name: str) -> bool | None:
@@ -210,22 +225,358 @@ def _evidence_ids(result: Any) -> list[str]:
     return values
 
 
-def _numeric_lineage(result: Any, fixture: Any) -> bool:
-    if _explicit_false(result, "numeric_lineage_complete"):
+_MISSING = object()
+
+
+def _path_key(path: Any) -> str:
+    if not isinstance(path, str):
+        return ""
+    value = path.strip()
+    value = value.removeprefix("/")
+    value = value.replace("~1", "/").replace("~0", "~")
+    return value
+
+
+def _resolve_payload_path(payload: Any, path: Any) -> Any:
+    key = _path_key(path)
+    if not key:
+        return _MISSING
+    current = _mapping(payload)
+    for part in key.split("/"):
+        if isinstance(current, Mapping) and part in current:
+            current = current[part]
+            continue
+        if isinstance(current, (list, tuple)) and part.isdigit():
+            index = int(part)
+            if index < len(current):
+                current = current[index]
+                continue
+        return _MISSING
+    return current
+
+
+def _canonical_fields(artifact: Any) -> dict[str, dict[str, Any]]:
+    raw = _get(artifact, "canonical_data", default={})
+    fields: dict[str, dict[str, Any]] = {}
+    if isinstance(raw, Mapping):
+        for path, value in raw.items():
+            entry = _mapping(value)
+            if entry:
+                key = _path_key(path)
+                if key in fields:
+                    fields["\x00duplicate_fields"] = {}
+                fields[key] = entry
+    elif isinstance(raw, (list, tuple)):
+        for value in raw:
+            entry = _mapping(value)
+            path = entry.get("path") or entry.get("artifact_path")
+            if path:
+                key = _path_key(path)
+                if key in fields:
+                    fields["\x00duplicate_fields"] = {}
+                fields[key] = entry
+    return {path: value for path, value in fields.items() if path or path == "\x00duplicate_fields"}
+
+
+def _lineage_evidence_ids(value: Any) -> set[str]:
+    ids: set[str] = set()
+    if isinstance(value, str) and value.strip():
+        return {value.strip()}
+    for item in _as_list(value):
+        if isinstance(item, str) and item.strip():
+            ids.add(item.strip())
+        elif isinstance(item, Mapping):
+            evidence_id = item.get("evidence_id")
+            if isinstance(evidence_id, str) and evidence_id.strip():
+                ids.add(evidence_id.strip())
+    if isinstance(value, Mapping):
+        for key in ("evidence_ids", "supporting_evidence_ids", "sources"):
+            ids.update(_lineage_evidence_ids(value.get(key)))
+        evidence_id = value.get("evidence_id")
+        if isinstance(evidence_id, str) and evidence_id.strip():
+            ids.add(evidence_id.strip())
+    return ids
+
+
+def _evidence_manifest(result: Any, fixture: Any, artifact: Any) -> dict[str, dict[str, Any]]:
+    # Evidence manifest 是验收 fixture 的唯一信任根；Artifact/result 自带的副本
+    # 只能作为被验证内容，不能在 fixture 缺失时自我授权。
+    raw = _get(fixture, "evidence_manifest", default=None)
+    if raw is None:
+        return {}
+    records: list[Any]
+    if isinstance(raw, Mapping):
+        records = [
+            item
+            for value in raw.values()
+            for item in (value if isinstance(value, list) else [value])
+        ]
+    else:
+        records = _as_list(raw)
+    manifest: dict[str, dict[str, Any]] = {}
+    for value in records:
+        record = _mapping(value)
+        evidence_id = record.get("evidence_id") or record.get("id")
+        if isinstance(evidence_id, str) and evidence_id.strip():
+            if evidence_id.strip() in manifest:
+                manifest["\x00duplicate_manifest"] = {}
+                continue
+            manifest[evidence_id.strip()] = record
+    return manifest
+
+
+def _valid_evidence_ids(
+    evidence_ids: set[str],
+    *,
+    manifest: Mapping[str, Mapping[str, Any]],
+    version_id: str,
+    result: Any,
+    expected_paths: set[str] | None = None,
+) -> bool:
+    run_id = _get(result, "run_id", default=None)
+    session_id = _get(result, "session_id", default=None)
+    if not _nonempty(version_id) or not _nonempty(run_id) or not _nonempty(session_id):
         return False
+    if not evidence_ids:
+        return False
+    for evidence_id in evidence_ids:
+        record = manifest.get(evidence_id)
+        if record is None:
+            return False
+        if str(record.get("version_id")) != str(version_id):
+            return False
+        if str(record.get("run_id")) != str(run_id):
+            return False
+        if str(record.get("session_id")) != str(session_id):
+            return False
+        if not _nonempty(record.get("source_path")):
+            return False
+        if expected_paths and _path_key(record.get("source_path")) not in expected_paths:
+            return False
+    return True
+
+
+def _limitation_paths(value: Any) -> set[str]:
+    paths: set[str] = set()
+    for item in _as_list(value):
+        record = _mapping(item)
+        raw_paths = record.get("affected_paths", record.get("paths", record.get("path", [])))
+        if isinstance(raw_paths, str):
+            raw_paths = [raw_paths]
+        for path in _as_list(raw_paths):
+            key = _path_key(path)
+            if key:
+                paths.add(key)
+    return paths
+
+
+def _claim_valid(
+    claim: Any,
+    *,
+    payload: Any,
+    fields: Mapping[str, Mapping[str, Any]],
+    manifest: Mapping[str, Mapping[str, Any]],
+    version_id: str,
+    result: Any,
+) -> bool:
+    record = _mapping(claim)
+    path = _path_key(record.get("path"))
+    if not path or path not in fields:
+        return False
+    actual = _resolve_payload_path(payload, path)
+    if actual is _MISSING or actual != record.get("value"):
+        return False
+    supporting = {_path_key(value) for value in _as_list(record.get("supporting_paths"))}
+    if not supporting or not supporting.issubset(fields):
+        return False
+    field_ids = set().union(
+        *(_lineage_evidence_ids(fields[supporting_path].get("evidence_ids")) for supporting_path in supporting)
+    )
+    claim_ids = _lineage_evidence_ids(record.get("evidence_ids"))
+    return (
+        path in supporting
+        and claim_ids == field_ids
+        and _valid_evidence_ids(
+        claim_ids,
+        manifest=manifest,
+        version_id=version_id,
+        result=result,
+        expected_paths=supporting,
+        )
+    )
+
+
+def _validate_structured_artifact(
+    result: Any, fixture: Any, artifact: Any, *, require_published: bool = True
+) -> tuple[bool, bool, bool]:
+    """返回 numeric lineage、narrative grounding、partial limitation 三项结构化结果。"""
+    artifact_map = _mapping(artifact)
+    version_id = str(artifact_map.get("version_id") or "")
+    validation_json = artifact_map.get("validation_json")
+    expected_version = _get(fixture, "published_version_id", "expected_version_id", default=None)
+    if (
+        (require_published and artifact_map.get("status") != "published")
+        or not isinstance(validation_json, Mapping)
+        or (require_published and validation_json.get("valid") is not True)
+        or version_id not in _declared_artifact_versions(result)
+        or (expected_version is not None and version_id != str(expected_version))
+    ):
+        return False, False, False
+    payload = _get(artifact_map, "payload", "payload_json", default=None)
+    fields = _canonical_fields(artifact_map)
+    raw_lineage = _get(artifact_map, "field_lineage", default={})
+    lineage = (
+        {_path_key(path): value for path, value in raw_lineage.items()}
+        if isinstance(raw_lineage, Mapping)
+        else raw_lineage
+    )
+    manifest = _evidence_manifest(result, fixture, artifact_map)
+    result_ids = _lineage_evidence_ids(_get(result, "evidence_ids", default=[]))
+    if "\x00duplicate_manifest" in manifest or not _valid_evidence_ids(
+        result_ids,
+        manifest=manifest,
+        version_id=version_id,
+        result=result,
+    ):
+        return False, False, False
+    if (
+        not isinstance(payload, Mapping)
+        or not fields
+        or "\x00duplicate_fields" in fields
+        or not isinstance(lineage, Mapping)
+    ):
+        return False, False, False
+
+    numeric_ok = True
+    partial_ok = True
+    expected_claims: set[str] = set()
+    for path, field in fields.items():
+        actual = _resolve_payload_path(payload, path)
+        value = field.get("value")
+        availability = str(field.get("availability", "")).lower()
+        field_ids = _lineage_evidence_ids(field.get("evidence_ids"))
+        lineage_ids = _lineage_evidence_ids(lineage.get(path))
+        single_evidence_value_mismatch = False
+        if len(field_ids) == 1:
+            evidence_record = manifest.get(next(iter(field_ids)), {})
+            if "value" in evidence_record and evidence_record.get("value") != value:
+                single_evidence_value_mismatch = True
+        if (
+            actual is _MISSING
+            or actual != value
+            or "path" not in field
+            or _path_key(field.get("path")) != path
+            or availability not in {"complete", "partial", "unavailable"}
+            or not _nonempty(field.get("unit"))
+            or single_evidence_value_mismatch
+            or path not in lineage
+            or (availability == "unavailable" and value is not None)
+            or (availability != "unavailable" and not field_ids)
+            or (lineage_ids != field_ids)
+            or (field_ids and not _valid_evidence_ids(
+                field_ids,
+                manifest=manifest,
+                version_id=version_id,
+                result=result,
+                expected_paths={path},
+            ))
+        ):
+            numeric_ok = False
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and availability != "unavailable":
+            expected_claims.add(path)
+        if availability in {"partial", "unavailable"}:
+            limitations = _get(artifact_map, "limitations", default=[])
+            if path not in _limitation_paths(limitations):
+                partial_ok = False
+
+    raw_availability_map = _get(artifact_map, "availability", default={})
+    availability_duplicate = False
+    if isinstance(raw_availability_map, Mapping):
+        availability_map: Any = {}
+        for raw_path, declared in raw_availability_map.items():
+            key = _path_key(raw_path)
+            if key in availability_map:
+                availability_duplicate = True
+            availability_map[key] = declared
+    else:
+        availability_map = raw_availability_map
+    if not isinstance(availability_map, Mapping) or availability_duplicate or {
+        _path_key(path) for path in availability_map
+    } != set(fields):
+        numeric_ok = False
+    else:
+        for path, field in fields.items():
+            declared = availability_map.get(path)
+            if declared is None or str(declared).lower() != str(field.get("availability")).lower():
+                numeric_ok = False
+
+    if {
+        _path_key(path) for path in lineage
+    } != set(fields):
+        numeric_ok = False
+
+    field_evidence_ids = set()
+    for field in fields.values():
+        field_evidence_ids.update(_lineage_evidence_ids(field.get("evidence_ids")))
+    if result_ids != field_evidence_ids:
+        numeric_ok = False
+
+    claims = _as_list(_get(artifact_map, "structured_claims", default=[]))
+    claim_paths = set()
+    claims_ok = bool(claims)
+    for claim in claims:
+        claim_path = _path_key(_get(claim, "path", default=None))
+        claim_paths.add(claim_path)
+        claims_ok = claims_ok and _claim_valid(
+            claim,
+            payload=payload,
+            fields=fields,
+            manifest=manifest,
+            version_id=version_id,
+            result=result,
+        )
+    numeric_ok = numeric_ok and expected_claims.issubset(claim_paths) and claims_ok
+
+    narrative_claims = _as_list(_get(artifact_map, "narrative_claims", default=[]))
+    narrative_ok = bool(narrative_claims) and all(
+        _claim_valid(
+            claim,
+            payload=payload,
+            fields=fields,
+            manifest=manifest,
+            version_id=version_id,
+            result=result,
+        )
+        for claim in narrative_claims
+    )
+    return numeric_ok, narrative_ok, partial_ok
+
+
+def validate_structured_artifact(
+    result: Any, fixture: Any, artifact: Any, *, require_published: bool = True
+) -> tuple[bool, bool, bool]:
+    """公开纯值对象校验，供离线回放在 Publication 前复用。"""
+    return _validate_structured_artifact(
+        result, fixture, artifact, require_published=require_published
+    )
+
+
+def _artifact_self_reported_false(artifact: Any, name: str) -> bool:
+    """自报 false 只能让门禁失败，不能让自报 true 代替结构化校验。"""
+    return _mapping(artifact).get(name) is False
+
+
+def _numeric_lineage(result: Any, fixture: Any) -> bool:
     if _behavior(result, fixture) != _REPORT:
         return True
     if not _report_has_expected_artifact(result, fixture):
         return False
-    if not _evidence_ids(result):
-        return False
-    signal = _signal_from_artifacts(result, "numeric_lineage_complete")
-    if signal is not None:
-        return signal
-    explicit = _explicit_value(result, "numeric_lineage_complete")
-    if explicit is not None:
-        return explicit
-    return _explicit_value(result, "lineage_complete") is True
+    artifacts = _artifacts(result)
+    return all(
+        not _artifact_self_reported_false(artifact, "numeric_lineage_complete")
+        and _validate_structured_artifact(result, fixture, artifact)[0]
+        for artifact in artifacts
+    )
 
 
 def _valid_candidate(candidate: Any) -> bool:
@@ -267,24 +618,20 @@ def _valid_candidates(result: Any, fixture: Any) -> bool:
             candidates = _as_list(artifact.get("candidates", artifact.get("items", [])))
             if candidates:
                 break
-    if not candidates or not all(_valid_candidate(item) for item in candidates):
-        return False
-    signal = _signal_from_artifacts(result, "valid_candidates")
-    return signal is not False
+    return bool(candidates) and all(_valid_candidate(item) for item in candidates)
 
 
 def _narrative_grounded(result: Any, fixture: Any) -> bool:
-    if _explicit_false(result, "narrative_grounded"):
-        return False
     if _behavior(result, fixture) != _REPORT:
         return True
-    signal = _signal_from_artifacts(result, "narrative_grounded")
-    if signal is not None:
-        return signal
-    explicit = _explicit_value(result, "narrative_grounded")
-    if explicit is not None:
-        return explicit
-    return False
+    artifacts = _artifacts(result)
+    if not _report_has_expected_artifact(result, fixture):
+        return False
+    return all(
+        not _artifact_self_reported_false(artifact, "narrative_grounded")
+        and _validate_structured_artifact(result, fixture, artifact)[1]
+        for artifact in artifacts
+    )
 
 
 def _drilldown_bound(result: Any, fixture: Any) -> bool:
@@ -341,22 +688,16 @@ def _no_duplicate_report(result: Any) -> bool:
 
 
 def _partial_limitations(result: Any, fixture: Any) -> bool:
-    if _explicit_false(result, "partial_limitations_complete"):
-        return False
     if _behavior(result, fixture) != _REPORT:
         return True
-    signal = _signal_from_artifacts(result, "partial_limitations_complete")
-    if signal is False:
-        return False
     artifacts = _artifacts(result)
-    partial = any(str(artifact.get("availability", "")).lower() == "partial" for artifact in artifacts)
-    if not partial:
-        explicit = _explicit_value(result, "partial_limitations_complete")
-        return explicit is not False and (signal is not None or explicit is not None or bool(artifacts))
-    limitations = _get(result, "limitations", "limitation", default=None)
-    if not _nonempty(limitations):
-        limitations = [artifact.get("limitations") for artifact in artifacts]
-    return _has_content(limitations)
+    if not _report_has_expected_artifact(result, fixture):
+        return False
+    return all(
+        not _artifact_self_reported_false(artifact, "partial_limitations_complete")
+        and _validate_structured_artifact(result, fixture, artifact)[2]
+        for artifact in artifacts
+    )
 
 
 def evaluate_case(result: Any, fixture: Any) -> dict[str, bool]:
@@ -470,4 +811,11 @@ def write_summary_append_once(path: Path, payload: Mapping[str, Any]) -> Path:
     return path
 
 
-__all__ = ["HARD_CHECKS", "Summary", "evaluate_case", "finalize_execution", "write_summary_append_once"]
+__all__ = [
+    "HARD_CHECKS",
+    "Summary",
+    "evaluate_case",
+    "finalize_execution",
+    "validate_structured_artifact",
+    "write_summary_append_once",
+]

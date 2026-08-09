@@ -222,15 +222,17 @@ DataTap 冒烟授权，才可继续。Task 9 与方案 B/C 均未进入。
 
 ### 范围与保全
 
-- 回放只读取 `backend/fixtures/pi_runtime_poc/marketing_b0/` 中的脱敏 cases、results 和
-  fake Pi events；`app/pi_runtime_poc/replay.py` 只返回确定性的 execution 值对象。
+- 回放只读取 `backend/fixtures/pi_runtime_poc/marketing_b0/` 中的脱敏 cases、synthetic
+  Evidence 和对象化 fake Pi events；`app/pi_runtime_poc/replay.py` 由事件驱动确定性
+  Builder、Validator、Publication、Version、Exporter，再返回 execution 值对象。
 - 没有创建数据库、模型、DataTap、钱包或积分客户端；没有启动真实 Pi、没有运行或修改
   Task 9，也没有覆盖历史 round。此节不是 Gate A 真实业务结论。
 
 ### 六案例证据
 
-- 品牌、活动和 KOL 三个报告案例分别带有期望 artifact type、Version、Evidence、scope
-  和结构化 lineage/叙事/limitations 标记；`evaluate_case` 的十项 hard checks 全部为真。
+- 品牌、活动和 KOL 三个报告案例分别由 Evidence shape 生成 artifact type、Version、
+  Evidence、scope 和结构化 lineage/叙事/limitations；`evaluate_case` 的十项 hard
+  checks 全部由结构化结果计算为真。
 - 钻取只绑定 `version-brand-b0`，不产生 Artifact 或 DataTap 调用；篡改绑定 Version 会
   被本地回放和 Gate 拒绝。
 - 澄清和非营销拒答均为零 Artifact、零 DataTap，分别返回 clarification/refused 行为。
