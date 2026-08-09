@@ -30,7 +30,8 @@ Playwright。
   覆盖或表述为 PASS。
 - B0 的 synthetic Gate PASS 证明本地 Builder/Publication/Gate 业务契约可用，不等于真实模型、
   DataTap、多租户钱包或生产切流授权。
-- 实施期间不得调用真实模型、DataTap、真实钱包或积分，不得重跑 Task 9，不得写历史 round；
+- 实施期间不得调用真实模型、DataTap、真实钱包或积分，不得重跑历史 Pi RPC/POC 真实六场景 Task 9；
+  本计划 Task 9（B5-SSE）属于获准的本地实现范围，不得写历史 round；
   账务测试只使用事务回滚的测试库或纯内存 fake。
 - B7 只做到本地多租户 UAT、灰度机制和回滚演练。真实模型/DataTap/钱包 UAT、生产租户切流、
   将 Pi 设为默认，以及方案 C 都要在本计划之外取得新的明确授权。
@@ -939,7 +940,7 @@ git status --short
 - 无法在外发前完成 durable reservation；
 - migration 无法无损归属旧钱包预留；
 - 跨租户、密钥泄漏、重复外发、重复终态或双 Runtime 执行；
-- 需要真实模型、DataTap、真实钱包、Task 9、生产切流或方案 C 才能继续。
+- 需要真实模型、DataTap、真实钱包、历史 Pi RPC/POC 真实六场景 Task 9、生产切流或方案 C 才能继续。
 
 ---
 
