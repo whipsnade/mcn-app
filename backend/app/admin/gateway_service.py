@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
@@ -33,14 +33,16 @@ from app.agent_runtime.models import (
     AgentToolCall,
 )
 from app.billing.models import RuntimeUsageRecord
+from app.core.config import get_settings
 from app.core.redaction import redact_for_log
 from app.identity.models import AuthIdentity, User
 from app.licensing.models import TenantLicense
 from app.pi_gateway.accounting import RuntimeUsageService, TenantAccountingService
 from app.pi_gateway.models import PiGatewayInstance
 from app.runtime_config.models import RuntimeConfigVersion
-from app.runtime_config.schemas import RuntimeSecretBundle
-from app.runtime_config.service import RuntimeConfigError, RuntimeConfigService
+from app.runtime_config.schemas import RuntimeConfigSnapshot, RuntimeSecretBundle
+from app.runtime_config.service import RUNTIME_CONTRACT_VERSION, RuntimeConfigError, RuntimeConfigService
+from app.marketing_capability_pack.runtime import MarketingRunCapability
 from app.tenancy.models import SUPPORTED_LICENSE_FEATURES, Tenant, TenantMembership
 
 
@@ -48,6 +50,26 @@ class GatewayAdminError(ValueError):
     def __init__(self, code: str) -> None:
         self.code = code
         super().__init__(code)
+
+
+def _pi_rollout_config_compatible(config: object) -> bool:
+    """Validate the active tenant config before allowing a Pi cutover."""
+    try:
+        if config is None:
+            return False
+        if getattr(config, "runtime_contract_version", None) != RUNTIME_CONTRACT_VERSION:
+            return False
+        if getattr(config, "runtime_backend", None) != "pi":
+            return False
+        if not getattr(config, "secret_refs_json", None):
+            return False
+        snapshot = RuntimeConfigSnapshot.model_validate(getattr(config, "config_json", None))
+        if snapshot.runtime_backend != "pi":
+            return False
+        MarketingRunCapability.model_validate(snapshot.capability_pack)
+    except Exception:
+        return False
+    return True
 
 
 def _now() -> datetime:
@@ -178,7 +200,7 @@ class GatewayAdminService:
             active_license = await self.db.get(TenantLicense, tenant.active_license_id)
             feature_enabled = active_license if active_license is not None and active_license.features_json.get("kol_selection") is True else None
             config = await self.db.scalar(
-                select(RuntimeConfigVersion.id).where(
+                select(RuntimeConfigVersion).where(
                     RuntimeConfigVersion.id == tenant.active_runtime_config_id,
                     RuntimeConfigVersion.scope == "tenant",
                     RuntimeConfigVersion.tenant_id == tenant.id,
@@ -186,14 +208,18 @@ class GatewayAdminService:
                     RuntimeConfigVersion.status == "active",
                 )
             )
+            now = _now()
+            gateway_lease = get_settings().pi_gateway_lease_seconds
             healthy_gateway = await self.db.scalar(
                 select(PiGatewayInstance.id).where(
                     PiGatewayInstance.status == "active",
                     PiGatewayInstance.mode == "active",
                     PiGatewayInstance.desired_capacity > 0,
+                    PiGatewayInstance.last_seen_at.is_not(None),
+                    PiGatewayInstance.last_seen_at >= now - timedelta(seconds=gateway_lease * 2),
                 ).limit(1)
             )
-            if feature_enabled is None or config is None or healthy_gateway is None:
+            if feature_enabled is None or not _pi_rollout_config_compatible(config) or healthy_gateway is None:
                 raise GatewayAdminError("pi_rollout_precondition_failed")
         if payload.status == "disabled":
             active = await self.db.scalar(
