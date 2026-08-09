@@ -19,6 +19,26 @@ export interface IsolatedWorkerOptions {
   execArgv?: string[];
 }
 
+export type WorkerFailureCode =
+  | "worker_exited"
+  | "worker_signaled"
+  | "sdk_protocol_error"
+  | "worker_error";
+
+export function classifyWorkerExit(
+  exitCode: number | null,
+  signal: NodeJS.Signals | null,
+): "worker_exited" | "worker_signaled" {
+  void exitCode;
+  return signal !== null ? "worker_signaled" : "worker_exited";
+}
+
+export function classifyWorkerError(error: unknown): "sdk_protocol_error" | "worker_error" {
+  return error instanceof Error && error.message === "sdk_protocol_error"
+    ? "sdk_protocol_error"
+    : "worker_error";
+}
+
 /** Spawn a child worker with only non-secret claim data on IPC. */
 export function spawnIsolatedWorker(
   work: ClaimedRun,
@@ -104,7 +124,10 @@ export async function runSingleWorker(
 
 type WorkerMessage = { type: "run"; work: ClaimedRun };
 
-function finishChildProcess(message: { type: "done" | "failed"; runId: string }, exitCode: number): void {
+function finishChildProcess(
+  message: { type: "done" | "failed"; runId: string; errorCode?: WorkerFailureCode },
+  exitCode: number,
+): void {
   let finished = false;
   const finish = (): void => {
     if (finished) return;
@@ -143,6 +166,13 @@ if (process.env.PI_WORKER_CHILD === "1" && process.send) {
       onReady: () => process.send?.({ type: "ready", runId: message.work.runId }),
     })
       .then(() => finishChildProcess({ type: "done", runId: message.work.runId }, 0))
-      .catch(() => finishChildProcess({ type: "failed", runId: message.work.runId }, 1));
+      .catch((error) => finishChildProcess(
+        {
+          type: "failed",
+          runId: message.work.runId,
+          errorCode: classifyWorkerError(error),
+        },
+        1,
+      ));
   });
 }

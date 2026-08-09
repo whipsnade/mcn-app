@@ -42,4 +42,17 @@ describe("Pi Gateway control-plane client", () => {
     expect(() => new ControlPlaneClient({ origin: "http://127.0.0.1:8080", gatewayId: "gw", internalSecret: "s" })).toThrow("pi_gateway_origin_invalid");
     expect(() => new ControlPlaneClient({ origin: "http://127.0.0.1:8080", environment: "test", gatewayId: "gw", internalSecret: "s" })).not.toThrow();
   });
+
+  it("classifies transport failure as control_plane_unreachable", async () => {
+    const client = new ControlPlaneClient({
+      origin: "https://control.invalid",
+      gatewayId: "gw-1",
+      internalSecret: "gateway-secret",
+      fetchImpl: async () => { throw new Error("connection refused"); },
+    });
+
+    await expect(client.claim({ capacity: 1 })).rejects.toMatchObject({
+      code: "control_plane_unreachable",
+    });
+  });
 });

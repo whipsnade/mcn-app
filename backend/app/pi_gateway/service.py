@@ -7,13 +7,22 @@ import hmac
 import secrets
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agent_runtime.models import AgentMessage, AgentRun, AgentRunAttempt
+from app.agent_runtime.events import AgentEventBroker, AgentEventStream
+from app.agent_runtime.models import (
+    AgentMessage,
+    AgentRun,
+    AgentRunAttempt,
+    AgentSession,
+    AgentStep,
+    AgentToolCall,
+)
 from app.agent_runtime.state import RunStatus
+from app.agent_runtime.tools.mcp import DEFINITELY_NOT_SENT, RESULT_UNKNOWN, AgentMcpAccounting
 from app.mcp_gateway.models import McpToolCatalog
 from app.runtime_config.schemas import RuntimeSecretBundle
 from app.runtime_config.service import RuntimeConfigService
@@ -250,6 +259,189 @@ class PiGatewayService:
             now=self.now_fn().timestamp(),
         )
         return run
+
+
+class PiGatewayRecoveryService:
+    """Recover an expired Pi lease without invoking the current executor.
+
+    A lost Gateway is an infrastructure failure, not a model/business result.
+    The first loss closes the open Attempt and returns the same Run to the
+    durable Pi queue.  A second loss is terminal ``failed`` and is emitted via
+    the shared event transaction.  No tool call or model prompt is replayed by
+    this class.
+    """
+
+    def __init__(
+        self,
+        db: AsyncSession,
+        *,
+        broker: AgentEventBroker | None = None,
+        now_fn: Callable[[], datetime] | None = None,
+        lease_seconds: int = 60,
+    ) -> None:
+        self.db = db
+        self.broker = broker or AgentEventBroker()
+        self.now_fn = now_fn or (lambda: datetime.now(UTC).replace(tzinfo=None))
+        self.scheduler = PiRunScheduler(db, lease_seconds=lease_seconds, now_fn=self.now_fn)
+
+    async def recover_expired_run(self, run_id: str) -> Literal["requeued", "failed", "ignored"]:
+        """Atomically consume one expired Gateway lease.
+
+        ``ignored`` covers non-Pi, active-lease, cancelled, queued or already
+        terminal Runs.  The caller can safely scan these results repeatedly.
+        """
+        session_id = await self.db.scalar(select(AgentRun.session_id).where(AgentRun.id == run_id))
+        if session_id is None:
+            return "ignored"
+        session = await self.db.scalar(
+            select(AgentSession)
+            .where(AgentSession.id == session_id)
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
+        run = await self.db.scalar(
+            select(AgentRun)
+            .where(AgentRun.id == run_id)
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
+        now = self.now_fn()
+        if (
+            run is None
+            or session is None
+            or run.runtime_backend != "pi"
+            or run.status not in (RunStatus.RUNNING, RunStatus.REVIEWING)
+            or run.cancel_requested
+            or (run.gateway_lease_expires_at is not None and run.gateway_lease_expires_at > now)
+        ):
+            await self.db.commit()
+            return "ignored"
+        attempt = await self.db.scalar(
+            select(AgentRunAttempt)
+            .where(AgentRunAttempt.run_id == run.id, AgentRunAttempt.ended_at.is_(None))
+            .order_by(AgentRunAttempt.attempt.desc())
+            .with_for_update()
+        )
+        if run.infrastructure_retry_count < 1:
+            await self._mark_attempt_tool_calls_unknown(attempt, now)
+            if attempt is not None:
+                attempt.outcome = "failed"
+                attempt.ended_at = now
+            run.infrastructure_retry_count += 1
+            run.status = RunStatus.QUEUED
+            run.error_code = None
+            await self.scheduler.release_run(run)
+            await self.db.commit()
+            return "requeued"
+
+        async def before_commit(locked_run: AgentRun) -> None:
+            await self.scheduler.release_run(locked_run)
+            if session.active_run_id == locked_run.id:
+                session.active_run_id = None
+
+        event = await AgentEventStream(self.db, self.broker).settle_terminal(
+            run.id,
+            run.user_id,
+            RunStatus.FAILED,
+            {"error_code": "pi_infrastructure_retry_exhausted"},
+            before_commit=before_commit,
+        )
+        return "failed" if event is not None or run.status == RunStatus.FAILED else "ignored"
+
+    async def cancel_expired_run(self, run_id: str) -> bool:
+        """收口已请求取消且 Gateway 已失联的 Pi Run，不启动新 Attempt。"""
+        session_id = await self.db.scalar(select(AgentRun.session_id).where(AgentRun.id == run_id))
+        if session_id is None:
+            return False
+        session = await self.db.scalar(
+            select(AgentSession)
+            .where(AgentSession.id == session_id)
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
+        run = await self.db.scalar(
+            select(AgentRun)
+            .where(AgentRun.id == run_id)
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
+        now = self.now_fn()
+        if (
+            run is None
+            or session is None
+            or run.runtime_backend != "pi"
+            or not run.cancel_requested
+            or run.status in (RunStatus.COMPLETED, RunStatus.COMPLETED_WITH_WARNINGS, RunStatus.FAILED, RunStatus.CANCELLED)
+            or (run.gateway_lease_expires_at is not None and run.gateway_lease_expires_at > now)
+        ):
+            await self.db.commit()
+            return False
+
+        attempt = await self.db.scalar(
+            select(AgentRunAttempt)
+            .where(AgentRunAttempt.run_id == run.id, AgentRunAttempt.ended_at.is_(None))
+            .order_by(AgentRunAttempt.attempt.desc())
+            .with_for_update()
+        )
+
+        async def before_commit(locked_run: AgentRun) -> None:
+            await self._mark_attempt_tool_calls_unknown(
+                attempt,
+                now,
+                release_reserved=True,
+                user_id=locked_run.user_id,
+            )
+            await self.scheduler.release_run(locked_run)
+            if session.active_run_id == locked_run.id:
+                session.active_run_id = None
+
+        event = await AgentEventStream(self.db, self.broker).settle_terminal(
+            run.id,
+            run.user_id,
+            RunStatus.CANCELLED,
+            {"code": "cancel_requested"},
+            before_commit=before_commit,
+        )
+        return event is not None
+
+    async def _mark_attempt_tool_calls_unknown(
+        self,
+        attempt: AgentRunAttempt | None,
+        now: datetime,
+        *,
+        release_reserved: bool = False,
+        user_id: str | None = None,
+    ) -> None:
+        """Fence incomplete MCP calls before recovery or cancellation is visible."""
+        if attempt is None:
+            return
+        calls = (
+            await self.db.scalars(
+                select(AgentToolCall)
+                .join(AgentStep, AgentStep.id == AgentToolCall.step_id)
+                .where(
+                    AgentStep.attempt_id == attempt.id,
+                    AgentToolCall.status.in_(("reserved", "running")),
+                )
+                .with_for_update()
+            )
+        ).all()
+        accounting = AgentMcpAccounting(self.db) if release_reserved else None
+        for call in calls:
+            if release_reserved and call.status == "reserved":
+                if user_id is None or accounting is None:
+                    raise ValueError("pi_recovery_user_required_for_reserved_release")
+                await accounting.release(
+                    user_id,
+                    call,
+                    error_type=DEFINITELY_NOT_SENT,
+                    message="cancelled before external dispatch",
+                )
+                continue
+            call.status = "unknown"
+            call.error_type = RESULT_UNKNOWN
+            call.safe_error_message = "gateway infrastructure failure; result requires reconciliation"
+            call.completed_at = now
 
 
 def _secret_bundle_dict(bundle: RuntimeSecretBundle) -> dict[str, Any]:

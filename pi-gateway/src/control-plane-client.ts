@@ -22,6 +22,16 @@ export interface ControlPlaneTransport {
   executeInternalTool(toolName: string, args: Record<string, unknown>): Promise<unknown>;
 }
 
+/** Stable infrastructure classification; callers must leave the Run for recovery. */
+export class ControlPlaneUnavailableError extends Error {
+  readonly code = "control_plane_unreachable" as const;
+
+  constructor(cause?: unknown) {
+    super("control_plane_unreachable", { cause });
+    this.name = "ControlPlaneUnavailableError";
+  }
+}
+
 export class ControlPlaneClient implements ControlPlaneTransport {
   private readonly origin: string;
   private readonly gatewayId: string;
@@ -140,12 +150,13 @@ export class ControlPlaneClient implements ControlPlaneTransport {
         signal: controller.signal,
       });
     } catch (error) {
-      throw new Error("pi_gateway_network_error", { cause: error });
+      throw new ControlPlaneUnavailableError(error);
     } finally {
       clearTimeout(timer);
     }
     if (response.status >= 300 && response.status < 400) throw new Error("pi_gateway_redirect_forbidden");
     if (response.status === 204) return undefined;
+    if (response.status >= 500) throw new ControlPlaneUnavailableError(new Error(`http_${response.status}`));
     if (!response.ok) throw new Error(`pi_gateway_http_${response.status}`);
     return (await response.json()) as T;
   }

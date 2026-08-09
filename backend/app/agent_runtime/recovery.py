@@ -28,9 +28,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager
 from datetime import datetime, timedelta
+from typing import Literal
 
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -65,6 +66,9 @@ class RecoveryLoop:
         interval_seconds: float = 30.0,
         clock: Callable[[], datetime] = utc_now,
         stuck_seconds: float = 900.0,
+        runtime_backend: Literal["current", "pi"] = "current",
+        pi_recovery: Callable[[str], Awaitable[str]] | None = None,
+        pi_cancel: Callable[[str], Awaitable[bool]] | None = None,
     ) -> None:
         self._executor = executor
         self._session_factory = session_factory
@@ -74,6 +78,11 @@ class RecoveryLoop:
         self._interval_seconds = interval_seconds
         self._clock = clock
         self._stuck_seconds = stuck_seconds
+        if runtime_backend not in {"current", "pi"}:
+            raise ValueError("runtime_backend_invalid")
+        self._runtime_backend = runtime_backend
+        self._pi_recovery = pi_recovery
+        self._pi_cancel = pi_cancel
         self._stop = asyncio.Event()
         self._loop_task: asyncio.Task[None] | None = None
 
@@ -153,6 +162,7 @@ class RecoveryLoop:
                     select(AgentRun.id)
                     .where(
                         AgentRun.run_kind == "user",
+                        AgentRun.runtime_backend == self._runtime_backend,
                         AgentRun.status.in_((RunStatus.RUNNING, RunStatus.REVIEWING)),
                         AgentRun.cancel_requested.is_(False),
                         or_(
@@ -169,6 +179,7 @@ class RecoveryLoop:
                     select(AgentRun.id)
                     .where(
                         AgentRun.run_kind == "user",
+                        AgentRun.runtime_backend == self._runtime_backend,
                         AgentRun.status.in_((RunStatus.RUNNING, RunStatus.REVIEWING)),
                         AgentRun.cancel_requested.is_(True),
                         or_(
@@ -182,6 +193,12 @@ class RecoveryLoop:
             ).all()
         for run_id in expired:
             try:
+                if self._runtime_backend == "pi":
+                    if self._pi_recovery is not None:
+                        outcome = await self._pi_recovery(run_id)
+                        if outcome in {"requeued", "failed"}:
+                            reclaimed.append(run_id)
+                    continue
                 # 使用恢复循环自己的 worker id：与原 worker 租约隔离，避免同一
                 # Run 被两个 worker 并发执行（Fix 4）。
                 await self._executor.process_run(run_id, worker_id=self._worker_id)
@@ -192,6 +209,10 @@ class RecoveryLoop:
                 logger.exception("recovery reclaim failed for run %s", run_id)
         for run_id in cancel_pending:
             try:
+                if self._runtime_backend == "pi":
+                    if self._pi_cancel is not None and await self._pi_cancel(run_id):
+                        reclaimed.append(run_id)
+                    continue
                 # 取消孤儿：不恢复模型执行，直接 settle cancelled（I1）。
                 if await self._executor.settle_cancel_requested(run_id):
                     reclaimed.append(run_id)
@@ -225,7 +246,9 @@ class RecoveryLoop:
                 (
                     await db.execute(
                         select(AgentToolCall.id, AgentToolCall.logical_call_id)
+                        .join(AgentRun, AgentRun.id == AgentToolCall.run_id)
                         .where(
+                            AgentRun.runtime_backend == self._runtime_backend,
                             AgentToolCall.status.in_(("running", "reserved")),
                             or_(
                                 AgentToolCall.started_at.is_(None),
@@ -240,7 +263,9 @@ class RecoveryLoop:
             for call_id, logical_call_id in stuck:
                 row = await db.scalar(
                     select(AgentToolCall)
+                    .join(AgentRun, AgentRun.id == AgentToolCall.run_id)
                     .where(
+                        AgentRun.runtime_backend == self._runtime_backend,
                         AgentToolCall.id == call_id,
                         AgentToolCall.status.in_(("running", "reserved")),
                     )
@@ -273,7 +298,9 @@ class RecoveryLoop:
             unknown = (
                 await db.scalars(
                     select(AgentToolCall)
+                    .join(AgentRun, AgentRun.id == AgentToolCall.run_id)
                     .where(AgentToolCall.status == "unknown")
+                    .where(AgentRun.runtime_backend == self._runtime_backend)
                     .order_by(AgentToolCall.started_at.asc())
                     .limit(_SCAN_LIMIT)
                 )

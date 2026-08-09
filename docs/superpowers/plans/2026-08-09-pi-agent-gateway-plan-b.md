@@ -540,10 +540,10 @@ PiRunScheduler.set_gateway_mode(gateway_id: str, mode: Literal["active", "draini
 
 - Modify: `backend/app/pi_gateway/{service.py,scheduler.py,events.py}`
 - Modify: `backend/app/agent_runtime/{repository.py,recovery.py,transcript.py,state.py,events.py}`
-- Modify: `pi-gateway/src/{gateway.ts,worker-pool.ts,worker-entry.ts,pi-session.ts}`
+- Modify: `pi-gateway/src/{control-plane-client.ts,gateway.ts,worker-pool.ts,worker-entry.ts,pi-session.ts}`
 - Test: `backend/tests/pi_gateway/{test_recovery.py,test_cancel.py,test_terminal.py}`
 - Test: `backend/tests/agent_runtime/test_pi_attempt_recovery.py`
-- Test: `pi-gateway/tests/{worker-crash.test.ts,cancel.test.ts}`
+- Test: `pi-gateway/tests/{control-plane-client.test.ts,gateway.test.ts,worker-crash.test.ts,cancel.test.ts}`
 
 **恢复分类**
 
@@ -568,17 +568,17 @@ BusinessFailure = Literal[
   FastAPI 释放未外发预留/活动 Draft并以现有终态事务收口。取消时 Worker 崩溃由恢复循环直接 cancel，
   不创建恢复 Attempt。
 
-- [ ] **Step 1：红灯矩阵。** 分别模拟 claim 后/模型中/tool preflight 前/preflight 后外发前/外发后
+- [x] **Step 1：红灯矩阵。** 分别模拟 claim 后/模型中/tool preflight 前/preflight 后外发前/外发后
   result 前/result 后/Artifact 发布前/终态提交前崩溃，断言每个窗口唯一且安全的状态。
-- [ ] **Step 2：一次恢复红灯。** 第一次 gateway_lost 产生 Attempt 2，第二次直接 failed；业务错误不
+- [x] **Step 2：一次恢复红灯。** 第一次 gateway_lost 产生 Attempt 2，第二次直接 failed；业务错误不
   消耗 infra retry；用户 resume 的 Attempt 与 infra retry 计数相互独立。
-- [ ] **Step 3：最小实现。** 恢复循环只处理 runtime_backend=pi 的过期 gateway lease；current 路径
+- [x] **Step 3：最小实现。** 恢复循环只处理 runtime_backend=pi 的过期 gateway lease；current 路径
   继续使用既有 executor lease。终态/接管均以 `populate_existing` 当前读复核。
-- [ ] **Step 4：Node crash/abort。** 子 Worker exit code/signal 映射稳定错误码；父进程只上报，不伪造
+- [x] **Step 4：Node crash/abort。** 子 Worker exit code/signal 映射稳定错误码；父进程只上报，不伪造
   Tool result；FastAPI 不可达时本地只保存有界内存事件，超过上限 abort 并按 infra fail。
-- [ ] **Step 5：绿灯。** Python/Node 恢复与取消测试、现有 Agent recovery/unknown reconciliation 全量、
+- [x] **Step 5：绿灯。** Python/Node 恢复与取消测试、现有 Agent recovery/unknown reconciliation 全量、
   真实 MySQL 窗口测试、Ruff/typecheck/build。
-- [ ] **Step 6：审查。** 断言 `dispatch_count` 不因基础设施恢复增加，unknown 没有 Evidence，所有
+- [x] **Step 6：审查。** 断言 `dispatch_count` 不因基础设施恢复增加，unknown 没有 Evidence，所有
   terminal path 恰好一个终态事件。
 - [ ] **Step 7：Commit。** `feat: recover pi infrastructure failures once`。
 
