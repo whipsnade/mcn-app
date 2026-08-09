@@ -5,6 +5,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.admin.schemas import (
+    AdminGatewayItem,
+    AdminGatewayUpdate,
+    AdminLicenseCreate,
+    AdminLicenseItem,
+    AdminLicenseStatusUpdate,
+    AdminRunDiagnostics,
+    AdminRuntimeConfigCreate,
+    AdminRuntimeConfigItem,
+    AdminTenantCreate,
+    AdminTenantItem,
+    AdminTenantUpdate,
+    AdminTenantUserCreate,
+    AdminTenantUserItem,
+    AdminUsageResponse,
     AdminUserCreate,
     AdminUserItem,
     AdminUserListResponse,
@@ -16,6 +30,7 @@ from app.admin.schemas import (
     PointsHistoryResponse,
 )
 from app.admin.service import AdminService, PhoneConflictError
+from app.admin.gateway_service import GatewayAdminError, GatewayAdminService
 from app.billing.service import InsufficientPointsError
 from app.core.errors import ErrorCode
 from app.db.session import get_db
@@ -42,6 +57,19 @@ def invalid(error: ValueError) -> HTTPException:
     return HTTPException(
         status_code=status.HTTP_400_BAD_REQUEST, detail=ErrorCode.VALIDATION_ERROR
     )
+
+
+def gateway_error(error: GatewayAdminError) -> HTTPException:
+    code = error.code
+    if code.endswith("_not_found") or code in {"run_not_found"}:
+        return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=code)
+    if code.endswith("_conflict") or code.endswith("_blocked") or code in {
+        "tenant_disabled", "runtime_config_required", "runtime_secrets_required",
+    }:
+        return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=code)
+    if code.startswith("license_") or code == "feature_disabled":
+        return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=code)
+    return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=code)
 
 
 @router.get("/users", response_model=AdminUserListResponse)
@@ -181,3 +209,244 @@ async def reconcile_agent_tool_call(
     except LookupError as error:
         raise not_found(error) from error
     return AgentToolCallReconcileResponse(**outcome)
+
+
+# ---------------------------------------------------------------------------
+# Pi Agent Gateway administration (B6A)
+# ---------------------------------------------------------------------------
+
+
+def _gateway_service(db: AsyncSession) -> GatewayAdminService:
+    return GatewayAdminService(db)
+
+
+@router.get("/tenants", response_model=dict)
+async def list_tenants(
+    admin: AdminUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> dict[str, object]:
+    del admin
+    items, total = await _gateway_service(db).list_tenants(limit=limit, offset=offset)
+    return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+
+@router.post("/tenants", response_model=AdminTenantItem, status_code=201)
+async def create_tenant(
+    payload: AdminTenantCreate,
+    admin: AdminUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+) -> AdminTenantItem:
+    try:
+        result = await _gateway_service(db).create_tenant(admin, payload, idempotency_key=idempotency_key)
+        await db.commit()
+        return result
+    except GatewayAdminError as exc:
+        await db.rollback()
+        raise gateway_error(exc) from exc
+
+
+@router.patch("/tenants/{tenant_id}", response_model=AdminTenantItem)
+async def update_tenant(
+    tenant_id: str,
+    payload: AdminTenantUpdate,
+    admin: AdminUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+) -> AdminTenantItem:
+    try:
+        result = await _gateway_service(db).update_tenant(admin, tenant_id, payload, idempotency_key=idempotency_key)
+        await db.commit()
+        return result
+    except GatewayAdminError as exc:
+        await db.rollback()
+        raise gateway_error(exc) from exc
+
+
+@router.get("/tenants/{tenant_id}/users", response_model=dict)
+async def list_tenant_users(
+    tenant_id: str,
+    admin: AdminUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> dict[str, object]:
+    del admin
+    try:
+        items, total = await _gateway_service(db).list_users(tenant_id, limit=limit, offset=offset)
+    except GatewayAdminError as exc:
+        raise gateway_error(exc) from exc
+    return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+
+@router.post("/tenants/{tenant_id}/users", response_model=AdminTenantUserItem, status_code=201)
+async def create_tenant_user(
+    tenant_id: str,
+    payload: AdminTenantUserCreate,
+    admin: AdminUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+) -> AdminTenantUserItem:
+    try:
+        result = await _gateway_service(db).create_user(admin, tenant_id, payload, idempotency_key=idempotency_key)
+        await db.commit()
+        return result
+    except GatewayAdminError as exc:
+        await db.rollback()
+        raise gateway_error(exc) from exc
+
+
+@router.get("/tenants/{tenant_id}/license", response_model=list[AdminLicenseItem])
+async def list_tenant_licenses(
+    tenant_id: str,
+    admin: AdminUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> list[AdminLicenseItem]:
+    del admin
+    try:
+        return await _gateway_service(db).list_licenses(tenant_id)
+    except GatewayAdminError as exc:
+        raise gateway_error(exc) from exc
+
+
+@router.post("/tenants/{tenant_id}/license", response_model=AdminLicenseItem, status_code=201)
+async def append_tenant_license(
+    tenant_id: str,
+    payload: AdminLicenseCreate,
+    admin: AdminUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+) -> AdminLicenseItem:
+    try:
+        result = await _gateway_service(db).create_license(admin, tenant_id, payload, idempotency_key=idempotency_key)
+        await db.commit()
+        return result
+    except GatewayAdminError as exc:
+        await db.rollback()
+        raise gateway_error(exc) from exc
+
+
+@router.patch("/tenants/{tenant_id}/license/{license_id}", response_model=AdminLicenseItem)
+async def update_tenant_license(
+    tenant_id: str,
+    license_id: str,
+    payload: AdminLicenseStatusUpdate,
+    admin: AdminUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+) -> AdminLicenseItem:
+    try:
+        result = await _gateway_service(db).update_license_status(admin, tenant_id, license_id, payload, idempotency_key=idempotency_key)
+        await db.commit()
+        return result
+    except GatewayAdminError as exc:
+        await db.rollback()
+        raise gateway_error(exc) from exc
+
+
+@router.get("/tenants/{tenant_id}/usage", response_model=AdminUsageResponse)
+async def tenant_usage(
+    tenant_id: str,
+    admin: AdminUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    group_by: Annotated[str, Query(pattern="^(tenant|user|run|day)$")] = "day",
+    limit: Annotated[int, Query(ge=1, le=200)] = 100,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> AdminUsageResponse:
+    del admin
+    try:
+        items = await _gateway_service(db).list_usage(tenant_id, group_by=group_by, limit=limit, offset=offset)
+    except GatewayAdminError as exc:
+        raise gateway_error(exc) from exc
+    return AdminUsageResponse(items=items, limit=limit, offset=offset)
+
+
+@router.get("/pi-runtime/gateways", response_model=dict)
+async def list_pi_gateways(
+    admin: AdminUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> dict[str, object]:
+    del admin
+    items, total = await _gateway_service(db).list_gateways(limit=limit, offset=offset)
+    return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+
+@router.patch("/pi-runtime/gateways/{gateway_id}", response_model=AdminGatewayItem)
+async def update_pi_gateway(
+    gateway_id: str,
+    payload: AdminGatewayUpdate,
+    admin: AdminUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+) -> AdminGatewayItem:
+    try:
+        result = await _gateway_service(db).update_gateway(admin, gateway_id, payload, idempotency_key=idempotency_key)
+        await db.commit()
+        return result
+    except GatewayAdminError as exc:
+        await db.rollback()
+        raise gateway_error(exc) from exc
+
+
+@router.get("/runtime-configs", response_model=dict)
+async def list_runtime_configs(
+    tenant_id: str,
+    admin: AdminUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> dict[str, object]:
+    del admin
+    try:
+        items, total = await _gateway_service(db).list_runtime_configs(tenant_id, limit=limit, offset=offset)
+    except GatewayAdminError as exc:
+        raise gateway_error(exc) from exc
+    return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+
+@router.post("/runtime-configs", response_model=AdminRuntimeConfigItem, status_code=201)
+async def create_runtime_config(
+    payload: AdminRuntimeConfigCreate,
+    admin: AdminUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+) -> AdminRuntimeConfigItem:
+    try:
+        result = await _gateway_service(db).create_runtime_config(admin, payload, idempotency_key=idempotency_key)
+        await db.commit()
+        return result
+    except GatewayAdminError as exc:
+        await db.rollback()
+        raise gateway_error(exc) from exc
+
+
+@router.post("/runtime-configs/{config_id}/activate", response_model=AdminRuntimeConfigItem)
+async def activate_runtime_config(
+    config_id: str,
+    admin: AdminUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+) -> AdminRuntimeConfigItem:
+    try:
+        result = await _gateway_service(db).activate_runtime_config(admin, config_id, idempotency_key=idempotency_key)
+        await db.commit()
+        return result
+    except GatewayAdminError as exc:
+        await db.rollback()
+        raise gateway_error(exc) from exc
+
+
+@router.get("/agent-runs/{run_id}/diagnostics", response_model=AdminRunDiagnostics)
+async def run_diagnostics(
+    run_id: str,
+    admin: AdminUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> AdminRunDiagnostics:
+    try:
+        return await _gateway_service(db).run_diagnostics(admin, run_id)
+    except GatewayAdminError as exc:
+        raise gateway_error(exc) from exc

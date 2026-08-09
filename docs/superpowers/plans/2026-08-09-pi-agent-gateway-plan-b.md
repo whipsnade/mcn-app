@@ -760,16 +760,16 @@ TenantAccountingService.fail_mcp_call(
 - 所有写操作使用 `Idempotency-Key`，调用现有 `_audit()` 写 `AdminAuditLog`；detail 记录 before/after
   的安全字段、tenant、actor、reason，不记录 secret 值。
 
-- [ ] **Step 1：红灯。** 每模块覆盖普通用户 403、未知/跨租户 404、幂等写、并发版本冲突、secret
+- [x] **Step 1：红灯。** 每模块覆盖普通用户 403、未知/跨租户 404、幂等写、并发版本冲突、secret
   response/audit/log 泄漏、Run diagnostics 只读。
-- [ ] **Step 2：最小实现。** router 只做 DTO/异常映射；事务和审计在 service 同一提交边界。平台 admin
+- [x] **Step 2：最小实现。** router 只做 DTO/异常映射；事务和审计在 service 同一提交边界。平台 admin
   可跨租户，但每次请求必须显式 target tenant，不提供无界全表 dump。
-- [ ] **Step 3：分页与索引验证。** 所有 list limit 上限 200，稳定排序和 cursor/offset；对 usage/run
+- [x] **Step 3：分页与索引验证。** 所有 list limit 上限 200，稳定排序和 cursor/offset；对 usage/run
   diagnostics 运行 EXPLAIN 测试或索引断言，禁止 N+1 逐行查询。
-- [ ] **Step 4：绿灯。** admin、tenancy/licensing/runtime config/billing/pi gateway 相关测试与后端全量，
+- [x] **Step 4：绿灯。** admin、tenancy/licensing/runtime config/billing/pi gateway 相关测试与后端全量，
   Ruff、diff check。
-- [ ] **Step 5：审查。** Critical/Important=0；重点检查 secret、跨 tenant、审计原子性和管理写操作权限。
-- [ ] **Step 6：Commit。** `feat: expose audited pi gateway administration api`。
+- [x] **Step 5：审查。** Critical/Important=0；重点检查 secret、跨 tenant、审计原子性和管理写操作权限。
+- [x] **Step 6：Commit。** `feat: expose audited pi gateway administration api`。
 
 ---
 
