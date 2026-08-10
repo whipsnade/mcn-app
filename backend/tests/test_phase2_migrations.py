@@ -1,4 +1,5 @@
 import os
+import asyncio
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -14,6 +15,65 @@ from sqlalchemy import Integer, func, inspect, select, text
 from app.db.base import Base
 import app.db.models  # noqa: F401
 from app.db.session import engine
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _clean_tenant_billing_residue():
+    """0043 downgrade guard 的干净窗口。
+
+    提交落库的集成测试（真实拓扑 UAT、agent runtime real 等）会经 B4 懒
+    provisioning / welcome grant 在租户账本表留下已提交残留；0043 的
+    downgrade guard 按设计会因此 fail-closed。迁移可逆性测试与这些残留
+    无关，运行前清掉；迁移副本（旧表同 id 行、validation 副本）保留。
+    """
+
+    async def _clean() -> None:
+        async with engine.begin() as connection:
+            exists = await connection.scalar(
+                text(
+                    "SELECT COUNT(*) FROM information_schema.TABLES "
+                    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'tenant_wallets'"
+                )
+            )
+            if not exists:
+                # 库停在中段迁移版本（如 0037，B4 表尚未创建）时无可清理。
+                return
+            await connection.execute(
+                text(
+                    "DELETE t FROM tenant_wallet_transactions t "
+                    "LEFT JOIN wallet_transactions w ON w.id = t.id WHERE w.id IS NULL"
+                )
+            )
+            await connection.execute(text("DELETE FROM runtime_usage_records"))
+            await connection.execute(
+                text("UPDATE tenant_user_quota_usage SET spent = 0, reserved = 0")
+            )
+            await connection.execute(
+                text(
+                    "DELETE w FROM tenant_wallets w "
+                    "LEFT JOIN tenant_billing_migration_validations v "
+                    "ON v.tenant_id = w.tenant_id WHERE v.id IS NULL"
+                )
+            )
+            # 提交测试遗留的 legacy 钱包孤儿行（用户已删或无 membership）会让
+            # 0040 升级的 tenant_billing_wallet_orphan 校验 fail-closed。
+            await connection.execute(
+                text(
+                    "DELETE t FROM wallet_transactions t "
+                    "LEFT JOIN tenant_memberships m ON m.user_id = t.user_id "
+                    "WHERE m.user_id IS NULL"
+                )
+            )
+            await connection.execute(
+                text(
+                    "DELETE w FROM wallets w "
+                    "LEFT JOIN tenant_memberships m ON m.user_id = w.user_id "
+                    "WHERE m.user_id IS NULL"
+                )
+            )
+
+    asyncio.run(_clean())
+    yield
 
 
 def test_migration_chain_has_single_head() -> None:

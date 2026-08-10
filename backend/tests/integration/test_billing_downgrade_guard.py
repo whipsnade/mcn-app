@@ -51,7 +51,27 @@ def test_downgrade_guard_blocks_post_migration_ledger_activity() -> None:
             await connection.execute(text(sql), params or {})
 
     tenant_id = _run(_scalar("SELECT tenant_id FROM tenant_wallets LIMIT 1"))
-    assert tenant_id is not None, "测试库应已含 0040 迁移的租户钱包行"
+    if tenant_id is None:
+        # 干净重建的测试库没有 0040 迁移的钱包行：自建最小租户+钱包作探针宿主。
+        tenant_id = str(uuid4())
+        _run(
+            _execute(
+                "INSERT INTO tenants (id, slug, name, status, is_internal, runtime_backend,"
+                " license_status, active_license_id, created_at, updated_at) VALUES"
+                " (:id, :slug, 'guard-probe', 'active', 0, 'current', 'active', NULL,"
+                " '2026-08-10 00:00:00', '2026-08-10 00:00:00')",
+                {"id": tenant_id, "slug": f"legacy-guard-probe-{tenant_id[:8]}"},
+            )
+        )
+        _run(
+            _execute(
+                "INSERT INTO tenant_wallets (tenant_id, balance, reserved, version, updated_at)"
+                " VALUES (:t, 0, 0, 0, '2026-08-10 00:00:00')",
+                {"t": tenant_id},
+            )
+        )
+    else:
+        tenant_id = str(tenant_id)
 
     def _current_version() -> str | None:
         return _run(_scalar("SELECT version_num FROM alembic_version"))

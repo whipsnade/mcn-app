@@ -590,6 +590,8 @@ class PiUatTopology:
             TenantUserQuotaUsage,
             TenantWallet,
             TenantWalletTransaction,
+            Wallet,
+            WalletTransaction,
         )
         from app.mcp_gateway.models import McpToolCatalog, McpToolDiscovery
         from app.pi_gateway.models import PiGatewayInstance, PiGatewayRequestNonce, PiTenantQueueState
@@ -702,6 +704,10 @@ class PiUatTopology:
                     await db.execute(delete(TenantMembership).where(TenantMembership.tenant_id.in_(tenant_ids)))
                     await db.execute(delete(Tenant).where(Tenant.id.in_(tenant_ids)))
                 await db.execute(delete(AuthIdentity).where(AuthIdentity.user_id.in_(user_ids or [""])))
+                # legacy 钱包（welcome grant）：0040 升级要求每个 legacy wallet
+                # 都有 membership，残留孤儿行会让迁移链 fail-closed。
+                await db.execute(delete(WalletTransaction).where(WalletTransaction.user_id.in_(user_ids or [""])))
+                await db.execute(delete(Wallet).where(Wallet.user_id.in_(user_ids or [""])))
                 await db.execute(delete(User).where(User.id.in_(user_ids or [""])))
                 await db.execute(delete(PiGatewayRequestNonce).where(PiGatewayRequestNonce.gateway_id == GATEWAY_ID))
                 await db.execute(delete(PiGatewayInstance).where(PiGatewayInstance.gateway_id == GATEWAY_ID))
