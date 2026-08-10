@@ -24,9 +24,9 @@ from app.model.dependencies import get_model_adapter
 from app.mcp_gateway.service import get_agent_mcp_transport, refresh_approved_datatap_tools
 from app.pi_gateway.service import PiGatewayRecoveryService
 
-# 新 Agent 运行时默认租约时长 / 恢复扫描间隔（Task 15）。
+# 新 Agent 运行时默认租约时长（Task 15）；恢复扫描间隔走 Settings
+# （agent_recovery_interval_seconds，默认 30s）。
 AGENT_LEASE_SECONDS = 300
-RECOVERY_INTERVAL_SECONDS = 30
 
 
 def _make_recovery_tool(db, call, *, breaker, transport) -> AgentMcpTool | None:
@@ -141,7 +141,7 @@ def create_agent_runtime(*, stuck_seconds: float | None = None) -> tuple[
         ),
         worker_id=recovery_worker_id,
         lease_seconds=AGENT_LEASE_SECONDS,
-        interval_seconds=RECOVERY_INTERVAL_SECONDS,
+        interval_seconds=get_settings().agent_recovery_interval_seconds,
         stuck_seconds=(
             stuck_seconds
             if stuck_seconds is not None
@@ -176,7 +176,7 @@ def create_agent_runtime(*, stuck_seconds: float | None = None) -> tuple[
         ),
         worker_id=f"pi-recovery-{os.getpid()}",
         lease_seconds=AGENT_LEASE_SECONDS,
-        interval_seconds=RECOVERY_INTERVAL_SECONDS,
+        interval_seconds=get_settings().agent_recovery_interval_seconds,
         runtime_backend="pi",
         pi_recovery=_pi_recover,
         pi_cancel=_pi_cancel,

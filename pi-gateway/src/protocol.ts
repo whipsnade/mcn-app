@@ -195,9 +195,11 @@ export function normalizePiGatewayClaimResponse(
 
 const PI_GATEWAY_SOURCE_EVENT_TYPES = new Set([
   "agent.turn.start", "agent.turn.end", "agent/turn/start", "agent/turn/end",
+  "turn.start", "turn/start",
   "message.start", "message.delta", "message.end", "message.completed",
   "message/start", "message/delta", "message/end", "tool.start", "tool.end",
-  "tool_call.start", "tool_call.end", "tool/start", "tool/end", "thinking.start",
+  "tool_call.start", "tool_call.end", "tool_call/start", "tool_call/end",
+  "tool/start", "tool/end", "thinking.start",
   "thinking.delta", "thinking.end", "thinking/start", "thinking/delta", "thinking/end",
   "text.delta", "text/delta", "usage",
 ]);

@@ -26,6 +26,8 @@ _EVENT_ALIASES = {
     "agent/turn/start": "run.started",
     "agent.turn.end": "turn.completed",
     "agent/turn/end": "turn.completed",
+    "turn.start": "turn.started",
+    "turn/start": "turn.started",
     "message.start": "message.started",
     "message/start": "message.started",
     "message.delta": "message.delta",
@@ -43,6 +45,7 @@ _EVENT_ALIASES = {
     "tool.start": "tool.started",
     "tool/start": "tool.started",
     "tool_call.start": "tool.started",
+    "tool_call/start": "tool.started",
     "tool_call.end": "tool.completed",
     "tool_call/end": "tool.completed",
     "tool.end": "tool.completed",
@@ -51,6 +54,7 @@ _EVENT_ALIASES = {
 
 _SOURCE_EVENT_ALLOWED_FIELDS = {
     "run.started": set(),
+    "turn.started": set(),
     "turn.completed": {"safe_summary"},
     "message.started": {"message_id", "role"},
     "message.delta": {"message_id", "delta", "text"},
@@ -99,7 +103,12 @@ def normalize_source_payload(event_type: str, payload: Mapping[str, Any]) -> dic
     if not isinstance(payload, Mapping):
         raise PiGatewayEventError("pi_gateway_event_payload_invalid")
     canonical = canonical_event_type(event_type, payload)
+    # 白名单按别名归一后的粗粒度类型（tool.completed）索引；状态细分
+    # （tool.succeeded/failed/unknown）共享同一张字段白名单。
+    alias_canonical = _EVENT_ALIASES.get(event_type, event_type)
     allowed = _SOURCE_EVENT_ALLOWED_FIELDS.get(canonical)
+    if allowed is None:
+        allowed = _SOURCE_EVENT_ALLOWED_FIELDS.get(alias_canonical)
     if allowed is None:
         raise PiGatewayEventError("pi_gateway_source_event_unknown")
     unknown = set(payload) - allowed

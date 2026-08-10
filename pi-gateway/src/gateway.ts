@@ -207,6 +207,10 @@ export class PiGateway {
       let heartbeatFailed = false;
       let heartbeatOutcome: "cancelled" | "lost" | undefined;
       let heartbeatError: unknown;
+      // 单次网络抖动/超时不能丢租约：连续失败达到阈值才按 lease 丢失处理。
+      // 阈值 × 请求超时必须小于服务端 run lease（默认 60s）。
+      let consecutiveHeartbeatFailures = 0;
+      const maxConsecutiveHeartbeatFailures = 3;
       try {
         const heartbeat = async (): Promise<void> => {
           if (heartbeatFailed) return;
@@ -216,6 +220,7 @@ export class PiGateway {
               claim.attempt_id,
               claim.lease_token,
             );
+            consecutiveHeartbeatFailures = 0;
             if (this.controlPlane.sendEvent && !eventBufferError) {
               eventFlushBlocked = false;
               void flushEvents().catch((error) => this.onError(error));
@@ -233,6 +238,15 @@ export class PiGateway {
               }
             }
           } catch (error) {
+            // 取消语义立即生效；其余错误先计数，连续超阈值才丢租约。
+            consecutiveHeartbeatFailures += 1;
+            if (consecutiveHeartbeatFailures < maxConsecutiveHeartbeatFailures) {
+              this.onError(
+                asPiGatewayInfrastructureError(error)
+                  ?? new PiGatewayInfrastructureError("control_plane_unreachable", error),
+              );
+              return;
+            }
             heartbeatFailed = true;
             heartbeatOutcome = "lost";
             heartbeatError = asPiGatewayInfrastructureError(error)
@@ -291,15 +305,34 @@ export class PiGateway {
         if (handle?.done) await Promise.race([handle.done, heartbeatFailure]);
         if (this.stopped) return;
         if (this.controlPlane.sendEvent) {
-          while (eventBuffer.size > 0 && !eventBufferError && !heartbeatFailed && !this.stopped) {
+          while (
+            eventBuffer.size > 0 &&
+            !eventBufferError &&
+            !eventFlushBlocked &&
+            !heartbeatFailed &&
+            !this.stopped
+          ) {
             await flushEvents();
-            if (eventBuffer.size > 0 && !eventBufferError && !heartbeatFailed && !this.stopped) {
+            if (
+              eventBuffer.size > 0 &&
+              !eventBufferError &&
+              !eventFlushBlocked &&
+              !heartbeatFailed &&
+              !this.stopped
+            ) {
               await new Promise<void>((resolve) => {
                 const timer = setTimeout(resolve, this.heartbeatIntervalMs);
                 timer.unref?.();
               });
             }
           }
+        }
+        if (eventFlushBlocked && eventBuffer.size > 0) {
+          // 事件投递在控制面持续失败：中止 worker 并把 Run 留给恢复，
+          // 绝不绕过事件顺序伪造 terminal。
+          await handle?.abort?.();
+          this.onError(new PiGatewayInfrastructureError("control_plane_unreachable"));
+          return;
         }
         if (heartbeatOutcome === "lost") {
           this.onError(heartbeatError ?? new Error("pi_gateway_heartbeat_lost"));

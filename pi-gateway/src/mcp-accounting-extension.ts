@@ -40,6 +40,17 @@ export interface McpAccountingControlPlane {
 
 const FREE_DISCOVERY_TOOLS = new Set(["connect", "search", "list"]);
 
+/**
+ * The adapter presents proxy tools as ``<server_with_underscores>_<remote
+ * with dots replaced>``; the claim catalog binds that visible name back to
+ * the reviewed internal tool identity.  Model input never self-reports the
+ * mapping — unmappable names fall through and are rejected by the server's
+ * preflight before any external dispatch.
+ */
+export function proxyVisibleToolName(server: string, remoteName: string): string {
+  return `${server.replace(/-/g, "_")}_${remoteName.replace(/\./g, "_")}`;
+}
+
 export class McpAccountingExtension {
   constructor(private readonly controlPlane: McpAccountingControlPlane) {}
 
@@ -133,9 +144,19 @@ function toMcpToolCall(
     // explicitly free.  Only the presence of an explicit `tool` is billable.
     if (typeof input.tool !== "string" || input.tool.length === 0) return undefined;
     const args = normalizeArgs(input.args);
+    const requestedServer = typeof input.server === "string" ? input.server : "";
+    const match = bindings.find(
+      (binding) =>
+        binding.remoteName !== undefined &&
+        proxyVisibleToolName(binding.server, binding.remoteName) === input.tool &&
+        (requestedServer.length === 0 || binding.server === requestedServer),
+    );
+    if (match) {
+      return { tool: match.toolName, server: match.server, args };
+    }
     return {
       tool: input.tool,
-      server: typeof input.server === "string" ? input.server : "",
+      server: requestedServer,
       args,
     };
   }

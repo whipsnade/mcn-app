@@ -37,7 +37,14 @@ from app.mcp_gateway.transport import (
 logger = logging.getLogger(__name__)
 
 
-_DATATAP_ORIGIN = "https://datatap.deepminer.com.cn"
+_DEFAULT_DATATAP_ORIGIN = "https://datatap.deepminer.com.cn"
+
+
+def _datatap_origin() -> str:
+    """生产默认指向真实 DataTap；测试/离线拓扑经 Settings 覆盖到 loopback。"""
+    from app.core.config import get_settings
+
+    return get_settings().datatap_mcp_origin.rstrip("/")
 _DISABLED_SERVICES = {
     "zhihu-mcp",
     "toutiao-mcp",
@@ -312,7 +319,7 @@ class DataTapTransport:
 
     @staticmethod
     def _endpoint(service: DataTapService) -> str:
-        return f"{_DATATAP_ORIGIN}/api/gateway/{service.value}/mcp"
+        return f"{_datatap_origin()}/api/gateway/{service.value}/mcp"
 
     async def _run_isolated(self, service: DataTapService, operation: Callable[[], Any]):
         state = self._states[service]

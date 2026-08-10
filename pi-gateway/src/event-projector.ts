@@ -63,11 +63,16 @@ function safeEventId(event: RecordValue): string | undefined {
 
 function genericProjection(event: RecordValue): { event_type: string; payload: RecordValue; identity?: string } | undefined {
   const type = event.type;
-  if (type === "agent_start" || type === "turn_start") {
-    return { event_type: "run.started", payload: {}, identity: safeEventId(event) };
+  if (type === "agent_start") {
+    return { event_type: "agent.turn.start", payload: {}, identity: safeEventId(event) };
+  }
+  if (type === "turn_start") {
+    // turn_start 是每轮一次的 SDK 事件，不能映射成每次会话唯一的 run.started；
+    // 独立别名，后端归一为 turn.started。
+    return { event_type: "turn.start", payload: {}, identity: safeEventId(event) };
   }
   if (type === "agent_end" || type === "turn_end") {
-    return { event_type: "turn.completed", payload: {}, identity: safeEventId(event) };
+    return { event_type: "agent.turn.end", payload: {}, identity: safeEventId(event) };
   }
   if (type === "message_update") {
     const update = event.assistantMessageEvent;
@@ -79,10 +84,10 @@ function genericProjection(event: RecordValue): { event_type: string; payload: R
     if (update.type === "text_delta" && delta) {
       return { event_type: "message.delta", payload: { text: delta }, identity: safeEventId(event) };
     }
-    // text_end carries no new information (deltas already streamed); the
-    // completion is emitted exactly once from done/error below.
-    if (update.type === "text_end") return undefined;
-    if (["done", "error"].includes(String(update.type))) {
+    // 真实 SDK 会话事件流没有 "done" update；assistant 文本以 text_end
+    // （携带完整 content）收口，done/error 是其他 provider 路径的等价终帧。
+    // completionEmitted 保证每个 Attempt 恰好一次 completion。
+    if (update.type === "text_end" || ["done", "error"].includes(String(update.type))) {
       const text = safeDelta(update.text ?? update.content);
       const message = isRecord(update.message) ? update.message : undefined;
       const content = message && Array.isArray(message.content) ? message.content : undefined;
@@ -101,13 +106,13 @@ function genericProjection(event: RecordValue): { event_type: string; payload: R
     }
     return undefined;
   }
-  if (type === "message_start") return { event_type: "message.started", payload: {}, identity: safeEventId(event) };
+  if (type === "message_start") return { event_type: "message.start", payload: {}, identity: safeEventId(event) };
   if (type === "tool_execution_start" || type === "tool_call") {
     const callId = safeString(event.toolCallId ?? event.callId ?? event.call_id);
     const toolName = safeString(event.toolName ?? event.tool_name ?? event.name);
     if (!callId || !toolName) return undefined;
     return {
-      event_type: "tool.started",
+      event_type: "tool.start",
       payload: { call_id: callId, internal_tool_name: toolName },
       identity: safeEventId(event),
     };
@@ -116,7 +121,7 @@ function genericProjection(event: RecordValue): { event_type: string; payload: R
     const callId = safeString(event.toolCallId ?? event.callId ?? event.call_id);
     if (!callId) return undefined;
     const status = event.isError === true || event.status === "failed" ? "failed" : "succeeded";
-    return { event_type: `tool.${status}`, payload: { call_id: callId, status }, identity: safeEventId(event) };
+    return { event_type: "tool.end", payload: { call_id: callId, status }, identity: safeEventId(event) };
   }
   return undefined;
 }

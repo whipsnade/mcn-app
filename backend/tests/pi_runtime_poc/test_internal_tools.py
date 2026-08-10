@@ -540,6 +540,55 @@ async def test_search_evidence_returns_seeded_rows(
     assert evidence_id in result["safe_summary"]
 
 
+async def test_get_session_context_lists_published_versions(
+    svc: PiEvidenceIngestService, settings: Settings, seeded: dict[str, Any], db: AsyncSession
+) -> None:
+    """回归：get_session_context 的版本清单是多列查询，必须用 Row 而不是
+    scalars() 首列（曾因 row.id 打在 str 上 500，恰好被恢复重放路径触发）。"""
+    from app.agent_artifacts.service import ArtifactService
+    from tests.agent_artifacts.payload_fixtures import brand_payload
+
+    run_id = seeded["run"].id
+    service = ArtifactService(db)
+    artifact, _draft, revision = await service.create_or_get_draft(
+        session_id=seeded["session"].id,
+        user_id=seeded["user"].id,
+        run_id=run_id,
+        module="brand",
+        business_fields={"brand": "测试品牌"},
+        schema_version="brand_report_v3",
+        payload=brand_payload(),
+        evidence_refs=[],
+        artifact_type="brand_report_v3",
+    )
+    version = AgentArtifactVersion(
+        artifact_id=artifact.id,
+        version=1,
+        source_run_id=run_id,
+        source_draft_revision_id=revision.id,
+        schema_version="brand_report_v3",
+        payload_json=brand_payload(),
+        evidence_refs_json=[],
+        review_json=None,
+        data_status="complete",
+        created_at=_now(),
+    )
+    db.add(version)
+    await db.flush()
+
+    token = issue_run_token(run_id, settings=settings)
+    result = await svc.execute_internal_tool(
+        token=token,
+        run_id=run_id,
+        tool_name="get_session_context",
+        arguments={},
+    )
+
+    assert result["status"] == "success"
+    summary = json.loads(result["safe_summary"])
+    assert [entry["id"] for entry in summary["artifact_versions"]] == [version.id]
+
+
 async def test_build_brand_report_draft_succeeds_with_limited_feedback(
     svc: PiEvidenceIngestService, settings: Settings, seeded: dict[str, Any]
 ) -> None:

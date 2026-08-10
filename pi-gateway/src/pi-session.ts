@@ -20,7 +20,7 @@ import {
   type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
 
-import { adapterServerName, createMcpConfig, createProductionResourceLoader } from "./resource-loader.js";
+import { createMcpConfig, createProductionResourceLoader } from "./resource-loader.js";
 import {
   createMcpAccountingExtensionFactory,
   McpAccountingExtension,
@@ -92,6 +92,17 @@ export function resolveMcpAdapterExtensionPath(): string {
 }
 
 /**
+ * Point the adapter's default config discovery (argv ``--mcp-config``) at the
+ * current Run's rendered `.mcp.json`.  Each isolated worker process serves
+ * exactly one Run; any previous entry is replaced.
+ */
+export function setAdapterMcpConfigPath(configPath: string): void {
+  const index = process.argv.indexOf("--mcp-config");
+  if (index >= 0) process.argv.splice(index, 2);
+  process.argv.push("--mcp-config", configPath);
+}
+
+/**
  * Assert every catalogued service has a decrypted endpoint in the Run bundle.
  * Endpoint and token values stay in the child process environment; the
  * on-disk `.mcp.json` only carries references to their variable names.
@@ -122,10 +133,14 @@ export async function createProductionPiSession(
   await chmod(runDir, 0o700);
   const agentDir = join(runDir, "agent");
   await mkdir(agentDir, { mode: 0o700 });
-  await writeFile(join(runDir, ".mcp.json"), JSON.stringify(createMcpConfig(work.runtimeSnapshot.adapterCatalog), null, 2), {
+  const mcpConfigPath = join(runDir, ".mcp.json");
+  await writeFile(mcpConfigPath, JSON.stringify(createMcpConfig(work.runtimeSnapshot.adapterCatalog), null, 2), {
     encoding: "utf8",
     mode: 0o600,
   });
+  // The adapter's default export discovers this Run's config via argv
+  // ``--mcp-config`` (jiti-loaded extension runs in this same child process).
+  setAdapterMcpConfigPath(mcpConfigPath);
 
   let disposed = false;
   try {
@@ -134,9 +149,9 @@ export async function createProductionPiSession(
       ? new McpAccountingExtension(options.mcpAccounting)
       : undefined;
     const extensionFactories: ExtensionFactory[] = mcpAccounting
-      ? [createMcpAccountingExtensionFactory(mcpAccounting, work.runtimeSnapshot.adapterCatalog.map((entry, index, catalog) => ({
+      ? [createMcpAccountingExtensionFactory(mcpAccounting, work.runtimeSnapshot.adapterCatalog.map((entry) => ({
         toolName: entry.adapterName,
-        server: adapterServerName(entry, index, catalog),
+        server: entry.service,
         remoteName: entry.remoteName,
       })))]
       : [];
@@ -180,6 +195,10 @@ export async function createProductionPiSession(
       sessionManager,
       settingsManager,
     });
+    // The SDK createAgentSession path never fires the extension session_start
+    // event (the CLI does); the reviewed adapter initializes its MCP runtime
+    // state on that event.  bindExtensions({}) is the public startup emit.
+    await session.bindExtensions({});
     const listeners = new Set<(event: PiSdkEvent) => void>();
     const unsubscribeSdk = session.subscribe((event) => {
       for (const listener of listeners) {

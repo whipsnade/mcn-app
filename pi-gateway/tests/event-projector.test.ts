@@ -2,12 +2,14 @@ import { describe, expect, it } from "vitest";
 
 import { ControlPlaneClient } from "../src/control-plane-client.js";
 import { PiSdkUsageProjector, projectPiSdkEvent } from "../src/event-projector.js";
+import { parsePiGatewaySourceEvent } from "../src/protocol.js";
 
 describe("Pi SDK usage projector", () => {
   it("projects only bounded run, thinking, text and tool fields in SDK order", () => {
     const projector = new PiSdkUsageProjector("attempt-events");
     const events = [
       { type: "agent_start", eventId: "turn-1" },
+      { type: "turn_start", eventId: "turn-1a" },
       { type: "message_update", eventId: "msg-1", assistantMessageEvent: { type: "thinking_delta", delta: "plan" } },
       { type: "message_update", eventId: "msg-2", assistantMessageEvent: { type: "text_delta", delta: "answer" } },
       { type: "tool_execution_start", toolCallId: "call-1", toolName: "load_marketing_skill", args: { token: "secret" } },
@@ -15,10 +17,10 @@ describe("Pi SDK usage projector", () => {
     ].flatMap((event) => projector.project(event));
 
     expect(events.map((event) => event.event_type)).toEqual([
-      "run.started", "thinking.delta", "message.delta", "tool.started", "tool.failed",
+      "agent.turn.start", "turn.start", "thinking.delta", "message.delta", "tool.start", "tool.end",
     ]);
-    expect(events[3]?.payload).toEqual({ call_id: "call-1", internal_tool_name: "load_marketing_skill" });
-    expect(events[4]?.payload).toEqual({ call_id: "call-1", status: "failed" });
+    expect(events[4]?.payload).toEqual({ call_id: "call-1", internal_tool_name: "load_marketing_skill" });
+    expect(events[5]?.payload).toEqual({ call_id: "call-1", status: "failed" });
     expect(JSON.stringify(events)).not.toContain("secret");
   });
 
@@ -169,6 +171,35 @@ describe("Pi SDK usage projector", () => {
     });
     expect(first[0]?.payload).not.toHaveProperty("token");
     expect(duplicate).toEqual([]);
+  });
+
+  it("every projector output passes the control-plane source-event wire contract", () => {
+    // 回归：projector 新增别名（如 turn.start）必须同步进入 protocol 白名单，
+    // 否则 sendEvent 在 flush 时同步抛错，事件流被当作控制面不可用而中断。
+    const projector = new PiSdkUsageProjector("attempt-wire");
+    const sdkEvents: unknown[] = [
+      { type: "agent_start" },
+      { type: "turn_start" },
+      { type: "message_start" },
+      { type: "message_update", assistantMessageEvent: { type: "thinking_delta", delta: "思考" } },
+      { type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "片段" } },
+      { type: "tool_execution_start", toolCallId: "call-1", toolName: "mcp" },
+      { type: "tool_execution_end", toolCallId: "call-1", isError: false },
+      {
+        type: "message_update",
+        assistantMessageEvent: {
+          type: "text_end",
+          content: "结论",
+          message: { usage: { input: 5, output: 2, requestId: "req-wire" } },
+        },
+      },
+      { type: "turn_end" },
+    ];
+    const projected = sdkEvents.flatMap((event) => projector.project(event));
+    expect(projected.length).toBeGreaterThanOrEqual(9);
+    for (const event of projected) {
+      expect(() => parsePiGatewaySourceEvent(event)).not.toThrow();
+    }
   });
 
   it("sends usage through the authenticated control-plane event path", async () => {

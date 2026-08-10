@@ -78,4 +78,40 @@ describe("McpAccountingExtension", () => {
       input: { tool: "query", server: "insight", args: {} },
     })).resolves.toEqual({ block: true, reason: "control_plane_unreachable" });
   });
+
+  it("maps adapter proxy names back to reviewed catalog identities", async () => {
+    const handlers = new Map<string, (event: any) => Promise<unknown>>();
+    const control = {
+      preflight: vi.fn(async () => ({ permit_id: "p-1" })),
+      finalize: vi.fn(),
+      fail: vi.fn(),
+    };
+    const extension = new McpAccountingExtension(control);
+    createMcpAccountingExtensionFactory(extension, [
+      {
+        toolName: "query_analysis_data",
+        server: "insight-cube",
+        remoteName: "datatap.insight.query.analysis.v1",
+      },
+    ])({
+      on: (name: string, handler: (event: any) => Promise<unknown>) => handlers.set(name, handler),
+    } as any);
+
+    await handlers.get("tool_call")?.({
+      type: "tool_call",
+      toolName: "mcp",
+      toolCallId: "tc-9",
+      input: {
+        tool: "insight_cube_datatap_insight_query_analysis_v1",
+        server: "insight-cube",
+        args: { keyword: "美妆" },
+      },
+    });
+
+    expect(control.preflight).toHaveBeenCalledWith({
+      tool: "query_analysis_data",
+      server: "insight-cube",
+      args: { keyword: "美妆" },
+    });
+  });
 });

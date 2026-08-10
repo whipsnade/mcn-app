@@ -103,13 +103,3 @@ export function createMcpConfig(catalog: readonly AdapterCatalogEntry[]): Produc
     mcpServers,
   };
 }
-
-/** Stable server key for a catalog that contains multiple reviewed tools per service. */
-export function adapterServerName(
-  entry: AdapterCatalogEntry,
-  index: number,
-  catalog: readonly AdapterCatalogEntry[],
-): string {
-  const firstIndex = catalog.findIndex((item) => item.service === entry.service);
-  return firstIndex === index ? entry.service : `${entry.service}__${entry.adapterName}`;
-}

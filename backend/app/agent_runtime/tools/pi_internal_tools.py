@@ -45,16 +45,20 @@ class GetSessionContextTool:
         run = await self._db.get(AgentRun, context.run_id)
         if session is None or run is None or session.user_id != context.user_id:
             return ToolResult(status="failed", safe_summary="session_not_found", error_type="not_found")
-        versions = await self._db.scalars(
-            select(
-                AgentArtifactVersion.id,
-                AgentArtifactVersion.artifact_id,
-                AgentArtifactVersion.version,
-                AgentArtifactVersion.schema_version,
+        # 多列查询必须用 execute().all() 取 Row；scalars() 只会返回首列
+        # （str），下方 row.id 将抛 AttributeError。
+        versions = (
+            await self._db.execute(
+                select(
+                    AgentArtifactVersion.id,
+                    AgentArtifactVersion.artifact_id,
+                    AgentArtifactVersion.version,
+                    AgentArtifactVersion.schema_version,
+                )
+                .where(AgentArtifactVersion.source_run_id == context.run_id)
+                .order_by(AgentArtifactVersion.version)
             )
-            .where(AgentArtifactVersion.source_run_id == context.run_id)
-            .order_by(AgentArtifactVersion.version)
-        )
+        ).all()
         evidence_count = await self._db.scalar(
             select(func.count())
             .select_from(EvidenceItem)

@@ -101,8 +101,8 @@ describe("isolated worker control-plane bridge", () => {
     expect(calls).toEqual([
       { method: "internal_tool", params: { tool_name: "get_session_context", args: {} } },
     ]);
-    expect(events).toContain("tool.started");
-    expect(events).toContain("tool.succeeded");
+    expect(events).toContain("tool.start");
+    expect(events).toContain("tool.end");
     // bridge listener detached after child exit
     expect(child.listenerCount("message")).toBe(baselineListeners);
   }, 60_000);

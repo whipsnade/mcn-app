@@ -57,6 +57,8 @@ class Settings(BaseSettings):
     # DataTap 接入链接返回多服务 endpoint；只接受显式 slug → URL 映射，Pi 不在运行时
     # 猜测、拼接或发现服务 URL。旧的单 endpoint 留作兼容读取，POC 一律使用此映射。
     datatap_mcp_urls: dict[str, AnyHttpUrl] = Field(default_factory=dict)
+    # DataTap 网关 origin；默认真实生产地址，仅测试/离线拓扑覆盖为 loopback。
+    datatap_mcp_origin: str = "https://datatap.deepminer.com.cn"
     # DataTap 查询级读取超时：统计类查询通常一分钟内返回，超时按失败释放积分。
     datatap_read_timeout_seconds: float = Field(default=60.0, gt=0)
     # Agent 路径单次 MCP 调用外发墙钟上限（不含队列等待）：DataTap 统计查询可能
@@ -69,6 +71,8 @@ class Settings(BaseSettings):
     # Agent 工具调用 stuck 阈值：超过该时长仍处于 running/reserved 的调用由恢复
     # 循环迁移为 unknown 再核对（设计 §5.4）；须大于 DataTap 队列 + 读取超时。
     agent_tool_call_stuck_seconds: float = Field(default=900.0, gt=0)
+    # 恢复循环扫描间隔（秒）；离线进程级 UAT 可调小以快速演练崩溃恢复。
+    agent_recovery_interval_seconds: float = Field(default=30.0, gt=0)
     # 达人详情 Session 级缓存 TTL（设计 §8.1 kol_detail_cache）：默认 24 小时。
     kol_detail_cache_ttl_hours: int = Field(default=24, ge=1)
     # 用户上传存储目录与限制：仅 .csv/.xlsx，文件 20 MiB / 数据行 50,000 上限

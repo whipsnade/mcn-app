@@ -96,7 +96,20 @@ export function spawnIsolatedWorker(
   };
   handle.done = done;
   handle.abort = () => {
-    if (!child.killed) child.kill("SIGTERM");
+    if (child.killed) return;
+    // 子进程安装了优雅停机钩子（adapter/SDK 清理），可能永远不退出；
+    // 租约丢失或取消必须保证 worker 真正死亡，否则旧 Attempt 会继续
+    // 经 IPC 桥执行工具调用（双重执行）。SIGTERM 后有限时升级 SIGKILL。
+    child.kill("SIGTERM");
+    const escalate = setTimeout(() => {
+      try {
+        if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      } catch {
+        // 进程已退出。
+      }
+    }, 5_000);
+    escalate.unref?.();
+    child.once("close", () => clearTimeout(escalate));
   };
   clearSecretEnv(childEnv);
   child.send({ type: "run", work });
@@ -189,7 +202,9 @@ function finishChildProcess(
     if (finished) return;
     finished = true;
     if (process.connected) process.disconnect();
-    process.exitCode = exitCode;
+    // 隔离 Worker 的全部持久状态都在 FastAPI；adapter 的 keep-alive 连接会
+    // 拖住事件循环，因此终帧落 IPC 后必须硬退出，不能等待自然排空。
+    process.exit(exitCode);
   };
   if (!process.send) {
     finish();
