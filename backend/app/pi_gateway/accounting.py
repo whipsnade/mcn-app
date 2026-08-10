@@ -27,7 +27,7 @@ from app.billing.models import (
 )
 from app.agent_runtime.models import AgentRun, AgentRunAttempt, AgentToolCall
 from app.billing.service import InsufficientPointsError
-from app.tenancy.models import TenantMembership
+from app.tenancy.models import SUPPORTED_LICENSE_FEATURES, TenantMembership
 
 
 MCP_POINTS_COST = 10
@@ -182,6 +182,8 @@ class McpPreflightContext(BaseModel):
     service_slug: str = Field(min_length=1, max_length=64)
     arguments: dict[str, Any] = Field(default_factory=dict)
     feature: str = Field(min_length=1, max_length=64)
+    # DNR 单次真实重试按 dispatch 次数区分账务幂等键（第二次派发真实收费）。
+    dispatch_count: int = Field(default=1, ge=1, le=100)
 
     @field_validator("arguments")
     @classmethod
@@ -729,13 +731,34 @@ class TenantAccountingService:
             raise TenantAccountingError("tenant_wallet_not_found")
         return wallet
 
+    @staticmethod
+    def reserve_idempotency_key(tool_call_id: str, dispatch_count: int) -> str:
+        if dispatch_count <= 1:
+            return f"tenant-mcp:{tool_call_id}:reserve"
+        return f"tenant-mcp:{tool_call_id}:dispatch:{dispatch_count}:reserve"
+
+    @classmethod
+    def _reserve_idempotency_key(cls, context: McpPreflightContext) -> str:
+        return cls.reserve_idempotency_key(context.tool_call_id, context.dispatch_count)
+
     async def reserve_mcp_call(self, context: McpPreflightContext) -> McpPermit:
         await self._membership(context)
+        # 每次外发前复核 License 状态/有效期/feature（新旧 Runtime 共用本入口，
+        # Run 中途暂停、过期或 feature 关闭都会在下一次调用前阻断）。``billing``
+        # 等兼容账务入口不携带营销 feature，不在本门禁范围内。
+        if context.feature in SUPPORTED_LICENSE_FEATURES:
+            from app.licensing.service import LicenseService
+
+            decision = await LicenseService(self.db).authorize_feature_decision(
+                context.tenant_id, context.user_id, context.feature
+            )
+            if not decision.allowed:
+                raise TenantAccountingError(decision.code)
         existing = await self.db.scalar(
             select(TenantWalletTransaction)
             .where(
                 TenantWalletTransaction.idempotency_key
-                == f"tenant-mcp:{context.tool_call_id}:reserve"
+                == self._reserve_idempotency_key(context)
             )
             .with_for_update()
         )
@@ -756,7 +779,14 @@ class TenantAccountingService:
                 tool_call_id=context.tool_call_id,
                 catalog_entry_id=context.internal_tool_name,
             )
-        wallet = await self._wallet(context.tenant_id)
+        wallet = await self.db.scalar(
+            select(TenantWallet)
+            .where(TenantWallet.tenant_id == context.tenant_id)
+            .with_for_update()
+        )
+        if wallet is None:
+            # 置备/迁移故障：fail-closed，不自动开空钱包、不写旧账。
+            raise TenantAccountingError("tenant_wallet_missing")
         policy, usage = await self._usage_rows(context)
         if wallet.balance < MCP_POINTS_COST:
             raise TenantWalletInsufficientError()
@@ -784,7 +814,7 @@ class TenantAccountingService:
                 reserved_delta=MCP_POINTS_COST,
                 balance_after=wallet.balance,
                 reserved_after=wallet.reserved,
-                idempotency_key=f"tenant-mcp:{context.tool_call_id}:reserve",
+                idempotency_key=self._reserve_idempotency_key(context),
                 reference_type="mcp_call",
                 reference_id=context.tool_call_id,
                 created_at=now,
@@ -912,7 +942,7 @@ class TenantAccountingService:
         )
         if reserve is None or reserve.kind != "reserve":
             raise TenantAccountingError("mcp_permit_not_found")
-        idem = f"tenant-mcp:{reserve.tool_call_id}:settle"
+        idem = f"tenant-mcp:{reserve.id}:settle"
         if await self.db.scalar(
             select(TenantWalletTransaction.id).where(
                 TenantWalletTransaction.idempotency_key == idem
@@ -975,7 +1005,7 @@ class TenantAccountingService:
         terminal = await self.db.scalar(
             select(TenantWalletTransaction.id)
             .where(
-                TenantWalletTransaction.tool_call_id == reserve.tool_call_id,
+                TenantWalletTransaction.reference_id == reserve.id,
                 TenantWalletTransaction.kind.in_(("settle", "release")),
             )
             .limit(1)
@@ -1022,7 +1052,7 @@ class TenantAccountingService:
                 )
                 await self.db.flush()
             return
-        idem = f"tenant-mcp:{reserve.tool_call_id}:release"
+        idem = f"tenant-mcp:{reserve.id}:release"
         if await self.db.scalar(
             select(TenantWalletTransaction.id).where(
                 TenantWalletTransaction.idempotency_key == idem

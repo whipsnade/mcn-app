@@ -166,7 +166,7 @@ export async function runSingleWorker(
       options.onSdkEvent?.(event);
       if (event.type !== "sdk_event") return;
       const projected = projectPiSdkEvent(event.event ?? event, usageProjector);
-      if (projected) options.onEvent?.(projected);
+      for (const item of projected) options.onEvent?.(item);
     });
     await session.prompt(work.userPrompt ?? "");
   } finally {

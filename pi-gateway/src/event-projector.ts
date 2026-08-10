@@ -40,18 +40,9 @@ function usageObject(event: RecordValue): RecordValue | undefined {
     if (!["done", "error", "text_end", "usage"].includes(String(updateType))) return undefined;
     if (isRecord(update.usage)) return update.usage;
     if (isRecord(update.partial) && isRecord(update.partial.usage)) return update.partial.usage;
+    if (isRecord(update.message) && isRecord(update.message.usage)) return update.message.usage;
     if (isRecord(event.message) && isRecord(event.message.usage)) return event.message.usage;
     return {};
-  }
-  return undefined;
-}
-
-function eventIdentity(event: RecordValue, usage: RecordValue): string | undefined {
-  const requestId = safeString(usage.requestId ?? usage.upstream_request_id);
-  if (requestId) return `request:${requestId}`;
-  for (const key of ["eventId", "event_id", "messageId", "message_id", "turnId", "turn_id", "id"]) {
-    const value = safeString(event[key] ?? usage[key]);
-    if (value) return `event:${value}`;
   }
   return undefined;
 }
@@ -88,9 +79,25 @@ function genericProjection(event: RecordValue): { event_type: string; payload: R
     if (update.type === "text_delta" && delta) {
       return { event_type: "message.delta", payload: { text: delta }, identity: safeEventId(event) };
     }
-    if (["done", "text_end", "error"].includes(String(update.type))) {
+    // text_end carries no new information (deltas already streamed); the
+    // completion is emitted exactly once from done/error below.
+    if (update.type === "text_end") return undefined;
+    if (["done", "error"].includes(String(update.type))) {
       const text = safeDelta(update.text ?? update.content);
-      return { event_type: "message.completed", payload: text ? { text } : {}, identity: safeEventId(event) };
+      const message = isRecord(update.message) ? update.message : undefined;
+      const content = message && Array.isArray(message.content) ? message.content : undefined;
+      const contentText = content
+        ?.filter((block): block is RecordValue => isRecord(block))
+        .filter((block) => block.type === "text")
+        .map((block) => safeDelta(block.text))
+        .filter((value): value is string => Boolean(value))
+        .join("");
+      const finalText = text ?? (contentText || undefined);
+      return {
+        event_type: "message.completed",
+        payload: finalText ? { text: finalText } : {},
+        identity: safeEventId(event),
+      };
     }
     return undefined;
   }
@@ -117,6 +124,7 @@ function genericProjection(event: RecordValue): { event_type: string; payload: R
 export class PiSdkUsageProjector {
   private sequence = 1;
   private readonly seen = new Set<string>();
+  private completionEmitted = false;
   readonly diagnostics: UsageProjectorDiagnostics = {
     unknownEvents: 0,
     invalidUsage: 0,
@@ -128,34 +136,62 @@ export class PiSdkUsageProjector {
     if (!/^[A-Za-z0-9._-]{1,64}$/.test(attemptId)) throw new Error("pi_usage_attempt_invalid");
   }
 
-  project(event: unknown): PiGatewaySourceEvent | undefined {
+  /**
+   * Project one SDK event into zero or more ordered product events.  A
+   * message-completion update that also carries usage yields the completion
+   * first and the usage record second, so usage can never swallow the
+   * assistant completion the terminal ordering relies on.
+   */
+  project(event: unknown): PiGatewaySourceEvent[] {
     if (!isRecord(event) || typeof event.type !== "string") {
       this.diagnostics.unknownEvents += 1;
-      return undefined;
+      return [];
     }
+    const generic = genericProjection(event);
     const usage = usageObject(event);
-    if (usage === undefined) {
-      const generic = genericProjection(event);
-      if (!generic) {
-        this.diagnostics.unknownEvents += 1;
-        return undefined;
-      }
-      if (generic.identity && this.seen.has(`event:${generic.identity}`)) {
-        this.diagnostics.duplicateUsage += 1;
-        return undefined;
-      }
-      if (generic.identity) this.seen.add(`event:${generic.identity}`);
-      const sequence = this.sequence++;
-      this.diagnostics.projectedEvents += 1;
-      return {
-        source_event_id: `${this.attemptId}:${sequence}`,
-        sequence,
-        event_type: generic.event_type,
-        payload: generic.payload,
-      };
+    if (generic === undefined && usage === undefined) {
+      this.diagnostics.unknownEvents += 1;
+      return [];
     }
+    const out: PiGatewaySourceEvent[] = [];
+    if (generic !== undefined) {
+      const isCompletion = generic.event_type === "message.completed";
+      const dedupeKey = generic.identity ? `event:${generic.identity}` : undefined;
+      if (isCompletion && this.completionEmitted) {
+        this.diagnostics.duplicateUsage += 1;
+      } else if (dedupeKey && this.seen.has(dedupeKey)) {
+        this.diagnostics.duplicateUsage += 1;
+      } else {
+        if (isCompletion) this.completionEmitted = true;
+        if (dedupeKey) this.seen.add(dedupeKey);
+        out.push(this.nextEvent(generic.event_type, generic.payload));
+      }
+    }
+    if (usage !== undefined) {
+      const usageEvent = this.projectUsage(event, usage);
+      if (usageEvent !== undefined) out.push(usageEvent);
+    }
+    return out;
+  }
+
+  private nextEvent(eventType: string, payload: RecordValue): PiGatewaySourceEvent {
+    const sequence = this.sequence++;
+    this.diagnostics.projectedEvents += 1;
+    return {
+      source_event_id: `${this.attemptId}:${sequence}`,
+      sequence,
+      event_type: eventType,
+      payload,
+    };
+  }
+
+  private projectUsage(event: RecordValue, usage: RecordValue): PiGatewaySourceEvent | undefined {
     const requestId = safeString(usage.requestId ?? usage.upstream_request_id);
-    const dedupeKey = eventIdentity(event, usage);
+    const dedupeKey = requestId
+      ? `request:${requestId}`
+      : safeEventId(event)
+        ? `usage-event:${safeEventId(event)}`
+        : undefined;
     if (dedupeKey && this.seen.has(dedupeKey)) {
       this.diagnostics.duplicateUsage += 1;
       return undefined;
@@ -187,19 +223,13 @@ export class PiSdkUsageProjector {
       ? "available"
       : "unavailable";
     if (dedupeKey) this.seen.add(dedupeKey);
-    const sequence = this.sequence++;
-    return {
-      source_event_id: `${this.attemptId}:${sequence}`,
-      sequence,
-      event_type: "usage",
-      payload: fields,
-    };
+    return this.nextEvent("usage", fields);
   }
 }
 
 export function projectPiSdkEvent(
   event: unknown,
   projector: PiSdkUsageProjector,
-): PiGatewaySourceEvent | undefined {
+): PiGatewaySourceEvent[] {
   return projector.project(event);
 }

@@ -47,7 +47,15 @@ from app.agent_runtime.schemas import CallTool, Complete, PublishArtifacts
 from app.agent_runtime.tools.builders import BuildKolDetailDraftTool
 from app.agent_runtime.tools.mcp import MCP_POINTS_COST, AgentMcpTool
 from app.agent_runtime.tools.registry import McpCatalogEntry, ToolRegistry
-from app.billing.models import Wallet
+from app.billing.models import (
+    TenantUserQuotaPolicy,
+    TenantUserQuotaUsage,
+    TenantWallet,
+    TenantWalletTransaction,
+    Wallet,
+)
+from app.licensing.models import TenantLicense
+from app.tenancy.models import Tenant, TenantMembership
 from app.db.session import SessionFactory
 from app.identity.models import User
 from app.mcp_gateway.contracts import DataTapService
@@ -360,6 +368,53 @@ def _make_service(db, *, gateway: ScriptedGateway, transport, worker: str):
     )
 
 
+async def _provision_tenant(setup, *, user_id: str, now, balance: int = 1000) -> str:
+    """为直构造用户置备 B4 租户账本（tenant/license/membership/wallet/quota）。"""
+    tenant = Tenant(
+        id=str(uuid4()), slug=f"koldetail-{uuid4().hex[:18]}", name="达人详情租户",
+        status="active", is_internal=False, runtime_backend="current",
+        license_status="active", active_license_id=None,
+        created_at=now, updated_at=now,
+    )
+    setup.add(tenant)
+    await setup.flush()
+    license_row = TenantLicense(
+        id=str(uuid4()), tenant_id=tenant.id, version=1,
+        valid_from=now.replace(microsecond=0), valid_until=None,
+        features_json={
+            "kol_selection": True,
+            "brand_analysis": True,
+            "campaign_analysis": True,
+            "kol_detail": True,
+            "utility": True,
+        },
+        max_concurrent_runs=16, max_user_concurrent_runs=8,
+        created_by=user_id, created_at=now,
+    )
+    setup.add(license_row)
+    await setup.flush()
+    tenant.active_license_id = license_row.id
+    setup.add(
+        TenantMembership(
+            id=str(uuid4()), tenant_id=tenant.id, user_id=user_id,
+            role="owner", status="active", created_at=now, updated_at=now,
+        )
+    )
+    setup.add(
+        TenantWallet(
+            tenant_id=tenant.id, balance=balance, reserved=0, version=0, updated_at=now,
+        )
+    )
+    setup.add(
+        TenantUserQuotaPolicy(
+            id=str(uuid4()), tenant_id=tenant.id, user_id=user_id,
+            period="monthly", points_limit=1_000_000, status="active",
+            created_at=now, updated_at=now,
+        )
+    )
+    return tenant.id
+
+
 async def _teardown(user_id: str, session_id: str) -> None:
     """清理真实提交的测试数据（按 FK 依赖顺序，最后删 user 级联收尾）。"""
     async with SessionFactory() as db:
@@ -457,8 +512,23 @@ async def _teardown(user_id: str, session_id: str) -> None:
         if child_run_ids:
             await db.execute(delete(AgentRun).where(AgentRun.id.in_(child_run_ids)))
         user = await db.get(User, user_id)
+        membership = await db.scalar(
+            select(TenantMembership).where(TenantMembership.user_id == user_id)
+        )
+        tenant_id = membership.tenant_id if membership is not None else None
         if user is not None:
             await db.delete(user)
+        if tenant_id is not None:
+            for model in (
+                TenantUserQuotaUsage,
+                TenantUserQuotaPolicy,
+                TenantWalletTransaction,
+                TenantWallet,
+                TenantMembership,
+                TenantLicense,
+            ):
+                await db.execute(delete(model).where(model.tenant_id == tenant_id))
+            await db.execute(delete(Tenant).where(Tenant.id == tenant_id))
         await db.commit()
 
 
@@ -484,13 +554,12 @@ async def test_concurrent_create_fetches_and_charges_exactly_once() -> None:
             )
         )
         await setup.flush()
-        setup.add(
-            Wallet(user_id=user_id, balance=1000, reserved=0, version=0, updated_at=now)
-        )
+        tenant_id = await _provision_tenant(setup, user_id=user_id, now=now)
         setup.add(
             AgentSession(
                 id=session_id,
                 user_id=user_id,
+                tenant_id=tenant_id,
                 title="并发协调会话",
                 status="active",
                 created_at=now,
@@ -538,9 +607,14 @@ async def test_concurrent_create_fetches_and_charges_exactly_once() -> None:
             # MCP 传输恰好外发一次（OneShotMcpTransport 对第二次外发也会断言失败）。
             assert len(transport.calls) == 1
             # 钱包恰好结算一次 10 积分。
-            wallet = await verify.get(Wallet, user_id)
+            membership = await verify.scalar(
+                select(TenantMembership).where(TenantMembership.user_id == user_id)
+            )
+            assert membership is not None
+            wallet = await verify.get(TenantWallet, membership.tenant_id)
             assert wallet is not None
             assert (wallet.balance, wallet.reserved) == (1000 - MCP_POINTS_COST, 0)
+            assert await verify.get(Wallet, user_id) is None
             settled_calls = await verify.scalar(
                 select(func.count(AgentToolCall.id)).where(
                     AgentToolCall.run_id.in_(run_ids),
@@ -586,13 +660,12 @@ async def test_published_version_fallback_serves_without_recharge() -> None:
             )
         )
         await setup.flush()
-        setup.add(
-            Wallet(user_id=user_id, balance=1000, reserved=0, version=0, updated_at=now)
-        )
+        tenant_id = await _provision_tenant(setup, user_id=user_id, now=now)
         setup.add(
             AgentSession(
                 id=session_id,
                 user_id=user_id,
+                tenant_id=tenant_id,
                 title="Version 回退会话",
                 status="active",
                 created_at=now,
@@ -640,9 +713,14 @@ async def test_published_version_fallback_serves_without_recharge() -> None:
             )
             assert run_count == 1
             assert len(transport.calls) == 1
-            wallet = await verify.get(Wallet, user_id)
+            membership = await verify.scalar(
+                select(TenantMembership).where(TenantMembership.user_id == user_id)
+            )
+            assert membership is not None
+            wallet = await verify.get(TenantWallet, membership.tenant_id)
             assert wallet is not None
             assert (wallet.balance, wallet.reserved) == (1000 - MCP_POINTS_COST, 0)
+            assert await verify.get(Wallet, user_id) is None
             # 缓存行已由 Version 重建：fetched_at/expires_at 与 Version 发布时间对齐。
             version = await verify.scalar(
                 select(AgentArtifactVersion).where(

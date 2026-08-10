@@ -356,12 +356,12 @@ async def test_reconcile_idempotent_replay_no_double_settle(
     assert first.json()["status"] == second.json()["status"] == "settled"
     assert first.json()["evidence_id"] == second.json()["evidence_id"]
 
-    # 只结算一次：幂等键阻止重复扣费
+    # 只结算一次：幂等键阻止重复扣费（settle 幂等键按 permit 维度唯一）
     settles = (
         await db_session.scalars(
             select(TenantWalletTransaction).where(
-                TenantWalletTransaction.idempotency_key
-                == f"tenant-mcp:{call.id}:settle"
+                TenantWalletTransaction.tool_call_id == call.id,
+                TenantWalletTransaction.kind == "settle",
             )
         )
     ).all()

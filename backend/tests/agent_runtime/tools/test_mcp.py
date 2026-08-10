@@ -57,8 +57,16 @@ from app.agent_runtime.tools.mcp import (
 from app.agent_runtime.tools.registry import ToolRegistry
 from app.agent_runtime.evidence import EvidenceWriter
 from app.agent_runtime.transcript import RunTranscriptLoader
-from app.billing.models import Wallet
+from app.billing.models import (
+    TenantUserQuotaPolicy,
+    TenantUserQuotaUsage,
+    TenantWallet,
+    TenantWalletTransaction,
+)
 from app.billing.service import WalletService
+from app.licensing.models import TenantLicense
+from app.pi_gateway.accounting import McpPreflightContext, TenantAccountingService
+from app.tenancy.models import Tenant, TenantMembership
 from app.db.session import SessionFactory
 from app.identity.models import User
 from app.mcp_gateway.contracts import DataTapService
@@ -146,6 +154,7 @@ class FakeMcpTransport:
 @dataclass(frozen=True)
 class _Chain:
     user_id: str
+    tenant_id: str
     session_id: str
     run_id: str
     attempt_id: str
@@ -157,7 +166,11 @@ class _Chain:
 
 
 async def _setup_chain(*, balance: int = 1000, steps: int = 1) -> _Chain:
-    """在独立已提交事务中创建 user+wallet+session+run+attempt+N 个 step。"""
+    """在独立已提交事务中创建 user+租户账本+session+run+attempt+N 个 step。
+
+    B4 后 MCP 计费只认租户账本：夹具直接置备 tenant/license/membership/
+    TenantWallet/quota，与生产个人租户同构。
+    """
     now = _now()
     async with SessionFactory.begin() as db:
         user = User(
@@ -166,9 +179,52 @@ async def _setup_chain(*, balance: int = 1000, steps: int = 1) -> _Chain:
         )
         db.add(user)
         await db.flush()
-        db.add(Wallet(user_id=user.id, balance=balance, reserved=0, version=0, updated_at=now))
+        tenant = Tenant(
+            id=str(uuid4()), slug=f"mcp-{uuid4().hex[:20]}", name="MCP桥租户",
+            status="active", is_internal=False, runtime_backend="current",
+            license_status="active", active_license_id=None,
+            created_at=now, updated_at=now,
+        )
+        db.add(tenant)
+        await db.flush()
+        license_row = TenantLicense(
+            id=str(uuid4()), tenant_id=tenant.id, version=1,
+            valid_from=now.replace(microsecond=0), valid_until=None,
+            features_json={
+                "kol_selection": True,
+                "brand_analysis": True,
+                "campaign_analysis": True,
+                "kol_detail": True,
+                "utility": True,
+            },
+            max_concurrent_runs=64, max_user_concurrent_runs=32,
+            created_by=user.id, created_at=now,
+        )
+        db.add(license_row)
+        await db.flush()
+        tenant.active_license_id = license_row.id
+        db.add(
+            TenantMembership(
+                id=str(uuid4()), tenant_id=tenant.id, user_id=user.id,
+                role="owner", status="active", created_at=now, updated_at=now,
+            )
+        )
+        db.add(
+            TenantWallet(
+                tenant_id=tenant.id, balance=balance, reserved=0,
+                version=0, updated_at=now,
+            )
+        )
+        db.add(
+            TenantUserQuotaPolicy(
+                id=str(uuid4()), tenant_id=tenant.id, user_id=user.id,
+                period="monthly", points_limit=10_000_000, status="active",
+                created_at=now, updated_at=now,
+            )
+        )
         session = AgentSession(
-            id=str(uuid4()), user_id=user.id, title="MCP桥会话", status="active",
+            id=str(uuid4()), user_id=user.id, tenant_id=tenant.id,
+            title="MCP桥会话", status="active",
             created_at=now, updated_at=now,
         )
         db.add(session)
@@ -176,6 +232,7 @@ async def _setup_chain(*, balance: int = 1000, steps: int = 1) -> _Chain:
         # agent_runs 与 agent_messages 存在环形外键，逐条 flush 保证父行先落库。
         run = AgentRun(
             id=str(uuid4()), session_id=session.id, user_id=user.id,
+            tenant_id=tenant.id,
             run_kind="user", visibility="user",
             profile_name="session_analyst_v1", profile_version="v1", model="test-model",
             status="running", decision_count=0, review_count=0, revision_count=0,
@@ -200,6 +257,7 @@ async def _setup_chain(*, balance: int = 1000, steps: int = 1) -> _Chain:
             step_ids.append(step.id)
         chain = _Chain(
             user_id=user.id,
+            tenant_id=tenant.id,
             session_id=session.id,
             run_id=run.id,
             attempt_id=attempt.id,
@@ -234,10 +292,25 @@ async def _teardown_chain(chain: _Chain) -> None:
             call = await db.get(AgentToolCall, call_id)
             if call is not None:
                 await db.delete(call)
-        # 其余（session/run/attempt/step/wallet/流水）由 users 的级联删除收尾。
+        # 其余（session/run/attempt/step）由 users 的级联删除收尾；租户侧行显式删除。
         user = await db.get(User, chain.user_id)
         if user is not None:
             await db.delete(user)
+        for model in (
+            TenantUserQuotaUsage,
+            TenantUserQuotaPolicy,
+            TenantWalletTransaction,
+            TenantWallet,
+            TenantMembership,
+            TenantLicense,
+        ):
+            for row in (
+                await db.scalars(select(model).where(model.tenant_id == chain.tenant_id))
+            ).all():
+                await db.delete(row)
+        tenant = await db.get(Tenant, chain.tenant_id)
+        if tenant is not None:
+            await db.delete(tenant)
         await db.commit()
 
 
@@ -269,14 +342,16 @@ def _bridge(
     )
 
 
-async def _wallet(user_id: str) -> Wallet:
+async def _wallet(user_id: str) -> TenantWallet:
+    """读取当前用户租户账本（B4 后唯一事实源）。"""
     async with SessionFactory() as db:
-        wallet = await db.get(Wallet, user_id)
-        assert wallet is not None
-        return Wallet(
-            user_id=wallet.user_id, balance=wallet.balance, reserved=wallet.reserved,
-            version=wallet.version, updated_at=wallet.updated_at,
+        membership = await db.scalar(
+            select(TenantMembership).where(TenantMembership.user_id == user_id)
         )
+        assert membership is not None
+        wallet = await db.get(TenantWallet, membership.tenant_id)
+        assert wallet is not None
+        return wallet
 
 
 async def _rows(run_id: str) -> list[AgentToolCall]:
@@ -469,7 +544,8 @@ async def test_durable_before_send_visible_from_independent_session() -> None:
                 if row is None
                 else (row.status, row.points_reserved, row.started_at is not None)
             )
-            wallet = await db.get(Wallet, chain.user_id)
+            wallet = await db.get(TenantWallet, chain.tenant_id)
+            assert wallet is not None
             observed_wallet.append((wallet.balance, wallet.reserved))
 
     try:
@@ -720,10 +796,17 @@ async def _make_unknown_call(
         )
         db.add(call)
         await db.flush()
-        await WalletService(db).reserve(
-            chain.user_id, MCP_POINTS_COST, f"agent-mcp:{logical_id}:reserve", call.id,
-            reference_type="agent_tool_call",
-            tenant_source=False,
+        await TenantAccountingService(db).reserve_mcp_call(
+            McpPreflightContext(
+                tenant_id=chain.tenant_id,
+                user_id=chain.user_id,
+                run_id=chain.run_id,
+                tool_call_id=call.id,
+                internal_tool_name=INTERNAL_NAME,
+                service_slug=DataTapService.INSIGHT_CUBE.value,
+                arguments={"keyword": "美妆"},
+                feature="kol_selection",
+            )
         )
         call_id = call.id
     return logical_id, call_id
@@ -973,7 +1056,8 @@ async def test_insufficient_balance_leaves_no_dangling_row_and_retry_proceeds() 
 
         # 充值后同一 logical_call_id 可重试并成功
         async with SessionFactory.begin() as db:
-            wallet = await db.get(Wallet, chain.user_id)
+            wallet = await db.get(TenantWallet, chain.tenant_id)
+            assert wallet is not None
             wallet.balance = 100
         retry = await bridge.execute(_context(chain), {"keyword": "美妆"})
         assert retry.status == "success"
@@ -1529,24 +1613,27 @@ async def test_p0_dnr_retry_insufficient_balance_no_dispatch() -> None:
         w1 = await _wallet(chain.user_id)
         assert (w1.balance, w1.reserved) == (20, 0)
 
-        # 用真实 WalletService 消耗余额（新增一个独立预留），使重试时余额不足
+        # 用真实租户账务消耗余额（两笔固定 10 分独立预留），使重试时余额不足
         async with SessionFactory.begin() as db:
-            from app.billing.service import WalletService
             await WalletService(db).reserve(
-                chain.user_id, 15, "drain-for-retry-test", "drain-1",
+                chain.user_id, 10, "drain-for-retry-test-1", "drain-1",
                 reference_type="agent_tool_call",
-                tenant_source=False,
+            )
+        async with SessionFactory.begin() as db:
+            await WalletService(db).reserve(
+                chain.user_id, 10, "drain-for-retry-test-2", "drain-2",
+                reference_type="agent_tool_call",
             )
         w_drained = await _wallet(chain.user_id)
-        assert (w_drained.balance, w_drained.reserved) == (5, 15)
+        assert (w_drained.balance, w_drained.reserved) == (0, 20)
 
-        # 第二次 retry：balance=5 < 10 → 不派发
+        # 第二次 retry：租户池余额已被独立预留耗尽（0 < 10）→ 不派发
         r2 = await bridge.execute(_context(chain, chain.step_ids[1]), {"keyword": "美妆"})
         assert r2.status == "failed"
         assert r2.error_type == DEFINITELY_NOT_SENT
         assert len(transport.calls) == 1  # 未派发第二次
         w2 = await _wallet(chain.user_id)
-        assert (w2.balance, w2.reserved) == (5, 15)
+        assert (w2.balance, w2.reserved) == (0, 20)
     finally:
         await _teardown_chain(chain)
 

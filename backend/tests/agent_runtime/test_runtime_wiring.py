@@ -52,7 +52,7 @@ async def test_engine_factory_shares_one_breaker_and_agent_transport(db_session)
     from app.main import create_agent_runtime
 
     await _add_approved_catalog_row(db_session, internal_name="query_analysis_data")
-    _executor, _recovery, _broker, engine_factory, _utility = create_agent_runtime()
+    _executor, _recovery, _broker, engine_factory, _utility, _pi_recovery = create_agent_runtime()
     engine_a = engine_factory(db_session, "worker-a", channel_permissions=())
     engine_b = engine_factory(db_session, "worker-b", channel_permissions=())
 
@@ -71,7 +71,7 @@ async def test_recovery_tool_factory_shares_breaker_and_agent_transport(db_sessi
     from app.main import create_agent_runtime
 
     await _add_approved_catalog_row(db_session, internal_name="query_analysis_data")
-    _executor, recovery, _broker, engine_factory, _utility = create_agent_runtime()
+    _executor, recovery, _broker, engine_factory, _utility, _pi_recovery = create_agent_runtime()
     engine = engine_factory(db_session, "worker-a", channel_permissions=())
     engine_tool = await _engine_mcp_tool(engine, "query_analysis_data")
 
@@ -94,7 +94,7 @@ async def test_engine_factory_does_not_wire_model_reviewer(db_session) -> None:
     """
     from app.main import create_agent_runtime
 
-    _executor, _recovery, _broker, engine_factory, _utility = create_agent_runtime()
+    _executor, _recovery, _broker, engine_factory, _utility, _pi_recovery = create_agent_runtime()
     engine = engine_factory(db_session, "worker-a", channel_permissions=())
 
     assert not hasattr(engine, "_reviewer")

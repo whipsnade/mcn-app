@@ -36,6 +36,15 @@ from .service import PiGatewayClaimError, PiGatewayLeaseError, PiGatewayService
 
 
 router = APIRouter()
+
+# HMAC 时间偏差上限（与 auth.verify_signed_request 默认值一致）。
+_SIGNATURE_MAX_SKEW_SECONDS = 30
+
+
+def _utc_now() -> datetime:
+    return datetime.now(UTC).replace(tzinfo=None)
+
+
 def _auth_error() -> HTTPException:
     return HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="pi_gateway_auth_failed")
 
@@ -45,6 +54,7 @@ async def _authenticate(request: Request, body: bytes, db: AsyncSession) -> str:
     secret = settings.pi_gateway_internal_secret.get_secret_value()
     if not secret or not settings.pi_gateway_allowed_ids:
         raise _auth_error()
+    now = _utc_now()
     try:
         verified = verify_signed_request(
             request.headers,
@@ -54,18 +64,23 @@ async def _authenticate(request: Request, body: bytes, db: AsyncSession) -> str:
             secret=secret,
             allowed_gateway_ids=set(settings.pi_gateway_allowed_ids),
             nonce_store=None,
+            # naive UTC -> epoch：先补回 tzinfo 再取 timestamp，避免按本地时区解释。
+            now=int(now.replace(tzinfo=UTC).timestamp()),
         )
     except PiGatewayAuthError as exc:
         # Do not expose the distinction between unknown gateway, bad HMAC and replay.
         raise _auth_error() from exc
-    now = datetime.now(UTC).replace(tzinfo=None)
     await db.execute(delete(PiGatewayRequestNonce).where(PiGatewayRequestNonce.expires_at <= now))
+    # The barrier row must outlive the *entire* signature acceptance window,
+    # which is derived from the signed timestamp (client clock may be fast),
+    # not from the server receive time.  +1s covers the inclusive skew edge.
+    signed_at = datetime.fromtimestamp(verified.timestamp, UTC).replace(tzinfo=None)
     db.add(
         PiGatewayRequestNonce(
             id=str(uuid4()),
             gateway_id=verified.gateway_id,
             nonce=verified.nonce,
-            expires_at=now + timedelta(seconds=30),
+            expires_at=signed_at + timedelta(seconds=_SIGNATURE_MAX_SKEW_SECONDS + 1),
             created_at=now,
         )
     )
@@ -296,6 +311,15 @@ async def terminal(
     except PiGatewayLeaseError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="pi_gateway_run_not_found") from exc
     outcome = RunStatus(payload.outcome)
+    if outcome in (RunStatus.COMPLETED, RunStatus.COMPLETED_WITH_WARNINGS):
+        # A success terminal without a durable assistant completion is a
+        # projector/worker defect: reject it; the Gateway's safe-close rule
+        # then reports the Run as failed instead of completing without output.
+        if not await _service(db, _gateway_id).has_assistant_completion(run):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="pi_gateway_terminal_missing_completion",
+            )
     stream = AgentEventStream(db, request.app.state.agent_event_broker)
 
     async def cleanup_before_commit(locked_run) -> None:

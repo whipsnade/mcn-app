@@ -16,10 +16,10 @@
 - 恢复核对（reconcile）同样走独立事务并即时提交；取回的 payload 必须重新过
   输出 Schema 校验才能写 Evidence（与 execute 路径一致，§5.3）。
 
-:class:`AgentMcpAccounting` 与 legacy ``McpAccounting`` 解耦：共用
-``WalletService`` 的 reserve/settle/release，但挂靠 ``agent_tool_calls``，
-完全不依赖 ``analysis_tasks``。幂等键固定为
-``agent-mcp:{logical_call_id}:{reserve|settle|release}``。
+:class:`AgentMcpAccounting` 与 legacy ``McpAccounting`` 解耦：B4 起统一写入
+``TenantAccountingService`` 的租户账本（新旧 Runtime 共享同一事实源），挂靠
+``agent_tool_calls``，完全不依赖 ``analysis_tasks``；TenantWallet 缺失一律
+fail-closed，绝不回退写旧用户钱包。
 """
 
 from __future__ import annotations
@@ -53,8 +53,12 @@ from app.agent_runtime.tools.contracts import (
     arguments_hash,
     logical_call_id_for,
 )
-from app.billing.service import InsufficientPointsError, WalletService
-from app.pi_gateway.accounting import McpPreflightContext, TenantAccountingService
+from app.billing.service import InsufficientPointsError
+from app.pi_gateway.accounting import (
+    McpPreflightContext,
+    TenantAccountingError,
+    TenantAccountingService,
+)
 from app.billing.models import TenantWallet, TenantWalletTransaction
 from app.db.session import SessionFactory
 from app.mcp_gateway.contracts import DataTapService
@@ -157,20 +161,18 @@ class AgentMcpAccounting:
 
     def __init__(self, db_session: AsyncSession) -> None:
         self._db = db_session
-        self._wallets = WalletService(db_session)
 
-    async def _tenant_context(self, user_id: str, call: AgentToolCall) -> McpPreflightContext | None:
+    async def _tenant_context(self, user_id: str, call: AgentToolCall) -> McpPreflightContext:
         run = await self._db.get(AgentRun, call.run_id)
         if run is None or run.user_id != user_id or not run.tenant_id:
-            return None
-        # Historical unit fixtures may predate 0040 and contain only the
-        # legacy Wallet row.  Keep that path read-compatible; migrated/new
-        # tenants always have a TenantWallet and use the unified ledger.
+            raise TenantAccountingError("mcp_run_context_invalid")
+        # B4 之后租户钱包是新旧 Runtime 的唯一事实源：TenantWallet 缺失是
+        # 置备/迁移故障，必须 fail-closed，绝不回退写旧用户钱包（split-brain）。
         tenant_wallet_exists = await self._db.scalar(
             select(TenantWallet.tenant_id).where(TenantWallet.tenant_id == run.tenant_id)
         )
         if tenant_wallet_exists is None:
-            return None
+            raise TenantAccountingError("tenant_wallet_missing")
         return McpPreflightContext(
             tenant_id=run.tenant_id,
             user_id=user_id,
@@ -180,46 +182,27 @@ class AgentMcpAccounting:
             service_slug=call.service,
             arguments=dict(call.arguments_json or {}),
             feature=_feature_for_profile(run.profile_name),
+            dispatch_count=call.dispatch_count or 1,
         )
 
     async def _tenant_permit_id(self, call: AgentToolCall) -> str:
+        # 当前 dispatch 的预留由确定性幂等键定位：同秒 created_at 下按时间
+        # 排序可能选中上一次已释放的预留（DNR 重试窗口）。
         permit_id = await self._db.scalar(
-            select(TenantWalletTransaction.id)
-            .where(
-                TenantWalletTransaction.tool_call_id == call.id,
-                TenantWalletTransaction.kind == "reserve",
+            select(TenantWalletTransaction.id).where(
+                TenantWalletTransaction.idempotency_key
+                == TenantAccountingService.reserve_idempotency_key(
+                    call.id, call.dispatch_count or 1
+                )
             )
-            .order_by(TenantWalletTransaction.created_at.desc())
-            .limit(1)
         )
         if permit_id is None:
             raise ValueError("tenant_mcp_permit_not_found")
         return permit_id
 
-    @staticmethod
-    def _key(call: AgentToolCall, op: str) -> str:
-        """账务幂等键：按 dispatch attempt 区分（Gate B P0）。
-
-        第一次派发（dispatch_count=1）保留旧键兼容既有账本；
-        第二次及以后按 dispatch:{dispatch_count} 区分，保证每次真实预留/结算。
-        """
-        if call.dispatch_count is None or call.dispatch_count <= 1:
-            return f"agent-mcp:{call.logical_call_id}:{op}"
-        return f"agent-mcp:{call.logical_call_id}:dispatch:{call.dispatch_count}:{op}"
-
     async def reserve(self, user_id: str, call: AgentToolCall) -> None:
         context = await self._tenant_context(user_id, call)
-        if context is None:
-            await self._wallets.reserve(
-                user_id,
-                self.MCP_COST,
-                self._key(call, "reserve"),
-                call.id,
-                reference_type="agent_tool_call",
-                tenant_source=False,
-            )
-        else:
-            await TenantAccountingService(self._db).reserve_mcp_call(context)
+        await TenantAccountingService(self._db).reserve_mcp_call(context)
         call.points_reserved = self.MCP_COST
         call.status = "reserved"
         await self._db.flush()
@@ -231,27 +214,16 @@ class AgentMcpAccounting:
 
     async def mark_unknown(self, user_id: str, call: AgentToolCall) -> None:
         """Append the tenant-ledger audit while retaining the reservation."""
-        context = await self._tenant_context(user_id, call)
-        if context is not None:
-            await TenantAccountingService(self._db).fail_mcp_call(
-                await self._tenant_permit_id(call), RESULT_UNKNOWN
-            )
+        await self._tenant_context(user_id, call)  # 归属/租户钱包 fail-closed 门禁
+        await TenantAccountingService(self._db).fail_mcp_call(
+            await self._tenant_permit_id(call), RESULT_UNKNOWN
+        )
 
     async def settle(self, user_id: str, call: AgentToolCall) -> None:
-        context = await self._tenant_context(user_id, call)
-        if context is None:
-            await self._wallets.settle(
-                user_id,
-                self.MCP_COST,
-                self._key(call, "settle"),
-                call.id,
-                reference_type="agent_tool_call",
-                tenant_source=False,
-            )
-        else:
-            await TenantAccountingService(self._db).settle_mcp_call(
-                await self._tenant_permit_id(call), {"mode": "mcpResult"}
-            )
+        await self._tenant_context(user_id, call)  # 归属/租户钱包 fail-closed 门禁
+        await TenantAccountingService(self._db).settle_mcp_call(
+            await self._tenant_permit_id(call), {"mode": "mcpResult"}
+        )
         call.points_settled = self.MCP_COST
         call.points_reserved = 0
         call.status = "settled"
@@ -266,23 +238,13 @@ class AgentMcpAccounting:
         error_type: str | None,
         message: str | None,
     ) -> None:
-        context = await self._tenant_context(user_id, call)
-        if context is None:
-            await self._wallets.release(
-                user_id,
-                self.MCP_COST,
-                self._key(call, "release"),
-                call.id,
-                reference_type="agent_tool_call",
-                tenant_source=False,
-            )
-        else:
-            classification = (
-                "definitely_not_sent" if error_type == DEFINITELY_NOT_SENT else "failed_confirmed"
-            )
-            await TenantAccountingService(self._db).fail_mcp_call(
-                await self._tenant_permit_id(call), classification
-            )
+        await self._tenant_context(user_id, call)  # 归属/租户钱包 fail-closed 门禁
+        classification = (
+            "definitely_not_sent" if error_type == DEFINITELY_NOT_SENT else "failed_confirmed"
+        )
+        await TenantAccountingService(self._db).fail_mcp_call(
+            await self._tenant_permit_id(call), classification
+        )
         call.points_reserved = 0
         call.points_settled = 0
         call.status = "failed"
@@ -396,6 +358,14 @@ class DurableToolCallCoordinator:
                 return ToolResult(
                     status="failed",
                     safe_summary="insufficient points for MCP call",
+                    error_type=DEFINITELY_NOT_SENT,
+                )
+            except TenantAccountingError as exc:
+                # License/额度/租户账本门禁：外发前阻断，整体回滚，0 dispatch。
+                await db.rollback()
+                return ToolResult(
+                    status="failed",
+                    safe_summary=f"mcp call blocked before dispatch: {exc.code}",
                     error_type=DEFINITELY_NOT_SENT,
                 )
             except IntegrityError:

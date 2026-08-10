@@ -277,7 +277,7 @@ async def test_session_analyst_still_sees_all_approved_mcp_tools(db_session) -> 
 async def test_main_engine_factory_assembles_full_registry(db_session) -> None:
     from app.main import create_agent_runtime
 
-    _executor, _recovery, _broker, engine_factory, _utility = create_agent_runtime()
+    _executor, _recovery, _broker, engine_factory, _utility, _pi_recovery = create_agent_runtime()
     engine = engine_factory(
         db_session, "test-worker", channel_permissions=frozenset({"bilibili"})
     )

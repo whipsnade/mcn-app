@@ -22,6 +22,7 @@ from app.db.session import SessionFactory
 from app.mcp_gateway.contracts import DataTapService
 from app.model.dependencies import get_model_adapter
 from app.mcp_gateway.service import get_agent_mcp_transport, refresh_approved_datatap_tools
+from app.pi_gateway.service import PiGatewayRecoveryService
 
 # 新 Agent 运行时默认租约时长 / 恢复扫描间隔（Task 15）。
 AGENT_LEASE_SECONDS = 300
@@ -54,7 +55,12 @@ def _make_recovery_tool(db, call, *, breaker, transport) -> AgentMcpTool | None:
 
 
 def create_agent_runtime(*, stuck_seconds: float | None = None) -> tuple[
-    AgentRunExecutor, RecoveryLoop, AgentEventBroker, Callable[..., AgentEngine], UtilityDispatcher
+    AgentRunExecutor,
+    RecoveryLoop,
+    AgentEventBroker,
+    Callable[..., AgentEngine],
+    UtilityDispatcher,
+    RecoveryLoop,
 ]:
     """构建进程级 Agent 执行器 + 恢复循环（共享一个事件 broker）。
 
@@ -142,7 +148,45 @@ def create_agent_runtime(*, stuck_seconds: float | None = None) -> tuple[
             else get_settings().agent_tool_call_stuck_seconds
         ),
     )
-    return executor, recovery, broker, engine_factory, utility_dispatcher
+
+    # Pi 恢复循环与 current 严格分离：只扫描 runtime_backend=pi 的过期
+    # Gateway lease，经 PiGatewayRecoveryService 一次回队列/二次失败收口；
+    # current executor 永远不会领取 Pi Run。
+    async def _pi_recover(run_id: str) -> str:
+        async with SessionFactory() as db:
+            return await PiGatewayRecoveryService(
+                db,
+                broker=broker,
+                lease_seconds=get_settings().pi_gateway_lease_seconds,
+            ).recover_expired_run(run_id)
+
+    async def _pi_cancel(run_id: str) -> bool:
+        async with SessionFactory() as db:
+            return await PiGatewayRecoveryService(
+                db,
+                broker=broker,
+                lease_seconds=get_settings().pi_gateway_lease_seconds,
+            ).cancel_expired_run(run_id)
+
+    pi_recovery = RecoveryLoop(
+        executor=executor,
+        session_factory=SessionFactory,
+        tool_factory=lambda db, call: _make_recovery_tool(
+            db, call, breaker=breaker, transport=agent_transport
+        ),
+        worker_id=f"pi-recovery-{os.getpid()}",
+        lease_seconds=AGENT_LEASE_SECONDS,
+        interval_seconds=RECOVERY_INTERVAL_SECONDS,
+        runtime_backend="pi",
+        pi_recovery=_pi_recover,
+        pi_cancel=_pi_cancel,
+        stuck_seconds=(
+            stuck_seconds
+            if stuck_seconds is not None
+            else get_settings().agent_tool_call_stuck_seconds
+        ),
+    )
+    return executor, recovery, broker, engine_factory, utility_dispatcher, pi_recovery
 
 
 def create_app() -> FastAPI:
@@ -153,6 +197,7 @@ def create_app() -> FastAPI:
         agent_broker,
         agent_engine_factory,
         agent_utility_dispatcher,
+        agent_pi_recovery,
     ) = create_agent_runtime()
 
     @asynccontextmanager
@@ -162,16 +207,19 @@ def create_app() -> FastAPI:
         Path(settings.agent_upload_storage_dir).mkdir(parents=True, exist_ok=True)
         app.state.agent_executor = agent_executor
         app.state.agent_recovery = agent_recovery
+        app.state.agent_pi_recovery = agent_pi_recovery
         app.state.agent_event_broker = agent_broker
         app.state.agent_engine_factory = agent_engine_factory
         app.state.agent_utility_dispatcher = agent_utility_dispatcher
         app.state.agent_tool_reconciler = get_agent_mcp_transport().reconcile_tool_call
         agent_executor.start()
         agent_recovery.start()
+        agent_pi_recovery.start()
         agent_utility_dispatcher.start()
         try:
             yield
         finally:
+            await agent_pi_recovery.stop()
             await agent_recovery.stop()
             await agent_executor.stop()
             # 最后停 utility：executor 优雅停机期间收口的 Run 仍能触发，
@@ -183,6 +231,7 @@ def create_app() -> FastAPI:
     # same agent runtime available while production startup still performs recovery.
     app.state.agent_executor = agent_executor
     app.state.agent_recovery = agent_recovery
+    app.state.agent_pi_recovery = agent_pi_recovery
     app.state.agent_event_broker = agent_broker
     app.state.agent_engine_factory = agent_engine_factory
     # 未 start 的 dispatcher schedule 安全空转：窄路由测试不会泄露真实模型调用。

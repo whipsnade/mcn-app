@@ -79,6 +79,8 @@ async def test_terminal_settles_with_gateway_worker_and_releases_session_slot(mo
         "_service",
         lambda *_args, **_kwargs: SimpleNamespace(
             leased_run=leased_run,
+            # 本用例聚焦槽位/租约清理；完成门禁由 test_terminal_gate.py 专项覆盖。
+            has_assistant_completion=lambda *_args, **_kwargs: _true(),
             scheduler=SimpleNamespace(release_run=lambda *_args, **_kwargs: _noop()),
             now_fn=lambda: object(),
         ),
@@ -111,3 +113,7 @@ async def test_terminal_settles_with_gateway_worker_and_releases_session_slot(mo
 
 async def _noop() -> None:
     return None
+
+
+async def _true() -> bool:
+    return True

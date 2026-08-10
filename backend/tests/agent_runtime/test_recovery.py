@@ -49,14 +49,22 @@ from app.agent_runtime.schemas import Complete
 from app.agent_runtime.state import RunStatus
 from app.agent_runtime.tools.mcp import MCP_POINTS_COST, AgentMcpTool, logical_call_id_for
 from app.agent_runtime.tools.registry import ToolRegistry
-from app.billing.models import Wallet
+from app.billing.models import (
+    TenantUserQuotaPolicy,
+    TenantUserQuotaUsage,
+    TenantWallet,
+    TenantWalletTransaction,
+    Wallet,
+)
 from app.billing.service import WalletService
 from app.db.session import SessionFactory
 from app.identity.models import User
 from app.mcp_gateway.contracts import DataTapService
 from app.mcp_gateway.transport import RemoteToolResult
 from app.mcp_gateway.validation import canonical_json_bytes
+from app.licensing.models import TenantLicense
 from app.pi_gateway.accounting import McpPreflightContext, TenantAccountingService
+from app.tenancy.models import Tenant, TenantMembership
 
 INPUT_SCHEMA = {
     "type": "object",
@@ -482,9 +490,44 @@ async def _setup_call_committed(
         )
         db.add(user)
         await db.flush()
-        db.add(Wallet(user_id=user.id, balance=1000, reserved=0, version=0, updated_at=now))
+        tenant = Tenant(
+            id=str(uuid4()), slug=f"recovery-{uuid4().hex[:20]}", name="恢复测试租户",
+            status="active", is_internal=False, runtime_backend="current",
+            license_status="active", active_license_id=None,
+            created_at=now, updated_at=now,
+        )
+        db.add(tenant)
+        await db.flush()
+        license_row = TenantLicense(
+            id=str(uuid4()), tenant_id=tenant.id, version=1,
+            valid_from=now.replace(microsecond=0), valid_until=None,
+            features_json={
+                "kol_selection": True,
+                "brand_analysis": True,
+                "campaign_analysis": True,
+                "kol_detail": True,
+                "utility": True,
+            },
+            max_concurrent_runs=10, max_user_concurrent_runs=5,
+            created_by=user.id, created_at=now,
+        )
+        db.add(license_row)
+        await db.flush()
+        tenant.active_license_id = license_row.id
+        db.add(
+            TenantMembership(
+                id=str(uuid4()), tenant_id=tenant.id, user_id=user.id,
+                role="owner", status="active", created_at=now, updated_at=now,
+            )
+        )
+        db.add(
+            TenantWallet(
+                tenant_id=tenant.id, balance=1000, reserved=0, version=0, updated_at=now,
+            )
+        )
         session = AgentSession(
-            id=str(uuid4()), user_id=user.id, title="恢复提交会话", status="active",
+            id=str(uuid4()), user_id=user.id, tenant_id=tenant.id,
+            title="恢复提交会话", status="active",
             created_at=now, updated_at=now,
         )
         db.add(session)
@@ -493,6 +536,7 @@ async def _setup_call_committed(
         await db.flush()
         run = AgentRun(
             id=str(uuid4()), session_id=session.id, user_id=user.id,
+            tenant_id=tenant.id,
             run_kind="user", visibility="user",
             profile_name="session_analyst_v1", profile_version="v1", model="test-model",
             status="running", decision_count=0, review_count=0, revision_count=0,
@@ -530,14 +574,21 @@ async def _setup_call_committed(
         )
         db.add(call)
         await db.flush()
-        await WalletService(db).reserve(
-            user.id, MCP_POINTS_COST, f"agent-mcp:{logical_id}:reserve", call.id,
-            reference_type="agent_tool_call",
-            tenant_source=False,
+        await TenantAccountingService(db).reserve_mcp_call(
+            McpPreflightContext(
+                tenant_id=tenant.id,
+                user_id=user.id,
+                run_id=run.id,
+                tool_call_id=call.id,
+                internal_tool_name=INTERNAL_NAME,
+                service_slug=DataTapService.INSIGHT_CUBE.value,
+                arguments={"keyword": "美妆"},
+                feature="kol_selection",
+            )
         )
         await db.flush()
-        user_id, call_id = user.id, call.id
-    return user_id, call_id, logical_id
+        user_id, call_id, tid = user.id, call.id, tenant.id
+    return user_id, call_id, logical_id, tid
 
 
 async def _setup_unknown_call_committed(*, upstream_request_id: str = "req-1"):
@@ -565,8 +616,28 @@ async def _cleanup_committed_user(user_id: str, call_id: str) -> None:
             await db.delete(call)
         # 其余（run/attempt/step/session/wallet/流水）由 users 的级联删除收尾。
         user = await db.get(User, user_id)
+        membership = await db.scalar(
+            select(TenantMembership).where(TenantMembership.user_id == user_id)
+        )
+        tenant_id = membership.tenant_id if membership is not None else None
         if user is not None:
             await db.delete(user)
+        if tenant_id is not None:
+            for model in (
+                TenantUserQuotaUsage,
+                TenantUserQuotaPolicy,
+                TenantWalletTransaction,
+                TenantWallet,
+                TenantMembership,
+                TenantLicense,
+            ):
+                for row in (
+                    await db.scalars(select(model).where(model.tenant_id == tenant_id))
+                ).all():
+                    await db.delete(row)
+            tenant_row = await db.get(Tenant, tenant_id)
+            if tenant_row is not None:
+                await db.delete(tenant_row)
         await db.commit()
 
 
@@ -578,7 +649,7 @@ async def test_reconcile_writes_committed_visible_from_fresh_session(
     transport.reconciled["req-1"] = RemoteToolResult(
         structured_content={"result": "ok"}, is_error=False, upstream_request_id="req-1"
     )
-    user_id, call_id, logical_id = await _setup_unknown_call_committed(upstream_request_id="req-1")
+    user_id, call_id, logical_id, tenant_id = await _setup_unknown_call_committed(upstream_request_id="req-1")
     try:
         executor = await _make_executor(db_session)
         recovery = RecoveryLoop(
@@ -610,9 +681,11 @@ async def test_reconcile_writes_committed_visible_from_fresh_session(
             )
             assert recon is not None
             assert recon.decision == "confirm_success"
-            wallet = await db.get(Wallet, user_id)
+            wallet = await db.get(TenantWallet, tenant_id)
             assert wallet is not None
             assert (wallet.balance, wallet.reserved) == (990, 0)
+            # 旧用户钱包/流水保持零写入：租户账本是唯一事实源。
+            assert await db.get(Wallet, user_id) is None
     finally:
         # 独立事务提交的数据会跨测试残留，必须清理避免污染后续用例。
         await _cleanup_committed_user(user_id, call_id)
@@ -912,7 +985,7 @@ async def test_stuck_running_call_recovers_via_committed_sessions(
     transport.reconciled["req-stuck"] = RemoteToolResult(
         structured_content={"result": "ok"}, is_error=False, upstream_request_id="req-stuck"
     )
-    user_id, call_id, logical_id = await _setup_call_committed(
+    user_id, call_id, logical_id, tenant_id = await _setup_call_committed(
         status="running",
         upstream_request_id="req-stuck",
         started_at=utc_now() - timedelta(hours=1),
@@ -945,8 +1018,10 @@ async def test_stuck_running_call_recovers_via_committed_sessions(
                 select(EvidenceItem).where(EvidenceItem.tool_call_id == call_id)
             )
             assert evidence is not None
-            wallet = await db.get(Wallet, user_id)
+            wallet = await db.get(TenantWallet, tenant_id)
+            assert wallet is not None
             assert (wallet.balance, wallet.reserved) == (990, 0)
+            assert await db.get(Wallet, user_id) is None
     finally:
         await _cleanup_committed_user(user_id, call_id)
 

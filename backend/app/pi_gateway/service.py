@@ -487,6 +487,27 @@ class PiGatewayService:
             )
         )
 
+    async def has_assistant_completion(self, run: AgentRun) -> bool:
+        """True once the Run has a persisted assistant completion.
+
+        A ``completed``/``completed_with_warnings`` terminal is only legal
+        after the merged assistant message (or its ``message.completed``
+        event) is durable; usage or tool events never satisfy this gate.
+        """
+        message_id = await self.db.scalar(
+            select(AgentMessage.id)
+            .where(AgentMessage.run_id == run.id, AgentMessage.role == "assistant")
+            .limit(1)
+        )
+        if message_id is not None:
+            return True
+        event_id = await self.db.scalar(
+            select(AgentEvent.id)
+            .where(AgentEvent.run_id == run.id, AgentEvent.event_type == "message.completed")
+            .limit(1)
+        )
+        return event_id is not None
+
     async def preflight_mcp(
         self,
         run: AgentRun,
