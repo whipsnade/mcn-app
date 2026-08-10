@@ -978,3 +978,40 @@ git status --short
 
 计划没有把 B0 synthetic PASS 误写为真实 Gate A PASS，没有修改历史 round，也没有为完成本地开发而
 放宽外部调用、钱包、密钥、租户隔离或 Artifact lineage 边界。
+
+---
+
+## 5. 修复期偏差记录（2026-08-10，架构审核否决后）
+
+本节只记录实际偏差，不改写上方历史设计。
+
+- 2026-08-09 写入的 `READY_FOR_REAL_B7_UAT` 已被架构独立审核否决：当时的「本地 UAT」
+  （Task 12 Step 5 / Task 13 Step 3）实际是组件级 fixture，未启动真实 FastAPI/Gateway
+  进程，且审核发现生产组合链存在 Critical/Important 缺陷（HMAC 签名路径、无生产组合根、
+  Child 无内部工具/MCP durable accounting、Pi recovery 未接 lifespan、message.completed
+  与 terminal 顺序、legacy wallet 回退、License 复核、管理幂等、管理台、nonce 窗口、
+  0040 downgrade、UAT 弱化）。状态回退为 `REQUIRES_PLAN_B_REPAIR`。
+- 修复期提交（每 Repair 独立提交）：
+  1. `fix: make pi gateway control path executable`（HMAC 跨语言 + 生产组合根 + Minor 修复）
+  2. `fix: bridge isolated pi worker control plane`（父子 IPC RPC 桥 + 内部工具 + MCP accounting）
+  3. `fix: close pi runtime recovery and accounting gaps`（recovery lifespan、terminal 门禁、
+     TenantWallet fail-closed、License 复核、nonce 窗口）
+  4. `fix: enforce idempotent admin and safe billing rollback`（管理幂等 + downgrade guard）
+  5. `feat: complete pi gateway administration console`（B6 管理台六模块）
+  6. `test: restore full offline pi gateway topology gate`（进程级 UAT 恢复，见下）
+  7. `docs: correct plan b readiness after repair`（本文档与 QA/runbook 纠偏）
+- Task 12 Step 5 与 Task 13 Step 3 的验收口径恢复为 f3186be 的原始目标：真实启动
+  fake model、fake MCP（Streamable HTTP）、FastAPI 子进程与生产 Pi Gateway 可执行文件，
+  真实经过 Pi SDK、HTTP HMAC、scheduler、MCP preflight、Builder、Publication、
+  Artifact Version、Excel、BI 与 SSE，并对正式产物执行 B0 Gate 与 Version 绑定检查。
+  落地为 `backend/tests/integration/test_pi_gateway_offline_uat.py` 的 16 个进程级场景
+  （见 `docs/qa/pi-agent-gateway-local-uat.md` 2026-08-10 版）；被弱化的
+  `test_pi_gateway_local_uat.py`（纯函数断言）已删除。
+- 进程级拓扑暴露并已修复的附加缺陷（超出审核清单、由真实链路驱动发现）：
+  `turn.start` 事件别名三份白名单漂移导致事件流断流与双重执行；heartbeat 单次失败即丢
+  租约（改为连续 3 次才丢失）；abort 仅 SIGTERM 杀不掉优雅停机卡住的子进程（增加 SIGKILL
+  升级）；`get_session_context` 多列查询误用 `scalars()`；worker 进程退出依赖事件循环
+  排空（改显式退出）。
+- 当前状态：`READY_FOR_REAL_B7_UAT_REVIEW`。不写成 B7 PASS / production ready；
+  是否恢复 `READY_FOR_REAL_B7_UAT` 由架构审核会话独立复审决定。真实 B7 UAT、生产切流、
+  方案 C 仍未授权。

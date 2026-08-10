@@ -113,6 +113,9 @@ active 版本转 retired，不修改已创建 Run 的 snapshot。
   到日志。恢复失败时停新 Run，保留原 Config 和审计记录，修复 key store 后再重试。
 - **Gateway 离线/网络失败**：控制面错误归类为 `control_plane_unreachable`，worker 使用有界事件缓存；
   超限 abort 并交给恢复，不伪造业务 failed。查看 Gateway diagnostics 时只看稳定 error code。
+- **Heartbeat 失败语义**：单次 heartbeat 网络抖动/超时不丢租约；连续 3 次失败才按 lease 丢失
+  处理并把 Run 交给恢复。Worker abort 是 SIGTERM 加 5 秒 SIGKILL 升级——优雅停机卡住的子进程
+  也必须真正退出，否则旧 Attempt 会经 IPC 桥继续执行工具调用（双重执行）。
 - **SSE**：用户事件从 AgentEvent/SSE 续传；usage 仅进入 RuntimeUsageRecord，不进入用户 SSE 或 prompt。
 
 ## 禁止事项与真实 UAT 停止门
@@ -121,6 +124,8 @@ active 版本转 retired，不修改已创建 Run 的 snapshot。
 commit、迁移 head、依赖版本、Run/Attempt/lease、账务和停止条件。任一 secret 泄露、跨租户数据、重复
 MCP/积分、unknown 重放、终态不一致或外部服务超时未分类，都立即停止并保留证据。
 
-本地 Task 12 只使用 fake-friendly 组件/测试库，不等于真实 UAT 通过。当前 Runtime 至少保留一个稳定
+本地 Task 12 使用 `backend/tests/integration/test_pi_gateway_offline_uat.py` 的离线进程级
+fake topology（测试 MySQL + FastAPI 子进程 + 生产 Gateway 可执行文件 + fake 模型 + fake
+DataTap MCP，0 外部网络），不等于真实 UAT 通过。当前 Runtime 至少保留一个稳定
 发布周期；周期结束前不得删除旧表、旧 Review 数据或历史快照，也不得执行历史 Pi RPC/POC 真实六场景
 Task 9、真实模型/DataTap、真实钱包/积分调用或生产切流。

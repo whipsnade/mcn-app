@@ -1,47 +1,95 @@
 # Pi Agent Gateway 本地 UAT 记录
 
-日期：2026-08-09
-范围：方案 B Task 12 本地部分与 Task 13 离线验证
-状态：`READY_FOR_REAL_B7_UAT`
+日期：2026-08-10（替代 2026-08-09 版）
+范围：方案 B Task 12 本地部分与 Task 13 离线验证（修复期重估）
+状态：`READY_FOR_REAL_B7_UAT_REVIEW`（等待架构审核独立复审；此前 2026-08-09 写入的
+`READY_FOR_REAL_B7_UAT` 已被架构审核否决，本记录不重写该事实）
 
 ## 边界
 
-本记录只覆盖本地 fake topology、事务测试库、FastAPI 代码和 fake-friendly Pi Gateway。未启动历史
-Pi RPC/POC 真实六场景 Task 9，未调用真实模型、DataTap、钱包、积分，未执行真实 B7 UAT、生产切流或方案 C。
+本记录只覆盖离线 fake topology：测试 MySQL（`kol_insight_test`）、FastAPI 真实子进程、
+生产 Pi Gateway 可执行文件（`node dist/main.js`）、进程内 fake OpenAI 兼容模型、进程内
+fake DataTap MCP（真实 Streamable HTTP）。未启动历史 Pi RPC/POC 真实六场景 Task 9
+（round `20260808T060814Z` 永为 EVALUATED_FAIL），未调用真实模型、DataTap、钱包、积分，
+未执行真实 B7 UAT、生产切流或方案 C。全程 0 外部网络。
 
-## 两租户场景
+## 与 2026-08-09 版的差异（架构审核否决点 → 修复）
 
-- tenant-a 的声明 backend 为 `pi`，tenant-b 为 `current`；两者使用不同 attempt/source-event 身份。
-- kill switch 打开时只把新 Run 解析为 `current`；历史 snapshot 不被修改。
-- `effective_runtime_backend` 对未知 backend fail-closed；Pi rollout 需要 active License、兼容 tenant
-  config 和健康 Gateway capacity。
-- source event 的 `{attempt_id}:{sequence}` 身份跨租户不可混用，工具投影只保留安全字段。
+2026-08-09 版的「本地 UAT」是组件级 fixture（纯函数断言 + 事务测试），没有启动真实
+FastAPI/Gateway 进程，架构审核据此否决了 READY 结论。修复期以完整进程级拓扑重做，
+并修复了拓扑暴露的真实缺陷：
+
+- HMAC 签名路径：Node 曾对 `/claims` 签名而 FastAPI 验签路径是完整挂载路径
+  `/api/v1/internal/pi-gateway/v1/claims`；已统一为唯一 canonical signed path，
+  跨语言固定夹具（两侧测试互锁签名值）。
+- 生产组合根缺失：新增 `pi-gateway/src/{config,health,main}.ts` 与 `npm start`
+  （fail-closed 配置校验、claim/tick 有界 backoff、health/readiness/metrics、
+  SIGTERM/SIGINT draining）。
+- 隔离 Child 无内部工具/MCP 计费：父子 IPC RPC 桥（父持 HMAC secret 与 lease token，
+  不下发；preflight durable commit → adapter 外发 → finalize/fail；unknown 不重放）。
+- 事件流断流：`turn.start` 别名只进了 projector 没进 Gateway protocol 白名单与后端
+  contracts，sendEvent 同步抛错被当作控制面不可用，事件流中断、租约过期导致
+  双重执行；三份白名单（projector/protocol.ts/contracts.py + events.py 别名与字段
+  白名单）已同步并加防漂移测试。
+- Heartbeat 单次失败即丢租约：改为连续 3 次失败才按 lease 丢失处理；abort 增加
+  SIGTERM→SIGKILL 升级，孤儿子进程不能再经 IPC 桥继续执行（双重执行根因之一）。
+- `get_session_context` 多列查询误用 `scalars()` 取 Row（有版本产物时 500）。
+- message.completed 与 terminal 顺序：projector 多事件输出（completion 先于 usage），
+  后端 terminal 完成门禁（缺 assistant completion 拒绝，gateway 安全收口）。
+
+## 进程级拓扑场景（`backend/tests/integration/test_pi_gateway_offline_uat.py`，16 个）
+
+- 品牌全链路：HMAC/claim/lease/heartbeat → secret envelope AAD 解密 → Child 隔离 →
+  内部工具经 IPC 桥 → 4 次 MCP durable preflight 全部 settled（租户账本恰好 -40，
+  reserved=0）→ Builder → Publication → 不可变 Artifact Version（brand_report_v3，
+  `overview.total_volume=320` 来自真实 fake DataTap 数据）→ Excel 导出与 BI 详情绑定
+  同一 Version → `validate_structured_claims` 零 issue（B0 发布门禁对正式产物复核）→
+  `message.completed` 先于唯一 `run.completed`。
+- 澄清（request_clarification）：0 Artifact、0 MCP 外发。
+- 非营销拒答：0 工具调用、0 MCP 外发、0 Artifact。
+- 余额不足（<10 积分）：0 真实外发、钱包不变、无任何 reserve/settle/release 流水。
+- Session 互斥：并发第二条消息 409 `active_run_in_progress`。
+- 跨租户隔离：B 用户读 A 的 session/run/events 全部 404；DB 层互不可见。
+- nonce 重放/篡改：手工签名请求重放与 body 篡改均 401。
+- 钻取：read_artifact → build_insight_draft → publish 绑定精确父 Version，
+  0 DataTap 外发；insight Artifact/Version 的 parent 关联落库正确。
+- License 中途暂停：第一次 MCP settled 后暂停 License，第二次 preflight 被拒，
+  0 新增外发、0 新增流水。
+- 取消：hang 中的 Run 经 `POST /runs/{id}/cancel` 收口 cancelled，终态事件唯一不翻转。
+- Worker 崩溃恢复：SIGKILL 子进程 → 恢复恰好创建一次新 Attempt 并重放 → 再次
+  SIGKILL → 终态 failed，恰好 2 个 Attempt，无第三次重试。
+- 公平调度/容量：两租户 brand Run 在 capacity=2 下并发执行（Attempt 窗口重叠），
+  各自账务独立。
+- Draining：置 draining 后新 Run 保持 queued 不被派发，在途 Run 正常完成，恢复
+  active 后 queued Run 被 claim 并完成。
+- current→pi→current 与 kill switch：三路径轮流执行；kill switch 的真实语义是
+  新 Run 建单阶段即改道 current（`effective_runtime_backend`），只影响新 Run；
+  旧 Run 的 `runtime_config_snapshot_json` 逐字节不变。
+- SSE：事件序号单调递增、`message.completed` 先于终态；`Last-Event-ID` 重连续传
+  无洞无重复。
+- Snapshot 不变：激活新 config 版本后，旧 Run 快照与版本指针不变。
 
 ## 自动化证据
 
-Task 12 定向：
+- `backend/tests/integration/test_pi_gateway_offline_uat.py`：16 个进程级场景全绿。
+- 被弱化的 `backend/tests/integration/test_pi_gateway_local_uat.py`（纯函数断言，
+  不能称为本地端到端）已删除，由上述进程级拓扑文件替代。
+- 恢复间隔与 lease 时长在 harness 中经 `AGENT_RECOVERY_INTERVAL_SECONDS=1` /
+  `PI_GATEWAY_LEASE_SECONDS=5` 加速；均为既有 Settings/env，非测试旁路。
 
-```text
-backend/tests/pi_gateway/test_runtime_rollout.py
-backend/tests/integration/test_pi_gateway_local_uat.py
-backend/tests/admin/test_gateway_admin.py
-9 passed
-```
+## 已知限制与 flake 记录
 
-TenantAdmin backend 切换 red/green 测试加入前端套件；前端全套 **233 passed（31 files）**。
-后端全套 **1949 passed、22 skipped**；修改 Python 文件及 `ruff check app tests` 全部通过。
-Pi Gateway **56 passed（17 files）**，typecheck/build 通过；Pi Runtime **47 passed（9 files）**，
-typecheck 通过；根目录 lint/build 通过（仅既有 chunk size warning）。
-
-本地**组件级** fake topology 由后端事务测试、Pi Gateway fake control plane/worker 测试和前端 fake API
-共同驱动；没有启动 FastAPI/Gateway 真实进程、外部 provider，也没有创建真实 round。最终全量复跑产生的 3 个 xlsx 仅作为测试产物移到
-`/private/tmp/b0-task13-final-artifacts-r2-XHOL1Q`，未进入工作树；此前首轮 6 个产物也已移出工作树。
-后端迁移 head 为 `0041_runtime_usage_constraints`；Pi Gateway 依赖锁定在
-`@earendil-works/pi-coding-agent@0.79.10`、`@earendil-works/pi-ai@0.74.2`、
-`@earendil-works/pi-tui@0.74.2`、`pi-mcp-adapter@2.20.1`、`typebox@1.3.11`。
+- 共享测试库 + 固定 gateway_id（`gw-uat-1`）：被中断运行遗留的 uvicorn/gateway 进程
+  会窃取后续拓扑的 Run（current executor 对已死 fake 模型端口执行导致秒挂）。
+  出现过两次全文件回归失败（`test_session_mutex…`、`test_current_to_pi…`），
+  清场（杀掉遗留进程）后单跑与全文件回归均恢复全绿。并行会话不得同时跑本文件。
+- 模型/账务/产物数值全部来自 fake DataTap 固定数据（例如 320 声量），只证明拓扑
+  与一致性，不证明真实模型质量或 DataTap SLA。
 
 ## 判定与未授权范围
 
-本地结果只证明路由选择、灰度前置条件、事件身份和 UI 请求边界；不证明真实模型质量、DataTap SLA、
-生产网络、真实钱包扣账或 B7 发布。真实 B7 UAT 需另行授权并按运维手册保留 append-only 证据；在此
-之前不得把状态改写为 Gate A PASS、B7 PASS 或 production ready。
+本地结果只证明离线生产拓扑可运行、账务/产物/事件一致性成立；不证明真实模型质量、
+DataTap SLA、生产网络、真实钱包扣账或 B7 发布。真实 B7 UAT 需用户新的明确授权、
+独立测试租户、测试钱包、append-only 证据目录和停止条件；在此之前不得把状态改写为
+Gate A PASS、B7 PASS 或 production ready。最终是否恢复 `READY_FOR_REAL_B7_UAT`
+由架构审核会话独立复审决定。
