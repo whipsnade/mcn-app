@@ -4,9 +4,12 @@ import { fileURLToPath } from "node:url";
 import { createProductionPiSession } from "./pi-session.js";
 import { buildSecretEnv, clearSecretEnv } from "./secret-env.js";
 import type { McpAccountingControlPlane } from "./mcp-accounting-extension.js";
+import type { ControlPlaneTransport } from "./control-plane-client.js";
+import { WorkerRpcClient, WorkerRpcControlPlane } from "./ipc-rpc.js";
 import { PiSdkUsageProjector, projectPiSdkEvent } from "./event-projector.js";
 import type {
   ClaimedRun,
+  FakeScriptStep,
   PiGatewaySourceEvent,
   PiRunSession,
   PiSdkEvent,
@@ -17,6 +20,7 @@ import type {
 export interface WorkerOptions {
   sessionFactory?: PiSessionFactory;
   fakeProvider?: boolean;
+  fakeScript?: readonly FakeScriptStep[];
   parentEnv?: NodeJS.ProcessEnv;
   /** Projected, secret-free source events delivered to the Gateway buffer. */
   onEvent?: (event: PiGatewaySourceEvent) => void;
@@ -24,6 +28,7 @@ export interface WorkerOptions {
   onSdkEvent?: (event: PiSdkEvent) => void;
   onReady?: () => void;
   mcpAccounting?: McpAccountingControlPlane;
+  internalTools?: ControlPlaneTransport;
 }
 
 export interface IsolatedWorkerOptions {
@@ -151,7 +156,9 @@ export async function runSingleWorker(
       ? await options.sessionFactory.create(work, workerSecrets)
       : await createProductionPiSession(work, workerSecrets, {
         fakeProvider: options.fakeProvider,
+        fakeScript: options.fakeScript,
         mcpAccounting: options.mcpAccounting,
+        internalTools: options.internalTools,
       });
     workerSecrets = undefined;
     options.onReady?.();
@@ -207,22 +214,52 @@ function readChildSecretBundle(env: NodeJS.ProcessEnv): SecretBundle {
 
 if (process.env.PI_WORKER_CHILD === "1" && process.send) {
   let started = false;
+  // The child never receives the HMAC secret or Run lease; internal tools and
+  // MCP accounting are proxied to the parent over this bounded IPC RPC client.
+  const rpc = new WorkerRpcClient({
+    send: (message) => {
+      if (!process.connected || !process.send) throw new Error("worker_rpc_disconnected");
+      process.send(message);
+    },
+    onMessage: (listener) => {
+      process.on("message", listener);
+      return () => {
+        process.removeListener("message", listener);
+      };
+    },
+    onDisconnect: (listener) => {
+      process.once("disconnect", listener);
+      return () => {
+        process.removeListener("disconnect", listener);
+      };
+    },
+  });
   process.on("message", (message: WorkerMessage) => {
     if (started || !message || message.type !== "run") return;
     started = true;
+    const bridge = new WorkerRpcControlPlane(rpc);
     void runSingleWorker(message.work, readChildSecretBundle(process.env), {
       fakeProvider: message.work.runtimeSnapshot.model.api === "faux",
+      fakeScript: message.work.fakeScript,
+      mcpAccounting: bridge,
+      internalTools: bridge,
       onReady: () => process.send?.({ type: "ready", runId: message.work.runId }),
       onEvent: (event) => process.send?.({ type: "event", runId: message.work.runId, event }),
     })
-      .then(() => finishChildProcess({ type: "done", runId: message.work.runId }, 0))
-      .catch((error) => finishChildProcess(
-        {
-          type: "failed",
-          runId: message.work.runId,
-          errorCode: classifyWorkerError(error),
-        },
-        1,
-      ));
+      .then(() => {
+        rpc.dispose();
+        finishChildProcess({ type: "done", runId: message.work.runId }, 0);
+      })
+      .catch((error) => {
+        rpc.dispose();
+        finishChildProcess(
+          {
+            type: "failed",
+            runId: message.work.runId,
+            errorCode: classifyWorkerError(error),
+          },
+          1,
+        );
+      });
   });
 }

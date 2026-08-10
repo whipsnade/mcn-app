@@ -29,7 +29,12 @@ const secrets: SecretBundle = {
   modelBaseUrl: "http://127.0.0.1:1",
   modelApiKey: "fake-model-key",
   datatapToken: "fake-datatap-token",
-  datatapUrls: { insightCube: "http://127.0.0.1:2" },
+  datatapUrls: {
+    insightCube: "http://127.0.0.1:2",
+    socialGrow: "http://127.0.0.1:3",
+    socialGrowContent: "http://127.0.0.1:4",
+    aktools: "http://127.0.0.1:5",
+  },
 };
 
 describe("Pi SDK session factory", () => {

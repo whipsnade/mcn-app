@@ -6,6 +6,7 @@ import { PiGateway, type GatewayWorkerHandle } from "./gateway.js";
 import { startHealthServer, type GatewayMetricsSnapshot } from "./health.js";
 import type { GatewaySignalSource } from "./server.js";
 import { clearSecretBundle, decryptSecretEnvelope } from "./secret-env.js";
+import { attachWorkerRpcBridge, createWorkerRpcHandlers } from "./worker-bridge.js";
 import { spawnIsolatedWorker } from "./worker-entry.js";
 import type {
   AdapterCatalogEntry,
@@ -116,14 +117,23 @@ export function extractUserPrompt(transcript: readonly Record<string, unknown>[]
  */
 export function createProductionWorker(options: {
   gatewayId: string;
+  controlPlane: ControlPlaneClient;
   workerScript: string;
   workerExecArgv: readonly string[];
   spawn?: typeof spawnIsolatedWorker;
+  attachRpcBridge?: typeof attachWorkerRpcBridge;
 }): (claim: PiGatewayClaimResponse) => Promise<GatewayWorkerHandle> {
   const spawn = options.spawn ?? spawnIsolatedWorker;
+  const attachRpc = options.attachRpcBridge ?? attachWorkerRpcBridge;
   return async (claim) => {
     const runtimeSnapshot = mapClaimRuntimeSnapshot(claim.runtime_snapshot);
     const userPrompt = extractUserPrompt(claim.transcript);
+    const internalTools = claim.internal_tools.map((tool) => {
+      if (!tool || typeof tool.name !== "string" || tool.name.length === 0) {
+        throw new Error("pi_gateway_claim_tools_invalid");
+      }
+      return tool.name;
+    });
     const secrets = await decryptSecretEnvelope(claim.secret_envelope, claim.lease_token, {
       runId: claim.run_id,
       attemptId: claim.attempt_id,
@@ -137,11 +147,16 @@ export function createProductionWorker(options: {
         runtimeBackend: "pi",
         runtimeSnapshot,
         userPrompt,
+        internalTools,
       };
-      return spawn(work, secrets, {
+      const child = spawn(work, secrets, {
         workerScript: options.workerScript,
         execArgv: [...options.workerExecArgv],
       });
+      // The parent keeps the HMAC secret and lease token; every child tool
+      // call crosses this bridge and is re-executed against FastAPI.
+      attachRpc(child, createWorkerRpcHandlers(options.controlPlane, claim));
+      return child;
     } finally {
       clearSecretBundle(secrets);
     }
@@ -220,6 +235,7 @@ export async function runGatewayMain(deps: GatewayMainDependencies = {}): Promis
     maxBufferedEvents: config.maxBufferedEvents,
     worker: createProductionWorker({
       gatewayId: config.gatewayId,
+      controlPlane,
       workerScript: config.workerScript,
       workerExecArgv: config.workerExecArgv,
       spawn: deps.spawnWorker,

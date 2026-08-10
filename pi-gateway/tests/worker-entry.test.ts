@@ -33,7 +33,12 @@ const secrets: SecretBundle = {
   modelBaseUrl: "http://model.invalid",
   modelApiKey: "model-secret",
   datatapToken: "datatap-secret",
-  datatapUrls: {},
+  datatapUrls: {
+    "insight-cube": "http://127.0.0.1:2",
+    "social-grow": "http://127.0.0.1:3",
+    "social-grow-content": "http://127.0.0.1:4",
+    aktools: "http://127.0.0.1:5",
+  },
 };
 
 describe("single-run worker lifecycle", () => {

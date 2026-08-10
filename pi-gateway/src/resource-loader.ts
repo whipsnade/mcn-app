@@ -15,22 +15,22 @@ export interface ProductionResourceLoaderOptions {
   rootPolicy: string;
   skillCatalog?: readonly SkillCatalogEntry[];
   adapterCatalog?: readonly AdapterCatalogEntry[];
+  /** Absolute path of the reviewed pi-mcp-adapter entrypoint (jiti-loaded). */
   adapterExtension?: string;
-  auditExtension?: string;
   extensionFactories?: readonly ExtensionFactory[];
 }
 
 /**
  * Resource boundary for a single production Run.  All discovery switches are
- * disabled; only the two explicitly supplied production extension slots are loaded.
+ * disabled; only the explicit adapter path and audited factory slots load.
  */
 export function createProductionResourceLoader(options: ProductionResourceLoaderOptions): ResourceLoader {
-  const factories = options.extensionFactories ? [...options.extensionFactories] : [noopExtension, noopExtension];
   const loader = new DefaultResourceLoader({
     cwd: options.cwd,
     agentDir: options.agentDir,
     settingsManager: SettingsManager.inMemory(),
-    extensionFactories: factories,
+    additionalExtensionPaths: options.adapterExtension ? [options.adapterExtension] : [],
+    extensionFactories: options.extensionFactories ? [...options.extensionFactories] : [],
     noExtensions: true,
     noSkills: true,
     noPromptTemplates: true,
@@ -51,12 +51,27 @@ export function formatSkillDirectory(skills: readonly SkillCatalogEntry[]): stri
   ].join("\n");
 }
 
-export function createMcpConfig(catalog: readonly AdapterCatalogEntry[]): {
-  mcpServers: Record<string, { command: string; args: string[]; env: Record<string, string> }>;
-} {
-  const seen = new Set<string>();
-  const mcpServers: Record<string, { command: string; args: string[]; env: Record<string, string> }> = {};
-  for (const [index, entry] of catalog.entries()) {
+export interface ProductionMcpConfig {
+  settings: {
+    hostConfigDiscovery: "off";
+    scriptMode: false;
+    directTools: false;
+    requestTimeoutMs: number;
+  };
+  mcpServers: Record<
+    string,
+    { url: string; headers: { Authorization: string }; lifecycle: "lazy" }
+  >;
+}
+
+/**
+ * Render the adapter-readable `.mcp.json` for a Run.  The file only carries
+ * environment *references*; the decrypted endpoint/token values exist solely
+ * in the child process environment built by ``secret-env.ts``.
+ */
+export function createMcpConfig(catalog: readonly AdapterCatalogEntry[]): ProductionMcpConfig {
+  const mcpServers: ProductionMcpConfig["mcpServers"] = {};
+  for (const entry of catalog) {
     if (!ALLOWED_SERVICES.includes(entry.service as (typeof ALLOWED_SERVICES)[number])) {
       throw new Error("pi_mcp_catalog_invalid");
     }
@@ -67,23 +82,26 @@ export function createMcpConfig(catalog: readonly AdapterCatalogEntry[]): {
     ) {
       throw new Error("pi_mcp_catalog_invalid");
     }
-    const serverName = adapterServerName(entry, index, catalog);
-    if (mcpServers[serverName]) throw new Error("pi_mcp_catalog_invalid");
-    seen.add(entry.service);
-    mcpServers[serverName] = {
-      command: "pi-mcp-adapter",
-      args: ["--service", entry.service, "--remote-tool", entry.remoteName],
-      env: {
-        PI_MCP_RUN_ID: "${PI_RUN_ID}",
-        PI_MCP_SERVICE: entry.service,
-        PI_MCP_ADAPTER_NAME: entry.adapterName,
-      },
+    if (mcpServers[entry.service]) continue;
+    const envName = `PI_DATATAP_URL_${entry.service.replace(/[^a-z0-9]+/gi, "_").toUpperCase()}`;
+    mcpServers[entry.service] = {
+      url: `\${${envName}}`,
+      headers: { Authorization: "Bearer ${PI_DATATAP_TOKEN}" },
+      lifecycle: "lazy",
     };
   }
-  if (seen.size === 0) {
+  if (Object.keys(mcpServers).length === 0) {
     throw new Error("pi_mcp_catalog_incomplete");
   }
-  return { mcpServers };
+  return {
+    settings: {
+      hostConfigDiscovery: "off",
+      scriptMode: false,
+      directTools: false,
+      requestTimeoutMs: 180_000,
+    },
+    mcpServers,
+  };
 }
 
 /** Stable server key for a catalog that contains multiple reviewed tools per service. */
@@ -94,9 +112,4 @@ export function adapterServerName(
 ): string {
   const firstIndex = catalog.findIndex((item) => item.service === entry.service);
   return firstIndex === index ? entry.service : `${entry.service}__${entry.adapterName}`;
-}
-
-async function noopExtension(): Promise<void> {
-  // The actual adapter and audit factories are injected by the authenticated
-  // control-plane task.  Keeping these slots explicit prevents auto-discovery.
 }

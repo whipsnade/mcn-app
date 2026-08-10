@@ -68,12 +68,26 @@ export interface RuntimeSnapshot {
   adapterCatalog: readonly AdapterCatalogEntry[];
 }
 
+/**
+ * Offline/test-only scripted fake provider step.  The production composition
+ * root never populates ``ClaimedRun.fakeScript``; it exists so isolated-child
+ * tests and the offline UAT can drive deterministic tool-call rounds through
+ * the real Pi SDK without any external model call.
+ */
+export type FakeScriptStep =
+  | { kind: "text"; text: string }
+  | { kind: "tool_call"; tool: string; args: Record<string, unknown> };
+
 export interface ClaimedRun {
   runId: string;
   attemptId: string;
   runtimeBackend: "pi";
   runtimeSnapshot: RuntimeSnapshot;
   userPrompt?: string;
+  /** Claim-allowed internal tool names; the child registers only these. */
+  internalTools?: readonly string[];
+  /** Offline/test-only fake provider script; never set by production claim. */
+  fakeScript?: readonly FakeScriptStep[];
   /**
    * Tenant identity is owned by the FastAPI control plane and bound to the
    * Run lease.  Production workers never receive it; these optional fields

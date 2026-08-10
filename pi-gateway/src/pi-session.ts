@@ -1,6 +1,7 @@
 import { mkdtemp, mkdir, rm, writeFile, chmod } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   AuthStorage,
@@ -8,9 +9,11 @@ import {
   ModelRegistry,
   SessionManager,
   SettingsManager,
+  type ExtensionFactory,
 } from "@earendil-works/pi-coding-agent";
 import {
   fauxAssistantMessage,
+  fauxToolCall,
   createAssistantMessageEventStream,
   type Context,
   type Model,
@@ -23,10 +26,14 @@ import {
   McpAccountingExtension,
   type McpAccountingControlPlane,
 } from "./mcp-accounting-extension.js";
+import { buildInternalToolDefinitions, PiInternalToolsClient } from "./internal-tools.js";
+import type { ControlPlaneTransport } from "./control-plane-client.js";
 import {
   assertCompletePiSdkContract,
   PI_ALLOWED_TOOL_NAMES,
+  type AdapterCatalogEntry,
   type ClaimedRun,
+  type FakeScriptStep,
   type PiRunSession,
   type PiSdkEvent,
   type SecretBundle,
@@ -34,8 +41,71 @@ import {
 
 export interface PiSessionOptions {
   fakeProvider?: boolean;
+  /** Offline/test-only scripted responses; requires fakeProvider. */
+  fakeScript?: readonly FakeScriptStep[];
   /** Optional control-plane bridge used by the MCP adapter hook. */
   mcpAccounting?: McpAccountingControlPlane;
+  /** Optional control-plane bridge for the reviewed internal tools. */
+  internalTools?: ControlPlaneTransport;
+}
+
+const FAKE_TOOL_NAME = /^[A-Za-z0-9._:-]{1,128}$/;
+
+function validateFakeScript(script: readonly FakeScriptStep[] | undefined): void {
+  if (script === undefined) return;
+  if (script.length === 0 || script.length > 16) throw new Error("pi_fake_script_invalid");
+  for (const step of script) {
+    if (step.kind === "text") {
+      if (typeof step.text !== "string" || step.text.length === 0 || step.text.length > 16_384) {
+        throw new Error("pi_fake_script_invalid");
+      }
+      continue;
+    }
+    if (step.kind === "tool_call") {
+      if (
+        !FAKE_TOOL_NAME.test(step.tool) ||
+        (step.tool !== "mcp" && !(PI_ALLOWED_TOOL_NAMES as readonly string[]).includes(step.tool)) ||
+        !step.args ||
+        typeof step.args !== "object" ||
+        Array.isArray(step.args) ||
+        Object.keys(step.args).length > 64
+      ) {
+        throw new Error("pi_fake_script_invalid");
+      }
+      continue;
+    }
+    throw new Error("pi_fake_script_invalid");
+  }
+}
+
+function normalizeServiceKey(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+/**
+ * Resolve the reviewed pi-mcp-adapter entrypoint for the resource loader.
+ * The SDK loads it with jiti at runtime, so the TypeScript-only package never
+ * enters this project's own typecheck or build graph.
+ */
+export function resolveMcpAdapterExtensionPath(): string {
+  return fileURLToPath(import.meta.resolve("pi-mcp-adapter"));
+}
+
+/**
+ * Assert every catalogued service has a decrypted endpoint in the Run bundle.
+ * Endpoint and token values stay in the child process environment; the
+ * on-disk `.mcp.json` only carries references to their variable names.
+ */
+export function assertDatatapUrlsForCatalog(
+  catalog: readonly AdapterCatalogEntry[],
+  secrets: SecretBundle,
+): void {
+  const available = new Set(Object.keys(secrets.datatapUrls).map(normalizeServiceKey));
+  for (const entry of catalog) {
+    if (!available.has(normalizeServiceKey(entry.service))) {
+      throw new Error("pi_datatap_url_missing");
+    }
+  }
 }
 
 export async function createProductionPiSession(
@@ -44,6 +114,10 @@ export async function createProductionPiSession(
   options: PiSessionOptions = {},
 ): Promise<PiRunSession> {
   assertCompletePiSdkContract();
+  validateFakeScript(options.fakeScript);
+  if (options.fakeScript !== undefined && options.fakeProvider !== true) {
+    throw new Error("pi_fake_script_requires_fake_provider");
+  }
   const runDir = await mkdtemp(join(tmpdir(), "kol-pi-run-"));
   await chmod(runDir, 0o700);
   const agentDir = join(runDir, "agent");
@@ -55,26 +129,35 @@ export async function createProductionPiSession(
 
   let disposed = false;
   try {
+    assertDatatapUrlsForCatalog(work.runtimeSnapshot.adapterCatalog, secrets);
     const mcpAccounting = options.mcpAccounting
       ? new McpAccountingExtension(options.mcpAccounting)
       : undefined;
+    const extensionFactories: ExtensionFactory[] = mcpAccounting
+      ? [createMcpAccountingExtensionFactory(mcpAccounting, work.runtimeSnapshot.adapterCatalog.map((entry, index, catalog) => ({
+        toolName: entry.adapterName,
+        server: adapterServerName(entry, index, catalog),
+        remoteName: entry.remoteName,
+      })))]
+      : [];
+    const internalTools = options.internalTools
+      ? buildInternalToolDefinitions(
+          new PiInternalToolsClient(options.internalTools),
+          work.internalTools,
+        )
+      : [];
     const authStorage = AuthStorage.inMemory();
     authStorage.setRuntimeApiKey(work.runtimeSnapshot.model.provider, secrets.modelApiKey);
     const modelRegistry = ModelRegistry.inMemory(authStorage);
-    const model = registerModel(modelRegistry, work, secrets, options.fakeProvider === true);
+    const model = registerModel(modelRegistry, work, secrets, options.fakeProvider === true, options.fakeScript);
     const loader = createProductionResourceLoader({
       cwd: runDir,
       agentDir,
       rootPolicy: work.runtimeSnapshot.rootPolicy,
       skillCatalog: work.runtimeSnapshot.skillCatalog,
       adapterCatalog: work.runtimeSnapshot.adapterCatalog,
-      extensionFactories: mcpAccounting
-        ? [createMcpAccountingExtensionFactory(mcpAccounting, work.runtimeSnapshot.adapterCatalog.map((entry, index, catalog) => ({
-          toolName: entry.adapterName,
-          server: adapterServerName(entry, index, catalog),
-          remoteName: entry.remoteName,
-        })))]
-        : undefined,
+      adapterExtension: resolveMcpAdapterExtensionPath(),
+      extensionFactories,
     });
     await loader.reload();
     const settingsManager = SettingsManager.inMemory({
@@ -92,6 +175,7 @@ export async function createProductionPiSession(
       thinkingLevel: work.runtimeSnapshot.model.thinkingLevel ?? "medium",
       noTools: "builtin",
       tools: [...PI_ALLOWED_TOOL_NAMES],
+      customTools: internalTools,
       resourceLoader: loader,
       sessionManager,
       settingsManager,
@@ -148,6 +232,7 @@ function registerModel(
   work: ClaimedRun,
   secrets: SecretBundle,
   fakeProvider: boolean,
+  fakeScript?: readonly FakeScriptStep[],
 ): Model<any> {
   const provider = work.runtimeSnapshot.model.provider;
   const id = work.runtimeSnapshot.model.id;
@@ -160,7 +245,7 @@ function registerModel(
     // The locked coding-agent package carries its own pi-ai declaration; the
     // runtime stream protocol is identical, so bridge the duplicate private
     // EventStream type at this one SDK registration boundary.
-    streamSimple: fakeProvider ? fakeStream as any : undefined,
+    streamSimple: fakeProvider ? fakeStreamFactory(fakeScript) as any : undefined,
     models: [{
       id,
       name: id,
@@ -177,19 +262,37 @@ function registerModel(
   return model;
 }
 
-function fakeStream(
-  _model: Model<any>,
-  _context: Context,
-  _options?: SimpleStreamOptions,
-): ReturnType<typeof createAssistantMessageEventStream> {
-  const stream = createAssistantMessageEventStream();
-  const message = fauxAssistantMessage("fake provider response");
-  queueMicrotask(() => {
-    stream.push({ type: "start", partial: message });
-    stream.push({ type: "text_start", contentIndex: 0, partial: message });
-    stream.push({ type: "text_delta", contentIndex: 0, delta: "fake provider response", partial: message });
-    stream.push({ type: "text_end", contentIndex: 0, content: "fake provider response", partial: message });
-    stream.push({ type: "done", reason: "stop", message });
-  });
-  return stream;
+function selectFakeStep(script: readonly FakeScriptStep[] | undefined, context: Context): FakeScriptStep {
+  if (!script || script.length === 0) return { kind: "text", text: "fake provider response" };
+  const assistantRounds = context.messages.filter((message) => message.role === "assistant").length;
+  return script[Math.min(assistantRounds, script.length - 1)];
+}
+
+function fakeStreamFactory(script: readonly FakeScriptStep[] | undefined) {
+  return function fakeStream(
+    _model: Model<any>,
+    context: Context,
+    _options?: SimpleStreamOptions,
+  ): ReturnType<typeof createAssistantMessageEventStream> {
+    const step = selectFakeStep(script, context);
+    const stream = createAssistantMessageEventStream();
+    queueMicrotask(() => {
+      if (step.kind === "tool_call") {
+        const toolCall = fauxToolCall(step.tool, step.args, { id: `fake-tool-${step.tool}` });
+        const message = fauxAssistantMessage([toolCall], { stopReason: "toolUse" });
+        stream.push({ type: "start", partial: message });
+        stream.push({ type: "toolcall_start", contentIndex: 0, partial: message });
+        stream.push({ type: "toolcall_end", contentIndex: 0, toolCall, partial: message });
+        stream.push({ type: "done", reason: "toolUse", message });
+        return;
+      }
+      const message = fauxAssistantMessage(step.text);
+      stream.push({ type: "start", partial: message });
+      stream.push({ type: "text_start", contentIndex: 0, partial: message });
+      stream.push({ type: "text_delta", contentIndex: 0, delta: step.text, partial: message });
+      stream.push({ type: "text_end", contentIndex: 0, content: step.text, partial: message });
+      stream.push({ type: "done", reason: "stop", message });
+    });
+    return stream;
+  };
 }

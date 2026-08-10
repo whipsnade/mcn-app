@@ -20,6 +20,7 @@ interface RecordedRequest {
   method: string;
   path: string;
   signatureValid: boolean;
+  leaseOk: boolean;
   body: Record<string, unknown>;
 }
 
@@ -139,7 +140,13 @@ async function startFakeControlPlane(options: {
       // The idle claim loop can issue unbounded requests in fast tests; the
       // assertions below only need the leading protocol window.
       if (requests.length < 500) {
-        requests.push({ method, path, signatureValid, body: parsed });
+        requests.push({
+          method,
+          path,
+          signatureValid,
+          leaseOk: req.headers["x-pi-run-lease"] === LEASE_TOKEN,
+          body: parsed,
+        });
       }
       if (!signatureValid || req.headers["x-pi-gateway-id"] !== GATEWAY_ID) {
         res.writeHead(401, { "content-type": "application/json" });
@@ -171,6 +178,26 @@ async function startFakeControlPlane(options: {
       if (path.endsWith("/events")) {
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ event_id: "evt-1", sequence: 1, duplicate: false }));
+        return;
+      }
+      if (path.endsWith("/internal-tools")) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ context: { summary: "受限上下文" } }));
+        return;
+      }
+      if (path.endsWith("/mcp/preflight")) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ permit_id: "permit-1", catalog_entry_id: "ce-1" }));
+        return;
+      }
+      if (path.endsWith("/mcp/finalize")) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ permit_id: "permit-1", status: "settled", receipt: null }));
+        return;
+      }
+      if (path.endsWith("/mcp/fail")) {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true }));
         return;
       }
       if (path.endsWith("/terminal")) {
@@ -375,6 +402,87 @@ describe("production gateway composition root", () => {
       await controlPlane.close();
     }
   }, 20_000);
+
+  it("proxies child internal-tool and MCP accounting RPCs over signed parent HTTP", async () => {
+    const controlPlane = await startFakeControlPlane();
+    const signals = signalHarness();
+    const rpcProbe = join(workdir, "probe-rpc.ts");
+    await writeFile(rpcProbe, [
+      'import { WorkerRpcClient } from "' + new URL("../src/ipc-rpc.js", import.meta.url).pathname + '";',
+      "const rpc = new WorkerRpcClient({",
+      "  send: (message) => { if (process.connected) process.send(message); },",
+      "  onMessage: (listener) => { process.on('message', listener); return () => process.removeListener('message', listener); },",
+      "});",
+      "process.on('message', async (message) => {",
+      "  if (!message || message.type !== 'run') return;",
+      "  const leaseVisible = JSON.stringify(message).includes('lease-token');",
+      "  try {",
+      "    const toolResult = await rpc.call('internal_tool', { tool_name: 'get_session_context', args: {} });",
+      "    const permit = await rpc.call('mcp_preflight', { tool: 'query_analysis_data', server: 'insight-cube', args: { keyword: 'x' } });",
+      "    await rpc.call('mcp_finalize', { permit_id: permit.permit_id, details: { mode: 'mcpResult' } });",
+      "    await rpc.call('mcp_fail', { permit_id: permit.permit_id, classification: 'result_unknown' });",
+      "    process.send({ type: 'event', runId: message.work.runId, event: {",
+      "      source_event_id: message.work.attemptId + ':1', sequence: 1,",
+      "      event_type: 'message.completed',",
+      "      payload: { text: 'rpc-ok:' + leaseVisible + ':' + (toolResult && toolResult.context ? 'ctx' : 'none') },",
+      "    } });",
+      "    process.send({ type: 'done', runId: message.work.runId });",
+      "    rpc.dispose();",
+      "    process.disconnect();",
+      "  } catch (error) {",
+      "    process.send({ type: 'event', runId: message.work.runId, event: {",
+      "      source_event_id: message.work.attemptId + ':1', sequence: 1,",
+      "      event_type: 'message.completed',",
+      "      payload: { text: 'rpc-fail' },",
+      "    } });",
+      "    process.exit(1);",
+      "  }",
+      "});",
+    ].join("\n"));
+    const mainPromise = runGatewayMain({
+      env: {
+        ...baseEnv(controlPlane.url, rpcProbe),
+        PI_GATEWAY_WORKER_EXEC_ARGV: '["--import","tsx"]',
+      },
+      signalSource: signals.source,
+      random: () => 0.5,
+    });
+    try {
+      const deadline = Date.now() + 15_000;
+      while (Date.now() < deadline) {
+        const terminal = controlPlane.requests.find((request) => request.path.endsWith("/terminal"));
+        if (terminal) break;
+        await sleep(25);
+      }
+      signals.emit("SIGTERM");
+      await expect(mainPromise).resolves.toBe(0);
+
+      const sequence = controlPlane.requests
+        .map((request) => request.path)
+        .filter((path) => /internal-tools|mcp\//.test(path));
+      expect(sequence).toEqual([
+        "/api/v1/internal/pi-gateway/v1/runs/run-main-1/internal-tools",
+        "/api/v1/internal/pi-gateway/v1/runs/run-main-1/mcp/preflight",
+        "/api/v1/internal/pi-gateway/v1/runs/run-main-1/mcp/finalize",
+        "/api/v1/internal/pi-gateway/v1/runs/run-main-1/mcp/fail",
+      ]);
+      const rpcRequests = controlPlane.requests.filter((request) =>
+        /internal-tools|mcp\//.test(request.path),
+      );
+      expect(rpcRequests.every((request) => request.signatureValid && request.leaseOk)).toBe(true);
+      expect(rpcRequests[1].body).toMatchObject({
+        tool_name: "query_analysis_data",
+        server: "insight-cube-mcp",
+      });
+      const event = controlPlane.requests.find((request) => request.path.endsWith("/events"));
+      // rpc-ok:false -> the lease token never appears in the child IPC payload
+      expect(JSON.stringify(event?.body)).toContain("rpc-ok:false:ctx");
+      const terminal = controlPlane.requests.find((request) => request.path.endsWith("/terminal"));
+      expect(terminal?.body).toMatchObject({ outcome: "completed" });
+    } finally {
+      await controlPlane.close();
+    }
+  }, 30_000);
 
   it("exits 1 without starting the loop when configuration is invalid", async () => {
     const logs: string[] = [];
