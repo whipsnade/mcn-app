@@ -49,12 +49,13 @@ export const createAdminTenant = (input: { slug: string; name: string; is_intern
 export const updateAdminTenant = (id: string, input: { name?: string; status?: 'active' | 'disabled'; runtime_backend?: 'current' | 'pi' }) =>
   request<AdminTenant>(`/api/v1/admin/tenants/${encodeURIComponent(id)}`, { method: 'PATCH', headers: key(), body: JSON.stringify(input) });
 export const listAdminLicenses = (tenantId: string) => request<AdminLicense[]>(`/api/v1/admin/tenants/${encodeURIComponent(tenantId)}/license`);
-export const createAdminLicense = (tenantId: string, input: Omit<AdminLicense, 'id' | 'tenant_id' | 'version' | 'active' | 'created_at'>) =>
+// 后端 valid_from/valid_until 均可选（缺省 valid_from 取当前时间），类型在此如实放宽；运行时行为不变。
+export const createAdminLicense = (tenantId: string, input: { valid_from?: string; valid_until?: string | null; features: Record<string, boolean>; max_concurrent_runs: number; max_user_concurrent_runs: number }) =>
   request<AdminLicense>(`/api/v1/admin/tenants/${encodeURIComponent(tenantId)}/license`, { method: 'POST', headers: key(), body: JSON.stringify(input) });
 export const updateAdminLicense = (tenantId: string, licenseId: string, status: 'active' | 'suspended') =>
   request<AdminLicense>(`/api/v1/admin/tenants/${encodeURIComponent(tenantId)}/license/${encodeURIComponent(licenseId)}`, { method: 'PATCH', headers: key(), body: JSON.stringify({ status }) });
-export const listAdminUsage = (tenantId: string, groupBy: 'tenant' | 'user' | 'run' | 'day' = 'day') =>
-  request<{ items: AdminUsage[]; limit: number; offset: number }>(query(`/api/v1/admin/tenants/${encodeURIComponent(tenantId)}/usage`, { group_by: groupBy, limit: 200 }));
+export const listAdminUsage = (tenantId: string, groupBy: 'tenant' | 'user' | 'run' | 'day' = 'day', options: { limit?: number; offset?: number } = {}) =>
+  request<{ items: AdminUsage[]; limit: number; offset: number }>(query(`/api/v1/admin/tenants/${encodeURIComponent(tenantId)}/usage`, { group_by: groupBy, limit: options.limit ?? 200, offset: options.offset }));
 export const listAdminGateways = () => request<{ items: AdminGateway[]; total: number }>('/api/v1/admin/pi-runtime/gateways');
 export const updateAdminGateway = (gatewayId: string, input: { desired_capacity?: number; mode?: 'active' | 'draining' }) =>
   request<AdminGateway>(`/api/v1/admin/pi-runtime/gateways/${encodeURIComponent(gatewayId)}`, { method: 'PATCH', headers: key(), body: JSON.stringify(input) });
