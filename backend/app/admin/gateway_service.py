@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import hashlib
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, TypeVar
 from uuid import uuid4
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from pydantic import BaseModel
 
-from app.admin.models import AdminAuditLog
+from app.admin.models import AdminAuditLog, AdminIdempotencyRecord
 from app.admin.schemas import (
     AdminGatewayItem,
     AdminGatewayUpdate,
@@ -50,6 +54,37 @@ class GatewayAdminError(ValueError):
     def __init__(self, code: str) -> None:
         self.code = code
         super().__init__(code)
+
+
+def _canonical_json(value: Any) -> bytes:
+    import json
+
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def _request_fingerprint(payload: Mapping[str, Any]) -> str:
+    """Stable SHA-256 over the operation's full logical request identity."""
+    return hashlib.sha256(_canonical_json(dict(payload))).hexdigest()
+
+
+def _secret_fingerprints(secrets: Mapping[str, Any]) -> dict[str, Any]:
+    """One-way fingerprints of write-only secret fields for request hashing.
+
+    Secret values never enter the idempotency record or audit trail; two
+    requests that differ only in secret material still hash differently.
+    """
+
+    def fp(value: Any) -> Any:
+        if isinstance(value, str):
+            return hashlib.sha256(value.encode("utf-8")).hexdigest()
+        if isinstance(value, Mapping):
+            return {str(key): fp(item) for key, item in value.items()}
+        return value
+
+    return {str(key): fp(value) for key, value in secrets.items()}
+
+
+T = TypeVar("T", bound=BaseModel)
 
 
 def _pi_rollout_config_compatible(config: object) -> bool:
@@ -105,6 +140,60 @@ class GatewayAdminService:
         self.db.add(row)
         return row
 
+    async def _idempotent(
+        self,
+        admin: User,
+        *,
+        action: str,
+        idempotency_key: str,
+        fingerprint: Mapping[str, Any],
+        target_type: str,
+        response_model: type[T],
+        produce: Callable[[], Awaitable[tuple[T, str]]],
+    ) -> T:
+        """Durable admin-write idempotency in the router-owned transaction.
+
+        Same key + same request replays the stored safe projection; same key
+        + different request is a stable 409.  The business writes, the audit
+        row and this record commit or roll back together.
+        """
+        request_hash = _request_fingerprint(fingerprint)
+        statement = select(AdminIdempotencyRecord).where(
+            AdminIdempotencyRecord.actor_id == admin.id,
+            AdminIdempotencyRecord.action == action,
+            AdminIdempotencyRecord.idempotency_key == idempotency_key,
+        )
+        existing = await self.db.scalar(statement.with_for_update())
+        if existing is not None:
+            if existing.request_hash != request_hash:
+                raise GatewayAdminError("admin_idempotency_conflict")
+            return response_model.model_validate(existing.response_json)
+        dto, target_id = await produce()
+        self.db.add(
+            AdminIdempotencyRecord(
+                id=str(uuid4()),
+                actor_id=admin.id,
+                action=action,
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+                target_type=target_type,
+                target_id=target_id,
+                response_json=dto.model_dump(mode="json"),
+                created_at=_now(),
+            )
+        )
+        try:
+            await self.db.flush()
+        except IntegrityError as exc:
+            # A concurrent retry with the same key won the unique constraint;
+            # roll back this attempt's writes and replay the winner's result.
+            await self.db.rollback()
+            winner = await self.db.scalar(statement)
+            if winner is not None and winner.request_hash == request_hash:
+                return response_model.model_validate(winner.response_json)
+            raise GatewayAdminError("admin_idempotency_conflict") from exc
+        return dto
+
     async def _tenant(self, tenant_id: str, *, for_update: bool = False) -> Tenant:
         statement = select(Tenant).where(Tenant.id == tenant_id)
         if for_update:
@@ -156,42 +245,67 @@ class GatewayAdminService:
             updated_at=tenant.updated_at,
         )
 
-    async def create_tenant(self, admin: User, payload: AdminTenantCreate, *, idempotency_key: str | None) -> AdminTenantItem:
-        if await self.db.scalar(select(Tenant.id).where(Tenant.slug == payload.slug)) is not None:
-            raise GatewayAdminError("tenant_slug_conflict")
-        now = _now()
-        tenant_id = str(uuid4())
-        tenant = Tenant(
-            id=tenant_id,
-            slug=payload.slug,
-            name=payload.name,
-            status="active",
-            is_internal=payload.is_internal,
-            runtime_backend="current",
-            license_status="active",
-            active_license_id=None,
-            active_runtime_config_id=None,
-            created_at=now,
-            updated_at=now,
-        )
-        self.db.add(tenant)
-        await self.db.flush()
-        license_row = TenantLicense(
-            id=str(uuid4()), tenant_id=tenant.id, version=1, valid_from=now,
-            valid_until=None,
-            features_json={feature: True for feature in SUPPORTED_LICENSE_FEATURES},
-            max_concurrent_runs=4, max_user_concurrent_runs=2,
-            created_by=admin.id, created_at=now,
-        )
-        self.db.add(license_row)
-        tenant.active_license_id = license_row.id
-        await TenantAccountingService(self.db).ensure_tenant_wallet(tenant.id)
-        self._audit(admin.id, action="tenant.create", target_type="tenant", target_id=tenant.id,
-                    detail={"after": {"slug": tenant.slug, "name": tenant.name}}, idempotency_key=idempotency_key)
-        await self.db.flush()
-        return self._tenant_item(tenant, 0, 0)
+    async def create_tenant(self, admin: User, payload: AdminTenantCreate, *, idempotency_key: str) -> AdminTenantItem:
+        async def produce() -> tuple[AdminTenantItem, str]:
+            if await self.db.scalar(select(Tenant.id).where(Tenant.slug == payload.slug)) is not None:
+                raise GatewayAdminError("tenant_slug_conflict")
+            now = _now()
+            tenant_id = str(uuid4())
+            tenant = Tenant(
+                id=tenant_id,
+                slug=payload.slug,
+                name=payload.name,
+                status="active",
+                is_internal=payload.is_internal,
+                runtime_backend="current",
+                license_status="active",
+                active_license_id=None,
+                active_runtime_config_id=None,
+                created_at=now,
+                updated_at=now,
+            )
+            self.db.add(tenant)
+            await self.db.flush()
+            license_row = TenantLicense(
+                id=str(uuid4()), tenant_id=tenant.id, version=1, valid_from=now,
+                valid_until=None,
+                features_json={feature: True for feature in SUPPORTED_LICENSE_FEATURES},
+                max_concurrent_runs=4, max_user_concurrent_runs=2,
+                created_by=admin.id, created_at=now,
+            )
+            self.db.add(license_row)
+            tenant.active_license_id = license_row.id
+            await TenantAccountingService(self.db).ensure_tenant_wallet(tenant.id)
+            self._audit(admin.id, action="tenant.create", target_type="tenant", target_id=tenant.id,
+                        detail={"after": {"slug": tenant.slug, "name": tenant.name}}, idempotency_key=idempotency_key)
+            await self.db.flush()
+            return self._tenant_item(tenant, 0, 0), tenant.id
 
-    async def update_tenant(self, admin: User, tenant_id: str, payload: AdminTenantUpdate, *, idempotency_key: str | None) -> AdminTenantItem:
+        return await self._idempotent(
+            admin,
+            action="tenant.create",
+            idempotency_key=idempotency_key,
+            fingerprint=payload.model_dump(mode="json"),
+            target_type="tenant",
+            response_model=AdminTenantItem,
+            produce=produce,
+        )
+
+    async def update_tenant(self, admin: User, tenant_id: str, payload: AdminTenantUpdate, *, idempotency_key: str) -> AdminTenantItem:
+        async def produce() -> tuple[AdminTenantItem, str]:
+            return await self._produce_update_tenant(admin, tenant_id, payload, idempotency_key)
+
+        return await self._idempotent(
+            admin,
+            action="tenant.update",
+            idempotency_key=idempotency_key,
+            fingerprint={"tenant_id": tenant_id, **payload.model_dump(mode="json", exclude_unset=True)},
+            target_type="tenant",
+            response_model=AdminTenantItem,
+            produce=produce,
+        )
+
+    async def _produce_update_tenant(self, admin: User, tenant_id: str, payload: AdminTenantUpdate, idempotency_key: str) -> tuple[AdminTenantItem, str]:
         tenant = await self._tenant(tenant_id, for_update=True)
         before = {"name": tenant.name, "status": tenant.status, "runtime_backend": tenant.runtime_backend}
         if payload.runtime_backend == "pi" and tenant.runtime_backend != "pi":
@@ -246,7 +360,7 @@ class GatewayAdminService:
                     detail={"before": before, "after": {"name": tenant.name, "status": tenant.status, "runtime_backend": tenant.runtime_backend}}, idempotency_key=idempotency_key)
         members = int(await self.db.scalar(select(func.count()).select_from(TenantMembership).where(TenantMembership.tenant_id == tenant.id)) or 0)
         runs = int(await self.db.scalar(select(func.count()).select_from(AgentRun).where(AgentRun.tenant_id == tenant.id, AgentRun.status.in_(('queued','running','reviewing')))) or 0)
-        return self._tenant_item(tenant, members, runs)
+        return self._tenant_item(tenant, members, runs), tenant.id
 
     async def list_users(self, tenant_id: str, *, limit: int, offset: int) -> tuple[list[AdminTenantUserItem], int]:
         await self._tenant(tenant_id)
@@ -259,7 +373,21 @@ class GatewayAdminService:
         total = int(await self.db.scalar(select(func.count()).select_from(TenantMembership).where(TenantMembership.tenant_id == tenant_id)) or 0)
         return [AdminTenantUserItem(id=u.id, nickname=u.nickname, role=m.role, status=m.status, created_at=u.created_at) for u, m in rows], total
 
-    async def create_user(self, admin: User, tenant_id: str, payload: AdminTenantUserCreate, *, idempotency_key: str | None) -> AdminTenantUserItem:
+    async def create_user(self, admin: User, tenant_id: str, payload: AdminTenantUserCreate, *, idempotency_key: str) -> AdminTenantUserItem:
+        async def produce() -> tuple[AdminTenantUserItem, str]:
+            return await self._produce_create_user(admin, tenant_id, payload, idempotency_key)
+
+        return await self._idempotent(
+            admin,
+            action="tenant.user.create",
+            idempotency_key=idempotency_key,
+            fingerprint={"tenant_id": tenant_id, **payload.model_dump(mode="json")},
+            target_type="tenant_user",
+            response_model=AdminTenantUserItem,
+            produce=produce,
+        )
+
+    async def _produce_create_user(self, admin: User, tenant_id: str, payload: AdminTenantUserCreate, idempotency_key: str) -> tuple[AdminTenantUserItem, str]:
         tenant = await self._tenant(tenant_id, for_update=True)
         if tenant.status != "active":
             raise GatewayAdminError("tenant_disabled")
@@ -279,7 +407,7 @@ class GatewayAdminService:
         await accounting.ensure_user_quota(tenant.id, user_id, points_limit=payload.points or 1000)
         await accounting.ensure_tenant_wallet(tenant.id)
         self._audit(admin.id, action="tenant.user.create", target_type="tenant_user", target_id=user_id, detail={"tenant_id": tenant.id, "after": {"nickname": payload.nickname, "role": payload.role}}, idempotency_key=idempotency_key)
-        return AdminTenantUserItem(id=user.id, nickname=user.nickname, role=membership.role, status=membership.status, created_at=user.created_at)
+        return AdminTenantUserItem(id=user.id, nickname=user.nickname, role=membership.role, status=membership.status, created_at=user.created_at), user.id
 
     @staticmethod
     def _license_item(row: TenantLicense, active_id: str | None) -> AdminLicenseItem:
@@ -290,7 +418,21 @@ class GatewayAdminService:
         rows = list((await self.db.scalars(select(TenantLicense).where(TenantLicense.tenant_id == tenant_id).order_by(TenantLicense.version.desc()))).all())
         return [self._license_item(row, tenant.active_license_id) for row in rows]
 
-    async def create_license(self, admin: User, tenant_id: str, payload: AdminLicenseCreate, *, idempotency_key: str | None) -> AdminLicenseItem:
+    async def create_license(self, admin: User, tenant_id: str, payload: AdminLicenseCreate, *, idempotency_key: str) -> AdminLicenseItem:
+        async def produce() -> tuple[AdminLicenseItem, str]:
+            return await self._produce_create_license(admin, tenant_id, payload, idempotency_key)
+
+        return await self._idempotent(
+            admin,
+            action="license.append",
+            idempotency_key=idempotency_key,
+            fingerprint={"tenant_id": tenant_id, **payload.model_dump(mode="json")},
+            target_type="tenant_license",
+            response_model=AdminLicenseItem,
+            produce=produce,
+        )
+
+    async def _produce_create_license(self, admin: User, tenant_id: str, payload: AdminLicenseCreate, idempotency_key: str) -> tuple[AdminLicenseItem, str]:
         tenant = await self._tenant(tenant_id, for_update=True)
         if set(payload.features) - SUPPORTED_LICENSE_FEATURES or any(not isinstance(v, bool) for v in payload.features.values()):
             raise GatewayAdminError("license_feature_invalid")
@@ -300,9 +442,23 @@ class GatewayAdminService:
         self.db.add(row)
         await self.db.flush()
         self._audit(admin.id, action="license.append", target_type="tenant_license", target_id=row.id, detail={"tenant_id": tenant_id, "after": {"version": version, "features": payload.features}}, idempotency_key=idempotency_key)
-        return self._license_item(row, tenant.active_license_id)
+        return self._license_item(row, tenant.active_license_id), row.id
 
-    async def update_license_status(self, admin: User, tenant_id: str, license_id: str, payload: AdminLicenseStatusUpdate, *, idempotency_key: str | None) -> AdminLicenseItem:
+    async def update_license_status(self, admin: User, tenant_id: str, license_id: str, payload: AdminLicenseStatusUpdate, *, idempotency_key: str) -> AdminLicenseItem:
+        async def produce() -> tuple[AdminLicenseItem, str]:
+            return await self._produce_update_license_status(admin, tenant_id, license_id, payload, idempotency_key)
+
+        return await self._idempotent(
+            admin,
+            action="license.status",
+            idempotency_key=idempotency_key,
+            fingerprint={"tenant_id": tenant_id, "license_id": license_id, **payload.model_dump(mode="json")},
+            target_type="tenant_license",
+            response_model=AdminLicenseItem,
+            produce=produce,
+        )
+
+    async def _produce_update_license_status(self, admin: User, tenant_id: str, license_id: str, payload: AdminLicenseStatusUpdate, idempotency_key: str) -> tuple[AdminLicenseItem, str]:
         tenant = await self._tenant(tenant_id, for_update=True)
         row = await self.db.scalar(select(TenantLicense).where(TenantLicense.id == license_id, TenantLicense.tenant_id == tenant_id).with_for_update())
         if row is None:
@@ -314,7 +470,7 @@ class GatewayAdminService:
             tenant.active_license_id = None
             tenant.license_status = "suspended"
         self._audit(admin.id, action="license.status", target_type="tenant_license", target_id=row.id, detail={"tenant_id": tenant_id, "status": payload.status}, idempotency_key=idempotency_key)
-        return self._license_item(row, tenant.active_license_id)
+        return self._license_item(row, tenant.active_license_id), row.id
 
     async def list_usage(self, tenant_id: str, *, group_by: str, limit: int, offset: int) -> list[dict[str, Any]]:
         await self._tenant(tenant_id)
@@ -330,17 +486,28 @@ class GatewayAdminService:
         total = int(await self.db.scalar(select(func.count()).select_from(PiGatewayInstance)) or 0)
         return [self._gateway_item(row) for row in rows], total
 
-    async def update_gateway(self, admin: User, gateway_id: str, payload: AdminGatewayUpdate, *, idempotency_key: str | None) -> AdminGatewayItem:
-        row = await self.db.scalar(select(PiGatewayInstance).where(PiGatewayInstance.gateway_id == gateway_id).with_for_update())
-        if row is None:
-            raise GatewayAdminError("gateway_not_found")
-        if payload.desired_capacity is not None:
-            row.desired_capacity = payload.desired_capacity
-        if payload.mode is not None:
-            row.mode = payload.mode
-        row.updated_at = _now()
-        self._audit(admin.id, action="gateway.update", target_type="pi_gateway", target_id=row.gateway_id, detail={"after": {"mode": row.mode, "desired_capacity": row.desired_capacity}}, idempotency_key=idempotency_key)
-        return self._gateway_item(row)
+    async def update_gateway(self, admin: User, gateway_id: str, payload: AdminGatewayUpdate, *, idempotency_key: str) -> AdminGatewayItem:
+        async def produce() -> tuple[AdminGatewayItem, str]:
+            row = await self.db.scalar(select(PiGatewayInstance).where(PiGatewayInstance.gateway_id == gateway_id).with_for_update())
+            if row is None:
+                raise GatewayAdminError("gateway_not_found")
+            if payload.desired_capacity is not None:
+                row.desired_capacity = payload.desired_capacity
+            if payload.mode is not None:
+                row.mode = payload.mode
+            row.updated_at = _now()
+            self._audit(admin.id, action="gateway.update", target_type="pi_gateway", target_id=row.gateway_id, detail={"after": {"mode": row.mode, "desired_capacity": row.desired_capacity}}, idempotency_key=idempotency_key)
+            return self._gateway_item(row), row.gateway_id
+
+        return await self._idempotent(
+            admin,
+            action="gateway.update",
+            idempotency_key=idempotency_key,
+            fingerprint={"gateway_id": gateway_id, **payload.model_dump(mode="json", exclude_unset=True)},
+            target_type="pi_gateway",
+            response_model=AdminGatewayItem,
+            produce=produce,
+        )
 
     @staticmethod
     def _config_item(row: RuntimeConfigVersion) -> AdminRuntimeConfigItem:
@@ -352,23 +519,49 @@ class GatewayAdminService:
         total = int(await self.db.scalar(select(func.count()).select_from(RuntimeConfigVersion).where(RuntimeConfigVersion.scope == "tenant", RuntimeConfigVersion.tenant_id == tenant_id)) or 0)
         return [self._config_item(row) for row in rows], total
 
-    async def create_runtime_config(self, admin: User, payload: AdminRuntimeConfigCreate, *, idempotency_key: str | None) -> AdminRuntimeConfigItem:
-        await self._tenant(payload.tenant_id, for_update=True)
-        secrets = RuntimeSecretBundle.model_validate(payload.secrets) if payload.secrets is not None else None
-        try:
-            row = await RuntimeConfigService(self.db).create_tenant_version(payload.tenant_id, created_by=admin.id, runtime_backend=payload.runtime_backend, model=payload.model, datatap=payload.datatap, limits=payload.limits, billing=payload.billing, secrets=secrets, runtime_contract_version=payload.runtime_contract_version)
-        except RuntimeConfigError as exc:
-            raise GatewayAdminError(str(exc)) from exc
-        self._audit(admin.id, action="runtime_config.create", target_type="runtime_config", target_id=row.id, detail={"tenant_id": payload.tenant_id, "after": {"runtime_backend": row.runtime_backend, "version": row.version, "secret_count": len(row.secret_refs_json or [])}}, idempotency_key=idempotency_key)
-        return self._config_item(row)
+    async def create_runtime_config(self, admin: User, payload: AdminRuntimeConfigCreate, *, idempotency_key: str) -> AdminRuntimeConfigItem:
+        async def produce() -> tuple[AdminRuntimeConfigItem, str]:
+            await self._tenant(payload.tenant_id, for_update=True)
+            secrets = RuntimeSecretBundle.model_validate(payload.secrets) if payload.secrets is not None else None
+            try:
+                row = await RuntimeConfigService(self.db).create_tenant_version(payload.tenant_id, created_by=admin.id, runtime_backend=payload.runtime_backend, model=payload.model, datatap=payload.datatap, limits=payload.limits, billing=payload.billing, secrets=secrets, runtime_contract_version=payload.runtime_contract_version)
+            except RuntimeConfigError as exc:
+                raise GatewayAdminError(str(exc)) from exc
+            self._audit(admin.id, action="runtime_config.create", target_type="runtime_config", target_id=row.id, detail={"tenant_id": payload.tenant_id, "after": {"runtime_backend": row.runtime_backend, "version": row.version, "secret_count": len(row.secret_refs_json or [])}}, idempotency_key=idempotency_key)
+            return self._config_item(row), row.id
 
-    async def activate_runtime_config(self, admin: User, config_id: str, *, idempotency_key: str | None) -> AdminRuntimeConfigItem:
-        try:
-            row = await RuntimeConfigService(self.db).activate(config_id)
-        except RuntimeConfigError as exc:
-            raise GatewayAdminError(str(exc)) from exc
-        self._audit(admin.id, action="runtime_config.activate", target_type="runtime_config", target_id=row.id, detail={"tenant_id": row.tenant_id, "status": row.status}, idempotency_key=idempotency_key)
-        return self._config_item(row)
+        fingerprint_payload = payload.model_dump(mode="json")
+        if payload.secrets is not None:
+            # 只用单向指纹区分请求，密文值绝不进入幂等记录或审计。
+            fingerprint_payload["secrets"] = _secret_fingerprints(payload.secrets)
+        return await self._idempotent(
+            admin,
+            action="runtime_config.create",
+            idempotency_key=idempotency_key,
+            fingerprint=fingerprint_payload,
+            target_type="runtime_config",
+            response_model=AdminRuntimeConfigItem,
+            produce=produce,
+        )
+
+    async def activate_runtime_config(self, admin: User, config_id: str, *, idempotency_key: str) -> AdminRuntimeConfigItem:
+        async def produce() -> tuple[AdminRuntimeConfigItem, str]:
+            try:
+                row = await RuntimeConfigService(self.db).activate(config_id)
+            except RuntimeConfigError as exc:
+                raise GatewayAdminError(str(exc)) from exc
+            self._audit(admin.id, action="runtime_config.activate", target_type="runtime_config", target_id=row.id, detail={"tenant_id": row.tenant_id, "status": row.status}, idempotency_key=idempotency_key)
+            return self._config_item(row), row.id
+
+        return await self._idempotent(
+            admin,
+            action="runtime_config.activate",
+            idempotency_key=idempotency_key,
+            fingerprint={"config_id": config_id},
+            target_type="runtime_config",
+            response_model=AdminRuntimeConfigItem,
+            produce=produce,
+        )
 
     async def run_diagnostics(self, admin: User, run_id: str) -> AdminRunDiagnostics:
         del admin

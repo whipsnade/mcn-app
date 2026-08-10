@@ -22,7 +22,7 @@ from app.agent_runtime.models import (
     EvidenceItem,
     MemoryEntry,
 )
-from app.admin.models import AdminAuditLog
+from app.admin.models import AdminAuditLog, AdminIdempotencyRecord
 from app.artifacts.models import ArtifactReadState, TaskArtifact
 from app.billing.models import (
     RuntimeUsageRecord,
@@ -65,6 +65,7 @@ from app.workspace.models import Message, WorkspaceSession
 
 __all__ = [
     "AdminAuditLog",
+    "AdminIdempotencyRecord",
     "AgentArtifact",
     "AgentArtifactReadState",
     "AgentArtifactVersion",

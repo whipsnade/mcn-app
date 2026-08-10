@@ -72,6 +72,20 @@ def gateway_error(error: GatewayAdminError) -> HTTPException:
     return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=code)
 
 
+def _require_idempotency_key(value: str | None) -> str:
+    """B6 管理写操作必须携带非空 Idempotency-Key（持久化唯一键回放/409）。"""
+    if value is None or not value.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="admin_idempotency_key_required"
+        )
+    key = value.strip()
+    if len(key) > 128:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="admin_idempotency_key_invalid"
+        )
+    return key
+
+
 @router.get("/users", response_model=AdminUserListResponse)
 async def list_users(
     admin: AdminUser,
@@ -240,7 +254,7 @@ async def create_tenant(
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> AdminTenantItem:
     try:
-        result = await _gateway_service(db).create_tenant(admin, payload, idempotency_key=idempotency_key)
+        result = await _gateway_service(db).create_tenant(admin, payload, idempotency_key=_require_idempotency_key(idempotency_key))
         await db.commit()
         return result
     except GatewayAdminError as exc:
@@ -257,7 +271,7 @@ async def update_tenant(
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> AdminTenantItem:
     try:
-        result = await _gateway_service(db).update_tenant(admin, tenant_id, payload, idempotency_key=idempotency_key)
+        result = await _gateway_service(db).update_tenant(admin, tenant_id, payload, idempotency_key=_require_idempotency_key(idempotency_key))
         await db.commit()
         return result
     except GatewayAdminError as exc:
@@ -290,7 +304,7 @@ async def create_tenant_user(
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> AdminTenantUserItem:
     try:
-        result = await _gateway_service(db).create_user(admin, tenant_id, payload, idempotency_key=idempotency_key)
+        result = await _gateway_service(db).create_user(admin, tenant_id, payload, idempotency_key=_require_idempotency_key(idempotency_key))
         await db.commit()
         return result
     except GatewayAdminError as exc:
@@ -320,7 +334,7 @@ async def append_tenant_license(
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> AdminLicenseItem:
     try:
-        result = await _gateway_service(db).create_license(admin, tenant_id, payload, idempotency_key=idempotency_key)
+        result = await _gateway_service(db).create_license(admin, tenant_id, payload, idempotency_key=_require_idempotency_key(idempotency_key))
         await db.commit()
         return result
     except GatewayAdminError as exc:
@@ -338,7 +352,7 @@ async def update_tenant_license(
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> AdminLicenseItem:
     try:
-        result = await _gateway_service(db).update_license_status(admin, tenant_id, license_id, payload, idempotency_key=idempotency_key)
+        result = await _gateway_service(db).update_license_status(admin, tenant_id, license_id, payload, idempotency_key=_require_idempotency_key(idempotency_key))
         await db.commit()
         return result
     except GatewayAdminError as exc:
@@ -384,7 +398,7 @@ async def update_pi_gateway(
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> AdminGatewayItem:
     try:
-        result = await _gateway_service(db).update_gateway(admin, gateway_id, payload, idempotency_key=idempotency_key)
+        result = await _gateway_service(db).update_gateway(admin, gateway_id, payload, idempotency_key=_require_idempotency_key(idempotency_key))
         await db.commit()
         return result
     except GatewayAdminError as exc:
@@ -416,7 +430,7 @@ async def create_runtime_config(
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> AdminRuntimeConfigItem:
     try:
-        result = await _gateway_service(db).create_runtime_config(admin, payload, idempotency_key=idempotency_key)
+        result = await _gateway_service(db).create_runtime_config(admin, payload, idempotency_key=_require_idempotency_key(idempotency_key))
         await db.commit()
         return result
     except GatewayAdminError as exc:
@@ -432,7 +446,7 @@ async def activate_runtime_config(
     idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> AdminRuntimeConfigItem:
     try:
-        result = await _gateway_service(db).activate_runtime_config(admin, config_id, idempotency_key=idempotency_key)
+        result = await _gateway_service(db).activate_runtime_config(admin, config_id, idempotency_key=_require_idempotency_key(idempotency_key))
         await db.commit()
         return result
     except GatewayAdminError as exc:
