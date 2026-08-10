@@ -28,6 +28,44 @@ cd backend && .venv/bin/alembic heads
 cd ../pi-gateway && npm ls --depth=0 && npm run typecheck
 ```
 
+### 生产 Gateway 启动
+
+生产入口是 `pi-gateway/src/main.ts`（构建产物 `dist/main.js`）：
+
+```bash
+cd pi-gateway
+npm ci
+npm run build
+npm start        # node dist/main.js
+```
+
+配置只来自进程环境，缺失或非法即 fail-closed（退出码 1，日志只含变量名、不含取值）：
+
+| 变量 | 必填 | 语义 |
+| --- | --- | --- |
+| `PI_GATEWAY_ID` | 是 | 固定 gateway id，必须在 FastAPI `PI_GATEWAY_ALLOWED_IDS` 白名单内 |
+| `PI_GATEWAY_CONTROL_PLANE_URL` | 是 | FastAPI origin；production 必须 HTTPS，仅 development/test 允许 loopback HTTP |
+| `PI_GATEWAY_INTERNAL_SECRET` | 是 | 与控制面共享的 HMAC 密钥（16–512 字符），签名绑定完整挂载路径 |
+| `PI_GATEWAY_ENVIRONMENT` | 否 | `production`（默认）/ `development` / `test` |
+| `PI_GATEWAY_CAPACITY` | 否 | 共享 Worker 容量，默认 1，上限 128 |
+| `PI_GATEWAY_HEALTH_HOST` / `PI_GATEWAY_HEALTH_PORT` | 否 | 运维 HTTP 监听，仅 loopback，默认 `127.0.0.1:9471` |
+| `PI_GATEWAY_CLAIM_INTERVAL_MS` / `PI_GATEWAY_CLAIM_MAX_BACKOFF_MS` | 否 | claim 轮询间隔（默认 1000）与有界退避上限（默认 30000） |
+| `PI_GATEWAY_HEARTBEAT_INTERVAL_MS` | 否 | Run lease 续租间隔（默认 20000，必须小于 lease 秒数） |
+| `PI_GATEWAY_SHUTDOWN_TIMEOUT_MS` | 否 | draining 等待上限（默认 10000） |
+| `PI_GATEWAY_MAX_BUFFERED_EVENTS` | 否 | 控制面不可达时的有界内存事件缓冲（默认 256） |
+| `PI_GATEWAY_WORKER_SCRIPT` / `PI_GATEWAY_WORKER_EXEC_ARGV` | 否 | Worker 入口覆盖，仅本地运行器/测试使用 |
+
+HMAC 签名串精确为 `METHOD\n<完整挂载路径>\nTIMESTAMP\nNONCE\nSHA256(body)`；Node 与 Python 以
+`pi-gateway/tests/hmac-contract.test.ts` 和 `backend/tests/pi_gateway/test_auth.py` 中同一组固定
+夹具摘要互锁，任何一侧改动签名口径都会立即红灯。
+
+运维 HTTP 仅监听 loopback：`GET /healthz` 存活性、`GET /readyz` 调度就绪（draining 后 503）、
+`GET /metrics` 有界 JSON 计数（claim/错误/活动 Worker，不含租户、用户或任何密钥材料）。
+SIGTERM/SIGINT 进入 draining：停止新 claim，按 `PI_GATEWAY_SHUTDOWN_TIMEOUT_MS` 有界等待活动
+Worker abort，随后退出码 0。secret envelope 只在领取 Run 后以
+`run_id:attempt_id:config_version_id:gateway_id` AAD 在内存解封，经子进程环境注入 Worker，
+父进程随即清除引用；解密失败以稳定错误码收口当前 Run，不输出任何明文。
+
 ## Secret 与 Runtime Config
 
 ### Master key 生成与轮换

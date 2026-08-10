@@ -80,4 +80,3 @@ async def test_gateway_events_reject_gap_cross_attempt_and_second_completion(db_
             event_type="message.end",
             payload={},
         )
-

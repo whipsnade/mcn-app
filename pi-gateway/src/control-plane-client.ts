@@ -11,6 +11,7 @@ import type {
   McpToolCallInput,
 } from "./mcp-accounting-extension.js";
 import {
+  CONTROL_PLANE_BASE_PATH,
   normalizePiGatewayClaimResponse,
   parsePiGatewayClaimResponse,
   parsePiGatewaySourceEvent,
@@ -201,7 +202,10 @@ export class ControlPlaneClient implements ControlPlaneTransport {
     const body = JSON.stringify(payload);
     const timestamp = this.timestamp();
     const nonce = this.nonceFactory();
-    const signature = buildSignature(this.internalSecret, method, path, timestamp, nonce, body);
+    // The signature binds the exact mounted path the backend verifies via
+    // ``request.url.path``; a relative suffix would not authenticate.
+    const fullPath = `${CONTROL_PLANE_BASE_PATH}${path}`;
+    const signature = buildSignature(this.internalSecret, method, fullPath, timestamp, nonce, body);
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
       "X-Pi-Gateway-Id": this.gatewayId,
@@ -214,7 +218,7 @@ export class ControlPlaneClient implements ControlPlaneTransport {
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
     let response: Response;
     try {
-      response = await this.fetchImpl(`${this.origin}/api/v1/internal/pi-gateway/v1${path}`, {
+      response = await this.fetchImpl(`${this.origin}${fullPath}`, {
         method,
         headers,
         body,

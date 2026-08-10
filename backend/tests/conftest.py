@@ -19,6 +19,10 @@ os.environ.setdefault("MYSQL_DATABASE", "kol_insight_test")
 os.environ.setdefault("MYSQL_USER", "kol_test")
 os.environ.setdefault("MYSQL_PASSWORD", "test-only-password")
 os.environ.setdefault("JWT_SECRET", "test-only-jwt-secret-at-least-32-characters")
+# 测试自包含占位：套件不得依赖开发者本地 .env 中的真实模型/MCP 凭证；
+# 真实服务 UAT 由脚本显式导出真实值，setdefault 不会覆盖。
+os.environ.setdefault("TENCENT_PLAN_API_KEY", "test-only-model-key")
+os.environ.setdefault("DATATAP_MCP_TOKEN", "test-only-datatap-token")
 # 测试环境确定性：enforce 开关一律由用例显式控制，不受开发 .env 影响。
 os.environ.setdefault("GOAL_PLANNER_ENFORCE_ENABLED", "false")
 

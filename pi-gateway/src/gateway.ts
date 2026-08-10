@@ -102,6 +102,10 @@ export interface PiGatewayOptions {
   maxBufferedEvents?: number;
 }
 
+export type PiGatewayDispatch =
+  | { outcome: "empty" | "unavailable" }
+  | { outcome: "claimed"; completion: Promise<void> };
+
 /** Local fake-friendly Gateway loop; Task 6 adds crash/recovery classification. */
 export class PiGateway {
   private readonly controlPlane: GatewayControlPlane;
@@ -134,7 +138,20 @@ export class PiGateway {
   }
 
   async tick(): Promise<boolean> {
-    if (this.stopped || this.activeCount >= this.capacity) return false;
+    const dispatch = await this.dispatchNext();
+    if (dispatch.outcome !== "claimed") return false;
+    await dispatch.completion;
+    return true;
+  }
+
+  /**
+   * Claim at most one Run and dispatch it to the pool without waiting for
+   * the worker to finish.  The production run loop uses this to fill shared
+   * capacity concurrently; callers must attach a rejection handler to the
+   * returned completion promise.
+   */
+  async dispatchNext(): Promise<PiGatewayDispatch> {
+    if (this.stopped || this.activeCount >= this.capacity) return { outcome: "empty" };
     let claim: PiGatewayClaimResponse | undefined;
     try {
       claim = await this.controlPlane.claim({ capacity: this.capacity });
@@ -142,11 +159,11 @@ export class PiGateway {
       const infrastructureError = asPiGatewayInfrastructureError(error);
       if (infrastructureError) {
         this.onError(infrastructureError);
-        return false;
+        return { outcome: "unavailable" };
       }
       throw error;
     }
-    if (!claim) return false;
+    if (!claim) return { outcome: "empty" };
     const promise = this.pool.submit(async () => {
       let handle: GatewayWorkerHandle | undefined;
       let unregisterAbort: (() => void) | undefined;
@@ -362,8 +379,7 @@ export class PiGateway {
         unregisterAbort?.();
       }
     });
-    await promise;
-    return true;
+    return { outcome: "claimed", completion: promise };
   }
 
   async stop(): Promise<void> {

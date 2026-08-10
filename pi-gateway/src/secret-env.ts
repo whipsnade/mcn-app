@@ -47,6 +47,21 @@ export function clearSecretEnv(env: Record<string, string>): void {
   }
 }
 
+/**
+ * Best-effort erasure of a decrypted bundle once the child process has been
+ * spawned with its own environment copy.  JavaScript strings are immutable,
+ * so this overwrites the reachable references and the caller drops the rest.
+ */
+export function clearSecretBundle(bundle: SecretBundle): void {
+  bundle.modelBaseUrl = "";
+  bundle.modelApiKey = "";
+  bundle.datatapToken = "";
+  const urls = bundle.datatapUrls as Record<string, string>;
+  for (const key of Object.keys(urls)) {
+    urls[key] = "";
+  }
+}
+
 export async function decryptSecretEnvelope(
   envelope: RuntimeSecretEnvelope,
   leaseToken: string,

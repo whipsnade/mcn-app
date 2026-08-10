@@ -6,7 +6,8 @@
   "scripts": {
     "test": "vitest run --config vitest.config.ts",
     "typecheck": "tsc --noEmit",
-    "build": "tsc --outDir dist --declaration"
+    "build": "rm -rf dist && tsc -p tsconfig.build.json --outDir dist --declaration",
+    "start": "node dist/main.js"
   },
   "dependencies": {
     "@earendil-works/pi-ai": "0.74.2",

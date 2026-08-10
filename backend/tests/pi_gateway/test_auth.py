@@ -215,3 +215,32 @@ def test_control_plane_http_is_loopback_only_and_production_requires_https() -> 
     assert str(
         _settings(app_env="test", pi_gateway_control_plane_url="http://127.0.0.1:8080").pi_gateway_control_plane_url
     ).startswith("http://127.0.0.1")
+
+
+def test_signature_matches_pinned_cross_language_fixture() -> None:
+    """Anchor half of the Node/Python HMAC contract.
+
+    The hex digest below is pinned identically in
+    ``pi-gateway/tests/hmac-contract.test.ts``.  Both implementations must sign
+    the full mounted path; a relative suffix (for example ``/claims``) must
+    produce a different digest.
+    """
+
+    signature = build_signature(
+        "cross-language-fixture-secret",
+        "POST",
+        "/api/v1/internal/pi-gateway/v1/claims",
+        1_700_000_000,
+        "nonce-cross-1",
+        b'{"capacity":2}',
+    )
+    assert signature == "5c0c9eaa797cc4728dfebac69c12de624fbfea50f0f090b99abcd99e020a522c"
+    relative = build_signature(
+        "cross-language-fixture-secret",
+        "POST",
+        "/claims",
+        1_700_000_000,
+        "nonce-cross-1",
+        b'{"capacity":2}',
+    )
+    assert relative != signature

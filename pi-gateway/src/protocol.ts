@@ -15,6 +15,13 @@ export const PI_DEPENDENCY_VERSIONS = Object.freeze({
   mcpAdapter: "2.20.1",
 });
 
+/**
+ * The single canonical mounted base path of the FastAPI internal protocol.
+ * HMAC signatures always cover the full mounted path below, never a relative
+ * suffix; the backend verifies ``request.url.path`` byte-for-byte.
+ */
+export const CONTROL_PLANE_BASE_PATH = "/api/v1/internal/pi-gateway/v1";
+
 export const PI_ALLOWED_TOOL_NAMES = Object.freeze([
   "mcp",
   "get_session_context",
@@ -63,13 +70,18 @@ export interface RuntimeSnapshot {
 
 export interface ClaimedRun {
   runId: string;
-  tenantId: string;
-  userId: string;
-  sessionId: string;
   attemptId: string;
   runtimeBackend: "pi";
   runtimeSnapshot: RuntimeSnapshot;
   userPrompt?: string;
+  /**
+   * Tenant identity is owned by the FastAPI control plane and bound to the
+   * Run lease.  Production workers never receive it; these optional fields
+   * exist only for in-process test doubles.
+   */
+  tenantId?: string;
+  userId?: string;
+  sessionId?: string;
 }
 
 export interface SecretBundle {
