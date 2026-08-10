@@ -83,6 +83,13 @@ FastAPI/Gateway 进程，架构审核据此否决了 READY 结论。修复期以
   会窃取后续拓扑的 Run（current executor 对已死 fake 模型端口执行导致秒挂）。
   出现过两次全文件回归失败（`test_session_mutex…`、`test_current_to_pi…`），
   清场（杀掉遗留进程）后单跑与全文件回归均恢复全绿。并行会话不得同时跑本文件。
+- 已修复的套件级卫生问题：UAT harness teardown 曾不删 legacy Wallet/wallet_transactions
+  （welcome grant 行），残留孤儿 wallet 让 0040 升级的 orphan 校验 fail-closed，
+  导致全量套件中迁移可逆测试级联失败（MySQL DDL 自动提交使中断的迁移链留下部分
+  回滚的 schema）；teardown 已补删，迁移模块增加干净窗口 fixture。
+- `test_fair_scheduling_two_tenants_share_capacity` 偶发时序 flake：全量套件中出现过
+  一次租户 B 仅 3/4 次 settled MCP（疑似并行负载下某次 preflight 超时后脚本步进错位），
+  单跑连续通过；如出现率上升需捕获现场再定性，不得为全绿放宽 4 次外发的硬断言。
 - 模型/账务/产物数值全部来自 fake DataTap 固定数据（例如 320 声量），只证明拓扑
   与一致性，不证明真实模型质量或 DataTap SLA。
 
