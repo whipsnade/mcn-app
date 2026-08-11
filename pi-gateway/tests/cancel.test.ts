@@ -10,6 +10,7 @@ describe("Pi Gateway cancellation", () => {
         run_id: "run-cancel-abort",
         attempt_id: "attempt-cancel-abort",
         lease_token: "lease-token-with-enough-entropy",
+        lease_expires_at: Math.floor(Date.now() / 1000) + 3600,
         runtime_snapshot: {}, transcript: [],
         secret_envelope: { alg: "AES-256-GCM", nonce: "1234567890123456", ciphertext: "1234567890123456" },
         adapter_catalog: [], internal_tools: [],

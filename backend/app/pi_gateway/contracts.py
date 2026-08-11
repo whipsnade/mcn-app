@@ -199,6 +199,9 @@ class PiGatewayClaimResponse(_StrictModel):
     run_id: str = Field(min_length=1, max_length=64)
     attempt_id: str = Field(min_length=1, max_length=64)
     lease_token: str = Field(min_length=32, max_length=512)
+    # 明确的 lease deadline（epoch 秒）：Gateway 的 heartbeat 串行节奏、
+    # 超时与失败重试预算都以它为界。
+    lease_expires_at: float
     runtime_snapshot: dict[str, Any]
     transcript: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
     secret_envelope: RuntimeSecretEnvelope

@@ -35,12 +35,15 @@ export interface IsolatedWorkerOptions {
   workerScript?: string;
   parentEnv?: NodeJS.ProcessEnv;
   execArgv?: string[];
+  /** SIGTERM 后到 SIGKILL 的升级窗口；必须小于 Run lease 的安全预算。 */
+  abortGraceMs?: number;
 }
 
 export interface IsolatedWorkerProcess extends ChildProcess {
   onEvent(listener: (event: PiGatewaySourceEvent) => void): () => void;
   done: Promise<void>;
-  abort(): void;
+  /** SIGTERM 并等待 Child 真正 close（grace 后升级 SIGKILL）才返回。 */
+  abort(): Promise<void>;
 }
 
 export type WorkerFailureCode =
@@ -95,21 +98,35 @@ export function spawnIsolatedWorker(
     return () => listeners.delete(listener);
   };
   handle.done = done;
-  handle.abort = () => {
-    if (child.killed) return;
+  // 幂等 close 信号：任何退出码/信号都 resolve（abort 等待的是进程消失，
+  // 不是成功失败）。
+  const closed = new Promise<void>((resolve) => {
+    child.once("close", () => resolve());
+  });
+  let abortStarted = false;
+  handle.abort = async () => {
+    if (abortStarted) return closed;
+    abortStarted = true;
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    const graceMs = options.abortGraceMs ?? 5_000;
     // 子进程安装了优雅停机钩子（adapter/SDK 清理），可能永远不退出；
     // 租约丢失或取消必须保证 worker 真正死亡，否则旧 Attempt 会继续
-    // 经 IPC 桥执行工具调用（双重执行）。SIGTERM 后有限时升级 SIGKILL。
+    // 经 IPC 桥执行工具调用（双重执行）。SIGTERM 后有限时升级 SIGKILL，
+    // 且只有 Child 真正 close 才返回。
     child.kill("SIGTERM");
-    const escalate = setTimeout(() => {
+    const grace = new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, graceMs);
+      timer.unref?.();
+    });
+    await Promise.race([closed, grace]);
+    if (child.exitCode === null && child.signalCode === null) {
       try {
-        if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+        child.kill("SIGKILL");
       } catch {
-        // 进程已退出。
+        // 进程刚好退出。
       }
-    }, 5_000);
-    escalate.unref?.();
-    child.once("close", () => clearTimeout(escalate));
+      await closed;
+    }
   };
   clearSecretEnv(childEnv);
   child.send({ type: "run", work });

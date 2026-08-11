@@ -13,6 +13,7 @@ export interface GatewayConfig {
   claimIntervalMs: number;
   claimMaxBackoffMs: number;
   heartbeatIntervalMs: number;
+  controlTimeoutMs: number;
   shutdownTimeoutMs: number;
   maxBufferedEvents: number;
   workerScript: string;
@@ -156,6 +157,14 @@ export function loadGatewayConfig(env: NodeJS.ProcessEnv): GatewayConfig {
     55_000,
     invalid,
   );
+  const controlTimeoutMs = readInteger(
+    env,
+    "PI_GATEWAY_CONTROL_TIMEOUT_MS",
+    15_000,
+    250,
+    120_000,
+    invalid,
+  );
   const shutdownTimeoutMs = readInteger(
     env,
     "PI_GATEWAY_SHUTDOWN_TIMEOUT_MS",
@@ -210,6 +219,7 @@ export function loadGatewayConfig(env: NodeJS.ProcessEnv): GatewayConfig {
     claimIntervalMs,
     claimMaxBackoffMs,
     heartbeatIntervalMs,
+    controlTimeoutMs,
     shutdownTimeoutMs,
     maxBufferedEvents,
     workerScript,

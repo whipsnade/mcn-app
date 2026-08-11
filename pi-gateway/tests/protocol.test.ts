@@ -21,6 +21,7 @@ describe("Pi Gateway protocol parser", () => {
       run_id: "run-1",
       attempt_id: "attempt-1",
       lease_token: "lease-token-that-is-long-enough-123",
+          lease_expires_at: 1_700_000_600,
       runtime_snapshot: {},
       transcript: [{ role: "user", content: "hello" }],
       secret_envelope: { alg: "AES-256-GCM", nonce: "AAAAAAAAAAAAAAAA", ciphertext: "BBBBBBBBBBBBBBBB" },

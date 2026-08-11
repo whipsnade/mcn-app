@@ -32,7 +32,7 @@ from .accounting import RuntimeUsageError, RuntimeUsageService, TenantAccounting
 from .events import PiGatewayEventError, parse_source_event_id
 from .internal_tools import ProductionInternalToolBridge
 from .models import PiGatewayRequestNonce
-from .service import PiGatewayClaimError, PiGatewayLeaseError, PiGatewayService
+from .service import PiGatewayClaimError, PiGatewayLeaseError, PiGatewayService, lease_deadline_epoch
 
 
 router = APIRouter()
@@ -165,7 +165,11 @@ async def heartbeat(
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="pi_gateway_run_not_found") from exc
-    return {"ok": True, "cancel_requested": decision.cancel_requested}
+    return {
+        "ok": True,
+        "cancel_requested": decision.cancel_requested,
+        "lease_expires_at": lease_deadline_epoch(decision.lease_expires_at),
+    }
 
 
 @router.post("/runs/{run_id}/events")

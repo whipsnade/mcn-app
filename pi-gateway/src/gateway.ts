@@ -75,7 +75,11 @@ export class BoundedGatewayEventBuffer<T = unknown> {
 
 export interface GatewayControlPlane {
   claim(payload: { capacity: number }): Promise<PiGatewayClaimResponse | undefined>;
-  heartbeat(runId: string, attemptId: string, leaseToken: string): Promise<unknown>;
+  heartbeat(
+    runId: string,
+    attemptId: string,
+    leaseToken: string,
+  ): Promise<{ cancel_requested?: boolean; lease_expires_at?: number } | undefined>;
   sendEvent?(runId: string, event: PiGatewaySourceEvent, leaseToken: string): Promise<unknown>;
   terminal(
     runId: string,
@@ -98,6 +102,8 @@ export interface PiGatewayOptions {
   worker: (claim: PiGatewayClaimResponse) => Promise<void | GatewayWorkerHandle>;
   onError?: (error: unknown) => void;
   heartbeatIntervalMs?: number;
+  /** 单次控制面请求的墙钟上限；每次 beat 的实际超时还会按租约余额收紧。 */
+  controlTimeoutMs?: number;
   shutdownTimeoutMs?: number;
   maxBufferedEvents?: number;
 }
@@ -113,8 +119,9 @@ export class PiGateway {
   private readonly worker: PiGatewayOptions["worker"];
   private readonly onError: (error: unknown) => void;
   private readonly pool: WorkerPool;
-  private readonly heartbeatTimers = new Set<ReturnType<typeof setInterval>>();
+  private readonly heartbeatTimers = new Set<ReturnType<typeof setTimeout>>();
   private readonly heartbeatIntervalMs: number;
+  private readonly controlTimeoutMs: number;
   private readonly shutdownTimeoutMs: number;
   private readonly maxBufferedEvents: number;
   private stopped = false;
@@ -125,6 +132,7 @@ export class PiGateway {
     this.worker = options.worker;
     this.onError = options.onError ?? (() => undefined);
     this.heartbeatIntervalMs = Math.max(1, options.heartbeatIntervalMs ?? 20_000);
+    this.controlTimeoutMs = Math.max(25, options.controlTimeoutMs ?? 15_000);
     this.shutdownTimeoutMs = Math.max(1, options.shutdownTimeoutMs ?? 10_000);
     this.maxBufferedEvents = options.maxBufferedEvents ?? 256;
     if (!Number.isInteger(this.maxBufferedEvents) || this.maxBufferedEvents < 1 || this.maxBufferedEvents > 100_000) {
@@ -193,7 +201,7 @@ export class PiGateway {
         })().finally(() => { eventFlushPromise = undefined; });
         await eventFlushPromise;
       };
-      let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+      let heartbeatTimer: ReturnType<typeof setTimeout> | undefined;
       let rejectHeartbeat!: (error: unknown) => void;
       const heartbeatFailure = new Promise<never>((_resolve, reject) => {
         rejectHeartbeat = reject;
@@ -205,30 +213,89 @@ export class PiGateway {
       // rejection.
       void heartbeatFailure.catch(() => undefined);
       let heartbeatFailed = false;
+      let beatsStopped = false;
       let heartbeatOutcome: "cancelled" | "lost" | undefined;
       let heartbeatError: unknown;
-      // 单次网络抖动/超时不能丢租约：连续失败达到阈值才按 lease 丢失处理。
-      // 阈值 × 请求超时必须小于服务端 run lease（默认 60s）。
+      // 租约 fencing：claim 必须携带明确 deadline（协议必填，缺省 fail-closed
+      // 不启动 worker）；heartbeat 串行自调度，任何时刻至多一个在飞请求；
+      // 单次 beat 超时按租约余额收紧，且「失败重试窗口 + abort grace」严格
+      // 小于 lease：maxFailures(2) × lease/4 + lease/4 = 3/4 lease < lease。
+      const claimedDeadline = (claim as { lease_expires_at?: unknown }).lease_expires_at;
+      if (
+        typeof claimedDeadline !== "number" ||
+        !Number.isFinite(claimedDeadline) ||
+        claimedDeadline <= 0
+      ) {
+        // 协议违规：不启动 worker，把 Run 留给后端恢复（lease 到期回收）。
+        this.onError(new PiGatewayInfrastructureError("control_plane_unreachable"));
+        return;
+      }
+      let leaseDeadlineMs = claimedDeadline * 1000;
+      const abortGraceMs = Math.max(
+        25,
+        Math.min(5_000, Math.floor((leaseDeadlineMs - Date.now()) / 4)),
+      );
+      const maxConsecutiveHeartbeatFailures = 2;
       let consecutiveHeartbeatFailures = 0;
-      const maxConsecutiveHeartbeatFailures = 3;
-      try {
-        const heartbeat = async (): Promise<void> => {
-          if (heartbeatFailed) return;
+      let beatInFlight = false;
+      const markLost = (cause: unknown): void => {
+        if (heartbeatFailed) return;
+        heartbeatFailed = true;
+        heartbeatOutcome = "lost";
+        heartbeatError = asPiGatewayInfrastructureError(cause)
+          ?? new PiGatewayInfrastructureError("control_plane_unreachable", cause);
+        // abort 等待 Child 真正 close（内部 SIGKILL 升级兜底）后才交还恢复。
+        void (async () => {
+          try { await handle?.abort?.(); } finally { rejectHeartbeat(heartbeatError); }
+        })();
+      };
+      const scheduleNextBeat = (): void => {
+        if (heartbeatFailed || beatsStopped) return;
+        const delay = Math.min(
+          this.heartbeatIntervalMs,
+          Math.max(10, Math.floor((leaseDeadlineMs - Date.now()) / 3)),
+        );
+        const timer = setTimeout(() => {
+          this.heartbeatTimers.delete(timer);
+          void beat();
+        }, delay);
+        timer.unref?.();
+        this.heartbeatTimers.add(timer);
+        heartbeatTimer = timer;
+      };
+      const beat = async (): Promise<void> => {
+        if (heartbeatFailed || beatInFlight) return;
+        beatInFlight = true;
+        try {
+          const remainingMs = leaseDeadlineMs - Date.now();
+          if (remainingMs <= abortGraceMs) {
+            // 再发一次也可能在 deadline 之后才被处理：直接放弃租约，留足
+            // abort grace，把 Run 交给后端恢复。
+            markLost(new Error("pi_gateway_lease_deadline"));
+            return;
+          }
+          const beatTimeoutMs = Math.max(25, Math.min(this.controlTimeoutMs, Math.floor(remainingMs / 4)));
+          let beatTimeout: ReturnType<typeof setTimeout> | undefined;
           try {
-            const decision = await this.controlPlane.heartbeat(
-              claim.run_id,
-              claim.attempt_id,
-              claim.lease_token,
-            );
+            const decision = await Promise.race([
+              this.controlPlane.heartbeat(claim.run_id, claim.attempt_id, claim.lease_token),
+              new Promise<never>((_resolve, reject) => {
+                beatTimeout = setTimeout(
+                  () => reject(new Error("pi_gateway_heartbeat_timeout")),
+                  beatTimeoutMs,
+                );
+                beatTimeout.unref?.();
+              }),
+            ]);
             consecutiveHeartbeatFailures = 0;
+            if (decision && typeof decision.lease_expires_at === "number") {
+              leaseDeadlineMs = decision.lease_expires_at * 1000;
+            }
             if (this.controlPlane.sendEvent && !eventBufferError) {
               eventFlushBlocked = false;
               void flushEvents().catch((error) => this.onError(error));
             }
-            if (
-              decision && typeof decision === "object" &&
-              "cancel_requested" in decision && decision.cancel_requested === true
-            ) {
+            if (decision?.cancel_requested === true) {
               heartbeatFailed = true;
               heartbeatOutcome = "cancelled";
               try {
@@ -236,29 +303,33 @@ export class PiGateway {
               } finally {
                 rejectHeartbeat(new Error("pi_gateway_cancel_requested"));
               }
-            }
-          } catch (error) {
-            // 取消语义立即生效；其余错误先计数，连续超阈值才丢租约。
-            consecutiveHeartbeatFailures += 1;
-            if (consecutiveHeartbeatFailures < maxConsecutiveHeartbeatFailures) {
-              this.onError(
-                asPiGatewayInfrastructureError(error)
-                  ?? new PiGatewayInfrastructureError("control_plane_unreachable", error),
-              );
               return;
             }
-            heartbeatFailed = true;
-            heartbeatOutcome = "lost";
-            heartbeatError = asPiGatewayInfrastructureError(error)
-              ?? new PiGatewayInfrastructureError("control_plane_unreachable", error);
-            try { await handle?.abort?.(); } finally { rejectHeartbeat(heartbeatError); }
+          } catch (error) {
+            consecutiveHeartbeatFailures += 1;
+            this.onError(
+              asPiGatewayInfrastructureError(error)
+                ?? new PiGatewayInfrastructureError("control_plane_unreachable", error),
+            );
+            if (
+              consecutiveHeartbeatFailures >= maxConsecutiveHeartbeatFailures ||
+              Date.now() + abortGraceMs >= leaseDeadlineMs
+            ) {
+              markLost(error);
+              return;
+            }
+          } finally {
+            if (beatTimeout !== undefined) clearTimeout(beatTimeout);
           }
-        };
+        } finally {
+          beatInFlight = false;
+          scheduleNextBeat();
+        }
+      };
+      try {
         // Start renewing before worker/session initialization completes; a
-        // slow SDK factory must not let the 60s gateway lease expire.
-        heartbeatTimer = setInterval(() => { void heartbeat().catch(() => undefined); }, this.heartbeatIntervalMs);
-        heartbeatTimer.unref?.();
-        this.heartbeatTimers.add(heartbeatTimer);
+        // slow SDK factory must not let the gateway lease expire.
+        scheduleNextBeat();
         const workerResult = await this.worker(claim);
         handle = typeof workerResult === "object" && workerResult !== null
           ? workerResult
@@ -384,6 +455,9 @@ export class PiGateway {
         if (heartbeatOutcome === "lost") {
           // A lost lease is an infrastructure hand-off.  Leave the Run for
           // backend recovery instead of manufacturing a business failure.
+          // markLost 可能发生在 worker 初始化完成之前——这里必须兜底 abort
+          // 已经 spawn 的 Child，否则孤儿进程会继续经 IPC 桥执行工具调用。
+          await handle?.abort?.();
           this.onError(heartbeatError ?? error);
           return;
         }
@@ -406,6 +480,9 @@ export class PiGateway {
         }
         throw error;
       } finally {
+        // 先停止再清理：在飞的 beat 结束时会尝试自调度，必须先立停止标志，
+        // 否则任务收口后仍会续租，把已结束的 Run 的 lease 永远续下去。
+        beatsStopped = true;
         if (heartbeatTimer !== undefined) clearInterval(heartbeatTimer);
         if (heartbeatTimer !== undefined) this.heartbeatTimers.delete(heartbeatTimer);
         unregisterEvents?.();

@@ -195,4 +195,28 @@ describe("single-run worker lifecycle", () => {
     remove();
     expect(calls).toBe(1);
   });
+
+  it("abort resolves only after the child closes, escalating to SIGKILL after the grace", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "worker-sigterm-ignore-"));
+    const script = join(directory, "ignore-sigterm.mjs");
+    await writeFile(script, [
+      "process.on('SIGTERM', () => {});",
+      "process.on('message', () => process.send({ type: 'ready' }));",
+      "setInterval(() => {}, 1000);",
+    ].join("\n"));
+    const child = spawnIsolatedWorker(work, secrets, {
+      workerScript: script,
+      parentEnv: { PATH: "/usr/bin" },
+      abortGraceMs: 50,
+    });
+    await new Promise<void>((resolve) => child.once("message", () => resolve()));
+    let closed = false;
+    child.once("close", () => { closed = true; });
+
+    await child.abort();
+
+    // abort 必须等 Child 真正 close（SIGTERM 被忽略 → 升级到 SIGKILL 后关闭）。
+    expect(closed).toBe(true);
+    expect(child.killed).toBe(true);
+  });
 });

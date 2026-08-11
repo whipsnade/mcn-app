@@ -64,6 +64,7 @@ function claimResponse(overrides: { tamperAad?: boolean } = {}) {
     run_id: "run-main-1",
     attempt_id: "attempt-main-1",
     lease_token: LEASE_TOKEN,
+    lease_expires_at: Math.floor(Date.now() / 1000) + 3600,
     runtime_snapshot: {
       config_version_id: CONFIG_VERSION_ID,
       runtime_contract_version: "marketing_runtime_v1",

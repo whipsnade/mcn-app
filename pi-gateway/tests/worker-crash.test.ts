@@ -19,6 +19,7 @@ describe("Pi Gateway worker crash", () => {
         run_id: "run-worker-crash",
         attempt_id: "attempt-worker-crash",
         lease_token: "lease-token-with-enough-entropy",
+        lease_expires_at: Math.floor(Date.now() / 1000) + 3600,
         runtime_snapshot: {}, transcript: [],
         secret_envelope: { alg: "AES-256-GCM", nonce: "1234567890123456", ciphertext: "1234567890123456" },
         adapter_catalog: [], internal_tools: [],

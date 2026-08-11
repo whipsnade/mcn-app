@@ -130,6 +130,8 @@ export interface PiGatewayClaimResponse {
   run_id: string;
   attempt_id: string;
   lease_token: string;
+  /** 明确的 lease deadline（epoch 秒）；缺省视为协议违规，禁止执行。 */
+  lease_expires_at: number;
   runtime_snapshot: Record<string, unknown>;
   transcript: Array<Record<string, unknown>>;
   secret_envelope: RuntimeSecretEnvelope;
@@ -277,7 +279,7 @@ export function parsePiGatewaySourceEvent(value: unknown): PiGatewaySourceEvent 
 
 /** Runtime validation mirror for the strict FastAPI claim response DTO. */
 export function parsePiGatewayClaimResponse(value: unknown): PiGatewayClaimResponse {
-  if (!isRecord(value) || !exactKeys(value, ["run_id", "attempt_id", "lease_token", "runtime_snapshot", "transcript", "secret_envelope", "adapter_catalog", "internal_tools"])) {
+  if (!isRecord(value) || !exactKeys(value, ["run_id", "attempt_id", "lease_token", "lease_expires_at", "runtime_snapshot", "transcript", "secret_envelope", "adapter_catalog", "internal_tools"])) {
     throw new Error("pi_gateway_claim_response_invalid");
   }
   const envelope = value.secret_envelope;
@@ -285,6 +287,7 @@ export function parsePiGatewayClaimResponse(value: unknown): PiGatewayClaimRespo
     typeof value.run_id !== "string" || value.run_id.length < 1 || value.run_id.length > 64 ||
     typeof value.attempt_id !== "string" || value.attempt_id.length < 1 || value.attempt_id.length > 64 ||
     typeof value.lease_token !== "string" || value.lease_token.length < 32 || value.lease_token.length > 512 ||
+    typeof value.lease_expires_at !== "number" || !Number.isFinite(value.lease_expires_at) || value.lease_expires_at <= 0 ||
     !isRecord(value.runtime_snapshot) || !Array.isArray(value.transcript) || value.transcript.length > 100 ||
     !isRecord(envelope) || !exactKeys(envelope, ["alg", "nonce", "ciphertext"]) ||
     envelope.alg !== "AES-256-GCM" || typeof envelope.nonce !== "string" || envelope.nonce.length < 16 || envelope.nonce.length > 64 ||

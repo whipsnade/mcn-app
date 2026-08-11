@@ -15,6 +15,7 @@ describe("PiGateway", () => {
           run_id: `run-${remaining}`,
           attempt_id: `attempt-${remaining}`,
           lease_token: "lease-token-with-enough-entropy",
+        lease_expires_at: Math.floor(Date.now() / 1000) + 3600,
           runtime_snapshot: {},
           transcript: [],
           secret_envelope: { alg: "AES-256-GCM", nonce: "1234567890123456", ciphertext: "1234567890123456" },
@@ -45,6 +46,7 @@ describe("PiGateway", () => {
         run_id: "run-heartbeat",
         attempt_id: "attempt-heartbeat",
         lease_token: "lease-token-with-enough-entropy",
+        lease_expires_at: Math.floor(Date.now() / 1000) + 3600,
         runtime_snapshot: {},
         transcript: [],
         secret_envelope: { alg: "AES-256-GCM", nonce: "1234567890123456", ciphertext: "1234567890123456" },
@@ -90,6 +92,7 @@ describe("PiGateway", () => {
         run_id: "run-lost",
         attempt_id: "attempt-lost",
         lease_token: "lease-token-with-enough-entropy",
+        lease_expires_at: Math.floor(Date.now() / 1000) + 3600,
         runtime_snapshot: {}, transcript: [],
         secret_envelope: { alg: "AES-256-GCM", nonce: "1234567890123456", ciphertext: "1234567890123456" },
         adapter_catalog: [], internal_tools: [],
@@ -116,6 +119,7 @@ describe("PiGateway", () => {
         run_id: "run-init-lost",
         attempt_id: "attempt-init-lost",
         lease_token: "lease-token-with-enough-entropy",
+        lease_expires_at: Math.floor(Date.now() / 1000) + 3600,
         runtime_snapshot: {}, transcript: [],
         secret_envelope: { alg: "AES-256-GCM", nonce: "1234567890123456", ciphertext: "1234567890123456" },
         adapter_catalog: [], internal_tools: [],
@@ -152,6 +156,7 @@ describe("PiGateway", () => {
         run_id: "run-cancel",
         attempt_id: "attempt-cancel",
         lease_token: "lease-token-with-enough-entropy",
+        lease_expires_at: Math.floor(Date.now() / 1000) + 3600,
         runtime_snapshot: {}, transcript: [],
         secret_envelope: { alg: "AES-256-GCM", nonce: "1234567890123456", ciphertext: "1234567890123456" },
         adapter_catalog: [], internal_tools: [],
@@ -202,6 +207,7 @@ describe("PiGateway", () => {
         run_id: "run-terminal-lost",
         attempt_id: "attempt-terminal-lost",
         lease_token: "lease-token-with-enough-entropy",
+        lease_expires_at: Math.floor(Date.now() / 1000) + 3600,
         runtime_snapshot: {}, transcript: [],
         secret_envelope: { alg: "AES-256-GCM", nonce: "1234567890123456", ciphertext: "1234567890123456" },
         adapter_catalog: [], internal_tools: [],
@@ -227,6 +233,7 @@ describe("PiGateway", () => {
         run_id: "run-event-overflow",
         attempt_id: "attempt-event-overflow",
         lease_token: "lease-token-with-enough-entropy",
+        lease_expires_at: Math.floor(Date.now() / 1000) + 3600,
         runtime_snapshot: {}, transcript: [],
         secret_envelope: { alg: "AES-256-GCM", nonce: "1234567890123456", ciphertext: "1234567890123456" },
         adapter_catalog: [], internal_tools: [],
@@ -269,6 +276,7 @@ describe("PiGateway", () => {
         run_id: "run-event-flush",
         attempt_id: "attempt-event-flush",
         lease_token: "lease-token-with-enough-entropy",
+        lease_expires_at: Math.floor(Date.now() / 1000) + 3600,
         runtime_snapshot: {}, transcript: [],
         secret_envelope: { alg: "AES-256-GCM", nonce: "1234567890123456", ciphertext: "BBBBBBBBBBBBBBBB" },
         adapter_catalog: [], internal_tools: [],
@@ -313,5 +321,106 @@ describe("PiGateway", () => {
       },
       "lease-token-with-enough-entropy",
     );
+  });
+
+  it("serializes heartbeats so a slow beat never overlaps the next one", async () => {
+    // 租约 fencing：同一 Run 的 heartbeat 必须串行，慢请求不得与下一次重叠。
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const pending: Array<() => void> = [];
+    const heartbeat = vi.fn(() => {
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      return new Promise<{ cancel_requested: boolean; lease_expires_at: number }>((resolve) => {
+        pending.push(() => {
+          inFlight -= 1;
+          resolve({
+            cancel_requested: false,
+            lease_expires_at: Math.floor(Date.now() / 1000) + 3600,
+          });
+        });
+      });
+    });
+    const terminal = vi.fn().mockResolvedValue(undefined);
+    const controlPlane = {
+      claim: vi.fn().mockResolvedValue({
+        run_id: "run-serial-hb",
+        attempt_id: "attempt-serial-hb",
+        lease_token: "lease-token-with-enough-entropy",
+        lease_expires_at: Math.floor(Date.now() / 1000) + 3600,
+        runtime_snapshot: {}, transcript: [],
+        secret_envelope: { alg: "AES-256-GCM", nonce: "1234567890123456", ciphertext: "1234567890123456" },
+        adapter_catalog: [], internal_tools: [],
+      }),
+      terminal,
+      heartbeat,
+    };
+    const gateway = new PiGateway({
+      controlPlane, capacity: 1, heartbeatIntervalMs: 1,
+      worker: async () => ({ done: new Promise<void>((resolve) => setTimeout(resolve, 25)) }),
+    });
+
+    const tick = gateway.tick();
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    for (const release of pending.splice(0)) release();
+    await tick;
+
+    expect(maxInFlight).toBe(1);
+    expect(heartbeat).toHaveBeenCalled();
+  });
+
+  it("fails closed when the claim carries no explicit lease deadline", async () => {
+    const onError = vi.fn();
+    const worker = vi.fn();
+    const controlPlane = {
+      claim: vi.fn().mockResolvedValue({
+        run_id: "run-no-deadline",
+        attempt_id: "attempt-no-deadline",
+        lease_token: "lease-token-with-enough-entropy",
+        runtime_snapshot: {}, transcript: [],
+        secret_envelope: { alg: "AES-256-GCM", nonce: "1234567890123456", ciphertext: "1234567890123456" },
+        adapter_catalog: [], internal_tools: [],
+      }),
+      terminal: vi.fn(),
+      heartbeat: vi.fn(),
+    };
+    const gateway = new PiGateway({ controlPlane, capacity: 1, onError, worker });
+
+    await gateway.tick();
+
+    expect(worker).not.toHaveBeenCalled();
+    expect(onError).toHaveBeenCalled();
+  });
+
+  it("declares the lease lost at the deadline and aborts the worker inside the grace", async () => {
+    // heartbeat 永不返回：deadline 到达时（预留 abort grace）必须放弃租约并
+    // 中止 worker，把 Run 留给恢复，而不是等超时拖过 lease。
+    const heartbeat = vi.fn(() => new Promise<never>(() => undefined));
+    const terminal = vi.fn().mockResolvedValue(undefined);
+    let finish!: () => void;
+    const done = new Promise<void>((resolve) => { finish = resolve; });
+    const abort = vi.fn(async () => { finish(); });
+    const controlPlane = {
+      claim: vi.fn().mockResolvedValue({
+        run_id: "run-deadline",
+        attempt_id: "attempt-deadline",
+        lease_token: "lease-token-with-enough-entropy",
+        lease_expires_at: Date.now() / 1000 + 0.3,
+        runtime_snapshot: {}, transcript: [],
+        secret_envelope: { alg: "AES-256-GCM", nonce: "1234567890123456", ciphertext: "1234567890123456" },
+        adapter_catalog: [], internal_tools: [],
+      }),
+      terminal,
+      heartbeat,
+    };
+    const gateway = new PiGateway({
+      controlPlane, capacity: 1, heartbeatIntervalMs: 5,
+      worker: async () => ({ abort, done }),
+    });
+
+    await gateway.tick();
+
+    expect(abort).toHaveBeenCalledTimes(1);
+    expect(terminal).not.toHaveBeenCalled();
   });
 });

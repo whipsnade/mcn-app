@@ -146,6 +146,17 @@ def _adapter_catalog_entry(
     )
 
 
+def lease_deadline_epoch(value: datetime) -> float:
+    """naive UTC datetime → epoch 秒。
+
+    仓库约定按 naive UTC 存储（``datetime.now(UTC).replace(tzinfo=None)``）；
+    直接 ``.timestamp()`` 会按本地时区解释，UTC+8 下向外暴露的 lease
+    deadline 会偏早 8 小时（Gateway 侧立即判 lease 过期）。对外暴露一律
+    走这里；lease token 内部校验两侧同口径，不受影响。
+    """
+    return value.replace(tzinfo=UTC).timestamp()
+
+
 class PiGatewayService:
     """The B2B response boundary layered over the persistent Pi scheduler."""
 
@@ -251,6 +262,7 @@ class PiGatewayService:
                 run_id=run.id,
                 attempt_id=attempt.id,
                 lease_token=token,
+                lease_expires_at=lease_deadline_epoch(prepared.lease_expires_at),
                 runtime_snapshot=snapshot,
                 transcript=[{"role": item.role, "content": item.content} for item in messages],
                 secret_envelope=envelope,

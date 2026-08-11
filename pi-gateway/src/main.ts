@@ -149,9 +149,14 @@ export function createProductionWorker(options: {
         userPrompt,
         internalTools,
       };
+      // abort grace 必须与 gateway.ts 的租约预算同构：严格小于 lease/4，
+      // 保证「beat 超时 × 重试 + grace」总和永远在 lease 之内。
+      const leaseMs = Math.max(0, claim.lease_expires_at * 1000 - Date.now());
+      const abortGraceMs = Math.max(25, Math.min(5_000, Math.floor(leaseMs / 4)));
       const child = spawn(work, secrets, {
         workerScript: options.workerScript,
         execArgv: [...options.workerExecArgv],
+        abortGraceMs,
       });
       // The parent keeps the HMAC secret and lease token; every child tool
       // call crosses this bridge and is re-executed against FastAPI.
@@ -226,11 +231,13 @@ export async function runGatewayMain(deps: GatewayMainDependencies = {}): Promis
     internalSecret: config.internalSecret,
     fetchImpl: deps.fetchImpl,
     environment: config.environment,
+    timeoutMs: config.controlTimeoutMs,
   });
   const gateway = new PiGateway({
     controlPlane,
     capacity: config.capacity,
     heartbeatIntervalMs: config.heartbeatIntervalMs,
+    controlTimeoutMs: config.controlTimeoutMs,
     shutdownTimeoutMs: config.shutdownTimeoutMs,
     maxBufferedEvents: config.maxBufferedEvents,
     worker: createProductionWorker({

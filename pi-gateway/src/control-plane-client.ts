@@ -95,8 +95,35 @@ export class ControlPlaneClient implements ControlPlaneTransport {
       : normalizePiGatewayClaimResponse(parsePiGatewayClaimResponse(response));
   }
 
-  async heartbeat(runId: string, attemptId: string, leaseToken: string): Promise<unknown> {
-    return this.request("POST", `/runs/${encodeURIComponent(runId)}/heartbeat`, { attempt_id: attemptId }, leaseToken);
+  async heartbeat(
+    runId: string,
+    attemptId: string,
+    leaseToken: string,
+  ): Promise<{ cancel_requested?: boolean; lease_expires_at?: number } | undefined> {
+    const result = await this.request<unknown>(
+      "POST",
+      `/runs/${encodeURIComponent(runId)}/heartbeat`,
+      { attempt_id: attemptId },
+      leaseToken,
+    );
+    if (result === undefined) return undefined;
+    if (!result || typeof result !== "object") throw new Error("pi_gateway_heartbeat_invalid");
+    const decision = result as Record<string, unknown>;
+    const out: { cancel_requested?: boolean; lease_expires_at?: number } = {};
+    if ("cancel_requested" in decision) {
+      if (typeof decision.cancel_requested !== "boolean") {
+        throw new Error("pi_gateway_heartbeat_invalid");
+      }
+      out.cancel_requested = decision.cancel_requested;
+    }
+    if ("lease_expires_at" in decision) {
+      const expiry = decision.lease_expires_at;
+      if (typeof expiry !== "number" || !Number.isFinite(expiry) || expiry <= 0) {
+        throw new Error("pi_gateway_heartbeat_invalid");
+      }
+      out.lease_expires_at = expiry;
+    }
+    return out;
   }
 
   async executeInternalTool(
