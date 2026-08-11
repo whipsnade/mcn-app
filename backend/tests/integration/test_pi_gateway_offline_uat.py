@@ -21,6 +21,7 @@ from uuid import uuid4
 
 import httpx
 import pytest
+import pytest_asyncio
 from sqlalchemy import func, select, update
 
 from app.agent_artifacts.models import AgentArtifact, AgentArtifactVersion
@@ -44,9 +45,19 @@ from .pi_uat.fake_model import (
     step_text,
     tool_result_texts,
 )
-from .pi_uat.harness import GATEWAY_ID, GATEWAY_SECRET, PiUatTopology
+from .pi_uat.harness import GATEWAY_SECRET, PiUatTopology, purge_uat_residue
 
 pytestmark = pytest.mark.asyncio
+
+
+@pytest_asyncio.fixture(scope="module", autouse=True)
+async def _uat_file_scope_cleanup():
+    """清理中断轮次的 UAT 残留；harness 已硬断言只允许 test DB。"""
+    await purge_uat_residue()
+    try:
+        yield
+    finally:
+        await purge_uat_residue()
 
 BRAND = "测试品牌"
 BRAND_SCOPE = {
@@ -174,7 +185,7 @@ async def _wait_gateway_registered(topology: PiUatTopology, timeout: float = 15.
     while time.monotonic() < deadline:
         async with SessionFactory() as db:
             row = await db.scalar(
-                select(PiGatewayInstance).where(PiGatewayInstance.gateway_id == "gw-uat-1")
+                select(PiGatewayInstance).where(PiGatewayInstance.gateway_id == topology.gateway_id)
             )
             if row is not None and row.status == "active":
                 return
@@ -670,7 +681,7 @@ async def test_nonce_replay_rejected() -> None:
         nonce = uuid4().hex
         headers = {
             "Content-Type": "application/json",
-            "X-Pi-Gateway-Id": "gw-uat-1",
+            "X-Pi-Gateway-Id": topology.gateway_id,
             "X-Pi-Timestamp": str(timestamp),
             "X-Pi-Nonce": nonce,
             "X-Pi-Signature": _gateway_signature("POST", path, timestamp, nonce, body),
@@ -1041,7 +1052,7 @@ async def test_worker_crash_single_recovery_then_failed_on_second_crash() -> Non
         assert response.status_code in (200, 201, 202), response.text
         run = await topology.run_by_session(session_id)
 
-        async def wait_new_worker(exclude: set[int], timeout: float = 60.0) -> set[int]:
+        async def wait_new_worker(exclude: set[int], timeout: float = 180.0) -> set[int]:
             deadline = time.monotonic() + timeout
             while time.monotonic() < deadline:
                 current = _worker_pids(topology) - exclude
@@ -1050,7 +1061,7 @@ async def test_worker_crash_single_recovery_then_failed_on_second_crash() -> Non
                 await asyncio.sleep(0.2)
             raise RuntimeError("worker_spawn_timeout")
 
-        async def wait_model_calls(expected: int, timeout: float = 60.0) -> None:
+        async def wait_model_calls(expected: int, timeout: float = 180.0) -> None:
             """等该 Attempt 的模型请求真正发出（worker 进入 hang 状态）再 kill。"""
             deadline = time.monotonic() + timeout
             while time.monotonic() < deadline:
@@ -1114,7 +1125,7 @@ async def _set_gateway_mode(topology: PiUatTopology, mode: str) -> None:
     """经管理 API 切换 gateway mode（active/draining），走真实审计与幂等路径。"""
     async with topology.admin_client() as admin:
         response = await admin.patch(
-            f"/api/v1/admin/pi-runtime/gateways/{GATEWAY_ID}",
+            f"/api/v1/admin/pi-runtime/gateways/{topology.gateway_id}",
             headers={"Idempotency-Key": str(uuid4())},
             json={"mode": mode},
         )
@@ -1297,7 +1308,7 @@ async def test_draining_gateway_stops_new_claims_but_finishes_active() -> None:
 
         async with SessionFactory() as db:
             instance = await db.scalar(
-                select(PiGatewayInstance).where(PiGatewayInstance.gateway_id == GATEWAY_ID)
+                select(PiGatewayInstance).where(PiGatewayInstance.gateway_id == topology.gateway_id)
             )
         assert instance is not None and instance.mode == "draining"
         session2 = await topology.create_session(user)

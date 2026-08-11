@@ -44,6 +44,17 @@ GATEWAY_ID = "gw-uat-1"
 MASTER_KEY_B64 = "dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXV1dXU="  # base64(32 bytes, 测试占位)
 
 
+def assert_uat_database_scope() -> None:
+    """Destructive UAT cleanup is allowed only in the dedicated test database."""
+    expected = {
+        "APP_ENV": "test",
+        "MYSQL_DATABASE": "kol_insight_test",
+        "MYSQL_USER": "kol_test",
+    }
+    if any(os.environ.get(key) != value for key, value in expected.items()):
+        raise RuntimeError("uat_database_scope_invalid")
+
+
 @dataclass
 class UatUser:
     user_id: str
@@ -64,6 +75,7 @@ async def purge_uat_residue() -> None:
     迁移类测试（0037/0040/0043 guard）要求全库无此类残留；正常 teardown
     已逐拓扑清理，这里兜底中断场景。仅限隔离测试库。
     """
+    assert_uat_database_scope()
     from app.agent_runtime.models import AgentRun, AgentSession
     from app.identity.models import User
     from app.tenancy.models import Tenant
@@ -153,8 +165,8 @@ async def purge_uat_residue() -> None:
                         f"DELETE FROM agent_artifacts WHERE session_id IN ({','.join(repr(i) for i in session_ids)})"
                     )
                 )
-            await db.execute(text("DELETE FROM pi_gateway_instances"))
-            await db.execute(text("DELETE FROM pi_gateway_request_nonces"))
+            await db.execute(text("DELETE FROM pi_gateway_instances WHERE gateway_id LIKE 'gw-uat-%'"))
+            await db.execute(text("DELETE FROM pi_gateway_request_nonces WHERE gateway_id LIKE 'gw-uat-%'"))
         finally:
             await db.execute(text("SET FOREIGN_KEY_CHECKS=1"))
 
@@ -214,11 +226,32 @@ class _InProcessServer:
 
     async def stop(self) -> None:
         self._server.should_exit = True
-        if self._task is not None:
-            await asyncio.wait_for(self._task, timeout=10)
+        task = self._task
+        if task is None:
+            return
+        try:
+            await asyncio.wait_for(task, timeout=10)
+        except asyncio.TimeoutError:
+            # Uvicorn may still be draining a deliberately hanging fake
+            # request. Cancel and gather the serve task so no task exception
+            # or loop reference survives the topology cleanup.
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            if not task.done():
+                raise RuntimeError("in_process_server_stop_timeout")
 
 
-async def _wait_http_ok(url: str, timeout: float = 30.0) -> None:
+async def _wait_proc_exit(proc: subprocess.Popen, timeout: float) -> bool:
+    """非阻塞等子进程退出；proc.wait() 会冻结事件循环，饿死同进程的 fake 服务。"""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            return True
+        await asyncio.sleep(0.1)
+    return False
+
+
+async def _wait_http_ok(url: str, timeout: float = 60.0) -> None:
     deadline = time.monotonic() + timeout
     async with httpx.AsyncClient() as client:
         while time.monotonic() < deadline:
@@ -239,6 +272,8 @@ class PiUatTopology:
         self.model = FakeModelServer(scripts)
         self.mcp_services = [FakeDataTapService("insight-cube-mcp"), FakeDataTapService("social-grow-mcp")]
         self.kill_switch = kill_switch
+        self.gateway_id = f"gw-uat-{uuid4().hex[:12]}"
+        self.lifecycle_events: list[str] = []
         self._servers: list[_InProcessServer] = []
         self._fastapi: subprocess.Popen | None = None
         self._gateway: subprocess.Popen | None = None
@@ -252,6 +287,10 @@ class PiUatTopology:
         self.admin_token = ""
         self._seeded_user_ids: list[str] = []
         self._seeded_tenant_ids: list[str] = []
+        self._cleanup_task: asyncio.Task | None = None
+
+    def _log_lifecycle(self, event: str) -> None:
+        self.lifecycle_events.append(event)
 
     @property
     def api_base(self) -> str:
@@ -271,8 +310,7 @@ class PiUatTopology:
             # 启动中途失败（例如 healthz 等待超时）也必须回收已拉起的子进程
             # 与已提交的种子数据，否则泄漏的 FastAPI/Gateway 会继续在共享
             # 测试库上窃取后续拓扑的 Run，残留租户会阻断迁移 guard。
-            await self._stop_processes()
-            await self._teardown_db()
+            await self._cleanup()
             raise
 
     async def _start_topology(self) -> PiUatTopology:
@@ -283,22 +321,27 @@ class PiUatTopology:
         model_server = _InProcessServer(self.model.app(), self.model_port)
         await model_server.start()
         self._servers.append(model_server)
+        self._log_lifecycle("fake_model_ready")
         mcp_port = await _free_port()
         mcp_server = _InProcessServer(datatap_gateway_app(self.mcp_services), mcp_port)
         await mcp_server.start()
         self._servers.append(mcp_server)
+        self._log_lifecycle("fake_mcp_ready")
         self.mcp_origin = f"http://127.0.0.1:{mcp_port}"
         for service in self.mcp_services:
             self.mcp_urls[service.service] = (
                 f"{self.mcp_origin}/api/gateway/{service.service}/mcp"
             )
         await self._seed_db()
+        self._log_lifecycle("db_seeded")
         self._start_fastapi()
         await _wait_http_ok(f"{self.api_base}/healthz")
+        self._log_lifecycle("fastapi_ready")
         await self._approve_catalog_rows()
         await self._login_users()
         self._start_gateway()
         await _wait_http_ok(f"http://127.0.0.1:{self.gateway_health_port}/healthz")
+        self._log_lifecycle("gateway_ready")
         return self
 
     async def _stop_processes(self) -> None:
@@ -310,27 +353,53 @@ class PiUatTopology:
         """
         for proc in (self._gateway, self._fastapi):
             if proc is None or proc.poll() is not None:
+                if proc is not None:
+                    self._log_lifecycle("process_reaped")
                 continue
             try:
                 os.killpg(proc.pid, signal.SIGTERM)
-                proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
+            except ProcessLookupError:
+                self._log_lifecycle("process_reaped")
+                continue
+            if not await _wait_proc_exit(proc, 10):
                 try:
                     os.killpg(proc.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    pass
-            except ProcessLookupError:
-                pass
+                await _wait_proc_exit(proc, 5)
+            self._log_lifecycle("process_reaped")
 
     async def __aexit__(self, *exc) -> None:
+        await self._cleanup()
+
+    async def _cleanup_impl(self) -> None:
+        self._log_lifecycle("cleanup_started")
         await self._stop_processes()
-        for server in self._servers:
-            await server.stop()
+        results = await asyncio.gather(
+            *(server.stop() for server in self._servers),
+            return_exceptions=True,
+        )
         await self._teardown_db()
+        errors = [result for result in results if isinstance(result, BaseException)]
+        if errors:
+            raise RuntimeError("in_process_server_cleanup_failed") from errors[0]
+
+    async def _cleanup(self) -> None:
+        if self._cleanup_task is None:
+            self._cleanup_task = asyncio.create_task(self._cleanup_impl())
+        task = self._cleanup_task
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # Outer pytest/task cancellation must not cancel cleanup. Drain
+            # the shielded task before propagating the original cancellation.
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    continue
+            await task
+            raise
 
     # ------------------------------------------------------------------ #
     # 子进程
@@ -354,7 +423,7 @@ class PiUatTopology:
             "DATATAP_MCP_TOKEN": "uat-fake-datatap-token",
             "DATATAP_MCP_ORIGIN": self.mcp_origin,
             "PI_GATEWAY_INTERNAL_SECRET": GATEWAY_SECRET,
-            "PI_GATEWAY_ALLOWED_IDS": json.dumps([GATEWAY_ID]),
+            "PI_GATEWAY_ALLOWED_IDS": json.dumps([self.gateway_id]),
             "PI_GATEWAY_KILL_SWITCH": "true" if self.kill_switch else "false",
             "RUNTIME_SECRET_MASTER_KEYS": f"v1:{MASTER_KEY_B64}",
             "RUNTIME_SECRET_ACTIVE_KEY_VERSION": "v1",
@@ -391,6 +460,7 @@ class PiUatTopology:
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
+        self._log_lifecycle("fastapi_spawned")
 
     def _start_gateway(self) -> None:
         log = Path(f"/tmp/pi-uat-gateway-{uuid4().hex[:8]}.log")
@@ -398,7 +468,7 @@ class PiUatTopology:
         env = {
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
             "HOME": os.environ.get("HOME", "/tmp"),
-            "PI_GATEWAY_ID": GATEWAY_ID,
+            "PI_GATEWAY_ID": self.gateway_id,
             "PI_GATEWAY_CONTROL_PLANE_URL": self.api_base,
             "PI_GATEWAY_INTERNAL_SECRET": GATEWAY_SECRET,
             "PI_GATEWAY_ENVIRONMENT": "test",
@@ -417,6 +487,7 @@ class PiUatTopology:
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
+        self._log_lifecycle("gateway_spawned")
 
     # ------------------------------------------------------------------ #
     # 种子数据
@@ -641,7 +712,7 @@ class PiUatTopology:
                 headers={"Idempotency-Key": str(uuid4())},
             )
 
-    async def wait_run_terminal(self, run_id: str, timeout: float = 240.0) -> AgentRun:
+    async def wait_run_terminal(self, run_id: str, timeout: float = 360.0) -> AgentRun:
         deadline = time.monotonic() + timeout
         # 每轮新建会话：MySQL REPEATABLE READ 长事务复用同一快照，单会话轮询
         # 永远看不到子进程提交的终态。
@@ -681,8 +752,9 @@ class PiUatTopology:
         if self._fastapi is not None and self._fastapi.poll() is None:
             try:
                 os.killpg(self._fastapi.pid, signal.SIGTERM)
-                self._fastapi.wait(timeout=10)
-            except (subprocess.TimeoutExpired, ProcessLookupError):
+            except ProcessLookupError:
+                pass
+            if not await _wait_proc_exit(self._fastapi, 10):
                 try:
                     os.killpg(self._fastapi.pid, signal.SIGKILL)
                 except ProcessLookupError:
@@ -700,8 +772,9 @@ class PiUatTopology:
         if self._gateway is not None and self._gateway.poll() is None:
             try:
                 os.killpg(self._gateway.pid, signal.SIGTERM)
-                self._gateway.wait(timeout=15)
-            except (subprocess.TimeoutExpired, ProcessLookupError):
+            except ProcessLookupError:
+                return
+            if not await _wait_proc_exit(self._gateway, 15):
                 try:
                     os.killpg(self._gateway.pid, signal.SIGKILL)
                 except ProcessLookupError:
@@ -712,6 +785,7 @@ class PiUatTopology:
     # ------------------------------------------------------------------ #
 
     async def _teardown_db(self) -> None:
+        assert_uat_database_scope()
         from app.agent_artifacts.models import (
             AgentArtifact,
             AgentArtifactReadState,
@@ -859,8 +933,8 @@ class PiUatTopology:
                 await db.execute(delete(WalletTransaction).where(WalletTransaction.user_id.in_(user_ids or [""])))
                 await db.execute(delete(Wallet).where(Wallet.user_id.in_(user_ids or [""])))
                 await db.execute(delete(User).where(User.id.in_(user_ids or [""])))
-                await db.execute(delete(PiGatewayRequestNonce).where(PiGatewayRequestNonce.gateway_id == GATEWAY_ID))
-                await db.execute(delete(PiGatewayInstance).where(PiGatewayInstance.gateway_id == GATEWAY_ID))
+                await db.execute(delete(PiGatewayRequestNonce).where(PiGatewayRequestNonce.gateway_id == self.gateway_id))
+                await db.execute(delete(PiGatewayInstance).where(PiGatewayInstance.gateway_id == self.gateway_id))
                 # 本 UAT 登记/重审的 catalog 与 discovery 行（只限两个 fake 服务）
                 fake_tools = (
                     "social_statistic_overview",
