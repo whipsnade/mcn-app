@@ -81,14 +81,27 @@ export function spawnIsolatedWorker(
     serialization: "advanced",
   });
   const listeners = new Set<(event: PiGatewaySourceEvent) => void>();
+  // Child 终帧：{type:"done"} 或 {type:"failed", errorCode}。父进程据此把
+  // 业务失败（worker_error）与基础设施崩溃（无终帧的退出/信号）区分开。
+  let terminalFrameCode: string | undefined;
+  const TERMINAL_FRAME_CODES = new Set(["worker_error", "sdk_protocol_error"]);
   child.on("message", (message: unknown) => {
-    if (!message || typeof message !== "object" || !("type" in message) || message.type !== "event") return;
+    if (!message || typeof message !== "object" || !("type" in message)) return;
+    if (message.type === "failed" && "errorCode" in message) {
+      const code = (message as { errorCode?: unknown }).errorCode;
+      if (typeof code === "string" && TERMINAL_FRAME_CODES.has(code)) {
+        terminalFrameCode = code;
+      }
+      return;
+    }
+    if (message.type !== "event") return;
     if (!("event" in message) || !message.event || typeof message.event !== "object") return;
     for (const listener of listeners) listener(message.event as PiGatewaySourceEvent);
   });
   const done = new Promise<void>((resolve, reject) => {
     child.once("close", (code, signal) => {
       if (code === 0 && signal === null) resolve();
+      else if (terminalFrameCode !== undefined) reject(new Error(terminalFrameCode));
       else reject(new Error(signal ? "worker_signaled" : "worker_exited"));
     });
   });

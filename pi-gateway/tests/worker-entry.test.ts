@@ -187,15 +187,6 @@ describe("single-run worker lifecycle", () => {
     expect(projected[0]).toMatchObject({ source_event_id: "attempt-worker:1" });
   });
 
-  it("installs a signal cleanup hook exactly once", async () => {
-    let calls = 0;
-    const remove = installWorkerSignalHandlers(async () => { calls += 1; });
-    process.emit("SIGTERM");
-    await new Promise((resolve) => setImmediate(resolve));
-    remove();
-    expect(calls).toBe(1);
-  });
-
   it("abort resolves only after the child closes, escalating to SIGKILL after the grace", async () => {
     const directory = await mkdtemp(join(tmpdir(), "worker-sigterm-ignore-"));
     const script = join(directory, "ignore-sigterm.mjs");
@@ -218,5 +209,49 @@ describe("single-run worker lifecycle", () => {
     // abort 必须等 Child 真正 close（SIGTERM 被忽略 → 升级到 SIGKILL 后关闭）。
     expect(closed).toBe(true);
     expect(child.killed).toBe(true);
+  });
+
+  it("rejects done with the child terminal-frame business code, not a crash code", async () => {
+    // 业务失败（worker_error）必须原样传给父进程，不得被记为可恢复的
+    // worker_exited/worker_signaled 基础设施崩溃。
+    const directory = await mkdtemp(join(tmpdir(), "worker-business-fail-"));
+    const script = join(directory, "business-fail.mjs");
+    await writeFile(script, [
+      "process.on('message', () => {",
+      "  process.send({ type: 'failed', runId: 'run-worker', errorCode: 'worker_error' }, () => {",
+      "    process.disconnect();",
+      "    process.exit(1);",
+      "  });",
+      "});",
+    ].join("\n"));
+    const child = spawnIsolatedWorker(work, secrets, {
+      workerScript: script,
+      parentEnv: { PATH: "/usr/bin" },
+    });
+
+    await expect(child.done).rejects.toMatchObject({ message: "worker_error" });
+  });
+
+  it("rejects done with worker_exited when the child dies without a terminal frame", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "worker-crash-noframe-"));
+    const script = join(directory, "crash.mjs");
+    await writeFile(script, [
+      "process.on('message', () => process.exit(1));",
+    ].join("\n"));
+    const child = spawnIsolatedWorker(work, secrets, {
+      workerScript: script,
+      parentEnv: { PATH: "/usr/bin" },
+    });
+
+    await expect(child.done).rejects.toMatchObject({ message: "worker_exited" });
+  });
+
+  it("installs a signal cleanup hook exactly once", async () => {
+    let calls = 0;
+    const remove = installWorkerSignalHandlers(async () => { calls += 1; });
+    process.emit("SIGTERM");
+    await new Promise((resolve) => setImmediate(resolve));
+    remove();
+    expect(calls).toBe(1);
   });
 });

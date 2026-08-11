@@ -323,6 +323,75 @@ describe("PiGateway", () => {
     );
   });
 
+  it("posts a failed terminal for child business errors without touching recovery", async () => {
+    // 子进程终帧的业务错误（worker_error）不属于基础设施故障：直接 failed
+    // 收口，不留给恢复、不消耗唯一的一次基础设施重试。
+    const terminal = vi.fn().mockResolvedValue(undefined);
+    const controlPlane = {
+      claim: vi.fn().mockResolvedValue({
+        run_id: "run-biz-fail",
+        attempt_id: "attempt-biz-fail",
+        lease_token: "lease-token-with-enough-entropy",
+        lease_expires_at: Math.floor(Date.now() / 1000) + 3600,
+        runtime_snapshot: {}, transcript: [],
+        secret_envelope: { alg: "AES-256-GCM", nonce: "1234567890123456", ciphertext: "1234567890123456" },
+        adapter_catalog: [], internal_tools: [],
+      }),
+      terminal,
+      heartbeat: vi.fn().mockResolvedValue({ cancel_requested: false }),
+    };
+    const gateway = new PiGateway({
+      controlPlane, capacity: 1, heartbeatIntervalMs: 1,
+      worker: async () => ({
+        done: new Promise<void>((_resolve, reject) =>
+          setTimeout(() => reject(new Error("worker_error")), 1)
+        ),
+      }),
+    });
+
+    // 终帧业务错误已成功收口为 failed；pool task 仍会向上抛出该错误供
+    // 主循环记录（生产 main 的 tracked completion 捕获）。
+    await expect(gateway.tick()).rejects.toThrow("worker_error");
+
+    expect(terminal).toHaveBeenCalledWith(
+      "run-biz-fail", "attempt-biz-fail", "failed", "lease-token-with-enough-entropy",
+      { code: "pi_gateway_worker_failed" },
+    );
+  });
+
+  it("leaves a signaled worker for recovery without posting a terminal", async () => {
+    // 无终帧的信号死亡（worker_signaled）是基础设施故障：不得伪造业务
+    // failed，交给后端恢复创建一次新 Attempt。
+    const terminal = vi.fn().mockResolvedValue(undefined);
+    const onError = vi.fn();
+    const controlPlane = {
+      claim: vi.fn().mockResolvedValue({
+        run_id: "run-signaled",
+        attempt_id: "attempt-signaled",
+        lease_token: "lease-token-with-enough-entropy",
+        lease_expires_at: Math.floor(Date.now() / 1000) + 3600,
+        runtime_snapshot: {}, transcript: [],
+        secret_envelope: { alg: "AES-256-GCM", nonce: "1234567890123456", ciphertext: "1234567890123456" },
+        adapter_catalog: [], internal_tools: [],
+      }),
+      terminal,
+      heartbeat: vi.fn().mockResolvedValue({ cancel_requested: false }),
+    };
+    const gateway = new PiGateway({
+      controlPlane, capacity: 1, heartbeatIntervalMs: 1, onError,
+      worker: async () => ({
+        done: new Promise<void>((_resolve, reject) =>
+          setTimeout(() => reject(new Error("worker_signaled")), 1)
+        ),
+      }),
+    });
+
+    await gateway.tick();
+
+    expect(terminal).not.toHaveBeenCalled();
+    expect(onError).toHaveBeenCalled();
+  });
+
   it("serializes heartbeats so a slow beat never overlaps the next one", async () => {
     // 租约 fencing：同一 Run 的 heartbeat 必须串行，慢请求不得与下一次重叠。
     let inFlight = 0;
