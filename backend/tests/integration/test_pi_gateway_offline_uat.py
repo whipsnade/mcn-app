@@ -234,7 +234,13 @@ async def test_brand_report_full_chain_same_version_excel_bi_and_gate() -> None:
             assert all(call.status == "settled" for call in calls)
             wallet = await db.get(TenantWallet, tenant.tenant_id)
             assert wallet is not None
-            assert (wallet.balance, wallet.reserved) == (wallet_before.balance - 40, 0)
+            # 账务硬绑定：钱包净支出必须恰好等于 fake MCP 实际收到的调用数 ×10。
+            mcp_received = len(topology.mcp_services[0].calls)
+            assert mcp_received == 4
+            assert (wallet.balance, wallet.reserved) == (
+                wallet_before.balance - mcp_received * 10,
+                0,
+            )
             ledger = list(
                 (
                     await db.scalars(
@@ -475,6 +481,98 @@ async def test_insufficient_balance_blocks_mcp_with_zero_external_calls() -> Non
                 )
             )
         assert ledger_count == 0
+
+
+async def test_unreachable_mcp_releases_reservation_with_zero_external_calls() -> None:
+    """MCP 服务不可达（本地未外发错误）：definitely_not_sent 释放预留。
+
+    硬断言：fake MCP 实际收到 0 次调用，钱包净支出 == 实际外发数 ×10 == 0。
+    覆盖 adapter 本地错误（not_connected/init_failed/server_backoff 等）不得
+    进入成功结算分支的进程级证据。
+    """
+    import socket
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        dead_port = int(sock.getsockname()[1])
+    topology = PiUatTopology(
+        scripts={
+            "deadmcp": [
+                step_internal("get_session_context"),
+                step_mcp("insight-cube", "social_statistic_overview", {"brand": BRAND}),
+                step_text("数据服务暂不可用。"),
+            ]
+        }
+    )
+    async with topology:
+        await _wait_gateway_registered(topology)
+        tenant = topology.tenants["uat-tenant-a"]
+        # 自定义配置：datatap_urls 指向已关闭的 loopback 端口
+        async with topology.admin_client() as admin:
+            created = await admin.post(
+                "/api/v1/admin/runtime-configs",
+                headers={"Idempotency-Key": str(uuid4())},
+                json={
+                    "tenant_id": tenant.tenant_id,
+                    "runtime_backend": "pi",
+                    "model": {"name": "fake-pi-model", "masked_origin": "fake", "provider": "fake"},
+                    "datatap": {"service": "fake", "schema_digest": "sha256:" + "a" * 64},
+                    "limits": {"max_decisions": 50},
+                    "billing": {"mcp_call_points": 10},
+                    "secrets": {
+                        "model_base_url": f"http://127.0.0.1:{topology.model_port}/v1",
+                        "model_api_key": "uat-fake-model-key",
+                        "datatap_token": "uat-fake-datatap-token",
+                        "datatap_urls": {
+                            "insight-cube": f"http://127.0.0.1:{dead_port}/api/gateway/insight-cube-mcp/mcp",
+                            "social-grow": f"http://127.0.0.1:{dead_port}/api/gateway/social-grow-mcp/mcp",
+                        },
+                    },
+                },
+            )
+            assert created.status_code == 201, created.text
+            config_id = created.json()["id"]
+            activated = await admin.post(
+                f"/api/v1/admin/runtime-configs/{config_id}/activate",
+                headers={"Idempotency-Key": str(uuid4())},
+            )
+            assert activated.status_code == 200, activated.text
+            switched = await admin.patch(
+                f"/api/v1/admin/tenants/{tenant.tenant_id}",
+                headers={"Idempotency-Key": str(uuid4())},
+                json={"runtime_backend": "pi"},
+            )
+            assert switched.status_code == 200, switched.text
+        user = tenant.users[0]
+        async with SessionFactory() as db:
+            wallet_before = await db.get(TenantWallet, tenant.tenant_id)
+        assert wallet_before is not None
+        session_id = await topology.create_session(user)
+        response = await topology.send_message(user, session_id, f"[scenario:deadmcp]\n请分析{BRAND}")
+        assert response.status_code in (200, 201, 202), response.text
+        run = await topology.run_by_session(session_id)
+        terminal_status = await topology.wait_run_terminal(run.id)
+        # 终态不设硬断言（模型收到工具错误后的收口路径是实现细节）。
+        assert terminal_status in ("completed", "completed_with_warnings", "failed")
+        mcp_received = len(topology.mcp_services[0].calls) + len(topology.mcp_services[1].calls)
+        assert mcp_received == 0
+        async with SessionFactory() as db:
+            wallet = await db.get(TenantWallet, tenant.tenant_id)
+            assert wallet is not None
+            # 钱包净支出 == 实际外发数 ×10 == 0；预留全部释放
+            assert (wallet.balance, wallet.reserved) == (
+                wallet_before.balance - mcp_received * 10,
+                0,
+            )
+            settled = await db.scalar(
+                select(func.count())
+                .select_from(TenantWalletTransaction)
+                .where(
+                    TenantWalletTransaction.tenant_id == tenant.tenant_id,
+                    TenantWalletTransaction.kind == "settle",
+                )
+            )
+        assert settled == 0
 
 
 async def test_session_mutex_rejects_concurrent_message() -> None:

@@ -114,4 +114,106 @@ describe("McpAccountingExtension", () => {
       args: { keyword: "美妆" },
     });
   });
+
+  // 本地未外发错误必须 definitely_not_sent（释放预留）；带 details.error 的
+  // 结果绝不允许进入成功结算分支——无论 isError 是否为 true。
+  it.each([
+    "server_backoff",
+    "connect_failed",
+    "not_connected",
+    "server_not_connected",
+    "auth_required",
+    "not_authenticated",
+    "not_initialized",
+    "init_failed",
+    "init_timeout",
+    "server_disabled",
+    "server_unavailable",
+    "missing_server",
+    "tool_not_found",
+    "tool_not_found_after_reconnect",
+  ])("classifies local no-dispatch error %s as definitely_not_sent", async (code) => {
+    const handlers = new Map<string, (event: any) => Promise<unknown>>();
+    const control = {
+      preflight: vi.fn(async () => ({ permit_id: "p-1" })),
+      finalize: vi.fn(),
+      fail: vi.fn(async () => ({ ok: true })),
+    };
+    const extension = new McpAccountingExtension(control);
+    createMcpAccountingExtensionFactory(extension, [
+      { toolName: "insight_query", server: "insight", remoteName: "query" },
+    ])({
+      on: (name: string, handler: (event: any) => Promise<unknown>) => handlers.set(name, handler),
+    } as any);
+
+    await handlers.get("tool_call")?.({
+      type: "tool_call", toolName: "insight_query", toolCallId: "tc-1", input: {},
+    });
+    await handlers.get("tool_result")?.({
+      type: "tool_result", toolName: "insight_query", toolCallId: "tc-1",
+      content: [{ type: "text", text: "server not connected" }],
+      isError: false,
+      details: { error: code },
+    });
+
+    expect(control.fail).toHaveBeenCalledWith({ permit_id: "p-1" }, "definitely_not_sent");
+    expect(control.finalize).not.toHaveBeenCalled();
+  });
+
+  it("classifies a server-confirmed error result as failed_confirmed", async () => {
+    const handlers = new Map<string, (event: any) => Promise<unknown>>();
+    const control = {
+      preflight: vi.fn(async () => ({ permit_id: "p-1" })),
+      finalize: vi.fn(),
+      fail: vi.fn(async () => ({ ok: true })),
+    };
+    const extension = new McpAccountingExtension(control);
+    createMcpAccountingExtensionFactory(extension, [
+      { toolName: "insight_query", server: "insight", remoteName: "query" },
+    ])({
+      on: (name: string, handler: (event: any) => Promise<unknown>) => handlers.set(name, handler),
+    } as any);
+
+    await handlers.get("tool_call")?.({
+      type: "tool_call", toolName: "insight_query", toolCallId: "tc-1", input: {},
+    });
+    await handlers.get("tool_result")?.({
+      type: "tool_result", toolName: "insight_query", toolCallId: "tc-1",
+      content: [{ type: "text", text: "remote validation failed" }],
+      isError: true,
+      details: { error: "tool_error" },
+    });
+
+    expect(control.fail).toHaveBeenCalledWith({ permit_id: "p-1" }, "failed_confirmed");
+    expect(control.finalize).not.toHaveBeenCalled();
+  });
+
+  it("keeps thrown mid-flight calls and unknown error codes as result_unknown", async () => {
+    const handlers = new Map<string, (event: any) => Promise<unknown>>();
+    const control = {
+      preflight: vi.fn(async () => ({ permit_id: "p-1" })),
+      finalize: vi.fn(),
+      fail: vi.fn(async () => ({ ok: true })),
+    };
+    const extension = new McpAccountingExtension(control);
+    createMcpAccountingExtensionFactory(extension, [
+      { toolName: "insight_query", server: "insight", remoteName: "query" },
+    ])({
+      on: (name: string, handler: (event: any) => Promise<unknown>) => handlers.set(name, handler),
+    } as any);
+
+    for (const [index, code] of ["call_failed", "some_future_error"].entries()) {
+      await handlers.get("tool_call")?.({
+        type: "tool_call", toolName: "insight_query", toolCallId: `tc-${index}`, input: {},
+      });
+      await handlers.get("tool_result")?.({
+        type: "tool_result", toolName: "insight_query", toolCallId: `tc-${index}`,
+        content: [], isError: true, details: { error: code },
+      });
+    }
+
+    expect(control.fail).toHaveBeenNthCalledWith(1, { permit_id: "p-1" }, "result_unknown");
+    expect(control.fail).toHaveBeenNthCalledWith(2, { permit_id: "p-1" }, "result_unknown");
+    expect(control.finalize).not.toHaveBeenCalled();
+  });
 });

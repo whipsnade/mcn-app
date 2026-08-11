@@ -41,6 +41,76 @@ export interface McpAccountingControlPlane {
 const FREE_DISCOVERY_TOOLS = new Set(["connect", "search", "list"]);
 
 /**
+ * Adapter `details.error` codes that prove the call never left the local
+ * process (readiness/auth/config/validation gates).  These must release the
+ * reservation as ``definitely_not_sent``; settling them would bill 10 points
+ * for a call the supplier never saw.
+ */
+const NO_DISPATCH_ERROR_CODES: ReadonlySet<string> = new Set([
+  "server_backoff",
+  "connect_failed",
+  "not_connected",
+  "server_not_connected",
+  "auth_required",
+  "not_authenticated",
+  "not_initialized",
+  "init_failed",
+  "init_timeout",
+  "server_disabled",
+  "server_unavailable",
+  "server_not_found",
+  "missing_server",
+  "tool_not_found",
+  "tool_not_found_after_reconnect",
+  "auth_start_failed",
+  "auth_complete_failed",
+  "oauth_not_supported",
+  "url_elicitation_required",
+  "unsafe_pattern",
+  "invalid_pattern",
+  "query_too_long",
+  "empty_query",
+  "missing_input",
+  "incomplete",
+  "not_found",
+  "native_tool",
+  "no_instructions",
+]);
+
+type FailureClassification = "definitely_not_sent" | "failed_confirmed" | "result_unknown";
+
+/**
+ * Classify an adapter tool_result failure into the durable billing taxonomy.
+ *
+ * - ``tool_error``: the supplier received the call and returned an error
+ *   result — dispatched and confirmed failed → ``failed_confirmed``.
+ * - ``call_failed``: the call threw mid-flight — outcome unknowable →
+ *   ``result_unknown`` (reservation retained, never auto-replayed).
+ * - known local readiness/auth/validation codes: never dispatched →
+ *   ``definitely_not_sent``.
+ * - anything else: fail-safe ``result_unknown``.
+ */
+export function classifyMcpFailure(
+  errorCode: string | undefined,
+  details: Record<string, unknown>,
+): FailureClassification {
+  if (errorCode === "tool_error") return "failed_confirmed";
+  if (errorCode === "call_failed") return "result_unknown";
+  if (errorCode !== undefined && NO_DISPATCH_ERROR_CODES.has(errorCode)) {
+    return "definitely_not_sent";
+  }
+  const explicit = details.classification;
+  if (
+    explicit === "definitely_not_sent" ||
+    explicit === "failed_confirmed" ||
+    explicit === "result_unknown"
+  ) {
+    return explicit;
+  }
+  return "result_unknown";
+}
+
+/**
  * The adapter presents proxy tools as ``<server_with_underscores>_<remote
  * with dots replaced>``; the claim catalog binds that visible name back to
  * the reviewed internal tool identity.  Model input never self-reports the
@@ -112,16 +182,10 @@ export function createMcpAccountingExtensionFactory(
       if (!permit) return;
       permits.delete(event.toolCallId);
       const details = isRecord(event.details) ? event.details : {};
-      if (event.isError) {
-        const classification = details.classification;
-        await accounting.afterToolError(
-          permit,
-          classification === "definitely_not_sent" ||
-            classification === "failed_confirmed" ||
-            classification === "result_unknown"
-            ? classification
-            : "result_unknown",
-        );
+      const errorCode = typeof details.error === "string" ? details.error : undefined;
+      if (event.isError || errorCode !== undefined) {
+        // 带 details.error 的结果绝不进入成功结算分支；isError 由谁置位无关。
+        await accounting.afterToolError(permit, classifyMcpFailure(errorCode, details));
         return;
       }
       await accounting.afterToolResult(permit, {
