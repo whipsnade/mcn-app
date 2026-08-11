@@ -389,6 +389,24 @@ _UAT_CLEANUP_STATEMENTS = (
     "JOIN users u ON wt.user_id = u.id WHERE u.nickname LIKE 'uat-%'",
     "DELETE w FROM wallets w "
     "JOIN users u ON w.user_id = u.id WHERE u.nickname LIKE 'uat-%'",
+    # B4 租户账本（0040 起）：mock 登录的 welcome grant 与懒置备会提交租户
+    # 钱包/流水/额度/用量行；不清除会让 0040/0043 的 downgrade guard 在后续
+    # 迁移可逆测试中 fail-closed（级联打挂整个迁移套件）。
+    "DELETE twt FROM tenant_wallet_transactions twt "
+    "JOIN tenant_memberships m ON twt.tenant_id = m.tenant_id "
+    "JOIN users u ON m.user_id = u.id WHERE u.nickname LIKE 'uat-%'",
+    "DELETE rur FROM runtime_usage_records rur "
+    "JOIN tenant_memberships m ON rur.tenant_id = m.tenant_id "
+    "JOIN users u ON m.user_id = u.id WHERE u.nickname LIKE 'uat-%'",
+    "DELETE qu FROM tenant_user_quota_usage qu "
+    "JOIN tenant_memberships m ON qu.tenant_id = m.tenant_id "
+    "JOIN users u ON m.user_id = u.id WHERE u.nickname LIKE 'uat-%'",
+    "DELETE qp FROM tenant_user_quota_policies qp "
+    "JOIN tenant_memberships m ON qp.tenant_id = m.tenant_id "
+    "JOIN users u ON m.user_id = u.id WHERE u.nickname LIKE 'uat-%'",
+    "DELETE tw FROM tenant_wallets tw "
+    "JOIN tenant_memberships m ON tw.tenant_id = m.tenant_id "
+    "JOIN users u ON m.user_id = u.id WHERE u.nickname LIKE 'uat-%'",
     "DELETE mpl FROM model_prompt_logs mpl "
     "JOIN users u ON mpl.user_id = u.id WHERE u.nickname LIKE 'uat-%'",
     "DELETE p FROM user_channel_permissions p "

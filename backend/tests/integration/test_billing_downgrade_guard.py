@@ -36,6 +36,58 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _clean_tenant_billing_residue():
+    """与 test_phase2_migrations 同一干净窗口：清除已提交集成测试遗留的
+    B4 租户账本残留（welcome grant/懒置备），否则首个干净窗口 downgrade
+    就会被 guard 阻断并把库停在中段版本。"""
+
+    async def _clean() -> None:
+        async with engine.begin() as connection:
+            exists = await connection.scalar(
+                text(
+                    "SELECT COUNT(*) FROM information_schema.TABLES "
+                    "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'tenant_wallets'"
+                )
+            )
+            if not exists:
+                return
+            await connection.execute(
+                text(
+                    "DELETE t FROM tenant_wallet_transactions t "
+                    "LEFT JOIN wallet_transactions w ON w.id = t.id WHERE w.id IS NULL"
+                )
+            )
+            await connection.execute(text("DELETE FROM runtime_usage_records"))
+            await connection.execute(
+                text("UPDATE tenant_user_quota_usage SET spent = 0, reserved = 0")
+            )
+            await connection.execute(
+                text(
+                    "DELETE w FROM tenant_wallets w "
+                    "LEFT JOIN tenant_billing_migration_validations v "
+                    "ON v.tenant_id = w.tenant_id WHERE v.id IS NULL"
+                )
+            )
+            await connection.execute(
+                text(
+                    "DELETE t FROM wallet_transactions t "
+                    "LEFT JOIN tenant_memberships m ON m.user_id = t.user_id "
+                    "WHERE m.user_id IS NULL"
+                )
+            )
+            await connection.execute(
+                text(
+                    "DELETE w FROM wallets w "
+                    "LEFT JOIN tenant_memberships m ON m.user_id = w.user_id "
+                    "WHERE m.user_id IS NULL"
+                )
+            )
+
+    _run(_clean())
+    yield
+
+
 def test_downgrade_guard_blocks_post_migration_ledger_activity() -> None:
     """新流水/用量/余额漂移存在时 downgrade 必须 fail-closed；清理后可放行。"""
     assert os.environ.get("MYSQL_DATABASE") == "kol_insight_test"
@@ -77,34 +129,39 @@ def test_downgrade_guard_blocks_post_migration_ledger_activity() -> None:
         return _run(_scalar("SELECT version_num FROM alembic_version"))
 
     # 干净窗口：0043 -> 0042 放行（0040 迁移副本不构成新活动），随后升回 head。
-    alembic_downgrade(config, "0042_admin_idempotency_records")
-    assert _current_version() == "0042_admin_idempotency_records"
-    alembic_upgrade(config, "head")
-    assert _current_version() == "0043_billing_downgrade_guard"
-
-    # 植入一行 0040 之后的新流水（旧表无同 id 对应行）：downgrade 必须阻断。
-    _run(
-        _execute(
-            "INSERT INTO tenant_wallet_transactions "
-            "(id,tenant_id,user_id,run_id,tool_call_id,internal_tool_name,kind,"
-            "balance_delta,reserved_delta,balance_after,reserved_after,"
-            "idempotency_key,reference_type,reference_id,created_at) "
-            "VALUES (:id,:tenant_id,NULL,NULL,NULL,NULL,'reserve',-10,10,0,10,"
-            ":idem,'mcp_call',NULL,'2026-08-10 00:00:00')",
-            {"id": marker_id, "tenant_id": tenant_id, "idem": f"guard-probe:{marker_id}"},
-        )
-    )
+    # 全程在 try/finally 内执行：任何一步失败都必须把库升回 head，
+    # 否则后续测试会在中段版本上级联失败。
     try:
+        alembic_downgrade(config, "0042_admin_idempotency_records")
+        assert _current_version() == "0042_admin_idempotency_records"
+        alembic_upgrade(config, "head")
+        assert _current_version() == "0043_billing_downgrade_guard"
+
+        # 植入一行 0040 之后的新流水（旧表无同 id 对应行）：downgrade 必须阻断。
+        _run(
+            _execute(
+                "INSERT INTO tenant_wallet_transactions "
+                "(id,tenant_id,user_id,run_id,tool_call_id,internal_tool_name,kind,"
+                "balance_delta,reserved_delta,balance_after,reserved_after,"
+                "idempotency_key,reference_type,reference_id,created_at) "
+                "VALUES (:id,:tenant_id,NULL,NULL,NULL,NULL,'reserve',-10,10,0,10,"
+                ":idem,'mcp_call',NULL,'2026-08-10 00:00:00')",
+                {"id": marker_id, "tenant_id": tenant_id, "idem": f"guard-probe:{marker_id}"},
+            )
+        )
         with pytest.raises(Exception, match="tenant_billing_downgrade_blocked"):
             alembic_downgrade(config, "0042_admin_idempotency_records")
         assert _current_version() == "0043_billing_downgrade_guard"
     finally:
-        _run(
-            _execute(
-                "DELETE FROM tenant_wallet_transactions WHERE id = :id",
-                {"id": marker_id},
+        try:
+            _run(
+                _execute(
+                    "DELETE FROM tenant_wallet_transactions WHERE id = :id",
+                    {"id": marker_id},
+                )
             )
-        )
+        finally:
+            alembic_upgrade(config, "head")
 
     # 清理后同一 downgrade 再次放行。
     alembic_downgrade(config, "0042_admin_idempotency_records")

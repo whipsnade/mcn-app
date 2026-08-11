@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 from uuid import uuid4
@@ -10,13 +9,14 @@ from uuid import uuid4
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.exc import IntegrityError
 
 from app.agent_runtime.events import AgentEventStream
 from app.agent_runtime.models import AgentEvent, AgentRun, AgentRunAttempt, AgentSession
 from app.agent_runtime.state import InvalidRunTransition, RunStatus
-from app.db.session import get_db
 from app.core.config import get_settings
+from app.core.db_retry import with_lock_retry as _with_lock_retry
+from app.db.session import get_db
 
 from .auth import PiGatewayAuthError, verify_signed_request
 from .contracts import (
@@ -37,31 +37,6 @@ from .service import PiGatewayClaimError, PiGatewayLeaseError, PiGatewayService,
 
 
 router = APIRouter()
-
-# InnoDB 死锁（1213）与锁等待超时（1205）：REPEATABLE READ 下并发写路径
-# （heartbeat/preflight/finalize/events 共用 Run/Attempt/Wallet 行与间隙锁）
-# 可能瞬时互锁；回滚后按有界退避重试是标准处置，语义不变（全部写路径幂等）。
-_LOCK_RETRYABLE_ERRNOS = {1205, 1213}
-_LOCK_RETRY_ATTEMPTS = 3
-
-
-def _is_retryable_lock_error(exc: BaseException) -> bool:
-    origin = getattr(exc, "orig", exc)
-    args = getattr(origin, "args", ())
-    return bool(args) and args[0] in _LOCK_RETRYABLE_ERRNOS
-
-
-async def _with_lock_retry(db: AsyncSession, operation: Any) -> Any:
-    """在幂等写操作上重试 InnoDB 死锁/锁等待；每次重试都是全新事务。"""
-    for attempt in range(_LOCK_RETRY_ATTEMPTS):
-        try:
-            return await operation()
-        except OperationalError as exc:
-            if attempt + 1 >= _LOCK_RETRY_ATTEMPTS or not _is_retryable_lock_error(exc):
-                raise
-            await db.rollback()
-            await asyncio.sleep(0.05 * (attempt + 1))
-    return None
 
 # HMAC 时间偏差上限（与 auth.verify_signed_request 默认值一致）。
 _SIGNATURE_MAX_SKEW_SECONDS = 30

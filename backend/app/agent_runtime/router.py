@@ -55,6 +55,7 @@ from app.agent_runtime.tools.factory import load_channel_permissions
 from app.agent_runtime.uploads import UploadRejectedError, UploadService
 from app.agent_runtime.utility import UtilityDispatcher
 from app.core.config import get_settings
+from app.core.db_retry import with_lock_retry
 from app.db.session import get_db
 from app.identity.dependencies import CurrentUser
 from app.licensing.service import LicenseService
@@ -941,24 +942,32 @@ async def cancel_run(
     Reviewer 返回后 / 循环顶）收口。终态幂等返回。
     H1：立即取消的迁移与终态事件由 settle_terminal 同一加锁事务提交。
     """
-    run = await _get_owned_run(db, user.id, run_id)
-    try:
-        tenant_context = await TenantService(db).resolve_user(user.id, for_update=True)
-    except PermissionError as error:
-        raise _not_found("run_not_found") from error
-    if run.tenant_id is None or run.tenant_id != tenant_context.tenant_id:
-        raise _not_found("run_not_found")
-    repo = AgentRunRepository(db)
-    current = RunStatus(run.status)
     settled_immediately = False
-    if current in _IMMEDIATE_CANCEL_STATUSES:
-        await AgentEventStream(db, broker).settle_terminal(
-            run.id, user.id, RunStatus.CANCELLED, {}
-        )
-        settled_immediately = True
-    elif current in _REQUEST_CANCEL_STATUSES:
-        await repo.request_cancel(run.id, user.id)
-    await db.commit()
+
+    async def _do() -> AgentRun:
+        nonlocal settled_immediately
+        run = await _get_owned_run(db, user.id, run_id)
+        try:
+            tenant_context = await TenantService(db).resolve_user(user.id, for_update=True)
+        except PermissionError as error:
+            raise _not_found("run_not_found") from error
+        if run.tenant_id is None or run.tenant_id != tenant_context.tenant_id:
+            raise _not_found("run_not_found")
+        repo = AgentRunRepository(db)
+        current = RunStatus(run.status)
+        if current in _IMMEDIATE_CANCEL_STATUSES:
+            await AgentEventStream(db, broker).settle_terminal(
+                run.id, user.id, RunStatus.CANCELLED, {}
+            )
+            settled_immediately = True
+        elif current in _REQUEST_CANCEL_STATUSES:
+            await repo.request_cancel(run.id, user.id)
+        await db.commit()
+        return run
+
+    # 取消与 heartbeat/preflight 等并发写路径可能瞬时互锁（InnoDB 1213/1205）；
+    # 幂等写全新事务有界重试。
+    run = await with_lock_retry(db, _do)
     # §6.4：立即取消不经过 executor，主分析 Run 的终态 utility（run_summary +
     # suggestions）在这里 best-effort 触发；kol_detail_v1 等辅助 Run 不触发；
     # running/reviewing 的 request_cancel 由 Engine/executor 收口时在那一侧触发。
