@@ -882,15 +882,27 @@ class PiGatewayRecoveryService:
         if await self._has_durable_completion(run):
             # durable completion 已存在（terminal ACK 丢失场景）：幂等收口为
             # completed，绝不新起 Attempt——新 Attempt 会重放模型与 MCP 外发。
-            # 开放 ToolCall 置 unknown、Attempt 关闭、lease/session 释放与终态
-            # 事件全部在同一个事务内完成。
+            # 开放 ToolCall 置 unknown、Attempt 关闭、lease/session/租户计数
+            # 释放与终态事件全部在同一个事务内完成。
             await self._mark_attempt_tool_calls_unknown(attempt, now)
+
+            async def complete_before_commit(locked_run: AgentRun) -> None:
+                # force_complete 已处理 lease_owner/session slot/Attempt；
+                # 这里补齐 gateway 租约字段与租户队列计数（release_run 的
+                # gateway_lease_hash 一次性标记必须被消费）。
+                await self.scheduler.release_run(locked_run)
+                if session.active_run_id == locked_run.id:
+                    session.active_run_id = None
+                locked_run.gateway_lease_hash = None
+                locked_run.gateway_lease_expires_at = None
+                locked_run.gateway_id = None
 
             event = await AgentEventStream(self.db, self.broker).settle_terminal(
                 run.id,
                 run.user_id,
                 RunStatus.COMPLETED,
                 {"recovered_after_terminal_ack_lost": True},
+                before_commit=complete_before_commit,
                 allow_system_completion=self._has_durable_completion,
             )
             await self._reconcile_after_terminal(run.id)

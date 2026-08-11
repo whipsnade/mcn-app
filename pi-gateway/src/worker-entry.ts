@@ -120,7 +120,9 @@ export function spawnIsolatedWorker(
   handle.abort = async () => {
     if (abortStarted) return closed;
     abortStarted = true;
-    if (child.exitCode !== null || child.signalCode !== null) return;
+    // 已 exit 但尚未 close 时同样等待 close（stdio/IPC 资源排空），保持
+    // 「只有 Child 真正 close 才返回」的契约。
+    if (child.exitCode !== null || child.signalCode !== null) return closed;
     const graceMs = options.abortGraceMs ?? 5_000;
     // 子进程安装了优雅停机钩子（adapter/SDK 清理），可能永远不退出；
     // 租约丢失或取消必须保证 worker 真正死亡，否则旧 Attempt 会继续

@@ -99,12 +99,14 @@ export class ControlPlaneClient implements ControlPlaneTransport {
     runId: string,
     attemptId: string,
     leaseToken: string,
+    signal?: AbortSignal,
   ): Promise<{ cancel_requested?: boolean; lease_expires_at?: number } | undefined> {
     const result = await this.request<unknown>(
       "POST",
       `/runs/${encodeURIComponent(runId)}/heartbeat`,
       { attempt_id: attemptId },
       leaseToken,
+      signal,
     );
     if (result === undefined) return undefined;
     if (!result || typeof result !== "object") throw new Error("pi_gateway_heartbeat_invalid");
@@ -225,6 +227,7 @@ export class ControlPlaneClient implements ControlPlaneTransport {
     path: string,
     payload: unknown,
     leaseToken?: string,
+    externalSignal?: AbortSignal,
   ): Promise<T | undefined> {
     const body = JSON.stringify(payload);
     const timestamp = this.timestamp();
@@ -243,6 +246,13 @@ export class ControlPlaneClient implements ControlPlaneTransport {
     if (leaseToken) headers["X-Pi-Run-Lease"] = leaseToken;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    // 外部信号（如租约 beat 超时）联动中止底层 fetch，避免超时后请求仍
+    // 在服务端完成续租。
+    const linkExternal = (): void => controller.abort();
+    if (externalSignal) {
+      if (externalSignal.aborted) controller.abort();
+      else externalSignal.addEventListener("abort", linkExternal, { once: true });
+    }
     let response: Response;
     try {
       response = await this.fetchImpl(`${this.origin}${fullPath}`, {
@@ -256,6 +266,7 @@ export class ControlPlaneClient implements ControlPlaneTransport {
       throw new ControlPlaneUnavailableError(error);
     } finally {
       clearTimeout(timer);
+      externalSignal?.removeEventListener("abort", linkExternal);
     }
     if (response.status >= 300 && response.status < 400) throw new Error("pi_gateway_redirect_forbidden");
     if (response.status === 204) return undefined;

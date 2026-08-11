@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class AdminUserItem(BaseModel):
@@ -142,8 +142,15 @@ class AdminWalletAdjustRequest(BaseModel):
     """租户钱包人工调整（admin_adjust 账本 + 审计）。"""
 
     user_id: str = Field(min_length=1, max_length=64)
-    delta: int = Field(ne=0, ge=-1_000_000, le=1_000_000)
+    delta: int = Field(ge=-1_000_000, le=1_000_000)
     reason: str = Field(min_length=1, max_length=200)
+
+    @field_validator("delta")
+    @classmethod
+    def delta_nonzero(cls, value: int) -> int:
+        if value == 0:
+            raise ValueError("delta_must_be_nonzero")
+        return value
 
 
 class AdminWalletAdjustResponse(BaseModel):

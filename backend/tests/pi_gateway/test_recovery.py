@@ -78,6 +78,10 @@ async def test_pi_recovery_closes_idempotently_on_durable_completion(db_session,
         if event.event_type.startswith("run.")
     ]
     assert terminal_events == ["run.completed"]
+    # 租户队列计数与 gateway 租约字段必须随收口释放（无残留漂移）
+    assert run.gateway_lease_hash is None
+    assert run.gateway_lease_expires_at is None
+    assert run.gateway_id is None
 
 
 @pytest.mark.asyncio

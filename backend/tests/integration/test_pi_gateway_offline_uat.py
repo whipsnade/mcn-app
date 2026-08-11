@@ -1262,6 +1262,10 @@ async def test_fair_scheduling_two_tenants_share_capacity() -> None:
         # 各租户恰好 4 次 settled MCP 调用、钱包各结 40 分（互不侵占额度）
         calls_a = await _run_tool_calls(run_a_id)
         calls_b = await _run_tool_calls(run_b_id)
+        if not (len(calls_a) == 4 and len(calls_b) == 4):
+            # flake 现场留证：dump 两条 run 的调用/事件/attempt 供定性
+            await _debug_dump_run(run_a_id, "fairness-A")
+            await _debug_dump_run(run_b_id, "fairness-B")
         assert len(calls_a) == 4 and all(call.status == "settled" for call in calls_a)
         assert len(calls_b) == 4 and all(call.status == "settled" for call in calls_b)
         assert wallet_a is not None

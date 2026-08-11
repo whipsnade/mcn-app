@@ -82,10 +82,6 @@ const NO_DISPATCH_ERROR_CODES: ReadonlySet<string> = new Set([
   "query_too_long",
   "empty_query",
   "missing_input",
-  "incomplete",
-  "not_found",
-  "native_tool",
-  "no_instructions",
 ]);
 
 type FailureClassification = "definitely_not_sent" | "failed_confirmed" | "result_unknown";

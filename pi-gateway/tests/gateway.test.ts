@@ -72,6 +72,7 @@ describe("PiGateway", () => {
       "run-heartbeat",
       "attempt-heartbeat",
       "lease-token-with-enough-entropy",
+      expect.anything(),
     );
     expect(terminal).toHaveBeenCalledWith(
       "run-heartbeat",
@@ -390,6 +391,49 @@ describe("PiGateway", () => {
 
     expect(terminal).not.toHaveBeenCalled();
     expect(onError).toHaveBeenCalled();
+  });
+
+  it("never leaves a rejected done promise unhandled on early-return paths", async () => {
+    // abort 等 close 后，提前返回路径（lease lost 等）不给 done 挂 handler
+    // 会让被拒绝的 done 成为 unhandledRejection，生产上会打挂 Gateway 进程。
+    const terminal = vi.fn().mockResolvedValue(undefined);
+    const onError = vi.fn();
+    const heartbeat = vi.fn().mockRejectedValue(
+      Object.assign(new Error("offline"), { code: "control_plane_unreachable" }),
+    );
+    const controlPlane = {
+      claim: vi.fn().mockResolvedValue({
+        run_id: "run-unhandled",
+        attempt_id: "attempt-unhandled",
+        lease_token: "lease-token-with-enough-entropy",
+        lease_expires_at: Math.floor(Date.now() / 1000) + 3600,
+        runtime_snapshot: {}, transcript: [],
+        secret_envelope: { alg: "AES-256-GCM", nonce: "1234567890123456", ciphertext: "1234567890123456" },
+        adapter_catalog: [], internal_tools: [],
+      }),
+      terminal,
+      heartbeat,
+    };
+    let unhandled: unknown;
+    const onUnhandled = (reason: unknown): void => { unhandled = reason; };
+    process.once("unhandledRejection", onUnhandled);
+    try {
+      const gateway = new PiGateway({
+        controlPlane, capacity: 1, heartbeatIntervalMs: 1, onError,
+        worker: async () => ({
+          // abort 不触碰 done：模拟 close 后拒绝（worker_exited）
+          abort: async () => undefined,
+          done: new Promise<void>((_resolve, reject) =>
+            setTimeout(() => reject(new Error("worker_exited")), 5)
+          ),
+        }),
+      });
+      await gateway.tick();
+      await new Promise<void>((resolve) => setTimeout(resolve, 30));
+      expect(unhandled).toBeUndefined();
+    } finally {
+      process.removeListener("unhandledRejection", onUnhandled);
+    }
   });
 
   it("serializes heartbeats so a slow beat never overlaps the next one", async () => {

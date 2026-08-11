@@ -79,6 +79,7 @@ export interface GatewayControlPlane {
     runId: string,
     attemptId: string,
     leaseToken: string,
+    signal?: AbortSignal,
   ): Promise<{ cancel_requested?: boolean; lease_expires_at?: number } | undefined>;
   sendEvent?(runId: string, event: PiGatewaySourceEvent, leaseToken: string): Promise<unknown>;
   terminal(
@@ -276,14 +277,22 @@ export class PiGateway {
           }
           const beatTimeoutMs = Math.max(25, Math.min(this.controlTimeoutMs, Math.floor(remainingMs / 4)));
           let beatTimeout: ReturnType<typeof setTimeout> | undefined;
+          const beatAbort = new AbortController();
           try {
             const decision = await Promise.race([
-              this.controlPlane.heartbeat(claim.run_id, claim.attempt_id, claim.lease_token),
+              this.controlPlane.heartbeat(
+                claim.run_id,
+                claim.attempt_id,
+                claim.lease_token,
+                beatAbort.signal,
+              ),
               new Promise<never>((_resolve, reject) => {
-                beatTimeout = setTimeout(
-                  () => reject(new Error("pi_gateway_heartbeat_timeout")),
-                  beatTimeoutMs,
-                );
+                beatTimeout = setTimeout(() => {
+                  // 竞速超时必须同时中止底层 fetch，避免服务端在 lost 之后
+                  // 仍完成续租。
+                  beatAbort.abort();
+                  reject(new Error("pi_gateway_heartbeat_timeout"));
+                }, beatTimeoutMs);
                 beatTimeout.unref?.();
               }),
             ]);
@@ -334,6 +343,9 @@ export class PiGateway {
         handle = typeof workerResult === "object" && workerResult !== null
           ? workerResult
           : undefined;
+        // 任何提前返回路径都不消费 done：先挂 sink，被拒绝的 done 永远不会
+        // 成为 unhandledRejection 打挂 Gateway 进程；race 处的 await 语义不变。
+        if (handle?.done) void handle.done.catch(() => undefined);
         if (handle?.onEvent) {
           unregisterEvents = handle.onEvent((event) => {
             if (eventBufferError) return;
