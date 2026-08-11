@@ -38,6 +38,11 @@ def _clean_tenant_billing_residue():
             if not exists:
                 # 库停在中段迁移版本（如 0037，B4 表尚未创建）时无可清理。
                 return
+        # 先兜底清除任何已提交 UAT 残留（含非 legacy slug 租户，0037 guard）。
+        from tests.integration.pi_uat.harness import purge_uat_residue
+
+        await purge_uat_residue()
+        async with engine.begin() as connection:
             await connection.execute(
                 text(
                     "DELETE t FROM tenant_wallet_transactions t "

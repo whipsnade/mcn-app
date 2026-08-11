@@ -58,6 +58,107 @@ class UatTenant:
     users: list[UatUser] = field(default_factory=list)
 
 
+async def purge_uat_residue() -> None:
+    """清除任何已提交 UAT/agent-real 链路残留（崩溃/中断运行的种子行）。
+
+    迁移类测试（0037/0040/0043 guard）要求全库无此类残留；正常 teardown
+    已逐拓扑清理，这里兜底中断场景。仅限隔离测试库。
+    """
+    from app.agent_runtime.models import AgentRun, AgentSession
+    from app.identity.models import User
+    from app.tenancy.models import Tenant
+
+    async with SessionFactory.begin() as db:
+        await db.execute(text("SET FOREIGN_KEY_CHECKS=0"))
+        try:
+            user_ids = list(
+                (
+                    await db.scalars(
+                        select(User.id).where(User.nickname.like("uat-%"))
+                    )
+                ).all()
+            )
+            tenant_ids = list(
+                (
+                    await db.scalars(
+                        select(Tenant.id).where(Tenant.slug.like("uat-tenant-%"))
+                    )
+                ).all()
+            )
+            session_ids = list(
+                (
+                    await db.scalars(
+                        select(AgentSession.id).where(AgentSession.user_id.in_(user_ids or [""]))
+                    )
+                ).all()
+            )
+            run_ids = list(
+                (
+                    await db.scalars(
+                        select(AgentRun.id).where(AgentRun.session_id.in_(session_ids or [""]))
+                    )
+                ).all()
+            )
+            for table, column, ids in (
+                ("artifact_publish_attempts", "run_id", run_ids),
+                ("artifact_draft_revisions", "run_id", run_ids),
+                ("runtime_usage_records", "run_id", run_ids),
+                ("agent_tool_call_reconciliations", "run_id", run_ids),
+                ("agent_tool_calls", "run_id", run_ids),
+                ("agent_steps", "run_id", run_ids),
+                ("agent_run_attempts", "run_id", run_ids),
+                ("agent_events", "run_id", run_ids),
+                ("agent_messages", "run_id", run_ids),
+                ("agent_runs", "id", run_ids),
+                ("runtime_usage_records", "tenant_id", tenant_ids),
+                ("tenant_wallet_transactions", "tenant_id", tenant_ids),
+                ("tenant_user_quota_usage", "tenant_id", tenant_ids),
+                ("tenant_user_quota_policies", "tenant_id", tenant_ids),
+                ("tenant_wallets", "tenant_id", tenant_ids),
+                ("pi_tenant_queue_states", "tenant_id", tenant_ids),
+                ("encrypted_runtime_secrets", "tenant_id", tenant_ids),
+                ("runtime_config_versions", "tenant_id", tenant_ids),
+                ("tenant_licenses", "tenant_id", tenant_ids),
+                ("tenant_memberships", "tenant_id", tenant_ids),
+                ("tenants", "id", tenant_ids),
+                ("evidence_items", "session_id", session_ids),
+                ("agent_artifact_read_states", "session_id", session_ids),
+                ("kol_detail_cache", "session_id", session_ids),
+                ("memory_entries", "session_id", session_ids),
+                ("agent_uploads", "session_id", session_ids),
+                ("artifact_events", "session_id", session_ids),
+                ("agent_messages", "session_id", session_ids),
+                ("agent_sessions", "id", session_ids),
+                ("model_prompt_logs", "user_id", user_ids),
+                ("wallet_transactions", "user_id", user_ids),
+                ("wallets", "user_id", user_ids),
+                ("auth_identities", "user_id", user_ids),
+                ("users", "id", user_ids),
+            ):
+                if ids:
+                    await db.execute(
+                        text(f"DELETE FROM {table} WHERE {column} IN ({','.join(repr(i) for i in ids)})")
+                    )
+            # artifact 侧（经 session → artifact 关联）
+            if session_ids:
+                await db.execute(
+                    text(
+                        "DELETE av FROM agent_artifact_versions av "
+                        "JOIN agent_artifacts a ON av.artifact_id = a.id "
+                        f"WHERE a.session_id IN ({','.join(repr(i) for i in session_ids)})"
+                    )
+                )
+                await db.execute(
+                    text(
+                        f"DELETE FROM agent_artifacts WHERE session_id IN ({','.join(repr(i) for i in session_ids)})"
+                    )
+                )
+            await db.execute(text("DELETE FROM pi_gateway_instances"))
+            await db.execute(text("DELETE FROM pi_gateway_request_nonces"))
+        finally:
+            await db.execute(text("SET FOREIGN_KEY_CHECKS=1"))
+
+
 async def _free_port() -> int:
     import socket
 
@@ -167,10 +268,11 @@ class PiUatTopology:
         try:
             return await self._start_topology()
         except BaseException:
-            # 启动中途失败（例如 healthz 等待超时）也必须回收已拉起的子进程，
-            # 否则泄漏的 FastAPI/Gateway 会继续在共享测试库上窃取后续拓扑的 Run，
-            # 把后续测试级联打挂。
+            # 启动中途失败（例如 healthz 等待超时）也必须回收已拉起的子进程
+            # 与已提交的种子数据，否则泄漏的 FastAPI/Gateway 会继续在共享
+            # 测试库上窃取后续拓扑的 Run，残留租户会阻断迁移 guard。
             await self._stop_processes()
+            await self._teardown_db()
             raise
 
     async def _start_topology(self) -> PiUatTopology:

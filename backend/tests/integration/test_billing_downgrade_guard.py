@@ -52,6 +52,10 @@ def _clean_tenant_billing_residue():
             )
             if not exists:
                 return
+        from tests.integration.pi_uat.harness import purge_uat_residue
+
+        await purge_uat_residue()
+        async with engine.begin() as connection:
             await connection.execute(
                 text(
                     "DELETE t FROM tenant_wallet_transactions t "
