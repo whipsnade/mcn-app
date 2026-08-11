@@ -38,6 +38,39 @@ const secrets: SecretBundle = {
 };
 
 describe("Pi SDK session factory", () => {
+  it("does not resolve or allow prompt before MCP readiness completes", async () => {
+    let release!: () => void;
+    let signalStarted!: () => void;
+    const started = new Promise<void>((resolve) => { signalStarted = resolve; });
+    const readiness = {
+      waitUntilReady: () => new Promise<void>((resolve) => {
+        release = resolve;
+        signalStarted();
+      }),
+    };
+    let created = false;
+    const creating = createProductionPiSession(work, secrets, {
+      fakeProvider: true,
+      mcpReadiness: readiness,
+    } as any).then((session) => {
+      created = true;
+      return session;
+    });
+    await started;
+    expect(created).toBe(false);
+    release();
+    const session = await creating;
+    await session.prompt("first prompt after readiness");
+    await session.dispose();
+  });
+
+  it("fails closed before session creation when MCP readiness fails", async () => {
+    await expect(createProductionPiSession(work, secrets, {
+      fakeProvider: true,
+      mcpReadiness: { waitUntilReady: async () => { throw new Error("pi_mcp_readiness_failed"); } },
+    } as any)).rejects.toThrow("pi_mcp_readiness_failed");
+  });
+
   it("creates an in-memory session with the root policy in system prompt", async () => {
     const session = await createProductionPiSession(work, secrets, { fakeProvider: true });
     const events: PiSdkEvent[] = [];

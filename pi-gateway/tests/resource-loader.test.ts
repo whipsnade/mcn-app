@@ -44,12 +44,12 @@ describe("production resource loader", () => {
     expect(config.mcpServers["insight-cube"]).toEqual({
       url: "${PI_DATATAP_URL_INSIGHT_CUBE}",
       headers: { Authorization: "Bearer ${PI_DATATAP_TOKEN}" },
-      lifecycle: "lazy",
+      lifecycle: "eager",
     });
     expect(config.mcpServers["aktools"]).toEqual({
       url: "${PI_DATATAP_URL_AKTOOLS}",
       headers: { Authorization: "Bearer ${PI_DATATAP_TOKEN}" },
-      lifecycle: "lazy",
+      lifecycle: "eager",
     });
   });
 

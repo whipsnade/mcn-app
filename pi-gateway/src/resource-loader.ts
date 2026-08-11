@@ -60,7 +60,7 @@ export interface ProductionMcpConfig {
   };
   mcpServers: Record<
     string,
-    { url: string; headers: { Authorization: string }; lifecycle: "lazy" }
+    { url: string; headers: { Authorization: string }; lifecycle: "lazy" | "eager" }
   >;
 }
 
@@ -69,7 +69,10 @@ export interface ProductionMcpConfig {
  * environment *references*; the decrypted endpoint/token values exist solely
  * in the child process environment built by ``secret-env.ts``.
  */
-export function createMcpConfig(catalog: readonly AdapterCatalogEntry[]): ProductionMcpConfig {
+export function createMcpConfig(
+  catalog: readonly AdapterCatalogEntry[],
+  options: { lifecycle?: "lazy" | "eager" } = {},
+): ProductionMcpConfig {
   const mcpServers: ProductionMcpConfig["mcpServers"] = {};
   for (const entry of catalog) {
     if (!ALLOWED_SERVICES.includes(entry.service as (typeof ALLOWED_SERVICES)[number])) {
@@ -87,7 +90,7 @@ export function createMcpConfig(catalog: readonly AdapterCatalogEntry[]): Produc
     mcpServers[entry.service] = {
       url: `\${${envName}}`,
       headers: { Authorization: "Bearer ${PI_DATATAP_TOKEN}" },
-      lifecycle: "lazy",
+      lifecycle: options.lifecycle ?? "eager",
     };
   }
   if (Object.keys(mcpServers).length === 0) {

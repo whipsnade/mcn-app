@@ -29,6 +29,11 @@ import {
 import { buildInternalToolDefinitions, PiInternalToolsClient } from "./internal-tools.js";
 import type { ControlPlaneTransport } from "./control-plane-client.js";
 import {
+  createMcpReadinessExtensionFactory,
+  createMcpReadinessGate,
+  type McpReadinessGate,
+} from "./mcp-readiness.js";
+import {
   assertCompletePiSdkContract,
   PI_ALLOWED_TOOL_NAMES,
   type AdapterCatalogEntry,
@@ -47,6 +52,11 @@ export interface PiSessionOptions {
   mcpAccounting?: McpAccountingControlPlane;
   /** Optional control-plane bridge for the reviewed internal tools. */
   internalTools?: ControlPlaneTransport;
+  /** Test-injectable adapter readiness barrier; production creates one by default. */
+  mcpReadiness?: Pick<McpReadinessGate, "waitUntilReady"> &
+    Partial<Pick<McpReadinessGate, "observeSnapshot" | "beginSession" | "dispose">>;
+  /** Bounded adapter startup wait; only used by the production default barrier. */
+  mcpReadinessTimeoutMs?: number;
 }
 
 const FAKE_TOOL_NAME = /^[A-Za-z0-9._:-]{1,128}$/;
@@ -129,12 +139,24 @@ export async function createProductionPiSession(
   if (options.fakeScript !== undefined && options.fakeProvider !== true) {
     throw new Error("pi_fake_script_requires_fake_provider");
   }
+  const mcpReadiness = options.mcpReadiness ?? (
+    options.fakeProvider === true
+      ? undefined
+      : createMcpReadinessGate(
+          work.runtimeSnapshot.adapterCatalog.map((entry) => entry.service),
+          options.mcpReadinessTimeoutMs,
+        )
+  );
   const runDir = await mkdtemp(join(tmpdir(), "kol-pi-run-"));
   await chmod(runDir, 0o700);
   const agentDir = join(runDir, "agent");
   await mkdir(agentDir, { mode: 0o700 });
   const mcpConfigPath = join(runDir, ".mcp.json");
-  await writeFile(mcpConfigPath, JSON.stringify(createMcpConfig(work.runtimeSnapshot.adapterCatalog), null, 2), {
+  await writeFile(mcpConfigPath, JSON.stringify(createMcpConfig(work.runtimeSnapshot.adapterCatalog, {
+    // Unit fake providers do not own a real MCP server.  Offline UAT and all
+    // production workers use the default eager lifecycle and the barrier.
+    lifecycle: options.fakeProvider === true ? "lazy" : "eager",
+  }), null, 2), {
     encoding: "utf8",
     mode: 0o600,
   });
@@ -143,18 +165,37 @@ export async function createProductionPiSession(
   setAdapterMcpConfigPath(mcpConfigPath);
 
   let disposed = false;
+  let sdkSession: { dispose(): void } | undefined;
+  // pi-mcp-adapter persists its metadata cache through PI_CODING_AGENT_DIR;
+  // the SDK's agentDir option does not configure that adapter-owned path.
+  // Bind it to this isolated Run before loading the extension so a worker
+  // never writes the parent user's ~/.pi cache (or races another Run).
+  const previousAdapterAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  const restoreAdapterAgentDir = (): void => {
+    if (previousAdapterAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAdapterAgentDir;
+  };
   try {
     assertDatatapUrlsForCatalog(work.runtimeSnapshot.adapterCatalog, secrets);
     const mcpAccounting = options.mcpAccounting
       ? new McpAccountingExtension(options.mcpAccounting)
       : undefined;
-    const extensionFactories: ExtensionFactory[] = mcpAccounting
-      ? [createMcpAccountingExtensionFactory(mcpAccounting, work.runtimeSnapshot.adapterCatalog.map((entry) => ({
-        toolName: entry.adapterName,
-        server: entry.service,
-        remoteName: entry.remoteName,
-      })))]
-      : [];
+    const extensionFactories: ExtensionFactory[] = [
+      ...(mcpReadiness && mcpReadiness.observeSnapshot && mcpReadiness.beginSession
+        ? [createMcpReadinessExtensionFactory(mcpReadiness as McpReadinessGate)]
+        : []),
+      ...(mcpAccounting ? [
+        createMcpAccountingExtensionFactory(
+          mcpAccounting,
+          work.runtimeSnapshot.adapterCatalog.map((entry) => ({
+            toolName: entry.adapterName,
+            server: entry.service,
+            remoteName: entry.remoteName,
+          })),
+        ),
+      ] : []),
+    ];
     const internalTools = options.internalTools
       ? buildInternalToolDefinitions(
           new PiInternalToolsClient(options.internalTools),
@@ -195,10 +236,14 @@ export async function createProductionPiSession(
       sessionManager,
       settingsManager,
     });
+    sdkSession = session;
     // The SDK createAgentSession path never fires the extension session_start
     // event (the CLI does); the reviewed adapter initializes its MCP runtime
     // state on that event.  bindExtensions({}) is the public startup emit.
     await session.bindExtensions({});
+    // ExtensionRunner catches extension handler failures by design.  Await the
+    // separate bridge here so adapter failure cannot be mistaken for readiness.
+    await mcpReadiness?.waitUntilReady();
     const listeners = new Set<(event: PiSdkEvent) => void>();
     const unsubscribeSdk = session.subscribe((event) => {
       for (const listener of listeners) {
@@ -231,7 +276,11 @@ export async function createProductionPiSession(
             for (const listener of listeners) listener({ type: "session_end" });
           } finally {
             listeners.clear();
-            await rm(runDir, { recursive: true, force: true });
+            try {
+              await rm(runDir, { recursive: true, force: true });
+            } finally {
+              restoreAdapterAgentDir();
+            }
           }
         }
       },
@@ -241,7 +290,19 @@ export async function createProductionPiSession(
       mcpAccounting,
     };
   } catch (error) {
-    await rm(runDir, { recursive: true, force: true });
+    try {
+      // If readiness failed after SDK construction, shut down the adapter
+      // session before removing its config/temp directory.
+      sdkSession?.dispose();
+    } catch {
+      // Preserve the stable startup error below.
+    }
+    mcpReadiness?.dispose?.();
+    try {
+      await rm(runDir, { recursive: true, force: true });
+    } finally {
+      restoreAdapterAgentDir();
+    }
     throw error;
   }
 }
