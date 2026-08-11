@@ -66,6 +66,28 @@ async def _free_port() -> int:
         return int(sock.getsockname()[1])
 
 
+_GATEWAY_BUILT = False
+
+
+def _ensure_gateway_built() -> None:
+    """每个测试会话一次：从当前 HEAD 的 src 构建 Gateway（dist 过期才重建）。"""
+    global _GATEWAY_BUILT
+    if _GATEWAY_BUILT:
+        return
+    src_dir = GATEWAY_DIR / "src"
+    dist_main = GATEWAY_DIR / "dist" / "main.js"
+    newest_src = max((path.stat().st_mtime for path in src_dir.glob("*.ts")), default=0.0)
+    if not dist_main.exists() or dist_main.stat().st_mtime < newest_src:
+        subprocess.run(
+            ["npm", "run", "build"],
+            cwd=str(GATEWAY_DIR),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    _GATEWAY_BUILT = True
+
+
 class _InProcessServer:
     def __init__(self, app, port: int) -> None:
         # timeout_graceful_shutdown=2：step_hang 场景 teardown 时模型服务器还有
@@ -134,6 +156,13 @@ class PiUatTopology:
     def api_base(self) -> str:
         return f"http://127.0.0.1:{self.fastapi_port}"
 
+    @property
+    def gateway_pgid(self) -> int | None:
+        """本拓扑 Gateway 的进程组 id（worker 子进程 fork 自同组）。"""
+        if self._gateway is None or self._gateway.poll() is not None:
+            return None
+        return self._gateway.pid
+
     async def __aenter__(self) -> PiUatTopology:
         try:
             return await self._start_topology()
@@ -145,6 +174,7 @@ class PiUatTopology:
             raise
 
     async def _start_topology(self) -> PiUatTopology:
+        _ensure_gateway_built()
         self.model_port = await _free_port()
         self.fastapi_port = await _free_port()
         self.gateway_health_port = await _free_port()
@@ -170,19 +200,29 @@ class PiUatTopology:
         return self
 
     async def _stop_processes(self) -> None:
-        """终止已拉起的子进程（幂等，可重复调用）。"""
+        """按进程组终止本拓扑拉起的子进程（幂等，可重复调用）。
+
+        FastAPI/Gateway 都以独立进程组启动（start_new_session），终止只打
+        本拓扑的 pgid，绝不触碰其他会话/拓扑的同名进程。Gateway 的 worker
+        子进程由 fork 产生，与 Gateway 同组，一并随组终止。
+        """
         for proc in (self._gateway, self._fastapi):
             if proc is None or proc.poll() is not None:
                 continue
             try:
-                proc.send_signal(signal.SIGTERM)
+                os.killpg(proc.pid, signal.SIGTERM)
                 proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                proc.kill()
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
                 try:
                     proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     pass
+            except ProcessLookupError:
+                pass
 
     async def __aexit__(self, *exc) -> None:
         await self._stop_processes()
@@ -247,6 +287,7 @@ class PiUatTopology:
             env=self._fastapi_env(),
             stdout=log.open("w"),
             stderr=subprocess.STDOUT,
+            start_new_session=True,
         )
 
     def _start_gateway(self) -> None:
@@ -272,6 +313,7 @@ class PiUatTopology:
             env=env,
             stdout=log.open("w"),
             stderr=subprocess.STDOUT,
+            start_new_session=True,
         )
 
     # ------------------------------------------------------------------ #
@@ -535,11 +577,14 @@ class PiUatTopology:
         与 gateway 子进程均不受影响（gateway 的 claim 循环持续轮询）。
         """
         if self._fastapi is not None and self._fastapi.poll() is None:
-            self._fastapi.send_signal(signal.SIGTERM)
             try:
+                os.killpg(self._fastapi.pid, signal.SIGTERM)
                 self._fastapi.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self._fastapi.kill()
+            except (subprocess.TimeoutExpired, ProcessLookupError):
+                try:
+                    os.killpg(self._fastapi.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
         self.kill_switch = kill_switch
         self._start_fastapi()
         await _wait_http_ok(f"{self.api_base}/healthz")
@@ -551,11 +596,14 @@ class PiUatTopology:
         循环与手工签名请求在 nonce 屏障表上的并发竞争，让断言确定。
         """
         if self._gateway is not None and self._gateway.poll() is None:
-            self._gateway.send_signal(signal.SIGTERM)
             try:
+                os.killpg(self._gateway.pid, signal.SIGTERM)
                 self._gateway.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                self._gateway.kill()
+            except (subprocess.TimeoutExpired, ProcessLookupError):
+                try:
+                    os.killpg(self._gateway.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
     # ------------------------------------------------------------------ #
     # 清理
