@@ -111,3 +111,74 @@ def test_downgrade_guard_blocks_post_migration_ledger_activity() -> None:
     assert _current_version() == "0042_admin_idempotency_records"
     alembic_upgrade(config, "head")
     assert _current_version() == "0043_billing_downgrade_guard"
+
+
+def test_staged_downgrade_cannot_bypass_the_guard() -> None:
+    """分段降级不得绕过 guard：先降到 0042（guard 通过），植入新流水后继续
+    降穿 0040 时必须 fail-closed——guard 不能只挂在 0043→0042 一步上。"""
+    assert os.environ.get("MYSQL_DATABASE") == "kol_insight_test"
+    config = _alembic_config()
+    marker_id = str(uuid4())
+
+    async def _scalar(sql: str, params: dict | None = None):
+        async with engine.begin() as connection:
+            return await connection.scalar(text(sql), params or {})
+
+    async def _execute(sql: str, params: dict | None = None):
+        async with engine.begin() as connection:
+            await connection.execute(text(sql), params or {})
+
+    def _current_version() -> str | None:
+        return _run(_scalar("SELECT version_num FROM alembic_version"))
+
+    tenant_id = _run(_scalar("SELECT tenant_id FROM tenant_wallets LIMIT 1"))
+    if tenant_id is None:
+        tenant_id = str(uuid4())
+        _run(
+            _execute(
+                "INSERT INTO tenants (id, slug, name, status, is_internal, runtime_backend,"
+                " license_status, active_license_id, created_at, updated_at) VALUES"
+                " (:id, :slug, 'staged-guard-probe', 'active', 0, 'current', 'active', NULL,"
+                " '2026-08-10 00:00:00', '2026-08-10 00:00:00')",
+                {"id": tenant_id, "slug": f"legacy-staged-probe-{tenant_id[:8]}"},
+            )
+        )
+        _run(
+            _execute(
+                "INSERT INTO tenant_wallets (tenant_id, balance, reserved, version, updated_at)"
+                " VALUES (:t, 0, 0, 0, '2026-08-10 00:00:00')",
+                {"t": tenant_id},
+            )
+        )
+
+    try:
+        # 第一段：head → 0042（guard 运行并通过）
+        alembic_downgrade(config, "0042_admin_idempotency_records")
+        assert _current_version() == "0042_admin_idempotency_records"
+        # 在 0043 guard 身后植入 0040 之后的新流水
+        _run(
+            _execute(
+                "INSERT INTO tenant_wallet_transactions "
+                "(id,tenant_id,user_id,run_id,tool_call_id,internal_tool_name,kind,"
+                "balance_delta,reserved_delta,balance_after,reserved_after,"
+                "idempotency_key,reference_type,reference_id,created_at) "
+                "VALUES (:id,:tenant_id,NULL,NULL,NULL,NULL,'reserve',-10,10,0,10,"
+                ":idem,'mcp_call',NULL,'2026-08-10 00:00:00')",
+                {"id": marker_id, "tenant_id": tenant_id, "idem": f"staged-probe:{marker_id}"},
+            )
+        )
+        # 第二段：继续降穿 0040——必须被拒绝（staged bypass 封堵）
+        with pytest.raises(Exception, match="tenant_billing_downgrade_blocked"):
+            alembic_downgrade(config, "0039a_pi_session_mutex_backfill")
+    finally:
+        # 清理探针并恢复 head（若第二段已被阻断，只需删行后升回）
+        try:
+            _run(
+                _execute(
+                    "DELETE FROM tenant_wallet_transactions WHERE id = :id",
+                    {"id": marker_id},
+                )
+            )
+        finally:
+            alembic_upgrade(config, "head")
+            assert _current_version() == "0043_billing_downgrade_guard"

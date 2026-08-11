@@ -1,13 +1,18 @@
 # Pi Agent Gateway 运维手册
 
 本手册覆盖方案 B 的本地/预生产操作边界。当前交付状态只到
-`READY_FOR_REAL_B7_UAT`：真实 B7 UAT、生产切流和方案 C 均需要单独审批。
+`READY_FOR_REAL_B7_UAT_REVIEW`（2026-08-09 写入的 `READY_FOR_REAL_B7_UAT` 已被架构审核
+否决，修复完成后由独立复审决定是否恢复）：真实 B7 UAT、生产切流和方案 C 均需要单独审批。
 
 ## 组件、版本与启动检查
 
 后端使用 Python 3.11/3.12、FastAPI、SQLAlchemy Async 和 MySQL 8；启动前必须在隔离测试库执行
 `backend/.venv/bin/alembic upgrade head`，并确认只有一个迁移 head。当前 head 为
-`0041_runtime_usage_constraints`。后端健康检查使用 `GET /healthz`。
+`0043_billing_downgrade_guard`。后端健康检查使用 `GET /healthz`。
+
+迁移回滚护栏：0043 的 downgrade guard 挂在 head→0042 一步；任何降穿 0040 的命令（包括
+staged downgrade）由 `migrations/env.py` 的预检统一拦截——租户账本在 0040 之后产生新流水/
+用量/余额漂移时 fail-closed，绝不静默丢账。
 
 Pi Gateway 是独立 Node worker，控制面只允许调用显式注入的 FastAPI origin；生产锁定依赖为：
 
