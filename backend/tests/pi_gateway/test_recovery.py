@@ -5,7 +5,7 @@ import pytest
 from sqlalchemy import select
 
 from app.agent_runtime.events import AgentEvent, AgentEventBroker
-from app.agent_runtime.models import AgentRunAttempt, AgentToolCall
+from app.agent_runtime.models import AgentMessage, AgentRunAttempt, AgentStep, AgentToolCall
 from app.agent_runtime.recovery import RecoveryLoop
 from app.agent_runtime.repository import utc_now
 from app.agent_runtime.state import RunStatus
@@ -30,6 +30,54 @@ class _FakeExecutor:
 @asynccontextmanager
 async def _session(db_session):
     yield db_session
+
+
+@pytest.mark.asyncio
+async def test_pi_recovery_closes_idempotently_on_durable_completion(db_session, user_factory) -> None:
+    """terminal ACK 丢失（completion 已持久化但 gateway 失联）：恢复必须按
+    durable completion 幂等收口 completed——不新起 Attempt（新 Attempt 会
+    重放模型与 MCP 外发）、不消耗基础设施重试。"""
+    user = await _funded_user(db_session, user_factory)
+    session, run, _step = await _make_chain(db_session, user.id)
+    run.runtime_backend = "pi"
+    session.active_run_id = run.id
+    now = utc_now()
+    run.gateway_id = "gateway-ack-lost"
+    run.gateway_lease_hash = hash_lease_token("lease-token-ack-lost")
+    run.gateway_lease_expires_at = now - timedelta(seconds=1)
+    run.lease_owner = run.gateway_id
+    run.lease_expires_at = run.gateway_lease_expires_at
+    db_session.add(
+        AgentMessage(
+            id="msg-ack-lost-completion",
+            session_id=session.id,
+            run_id=run.id,
+            role="assistant",
+            content="最终结论",
+            metadata_json={"gateway_message": True},
+            sequence=2,
+            created_at=now,
+        )
+    )
+    await db_session.flush()
+
+    recovery = PiGatewayRecoveryService(db_session, broker=AgentEventBroker(), now_fn=lambda: now)
+
+    assert await recovery.recover_expired_run(run.id) == "completed"
+    assert run.status == RunStatus.COMPLETED
+    assert run.infrastructure_retry_count == 0
+    attempts = list(
+        (await db_session.scalars(select(AgentRunAttempt).where(AgentRunAttempt.run_id == run.id))).all()
+    )
+    assert len(attempts) == 1
+    assert attempts[0].outcome != "running"
+    assert session.active_run_id is None
+    terminal_events = [
+        event.event_type
+        for event in (await db_session.scalars(select(AgentEvent).where(AgentEvent.run_id == run.id))).all()
+        if event.event_type.startswith("run.")
+    ]
+    assert terminal_events == ["run.completed"]
 
 
 @pytest.mark.asyncio
@@ -102,6 +150,33 @@ async def test_pi_recovery_requeues_once_then_fails_closed(db_session, user_fact
         decision_count=0,
     )
     db_session.add(second_attempt)
+    # 第二次恢复时仍有开放 ToolCall：必须在同一事务内置 unknown 并关闭 Attempt 2。
+    open_call = AgentToolCall(
+        id="tool-call-second-attempt-open",
+        run_id=run.id,
+        step_id=_step.id,
+        logical_call_id="logical-second-attempt-open",
+        service="insight_cube",
+        internal_tool_name="query_analysis_data",
+        arguments_hash="f" * 64,
+        status="running",
+        points_reserved=10,
+        started_at=now,
+    )
+    step2 = AgentStep(
+        id="step-pi-recovery-2",
+        run_id=run.id,
+        attempt_id=second_attempt.id,
+        sequence=2,
+        step_type="tool_call",
+        status="running",
+        visibility="user",
+        created_at=now,
+    )
+    db_session.add(step2)
+    await db_session.flush()
+    open_call.step_id = step2.id
+    db_session.add(open_call)
     run.status = RunStatus.RUNNING
     run.gateway_id = "gateway-dead"
     run.gateway_lease_hash = hash_lease_token("lease-token-second-attempt")
@@ -113,6 +188,14 @@ async def test_pi_recovery_requeues_once_then_fails_closed(db_session, user_fact
     assert await recovery.recover_expired_run(run.id) == "failed"
     assert run.status == RunStatus.FAILED
     assert run.infrastructure_retry_count == 1
+    # 第二次恢复必须同事务关闭 Attempt 2、处理开放 ToolCall、释放 lease/session
+    await db_session.refresh(second_attempt)
+    assert second_attempt.outcome == "failed"
+    assert second_attempt.ended_at is not None
+    await db_session.refresh(open_call)
+    assert open_call.status == "unknown"
+    assert session.active_run_id is None
+    assert run.gateway_lease_hash is None
     events = list(
         (
             await db_session.scalars(

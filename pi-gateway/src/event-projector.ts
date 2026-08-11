@@ -61,6 +61,21 @@ function safeEventId(event: RecordValue): string | undefined {
   return undefined;
 }
 
+function extractCompletionCandidate(event: RecordValue): string | undefined {
+  const update = event.assistantMessageEvent;
+  if (!isRecord(update)) return undefined;
+  const text = safeDelta(update.text ?? update.content);
+  const message = isRecord(update.message) ? update.message : undefined;
+  const content = message && Array.isArray(message.content) ? message.content : undefined;
+  const contentText = content
+    ?.filter((block): block is RecordValue => isRecord(block))
+    .filter((block) => block.type === "text")
+    .map((block) => safeDelta(block.text))
+    .filter((value): value is string => Boolean(value))
+    .join("");
+  return text ?? (contentText || undefined);
+}
+
 function genericProjection(event: RecordValue): { event_type: string; payload: RecordValue; identity?: string } | undefined {
   const type = event.type;
   if (type === "agent_start") {
@@ -84,26 +99,9 @@ function genericProjection(event: RecordValue): { event_type: string; payload: R
     if (update.type === "text_delta" && delta) {
       return { event_type: "message.delta", payload: { text: delta }, identity: safeEventId(event) };
     }
-    // 真实 SDK 会话事件流没有 "done" update；assistant 文本以 text_end
-    // （携带完整 content）收口，done/error 是其他 provider 路径的等价终帧。
-    // completionEmitted 保证每个 Attempt 恰好一次 completion。
-    if (update.type === "text_end" || ["done", "error"].includes(String(update.type))) {
-      const text = safeDelta(update.text ?? update.content);
-      const message = isRecord(update.message) ? update.message : undefined;
-      const content = message && Array.isArray(message.content) ? message.content : undefined;
-      const contentText = content
-        ?.filter((block): block is RecordValue => isRecord(block))
-        .filter((block) => block.type === "text")
-        .map((block) => safeDelta(block.text))
-        .filter((value): value is string => Boolean(value))
-        .join("");
-      const finalText = text ?? (contentText || undefined);
-      return {
-        event_type: "message.completed",
-        payload: finalText ? { text: finalText } : {},
-        identity: safeEventId(event),
-      };
-    }
+    // text_end/done 的文本只是 completion 候选：前导语后接工具调用时必须作废，
+    // 只有 agent_end/turn_end 收口时的最近候选才发布 message.completed。
+    // 该状态由 project() 持有（pendingCompletionText），此处不再产出事件。
     return undefined;
   }
   if (type === "message_start") return { event_type: "message.start", payload: {}, identity: safeEventId(event) };
@@ -130,6 +128,8 @@ export class PiSdkUsageProjector {
   private sequence = 1;
   private readonly seen = new Set<string>();
   private completionEmitted = false;
+  /** 最近一次 text_end/done 的候选最终文本；工具调用出现即作废。 */
+  private pendingCompletionText: string | undefined;
   readonly diagnostics: UsageProjectorDiagnostics = {
     unknownEvents: 0,
     invalidUsage: 0,
@@ -142,32 +142,44 @@ export class PiSdkUsageProjector {
   }
 
   /**
-   * Project one SDK event into zero or more ordered product events.  A
-   * message-completion update that also carries usage yields the completion
-   * first and the usage record second, so usage can never swallow the
-   * assistant completion the terminal ordering relies on.
+   * Project one SDK event into zero or more ordered product events.
+   *
+   * message.completed 只在 agent_end/turn_end 收口时发布：text_end/done
+   * 只登记候选文本，后续 tool_execution_start 把它作废（文本前导 → 工具
+   * 调用 → 最终回答）；候选与 delta 都按构造时的 attemptId 归属。
+   * usage 事件不受影响，与 completion 同帧时 completion 仍然先出。
    */
   project(event: unknown): PiGatewaySourceEvent[] {
     if (!isRecord(event) || typeof event.type !== "string") {
       this.diagnostics.unknownEvents += 1;
       return [];
     }
+    if (event.type === "tool_execution_start" || event.type === "tool_call") {
+      // 工具调用意味着之前的文本只是前导语，不是最终回答。
+      this.pendingCompletionText = undefined;
+    }
+    if (event.type === "message_update") {
+      const update = event.assistantMessageEvent;
+      if (isRecord(update) && (update.type === "text_end" || update.type === "done")) {
+        const candidate = extractCompletionCandidate(event);
+        if (candidate) this.pendingCompletionText = candidate;
+      }
+    }
+    const isTurnBoundary = event.type === "agent_end" || event.type === "turn_end";
     const generic = genericProjection(event);
     const usage = usageObject(event);
-    if (generic === undefined && usage === undefined) {
-      this.diagnostics.unknownEvents += 1;
-      return [];
-    }
     const out: PiGatewaySourceEvent[] = [];
+    if (isTurnBoundary && this.pendingCompletionText && !this.completionEmitted) {
+      // 最终回答：completion 先于 turn.end 与 usage 发布，每 Attempt 恰好一次。
+      this.completionEmitted = true;
+      out.push(this.nextEvent("message.completed", { text: this.pendingCompletionText }));
+      this.pendingCompletionText = undefined;
+    }
     if (generic !== undefined) {
-      const isCompletion = generic.event_type === "message.completed";
       const dedupeKey = generic.identity ? `event:${generic.identity}` : undefined;
-      if (isCompletion && this.completionEmitted) {
-        this.diagnostics.duplicateUsage += 1;
-      } else if (dedupeKey && this.seen.has(dedupeKey)) {
+      if (dedupeKey && this.seen.has(dedupeKey)) {
         this.diagnostics.duplicateUsage += 1;
       } else {
-        if (isCompletion) this.completionEmitted = true;
         if (dedupeKey) this.seen.add(dedupeKey);
         out.push(this.nextEvent(generic.event_type, generic.payload));
       }
@@ -175,6 +187,9 @@ export class PiSdkUsageProjector {
     if (usage !== undefined) {
       const usageEvent = this.projectUsage(event, usage);
       if (usageEvent !== undefined) out.push(usageEvent);
+    }
+    if (generic === undefined && usage === undefined && out.length === 0) {
+      this.diagnostics.unknownEvents += 1;
     }
     return out;
   }

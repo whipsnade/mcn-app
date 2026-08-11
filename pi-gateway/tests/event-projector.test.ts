@@ -26,28 +26,30 @@ describe("Pi SDK usage projector", () => {
 
   it("emits message.completed before usage when done carries both text and usage", () => {
     const projector = new PiSdkUsageProjector("attempt-mix");
-    const events = projector.project({
-      type: "message_update",
-      eventId: "msg-done-1",
-      assistantMessageEvent: {
-        type: "done",
-        message: {
-          role: "assistant",
-          content: [{ type: "text", text: "最终结论" }],
-          usage: { input: 12, output: 4, requestId: "req-mix" },
+    const events = [
+      {
+        type: "message_update",
+        eventId: "msg-done-1",
+        assistantMessageEvent: {
+          type: "done",
+          message: {
+            role: "assistant",
+            content: [{ type: "text", text: "最终结论" }],
+            usage: { input: 12, output: 4, requestId: "req-mix" },
+          },
         },
       },
-    });
+      { type: "agent_end" },
+    ].flatMap((event) => projector.project(event));
 
-    expect(events.map((event) => event.event_type)).toEqual(["message.completed", "usage"]);
-    expect(events[0]).toMatchObject({
-      source_event_id: "attempt-mix:1",
-      sequence: 1,
+    // usage 随 done 帧投影；completion 推迟到 agent_end 发布且先于 turn.end，
+    // 保证 terminal 前持久化的顺序不变。
+    expect(events.map((event) => event.event_type)).toEqual(["usage", "message.completed", "agent.turn.end"]);
+    expect(events[1]).toMatchObject({
+      event_type: "message.completed",
       payload: { text: "最终结论" },
     });
-    expect(events[1]).toMatchObject({
-      source_event_id: "attempt-mix:2",
-      sequence: 2,
+    expect(events[0]).toMatchObject({
       event_type: "usage",
       payload: { input_tokens: 12, output_tokens: 4, usage_status: "available" },
     });
@@ -63,11 +65,17 @@ describe("Pi SDK usage projector", () => {
       type: "message_update",
       assistantMessageEvent: { type: "done", message: { role: "assistant", content: [{ type: "text", text: "结论" }] } },
     });
+    const boundary = projector.project({ type: "agent_end" });
 
-    expect(first.map((event) => event.event_type)).toEqual(["message.completed", "usage"]);
-    expect(first[1]?.payload).toMatchObject({ usage_status: "unavailable" });
-    // a repeated done never produces a second assistant completion
+    // done 帧只投影 usage；completion 推迟到 agent_end 且每 Attempt 恰好一次
+    expect(first.map((event) => event.event_type)).toEqual(["usage"]);
+    expect(first[0]?.payload).toMatchObject({ usage_status: "unavailable" });
     expect(second.map((event) => event.event_type)).toEqual(["usage"]);
+    expect(boundary.map((event) => event.event_type)).toEqual(["message.completed", "agent.turn.end"]);
+    expect(boundary[0]?.payload).toEqual({ text: "结论" });
+    expect(projector.project({ type: "agent_end" }).map((event) => event.event_type)).toEqual(
+      ["agent.turn.end"],
+    );
   });
 
   it("never lets a usage payload swallow the assistant completion", () => {
@@ -84,12 +92,13 @@ describe("Pi SDK usage projector", () => {
           message: { role: "assistant", content: [{ type: "text", text: "部分结论" }], usage: { input: 1 } },
         },
       },
+      { type: "agent_end" },
     ].flatMap((event) => projector.project(event));
 
     const types = projected.map((event) => event.event_type);
-    expect(types).toEqual(["message.delta", "message.completed", "usage"]);
-    expect(types.indexOf("message.completed")).toBeLessThan(types.indexOf("usage"));
-    expect(projected[1]?.payload).toEqual({ text: "部分结论" });
+    expect(types).toEqual(["message.delta", "usage", "message.completed", "agent.turn.end"]);
+    expect(types.indexOf("message.completed")).toBeLessThan(types.indexOf("agent.turn.end"));
+    expect(projected[2]?.payload).toEqual({ text: "部分结论" });
   });
 
   it("projects provider usage with cache fields and stable source ids", () => {
@@ -200,6 +209,44 @@ describe("Pi SDK usage projector", () => {
     for (const event of projected) {
       expect(() => parsePiGatewaySourceEvent(event)).not.toThrow();
     }
+  });
+
+  it("emits message.completed only for the final assistant text at agent_end", () => {
+    // 文本前导 → 工具调用 → 最终回答：前导 text_end 不得产出 completion；
+    // 只有 agent_end/turn_end 收口时的最近一段最终文本才是 completion。
+    const projector = new PiSdkUsageProjector("attempt-final");
+    const events = [
+      { type: "agent_start" },
+      { type: "turn_start" },
+      { type: "message_update", assistantMessageEvent: { type: "text_end", content: "我先查一下数据。" } },
+      { type: "tool_execution_start", toolCallId: "call-1", toolName: "mcp" },
+      { type: "tool_execution_end", toolCallId: "call-1", isError: false },
+      { type: "turn_end" },
+      { type: "turn_start" },
+      { type: "message_update", assistantMessageEvent: { type: "text_end", content: "最终结论：声量上升。" } },
+      { type: "turn_end" },
+      { type: "agent_end" },
+    ].flatMap((event) => projector.project(event));
+
+    const types = events.map((event) => event.event_type);
+    const completions = events.filter((event) => event.event_type === "message.completed");
+    expect(completions).toHaveLength(1);
+    expect(completions[0]?.payload).toEqual({ text: "最终结论：声量上升。" });
+    // completion 必须在最后一个 turn.end 之前、且不出现在前导语之后
+    expect(types.indexOf("message.completed")).toBeGreaterThan(types.lastIndexOf("tool.end"));
+    expect(types.filter((t) => t === "message.completed")).toHaveLength(1);
+  });
+
+  it("does not emit a completion when a text preamble is followed only by tool calls", () => {
+    const projector = new PiSdkUsageProjector("attempt-preamble");
+    const events = [
+      { type: "message_update", assistantMessageEvent: { type: "text_end", content: "准备调用工具" } },
+      { type: "tool_execution_start", toolCallId: "call-1", toolName: "mcp" },
+      { type: "tool_execution_end", toolCallId: "call-1", isError: false },
+      { type: "agent_end" },
+    ].flatMap((event) => projector.project(event));
+
+    expect(events.filter((event) => event.event_type === "message.completed")).toEqual([]);
   });
 
   it("sends usage through the authenticated control-plane event path", async () => {

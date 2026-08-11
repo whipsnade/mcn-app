@@ -825,7 +825,23 @@ class PiGatewayRecoveryService:
         self.now_fn = now_fn or (lambda: datetime.now(UTC).replace(tzinfo=None))
         self.scheduler = PiRunScheduler(db, lease_seconds=lease_seconds, now_fn=self.now_fn)
 
-    async def recover_expired_run(self, run_id: str) -> Literal["requeued", "failed", "ignored"]:
+    async def _has_durable_completion(self, run: AgentRun) -> bool:
+        """durable completion：已持久化的 assistant 消息或 message.completed 事件。"""
+        message_id = await self.db.scalar(
+            select(AgentMessage.id)
+            .where(AgentMessage.run_id == run.id, AgentMessage.role == "assistant")
+            .limit(1)
+        )
+        if message_id is not None:
+            return True
+        event_id = await self.db.scalar(
+            select(AgentEvent.id)
+            .where(AgentEvent.run_id == run.id, AgentEvent.event_type == "message.completed")
+            .limit(1)
+        )
+        return event_id is not None
+
+    async def recover_expired_run(self, run_id: str) -> Literal["requeued", "failed", "completed", "ignored"]:
         """Atomically consume one expired Gateway lease.
 
         ``ignored`` covers non-Pi, active-lease, cancelled, queued or already
@@ -863,6 +879,22 @@ class PiGatewayRecoveryService:
             .order_by(AgentRunAttempt.attempt.desc())
             .with_for_update()
         )
+        if await self._has_durable_completion(run):
+            # durable completion 已存在（terminal ACK 丢失场景）：幂等收口为
+            # completed，绝不新起 Attempt——新 Attempt 会重放模型与 MCP 外发。
+            # 开放 ToolCall 置 unknown、Attempt 关闭、lease/session 释放与终态
+            # 事件全部在同一个事务内完成。
+            await self._mark_attempt_tool_calls_unknown(attempt, now)
+
+            event = await AgentEventStream(self.db, self.broker).settle_terminal(
+                run.id,
+                run.user_id,
+                RunStatus.COMPLETED,
+                {"recovered_after_terminal_ack_lost": True},
+                allow_system_completion=self._has_durable_completion,
+            )
+            await self._reconcile_after_terminal(run.id)
+            return "completed" if event is not None or run.status == RunStatus.COMPLETED else "ignored"
         if run.infrastructure_retry_count < 1:
             await self._mark_attempt_tool_calls_unknown(attempt, now)
             if attempt is not None:
@@ -880,6 +912,9 @@ class PiGatewayRecoveryService:
             if session.active_run_id == locked_run.id:
                 session.active_run_id = None
 
+        # 第二次基础设施失败：开放 ToolCall 置 unknown 与终态收口同一事务；
+        # force_fail 会同事务关闭敞开的 Attempt 2 并释放 session slot。
+        await self._mark_attempt_tool_calls_unknown(attempt, now)
         event = await AgentEventStream(self.db, self.broker).settle_terminal(
             run.id,
             run.user_id,

@@ -193,6 +193,32 @@ class AgentRunRepository:
         await self.db.flush()
         return True
 
+    async def force_complete(self, run_id: str) -> bool:
+        """系统级完成收口：仅在调用方已核实 durable completion 后使用。
+
+        与 force_fail 同构：仅在无其他 worker 活跃持有时生效；用于 Pi
+        Gateway「terminal ACK 丢失」恢复——completion 已持久化、租约过期，
+        Run 必须干净置为 completed 而不是重跑。
+        """
+        run = await self.lock_run(run_id)
+        if RunStatus(run.status) in TERMINAL_RUN_STATUSES:
+            return False
+        if run.lease_owner is not None and (
+            run.lease_expires_at is None or run.lease_expires_at > utc_now()
+        ):
+            return False
+        ensure_transition(RunStatus(run.status), RunStatus.COMPLETED)
+        now = utc_now()
+        run.status = RunStatus.COMPLETED
+        run.completed_at = run.completed_at or now
+        run.error_code = None
+        run.lease_owner = None
+        run.lease_expires_at = None
+        await self._end_open_attempt(run_id, "completed", now)
+        await self._clear_session_slot(run.session_id, run.id)
+        await self.db.flush()
+        return True
+
     async def pause(self, run_id: str, worker_id: str) -> bool:
         """运行达到阈值后暂停：释放租约、结束当前 Attempt（outcome=paused）。"""
         run = await self.lock_run(run_id)

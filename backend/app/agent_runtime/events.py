@@ -275,6 +275,7 @@ class AgentEventStream:
         *,
         worker_id: str | None = None,
         before_commit: Callable[[AgentRun], Awaitable[None]] | None = None,
+        allow_system_completion: Callable[[AgentRun], Awaitable[bool]] | None = None,
     ) -> AgentEvent | None:
         """Run 终态收口唯一事务边界（H1/§5.8）：状态迁移与终态事件同一加锁事务。
 
@@ -308,7 +309,9 @@ class AgentEventStream:
             # 旧窗口残留（Run 已终态、无终态事件）：按实际终态补发，不再迁移。
             event_type = f"run.{current.value}"
         else:
-            migrated = await self._migrate_terminal_locked(run, outcome, worker_id, payload)
+            migrated = await self._migrate_terminal_locked(
+                run, outcome, worker_id, payload, allow_system_completion
+            )
             if not migrated:
                 await self.db.commit()
                 return None
@@ -416,6 +419,7 @@ class AgentEventStream:
         outcome: RunStatus,
         worker_id: str | None,
         payload: dict[str, Any] | None,
+        allow_system_completion: Callable[[AgentRun], Awaitable[bool]] | None = None,
     ) -> bool:
         """持锁状态下按 outcome 迁移 Run 终态（不 commit）。
 
@@ -428,10 +432,14 @@ class AgentEventStream:
             # 用户取消跨切面：任意非终态 → cancelled，不看租约。
             return await repo.cancel(run.id, run.user_id)
         if outcome in (RunStatus.COMPLETED, RunStatus.COMPLETED_WITH_WARNINGS):
-            if worker_id is None or not AgentRunRepository.owns_active_lease(run, worker_id):
-                raise InvalidRunTransition("run_lease_not_held")
-            await repo.transition(run.id, outcome, worker_id=worker_id)
-            return True
+            if worker_id is not None and AgentRunRepository.owns_active_lease(run, worker_id):
+                await repo.transition(run.id, outcome, worker_id=worker_id)
+                return True
+            # 系统级完成收口：仅当调用方（Pi 恢复）核实 durable completion
+            # 存在，用于 terminal ACK 丢失后的幂等收口。
+            if allow_system_completion is not None and await allow_system_completion(run):
+                return await repo.force_complete(run.id)
+            raise InvalidRunTransition("run_lease_not_held")
         # FAILED：持租约走状态机；无租约/过期走系统级 force_fail（error_code 落 Run 行）。
         if worker_id is not None and AgentRunRepository.owns_active_lease(run, worker_id):
             await repo.transition(run.id, RunStatus.FAILED, worker_id=worker_id)
