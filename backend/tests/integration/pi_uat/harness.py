@@ -366,7 +366,8 @@ class PiUatTopology:
                     os.killpg(proc.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-                await _wait_proc_exit(proc, 5)
+                if not await _wait_proc_exit(proc, 5):
+                    raise RuntimeError("uat_process_reap_timeout")
             self._log_lifecycle("process_reaped")
 
     async def __aexit__(self, *exc) -> None:
