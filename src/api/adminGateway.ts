@@ -33,6 +33,19 @@ export type AdminRunDiagnostics = {
   tool_calls: Array<Record<string, unknown>>; events: Array<Record<string, unknown>>;
   usage: Array<Record<string, unknown>>; reconciliation: Record<string, unknown> | null;
 };
+export type AdminTenantUser = {
+  id: string; nickname: string; role: 'owner' | 'admin' | 'member';
+  status: 'active' | 'disabled'; created_at: string;
+};
+export type AdminWalletAdjustResult = {
+  tenant_id: string; balance: number; reserved: number; transaction_id: string;
+};
+export type AdminWalletState = {
+  tenant_id: string; balance: number; reserved: number;
+};
+export type AdminQuotaItem = {
+  user_id: string; period: 'monthly'; points_limit: number; status: 'active' | 'disabled';
+};
 
 const key = (value?: string): Record<string, string> => ({ 'Idempotency-Key': value ?? crypto.randomUUID() });
 const query = (path: string, params: Record<string, string | number | undefined>): string => {
@@ -63,3 +76,17 @@ export const listAdminRuntimeConfigs = (tenantId: string) => request<{ items: Ad
 export const createAdminRuntimeConfig = (input: Record<string, unknown>) => request<AdminRuntimeConfig>('/api/v1/admin/runtime-configs', { method: 'POST', headers: key(), body: JSON.stringify(input) });
 export const activateAdminRuntimeConfig = (id: string) => request<AdminRuntimeConfig>(`/api/v1/admin/runtime-configs/${encodeURIComponent(id)}/activate`, { method: 'POST', headers: key() });
 export const getAdminRunDiagnostics = (id: string) => request<AdminRunDiagnostics>(`/api/v1/admin/agent-runs/${encodeURIComponent(id)}/diagnostics`);
+// 租户成员列表：钱包调整与周期额度编辑的成员选择数据源。
+export const listAdminTenantUsers = (tenantId: string, options: { limit?: number; offset?: number } = {}) =>
+  request<{ items: AdminTenantUser[]; total: number; limit: number; offset: number }>(query(`/api/v1/admin/tenants/${encodeURIComponent(tenantId)}/users`, { limit: options.limit ?? 200, offset: options.offset }));
+// 租户钱包只读投影：无钱包行时 404 tenant_wallet_not_found。
+export const getTenantWallet = (tenantId: string) =>
+  request<AdminWalletState>(`/api/v1/admin/tenants/${encodeURIComponent(tenantId)}/wallet`);
+// 租户钱包人工调整：delta 非零整数，正加负减；服务端强制持久化幂等键。
+export const adjustTenantWallet = (tenantId: string, input: { user_id: string; delta: number; reason: string }, idempotencyKey?: string) =>
+  request<AdminWalletAdjustResult>(`/api/v1/admin/tenants/${encodeURIComponent(tenantId)}/wallet/adjust`, { method: 'POST', headers: key(idempotencyKey), body: JSON.stringify(input) });
+export const listTenantQuota = (tenantId: string) =>
+  request<{ items: AdminQuotaItem[] }>(`/api/v1/admin/tenants/${encodeURIComponent(tenantId)}/quota`);
+// 用户周期额度 upsert：只影响新周期/新 Run 的扣费上限。
+export const setTenantQuota = (tenantId: string, userId: string, input: { points_limit: number }, idempotencyKey?: string) =>
+  request<AdminQuotaItem>(`/api/v1/admin/tenants/${encodeURIComponent(tenantId)}/quota/${encodeURIComponent(userId)}`, { method: 'PUT', headers: key(idempotencyKey), body: JSON.stringify(input) });

@@ -99,6 +99,7 @@ async def test_gateway_admin_writes_require_a_nonempty_idempotency_key(authed_cl
     client, _admin = await authed_client_factory()
     response = await client.post(
         "/api/v1/admin/tenants",
+        headers={"X-Test-Raw-Write": "1"},
         json={"slug": "no-key-tenant", "name": "缺幂等键"},
     )
     assert response.status_code == 400

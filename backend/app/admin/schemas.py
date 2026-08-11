@@ -138,6 +138,47 @@ class AdminTenantUserCreate(BaseModel):
     points: int = Field(default=0, ge=0, le=50000)
 
 
+class AdminWalletAdjustRequest(BaseModel):
+    """租户钱包人工调整（admin_adjust 账本 + 审计）。"""
+
+    user_id: str = Field(min_length=1, max_length=64)
+    delta: int = Field(ne=0, ge=-1_000_000, le=1_000_000)
+    reason: str = Field(min_length=1, max_length=200)
+
+
+class AdminWalletAdjustResponse(BaseModel):
+    tenant_id: str
+    balance: int
+    reserved: int
+    transaction_id: str
+
+
+class AdminWalletItem(BaseModel):
+    """租户钱包只读投影。"""
+
+    tenant_id: str
+    balance: int
+    reserved: int
+
+
+class AdminQuotaPolicyItem(BaseModel):
+    user_id: str
+    period: Literal["monthly"]
+    points_limit: int
+    status: Literal["active", "disabled"]
+
+
+class AdminQuotaPolicyUpdate(BaseModel):
+    points_limit: int = Field(ge=0, le=10_000_000)
+
+
+class AdminUserDisableResult(BaseModel):
+    """legacy 用户软禁用的幂等回放投影（路由层始终返回 204）。"""
+
+    id: str
+    status: Literal["disabled"] = "disabled"
+
+
 class AdminLicenseItem(BaseModel):
     id: str
     tenant_id: str

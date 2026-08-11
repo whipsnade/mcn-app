@@ -10,6 +10,8 @@ from app.admin.schemas import (
     AdminLicenseCreate,
     AdminLicenseItem,
     AdminLicenseStatusUpdate,
+    AdminQuotaPolicyItem,
+    AdminQuotaPolicyUpdate,
     AdminRunDiagnostics,
     AdminRuntimeConfigCreate,
     AdminRuntimeConfigItem,
@@ -23,6 +25,9 @@ from app.admin.schemas import (
     AdminUserItem,
     AdminUserListResponse,
     AdminUserUpdate,
+    AdminWalletAdjustRequest,
+    AdminWalletAdjustResponse,
+    AdminWalletItem,
     AgentToolCallReconcileRequest,
     AgentToolCallReconcileResponse,
     PointsAdjustRequest,
@@ -106,11 +111,18 @@ async def create_user(
     payload: AdminUserCreate,
     admin: AdminUser,
     db: Annotated[AsyncSession, Depends(get_db)],
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> AdminUserItem:
     try:
-        return await AdminService(db).create_user(admin, payload)
+        result = await _gateway_service(db).create_legacy_user(
+            admin, payload, idempotency_key=_require_idempotency_key(idempotency_key)
+        )
+        await db.commit()
+        return result
     except PhoneConflictError as error:
         raise phone_conflict(error) from error
+    except GatewayAdminError as exc:
+        raise gateway_error(exc) from exc
 
 
 @router.patch("/users/{user_id}", response_model=AdminUserItem)
@@ -119,13 +131,20 @@ async def update_user(
     payload: AdminUserUpdate,
     admin: AdminUser,
     db: Annotated[AsyncSession, Depends(get_db)],
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> AdminUserItem:
     try:
-        return await AdminService(db).update_user(admin, user_id, payload)
+        result = await _gateway_service(db).update_legacy_user(
+            admin, user_id, payload, idempotency_key=_require_idempotency_key(idempotency_key)
+        )
+        await db.commit()
+        return result
     except LookupError as error:
         raise not_found(error) from error
     except PhoneConflictError as error:
         raise phone_conflict(error) from error
+    except GatewayAdminError as exc:
+        raise gateway_error(exc) from exc
     except ValueError as error:
         raise invalid(error) from error
 
@@ -135,11 +154,17 @@ async def delete_user(
     user_id: str,
     admin: AdminUser,
     db: Annotated[AsyncSession, Depends(get_db)],
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> Response:
     try:
-        await AdminService(db).disable_user(admin, user_id)
+        await _gateway_service(db).disable_legacy_user(
+            admin, user_id, idempotency_key=_require_idempotency_key(idempotency_key)
+        )
+        await db.commit()
     except LookupError as error:
         raise not_found(error) from error
+    except GatewayAdminError as exc:
+        raise gateway_error(exc) from exc
     except ValueError as error:
         raise invalid(error) from error
     return Response(status_code=status.HTTP_204_NO_CONTENT)
@@ -375,6 +400,72 @@ async def tenant_usage(
     except GatewayAdminError as exc:
         raise gateway_error(exc) from exc
     return AdminUsageResponse(items=items, limit=limit, offset=offset)
+
+
+@router.get("/tenants/{tenant_id}/wallet", response_model=AdminWalletItem)
+async def get_tenant_wallet(
+    tenant_id: str,
+    admin: AdminUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> AdminWalletItem:
+    del admin
+    try:
+        return await _gateway_service(db).get_wallet(tenant_id)
+    except GatewayAdminError as exc:
+        raise gateway_error(exc) from exc
+
+
+@router.post("/tenants/{tenant_id}/wallet/adjust", response_model=AdminWalletAdjustResponse)
+async def adjust_tenant_wallet(
+    tenant_id: str,
+    payload: AdminWalletAdjustRequest,
+    admin: AdminUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+) -> AdminWalletAdjustResponse:
+    try:
+        result = await _gateway_service(db).adjust_wallet(
+            admin, tenant_id, payload, idempotency_key=_require_idempotency_key(idempotency_key)
+        )
+        await db.commit()
+        return result
+    except GatewayAdminError as exc:
+        await db.rollback()
+        raise gateway_error(exc) from exc
+
+
+@router.get("/tenants/{tenant_id}/quota", response_model=dict)
+async def list_tenant_quota(
+    tenant_id: str,
+    admin: AdminUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> dict[str, object]:
+    del admin
+    try:
+        items = await _gateway_service(db).list_quota(tenant_id)
+    except GatewayAdminError as exc:
+        raise gateway_error(exc) from exc
+    return {"items": [item.model_dump(mode="json") for item in items]}
+
+
+@router.put("/tenants/{tenant_id}/quota/{user_id}", response_model=AdminQuotaPolicyItem)
+async def set_tenant_quota(
+    tenant_id: str,
+    user_id: str,
+    payload: AdminQuotaPolicyUpdate,
+    admin: AdminUser,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+) -> AdminQuotaPolicyItem:
+    try:
+        result = await _gateway_service(db).set_quota(
+            admin, tenant_id, user_id, payload, idempotency_key=_require_idempotency_key(idempotency_key)
+        )
+        await db.commit()
+        return result
+    except GatewayAdminError as exc:
+        await db.rollback()
+        raise gateway_error(exc) from exc
 
 
 @router.get("/pi-runtime/gateways", response_model=dict)

@@ -16,10 +16,16 @@ from pydantic import BaseModel
 from app.admin.models import AdminAuditLog, AdminIdempotencyRecord
 from app.admin.schemas import (
     AdminGatewayItem,
+    AdminUserCreate,
+    AdminUserDisableResult,
+    AdminUserItem,
+    AdminUserUpdate,
     AdminGatewayUpdate,
     AdminLicenseCreate,
     AdminLicenseItem,
     AdminLicenseStatusUpdate,
+    AdminQuotaPolicyItem,
+    AdminQuotaPolicyUpdate,
     AdminRunDiagnostics,
     AdminRuntimeConfigCreate,
     AdminRuntimeConfigItem,
@@ -28,6 +34,9 @@ from app.admin.schemas import (
     AdminTenantUpdate,
     AdminTenantUserCreate,
     AdminTenantUserItem,
+    AdminWalletAdjustRequest,
+    AdminWalletAdjustResponse,
+    AdminWalletItem,
 )
 from app.agent_runtime.models import (
     AgentEvent,
@@ -36,12 +45,16 @@ from app.agent_runtime.models import (
     AgentStep,
     AgentToolCall,
 )
-from app.billing.models import RuntimeUsageRecord
+from app.billing.models import RuntimeUsageRecord, TenantUserQuotaPolicy, TenantWallet
 from app.core.config import get_settings
 from app.core.redaction import redact_for_log
 from app.identity.models import AuthIdentity, User
 from app.licensing.models import TenantLicense
-from app.pi_gateway.accounting import RuntimeUsageService, TenantAccountingService
+from app.pi_gateway.accounting import (
+    RuntimeUsageService,
+    TenantAccountingService,
+    TenantWalletInsufficientError,
+)
 from app.pi_gateway.models import PiGatewayInstance
 from app.runtime_config.models import RuntimeConfigVersion
 from app.runtime_config.schemas import RuntimeConfigSnapshot, RuntimeSecretBundle
@@ -476,6 +489,243 @@ class GatewayAdminService:
         await self._tenant(tenant_id)
         rows = await RuntimeUsageService(self.db).aggregate_usage(tenant_id, group_by=group_by)  # type: ignore[arg-type]
         return [item.model_dump(mode="json") for item in rows[offset : offset + limit]]
+
+    async def adjust_wallet(
+        self,
+        admin: User,
+        tenant_id: str,
+        payload: AdminWalletAdjustRequest,
+        *,
+        idempotency_key: str,
+    ) -> AdminWalletAdjustResponse:
+        """租户钱包人工调整：admin_adjust 账本 + 审计 + 持久化幂等同一事务。"""
+
+        async def produce() -> tuple[AdminWalletAdjustResponse, str]:
+            await self._tenant(tenant_id, for_update=True)
+            member = await self.db.scalar(
+                select(TenantMembership).where(
+                    TenantMembership.tenant_id == tenant_id,
+                    TenantMembership.user_id == payload.user_id,
+                    TenantMembership.status == "active",
+                )
+            )
+            if member is None:
+                raise GatewayAdminError("tenant_membership_not_found")
+            try:
+                wallet, transaction = await TenantAccountingService(self.db).admin_adjust(
+                    tenant_id,
+                    payload.user_id,
+                    delta=payload.delta,
+                    idempotency_key=f"admin-wallet-adjust:{admin.id}:{idempotency_key}",
+                    reference_id=f"{admin.id}:{idempotency_key}",
+                )
+            except ValueError as exc:
+                raise GatewayAdminError(str(exc)) from exc
+            except TenantWalletInsufficientError as exc:
+                raise GatewayAdminError("tenant_wallet_insufficient") from exc
+            self._audit(
+                admin.id,
+                action="tenant.wallet_adjust",
+                target_type="tenant",
+                target_id=tenant_id,
+                detail={
+                    "user_id": payload.user_id,
+                    "delta": payload.delta,
+                    "reason": payload.reason,
+                    "balance_after": wallet.balance,
+                },
+                idempotency_key=idempotency_key,
+            )
+            return (
+                AdminWalletAdjustResponse(
+                    tenant_id=tenant_id,
+                    balance=wallet.balance,
+                    reserved=wallet.reserved,
+                    transaction_id=transaction.id,
+                ),
+                tenant_id,
+            )
+
+        return await self._idempotent(
+            admin,
+            action="tenant.wallet_adjust",
+            idempotency_key=idempotency_key,
+            fingerprint={"tenant_id": tenant_id, **payload.model_dump(mode="json")},
+            target_type="tenant",
+            response_model=AdminWalletAdjustResponse,
+            produce=produce,
+        )
+
+    async def get_wallet(self, tenant_id: str) -> AdminWalletItem:
+        """租户钱包只读投影；无钱包行时抛 tenant_wallet_not_found（路由映射 404）。"""
+        await self._tenant(tenant_id)
+        wallet = await self.db.scalar(
+            select(TenantWallet).where(TenantWallet.tenant_id == tenant_id)
+        )
+        if wallet is None:
+            raise GatewayAdminError("tenant_wallet_not_found")
+        return AdminWalletItem(
+            tenant_id=tenant_id,
+            balance=wallet.balance,
+            reserved=wallet.reserved,
+        )
+
+    async def list_quota(self, tenant_id: str) -> list[AdminQuotaPolicyItem]:
+        await self._tenant(tenant_id)
+        rows = list(
+            (
+                await self.db.scalars(
+                    select(TenantUserQuotaPolicy)
+                    .where(TenantUserQuotaPolicy.tenant_id == tenant_id)
+                    .order_by(TenantUserQuotaPolicy.user_id)
+                )
+            ).all()
+        )
+        return [
+            AdminQuotaPolicyItem(
+                user_id=row.user_id,
+                period="monthly",
+                points_limit=row.points_limit,
+                status=row.status,
+            )
+            for row in rows
+        ]
+
+    async def set_quota(
+        self,
+        admin: User,
+        tenant_id: str,
+        user_id: str,
+        payload: AdminQuotaPolicyUpdate,
+        *,
+        idempotency_key: str,
+    ) -> AdminQuotaPolicyItem:
+        """用户周期额度 upsert：同一事务写审计与幂等记录。"""
+
+        async def produce() -> tuple[AdminQuotaPolicyItem, str]:
+            await self._tenant(tenant_id, for_update=True)
+            member = await self.db.scalar(
+                select(TenantMembership).where(
+                    TenantMembership.tenant_id == tenant_id,
+                    TenantMembership.user_id == user_id,
+                    TenantMembership.status == "active",
+                )
+            )
+            if member is None:
+                raise GatewayAdminError("tenant_membership_not_found")
+            policy = await self.db.scalar(
+                select(TenantUserQuotaPolicy)
+                .where(
+                    TenantUserQuotaPolicy.tenant_id == tenant_id,
+                    TenantUserQuotaPolicy.user_id == user_id,
+                    TenantUserQuotaPolicy.period == "monthly",
+                )
+                .with_for_update()
+            )
+            if policy is None:
+                policy = TenantUserQuotaPolicy(
+                    id=str(uuid4()),
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    period="monthly",
+                    points_limit=payload.points_limit,
+                    status="active",
+                    created_at=_now(),
+                    updated_at=_now(),
+                )
+                self.db.add(policy)
+            else:
+                policy.points_limit = payload.points_limit
+                policy.updated_at = _now()
+            await self.db.flush()
+            self._audit(
+                admin.id,
+                action="tenant.quota_set",
+                target_type="tenant",
+                target_id=tenant_id,
+                detail={"user_id": user_id, "points_limit": payload.points_limit},
+                idempotency_key=idempotency_key,
+            )
+            return (
+                AdminQuotaPolicyItem(
+                    user_id=user_id,
+                    period="monthly",
+                    points_limit=policy.points_limit,
+                    status=policy.status,
+                ),
+                policy.id,
+            )
+
+        return await self._idempotent(
+            admin,
+            action="tenant.quota_set",
+            idempotency_key=idempotency_key,
+            fingerprint={"tenant_id": tenant_id, "user_id": user_id, **payload.model_dump(mode="json")},
+            target_type="tenant_quota",
+            response_model=AdminQuotaPolicyItem,
+            produce=produce,
+        )
+
+    # ------------------------------------------------------------------ #
+    # legacy 账号管理写操作：与 Task 10 模块共用同一套持久化幂等指纹
+    # ------------------------------------------------------------------ #
+
+    async def create_legacy_user(
+        self, admin: User, payload: AdminUserCreate, *, idempotency_key: str
+    ) -> AdminUserItem:
+        from app.admin.service import AdminService
+
+        async def produce() -> tuple[AdminUserItem, str]:
+            dto = await AdminService(self.db).create_user(admin, payload)
+            return dto, dto.id
+
+        return await self._idempotent(
+            admin,
+            action="user.create",
+            idempotency_key=idempotency_key,
+            fingerprint=payload.model_dump(mode="json"),
+            target_type="user",
+            response_model=AdminUserItem,
+            produce=produce,
+        )
+
+    async def update_legacy_user(
+        self, admin: User, user_id: str, payload: AdminUserUpdate, *, idempotency_key: str
+    ) -> AdminUserItem:
+        from app.admin.service import AdminService
+
+        async def produce() -> tuple[AdminUserItem, str]:
+            dto = await AdminService(self.db).update_user(admin, user_id, payload)
+            return dto, dto.id
+
+        return await self._idempotent(
+            admin,
+            action="user.update",
+            idempotency_key=idempotency_key,
+            fingerprint={"user_id": user_id, **payload.model_dump(mode="json", exclude_unset=True)},
+            target_type="user",
+            response_model=AdminUserItem,
+            produce=produce,
+        )
+
+    async def disable_legacy_user(
+        self, admin: User, user_id: str, *, idempotency_key: str
+    ) -> AdminUserDisableResult:
+        from app.admin.service import AdminService
+
+        async def produce() -> tuple[AdminUserDisableResult, str]:
+            await AdminService(self.db).disable_user(admin, user_id)
+            return AdminUserDisableResult(id=user_id), user_id
+
+        return await self._idempotent(
+            admin,
+            action="user.disable",
+            idempotency_key=idempotency_key,
+            fingerprint={"user_id": user_id},
+            target_type="user",
+            response_model=AdminUserDisableResult,
+            produce=produce,
+        )
 
     @staticmethod
     def _gateway_item(row: PiGatewayInstance) -> AdminGatewayItem:

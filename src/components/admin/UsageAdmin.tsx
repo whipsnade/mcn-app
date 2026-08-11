@@ -2,6 +2,7 @@ import { useCallback, useEffect, useId, useState } from 'react';
 
 import { listAdminUsage, type AdminUsage } from '../../api/adminGateway';
 import TenantSelect from './TenantSelect';
+import TenantWalletQuota from './TenantWalletQuota';
 
 const PAGE_SIZE = 20;
 
@@ -77,6 +78,7 @@ export default function UsageAdmin({ tenantId: initialTenantId }: { tenantId?: s
       {loading && <p role="status">加载中…</p>}
       {error && <p role="alert" className="text-rose-600">{error}</p>}
       {tenantId && !loading && !error && items.length === 0 && <p className="text-xs text-slate-400">暂无用量记录</p>}
+      {tenantId && <TenantWalletQuota tenantId={tenantId} />}
       {tenantId && items.length > 0 && (
         <>
           <div className="overflow-x-auto">

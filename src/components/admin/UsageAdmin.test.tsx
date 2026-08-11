@@ -1,12 +1,25 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { listAdminTenants, listAdminUsage, type AdminTenant, type AdminUsage } from '../../api/adminGateway';
+import {
+  getTenantWallet,
+  listAdminTenantUsers,
+  listAdminTenants,
+  listAdminUsage,
+  listTenantQuota,
+  type AdminTenant,
+  type AdminUsage,
+} from '../../api/adminGateway';
 import UsageAdmin from './UsageAdmin';
 
 vi.mock('../../api/adminGateway', () => ({
   listAdminTenants: vi.fn(),
   listAdminUsage: vi.fn(),
+  listAdminTenantUsers: vi.fn(),
+  listTenantQuota: vi.fn(),
+  getTenantWallet: vi.fn(),
+  adjustTenantWallet: vi.fn(),
+  setTenantQuota: vi.fn(),
 }));
 
 const TENANT: AdminTenant = {
@@ -39,6 +52,10 @@ describe('UsageAdmin', () => {
     vi.clearAllMocks();
     vi.mocked(listAdminTenants).mockResolvedValue({ items: [TENANT], total: 1 });
     vi.mocked(listAdminUsage).mockResolvedValue({ items: [USAGE_MISSING, USAGE_UNPRICED], limit: 20, offset: 0 });
+    // 内嵌的成员额度与钱包组件默认返回空数据，不影响用量断言。
+    vi.mocked(listAdminTenantUsers).mockResolvedValue({ items: [], total: 0, limit: 200, offset: 0 });
+    vi.mocked(listTenantQuota).mockResolvedValue({ items: [] });
+    vi.mocked(getTenantWallet).mockResolvedValue({ tenant_id: 'tenant-a', balance: 0, reserved: 0 });
   });
 
   it('prompts to pick a tenant first', () => {
