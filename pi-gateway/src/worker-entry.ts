@@ -105,6 +105,11 @@ export function spawnIsolatedWorker(
       else reject(new Error(signal ? "worker_signaled" : "worker_exited"));
     });
   });
+  // `abort()` intentionally waits only for the child to close; callers do not
+  // always consume the business/crash outcome. Attach a sink so a rejected
+  // done promise can never become an unhandled rejection while preserving the
+  // original rejection for callers that explicitly await `handle.done`.
+  void done.catch(() => undefined);
   const handle = child as IsolatedWorkerProcess;
   handle.onEvent = (listener) => {
     listeners.add(listener);
