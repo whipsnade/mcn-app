@@ -216,4 +216,59 @@ describe("McpAccountingExtension", () => {
     expect(control.fail).toHaveBeenNthCalledWith(2, { permit_id: "p-1" }, "result_unknown");
     expect(control.finalize).not.toHaveBeenCalled();
   });
+
+  it("marks the call result_unknown when the finalize ACK is lost", async () => {
+    // finalize 的 durable ACK 未到达：结果不得按成功丢弃，必须降级
+    // result_unknown（保留预留、禁止重放）。
+    const handlers = new Map<string, (event: any) => Promise<unknown>>();
+    const control = {
+      preflight: vi.fn(async () => ({ permit_id: "p-1" })),
+      finalize: vi.fn(async () => { throw new Error("ack_lost"); }),
+      fail: vi.fn(async () => ({ ok: true })),
+    };
+    const extension = new McpAccountingExtension(control);
+    createMcpAccountingExtensionFactory(extension, [
+      { toolName: "insight_query", server: "insight", remoteName: "query" },
+    ])({
+      on: (name: string, handler: (event: any) => Promise<unknown>) => handlers.set(name, handler),
+    } as any);
+
+    await handlers.get("tool_call")?.({
+      type: "tool_call", toolName: "insight_query", toolCallId: "tc-1", input: {},
+    });
+    await handlers.get("tool_result")?.({
+      type: "tool_result", toolName: "insight_query", toolCallId: "tc-1",
+      content: [{ type: "text", text: "ok" }], isError: false,
+      details: { mode: "mcpResult", mcpResult: { structuredContent: { rows: [] } } },
+    });
+
+    expect(control.fail).toHaveBeenCalledWith({ permit_id: "p-1" }, "result_unknown");
+  });
+
+  it("never settles an oversized result and falls back to result_unknown", async () => {
+    const handlers = new Map<string, (event: any) => Promise<unknown>>();
+    const control = {
+      preflight: vi.fn(async () => ({ permit_id: "p-1" })),
+      finalize: vi.fn(async () => ({ ok: true })),
+      fail: vi.fn(async () => ({ ok: true })),
+    };
+    const extension = new McpAccountingExtension(control);
+    createMcpAccountingExtensionFactory(extension, [
+      { toolName: "insight_query", server: "insight", remoteName: "query" },
+    ])({
+      on: (name: string, handler: (event: any) => Promise<unknown>) => handlers.set(name, handler),
+    } as any);
+
+    await handlers.get("tool_call")?.({
+      type: "tool_call", toolName: "insight_query", toolCallId: "tc-1", input: {},
+    });
+    await handlers.get("tool_result")?.({
+      type: "tool_result", toolName: "insight_query", toolCallId: "tc-1",
+      content: [{ type: "text", text: "ok" }], isError: false,
+      details: { mode: "mcpResult", mcpResult: { structuredContent: { blob: "x".repeat(2 * 1024 * 1024) } } },
+    });
+
+    expect(control.finalize).not.toHaveBeenCalled();
+    expect(control.fail).toHaveBeenCalledWith({ permit_id: "p-1" }, "result_unknown");
+  });
 });

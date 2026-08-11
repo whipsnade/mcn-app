@@ -41,6 +41,17 @@ export interface McpAccountingControlPlane {
 const FREE_DISCOVERY_TOOLS = new Set(["connect", "search", "list"]);
 
 /**
+ * finalize 载荷的有界上限：小于 IPC mcp_finalize 通道的 1 MiB 请求上限，
+ * 为请求信封（permit_id、方法名、id）预留余量。超限结果降级
+ * result_unknown，绝不截断后按成功结算。
+ */
+export const MAX_FINALIZE_DETAILS_BYTES = 900 * 1024;
+
+function byteLength(value: unknown): number {
+  return new TextEncoder().encode(JSON.stringify(value)).byteLength;
+}
+
+/**
  * Adapter `details.error` codes that prove the call never left the local
  * process (readiness/auth/config/validation gates).  These must release the
  * reservation as ``definitely_not_sent``; settling them would bill 10 points
@@ -180,18 +191,41 @@ export function createMcpAccountingExtensionFactory(
     hooks.on("tool_result", async (event: ToolResultEvent) => {
       const permit = permits.get(event.toolCallId);
       if (!permit) return;
-      permits.delete(event.toolCallId);
       const details = isRecord(event.details) ? event.details : {};
       const errorCode = typeof details.error === "string" ? details.error : undefined;
-      if (event.isError || errorCode !== undefined) {
-        // 带 details.error 的结果绝不进入成功结算分支；isError 由谁置位无关。
-        await accounting.afterToolError(permit, classifyMcpFailure(errorCode, details));
-        return;
+      // permit 只能在控制面 durable ACK 之后删除；任何 ACK 失败都把结果降级
+      // 为 result_unknown（保留预留、禁止重放），仍失败则保留 permit 由
+      // 恢复/对账兜底。
+      const failAsUnknown = async (): Promise<void> => {
+        await accounting.afterToolError(permit, "result_unknown");
+        permits.delete(event.toolCallId);
+      };
+      try {
+        if (event.isError || errorCode !== undefined) {
+          // 带 details.error 的结果绝不进入成功结算分支；isError 由谁置位无关。
+          await accounting.afterToolError(permit, classifyMcpFailure(errorCode, details));
+          permits.delete(event.toolCallId);
+          return;
+        }
+        const payload = {
+          ...details,
+          mode: typeof details.mode === "string" ? details.mode : "mcpResult",
+        };
+        if (byteLength(payload) > MAX_FINALIZE_DETAILS_BYTES) {
+          // 超大有界上限的结果不参与成功结算（避免截断写库假成功）。
+          await failAsUnknown();
+          return;
+        }
+        await accounting.afterToolResult(permit, payload);
+        permits.delete(event.toolCallId);
+      } catch {
+        try {
+          await failAsUnknown();
+        } catch {
+          // 两次 ACK 都未确认：保留 permit（随 Child 退出清理），预留由
+          // 后端恢复/对账收口，绝不伪造已结算。
+        }
       }
-      await accounting.afterToolResult(permit, {
-        ...details,
-        mode: typeof details.mode === "string" ? details.mode : "mcpResult",
-      });
     });
   };
 }

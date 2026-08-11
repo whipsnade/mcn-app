@@ -24,6 +24,8 @@ export const WORKER_RPC_METHODS = [
 export type WorkerRpcMethod = (typeof WORKER_RPC_METHODS)[number];
 
 export const WORKER_RPC_MAX_REQUEST_BYTES = 64 * 1024;
+/** mcp_finalize 携带完整结构化结果，独立放行到 1 MiB（后端同口径）。 */
+export const WORKER_RPC_MAX_FINALIZE_BYTES = 1024 * 1024;
 export const WORKER_RPC_MAX_RESPONSE_BYTES = 1024 * 1024;
 const RPC_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
 const SAFE_ERROR_CODE = /^[a-z0-9_:-]{1,64}$/;
@@ -60,6 +62,10 @@ export function parseWorkerRpcRequest(value: unknown): WorkerRpcRequest {
   if (!isRecord(value) || !exactKeys(value, ["type", "id", "method", "params"])) {
     throw new Error("worker_rpc_invalid");
   }
+  const maxParamBytes =
+    value.method === "mcp_finalize"
+      ? WORKER_RPC_MAX_FINALIZE_BYTES
+      : WORKER_RPC_MAX_REQUEST_BYTES;
   if (
     value.type !== "worker_rpc" ||
     typeof value.id !== "string" ||
@@ -67,7 +73,7 @@ export function parseWorkerRpcRequest(value: unknown): WorkerRpcRequest {
     typeof value.method !== "string" ||
     !(WORKER_RPC_METHODS as readonly string[]).includes(value.method) ||
     !isRecord(value.params) ||
-    byteLength(value.params) > WORKER_RPC_MAX_REQUEST_BYTES
+    byteLength(value.params) > maxParamBytes
   ) {
     throw new Error("worker_rpc_invalid");
   }
@@ -150,7 +156,11 @@ export class WorkerRpcClient {
     this.counter += 1;
     const id = `rpc-${this.counter}-${Math.random().toString(36).slice(2, 10)}`;
     const request: WorkerRpcRequest = { type: "worker_rpc", id, method, params };
-    if (byteLength(request) > WORKER_RPC_MAX_REQUEST_BYTES + 256) {
+    const maxBytes =
+      method === "mcp_finalize"
+        ? WORKER_RPC_MAX_FINALIZE_BYTES
+        : WORKER_RPC_MAX_REQUEST_BYTES;
+    if (byteLength(request) > maxBytes + 256) {
       return Promise.reject(new Error("worker_rpc_payload_too_large"));
     }
     return new Promise((resolve, reject) => {

@@ -240,8 +240,15 @@ def _contains_sensitive_key(value: object, sensitive: set[str]) -> bool:
     return False
 
 
+_PAYLOAD_MAX_BYTES = 64 * 1024
+# mcp_finalize 携带完整结构化结果（Evidence 来源），独立放行到 1 MiB，
+# 与 Gateway IPC 通道上限同口径；超限由 Gateway 侧降级 result_unknown。
+_FINALIZE_MAX_BYTES = 1024 * 1024
+
+
 def _validate_payload(value: dict[str, Any], prefix: str) -> None:
-    if len(str(value).encode("utf-8")) > 64 * 1024:
+    limit = _FINALIZE_MAX_BYTES if prefix == "mcp_finalize" else _PAYLOAD_MAX_BYTES
+    if len(str(value).encode("utf-8")) > limit:
         raise ValueError(f"{prefix}_payload_too_large")
     if _contains_sensitive_key(value, _SENSITIVE_PAYLOAD_KEYS):
         raise ValueError(f"{prefix}_payload_sensitive_field")

@@ -173,6 +173,49 @@ async def test_finalize_writes_evidence_and_settles_after_durable_preflight(
 
 
 @pytest.mark.asyncio
+async def test_finalize_accepts_large_structured_result_within_bounded_cap(
+    db_session, user_factory
+) -> None:
+    """大于 64 KiB 的合法结果必须能 finalize（旧上限会让预留永远悬挂）。"""
+    user = await user_factory()
+    await _seed_catalog(db_session)
+    run, _attempt, tenant_id = await _pi_run(db_session, user)
+    await _fund(db_session, tenant_id, user.id)
+    service = PiGatewayService(db_session, gateway_id="gw-chain")
+
+    permit = await service.preflight_mcp(
+        run,
+        PiGatewayMcpPreflightRequest(
+            tool_name="query_analysis_data", server="insight-cube-mcp", args={"keyword": "美妆"}
+        ),
+    )
+    # >64 KiB（result JSON 串尾部空白，json.loads 兼容），<1 MiB
+    payload = {"result": '{"rows": [{"日期": "2026-08-01", "平台": "小红书", "声量": 120}]}' + " " * (100 * 1024)}
+    await service.finalize_mcp(
+        run,
+        PiGatewayMcpFinalizeRequest(
+            permit_id=permit.permit_id,
+            details={"mode": "call", "mcpResult": {"structuredContent": payload}},
+        ),
+    )
+    call = await db_session.scalar(select(AgentToolCall).where(AgentToolCall.run_id == run.id))
+    assert call is not None and call.status == "settled"
+    wallet = await db_session.get(TenantWallet, tenant_id)
+    assert wallet is not None and (wallet.balance, wallet.reserved) == (990, 0)
+
+
+def test_finalize_payload_above_one_mib_is_rejected() -> None:
+    """finalize 有界上限是 1 MiB：超限必须在 DTO 校验期拒绝。"""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        PiGatewayMcpFinalizeRequest(
+            permit_id="p-oversized",
+            details={"mode": "call", "blob": "x" * (1024 * 1024 + 1024)},
+        )
+
+
+@pytest.mark.asyncio
 async def test_finalize_with_invalid_output_releases_and_writes_no_evidence(
     db_session, user_factory
 ) -> None:
