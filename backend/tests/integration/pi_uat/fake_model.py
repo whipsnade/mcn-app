@@ -26,7 +26,13 @@ from starlette.routing import Route
 
 
 def proxy_tool_name(server: str, remote: str) -> str:
-    """与 pi-mcp-adapter 的 model 可见名一致（server 前缀 + 点转下划线）。"""
+    """旧式 prefixed 可见名（server 前缀 + 点转下划线）。
+
+    仅 ``step_mcp`` 旧兼容路径使用：生产 .mcp.json 已是 ``toolPrefix="none"``
+    （模型可见名 = 裸 remote 名），prefixed 名在 adapter 分发面 fail-closed
+    （tool_not_found → definitely_not_sent 释放，不计费），但计费扩展仍须把
+    它映射回已审核身份（preflight 记录正确 internal 名）。
+    """
     return f"{server.replace('-', '_')}_{remote.replace('.', '_')}"
 
 
@@ -46,6 +52,20 @@ def step_mcp(server: str, remote: str, args: dict[str, Any] | None = None) -> di
         # mcp 代理工具的 tool 参数是 adapter 可见名
         "tool": proxy_tool_name(server, remote),
     }
+
+
+def step_mcp_proxy(
+    tool: str, server: str | None = None, args: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """真实模型的通用 mcp 代理寻址形状：裸 remote 名，server 可选。
+
+    真实 claim 投影的 adapter_visible_name 就是裸 remote 名（如
+    ``match_best_tag``），真实模型走通用 ``mcp`` 代理工具时直接以裸名寻址、
+    server 可省略（唯一映射由计费扩展从 claim bindings 推导）。这与旧
+    prefixed 兼容路径（``step_mcp``）是两条不同寻址形状，都必须有进程级
+    覆盖——REAL_B7_20260812T045636Z_b801c490 的 L1 失败即裸名路径缺失覆盖。
+    """
+    return {"kind": "mcp", "server": server, "args": args or {}, "tool": tool}
 
 
 def step_hang(seconds: float) -> dict[str, Any]:
@@ -103,10 +123,11 @@ def _step_tool_fields(step: dict[str, Any]) -> tuple[str, str]:
     tool_name = step["tool"]
     arguments = json.dumps(step["args"], ensure_ascii=False)
     if step["kind"] == "mcp":
-        arguments = json.dumps(
-            {"tool": step["tool"], "server": step["server"], "args": step["args"]},
-            ensure_ascii=False,
-        )
+        proxy_args: dict[str, Any] = {"tool": step["tool"], "args": step["args"]}
+        # server 可选：缺省时由计费扩展按 claim bindings 唯一性推导（真实代理形状）。
+        if step.get("server") is not None:
+            proxy_args["server"] = step["server"]
+        arguments = json.dumps(proxy_args, ensure_ascii=False)
         tool_name = "mcp"
     return tool_name, arguments
 

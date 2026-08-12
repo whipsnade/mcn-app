@@ -1127,6 +1127,10 @@ class PiUatTopology:
                     "query_raw_posts",
                     "social_statistic_user_profile",
                     "kol_xiaohongshu_search",
+                    # 重名 fail-closed 场景的测试专用登记行（两 service 同 remote 名，
+                    # internal 名复用各 service 的已审核 allowlist 名以通过输出校验）
+                    "match_best_tag",
+                    "kol_detail",
                 )
                 await db.execute(
                     delete(McpToolCatalog).where(McpToolCatalog.internal_tool_name.in_(fake_tools))

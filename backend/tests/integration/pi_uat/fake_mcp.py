@@ -61,9 +61,13 @@ _SERVICE_TOOLS: dict[str, dict[str, list[dict[str, Any]]]] = {
         "social_statistic_hot_topic": TOPIC_ROWS,
         "query_raw_posts": TOP_POST_ROWS,
         "social_statistic_user_profile": [{"平台": "小红书", "年龄段": "25-29", "占比": 0.4}],
+        # 与 social-grow-mcp 同 remote 名：重名 fail-closed 场景专用（默认 quarantined，
+        # 只有显式审批的测试才会让它进入 claim bindings）。
+        "shared_lookup": OVERVIEW_ROWS,
     },
     "social-grow-mcp": {
         "kol_xiaohongshu_search": KOL_ROWS,
+        "shared_lookup": KOL_ROWS,
     },
 }
 

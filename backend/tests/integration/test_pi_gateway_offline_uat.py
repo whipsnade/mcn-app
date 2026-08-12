@@ -41,6 +41,7 @@ from .pi_uat.fake_model import (
     step_hang,
     step_internal,
     step_mcp,
+    step_mcp_proxy,
     step_text,
     tool_result_texts,
 )
@@ -112,10 +113,10 @@ def _publish_step(messages: list[dict[str, Any]]) -> dict[str, Any]:
 def _brand_script() -> list[Any]:
     return [
         step_internal("get_session_context"),
-        step_mcp("insight-cube", "social_statistic_overview", {"brand": BRAND}),
-        step_mcp("insight-cube", "social_statistic_trend", {"brand": BRAND}),
-        step_mcp("insight-cube", "query_raw_posts", {"brand": BRAND}),
-        step_mcp("insight-cube", "query_analysis_data", {"keyword": BRAND}),
+        step_mcp_proxy("social_statistic_overview", server="insight-cube", args={"brand": BRAND}),
+        step_mcp_proxy("social_statistic_trend", server="insight-cube", args={"brand": BRAND}),
+        step_mcp_proxy("query_raw_posts", server="insight-cube", args={"brand": BRAND}),
+        step_mcp_proxy("query_analysis_data", server="insight-cube", args={"keyword": BRAND}),
         step_internal("search_evidence", {}),
         _build_brand_step,
         _publish_step,
@@ -446,7 +447,7 @@ async def test_insufficient_balance_blocks_mcp_with_zero_external_calls() -> Non
         scripts={
             "brand": [
                 step_internal("get_session_context"),
-                step_mcp("insight-cube", "social_statistic_overview", {"brand": BRAND}),
+                step_mcp_proxy("social_statistic_overview", server="insight-cube", args={"brand": BRAND}),
                 step_text("积分不足，已停止外呼。"),
             ]
         }
@@ -493,6 +494,300 @@ async def test_insufficient_balance_blocks_mcp_with_zero_external_calls() -> Non
         assert ledger_count == 0
 
 
+async def _approve_extra_tool(service: str, remote_name: str, internal_name: str) -> None:
+    """测试侧补充审批：把 discovery 里的额外工具登记进 catalog（重名场景专用）。
+
+    镜像 harness._approve_catalog_rows 的管理员审核语义，但不查生产
+    DYNAMIC_TOOL_ALLOWLIST。catalog 的 internal_tool_name 全局唯一；重名场景用
+    「同 remote 名（测试专用）+ 各 service 已审核 allowlist 内的 internal 名」构造，
+    使 finalize 的输出 Schema 校验（按 service+internal 名查 allowlist）仍可正常通过。
+    """
+    from datetime import UTC, datetime
+
+    from app.mcp_gateway.models import McpToolCatalog, McpToolDiscovery
+
+    now = datetime.now(UTC).replace(tzinfo=None)
+    async with SessionFactory.begin() as db:
+        discovery = await db.scalar(
+            select(McpToolDiscovery).where(
+                McpToolDiscovery.service_slug == service,
+                McpToolDiscovery.remote_name == remote_name,
+            )
+        )
+        if discovery is None:
+            raise RuntimeError(f"discovery row missing for {service}/{remote_name}")
+        discovery.review_status = "approved"
+        discovery.updated_at = now
+        # upsert：崩溃运行的残留行不导致整轮失败（与 harness 审批的幂等语义一致）
+        catalog = await db.scalar(
+            select(McpToolCatalog).where(McpToolCatalog.internal_tool_name == internal_name)
+        )
+        if catalog is None:
+            db.add(
+                McpToolCatalog(
+                    id=str(uuid4()),
+                    service_slug=service,
+                    internal_tool_name=internal_name,
+                    reviewed_description=f"uat duplicate-name review for {remote_name}",
+                    input_schema_json=discovery.input_schema_json,
+                    output_validator_version="v1",
+                    discovery_digest=discovery.discovery_digest,
+                    review_status="approved",
+                    is_enabled=True,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+        else:
+            catalog.service_slug = service
+            catalog.review_status = "approved"
+            catalog.is_enabled = True
+            catalog.discovery_digest = discovery.discovery_digest
+            catalog.updated_at = now
+
+
+async def test_generic_proxy_bare_remote_name_billing_chain() -> None:
+    """真实 L1 路径复现（REAL_B7_20260812T045636Z_b801c490 失败 round）。
+
+    真实模型经通用 ``mcp`` 代理工具以裸 remote 名寻址（不带 server）。修复前
+    该形状必然被 mcp_tool_identity_invalid 拦截；修复后必须完成全链路：
+    durable preflight → fake MCP 外发 → finalize → Evidence → ToolCall →
+    10 积分结算。
+    """
+    topology = PiUatTopology(
+        scripts={
+            "bare": [
+                step_internal("get_session_context"),
+                step_mcp_proxy("social_statistic_overview", args={"brand": BRAND}),
+                step_text("冒烟完成"),
+            ]
+        }
+    )
+    async with topology:
+        await _wait_gateway_registered(topology)
+        tenant = topology.tenants["uat-tenant-a"]
+        await _enable_pi(topology, tenant.tenant_id)
+        user = tenant.users[0]
+        async with SessionFactory() as db:
+            wallet_before = await db.get(TenantWallet, tenant.tenant_id)
+        assert wallet_before is not None
+        session_id = await topology.create_session(user)
+        response = await topology.send_message(user, session_id, f"[scenario:bare]\n请分析{BRAND}")
+        assert response.status_code in (200, 201, 202), response.text
+        run = await topology.run_by_session(session_id)
+        terminal_status = await topology.wait_run_terminal(run.id)
+        assert terminal_status == "completed"
+        # durable preflight 之后恰好 1 次真实外发（fake MCP 实收）
+        assert [c["tool"] for c in topology.mcp_services[0].calls] == ["social_statistic_overview"]
+        assert topology.mcp_services[1].calls == []
+        # ToolCall settled + Evidence 落库
+        calls = await _run_tool_calls(run.id)
+        assert len(calls) == 1
+        assert calls[0].internal_tool_name == "social_statistic_overview"
+        assert calls[0].status == "settled"
+        assert calls[0].points_settled == 10
+        async with SessionFactory() as db:
+            evidence_count = await db.scalar(
+                select(func.count())
+                .select_from(EvidenceItem)
+                .where(EvidenceItem.tool_call_id == calls[0].id)
+            )
+            assert evidence_count == 1
+            # 10 积分结算：reserve + settle 各一条，净支出恰好 10
+            wallet = await db.get(TenantWallet, tenant.tenant_id)
+            assert wallet is not None
+            assert (wallet.balance, wallet.reserved) == (wallet_before.balance - 10, 0)
+            ledger = list(
+                (
+                    await db.scalars(
+                        select(TenantWalletTransaction).where(
+                            TenantWalletTransaction.tenant_id == tenant.tenant_id,
+                            TenantWalletTransaction.kind.in_(
+                                ("reserve", "settle", "release", "unknown")
+                            ),
+                        )
+                    )
+                ).all()
+            )
+        assert sorted(row.kind for row in ledger) == ["reserve", "settle"]
+
+
+async def test_generic_proxy_bare_name_unique_mapping_without_server() -> None:
+    """裸 remote 名且不带 server：全局唯一时由 bindings 推导 server 并完成计费。"""
+    topology = PiUatTopology(
+        scripts={
+            "unique": [
+                step_mcp_proxy("kol_xiaohongshu_search", args={"keyword": "美妆"}),
+                step_text("完成"),
+            ]
+        }
+    )
+    async with topology:
+        await _wait_gateway_registered(topology)
+        tenant = topology.tenants["uat-tenant-a"]
+        await _enable_pi(topology, tenant.tenant_id)
+        user = tenant.users[0]
+        async with SessionFactory() as db:
+            wallet_before = await db.get(TenantWallet, tenant.tenant_id)
+        assert wallet_before is not None
+        session_id = await topology.create_session(user)
+        response = await topology.send_message(user, session_id, "[scenario:unique]\n找达人")
+        assert response.status_code in (200, 201, 202), response.text
+        run = await topology.run_by_session(session_id)
+        terminal_status = await topology.wait_run_terminal(run.id)
+        assert terminal_status == "completed"
+        # 唯一映射到 social-grow-mcp：insight-cube 0 外发，social-grow 恰好 1 次
+        assert topology.mcp_services[0].calls == []
+        assert [c["tool"] for c in topology.mcp_services[1].calls] == ["kol_xiaohongshu_search"]
+        calls = await _run_tool_calls(run.id)
+        assert len(calls) == 1
+        assert calls[0].internal_tool_name == "kol_xiaohongshu_search"
+        assert calls[0].status == "settled"
+        async with SessionFactory() as db:
+            wallet = await db.get(TenantWallet, tenant.tenant_id)
+            assert wallet is not None
+            assert (wallet.balance, wallet.reserved) == (wallet_before.balance - 10, 0)
+
+
+async def test_generic_proxy_ambiguous_remote_name_fails_closed() -> None:
+    """两个 service 暴露同名 remote 工具且未指定 server：fail-closed。
+
+    0 preflight（本地身份闸拦截）、0 外发、0 扣费、0 ToolCall 行；
+    禁止对重名候选取第一个。
+    """
+    topology = PiUatTopology(
+        scripts={
+            "ambiguous": [
+                step_mcp_proxy("shared_lookup", args={"brand": BRAND}),
+                step_text("无法确定服务，已停止"),
+            ]
+        }
+    )
+    async with topology:
+        await _wait_gateway_registered(topology)
+        # 同一 remote 名在两个 service 各登记一条 catalog（internal 名不同）
+        await _approve_extra_tool("insight-cube-mcp", "shared_lookup", "match_best_tag")
+        await _approve_extra_tool("social-grow-mcp", "shared_lookup", "kol_detail")
+        tenant = topology.tenants["uat-tenant-a"]
+        await _enable_pi(topology, tenant.tenant_id)
+        user = tenant.users[0]
+        async with SessionFactory() as db:
+            wallet_before = await db.get(TenantWallet, tenant.tenant_id)
+        assert wallet_before is not None
+        session_id = await topology.create_session(user)
+        response = await topology.send_message(
+            user, session_id, f"[scenario:ambiguous]\n查一下{BRAND}"
+        )
+        assert response.status_code in (200, 201, 202), response.text
+        run = await topology.run_by_session(session_id)
+        terminal_status = await topology.wait_run_terminal(run.id)
+        assert terminal_status in ("completed", "completed_with_warnings", "failed")
+        # 硬断言：0 外发、0 扣费、0 ToolCall
+        assert topology.mcp_services[0].calls == []
+        assert topology.mcp_services[1].calls == []
+        calls = await _run_tool_calls(run.id)
+        assert calls == []
+        async with SessionFactory() as db:
+            wallet = await db.get(TenantWallet, tenant.tenant_id)
+            assert wallet is not None
+            assert (wallet.balance, wallet.reserved) == (wallet_before.balance, 0)
+
+
+async def test_generic_proxy_ambiguous_remote_name_with_explicit_server() -> None:
+    """重名 remote 名 + 显式 server：精确映射到指定 service 并完成计费。"""
+    topology = PiUatTopology(
+        scripts={
+            "disambiguated": [
+                step_mcp_proxy("shared_lookup", server="social-grow", args={"brand": BRAND}),
+                step_text("完成"),
+            ]
+        }
+    )
+    async with topology:
+        await _wait_gateway_registered(topology)
+        await _approve_extra_tool("insight-cube-mcp", "shared_lookup", "match_best_tag")
+        await _approve_extra_tool("social-grow-mcp", "shared_lookup", "kol_detail")
+        tenant = topology.tenants["uat-tenant-a"]
+        await _enable_pi(topology, tenant.tenant_id)
+        user = tenant.users[0]
+        async with SessionFactory() as db:
+            wallet_before = await db.get(TenantWallet, tenant.tenant_id)
+        assert wallet_before is not None
+        session_id = await topology.create_session(user)
+        response = await topology.send_message(
+            user, session_id, f"[scenario:disambiguated]\n查一下{BRAND}"
+        )
+        assert response.status_code in (200, 201, 202), response.text
+        run = await topology.run_by_session(session_id)
+        terminal_status = await topology.wait_run_terminal(run.id)
+        assert terminal_status == "completed"
+        # 精确落到 social-grow：insight-cube 0 外发
+        assert topology.mcp_services[0].calls == []
+        assert [c["tool"] for c in topology.mcp_services[1].calls] == ["shared_lookup"]
+        calls = await _run_tool_calls(run.id)
+        assert len(calls) == 1
+        assert calls[0].internal_tool_name == "kol_detail"
+        assert calls[0].status == "settled"
+        async with SessionFactory() as db:
+            wallet = await db.get(TenantWallet, tenant.tenant_id)
+            assert wallet is not None
+            assert (wallet.balance, wallet.reserved) == (wallet_before.balance - 10, 0)
+
+
+async def test_legacy_prefixed_name_fails_closed_unbilled() -> None:
+    """旧 prefixed 寻址名的兼容边界：计费身份仍可映射，但 adapter 分发面
+    （toolPrefix=none，裸 remote 名）不再接受 prefixed 名——必须安全失败：
+    tool_not_found → definitely_not_sent → release，0 外发、0 净扣费。
+    """
+    topology = PiUatTopology(
+        scripts={
+            "legacy": [
+                step_internal("get_session_context"),
+                step_mcp("insight-cube", "social_statistic_overview", {"brand": BRAND}),
+                step_text("旧名不可用，已停止"),
+            ]
+        }
+    )
+    async with topology:
+        await _wait_gateway_registered(topology)
+        tenant = topology.tenants["uat-tenant-a"]
+        await _enable_pi(topology, tenant.tenant_id)
+        user = tenant.users[0]
+        async with SessionFactory() as db:
+            wallet_before = await db.get(TenantWallet, tenant.tenant_id)
+        assert wallet_before is not None
+        session_id = await topology.create_session(user)
+        response = await topology.send_message(user, session_id, f"[scenario:legacy]\n请分析{BRAND}")
+        assert response.status_code in (200, 201, 202), response.text
+        run = await topology.run_by_session(session_id)
+        terminal_status = await topology.wait_run_terminal(run.id)
+        assert terminal_status in ("completed", "completed_with_warnings", "failed")
+        # 0 真实外发；预留已释放（reserve+release），净支出 0
+        assert topology.mcp_services[0].calls == []
+        assert topology.mcp_services[1].calls == []
+        calls = await _run_tool_calls(run.id)
+        assert len(calls) == 1
+        assert calls[0].internal_tool_name == "social_statistic_overview"
+        assert calls[0].status == "failed"
+        async with SessionFactory() as db:
+            wallet = await db.get(TenantWallet, tenant.tenant_id)
+            assert wallet is not None
+            assert (wallet.balance, wallet.reserved) == (wallet_before.balance, 0)
+            ledger = list(
+                (
+                    await db.scalars(
+                        select(TenantWalletTransaction).where(
+                            TenantWalletTransaction.tenant_id == tenant.tenant_id,
+                            TenantWalletTransaction.kind.in_(
+                                ("reserve", "settle", "release", "unknown")
+                            ),
+                        )
+                    )
+                ).all()
+            )
+        assert sorted(row.kind for row in ledger) == ["release", "reserve"]
+
+
 async def test_unreachable_mcp_releases_reservation_with_zero_external_calls() -> None:
     """MCP 服务不可达（本地未外发错误）：definitely_not_sent 释放预留。
 
@@ -509,7 +804,7 @@ async def test_unreachable_mcp_releases_reservation_with_zero_external_calls() -
         scripts={
             "deadmcp": [
                 step_internal("get_session_context"),
-                step_mcp("insight-cube", "social_statistic_overview", {"brand": BRAND}),
+                step_mcp_proxy("social_statistic_overview", server="insight-cube", args={"brand": BRAND}),
                 step_text("数据服务暂不可用。"),
             ]
         }
@@ -870,12 +1165,12 @@ async def test_license_suspended_mid_run_blocks_further_mcp() -> None:
                 .where(Tenant.id == tenant_holder["tenant_id"])
                 .values(license_status="suspended")
             )
-        return step_mcp("insight-cube", "social_statistic_trend", {"brand": BRAND})
+        return step_mcp_proxy("social_statistic_trend", server="insight-cube", args={"brand": BRAND})
 
     topology = PiUatTopology(
         scripts={
             "license": [
-                step_mcp("insight-cube", "social_statistic_overview", {"brand": BRAND}),
+                step_mcp_proxy("social_statistic_overview", server="insight-cube", args={"brand": BRAND}),
                 _suspend_then_mcp,
                 step_text("已停止"),
             ]
