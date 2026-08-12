@@ -39,6 +39,7 @@ function makeWork(overrides: Partial<ClaimedRun> = {}): ClaimedRun {
       rootPolicy: "policy",
       skillCatalog: [],
       adapterCatalog: ADAPTER_CATALOG,
+      maxDecisions: 50,
     },
     userPrompt: "分析这个品牌",
     ...overrides,

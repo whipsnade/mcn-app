@@ -24,6 +24,27 @@ function snapshotError(): never {
   throw new Error("pi_gateway_claim_snapshot_invalid");
 }
 
+/**
+ * ``limits.max_decisions`` is the server-owned model request budget.  It must
+ * be a present integer in 1..100 — missing, boolean, float, non-positive or
+ * out-of-range values all fail closed before any worker is spawned, and the
+ * gateway never substitutes a default for the server snapshot.
+ */
+export function readSnapshotMaxDecisions(snapshot: Record<string, unknown>): number {
+  const limits = snapshot.limits;
+  if (!isRecord(limits)) throw new Error("pi_gateway_runtime_snapshot_invalid");
+  const value = limits.max_decisions;
+  if (
+    typeof value !== "number" ||
+    !Number.isInteger(value) ||
+    value < 1 ||
+    value > 100
+  ) {
+    throw new Error("pi_gateway_runtime_snapshot_invalid");
+  }
+  return value;
+}
+
 function skillDescription(content: unknown): string {
   if (typeof content !== "string") return "";
   for (const line of content.split("\n")) {
@@ -96,6 +117,7 @@ export function mapClaimRuntimeSnapshot(snapshot: Record<string, unknown>): Runt
     rootPolicy: rootPolicy as string,
     skillCatalog,
     adapterCatalog,
+    maxDecisions: readSnapshotMaxDecisions(snapshot),
   };
 }
 

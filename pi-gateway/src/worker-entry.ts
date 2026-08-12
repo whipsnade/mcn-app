@@ -7,6 +7,12 @@ import type { McpAccountingControlPlane } from "./mcp-accounting-extension.js";
 import type { ControlPlaneTransport } from "./control-plane-client.js";
 import { WorkerRpcClient, WorkerRpcControlPlane } from "./ipc-rpc.js";
 import { PiSdkUsageProjector, projectPiSdkEvent } from "./event-projector.js";
+import {
+  isDecisionLimitError,
+  isProviderFailureError,
+  PiDecisionLimitError,
+  PiModelProviderError,
+} from "./model-request-budget.js";
 import type {
   ClaimedRun,
   FakeScriptStep,
@@ -50,6 +56,8 @@ export type WorkerFailureCode =
   | "worker_exited"
   | "worker_signaled"
   | "sdk_protocol_error"
+  | "pi_decision_limit"
+  | "pi_model_provider_error"
   | "worker_error";
 
 export function classifyWorkerExit(
@@ -60,7 +68,12 @@ export function classifyWorkerExit(
   return signal !== null ? "worker_signaled" : "worker_exited";
 }
 
-export function classifyWorkerError(error: unknown): "sdk_protocol_error" | "worker_error" {
+export function classifyWorkerError(
+  error: unknown,
+): "sdk_protocol_error" | "pi_decision_limit" | "pi_model_provider_error" | "worker_error" {
+  // 业务预算/模型终局失败码必须原样保留：它们是稳定业务终态，不是基础设施崩溃。
+  if (isDecisionLimitError(error)) return "pi_decision_limit";
+  if (isProviderFailureError(error)) return "pi_model_provider_error";
   return error instanceof Error && error.message === "sdk_protocol_error"
     ? "sdk_protocol_error"
     : "worker_error";
@@ -84,7 +97,12 @@ export function spawnIsolatedWorker(
   // Child 终帧：{type:"done"} 或 {type:"failed", errorCode}。父进程据此把
   // 业务失败（worker_error）与基础设施崩溃（无终帧的退出/信号）区分开。
   let terminalFrameCode: string | undefined;
-  const TERMINAL_FRAME_CODES = new Set(["worker_error", "sdk_protocol_error"]);
+  const TERMINAL_FRAME_CODES = new Set([
+    "worker_error",
+    "sdk_protocol_error",
+    "pi_decision_limit",
+    "pi_model_provider_error",
+  ]);
   child.on("message", (message: unknown) => {
     if (!message || typeof message !== "object" || !("type" in message)) return;
     if (message.type === "failed" && "errorCode" in message) {
@@ -180,6 +198,10 @@ export async function runSingleWorker(
   let unsubscribe: (() => void) | undefined;
   let workerSecrets: SecretBundle | undefined = secrets;
   const usageProjector = new PiSdkUsageProjector(work.attemptId);
+  // provider 流式终局失败标记：SDK 以 stopReason="error" 的 assistant 消息收口
+  // （经 message_end 事件暴露）。两层重试已关闭，该错误即本 Run 的终局模型失败，
+  // 必须成为稳定 failed 终态而非「错误文本的完成」。
+  let providerFailed = false;
   let cleanupPromise: Promise<void> | undefined;
   const cleanup = (): Promise<void> => {
     if (cleanupPromise) return cleanupPromise;
@@ -215,10 +237,27 @@ export async function runSingleWorker(
     unsubscribe = session.subscribe((event) => {
       options.onSdkEvent?.(event);
       if (event.type !== "sdk_event") return;
+      const sdkEvent = event.event;
+      if (
+        isRecordValue(sdkEvent) &&
+        sdkEvent.type === "message_end" &&
+        isRecordValue(sdkEvent.message) &&
+        sdkEvent.message.stopReason === "error"
+      ) {
+        providerFailed = true;
+      }
       const projected = projectPiSdkEvent(event.event ?? event, usageProjector);
       for (const item of projected) options.onEvent?.(item);
     });
     await session.prompt(work.userPrompt ?? "");
+    // SDK 可能把 provider 错误吞进 error 消息再正常收口 prompt——预算超限必须
+    // 在 worker 边界重新抛出稳定码，Run 才能得到 failed/pi_decision_limit 终态。
+    if (session.modelBudget?.limitExceeded) {
+      throw new PiDecisionLimitError(session.modelBudget.maxDecisions);
+    }
+    if (providerFailed) {
+      throw new PiModelProviderError();
+    }
   } finally {
     try {
       await cleanup();
@@ -229,6 +268,10 @@ export async function runSingleWorker(
 }
 
 type WorkerMessage = { type: "run"; work: ClaimedRun };
+
+function isRecordValue(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
 
 function finishChildProcess(
   message: { type: "done" | "failed"; runId: string; errorCode?: WorkerFailureCode },

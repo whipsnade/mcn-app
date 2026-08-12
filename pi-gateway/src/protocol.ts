@@ -66,6 +66,12 @@ export interface RuntimeSnapshot {
   rootPolicy: string;
   skillCatalog: readonly SkillCatalogEntry[];
   adapterCatalog: readonly AdapterCatalogEntry[];
+  /**
+   * Server-owned per-Run model decision budget (runtime config
+   * ``limits.max_decisions``).  Enforced synchronously at the provider
+   * dispatch boundary; there is deliberately no gateway-side default.
+   */
+  maxDecisions: number;
 }
 
 /**
@@ -341,6 +347,13 @@ export interface PiRunSession {
   cwd(): string;
   /** Adapter-facing hook; the SDK session itself never receives wallet data. */
   mcpAccounting?: McpAccountingExtension;
+  /** Per-Run provider dispatch budget (hard-enforced before any HTTP). */
+  modelBudget?: import("./model-request-budget.js").ModelRequestBudget;
+  /** Effective retry configuration proof: both layers must be disabled. */
+  retrySettings?(): {
+    agent: { enabled: boolean; maxRetries: number; baseDelayMs: number };
+    provider: { timeoutMs?: number; maxRetries?: number; maxRetryDelayMs: number };
+  };
 }
 
 export interface PiSessionFactory {

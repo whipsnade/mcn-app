@@ -7,7 +7,7 @@ import { createServer, type IncomingMessage, type Server } from "node:http";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { buildSignature } from "../src/control-plane-client.js";
-import { runGatewayMain } from "../src/main.js";
+import { runGatewayMain, mapClaimRuntimeSnapshot } from "../src/main.js";
 
 const GATEWAY_SECRET = "test-only-gateway-secret-0123456789";
 const LEASE_TOKEN = "lease-token-with-enough-entropy-0123456789";
@@ -500,5 +500,38 @@ describe("production gateway composition root", () => {
     const pkg = JSON.parse(raw) as { dependencies?: Record<string, string>; devDependencies?: Record<string, string> };
     const deps = Object.keys({ ...pkg.dependencies, ...pkg.devDependencies });
     expect(deps.filter((dep) => /mysql|mariadb|typeorm|sequelize|knex|mongodb|sqlite|better-sqlite|pg($|[-_])/i.test(dep))).toEqual([]);
+  });
+});
+
+describe("mapClaimRuntimeSnapshot maxDecisions budget", () => {
+  const base = () => {
+    const snapshot = JSON.parse(JSON.stringify(claimResponse().runtime_snapshot)) as Record<string, unknown>;
+    // claim 时刻由控制面注入并归一化的 adapterCatalog（camelCase）——fixture 补齐。
+    snapshot.adapterCatalog = [
+      { service: "insight-cube", adapterName: "match_best_tag", remoteName: "match_best_tag", schemaDigest: shaDigest("1") },
+    ];
+    return snapshot;
+  };
+
+  it("reads a valid limits.max_decisions into the worker snapshot", () => {
+    const snapshot = base();
+    snapshot.limits = { max_decisions: 2 };
+    expect(mapClaimRuntimeSnapshot(snapshot).maxDecisions).toBe(2);
+  });
+
+  it.each([
+    ["missing limits", (s: Record<string, unknown>) => { delete s.limits; }],
+    ["missing max_decisions", (s: Record<string, unknown>) => { s.limits = {}; }],
+    ["boolean", (s: Record<string, unknown>) => { s.limits = { max_decisions: true }; }],
+    ["float", (s: Record<string, unknown>) => { s.limits = { max_decisions: 2.5 }; }],
+    ["zero", (s: Record<string, unknown>) => { s.limits = { max_decisions: 0 }; }],
+    ["negative", (s: Record<string, unknown>) => { s.limits = { max_decisions: -1 }; }],
+    ["out of range", (s: Record<string, unknown>) => { s.limits = { max_decisions: 101 }; }],
+    ["string", (s: Record<string, unknown>) => { s.limits = { max_decisions: "2" }; }],
+    ["null", (s: Record<string, unknown>) => { s.limits = { max_decisions: null }; }],
+  ])("fails closed with pi_gateway_runtime_snapshot_invalid: %s", (_name, mutate) => {
+    const snapshot = base();
+    mutate(snapshot);
+    expect(() => mapClaimRuntimeSnapshot(snapshot)).toThrow("pi_gateway_runtime_snapshot_invalid");
   });
 });

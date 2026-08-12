@@ -1,4 +1,5 @@
 import type { PiGatewayClaimResponse, PiGatewaySourceEvent } from "./protocol.js";
+import { isDecisionLimitError, isProviderFailureError } from "./model-request-budget.js";
 import { WorkerPool } from "./worker-pool.js";
 
 export type PiGatewayInfrastructureCode =
@@ -487,6 +488,25 @@ export class PiGateway {
         const infrastructureError = asPiGatewayInfrastructureError(error);
         if (infrastructureError) {
           this.onError(infrastructureError);
+          return;
+        }
+        if (isDecisionLimitError(error) || isProviderFailureError(error)) {
+          // 业务预算/模型终局失败：稳定 failed + 稳定码；不是基础设施崩溃——
+          // 不创建恢复 Attempt、不自动重放，也绝不降级成 pi_gateway_worker_failed。
+          const businessCode = isDecisionLimitError(error)
+            ? "pi_decision_limit"
+            : "pi_model_provider_error";
+          try {
+            await this.controlPlane.terminal(
+              claim.run_id,
+              claim.attempt_id,
+              "failed",
+              claim.lease_token,
+              { code: businessCode },
+            );
+          } catch (terminalError) {
+            this.onError(terminalError);
+          }
           return;
         }
         this.onError(error);

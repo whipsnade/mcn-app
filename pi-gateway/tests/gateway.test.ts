@@ -569,3 +569,45 @@ describe("PiGateway", () => {
     expect(terminal).not.toHaveBeenCalled();
   });
 });
+
+describe("pi_decision_limit business terminal", () => {
+  it("settles failed with code pi_decision_limit (no recovery, no opaque worker_failed)", async () => {
+    const terminal = vi.fn().mockResolvedValue(undefined);
+    const heartbeat = vi.fn().mockResolvedValue({ lease_expires_at: Math.floor(Date.now() / 1000) + 3600 });
+    const onError = vi.fn();
+    const controlPlane = {
+      claim: vi.fn().mockResolvedValue({
+        run_id: "run-budget",
+        attempt_id: "attempt-budget",
+        lease_token: "lease-token-with-enough-entropy",
+        lease_expires_at: Math.floor(Date.now() / 1000) + 3600,
+        runtime_snapshot: {}, transcript: [],
+        secret_envelope: { alg: "AES-256-GCM", nonce: "1234567890123456", ciphertext: "1234567890123456" },
+        adapter_catalog: [], internal_tools: [],
+      }),
+      terminal,
+      heartbeat,
+    };
+    const gateway = new PiGateway({
+      controlPlane, capacity: 1, heartbeatIntervalMs: 1, onError,
+      worker: async () => ({
+        done: Promise.reject(new Error("pi_decision_limit")),
+      }),
+    });
+
+    await gateway.tick();
+
+    expect(terminal).toHaveBeenCalledTimes(1);
+    expect(terminal).toHaveBeenCalledWith(
+      "run-budget",
+      "attempt-budget",
+      "failed",
+      "lease-token-with-enough-entropy",
+      { code: "pi_decision_limit" },
+    );
+    // 业务预算终止不得进入基础设施错误通道（那会把 Run 留给恢复/重放）。
+    for (const call of onError.mock.calls) {
+      expect(String(call[0])).not.toContain("PiGatewayInfrastructureError");
+    }
+  });
+});

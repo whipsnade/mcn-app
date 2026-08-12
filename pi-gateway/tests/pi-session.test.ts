@@ -22,6 +22,7 @@ const work: ClaimedRun = {
       { service: "social-grow-content", adapterName: "mcp__social_grow_content", remoteName: "content", schemaDigest: "sha256:c" },
       { service: "aktools", adapterName: "mcp__aktools", remoteName: "ak", schemaDigest: "sha256:d" },
     ],
+    maxDecisions: 50,
   },
 };
 
@@ -118,6 +119,34 @@ describe("Pi SDK session factory", () => {
       args: { keyword: "美妆" },
     })).toEqual({ permit_id: "permit-1" });
     expect(session.systemPrompt()).not.toContain("permit-1");
+    await session.dispose();
+  });
+
+  it("disables both SDK auto-retry layers in the actual session settings", async () => {
+    const session = await createProductionPiSession(work, secrets, { fakeProvider: true });
+    const retry = session.retrySettings?.();
+    expect(retry).toBeDefined();
+    expect(retry?.agent.enabled).toBe(false);
+    expect(retry?.provider.maxRetries).toBe(0);
+    await session.dispose();
+  });
+
+  it("enforces the snapshot maxDecisions budget at the provider boundary", async () => {
+    // maxDecisions=1：第一次决策（文本）放行；若 SDK 再次请求模型，第二次
+    // 在任何外发前被 pi_decision_limit 拦截（此处用单步脚本验证预算门接线）。
+    const budgeted = {
+      ...work,
+      runtimeSnapshot: { ...work.runtimeSnapshot, maxDecisions: 1 },
+    };
+    const session = await createProductionPiSession(budgeted, secrets, {
+      fakeProvider: true,
+      fakeScript: [{ kind: "text", text: "一次回答" }],
+    });
+    expect(session.modelBudget?.maxDecisions).toBe(1);
+    expect(session.modelBudget?.usedCount).toBe(0);
+    await session.prompt("问一个问题");
+    expect(session.modelBudget?.usedCount).toBe(1);
+    expect(session.modelBudget?.limitExceeded).toBe(false);
     await session.dispose();
   });
 });

@@ -43,6 +43,7 @@ describe("locked Pi SDK contract", () => {
         rootPolicy: "root-policy",
         skillCatalog: [],
         adapterCatalog: [],
+        maxDecisions: 50,
       },
     };
     const secrets: SecretBundle = {

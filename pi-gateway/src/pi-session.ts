@@ -19,6 +19,9 @@ import {
   type Model,
   type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
+// 静态捕获内建 openai-completions 流式实现作为 delegate：不经 api registry
+// 解析（registry 按 api 名无条件覆盖，经它会递归/静默注销 wrapper 自身）。
+import { streamSimpleOpenAICompletions } from "@earendil-works/pi-ai/openai-completions";
 
 import { createMcpConfig, createProductionResourceLoader } from "./resource-loader.js";
 import {
@@ -28,6 +31,10 @@ import {
 } from "./mcp-accounting-extension.js";
 import { buildInternalToolDefinitions, PiInternalToolsClient } from "./internal-tools.js";
 import type { ControlPlaneTransport } from "./control-plane-client.js";
+import {
+  createBoundedStreamSimple,
+  ModelRequestBudget,
+} from "./model-request-budget.js";
 import {
   createMcpReadinessExtensionFactory,
   createMcpReadinessGate,
@@ -202,10 +209,12 @@ export async function createProductionPiSession(
           work.internalTools,
         )
       : [];
+    // 每 Run 独立的模型请求预算门（计数成功与失败的 provider 外发尝试）。
+    const modelBudget = new ModelRequestBudget(work.runtimeSnapshot.maxDecisions);
     const authStorage = AuthStorage.inMemory();
     authStorage.setRuntimeApiKey(work.runtimeSnapshot.model.provider, secrets.modelApiKey);
     const modelRegistry = ModelRegistry.inMemory(authStorage);
-    const model = registerModel(modelRegistry, work, secrets, options.fakeProvider === true, options.fakeScript);
+    const model = registerModel(modelRegistry, work, secrets, options.fakeProvider === true, options.fakeScript, modelBudget);
     const loader = createProductionResourceLoader({
       cwd: runDir,
       agentDir,
@@ -220,6 +229,9 @@ export async function createProductionPiSession(
       defaultProvider: model.provider,
       defaultModel: model.id,
       defaultThinkingLevel: work.runtimeSnapshot.model.thinkingLevel ?? "medium",
+      // 两层自动重试全部关闭：agent 层 auto-retry 与 provider 层 maxRetries。
+      // 重试意味着重复外发，必须由预算门与账务链显式控制，不能默认可开。
+      retry: { enabled: false, provider: { maxRetries: 0 } },
     });
     const sessionManager = SessionManager.inMemory(runDir);
     const { session } = await createAgentSession({
@@ -288,6 +300,11 @@ export async function createProductionPiSession(
       activeToolNames: () => session.getActiveToolNames(),
       cwd: () => runDir,
       mcpAccounting,
+      modelBudget,
+      retrySettings: () => ({
+        agent: settingsManager.getRetrySettings(),
+        provider: settingsManager.getProviderRetrySettings(),
+      }),
     };
   } catch (error) {
     try {
@@ -312,11 +329,19 @@ function registerModel(
   work: ClaimedRun,
   secrets: SecretBundle,
   fakeProvider: boolean,
-  fakeScript?: readonly FakeScriptStep[],
+  fakeScript: readonly FakeScriptStep[] | undefined,
+  budget: ModelRequestBudget,
 ): Model<any> {
   const provider = work.runtimeSnapshot.model.provider;
   const id = work.runtimeSnapshot.model.id;
   const api = fakeProvider ? "faux" : work.runtimeSnapshot.model.api;
+  // 预算门包装 provider 流式入口：任何一次决策外发（含失败尝试）都先过
+  // budget.assertAndConsume()，超限在任何 HTTP 之前抛 pi_decision_limit。
+  const delegate = (
+    fakeProvider
+      ? fakeStreamFactory(fakeScript)
+      : streamSimpleOpenAICompletions
+  ) as (model: unknown, context: unknown, options?: Record<string, unknown>) => unknown;
   registry.registerProvider(provider, {
     api,
     baseUrl: secrets.modelBaseUrl,
@@ -325,7 +350,7 @@ function registerModel(
     // The locked coding-agent package carries its own pi-ai declaration; the
     // runtime stream protocol is identical, so bridge the duplicate private
     // EventStream type at this one SDK registration boundary.
-    streamSimple: fakeProvider ? fakeStreamFactory(fakeScript) as any : undefined,
+    streamSimple: createBoundedStreamSimple(delegate, budget) as any,
     models: [{
       id,
       name: id,
