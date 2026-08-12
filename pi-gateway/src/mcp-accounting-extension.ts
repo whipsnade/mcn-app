@@ -266,7 +266,7 @@ function toMcpToolCall(
       );
     });
     const unique = new Map<string, McpToolBinding>();
-    for (const binding of candidates) unique.set(`${binding.server}${binding.toolName}`, binding);
+    for (const binding of candidates) unique.set(`${binding.server}\u0000${binding.toolName}`, binding);
     if (unique.size === 1) {
       const match = [...unique.values()][0];
       // Pin the resolved server back into the model-supplied input when the
