@@ -116,3 +116,17 @@ Gate A PASS、B7 PASS 或 production ready。
   条件、授权文本模板）。
 - 在用户于新消息中完整确认授权文本之前，状态维持 `READY_FOR_REAL_B7_UAT_REVIEW`；
   历史真实 Task 9（round `20260808T060814Z`）不得重跑，生产切流与方案 C 均未授权。
+
+## 2026-08-12 更新（二）：授权模式消歧与专用隔离环境绑定
+
+- 授权流程定义两种合法模式：模式 A（两阶段，推荐）与模式 B（一次性完整授权 L0→L1→L2）；
+  用户已选择模式 B 作为本次执行授权形态。round 尚未开启：首次执行尝试在启动门禁
+  fail-closed（B7_BLOCKED，工作树存在未提交改动），未连接任何环境、未读取任何凭证。
+- 专用隔离环境已创建并核验（授权计划 §2.0）：数据库 `kol_insight_b7_uat`
+  （`kol_b7_uat@localhost`，`utf8mb4`/`utf8mb4_unicode_ci`，73 表，migration head
+  `0043_billing_downgrade_guard`），专用账号访问 `kol_insight` 被 MySQL 1142 拒绝；
+  凭证只以 Keychain/`.env` 引用记录，不记值；严禁 `kol_insight`/`kol_insight_test` 或任何
+  开发/预生产/生产/正式客户数据库。
+- execution commit 消歧：`f7ab159` 仅为第一版文档基线历史事实；实际候选 execution commit
+  为授权包最终修复提交后的 clean HEAD，round_id 以其前 8 位生成。
+- 上方全部历史否决与修复事实保持原样，不重写；本地离线 fake topology 仍不等于真实 B7 UAT。

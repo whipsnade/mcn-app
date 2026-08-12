@@ -5,10 +5,13 @@
 否决）：真实 B7 UAT、生产切流和方案 C 均需要单独审批。
 
 状态更新（2026-08-12）：本地代码修复与架构复核已完成，复核结论 Critical 0 / Important 0 /
-Minor 1；状态维持 `READY_FOR_REAL_B7_UAT_REVIEW`，仍等待用户对真实 B7 UAT 的明确授权。
-授权方案见 `docs/superpowers/plans/2026-08-12-real-b7-uat-authorization-plan.md` 与
-`docs/qa/2026-08-12-pi-b7-uat-authorization-pack.md`；在授权文本被完整确认前，不得执行
-真实外部调用，也不得把状态写成 B7 PASS 或 production ready。
+Minor 1；代码状态维持 `READY_FOR_REAL_B7_UAT_REVIEW`。授权状态：用户已于 2026-08-12 按
+模式 B（一次性完整授权 L0→L1→L2）授权本次真实 B7 UAT——授权方案见
+`docs/superpowers/plans/2026-08-12-real-b7-uat-authorization-plan.md`（§7 两种授权模式、
+§2.0 专用隔离环境绑定）与 `docs/qa/2026-08-12-pi-b7-uat-authorization-pack.md`（§5.3 模式 B
+一次性授权模板）；round 尚未开启（首次执行尝试在启动门禁 fail-closed：工作树存在未提交
+改动，未连接任何环境）。在 round 实际开启并通过全部启动门禁前，不得执行真实外部调用，
+也不得把状态写成 B7 PASS 或 production ready。
 
 ## 组件、版本与启动检查
 
@@ -128,6 +131,33 @@ active 版本转 retired，不修改已创建 Run 的 snapshot。
   处理并把 Run 交给恢复。Worker abort 是 SIGTERM 加 5 秒 SIGKILL 升级——优雅停机卡住的子进程
   也必须真正退出，否则旧 Attempt 会经 IPC 桥继续执行工具调用（双重执行）。
 - **SSE**：用户事件从 AgentEvent/SSE 续传；usage 仅进入 RuntimeUsageRecord，不进入用户 SSE 或 prompt。
+
+## 真实 B7 UAT 专用隔离环境（2026-08-12 绑定）
+
+真实 B7 UAT 只允许使用以下已创建并核验的专用环境（授权计划 §2.0；启动门禁逐项核验，
+任一不符即 B7_BLOCKED）：
+
+| 项 | 值 |
+| --- | --- |
+| 数据库 | `kol_insight_b7_uat`（host `127.0.0.1:3306`，user identity `kol_b7_uat@localhost`，`APP_ENV=test` / `AUTH_MODE=mock`） |
+| migration head | `0043_billing_downgrade_guard`（迁移已完成，只核验不重建） |
+| charset / collation | `utf8mb4` / `utf8mb4_unicode_ci`（73 张表） |
+| 隔离证明 | 专用账号访问 `kol_insight.users` 被 MySQL 1142 拒绝 |
+| MySQL 密码 | macOS Keychain `com.kol-insight.real-b7-uat.mysql` / `kol_b7_uat@127.0.0.1`（只记引用，值仅进程内） |
+| DataTap Token | macOS Keychain `com.kol-insight.real-b7-uat.datatap` / `DATATAP_MCP_TOKEN`（只记引用） |
+| Runtime master keys | macOS Keychain `com.kol-insight.real-b7-uat.runtime-secret-master-keys` / `v1`（32 bytes，active version `v1`，只记引用） |
+| 模型配置 | 主仓库未跟踪文件 `backend/.env`（只读 `TENCENT_PLAN_BASE_URL`/`TENCENT_PLAN_MODEL`/`TENCENT_PLAN_API_KEY`，仅进程内） |
+
+运维边界：
+
+- 严禁连接 `kol_insight`、`kol_insight_test` 或任何开发/预生产/生产/正式客户数据库；禁止
+  DROP/CREATE/重建 `kol_insight_b7_uat`；禁止对其运行普通 pytest、离线 UAT harness 或迁移
+  downgrade。
+- 环境初始化（两个 synthetic tenant、用户、各 2000 积分钱包、周期额度 2000、全能力 License、
+  租户级 Pi Runtime Config）只经生产 domain/admin service 幂等完成并写审计/账本；禁止直接
+  INSERT/UPDATE `encrypted_runtime_secrets`。
+- 数据库证据 `retained_by_policy`：tenant/用户/账本/Runtime Config/License/usage/lineage
+  保留至独立 reviewer 封口；清除需用户另行授权；证据目录永久保留。
 
 ## 禁止事项与真实 UAT 停止门
 

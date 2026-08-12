@@ -5,8 +5,10 @@
 > `docs/qa/2026-08-12-pi-b7-uat-authorization-pack.md`。
 
 ```text
-Status: AWAITING_USER_AUTHORIZATION
-Real external calls authorized: NO
+Status: AUTHORIZED_MODE_B_ROUND_NOT_OPENED（授权模式二选一：模式 A 两阶段 / 模式 B 一次性完整授权，见 §7；
+用户 2026-08-12 已按模式 B 一次性授权 L0→L1→L2；round 尚未开启——首次执行尝试在启动门禁
+fail-closed（B7_BLOCKED，工作树未提交改动），execution commit 为授权包最终修复提交后的 clean HEAD 候选）
+Real external calls authorized: ROUND_SCOPED（仅 round 内、启动门禁与 L0/L1 门禁全部通过后按授权消息执行；round 外仍禁止）
 Production cutover authorized: NO
 Historical Task 9 rerun authorized: NO
 Plan C authorized: NO
@@ -34,7 +36,9 @@ Plan C authorized: NO
 | 事实 | 值 | 核对来源 |
 | --- | --- | --- |
 | 分支 | `codex/marketing-capability-pack-b0` | `git status --short --branch` |
-| 当前 HEAD | `61576f7a45c3a93063bdaae5328aefd67933df68` | `git rev-parse HEAD` |
+| last production-code baseline | `61576f7a45c3a93063bdaae5328aefd67933df68`（最后一个触及代码的提交；其后 `58a88e0`、`f7ab159` 与全部授权包修复提交均为 docs-only） | `git log --oneline` |
+| 授权包第一版文档基线 HEAD | `f7ab159aaea379b37e3885381abe79cc3454bb41`（2026-08-12 第一版文档轮撰写时点的 `git rev-parse HEAD`，docs-only；仅为历史事实陈述，不是执行身份，也不是 execution commit 候选） | `git rev-parse HEAD`（撰写时点） |
+| execution commit（规则，不预写 SHA） | 等于授权包最终修复提交之后、执行启动门禁通过时点的 `git rev-parse HEAD`（工作树必须干净）；模式 A 由用户在阶段 A 授权文本中逐字确认，模式 B 由授权消息以身份规则绑定、执行时点现场核验；本文档不内嵌任何自指 SHA | 规则见 §1.1/§1.2 |
 | 工作树状态 | 干净（无未提交变更） | `git status --short` |
 | `git diff --check` | 通过（无输出） | `git diff --check` |
 | 迁移 head | `0043_billing_downgrade_guard` | `backend/migrations/versions/` 目录序 |
@@ -46,12 +50,17 @@ Plan C authorized: NO
 | 已审核动态工具 | 29 个（4 个服务，明细见 §4） | `backend/app/mcp_gateway/registry.py` `DYNAMIC_TOOL_ALLOWLIST` |
 | Pi 内部工具 | 13 个（明细见 §4） | `backend/app/pi_gateway/service.py` claim 响应 |
 | adapter 服务别名 | `insight-cube` / `social-grow` / `social-grow-content` / `aktools`（`bilibili-mcp` 经 `aktools` 别名接入） | `pi-gateway/src/protocol.ts` `PI_ADAPTER_SERVICE_ALIASES` |
-| 架构复核结论 | Critical 0 / Important 0 / Minor 1（2026-08-12） | 用户任务书事实陈述 |
+| 代码架构复核结论 | Critical 0 / Important 0 / Minor 1（2026-08-12，针对方案 B 代码） | 用户任务书事实陈述 |
+| 授权包复核结论 | Critical 0 / Important 3 / Minor 1（2026-08-12，针对授权包第一版 `f7ab159`）；修复轮已全部关闭，逐项证据见授权包 §6 | 用户任务书事实陈述 + 授权包 §6 |
 | 离线进程级 UAT | 17 场景 × 串行 3 轮全绿（fake model + fake DataTap MCP，0 外部网络） | `changelog/2026-08-11.md`、`docs/qa/pi-agent-gateway-local-uat.md` |
-| 当前交付状态 | `READY_FOR_REAL_B7_UAT_REVIEW` | `docs/qa/pi-agent-gateway-local-uat.md`、`docs/runbooks/pi-agent-gateway.md` |
+| 当前交付状态 | 代码：`READY_FOR_REAL_B7_UAT_REVIEW`；授权包：`AWAITING_USER_AUTHORIZATION`（两阶段均未授权；修复前曾为 `NEEDS_AUTHORIZATION_PACK_REPAIR`，见授权包 §6） | `docs/qa/pi-agent-gateway-local-uat.md`、`docs/runbooks/pi-agent-gateway.md`、授权包 §6 |
 
 **事实判读：** 本地离线 fake topology 通过 ≠ 真实 B7 通过；`READY_FOR_REAL_B7_UAT_REVIEW`
-≠ `READY` 被确认，更不等于 B7 PASS 或 production ready。真实 B7 UAT 必须取得用户新的明确授权。
+≠ `READY` 被确认，更不等于 B7 PASS 或 production ready。真实 B7 UAT 必须取得用户明确授权
+（§7 定义两种合法模式：模式 A 两阶段授权——阶段 A 只放行 L0 零外发预检、阶段 B 才放行真实
+模型/DataTap/钱包调用；模式 B 一次性完整授权 L0→L1→L2）。用户已于 2026-08-12 按模式 B
+授权本次执行；模式 B 不降低任何预算、隔离、destructive 开关或停止条件要求，L0 失败仍必须
+停止、L1 失败不得进入 L2。
 
 ## 1. Round 身份
 
@@ -61,38 +70,100 @@ Plan C authorized: NO
 REAL_B7_<YYYYMMDDTHHMMSSZ>_<SHORT_COMMIT>
 ```
 
-- `<YYYYMMDDTHHMMSSZ>`：round 创建（授权生效）时刻的 UTC 秒级时间戳，由执行现场生成。
-- `<SHORT_COMMIT>`：授权 commit SHA 的前 8 位小写十六进制（与 `git rev-parse --short=8` 一致）。
-- round_id 一经写入证据目录 `authorization.md` 即不可变；任何身份字段变化必须终止当前 round
-  并重新取得授权、新建 round。
-- **本轮不创建任何真实 round**：当前不存在合法 round_id，任何形如 `REAL_B7_*` 的目录在本授权前
-  均不得创建。
+- `<YYYYMMDDTHHMMSSZ>`：operator 提出 round_id 时刻的 UTC 秒级时间戳。提出行为仅为本地
+  字符串构造：不得创建任何目录、不得连接任何环境（数据库/模型/DataTap/钱包）。
+- `<SHORT_COMMIT>`：execution commit SHA 的前 8 位小写十六进制（与 `git rev-parse
+  --short=8` 一致）；模式 A 取用户最终批准值，模式 B 取启动门禁通过时点的 clean HEAD。
+- execution commit = 授权包最终修复提交之后、执行启动门禁通过时点 `git rev-parse HEAD` 的值
+  （工作树必须干净）。本文档与授权模板不预写该值——任何 commit 不得在自身内部硬编码自己的
+  SHA；`61576f7…` 与 `f7ab159…` 分别为 last production-code baseline 与第一版文档基线的
+  历史事实，均不构成执行身份。
+- round_id 必须由 operator 在授权确认**之前**以完整确定值或完整身份规则提出（模式 A：写入
+  阶段 A 授权模板由用户逐字确认；模式 B：以「执行时点 clean HEAD 前 8 位」规则写入一次性
+  授权模板由用户确认，执行时展开为确定值）；不存在任何"授权后由 operator 补填"的通道。
+- L0-01 现场复核 `git rev-parse HEAD` 与已确认 execution commit（模式 B 为身份规则展开值）
+  不一致，或工作树不干净，即整个授权作废：operator 必须以新时间戳与新 short commit 重新
+  提出 round_id 并按所选模式重新取得授权。
+- round_id 一经写入证据目录 `authorization-phase-a.md`（模式 A）或 `authorization.md`
+  （模式 B）即不可变；任何身份字段变化必须终止当前 round 并重新取得授权、新建 round。
+- **round 尚未开启**：2026-08-12 首次执行尝试在启动门禁 fail-closed（B7_BLOCKED：工作树
+  存在未提交改动），未创建任何目录、未连接任何环境；在启动门禁通过前，任何形如
+  `REAL_B7_*` 的目录均不得创建。
 
 ### 1.2 未来执行时必须固定的字段
 
 | 字段 | 当前值/来源 | 状态 |
 | --- | --- | --- |
-| round_id | 执行现场按 §1.1 生成 | NEEDS_USER_APPROVAL |
-| commit_sha | 候选 `61576f7a45c3a93063bdaae5328aefd67933df68`（当前 HEAD，VERIFIED）；实际执行 commit 以授权文本为准 | NEEDS_USER_APPROVAL |
+| 授权模式 | 模式 B（一次性完整授权 L0→L1→L2），用户 2026-08-12 授权消息选定；模式 A（两阶段）保留为推荐流程，见 §7 | VERIFIED |
+| round_id | operator 在授权前提出的完整确定值或身份规则（§1.1）；模式 A：阶段 A 模板逐字确认、阶段 B 绑定同一值；模式 B：一次性模板确认身份规则，启动门禁通过时点展开为确定值 | NEEDS_USER_APPROVAL |
+| commit_sha | 授权包最终修复提交之后、启动门禁通过时点 `git rev-parse HEAD`（工作树干净）；`61576f7…` 仅为 last production-code baseline，`f7ab159…` 仅为第一版文档基线，均非执行身份 | NEEDS_USER_APPROVAL |
 | branch | `codex/marketing-capability-pack-b0` | VERIFIED |
 | migration_head | `0043_billing_downgrade_guard` | VERIFIED |
 | Pi SDK 版本 | `pi-coding-agent 0.79.10` / `pi-ai 0.74.2` / `pi-tui 0.74.2` | VERIFIED |
 | adapter 版本 | `pi-mcp-adapter 2.20.1` | VERIFIED |
-| Gateway build hash | 执行时从授权 commit 全新 `npm ci && npm run build` 后记录 dist 摘要 | NEEDS_USER_APPROVAL |
-| Runtime Config ID/version | 测试环境独立 append-only 版本，执行前由用户确认 | NEEDS_USER_APPROVAL |
-| License ID/version | 测试环境独立 License，执行前由用户确认 | NEEDS_USER_APPROVAL |
-| tenant IDs | 至少两个独立测试租户 | NEEDS_USER_APPROVAL |
-| test user IDs | 每租户至少两个独立测试用户 | NEEDS_USER_APPROVAL |
-| gateway IDs | 测试 Gateway 固定 id 白名单值 | NEEDS_USER_APPROVAL |
+| Gateway build hash | L0-04 从 execution commit 全新 `npm ci && npm run build` 后记录 dist 摘要；模式 A 由阶段 B 模板固定，模式 B 逐字录入证据后视为固定值（变化命中授权包 §3-18） | NEEDS_USER_APPROVAL |
+| Runtime Config ID/version | 专用库内 append-only 独立版本（L0 初始化创建，§2.0/§6.1）；模式 A 由阶段 B 模板固定，模式 B 录入证据后视为固定值 | NEEDS_USER_APPROVAL |
+| License ID/version | 专用库内独立 License（L0 初始化创建，§2.0/§6.1）；固定方式同上 | NEEDS_USER_APPROVAL |
+| tenant IDs | 两个独立 synthetic B7 租户（slug 含 round_id 与 tenant-a/tenant-b，L0 初始化创建）；固定方式同上 | NEEDS_USER_APPROVAL |
+| test user IDs | 每租户至少两个 synthetic 测试用户（L0 初始化创建）；固定方式同上 | NEEDS_USER_APPROVAL |
+| gateway IDs | 测试 Gateway 固定 id 白名单值，L0 核对后固定（模式同上） | NEEDS_USER_APPROVAL |
 | evidence directory | `docs/qa/evidence/pi-b7/<round_id>/`（结构见授权包 §2） | NEEDS_USER_APPROVAL |
-| operator | 执行人 | NEEDS_USER_INPUT |
-| independent reviewer | 独立复核人（不得与 operator 同一人） | NEEDS_USER_INPUT |
-| start/end time | 授权时间窗口 | NEEDS_USER_APPROVAL |
-| authorization message reference | 用户完整确认授权文本的消息引用 | NEEDS_USER_APPROVAL |
+| operator | 执行人，授权模板填写（模式 A 阶段 A / 模式 B 一次性模板） | NEEDS_USER_INPUT |
+| independent reviewer | 独立复核人（不得与 operator 同一人），授权模板填写（模式同上） | NEEDS_USER_INPUT |
+| start/end time | 授权时间窗口，授权模板填写（模式 A：阶段 A 填写、阶段 B 可复述或延长且不早于阶段 A 窗口；模式 B：一次性模板填写） | NEEDS_USER_APPROVAL |
+| authorization message reference | 模式 A：两条独立用户新消息，记录于 `authorization-phase-{a,b}.md`；模式 B：单条一次性授权消息，记录于 `authorization.md`。用户在模板填 `THIS_MESSAGE`，operator 只记录平台消息 ID/任务 ID 与授权文本 SHA-256，不得修改用户原文 | NEEDS_USER_APPROVAL |
 
 ## 2. 隔离环境要求（必须由用户逐项确认）
 
-以下每一项均为 `NEEDS_USER_APPROVAL`；任一项不能确认即不得进入 Level 1/2：
+以下每一项均为 `NEEDS_USER_APPROVAL`；任一项不能确认即不得进入 Level 1/2。其中第 1、2 项
+（独立环境与独立数据库）已由 §2.0 的专用环境满足并经 2026-08-12 核验；第 3–6 项由 L0 环境
+初始化（§6.1）在专用库内创建 synthetic 数据满足；其余为执行期要求。
+
+### 2.0 本次授权绑定的专用隔离环境（2026-08-12 已创建并核验，VERIFIED）
+
+数据库身份（启动门禁逐项核验，任一不符即 B7_BLOCKED）：
+
+| 项 | 值 | 核验方式 |
+| --- | --- | --- |
+| host / port | `127.0.0.1` / `3306` | 连接参数 |
+| database | `kol_insight_b7_uat`（唯一允许数据库） | `SELECT DATABASE()` |
+| user identity | `kol_b7_uat@localhost` | `CURRENT_USER()` |
+| 运行模式 | `APP_ENV=test` / `AUTH_MODE=mock` | 进程环境 |
+| migration head | `0043_billing_downgrade_guard`（唯一 head；迁移已完成，只核验不重建） | `alembic heads` |
+| charset / collation | `utf8mb4` / `utf8mb4_unicode_ci` | 库级变量 |
+| 表数量 | 73 | information_schema 计数 |
+| 隔离证明 | 专用账号访问 `kol_insight.users` 被 MySQL 1142 拒绝 | 实测拒绝 |
+| 初始状态 | `tenants`=0、`encrypted_runtime_secrets`=0、`runtime_config_versions` 含 2 条系统迁移种子配置（保留） | SELECT 计数 |
+
+凭证引用（只记录引用，任何值不得写入文档/证据/Git）：
+
+| 凭证 | secret store reference（VERIFIED） |
+| --- | --- |
+| MySQL 密码 | macOS Keychain `service=com.kol-insight.real-b7-uat.mysql` / `account=kol_b7_uat@127.0.0.1`（直接捕获到进程内 `MYSQL_PASSWORD`，禁止 echo/日志/写文件） |
+| DataTap Token | macOS Keychain `service=com.kol-insight.real-b7-uat.datatap` / `account=DATATAP_MCP_TOKEN` |
+| Runtime master keys | macOS Keychain `service=com.kol-insight.real-b7-uat.runtime-secret-master-keys` / `account=v1`；已核验格式为 `v1` + 32 bytes；`RUNTIME_SECRET_ACTIVE_KEY_VERSION=v1` |
+| 模型配置 | 主仓库未跟踪文件 `backend/.env`（只读 `TENCENT_PLAN_BASE_URL`/`TENCENT_PLAN_MODEL`/`TENCENT_PLAN_API_KEY`，仅进程内；禁止写入 worktree 或证据） |
+
+已核验事实（2026-08-12，VERIFIED；不记录任何明文或完整指纹）：
+
+- DataTap Keychain 值与主仓库 `backend/.env` 当前 `DATATAP_MCP_TOKEN` 指纹一致。
+- L0 环境初始化只经生产 domain/admin service：两个 synthetic B7 tenant（slug 含 round_id 与
+  `tenant-a`/`tenant-b`，`status=active`，不用真实客户名称）、每 tenant ≥2 synthetic 用户、
+  TenantWallet（各 2000 积分、初始 reserved=0）、用户周期额度 2000、License（含
+  `kol_selection`/`brand_analysis`/`campaign_analysis`/`kol_detail`/`utility`，支持后续
+  suspend/restore）、租户级 Pi Runtime Config（`runtime_backend=pi`、
+  `runtime_contract_version=marketing_runtime_v1`，draft→单独激活，append-only）。
+  全部创建幂等并写审计/账本；**禁止直接 INSERT/UPDATE `encrypted_runtime_secrets`**。
+- 数据库证据 `retained_by_policy`：tenant/用户/账本/Runtime Config/License/usage/lineage
+  保留至独立 reviewer 封口；清除需用户另行授权；证据目录永久保留。
+
+使用约束（违反即 B7_BLOCKED）：
+
+- 严禁连接 `kol_insight`、`kol_insight_test` 或任何开发/预生产/生产/正式客户数据库。
+- 禁止 DROP/CREATE/重建 `kol_insight_b7_uat`；禁止对其运行普通 pytest、离线 UAT harness
+  或迁移 downgrade。
+- 禁止使用 shell xtrace；禁止把任何密码/Token/API Key/DSN/Cookie/Authorization header/
+  HMAC 值/解密结果写入命令输出、日志、Git、Markdown、SSE 或 Artifact。
 
 1. 只能使用独立 B7 测试环境，与开发、预生产、生产环境物理或账户级隔离。
 2. 独立测试数据库（独立实例或独立 schema），不连接开发/预生产/生产数据库。
@@ -112,20 +183,23 @@ REAL_B7_<YYYYMMDDTHHMMSSZ>_<SHORT_COMMIT>
 
 ## 3. 凭证引用清单（只记录引用，不记录值）
 
-以下字段全部 `NEEDS_USER_APPROVAL`；任何情况下不得把凭证值写入 Markdown、Git、日志或命令行输出。
-「masked fingerprint」只允许 `••••` + 末 4 位或等效掩码形式。
+任何情况下不得把凭证值写入 Markdown、Git、日志或命令行输出。「masked fingerprint」只允许
+`••••` + 末 4 位或等效掩码形式。9 项凭证的 secret store reference 列已按 §2.0 专用环境
+核验（VERIFIED，只记引用不记值）；其余 6 列元数据（masked fingerprint / key version /
+owner / rotation/expiry / execution host / status）在 L0 只读核对后逐项固定——模式 A 填入
+阶段 B 授权模板，模式 B 逐字录入证据后视为固定值（未授权变化命中授权包 §3-18）。
 
 | 凭证变量 | secret store reference | masked fingerprint | key version | owner | rotation/expiry | execution host | status |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `TENCENT_PLAN_BASE_URL` | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL |
-| `TENCENT_PLAN_MODEL` | NEEDS_USER_APPROVAL | NOT_APPLICABLE（非密钥，模型名） | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL |
-| `TENCENT_PLAN_API_KEY` | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL |
-| `DATATAP_MCP_ORIGIN` | NEEDS_USER_APPROVAL | NOT_APPLICABLE（非密钥，origin） | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL |
-| `DATATAP_MCP_TOKEN` | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL |
+| `TENCENT_PLAN_BASE_URL` | VERIFIED：主仓库未跟踪文件 `backend/.env`（仅进程内读取） | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL |
+| `TENCENT_PLAN_MODEL` | VERIFIED：主仓库未跟踪文件 `backend/.env`（仅进程内读取） | NOT_APPLICABLE（非密钥，模型名） | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL |
+| `TENCENT_PLAN_API_KEY` | VERIFIED：主仓库未跟踪文件 `backend/.env`（仅进程内读取） | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL |
+| `DATATAP_MCP_ORIGIN` | VERIFIED：`https://datatap.deepminer.com.cn`（代码默认的已审核真实 origin；以授权 Runtime Config 的 `datatap_urls` 为准） | NOT_APPLICABLE（非密钥，origin） | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL |
+| `DATATAP_MCP_TOKEN` | VERIFIED：Keychain `com.kol-insight.real-b7-uat.datatap` / account `DATATAP_MCP_TOKEN` | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL |
 | `PI_GATEWAY_INTERNAL_SECRET` | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL |
-| `RUNTIME_SECRET_MASTER_KEYS` | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL |
+| `RUNTIME_SECRET_MASTER_KEYS` | VERIFIED：Keychain `com.kol-insight.real-b7-uat.runtime-secret-master-keys` / account `v1` | NEEDS_USER_APPROVAL | VERIFIED：`v1`（32 bytes，active version `v1`） | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL |
 | `JWT_SECRET` | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL |
-| MySQL credential reference | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL |
+| MySQL credential reference | VERIFIED：Keychain `com.kol-insight.real-b7-uat.mysql` / account `kol_b7_uat@127.0.0.1` | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL | NEEDS_USER_APPROVAL |
 
 约束：
 
@@ -200,9 +274,9 @@ B0 能力包），不计 MCP 积分：
 
 | 方向 | 主机 | 状态 |
 | --- | --- | --- |
-| 允许 | 模型端点 origin（`TENCENT_PLAN_BASE_URL` 的授权取值） | NEEDS_USER_APPROVAL |
-| 允许 | DataTap MCP origin（默认 `https://datatap.deepminer.com.cn`，VERIFIED 为代码默认值；测试环境实际取值以授权 Runtime Config 的 `datatap_urls` 为准） | NEEDS_USER_APPROVAL |
-| 允许 | FastAPI 控制面 origin（`PI_GATEWAY_CONTROL_PLANE_URL`；production 必须 HTTPS，仅 development/test 允许 loopback HTTP） | NEEDS_USER_APPROVAL |
+| 允许 | 模型端点 origin（`TENCENT_PLAN_BASE_URL` 的授权取值，阶段 B 模板固定） | NEEDS_USER_APPROVAL |
+| 允许 | DataTap MCP origin（默认 `https://datatap.deepminer.com.cn`，VERIFIED 为代码默认值；测试环境实际取值以授权 Runtime Config 的 `datatap_urls` 为准，阶段 B 模板固定） | NEEDS_USER_APPROVAL |
+| 允许 | FastAPI 控制面 origin（`PI_GATEWAY_CONTROL_PLANE_URL`；production 必须 HTTPS，仅 development/test 允许 loopback HTTP；阶段 B 模板固定） | NEEDS_USER_APPROVAL |
 | 禁止 | 上述之外的一切主机：未登记供应商、对象存储、遥测/分析端点、模型自行决定的任意 URL、Pi 内建工具可达的本地资源与 shell | VERIFIED（禁止规则本身为代码强制：Worker `noTools:"builtin"`、adapter `hostConfigDiscovery:"off"`、ResourceLoader 全量关闭自动发现） |
 
 digest 漂移处置：catalog/schema digest 与授权记录不一致时，registry 自动隔离该工具；
@@ -210,7 +284,10 @@ digest 漂移处置：catalog/schema digest 与授权记录不一致时，regist
 
 ## 5. 预算授权表
 
-以下金额/上限全部由用户填写并批准；本计划不预填任何数值。固定项已标注 VERIFIED。
+以下金额/上限全部由用户在授权模板中填写并批准（模式 A：阶段 B 模板；模式 B：一次性模板）；
+本计划不预填任何数值。固定项已标注 VERIFIED。13 个待批数值：最大 round 数、最大 Run 数、
+每场景最大 Run 数、最大 MCP 外发次数、单 Run 最大 MCP 次数、测试钱包初始余额、最大允许积分
+净支出、用户周期额度、最大模型请求数、最大输入 token、最大输出 token、最大模型费用、最大执行时长。
 
 | 字段 | 值 | 状态 |
 | --- | --- | --- |
@@ -230,33 +307,46 @@ digest 漂移处置：catalog/schema digest 与授权记录不一致时，regist
 | 最大执行时长 | 由用户批准 | NEEDS_USER_APPROVAL |
 | 达到预算后的行为 | 立即停止整个 round（不自动重试、不进入后续场景） | VERIFIED（本计划强制） |
 
+本次执行（模式 B）用户已批准的 13 项数值以其 2026-08-12 一次性授权消息为唯一权威来源，
+round 开启时逐字录入 `authorization.md` 与 manifest 帧；本表不复制具体数值。
+
 ## 6. 场景矩阵
 
-授权层级：`L0`（零外部调用预检，不授权任何真实连接）→ `L1`（最小真实冒烟，需独立批准）→
-`L2`（完整真实 B7，需独立批准）。标记 `+D(...)` 的场景包含 destructive test-state change，
-必须由用户在授权文本中逐项显式开启，不能由通用授权隐含允许。
+授权层级：`L0`（零外部调用预检）→ `L1`（最小真实冒烟）→ `L2`（完整真实 B7）。授权模式见
+§7：模式 A 下 L0 由阶段 A `L0_PRECHECK_AUTHORIZATION` 授权、L1/L2 由阶段 B
+`REAL_B7_CALL_AUTHORIZATION` 授权（阶段 A 之后的另一条独立新消息）；模式 B 下 L0→L1→L2
+由单条一次性授权消息（`ONESHOT_FULL_AUTHORIZATION`）整体授权。无论哪种模式，在授权消息被
+完整确认之前，任何真实模型/DataTap/钱包操作均禁止。标记 `+D(...)` 的场景包含 destructive
+test-state change，必须由用户在授权文本中逐项显式开启，不能由通用授权隐含允许。
 
 所有场景的预算上限均 `NEEDS_USER_APPROVAL`，且不得超出 §5 全局预算；停止条件均为
 「命中授权包 §3 任一硬停止条件即终止整个 round」，下文不再逐场景重复全局条件，只列
 场景特有停止条件。
 
-### 6.1 Level 0：零外部调用预检（12 项）
+### 6.1 Level 0：零外部调用预检（初始化 + 12 项预检）
 
-L0 不发起任何真实模型/DataTap/钱包连接；数据库只读核对仅限测试环境。任一失败即停止，
-不进入 L1。
+L0 不调用真实模型/DataTap，不发生任何 Run 级计费（reserve/settle/release）。专用库当前为空
+（§2.0），L0 授权包含一次性的环境初始化例外：只经生产 domain/admin service 幂等创建
+synthetic 测试数据（两个 tenant、每 tenant ≥2 用户、TenantWallet 各 2000 积分且 reserved=0、
+用户周期额度 2000、含 `kol_selection`/`brand_analysis`/`campaign_analysis`/`kol_detail`/
+`utility` 的 License、租户级 Pi Runtime Config draft→单独激活），全部写审计/账本，禁止直接
+INSERT/UPDATE `encrypted_runtime_secrets`。除该初始化外，L0 只允许本地构建、对专用库只读
+访问（Runtime Config、License、TenantWallet 与 quota 元数据，SELECT only）、创建证据目录并
+写入首帧。任一失败即停止，不进入 L1；模式 A 下也不得提出阶段 B。
 
 | ID | 预检项 | 通过判据 | 状态 |
 | --- | --- | --- | --- |
-| L0-01 | Git commit/branch 核对 | 与授权文本一致、工作树干净 | NEEDS_USER_APPROVAL |
+| L0-00 | 专用库环境初始化（幂等，仅 domain/admin service） | 两 tenant 各有独立 active Runtime Config；`encrypted_runtime_secrets` 存在 `datatap_token`/`model_api_key`/`model_base_url`/`datatap_url:*` 密文行（只记 masked/fingerprint/key_version）；RuntimeConfigService 内存内解密一致性核验（只写 true/false）；DataTap token 指纹与 Keychain 一致；新 Run 绑定 active config snapshot | NEEDS_USER_APPROVAL |
+| L0-01 | Git commit/branch 核对 | `git rev-parse HEAD` 与阶段 A 授权文本逐字一致、工作树干净；不一致即授权作废 | NEEDS_USER_APPROVAL |
 | L0-02 | migration head 核对 | `alembic heads` 唯一且为 `0043_billing_downgrade_guard` | NEEDS_USER_APPROVAL |
 | L0-03 | 依赖版本核对 | `npm ls --depth=0` 与锁定版本一致；后端依赖与授权记录一致 | NEEDS_USER_APPROVAL |
-| L0-04 | Gateway build 核对 | 从授权 commit 全新构建，dist 摘要落 evidence | NEEDS_USER_APPROVAL |
+| L0-04 | Gateway build 核对 | 从 execution commit 全新构建，dist 摘要落 evidence（`dependency-versions.json`） | NEEDS_USER_APPROVAL |
 | L0-05 | Runtime Config/License 形状核对 | append-only、scope/status/版本号符合 §2；只读查询 | NEEDS_USER_APPROVAL |
 | L0-06 | catalog/schema digest 核对 | 测试环境目录全部 approved+enabled，digest 落 `catalog-digests.json` | NEEDS_USER_APPROVAL |
-| L0-07 | 租户/用户隔离配置核对 | ≥2 测试租户、每租户 ≥2 测试用户、membership 形状正确 | NEEDS_USER_APPROVAL |
+| L0-07 | 租户/用户隔离配置核对 | ≥2 测试租户、每租户 ≥2 测试用户、membership 形状正确；只读 | NEEDS_USER_APPROVAL |
 | L0-08 | 钱包/额度配置形状核对 | 测试钱包初始余额、预留=0、用户周期额度形状；只读 | NEEDS_USER_APPROVAL |
 | L0-09 | kill switch/current 回滚准备核对 | 配置可置位、回滚路径演练脚本就绪（不执行真实切换） | NEEDS_USER_APPROVAL |
-| L0-10 | append-only evidence 目录可写核对 | 创建 `<round_id>/` 并写入 `authorization.md`/`manifest.json` 首帧 | NEEDS_USER_APPROVAL |
+| L0-10 | append-only evidence 目录可写核对 | 创建 `<round_id>/` 并写入 `authorization-phase-a.md` 与 `manifest.jsonl` 首帧（round_opened），flush/fsync 成功 | NEEDS_USER_APPROVAL |
 | L0-11 | 日志脱敏检查 | 抽查启动日志无 token/key/DSN/手机号明文 | NEEDS_USER_APPROVAL |
 | L0-12 | 网络出口核对 | 进程外发目标仅 §4.3 允许主机（静态配置核对，不发真实请求） | NEEDS_USER_APPROVAL |
 
@@ -266,13 +356,13 @@ L0 不发起任何真实模型/DataTap/钱包连接；数据库只读核对仅�
 | --- | --- |
 | 场景 ID | L1-SMOKE |
 | 形状 | 单租户、单用户、单 Run、单个已审核只读 MCP 工具、一次外发、固定最多 10 积分 |
-| 候选工具 | `match_best_tag`（insight-cube-mcp）；最终工具选择 NEEDS_USER_APPROVAL |
+| 候选工具 | `match_best_tag`（insight-cube-mcp）；最终工具选择由阶段 B 模板固定，NEEDS_USER_APPROVAL |
 | 真实模型 / 真实 DataTap | 是 / 是（各一次） |
 | 验证点 | durable preflight 提交 → adapter 外发 → finalize 全链路；Evidence、租户账本（恰好 −10）、usage 记录、审计行齐备 |
 | 禁止事项 | 禁止自动重试；失败立即停止，不进入 L2 |
 | 预期 terminal | `completed`（或稳定分类的失败——仍判 L1 不通过并停止） |
 | 回滚动作 | 无需状态回滚；证据保留 |
-| 授权级别 | L1（需用户在授权文本中单独开启） |
+| 授权级别 | L1（模式 A：由阶段 B 授权文本；模式 B：由一次性授权文本的「允许的 Level」与「最终 L1 MCP 工具」字段单独开启） |
 
 ### 6.3 Level 2：完整真实 B7（20 个场景）
 
@@ -418,12 +508,79 @@ L0 不发起任何真实模型/DataTap/钱包连接；数据库只读核对仅�
 场景特有停止条件：存在无法有界退出的进程/租约即停（全局硬停止）
 回滚动作：按批准策略完成清理｜授权级别 L2+D(测试数据清理)
 
-## 7. 授权流程
+## 7. 授权流程（两种合法模式）
 
-1. 用户阅读本计划与配套授权包，逐字段填写授权文本模板（授权包 §5）并在**新消息**中完整确认。
-2. operator 按 §1.1 生成 round_id，创建证据目录并写入 `authorization.md` 首帧。
-3. 按 L0 → L1 → L2 顺序执行；L1 失败不得进入 L2；任一层级命中硬停止条件即终止整个 round。
-4. 每个场景结束即追加证据；round 结束由 independent reviewer 出具 `verdict.md`
-   （B7_PASS / B7_FAIL / B7_BLOCKED）。
-5. 停止或失败后：保留 append-only 证据、不覆盖不删除失败 round、不在同一 round 修代码、
+授权有两种合法模式，由用户选择；本次执行（2026-08-12）用户已选择**模式 B**：
+
+- 模式 A（推荐）：两阶段授权。阶段 A（`L0_PRECHECK_AUTHORIZATION`）与阶段 B
+  （`REAL_B7_CALL_AUTHORIZATION`）必须由用户在**两条独立的新消息**中分别完整确认；阶段 B
+  消息必须晚于阶段 A 且晚于 L0 全部通过。
+- 模式 B：一次性完整授权（`ONESHOT_FULL_AUTHORIZATION`）。用户在**一条新消息**中明确填写
+  全部字段，一次性授权 L0→L1→L2 连续执行，无需第二条授权消息。
+
+授权文本模板见授权包 §5（§5.1/§5.2 为模式 A，§5.3 为模式 B）；所有模板均不存在任何可留空
+后补的字段，任何留空/占位项视为未授权。模式 B 不降低任何预算、隔离、destructive 开关或
+停止条件要求：预算表（§5）、隔离要求（§2）、8 个 destructive 逐项开关、19 条硬停止条件与
+模式 A 完全相同；L0 任一失败仍必须停止，L1 失败不得进入 L2。
+
+### 7.1 模式 A 阶段 A：L0_PRECHECK_AUTHORIZATION
+
+1. operator 在提出授权之前：确认工作树干净、位于授权包最终修复提交之后的分支尖端，
+   以 `git rev-parse HEAD` 取得 execution commit，并按 §1.1 构造完整确定的 round_id。
+   本步骤只读：不得创建任何目录、不得连接任何环境（数据库/模型/DataTap/钱包）。
+2. operator 按授权包 §5.1 模板预填全部字段（round_id、execution commit SHA、branch、
+   migration head、隔离测试环境标识、隔离测试数据库引用、operator、reviewer、时间窗口、
+   evidence directory 等），提交给用户。
+3. 用户在**新消息**中完整确认阶段 A 授权文本（`authorization message reference` 填
+   `THIS_MESSAGE`）。operator 收到后只做记录：把平台消息 ID/任务 ID、收到时刻（UTC）与
+   授权文本全文的 SHA-256 写入 `authorization-phase-a.md`（L0-10），不得修改用户原文。
+4. 阶段 A 仅授权四件事：本地构建（不连接任何外部环境）、专用库环境初始化（仅经生产
+   domain/admin service 幂等写入并写审计/账本，见 §6.1 L0-00；禁止直接写
+   `encrypted_runtime_secrets`）、专用库只读预检（Runtime Config/License/TenantWallet/
+   quota 元数据，SELECT only）、证据目录创建与首帧写入。
+5. 阶段 A 明确禁止：真实模型调用、DataTap 外发、Run 级计费（reserve/settle/release）
+   与初始化之外的任何钱包/额度变更、一切 destructive state change。
+6. 按 §6.1 执行 L0-00…L0-12；任一失败即停止，阶段 B 不得提出。
+
+### 7.2 模式 A 阶段 B：REAL_B7_CALL_AUTHORIZATION
+
+1. 仅在 L0 全部通过后准备。operator 按授权包 §5.2 模板预填：与阶段 A 完全一致的 round_id
+   与 execution commit SHA；L0 固定值（Gateway build hash、dependency snapshot、
+   catalog/schema digests、Runtime Config ID/version、License ID/version、
+   tenant/user/gateway IDs）；三个网络 origin（模型/DataTap/FastAPI 控制面）；9 项凭证的
+   reference/fingerprint/key version/owner/expiry/host/status（只记录引用与掩码）；
+   最终 L1 MCP 工具、13 个预算数值、允许的 Level、8 个 destructive 开关、清理/保留策略。
+2. 用户必须在**另一条新消息**中完整确认阶段 B 授权文本，并再次确认授权包 §3 全部 19 条
+   硬停止条件生效。operator 按 §7.1.3 同样规则记录消息引用并写入
+   `authorization-phase-b.md`（首个真实调用之前）。
+3. 阶段 B 确认之前，任何真实模型/DataTap/钱包操作均禁止；确认之后也只允许按授权的
+   Level、预算、工具与 destructive 开关执行，不得超出。
+
+### 7.3 模式 B：ONESHOT_FULL_AUTHORIZATION（一次性完整授权）
+
+1. operator 在提出授权之前：确认工作树干净、位于授权包最终修复提交之后的分支尖端，
+   以 `git rev-parse HEAD` 取得 execution commit 候选，并按 §1.1 给出 round_id 身份规则。
+   本步骤只读：不得创建任何目录、不得连接任何环境（数据库/模型/DataTap/钱包）。
+2. operator 按授权包 §5.3 模板预填全部字段，提交给用户；用户在**一条新消息**中完整确认
+   （`authorization message reference` 填 `THIS_MESSAGE`）。operator 收到后只做记录：
+   平台消息 ID/任务 ID、收到时刻（UTC）与授权文本全文 SHA-256，round 开启时写入
+   `authorization.md`（L0-10），不得修改用户原文。
+3. 启动门禁（fail-closed，任一不符即 B7_BLOCKED）：工作树干净、HEAD 为 `61576f7…`
+   （last production-code baseline）的线性后代且基线至 HEAD 区间仅文档变更、§2.0 数据库
+   身份逐项核验（含专用账号访问 `kol_insight` 被 MySQL 1142 拒绝）、Keychain 引用可读取
+   （值仅进程内）。2026-08-12 首次尝试即因工作树未提交改动在此 fail-closed。
+4. 启动门禁通过后按 §6.1 执行 L0-00…L0-12；任一失败即停止，不进入 L1。L0 产出值
+   （tenant/user/gateway IDs、Runtime Config/License ID/version、Gateway build hash、
+   catalog/schema digests）逐字录入证据后视为授权固定值，任何未授权变化命中授权包 §3-18。
+5. L0 全部通过后进入 L1；L1 通过后进入 L2；L1 失败不得进入 L2。全程不存在第二条授权
+   消息要求。
+6. 模式 B 授权消息即完整授权面：执行不得超出其 Level、预算、工具、网络 origin 与
+   destructive 开关。
+
+### 7.4 执行与收口
+
+1. 按 L0 → L1 → L2 顺序执行；L1 失败不得进入 L2；任一层级命中硬停止条件即终止整个 round。
+2. 每个场景结束即按授权包 §2 追加证据帧（flush/fsync）；round 结束由 independent reviewer
+   出具 `verdict.md`（B7_PASS / B7_FAIL / B7_BLOCKED）并写入 `hashes.sha256` 封口。
+3. 停止或失败后：保留 append-only 证据、不覆盖不删除失败 round、不在同一 round 修代码、
    不自动新建下一 round；修复与新授权是下一轮的前提。
