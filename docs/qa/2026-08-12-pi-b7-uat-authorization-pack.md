@@ -6,10 +6,11 @@
 授权流程 §7：模式 A 两阶段 / 模式 B 一次性）。
 
 ```text
-Status: AUTHORIZED_MODE_B_ROUND_NOT_OPENED（用户 2026-08-12 已按模式 B 一次性完整授权
-L0→L1→L2；round 尚未开启——首次执行尝试在启动门禁 fail-closed（B7_BLOCKED，工作树未提交
-改动）；execution commit 为授权包最终修复提交后的 clean HEAD 候选）
-Real external calls authorized: ROUND_SCOPED（仅 round 内、启动门禁与 L0/L1 门禁全部通过后按授权消息执行；round 外仍禁止）
+Status: READY_FOR_REAL_B7_UAT_REAUTHORIZATION（round REAL_B7_20260812T045636Z_b801c490 已执行并封存：
+L0 通过；L1 FAIL——mcp_tool_identity_invalid，0 外发 0 扣费，账务恒等式成立；按「L1 失败不得
+进入 L2」规则终止。修复轮（§6.6）已收口；旧一次性授权已随失败 round 消费完毕，真实 B7 必须
+由用户按 §5.3 模板重新授权）
+Real external calls authorized: NO（旧授权已随失败 round 封存；新授权前任何真实外部调用禁止）
 Production cutover authorized: NO
 Historical Task 9 rerun authorized: NO
 Plan C authorized: NO
@@ -21,10 +22,13 @@ Plan C authorized: NO
 
 状态流转说明：授权包第一版（`f7ab159`）经 2026-08-12 架构复核（Critical 0 / Important 3 /
 Minor 1）进入 `NEEDS_AUTHORIZATION_PACK_REPAIR`；修复轮第一版关闭全部发现（§6.1–§6.4）。
-第二轮修复（§6.5）：用户选定模式 B（一次性完整授权 L0→L1→L2）为本次执行授权形态，模式 A
-（两阶段）保留为推荐流程；专用隔离环境绑定写入计划 §2.0；首次执行尝试在启动门禁
-fail-closed（B7_BLOCKED：工作树未提交改动，未开启 round、未连接任何环境）。execution
-commit 为授权包最终修复提交后的 clean HEAD 候选，round_id 以其前 8 位生成（计划 §1.1）。
+第二轮修复（§6.5）：用户选定模式 B（一次性完整授权 L0→L1→L2），专用隔离环境绑定写入
+计划 §2.0。模式 B round `REAL_B7_20260812T045636Z_b801c490` 于 2026-08-12 执行：启动门禁
+与 L0 全部通过；L1 因真实模型经通用 mcp 代理以裸 remote 名寻址被 `mcp_tool_identity_invalid`
+拦截（0 外发、0 扣费、19 条硬停止无一触发）而 FAIL，按规则终止并封存（证据目录只读）。
+第三轮修复（§6.6）：MCP 通用代理身份映射 + adapter toolPrefix + Evidence 生成器 +
+L0/L1-00 流程与封口角色修订；状态进入 `READY_FOR_REAL_B7_UAT_REAUTHORIZATION`——
+真实 B7 必须由用户按 §5.3 模板重新授权（execution commit 为修复提交后的 clean HEAD）。
 
 ## 1. 授权包范围
 
@@ -54,8 +58,9 @@ docs/qa/evidence/pi-b7/<round_id>/
   dependency-versions.json    # 单次写入不可变快照：npm ls --depth=0、后端依赖快照、Gateway dist build hash
   catalog-digests.json        # 单次写入不可变快照：Level 0 读取的目录行 internal_name/service/digest/review_status
   process-cleanup.txt         # 单次写入文本（L2-20）：进程/端口/租约/nonce/测试数据收口记录
-  verdict.md                  # 单次写入（仅封口）：独立 reviewer 判定 B7_PASS / B7_FAIL / B7_BLOCKED + 理由
-  hashes.sha256               # 单次写入（仅封口）：上述全部文件的 SHA-256（自身除外）
+  operator-summary.md         # operator 执行摘要（单次写入；非 reviewer 结论）
+  verdict.md                  # 单次写入（仅 independent reviewer 封口）：判定 B7_PASS / B7_FAIL / B7_BLOCKED + 理由
+  hashes.sha256               # 单次写入（仅 independent reviewer 封口最后一步）：上述全部文件的 SHA-256（自身除外）
 ```
 
 规则：
@@ -104,9 +109,12 @@ flush/fsync），写后不可变；`authorization.md`（模式 B，L0-10）/ `au
 （模式 A，L0-10）/ `authorization-phase-b.md`（模式 A，阶段 B 确认后、首个真实调用前）/
 `process-cleanup.txt`（L2-20）各自单次写入，写后不可变。
 
-**封口**：`verdict.md` 与 `hashes.sha256` 只在封口时各写一次。`hashes.sha256` 覆盖目录内
-除自身外全部文件（每行 `<sha256>  <相对路径>`）；`verdict.md` 记录每个 `.jsonl` 的末帧
-`record_hash`（chain head）以便肉眼比对。封口后目录内任何文件不得再变动。
+**封口（角色分离）**：operator 只允许追加 `execution_completed` / `execution_stopped` manifest
+帧并单次写入 `operator-summary.md`；operator **禁止**写 `round_sealed` 帧、`verdict.md`、
+`hashes.sha256`。independent reviewer 复核后追加 reviewer 帧与 `round_sealed` 帧（记录每个
+`.jsonl` 的末帧 `record_hash` 链头以便肉眼比对），单次写入 `verdict.md`，最后单次写入
+`hashes.sha256`（覆盖目录内除自身外全部文件，每行 `<sha256>  <相对路径>`，含 verdict.md）。
+封口后目录内任何文件不得再变动。历史失败 round 的证据目录只读封存，禁止补写、修改或覆盖。
 
 ### 2.3 manifest.jsonl 帧必须记录的字段（位于帧 payload 内）
 
@@ -151,7 +159,9 @@ flush/fsync），写后不可变；`authorization.md`（模式 B，L0-10）/ `au
 
 1. 任何凭证或 secret 泄露（含证据、日志、命令行输出、SSE、管理响应）。
 2. 请求到达 §4.3（授权计划）allowlist 之外的主机。
-3. catalog/schema digest 漂移（含新工具出现、已审核工具签名变化）。
+3. catalog/schema digest 漂移（含新工具出现、已审核工具签名变化），或授权计划 §2.1 固定
+   quarantine 基线（`insight-cube-mcp`/`query_user_info` 的 digest、行数、review_status）
+   发生任何变化。
 4. 出现跨租户数据、事件、Artifact 或账务记录。
 5. 同一逻辑 MCP 调用重复外发。
 6. 未完成 durable preflight 就发生外发。
@@ -161,7 +171,8 @@ flush/fsync），写后不可变；`authorization.md`（模式 B，L0-10）/ `au
 10. 出现多个 terminal。
 11. Artifact/Version/Evidence lineage 不一致。
 12. Excel 和 BI 未绑定同一 Version。
-13. 预算任一上限达到（授权计划 §5 任一字段）。
+13. 预算任一上限达到（授权计划 §5 任一字段）；L1-SMOKE 的模型逻辑请求达到 2 次上限时，
+    在第 3 次请求发生前即停（SDK/业务自动重试一律禁止）。
 14. 证据帧无法追加或落盘（write/flush/fsync 失败），或 hash-chain 校验发现篡改/损坏。
 15. 外部超时或错误无法稳定分类。
 16. Gateway/worker 无法有界退出。
@@ -371,15 +382,20 @@ REAL B7 UAT 一次性完整授权确认（ONESHOT_FULL_AUTHORIZATION，模式 B�
   - 模型配置: 主仓库未跟踪文件 backend/.env（TENCENT_PLAN_BASE_URL / TENCENT_PLAN_MODEL / TENCENT_PLAN_API_KEY，仅进程内）
 - L0 授权范围（零模型/DataTap 外发；任一失败即停止）:
   - 本地构建（不连接任何外部环境）: <YES>
+  - L0 控制面以 loopback 占位 DATATAP_MCP_ORIGIN 启动（零真实 discovery；真实 discovery 仅属 L1-00）: <YES>
   - 专用库环境初始化（仅经生产 domain/admin service，幂等 + 审计/账本：两个 synthetic
     tenant、每 tenant ≥2 synthetic 用户、TenantWallet 各 2000 积分且 reserved=0、用户周期
     额度 2000、License 含 kol_selection/brand_analysis/campaign_analysis/kol_detail/utility、
     租户级 Pi Runtime Config draft→单独激活；禁止直接写 encrypted_runtime_secrets）: <YES>
   - 专用库只读预检（Runtime Config/License/TenantWallet/quota 元数据，SELECT only）: <YES>
   - 证据目录创建与首帧写入: <YES>
+- L1-00 外部调用预检（真实 discovery，仅 negotiation/list-tools；0 ToolCall、0 积分、0 模型请求）: <YES>
+- 固定 quarantine 基线确认（insight-cube-mcp / query_user_info /
+  digest aa4933db9542bc5802a6a1a31b6dd274ea08e562ca01cf1ef1f1fd2a56afeb49 / quarantined；
+  不登记 allowlist、不进入 claim adapter_catalog；digest、行数或状态任何变化即硬停止）: <YES>
 - L1 授权范围（单 tenant/单 user/单 Run；失败不得进入 L2；禁止自动重试）:
   - 最终 L1 MCP 工具: <服务 slug / 工具内部名，如 insight-cube-mcp / match_best_tag>
-  - 上限: ≤1 次模型请求、≤1 次 DataTap 外发、≤10 积分: <YES>
+  - 上限: 最多 2 次模型逻辑请求（第一次工具调用、第二次消费结果并完成；第 3 次请求发生前硬停止）、≤1 次 DataTap 外发、≤10 积分: <YES>
 - L2 授权范围: L2-01 至 L2-20 全部 20 个场景；核验场景复用已有 Run/Artifact；unknown 禁止自动重放: <YES>
 - 允许的 Level: <L1 / L1+L2>
 - 预算（13 项，全部必填数值）:
@@ -430,8 +446,10 @@ READY 状态均不构成授权之外的执行许可。
 状态进入 `NEEDS_AUTHORIZATION_PACK_REPAIR`。修复轮第一版为纯文档修复（不执行真实 B7、
 不连接任何环境、不创建真实 round、不修改生产代码或迁移），全部 4 项发现关闭。第二轮修复
 （§6.5，同为纯文档）：用户选定模式 B 一次性完整授权为本次执行形态，专用隔离环境绑定写入
-计划 §2.0；状态进入 `AUTHORIZED_MODE_B_ROUND_NOT_OPENED`——授权消息存在，round 未开启，
-不代表真实 B7 已执行或可绕过启动门禁。
+计划 §2.0；状态进入 `AUTHORIZED_MODE_B_ROUND_NOT_OPENED`。该 round
+（`REAL_B7_20260812T045636Z_b801c490`）随后执行：L0 通过、L1 FAIL（
+`mcp_tool_identity_invalid`），按规则终止封存；第三轮修复（§6.6）后状态进入
+`READY_FOR_REAL_B7_UAT_REAUTHORIZATION`——旧授权已消费，真实 B7 需重新授权。
 
 ### 6.2 逐项关闭证据
 
@@ -526,3 +544,51 @@ READY 状态均不构成授权之外的执行许可。
   通过；提交后工作树干净。
 - 本轮未运行 pytest/npm/构建/迁移/UAT；未启动 Gateway/FastAPI；未连接数据库/模型/DataTap；
   未读取 Keychain 明文；未创建 round。
+
+### 6.6 第三轮修复（2026-08-12：L1 失败根因修复 + 流程修订）
+
+背景：模式 B round `REAL_B7_20260812T045636Z_b801c490` 执行——启动门禁与 L0 全部通过，
+L1-SMOKE 中真实模型经通用 `mcp` 代理工具以裸 remote 名（`match_best_tag`）寻址，计费扩展的
+代理分支只接受 prefixed 名（`insight_cube_mcp_match_best_tag`），必然本地拦截
+`mcp_tool_identity_invalid`：0 外发、0 扣费、0 ToolCall，账务恒等式成立，19 条硬停止无一
+触发。按「L1 失败不得进入 L2」终止并封存（operator 结论 B7_FAIL，证据目录只读，留待
+independent reviewer 封口）。离线 UAT 此前未暴露该分歧：fake model 脚本只发 prefixed 名。
+
+代码与测试修复（修复分支 `codex/real-b7-l1-repair`，本轮不执行真实 B7）：
+
+- `pi-gateway/src/mcp-accounting-extension.ts`：通用代理分支改为接受全部已审核寻址形式——
+  catalog 内部名（= adapter_visible_name）、裸 remote 名、旧 prefixed 名；无 server 时按
+  bindings 全局唯一性推导 server；重名且无 server 本地 fail-closed
+  `mcp_tool_identity_ambiguous`；未知名 `mcp_tool_identity_invalid`；两者均 0 preflight、
+  0 外发；禁止对重名候选取第一个；计费身份恒为 catalog 内部名。修正「proxy 只暴露 prefixed
+  名」的错误注释。
+- `pi-gateway/src/resource-loader.ts`：`.mcp.json` 增加 `toolPrefix: "none"`——adapter 的
+  模型可见名与 claim 投影的裸名对齐（此前默认前缀模式下裸名在 adapter 分发面
+  `tool_not_found`）；prefixed 旧名仍由扩展映射身份，但分发面不再接受，fail-closed
+  释放不计费。
+- 离线 UAT（`backend/tests/integration/`）：fake model 增加真实通用代理形状
+  （`step_mcp_proxy`，裸 remote 名、server 可选）；新增 5 个进程级场景——真实 L1 路径复现
+  （裸名全链路：durable preflight → fake 外发 → finalize → Evidence → ToolCall → 10 积分）、
+  无 server 唯一映射、重名 fail-closed、重名+显式 server 精确映射、旧 prefixed 名安全失败
+  不计费；红灯复现（修复前扩展 → 0 外发断言失败）与绿灯证据齐备。
+- `backend/scripts/b7_evidence.py`（新增，已跟踪）：可复用 B7 证据生成器——canonical JSONL
+  hash chain（逐帧 flush/fsync、sequence/prev_hash/record_hash、外部链头锚点校验）、strict
+  pydantic DTO（terminal 封闭集合、run.started 不计入、error_code 拒绝模型名、账务恒等式
+  本地校验）、命名 ORM 属性 builder（禁止 positional 拼装）、跨文件一致性校验、correction
+  帧追加；`backend/tests/scripts/test_b7_evidence.py` 16 项单测。
+
+授权/封口流程修订（本包与计划）：
+
+- 计划 §2.1 固定 quarantine 基线（`insight-cube-mcp`/`query_user_info` + 精确 digest），
+  新授权消息必须显式确认，任何变化即硬停止（§3-3）。
+- 计划 §2.2/§6.1/§6.2：L0 保持零真实模型/DataTap 请求（控制面以 loopback 占位 origin 启动）；
+  真实 DataTap discovery 移到新增的 **L1-00 外部调用预检**（仅 negotiation/list-tools，
+  0 ToolCall、0 积分、0 模型请求）。
+- 计划 §6.2 与本包 §3-13/§5.3：L1 模型逻辑请求上限明确为最多 2 次（第一次工具调用、第二次
+  消费结果并完成；第 3 次请求发生前硬停止；禁止 SDK/业务自动重试）。
+- 封口角色分离（本包 §2、计划 §7.4）：operator 只能追加 `execution_completed`/
+  `execution_stopped` 帧与 `operator-summary.md`；`round_sealed` 帧、`verdict.md`、
+  `hashes.sha256` 只由 independent reviewer 写入；历史失败 round 禁止补写或覆盖。
+
+验证：见 `changelog/2026-08-12.md` 修复轮条目（vitest/typecheck/build/pytest/ruff/git checks
+全绿，全程离线）。

@@ -5,10 +5,11 @@
 > `docs/qa/2026-08-12-pi-b7-uat-authorization-pack.md`。
 
 ```text
-Status: AUTHORIZED_MODE_B_ROUND_NOT_OPENED（授权模式二选一：模式 A 两阶段 / 模式 B 一次性完整授权，见 §7；
-用户 2026-08-12 已按模式 B 一次性授权 L0→L1→L2；round 尚未开启——首次执行尝试在启动门禁
-fail-closed（B7_BLOCKED，工作树未提交改动），execution commit 为授权包最终修复提交后的 clean HEAD 候选）
-Real external calls authorized: ROUND_SCOPED（仅 round 内、启动门禁与 L0/L1 门禁全部通过后按授权消息执行；round 外仍禁止）
+Status: READY_FOR_REAL_B7_UAT_REAUTHORIZATION（授权模式二选一：模式 A 两阶段 / 模式 B 一次性完整授权，见 §7；
+模式 B round REAL_B7_20260812T045636Z_b801c490 已执行并封存：L0 通过、L1 FAIL（mcp_tool_identity_invalid，
+0 外发 0 扣费）按规则终止；授权包 §6.6 修复轮已收口。旧授权已消费——真实 B7 必须由用户重新授权，
+execution commit 为修复提交后的 clean HEAD）
+Real external calls authorized: NO（旧授权已随失败 round 封存；新授权前任何真实外部调用禁止）
 Production cutover authorized: NO
 Historical Task 9 rerun authorized: NO
 Plan C authorized: NO
@@ -58,9 +59,10 @@ Plan C authorized: NO
 **事实判读：** 本地离线 fake topology 通过 ≠ 真实 B7 通过；`READY_FOR_REAL_B7_UAT_REVIEW`
 ≠ `READY` 被确认，更不等于 B7 PASS 或 production ready。真实 B7 UAT 必须取得用户明确授权
 （§7 定义两种合法模式：模式 A 两阶段授权——阶段 A 只放行 L0 零外发预检、阶段 B 才放行真实
-模型/DataTap/钱包调用；模式 B 一次性完整授权 L0→L1→L2）。用户已于 2026-08-12 按模式 B
-授权本次执行；模式 B 不降低任何预算、隔离、destructive 开关或停止条件要求，L0 失败仍必须
-停止、L1 失败不得进入 L2。
+模型/DataTap/钱包调用；模式 B 一次性完整授权 L0→L1→L2）。2026-08-12 的模式 B round
+`REAL_B7_20260812T045636Z_b801c490` 已执行：L0 通过、L1 FAIL（`mcp_tool_identity_invalid`，
+0 外发 0 扣费），按规则终止并封存；该次授权已消费完毕。修复轮（授权包 §6.6）后的任何真实
+B7 执行都必须取得用户**新的**授权，且 L0 失败仍必须停止、L1 失败不得进入 L2。
 
 ## 1. Round 身份
 
@@ -86,15 +88,16 @@ REAL_B7_<YYYYMMDDTHHMMSSZ>_<SHORT_COMMIT>
   提出 round_id 并按所选模式重新取得授权。
 - round_id 一经写入证据目录 `authorization-phase-a.md`（模式 A）或 `authorization.md`
   （模式 B）即不可变；任何身份字段变化必须终止当前 round 并重新取得授权、新建 round。
-- **round 尚未开启**：2026-08-12 首次执行尝试在启动门禁 fail-closed（B7_BLOCKED：工作树
-  存在未提交改动），未创建任何目录、未连接任何环境；在启动门禁通过前，任何形如
+- **历史 round 记录**：2026-08-12 模式 B round `REAL_B7_20260812T045636Z_b801c490` 已执行
+  并封存（L0 通过、L1 FAIL 按规则终止，授权包 §6.6）；其证据目录只读封存，禁止补写、修改
+  或覆盖。任何新的真实 B7 执行必须取得用户新授权并生成新 round_id；在新授权前，任何形如
   `REAL_B7_*` 的目录均不得创建。
 
 ### 1.2 未来执行时必须固定的字段
 
 | 字段 | 当前值/来源 | 状态 |
 | --- | --- | --- |
-| 授权模式 | 模式 B（一次性完整授权 L0→L1→L2），用户 2026-08-12 授权消息选定；模式 A（两阶段）保留为推荐流程，见 §7 | VERIFIED |
+| 授权模式 | 模式 A（两阶段）/ 模式 B（一次性完整授权）二选一；2026-08-12 的模式 B 授权已随失败 round `REAL_B7_20260812T045636Z_b801c490` 消费完毕，新执行须重新授权 | NEEDS_USER_APPROVAL |
 | round_id | operator 在授权前提出的完整确定值或身份规则（§1.1）；模式 A：阶段 A 模板逐字确认、阶段 B 绑定同一值；模式 B：一次性模板确认身份规则，启动门禁通过时点展开为确定值 | NEEDS_USER_APPROVAL |
 | commit_sha | 授权包最终修复提交之后、启动门禁通过时点 `git rev-parse HEAD`（工作树干净）；`61576f7…` 仅为 last production-code baseline，`f7ab159…` 仅为第一版文档基线，均非执行身份 | NEEDS_USER_APPROVAL |
 | branch | `codex/marketing-capability-pack-b0` | VERIFIED |
@@ -115,9 +118,9 @@ REAL_B7_<YYYYMMDDTHHMMSSZ>_<SHORT_COMMIT>
 
 ## 2. 隔离环境要求（必须由用户逐项确认）
 
-以下每一项均为 `NEEDS_USER_APPROVAL`；任一项不能确认即不得进入 Level 1/2。其中第 1、2 项
-（独立环境与独立数据库）已由 §2.0 的专用环境满足并经 2026-08-12 核验；第 3–6 项由 L0 环境
-初始化（§6.1）在专用库内创建 synthetic 数据满足；其余为执行期要求。
+§2.3 列出的 12 项均为 `NEEDS_USER_APPROVAL`；任一项不能确认即不得进入 Level 1/2。其中第
+1、2 项（独立环境与独立数据库）已由 §2.0 的专用环境满足并经 2026-08-12 核验；第 3–6 项由
+L0 环境初始化（§6.1）在专用库内创建 synthetic 数据满足；其余为执行期要求。
 
 ### 2.0 本次授权绑定的专用隔离环境（2026-08-12 已创建并核验，VERIFIED）
 
@@ -165,6 +168,32 @@ REAL_B7_<YYYYMMDDTHHMMSSZ>_<SHORT_COMMIT>
 - 禁止使用 shell xtrace；禁止把任何密码/Token/API Key/DSN/Cookie/Authorization header/
   HMAC 值/解密结果写入命令输出、日志、Git、Markdown、SSE 或 Artifact。
 
+### 2.1 固定 quarantine 基线（known_quarantined，不可调用）
+
+2026-08-12 首次真实 discovery（失败 round `REAL_B7_20260812T045636Z_b801c490`）核验并固定：
+
+| service | remote_name | discovery_digest | review_status |
+| --- | --- | --- | --- |
+| `insight-cube-mcp` | `query_user_info` | `aa4933db9542bc5802a6a1a31b6dd274ea08e562ca01cf1ef1f1fd2a56afeb49` | `quarantined` |
+
+- 该工具为 DataTap 网关存在但未审核的历史工具：**不登记** `DYNAMIC_TOOL_ALLOWLIST`、
+  **不进入** claim `adapter_catalog`、preflight 不可达。
+- 新的授权消息必须显式确认本基线（精确 service/remote_name/digest）。
+- round 期间该基线的 digest、行数（恰 1 条）或 review_status 发生任何变化，立即硬停止
+  （授权包 §3-3）；不得在 round 中审批或豁免。
+- 已审核 29 个工具的 digest 以 L1-00 写入的 `catalog-digests.json` 为准。
+
+### 2.2 真实 DataTap discovery 的时机（L0 零外发边界）
+
+- L0 全程零真实模型/DataTap 请求：L0 阶段启动控制面时，`DATATAP_MCP_ORIGIN` 必须指向
+  loopback 占位（discovery 本地失败、注册中心继续启动、catalog 不变更、0 外发、0 ToolCall、
+  0 积分）。
+- 真实 DataTap discovery 只允许发生在 **L1-00 外部调用预检**（§6.2）：以真实 origin 重启
+  控制面，让 lifespan 完成真实 discovery（negotiation/list-tools），然后核验 29 个已审核
+  工具 digest 全一致 + §2.1 quarantine 基线不变，写入 `catalog-digests.json`。discovery 是
+  协商动作：0 ToolCall、0 积分。
+
+### 2.3 隔离环境要求（必须由用户逐项确认）
 1. 只能使用独立 B7 测试环境，与开发、预生产、生产环境物理或账户级隔离。
 2. 独立测试数据库（独立实例或独立 schema），不连接开发/预生产/生产数据库。
 3. 独立测试租户，至少两个，用于跨租户隔离验证；不复用任何正式客户租户。
@@ -325,8 +354,11 @@ test-state change，必须由用户在授权文本中逐项显式开启，不能
 
 ### 6.1 Level 0：零外部调用预检（初始化 + 12 项预检）
 
-L0 不调用真实模型/DataTap，不发生任何 Run 级计费（reserve/settle/release）。专用库当前为空
-（§2.0），L0 授权包含一次性的环境初始化例外：只经生产 domain/admin service 幂等创建
+L0 不调用真实模型/DataTap，不发生任何 Run 级计费（reserve/settle/release），也不发生真实
+DataTap discovery：L0 阶段启动控制面时 `DATATAP_MCP_ORIGIN` 必须指向 loopback 占位
+（discovery 本地失败、注册中心容错继续启动、catalog 不变更、0 外发、0 ToolCall、0 积分）；
+真实 discovery 只允许发生在 L1-00（§6.2，§2.2）。专用库当前为空（§2.0），L0 授权包含一次性的
+环境初始化例外：只经生产 domain/admin service 幂等创建
 synthetic 测试数据（两个 tenant、每 tenant ≥2 用户、TenantWallet 各 2000 积分且 reserved=0、
 用户周期额度 2000、含 `kol_selection`/`brand_analysis`/`campaign_analysis`/`kol_detail`/
 `utility` 的 License、租户级 Pi Runtime Config draft→单独激活），全部写审计/账本，禁止直接
@@ -342,7 +374,7 @@ INSERT/UPDATE `encrypted_runtime_secrets`。除该初始化外，L0 只允许本
 | L0-03 | 依赖版本核对 | `npm ls --depth=0` 与锁定版本一致；后端依赖与授权记录一致 | NEEDS_USER_APPROVAL |
 | L0-04 | Gateway build 核对 | 从 execution commit 全新构建，dist 摘要落 evidence（`dependency-versions.json`） | NEEDS_USER_APPROVAL |
 | L0-05 | Runtime Config/License 形状核对 | append-only、scope/status/版本号符合 §2；只读查询 | NEEDS_USER_APPROVAL |
-| L0-06 | catalog/schema digest 核对 | 测试环境目录全部 approved+enabled，digest 落 `catalog-digests.json` | NEEDS_USER_APPROVAL |
+| L0-06 | catalog 静态核对 | 代码 `DYNAMIC_TOOL_ALLOWLIST` 29 个工具登记完整；真实 digest 核对在 L1-00 进行（L0 不做真实 discovery，§2.2） | NEEDS_USER_APPROVAL |
 | L0-07 | 租户/用户隔离配置核对 | ≥2 测试租户、每租户 ≥2 测试用户、membership 形状正确；只读 | NEEDS_USER_APPROVAL |
 | L0-08 | 钱包/额度配置形状核对 | 测试钱包初始余额、预留=0、用户周期额度形状；只读 | NEEDS_USER_APPROVAL |
 | L0-09 | kill switch/current 回滚准备核对 | 配置可置位、回滚路径演练脚本就绪（不执行真实切换） | NEEDS_USER_APPROVAL |
@@ -350,14 +382,21 @@ INSERT/UPDATE `encrypted_runtime_secrets`。除该初始化外，L0 只允许本
 | L0-11 | 日志脱敏检查 | 抽查启动日志无 token/key/DSN/手机号明文 | NEEDS_USER_APPROVAL |
 | L0-12 | 网络出口核对 | 进程外发目标仅 §4.3 允许主机（静态配置核对，不发真实请求） | NEEDS_USER_APPROVAL |
 
-### 6.2 Level 1：最小真实冒烟（1 个场景，需独立批准）
+### 6.2 Level 1：最小真实冒烟（L1-00 外部调用预检 + 1 个场景，需独立批准）
+
+**L1-00 外部调用预检（0 ToolCall、0 积分）**：以真实 `DATATAP_MCP_ORIGIN` 重启控制面，完成
+真实 DataTap discovery（仅 negotiation/list-tools 协商动作）；核验 29 个已审核工具 digest
+与 discovery 全部一致、§2.1 quarantine 基线不变（恰 1 条、digest 相同、仍 quarantined），
+写入 `catalog-digests.json` 快照。任一不符即停止，不进入 L1-SMOKE。模型请求 0、MCP 工具
+调用 0、扣费 0。
 
 | 字段 | 内容 |
 | --- | --- |
 | 场景 ID | L1-SMOKE |
 | 形状 | 单租户、单用户、单 Run、单个已审核只读 MCP 工具、一次外发、固定最多 10 积分 |
 | 候选工具 | `match_best_tag`（insight-cube-mcp）；最终工具选择由阶段 B 模板固定，NEEDS_USER_APPROVAL |
-| 真实模型 / 真实 DataTap | 是 / 是（各一次） |
+| 真实模型 / 真实 DataTap | 是 / 是（DataTap 一次；模型最多 2 次逻辑请求，见下） |
+| 模型请求上限 | **最多 2 次逻辑请求**：第一次产出工具调用，第二次消费结果并完成；第 3 次请求发生前硬停止（SDK/业务自动重试一律禁止） |
 | 验证点 | durable preflight 提交 → adapter 外发 → finalize 全链路；Evidence、租户账本（恰好 −10）、usage 记录、审计行齐备 |
 | 禁止事项 | 禁止自动重试；失败立即停止，不进入 L2 |
 | 预期 terminal | `completed`（或稳定分类的失败——仍判 L1 不通过并停止） |
@@ -510,7 +549,7 @@ INSERT/UPDATE `encrypted_runtime_secrets`。除该初始化外，L0 只允许本
 
 ## 7. 授权流程（两种合法模式）
 
-授权有两种合法模式，由用户选择；本次执行（2026-08-12）用户已选择**模式 B**：
+授权有两种合法模式，由用户选择（2026-08-12 的模式 B round 已执行并封存，新执行须重新授权）：
 
 - 模式 A（推荐）：两阶段授权。阶段 A（`L0_PRECHECK_AUTHORIZATION`）与阶段 B
   （`REAL_B7_CALL_AUTHORIZATION`）必须由用户在**两条独立的新消息**中分别完整确认；阶段 B
@@ -577,10 +616,17 @@ INSERT/UPDATE `encrypted_runtime_secrets`。除该初始化外，L0 只允许本
 6. 模式 B 授权消息即完整授权面：执行不得超出其 Level、预算、工具、网络 origin 与
    destructive 开关。
 
-### 7.4 执行与收口
+### 7.4 执行与收口（角色分离）
 
-1. 按 L0 → L1 → L2 顺序执行；L1 失败不得进入 L2；任一层级命中硬停止条件即终止整个 round。
-2. 每个场景结束即按授权包 §2 追加证据帧（flush/fsync）；round 结束由 independent reviewer
-   出具 `verdict.md`（B7_PASS / B7_FAIL / B7_BLOCKED）并写入 `hashes.sha256` 封口。
-3. 停止或失败后：保留 append-only 证据、不覆盖不删除失败 round、不在同一 round 修代码、
-   不自动新建下一 round；修复与新授权是下一轮的前提。
+1. 按 L0 → L1-00 → L1 → L2 顺序执行；L1 失败不得进入 L2；任一层级命中硬停止条件即终止
+   整个 round。
+2. 每个场景结束即按授权包 §2 追加证据帧（flush/fsync）。
+3. **operator 的收口权限仅限**：追加 `execution_completed` / `execution_stopped` manifest 帧
+   与 operator summary 文本。operator **禁止**写 `round_sealed` 帧、`verdict.md`、
+   `hashes.sha256`。
+4. **independent reviewer 封口**：复核证据后追加 reviewer 帧与 `round_sealed` 帧，单次写入
+   `verdict.md`（B7_PASS / B7_FAIL / B7_BLOCKED），最后单次写入 `hashes.sha256`（覆盖目录内
+   除自身外全部文件，含 verdict.md）；此后证据目录不可变。
+5. 停止或失败后：保留 append-only 证据、不覆盖不删除失败 round、不在同一 round 修代码、
+   不自动新建下一 round；修复与新授权是下一轮的前提。**历史失败 round（如
+   `REAL_B7_20260812T045636Z_b801c490`）的证据目录只读封存，禁止补写、修改或覆盖。**

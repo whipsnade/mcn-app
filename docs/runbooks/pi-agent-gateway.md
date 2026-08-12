@@ -5,12 +5,15 @@
 否决）：真实 B7 UAT、生产切流和方案 C 均需要单独审批。
 
 状态更新（2026-08-12）：本地代码修复与架构复核已完成，复核结论 Critical 0 / Important 0 /
-Minor 1；代码状态维持 `READY_FOR_REAL_B7_UAT_REVIEW`。授权状态：用户已于 2026-08-12 按
-模式 B（一次性完整授权 L0→L1→L2）授权本次真实 B7 UAT——授权方案见
-`docs/superpowers/plans/2026-08-12-real-b7-uat-authorization-plan.md`（§7 两种授权模式、
-§2.0 专用隔离环境绑定）与 `docs/qa/2026-08-12-pi-b7-uat-authorization-pack.md`（§5.3 模式 B
-一次性授权模板）；round 尚未开启（首次执行尝试在启动门禁 fail-closed：工作树存在未提交
-改动，未连接任何环境）。在 round 实际开启并通过全部启动门禁前，不得执行真实外部调用，
+Minor 1；代码状态维持 `READY_FOR_REAL_B7_UAT_REVIEW`。模式 B round
+`REAL_B7_20260812T045636Z_b801c490` 已于同日执行：启动门禁与 L0 全部通过，L1-SMOKE 因
+真实模型经通用 mcp 代理以裸 remote 名寻址被 `mcp_tool_identity_invalid` 拦截（0 外发、
+0 扣费、19 条硬停止无一触发）而 FAIL，按规则终止封存。修复分支 `codex/real-b7-l1-repair`
+已修复通用代理身份映射（裸名/重名 fail-closed）并将 adapter 切到 `toolPrefix: "none"`，
+新增 B7 证据生成器（`backend/scripts/b7_evidence.py` + 单测）；授权计划与授权包同步修订
+（L1-00 discovery 预检、固定 quarantine 基线、L1 模型请求上限 2 次、operator/reviewer
+封口角色分离）。当前状态 `READY_FOR_REAL_B7_UAT_REAUTHORIZATION`：旧授权已随失败 round
+消费，真实 B7 必须由用户按授权包 §5.3 模板重新授权；在新授权前不得执行真实外部调用，
 也不得把状态写成 B7 PASS 或 production ready。
 
 ## 组件、版本与启动检查
@@ -156,8 +159,15 @@ active 版本转 retired，不修改已创建 Run 的 snapshot。
 - 环境初始化（两个 synthetic tenant、用户、各 2000 积分钱包、周期额度 2000、全能力 License、
   租户级 Pi Runtime Config）只经生产 domain/admin service 幂等完成并写审计/账本；禁止直接
   INSERT/UPDATE `encrypted_runtime_secrets`。
+- L0 全程零真实模型/DataTap 请求：L0 阶段控制面以 loopback 占位 `DATATAP_MCP_ORIGIN` 启动；
+  真实 DataTap discovery（仅 negotiation/list-tools，0 ToolCall、0 积分）只允许发生在
+  L1-00 外部调用预检（真实 origin 重启控制面后核验 29 个已审核工具 digest 与固定
+  quarantine 基线 `insight-cube-mcp`/`query_user_info`）。
 - 数据库证据 `retained_by_policy`：tenant/用户/账本/Runtime Config/License/usage/lineage
   保留至独立 reviewer 封口；清除需用户另行授权；证据目录永久保留。
+- 证据封口角色分离：operator 只追加 `execution_completed`/`execution_stopped` 帧与
+  `operator-summary.md`；`round_sealed` 帧、`verdict.md`、`hashes.sha256` 只由
+  independent reviewer 写入；历史失败 round 的证据目录只读封存，禁止补写或覆盖。
 
 ## 禁止事项与真实 UAT 停止门
 
