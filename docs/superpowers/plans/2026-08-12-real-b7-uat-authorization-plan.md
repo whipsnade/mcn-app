@@ -37,9 +37,10 @@ Plan C authorized: NO
 | 事实 | 值 | 核对来源 |
 | --- | --- | --- |
 | 分支 | `codex/marketing-capability-pack-b0` | `git status --short --branch` |
-| last production-code baseline | `61576f7a45c3a93063bdaae5328aefd67933df68`（最后一个触及代码的提交；其后 `58a88e0`、`f7ab159` 与全部授权包修复提交均为 docs-only） | `git log --oneline` |
+| 修复前 production baseline | `61576f7a45c3a93063bdaae5328aefd67933df68`（`codex/marketing-capability-pack-b0` 上最后一个触及代码的提交，失败 round `REAL_B7_20260812T045636Z_b801c490` 的代码即此线；仅为历史事实，不再是 execution gate 参照） | `git log --oneline` |
+| 已审核 L1 repair baseline | `68deca58f2d2cd8aafb96d9ea47a0a60462142fa`（`codex/real-b7-l1-repair`；含 `f8a4ffa`/`494d20e`/`c22a3a1`/`8a5f264`/`68deca5` 五个已审核修复提交，独立审查 Critical 0 / Important 0；**新 round 启动门禁的代码基线**） | `git log --oneline`（修复分支） |
 | 授权包第一版文档基线 HEAD | `f7ab159aaea379b37e3885381abe79cc3454bb41`（2026-08-12 第一版文档轮撰写时点的 `git rev-parse HEAD`，docs-only；仅为历史事实陈述，不是执行身份，也不是 execution commit 候选） | `git rev-parse HEAD`（撰写时点） |
-| execution commit（规则，不预写 SHA） | 等于授权包最终修复提交之后、执行启动门禁通过时点的 `git rev-parse HEAD`（工作树必须干净）；模式 A 由用户在阶段 A 授权文本中逐字确认，模式 B 由授权消息以身份规则绑定、执行时点现场核验；本文档不内嵌任何自指 SHA | 规则见 §1.1/§1.2 |
+| execution commit（规则，不预写 SHA） | 等于本门禁纠偏提交之后、执行启动门禁通过时点的 `git rev-parse HEAD`（工作树必须干净）；必须是已审核 L1 repair baseline `68deca58…` 的线性后代且包含全部五个修复提交；`68deca58…` 至 HEAD 区间只允许本次门禁纠偏的 Markdown/changelog 变更；模式 A 由用户在阶段 A 授权文本中逐字确认，模式 B 由授权消息以身份规则绑定、执行时点现场核验；本文档不内嵌任何自指 SHA | 规则见 §1.1/§1.2 |
 | 工作树状态 | 干净（无未提交变更） | `git status --short` |
 | `git diff --check` | 通过（无输出） | `git diff --check` |
 | 迁移 head | `0043_billing_downgrade_guard` | `backend/migrations/versions/` 目录序 |
@@ -76,10 +77,12 @@ REAL_B7_<YYYYMMDDTHHMMSSZ>_<SHORT_COMMIT>
   字符串构造：不得创建任何目录、不得连接任何环境（数据库/模型/DataTap/钱包）。
 - `<SHORT_COMMIT>`：execution commit SHA 的前 8 位小写十六进制（与 `git rev-parse
   --short=8` 一致）；模式 A 取用户最终批准值，模式 B 取启动门禁通过时点的 clean HEAD。
-- execution commit = 授权包最终修复提交之后、执行启动门禁通过时点 `git rev-parse HEAD` 的值
-  （工作树必须干净）。本文档与授权模板不预写该值——任何 commit 不得在自身内部硬编码自己的
-  SHA；`61576f7…` 与 `f7ab159…` 分别为 last production-code baseline 与第一版文档基线的
-  历史事实，均不构成执行身份。
+- execution commit = 本门禁纠偏提交之后、执行启动门禁通过时点 `git rev-parse HEAD` 的值
+  （工作树必须干净），且必须是已审核 L1 repair baseline `68deca58…` 的线性后代、包含
+  `f8a4ffa`/`494d20e`/`c22a3a1`/`8a5f264`/`68deca5` 五个修复提交；`68deca58…` 至 HEAD
+  区间只允许已审核的文档纠偏。本文档与授权模板不预写该值——任何 commit 不得在自身内部
+  硬编码自己的 SHA；`61576f7…`（修复前 production baseline）与 `f7ab159…`（第一版文档
+  基线）均为历史事实，不构成执行身份；不再要求 `61576f7…` 至 HEAD 为 docs-only。
 - round_id 必须由 operator 在授权确认**之前**以完整确定值或完整身份规则提出（模式 A：写入
   阶段 A 授权模板由用户逐字确认；模式 B：以「执行时点 clean HEAD 前 8 位」规则写入一次性
   授权模板由用户确认，执行时展开为确定值）；不存在任何"授权后由 operator 补填"的通道。
@@ -99,7 +102,7 @@ REAL_B7_<YYYYMMDDTHHMMSSZ>_<SHORT_COMMIT>
 | --- | --- | --- |
 | 授权模式 | 模式 A（两阶段）/ 模式 B（一次性完整授权）二选一；2026-08-12 的模式 B 授权已随失败 round `REAL_B7_20260812T045636Z_b801c490` 消费完毕，新执行须重新授权 | NEEDS_USER_APPROVAL |
 | round_id | operator 在授权前提出的完整确定值或身份规则（§1.1）；模式 A：阶段 A 模板逐字确认、阶段 B 绑定同一值；模式 B：一次性模板确认身份规则，启动门禁通过时点展开为确定值 | NEEDS_USER_APPROVAL |
-| commit_sha | 授权包最终修复提交之后、启动门禁通过时点 `git rev-parse HEAD`（工作树干净）；`61576f7…` 仅为 last production-code baseline，`f7ab159…` 仅为第一版文档基线，均非执行身份 | NEEDS_USER_APPROVAL |
+| commit_sha | 本门禁纠偏提交之后、启动门禁通过时点 `git rev-parse HEAD`（工作树干净；`68deca58…` 已审核 L1 repair baseline 的线性后代且含全部五个修复提交；区间仅已审核文档纠偏）；`61576f7…` 仅为修复前 production baseline，`f7ab159…` 仅为第一版文档基线，均非执行身份 | NEEDS_USER_APPROVAL |
 | branch | `codex/marketing-capability-pack-b0`（L1 修复在 `codex/real-b7-l1-repair`；新 round 的 execution commit 须落在包含该修复的分支/合并线上） | VERIFIED |
 | migration_head | `0043_billing_downgrade_guard` | VERIFIED |
 | Pi SDK 版本 | `pi-coding-agent 0.79.10` / `pi-ai 0.74.2` / `pi-tui 0.74.2` | VERIFIED |
@@ -604,8 +607,9 @@ INSERT/UPDATE `encrypted_runtime_secrets`。除该初始化外，L0 只允许本
    （`authorization message reference` 填 `THIS_MESSAGE`）。operator 收到后只做记录：
    平台消息 ID/任务 ID、收到时刻（UTC）与授权文本全文 SHA-256，round 开启时写入
    `authorization.md`（L0-10），不得修改用户原文。
-3. 启动门禁（fail-closed，任一不符即 B7_BLOCKED）：工作树干净、HEAD 为 `61576f7…`
-   （last production-code baseline）的线性后代且基线至 HEAD 区间仅文档变更、§2.0 数据库
+3. 启动门禁（fail-closed，任一不符即 B7_BLOCKED）：工作树干净、HEAD 为已审核 L1 repair
+   baseline `68deca58…` 的线性后代且包含 `f8a4ffa`/`494d20e`/`c22a3a1`/`8a5f264`/`68deca5`
+   五个修复提交、`68deca58…` 至 HEAD 区间仅已审核文档纠偏、§2.0 数据库
    身份逐项核验（含专用账号访问 `kol_insight` 被 MySQL 1142 拒绝）、Keychain 引用可读取
    （值仅进程内）。2026-08-12 首次尝试即因工作树未提交改动在此 fail-closed。
 4. 启动门禁通过后按 §6.1 执行 L0-00…L0-12；任一失败即停止，不进入 L1。L0 产出值

@@ -199,9 +199,10 @@ flush/fsync），写后不可变；`authorization.md`（模式 B，L0-10）/ `au
 2. [x] 两份模板不存在任何"留空后由 operator 回填"的字段；round_id 等全部授权字段必须在
    用户授权消息中给出确定值；`authorization message reference` 一律由用户填
    `THIS_MESSAGE`，operator 只记录平台消息 ID/任务 ID 与授权文本 SHA-256，不改原文。
-3. [x] 文档未把任何历史 commit 写成"当前 HEAD"：`61576f7…` 仅标注为 last production-code
+3. [x] 文档未把任何历史 commit 写成"当前 HEAD"：`61576f7…` 仅标注为修复前 production
    baseline；execution commit 以授权时点 `git rev-parse HEAD` 为准，round_id 的 short
    commit 取自用户最终批准的 execution commit；文档不内嵌任何自指 SHA。
+   （2026-08-12 门禁纠偏后：执行身份锚定已审核 L1 repair baseline `68deca58…`，见 §5.3。）
 4. [x] 计划中全部 `NEEDS_USER_APPROVAL` / `NEEDS_USER_INPUT` 字段在两份模板中均有填写位
    （逐项对照见 §6.3）。
 5. [x] append-only 证据重设计：追加型文件改 canonical JSONL + `prev_hash`/`record_hash`
@@ -363,9 +364,11 @@ REAL B7 UAT 一次性完整授权确认（ONESHOT_FULL_AUTHORIZATION，模式 B�
 
 - authorization mode: ONESHOT_FULL_AUTHORIZATION（模式 B）
 - round_id 身份规则: REAL_B7_<启动门禁通过时点 UTC 秒级时间戳>_<execution commit 前 8 位>
-- execution commit 身份规则: 启动门禁通过时点的 clean HEAD；必须是
-  61576f7a45c3a93063bdaae5328aefd67933df68（last production-code baseline）的线性后代；
-  基线至 HEAD 区间只允许已审核文档变更；工作树必须干净；禁止 checkout/reset/rebase/amend
+- execution commit 身份规则: 启动门禁通过时点、最终文档纠偏后的 clean HEAD；必须是
+  68deca58f2d2cd8aafb96d9ea47a0a60462142fa（已审核 L1 repair baseline）的线性后代，
+  且包含 f8a4ffa / 494d20e / c22a3a1 / 8a5f264 / 68deca5 五个修复提交；
+  68deca58 至 HEAD 区间只允许已审核的文档纠偏；工作树必须干净；
+  禁止 checkout/reset/rebase/amend；不再要求 61576f7..HEAD 为 docs-only
 - branch: <分支名>
 - migration head: 0043_billing_downgrade_guard
 - 启动门禁数据库身份核验（逐项，任一不符即 B7_BLOCKED）:
@@ -457,7 +460,7 @@ READY 状态均不构成授权之外的执行许可。
 | --- | --- | --- | --- |
 | I-1 授权流程单阶段：零外发预检与真实调用混在同一授权面；L0 只读边界文案不清 | Important | 计划 §7 重写为两阶段（阶段 A 仅放行本地构建 + 隔离测试库只读预检 + 证据首帧写入；阶段 B 在 L0 通过后由用户另一条新消息确认才放行真实调用）；计划 §6/§6.1 与模板同步；本包 §5 拆为 §5.1/§5.2 | 阶段 B 确认前禁止真实模型/DataTap/钱包操作的硬规则写入计划 §7.2、§5.1/§5.2 模板结尾；L0 文案明确"不调用真实模型/DataTap、不变更钱包/额度、阶段 A 后可只读访问隔离测试库元数据" |
 | I-2 round_id 可留空由 operator 回填；授权消息引用未锚定 | Important | 删除模板"留空则回填"例外；计划 §1.1 规定 operator 在授权前提出完整确定 round_id（不建目录、不连环境）；本包 §5 规则：用户填 `THIS_MESSAGE`，operator 只记录平台消息 ID/任务 ID 与授权文本 SHA-256，不得修改原文 | 全文无"授权后回填"通道（`留空`/`回填` 仅以禁止性语义出现）；模板所有字段均须在授权消息中给出确定值 |
-| I-3 commit 身份错误：`61576f7` 被写成"当前 HEAD"，执行 commit 未锚定授权时点 | Important | 计划 §0 改标 `61576f7…` 为 last production-code baseline，文档基线 HEAD `f7ab159` 标注为撰写时点历史事实；§1.1/§1.2 规定 execution commit = 授权时点最终修复提交后 `git rev-parse HEAD`、round_id short commit 取自用户批准值、文档不内嵌自指 SHA | 全文无"当前 HEAD = 61576f7"表述；`61576f7` 仅以 baseline 语义出现 |
+| I-3 commit 身份错误：`61576f7` 被写成"当前 HEAD"，执行 commit 未锚定授权时点 | Important | 计划 §0 改标 `61576f7…` 为修复前 production baseline，文档基线 HEAD `f7ab159` 标注为撰写时点历史事实；§1.1/§1.2 规定 execution commit = 授权时点最终修复提交后 `git rev-parse HEAD`、round_id short commit 取自用户批准值、文档不内嵌自指 SHA（2026-08-12 门禁纠偏后锚定已审核 L1 repair baseline `68deca58…`） | 全文无"当前 HEAD = 61576f7"表述；`61576f7` 仅以 baseline 语义出现 |
 | M-1 append-only 证据语义不足：JSON 整文件"追加"无法防改写、无校验方法 | Minor | 本包 §2 重设计：8 个追加型文件改 canonical JSONL + `prev_hash`/`record_hash` 链，逐帧 flush/fsync；3 个快照单次写入不可变；`verdict.md`/`hashes.sha256` 仅封口写一次；明文禁止修改/删除/重排/插入既有帧并定义 4 步链式校验；§3-14 覆盖写入失败与链校验失败 | 本地脱机自洽性验证通过（§6.4）：合法链接受，篡改字节/删帧/重排/重序列化均被拒绝 |
 
 ### 6.3 待批准字段 → 模板填写位对照
@@ -551,8 +554,10 @@ READY 状态均不构成授权之外的执行许可。
 L1-SMOKE 中真实模型经通用 `mcp` 代理工具以裸 remote 名（`match_best_tag`）寻址，计费扩展的
 代理分支只接受 prefixed 名（`insight_cube_mcp_match_best_tag`），必然本地拦截
 `mcp_tool_identity_invalid`：0 外发、0 扣费、0 ToolCall，账务恒等式成立，19 条硬停止无一
-触发。按「L1 失败不得进入 L2」终止并封存（operator 结论 B7_FAIL，证据目录只读，留待
-independent reviewer 封口）。离线 UAT 此前未暴露该分歧：fake model 脚本只发 prefixed 名。
+触发。按「L1 失败不得进入 L2」终止并封存。该 round 已经架构独立复核确认为 **B7_FAIL**；
+其证据目录因 operator 曾提前写入 `hashes.sha256` 而保持只读历史现场——不再向该目录补写
+`verdict.md` 或任何文件，禁止修改、删除或覆盖。离线 UAT 此前未暴露该分歧：fake model 脚本
+只发 prefixed 名。
 
 代码与测试修复（修复分支 `codex/real-b7-l1-repair`，本轮不执行真实 B7）：
 
