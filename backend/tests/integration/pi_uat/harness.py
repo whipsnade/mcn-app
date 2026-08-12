@@ -243,12 +243,43 @@ class _InProcessServer:
             task for task in asyncio.all_tasks() if task is not current
         }
         self._task = asyncio.create_task(self._server.serve())
-        for _ in range(100):
-            if self._server.started:
-                self._active_servers.add(self)
-                return
-            await asyncio.sleep(0.05)
-        raise RuntimeError("in_process_server_start_timeout")
+        try:
+            for _ in range(100):
+                if self._server.started:
+                    self._active_servers.add(self)
+                    return
+                if self._task.done():
+                    # uvicorn 启动失败（如端口被占）会提前退出 serve：
+                    # 立即收口，而不是空等整个轮询窗口。
+                    exc = None if self._task.cancelled() else self._task.exception()
+                    raise RuntimeError("in_process_server_start_aborted") from exc
+                await asyncio.sleep(0.05)
+            raise RuntimeError("in_process_server_start_timeout")
+        except BaseException:
+            await self._abort_failed_start()
+            raise
+
+    async def _abort_failed_start(self) -> None:
+        """启动失败的有界收口：serve task/监听/SSE watcher 不得跨拓扑残留。
+
+        收口自身失败（如 serve task 吞掉 cancel）会继续抛错，绝不把失败的
+        启动静默伪装成成功。
+        """
+        AppStatus.should_exit = True
+        self._server.should_exit = True
+        task = self._task
+        try:
+            if task is not None:
+                if not task.done():
+                    task.cancel()
+                await _reap_tasks_bounded(
+                    [task], timeout=2, error_code="in_process_server_abort_timeout"
+                )
+            await _drain_sse_shutdown_watchers(self._tasks_before_start)
+        finally:
+            self._active_servers.discard(self)
+            if not self._active_servers:
+                AppStatus.should_exit = False
 
     async def stop(self) -> None:
         # Signal SSE responses owned by this in-process server before asking
@@ -452,13 +483,15 @@ class PiUatTopology:
         self.fastapi_port = await _free_port()
         self.gateway_health_port = await _free_port()
         model_server = _InProcessServer(self.model.app(), self.model_port)
-        await model_server.start()
+        # 先登记再 start：start 自身已有失败自清理语义，登记保证外层 cleanup
+        # 在启动失败时仍能看到并 stop 该 server（防御性双层收口）。
         self._servers.append(model_server)
+        await model_server.start()
         self._log_lifecycle("fake_model_ready")
         mcp_port = await _free_port()
         mcp_server = _InProcessServer(datatap_gateway_app(self.mcp_services), mcp_port)
-        await mcp_server.start()
         self._servers.append(mcp_server)
+        await mcp_server.start()
         self._log_lifecycle("fake_mcp_ready")
         self.mcp_origin = f"http://127.0.0.1:{mcp_port}"
         for service in self.mcp_services:

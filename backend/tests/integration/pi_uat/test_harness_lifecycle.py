@@ -1,11 +1,40 @@
 from __future__ import annotations
 
 import asyncio
+import socket
 
 import pytest
 
 from . import harness
 from .harness import PiUatTopology, _InProcessServer
+
+
+class _NeverStartedUvicorn:
+    """started 永远为 False、serve() 长期等待的 fake uvicorn server。"""
+
+    def __init__(self) -> None:
+        self.should_exit = False
+        self.started = False
+
+    async def serve(self) -> None:
+        await asyncio.Event().wait()
+
+
+def _patch_fast_poll(monkeypatch: pytest.MonkeyPatch) -> None:
+    """把 harness 的轮询 sleep 缩到 0，避免测试真实等待启动超时窗口。"""
+    real_sleep = asyncio.sleep
+
+    async def fast_sleep(_delay: float) -> None:
+        await real_sleep(0)
+
+    monkeypatch.setattr(harness.asyncio, "sleep", fast_sleep)
+
+
+def _assert_no_leftover_tasks(tasks_before: set[asyncio.Task[object]]) -> None:
+    leftovers = [
+        task for task in asyncio.all_tasks() if task not in tasks_before and not task.done()
+    ]
+    assert not leftovers, f"leftover tasks: {leftovers!r}"
 
 
 @pytest.mark.asyncio
@@ -65,6 +94,72 @@ async def test_stop_processes_kills_recorded_group_after_parent_exit(monkeypatch
 
     await topology._stop_processes()
     assert calls == [(1234, harness.signal.SIGTERM)]
+
+
+@pytest.mark.asyncio
+async def test_in_process_start_timeout_cancels_and_reaps_serve_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_fast_poll(monkeypatch)
+    server = _InProcessServer(object(), 0)
+    fake = _NeverStartedUvicorn()
+    server._server = fake
+    tasks_before = set(asyncio.all_tasks())
+
+    with pytest.raises(RuntimeError, match="in_process_server_start_timeout"):
+        await server.start()
+
+    task = server._task
+    assert task is not None
+    assert task.done()
+    assert task.cancelled()
+    assert fake.should_exit
+    assert server not in _InProcessServer._active_servers
+    _assert_no_leftover_tasks(tasks_before)
+
+
+@pytest.mark.asyncio
+async def test_topology_reaps_in_process_server_when_start_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_fast_poll(monkeypatch)
+    made: list[_InProcessServer] = []
+
+    def failing_server_factory(_app: object, port: int) -> _InProcessServer:
+        server = _InProcessServer(object(), port)
+        server._server = _NeverStartedUvicorn()
+        made.append(server)
+        return server
+
+    monkeypatch.setattr(harness, "_InProcessServer", failing_server_factory)
+    topology = PiUatTopology()
+    teardown_calls: list[bool] = []
+
+    async def record_teardown() -> None:
+        teardown_calls.append(True)
+
+    monkeypatch.setattr(topology, "_teardown_db", record_teardown)
+    tasks_before = set(asyncio.all_tasks())
+
+    with pytest.raises(RuntimeError, match="in_process_server_start_timeout"):
+        await topology.__aenter__()
+
+    # 外层 cleanup 仍完成，已创建的 serve task 被完整收口
+    assert made, "fake server factory should have been used"
+    for server in made:
+        task = server._task
+        assert task is not None
+        assert task.done()
+        assert server not in _InProcessServer._active_servers
+    # 数据库 teardown 仍执行，原始启动异常不被静默吞掉（上面的 match 即原始错误）
+    assert teardown_calls
+    # 无监听端口残留：能重新 bind 说明 fake server 没有占用该端口
+    probe = socket.socket()
+    try:
+        probe.bind(("127.0.0.1", topology.model_port))
+    finally:
+        probe.close()
+    _assert_no_leftover_tasks(tasks_before)
 
 
 @pytest.mark.asyncio
