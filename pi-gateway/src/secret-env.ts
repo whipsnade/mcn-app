@@ -15,6 +15,17 @@ const SECRET_KEYS = new Set([
 
 const SAFE_PARENT_KEYS = new Set(["PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ"]);
 
+/**
+ * Runtime Config stores DataTap endpoints under control-plane service names
+ * (for example `insight-cube-mcp`).  The approved Pi adapters deliberately
+ * use their canonical service names (`insight-cube`) when resolving
+ * `PI_DATATAP_URL_*` references in the isolated worker.
+ */
+function piDatatapServiceEnvName(name: string): string {
+  const piServiceName = name.replace(/-mcp$/i, "");
+  return piServiceName.replace(/[^a-z0-9]+/gi, "_").toUpperCase();
+}
+
 /** Build only the child-process environment; never mutate process.env. */
 export function buildSecretEnv(
   secrets: SecretBundle,
@@ -32,7 +43,7 @@ export function buildSecretEnv(
   child.PI_MODEL_API_KEY = secrets.modelApiKey;
   child.PI_DATATAP_TOKEN = secrets.datatapToken;
   for (const [name, url] of Object.entries(secrets.datatapUrls)) {
-    const normalized = name.replace(/[^a-z0-9]+/gi, "_").toUpperCase();
+    const normalized = piDatatapServiceEnvName(name);
     child[`PI_DATATAP_URL_${normalized}`] = url;
   }
   return child;

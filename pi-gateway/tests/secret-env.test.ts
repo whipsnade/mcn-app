@@ -39,4 +39,25 @@ describe("worker secret environment", () => {
     expect(env.PI_MODEL_API_KEY).toBeUndefined();
     expect(env.PI_DATATAP_TOKEN).toBeUndefined();
   });
+
+  it("canonicalizes backend DataTap secret keys to the approved Pi service names", () => {
+    const env = buildSecretEnv({
+      modelBaseUrl: "https://model.invalid",
+      modelApiKey: "model-secret",
+      datatapToken: "datatap-secret",
+      datatapUrls: {
+        "insight-cube-mcp": "https://cube.invalid",
+        "social-grow-mcp": "https://grow.invalid",
+        "social-grow-content-mcp": "https://content.invalid",
+        "aktools-mcp": "https://aktools.invalid",
+      },
+    }, {});
+
+    expect(env).toMatchObject({
+      PI_DATATAP_URL_INSIGHT_CUBE: "https://cube.invalid",
+      PI_DATATAP_URL_SOCIAL_GROW: "https://grow.invalid",
+      PI_DATATAP_URL_SOCIAL_GROW_CONTENT: "https://content.invalid",
+      PI_DATATAP_URL_AKTOOLS: "https://aktools.invalid",
+    });
+  });
 });
