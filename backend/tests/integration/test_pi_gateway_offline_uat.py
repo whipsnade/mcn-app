@@ -33,12 +33,13 @@ from app.agent_runtime.models import (
     AgentToolCall,
     EvidenceItem,
 )
-from app.billing.models import TenantWallet, TenantWalletTransaction
+from app.billing.models import RuntimeUsageRecord, TenantWallet, TenantWalletTransaction
 from app.db.session import SessionFactory
 from app.tenancy.models import Tenant
 
 from .pi_uat.fake_model import (
     step_hang,
+    step_http_error,
     step_internal,
     step_mcp,
     step_mcp_proxy,
@@ -124,8 +125,13 @@ def _brand_script() -> list[Any]:
     ]
 
 
-async def _create_activate_pi_config(topology: PiUatTopology, tenant_id: str) -> str:
-    """经管理 API 创建并激活一个租户 Pi 配置版本（灰度升级路径），返回 config_id。"""
+async def _create_activate_pi_config(
+    topology: PiUatTopology, tenant_id: str, *, max_decisions: int | None = 50
+) -> str:
+    """经管理 API 创建并激活一个租户 Pi 配置版本（灰度升级路径），返回 config_id。
+
+    ``max_decisions=None`` 用于「缺失/非法预算必须 fail-closed」的反例场景。
+    """
     async with topology.admin_client() as admin:
         created = await admin.post(
             "/api/v1/admin/runtime-configs",
@@ -139,7 +145,7 @@ async def _create_activate_pi_config(topology: PiUatTopology, tenant_id: str) ->
                     "provider": "fake",
                 },
                 "datatap": {"service": "fake", "schema_digest": "sha256:" + "a" * 64},
-                "limits": {"max_decisions": 50},
+                "limits": {} if max_decisions is None else {"max_decisions": max_decisions},
                 "billing": {"mcp_call_points": 10},
                 "secrets": {
                     "model_base_url": f"http://127.0.0.1:{topology.model_port}/v1",
@@ -162,9 +168,11 @@ async def _create_activate_pi_config(topology: PiUatTopology, tenant_id: str) ->
     return config_id
 
 
-async def _enable_pi(topology: PiUatTopology, tenant_id: str) -> str:
+async def _enable_pi(
+    topology: PiUatTopology, tenant_id: str, *, max_decisions: int | None = 50
+) -> str:
     """经管理 API 创建并激活租户 Pi 配置，再切 backend（真实灰度路径）。"""
-    config_id = await _create_activate_pi_config(topology, tenant_id)
+    config_id = await _create_activate_pi_config(topology, tenant_id, max_decisions=max_decisions)
     async with topology.admin_client() as admin:
         switched = await admin.patch(
             f"/api/v1/admin/tenants/{tenant_id}",
@@ -776,6 +784,165 @@ async def test_generic_proxy_unique_live_duplicate_dispatches_to_claimed_service
             wallet = await db.get(TenantWallet, tenant.tenant_id)
             assert wallet is not None
             assert (wallet.balance, wallet.reserved) == (wallet_before.balance - 10, 0)
+
+
+def _pi_model_requests(topology: PiUatTopology) -> int:
+    """fake 模型收到的 Pi worker 真实 HTTP 请求数（排除 current 运行时标题工具）。"""
+    return sum(1 for body in topology.model.requests if body.get("model") == "fake-pi-model")
+
+
+
+async def _terminal_event_code(run_id: str) -> str | None:
+    """run.* 终态事件 payload 的 code（terminal 请求体重心不在 agent_runs.error_code）。"""
+    async with SessionFactory() as db:
+        rows = (
+            await db.scalars(
+                select(AgentEvent)
+                .where(AgentEvent.run_id == run_id, AgentEvent.event_type.startswith("run."))
+                .order_by(AgentEvent.sequence)
+            )
+        ).all()
+    codes = []
+    for row in rows:
+        payload = row.payload_json
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        if isinstance(payload, dict) and payload.get("code"):
+            codes.append(str(payload["code"]))
+    return codes[-1] if codes else None
+
+async def _run_usage_records(run_id: str) -> list[RuntimeUsageRecord]:
+    async with SessionFactory() as db:
+        return list(
+            (
+                await db.scalars(
+                    select(RuntimeUsageRecord).where(RuntimeUsageRecord.run_id == run_id)
+                )
+            ).all()
+        )
+
+
+async def test_model_budget_two_decisions_complete() -> None:
+    """max_decisions=2：工具调用 + 最终回答恰好 2 次模型 HTTP，usage 恰好 2 条。"""
+    topology = PiUatTopology(
+        scripts={
+            "budget2": [
+                step_mcp_proxy("social_statistic_overview", args={"brand": BRAND}),
+                step_text("品牌声量良好"),
+            ]
+        }
+    )
+    async with topology:
+        await _wait_gateway_registered(topology)
+        tenant = topology.tenants["uat-tenant-a"]
+        await _enable_pi(topology, tenant.tenant_id, max_decisions=2)
+        user = tenant.users[0]
+        session_id = await topology.create_session(user)
+        response = await topology.send_message(user, session_id, f"[scenario:budget2]\n请分析{BRAND}")
+        assert response.status_code in (200, 201, 202), response.text
+        run = await topology.run_by_session(session_id)
+        terminal_status = await topology.wait_run_terminal(run.id)
+        assert terminal_status == "completed"
+        # 恰好 2 次真实模型 HTTP：第一次产出 MCP 工具调用，第二次消费结果并给出最终回答
+        assert _pi_model_requests(topology) == 2
+        usage = await _run_usage_records(run.id)
+        assert len(usage) == 2
+        calls = await _run_tool_calls(run.id)
+        assert [c.internal_tool_name for c in calls] == ["social_statistic_overview"]
+        assert calls[0].status == "settled"
+
+
+async def test_model_budget_third_decision_blocked_before_any_http() -> None:
+    """脚本试图产生第 3 次决策：HTTP 仍恰好 2 次，第 3 次在本地被
+    pi_decision_limit 拦截；Run failed；0 自动重试；Attempt 恰好 1。"""
+    topology = PiUatTopology(
+        scripts={
+            "budget3": [
+                step_mcp_proxy("social_statistic_overview", args={"brand": BRAND}),
+                step_mcp_proxy("social_statistic_trend", args={"brand": BRAND}),
+                step_text("不应到达"),
+            ]
+        }
+    )
+    async with topology:
+        await _wait_gateway_registered(topology)
+        tenant = topology.tenants["uat-tenant-a"]
+        await _enable_pi(topology, tenant.tenant_id, max_decisions=2)
+        user = tenant.users[0]
+        session_id = await topology.create_session(user)
+        response = await topology.send_message(user, session_id, f"[scenario:budget3]\n请分析{BRAND}")
+        assert response.status_code in (200, 201, 202), response.text
+        run = await topology.run_by_session(session_id)
+        terminal_status = await topology.wait_run_terminal(run.id)
+        assert terminal_status == "failed"
+        # 第 3 次决策在任何 HTTP 之前被本地拦截
+        assert _pi_model_requests(topology) == 2
+        # 终态码稳定为 pi_decision_limit（不是不透明 worker_failed）
+        assert await _terminal_event_code(run.id) == "pi_decision_limit"
+        # 业务预算终止：不创建恢复 Attempt、不自动重放
+        attempts = await _run_attempts(run.id)
+        assert len(attempts) == 1
+        # 已完成的两次 MCP 正常结算（各 10 积分），预算终止不影响已 settle 部分
+        calls = await _run_tool_calls(run.id)
+        assert len(calls) == 2
+        assert all(c.status == "settled" for c in calls)
+
+
+async def test_provider_http_error_no_auto_retry_stable_failure() -> None:
+    """provider 第一次返回 429：HTTP 恰好 1 次（SDK/OpenAI 均不自动重试），
+    Run 稳定 failed（pi_model_provider_error），Attempt 恰好 1。"""
+    topology = PiUatTopology(
+        scripts={
+            "http429": [
+                step_http_error(429),
+                step_text("不应到达"),
+            ]
+        }
+    )
+    async with topology:
+        await _wait_gateway_registered(topology)
+        tenant = topology.tenants["uat-tenant-a"]
+        await _enable_pi(topology, tenant.tenant_id, max_decisions=5)
+        user = tenant.users[0]
+        session_id = await topology.create_session(user)
+        response = await topology.send_message(user, session_id, f"[scenario:http429]\n请分析{BRAND}")
+        assert response.status_code in (200, 201, 202), response.text
+        run = await topology.run_by_session(session_id)
+        terminal_status = await topology.wait_run_terminal(run.id)
+        assert terminal_status == "failed"
+        # 关键断言：fake 模型只收到 1 次 HTTP（agent 层与 provider 层重试都关闭）
+        assert _pi_model_requests(topology) == 1
+        assert await _terminal_event_code(run.id) == "pi_model_provider_error"
+        attempts = await _run_attempts(run.id)
+        assert len(attempts) == 1
+        assert topology.mcp_services[0].calls == []
+        assert topology.mcp_services[1].calls == []
+
+
+async def test_model_budget_missing_fails_closed_before_worker_start() -> None:
+    """limits 缺 max_decisions：snapshot 校验 fail-closed，worker 未启动，HTTP 0 次。"""
+    topology = PiUatTopology(
+        scripts={
+            "nobudget": [
+                step_text("不应到达"),
+            ]
+        }
+    )
+    async with topology:
+        await _wait_gateway_registered(topology)
+        tenant = topology.tenants["uat-tenant-a"]
+        await _enable_pi(topology, tenant.tenant_id, max_decisions=None)
+        user = tenant.users[0]
+        session_id = await topology.create_session(user)
+        response = await topology.send_message(user, session_id, f"[scenario:nobudget]\n请分析{BRAND}")
+        assert response.status_code in (200, 201, 202), response.text
+        run = await topology.run_by_session(session_id)
+        terminal_status = await topology.wait_run_terminal(run.id)
+        assert terminal_status == "failed"
+        assert _pi_model_requests(topology) == 0
+        assert topology.mcp_services[0].calls == []
+        attempts = await _run_attempts(run.id)
+        assert len(attempts) == 1
 
 
 async def test_legacy_prefixed_name_fails_closed_unbilled() -> None:

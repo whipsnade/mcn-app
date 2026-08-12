@@ -72,6 +72,11 @@ def step_hang(seconds: float) -> dict[str, Any]:
     return {"kind": "hang", "seconds": seconds}
 
 
+def step_http_error(status: int) -> dict[str, Any]:
+    """可重试型 provider HTTP 错误（429/500 等）：验证两层自动重试均已关闭。"""
+    return {"kind": "http_error", "status": status}
+
+
 def extract_field_pairs(text: str, field: str) -> list[str]:
     """从工具结果文本按序提取 ``"field": "value"`` 字符串值。"""
     import re
@@ -272,6 +277,13 @@ class FakeModelServer:
         if step["kind"] == "hang":
             await asyncio.sleep(float(step["seconds"]))
             step = {"kind": "text", "text": "延迟后的回复"}
+        if step["kind"] == "http_error":
+            # provider 级可重试错误：请求已被 fake 收到（计入 requests），但
+            # SDK/OpenAI 两层重试都关闭时不得产生第二次 HTTP 请求。
+            return JSONResponse(
+                status_code=int(step["status"]),
+                content={"error": {"message": f"rate limit (fake {step['status']})", "type": "rate_limit_error"}},
+            )
         return self._respond(body, step, model)
 
     def _respond(self, body: dict[str, Any], step: dict[str, Any], model: str) -> Response:
