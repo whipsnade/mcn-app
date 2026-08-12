@@ -734,6 +734,50 @@ async def test_generic_proxy_ambiguous_remote_name_with_explicit_server() -> Non
             assert (wallet.balance, wallet.reserved) == (wallet_before.balance - 10, 0)
 
 
+async def test_generic_proxy_unique_live_duplicate_dispatches_to_claimed_service() -> None:
+    """同名 remote 在两个 live 服务上都暴露、但只有一侧登记进 claim catalog：
+
+    无 server 裸名 → bindings 唯一解析到已登记服务，并把 server 钉回 SDK 入参——
+    adapter 的裸名扫描是 live metadata first-match，钉入保证「分发身份 ==
+    计费身份」，不会落到未登记的对端。
+    """
+    topology = PiUatTopology(
+        scripts={
+            "pinned": [
+                step_mcp_proxy("shared_lookup", args={"brand": BRAND}),
+                step_text("完成"),
+            ]
+        }
+    )
+    async with topology:
+        await _wait_gateway_registered(topology)
+        # 只把 insight-cube 一侧登记进 catalog；social-grow 的同名工具保持 quarantined
+        await _approve_extra_tool("insight-cube-mcp", "shared_lookup", "match_best_tag")
+        tenant = topology.tenants["uat-tenant-a"]
+        await _enable_pi(topology, tenant.tenant_id)
+        user = tenant.users[0]
+        async with SessionFactory() as db:
+            wallet_before = await db.get(TenantWallet, tenant.tenant_id)
+        assert wallet_before is not None
+        session_id = await topology.create_session(user)
+        response = await topology.send_message(user, session_id, f"[scenario:pinned]\n查一下{BRAND}")
+        assert response.status_code in (200, 201, 202), response.text
+        run = await topology.run_by_session(session_id)
+        terminal_status = await topology.wait_run_terminal(run.id)
+        assert terminal_status == "completed"
+        # 钉入已登记的 insight-cube：恰好 1 次外发；未登记的 social-grow 0 次
+        assert [c["tool"] for c in topology.mcp_services[0].calls] == ["shared_lookup"]
+        assert topology.mcp_services[1].calls == []
+        calls = await _run_tool_calls(run.id)
+        assert len(calls) == 1
+        assert calls[0].internal_tool_name == "match_best_tag"
+        assert calls[0].status == "settled"
+        async with SessionFactory() as db:
+            wallet = await db.get(TenantWallet, tenant.tenant_id)
+            assert wallet is not None
+            assert (wallet.balance, wallet.reserved) == (wallet_before.balance - 10, 0)
+
+
 async def test_legacy_prefixed_name_fails_closed_unbilled() -> None:
     """旧 prefixed 寻址名的兼容边界：计费身份仍可映射，但 adapter 分发面
     （toolPrefix=none，裸 remote 名）不再接受 prefixed 名——必须安全失败：

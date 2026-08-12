@@ -100,7 +100,7 @@ REAL_B7_<YYYYMMDDTHHMMSSZ>_<SHORT_COMMIT>
 | 授权模式 | 模式 A（两阶段）/ 模式 B（一次性完整授权）二选一；2026-08-12 的模式 B 授权已随失败 round `REAL_B7_20260812T045636Z_b801c490` 消费完毕，新执行须重新授权 | NEEDS_USER_APPROVAL |
 | round_id | operator 在授权前提出的完整确定值或身份规则（§1.1）；模式 A：阶段 A 模板逐字确认、阶段 B 绑定同一值；模式 B：一次性模板确认身份规则，启动门禁通过时点展开为确定值 | NEEDS_USER_APPROVAL |
 | commit_sha | 授权包最终修复提交之后、启动门禁通过时点 `git rev-parse HEAD`（工作树干净）；`61576f7…` 仅为 last production-code baseline，`f7ab159…` 仅为第一版文档基线，均非执行身份 | NEEDS_USER_APPROVAL |
-| branch | `codex/marketing-capability-pack-b0` | VERIFIED |
+| branch | `codex/marketing-capability-pack-b0`（L1 修复在 `codex/real-b7-l1-repair`；新 round 的 execution commit 须落在包含该修复的分支/合并线上） | VERIFIED |
 | migration_head | `0043_billing_downgrade_guard` | VERIFIED |
 | Pi SDK 版本 | `pi-coding-agent 0.79.10` / `pi-ai 0.74.2` / `pi-tui 0.74.2` | VERIFIED |
 | adapter 版本 | `pi-mcp-adapter 2.20.1` | VERIFIED |

@@ -118,14 +118,19 @@ export function classifyMcpFailure(
 }
 
 /**
- * The claim catalog's ``adapter_visible_name`` is the plain remote name (e.g.
+ * The claim catalog's ``adapter_visible_name`` is the catalog internal name
+ * (which the live gateway exposes verbatim as the remote name, e.g.
  * ``match_best_tag``), and the model may address the generic ``mcp`` proxy
  * tool with that bare name — optionally qualified by ``server``.  The legacy
  * prefixed form ``<server_with_underscores>_<remote with dots replaced>``
- * remains accepted.  Every accepted name must resolve to exactly one claim
- * binding; ambiguous bare names without a server and unknown names are
- * blocked locally (zero preflight, zero dispatch), and the reviewed catalog
- * internal name is always the billing identity sent to preflight.
+ * remains accepted at the identity layer.  Every accepted name must resolve
+ * to exactly one claim binding; ambiguous bare names without a server and
+ * unknown names are blocked locally (zero preflight, zero dispatch), and the
+ * reviewed catalog internal name is always the billing identity sent to
+ * preflight.  When the model omits ``server`` and the binding is unique, the
+ * resolved server is pinned back into the call input so the adapter's
+ * dispatch can never first-match a different live twin — billed identity
+ * always equals dispatched identity.
  */
 export function proxyVisibleToolName(server: string, remoteName: string): string {
   return `${server.replace(/-/g, "_")}_${remoteName.replace(/\./g, "_")}`;
@@ -246,16 +251,17 @@ function toMcpToolCall(
     const args = normalizeArgs(input.args);
     const requestedServer = typeof input.server === "string" ? input.server : "";
     // Accept every reviewed addressing form: the catalog internal name
-    // (== adapter-visible name), the bare remote name, and the legacy
-    // prefixed proxy name.  Never "find first" — a bare name shared by two
-    // services without an explicit server must fail closed with zero
-    // preflight and zero dispatch.
+    // (== adapter-visible name), the bare remote name, its dot-sanitized
+    // adapter-visible variant, and the legacy prefixed proxy name.  Never
+    // "find first" — a bare name shared by two services without an explicit
+    // server must fail closed with zero preflight and zero dispatch.
     const candidates = bindings.filter((binding) => {
       if (requestedServer.length > 0 && binding.server !== requestedServer) return false;
       if (binding.toolName === input.tool) return true;
       if (binding.remoteName === undefined) return false;
       return (
         binding.remoteName === input.tool ||
+        binding.remoteName.replace(/\./g, "_") === input.tool ||
         proxyVisibleToolName(binding.server, binding.remoteName) === input.tool
       );
     });
@@ -263,6 +269,15 @@ function toMcpToolCall(
     for (const binding of candidates) unique.set(`${binding.server}${binding.toolName}`, binding);
     if (unique.size === 1) {
       const match = [...unique.values()][0];
+      // Pin the resolved server back into the model-supplied input when the
+      // model omitted it: the SDK executes with this same object, and the
+      // adapter's bare-name scan is first-match over *live* metadata — without
+      // pinning, a same-named live twin on another server could be dispatched
+      // while we bill the claimed one.  ``event.input`` is the mutable args
+      // object (SDK extension contract), so the mutation reaches dispatch.
+      if (requestedServer.length === 0 && isRecord(event.input)) {
+        (event.input as Record<string, unknown>).server = match.server;
+      }
       return { tool: match.toolName, server: match.server, args };
     }
     if (unique.size > 1) {

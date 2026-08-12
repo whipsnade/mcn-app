@@ -168,6 +168,10 @@ active 版本转 retired，不修改已创建 Run 的 snapshot。
 - 证据封口角色分离：operator 只追加 `execution_completed`/`execution_stopped` 帧与
   `operator-summary.md`；`round_sealed` 帧、`verdict.md`、`hashes.sha256` 只由
   independent reviewer 写入；历史失败 round 的证据目录只读封存，禁止补写或覆盖。
+- 本地身份闸拦截（`mcp_tool_identity_invalid`/`mcp_tool_identity_ambiguous`）按设计不产生
+  preflight/控制面记录（0 外发、0 扣费）；operator 必须从 Run 的 `agent_events`
+  （tool.started/tool.failed）与 assistant 消息中收录被拦截尝试，以便 reviewer 区分
+  「模型未尝试」与「尝试被拦截」。
 
 ## 禁止事项与真实 UAT 停止门
 

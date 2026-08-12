@@ -278,12 +278,13 @@ describe("McpAccountingExtension", () => {
 });
 
 describe("generic mcp proxy identity resolution (real catalog shapes)", () => {
-  // 真实 claim adapter_catalog 投影的 adapter_visible_name 是裸 remote 名
-  // （见 REAL_B7_20260812T045636Z_b801c490 L1 失败证据）；bindings 与真实
-  // catalog 对齐：toolName = remoteName = catalog 内部名。
+  // 真实 claim adapter_catalog 的 adapter_visible_name = catalog 内部名（实时网关
+  // 原样暴露为 remote 名）；bindings 经 protocol.ts 别名映射后 server 为 adapter
+  // 别名（insight-cube-mcp → insight-cube）。见 REAL_B7_20260812T045636Z_b801c490
+  // L1 失败证据。
   const REAL_BINDINGS = [
-    { toolName: "match_best_tag", server: "insight-cube-mcp", remoteName: "match_best_tag" },
-    { toolName: "kol_detail", server: "social-grow-mcp", remoteName: "kol_detail" },
+    { toolName: "match_best_tag", server: "insight-cube", remoteName: "match_best_tag" },
+    { toolName: "kol_detail", server: "social-grow", remoteName: "kol_detail" },
   ];
 
   function setup(bindings: readonly { toolName: string; server: string; remoteName?: string }[]) {
@@ -304,26 +305,30 @@ describe("generic mcp proxy identity resolution (real catalog shapes)", () => {
     const { handlers, control } = setup(REAL_BINDINGS);
     const before = await handlers.get("tool_call")?.({
       type: "tool_call", toolName: "mcp", toolCallId: "tc-1",
-      input: { tool: "match_best_tag", server: "insight-cube-mcp", args: { brand: "瑞幸咖啡" } },
+      input: { tool: "match_best_tag", server: "insight-cube", args: { brand: "瑞幸咖啡" } },
     });
     expect(before).toBeUndefined();
     expect(control.preflight).toHaveBeenCalledTimes(1);
     expect(control.preflight).toHaveBeenCalledWith({
-      tool: "match_best_tag", server: "insight-cube-mcp", args: { brand: "瑞幸咖啡" },
+      tool: "match_best_tag", server: "insight-cube", args: { brand: "瑞幸咖啡" },
     });
   });
 
   it("infers the server when the bare remote name is globally unique", async () => {
     const { handlers, control } = setup(REAL_BINDINGS);
+    const input: Record<string, unknown> = { tool: "match_best_tag", args: { brand: "瑞幸咖啡" } };
     const before = await handlers.get("tool_call")?.({
       type: "tool_call", toolName: "mcp", toolCallId: "tc-2",
-      input: { tool: "match_best_tag", args: { brand: "瑞幸咖啡" } },
+      input,
     });
     expect(before).toBeUndefined();
     expect(control.preflight).toHaveBeenCalledTimes(1);
     expect(control.preflight).toHaveBeenCalledWith({
-      tool: "match_best_tag", server: "insight-cube-mcp", args: { brand: "瑞幸咖啡" },
+      tool: "match_best_tag", server: "insight-cube", args: { brand: "瑞幸咖啡" },
     });
+    // 推导出的 server 必须钉回调用入参：adapter 裸名扫描是 first-match，
+    // 钉入后分发身份恒等于计费身份（同名 live twin 不会被误分发）。
+    expect(input.server).toBe("insight-cube");
   });
 
   it("fails closed without any preflight when a bare remote name is ambiguous and no server is given", async () => {
@@ -331,12 +336,14 @@ describe("generic mcp proxy identity resolution (real catalog shapes)", () => {
       { toolName: "get_config", server: "svc-a", remoteName: "get_config" },
       { toolName: "get_config", server: "svc-b", remoteName: "get_config" },
     ]);
+    const input: Record<string, unknown> = { tool: "get_config", args: {} };
     const before = await handlers.get("tool_call")?.({
       type: "tool_call", toolName: "mcp", toolCallId: "tc-3",
-      input: { tool: "get_config", args: {} },
+      input,
     });
     expect(before).toEqual({ block: true, reason: "mcp_tool_identity_ambiguous" });
     expect(control.preflight).not.toHaveBeenCalled();
+    expect(input.server).toBeUndefined();  // 失败时不得钉入任何候选
   });
 
   it("maps an ambiguous remote name exactly when the server is explicit", async () => {
@@ -357,22 +364,48 @@ describe("generic mcp proxy identity resolution (real catalog shapes)", () => {
     const { handlers, control } = setup(REAL_BINDINGS);
     const before = await handlers.get("tool_call")?.({
       type: "tool_call", toolName: "mcp", toolCallId: "tc-5",
-      input: { tool: "no_such_tool", server: "insight-cube-mcp", args: {} },
+      input: { tool: "no_such_tool", server: "insight-cube", args: {} },
     });
     expect(before).toEqual({ block: true, reason: "mcp_tool_identity_invalid" });
     expect(control.preflight).not.toHaveBeenCalled();
   });
 
-  it("keeps the legacy prefixed proxy name working", async () => {
+  it("maps the legacy prefixed proxy name to the reviewed identity (dispatch itself fails closed)", async () => {
     const { handlers, control } = setup(REAL_BINDINGS);
     const before = await handlers.get("tool_call")?.({
       type: "tool_call", toolName: "mcp", toolCallId: "tc-6",
-      input: { tool: "insight_cube_mcp_match_best_tag", args: {} },
+      input: { tool: "insight_cube_match_best_tag", args: {} },
     });
     expect(before).toBeUndefined();
     expect(control.preflight).toHaveBeenCalledTimes(1);
     expect(control.preflight).toHaveBeenCalledWith({
-      tool: "match_best_tag", server: "insight-cube-mcp", args: {},
+      tool: "match_best_tag", server: "insight-cube", args: {},
+    });
+  });
+
+  it("blocks a slug-prefixed name that no production binding owns", async () => {
+    // 历史观测名以 adapter 别名拼前缀（insight_cube_…）；slug 形式
+    // （insight_cube_mcp_…）不属于任何 binding——本地拦截，0 preflight。
+    const { handlers, control } = setup(REAL_BINDINGS);
+    const before = await handlers.get("tool_call")?.({
+      type: "tool_call", toolName: "mcp", toolCallId: "tc-6b",
+      input: { tool: "insight_cube_mcp_match_best_tag", args: {} },
+    });
+    expect(before).toEqual({ block: true, reason: "mcp_tool_identity_invalid" });
+    expect(control.preflight).not.toHaveBeenCalled();
+  });
+
+  it("accepts the dot-sanitized adapter-visible variant of a dotted remote name", async () => {
+    const { handlers, control } = setup([
+      { toolName: "query_analysis_data", server: "insight-cube", remoteName: "datatap.insight.query.analysis.v1" },
+    ]);
+    const before = await handlers.get("tool_call")?.({
+      type: "tool_call", toolName: "mcp", toolCallId: "tc-6c",
+      input: { tool: "datatap_insight_query_analysis_v1", args: {} },
+    });
+    expect(before).toBeUndefined();
+    expect(control.preflight).toHaveBeenCalledWith({
+      tool: "query_analysis_data", server: "insight-cube", args: {},
     });
   });
 
@@ -385,7 +418,7 @@ describe("generic mcp proxy identity resolution (real catalog shapes)", () => {
     expect(before).toBeUndefined();
     expect(control.preflight).toHaveBeenCalledTimes(1);
     expect(control.preflight).toHaveBeenCalledWith({
-      tool: "match_best_tag", server: "insight-cube-mcp", args: { brand: "瑞幸咖啡" },
+      tool: "match_best_tag", server: "insight-cube", args: { brand: "瑞幸咖啡" },
     });
   });
 });

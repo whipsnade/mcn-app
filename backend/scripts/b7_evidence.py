@@ -277,7 +277,12 @@ def check_cross_file_consistency(
 
 
 class EvidenceWriter:
-    """append-only canonical JSONL hash-chain 写入器（flush + fsync 逐帧）。"""
+    """append-only canonical JSONL hash-chain 写入器（flush + fsync 逐帧）。
+
+    使用约束：单 operator 顺序写入（B7 round 协议即为串行）；read-last-then-
+    append 非原子，多写入者并发会分叉链。帧级 fsync 保证每帧落盘；新建文件
+    的目录项持久化依赖文件系统语义，round 封口由 hashes.sha256 总体锚定。
+    """
 
     def __init__(self, directory: str | Path) -> None:
         self._dir = Path(directory)
