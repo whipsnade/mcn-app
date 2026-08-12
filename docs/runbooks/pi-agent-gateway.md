@@ -2,7 +2,13 @@
 
 本手册覆盖方案 B 的本地/预生产操作边界。当前交付状态只到
 `READY_FOR_REAL_B7_UAT_REVIEW`（2026-08-09 写入的 `READY_FOR_REAL_B7_UAT` 已被架构审核
-否决，修复完成后由独立复审决定是否恢复）：真实 B7 UAT、生产切流和方案 C 均需要单独审批。
+否决）：真实 B7 UAT、生产切流和方案 C 均需要单独审批。
+
+状态更新（2026-08-12）：本地代码修复与架构复核已完成，复核结论 Critical 0 / Important 0 /
+Minor 1；状态维持 `READY_FOR_REAL_B7_UAT_REVIEW`，仍等待用户对真实 B7 UAT 的明确授权。
+授权方案见 `docs/superpowers/plans/2026-08-12-real-b7-uat-authorization-plan.md` 与
+`docs/qa/2026-08-12-pi-b7-uat-authorization-pack.md`；在授权文本被完整确认前，不得执行
+真实外部调用，也不得把状态写成 B7 PASS 或 production ready。
 
 ## 组件、版本与启动检查
 

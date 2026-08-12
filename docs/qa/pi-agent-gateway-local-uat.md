@@ -2,8 +2,9 @@
 
 日期：2026-08-10（替代 2026-08-09 版）
 范围：方案 B Task 12 本地部分与 Task 13 离线验证（修复期重估）
-状态：`READY_FOR_REAL_B7_UAT_REVIEW`（等待架构审核独立复审；此前 2026-08-09 写入的
-`READY_FOR_REAL_B7_UAT` 已被架构审核否决，本记录不重写该事实）
+状态：`READY_FOR_REAL_B7_UAT_REVIEW`（架构复核已于 2026-08-12 完成：Critical 0 /
+Important 0 / Minor 1，本地代码与架构审核通过；仍等待用户对真实 B7 UAT 的明确授权。
+此前 2026-08-09 写入的 `READY_FOR_REAL_B7_UAT` 已被架构审核否决，本记录不重写该事实）
 
 ## 边界
 
@@ -98,5 +99,20 @@ FastAPI/Gateway 进程，架构审核据此否决了 READY 结论。修复期以
 本地结果只证明离线生产拓扑可运行、账务/产物/事件一致性成立；不证明真实模型质量、
 DataTap SLA、生产网络、真实钱包扣账或 B7 发布。真实 B7 UAT 需用户新的明确授权、
 独立测试租户、测试钱包、append-only 证据目录和停止条件；在此之前不得把状态改写为
-Gate A PASS、B7 PASS 或 production ready。最终是否恢复 `READY_FOR_REAL_B7_UAT`
-由架构审核会话独立复审决定。
+Gate A PASS、B7 PASS 或 production ready。
+
+## 2026-08-12 更新：架构复核通过，等待真实 B7 授权
+
+- 架构复核已完成：Critical 0 / Important 0 / Minor 1（剩余 Minor 为记录在案的已知边界，
+  不阻断授权评审）。本地代码修复与架构审核就此收口。
+- 上方全部历史否决（2026-08-09 READY 被否决）与修复事实保持原样，不重写。
+- 再次明确：本文记录的本地离线 fake topology（fake model + fake DataTap MCP，0 外部网络）
+  **不等于**真实 B7 UAT；它只证明拓扑与一致性，不证明真实模型质量、DataTap SLA 或真实
+  钱包扣账。
+- 真实 B7 UAT 的授权方案已就绪待批：
+  `docs/superpowers/plans/2026-08-12-real-b7-uat-authorization-plan.md`（round 身份、
+  隔离环境、凭证引用、工具/网络 allowlist、预算表、Level 0/1/2 场景矩阵）与
+  `docs/qa/2026-08-12-pi-b7-uat-authorization-pack.md`（append-only 证据设计、19 条硬停止
+  条件、授权文本模板）。
+- 在用户于新消息中完整确认授权文本之前，状态维持 `READY_FOR_REAL_B7_UAT_REVIEW`；
+  历史真实 Task 9（round `20260808T060814Z`）不得重跑，生产切流与方案 C 均未授权。

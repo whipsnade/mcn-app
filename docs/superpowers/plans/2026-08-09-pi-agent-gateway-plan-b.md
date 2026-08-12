@@ -530,7 +530,7 @@ PiRunScheduler.set_gateway_mode(gateway_id: str, mode: Literal["active", "draini
   Attempt/Event sequence、无负 active count、无脏 session slot。
 - [x] **Step 6：范围回归和审查。** agent router/executor/recovery 既有测试必须保持通过；审查锁顺序统一
   `Tenant → License/Wallet → Session → Run → child rows`，避免反向死锁。
-- [ ] **Step 7：Commit。** `feat: schedule pi runs fairly across tenants`。
+- [x] **Step 7：Commit。** `feat: schedule pi runs fairly across tenants`。
 
 ---
 
@@ -580,7 +580,7 @@ BusinessFailure = Literal[
   真实 MySQL 窗口测试、Ruff/typecheck/build。
 - [x] **Step 6：审查。** 断言 `dispatch_count` 不因基础设施恢复增加，unknown 没有 Evidence，所有
   terminal path 恰好一个终态事件。
-- [ ] **Step 7：Commit。** `feat: recover pi infrastructure failures once`。
+- [x] **Step 7：Commit。** `feat: recover pi infrastructure failures once`。
 
 ---
 
@@ -646,7 +646,7 @@ TenantAccountingService.fail_mcp_call(
   再运行后端全量与 Node 测试。
 - [x] **Step 6：审查。** 对所有 Wallet/WalletTransaction 写入口静态盘点，确认 B4 后除迁移与只读兼容外
   为 0；检查所有外发 MCP 都有已提交 permit。
-- [ ] **Step 7：Commit。** `feat: bill all agent mcp calls from tenant wallet`。
+- [x] **Step 7：Commit。** `feat: bill all agent mcp calls from tenant wallet`。
 
 ---
 
