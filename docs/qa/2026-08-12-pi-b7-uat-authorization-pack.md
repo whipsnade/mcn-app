@@ -209,10 +209,11 @@ flush/fsync），写后不可变；`authorization.md`（模式 B，L0-10）/ `au
    链，逐帧 flush/fsync，失败即硬停止；快照单次写入不可变；`verdict.md` 与
    `hashes.sha256` 仅封口写一次；禁止修改/删除/重排既有帧，校验方法已定义（§2.2），
    并经本地脱机自洽性验证（§6.4）。
-6. [x] L0 文案：不调用真实模型/DataTap、不发生 Run 级计费；专用空库的环境初始化例外只经
+6. [x] L0 文案：不调用真实模型/DataTap、不发生 Run 级计费；专用库（第一轮执行前为空，
+   系历史事实）的环境初始化例外只经
    生产 domain/admin service 幂等写入并写审计/账本（禁止直接写 `encrypted_runtime_secrets`）；
    其余预检保持只读（Runtime Config、License、TenantWallet 与 quota 元数据，SELECT only）
-   （计划 §6.1）。
+   （计划 §6.1）。重授权 round 的库内状态门禁见计划 §2.0 与 §5.3 确认项。
 7. [x] 两份文档均无任何明文凭证（只出现变量名、引用占位与掩码位）。
 8. [x] 没有把本地离线 fake topology 写成真实 B7；没有把 `READY_FOR_REAL_B7_UAT_REVIEW`
    写成 PASS（全文无 B7 PASS 表述）。
@@ -378,6 +379,12 @@ REAL B7 UAT 一次性完整授权确认（ONESHOT_FULL_AUTHORIZATION，模式 B�
   - 专用账号访问 kol_insight 被 MySQL 1142 拒绝: <YES>
   - 禁止 kol_insight / kol_insight_test / 任何开发、预生产、生产或正式客户数据库: <YES>
   - 禁止 DROP/CREATE/重建该库；禁止普通 pytest / 离线 UAT harness / 迁移 downgrade: <YES>
+- 数据库状态确认（retained_by_policy 隔离；逐项，任一不符即 B7_BLOCKED）:
+  - kol_insight_b7_uat 非空，包含历史 retained_by_policy 数据: <YES>
+  - 允许在不修改历史行的前提下创建本 round 全新 synthetic 数据: <YES>
+  - 禁止复用/修改/删除 REAL_B7_20260812T045636Z_b801c490 数据: <YES>
+  - 启动时新 round_id 对应 tenant/user/gateway/Run 必须为 0，创建后按新增行 delta 对账: <YES>
+  - 所有预算、账务、外发、usage、lineage 只统计新 round 身份集合: <YES>
 - 凭证引用（只记引用，值仅进程内，禁止 echo/日志/写文件）:
   - MySQL 密码: macOS Keychain service=com.kol-insight.real-b7-uat.mysql account=kol_b7_uat@127.0.0.1
   - DataTap Token: macOS Keychain service=com.kol-insight.real-b7-uat.datatap account=DATATAP_MCP_TOKEN
@@ -524,10 +531,11 @@ READY 状态均不构成授权之外的执行许可。
 - 计划 §2.0 新增专用环境绑定（VERIFIED）：数据库 `kol_insight_b7_uat`（host `127.0.0.1:3306`、
   user identity `kol_b7_uat@localhost`、`utf8mb4`/`utf8mb4_unicode_ci`、73 表、migration
   head `0043_billing_downgrade_guard`）、专用账号访问 `kol_insight.users` 被 MySQL 1142
-  拒绝的隔离证明、初始状态（tenants=0、encrypted_runtime_secrets=0、2 条系统迁移种子保留）、
+  拒绝的隔离证明、初始状态（tenants=0、encrypted_runtime_secrets=0、2 条系统迁移种子保留——
+  系第一轮执行前的历史事实，非新 round 前提）、
   `retained_by_policy` 保留策略；计划 §3 凭证表 reference 列按 Keychain 三引用与
   `backend/.env` 引用核验为 VERIFIED（只记引用不记值）。
-- 计划 §6.1 L0 边界澄清：零真实外发与无 Run 级计费不变；专用空库初始化例外只经生产
+- 计划 §6.1 L0 边界澄清：零真实外发与无 Run 级计费不变；专用库（第一轮前为空）初始化例外只经生产
   domain/admin service 幂等写入并写审计/账本（两 synthetic tenant、用户、各 2000 积分钱包、
   周期额度 2000、全能力 License、租户级 Pi Runtime Config draft→激活），禁止直接写
   `encrypted_runtime_secrets`；新增 L0-00 初始化核验项。

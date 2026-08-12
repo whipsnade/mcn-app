@@ -139,7 +139,8 @@ L0 环境初始化（§6.1）在专用库内创建 synthetic 数据满足；其�
 | charset / collation | `utf8mb4` / `utf8mb4_unicode_ci` | 库级变量 |
 | 表数量 | 73 | information_schema 计数 |
 | 隔离证明 | 专用账号访问 `kol_insight.users` 被 MySQL 1142 拒绝 | 实测拒绝 |
-| 初始状态 | `tenants`=0、`encrypted_runtime_secrets`=0、`runtime_config_versions` 含 2 条系统迁移种子配置（保留） | SELECT 计数 |
+| 第一轮执行前的历史初始状态 | `tenants`=0、`encrypted_runtime_secrets`=0、`runtime_config_versions` 含 2 条系统迁移种子配置（保留）。**仅历史事实（2026-08-12 第一轮 L0 前核验）；不得作为新 round 门禁** | SELECT 计数（当时） |
+| 当前状态（失败 round 后） | 专用库包含 round `REAL_B7_20260812T045636Z_b801c490` 的 retained_by_policy 数据：tenant/用户/钱包/账本/License/Runtime Config/encrypted_runtime_secrets/usage/lineage 等全部保留 | 历史 round 证据 |
 
 凭证引用（只记录引用，任何值不得写入文档/证据/Git）：
 
@@ -170,6 +171,23 @@ L0 环境初始化（§6.1）在专用库内创建 synthetic 数据满足；其�
   或迁移 downgrade。
 - 禁止使用 shell xtrace；禁止把任何密码/Token/API Key/DSN/Cookie/Authorization header/
   HMAC 值/解密结果写入命令输出、日志、Git、Markdown、SSE 或 Artifact。
+
+新 round 的数据库状态门禁（重授权 round 适用；任一不符即 B7_BLOCKED）：
+
+1. 专用库允许包含 retained_by_policy 历史数据（失败 round 的全套证据行）；「库为空」
+   不再是合法前提。
+2. 启动时只读记录 before snapshot 与各表现有行数（不写任何行）。
+3. 新 round_id 对应的 tenant/user/gateway/Run 在启动时必须为 0（按 slug/idempotency key/
+   gateway_id 中的新 round_id 前缀核验）。
+4. 禁止复用或修改旧 round 的 tenant、用户、钱包、账本、License、Runtime Config、
+   encrypted secret、usage、lineage；历史行只读。
+5. L0 只通过生产 domain/admin service 创建 slug 与 Idempotency-Key 含新 round_id 的全新
+   tenant-a/tenant-b 及配套数据（用户/钱包/额度/License/Runtime Config/gateway 身份）。
+6. 创建后核对新增行 delta：所有新增行只能属于新 round 身份集合。
+7. 新 round 的预算、账务、外发与隔离统计只计算新 round 身份集合；历史 retained rows
+   不得纳入（钱包恒等式、usage 对账、MCP 计数均以新 round 行过滤）。
+8. 即使清理授权为 YES，也只允许处理本 round 进程级临时状态与明确授权的本 round 数据；
+   旧失败 round 数据一律不得清理。
 
 ### 2.1 固定 quarantine 基线（known_quarantined，不可调用）
 
@@ -360,12 +378,15 @@ test-state change，必须由用户在授权文本中逐项显式开启，不能
 L0 不调用真实模型/DataTap，不发生任何 Run 级计费（reserve/settle/release），也不发生真实
 DataTap discovery：L0 阶段启动控制面时 `DATATAP_MCP_ORIGIN` 必须指向 loopback 占位
 （discovery 本地失败、注册中心容错继续启动、catalog 不变更、0 外发、0 ToolCall、0 积分）；
-真实 discovery 只允许发生在 L1-00（§6.2，§2.2）。专用库当前为空（§2.0），L0 授权包含一次性的
-环境初始化例外：只经生产 domain/admin service 幂等创建
+真实 discovery 只允许发生在 L1-00（§6.2，§2.2）。专用库含 retained_by_policy 历史数据
+（§2.0 新 round 数据库状态门禁），L0 授权包含一次性的
+环境初始化例外：只经生产 domain/admin service 幂等创建 slug 与 Idempotency-Key 含新
+round_id 的全新
 synthetic 测试数据（两个 tenant、每 tenant ≥2 用户、TenantWallet 各 2000 积分且 reserved=0、
 用户周期额度 2000、含 `kol_selection`/`brand_analysis`/`campaign_analysis`/`kol_detail`/
 `utility` 的 License、租户级 Pi Runtime Config draft→单独激活），全部写审计/账本，禁止直接
-INSERT/UPDATE `encrypted_runtime_secrets`。除该初始化外，L0 只允许本地构建、对专用库只读
+INSERT/UPDATE `encrypted_runtime_secrets`，禁止复用或修改历史 retained 行；创建后按新增行
+delta 对账（只允许属于新 round 身份集合）。除该初始化外，L0 只允许本地构建、对专用库只读
 访问（Runtime Config、License、TenantWallet 与 quota 元数据，SELECT only）、创建证据目录并
 写入首帧。任一失败即停止，不进入 L1；模式 A 下也不得提出阶段 B。
 
@@ -610,7 +631,9 @@ INSERT/UPDATE `encrypted_runtime_secrets`。除该初始化外，L0 只允许本
 3. 启动门禁（fail-closed，任一不符即 B7_BLOCKED）：工作树干净、HEAD 为已审核 L1 repair
    baseline `68deca58…` 的线性后代且包含 `f8a4ffa`/`494d20e`/`c22a3a1`/`8a5f264`/`68deca5`
    五个修复提交、`68deca58…` 至 HEAD 区间仅已审核文档纠偏、§2.0 数据库
-   身份逐项核验（含专用账号访问 `kol_insight` 被 MySQL 1142 拒绝）、Keychain 引用可读取
+   身份逐项核验（含专用账号访问 `kol_insight` 被 MySQL 1142 拒绝）与新 round 数据库状态
+   门禁（§2.0：before snapshot 只读记录、新 round_id 对应 tenant/user/gateway/Run 为 0、
+   历史 retained 行只读不得复用或修改）、Keychain 引用可读取
    （值仅进程内）。2026-08-12 首次尝试即因工作树未提交改动在此 fail-closed。
 4. 启动门禁通过后按 §6.1 执行 L0-00…L0-12；任一失败即停止，不进入 L1。L0 产出值
    （tenant/user/gateway IDs、Runtime Config/License ID/version、Gateway build hash、
