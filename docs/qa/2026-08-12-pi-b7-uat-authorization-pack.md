@@ -405,8 +405,12 @@ REAL B7 UAT 一次性完整授权确认（ONESHOT_FULL_AUTHORIZATION，模式 B�
   不登记 allowlist、不进入 claim adapter_catalog；digest、行数或状态任何变化即硬停止）: <YES>
 - L1 授权范围（单 tenant/单 user/单 Run；失败不得进入 L2；禁止自动重试）:
   - 最终 L1 MCP 工具: <服务 slug / 工具内部名，如 insight-cube-mcp / match_best_tag>
-  - 上限: 最多 2 次模型逻辑请求（第一次工具调用、第二次消费结果并完成；第 3 次请求发生前硬停止）、≤1 次 DataTap 外发、≤10 积分: <YES>
+  - 上限: 最多 2 次模型逻辑请求（第一次工具调用、第二次消费结果并完成；由 worker provider
+    guard 在外发前硬执行，超限即 pi_decision_limit 稳定 failed）、≤1 次 DataTap 外发、≤10 积分: <YES>
+  - L1 Runtime Config: tenant-a 使用 limits.max_decisions=2 的 append-only 版本: <YES>
 - L2 授权范围: L2-01 至 L2-20 全部 20 个场景；核验场景复用已有 Run/Artifact；unknown 禁止自动重放: <YES>
+- L1→L2 配置版本规则: L1 成功后、进入 L2 前激活 tenant-a 新 append-only 版本（max_decisions=50）；
+  既有 L1 Run snapshot 不重绑定；新 L2 Run 必须绑定新版本；L1 失败不得激活: <YES>
 - 允许的 Level: <L1 / L1+L2>
 - 预算（13 项，全部必填数值）:
   - 最大 round 数: <n>

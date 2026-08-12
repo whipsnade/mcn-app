@@ -105,6 +105,16 @@ masked/fingerprint 引用；浏览器不回读明文。确认 `runtime_contract_
 backend、tenant scope、模型/桥接配置和价格快照后，再单独激活。激活是 append-only 版本操作，旧
 active 版本转 retired，不修改已创建 Run 的 snapshot。
 
+B7 专用的模型决策预算：`limits.max_decisions`（整数 1..100）是 server-owned 的模型请求预算，
+经 claim snapshot 送达 worker；worker 的 provider 流式入口由 `ModelRequestBudget` 在任何 HTTP
+外发前同步计数并拦截（超限抛稳定码 `pi_decision_limit`，terminal=failed、不创建恢复 Attempt、
+不重放）。缺失或非法（布尔/浮点/越界）时 worker 在启动前 fail-closed
+（`pi_gateway_runtime_snapshot_invalid`），Gateway 不得用默认值替代服务端快照。SDK 两层自动
+重试（agent auto-retry 与 provider maxRetries）在生产 session 中一律关闭；provider 流式终局
+失败以 `pi_model_provider_error` 稳定 failed 收口。B7 流程：L1 用 `max_decisions=2` 的配置版本；
+L1 通过后、L2 前激活 `max_decisions=50` 的新 append-only 版本（只影响新 Run，旧 Run snapshot
+不变）。
+
 ## 灰度、容量与回滚
 
 1. 先创建/激活兼容的 tenant Pi Runtime Config，确认 License 有效且包含 `kol_selection`，再确认至少

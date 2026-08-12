@@ -420,8 +420,9 @@ delta 对账（只允许属于新 round 身份集合）。除该初始化外，L
 | 形状 | 单租户、单用户、单 Run、单个已审核只读 MCP 工具、一次外发、固定最多 10 积分 |
 | 候选工具 | `match_best_tag`（insight-cube-mcp）；最终工具选择由阶段 B 模板固定，NEEDS_USER_APPROVAL |
 | 真实模型 / 真实 DataTap | 是 / 是（DataTap 一次；模型最多 2 次逻辑请求，见下） |
-| 模型请求上限 | **最多 2 次逻辑请求**：第一次产出工具调用，第二次消费结果并完成；第 3 次请求发生前硬停止（SDK/业务自动重试一律禁止） |
-| 验证点 | durable preflight 提交 → adapter 外发 → finalize 全链路；Evidence、租户账本（恰好 −10）、usage 记录、审计行齐备 |
+| 模型请求上限 | **最多 2 次逻辑请求**：第一次产出工具调用，第二次消费结果并完成；第 3 次请求发生前硬停止（SDK/业务自动重试一律禁止）。执行门禁：worker 的 provider 流式入口由 `ModelRequestBudget` 在外发前同步计数并拦截（`pi_decision_limit`），不是文字约束 |
+| L1 Runtime Config | tenant-a 使用 `limits.max_decisions=2` 的 append-only 配置版本（L0 初始化创建并激活）；L1 Run 的 snapshot 绑定该版本 |
+| 验证点 | durable preflight 提交 → adapter 外发 → finalize 全链路；Evidence、租户账本（恰好 −10）、usage 记录、审计行齐备；provider guard 计数与去重后的 RuntimeUsageRecord 对账一致 |
 | 禁止事项 | 禁止自动重试；失败立即停止，不进入 L2 |
 | 预期 terminal | `completed`（或稳定分类的失败——仍判 L1 不通过并停止） |
 | 回滚动作 | 无需状态回滚；证据保留 |
@@ -430,6 +431,16 @@ delta 对账（只允许属于新 round 身份集合）。除该初始化外，L
 ### 6.3 Level 2：完整真实 B7（20 个场景）
 
 预算列统一为 `NEEDS_USER_APPROVAL`（最大 Run/MCP/token/积分，且 ≤ §5 全局预算）。
+
+**L1→L2 Runtime Config 版本规则（append-only，授权的状态变更）**：
+
+- L1 成功后、进入 L2 前，经管理 API 创建并激活 tenant-a 的新 append-only 配置版本，
+  `limits.max_decisions=50`（L2 上限）；L1 若失败，不得激活 L2 配置。
+- 激活只影响新 Run：既有 L1 Run 的 `runtime_config_snapshot_json` 逐字节不变、不重绑定；
+  新 L2 Run 必须绑定新版本（snapshot `config_version_id` == 新版本 id）。
+- Evidence 记录两个 Config ID/version、激活时间与每个相关 Run 的 snapshot 绑定关系。
+- 模型请求预算以 worker provider guard（`ModelRequestBudget`）计数为准，并与去重后的
+  RuntimeUsageRecord 对账；两者不一致即停止。
 
 **L2-01 品牌报告完整链路**
 真实模型 是｜真实 DataTap 是｜测试钱包变更 是｜状态变更 否
