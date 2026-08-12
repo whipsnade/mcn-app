@@ -21,7 +21,11 @@ from app.core.config import get_settings
 from app.db.session import SessionFactory
 from app.mcp_gateway.contracts import DataTapService
 from app.model.dependencies import get_model_adapter
-from app.mcp_gateway.service import get_agent_mcp_transport, refresh_approved_datatap_tools
+from app.mcp_gateway.service import (
+    get_agent_mcp_transport,
+    get_mcp_transport,
+    refresh_approved_datatap_tools,
+)
 from app.pi_gateway.service import PiGatewayRecoveryService
 
 # 新 Agent 运行时默认租约时长（Task 15）；恢复扫描间隔走 Settings
@@ -225,6 +229,23 @@ def create_app() -> FastAPI:
             # 最后停 utility：executor 优雅停机期间收口的 Run 仍能触发，
             # stop 拒绝新触发并等待在途标题/摘要/建议任务完成。
             await agent_utility_dispatcher.stop()
+            # FastAPI 的 DataTap clients 也属于本拓扑进程的资源。若只停
+            # recovery/executor 而不关闭 transport，已结束的 MCP stream 会在
+            # fake gateway 上保持半关闭连接，下一轮离线拓扑的 startup
+            # discovery 可能卡在 list_tools；关闭顺序放在所有调用者之后。
+            # These getters are process-level ``lru_cache`` factories.  Closing
+            # the client without clearing the cache would return the same
+            # closed httpx client on the next in-process lifespan (notably the
+            # offline UAT reuses one event loop for several topologies).
+            for getter in (get_agent_mcp_transport, get_mcp_transport):
+                try:
+                    await getter().aclose()
+                except Exception:
+                    # shutdown 只做资源收口；原有业务终态不应被 transport
+                    # 的二次关闭异常改写。
+                    pass
+                finally:
+                    getter.cache_clear()
 
     app = FastAPI(title="KOL Insight API", version="0.1.0", lifespan=lifespan)
     # httpx's ASGI transport may skip lifespan in narrow route tests; keep the

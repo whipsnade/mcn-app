@@ -31,6 +31,41 @@ async def test_lifespan_starts_and_stops_both_recovery_loops(
 
 
 @pytest.mark.asyncio
+async def test_repeated_lifespan_rebuilds_cached_transports(
+    monkeypatch, tmp_path
+) -> None:
+    """Closing one app lifespan must not leave the global transport cache poisoned."""
+    from app import main as app_main
+
+    async def no_refresh() -> None:
+        return None
+
+    monkeypatch.setattr(app_main, "refresh_approved_datatap_tools", no_refresh)
+    monkeypatch.setenv("AGENT_UPLOAD_STORAGE_DIR", str(tmp_path / "uploads"))
+    app_main.get_agent_mcp_transport.cache_clear()
+    app_main.get_mcp_transport.cache_clear()
+    try:
+        first = app_main.create_app()
+        async with first.router.lifespan_context(first):
+            first_agent = app_main.get_agent_mcp_transport()
+            first_legacy = app_main.get_mcp_transport()
+        assert first_agent._client.is_closed  # noqa: SLF001
+        assert first_legacy._client.is_closed  # noqa: SLF001
+
+        second = app_main.create_app()
+        async with second.router.lifespan_context(second):
+            second_agent = app_main.get_agent_mcp_transport()
+            second_legacy = app_main.get_mcp_transport()
+            assert second_agent is not first_agent
+            assert second_legacy is not first_legacy
+            assert not second_agent._client.is_closed  # noqa: SLF001
+            assert not second_legacy._client.is_closed  # noqa: SLF001
+    finally:
+        app_main.get_agent_mcp_transport.cache_clear()
+        app_main.get_mcp_transport.cache_clear()
+
+
+@pytest.mark.asyncio
 async def test_wired_pi_recovery_callback_is_the_real_service(db_session, user_factory) -> None:
     """The wired callback must construct and drive PiGatewayRecoveryService.
 
