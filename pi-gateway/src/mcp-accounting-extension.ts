@@ -118,11 +118,14 @@ export function classifyMcpFailure(
 }
 
 /**
- * The adapter presents proxy tools as ``<server_with_underscores>_<remote
- * with dots replaced>``; the claim catalog binds that visible name back to
- * the reviewed internal tool identity.  Model input never self-reports the
- * mapping — unmappable names fall through and are rejected by the server's
- * preflight before any external dispatch.
+ * The claim catalog's ``adapter_visible_name`` is the plain remote name (e.g.
+ * ``match_best_tag``), and the model may address the generic ``mcp`` proxy
+ * tool with that bare name — optionally qualified by ``server``.  The legacy
+ * prefixed form ``<server_with_underscores>_<remote with dots replaced>``
+ * remains accepted.  Every accepted name must resolve to exactly one claim
+ * binding; ambiguous bare names without a server and unknown names are
+ * blocked locally (zero preflight, zero dispatch), and the reviewed catalog
+ * internal name is always the billing identity sent to preflight.
  */
 export function proxyVisibleToolName(server: string, remoteName: string): string {
   return `${server.replace(/-/g, "_")}_${remoteName.replace(/\./g, "_")}`;
@@ -178,6 +181,9 @@ export function createMcpAccountingExtensionFactory(
     hooks.on("tool_call", async (event: ToolCallEvent) => {
       const input = toMcpToolCall(event, bindings);
       if (input === undefined) return;
+      // 本地身份解析失败的 block 决策直接下发 SDK：不触达控制面 preflight，
+      // 更不可能外发（0 preflight、0 dispatch）。
+      if ("block" in input) return input;
       const decision = await accounting.beforeToolCall(input);
       if ("block" in decision && decision.block) return decision;
       if ("permit_id" in decision) permits.set(event.toolCallId, decision);
@@ -229,7 +235,7 @@ export function createMcpAccountingExtensionFactory(
 function toMcpToolCall(
   event: ToolCallEvent,
   bindings: readonly McpToolBinding[],
-): McpToolCallInput | undefined {
+): McpToolCallInput | McpBlocked | undefined {
   const input: Record<string, unknown> = isRecord(event.input)
     ? event.input as Record<string, unknown>
     : {};
@@ -239,20 +245,30 @@ function toMcpToolCall(
     if (typeof input.tool !== "string" || input.tool.length === 0) return undefined;
     const args = normalizeArgs(input.args);
     const requestedServer = typeof input.server === "string" ? input.server : "";
-    const match = bindings.find(
-      (binding) =>
-        binding.remoteName !== undefined &&
-        proxyVisibleToolName(binding.server, binding.remoteName) === input.tool &&
-        (requestedServer.length === 0 || binding.server === requestedServer),
-    );
-    if (match) {
+    // Accept every reviewed addressing form: the catalog internal name
+    // (== adapter-visible name), the bare remote name, and the legacy
+    // prefixed proxy name.  Never "find first" — a bare name shared by two
+    // services without an explicit server must fail closed with zero
+    // preflight and zero dispatch.
+    const candidates = bindings.filter((binding) => {
+      if (requestedServer.length > 0 && binding.server !== requestedServer) return false;
+      if (binding.toolName === input.tool) return true;
+      if (binding.remoteName === undefined) return false;
+      return (
+        binding.remoteName === input.tool ||
+        proxyVisibleToolName(binding.server, binding.remoteName) === input.tool
+      );
+    });
+    const unique = new Map<string, McpToolBinding>();
+    for (const binding of candidates) unique.set(`${binding.server}${binding.toolName}`, binding);
+    if (unique.size === 1) {
+      const match = [...unique.values()][0];
       return { tool: match.toolName, server: match.server, args };
     }
-    return {
-      tool: input.tool,
-      server: requestedServer,
-      args,
-    };
+    if (unique.size > 1) {
+      return { block: true, reason: "mcp_tool_identity_ambiguous" };
+    }
+    return { block: true, reason: "mcp_tool_identity_invalid" };
   }
   const binding = bindings.find((item) => item.toolName === event.toolName);
   if (!binding) return undefined;

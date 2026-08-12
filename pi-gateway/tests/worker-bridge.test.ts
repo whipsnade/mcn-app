@@ -133,7 +133,9 @@ describe("isolated worker control-plane bridge", () => {
         {
           kind: "tool_call",
           tool: "mcp",
-          args: { tool: "query_analysis_data", server: "insight-cube", args: { keyword: "美妆" } },
+          // 身份必须能经 bindings 解析才会到达 preflight（本地身份闸先行）；
+          // 裸 remote 名 + 显式 server 命中 ADAPTER_CATALOG 的 insight-cube/query。
+          args: { tool: "query", server: "insight-cube", args: { keyword: "美妆" } },
         },
         { kind: "text", text: "无法调用数据工具" },
       ],

@@ -56,6 +56,7 @@ export interface ProductionMcpConfig {
     hostConfigDiscovery: "off";
     scriptMode: false;
     directTools: false;
+    toolPrefix: "none";
     requestTimeoutMs: number;
   };
   mcpServers: Record<
@@ -101,6 +102,11 @@ export function createMcpConfig(
       hostConfigDiscovery: "off",
       scriptMode: false,
       directTools: false,
+      // 模型可见名 = 裸 remote 名（与 claim catalog 投影的 adapter_visible_name
+      // 一致）。真实模型经通用 mcp 代理即以裸名寻址；prefixed 旧名仍由计费
+      // 扩展映射到已审核身份，但 adapter 分发只接受裸名（未知名 fail-closed
+      // tool_not_found → definitely_not_sent 释放，绝不计费）。
+      toolPrefix: "none",
       requestTimeoutMs: 180_000,
     },
     mcpServers,

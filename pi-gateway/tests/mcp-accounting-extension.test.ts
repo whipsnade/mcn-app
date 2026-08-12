@@ -70,7 +70,11 @@ describe("McpAccountingExtension", () => {
       finalize: vi.fn(),
       fail: vi.fn(),
     });
-    createMcpAccountingExtensionFactory(extension)({
+    // 身份必须先经 bindings 解析成功，才能走到 preflight 并覆盖
+    // control_plane_unreachable 路径（空 bindings 会在本地 identity 闸拦截）。
+    createMcpAccountingExtensionFactory(extension, [
+      { toolName: "query", server: "insight", remoteName: "query" },
+    ])({
       on: (name: string, handler: (event: any) => Promise<unknown>) => handlers.set(name, handler),
     } as any);
     await expect(handlers.get("tool_call")?.({
@@ -270,5 +274,118 @@ describe("McpAccountingExtension", () => {
 
     expect(control.finalize).not.toHaveBeenCalled();
     expect(control.fail).toHaveBeenCalledWith({ permit_id: "p-1" }, "result_unknown");
+  });
+});
+
+describe("generic mcp proxy identity resolution (real catalog shapes)", () => {
+  // 真实 claim adapter_catalog 投影的 adapter_visible_name 是裸 remote 名
+  // （见 REAL_B7_20260812T045636Z_b801c490 L1 失败证据）；bindings 与真实
+  // catalog 对齐：toolName = remoteName = catalog 内部名。
+  const REAL_BINDINGS = [
+    { toolName: "match_best_tag", server: "insight-cube-mcp", remoteName: "match_best_tag" },
+    { toolName: "kol_detail", server: "social-grow-mcp", remoteName: "kol_detail" },
+  ];
+
+  function setup(bindings: readonly { toolName: string; server: string; remoteName?: string }[]) {
+    const handlers = new Map<string, (event: any) => Promise<unknown>>();
+    const control = {
+      preflight: vi.fn(async () => ({ permit_id: "p-1" })),
+      finalize: vi.fn(),
+      fail: vi.fn(),
+    };
+    const extension = new McpAccountingExtension(control);
+    createMcpAccountingExtensionFactory(extension, bindings)({
+      on: (name: string, handler: (event: any) => Promise<unknown>) => handlers.set(name, handler),
+    } as any);
+    return { handlers, control };
+  }
+
+  it("resolves a bare remote name with an explicit server to the reviewed internal identity", async () => {
+    const { handlers, control } = setup(REAL_BINDINGS);
+    const before = await handlers.get("tool_call")?.({
+      type: "tool_call", toolName: "mcp", toolCallId: "tc-1",
+      input: { tool: "match_best_tag", server: "insight-cube-mcp", args: { brand: "瑞幸咖啡" } },
+    });
+    expect(before).toBeUndefined();
+    expect(control.preflight).toHaveBeenCalledTimes(1);
+    expect(control.preflight).toHaveBeenCalledWith({
+      tool: "match_best_tag", server: "insight-cube-mcp", args: { brand: "瑞幸咖啡" },
+    });
+  });
+
+  it("infers the server when the bare remote name is globally unique", async () => {
+    const { handlers, control } = setup(REAL_BINDINGS);
+    const before = await handlers.get("tool_call")?.({
+      type: "tool_call", toolName: "mcp", toolCallId: "tc-2",
+      input: { tool: "match_best_tag", args: { brand: "瑞幸咖啡" } },
+    });
+    expect(before).toBeUndefined();
+    expect(control.preflight).toHaveBeenCalledTimes(1);
+    expect(control.preflight).toHaveBeenCalledWith({
+      tool: "match_best_tag", server: "insight-cube-mcp", args: { brand: "瑞幸咖啡" },
+    });
+  });
+
+  it("fails closed without any preflight when a bare remote name is ambiguous and no server is given", async () => {
+    const { handlers, control } = setup([
+      { toolName: "get_config", server: "svc-a", remoteName: "get_config" },
+      { toolName: "get_config", server: "svc-b", remoteName: "get_config" },
+    ]);
+    const before = await handlers.get("tool_call")?.({
+      type: "tool_call", toolName: "mcp", toolCallId: "tc-3",
+      input: { tool: "get_config", args: {} },
+    });
+    expect(before).toEqual({ block: true, reason: "mcp_tool_identity_ambiguous" });
+    expect(control.preflight).not.toHaveBeenCalled();
+  });
+
+  it("maps an ambiguous remote name exactly when the server is explicit", async () => {
+    const { handlers, control } = setup([
+      { toolName: "get_config", server: "svc-a", remoteName: "get_config" },
+      { toolName: "get_config", server: "svc-b", remoteName: "get_config" },
+    ]);
+    const before = await handlers.get("tool_call")?.({
+      type: "tool_call", toolName: "mcp", toolCallId: "tc-4",
+      input: { tool: "get_config", server: "svc-b", args: {} },
+    });
+    expect(before).toBeUndefined();
+    expect(control.preflight).toHaveBeenCalledTimes(1);
+    expect(control.preflight).toHaveBeenCalledWith({ tool: "get_config", server: "svc-b", args: {} });
+  });
+
+  it("blocks an unknown bare tool name with mcp_tool_identity_invalid and zero preflight", async () => {
+    const { handlers, control } = setup(REAL_BINDINGS);
+    const before = await handlers.get("tool_call")?.({
+      type: "tool_call", toolName: "mcp", toolCallId: "tc-5",
+      input: { tool: "no_such_tool", server: "insight-cube-mcp", args: {} },
+    });
+    expect(before).toEqual({ block: true, reason: "mcp_tool_identity_invalid" });
+    expect(control.preflight).not.toHaveBeenCalled();
+  });
+
+  it("keeps the legacy prefixed proxy name working", async () => {
+    const { handlers, control } = setup(REAL_BINDINGS);
+    const before = await handlers.get("tool_call")?.({
+      type: "tool_call", toolName: "mcp", toolCallId: "tc-6",
+      input: { tool: "insight_cube_mcp_match_best_tag", args: {} },
+    });
+    expect(before).toBeUndefined();
+    expect(control.preflight).toHaveBeenCalledTimes(1);
+    expect(control.preflight).toHaveBeenCalledWith({
+      tool: "match_best_tag", server: "insight-cube-mcp", args: {},
+    });
+  });
+
+  it("does not regress the direct adapter tool path", async () => {
+    const { handlers, control } = setup(REAL_BINDINGS);
+    const before = await handlers.get("tool_call")?.({
+      type: "tool_call", toolName: "match_best_tag", toolCallId: "tc-7",
+      input: { brand: "瑞幸咖啡" },
+    });
+    expect(before).toBeUndefined();
+    expect(control.preflight).toHaveBeenCalledTimes(1);
+    expect(control.preflight).toHaveBeenCalledWith({
+      tool: "match_best_tag", server: "insight-cube-mcp", args: { brand: "瑞幸咖啡" },
+    });
   });
 });

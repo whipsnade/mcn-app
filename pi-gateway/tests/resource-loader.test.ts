@@ -39,6 +39,7 @@ describe("production resource loader", () => {
       hostConfigDiscovery: "off",
       scriptMode: false,
       directTools: false,
+      toolPrefix: "none",
       requestTimeoutMs: 180_000,
     });
     expect(config.mcpServers["insight-cube"]).toEqual({
