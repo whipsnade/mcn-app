@@ -27,7 +27,7 @@ function usageObject(event: RecordValue): RecordValue | undefined {
   if (event.type === "usage" && isRecord(event.usage)) return event.usage;
   if (event.type === "message_end" || event.type === "turn_end") {
     const message = event.message;
-    return isRecord(message) && isRecord(message.usage) ? message.usage : {};
+    return isRecord(message) && isRecord(message.usage) ? message.usage : undefined;
   }
   if (event.type === "message_update") {
     const update = event.assistantMessageEvent;
@@ -42,7 +42,9 @@ function usageObject(event: RecordValue): RecordValue | undefined {
     if (isRecord(update.partial) && isRecord(update.partial.usage)) return update.partial.usage;
     if (isRecord(update.message) && isRecord(update.message.usage)) return update.message.usage;
     if (isRecord(event.message) && isRecord(event.message.usage)) return event.message.usage;
-    return {};
+    // 没有 usage 时不立即制造 unavailable：同一 provider 调用的真实 usage
+    // 可能由后续 message_end/turn_end 携带；turn 边界统一兜底。
+    return undefined;
   }
   return undefined;
 }
@@ -130,6 +132,9 @@ export class PiSdkUsageProjector {
   private completionEmitted = false;
   /** 最近一次 text_end/done 的候选最终文本；工具调用出现即作废。 */
   private pendingCompletionText: string | undefined;
+  /** 当前 turn 序号（turn_start 递增）与本 turn 是否已产出 usage 记录。 */
+  private turnIndex = 0;
+  private usageEmittedThisTurn = false;
   readonly diagnostics: UsageProjectorDiagnostics = {
     unknownEvents: 0,
     invalidUsage: 0,
@@ -153,6 +158,16 @@ export class PiSdkUsageProjector {
     if (!isRecord(event) || typeof event.type !== "string") {
       this.diagnostics.unknownEvents += 1;
       return [];
+    }
+    if (event.type === "agent_start") {
+      this.turnIndex = 0;
+      this.usageEmittedThisTurn = false;
+    }
+    if (event.type === "turn_start") {
+      // turn_start 重置 turn 范围：不同 turn 中 token 数恰好相同的真实请求
+      // 属于不同 provider 调用，绝不能跨 turn 去重。
+      this.turnIndex += 1;
+      this.usageEmittedThisTurn = false;
     }
     if (event.type === "tool_execution_start" || event.type === "tool_call") {
       // 工具调用意味着之前的文本只是前导语，不是最终回答。
@@ -186,10 +201,26 @@ export class PiSdkUsageProjector {
     }
     if (usage !== undefined) {
       const usageEvent = this.projectUsage(event, usage);
-      if (usageEvent !== undefined) out.push(usageEvent);
+      if (usageEvent !== undefined) {
+        this.usageEmittedThisTurn = true;
+        out.push(usageEvent);
+      }
+    } else if (isTurnBoundary && !this.usageEmittedThisTurn) {
+      // turn 收口仍无任何 usage：恰好一条 unavailable 兜底（同一 provider
+      // 调用最终最多一条 RuntimeUsageRecord）。
+      this.usageEmittedThisTurn = true;
+      out.push(this.nextEvent("usage", { usage_status: "unavailable" }));
     }
     if (generic === undefined && usage === undefined && out.length === 0) {
-      this.diagnostics.unknownEvents += 1;
+      // 已知类型空产出（如无 usage 的 message_end）不算 unknown。
+      const KNOWN_SILENT = new Set([
+        "agent_start", "turn_start", "agent_end", "turn_end",
+        "message_start", "message_update", "message_end",
+        "tool_execution_start", "tool_call", "tool_execution_end", "tool_result", "usage",
+      ]);
+      if (!KNOWN_SILENT.has(event.type)) {
+        this.diagnostics.unknownEvents += 1;
+      }
     }
     return out;
   }
@@ -205,13 +236,36 @@ export class PiSdkUsageProjector {
     };
   }
 
+  private assistantMessageId(event: RecordValue): string | undefined {
+    const direct = isRecord(event.message) ? safeString(event.message.id) : undefined;
+    if (direct) return direct;
+    const update = event.assistantMessageEvent;
+    if (isRecord(update) && isRecord(update.message)) return safeString(update.message.id);
+    return undefined;
+  }
+
+  /** turn 内稳定 usage 指纹（仅用于无 request/message id 时的同调用去重）。 */
+  private turnUsageFingerprint(usage: RecordValue): string | undefined {
+    const tokens = [
+      usage.input_tokens ?? usage.input,
+      usage.output_tokens ?? usage.output,
+      usage.cache_read_tokens ?? usage.cache_read ?? usage.cacheRead,
+      usage.cache_write_tokens ?? usage.cache_write ?? usage.cacheWrite,
+    ].map((value) => (integer(value) ?? "x"));
+    const model = safeString(usage.model) ?? "";
+    const provider = safeString(usage.provider) ?? "";
+    return `t${this.turnIndex}|${tokens.join(",")}|${provider}|${model}`;
+  }
+
   private projectUsage(event: RecordValue, usage: RecordValue): PiGatewaySourceEvent | undefined {
     const requestId = safeString(usage.requestId ?? usage.upstream_request_id);
+    // 去重优先级：upstream request id → assistant message id → turn 内 usage 指纹。
+    const messageId = requestId ? undefined : this.assistantMessageId(event);
     const dedupeKey = requestId
       ? `request:${requestId}`
-      : safeEventId(event)
-        ? `usage-event:${safeEventId(event)}`
-        : undefined;
+      : messageId
+        ? `usage-message:${messageId}`
+        : `turn-usage:${this.turnUsageFingerprint(usage)}`;
     if (dedupeKey && this.seen.has(dedupeKey)) {
       this.diagnostics.duplicateUsage += 1;
       return undefined;

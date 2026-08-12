@@ -4,8 +4,9 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 
-import { installWorkerSignalHandlers, runSingleWorker, spawnIsolatedWorker } from "../src/worker-entry.js";
-import type { ClaimedRun, PiRunSession, SecretBundle } from "../src/protocol.js";
+import { classifyWorkerError, installWorkerSignalHandlers, runSingleWorker, spawnIsolatedWorker } from "../src/worker-entry.js";
+import { ModelRequestBudget } from "../src/model-request-budget.js";
+import type { ClaimedRun, PiRunSession, PiSessionFactory, SecretBundle } from "../src/protocol.js";
 
 const work: ClaimedRun = {
   runId: "run-worker",
@@ -26,6 +27,7 @@ const work: ClaimedRun = {
       { service: "social-grow-content", adapterName: "content", remoteName: "query", schemaDigest: "sha256:c" },
       { service: "aktools", adapterName: "ak", remoteName: "query", schemaDigest: "sha256:d" },
     ],
+    maxDecisions: 50,
   },
 };
 
@@ -180,9 +182,16 @@ describe("single-run worker lifecycle", () => {
     expect(messages[0]).toEqual({ type: "ready", runId: work.runId });
     expect(messages.at(-1)).toEqual({ type: "done", runId: work.runId });
     expect(messages.filter((message) => message.type === "event").length).toBeGreaterThanOrEqual(4);
-    expect(messages.find((message) => message.type === "event" && (message.event as { event_type?: string })?.event_type === "usage")).toMatchObject({
-      event: { source_event_id: "attempt-worker:4", event_type: "usage" },
+    // usage 去重后恰好一条（同一 provider 调用的 done/turn_end 不重复投影）；
+    // 具体序号随投影顺序演进，不作硬编码。
+    const usageEvents = messages.filter(
+      (message) => message.type === "event" && (message.event as { event_type?: string })?.event_type === "usage",
+    );
+    expect(usageEvents).toHaveLength(1);
+    expect(usageEvents[0]).toMatchObject({
+      event: { event_type: "usage" },
     });
+    expect(String((usageEvents[0] as { event: { source_event_id: string } }).event.source_event_id)).toMatch(/^attempt-worker:\d+$/);
     expect(projected.length).toBeGreaterThanOrEqual(4);
     expect(projected[0]).toMatchObject({ source_event_id: "attempt-worker:1" });
   });
@@ -253,5 +262,55 @@ describe("single-run worker lifecycle", () => {
     await new Promise((resolve) => setImmediate(resolve));
     remove();
     expect(calls).toBe(1);
+  });
+});
+
+describe("pi_decision_limit stable failure classification", () => {
+  it("classifyWorkerError preserves pi_decision_limit (message and code forms)", () => {
+    expect(classifyWorkerError(new Error("pi_decision_limit"))).toBe("pi_decision_limit");
+    const withCode = Object.assign(new Error("boom"), { code: "pi_decision_limit" });
+    expect(classifyWorkerError(withCode)).toBe("pi_decision_limit");
+    expect(classifyWorkerError(new Error("sdk_protocol_error"))).toBe("sdk_protocol_error");
+    expect(classifyWorkerError(new Error("something else"))).toBe("worker_error");
+  });
+
+  it("rejects done with pi_decision_limit from the child terminal frame", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "worker-decision-limit-"));
+    const script = join(directory, "decision-limit.mjs");
+    await writeFile(script, [
+      "process.on('message', () => {",
+      "  process.send({ type: 'failed', runId: 'run-worker', errorCode: 'pi_decision_limit' }, () => {",
+      "    process.disconnect();",
+      "    process.exit(1);",
+      "  });",
+      "});",
+    ].join("\n"));
+    const child = spawnIsolatedWorker(work, secrets, {
+      workerScript: script,
+      parentEnv: { PATH: "/usr/bin" },
+    });
+
+    await expect(child.done).rejects.toMatchObject({ message: "pi_decision_limit" });
+  });
+
+  it("runSingleWorker rethrows pi_decision_limit when the session budget was exceeded", async () => {
+    const budget = new ModelRequestBudget(1);
+    budget.assertAndConsume();
+    expect(() => budget.assertAndConsume()).toThrow("pi_decision_limit");
+    const sessionFactory: PiSessionFactory = {
+      create: async () => ({
+        prompt: async () => undefined,
+        subscribe: () => () => undefined,
+        abort: async () => undefined,
+        dispose: async () => undefined,
+        systemPrompt: () => "",
+        activeToolNames: () => [],
+        cwd: () => "/tmp",
+        modelBudget: budget,
+      }),
+    };
+    await expect(
+      runSingleWorker(work, secrets, { sessionFactory }),
+    ).rejects.toThrow("pi_decision_limit");
   });
 });

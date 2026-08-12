@@ -67,12 +67,13 @@ describe("Pi SDK usage projector", () => {
     });
     const boundary = projector.project({ type: "agent_end" });
 
-    // done 帧只投影 usage；completion 推迟到 agent_end 且每 Attempt 恰好一次
-    expect(first.map((event) => event.event_type)).toEqual(["usage"]);
-    expect(first[0]?.payload).toMatchObject({ usage_status: "unavailable" });
-    expect(second.map((event) => event.event_type)).toEqual(["usage"]);
-    expect(boundary.map((event) => event.event_type)).toEqual(["message.completed", "agent.turn.end"]);
+    // 无 usage 的 done 帧不再立即制造 unavailable；unavailable 由 turn 边界
+    // 兜底且恰好一条。completion 推迟到 agent_end 且每 Attempt 恰好一次。
+    expect(first.filter((event) => event.event_type === "usage")).toEqual([]);
+    expect(second.filter((event) => event.event_type === "usage")).toEqual([]);
+    expect(boundary.map((event) => event.event_type)).toEqual(["message.completed", "agent.turn.end", "usage"]);
     expect(boundary[0]?.payload).toEqual({ text: "结论" });
+    expect(boundary[2]?.payload).toEqual({ usage_status: "unavailable" });
     expect(projector.project({ type: "agent_end" }).map((event) => event.event_type)).toEqual(
       ["agent.turn.end"],
     );
@@ -132,30 +133,39 @@ describe("Pi SDK usage projector", () => {
     });
   });
 
-  it("records unavailable without estimating missing usage and ignores duplicates/unknown events", () => {
+  it("records one unavailable per usage-less turn at the turn boundary and ignores duplicates/unknown events", () => {
     const projector = new PiSdkUsageProjector("attempt-2");
-    const first = projector.project({ eventId: "end-1", type: "message_end", message: { role: "assistant" } });
-    const duplicate = projector.project({ eventId: "end-1", type: "message_end", message: { role: "assistant" } });
+    // 同一 turn 内：无 usage 的 message_end 不再立即产 unavailable；turn_end 兜底恰好一条。
+    const deferred = projector.project({ eventId: "end-1", type: "message_end", message: { role: "assistant" } });
+    const fallback = projector.project({ eventId: "end-2", type: "turn_end", message: { role: "assistant" } });
+    const dupMessage = projector.project({ eventId: "end-1", type: "message_end", message: { role: "assistant" } });
+    const dupBoundary = projector.project({ eventId: "end-3", type: "turn_end", message: { role: "assistant" } });
     const unknown = projector.project({ type: "queue_update", steering: [] });
 
-    expect(first[0]).toMatchObject({
-      source_event_id: "attempt-2:1",
-      payload: { usage_status: "unavailable" },
-    });
-    expect(first[0]?.payload).not.toHaveProperty("input_tokens");
-    expect(duplicate).toEqual([]);
+    expect(deferred.filter((event) => event.event_type === "usage")).toEqual([]);
+    const fallbackUsage = fallback.filter((event) => event.event_type === "usage");
+    expect(fallbackUsage).toHaveLength(1);
+    expect(fallbackUsage[0]?.payload).toEqual({ usage_status: "unavailable" });
+    expect(dupMessage.filter((event) => event.event_type === "usage")).toEqual([]);
+    expect(dupBoundary.filter((event) => event.event_type === "usage")).toEqual([]);
     expect(unknown).toEqual([]);
     expect(projector.diagnostics.unknownEvents).toBe(1);
   });
 
-  it("keeps distinct unavailable calls without an SDK identity", () => {
+  it("keeps distinct unavailable calls in distinct turns without an SDK identity", () => {
     const projector = new PiSdkUsageProjector("attempt-2b");
 
-    const first = projector.project({ type: "message_end", message: { role: "assistant" } });
-    const second = projector.project({ type: "message_end", message: { role: "assistant" } });
+    projector.project({ type: "turn_start" });
+    projector.project({ type: "message_end", message: { role: "assistant" } });
+    const firstTurn = projector.project({ type: "turn_end", message: { role: "assistant" } });
+    projector.project({ type: "turn_start" });
+    projector.project({ type: "message_end", message: { role: "assistant" } });
+    const secondTurn = projector.project({ type: "turn_end", message: { role: "assistant" } });
 
-    expect(first[0]?.source_event_id).toBe("attempt-2b:1");
-    expect(second[0]?.source_event_id).toBe("attempt-2b:2");
+    const first = firstTurn.filter((event) => event.event_type === "usage");
+    const second = secondTurn.filter((event) => event.event_type === "usage");
+    expect(first).toHaveLength(1);
+    expect(second).toHaveLength(1);
     expect(first[0]?.payload).toEqual({ usage_status: "unavailable" });
     expect(second[0]?.payload).toEqual({ usage_status: "unavailable" });
     expect(projector.diagnostics.duplicateUsage).toBe(0);
@@ -270,5 +280,71 @@ describe("Pi SDK usage projector", () => {
     expect(calls).toHaveLength(1);
     expect(JSON.parse(String(calls[0].body))).toMatchObject({ event_type: "usage" });
     expect(calls[0].headers).toMatchObject({ "X-Pi-Run-Lease": "lease-token-012345678901234567890123" });
+  });
+});
+
+describe("usage dedup per provider call (real event shapes)", () => {
+  const USAGE = { input: 10, output: 5 };
+
+  it("done with usage followed by turn_end with the same usage yields exactly one record", () => {
+    const projector = new PiSdkUsageProjector("attempt-d1");
+    const first = projector.project({
+      type: "message_update",
+      assistantMessageEvent: { type: "done", message: { id: "m1", role: "assistant", usage: USAGE } },
+      message: { id: "m1", role: "assistant", usage: USAGE },
+    });
+    const second = projector.project({ type: "turn_end", message: { id: "m1", role: "assistant", usage: USAGE } });
+    const usageEvents = [...first, ...second].filter((e) => e.event_type === "usage");
+    expect(usageEvents).toHaveLength(1);
+    expect(usageEvents[0]?.payload).toMatchObject({ input_tokens: 10, output_tokens: 5, usage_status: "available" });
+  });
+
+  it("dedups by upstream request id when present", () => {
+    const projector = new PiSdkUsageProjector("attempt-d2");
+    const usage = { input: 10, output: 5, requestId: "req-9" };
+    projector.project({ type: "message_update", assistantMessageEvent: { type: "done", message: { usage } }, message: { usage } });
+    const second = projector.project({ type: "turn_end", message: { usage } });
+    expect(second.filter((e) => e.event_type === "usage")).toEqual([]);
+  });
+
+  it("message_update without usage emits nothing; a later turn_end supplies the real usage", () => {
+    const projector = new PiSdkUsageProjector("attempt-d3");
+    const first = projector.project({
+      type: "message_update",
+      assistantMessageEvent: { type: "done", message: { id: "m2", role: "assistant" } },
+      message: { id: "m2", role: "assistant" },
+    });
+    expect(first.filter((e) => e.event_type === "usage")).toEqual([]);
+    const second = projector.project({ type: "turn_end", message: { id: "m2", role: "assistant", usage: USAGE } });
+    const usageEvents = second.filter((e) => e.event_type === "usage");
+    expect(usageEvents).toHaveLength(1);
+    expect(usageEvents[0]?.payload).toMatchObject({ usage_status: "available", input_tokens: 10 });
+  });
+
+  it("identical token counts in different turns are never deduped across turns", () => {
+    const projector = new PiSdkUsageProjector("attempt-d4");
+    projector.project({ type: "turn_start" });
+    const a1 = projector.project({ type: "message_update", assistantMessageEvent: { type: "done", message: { usage: USAGE } }, message: { usage: USAGE } });
+    const a2 = projector.project({ type: "turn_end", message: { usage: USAGE } });
+    projector.project({ type: "turn_start" });
+    const b1 = projector.project({ type: "message_update", assistantMessageEvent: { type: "done", message: { usage: USAGE } }, message: { usage: USAGE } });
+    const b2 = projector.project({ type: "turn_end", message: { usage: USAGE } });
+    const all = [...a1, ...a2, ...b1, ...b2].filter((e) => e.event_type === "usage");
+    expect(all).toHaveLength(2);
+  });
+
+  it("a fully usage-less turn yields exactly one unavailable record", () => {
+    const projector = new PiSdkUsageProjector("attempt-d5");
+    projector.project({ type: "turn_start" });
+    const first = projector.project({
+      type: "message_update",
+      assistantMessageEvent: { type: "done", message: { id: "m3", role: "assistant" } },
+      message: { id: "m3", role: "assistant" },
+    });
+    const second = projector.project({ type: "message_end", message: { id: "m3", role: "assistant" } });
+    const third = projector.project({ type: "turn_end", message: { id: "m3", role: "assistant" } });
+    const all = [...first, ...second, ...third].filter((e) => e.event_type === "usage");
+    expect(all).toHaveLength(1);
+    expect(all[0]?.payload).toEqual({ usage_status: "unavailable" });
   });
 });
