@@ -92,6 +92,8 @@ export interface GatewayControlPlane {
 }
 
 export interface GatewayWorkerHandle {
+  /** The child PID when the worker is an isolated process (test/ops only). */
+  pid?: number;
   abort?: () => void | Promise<void>;
   done?: Promise<void>;
   onEvent?: (listener: (event: PiGatewaySourceEvent) => void) => () => void;
@@ -125,6 +127,7 @@ export class PiGateway {
   private readonly controlTimeoutMs: number;
   private readonly shutdownTimeoutMs: number;
   private readonly maxBufferedEvents: number;
+  private readonly workerPids = new Set<number>();
   private stopped = false;
 
   constructor(options: PiGatewayOptions) {
@@ -144,6 +147,11 @@ export class PiGateway {
 
   get activeCount(): number {
     return this.pool.activeCount;
+  }
+
+  /** PIDs owned by this Gateway's currently active workers. */
+  get activeWorkerPids(): readonly number[] {
+    return [...this.workerPids].sort((left, right) => left - right);
   }
 
   async tick(): Promise<boolean> {
@@ -254,7 +262,7 @@ export class PiGateway {
         if (heartbeatFailed || beatsStopped) return;
         const delay = Math.min(
           this.heartbeatIntervalMs,
-          Math.max(10, Math.floor((leaseDeadlineMs - Date.now()) / 3)),
+          Math.max(1, Math.floor((leaseDeadlineMs - Date.now()) / 3)),
         );
         const timer = setTimeout(() => {
           this.heartbeatTimers.delete(timer);
@@ -343,6 +351,9 @@ export class PiGateway {
         handle = typeof workerResult === "object" && workerResult !== null
           ? workerResult
           : undefined;
+        if (handle?.pid !== undefined && Number.isInteger(handle.pid) && handle.pid > 0) {
+          this.workerPids.add(handle.pid);
+        }
         // 任何提前返回路径都不消费 done：先挂 sink，被拒绝的 done 永远不会
         // 成为 unhandledRejection 打挂 Gateway 进程；race 处的 await 语义不变。
         if (handle?.done) void handle.done.catch(() => undefined);
@@ -499,6 +510,7 @@ export class PiGateway {
         if (heartbeatTimer !== undefined) this.heartbeatTimers.delete(heartbeatTimer);
         unregisterEvents?.();
         unregisterAbort?.();
+        if (handle?.pid !== undefined) this.workerPids.delete(handle.pid);
       }
     });
     return { outcome: "claimed", completion: promise };

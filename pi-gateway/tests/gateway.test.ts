@@ -4,6 +4,38 @@ import { PiGateway } from "../src/gateway.js";
 import type { PiGatewaySourceEvent } from "../src/protocol.js";
 
 describe("PiGateway", () => {
+  it("tracks only active isolated worker PIDs", async () => {
+    let finish!: () => void;
+    const done = new Promise<void>((resolve) => { finish = resolve; });
+    const controlPlane = {
+      claim: vi.fn().mockResolvedValue({
+        run_id: "run-pid",
+        attempt_id: "attempt-pid",
+        lease_token: "lease-token-with-enough-entropy",
+        lease_expires_at: Math.floor(Date.now() / 1000) + 3600,
+        runtime_snapshot: {},
+        transcript: [],
+        secret_envelope: { alg: "AES-256-GCM", nonce: "1234567890123456", ciphertext: "1234567890123456" },
+        adapter_catalog: [],
+        internal_tools: [],
+      }),
+      terminal: vi.fn().mockResolvedValue(undefined),
+      heartbeat: vi.fn().mockResolvedValue({ cancel_requested: false }),
+    };
+    const gateway = new PiGateway({
+      controlPlane,
+      capacity: 1,
+      worker: async () => ({ pid: 4242, done }),
+    });
+
+    const dispatch = await gateway.dispatchNext();
+    expect(dispatch.outcome).toBe("claimed");
+    expect(gateway.activeWorkerPids).toEqual([4242]);
+    finish();
+    await (dispatch as { completion: Promise<void> }).completion;
+    expect(gateway.activeWorkerPids).toEqual([]);
+  });
+
   it("claims only up to capacity and sends terminal for completed workers", async () => {
     const terminal = vi.fn().mockResolvedValue(undefined);
     let remaining = 2;

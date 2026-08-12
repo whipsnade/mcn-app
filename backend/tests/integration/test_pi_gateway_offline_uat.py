@@ -14,7 +14,6 @@ import json
 import os
 import re
 import signal
-import subprocess
 import time
 from typing import Any
 from uuid import uuid4
@@ -990,29 +989,18 @@ async def test_cancel_run_reaches_cancelled_terminal() -> None:
         assert event_count == len(events)
 
 
-def _worker_pids(topology: PiUatTopology) -> set[int]:
-    """本拓扑 Gateway 进程组内的 worker 子进程（fork 的 worker-entry.js）。
-
-    按 pgid 过滤：不触碰其他测试会话/拓扑的同名进程。
-    """
-    pgid = topology.gateway_pgid
-    if pgid is None:
+async def _worker_pids(topology: PiUatTopology) -> set[int]:
+    """读取本拓扑 Gateway 自己登记的 worker 子进程 PID。"""
+    if topology.gateway_pgid is None:
         return set()
-    result = subprocess.run(
-        ["ps", "-eo", "pid=,pgid=,args="],  # noqa: S603,S607
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    pids: set[int] = set()
-    for line in result.stdout.splitlines():
-        parts = line.split(None, 2)
-        if len(parts) < 3:
-            continue
-        pid_s, pgid_s, args = parts
-        if pgid_s == str(pgid) and "worker-entry.js" in args and pid_s.isdigit():
-            pids.add(int(pid_s))
-    return pids
+    async with httpx.AsyncClient(timeout=5) as client:
+        response = await client.get(f"http://127.0.0.1:{topology.gateway_health_port}/metrics")
+    response.raise_for_status()
+    payload = response.json()
+    raw_pids = payload.get("worker_pids", [])
+    if not isinstance(raw_pids, list):
+        raise AssertionError("gateway_worker_pids_invalid")
+    return {pid for pid in raw_pids if isinstance(pid, int) and pid > 0}
 
 
 async def _run_attempts(run_id: str) -> list[AgentRunAttempt]:
@@ -1046,7 +1034,7 @@ async def test_worker_crash_single_recovery_then_failed_on_second_crash() -> Non
         await _enable_pi(topology, tenant.tenant_id)
         user = tenant.users[0]
         # 记录发消息前的 worker pid 集合做差集，排除其他测试残留进程
-        baseline_pids = _worker_pids(topology)
+        baseline_pids = await _worker_pids(topology)
         session_id = await topology.create_session(user)
         response = await topology.send_message(user, session_id, "[scenario:crash]\n开始分析")
         assert response.status_code in (200, 201, 202), response.text
@@ -1055,7 +1043,8 @@ async def test_worker_crash_single_recovery_then_failed_on_second_crash() -> Non
         async def wait_new_worker(exclude: set[int], timeout: float = 180.0) -> set[int]:
             deadline = time.monotonic() + timeout
             while time.monotonic() < deadline:
-                current = _worker_pids(topology) - exclude
+                current = await _worker_pids(topology)
+                current -= exclude
                 if current:
                     return current
                 await asyncio.sleep(0.2)

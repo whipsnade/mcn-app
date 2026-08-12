@@ -267,6 +267,7 @@ export async function runGatewayMain(deps: GatewayMainDependencies = {}): Promis
         errors_total: state.errorsTotal,
         last_error_code: state.lastErrorCode,
         last_claim_at: state.lastClaimAtMs === null ? null : new Date(state.lastClaimAtMs).toISOString(),
+        ...(config.environment === "test" ? { worker_pids: [...gateway.activeWorkerPids] } : {}),
       }),
     },
   });

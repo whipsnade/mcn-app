@@ -26,6 +26,48 @@ async def test_in_process_stop_cancels_and_reaps_after_timeout(monkeypatch: pyte
 
 
 @pytest.mark.asyncio
+async def test_in_process_stop_fails_bounded_when_task_ignores_cancel() -> None:
+    server = _InProcessServer(object(), 0)
+    release = asyncio.Event()
+
+    async def stubborn() -> None:
+        while not release.is_set():
+            try:
+                await asyncio.wait_for(release.wait(), timeout=3600)
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                continue
+
+    task = asyncio.create_task(stubborn())
+    server._task = task
+
+    with pytest.raises(RuntimeError, match="in_process_server_stop_timeout"):
+        await server.stop()
+    release.set()
+    task.cancel()
+    await asyncio.wait_for(task, timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_stop_processes_kills_recorded_group_after_parent_exit(monkeypatch: pytest.MonkeyPatch) -> None:
+    topology = PiUatTopology()
+    proc = type("Proc", (), {"pid": 1234, "poll": lambda _self: 1})()
+    topology._gateway = proc
+    topology._gateway_pgid = 1234
+    calls: list[tuple[int, int]] = []
+
+    monkeypatch.setattr(harness.os, "killpg", lambda pgid, sig: calls.append((pgid, sig)))
+    monkeypatch.setattr(harness, "_wait_pgid_gone", lambda _pgid, _timeout: _gone())
+
+    async def _gone() -> bool:
+        return True
+
+    await topology._stop_processes()
+    assert calls == [(1234, harness.signal.SIGTERM)]
+
+
+@pytest.mark.asyncio
 async def test_topology_cleanup_finishes_when_outer_task_is_cancelled(monkeypatch: pytest.MonkeyPatch) -> None:
     topology = PiUatTopology()
     started = asyncio.Event()
@@ -81,3 +123,23 @@ def test_destructive_uat_scope_is_fail_closed(monkeypatch: pytest.MonkeyPatch) -
 
     with pytest.raises(RuntimeError, match="uat_database_scope_invalid"):
         harness.assert_uat_database_scope()
+
+
+@pytest.mark.asyncio
+async def test_destructive_scope_checks_actual_database_and_user(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("APP_ENV", "test")
+    monkeypatch.setenv("MYSQL_DATABASE", "kol_insight_test")
+    monkeypatch.setenv("MYSQL_USER", "kol_test")
+
+    class Result:
+        def one(self):
+            return "kol_insight", "kol_test@localhost"
+
+    class Db:
+        async def execute(self, _statement):
+            return Result()
+
+    with pytest.raises(RuntimeError, match="uat_database_connection_scope_invalid"):
+        await harness.assert_uat_database_connection(Db())

@@ -12,6 +12,8 @@ export interface GatewayMetricsSnapshot {
   errors_total: number;
   last_error_code: string | null;
   last_claim_at: string | null;
+  /** Test-only process ownership probe; omitted in production responses. */
+  worker_pids?: number[];
 }
 
 export interface GatewayMetricsSource {

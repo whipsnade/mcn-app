@@ -20,11 +20,13 @@ import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import ClassVar
 from uuid import uuid4
 
 import httpx
 import uvicorn
 from sqlalchemy import delete, select, text, update
+from sse_starlette.sse import AppStatus
 
 from app.agent_runtime.models import AgentRun
 from app.db.session import SessionFactory
@@ -55,6 +57,17 @@ def assert_uat_database_scope() -> None:
         raise RuntimeError("uat_database_scope_invalid")
 
 
+async def assert_uat_database_connection(db) -> None:
+    """Verify the actual connection, not only caller-controlled environment vars."""
+    assert_uat_database_scope()
+    database, current_user = (
+        await db.execute(text("SELECT DATABASE(), CURRENT_USER()"))
+    ).one()
+    user_name = str(current_user).split("@", 1)[0]
+    if str(database) != "kol_insight_test" or user_name != "kol_test":
+        raise RuntimeError("uat_database_connection_scope_invalid")
+
+
 @dataclass
 class UatUser:
     user_id: str
@@ -81,6 +94,7 @@ async def purge_uat_residue() -> None:
     from app.tenancy.models import Tenant
 
     async with SessionFactory.begin() as db:
+        await assert_uat_database_connection(db)
         await db.execute(text("SET FOREIGN_KEY_CHECKS=0"))
         try:
             user_ids = list(
@@ -202,6 +216,8 @@ def _ensure_gateway_built() -> None:
 
 
 class _InProcessServer:
+    _active_servers: ClassVar[set[_InProcessServer]] = set()
+
     def __init__(self, app, port: int) -> None:
         # timeout_graceful_shutdown=2：step_hang 场景 teardown 时模型服务器还有
         # 长 sleep 的悬挂请求（客户端进程已消失），优雅停机 2s 后强制取消，
@@ -215,30 +231,90 @@ class _InProcessServer:
         )
         self._server = uvicorn.Server(config)
         self._task: asyncio.Task | None = None
+        self._tasks_before_start: set[asyncio.Task[object]] = set()
 
     async def start(self) -> None:
+        # sse-starlette keeps a per-event-loop shutdown watcher. In-process
+        # Uvicorn servers do not install a durable process signal handler, so
+        # reset the test-loop flag before each fresh server.
+        AppStatus.should_exit = False
+        current = asyncio.current_task()
+        self._tasks_before_start = {
+            task for task in asyncio.all_tasks() if task is not current
+        }
         self._task = asyncio.create_task(self._server.serve())
         for _ in range(100):
             if self._server.started:
+                self._active_servers.add(self)
                 return
             await asyncio.sleep(0.05)
         raise RuntimeError("in_process_server_start_timeout")
 
     async def stop(self) -> None:
+        # Signal SSE responses owned by this in-process server before asking
+        # Uvicorn to drain. Otherwise the watcher can outlive the server task
+        # and poison the next topology in the same event loop.
+        AppStatus.should_exit = True
         self._server.should_exit = True
         task = self._task
         if task is None:
+            self._active_servers.discard(self)
+            if not self._active_servers:
+                AppStatus.should_exit = False
             return
         try:
-            await asyncio.wait_for(task, timeout=10)
-        except asyncio.TimeoutError:
-            # Uvicorn may still be draining a deliberately hanging fake
-            # request. Cancel and gather the serve task so no task exception
-            # or loop reference survives the topology cleanup.
+            done, _ = await asyncio.wait({task}, timeout=2)
+            if done:
+                _consume_task_result(task)
+                await _drain_sse_shutdown_watchers(self._tasks_before_start)
+                return
+            # Uvicorn may still be draining a deliberately hanging fake request.
+            # Cancel and gather the serve task with a second bounded wait. A task
+            # that swallows cancellation must fail closed instead of blocking DB
+            # teardown forever.
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            await _reap_tasks_bounded(
+                [task], timeout=2, error_code="in_process_server_stop_timeout"
+            )
+            await _drain_sse_shutdown_watchers(self._tasks_before_start)
+        finally:
+            self._active_servers.discard(self)
+            if not self._active_servers:
+                AppStatus.should_exit = False
+
+
+def _consume_task_result(task: asyncio.Task[object]) -> None:
+    """Retrieve task exceptions without letting cleanup rewrite the root error."""
+    if task.cancelled():
+        return
+    try:
+        task.exception()
+    except BaseException:
+        pass
+
+
+async def _reap_tasks_bounded(
+    tasks: list[asyncio.Task[object]], *, timeout: float, error_code: str
+) -> None:
+    """Await tasks, then cancel and await them again within a hard deadline."""
+    if not tasks:
+        return
+    joined = asyncio.gather(*tasks, return_exceptions=True)
+    done, _ = await asyncio.wait({joined}, timeout=timeout)
+    if not done:
+        for task in tasks:
             if not task.done():
-                raise RuntimeError("in_process_server_stop_timeout")
+                task.cancel()
+        done, _ = await asyncio.wait({joined}, timeout=timeout)
+    if not done or any(not task.done() for task in tasks):
+        raise RuntimeError(error_code)
+    if not joined.cancelled():
+        try:
+            joined.result()
+        except BaseException:
+            pass
+    for task in tasks:
+        _consume_task_result(task)
 
 
 async def _wait_proc_exit(proc: subprocess.Popen, timeout: float) -> bool:
@@ -249,6 +325,61 @@ async def _wait_proc_exit(proc: subprocess.Popen, timeout: float) -> bool:
             return True
         await asyncio.sleep(0.1)
     return False
+
+
+async def _wait_pgid_gone(pgid: int, timeout: float) -> bool:
+    """Poll one recorded process group without blocking the event loop."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError as exc:
+            raise RuntimeError("uat_process_group_probe_denied") from exc
+        await asyncio.sleep(0.1)
+    return False
+
+
+async def _drain_sse_shutdown_watchers(
+    tasks_before_start: set[asyncio.Task[object]], timeout: float = 2.0
+) -> None:
+    """收口 sse-starlette 为进程内 Uvicorn 创建的 shutdown watcher。
+
+    UAT 的 fake MCP 使用 Streamable HTTP；其 SSE response 会在当前事件循环
+    创建一个全局 watcher，而 in-process Uvicorn 不会留下可复用的 signal
+    handler。仅等待 ``Server.serve`` 完成会让 watcher 越过拓扑边界，下一轮
+    启动又把全局退出标志重置，最终卡住新的 list_tools。这里只处理本测试
+    该 server 启动后创建、明确属于它的 SSE watcher，超过有界时间才取消并完整 gather。
+    """
+    deadline = time.monotonic() + timeout
+    current = asyncio.current_task()
+
+    def watchers() -> list[asyncio.Task[object]]:
+        result: list[asyncio.Task[object]] = []
+        for task in asyncio.all_tasks():
+            if task is current or task.done():
+                continue
+            if (
+                task not in tasks_before_start
+                and task.get_coro().__qualname__ == "_shutdown_watcher"
+            ):
+                result.append(task)
+        return result
+
+    while time.monotonic() < deadline:
+        pending = watchers()
+        if not pending:
+            return
+        await asyncio.sleep(0.05)
+    pending = watchers()
+    for task in pending:
+        task.cancel()
+    await _reap_tasks_bounded(
+        pending, timeout=timeout, error_code="sse_shutdown_watcher_cleanup_timeout"
+    )
+    if watchers():
+        raise RuntimeError("sse_shutdown_watcher_cleanup_timeout")
 
 
 async def _wait_http_ok(url: str, timeout: float = 60.0) -> None:
@@ -277,6 +408,8 @@ class PiUatTopology:
         self._servers: list[_InProcessServer] = []
         self._fastapi: subprocess.Popen | None = None
         self._gateway: subprocess.Popen | None = None
+        self._fastapi_pgid: int | None = None
+        self._gateway_pgid: int | None = None
         self.gateway_log: Path | None = None
         self.model_port = 0
         self.fastapi_port = 0
@@ -301,7 +434,7 @@ class PiUatTopology:
         """本拓扑 Gateway 的进程组 id（worker 子进程 fork 自同组）。"""
         if self._gateway is None or self._gateway.poll() is not None:
             return None
-        return self._gateway.pid
+        return self._gateway_pgid
 
     async def __aenter__(self) -> PiUatTopology:
         try:
@@ -351,39 +484,66 @@ class PiUatTopology:
         本拓扑的 pgid，绝不触碰其他会话/拓扑的同名进程。Gateway 的 worker
         子进程由 fork 产生，与 Gateway 同组，一并随组终止。
         """
-        for proc in (self._gateway, self._fastapi):
-            if proc is None or proc.poll() is not None:
-                if proc is not None:
-                    self._log_lifecycle("process_reaped")
+        for attr, pgid_attr in (
+            ("_gateway", "_gateway_pgid"),
+            ("_fastapi", "_fastapi_pgid"),
+        ):
+            proc = getattr(self, attr)
+            pgid = getattr(self, pgid_attr)
+            if proc is None or pgid is None:
                 continue
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                self._log_lifecycle("process_reaped")
-                continue
-            if not await _wait_proc_exit(proc, 10):
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                if not await _wait_proc_exit(proc, 5):
-                    raise RuntimeError("uat_process_reap_timeout")
+            await self._stop_process_group(proc, pgid)
+            setattr(self, pgid_attr, None)
             self._log_lifecycle("process_reaped")
+
+    async def _stop_process_group(self, proc: subprocess.Popen, pgid: int) -> None:
+        """终止并确认一个本拓扑记录的 PGID，即使其父进程已退出。"""
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        if proc.poll() is None and not await _wait_proc_exit(proc, 10):
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if await _wait_pgid_gone(pgid, 5):
+            return
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        if not await _wait_pgid_gone(pgid, 5):
+            raise RuntimeError("uat_process_group_reap_timeout")
 
     async def __aexit__(self, *exc) -> None:
         await self._cleanup()
 
     async def _cleanup_impl(self) -> None:
         self._log_lifecycle("cleanup_started")
-        await self._stop_processes()
-        results = await asyncio.gather(
-            *(server.stop() for server in self._servers),
-            return_exceptions=True,
-        )
-        await self._teardown_db()
-        errors = [result for result in results if isinstance(result, BaseException)]
+        errors: list[BaseException] = []
+        try:
+            await self._stop_processes()
+        except BaseException as exc:
+            errors.append(exc)
+        try:
+            results = await asyncio.gather(
+                *(server.stop() for server in self._servers),
+                return_exceptions=True,
+            )
+            errors.extend(result for result in results if isinstance(result, BaseException))
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            # ``AppStatus.should_exit`` is a process-global sse-starlette flag;
+            # reset it only after every in-process server has been attempted.
+            AppStatus.should_exit = False
+            try:
+                await self._teardown_db()
+            except BaseException as exc:
+                errors.append(exc)
         if errors:
-            raise RuntimeError("in_process_server_cleanup_failed") from errors[0]
+            raise RuntimeError("uat_cleanup_failed") from errors[0]
 
     async def _cleanup(self) -> None:
         if self._cleanup_task is None:
@@ -461,6 +621,7 @@ class PiUatTopology:
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
+        self._fastapi_pgid = self._fastapi.pid
         self._log_lifecycle("fastapi_spawned")
 
     def _start_gateway(self) -> None:
@@ -488,6 +649,7 @@ class PiUatTopology:
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
+        self._gateway_pgid = self._gateway.pid
         self._log_lifecycle("gateway_spawned")
 
     # ------------------------------------------------------------------ #
@@ -750,16 +912,9 @@ class PiUatTopology:
         再开 kill switch」的时序，只能经进程重启变更。数据库、fake 模型/MCP
         与 gateway 子进程均不受影响（gateway 的 claim 循环持续轮询）。
         """
-        if self._fastapi is not None and self._fastapi.poll() is None:
-            try:
-                os.killpg(self._fastapi.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            if not await _wait_proc_exit(self._fastapi, 10):
-                try:
-                    os.killpg(self._fastapi.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+        if self._fastapi is not None and self._fastapi_pgid is not None:
+            await self._stop_process_group(self._fastapi, self._fastapi_pgid)
+            self._fastapi_pgid = None
         self.kill_switch = kill_switch
         self._start_fastapi()
         await _wait_http_ok(f"{self.api_base}/healthz")
@@ -770,16 +925,9 @@ class PiUatTopology:
         只用于不需要 gateway 参与的用例（如 nonce 重放）：消除 gateway claim
         循环与手工签名请求在 nonce 屏障表上的并发竞争，让断言确定。
         """
-        if self._gateway is not None and self._gateway.poll() is None:
-            try:
-                os.killpg(self._gateway.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                return
-            if not await _wait_proc_exit(self._gateway, 15):
-                try:
-                    os.killpg(self._gateway.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+        if self._gateway is not None and self._gateway_pgid is not None:
+            await self._stop_process_group(self._gateway, self._gateway_pgid)
+            self._gateway_pgid = None
 
     # ------------------------------------------------------------------ #
     # 清理
@@ -825,6 +973,7 @@ class PiUatTopology:
         tenant_ids = self._seeded_tenant_ids
         user_ids = self._seeded_user_ids
         async with SessionFactory.begin() as db:
+            await assert_uat_database_connection(db)
             # 测试清理专用：产物/运行/消息之间存在多组互为引用的 FK
             # （versions↔revisions、runs↔messages 等），逐表排序删除极其脆弱；
             # 这里对独立测试库按种子 id 集合整批删除，会话级关闭 FK 检查。
