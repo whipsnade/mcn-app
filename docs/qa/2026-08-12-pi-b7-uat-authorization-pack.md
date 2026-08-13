@@ -181,8 +181,9 @@ flush/fsync），写后不可变；`authorization.md`（模式 B，L0-10）/ `au
     新 Pi 路径的 lineage 是 Publication/Version 结构校验与同 Session 归属校验，数据库
     Evidence 增量为 0 是预期事实，不是停止条件）。
 12. Excel 和 BI 未绑定同一 Version。
-13. 预算任一上限达到（授权计划 §5 任一字段）；L1-SMOKE 的模型逻辑请求达到 2 次上限时，
-    在第 3 次请求发生前即停（SDK/业务自动重试一律禁止）。
+13. 预算任一上限达到（授权计划 §5 任一字段）；（历史 B7 L1-SMOKE 口径：模型逻辑请求达到
+    2 次上限时在第 3 次请求发生前即停，SDK/业务自动重试一律禁止；下一轮 Scenario 2 使用
+    §5.4 的预算表，本子句不适用）。
 14. 证据帧无法追加或落盘（write/flush/fsync 失败），或 hash-chain 校验发现篡改/损坏。
 15. 外部超时或错误无法稳定分类。
 16. Gateway/worker 无法有界退出。
@@ -368,6 +369,9 @@ Level、预算、工具与 destructive 开关。
 
 ### 5.3 模式 B 一次性完整授权模板（ONESHOT_FULL_AUTHORIZATION）
 
+> 2026-08-13 纠偏：本模板是历史 B7 完整流程（L0→L1→L2）的授权模板，**不再用于新 round**；
+> 下一轮 Web Functional Scenario 2 一律使用 §5.4 单场景模板。本节保留为历史设计。
+
 ```text
 REAL B7 UAT 一次性完整授权确认（ONESHOT_FULL_AUTHORIZATION，模式 B）
 
@@ -416,14 +420,16 @@ REAL B7 UAT 一次性完整授权确认（ONESHOT_FULL_AUTHORIZATION，模式 B�
 - 固定 quarantine 基线确认（insight-cube-mcp / query_user_info /
   digest aa4933db9542bc5802a6a1a31b6dd274ea08e562ca01cf1ef1f1fd2a56afeb49 / quarantined；
   不登记 allowlist、不进入 claim adapter_catalog；digest、行数或状态任何变化即硬停止）: <YES>
-- L1 授权范围（单 tenant/单 user/单 Run；失败不得进入 L2；禁止自动重试）:
+- L1 授权范围（单 tenant/单 user/单 Run；失败不得进入 L2；禁止自动重试；历史 B7 L1-SMOKE
+  口径）:
   - 最终 L1 MCP 工具: <服务 slug / 工具内部名，如 insight-cube-mcp / match_best_tag>
   - 上限: 最多 2 次模型逻辑请求（第一次工具调用、第二次消费结果并完成；由 worker provider
     guard 在外发前硬执行，超限即 pi_decision_limit 稳定 failed）、≤1 次 DataTap 外发、≤10 积分: <YES>
   - L1 Runtime Config: tenant-a 使用 limits.max_decisions=2 的 append-only 版本: <YES>
 - L2 授权范围: L2-01 至 L2-20 全部 20 个场景；核验场景复用已有 Run/Artifact；unknown 禁止自动重放: <YES>
-- L1→L2 配置版本规则: L1 成功后、进入 L2 前激活 tenant-a 新 append-only 版本（max_decisions=50）；
-  既有 L1 Run snapshot 不重绑定；新 L2 Run 必须绑定新版本；L1 失败不得激活: <YES>
+- L1→L2 配置版本规则（历史 B7 流程口径）: L1 成功后、进入 L2 前激活 tenant-a 新 append-only
+  版本（max_decisions=50）；既有 L1 Run snapshot 不重绑定；新 L2 Run 必须绑定新版本；
+  L1 失败不得激活: <YES>
 - 允许的 Level: <L1 / L1+L2>
 - 预算（13 项，全部必填数值）:
   - 最大 round 数: <n>

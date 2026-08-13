@@ -71,6 +71,9 @@ Plan C authorized: NO
 `REAL_B7_20260812T045636Z_b801c490` 已执行：L0 通过、L1 FAIL（`mcp_tool_identity_invalid`，
 0 外发 0 扣费），按规则终止并封存；该次授权已消费完毕。修复轮（授权包 §6.6）后的任何真实
 B7 执行都必须取得用户**新的**授权，且 L0 失败仍必须停止、L1 失败不得进入 L2。
+下一轮的实际执行形态是 **Web Functional Scenario 2 单场景授权**（§8 契约 + 授权包 §5.4
+模板，入口 `READY_FOR_WEB_FUNCTIONAL_SCENARIO_2_REAUTHORIZATION`），不再走完整 B7
+L0→L1→L2 流程。
 
 ### 0.4 2026-08-13 架构纠偏说明（Direct MCP 结果 + Artifact Skill）
 
@@ -442,6 +445,10 @@ delta 对账（只允许属于新 round 身份集合）。除该初始化外，L
 
 ### 6.2 Level 1：最小真实冒烟（L1-00 外部调用预检 + 1 个场景，需独立批准）
 
+> 2026-08-13 纠偏：本节是历史 B7 完整流程的 L1-SMOKE 口径（「最多 2 次模型逻辑请求」、
+> `max_decisions=2` 等）；下一轮 Web Functional Scenario 2 不走本节，改用 §8/授权包 §5.4
+> 的单场景契约（`max_decisions=60`、预算为紧急上限）。本节保留为历史设计。
+
 **L1-00 外部调用预检（0 ToolCall、0 积分）**：以真实 `DATATAP_MCP_ORIGIN` 重启控制面，完成
 真实 DataTap discovery（仅 negotiation/list-tools 协商动作）；核验 29 个已审核工具 digest
 与 discovery 全部一致、§2.1 quarantine 基线不变（恰 1 条、digest 相同、仍 quarantined），
@@ -466,10 +473,10 @@ delta 对账（只允许属于新 round 身份集合）。除该初始化外，L
 
 预算列统一为 `NEEDS_USER_APPROVAL`（最大 Run/MCP/token/积分，且 ≤ §5 全局预算）。
 
-**L1→L2 Runtime Config 版本规则（append-only，授权的状态变更）**：
+**L1→L2 Runtime Config 版本规则（append-only，授权的状态变更；历史 B7 流程口径）**：
 
 - L1 成功后、进入 L2 前，经管理 API 创建并激活 tenant-a 的新 append-only 配置版本，
-  `limits.max_decisions=50`（L2 上限）；L1 若失败，不得激活 L2 配置。
+  `limits.max_decisions=50`（历史 B7 L2 上限）；L1 若失败，不得激活 L2 配置。
 - 激活只影响新 Run：既有 L1 Run 的 `runtime_config_snapshot_json` 逐字节不变、不重绑定；
   新 L2 Run 必须绑定新版本（snapshot `config_version_id` == 新版本 id）。
 - Evidence 记录两个 Config ID/version、激活时间与每个相关 Run 的 snapshot 绑定关系。
