@@ -47,6 +47,7 @@ from .pi_uat.fake_model import (
     tool_result_texts,
 )
 from .pi_uat.harness import GATEWAY_SECRET, PiUatTopology, purge_uat_residue
+from tests.agent_artifacts.payload_fixtures import brand_payload, insight_payload
 
 pytestmark = pytest.mark.asyncio
 
@@ -69,33 +70,12 @@ BRAND_SCOPE = {
     "comparison_mode": "none",
 }
 
-_GROUP_BY_SOURCE = {
-    "social_statistic_overview": "overview_current",
-    "social_statistic_trend": "daily_trend",
-    "query_raw_posts": "top_posts",
-    "query_analysis_data": "sentiment",
-}
-
-
-def _evidence_groups(messages: list[dict[str, Any]]) -> dict[str, list[str]]:
-    """从最近一次 search_evidence 结果解析 (source_name -> evidence_id) 分组。"""
-    texts = tool_result_texts(messages)
-    assert texts, "search_evidence 工具结果缺失"
-    payload = json.loads(texts[-1])
-    summary = json.loads(payload["safe_summary"])
-    groups: dict[str, list[str]] = {}
-    for match in summary["matches"]:
-        group = _GROUP_BY_SOURCE.get(match.get("source_name"))
-        evidence_id = match.get("evidence_id")
-        if group and evidence_id:
-            groups.setdefault(group, []).append(evidence_id)
-    return groups
-
-
-def _build_brand_step(messages: list[dict[str, Any]]) -> dict[str, Any]:
+def _build_direct_brand_step(messages: list[dict[str, Any]]) -> dict[str, Any]:
+    """模型直接提交 Artifact Skill payload；不读取或回灌 Evidence。"""
+    del messages
     return step_internal(
-        "build_brand_report_draft",
-        {"scope": BRAND_SCOPE, "evidence": _evidence_groups(messages)},
+        "build_artifact_draft",
+        {"artifact_type": "brand_report_v3", "payload": brand_payload()},
     )
 
 
@@ -118,8 +98,7 @@ def _brand_script() -> list[Any]:
         step_mcp_proxy("social_statistic_trend", server="insight-cube", args={"brand": BRAND}),
         step_mcp_proxy("query_raw_posts", server="insight-cube", args={"brand": BRAND}),
         step_mcp_proxy("query_analysis_data", server="insight-cube", args={"keyword": BRAND}),
-        step_internal("search_evidence", {}),
-        _build_brand_step,
+        _build_direct_brand_step,
         _publish_step,
         step_text("已完成品牌报告并发布。"),
     ]
@@ -299,8 +278,13 @@ async def test_brand_report_full_chain_same_version_excel_bi_and_gate() -> None:
             version = versions[0]
             assert version.schema_version == "brand_report_v3"
             payload = version.payload_json
-            assert payload["data"]["overview"]["total_volume"] == 320
+            assert payload["data"]["overview"]["total_volume"] == 1000
             assert payload["data_status"] in ("complete", "restricted")
+            # Direct Artifact Skill lineage is model-owned and contains no
+            # Evidence refs; MCP payloads stay in the model-visible tool
+            # conversation and never become Evidence rows.
+            assert version.evidence_refs_json == []
+            assert version.lineage_snapshot_json["mode"] == "model_direct_v1"
 
         # Excel 与 BI 绑定同一 Version
         async with topology.client_for(user) as client:
@@ -315,36 +299,13 @@ async def test_brand_report_full_chain_same_version_excel_bi_and_gate() -> None:
             assert detail.status_code == 200
             assert detail.json()["version"] == version.version
 
-        # B0 发布门禁对正式产物复核：结构化 claims 与 lineage 必须仍成立
-        from app.agent_artifacts.lineage import validate_structured_claims
-
         async with SessionFactory() as db:
-            evidence_rows = list(
-                (
-                    await db.scalars(
-                        select(EvidenceItem).where(EvidenceItem.session_id == session_id)
-                    )
-                ).all()
+            evidence_count = await db.scalar(
+                select(func.count())
+                .select_from(EvidenceItem)
+                .where(EvidenceItem.session_id == session_id)
             )
-            issues = validate_structured_claims(
-                version.payload_json,
-                version.id,
-                {
-                    "user_id": user.user_id,
-                    "session_id": session_id,
-                    "run_id": run.id,
-                    "evidence": {
-                        row.id: {
-                            "user_id": user.user_id,
-                            "session_id": session_id,
-                            "run_id": row.run_id,
-                            "source_type": row.source_type,
-                        }
-                        for row in evidence_rows
-                    },
-                },
-            )
-            assert issues == []
+            assert evidence_count == 0
 
         # fake MCP 收到的恰好是 4 次已审核工具的调用
         insight = topology.mcp_services[0]
@@ -569,12 +530,12 @@ async def _approve_extra_tool(service: str, remote_name: str, internal_name: str
 
 
 async def test_generic_proxy_bare_remote_name_billing_chain() -> None:
-    """真实 L1 路径复现（REAL_B7_20260812T045636Z_b801c490 失败 round）。
+    """真实 L1 路径形状的离线回归（不创建 Evidence）。
 
     真实模型经通用 ``mcp`` 代理工具以裸 remote 名寻址（不带 server）。修复前
-    该形状必然被 mcp_tool_identity_invalid 拦截；修复后必须完成全链路：
-    durable preflight → fake MCP 外发 → finalize → Evidence → ToolCall →
-    10 积分结算。
+    该形状必然被 mcp_tool_identity_invalid 拦截；现在必须完成：
+    durable preflight → fake MCP 外发 → finalize → ToolCall → 10 积分结算。
+    MCP Tool Result 由标准 adapter 原样交给模型，Pi accounting 不写 Evidence。
     """
     topology = PiUatTopology(
         scripts={
@@ -602,7 +563,7 @@ async def test_generic_proxy_bare_remote_name_billing_chain() -> None:
         # durable preflight 之后恰好 1 次真实外发（fake MCP 实收）
         assert [c["tool"] for c in topology.mcp_services[0].calls] == ["social_statistic_overview"]
         assert topology.mcp_services[1].calls == []
-        # ToolCall settled + Evidence 落库
+        # ToolCall settled；direct MCP 路径不落 Evidence
         calls = await _run_tool_calls(run.id)
         assert len(calls) == 1
         assert calls[0].internal_tool_name == "social_statistic_overview"
@@ -614,7 +575,7 @@ async def test_generic_proxy_bare_remote_name_billing_chain() -> None:
                 .select_from(EvidenceItem)
                 .where(EvidenceItem.tool_call_id == calls[0].id)
             )
-            assert evidence_count == 1
+            assert evidence_count == 0
             # 10 积分结算：reserve + settle 各一条，净支出恰好 10
             wallet = await db.get(TenantWallet, tenant.tenant_id)
             assert wallet is not None
@@ -1268,41 +1229,42 @@ def _drilldown_step(messages: list[dict[str, Any]]) -> dict[str, Any]:
                 "version": int(_message_tag(messages, "version")),
             },
         )
-    # 工具结果外层是 JSON，safe_summary 是转义的内层 JSON 字符串（两次 loads）
-    summary = json.loads(json.loads(texts[-1])["safe_summary"])
+    # 工具结果外层是 JSON，成功的 read_artifact safe_summary 才是内层 JSON。
+    # 失败结果保持结构化错误文本；在测试脚本中显式区分，避免把错误当作
+    # 父 Artifact payload 继续推进。
+    outer = json.loads(texts[-1])
+    safe_summary = outer.get("safe_summary")
+    assert isinstance(safe_summary, str) and safe_summary.lstrip().startswith(("{", "[")), (
+        "unexpected internal tool result: " + texts[-1][:1000]
+    )
+    summary = json.loads(safe_summary)
     if isinstance(summary, dict) and "payload" in summary:
-        # read_artifact 已完成：确认读到的就是要钻取的 Artifact，绑定该
-        # Version 行 id 构建钻取看板（数值只允许 value_ref 引用，不填字面值）
+        # read_artifact 已完成：确认读到的就是要钻取的 Artifact，模型把读到的
+        # 数值填入严格的 insight_board_v1 payload，并保留父 Version 绑定。
         assert summary["artifact_id"] == _message_tag(messages, "artifact_id")
+        source_payload = summary["payload"]
         version_id = _message_tag(messages, "version_id")
+        value = source_payload["data"]["overview"]["total_volume"]
+        direct_payload = insight_payload(
+            title="总声量钻取",
+            parent_artifact_id=_message_tag(messages, "artifact_id"),
+            blocks=[
+                {
+                    "block_type": "metric_grid",
+                    "title": "核心指标",
+                    "cards": [
+                        {"key": "total_volume", "label": "总声量", "value": value, "unit": "条"}
+                    ],
+                }
+            ],
+        )
+        direct_payload["parent_artifact_version_id"] = version_id
         return step_internal(
-            "build_insight_draft",
-            {
-                "parent_artifact_version_id": version_id,
-                "question": "本期总声量是多少？",
-                "title": "总声量钻取",
-                "blocks": [
-                    {
-                        "type": "metric_grid",
-                        "title": "核心指标",
-                        "cards": [
-                            {
-                                "key": "total_volume",
-                                "label": "总声量",
-                                "value_ref": {
-                                    "source_type": "artifact",
-                                    "artifact_version_id": version_id,
-                                    "source_path": "/data/overview/total_volume",
-                                },
-                                "unit": "条",
-                            }
-                        ],
-                    }
-                ],
-            },
+            "build_artifact_draft",
+            {"artifact_type": "insight_board_v1", "payload": direct_payload},
         )
     if isinstance(summary, dict) and summary.get("draft_id"):
-        # build_insight_draft 已完成：发布刚落库的 Draft
+        # build_artifact_draft 已完成：发布刚落库的 Draft
         return step_internal("publish_artifacts", {"draft_ids": [summary["draft_id"]]})
     # publish_artifacts 的 safe_summary 是 list：发布完成，收尾
     return step_text("钻取完成")
@@ -1378,9 +1340,9 @@ async def test_drilldown_binds_exact_version_with_zero_datatap() -> None:
         insight_version = next(v for v in versions_after if v.artifact_id == insight.id)
         assert insight_version.schema_version == "insight_board_v1"
         assert insight_version.parent_artifact_version_id == brand_version.id
-        # 钻取数值来自父 Version 的真实字段（fake fixture 总声量 320）
+        # 钻取数值来自父 Version 的真实字段（fake fixture 总声量 1000）
         card = insight_version.payload_json["data"][0]["cards"][0]
-        assert card["value"] == 320
+        assert card["value"] == 1000
 
 
 async def test_license_suspended_mid_run_blocks_further_mcp() -> None:
