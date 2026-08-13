@@ -47,7 +47,7 @@ from .pi_uat.fake_model import (
     tool_result_texts,
 )
 from .pi_uat.harness import GATEWAY_SECRET, PiUatTopology, purge_uat_residue
-from tests.agent_artifacts.payload_fixtures import brand_payload, insight_payload
+from tests.agent_artifacts.payload_fixtures import brand_model_input
 
 pytestmark = pytest.mark.asyncio
 
@@ -70,12 +70,34 @@ BRAND_SCOPE = {
     "comparison_mode": "none",
 }
 
+_METHODOLOGY_INPUT = {
+    "data_as_of": "2026-07-15T12:00:00",
+    "source_names": ["DataTap"],
+    "notes": [],
+}
+
+
+def _insight_model_input(*, title: str, parent_artifact_id: str, version_id: str, blocks: list[dict[str, Any]]) -> dict[str, Any]:
+    """模型输入形态的 insight_board_v1（不含 schema/module/data_status 等服务器字段）。"""
+    return {
+        "title": title,
+        "scope": {"summary": "围绕品牌概览"},
+        "parent_artifact_id": parent_artifact_id,
+        "parent_artifact_version_id": version_id,
+        "narrative": {"summary": "结论", "findings": []},
+        "blocks": blocks,
+        "availability": {"blocks": {"status": "complete", "reason_codes": []}},
+        "limitations": [],
+        "methodology_input": dict(_METHODOLOGY_INPUT),
+    }
+
+
 def _build_direct_brand_step(messages: list[dict[str, Any]]) -> dict[str, Any]:
-    """模型直接提交 Artifact Skill payload；不读取或回灌 Evidence。"""
+    """模型按 model_input_contract 提交品牌模型输入；不读取或回灌 Evidence。"""
     del messages
     return step_internal(
         "build_artifact_draft",
-        {"artifact_type": "brand_report_v3", "payload": brand_payload()},
+        {"artifact_type": "brand_report_v3", "payload": brand_model_input()},
     )
 
 
@@ -1240,14 +1262,16 @@ def _drilldown_step(messages: list[dict[str, Any]]) -> dict[str, Any]:
     summary = json.loads(safe_summary)
     if isinstance(summary, dict) and "payload" in summary:
         # read_artifact 已完成：确认读到的就是要钻取的 Artifact，模型把读到的
-        # 数值填入严格的 insight_board_v1 payload，并保留父 Version 绑定。
+        # 数值填入严格的 insight_board_v1 模型输入，并保留父 Version 绑定
+        # （parent 字段在 build_artifact_draft 内做归属校验后写入 payload）。
         assert summary["artifact_id"] == _message_tag(messages, "artifact_id")
         source_payload = summary["payload"]
         version_id = _message_tag(messages, "version_id")
         value = source_payload["data"]["overview"]["total_volume"]
-        direct_payload = insight_payload(
+        model_input = _insight_model_input(
             title="总声量钻取",
             parent_artifact_id=_message_tag(messages, "artifact_id"),
+            version_id=version_id,
             blocks=[
                 {
                     "block_type": "metric_grid",
@@ -1258,10 +1282,9 @@ def _drilldown_step(messages: list[dict[str, Any]]) -> dict[str, Any]:
                 }
             ],
         )
-        direct_payload["parent_artifact_version_id"] = version_id
         return step_internal(
             "build_artifact_draft",
-            {"artifact_type": "insight_board_v1", "payload": direct_payload},
+            {"artifact_type": "insight_board_v1", "payload": model_input},
         )
     if isinstance(summary, dict) and summary.get("draft_id"):
         # build_artifact_draft 已完成：发布刚落库的 Draft
@@ -2057,3 +2080,159 @@ async def test_run_snapshot_immutable_across_rollout() -> None:
         assert final1 is not None
         assert _canonical_snapshot(final1) == snapshot_1
         assert final1.runtime_config_version_id == config_id_1
+
+
+# --------------------------------------------------------------------------- #
+# 批次 D：直接 Artifact Skill 自纠错（提交 3：模型输入契约 + 结构化字段级错误）
+# --------------------------------------------------------------------------- #
+
+
+def _fail_first_build_step(messages: list[dict[str, Any]]) -> dict[str, Any]:
+    """第一次 build_artifact_draft：提交缺必填字段的模型输入（会失败）。"""
+    del messages
+    broken = brand_model_input()
+    del broken["data"]["overview"]["total_volume"]
+    return step_internal(
+        "build_artifact_draft",
+        {"artifact_type": "brand_report_v3", "payload": broken},
+    )
+
+
+def _assert_structured_error_then_retry(messages: list[dict[str, Any]]) -> dict[str, Any]:
+    """第二次 build_artifact_draft 前先断言上一步的结构化字段级错误回喂。
+
+    断言失败直接 raise：把「模型按错误修正」写成进程级硬约束——模型必须能
+    从 path/type/reason 定位到缺失字段，而不是盲改几十次。
+    """
+    texts = tool_result_texts(messages)
+    assert texts, "第一次 build_artifact_draft 的工具结果缺失"
+    outer = json.loads(texts[-1])
+    assert outer.get("status") == "failed", f"期望失败但返回: {texts[-1][:400]}"
+    summary = json.loads(outer["safe_summary"])
+    assert summary.get("error_code") == "model_input_invalid", summary
+    errors = summary.get("errors")
+    assert isinstance(errors, list) and errors, summary
+    assert any(entry.get("path") == "/data/overview/total_volume" for entry in errors), summary
+    # 修正：补上缺失字段后重试（自纠错 = 恰好这一次重试，非盲改几十次）
+    return step_internal(
+        "build_artifact_draft",
+        {"artifact_type": "brand_report_v3", "payload": brand_model_input()},
+    )
+
+
+def _self_correction_script() -> list[Any]:
+    return [
+        step_internal("get_session_context"),
+        step_mcp_proxy("social_statistic_overview", server="insight-cube", args={"brand": BRAND}),
+        _fail_first_build_step,
+        _assert_structured_error_then_retry,
+        _publish_step,
+        step_text("已按字段级错误修正并完成品牌报告发布。"),
+    ]
+
+
+def _direct_draft_call_count(topology: PiUatTopology) -> int:
+    """从 fake 模型收到的请求体消息历史中统计 build_artifact_draft 调用次数。
+
+    请求体是 OpenAI 兼容输入（messages 含 assistant tool_calls），不是响应；
+    逐请求去重统计（同一调用会随上下文重复出现在后续请求中）。
+    """
+    seen: set[str] = set()
+    for body in topology.model.requests:
+        if body.get("model") != "fake-pi-model":
+            continue
+        for message in body.get("messages") or []:
+            if message.get("role") != "assistant":
+                continue
+            for call in message.get("tool_calls") or []:
+                function = call.get("function") or {}
+                if function.get("name") == "build_artifact_draft":
+                    call_id = call.get("id")
+                    if call_id is not None:
+                        seen.add(call_id)
+                    else:
+                        # 无 id 的罕见形态：按 arguments 内容计数
+                        seen.add(str(function.get("arguments"))[:120])
+    return len(seen)
+
+
+async def test_direct_artifact_self_correction_bounded() -> None:
+    """模型输入契约 + 结构化字段级错误：缺字段失败 → 按 path 修正 → 成功发布。
+
+    硬断言：Run completed、Attempt 恰好 1、MCP 恰好 1 次 settled（10 分）、
+    build_artifact_draft 恰好 2 次（一次失败一次成功，非几十次盲改）、
+    evidence_items 增量 0、Draft/Publication/Version 存在且 BI 与 Excel 同版、
+    事件流无 event_buffer_overflow。
+    """
+    topology = PiUatTopology(scripts={"brand": _self_correction_script()})
+    async with topology:
+        await _wait_gateway_registered(topology)
+        tenant = topology.tenants["uat-tenant-a"]
+        await _enable_pi(topology, tenant.tenant_id)
+        user = tenant.users[0]
+        async with SessionFactory() as db:
+            wallet_before = await db.get(TenantWallet, tenant.tenant_id)
+            evidence_before = await db.scalar(
+                select(func.count()).select_from(EvidenceItem).where(EvidenceItem.session_id.in_(select(AgentSession.id).where(AgentSession.tenant_id == tenant.tenant_id)))
+            )
+        assert wallet_before is not None
+        session_id = await topology.create_session(user)
+        response = await topology.send_message(user, session_id, f"[scenario:brand]\n请分析{BRAND}近期表现")
+        assert response.status_code in (200, 201, 202), response.text
+        run = await topology.run_by_session(session_id)
+        terminal_status = await topology.wait_run_terminal(run.id)
+        assert terminal_status == "completed", terminal_status
+
+        # 自纠错恰好 2 次 build_artifact_draft（非几十次盲改）
+        assert _direct_draft_call_count(topology) == 2
+
+        async with SessionFactory() as db:
+            attempts = await _run_attempts(run.id)
+            calls = list(
+                (await db.scalars(select(AgentToolCall).where(AgentToolCall.run_id == run.id))).all()
+            )
+            wallet = await db.get(TenantWallet, tenant.tenant_id)
+            events = list(
+                (
+                    await db.scalars(
+                        select(AgentEvent).where(AgentEvent.run_id == run.id).order_by(AgentEvent.sequence)
+                    )
+                ).all()
+            )
+            evidence_after = await db.scalar(
+                select(func.count()).select_from(EvidenceItem).where(EvidenceItem.session_id.in_(select(AgentSession.id).where(AgentSession.tenant_id == tenant.tenant_id)))
+            )
+        assert len(attempts) == 1
+        # MCP 恰好 1 次真实外发且全部 settled（内部工具不落 AgentToolCall）
+        assert len(calls) == 1
+        assert calls[0].internal_tool_name == "social_statistic_overview"
+        assert calls[0].status == "settled"
+        mcp_received = len(topology.mcp_services[0].calls) + len(topology.mcp_services[1].calls)
+        assert mcp_received == 1
+        assert wallet is not None
+        # 账务硬绑定：净支出 == 实际外发数 ×10
+        assert (wallet.balance, wallet.reserved) == (wallet_before.balance - mcp_received * 10, 0)
+        # evidence_items 增量 0（direct MCP 路径不写 Evidence）
+        assert evidence_after == evidence_before
+        # 事件流无 event_buffer_overflow（gateway 事件缓冲保持默认有界）
+        assert all(event.event_type != "event_buffer_overflow" for event in events)
+
+        # 正式产物：不可变 Version、同版本 Excel/BI
+        versions = await _session_artifact_versions(session_id)
+        assert len(versions) == 1
+        version = versions[0]
+        assert version.schema_version == "brand_report_v3"
+        assert version.payload_json["data"]["overview"]["total_volume"] == 1000
+        assert version.evidence_refs_json == []
+        assert version.lineage_snapshot_json["mode"] == "model_direct_v1"
+        async with topology.client_for(user) as client:
+            export = await client.get(f"/api/v1/agent/artifacts/{version.artifact_id}/export")
+            assert export.status_code == 200
+            assert export.headers["content-type"].startswith(
+                "application/vnd.openxmlformats-officedocument"
+            )
+            detail = await client.get(
+                f"/api/v1/agent/artifacts/{version.artifact_id}/versions/{version.version}"
+            )
+            assert detail.status_code == 200
+            assert detail.json()["version"] == version.version

@@ -11,6 +11,7 @@ A5 起 Draft 写入必须经过强类型校验，并保存 ``model_dump(mode="js
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from app.agent_artifacts.payloads import BrandReportV3, CampaignReportV2, InsightBoardV1
@@ -80,12 +81,37 @@ def brand_payload() -> dict[str, Any]:
     return BrandReportV3.model_validate(build_brand_dict()).model_dump(mode="json")
 
 
+def brand_model_input() -> dict[str, Any]:
+    """合法品牌模型输入（build_artifact_draft 的 payload 形态，提交 3）。
+
+    不含 schema_version/module/data_status/canonical_data/field_lineage 等
+    服务器字段；服务器按 model_input_contract 组装为完整 brand_report_v3。
+    ``data`` 里的 date 对象经 JSON round-trip 转 ISO 字符串（跨进程传输要求
+    JSON 安全，与 DTO 的 model_dump(mode="json") 形态一致）。
+    """
+    d = build_brand_dict()
+    model_input = {
+        "scope": d["scope"],
+        "data": d["data"],
+        "narrative": d["narrative"],
+        "availability": d["availability"],
+        "limitations": d["limitations"],
+        "methodology_input": {
+            "data_as_of": d["methodology"]["data_as_of"],
+            "source_names": d["methodology"]["source_names"],
+            "notes": d["methodology"]["notes"],
+        },
+    }
+    return json.loads(json.dumps(model_input, ensure_ascii=False, default=str))
+
+
 def campaign_payload() -> dict[str, Any]:
     """合法 campaign_report_v2（标准化 dump；复用 test_payloads 的完整字典）。"""
     return CampaignReportV2.model_validate(build_campaign_dict()).model_dump(mode="json")
 
 
 __all__ = [
+    "brand_model_input",
     "brand_payload",
     "campaign_payload",
     "insight_metric_payload",

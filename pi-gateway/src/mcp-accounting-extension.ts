@@ -54,6 +54,12 @@ export type UnknownMcpSource =
 export interface McpFailureMetadata {
   version: "mcp_failure_v1";
   source: UnknownMcpSource;
+  /** Metadata-only observability (commit 3). Classification is unchanged. */
+  error_class?: string;
+  received_jsonrpc_response?: boolean;
+  dispatch_phase?: "preflight" | "dispatched" | "unknown";
+  is_standard_mcp_error?: boolean;
+  upstream_request_id?: string;
 }
 
 export interface McpAccountingControlPlane {
@@ -121,11 +127,28 @@ export function isSafeMcpFinalizeMetadata(value: unknown): value is McpFinalizeM
 }
 
 export function isSafeMcpFailureMetadata(value: unknown): value is McpFailureMetadata {
-  return isRecord(value)
-    && exactKeys(value, ["version", "source"])
-    && value.version === "mcp_failure_v1"
+  if (!isRecord(value)) return false;
+  const allowed = [
+    "version",
+    "source",
+    "error_class",
+    "received_jsonrpc_response",
+    "dispatch_phase",
+    "is_standard_mcp_error",
+    "upstream_request_id",
+  ] as const;
+  if (Object.keys(value).some((key) => !allowed.includes(key as (typeof allowed)[number]))) return false;
+  return value.version === "mcp_failure_v1"
     && typeof value.source === "string"
-    && UNKNOWN_MCP_SOURCES.has(value.source as UnknownMcpSource);
+    && UNKNOWN_MCP_SOURCES.has(value.source as UnknownMcpSource)
+    && (value.error_class === undefined || (typeof value.error_class === "string" && value.error_class.length <= 64))
+    && (value.received_jsonrpc_response === undefined || typeof value.received_jsonrpc_response === "boolean")
+    && (value.dispatch_phase === undefined
+      || value.dispatch_phase === "preflight"
+      || value.dispatch_phase === "dispatched"
+      || value.dispatch_phase === "unknown")
+    && (value.is_standard_mcp_error === undefined || typeof value.is_standard_mcp_error === "boolean")
+    && (value.upstream_request_id === undefined || (typeof value.upstream_request_id === "string" && value.upstream_request_id.length <= 128));
 }
 
 function firstRecord(...values: unknown[]): Record<string, unknown> | undefined {
@@ -302,6 +325,28 @@ export class McpAccountingExtension {
  * records only the permit identity and observes completion; it never returns
  * a replacement result and never changes `event.content`.
  */
+/**
+ * Copy only explicitly approved failure metadata (commit 3: metadata-only
+ * observability; `classifyMcpFailure` itself is unchanged).  Fields the
+ * adapter error path cannot determine reliably are omitted rather than guessed.
+ */
+export function buildMcpFailureMetadata(
+  source: UnknownMcpSource,
+  errorCode: string | undefined,
+  details: Record<string, unknown>,
+  isError: boolean,
+): McpFailureMetadata {
+  const metadata: McpFailureMetadata = { version: "mcp_failure_v1", source };
+  if (errorCode !== undefined) metadata.error_class = errorCode;
+  if (errorCode === "call_failed") metadata.dispatch_phase = "dispatched";
+  else if (errorCode !== undefined && NO_DISPATCH_ERROR_CODES.has(errorCode)) metadata.dispatch_phase = "preflight";
+  else metadata.dispatch_phase = "unknown";
+  if (isError) metadata.is_standard_mcp_error = true;
+  const upstream = requestIdFrom(details);
+  if (upstream !== undefined) metadata.upstream_request_id = upstream;
+  return isSafeMcpFailureMetadata(metadata) ? metadata : { version: "mcp_failure_v1", source };
+}
+
 export function createMcpAccountingExtensionFactory(
   accounting: McpAccountingExtension,
   bindings: readonly McpToolBinding[] = [],
@@ -335,10 +380,8 @@ export function createMcpAccountingExtensionFactory(
 
       const failUnknown = async (source: UnknownMcpSource): Promise<boolean> => {
         try {
-          await accounting.afterToolError(permit, "result_unknown", {
-            version: "mcp_failure_v1",
-            source,
-          });
+          await accounting.afterToolError(permit, "result_unknown",
+            buildMcpFailureMetadata(source, errorCode, details, event.isError === true));
           permits.delete(event.toolCallId);
           return true;
         } catch {
@@ -360,7 +403,12 @@ export function createMcpAccountingExtensionFactory(
               permit,
               classification,
               classification === "result_unknown"
-                ? { version: "mcp_failure_v1", source: errorCode === "call_failed" ? "call_failed" : "other" }
+                ? buildMcpFailureMetadata(
+                    errorCode === "call_failed" ? "call_failed" : "other",
+                    errorCode,
+                    details,
+                    event.isError === true,
+                  )
                 : undefined,
             );
             permits.delete(event.toolCallId);

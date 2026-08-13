@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from pydantic import ValidationError
 
+from app.agent_artifacts.canonical import model_direct_lineage_context
 from app.agent_artifacts.exporters.brand import render_brand_workbook
 from app.agent_artifacts.exporters.campaign import render_campaign_workbook
 from app.agent_artifacts.exporters.kol_selection import render_kol_selection_workbook
@@ -69,7 +70,12 @@ def export_artifact(version, *, model=None, gateway=None) -> bytes:
             schema_version, reason="no published immutable payload"
         )
     try:
-        return exporter(payload)
+        # Direct Artifact Skill payload（model_direct_v1，canonical 无 Evidence）
+        # 在发布校验时经 direct lineage context 豁免 evidence_ids 要求；导出是
+        # 同一 payload 的只读渲染，重新校验必须使用同一上下文，否则已发布
+        # direct payload 会被误判为 409（提交 3 修复）。
+        with model_direct_lineage_context():
+            return exporter(payload)
     except (ValidationError, ValueError) as exc:
         raise ArtifactExportUnsupported(
             schema_version, reason="published payload fails typed validation"

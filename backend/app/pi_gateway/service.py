@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import secrets
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
@@ -678,10 +679,26 @@ class PiGatewayService:
 
     @staticmethod
     def _safe_metadata_message(prefix: str, metadata: dict[str, Any] | None) -> str:
+        """把失败元数据收敛为紧凑 JSON（含 version/source 与新增可观测字段的
+        非空子集），供审计/排障；分类语义不变（unknown 仍保持 reserved）。"""
         if metadata is None:
             return prefix
-        source = metadata.get("source")
-        return f"{prefix}:{source}" if isinstance(source, str) else prefix
+        allowed = {
+            "version",
+            "source",
+            "error_class",
+            "received_jsonrpc_response",
+            "dispatch_phase",
+            "is_standard_mcp_error",
+            "upstream_request_id",
+        }
+        fields = {
+            key: value
+            for key, value in metadata.items()
+            if key in allowed and value is not None
+        }
+        rendered = json.dumps(fields, ensure_ascii=False, separators=(",", ":"))
+        return f"{prefix}:{rendered}" if fields else prefix
 
     async def _update_mcp_call_status(
         self,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from uuid import uuid4
 
@@ -179,15 +180,30 @@ async def test_confirmed_failure_releases_without_evidence(db_session, user_fact
 
 
 @pytest.mark.asyncio
-async def test_unknown_keeps_reservation_and_records_only_safe_source(db_session, user_factory) -> None:
+async def test_unknown_keeps_reservation_and_records_compact_metadata_json(
+    db_session, user_factory
+) -> None:
     _user, run, _attempt, tenant_id, service, permit = await _preflight(db_session, user_factory)
     await service.fail_mcp(
         run, permit.permit_id, "result_unknown",
-        metadata={"version": "mcp_failure_v1", "source": "worker_rpc_timeout"},
+        metadata={
+            "version": "mcp_failure_v1",
+            "source": "call_failed",
+            "error_class": "call_failed",
+            "dispatch_phase": "dispatched",
+            "upstream_request_id": "req-abc",
+        },
     )
     call = await db_session.scalar(select(AgentToolCall).where(AgentToolCall.run_id == run.id))
     assert call is not None and call.status == "unknown" and call.error_type == "result_unknown"
-    assert call.safe_error_message == "result_unknown:worker_rpc_timeout"
+    # 提交 3：safe_error_message 是紧凑 JSON（含 version/source 与可观测字段子集）。
+    summary = json.loads(call.safe_error_message.removeprefix("result_unknown:"))
+    assert summary["version"] == "mcp_failure_v1"
+    assert summary["source"] == "call_failed"
+    assert summary["error_class"] == "call_failed"
+    assert summary["dispatch_phase"] == "dispatched"
+    assert summary["upstream_request_id"] == "req-abc"
+    # 分类语义不变：result_unknown 仍保持预留，不释放。
     wallet = await db_session.get(TenantWallet, tenant_id)
     assert wallet is not None and wallet.reserved == 10
 

@@ -116,9 +116,25 @@ describe("direct MCP accounting hook", () => {
       { permit_id: "permit-1" },
       classification,
       ...(classification === "result_unknown"
-        ? [{ version: "mcp_failure_v1", source: code === "call_failed" ? "call_failed" : "other" }]
+        ? [expect.objectContaining({
+            version: "mcp_failure_v1",
+            source: code === "call_failed" ? "call_failed" : "other",
+          })]
         : []),
     );
+    // 提交 3：metadata-only 可观测性——call_failed → result_unknown 且携带
+    // error_class（adapter error code）与 dispatch_phase=dispatched。
+    if (classification === "result_unknown") {
+      const metadata = (fail.mock.calls[0] as unknown[] | undefined)?.[2];
+      expect(metadata).toMatchObject({
+        version: "mcp_failure_v1",
+        source: code === "call_failed" ? "call_failed" : "other",
+        error_class: code,
+      });
+      if (code === "call_failed") {
+        expect(metadata).toMatchObject({ dispatch_phase: "dispatched" });
+      }
+    }
   });
 
   it.each([
@@ -141,8 +157,17 @@ describe("direct MCP accounting hook", () => {
     expect(fail).toHaveBeenCalledWith(
       { permit_id: "permit-1" },
       "result_unknown",
-      { version: "mcp_failure_v1", source: "other" },
+      expect.objectContaining({ version: "mcp_failure_v1", source: "other" }),
     );
+    // 未知 error code 无法确认外发阶段：dispatch_phase=unknown 且保留 error_class。
+    const metadata = (fail.mock.calls[0] as unknown[] | undefined)?.[2];
+    expect(metadata).toMatchObject({
+      version: "mcp_failure_v1",
+      source: "other",
+      error_class: code,
+      dispatch_phase: "unknown",
+      ...(isError ? { is_standard_mcp_error: true } : {}),
+    });
   });
 
   it("treats the SDK isError marker without an error code as a confirmed Tool Error", async () => {
@@ -182,7 +207,7 @@ describe("direct MCP accounting hook", () => {
     expect(fail).toHaveBeenCalledWith(
       { permit_id: "permit-1" },
       "result_unknown",
-      { version: "mcp_failure_v1", source: "worker_rpc_timeout" },
+      expect.objectContaining({ version: "mcp_failure_v1", source: "worker_rpc_timeout" }),
     );
   });
 });

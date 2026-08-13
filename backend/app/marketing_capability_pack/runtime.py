@@ -78,7 +78,7 @@ def build_marketing_run_capability(
 ) -> MarketingRunCapability:
     root = packs_root or Path(__file__).with_name("packs")
     loader = CapabilityPackLoader(root)
-    snapshot = loader.load_manifest("marketing-v1")
+    snapshot = loader.load_manifest("marketing-v2")
     skills = tuple(
         MarketingSkillSnapshot(
             name=spec.name,

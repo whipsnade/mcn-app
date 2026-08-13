@@ -119,6 +119,46 @@ def test_repository_marketing_pack_declares_all_business_capabilities() -> None:
     assert snapshot.runtime_contract_version == "marketing_runtime_v1"
 
 
+def test_repository_marketing_v2_pack_aligns_with_pi_production_tool_surface() -> None:
+    """marketing-v2（1.1.0）的 required_tools 必须全部落在 Pi production 工具面，
+    不得再引用已废止 Builder/检索工具；SKILL 正文不得要求 Evidence 必经或
+    mcp_result_v1 包裹。"""
+    packs_root = Path(__file__).parents[2] / "app" / "marketing_capability_pack" / "packs"
+    snapshot = CapabilityPackLoader(packs_root).load_manifest("marketing-v2")
+    loader = CapabilityPackLoader(packs_root)
+
+    pi_tool_surface = {
+        "get_session_context",
+        "load_marketing_skill",
+        "read_artifact",
+        "build_artifact_draft",
+        "publish_artifacts",
+        "request_clarification",
+    }
+    assert snapshot.pack_version == "1.1.0"
+    for skill in snapshot.skills:
+        assert skill.version == "1.1.0"
+        assert set(skill.required_tools) <= pi_tool_surface
+    assert snapshot.builder_versions == {"brand_report_v3": "1.1.0", "campaign_report_v3": "1.1.0", "kol_selection_v3": "1.1.0"}
+    assert snapshot.exporter_versions == {"brand_report_v3": "1.1.0", "campaign_report_v3": "1.1.0", "kol_selection_v3": "1.1.0"}
+
+    forbidden = (
+        "search_evidence",
+        "read_tool_result",
+        "mcp_result_v1",
+        "build_brand_report_draft",
+        "build_campaign_report_draft",
+        "build_kol_selection_draft",
+        "build_insight_draft",
+    )
+    for skill in snapshot.skills:
+        content = loader.load_skill(snapshot, skill.name).content
+        for term in forbidden:
+            assert term not in content, f"{skill.name} SKILL.md 含禁用字样 {term!r}"
+    assert all(term not in snapshot.root_policy for term in forbidden)
+    assert "model_input_contract" in snapshot.root_policy
+
+
 @pytest.mark.parametrize("field", ["api_key", "token", "password", "secret", "endpoint", "dsn"])
 def test_loader_rejects_nested_sensitive_manifest_fields(tmp_path: Path, field: str) -> None:
     pack = _write_pack(tmp_path)

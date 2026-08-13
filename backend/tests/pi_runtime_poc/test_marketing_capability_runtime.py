@@ -33,7 +33,7 @@ def test_capability_loads_only_enabled_skill_and_is_idempotent() -> None:
     capability = build_marketing_run_capability()
 
     first = capability.load_skill("brand-research-report")
-    second = capability.load_skill("brand-research-report", "1.0.0")
+    second = capability.load_skill("brand-research-report", "1.1.0")
 
     assert first == second
     assert first["name"] == "brand-research-report"
@@ -49,9 +49,9 @@ def test_capability_snapshot_is_json_safe_and_has_all_version_facts() -> None:
     capability = build_marketing_run_capability()
     snapshot = capability.model_dump()
 
-    assert json.loads(json.dumps(snapshot))["pack_version"] == "1.0.0"
-    assert snapshot["builder_versions"]["brand_report_v3"] == "1.0.0"
-    assert snapshot["exporter_versions"]["kol_selection_v3"] == "1.0.0"
+    assert json.loads(json.dumps(snapshot))["pack_version"] == "1.1.0"
+    assert snapshot["builder_versions"]["brand_report_v3"] == "1.1.0"
+    assert snapshot["exporter_versions"]["kol_selection_v3"] == "1.1.0"
     assert not {"read", "bash", "edit", "write", "grep", "find", "ls"} & PI_POC_ALLOWED_TOOLS
     assert "load_marketing_skill" in PI_POC_ALLOWED_TOOLS
 

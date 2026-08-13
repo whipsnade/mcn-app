@@ -82,6 +82,15 @@ class PiGatewayMcpFailureMetadata(_StrictModel):
         "finalize_ack_unknown",
         "other",
     ]
+    # 提交 3：仅 metadata-only 可观测性，不改变分类语义（result_unknown 仍保持
+    # 预留、不自动释放、不自动重放）。真实 round 的 14 个 unknown 均为 adapter
+    # call_failed；这些字段让审计能区分「adapter 明确失败但结果未知」与「协议/
+    # 阶段不明」。
+    error_class: str | None = Field(default=None, max_length=64)
+    received_jsonrpc_response: bool | None = None
+    dispatch_phase: Literal["preflight", "dispatched", "unknown"] | None = None
+    is_standard_mcp_error: bool | None = None
+    upstream_request_id: str | None = Field(default=None, max_length=128)
 
 
 class PiGatewayMcpFailRequest(_StrictModel):
