@@ -1,5 +1,11 @@
 # Pi RPC POC 轮次记录
 
+> SUPERSEDED 说明（2026-08-13）：本文是历史 POC 轮次记录，正文不改写。文中
+> 「Evidence lineage」「复用既有 Evidence/Builder」等表述按当时 POC 设计理解；现行 Pi
+> production path（audited Direct MCP baseline `c01ec1ba…`）不写数据库 Evidence、无
+> required artifact，测试证明统一称为「验收证据/数据库快照/事件记录/账本对账/ToolCall
+> 记录」。历史 POC 结论（含 `EVALUATED_FAIL`）保持原样。
+
 真实对比仅通过 `backend/scripts/run_pi_runtime_poc.sh` 启动。每个 round 追加记录命令、
 模型/ Pi 版本、六例结果、供应商异常、人工可读性评分与 Gate A 结论；不记录密钥、DSN、
 完整 Prompt、原始 DataTap 结果或内部 Run token。

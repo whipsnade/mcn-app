@@ -64,4 +64,14 @@
 
 ## 交付状态
 
-验证完成后只报告：`READY_FOR_DIRECT_MODEL_MCP_SMOKE_REVIEW`。本分支停止等待架构复核，不直接运行完整 Scenario 2，也不进入 Scenario 3–7。
+> 更新（2026-08-13 后续）：阶段 6 已完成——4 个线性提交
+> `33d37c0`/`0d87d4e`/`96e8fd9`/`c01ec1b`（`e00690fb` 线性后代），全量离线验证通过，
+> 独立审查 Critical 0 / Important 0，真实 Direct Model + MCP Smoke 已执行：
+> `DIRECT_MODEL_MCP_SMOKE_FUNCTIONALLY_ACCEPTED_WITH_PROTOCOL_DEVIATION`
+> （详见 `docs/qa/2026-08-13-direct-model-mcp-smoke-review.md`；偏差：直连对照调用 2 次
+> 超出授权上限 1 次，如实记录）。当前基线 `c01ec1ba1ea3dc3805184ea3ddb8f4bf0ea14196`。
+> 下一状态：`READY_FOR_WEB_FUNCTIONAL_SCENARIO_2_REAUTHORIZATION`。
+
+历史交付状态（当时记录，保持原样）：验证完成后只报告
+`READY_FOR_DIRECT_MODEL_MCP_SMOKE_REVIEW`。本分支停止等待架构复核，不直接运行完整
+Scenario 2，也不进入 Scenario 3–7。

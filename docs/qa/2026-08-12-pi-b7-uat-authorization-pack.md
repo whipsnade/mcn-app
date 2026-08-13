@@ -6,11 +6,18 @@
 授权流程 §7：模式 A 两阶段 / 模式 B 一次性）。
 
 ```text
-Status: READY_FOR_REAL_B7_UAT_REAUTHORIZATION（round REAL_B7_20260812T045636Z_b801c490 已执行并封存：
-L0 通过；L1 FAIL——mcp_tool_identity_invalid，0 外发 0 扣费，账务恒等式成立；按「L1 失败不得
-进入 L2」规则终止。修复轮（§6.6）已收口；旧一次性授权已随失败 round 消费完毕，真实 B7 必须
-由用户按 §5.3 模板重新授权）
-Real external calls authorized: NO（旧授权已随失败 round 封存；新授权前任何真实外部调用禁止）
+Status: READY_FOR_WEB_FUNCTIONAL_SCENARIO_2_REAUTHORIZATION
+（架构转向（2026-08-13）：Evidence Bridge / mcp_result_v1 / required artifact 相关现行规则
+已被 `2026-08-13-pi-direct-mcp-result-artifact-skill-design.md` 覆盖，本包 §2.3/§2.4/§3
+已按「验收证据 ≠ 数据库 Evidence」语义纠偏；新 execution gate 锚定 audited Direct MCP
+baseline c01ec1ba…（§5.3/§5.4）。历史事实保留：round REAL_B7_20260812T045636Z_b801c490
+已执行并封存——L0 通过；L1 FAIL——mcp_tool_identity_invalid，0 外发 0 扣费，账务恒等式
+成立；按「L1 失败不得进入 L2」规则终止。修复轮（§6.6）已收口。真实 Direct Model + MCP
+Smoke（round DIRECT_MODEL_MCP_SMOKE_20260813T103101Z_c01ec1ba）已执行：
+DIRECT_MODEL_MCP_SMOKE_FUNCTIONALLY_ACCEPTED_WITH_PROTOCOL_DEVIATION（偏差：直连对照
+调用 2 次超出授权上限 1 次，见 docs/qa/2026-08-13-direct-model-mcp-smoke-review.md）。
+下一轮 Web Functional Scenario 2 由用户按 §5.4 单场景模板逐字重新授权）
+Real external calls authorized: NO（任何真实外部调用须按 §5.4 重新授权）
 Production cutover authorized: NO
 Historical Task 9 rerun authorized: NO
 Plan C authorized: NO
@@ -133,7 +140,7 @@ flush/fsync），写后不可变；`authorization.md`（模式 B，L0-10）/ `au
 | wallet/quota before and after | 整数积分值（测试钱包） |
 | ledger transaction IDs | 明文 ID，不含金额以外的敏感字段 |
 | usage record IDs | 明文 ID |
-| Artifact/Version/Evidence IDs | 明文 ID |
+| Artifact/Version IDs | 明文 ID（2026-08-13 纠偏：新 Pi 路径不产生数据库 Evidence 业务实体；需要测试证明时记录验收证据——数据库快照、事件记录、账本对账、ToolCall 记录，不再统称数据库 Evidence） |
 | export file SHA-256 | 明文哈希 |
 | sanitized log SHA-256 | 明文哈希（日志本体先脱敏再哈希） |
 | terminal status | 稳定终态码 |
@@ -151,7 +158,8 @@ flush/fsync），写后不可变；`authorization.md`（模式 B，L0-10）/ `au
 - 未脱敏手机号；
 - 原始供应商敏感错误（只允许稳定错误码与脱敏摘要）；
 - 无必要的用户 Prompt 全文（默认只记哈希与长度，确需引用时最小摘录并说明理由）；
-- 原始 DataTap payload 中的敏感字段（Evidence 以归一化后的落库形状为准）。
+- 原始 DataTap payload 中的敏感字段（新 Pi 路径不落库完整 MCP payload；证据文件只允许
+  脱敏安全投影与哈希，确需引用时最小摘录并说明理由）。
 
 ## 3. 硬停止条件
 
@@ -169,7 +177,9 @@ flush/fsync），写后不可变；`authorization.md`（模式 B，L0-10）/ `au
 8. `unknown` 被自动重放。
 9. `message.completed` 与 terminal 顺序错误。
 10. 出现多个 terminal。
-11. Artifact/Version/Evidence lineage 不一致。
+11. Artifact/Version lineage 不一致（2026-08-13 纠偏：不再含数据库 Evidence lineage——
+    新 Pi 路径的 lineage 是 Publication/Version 结构校验与同 Session 归属校验，数据库
+    Evidence 增量为 0 是预期事实，不是停止条件）。
 12. Excel 和 BI 未绑定同一 Version。
 13. 预算任一上限达到（授权计划 §5 任一字段）；L1-SMOKE 的模型逻辑请求达到 2 次上限时，
     在第 3 次请求发生前即停（SDK/业务自动重试一律禁止）。
@@ -365,13 +375,16 @@ REAL B7 UAT 一次性完整授权确认（ONESHOT_FULL_AUTHORIZATION，模式 B�
 
 - authorization mode: ONESHOT_FULL_AUTHORIZATION（模式 B）
 - round_id 身份规则: REAL_B7_<启动门禁通过时点 UTC 秒级时间戳>_<execution commit 前 8 位>
-- execution commit 身份规则: 启动门禁通过时点、最终文档纠偏后的 clean HEAD；必须是
-  68deca58f2d2cd8aafb96d9ea47a0a60462142fa（已审核 L1 repair baseline）的线性后代，
-  且包含 f8a4ffa / 494d20e / c22a3a1 / 8a5f264 / 68deca5 五个修复提交；
-  68deca58 至 HEAD 区间只允许已审核的文档纠偏；工作树必须干净；
-  禁止 checkout/reset/rebase/amend；不再要求 61576f7..HEAD 为 docs-only
+- execution commit 身份规则: 启动门禁通过时点、UAT 契约纠偏后的 clean HEAD；必须是
+  c01ec1ba1ea3dc3805184ea3ddb8f4bf0ea14196（audited Direct MCP baseline）的线性后代，
+  且包含 33d37c0 / 0d87d4e / 96e8fd9 / c01ec1b 四个已审核提交；
+  c01ec1ba 至 HEAD 区间只允许本轮 UAT 契约纠偏的 Markdown/changelog 提交；工作树必须干净；
+  禁止 checkout/reset/rebase/amend；execution HEAD 由本授权消息逐字确认
+  （历史事实：68deca58… 为已审核 L1 repair baseline、61576f7… 为修复前 production baseline，
+  均不再作为执行门禁）
 - branch: <分支名>
-- migration head: 0043_billing_downgrade_guard
+- migration head: 0044_agent_run_loop_guard（0043_billing_downgrade_guard 为第一轮
+  B7 时点的历史事实）
 - 启动门禁数据库身份核验（逐项，任一不符即 B7_BLOCKED）:
   - SELECT DATABASE() == kol_insight_b7_uat: <YES>
   - CURRENT_USER() == kol_b7_uat@localhost: <YES>
@@ -450,6 +463,69 @@ L2；L0 产出值（tenant/user/gateway IDs、Runtime Config/License ID/version�
 hash、catalog/schema digests）逐字录入证据后视为固定值，任何未授权变化命中 §3-18。
 本授权不降低任何预算、隔离、destructive 开关或停止条件要求。文档、Git commit、测试通过或
 READY 状态均不构成授权之外的执行许可。
+```
+
+### 5.4 单场景授权模板（WEB_FUNCTIONAL_SCENARIO_2，2026-08-13 新增）
+
+> 独立的单场景授权模板：只授权一次 Web Functional Scenario 2（纠偏后 L2-01 品牌报告
+> 蓝本）。状态入口 `READY_FOR_WEB_FUNCTIONAL_SCENARIO_2_REAUTHORIZATION`；执行契约见
+> 授权计划 §8。
+
+```text
+WEB FUNCTIONAL SCENARIO 2 单场景授权确认
+
+我授权在以下约束内执行一次 Web Functional Scenario 2：
+
+- authorization scope: WEB_FUNCTIONAL_SCENARIO_2（单场景，品牌报告蓝本）
+- round_id 身份规则: DIRECT_MCP_WEB_S2_<启动门禁通过时点 UTC 秒级时间戳>_<execution commit 前 8 位>
+- execution commit 身份规则: 启动门禁通过时点、UAT 契约纠偏后的 clean HEAD；必须是
+  c01ec1ba1ea3dc3805184ea3ddb8f4bf0ea14196（audited Direct MCP baseline）的线性后代，
+  且包含 33d37c0 / 0d87d4e / 96e8fd9 / c01ec1b 四个已审核提交；c01ec1ba 至 HEAD 区间
+  只允许本轮 UAT 契约纠偏的 Markdown/changelog 提交；工作树干净；禁止
+  checkout/reset/rebase/amend；execution HEAD 由本授权消息逐字确认
+- branch: codex/real-mcp-evidence-bridge-repair
+- migration head: 0044_agent_run_loop_guard
+- 隔离环境: kol_insight_b7_uat（kol_b7_uat@localhost）；禁止 kol_insight /
+  kol_insight_test / 任何开发、预生产、生产、正式客户数据库；禁止 DROP/CREATE/重建、
+  普通 pytest、离线 UAT harness、迁移 downgrade
+- 数据库状态: 新 round_id 对应 tenant/user/gateway/Run 启动为 0；创建后按新增行 delta
+  对账；历史 retained 行只读，禁止复用/修改（含 REAL_B7_20260812T045636Z_b801c490 与
+  DIRECT_MODEL_MCP_SMOKE_20260813T103101Z_c01ec1ba 数据）
+- 凭证引用（只记引用，值仅进程内，禁止 echo/日志/写文件）:
+  - MySQL 密码: Keychain com.kol-insight.real-b7-uat.mysql
+  - DataTap Token: Keychain com.kol-insight.real-b7-uat.datatap
+  - Runtime master keys: Keychain com.kol-insight.real-b7-uat.runtime-secret-master-keys（v1）
+  - 模型配置: 主仓库未跟踪文件 backend/.env（仅进程内）
+- 输入原则: 自然语言业务目标（示例见授权计划 §8.2）；不在输入中写工具名 / artifact_type /
+  Schema / Builder 名称 / 调用次数；不注入预计算 MCP 结果
+- 预算（防失控紧急上限，不是工具规划策略；不得因达到常见调用数量而提前干预模型）:
+  - 总执行时间: 2 小时
+  - Web 用户提交: 严格 1 次
+  - 业务 Run: 严格 1 个
+  - max_decisions: 60
+  - 真实模型请求: 最多 60 次
+  - DataTap discovery: 最多 5 次
+  - DataTap 业务 dispatch: 最多 50 次
+  - 钱包净支出: 最多 500 积分
+  - Artifact 发布: 只允许当前 Snapshot allowlist
+  - Gateway event buffer: 使用默认有界 buffer
+- 验收口径: 「必须生成品牌报告」是本场景 PASS 结果断言，不是 Runtime 完成门禁；Run 只完成
+  文字回答时 Runtime 可合法 completed 但本场景判 FAIL；数据库 Evidence 增量为 0 是预期
+  事实；不出现 mcp_result_v1 / Evidence Bridge 回灌
+- 启动规则: 真实模型或业务 DataTap 外发前可修正环境路径并重启服务；业务 Run 已发生真实
+  外部调用后，不得通过重启或 fresh Run 隐藏失败；环境问题与业务失败分别报告
+- 禁止: fake model；在真实调用后创建 fresh Run 重试；服务端 required artifact 强迫
+  Builder；将旧 Run/Artifact/Version 用作当前场景结果
+- stop conditions: 授权包 §3 全部硬停止条件（其中 §3-11 按 2026-08-13 纠偏语义）生效: <YES>
+- 清理/保留策略: <证据目录 append-only 永久保留；本 round 数据库数据 retained_by_policy
+  至独立 reviewer 封口，清除需用户另行授权>
+- operator: <执行人>
+- independent reviewer: <独立复核人，不得与 operator 同一人>
+- 时间窗口: <起止时间，含时区>
+- authorization message reference: THIS_MESSAGE
+
+文档、Git commit、测试通过或 READY 状态均不构成授权之外的执行许可。本模板是独立单场景
+授权面，不继承任何旧 round 授权。
 ```
 
 ## 6. 授权包修复记录（2026-08-12，NEEDS_AUTHORIZATION_PACK_REPAIR 收口）

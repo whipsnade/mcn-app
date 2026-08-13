@@ -1,5 +1,18 @@
 # Pi Agent Gateway 方案 B 实施计划
 
+> **SUPERSEDED 说明（2026-08-13）**：本计划是 2026-08-09 至 2026-08-12 期间的实施
+> 历史文档，正文不再改写。其中基于 Evidence Bridge / `mcp_result_v1` / required
+> artifact 的设计（尤其 Task 7 的「复用 output schema、Normalization、EvidenceWriter」、
+> Task 4 内部工具清单、Task 12/13 的 UAT 口径）已被
+> `docs/superpowers/specs/2026-08-13-pi-direct-mcp-result-artifact-skill-design.md`
+> 覆盖：新 Pi production path 不写数据库 Evidence、不使用 `mcp_result_v1` 分类、无
+> required artifact 门禁、Builder 统一为 `build_artifact_draft`。audited Direct MCP
+> baseline：`c01ec1ba1ea3dc3805184ea3ddb8f4bf0ea14196`（含
+> `33d37c0`/`0d87d4e`/`96e8fd9`/`c01ec1b`）。当前状态：
+> `READY_FOR_WEB_FUNCTIONAL_SCENARIO_2_REAUTHORIZATION`。文中「Evidence」一词按当时
+> 设计理解；现行规则中的测试证明统一称为「验收证据/数据库快照/事件记录/账本对账/
+> ToolCall 记录」。
+
 > **执行要求：** 开发代理必须使用 `superpowers:executing-plans`，逐项完成并在每个任务提交后复核。
 > 方案 B 含多个相互独立的审查面；可在同一开发会话内连续执行，但不得跨过任务内的红灯、绿灯、
 > 审查和提交边界。

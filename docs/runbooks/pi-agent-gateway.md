@@ -1,26 +1,27 @@
 # Pi Agent Gateway 运维手册
 
-本手册覆盖方案 B 的本地/预生产操作边界。当前交付状态只到
-`READY_FOR_REAL_B7_UAT_REVIEW`（2026-08-09 写入的 `READY_FOR_REAL_B7_UAT` 已被架构审核
-否决）：真实 B7 UAT、生产切流和方案 C 均需要单独审批。
+本手册覆盖方案 B 的本地/预生产操作边界。
 
-状态更新（2026-08-12）：本地代码修复与架构复核已完成，复核结论 Critical 0 / Important 0 /
-Minor 1；代码状态维持 `READY_FOR_REAL_B7_UAT_REVIEW`。模式 B round
-`REAL_B7_20260812T045636Z_b801c490` 已于同日执行：启动门禁与 L0 全部通过，L1-SMOKE 因
-真实模型经通用 mcp 代理以裸 remote 名寻址被 `mcp_tool_identity_invalid` 拦截（0 外发、
-0 扣费、19 条硬停止无一触发）而 FAIL，按规则终止封存。修复分支 `codex/real-b7-l1-repair`
-已修复通用代理身份映射（裸名/重名 fail-closed）并将 adapter 切到 `toolPrefix: "none"`，
-新增 B7 证据生成器（`backend/scripts/b7_evidence.py` + 单测）；授权计划与授权包同步修订
-（L1-00 discovery 预检、固定 quarantine 基线、L1 模型请求上限 2 次、operator/reviewer
-封口角色分离）。当前状态 `READY_FOR_REAL_B7_UAT_REAUTHORIZATION`：旧授权已随失败 round
-消费，真实 B7 必须由用户按授权包 §5.3 模板重新授权；在新授权前不得执行真实外部调用，
-也不得把状态写成 B7 PASS 或 production ready。
+> 状态更新（2026-08-13，Direct MCP 架构）：新 Pi production path 不产生数据库 `Evidence`
+> 业务实体、不使用 `mcp_result_v1` 分类、无 required artifact 门禁；标准 MCP Tool Result
+> 由 adapter 原样交给模型，accounting finalize 只传 metadata；Builder 统一为
+> `build_artifact_draft`（Snapshot allowlist + 严格 Schema）。真实 Direct Model + MCP
+> Smoke 已执行：`DIRECT_MODEL_MCP_SMOKE_FUNCTIONALLY_ACCEPTED_WITH_PROTOCOL_DEVIATION`
+> （直连对照调用 2 次超出授权上限 1 次，见
+> `docs/qa/2026-08-13-direct-model-mcp-smoke-review.md`）。audited Direct MCP baseline：
+> `c01ec1ba1ea3dc3805184ea3ddb8f4bf0ea14196`。当前状态：
+> `READY_FOR_WEB_FUNCTIONAL_SCENARIO_2_REAUTHORIZATION`（单场景授权模板见授权包 §5.4）。
+> 历史状态（2026-08-09 写入的 `READY_FOR_REAL_B7_UAT` 已被架构审核否决；2026-08-12 的
+> `READY_FOR_REAL_B7_UAT_REVIEW`/`REAUTHORIZATION` 与失败 round
+> `REAL_B7_20260812T045636Z_b801c490` 均为历史事实）：真实 B7 UAT、生产切流和方案 C 均
+> 需要单独审批。
 
 ## 组件、版本与启动检查
 
 后端使用 Python 3.11/3.12、FastAPI、SQLAlchemy Async 和 MySQL 8；启动前必须在隔离测试库执行
 `backend/.venv/bin/alembic upgrade head`，并确认只有一个迁移 head。当前 head 为
-`0043_billing_downgrade_guard`。后端健康检查使用 `GET /healthz`。
+`0044_agent_run_loop_guard`（`0043_billing_downgrade_guard` 为第一轮 B7 时点的历史事实）。
+后端健康检查使用 `GET /healthz`。
 
 迁移回滚护栏：0043 的 downgrade guard 挂在 head→0042 一步；任何降穿 0040 的命令（包括
 staged downgrade）由 `migrations/env.py` 的预检统一拦截——租户账本在 0040 之后产生新流水/
@@ -111,9 +112,10 @@ B7 专用的模型决策预算：`limits.max_decisions`（整数 1..100）是 se
 不重放）。缺失或非法（布尔/浮点/越界）时 worker 在启动前 fail-closed
 （`pi_gateway_runtime_snapshot_invalid`），Gateway 不得用默认值替代服务端快照。SDK 两层自动
 重试（agent auto-retry 与 provider maxRetries）在生产 session 中一律关闭；provider 流式终局
-失败以 `pi_model_provider_error` 稳定 failed 收口。B7 流程：L1 用 `max_decisions=2` 的配置版本；
+失败以 `pi_model_provider_error` 稳定 failed 收口。历史 B7 流程：L1 用 `max_decisions=2` 的配置版本；
 L1 通过后、L2 前激活 `max_decisions=50` 的新 append-only 版本（只影响新 Run，旧 Run snapshot
-不变）。
+不变）。现行（2026-08-13）：`max_decisions` 是防失控紧急上限，不是工具规划策略；Web Functional
+Scenario 2 建议 `max_decisions=60`，不得因达到常见调用数量而提前干预模型（授权包 §5.4）。
 
 ## 灰度、容量与回滚
 
@@ -173,7 +175,7 @@ L1 通过后、L2 前激活 `max_decisions=50` 的新 append-only 版本（只�
   真实 DataTap discovery（仅 negotiation/list-tools，0 ToolCall、0 积分）只允许发生在
   L1-00 外部调用预检（真实 origin 重启控制面后核验 29 个已审核工具 digest 与固定
   quarantine 基线 `insight-cube-mcp`/`query_user_info`）。
-- 数据库证据 `retained_by_policy`：tenant/用户/账本/Runtime Config/License/usage/lineage
+- 数据库数据 `retained_by_policy`：tenant/用户/账本/Runtime Config/License/usage/lineage
   保留至独立 reviewer 封口；清除需用户另行授权；证据目录永久保留。
 - 证据封口角色分离：operator 只追加 `execution_completed`/`execution_stopped` 帧与
   `operator-summary.md`；`round_sealed` 帧、`verdict.md`、`hashes.sha256` 只由

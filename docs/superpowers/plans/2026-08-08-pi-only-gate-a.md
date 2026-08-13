@@ -1,5 +1,10 @@
 # Pi-only Gate A Implementation Plan
 
+> SUPERSEDED 说明（2026-08-13）：本文是 2026-08-08 的历史 Gate A 实施计划，正文不改写。
+> 文中 `required_artifact_type`/「Evidence lineage」等表述按当时 POC/Gate 设计理解；
+> 现行 Pi production path（audited Direct MCP baseline `c01ec1ba…`）无 required
+> artifact 门禁、不写数据库 Evidence。历史 Gate A 结论保持原样。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 移除方案 A 验收 Harness 中的 Current Runtime 对照链路，修复 MySQL 长会话中的 Run 内序号旧快照冲突，并以一次 Pi-only 六场景真实轮次产出可审计的绝对 Gate A 结论。

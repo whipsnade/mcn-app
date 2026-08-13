@@ -6,6 +6,13 @@
 Important 0 / Minor 1，本地代码与架构审核通过；仍等待用户对真实 B7 UAT 的明确授权。
 此前 2026-08-09 写入的 `READY_FOR_REAL_B7_UAT` 已被架构审核否决，本记录不重写该事实）
 
+> 2026-08-13 更新（Direct MCP 架构转向）：本文记录的离线场景属于当时 Evidence Bridge
+> 方向的验证；新 Pi production path 已改为透明 MCP 结果 + Artifact Skill（不写数据库
+> Evidence、无 `mcp_result_v1`、无 required artifact），离线 UAT 脚本已同步改为
+> `build_artifact_draft` 直提 payload 路径（27 场景全绿，见 `changelog/2026-08-13.md`）。
+> 本文历史章节中「Evidence」「Builder → Publication」等表述按当时设计理解，不再作为
+> 现行规则。当前状态：`READY_FOR_WEB_FUNCTIONAL_SCENARIO_2_REAUTHORIZATION`。
+
 ## 边界
 
 本记录只覆盖离线 fake topology：测试 MySQL（`kol_insight_test`）、FastAPI 真实子进程、
@@ -130,3 +137,20 @@ Gate A PASS、B7 PASS 或 production ready。
 - execution commit 消歧：`f7ab159` 仅为第一版文档基线历史事实；实际候选 execution commit
   为授权包最终修复提交后的 clean HEAD，round_id 以其前 8 位生成。
 - 上方全部历史否决与修复事实保持原样，不重写；本地离线 fake topology 仍不等于真实 B7 UAT。
+
+## 2026-08-13 更新（三）：Direct MCP 架构转向与 Smoke 接受
+
+- 新 Pi production path（`docs/superpowers/specs/2026-08-13-pi-direct-mcp-result-artifact-skill-design.md`）：
+  标准 MCP Tool Result 由 adapter 原样交给模型；accounting finalize 只传 metadata；不写
+  数据库 Evidence、不使用 `mcp_result_v1` 分类、无 required artifact 门禁；Builder 统一为
+  `build_artifact_draft`（Snapshot allowlist + 严格 Schema + tenant/session/run + Version
+  lineage）。离线 UAT 脚本相应切换（27 场景全绿）。
+- 真实 Direct Model + MCP Smoke（round `DIRECT_MODEL_MCP_SMOKE_20260813T103101Z_c01ec1ba`）
+  已执行并接受：`DIRECT_MODEL_MCP_SMOKE_FUNCTIONALLY_ACCEPTED_WITH_PROTOCOL_DEVIATION`
+  （偏差：直连对照调用 2 次超出授权上限 1 次）；Run completed、Attempt 1、模型请求 3 次、
+  生产 dispatch 恰 1 次、钱包净支出 10、数据库 Evidence 增量 0（预期事实）。详见
+  `docs/qa/2026-08-13-direct-model-mcp-smoke-review.md`。
+- audited Direct MCP baseline：`c01ec1ba1ea3dc3805184ea3ddb8f4bf0ea14196`；新 execution
+  gate 见授权计划 §1.1/§8.1。当前状态：
+  `READY_FOR_WEB_FUNCTIONAL_SCENARIO_2_REAUTHORIZATION`。
+- 上方全部历史否决与修复事实保持原样，不重写。
