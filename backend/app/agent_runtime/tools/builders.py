@@ -61,7 +61,13 @@ from app.agent_artifacts.builders.kol_detail import build_kol_detail_draft
 from app.agent_artifacts.builders.kol_selection import build_kol_selection_draft
 from app.agent_artifacts.builders.raw_rows import extract_rows, unwrap_payload
 from app.agent_artifacts.lineage import PointerError, resolve_pointer
+from app.agent_artifacts.model_inputs import (
+    MODEL_INPUT_BY_ARTIFACT_TYPE,
+    SERVER_OWNED_PAYLOAD_KEYS,
+    assemble_model_payload,
+)
 from app.agent_artifacts.models import AgentArtifact, AgentArtifactVersion
+from app.agent_artifacts.payload_errors import format_model_input_errors, format_payload_errors
 from app.agent_artifacts.payloads.kol_analysis import KolAnalysisNarrative
 from app.agent_artifacts.payloads.kol_selection import KolSelectionNarrative
 from app.agent_artifacts.service import ArtifactBusy, ArtifactService
@@ -249,7 +255,10 @@ class _BuilderToolBase:
         except ArtifactBusy as exc:
             return _failed(exc.code, str(exc))
         except ArtifactPayloadInvalid as exc:
-            return _failed(exc.code, str(exc))
+            return _failed(
+                exc.code,
+                json.dumps(format_payload_errors(exc), ensure_ascii=False),
+            )
         return ToolResult(
             status="success",
             safe_summary=_draft_summary(
@@ -335,6 +344,40 @@ class BuildArtifactDraftTool(_BuilderToolBase):
                 "artifact_contract_not_allowed",
                 f"artifact type {args.artifact_type!r} is not allowed by the current Run snapshot",
             )
+        model_input_cls = MODEL_INPUT_BY_ARTIFACT_TYPE.get(args.artifact_type)
+        if model_input_cls is None:
+            return _failed(
+                "artifact_contract_not_allowed",
+                f"no direct model input contract for {args.artifact_type!r}",
+            )
+        present = sorted(set(args.payload) & SERVER_OWNED_PAYLOAD_KEYS)
+        if present:
+            return _failed(
+                "server_owned_field_rejected",
+                json.dumps(
+                    {
+                        "error": "payload contains server-owned fields; submit business fields only",
+                        "server_owned_fields": [
+                            {
+                                "path": "/" + key,
+                                "reason": (
+                                    f"{key!r} is derived server-side from the typed model input"
+                                ),
+                            }
+                            for key in present
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+        try:
+            model_input = model_input_cls.model_validate(args.payload)
+        except ValidationError as exc:
+            return _failed(
+                DRAFT_BUILD_ERROR,
+                json.dumps(format_model_input_errors(exc), ensure_ascii=False),
+            )
+        final_payload = assemble_model_payload(args.artifact_type, model_input)
         if args.source_tool_call_ids:
             owned = set(
                 (
@@ -351,7 +394,7 @@ class BuildArtifactDraftTool(_BuilderToolBase):
         parent_artifact_id: str | None = None
         parent_artifact_version_id: str | None = None
         if args.artifact_type == "insight_board_v1":
-            parent_artifact_id = args.payload.get("parent_artifact_id")
+            parent_artifact_id = final_payload.get("parent_artifact_id")
             if not isinstance(parent_artifact_id, str) or not parent_artifact_id:
                 return _failed("parent_artifact_not_found", "parent artifact is required")
             parent = await self._db.scalar(
@@ -364,7 +407,7 @@ class BuildArtifactDraftTool(_BuilderToolBase):
             )
             if parent is None:
                 return _failed("parent_artifact_not_found", "parent artifact is not published in the current session")
-            requested_version_id = args.payload.get("parent_artifact_version_id")
+            requested_version_id = final_payload.get("parent_artifact_version_id")
             version_query = select(AgentArtifactVersion).where(
                 AgentArtifactVersion.artifact_id == parent.id,
             )
@@ -380,7 +423,7 @@ class BuildArtifactDraftTool(_BuilderToolBase):
                 )
             parent_artifact_version_id = parent_version.id
 
-        business = self._business_fields(args.artifact_type, args.payload)
+        business = self._business_fields(args.artifact_type, final_payload)
         if business is None:
             return _failed(
                 DRAFT_BUILD_ERROR,
@@ -399,7 +442,7 @@ class BuildArtifactDraftTool(_BuilderToolBase):
                 artifact_type=args.artifact_type,
                 schema_version=args.artifact_type,
                 business_fields=business_fields,
-                payload=args.payload,
+                payload=final_payload,
                 evidence_refs=[],
                 parent_artifact_id=parent_artifact_id,
                 parent_artifact_version_id=parent_artifact_version_id,

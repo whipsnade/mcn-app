@@ -28,26 +28,24 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_artifacts.models import AgentArtifact, ArtifactDraft
+from app.agent_artifacts.payload_errors import format_payload_errors
 from app.agent_artifacts.publishing import ArtifactPublicationService, DraftAlreadyPublished
 from app.agent_artifacts.service import ArtifactBusy, ArtifactService
 from app.agent_artifacts.validation import ArtifactPayloadInvalid, SCHEMA_VERSION_BY_MODULE
 from app.agent_runtime.kol_detail import KOL_DETAIL_SNAPSHOT_KEY
 from app.agent_runtime.models import AgentRun
-from app.agent_runtime.tools.contracts import ToolContext, ToolResult, truncate_summary
+from app.agent_runtime.tools.contracts import ToolContext, ToolResult
 
 TYPED_ARTIFACT_REQUIRES_BUILDER = "typed_artifact_requires_builder"
 
 
 def _payload_error_summary(exc: ArtifactPayloadInvalid) -> str:
-    """artifact_payload_invalid → 字段级明细（loc: msg [type]），供模型自愈。
+    """artifact_payload_invalid → 有界结构化字段级明细 JSON，供模型自愈。
 
-    仅报"N error(s)"时模型无法定位失败字段（真实 UAT 钻取场景 7 次盲改失败）。
+    仅报"N error(s)"时模型无法定位失败字段（真实 UAT 钻取场景 7 次盲改失败）；
+    结构化 JSON（path/type/reason/retryable，截断到 2048 字节）让模型按路径修正。
     """
-    parts: list[str] = []
-    for error in exc.errors[:20]:
-        loc = ".".join(str(part) for part in error.get("loc", ())) or "(root)"
-        parts.append(f"{loc}: {error.get('msg')} [{error.get('type')}]")
-    return truncate_summary(f"{exc}; " + "; ".join(parts) if parts else str(exc))
+    return json.dumps(format_payload_errors(exc), ensure_ascii=False)
 
 # 六类强类型正式 Artifact 的直写护栏：schema_version → 应使用的 Builder 工具名。
 _TYPED_BUILDER_BY_SCHEMA: dict[str, str] = {
