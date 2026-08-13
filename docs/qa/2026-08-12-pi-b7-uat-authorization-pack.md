@@ -6,7 +6,7 @@
 授权流程 §7：模式 A 两阶段 / 模式 B 一次性）。
 
 ```text
-Status: READY_FOR_WEB_FUNCTIONAL_SCENARIO_2_REAUTHORIZATION
+Status: READY_FOR_WEB_FUNCTIONAL_SCENARIO_2_RERUN_REVIEW
 （架构转向（2026-08-13）：Evidence Bridge / mcp_result_v1 / required artifact 相关现行规则
 已被 `2026-08-13-pi-direct-mcp-result-artifact-skill-design.md` 覆盖，本包 §2.3/§2.4/§3
 已按「验收证据 ≠ 数据库 Evidence」语义纠偏；新 execution gate 锚定 audited Direct MCP
@@ -16,7 +16,8 @@ baseline c01ec1ba…（§5.3/§5.4）。历史事实保留：round REAL_B7_20260
 Smoke（round DIRECT_MODEL_MCP_SMOKE_20260813T103101Z_c01ec1ba）已执行：
 DIRECT_MODEL_MCP_SMOKE_FUNCTIONALLY_ACCEPTED_WITH_PROTOCOL_DEVIATION（偏差：直连对照
 调用 2 次超出授权上限 1 次，见 docs/qa/2026-08-13-direct-model-mcp-smoke-review.md）。
-下一轮 Web Functional Scenario 2 由用户按 §5.4 单场景模板逐字重新授权）
+Direct Artifact Skill 契约修复已完成（3 个提交 284e4c7/45ec465/260f5cc，见
+changelog/2026-08-13.md「提交 2/3/4」段），待独立审查确认后按 §5.4 单场景模板重跑 Scenario 2）
 Real external calls authorized: NO（任何真实外部调用须按 §5.4 重新授权）
 Production cutover authorized: NO
 Historical Task 9 rerun authorized: NO
@@ -515,9 +516,19 @@ WEB FUNCTIONAL SCENARIO 2 单场景授权确认
   - 钱包净支出: 最多 500 积分
   - Artifact 发布: 只允许当前 Snapshot allowlist
   - Gateway event buffer: 使用默认有界 buffer
-- 验收口径: 「必须生成品牌报告」是本场景 PASS 结果断言，不是 Runtime 完成门禁；Run 只完成
-  文字回答时 Runtime 可合法 completed 但本场景判 FAIL；数据库 Evidence 增量为 0 是预期
-  事实；不出现 mcp_result_v1 / Evidence Bridge 回灌
+- 验收口径（A/B/C 三档，2026-08-13 Direct Artifact Skill 契约修复后；禁止把单纯文字
+  `completed` 判为 PASS）:
+  - A. FUNCTIONAL_SCENARIO_2_PASS：Draft → Publication → 不可变 Version → BI/Excel 同版
+    全部成功，且本轮新增 result_unknown=0、reserved=0、账务恒等式成立（净支出=settled×10）；
+  - B. FUNCTIONAL_SCENARIO_2_PASS_WITH_ACCOUNTING_WARNINGS：核心 Artifact 链成功，但仍存在
+    已披露的 result_unknown/reserved（如 adapter call_failed）。仅表示品牌报告核心业务通过，
+    不等于 B7 PASS 或生产就绪；
+  - C. FUNCTIONAL_SCENARIO_2_FAIL：未生成正式品牌报告 / Version / 同版 BI/Excel。
+  - 独立遗留项 ACCOUNTING_UNKNOWN_DIAGNOSTIC_REQUIRED：DataTap 抛异常问题（真实 round 的
+    14 个 unknown 均为 adapter call_failed）待独立诊断，不阻塞下一轮核心功能 Scenario 2 重跑，
+    但阻塞完整 B7 PASS 和生产切流
+  - 数据库 Evidence 增量为 0 是预期事实，不属于失败；不出现 mcp_result_v1 / Evidence Bridge
+    回灌
 - 启动规则: 真实模型或业务 DataTap 外发前可修正环境路径并重启服务；业务 Run 已发生真实
   外部调用后，不得通过重启或 fresh Run 隐藏失败；环境问题与业务失败分别报告
 - 禁止: fake model；在真实调用后创建 fresh Run 重试；服务端 required artifact 强迫

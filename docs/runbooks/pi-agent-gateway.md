@@ -5,16 +5,57 @@
 > 状态更新（2026-08-13，Direct MCP 架构）：新 Pi production path 不产生数据库 `Evidence`
 > 业务实体、不使用 `mcp_result_v1` 分类、无 required artifact 门禁；标准 MCP Tool Result
 > 由 adapter 原样交给模型，accounting finalize 只传 metadata；Builder 统一为
-> `build_artifact_draft`（Snapshot allowlist + 严格 Schema）。真实 Direct Model + MCP
+> `build_artifact_draft`（Snapshot allowlist + typed model input）。真实 Direct Model + MCP
 > Smoke 已执行：`DIRECT_MODEL_MCP_SMOKE_FUNCTIONALLY_ACCEPTED_WITH_PROTOCOL_DEVIATION`
 > （直连对照调用 2 次超出授权上限 1 次，见
 > `docs/qa/2026-08-13-direct-model-mcp-smoke-review.md`）。audited Direct MCP baseline：
-> `c01ec1ba1ea3dc3805184ea3ddb8f4bf0ea14196`。当前状态：
-> `READY_FOR_WEB_FUNCTIONAL_SCENARIO_2_REAUTHORIZATION`（单场景授权模板见授权包 §5.4）。
+> `c01ec1ba1ea3dc3805184ea3ddb8f4bf0ea14196`。
+> Direct Artifact Skill 契约修复已完成（3 个提交 `284e4c7`/`45ec465`/`260f5cc`：
+> 模型输入 DTO + 服务器组装 + 结构化错误反馈 → load_marketing_skill 暴露模型输入契约 →
+> capability pack 1.1.0 + 离线 UAT 自纠错 + result_unknown 元数据可观测性）。
+> 当前状态：`READY_FOR_WEB_FUNCTIONAL_SCENARIO_2_RERUN_REVIEW`（待独立审查确认后重跑；
+> 单场景授权模板见授权包 §5.4，验收口径 A/B/C 三档）。
 > 历史状态（2026-08-09 写入的 `READY_FOR_REAL_B7_UAT` 已被架构审核否决；2026-08-12 的
 > `READY_FOR_REAL_B7_UAT_REVIEW`/`REAUTHORIZATION` 与失败 round
 > `REAL_B7_20260812T045636Z_b801c490` 均为历史事实）：真实 B7 UAT、生产切流和方案 C 均
 > 需要单独审批。
+
+## Direct Artifact Skill 契约（2026-08-13 修复后现行）
+
+### capability pack 版本
+
+- 当前包目录 `backend/app/marketing_capability_pack/packs/marketing-v2/`，manifest
+  `pack_version="1.1.0"`（6 个 skill 的 `version` 全部 1.1.0）；`build_marketing_run_capability`
+  现加载 `marketing-v2`。manifest 内所有 digest（root_policy / skill / contract）是文件内容
+  SHA-256（hex）；manifest 自身 `manifest_digest` 由 loader 对 manifest 内容计算。
+- 旧 `marketing-v1`（1.0.0）目录原样保留只读：历史 RuntimeSnapshot 经 digest 仍可解析，
+  旧 Run 语义不变；禁止原地修改 v1。
+- 下一轮 UAT 新建 Runtime Config 时自动使用新 pack（`build_marketing_run_capability` 指向
+  v2），无需手工切换；已有 Run 的快照保持不变。
+
+### 模型输入契约
+
+- `build_artifact_draft` 的 payload 按 `load_marketing_skill` 返回的
+  `model_input_contract.model_input_schema` 构造：只提交业务字段
+  （scope/data/narrative/availability/limitations/methodology_input，insight 另含
+  title/parent_artifact_id/parent_artifact_version_id/blocks）。
+- `schema_version`/`module`/`data_status`/`canonical_data`/`field_lineage` 是服务器字段，
+  由服务器组装（canonical/lineage 从 data 确定性生成、精确覆盖全部叶子）；模型提交这些
+  字段会被 `server_owned_field_rejected` 明确拒绝。
+- 校验失败回喂结构化字段级错误（RFC6901 path/type/reason/retryable，≤2048 字节、
+  truncated 标记、不泄漏提交值）；模型按 path 修正后重试（离线 UAT 自纠错场景已进程级验证）。
+
+### result_unknown 可观测性
+
+- `PiGatewayMcpFailureMetadata` 携带可观测字段（全部可选）：`error_class`（adapter error
+  code，如 `call_failed`）、`received_jsonrpc_response`、`dispatch_phase`
+  （preflight/dispatched/unknown）、`is_standard_mcp_error`、`upstream_request_id`；
+  控制面 `safe_error_message` 以紧凑 JSON 保存非空子集。
+- 分类语义不变：`call_failed` → `result_unknown`，预留保持、不自动释放、不自动重放；
+  metadata 只用于审计/排障。
+- 遗留项 `ACCOUNTING_UNKNOWN_DIAGNOSTIC_REQUIRED`：真实 round 的 14 个 unknown 均为
+  adapter `call_failed`（DataTap 抛异常问题），待独立诊断；不阻塞下一轮核心功能
+  Scenario 2 重跑，但阻塞完整 B7 PASS 与生产切流。
 
 ## 组件、版本与启动检查
 

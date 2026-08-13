@@ -72,6 +72,16 @@
 > 超出授权上限 1 次，如实记录）。当前基线 `c01ec1ba1ea3dc3805184ea3ddb8f4bf0ea14196`。
 > 下一状态：`READY_FOR_WEB_FUNCTIONAL_SCENARIO_2_REAUTHORIZATION`。
 
+> 更新（2026-08-13 当日，Direct Artifact Skill 契约修复）：阶段 4（模型输入 Builder）在
+> 本分支 `codex/direct-artifact-skill-contract-repair` 完成三个提交——
+> `284e4c7`（模型输入 DTO + 服务器组装边界 + 结构化字段级错误反馈）、
+> `45ec465`（把精确模型输入契约经 load_marketing_skill 交给模型）、
+> `260f5cc`（capability pack 1.1.0 升级 + 离线 UAT 自纠错场景 + result_unknown
+> 元数据可观测性）；验证：backend 定向 165 passed、agent_artifacts 591 passed、
+> pi-gateway vitest 179 + typecheck + build、离线 UAT 27 场景含自纠错（详见当日
+> `changelog/2026-08-13.md`「提交 2/3/4」段）。下一状态：
+> `READY_FOR_WEB_FUNCTIONAL_SCENARIO_2_RERUN_REVIEW`。
+
 历史交付状态（当时记录，保持原样）：验证完成后只报告
 `READY_FOR_DIRECT_MODEL_MCP_SMOKE_REVIEW`。本分支停止等待架构复核，不直接运行完整
 Scenario 2，也不进入 Scenario 3–7。

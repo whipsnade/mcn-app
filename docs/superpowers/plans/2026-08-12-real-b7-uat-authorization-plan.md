@@ -5,7 +5,7 @@
 > `docs/qa/2026-08-12-pi-b7-uat-authorization-pack.md`。
 
 ```text
-Status: READY_FOR_WEB_FUNCTIONAL_SCENARIO_2_REAUTHORIZATION
+Status: READY_FOR_WEB_FUNCTIONAL_SCENARIO_2_RERUN_REVIEW
 （架构转向（2026-08-13）：本文档中基于 Evidence Bridge / mcp_result_v1 / required artifact
 的现行规则已被 `2026-08-13-pi-direct-mcp-result-artifact-skill-design.md` 覆盖，见 §0.4 纠偏
 说明；新 execution gate 锚定 audited Direct MCP baseline c01ec1ba…（§1.1/§1.2/§7.3）。
@@ -14,7 +14,11 @@ L1 FAIL（mcp_tool_identity_invalid，0 外发 0 扣费）按规则终止；旧�
 真实 Direct Model + MCP Smoke（round DIRECT_MODEL_MCP_SMOKE_20260813T103101Z_c01ec1ba）
 已执行：DIRECT_MODEL_MCP_SMOKE_FUNCTIONALLY_ACCEPTED_WITH_PROTOCOL_DEVIATION
 （偏差：直连对照调用 2 次超出授权上限 1 次，见 docs/qa/2026-08-13-direct-model-mcp-smoke-review.md）。
-下一轮 Web Functional Scenario 2 必须由用户按 §8 单场景模板逐字重新授权）
+Direct Artifact Skill 契约修复已完成（3 个提交 284e4c7/45ec465/260f5cc：
+模型输入 DTO + 服务器组装 + 结构化错误反馈 → load_marketing_skill 暴露模型输入契约 →
+capability pack 1.1.0 + 离线 UAT 自纠错 + result_unknown 元数据可观测性），待重跑。
+下一轮 Web Functional Scenario 2 必须由用户按 §8 单场景模板逐字重新授权，验收口径见 §8.5
+（A/B/C 三档，禁止把单纯文字 completed 判为 PASS）
 Real external calls authorized: NO（任何真实外部调用须按 §8 重新授权）
 Production cutover authorized: NO
 Historical Task 9 rerun authorized: NO
@@ -46,8 +50,9 @@ Plan C authorized: NO
 | 修复前 production baseline | `61576f7a45c3a93063bdaae5328aefd67933df68`（`codex/marketing-capability-pack-b0` 上最后一个触及代码的提交，失败 round `REAL_B7_20260812T045636Z_b801c490` 的代码即此线；仅为历史事实，不再是 execution gate 参照） | `git log --oneline` |
 | 已审核 L1 repair baseline | **历史事实**：`68deca58f2d2cd8aafb96d9ea47a0a60462142fa`（`codex/real-b7-l1-repair`；含 `f8a4ffa`/`494d20e`/`c22a3a1`/`8a5f264`/`68deca5` 五个已审核修复提交，独立审查 Critical 0 / Important 0）。2026-08-13 起不再作为新 UAT 的执行门禁基线 | `git log --oneline`（修复分支） |
 | audited Direct MCP baseline | **现行执行门禁基线（2026-08-13 固化）**：`c01ec1ba1ea3dc3805184ea3ddb8f4bf0ea14196`（`codex/real-mcp-evidence-bridge-repair`；含 `33d37c0`/`0d87d4e`/`96e8fd9`/`c01ec1b` 四个已审核提交，独立审查 Critical 0 / Important 0，真实 Smoke 功能接受） | `git log --oneline`（本分支） |
+| Direct Artifact Skill 契约修复 | **历史事实（2026-08-13 本分支 `codex/direct-artifact-skill-contract-repair`）**：`284e4c7`（模型输入 DTO + 服务器组装 + 结构化字段级错误反馈）/`45ec465`（load_marketing_skill 暴露 model_input_contract）/`260f5cc`（capability pack 1.1.0 + 离线 UAT 自纠错 + result_unknown 元数据可观测性），均为 `c01ec1ba…` 的线性后代；下一轮 Scenario 2 重跑前必须先 review 本修复 | `git log --oneline`（本分支） |
 | 授权包第一版文档基线 HEAD | `f7ab159aaea379b37e3885381abe79cc3454bb41`（2026-08-12 第一版文档轮撰写时点的 `git rev-parse HEAD`，docs-only；仅为历史事实陈述，不是执行身份，也不是 execution commit 候选） | `git rev-parse HEAD`（撰写时点） |
-| execution commit（规则，不预写 SHA） | 等于 UAT 契约纠偏提交之后、执行启动门禁通过时点的 `git rev-parse HEAD`（工作树必须干净）；必须是 audited Direct MCP baseline `c01ec1ba…` 的线性后代且包含 `33d37c0`/`0d87d4e`/`96e8fd9`/`c01ec1b` 四个提交；`c01ec1ba…` 至 HEAD 区间只允许本轮 UAT 契约纠偏的 Markdown/changelog 变更；execution HEAD 由下一次授权消息逐字确认；本文档不内嵌任何自指 SHA | 规则见 §1.1/§1.2/§7.3 |
+| execution commit（规则，不预写 SHA） | 等于 UAT 契约纠偏提交之后、执行启动门禁通过时点的 `git rev-parse HEAD`（工作树必须干净）；必须是 audited Direct MCP baseline `c01ec1ba…` 的线性后代且包含 `33d37c0`/`0d87d4e`/`96e8fd9`/`c01ec1b` 四个提交；`c01ec1ba…` 至 HEAD 区间允许 Direct Artifact Skill 契约修复（`284e4c7`/`45ec465`/`260f5cc`）与后续 UAT 契约纠偏的 Markdown/changelog 提交；execution HEAD 由下一次授权消息逐字确认；本文档不内嵌任何自指 SHA | 规则见 §1.1/§1.2/§7.3 |
 | 工作树状态 | 干净（无未提交变更） | `git status --short` |
 | `git diff --check` | 通过（无输出） | `git diff --check` |
 | 迁移 head | `0044_agent_run_loop_guard`（2026-08-13 Smoke 实测；`0043_billing_downgrade_guard` 为第一轮 B7 时点的历史事实） | `backend/migrations/versions/` 目录序 + 专用库 `alembic_version` |
@@ -62,7 +67,7 @@ Plan C authorized: NO
 | 代码架构复核结论 | Critical 0 / Important 0 / Minor 1（2026-08-12，针对方案 B 代码） | 用户任务书事实陈述 |
 | 授权包复核结论 | Critical 0 / Important 3 / Minor 1（2026-08-12，针对授权包第一版 `f7ab159`）；修复轮已全部关闭，逐项证据见授权包 §6 | 用户任务书事实陈述 + 授权包 §6 |
 | 离线进程级 UAT | 17 场景 × 串行 3 轮全绿（fake model + fake DataTap MCP，0 外部网络） | `changelog/2026-08-11.md`、`docs/qa/pi-agent-gateway-local-uat.md` |
-| 当前交付状态 | `READY_FOR_WEB_FUNCTIONAL_SCENARIO_2_REAUTHORIZATION`（audited Direct MCP baseline `c01ec1ba…`；Smoke 功能接受、一项协议偏差已记录） | `docs/qa/2026-08-13-direct-model-mcp-smoke-review.md`、`changelog/2026-08-13.md` |
+| 当前交付状态 | `READY_FOR_WEB_FUNCTIONAL_SCENARIO_2_RERUN_REVIEW`（audited Direct MCP baseline `c01ec1ba…`；Smoke 功能接受、一项协议偏差已记录；Direct Artifact Skill 契约修复 3 提交完成，待独立审查确认后重跑 Scenario 2） | `docs/qa/2026-08-13-direct-model-mcp-smoke-review.md`、`changelog/2026-08-13.md` |
 
 **事实判读：** 本地离线 fake topology 通过 ≠ 真实 B7 通过；`READY_FOR_REAL_B7_UAT_REVIEW`
 ≠ `READY` 被确认，更不等于 B7 PASS 或 production ready。真实 B7 UAT 必须取得用户明确授权
@@ -797,3 +802,18 @@ baseline `c01ec1ba…`；Smoke 功能接受、一项协议偏差已记录）。�
 以 §6.3 纠偏后的 L2-01 品牌报告为 Scenario 2 的验收蓝本：场景的「必须生成品牌报告」是
 UAT 结果断言，不是 Runtime 完成门禁；Run 只完成文字回答时 Runtime 可以合法 completed，
 但该 UAT 场景判 FAIL。数据库 Evidence 增量为 0 是预期事实，不属于失败。
+
+**三档判定（2026-08-13 Direct Artifact Skill 契约修复后补充）：** 不得再把单纯文字
+`completed` 当成 PASS。按以下口径逐字判定：
+
+- **A. `FUNCTIONAL_SCENARIO_2_PASS`**：核心 Artifact 链成功——Draft → Publication →
+  不可变 Version → BI/Excel 同版全部成功；且本轮新增 `result_unknown`=0、`reserved`=0、
+  账务恒等式成立（净支出 = settled × 10）。
+- **B. `FUNCTIONAL_SCENARIO_2_PASS_WITH_ACCOUNTING_WARNINGS`**：Draft → Publication →
+  Version → BI/Excel 同版成功，但仍存在已披露的 `result_unknown`/`reserved`（如 adapter
+  `call_failed` 造成的 accounting 未决，见授权包 §5.4 遗留项
+  `ACCOUNTING_UNKNOWN_DIAGNOSTIC_REQUIRED`）。**仅表示品牌报告核心业务通过，不等于 B7
+  PASS 或生产就绪**；完整 B7 PASS 与生产切流仍被 `ACCOUNTING_UNKNOWN_DIAGNOSTIC_REQUIRED`
+  阻塞。
+- **C. `FUNCTIONAL_SCENARIO_2_FAIL`**：未生成正式品牌报告 / Version / 同版 BI/Excel
+  （含只输出文字、Builder 失败未收敛、产物未发布等）。
