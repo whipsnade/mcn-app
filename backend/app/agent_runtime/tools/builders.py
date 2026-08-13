@@ -80,6 +80,8 @@ from app.agent_runtime.tools.contracts import (
     format_validation_error,
     truncate_summary,
 )
+from app.db.session import SessionFactory
+from app.pi_gateway.loop_guard import LoopGuard
 
 NOT_FOUND = "not_found"
 FORBIDDEN = "forbidden"
@@ -150,16 +152,41 @@ class _BuilderToolBase:
     points_cost = 0
     external_side_effect = True
 
-    def __init__(self, db_session: AsyncSession | None = None) -> None:
+    def __init__(
+        self,
+        db_session: AsyncSession | None = None,
+        *,
+        durable_session_factory: Any = SessionFactory,
+    ) -> None:
         self._db = db_session
+        # The current-executor path uses an independent transaction so a
+        # crashed long-running worker cannot lose guard progress. Pi Gateway
+        # internal-tool requests already hold the Run lock in this session;
+        # they pass None to avoid waiting on their own uncommitted lock.
+        self._durable_session_factory = durable_session_factory
 
     async def execute(self, context: ToolContext, arguments: BaseModel) -> ToolResult:
+        guard: LoopGuard | None = None
+        run: AgentRun | None = None
+        if self._db is not None:
+            run = await self._db.get(AgentRun, context.run_id)
+            if run is not None:
+                guard = LoopGuard(
+                    self._db,
+                    durable_session_factory=self._durable_session_factory,
+                )
+                blocked = await guard.reject_if_open(run)
+                if blocked is not None:
+                    return blocked
         try:
-            return await self._execute(context, arguments)
+            result = await self._execute(context, arguments)
         except ValidationError as exc:
-            return _failed(DRAFT_BUILD_ERROR, _format_validation_error(exc))
+            result = _failed(DRAFT_BUILD_ERROR, _format_validation_error(exc))
         except DraftBuildError as exc:
-            return _failed(DRAFT_BUILD_ERROR, _truncate(str(exc)))
+            result = _failed(DRAFT_BUILD_ERROR, _truncate(str(exc)))
+        if guard is not None and run is not None:
+            return await guard.record_builder_result(run, self.name, result)
+        return result
 
     async def _execute(self, context: ToolContext, arguments: BaseModel) -> ToolResult:
         raise NotImplementedError

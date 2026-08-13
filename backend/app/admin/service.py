@@ -12,7 +12,7 @@ from app.admin.schemas import (
     AdminUserUpdate,
     PointsHistoryEntry,
 )
-from app.agent_runtime.evidence import EvidenceWriter
+from app.agent_runtime.evidence import EvidencePersistenceError, EvidenceWriter
 from app.agent_runtime.models import (
     AgentRun,
     AgentToolCall,
@@ -29,7 +29,9 @@ from app.tenancy.models import TenantMembership
 from app.tenancy.service import TenantService
 from app.mcp_gateway.contracts import DataTapService
 from app.mcp_gateway.models import McpCall
+from app.mcp_gateway.transport import resolve_remote_result_status
 from app.mcp_gateway.validation import McpValidationError, validate_output
+from app.pi_gateway.result import validate_reviewed_result_json
 from app.quick.models import QuickMcpCall
 from app.tasks.models import AnalysisTask
 from app.workspace.models import WorkspaceSession
@@ -578,7 +580,11 @@ class AdminService:
         幂等键（agent-mcp:{logical_call_id}:{settle|release}）。完整的
         Idempotency-Key 级去重延后到 Task 24 恢复循环接线 reconciler 时实现。
         """
-        call = await self.db.get(AgentToolCall, call_id)
+        call = await self.db.scalar(
+            select(AgentToolCall)
+            .where(AgentToolCall.id == call_id)
+            .with_for_update()
+        )
         if call is None:
             raise LookupError("agent_tool_call_not_found")
         user_id = await self._agent_run_user_id(call)
@@ -592,11 +598,23 @@ class AdminService:
         before_status = call.status
         evidence_id: str | None = None
         if decision == "confirm_success":
-            evidence = await self._retrievable_evidence(call)
+            evidence, invalid_payload = await self._retrievable_evidence(call)
             if evidence is not None:
                 evidence_id = evidence.id
-            await AgentMcpAccounting(self.db).settle(user_id, call)
-            if evidence is None:
+            if invalid_payload:
+                # Payload was confirmed to exist but failed the reviewed output
+                # contract: it is a confirmed failure, not an unavailable
+                # success. Release the reservation and never create Evidence.
+                await AgentMcpAccounting(self.db).release(
+                    user_id,
+                    call,
+                    error_type="failed_confirmed",
+                    message="reconciled payload failed output schema validation",
+                )
+            else:
+                await AgentMcpAccounting(self.db).settle(user_id, call)
+            if evidence is None and not invalid_payload:
+                call.error_type = "result_unavailable"
                 call.safe_error_message = "result_unavailable"
         elif decision == "confirm_failure":
             await AgentMcpAccounting(self.db).release(
@@ -650,48 +668,94 @@ class AdminService:
             select(EvidenceItem).where(EvidenceItem.tool_call_id == call_id)
         )
 
-    async def _retrievable_evidence(self, call: AgentToolCall) -> EvidenceItem | None:
+    async def _retrievable_evidence(
+        self, call: AgentToolCall
+    ) -> tuple[EvidenceItem | None, bool]:
         """已落库的 Evidence 优先；否则经注入的 reconciler 取回 payload 并新建。
 
         设计 §5.3：人工/恢复取回的 payload 必须重新过输出 Schema 校验才能写
-        Evidence（与 execute/reconcile 路径一致）；无法确定输出契约或校验
-        不过时绝不落 Evidence（退化为 settle + result_unavailable）。
+        Evidence（与 execute/reconcile 路径一致）；明确取回但 Schema 不通过
+        时返回 confirmed-invalid，交由调用方 release，而非伪装成
+        result_unavailable。
         """
+        from app.agent_runtime.normalization import NormalizationRegistry
+
         existing = await self._evidence_by_call(call.id)
         if existing is not None:
-            return existing
+            run = await self.db.get(AgentRun, call.run_id)
+            if run is None or existing.run_id != call.run_id or existing.session_id != run.session_id:
+                return None, True
+            try:
+                service = DataTapService(call.service)
+                entry = resolve_allowlist_entry(service, call.internal_tool_name)
+                if entry is None:
+                    return None, True
+                _remote_name, _description, output_schema = entry
+                if not validate_reviewed_result_json(
+                    service.value, output_schema, existing.raw_payload_json
+                ):
+                    return None, True
+                validated = validate_output(existing.raw_payload_json, output_schema)
+                NormalizationRegistry().normalize(call.internal_tool_name, validated)
+            except (McpValidationError, TypeError, ValueError):
+                return None, True
+            return existing, False
         if self._tool_call_reconciler is None or not call.upstream_request_id:
-            return None
+            return None, False
         result = await self._tool_call_reconciler(call.upstream_request_id)
-        if (
-            result is None
-            or getattr(result, "is_error", False)
-            or result.structured_content is None
-        ):
-            return None
+        if result is None:
+            return None, False
+        if getattr(result, "is_error", False):
+            return None, True
+        result_status, shape_error = resolve_remote_result_status(result)
+        if shape_error is not None or result_status is None:
+            return None, True
+        if result_status in ("empty", "unavailable"):
+            # Explicit empty/unavailable states are success outcomes without a
+            # trusted payload.  Never let an inconsistent legacy payload leak
+            # through the schema validator and become Evidence.
+            return None, False
+        if result.structured_content is None:
+            return None, False
         try:
             service = DataTapService(call.service)
         except ValueError:
-            return None
+            return None, True
         entry = resolve_allowlist_entry(service, call.internal_tool_name)
         if entry is None:
-            return None
+            return None, True
         _remote_name, _description, output_schema = entry
         try:
+            if not validate_reviewed_result_json(
+                service.value, output_schema, result.structured_content
+            ):
+                return None, True
             validated = validate_output(result.structured_content, output_schema)
         except McpValidationError:
-            return None
+            return None, True
         run = await self.db.get(AgentRun, call.run_id)
-        return await EvidenceWriter(self.db).write(
-            session_id=run.session_id if run is not None else call.run_id,
-            run_id=call.run_id,
-            tool_call_id=call.id,
-            source_type="mcp",
-            source_name=call.internal_tool_name,
-            scope_json=self._scope_from_arguments(call.arguments_json),
-            period_json=None,
-            raw_payload=validated,
-        )
+        if run is None:
+            return None, True
+        try:
+            async with self.db.begin_nested():
+                evidence = await EvidenceWriter(self.db).write(
+                    session_id=run.session_id,
+                    run_id=call.run_id,
+                    tool_call_id=call.id,
+                    source_type="mcp",
+                    source_name=call.internal_tool_name,
+                    scope_json=self._scope_from_arguments(call.arguments_json),
+                    period_json=None,
+                    raw_payload=validated,
+                    normalization=NormalizationRegistry().normalize(
+                        call.internal_tool_name, validated
+                    ),
+                )
+        except (EvidencePersistenceError, TypeError, ValueError):
+            # The upstream result is confirmed, so local persistence failure is
+            # a billable unavailable outcome, not an unknown transport result.
+            return None, False
+        return evidence, False
 
     @staticmethod
     def _scope_from_arguments(arguments: dict[str, Any] | None) -> dict[str, Any] | None:

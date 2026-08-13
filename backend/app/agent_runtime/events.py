@@ -243,7 +243,13 @@ class AgentEventStream:
         await self.broker.publish(event)
 
     async def append_terminal_once(
-        self, run_id: str, user_id: str, event_type: str, payload: dict[str, Any] | None
+        self,
+        run_id: str,
+        user_id: str,
+        event_type: str,
+        payload: dict[str, Any] | None,
+        *,
+        completion_validator: Callable[[AgentRun], Awaitable[object]] | None = None,
     ) -> AgentEvent | None:
         """终态事件补发出口（G1/§5.8）：同一 Run 全局恰好一个终态事件。
 
@@ -261,6 +267,20 @@ class AgentEventStream:
         if await self._terminal_event_locked(run_id) is not None:
             await self.db.commit()
             return None
+        if run.status in (
+            RunStatus.COMPLETED.value,
+            RunStatus.COMPLETED_WITH_WARNINGS.value,
+        ):
+            if completion_validator is None:
+                from app.pi_gateway.completion import CompletionValidator
+
+                completion_validator = CompletionValidator(self.db).validate
+            validation = await completion_validator(run)
+            if not bool(validation):
+                code = getattr(validation, "code", None)
+                raise InvalidRunTransition(
+                    code if isinstance(code, str) and code else "completion_validation_failed"
+                )
         event = await self._insert_terminal_locked(run, event_type, payload)
         await self.db.commit()
         await self.broker.publish(event)
@@ -276,6 +296,7 @@ class AgentEventStream:
         worker_id: str | None = None,
         before_commit: Callable[[AgentRun], Awaitable[None]] | None = None,
         allow_system_completion: Callable[[AgentRun], Awaitable[bool]] | None = None,
+        completion_validator: Callable[[AgentRun], Awaitable[object]] | None = None,
     ) -> AgentEvent | None:
         """Run 终态收口唯一事务边界（H1/§5.8）：状态迁移与终态事件同一加锁事务。
 
@@ -307,10 +328,29 @@ class AgentEventStream:
         current = RunStatus(run.status)
         if current in TERMINAL_RUN_STATUSES:
             # 旧窗口残留（Run 已终态、无终态事件）：按实际终态补发，不再迁移。
+            if current in (
+                RunStatus.COMPLETED,
+                RunStatus.COMPLETED_WITH_WARNINGS,
+            ):
+                if completion_validator is None:
+                    from app.pi_gateway.completion import CompletionValidator
+
+                    completion_validator = CompletionValidator(self.db).validate
+                validation = await completion_validator(run)
+                if not bool(validation):
+                    code = getattr(validation, "code", None)
+                    raise InvalidRunTransition(
+                        code if isinstance(code, str) and code else "completion_validation_failed"
+                    )
             event_type = f"run.{current.value}"
         else:
             migrated = await self._migrate_terminal_locked(
-                run, outcome, worker_id, payload, allow_system_completion
+                run,
+                outcome,
+                worker_id,
+                payload,
+                allow_system_completion,
+                completion_validator,
             )
             if not migrated:
                 await self.db.commit()
@@ -420,6 +460,7 @@ class AgentEventStream:
         worker_id: str | None,
         payload: dict[str, Any] | None,
         allow_system_completion: Callable[[AgentRun], Awaitable[bool]] | None = None,
+        completion_validator: Callable[[AgentRun], Awaitable[object]] | None = None,
     ) -> bool:
         """持锁状态下按 outcome 迁移 Run 终态（不 commit）。
 
@@ -430,18 +471,77 @@ class AgentEventStream:
         repo = AgentRunRepository(self.db)
         if outcome == RunStatus.CANCELLED:
             # 用户取消跨切面：任意非终态 → cancelled，不看租约。
+            from app.pi_gateway.completion import close_open_runtime_rows
+
+            await close_open_runtime_rows(
+                self.db,
+                run.id,
+                utc_now(),
+                error_code="cancel_requested",
+            )
             return await repo.cancel(run.id, run.user_id)
         if outcome in (RunStatus.COMPLETED, RunStatus.COMPLETED_WITH_WARNINGS):
+            if completion_validator is None:
+                # 所有成功终态都必须经过统一业务完成契约；保留动态导入避免
+                # agent_runtime 与 pi_gateway 形成模块级循环依赖。没有 required
+                # artifact 的旧 profile 仍会由 validator 校验 message/Step/MCP
+                # 生命周期，而不会回退为 assistant-only completion。
+                from app.pi_gateway.completion import CompletionValidator
+
+                completion_validator = CompletionValidator(self.db).validate
+
+            async def validate_completion() -> None:
+                if completion_validator is None:
+                    raise InvalidRunTransition("completion_validation_required")
+                result = await completion_validator(run)
+                if not bool(result):
+                    code = getattr(result, "code", None)
+                    raise InvalidRunTransition(
+                        code if isinstance(code, str) and code else "completion_validation_failed"
+                    )
+
             if worker_id is not None and AgentRunRepository.owns_active_lease(run, worker_id):
-                await repo.transition(run.id, outcome, worker_id=worker_id)
+                await validate_completion()
+                await repo.transition(
+                    run.id,
+                    outcome,
+                    worker_id=worker_id,
+                    completion_validator=completion_validator,
+                )
                 return True
-            # 系统级完成收口：仅当调用方（Pi 恢复）核实 durable completion
-            # 存在，用于 terminal ACK 丢失后的幂等收口。
+            if (
+                worker_id is not None
+                and run.lease_owner is not None
+                and run.lease_expires_at is not None
+                and run.lease_expires_at > utc_now()
+            ):
+                # 另一个仍存活的 worker 持有租约时，普通 terminal 请求不能
+                # 退化成 system force-complete；只有租约失效后的 Recovery 才能
+                # 进入无 worker 的 ACK-lost 收口路径。
+                raise InvalidRunTransition("run_lease_not_held")
+            # 系统级完成收口同样必须过完整业务契约。旧的
+            # allow_system_completion 只允许作为兼容调用信号，不能绕过校验。
             if allow_system_completion is not None and await allow_system_completion(run):
-                return await repo.force_complete(run.id)
+                await validate_completion()
+                return await repo.force_complete(
+                    run.id, completion_validator=completion_validator
+                )
+            if completion_validator is not None:
+                await validate_completion()
+                return await repo.force_complete(
+                    run.id, completion_validator=completion_validator
+                )
             raise InvalidRunTransition("run_lease_not_held")
         # FAILED：持租约走状态机；无租约/过期走系统级 force_fail（error_code 落 Run 行）。
         if worker_id is not None and AgentRunRepository.owns_active_lease(run, worker_id):
+            from app.pi_gateway.completion import close_open_runtime_rows
+
+            await close_open_runtime_rows(
+                self.db,
+                run.id,
+                utc_now(),
+                error_code=(payload or {}).get("error_code", "run_failed"),
+            )
             await repo.transition(run.id, RunStatus.FAILED, worker_id=worker_id)
             return True
         return await repo.force_fail(run.id, error_code=(payload or {}).get("error_code"))

@@ -21,6 +21,24 @@ const ALLOWED_INTERNAL_TOOLS = new Set([
 
 const RESERVED_KEYS = new Set(["user_id", "session_id", "run_id", "attempt_id", "tenant_id"]);
 
+/** Stable business stop raised when the durable server-side loop guard opens. */
+export class PiAgentLoopCircuitError extends Error {
+  readonly code = "agent_loop_circuit_open" as const;
+
+  constructor() {
+    super("agent_loop_circuit_open");
+    this.name = "PiAgentLoopCircuitError";
+  }
+}
+
+export function isPiAgentLoopCircuitError(error: unknown): error is PiAgentLoopCircuitError {
+  return Boolean(
+    error &&
+    typeof error === "object" &&
+    (error as { code?: unknown }).code === "agent_loop_circuit_open",
+  );
+}
+
 function scrubReservedKeys(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(scrubReservedKeys);
   if (!value || typeof value !== "object") return value;
@@ -32,12 +50,25 @@ function scrubReservedKeys(value: unknown): unknown {
 }
 
 export class PiInternalToolsClient {
-  constructor(private readonly transport: ControlPlaneTransport) {}
+  constructor(
+    private readonly transport: ControlPlaneTransport,
+    private readonly hooks: { onCircuitOpen?: () => void | Promise<void> } = {},
+  ) {}
 
   async execute(toolName: string, args: Record<string, unknown>): Promise<unknown> {
     if (!ALLOWED_INTERNAL_TOOLS.has(toolName)) throw new Error("pi_internal_tool_not_allowed");
     const scrubbed = scrubReservedKeys(args) as Record<string, unknown>;
-    return this.transport.executeInternalTool(toolName, scrubbed);
+    const result = await this.transport.executeInternalTool(toolName, scrubbed);
+    if (
+      result &&
+      typeof result === "object" &&
+      !Array.isArray(result) &&
+      (result as { error_type?: unknown }).error_type === "agent_loop_circuit_open"
+    ) {
+      await this.hooks.onCircuitOpen?.();
+      throw new PiAgentLoopCircuitError();
+    }
+    return result;
   }
 }
 

@@ -8,11 +8,13 @@ settled 的 MCP 工具 → 重复扣费。``RunTranscriptLoader`` 从触发消�
   ``evidence_id + 结构化预览``（Step 的 ``output_json`` 即当初回喂模型的
   ``ToolResult``，只含 safe_summary/evidence_id，**绝不回灌 raw payload**，
   控制上下文预算）；failed/unknown 回放原结构化错误结果；
-- 崩溃残留的 running tool_call Step（外发后 / settle 前崩溃）按
-  ``agent_tool_calls`` 行当前状态构造结果回放（settled → success，
-  其余 → unknown 待核对），并作为 ``resume_step`` 交给引擎：模型重新发起
-  相同调用时复用该 Step（同一 ``logical_call_id``，协调器幂等回放，绝不
-  重发、不重复扣费）——防重不依赖模型记忆；
+- 崩溃残留的 running Step 在恢复装载时先做持久化收口：已确认 settled 的
+  tool_call 标为 completed，其余 tool_call / model_decision 标为 failed；
+  tool_call 仍按 ``agent_tool_calls`` 行当前状态构造结果回放（settled →
+  success，其余 → unknown 待核对），并作为 ``resume_step`` 交给引擎：模型
+  重新发起相同调用时复用该 Step（同一 ``logical_call_id``，协调器幂等回放，
+  绝不重发、不重复扣费）。这样统一完成门禁看到的永远不是遗留的 running
+  Step；
 - 恢复从最后一个完整 Step 的下一 sequence 继续（引擎 ``_next_step_sequence``
   取全部 Step 最大 sequence + 1，语义不变）；
 - **显式用户问题锚点（G3）**：tool_result 回放同样是 ``role="user"`` 消息，
@@ -66,30 +68,53 @@ class RunTranscriptLoader:
         self._db = db
 
     async def load(self, run: AgentRun) -> RunTranscript:
-        """重建本 Run 的对话上下文（只读，不修改任何持久状态）。"""
+        """重建上下文并收口崩溃残留 Step。
+
+        这里只处理本 Run 已经存在的崩溃审计行：不会重发工具，也不会把
+        unknown ToolCall 改成成功；它只是把无法继续保持 ``running`` 的本地
+        Step 标为 completed/failed，随后由 CompletionValidator 继续检查
+        ToolCall 与 permit 是否仍未决。
+        """
         trigger = await self._trigger_message(run)
         messages = [trigger]
         steps = (
             await self._db.scalars(
                 select(AgentStep)
-                .where(
-                    AgentStep.run_id == run.id,
-                    AgentStep.step_type == "tool_call",
-                )
+                .where(AgentStep.run_id == run.id)
                 .order_by(AgentStep.sequence)
             )
         ).all()
         resume_step: AgentStep | None = None
+        reconciled = False
         for step in steps:
             if step.status == "running":
-                # 崩溃残留：按调用行当前状态回放，并交给引擎复用（正常最多
-                # 一个在飞调用；防御性地取最后一个 running Step）。
-                result = await self._replay_from_call_row(step)
-                resume_step = step
-            else:
+                if step.step_type == "tool_call":
+                    # 崩溃残留：按调用行当前状态回放，并交给引擎复用（正常最多
+                    # 一个在飞调用；防御性地取最后一个 running Step）。
+                    result = await self._replay_from_call_row(step)
+                    step.status = (
+                        "completed" if result.get("status") == "success" else "failed"
+                    )
+                    step.output_json = result
+                    reconciled = True
+                    resume_step = step
+                    messages.append(self._action_message(step))
+                    messages.append(self._result_message(result))
+                else:
+                    # 模型决策本身不能重放；标为恢复中断后从触发消息继续。
+                    step.status = "failed"
+                    step.output_json = {
+                        "status": "failed",
+                        "safe_summary": "model decision interrupted before durable output",
+                        "error_type": "recovery_interrupted",
+                    }
+                    reconciled = True
+            elif step.step_type == "tool_call":
                 result = dict(step.output_json or {})
-            messages.append(self._action_message(step))
-            messages.append(self._result_message(result))
+                messages.append(self._action_message(step))
+                messages.append(self._result_message(result))
+        if reconciled:
+            await self._db.flush()
         return RunTranscript(
             messages=messages,
             resume_step=resume_step,
@@ -187,9 +212,19 @@ class RunTranscriptLoader:
                     ),
                     "evidence_id": evidence.id,
                 }
+            if call.error_type in ("succeeded_empty", "result_unavailable"):
+                return {
+                    "status": "failed",
+                    "safe_summary": call.safe_error_message
+                    or ("confirmed MCP success without a retrievable payload"
+                        if call.error_type == "result_unavailable"
+                        else "upstream returned no structured content"),
+                    "error_type": call.error_type,
+                }
             return {
-                "status": "success",
-                "safe_summary": "confirmed success (payload unavailable)",
+                "status": "unknown",
+                "safe_summary": "settled tool call is missing Evidence",
+                "error_type": RESULT_UNKNOWN,
             }
         if call.status == "failed":
             return {

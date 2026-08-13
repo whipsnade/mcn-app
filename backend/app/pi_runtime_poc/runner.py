@@ -10,8 +10,9 @@ import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any, Protocol
+from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_artifacts.models import AgentArtifact, AgentArtifactVersion
@@ -337,8 +338,9 @@ class PiPocRunner:
     ) -> str:
         """仅 Pi 0.79 明确 ``agent_end/willRetry=false`` 后才允许走完成终态。"""
         text = "".join(assistant_parts).strip()
-        if text:
-            await self._events.append(run_id, user_id, "message.completed", {"text": text})
+        completion_text = text or "本次运行未生成可展示的最终答复，已按受限状态收口。"
+        await self._persist_assistant_completion(run_id, completion_text)
+        await self._events.append(run_id, user_id, "message.completed", {"text": completion_text})
         published, has_restriction = await self._emit_published_artifact_events(run_id, user_id)
         outcome = (
             RunStatus.COMPLETED_WITH_WARNINGS
@@ -352,6 +354,41 @@ class PiPocRunner:
             {"assistant_text_present": bool(text), "published_artifact_count": published},
         )
         return outcome.value
+
+    async def _persist_assistant_completion(self, run_id: str, text: str) -> None:
+        """POC 旁路也落 durable assistant message，供统一终态门禁读取。"""
+        run = await self._db.get(AgentRun, run_id, populate_existing=True)
+        if run is None:
+            raise LookupError("run_not_found")
+        existing = await self._db.scalar(
+            select(AgentMessage.id).where(
+                AgentMessage.run_id == run_id,
+                AgentMessage.role == "assistant",
+            )
+        )
+        if existing is not None:
+            return
+        sequence = (
+            await self._db.scalar(
+                select(func.max(AgentMessage.sequence)).where(
+                    AgentMessage.session_id == run.session_id
+                )
+            )
+            or 0
+        ) + 1
+        self._db.add(
+            AgentMessage(
+                id=str(uuid4()),
+                session_id=run.session_id,
+                run_id=run_id,
+                role="assistant",
+                content=text,
+                metadata_json={"poc_completion": True},
+                sequence=sequence,
+                created_at=datetime.now(UTC).replace(tzinfo=None),
+            )
+        )
+        await self._db.flush()
 
     async def _emit_published_artifact_events(self, run_id: str, user_id: str) -> tuple[int, bool]:
         """把已由确定性发布服务落库的版本投影为稳定 Artifact 事件。

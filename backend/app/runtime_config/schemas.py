@@ -4,9 +4,38 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 import re
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, SecretStr, field_validator, model_validator
+
+
+class FrozenDict(dict[str, Any]):
+    """JSON-shaped mapping that cannot be mutated after snapshot creation."""
+
+    __slots__ = ()
+
+    @staticmethod
+    def _immutable(*args: Any, **kwargs: Any) -> None:
+        raise TypeError("runtime_snapshot_is_immutable")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    __ior__ = _immutable
+    clear = _immutable
+    pop = _immutable
+    popitem = _immutable
+    setdefault = _immutable
+    update = _immutable
+
+
+def _deep_freeze(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return FrozenDict({key: _deep_freeze(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_deep_freeze(item) for item in value)
+    if isinstance(value, set):
+        return frozenset(_deep_freeze(item) for item in value)
+    return value
 
 
 class RuntimeConfigSnapshot(BaseModel):
@@ -18,15 +47,32 @@ class RuntimeConfigSnapshot(BaseModel):
     model: dict[str, str | int | float | None]
     datatap: dict[str, object]
     capability_pack: dict[str, object]
+    # Legacy snapshots may omit these fields.  Every new Run snapshot produced
+    # by RuntimeConfigService fills them from the reviewed pack/profile policy.
+    profile_name: str | None = None
+    # Explicitly distinguishes a profile that produces no required artifact
+    # from a snapshot that accidentally lost its contract mapping.
+    artifact_contract_mode: Literal["required", "none"] = "none"
+    required_artifact_contract: str | None = None
+    capability_pack_version: str | None = None
+    capability_pack_manifest_digest: str | None = None
     limits: dict[str, int | float]
     # ``price_table`` is a nested, public snapshot contract.  Secrets remain
     # forbidden recursively; values are integer micros (or bounded labels).
     billing: dict[str, int | str | dict[str, int | str]]
+    # Reviewed adapter bindings are captured together with the Run snapshot;
+    # claim/terminal/recovery may read them but must never append to the row.
+    adapter_catalog: tuple[dict[str, object], ...] = ()
 
     @field_validator("model", "datatap", "capability_pack", "limits", "billing")
     @classmethod
     def copy_containers(cls, value):
-        return dict(value)
+        return _deep_freeze(dict(value))
+
+    @field_validator("adapter_catalog")
+    @classmethod
+    def freeze_adapter_catalog(cls, value):
+        return tuple(_deep_freeze(dict(entry)) for entry in value)
 
     @field_validator("billing")
     @classmethod
@@ -63,9 +109,37 @@ class RuntimeConfigSnapshot(BaseModel):
     @model_validator(mode="after")
     def reject_secret_fields(self) -> RuntimeConfigSnapshot:
         forbidden = {"api_key", "token", "password", "secret", "authorization", "key"}
-        for container in (self.model, self.datatap, self.capability_pack, self.limits, self.billing):
+        for container in (
+            self.model,
+            self.datatap,
+            self.adapter_catalog,
+            self.capability_pack,
+            self.limits,
+            self.billing,
+        ):
             if _contains_forbidden_key(container, forbidden) or _contains_credential_value(container):
                 raise ValueError("runtime_snapshot_secret_field")
+        nested_pack_version = self.capability_pack.get("pack_version")
+        if (
+            self.capability_pack_version is not None
+            and isinstance(nested_pack_version, str)
+            and self.capability_pack_version != nested_pack_version
+        ):
+            raise ValueError("runtime_snapshot_capability_audit_mismatch")
+        nested_manifest_digest = self.capability_pack.get("manifest_digest")
+        if (
+            self.capability_pack_manifest_digest is not None
+            and isinstance(nested_manifest_digest, str)
+            and self.capability_pack_manifest_digest != nested_manifest_digest
+        ):
+            raise ValueError("runtime_snapshot_capability_audit_mismatch")
+        if self.required_artifact_contract is not None and not self.profile_name:
+            raise ValueError("runtime_snapshot_profile_missing")
+        if self.artifact_contract_mode == "required":
+            if not self.profile_name or not self.required_artifact_contract:
+                raise ValueError("runtime_snapshot_artifact_contract_missing")
+        elif self.required_artifact_contract is not None:
+            raise ValueError("runtime_snapshot_artifact_contract_mode_invalid")
         return self
 
 

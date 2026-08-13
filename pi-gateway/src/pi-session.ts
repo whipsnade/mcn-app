@@ -173,6 +173,7 @@ export async function createProductionPiSession(
 
   let disposed = false;
   let sdkSession: { dispose(): void } | undefined;
+  let abortSdkSession: (() => void | Promise<void>) | undefined;
   // pi-mcp-adapter persists its metadata cache through PI_CODING_AGENT_DIR;
   // the SDK's agentDir option does not configure that adapter-owned path.
   // Bind it to this isolated Run before loading the extension so a worker
@@ -205,7 +206,9 @@ export async function createProductionPiSession(
     ];
     const internalTools = options.internalTools
       ? buildInternalToolDefinitions(
-          new PiInternalToolsClient(options.internalTools),
+          new PiInternalToolsClient(options.internalTools, {
+            onCircuitOpen: () => abortSdkSession?.(),
+          }),
           work.internalTools,
         )
       : [];
@@ -249,6 +252,7 @@ export async function createProductionPiSession(
       settingsManager,
     });
     sdkSession = session;
+    abortSdkSession = () => session.abort();
     // The SDK createAgentSession path never fires the extension session_start
     // event (the CLI does); the reviewed adapter initializes its MCP runtime
     // state on that event.  bindExtensions({}) is the public startup emit.
@@ -277,6 +281,7 @@ export async function createProductionPiSession(
       dispose: async () => {
         if (disposed) return;
         disposed = true;
+        abortSdkSession = undefined;
         try {
           try {
             unsubscribeSdk();
@@ -307,6 +312,7 @@ export async function createProductionPiSession(
       }),
     };
   } catch (error) {
+    abortSdkSession = undefined;
     try {
       // If readiness failed after SDK construction, shut down the adapter
       // session before removing its config/temp directory.

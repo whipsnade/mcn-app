@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import time
 from collections.abc import Callable, Mapping
@@ -25,6 +26,7 @@ from app.mcp_gateway.transport import (
     McpConnectionError,
     McpConnectionTimeout,
     McpGatewayTimeout,
+    McpNotSentError,
     McpProtocolError,
     McpQueueTimeout,
     McpUpstreamHttpError,
@@ -32,6 +34,8 @@ from app.mcp_gateway.transport import (
     PossiblySentTimeout,
     RemoteToolResult,
     ServiceNotAllowedError,
+    contains_transport_artifact_marker,
+    is_non_empty_json,
 )
 
 logger = logging.getLogger(__name__)
@@ -217,7 +221,16 @@ class DataTapTransport:
                         write_stream,
                         read_timeout_seconds=timedelta(seconds=self._read_timeout_seconds),
                     ) as session:
-                        await session.initialize()
+                        try:
+                            await session.initialize()
+                        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                            raise
+                        except Exception as exc:
+                            # Session initialization happens before the MCP
+                            # request is dispatched.  Preserve that fact for
+                            # billing: it is a confirmed non-send, not an
+                            # unknown result.
+                            raise McpNotSentError("MCP session initialization failed") from exc
                         try:
                             result = await session.call_tool(remote_name, dict(arguments))
                         except McpError as exc:
@@ -226,7 +239,9 @@ class DataTapTransport:
                             raise McpProtocolError("MCP tool protocol error") from exc
                         except (httpx.ReadTimeout, TimeoutError) as exc:
                             raise PossiblySentTimeout("MCP result was not confirmed") from exc
-                        structured_content = self._structured_content(result)
+                        structured_content, result_status, unavailable_reason = (
+                            self._classify_result(result)
+                        )
                         error_text = None
                         if getattr(result, "isError", False):
                             error_text = self._error_text(result)
@@ -235,6 +250,8 @@ class DataTapTransport:
                             is_error=bool(getattr(result, "isError", False)),
                             upstream_request_id=self._request_id(result),
                             error_text=error_text,
+                            result_status=result_status,
+                            unavailable_reason=unavailable_reason,
                         )
             except PossiblySentTimeout:
                 raise
@@ -461,20 +478,60 @@ class DataTapTransport:
 
     @staticmethod
     def _structured_content(result: Any) -> Any:
-        """提取结构化结果；文本内容中的数据按 {result: string} 包装补齐。
+        """返回严格规范化后的 payload；不可信文本一律返回 ``None``。
 
-        DataTap 的统计/榜单类工具常把数据 JSON 放在 MCP 文本内容里而不填
-        ``structuredContent``。KOL 搜索类工具则按 ``{result: string}`` 填充。
-        这里把前者统一成后者，保证下游校验、证据与归一化共用同一契约。
+        需要区分 ``None`` 的 genuinely empty 与 unavailable，实际传输路径使用
+        :meth:`_classify_result` 取得状态；此兼容 helper 只保留旧测试/调用方的
+        payload 视图，绝不再把普通文本包装成可写 Evidence 的对象。
+        """
+        payload, _status, _reason = DataTapTransport._classify_result(result)
+        return payload
+
+    @staticmethod
+    def _classify_result(result: Any) -> tuple[Any, Literal["available", "empty", "unavailable"], str | None]:
+        """把真实 MCP CallToolResult 归一化为三态结果。
+
+        只有 native ``structuredContent``，或唯一且整体可解析的 JSON text block
+        才能进入 available。resource/image/audio、多个 text block、普通文本、
+        临时路径和解析失败都进入 unavailable；没有任何 content 才是 empty。
         """
         structured = getattr(result, "structuredContent", None)
-        if structured is not None or getattr(result, "isError", False):
-            return structured
-        # 与 validate_output 的字符串上限对齐。
-        text = DataTapTransport._content_text(result, limit=262_000)
-        if text is None:
-            return None
-        return {"result": text}
+        if structured is not None:
+            if is_non_empty_json(structured):
+                if contains_transport_artifact_marker(structured):
+                    return None, "unavailable", "unsupported_content"
+                return structured, "available", None
+            # Native structuredContent is authoritative when present. An empty
+            # native value must not fall through to an unrelated text/resource
+            # block and become a different payload.
+            try:
+                json.dumps(structured, ensure_ascii=False, allow_nan=False)
+            except (TypeError, ValueError, RecursionError):
+                return None, "unavailable", "unsupported_content"
+            return None, "empty", None
+        if getattr(result, "isError", False):
+            return None, "empty", None
+
+        blocks = getattr(result, "content", None)
+        if blocks is None or (isinstance(blocks, list) and len(blocks) == 0):
+            return None, "empty", None
+        if not isinstance(blocks, list) or len(blocks) != 1:
+            return None, "unavailable", "unsupported_content"
+        block = blocks[0]
+        text = getattr(block, "text", None)
+        if getattr(block, "type", None) != "text" or not isinstance(text, str):
+            return None, "unavailable", "unsupported_content"
+        if not text.strip():
+            return None, "empty", None
+        try:
+            parsed = json.loads(text)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None, "unavailable", "invalid_json_text"
+        if not is_non_empty_json(parsed):
+            return None, "empty", None
+        if contains_transport_artifact_marker(parsed):
+            return None, "unavailable", "unsupported_content"
+        return parsed, "available", None
 
     @staticmethod
     def _error_text(result: Any) -> str | None:

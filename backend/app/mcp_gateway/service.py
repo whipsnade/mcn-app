@@ -35,6 +35,7 @@ from app.mcp_gateway.transport import (
     RemoteToolResult,
     McpUpstreamHttpError,
     ToolInvocationOutcome,
+    resolve_remote_result_status,
 )
 from app.mcp_gateway.validation import (
     McpValidationError,
@@ -42,6 +43,7 @@ from app.mcp_gateway.validation import (
     validate_input,
     validate_output,
 )
+from app.pi_gateway.result import validate_wrapped_result_json
 from app.tasks.models import AnalysisTask
 
 
@@ -349,13 +351,22 @@ class McpCallService:
             return await self._finish_failed(
                 row, "upstream_tool_error", upstream_message=result.error_text
             )
+        result_status, result_shape_error = resolve_remote_result_status(result)
+        if result_shape_error is not None or result_status is None:
+            row.upstream_request_id = result.upstream_request_id
+            return await self._finish_failed(row, "result_envelope_invalid")
         # DataTap 对“查询成功但无数据”返回 is_error=False + null content（上游
         # 同样按成功计费）。这不是格式错误：按空结果结算，避免模型对确定性
-        # 空响应反复重试而烧光调用预算。
-        if result.structured_content is None:
+        # 空响应反复重试而烧光调用预算。不可取回的已确认结果同样结算，但不写
+        # payload；两者都不进入 result_unknown。
+        if result_status in ("empty", "unavailable"):
             validated_output = None
         else:
             try:
+                if not validate_wrapped_result_json(
+                    approved.service.value, result.structured_content
+                ):
+                    raise McpValidationError("reviewed result wrapper is not valid JSON")
                 validated_output = validate_output(result.structured_content, approved.output_schema)
             except McpValidationError:
                 row.upstream_request_id = result.upstream_request_id
@@ -365,12 +376,20 @@ class McpCallService:
         row.upstream_request_id = result.upstream_request_id
         row.response_hash = hashlib.sha256(canonical_json_bytes(validated_output)).hexdigest()
         row.evidence_json = {
-            "outcome": "succeeded",
+            "outcome": (
+                "succeeded_empty" if result_status == "empty"
+                else "result_unavailable" if result_status == "unavailable"
+                else "succeeded"
+            ),
             "structured_content": validated_output,
             "upstream_request_id": result.upstream_request_id,
         }
-        row.error_type = None
-        row.error_message = None
+        row.error_type = (
+            "succeeded_empty" if result_status == "empty"
+            else "result_unavailable" if result_status == "unavailable"
+            else None
+        )
+        row.error_message = row.error_type
         row.completed_at = datetime.now(UTC).replace(tzinfo=None)
         row.updated_at = row.completed_at
         await self._db.commit()
@@ -472,11 +491,25 @@ class McpCallService:
                 "upstream_tool_error",
                 error_message=safe_upstream_text(result.error_text),
             )
-        # 与 invoke 路径一致：is_error=False 的 null content 是合法空结果。
-        if result.structured_content is None:
+        result_status, result_shape_error = resolve_remote_result_status(result)
+        if result_shape_error is not None or result_status is None:
+            return ToolInvocationOutcome(
+                "failed",
+                None,
+                None,
+                result.upstream_request_id,
+                "result_envelope_invalid",
+            )
+        # 与 invoke 路径一致：is_error=False 的 null content 是合法空结果；已
+        # 确认但不可取回的结果也保留 succeeded outcome，交由 settlement 结算。
+        if result_status in ("empty", "unavailable"):
             output = None
         else:
             try:
+                if not validate_wrapped_result_json(
+                    invocation.service.value, result.structured_content
+                ):
+                    raise McpValidationError("reviewed result wrapper is not valid JSON")
                 output = validate_output(result.structured_content, invocation.output_schema)
             except McpValidationError as error:
                 return ToolInvocationOutcome(
@@ -493,6 +526,7 @@ class McpCallService:
             hashlib.sha256(canonical_json_bytes(output)).hexdigest(),
             result.upstream_request_id,
             None,
+            result_status=result_status,
         )
 
     async def _finish_unknown(self, row: McpCall) -> McpCall:

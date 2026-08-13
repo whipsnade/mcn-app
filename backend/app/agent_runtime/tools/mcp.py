@@ -39,7 +39,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_runtime.circuit_breaker import FineGrainedCircuitBreaker
-from app.agent_runtime.evidence import EvidenceWriter, build_model_evidence_view
+from app.agent_runtime.evidence import (
+    EvidencePersistenceError,
+    EvidenceWriter,
+    build_model_evidence_view,
+)
 from app.agent_runtime.normalization import NormalizationRegistry
 from app.agent_runtime.models import (
     AgentRun,
@@ -59,6 +63,7 @@ from app.pi_gateway.accounting import (
     TenantAccountingError,
     TenantAccountingService,
 )
+from app.pi_gateway.result import validate_reviewed_result_json
 from app.billing.models import TenantWallet, TenantWalletTransaction
 from app.db.session import SessionFactory
 from app.mcp_gateway.contracts import DataTapService
@@ -69,11 +74,16 @@ from app.mcp_gateway.transport import (
     McpConnectionError,
     McpConnectionTimeout,
     McpGatewayTimeout,
+    McpNotSentError,
     McpProtocolError,
     McpQueueTimeout,
     McpTransport,
     McpUpstreamHttpError,
+    MCP_UNAVAILABLE_REASONS,
     PossiblySentTimeout,
+    is_non_empty_json,
+    resolve_remote_result_status,
+    ServiceNotAllowedError,
 )
 from app.mcp_gateway.validation import (
     McpValidationError,
@@ -98,10 +108,12 @@ _UNCONFIRMED_ERRORS = (
 )
 # 外发前即可确认未发出的异常 → definitely_not_sent。
 _PRE_CONNECTION_ERRORS = (
+    McpNotSentError,
     McpConnectionTimeout,
     McpConnectionError,
     McpQueueTimeout,
     McpCircuitOpen,
+    ServiceNotAllowedError,
 )
 
 # Evidence scope/period 提取用到的参数键。
@@ -389,7 +401,7 @@ class DurableToolCallCoordinator:
         session_id: str,
         validated_payload: Any,
         upstream_request_id: str | None,
-    ) -> tuple[str, dict[str, Any] | None]:
+    ) -> tuple[str | None, dict[str, Any] | None]:
         """成功收口：写 Evidence + settle 10 分，返回 (evidence_id, 统一模型视图)。
 
         幂等：已 settled 的调用直接回放既有 Evidence（重入不重复写、不重复扣费）。
@@ -403,24 +415,38 @@ class DurableToolCallCoordinator:
             if row.status == "settled":
                 evidence = await EvidenceWriter(db).get_by_tool_call_id(row.id)
                 if evidence is None:
+                    if row.error_type == "result_unavailable":
+                        return None, None
                     raise LookupError("evidence_missing_for_settled_call")
                 return evidence.id, build_model_evidence_view(evidence)
             if row.status == "failed":
                 raise RuntimeError("agent_tool_call_already_failed")
             scope, period = _extract_scope_period(row.arguments_json or {})
-            evidence = await EvidenceWriter(db).write(
-                session_id=session_id,
-                run_id=row.run_id,
-                tool_call_id=row.id,
-                source_type="mcp",
-                source_name=self._internal_tool_name,
-                scope_json=scope,
-                period_json=period,
-                raw_payload=validated_payload,
-                normalization=NormalizationRegistry().normalize(
-                    self._internal_tool_name, validated_payload
-                ),
-            )
+            try:
+                async with db.begin_nested():
+                    evidence = await EvidenceWriter(db).write(
+                        session_id=session_id,
+                        run_id=row.run_id,
+                        tool_call_id=row.id,
+                        source_type="mcp",
+                        source_name=self._internal_tool_name,
+                        scope_json=scope,
+                        period_json=period,
+                        raw_payload=validated_payload,
+                        normalization=NormalizationRegistry().normalize(
+                            self._internal_tool_name, validated_payload
+                        ),
+                    )
+            except (EvidencePersistenceError, TypeError, ValueError):
+                # 上游成功已经由 transport 返回确认；仅本地 Evidence 不可写，
+                # 因此必须 settle + result_unavailable，而不是交给未知结果恢复。
+                if upstream_request_id:
+                    row.upstream_request_id = upstream_request_id
+                await AgentMcpAccounting(db).settle(user_id, row)
+                row.error_type = "result_unavailable"
+                row.safe_error_message = "local Evidence persistence failed"
+                await db.commit()
+                return None, None
             row.upstream_request_id = upstream_request_id
             await AgentMcpAccounting(db).settle(user_id, row)
             await db.commit()
@@ -499,10 +525,10 @@ class DurableToolCallCoordinator:
         message: str,
         upstream_request_id: str | None = None,
     ) -> None:
-        """succeeded_empty 收口：结算积分 + 标记 failed+succeeded_empty，不写 Evidence。
+        """succeeded_empty 收口：结算积分 + 标记 settled/succeeded_empty，不写 Evidence。
 
         上游返回成功但无结构化内容：调用确实成功（结算 10 分），但产物不可用
-        （标记 failed + error_type=succeeded_empty），绝不创建内容为 None 的 Evidence。
+        （标记 settled + error_type=succeeded_empty），绝不创建内容为 None 的 Evidence。
         回放时返回 failed+succeeded_empty（不变成 success/already settled）。
         """
         async with self._session_factory() as db:
@@ -518,8 +544,35 @@ class DurableToolCallCoordinator:
             if upstream_request_id:
                 row.upstream_request_id = upstream_request_id
             await AgentMcpAccounting(db).settle(user_id, row)
-            row.status = "failed"
             row.error_type = "succeeded_empty"
+            row.safe_error_message = message
+            row.completed_at = _now()
+            await db.commit()
+
+    async def finalize_succeeded_unavailable(
+        self,
+        *,
+        logical_call_id: str,
+        user_id: str,
+        session_id: str,
+        message: str,
+        upstream_request_id: str | None = None,
+    ) -> None:
+        """确认成功但 payload 不可取回：settle，不写 Evidence，不伪装 unknown。"""
+        async with self._session_factory() as db:
+            row = await self._require_call(
+                db,
+                logical_call_id,
+                user_id=user_id,
+                session_id=session_id,
+                for_update=True,
+            )
+            if row.status in ("settled", "failed"):
+                return
+            if upstream_request_id:
+                row.upstream_request_id = upstream_request_id
+            await AgentMcpAccounting(db).settle(user_id, row)
+            row.error_type = "result_unavailable"
             row.safe_error_message = message
             row.completed_at = _now()
             await db.commit()
@@ -618,12 +671,22 @@ class DurableToolCallCoordinator:
         validated_payload: Any,
         upstream_request_id: str | None,
         note: str,
+        result_status: str = "available",
+        unavailable_reason: str | None = None,
     ) -> str | None:
         """核对确认成功：（有 payload 时）写 Evidence + settle + 审计。
 
         ``validated_payload`` 为 ``None`` 表示 payload 不可取回：只结算并标记
         ``result_unavailable``，绝不伪造 Evidence。返回 evidence_id 或 None。
         """
+        if result_status not in ("available", "empty", "unavailable"):
+            raise ValueError("confirmed_success_result_status_invalid")
+        if result_status == "available" and not is_non_empty_json(validated_payload):
+            raise ValueError("confirmed_success_without_payload_status")
+        if result_status in ("empty", "unavailable") and validated_payload is not None:
+            raise ValueError("confirmed_success_payload_status_mismatch")
+        if result_status == "unavailable" and unavailable_reason not in MCP_UNAVAILABLE_REASONS:
+            raise ValueError("confirmed_success_unavailable_reason_missing")
         async with self._session_factory() as db:
             row = await self._require_call(
                 db,
@@ -638,25 +701,42 @@ class DurableToolCallCoordinator:
             evidence_id: str | None = None
             if validated_payload is not None:
                 scope, period = _extract_scope_period(row.arguments_json or {})
-                evidence = await EvidenceWriter(db).write(
-                    session_id=snapshot.session_id,
-                    run_id=row.run_id,
-                    tool_call_id=row.id,
-                    source_type="mcp",
-                    source_name=self._internal_tool_name,
-                    scope_json=scope,
-                    period_json=period,
-                    raw_payload=validated_payload,
-                    normalization=NormalizationRegistry().normalize(
-                        self._internal_tool_name, validated_payload
-                    ),
-                )
-                evidence_id = evidence.id
+                try:
+                    async with db.begin_nested():
+                        evidence = await EvidenceWriter(db).write(
+                            session_id=snapshot.session_id,
+                            run_id=row.run_id,
+                            tool_call_id=row.id,
+                            source_type="mcp",
+                            source_name=self._internal_tool_name,
+                            scope_json=scope,
+                            period_json=period,
+                            raw_payload=validated_payload,
+                            normalization=NormalizationRegistry().normalize(
+                                self._internal_tool_name, validated_payload
+                            ),
+                        )
+                    evidence_id = evidence.id
+                except (EvidencePersistenceError, TypeError, ValueError):
+                    # reconciliation 已确认上游成功；本地失败只让 payload
+                    # unavailable，不释放也不伪装成 result_unknown。
+                    evidence_id = None
             if upstream_request_id:
                 row.upstream_request_id = upstream_request_id
             await AgentMcpAccounting(db).settle(snapshot.user_id, row)
             if evidence_id is None:
-                row.safe_error_message = "result_unavailable"
+                row.error_type = (
+                    "succeeded_empty"
+                    if result_status == "empty" and validated_payload is None
+                    else "result_unavailable"
+                )
+                row.safe_error_message = (
+                    row.error_type
+                    if row.error_type == "succeeded_empty"
+                    else "local Evidence persistence failed"
+                    if validated_payload is not None
+                    else row.error_type
+                )
             self._append_reconciliation(
                 db,
                 row.id,
@@ -682,7 +762,15 @@ class DurableToolCallCoordinator:
                     ),
                     evidence_id=evidence.id,
                 )
-            return ToolResult(status="success", safe_summary="already settled")
+            if row.error_type in ("succeeded_empty", "result_unavailable"):
+                return ToolResult(
+                    status="failed",
+                    safe_summary=row.safe_error_message
+                    or ("confirmed MCP success without a retrievable payload" if row.error_type == "result_unavailable"
+                        else "upstream returned no structured content"),
+                    error_type=row.error_type,
+                )
+            raise LookupError("evidence_missing_for_settled_call")
         if row.status == "failed":
             feedback = _parse_feedback(row.safe_error_message)
             if feedback is not None:
@@ -932,8 +1020,60 @@ class AgentMcpTool:
             # 会导致模型用同样错误参数反复调用（真实 UAT 已观察到该模式）。
             return feedback
 
+        result_status, result_shape_error = resolve_remote_result_status(result)
+        if result_shape_error is not None or result_status is None:
+            self._breaker.record_success(
+                service=self._service.value, internal_tool_name=self.name, arguments=normalized
+            )
+            feedback = _feedback_result(
+                tool=self.name,
+                normalized=normalized,
+                error_type=FAILED_CONFIRMED,
+                request_state="failed",
+                points_state="released",
+                retry_allowed=False,
+                suggested_actions=["结果状态与载荷不一致，请稍后重试"],
+                upstream_code=result.upstream_request_id,
+                upstream_reason="MCP result status/payload mismatch",
+            )
+            await self._coordinator.finalize_release(
+                logical_call_id=logical_call_id,
+                user_id=context.user_id,
+                error_type=FAILED_CONFIRMED,
+                message=feedback.safe_summary,
+                upstream_request_id=result.upstream_request_id,
+            )
+            return feedback
+        if result_status == "unavailable":
+            self._breaker.record_success(
+                service=self._service.value, internal_tool_name=self.name, arguments=normalized
+            )
+            feedback = _feedback_result(
+                tool=self.name,
+                normalized=normalized,
+                error_type="result_unavailable",
+                request_state="settled",
+                points_state="settled",
+                retry_allowed=False,
+                suggested_actions=["结果已确认但载荷不可取回；不要重复相同调用，继续其他章节"],
+                upstream_code=result.upstream_request_id,
+                upstream_reason=result.unavailable_reason or "confirmed result payload unavailable",
+            )
+            await self._coordinator.finalize_succeeded_unavailable(
+                logical_call_id=logical_call_id,
+                user_id=context.user_id,
+                session_id=context.session_id,
+                message=feedback.safe_summary,
+                upstream_request_id=result.upstream_request_id,
+            )
+            return feedback
+
         if result.structured_content is not None:
             try:
+                if not validate_reviewed_result_json(
+                    self._service.value, self._output_schema, result.structured_content
+                ):
+                    raise McpValidationError("reviewed result wrapper validation failed")
                 validated = validate_output(result.structured_content, self._output_schema)
             except McpValidationError:
                 self._breaker.record_success(
@@ -991,6 +1131,12 @@ class AgentMcpTool:
             validated_payload=validated,
             upstream_request_id=result.upstream_request_id,
         )
+        if evidence_id is None or view is None:
+            return ToolResult(
+                status="failed",
+                safe_summary="confirmed success but local Evidence persistence failed",
+                error_type="result_unavailable",
+            )
         # 统一模型视图（有界、合法 JSON）已含 normalization 诊断；不重复归一化、
         # 不中途截断 safe_summary。
         return ToolResult(
@@ -1049,18 +1195,60 @@ class AgentMcpTool:
                 error_type=FAILED_CONFIRMED,
             )
         # 可确认成功；payload 必须重新过输出 Schema 校验才能写 Evidence（§5.3）。
-        if result.structured_content is None:
+        # A legacy reconciliation probe may only tell us "confirmed success"
+        # without carrying the explicit adapter status. With no payload this is
+        # confirmed-but-unavailable; live DataTap results carry the explicit
+        # union and are still validated strictly.
+        if result.result_status is None and result.structured_content is None:
+            result_status, result_shape_error = "unavailable", None
+            unavailable_reason = "payload_not_retrievable"
+        else:
+            result_status, result_shape_error = resolve_remote_result_status(result)
+            unavailable_reason = result.unavailable_reason
+        if result_shape_error is not None or result_status is None:
+            await self._coordinator.confirm_failure(
+                snapshot,
+                message="MCP result status/payload mismatch",
+                note="MCP result status/payload mismatch",
+                upstream_request_id=result.upstream_request_id,
+            )
+            return ToolResult(
+                status="failed",
+                safe_summary="MCP result status/payload mismatch",
+                error_type=FAILED_CONFIRMED,
+            )
+        if result_status == "unavailable":
             await self._coordinator.confirm_success(
                 snapshot,
                 validated_payload=None,
                 upstream_request_id=result.upstream_request_id,
-                note="payload not retrievable",
+                note="confirmed success but payload unavailable",
+                result_status="unavailable",
+                unavailable_reason=unavailable_reason,
             )
             return ToolResult(
                 status="success", safe_summary="confirmed success (payload unavailable)",
                 evidence_id=None,
             )
+        if result_status == "empty":
+            await self._coordinator.confirm_success(
+                snapshot,
+                validated_payload=None,
+                upstream_request_id=result.upstream_request_id,
+                note="confirmed success with empty result",
+                result_status="empty",
+            )
+            return ToolResult(
+                status="success", safe_summary="confirmed success (empty result)",
+                evidence_id=None,
+            )
+        if result.structured_content is None:
+            raise ValueError("mcp_result_status_missing")
         try:
+            if not validate_reviewed_result_json(
+                self._service.value, self._output_schema, result.structured_content
+            ):
+                raise McpValidationError("reviewed result wrapper validation failed")
             validated = validate_output(result.structured_content, self._output_schema)
         except McpValidationError:
             await self._coordinator.confirm_failure(
@@ -1079,6 +1267,12 @@ class AgentMcpTool:
             upstream_request_id=result.upstream_request_id,
             note="confirmed via upstream",
         )
+        if evidence_id is None:
+            return ToolResult(
+                status="failed",
+                safe_summary="confirmed success but local Evidence persistence failed",
+                error_type="result_unavailable",
+            )
         return ToolResult(status="success", safe_summary="confirmed success", evidence_id=evidence_id)
 
     # ------------------------------------------------------------------ #

@@ -47,6 +47,10 @@ class AgentProfile:
     ``output_schema`` 是短描述符：``agent_actions``（四种动作协议）/
     ``review_decision``（approve/revise/reject，独立于动作协议；遗留，
     仅 artifact_reviewer_v1 使用）/ ``utility_json``（对应强类型 Utility 输出）。
+    ``allowed_artifact_contracts`` 是该 Profile 的审核输出契约 allowlist；它
+    只描述可以交付的已审核产物类型，不描述 Builder 调用顺序。Run 创建时
+    RuntimeConfigService 要求 runtime config 的 profile 映射同时命中此 allowlist
+    和当前 capability pack 的 typed contract。
     """
 
     name: str
@@ -57,6 +61,7 @@ class AgentProfile:
     max_context_budget: int
     output_schema: str
     system_prompt_key: str
+    allowed_artifact_contracts: frozenset[str] = frozenset()
     mcp_tool_allowlist: frozenset[str] | None = None
 
     def __post_init__(self) -> None:
@@ -85,6 +90,7 @@ def _make_profile(
     requires_reviewer: bool,
     max_context_budget: int,
     output_schema: str,
+    allowed_artifact_contracts: frozenset[str] = frozenset(),
     mcp_tool_allowlist: frozenset[str] | None = None,
 ) -> AgentProfile:
     return AgentProfile(
@@ -96,6 +102,7 @@ def _make_profile(
         max_context_budget=max_context_budget,
         output_schema=output_schema,
         system_prompt_key=f"{name}_{version}",
+        allowed_artifact_contracts=allowed_artifact_contracts,
         mcp_tool_allowlist=mcp_tool_allowlist,
     )
 
@@ -115,6 +122,14 @@ PROFILES: dict[str, AgentProfile] = {
             requires_reviewer=False,
             max_context_budget=128_000,
             output_schema="agent_actions",
+            allowed_artifact_contracts=frozenset(
+                {
+                    "brand_report_v3",
+                    "campaign_report_v3",
+                    "kol_selection_v3",
+                    "insight_board_v1",
+                }
+            ),
         ),
         # （遗留）正式 Artifact 提交复核：只读，输出 approve/revise/reject，
         # 禁用工具。Reviewer 已从新执行路径下线，本 Profile 仅保留供历史
@@ -142,6 +157,7 @@ PROFILES: dict[str, AgentProfile] = {
             requires_reviewer=False,
             max_context_budget=32_000,
             output_schema="agent_actions",
+            allowed_artifact_contracts=frozenset({"insight_board_v1"}),
             mcp_tool_allowlist=KOL_DETAIL_MCP_TOOL_ALLOWLIST,
         ),
         # 标题、Run 摘要、建议等后台轻量任务：只输出受控结构，不需要 Reviewer。

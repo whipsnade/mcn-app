@@ -58,6 +58,7 @@ export type WorkerFailureCode =
   | "sdk_protocol_error"
   | "pi_decision_limit"
   | "pi_model_provider_error"
+  | "agent_loop_circuit_open"
   | "worker_error";
 
 export function classifyWorkerExit(
@@ -70,10 +71,17 @@ export function classifyWorkerExit(
 
 export function classifyWorkerError(
   error: unknown,
-): "sdk_protocol_error" | "pi_decision_limit" | "pi_model_provider_error" | "worker_error" {
+): "sdk_protocol_error" | "pi_decision_limit" | "pi_model_provider_error" | "agent_loop_circuit_open" | "worker_error" {
   // 业务预算/模型终局失败码必须原样保留：它们是稳定业务终态，不是基础设施崩溃。
   if (isDecisionLimitError(error)) return "pi_decision_limit";
   if (isProviderFailureError(error)) return "pi_model_provider_error";
+  if (
+    error &&
+    typeof error === "object" &&
+    (error as { code?: unknown }).code === "agent_loop_circuit_open"
+  ) {
+    return "agent_loop_circuit_open";
+  }
   return error instanceof Error && error.message === "sdk_protocol_error"
     ? "sdk_protocol_error"
     : "worker_error";
@@ -102,6 +110,7 @@ export function spawnIsolatedWorker(
     "sdk_protocol_error",
     "pi_decision_limit",
     "pi_model_provider_error",
+    "agent_loop_circuit_open",
   ]);
   child.on("message", (message: unknown) => {
     if (!message || typeof message !== "object" || !("type" in message)) return;
@@ -198,6 +207,7 @@ export async function runSingleWorker(
   let unsubscribe: (() => void) | undefined;
   let workerSecrets: SecretBundle | undefined = secrets;
   const usageProjector = new PiSdkUsageProjector(work.attemptId);
+  let deltaFlushTimer: ReturnType<typeof setInterval> | undefined;
   // provider 流式终局失败标记：SDK 以 stopReason="error" 的 assistant 消息收口
   // （经 message_end 事件暴露）。两层重试已关闭，该错误即本 Run 的终局模型失败，
   // 必须成为稳定 failed 终态而非「错误文本的完成」。
@@ -249,6 +259,13 @@ export async function runSingleWorker(
       const projected = projectPiSdkEvent(event.event ?? event, usageProjector);
       for (const item of projected) options.onEvent?.(item);
     });
+    // The projector owns a 50ms bounded wait. A short timer makes a quiet SDK
+    // stream flush a partial batch without blocking or inflating the gateway
+    // handoff buffer; semantic boundaries still flush synchronously in project().
+    deltaFlushTimer = setInterval(() => {
+      for (const item of usageProjector.flushIfDue()) options.onEvent?.(item);
+    }, 10);
+    deltaFlushTimer.unref?.();
     await session.prompt(work.userPrompt ?? "");
     // SDK 可能把 provider 错误吞进 error 消息再正常收口 prompt——预算超限必须
     // 在 worker 边界重新抛出稳定码，Run 才能得到 failed/pi_decision_limit 终态。
@@ -260,6 +277,11 @@ export async function runSingleWorker(
     }
   } finally {
     try {
+      // Every exit path (normal, cancel, abort, provider/decision failure and
+      // child exit) publishes the last partial delta batch before the child
+      // sends its terminal IPC frame.
+      if (deltaFlushTimer !== undefined) clearInterval(deltaFlushTimer);
+      for (const item of usageProjector.flush()) options.onEvent?.(item);
       await cleanup();
     } finally {
       removeSignalHandlers();

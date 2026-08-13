@@ -44,6 +44,19 @@ export class ControlPlaneUnavailableError extends Error {
   }
 }
 
+/** A durable business rejection returned by the FastAPI control plane. */
+export class ControlPlaneBusinessError extends Error {
+  readonly code: string;
+  readonly status: number;
+
+  constructor(status: number, code: string) {
+    super(code);
+    this.name = "ControlPlaneBusinessError";
+    this.status = status;
+    this.code = code;
+  }
+}
+
 const BACKEND_SERVICE_SLUGS: Readonly<Record<string, string>> = Object.freeze({
   "insight-cube": "insight-cube-mcp",
   "social-grow": "social-grow-mcp",
@@ -271,7 +284,24 @@ export class ControlPlaneClient implements ControlPlaneTransport {
     if (response.status >= 300 && response.status < 400) throw new Error("pi_gateway_redirect_forbidden");
     if (response.status === 204) return undefined;
     if (response.status >= 500) throw new ControlPlaneUnavailableError(new Error(`http_${response.status}`));
-    if (!response.ok) throw new Error(`pi_gateway_http_${response.status}`);
+    if (!response.ok) {
+      let code = `pi_gateway_http_${response.status}`;
+      try {
+        const errorBody = (await response.json()) as unknown;
+        if (
+          errorBody &&
+          typeof errorBody === "object" &&
+          !Array.isArray(errorBody) &&
+          typeof (errorBody as { detail?: unknown }).detail === "string" &&
+          (errorBody as { detail: string }).detail.length > 0
+        ) {
+          code = (errorBody as { detail: string }).detail;
+        }
+      } catch {
+        // Preserve the stable HTTP fallback when the error body is not JSON.
+      }
+      throw new ControlPlaneBusinessError(response.status, code);
+    }
     return (await response.json()) as T;
   }
 }

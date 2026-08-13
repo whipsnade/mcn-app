@@ -248,9 +248,13 @@ class UtilityRunner:
             raise PermissionError(license_decision.code)
         runtime_service = RuntimeConfigService(self._db)
         if parent_run is None:
-            runtime_snapshot = await runtime_service.snapshot_for_new_run(tenant_id)
+            runtime_snapshot = await runtime_service.snapshot_for_new_run(
+                tenant_id, profile_name=self._profile.full_name
+            )
         else:
-            runtime_snapshot = await runtime_service.snapshot_for_existing_run(parent_run)
+            runtime_snapshot = await runtime_service.snapshot_for_child_run(
+                parent_run, profile_name=self._profile.full_name
+            )
         internal_run = AgentRun(
             id=str(uuid4()),
             session_id=session_id,

@@ -802,7 +802,8 @@ async def append_message(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=license_decision.code)
     try:
         runtime_snapshot = await RuntimeConfigService(db).snapshot_for_new_run(
-            tenant_context.tenant_id
+            tenant_context.tenant_id,
+            profile_name=SESSION_ANALYST_PROFILE,
         )
     except RuntimeConfigError as error:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
@@ -942,13 +943,18 @@ async def cancel_run(
     Reviewer 返回后 / 循环顶）收口。终态幂等返回。
     H1：立即取消的迁移与终态事件由 settle_terminal 同一加锁事务提交。
     """
+    user_id = user.id
     settled_immediately = False
 
     async def _do() -> AgentRun:
         nonlocal settled_immediately
-        run = await _get_owned_run(db, user.id, run_id)
+        # ``with_lock_retry`` rolls back the AsyncSession after a deadlock;
+        # rollback expires ORM instances supplied by dependencies.  Capture
+        # the scalar identity before the retry boundary so a second attempt
+        # never triggers an implicit async refresh (MissingGreenlet).
+        run = await _get_owned_run(db, user_id, run_id)
         try:
-            tenant_context = await TenantService(db).resolve_user(user.id, for_update=True)
+            tenant_context = await TenantService(db).resolve_user(user_id, for_update=True)
         except PermissionError as error:
             raise _not_found("run_not_found") from error
         if run.tenant_id is None or run.tenant_id != tenant_context.tenant_id:
@@ -957,11 +963,11 @@ async def cancel_run(
         current = RunStatus(run.status)
         if current in _IMMEDIATE_CANCEL_STATUSES:
             await AgentEventStream(db, broker).settle_terminal(
-                run.id, user.id, RunStatus.CANCELLED, {}
+                run.id, user_id, RunStatus.CANCELLED, {}
             )
             settled_immediately = True
         elif current in _REQUEST_CANCEL_STATUSES:
-            await repo.request_cancel(run.id, user.id)
+            await repo.request_cancel(run.id, user_id)
         await db.commit()
         return run
 

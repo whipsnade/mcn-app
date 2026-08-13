@@ -1,4 +1,5 @@
 from datetime import UTC, datetime, timedelta
+from collections.abc import Awaitable, Callable
 from uuid import uuid4
 
 from sqlalchemy import func, select, update
@@ -183,6 +184,14 @@ class AgentRunRepository:
             return False
         ensure_transition(RunStatus(run.status), RunStatus.FAILED)
         now = utc_now()
+        from app.pi_gateway.completion import close_open_runtime_rows
+
+        await close_open_runtime_rows(
+            self.db,
+            run.id,
+            now,
+            error_code=error_code or "run_force_failed",
+        )
         run.status = RunStatus.FAILED
         run.completed_at = run.completed_at or now
         run.error_code = error_code
@@ -193,16 +202,30 @@ class AgentRunRepository:
         await self.db.flush()
         return True
 
-    async def force_complete(self, run_id: str) -> bool:
-        """系统级完成收口：仅在调用方已核实 durable completion 后使用。
+    async def force_complete(
+        self,
+        run_id: str,
+        *,
+        completion_validator: Callable[[object], Awaitable[object]] | None = None,
+    ) -> bool:
+        """系统级完成收口：必须在同一持锁边界再次执行完成契约。
 
         与 force_fail 同构：仅在无其他 worker 活跃持有时生效；用于 Pi
-        Gateway「terminal ACK 丢失」恢复——completion 已持久化、租约过期，
-        Run 必须干净置为 completed 而不是重跑。
+        Gateway「terminal ACK 丢失」恢复。调用方不能只传一个
+        ``has_assistant_completion`` 谓词，否则会绕过 artifact、ToolCall 与
+        running Step 门禁。
         """
         run = await self.lock_run(run_id)
         if RunStatus(run.status) in TERMINAL_RUN_STATUSES:
             return False
+        if completion_validator is None:
+            raise InvalidRunTransition("completion_validation_required")
+        validation = await completion_validator(run)
+        if not bool(validation):
+            code = getattr(validation, "code", None)
+            raise InvalidRunTransition(
+                code if isinstance(code, str) and code else "completion_validation_failed"
+            )
         if run.lease_owner is not None and (
             run.lease_expires_at is None or run.lease_expires_at > utc_now()
         ):
@@ -236,13 +259,36 @@ class AgentRunRepository:
         return True
 
     async def transition(
-        self, run_id: str, target: RunStatus, *, worker_id: str
+        self,
+        run_id: str,
+        target: RunStatus,
+        *,
+        worker_id: str,
+        completion_validator: Callable[[AgentRun], Awaitable[object]] | None = None,
     ) -> AgentRun:
         """按状态机迁移 Run 状态；仅活跃租约持有者可迁移，终态/暂停做 Attempt 收尾。"""
         run = await self.lock_run(run_id)
         ensure_transition(RunStatus(run.status), target)
         if not self.owns_active_lease(run, worker_id):
             raise InvalidRunTransition("run_lease_not_held")
+        if target in (RunStatus.COMPLETED, RunStatus.COMPLETED_WITH_WARNINGS):
+            if completion_validator is None:
+                raise InvalidRunTransition("completion_validation_required")
+            validation = await completion_validator(run)
+            if not bool(validation):
+                code = getattr(validation, "code", None)
+                raise InvalidRunTransition(
+                    code if isinstance(code, str) and code else "completion_validation_failed"
+                )
+        if target == RunStatus.FAILED:
+            from app.pi_gateway.completion import close_open_runtime_rows
+
+            await close_open_runtime_rows(
+                self.db,
+                run.id,
+                utc_now(),
+                error_code="run_failed",
+            )
         now = utc_now()
         run.status = target
         if target in TERMINAL_RUN_STATUSES:

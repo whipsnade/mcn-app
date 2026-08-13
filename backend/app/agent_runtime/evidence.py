@@ -275,6 +275,13 @@ def build_model_evidence_view(evidence: EvidenceItem) -> dict[str, Any]:
     return _view({"__truncated__": True}, {}, [], True)
 
 
+class EvidencePersistenceError(RuntimeError):
+    """本地 Evidence 持久化失败；不表示上游 MCP 结果未知。"""
+
+    def __init__(self, message: str = "evidence_persistence_failed") -> None:
+        super().__init__(message)
+
+
 class EvidenceWriter:
     """不可变 Evidence 写入器：仅插入（append-only），不提供更新路径。"""
 
@@ -332,8 +339,14 @@ class EvidenceWriter:
             ),
             normalization_error_code=normalization.error_code if normalization else None,
         )
-        self._db.add(item)
-        await self._db.flush()
+        try:
+            self._db.add(item)
+            await self._db.flush()
+        except Exception as exc:
+            # 调用方在独立 savepoint 中调用 write，并在捕获后按
+            # confirmed-success + unavailable 结算。不要让本地 DB 异常被
+            # 上层 transport 处理器误归类成 result_unknown。
+            raise EvidencePersistenceError() from exc
         return item
 
     async def get_by_tool_call_id(self, tool_call_id: str) -> EvidenceItem | None:
@@ -347,6 +360,7 @@ class EvidenceWriter:
 
 __all__ = [
     "CanonicalField",
+    "EvidencePersistenceError",
     "EvidenceWriter",
     "bound_model_value",
     "build_model_evidence_view",

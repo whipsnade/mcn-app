@@ -110,6 +110,9 @@ class AgentRun(Base):
         String(64), ForeignKey("runtime_config_versions.id", ondelete="RESTRICT"), nullable=False
     )
     runtime_config_snapshot_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    # 服务端 loop guard：只存确定性错误指纹/证据集合版本/熔断状态，跨 Attempt
+    # 复用；模型输入与模型参数不能写入此字段。
+    loop_guard_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     queued_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=_utc_now)
     input_message_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("agent_messages.id", use_alter=True), nullable=True

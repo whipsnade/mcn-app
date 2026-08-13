@@ -57,10 +57,10 @@ _SOURCE_EVENT_ALLOWED_FIELDS = {
     "turn.started": set(),
     "turn.completed": {"safe_summary"},
     "message.started": {"message_id", "role"},
-    "message.delta": {"message_id", "delta", "text"},
+    "message.delta": {"message_id", "delta", "text", "delta_count", "batched"},
     "message.completed": {"message_id", "text", "type"},
     "thinking.started": {"attempt"},
-    "thinking.delta": {"attempt", "delta", "text"},
+    "thinking.delta": {"attempt", "delta", "text", "delta_count", "batched"},
     "thinking.completed": {"attempt", "duration_ms"},
     "tool.started": {"call_id", "internal_tool_name", "safe_summary"},
     "tool.completed": {
@@ -127,6 +127,14 @@ def normalize_source_payload(event_type: str, payload: Mapping[str, Any]) -> dic
         elif key in {"attempt", "duration_ms", "points"}:
             if isinstance(value, bool) or not isinstance(value, int) or value < 0 or value > 10**9:
                 raise PiGatewayEventError("pi_gateway_event_number_invalid")
+            result[key] = value
+        elif key == "delta_count":
+            if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 32:
+                raise PiGatewayEventError("pi_gateway_event_number_invalid")
+            result[key] = value
+        elif key == "batched":
+            if not isinstance(value, bool):
+                raise PiGatewayEventError("pi_gateway_event_field_invalid")
             result[key] = value
         elif key == "status":
             if value not in {"succeeded", "failed", "unknown", "error", "result_unknown"}:

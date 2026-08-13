@@ -121,8 +121,11 @@ class LoadMarketingSkillTool:
         if run is None:
             return ToolResult(status="failed", safe_summary="run_not_found", error_type="not_found")
         try:
+            # The capability pack is a Run-time trust input.  Prompt snapshots
+            # are model-facing/audit data and must never be able to widen the
+            # set of Skills or artifact contracts after Run creation.
             capability = MarketingRunCapability.model_validate(
-                (run.prompt_snapshot_json or {}).get("marketing_capability_pack")
+                (run.runtime_config_snapshot_json or {}).get("capability_pack")
             )
             loaded = capability.load_skill(args.skill_name, args.requested_version)
         except ValidationError:
@@ -138,13 +141,11 @@ class LoadMarketingSkillTool:
                 error_type="marketing_skill_not_enabled",
             )
         snapshot = dict(run.prompt_snapshot_json or {})
-        pack = dict(snapshot.get("marketing_capability_pack") or {})
-        loaded_skills = list(pack.get("loaded_skills") or [])
+        loaded_skills = list(snapshot.get("loaded_marketing_skills") or [])
         record = {key: loaded[key] for key in ("name", "version", "digest")}
         if record not in loaded_skills:
             loaded_skills.append(record)
-        pack["loaded_skills"] = loaded_skills
-        snapshot["marketing_capability_pack"] = pack
+        snapshot["loaded_marketing_skills"] = loaded_skills
         run.prompt_snapshot_json = snapshot
         await self._db.flush()
         return ToolResult(status="success", safe_summary=json.dumps(loaded, ensure_ascii=False))

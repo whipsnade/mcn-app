@@ -30,6 +30,7 @@ from .contracts import (
     PiGatewayTerminalRequest,
 )
 from .accounting import RuntimeUsageError, RuntimeUsageService, TenantAccountingError
+from .completion import CompletionValidator, close_open_runtime_rows
 from .events import PiGatewayEventError, parse_source_event_id
 from .internal_tools import ProductionInternalToolBridge
 from .models import PiGatewayRequestNonce
@@ -251,6 +252,20 @@ async def internal_tool(
     gateway_id = await _authenticate_run_access(request, db, x_pi_run_lease)
 
     async def _do() -> dict[str, object]:
+        # Internal builders/search may update the persisted LoopGuard in this
+        # same transaction.  Acquire Session before the leased Run so that
+        # Gateway requests cannot invert the terminal/recovery lock order.
+        session_id = await db.scalar(select(AgentRun.session_id).where(AgentRun.id == run_id))
+        if not session_id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="pi_gateway_run_not_found")
+        session = await db.scalar(
+            select(AgentSession)
+            .where(AgentSession.id == session_id)
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
+        if session is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="pi_gateway_run_not_found")
         run = await _leased_run(db, gateway_id, run_id, None, x_pi_run_lease)
         bridge = ProductionInternalToolBridge(db=db, worker_id=gateway_id)
         result = await bridge.execute(
@@ -353,6 +368,7 @@ async def terminal(
     gateway_id = await _authenticate_run_access(request, db, x_pi_run_lease)
     outcome = RunStatus(payload.outcome)
     stream = AgentEventStream(db, request.app.state.agent_event_broker)
+    completion_validator = CompletionValidator(db)
 
     async def _do() -> tuple[object, object]:
         session_id = await db.scalar(select(AgentRun.session_id).where(AgentRun.id == run_id))
@@ -371,13 +387,13 @@ async def terminal(
         except PiGatewayLeaseError as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="pi_gateway_run_not_found") from exc
         if outcome in (RunStatus.COMPLETED, RunStatus.COMPLETED_WITH_WARNINGS):
-            # A success terminal without a durable assistant completion is a
-            # projector/worker defect: reject it; the Gateway's safe-close rule
-            # then reports the Run as failed instead of completing without output.
-            if not await _service(db, gateway_id).has_assistant_completion(run):
+            # 业务完成契约由服务端根据 Run 创建时冻结的 snapshot 执行；Gateway
+            # 不能用 assistant message 或当前 builder 调用记录自行推导成功。
+            validation = await completion_validator.validate(run)
+            if not validation.ok:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
-                    detail="pi_gateway_terminal_missing_completion",
+                    detail=validation.code or "pi_gateway_terminal_rejected",
                 )
 
         async def cleanup_before_commit(locked_run) -> None:
@@ -389,6 +405,23 @@ async def terminal(
             if attempt is not None and attempt.outcome == "running":
                 attempt.outcome = "completed" if outcome == RunStatus.COMPLETED_WITH_WARNINGS else outcome.value
                 attempt.ended_at = _service(db, gateway_id).now_fn()
+            if outcome == RunStatus.FAILED:
+                failure_payload = payload.payload or {}
+                await close_open_runtime_rows(
+                    db,
+                    locked_run.id,
+                    _service(db, gateway_id).now_fn(),
+                    error_code=(
+                        failure_payload.get("error_code")
+                        or failure_payload.get("code")
+                        or "pi_gateway_terminal_failed"
+                    ),
+                )
+                locked_run.error_code = (
+                    failure_payload.get("error_code")
+                    or failure_payload.get("code")
+                    or "pi_gateway_terminal_failed"
+                )
             await _service(db, gateway_id).scheduler.release_run(locked_run)
             if session.active_run_id == locked_run.id:
                 session.active_run_id = None
@@ -406,10 +439,24 @@ async def terminal(
                 payload.payload,
                 worker_id=gateway_id,
                 before_commit=cleanup_before_commit,
+                completion_validator=(
+                    completion_validator.validate
+                    if outcome in (RunStatus.COMPLETED, RunStatus.COMPLETED_WITH_WARNINGS)
+                    else None
+                ),
             )
         except InvalidRunTransition as exc:
             await db.rollback()
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="pi_gateway_terminal_rejected") from exc
+            code = str(exc)
+            if code not in {
+                "pi_gateway_terminal_missing_completion",
+                "pi_gateway_running_agent_steps",
+                "pi_gateway_unresolved_mcp_calls",
+                "required_artifact_missing",
+                "required_artifact_invalid_lineage",
+            }:
+                code = "pi_gateway_terminal_rejected"
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=code) from exc
         return run, event
 
     run, event = await _with_lock_retry(db, _do)

@@ -310,8 +310,8 @@ class ReviewerDriver:
 
         # 创建独立 internal 子 Run（自己的 Attempt / Step / token 审计）。
         try:
-            runtime_snapshot = await RuntimeConfigService(self.db).snapshot_for_existing_run(
-                parent_run
+            runtime_snapshot = await RuntimeConfigService(self.db).snapshot_for_child_run(
+                parent_run, profile_name="artifact_reviewer_v1"
             )
         except RuntimeConfigError:
             # Runtime snapshot tampering/missing configuration is a stable

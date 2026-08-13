@@ -132,6 +132,7 @@ from app.agent_runtime.tools.mcp import DEFINITELY_NOT_SENT
 from app.agent_runtime.tools.registry import ToolRegistry, UnknownToolError
 from app.billing.service import InsufficientPointsError
 from app.model.contracts import ChatMessage
+from app.pi_gateway.loop_guard import AGENT_LOOP_CIRCUIT_OPEN
 
 logger = logging.getLogger(__name__)
 
@@ -374,6 +375,11 @@ class AgentEngine:
                         # decide→dispatch 间隙收到取消：不发起新调用，直接收口 cancelled
                         await self._settle_cancelled(run)
                         break
+                    if call_result == "circuit_open":
+                        # LoopGuard 已持久化一次解释性 assistant message；熔断后
+                        # 不再把稳定业务失败回喂模型继续空转，直接以稳定终态收口。
+                        await self._fail_run(run, error_code=AGENT_LOOP_CIRCUIT_OPEN)
+                        break
                     continue
                 if action.action == "publish_artifacts":
                     dispatch = await self._handle_publish_artifacts(
@@ -397,7 +403,16 @@ class AgentEngine:
                     if active_draft_ids:
                         self._feed_completion_blocked(conversation, active_draft_ids)
                         continue
-                    message = await self._handle_complete(run, action)
+                    try:
+                        message = await self._handle_complete(run, action)
+                    except InvalidRunTransition as exc:
+                        # Completion gate rejection is a stable business outcome,
+                        # not an executor/worker crash.  Preserve its code in the
+                        # terminal event and prevent Recovery from treating it as
+                        # an infrastructure retry.
+                        error_code = str(exc) or "completion_validation_failed"
+                        await self._fail_run(run, error_code=error_code)
+                        break
                     assistant_message_id = message.id
                     break
         finally:
@@ -606,6 +621,8 @@ class AgentEngine:
         # （tool 事件之后、终态事件之前），kol_detail Run 同样覆盖。
         await self._emit_draft_tool_event(run, action, result)
         self._feed_tool_result(conversation, result)
+        if result.error_type == AGENT_LOOP_CIRCUIT_OPEN:
+            return "circuit_open"
         return "resumed" if resumed is not None else "ok"
 
     async def _emit_draft_tool_event(
@@ -863,6 +880,11 @@ class AgentEngine:
         消除"已终态无事件"窗口。
         """
         metadata = {"type": "completion", "suggestions": action.suggestions}
+        await self._emit_missing_published_events(run)
+        published_ids, warning_artifact_ids = await self._publish_outcome_artifact_ids(run)
+        # 先持久化本次 completion，再由统一 validator 检查真实 Step/ToolCall
+        # 状态；只有门禁通过后才发 message.completed。不能先收口 running Step
+        # 再检查，否则 ACK 丢失窗口会被伪装成可完成。
         message = await self._append_message(
             session_id=run.session_id,
             run_id=run.id,
@@ -870,11 +892,21 @@ class AgentEngine:
             content=action.text,
             metadata=metadata,
         )
-        await self._emit_missing_published_events(run)
+        completion_validator = None
+        if not (warning_artifact_ids and not published_ids):
+            from app.pi_gateway.completion import CompletionValidator
+
+            completion_validator = CompletionValidator(self._db).validate
+            validation = await completion_validator(run)
+            if not bool(validation):
+                code = getattr(validation, "code", None)
+                raise InvalidRunTransition(
+                    code if isinstance(code, str) else "completion_validation_failed"
+                )
+
         await self._events.append(
             run.id, run.user_id, "message.completed", {"type": "completion"}
         )
-        published_ids, warning_artifact_ids = await self._publish_outcome_artifact_ids(run)
         if warning_artifact_ids and not published_ids:
             # 零发布成功 + 有失败/放弃项：complete 交付为空，按失败收口。
             run.error_code = "ALL_ARTIFACTS_FAILED"
@@ -895,6 +927,7 @@ class AgentEngine:
                     "warning_artifact_ids": sorted(warning_artifact_ids),
                 },
                 worker_id=self._worker_id,
+                completion_validator=completion_validator,
             )
         else:
             await self._events.settle_terminal(
@@ -903,6 +936,7 @@ class AgentEngine:
                 RunStatus.COMPLETED,
                 {"outcome": "completed"},
                 worker_id=self._worker_id,
+                completion_validator=completion_validator,
             )
         return message
 
@@ -1040,6 +1074,8 @@ class AgentEngine:
                 return
             failed = await self._repo.force_fail(run.id, error_code=error_code)
         if failed:
+            run.error_code = error_code
+            await self._db.flush()
             await self._release_owned_drafts(run, outcome="failed")
             await self._events.settle_terminal(
                 run.id,

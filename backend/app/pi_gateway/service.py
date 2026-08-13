@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import secrets
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
 from uuid import uuid4
 
-from sqlalchemy import and_, func, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_runtime.events import AgentEventBroker, AgentEventStream
@@ -25,7 +26,7 @@ from app.agent_runtime.models import (
 )
 from app.billing.models import RuntimeUsageRecord, TenantWalletTransaction
 from app.agent_runtime.state import RunStatus
-from app.agent_runtime.evidence import EvidenceWriter
+from app.agent_runtime.evidence import EvidencePersistenceError, EvidenceWriter
 from app.agent_runtime.normalization import NormalizationRegistry
 from app.agent_runtime.tools.contracts import arguments_hash, logical_call_id_for
 from app.agent_runtime.tools.mcp import _extract_scope_period
@@ -38,7 +39,8 @@ from app.pi_gateway.accounting import (
     TenantAccountingError,
     TenantAccountingService,
 )
-from app.mcp_gateway.models import McpToolCatalog, McpToolDiscovery
+from app.pi_gateway.result import validate_reviewed_result_json
+from app.mcp_gateway.models import McpToolCatalog
 from app.mcp_gateway.contracts import DataTapService
 from app.mcp_gateway.registry import close_input_schema
 from app.mcp_gateway.validation import McpValidationError, validate_input, validate_output
@@ -62,6 +64,11 @@ from .events import (
     parse_source_event_id,
 )
 from .scheduler import PiRunScheduler
+from .result import (
+    McpResultEnvelopeError,
+    parse_mcp_result_details,
+)
+from .completion import CompletionValidator, close_open_runtime_rows
 
 
 class PiGatewayLeaseError(ValueError):
@@ -128,13 +135,7 @@ def _adapter_catalog_entry(
     row: McpToolCatalog,
     discovered_remote_name: str | None = None,
 ) -> PiGatewayAdapterCatalogEntry:
-    """Build the server-owned catalog entry used by claim and preflight.
-
-    ``McpToolCatalog.internal_tool_name`` is the stable model-facing name.  A
-    live discovery row carries the remote name; falling back to the internal
-    name is only valid for the reviewed dynamic tools whose provider exposes
-    that name verbatim.  The gateway never receives an unreviewed caller value.
-    """
+    """Build the server-owned catalog entry shape for snapshot creation/tests."""
     remote_name = discovered_remote_name or row.internal_tool_name
     digest = row.discovery_digest
     return PiGatewayAdapterCatalogEntry(
@@ -224,34 +225,14 @@ class PiGatewayService:
                 config_version_id=run.runtime_config_version_id,
                 gateway_id=self.gateway_id,
             )
-            rows = (
-                await self.db.execute(
-                    select(McpToolCatalog, McpToolDiscovery.remote_name)
-                    .outerjoin(
-                        McpToolDiscovery,
-                        and_(
-                            McpToolDiscovery.service_slug == McpToolCatalog.service_slug,
-                            McpToolDiscovery.discovery_digest == McpToolCatalog.discovery_digest,
-                            McpToolDiscovery.review_status == "approved",
-                        ),
-                    )
-                    .where(
-                        McpToolCatalog.review_status == "approved",
-                        McpToolCatalog.is_enabled.is_(True),
-                    )
-                    .order_by(McpToolCatalog.internal_tool_name)
-                    .limit(32)
-                )
-            ).all()
-            adapter_catalog = [_adapter_catalog_entry(row, remote_name) for row, remote_name in rows]
-            # Bind the adapter mapping into the claimed snapshot.  Preflight
-            # later re-reads the catalog and compares this exact projection;
-            # the Gateway cannot self-report a remote name or schema digest.
-            snapshot["adapter_catalog"] = [entry.model_dump(mode="json") for entry in adapter_catalog]
-            # The runtime config itself is immutable after claim; this is the
-            # claim-time catalog observation that binds adapter-visible names
-            # to the immutable Run snapshot used by preflight.
-            run.runtime_config_snapshot_json = snapshot
+            try:
+                adapter_catalog = [
+                    PiGatewayAdapterCatalogEntry.model_validate(entry)
+                    for entry in snapshot.get("adapter_catalog", [])
+                ]
+            except Exception as exc:
+                await self.db.rollback()
+                raise PiGatewayClaimError("pi_gateway_snapshot_catalog_invalid") from exc
             messages = await self.db.scalars(
                 select(AgentMessage)
                 .where(AgentMessage.session_id == run.session_id)
@@ -505,25 +486,8 @@ class PiGatewayService:
         )
 
     async def has_assistant_completion(self, run: AgentRun) -> bool:
-        """True once the Run has a persisted assistant completion.
-
-        A ``completed``/``completed_with_warnings`` terminal is only legal
-        after the merged assistant message (or its ``message.completed``
-        event) is durable; usage or tool events never satisfy this gate.
-        """
-        message_id = await self.db.scalar(
-            select(AgentMessage.id)
-            .where(AgentMessage.run_id == run.id, AgentMessage.role == "assistant")
-            .limit(1)
-        )
-        if message_id is not None:
-            return True
-        event_id = await self.db.scalar(
-            select(AgentEvent.id)
-            .where(AgentEvent.run_id == run.id, AgentEvent.event_type == "message.completed")
-            .limit(1)
-        )
-        return event_id is not None
+        """兼容旧调用方，但成功判定统一委托给 CompletionValidator。"""
+        return bool(await CompletionValidator(self.db).validate(run))
 
     async def preflight_mcp(
         self,
@@ -688,45 +652,65 @@ class PiGatewayService:
         details = request.details
         mode = details.get("mode")
         accounting = TenantAccountingService(self.db)
-        if mode in {"call", "mcpResult"}:
-            raw_result = details.get("mcpResult")
-            structured = (
-                raw_result.get("structuredContent") if isinstance(raw_result, Mapping) else None
-            )
-            if structured is None:
-                # 上游成功但无结构化内容：结算积分、failed+succeeded_empty、不写 Evidence。
+        if mode == "mcpResult":
+            try:
+                parsed_result = parse_mcp_result_details(details)
+            except McpResultEnvelopeError as exc:
+                # A malformed finalize request does not prove what the
+                # provider did.  Keep the reservation for admin reconciliation
+                # instead of accepting a legacy/raw payload or releasing money.
+                raise TenantAccountingError(exc.code) from exc
+            if parsed_result.upstream_request_id is not None:
+                if (
+                    call.upstream_request_id is not None
+                    and call.upstream_request_id != parsed_result.upstream_request_id
+                ):
+                    raise TenantAccountingError("mcp_upstream_request_id_conflict")
+                call.upstream_request_id = parsed_result.upstream_request_id
+            if parsed_result.result_status == "empty":
+                # Confirmed success with no payload: settle the fixed fee, but
+                # keep Evidence absent and distinguish it from unknown.
                 receipt = await accounting.settle_mcp_call(request.permit_id, details)
                 status = "succeeded_empty"
+            elif parsed_result.result_status == "unavailable":
+                # The provider result is confirmed, but the payload cannot be
+                # trusted/retrieved.  It is billable and must not become
+                # result_unknown.
+                receipt = await accounting.settle_mcp_call(request.permit_id, details)
+                status = "result_unavailable"
             else:
-                validated = self._validate_mcp_output(call, structured)
+                validated = self._validate_mcp_output(call, parsed_result.structured_content)
                 if validated is None:
                     await accounting.fail_mcp_call(request.permit_id, "failed_confirmed")
                     receipt = None
                     status = "failed_confirmed"
                 else:
                     scope, period = _extract_scope_period(call.arguments_json or {})
-                    await EvidenceWriter(self.db).write(
-                        session_id=run.session_id,
-                        run_id=run.id,
-                        tool_call_id=call.id,
-                        source_type="mcp",
-                        source_name=call.internal_tool_name,
-                        scope_json=scope,
-                        period_json=period,
-                        raw_payload=validated,
-                        normalization=NormalizationRegistry().normalize(
-                            call.internal_tool_name, validated
-                        ),
-                    )
-                    receipt = await accounting.settle_mcp_call(request.permit_id, details)
-                    status = "settled"
-        elif mode == "error":
-            classification = details.get("classification", "result_unknown")
-            await accounting.fail_mcp_call(request.permit_id, str(classification))
-            receipt = None
-            status = str(classification)
+                    try:
+                        async with self.db.begin_nested():
+                            await EvidenceWriter(self.db).write(
+                                session_id=run.session_id,
+                                run_id=run.id,
+                                tool_call_id=call.id,
+                                source_type="mcp",
+                                source_name=call.internal_tool_name,
+                                scope_json=scope,
+                                period_json=period,
+                                raw_payload=validated,
+                                normalization=NormalizationRegistry().normalize(
+                                    call.internal_tool_name, validated
+                                ),
+                            )
+                    except (EvidencePersistenceError, TypeError, ValueError):
+                        # MCP 已确认成功；本地 Evidence 不可持久化时仍结算，
+                        # 并显式标记 unavailable，绝不让 Gateway fallback 成 unknown。
+                        receipt = await accounting.settle_mcp_call(request.permit_id, details)
+                        status = "result_unavailable"
+                    else:
+                        receipt = await accounting.settle_mcp_call(request.permit_id, details)
+                        status = "settled"
         else:
-            raise TenantAccountingError("mcp_result_mode_invalid")
+            raise TenantAccountingError("mcp_result_envelope_invalid")
         await self._update_mcp_call_status(request.permit_id, status)
         await self.db.flush()
         return {"permit_id": request.permit_id, "status": status, "receipt": receipt.model_dump(mode="json") if receipt else None}
@@ -741,9 +725,14 @@ class PiGatewayService:
         if entry is None:
             return None
         _remote_name, _description, output_schema = entry
+        if not validate_reviewed_result_json(call.service, output_schema, structured):
+            return None
         try:
-            return validate_output(structured, output_schema)
+            validated = validate_output(structured, output_schema)
+            return validated
         except McpValidationError:
+            return None
+        except (TypeError, ValueError, json.JSONDecodeError):
             return None
 
     async def fail_mcp(self, run: AgentRun, permit_id: str, classification: str) -> None:
@@ -781,8 +770,14 @@ class PiGatewayService:
             call.points_reserved = 0
         elif status == "succeeded_empty":
             # 上游成功但无结构化内容：积分已结算，产物不可用，不留 Evidence。
-            call.status = "failed"
+            call.status = "settled"
             call.error_type = "succeeded_empty"
+            call.points_settled = 10
+            call.points_reserved = 0
+        elif status == "result_unavailable":
+            call.status = "settled"
+            call.error_type = "result_unavailable"
+            call.safe_error_message = "confirmed MCP success without a retrievable payload"
             call.points_settled = 10
             call.points_reserved = 0
         elif status == "result_unknown":
@@ -795,6 +790,55 @@ class PiGatewayService:
             )
             call.points_reserved = 0
         call.completed_at = self.now_fn()
+        await self._close_tool_step_if_terminal(call, status)
+
+    async def _close_tool_step_if_terminal(self, call: AgentToolCall, terminal_status: str) -> None:
+        """在 Pi MCP 调用终态后关闭其 durable AgentStep。
+
+        Pi Gateway 的 MCP 钩子不会经过 ``AgentEngine`` 的普通 tool-step 收尾，
+        因而必须在同一个事务里把最后一个调用所属的 step 也推进到终态。多个
+        MCP 调用可以共享一个 step；只有该 step 下没有 planned/reserved/running
+        调用时才允许关闭，避免终结检查看到半开放的 step。
+        """
+        step = await self.db.scalar(
+            select(AgentStep)
+            .where(AgentStep.id == call.step_id)
+            .with_for_update()
+        )
+        if step is None or step.status != "running":
+            return
+        open_call = await self.db.scalar(
+            select(AgentToolCall.id)
+            .where(
+                AgentToolCall.step_id == step.id,
+                AgentToolCall.status.in_(("planned", "reserved", "running")),
+            )
+            .limit(1)
+        )
+        if open_call is not None:
+            return
+        terminal_calls = list(
+            (
+                await self.db.scalars(
+                    select(AgentToolCall).where(AgentToolCall.step_id == step.id)
+                )
+            ).all()
+        )
+        step.status = (
+            "failed"
+            if terminal_status in ("result_unknown", "failed_confirmed", "definitely_not_sent")
+            or any(item.status == "unknown" for item in terminal_calls)
+            else "completed"
+        )
+        step.output_json = {
+            **(step.output_json or {}),
+            "mcp_terminal_status": terminal_status,
+            "tool_call_count": len(terminal_calls),
+        }
+        step.duration_ms = max(
+            0,
+            int((self.now_fn() - step.created_at).total_seconds() * 1000),
+        )
 
     async def _feature_allowed(self, tenant_id: str, user_id: str, feature: str) -> bool:
         from app.licensing.service import LicenseService
@@ -826,20 +870,8 @@ class PiGatewayRecoveryService:
         self.scheduler = PiRunScheduler(db, lease_seconds=lease_seconds, now_fn=self.now_fn)
 
     async def _has_durable_completion(self, run: AgentRun) -> bool:
-        """durable completion：已持久化的 assistant 消息或 message.completed 事件。"""
-        message_id = await self.db.scalar(
-            select(AgentMessage.id)
-            .where(AgentMessage.run_id == run.id, AgentMessage.role == "assistant")
-            .limit(1)
-        )
-        if message_id is not None:
-            return True
-        event_id = await self.db.scalar(
-            select(AgentEvent.id)
-            .where(AgentEvent.run_id == run.id, AgentEvent.event_type == "message.completed")
-            .limit(1)
-        )
-        return event_id is not None
+        """兼容旧恢复调用方，但不再提供 assistant-only 成功判定。"""
+        return bool(await CompletionValidator(self.db).validate(run))
 
     async def recover_expired_run(self, run_id: str) -> Literal["requeued", "failed", "completed", "ignored"]:
         """Atomically consume one expired Gateway lease.
@@ -879,12 +911,11 @@ class PiGatewayRecoveryService:
             .order_by(AgentRunAttempt.attempt.desc())
             .with_for_update()
         )
-        if await self._has_durable_completion(run):
-            # durable completion 已存在（terminal ACK 丢失场景）：幂等收口为
-            # completed，绝不新起 Attempt——新 Attempt 会重放模型与 MCP 外发。
-            # 开放 ToolCall 置 unknown、Attempt 关闭、lease/session/租户计数
-            # 释放与终态事件全部在同一个事务内完成。
-            await self._mark_attempt_tool_calls_unknown(attempt, now)
+        completion_validator = CompletionValidator(self.db)
+        completion = await completion_validator.validate(run)
+        if completion.ok:
+            # durable completion 已存在且满足完整业务契约（terminal ACK 丢失）：
+            # 幂等收口为 completed，绝不新起 Attempt。
 
             async def complete_before_commit(locked_run: AgentRun) -> None:
                 # force_complete 已处理 lease_owner/session slot/Attempt；
@@ -903,10 +934,33 @@ class PiGatewayRecoveryService:
                 RunStatus.COMPLETED,
                 {"recovered_after_terminal_ack_lost": True},
                 before_commit=complete_before_commit,
-                allow_system_completion=self._has_durable_completion,
+                completion_validator=completion_validator.validate,
             )
             await self._reconcile_after_terminal(run.id)
             return "completed" if event is not None or run.status == RunStatus.COMPLETED else "ignored"
+        if completion.code != "pi_gateway_terminal_missing_completion":
+            # assistant 已落库但 artifact/Step/MCP 契约不满足时是稳定业务失败，
+            # 不能把它误判为基础设施丢失而启动新 Attempt。
+            async def invalid_completion_before_commit(locked_run: AgentRun) -> None:
+                await close_open_runtime_rows(
+                    self.db,
+                    locked_run.id,
+                    self.now_fn(),
+                    error_code=completion.code or "pi_gateway_completion_rejected",
+                )
+                await self.scheduler.release_run(locked_run)
+                if session.active_run_id == locked_run.id:
+                    session.active_run_id = None
+
+            event = await AgentEventStream(self.db, self.broker).settle_terminal(
+                run.id,
+                run.user_id,
+                RunStatus.FAILED,
+                {"error_code": completion.code or "pi_gateway_completion_rejected"},
+                before_commit=invalid_completion_before_commit,
+            )
+            await self._reconcile_after_terminal(run.id)
+            return "failed" if event is not None or run.status == RunStatus.FAILED else "ignored"
         if run.infrastructure_retry_count < 1:
             await self._mark_attempt_tool_calls_unknown(attempt, now)
             if attempt is not None:
@@ -920,6 +974,12 @@ class PiGatewayRecoveryService:
             return "requeued"
 
         async def before_commit(locked_run: AgentRun) -> None:
+            await close_open_runtime_rows(
+                self.db,
+                locked_run.id,
+                self.now_fn(),
+                error_code="pi_infrastructure_retry_exhausted",
+            )
             await self.scheduler.release_run(locked_run)
             if session.active_run_id == locked_run.id:
                 session.active_run_id = None
@@ -980,6 +1040,12 @@ class PiGatewayRecoveryService:
                 release_reserved=True,
                 user_id=locked_run.user_id,
             )
+            await close_open_runtime_rows(
+                self.db,
+                locked_run.id,
+                self.now_fn(),
+                error_code="cancel_requested",
+            )
             await self.scheduler.release_run(locked_run)
             if session.active_run_id == locked_run.id:
                 session.active_run_id = None
@@ -1013,19 +1079,43 @@ class PiGatewayRecoveryService:
         """Fence incomplete MCP calls before recovery or cancellation is visible."""
         if attempt is None:
             return
+        steps = (
+            await self.db.scalars(
+                select(AgentStep)
+                .where(AgentStep.attempt_id == attempt.id, AgentStep.status == "running")
+                .with_for_update()
+            )
+        ).all()
+        for step in steps:
+            step.status = "failed"
+            step.output_json = {
+                **(step.output_json or {}),
+                "error_code": "pi_gateway_attempt_lost",
+                "terminal_cleanup": True,
+            }
         calls = (
             await self.db.scalars(
                 select(AgentToolCall)
                 .join(AgentStep, AgentStep.id == AgentToolCall.step_id)
                 .where(
                     AgentStep.attempt_id == attempt.id,
-                    AgentToolCall.status.in_(("reserved", "running")),
+                    AgentToolCall.status.in_(("planned", "reserved", "running")),
                 )
                 .with_for_update()
             )
         ).all()
         accounting = AgentMcpAccounting(self.db) if release_reserved else None
         for call in calls:
+            if call.status == "planned":
+                # planned 仍在 durable-before-send 之前；Recovery 可以确认未
+                # 外发，关闭为 definitely_not_sent，后续同 logical_call_id
+                # 仍可按既有一次性重试规则重新准备。
+                call.status = "failed"
+                call.error_type = DEFINITELY_NOT_SENT
+                call.points_reserved = 0
+                call.completed_at = now
+                call.safe_error_message = "gateway lost before external dispatch"
+                continue
             if release_reserved and call.status == "reserved":
                 if user_id is None or accounting is None:
                     raise ValueError("pi_recovery_user_required_for_reserved_release")

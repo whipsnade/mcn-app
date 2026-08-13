@@ -66,6 +66,11 @@ export interface RuntimeSnapshot {
   rootPolicy: string;
   skillCatalog: readonly SkillCatalogEntry[];
   adapterCatalog: readonly AdapterCatalogEntry[];
+  /** Server-resolved profile capability captured at Run creation. */
+  profileName?: string;
+  requiredArtifactContract?: string | null;
+  capabilityPackVersion?: string;
+  capabilityPackManifestDigest?: string;
   /**
    * Server-owned per-Run model decision budget (runtime config
    * ``limits.max_decisions``).  Enforced synchronously at the provider

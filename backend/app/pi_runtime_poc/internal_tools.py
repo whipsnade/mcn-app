@@ -69,18 +69,42 @@ PIPOC_PROFILE = AgentProfile(
 
 def build_pi_internal_registry(*, db: AsyncSession, worker_id: str) -> ToolRegistry:
     """构建只含白名单工具的 Registry；不注册任何 MCP/计算/Draft 直写工具。"""
+    # Pi request handlers already own the leased Run lock; use the request
+    # transaction for guard persistence instead of a nested SessionFactory.
+    durable_session_factory = None
     registry = ToolRegistry()
     registry.register(ReadArtifactTool(db), category=HISTORY_TOOLS)
-    registry.register(SearchEvidenceTool(db), category=HISTORY_TOOLS)
+    registry.register(
+        SearchEvidenceTool(db, durable_session_factory=durable_session_factory),
+        category=HISTORY_TOOLS,
+    )
     registry.register(ReadToolResultTool(db), category=HISTORY_TOOLS)
     registry.register(GetSessionContextTool(db), category=HISTORY_TOOLS)
     registry.register(LoadMarketingSkillTool(db), category=HISTORY_TOOLS)
-    registry.register(BuildBrandReportDraftTool(db), category=ARTIFACT_TOOLS)
-    registry.register(BuildCampaignReportDraftTool(db), category=ARTIFACT_TOOLS)
-    registry.register(BuildKolSelectionDraftTool(db), category=ARTIFACT_TOOLS)
-    registry.register(BuildKolAnalysisDraftTool(db), category=ARTIFACT_TOOLS)
-    registry.register(BuildKolDetailDraftTool(db), category=ARTIFACT_TOOLS)
-    registry.register(BuildInsightDraftTool(db), category=ARTIFACT_TOOLS)
+    registry.register(
+        BuildBrandReportDraftTool(db, durable_session_factory=durable_session_factory),
+        category=ARTIFACT_TOOLS,
+    )
+    registry.register(
+        BuildCampaignReportDraftTool(db, durable_session_factory=durable_session_factory),
+        category=ARTIFACT_TOOLS,
+    )
+    registry.register(
+        BuildKolSelectionDraftTool(db, durable_session_factory=durable_session_factory),
+        category=ARTIFACT_TOOLS,
+    )
+    registry.register(
+        BuildKolAnalysisDraftTool(db, durable_session_factory=durable_session_factory),
+        category=ARTIFACT_TOOLS,
+    )
+    registry.register(
+        BuildKolDetailDraftTool(db, durable_session_factory=durable_session_factory),
+        category=ARTIFACT_TOOLS,
+    )
+    registry.register(
+        BuildInsightDraftTool(db, durable_session_factory=durable_session_factory),
+        category=ARTIFACT_TOOLS,
+    )
     registry.register(PublishArtifactsTool(db, worker_id=worker_id), category=ARTIFACT_TOOLS)
     registry.register(RequestClarificationTool(db, worker_id=worker_id), category=HISTORY_TOOLS)
     return registry

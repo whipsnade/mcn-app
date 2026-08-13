@@ -523,7 +523,7 @@ def build_real_pi_client_factory(settings: Settings) -> Callable[[AgentRun, str]
     def factory(run: AgentRun, token: str) -> object:
         try:
             capability = MarketingRunCapability.model_validate(
-                (run.prompt_snapshot_json or {}).get("marketing_capability_pack")
+                (run.runtime_config_snapshot_json or {}).get("capability_pack")
             )
         except ValueError as exc:
             raise ValueError("pi_marketing_capability_snapshot_invalid") from exc

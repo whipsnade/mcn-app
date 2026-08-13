@@ -29,18 +29,44 @@ from app.agent_runtime.tools.registry import ToolRegistry
 
 def build_production_internal_registry(*, db: AsyncSession, worker_id: str) -> ToolRegistry:
     """构建生产 Gateway 的 B0 Registry，不依赖 POC 模块或旁路。"""
+    # The authenticated route locks the leased Run before dispatching the
+    # internal tool. Guard writes therefore share this transaction; opening a
+    # second SessionFactory transaction here would wait on the Run lock held by
+    # this very request and starve heartbeat/terminal traffic.
+    durable_session_factory = None
     registry = ToolRegistry()
     registry.register(ReadArtifactTool(db), category=HISTORY_TOOLS)
-    registry.register(SearchEvidenceTool(db), category=HISTORY_TOOLS)
+    registry.register(
+        SearchEvidenceTool(db, durable_session_factory=durable_session_factory),
+        category=HISTORY_TOOLS,
+    )
     registry.register(ReadToolResultTool(db), category=HISTORY_TOOLS)
     registry.register(GetSessionContextTool(db), category=HISTORY_TOOLS)
     registry.register(LoadMarketingSkillTool(db), category=HISTORY_TOOLS)
-    registry.register(BuildBrandReportDraftTool(db), category=ARTIFACT_TOOLS)
-    registry.register(BuildCampaignReportDraftTool(db), category=ARTIFACT_TOOLS)
-    registry.register(BuildKolSelectionDraftTool(db), category=ARTIFACT_TOOLS)
-    registry.register(BuildKolAnalysisDraftTool(db), category=ARTIFACT_TOOLS)
-    registry.register(BuildKolDetailDraftTool(db), category=ARTIFACT_TOOLS)
-    registry.register(BuildInsightDraftTool(db), category=ARTIFACT_TOOLS)
+    registry.register(
+        BuildBrandReportDraftTool(db, durable_session_factory=durable_session_factory),
+        category=ARTIFACT_TOOLS,
+    )
+    registry.register(
+        BuildCampaignReportDraftTool(db, durable_session_factory=durable_session_factory),
+        category=ARTIFACT_TOOLS,
+    )
+    registry.register(
+        BuildKolSelectionDraftTool(db, durable_session_factory=durable_session_factory),
+        category=ARTIFACT_TOOLS,
+    )
+    registry.register(
+        BuildKolAnalysisDraftTool(db, durable_session_factory=durable_session_factory),
+        category=ARTIFACT_TOOLS,
+    )
+    registry.register(
+        BuildKolDetailDraftTool(db, durable_session_factory=durable_session_factory),
+        category=ARTIFACT_TOOLS,
+    )
+    registry.register(
+        BuildInsightDraftTool(db, durable_session_factory=durable_session_factory),
+        category=ARTIFACT_TOOLS,
+    )
     registry.register(PublishArtifactsTool(db, worker_id=worker_id), category=ARTIFACT_TOOLS)
     registry.register(RequestClarificationTool(db, worker_id=worker_id), category=HISTORY_TOOLS)
     return registry

@@ -55,6 +55,35 @@ function safeDelta(value: unknown): string | undefined {
     : undefined;
 }
 
+const DELTA_BATCH_MAX_BYTES = 4 * 1024;
+const DELTA_BATCH_MAX_PARTS = 32;
+const DELTA_BATCH_MAX_WAIT_MS = 50;
+type DeltaChannel = "thinking" | "message";
+type DeltaBatch = {
+  text: string;
+  bytes: number;
+  parts: number;
+  startedAt: number;
+};
+
+function utf8Bytes(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
+}
+
+function takeUtf8Prefix(value: string, maxBytes: number): [string, string] {
+  const chars = Array.from(value);
+  let used = 0;
+  let count = 0;
+  for (const char of chars) {
+    const bytes = utf8Bytes(char);
+    if (used + bytes > maxBytes) break;
+    used += bytes;
+    count += 1;
+    if (used >= maxBytes) break;
+  }
+  return [chars.slice(0, count).join(""), chars.slice(count).join("")];
+}
+
 function safeEventId(event: RecordValue): string | undefined {
   for (const key of ["eventId", "event_id", "messageId", "message_id", "id"]) {
     const value = safeString(event[key]);
@@ -135,6 +164,7 @@ export class PiSdkUsageProjector {
   /** 当前 turn 序号（turn_start 递增）与本 turn 是否已产出 usage 记录。 */
   private turnIndex = 0;
   private usageEmittedThisTurn = false;
+  private readonly deltaBatches: Partial<Record<DeltaChannel, DeltaBatch>> = {};
   readonly diagnostics: UsageProjectorDiagnostics = {
     unknownEvents: 0,
     invalidUsage: 0,
@@ -159,6 +189,23 @@ export class PiSdkUsageProjector {
       this.diagnostics.unknownEvents += 1;
       return [];
     }
+    const update = event.type === "message_update" && isRecord(event.assistantMessageEvent)
+      ? event.assistantMessageEvent
+      : undefined;
+    const deltaType = update?.type;
+    const deltaChannel: DeltaChannel | undefined = deltaType === "thinking_delta"
+      ? "thinking"
+      : deltaType === "text_delta"
+        ? "message"
+        : undefined;
+    // Non-delta SDK events are hard boundaries. They flush before their own
+    // event so message.completed/tool/usage/turn ordering remains durable.
+    const prefix = deltaChannel === undefined ? this.flush() : this.flushIfDue();
+    if (deltaChannel !== undefined) {
+      const delta = safeDelta(update?.delta);
+      if (!delta) return prefix;
+      return [...prefix, ...this.appendDelta(deltaChannel, delta)];
+    }
     if (event.type === "agent_start") {
       this.turnIndex = 0;
       this.usageEmittedThisTurn = false;
@@ -174,7 +221,6 @@ export class PiSdkUsageProjector {
       this.pendingCompletionText = undefined;
     }
     if (event.type === "message_update") {
-      const update = event.assistantMessageEvent;
       if (isRecord(update) && (update.type === "text_end" || update.type === "done")) {
         const candidate = extractCompletionCandidate(event);
         if (candidate) this.pendingCompletionText = candidate;
@@ -183,7 +229,7 @@ export class PiSdkUsageProjector {
     const isTurnBoundary = event.type === "agent_end" || event.type === "turn_end";
     const generic = genericProjection(event);
     const usage = usageObject(event);
-    const out: PiGatewaySourceEvent[] = [];
+    const out: PiGatewaySourceEvent[] = [...prefix];
     if (isTurnBoundary && this.pendingCompletionText && !this.completionEmitted) {
       // 最终回答：completion 先于 turn.end 与 usage 发布，每 Attempt 恰好一次。
       this.completionEmitted = true;
@@ -223,6 +269,73 @@ export class PiSdkUsageProjector {
       }
     }
     return out;
+  }
+
+  /** Flush all pending delta batches at a semantic boundary or worker exit. */
+  flush(): PiGatewaySourceEvent[] {
+    const pending = Object.entries(this.deltaBatches)
+      .filter((entry): entry is [DeltaChannel, DeltaBatch] => entry[1] !== undefined)
+      .sort((left, right) => (left[1]?.startedAt ?? 0) - (right[1]?.startedAt ?? 0));
+    const events: PiGatewaySourceEvent[] = [];
+    for (const [channel, batch] of pending) {
+      delete this.deltaBatches[channel];
+      events.push(
+        this.nextEvent(channel === "thinking" ? "thinking.delta" : "message.delta", {
+          text: batch.text,
+          delta_count: batch.parts,
+          batched: true,
+        }),
+      );
+    }
+    return events;
+  }
+
+  /** Timer-friendly bounded wait check; it never blocks the event loop. */
+  flushIfDue(now = Date.now()): PiGatewaySourceEvent[] {
+    const due = Object.values(this.deltaBatches).some(
+      (batch) => batch !== undefined && now - batch.startedAt >= DELTA_BATCH_MAX_WAIT_MS,
+    );
+    return due ? this.flush() : [];
+  }
+
+  private appendDelta(channel: DeltaChannel, value: string): PiGatewaySourceEvent[] {
+    let remaining = value;
+    const events: PiGatewaySourceEvent[] = [];
+    while (remaining.length > 0) {
+      let batch = this.deltaBatches[channel];
+      if (!batch || batch.parts >= DELTA_BATCH_MAX_PARTS || batch.bytes >= DELTA_BATCH_MAX_BYTES) {
+        if (batch) events.push(...this.flushChannel(channel));
+        batch = { text: "", bytes: 0, parts: 0, startedAt: Date.now() };
+        this.deltaBatches[channel] = batch;
+      }
+      const remainingBytes = DELTA_BATCH_MAX_BYTES - batch.bytes;
+      const [part, rest] = takeUtf8Prefix(remaining, remainingBytes);
+      if (!part) {
+        events.push(...this.flushChannel(channel));
+        continue;
+      }
+      batch.text += part;
+      batch.bytes += utf8Bytes(part);
+      batch.parts += 1;
+      remaining = rest;
+      if (batch.parts >= DELTA_BATCH_MAX_PARTS || batch.bytes >= DELTA_BATCH_MAX_BYTES) {
+        events.push(...this.flushChannel(channel));
+      }
+    }
+    return events;
+  }
+
+  private flushChannel(channel: DeltaChannel): PiGatewaySourceEvent[] {
+    const batch = this.deltaBatches[channel];
+    if (!batch) return [];
+    delete this.deltaBatches[channel];
+    return [
+      this.nextEvent(channel === "thinking" ? "thinking.delta" : "message.delta", {
+        text: batch.text,
+        delta_count: batch.parts,
+        batched: true,
+      }),
+    ];
   }
 
   private nextEvent(eventType: string, payload: RecordValue): PiGatewaySourceEvent {

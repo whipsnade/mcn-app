@@ -49,12 +49,15 @@ from app.agent_runtime.evidence import (
 )
 from app.agent_runtime.models import (
     AgentMessage,
+    AgentRun,
     AgentSession,
     EvidenceItem,
     MemoryEntry,
 )
 from app.agent_runtime.repository import utc_now
 from app.agent_runtime.tools.contracts import ToolContext, ToolResult
+from app.db.session import SessionFactory
+from app.pi_gateway.loop_guard import LoopGuard
 
 # 与 mcp_gateway.transport.JsonValue 同义，但用 TypeAliasType 声明：py311 下
 # pydantic 无法为 typing.TypeAlias 的隐式递归别名生成 Schema（RecursionError）。
@@ -201,7 +204,6 @@ class ReadArtifactTool:
         _session, error = await _owned_session(self._db, context)
         if error is not None:
             return _failed(error, "session_" + error)
-
         artifact = await self._db.get(AgentArtifact, args.artifact_id)
         if artifact is None:
             return _failed(NOT_FOUND, "artifact_not_found")
@@ -354,8 +356,16 @@ class SearchEvidenceTool:
     points_cost = 0
     external_side_effect = False
 
-    def __init__(self, db_session: AsyncSession) -> None:
+    def __init__(
+        self,
+        db_session: AsyncSession,
+        *,
+        durable_session_factory: Any = SessionFactory,
+    ) -> None:
         self._db = db_session
+        # Pi Gateway passes None because its route already owns the Run lock;
+        # the ordinary executor keeps an isolated commit boundary.
+        self._durable_session_factory = durable_session_factory
 
     async def execute(self, context: ToolContext, arguments: BaseModel) -> ToolResult:
         args, parse_error = _parse_args(SearchEvidenceArgs, arguments)
@@ -364,6 +374,16 @@ class SearchEvidenceTool:
         _session, error = await _owned_session(self._db, context)
         if error is not None:
             return _failed(error, "session_" + error)
+        run = await self._db.get(AgentRun, context.run_id)
+        guard = (
+            LoopGuard(self._db, durable_session_factory=self._durable_session_factory)
+            if run is not None
+            else None
+        )
+        if guard is not None:
+            blocked = await guard.reject_if_open(run)
+            if blocked is not None:
+                return blocked
 
         conditions = [EvidenceItem.session_id == context.session_id]
         if args.artifact_id:
@@ -480,8 +500,17 @@ class SearchEvidenceTool:
             "matches": page,
         }
         # 逐项预算校验保证整个响应 <= 50KB（占位测量固定字段为最保守值）。
-        summary = json.dumps(summary_payload, ensure_ascii=False)
-        return ToolResult(status="success", safe_summary=summary)
+        result = ToolResult(
+            status="success",
+            safe_summary=json.dumps(summary_payload, ensure_ascii=False),
+        )
+        if guard is not None and run is not None:
+            return await guard.record_search_result(
+                run,
+                args.model_dump(mode="json"),
+                result,
+            )
+        return result
 
     @staticmethod
     def _matches(item: EvidenceItem, query: str) -> bool:

@@ -427,7 +427,8 @@ class KolDetailRunService:
                 raise PermissionError(license_decision.code)
             try:
                 runtime_snapshot = await RuntimeConfigService(self.db).snapshot_for_new_run(
-                    tenant_context.tenant_id
+                    tenant_context.tenant_id,
+                    profile_name="kol_detail_v1",
                 )
             except RuntimeConfigError as error:
                 raise PermissionError(str(error)) from error

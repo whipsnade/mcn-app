@@ -32,6 +32,33 @@ export interface McpFree {
   free: true;
 }
 
+export type McpResultStatus = "available" | "empty" | "unavailable";
+export type UnavailableReason =
+  | "payload_too_large"
+  | "payload_not_retrievable"
+  | "invalid_json_text"
+  | "unsupported_content"
+  | "local_persistence_failed";
+
+export type McpResultEnvelope =
+  | {
+      envelope: "mcp_result_v1";
+      result_status: "available";
+      structuredContent: unknown;
+      upstream_request_id?: string;
+    }
+  | {
+      envelope: "mcp_result_v1";
+      result_status: "empty";
+      upstream_request_id?: string;
+    }
+  | {
+      envelope: "mcp_result_v1";
+      result_status: "unavailable";
+      unavailable_reason: UnavailableReason;
+      upstream_request_id?: string;
+    };
+
 export interface McpAccountingControlPlane {
   preflight(input: McpToolCallInput): Promise<McpPermit | McpBlocked>;
   finalize(permit: McpPermit, result: unknown): Promise<unknown>;
@@ -42,13 +69,174 @@ const FREE_DISCOVERY_TOOLS = new Set(["connect", "search", "list"]);
 
 /**
  * finalize 载荷的有界上限：小于 IPC mcp_finalize 通道的 1 MiB 请求上限，
- * 为请求信封（permit_id、方法名、id）预留余量。超限结果降级
- * result_unknown，绝不截断后按成功结算。
+ * 为请求信封（permit_id、方法名、id）预留余量。超限结果标记为
+ * confirmed success but unavailable，绝不截断后按有 Evidence 成功结算。
  */
 export const MAX_FINALIZE_DETAILS_BYTES = 900 * 1024;
 
 function byteLength(value: unknown): number {
-  return new TextEncoder().encode(JSON.stringify(value)).byteLength;
+  try {
+    return new TextEncoder().encode(JSON.stringify(value)).byteLength;
+  } catch {
+    return Number.POSITIVE_INFINITY;
+  }
+}
+
+const UNAVAILABLE_REASONS = new Set<UnavailableReason>([
+  "payload_too_large",
+  "payload_not_retrievable",
+  "invalid_json_text",
+  "unsupported_content",
+  "local_persistence_failed",
+]);
+
+function isJsonValue(value: unknown): boolean {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (Array.isArray(value)) return value.every(isJsonValue);
+  if (!isRecord(value)) return false;
+  return Object.values(value).every(isJsonValue);
+}
+
+function isNonEmptyJsonValue(value: unknown): boolean {
+  if (!isJsonValue(value) || value === null) return false;
+  if (typeof value === "string") return value.trim().length > 0;
+  if (Array.isArray(value)) return value.length > 0;
+  if (isRecord(value)) return Object.keys(value).length > 0;
+  return true;
+}
+
+function containsTransportArtifactMarker(value: unknown): boolean {
+  if (Array.isArray(value)) return value.some(containsTransportArtifactMarker);
+  if (!isRecord(value)) return false;
+  for (const [key, item] of Object.entries(value)) {
+    if (["fullResultPath", "full_result_path", "resultWriteError", "resource", "image", "audio", "summary", "omitted"].includes(key)) {
+      return true;
+    }
+    if (["path", "filepath", "file_path", "temppath", "temp_path"].includes(key.toLowerCase()) &&
+        typeof item === "string" &&
+        ["/tmp/", "/private/tmp/", "/var/tmp/", "/var/folders/"].some((prefix) => item.startsWith(prefix))) {
+      return true;
+    }
+    if (containsTransportArtifactMarker(item)) return true;
+  }
+  return false;
+}
+
+function requestIdFrom(value: unknown): string | undefined {
+  if (!isRecord(value)) return undefined;
+  for (const container of [value, value.meta, value._meta]) {
+    if (!isRecord(container)) continue;
+    const requestId = container.requestId ?? container.request_id;
+    if (typeof requestId === "string" && requestId.length > 0 && requestId.length <= 128) {
+      return requestId;
+    }
+  }
+  return undefined;
+}
+
+function unavailable(
+  reason: UnavailableReason,
+  upstreamRequestId?: string,
+): Record<string, unknown> {
+  if (!UNAVAILABLE_REASONS.has(reason)) throw new Error("mcp_result_reason_invalid");
+  return {
+    mode: "mcpResult",
+    mcpResult: {
+      envelope: "mcp_result_v1",
+      result_status: "unavailable",
+      unavailable_reason: reason,
+      ...(upstreamRequestId === undefined ? {} : { upstream_request_id: upstreamRequestId }),
+    },
+  };
+}
+
+function empty(upstreamRequestId?: string): Record<string, unknown> {
+  return {
+    mode: "mcpResult",
+    mcpResult: {
+      envelope: "mcp_result_v1",
+      result_status: "empty",
+      ...(upstreamRequestId === undefined ? {} : { upstream_request_id: upstreamRequestId }),
+    },
+  };
+}
+
+function available(
+  structuredContent: unknown,
+  upstreamRequestId?: string,
+): Record<string, unknown> {
+  const mcpResult = {
+    envelope: "mcp_result_v1",
+    result_status: "available",
+    structuredContent,
+    ...(upstreamRequestId === undefined ? {} : { upstream_request_id: upstreamRequestId }),
+  };
+  if (byteLength({ mode: "mcpResult", mcpResult }) > MAX_FINALIZE_DETAILS_BYTES) {
+    return unavailable("payload_too_large", upstreamRequestId);
+  }
+  return { mode: "mcpResult", mcpResult };
+}
+
+/**
+ * Normalize the adapter's real CallToolResult shape at the only boundary that
+ * can see it.  Text is accepted only as one complete JSON text block.  No
+ * resource URI, image data, summary or temporary path is ever a payload.
+ */
+export function normalizeMcpResultEnvelope(
+  details: Record<string, unknown>,
+  content: unknown,
+): Record<string, unknown> {
+  const raw = isRecord(details.mcpResult) ? details.mcpResult : {};
+  const upstreamRequestId = requestIdFrom(raw) ?? requestIdFrom(details);
+  if (raw.omitted === true || raw.fullResultPath !== undefined) {
+    return unavailable("payload_not_retrievable", upstreamRequestId);
+  }
+  if (raw.resultWriteError !== undefined && raw.resultWriteError !== false && raw.resultWriteError !== null) {
+    return unavailable("local_persistence_failed", upstreamRequestId);
+  }
+  if (byteLength({ mode: "mcpResult", mcpResult: raw }) > MAX_FINALIZE_DETAILS_BYTES) {
+    return unavailable("payload_too_large", upstreamRequestId);
+  }
+
+  const hasNativeStructuredContent = Object.prototype.hasOwnProperty.call(raw, "structuredContent");
+  const native = raw.structuredContent;
+  if (hasNativeStructuredContent) {
+    if (isNonEmptyJsonValue(native) && !containsTransportArtifactMarker(native)) {
+      return available(native, upstreamRequestId);
+    }
+    // Native structuredContent is authoritative, including a valid empty
+    // value.  Never fall through to an unrelated text block and turn it into
+    // a different payload.
+    if (isJsonValue(native) && !containsTransportArtifactMarker(native)) return empty(upstreamRequestId);
+    return unavailable("unsupported_content", upstreamRequestId);
+  }
+
+  const blocks = Array.isArray(content) ? content : raw.content;
+  if (blocks === undefined || (Array.isArray(blocks) && blocks.length === 0)) {
+    return empty(upstreamRequestId);
+  }
+  if (!Array.isArray(blocks) || blocks.length !== 1 || !isRecord(blocks[0])) {
+    return unavailable("unsupported_content", upstreamRequestId);
+  }
+  const block = blocks[0];
+  if (block.type !== "text") return unavailable("unsupported_content", upstreamRequestId);
+  if (typeof block.text !== "string" || block.text.trim().length === 0) {
+    return empty(upstreamRequestId);
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(block.text);
+  } catch {
+    return unavailable("invalid_json_text", upstreamRequestId);
+  }
+  if (containsTransportArtifactMarker(parsed)) {
+    return unavailable("unsupported_content", upstreamRequestId);
+  }
+  if (!isNonEmptyJsonValue(parsed)) {
+    return empty(upstreamRequestId);
+  }
+  return available(parsed, upstreamRequestId);
 }
 
 /**
@@ -200,6 +388,10 @@ export function createMcpAccountingExtensionFactory(
       if (!permit) return;
       const details = isRecord(event.details) ? event.details : {};
       const errorCode = typeof details.error === "string" ? details.error : undefined;
+      const hasErrorMarker = Object.prototype.hasOwnProperty.call(details, "error")
+        && details.error !== undefined
+        && details.error !== null
+        && details.error !== false;
       // permit 只能在控制面 durable ACK 之后删除；任何 ACK 失败都把结果降级
       // 为 result_unknown（保留预留、禁止重放），仍失败则保留 permit 由
       // 恢复/对账兜底。
@@ -208,21 +400,13 @@ export function createMcpAccountingExtensionFactory(
         permits.delete(event.toolCallId);
       };
       try {
-        if (event.isError || errorCode !== undefined) {
+        if (event.isError || hasErrorMarker || errorCode !== undefined) {
           // 带 details.error 的结果绝不进入成功结算分支；isError 由谁置位无关。
           await accounting.afterToolError(permit, classifyMcpFailure(errorCode, details));
           permits.delete(event.toolCallId);
           return;
         }
-        const payload = {
-          ...details,
-          mode: typeof details.mode === "string" ? details.mode : "mcpResult",
-        };
-        if (byteLength(payload) > MAX_FINALIZE_DETAILS_BYTES) {
-          // 超大有界上限的结果不参与成功结算（避免截断写库假成功）。
-          await failAsUnknown();
-          return;
-        }
+        const payload = normalizeMcpResultEnvelope(details, event.content);
         await accounting.afterToolResult(permit, payload);
         permits.delete(event.toolCallId);
       } catch {

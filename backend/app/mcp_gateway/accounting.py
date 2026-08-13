@@ -137,12 +137,20 @@ class McpAccounting:
         row.upstream_request_id = outcome.upstream_request_id
         row.response_hash = outcome.response_hash
         row.evidence_json = {
-            "outcome": "succeeded",
+            "outcome": (
+                "succeeded_empty" if outcome.result_status == "empty"
+                else "result_unavailable" if outcome.result_status == "unavailable"
+                else "succeeded"
+            ),
             "structured_content": outcome.validated_output,
             "upstream_request_id": outcome.upstream_request_id,
         }
-        row.error_type = None
-        row.error_message = None
+        row.error_type = (
+            "succeeded_empty" if outcome.result_status == "empty"
+            else "result_unavailable" if outcome.result_status == "unavailable"
+            else None
+        )
+        row.error_message = row.error_type
         row.completed_at = now
         row.updated_at = now
         await self._db.flush()

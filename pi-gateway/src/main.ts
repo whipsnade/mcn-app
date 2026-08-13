@@ -68,6 +68,17 @@ export function mapClaimRuntimeSnapshot(snapshot: Record<string, unknown>): Runt
     typeof model.provider === "string" && model.provider.length > 0 ? model.provider : "custom";
   const capabilityPack = snapshot.capability_pack;
   if (!isRecord(capabilityPack)) snapshotError();
+  const profileName = snapshot.profile_name;
+  const requiredArtifactContract = snapshot.required_artifact_contract;
+  const capabilityPackVersion = snapshot.capability_pack_version;
+  const capabilityPackManifestDigest = snapshot.capability_pack_manifest_digest;
+  if (profileName !== undefined && (typeof profileName !== "string" || profileName.length === 0)) snapshotError();
+  if (requiredArtifactContract !== undefined && requiredArtifactContract !== null && (typeof requiredArtifactContract !== "string" || requiredArtifactContract.length === 0)) snapshotError();
+  if (capabilityPackVersion !== undefined && (typeof capabilityPackVersion !== "string" || capabilityPackVersion.length === 0)) snapshotError();
+  if (capabilityPackManifestDigest !== undefined && (typeof capabilityPackManifestDigest !== "string" || !/^[0-9a-fA-F]{64}$/.test(capabilityPackManifestDigest))) snapshotError();
+  if (capabilityPackVersion !== undefined && capabilityPack.pack_version !== capabilityPackVersion) snapshotError();
+  if (capabilityPackManifestDigest !== undefined && capabilityPack.manifest_digest !== capabilityPackManifestDigest) snapshotError();
+  if (requiredArtifactContract !== undefined && requiredArtifactContract !== null && profileName === undefined) snapshotError();
   const rootPolicy = capabilityPack.root_policy;
   if (typeof rootPolicy !== "string" || rootPolicy.length === 0) snapshotError();
   const skillsRaw = capabilityPack.skills ?? [];
@@ -117,6 +128,10 @@ export function mapClaimRuntimeSnapshot(snapshot: Record<string, unknown>): Runt
     rootPolicy: rootPolicy as string,
     skillCatalog,
     adapterCatalog,
+    ...(profileName === undefined ? {} : { profileName: profileName as string }),
+    ...(requiredArtifactContract === undefined ? {} : { requiredArtifactContract: requiredArtifactContract as string | null }),
+    ...(capabilityPackVersion === undefined ? {} : { capabilityPackVersion: capabilityPackVersion as string }),
+    ...(capabilityPackManifestDigest === undefined ? {} : { capabilityPackManifestDigest: capabilityPackManifestDigest as string }),
     maxDecisions: readSnapshotMaxDecisions(snapshot),
   };
 }
