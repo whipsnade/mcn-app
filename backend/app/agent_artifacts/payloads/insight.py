@@ -186,6 +186,11 @@ class InsightBoardV1(ArtifactPayloadBase):
     title: str
     scope: InsightScope
     parent_artifact_id: str
+    # Direct Artifact Skill submissions may pin the board to an explicitly
+    # read, published parent Version from the same Session.  The Builder still
+    # resolves and verifies this relation server-side; this field is not a
+    # permission to copy a payload or cross a tenant/session boundary.
+    parent_artifact_version_id: str | None = None
     narrative: InsightNarrative
     data: tuple[InsightBlock, ...] = Field(default_factory=tuple, max_length=50)
 

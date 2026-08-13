@@ -66,6 +66,15 @@ def test_campaign_export_has_nine_sheets_without_roi() -> None:
     assert "某品牌" in str(wb["活动综合概览"]["A1"].value)
 
 
+def test_campaign_report_v3_export_uses_the_direct_contract() -> None:
+    payload = build_campaign_dict()
+    payload["schema_version"] = "campaign_report_v3"
+    content = export_artifact(_Version("campaign_report_v3", payload))
+    wb = load_workbook(BytesIO(content), data_only=False)
+    assert tuple(wb.sheetnames) == CAMPAIGN_SHEETS
+    assert "某品牌" in str(wb["活动综合概览"]["A1"].value)
+
+
 def test_campaign_export_adds_roi_sheet_only_when_available() -> None:
     payload = build_campaign_dict()
     payload["data"]["internal_metrics"] = {

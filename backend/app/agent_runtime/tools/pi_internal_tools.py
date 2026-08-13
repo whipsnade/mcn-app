@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_artifacts.models import AgentArtifactVersion
 from app.agent_artifacts.publishing import ArtifactPublicationService
-from app.agent_runtime.models import AgentMessage, AgentRun, AgentSession, EvidenceItem, MemoryEntry
+from app.agent_runtime.models import AgentMessage, AgentRun, AgentSession, MemoryEntry
 from app.agent_runtime.repository import AgentRunRepository
 from app.agent_runtime.reviewer import release_run_drafts
 from app.agent_runtime.state import RunStatus
@@ -59,14 +59,6 @@ class GetSessionContextTool:
                 .order_by(AgentArtifactVersion.version)
             )
         ).all()
-        evidence_count = await self._db.scalar(
-            select(func.count())
-            .select_from(EvidenceItem)
-            .where(
-                EvidenceItem.session_id == context.session_id,
-                EvidenceItem.availability_status == "available",
-            )
-        )
         summary = {
             "run_id": run.id,
             "session_id": session.id,
@@ -83,7 +75,6 @@ class GetSessionContextTool:
                 }
                 for row in versions
             ],
-            "evidence_count": evidence_count or 0,
         }
         return ToolResult(status="success", safe_summary=json.dumps(summary, ensure_ascii=False))
 

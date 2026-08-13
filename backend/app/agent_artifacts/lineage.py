@@ -89,6 +89,9 @@ class EvidenceScope:
     allowed_artifact_version_ids: frozenset[str] = frozenset()
     field_versions: Mapping[str, str] = field(default_factory=dict)
     field_evidence_ids: Mapping[str, frozenset[str]] = field(default_factory=dict)
+    # Direct model-owned Artifact payloads have no trusted Evidence lineage.
+    # This flag is only set from the immutable publication snapshot marker.
+    model_direct: bool = False
 
 
 def _scope_attr(scope: EvidenceScope | Mapping[str, Any] | Any, name: str, default: Any = None) -> Any:
@@ -126,6 +129,7 @@ def _normalise_scope(scope: EvidenceScope | Mapping[str, Any] | Any) -> Evidence
             str(path): frozenset(str(item) for item in ids)
             for path, ids in (field_evidence.items() if isinstance(field_evidence, Mapping) else ())
         },
+        model_direct=bool(_scope_attr(scope, "model_direct", False)),
     )
 
 
@@ -304,9 +308,9 @@ def validate_structured_claims(
         value = field_entry.get("value")
         evidence_ids = field_entry.get("evidence_ids") or []
         if isinstance(value, (int, float)) and not isinstance(value, bool) and status != "unavailable":
-            if not evidence_ids:
+            if not evidence_ids and not scope.model_direct:
                 issues.append(ValidationIssue("numeric_lineage_missing", "numeric canonical field has no Evidence lineage", path))
-            else:
+            elif not scope.model_direct:
                 expected_evidence = scope.field_evidence_ids.get(path)
                 if expected_evidence is not None and set(evidence_ids) != expected_evidence:
                     issues.append(
@@ -364,7 +368,12 @@ def validate_structured_claims(
         targets = field_lineage.get(pointer)
         if targets != [pointer] and targets != (pointer,):
             issues.append(ValidationIssue("field_lineage_mismatch", "supporting path is not self-lineaged", pointer))
-        if isinstance(value, (int, float)) and not isinstance(value, bool) and not field_entry.get("evidence_ids"):
+        if (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and not field_entry.get("evidence_ids")
+            and not scope.model_direct
+        ):
             issues.append(ValidationIssue("numeric_lineage_missing", "narrative numeric claim has no Evidence lineage", pointer))
 
     return issues
@@ -397,6 +406,7 @@ def evidence_scope_from_snapshot(
         field_evidence_ids={
             path: frozenset(ids) for path, ids in field_evidence_ids.items()
         },
+        model_direct=(snapshot or {}).get("mode") == "model_direct_v1",
     )
 
 
@@ -972,6 +982,28 @@ class ArtifactLineageFreezer:
             loader=self._loader,
         )
         return frozen.model_dump(mode="json")
+
+    async def freeze_model_direct(
+        self,
+        *,
+        owner: LineageOwner,
+        source_tool_call_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Freeze a model-owned Artifact without inventing an Evidence claim.
+
+        The snapshot is deliberately a separate, explicit shape.  It carries
+        only the optional current-Run tool-call audit handles; it never embeds
+        MCP payload, text blocks, paths, or business data.
+        """
+        del owner  # ownership is checked by the Builder and publication query
+        ids = source_tool_call_ids or []
+        if len(ids) > 32 or any(not isinstance(item, str) or not item for item in ids):
+            raise LineageError("model_direct_source_tool_calls_invalid", "source tool call ids are invalid")
+        return {
+            "mode": "model_direct_v1",
+            "refs": [],
+            "source_tool_call_ids": list(dict.fromkeys(ids)),
+        }
 
 
 __all__ = [

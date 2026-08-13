@@ -249,7 +249,7 @@ async def test_tampered_capability_pack_audit_is_rejected(db_session, user_facto
     result = await CompletionValidator(db_session).validate(run)
 
     assert not result.ok
-    assert result.code == "required_artifact_missing"
+    assert result.code == "pi_gateway_snapshot_invalid"
 
 
 @pytest.mark.asyncio
@@ -334,7 +334,7 @@ async def test_invalid_frozen_lineage_does_not_allow_completion(db_session, user
     result = await CompletionValidator(db_session).validate(run)
 
     assert not result.ok
-    assert result.code == "required_artifact_invalid_lineage"
+    assert result.code == "pi_gateway_artifact_invalid"
 
 
 @pytest.mark.asyncio

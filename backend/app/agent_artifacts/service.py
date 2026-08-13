@@ -183,6 +183,7 @@ class ArtifactService:
         artifact_type: str,
         parent_artifact_id: str | None = None,
         parent_artifact_version_id: str | None = None,
+        direct_model_payload: bool = False,
     ) -> tuple[AgentArtifact, ArtifactDraft, ArtifactDraftRevision]:
         """构建 key → 锁定/创建稳定身份 → 锁定/认领 working head → 写入首个 Revision。
 
@@ -199,6 +200,7 @@ class ArtifactService:
             artifact_type=artifact_type,
             business_fields=business_fields,
             payload=payload,
+            direct_model_payload=direct_model_payload,
         )
         artifact_key = build_artifact_key(module, **business_fields)
         now = _utcnow()
@@ -338,6 +340,12 @@ class ArtifactService:
             schema_version=schema_version,
             artifact_type=artifact.artifact_type,
             payload=payload,
+            direct_model_payload=(
+                await self.db.scalar(
+                    select(AgentRun.runtime_backend).where(AgentRun.id == run_id)
+                )
+            )
+            == "pi",
         )
 
         revision_no = draft.current_revision + 1

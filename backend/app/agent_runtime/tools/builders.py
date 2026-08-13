@@ -224,7 +224,11 @@ class _BuilderToolBase:
         return loaded
 
     async def _persist(
-        self, context: ToolContext, result: DraftBuildResult
+        self,
+        context: ToolContext,
+        result: DraftBuildResult,
+        *,
+        direct_model_payload: bool = False,
     ) -> ToolResult:
         """经 ArtifactService 落 Draft（稳定身份复用即追加新 Revision）。"""
         try:
@@ -240,6 +244,7 @@ class _BuilderToolBase:
                 artifact_type=result.artifact_type,
                 parent_artifact_id=result.parent_artifact_id,
                 parent_artifact_version_id=result.parent_artifact_version_id,
+                direct_model_payload=direct_model_payload,
             )
         except ArtifactBusy as exc:
             return _failed(exc.code, str(exc))
@@ -255,6 +260,151 @@ class _BuilderToolBase:
                 revision_id=revision.id,
                 revision=revision.revision,
             ),
+        )
+
+
+# ---------------------------------------------------------------------------
+# build_artifact_draft (direct model-owned Artifact Skill input)
+# ---------------------------------------------------------------------------
+
+
+class BuildArtifactDraftArgs(BaseModel):
+    """模型自主选择产物类型并提交最终严格结构化 payload。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    artifact_type: str = Field(min_length=1, max_length=64)
+    payload: dict[str, Any]
+    source_tool_call_ids: list[str] = Field(default_factory=list, max_length=32)
+
+
+class BuildArtifactDraftTool(_BuilderToolBase):
+    """Artifact Skill 的统一入口；不读取 Evidence，也不推导 required contract。"""
+
+    name = "build_artifact_draft"
+    input_model = BuildArtifactDraftArgs
+    description = (
+        "提交一个由模型自主选择的正式 Artifact Draft。artifact_type 必须属于当前 Run "
+        "RuntimeSnapshot.allowed_artifact_contracts；payload 必须完整符合该 Artifact "
+        "Schema。可选 source_tool_call_ids 仅用于校验调用属于当前 Run，不会读取或重验 MCP "
+        "业务结果。成功只返回 Draft 身份摘要；模型也可以不调用本工具而直接返回文字。"
+    )
+
+    @staticmethod
+    def _business_fields(artifact_type: str, payload: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+        scope = payload.get("scope")
+        if artifact_type == "brand_report_v3":
+            if not isinstance(scope, dict) or not isinstance(scope.get("brand"), str):
+                return None
+            return "brand", {"brand": scope["brand"]}
+        if artifact_type in {"campaign_report_v2", "campaign_report_v3"}:
+            if not isinstance(scope, dict):
+                return None
+            brand = scope.get("brand")
+            campaign = scope.get("campaign")
+            if not isinstance(brand, str) or not isinstance(campaign, str):
+                return None
+            return "campaign", {"brand": brand, "campaign": campaign}
+        if artifact_type == "kol_selection_v3":
+            if not isinstance(scope, dict) or not scope:
+                return None
+            return "kol-selection", {"scope": scope}
+        if artifact_type == "insight_board_v1":
+            parent = payload.get("parent_artifact_version_id") or payload.get("parent_artifact_id")
+            question = payload.get("title")
+            if not isinstance(parent, str) or not parent or not isinstance(question, str) or not question:
+                return None
+            return "insight", {"parent_artifact_version_id": parent, "question": question}
+        return None
+
+    async def _execute(self, context: ToolContext, arguments: BaseModel) -> ToolResult:
+        args = BuildArtifactDraftArgs.model_validate(arguments)
+        if self._db is None:
+            return _failed(DRAFT_BUILD_ERROR, "build_artifact_draft requires a database session")
+        if not args.payload:
+            return _failed("artifact_payload_empty", "artifact payload must be a non-empty object")
+        run = await self._db.get(AgentRun, context.run_id)
+        if run is None or run.user_id != context.user_id or run.session_id != context.session_id:
+            return _failed(FORBIDDEN, "run_forbidden")
+        snapshot = run.runtime_config_snapshot_json or {}
+        allowed = snapshot.get("allowed_artifact_contracts")
+        if not isinstance(allowed, (list, tuple)) or not all(isinstance(item, str) for item in allowed):
+            return _failed("runtime_snapshot_invalid", "runtime snapshot artifact allowlist is invalid")
+        if args.artifact_type not in allowed:
+            return _failed(
+                "artifact_contract_not_allowed",
+                f"artifact type {args.artifact_type!r} is not allowed by the current Run snapshot",
+            )
+        if args.source_tool_call_ids:
+            owned = set(
+                (
+                    await self._db.scalars(
+                        select(AgentToolCall.id).where(
+                            AgentToolCall.run_id == run.id,
+                            AgentToolCall.id.in_(args.source_tool_call_ids),
+                        )
+                    )
+                ).all()
+            )
+            if owned != set(args.source_tool_call_ids):
+                return _failed("tool_call_not_owned", "source tool call is not owned by the current Run")
+        parent_artifact_id: str | None = None
+        parent_artifact_version_id: str | None = None
+        if args.artifact_type == "insight_board_v1":
+            parent_artifact_id = args.payload.get("parent_artifact_id")
+            if not isinstance(parent_artifact_id, str) or not parent_artifact_id:
+                return _failed("parent_artifact_not_found", "parent artifact is required")
+            parent = await self._db.scalar(
+                select(AgentArtifact).where(
+                    AgentArtifact.id == parent_artifact_id,
+                    AgentArtifact.session_id == context.session_id,
+                    AgentArtifact.user_id == context.user_id,
+                    AgentArtifact.status == "published",
+                )
+            )
+            if parent is None:
+                return _failed("parent_artifact_not_found", "parent artifact is not published in the current session")
+            requested_version_id = args.payload.get("parent_artifact_version_id")
+            version_query = select(AgentArtifactVersion).where(
+                AgentArtifactVersion.artifact_id == parent.id,
+            )
+            if isinstance(requested_version_id, str) and requested_version_id:
+                version_query = version_query.where(AgentArtifactVersion.id == requested_version_id)
+            parent_version = await self._db.scalar(
+                version_query.order_by(AgentArtifactVersion.version.desc())
+            )
+            if parent_version is None:
+                return _failed(
+                    "parent_artifact_version_not_found",
+                    "parent artifact version is not published in the current session",
+                )
+            parent_artifact_version_id = parent_version.id
+
+        business = self._business_fields(args.artifact_type, args.payload)
+        if business is None:
+            return _failed(
+                DRAFT_BUILD_ERROR,
+                f"payload does not contain business identity fields for {args.artifact_type!r}",
+            )
+        module, business_fields = business
+        if module == "insight" and parent_artifact_version_id is not None:
+            business_fields = {
+                "parent_artifact_version_id": parent_artifact_version_id,
+                "question": business_fields["question"],
+            }
+        return await self._persist(
+            context,
+            DraftBuildResult(
+                module=module,
+                artifact_type=args.artifact_type,
+                schema_version=args.artifact_type,
+                business_fields=business_fields,
+                payload=args.payload,
+                evidence_refs=[],
+                parent_artifact_id=parent_artifact_id,
+                parent_artifact_version_id=parent_artifact_version_id,
+            ),
+            direct_model_payload=True,
         )
 
 

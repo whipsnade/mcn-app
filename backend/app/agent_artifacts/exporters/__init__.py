@@ -38,6 +38,7 @@ _SUPPORTED_EXPORTERS = {
     "brand_report_v3": render_brand_workbook,
     "kol_selection_v3": render_kol_selection_workbook,
     "campaign_report_v2": render_campaign_workbook,
+    "campaign_report_v3": render_campaign_workbook,
 }
 
 

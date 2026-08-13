@@ -200,7 +200,7 @@ class CompletionValidator:
         if not isinstance(snapshot, dict):
             return CompletionValidationResult(
                 False,
-                "required_artifact_missing",
+                "pi_gateway_snapshot_invalid",
                 "frozen runtime snapshot is missing",
             )
         capability_pack = snapshot.get("capability_pack")
@@ -217,7 +217,7 @@ class CompletionValidator:
         ):
             return CompletionValidationResult(
                 False,
-                "required_artifact_missing",
+                "pi_gateway_snapshot_invalid",
                 "frozen capability pack audit fields are missing or inconsistent",
             )
 
@@ -227,34 +227,8 @@ class CompletionValidator:
         ) or len(set(allowed_contracts)) != len(allowed_contracts):
             return CompletionValidationResult(
                 False,
-                "required_artifact_missing",
+                "pi_gateway_snapshot_invalid",
                 "frozen artifact contract allowlist is invalid",
-            )
-
-        # Historical snapshots may carry an explicit required contract.  It is
-        # preserved for read-only compatibility, but new snapshots never set
-        # these fields and therefore have no required artifact gate.
-        legacy_required = snapshot.get("artifact_contract_mode") == "required"
-        required_contract = snapshot.get("required_artifact_contract")
-        if legacy_required:
-            if not isinstance(required_contract, str) or not required_contract:
-                return CompletionValidationResult(
-                    False,
-                    "required_artifact_missing",
-                    "historical required artifact contract is invalid",
-                )
-            version, validation_error = await self._find_valid_published_version(
-                run, required_contract
-            )
-            if version is None:
-                code = (
-                    "required_artifact_invalid_lineage"
-                    if validation_error == "published artifact lineage snapshot is invalid"
-                    else "required_artifact_missing"
-                )
-                return CompletionValidationResult(False, code, validation_error)
-            return CompletionValidationResult(
-                True, artifact_version_id=version.id, warnings=tuple(warnings)
             )
 
         versions = await self._current_published_versions(run)
@@ -299,34 +273,14 @@ class CompletionValidator:
                 run, version, publication
             )
             if validation_error is not None:
-                code = (
-                    "required_artifact_invalid_lineage"
-                    if validation_error == "published artifact lineage snapshot is invalid"
-                    else "pi_gateway_artifact_invalid"
-                )
+                code = "pi_gateway_artifact_invalid"
                 return CompletionValidationResult(False, code, validation_error)
         return CompletionValidationResult(
             True, artifact_version_id=versions[0][0].id, warnings=tuple(warnings)
         )
 
-    async def _find_valid_published_version(
-        self, run: AgentRun, required_contract: str
-    ) -> tuple[AgentArtifactVersion | None, str | None]:
-        """只接受当前 Run 发布的、当前 latest、lineage 完整的 Version。"""
-        rows = await self._current_published_versions(
-            run, required_contract=required_contract
-        )
-        if not rows:
-            return None, "no published artifact Version belongs to this Run"
-        for version, _artifact, _revision, publication in rows:
-            error = await self._validate_published_version(run, version, publication)
-            if error is None:
-                return version, None
-            return None, error
-        return None, "published artifact Version is invalid"
-
     async def _current_published_versions(
-        self, run: AgentRun, *, required_contract: str | None = None
+        self, run: AgentRun
     ) -> list[tuple[AgentArtifactVersion, AgentArtifact, ArtifactDraftRevision, ArtifactPublishAttempt]]:
         """Load only versions whose complete publication chain belongs to Run."""
         statement = (
@@ -361,11 +315,6 @@ class CompletionValidator:
                 ArtifactPublishAttempt.status == "published",
             )
         )
-        if required_contract is not None:
-            statement = statement.where(
-                AgentArtifactVersion.schema_version == required_contract,
-                ArtifactDraftRevision.schema_version == required_contract,
-            )
         return list((await self.db.execute(statement)).all())
 
     async def _validate_published_version(
@@ -394,6 +343,36 @@ class CompletionValidator:
     ) -> bool:
         if not isinstance(value, dict):
             return False
+        if value.get("mode") == "model_direct_v1":
+            # Direct Artifact Skill payloads have no trusted Evidence claim.
+            # The marker is explicit and still binds optional audit handles to
+            # this exact Run; it cannot be used by a historical Artifact.
+            if set(value) - {"mode", "refs", "source_tool_call_ids"}:
+                return False
+            if value.get("refs") != [] or version.source_run_id != run.id:
+                return False
+            source_ids = value.get("source_tool_call_ids", [])
+            if (
+                not isinstance(source_ids, list)
+                or len(source_ids) > 32
+                or any(not isinstance(item, str) or not item for item in source_ids)
+                or len(set(source_ids)) != len(source_ids)
+            ):
+                return False
+            if source_ids:
+                owned = set(
+                    (
+                        await self.db.scalars(
+                            select(AgentToolCall.id).where(
+                                AgentToolCall.run_id == run.id,
+                                AgentToolCall.id.in_(source_ids),
+                            )
+                        )
+                    ).all()
+                )
+                if owned != set(source_ids):
+                    return False
+            return True
         try:
             lineage = FrozenLineage.model_validate(value)
         except (TypeError, ValueError):

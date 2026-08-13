@@ -17,6 +17,7 @@ from app.agent_artifacts.payloads import (
     TYPED_PAYLOAD_BY_SCHEMA,
     BrandReportV3,
     CampaignReportV2,
+    CampaignReportV3,
     InsightBoardV1,
     KolAnalysisV2,
     KolDetailV2,
@@ -583,12 +584,14 @@ def test_type_map_keys_are_fixed() -> None:
     assert set(TYPED_PAYLOAD_BY_SCHEMA) == {
         "brand_report_v3",
         "campaign_report_v2",
+        "campaign_report_v3",
         "kol_selection_v3",
         "kol_analysis_v2",
         "kol_detail_v2",
         "insight_board_v1",
     }
     assert TYPED_PAYLOAD_BY_SCHEMA["brand_report_v3"] is BrandReportV3
+    assert TYPED_PAYLOAD_BY_SCHEMA["campaign_report_v3"] is CampaignReportV3
     assert TYPED_PAYLOAD_BY_SCHEMA["insight_board_v1"] is InsightBoardV1
 
 
@@ -998,6 +1001,15 @@ def test_insight_requires_module_title_scope_parent() -> None:
         del d[key]
         with pytest.raises(ValidationError):
             InsightBoardV1.model_validate(d)
+
+
+def test_insight_accepts_explicit_parent_version_binding() -> None:
+    d = build_insight_dict()
+    d["parent_artifact_version_id"] = "published-parent-version"
+
+    payload = InsightBoardV1.model_validate(d)
+
+    assert payload.parent_artifact_version_id == "published-parent-version"
 
 
 # ---------------------------------------------------------------- stable-key uniqueness

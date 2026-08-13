@@ -26,7 +26,7 @@ from app.agent_artifacts.exporters._common import (
     platform_label,
     write_table,
 )
-from app.agent_artifacts.payloads.campaign import CampaignReportV2
+from app.agent_artifacts.payloads.campaign import CampaignReportV2, CampaignReportV3
 
 TEMPLATE_PATH = (
     Path(__file__).resolve().parents[1] / "templates" / "campaign_report_v2.xlsx"
@@ -74,8 +74,13 @@ def _bar_chart(
 
 
 def render_campaign_workbook(payload: dict) -> bytes:
-    """把已发布 campaign_report_v2 payload 渲染为 .xlsx bytes（同步 CPU 密集）。"""
-    report = CampaignReportV2.model_validate(payload)
+    """把已发布 campaign_report_v2/v3 payload 渲染为 .xlsx bytes。
+
+    v3 是 direct Artifact Skill 的正式契约；它复用同一受控模板和渲染逻辑，
+    但必须先用对应的强类型模型校验，不能把 v3 当成 v2 绕过 schema_version。
+    """
+    report_model = CampaignReportV3 if payload.get("schema_version") == "campaign_report_v3" else CampaignReportV2
+    report = report_model.model_validate(payload)
     workbook = load_workbook(TEMPLATE_PATH)
     _write_title(workbook["活动综合概览"], f"{report.scope.brand}「{report.scope.campaign}」活动分析报告")
     _write_title(workbook["周期对比与趋势"], "周期对比与趋势")

@@ -15,8 +15,10 @@ def test_pi_internal_tools_do_not_start_nested_durable_loop_guard_transaction() 
     registry = build_production_internal_registry(db=SimpleNamespace(), worker_id="gw-1")
     tools = {entry.internal_name: entry.tool for entry in registry.registered_tools}
 
-    assert getattr(tools["search_evidence"], "_durable_session_factory") is None
-    assert getattr(tools["build_brand_report_draft"], "_durable_session_factory") is None
+    assert getattr(tools["build_artifact_draft"], "_durable_session_factory") is None
+    assert "search_evidence" not in tools
+    assert "read_tool_result" not in tools
+    assert "build_brand_report_draft" not in tools
 
 
 @pytest.mark.asyncio

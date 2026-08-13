@@ -9,15 +9,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_runtime.profiles import ARTIFACT_TOOLS, HISTORY_TOOLS, get_profile
 from app.agent_runtime.tools.builders import (
-    BuildBrandReportDraftTool,
-    BuildCampaignReportDraftTool,
-    BuildInsightDraftTool,
-    BuildKolAnalysisDraftTool,
-    BuildKolDetailDraftTool,
-    BuildKolSelectionDraftTool,
+    BuildArtifactDraftTool,
 )
 from app.agent_runtime.tools.contracts import SERVER_RESERVED_KEYS, ToolResult
-from app.agent_runtime.tools.history import ReadArtifactTool, ReadToolResultTool, SearchEvidenceTool
+from app.agent_runtime.tools.history import ReadArtifactTool
 from app.agent_runtime.tools.pi_internal_tools import (
     GetSessionContextTool,
     LoadMarketingSkillTool,
@@ -36,35 +31,12 @@ def build_production_internal_registry(*, db: AsyncSession, worker_id: str) -> T
     durable_session_factory = None
     registry = ToolRegistry()
     registry.register(ReadArtifactTool(db), category=HISTORY_TOOLS)
-    registry.register(
-        SearchEvidenceTool(db, durable_session_factory=durable_session_factory),
-        category=HISTORY_TOOLS,
-    )
-    registry.register(ReadToolResultTool(db), category=HISTORY_TOOLS)
+    # Pi's direct-result path intentionally has no Evidence search/read bridge.
+    # The legacy history tools remain registered only in the current runtime.
     registry.register(GetSessionContextTool(db), category=HISTORY_TOOLS)
     registry.register(LoadMarketingSkillTool(db), category=HISTORY_TOOLS)
     registry.register(
-        BuildBrandReportDraftTool(db, durable_session_factory=durable_session_factory),
-        category=ARTIFACT_TOOLS,
-    )
-    registry.register(
-        BuildCampaignReportDraftTool(db, durable_session_factory=durable_session_factory),
-        category=ARTIFACT_TOOLS,
-    )
-    registry.register(
-        BuildKolSelectionDraftTool(db, durable_session_factory=durable_session_factory),
-        category=ARTIFACT_TOOLS,
-    )
-    registry.register(
-        BuildKolAnalysisDraftTool(db, durable_session_factory=durable_session_factory),
-        category=ARTIFACT_TOOLS,
-    )
-    registry.register(
-        BuildKolDetailDraftTool(db, durable_session_factory=durable_session_factory),
-        category=ARTIFACT_TOOLS,
-    )
-    registry.register(
-        BuildInsightDraftTool(db, durable_session_factory=durable_session_factory),
+        BuildArtifactDraftTool(db, durable_session_factory=durable_session_factory),
         category=ARTIFACT_TOOLS,
     )
     registry.register(PublishArtifactsTool(db, worker_id=worker_id), category=ARTIFACT_TOOLS)

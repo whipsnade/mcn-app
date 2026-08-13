@@ -26,7 +26,7 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from app.agent_artifacts.canonical import CanonicalPayloadMixin
+from app.agent_artifacts.canonical import CanonicalPayloadMixin, model_direct_lineage_context
 from app.agent_artifacts.lineage import ValidationIssue, validate_structured_claims
 from app.agent_artifacts.payloads import TYPED_PAYLOAD_BY_SCHEMA
 
@@ -80,9 +80,15 @@ def _check_fixed_combo(module: str, schema_version: str, artifact_type: str) -> 
     expected = SCHEMA_VERSION_BY_MODULE.get(module)
     if expected is None:
         raise ArtifactPayloadInvalid(f"unknown artifact module: {module!r}")
-    if schema_version != expected:
+    allowed_schema_versions = {expected}
+    if module == "campaign":
+        # campaign_report_v2 remains the current/legacy contract.  Pi's
+        # direct Artifact Skill may also submit the reviewed v3 alias.
+        allowed_schema_versions.add("campaign_report_v3")
+    if schema_version not in allowed_schema_versions:
         raise ArtifactPayloadInvalid(
-            f"module {module!r} requires schema_version {expected!r}, got {schema_version!r}"
+            f"module {module!r} requires schema_version in {sorted(allowed_schema_versions)!r}, "
+            f"got {schema_version!r}"
         )
     if artifact_type != schema_version:
         raise ArtifactPayloadInvalid(
@@ -497,6 +503,7 @@ class ArtifactPayloadValidator:
         artifact_type: str,
         business_fields: dict[str, Any],
         payload: Any,
+        direct_model_payload: bool = False,
     ) -> dict[str, Any]:
         """新建 Draft 全量校验：固定组合 + business fields + 强类型，返回标准化形态。"""
         _check_fixed_combo(module, schema_version, artifact_type)
@@ -511,6 +518,7 @@ class ArtifactPayloadValidator:
             schema_version=schema_version,
             artifact_type=artifact_type,
             payload=payload,
+            direct_model_payload=direct_model_payload,
         )
 
     @staticmethod
@@ -521,6 +529,7 @@ class ArtifactPayloadValidator:
         artifact_type: str,
         payload: Any,
         enforce_kol_publication_validity: bool = False,
+        direct_model_payload: bool = False,
     ) -> dict[str, Any]:
         """Revision 级校验（update/publish 复用）：固定组合 + 强类型。
 
@@ -534,7 +543,8 @@ class ArtifactPayloadValidator:
                 f"got {type(payload).__name__}"
             )
         try:
-            instance = payload_cls.model_validate(payload)
+            with model_direct_lineage_context(direct_model_payload):
+                instance = payload_cls.model_validate(payload)
         except ValidationError as exc:
             raise ArtifactPayloadInvalid(
                 f"payload fails {schema_version!r} contract: {exc.error_count()} error(s)",
@@ -579,6 +589,7 @@ class ArtifactPayloadValidator:
         artifact_type: str,
         payload: Any,
         enforce_kol_publication_validity: bool = False,
+        direct_model_payload: bool = False,
     ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
         """收集式 Revision 校验：不抛异常，返回 ``(标准化 payload | None, 错误列表)``。
 
@@ -593,6 +604,7 @@ class ArtifactPayloadValidator:
                 artifact_type=artifact_type,
                 payload=payload,
                 enforce_kol_publication_validity=enforce_kol_publication_validity,
+                direct_model_payload=direct_model_payload,
             )
         except ArtifactPayloadInvalid as exc:
             errors = exc.errors or [{"loc": [], "msg": str(exc), "type": exc.code}]

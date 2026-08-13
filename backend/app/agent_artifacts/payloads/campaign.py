@@ -217,3 +217,9 @@ class CampaignReportV2(ArtifactPayloadBase, CanonicalPayloadMixin):
             "roi",
         }
     )
+
+
+class CampaignReportV3(CampaignReportV2):
+    """Direct Artifact Skill contract; v2 remains the legacy/current contract."""
+
+    schema_version: Literal["campaign_report_v3"] = "campaign_report_v3"

@@ -9,7 +9,7 @@ maps a fixed `schema_version` to its payload type for dispatch by later tasks
 from __future__ import annotations
 
 from app.agent_artifacts.payloads.brand import BrandReportV3
-from app.agent_artifacts.payloads.campaign import CampaignReportV2
+from app.agent_artifacts.payloads.campaign import CampaignReportV2, CampaignReportV3
 from app.agent_artifacts.payloads.common import (
     ArtifactPayloadBase,
     Limitation,
@@ -24,6 +24,7 @@ from app.agent_artifacts.payloads.kol_selection import KolSelectionScopeV3, KolS
 TYPED_PAYLOAD_BY_SCHEMA: dict[str, type[ArtifactPayloadBase]] = {
     "brand_report_v3": BrandReportV3,
     "campaign_report_v2": CampaignReportV2,
+    "campaign_report_v3": CampaignReportV3,
     "kol_selection_v3": KolSelectionV3,
     "kol_analysis_v2": KolAnalysisV2,
     "kol_detail_v2": KolDetailV2,
@@ -35,6 +36,7 @@ __all__ = [
     "ArtifactPayloadBase",
     "BrandReportV3",
     "CampaignReportV2",
+    "CampaignReportV3",
     "InsightBoardV1",
     "KolAnalysisV2",
     "KolDetailV2",

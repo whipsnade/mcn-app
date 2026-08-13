@@ -20,11 +20,28 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Any, Iterator, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, model_validator
 
 CanonicalAvailability = Literal["complete", "partial", "unavailable"]
+
+# Direct Pi Artifact Skill payloads are still validated by the same typed
+# payloads and canonical shape, but they do not claim that a model-provided
+# numeric field came from an Evidence row.  Keep this opt-in and scoped to the
+# validator call so legacy/current builders remain Evidence-backed by default.
+_MODEL_DIRECT_LINEAGE = ContextVar("model_direct_lineage", default=False)
+
+
+@contextmanager
+def model_direct_lineage_context(enabled: bool = True) -> Iterator[None]:
+    token = _MODEL_DIRECT_LINEAGE.set(enabled)
+    try:
+        yield
+    finally:
+        _MODEL_DIRECT_LINEAGE.reset(token)
 
 # 数值叶子单位（按 path 末段推断；比率/文本字段无单位）。
 _UNIT_BY_SUFFIX: dict[str, str] = {
@@ -120,7 +137,7 @@ class CanonicalField(BaseModel):
                 raise ValueError("availability=unavailable requires value=None")
         elif self.value is None:
             raise ValueError(f"canonical field {self.path!r} with value=None must be unavailable")
-        elif _is_number(self.value) and not self.evidence_ids:
+        elif _is_number(self.value) and not self.evidence_ids and not _MODEL_DIRECT_LINEAGE.get():
             raise ValueError(
                 f"complete/partial numeric canonical field {self.path!r} requires evidence_ids"
             )
@@ -281,6 +298,7 @@ __all__ = [
     "CanonicalAvailability",
     "CanonicalField",
     "CanonicalPayloadMixin",
+    "model_direct_lineage_context",
     "publish_canonical",
     "unit_for_path",
     "walk_data_leaves",

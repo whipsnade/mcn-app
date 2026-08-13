@@ -22,6 +22,7 @@ def validate_payload_for_publication(
     evidence_scope: EvidenceScope | Mapping[str, Any] | None = None,
     artifact_version_id: str | None = None,
     enforce_kol_publication_validity: bool = True,
+    direct_model_payload: bool = False,
     structured_validator: Callable[..., list[Any]] = validate_structured_claims,
 ) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
     """返回标准化 payload 与结构化错误，供 direct/batch/replay 共用。"""
@@ -32,6 +33,7 @@ def validate_payload_for_publication(
         artifact_type=artifact_type,
         payload=payload,
         enforce_kol_publication_validity=enforce_kol_publication_validity,
+        direct_model_payload=direct_model_payload,
     )
     if errors or normalized is None or evidence_scope is None or artifact_version_id is None:
         return normalized, list(errors)

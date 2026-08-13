@@ -191,6 +191,8 @@ class ArtifactPublicationService:
         return tuple(results)
 
     async def _publish_one(self, *, run_id: str, draft_id: str) -> PublishItemResult:
+        run = await self.db.get(AgentRun, run_id)
+        direct_model_payload = run is not None and run.runtime_backend == "pi"
         draft = await self.db.scalar(
             select(ArtifactDraft).where(ArtifactDraft.id == draft_id).with_for_update()
         )
@@ -314,20 +316,25 @@ class ArtifactPublicationService:
             artifact_type=artifact.artifact_type,
             payload=revision.payload_json,
             enforce_kol_publication_validity=True,
+            direct_model_payload=direct_model_payload,
         )
         lineage_snapshot: dict[str, Any] | None = None
         lineage_errors: list[dict[str, Any]] = []
         if not payload_errors:
             try:
-                lineage_snapshot = await self._freezer.freeze(
-                    payload=validated_payload,
-                    refs=revision.evidence_refs_json,
-                    owner=LineageOwner(
-                        user_id=artifact.user_id,
-                        session_id=artifact.session_id,
-                        run_id=run_id,
-                    ),
+                owner = LineageOwner(
+                    user_id=artifact.user_id,
+                    session_id=artifact.session_id,
+                    run_id=run_id,
                 )
+                if direct_model_payload and not revision.evidence_refs_json:
+                    lineage_snapshot = await self._freezer.freeze_model_direct(owner=owner)
+                else:
+                    lineage_snapshot = await self._freezer.freeze(
+                        payload=validated_payload,
+                        refs=revision.evidence_refs_json,
+                        owner=owner,
+                    )
             except LineageError as exc:
                 lineage_errors = [{"stage": "lineage", "code": exc.code, "msg": exc.message}]
 
@@ -356,6 +363,7 @@ class ArtifactPublicationService:
                 ),
                 artifact_version_id=candidate_version_id,
                 enforce_kol_publication_validity=True,
+                direct_model_payload=direct_model_payload,
                 structured_validator=validate_structured_claims,
             )
         flat_errors: list[dict[str, Any]] = [
