@@ -120,8 +120,14 @@ class ExportCacheService:
         schema_version: str,
         payload: dict[str, Any] | None,
         filename: str,
+        lineage_snapshot: dict[str, Any] | None = None,
     ) -> ExportedFile:
-        """构建并返回缓存文件；并发下只渲染一次。"""
+        """构建并返回缓存文件；并发下只渲染一次。
+
+        ``lineage_snapshot`` 透传给构建路径（direct payload 识别所需：
+        ``mode == "model_direct_v1"`` 时 export_artifact 启用 direct lineage
+        context）；缓存命中路径不消费该参数。
+        """
         template_version = _template_version_for(schema_version)
         self._storage_dir.mkdir(parents=True, exist_ok=True)
         retry_budget = _MAX_DB_RETRY_ATTEMPTS
@@ -239,7 +245,11 @@ class ExportCacheService:
             claim_token = row.claim_token
             try:
                 content = await asyncio.to_thread(
-                    self._render, schema_version, payload, filename
+                    self._render,
+                    schema_version,
+                    payload,
+                    filename,
+                    lineage_snapshot,
                 )
             except asyncio.CancelledError:
                 # 取消必须安全收尾（标记 failed 可接管）后重新抛出。
@@ -359,13 +369,23 @@ class ExportCacheService:
     # helpers
     # ------------------------------------------------------------------ #
 
-    def _render(self, schema_version: str, payload: dict[str, Any] | None, filename: str) -> bytes:
+    def _render(
+        self,
+        schema_version: str,
+        payload: dict[str, Any] | None,
+        filename: str,
+        lineage_snapshot: dict[str, Any] | None = None,
+    ) -> bytes:
         if self._renderer is not None:
             return self._renderer(payload)
         if payload is None:
             raise ArtifactExportUnsupported(schema_version, reason="no published payload")
         return export_artifact(
-            _VersionLike(schema_version=schema_version, payload_json=payload)
+            _VersionLike(
+                schema_version=schema_version,
+                payload_json=payload,
+                lineage_snapshot_json=lineage_snapshot,
+            )
         )
 
     async def _mark_failed(
@@ -445,11 +465,18 @@ class ExportCacheService:
 
 
 class _VersionLike:
-    """导出器读取面桩：schema_version + payload_json。"""
+    """导出器读取面桩：schema_version + payload_json + lineage_snapshot_json。"""
 
-    def __init__(self, *, schema_version: str, payload_json: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        *,
+        schema_version: str,
+        payload_json: dict[str, Any],
+        lineage_snapshot_json: dict[str, Any] | None = None,
+    ) -> None:
         self.schema_version = schema_version
         self.payload_json = payload_json
+        self.lineage_snapshot_json = lineage_snapshot_json
         self.data_status = "complete"
 
 

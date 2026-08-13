@@ -287,6 +287,9 @@ async def export_artifact_xlsx(
             schema_version=version_row.schema_version,
             payload=version_row.payload_json,
             filename=f"{_sanitize_filename(artifact.artifact_type)}_v{version_row.version}.xlsx",
+            # Direct Artifact Skill payload（mode == "model_direct_v1"）的导出重校验
+            # 需要 lineage 快照启用 direct context；路由层已持有完整 version_row。
+            lineage_snapshot=version_row.lineage_snapshot_json,
         )
     except ArtifactExportUnsupported as error:
         raise HTTPException(

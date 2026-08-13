@@ -944,3 +944,61 @@ async def _purge_committed(user_id: str) -> None:
         if user is not None:
             await db.delete(user)
         await db.commit()
+
+
+# --------------------------------------------------------------------------- #
+# direct payload 导出回归（f15ff5d Minor #1 条件化修复验证）
+# --------------------------------------------------------------------------- #
+
+
+async def test_get_or_build_renders_direct_payload_with_lineage_snapshot(
+    db_session, tmp_path, user_factory
+) -> None:
+    """lineage_snapshot={"mode": "model_direct_v1"} 时真实 export_artifact
+    （_renderer=None）渲染 direct brand payload 成功——修复 f15ff5d 引入的
+    direct payload 导出 409 回归（_VersionLike 缺 lineage_snapshot_json）。"""
+    from app.agent_artifacts.model_inputs import assemble_model_payload
+    from app.agent_artifacts.model_inputs.brand import BrandReportV3Input
+    from tests.agent_artifacts.payload_fixtures import brand_model_input
+
+    user = await user_factory()
+    direct_payload = assemble_model_payload(
+        "brand_report_v3",
+        BrandReportV3Input.model_validate(brand_model_input()),
+    )
+    version_id = await _make_version(db_session, direct_payload, user_id=user.id)
+    service = ExportCacheService(db_session, storage_dir=str(tmp_path))
+
+    result = await service.get_or_build(
+        artifact_version_id=version_id,
+        schema_version="brand_report_v3",
+        payload=direct_payload,
+        filename="brand_report_v1.xlsx",
+        lineage_snapshot={"mode": "model_direct_v1"},
+    )
+    assert result.content.startswith(b"PK\x03\x04")
+    assert result.size_bytes == len(result.content)
+    row = await db_session.scalar(
+        select(ArtifactExport).where(ArtifactExport.artifact_version_id == version_id)
+    )
+    assert row is not None and row.status == "ready"
+
+
+async def test_get_or_build_without_lineage_snapshot_keeps_legacy_path(
+    db_session, tmp_path, user_factory
+) -> None:
+    """不传 lineage_snapshot（legacy Evidence-backed payload / 历史 Version）：
+    真实 export_artifact 走无条件路径成功，行为与 f15ff5d 之前一致。"""
+    user = await user_factory()
+    payload = build_brand_dict()  # canonical 带 evidence refs 的 legacy 完整 payload
+    version_id = await _make_version(db_session, payload, user_id=user.id)
+    service = ExportCacheService(db_session, storage_dir=str(tmp_path))
+
+    result = await service.get_or_build(
+        artifact_version_id=version_id,
+        schema_version="brand_report_v3",
+        payload=payload,
+        filename="brand_report_v1.xlsx",
+        lineage_snapshot=None,
+    )
+    assert result.content.startswith(b"PK\x03\x04")
