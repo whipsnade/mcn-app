@@ -618,13 +618,10 @@ async def test_publish_artifacts_returns_to_decision_loop(db_session, user_facto
     assert types[-1] == "run.completed"
 
 
-async def test_zero_published_with_failures_settles_failed(
+async def test_zero_published_with_failures_can_degrade_to_text_completion(
     db_session, user_factory
 ) -> None:
-    """零发布成功 + 有失败项（设计 §4.2）：发布校验失败（缺 lineage）→
-    逐项结果回喂 → 模型 abandon_draft → complete 时无任何产物发布成功，
-    Run 收口 failed（error_code=ALL_ARTIFACTS_FAILED），不是 completed_with_warnings
-    （后者要求至少一个产物发布成功）。"""
+    """Builder 失败后 Pi 放弃 Draft，仍可自主降级为带 warning 的文字完成。"""
     run, attempt, _, _ = await _setup_run(db_session, user_factory)
     # 必需数字叶子缺 lineage：确定性校验判 validation_failed（§10.3）。
     _, draft, _ = await _make_draft(db_session, run, payload=insight_metric_payload(value=100))
@@ -658,9 +655,9 @@ async def test_zero_published_with_failures_settles_failed(
         profile=get_profile("session_analyst_v1"),
         messages=[ChatMessage(role="user", content="分析瑞幸品牌")],
     )
-    assert outcome.status == RunStatus.FAILED
-    assert run.status == RunStatus.FAILED
-    assert run.error_code == "ALL_ARTIFACTS_FAILED"
+    assert outcome.status == RunStatus.COMPLETED_WITH_WARNINGS
+    assert run.status == RunStatus.COMPLETED_WITH_WARNINGS
+    assert run.error_code is None
     # validation_failed 逐项结果回喂给模型
     assert any("validation_failed" in m.content for m in gateway.calls[1]["messages"])
     # 未产生任何 Version；Draft 已放弃（failed）
@@ -675,13 +672,13 @@ async def test_zero_published_with_failures_settles_failed(
     assert draft_row is not None
     assert draft_row.status == "failed"
     assert draft_row.owner_run_id is None
-    # 恰好一个 run.failed 终态事件且为最后一条（与其他 failed 路径同一事件通道）
+    # 恰好一个 warning terminal 事件且为最后一条。
     types = await _event_types(db_session, run.id)
-    assert types[-1] == "run.failed"
+    assert types[-1] == "run.completed_with_warnings"
     terminal = await _terminal_events(db_session, run.id)
     assert len(terminal) == 1
-    assert terminal[0].event_type == "run.failed"
-    assert terminal[0].payload_json["error_code"] == "ALL_ARTIFACTS_FAILED"
+    assert terminal[0].event_type == "run.completed_with_warnings"
+    assert ["artifact", draft.artifact_id] in terminal[0].payload_json["warning_artifact_ids"]
 
 
 async def test_mixed_publish_and_abandon_completes_with_warnings(
@@ -1190,9 +1187,7 @@ async def test_complete_with_active_draft_is_fed_back(db_session, user_factory) 
 async def test_publish_with_nonexistent_draft_id_fed_back_as_failed_item(
     db_session, user_factory
 ) -> None:
-    """幻觉 draft_id（不存在）：逐项 failed（draft_not_found）回喂且持久化拒绝
-    记录；随后 complete 聚合失败项 → ALL_ARTIFACTS_FAILED，Run 不得被错误标记
-    completed（Gate A 审查修复）。"""
+    """幻觉 draft_id 只形成 warning，Pi 仍可选择直接文字完成。"""
     run, attempt, _, _ = await _setup_run(db_session, user_factory)
     engine, gateway = _make_engine(
         db_session,
@@ -1211,8 +1206,8 @@ async def test_publish_with_nonexistent_draft_id_fed_back_as_failed_item(
         profile=get_profile("session_analyst_v1"),
         messages=[ChatMessage(role="user", content="分析瑞幸品牌")],
     )
-    assert outcome.status == RunStatus.FAILED
-    assert run.error_code == "ALL_ARTIFACTS_FAILED"
+    assert outcome.status == RunStatus.COMPLETED_WITH_WARNINGS
+    assert run.error_code is None
     assert len(gateway.calls) == 2
     assert any("draft_not_found" in m.content for m in gateway.calls[1]["messages"])
     rejected = (
@@ -1231,9 +1226,7 @@ async def test_publish_with_nonexistent_draft_id_fed_back_as_failed_item(
 async def test_publish_with_foreign_draft_id_fed_back_as_not_found(
     db_session, user_factory
 ) -> None:
-    """幻觉 draft_id（属于其他活动 Run）：逐项 failed（draft_not_found）回喂且
-    持久化拒绝记录；随后 complete 聚合失败项 → ALL_ARTIFACTS_FAILED（Gate A
-    审查修复）。他人的 Draft 不发布、owner 不变。"""
+    """越权 Draft 只回喂 not_found；其他 Run 的活动 Draft 不阻断当前文字完成。"""
     run, attempt, user, session = await _setup_run(db_session, user_factory)
     run_b, _ = await _new_run(db_session, user_id=user.id, session_id=session.id)
     _, draft_b, _ = await _make_draft(db_session, run_b, brand="瑞幸")
@@ -1254,8 +1247,8 @@ async def test_publish_with_foreign_draft_id_fed_back_as_not_found(
         profile=get_profile("session_analyst_v1"),
         messages=[ChatMessage(role="user", content="分析瑞幸品牌")],
     )
-    assert outcome.status == RunStatus.FAILED
-    assert run.error_code == "ALL_ARTIFACTS_FAILED"
+    assert outcome.status == RunStatus.COMPLETED_WITH_WARNINGS
+    assert run.error_code is None
     # 统一 not_found：不暴露 artifact_busy / owner_run_id。
     fed = gateway.calls[1]["messages"]
     assert any("draft_not_found" in m.content for m in fed)
@@ -1383,8 +1376,8 @@ async def test_published_draft_replayed_by_other_run_emits_no_external_events(
         profile=get_profile("session_analyst_v1"),
         messages=[ChatMessage(role="user", content="分析瑞幸品牌")],
     )
-    # 重放被拒：零发布成功 + 拒绝项 → ALL_ARTIFACTS_FAILED。
-    assert outcome_b.status == RunStatus.FAILED
+    # 重放被拒：零发布成功也可以由 Pi 降级为文字完成并带 warning。
+    assert outcome_b.status == RunStatus.COMPLETED_WITH_WARNINGS
     fed = gateway_b.calls[1]["messages"]
     assert any("draft_not_found" in m.content for m in fed)
     # 引擎不给 run_b 发任何 artifact.published 事件（外部 Artifact 不进入本 Run

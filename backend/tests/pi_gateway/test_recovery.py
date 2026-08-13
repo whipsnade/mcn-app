@@ -101,6 +101,79 @@ async def test_pi_recovery_closes_idempotently_on_durable_completion(db_session,
 
 
 @pytest.mark.asyncio
+async def test_pi_recovery_unknown_result_completes_with_warning_without_new_attempt(
+    db_session, user_factory
+) -> None:
+    user = await _funded_user(db_session, user_factory)
+    session, run, step = await _make_chain(db_session, user.id)
+    run.runtime_backend = "pi"
+    run.profile_name = "utility_v1"
+    run.profile_version = "v1"
+    run.runtime_config_snapshot_json = {
+        "runtime_backend": "pi",
+        "profile_name": "utility_v1",
+        "allowed_artifact_contracts": [],
+        "capability_pack": {
+            "pack_version": "test-pack-v1",
+            "manifest_digest": "test-manifest-digest",
+        },
+        "capability_pack_version": "test-pack-v1",
+        "capability_pack_manifest_digest": "test-manifest-digest",
+    }
+    step.status = "completed"
+    now = utc_now()
+    run.gateway_id = "gateway-unknown-ack"
+    run.gateway_lease_hash = hash_lease_token("lease-token-unknown-ack")
+    run.gateway_lease_expires_at = now - timedelta(seconds=1)
+    run.lease_owner = run.gateway_id
+    run.lease_expires_at = run.gateway_lease_expires_at
+    db_session.add(
+        AgentMessage(
+            id="msg-unknown-ack-completion",
+            session_id=session.id,
+            run_id=run.id,
+            role="assistant",
+            content="已完成可见结论，外部数据状态待核对。",
+            metadata_json={"gateway_message": True},
+            sequence=2,
+            created_at=now,
+        )
+    )
+    db_session.add(
+        AgentToolCall(
+            id="tool-call-unknown-ack",
+            run_id=run.id,
+            step_id=step.id,
+            logical_call_id="logical-unknown-ack",
+            service="insight_cube",
+            internal_tool_name="query_analysis_data",
+            arguments_hash="u" * 64,
+            status="unknown",
+            points_reserved=10,
+            started_at=now,
+        )
+    )
+    await db_session.flush()
+
+    recovery = PiGatewayRecoveryService(db_session, broker=AgentEventBroker(), now_fn=lambda: now)
+
+    assert await recovery.recover_expired_run(run.id) == "completed"
+    assert run.status == RunStatus.COMPLETED_WITH_WARNINGS
+    assert run.infrastructure_retry_count == 0
+    attempts = list(
+        (await db_session.scalars(select(AgentRunAttempt).where(AgentRunAttempt.run_id == run.id))).all()
+    )
+    assert len(attempts) == 1
+    assert attempts[0].outcome == "completed"
+    terminal_events = [
+        event.event_type
+        for event in (await db_session.scalars(select(AgentEvent).where(AgentEvent.run_id == run.id))).all()
+        if event.event_type.startswith("run.")
+    ]
+    assert terminal_events == ["run.completed_with_warnings"]
+
+
+@pytest.mark.asyncio
 async def test_pi_recovery_loop_does_not_reclaim_current_runs(db_session, user_factory) -> None:
     user = await _funded_user(db_session, user_factory)
     _current_session, current_run, _ = await _make_chain(db_session, user.id)

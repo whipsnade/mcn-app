@@ -220,21 +220,18 @@ async def _publish_brand_report(db_session, run, *, source_run_id: str | None = 
 
 
 @pytest.mark.asyncio
-async def test_assistant_without_snapshot_required_artifact_is_rejected(db_session, user_factory):
+async def test_assistant_without_artifact_can_complete(db_session, user_factory):
     user = await user_factory()
     snapshot = {
-        "required_artifact_contract": "brand_report_v3",
-        "profile_name": "brand_analysis_v1",
-        "capability_pack_version": "2026.08.12",
-        "capability_pack_manifest_digest": "sha256:" + "a" * 64,
+        "allowed_artifact_contracts": ["brand_report_v3", "campaign_report_v3"],
     }
     run, _attempt, _tenant_id = await _run(db_session, user, snapshot=snapshot)
     await _assistant(db_session, run)
 
     result = await CompletionValidator(db_session).validate(run)
 
-    assert not result.ok
-    assert result.code == "required_artifact_missing"
+    assert result.ok
+    assert result.artifact_version_id is None
 
 
 @pytest.mark.asyncio
@@ -244,7 +241,6 @@ async def test_tampered_capability_pack_audit_is_rejected(db_session, user_facto
         db_session,
         user,
         snapshot={
-            "required_artifact_contract": "brand_report_v3",
             "capability_pack_manifest_digest": "sha256:" + "b" * 64,
         },
     )
@@ -259,21 +255,21 @@ async def test_tampered_capability_pack_audit_is_rejected(db_session, user_facto
 @pytest.mark.asyncio
 async def test_historical_artifact_cannot_satisfy_current_run(db_session, user_factory):
     user = await user_factory()
-    snapshot = {"required_artifact_contract": "brand_report_v3"}
+    snapshot = {"allowed_artifact_contracts": ["brand_report_v3"]}
     run, _attempt, _tenant_id = await _run(db_session, user, snapshot=snapshot)
     await _assistant(db_session, run)
     await _publish_brand_report(db_session, run, source_run_id=str(uuid4()))
 
     result = await CompletionValidator(db_session).validate(run)
 
-    assert not result.ok
-    assert result.code == "required_artifact_missing"
+    assert result.ok
+    assert result.artifact_version_id is None
 
 
 @pytest.mark.asyncio
 async def test_current_published_artifact_and_lineage_allow_completion(db_session, user_factory):
     user = await user_factory()
-    snapshot = {"required_artifact_contract": "brand_report_v3"}
+    snapshot = {"allowed_artifact_contracts": ["brand_report_v3"]}
     run, _attempt, _tenant_id = await _run(db_session, user, snapshot=snapshot)
     await _assistant(db_session, run)
     await _publish_brand_report(db_session, run)
@@ -326,7 +322,7 @@ async def test_loop_guard_explanation_is_not_a_durable_completion(
 async def test_invalid_frozen_lineage_does_not_allow_completion(db_session, user_factory):
     user = await user_factory()
     run, _attempt, _tenant_id = await _run(
-        db_session, user, snapshot={"required_artifact_contract": "brand_report_v3"}
+        db_session, user, snapshot={"allowed_artifact_contracts": ["brand_report_v3"]}
     )
     await _assistant(db_session, run)
     await _publish_brand_report(db_session, run)
@@ -376,7 +372,9 @@ async def test_unresolved_tenant_permit_blocks_completion_even_without_tool_row(
 
 
 @pytest.mark.asyncio
-async def test_unknown_tool_call_blocks_completion_even_with_assistant(db_session, user_factory):
+async def test_unknown_tool_call_is_warning_but_does_not_trigger_recovery(
+    db_session, user_factory
+):
     user = await user_factory()
     run, attempt, _tenant_id = await _run(db_session, user)
     await _assistant(db_session, run)
@@ -411,8 +409,53 @@ async def test_unknown_tool_call_blocks_completion_even_with_assistant(db_sessio
 
     result = await CompletionValidator(db_session).validate(run)
 
+    assert result.ok
+    assert result.code is None
+    assert "pi_gateway_result_unknown" in result.warnings
+
+
+@pytest.mark.asyncio
+async def test_active_artifact_draft_blocks_completion(db_session, user_factory):
+    user = await user_factory()
+    run, _attempt, _tenant_id = await _run(
+        db_session, user, snapshot={"allowed_artifact_contracts": ["brand_report_v3"]}
+    )
+    await _assistant(db_session, run)
+    now = _now()
+    artifact = AgentArtifact(
+        id=str(uuid4()),
+        session_id=run.session_id,
+        user_id=run.user_id,
+        module="brand",
+        artifact_type="brand_report_v3",
+        artifact_key=f"draft-{uuid4()}",
+        status="draft",
+        latest_version=0,
+        activity_sequence=0,
+        created_at=now,
+        updated_at=now,
+    )
+    db_session.add(artifact)
+    await db_session.flush()
+    db_session.add(
+        ArtifactDraft(
+            id=str(uuid4()),
+            artifact_id=artifact.id,
+            session_id=run.session_id,
+            owner_run_id=run.id,
+            current_revision=1,
+            status="drafting",
+            review_count=0,
+            revision_count=1,
+            updated_at=now,
+        )
+    )
+    await db_session.flush()
+
+    result = await CompletionValidator(db_session).validate(run)
+
     assert not result.ok
-    assert result.code == "pi_gateway_unresolved_mcp_calls"
+    assert result.code == "pi_gateway_active_artifact_draft"
 
 
 @pytest.mark.asyncio

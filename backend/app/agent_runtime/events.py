@@ -524,12 +524,12 @@ class AgentEventStream:
             if allow_system_completion is not None and await allow_system_completion(run):
                 await validate_completion()
                 return await repo.force_complete(
-                    run.id, completion_validator=completion_validator
+                    run.id, outcome=outcome, completion_validator=completion_validator
                 )
             if completion_validator is not None:
                 await validate_completion()
                 return await repo.force_complete(
-                    run.id, completion_validator=completion_validator
+                    run.id, outcome=outcome, completion_validator=completion_validator
                 )
             raise InvalidRunTransition("run_lease_not_held")
         # FAILED：持租约走状态机；无租约/过期走系统级 force_fail（error_code 落 Run 行）。

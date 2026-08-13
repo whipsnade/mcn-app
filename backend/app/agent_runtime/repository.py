@@ -206,6 +206,7 @@ class AgentRunRepository:
         self,
         run_id: str,
         *,
+        outcome: RunStatus = RunStatus.COMPLETED,
         completion_validator: Callable[[object], Awaitable[object]] | None = None,
     ) -> bool:
         """系统级完成收口：必须在同一持锁边界再次执行完成契约。
@@ -230,9 +231,11 @@ class AgentRunRepository:
             run.lease_expires_at is None or run.lease_expires_at > utc_now()
         ):
             return False
-        ensure_transition(RunStatus(run.status), RunStatus.COMPLETED)
+        if outcome not in (RunStatus.COMPLETED, RunStatus.COMPLETED_WITH_WARNINGS):
+            raise InvalidRunTransition("force_complete_outcome_invalid")
+        ensure_transition(RunStatus(run.status), outcome)
         now = utc_now()
-        run.status = RunStatus.COMPLETED
+        run.status = outcome
         run.completed_at = run.completed_at or now
         run.error_code = None
         run.lease_owner = None

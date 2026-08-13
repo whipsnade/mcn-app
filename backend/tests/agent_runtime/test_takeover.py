@@ -499,11 +499,11 @@ async def test_takeover_after_dispatch_reuses_step_and_never_redispatches(
     run_id = await executor.claim_and_process_one()
 
     assert run_id == run.id
-    # unknown 调用仍保留预留，不能被模型的 assistant 结论越过完成门禁；
-    # 接管路径应以稳定业务失败结束且不重发外部调用。
+    # unknown 调用仍保留预留；平台允许文字结论完成，但必须带 warning，
+    # 且接管路径不得自动重发外部调用。
     fresh_run = await db_session.get(AgentRun, run.id)
-    assert fresh_run.status == RunStatus.FAILED
-    assert fresh_run.error_code == "pi_gateway_unresolved_mcp_calls"
+    assert fresh_run.status == RunStatus.COMPLETED_WITH_WARNINGS
+    assert fresh_run.error_code is None
     # 第一轮 decide 的 transcript 已回放 unknown 结果（不依赖模型记忆防重）
     first_messages = gateway.calls[0]["messages"]
     assert any(

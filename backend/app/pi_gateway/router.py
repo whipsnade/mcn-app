@@ -367,10 +367,12 @@ async def terminal(
     # the authoritative gateway/attempt/lease validation under the Run lock.
     gateway_id = await _authenticate_run_access(request, db, x_pi_run_lease)
     outcome = RunStatus(payload.outcome)
+    effective_outcome = outcome
     stream = AgentEventStream(db, request.app.state.agent_event_broker)
     completion_validator = CompletionValidator(db)
 
     async def _do() -> tuple[object, object]:
+        nonlocal effective_outcome
         session_id = await db.scalar(select(AgentRun.session_id).where(AgentRun.id == run_id))
         if not session_id:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="pi_gateway_run_not_found")
@@ -395,6 +397,8 @@ async def terminal(
                     status_code=status.HTTP_409_CONFLICT,
                     detail=validation.code or "pi_gateway_terminal_rejected",
                 )
+            if outcome == RunStatus.COMPLETED and getattr(validation, "warnings", ()):
+                effective_outcome = RunStatus.COMPLETED_WITH_WARNINGS
 
         async def cleanup_before_commit(locked_run) -> None:
             attempt = await db.scalar(
@@ -403,7 +407,11 @@ async def terminal(
                 .with_for_update()
             )
             if attempt is not None and attempt.outcome == "running":
-                attempt.outcome = "completed" if outcome == RunStatus.COMPLETED_WITH_WARNINGS else outcome.value
+                attempt.outcome = (
+                    "completed"
+                    if effective_outcome == RunStatus.COMPLETED_WITH_WARNINGS
+                    else effective_outcome.value
+                )
                 attempt.ended_at = _service(db, gateway_id).now_fn()
             if outcome == RunStatus.FAILED:
                 failure_payload = payload.payload or {}
@@ -432,16 +440,22 @@ async def terminal(
             locked_run.lease_expires_at = None
 
         try:
+            terminal_payload = dict(payload.payload or {})
+            if effective_outcome == RunStatus.COMPLETED_WITH_WARNINGS:
+                validation_warnings = await completion_validator.validate(run)
+                warnings = getattr(validation_warnings, "warnings", ())
+                if warnings:
+                    terminal_payload.setdefault("warnings", list(warnings))
             event = await stream.settle_terminal(
                 run.id,
                 run.user_id,
-                outcome,
-                payload.payload,
+                effective_outcome,
+                terminal_payload,
                 worker_id=gateway_id,
                 before_commit=cleanup_before_commit,
                 completion_validator=(
                     completion_validator.validate
-                    if outcome in (RunStatus.COMPLETED, RunStatus.COMPLETED_WITH_WARNINGS)
+                    if effective_outcome in (RunStatus.COMPLETED, RunStatus.COMPLETED_WITH_WARNINGS)
                     else None
                 ),
             )
@@ -471,6 +485,6 @@ async def terminal(
         reconciliation_status = "unavailable"
     return {
         "event_id": event.id if event else None,
-        "status": outcome.value,
+        "status": effective_outcome.value,
         "reconciliation_status": reconciliation_status,
     }

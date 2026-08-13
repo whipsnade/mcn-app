@@ -928,16 +928,29 @@ class PiGatewayRecoveryService:
                 locked_run.gateway_lease_expires_at = None
                 locked_run.gateway_id = None
 
+            completion_outcome = (
+                RunStatus.COMPLETED_WITH_WARNINGS
+                if completion.warnings
+                else RunStatus.COMPLETED
+            )
             event = await AgentEventStream(self.db, self.broker).settle_terminal(
                 run.id,
                 run.user_id,
-                RunStatus.COMPLETED,
-                {"recovered_after_terminal_ack_lost": True},
+                completion_outcome,
+                {
+                    "recovered_after_terminal_ack_lost": True,
+                    **({"warnings": list(completion.warnings)} if completion.warnings else {}),
+                },
                 before_commit=complete_before_commit,
                 completion_validator=completion_validator.validate,
             )
             await self._reconcile_after_terminal(run.id)
-            return "completed" if event is not None or run.status == RunStatus.COMPLETED else "ignored"
+            return (
+                "completed"
+                if event is not None
+                or run.status in (RunStatus.COMPLETED, RunStatus.COMPLETED_WITH_WARNINGS)
+                else "ignored"
+            )
         if completion.code != "pi_gateway_terminal_missing_completion":
             # assistant 已落库但 artifact/Step/MCP 契约不满足时是稳定业务失败，
             # 不能把它误判为基础设施丢失而启动新 Attempt。

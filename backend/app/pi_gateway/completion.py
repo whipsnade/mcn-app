@@ -1,8 +1,8 @@
-"""Pi Run 的统一业务完成契约。
+"""Pi Run 的统一平台完成契约。
 
 该模块是正常 terminal、ACK 丢失恢复以及系统 force-complete 共用的唯一成功
-判定。尤其是 required artifact 必须来自 Run 创建时冻结的快照，不能从当前
-profile、builder 调用记录或模型文本反推。
+判定。它只守住平台一致性；是否完成用户目标、是否生成报告以及选择哪种
+artifact contract 都由 Pi 决定，UAT 另行评价。
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ from app.agent_artifacts.models import (
     AgentArtifact,
     AgentArtifactVersion,
     ArtifactPublishAttempt,
+    ArtifactDraft,
     ArtifactDraftRevision,
 )
 from app.agent_runtime.models import (
@@ -41,6 +42,7 @@ class CompletionValidationResult:
     code: str | None = None
     detail: str | None = None
     artifact_version_id: str | None = None
+    warnings: tuple[str, ...] = ()
 
     def __bool__(self) -> bool:
         return self.ok
@@ -53,7 +55,13 @@ class CompletionValidator:
         self.db = db
 
     async def validate(self, run: AgentRun) -> CompletionValidationResult:
-        """按固定顺序检查 durable message、运行中工作、未决 MCP 与产物。"""
+        """按固定顺序检查 durable message、运行中工作、MCP 与已存在产物。
+
+        ``result_unknown`` 是会计上的未决事实，不是平台可以擅自重放或释放
+        的失败。只要没有 running/unresolved row，它会以 warning 伴随文本
+        完成；真正仍在生命周期中的 permit/Step 继续阻止成功终态。
+        """
+        warnings: list[str] = []
         assistant_messages = list(
             (
                 await self.db.scalars(
@@ -97,54 +105,96 @@ class CompletionValidator:
                 "running AgentStep remains open",
             )
 
-        unresolved_call_id = await self.db.scalar(
-            select(AgentToolCall.id)
-            .where(
-                AgentToolCall.run_id == run.id,
-                # planned 也不能在成功终态留下；它代表还未完成 permit 生命周期。
-                AgentToolCall.status.in_(
-                    ("planned", "reserved", "running", "unknown")
-                ),
-            )
-            .limit(1)
+        unresolved_calls = list(
+            (
+                await self.db.execute(
+                    select(AgentToolCall.id, AgentToolCall.status).where(
+                        AgentToolCall.run_id == run.id,
+                        AgentToolCall.status.in_(
+                            ("planned", "reserved", "running", "unknown")
+                        ),
+                    )
+                )
+            ).all()
         )
-        if unresolved_call_id is not None:
+        active_call = next(
+            ((call_id, call_status) for call_id, call_status in unresolved_calls if call_status != "unknown"),
+            None,
+        )
+        if active_call is not None:
             return CompletionValidationResult(
                 False,
                 "pi_gateway_unresolved_mcp_calls",
                 "MCP ToolCall or permit remains unresolved",
             )
+        if unresolved_calls:
+            warnings.append("pi_gateway_result_unknown")
 
         reserve = TenantWalletTransaction
         terminal_ledger = aliased(TenantWalletTransaction)
-        unresolved_permit_id = await self.db.scalar(
-            select(reserve.id)
-            .where(
-                reserve.run_id == run.id,
-                reserve.tool_call_id.is_not(None),
-                reserve.kind == "reserve",
-                ~select(terminal_ledger.id)
-                .where(
-                    terminal_ledger.reference_id == reserve.id,
-                    terminal_ledger.kind.in_(("settle", "release")),
+        unresolved_reserves = list(
+            (
+                await self.db.execute(
+                    select(reserve.id, AgentToolCall.status)
+                    .outerjoin(AgentToolCall, AgentToolCall.id == reserve.tool_call_id)
+                    .where(
+                        reserve.run_id == run.id,
+                        reserve.tool_call_id.is_not(None),
+                        reserve.kind == "reserve",
+                        ~select(terminal_ledger.id)
+                        .where(
+                            terminal_ledger.reference_id == reserve.id,
+                            terminal_ledger.kind.in_(("settle", "release")),
+                        )
+                        .exists(),
+                    )
                 )
-                .exists(),
-            )
-            .limit(1)
+            ).all()
         )
-        if unresolved_permit_id is not None:
+        for _reserve_id, call_status in unresolved_reserves:
+            if call_status == "unknown":
+                if "pi_gateway_result_unknown" not in warnings:
+                    warnings.append("pi_gateway_result_unknown")
+                continue
             return CompletionValidationResult(
                 False,
                 "pi_gateway_unresolved_mcp_calls",
                 "tenant MCP permit remains unresolved",
             )
 
+        active_draft_id = await self.db.scalar(
+            select(ArtifactDraft.id).where(
+                ArtifactDraft.owner_run_id == run.id,
+                ArtifactDraft.status.in_(("drafting", "reviewing")),
+            ).limit(1)
+        )
+        if active_draft_id is not None:
+            return CompletionValidationResult(
+                False,
+                "pi_gateway_active_artifact_draft",
+                "an active Artifact Draft must be published or abandoned before completion",
+            )
+        abandoned_draft = await self.db.scalar(
+            select(ArtifactDraft.id)
+            .join(ArtifactDraftRevision, ArtifactDraftRevision.draft_id == ArtifactDraft.id)
+            .where(
+                ArtifactDraftRevision.run_id == run.id,
+                ArtifactDraft.status == "failed",
+            )
+            .limit(1)
+        )
+        if abandoned_draft is not None:
+            warnings.append("pi_gateway_abandoned_artifact_draft")
+
+        # A Draft owned by another live Run is not an unfinished obligation of
+        # this Run. Cross-Run isolation is checked by publication/lineage, but
+        # it must not turn an otherwise valid text completion into a global
+        # session business gate.
         # The legacy/current executor has its own artifact lifecycle and does
-        # not create a Pi RuntimeSnapshot.  The frozen capability-pack
-        # contract below is specifically the Pi production boundary; shared
-        # event code still benefits from the assistant/Step/MCP checks above.
+        # not create a Pi RuntimeSnapshot.  Shared lifecycle checks above still
+        # apply to it.
         if run.runtime_backend != "pi":
-            return CompletionValidationResult(True)
+            return CompletionValidationResult(True, warnings=tuple(warnings))
 
         snapshot = run.runtime_config_snapshot_json
         if not isinstance(snapshot, dict):
@@ -170,107 +220,174 @@ class CompletionValidator:
                 "required_artifact_missing",
                 "frozen capability pack audit fields are missing or inconsistent",
             )
-        required_contract = (
-            snapshot.get("required_artifact_contract")
-        )
-        artifact_mode = snapshot.get("artifact_contract_mode")
-        if artifact_mode not in {"required", "none"}:
+
+        allowed_contracts = snapshot.get("allowed_artifact_contracts", ())
+        if not isinstance(allowed_contracts, (list, tuple)) or any(
+            not isinstance(contract, str) or not contract for contract in allowed_contracts
+        ) or len(set(allowed_contracts)) != len(allowed_contracts):
             return CompletionValidationResult(
                 False,
                 "required_artifact_missing",
-                "frozen artifact contract mode is missing",
+                "frozen artifact contract allowlist is invalid",
             )
-        if artifact_mode == "required" and not required_contract:
-            return CompletionValidationResult(
-                False,
-                "required_artifact_missing",
-                "frozen required artifact contract is missing",
-            )
-        if artifact_mode == "none":
-            if required_contract is not None:
+
+        # Historical snapshots may carry an explicit required contract.  It is
+        # preserved for read-only compatibility, but new snapshots never set
+        # these fields and therefore have no required artifact gate.
+        legacy_required = snapshot.get("artifact_contract_mode") == "required"
+        required_contract = snapshot.get("required_artifact_contract")
+        if legacy_required:
+            if not isinstance(required_contract, str) or not required_contract:
                 return CompletionValidationResult(
                     False,
                     "required_artifact_missing",
-                    "no-artifact snapshot carries a required contract",
+                    "historical required artifact contract is invalid",
                 )
-            return CompletionValidationResult(True)
-        if not isinstance(required_contract, str) or not required_contract:
+            version, validation_error = await self._find_valid_published_version(
+                run, required_contract
+            )
+            if version is None:
+                code = (
+                    "required_artifact_invalid_lineage"
+                    if validation_error == "published artifact lineage snapshot is invalid"
+                    else "required_artifact_missing"
+                )
+                return CompletionValidationResult(False, code, validation_error)
             return CompletionValidationResult(
-                False,
-                "required_artifact_missing",
-                "frozen required artifact contract is invalid",
+                True, artifact_version_id=version.id, warnings=tuple(warnings)
             )
 
-        version, validation_error = await self._find_valid_published_version(
-            run, required_contract
-        )
-        if version is None:
-            code = (
-                "required_artifact_invalid_lineage"
-                if validation_error == "published artifact lineage snapshot is invalid"
-                else "required_artifact_missing"
+        versions = await self._current_published_versions(run)
+        if not versions:
+            published_attempt_exists = await self.db.scalar(
+                select(ArtifactPublishAttempt.id)
+                .where(
+                    ArtifactPublishAttempt.run_id == run.id,
+                    ArtifactPublishAttempt.status == "published",
+                )
+                .limit(1)
             )
-            return CompletionValidationResult(False, code, validation_error)
-        return CompletionValidationResult(True, artifact_version_id=version.id)
+            if published_attempt_exists is not None:
+                return CompletionValidationResult(
+                    False,
+                    "pi_gateway_artifact_invalid",
+                    "published artifact Version is missing or does not belong to this Run",
+                )
+            return CompletionValidationResult(True, warnings=tuple(warnings))
+
+        for version, artifact, revision, publication in versions:
+            if (
+                version.artifact_id != artifact.id
+                or version.source_draft_revision_id != revision.id
+                or publication.published_version_id != version.id
+                or publication.artifact_id != artifact.id
+                or revision.schema_version != version.schema_version
+                or revision.artifact_id != artifact.id
+            ):
+                return CompletionValidationResult(
+                    False,
+                    "pi_gateway_artifact_invalid",
+                    "published artifact Version chain is inconsistent",
+                )
+            if version.schema_version not in set(allowed_contracts):
+                return CompletionValidationResult(
+                    False,
+                    "pi_gateway_artifact_contract_not_allowed",
+                    "published artifact contract is outside the frozen capability allowlist",
+                )
+            validation_error = await self._validate_published_version(
+                run, version, publication
+            )
+            if validation_error is not None:
+                code = (
+                    "required_artifact_invalid_lineage"
+                    if validation_error == "published artifact lineage snapshot is invalid"
+                    else "pi_gateway_artifact_invalid"
+                )
+                return CompletionValidationResult(False, code, validation_error)
+        return CompletionValidationResult(
+            True, artifact_version_id=versions[0][0].id, warnings=tuple(warnings)
+        )
 
     async def _find_valid_published_version(
         self, run: AgentRun, required_contract: str
     ) -> tuple[AgentArtifactVersion | None, str | None]:
         """只接受当前 Run 发布的、当前 latest、lineage 完整的 Version。"""
-        row = (
-            await self.db.execute(
-                select(
-                    AgentArtifactVersion,
-                    AgentArtifact,
-                    ArtifactDraftRevision,
-                    ArtifactPublishAttempt,
-                )
-                .join(AgentArtifact, AgentArtifact.id == AgentArtifactVersion.artifact_id)
-                .join(AgentSession, AgentSession.id == AgentArtifact.session_id)
-                .join(
-                    ArtifactDraftRevision,
-                    ArtifactDraftRevision.id
-                    == AgentArtifactVersion.source_draft_revision_id,
-                )
-                .join(
-                    ArtifactPublishAttempt,
-                    (
-                        (ArtifactPublishAttempt.published_version_id == AgentArtifactVersion.id)
-                        & (ArtifactPublishAttempt.draft_revision_id == ArtifactDraftRevision.id)
-                    ),
-                )
-                .where(
-                    AgentArtifact.session_id == run.session_id,
-                    AgentArtifact.user_id == run.user_id,
-                    AgentSession.tenant_id == run.tenant_id,
-                    AgentArtifact.status == "published",
-                    AgentArtifactVersion.version == AgentArtifact.latest_version,
-                    AgentArtifactVersion.schema_version == required_contract,
-                    AgentArtifactVersion.source_run_id == run.id,
-                    ArtifactDraftRevision.run_id == run.id,
-                    ArtifactPublishAttempt.run_id == run.id,
-                    ArtifactPublishAttempt.status == "published",
-                    ArtifactDraftRevision.schema_version == required_contract,
-                    AgentArtifactVersion.lineage_snapshot_json.is_not(None),
-                    AgentArtifactVersion.validation_json.is_not(None),
-                )
-                .limit(1)
-            )
-        ).first()
-        if row is None:
+        rows = await self._current_published_versions(
+            run, required_contract=required_contract
+        )
+        if not rows:
             return None, "no published artifact Version belongs to this Run"
-        version, _artifact, _revision, publication = row
+        for version, _artifact, _revision, publication in rows:
+            error = await self._validate_published_version(run, version, publication)
+            if error is None:
+                return version, None
+            return None, error
+        return None, "published artifact Version is invalid"
+
+    async def _current_published_versions(
+        self, run: AgentRun, *, required_contract: str | None = None
+    ) -> list[tuple[AgentArtifactVersion, AgentArtifact, ArtifactDraftRevision, ArtifactPublishAttempt]]:
+        """Load only versions whose complete publication chain belongs to Run."""
+        statement = (
+            select(
+                AgentArtifactVersion,
+                AgentArtifact,
+                ArtifactDraftRevision,
+                ArtifactPublishAttempt,
+            )
+            .join(AgentArtifact, AgentArtifact.id == AgentArtifactVersion.artifact_id)
+            .join(AgentSession, AgentSession.id == AgentArtifact.session_id)
+            .join(
+                ArtifactDraftRevision,
+                ArtifactDraftRevision.id == AgentArtifactVersion.source_draft_revision_id,
+            )
+            .join(
+                ArtifactPublishAttempt,
+                (
+                    (ArtifactPublishAttempt.published_version_id == AgentArtifactVersion.id)
+                    & (ArtifactPublishAttempt.draft_revision_id == ArtifactDraftRevision.id)
+                ),
+            )
+            .where(
+                AgentArtifact.session_id == run.session_id,
+                AgentArtifact.user_id == run.user_id,
+                AgentSession.tenant_id == run.tenant_id,
+                AgentArtifact.status == "published",
+                AgentArtifactVersion.version == AgentArtifact.latest_version,
+                AgentArtifactVersion.source_run_id == run.id,
+                ArtifactDraftRevision.run_id == run.id,
+                ArtifactPublishAttempt.run_id == run.id,
+                ArtifactPublishAttempt.status == "published",
+            )
+        )
+        if required_contract is not None:
+            statement = statement.where(
+                AgentArtifactVersion.schema_version == required_contract,
+                ArtifactDraftRevision.schema_version == required_contract,
+            )
+        return list((await self.db.execute(statement)).all())
+
+    async def _validate_published_version(
+        self,
+        run: AgentRun,
+        version: AgentArtifactVersion,
+        publication: ArtifactPublishAttempt,
+    ) -> str | None:
+        """Validate lineage and immutable publication snapshots for one Version."""
+        if version.lineage_snapshot_json is None:
+            return "published artifact lineage snapshot is invalid"
         if not await self._valid_lineage(version.lineage_snapshot_json, run, version):
-            return None, "published artifact lineage snapshot is invalid"
+            return "published artifact lineage snapshot is invalid"
         validation = version.validation_json
         if not isinstance(validation, dict) or validation.get("valid") is not True:
-            return None, "published artifact validation snapshot is invalid"
+            return "published artifact validation snapshot is invalid"
         publication_validation = publication.validation_json
         if not isinstance(publication_validation, dict) or publication_validation.get("valid") is not True:
-            return None, "published artifact publication validation snapshot is invalid"
+            return "published artifact publication validation snapshot is invalid"
         if not isinstance(version.payload_json, dict):
-            return None, "published artifact payload is invalid"
-        return version, None
+            return "published artifact payload is invalid"
+        return None
 
     async def _valid_lineage(
         self, value: Any, run: AgentRun, version: AgentArtifactVersion

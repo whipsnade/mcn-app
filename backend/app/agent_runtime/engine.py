@@ -132,7 +132,6 @@ from app.agent_runtime.tools.mcp import DEFINITELY_NOT_SENT
 from app.agent_runtime.tools.registry import ToolRegistry, UnknownToolError
 from app.billing.service import InsufficientPointsError
 from app.model.contracts import ChatMessage
-from app.pi_gateway.loop_guard import AGENT_LOOP_CIRCUIT_OPEN
 
 logger = logging.getLogger(__name__)
 
@@ -375,11 +374,6 @@ class AgentEngine:
                         # decide→dispatch 间隙收到取消：不发起新调用，直接收口 cancelled
                         await self._settle_cancelled(run)
                         break
-                    if call_result == "circuit_open":
-                        # LoopGuard 已持久化一次解释性 assistant message；熔断后
-                        # 不再把稳定业务失败回喂模型继续空转，直接以稳定终态收口。
-                        await self._fail_run(run, error_code=AGENT_LOOP_CIRCUIT_OPEN)
-                        break
                     continue
                 if action.action == "publish_artifacts":
                     dispatch = await self._handle_publish_artifacts(
@@ -621,8 +615,6 @@ class AgentEngine:
         # （tool 事件之后、终态事件之前），kol_detail Run 同样覆盖。
         await self._emit_draft_tool_event(run, action, result)
         self._feed_tool_result(conversation, result)
-        if result.error_type == AGENT_LOOP_CIRCUIT_OPEN:
-            return "circuit_open"
         return "resumed" if resumed is not None else "ok"
 
     async def _emit_draft_tool_event(
@@ -870,10 +862,9 @@ class AgentEngine:
         """complete：写 assistant 消息，按发布/失败项聚合终态（设计 §4.2）。
 
         调用前主循环已过活动 Draft 闸门（本 Run 无持有 Draft）。
-        终态聚合：有产物发布成功且存在未最终发布的失败/放弃项 →
-        ``completed_with_warnings``；零产物成功且存在失败/放弃项 →
-        ``failed``（``error_code=ALL_ARTIFACTS_FAILED``，与其他失败路径共用
-        ``run.failed`` 终态事件通道）；无失败项 → ``completed``。
+        终态聚合：有未最终发布的失败/放弃项或统一 completion validator 返回
+        warning → ``completed_with_warnings``；否则 ``completed``。失败/放弃
+        本身不定义用户业务目标，也不能强制 Pi 必须创建某类 Artifact。
         §5.8 事件顺序：缺失的 artifact.published（崩溃窗口兜底）→
         message.completed → run.completed / run.completed_with_warnings / run.failed。
         H1：Run 迁移与终态事件由 settle_terminal 同一加锁事务提交，
@@ -881,7 +872,7 @@ class AgentEngine:
         """
         metadata = {"type": "completion", "suggestions": action.suggestions}
         await self._emit_missing_published_events(run)
-        published_ids, warning_artifact_ids = await self._publish_outcome_artifact_ids(run)
+        _published_ids, warning_artifact_ids = await self._publish_outcome_artifact_ids(run)
         # 先持久化本次 completion，再由统一 validator 检查真实 Step/ToolCall
         # 状态；只有门禁通过后才发 message.completed。不能先收口 running Step
         # 再检查，否则 ACK 丢失窗口会被伪装成可完成。
@@ -892,40 +883,36 @@ class AgentEngine:
             content=action.text,
             metadata=metadata,
         )
-        completion_validator = None
-        if not (warning_artifact_ids and not published_ids):
-            from app.pi_gateway.completion import CompletionValidator
+        from app.pi_gateway.completion import CompletionValidator
 
-            completion_validator = CompletionValidator(self._db).validate
-            validation = await completion_validator(run)
-            if not bool(validation):
-                code = getattr(validation, "code", None)
-                raise InvalidRunTransition(
-                    code if isinstance(code, str) else "completion_validation_failed"
-                )
+        completion_validator = CompletionValidator(self._db).validate
+        validation = await completion_validator(run)
+        if not bool(validation):
+            code = getattr(validation, "code", None)
+            raise InvalidRunTransition(
+                code if isinstance(code, str) else "completion_validation_failed"
+            )
+        validation_warnings = tuple(
+            warning for warning in getattr(validation, "warnings", ()) if isinstance(warning, str)
+        )
 
         await self._events.append(
             run.id, run.user_id, "message.completed", {"type": "completion"}
         )
-        if warning_artifact_ids and not published_ids:
-            # 零发布成功 + 有失败/放弃项：complete 交付为空，按失败收口。
-            run.error_code = "ALL_ARTIFACTS_FAILED"
-            await self._events.settle_terminal(
-                run.id,
-                run.user_id,
-                RunStatus.FAILED,
-                {"outcome": "failed", "error_code": "ALL_ARTIFACTS_FAILED"},
-                worker_id=self._worker_id,
-            )
-        elif warning_artifact_ids:
+        if warning_artifact_ids or validation_warnings:
+            # Builder 失败/放弃不再定义业务失败；Pi 可以降级为文字完成。
+            # 平台只把 abandoned Draft、unknown 等一致性限制作为 warning
+            # 暴露给 UI/UAT，不能借此推导用户必须交付某种 Artifact。
+            warning_payload: dict[str, Any] = {"outcome": "completed_with_warnings"}
+            if warning_artifact_ids:
+                warning_payload["warning_artifact_ids"] = sorted(warning_artifact_ids)
+            if validation_warnings:
+                warning_payload["warnings"] = list(validation_warnings)
             await self._events.settle_terminal(
                 run.id,
                 run.user_id,
                 RunStatus.COMPLETED_WITH_WARNINGS,
-                {
-                    "outcome": "completed_with_warnings",
-                    "warning_artifact_ids": sorted(warning_artifact_ids),
-                },
+                warning_payload,
                 worker_id=self._worker_id,
                 completion_validator=completion_validator,
             )
