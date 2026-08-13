@@ -1,7 +1,7 @@
 # Pi 自主决策边界纠偏设计
 
-日期：2026-08-13  
-范围：Pi Agent Runtime、MCP accounting bridge、Evidence/Artifact terminal gate 及离线回归  
+日期：2026-08-13
+范围：Pi Agent Runtime、MCP accounting bridge、Evidence/Artifact terminal gate 及离线回归
 目标：恢复模型主导的业务决策边界，同时保留平台级安全、计费、证据完整性和终态一致性约束。
 
 ## 1. 决策结论

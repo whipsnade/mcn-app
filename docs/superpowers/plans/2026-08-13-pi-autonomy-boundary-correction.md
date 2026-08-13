@@ -1,7 +1,7 @@
 # Pi 自主决策边界纠偏实施计划
 
-基线：`a53533bbb60c37fc0f74afec51e068262d02de1f`  
-分支：`codex/pi-autonomy-boundary-correction`  
+基线：`a53533bbb60c37fc0f74afec51e068262d02de1f`
+分支：`codex/pi-autonomy-boundary-correction`
 范围：离线 TDD；不调用真实模型/DataTap/钱包，不创建 UAT Run。
 
 ## 执行约束
