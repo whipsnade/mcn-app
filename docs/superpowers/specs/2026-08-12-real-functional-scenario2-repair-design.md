@@ -1,5 +1,9 @@
 # Scenario 2 生产链路修复设计
 
+> **SUPERSEDED（2026-08-13）**：本文记录的 Evidence Bridge 方案已被
+> `2026-08-13-pi-direct-mcp-result-artifact-skill-design.md` 覆盖。本文正文
+> 保留为历史事实，不再作为当前 Pi production path 的实现依据。
+
 日期：2026-08-12
 
 状态：已实施，独立代码审查通过（Critical 0 / Important 0 / Minor 0）
