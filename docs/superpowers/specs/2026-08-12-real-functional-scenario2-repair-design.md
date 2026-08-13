@@ -2,7 +2,7 @@
 
 日期：2026-08-12
 
-状态：已批准，待 TDD 实施
+状态：已实施，独立代码审查通过（Critical 0 / Important 0 / Minor 0）
 
 ## 背景与范围
 
@@ -17,8 +17,10 @@
 `RuntimeConfigVersion.config_json` 新增服务端维护的 `profile_artifact_contracts` 映射。该映射只能由管理员通过已激活、不可变的 runtime config 版本提供；创建时必须同时满足：
 
 1. profile 名称存在于服务端 `AgentProfile` 注册表；
-2. artifact contract 存在于本次已审核 capability pack 的 contract 清单；
-3. profile 允许 artifact 工具，且 contract 与审核 skill 的 contract 一致；
+2. artifact contract 必须来自本次已审核 capability pack 的 typed contract
+   清单，或来自该 pack 中审核 Skill 自己声明的 typed `artifact_contract`
+   （例如钻取看板）；
+3. profile 允许 artifact 工具，且 contract 与审核 Skill 的 contract 一致；
 4. contract 不是从用户文本、模型动作、builder 调用、Draft 类型或已写入的 Artifact 反推。
 
 Run 创建入口把服务端固定的 `profile_name` 传给 `snapshot_for_new_run`。该方法从当前激活 config 的审核 capability pack/profile policy 解析唯一的 `required_artifact_contract`，并在同一事务中生成快照。没有要求产物的 profile 显式保存 `null`，不能在后续执行中升级为必需产物。
@@ -83,8 +85,8 @@ Gateway/adapter 边界只产生下面一种 MCP 成功结果形状：
 | 外部事实 | ToolCall | 钱包预留 | Evidence |
 | --- | --- | --- | --- |
 | confirmed success + valid payload | `settled` | 归零 | 一条且仅一条 |
-| confirmed success + empty | `failed(error_type=succeeded_empty)` | 归零 | 无 |
-| confirmed success + unavailable | `failed(error_type=result_unavailable)` | 归零 | 无 |
+| confirmed success + empty | `settled(error_type=succeeded_empty)` | 归零 | 无 |
+| confirmed success + unavailable | `settled(error_type=result_unavailable)` | 归零 | 无 |
 | confirmed failure | `failed(error_type=failed_confirmed/definitely_not_sent)` | 释放 | 无 |
 | 无法确认是否外发/成功 | `unknown(error_type=result_unknown)` | 保留 | 无 |
 
@@ -163,4 +165,4 @@ Pi projector 按 thinking/message 两个通道合并 delta，默认每批最多 
 8. Scenario 1 裸 MCP 名称映射、模型决策限制、usage 去重、terminal ACK、既有 Evidence/Builder/Publication/Version/Gate 测试不回归。
 9. 完整 fake topology 离线 Pi UAT 一轮；不设置真实凭证，不调用真实服务。
 
-验证命令、红绿结果和剩余风险追加到 `changelog/2026-08-12.md`，不改写历史 operator report。完成后的唯一对外状态为 `READY_FOR_FUNCTIONAL_SCENARIO_2_RERUN_REVIEW`。
+验证命令、红绿结果和剩余风险追加到当日 `changelog/2026-08-13.md`，不改写历史 operator report。完成后的唯一对外状态为 `READY_FOR_FUNCTIONAL_SCENARIO_2_RERUN_REVIEW`。
