@@ -130,7 +130,6 @@ async def _create_activate_pi_config(
     tenant_id: str,
     *,
     max_decisions: int | None = 50,
-    profile_artifact_contracts: dict[str, str] | None = None,
 ) -> str:
     """经管理 API 创建并激活一个租户 Pi 配置版本（灰度升级路径），返回 config_id。
 
@@ -158,11 +157,6 @@ async def _create_activate_pi_config(
                 },
             },
         }
-        payload["profile_artifact_contracts"] = {
-            "session_analyst_v1": "none",
-            "kol_detail_v1": "insight_board_v1",
-            **(profile_artifact_contracts or {}),
-        }
         created = await admin.post(
             "/api/v1/admin/runtime-configs",
             headers={"Idempotency-Key": str(uuid4())},
@@ -183,14 +177,12 @@ async def _enable_pi(
     tenant_id: str,
     *,
     max_decisions: int | None = 50,
-    profile_artifact_contracts: dict[str, str] | None = None,
 ) -> str:
     """经管理 API 创建并激活租户 Pi 配置，再切 backend（真实灰度路径）。"""
     config_id = await _create_activate_pi_config(
         topology,
         tenant_id,
         max_decisions=max_decisions,
-        profile_artifact_contracts=profile_artifact_contracts,
     )
     async with topology.admin_client() as admin:
         switched = await admin.patch(
@@ -228,7 +220,6 @@ async def test_brand_report_full_chain_same_version_excel_bi_and_gate() -> None:
         await _enable_pi(
             topology,
             tenant.tenant_id,
-            profile_artifact_contracts={"session_analyst_v1": "brand_report_v3"},
         )
         user = tenant.users[0]
         # 账本断言只依赖不变量：运行前后余额差恰好等于 4 次 MCP 结算（40 分），
@@ -1067,10 +1058,6 @@ async def test_unreachable_mcp_releases_reservation_with_zero_external_calls() -
                             "social-grow": f"http://127.0.0.1:{dead_port}/api/gateway/social-grow-mcp/mcp",
                         },
                     },
-                    "profile_artifact_contracts": {
-                        "session_analyst_v1": "none",
-                        "kol_detail_v1": "insight_board_v1",
-                    },
                 },
             )
             assert created.status_code == 201, created.text
@@ -1332,7 +1319,6 @@ async def test_drilldown_binds_exact_version_with_zero_datatap() -> None:
         await _enable_pi(
             topology,
             tenant.tenant_id,
-            profile_artifact_contracts={"session_analyst_v1": "brand_report_v3"},
         )
         user = tenant.users[0]
         session_id = await topology.create_session(user)
@@ -1351,13 +1337,9 @@ async def test_drilldown_binds_exact_version_with_zero_datatap() -> None:
         brand_version = versions[0]
         assert brand_version.schema_version == "brand_report_v3"
         mcp_before = [len(service.calls) for service in topology.mcp_services]
-        # 钻取是另一个已审核 capability/profile 合约：其当前 Run 要求
-        # insight_board_v1，而不是把父 Run 的 brand_report_v3 合约或 builder
-        # 调用结果带入当前 Run。新配置版本会在 Run 创建时冻结这个选择。
         await _enable_pi(
             topology,
             tenant.tenant_id,
-            profile_artifact_contracts={"session_analyst_v1": "insight_board_v1"},
         )
         # 第二条 Run：同一 Session 钻取，真实 artifact/version id 拼进消息文本
         second = await topology.send_message(
@@ -1753,12 +1735,10 @@ async def test_fair_scheduling_two_tenants_share_capacity() -> None:
         await _enable_pi(
             topology,
             tenant_a.tenant_id,
-            profile_artifact_contracts={"session_analyst_v1": "brand_report_v3"},
         )
         await _enable_pi(
             topology,
             tenant_b.tenant_id,
-            profile_artifact_contracts={"session_analyst_v1": "brand_report_v3"},
         )
         # 账本断言只依赖不变量：运行前后余额差恰好等于各自 4 次 MCP 结算（40 分）
         async with SessionFactory() as db:
