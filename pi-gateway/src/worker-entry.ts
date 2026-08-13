@@ -58,7 +58,6 @@ export type WorkerFailureCode =
   | "sdk_protocol_error"
   | "pi_decision_limit"
   | "pi_model_provider_error"
-  | "agent_loop_circuit_open"
   | "worker_error";
 
 export function classifyWorkerExit(
@@ -71,17 +70,10 @@ export function classifyWorkerExit(
 
 export function classifyWorkerError(
   error: unknown,
-): "sdk_protocol_error" | "pi_decision_limit" | "pi_model_provider_error" | "agent_loop_circuit_open" | "worker_error" {
+): "sdk_protocol_error" | "pi_decision_limit" | "pi_model_provider_error" | "worker_error" {
   // 业务预算/模型终局失败码必须原样保留：它们是稳定业务终态，不是基础设施崩溃。
   if (isDecisionLimitError(error)) return "pi_decision_limit";
   if (isProviderFailureError(error)) return "pi_model_provider_error";
-  if (
-    error &&
-    typeof error === "object" &&
-    (error as { code?: unknown }).code === "agent_loop_circuit_open"
-  ) {
-    return "agent_loop_circuit_open";
-  }
   return error instanceof Error && error.message === "sdk_protocol_error"
     ? "sdk_protocol_error"
     : "worker_error";
@@ -110,7 +102,6 @@ export function spawnIsolatedWorker(
     "sdk_protocol_error",
     "pi_decision_limit",
     "pi_model_provider_error",
-    "agent_loop_circuit_open",
   ]);
   child.on("message", (message: unknown) => {
     if (!message || typeof message !== "object" || !("type" in message)) return;

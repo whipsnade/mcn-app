@@ -175,9 +175,6 @@ class _BuilderToolBase:
                     self._db,
                     durable_session_factory=self._durable_session_factory,
                 )
-                blocked = await guard.reject_if_open(run)
-                if blocked is not None:
-                    return blocked
         try:
             result = await self._execute(context, arguments)
         except ValidationError as exc:

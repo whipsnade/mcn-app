@@ -11,14 +11,12 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping
-from datetime import UTC, datetime
 from typing import Any
-from uuid import uuid4
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agent_runtime.models import AgentMessage, AgentRun, AgentSession, EvidenceItem
+from app.agent_runtime.models import AgentRun, AgentSession, EvidenceItem
 from app.agent_runtime.tools.contracts import ToolResult
 from app.mcp_gateway.validation import canonical_json_bytes
 
@@ -52,14 +50,17 @@ def _empty_guard() -> dict[str, Any]:
             "fingerprint": None,
             "evidence_set_version": None,
             "streak": 0,
+            "threshold": BUILDER_GUARD_THRESHOLD,
+            "warning_code": None,
         },
         "search_evidence": {
             "request_fingerprint": None,
             "evidence_set_version": None,
             "result_fingerprint": None,
             "streak": 0,
+            "threshold": SEARCH_GUARD_THRESHOLD,
+            "warning_code": None,
         },
-        "terminal_code": None,
     }
 
 
@@ -119,19 +120,15 @@ class LoopGuard:
         # back to the caller session below.
         self._durable_session_factory = durable_session_factory
 
-    async def reject_if_open(self, run: AgentRun) -> ToolResult | None:
-        durable = await self._run_durable("reject_if_open", run)
-        if durable is not _DURABLE_NOT_VISIBLE:
-            return durable
-        return await self._reject_if_open(run)
+    async def reject_if_open(self, run: AgentRun) -> None:
+        """兼容旧调用点；重复业务结果不再被平台拦截。
 
-    async def _reject_if_open(self, run: AgentRun) -> ToolResult | None:
-        locked = await self._lock_run(run.id)
-        guard = self._guard(locked)
-        self._sync(run, locked, guard)
-        if guard["terminal_code"] != AGENT_LOOP_CIRCUIT_OPEN:
-            return None
-        return self._circuit_result()
+        ``loop_guard_json`` 仍由 ``record_*`` 持久化，供运维/UI 观察。这个
+        方法故意不读取并生成 ToolResult，避免把相同工具/参数错误误判为
+        平台终止条件；真正的通用上限由 AgentEngine 的 max_decisions 负责。
+        """
+        del run
+        return None
 
     async def record_builder_result(
         self, run: AgentRun, tool_name: str, result: ToolResult
@@ -149,8 +146,6 @@ class LoopGuard:
         locked = await self._lock_run(run.id)
         guard = self._guard(locked)
         self._sync(run, locked, guard)
-        if guard["terminal_code"] == AGENT_LOOP_CIRCUIT_OPEN:
-            return self._circuit_result()
 
         evidence_version = await self.evidence_set_version(locked.session_id)
         state = dict(guard["builder"])
@@ -159,6 +154,8 @@ class LoopGuard:
                 "fingerprint": None,
                 "evidence_set_version": evidence_version,
                 "streak": 0,
+                "threshold": BUILDER_GUARD_THRESHOLD,
+                "warning_code": None,
             }
             guard["builder"] = state
             await self._persist(locked, guard, run)
@@ -169,6 +166,8 @@ class LoopGuard:
                 "fingerprint": None,
                 "evidence_set_version": evidence_version,
                 "streak": 0,
+                "threshold": BUILDER_GUARD_THRESHOLD,
+                "warning_code": None,
             }
             await self._persist(locked, guard, run)
             return result
@@ -185,9 +184,11 @@ class LoopGuard:
             "fingerprint": fingerprint,
             "evidence_set_version": evidence_version,
             "streak": streak,
+            "threshold": BUILDER_GUARD_THRESHOLD,
+            "warning_code": (
+                AGENT_LOOP_CIRCUIT_OPEN if streak >= BUILDER_GUARD_THRESHOLD else None
+            ),
         }
-        if streak >= BUILDER_GUARD_THRESHOLD:
-            return await self._open(locked, guard, run)
         await self._persist(locked, guard, run)
         return result
 
@@ -207,8 +208,6 @@ class LoopGuard:
         locked = await self._lock_run(run.id)
         guard = self._guard(locked)
         self._sync(run, locked, guard)
-        if guard["terminal_code"] == AGENT_LOOP_CIRCUIT_OPEN:
-            return self._circuit_result()
 
         evidence_version = await self.evidence_set_version(locked.session_id)
         request_fp = _request_fingerprint(arguments)
@@ -227,9 +226,11 @@ class LoopGuard:
             "evidence_set_version": evidence_version,
             "result_fingerprint": result_fp,
             "streak": streak,
+            "threshold": SEARCH_GUARD_THRESHOLD,
+            "warning_code": (
+                AGENT_LOOP_CIRCUIT_OPEN if streak >= SEARCH_GUARD_THRESHOLD else None
+            ),
         }
-        if streak >= SEARCH_GUARD_THRESHOLD:
-            return await self._open(locked, guard, run)
         await self._persist(locked, guard, run)
         return result
 
@@ -320,6 +321,10 @@ class LoopGuard:
                 builder.get("evidence_set_version")
             ),
             "streak": LoopGuard._valid_streak(builder.get("streak")),
+            "threshold": LoopGuard._valid_threshold(
+                builder.get("threshold"), BUILDER_GUARD_THRESHOLD
+            ),
+            "warning_code": LoopGuard._valid_warning_code(builder.get("warning_code")),
         }
         guard["search_evidence"] = {
             "request_fingerprint": LoopGuard._valid_fingerprint(
@@ -332,10 +337,20 @@ class LoopGuard:
                 search.get("result_fingerprint")
             ),
             "streak": LoopGuard._valid_streak(search.get("streak")),
+            "threshold": LoopGuard._valid_threshold(
+                search.get("threshold"), SEARCH_GUARD_THRESHOLD
+            ),
+            "warning_code": LoopGuard._valid_warning_code(search.get("warning_code")),
         }
+        # Pre-correction rows used ``terminal_code``. Keep the warning visible
+        # when reading those rows, but never carry that field forward or use it
+        # as a business terminal decision.
         terminal_code = raw.get("terminal_code")
         if terminal_code == AGENT_LOOP_CIRCUIT_OPEN:
-            guard["terminal_code"] = terminal_code
+            if guard["builder"]["streak"] >= BUILDER_GUARD_THRESHOLD:
+                guard["builder"]["warning_code"] = terminal_code
+            if guard["search_evidence"]["streak"] >= SEARCH_GUARD_THRESHOLD:
+                guard["search_evidence"]["warning_code"] = terminal_code
         return guard
 
     @staticmethod
@@ -347,6 +362,16 @@ class LoopGuard:
         if isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 1_000_000:
             return value
         return 0
+
+    @staticmethod
+    def _valid_threshold(value: Any, default: int) -> int:
+        if isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= 1_000_000:
+            return value
+        return default
+
+    @staticmethod
+    def _valid_warning_code(value: Any) -> str | None:
+        return value if value == AGENT_LOOP_CIRCUIT_OPEN else None
 
     @staticmethod
     def _save(locked: AgentRun, guard: dict[str, Any], original: AgentRun) -> None:
@@ -361,62 +386,10 @@ class LoopGuard:
         self._save(locked, guard, original)
         await self.db.flush()
 
-    async def _open(
-        self, locked: AgentRun, guard: dict[str, Any], original: AgentRun
-    ) -> ToolResult:
-        if guard["terminal_code"] != AGENT_LOOP_CIRCUIT_OPEN:
-            guard["terminal_code"] = AGENT_LOOP_CIRCUIT_OPEN
-            # Serialize the session sequence allocation with other assistant
-            # message writers.  The guard explanation must be the sole durable
-            # explanation even when two attempts open the circuit concurrently.
-            session = await self.db.scalar(
-                select(AgentSession)
-                .where(AgentSession.id == locked.session_id)
-                .with_for_update()
-            )
-            if session is None:
-                raise LookupError("session_not_found")
-            max_sequence = await self.db.scalar(
-                select(func.max(AgentMessage.sequence)).where(
-                    AgentMessage.session_id == locked.session_id
-                )
-            )
-            self.db.add(
-                AgentMessage(
-                    id=str(uuid4()),
-                    session_id=locked.session_id,
-                    run_id=locked.id,
-                    role="assistant",
-                    content=(
-                        "系统已停止重复的产物校验/证据检索循环（agent_loop_circuit_open）。"
-                        "当前证据集合没有产生足以修复相同错误的变化，请调整查询或补充有效证据后重试。"
-                    ),
-                    metadata_json={
-                        "system_loop_guard": True,
-                        "terminal_code": AGENT_LOOP_CIRCUIT_OPEN,
-                    },
-                    sequence=(max_sequence or 0) + 1,
-                    created_at=datetime.now(UTC).replace(tzinfo=None),
-                )
-            )
-        await self._persist(locked, guard, original)
-        return self._circuit_result()
-
     @staticmethod
     def _sync(original: AgentRun, locked: AgentRun, guard: dict[str, Any]) -> None:
         if original is not locked:
             original.loop_guard_json = locked.loop_guard_json
-
-    @staticmethod
-    def _circuit_result() -> ToolResult:
-        return ToolResult(
-            status="failed",
-            safe_summary=(
-                "agent_loop_circuit_open: repeated identical builder/search result; "
-                "stop retrying and adjust the evidence/query"
-            ),
-            error_type=AGENT_LOOP_CIRCUIT_OPEN,
-        )
 
 
 __all__ = [

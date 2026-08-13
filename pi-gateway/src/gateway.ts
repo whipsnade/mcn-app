@@ -40,8 +40,7 @@ export function isPiGatewayTerminalBusinessError(error: unknown): boolean {
   // that stable server-owned code instead of treating initialization as a
   // worker crash/recovery candidate.
   const code = errorCode(error) ?? (error instanceof Error ? error.message : undefined);
-  return code === "agent_loop_circuit_open" ||
-    code === "required_artifact_missing" ||
+  return code === "required_artifact_missing" ||
     code === "pi_gateway_terminal_missing_completion" ||
     code === "pi_gateway_running_agent_steps" ||
     code === "pi_gateway_unresolved_mcp_calls" ||

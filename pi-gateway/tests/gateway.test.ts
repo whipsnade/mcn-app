@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
-import { PiGateway } from "../src/gateway.js";
+import { isPiGatewayTerminalBusinessError, PiGateway } from "../src/gateway.js";
 import type { PiGatewaySourceEvent } from "../src/protocol.js";
 
 describe("PiGateway", () => {
@@ -776,41 +776,9 @@ describe("completion and loop-guard business terminal", () => {
     expect(onError).not.toHaveBeenCalled();
   });
 
-  it("converts the persisted loop guard error into stable failed", async () => {
-    const terminal = vi.fn().mockResolvedValue(undefined);
-    const heartbeat = vi.fn().mockResolvedValue({
-      lease_expires_at: Math.floor(Date.now() / 1000) + 3600,
-    });
-    const controlPlane = {
-      claim: vi.fn().mockResolvedValue({
-        run_id: "run-circuit",
-        attempt_id: "attempt-circuit",
-        lease_token: "lease-token-with-enough-entropy",
-        lease_expires_at: Math.floor(Date.now() / 1000) + 3600,
-        runtime_snapshot: {}, transcript: [],
-        secret_envelope: { alg: "AES-256-GCM", nonce: "1234567890123456", ciphertext: "1234567890123456" },
-        adapter_catalog: [], internal_tools: [],
-      }),
-      terminal,
-      heartbeat,
-    };
-    const gateway = new PiGateway({
-      controlPlane, capacity: 1, heartbeatIntervalMs: 1,
-      worker: async () => ({
-        done: Promise.reject(Object.assign(new Error("agent_loop_circuit_open"), {
-          code: "agent_loop_circuit_open",
-        })),
-      }),
-    });
-
-    await gateway.tick();
-
-    expect(terminal).toHaveBeenCalledWith(
-      "run-circuit",
-      "attempt-circuit",
-      "failed",
-      "lease-token-with-enough-entropy",
-      { code: "agent_loop_circuit_open" },
-    );
+  it("does not classify a legacy loop warning as a terminal business error", () => {
+    expect(isPiGatewayTerminalBusinessError(Object.assign(new Error("agent_loop_circuit_open"), {
+      code: "agent_loop_circuit_open",
+    }))).toBe(false);
   });
 });

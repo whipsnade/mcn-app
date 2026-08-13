@@ -380,10 +380,6 @@ class SearchEvidenceTool:
             if run is not None
             else None
         )
-        if guard is not None:
-            blocked = await guard.reject_if_open(run)
-            if blocked is not None:
-                return blocked
 
         conditions = [EvidenceItem.session_id == context.session_id]
         if args.artifact_id:

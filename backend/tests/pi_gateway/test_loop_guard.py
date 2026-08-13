@@ -5,9 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import pytest
-from sqlalchemy import select
 
-from app.agent_runtime.models import AgentMessage
 from app.agent_runtime.tools.contracts import ToolResult
 from app.pi_gateway.loop_guard import (
     AGENT_LOOP_CIRCUIT_OPEN,
@@ -32,7 +30,7 @@ def _builder_error(summary: str = "missing evidence at 2026-08-12T12:00:00Z") ->
 
 
 @pytest.mark.asyncio
-async def test_builder_guard_opens_on_third_identical_error_and_persists_explanation(
+async def test_builder_guard_records_warning_on_third_identical_error_without_blocking(
     db_session, user_factory
 ) -> None:
     user = await user_factory()
@@ -41,29 +39,20 @@ async def test_builder_guard_opens_on_third_identical_error_and_persists_explana
 
     first = await guard.record_builder_result(run, "build_brand_report_draft", _builder_error())
     second = await guard.record_builder_result(run, "build_brand_report_draft", _builder_error())
-    opened = await guard.record_builder_result(run, "build_brand_report_draft", _builder_error())
+    third = await guard.record_builder_result(run, "build_brand_report_draft", _builder_error())
 
     assert first.error_type == "draft_build_error"
     assert second.error_type == "draft_build_error"
-    assert opened.error_type == AGENT_LOOP_CIRCUIT_OPEN
-    assert opened.status == "failed"
-    assert run.loop_guard_json["terminal_code"] == AGENT_LOOP_CIRCUIT_OPEN
-    assert run.loop_guard_json["builder"]["streak"] == BUILDER_GUARD_THRESHOLD
-    messages = list(
-        (
-            await db_session.scalars(
-                select(AgentMessage).where(
-                    AgentMessage.run_id == run.id,
-                    AgentMessage.metadata_json["system_loop_guard"].as_boolean().is_(True),
-                )
-            )
-        ).all()
-    )
-    assert len(messages) == 1
+    assert third.error_type == "draft_build_error"
+    assert third.status == "failed"
+    assert run.loop_guard_json["builder"]["warning_code"] == AGENT_LOOP_CIRCUIT_OPEN
+    assert run.loop_guard_json["builder"]["threshold"] == BUILDER_GUARD_THRESHOLD
 
-    blocked = await guard.reject_if_open(run)
-    assert blocked is not None
-    assert blocked.error_type == AGENT_LOOP_CIRCUIT_OPEN
+    # The warning is observability only. A later identical logical call is still
+    # returned to Pi and is never rewritten as a platform circuit error.
+    fourth = await guard.record_builder_result(run, "build_brand_report_draft", _builder_error())
+    assert fourth.error_type == "draft_build_error"
+    assert await guard.reject_if_open(run) is None
 
 
 @pytest.mark.asyncio
@@ -78,14 +67,12 @@ async def test_loop_guard_is_not_reset_by_a_new_attempt(db_session, user_factory
     run.loop_guard_json["attempt_marker_written_by_test"] = 2
     await db_session.flush()
 
-    blocked = await guard.reject_if_open(run)
-
-    assert blocked is not None
-    assert run.loop_guard_json["terminal_code"] == AGENT_LOOP_CIRCUIT_OPEN
+    assert await guard.reject_if_open(run) is None
+    assert run.loop_guard_json["builder"]["warning_code"] == AGENT_LOOP_CIRCUIT_OPEN
 
 
 @pytest.mark.asyncio
-async def test_search_guard_opens_when_evidence_set_and_result_do_not_change(
+async def test_search_guard_records_warning_when_evidence_set_and_result_do_not_change(
     db_session, user_factory
 ) -> None:
     user = await user_factory()
@@ -99,8 +86,9 @@ async def test_search_guard_opens_when_evidence_set_and_result_do_not_change(
         assert recorded.error_type is None
     opened = await guard.record_search_result(run, args, result)
 
-    assert opened.error_type == AGENT_LOOP_CIRCUIT_OPEN
+    assert opened.error_type is None
     assert run.loop_guard_json["search_evidence"]["streak"] == 3
+    assert run.loop_guard_json["search_evidence"]["warning_code"] == AGENT_LOOP_CIRCUIT_OPEN
     assert isinstance(run.loop_guard_json["search_evidence"]["evidence_set_version"], str)
 
 
