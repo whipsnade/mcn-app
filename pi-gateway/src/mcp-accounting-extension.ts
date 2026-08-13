@@ -6,6 +6,9 @@
  * caller after `beforeToolCall` resolves successfully.
  */
 
+import { lstat, readFile, realpath, stat } from "node:fs/promises";
+import { isAbsolute, relative, resolve, sep } from "node:path";
+
 export interface McpToolCallInput {
   tool: string;
   server: string;
@@ -59,10 +62,21 @@ export type McpResultEnvelope =
       upstream_request_id?: string;
     };
 
+export interface McpResultDetails {
+  mode: "mcpResult";
+  mcpResult: McpResultEnvelope;
+}
+
 export interface McpAccountingControlPlane {
   preflight(input: McpToolCallInput): Promise<McpPermit | McpBlocked>;
   finalize(permit: McpPermit, result: unknown): Promise<unknown>;
   fail(permit: McpPermit, classification: "definitely_not_sent" | "failed_confirmed" | "result_unknown"): Promise<unknown>;
+}
+
+export interface TrustedMcpOffloadOptions {
+  /** Current Run's private temp root; no global/system temp path is trusted. */
+  rootDir: string;
+  maxBytes?: number;
 }
 
 const FREE_DISCOVERY_TOOLS = new Set(["connect", "search", "list"]);
@@ -138,7 +152,7 @@ function requestIdFrom(value: unknown): string | undefined {
 function unavailable(
   reason: UnavailableReason,
   upstreamRequestId?: string,
-): Record<string, unknown> {
+): McpResultDetails {
   if (!UNAVAILABLE_REASONS.has(reason)) throw new Error("mcp_result_reason_invalid");
   return {
     mode: "mcpResult",
@@ -151,7 +165,7 @@ function unavailable(
   };
 }
 
-function empty(upstreamRequestId?: string): Record<string, unknown> {
+function empty(upstreamRequestId?: string): McpResultDetails {
   return {
     mode: "mcpResult",
     mcpResult: {
@@ -165,8 +179,8 @@ function empty(upstreamRequestId?: string): Record<string, unknown> {
 function available(
   structuredContent: unknown,
   upstreamRequestId?: string,
-): Record<string, unknown> {
-  const mcpResult = {
+): McpResultDetails {
+  const mcpResult: Extract<McpResultEnvelope, { result_status: "available" }> = {
     envelope: "mcp_result_v1",
     result_status: "available",
     structuredContent,
@@ -186,14 +200,14 @@ function available(
 export function normalizeMcpResultEnvelope(
   details: Record<string, unknown>,
   content: unknown,
-): Record<string, unknown> {
+): McpResultDetails {
   const raw = isRecord(details.mcpResult) ? details.mcpResult : {};
   const upstreamRequestId = requestIdFrom(raw) ?? requestIdFrom(details);
-  if (raw.omitted === true || raw.fullResultPath !== undefined) {
-    return unavailable("payload_not_retrievable", upstreamRequestId);
-  }
   if (raw.resultWriteError !== undefined && raw.resultWriteError !== false && raw.resultWriteError !== null) {
     return unavailable("local_persistence_failed", upstreamRequestId);
+  }
+  if (raw.omitted === true || raw.fullResultPath !== undefined) {
+    return unavailable("payload_not_retrievable", upstreamRequestId);
   }
   if (byteLength({ mode: "mcpResult", mcpResult: raw }) > MAX_FINALIZE_DETAILS_BYTES) {
     return unavailable("payload_too_large", upstreamRequestId);
@@ -224,6 +238,10 @@ export function normalizeMcpResultEnvelope(
   if (typeof block.text !== "string" || block.text.trim().length === 0) {
     return empty(upstreamRequestId);
   }
+  // pi-mcp-adapter emits this sentinel when the upstream result has no
+  // content blocks. It represents a genuinely empty success, not provider
+  // text and must not become invalid_json_text.
+  if (block.text.trim() === "(empty result)") return empty(upstreamRequestId);
   let parsed: unknown;
   try {
     parsed = JSON.parse(block.text);
@@ -237,6 +255,77 @@ export function normalizeMcpResultEnvelope(
     return empty(upstreamRequestId);
   }
   return available(parsed, upstreamRequestId);
+}
+
+/**
+ * Read an adapter offload only when the SDK was explicitly bound to the
+ * current Run's private directory. The default normalizer never reads paths,
+ * which keeps old adapters fail-closed; production passes this policy only
+ * after binding TMPDIR to the Run root.
+ */
+export async function readTrustedMcpOffload(
+  candidatePath: string,
+  options: TrustedMcpOffloadOptions,
+): Promise<unknown | undefined> {
+  if (!isAbsolute(candidatePath) || !isAbsolute(options.rootDir)) return undefined;
+  const maxBytes = options.maxBytes ?? MAX_FINALIZE_DETAILS_BYTES;
+  if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0 || maxBytes > MAX_FINALIZE_DETAILS_BYTES) {
+    return undefined;
+  }
+  try {
+    const root = await realpath(resolve(options.rootDir));
+    const candidate = resolve(candidatePath);
+    const candidateReal = await realpath(candidate);
+    const rootRelative = relative(root, candidateReal);
+    if (!rootRelative || rootRelative === ".." || rootRelative.startsWith(`..${sep}`) || isAbsolute(rootRelative)) {
+      return undefined;
+    }
+    const linkInfo = await lstat(candidate);
+    if (linkInfo.isSymbolicLink() || !linkInfo.isFile()) return undefined;
+    const rootInfo = await stat(root);
+    if (typeof process.getuid === "function" && linkInfo.uid !== process.getuid()) return undefined;
+    if (linkInfo.uid !== rootInfo.uid || (linkInfo.mode & 0o077) !== 0 || linkInfo.size > maxBytes) {
+      return undefined;
+    }
+    const text = await readFile(candidate, "utf8");
+    const parsed: unknown = JSON.parse(text);
+    return isJsonValue(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Normalize a raw result and, only when explicitly trusted, its offloaded full result. */
+export async function normalizeMcpResultEnvelopeAsync(
+  details: Record<string, unknown>,
+  content: unknown,
+  offload?: TrustedMcpOffloadOptions,
+): Promise<McpResultDetails> {
+  const raw = isRecord(details.mcpResult) ? details.mcpResult : {};
+  const path = typeof raw.fullResultPath === "string" ? raw.fullResultPath : undefined;
+  const upstreamRequestId = requestIdFrom(raw) ?? requestIdFrom(details);
+  if (raw.resultWriteError !== undefined && raw.resultWriteError !== false && raw.resultWriteError !== null) {
+    return unavailable("local_persistence_failed", upstreamRequestId);
+  }
+  if (path !== undefined && offload !== undefined) {
+    const loaded = await readTrustedMcpOffload(path, offload);
+    if (isRecord(loaded)) {
+      const loadedRequestId = requestIdFrom(loaded) ?? upstreamRequestId;
+      if (Object.prototype.hasOwnProperty.call(loaded, "structuredContent")) {
+        const structured = loaded.structuredContent;
+        if (isNonEmptyJsonValue(structured) && !containsTransportArtifactMarker(structured)) {
+          return available(structured, loadedRequestId);
+        }
+        if (isJsonValue(structured) && !containsTransportArtifactMarker(structured)) {
+          return empty(loadedRequestId);
+        }
+      }
+      if (loaded.content !== undefined) {
+        return normalizeMcpResultEnvelope({ mcpResult: loaded }, loaded.content);
+      }
+    }
+  }
+  return normalizeMcpResultEnvelope(details, content);
 }
 
 /**
@@ -325,7 +414,14 @@ export function proxyVisibleToolName(server: string, remoteName: string): string
 }
 
 export class McpAccountingExtension {
-  constructor(private readonly controlPlane: McpAccountingControlPlane) {}
+  constructor(
+    private readonly controlPlane: McpAccountingControlPlane,
+    private readonly offload?: TrustedMcpOffloadOptions,
+  ) {}
+
+  normalizeResult(details: Record<string, unknown>, content: unknown): Promise<McpResultDetails> {
+    return normalizeMcpResultEnvelopeAsync(details, content, this.offload);
+  }
 
   async beforeToolCall(input: McpToolCallInput): Promise<McpPermit | McpBlocked | McpFree> {
     if (FREE_DISCOVERY_TOOLS.has(input.tool)) return { free: true };
@@ -406,7 +502,7 @@ export function createMcpAccountingExtensionFactory(
           permits.delete(event.toolCallId);
           return;
         }
-        const payload = normalizeMcpResultEnvelope(details, event.content);
+        const payload = await accounting.normalizeResult(details, event.content);
         await accounting.afterToolResult(permit, payload);
         permits.delete(event.toolCallId);
       } catch {

@@ -1,9 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
+import { chmod, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 
 import {
   createMcpAccountingExtensionFactory,
   McpAccountingExtension,
   normalizeMcpResultEnvelope,
+  normalizeMcpResultEnvelopeAsync,
+  readTrustedMcpOffload,
 } from "../src/mcp-accounting-extension.js";
 
 describe("mcp_result_v1 normalization", () => {
@@ -72,6 +77,33 @@ describe("mcp_result_v1 normalization", () => {
       mode: "mcpResult",
       mcpResult: { envelope: "mcp_result_v1", result_status: "empty" },
     });
+    expect(normalizeMcpResultEnvelope({ mcpResult: {} }, [
+      { type: "text", text: "(empty result)" },
+    ])).toEqual({
+      mode: "mcpResult",
+      mcpResult: { envelope: "mcp_result_v1", result_status: "empty" },
+    });
+  });
+
+  it("normalizes the real proxy adapter result without changing the model-visible content", () => {
+    const rawAdapterResult = {
+      content: [{ type: "text", text: "{" + '"result":"summary only"' + "}" }],
+      structuredContent: { result: '{"rows":[{"平台":"小红书"}]}' },
+      isError: false,
+      _meta: { requestId: "proxy-request-redacted-1" },
+    };
+    const modelVisibleContent = [{ type: "text", text: "adapter-rendered summary" }];
+
+    expect(normalizeMcpResultEnvelope({ mode: "call", mcpResult: rawAdapterResult }, modelVisibleContent)).toEqual({
+      mode: "mcpResult",
+      mcpResult: {
+        envelope: "mcp_result_v1",
+        result_status: "available",
+        structuredContent: { result: '{"rows":[{"平台":"小红书"}]}' },
+        upstream_request_id: "proxy-request-redacted-1",
+      },
+    });
+    expect(modelVisibleContent).toEqual([{ type: "text", text: "adapter-rendered summary" }]);
   });
 
   it("treats an explicit empty native structuredContent as empty and never falls through to text", () => {
@@ -96,6 +128,60 @@ describe("mcp_result_v1 normalization", () => {
         unavailable_reason: "unsupported_content",
       },
     });
+  });
+
+  it("reads only a private current-run offload and rejects traversal/symlink paths", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-mcp-offload-test-"));
+    const outside = await mkdtemp(join(tmpdir(), "pi-mcp-offload-outside-"));
+    const file = join(root, "result.json");
+    const outsideFile = join(outside, "result.json");
+    const link = join(root, "link.json");
+    const raw = {
+      content: [{ type: "text", text: "adapter summary" }],
+      structuredContent: { result: '{"rows":[{"id":"safe"}]}' },
+      _meta: { requestId: "offload-request-redacted-1" },
+    };
+    try {
+      await writeFile(file, JSON.stringify(raw), { encoding: "utf8", mode: 0o600 });
+      await writeFile(outsideFile, JSON.stringify(raw), { encoding: "utf8", mode: 0o600 });
+      await chmod(file, 0o600);
+      await chmod(outsideFile, 0o600);
+      await symlink(outsideFile, link);
+
+      await expect(readTrustedMcpOffload(file, { rootDir: root })).resolves.toEqual(raw);
+      await expect(
+        readTrustedMcpOffload(outsideFile, { rootDir: root }),
+      ).resolves.toBeUndefined();
+      await expect(readTrustedMcpOffload(link, { rootDir: root })).resolves.toBeUndefined();
+      await expect(
+        normalizeMcpResultEnvelopeAsync(
+          { mode: "call", mcpResult: { omitted: true, fullResultPath: file } },
+          [{ type: "text", text: "summary" }],
+          { rootDir: root },
+        ),
+      ).resolves.toMatchObject({
+        mcpResult: {
+          result_status: "available",
+          structuredContent: raw.structuredContent,
+          upstream_request_id: "offload-request-redacted-1",
+        },
+      });
+      await expect(
+        normalizeMcpResultEnvelopeAsync(
+          { mode: "call", mcpResult: { resultWriteError: "disk-full", fullResultPath: file } },
+          [{ type: "text", text: "summary" }],
+          { rootDir: root },
+        ),
+      ).resolves.toMatchObject({
+        mcpResult: {
+          result_status: "unavailable",
+          unavailable_reason: "local_persistence_failed",
+        },
+      });
+    } finally {
+      // The read above is intentionally bounded to this disposable fixture.
+      await Promise.all([rm(root, { recursive: true, force: true }), rm(outside, { recursive: true, force: true })]);
+    }
   });
 
   it("rejects transport artifact markers nested in the reviewed JSON text block", () => {

@@ -156,21 +156,21 @@ export async function createProductionPiSession(
   );
   const runDir = await mkdtemp(join(tmpdir(), "kol-pi-run-"));
   await chmod(runDir, 0o700);
+  // pi-mcp-adapter spills oversized raw results through os.tmpdir(). A real
+  // production Worker owns exactly one Run, so bind that SDK-owned path to the
+  // Run before loading the adapter; the Gateway sidecar will only read files
+  // beneath this private root. Fake-provider sessions do not dispatch the
+  // adapter and must not mutate the process-global TMPDIR while concurrent
+  // offline fixtures are being created.
+  const bindAdapterTempDir = options.fakeProvider !== true;
+  const previousTmpDir = process.env.TMPDIR;
+  if (bindAdapterTempDir) process.env.TMPDIR = runDir;
+  const restoreTmpDir = (): void => {
+    if (!bindAdapterTempDir) return;
+    if (previousTmpDir === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = previousTmpDir;
+  };
   const agentDir = join(runDir, "agent");
-  await mkdir(agentDir, { mode: 0o700 });
-  const mcpConfigPath = join(runDir, ".mcp.json");
-  await writeFile(mcpConfigPath, JSON.stringify(createMcpConfig(work.runtimeSnapshot.adapterCatalog, {
-    // Unit fake providers do not own a real MCP server.  Offline UAT and all
-    // production workers use the default eager lifecycle and the barrier.
-    lifecycle: options.fakeProvider === true ? "lazy" : "eager",
-  }), null, 2), {
-    encoding: "utf8",
-    mode: 0o600,
-  });
-  // The adapter's default export discovers this Run's config via argv
-  // ``--mcp-config`` (jiti-loaded extension runs in this same child process).
-  setAdapterMcpConfigPath(mcpConfigPath);
-
   let disposed = false;
   let sdkSession: { dispose(): void } | undefined;
   let abortSdkSession: (() => void | Promise<void>) | undefined;
@@ -185,9 +185,22 @@ export async function createProductionPiSession(
     else process.env.PI_CODING_AGENT_DIR = previousAdapterAgentDir;
   };
   try {
+    await mkdir(agentDir, { mode: 0o700 });
+    const mcpConfigPath = join(runDir, ".mcp.json");
+    await writeFile(mcpConfigPath, JSON.stringify(createMcpConfig(work.runtimeSnapshot.adapterCatalog, {
+      // Unit fake providers do not own a real MCP server.  Offline UAT and all
+      // production workers use the default eager lifecycle and the barrier.
+      lifecycle: options.fakeProvider === true ? "lazy" : "eager",
+    }), null, 2), {
+      encoding: "utf8",
+      mode: 0o600,
+    });
+    // The adapter's default export discovers this Run's config via argv
+    // ``--mcp-config`` (jiti-loaded extension runs in this same child process).
+    setAdapterMcpConfigPath(mcpConfigPath);
     assertDatatapUrlsForCatalog(work.runtimeSnapshot.adapterCatalog, secrets);
     const mcpAccounting = options.mcpAccounting
-      ? new McpAccountingExtension(options.mcpAccounting)
+      ? new McpAccountingExtension(options.mcpAccounting, { rootDir: runDir })
       : undefined;
     const extensionFactories: ExtensionFactory[] = [
       ...(mcpReadiness && mcpReadiness.observeSnapshot && mcpReadiness.beginSession
@@ -206,9 +219,7 @@ export async function createProductionPiSession(
     ];
     const internalTools = options.internalTools
       ? buildInternalToolDefinitions(
-          new PiInternalToolsClient(options.internalTools, {
-            onCircuitOpen: () => abortSdkSession?.(),
-          }),
+          new PiInternalToolsClient(options.internalTools),
           work.internalTools,
         )
       : [];
@@ -296,6 +307,7 @@ export async function createProductionPiSession(
             try {
               await rm(runDir, { recursive: true, force: true });
             } finally {
+              restoreTmpDir();
               restoreAdapterAgentDir();
             }
           }
@@ -324,6 +336,7 @@ export async function createProductionPiSession(
     try {
       await rm(runDir, { recursive: true, force: true });
     } finally {
+      restoreTmpDir();
       restoreAdapterAgentDir();
     }
     throw error;
