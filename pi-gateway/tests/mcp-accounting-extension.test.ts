@@ -166,8 +166,15 @@ describe("direct MCP accounting hook", () => {
       source: "other",
       error_class: code,
       dispatch_phase: "unknown",
-      ...(isError ? { is_standard_mcp_error: true } : {}),
+      ...(isError
+        ? { is_standard_mcp_error: true, received_jsonrpc_response: true }
+        : {}),
     });
+    if (isError) {
+      // Minor #2：SDK isError 标记确认收到标准 MCP error 响应 → 赋值 true；
+      // 未确认路径保持省略（不猜 false）。
+      expect(metadata).not.toHaveProperty("received_jsonrpc_response", false);
+    }
   });
 
   it("treats the SDK isError marker without an error code as a confirmed Tool Error", async () => {

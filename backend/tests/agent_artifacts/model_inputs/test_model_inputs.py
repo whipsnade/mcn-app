@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from pydantic import ValidationError
 
@@ -27,6 +29,10 @@ from app.agent_artifacts.model_inputs.brand import BrandReportV3Input
 from app.agent_artifacts.model_inputs.campaign import CampaignReportV3Input
 from app.agent_artifacts.model_inputs.insight import InsightBoardV1Input
 from app.agent_artifacts.model_inputs.kol_selection import KolSelectionV3Input
+from app.agent_artifacts.payload_errors import (
+    format_model_input_errors,
+    format_payload_errors,
+)
 from app.agent_artifacts.payloads import (
     BrandReportV3,
     CampaignReportV2,
@@ -34,6 +40,7 @@ from app.agent_artifacts.payloads import (
     InsightBoardV1,
     KolSelectionV3,
 )
+from app.agent_artifacts.validation import ArtifactPayloadInvalid
 
 from tests.agent_artifacts.test_payloads import (
     build_brand_dict,
@@ -267,3 +274,55 @@ def test_insight_module_is_server_owned() -> None:
     assert "module" not in example
     with pytest.raises(ValidationError):
         InsightBoardV1Input.model_validate({**build_insight_model_input(), "module": "brand"})
+
+
+def test_error_feedback_redacts_credential_shaped_reason() -> None:
+    """Minor #4：错误反馈 reason 做凭证形态值剥离（防御层）。
+
+    即使上游 validator 错误 msg 内含 sk-/Bearer/DSN/URL 凭证形态派生值，
+    format_payload_errors / format_model_input_errors 输出也绝不回灌原值。
+    """
+    secret = "sk-proj-SECRETVALUE123"
+    dsn = "mysql+asyncmy://user:passw0rd@db.example.invalid:3306/app"
+    bearer = "Bearer A1b2C3d4E5f6G7h8"
+    errors = [
+        {
+            "loc": ["data", "overview", "total_volume"],
+            "msg": f"无法连接 {dsn}，鉴权失败 {bearer}，token {secret}",
+            "type": "value_error",
+        },
+        {"loc": [], "msg": "ordinary message without secrets", "type": "value_error"},
+    ]
+    exc = ArtifactPayloadInvalid("payload fails contract", errors=errors)
+    body = format_payload_errors(exc)
+    rendered = json.dumps(body, ensure_ascii=False)
+    for leaked in (secret, "passw0rd", "A1b2C3d4E5f6G7h8"):
+        assert leaked not in rendered
+    assert rendered.count("[redacted]") >= 3
+    # 普通消息不受影响，且 path/type 结构完整。
+    assert "ordinary message without secrets" in rendered
+    entry = body["errors"][0]
+    assert entry["path"] == "/data/overview/total_volume"
+    assert entry["type"] == "value_error"
+    # ValidationError 路径同样经 _error_entries 的剥离层。
+    dto_error = ArtifactPayloadInvalid(
+        "model input invalid",
+        errors=[{"loc": ["scope", "brand"], "msg": f"invalid with {secret}", "type": "value_error"}],
+    )
+    del dto_error
+    model_errors = format_model_input_errors(_synthetic_validation_error(secret))
+    assert secret not in json.dumps(model_errors, ensure_ascii=False)
+
+
+def _synthetic_validation_error(secret: str) -> ValidationError:
+    """构造一个 msg 内嵌凭证形态的 ValidationError（pydantic include_context=False
+    不携带输入值，这里模拟上游手工构造的 error dict 场景）。"""
+    try:
+        raise ValueError(f"connection failed with {secret}")
+    except ValueError as cause:
+        from pydantic_core import ValidationError as CoreValidationError
+
+        return CoreValidationError.from_exception_data(
+            "BrandReportV3Input",
+            [{"type": "value_error", "loc": ("scope", "brand"), "input": None, "ctx": {"error": cause}}],
+        )

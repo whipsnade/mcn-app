@@ -329,6 +329,9 @@ export class McpAccountingExtension {
  * Copy only explicitly approved failure metadata (commit 3: metadata-only
  * observability; `classifyMcpFailure` itself is unchanged).  Fields the
  * adapter error path cannot determine reliably are omitted rather than guessed.
+ * `received_jsonrpc_response` (Minor #2) is only set when the SDK `isError`
+ * marker confirms a standard MCP error response was actually received; the
+ * uncertain adapter-error paths omit it (never guessed as false).
  */
 export function buildMcpFailureMetadata(
   source: UnknownMcpSource,
@@ -341,7 +344,12 @@ export function buildMcpFailureMetadata(
   if (errorCode === "call_failed") metadata.dispatch_phase = "dispatched";
   else if (errorCode !== undefined && NO_DISPATCH_ERROR_CODES.has(errorCode)) metadata.dispatch_phase = "preflight";
   else metadata.dispatch_phase = "unknown";
-  if (isError) metadata.is_standard_mcp_error = true;
+  if (isError) {
+    // SDK 只在收到标准 MCP CallToolResult error 响应后置位 isError：这是
+    // 「确认收到了 JSON-RPC 响应」的唯一可靠信号；其他路径不确定则不设置。
+    metadata.is_standard_mcp_error = true;
+    metadata.received_jsonrpc_response = true;
+  }
   const upstream = requestIdFrom(details);
   if (upstream !== undefined) metadata.upstream_request_id = upstream;
   return isSafeMcpFailureMetadata(metadata) ? metadata : { version: "mcp_failure_v1", source };

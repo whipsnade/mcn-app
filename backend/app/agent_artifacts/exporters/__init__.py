@@ -69,13 +69,21 @@ def export_artifact(version, *, model=None, gateway=None) -> bytes:
         raise ArtifactExportUnsupported(
             schema_version, reason="no published immutable payload"
         )
+    # Direct Artifact Skill payload（lineage_snapshot_json.mode == "model_direct_v1"，
+    # canonical 无 Evidence）在发布校验时经 direct lineage context 豁免 evidence_ids
+    # 要求；导出是同一 payload 的只读渲染，重新校验必须使用同一上下文，否则已发布
+    # direct payload 会被误判为 409（提交 3 修复）。legacy Evidence-backed payload 或
+    # 缺 lineage_snapshot_json 的历史 Version 不得启用 direct context（Minor #1）。
+    lineage_snapshot = getattr(version, "lineage_snapshot_json", None)
+    direct_payload = (
+        isinstance(lineage_snapshot, dict)
+        and lineage_snapshot.get("mode") == "model_direct_v1"
+    )
     try:
-        # Direct Artifact Skill payload（model_direct_v1，canonical 无 Evidence）
-        # 在发布校验时经 direct lineage context 豁免 evidence_ids 要求；导出是
-        # 同一 payload 的只读渲染，重新校验必须使用同一上下文，否则已发布
-        # direct payload 会被误判为 409（提交 3 修复）。
-        with model_direct_lineage_context():
-            return exporter(payload)
+        if direct_payload:
+            with model_direct_lineage_context():
+                return exporter(payload)
+        return exporter(payload)
     except (ValidationError, ValueError) as exc:
         raise ArtifactExportUnsupported(
             schema_version, reason="published payload fails typed validation"

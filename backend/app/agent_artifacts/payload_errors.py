@@ -7,6 +7,7 @@
 - ``reason`` 只取 ``msg``，绝不含输入值（上游已用
   ``errors(include_context=False)`` 保证；本模块对 ``ValidationError``
   同样调用 ``errors(include_context=False)``，且从不写入 ``ctx``）；
+  叠加凭证形态值剥离（sk-/Bearer/DSN/URL → ``[redacted]``，Minor #4 防御层）；
 - 序列化后总长不超过 :data:`MAX_PAYLOAD_ERROR_BYTES`（2048）：条目太多时
   只保留能容纳的前 N 条并置 ``truncated=True``；首条 reason 本身超长时
   截断该条 reason 并置 ``truncated=True``。
@@ -15,6 +16,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from pydantic import ValidationError
@@ -29,6 +31,30 @@ _MAX_ERROR_ENTRIES = 8
 #: 条目数超限 / reason 截断时的统一后缀。
 _TRUNCATION_SUFFIX = "...(truncated)"
 
+#: reason 值剥离（Minor #4）：防御性脱敏层——即使上游 validator 内插了
+#: sk-/Bearer/DSN/URL 凭证形态的派生值，也绝不让它们进入模型上下文。
+#: 形态与 ``marketing_capability_pack/loader.py`` 的敏感内容扫描一致。
+_CREDENTIAL_PATTERNS = (
+    re.compile(r"\bsk(?:-proj)?-[A-Za-z0-9_-]{8,}", re.IGNORECASE),
+    re.compile(r"\bBearer\s+[A-Za-z0-9._~+/=-]{8,}", re.IGNORECASE),
+    re.compile(
+        r"(?:(?:mysql(?:\+[A-Za-z0-9_-]+)?|postgres(?:ql)?|mongodb|redis)://"
+        r"[^\s/@:]+:[^\s/@]+@)|(?:(?:https?|ftp)://[^\s<>\"'，；。！？、)\]}]+)",
+        re.IGNORECASE,
+    ),
+)
+_REDACTED = "[redacted]"
+
+
+def _redact_reason(msg: Any) -> Any:
+    """对 reason 字符串做凭证形态值剥离（非字符串原样返回）。"""
+    if not isinstance(msg, str):
+        return msg
+    redacted = msg
+    for pattern in _CREDENTIAL_PATTERNS:
+        redacted = pattern.sub(_REDACTED, redacted)
+    return redacted
+
 
 def _escape_token(token: str) -> str:
     """RFC 6901 转义：``~`` → ``~0``、``/`` → ``~1``。"""
@@ -39,7 +65,8 @@ def _error_entries(errors: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Pydantic error dict（loc/type/msg）→ 结构化反馈条目。
 
     ``reason`` 只取 ``msg``，绝不携带 ``ctx`` 或任何输入值——错误回喂
-    不得把用户/模型的提交内容回灌模型上下文（脱敏与不泄漏）。
+    不得把用户/模型的提交内容回灌模型上下文（脱敏与不泄漏）；再叠加
+    :func:`_redact_reason` 的凭证形态防御性剥离。
     """
     entries: list[dict[str, Any]] = []
     for error in errors:
@@ -49,7 +76,7 @@ def _error_entries(errors: list[dict[str, Any]]) -> list[dict[str, Any]]:
             {
                 "path": f"/{path}" if path else "/",
                 "type": error.get("type"),
-                "reason": error.get("msg"),
+                "reason": _redact_reason(error.get("msg")),
                 "retryable": True,
             }
         )

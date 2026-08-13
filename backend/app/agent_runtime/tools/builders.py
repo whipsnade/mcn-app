@@ -294,9 +294,15 @@ class BuildArtifactDraftTool(_BuilderToolBase):
     input_model = BuildArtifactDraftArgs
     description = (
         "提交一个由模型自主选择的正式 Artifact Draft。artifact_type 必须属于当前 Run "
-        "RuntimeSnapshot.allowed_artifact_contracts；payload 必须完整符合该 Artifact "
-        "Schema。可选 source_tool_call_ids 仅用于校验调用属于当前 Run，不会读取或重验 MCP "
-        "业务结果。成功只返回 Draft 身份摘要；模型也可以不调用本工具而直接返回文字。"
+        "RuntimeSnapshot.allowed_artifact_contracts；payload 按 load_marketing_skill 返回的 "
+        "model_input_contract.model_input_schema 构造（只提交业务字段：scope/data/"
+        "narrative/availability/limitations/methodology_input，insight 另含 title/"
+        "parent_artifact_id/parent_artifact_version_id/blocks）；schema_version/module/"
+        "data_status/canonical_data/field_lineage 由服务器组装，模型不得提交这些字段"
+        "（提交会被 server_owned_field_rejected 拒绝）。校验失败返回结构化字段级错误"
+        "（RFC6901 path/type/reason），按路径修正后重试。可选 source_tool_call_ids 仅用于"
+        "校验调用属于当前 Run，不会读取或重验 MCP 业务结果。成功只返回 Draft 身份摘要；"
+        "模型也可以不调用本工具而直接返回文字。"
     )
 
     @staticmethod
