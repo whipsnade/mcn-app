@@ -156,12 +156,12 @@ export async function createProductionPiSession(
   );
   const runDir = await mkdtemp(join(tmpdir(), "kol-pi-run-"));
   await chmod(runDir, 0o700);
-  // pi-mcp-adapter spills oversized raw results through os.tmpdir(). A real
-  // production Worker owns exactly one Run, so bind that SDK-owned path to the
-  // Run before loading the adapter; the Gateway sidecar will only read files
-  // beneath this private root. Fake-provider sessions do not dispatch the
-  // adapter and must not mutate the process-global TMPDIR while concurrent
-  // offline fixtures are being created.
+  // A real production Worker owns exactly one Run, so bind adapter-owned
+  // temporary state to that Run before loading it. The direct MCP config turns
+  // off the adapter output guard: the controlled MCP service owns pagination
+  // and Pi must receive the standard result without a success preview/path.
+  // Fake-provider sessions do not dispatch the adapter and must not mutate the
+  // process-global TMPDIR while concurrent offline fixtures are being created.
   const bindAdapterTempDir = options.fakeProvider !== true;
   const previousTmpDir = process.env.TMPDIR;
   if (bindAdapterTempDir) process.env.TMPDIR = runDir;
@@ -200,7 +200,7 @@ export async function createProductionPiSession(
     setAdapterMcpConfigPath(mcpConfigPath);
     assertDatatapUrlsForCatalog(work.runtimeSnapshot.adapterCatalog, secrets);
     const mcpAccounting = options.mcpAccounting
-      ? new McpAccountingExtension(options.mcpAccounting, { rootDir: runDir })
+      ? new McpAccountingExtension(options.mcpAccounting)
       : undefined;
     const extensionFactories: ExtensionFactory[] = [
       ...(mcpReadiness && mcpReadiness.observeSnapshot && mcpReadiness.beginSession

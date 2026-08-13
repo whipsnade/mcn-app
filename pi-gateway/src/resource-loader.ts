@@ -58,6 +58,8 @@ export interface ProductionMcpConfig {
     directTools: false;
     toolPrefix: "none";
     requestTimeoutMs: number;
+    /** Trusted internal MCP owns pagination; adapter must not summarize/spill results. */
+    outputGuard: false;
   };
   mcpServers: Record<
     string,
@@ -108,6 +110,10 @@ export function createMcpConfig(
       // tool_not_found → definitely_not_sent 释放，绝不计费）。
       toolPrefix: "none",
       requestTimeoutMs: 180_000,
+      // The internal MCP contract owns pagination and response bounds.  The
+      // adapter's optional guard would truncate/spill a successful result and
+      // replace it with a success preview, which is not transparent delivery.
+      outputGuard: false,
     },
     mcpServers,
   };

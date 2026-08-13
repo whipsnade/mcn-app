@@ -935,6 +935,12 @@ class TenantAccountingService:
         return wallet, transaction
 
     async def settle_mcp_call(self, permit_id: str, payload: object) -> EvidenceReceipt:
+        """Legacy settlement API used by the current/legacy runtime.
+
+        The Pi Gateway production path must call
+        :meth:`settle_mcp_call_metadata` instead, so business MCP payloads
+        cannot enter the control plane accidentally.
+        """
         reserve = await self.db.scalar(
             select(TenantWalletTransaction)
             .where(TenantWalletTransaction.id == permit_id)
@@ -992,6 +998,50 @@ class TenantAccountingService:
         )
         await self.db.flush()
         return EvidenceReceipt(permit_id=permit_id, payload=_safe_payload(payload))
+
+    async def settle_mcp_call_metadata(
+        self,
+        permit_id: str,
+        metadata: Mapping[str, Any],
+    ) -> EvidenceReceipt:
+        """Settle Pi MCP success using only the strict accounting metadata.
+
+        This is intentionally separate from ``settle_mcp_call``.  The latter
+        remains for compatibility with legacy tool loops that store their own
+        receipt, while this method rejects nested/business data before it can
+        be persisted in a Pi settlement receipt.
+        """
+        allowed = {
+            "outcome",
+            "upstream_request_id",
+            "response_bytes",
+            "adapter_version",
+            "completed_at",
+            "response_hash",
+        }
+        if not isinstance(metadata, Mapping) or set(metadata) - allowed or metadata.get("outcome") != "succeeded":
+            raise TenantAccountingError("mcp_finalize_metadata_invalid")
+        for key in ("upstream_request_id", "adapter_version", "completed_at", "response_hash"):
+            value = metadata.get(key)
+            if value is not None and (not isinstance(value, str) or len(value) > 128):
+                raise TenantAccountingError("mcp_finalize_metadata_invalid")
+        response_bytes = metadata.get("response_bytes")
+        if response_bytes is not None and (
+            isinstance(response_bytes, bool)
+            or not isinstance(response_bytes, int)
+            or response_bytes < 0
+            or response_bytes > 64 * 1024 * 1024
+        ):
+            raise TenantAccountingError("mcp_finalize_metadata_invalid")
+        response_hash = metadata.get("response_hash")
+        if response_hash is not None and (
+            not isinstance(response_hash, str)
+            or len(response_hash) != len("sha256:") + 64
+            or not response_hash.startswith("sha256:")
+            or any(character not in "0123456789abcdefABCDEF" for character in response_hash[7:])
+        ):
+            raise TenantAccountingError("mcp_finalize_metadata_invalid")
+        return await self.settle_mcp_call(permit_id, dict(metadata))
 
     async def fail_mcp_call(self, permit_id: str, classification: str) -> None:
         classification = self.validate_failure_classification(classification)

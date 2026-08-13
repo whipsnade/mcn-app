@@ -242,6 +242,24 @@ class AgentMcpAccounting:
         call.completed_at = _now()
         await self._db.flush()
 
+    async def settle_metadata(
+        self,
+        user_id: str,
+        call: AgentToolCall,
+        metadata: Mapping[str, Any],
+    ) -> None:
+        """Settle a Pi call with control metadata only; never stores MCP data."""
+        await self._tenant_context(user_id, call)
+        await TenantAccountingService(self._db).settle_mcp_call_metadata(
+            await self._tenant_permit_id(call), metadata
+        )
+        call.points_settled = self.MCP_COST
+        call.points_reserved = 0
+        call.status = "settled"
+        call.error_type = None
+        call.completed_at = _now()
+        await self._db.flush()
+
     async def release(
         self,
         user_id: str,

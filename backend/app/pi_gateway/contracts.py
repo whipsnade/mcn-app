@@ -8,8 +8,6 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .events import normalize_source_payload, normalize_usage_payload
-
-
 class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
@@ -66,18 +64,30 @@ class PiGatewayMcpPermitResponse(_StrictModel):
 
 class PiGatewayMcpFinalizeRequest(_StrictModel):
     permit_id: str = Field(min_length=1, max_length=64)
-    details: dict[str, Any] = Field(default_factory=dict)
+    outcome: Literal["succeeded"]
+    upstream_request_id: str | None = Field(default=None, min_length=1, max_length=128)
+    response_bytes: int | None = Field(default=None, ge=0, le=64 * 1024 * 1024)
+    adapter_version: str | None = Field(default=None, min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._:-]{1,64}$")
+    completed_at: str | None = Field(default=None, min_length=1, max_length=64, pattern=r"^[A-Za-z0-9:+.TZ_-]{1,64}$")
+    response_hash: str | None = Field(default=None, pattern=r"^sha256:[0-9a-fA-F]{64}$")
 
-    @field_validator("details")
-    @classmethod
-    def bound_details(cls, value: dict[str, Any]) -> dict[str, Any]:
-        _validate_payload(value, "mcp_finalize")
-        return value
+
+class PiGatewayMcpFailureMetadata(_StrictModel):
+    version: Literal["mcp_failure_v1"]
+    source: Literal[
+        "call_failed",
+        "aborted",
+        "worker_rpc_timeout",
+        "worker_rpc_disconnected",
+        "finalize_ack_unknown",
+        "other",
+    ]
 
 
 class PiGatewayMcpFailRequest(_StrictModel):
     permit_id: str = Field(min_length=1, max_length=64)
     classification: Literal["definitely_not_sent", "failed_confirmed", "result_unknown"]
+    metadata: PiGatewayMcpFailureMetadata | None = None
 
 
 _SOURCE_EVENT_TYPES = {
@@ -241,14 +251,10 @@ def _contains_sensitive_key(value: object, sensitive: set[str]) -> bool:
 
 
 _PAYLOAD_MAX_BYTES = 64 * 1024
-# mcp_finalize 携带完整结构化结果（Evidence 来源），独立放行到 1 MiB，
-# 与 Gateway IPC 通道上限同口径；超限由 Gateway 侧降级 result_unknown。
-_FINALIZE_MAX_BYTES = 1024 * 1024
 
 
 def _validate_payload(value: dict[str, Any], prefix: str) -> None:
-    limit = _FINALIZE_MAX_BYTES if prefix == "mcp_finalize" else _PAYLOAD_MAX_BYTES
-    if len(str(value).encode("utf-8")) > limit:
+    if len(str(value).encode("utf-8")) > _PAYLOAD_MAX_BYTES:
         raise ValueError(f"{prefix}_payload_too_large")
     if _contains_sensitive_key(value, _SENSITIVE_PAYLOAD_KEYS):
         raise ValueError(f"{prefix}_payload_sensitive_field")

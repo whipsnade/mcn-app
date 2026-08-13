@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import json
 import secrets
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
@@ -26,11 +25,7 @@ from app.agent_runtime.models import (
 )
 from app.billing.models import RuntimeUsageRecord, TenantWalletTransaction
 from app.agent_runtime.state import RunStatus
-from app.agent_runtime.evidence import EvidencePersistenceError, EvidenceWriter
-from app.agent_runtime.normalization import NormalizationRegistry
 from app.agent_runtime.tools.contracts import arguments_hash, logical_call_id_for
-from app.agent_runtime.tools.mcp import _extract_scope_period
-from app.agent_runtime.tools.factory import resolve_allowlist_entry
 from app.agent_runtime.tools.mcp import DEFINITELY_NOT_SENT, RESULT_UNKNOWN, AgentMcpAccounting
 from app.pi_gateway.accounting import (
     McpPreflightContext,
@@ -39,11 +34,9 @@ from app.pi_gateway.accounting import (
     TenantAccountingError,
     TenantAccountingService,
 )
-from app.pi_gateway.result import validate_reviewed_result_json
 from app.mcp_gateway.models import McpToolCatalog
-from app.mcp_gateway.contracts import DataTapService
 from app.mcp_gateway.registry import close_input_schema
-from app.mcp_gateway.validation import McpValidationError, validate_input, validate_output
+from app.mcp_gateway.validation import McpValidationError, validate_input
 from app.runtime_config.schemas import RuntimeSecretBundle
 from app.runtime_config.service import RuntimeConfigService
 
@@ -64,10 +57,6 @@ from .events import (
     parse_source_event_id,
 )
 from .scheduler import PiRunScheduler
-from .result import (
-    McpResultEnvelopeError,
-    parse_mcp_result_details,
-)
 from .completion import CompletionValidator, close_open_runtime_rows
 
 
@@ -251,15 +240,8 @@ class PiGatewayService:
                 internal_tools=[{"name": name} for name in (
                     "get_session_context",
                     "load_marketing_skill",
-                    "search_evidence",
-                    "read_tool_result",
                     "read_artifact",
-                    "build_brand_report_draft",
-                    "build_campaign_report_draft",
-                    "build_kol_selection_draft",
-                    "build_kol_analysis_draft",
-                    "build_kol_detail_draft",
-                    "build_insight_draft",
+                    "build_artifact_draft",
                     "publish_artifacts",
                     "request_clarification",
                 )],
@@ -647,95 +629,34 @@ class PiGatewayService:
         if call is None:
             raise TenantAccountingError("mcp_tool_call_not_found")
         if call.status in ("settled", "failed", "unknown"):
-            # 幂等回放：终态调用不重复结算/释放，也不重复写 Evidence。
+            # 幂等回放：终态调用不重复结算/释放，也不重新解释模型看到的结果。
             return {"permit_id": request.permit_id, "status": call.status, "receipt": None}
-        details = request.details
-        mode = details.get("mode")
-        accounting = TenantAccountingService(self.db)
-        if mode == "mcpResult":
-            try:
-                parsed_result = parse_mcp_result_details(details)
-            except McpResultEnvelopeError as exc:
-                # A malformed finalize request does not prove what the
-                # provider did.  Keep the reservation for admin reconciliation
-                # instead of accepting a legacy/raw payload or releasing money.
-                raise TenantAccountingError(exc.code) from exc
-            if parsed_result.upstream_request_id is not None:
-                if (
-                    call.upstream_request_id is not None
-                    and call.upstream_request_id != parsed_result.upstream_request_id
-                ):
-                    raise TenantAccountingError("mcp_upstream_request_id_conflict")
-                call.upstream_request_id = parsed_result.upstream_request_id
-            if parsed_result.result_status == "empty":
-                # Confirmed success with no payload: settle the fixed fee, but
-                # keep Evidence absent and distinguish it from unknown.
-                receipt = await accounting.settle_mcp_call(request.permit_id, details)
-                status = "succeeded_empty"
-            elif parsed_result.result_status == "unavailable":
-                # The provider result is confirmed, but the payload cannot be
-                # trusted/retrieved.  It is billable and must not become
-                # result_unknown.
-                receipt = await accounting.settle_mcp_call(request.permit_id, details)
-                status = "result_unavailable"
-            else:
-                validated = self._validate_mcp_output(call, parsed_result.structured_content)
-                if validated is None:
-                    await accounting.fail_mcp_call(request.permit_id, "failed_confirmed")
-                    receipt = None
-                    status = "failed_confirmed"
-                else:
-                    scope, period = _extract_scope_period(call.arguments_json or {})
-                    try:
-                        async with self.db.begin_nested():
-                            await EvidenceWriter(self.db).write(
-                                session_id=run.session_id,
-                                run_id=run.id,
-                                tool_call_id=call.id,
-                                source_type="mcp",
-                                source_name=call.internal_tool_name,
-                                scope_json=scope,
-                                period_json=period,
-                                raw_payload=validated,
-                                normalization=NormalizationRegistry().normalize(
-                                    call.internal_tool_name, validated
-                                ),
-                            )
-                    except (EvidencePersistenceError, TypeError, ValueError):
-                        # MCP 已确认成功；本地 Evidence 不可持久化时仍结算，
-                        # 并显式标记 unavailable，绝不让 Gateway fallback 成 unknown。
-                        receipt = await accounting.settle_mcp_call(request.permit_id, details)
-                        status = "result_unavailable"
-                    else:
-                        receipt = await accounting.settle_mcp_call(request.permit_id, details)
-                        status = "settled"
-        else:
-            raise TenantAccountingError("mcp_result_envelope_invalid")
-        await self._update_mcp_call_status(request.permit_id, status)
+        if call.upstream_request_id is not None and request.upstream_request_id is not None:
+            if call.upstream_request_id != request.upstream_request_id:
+                raise TenantAccountingError("mcp_upstream_request_id_conflict")
+        elif request.upstream_request_id is not None:
+            call.upstream_request_id = request.upstream_request_id
+        metadata = request.model_dump(mode="json", exclude={"permit_id"})
+        receipt = await TenantAccountingService(self.db).settle_mcp_call_metadata(
+            request.permit_id,
+            metadata,
+        )
+        await self._update_mcp_call_status(request.permit_id, "settled")
         await self.db.flush()
-        return {"permit_id": request.permit_id, "status": status, "receipt": receipt.model_dump(mode="json") if receipt else None}
+        return {
+            "permit_id": request.permit_id,
+            "status": "settled",
+            "receipt": receipt.model_dump(mode="json"),
+        }
 
-    @staticmethod
-    def _validate_mcp_output(call: AgentToolCall, structured: Any) -> Any | None:
-        """按审核 allowlist 的输出 Schema 校验结构化结果；非法返回 None。"""
-        try:
-            entry = resolve_allowlist_entry(DataTapService(call.service), call.internal_tool_name)
-        except ValueError:
-            return None
-        if entry is None:
-            return None
-        _remote_name, _description, output_schema = entry
-        if not validate_reviewed_result_json(call.service, output_schema, structured):
-            return None
-        try:
-            validated = validate_output(structured, output_schema)
-            return validated
-        except McpValidationError:
-            return None
-        except (TypeError, ValueError, json.JSONDecodeError):
-            return None
-
-    async def fail_mcp(self, run: AgentRun, permit_id: str, classification: str) -> None:
+    async def fail_mcp(
+        self,
+        run: AgentRun,
+        permit_id: str,
+        classification: str,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
         permit = await self.db.scalar(
             select(TenantWalletTransaction)
             .where(TenantWalletTransaction.id == permit_id)
@@ -749,9 +670,26 @@ class PiGatewayService:
         ):
             raise TenantAccountingError("mcp_permit_run_mismatch")
         await TenantAccountingService(self.db).fail_mcp_call(permit_id, classification)
-        await self._update_mcp_call_status(permit_id, classification)
+        await self._update_mcp_call_status(
+            permit_id,
+            classification,
+            metadata=metadata,
+        )
 
-    async def _update_mcp_call_status(self, permit_id: str, status: str) -> None:
+    @staticmethod
+    def _safe_metadata_message(prefix: str, metadata: dict[str, Any] | None) -> str:
+        if metadata is None:
+            return prefix
+        source = metadata.get("source")
+        return f"{prefix}:{source}" if isinstance(source, str) else prefix
+
+    async def _update_mcp_call_status(
+        self,
+        permit_id: str,
+        status: str,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
         transaction = await self.db.scalar(
             select(TenantWalletTransaction).where(TenantWalletTransaction.id == permit_id)
         )
@@ -768,21 +706,10 @@ class PiGatewayService:
             call.status = "settled"
             call.points_settled = 10
             call.points_reserved = 0
-        elif status == "succeeded_empty":
-            # 上游成功但无结构化内容：积分已结算，产物不可用，不留 Evidence。
-            call.status = "settled"
-            call.error_type = "succeeded_empty"
-            call.points_settled = 10
-            call.points_reserved = 0
-        elif status == "result_unavailable":
-            call.status = "settled"
-            call.error_type = "result_unavailable"
-            call.safe_error_message = "confirmed MCP success without a retrievable payload"
-            call.points_settled = 10
-            call.points_reserved = 0
         elif status == "result_unknown":
             call.status = "unknown"
             call.error_type = RESULT_UNKNOWN
+            call.safe_error_message = self._safe_metadata_message("result_unknown", metadata)
         else:
             call.status = "failed"
             call.error_type = (

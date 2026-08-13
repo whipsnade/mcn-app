@@ -9,7 +9,13 @@
 import type { ChildProcess } from "node:child_process";
 
 import type { ControlPlaneClient } from "./control-plane-client.js";
-import type { McpToolCallInput } from "./mcp-accounting-extension.js";
+import {
+  isSafeMcpFailureMetadata,
+  isSafeMcpFinalizeMetadata,
+  type McpFailureMetadata,
+  type McpFinalizeMetadata,
+  type McpToolCallInput,
+} from "./mcp-accounting-extension.js";
 import {
   parseWorkerRpcRequest,
   WORKER_RPC_MAX_RESPONSE_BYTES,
@@ -87,19 +93,40 @@ export function createWorkerRpcHandlers(
     },
     mcp_finalize: async (params) => {
       const permitId = requireString(params.permit_id, 64);
-      const details = requireRecord(params.details ?? {});
-      return controlPlane.finalizeMcp(claim.run_id, { permit_id: permitId }, details, claim.lease_token);
+      const metadata: Record<string, unknown> = { ...params };
+      delete metadata.permit_id;
+      if (!isSafeMcpFinalizeMetadata(metadata)) throw new Error("worker_rpc_params_invalid");
+      return controlPlane.finalizeMcp(
+        claim.run_id,
+        { permit_id: permitId },
+        metadata as McpFinalizeMetadata,
+        claim.lease_token,
+      );
     },
     mcp_fail: async (params) => {
       const permitId = requireString(params.permit_id, 64);
       const classification = requireString(params.classification, 64);
       if (!MCP_CLASSIFICATIONS.has(classification)) throw new Error("worker_rpc_params_invalid");
-      return controlPlane.failMcp(
-        claim.run_id,
-        { permit_id: permitId },
-        classification as "definitely_not_sent" | "failed_confirmed" | "result_unknown",
-        claim.lease_token,
-      );
+      const metadata = params.metadata;
+      if (metadata !== undefined && !isSafeMcpFailureMetadata(metadata)) {
+        throw new Error("worker_rpc_params_invalid");
+      }
+      const classificationValue = classification as
+        "definitely_not_sent" | "failed_confirmed" | "result_unknown";
+      return metadata === undefined
+        ? controlPlane.failMcp(
+          claim.run_id,
+          { permit_id: permitId },
+          classificationValue,
+          claim.lease_token,
+        )
+        : controlPlane.failMcp(
+          claim.run_id,
+          { permit_id: permitId },
+          classificationValue,
+          claim.lease_token,
+          metadata as McpFailureMetadata,
+        );
     },
   };
 }

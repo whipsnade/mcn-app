@@ -7,6 +7,8 @@ import type {
 } from "./protocol.js";
 import type {
   McpAccountingControlPlane,
+  McpFailureMetadata,
+  McpFinalizeMetadata,
   McpPermit,
   McpToolCallInput,
 } from "./mcp-accounting-extension.js";
@@ -178,10 +180,15 @@ export class ControlPlaneClient implements ControlPlaneTransport {
     return result as McpPermit;
   }
 
-  async finalizeMcp(runId: string, permit: McpPermit, details: unknown, leaseToken: string): Promise<unknown> {
+  async finalizeMcp(
+    runId: string,
+    permit: McpPermit,
+    metadata: McpFinalizeMetadata,
+    leaseToken: string,
+  ): Promise<unknown> {
     return this.request("POST", `/runs/${encodeURIComponent(runId)}/mcp/finalize`, {
       permit_id: permit.permit_id,
-      details,
+      ...metadata,
     }, leaseToken);
   }
 
@@ -190,10 +197,12 @@ export class ControlPlaneClient implements ControlPlaneTransport {
     permit: McpPermit,
     classification: "definitely_not_sent" | "failed_confirmed" | "result_unknown",
     leaseToken: string,
+    metadata?: McpFailureMetadata,
   ): Promise<unknown> {
     return this.request("POST", `/runs/${encodeURIComponent(runId)}/mcp/fail`, {
       permit_id: permit.permit_id,
       classification,
+      ...(metadata === undefined ? {} : { metadata }),
     }, leaseToken);
   }
 
@@ -202,8 +211,9 @@ export class ControlPlaneClient implements ControlPlaneTransport {
       executeInternalTool: (toolName, args) =>
         this.executeInternalTool(toolName, args, runId, attemptId, leaseToken),
       preflight: (input) => this.preflightMcp(runId, input, leaseToken),
-      finalize: (permit, details) => this.finalizeMcp(runId, permit, details, leaseToken),
-      fail: (permit, classification) => this.failMcp(runId, permit, classification, leaseToken),
+      finalize: (permit, metadata) => this.finalizeMcp(runId, permit, metadata, leaseToken),
+      fail: (permit, classification, metadata) =>
+        this.failMcp(runId, permit, classification, leaseToken, metadata),
     };
   }
 

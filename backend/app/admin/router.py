@@ -247,6 +247,8 @@ async def reconcile_agent_tool_call(
         )
     except LookupError as error:
         raise not_found(error) from error
+    except ValueError as error:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
     return AgentToolCallReconcileResponse(**outcome)
 
 

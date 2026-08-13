@@ -342,7 +342,12 @@ async def mcp_fail(
     async def _do() -> dict[str, object]:
         run = await _leased_run(db, gateway_id, run_id, None, x_pi_run_lease)
         try:
-            await _service(db, gateway_id).fail_mcp(run, payload.permit_id, payload.classification)
+            await _service(db, gateway_id).fail_mcp(
+                run,
+                payload.permit_id,
+                payload.classification,
+                metadata=payload.metadata.model_dump(mode="json") if payload.metadata is not None else None,
+            )
             await db.commit()
         except (TenantAccountingError, ValueError) as exc:
             await db.rollback()
@@ -466,8 +471,10 @@ async def terminal(
                 "pi_gateway_terminal_missing_completion",
                 "pi_gateway_running_agent_steps",
                 "pi_gateway_unresolved_mcp_calls",
-                "required_artifact_missing",
-                "required_artifact_invalid_lineage",
+                "pi_gateway_snapshot_invalid",
+                "pi_gateway_artifact_invalid",
+                "pi_gateway_artifact_contract_not_allowed",
+                "pi_gateway_active_artifact_draft",
             }:
                 code = "pi_gateway_terminal_rejected"
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=code) from exc

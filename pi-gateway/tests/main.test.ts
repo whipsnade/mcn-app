@@ -421,7 +421,7 @@ describe("production gateway composition root", () => {
       "  try {",
       "    const toolResult = await rpc.call('internal_tool', { tool_name: 'get_session_context', args: {} });",
       "    const permit = await rpc.call('mcp_preflight', { tool: 'query_analysis_data', server: 'insight-cube', args: { keyword: 'x' } });",
-      "    await rpc.call('mcp_finalize', { permit_id: permit.permit_id, details: { mode: 'mcpResult' } });",
+      "    await rpc.call('mcp_finalize', { permit_id: permit.permit_id, outcome: 'succeeded', response_bytes: 0 });",
       "    await rpc.call('mcp_fail', { permit_id: permit.permit_id, classification: 'result_unknown' });",
       "    process.send({ type: 'event', runId: message.work.runId, event: {",
       "      source_event_id: message.work.attemptId + ':1', sequence: 1,",

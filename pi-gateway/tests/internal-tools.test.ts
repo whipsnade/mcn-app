@@ -24,7 +24,7 @@ describe("production internal tool client", () => {
         return { status: "success" };
       },
     });
-    await client.execute("search_evidence", {
+    await client.execute("build_artifact_draft", {
       filters: { session_id: "attacker", query: "brand" },
       items: [{ run_id: "attacker", value: 1 }],
     });
@@ -40,10 +40,19 @@ describe("production internal tool client", () => {
       }),
     });
 
-    await expect(client.execute("build_brand_report_draft", {})).resolves.toEqual({
+    await expect(client.execute("build_artifact_draft", {})).resolves.toEqual({
       status: "failed",
       error_type: "draft_build_error",
       warning_code: "agent_loop_circuit_open",
     });
+  });
+
+  it("does not expose the legacy Evidence bridge tools", async () => {
+    const client = new PiInternalToolsClient({
+      executeInternalTool: async () => ({ status: "success" }),
+    });
+    await expect(client.execute("search_evidence", {})).rejects.toThrow("pi_internal_tool_not_allowed");
+    await expect(client.execute("read_tool_result", {})).rejects.toThrow("pi_internal_tool_not_allowed");
+    await expect(client.execute("build_brand_report_draft", {})).rejects.toThrow("pi_internal_tool_not_allowed");
   });
 });

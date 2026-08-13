@@ -58,6 +58,16 @@ def _make_recovery_tool(db, call, *, breaker, transport) -> AgentMcpTool | None:
     )
 
 
+def _make_pi_recovery_tool(_db, _call) -> None:
+    """Pi unknown calls are accounting facts, not legacy Evidence inputs.
+
+    The Pi Gateway has its own metadata-only finalize/reconciliation boundary.
+    Automatic recovery must not instantiate the current AgentMcpTool, which
+    would parse a provider payload and write Evidence on the Pi path.
+    """
+    return None
+
+
 def create_agent_runtime(*, stuck_seconds: float | None = None) -> tuple[
     AgentRunExecutor,
     RecoveryLoop,
@@ -175,9 +185,7 @@ def create_agent_runtime(*, stuck_seconds: float | None = None) -> tuple[
     pi_recovery = RecoveryLoop(
         executor=executor,
         session_factory=SessionFactory,
-        tool_factory=lambda db, call: _make_recovery_tool(
-            db, call, breaker=breaker, transport=agent_transport
-        ),
+        tool_factory=_make_pi_recovery_tool,
         worker_id=f"pi-recovery-{os.getpid()}",
         lease_seconds=AGENT_LEASE_SECONDS,
         interval_seconds=get_settings().agent_recovery_interval_seconds,

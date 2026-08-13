@@ -10,9 +10,12 @@
 import type {
   McpAccountingControlPlane,
   McpBlocked,
+  McpFailureMetadata,
+  McpFinalizeMetadata,
   McpPermit,
   McpToolCallInput,
 } from "./mcp-accounting-extension.js";
+import { isSafeMcpFinalizeMetadata } from "./mcp-accounting-extension.js";
 import type { ControlPlaneTransport } from "./control-plane-client.js";
 
 export const WORKER_RPC_METHODS = [
@@ -24,8 +27,8 @@ export const WORKER_RPC_METHODS = [
 export type WorkerRpcMethod = (typeof WORKER_RPC_METHODS)[number];
 
 export const WORKER_RPC_MAX_REQUEST_BYTES = 64 * 1024;
-/** mcp_finalize 携带完整结构化结果，独立放行到 1 MiB（后端同口径）。 */
-export const WORKER_RPC_MAX_FINALIZE_BYTES = 1024 * 1024;
+/** mcp_finalize 只携带严格、有界的非业务结算元数据。 */
+export const WORKER_RPC_MAX_FINALIZE_BYTES = 8 * 1024;
 export const WORKER_RPC_MAX_RESPONSE_BYTES = 1024 * 1024;
 const RPC_ID_PATTERN = /^[A-Za-z0-9._:-]{1,128}$/;
 const SAFE_ERROR_CODE = /^[a-z0-9_:-]{1,64}$/;
@@ -76,6 +79,14 @@ export function parseWorkerRpcRequest(value: unknown): WorkerRpcRequest {
     byteLength(value.params) > maxParamBytes
   ) {
     throw new Error("worker_rpc_invalid");
+  }
+  if (value.method === "mcp_finalize") {
+    const permitId = value.params.permit_id;
+    const metadata = { ...value.params };
+    delete metadata.permit_id;
+    if (typeof permitId !== "string" || permitId.length === 0 || !isSafeMcpFinalizeMetadata(metadata)) {
+      throw new Error("worker_rpc_invalid");
+    }
   }
   return {
     type: "worker_rpc",
@@ -247,14 +258,19 @@ export class WorkerRpcControlPlane implements McpAccountingControlPlane, Control
     }
   }
 
-  async finalize(permit: McpPermit, result: unknown): Promise<unknown> {
-    return this.rpc.call("mcp_finalize", { permit_id: permit.permit_id, details: result });
+  async finalize(permit: McpPermit, metadata: McpFinalizeMetadata): Promise<unknown> {
+    return this.rpc.call("mcp_finalize", { permit_id: permit.permit_id, ...metadata });
   }
 
   async fail(
     permit: McpPermit,
     classification: "definitely_not_sent" | "failed_confirmed" | "result_unknown",
+    metadata?: McpFailureMetadata,
   ): Promise<unknown> {
-    return this.rpc.call("mcp_fail", { permit_id: permit.permit_id, classification });
+    return this.rpc.call("mcp_fail", {
+      permit_id: permit.permit_id,
+      classification,
+      ...(metadata === undefined ? {} : { metadata }),
+    });
   }
 }

@@ -41,6 +41,7 @@ describe("production resource loader", () => {
       directTools: false,
       toolPrefix: "none",
       requestTimeoutMs: 180_000,
+      outputGuard: false,
     });
     expect(config.mcpServers["insight-cube"]).toEqual({
       url: "${PI_DATATAP_URL_INSIGHT_CUBE}",

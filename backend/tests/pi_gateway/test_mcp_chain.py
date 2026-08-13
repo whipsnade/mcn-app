@@ -1,27 +1,15 @@
-"""Pi MCP 链路服务级测试：preflight durable 预留 → finalize → Evidence。
-
-覆盖 B4/B5 契约：成功调用写不可变 Evidence 并结算 10 分；输出 Schema 非法
-按 failed_confirmed 释放；成功但无结构化内容按 succeeded_empty 结算但不留
-Evidence；未审核工具在 preflight 即阻断（0 外发、0 扣费）。
-"""
+"""Pi MCP 服务级测试：透明 Tool Result 旁路计费与严格身份边界。"""
 
 from __future__ import annotations
 
-import json
 from datetime import UTC, datetime
 from uuid import uuid4
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import select
 
-from app.agent_runtime.models import (
-    AgentRun,
-    AgentRunAttempt,
-    AgentSession,
-    AgentStep,
-    AgentToolCall,
-    EvidenceItem,
-)
+from app.agent_runtime.models import AgentRun, AgentRunAttempt, AgentSession, AgentStep, AgentToolCall, EvidenceItem
 from app.billing.models import TenantWallet
 from app.mcp_gateway.models import McpToolCatalog, McpToolDiscovery
 from app.pi_gateway.accounting import TenantAccountingError, TenantAccountingService
@@ -41,90 +29,63 @@ _DIGEST = "a" * 64
 
 async def _seed_catalog(db_session) -> None:
     now = _now()
+    schema = {
+        "type": "object",
+        "properties": {"keyword": {"type": "string"}},
+        "required": ["keyword"],
+        "additionalProperties": False,
+    }
     db_session.add(
         McpToolCatalog(
-            id=str(uuid4()),
-            service_slug="insight-cube-mcp",
-            internal_tool_name="query_analysis_data",
-            reviewed_description="品牌声量统计",
-            input_schema_json={
-                "type": "object",
-                "properties": {"keyword": {"type": "string"}},
-                "required": ["keyword"],
-                "additionalProperties": False,
-            },
-            output_validator_version="v1",
-            discovery_digest=_DIGEST,
-            review_status="approved",
-            is_enabled=True,
-            created_at=now,
-            updated_at=now,
+            id=str(uuid4()), service_slug="insight-cube-mcp", internal_tool_name="query_analysis_data",
+            reviewed_description="品牌声量统计", input_schema_json=schema, output_validator_version="v1",
+            discovery_digest=_DIGEST, review_status="approved", is_enabled=True,
+            created_at=now, updated_at=now,
         )
     )
     db_session.add(
         McpToolDiscovery(
-            id=str(uuid4()),
-            service_slug="insight-cube-mcp",
-            remote_name="query_analysis_data",
-            description="品牌声量统计",
-            input_schema_json={
-                "type": "object",
-                "properties": {"keyword": {"type": "string"}},
-                "required": ["keyword"],
-                "additionalProperties": False,
-            },
-            output_schema_json=None,
-            discovery_digest=_DIGEST,
-            review_status="approved",
-            discovered_at=now,
-            updated_at=now,
+            id=str(uuid4()), service_slug="insight-cube-mcp", remote_name="query_analysis_data",
+            description="品牌声量统计", input_schema_json=schema, output_schema_json=None,
+            discovery_digest=_DIGEST, review_status="approved", discovered_at=now, updated_at=now,
         )
     )
     await db_session.flush()
 
 
 async def _pi_run(db_session, user) -> tuple[AgentRun, AgentRunAttempt, str]:
-    membership = await db_session.scalar(
-        select(TenantMembership).where(TenantMembership.user_id == user.id)
-    )
+    membership = await db_session.scalar(select(TenantMembership).where(TenantMembership.user_id == user.id))
     assert membership is not None
     tenant_id = membership.tenant_id
     now = _now()
     session = AgentSession(
-        id=str(uuid4()), user_id=user.id, tenant_id=tenant_id,
-        title="pi mcp 链路", status="active", created_at=now, updated_at=now,
+        id=str(uuid4()), user_id=user.id, tenant_id=tenant_id, title="pi mcp 链路",
+        status="active", created_at=now, updated_at=now,
     )
     db_session.add(session)
     await db_session.flush()
     snapshot = _snapshot()
-    snapshot["adapter_catalog"] = [
-        {
-            "catalog_entry_id": "placeholder",
-            "adapter_visible_name": "query_analysis_data",
-            "service": "insight-cube-mcp",
-            "remote_name": "query_analysis_data",
-            "input_schema_digest": f"sha256:{_DIGEST}",
-        }
-    ]
+    snapshot["adapter_catalog"] = [{
+        "catalog_entry_id": "placeholder", "adapter_visible_name": "query_analysis_data",
+        "service": "insight-cube-mcp", "remote_name": "query_analysis_data",
+        "input_schema_digest": f"sha256:{_DIGEST}",
+    }]
     run = AgentRun(
         id=str(uuid4()), session_id=session.id, user_id=user.id, tenant_id=tenant_id,
-        runtime_backend="pi", runtime_config_version_id=None,
-        runtime_config_snapshot_json=None, queued_at=None,
-        profile_name="session_analyst_v1", profile_version="v1", model="fake-model",
+        runtime_backend="pi", runtime_config_version_id=None, runtime_config_snapshot_json=None,
+        queued_at=None, profile_name="session_analyst_v1", profile_version="v1", model="fake-model",
         status="running", decision_count=0, review_count=0, revision_count=0,
         created_at=now, started_at=now, run_kind="user",
     )
     db_session.add(run)
     await db_session.flush()
-    # 快照里的 catalog_entry_id 必须与真实目录行一致（claim 时绑定的复核口径）。
     catalog = await db_session.scalar(
         select(McpToolCatalog).where(McpToolCatalog.internal_tool_name == "query_analysis_data")
     )
     snapshot["adapter_catalog"][0]["catalog_entry_id"] = catalog.id
     run.runtime_config_snapshot_json = snapshot
     attempt = AgentRunAttempt(
-        id=str(uuid4()), run_id=run.id, attempt=1, started_at=now,
-        outcome="running", decision_count=0,
+        id=str(uuid4()), run_id=run.id, attempt=1, started_at=now, outcome="running", decision_count=0,
     )
     db_session.add(attempt)
     await db_session.flush()
@@ -137,318 +98,107 @@ async def _fund(db_session, tenant_id: str, user_id: str, balance: int = 1000) -
     await accounting.ensure_user_quota(tenant_id, user_id, points_limit=100_000)
 
 
-@pytest.mark.asyncio
-async def test_finalize_writes_evidence_and_settles_after_durable_preflight(
-    db_session, user_factory
-) -> None:
+async def _preflight(db_session, user_factory):
     user = await user_factory()
     await _seed_catalog(db_session)
-    run, _attempt, tenant_id = await _pi_run(db_session, user)
+    run, attempt, tenant_id = await _pi_run(db_session, user)
     await _fund(db_session, tenant_id, user.id)
     service = PiGatewayService(db_session, gateway_id="gw-chain")
-
     permit = await service.preflight_mcp(
         run,
         PiGatewayMcpPreflightRequest(
             tool_name="query_analysis_data", server="insight-cube-mcp", args={"keyword": "美妆"}
         ),
     )
-    call = await db_session.scalar(
-        select(AgentToolCall).where(AgentToolCall.run_id == run.id)
-    )
-    assert call is not None and call.status == "running" and call.points_reserved == 10
-    wallet = await db_session.get(TenantWallet, tenant_id)
-    assert wallet is not None and (wallet.balance, wallet.reserved) == (990, 10)
+    return user, run, attempt, tenant_id, service, permit
 
-    payload = {"result": '{"rows": [{"日期": "2026-08-01", "平台": "小红书", "声量": 120}]}'}
-    await service.finalize_mcp(
+
+@pytest.mark.asyncio
+async def test_success_metadata_settles_without_interpreting_or_writing_evidence(db_session, user_factory) -> None:
+    _user, run, _attempt, tenant_id, service, permit = await _preflight(db_session, user_factory)
+    result = await service.finalize_mcp(
         run,
         PiGatewayMcpFinalizeRequest(
-            permit_id=permit.permit_id,
-            details={
-                "mode": "mcpResult",
-                "mcpResult": {
-                    "envelope": "mcp_result_v1",
-                    "result_status": "available",
-                    "structuredContent": payload,
-                    "upstream_request_id": "upstream-redacted-chain-1",
-                },
-            },
+            permit_id=permit.permit_id, outcome="succeeded", upstream_request_id="upstream-1",
+            response_bytes=120, adapter_version="adapter-v1",
         ),
     )
-    await db_session.refresh(call)
-    assert call.status == "settled" and call.points_settled == 10
+    call = await db_session.scalar(select(AgentToolCall).where(AgentToolCall.run_id == run.id))
+    assert call is not None and call.status == "settled" and call.points_settled == 10 and call.points_reserved == 0
+    assert call.upstream_request_id == "upstream-1"
+    assert result["status"] == "settled"
+    assert await db_session.scalar(select(EvidenceItem.id).where(EvidenceItem.tool_call_id == call.id)) is None
     step = await db_session.get(AgentStep, call.step_id)
     assert step is not None and step.status == "completed"
-    assert call.upstream_request_id == "upstream-redacted-chain-1"
-    evidence = await db_session.scalar(
-        select(EvidenceItem).where(EvidenceItem.tool_call_id == call.id)
-    )
-    assert evidence is not None
-    assert evidence.raw_payload_json == payload
-    assert evidence.source_name == "query_analysis_data"
-    await db_session.refresh(wallet)
-    assert (wallet.balance, wallet.reserved) == (990, 0)
-
-
-@pytest.mark.asyncio
-async def test_finalize_accepts_large_structured_result_within_bounded_cap(
-    db_session, user_factory
-) -> None:
-    """大于 64 KiB 的合法结果必须能 finalize（旧上限会让预留永远悬挂）。"""
-    user = await user_factory()
-    await _seed_catalog(db_session)
-    run, _attempt, tenant_id = await _pi_run(db_session, user)
-    await _fund(db_session, tenant_id, user.id)
-    service = PiGatewayService(db_session, gateway_id="gw-chain")
-
-    permit = await service.preflight_mcp(
-        run,
-        PiGatewayMcpPreflightRequest(
-            tool_name="query_analysis_data", server="insight-cube-mcp", args={"keyword": "美妆"}
-        ),
-    )
-    # >64 KiB（result JSON 串尾部空白，json.loads 兼容），<1 MiB
-    payload = {"result": '{"rows": [{"日期": "2026-08-01", "平台": "小红书", "声量": 120}]}' + " " * (100 * 1024)}
-    await service.finalize_mcp(
-        run,
-        PiGatewayMcpFinalizeRequest(
-            permit_id=permit.permit_id,
-            details={
-                "mode": "mcpResult",
-                "mcpResult": {
-                    "envelope": "mcp_result_v1",
-                    "result_status": "available",
-                    "structuredContent": payload,
-                },
-            },
-        ),
-    )
-    call = await db_session.scalar(select(AgentToolCall).where(AgentToolCall.run_id == run.id))
-    assert call is not None and call.status == "settled"
     wallet = await db_session.get(TenantWallet, tenant_id)
     assert wallet is not None and (wallet.balance, wallet.reserved) == (990, 0)
 
 
-def test_finalize_payload_above_one_mib_is_rejected() -> None:
-    """finalize 有界上限是 1 MiB：超限必须在 DTO 校验期拒绝。"""
-    from pydantic import ValidationError
+@pytest.mark.asyncio
+@pytest.mark.parametrize("metadata", [{"outcome": "succeeded"}, {"outcome": "succeeded", "response_bytes": 0}])
+async def test_empty_text_and_structured_results_share_confirmed_success_accounting(
+    db_session, user_factory, metadata
+) -> None:
+    # The service deliberately cannot observe the model-visible result. Empty,
+    # plain text, multiple text blocks, and structuredContent all use this same
+    # metadata-only finalize contract.
+    _user, run, _attempt, tenant_id, service, permit = await _preflight(db_session, user_factory)
+    await service.finalize_mcp(run, PiGatewayMcpFinalizeRequest(permit_id=permit.permit_id, **metadata))
+    call = await db_session.scalar(select(AgentToolCall).where(AgentToolCall.run_id == run.id))
+    assert call is not None and call.status == "settled" and call.error_type is None
+    assert await db_session.scalar(select(EvidenceItem.id).where(EvidenceItem.tool_call_id == call.id)) is None
+    wallet = await db_session.get(TenantWallet, tenant_id)
+    assert wallet is not None and wallet.reserved == 0
 
+
+def test_finalize_rejects_business_payload_and_legacy_envelope() -> None:
+    for payload in (
+        {"permit_id": "p-1", "details": {"mode": "mcpResult"}},
+        {"permit_id": "p-1", "outcome": "succeeded", "structuredContent": {"rows": [1]}},
+        {"permit_id": "p-1", "outcome": "succeeded", "payload": {"rows": [1]}},
+    ):
+        with pytest.raises(ValidationError):
+            PiGatewayMcpFinalizeRequest.model_validate(payload)
+
+
+def test_finalize_metadata_has_a_small_bounded_shape() -> None:
     with pytest.raises(ValidationError):
         PiGatewayMcpFinalizeRequest(
-            permit_id="p-oversized",
-            details={"mode": "call", "blob": "x" * (1024 * 1024 + 1024)},
+            permit_id="p-1", outcome="succeeded", response_bytes=64 * 1024 * 1024 + 1,
         )
 
 
 @pytest.mark.asyncio
-async def test_finalize_with_invalid_output_releases_and_writes_no_evidence(
-    db_session, user_factory
-) -> None:
-    user = await user_factory()
-    await _seed_catalog(db_session)
-    run, _attempt, tenant_id = await _pi_run(db_session, user)
-    await _fund(db_session, tenant_id, user.id)
-    service = PiGatewayService(db_session, gateway_id="gw-chain")
-
-    permit = await service.preflight_mcp(
-        run,
-        PiGatewayMcpPreflightRequest(
-            tool_name="query_analysis_data", server="insight-cube-mcp", args={"keyword": "美妆"}
-        ),
-    )
-    await service.finalize_mcp(
-        run,
-        PiGatewayMcpFinalizeRequest(
-            permit_id=permit.permit_id,
-            details={
-                "mode": "mcpResult",
-                "mcpResult": {
-                    "envelope": "mcp_result_v1",
-                    "result_status": "available",
-                    "structuredContent": {"unexpected": 1},
-                },
-            },
-        ),
-    )
+async def test_confirmed_failure_releases_without_evidence(db_session, user_factory) -> None:
+    _user, run, _attempt, tenant_id, service, permit = await _preflight(db_session, user_factory)
+    await service.fail_mcp(run, permit.permit_id, "failed_confirmed", metadata=None)
     call = await db_session.scalar(select(AgentToolCall).where(AgentToolCall.run_id == run.id))
-    assert call is not None and call.status == "failed"
-    assert call.error_type == "failed_confirmed"
-    evidence = await db_session.scalar(select(EvidenceItem).where(EvidenceItem.tool_call_id == call.id))
-    assert evidence is None
+    assert call is not None and call.status == "failed" and call.points_reserved == 0
     wallet = await db_session.get(TenantWallet, tenant_id)
-    assert wallet is not None and (wallet.balance, wallet.reserved) == (1000, 0)
+    assert wallet is not None and wallet.reserved == 0
 
 
 @pytest.mark.asyncio
-async def test_finalize_without_structured_content_settles_empty_without_evidence(
-    db_session, user_factory
-) -> None:
-    user = await user_factory()
-    await _seed_catalog(db_session)
-    run, _attempt, tenant_id = await _pi_run(db_session, user)
-    await _fund(db_session, tenant_id, user.id)
-    service = PiGatewayService(db_session, gateway_id="gw-chain")
-
-    permit = await service.preflight_mcp(
-        run,
-        PiGatewayMcpPreflightRequest(
-            tool_name="query_analysis_data", server="insight-cube-mcp", args={"keyword": "美妆"}
-        ),
-    )
-    await service.finalize_mcp(
-        run,
-        PiGatewayMcpFinalizeRequest(
-            permit_id=permit.permit_id,
-            details={
-                "mode": "mcpResult",
-                "mcpResult": {"envelope": "mcp_result_v1", "result_status": "empty"},
-            },
-        ),
+async def test_unknown_keeps_reservation_and_records_only_safe_source(db_session, user_factory) -> None:
+    _user, run, _attempt, tenant_id, service, permit = await _preflight(db_session, user_factory)
+    await service.fail_mcp(
+        run, permit.permit_id, "result_unknown",
+        metadata={"version": "mcp_failure_v1", "source": "worker_rpc_timeout"},
     )
     call = await db_session.scalar(select(AgentToolCall).where(AgentToolCall.run_id == run.id))
-    assert call is not None and call.status == "settled" and call.error_type == "succeeded_empty"
-    assert call.points_settled == 10  # 上游确实成功：结算但不产 Evidence
-    evidence = await db_session.scalar(select(EvidenceItem).where(EvidenceItem.tool_call_id == call.id))
-    assert evidence is None
+    assert call is not None and call.status == "unknown" and call.error_type == "result_unknown"
+    assert call.safe_error_message == "result_unknown:worker_rpc_timeout"
     wallet = await db_session.get(TenantWallet, tenant_id)
-    assert wallet is not None and (wallet.balance, wallet.reserved) == (990, 0)
+    assert wallet is not None and wallet.reserved == 10
 
 
 @pytest.mark.asyncio
-async def test_finalize_known_success_unavailable_settles_without_evidence(
-    db_session, user_factory
-) -> None:
+async def test_preflight_rejects_unreviewed_tool_before_reservation(db_session, user_factory) -> None:
     user = await user_factory()
     await _seed_catalog(db_session)
     run, _attempt, tenant_id = await _pi_run(db_session, user)
     await _fund(db_session, tenant_id, user.id)
     service = PiGatewayService(db_session, gateway_id="gw-chain")
-
-    permit = await service.preflight_mcp(
-        run,
-        PiGatewayMcpPreflightRequest(
-            tool_name="query_analysis_data", server="insight-cube-mcp", args={"keyword": "美妆"}
-        ),
-    )
-    result = await service.finalize_mcp(
-        run,
-        PiGatewayMcpFinalizeRequest(
-            permit_id=permit.permit_id,
-            details={
-                "mode": "mcpResult",
-                "mcpResult": {
-                    "envelope": "mcp_result_v1",
-                    "result_status": "unavailable",
-                    "unavailable_reason": "payload_too_large",
-                    "upstream_request_id": "upstream-redacted-unavailable",
-                },
-            },
-        ),
-    )
-    assert result["status"] == "result_unavailable"
-    call = await db_session.scalar(select(AgentToolCall).where(AgentToolCall.run_id == run.id))
-    assert call is not None
-    assert call.status == "settled"
-    assert call.error_type == "result_unavailable"
-    assert call.points_settled == 10 and call.points_reserved == 0
-    assert call.upstream_request_id == "upstream-redacted-unavailable"
-    assert await db_session.scalar(select(EvidenceItem).where(EvidenceItem.tool_call_id == call.id)) is None
-    wallet = await db_session.get(TenantWallet, tenant_id)
-    assert wallet is not None and (wallet.balance, wallet.reserved) == (990, 0)
-
-
-@pytest.mark.asyncio
-async def test_finalize_confirmed_success_local_evidence_failure_settles_unavailable(
-    db_session, user_factory, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """已确认上游成功但本地 Evidence 持久化失败：结算并标记 unavailable。"""
-    user = await user_factory()
-    await _seed_catalog(db_session)
-    run, _attempt, tenant_id = await _pi_run(db_session, user)
-    await _fund(db_session, tenant_id, user.id)
-    service = PiGatewayService(db_session, gateway_id="gw-chain")
-
-    async def fail_evidence_write(*_args, **_kwargs):
-        from app.agent_runtime.evidence import EvidencePersistenceError
-
-        raise EvidencePersistenceError("simulated evidence persistence failure")
-
-    from app.agent_runtime.evidence import EvidenceWriter
-
-    monkeypatch.setattr(EvidenceWriter, "write", fail_evidence_write)
-    permit = await service.preflight_mcp(
-        run,
-        PiGatewayMcpPreflightRequest(
-            tool_name="query_analysis_data", server="insight-cube-mcp", args={"keyword": "美妆"}
-        ),
-    )
-
-    result = await service.finalize_mcp(
-        run,
-        PiGatewayMcpFinalizeRequest(
-            permit_id=permit.permit_id,
-            details={
-                "mode": "mcpResult",
-                "mcpResult": {
-                    "envelope": "mcp_result_v1",
-                    "result_status": "available",
-                    "structuredContent": {"result": json.dumps("upstream-success")},
-                },
-            },
-        ),
-    )
-
-    call = await db_session.scalar(select(AgentToolCall).where(AgentToolCall.run_id == run.id))
-    assert result["status"] == "result_unavailable"
-    assert call is not None and call.status == "settled"
-    assert call.error_type == "result_unavailable"
-    assert call.points_settled == 10 and call.points_reserved == 0
-    assert await db_session.scalar(select(EvidenceItem).where(EvidenceItem.tool_call_id == call.id)) is None
-    wallet = await db_session.get(TenantWallet, tenant_id)
-    assert wallet is not None and (wallet.balance, wallet.reserved) == (990, 0)
-
-
-@pytest.mark.asyncio
-async def test_finalize_rejects_noncanonical_raw_payload_and_keeps_reservation_unknown(
-    db_session, user_factory
-) -> None:
-    user = await user_factory()
-    await _seed_catalog(db_session)
-    run, _attempt, tenant_id = await _pi_run(db_session, user)
-    await _fund(db_session, tenant_id, user.id)
-    service = PiGatewayService(db_session, gateway_id="gw-chain")
-
-    permit = await service.preflight_mcp(
-        run,
-        PiGatewayMcpPreflightRequest(
-            tool_name="query_analysis_data", server="insight-cube-mcp", args={"keyword": "美妆"}
-        ),
-    )
-    with pytest.raises(TenantAccountingError, match="mcp_result_envelope_invalid"):
-        await service.finalize_mcp(
-            run,
-            PiGatewayMcpFinalizeRequest(
-                permit_id=permit.permit_id,
-                details={"mode": "call", "mcpResult": {"structuredContent": {"result": "{}"}}},
-            ),
-        )
-    call = await db_session.scalar(select(AgentToolCall).where(AgentToolCall.run_id == run.id))
-    assert call is not None and call.status == "running"
-    wallet = await db_session.get(TenantWallet, tenant_id)
-    assert wallet is not None and (wallet.balance, wallet.reserved) == (990, 10)
-
-
-@pytest.mark.asyncio
-async def test_preflight_rejects_unreviewed_tool_before_any_reservation(
-    db_session, user_factory
-) -> None:
-    user = await user_factory()
-    await _seed_catalog(db_session)
-    run, _attempt, tenant_id = await _pi_run(db_session, user)
-    await _fund(db_session, tenant_id, user.id)
-    service = PiGatewayService(db_session, gateway_id="gw-chain")
-
     with pytest.raises(TenantAccountingError, match="mcp_tool_not_allowed"):
         await service.preflight_mcp(
             run,
@@ -456,7 +206,6 @@ async def test_preflight_rejects_unreviewed_tool_before_any_reservation(
                 tool_name="unreviewed_tool", server="insight-cube-mcp", args={"keyword": "美妆"}
             ),
         )
-    calls = list((await db_session.scalars(select(AgentToolCall).where(AgentToolCall.run_id == run.id))).all())
-    assert calls == []
+    assert list((await db_session.scalars(select(AgentToolCall).where(AgentToolCall.run_id == run.id))).all()) == []
     wallet = await db_session.get(TenantWallet, tenant_id)
     assert wallet is not None and (wallet.balance, wallet.reserved) == (1000, 0)

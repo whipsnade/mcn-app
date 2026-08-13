@@ -174,6 +174,22 @@ describe("worker IPC RPC protocol", () => {
     client.dispose();
   });
 
+  it("carries only a small failure source over the MCP fail RPC", async () => {
+    const channel = memoryChannel();
+    const client = new WorkerRpcClient(channel);
+    const controlPlane = new WorkerRpcControlPlane(client);
+    const metadata = { version: "mcp_failure_v1" as const, source: "worker_rpc_timeout" as const };
+    const pending = controlPlane.fail({ permit_id: "p-unknown" }, "result_unknown", metadata);
+    const [request] = channel.sent as Array<{ method: string; params: Record<string, unknown>; id: string }>;
+    expect(request).toMatchObject({
+      method: "mcp_fail",
+      params: { permit_id: "p-unknown", classification: "result_unknown", metadata },
+    });
+    channel.emit({ type: "worker_rpc_result", id: request.id, ok: true, result: { ok: true } });
+    await expect(pending).resolves.toEqual({ ok: true });
+    client.dispose();
+  });
+
   it("bridges internal tool execution with tool name and args only", async () => {
     const channel = memoryChannel();
     const client = new WorkerRpcClient(channel);

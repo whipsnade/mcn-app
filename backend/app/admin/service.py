@@ -31,6 +31,7 @@ from app.mcp_gateway.contracts import DataTapService
 from app.mcp_gateway.models import McpCall
 from app.mcp_gateway.transport import resolve_remote_result_status
 from app.mcp_gateway.validation import McpValidationError, validate_output
+from app.pi_gateway.accounting import TenantAccountingService
 from app.pi_gateway.result import validate_reviewed_result_json
 from app.quick.models import QuickMcpCall
 from app.tasks.models import AnalysisTask
@@ -587,6 +588,9 @@ class AdminService:
         )
         if call is None:
             raise LookupError("agent_tool_call_not_found")
+        run = await self.db.get(AgentRun, call.run_id)
+        if run is None:
+            raise LookupError("agent_run_not_found")
         user_id = await self._agent_run_user_id(call)
 
         if call.status in ("settled", "failed"):
@@ -598,24 +602,49 @@ class AdminService:
         before_status = call.status
         evidence_id: str | None = None
         if decision == "confirm_success":
-            evidence, invalid_payload = await self._retrievable_evidence(call)
-            if evidence is not None:
-                evidence_id = evidence.id
-            if invalid_payload:
-                # Payload was confirmed to exist but failed the reviewed output
-                # contract: it is a confirmed failure, not an unavailable
-                # success. Release the reservation and never create Evidence.
-                await AgentMcpAccounting(self.db).release(
-                    user_id,
-                    call,
-                    error_type="failed_confirmed",
-                    message="reconciled payload failed output schema validation",
+            # Pi's model-visible MCP result is never reconstructed by the
+            # admin path. A Pi unknown call may only be settled after an
+            # authoritative upstream fact is supplied; this route does not
+            # accept arbitrary payloads or create Evidence for Pi.
+            if run.runtime_backend == "pi":
+                if self._tool_call_reconciler is None or not call.upstream_request_id:
+                    raise ValueError("pi_mcp_success_confirmation_unavailable")
+                result = await self._tool_call_reconciler(call.upstream_request_id)
+                if result is None or getattr(result, "is_error", False):
+                    raise ValueError("pi_mcp_success_confirmation_unavailable")
+                await TenantAccountingService(self.db).settle_mcp_call_metadata(
+                    await self._tenant_permit_id(call),
+                    {
+                        "outcome": "succeeded",
+                        "upstream_request_id": call.upstream_request_id,
+                    },
                 )
+                call.status = "settled"
+                call.points_reserved = 0
+                call.points_settled = 10
+                call.error_type = None
+                call.safe_error_message = None
+                call.completed_at = utc_now()
+                evidence_id = None
             else:
-                await AgentMcpAccounting(self.db).settle(user_id, call)
-            if evidence is None and not invalid_payload:
-                call.error_type = "result_unavailable"
-                call.safe_error_message = "result_unavailable"
+                evidence, invalid_payload = await self._retrievable_evidence(call)
+                if evidence is not None:
+                    evidence_id = evidence.id
+                if invalid_payload:
+                    # Payload was confirmed to exist but failed the reviewed output
+                    # contract: it is a confirmed failure, not an unavailable
+                    # success. Release the reservation and never create Evidence.
+                    await AgentMcpAccounting(self.db).release(
+                        user_id,
+                        call,
+                        error_type="failed_confirmed",
+                        message="reconciled payload failed output schema validation",
+                    )
+                else:
+                    await AgentMcpAccounting(self.db).settle(user_id, call)
+                if evidence is None and not invalid_payload:
+                    call.error_type = "result_unavailable"
+                    call.safe_error_message = "result_unavailable"
         elif decision == "confirm_failure":
             await AgentMcpAccounting(self.db).release(
                 user_id,
@@ -662,6 +691,31 @@ class AdminService:
         if run is None:
             raise LookupError("agent_run_not_found")
         return run.user_id
+
+    async def _tenant_permit_id(self, call: AgentToolCall) -> str:
+        """Find the still-open tenant reserve for one unknown call."""
+        reserves = list(
+            (
+                await self.db.scalars(
+                    select(TenantWalletTransaction)
+                    .where(
+                        TenantWalletTransaction.tool_call_id == call.id,
+                        TenantWalletTransaction.kind == "reserve",
+                    )
+                    .order_by(TenantWalletTransaction.created_at.desc())
+                )
+            ).all()
+        )
+        for reserve in reserves:
+            terminal = await self.db.scalar(
+                select(TenantWalletTransaction.id).where(
+                    TenantWalletTransaction.reference_id == reserve.id,
+                    TenantWalletTransaction.kind.in_(("settle", "release")),
+                )
+            )
+            if terminal is None:
+                return reserve.id
+        raise ValueError("tenant_mcp_permit_not_found")
 
     async def _evidence_by_call(self, call_id: str) -> EvidenceItem | None:
         return await self.db.scalar(

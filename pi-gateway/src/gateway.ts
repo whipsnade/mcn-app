@@ -40,11 +40,13 @@ export function isPiGatewayTerminalBusinessError(error: unknown): boolean {
   // that stable server-owned code instead of treating initialization as a
   // worker crash/recovery candidate.
   const code = errorCode(error) ?? (error instanceof Error ? error.message : undefined);
-  return code === "required_artifact_missing" ||
-    code === "pi_gateway_terminal_missing_completion" ||
+  return code === "pi_gateway_terminal_missing_completion" ||
     code === "pi_gateway_running_agent_steps" ||
     code === "pi_gateway_unresolved_mcp_calls" ||
-    code === "required_artifact_invalid_lineage" ||
+    code === "pi_gateway_snapshot_invalid" ||
+    code === "pi_gateway_artifact_invalid" ||
+    code === "pi_gateway_artifact_contract_not_allowed" ||
+    code === "pi_gateway_active_artifact_draft" ||
     code === "pi_gateway_runtime_snapshot_invalid" ||
     code === "pi_gateway_claim_snapshot_invalid" ||
     code === "pi_gateway_claim_tools_invalid" ||

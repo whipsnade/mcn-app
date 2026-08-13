@@ -729,8 +729,8 @@ describe("completion and loop-guard business terminal", () => {
 
   it("converts a completion gate rejection into stable failed without worker_failed", async () => {
     const terminal = vi.fn()
-      .mockRejectedValueOnce(Object.assign(new Error("required_artifact_missing"), {
-        code: "required_artifact_missing",
+      .mockRejectedValueOnce(Object.assign(new Error("pi_gateway_artifact_invalid"), {
+        code: "pi_gateway_artifact_invalid",
         status: 409,
       }))
       .mockResolvedValueOnce(undefined);
@@ -771,7 +771,7 @@ describe("completion and loop-guard business terminal", () => {
       "attempt-artifact-gate",
       "failed",
       "lease-token-with-enough-entropy",
-      { code: "required_artifact_missing" },
+      { code: "pi_gateway_artifact_invalid" },
     );
     expect(onError).not.toHaveBeenCalled();
   });

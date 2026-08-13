@@ -1,11 +1,10 @@
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
-import { attachWorkerRpcBridge, type WorkerRpcHandlers } from "../src/worker-bridge.js";
+import { attachWorkerRpcBridge, createWorkerRpcHandlers, type WorkerRpcHandlers } from "../src/worker-bridge.js";
 import { spawnIsolatedWorker } from "../src/worker-entry.js";
 import type { ClaimedRun, SecretBundle } from "../src/protocol.js";
 
@@ -71,11 +70,31 @@ describe("isolated worker control-plane bridge", () => {
   let tempdirs: string[] = [];
 
   beforeAll(async () => {
-    workerScript = fileURLToPath(new URL("../src/worker-entry.ts", import.meta.url));
+    const projectRoot = process.cwd().endsWith("/pi-gateway")
+      ? process.cwd()
+      : join(process.cwd(), "pi-gateway");
+    workerScript = join(projectRoot, "src/worker-entry.ts");
   });
 
   afterAll(async () => {
     for (const dir of tempdirs) await rm(dir, { recursive: true, force: true });
+  });
+
+  it("forwards only the unknown source metadata to the authenticated control plane", async () => {
+    const calls: Array<{ classification: string; metadata: unknown }> = [];
+    const handlers = createWorkerRpcHandlers({
+      failMcp: async (_runId: string, _permit: unknown, classification: string, _lease: string, metadata: unknown) => {
+        calls.push({ classification, metadata });
+        return { ok: true };
+      },
+    } as any, { run_id: "run-bridge", attempt_id: "attempt-bridge", lease_token: "lease-bridge" });
+    const metadata = { version: "mcp_failure_v1", source: "worker_rpc_disconnected" };
+    await expect(handlers.mcp_fail({
+      permit_id: "permit-1",
+      classification: "result_unknown",
+      metadata,
+    })).resolves.toEqual({ ok: true });
+    expect(calls).toEqual([{ classification: "result_unknown", metadata }]);
   });
 
   it("executes an SDK internal tool call through the real child IPC bridge", async () => {
