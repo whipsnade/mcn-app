@@ -1,15 +1,15 @@
-"""insight_board_v1 模型输入 DTO 与服务器端组装（提交 1）。
+"""insight_board_v1 模型输入 DTO 与服务器端组装（提交 1/2）。
 
 insight_board_v1 不是 :class:`CanonicalPayloadMixin`，组装输出不包含
 canonical_data/field_lineage。payload 的 ``data`` 字段直接来自模型输入的
-``blocks``（看板板块序列），``module`` 复用父 Artifact 语义
-（brand/campaign/kol，与既有 Builder 的 ``_PAYLOAD_MODULE_BY_PARENT``
-默认一致），模型可在输入中显式声明钻取对象侧。
+``blocks``（看板板块序列）；payload ``module`` 是服务器拥有字段
+（ArtifactPayloadBase 的 Literal["brand","campaign","kol"]），服务器固定取
+"brand"（与既有 insight fixture 一致），模型不得提交。
 """
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -29,13 +29,10 @@ InsightMethodologyInput = BrandMethodologyInput
 
 
 class InsightBoardV1Input(BaseModel):
-    """insight_board_v1 模型输入契约（不含 schema/data_status/canonical 等服务器字段）。"""
+    """insight_board_v1 模型输入契约（不含 schema/module/data_status/canonical 等服务器字段）。"""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    # payload module 是 ArtifactPayloadBase 的 Literal["brand","campaign","kol"]；
-    # 模型输入显式声明钻取对象侧，缺省 brand（与既有 insight fixture 一致）。
-    module: Literal["brand", "campaign", "kol"] = "brand"
     title: str
     scope: InsightScope
     parent_artifact_id: str
@@ -67,10 +64,14 @@ class InsightBoardV1Input(BaseModel):
 
 
 def assemble_insight_payload(model_input: InsightBoardV1Input) -> dict[str, Any]:
-    """模型输入 → 完整 insight_board_v1 发布 payload（无 canonical）。"""
+    """模型输入 → 完整 insight_board_v1 发布 payload（无 canonical）。
+
+    ``module`` 是服务器拥有字段：固定取 "brand"（InsightBoardV1 的 payload
+    module 为 Literal["brand","campaign","kol"]，与既有 insight fixture 一致）。
+    """
     payload = {
         "schema_version": "insight_board_v1",
-        "module": model_input.module,
+        "module": "brand",
         "data_status": _derive_data_status(
             model_input.availability, InsightBoardV1.REQUIRED_SECTIONS
         ),

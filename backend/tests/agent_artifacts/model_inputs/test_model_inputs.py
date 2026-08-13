@@ -100,7 +100,6 @@ def build_kol_model_input() -> dict:
 
 def build_insight_model_input() -> dict:
     return {
-        "module": "brand",
         "title": "品牌钻取",
         "scope": {"summary": "围绕品牌概览", "period": PERIOD, "platforms": ["xiaohongshu"]},
         "parent_artifact_id": "art-1",
@@ -260,3 +259,11 @@ def test_model_input_contract_schema_is_single_source_of_truth(artifact_type: st
         "via": "publish_artifacts",
         "same_version_bi_excel": True,
     }
+
+
+def test_insight_module_is_server_owned() -> None:
+    """module 是服务器拥有字段：模型输入必须拒绝 module 键，concise_example 不含之。"""
+    example = InsightBoardV1Input.concise_example()
+    assert "module" not in example
+    with pytest.raises(ValidationError):
+        InsightBoardV1Input.model_validate({**build_insight_model_input(), "module": "brand"})

@@ -15,6 +15,10 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_artifacts.models import AgentArtifactVersion
+from app.agent_artifacts.model_inputs import (
+    MODEL_INPUT_BY_ARTIFACT_TYPE,
+    model_input_contract,
+)
 from app.agent_artifacts.publishing import ArtifactPublicationService
 from app.agent_runtime.models import AgentMessage, AgentRun, AgentSession, MemoryEntry
 from app.agent_runtime.repository import AgentRunRepository
@@ -22,6 +26,10 @@ from app.agent_runtime.reviewer import release_run_drafts
 from app.agent_runtime.state import RunStatus
 from app.agent_runtime.tools.contracts import ToolContext, ToolResult
 from app.marketing_capability_pack.runtime import MarketingRunCapability
+
+#: load_marketing_skill 返回体 fail-closed 上限（skill 正文 + 模型输入契约
+#: 完整 JSON Schema；超出即拒绝，防止撑爆模型上下文）。
+_MAX_SKILL_PAYLOAD_BYTES = 512 * 1024
 
 
 class GetSessionContextArgs(BaseModel):
@@ -131,6 +139,21 @@ class LoadMarketingSkillTool:
                 safe_summary="marketing_skill_not_enabled",
                 error_type="marketing_skill_not_enabled",
             )
+        # 已注册模型输入契约的 Artifact 类型：把精确 DTO JSON Schema / 合法示例 /
+        # 发布预期一并交给模型（单一事实源来自 model_input_contract，不手写第二份）。
+        artifact_contract = loaded.get("artifact_contract")
+        if (
+            isinstance(artifact_contract, str)
+            and artifact_contract in MODEL_INPUT_BY_ARTIFACT_TYPE
+        ):
+            loaded["model_input_contract"] = model_input_contract(artifact_contract)
+        rendered = json.dumps(loaded, ensure_ascii=False)
+        if len(rendered.encode("utf-8")) > _MAX_SKILL_PAYLOAD_BYTES:
+            return ToolResult(
+                status="failed",
+                safe_summary="marketing_skill_contract_too_large",
+                error_type="marketing_skill_contract_too_large",
+            )
         snapshot = dict(run.prompt_snapshot_json or {})
         loaded_skills = list(snapshot.get("loaded_marketing_skills") or [])
         record = {key: loaded[key] for key in ("name", "version", "digest")}
@@ -139,7 +162,7 @@ class LoadMarketingSkillTool:
         snapshot["loaded_marketing_skills"] = loaded_skills
         run.prompt_snapshot_json = snapshot
         await self._db.flush()
-        return ToolResult(status="success", safe_summary=json.dumps(loaded, ensure_ascii=False))
+        return ToolResult(status="success", safe_summary=rendered)
 
 
 class PublishArtifactsArgs(BaseModel):

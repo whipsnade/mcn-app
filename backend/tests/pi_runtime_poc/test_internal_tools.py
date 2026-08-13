@@ -304,10 +304,12 @@ async def test_load_marketing_skill_service_registry_tool_records_idempotently(
             "content",
             "required_tools",
             "artifact_contract",
+            "model_input_contract",
         }
         assert payload["name"] == "brand-research-report"
         assert payload["content"]
         assert payload["required_tools"]
+        assert payload["model_input_contract"]["artifact_type"] == "brand_report_v3"
 
     await db.refresh(seeded["run"])
     assert seeded["run"].prompt_snapshot_json["loaded_marketing_skills"] == [{

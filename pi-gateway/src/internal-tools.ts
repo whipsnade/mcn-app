@@ -51,7 +51,11 @@ export const INTERNAL_TOOL_DEFINITIONS = [
   },
   {
     name: "load_marketing_skill",
-    description: "从当前 Run 的营销能力包快照加载一个已启用专项 Skill 正文。",
+    description:
+      "从当前 Run 的营销能力包快照加载一个已启用专项 Skill 正文。返回包含 skill 正文、" +
+      "required_tools 与 model_input_contract（含该 Artifact 的精确模型输入 JSON Schema、" +
+      "合法示例与发布预期）；应按 model_input_contract.model_input_schema 构造 " +
+      "build_artifact_draft 的 payload。",
     parameters: Type.Object(
       {
         skill_name: Type.String({ minLength: 1, maxLength: 64, pattern: "^[a-z0-9][a-z0-9-]{0,63}$" }),
@@ -76,8 +80,10 @@ export const INTERNAL_TOOL_DEFINITIONS = [
     name: "build_artifact_draft",
     description:
       "提交模型自主选择的正式 Artifact Draft。artifact_type 必须属于当前 Run Snapshot 的 " +
-      "allowed_artifact_contracts，payload 必须完整符合该类型 Schema；可选 source_tool_call_ids " +
-      "只校验属于当前 Run，不读取或重验 MCP 业务结果。",
+      "allowed_artifact_contracts；payload 按 load_marketing_skill 返回的 " +
+      "model_input_contract.model_input_schema 构造（仅提交业务字段）；服务器负责补齐 " +
+      "schema_version/module/data_status/canonical_data/field_lineage，模型不得提交这些字段。" +
+      "可选 source_tool_call_ids 只校验属于当前 Run，不读取或重验 MCP 业务结果。",
     parameters: Type.Object(
       {
         artifact_type: Type.String({ minLength: 1, maxLength: 64 }),
