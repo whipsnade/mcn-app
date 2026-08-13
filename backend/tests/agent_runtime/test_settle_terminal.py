@@ -27,7 +27,7 @@ from app.agent_runtime.events import (
     AgentEventStream,
     is_terminal_event,
 )
-from app.agent_runtime.models import AgentEvent, AgentRun, AgentSession
+from app.agent_runtime.models import AgentEvent, AgentMessage, AgentRun, AgentSession
 from app.agent_runtime.repository import AgentRunRepository
 from app.agent_runtime.state import InvalidRunTransition, RunStatus
 from app.db.session import SessionFactory
@@ -72,6 +72,19 @@ async def _make_run(
     db_session.add(run)
     await db_session.flush()
     if start:
+        db_session.add(
+            AgentMessage(
+                id=str(uuid4()),
+                session_id=session.id,
+                run_id=run.id,
+                role="assistant",
+                content="测试完成消息",
+                metadata_json={"test_fixture": True},
+                sequence=1,
+                created_at=now,
+            )
+        )
+        await db_session.flush()
         repo = AgentRunRepository(db_session)
         await repo.begin_attempt(run.id)
         if worker is not None:
@@ -102,6 +115,18 @@ async def _create_committed_running_run(worker: str = "worker-a") -> tuple[str, 
         repo = AgentRunRepository(db)
         await repo.begin_attempt(run_id)
         assert await repo.claim_lease(run_id, worker, 300)
+        db.add(
+            AgentMessage(
+                id=str(uuid4()),
+                session_id=session_id,
+                run_id=run_id,
+                role="assistant",
+                content="并发测试完成消息",
+                metadata_json={"test_fixture": True},
+                sequence=1,
+                created_at=utc_now(),
+            )
+        )
         await db.commit()
     return user_id, session_id, run_id
 

@@ -10,7 +10,7 @@ from app.agent_runtime.events import (
     AgentEventStream,
     RunEventForbidden,
 )
-from app.agent_runtime.models import AgentEvent, AgentRun, AgentSession
+from app.agent_runtime.models import AgentEvent, AgentMessage, AgentRun, AgentSession
 from app.db.session import SessionFactory, engine
 from app.identity.models import User
 
@@ -99,6 +99,7 @@ async def _purge_committed(user_id: str, session_id: str, run_id: str) -> None:
     """删除独立会话测试提交的行，保持测试库干净。"""
     async with engine.begin() as conn:
         await conn.execute(delete(AgentEvent).where(AgentEvent.run_id == run_id))
+        await conn.execute(delete(AgentMessage).where(AgentMessage.run_id == run_id))
         await conn.execute(delete(AgentRun).where(AgentRun.id == run_id))
         await conn.execute(delete(AgentSession).where(AgentSession.id == session_id))
         await conn.execute(delete(User).where(User.id == user_id))

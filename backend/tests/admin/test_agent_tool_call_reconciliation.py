@@ -372,11 +372,11 @@ async def test_reconcile_idempotent_replay_no_double_settle(
 
 
 @pytest.mark.asyncio
-async def test_confirm_success_with_invalid_payload_settles_without_evidence(
+async def test_confirm_success_with_invalid_payload_releases_without_evidence(
     db_session, user_factory, reconcile_client_factory
 ) -> None:
     """人工取回的 payload 必须重新过输出 Schema 校验（设计 §5.3）：
-    校验不过 → 不落 Evidence，退化为 settle + result_unavailable。"""
+    校验不过 → 按已确认失败释放预留，不得伪装为 result_unavailable。"""
     async def invalid_payload_reconciler(upstream_request_id: str) -> RemoteToolResult | None:
         return RemoteToolResult(
             structured_content={"wrong_shape": 123},
@@ -394,7 +394,7 @@ async def test_confirm_success_with_invalid_payload_settles_without_evidence(
         json={"decision": "confirm_success", "note": "人工确认成功"},
     )
     assert response.status_code == 200
-    assert response.json()["status"] == "settled"
+    assert response.json()["status"] == "failed"
     assert response.json()["evidence_id"] is None
 
     # 非法 payload 绝不写 Evidence
@@ -403,6 +403,108 @@ async def test_confirm_success_with_invalid_payload_settles_without_evidence(
     )
     assert evidence is None
     refreshed = await db_session.get(AgentToolCall, call.id)
-    assert refreshed.safe_error_message == "result_unavailable"
+    assert refreshed.error_type == "failed_confirmed"
+    wallet = await WalletService(db_session).get_wallet(user.id)
+    assert (wallet.balance, wallet.reserved) == (1000, 0)
+
+
+@pytest.mark.asyncio
+async def test_confirm_success_does_not_trust_existing_invalid_evidence(
+    db_session, user_factory, reconcile_client_factory
+) -> None:
+    """核对重放也必须重新验证已存在的 Evidence wrapper/schema。"""
+    user = await user_factory()
+    await WalletService(db_session).ensure_welcome_grant(user.id)
+    call = await _make_unknown_call(db_session, user.id)
+    run = await db_session.get(AgentRun, call.run_id)
+    assert run is not None
+    db_session.add(
+        EvidenceItem(
+            id=str(uuid4()),
+            session_id=run.session_id,
+            run_id=run.id,
+            tool_call_id=call.id,
+            source_type="mcp",
+            source_name=call.internal_tool_name,
+            raw_payload_json={"result": "not-json"},
+            normalized_preview_json={"result": "not-json"},
+            payload_hash="a" * 64,
+            collected_at=_now(),
+            availability_status="available",
+        )
+    )
+    await db_session.flush()
+    admin_client, _ = await reconcile_client_factory()
+
+    response = await admin_client.post(
+        f"/api/v1/admin/agent-tool-calls/{call.id}/reconcile",
+        json={"decision": "confirm_success"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "failed"
+    refreshed = await db_session.get(AgentToolCall, call.id)
+    assert refreshed is not None and refreshed.error_type == "failed_confirmed"
+    wallet = await WalletService(db_session).get_wallet(user.id)
+    assert (wallet.balance, wallet.reserved) == (1000, 0)
+
+
+@pytest.mark.asyncio
+async def test_confirmed_success_local_evidence_failure_settles_unavailable(
+    db_session, user_factory, reconcile_client_factory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user = await user_factory()
+    await WalletService(db_session).ensure_welcome_grant(user.id)
+    call = await _make_unknown_call(db_session, user.id)
+    admin_client, _ = await reconcile_client_factory(_payload_reconciler)
+
+    from app.agent_runtime.evidence import EvidencePersistenceError, EvidenceWriter
+
+    async def fail_write(*_args, **_kwargs):
+        raise EvidencePersistenceError("simulated evidence persistence failure")
+
+    monkeypatch.setattr(EvidenceWriter, "write", fail_write)
+    response = await admin_client.post(
+        f"/api/v1/admin/agent-tool-calls/{call.id}/reconcile",
+        json={"decision": "confirm_success"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "settled"
+    assert response.json()["evidence_id"] is None
+    refreshed = await db_session.get(AgentToolCall, call.id)
+    assert refreshed is not None
+    assert refreshed.error_type == "result_unavailable"
     wallet = await WalletService(db_session).get_wallet(user.id)
     assert (wallet.balance, wallet.reserved) == (990, 0)
+
+
+@pytest.mark.asyncio
+async def test_confirm_success_rejects_contradictory_result_status(
+    db_session, user_factory, reconcile_client_factory
+) -> None:
+    async def contradictory_reconciler(upstream_request_id: str) -> RemoteToolResult | None:
+        return RemoteToolResult(
+            structured_content={"result": '{"rows": [{"keyword": "美妆"}]}'},
+            is_error=False,
+            upstream_request_id=upstream_request_id,
+            result_status="empty",
+        )
+
+    user = await user_factory()
+    await WalletService(db_session).ensure_welcome_grant(user.id)
+    call = await _make_unknown_call(db_session, user.id)
+    admin_client, _ = await reconcile_client_factory(contradictory_reconciler)
+
+    response = await admin_client.post(
+        f"/api/v1/admin/agent-tool-calls/{call.id}/reconcile",
+        json={"decision": "confirm_success"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "failed"
+    assert response.json()["error_type"] == "failed_confirmed"
+    refreshed = await db_session.get(AgentToolCall, call.id)
+    assert refreshed is not None and refreshed.points_reserved == 0
+    wallet = await WalletService(db_session).get_wallet(user.id)
+    assert (wallet.balance, wallet.reserved) == (1000, 0)

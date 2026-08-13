@@ -55,6 +55,7 @@ from app.pi_runtime_poc.schemas import (
     PiToolStarted,
 )
 from app.pi_runtime_poc.service import PiEvidenceIngestService
+from app.pi_gateway.internal_tools import ProductionInternalToolBridge
 
 
 def _now() -> datetime:
@@ -108,6 +109,7 @@ async def seeded(db: AsyncSession) -> dict[str, Any]:
     )
     db.add(session)
     await db.flush()
+    capability = build_marketing_run_capability(model_version="test").model_dump(mode="json")
     run = AgentRun(
         id=str(uuid4()),
         session_id=session.id,
@@ -117,11 +119,8 @@ async def seeded(db: AsyncSession) -> dict[str, Any]:
         profile_name="session_analyst_v1",
         profile_version="1",
         model="test",
-        prompt_snapshot_json={
-            "marketing_capability_pack": build_marketing_run_capability(
-                model_version="test"
-            ).model_dump(mode="json")
-        },
+        prompt_snapshot_json={"marketing_capability_pack": capability},
+        runtime_config_snapshot_json={"capability_pack": capability},
         status="running",
     )
     db.add(run)
@@ -255,6 +254,7 @@ async def _seed_other_run(db: AsyncSession) -> dict[str, Any]:
     )
     db.add(session)
     await db.flush()
+    capability = build_marketing_run_capability(model_version="test").model_dump(mode="json")
     run = AgentRun(
         id=str(uuid4()),
         session_id=session.id,
@@ -264,11 +264,8 @@ async def _seed_other_run(db: AsyncSession) -> dict[str, Any]:
         profile_name="session_analyst_v1",
         profile_version="1",
         model="test",
-        prompt_snapshot_json={
-            "marketing_capability_pack": build_marketing_run_capability(
-                model_version="test"
-            ).model_dump(mode="json")
-        },
+        prompt_snapshot_json={"marketing_capability_pack": capability},
+        runtime_config_snapshot_json={"capability_pack": capability},
         status="running",
         created_at=now,
     )
@@ -313,12 +310,34 @@ async def test_load_marketing_skill_service_registry_tool_records_idempotently(
         assert payload["required_tools"]
 
     await db.refresh(seeded["run"])
-    pack = seeded["run"].prompt_snapshot_json["marketing_capability_pack"]
-    assert pack["loaded_skills"] == [{
+    assert seeded["run"].prompt_snapshot_json["loaded_marketing_skills"] == [{
         "name": "brand-research-report",
         "version": first_payload["version"] if (first_payload := json.loads(first["safe_summary"])) else "",
         "digest": first_payload["digest"],
     }]
+
+
+async def test_production_skill_bridge_ignores_mutable_prompt_pack(
+    settings: Settings, seeded: dict[str, Any], db: AsyncSession
+) -> None:
+    """生产 Registry 必须从不可变 RuntimeSnapshot 读取能力，而非 prompt 审计区。"""
+    seeded["run"].prompt_snapshot_json = {
+        "marketing_capability_pack": {"runtime_contract_version": "tampered"}
+    }
+    await db.commit()
+
+    result = await ProductionInternalToolBridge(db=db).execute(
+        tool_name="load_marketing_skill",
+        arguments={"skill_name": "brand-research-report"},
+        user_id=seeded["user"].id,
+        session_id=seeded["session"].id,
+        run_id=seeded["run"].id,
+        profile_name="session_analyst_v1",
+    )
+
+    assert result.status == "success"
+    await db.refresh(seeded["run"])
+    assert seeded["run"].prompt_snapshot_json["loaded_marketing_skills"]
 
 
 @pytest.mark.parametrize(
@@ -348,7 +367,7 @@ async def test_load_marketing_skill_rejects_invalid_or_ignores_reserved_argument
 
     assert result["error_type"] == expected_code
     await db.refresh(seeded["run"])
-    loaded = seeded["run"].prompt_snapshot_json["marketing_capability_pack"]["loaded_skills"]
+    loaded = seeded["run"].prompt_snapshot_json.get("loaded_marketing_skills", [])
     assert loaded == []
     assert "完整技能正文" not in result["safe_summary"]
     assert "skills/" not in result["safe_summary"]
@@ -358,13 +377,13 @@ async def test_load_marketing_skill_rejects_invalid_or_ignores_reserved_argument
 async def test_load_marketing_skill_fails_closed_for_tampered_snapshot(
     svc: PiEvidenceIngestService, settings: Settings, seeded: dict[str, Any], db: AsyncSession
 ) -> None:
-    snapshot = dict(seeded["run"].prompt_snapshot_json or {})
-    pack = dict(snapshot["marketing_capability_pack"])
+    runtime_snapshot = dict(seeded["run"].runtime_config_snapshot_json or {})
+    pack = dict(runtime_snapshot["capability_pack"])
     skills = list(pack["skills"])
     skills[0] = {**skills[0], "digest": "0" * 64}
     pack["skills"] = skills
-    snapshot["marketing_capability_pack"] = pack
-    seeded["run"].prompt_snapshot_json = snapshot
+    runtime_snapshot["capability_pack"] = pack
+    seeded["run"].runtime_config_snapshot_json = runtime_snapshot
     await db.commit()
 
     result = await svc.execute_internal_tool(
@@ -378,19 +397,19 @@ async def test_load_marketing_skill_fails_closed_for_tampered_snapshot(
     assert result["error_type"] == "marketing_skill_snapshot_invalid"
     assert result["safe_summary"] == "marketing_skill_snapshot_invalid"
     await db.refresh(seeded["run"])
-    assert seeded["run"].prompt_snapshot_json["marketing_capability_pack"]["loaded_skills"] == []
+    assert seeded["run"].prompt_snapshot_json.get("loaded_marketing_skills", []) == []
 
 
 async def test_load_marketing_skill_rejects_skill_removed_from_current_run_snapshot(
     svc: PiEvidenceIngestService, settings: Settings, seeded: dict[str, Any], db: AsyncSession
 ) -> None:
-    snapshot = dict(seeded["run"].prompt_snapshot_json or {})
-    pack = dict(snapshot["marketing_capability_pack"])
+    runtime_snapshot = dict(seeded["run"].runtime_config_snapshot_json or {})
+    pack = dict(runtime_snapshot["capability_pack"])
     pack["skills"] = [
         item for item in pack["skills"] if item["name"] != "brand-research-report"
     ]
-    snapshot["marketing_capability_pack"] = pack
-    seeded["run"].prompt_snapshot_json = snapshot
+    runtime_snapshot["capability_pack"] = pack
+    seeded["run"].runtime_config_snapshot_json = runtime_snapshot
     await db.commit()
 
     result = await svc.execute_internal_tool(
@@ -403,7 +422,7 @@ async def test_load_marketing_skill_rejects_skill_removed_from_current_run_snaps
     assert result["status"] == "failed"
     assert result["error_type"] == "marketing_skill_not_enabled"
     await db.refresh(seeded["run"])
-    assert seeded["run"].prompt_snapshot_json["marketing_capability_pack"]["loaded_skills"] == []
+    assert seeded["run"].prompt_snapshot_json.get("loaded_marketing_skills", []) == []
 
 
 async def test_load_marketing_skill_token_and_snapshot_are_isolated_by_run(

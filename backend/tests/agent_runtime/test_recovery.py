@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from typing import Any, Mapping
@@ -341,7 +342,7 @@ async def test_reconcile_confirmed_success_with_payload_settles_and_writes_evide
     logical_id, call = await _make_unknown_call(db_session, user.id, run, step, upstream_request_id="req-1")
     transport = FakeMcpTransport()
     transport.reconciled["req-1"] = RemoteToolResult(
-        structured_content={"result": "ok"}, is_error=False, upstream_request_id="req-1"
+        structured_content={"result": json.dumps("ok")}, is_error=False, upstream_request_id="req-1"
     )
     executor = await _make_executor(db_session)
     recovery = _make_recovery(db_session, executor=executor, transport=transport)
@@ -359,7 +360,7 @@ async def test_reconcile_confirmed_success_with_payload_settles_and_writes_evide
     assert (wallet.balance, wallet.reserved) == (990, 0)
     evidence = await db_session.scalar(select(EvidenceItem).where(EvidenceItem.tool_call_id == call.id))
     assert evidence is not None
-    assert evidence.raw_payload_json == {"result": "ok"}
+    assert evidence.raw_payload_json == {"result": json.dumps("ok")}
     recon = await _reconciliation(db_session, call)
     assert recon is not None
     assert recon.decision == "confirm_success"
@@ -647,7 +648,7 @@ async def test_reconcile_writes_committed_visible_from_fresh_session(
     """恢复核对结果必须提交：用全新独立会话读回 settle/evidence/审计/钱包。"""
     transport = FakeMcpTransport()
     transport.reconciled["req-1"] = RemoteToolResult(
-        structured_content={"result": "ok"}, is_error=False, upstream_request_id="req-1"
+        structured_content={"result": json.dumps("ok")}, is_error=False, upstream_request_id="req-1"
     )
     user_id, call_id, logical_id, tenant_id = await _setup_unknown_call_committed(upstream_request_id="req-1")
     try:
@@ -830,7 +831,7 @@ async def test_stuck_running_call_migrates_to_unknown_then_reconciles(
     )
     transport = FakeMcpTransport()
     transport.reconciled["req-stuck"] = RemoteToolResult(
-        structured_content={"result": "ok"}, is_error=False, upstream_request_id="req-stuck"
+        structured_content={"result": json.dumps("ok")}, is_error=False, upstream_request_id="req-stuck"
     )
     executor = await _make_executor(db_session)
     recovery = _make_recovery(db_session, executor=executor, transport=transport, stuck_seconds=60)
@@ -880,7 +881,7 @@ async def test_run_once_migrates_stuck_then_reconciles_in_same_round(
     )
     transport = FakeMcpTransport()
     transport.reconciled["req-stuck"] = RemoteToolResult(
-        structured_content={"result": "ok"}, is_error=False, upstream_request_id="req-stuck"
+        structured_content={"result": json.dumps("ok")}, is_error=False, upstream_request_id="req-stuck"
     )
     executor = await _make_executor(db_session)
     recovery = _make_recovery(db_session, executor=executor, transport=transport, stuck_seconds=60)
@@ -983,7 +984,7 @@ async def test_stuck_running_call_recovers_via_committed_sessions(
     被恢复扫描迁移为 unknown 并核对 settle，结果对全新会话可见。"""
     transport = FakeMcpTransport()
     transport.reconciled["req-stuck"] = RemoteToolResult(
-        structured_content={"result": "ok"}, is_error=False, upstream_request_id="req-stuck"
+        structured_content={"result": json.dumps("ok")}, is_error=False, upstream_request_id="req-stuck"
     )
     user_id, call_id, logical_id, tenant_id = await _setup_call_committed(
         status="running",

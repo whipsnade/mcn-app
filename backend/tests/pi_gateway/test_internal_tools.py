@@ -4,7 +4,19 @@ from types import SimpleNamespace
 from app.pi_gateway import router as gateway_router
 from app.pi_gateway.contracts import PiGatewayTerminalRequest
 
-from app.pi_gateway.internal_tools import ProductionInternalToolBridge
+from app.pi_gateway.internal_tools import (
+    ProductionInternalToolBridge,
+    build_production_internal_registry,
+)
+
+
+def test_pi_internal_tools_do_not_start_nested_durable_loop_guard_transaction() -> None:
+    """Pi route already owns the Run lock; guards must persist on that transaction."""
+    registry = build_production_internal_registry(db=SimpleNamespace(), worker_id="gw-1")
+    tools = {entry.internal_name: entry.tool for entry in registry.registered_tools}
+
+    assert getattr(tools["search_evidence"], "_durable_session_factory") is None
+    assert getattr(tools["build_brand_report_draft"], "_durable_session_factory") is None
 
 
 @pytest.mark.asyncio
@@ -86,6 +98,14 @@ async def test_terminal_settles_with_gateway_worker_and_releases_session_slot(mo
         ),
     )
     monkeypatch.setattr(gateway_router, "AgentEventStream", FakeStream)
+    class FakeCompletionValidator:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def validate(self, *_args, **_kwargs):
+            return SimpleNamespace(ok=True, code=None)
+
+    monkeypatch.setattr(gateway_router, "CompletionValidator", FakeCompletionValidator)
     db = FakeDb()
     async def body() -> bytes:
         return b"{}"

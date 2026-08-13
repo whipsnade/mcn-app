@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { PiInternalToolsClient } from "../src/internal-tools.js";
 
@@ -29,5 +29,23 @@ describe("production internal tool client", () => {
       items: [{ run_id: "attacker", value: 1 }],
     });
     expect(forwarded).toEqual({ filters: { query: "brand" }, items: [{ value: 1 }] });
+  });
+
+  it("turns the durable circuit-open result into a stable business error", async () => {
+    const onCircuitOpen = vi.fn();
+    const client = new PiInternalToolsClient(
+      {
+        executeInternalTool: async () => ({
+          status: "failed",
+          error_type: "agent_loop_circuit_open",
+        }),
+      },
+      { onCircuitOpen },
+    );
+
+    await expect(client.execute("build_brand_report_draft", {})).rejects.toMatchObject({
+      code: "agent_loop_circuit_open",
+    });
+    expect(onCircuitOpen).toHaveBeenCalledOnce();
   });
 });

@@ -3,7 +3,124 @@ import { describe, expect, it, vi } from "vitest";
 import {
   createMcpAccountingExtensionFactory,
   McpAccountingExtension,
+  normalizeMcpResultEnvelope,
 } from "../src/mcp-accounting-extension.js";
+
+describe("mcp_result_v1 normalization", () => {
+  it("accepts native structuredContent as available and preserves request id", () => {
+    expect(normalizeMcpResultEnvelope({
+      mcpResult: {
+        structuredContent: { result: '{"rows":[{"平台":"小红书"}]}' },
+        _meta: { requestId: "req-脱敏-1" },
+      },
+    }, [])).toEqual({
+      mode: "mcpResult",
+      mcpResult: {
+        envelope: "mcp_result_v1",
+        result_status: "available",
+        structuredContent: { result: '{"rows":[{"平台":"小红书"}]}' },
+        upstream_request_id: "req-脱敏-1",
+      },
+    });
+  });
+
+  it("parses exactly one whole JSON text block but rejects ordinary text/resources/images/paths", () => {
+    expect(normalizeMcpResultEnvelope({ mcpResult: {} }, [
+      { type: "text", text: '{"result":"{\\"rows\\":[]}"}' },
+    ])).toMatchObject({
+      mcpResult: {
+        result_status: "available",
+        structuredContent: { result: '{"rows":[]}' },
+      },
+    });
+    for (const content of [
+      [{ type: "text", text: "请求已完成" }],
+      [{ type: "text", text: "{}" }, { type: "text", text: "{}" }],
+      [{ type: "resource", resource: { uri: "ui://result" } }],
+      [{ type: "image", data: "脱敏" }],
+    ]) {
+      expect(normalizeMcpResultEnvelope({ mcpResult: { fullResultPath: "/tmp/不可信" } }, content)).toEqual({
+        mode: "mcpResult",
+        mcpResult: {
+          envelope: "mcp_result_v1",
+          result_status: "unavailable",
+          unavailable_reason: "payload_not_retrievable",
+        },
+      });
+    }
+    expect(normalizeMcpResultEnvelope({ mcpResult: {} }, [
+      { type: "text", text: "请求已完成" },
+    ])).toMatchObject({ mcpResult: { unavailable_reason: "invalid_json_text" } });
+  });
+
+  it("keeps genuine empty distinct from known success unavailable", () => {
+    expect(normalizeMcpResultEnvelope({ mcpResult: {} }, [])).toEqual({
+      mode: "mcpResult",
+      mcpResult: { envelope: "mcp_result_v1", result_status: "empty" },
+    });
+    expect(normalizeMcpResultEnvelope({ mcpResult: { omitted: true } }, [])).toEqual({
+      mode: "mcpResult",
+      mcpResult: {
+        envelope: "mcp_result_v1",
+        result_status: "unavailable",
+        unavailable_reason: "payload_not_retrievable",
+      },
+    });
+    expect(normalizeMcpResultEnvelope({ mcpResult: {} }, [
+      { type: "text", text: "{}" },
+    ])).toEqual({
+      mode: "mcpResult",
+      mcpResult: { envelope: "mcp_result_v1", result_status: "empty" },
+    });
+  });
+
+  it("treats an explicit empty native structuredContent as empty and never falls through to text", () => {
+    expect(normalizeMcpResultEnvelope({
+      mcpResult: { structuredContent: {} },
+    }, [
+      { type: "text", text: '{"rows":[{"id":"must-not-be-used"}]}' },
+    ])).toEqual({
+      mode: "mcpResult",
+      mcpResult: { envelope: "mcp_result_v1", result_status: "empty" },
+    });
+  });
+
+  it("classifies transport artifact markers inside native structuredContent as unavailable", () => {
+    expect(normalizeMcpResultEnvelope({
+      mcpResult: { structuredContent: { fullResultPath: "/tmp/opaque-result.json" } },
+    }, [])).toEqual({
+      mode: "mcpResult",
+      mcpResult: {
+        envelope: "mcp_result_v1",
+        result_status: "unavailable",
+        unavailable_reason: "unsupported_content",
+      },
+    });
+  });
+
+  it("rejects transport artifact markers nested in the reviewed JSON text block", () => {
+    expect(normalizeMcpResultEnvelope({ mcpResult: {} }, [
+      { type: "text", text: '{"rows":[{"fullResultPath":"/tmp/opaque-result.json"}]}' },
+    ])).toEqual({
+      mode: "mcpResult",
+      mcpResult: {
+        envelope: "mcp_result_v1",
+        result_status: "unavailable",
+        unavailable_reason: "unsupported_content",
+      },
+    });
+    for (const marker of ["summary", "omitted"]) {
+      expect(normalizeMcpResultEnvelope({ mcpResult: {} }, [
+        { type: "text", text: JSON.stringify({ rows: [{ [marker]: "transport placeholder" }] }) },
+      ])).toMatchObject({
+        mcpResult: {
+          result_status: "unavailable",
+          unavailable_reason: "unsupported_content",
+        },
+      });
+    }
+  });
+});
 
 describe("McpAccountingExtension", () => {
   it("commits a permit before calling the adapter and finalizes after result", async () => {
@@ -221,6 +338,31 @@ describe("McpAccountingExtension", () => {
     expect(control.finalize).not.toHaveBeenCalled();
   });
 
+  it("does not treat a structured adapter error object as an empty success", async () => {
+    const handlers = new Map<string, (event: any) => Promise<unknown>>();
+    const control = {
+      preflight: vi.fn(async () => ({ permit_id: "p-1" })),
+      finalize: vi.fn(),
+      fail: vi.fn(async () => ({ ok: true })),
+    };
+    createMcpAccountingExtensionFactory(new McpAccountingExtension(control), [
+      { toolName: "insight_query", server: "insight", remoteName: "query" },
+    ])({
+      on: (name: string, handler: (event: any) => Promise<unknown>) => handlers.set(name, handler),
+    } as any);
+
+    await handlers.get("tool_call")?.({
+      type: "tool_call", toolName: "insight_query", toolCallId: "tc-object-error", input: {},
+    });
+    await handlers.get("tool_result")?.({
+      type: "tool_result", toolName: "insight_query", toolCallId: "tc-object-error",
+      content: [], isError: false, details: { error: { code: "call_failed" } },
+    });
+
+    expect(control.fail).toHaveBeenCalledWith({ permit_id: "p-1" }, "result_unknown");
+    expect(control.finalize).not.toHaveBeenCalled();
+  });
+
   it("marks the call result_unknown when the finalize ACK is lost", async () => {
     // finalize 的 durable ACK 未到达：结果不得按成功丢弃，必须降级
     // result_unknown（保留预留、禁止重放）。
@@ -249,7 +391,7 @@ describe("McpAccountingExtension", () => {
     expect(control.fail).toHaveBeenCalledWith({ permit_id: "p-1" }, "result_unknown");
   });
 
-  it("never settles an oversized result and falls back to result_unknown", async () => {
+  it("settles a confirmed oversized result as unavailable rather than result_unknown", async () => {
     const handlers = new Map<string, (event: any) => Promise<unknown>>();
     const control = {
       preflight: vi.fn(async () => ({ permit_id: "p-1" })),
@@ -272,8 +414,18 @@ describe("McpAccountingExtension", () => {
       details: { mode: "mcpResult", mcpResult: { structuredContent: { blob: "x".repeat(2 * 1024 * 1024) } } },
     });
 
-    expect(control.finalize).not.toHaveBeenCalled();
-    expect(control.fail).toHaveBeenCalledWith({ permit_id: "p-1" }, "result_unknown");
+    expect(control.finalize).toHaveBeenCalledWith(
+      { permit_id: "p-1" },
+      expect.objectContaining({
+        mode: "mcpResult",
+        mcpResult: expect.objectContaining({
+          envelope: "mcp_result_v1",
+          result_status: "unavailable",
+          unavailable_reason: "payload_too_large",
+        }),
+      }),
+    );
+    expect(control.fail).not.toHaveBeenCalled();
   });
 });
 

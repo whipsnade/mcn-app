@@ -690,7 +690,7 @@ async def test_breaker_blocks_only_same_call_after_failures() -> None:
         transport = FakeMcpTransport(
             [PossiblySentTimeout("t")]
             + [_ok_result()]
-            + [RemoteToolResult(structured_content={"result": "d"}, is_error=False, upstream_request_id="req-diff")]
+            + [RemoteToolResult(structured_content={"result": json.dumps("d")}, is_error=False, upstream_request_id="req-diff")]
         )
         trend = _bridge(transport, internal_name="social_statistic_trend", breaker=breaker)
         sentiment = _bridge(transport, internal_name="social_statistic_sentiment", breaker=breaker)
@@ -867,7 +867,7 @@ async def test_reconcile_confirms_success_settles_and_writes_evidence() -> None:
         logical_id, call_id = await _make_unknown_call(chain, upstream_request_id="req-1")
         transport = FakeMcpTransport([])
         transport.reconciled["req-1"] = RemoteToolResult(
-            structured_content={"result": "ok"}, is_error=False, upstream_request_id="req-1"
+            structured_content={"result": json.dumps("ok")}, is_error=False, upstream_request_id="req-1"
         )
         bridge = _bridge(transport)
 
@@ -881,9 +881,115 @@ async def test_reconcile_confirms_success_settles_and_writes_evidence() -> None:
             evidence = await db.get(EvidenceItem, result.evidence_id)
         assert evidence is not None
         assert evidence.tool_call_id == call_id
-        assert evidence.raw_payload_json == {"result": "ok"}
+        assert evidence.raw_payload_json == {"result": json.dumps("ok")}
         reconciliation = await _reconciliation(call_id)
         assert reconciliation.decision == "confirm_success"
+    finally:
+        await _teardown_chain(chain)
+
+
+@pytest.mark.asyncio
+async def test_execute_confirmed_success_local_evidence_failure_settles_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """本地 Evidence 写入失败不能把已确认成功重新归类为 result_unknown。"""
+    chain = await _setup_chain()
+    try:
+        from app.agent_runtime.evidence import EvidenceWriter
+
+        async def fail_evidence_write(*_args, **_kwargs):
+            from app.agent_runtime.evidence import EvidencePersistenceError
+
+            raise EvidencePersistenceError("simulated evidence persistence failure")
+
+        monkeypatch.setattr(EvidenceWriter, "write", fail_evidence_write)
+        bridge = _bridge(FakeMcpTransport([_ok_result()]))
+
+        result = await bridge.execute(_context(chain), {"keyword": "美妆"})
+
+        assert result.status == "failed"
+        assert result.error_type == "result_unavailable"
+        row = await _only_row(chain.run_id)
+        assert row.status == "settled"
+        assert row.error_type == "result_unavailable"
+        assert row.points_settled == 10 and row.points_reserved == 0
+        assert await _wallet(chain.user_id)
+        wallet = await _wallet(chain.user_id)
+        assert (wallet.balance, wallet.reserved) == (990, 0)
+        async with SessionFactory() as db:
+            assert await db.scalar(select(EvidenceItem).where(EvidenceItem.tool_call_id == row.id)) is None
+    finally:
+        await _teardown_chain(chain)
+
+
+@pytest.mark.asyncio
+async def test_execute_rejects_malformed_reviewed_datatap_wrapper_before_evidence() -> None:
+    """通用 AgentMcpTool 也必须执行审核 DataTap wrapper policy。"""
+    chain = await _setup_chain()
+    try:
+        bridge = _bridge(
+            FakeMcpTransport([
+                RemoteToolResult(
+                    structured_content={"result": "not-json"},
+                    is_error=False,
+                    upstream_request_id="req-malformed-wrapper",
+                )
+            ])
+        )
+
+        result = await bridge.execute(_context(chain), {"keyword": "美妆"})
+
+        assert result.status == "failed"
+        assert result.error_type == FAILED_CONFIRMED
+        row = await _only_row(chain.run_id)
+        assert row.status == "failed"
+        assert row.points_reserved == 0
+        wallet = await _wallet(chain.user_id)
+        assert (wallet.balance, wallet.reserved) == (1000, 0)
+        async with SessionFactory() as db:
+            assert await db.scalar(
+                select(EvidenceItem).where(EvidenceItem.tool_call_id == row.id)
+            ) is None
+    finally:
+        await _teardown_chain(chain)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_confirmed_success_local_evidence_failure_settles_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """reconcile 取回成功结果后，本地落 Evidence 失败仍按 confirmed success 结算。"""
+    chain = await _setup_chain()
+    try:
+        logical_id, call_id = await _make_unknown_call(chain, upstream_request_id="req-local-fail")
+        transport = FakeMcpTransport([])
+        transport.reconciled["req-local-fail"] = RemoteToolResult(
+            structured_content={"result": json.dumps("ok")},
+            is_error=False,
+            upstream_request_id="req-local-fail",
+        )
+
+        from app.agent_runtime.evidence import EvidencePersistenceError, EvidenceWriter
+
+        async def fail_evidence_write(*_args, **_kwargs):
+            raise EvidencePersistenceError("simulated evidence persistence failure")
+
+        monkeypatch.setattr(EvidenceWriter, "write", fail_evidence_write)
+        result = await _bridge(transport).reconcile(logical_id)
+
+        assert result.status == "failed"
+        assert result.error_type == "result_unavailable"
+        async with SessionFactory() as db:
+            call = await db.get(AgentToolCall, call_id)
+            assert call is not None and call.status == "settled"
+            assert call.error_type == "result_unavailable"
+            assert call.points_settled == 10 and call.points_reserved == 0
+            assert (
+                await db.scalar(select(EvidenceItem).where(EvidenceItem.tool_call_id == call_id))
+                is None
+            )
+        wallet = await _wallet(chain.user_id)
+        assert (wallet.balance, wallet.reserved) == (990, 0)
     finally:
         await _teardown_chain(chain)
 
@@ -895,7 +1001,11 @@ async def test_reconcile_confirms_success_without_payload_settles_result_unavail
         logical_id, call_id = await _make_unknown_call(chain, upstream_request_id="req-1")
         transport = FakeMcpTransport([])
         transport.reconciled["req-1"] = RemoteToolResult(
-            structured_content=None, is_error=False, upstream_request_id="req-1"
+            structured_content=None,
+            is_error=False,
+            upstream_request_id="req-1",
+            result_status="unavailable",
+            unavailable_reason="payload_not_retrievable",
         )
         bridge = _bridge(transport)
 
@@ -1313,6 +1423,59 @@ async def test_feedback_matrix(
         await _teardown_chain(chain)
 
 
+@pytest.mark.parametrize(
+    "transport_outcome",
+    [
+        RemoteToolResult(
+            structured_content=None,
+            is_error=False,
+            upstream_request_id="req-available-without-payload",
+            result_status="available",
+        ),
+        RemoteToolResult(
+            structured_content={"result": "ok"},
+            is_error=False,
+            upstream_request_id="req-empty-with-payload",
+            result_status="empty",
+        ),
+        RemoteToolResult(
+            structured_content=None,
+            is_error=False,
+            upstream_request_id="req-unavailable-without-reason",
+            result_status="unavailable",
+        ),
+        RemoteToolResult(
+            structured_content={"result": "ok"},
+            is_error=False,
+            upstream_request_id="req-unavailable-with-payload",
+            result_status="unavailable",
+            unavailable_reason="payload_too_large",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_explicit_result_status_payload_mismatch_releases_reservation(
+    transport_outcome: RemoteToolResult,
+) -> None:
+    """三态联合矛盾时 fail-closed：不写 Evidence，也不把结果算 unknown。"""
+    chain = await _setup_chain()
+    try:
+        result = await _bridge(FakeMcpTransport([transport_outcome])).execute(
+            _context(chain), {"keyword": "美妆"}
+        )
+        assert result.status == "failed"
+        assert result.error_type == FAILED_CONFIRMED
+        wallet = await _wallet(chain.user_id)
+        assert (wallet.balance, wallet.reserved) == (1000, 0)
+        row = await _only_row(chain.run_id)
+        assert row.status == "failed"
+        assert row.error_type == FAILED_CONFIRMED
+        async with SessionFactory() as db:
+            assert await EvidenceWriter(db).get_by_tool_call_id(row.id) is None
+    finally:
+        await _teardown_chain(chain)
+
+
 @pytest.mark.asyncio
 async def test_same_fingerprint_retry_is_rejected_on_replay() -> None:
     """definitely_not_sent 后同参数跨 Step：允许一次重试，第二次失败后阻止。"""
@@ -1459,7 +1622,7 @@ async def test_m1_succeeded_empty_no_evidence_and_consistent_replay() -> None:
         rows = await _rows(chain.run_id)
         assert len(rows) == 1
         row = rows[0]
-        assert row.status == "failed"
+        assert row.status == "settled"
         assert row.error_type == "succeeded_empty"
         # 无 Evidence 行
         async with SessionFactory() as db:
@@ -1583,7 +1746,7 @@ async def test_p0_dnr_retry_succeeded_empty_settles_no_evidence() -> None:
         assert (w2.balance, w2.reserved) == (990, 0)
 
         row = await _only_row(chain.run_id)
-        assert row.status == "failed"
+        assert row.status == "settled"
         assert row.error_type == "succeeded_empty"
         assert row.points_reserved == 0
         assert row.points_settled == 10  # 结算

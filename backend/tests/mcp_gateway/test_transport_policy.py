@@ -23,6 +23,7 @@ from app.mcp_gateway.transport import (
     McpUpstreamHttpError,
     PossiblySentTimeout,
     ServiceNotAllowedError,
+    contains_transport_artifact_marker,
 )
 
 
@@ -52,6 +53,11 @@ class FakeProtocolSession:
                 )
             ]
         )
+
+
+class InitializeFailureSession(FakeProtocolSession):
+    async def initialize(self) -> None:
+        raise RuntimeError("offline initialization failure")
 
 
 class ReadTimeoutSession(FakeProtocolSession):
@@ -149,6 +155,13 @@ async def test_raw_allowlisted_string_is_rejected_before_network() -> None:
         await transport.list_tools(DataTapService.AKTOOLS.value)  # type: ignore[arg-type]
 
     opened.assert_not_awaited()
+
+
+@pytest.mark.parametrize("key", ["path", "filePath", "file_path", "tempPath", "temp_path"])
+def test_temporary_transport_paths_are_not_evidence_payloads(key: str) -> None:
+    assert contains_transport_artifact_marker({key: "/private/tmp/datatap-result.json"})
+    assert contains_transport_artifact_marker({"nested": [{key: "/var/folders/x/result.json"}]})
+    assert not contains_transport_artifact_marker({key: "https://example.invalid/result.json"})
 
 
 async def test_all_five_services_use_fixed_https_endpoint_and_bearer_auth() -> None:
@@ -272,6 +285,24 @@ async def test_connect_timeout_is_classified_before_request_is_sent() -> None:
 
     with pytest.raises(McpConnectionTimeout):
         await transport.list_tools(DataTapService.BILIBILI)
+
+
+async def test_call_initialize_failure_is_classified_as_not_sent() -> None:
+    """MCP session initialization cannot be mistaken for an unknown dispatched call."""
+    @asynccontextmanager
+    async def opener(_url: str, **_kwargs):
+        yield DataTapService.BILIBILI, object(), lambda: "session-init-failure"
+
+    transport = DataTapTransport(
+        token=SecretStr("unit-test-token"),
+        session_opener=opener,
+        session_factory=InitializeFailureSession,
+    )
+
+    from app.mcp_gateway.transport import McpNotSentError
+
+    with pytest.raises(McpNotSentError):
+        await transport.call_tool(DataTapService.BILIBILI, "search", {"keyword": "美妆"})
 
 
 async def test_gateway_504_is_classified_as_upstream_timeout() -> None:

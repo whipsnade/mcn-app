@@ -89,7 +89,7 @@ async def purge_uat_residue() -> None:
     已逐拓扑清理，这里兜底中断场景。仅限隔离测试库。
     """
     assert_uat_database_scope()
-    from app.agent_runtime.models import AgentRun, AgentSession
+    from app.agent_runtime.models import AgentRun, AgentSession, AgentToolCall
     from app.identity.models import User
     from app.tenancy.models import Tenant
 
@@ -125,11 +125,18 @@ async def purge_uat_residue() -> None:
                     )
                 ).all()
             )
+            tool_call_ids = list(
+                (
+                    await db.scalars(
+                        select(AgentToolCall.id).where(AgentToolCall.run_id.in_(run_ids or [""]))
+                    )
+                ).all()
+            )
             for table, column, ids in (
                 ("artifact_publish_attempts", "run_id", run_ids),
                 ("artifact_draft_revisions", "run_id", run_ids),
                 ("runtime_usage_records", "run_id", run_ids),
-                ("agent_tool_call_reconciliations", "run_id", run_ids),
+                ("agent_tool_call_reconciliations", "tool_call_id", tool_call_ids),
                 ("agent_tool_calls", "run_id", run_ids),
                 ("agent_steps", "run_id", run_ids),
                 ("agent_run_attempts", "run_id", run_ids),

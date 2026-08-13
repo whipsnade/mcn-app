@@ -270,6 +270,9 @@ describe("pi_decision_limit stable failure classification", () => {
     expect(classifyWorkerError(new Error("pi_decision_limit"))).toBe("pi_decision_limit");
     const withCode = Object.assign(new Error("boom"), { code: "pi_decision_limit" });
     expect(classifyWorkerError(withCode)).toBe("pi_decision_limit");
+    expect(classifyWorkerError(Object.assign(new Error("boom"), {
+      code: "agent_loop_circuit_open",
+    }))).toBe("agent_loop_circuit_open");
     expect(classifyWorkerError(new Error("sdk_protocol_error"))).toBe("sdk_protocol_error");
     expect(classifyWorkerError(new Error("something else"))).toBe("worker_error");
   });

@@ -94,8 +94,9 @@ async def queued_run(db: AsyncSession) -> AgentRun:
     run = AgentRun(
         id=str(uuid4()), session_id=session.id, user_id=user.id, run_kind="user", visibility="user",
         profile_name="pi_poc", profile_version="v1", model="test", status="queued",
-        prompt_snapshot_json={
-            "marketing_capability_pack": build_marketing_run_capability(
+        prompt_snapshot_json={},
+        runtime_config_snapshot_json={
+            "capability_pack": build_marketing_run_capability(
                 model_version="test"
             ).model_dump(mode="json")
         },

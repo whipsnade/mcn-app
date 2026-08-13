@@ -1981,6 +1981,48 @@ async def test_complete_emits_message_completed_before_run_completed(
     assert types[-2:] == ["message.completed", "run.completed"]
 
 
+async def test_complete_rejects_running_step_before_closing_it(
+    db_session, user_factory
+) -> None:
+    """统一完成门禁必须看到真实 running Step，不能先把它伪装成 completed。"""
+    run, attempt, _, _ = await _setup_run(db_session, user_factory)
+    db_session.add(
+        AgentStep(
+            id=str(uuid4()),
+            run_id=run.id,
+            attempt_id=attempt.id,
+            sequence=1,
+            step_type="tool_call",
+            input_json={"internal_tool_name": "unfinished"},
+            status="running",
+            visibility="user",
+            created_at=utc_now(),
+        )
+    )
+    await db_session.flush()
+
+    engine, _ = _make_engine(
+        db_session,
+        actions=[Complete(action="complete", text="不应在开放 Step 上完成")],
+    )
+    outcome = await engine.run(
+        run=run,
+        attempt_id=attempt.id,
+        profile=get_profile("session_analyst_v1"),
+        messages=[ChatMessage(role="user", content="分析品牌")],
+    )
+
+    assert outcome.status == RunStatus.FAILED
+    step = await db_session.scalar(
+        select(AgentStep).where(AgentStep.run_id == run.id, AgentStep.sequence == 1)
+    )
+    assert step is not None
+    assert step.status == "failed"
+    types = await _event_types(db_session, run.id)
+    assert "message.completed" not in types
+    assert types[-1] == "run.failed"
+
+
 async def test_publish_then_complete_emits_message_completed_before_run_completed(
     db_session, user_factory
 ) -> None:

@@ -16,6 +16,8 @@ import hashlib
 import json
 from uuid import uuid4
 
+from sqlalchemy import select
+
 from app.agent_runtime.evidence import EvidenceWriter
 from app.agent_runtime.kol_detail import (
     build_kol_detail_prompt_snapshot,
@@ -348,6 +350,7 @@ async def test_running_step_with_settled_call_replays_success(
     # 崩溃残留 Step 交给引擎复用（沿用原 logical_call_id）
     assert transcript.resume_step is not None
     assert transcript.resume_step.id == step.id
+    assert step.status == "completed"
 
 
 async def test_running_step_with_unknown_call_replays_unknown(
@@ -370,6 +373,7 @@ async def test_running_step_with_unknown_call_replays_unknown(
     assert "504" in results[0]["summary"]
     assert transcript.resume_step is not None
     assert transcript.resume_step.id == step.id
+    assert step.status == "failed"
 
 
 async def test_running_step_without_call_row_replays_interrupted_unknown(
@@ -389,6 +393,7 @@ async def test_running_step_without_call_row_replays_interrupted_unknown(
     assert results[0]["error_type"] == "result_unknown"
     assert transcript.resume_step is not None
     assert transcript.resume_step.id == step.id
+    assert step.status == "failed"
 
 
 async def test_model_decision_steps_are_not_replayed(db_session, user_factory) -> None:
@@ -414,6 +419,11 @@ async def test_model_decision_steps_are_not_replayed(db_session, user_factory) -
 
     assert len(transcript.messages) == 1  # 只有触发消息
     assert transcript.resume_step is None
+    step = await db_session.scalar(
+        select(AgentStep).where(AgentStep.run_id == run.id, AgentStep.step_type == "model_decision")
+    )
+    assert step is not None
+    assert step.status == "failed"
 
 
 # ---------------------------------------------------------------------------

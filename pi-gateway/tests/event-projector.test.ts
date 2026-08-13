@@ -24,6 +24,63 @@ describe("Pi SDK usage projector", () => {
     expect(JSON.stringify(events)).not.toContain("secret");
   });
 
+  it("batches high-volume deltas with bounded bytes/parts and flushes the tail", () => {
+    const projector = new PiSdkUsageProjector("attempt-batched-delta");
+    const source = Array.from({ length: 400 }, () => "思").join("");
+    const emitted: ReturnType<typeof projector.project> = [];
+    for (const character of Array.from(source)) {
+      emitted.push(
+        ...projector.project({
+          type: "message_update",
+          assistantMessageEvent: { type: "text_delta", delta: character },
+        }),
+      );
+    }
+    emitted.push(...projector.flush());
+
+    const batches = emitted.filter((event) => event.event_type === "message.delta");
+    expect(batches.length).toBeGreaterThan(1);
+    expect(batches.reduce((text, event) => text + String(event.payload.text), "")).toBe(source);
+    for (const batch of batches) {
+      expect(Number(batch.payload.delta_count)).toBeLessThanOrEqual(32);
+      expect(new TextEncoder().encode(String(batch.payload.text)).byteLength).toBeLessThanOrEqual(4096);
+      expect(batch.payload.batched).toBe(true);
+    }
+    expect(projector.diagnostics.projectedEvents).toBe(batches.length);
+  });
+
+  it("flushes a not-yet-full batch once its bounded wait expires", () => {
+    const projector = new PiSdkUsageProjector("attempt-delta-timeout");
+    expect(projector.project({
+      type: "message_update",
+      assistantMessageEvent: { type: "thinking_delta", delta: "短片段" },
+    })).toEqual([]);
+
+    const flushed = projector.flushIfDue(Date.now() + 51);
+
+    expect(flushed).toHaveLength(1);
+    expect(flushed[0]).toMatchObject({
+      event_type: "thinking.delta",
+      payload: { text: "短片段", delta_count: 1, batched: true },
+    });
+  });
+
+  it("keeps the byte bound exact when a multibyte delta crosses the boundary", () => {
+    const projector = new PiSdkUsageProjector("attempt-utf8-boundary");
+    const source = `${"a".repeat(4095)}🙂`;
+    const emitted = Array.from(source).flatMap((delta) => projector.project({
+      type: "message_update",
+      assistantMessageEvent: { type: "text_delta", delta },
+    }));
+    emitted.push(...projector.flush());
+
+    expect(emitted.filter((event) => event.event_type === "message.delta")
+      .map((event) => String(event.payload.text)).join("")).toBe(source);
+    for (const event of emitted.filter((item) => item.event_type === "message.delta")) {
+      expect(new TextEncoder().encode(String(event.payload.text)).byteLength).toBeLessThanOrEqual(4096);
+    }
+  });
+
   it("emits message.completed before usage when done carries both text and usage", () => {
     const projector = new PiSdkUsageProjector("attempt-mix");
     const events = [

@@ -87,8 +87,9 @@ def test_settings_mapping_is_forwarded_to_pi_adapter_as_explicit_urls(monkeypatc
             AgentRun,
             SimpleNamespace(
                 id="run-task8b",
-                prompt_snapshot_json={
-                    "marketing_capability_pack": build_marketing_run_capability(
+                prompt_snapshot_json={},
+                runtime_config_snapshot_json={
+                    "capability_pack": build_marketing_run_capability(
                         model_version=settings.tencent_plan_model
                     ).model_dump(mode="json")
                 },
@@ -128,7 +129,8 @@ def test_pi_factory_rejects_tampered_capability_snapshot_without_echoing_content
                 AgentRun,
                 SimpleNamespace(
                     id="run-tampered",
-                    prompt_snapshot_json={"marketing_capability_pack": snapshot},
+                    prompt_snapshot_json={},
+                    runtime_config_snapshot_json={"capability_pack": snapshot},
                 ),
             ),
             "test-run-token",

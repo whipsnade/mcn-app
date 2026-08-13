@@ -53,6 +53,14 @@ def test_projection_rejects_raw_payload_and_unbounded_text() -> None:
         normalize_source_payload("message.delta", {"text": "x" * (64 * 1024 + 1)})
 
 
+def test_delta_batch_metadata_is_bounded_and_safe() -> None:
+    assert normalize_source_payload(
+        "message.delta", {"text": "批次", "delta_count": 2, "batched": True}
+    ) == {"text": "批次", "delta_count": 2, "batched": True}
+    with pytest.raises(PiGatewayEventError, match="pi_gateway_event_number_invalid"):
+        normalize_source_payload("message.delta", {"text": "x", "delta_count": 33})
+
+
 def test_alias_table_stays_inside_the_wire_contract() -> None:
     """防漂移：events 别名表、contracts 请求校验与字段白名单必须同步。
 

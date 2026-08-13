@@ -99,9 +99,40 @@ def test_structured_content_falls_back_to_text_payload() -> None:
     class _R:
         isError = False
         structuredContent = None
-        content = [type("C", (), {"text": '[{"声量": 14404383}]'})()]
+        content = [type("C", (), {"type": "text", "text": '[{"声量": 14404383}]'})()]
 
-    assert DataTapTransport._structured_content(_R()) == {"result": '[{"声量": 14404383}]'}
+    assert DataTapTransport._structured_content(_R()) == [{"声量": 14404383}]
+
+    class _OrdinaryText:
+        isError = False
+        structuredContent = None
+        content = [type("C", (), {"type": "text", "text": "请求已完成"})()]
+
+    assert DataTapTransport._structured_content(_OrdinaryText()) is None
+    assert DataTapTransport._classify_result(_OrdinaryText())[1:] == (
+        "unavailable",
+        "invalid_json_text",
+    )
+
+    class _Resource:
+        isError = False
+        structuredContent = None
+        content = [type("C", (), {"type": "resource", "resource": {"uri": "ui://result"}})()]
+
+    assert DataTapTransport._classify_result(_Resource())[1:] == (
+        "unavailable",
+        "unsupported_content",
+    )
+
+    class _MissingTextType:
+        isError = False
+        structuredContent = None
+        content = [type("C", (), {"text": '{"声量": 14404383}'})()]
+
+    assert DataTapTransport._classify_result(_MissingTextType())[1:] == (
+        "unavailable",
+        "unsupported_content",
+    )
 
 
 def test_structured_content_prefers_native_field_and_ignores_error_results() -> None:
@@ -120,3 +151,97 @@ def test_structured_content_prefers_native_field_and_ignores_error_results() -> 
         content = [type("C", (), {"text": "some error"})()]
 
     assert DataTapTransport._structured_content(_E()) is None
+
+
+def test_native_empty_and_non_json_structured_content_are_not_available() -> None:
+    from app.mcp_gateway.datatap import DataTapTransport
+
+    class _EmptyNative:
+        isError = False
+        structuredContent = {}
+        content = [type("C", (), {"type": "text", "text": '{"result":"should not win"}'})()]
+
+    assert DataTapTransport._classify_result(_EmptyNative()) == (None, "empty", None)
+
+    class _InvalidNative:
+        isError = False
+        structuredContent = object()
+        content = []
+
+    assert DataTapTransport._classify_result(_InvalidNative())[1:] == (
+        "unavailable",
+        "unsupported_content",
+    )
+
+    class _EmptyJsonText:
+        isError = False
+        structuredContent = None
+        content = [type("C", (), {"type": "text", "text": "{}"})()]
+
+    assert DataTapTransport._classify_result(_EmptyJsonText()) == (None, "empty", None)
+
+
+def test_transport_artifact_markers_are_unavailable_not_evidence_payload() -> None:
+    from app.mcp_gateway.datatap import DataTapTransport
+
+    for marker, value in (
+        ("fullResultPath", "/tmp/datapoint.json"),
+        ("full_result_path", "/private/tmp/datapoint.json"),
+        ("path", "/private/tmp/datapoint.json"),
+        ("filePath", "/var/folders/opaque/result.json"),
+        ("summary", "transport placeholder"),
+        ("omitted", True),
+    ):
+        result = type(
+            "TransportMarker",
+            (),
+            {"isError": False, "structuredContent": {"rows": [{marker: value}]}, "content": []},
+        )()
+        assert DataTapTransport._classify_result(result)[1:] == (
+            "unavailable",
+            "unsupported_content",
+        )
+
+
+def test_permissive_output_shape_still_cannot_make_transport_path_available() -> None:
+    """宽松 allowlist schema 也必须在 adapter 边界拒绝路径元数据。"""
+    from app.mcp_gateway.datatap import DataTapTransport
+
+    for structured in (
+        {"path": "/private/tmp/result.json"},
+        {"rows": [{"full_result_path": "/var/folders/opaque/result.json"}]},
+    ):
+        result = type(
+            "PathNativeResult",
+            (),
+            {"isError": False, "structuredContent": structured, "content": []},
+        )()
+        assert DataTapTransport._classify_result(result) == (
+            None,
+            "unavailable",
+            "unsupported_content",
+        )
+
+    text_result = type(
+        "PathTextResult",
+        (),
+        {
+            "isError": False,
+            "structuredContent": None,
+            "content": [
+                type(
+                    "TextBlock",
+                    (),
+                    {
+                        "type": "text",
+                        "text": '{"full_result_path":"/private/tmp/result.json"}',
+                    },
+                )()
+            ],
+        },
+    )()
+    assert DataTapTransport._classify_result(text_result) == (
+        None,
+        "unavailable",
+        "unsupported_content",
+    )

@@ -40,6 +40,22 @@ async def test_pi_recovery_closes_idempotently_on_durable_completion(db_session,
     user = await _funded_user(db_session, user_factory)
     session, run, _step = await _make_chain(db_session, user.id)
     run.runtime_backend = "pi"
+    # This ACK-loss fixture exercises the no-artifact utility completion path;
+    # artifact-capable production profiles are tested with a published Version.
+    run.profile_name = "utility_v1"
+    run.profile_version = "v1"
+    run.runtime_config_snapshot_json = {
+        "runtime_backend": "pi",
+        "profile_name": "utility_v1",
+        "artifact_contract_mode": "none",
+        "capability_pack": {
+            "pack_version": "test-pack-v1",
+            "manifest_digest": "test-manifest-digest",
+        },
+        "capability_pack_version": "test-pack-v1",
+        "capability_pack_manifest_digest": "test-manifest-digest",
+    }
+    _step.status = "completed"
     session.active_run_id = run.id
     now = utc_now()
     run.gateway_id = "gateway-ack-lost"
@@ -249,6 +265,18 @@ async def test_pi_recovery_marks_open_tool_calls_unknown_before_requeue(
         points_reserved=10,
         started_at=now,
     )
+    planned = AgentToolCall(
+        id="tool-call-planned",
+        run_id=run.id,
+        step_id=step.id,
+        logical_call_id="logical-planned",
+        service="insight_cube",
+        internal_tool_name="query_analysis_data",
+        arguments_hash="p" * 64,
+        status="planned",
+        points_reserved=0,
+        started_at=now,
+    )
     settled = AgentToolCall(
         id="tool-call-settled",
         run_id=run.id,
@@ -261,7 +289,7 @@ async def test_pi_recovery_marks_open_tool_calls_unknown_before_requeue(
         points_reserved=10,
         started_at=now,
     )
-    db_session.add_all([running, reserved, settled])
+    db_session.add_all([running, reserved, planned, settled])
     await db_session.flush()
 
     recovery = PiGatewayRecoveryService(db_session, now_fn=lambda: now)
@@ -269,7 +297,11 @@ async def test_pi_recovery_marks_open_tool_calls_unknown_before_requeue(
     assert await recovery.recover_expired_run(run.id) == "requeued"
     assert running.status == "unknown"
     assert reserved.status == "unknown"
+    assert planned.status == "failed"
+    assert planned.error_type == DEFINITELY_NOT_SENT
     assert settled.status == "settled"
+    await db_session.refresh(step)
+    assert step.status == "failed"
     assert running.points_reserved == 10
     assert reserved.points_reserved == 10
 

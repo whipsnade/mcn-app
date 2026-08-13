@@ -19,7 +19,15 @@ def _snapshot(price_table: dict[str, int | str] | None = None) -> dict:
         "runtime_backend": "pi",
         "model": {"provider": "fake-provider", "name": "fake-model"},
         "datatap": {"service": "fake", "schema_digest": "sha256:" + "a" * 64},
-        "capability_pack": {"runtime_contract_version": "marketing_runtime_v1"},
+        "capability_pack": {
+            "runtime_contract_version": "marketing_runtime_v1",
+            "pack_version": "test-pack-v1",
+            "manifest_digest": "test-manifest-digest",
+        },
+        "profile_name": "utility_v1",
+        "artifact_contract_mode": "none",
+        "capability_pack_version": "test-pack-v1",
+        "capability_pack_manifest_digest": "test-manifest-digest",
         "limits": {"max_decisions": 50},
         "billing": billing,
     }
@@ -66,7 +74,13 @@ async def _run(db_session, user, *, snapshot: dict | None = None):
     await db_session.flush()
     db_session.add_all([run, attempt])
     await db_session.flush()
-    run.runtime_config_snapshot_json = snapshot or _snapshot()
+    snapshot_payload = dict(_snapshot())
+    snapshot_payload.update(snapshot or {})
+    if snapshot and "artifact_contract_mode" not in snapshot:
+        snapshot_payload["artifact_contract_mode"] = (
+            "required" if snapshot_payload.get("required_artifact_contract") else "none"
+        )
+    run.runtime_config_snapshot_json = snapshot_payload
     await db_session.flush()
     return run, attempt, membership.tenant_id
 

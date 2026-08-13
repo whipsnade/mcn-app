@@ -42,19 +42,138 @@ async def test_tenant_runtime_config_snapshot_is_secret_free_and_switchable(
         limits={"max_decisions": 10},
         billing={"mcp_call_points": 10},
         secrets=_bundle(),
+        profile_artifact_contracts={
+            "session_analyst_v1": "brand_report_v3",
+            "kol_detail_v1": "insight_board_v1",
+        },
     )
     tenant = await db_session.get(Tenant, tenant_id)
     tenant.runtime_backend = "pi"
     await db_session.flush()
     await service.activate(version.id)
 
-    snapshot = await service.snapshot_for_new_run(tenant_id)
+    snapshot = await service.snapshot_for_new_run(tenant_id, profile_name="session_analyst_v1")
     dumped = snapshot.model_dump(mode="json")
     assert snapshot.runtime_backend == "pi"
     assert snapshot.config_version_id == version.id
     assert "model-secret" not in repr(snapshot)
     assert "datatap-secret" not in str(dumped)
     assert dumped["model"]["masked_origin"] == "https://model.example.test"
+    assert dumped["profile_name"] == "session_analyst_v1"
+    assert dumped["required_artifact_contract"] == "brand_report_v3"
+    assert dumped["capability_pack_version"] == dumped["capability_pack"]["pack_version"]
+    assert dumped["capability_pack_manifest_digest"] == dumped["capability_pack"]["manifest_digest"]
+
+    now = datetime.now(UTC).replace(tzinfo=None)
+    session = AgentSession(
+        id=str(uuid4()),
+        user_id=user.id,
+        tenant_id=tenant_id,
+        title="runtime child snapshot",
+        status="active",
+        created_at=now,
+        updated_at=now,
+    )
+    db_session.add(session)
+    await db_session.flush()
+    parent = AgentRun(
+        id=str(uuid4()),
+        session_id=session.id,
+        user_id=user.id,
+        tenant_id=tenant_id,
+        runtime_backend="pi",
+        runtime_config_version_id=version.id,
+        runtime_config_snapshot_json=dumped,
+        profile_name="session_analyst_v1",
+        profile_version="v1",
+        model="test-model",
+        run_kind="user",
+        visibility="user",
+        status="queued",
+        created_at=now,
+        queued_at=now,
+    )
+    db_session.add(parent)
+    await db_session.flush()
+
+    child_snapshot = await service.snapshot_for_child_run(
+        parent, profile_name="kol_detail_v1"
+    )
+    assert child_snapshot.profile_name == "kol_detail_v1"
+    assert child_snapshot.required_artifact_contract == "insight_board_v1"
+    assert child_snapshot.capability_pack_manifest_digest == snapshot.capability_pack_manifest_digest
+    assert child_snapshot.adapter_catalog == snapshot.adapter_catalog
+
+
+@pytest.mark.asyncio
+async def test_profile_artifact_contract_is_reviewed_against_pack_and_profile(
+    db_session, user_factory
+) -> None:
+    user = await user_factory()
+    tenant = await db_session.scalar(select(Tenant).where(Tenant.id.is_not(None)))
+    service = RuntimeConfigService(db_session, cipher=_cipher())
+
+    with pytest.raises(RuntimeConfigError, match="runtime_profile_contract_invalid"):
+        await service.create_tenant_version(
+            tenant.id,
+            created_by=user.id,
+            runtime_backend="current",
+            model={"name": "test-model", "masked_origin": "test"},
+            datatap={"service": "social", "schema_digest": "digest"},
+            limits={"max_decisions": 10},
+            billing={"mcp_call_points": 10},
+            profile_artifact_contracts={"session_analyst_v1": "not_in_pack"},
+        )
+
+    with pytest.raises(RuntimeConfigError, match="runtime_profile_contract_invalid"):
+        await service.create_tenant_version(
+            tenant.id,
+            created_by=user.id,
+            runtime_backend="current",
+            model={"name": "test-model", "masked_origin": "test"},
+            datatap={"service": "social", "schema_digest": "digest"},
+            limits={"max_decisions": 10},
+            billing={"mcp_call_points": 10},
+            profile_artifact_contracts={"kol_detail_v1": "brand_report_v3"},
+        )
+
+
+@pytest.mark.asyncio
+async def test_activation_rejects_missing_artifact_profile_mapping(
+    db_session, user_factory
+) -> None:
+    user = await user_factory()
+    tenant = await db_session.scalar(select(Tenant).where(Tenant.id.is_not(None)))
+    service = RuntimeConfigService(db_session, cipher=_cipher())
+    version = await service.create_tenant_version(
+        tenant.id,
+        created_by=user.id,
+        runtime_backend="pi",
+        model={"name": "test-model", "masked_origin": "test"},
+        datatap={"service": "social", "schema_digest": "digest"},
+        limits={"max_decisions": 10},
+        billing={"mcp_call_points": 10},
+        secrets=_bundle(),
+        profile_artifact_contracts={"session_analyst_v1": "brand_report_v3"},
+    )
+
+    with pytest.raises(RuntimeConfigError, match="runtime_profile_contract_required"):
+        await service.activate(version.id)
+
+    with pytest.raises(RuntimeConfigError, match="runtime_profile_contract_required"):
+        RuntimeConfigService._snapshot_from_config(version, profile_name="kol_detail_v1")
+
+    with pytest.raises(RuntimeConfigError, match="runtime_profile_contract_invalid"):
+        await service.create_tenant_version(
+            tenant.id,
+            created_by=user.id,
+            runtime_backend="current",
+            model={"name": "test-model", "masked_origin": "test"},
+            datatap={"service": "social", "schema_digest": "digest"},
+            limits={"max_decisions": 10},
+            billing={"mcp_call_points": 10},
+            profile_artifact_contracts={"utility_v1": "brand_report_v3"},
+        )
 
 
 @pytest.mark.asyncio
@@ -145,6 +264,10 @@ async def test_secret_bundle_requires_the_exact_run_snapshot_and_decrypts_only_f
         limits={"max_decisions": 10},
         billing={"mcp_call_points": 10},
         secrets=_bundle(),
+        profile_artifact_contracts={
+            "session_analyst_v1": "none",
+            "kol_detail_v1": "insight_board_v1",
+        },
     )
     tenant.runtime_backend = "pi"
     await service.activate(version.id)

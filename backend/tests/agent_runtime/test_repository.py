@@ -4,7 +4,13 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import select
 
-from app.agent_runtime.models import AgentRun, AgentRunAttempt, AgentSession
+from app.agent_runtime.models import (
+    AgentRun,
+    AgentRunAttempt,
+    AgentSession,
+    AgentStep,
+    AgentToolCall,
+)
 from app.agent_runtime.repository import (
     ATTEMPT_MAX_DECISIONS,
     ATTEMPT_MAX_SECONDS,
@@ -15,6 +21,10 @@ from app.agent_runtime.state import InvalidRunTransition, RunStatus
 
 def utc_now() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
+
+
+async def _valid_completion(_run: AgentRun) -> bool:
+    return True
 
 
 async def _create_queued_run(db_session, user_factory) -> tuple[str, str]:
@@ -483,11 +493,63 @@ async def test_transition_reviewing_to_completed_is_terminal_and_releases_lease(
     run = await repo.transition(run_id, RunStatus.REVIEWING, worker_id="worker-a")
     assert run.status == "reviewing"
 
-    run = await repo.transition(run_id, RunStatus.COMPLETED, worker_id="worker-a")
+    with pytest.raises(InvalidRunTransition, match="completion_validation_required"):
+        await repo.transition(run_id, RunStatus.COMPLETED, worker_id="worker-a")
+
+    run = await repo.transition(
+        run_id,
+        RunStatus.COMPLETED,
+        worker_id="worker-a",
+        completion_validator=_valid_completion,
+    )
     assert run.status == "completed"
     assert run.completed_at is not None
     assert run.lease_owner is None
     assert run.lease_expires_at is None
+
+
+async def test_transition_to_failed_closes_running_runtime_rows(db_session, user_factory):
+    user_id, run_id = await _create_queued_run(db_session, user_factory)
+    repo = AgentRunRepository(db_session)
+    await repo.begin_attempt(run_id)
+    await repo.claim_lease(run_id, "worker-a", 300)
+    attempt = await db_session.scalar(
+        select(AgentRunAttempt).where(AgentRunAttempt.run_id == run_id)
+    )
+    assert attempt is not None
+    step = AgentStep(
+        id=str(uuid4()),
+        run_id=run_id,
+        attempt_id=attempt.id,
+        sequence=1,
+        step_type="tool_call",
+        status="running",
+        visibility="internal",
+        created_at=utc_now(),
+    )
+    db_session.add(step)
+    await db_session.flush()
+    call = AgentToolCall(
+        id=str(uuid4()),
+        run_id=run_id,
+        step_id=step.id,
+        logical_call_id=str(uuid4()),
+        service="insight-cube-mcp",
+        internal_tool_name="query_analysis_data",
+        arguments_hash="a" * 64,
+        status="running",
+        points_reserved=10,
+    )
+    db_session.add(call)
+    await db_session.flush()
+
+    run = await repo.transition(run_id, RunStatus.FAILED, worker_id="worker-a")
+
+    assert run.status == "failed"
+    await db_session.refresh(step)
+    await db_session.refresh(call)
+    assert step.status == "failed"
+    assert call.status == "unknown"
 
 
 async def test_resume_after_pause_resets_attempt_counters_on_every_new_attempt(

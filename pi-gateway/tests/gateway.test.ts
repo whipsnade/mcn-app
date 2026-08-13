@@ -180,10 +180,16 @@ describe("PiGateway", () => {
 
   it("acknowledges a cancellation requested by heartbeat", async () => {
     const terminal = vi.fn().mockResolvedValue(undefined);
+    const order: string[] = [];
+    const sendEvent = vi.fn(async () => { order.push("event"); });
     const heartbeat = vi.fn().mockResolvedValue({ cancel_requested: true });
     let finish!: () => void;
     const done = new Promise<void>((resolve) => { finish = resolve; });
-    const abort = vi.fn(() => finish());
+    let emit!: (event: PiGatewaySourceEvent) => void;
+    const abort = vi.fn(() => {
+      emit({ source_event_id: "cancel:1", sequence: 1, event_type: "message.completed", payload: { text: "已取消前的答复" } });
+      finish();
+    });
     const controlPlane = {
       claim: vi.fn().mockResolvedValue({
         run_id: "run-cancel",
@@ -196,10 +202,18 @@ describe("PiGateway", () => {
       }),
       terminal,
       heartbeat,
+      sendEvent,
     };
     const gateway = new PiGateway({
       controlPlane, capacity: 1, heartbeatIntervalMs: 1,
-      worker: async () => ({ abort, done }),
+      worker: async () => ({
+        abort,
+        done,
+        onEvent: (listener: (event: PiGatewaySourceEvent) => void) => {
+          emit = listener;
+          return () => undefined;
+        },
+      }),
     });
 
     await gateway.tick();
@@ -208,6 +222,8 @@ describe("PiGateway", () => {
       "run-cancel", "attempt-cancel", "cancelled", "lease-token-with-enough-entropy",
       { code: "cancel_requested" },
     );
+    order.push("terminal");
+    expect(order).toEqual(["event", "terminal"]);
   });
 
   it("leaves a Run for recovery when claim transport is unreachable", async () => {
@@ -360,6 +376,9 @@ describe("PiGateway", () => {
     // 子进程终帧的业务错误（worker_error）不属于基础设施故障：直接 failed
     // 收口，不留给恢复、不消耗唯一的一次基础设施重试。
     const terminal = vi.fn().mockResolvedValue(undefined);
+    const order: string[] = [];
+    const sendEvent = vi.fn(async () => { order.push("event"); });
+    let emit!: (event: PiGatewaySourceEvent) => void;
     const controlPlane = {
       claim: vi.fn().mockResolvedValue({
         run_id: "run-biz-fail",
@@ -372,13 +391,22 @@ describe("PiGateway", () => {
       }),
       terminal,
       heartbeat: vi.fn().mockResolvedValue({ cancel_requested: false }),
+      sendEvent,
     };
+    const done = new Promise<void>((_resolve, reject) =>
+      setTimeout(() => {
+        emit({ source_event_id: "business:1", sequence: 1, event_type: "message.completed", payload: { text: "失败前的说明" } });
+        reject(new Error("worker_error"));
+      }, 1),
+    );
     const gateway = new PiGateway({
       controlPlane, capacity: 1, heartbeatIntervalMs: 1,
       worker: async () => ({
-        done: new Promise<void>((_resolve, reject) =>
-          setTimeout(() => reject(new Error("worker_error")), 1)
-        ),
+        done,
+        onEvent: (listener: (event: PiGatewaySourceEvent) => void) => {
+          emit = listener;
+          return () => undefined;
+        },
       }),
     });
 
@@ -390,6 +418,8 @@ describe("PiGateway", () => {
       "run-biz-fail", "attempt-biz-fail", "failed", "lease-token-with-enough-entropy",
       { code: "pi_gateway_worker_failed" },
     );
+    order.push("terminal");
+    expect(order).toEqual(["event", "terminal"]);
   });
 
   it("leaves a signaled worker for recovery without posting a terminal", async () => {
@@ -537,6 +567,48 @@ describe("PiGateway", () => {
     expect(onError).toHaveBeenCalled();
   });
 
+  it("allows a bounded slow heartbeat without aborting before the lease grace", async () => {
+    const terminal = vi.fn().mockResolvedValue(undefined);
+    const heartbeat = vi.fn(async () => {
+      await new Promise<void>((resolve) => setTimeout(resolve, 1_200));
+      return {
+        cancel_requested: false,
+        lease_expires_at: Math.floor(Date.now() / 1000) + 3,
+      };
+    });
+    const controlPlane = {
+      claim: vi.fn().mockResolvedValue({
+        run_id: "run-slow-heartbeat",
+        attempt_id: "attempt-slow-heartbeat",
+        lease_token: "lease-token-with-enough-entropy",
+        lease_expires_at: Date.now() / 1000 + 3,
+        runtime_snapshot: {}, transcript: [],
+        secret_envelope: { alg: "AES-256-GCM", nonce: "1234567890123456", ciphertext: "1234567890123456" },
+        adapter_catalog: [], internal_tools: [],
+      }),
+      terminal,
+      heartbeat,
+    };
+    const gateway = new PiGateway({
+      controlPlane,
+      capacity: 1,
+      heartbeatIntervalMs: 5,
+      worker: async () => ({
+        done: new Promise<void>((resolve) => setTimeout(resolve, 1_400)),
+      }),
+    });
+
+    await gateway.tick();
+
+    expect(heartbeat).toHaveBeenCalled();
+    expect(terminal).toHaveBeenCalledWith(
+      "run-slow-heartbeat",
+      "attempt-slow-heartbeat",
+      "completed",
+      "lease-token-with-enough-entropy",
+    );
+  });
+
   it("declares the lease lost at the deadline and aborts the worker inside the grace", async () => {
     // heartbeat 永不返回：deadline 到达时（预留 abort grace）必须放弃租约并
     // 中止 worker，把 Run 留给恢复，而不是等超时拖过 lease。
@@ -609,5 +681,136 @@ describe("pi_decision_limit business terminal", () => {
     for (const call of onError.mock.calls) {
       expect(String(call[0])).not.toContain("PiGatewayInfrastructureError");
     }
+  });
+});
+
+describe("completion and loop-guard business terminal", () => {
+  it("converts a server-owned runtime snapshot rejection into stable failed without recovery", async () => {
+    const terminal = vi.fn().mockResolvedValue(undefined);
+    const heartbeat = vi.fn().mockResolvedValue({
+      lease_expires_at: Math.floor(Date.now() / 1000) + 3600,
+    });
+    const onError = vi.fn();
+    const controlPlane = {
+      claim: vi.fn().mockResolvedValue({
+        run_id: "run-invalid-snapshot",
+        attempt_id: "attempt-invalid-snapshot",
+        lease_token: "lease-token-with-enough-entropy",
+        lease_expires_at: Math.floor(Date.now() / 1000) + 3600,
+        runtime_snapshot: {},
+        transcript: [],
+        secret_envelope: { alg: "AES-256-GCM", nonce: "1234567890123456", ciphertext: "1234567890123456" },
+        adapter_catalog: [],
+        internal_tools: [],
+      }),
+      terminal,
+      heartbeat,
+    };
+    const gateway = new PiGateway({
+      controlPlane, capacity: 1, heartbeatIntervalMs: 1, onError,
+      worker: async () => ({ done: Promise.reject(new Error("pi_gateway_runtime_snapshot_invalid")) }),
+    });
+
+    await gateway.tick();
+
+    expect(terminal).toHaveBeenCalledWith(
+      "run-invalid-snapshot",
+      "attempt-invalid-snapshot",
+      "failed",
+      "lease-token-with-enough-entropy",
+      { code: "pi_gateway_runtime_snapshot_invalid" },
+    );
+    expect(terminal).not.toHaveBeenCalledWith(
+      expect.anything(), expect.anything(), expect.anything(), expect.anything(),
+      { code: "pi_gateway_worker_failed" },
+    );
+    expect(onError).not.toHaveBeenCalled();
+  });
+
+  it("converts a completion gate rejection into stable failed without worker_failed", async () => {
+    const terminal = vi.fn()
+      .mockRejectedValueOnce(Object.assign(new Error("required_artifact_missing"), {
+        code: "required_artifact_missing",
+        status: 409,
+      }))
+      .mockResolvedValueOnce(undefined);
+    const heartbeat = vi.fn().mockResolvedValue({
+      lease_expires_at: Math.floor(Date.now() / 1000) + 3600,
+    });
+    const onError = vi.fn();
+    const controlPlane = {
+      claim: vi.fn().mockResolvedValue({
+        run_id: "run-artifact-gate",
+        attempt_id: "attempt-artifact-gate",
+        lease_token: "lease-token-with-enough-entropy",
+        lease_expires_at: Math.floor(Date.now() / 1000) + 3600,
+        runtime_snapshot: {}, transcript: [],
+        secret_envelope: { alg: "AES-256-GCM", nonce: "1234567890123456", ciphertext: "1234567890123456" },
+        adapter_catalog: [], internal_tools: [],
+      }),
+      terminal,
+      heartbeat,
+    };
+    const gateway = new PiGateway({
+      controlPlane, capacity: 1, heartbeatIntervalMs: 1, onError,
+      worker: async () => ({ done: Promise.resolve() }),
+    });
+
+    await gateway.tick();
+
+    expect(terminal).toHaveBeenNthCalledWith(
+      1,
+      "run-artifact-gate",
+      "attempt-artifact-gate",
+      "completed",
+      "lease-token-with-enough-entropy",
+    );
+    expect(terminal).toHaveBeenNthCalledWith(
+      2,
+      "run-artifact-gate",
+      "attempt-artifact-gate",
+      "failed",
+      "lease-token-with-enough-entropy",
+      { code: "required_artifact_missing" },
+    );
+    expect(onError).not.toHaveBeenCalled();
+  });
+
+  it("converts the persisted loop guard error into stable failed", async () => {
+    const terminal = vi.fn().mockResolvedValue(undefined);
+    const heartbeat = vi.fn().mockResolvedValue({
+      lease_expires_at: Math.floor(Date.now() / 1000) + 3600,
+    });
+    const controlPlane = {
+      claim: vi.fn().mockResolvedValue({
+        run_id: "run-circuit",
+        attempt_id: "attempt-circuit",
+        lease_token: "lease-token-with-enough-entropy",
+        lease_expires_at: Math.floor(Date.now() / 1000) + 3600,
+        runtime_snapshot: {}, transcript: [],
+        secret_envelope: { alg: "AES-256-GCM", nonce: "1234567890123456", ciphertext: "1234567890123456" },
+        adapter_catalog: [], internal_tools: [],
+      }),
+      terminal,
+      heartbeat,
+    };
+    const gateway = new PiGateway({
+      controlPlane, capacity: 1, heartbeatIntervalMs: 1,
+      worker: async () => ({
+        done: Promise.reject(Object.assign(new Error("agent_loop_circuit_open"), {
+          code: "agent_loop_circuit_open",
+        })),
+      }),
+    });
+
+    await gateway.tick();
+
+    expect(terminal).toHaveBeenCalledWith(
+      "run-circuit",
+      "attempt-circuit",
+      "failed",
+      "lease-token-with-enough-entropy",
+      { code: "agent_loop_circuit_open" },
+    );
   });
 });

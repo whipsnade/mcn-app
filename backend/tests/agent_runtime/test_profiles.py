@@ -35,6 +35,7 @@ EXPECTED_FIELDS = {
     "max_context_budget",
     "output_schema",
     "system_prompt_key",
+    "allowed_artifact_contracts",
 }
 
 
@@ -98,6 +99,21 @@ def test_session_analyst_tool_categories() -> None:
     assert profile.allowed_tool_categories == frozenset(
         {MCP_TOOLS, HISTORY_TOOLS, CALCULATION_TOOLS, ARTIFACT_TOOLS}
     )
+
+
+def test_artifact_contract_allowlists_are_profile_scoped() -> None:
+    assert PROFILES["session_analyst_v1"].allowed_artifact_contracts == frozenset(
+        {
+            "brand_report_v3",
+            "campaign_report_v3",
+            "kol_selection_v3",
+            "insight_board_v1",
+        }
+    )
+    assert PROFILES["kol_detail_v1"].allowed_artifact_contracts == frozenset(
+        {"insight_board_v1"}
+    )
+    assert PROFILES["utility_v1"].allowed_artifact_contracts == frozenset()
 
 
 def test_artifact_reviewer_has_no_tools() -> None:
