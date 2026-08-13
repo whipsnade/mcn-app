@@ -38,6 +38,7 @@ function makeWork(overrides: Partial<ClaimedRun> = {}): ClaimedRun {
       model: { provider: "fake", id: "fake-model", api: "faux" },
       rootPolicy: "policy",
       skillCatalog: [],
+      allowedArtifactContracts: [],
       adapterCatalog: ADAPTER_CATALOG,
       maxDecisions: 50,
     },

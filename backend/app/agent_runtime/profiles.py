@@ -48,9 +48,10 @@ class AgentProfile:
     ``review_decision``（approve/revise/reject，独立于动作协议；遗留，
     仅 artifact_reviewer_v1 使用）/ ``utility_json``（对应强类型 Utility 输出）。
     ``allowed_artifact_contracts`` 是该 Profile 的审核输出契约 allowlist；它
-    只描述可以交付的已审核产物类型，不描述 Builder 调用顺序。Run 创建时
-    RuntimeConfigService 要求 runtime config 的 profile 映射同时命中此 allowlist
-    和当前 capability pack 的 typed contract。
+    只描述可以交付的已审核产物类型，不描述 Builder 调用顺序，也不代表某
+    个 Run 必须产出其中任意一种。Run 创建时 RuntimeConfigService 将它与
+    当前 capability pack 的 typed contract 求交集并冻结到 Snapshot，最终由
+    Pi 自主选择是否以及选择哪一种产物。
     """
 
     name: str

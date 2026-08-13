@@ -42,6 +42,7 @@ describe("locked Pi SDK contract", () => {
         model: { provider: "fake", id: "fake-model", api: "openai-completions" },
         rootPolicy: "root-policy",
         skillCatalog: [],
+        allowedArtifactContracts: [],
         adapterCatalog: [],
         maxDecisions: 50,
       },

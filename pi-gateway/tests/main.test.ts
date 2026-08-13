@@ -83,6 +83,7 @@ function claimResponse(overrides: { tamperAad?: boolean } = {}) {
           artifact_contract: "brand_report_v3",
         }],
       },
+      allowed_artifact_contracts: ["brand_report_v3"],
       limits: { max_decisions: 50 },
       billing: { mcp_call_points: 10 },
     },
@@ -516,7 +517,18 @@ describe("mapClaimRuntimeSnapshot maxDecisions budget", () => {
   it("reads a valid limits.max_decisions into the worker snapshot", () => {
     const snapshot = base();
     snapshot.limits = { max_decisions: 2 };
-    expect(mapClaimRuntimeSnapshot(snapshot).maxDecisions).toBe(2);
+    const mapped = mapClaimRuntimeSnapshot(snapshot);
+    expect(mapped.maxDecisions).toBe(2);
+    expect(mapped.allowedArtifactContracts).toEqual(["brand_report_v3"]);
+  });
+
+  it("does not carry a historical required contract into the Pi worker", () => {
+    const snapshot = base();
+    snapshot.artifact_contract_mode = "required";
+    snapshot.required_artifact_contract = "brand_report_v3";
+    const mapped = mapClaimRuntimeSnapshot(snapshot);
+    expect(mapped).not.toHaveProperty("requiredArtifactContract");
+    expect(mapped.allowedArtifactContracts).toEqual(["brand_report_v3"]);
   });
 
   it.each([

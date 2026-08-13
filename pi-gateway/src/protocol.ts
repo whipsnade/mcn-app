@@ -68,7 +68,8 @@ export interface RuntimeSnapshot {
   adapterCatalog: readonly AdapterCatalogEntry[];
   /** Server-resolved profile capability captured at Run creation. */
   profileName?: string;
-  requiredArtifactContract?: string | null;
+  /** Candidate artifact contracts frozen by the server; never a required target. */
+  allowedArtifactContracts: readonly string[];
   capabilityPackVersion?: string;
   capabilityPackManifestDigest?: string;
   /**

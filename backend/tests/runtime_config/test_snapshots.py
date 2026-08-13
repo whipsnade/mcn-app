@@ -123,3 +123,30 @@ def test_runtime_snapshot_accepts_versioned_public_price_table_only() -> None:
         RuntimeConfigSnapshot.model_validate(
             {**base.model_dump(), "billing": {"price_table": {"api_key": "secret"}}}
         )
+
+
+def test_runtime_snapshot_freezes_allowed_artifact_contracts_without_required_contract() -> None:
+    snapshot = RuntimeConfigSnapshot(
+        config_version_id="cfg-capability-only",
+        runtime_contract_version="marketing_runtime_v1",
+        runtime_backend="pi",
+        model={"name": "test", "masked_origin": "https://model.example"},
+        datatap={"service": "social", "schema_digest": "digest"},
+        capability_pack={"manifest_digest": "digest-pack"},
+        profile_name="session_analyst_v1",
+        allowed_artifact_contracts=(
+            "brand_report_v3",
+            "campaign_report_v3",
+            "insight_board_v1",
+        ),
+        limits={"max_decisions": 50},
+        billing={"mcp_call_points": 10},
+    )
+
+    assert snapshot.required_artifact_contract is None
+    assert snapshot.artifact_contract_mode is None
+    assert snapshot.allowed_artifact_contracts == (
+        "brand_report_v3",
+        "campaign_report_v3",
+        "insight_board_v1",
+    )

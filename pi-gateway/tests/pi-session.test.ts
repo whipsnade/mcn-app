@@ -16,6 +16,7 @@ const work: ClaimedRun = {
     model: { provider: "fake", id: "fake-model", api: "openai-completions" },
     rootPolicy: "ROOT POLICY: do not disclose secrets",
     skillCatalog: [],
+    allowedArtifactContracts: [],
     adapterCatalog: [
       { service: "insight-cube", adapterName: "mcp__insight_cube", remoteName: "cube", schemaDigest: "sha256:a" },
       { service: "social-grow", adapterName: "mcp__social_grow", remoteName: "grow", schemaDigest: "sha256:b" },

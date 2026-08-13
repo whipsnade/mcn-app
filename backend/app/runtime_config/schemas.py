@@ -47,12 +47,15 @@ class RuntimeConfigSnapshot(BaseModel):
     model: dict[str, str | int | float | None]
     datatap: dict[str, object]
     capability_pack: dict[str, object]
-    # Legacy snapshots may omit these fields.  Every new Run snapshot produced
-    # by RuntimeConfigService fills them from the reviewed pack/profile policy.
+    # Legacy snapshots may omit these fields.  New Run snapshots fill the
+    # capability allowlist from the reviewed pack/profile pair.  This is a
+    # candidate set for Pi, never a required artifact contract.
     profile_name: str | None = None
-    # Explicitly distinguishes a profile that produces no required artifact
-    # from a snapshot that accidentally lost its contract mapping.
-    artifact_contract_mode: Literal["required", "none"] = "none"
+    allowed_artifact_contracts: tuple[str, ...] = ()
+    # These two fields are read-only compatibility fields for historical Run
+    # snapshots created before the autonomy-boundary correction.  New
+    # snapshots leave both unset; no new decision may be derived from them.
+    artifact_contract_mode: Literal["required", "none"] | None = None
     required_artifact_contract: str | None = None
     capability_pack_version: str | None = None
     capability_pack_manifest_digest: str | None = None
@@ -73,6 +76,16 @@ class RuntimeConfigSnapshot(BaseModel):
     @classmethod
     def freeze_adapter_catalog(cls, value):
         return tuple(_deep_freeze(dict(entry)) for entry in value)
+
+    @field_validator("allowed_artifact_contracts")
+    @classmethod
+    def freeze_allowed_artifact_contracts(cls, value):
+        contracts = tuple(value)
+        if any(not isinstance(contract, str) or not contract for contract in contracts):
+            raise ValueError("runtime_snapshot_artifact_allowlist_invalid")
+        if len(set(contracts)) != len(contracts):
+            raise ValueError("runtime_snapshot_artifact_allowlist_invalid")
+        return contracts
 
     @field_validator("billing")
     @classmethod
@@ -133,12 +146,12 @@ class RuntimeConfigSnapshot(BaseModel):
             and self.capability_pack_manifest_digest != nested_manifest_digest
         ):
             raise ValueError("runtime_snapshot_capability_audit_mismatch")
-        if self.required_artifact_contract is not None and not self.profile_name:
-            raise ValueError("runtime_snapshot_profile_missing")
         if self.artifact_contract_mode == "required":
             if not self.profile_name or not self.required_artifact_contract:
                 raise ValueError("runtime_snapshot_artifact_contract_missing")
-        elif self.required_artifact_contract is not None:
+        elif self.artifact_contract_mode == "none" and self.required_artifact_contract is not None:
+            raise ValueError("runtime_snapshot_artifact_contract_mode_invalid")
+        elif self.artifact_contract_mode is None and self.required_artifact_contract is not None:
             raise ValueError("runtime_snapshot_artifact_contract_mode_invalid")
         return self
 

@@ -21,6 +21,7 @@ const work: ClaimedRun = {
     model: { provider: "fake", id: "model", api: "faux" },
     rootPolicy: "policy",
     skillCatalog: [],
+    allowedArtifactContracts: [],
     adapterCatalog: [
       { service: "insight-cube", adapterName: "cube", remoteName: "query", schemaDigest: "sha256:a" },
       { service: "social-grow", adapterName: "grow", remoteName: "query", schemaDigest: "sha256:b" },
@@ -109,6 +110,84 @@ describe("single-run worker lifecycle", () => {
     };
     await expect(runSingleWorker(work, secrets, { sessionFactory: { create: async () => session } })).rejects.toThrow("fake_failure");
     expect(order).toEqual(["prompt", "abort", "unsubscribe", "dispose"]);
+  });
+
+  it("flushes the pending delta tail before normal, provider, decision-limit and prompt exits", async () => {
+    const makeSession = (
+      prompt: () => Promise<void>,
+      options: { providerError?: boolean; modelBudget?: ModelRequestBudget } = {},
+    ): PiRunSession => ({
+      prompt,
+      subscribe: (listener) => {
+        listener({
+          type: "sdk_event",
+          eventType: "message_update",
+          event: {
+            type: "message_update",
+            assistantMessageEvent: { type: "text_delta", delta: "尾部片段" },
+          },
+        });
+        if (options.providerError) {
+          listener({
+            type: "sdk_event",
+            eventType: "message_end",
+            event: { type: "message_end", message: { stopReason: "error" } },
+          });
+        }
+        return () => undefined;
+      },
+      abort: async () => undefined,
+      dispose: async () => undefined,
+      systemPrompt: () => "policy",
+      activeToolNames: () => [],
+      cwd: () => "/tmp/worker",
+      modelBudget: options.modelBudget,
+    });
+
+    const runCase = async (
+      prompt: () => Promise<void>,
+      options: { providerError?: boolean; modelBudget?: ModelRequestBudget } = {},
+    ): Promise<Array<Record<string, unknown>>> => {
+      const events: Array<Record<string, unknown>> = [];
+      await runSingleWorker(work, secrets, {
+        sessionFactory: { create: async () => makeSession(prompt, options) },
+        onEvent: (event) => events.push(event as unknown as Record<string, unknown>),
+      });
+      return events;
+    };
+
+    const normal = await runCase(async () => undefined);
+    expect(normal.map((event) => event.event_type)).toEqual(["message.delta"]);
+    expect(normal[0]?.payload).toMatchObject({ text: "尾部片段", batched: true });
+
+    const promptErrorEvents: Array<Record<string, unknown>> = [];
+    await expect(runSingleWorker(work, secrets, {
+      sessionFactory: {
+        create: async () => makeSession(async () => { throw new Error("prompt_exit"); }),
+      },
+      onEvent: (event) => promptErrorEvents.push(event as unknown as Record<string, unknown>),
+    })).rejects.toThrow("prompt_exit");
+    expect(promptErrorEvents.map((event) => event.event_type)).toEqual(["message.delta"]);
+
+    const providerEvents: Array<Record<string, unknown>> = [];
+    await expect(runSingleWorker(work, secrets, {
+      sessionFactory: {
+        create: async () => makeSession(async () => undefined, { providerError: true }),
+      },
+      onEvent: (event) => providerEvents.push(event as unknown as Record<string, unknown>),
+    })).rejects.toThrow("pi_model_provider_error");
+    expect(providerEvents.map((event) => event.event_type)).toEqual(["message.delta"]);
+
+    const budget = new ModelRequestBudget(1);
+    budget.assertAndConsume();
+    const decisionLimitEvents: Array<Record<string, unknown>> = [];
+    await expect(runSingleWorker(work, secrets, {
+      sessionFactory: {
+        create: async () => makeSession(async () => budget.assertAndConsume(), { modelBudget: budget }),
+      },
+      onEvent: (event) => decisionLimitEvents.push(event as unknown as Record<string, unknown>),
+    })).rejects.toThrow("pi_decision_limit");
+    expect(decisionLimitEvents.map((event) => event.event_type)).toEqual(["message.delta"]);
   });
 
   it("disposes the session even when unsubscribe throws", async () => {
@@ -270,9 +349,11 @@ describe("pi_decision_limit stable failure classification", () => {
     expect(classifyWorkerError(new Error("pi_decision_limit"))).toBe("pi_decision_limit");
     const withCode = Object.assign(new Error("boom"), { code: "pi_decision_limit" });
     expect(classifyWorkerError(withCode)).toBe("pi_decision_limit");
+    // The former builder/search circuit code is no longer a worker terminal
+    // classification; LoopGuard warnings stay inside normal tool results.
     expect(classifyWorkerError(Object.assign(new Error("boom"), {
       code: "agent_loop_circuit_open",
-    }))).toBe("agent_loop_circuit_open");
+    }))).toBe("worker_error");
     expect(classifyWorkerError(new Error("sdk_protocol_error"))).toBe("sdk_protocol_error");
     expect(classifyWorkerError(new Error("something else"))).toBe("worker_error");
   });

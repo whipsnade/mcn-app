@@ -260,7 +260,6 @@ class AdminRuntimeConfigItem(BaseModel):
     datatap: dict[str, Any]
     limits: dict[str, Any]
     billing: dict[str, Any]
-    profile_artifact_contracts: dict[str, str] = Field(default_factory=dict)
     secret_refs: list[dict[str, str]]
     created_by: str | None = None
     created_at: datetime
@@ -274,7 +273,6 @@ class AdminRuntimeConfigCreate(BaseModel):
     datatap: dict[str, Any]
     limits: dict[str, int | float]
     billing: dict[str, Any]
-    profile_artifact_contracts: dict[str, str] = Field(default_factory=dict)
     secrets: dict[str, Any] | None = None
     runtime_contract_version: str = "marketing_runtime_v1"
 

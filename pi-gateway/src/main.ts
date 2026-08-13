@@ -69,16 +69,19 @@ export function mapClaimRuntimeSnapshot(snapshot: Record<string, unknown>): Runt
   const capabilityPack = snapshot.capability_pack;
   if (!isRecord(capabilityPack)) snapshotError();
   const profileName = snapshot.profile_name;
-  const requiredArtifactContract = snapshot.required_artifact_contract;
+  const allowedArtifactContracts = snapshot.allowed_artifact_contracts ?? [];
   const capabilityPackVersion = snapshot.capability_pack_version;
   const capabilityPackManifestDigest = snapshot.capability_pack_manifest_digest;
   if (profileName !== undefined && (typeof profileName !== "string" || profileName.length === 0)) snapshotError();
-  if (requiredArtifactContract !== undefined && requiredArtifactContract !== null && (typeof requiredArtifactContract !== "string" || requiredArtifactContract.length === 0)) snapshotError();
+  if (
+    !Array.isArray(allowedArtifactContracts) ||
+    allowedArtifactContracts.some((contract) => typeof contract !== "string" || contract.length === 0) ||
+    new Set(allowedArtifactContracts).size !== allowedArtifactContracts.length
+  ) snapshotError();
   if (capabilityPackVersion !== undefined && (typeof capabilityPackVersion !== "string" || capabilityPackVersion.length === 0)) snapshotError();
   if (capabilityPackManifestDigest !== undefined && (typeof capabilityPackManifestDigest !== "string" || !/^[0-9a-fA-F]{64}$/.test(capabilityPackManifestDigest))) snapshotError();
   if (capabilityPackVersion !== undefined && capabilityPack.pack_version !== capabilityPackVersion) snapshotError();
   if (capabilityPackManifestDigest !== undefined && capabilityPack.manifest_digest !== capabilityPackManifestDigest) snapshotError();
-  if (requiredArtifactContract !== undefined && requiredArtifactContract !== null && profileName === undefined) snapshotError();
   const rootPolicy = capabilityPack.root_policy;
   if (typeof rootPolicy !== "string" || rootPolicy.length === 0) snapshotError();
   const skillsRaw = capabilityPack.skills ?? [];
@@ -129,7 +132,7 @@ export function mapClaimRuntimeSnapshot(snapshot: Record<string, unknown>): Runt
     skillCatalog,
     adapterCatalog,
     ...(profileName === undefined ? {} : { profileName: profileName as string }),
-    ...(requiredArtifactContract === undefined ? {} : { requiredArtifactContract: requiredArtifactContract as string | null }),
+    allowedArtifactContracts: allowedArtifactContracts as string[],
     ...(capabilityPackVersion === undefined ? {} : { capabilityPackVersion: capabilityPackVersion as string }),
     ...(capabilityPackManifestDigest === undefined ? {} : { capabilityPackManifestDigest: capabilityPackManifestDigest as string }),
     maxDecisions: readSnapshotMaxDecisions(snapshot),

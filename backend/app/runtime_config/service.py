@@ -12,7 +12,7 @@ from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_runtime.models import AgentRun
-from app.agent_runtime.profiles import ARTIFACT_TOOLS, PROFILES, get_profile
+from app.agent_runtime.profiles import get_profile
 from app.core.config import get_settings
 from app.marketing_capability_pack.runtime import (
     MarketingRunCapability,
@@ -29,11 +29,6 @@ from .schemas import RuntimeConfigSnapshot, RuntimeSecretBundle
 LEGACY_RUNTIME_CONFIG_ID = "legacy-env-v1"
 POC_RUNTIME_CONFIG_ID = "poc-isolated-v1"
 RUNTIME_CONTRACT_VERSION = "marketing_runtime_v1"
-# Explicit reviewed policy for a profile that has no required artifact.  This
-# is intentionally different from an omitted mapping, which fails closed.
-NO_ARTIFACT_POLICY = "none"
-
-
 class RuntimeConfigService:
     """Append-only config service used by Run creators and the Gateway boundary."""
 
@@ -69,7 +64,6 @@ class RuntimeConfigService:
         limits: dict[str, int | float],
         billing: dict[str, Any],
         secrets: RuntimeSecretBundle | None = None,
-        profile_artifact_contracts: dict[str, str] | None = None,
         runtime_contract_version: str = RUNTIME_CONTRACT_VERSION,
     ) -> RuntimeConfigVersion:
         if runtime_backend not in {"current", "pi"}:
@@ -113,7 +107,6 @@ class RuntimeConfigService:
                 datatap=datatap,
                 limits=limits,
                 billing=billing,
-                profile_artifact_contracts=profile_artifact_contracts,
             ),
             secret_refs_json=[],
             created_by=created_by,
@@ -142,7 +135,7 @@ class RuntimeConfigService:
         if config.runtime_backend == "pi" and not config.secret_refs_json:
             raise RuntimeConfigError("runtime_secrets_required")
         if config.runtime_backend == "pi" and config.runtime_contract_version == RUNTIME_CONTRACT_VERSION:
-            self._validate_activation_artifact_contracts(config)
+            self._validate_activation_capability_pack(config)
         now = self._now_fn()
         if config.scope == "tenant":
             tenant = await self.db.scalar(
@@ -181,35 +174,25 @@ class RuntimeConfigService:
         return config
 
     @staticmethod
-    def _validate_activation_artifact_contracts(config: RuntimeConfigVersion) -> None:
-        """Fail closed before an artifact-capable pack can be activated.
+    def _validate_activation_capability_pack(config: RuntimeConfigVersion) -> None:
+        """Validate the reviewed capability pack without a business target.
 
-        Activation has no user Run profile, so it validates the complete
-        reviewed mapping for all production profiles that can create an
-        artifact.  A later Run snapshot selects exactly one of these entries;
-        it never derives a contract from builder calls.
+        Activation has no user Run profile.  It therefore validates only the
+        immutable capability pack projection; artifact selection happens later
+        inside the Pi decision boundary and is limited by the Run snapshot.
         """
-        payload = config.config_json or {}
+        payload = copy.deepcopy(config.config_json or {})
+        # Do not let the legacy admin mapping become a new Runtime policy.
+        payload.pop("profile_artifact_contracts", None)
         capability_payload = payload.get("capability_pack")
         try:
-            capability = MarketingRunCapability.model_validate(capability_payload)
+            MarketingRunCapability.model_validate(capability_payload)
         except Exception as exc:
-            raise RuntimeConfigError("runtime_profile_contract_invalid") from exc
-        profile_contracts = payload.get("profile_artifact_contracts")
-        if not isinstance(profile_contracts, Mapping):
-            raise RuntimeConfigError("runtime_profile_contract_required")
-        required_profiles = {
-            profile.full_name
-            for profile in PROFILES.values()
-            if ARTIFACT_TOOLS in profile.allowed_tool_categories
-            and profile.full_name != "artifact_reviewer_v1"
-        }
-        missing = required_profiles - set(profile_contracts)
-        if missing:
-            raise RuntimeConfigError("runtime_profile_contract_required")
-        RuntimeConfigService._validate_profile_artifact_contracts(
-            {name: profile_contracts[name] for name in required_profiles}, capability
-        )
+            raise RuntimeConfigError("runtime_capability_pack_invalid") from exc
+        try:
+            RuntimeConfigSnapshot.model_validate(payload)
+        except Exception as exc:
+            raise RuntimeConfigError("runtime_config_snapshot_invalid") from exc
 
     async def update_version(self, config_version_id: str, *, config_json: dict[str, Any]) -> None:
         del config_version_id, config_json
@@ -295,10 +278,8 @@ class RuntimeConfigService:
             except Exception as exc:
                 raise RuntimeConfigError("runtime_snapshot_invalid") from exc
         # Legacy rows predate the explicit audit fields.  Enrich only the
-        # in-memory audit aliases; the historical JSON is never rewritten.  In
-        # particular, do not infer ``artifact_contract_mode`` from the profile:
-        # a missing mode must remain missing so the Pi completion gate fails
-        # closed instead of silently manufacturing a required/no-artifact policy.
+        # in-memory pack aliases; the historical JSON is never rewritten.  Do
+        # not infer an artifact target from the profile or old config mapping.
         capability_for_audit = snapshot_payload.get("capability_pack")
         if isinstance(capability_for_audit, Mapping):
             snapshot_payload.setdefault("profile_name", run.profile_name)
@@ -488,8 +469,12 @@ class RuntimeConfigService:
             datatap={"service": "poc", "schema_digest": "poc"},
             capability_pack=capability.model_dump(mode="json"),
             profile_name="session_analyst_v1",
-            artifact_contract_mode="required",
-            required_artifact_contract="brand_report_v3",
+            allowed_artifact_contracts=(
+                "brand_report_v3",
+                "campaign_report_v3",
+                "insight_board_v1",
+                "kol_selection_v3",
+            ),
             capability_pack_version=capability.pack_version,
             capability_pack_manifest_digest=capability.manifest_digest,
             limits={"max_decisions": 50},
@@ -545,18 +530,12 @@ class RuntimeConfigService:
         datatap: dict[str, Any],
         limits: dict[str, int | float],
         billing: dict[str, Any],
-        profile_artifact_contracts: dict[str, str] | None,
     ) -> dict[str, Any]:
         if any(key not in {"name", "masked_origin", "provider"} for key in model):
             raise RuntimeConfigError("runtime_model_config_invalid")
         if set(datatap) - {"service", "schema_digest"}:
             raise RuntimeConfigError("runtime_datatap_config_invalid")
         capability = build_marketing_run_capability(model_version=str(model.get("name") or "runtime"))
-        if profile_artifact_contracts is None:
-            profile_artifact_contracts = {}
-        profile_contracts = RuntimeConfigService._validate_profile_artifact_contracts(
-            profile_artifact_contracts, capability
-        )
         payload = {
             "config_version_id": config_id,
             "runtime_contract_version": runtime_contract_version,
@@ -564,14 +543,12 @@ class RuntimeConfigService:
             "model": {"name": model.get("name"), "masked_origin": model.get("masked_origin"), "provider": model.get("provider")},
             "datatap": dict(datatap),
             "capability_pack": capability.model_dump(mode="json"),
-            "profile_artifact_contracts": profile_contracts,
             "limits": dict(limits),
             "billing": dict(billing),
         }
         if runtime_contract_version == RUNTIME_CONTRACT_VERSION:
             try:
                 snapshot_payload = dict(payload)
-                snapshot_payload.pop("profile_artifact_contracts", None)
                 RuntimeConfigSnapshot.model_validate(snapshot_payload)
             except Exception as exc:
                 raise RuntimeConfigError("runtime_config_snapshot_invalid") from exc
@@ -582,7 +559,9 @@ class RuntimeConfigService:
         config: RuntimeConfigVersion, *, profile_name: str | None = None
     ) -> RuntimeConfigSnapshot:
         payload = copy.deepcopy(config.config_json or {})
-        profile_contracts = payload.pop("profile_artifact_contracts", {})
+        # Older config JSON may still contain this field.  It is deliberately
+        # ignored for new Run snapshots and never copied into the snapshot.
+        payload.pop("profile_artifact_contracts", None)
         for key, expected in (
             ("config_version_id", config.id),
             ("runtime_contract_version", config.runtime_contract_version),
@@ -603,73 +582,32 @@ class RuntimeConfigService:
         capability = MarketingRunCapability.model_validate(capability_payload)
         payload["capability_pack_version"] = capability.pack_version
         payload["capability_pack_manifest_digest"] = capability.manifest_digest
-        payload["artifact_contract_mode"] = "none"
         if profile_name is not None:
             try:
                 get_profile(profile_name)
             except KeyError as exc:
                 raise RuntimeConfigError("runtime_profile_invalid") from exc
             profile = get_profile(profile_name)
-            required_contract = None
-            if config.runtime_backend == "pi":
-                if not isinstance(profile_contracts, Mapping):
-                    raise RuntimeConfigError("runtime_profile_contract_invalid")
-                configured_contract = profile_contracts.get(profile_name)
-                if ARTIFACT_TOOLS in profile.allowed_tool_categories:
-                    if not isinstance(configured_contract, str) or not configured_contract:
-                        raise RuntimeConfigError("runtime_profile_contract_required")
-                    if configured_contract != NO_ARTIFACT_POLICY:
-                        RuntimeConfigService._validate_profile_artifact_contracts(
-                            {profile_name: configured_contract}, capability
-                        )
-                        payload["artifact_contract_mode"] = "required"
-                        required_contract = configured_contract
-                elif configured_contract is not None:
-                    raise RuntimeConfigError("runtime_profile_contract_invalid")
             payload["profile_name"] = profile_name
-            payload["required_artifact_contract"] = required_contract
+            payload["allowed_artifact_contracts"] = list(
+                RuntimeConfigService._allowed_artifact_contracts(profile, capability)
+            )
         try:
             return RuntimeConfigSnapshot.model_validate(payload)
         except Exception as exc:
             raise RuntimeConfigError("runtime_snapshot_invalid") from exc
 
     @staticmethod
-    def _validate_profile_artifact_contracts(
-        profile_contracts: Mapping[str, str], capability: MarketingRunCapability
-    ) -> dict[str, str]:
-        if not isinstance(profile_contracts, Mapping):
-            raise RuntimeConfigError("runtime_profile_contract_invalid")
+    def _allowed_artifact_contracts(profile, capability: MarketingRunCapability) -> tuple[str, ...]:
+        """Return the immutable candidate contract set for one Run profile."""
         available = {
             str(item.get("artifact_type"))
             for item in capability.artifact_contracts
             if isinstance(item, Mapping)
         }
         skill_contracts = {skill.artifact_contract for skill in capability.skills}
-        validated: dict[str, str] = {}
-        for profile_name, contract in profile_contracts.items():
-            if not isinstance(profile_name, str) or not isinstance(contract, str) or not contract:
-                raise RuntimeConfigError("runtime_profile_contract_invalid")
-            try:
-                profile = get_profile(profile_name)
-            except KeyError as exc:
-                raise RuntimeConfigError("runtime_profile_contract_invalid") from exc
-            if ARTIFACT_TOOLS not in profile.allowed_tool_categories:
-                raise RuntimeConfigError("runtime_profile_contract_invalid")
-            if contract != NO_ARTIFACT_POLICY and contract not in profile.allowed_artifact_contracts:
-                raise RuntimeConfigError("runtime_profile_contract_invalid")
-            # A reviewed skill may own a typed contract that is intentionally
-            # not one of the three export contracts listed under
-            # ``artifact_contracts`` (for example insight_board_v1).  Both
-            # sources are pack-authored and immutable; neither permits a
-            # caller to invent a contract from observed builder output.
-            if (
-                contract != NO_ARTIFACT_POLICY
-                and contract not in available
-                and contract not in skill_contracts
-            ):
-                raise RuntimeConfigError("runtime_profile_contract_invalid")
-            validated[profile_name] = contract
-        return validated
+        approved = available | skill_contracts
+        return tuple(sorted(set(profile.allowed_artifact_contracts) & approved))
 
 
 def _aad(tenant_id: str, secret_id: str, kind: str, key_version: str) -> bytes:
