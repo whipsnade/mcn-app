@@ -8,15 +8,18 @@
 Status: READY_FOR_WEB_FUNCTIONAL_SCENARIO_2_RERUN_REVIEW
 （架构转向（2026-08-13）：本文档中基于 Evidence Bridge / mcp_result_v1 / required artifact
 的现行规则已被 `2026-08-13-pi-direct-mcp-result-artifact-skill-design.md` 覆盖，见 §0.4 纠偏
-说明；新 execution gate 锚定 audited Direct MCP baseline c01ec1ba…（§1.1/§1.2/§7.3）。
+说明；新 execution gate 锚定 audited Direct Artifact Skill baseline 37be5b6…（§1.1/§1.2/§7.3/§8.1）。
 历史事实保留：模式 B round REAL_B7_20260812T045636Z_b801c490 已执行并封存——L0 通过、
 L1 FAIL（mcp_tool_identity_invalid，0 外发 0 扣费）按规则终止；旧授权已消费。
 真实 Direct Model + MCP Smoke（round DIRECT_MODEL_MCP_SMOKE_20260813T103101Z_c01ec1ba）
 已执行：DIRECT_MODEL_MCP_SMOKE_FUNCTIONALLY_ACCEPTED_WITH_PROTOCOL_DEVIATION
 （偏差：直连对照调用 2 次超出授权上限 1 次，见 docs/qa/2026-08-13-direct-model-mcp-smoke-review.md）。
-Direct Artifact Skill 契约修复已完成（3 个提交 284e4c7/45ec465/260f5cc：
-模型输入 DTO + 服务器组装 + 结构化错误反馈 → load_marketing_skill 暴露模型输入契约 →
-capability pack 1.1.0 + 离线 UAT 自纠错 + result_unknown 元数据可观测性），待重跑。
+Direct Artifact Skill 契约修复已完成并独立审查通过（Critical 0 / Important 0 / Minor 0；
+六个已审核线性提交 284e4c7/45ec465/260f5cc/d4ab189/f15ff5d/37be5b6：模型输入 DTO +
+服务器组装 + 结构化错误反馈 → load_marketing_skill 暴露模型输入契约 → capability pack
+1.1.0 + 离线 UAT 自纠错 + result_unknown 元数据可观测性 → B7 文档对齐 → 关闭审查 Minor →
+导出缓存透传 lineage snapshot），现行 execution gate 锚定 37be5b67…（§1.1/§1.2/§7.3/
+§8.1），待用户授权后重跑。
 下一轮 Web Functional Scenario 2 必须由用户按 §8 单场景模板逐字重新授权，验收口径见 §8.5
 （A/B/C 三档，禁止把单纯文字 completed 判为 PASS）
 Real external calls authorized: NO（任何真实外部调用须按 §8 重新授权）
@@ -49,10 +52,11 @@ Plan C authorized: NO
 | 分支 | `codex/marketing-capability-pack-b0` | `git status --short --branch` |
 | 修复前 production baseline | `61576f7a45c3a93063bdaae5328aefd67933df68`（`codex/marketing-capability-pack-b0` 上最后一个触及代码的提交，失败 round `REAL_B7_20260812T045636Z_b801c490` 的代码即此线；仅为历史事实，不再是 execution gate 参照） | `git log --oneline` |
 | 已审核 L1 repair baseline | **历史事实**：`68deca58f2d2cd8aafb96d9ea47a0a60462142fa`（`codex/real-b7-l1-repair`；含 `f8a4ffa`/`494d20e`/`c22a3a1`/`8a5f264`/`68deca5` 五个已审核修复提交，独立审查 Critical 0 / Important 0）。2026-08-13 起不再作为新 UAT 的执行门禁基线 | `git log --oneline`（修复分支） |
-| audited Direct MCP baseline | **现行执行门禁基线（2026-08-13 固化）**：`c01ec1ba1ea3dc3805184ea3ddb8f4bf0ea14196`（`codex/real-mcp-evidence-bridge-repair`；含 `33d37c0`/`0d87d4e`/`96e8fd9`/`c01ec1b` 四个已审核提交，独立审查 Critical 0 / Important 0，真实 Smoke 功能接受） | `git log --oneline`（本分支） |
-| Direct Artifact Skill 契约修复 | **历史事实（2026-08-13 本分支 `codex/direct-artifact-skill-contract-repair`）**：`284e4c7`（模型输入 DTO + 服务器组装 + 结构化字段级错误反馈）/`45ec465`（load_marketing_skill 暴露 model_input_contract）/`260f5cc`（capability pack 1.1.0 + 离线 UAT 自纠错 + result_unknown 元数据可观测性），均为 `c01ec1ba…` 的线性后代；下一轮 Scenario 2 重跑前必须先 review 本修复 | `git log --oneline`（本分支） |
+| audited Direct MCP baseline（历史） | **历史事实（不再作为新 Scenario 2 的执行门禁，仅保留为历史 Direct MCP Smoke baseline）**：`c01ec1ba1ea3dc3805184ea3ddb8f4bf0ea14196`（`codex/real-mcp-evidence-bridge-repair`；含 `33d37c0`/`0d87d4e`/`96e8fd9`/`c01ec1b` 四个已审核提交，真实 Smoke 功能接受） | `git log --oneline`（历史分支） |
+| audited Direct Artifact Skill baseline（现行） | **现行执行门禁基线（2026-08-14 固化）**：`37be5b67c52764abb0ab38c458197d3827729144`（`codex/direct-artifact-skill-contract-repair`；含 `284e4c7`/`45ec465`/`260f5cc`/`d4ab189`/`f15ff5d`/`37be5b6` 六个已审核线性提交，独立审查 Critical 0 / Important 0 / Minor 0） | `git log --oneline`（本分支） |
+| Direct Artifact Skill 契约修复（现行基线六提交） | `284e4c7`（模型输入 DTO + 服务器组装 + 结构化字段级错误反馈）/`45ec465`（load_marketing_skill 暴露 model_input_contract）/`260f5cc`（capability pack 1.1.0 + 离线 UAT 自纠错 + result_unknown 元数据可观测性）/`d4ab189`（B7 文档对齐 Direct Artifact 契约）/`f15ff5d`（关闭独立审查 4 项 Minor）/`37be5b6`（导出缓存透传 lineage snapshot），均为 `c01ec1ba…` 的线性后代，独立审查 Critical 0 / Important 0 / Minor 0 | `git log --oneline`（本分支） |
 | 授权包第一版文档基线 HEAD | `f7ab159aaea379b37e3885381abe79cc3454bb41`（2026-08-12 第一版文档轮撰写时点的 `git rev-parse HEAD`，docs-only；仅为历史事实陈述，不是执行身份，也不是 execution commit 候选） | `git rev-parse HEAD`（撰写时点） |
-| execution commit（规则，不预写 SHA） | 等于 UAT 契约纠偏提交之后、执行启动门禁通过时点的 `git rev-parse HEAD`（工作树必须干净）；必须是 audited Direct MCP baseline `c01ec1ba…` 的线性后代且包含 `33d37c0`/`0d87d4e`/`96e8fd9`/`c01ec1b` 四个提交；`c01ec1ba…` 至 HEAD 区间允许 Direct Artifact Skill 契约修复（`284e4c7`/`45ec465`/`260f5cc`）与后续 UAT 契约纠偏的 Markdown/changelog 提交；execution HEAD 由下一次授权消息逐字确认；本文档不内嵌任何自指 SHA | 规则见 §1.1/§1.2/§7.3 |
+| execution commit（规则，不预写 SHA） | 等于本次门禁纠偏提交之后、执行启动门禁通过时点的 `git rev-parse HEAD`（工作树必须干净）；必须是 audited Direct Artifact Skill baseline `37be5b67…` 的线性后代且包含 `284e4c7`/`45ec465`/`260f5cc`/`d4ab189`/`f15ff5d`/`37be5b6` 六个已审核提交；`37be5b67…` 至 HEAD 区间只允许本次门禁纠偏的 Markdown/changelog 提交；execution HEAD 由下一次授权消息逐字确认；本文档不内嵌任何自指 SHA | 规则见 §1.1/§1.2/§7.3/§8.1 |
 | 工作树状态 | 干净（无未提交变更） | `git status --short` |
 | `git diff --check` | 通过（无输出） | `git diff --check` |
 | 迁移 head | `0044_agent_run_loop_guard`（2026-08-13 Smoke 实测；`0043_billing_downgrade_guard` 为第一轮 B7 时点的历史事实） | `backend/migrations/versions/` 目录序 + 专用库 `alembic_version` |
@@ -67,7 +71,7 @@ Plan C authorized: NO
 | 代码架构复核结论 | Critical 0 / Important 0 / Minor 1（2026-08-12，针对方案 B 代码） | 用户任务书事实陈述 |
 | 授权包复核结论 | Critical 0 / Important 3 / Minor 1（2026-08-12，针对授权包第一版 `f7ab159`）；修复轮已全部关闭，逐项证据见授权包 §6 | 用户任务书事实陈述 + 授权包 §6 |
 | 离线进程级 UAT | 17 场景 × 串行 3 轮全绿（fake model + fake DataTap MCP，0 外部网络） | `changelog/2026-08-11.md`、`docs/qa/pi-agent-gateway-local-uat.md` |
-| 当前交付状态 | `READY_FOR_WEB_FUNCTIONAL_SCENARIO_2_RERUN_REVIEW`（audited Direct MCP baseline `c01ec1ba…`；Smoke 功能接受、一项协议偏差已记录；Direct Artifact Skill 契约修复 3 提交完成，待独立审查确认后重跑 Scenario 2） | `docs/qa/2026-08-13-direct-model-mcp-smoke-review.md`、`changelog/2026-08-13.md` |
+| 当前交付状态 | `READY_FOR_WEB_FUNCTIONAL_SCENARIO_2_RERUN_REVIEW`（audited Direct Artifact Skill baseline `37be5b67…`；Direct Artifact Skill 契约修复六提交完成、独立审查 Critical 0 / Important 0 / Minor 0；待用户授权后重跑 Scenario 2） | `docs/qa/2026-08-13-direct-model-mcp-smoke-review.md`、`changelog/2026-08-13.md`、`changelog/2026-08-14.md` |
 
 **事实判读：** 本地离线 fake topology 通过 ≠ 真实 B7 通过；`READY_FOR_REAL_B7_UAT_REVIEW`
 ≠ `READY` 被确认，更不等于 B7 PASS 或 production ready。真实 B7 UAT 必须取得用户明确授权
@@ -77,7 +81,7 @@ Plan C authorized: NO
 0 外发 0 扣费），按规则终止并封存；该次授权已消费完毕。修复轮（授权包 §6.6）后的任何真实
 B7 执行都必须取得用户**新的**授权，且 L0 失败仍必须停止、L1 失败不得进入 L2。
 下一轮的实际执行形态是 **Web Functional Scenario 2 单场景授权**（§8 契约 + 授权包 §5.4
-模板，入口 `READY_FOR_WEB_FUNCTIONAL_SCENARIO_2_REAUTHORIZATION`），不再走完整 B7
+模板，入口 `READY_FOR_WEB_FUNCTIONAL_SCENARIO_2_RERUN_REVIEW`），不再走完整 B7
 L0→L1→L2 流程。
 
 ### 0.4 2026-08-13 架构纠偏说明（Direct MCP 结果 + Artifact Skill）
@@ -110,15 +114,17 @@ REAL_B7_<YYYYMMDDTHHMMSSZ>_<SHORT_COMMIT>
   字符串构造：不得创建任何目录、不得连接任何环境（数据库/模型/DataTap/钱包）。
 - `<SHORT_COMMIT>`：execution commit SHA 的前 8 位小写十六进制（与 `git rev-parse
   --short=8` 一致）；模式 A 取用户最终批准值，模式 B 取启动门禁通过时点的 clean HEAD。
-- execution commit = UAT 契约纠偏提交之后、执行启动门禁通过时点 `git rev-parse HEAD` 的值
-  （工作树必须干净），且必须是 audited Direct MCP baseline
-  `c01ec1ba1ea3dc3805184ea3ddb8f4bf0ea14196` 的线性后代、包含
-  `33d37c0`/`0d87d4e`/`96e8fd9`/`c01ec1b` 四个已审核提交；`c01ec1ba…` 至 HEAD 区间只允许
-  本轮 UAT 契约纠偏的 Markdown/changelog 提交；禁止 reset/rebase/amend；execution HEAD 由
-  下一次授权消息逐字确认。本文档与授权模板不预写该值——任何 commit 不得在自身内部硬编码
-  自己的 SHA。历史事实（不再是执行门禁）：`68deca58…`（已审核 L1 repair baseline）、
-  `61576f7…`（修复前 production baseline）、`f7ab159…`（第一版文档基线）均不构成执行身份；
-  不再要求 `61576f7…` 至 HEAD 为 docs-only。
+- execution commit = 本次门禁纠偏提交之后、执行启动门禁通过时点 `git rev-parse HEAD` 的值
+  （工作树必须干净），且必须是 audited Direct Artifact Skill baseline
+  `37be5b67c52764abb0ab38c458197d3827729144` 的线性后代、包含
+  `284e4c7`/`45ec465`/`260f5cc`/`d4ab189`/`f15ff5d`/`37be5b6` 六个已审核提交；
+  `37be5b67…` 至 HEAD 区间只允许本次门禁纠偏的 Markdown/changelog 提交；禁止
+  reset/rebase/amend；execution HEAD 由下一次授权消息逐字确认。本文档与授权模板不预写
+  该值——任何 commit 不得在自身内部硬编码自己的 SHA。历史事实（不再是执行门禁）：
+  `c01ec1ba…`（audited Direct MCP baseline，仅保留为历史 Direct MCP Smoke baseline）、
+  `68deca58…`（已审核 L1 repair baseline）、`61576f7…`（修复前 production baseline）、
+  `f7ab159…`（第一版文档基线）均不构成执行身份；不再要求 `61576f7…` 至 HEAD 为
+  docs-only。
 - round_id 必须由 operator 在授权确认**之前**以完整确定值或完整身份规则提出（模式 A：写入
   阶段 A 授权模板由用户逐字确认；模式 B：以「执行时点 clean HEAD 前 8 位」规则写入一次性
   授权模板由用户确认，执行时展开为确定值）；不存在任何"授权后由 operator 补填"的通道。
@@ -138,8 +144,8 @@ REAL_B7_<YYYYMMDDTHHMMSSZ>_<SHORT_COMMIT>
 | --- | --- | --- |
 | 授权模式 | 模式 A（两阶段）/ 模式 B（一次性完整授权）二选一；2026-08-12 的模式 B 授权已随失败 round `REAL_B7_20260812T045636Z_b801c490` 消费完毕，新执行须重新授权 | NEEDS_USER_APPROVAL |
 | round_id | operator 在授权前提出的完整确定值或身份规则（§1.1）；模式 A：阶段 A 模板逐字确认、阶段 B 绑定同一值；模式 B：一次性模板确认身份规则，启动门禁通过时点展开为确定值 | NEEDS_USER_APPROVAL |
-| commit_sha | UAT 契约纠偏提交之后、启动门禁通过时点 `git rev-parse HEAD`（工作树干净；audited Direct MCP baseline `c01ec1ba…` 的线性后代且含 `33d37c0`/`0d87d4e`/`96e8fd9`/`c01ec1b`；区间仅本轮 Markdown/changelog 纠偏；由下一次授权消息逐字确认）；`68deca58…`/`61576f7…`/`f7ab159…` 均为历史事实，非执行身份 | NEEDS_USER_APPROVAL |
-| branch | `codex/real-mcp-evidence-bridge-repair`（audited Direct MCP baseline 所在分支；新 execution HEAD 必须落在该分支的线性历史内） | VERIFIED |
+| commit_sha | 本次门禁纠偏提交之后、启动门禁通过时点 `git rev-parse HEAD`（工作树干净；audited Direct Artifact Skill baseline `37be5b67…` 的线性后代且含 `284e4c7`/`45ec465`/`260f5cc`/`d4ab189`/`f15ff5d`/`37be5b6` 六个已审核提交；区间仅本次门禁纠偏的 Markdown/changelog 提交；由下一次授权消息逐字确认）；`c01ec1ba…`/`68deca58…`/`61576f7…`/`f7ab159…` 均为历史事实，非执行身份 | NEEDS_USER_APPROVAL |
+| branch | `codex/direct-artifact-skill-contract-repair`（audited Direct Artifact Skill baseline 所在分支；新 execution HEAD 必须落在该分支的线性历史内） | VERIFIED |
 | migration_head | `0044_agent_run_loop_guard`（`0043_billing_downgrade_guard` 为第一轮 B7 时点的历史事实） | VERIFIED |
 | Pi SDK 版本 | `pi-coding-agent 0.79.10` / `pi-ai 0.74.2` / `pi-tui 0.74.2` | VERIFIED |
 | adapter 版本 | `pi-mcp-adapter 2.20.1` | VERIFIED |
@@ -714,8 +720,9 @@ Evidence；旧名称中的 "Evidence" 已删除）。
    平台消息 ID/任务 ID、收到时刻（UTC）与授权文本全文 SHA-256，round 开启时写入
    `authorization.md`（L0-10），不得修改用户原文。
 3. 启动门禁（fail-closed，任一不符即 B7_BLOCKED）：工作树干净、HEAD 为 audited Direct
-   MCP baseline `c01ec1ba…` 的线性后代且包含 `33d37c0`/`0d87d4e`/`96e8fd9`/`c01ec1b`
-   四个已审核提交、`c01ec1ba…` 至 HEAD 区间仅本轮 UAT 契约纠偏的 Markdown/changelog
+   Artifact Skill baseline `37be5b67…` 的线性后代且包含
+   `284e4c7`/`45ec465`/`260f5cc`/`d4ab189`/`f15ff5d`/`37be5b6` 六个已审核提交、
+   `37be5b67…` 至 HEAD 区间仅本次门禁纠偏的 Markdown/changelog
    提交、§2.0 数据库身份逐项核验（含专用账号访问 `kol_insight` 被 MySQL 1142 拒绝）与
    新 round 数据库状态门禁（§2.0：before snapshot 只读记录、新 round_id 对应
    tenant/user/gateway/Run 为 0、历史 retained 行只读不得复用或修改）、Keychain 引用可读取
@@ -746,18 +753,21 @@ Evidence；旧名称中的 "Evidence" 已删除）。
 
 ## 8. Web Functional Scenario 2 单场景授权契约（2026-08-13 新增）
 
-状态入口：`READY_FOR_WEB_FUNCTIONAL_SCENARIO_2_REAUTHORIZATION`（audited Direct MCP
-baseline `c01ec1ba…`；Smoke 功能接受、一项协议偏差已记录）。独立单场景授权模板见
+状态入口：`READY_FOR_WEB_FUNCTIONAL_SCENARIO_2_RERUN_REVIEW`（audited Direct Artifact
+Skill baseline `37be5b67…`；Direct Artifact Skill 契约修复六提交完成、独立审查
+Critical 0 / Important 0 / Minor 0）。独立单场景授权模板见
 授权包 §5.4；本节定义契约内容。
 
 ### 8.1 执行身份门禁
 
-- execution HEAD 必须是 `c01ec1ba1ea3dc3805184ea3ddb8f4bf0ea14196` 的线性后代；
-- 必须包含 `33d37c0`/`0d87d4e`/`96e8fd9`/`c01ec1b` 四个已审核提交；
-- `c01ec1ba..execution HEAD` 区间只允许本轮 UAT 契约纠偏的 Markdown/changelog 提交；
-- 工作树必须干净；禁止 reset/rebase/amend；execution HEAD 由下一次授权消息逐字确认。
-- 旧基线（`68deca58…`/`61576f7…`/`f7ab159…`）与旧失败 round 只出现在「历史事实」章节，
-  不再作为新 UAT 的执行门禁。
+- execution HEAD 必须是 `37be5b67c52764abb0ab38c458197d3827729144` 的线性后代；
+- 必须包含 `284e4c7`/`45ec465`/`260f5cc`/`d4ab189`/`f15ff5d`/`37be5b6` 六个已审核提交；
+- `37be5b67..execution HEAD` 区间只允许本次门禁纠偏的 Markdown/changelog 提交；
+- 工作树必须干净；禁止 reset/rebase/amend；下一条真实 UAT 授权消息必须逐字绑定
+  纠偏提交后的完整 execution HEAD；
+- branch 必须是 `codex/direct-artifact-skill-contract-repair`。
+- 旧基线（`c01ec1ba…` 仅保留为历史 Direct MCP Smoke baseline、`68deca58…`/`61576f7…`/
+  `f7ab159…`）与旧失败 round 只出现在「历史事实」章节，不再作为新 UAT 的执行门禁。
 
 ### 8.2 输入与自主边界
 

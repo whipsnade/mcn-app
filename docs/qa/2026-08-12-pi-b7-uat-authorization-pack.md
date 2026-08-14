@@ -9,15 +9,17 @@
 Status: READY_FOR_WEB_FUNCTIONAL_SCENARIO_2_RERUN_REVIEW
 （架构转向（2026-08-13）：Evidence Bridge / mcp_result_v1 / required artifact 相关现行规则
 已被 `2026-08-13-pi-direct-mcp-result-artifact-skill-design.md` 覆盖，本包 §2.3/§2.4/§3
-已按「验收证据 ≠ 数据库 Evidence」语义纠偏；新 execution gate 锚定 audited Direct MCP
-baseline c01ec1ba…（§5.3/§5.4）。历史事实保留：round REAL_B7_20260812T045636Z_b801c490
+已按「验收证据 ≠ 数据库 Evidence」语义纠偏；新 execution gate 锚定 audited Direct Artifact
+Skill baseline 37be5b6…（§5.4）。历史事实保留：round REAL_B7_20260812T045636Z_b801c490
 已执行并封存——L0 通过；L1 FAIL——mcp_tool_identity_invalid，0 外发 0 扣费，账务恒等式
 成立；按「L1 失败不得进入 L2」规则终止。修复轮（§6.6）已收口。真实 Direct Model + MCP
 Smoke（round DIRECT_MODEL_MCP_SMOKE_20260813T103101Z_c01ec1ba）已执行：
 DIRECT_MODEL_MCP_SMOKE_FUNCTIONALLY_ACCEPTED_WITH_PROTOCOL_DEVIATION（偏差：直连对照
 调用 2 次超出授权上限 1 次，见 docs/qa/2026-08-13-direct-model-mcp-smoke-review.md）。
-Direct Artifact Skill 契约修复已完成（3 个提交 284e4c7/45ec465/260f5cc，见
-changelog/2026-08-13.md「提交 2/3/4」段），待独立审查确认后按 §5.4 单场景模板重跑 Scenario 2）
+Direct Artifact Skill 契约修复已完成并独立审查通过（Critical 0 / Important 0 / Minor 0；
+六个已审核线性提交 284e4c7/45ec465/260f5cc/d4ab189/f15ff5d/37be5b6，见
+changelog/2026-08-13.md 与 changelog/2026-08-14.md），现行 execution gate 锚定
+37be5b67…（§5.4），待用户授权后按 §5.4 单场景模板重跑 Scenario 2）
 Real external calls authorized: NO（任何真实外部调用须按 §5.4 重新授权）
 Production cutover authorized: NO
 Historical Task 9 rerun authorized: NO
@@ -475,7 +477,7 @@ READY 状态均不构成授权之外的执行许可。
 ### 5.4 单场景授权模板（WEB_FUNCTIONAL_SCENARIO_2，2026-08-13 新增）
 
 > 独立的单场景授权模板：只授权一次 Web Functional Scenario 2（纠偏后 L2-01 品牌报告
-> 蓝本）。状态入口 `READY_FOR_WEB_FUNCTIONAL_SCENARIO_2_REAUTHORIZATION`；执行契约见
+> 蓝本）。状态入口 `READY_FOR_WEB_FUNCTIONAL_SCENARIO_2_RERUN_REVIEW`；执行契约见
 > 授权计划 §8。
 
 ```text
@@ -485,12 +487,13 @@ WEB FUNCTIONAL SCENARIO 2 单场景授权确认
 
 - authorization scope: WEB_FUNCTIONAL_SCENARIO_2（单场景，品牌报告蓝本）
 - round_id 身份规则: DIRECT_MCP_WEB_S2_<启动门禁通过时点 UTC 秒级时间戳>_<execution commit 前 8 位>
-- execution commit 身份规则: 启动门禁通过时点、UAT 契约纠偏后的 clean HEAD；必须是
-  c01ec1ba1ea3dc3805184ea3ddb8f4bf0ea14196（audited Direct MCP baseline）的线性后代，
-  且包含 33d37c0 / 0d87d4e / 96e8fd9 / c01ec1b 四个已审核提交；c01ec1ba 至 HEAD 区间
-  只允许本轮 UAT 契约纠偏的 Markdown/changelog 提交；工作树干净；禁止
-  checkout/reset/rebase/amend；execution HEAD 由本授权消息逐字确认
-- branch: codex/real-mcp-evidence-bridge-repair
+- execution commit 身份规则: 启动门禁通过时点、门禁纠偏后的 clean HEAD；必须是
+  37be5b67c52764abb0ab38c458197d3827729144（audited Direct Artifact Skill baseline）
+  的线性后代，且包含 284e4c7 / 45ec465 / 260f5cc / d4ab189 / f15ff5d / 37be5b6
+  六个已审核提交；37be5b67 至 HEAD 区间只允许本次门禁纠偏的 Markdown/changelog 提交；
+  工作树干净；禁止 checkout/reset/rebase/amend；execution HEAD 由本授权消息逐字绑定
+  纠偏提交后的完整 SHA
+- branch: codex/direct-artifact-skill-contract-repair
 - migration head: 0044_agent_run_loop_guard
 - 隔离环境: kol_insight_b7_uat（kol_b7_uat@localhost）；禁止 kol_insight /
   kol_insight_test / 任何开发、预生产、生产、正式客户数据库；禁止 DROP/CREATE/重建、

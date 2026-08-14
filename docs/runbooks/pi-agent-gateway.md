@@ -2,18 +2,25 @@
 
 本手册覆盖方案 B 的本地/预生产操作边界。
 
-> 状态更新（2026-08-13，Direct MCP 架构）：新 Pi production path 不产生数据库 `Evidence`
-> 业务实体、不使用 `mcp_result_v1` 分类、无 required artifact 门禁；标准 MCP Tool Result
-> 由 adapter 原样交给模型，accounting finalize 只传 metadata；Builder 统一为
-> `build_artifact_draft`（Snapshot allowlist + typed model input）。真实 Direct Model + MCP
-> Smoke 已执行：`DIRECT_MODEL_MCP_SMOKE_FUNCTIONALLY_ACCEPTED_WITH_PROTOCOL_DEVIATION`
+> 状态更新（2026-08-14，Direct Artifact Skill 门禁纠偏）：新 Pi production path 不产生
+> 数据库 `Evidence` 业务实体、不使用 `mcp_result_v1` 分类、无 required artifact 门禁；
+> 标准 MCP Tool Result 由 adapter 原样交给模型，accounting finalize 只传 metadata；Builder
+> 统一为 `build_artifact_draft`（Snapshot allowlist + typed model input）。真实 Direct Model
+> + MCP Smoke 已执行：`DIRECT_MODEL_MCP_SMOKE_FUNCTIONALLY_ACCEPTED_WITH_PROTOCOL_DEVIATION`
 > （直连对照调用 2 次超出授权上限 1 次，见
-> `docs/qa/2026-08-13-direct-model-mcp-smoke-review.md`）。audited Direct MCP baseline：
-> `c01ec1ba1ea3dc3805184ea3ddb8f4bf0ea14196`。
-> Direct Artifact Skill 契约修复已完成（3 个提交 `284e4c7`/`45ec465`/`260f5cc`：
-> 模型输入 DTO + 服务器组装 + 结构化错误反馈 → load_marketing_skill 暴露模型输入契约 →
-> capability pack 1.1.0 + 离线 UAT 自纠错 + result_unknown 元数据可观测性）。
-> 当前状态：`READY_FOR_WEB_FUNCTIONAL_SCENARIO_2_RERUN_REVIEW`（待独立审查确认后重跑；
+> `docs/qa/2026-08-13-direct-model-mcp-smoke-review.md`）。audited Direct MCP baseline
+> `c01ec1ba1ea3dc3805184ea3ddb8f4bf0ea14196` 仅保留为历史 Direct MCP Smoke baseline，
+> 不再是新 Scenario 2 的 execution gate。
+> Direct Artifact Skill 契约修复已完成并独立审查通过（Critical 0 / Important 0 / Minor 0；
+> 六个已审核线性提交 `284e4c7`/`45ec465`/`260f5cc`/`d4ab189`/`f15ff5d`/`37be5b6`：模型输入
+> DTO + 服务器组装 + 结构化错误反馈 → load_marketing_skill 暴露模型输入契约 →
+> capability pack 1.1.0 + 离线 UAT 自纠错 + result_unknown 元数据可观测性 → B7 文档对齐 →
+> 关闭审查 Minor → 导出缓存透传 lineage snapshot）。现行 audited Direct Artifact Skill
+> baseline（执行门禁）：`37be5b67c52764abb0ab38c458197d3827729144`（branch
+> `codex/direct-artifact-skill-contract-repair`；execution HEAD 必须是其线性后代且包含上述
+> 六个提交，`37be5b67..execution HEAD` 区间只允许门禁纠偏的 Markdown/changelog 提交，
+> 下一条真实 UAT 授权消息必须逐字绑定纠偏提交后的完整 execution HEAD）。
+> 当前状态：`READY_FOR_WEB_FUNCTIONAL_SCENARIO_2_RERUN_REVIEW`（待用户授权后重跑；
 > 单场景授权模板见授权包 §5.4，验收口径 A/B/C 三档）。
 > 历史状态（2026-08-09 写入的 `READY_FOR_REAL_B7_UAT` 已被架构审核否决；2026-08-12 的
 > `READY_FOR_REAL_B7_UAT_REVIEW`/`REAUTHORIZATION` 与失败 round
