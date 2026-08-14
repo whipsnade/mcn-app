@@ -95,6 +95,10 @@ class FakeCompletions:
         return outcome
 
 
+async def _no_backoff(_: float) -> None:
+    return None
+
+
 class _StreamUnsupportedError(Exception):
     status_code = 400
     body = {"error": {"message": "stream is not supported", "param": "stream"}}
@@ -255,6 +259,46 @@ async def test_complete_json_falls_back_when_stream_is_not_supported() -> None:
     assert sink.terminal == ("completed", 1)
 
 
+def test_map_error_treats_provider_generation_abort_as_retryable() -> None:
+    """供应商 response_format 生成中途自我中止（glm "became abnormal"）按可重试分类。"""
+    import httpx
+    from openai import APIError
+
+    adapter = TencentPlanAdapter(
+        client=FakeCompletions([]), log_writer=_CaptureWriter(), stream_support_cache={}
+    )
+    exc = APIError(
+        "<400> InternalError.Algo.InvalidParameter: Model output became abnormal while "
+        "generating a JSON response for response_format. The generation was aborted "
+        "because the partial output may be incomplete or invalid JSON. Please retry "
+        "the request or adjust your prompt or JSON schema.",
+        request=httpx.Request("POST", "https://example.com/v1/chat/completions"),
+        body=None,
+    )
+
+    mapped = adapter._map_error(exc)
+
+    assert mapped.code == "MODEL_UPSTREAM_ERROR"
+    assert mapped.retryable is True
+
+
+def test_map_error_treats_raw_httpx_stream_errors_as_retryable_network() -> None:
+    """流式迭代中泄漏的原始 httpx 传输错误按可重试网络错误分类。"""
+    import httpx
+
+    adapter = TencentPlanAdapter(
+        client=FakeCompletions([]), log_writer=_CaptureWriter(), stream_support_cache={}
+    )
+    exc = httpx.RemoteProtocolError(
+        "peer closed connection without sending complete message body"
+    )
+
+    mapped = adapter._map_error(exc)
+
+    assert mapped.code == "MODEL_NETWORK_ERROR"
+    assert mapped.retryable is True
+
+
 @pytest.mark.asyncio
 async def test_complete_json_does_not_downgrade_for_unsupported_upstream_model() -> None:
     sink = CaptureThinkingSink()
@@ -302,18 +346,64 @@ async def test_complete_json_fallback_publishes_think_before_repairing_invalid_j
 
 
 @pytest.mark.asyncio
-async def test_complete_json_stream_interrupt_after_visible_output_does_not_replay() -> None:
+async def test_complete_json_retries_provider_generation_abort_mid_stream() -> None:
+    """供应商 response_format 生成中途自我中止（已收到部分输出）也可安全重试。"""
+    import httpx
+    from openai import APIError
+
+    async def abort_stream() -> Any:
+        yield SimpleNamespace(
+            choices=[SimpleNamespace(delta=SimpleNamespace(content='{"value": 4'), finish_reason=None)],
+            usage=None,
+            _request_id="req-abort",
+        )
+        raise APIError(
+            "<400> InternalError.Algo.InvalidParameter: Model output became abnormal "
+            "while generating a JSON response for response_format. Please retry.",
+            request=httpx.Request("POST", "https://example.com/v1/chat/completions"),
+            body=None,
+        )
+
     sink = CaptureThinkingSink()
     client = FakeCompletions(
-        [stream_chunks(content_chunks=["<think>分析"], reasoning_chunks=[None], finished=False)]
+        [
+            abort_stream(),
+            stream_chunks(
+                content_chunks=['{"value": 4}'], reasoning_chunks=[None], finished=True
+            ),
+        ]
     )
     adapter = TencentPlanAdapter(client=client, log_writer=_CaptureWriter(), stream_support_cache={})
+
+    result = await adapter.complete_json(_request(thinking_sink=sink))
+
+    assert result.value.value == 4
+    assert len(client.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_complete_json_stream_interrupt_retries_within_budget_then_fails() -> None:
+    """流结束无 finish_reason：预算内整体重试，预算耗尽才明确失败。"""
+    sink = CaptureThinkingSink()
+    client = FakeCompletions(
+        [
+            stream_chunks(content_chunks=["<think>分析"], reasoning_chunks=[None], finished=False)
+            for _ in range(3)
+        ]
+    )
+    adapter = TencentPlanAdapter(
+        client=client,
+        log_writer=_CaptureWriter(),
+        stream_support_cache={},
+        sleep=_no_backoff,
+    )
 
     with pytest.raises(Exception, match="MODEL_STREAM_INTERRUPTED"):
         await adapter.complete_json(_request(thinking_sink=sink))
 
-    assert len(client.calls) == 1
-    assert sink.deltas == [(1, "分析")]
+    assert len(client.calls) == 3
+    # 整体重试会重放该次尝试的部分思考 delta（与生成中止重试一致的取舍）。
+    assert sink.deltas == [(1, "分析"), (1, "分析"), (1, "分析")]
     assert sink.terminal == ("failed", 1)
 
 

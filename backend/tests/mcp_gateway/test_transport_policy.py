@@ -15,6 +15,7 @@ from app.mcp_gateway.contracts import DataTapService
 from app.mcp_gateway.datatap import DataTapTransport
 from app.mcp_gateway.service import McpCallService, PreparedMcpInvocation
 from app.mcp_gateway.transport import (
+    McpCircuitOpen,
     McpConnectionTimeout,
     McpGatewayTimeout,
     McpProtocolError,
@@ -22,6 +23,7 @@ from app.mcp_gateway.transport import (
     McpUpstreamHttpError,
     PossiblySentTimeout,
     ServiceNotAllowedError,
+    contains_transport_artifact_marker,
 )
 
 
@@ -51,6 +53,11 @@ class FakeProtocolSession:
                 )
             ]
         )
+
+
+class InitializeFailureSession(FakeProtocolSession):
+    async def initialize(self) -> None:
+        raise RuntimeError("offline initialization failure")
 
 
 class ReadTimeoutSession(FakeProtocolSession):
@@ -148,6 +155,13 @@ async def test_raw_allowlisted_string_is_rejected_before_network() -> None:
         await transport.list_tools(DataTapService.AKTOOLS.value)  # type: ignore[arg-type]
 
     opened.assert_not_awaited()
+
+
+@pytest.mark.parametrize("key", ["path", "filePath", "file_path", "tempPath", "temp_path"])
+def test_temporary_transport_paths_are_not_evidence_payloads(key: str) -> None:
+    assert contains_transport_artifact_marker({key: "/private/tmp/datatap-result.json"})
+    assert contains_transport_artifact_marker({"nested": [{key: "/var/folders/x/result.json"}]})
+    assert not contains_transport_artifact_marker({key: "https://example.invalid/result.json"})
 
 
 async def test_all_five_services_use_fixed_https_endpoint_and_bearer_auth() -> None:
@@ -273,6 +287,24 @@ async def test_connect_timeout_is_classified_before_request_is_sent() -> None:
         await transport.list_tools(DataTapService.BILIBILI)
 
 
+async def test_call_initialize_failure_is_classified_as_not_sent() -> None:
+    """MCP session initialization cannot be mistaken for an unknown dispatched call."""
+    @asynccontextmanager
+    async def opener(_url: str, **_kwargs):
+        yield DataTapService.BILIBILI, object(), lambda: "session-init-failure"
+
+    transport = DataTapTransport(
+        token=SecretStr("unit-test-token"),
+        session_opener=opener,
+        session_factory=InitializeFailureSession,
+    )
+
+    from app.mcp_gateway.transport import McpNotSentError
+
+    with pytest.raises(McpNotSentError):
+        await transport.call_tool(DataTapService.BILIBILI, "search", {"keyword": "美妆"})
+
+
 async def test_gateway_504_is_classified_as_upstream_timeout() -> None:
     def opener(url: str, **_kwargs):
         service = next(item for item in DataTapService if item.value in url)
@@ -288,7 +320,8 @@ async def test_gateway_504_is_classified_as_upstream_timeout() -> None:
         await transport.call_tool(DataTapService.BILIBILI, "search", {"keyword": "美妆"})
 
 
-async def test_transient_upstream_error_is_retried_once_and_succeeds() -> None:
+async def test_transient_upstream_error_is_retried_once_under_legacy_policy() -> None:
+    """显式 opt-in legacy ``retry_policy="transient_once"``：瞬时 5xx 自动重试一次。"""
     @asynccontextmanager
     async def opener(url: str, **_kwargs):
         service = next(item for item in DataTapService if item.value in url)
@@ -299,6 +332,7 @@ async def test_transient_upstream_error_is_retried_once_and_succeeds() -> None:
         token=SecretStr("unit-test-token"),
         session_opener=opener,
         session_factory=FlakyUpstreamSession,
+        retry_policy="transient_once",
     )
 
     result = await transport.call_tool(DataTapService.BILIBILI, "search", {"keyword": "美妆"})
@@ -308,7 +342,9 @@ async def test_transient_upstream_error_is_retried_once_and_succeeds() -> None:
     assert result.structured_content == {"result": "{}"}
 
 
-async def test_transient_upstream_error_gives_up_after_one_retry() -> None:
+async def test_possibly_sent_5xx_is_never_retried_by_default() -> None:
+    """默认 ``retry_policy="never"``（Agent 路径契约，设计 §5.3/§11.1）：
+    5xx 属"可能已发送"，绝不自动重放，一次失败即抛出。"""
     @asynccontextmanager
     async def opener(url: str, **_kwargs):
         service = next(item for item in DataTapService if item.value in url)
@@ -324,7 +360,50 @@ async def test_transient_upstream_error_gives_up_after_one_retry() -> None:
     with pytest.raises(McpUpstreamHttpError):
         await transport.call_tool(DataTapService.BILIBILI, "search", {"keyword": "美妆"})
 
-    assert AlwaysUpstreamErrorSession.call_count == 2
+    assert AlwaysUpstreamErrorSession.call_count == 1
+
+
+async def test_gateway_504_is_never_retried_by_default() -> None:
+    """默认策略下 504 同样只外发一次（408/504 属"可能已发送"）。"""
+    opens = 0
+
+    def opener(url: str, **_kwargs):
+        nonlocal opens
+        opens += 1
+        service = next(item for item in DataTapService if item.value in url)
+        return GatewayTimeoutOpener(service)
+
+    transport = DataTapTransport(
+        token=SecretStr("unit-test-token"),
+        session_opener=opener,
+        session_factory=FakeProtocolSession,
+    )
+
+    with pytest.raises(McpGatewayTimeout):
+        await transport.call_tool(DataTapService.BILIBILI, "search", {"keyword": "美妆"})
+
+    assert opens == 1
+
+
+async def test_possibly_sent_timeout_is_never_retried_even_under_legacy_policy() -> None:
+    """即使 opt-in legacy 策略，PossiblySentTimeout 也不自动重试（结果未确认）。"""
+    @asynccontextmanager
+    async def opener(url: str, **_kwargs):
+        service = next(item for item in DataTapService if item.value in url)
+        yield service, object(), lambda: "session-1"
+
+    SdkReadTimeoutSession.call_count = 0
+    transport = DataTapTransport(
+        token=SecretStr("unit-test-token"),
+        session_opener=opener,
+        session_factory=SdkReadTimeoutSession,
+        retry_policy="transient_once",
+    )
+
+    with pytest.raises(PossiblySentTimeout):
+        await transport.call_tool(DataTapService.BILIBILI, "search", {"keyword": "美妆"})
+
+    assert SdkReadTimeoutSession.call_count == 1
 
 
 @pytest.mark.parametrize(
@@ -384,3 +463,46 @@ def test_protocol_session_digest_is_scoped_and_contains_no_raw_identifiers() -> 
     assert "gateway-session-secret" not in digest
     assert "credential-v7" not in digest
     assert "unit-test-token" not in digest
+
+
+async def test_circuit_scope_none_never_opens_service_circuit() -> None:
+    """Agent Transport 使用 circuit_scope="none"：不维护服务级熔断，队列照常。"""
+    transport = DataTapTransport(
+        token=SecretStr("unit-test-token"),
+        circuit_scope="none",
+        failure_threshold=3,
+    )
+    state = transport._states[DataTapService.BILIBILI]
+    for _ in range(5):  # 连续失败远超 threshold
+        epoch = await transport._enter_circuit(state)
+        await transport._record_failure(state, epoch)
+    # scope=none：熔断器永不打开，_enter_circuit 直接放行
+    epoch = await transport._enter_circuit(state)
+    assert transport._states[DataTapService.BILIBILI].opened_at is None
+    assert epoch == transport._states[DataTapService.BILIBILI].epoch
+
+
+async def test_circuit_scope_service_still_opens_after_threshold() -> None:
+    """legacy 默认 circuit_scope="service"：连续失败后服务级熔断打开。"""
+    transport = DataTapTransport(
+        token=SecretStr("unit-test-token"),
+        circuit_scope="service",
+        failure_threshold=3,
+    )
+    state = transport._states[DataTapService.BILIBILI]
+    for _ in range(3):
+        epoch = await transport._enter_circuit(state)
+        await transport._record_failure(state, epoch)
+    with pytest.raises(McpCircuitOpen):
+        await transport._enter_circuit(state)
+    assert transport._states[DataTapService.BILIBILI].opened_at is not None
+
+
+async def test_circuit_scope_none_still_serializes_by_queue() -> None:
+    """scope=none 只是关闭服务级熔断，队列并发限制与超时仍然生效。"""
+    transport = DataTapTransport(
+        token=SecretStr("unit-test-token"),
+        circuit_scope="none",
+        max_concurrency_per_service=1,
+    )
+    assert transport._states[DataTapService.BILIBILI].semaphore._value == 1

@@ -52,6 +52,22 @@ async def authed_client_factory(
         token = create_access_token(user_id=user.id, session_id=login_session.id, role=role)
         test_client = AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
         test_client.headers["Authorization"] = f"Bearer {token}"
+        # 管理写操作已强制 Idempotency-Key：与前端 adminGateway.ts 的真实行为
+        # 一致，为未显式提供的写请求自动补键；显式提供的键原样透传（幂等
+        # 回放/409 用例依赖固定键）。
+        original_request = test_client.request
+
+        async def with_idempotency(method: str, url: str, **kwargs: Any):
+            if method.upper() in {"POST", "PUT", "PATCH", "DELETE"}:
+                headers = kwargs.get("headers") or {}
+                # 负向测试显式 opt-out：剥离标记头且不注入幂等键。
+                raw_write = headers.pop("X-Test-Raw-Write", None) is not None
+                if not raw_write:
+                    headers.setdefault("Idempotency-Key", str(uuid4()))
+                kwargs["headers"] = headers
+            return await original_request(method, url, **kwargs)
+
+        test_client.request = with_idempotency  # type: ignore[method-assign]
         clients.append(test_client)
         return test_client, user
 

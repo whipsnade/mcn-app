@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# 方案 A 唯一真实入口：加载主分支真实模型/DataTap 配置，但只写 POC 数据库。
+set -euo pipefail
+
+BACKEND_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ROOT_DIR="$(cd "${BACKEND_DIR}/.." && pwd)"
+# 默认取 Git 主工作树，真实配置只能从该处的未跟踪 .env 读取；不会复制到 POC
+# 工作树或写入输出。也允许调用者显式指定主工作树路径。
+MAIN_ROOT="${PI_RUNTIME_POC_MAIN_ROOT:-$(git -C "${ROOT_DIR}" worktree list --porcelain | sed -n '1s/^worktree //p')}"
+[[ -n "${MAIN_ROOT}" && -d "${MAIN_ROOT}" ]] || exit 2
+# 接入链接解析出的 token/endpoint mapping 只能在本次进程内存在；主工作树的 .env
+# 仅作为常规运行时配置回退，不能覆盖调用方刚解析出的 DataTap 连接凭证。
+CONNECT_DATATAP_TOKEN="${DATATAP_MCP_TOKEN:-}"
+CONNECT_DATATAP_ENDPOINTS_JSON="${DATATAP_MCP_ENDPOINTS_JSON:-}"
+
+for env_file in "${MAIN_ROOT}/.env" "${MAIN_ROOT}/backend/.env"; do
+  if [[ -f "${env_file}" ]]; then
+    set -a
+    # shellcheck disable=SC1090
+    source "${env_file}"
+    set +a
+  fi
+done
+
+if [[ -n "${CONNECT_DATATAP_TOKEN}" ]]; then
+  export DATATAP_MCP_TOKEN="${CONNECT_DATATAP_TOKEN}"
+fi
+if [[ -n "${CONNECT_DATATAP_ENDPOINTS_JSON}" ]]; then
+  export DATATAP_MCP_ENDPOINTS_JSON="${CONNECT_DATATAP_ENDPOINTS_JSON}"
+fi
+source "${BACKEND_DIR}/scripts/pi_runtime_poc_env.sh"
+pi_poc_normalize_datatap_mapping
+
+export APP_ENV=test
+export AUTH_MODE=mock
+export MYSQL_DATABASE=kol_insight_pi_poc
+export PI_RUNTIME_POC_ENABLED=true
+export PI_RUNTIME_POC_INTERNAL_SECRET="${PI_RUNTIME_POC_INTERNAL_SECRET:-$(openssl rand -hex 32)}"
+export RUN_REAL_SERVICES=1
+
+DIAGNOSTIC_DIR="${ROOT_DIR}/outputs/pi-runtime-poc/diagnostics"
+mkdir -p "${DIAGNOSTIC_DIR}"
+chmod 700 "${DIAGNOSTIC_DIR}"
+export PI_RUNTIME_POC_DIAGNOSTIC_LOG="${DIAGNOSTIC_DIR}/server-$$.log"
+touch "${PI_RUNTIME_POC_DIAGNOSTIC_LOG}"
+chmod 600 "${PI_RUNTIME_POC_DIAGNOSTIC_LOG}"
+
+[[ "${APP_ENV}" == "test" ]] || exit 2
+[[ "${MYSQL_DATABASE}" == "kol_insight_pi_poc" ]] || exit 2
+[[ "${PI_RUNTIME_POC_ENABLED}" == "true" ]] || exit 2
+[[ -n "${DATATAP_MCP_URLS:-}" ]] || exit 2
+[[ -n "${DATATAP_INSIGHT_CUBE_MCP_URL:-}" ]] || exit 2
+[[ -n "${DATATAP_SOCIAL_GROW_MCP_URL:-}" ]] || exit 2
+[[ -n "${DATATAP_SOCIAL_GROW_CONTENT_MCP_URL:-}" ]] || exit 2
+[[ -n "${DATATAP_AKTOOLS_MCP_URL:-}" ]] || exit 2
+[[ -n "${TENCENT_PLAN_API_KEY:-}" ]] || exit 2
+
+cd "${BACKEND_DIR}"
+"${BACKEND_DIR}/.venv/bin/alembic" upgrade head
+
+# Pi 的受控 Evidence/内部工具回调必须落到同一 POC 服务。已有 8000 服务来源不明，
+# 为防止误连主库/非 POC 配置直接拒绝，不复用。
+if curl -fsS --max-time 1 http://127.0.0.1:8000/healthz >/dev/null 2>&1; then
+  exit 2
+fi
+# 只能启动 Pi POC 内部回调服务，禁止启动主应用的后台 Current Runtime 领取循环。
+"${BACKEND_DIR}/.venv/bin/uvicorn" app.pi_runtime_poc.server:app --host 127.0.0.1 --port 8000 \
+  --timeout-graceful-shutdown 5 --no-access-log --log-level critical \
+  >/dev/null 2>/dev/null &
+SERVER_PID=$!
+cleanup() {
+  kill "${SERVER_PID}" >/dev/null 2>&1 || true
+  printf 'pi-poc diagnostic log: %s\n' "${PI_RUNTIME_POC_DIAGNOSTIC_LOG}" >&2
+}
+trap cleanup EXIT
+# 中央模型注册会让冷启动超过旧的 30 秒窗口；未 ready 前不得创建真实 round。
+for _ in $(seq 1 60); do
+  if curl -fsS --max-time 1 http://127.0.0.1:8000/healthz >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
+curl -fsS --max-time 1 http://127.0.0.1:8000/healthz >/dev/null
+if [[ "$#" -eq 0 ]]; then
+  set -- --case all --runtime pi
+fi
+"${BACKEND_DIR}/.venv/bin/python" scripts/run_pi_runtime_poc.py "$@"

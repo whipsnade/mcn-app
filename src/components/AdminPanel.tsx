@@ -17,6 +17,13 @@ import {
   listAdminUsers,
   updateAdminUser,
 } from '../api/admin';
+import AdminNavigation, { type AdminModule } from './admin/AdminNavigation';
+import TenantAdmin from './admin/TenantAdmin';
+import LicenseAdmin from './admin/LicenseAdmin';
+import UsageAdmin from './admin/UsageAdmin';
+import PiRuntimeAdmin from './admin/PiRuntimeAdmin';
+import RuntimeConfigAdmin from './admin/RuntimeConfigAdmin';
+import RunDiagnostics from './admin/RunDiagnostics';
 
 interface AdminPanelProps {
   isOpen: boolean;
@@ -116,6 +123,7 @@ export default function AdminPanel({
   currentUserId,
   currentUserNickname
 }: AdminPanelProps) {
+  const [activeModule, setActiveModule] = useState<AdminModule>('users');
   const [users, setUsers] = useState<ApiAdminUser[]>([]);
   const [isListLoading, setIsListLoading] = useState(false);
   const [listError, setListError] = useState('');
@@ -415,9 +423,20 @@ export default function AdminPanel({
 
         {/* Content Area */}
         <div className="flex-1 overflow-y-auto flex flex-col md:flex-row min-h-0">
+          <AdminNavigation active={activeModule} onChange={setActiveModule} />
+          {activeModule !== 'users' && (
+            <div className="min-w-0 flex-1 overflow-y-auto">
+              {activeModule === 'tenants' && <TenantAdmin />}
+              {activeModule === 'licenses' && <LicenseAdmin />}
+              {activeModule === 'usage' && <UsageAdmin />}
+              {activeModule === 'pi-runtime' && <PiRuntimeAdmin />}
+              {activeModule === 'runtime-configs' && <RuntimeConfigAdmin />}
+              {activeModule === 'diagnostics' && <RunDiagnostics />}
+            </div>
+          )}
 
           {/* Left panel: List of accounts */}
-          <div className="flex-1 p-6 border-r border-slate-100 flex flex-col min-h-0 space-y-4">
+          <div className={`${activeModule === 'users' ? '' : 'hidden'} flex-1 p-6 border-r border-slate-100 flex flex-col min-h-0 space-y-4`}>
 
             {/* Filter & Add Actions */}
             <div className="flex flex-col sm:flex-row gap-2 justify-between">
@@ -681,7 +700,7 @@ export default function AdminPanel({
           </div>
 
           {/* Right panel: Editor / Creator */}
-          {(isAdding || editingAccount) ? (
+          {(activeModule === 'users' && (isAdding || editingAccount)) ? (
             <div className="w-full md:w-80 p-6 bg-slate-50/50 flex flex-col shrink-0 border-t md:border-t-0 md:border-l border-slate-100 animate-in slide-in-from-right-10 duration-200">
               <div className="flex items-center justify-between pb-3 border-b border-slate-100 mb-4">
                 <h3 className="text-xs font-bold text-slate-700 flex items-center gap-1.5">
@@ -1130,7 +1149,7 @@ export default function AdminPanel({
                 </>
               )}
             </div>
-          ) : (
+          ) : activeModule === 'users' ? (
             <div className="hidden md:flex w-80 p-6 bg-slate-50/50 flex-col items-center justify-center text-center shrink-0 border-l border-slate-100">
               <div className="h-12 w-12 rounded-full bg-slate-100 flex items-center justify-center text-slate-400 mb-3">
                 <Users className="h-6 w-6 stroke-[1.5]" />
@@ -1140,7 +1159,7 @@ export default function AdminPanel({
                 点击左侧列表账号的 <Edit className="h-3 w-3 inline text-slate-400" /> 进行修改与配置，点击 <BarChart3 className="h-3 w-3 inline text-amber-500" /> 查看积分消耗，或点击「新增账号」添加新账号。
               </p>
             </div>
-          )}
+          ) : null}
 
         </div>
 

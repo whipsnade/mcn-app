@@ -25,6 +25,7 @@ ModelPurpose = Literal[
     "goal_summary",
     "context_qa",
     "brand_report_narrative",
+    "artifact_reviewer",
 ]
 
 
@@ -65,7 +66,7 @@ class StructuredModelRequest(Generic[T]):
     template_name: str
     messages: tuple[ChatMessage, ...]
     output_model: type[T]
-    max_tokens: int = 4096
+    max_tokens: int = 16384
     # prompt 学习日志上下文（user_id/session_id/task_id/tags），不写进 prompt。
     log_context: dict[str, Any] | None = field(default=None, compare=False)
     thinking_sink: ThinkingSink | None = field(default=None, compare=False)
@@ -97,6 +98,10 @@ class StructuredResult(BaseModel, Generic[T]):
     usage: TokenUsage | None
     request_id: str | None
     regeneration_count: int
+    # 供应商暴露的思考文本（reasoning_content / <think>），跨修复尝试累积；
+    # 无思考输出时为 None。供无 sink 的非流式决策写 Step 审计（agent_steps
+    # .thinking_text），流式路径由 ThinkingSink delta 累积，不读该字段。
+    thinking_text: str | None = None
 
 
 class ModelRequestMetadata(BaseModel):

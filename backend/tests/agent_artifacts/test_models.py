@@ -1,0 +1,111 @@
+from sqlalchemy import CheckConstraint, UniqueConstraint
+
+from app.db.base import Base
+import app.agent_runtime.models  # noqa: F401
+import app.agent_artifacts.models  # noqa: F401
+
+
+def test_artifact_tables_are_registered() -> None:
+    expected = {
+        "agent_artifacts",
+        "artifact_drafts",
+        "artifact_draft_revisions",
+        "artifact_review_batches",
+        "artifact_review_items",
+        "artifact_review_attempts",
+        "agent_artifact_versions",
+        "artifact_events",
+        "agent_artifact_read_states",
+        "kol_detail_cache",
+        "artifact_publish_attempts",
+    }
+    assert expected.issubset(Base.metadata.tables)
+
+
+def test_artifact_drafts_unique_artifact_id() -> None:
+    drafts = Base.metadata.tables["artifact_drafts"]
+    assert any(
+        tuple(column.name for column in constraint.columns) == ("artifact_id",)
+        for constraint in drafts.constraints
+        if isinstance(constraint, UniqueConstraint)
+    )
+
+
+def test_artifact_review_attempts_unique_review_item_attempt() -> None:
+    attempts = Base.metadata.tables["artifact_review_attempts"]
+    assert any(
+        tuple(column.name for column in constraint.columns) == ("review_item_id", "attempt")
+        for constraint in attempts.constraints
+        if isinstance(constraint, UniqueConstraint)
+    )
+
+
+def test_artifact_events_session_sequence_unique() -> None:
+    events = Base.metadata.tables["artifact_events"]
+    assert any(
+        tuple(column.name for column in constraint.columns) == ("session_id", "sequence")
+        for constraint in events.constraints
+        if isinstance(constraint, UniqueConstraint)
+    )
+
+
+def test_agent_artifact_read_states_has_schema_columns_and_unique() -> None:
+    states = Base.metadata.tables["agent_artifact_read_states"]
+    assert "module" in states.c
+    assert "last_seen_sequence" in states.c
+    assert "updated_at" in states.c
+    assert any(
+        tuple(column.name for column in constraint.columns)
+        == ("user_id", "session_id", "module")
+        for constraint in states.constraints
+        if isinstance(constraint, UniqueConstraint)
+    )
+
+
+def test_agent_artifact_read_states_session_id_foreign_key() -> None:
+    states = Base.metadata.tables["agent_artifact_read_states"]
+    assert {fk.target_fullname for fk in states.c.session_id.foreign_keys} == {
+        "agent_sessions.id"
+    }
+
+
+def test_agent_artifact_versions_has_lineage_snapshot_column() -> None:
+    versions = Base.metadata.tables["agent_artifact_versions"]
+    assert "lineage_snapshot_json" in versions.c
+    assert versions.c.lineage_snapshot_json.nullable is True
+
+
+def test_agent_artifact_versions_has_validation_json_column() -> None:
+    versions = Base.metadata.tables["agent_artifact_versions"]
+    assert "validation_json" in versions.c
+    assert versions.c.validation_json.nullable is True
+
+
+def test_artifact_publish_attempts_constraints() -> None:
+    attempts = Base.metadata.tables["artifact_publish_attempts"]
+    assert any(
+        tuple(column.name for column in constraint.columns) == ("idempotency_key",)
+        for constraint in attempts.constraints
+        if isinstance(constraint, UniqueConstraint)
+    )
+    checks = {
+        constraint.name: constraint.sqltext.text
+        for constraint in attempts.constraints
+        if isinstance(constraint, CheckConstraint)
+    }
+    assert (
+        checks["ck_artifact_publish_attempts_status"]
+        == "status IN ('validating','published','validation_failed','failed')"
+    )
+
+
+def test_immutable_tables_have_no_updated_at() -> None:
+    for table_name in (
+        "artifact_draft_revisions",
+        "agent_artifact_versions",
+        "artifact_review_attempts",
+        "agent_tool_call_reconciliations",
+    ):
+        assert "updated_at" not in [
+            column.name for column in Base.metadata.tables[table_name].columns
+        ]

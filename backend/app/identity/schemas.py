@@ -32,6 +32,9 @@ class UserRead(BaseModel):
     role: Literal["user", "admin"]
     channels: list[str]
     industries: list[str]
+    tenant_id: str | None = None
+    tenant_name: str | None = None
+    membership_role: Literal["owner", "admin", "member"] | None = None
 
 
 class BrandProfileItem(BaseModel):

@@ -32,8 +32,36 @@ def run_migrations_offline() -> None:
 
 def do_run_migrations(connection) -> None:
     context.configure(connection=connection, target_metadata=target_metadata, compare_type=True)
+    _guard_staged_billing_downgrade(connection)
     with context.begin_transaction():
         context.run_migrations()
+
+
+_BILLING_LEDGER_REVISION = "0040_tenant_billing_usage"
+
+
+def _guard_staged_billing_downgrade(connection) -> None:
+    """降穿 0040 的预检：staged downgrade 绕过 0043 guard 的封堵点。
+
+    0043 的 guard 只在 head→0042 一步运行；先从 0043 降到 0042 再降穿
+    0040 的链路不会经过它。这里在真正执行前预演步骤列表，凡是要执行
+    0040 downgrade（drop 权威租户账本表）的命令一律先跑同一组检查。
+    """
+    migration_context = context.get_context()
+    migrations_fn = getattr(migration_context, "_migrations_fn", None)
+    if migrations_fn is None:
+        return
+    steps = list(migrations_fn(migration_context.get_current_heads(), migration_context))
+    crossing = any(
+        step.is_downgrade
+        and getattr(getattr(step, "revision", None), "revision", None) == _BILLING_LEDGER_REVISION
+        for step in steps
+    )
+    if not crossing:
+        return
+    from migrations.billing_downgrade_guard import assert_safe_to_drop_tenant_billing
+
+    assert_safe_to_drop_tenant_billing(connection)
 
 
 async def run_async_migrations() -> None:

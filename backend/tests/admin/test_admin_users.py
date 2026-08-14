@@ -2,8 +2,9 @@ import pytest
 from sqlalchemy import select
 
 from app.admin.models import AdminAuditLog
-from app.billing.models import WalletTransaction
+from app.billing.models import TenantWalletTransaction
 from app.identity.models import AuthIdentity, User
+from app.tenancy.models import TenantMembership
 
 
 @pytest.mark.asyncio
@@ -23,15 +24,22 @@ async def test_create_user_with_points_and_channels(authed_client_factory, db_se
     assert created.status_code == 201
     item = created.json()
     assert item["nickname"] == "新账号"
+    assert item["tenant_id"] is not None
     assert item["phone"] == "13800000002"
     assert item["points"] == 300
     assert item["reserved_points"] == 0
     assert set(item["channels"]) == {"douyin", "xiaohongshu"}
 
+    membership = await db_session.scalar(
+        select(TenantMembership).where(TenantMembership.user_id == item["id"])
+    )
+    assert membership is not None
+    assert membership.role == "owner"
+
     ledger = await db_session.scalar(
-        select(WalletTransaction).where(
-            WalletTransaction.user_id == item["id"],
-            WalletTransaction.kind == "admin_adjust",
+        select(TenantWalletTransaction).where(
+            TenantWalletTransaction.user_id == item["id"],
+            TenantWalletTransaction.kind == "admin_adjust",
         )
     )
     assert ledger is not None

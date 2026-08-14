@@ -1,13 +1,6 @@
 import { request } from './client';
 import type { ApiFavorite } from './contracts';
-import type { KolSelectionItem } from './kolSelection';
 
-
-export interface FavoriteKolSelectionRef {
-  session_id: string;
-  set_id: string;
-  item: KolSelectionItem;
-}
 
 export interface CreateFavoriteInput {
   kol_id: string;
@@ -49,15 +42,6 @@ export function createFavoriteByKey(input: CreateFavoriteByKeyInput): Promise<Ap
 export function deleteFavoriteByKey(platform: string, kolUid: string): Promise<void> {
   const query = `platform=${encodeURIComponent(platform)}&kol_uid=${encodeURIComponent(kolUid)}`;
   return request<void>(`/api/v1/favorites?${query}`, { method: 'DELETE' });
-}
-
-// 把收藏达人解析到其最新圈选名单条目；不在任何名单（404）时由调用方回退快捷详情。
-export function getFavoriteKolSelectionRef(
-  platform: string,
-  kolUid: string,
-): Promise<FavoriteKolSelectionRef> {
-  const query = `platform=${encodeURIComponent(platform)}&kol_uid=${encodeURIComponent(kolUid)}`;
-  return request<FavoriteKolSelectionRef>(`/api/v1/favorites/kol-selection-ref?${query}`);
 }
 
 export function deleteFavorite(kolId: string): Promise<void> {

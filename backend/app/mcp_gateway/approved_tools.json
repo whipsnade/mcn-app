@@ -2,7 +2,7 @@
   "manifest_version": 1,
   "tools": [
     {
-      "internal_name": "datatap.xiaohongshu.kol.search.v1",
+      "internal_name": "kol_xiaohongshu_search",
       "service": "social-grow-mcp",
       "remote_name": "kol_xiaohongshu_search",
       "description": "小红书 KOL 候选检索。arguments 必须为 {request:{...}}；优先按用户条件设置 page=1、size（最多100）、followercountMin、sumpostMin（近30天活跃）、sexListFan/sexListFanMin、ageListFan/ageListFanMin、kwProvinceList、品牌或品类提及标签，无法确定标签时才用 textContentWord。此工具仅能筛选达人所在地浙江省，不能验证粉丝城市为湖州/浙江或粉丝消费力金额，结果分析必须明确这些数据限制。",
@@ -57,7 +57,7 @@
       "enabled": true
     },
     {
-      "internal_name": "datatap.douyin.kol.search.v1",
+      "internal_name": "kol_douyin_search",
       "service": "social-grow-mcp",
       "remote_name": "kol_douyin_search",
       "description": "抖音 KOL 候选检索。arguments 必须为 {request:{...}}；支持粉丝数、近月发帖量、女性和20～30岁受众、达人所在省份以及品牌关键词筛选。此工具仅能筛选达人所在地浙江省，不能验证粉丝城市为湖州/浙江或粉丝消费力金额，结果分析必须明确这些数据限制。",

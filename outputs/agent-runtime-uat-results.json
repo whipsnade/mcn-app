@@ -1,0 +1,1058 @@
+{
+  "generated_at": "2026-08-07T02:32:12.772020",
+  "env": {
+    "app_env": "test",
+    "mysql_database": "kol_insight_test",
+    "auth_mode": "mock"
+  },
+  "scenarios": [
+    {
+      "scenario": "clarification",
+      "prompt_tag": "帮我分析一下某个品牌的声量和情感，但我不确定具体要分析哪个品牌。",
+      "profile": "session_analyst_v1",
+      "run_id": "34955835-c8d6-43fa-9fce-532c4d040e88",
+      "status": "clarification_requested",
+      "decision_count": 1,
+      "points_before": 1000,
+      "points_after": 1000,
+      "user_id": "64c600e5-9c41-467b-b8d1-7902e0197654",
+      "session_id": "b1580f12-8a69-455b-b900-498caf8c73bb",
+      "wallet_tx_summary": [],
+      "calls": [],
+      "steps": [],
+      "artifact_versions": [],
+      "assistant_summary": [
+        {
+          "type": "clarification",
+          "content_prefix": "您想分析哪个品牌的声量与情感呢？如果还没想好，我可以根据您关注的行业或品类帮您推荐候选品牌，或直接查询系统里可分析的对象供您挑选。"
+        }
+      ],
+      "unknown_reconciled": false,
+      "limitations": []
+    },
+    {
+      "scenario": "brand_analysis",
+      "prompt_tag": "请分析最近一个月瑞幸咖啡的品牌声量和情感表现，并产出正式分析报告。",
+      "profile": "session_analyst_v1",
+      "run_id": "b9a59c51-0ee0-4655-bcb7-7cd2b4557da9",
+      "status": "completed",
+      "decision_count": 33,
+      "points_before": 1000,
+      "points_after": 1000,
+      "user_id": "ab406f83-0bb6-4624-b537-a40038a242e6",
+      "session_id": "0329a9bb-ffb7-48c3-a123-a9a1e7ff4ebc",
+      "wallet_tx_summary": [
+        {
+          "kind": "reserve",
+          "balance_delta": -10,
+          "reserved_delta": 10
+        },
+        {
+          "kind": "settle",
+          "balance_delta": 0,
+          "reserved_delta": -10
+        },
+        {
+          "kind": "reserve",
+          "balance_delta": -10,
+          "reserved_delta": 10
+        },
+        {
+          "kind": "settle",
+          "balance_delta": 0,
+          "reserved_delta": -10
+        },
+        {
+          "kind": "reserve",
+          "balance_delta": -10,
+          "reserved_delta": 10
+        },
+        {
+          "kind": "settle",
+          "balance_delta": 0,
+          "reserved_delta": -10
+        },
+        {
+          "kind": "reserve",
+          "balance_delta": -10,
+          "reserved_delta": 10
+        },
+        {
+          "kind": "release",
+          "balance_delta": 10,
+          "reserved_delta": -10
+        },
+        {
+          "kind": "reserve",
+          "balance_delta": -10,
+          "reserved_delta": 10
+        },
+        {
+          "kind": "reserve",
+          "balance_delta": -10,
+          "reserved_delta": 10
+        },
+        {
+          "kind": "settle",
+          "balance_delta": 0,
+          "reserved_delta": -10
+        },
+        {
+          "kind": "reserve",
+          "balance_delta": -10,
+          "reserved_delta": 10
+        },
+        {
+          "kind": "settle",
+          "balance_delta": 0,
+          "reserved_delta": -10
+        },
+        {
+          "kind": "reserve",
+          "balance_delta": -10,
+          "reserved_delta": 10
+        },
+        {
+          "kind": "settle",
+          "balance_delta": 0,
+          "reserved_delta": -10
+        },
+        {
+          "kind": "reserve",
+          "balance_delta": -10,
+          "reserved_delta": 10
+        },
+        {
+          "kind": "settle",
+          "balance_delta": 0,
+          "reserved_delta": -10
+        },
+        {
+          "kind": "reserve",
+          "balance_delta": -10,
+          "reserved_delta": 10
+        },
+        {
+          "kind": "settle",
+          "balance_delta": 0,
+          "reserved_delta": -10
+        },
+        {
+          "kind": "reserve",
+          "balance_delta": -10,
+          "reserved_delta": 10
+        },
+        {
+          "kind": "settle",
+          "balance_delta": 0,
+          "reserved_delta": -10
+        },
+        {
+          "kind": "reserve",
+          "balance_delta": -10,
+          "reserved_delta": 10
+        },
+        {
+          "kind": "settle",
+          "balance_delta": 0,
+          "reserved_delta": -10
+        },
+        {
+          "kind": "reserve",
+          "balance_delta": -10,
+          "reserved_delta": 10
+        },
+        {
+          "kind": "settle",
+          "balance_delta": 0,
+          "reserved_delta": -10
+        },
+        {
+          "kind": "reserve",
+          "balance_delta": -10,
+          "reserved_delta": 10
+        },
+        {
+          "kind": "settle",
+          "balance_delta": 0,
+          "reserved_delta": -10
+        },
+        {
+          "kind": "reserve",
+          "balance_delta": -10,
+          "reserved_delta": 10
+        },
+        {
+          "kind": "settle",
+          "balance_delta": 0,
+          "reserved_delta": -10
+        }
+      ],
+      "calls": [
+        {
+          "tool_call_id": "fb8d4ced-f827-455f-8486-f3fed09b97e9",
+          "internal_tool_name": "match_best_tag",
+          "status": "settled",
+          "error_type": null,
+          "points_reserved": 0,
+          "points_settled": 10,
+          "service": "insight-cube-mcp",
+          "reconciled": false
+        },
+        {
+          "tool_call_id": "271f9c61-5410-4384-af29-6102dfd1b7f1",
+          "internal_tool_name": "query_analysis_data",
+          "status": "settled",
+          "error_type": null,
+          "points_reserved": 0,
+          "points_settled": 10,
+          "service": "insight-cube-mcp",
+          "reconciled": false
+        },
+        {
+          "tool_call_id": "c4fe53c8-070c-4090-89f4-79747c5e4956",
+          "internal_tool_name": "query_analysis_data",
+          "status": "settled",
+          "error_type": null,
+          "points_reserved": 0,
+          "points_settled": 10,
+          "service": "insight-cube-mcp",
+          "reconciled": false
+        },
+        {
+          "tool_call_id": "dc4bc492-5588-4d35-9713-8cb22e69db86",
+          "internal_tool_name": "query_analysis_data",
+          "status": "failed",
+          "error_type": "failed_confirmed",
+          "points_reserved": 0,
+          "points_settled": 0,
+          "service": "insight-cube-mcp",
+          "reconciled": false
+        },
+        {
+          "tool_call_id": "26199fa6-83b1-40e3-9333-d0c896ee0b6b",
+          "internal_tool_name": "social_statistic_trend",
+          "status": "unknown",
+          "error_type": "result_unknown",
+          "points_reserved": 10,
+          "points_settled": 0,
+          "service": "insight-cube-mcp",
+          "reconciled": false
+        },
+        {
+          "tool_call_id": "0397d391-904d-4d67-8528-41b29a356292",
+          "internal_tool_name": "query_analysis_data",
+          "status": "settled",
+          "error_type": null,
+          "points_reserved": 0,
+          "points_settled": 10,
+          "service": "insight-cube-mcp",
+          "reconciled": false
+        },
+        {
+          "tool_call_id": "211b7cf6-8ca1-4381-aea0-5f6a3cb50f2b",
+          "internal_tool_name": "query_analysis_data",
+          "status": "settled",
+          "error_type": null,
+          "points_reserved": 0,
+          "points_settled": 10,
+          "service": "insight-cube-mcp",
+          "reconciled": false
+        },
+        {
+          "tool_call_id": "faaa99be-4cc5-4296-8de3-94da842936c0",
+          "internal_tool_name": "query_analysis_data",
+          "status": "settled",
+          "error_type": null,
+          "points_reserved": 0,
+          "points_settled": 10,
+          "service": "insight-cube-mcp",
+          "reconciled": false
+        },
+        {
+          "tool_call_id": "0d588265-6fe1-4564-949d-d1dae9d2bbb8",
+          "internal_tool_name": "social_statistic_hot_topic",
+          "status": "settled",
+          "error_type": null,
+          "points_reserved": 0,
+          "points_settled": 10,
+          "service": "insight-cube-mcp",
+          "reconciled": false
+        },
+        {
+          "tool_call_id": "900e9b54-ca0d-496f-8a72-98bd2e4e7511",
+          "internal_tool_name": "query_raw_posts",
+          "status": "settled",
+          "error_type": null,
+          "points_reserved": 0,
+          "points_settled": 10,
+          "service": "insight-cube-mcp",
+          "reconciled": false
+        },
+        {
+          "tool_call_id": "0cf50178-d66a-4778-beb5-7697b73087a4",
+          "internal_tool_name": "social_statistic_hot_user",
+          "status": "settled",
+          "error_type": null,
+          "points_reserved": 0,
+          "points_settled": 10,
+          "service": "insight-cube-mcp",
+          "reconciled": false
+        },
+        {
+          "tool_call_id": "0a204e98-db71-4067-a1fd-68751ec4055e",
+          "internal_tool_name": "query_analysis_data",
+          "status": "settled",
+          "error_type": null,
+          "points_reserved": 0,
+          "points_settled": 10,
+          "service": "insight-cube-mcp",
+          "reconciled": false
+        },
+        {
+          "tool_call_id": "37d3ae2f-690d-40f3-9d17-6c11cdbaaed7",
+          "internal_tool_name": "aggregate_metrics",
+          "status": "settled",
+          "error_type": null,
+          "points_reserved": 0,
+          "points_settled": 0,
+          "service": "internal",
+          "reconciled": false
+        },
+        {
+          "tool_call_id": "a74325b3-e4b3-4e50-9964-afd5b5ceab0f",
+          "internal_tool_name": "social_statistic_user_profile",
+          "status": "settled",
+          "error_type": null,
+          "points_reserved": 0,
+          "points_settled": 10,
+          "service": "insight-cube-mcp",
+          "reconciled": false
+        },
+        {
+          "tool_call_id": "07060bbe-babb-4234-a412-8b38b9a92e8b",
+          "internal_tool_name": "query_analysis_data",
+          "status": "settled",
+          "error_type": null,
+          "points_reserved": 0,
+          "points_settled": 10,
+          "service": "insight-cube-mcp",
+          "reconciled": false
+        },
+        {
+          "tool_call_id": "c62d5f83-96d4-4d5f-929e-17d7929b4b6d",
+          "internal_tool_name": "query_raw_posts",
+          "status": "settled",
+          "error_type": null,
+          "points_reserved": 0,
+          "points_settled": 10,
+          "service": "insight-cube-mcp",
+          "reconciled": false
+        }
+      ],
+      "steps": [
+        {
+          "sequence": 2,
+          "internal_tool_name": "match_best_tag",
+          "status": "completed",
+          "error_type": null
+        },
+        {
+          "sequence": 4,
+          "internal_tool_name": "query_analysis_data",
+          "status": "completed",
+          "error_type": null
+        },
+        {
+          "sequence": 6,
+          "internal_tool_name": "query_analysis_data",
+          "status": "completed",
+          "error_type": null
+        },
+        {
+          "sequence": 8,
+          "internal_tool_name": "read_tool_result",
+          "status": "completed",
+          "error_type": null
+        },
+        {
+          "sequence": 10,
+          "internal_tool_name": "query_analysis_data",
+          "status": "failed",
+          "error_type": "failed_confirmed"
+        },
+        {
+          "sequence": 12,
+          "internal_tool_name": "social_statistic_trend",
+          "status": "failed",
+          "error_type": "result_unknown"
+        },
+        {
+          "sequence": 14,
+          "internal_tool_name": "query_analysis_data",
+          "status": "completed",
+          "error_type": null
+        },
+        {
+          "sequence": 16,
+          "internal_tool_name": "query_analysis_data",
+          "status": "completed",
+          "error_type": null
+        },
+        {
+          "sequence": 18,
+          "internal_tool_name": "read_tool_result",
+          "status": "completed",
+          "error_type": null
+        },
+        {
+          "sequence": 20,
+          "internal_tool_name": "query_analysis_data",
+          "status": "completed",
+          "error_type": null
+        },
+        {
+          "sequence": 22,
+          "internal_tool_name": "social_statistic_hot_topic",
+          "status": "completed",
+          "error_type": null
+        },
+        {
+          "sequence": 24,
+          "internal_tool_name": "query_raw_posts",
+          "status": "completed",
+          "error_type": null
+        },
+        {
+          "sequence": 26,
+          "internal_tool_name": "read_tool_result",
+          "status": "completed",
+          "error_type": null
+        },
+        {
+          "sequence": 28,
+          "internal_tool_name": "social_statistic_hot_user",
+          "status": "completed",
+          "error_type": null
+        },
+        {
+          "sequence": 30,
+          "internal_tool_name": "query_analysis_data",
+          "status": "completed",
+          "error_type": null
+        },
+        {
+          "sequence": 32,
+          "internal_tool_name": "read_tool_result",
+          "status": "completed",
+          "error_type": null
+        },
+        {
+          "sequence": 34,
+          "internal_tool_name": "aggregate_metrics",
+          "status": "completed",
+          "error_type": null
+        },
+        {
+          "sequence": 36,
+          "internal_tool_name": "social_statistic_user_profile",
+          "status": "completed",
+          "error_type": null
+        },
+        {
+          "sequence": 38,
+          "internal_tool_name": "build_brand_report_draft",
+          "status": "completed",
+          "error_type": null
+        },
+        {
+          "sequence": 40,
+          "internal_tool_name": "read_tool_result",
+          "status": "completed",
+          "error_type": null
+        },
+        {
+          "sequence": 42,
+          "internal_tool_name": "read_tool_result",
+          "status": "completed",
+          "error_type": null
+        },
+        {
+          "sequence": 44,
+          "internal_tool_name": "read_tool_result",
+          "status": "completed",
+          "error_type": null
+        },
+        {
+          "sequence": 46,
+          "internal_tool_name": "read_tool_result",
+          "status": "completed",
+          "error_type": null
+        },
+        {
+          "sequence": 48,
+          "internal_tool_name": "build_brand_report_draft",
+          "status": "completed",
+          "error_type": null
+        },
+        {
+          "sequence": 50,
+          "internal_tool_name": "read_artifact",
+          "status": "completed",
+          "error_type": null
+        },
+        {
+          "sequence": 52,
+          "internal_tool_name": "query_analysis_data",
+          "status": "completed",
+          "error_type": null
+        },
+        {
+          "sequence": 54,
+          "internal_tool_name": "read_tool_result",
+          "status": "completed",
+          "error_type": null
+        },
+        {
+          "sequence": 56,
+          "internal_tool_name": "search_evidence",
+          "status": "completed",
+          "error_type": null
+        },
+        {
+          "sequence": 58,
+          "internal_tool_name": "build_brand_report_draft",
+          "status": "completed",
+          "error_type": null
+        },
+        {
+          "sequence": 60,
+          "internal_tool_name": "query_raw_posts",
+          "status": "completed",
+          "error_type": null
+        },
+        {
+          "sequence": 62,
+          "internal_tool_name": "build_brand_report_draft",
+          "status": "completed",
+          "error_type": null
+        }
+      ],
+      "artifact_versions": [
+        {
+          "artifact_id": "6f6a6b15-1416-4c12-9df8-813c80737bb8",
+          "version": 1,
+          "schema_version": "brand_report_v3",
+          "data_status": "restricted",
+          "lineage_ok": true,
+          "lineage_error": null
+        }
+      ],
+      "assistant_summary": [
+        {
+          "type": "completion",
+          "content_prefix": "已为「瑞幸咖啡」生成并发布品牌分析报告（brand_report_v3，2026-07-08 至 2026-08-07，覆盖小红书/抖音/微博）。\n\n核心结论：\n- **总声量 947,786**，总互动 36,428,256，综合情感指数"
+        }
+      ],
+      "unknown_reconciled": false,
+      "limitations": [
+        "unknown call social_statistic_trend keeps reservation but lacks reconciliation audit row (recovery loop not exercised in UAT)"
+      ]
+    },
+    {
+      "scenario": "campaign_analysis",
+      "prompt_tag": "瑞幸咖啡最近有‘9.9咖啡节’活动，请分析这个活动在社交媒体的传播效果。",
+      "profile": "session_analyst_v1",
+      "run_id": "97a859b8-25aa-4b02-aa78-291890f328ae",
+      "status": "clarification_requested",
+      "decision_count": 22,
+      "points_before": 1000,
+      "points_after": 1000,
+      "user_id": "3e52800e-2834-4f30-9b82-960abdde312c",
+      "session_id": "4eaaf3a1-42fd-4165-a341-5374aa1e6acf",
+      "wallet_tx_summary": [
+        {
+          "kind": "reserve",
+          "balance_delta": -10,
+          "reserved_delta": 10
+        },
+        {
+          "kind": "reserve",
+          "balance_delta": -10,
+          "reserved_delta": 10
+        },
+        {
+          "kind": "settle",
+          "balance_delta": 0,
+          "reserved_delta": -10
+        },
+        {
+          "kind": "reserve",
+          "balance_delta": -10,
+          "reserved_delta": 10
+        },
+        {
+          "kind": "release",
+          "balance_delta": 10,
+          "reserved_delta": -10
+        },
+        {
+          "kind": "reserve",
+          "balance_delta": -10,
+          "reserved_delta": 10
+        },
+        {
+          "kind": "settle",
+          "balance_delta": 0,
+          "reserved_delta": -10
+        },
+        {
+          "kind": "reserve",
+          "balance_delta": -10,
+          "reserved_delta": 10
+        },
+        {
+          "kind": "reserve",
+          "balance_delta": -10,
+          "reserved_delta": 10
+        },
+        {
+          "kind": "settle",
+          "balance_delta": 0,
+          "reserved_delta": -10
+        },
+        {
+          "kind": "reserve",
+          "balance_delta": -10,
+          "reserved_delta": 10
+        },
+        {
+          "kind": "settle",
+          "balance_delta": 0,
+          "reserved_delta": -10
+        },
+        {
+          "kind": "reserve",
+          "balance_delta": -10,
+          "reserved_delta": 10
+        },
+        {
+          "kind": "settle",
+          "balance_delta": 0,
+          "reserved_delta": -10
+        },
+        {
+          "kind": "reserve",
+          "balance_delta": -10,
+          "reserved_delta": 10
+        },
+        {
+          "kind": "settle",
+          "balance_delta": 0,
+          "reserved_delta": -10
+        },
+        {
+          "kind": "reserve",
+          "balance_delta": -10,
+          "reserved_delta": 10
+        },
+        {
+          "kind": "settle",
+          "balance_delta": 0,
+          "reserved_delta": -10
+        },
+        {
+          "kind": "reserve",
+          "balance_delta": -10,
+          "reserved_delta": 10
+        },
+        {
+          "kind": "release",
+          "balance_delta": 10,
+          "reserved_delta": -10
+        },
+        {
+          "kind": "reserve",
+          "balance_delta": -10,
+          "reserved_delta": 10
+        },
+        {
+          "kind": "settle",
+          "balance_delta": 0,
+          "reserved_delta": -10
+        },
+        {
+          "kind": "reserve",
+          "balance_delta": -10,
+          "reserved_delta": 10
+        },
+        {
+          "kind": "settle",
+          "balance_delta": 0,
+          "reserved_delta": -10
+        },
+        {
+          "kind": "reserve",
+          "balance_delta": -10,
+          "reserved_delta": 10
+        },
+        {
+          "kind": "settle",
+          "balance_delta": 0,
+          "reserved_delta": -10
+        },
+        {
+          "kind": "reserve",
+          "balance_delta": -10,
+          "reserved_delta": 10
+        },
+        {
+          "kind": "settle",
+          "balance_delta": 0,
+          "reserved_delta": -10
+        },
+        {
+          "kind": "reserve",
+          "balance_delta": -10,
+          "reserved_delta": 10
+        },
+        {
+          "kind": "settle",
+          "balance_delta": 0,
+          "reserved_delta": -10
+        }
+      ],
+      "calls": [
+        {
+          "tool_call_id": "a9e20725-30df-4d8a-a0d3-302043ac5c3c",
+          "internal_tool_name": "social_statistic_brand_activity",
+          "status": "unknown",
+          "error_type": "result_unknown",
+          "points_reserved": 10,
+          "points_settled": 0,
+          "service": "insight-cube-mcp",
+          "reconciled": false
+        },
+        {
+          "tool_call_id": "7465bc1f-8f64-4cc8-a0ac-ffaae30d1c8e",
+          "internal_tool_name": "social_statistic_trend",
+          "status": "settled",
+          "error_type": null,
+          "points_reserved": 0,
+          "points_settled": 10,
+          "service": "insight-cube-mcp",
+          "reconciled": false
+        },
+        {
+          "tool_call_id": "4df7b224-3a14-4268-bf53-20b1386708b1",
+          "internal_tool_name": "social_statistic_hot_topic",
+          "status": "failed",
+          "error_type": "failed_confirmed",
+          "points_reserved": 0,
+          "points_settled": 0,
+          "service": "insight-cube-mcp",
+          "reconciled": false
+        },
+        {
+          "tool_call_id": "93e253ef-e003-44ef-b14b-a9d3fe7bd521",
+          "internal_tool_name": "match_best_tag",
+          "status": "settled",
+          "error_type": null,
+          "points_reserved": 0,
+          "points_settled": 10,
+          "service": "insight-cube-mcp",
+          "reconciled": false
+        },
+        {
+          "tool_call_id": "10f57bfd-f2e5-48de-9102-80b380504871",
+          "internal_tool_name": "social_statistic_trend",
+          "status": "unknown",
+          "error_type": "result_unknown",
+          "points_reserved": 10,
+          "points_settled": 0,
+          "service": "insight-cube-mcp",
+          "reconciled": false
+        },
+        {
+          "tool_call_id": "e9bc7501-84b7-406e-afda-b7df5bbfbfb9",
+          "internal_tool_name": "social_statistic_overview",
+          "status": "settled",
+          "error_type": null,
+          "points_reserved": 0,
+          "points_settled": 10,
+          "service": "insight-cube-mcp",
+          "reconciled": false
+        },
+        {
+          "tool_call_id": "45e3ff1e-e4bd-452b-8d43-76d9f1847525",
+          "internal_tool_name": "query_analysis_data",
+          "status": "settled",
+          "error_type": null,
+          "points_reserved": 0,
+          "points_settled": 10,
+          "service": "insight-cube-mcp",
+          "reconciled": false
+        },
+        {
+          "tool_call_id": "34710f6c-4446-4f58-bd6c-0ae15dc82c1f",
+          "internal_tool_name": "query_analysis_data",
+          "status": "settled",
+          "error_type": null,
+          "points_reserved": 0,
+          "points_settled": 10,
+          "service": "insight-cube-mcp",
+          "reconciled": false
+        },
+        {
+          "tool_call_id": "e3356953-185a-4842-b280-75e9d9d62fb2",
+          "internal_tool_name": "query_analysis_data",
+          "status": "settled",
+          "error_type": null,
+          "points_reserved": 0,
+          "points_settled": 10,
+          "service": "insight-cube-mcp",
+          "reconciled": false
+        },
+        {
+          "tool_call_id": "ff384a3f-eab8-4a3d-948d-62b113752ffb",
+          "internal_tool_name": "query_analysis_data",
+          "status": "settled",
+          "error_type": null,
+          "points_reserved": 0,
+          "points_settled": 10,
+          "service": "insight-cube-mcp",
+          "reconciled": false
+        },
+        {
+          "tool_call_id": "8443be81-a5b1-47b3-9839-3a96032a6f6e",
+          "internal_tool_name": "query_raw_posts",
+          "status": "failed",
+          "error_type": "failed_confirmed",
+          "points_reserved": 0,
+          "points_settled": 0,
+          "service": "insight-cube-mcp",
+          "reconciled": false
+        },
+        {
+          "tool_call_id": "dd9886e6-c92c-46ca-86bb-f9443edaf3f7",
+          "internal_tool_name": "query_raw_posts",
+          "status": "settled",
+          "error_type": null,
+          "points_reserved": 0,
+          "points_settled": 10,
+          "service": "insight-cube-mcp",
+          "reconciled": false
+        },
+        {
+          "tool_call_id": "d3c108bb-523b-4bea-9aee-de6eb918524b",
+          "internal_tool_name": "query_analysis_data",
+          "status": "settled",
+          "error_type": null,
+          "points_reserved": 0,
+          "points_settled": 10,
+          "service": "insight-cube-mcp",
+          "reconciled": false
+        },
+        {
+          "tool_call_id": "d132eb18-400e-48ed-9033-8cd1eae2b490",
+          "internal_tool_name": "query_analysis_data",
+          "status": "settled",
+          "error_type": null,
+          "points_reserved": 0,
+          "points_settled": 10,
+          "service": "insight-cube-mcp",
+          "reconciled": false
+        },
+        {
+          "tool_call_id": "e24e583e-8a13-4669-b547-408f7110e14e",
+          "internal_tool_name": "query_analysis_data",
+          "status": "settled",
+          "error_type": null,
+          "points_reserved": 0,
+          "points_settled": 10,
+          "service": "insight-cube-mcp",
+          "reconciled": false
+        },
+        {
+          "tool_call_id": "5f1fd6ff-a96b-46ac-a1ed-74be294ba6b9",
+          "internal_tool_name": "query_raw_posts",
+          "status": "settled",
+          "error_type": null,
+          "points_reserved": 0,
+          "points_settled": 10,
+          "service": "insight-cube-mcp",
+          "reconciled": false
+        },
+        {
+          "tool_call_id": "0012ed15-b08a-4875-a802-39e3a4cfb93f",
+          "internal_tool_name": "aggregate_metrics",
+          "status": "settled",
+          "error_type": null,
+          "points_reserved": 0,
+          "points_settled": 0,
+          "service": "internal",
+          "reconciled": false
+        }
+      ],
+      "steps": [
+        {
+          "sequence": 2,
+          "internal_tool_name": "social_statistic_brand_activity",
+          "status": "failed",
+          "error_type": "result_unknown"
+        },
+        {
+          "sequence": 4,
+          "internal_tool_name": "social_statistic_trend",
+          "status": "completed",
+          "error_type": null
+        },
+        {
+          "sequence": 6,
+          "internal_tool_name": "social_statistic_hot_topic",
+          "status": "failed",
+          "error_type": "failed_confirmed"
+        },
+        {
+          "sequence": 8,
+          "internal_tool_name": "match_best_tag",
+          "status": "completed",
+          "error_type": null
+        },
+        {
+          "sequence": 10,
+          "internal_tool_name": "social_statistic_trend",
+          "status": "failed",
+          "error_type": "result_unknown"
+        },
+        {
+          "sequence": 12,
+          "internal_tool_name": "social_statistic_overview",
+          "status": "completed",
+          "error_type": null
+        },
+        {
+          "sequence": 14,
+          "internal_tool_name": "query_analysis_data",
+          "status": "completed",
+          "error_type": null
+        },
+        {
+          "sequence": 16,
+          "internal_tool_name": "query_analysis_data",
+          "status": "completed",
+          "error_type": null
+        },
+        {
+          "sequence": 18,
+          "internal_tool_name": "query_analysis_data",
+          "status": "completed",
+          "error_type": null
+        },
+        {
+          "sequence": 20,
+          "internal_tool_name": "query_analysis_data",
+          "status": "completed",
+          "error_type": null
+        },
+        {
+          "sequence": 22,
+          "internal_tool_name": "read_tool_result",
+          "status": "completed",
+          "error_type": null
+        },
+        {
+          "sequence": 24,
+          "internal_tool_name": "query_raw_posts",
+          "status": "failed",
+          "error_type": "failed_confirmed"
+        },
+        {
+          "sequence": 26,
+          "internal_tool_name": "query_raw_posts",
+          "status": "completed",
+          "error_type": null
+        },
+        {
+          "sequence": 28,
+          "internal_tool_name": "read_tool_result",
+          "status": "completed",
+          "error_type": null
+        },
+        {
+          "sequence": 30,
+          "internal_tool_name": "query_analysis_data",
+          "status": "completed",
+          "error_type": null
+        },
+        {
+          "sequence": 32,
+          "internal_tool_name": "query_analysis_data",
+          "status": "completed",
+          "error_type": null
+        },
+        {
+          "sequence": 34,
+          "internal_tool_name": "query_analysis_data",
+          "status": "completed",
+          "error_type": null
+        },
+        {
+          "sequence": 36,
+          "internal_tool_name": "query_raw_posts",
+          "status": "completed",
+          "error_type": null
+        },
+        {
+          "sequence": 38,
+          "internal_tool_name": "read_tool_result",
+          "status": "completed",
+          "error_type": null
+        },
+        {
+          "sequence": 40,
+          "internal_tool_name": "aggregate_metrics",
+          "status": "failed",
+          "error_type": "tool_arguments_invalid"
+        },
+        {
+          "sequence": 42,
+          "internal_tool_name": "aggregate_metrics",
+          "status": "completed",
+          "error_type": null
+        }
+      ],
+      "artifact_versions": [],
+      "assistant_summary": [
+        {
+          "type": "clarification",
+          "content_prefix": "我检索发现：当前数据源中『9.9咖啡节』作为独立关键词的声量很低（近一个多月约1311条，7月23-29日有小幅峰值），而与之关联的高互动内容主要集中在『贫困生喝9.9元咖啡被举报』的社会争议话题（如#别让贫困生喝咖啡争议撕裂舆论#，单条帖"
+        }
+      ],
+      "unknown_reconciled": false,
+      "limitations": [
+        "unknown call social_statistic_brand_activity keeps reservation but lacks reconciliation audit row (recovery loop not exercised in UAT)",
+        "unknown call social_statistic_trend keeps reservation but lacks reconciliation audit row (recovery loop not exercised in UAT)"
+      ]
+    },
+    {
+      "scenario": "campaign_analysis_answer1",
+      "prompt_tag": "活动：瑞幸咖啡「9.9咖啡节」；时间范围：最近30天；平台：小红书、抖音。请直接执行分析并产出正式活动报告。",
+      "profile": "session_analyst_v1",
+      "run_id": "7f3edf14-ac34-4458-9c66-e802b6c28650",
+      "status": "running",
+      "decision_count": 0,
+      "points_before": 860,
+      "points_after": 860,
+      "user_id": "3e52800e-2834-4f30-9b82-960abdde312c",
+      "session_id": "4eaaf3a1-42fd-4165-a341-5374aa1e6acf",
+      "wallet_tx_summary": [],
+      "calls": [],
+      "steps": [],
+      "artifact_versions": [],
+      "assistant_summary": [],
+      "unknown_reconciled": false,
+      "limitations": []
+    }
+  ]
+}

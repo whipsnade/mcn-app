@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
 import random
+
+import httpx
 import re
 import time
 from collections.abc import Awaitable, Callable, MutableMapping
 from typing import Any
 
-from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI
+from openai import APIConnectionError, APIError, APIStatusError, APITimeoutError, AsyncOpenAI
 from pydantic import ValidationError
 
 from app.core.config import Settings
@@ -131,6 +134,7 @@ class TencentPlanAdapter:
         owned_client: AsyncOpenAI | None = None,
         log_writer: PromptLogWriter | None = None,
         reasoning_effort: str | None = None,
+        decision_timeout_seconds: float | None = 240.0,
     ) -> None:
         self._client = client
         self.base_url = base_url
@@ -139,6 +143,8 @@ class TencentPlanAdapter:
         self._sleep = sleep
         self._jitter = jitter
         self._max_attempts = max_attempts
+        # 单次 create 尝试的决策级墙钟（含整个流消费）；None 表示不限制。
+        self._decision_timeout_seconds = decision_timeout_seconds
         self._schema_support_cache = (
             schema_support_cache if schema_support_cache is not None else _SCHEMA_SUPPORT_CACHE
         )
@@ -165,6 +171,7 @@ class TencentPlanAdapter:
             model=settings.tencent_plan_model,
             owned_client=client,
             reasoning_effort=settings.tencent_plan_reasoning_effort,
+            decision_timeout_seconds=settings.model_decision_timeout_seconds,
         )
 
     async def complete_json(
@@ -220,6 +227,7 @@ class TencentPlanAdapter:
                 use_schema=use_schema,
             )
 
+        thinking_parts: list[str] = []
         for regeneration_count in range(2):
             response_format = self._response_format(request, schema, use_schema=use_schema)
             try:
@@ -244,6 +252,7 @@ class TencentPlanAdapter:
             log.usage = _usage(response)
             try:
                 parsed = parse_non_stream_output(content)
+                thinking_parts.append(parsed.thinking_text)
                 value = validate_with_repair(request.output_model, parsed.json_text)
             except (ValidationError, ValueError) as exc:
                 if regeneration_count == 1:
@@ -261,6 +270,7 @@ class TencentPlanAdapter:
                 usage=_usage(response),
                 request_id=_request_id(response),
                 regeneration_count=regeneration_count,
+                thinking_text="".join(thinking_parts) or None,
             )
 
         raise AssertionError("unreachable")
@@ -277,6 +287,7 @@ class TencentPlanAdapter:
         sink = request.thinking_sink
         assert sink is not None
         stream_cache_key = (self.base_url, self.model)
+        thinking_parts: list[str] = []
 
         for regeneration_count in range(2):
             attempt = regeneration_count + 1
@@ -316,6 +327,7 @@ class TencentPlanAdapter:
                         log=log,
                     )
 
+                thinking_parts.append(parsed.thinking_text)
                 value = validate_with_repair(request.output_model, parsed.json_text)
             except asyncio.CancelledError:
                 # Sink 已 started 后被取消也必须给出失败终态，
@@ -372,6 +384,7 @@ class TencentPlanAdapter:
                 usage=usage,
                 request_id=request_id,
                 regeneration_count=regeneration_count,
+                thinking_text="".join(thinking_parts) or None,
             )
 
         raise AssertionError("unreachable")
@@ -420,64 +433,76 @@ class TencentPlanAdapter:
             request_id: str | None = None
             usage: TokenUsage | None = None
             try:
-                stream = await self._client.create(
-                    model=self.model,
-                    messages=messages,
-                    max_tokens=max_tokens,
-                    response_format=response_format,
-                    stream=True,
-                    stream_options={"include_usage": True},
-                    **self._create_kwargs(),
-                )
-                async for chunk in stream:
-                    request_id = _request_id(chunk) or request_id
-                    chunk_usage = _usage(chunk)
-                    if chunk_usage is not None:
-                        usage = chunk_usage
-                        log.usage = chunk_usage
-                    choices = _value(chunk, "choices") or ()
-                    for choice in choices:
-                        reason = _value(choice, "finish_reason")
-                        if reason is not None:
-                            finish_reason = str(reason)
-                        delta = _value(choice, "delta")
-                        reasoning = _value(delta, "reasoning_content")
-                        if reasoning:
-                            partial_output_received = True
-                            for text in parser.feed_reasoning(str(reasoning)):
-                                await self._safe_sink_call(sink, "delta", text, attempt=attempt)
-                        content = _value(delta, "content")
-                        if content:
-                            partial_output_received = True
-                            text_content = str(content)
-                            log.parts.append(text_content)
-                            for text in parser.feed_content(text_content):
-                                await self._safe_sink_call(sink, "delta", text, attempt=attempt)
-                if finish_reason is None:
-                    raise ModelStreamInterrupted(
-                        partial_output_received=partial_output_received,
-                        request_id=request_id,
+                # 决策级墙钟：包住 create + 整个流消费。流持续 trickle 时 httpx
+                # 读超时永不触发，墙钟超时即取消本次尝试，按可重试
+                # MODEL_TIMEOUT 在 attempts 预算内重试。
+                async with self._decision_deadline():
+                    stream = await self._client.create(
+                        model=self.model,
+                        messages=messages,
+                        max_tokens=max_tokens,
+                        response_format=response_format,
+                        stream=True,
+                        stream_options={"include_usage": True},
+                        **self._create_kwargs(),
                     )
-                return parser.finish(), usage, request_id
+                    async for chunk in stream:
+                        request_id = _request_id(chunk) or request_id
+                        chunk_usage = _usage(chunk)
+                        if chunk_usage is not None:
+                            usage = chunk_usage
+                            log.usage = chunk_usage
+                        choices = _value(chunk, "choices") or ()
+                        for choice in choices:
+                            reason = _value(choice, "finish_reason")
+                            if reason is not None:
+                                finish_reason = str(reason)
+                            delta = _value(choice, "delta")
+                            reasoning = _value(delta, "reasoning_content")
+                            if reasoning:
+                                partial_output_received = True
+                                for text in parser.feed_reasoning(str(reasoning)):
+                                    await self._safe_sink_call(sink, "delta", text, attempt=attempt)
+                            content = _value(delta, "content")
+                            if content:
+                                partial_output_received = True
+                                text_content = str(content)
+                                log.parts.append(text_content)
+                                for text in parser.feed_content(text_content):
+                                    await self._safe_sink_call(sink, "delta", text, attempt=attempt)
+                    if finish_reason is None:
+                        raise ModelStreamInterrupted(
+                            partial_output_received=partial_output_received,
+                            request_id=request_id,
+                        )
+                    return parser.finish(), usage, request_id
             except asyncio.CancelledError:
                 raise
             except ValueError:
                 raise
             except ModelStreamInterrupted:
+                # 流结束无 finish_reason（连接中断类，无外部副作用）：
+                # 预算内整体重试，预算耗尽才明确失败。
+                if create_attempt + 1 < self._max_attempts:
+                    await self._backoff(create_attempt)
+                    create_attempt += 1
+                    continue
                 raise
             except Exception as exc:
                 if not partial_output_received and self._is_stream_unsupported(exc):
                     raise _StreamUnsupported(_request_id(exc) or request_id) from exc
                 mapped = self._map_error(exc)
-                if (
-                    mapped.retryable
-                    and not partial_output_received
-                    and create_attempt + 1 < self._max_attempts
-                ):
+                # 模型调用无外部副作用，可重试错误（网络中断、供应商生成中止、
+                # 决策墙钟超时）即使已收到部分输出也可安全整体重试——供应商
+                # 对生成中止类错误明确建议 retry。
+                if mapped.retryable and create_attempt + 1 < self._max_attempts:
                     await self._backoff(create_attempt)
                     create_attempt += 1
                     continue
-                if partial_output_received:
+                # 决策墙钟超时的最终失败保持 MODEL_TIMEOUT 语义；其他带部分
+                # 输出的最终失败已对用户产生可见 delta，不能重放，保持
+                # ModelStreamInterrupted 语义。
+                if partial_output_received and mapped.code != "MODEL_TIMEOUT":
                     raise ModelStreamInterrupted(
                         partial_output_received=True,
                         request_id=mapped.request_id or request_id,
@@ -654,14 +679,17 @@ class TencentPlanAdapter:
     ) -> Any:
         for attempt in range(self._max_attempts):
             try:
-                return await self._client.create(
-                    model=self.model,
-                    messages=messages,
-                    max_tokens=max_tokens,
-                    response_format=response_format,
-                    stream=False,
-                    **self._create_kwargs(),
-                )
+                # 与非流式 create 同样适用决策级墙钟：响应持续 trickle 时
+                # httpx 读超时失效，墙钟超时按可重试 MODEL_TIMEOUT 处理。
+                async with self._decision_deadline():
+                    return await self._client.create(
+                        model=self.model,
+                        messages=messages,
+                        max_tokens=max_tokens,
+                        response_format=response_format,
+                        stream=False,
+                        **self._create_kwargs(),
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -676,12 +704,19 @@ class TencentPlanAdapter:
     async def _backoff(self, attempt: int) -> None:
         await self._sleep((0.1 * (2**attempt)) + (0.05 * self._jitter()))
 
+    def _decision_deadline(self) -> Any:
+        """单次 create 尝试的决策级墙钟上下文（None = 不限制）。"""
+        if self._decision_timeout_seconds is None:
+            return contextlib.nullcontext()
+        return asyncio.timeout(self._decision_timeout_seconds)
+
     def _map_error(self, exc: Exception) -> ModelAdapterError:
         if isinstance(exc, ModelAdapterError):
             return exc
         request_id = _request_id(exc)
         if isinstance(exc, (asyncio.TimeoutError, APITimeoutError)):
-            return ModelAdapterError("MODEL_TIMEOUT", retryable=False, request_id=request_id)
+            # 决策墙钟/传输层超时：受墙钟与 attempts 预算双重上界约束，可重试。
+            return ModelAdapterError("MODEL_TIMEOUT", retryable=True, request_id=request_id)
         if isinstance(exc, APIStatusError):
             status = exc.status_code
             return ModelAdapterError(
@@ -695,6 +730,23 @@ class TencentPlanAdapter:
                 retryable=True,
                 request_id=request_id,
             )
+        if isinstance(exc, httpx.HTTPError):
+            # 流式迭代中泄漏的原始 httpx 传输错误（openai SDK 只包装 request 阶段）：
+            # RemoteProtocolError/ReadError/ConnectError 等连接层问题，可安全重试。
+            return ModelAdapterError(
+                "MODEL_NETWORK_ERROR", retryable=True, request_id=request_id
+            )
+        if isinstance(exc, APIError):
+            # 供应商在 response_format 生成中途自我中止（如 glm 的
+            # "Model output became abnormal ... Please retry the request"）：
+            # 非客户端参数错误，按其指引可安全重试。
+            message = str(exc).lower()
+            if "became abnormal" in message or (
+                "invalidparameter" in message and "response_format" in message
+            ):
+                return ModelAdapterError(
+                    "MODEL_UPSTREAM_ERROR", retryable=True, request_id=request_id
+                )
         return ModelAdapterError("MODEL_UPSTREAM_ERROR", retryable=False, request_id=request_id)
 
     def _is_schema_unsupported(self, exc: Exception) -> bool:

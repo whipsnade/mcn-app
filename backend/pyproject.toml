@@ -28,6 +28,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+  "aiosqlite>=0.20,<1",
   "pytest>=8.3,<10",
   "pytest-asyncio>=0.25,<2",
   "ruff>=0.9,<1",
@@ -36,10 +37,24 @@ dev = [
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# 真实服务 UAT 标记：只有显式 ``-m real_services`` 且脚本设置 ``RUN_REAL_SERVICES=1``
+# 才会运行 tests/integration/test_agent_runtime_real.py（真实模型 + 真实 DataTap MCP）。
+markers = [
+  "real_services: 真实模型 + 真实 DataTap MCP UAT（默认跳过，RUN_REAL_SERVICES=1 启用）",
+]
 
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/pi_runtime_poc/test_comparison.py" = ["E701", "E702"]
+"tests/pi_runtime_poc/test_evidence_ingest.py" = ["E402"]
+"tests/pi_runtime_poc/test_gate.py" = ["E721"]
+"tests/pi_runtime_poc/test_internal_tools.py" = ["E402"]
 
 [tool.setuptools.packages.find]
 include = ["app*"]

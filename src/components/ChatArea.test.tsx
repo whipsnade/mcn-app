@@ -1,13 +1,13 @@
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import type { Session, ThinkingBlock } from '../types';
-import { useSessionThinkingStream } from '../hooks/useSessionThinkingStream';
-import ChatArea, { mergeHistoricalAndRuntimeThinking } from './ChatArea';
+import type { Session } from '../types';
+import { initialRunRuntime, type RunRuntimeState } from '../state/agentEvents';
+import ChatArea from './ChatArea';
 
-vi.mock('../hooks/useSessionThinkingStream', () => ({
-  useSessionThinkingStream: vi.fn(),
-}));
+function runtime(runId: string, overrides: Partial<RunRuntimeState> = {}): RunRuntimeState {
+  return { ...initialRunRuntime(runId), ...overrides };
+}
 
 
 const session: Session = {
@@ -26,23 +26,6 @@ const session: Session = {
   updatedAt: '2026-07-14T10:00:00Z',
 };
 
-function thinkingBlock(
-  content: string,
-  changes: Partial<ThinkingBlock> = {},
-): ThinkingBlock {
-  return {
-    operationId: 'operation-1',
-    turnId: 'turn-1',
-    purpose: 'agent_loop',
-    attempt: 1,
-    label: '分析品牌',
-    content,
-    status: 'running',
-    truncated: false,
-    ...changes,
-  };
-}
-
 
 describe('ChatArea', () => {
   beforeAll(() => {
@@ -50,270 +33,7 @@ describe('ChatArea', () => {
   });
 
   beforeEach(() => {
-    vi.mocked(useSessionThinkingStream).mockReset();
-    vi.mocked(useSessionThinkingStream).mockReturnValue(undefined);
     vi.mocked(Element.prototype.scrollIntoView).mockClear();
-  });
-
-  it('merges historical and runtime thinking once between its user and assistant messages', () => {
-    vi.mocked(useSessionThinkingStream).mockReturnValue({
-      sessionId: 'session-1',
-      byTurn: {
-        'turn-1': [thinkingBlock('运行时分析品牌')],
-      },
-      sequenceByOperationAttempt: { 'operation-1:1': 2 },
-      connection: 'connected',
-    });
-    render(
-      <ChatArea
-        session={{
-          ...session,
-          messages: [
-            {
-              id: 'message-user',
-              sender: 'user',
-              text: '请分析品牌',
-              timestamp: '10:00',
-              turnId: 'turn-1',
-            },
-            {
-              id: 'message-assistant',
-              sender: 'ai',
-              text: '品牌分析完成',
-              timestamp: '10:01',
-              turnId: 'turn-1',
-              thinking: {
-                version: 1,
-                status: 'running',
-                blocks: [thinkingBlock('历史分析品牌')],
-              },
-            },
-          ],
-        }}
-        onSendMessage={vi.fn()}
-        isAnalyzing
-        isMockMode={false}
-      />,
-    );
-
-    expect(screen.getAllByRole('button', { name: '思考中' })).toHaveLength(1);
-    expect(screen.getByText('运行时分析品牌')).toBeVisible();
-    expect(screen.queryByText('历史分析品牌')).toBeNull();
-    const logText = screen.getByRole('log', { name: '会话消息' }).textContent ?? '';
-    expect(logText.indexOf('请分析品牌')).toBeLessThan(logText.indexOf('运行时分析品牌'));
-    expect(logText.indexOf('运行时分析品牌')).toBeLessThan(logText.indexOf('品牌分析完成'));
-  });
-
-  it.each(['completed', 'interrupted'] as const)(
-    'keeps persisted terminal thinking over %s runtime blocks',
-    runtimeStatus => {
-      const historical = thinkingBlock('持久化终态内容', {
-        status: 'completed',
-        durationMs: 21808,
-      });
-      const merged = mergeHistoricalAndRuntimeThinking(
-        [{
-          id: 'message-assistant',
-          sender: 'ai',
-          text: '分析完成',
-          timestamp: '10:01',
-          turnId: 'turn-1',
-          thinking: {
-            version: 1,
-            status: 'completed',
-            blocks: [historical],
-          },
-        }],
-        {
-          'turn-1': [thinkingBlock('runtime 终态内容', {
-            status: runtimeStatus,
-            durationMs: 20000,
-          })],
-        },
-      );
-
-      expect(merged['turn-1']).toEqual([
-        expect.objectContaining({
-          content: '持久化终态内容',
-          status: 'completed',
-          durationMs: 21808,
-        }),
-      ]);
-    },
-  );
-
-  it('does not render thinking panels for empty event blocks', () => {
-    vi.mocked(useSessionThinkingStream).mockReturnValue({
-      sessionId: 'session-1',
-      byTurn: {
-        'turn-1': [thinkingBlock('', { status: 'completed', durationMs: 80 })],
-      },
-      sequenceByOperationAttempt: { 'operation-1:1': 2 },
-      connection: 'connected',
-    });
-    render(
-      <ChatArea
-        session={{
-          ...session,
-          messages: [{
-            id: 'message-user',
-            sender: 'user',
-            text: '请分析品牌',
-            timestamp: '10:00',
-            turnId: 'turn-1',
-          }],
-        }}
-        onSendMessage={vi.fn()}
-        isAnalyzing={false}
-        isMockMode={false}
-      />,
-    );
-
-    expect(screen.queryByRole('button', { name: /思考/ })).toBeNull();
-  });
-
-  it('does not follow thinking deltas after the user scrolls away from the bottom', () => {
-    let runtimeContent = '第一段';
-    vi.mocked(useSessionThinkingStream).mockImplementation(() => ({
-      sessionId: 'session-1',
-      byTurn: { 'turn-1': [thinkingBlock(runtimeContent)] },
-      sequenceByOperationAttempt: { 'operation-1:1': 2 },
-      connection: 'connected',
-    }));
-    const thinkingSession: Session = {
-      ...session,
-      messages: [{
-        id: 'message-user',
-        sender: 'user',
-        text: '请分析品牌',
-        timestamp: '10:00',
-        turnId: 'turn-1',
-      }],
-    };
-    const { rerender } = render(
-      <ChatArea
-        session={thinkingSession}
-        onSendMessage={vi.fn()}
-        isAnalyzing
-        isMockMode={false}
-      />,
-    );
-    const log = screen.getByRole('log', { name: '会话消息' });
-    Object.defineProperties(log, {
-      scrollHeight: { configurable: true, value: 1000 },
-      clientHeight: { configurable: true, value: 400 },
-      scrollTop: { configurable: true, writable: true, value: 400 },
-    });
-    fireEvent.scroll(log);
-    vi.mocked(Element.prototype.scrollIntoView).mockClear();
-
-    runtimeContent = '第一段第二段';
-    rerender(
-      <ChatArea
-        session={thinkingSession}
-        onSendMessage={vi.fn()}
-        isAnalyzing
-        isMockMode={false}
-      />,
-    );
-
-    expect(Element.prototype.scrollIntoView).not.toHaveBeenCalled();
-  });
-
-  it('follows thinking deltas while the user remains near the bottom', () => {
-    let runtimeContent = '第一段';
-    vi.mocked(useSessionThinkingStream).mockImplementation(() => ({
-      sessionId: 'session-1',
-      byTurn: { 'turn-1': [thinkingBlock(runtimeContent)] },
-      sequenceByOperationAttempt: { 'operation-1:1': 2 },
-      connection: 'connected',
-    }));
-    const thinkingSession: Session = {
-      ...session,
-      messages: [{
-        id: 'message-user',
-        sender: 'user',
-        text: '请分析品牌',
-        timestamp: '10:00',
-        turnId: 'turn-1',
-      }],
-    };
-    const { rerender } = render(
-      <ChatArea
-        session={thinkingSession}
-        onSendMessage={vi.fn()}
-        isAnalyzing
-        isMockMode={false}
-      />,
-    );
-    const log = screen.getByRole('log', { name: '会话消息' });
-    Object.defineProperties(log, {
-      scrollHeight: { configurable: true, value: 1000 },
-      clientHeight: { configurable: true, value: 400 },
-      scrollTop: { configurable: true, writable: true, value: 570 },
-    });
-    fireEvent.scroll(log);
-    vi.mocked(Element.prototype.scrollIntoView).mockClear();
-
-    runtimeContent = '第一段第二段';
-    rerender(
-      <ChatArea
-        session={thinkingSession}
-        onSendMessage={vi.fn()}
-        isAnalyzing
-        isMockMode={false}
-      />,
-    );
-
-    expect(Element.prototype.scrollIntoView).toHaveBeenCalledOnce();
-  });
-
-  it('does not show thinking left over from another session', () => {
-    vi.mocked(useSessionThinkingStream).mockReturnValue({
-      sessionId: 'session-1',
-      byTurn: { 'turn-1': [thinkingBlock('旧会话思考')] },
-      sequenceByOperationAttempt: { 'operation-1:1': 2 },
-      connection: 'connected',
-    });
-    const { rerender } = render(
-      <ChatArea
-        session={{
-          ...session,
-          messages: [{
-            id: 'message-user',
-            sender: 'user',
-            text: '旧会话问题',
-            timestamp: '10:00',
-            turnId: 'turn-1',
-          }],
-        }}
-        onSendMessage={vi.fn()}
-        isAnalyzing
-        isMockMode={false}
-      />,
-    );
-    expect(screen.getByText('旧会话思考')).toBeVisible();
-
-    rerender(
-      <ChatArea
-        session={{
-          ...session,
-          id: 'session-2',
-          messages: [{
-            id: 'message-user-2',
-            sender: 'user',
-            text: '新会话问题',
-            timestamp: '10:00',
-            turnId: 'turn-1',
-          }],
-        }}
-        onSendMessage={vi.fn()}
-        isAnalyzing={false}
-        isMockMode={false}
-      />,
-    );
-
-    expect(screen.queryByText('旧会话思考')).toBeNull();
   });
 
   it('keeps the draft until the message is persisted successfully', async () => {
@@ -423,156 +143,207 @@ describe('ChatArea', () => {
     expect(screen.queryByRole('button', { name: '暂停' })).toBeNull();
   });
 
-  it('shows the flow nodes with failure detail without exposing transport details', () => {
+  it('shows a failed run as a terminal card without exposing transport details', async () => {
     render(
       <ChatArea
-        session={session}
-        onSendMessage={vi.fn()}
-        isAnalyzing
-        isMockMode={false}
-        flowNodes={[
-          { id: 'accepted', label: '任务已受理', status: 'succeeded' },
-          { id: 'tool-1', label: '查询小红书数据', status: 'failed', detail: '社媒数据服务返回错误，请稍后重试。' },
-        ]}
-      />,
-    );
-
-    expect(screen.getByText('查询小红书数据')).toBeVisible();
-    expect(screen.getByText('社媒数据服务返回错误，请稍后重试。')).toBeVisible();
-    expect(screen.queryByText('/api/v1/mcp')).not.toBeInTheDocument();
-  });
-
-  it('collapses the flow nodes after the terminal event and keeps the final reply', async () => {
-    render(
-      <ChatArea
-        session={session}
+        session={{
+          ...session,
+          messages: [{ id: 'm1', sender: 'user', text: '第一轮分析', timestamp: '10:00', runId: 'run-1' }],
+        }}
         onSendMessage={vi.fn()}
         isAnalyzing={false}
         isMockMode={false}
-        flowTerminal
-        flowTerminalLabel="分析完成"
-        assistantDraft="本轮共找到 3 位候选达人。"
-        flowNodes={[
-          { id: 'accepted', label: '任务已受理', status: 'succeeded' },
-          { id: 'tool-1', label: '查询小红书数据', status: 'failed', detail: '社媒数据服务返回错误，请稍后重试。' },
-          { id: 'terminal', label: '分析完成', status: 'succeeded' },
-        ]}
+        run={runtime('run-1', {
+          status: 'failed',
+          errorMessage: '社媒数据服务返回错误，请稍后重试。',
+          steps: [
+            { id: 'run', label: '开始执行', status: 'succeeded' },
+            { id: 'terminal-1', label: '运行失败', status: 'failed' },
+          ],
+          toolCalls: [{ id: 'tool-1', name: 'brand_search', status: 'failed' }],
+        })}
       />,
     );
 
-    // 终态后自动收缩：节点明细默认不可见，摘要行可见，最终回复保留。
-    expect(screen.queryByText('查询小红书数据')).not.toBeInTheDocument();
-    expect(screen.getByText('本轮共找到 3 位候选达人。')).toBeVisible();
-    const toggle = screen.getByRole('button', { name: /执行流程/ });
-    expect(toggle).toHaveTextContent('1 步失败');
-    fireEvent.click(toggle);
-    expect(await screen.findByText('查询小红书数据')).toBeVisible();
-    expect(screen.getByText('社媒数据服务返回错误，请稍后重试。')).toBeVisible();
+    // 终态收缩为摘要行，失败提示保留在展开明细里。
+    const collapsed = screen.getByRole('button', { name: /执行卡/ });
+    expect(collapsed).toHaveTextContent('运行失败');
+    expect(screen.queryByText('/api/v1/mcp')).not.toBeInTheDocument();
+    fireEvent.click(collapsed);
+    expect(await screen.findByText('社媒数据服务返回错误，请稍后重试。')).toBeVisible();
+    expect(screen.getByText('brand_search')).toBeVisible();
   });
 
-  it('anchors each task flow under its own user message instead of sharing one flow', () => {
+  it('anchors each run card under its triggering user message; historical runs collapse, the active run is live', () => {
     render(
       <ChatArea
         session={{
           ...session,
           messages: [
-            { id: 'm1', sender: 'user', text: '第一轮分析', timestamp: '10:00', taskId: 'task-1' },
-            { id: 'm2', sender: 'user', text: '第二轮分析', timestamp: '10:05', taskId: 'task-2' },
+            { id: 'm1', sender: 'user', text: '第一轮分析', timestamp: '10:00', runId: 'run-1' },
+            { id: 'm2', sender: 'user', text: '第二轮分析', timestamp: '10:05', runId: 'run-2' },
           ],
         }}
         onSendMessage={vi.fn()}
         isAnalyzing={false}
         isMockMode={false}
-        flowTaskId="task-2"
-        flowTerminal
-        flowTerminalLabel="分析完成"
-        flowNodes={[
-          { id: 'accepted', label: '任务已受理', status: 'succeeded' },
-          { id: 'terminal', label: '分析完成', status: 'succeeded' },
-        ]}
-        taskFlows={{
-          'task-1': {
-            runtime: {
-              taskId: 'task-1',
-              lastEventId: 2,
-              assistantDraft: '',
-              connection: 'closed',
-              status: 'completed',
-              phaseLabel: '分析完成',
-              nodes: [
-                { id: 'accepted', label: '任务已受理', status: 'succeeded' },
-                { id: 'tool-1', label: '查询抖音数据', status: 'succeeded' },
-                { id: 'terminal', label: '分析完成', status: 'succeeded' },
-              ],
-            },
-          },
+        run={runtime('run-2', {
+          status: 'running',
+          hasThinking: true,
+          thinkingStatus: 'running',
+          thinking: '正在交叉匹配达人',
+          toolCalls: [{ id: 'tool-1', name: 'kol_feed', status: 'running' }],
+        })}
+        runHistory={{
+          'run-1': runtime('run-1', {
+            status: 'completed',
+            steps: [
+              { id: 'run', label: '开始执行', status: 'succeeded' },
+              { id: 'terminal-1', label: '分析完成', status: 'succeeded' },
+            ],
+          }),
         }}
       />,
     );
 
-    // 两张终态流程卡各自锚定（底部不再出现第三块共享流程区）。
-    const toggles = screen.getAllByRole('button', { name: /执行流程/ });
-    expect(toggles).toHaveLength(2);
-    expect(toggles[0]).toHaveTextContent('共 3 步');
-    expect(toggles[1]).toHaveTextContent('共 2 步');
-    // 第一张卡在第二轮用户消息之前（锚定在第一轮消息下方）。
+    // 历史 run-1 收缩为终态摘要；活跃 run-2 实时展示节点与思考。
+    const collapsed = screen.getByRole('button', { name: /执行卡/ });
+    expect(collapsed).toHaveTextContent('分析完成');
+    expect(collapsed).toHaveTextContent('共 2 步');
+    expect(screen.getByText('kol_feed')).toBeVisible();
+    expect(screen.getByRole('button', { name: '思考中' })).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByText('正在交叉匹配达人')).toBeNull();
+    // 活跃 Run 已锚定到消息，底部不再重复渲染执行卡。
+    expect(screen.getAllByLabelText('执行卡')).toHaveLength(1);
+    // 历史卡锚定在第一轮消息之后、第二轮消息之前；活跃卡在第二轮消息之后。
     const secondMessage = screen.getByText('第二轮分析');
-    expect(toggles[0].compareDocumentPosition(secondMessage) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(collapsed.compareDocumentPosition(secondMessage) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    const activeCard = screen.getByLabelText('执行卡');
+    expect(secondMessage.compareDocumentPosition(activeCard) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
-  it('shows a loading placeholder while a historical flow is replaying and no card when missing', () => {
-    const { rerender } = render(
-      <ChatArea
-        session={{
-          ...session,
-          messages: [{ id: 'm1', sender: 'user', text: '历史分析', timestamp: '10:00', taskId: 'task-h' }],
-        }}
-        onSendMessage={vi.fn()}
-        isAnalyzing={false}
-        isMockMode={false}
-        taskFlows={{}}
-      />,
-    );
-
-    expect(screen.getByText('执行流程加载中…')).toBeVisible();
-
-    rerender(
-      <ChatArea
-        session={{
-          ...session,
-          messages: [{ id: 'm1', sender: 'user', text: '历史分析', timestamp: '10:00', taskId: 'task-h' }],
-        }}
-        onSendMessage={vi.fn()}
-        isAnalyzing={false}
-        isMockMode={false}
-        taskFlows={{ 'task-h': { missing: true } }}
-      />,
-    );
-
-    expect(screen.queryByText('执行流程加载中…')).toBeNull();
-    expect(screen.queryByRole('button', { name: /执行流程/ })).toBeNull();
-  });
-
-  it('renders the active flow live under its trigger message without duplicating the bottom block', () => {
+  it('shows a loading placeholder while a historical run runtime is still loading', () => {
     render(
       <ChatArea
         session={{
           ...session,
-          messages: [{ id: 'm1', sender: 'user', text: '正在进行的分析', timestamp: '10:00', taskId: 'task-1', turnId: 'turn-1' }],
+          messages: [{ id: 'm1', sender: 'user', text: '历史分析', timestamp: '10:00', runId: 'run-h' }],
         }}
         onSendMessage={vi.fn()}
-        isAnalyzing
+        isAnalyzing={false}
         isMockMode={false}
-        flowTaskId="task-1"
-        flowNodes={[{ id: 'tool-1', label: '查询小红书数据', status: 'running' }]}
-        assistantDraft="已找到 2 位候选…"
+        runHistory={{}}
       />,
     );
 
-    // 实时节点 + 草稿锚定在消息下方，全流程区只有这一块。
-    expect(screen.getByText('查询小红书数据')).toBeVisible();
-    expect(screen.getByText(/已找到 2 位候选/)).toBeVisible();
-    expect(screen.getAllByLabelText('执行流程')).toHaveLength(1);
+    expect(screen.getByText('Run 加载中…')).toBeVisible();
+  });
+
+  it('renders a replayed historical run card with tool steps and collapsed thinking', () => {
+    // C3：历史 Run 经事件回放补齐完整 runtime 后，执行卡展开可回看工具步骤，
+    // thinking 以「已思考」折叠区呈现。
+    render(
+      <ChatArea
+        session={{
+          ...session,
+          messages: [{ id: 'm1', sender: 'user', text: '历史分析', timestamp: '10:00', runId: 'run-h' }],
+        }}
+        onSendMessage={vi.fn()}
+        isAnalyzing={false}
+        isMockMode={false}
+        runHistory={{
+          'run-h': runtime('run-h', {
+            status: 'completed',
+            connection: 'closed',
+            hasThinking: true,
+            thinking: '正在检索品牌声量',
+            thinkingStatus: 'completed',
+            steps: [
+              { id: 'run', label: '开始执行', status: 'succeeded' },
+              { id: 'tool-5', label: '查询brand_search', status: 'succeeded' },
+              { id: 'terminal-7', label: '分析完成', status: 'succeeded' },
+            ],
+            toolCalls: [{ id: 'tool-5', name: 'brand_search', status: 'succeeded' }],
+          }),
+        }}
+      />,
+    );
+
+    // 终态折叠摘要带真实步数（回放成功不再是「历史执行记录」空壳）。
+    const collapsed = screen.getByRole('button', { name: /执行卡 · 共 3 步\s*· 分析完成/ });
+    fireEvent.click(collapsed);
+
+    const card = screen.getByLabelText('执行卡');
+    expect(within(card).getByText('brand_search')).toBeVisible();
+    // thinking 折叠展示，展开后可读。
+    fireEvent.click(within(card).getByRole('button', { name: '已思考' }));
+    expect(within(card).getByText('正在检索品牌声量')).toBeVisible();
+  });
+
+  it('wires clarification chips and pause/resume through ChatArea', async () => {
+    const onSendMessage = vi.fn().mockResolvedValue(undefined);
+    const onCancelRun = vi.fn().mockResolvedValue(undefined);
+    const onResumeRun = vi.fn().mockResolvedValue(undefined);
+    const { rerender } = render(
+      <ChatArea
+        session={{
+          ...session,
+          messages: [
+            { id: 'm1', sender: 'user', text: '帮我分析', timestamp: '10:00', runId: 'run-1' },
+            { id: 'a1', sender: 'ai', text: '想看哪个品牌的分析？', timestamp: '10:01', runId: 'run-1', clarify: { options: ['海底捞', '喜茶'] } },
+          ],
+        }}
+        onSendMessage={onSendMessage}
+        isAnalyzing={false}
+        isMockMode={false}
+        run={runtime('run-1', { status: 'clarification_requested' })}
+        onCancelRun={onCancelRun}
+        onResumeRun={onResumeRun}
+      />,
+    );
+
+    // 澄清 chips：点击只填入输入框，不自动提交。
+    const card = screen.getByLabelText('执行卡');
+    await act(async () => {
+      fireEvent.click(within(card).getByRole('button', { name: '海底捞' }));
+    });
+    expect(onSendMessage).not.toHaveBeenCalled();
+    expect((screen.getByPlaceholderText(/输入消息并向 AI 分析师提问/) as HTMLTextAreaElement).value)
+      .toBe('海底捞');
+
+    // paused → 继续按钮调用 onResumeRun。
+    rerender(
+      <ChatArea
+        session={{ ...session, messages: [{ id: 'm1', sender: 'user', text: '帮我分析', timestamp: '10:00', runId: 'run-1' }] }}
+        onSendMessage={onSendMessage}
+        isAnalyzing={false}
+        isMockMode={false}
+        run={runtime('run-1', { status: 'paused' })}
+        onCancelRun={onCancelRun}
+        onResumeRun={onResumeRun}
+      />,
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '继续' }));
+    });
+    expect(onResumeRun).toHaveBeenCalledOnce();
+
+    // running → 暂停按钮调用 onCancelRun。
+    rerender(
+      <ChatArea
+        session={{ ...session, messages: [{ id: 'm1', sender: 'user', text: '帮我分析', timestamp: '10:00', runId: 'run-1' }] }}
+        onSendMessage={onSendMessage}
+        isAnalyzing={false}
+        isMockMode={false}
+        run={runtime('run-1', { status: 'running' })}
+        onCancelRun={onCancelRun}
+        onResumeRun={onResumeRun}
+      />,
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '暂停' }));
+    });
+    expect(onCancelRun).toHaveBeenCalledOnce();
   });
 
   it('allows retrying a terminal user message', async () => {
@@ -591,6 +362,38 @@ describe('ChatArea', () => {
       fireEvent.click(screen.getByRole('button', { name: '再次执行' }));
     });
     expect(onRetryMessage).toHaveBeenCalledWith('message-1');
+  });
+
+  it('only exposes run retry for failed runs', async () => {
+    const onRetryRun = vi.fn().mockResolvedValue(undefined);
+    const message = { id: 'message-1', sender: 'user' as const, text: '重跑这条', timestamp: '10:00', runId: 'run-1' };
+    const { rerender } = render(
+      <ChatArea
+        session={{ ...session, messages: [message] }}
+        onSendMessage={vi.fn()}
+        isAnalyzing={false}
+        isMockMode={false}
+        run={runtime('run-1', { status: 'completed' })}
+        onRetryRun={onRetryRun}
+      />,
+    );
+
+    expect(screen.queryByRole('button', { name: '重试此 Run' })).toBeNull();
+
+    rerender(
+      <ChatArea
+        session={{ ...session, messages: [message] }}
+        onSendMessage={vi.fn()}
+        isAnalyzing={false}
+        isMockMode={false}
+        run={runtime('run-1', { status: 'failed' })}
+        onRetryRun={onRetryRun}
+      />,
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: '重试此 Run' }));
+    });
+    expect(onRetryRun).toHaveBeenCalledWith('run-1');
   });
 
   it('shows ready follow-up suggestions and fills the input with the clicked prompt without sending', async () => {
@@ -614,6 +417,63 @@ describe('ChatArea', () => {
     expect(onSendMessage).not.toHaveBeenCalled();
     expect((screen.getByPlaceholderText(/输入消息并向 AI 分析师提问/) as HTMLTextAreaElement).value)
       .toBe('请进一步分析粉丝地域分布');
+  });
+
+  it('renders utility suggestion chips under the assistant message and fills the input without sending', async () => {
+    const onSendMessage = vi.fn().mockResolvedValue(undefined);
+    render(
+      <ChatArea
+        session={{
+          ...session,
+          messages: [
+            { id: 'm1', sender: 'user', text: '帮我分析品牌', timestamp: '10:00', runId: 'run-1' },
+            {
+              id: 'a1',
+              sender: 'ai',
+              text: '分析完成，共圈选 12 位达人。',
+              timestamp: '10:01',
+              runId: 'run-1',
+              suggestions: ['对比一下竞品的投放节奏', '按预算重新排序达人名单'],
+            },
+          ],
+        }}
+        onSendMessage={onSendMessage}
+        isAnalyzing={false}
+        isMockMode={false}
+        runHistory={{ 'run-1': runtime('run-1', { status: 'completed' }) }}
+      />,
+    );
+
+    const region = screen.getByLabelText('追问建议');
+    const chip = within(region).getByRole('button', { name: '对比一下竞品的投放节奏' });
+    expect(within(region).getByRole('button', { name: '按预算重新排序达人名单' })).toBeVisible();
+    await act(async () => {
+      fireEvent.click(chip);
+    });
+    // 点击只填入输入框并聚焦，不自动提交。
+    expect(onSendMessage).not.toHaveBeenCalled();
+    const input = screen.getByPlaceholderText(/输入消息并向 AI 分析师提问/) as HTMLTextAreaElement;
+    expect(input.value).toBe('对比一下竞品的投放节奏');
+    expect(document.activeElement).toBe(input);
+  });
+
+  it('does not render suggestion chips when the assistant message has no suggestions', () => {
+    render(
+      <ChatArea
+        session={{
+          ...session,
+          messages: [
+            { id: 'a1', sender: 'ai', text: '第一轮分析完成。', timestamp: '10:01', runId: 'run-1' },
+            { id: 'a2', sender: 'ai', text: '第二轮分析完成。', timestamp: '10:02', runId: 'run-2', suggestions: [] },
+          ],
+        }}
+        onSendMessage={vi.fn()}
+        isAnalyzing={false}
+        isMockMode={false}
+      />,
+    );
+
+    expect(screen.queryByLabelText('追问建议')).toBeNull();
   });
 
   it('keeps a long message history inside the fixed workspace column', () => {
@@ -998,88 +858,5 @@ describe('ChatArea', () => {
     expect(screen.getByRole('button', { name: '声量口碑' })).toHaveAttribute('aria-pressed', 'false');
     expect(screen.getByRole('button', { name: '达人投放' })).toHaveAttribute('aria-pressed', 'false');
     expect(screen.getByRole('button', { name: '确认' })).toBeDisabled();
-  });
-
-  it('hides the active turn thinking panel while flow nodes stream and keeps history panels', () => {
-    vi.mocked(useSessionThinkingStream).mockReturnValue({
-      sessionId: 'session-1',
-      byTurn: {
-        'turn-1': [thinkingBlock('历史思考内容', {
-          status: 'completed',
-          durationMs: 21808,
-          label: '历史决策',
-        })],
-        'turn-2': [thinkingBlock('活跃思考内容', {
-          operationId: 'operation-2',
-          turnId: 'turn-2',
-          status: 'completed',
-          durationMs: 5000,
-          label: '活跃决策',
-        })],
-      },
-      sequenceByOperationAttempt: {},
-      connection: 'connected',
-    });
-    render(
-      <ChatArea
-        session={{
-          ...session,
-          messages: [
-            { id: 'message-u1', sender: 'user', text: '第一问', timestamp: '10:00', turnId: 'turn-1' },
-            { id: 'message-u2', sender: 'user', text: '第二问', timestamp: '10:01', turnId: 'turn-2' },
-          ],
-        }}
-        onSendMessage={vi.fn()}
-        isAnalyzing
-        isMockMode={false}
-        flowNodes={[{ id: 'tool-1', label: '查询数据', status: 'running' }]}
-      />,
-    );
-
-    // 历史 turn 的 ThinkingPanel 保留；活跃 turn 的 ThinkingPanel 去重隐藏。
-    expect(screen.getByRole('button', { name: '已思考 21.8 秒' })).toBeVisible();
-    expect(screen.queryByRole('button', { name: '已思考 5.0 秒' })).toBeNull();
-    // 活跃 turn 的思考块并入执行流程节点（默认折叠，展示标签）。
-    const flowSection = screen.getByRole('region', { name: '执行流程' });
-    expect(within(flowSection).getByText('活跃决策')).toBeVisible();
-  });
-
-  it('restores the active turn thinking panel after the flow reaches a terminal state', () => {
-    vi.mocked(useSessionThinkingStream).mockReturnValue({
-      sessionId: 'session-1',
-      byTurn: {
-        'turn-2': [thinkingBlock('活跃思考内容', {
-          operationId: 'operation-2',
-          turnId: 'turn-2',
-          status: 'completed',
-          durationMs: 5000,
-          label: '活跃决策',
-        })],
-      },
-      sequenceByOperationAttempt: {},
-      connection: 'connected',
-    });
-    render(
-      <ChatArea
-        session={{
-          ...session,
-          messages: [
-            { id: 'message-u2', sender: 'user', text: '第二问', timestamp: '10:01', turnId: 'turn-2' },
-          ],
-        }}
-        onSendMessage={vi.fn()}
-        isAnalyzing={false}
-        isMockMode={false}
-        flowTerminal
-        flowTerminalLabel="分析完成"
-        flowNodes={[
-          { id: 'tool-1', label: '查询数据', status: 'succeeded' },
-          { id: 'terminal', label: '分析完成', status: 'succeeded' },
-        ]}
-      />,
-    );
-
-    // 终态后消息下方的 ThinkingPanel 恢复渲染。
-    expect(screen.getByRole('button', { name: '已思考 5.0 秒' })).toBeVisible();
   });
 });

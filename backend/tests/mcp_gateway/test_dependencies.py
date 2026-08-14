@@ -2,7 +2,7 @@ from pydantic import SecretStr
 
 from app.core.config import Settings
 from app.mcp_gateway.datatap import DataTapTransport
-from app.tasks import dependencies
+from app.mcp_gateway import service as gateway_service
 
 
 def settings(**changes: object) -> Settings:
@@ -17,11 +17,11 @@ def settings(**changes: object) -> Settings:
 
 
 def test_process_dependency_always_builds_datatap_transport(monkeypatch) -> None:
-    dependencies.get_mcp_transport.cache_clear()
-    monkeypatch.setattr(dependencies, "get_settings", lambda: settings())
+    gateway_service.get_mcp_transport.cache_clear()
+    monkeypatch.setattr(gateway_service, "get_settings", lambda: settings())
 
-    transport = dependencies.get_mcp_transport()
+    transport = gateway_service.get_mcp_transport()
     assert isinstance(transport, DataTapTransport)
     assert transport._read_timeout_seconds == 60.0
 
-    dependencies.get_mcp_transport.cache_clear()
+    gateway_service.get_mcp_transport.cache_clear()

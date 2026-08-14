@@ -3,7 +3,11 @@ from uuid import uuid4
 
 import pytest
 
-from app.billing.models import WalletTransaction
+from sqlalchemy import select
+
+from app.billing.models import TenantWalletTransaction, WalletTransaction
+from app.pi_gateway.accounting import TenantAccountingService
+from app.tenancy.models import TenantMembership
 from app.mcp_gateway.models import McpCall
 from app.quick.models import QuickMcpCall
 from app.tasks.models import AnalysisTask
@@ -14,8 +18,15 @@ def utc_now() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
 
 
-async def _seed_settled_call(db_session, user, *, platform: str) -> WalletTransaction:
+async def _seed_settled_call(db_session, user, *, platform: str) -> TenantWalletTransaction:
     now = utc_now()
+    membership = await db_session.scalar(
+        select(TenantMembership).where(TenantMembership.user_id == user.id)
+    )
+    assert membership is not None
+    accounting = TenantAccountingService(db_session)
+    await accounting.ensure_tenant_wallet(membership.tenant_id, balance=1000)
+    await accounting.ensure_user_quota(membership.tenant_id, user.id)
     session = WorkspaceSession(
         id=str(uuid4()),
         user_id=user.id,
@@ -55,9 +66,27 @@ async def _seed_settled_call(db_session, user, *, platform: str) -> WalletTransa
         created_at=now,
         updated_at=now,
     )
-    transaction = WalletTransaction(
+    call_id = str(uuid4())
+    legacy_transaction = WalletTransaction(
         id=str(uuid4()),
         user_id=user.id,
+        kind="settle",
+        balance_delta=0,
+        reserved_delta=-10,
+        balance_after=990,
+        reserved_after=0,
+        idempotency_key=f"legacy-mcp:{uuid4()}:settle",
+        reference_type="mcp_call",
+        reference_id=call_id,
+        created_at=now,
+    )
+    transaction = TenantWalletTransaction(
+        id=str(uuid4()),
+        tenant_id=membership.tenant_id,
+        user_id=user.id,
+        run_id=None,
+        tool_call_id=call_id,
+        internal_tool_name="kol.search",
         kind="settle",
         balance_delta=0,
         reserved_delta=-10,
@@ -69,7 +98,7 @@ async def _seed_settled_call(db_session, user, *, platform: str) -> WalletTransa
         created_at=now,
     )
     call = McpCall(
-        id=str(uuid4()),
+        id=call_id,
         logical_call_id=str(uuid4()),
         task_id=task.id,
         batch_no=1,
@@ -79,7 +108,7 @@ async def _seed_settled_call(db_session, user, *, platform: str) -> WalletTransa
         internal_tool_name="kol.search",
         arguments_digest=uuid4().hex + uuid4().hex,
         status="settled",
-        settlement_transaction_id=transaction.id,
+        settlement_transaction_id=legacy_transaction.id,
         created_at=now,
         updated_at=now,
     )
@@ -90,6 +119,8 @@ async def _seed_settled_call(db_session, user, *, platform: str) -> WalletTransa
     db_session.add(message)
     await db_session.flush()
     db_session.add(task)
+    await db_session.flush()
+    db_session.add(legacy_transaction)
     await db_session.flush()
     db_session.add(transaction)
     await db_session.flush()

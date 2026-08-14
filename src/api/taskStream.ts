@@ -1,20 +1,7 @@
-import { authorizedFetch } from './client';
-import type { TaskEvent } from '../state/taskEvents';
-
-
 interface RawSseEvent {
   id?: string;
   event?: string;
   data: string;
-}
-
-function toTaskEvent(taskId: string, raw: RawSseEvent): TaskEvent {
-  const id = Number(raw.id);
-  if (!Number.isSafeInteger(id) || id < 1 || !raw.event) {
-    throw new Error('SSE_INVALID_EVENT');
-  }
-  const payload = JSON.parse(raw.data || '{}') as Record<string, unknown>;
-  return { id, taskId, type: raw.event, payload };
 }
 
 export async function parseSseStream(
@@ -58,17 +45,4 @@ export async function parseSseStream(
   } finally {
     reader.releaseLock();
   }
-}
-
-export async function streamTaskEvents(
-  taskId: string,
-  lastEventId: number,
-  signal: AbortSignal,
-  onEvent: (event: TaskEvent) => void,
-): Promise<void> {
-  const headers = new Headers({ Accept: 'text/event-stream' });
-  if (lastEventId > 0) headers.set('Last-Event-ID', String(lastEventId));
-  const response = await authorizedFetch(`/api/v1/tasks/${taskId}/events`, { headers, signal });
-  if (!response.ok || !response.body) throw new Error(`SSE_${response.status}`);
-  await parseSseStream(response.body, raw => onEvent(toTaskEvent(taskId, raw)));
 }

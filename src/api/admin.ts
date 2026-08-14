@@ -15,6 +15,11 @@ export interface AdminUserListParams {
   offset?: number;
 }
 
+// legacy 用户写操作服务端强制 Idempotency-Key：缺省自动生成，允许调用方显式传入覆盖。
+const idempotencyHeaders = (value?: string): Record<string, string> => ({
+  'Idempotency-Key': value ?? crypto.randomUUID(),
+});
+
 export function listAdminUsers(params: AdminUserListParams = {}): Promise<ApiAdminUserList> {
   const search = new URLSearchParams();
   if (params.keyword) search.set('keyword', params.keyword);
@@ -25,9 +30,13 @@ export function listAdminUsers(params: AdminUserListParams = {}): Promise<ApiAdm
   return request<ApiAdminUserList>(`/api/v1/admin/users${query ? `?${query}` : ''}`);
 }
 
-export function createAdminUser(input: ApiAdminUserCreateInput): Promise<ApiAdminUser> {
+export function createAdminUser(
+  input: ApiAdminUserCreateInput,
+  idempotencyKey?: string,
+): Promise<ApiAdminUser> {
   return request<ApiAdminUser>('/api/v1/admin/users', {
     method: 'POST',
+    headers: idempotencyHeaders(idempotencyKey),
     body: JSON.stringify(input),
   });
 }
@@ -35,16 +44,19 @@ export function createAdminUser(input: ApiAdminUserCreateInput): Promise<ApiAdmi
 export function updateAdminUser(
   id: string,
   changes: ApiAdminUserUpdateInput,
+  idempotencyKey?: string,
 ): Promise<ApiAdminUser> {
   return request<ApiAdminUser>(`/api/v1/admin/users/${encodeURIComponent(id)}`, {
     method: 'PATCH',
+    headers: idempotencyHeaders(idempotencyKey),
     body: JSON.stringify(changes),
   });
 }
 
-export async function deleteAdminUser(id: string): Promise<void> {
+export async function deleteAdminUser(id: string, idempotencyKey?: string): Promise<void> {
   await request(`/api/v1/admin/users/${encodeURIComponent(id)}`, {
     method: 'DELETE',
+    headers: idempotencyHeaders(idempotencyKey),
   });
 }
 

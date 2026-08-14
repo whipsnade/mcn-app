@@ -1,3 +1,5 @@
+"""legacy/read-only ORM：仅注册旧表（分析报告/达人/收藏等），不导出执行服务。"""
+
 from datetime import datetime
 from decimal import Decimal
 from typing import Any

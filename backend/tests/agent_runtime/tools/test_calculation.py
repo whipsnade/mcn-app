@@ -1,0 +1,553 @@
+"""确定性计算工具测试（设计文档 §10.3）。
+
+覆盖五个零积分确定性工具：
+calculate_expression / aggregate_metrics / calculate_period_comparison /
+normalize_sentiment / rank_kols。rank_kols 复用 selection.scoring_v2 严格
+八维 missing_as_zero，并默认跨平台 engagement_total 降序 Top20；结果通过
+settled 的 tool call 行建立 lineage。
+"""
+
+from __future__ import annotations
+
+import json
+from datetime import UTC, datetime
+from uuid import uuid4
+
+import pytest
+from sqlalchemy import select
+
+from app.agent_runtime.models import (
+    AgentRun,
+    AgentRunAttempt,
+    AgentSession,
+    AgentStep,
+    AgentToolCall,
+)
+from app.agent_runtime.tools.calculation import (
+    AggregateMetricsTool,
+    CalculateExpressionTool,
+    CalculatePeriodComparisonTool,
+    NormalizeSentimentTool,
+    RankKolsTool,
+)
+from app.agent_runtime.tools.contracts import ToolContext
+
+CTX = ToolContext(
+    user_id="u-1",
+    session_id="s-1",
+    run_id="r-1",
+    profile_name="session_analyst_v1",
+)
+
+# 与 selection/scoring_v2.WEIGHTS_V2 完全一致（§10.3 权重约束，和 = 100）。
+EXPECTED_WEIGHTS = {
+    "industry_interest": 10,
+    "target_region": 8,
+    "target_age": 8,
+    "engagement": 20,
+    "active_follower": 15,
+    "content": 15,
+    "followers": 10,
+    "engagement_follower_ratio": 14,
+}
+
+
+def _summary(result) -> dict:
+    assert result.status == "success", result.safe_summary
+    return json.loads(result.safe_summary)
+
+
+def _now() -> datetime:
+    return datetime.now(UTC).replace(tzinfo=None)
+
+
+async def _make_chain(db_session, user_id: str) -> tuple[AgentSession, AgentRun, AgentStep]:
+    now = _now()
+    session = AgentSession(
+        id=str(uuid4()), user_id=user_id, title="会话", status="active", created_at=now, updated_at=now
+    )
+    db_session.add(session)
+    await db_session.flush()
+    run = AgentRun(
+        id=str(uuid4()),
+        session_id=session.id,
+        user_id=user_id,
+        profile_name="session_analyst_v1",
+        profile_version="v1",
+        model="test-model",
+        status="running",
+    )
+    db_session.add(run)
+    await db_session.flush()
+    attempt = AgentRunAttempt(id=str(uuid4()), run_id=run.id, attempt=1, started_at=now)
+    db_session.add(attempt)
+    await db_session.flush()
+    step = AgentStep(
+        id=str(uuid4()),
+        run_id=run.id,
+        attempt_id=attempt.id,
+        sequence=1,
+        step_type="tool_call",
+        status="running",
+        created_at=now,
+    )
+    db_session.add(step)
+    await db_session.flush()
+    return session, run, step
+
+
+def _kol_item(
+    *,
+    uid: str,
+    engagement_total: float | None,
+    followers: int = 500_000,
+    **overrides: object,
+) -> dict:
+    item = {
+        "platform": "小红书",
+        "kol_uid": uid,
+        "nickname": f"达人{uid}",
+        "followers": followers,
+        "engagement_total": engagement_total,
+        "growth_rate": 0.3,
+        "quoted_price": 800,
+        "score_inputs": {
+            "audience_interests": {"美食": 80},
+            "audience_regions": {"上海": 50},
+            "audience_age": {"18-24岁": 40, "25至34": 30},
+            "average_interactions": 20_000,
+            "effective_follower_rate": 60,
+            "active_follower_count": 300_000,
+            "content_score": 90,
+            "interaction_follower_ratio": 3.0,
+        },
+    }
+    item.update(overrides)
+    return item
+
+
+# ---------------------------------------------------------------------------
+# calculate_expression：受限安全表达式求值
+# ---------------------------------------------------------------------------
+
+
+async def test_calculate_expression_arithmetic() -> None:
+    tool = CalculateExpressionTool()
+    result = await tool.execute(CTX, type(tool).input_model(expression="1 + 2 * 3"))
+    data = _summary(result)
+    assert data["result"] == 7
+    assert data["expression"] == "1 + 2 * 3"
+
+
+async def test_calculate_expression_uses_variables() -> None:
+    tool = CalculateExpressionTool()
+    result = await tool.execute(
+        CTX, type(tool).input_model(expression="x * y + 1", variables={"x": 2, "y": 3})
+    )
+    assert _summary(result)["result"] == 7
+
+
+async def test_calculate_expression_supports_compare() -> None:
+    tool = CalculateExpressionTool()
+    result = await tool.execute(
+        CTX, type(tool).input_model(expression="x > 100", variables={"x": 120})
+    )
+    assert _summary(result)["result"] is True
+
+
+async def test_calculate_expression_rejects_arbitrary_code() -> None:
+    tool = CalculateExpressionTool()
+    for unsafe in (
+        "__import__('os').getcwd()",
+        "1 + len([])",
+        "(1).__class__",
+        "[x for x in (1, 2)]",
+        "lambda: 1",
+    ):
+        result = await tool.execute(CTX, type(tool).input_model(expression=unsafe))
+        assert result.status == "failed", unsafe
+        assert result.safe_summary
+
+
+async def test_calculate_expression_rejects_huge_power_fast() -> None:
+    tool = CalculateExpressionTool()
+    # 9**9**9 ≈ 10^(3.7e8 位)：必须在构造天文数字前被拒绝（快速返回，不挂起）。
+    result = await tool.execute(CTX, type(tool).input_model(expression="9**9**9"))
+    assert result.status == "failed"
+    assert "exponent too large" in result.safe_summary
+
+
+async def test_calculate_expression_rejects_huge_exponent_constant() -> None:
+    tool = CalculateExpressionTool()
+    result = await tool.execute(CTX, type(tool).input_model(expression="2**100000"))
+    assert result.status == "failed"
+    assert "exponent too large" in result.safe_summary
+
+
+async def test_calculate_expression_oversized_result_is_structured_error() -> None:
+    tool = CalculateExpressionTool()
+    # (10**999)**5 ≈ 10^4995，超过 Python int→str 的 4300 位上限：
+    # 返回结构化错误而非抛异常崩溃。
+    result = await tool.execute(CTX, type(tool).input_model(expression="(10**999)**5"))
+    assert result.status == "failed"
+    assert "serialize" in result.safe_summary
+
+
+# ---------------------------------------------------------------------------
+# aggregate_metrics：确定性聚合
+# ---------------------------------------------------------------------------
+
+
+async def test_aggregate_metrics_by_group() -> None:
+    tool = AggregateMetricsTool()
+    rows = [
+        {"brand": "A", "volume": 100, "spend": 10},
+        {"brand": "A", "volume": 200, "spend": 20},
+        {"brand": "B", "volume": 50, "spend": 5},
+    ]
+    metrics = [
+        {"name": "total_volume", "field": "volume", "op": "sum"},
+        {"name": "avg_spend", "field": "spend", "op": "avg"},
+        {"name": "min_volume", "field": "volume", "op": "min"},
+        {"name": "max_volume", "field": "volume", "op": "max"},
+        {"name": "count_volume", "field": "volume", "op": "count"},
+    ]
+    result = await tool.execute(
+        CTX, type(tool).input_model(rows=rows, group_by="brand", metrics=metrics)
+    )
+    data = _summary(result)
+    groups = {g["group"]["brand"]: g for g in data["groups"]}
+    assert groups["A"]["total_volume"] == 300
+    assert groups["A"]["avg_spend"] == 15
+    assert groups["A"]["min_volume"] == 100
+    assert groups["A"]["max_volume"] == 200
+    assert groups["A"]["count_volume"] == 2
+    assert groups["B"]["total_volume"] == 50
+    assert data["rows_processed"] == 3
+
+
+async def test_aggregate_metrics_without_group() -> None:
+    tool = AggregateMetricsTool()
+    result = await tool.execute(
+        CTX,
+        type(tool).input_model(
+            rows=[{"v": 1}, {"v": 2}, {"v": 3}],
+            metrics=[{"name": "sum", "field": "v", "op": "sum"}],
+        ),
+    )
+    data = _summary(result)
+    assert data["groups"] == [{"group": None, "sum": 6}]
+
+
+async def test_aggregate_metrics_skips_missing_values_and_deterministic_order() -> None:
+    tool = AggregateMetricsTool()
+    rows = [{"k": "b", "v": 10}, {"k": "a", "v": 20}, {"k": "a"}]
+    result = await tool.execute(
+        CTX,
+        type(tool).input_model(
+            rows=rows,
+            group_by="k",
+            metrics=[{"name": "sum", "field": "v", "op": "sum"}, {"name": "cnt", "field": "v", "op": "count"}],
+        ),
+    )
+    data = _summary(result)
+    # 组顺序确定性：按组键排序；缺失值不计入 sum。
+    assert [g["group"]["k"] for g in data["groups"]] == ["a", "b"]
+    by_key = {g["group"]["k"]: g for g in data["groups"]}
+    assert by_key["a"]["sum"] == 20
+    assert by_key["a"]["cnt"] == 1
+    assert by_key["b"]["sum"] == 10
+
+
+# ---------------------------------------------------------------------------
+# calculate_period_comparison：delta + rate
+# ---------------------------------------------------------------------------
+
+
+async def test_period_comparison_numbers() -> None:
+    tool = CalculatePeriodComparisonTool()
+    result = await tool.execute(
+        CTX, type(tool).input_model(current=120, baseline=100)
+    )
+    data = _summary(result)
+    assert data["delta"] == 20
+    assert data["rate"] == pytest.approx(0.2)
+
+
+async def test_period_comparison_zero_baseline_rate_is_null() -> None:
+    tool = CalculatePeriodComparisonTool()
+    result = await tool.execute(
+        CTX, type(tool).input_model(current=10, baseline=0)
+    )
+    data = _summary(result)
+    assert data["delta"] == 10
+    assert data["rate"] is None
+
+
+async def test_period_comparison_dicts() -> None:
+    tool = CalculatePeriodComparisonTool()
+    result = await tool.execute(
+        CTX,
+        type(tool).input_model(current={"声量": 120, "互动": 60}, baseline={"声量": 100, "互动": 80}),
+    )
+    data = _summary(result)
+    assert data["声量"]["delta"] == 20
+    assert data["声量"]["rate"] == pytest.approx(0.2)
+    assert data["互动"]["delta"] == -20
+    assert data["互动"]["rate"] == pytest.approx(-0.25)
+
+
+# ---------------------------------------------------------------------------
+# normalize_sentiment：规范化情感
+# ---------------------------------------------------------------------------
+
+
+async def test_normalize_sentiment_numeric() -> None:
+    tool = NormalizeSentimentTool()
+    assert _summary(await tool.execute(CTX, type(tool).input_model(raw=0.8)))["sentiment"] == "positive"
+    assert _summary(await tool.execute(CTX, type(tool).input_model(raw=-0.5)))["sentiment"] == "negative"
+    assert _summary(await tool.execute(CTX, type(tool).input_model(raw=0.1)))["sentiment"] == "neutral"
+    assert _summary(await tool.execute(CTX, type(tool).input_model(raw=75)))["sentiment"] == "positive"
+    assert _summary(await tool.execute(CTX, type(tool).input_model(raw=20)))["sentiment"] == "negative"
+
+
+async def test_normalize_sentiment_labels() -> None:
+    tool = NormalizeSentimentTool()
+    for raw, expected in (
+        ("正面", "positive"),
+        ("positive", "positive"),
+        ("积极", "positive"),
+        ("负面", "negative"),
+        ("negative", "negative"),
+        ("中性", "neutral"),
+        ("neutral", "neutral"),
+        ("未知标签", "neutral"),
+    ):
+        data = _summary(await tool.execute(CTX, type(tool).input_model(raw=raw)))
+        assert data["sentiment"] == expected, raw
+        assert data["polarity"] in (1, 0, -1)
+
+
+# ---------------------------------------------------------------------------
+# rank_kols：严格复用 kol_value_score_v3（效果 70 + 价格效率 30）
+# ---------------------------------------------------------------------------
+
+V3_EXPECTED_WEIGHTS = {
+    "average_interactions": 14,
+    "active_follower": 10,
+    "engagement_follower_ratio": 10,
+    "content_match": 10,
+    "followers": 7,
+    "industry_interest": 7,
+    "target_region": 6,
+    "target_age": 6,
+}
+
+
+async def test_rank_kols_uses_strict_v3_snapshot_with_exact_weights() -> None:
+    tool = RankKolsTool()
+    result = await tool.execute(
+        CTX,
+        type(tool).input_model(
+            items=[_kol_item(uid="1", engagement_total=100)],
+            context={"industry": "美食", "regions": ["上海", "杭州"], "age_ranges": ["18-24", "25-34"]},
+        ),
+    )
+    data = _summary(result)
+    assert data["total"] == 1
+    item = data["items"][0]
+    snapshot = item["score_snapshot"]
+    assert snapshot["version"] == "kol_value_score_v3"
+    assert set(snapshot["dimensions"].keys()) == set(V3_EXPECTED_WEIGHTS.keys())
+    for name, dimension in snapshot["dimensions"].items():
+        assert dimension["weight"] == V3_EXPECTED_WEIGHTS[name]
+        assert dimension["weighted_score"] == pytest.approx(
+            round(dimension["raw_score"] * V3_EXPECTED_WEIGHTS[name] / 100, 2)
+        )
+    # 效果 70 + 价格效率 30 = 价值总分。
+    assert snapshot["effect_score"] == pytest.approx(
+        sum(d["weighted_score"] for d in snapshot["dimensions"].values())
+    )
+    assert snapshot["value_score"] == pytest.approx(
+        snapshot["effect_score"] + snapshot["price_efficiency_score"]
+    )
+    assert snapshot["price_sample_size"] >= 0
+
+
+async def test_rank_kols_missing_dimension_is_zero_no_redistribution() -> None:
+    tool = RankKolsTool()
+    result = await tool.execute(
+        CTX,
+        type(tool).input_model(
+            items=[_kol_item(uid="1", engagement_total=50, score_inputs={"content_score": 80})],
+            context={"industry": "美食", "regions": ["上海"], "age_ranges": ["18-24"]},
+        ),
+    )
+    data = _summary(result)
+    snapshot = data["items"][0]["score_snapshot"]
+    # 仅 content_match=80 → 10 分维度有效：weighted=8，其余维度 0，无权重重分配。
+    assert snapshot["dimensions"]["content_match"]["raw_score"] == 80
+    assert snapshot["dimensions"]["average_interactions"]["raw_score"] == 0
+    assert snapshot["dimensions"]["average_interactions"]["missing_reason"] == "missing_average_interactions"
+    assert snapshot["effect_score"] == pytest.approx(8.0)
+    assert snapshot["data_completeness"] == pytest.approx(10 / 70 * 100, abs=0.01)
+
+
+async def test_rank_kols_default_top20_sorted_by_value_with_stable_tiebreak() -> None:
+    tool = RankKolsTool()
+    # d1 互动/粉丝最高 → 效果与价值最高；其余同输入 → 稳定 tie-break。
+    items = [
+        _kol_item(uid=f"{i}", engagement_total=float(200 - i * 10)) for i in range(5)
+    ]
+    items[0]["score_inputs"]["average_interactions"] = 200_000
+    items[0]["score_inputs"]["followers"] = 5_000_000
+    items.reverse()
+    result = await tool.execute(
+        CTX,
+        type(tool).input_model(
+            items=items,
+            context={"industry": "美食", "regions": ["上海"], "age_ranges": ["18-24"]},
+        ),
+    )
+    data = _summary(result)
+    assert data["items"][0]["kol_uid"] == "0"
+    assert [item["rank"] for item in data["items"]] == [1, 2, 3, 4, 5]
+    assert data["truncated"] is False
+
+
+async def test_rank_kols_preference_only_changes_order_not_scores() -> None:
+    tool = RankKolsTool()
+    items = [
+        _kol_item(uid="a", engagement_total=100, quoted_price=1000),
+        _kol_item(uid="b", engagement_total=100, quoted_price=800),
+        _kol_item(uid="c", engagement_total=100, quoted_price=600),
+    ]
+    balanced = _summary(await tool.execute(
+        CTX, type(tool).input_model(items=items, context={"industry": "美食"},
+                                   preference="balanced")))
+    effect = _summary(await tool.execute(
+        CTX, type(tool).input_model(items=items, context={"industry": "美食"},
+                                   preference="effect")))
+    scores = {
+        item["kol_uid"]: (item["score_snapshot"]["effect_score"],
+                          item["score_snapshot"]["price_efficiency_score"],
+                          item["score_snapshot"]["value_score"])
+        for item in balanced["items"]
+    }
+    for rows in (balanced, effect):
+        for item in rows["items"]:
+            uid = item["kol_uid"]
+            assert (item["score_snapshot"]["effect_score"],
+                    item["score_snapshot"]["price_efficiency_score"],
+                    item["score_snapshot"]["value_score"]) == scores[uid]
+    # price 模式下最低报价（最高性价比）排第一。
+    price = _summary(await tool.execute(
+        CTX, type(tool).input_model(items=items, context={"industry": "美食"},
+                                   preference="price")))
+    assert price["items"][0]["kol_uid"] == "c"
+
+
+async def test_rank_kols_price_needs_three_valid_quotes_and_missing_quote_last() -> None:
+    tool = RankKolsTool()
+    unpriced = _kol_item(uid="u", engagement_total=200, quoted_price=None,
+                         score_inputs={"average_interactions": 200_000, "followers": 5_000_000})
+    items = [
+        unpriced,
+        _kol_item(uid="p1", engagement_total=100, quoted_price=1000),
+        _kol_item(uid="p2", engagement_total=100, quoted_price=800),
+    ]
+    result = await tool.execute(
+        CTX,
+        type(tool).input_model(
+            items=items, context={"industry": "美食"}, limit=10
+        ),
+    )
+    data = _summary(result)
+    assert data["items"][-1]["kol_uid"] == "u"  # 报价缺失置后
+    assert data["items"][-1]["score_snapshot"]["price_efficiency_score"] == 0
+    assert data["items"][-1]["score_snapshot"]["quoted_price"] is None
+    # 有效报价 2 个 < 3 → 全部价格效率 0。
+    assert all(item["score_snapshot"]["price_efficiency_score"] == 0 for item in data["items"])
+    assert data["items"][0]["score_snapshot"]["price_sample_size"] == 2
+
+
+async def test_rank_kols_limit_truncates_and_marks_truncated() -> None:
+    tool = RankKolsTool()
+    items = [
+        _kol_item(uid=f"{i}", engagement_total=float(200 - i * 10)) for i in range(5)
+    ]
+    result = await tool.execute(
+        CTX,
+        type(tool).input_model(
+            items=items, context={"industry": "美食"}, limit=2
+        ),
+    )
+    data = _summary(result)
+    assert len(data["items"]) == 2
+    assert data["truncated"] is True
+
+
+async def test_rank_kols_records_settled_zero_cost_tool_call(db_session, user_factory) -> None:
+    user = await user_factory()
+    session, run, step = await _make_chain(db_session, user.id)
+    tool = RankKolsTool(db_session)
+    context = ToolContext(
+        user_id=user.id,
+        session_id=session.id,
+        run_id=run.id,
+        profile_name="session_analyst_v1",
+        step_id=step.id,
+    )
+    result = await tool.execute(
+        context,
+        type(tool).input_model(
+            items=[_kol_item(uid="1", engagement_total=100)],
+            context={"industry": "美食", "regions": ["上海"], "age_ranges": ["18-24"]},
+        ),
+    )
+    assert result.status == "success"
+    assert json.loads(result.safe_summary)["items"][0]["rank"] == 1
+    rows = (
+        await db_session.scalars(select(AgentToolCall).where(AgentToolCall.run_id == run.id))
+    ).all()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.status == "settled"
+    assert row.internal_tool_name == "rank_kols"
+    assert row.step_id == step.id
+    # 零积分确定性工具不产生任何计费。
+    assert row.points_reserved == 0
+    assert row.points_settled == 0
+    assert row.arguments_json is not None
+    assert row.arguments_hash
+    # logical_call_id 确定性派生：同一 run/step/参数重入复用同一行。
+    assert len({row.logical_call_id for row in rows}) == 1
+
+
+async def test_settled_call_duplicate_insert_is_idempotent(db_session, user_factory) -> None:
+    from unittest.mock import AsyncMock, patch
+
+    user = await user_factory()
+    session, run, step = await _make_chain(db_session, user.id)
+    tool = RankKolsTool(db_session)
+    context = ToolContext(
+        user_id=user.id,
+        session_id=session.id,
+        run_id=run.id,
+        profile_name="session_analyst_v1",
+        step_id=step.id,
+    )
+    args = type(tool).input_model(
+        items=[_kol_item(uid="1", engagement_total=100)],
+        context={"industry": "美食", "regions": ["上海"], "age_ranges": ["18-24"]},
+    )
+    await tool.execute(context, args)
+
+    # 模拟并发 TOCTOU：幂等预查 miss，INSERT 撞唯一约束 → 不崩溃、不重复落库。
+    with patch.object(db_session, "scalar", new=AsyncMock(return_value=None)):
+        result = await tool.execute(context, args)
+    assert result.status == "success"
+    rows = (
+        await db_session.scalars(select(AgentToolCall).where(AgentToolCall.run_id == run.id))
+    ).all()
+    assert len(rows) == 1

@@ -1,6 +1,7 @@
 interface FakeSseEvent {
   id: number;
-  taskId: string;
+  /** 任务流事件携带 taskId；Agent Run 事件没有该字段。 */
+  taskId?: string;
   type: string;
   payload: Record<string, unknown>;
 }

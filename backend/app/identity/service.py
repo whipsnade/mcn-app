@@ -9,6 +9,7 @@ from app.billing.service import WalletService
 from app.core.config import get_settings
 from app.core.security import create_access_token, create_refresh_token, hash_refresh_token
 from app.identity.models import AuthIdentity, LoginSession, User, UserChannelPermission
+from app.tenancy.service import TenantService
 
 
 def utc_now() -> datetime:
@@ -86,6 +87,16 @@ class IdentityService:
         )
         self.db.add(user)
         await self.db.flush()
+        tenant_context = await TenantService(self.db).provision_personal_tenant(
+            user.id, name=nickname, now=now
+        )
+        # New users created after B4 start on the tenant ledger.  The legacy
+        # Wallet row is not created as a second source of truth.
+        from app.pi_gateway.accounting import TenantAccountingService
+
+        accounting = TenantAccountingService(self.db)
+        await accounting.ensure_tenant_wallet(tenant_context.tenant_id)
+        await accounting.ensure_user_quota(tenant_context.tenant_id, user.id)
         self.db.add(
             AuthIdentity(
                 id=str(uuid4()),

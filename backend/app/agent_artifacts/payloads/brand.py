@@ -1,0 +1,195 @@
+"""brand_report_v3: 品牌八章节强类型 payload (spec §12.1)."""
+
+from __future__ import annotations
+
+from datetime import date
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from app.agent_artifacts.canonical import CanonicalPayloadMixin
+from app.agent_artifacts.payloads.common import (
+    ArtifactPayloadBase,
+    ContentTypeItem,
+    NarrativeFinding,
+    NarrativeRecommendation,
+    Period,
+    SentimentSection,
+    TopPost,
+    UniqueKeyValidator,
+)
+
+
+class BrandScope(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    brand: str
+    period: Period
+    platforms: tuple[str, ...] = Field(default_factory=tuple)
+    keywords: tuple[str, ...] = Field(default_factory=tuple)
+    comparison_mode: Literal["none", "mom", "mom_yoy"]
+
+
+class BrandPlatformMetric(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    platform: str
+    volume: int | None
+    engagement: int | None
+    posts: int | None
+    share_of_voice: float | None
+    sentiment_score: float | None
+
+
+class BrandOverview(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    total_volume: int | None
+    total_engagement: int | None
+    total_posts: int | None
+    sentiment_score: float | None
+    platforms: tuple[BrandPlatformMetric, ...] = Field(default_factory=tuple)
+
+
+class ComparisonMetric(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    metric: str
+    current: float | None
+    baseline: float | None
+    delta: float | None
+    rate: float | None
+
+
+class Comparison(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    status: Literal["not_requested", "complete", "partial", "unavailable"]
+    baseline_period: Period | None = None
+    metrics: tuple[ComparisonMetric, ...] = Field(default_factory=tuple)
+
+    @model_validator(mode="after")
+    def _validate_requested_invariant(self) -> Comparison:
+        """Spec §12.1: an unrequested comparison is not_requested and has no metrics."""
+        if self.status == "not_requested":
+            if self.metrics:
+                raise ValueError("status=not_requested comparison must have no metrics")
+        elif not self.metrics:
+            raise ValueError(f"comparison with status={self.status!r} must have metrics")
+        return self
+
+
+class BrandComparisons(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    mom: Comparison
+    yoy: Comparison
+
+
+class DailyTrendItem(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    date: date
+    platform: str
+    volume: int | None
+    engagement: int | None
+    positive: int | None
+    neutral: int | None
+    negative: int | None
+
+
+class CreatorTierItem(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    platform: str
+    tier: str
+    creator_count: int | None
+    posts: int | None
+    volume: int | None
+    engagement: int | None
+
+
+class OrganicVsPaidItem(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    platform: str
+    kind: str
+    posts: int | None
+    volume: int | None
+    engagement: int | None
+
+
+class RegionItem(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    region: str
+    volume: int | None
+    share: float | None
+    sentiment_score: float | None
+
+
+class TopicItem(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    topic: str
+    volume: int | None
+    engagement: int | None
+    sentiment_score: float | None
+
+
+class BrandData(UniqueKeyValidator):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    overview: BrandOverview
+    comparisons: BrandComparisons
+    sentiment: SentimentSection
+    daily_trend: tuple[DailyTrendItem, ...] = Field(default_factory=tuple)
+    content_types: tuple[ContentTypeItem, ...] = Field(default_factory=tuple)
+    creator_tiers: tuple[CreatorTierItem, ...] = Field(default_factory=tuple)
+    organic_vs_paid: tuple[OrganicVsPaidItem, ...] = Field(default_factory=tuple)
+    regions: tuple[RegionItem, ...] = Field(default_factory=tuple)
+    topics: tuple[TopicItem, ...] = Field(default_factory=tuple)
+    top_posts: tuple[TopPost, ...] = Field(default_factory=tuple, max_length=20)
+
+    STABLE_KEYS = {
+        "top_posts": ("platform", "post_id"),
+        "regions": ("region",),
+        "topics": ("topic",),
+        "content_types": ("platform", "type"),
+        "creator_tiers": ("platform", "tier"),
+        "organic_vs_paid": ("platform", "kind"),
+    }
+
+
+class BrandNarrative(BaseModel):
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    executive_summary: str
+    findings: tuple[NarrativeFinding, ...] = Field(default_factory=tuple)
+    recommendations: tuple[NarrativeRecommendation, ...] = Field(default_factory=tuple)
+
+
+class BrandReportV3(ArtifactPayloadBase, CanonicalPayloadMixin):
+    schema_version: Literal["brand_report_v3"] = "brand_report_v3"
+    module: Literal["brand"] = "brand"
+
+    scope: BrandScope
+    data: BrandData
+    narrative: BrandNarrative
+
+    REQUIRED_SECTIONS = frozenset({"overview", "sentiment", "daily_trend", "topics", "top_posts"})
+    # §6.3：全部业务章节根纳入递归 null 治理（含数组元素内的 Optional 数值叶子）。
+    GOVERNED_SECTIONS = frozenset(
+        {
+            "overview",
+            "comparisons",
+            "sentiment",
+            "daily_trend",
+            "content_types",
+            "creator_tiers",
+            "organic_vs_paid",
+            "regions",
+            "topics",
+            "top_posts",
+        }
+    )

@@ -1,0 +1,105 @@
+{
+  "exemplar_id": "brand_analysis_success_v1",
+  "version": 1,
+  "purpose": "agent_loop",
+  "domain": "brand",
+  "language": "zh-CN",
+  "source": {
+    "kind": "curated_success_record",
+    "record_path": "backend/app/agent_runtime/exemplars/brand_analysis_success_v1.source.md",
+    "verified_result": "brand_report_excel_generated",
+    "sanitized": true
+  },
+  "applicable_when": [
+    "用户要求对单一品牌做指定周期的社媒声量、互动、情感或综合表现分析",
+    "目标是形成正式品牌 Artifact、BI 与 Excel，而非只解释已有报告"
+  ],
+  "parameters": {
+    "brand": "{{brand}}",
+    "period_start": "{{period_start}}",
+    "period_end": "{{period_end}}",
+    "platforms": "{{platforms}}",
+    "comparison_mode": "{{comparison_mode}}"
+  },
+  "objective": "在不规定固定工具顺序的前提下，采集足以支撑品牌概览、情感、趋势、内容、地域、热门帖子、洞察和方法论的证据，并发布可追溯报告。",
+  "successful_strategy": [
+    {
+      "stage": "resolve_entity",
+      "goal": "先确认供应商可识别的品牌实体或标签，避免宽泛关键词污染结果。",
+      "preferred_capability": "品牌标签匹配工具",
+      "success_signal": "返回与 {{brand}} 对应且可用于后续查询的稳定标签或实体标识",
+      "fallback": "若无法唯一匹配，ask_user 澄清品牌全称、行业或官方账号，不进入正式查询"
+    },
+    {
+      "stage": "collect_core_metrics",
+      "goal": "按平台采集当前周期核心声量、互动、内容量、情感和可用对比指标。",
+      "preferred_capability": "平台概览统计工具",
+      "success_signal": "当前周期至少一个平台返回可靠核心指标",
+      "fallback": "拆分平台、缩小维度或改用通用分析查询；保留失败状态并避免原样重复"
+    },
+    {
+      "stage": "collect_trend",
+      "goal": "获得可按日或周展示的声量与互动趋势。",
+      "preferred_capability": "趋势统计工具",
+      "success_signal": "返回时间键和可汇总指标",
+      "fallback": "专用趋势工具失败时，使用通用分析工具按“日”或“周”维度查询，并在 limitations/methodology 披露替代口径"
+    },
+    {
+      "stage": "collect_dimensions",
+      "goal": "补充平台×情感、内容类型、地域、话题和热点用户等报告维度。",
+      "preferred_capability": "通用多维分析、热点话题和热点用户工具",
+      "success_signal": "返回的维度能够映射到目标报告章节",
+      "fallback": "无法获得的章节标记 restricted/null，不用其他指标猜测"
+    },
+    {
+      "stage": "collect_posts",
+      "goal": "采集带稳定身份、标题、作者、发布时间、互动指标和可用链接的热门原帖。",
+      "preferred_capability": "原帖查询工具",
+      "success_signal": "每个平台存在可审计的热门帖子记录",
+      "fallback": "平台字段缺失时保留 null 和字段可用性，不伪造标题或链接"
+    },
+    {
+      "stage": "reconcile_and_build",
+      "goal": "确定性核对数据后调用品牌 Builder，再直接发布 Artifact。",
+      "preferred_capability": "计算工具、build_brand_report_draft、publish_artifacts",
+      "success_signal": "概览与趋势在允许误差内一致，Schema/lineage/availability 校验通过",
+      "fallback": "冲突值双口径保留并标记 restricted；Builder 或发布错误按结构化反馈修订，不交给模型补造数值"
+    }
+  ],
+  "decision_rules": [
+    "本案例是策略参考，不是固定编排；模型必须依据实时工具目录、用户范围、覆盖状态和错误反馈决定下一步。",
+    "实体、日期、平台和工具参数必须使用本次 Run 的真实值，禁止照抄来源案例中的品牌或日期。",
+    "result_unknown 禁止重放；succeeded_empty 不用相同参数重复；failed_confirmed 应调整参数、拆平台或换工具。",
+    "专用工具失败不代表整个章节失败；存在已成功返回的等价维度时，可以确定性构造替代结果并披露来源。",
+    "概览总量应由同口径平台值汇总；对比率应先恢复各平台对比期基数再聚合，不能直接平均百分比。",
+    "趋势汇总应与概览核对；无法解释的差异必须保留限制说明。",
+    "任何未返回数值保持 null；只允许确定性计算产生衍生值，并为衍生值保存输入引用与方法。"
+  ],
+  "coverage_targets": [
+    "overview",
+    "sentiment",
+    "trend",
+    "content_and_creators",
+    "regions_topics_audience",
+    "top_posts",
+    "insights_and_recommendations",
+    "methodology"
+  ],
+  "completion_contract": {
+    "no_current_period_evidence": "do_not_publish",
+    "core_evidence_with_missing_sections": "publish_restricted",
+    "all_required_checks_pass": "publish_complete",
+    "final_outputs": [
+      "brand_report_v3 artifact version",
+      "brand BI rendered from the same version",
+      "8-sheet Excel rendered from the same version",
+      "assistant conclusion referencing the published version"
+    ]
+  },
+  "forbidden_copy_values": [
+    "瑞幸咖啡",
+    "2026-07-01",
+    "2026-07-31",
+    "425457"
+  ]
+}

@@ -1,6 +1,38 @@
-from app.admin.models import AdminAuditLog
+from app.agent_artifacts.models import (
+    AgentArtifact,
+    AgentArtifactReadState,
+    AgentArtifactVersion,
+    ArtifactDraft,
+    ArtifactDraftRevision,
+    ArtifactEvent,
+    ArtifactReviewAttempt,
+    ArtifactReviewBatch,
+    ArtifactReviewItem,
+    KolDetailCache,
+)
+from app.agent_runtime.models import (
+    AgentEvent,
+    AgentMessage,
+    AgentRun,
+    AgentRunAttempt,
+    AgentSession,
+    AgentStep,
+    AgentToolCall,
+    AgentToolCallReconciliation,
+    EvidenceItem,
+    MemoryEntry,
+)
+from app.admin.models import AdminAuditLog, AdminIdempotencyRecord
 from app.artifacts.models import ArtifactReadState, TaskArtifact
-from app.billing.models import Wallet, WalletTransaction
+from app.billing.models import (
+    RuntimeUsageRecord,
+    TenantUserQuotaPolicy,
+    TenantUserQuotaUsage,
+    TenantWallet,
+    TenantWalletTransaction,
+    Wallet,
+    WalletTransaction,
+)
 from app.goals.models import TaskGoal
 from app.identity.models import (
     AuthIdentity,
@@ -9,6 +41,7 @@ from app.identity.models import (
     UserBrandProfile,
     UserChannelPermission,
 )
+from app.licensing.models import TenantLicense
 from app.mcp_gateway.models import McpCall, McpToolCatalog, McpToolDiscovery
 from app.model.models import ModelPromptLog, ModelRun
 from app.quick.models import QuickMcpCall
@@ -22,19 +55,42 @@ from app.reporting.models import (
     TaskCandidatePoolItem,
     UserKolFavorite,
 )
+from app.runtime_config.models import EncryptedRuntimeSecret, RuntimeConfigVersion
+from app.pi_gateway.models import PiGatewayInstance, PiGatewayRequestNonce, PiTenantQueueState
 from app.selection.models import KolSelectionItem, KolSelectionSet, SessionKolSelection
+from app.tenancy.models import Tenant, TenantMembership
 from app.tasks.models import AnalysisTask, TaskEvent
 from app.workspace.models import Message, WorkspaceSession
 
 
 __all__ = [
     "AdminAuditLog",
+    "AdminIdempotencyRecord",
+    "AgentArtifact",
+    "AgentArtifactReadState",
+    "AgentArtifactVersion",
+    "AgentEvent",
+    "AgentMessage",
+    "AgentRun",
+    "AgentRunAttempt",
+    "AgentSession",
+    "AgentStep",
+    "AgentToolCall",
+    "AgentToolCallReconciliation",
     "AnalysisReport",
     "AnalysisTask",
+    "ArtifactDraft",
+    "ArtifactDraftRevision",
+    "ArtifactEvent",
     "ArtifactReadState",
+    "ArtifactReviewAttempt",
+    "ArtifactReviewBatch",
+    "ArtifactReviewItem",
     "AuthIdentity",
     "BiReport",
+    "EvidenceItem",
     "Kol",
+    "KolDetailCache",
     "KolSelectionItem",
     "KolSelectionSet",
     "KolSnapshot",
@@ -42,10 +98,16 @@ __all__ = [
     "McpCall",
     "McpToolCatalog",
     "McpToolDiscovery",
+    "MemoryEntry",
     "Message",
     "ModelPromptLog",
     "ModelRun",
     "QuickMcpCall",
+    "EncryptedRuntimeSecret",
+    "RuntimeConfigVersion",
+    "PiGatewayInstance",
+    "PiGatewayRequestNonce",
+    "PiTenantQueueState",
     "SessionKolSelection",
     "TaskArtifact",
     "TaskCandidate",
@@ -53,11 +115,19 @@ __all__ = [
     "TaskCandidatePoolItem",
     "TaskEvent",
     "TaskGoal",
+    "Tenant",
+    "TenantLicense",
+    "TenantMembership",
     "User",
     "UserBrandProfile",
     "UserChannelPermission",
     "UserKolFavorite",
     "Wallet",
     "WalletTransaction",
+    "RuntimeUsageRecord",
+    "TenantUserQuotaPolicy",
+    "TenantUserQuotaUsage",
+    "TenantWallet",
+    "TenantWalletTransaction",
     "WorkspaceSession",
 ]

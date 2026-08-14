@@ -211,6 +211,15 @@ describe('SessionList', () => {
     expect(screen.queryByTitle('大盘层级')).toBeNull();
   });
 
+  it('does not render dead star controls (agent runtime does not model starring)', () => {
+    renderList({ sessions: [{ ...baseSession, isStarred: true }] });
+
+    expect(screen.queryByTitle('仅看已标星重点项目')).toBeNull();
+    expect(screen.queryByText('重点')).toBeNull();
+    expect(screen.queryByTitle('标星为重点营销项目')).toBeNull();
+    expect(screen.queryByTitle('取消标星')).toBeNull();
+  });
+
   it('allows saving an empty project or campaign name', () => {
     const onRenameSession = vi.fn();
     renderList({ onRenameSession });

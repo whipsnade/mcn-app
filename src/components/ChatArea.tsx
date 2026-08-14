@@ -1,12 +1,11 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Loader2, Pause, Send, Sparkles, ShieldAlert } from 'lucide-react';
-import { Session, Message, type ThinkingBlock } from '../types';
+import { Session } from '../types';
 import type { FollowupSuggestion } from '../api/contracts';
-import { useSessionThinkingStream } from '../hooks/useSessionThinkingStream';
-import TaskFlowNodes from './TaskFlowNodes';
-import ThinkingPanel from './ThinkingPanel';
-import { isTerminalTaskStatus, type TaskFlowNode } from '../state/taskEvents';
-import type { TaskFlowReplay } from '../hooks/useTaskFlows';
+import { uploadAgentFile, type AgentMessageOptions, type ApiAgentUpload } from '../api/agent';
+import { isTerminalRunStatus, type RunRuntimeState } from '../state/agentEvents';
+import AgentRunCard, { type RunClarification } from './agent/AgentRunCard';
+import AgentUploadComposer from './agent/AgentUploadComposer';
 
 /** 空白会话（无消息、无 followup 建议）展示的默认圈选建议，点击填入输入框。 */
 const DEFAULT_SUGGESTIONS: { title: string; prompt: string }[] = [
@@ -17,67 +16,28 @@ const DEFAULT_SUGGESTIONS: { title: string; prompt: string }[] = [
 ];
 
 const NEAR_BOTTOM_THRESHOLD_PX = 48;
-const EMPTY_THINKING_BY_TURN: Record<string, ThinkingBlock[]> = {};
-
-function blockKey(block: ThinkingBlock): string {
-  return `${block.operationId}:${block.attempt}`;
-}
-
-export function mergeHistoricalAndRuntimeThinking(
-  messages: Message[],
-  runtimeByTurn: Record<string, ThinkingBlock[]> = {},
-): Record<string, ThinkingBlock[]> {
-  const merged = new Map<string, Map<string, ThinkingBlock>>();
-
-  messages.forEach(message => {
-    if (!message.turnId || !message.thinking) return;
-    const byOperation = merged.get(message.turnId) ?? new Map<string, ThinkingBlock>();
-    message.thinking.blocks.forEach(block => {
-      byOperation.set(blockKey(block), { ...block, turnId: message.turnId });
-    });
-    merged.set(message.turnId, byOperation);
-  });
-
-  Object.entries(runtimeByTurn).forEach(([turnId, blocks]) => {
-    const byOperation = merged.get(turnId) ?? new Map<string, ThinkingBlock>();
-    blocks.forEach(block => {
-      const key = blockKey(block);
-      const historical = byOperation.get(key);
-      // 已持久化的终态 metadata 是最终快照；其余情况优先展示更实时的流内容。
-      if (historical && historical.status !== 'running') return;
-      byOperation.set(key, { ...block, turnId });
-    });
-    merged.set(turnId, byOperation);
-  });
-
-  return Object.fromEntries(
-    [...merged.entries()].map(([turnId, blocks]) => [turnId, [...blocks.values()]]),
-  );
-}
 
 interface ChatAreaProps {
   session: Session;
-  onSendMessage: (text: string) => Promise<unknown>;
+  onSendMessage: (text: string, options?: AgentMessageOptions) => Promise<unknown>;
   isAnalyzing: boolean;
   /** 是否处于 brainstorm 澄清等待中（loading 文案区分于任务分析）。 */
   isClarifying?: boolean;
-  /** 取消当前运行中的任务（点击暂停按钮触发）。 */
-  onCancelTask?: () => Promise<unknown>;
   /** 取消请求已发出、等待任务收敛到终态（暂停按钮禁用并显示 loading）。 */
   isCancelling?: boolean;
   isMockMode: boolean;
-  /** 当前流程所属任务，用于隔离不同轮次分析的流程 UI 状态。 */
-  flowTaskId?: string;
-  /** 当前任务的执行流程节点（竖状节点图）。 */
-  flowNodes?: TaskFlowNode[];
-  /** 任务是否已到终态（节点图自动收缩）。 */
-  flowTerminal?: boolean;
-  /** 终态摘要文案（如 分析完成 / 任务失败）。 */
-  flowTerminalLabel?: string;
-  /** 各任务的历史执行流程（终态冻结 / 事件回放重建），锚定在触发消息下方。 */
-  taskFlows?: Record<string, TaskFlowReplay>;
-  /** AI 摘要的流式草稿，实时渲染在节点图下方。 */
-  assistantDraft?: string;
+  /** 当前活跃 Run 的运行时状态（实时执行卡，锚定在触发消息下方）。 */
+  run?: RunRuntimeState;
+  /** 历史 Run 的终态冻结 runtime（按 runId 索引），锚定在各自触发消息下方。 */
+  runHistory?: Record<string, RunRuntimeState>;
+  /** 恢复暂停的 Run（paused → 继续）。 */
+  onResumeRun?: () => Promise<unknown>;
+  /** 暂停当前 Run（点击暂停按钮触发）。 */
+  onCancelRun?: () => Promise<unknown>;
+  /** 兜底取消（旧任务流 App 仍传 onCancelTask；Task 23 切换到 onCancelRun 后移除）。 */
+  onCancelTask?: () => Promise<unknown>;
+  /** 失败/中断的历史 Run 重试：服务端创建新的 Child Run，旧卡保持终态。 */
+  onRetryRun?: (runId: string) => Promise<unknown>;
   onRetryMessage?: (messageId: string) => Promise<unknown>;
   followupStatus?: 'pending' | 'completed' | 'failed';
   followupSuggestions?: FollowupSuggestion[];
@@ -90,15 +50,14 @@ export default function ChatArea({
   onSendMessage,
   isAnalyzing,
   isClarifying = false,
-  onCancelTask,
   isCancelling = false,
   isMockMode,
-  flowTaskId,
-  flowNodes = [],
-  flowTerminal = false,
-  flowTerminalLabel,
-  taskFlows = {},
-  assistantDraft = '',
+  run,
+  runHistory = {},
+  onResumeRun,
+  onCancelRun,
+  onCancelTask,
+  onRetryRun,
   onRetryMessage,
   followupStatus,
   followupSuggestions = [],
@@ -107,60 +66,55 @@ export default function ChatArea({
 }: ChatAreaProps) {
   const [inputText, setInputText] = useState('');
   const [selectedOptions, setSelectedOptions] = useState<string[]>([]);
+  const [uploads, setUploads] = useState<ApiAgentUpload[]>([]);
   const chatEndRef = useRef<HTMLDivElement>(null);
   const chatLogRef = useRef<HTMLDivElement>(null);
   const isNearBottomRef = useRef(true);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const thinkingRuntime = useSessionThinkingStream(session.id);
-  const runtimeByTurn = thinkingRuntime?.sessionId === session.id
-    ? thinkingRuntime.byTurn
-    : EMPTY_THINKING_BY_TURN;
-  const thinkingByTurn: Record<string, ThinkingBlock[]> = useMemo(
-    () => mergeHistoricalAndRuntimeThinking(session.messages, runtimeByTurn),
-    [runtimeByTurn, session.messages],
-  );
-  const thinkingTextKey = useMemo(
-    () => Object.entries(thinkingByTurn)
-      .flatMap(([turnId, blocks]) => blocks.map(block => (
-        `${turnId}:${blockKey(block)}:${block.status}:${block.content}`
-      )))
-      .join('|'),
-    [thinkingByTurn],
-  );
 
-  // 活跃 turn = 最新一条用户消息的 turnId；其思考块并入执行流程节点展示。
-  const activeTurnId = useMemo(() => {
-    for (let index = session.messages.length - 1; index >= 0; index -= 1) {
-      const message = session.messages[index];
-      if (message.sender === 'user' && message.turnId) return message.turnId;
-    }
-    return undefined;
-  }, [session.messages]);
-  const activeThinkingBlocks = activeTurnId ? thinkingByTurn[activeTurnId] : undefined;
-  // 活跃流程是否已锚定到触发它的用户消息（锚定后底部不再重复渲染流程区）。
-  const activeFlowAnchored = Boolean(
-    flowTaskId && session.messages.some(message => message.sender === 'user' && message.taskId === flowTaskId),
+  // 活跃 Run 是否已锚定到触发它的用户消息（锚定后底部不再重复渲染执行卡）。
+  const activeRunAnchored = Boolean(
+    run && session.messages.some(message => message.sender === 'user' && message.runId === run.runId),
   );
-  // 活跃 turn 且流程进行中：思考只出现在流程节点里，消息下方的 ThinkingPanel 去重隐藏；
-  // 终态后流程面板收缩为摘要行，ThinkingPanel 恢复（历史 turn 始终不受影响）。
-  const dedupeActiveThinkingPanel = flowNodes.length > 0 && !flowTerminal;
 
   // 建议点击统一行为：填入输入框并聚焦，不自动提交，由用户确认后发送。
-  const fillInput = (text: string) => {
+  // useCallback + AgentRunCard 的 React.memo：稳定引用让历史卡跳过每次 SSE 增量重渲染。
+  const fillInput = useCallback((text: string) => {
     setInputText(text);
     textareaRef.current?.focus();
-  };
+  }, []);
+  const handlePauseRun = useCallback(
+    () => void (onCancelRun ?? onCancelTask)?.(),
+    [onCancelRun, onCancelTask],
+  );
+  const handleResumeRun = useCallback(
+    () => void onResumeRun?.(),
+    [onResumeRun],
+  );
+  // 澄清内容按 runId 建索引（来自关联 assistant 消息的 clarify/brainstorm metadata），
+  // 引用稳定，避免每次渲染重建触发 memo 卡重渲染。
+  const clarificationByRun = useMemo(() => {
+    const map: Record<string, RunClarification> = {};
+    for (const message of session.messages) {
+      if (message.sender !== 'ai' || !message.runId) continue;
+      const options = message.clarify?.options ?? message.brainstorm?.options ?? [];
+      if (options.length === 0 || map[message.runId]) continue;
+      map[message.runId] = { question: message.text, options };
+    }
+    return map;
+  }, [session.messages]);
 
   useEffect(() => {
     isNearBottomRef.current = true;
+    setUploads([]);
   }, [session.id]);
 
-  // 仅在用户仍靠近底部时跟随新消息或思考增量。
+  // 仅在用户仍靠近底部时跟随新消息。
   useEffect(() => {
     if (isNearBottomRef.current) {
       chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
     }
-  }, [session.id, session.messages, isAnalyzing, thinkingTextKey]);
+  }, [session.id, session.messages, isAnalyzing]);
 
   const handleChatScroll = () => {
     const container = chatLogRef.current;
@@ -174,8 +128,9 @@ export default function ChatArea({
     if (!inputText.trim() || isAnalyzing) return;
     const draft = inputText.trim();
     try {
-      await onSendMessage(draft);
+      await onSendMessage(draft, { uploadIds: uploads.filter(upload => upload.status === 'parsed').map(upload => upload.id) });
       setInputText(current => current.trim() === draft ? '' : current);
+      setUploads([]);
     } catch {
       // The workspace error banner explains the persistence failure; keep the draft for retry.
     }
@@ -290,9 +245,7 @@ export default function ChatArea({
             : [];
           // 仅 brainstorm 显式标记 multi=true 走多选；clarify 与存量无 multi 消息保持单选。
           const isMultiSelect = brainstormOptions.length > 0 && msg.brainstorm?.multi === true;
-          const thinkingBlocks = !isAI && msg.turnId
-            ? thinkingByTurn[msg.turnId] ?? []
-            : [];
+          const messageRun = msg.runId === run?.runId ? run : msg.runId ? runHistory[msg.runId] : undefined;
 
           return (
             <React.Fragment key={msg.id}>
@@ -336,6 +289,15 @@ export default function ChatArea({
                         className="mt-2 rounded-lg border border-indigo-200 bg-white px-2.5 py-1 text-[10px] font-semibold text-indigo-600 transition hover:bg-indigo-50"
                       >
                         再次执行
+                      </button>
+                    )}
+                    {!isAI && msg.runId && messageRun?.status === 'failed' && onRetryRun && !isAnalyzing && (
+                      <button
+                        type="button"
+                        onClick={() => void onRetryRun(msg.runId!).catch(() => undefined)}
+                        className="mt-2 rounded-lg border border-indigo-200 bg-white px-2.5 py-1 text-[10px] font-semibold text-indigo-600 transition hover:bg-indigo-50"
+                      >
+                        重试此 Run
                       </button>
                     )}
                   </div>
@@ -391,69 +353,53 @@ export default function ChatArea({
                       )}
                     </div>
                   )}
+                  {/* Run 终态追问建议 chips（utility suggestions，§13.1）：每个 Run 的
+                      assistant 消息各自携带，点击填入输入框并聚焦，不自动提交。 */}
+                  {isAI && msg.suggestions && msg.suggestions.length > 0 && (
+                    <div className="mt-2 flex flex-wrap gap-1.5" aria-label="追问建议">
+                      {msg.suggestions.map(suggestion => (
+                        <button
+                          key={suggestion}
+                          type="button"
+                          disabled={isAnalyzing}
+                          onClick={() => {
+                            if (!isAnalyzing) fillInput(suggestion);
+                          }}
+                          className={`rounded-lg border px-2.5 py-1.5 text-[10px] font-semibold transition active:scale-95 ${isAnalyzing
+                            ? 'cursor-not-allowed border-slate-100 bg-slate-50 text-slate-300'
+                            : 'border-indigo-100 bg-white text-indigo-700 hover:border-indigo-300 hover:bg-indigo-50'
+                          }`}
+                        >
+                          {suggestion}
+                        </button>
+                      ))}
+                    </div>
+                  )}
                 </div>
               </div>
-              {thinkingBlocks.length > 0 && !(dedupeActiveThinkingPanel && msg.turnId === activeTurnId) && (
-                <div className="mr-auto ml-11 w-[calc(85%-2.75rem)] max-w-[85%]">
-                  <ThinkingPanel blocks={thinkingBlocks} />
-                </div>
-              )}
-              {/* 每个任务一张执行流程卡，锚定在触发它的用户消息下方，终态收缩保留可回看 */}
-              {!isAI && msg.taskId && (() => {
-                const isActiveFlow = msg.taskId === flowTaskId;
-                if (!isActiveFlow) {
-                  const replay = taskFlows[msg.taskId];
-                  if (replay?.missing) return null;
-                  if (!replay?.runtime) {
-                    return (
-                      <div className="mr-auto ml-11 w-[calc(85%-2.75rem)] max-w-[85%]">
-                        <div className="flex items-center gap-2 rounded-xl border border-slate-100 bg-slate-50 px-3 py-2.5 text-[11px] font-medium text-slate-400" role="status">
-                          <Loader2 className="h-3 w-3 animate-spin" />
-                          执行流程加载中…
-                        </div>
-                      </div>
-                    );
-                  }
+              {/* 每个 Run 一张独立执行卡，锚定在触发它的用户消息下方；终态收缩保留可回看 */}
+              {!isAI && msg.runId && (() => {
+                const isActiveRun = msg.runId === run?.runId;
+                const runtime = messageRun;
+                if (!runtime) {
                   return (
                     <div className="mr-auto ml-11 w-[calc(85%-2.75rem)] max-w-[85%]">
-                      <TaskFlowNodes
-                        taskId={msg.taskId}
-                        nodes={replay.runtime.nodes ?? []}
-                        terminal={isTerminalTaskStatus(replay.runtime.status)}
-                        terminalLabel={replay.runtime.phaseLabel}
-                      />
+                      <div className="flex items-center gap-2 rounded-xl border border-slate-100 bg-slate-50 px-3 py-2.5 text-[11px] font-medium text-slate-400" role="status">
+                        <Loader2 className="h-3 w-3 animate-spin" />
+                        Run 加载中…
+                      </div>
                     </div>
                   );
                 }
-                if (flowNodes.length === 0 && !assistantDraft && !isAnalyzing) return null;
                 return (
-                  <div className="flex items-start gap-3 mr-auto max-w-[85%]">
-                    <div className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-full font-bold text-[10px] shadow-sm ${isAnalyzing ? 'bg-indigo-500 text-white animate-pulse' : 'bg-indigo-600 text-white'}`}>
-                      AI
-                    </div>
-                    <div className="space-y-2 flex-1 min-w-0">
-                      <div className="flex items-center gap-2 text-[10px] text-slate-400">
-                        <span className="font-semibold text-slate-500">AI 分析师</span>
-                        {isAnalyzing && <span className="text-indigo-500">分析中…</span>}
-                      </div>
-                      {flowNodes.length > 0 && (
-                        <TaskFlowNodes
-                          taskId={flowTaskId}
-                          nodes={flowNodes}
-                          terminal={flowTerminal}
-                          terminalLabel={flowTerminalLabel}
-                          thinkingBlocks={msg.turnId === activeTurnId ? activeThinkingBlocks : undefined}
-                        />
-                      )}
-                      {assistantDraft && (
-                        <div className="rounded-2xl rounded-tl-none bg-indigo-600 px-4 py-3 text-xs md:text-sm leading-relaxed text-white shadow-md">
-                          <div className="whitespace-pre-line font-normal">
-                            {assistantDraft}
-                            {isAnalyzing && <span className="ml-0.5 inline-block h-3.5 w-1.5 animate-pulse rounded-sm bg-white/70 align-middle" />}
-                          </div>
-                        </div>
-                      )}
-                    </div>
+                  <div className="mr-auto ml-11 w-[calc(85%-2.75rem)] max-w-[85%]">
+                    <AgentRunCard
+                      run={runtime}
+                      clarification={clarificationByRun[msg.runId]}
+                      onPause={onCancelRun || onCancelTask ? handlePauseRun : undefined}
+                      onResume={onResumeRun ? handleResumeRun : undefined}
+                      onClarify={fillInput}
+                    />
                   </div>
                 );
               })()}
@@ -461,46 +407,38 @@ export default function ChatArea({
           );
         })}
 
-        {/* 过渡形态：活跃任务尚未锚定到消息（POST 未返回的窗口期）时，底部显示进行中指示；
-            一旦锚定（或已是历史任务）流程卡渲染在对应用户消息下方。 */}
-        {!activeFlowAnchored && (isAnalyzing || flowNodes.length > 0 || assistantDraft) && (
+        {/* 过渡形态：活跃 Run 尚未锚定到消息（POST 未返回的窗口期）时，底部显示实时执行卡；
+            一旦锚定，执行卡渲染在触发它的用户消息下方。 */}
+        {!activeRunAnchored && run && !isTerminalRunStatus(run.status) && (
+          <div className="mr-auto ml-11 w-[calc(85%-2.75rem)] max-w-[85%]">
+            <AgentRunCard
+              run={run}
+              clarification={clarificationByRun[run.runId]}
+              onPause={onCancelRun || onCancelTask ? handlePauseRun : undefined}
+              onResume={onResumeRun ? handleResumeRun : undefined}
+              onClarify={fillInput}
+            />
+          </div>
+        )}
+        {/* Run 尚未创建（POST 未返回 / brainstorm 澄清等待）时保留进行中提示。 */}
+        {!activeRunAnchored && !run && isAnalyzing && (
           <div className="flex items-start gap-3 mr-auto max-w-[85%]">
-            <div className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-full font-bold text-[10px] shadow-sm ${isAnalyzing ? 'bg-indigo-500 text-white animate-pulse' : 'bg-indigo-600 text-white'}`}>
+            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-indigo-500 font-bold text-[10px] text-white shadow-sm animate-pulse">
               AI
             </div>
             <div className="space-y-2 flex-1 min-w-0">
               <div className="flex items-center gap-2 text-[10px] text-slate-400">
                 <span className="font-semibold text-slate-500">AI 分析师</span>
-                {isAnalyzing && <span className="text-indigo-500">分析中…</span>}
+                <span className="text-indigo-500">分析中…</span>
               </div>
-              {flowNodes.length > 0 && (
-                <TaskFlowNodes
-                  taskId={flowTaskId}
-                  nodes={flowNodes}
-                  terminal={flowTerminal}
-                  terminalLabel={flowTerminalLabel}
-                  thinkingBlocks={activeThinkingBlocks}
-                />
-              )}
-              {assistantDraft ? (
-                <div className="rounded-2xl rounded-tl-none bg-indigo-600 px-4 py-3 text-xs md:text-sm leading-relaxed text-white shadow-md">
-                  <div className="whitespace-pre-line font-normal">
-                    {assistantDraft}
-                    {isAnalyzing && <span className="ml-0.5 inline-block h-3.5 w-1.5 animate-pulse rounded-sm bg-white/70 align-middle" />}
-                  </div>
+              <div className="rounded-2xl rounded-tl-none border border-slate-100 bg-white px-4 py-3.5 shadow-sm">
+                <div className="flex items-center gap-1.5" role="status">
+                  <span className="h-2 w-2 rounded-full bg-indigo-500 animate-bounce" />
+                  <span className="h-2 w-2 rounded-full bg-indigo-500 animate-bounce [animation-delay:0.2s]" />
+                  <span className="h-2 w-2 rounded-full bg-indigo-500 animate-bounce [animation-delay:0.4s]" />
+                  <span className="text-xs text-slate-400 font-medium ml-1">{isClarifying ? '正在澄清需求…' : '正在分析数据并编制图表...'}</span>
                 </div>
-              ) : (
-                isAnalyzing && (
-                  <div className="rounded-2xl rounded-tl-none bg-white border border-slate-100 px-4 py-3.5 shadow-sm">
-                    <div className="flex items-center gap-1.5" role="status">
-                      <span className="h-2 w-2 rounded-full bg-indigo-500 animate-bounce" />
-                      <span className="h-2 w-2 rounded-full bg-indigo-500 animate-bounce [animation-delay:0.2s]" />
-                      <span className="h-2 w-2 rounded-full bg-indigo-500 animate-bounce [animation-delay:0.4s]" />
-                      <span className="text-xs text-slate-400 font-medium ml-1">{isClarifying ? '正在澄清需求…' : '正在分析数据并编制图表...'}</span>
-                    </div>
-                  </div>
-                )
-              )}
+              </div>
             </div>
           </div>
         )}
@@ -510,6 +448,18 @@ export default function ChatArea({
 
       {/* Input panel container */}
       <div className="shrink-0 p-4 bg-white border-t border-slate-100 space-y-2.5">
+
+        <AgentUploadComposer
+          uploads={uploads}
+          disabled={isAnalyzing}
+          onUpload={file => {
+            if (!['csv', 'xlsx'].includes(file.name.split('.').pop()?.toLowerCase() ?? '')) return;
+            const pending: ApiAgentUpload = { id: `local-${Date.now()}`, original_filename: file.name, mime_type: file.type, size_bytes: file.size, sha256: '', status: 'uploaded', error_code: null, created_at: '', completed_at: null };
+            setUploads(current => [...current, pending]);
+            void uploadAgentFile(session.id, file).then(upload => setUploads(current => current.map(item => item.id === pending.id ? upload : item))).catch(() => setUploads(current => current.map(item => item.id === pending.id ? { ...item, status: 'failed' } : item)));
+          }}
+          onRemove={id => setUploads(current => current.filter(upload => upload.id !== id))}
+        />
 
         {!followupStatus && session.messages.length === 0 && (
           <section aria-label="开始圈选建议" className="rounded-xl border border-indigo-100 bg-indigo-50/40 px-3 py-2.5">
@@ -611,7 +561,7 @@ export default function ChatArea({
               type="button"
               aria-label={isCancelling ? '正在取消' : '暂停'}
               disabled={isCancelling}
-              onClick={() => void onCancelTask?.()}
+              onClick={() => void (onCancelRun ?? onCancelTask)?.()}
               className={`px-3 py-2 rounded-lg text-white transition active:scale-95 ${
                 isCancelling
                   ? 'bg-slate-200 text-slate-400 cursor-not-allowed'

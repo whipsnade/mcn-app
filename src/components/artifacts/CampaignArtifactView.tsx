@@ -1,0 +1,358 @@
+import { Activity, FileText, Heart, LayoutDashboard, Lightbulb, Megaphone, Sparkles, Users } from 'lucide-react';
+import { Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
+
+import type { CampaignReportPayload } from '../../api/agentArtifacts';
+import { Card, Missing, restrictedCount, restrictedRatio, restrictedScore } from '../reportPrimitives';
+import { safeHttpUrl } from './urlUtils';
+
+const PLATFORM_NAMES: Record<string, string> = {
+  xiaohongshu: '小红书', douyin: '抖音', bilibili: 'B站', kuaishou: '快手', weibo: '微博',
+};
+
+function platformName(platform: string): string {
+  return PLATFORM_NAMES[platform] ?? platform;
+}
+
+function Metric({ label, value }: { label: string; value: string }) {
+  const isRestricted = value === '数据受限';
+  return (
+    <div className="min-w-0 rounded-xl border border-slate-100 bg-white px-3.5 py-3 shadow-sm">
+      <p className="text-[12px] font-medium text-slate-400">{label}</p>
+      <p className={`mt-2 truncate text-[22px] font-bold leading-none tracking-tight ${isRestricted ? 'text-slate-300' : 'text-slate-800'}`}>
+        {value}
+      </p>
+    </div>
+  );
+}
+
+function DataTable({ rows, columns }: {
+  rows: Array<Record<string, string>>;
+  columns: Array<{ key: string; label: string }>;
+}) {
+  if (rows.length === 0) return <Missing label="数据不足" />;
+  return (
+    <div className="overflow-x-auto">
+      <table className="w-full border-collapse text-[11px] text-slate-600">
+        <thead>
+          <tr>
+            {columns.map(column => (
+              <th key={column.key} className="border-b border-slate-100 px-2 py-1.5 text-left font-semibold text-slate-500">
+                {column.label}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row, index) => (
+            <tr key={index} className="odd:bg-slate-50/60">
+              {columns.map(column => (
+                <td key={column.key} className="px-2 py-1.5">{row[column.key]}</td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function TimelineChart({ timeline }: { timeline: CampaignReportPayload['data']['timeline'] }) {
+  // §12.1：timeline 是必需章节，单日任一项 volume/engagement 为 null 时该序列点
+  // 置为 null（缺口），绝不把 null 求和成 0 渲染到坐标轴/提示框。
+  const dates = [...new Set(timeline.map(item => item.date))].sort();
+  const rows = dates.map(date => {
+    const items = timeline.filter(item => item.date === date);
+    const volumeRestricted = items.some(item => item.volume == null);
+    const engagementRestricted = items.some(item => item.engagement == null);
+    const row: Record<string, string | number | null | boolean> = {
+      date,
+      声量: volumeRestricted ? null : items.reduce((sum, item) => sum + (item.volume ?? 0), 0),
+      互动: engagementRestricted ? null : items.reduce((sum, item) => sum + (item.engagement ?? 0), 0),
+    };
+    return row;
+  });
+  const restrictedDates = rows.filter(row => row.声量 == null || row.互动 == null).map(row => String(row.date));
+  return (
+    <>
+      <div className="h-44" aria-label="活动声量趋势图表">
+        <ResponsiveContainer width="100%" height="100%">
+          <LineChart data={rows} margin={{ top: 8, right: 8, bottom: 4, left: -12 }}>
+            <XAxis dataKey="date" tickFormatter={value => String(value).slice(5)} tick={{ fontSize: 10, fill: '#94a3b8' }} />
+            <YAxis tick={{ fontSize: 10, fill: '#94a3b8' }} width={42} />
+            <Tooltip formatter={(value) => [value == null ? '数据受限' : restrictedCount(Number(value)), '数值']} />
+            <Line type="monotone" dataKey="声量" stroke="#4f46e5" strokeWidth={2} dot={{ r: 3 }} />
+            <Line type="monotone" dataKey="互动" stroke="#14b8a6" strokeWidth={2} dot={{ r: 3 }} />
+          </LineChart>
+        </ResponsiveContainer>
+      </div>
+      {restrictedDates.length > 0 && (
+        <div className="mt-2 flex flex-wrap gap-1.5">
+          {restrictedDates.map(date => (
+            <span key={date} className="rounded bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-600">
+              {date.slice(5)} 数据受限
+            </span>
+          ))}
+        </div>
+      )}
+    </>
+  );
+}
+
+function TopPosts({ posts }: { posts: CampaignReportPayload['data']['top_posts'] }) {
+  if (posts.length === 0) return <Missing label="数据不足" />;
+  return (
+    <div className="divide-y divide-slate-100">
+      {posts.slice(0, 20).map((post, index) => {
+        // URL 白名单：非 http(s) 链接按无链接的受限态渲染，不注入可执行协议。
+        const url = safeHttpUrl(post.url);
+        const title = post.title || '无标题';
+        return (
+          <article key={`${post.platform}-${post.post_id}-${index}`} className="flex items-center gap-3 py-3">
+            <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md bg-indigo-50 text-[10px] font-bold text-indigo-600">{index + 1}</span>
+            <div className="min-w-0 flex-1">
+              <p className="truncate text-[12px] font-semibold text-slate-700">
+                {url ? <a href={url} target="_blank" rel="noreferrer" className="hover:text-indigo-600 hover:underline">{title}</a> : title}
+              </p>
+              <p className="mt-1 text-[10px] text-slate-400">
+                {platformName(post.platform)} · {post.author || '未知达人'}{post.published_at ? ` · ${post.published_at}` : ''}
+                {!url && <span className="ml-1 text-amber-600">数据受限（无原文链接）</span>}
+              </p>
+            </div>
+            <p className="shrink-0 text-[10px] text-slate-400">互动 {restrictedScore(post.engagement)}</p>
+          </article>
+        );
+      })}
+    </div>
+  );
+}
+
+export default function CampaignArtifactView({ payload }: { payload: CampaignReportPayload }) {
+  const { data, narrative, scope, data_status, limitations } = payload;
+
+  return (
+    <div className="space-y-3">
+      {data_status === 'restricted' && (
+        <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2">
+          <p className="text-[11px] font-semibold text-amber-700">数据受限</p>
+          {limitations.map(limitation => (
+            <p key={limitation.code} className="mt-1 text-[10px] leading-4 text-amber-600">{limitation.message}</p>
+          ))}
+        </div>
+      )}
+
+      <section data-chapter="overview">
+        <Card title="概览" icon={<LayoutDashboard className="h-4 w-4" />}>
+          <p className="mb-3 text-[10px] text-slate-400">
+            <span className="font-semibold text-slate-600">{scope.brand}</span>
+            {scope.campaign ? <span> · {scope.campaign}</span> : null}
+          </p>
+          <div className="grid grid-cols-2 gap-2.5 md:grid-cols-5">
+            <Metric label="总声量" value={restrictedCount(data.overview.total_volume)} />
+            <Metric label="总互动" value={restrictedScore(data.overview.total_engagement)} />
+            <Metric label="内容量" value={restrictedScore(data.overview.total_posts)} />
+            <Metric label="达人量" value={restrictedScore(data.overview.total_creators)} />
+            <Metric label="情感指数" value={restrictedRatio(data.overview.sentiment_score)} />
+          </div>
+        </Card>
+      </section>
+
+      <section data-chapter="platform_contributions">
+        <Card title="平台贡献" icon={<Megaphone className="h-4 w-4" />}>
+          <DataTable
+            rows={data.platform_contributions.map(item => ({
+              平台: platformName(item.platform),
+              声量: restrictedCount(item.volume),
+              互动: restrictedScore(item.engagement),
+              内容量: restrictedScore(item.posts),
+              达人: restrictedScore(item.creators),
+              占比: restrictedRatio(item.share),
+            }))}
+            columns={[
+              { key: '平台', label: '平台' },
+              { key: '声量', label: '声量' },
+              { key: '互动', label: '互动' },
+              { key: '内容量', label: '内容量' },
+              { key: '达人', label: '达人' },
+              { key: '占比', label: '占比' },
+            ]}
+          />
+        </Card>
+      </section>
+
+      <section data-chapter="timeline">
+        <Card title="时间线" icon={<Activity className="h-4 w-4" />}>
+          {data.timeline.length > 0 ? <TimelineChart timeline={data.timeline} /> : <Missing label="数据不足" />}
+        </Card>
+      </section>
+
+      <section data-chapter="kol_contributions">
+        <Card title="KOL 贡献" icon={<Users className="h-4 w-4" />}>
+          <DataTable
+            rows={data.kol_contributions.map(item => ({
+              平台: platformName(item.platform),
+              达人: item.nickname || item.kol_uid,
+              内容量: restrictedScore(item.posts),
+              声量: restrictedCount(item.volume),
+              互动: restrictedScore(item.engagement),
+              贡献占比: restrictedRatio(item.contribution_share),
+            }))}
+            columns={[
+              { key: '平台', label: '平台' },
+              { key: '达人', label: '达人' },
+              { key: '内容量', label: '内容量' },
+              { key: '声量', label: '声量' },
+              { key: '互动', label: '互动' },
+              { key: '贡献占比', label: '贡献占比' },
+            ]}
+          />
+        </Card>
+      </section>
+
+      <section data-chapter="content_types">
+        <Card title="内容类型" icon={<FileText className="h-4 w-4" />}>
+          <DataTable
+            rows={data.content_types.map(item => ({
+              平台: platformName(item.platform),
+              类型: item.type,
+              内容量: restrictedScore(item.posts),
+              声量: restrictedCount(item.volume),
+              互动: restrictedScore(item.engagement),
+            }))}
+            columns={[
+              { key: '平台', label: '平台' },
+              { key: '类型', label: '类型' },
+              { key: '内容量', label: '内容量' },
+              { key: '声量', label: '声量' },
+              { key: '互动', label: '互动' },
+            ]}
+          />
+        </Card>
+      </section>
+
+      <section data-chapter="sentiment">
+        <Card title="情感分析" icon={<Heart className="h-4 w-4" />}>
+          <div className="grid gap-3 md:grid-cols-2">
+            <div className="space-y-1.5">
+              {([
+                ['正面', data.sentiment.summary.positive],
+                ['中性', data.sentiment.summary.neutral],
+                ['负面', data.sentiment.summary.negative],
+              ] as const).map(([label, item]) => (
+                <p key={label} className="flex items-center justify-between text-[11px] text-slate-500">
+                  <span>{label}</span>
+                  <b className="text-slate-700">{restrictedScore(item.count)} 篇 · {restrictedRatio(item.share)}</b>
+                </p>
+              ))}
+            </div>
+            <DataTable
+              rows={data.sentiment.by_platform.map(item => ({
+                平台: platformName(item.platform),
+                正面: restrictedScore(item.positive.count),
+                中性: restrictedScore(item.neutral.count),
+                负面: restrictedScore(item.negative.count),
+              }))}
+              columns={[
+                { key: '平台', label: '平台' },
+                { key: '正面', label: '正面' },
+                { key: '中性', label: '中性' },
+                { key: '负面', label: '负面' },
+              ]}
+            />
+          </div>
+        </Card>
+      </section>
+
+      <section data-chapter="top_posts">
+        <Card title="热帖" icon={<Sparkles className="h-4 w-4" />}>
+          <TopPosts posts={data.top_posts} />
+        </Card>
+      </section>
+
+      <section data-chapter="attribution_audience">
+        <Card title="归属、自然传播与受众" icon={<Users className="h-4 w-4" />}>
+          <div className="grid gap-3 md:grid-cols-2">
+            <div>
+              <p className="mb-1.5 text-[11px] font-semibold text-slate-600">内容归属</p>
+              {data.attribution ? (
+                <div className="space-y-1 text-[11px] text-slate-500">
+                  <p>确认投放 {restrictedScore(data.attribution.paid_confirmed)}</p>
+                  <p>自然传播 {restrictedScore(data.attribution.organic)}</p>
+                  <p>待确认 {restrictedScore(data.attribution.unknown)}</p>
+                </div>
+              ) : <Missing label="数据受限/未提供" />}
+            </div>
+            <div>
+              <p className="mb-1.5 text-[11px] font-semibold text-slate-600">自然传播与受众</p>
+              {data.organic_summary ? (
+                <p className="text-[11px] text-slate-500">
+                  自然声量 {restrictedCount(data.organic_summary.volume)} · 互动 {restrictedScore(data.organic_summary.engagement)}
+                </p>
+              ) : <Missing label="数据受限/未提供" />}
+              {data.audience_regions && data.audience_regions.length > 0 && (
+                <p className="mt-1 text-[11px] text-slate-500">
+                  主要地区：{data.audience_regions.map(item => `${item.region} ${restrictedRatio(item.share)}`).join('、')}
+                </p>
+              )}
+            </div>
+          </div>
+        </Card>
+      </section>
+
+      {data.roi != null && (
+        <section data-chapter="roi">
+          <Card title="ROI 与转化" icon={<Activity className="h-4 w-4" />}>
+            <div className="grid grid-cols-2 gap-2.5 md:grid-cols-4">
+              <Metric label="投放金额" value={restrictedScore(data.roi.spend)} />
+              <Metric label="转化" value={restrictedScore(data.roi.conversions)} />
+              <Metric label="ROI" value={restrictedRatio(data.roi.roi)} />
+              <Metric label="ROAS" value={restrictedRatio(data.roi.roas)} />
+            </div>
+            <p className="mt-2 text-[10px] text-slate-400">归因窗口：{data.roi.attribution_window}</p>
+          </Card>
+        </section>
+      )}
+
+      <section data-chapter="narrative">
+        <Card title="执行摘要" icon={<Sparkles className="h-4 w-4" />}>
+          <p className="whitespace-pre-wrap text-[12px] leading-5 text-slate-600">{narrative.executive_summary}</p>
+        </Card>
+        {narrative.phase_review.length > 0 && (
+          <Card title="阶段复盘" icon={<Activity className="h-4 w-4" />}>
+            <ul className="space-y-2">
+              {narrative.phase_review.map((phase, index) => (
+                <li key={index} className="rounded-lg bg-slate-50 px-2.5 py-2">
+                  <p className="text-[12px] font-semibold text-slate-700">{phase.phase}</p>
+                  <p className="mt-0.5 text-[11px] leading-4 text-slate-500">{phase.detail}</p>
+                </li>
+              ))}
+            </ul>
+          </Card>
+        )}
+        {narrative.findings.length > 0 && (
+          <Card title="发现" icon={<Lightbulb className="h-4 w-4" />}>
+            <ul className="space-y-2">
+              {narrative.findings.map((finding, index) => (
+                <li key={index} className="rounded-lg bg-slate-50 px-2.5 py-2">
+                  <p className="text-[12px] font-semibold text-slate-700">{finding.title}</p>
+                  {finding.detail && <p className="mt-0.5 text-[11px] leading-4 text-slate-500">{finding.detail}</p>}
+                </li>
+              ))}
+            </ul>
+          </Card>
+        )}
+        {narrative.recommendations.length > 0 && (
+          <Card title="建议" icon={<Lightbulb className="h-4 w-4" />}>
+            <ul className="space-y-2">
+              {narrative.recommendations.map((recommendation, index) => (
+                <li key={index} className="rounded-lg border border-indigo-50 bg-indigo-50/50 px-2.5 py-2">
+                  <p className="text-[12px] font-semibold text-indigo-700">{recommendation.title}</p>
+                  {recommendation.action && <p className="mt-0.5 text-[11px] leading-4 text-slate-500">{recommendation.action}</p>}
+                </li>
+              ))}
+            </ul>
+          </Card>
+        )}
+      </section>
+    </div>
+  );
+}

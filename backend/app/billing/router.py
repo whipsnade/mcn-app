@@ -17,5 +17,10 @@ async def get_wallet(
     user: CurrentUser,
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> WalletRead:
-    wallet = await WalletService(db).get_wallet(user.id)
-    return WalletRead(balance=wallet.balance, reserved=wallet.reserved, available=wallet.balance)
+    service = WalletService(db)
+    wallet = await service.get_wallet(user.id)
+    return WalletRead(
+        balance=wallet.balance,
+        reserved=wallet.reserved,
+        available=await service.available_points(user.id),
+    )

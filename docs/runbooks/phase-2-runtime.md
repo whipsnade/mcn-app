@@ -1,6 +1,8 @@
 # 第二阶段运行手册
 
-本阶段采用异步流式模块化单体。当前部署只使用一个 Uvicorn worker；任务、租约、MCP 调用和积分账本都由 MySQL 持久化，后续再按负载拆分 Worker。
+当前架构为**模型主导的统一 Agent 运行时（Agent Runtime v3）**：`/api/v1/agent` 提供会话、Run、SSE 事件与 Artifact API，`backend/app/agent_runtime/` 负责执行与恢复，`backend/app/agent_artifacts/` 负责产物与导出。旧 `/api/v1/sessions/{id}/tasks`、`/quick/*`、`brainstorm`、手动 `/kol-analysis` 等执行入口已取消注册（返回 404，见 `backend/tests/agent_runtime/test_legacy_routes_removed.py`）。一次性切换、发布阻断条件与回滚清单见 [agent-runtime-v3-cutover.md](agent-runtime-v3-cutover.md)。
+
+部署只使用一个 Uvicorn worker；Run、租约、MCP 调用、Evidence 与积分账本都由 MySQL 持久化，后续再按负载拆分 Worker。
 
 ## 启动与迁移
 
@@ -12,7 +14,7 @@ cd backend
 .venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1 --timeout-graceful-shutdown 5
 ```
 
-`--timeout-graceful-shutdown 5` 限制优雅停机等待时长：前端 SSE 长连接（任务事件/思考流）不释放时，重启与热重载不会被无限期卡住。
+`--timeout-graceful-shutdown 5` 限制优雅停机等待时长：前端 SSE 长连接（Run 事件流/thinking 流）不释放时，重启与热重载不会被无限期卡住。
 
 开发环境只保留 `AUTH_MODE=mock` 的短信与微信登录模拟。模型与 MCP 在所有环境均使用真实供应商；测试前确认密钥有效，且测试日志不得输出模型响应、达人数据、令牌或接口地址。
 
@@ -24,44 +26,23 @@ cd backend
 .venv/bin/pytest tests/integration/test_real_providers.py -q
 ```
 
+（`test_real_providers.py` 中断言 `deepseek-v4-pro`，与本机 `backend/.env` 的 `glm-5.2` 不符是历史遗留的环境性失败，不影响运行时。）
+
 ## 运行与恢复
 
-- 发布或维护前将管理开关设为“关闭新任务”；已运行任务允许完成，必要时由任务取消接口终止。
-- 进程重启后运行恢复作业扫描过期租约，重新领取可恢复任务；已成功收到远端响应的调用只补结算，不重复调用 MCP。
-- `unknown` 调用必须由人工或受控协调流程确认后再结算/释放，禁止凭猜测重复请求。
-- 账务排查以 `wallet_ledger` 和 MCP 调用状态为准，核对每次成功工具调用 10 积分；发现差异先冻结新任务，再导出账本与调用证据处理。
-- 创建会话后应依次出现 `plan.ready`、真实 MCP 调用和 `report.updated` 自由分析报告；调用失败的诊断仅保存字段名、字段类型、长度与 Schema 校验路径。
-- 所有任务按 agent 迭代循环执行（`kind` 固定 `"agent"`）：每轮一个 MCP 调用，`report.updated` 事件先于终态到达，右侧展示自由分析报告。循环由 `orchestration/bi_requirements.py` 的 8 项 BI 数据项驱动：模型 finish 前服务端做覆盖门禁，缺失数据项回喂补齐（连续被拒 3 次后放行；工具 settled 但返回空视为已满足）。循环不设调用次数上限，仅当钱包可用余额不足一次 10 积分调用时停止，任务进入 `insufficient_balance` 终态；余额不足前已采集证据时仍生成分析报告。其循环轨迹持久化在 `plan_json`（`agent_trajectory_v1`）；恢复时按轨迹原参数重放未完成的步骤，绝不重发 `unknown` 调用。连续两次非法决策（工具/参数越界）任务直接失败，错误码即校验失败码。
-
-## GoalPlanner 影子模式
-
-1. UAT 设置 `GOAL_PLANNER_SHADOW_ENABLED=true` 后重启后端。
-2. 影子规划在旧任务进入终态后运行，不调用 MCP、不扣积分；当前尚未创建 TaskGoal 与 TaskArtifact，GoalPlanner 未接管执行，真实任务仍走旧 Agent Loop。
-3. 本地开发环境使用后端目录内的虚拟环境汇总最近 100 个 GoalPlanner 任务；
-   JSON 中的 `current_message` 已脱敏，供人工复核：
-
-   ```bash
-   cd backend
-   .venv/bin/python scripts/evaluate_goal_planner_shadow.py --limit 100
-   ```
-
-4. UAT 的虚拟环境位于项目根目录，必须使用以下独立命令：
-
-   ```bash
-   cd /home/kol_insight/backend
-   ../.venv/bin/python scripts/evaluate_goal_planner_shadow.py --limit 100
-   ```
-
-5. `--limit` 仅允许 1–1000。阶段一只做低量、只读 UAT 评估；CLI 在 task 聚合前最多
-   读取 `2 * limit` 行。当前不新增迁移；待真实日志规模和查询计划证明必要后，再评估
-   增加 `(purpose, created_at)` 索引。
-6. 人工抽查 `brand_source`、campaign 的 `brand` / `campaign`、`kol_selection` 的 `request_evidence`。
-7. 非圈选消息出现 `kol_selection` 时不得进入下一阶段。
-8. 紧急关闭：设置 `GOAL_PLANNER_SHADOW_ENABLED=false` 并重启；无需数据库回滚。
-
-## 回滚
-
-先关闭新任务并等待当前请求进入终态，再回滚应用版本。数据库迁移只按 Alembic 的可逆 downgrade 执行；不要手工删除账本、调用记录或会话历史。回滚后运行一次只读健康检查和 focused 回归，确认租约、积分和版本门控一致后再开放新任务。
+- 发布或维护前将管理开关设为“关闭新任务”；已运行 Run 允许完成，必要时由 `POST /agent/runs/{run_id}/cancel` 终止。
+- 进程重启后恢复作业（`agent_runtime/recovery.py`）扫描过期租约，重新领取可恢复 Run，从最后一个完整 Step 继续，**禁止凭内存状态重建调用**；相同 `logical_call_id` 不重复执行或扣费。
+- `unknown` MCP 调用（请求已发出但结果未知，如网关 504）保持预留、禁止自动重放，只能经恢复核对（`agent_tool_call_reconciliations`）确认成功/失败/保持 unknown，必要时管理员走 `POST /api/v1/admin/agent-tool-calls/{call_id}/reconcile` 人工核对。禁止凭猜测重复请求。
+- 账务排查以 `wallet_ledger` 与 `agent_tool_calls` 状态为准，核对每次成功 DataTap 调用 10 积分（`points_settled == 10`）；发现差异先冻结新任务，再导出账本与调用证据处理。
+- 每条用户消息创建一个独立 Run（`session_analyst_v1`），SSE 事件流按 Run sequence 幂等续传（Last-Event-ID）。每个 Run Attempt 上限 30 分钟或 50 次模型决策，触发后 Run 以 `paused` 结束，用户显式 `POST /agent/runs/{run_id}/resume` 创建新 Attempt 继续。余额不足（`InsufficientPointsError`）作为结构化工具错误回喂模型，不直接失败。
+- 正式 Artifact 走确定性字段级 lineage 门禁后逐项直接发布为不可变 Version；新 Run 不得启动 Reviewer。
+  发布汇总以 `artifact.publish.completed` 表达逐项 `published/validation_failed/failed`，至少一项
+  成功且存在失败时 Run 为 `completed_with_warnings`。旧 Review 表只读保留，供历史回滚读取。
+- 当前唯一迁移 head 为 `0036_export_claim_token`。部署顺序：备份数据库和上传目录 → drain Run /
+  清零历史 `reviewing` → 后端代码与 `alembic upgrade head` → 同批前端 `dist/` → 单 worker 重启 →
+  权限、账本、SSE、三类导出冒烟。详情与回滚限制见 cutover §5.10。
+- **已知风险（UAT 阻断项，见 cutover 清单）**：2026-08-07 真实 UAT 的品牌场景成功（restricted
+  lineage_ok），但活动回答 child Run 因模型供应商持续重连被中断；未完成真实全场景验收前不得生产切档。
 
 ## UAT 部署
 
@@ -70,9 +51,9 @@ cd backend
 - 服务：systemd `kol-insight.service`（WorkingDirectory=`/home/kol_insight/backend`，uvicorn 监听 `127.0.0.1:8100`）；重启 `systemctl restart kol-insight.service`。
 - 公网入口：nginx `http://111.10.192.19:40099`（`/api/` 反代到 8100，`/` 静态托管 dist；站点配置在 `/etc/nginx/sites-available/kol-insight`）。
 - 同步方式：从本地工作区 `rsync`/`scp` 改动文件到 `/home/kol_insight/backend/`（不覆盖远端 `.env`），有迁移时先 `alembic upgrade head`，再重启服务。
-- 验证：本机 `curl http://127.0.0.1:8100/healthz` 应返回 `{"status":"ok"}`；公网用 `curl http://111.10.192.19:40099/api/v1/sessions` 期望 401（证明 nginx→后端链路通，`/healthz` 不在 `/api/` 下、不公网暴露）。
+- 验证：本机 `curl http://127.0.0.1:8100/healthz` 应返回 `{"status":"ok"}`；公网用 `curl http://111.10.192.19:40099/api/v1/agent/sessions` 期望 401（证明 nginx→后端链路通，`/healthz` 不在 `/api/` 下、不公网暴露）。
 - 注意：远端无 --reload，改代码必须重启服务；云安全组与 ufw 是两层，曾误开 ufw 导致 SSH 断连，端口变更需同时确认两侧放行。
 
 ## 凭据与日志
 
-日志调用 `app.core.redaction.redact_for_log()` 后再序列化。该函数递归遮蔽授权头、Cookie、手机号、模型/MCP token、JWT 密钥和 MySQL 密码；严禁打印原始请求头、环境变量或完整 Prompt。
+日志调用 `app.core.redaction.redact_for_log()` 后再序列化。该函数递归遮蔽授权头、Cookie、手机号、模型/MCP token、JWT 密钥和 MySQL 密码；严禁打印原始请求头、环境变量或完整 Prompt。模型永远不接触 DataTap token、数据库 DSN 或 JWT 密钥。

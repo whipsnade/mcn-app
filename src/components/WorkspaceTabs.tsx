@@ -1,8 +1,6 @@
-import { FileSpreadsheet, Flame, MessageSquare, Star, Users, Zap } from 'lucide-react';
+import { MessageSquare, Star } from 'lucide-react';
 
-export type WorkspaceTab = 'chat' | 'favorites' | 'kol' | 'evaluate' | 'posts-xhs' | 'posts-dy';
-
-export const QUICK_TAB_IDS: readonly WorkspaceTab[] = ['kol', 'evaluate', 'posts-xhs', 'posts-dy'];
+export type WorkspaceTab = 'chat' | 'favorites';
 
 interface WorkspaceTabsProps {
   active: WorkspaceTab;
@@ -10,14 +8,11 @@ interface WorkspaceTabsProps {
   favoriteCount: number;
 }
 
+// 顶部工作区只保留智能会话与收藏（design §13.2）：品牌/活动/达人属于右侧 BI，不作为快捷入口。
 export function WorkspaceTabs({ active, onChange, favoriteCount }: WorkspaceTabsProps) {
   const tabs = [
     { id: 'chat' as const, label: '智能会话', icon: MessageSquare, title: '智能会话' },
     { id: 'favorites' as const, label: `已收藏 ${favoriteCount}`, icon: Star, title: '已收藏' },
-    { id: 'kol' as const, label: '达人推荐', icon: Users, title: '预算内达人推荐（每次刷新约 20 积分）' },
-    { id: 'evaluate' as const, label: '活动评估', icon: FileSpreadsheet, title: '达人/活动评估：上传 xlsx/csv 生成热度分析（免费）' },
-    { id: 'posts-xhs' as const, label: '小红书爆贴', icon: Flame, title: '小红书前十爆贴（近 7 日，约 10~20 积分）' },
-    { id: 'posts-dy' as const, label: '抖音爆贴', icon: Zap, title: '抖音前十爆贴（近 7 日，约 10~20 积分）' },
   ];
 
   return (

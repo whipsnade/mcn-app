@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
+import logging
 import time
 from collections.abc import Callable, Mapping
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from datetime import timedelta
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 import httpx
@@ -24,6 +26,7 @@ from app.mcp_gateway.transport import (
     McpConnectionError,
     McpConnectionTimeout,
     McpGatewayTimeout,
+    McpNotSentError,
     McpProtocolError,
     McpQueueTimeout,
     McpUpstreamHttpError,
@@ -31,10 +34,21 @@ from app.mcp_gateway.transport import (
     PossiblySentTimeout,
     RemoteToolResult,
     ServiceNotAllowedError,
+    contains_transport_artifact_marker,
+    is_non_empty_json,
 )
 
+logger = logging.getLogger(__name__)
 
-_DATATAP_ORIGIN = "https://datatap.deepminer.com.cn"
+
+_DEFAULT_DATATAP_ORIGIN = "https://datatap.deepminer.com.cn"
+
+
+def _datatap_origin() -> str:
+    """生产默认指向真实 DataTap；测试/离线拓扑经 Settings 覆盖到 loopback。"""
+    from app.core.config import get_settings
+
+    return get_settings().datatap_mcp_origin.rstrip("/")
 _DISABLED_SERVICES = {
     "zhihu-mcp",
     "toutiao-mcp",
@@ -78,6 +92,26 @@ class DataTapTransport:
         write_timeout_seconds: float = 10.0,
         pool_timeout_seconds: float = 5.0,
         clock: Callable[[], float] = time.monotonic,
+        # "service"：legacy 服务级熔断（默认，行为不变）。
+        # "none"：Agent 桥固定使用，服务级熔断不再维护 open 状态，改由
+        #   agent_runtime.circuit_breaker 的 service+tool+args-hash 细粒度熔断
+        #   单独负责；队列并发限制与超时仍然生效。禁止两层熔断叠加。
+        circuit_scope: Literal["service", "none"] = "service",
+        # "never"（默认）：任何失败都不自动重发——504、5xx、协议中断与
+        #   PossiblySentTimeout 都属"可能已发送"（result_unknown），设计
+        #   §5.3/§11.1 禁止自动重放；明确的连接前失败交由模型决定是否重新尝试。
+        # "transient_once"：legacy 策略，瞬时上游错误自动重试一次。
+        retry_policy: Literal["transient_once", "never"] = "never",
+        # 外发阶段墙钟上限（秒，不含 per-service 队列等待）：None（默认）不启用，
+        #   legacy 行为不变；Agent 传输经 AGENT_MCP_CALL_TIMEOUT_SECONDS 注入。
+        #   DataTap 统计查询可能持续 trickle 返回数据，httpx read_timeout 是
+        #   "无活动"超时会被不断重置（UAT Incident #8：一次慢查询挂死整个 Run）。
+        #   超时按 PossiblySentTimeout（可能已发送）收口，由上层分类为
+        #   result_unknown（保留预留、进恢复核对），Run 继续后续工具。
+        call_timeout_seconds: float | None = None,
+        # 取消宽限：墙钟超时后取消底层任务并等待其退出的上限；仍不死则隔离
+        #   悬挂任务（保留引用防 GC、完成时吞噬异常），运行时侧按时收口。
+        cancel_grace_seconds: float = 5.0,
     ) -> None:
         secret = token.get_secret_value()
         if not secret.strip():
@@ -88,6 +122,16 @@ class DataTapTransport:
             raise ValueError("failure_threshold must be positive")
         if circuit_reset_seconds <= 0 or queue_timeout_seconds <= 0:
             raise ValueError("timeouts must be positive")
+        if circuit_scope not in ("service", "none"):
+            raise ValueError("circuit_scope must be 'service' or 'none'")
+        if retry_policy not in ("transient_once", "never"):
+            raise ValueError("retry_policy must be 'transient_once' or 'never'")
+        if call_timeout_seconds is not None and call_timeout_seconds <= 0:
+            raise ValueError("call_timeout_seconds must be positive")
+        if cancel_grace_seconds <= 0:
+            raise ValueError("cancel_grace_seconds must be positive")
+        self.circuit_scope = circuit_scope
+        self.retry_policy = retry_policy
 
         self.gateway_session_id = gateway_session_id or str(uuid4())
         if not self.gateway_session_id.strip() or not credential_version.strip():
@@ -97,6 +141,10 @@ class DataTapTransport:
         self._circuit_reset_seconds = circuit_reset_seconds
         self._queue_timeout_seconds = queue_timeout_seconds
         self._read_timeout_seconds = read_timeout_seconds
+        self._call_timeout_seconds = call_timeout_seconds
+        self._cancel_grace_seconds = cancel_grace_seconds
+        # 墙钟超时后取消仍不死的悬挂任务：保留引用防 GC，完成时吞噬异常。
+        self._abandoned: set[asyncio.Task[Any]] = set()
         self._clock = clock
         self._session_opener = session_opener
         self._session_factory = session_factory
@@ -104,6 +152,9 @@ class DataTapTransport:
             service: _ServiceState(asyncio.Semaphore(max_concurrency_per_service))
             for service in DataTapService
         }
+        # 已确认结果按 upstream_request_id 的受限本地缓存，供 reconcile_tool_call
+        # 只读核对（见下）。
+        self._recent_results: dict[str, RemoteToolResult] = {}
         self._client = httpx.AsyncClient(
             headers={"Authorization": f"Bearer {secret}"},
             timeout=httpx.Timeout(
@@ -170,7 +221,16 @@ class DataTapTransport:
                         write_stream,
                         read_timeout_seconds=timedelta(seconds=self._read_timeout_seconds),
                     ) as session:
-                        await session.initialize()
+                        try:
+                            await session.initialize()
+                        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+                            raise
+                        except Exception as exc:
+                            # Session initialization happens before the MCP
+                            # request is dispatched.  Preserve that fact for
+                            # billing: it is a confirmed non-send, not an
+                            # unknown result.
+                            raise McpNotSentError("MCP session initialization failed") from exc
                         try:
                             result = await session.call_tool(remote_name, dict(arguments))
                         except McpError as exc:
@@ -179,7 +239,9 @@ class DataTapTransport:
                             raise McpProtocolError("MCP tool protocol error") from exc
                         except (httpx.ReadTimeout, TimeoutError) as exc:
                             raise PossiblySentTimeout("MCP result was not confirmed") from exc
-                        structured_content = self._structured_content(result)
+                        structured_content, result_status, unavailable_reason = (
+                            self._classify_result(result)
+                        )
                         error_text = None
                         if getattr(result, "isError", False):
                             error_text = self._error_text(result)
@@ -188,6 +250,8 @@ class DataTapTransport:
                             is_error=bool(getattr(result, "isError", False)),
                             upstream_request_id=self._request_id(result),
                             error_text=error_text,
+                            result_status=result_status,
+                            unavailable_reason=unavailable_reason,
                         )
             except PossiblySentTimeout:
                 raise
@@ -211,16 +275,47 @@ class DataTapTransport:
                     raise
                 raise McpProtocolError("MCP protocol operation failed") from exc
 
-        return await self._run_isolated_with_retry(checked, operation)
+        result = await self._run_isolated_with_retry(checked, operation)
+        if result.upstream_request_id:
+            self._record_recent(result)
+        return result
+
+    async def reconcile_tool_call(self, upstream_request_id: str) -> RemoteToolResult | None:
+        """READ ONLY：按 upstream_request_id 回查本地已确认结果，绝不重放原调用。
+
+        调用结果在 :meth:`call_tool` 返回时按 ``upstream_request_id`` 记录在
+        受控大小的本地缓存；恢复流程据此确认 result_unknown，不重新外发
+        原调用（§11.1「禁止自动重放」）。
+        """
+        if not upstream_request_id:
+            return None
+        return self._recent_results.get(upstream_request_id)
+
+    _MAX_RECENT_RESULTS = 1_000
+
+    def _record_recent(self, result: RemoteToolResult) -> None:
+        request_id = result.upstream_request_id
+        if request_id is None:
+            return
+        if len(self._recent_results) >= self._MAX_RECENT_RESULTS:
+            oldest = next(iter(self._recent_results))
+            self._recent_results.pop(oldest, None)
+        self._recent_results[request_id] = result
 
     async def _run_isolated_with_retry(
         self, service: DataTapService, operation: Callable[[], Any]
     ):
-        """瞬时上游错误（5xx/网关超时/连接失败）自动重试一次。
+        """按 ``retry_policy`` 决定是否自动重发。
 
-        PossiblySentTimeout 不在重试之列（结果未确认，重试可能重复执行上游
-        查询）；熔断器/队列类错误立即抛出（立即重试同样会被拒绝）。
+        - ``"never"``（默认）：绝不重发。504、5xx、协议中断与
+          PossiblySentTimeout 都属"可能已发送"（result_unknown），自动重放
+          可能重复执行上游查询（设计 §5.3/§11.1 禁止）；
+        - ``"transient_once"``（legacy）：瞬时上游错误（5xx/网关超时/连接
+          失败）自动重试一次。PossiblySentTimeout 仍不在重试之列；熔断器/
+          队列类错误立即抛出（立即重试同样会被拒绝）。
         """
+        if self.retry_policy == "never":
+            return await self._run_isolated(service, operation)
         try:
             return await self._run_isolated(service, operation)
         except (
@@ -241,7 +336,7 @@ class DataTapTransport:
 
     @staticmethod
     def _endpoint(service: DataTapService) -> str:
-        return f"{_DATATAP_ORIGIN}/api/gateway/{service.value}/mcp"
+        return f"{_datatap_origin()}/api/gateway/{service.value}/mcp"
 
     async def _run_isolated(self, service: DataTapService, operation: Callable[[], Any]):
         state = self._states[service]
@@ -253,7 +348,7 @@ class DataTapTransport:
         try:
             epoch = await self._enter_circuit(state)
             try:
-                result = await operation()
+                result = await self._dispatch_with_wall_clock(operation)
             except Exception as exc:
                 await self._record_failure(state, epoch)
                 if isinstance(exc, PossiblySentTimeout):
@@ -274,7 +369,63 @@ class DataTapTransport:
         finally:
             state.semaphore.release()
 
+    async def _dispatch_with_wall_clock(self, operation: Callable[[], Any]):
+        """外发阶段墙钟上限（``call_timeout_seconds``，仅 Agent 传输启用）。
+
+        超时即按 :class:`PossiblySentTimeout`（可能已发送）收口——取消底层
+        任务并在 ``cancel_grace_seconds`` 宽限内等待其真正退出；仍不死
+        （某层吞掉取消）则隔离悬挂任务，运行时侧按时收口，绝不挂死调用方。
+        外层被取消（引擎停机/租约让渡）时同样取消并隔离内层任务，避免
+        悬挂请求在后台静默完成后无人收口。
+
+        不使用 ``asyncio.wait_for``：它在超时后会无限期等待被取消任务退出，
+        底层不可取消时依旧挂死（UAT Incident #8 的教训）。
+        """
+        if self._call_timeout_seconds is None:
+            return await operation()
+        task = asyncio.ensure_future(operation())
+        try:
+            done, _pending = await asyncio.wait({task}, timeout=self._call_timeout_seconds)
+            if done:
+                return task.result()  # 异常原样上抛，保持既有故障分类
+            task.cancel()
+            done, _pending = await asyncio.wait({task}, timeout=self._cancel_grace_seconds)
+            if not done:
+                logger.warning(
+                    "MCP dispatch survived cancellation after wall-clock timeout; "
+                    "abandoning hung task (outcome unconfirmed)"
+                )
+            raise PossiblySentTimeout("MCP call exceeded wall-clock timeout")
+        finally:
+            if not task.done():
+                task.cancel()
+                self._track_abandoned(task)
+
+    def _track_abandoned(self, task: asyncio.Task[Any]) -> None:
+        """隔离悬挂任务：保留引用防 GC，完成时吞噬异常并记录，绝不影响后续调用。"""
+        if task in self._abandoned:
+            return
+        self._abandoned.add(task)
+
+        def _consume(finished: asyncio.Task[Any]) -> None:
+            self._abandoned.discard(finished)
+            if finished.cancelled():
+                return
+            exc = finished.exception()
+            if exc is not None:
+                logger.warning("abandoned MCP dispatch finished with error: %r", exc)
+            else:
+                logger.warning(
+                    "abandoned MCP dispatch finished after the caller was cut off; "
+                    "result discarded (reservation stays with recovery reconcile)"
+                )
+
+        task.add_done_callback(_consume)
+
     async def _enter_circuit(self, state: _ServiceState) -> int:
+        if self.circuit_scope == "none":
+            # 服务级熔断不参与 Agent 路径；立即放行。
+            return state.epoch
         async with state.lock:
             if state.opened_at is None:
                 return state.epoch
@@ -286,6 +437,8 @@ class DataTapTransport:
             return state.epoch
 
     async def _record_failure(self, state: _ServiceState, epoch: int) -> None:
+        if self.circuit_scope == "none":
+            return
         async with state.lock:
             if epoch != state.epoch:
                 return
@@ -296,6 +449,8 @@ class DataTapTransport:
             state.half_open_in_flight = False
 
     async def _record_success(self, state: _ServiceState, epoch: int) -> None:
+        if self.circuit_scope == "none":
+            return
         async with state.lock:
             if epoch != state.epoch:
                 return
@@ -323,20 +478,60 @@ class DataTapTransport:
 
     @staticmethod
     def _structured_content(result: Any) -> Any:
-        """提取结构化结果；文本内容中的数据按 {result: string} 包装补齐。
+        """返回严格规范化后的 payload；不可信文本一律返回 ``None``。
 
-        DataTap 的统计/榜单类工具常把数据 JSON 放在 MCP 文本内容里而不填
-        ``structuredContent``。KOL 搜索类工具则按 ``{result: string}`` 填充。
-        这里把前者统一成后者，保证下游校验、证据与归一化共用同一契约。
+        需要区分 ``None`` 的 genuinely empty 与 unavailable，实际传输路径使用
+        :meth:`_classify_result` 取得状态；此兼容 helper 只保留旧测试/调用方的
+        payload 视图，绝不再把普通文本包装成可写 Evidence 的对象。
+        """
+        payload, _status, _reason = DataTapTransport._classify_result(result)
+        return payload
+
+    @staticmethod
+    def _classify_result(result: Any) -> tuple[Any, Literal["available", "empty", "unavailable"], str | None]:
+        """把真实 MCP CallToolResult 归一化为三态结果。
+
+        只有 native ``structuredContent``，或唯一且整体可解析的 JSON text block
+        才能进入 available。resource/image/audio、多个 text block、普通文本、
+        临时路径和解析失败都进入 unavailable；没有任何 content 才是 empty。
         """
         structured = getattr(result, "structuredContent", None)
-        if structured is not None or getattr(result, "isError", False):
-            return structured
-        # 与 validate_output 的字符串上限对齐。
-        text = DataTapTransport._content_text(result, limit=262_000)
-        if text is None:
-            return None
-        return {"result": text}
+        if structured is not None:
+            if is_non_empty_json(structured):
+                if contains_transport_artifact_marker(structured):
+                    return None, "unavailable", "unsupported_content"
+                return structured, "available", None
+            # Native structuredContent is authoritative when present. An empty
+            # native value must not fall through to an unrelated text/resource
+            # block and become a different payload.
+            try:
+                json.dumps(structured, ensure_ascii=False, allow_nan=False)
+            except (TypeError, ValueError, RecursionError):
+                return None, "unavailable", "unsupported_content"
+            return None, "empty", None
+        if getattr(result, "isError", False):
+            return None, "empty", None
+
+        blocks = getattr(result, "content", None)
+        if blocks is None or (isinstance(blocks, list) and len(blocks) == 0):
+            return None, "empty", None
+        if not isinstance(blocks, list) or len(blocks) != 1:
+            return None, "unavailable", "unsupported_content"
+        block = blocks[0]
+        text = getattr(block, "text", None)
+        if getattr(block, "type", None) != "text" or not isinstance(text, str):
+            return None, "unavailable", "unsupported_content"
+        if not text.strip():
+            return None, "empty", None
+        try:
+            parsed = json.loads(text)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None, "unavailable", "invalid_json_text"
+        if not is_non_empty_json(parsed):
+            return None, "empty", None
+        if contains_transport_artifact_marker(parsed):
+            return None, "unavailable", "unsupported_content"
+        return parsed, "available", None
 
     @staticmethod
     def _error_text(result: Any) -> str | None:
