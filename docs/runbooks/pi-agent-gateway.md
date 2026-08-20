@@ -52,6 +52,37 @@
 - 校验失败回喂结构化字段级错误（RFC6901 path/type/reason/retryable，≤2048 字节、
   truncated 标记、不泄漏提交值）；模型按 path 修正后重试（离线 UAT 自纠错场景已进程级验证）。
 
+## Native Skill/Report 迁移边界（2026-08-21）
+
+### 生产 Native 路径
+
+- Skill 的唯一运行时事实源是创建 Run 时冻结并校验的 Run Snapshot。Gateway 将 Snapshot 中的
+  Skill 正文物化到当前 Run 专属目录后显式注入；不读取用户目录、项目目录、cwd 或本机工作树
+  的自动发现结果。Root Policy、Tool Contract、Skill digest 和 capability pack 版本必须与
+  Snapshot 一致，任一漂移都在模型/MCP 外发前 fail-closed。
+- Skill 是模型自主决策的能力说明，不是固定阶段、固定工具顺序、固定调用次数、固定输出规模
+  或固定业务权重。模型可按用户目标和当前可用能力选择澄清、历史读取、MCP、确定性计算、Draft、
+  Reviewer 或完成；服务端只守住能力边界、归属、计费、证据、结构校验和状态机。
+- MCP 标准结果直接交给模型；错误、空结果、partial、timeout 与 `result_unknown` 保持原分类，
+  不经 Evidence Bridge，不引入 `mcp_result_v1` 业务实体，也不自动重放可能已发送的调用。
+- 正式产物统一经受控 Artifact Draft/Review/Publish 链路。固定模板不能表达长尾需求时使用
+  `analysis_report_v1`；Excel 由不可变同版 Version 确定性投影为 `workbook_v1`。所有缺失值必须
+  用 `null`、availability 和 limitation 表达，禁止将受限数据当作 0。
+
+### 迁移期 POC 兼容面
+
+- `pi-runtime/src/extensions/internal-tools.ts` 明确标记为 `compatibility`，只供 POC 和兼容测试
+  使用。`load_marketing_skill` 在迁移期保留，但生产 Native 正常路径不依赖它；旧 POC 的
+  `build_*_draft`/发布工具名不得写入 Native Skill 作为生产必经步骤。
+- 修改 Native Skill 文案时必须保持模型自主决策、Run Snapshot、Tool Contract、Evidence 可追溯、
+  partial/限制披露和结构化校验反馈语义；不得恢复固定工具顺序、旧桥接协议或本机路径依赖。
+
+### 验证边界
+
+- 本迁移记录只使用离线单元/集成测试验证文案、快照来源、工具契约和安全断言；不等同于真实模型、
+  DataTap、钱包、生产数据库、部署或 Web UAT 通过。任何真实外部调用仍需独立授权、隔离租户、
+  append-only 证据目录和 reviewer 封口。
+
 ### result_unknown 可观测性
 
 - `PiGatewayMcpFailureMetadata` 携带可观测字段（全部可选）：`error_class`（adapter error

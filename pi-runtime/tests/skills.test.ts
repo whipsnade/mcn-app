@@ -48,7 +48,7 @@ describe("Pi 营销 Skills", () => {
   it("每个报告 Skill 都要求 Evidence、partial、Builder feedback、澄清与完成条件", () => {
     for (const name of reportSkills) {
       const text = skillText(name);
-      for (const required of ["Evidence", "partial", "Builder feedback", "禁止编造", "澄清", "完成条件"]) {
+      for (const required of ["Evidence", "partial", "结构化校验反馈", "禁止编造", "澄清", "完成条件"]) {
         expect(text).toContain(required);
       }
     }
@@ -71,5 +71,19 @@ describe("Pi 营销 Skills", () => {
     expect(combined).not.toMatch(/sk-[A-Za-z0-9_-]{12,}/);
     expect(combined).not.toMatch(/瑞幸咖啡|2026-07-\d{2}|425457/);
     expect(combined).not.toMatch(/先(?:调用|使用).{0,100}(?:再|然后)(?:调用|使用)/);
+  });
+
+  it("Native Skill 遵循模型主导的 Snapshot/Tool Contract 路径", () => {
+    const combined = skills.map(skillText).join("\n");
+
+    expect(combined).toContain("模型自主决策");
+    expect(combined).toContain("Run Snapshot");
+    expect(combined).toContain("Tool Contract");
+    expect(combined).toContain("analysis_report_v1");
+    expect(combined).toContain("workbook_v1");
+    expect(combined).not.toContain("Evidence Bridge");
+    expect(combined).not.toContain("mcp_result_v1");
+    expect(combined).not.toMatch(/build_(?:brand|campaign|kol_selection|kol_analysis|kol_detail|insight)_draft/);
+    expect(combined).not.toContain("publish_artifacts");
   });
 });
