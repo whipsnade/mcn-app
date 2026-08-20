@@ -1,4 +1,4 @@
-import { createCipheriv, hkdfSync, randomBytes } from "node:crypto";
+import { createCipheriv, createHash, hkdfSync, randomBytes } from "node:crypto";
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,6 +8,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
 import { buildSignature } from "../src/control-plane-client.js";
 import { runGatewayMain, mapClaimRuntimeSnapshot } from "../src/main.js";
+import { skillManifestDigest } from "../src/skill-snapshot.js";
 
 const GATEWAY_SECRET = "test-only-gateway-secret-0123456789";
 const LEASE_TOKEN = "lease-token-with-enough-entropy-0123456789";
@@ -545,5 +546,72 @@ describe("mapClaimRuntimeSnapshot maxDecisions budget", () => {
     const snapshot = base();
     mutate(snapshot);
     expect(() => mapClaimRuntimeSnapshot(snapshot)).toThrow("pi_gateway_runtime_snapshot_invalid");
+  });
+});
+
+describe("mapClaimRuntimeSnapshot Skill manifest", () => {
+  it("verifies the immutable manifest against capability-pack content", () => {
+    const snapshot = JSON.parse(JSON.stringify(claimResponse().runtime_snapshot)) as Record<string, unknown>;
+    snapshot.adapterCatalog = [
+      { service: "insight-cube", adapterName: "match_best_tag", remoteName: "match_best_tag", schemaDigest: shaDigest("1") },
+    ];
+    const content = "---\nname: campaign-research\ndescription: test\nrequired_tools: []\n---\n\nbody\n";
+    const contentDigest = createHash("sha256").update(content).digest("hex");
+    const entry = {
+      name: "campaign-research",
+      revision: 3,
+      contentDigest,
+      description: "test",
+      requiredTools: [],
+      artifactContract: "analysis_report_v1",
+      content,
+    };
+    (snapshot.capability_pack as Record<string, unknown>).skills = [{
+      name: entry.name,
+      version: "db-revision-3",
+      revision: 3,
+      digest: contentDigest,
+      content,
+      required_tools: [],
+      artifact_contract: entry.artifactContract,
+    }];
+    snapshot.skill_manifest = {
+      entries: [{
+        name: entry.name,
+        revision: entry.revision,
+        content_digest: entry.contentDigest,
+        description: entry.description,
+        required_tools: entry.requiredTools,
+        artifact_contract: entry.artifactContract,
+        content: entry.content,
+      }],
+      source_scope: "database_activation",
+      manifest_digest: skillManifestDigest([entry], "database_activation"),
+    };
+
+    const mapped = mapClaimRuntimeSnapshot(snapshot);
+    expect(mapped.skillManifest?.entries[0].revision).toBe(3);
+    expect(mapped.skillCatalog[0].version).toBe("db-revision-3");
+  });
+
+  it("rejects manifest content or digest drift before a worker can be created", () => {
+    const snapshot = JSON.parse(JSON.stringify(claimResponse().runtime_snapshot)) as Record<string, unknown>;
+    snapshot.adapterCatalog = [
+      { service: "insight-cube", adapterName: "match_best_tag", remoteName: "match_best_tag", schemaDigest: shaDigest("1") },
+    ];
+    snapshot.skill_manifest = {
+      entries: [{
+        name: "brand-research-report",
+        revision: 2,
+        content_digest: shaDigest("x"),
+        description: "bad",
+        required_tools: [],
+        artifact_contract: "brand_report_v3",
+        content: "tampered",
+      }],
+      source_scope: "database_activation",
+      manifest_digest: "0".repeat(64),
+    };
+    expect(() => mapClaimRuntimeSnapshot(snapshot)).toThrow("pi_gateway_claim_snapshot_invalid");
   });
 });

@@ -14,10 +14,19 @@ import type {
   PiGatewayClaimResponse,
   RuntimeSnapshot,
   SkillCatalogEntry,
+  SkillManifestSnapshot,
+  SkillSnapshotEntry,
 } from "./protocol.js";
+import { skillManifestDigest, skillSnapshotDigest } from "./skill-snapshot.js";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function exactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
+  const expectedKeys = new Set(expected);
+  const actual = Object.keys(value);
+  return actual.length === expectedKeys.size && actual.every((key) => expectedKeys.has(key));
 }
 
 function snapshotError(): never {
@@ -53,6 +62,92 @@ function skillDescription(content: unknown): string {
   return "";
 }
 
+function mapSkillManifest(
+  value: unknown,
+  capabilitySkills: readonly unknown[],
+): SkillManifestSnapshot {
+  if (!isRecord(value)) snapshotError();
+  const entriesRaw = value.entries;
+  const sourceScope = value.source_scope;
+  const manifestDigest = value.manifest_digest;
+  if (
+    !Array.isArray(entriesRaw) ||
+    (sourceScope !== "database_activation" && sourceScope !== "legacy_pack") ||
+    typeof manifestDigest !== "string" ||
+    !/^[0-9a-fA-F]{64}$/.test(manifestDigest)
+  ) snapshotError();
+  const seen = new Set<string>();
+  const entries: SkillSnapshotEntry[] = entriesRaw.map((raw) => {
+    if (!isRecord(raw)) snapshotError();
+    const expectedKeys = [
+      "name",
+      "revision",
+      "content_digest",
+      "description",
+      "required_tools",
+      "artifact_contract",
+      "content",
+    ];
+    if (!exactKeys(raw, expectedKeys)) snapshotError();
+    const name = raw.name;
+    const revision = raw.revision;
+    const contentDigest = raw.content_digest;
+    const description = raw.description;
+    const requiredTools = raw.required_tools;
+    const artifactContract = raw.artifact_contract;
+    const content = raw.content;
+    if (
+      typeof name !== "string" ||
+      !/^[a-z][a-z0-9-]{1,95}$/.test(name) ||
+      !Number.isInteger(revision) ||
+      (revision as number) < 1 ||
+      typeof contentDigest !== "string" ||
+      !/^[0-9a-fA-F]{64}$/.test(contentDigest) ||
+      typeof description !== "string" ||
+      description.length < 1 ||
+      description.length > 512 ||
+      !Array.isArray(requiredTools) ||
+      requiredTools.some((tool) => typeof tool !== "string" || tool.length === 0) ||
+      new Set(requiredTools).size !== requiredTools.length ||
+      (artifactContract !== null &&
+        (typeof artifactContract !== "string" || artifactContract.length === 0)) ||
+      typeof content !== "string"
+    ) snapshotError();
+    if (new TextEncoder().encode(content).byteLength > 200_000) snapshotError();
+    const entry = {
+      name,
+      revision: revision as number,
+      contentDigest,
+      description,
+      requiredTools,
+      artifactContract,
+      content,
+    } satisfies SkillSnapshotEntry;
+    if (seen.has(entry.name) || skillSnapshotDigest(entry) !== entry.contentDigest) snapshotError();
+    seen.add(entry.name);
+    const capability = capabilitySkills.find(
+      (candidate) => isRecord(candidate) && candidate.name === entry.name,
+    );
+    if (
+      !isRecord(capability) ||
+      capability.revision !== entry.revision ||
+      capability.digest !== entry.contentDigest ||
+      capability.content !== entry.content ||
+      capability.artifact_contract !== entry.artifactContract ||
+      !Array.isArray(capability.required_tools) ||
+      capability.required_tools.length !== entry.requiredTools.length ||
+      capability.required_tools.some((tool, index) => tool !== entry.requiredTools[index])
+    ) snapshotError();
+    return entry;
+  });
+  if (skillManifestDigest(entries, sourceScope) !== manifestDigest) snapshotError();
+  return {
+    entries,
+    manifestDigest,
+    sourceScope,
+  };
+}
+
 /**
  * Convert the authenticated backend claim snapshot (snake_case, server-owned)
  * into the worker runtime snapshot.  Any shape violation fails closed before
@@ -86,13 +181,25 @@ export function mapClaimRuntimeSnapshot(snapshot: Record<string, unknown>): Runt
   if (typeof rootPolicy !== "string" || rootPolicy.length === 0) snapshotError();
   const skillsRaw = capabilityPack.skills ?? [];
   if (!Array.isArray(skillsRaw)) snapshotError();
-  const skillCatalog: SkillCatalogEntry[] = skillsRaw.map((skill) => {
+  const skillManifest = snapshot.skill_manifest;
+  const mappedManifest =
+    skillManifest === undefined ? undefined : mapSkillManifest(skillManifest, skillsRaw);
+  const skillCatalog: SkillCatalogEntry[] = (mappedManifest?.entries ?? skillsRaw).map((skill) => {
     if (!isRecord(skill)) snapshotError();
-    const { name, version, artifact_contract: artifactContract, content } = skill;
+    const { name, version, artifact_contract: artifactContract, content } =
+      mappedManifest
+        ? {
+            name: skill.name,
+            version: `db-revision-${skill.revision}`,
+            artifact_contract: skill.artifactContract,
+            content: skill.content,
+          }
+        : skill;
     if (
       typeof name !== "string" || name.length === 0 ||
       typeof version !== "string" || version.length === 0 ||
-      typeof artifactContract !== "string" || artifactContract.length === 0
+      (artifactContract !== null &&
+        (typeof artifactContract !== "string" || artifactContract.length === 0))
     ) snapshotError();
     return {
       name: name as string,
@@ -131,6 +238,7 @@ export function mapClaimRuntimeSnapshot(snapshot: Record<string, unknown>): Runt
     rootPolicy: rootPolicy as string,
     skillCatalog,
     adapterCatalog,
+    ...(mappedManifest === undefined ? {} : { skillManifest: mappedManifest }),
     ...(profileName === undefined ? {} : { profileName: profileName as string }),
     allowedArtifactContracts: allowedArtifactContracts as string[],
     ...(capabilityPackVersion === undefined ? {} : { capabilityPackVersion: capabilityPackVersion as string }),

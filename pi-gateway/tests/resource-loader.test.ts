@@ -28,6 +28,17 @@ describe("production resource loader", () => {
     expect(extensions.map((item) => item.path)).toEqual([adapterPath]);
   });
 
+  it("keeps explicit Skill paths separate from SDK discovery", async () => {
+    const loader = createProductionResourceLoader({
+      cwd: "/tmp/run-explicit",
+      agentDir: "/tmp/run-explicit/agent",
+      rootPolicy: "ROOT POLICY",
+      additionalSkillPaths: ["/tmp/run-explicit/skill-snapshot"],
+    });
+    await loader.reload();
+    expect(loader.getSystemPrompt()).toBe("ROOT POLICY");
+  });
+
   it("writes an adapter-readable MCP config with environment references only", () => {
     const config = createMcpConfig(FULL_CATALOG);
     const serialized = JSON.stringify(config);

@@ -36,7 +36,23 @@ export interface SkillCatalogEntry {
   name: string;
   description: string;
   version: string;
-  artifactContract: string;
+  artifactContract: string | null;
+}
+
+export interface SkillSnapshotEntry {
+  name: string;
+  revision: number;
+  contentDigest: string;
+  description: string;
+  requiredTools: readonly string[];
+  artifactContract: string | null;
+  content: string;
+}
+
+export interface SkillManifestSnapshot {
+  entries: readonly SkillSnapshotEntry[];
+  manifestDigest: string;
+  sourceScope: "database_activation" | "legacy_pack";
 }
 
 export interface AdapterCatalogEntry {
@@ -58,6 +74,7 @@ export interface RuntimeSnapshot {
   model: RuntimeModelSnapshot;
   rootPolicy: string;
   skillCatalog: readonly SkillCatalogEntry[];
+  skillManifest?: SkillManifestSnapshot;
   adapterCatalog: readonly AdapterCatalogEntry[];
   /** Server-resolved profile capability captured at Run creation. */
   profileName?: string;

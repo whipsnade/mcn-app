@@ -43,11 +43,11 @@
 - `SkillRevision`：`skill_name/tenant_id/revision/content/content_digest/description/required_tools/artifact_contract/created_by/created_at/change_note`，唯一键为 `(tenant_id, skill_name, revision)`，Revision 与内容均不可更新/删除。
 - `SkillActivation`：`environment/tenant_id/skill_name/active_revision_id/previous_revision_id/rollout_percent/updated_by/updated_at`，唯一键为 `(environment, tenant_id, skill_name)`，百分比范围 `0..100`。
 
-- [ ] **Step 1: Write the failing test**：覆盖合法 frontmatter、缺字段、名称不一致、未知工具、secret/DSN/绝对路径/越权声明、digest 稳定性、灰度边界和 Revision 不可变约束。
-- [ ] **Step 2: Run test to verify it fails**：`cd backend && .venv/bin/pytest -q tests/marketing_skills/test_validation.py tests/marketing_skills/test_repository.py`；预期因模块、模型和迁移不存在而失败。
-- [ ] **Step 3: Write minimal implementation**：实现严格模型、无第三方 frontmatter 隐式执行的解析器、固定错误码、稳定桶算法和 0045 新表；迁移内只写入已审核 `marketing-v2` 基线的不可变 Revision 快照，运行期不再依赖包目录读取 Skill 正文。
-- [ ] **Step 4: Run test to verify it passes**：运行同一组定向测试，并用 `alembic upgrade head`/`alembic downgrade 0044_agent_run_loop_guard` 的隔离迁移测试确认 upgrade/downgrade 不修改历史迁移。
-- [ ] **Step 5: Update changelog and commit**：追加背景、模型/迁移、RED→GREEN 结果；执行 `git diff --check`，提交 `feat(skills): add immutable revision registry`。
+- [x] **Step 1: Write the failing test**：覆盖合法 frontmatter、缺字段、名称不一致、未知工具、secret/DSN/绝对路径/越权声明、digest 稳定性、灰度边界和 Revision 不可变约束。
+- [x] **Step 2: Run test to verify it fails**：`cd backend && .venv/bin/pytest -q tests/marketing_skills/test_validation.py tests/marketing_skills/test_repository.py`；预期因模块、模型和迁移不存在而失败。
+- [x] **Step 3: Write minimal implementation**：实现严格模型、无第三方 frontmatter 隐式执行的解析器、固定错误码、稳定桶算法和 0045 新表；迁移内只写入已审核 `marketing-v2` 基线的不可变 Revision 快照，运行期不再依赖包目录读取 Skill 正文。
+- [x] **Step 4: Run test to verify it passes**：运行同一组定向测试，并用 `alembic upgrade head`/`alembic downgrade 0044_agent_run_loop_guard` 的隔离迁移测试确认 upgrade/downgrade 不修改历史迁移。
+- [x] **Step 5: Update changelog and commit**：追加背景、模型/迁移、RED→GREEN 结果；执行 `git diff --check`，提交 `feat(skills): add immutable revision registry`。
 
 ### Task 2: Skill 管理服务、幂等审计与管理 API
 
@@ -67,11 +67,11 @@
 - `SkillAdminService.rollback(...) -> SkillActivationRead`：只能指向已有 previous Revision，回滚本身仍是新幂等管理写操作。
 - API：`GET /api/v1/admin/skills`、`GET /api/v1/admin/skills/{skill_name}`、`GET /api/v1/admin/skills/{skill_name}/revisions/{revision}`、`GET /api/v1/admin/skills/{skill_name}/diff?from_revision=&to_revision=`、`POST /api/v1/admin/skills/validate`、`POST /api/v1/admin/skills/{skill_name}/revisions`、`POST /api/v1/admin/skills/{skill_name}/activate`、`POST /api/v1/admin/skills/{skill_name}/rollback`。
 
-- [ ] **Step 1: Write the failing test**：测试管理员以外返回 403、租户不存在/归属错误、缺少/重复/冲突 Idempotency-Key、创建 Revision 审计、diff 使用数据库内容、全局/租户/灰度/回滚指针和重复请求回放。
-- [ ] **Step 2: Run test to verify it fails**：`cd backend && .venv/bin/pytest -q tests/marketing_skills/test_service.py tests/marketing_skills/test_api.py`；预期路由/服务不存在而失败。
-- [ ] **Step 3: Write minimal implementation**：复用 `AdminIdempotencyRecord` 与 `AdminAuditLog`，所有响应 JSON 仅含非秘密字段；路由统一使用 `AdminUser`，diff 通过 `difflib.unified_diff` 生成，所有归属失败不泄露 Revision 是否存在。
-- [ ] **Step 4: Run test to verify it passes**：运行同一组测试；额外执行 `backend/.venv/bin/ruff check app/marketing_skills tests/marketing_skills`。
-- [ ] **Step 5: Update changelog and commit**：记录 API、错误码、幂等/审计结果；提交 `feat(skills): expose audited revision management api`。
+- [x] **Step 1: Write the failing test**：测试管理员以外返回 403、租户不存在/归属错误、缺少/重复/冲突 Idempotency-Key、创建 Revision 审计、diff 使用数据库内容、全局/租户/灰度/回滚指针和重复请求回放。
+- [x] **Step 2: Run test to verify it fails**：`cd backend && .venv/bin/pytest -q tests/marketing_skills/test_service.py tests/marketing_skills/test_api.py`；预期路由/服务不存在而失败。
+- [x] **Step 3: Write minimal implementation**：复用 `AdminIdempotencyRecord` 与 `AdminAuditLog`，所有响应 JSON 仅含非秘密字段；路由统一使用 `AdminUser`，diff 通过 `difflib.unified_diff` 生成，所有归属失败不泄露 Revision 是否存在。
+- [x] **Step 4: Run test to verify it passes**：运行同一组测试；额外执行 `backend/.venv/bin/ruff check app/marketing_skills tests/marketing_skills`。
+- [x] **Step 5: Update changelog and commit**：记录 API、错误码、幂等/审计结果；提交 `feat(skills): expose audited revision management api`。
 
 ### Task 3: 新 Run Skill Snapshot 与恢复不变性
 
@@ -93,11 +93,11 @@
 - `SkillSnapshotService.resolve_for_new_run(db, *, tenant_id, base_capability) -> MarketingRunCapability`：只在新 Run 创建时查询 Active 指针，把 DB Revision 组装进 immutable RuntimeConfigSnapshot；缺行、校验失败、digest 漂移直接抛 `skill_snapshot_invalid`。
 - `SkillSnapshotService.validate_existing_run(snapshot) -> None`：只验证已有 JSON 快照，不读取当前 Activation；`snapshot_for_child_run` 复制父 Run Skill manifest，resume/recovery 不重新解析。
 
-- [ ] **Step 1: Write the failing test**：覆盖激活前/后新 Run 版本切换、同租户灰度稳定桶、运行中 Run 保持旧 digest、resume/recovery 保持旧 manifest、非法 Revision/缺失内容在模型/MCP 前失败，以及动态 Skill 不改变 Root Policy/Tool Contracts。
-- [ ] **Step 2: Run test to verify it fails**：`cd backend && .venv/bin/pytest -q tests/marketing_skills/test_snapshot.py tests/agent_runtime/test_runtime_snapshot_skills.py`；预期 snapshot 字段和 resolver 不存在而失败。
-- [ ] **Step 3: Write minimal implementation**：在 `RuntimeConfigSnapshot` 增加冻结的 Skill manifest/digest 字段；`snapshot_for_new_run` 仅对新 Pi Run 注入 DB Revision；existing/child snapshot 只验证持久 JSON。保留 `load_marketing_skill` 对历史快照的兼容读取，但新 Skill 目录不依赖该工具。
-- [ ] **Step 4: Run test to verify it passes**：运行同一组测试，并验证 `RuntimeConfigSnapshot.model_dump(mode="json")` 不含 API Key、Bearer、DSN、用户身份或任意本机路径。
-- [ ] **Step 5: Update changelog and commit**：记录 snapshot 不变性与 fail-closed 边界；提交 `feat(runtime): freeze database-backed skill snapshots per run`。
+- [x] **Step 1: Write the failing test**：覆盖激活前/后新 Run 版本切换、同租户灰度稳定桶、运行中 Run 保持旧 digest、resume/recovery 保持旧 manifest、非法 Revision/缺失内容在模型/MCP 前失败，以及动态 Skill 不改变 Root Policy/Tool Contracts。
+- [x] **Step 2: Run test to verify it fails**：`cd backend && .venv/bin/pytest -q tests/marketing_skills/test_snapshot.py tests/agent_runtime/test_runtime_snapshot_skills.py`；预期 snapshot 字段和 resolver 不存在而失败。
+- [x] **Step 3: Write minimal implementation**：在 `RuntimeConfigSnapshot` 增加冻结的 Skill manifest/digest 字段；`snapshot_for_new_run` 仅对新 Pi Run 注入 DB Revision；existing/child snapshot 只验证持久 JSON。保留 `load_marketing_skill` 对历史快照的兼容读取，但新 Skill 目录不依赖该工具。
+- [x] **Step 4: Run test to verify it passes**：运行同一组测试，并验证 `RuntimeConfigSnapshot.model_dump(mode="json")` 不含 API Key、Bearer、DSN、用户身份或任意本机路径。
+- [x] **Step 5: Update changelog and commit**：记录 snapshot 不变性与 fail-closed 边界；提交 `feat(runtime): freeze database-backed skill snapshots per run`。
 
 ### Task 4: Pi Gateway 原生 Skill 目录物化与显式加载
 
@@ -117,11 +117,11 @@
 - `createProductionResourceLoader({ ..., additionalSkillPaths })`：固定 `noSkills: true`、`noContextFiles: true`、`noPromptTemplates: true`、`noThemes: true`，仅把已物化目录传给 `additionalSkillPaths`；Root Policy 仍由 `systemPrompt` 注入。
 - `mapClaimRuntimeSnapshot`：校验每个快照条目的 revision/content digest 与 capability pack 正文；缺失或非法时在 worker spawn 前抛 `pi_gateway_claim_snapshot_invalid`。
 
-- [ ] **Step 1: Write the failing test**：测试用户级 `.pi/skills`、项目级 `.pi/skills`、cwd 外目录均不加载；显式快照 Skill 可加载；路径穿越/symlink/未知文件/digest 错误/超限 fail-closed；`additionalSkillPaths` 只有当前 Run 目录。
-- [ ] **Step 2: Run test to verify it fails**：`cd pi-gateway && npm test -- --run tests/skill-snapshot.test.ts tests/resource-loader.test.ts tests/sdk-contract.test.ts`；预期函数和配置字段不存在而失败。
-- [ ] **Step 3: Write minimal implementation**：在 `createProductionPiSession` 中先物化快照、再 `loader.reload()`、再 `createAgentSession()`；任何物化错误都不创建模型 Session，也不触发 MCP。保留迁移期 `load_marketing_skill` 工具，但新原生 Skill 正文不得把它作为必经依赖。
-- [ ] **Step 4: Run test to verify it passes**：运行同一组 Vitest；再执行 `npm run typecheck`（若 package script 名称不同，使用 `npx tsc -p tsconfig.json --noEmit`）。
-- [ ] **Step 5: Update changelog and commit**：记录 `noSkills: true`、显式路径和 spawn 前 fail-closed 证据；提交 `feat(pi): load only immutable run skill snapshots`。
+- [x] **Step 1: Write the failing test**：测试用户级 `.pi/skills`、项目级 `.pi/skills`、cwd 外目录均不加载；显式快照 Skill 可加载；路径穿越/symlink/未知文件/digest 错误/超限 fail-closed；`additionalSkillPaths` 只有当前 Run 目录。
+- [x] **Step 2: Run test to verify it fails**：`cd pi-gateway && npm test -- --run tests/skill-snapshot.test.ts tests/resource-loader.test.ts tests/sdk-contract.test.ts`；预期函数和配置字段不存在而失败。
+- [x] **Step 3: Write minimal implementation**：在 `createProductionPiSession` 中先物化快照、再 `loader.reload()`、再 `createAgentSession()`；任何物化错误都不创建模型 Session，也不触发 MCP。保留迁移期 `load_marketing_skill` 工具，但新原生 Skill 正文不得把它作为必经依赖。
+- [x] **Step 4: Run test to verify it passes**：运行同一组 Vitest；再执行 `npm run typecheck`（若 package script 名称不同，使用 `npx tsc -p tsconfig.json --noEmit`）。
+- [x] **Step 5: Update changelog and commit**：记录 `noSkills: true`、显式路径和 spawn 前 fail-closed 证据；提交 `feat(pi): load only immutable run skill snapshots`。
 
 ### Task 5: `analysis_report_v1` 强类型模型输入、发布和能力注册
 

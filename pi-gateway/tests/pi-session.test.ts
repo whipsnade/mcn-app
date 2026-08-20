@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { access, stat } from "node:fs/promises";
 
 import { createProductionPiSession } from "../src/pi-session.js";
-import type { ClaimedRun, PiSdkEvent, SecretBundle } from "../src/protocol.js";
+import type { ClaimedRun, PiSdkEvent, SecretBundle, SkillSnapshotEntry } from "../src/protocol.js";
 
 const work: ClaimedRun = {
   runId: "run-a",
@@ -40,6 +40,32 @@ const secrets: SecretBundle = {
 };
 
 describe("Pi SDK session factory", () => {
+  it("rejects an invalid Skill snapshot before readiness, model, or MCP setup", async () => {
+    const invalidEntry: SkillSnapshotEntry = {
+      name: "campaign-research",
+      revision: 1,
+      contentDigest: "0".repeat(64),
+      description: "tampered",
+      requiredTools: [],
+      artifactContract: null,
+      content: "tampered",
+    };
+    await expect(createProductionPiSession({
+      ...work,
+      runtimeSnapshot: {
+        ...work.runtimeSnapshot,
+        skillManifest: {
+          entries: [invalidEntry],
+          manifestDigest: "0".repeat(64),
+          sourceScope: "database_activation",
+        },
+      },
+    }, secrets, {
+      fakeProvider: true,
+      mcpReadiness: { waitUntilReady: async () => { throw new Error("must_not_start"); } },
+    } as any)).rejects.toThrow("pi_skill_snapshot_digest_mismatch");
+  });
+
   it("does not resolve or allow prompt before MCP readiness completes", async () => {
     let release!: () => void;
     let signalStarted!: () => void;
