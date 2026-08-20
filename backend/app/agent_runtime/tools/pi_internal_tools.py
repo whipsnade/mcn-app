@@ -26,6 +26,7 @@ from app.agent_runtime.reviewer import release_run_drafts
 from app.agent_runtime.state import RunStatus
 from app.agent_runtime.tools.contracts import ToolContext, ToolResult
 from app.marketing_capability_pack.runtime import MarketingRunCapability
+from app.marketing_skills.snapshot import SkillManifest
 
 #: load_marketing_skill 返回体 fail-closed 上限（skill 正文 + 模型输入契约
 #: 完整 JSON Schema；超出即拒绝，防止撑爆模型上下文）。
@@ -120,13 +121,38 @@ class LoadMarketingSkillTool:
         if run is None:
             return ToolResult(status="failed", safe_summary="run_not_found", error_type="not_found")
         try:
-            # The capability pack is a Run-time trust input.  Prompt snapshots
-            # are model-facing/audit data and must never be able to widen the
-            # set of Skills or artifact contracts after Run creation.
-            capability = MarketingRunCapability.model_validate(
-                (run.runtime_config_snapshot_json or {}).get("capability_pack")
-            )
-            loaded = capability.load_skill(args.skill_name, args.requested_version)
+            # New Runs prefer the immutable database manifest.  Historical
+            # snapshots continue through the capability-pack compatibility path.
+            snapshot_payload = run.runtime_config_snapshot_json or {}
+            manifest_payload = snapshot_payload.get("skill_manifest")
+            if manifest_payload is not None:
+                manifest = SkillManifest.model_validate(manifest_payload)
+                entry = next(
+                    (item for item in manifest.entries if item.name == args.skill_name), None
+                )
+                if entry is None or (
+                    args.requested_version is not None
+                    and args.requested_version
+                    not in {str(entry.revision), f"db-revision-{entry.revision}"}
+                ):
+                    raise ValueError("marketing_skill_not_enabled")
+                loaded = {
+                    "name": entry.name,
+                    "version": f"db-revision-{entry.revision}",
+                    "revision": entry.revision,
+                    "digest": entry.content_digest,
+                    "content": entry.content,
+                    "required_tools": list(entry.required_tools),
+                    "artifact_contract": entry.artifact_contract,
+                }
+            else:
+                # The capability pack is a Run-time trust input.  Prompt
+                # snapshots are model-facing/audit data and must never widen
+                # the set of Skills or artifact contracts after Run creation.
+                capability = MarketingRunCapability.model_validate(
+                    snapshot_payload.get("capability_pack")
+                )
+                loaded = capability.load_skill(args.skill_name, args.requested_version)
         except ValidationError:
             return ToolResult(
                 status="failed",
@@ -157,6 +183,8 @@ class LoadMarketingSkillTool:
         snapshot = dict(run.prompt_snapshot_json or {})
         loaded_skills = list(snapshot.get("loaded_marketing_skills") or [])
         record = {key: loaded[key] for key in ("name", "version", "digest")}
+        if "revision" in loaded:
+            record["revision"] = loaded["revision"]
         if record not in loaded_skills:
             loaded_skills.append(record)
         snapshot["loaded_marketing_skills"] = loaded_skills

@@ -16,10 +16,11 @@ class MarketingSkillSnapshot(BaseModel):
 
     name: str
     version: str
+    revision: int | None = None
     digest: str
     content: str
     required_tools: tuple[str, ...]
-    artifact_contract: str
+    artifact_contract: str | None = None
 
     @model_validator(mode="after")
     def verify_digest(self) -> MarketingSkillSnapshot:
@@ -66,6 +67,7 @@ class MarketingRunCapability(BaseModel):
         return {
             "name": skill.name,
             "version": skill.version,
+            "revision": skill.revision,
             "digest": skill.digest,
             "content": skill.content,
             "required_tools": list(skill.required_tools),

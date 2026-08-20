@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Sequence
+from datetime import UTC, datetime
 
 from alembic import op
 import sqlalchemy as sa
@@ -49,13 +50,13 @@ _BASELINE_SKILLS = (
     (
         "marketing-strategy",
         "营销策略分析领域知识",
-        None,
+        "strategy_advice_v1",
         "围绕业务目标组织分析，允许模型决定澄清、工具顺序和停止条件。",
     ),
     (
         "artifact-drilldown",
         "已发布产物钻取指导",
-        None,
+        "insight_board_v1",
         "只读已发布版本和证据，遵守租户归属、不可变版本和数据受限披露。",
     ),
     (
@@ -87,6 +88,7 @@ def _content(name: str, description: str, body: str) -> str:
 def _baseline_rows() -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     revisions: list[dict[str, object]] = []
     activations: list[dict[str, object]] = []
+    now = datetime.now(UTC).replace(tzinfo=None)
     for index, (name, description, artifact_contract, body) in enumerate(_BASELINE_SKILLS, start=1):
         content = _content(name, description, body)
         revision_id = f"00000000-0045-4000-8000-{index:012d}"
@@ -102,7 +104,7 @@ def _baseline_rows() -> tuple[list[dict[str, object]], list[dict[str, object]]]:
                 "required_tools": [],
                 "artifact_contract": artifact_contract,
                 "created_by": None,
-                "created_at": sa.func.now(),
+                "created_at": now,
                 "change_note": "marketing-v2 baseline snapshot",
             }
         )
@@ -116,7 +118,7 @@ def _baseline_rows() -> tuple[list[dict[str, object]], list[dict[str, object]]]:
                 "previous_revision_id": None,
                 "rollout_percent": 100,
                 "updated_by": None,
-                "updated_at": sa.func.now(),
+                "updated_at": now,
             }
         )
     return revisions, activations

@@ -8,6 +8,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, SecretStr, field_validator, model_validator
 
+from app.marketing_skills.snapshot import SkillManifest
+
 
 class FrozenDict(dict[str, Any]):
     """JSON-shaped mapping that cannot be mutated after snapshot creation."""
@@ -59,6 +61,7 @@ class RuntimeConfigSnapshot(BaseModel):
     required_artifact_contract: str | None = None
     capability_pack_version: str | None = None
     capability_pack_manifest_digest: str | None = None
+    skill_manifest: SkillManifest | None = None
     limits: dict[str, int | float]
     # ``price_table`` is a nested, public snapshot contract.  Secrets remain
     # forbidden recursively; values are integer micros (or bounded labels).
@@ -129,6 +132,7 @@ class RuntimeConfigSnapshot(BaseModel):
             self.capability_pack,
             self.limits,
             self.billing,
+            self.skill_manifest.model_dump(mode="json") if self.skill_manifest else {},
         ):
             if _contains_forbidden_key(container, forbidden) or _contains_credential_value(container):
                 raise ValueError("runtime_snapshot_secret_field")
