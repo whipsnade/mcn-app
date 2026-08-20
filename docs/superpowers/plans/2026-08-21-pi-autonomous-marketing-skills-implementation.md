@@ -288,8 +288,8 @@
 - [x] **Step 2: Run affected verification**：遵循用户明确“不重复全量测试”，未重跑 backend/Gateway/Runtime/前端全量、E2E、迁移升级回滚或真实外部验证；已在最终执行分支完成受影响 Skill 定向测试、`git diff --check`、`git show --check` 和 secret/DSN/Bearer 扫描，结果记录在 QA 文档。
 - [x] **Step 3: Independent review**：只读审查 `63d3cf7..b3249e9`；Critical 0，Important 2，Minor 1，重点架构边界未发现其他问题。
 - [x] **Step 4: Fix only affected findings**：先补 RED 测试，再修复报告元数据展示、全局 scope 唯一性与租户 Diff；受影响后端 18 项、前端 10 项和后端 Ruff 通过，未重跑无关全量。
-- [ ] **Step 5: Create integration candidate**：保持当前 main 脏状态不动，在独立 integration branch/worktree 从执行 HEAD 创建 `--no-ff` merge candidate；只在候选上完成一次合并后验证，不 push、不部署、不移动 main 引用。
-- [ ] **Step 6: Mark Goal complete**：仅在计划 checkbox、迁移、文档、测试、审查、工作树和本地 integration candidate 全部满足后，将 Goal 标记 `complete`；未执行的真实模型/DataTap/钱包/生产部署/Web UAT 继续明确列为外部发布步骤，而非本开发验证。
+- [x] **Step 5: Create integration candidate**：已保持 `main` 引用不动，在独立 worktree 从执行 HEAD `b3ffe36` 创建 `codex/pi-autonomous-marketing-skills-integration`，以 `--no-ff` 合并提交 `158e503`；仅在候选上完成一次受影响验证，不 push、不部署、不移动 main 引用。
+- [x] **Step 6: Mark Goal complete**：计划 checkbox、迁移、文档、测试、审查、执行/候选工作树和本地 integration candidate 均已满足；真实模型/DataTap/钱包/生产部署/Web UAT 仍明确列为外部发布步骤，而非本开发验证。
 
 ## Spec Coverage Self-Review Matrix
 

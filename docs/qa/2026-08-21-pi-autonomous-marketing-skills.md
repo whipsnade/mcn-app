@@ -69,8 +69,8 @@ Web UAT、Corpus Replay、Stage 2A/2B、60-observation、长周期稳定性循�
 
 - 补齐 `pi-runtime` 依赖后再运行 `tests/internal-tools.test.ts` 和 `npm run typecheck`；这不是本阶段
   通过真实运行时的证明。
-- Task 11 的独立审查和受影响修复已完成；仍需在不移动 `main` 引用的独立 worktree 中创建本地
-  integration candidate。未获得授权前不启动真实服务或生产切流。
+- Task 11 的独立审查、受影响修复和本地 integration candidate 已完成；候选分支不移动 `main` 引用，
+  未获得授权前不启动真实服务或生产切流。
 
 ## Task 11：设计覆盖自审与独立边界审查
 
@@ -98,7 +98,17 @@ Web UAT、Corpus Replay、Stage 2A/2B、60-observation、长周期稳定性循�
   `mcp_result_v1`、旧 Builder/发布必经名称或固定规模/权重命中。
 - 管理端 Skill 工作台源码无 `window.confirm`/`window.prompt`；通用 Report 链接只接受 HTTP(S)，
   `null` 显示为数据受限，表格不按业务规则截断。
-- 当前执行 worktree 在 Task 10 提交后干净；此段 Task 11 文档更新尚未提交。
+- 执行 worktree 在实现提交 `b3ffe36` 后干净；Task 11 文档更新随后作为记录提交。候选 worktree
+  也保持干净，依赖符号链接属于忽略文件，不改变源码状态。
+
+### 本地 integration candidate
+
+- 从 `main` 的 `3cb6bd9` 创建独立分支 `codex/pi-autonomous-marketing-skills-integration`，以
+  `--no-ff` 合并执行分支 `b3ffe36`，候选合并提交为 `158e503`；合并时仅
+  `changelog/2026-08-14.md` 的历史记录发生冲突，已保留双方内容后完成合并。
+- 候选验证：受影响后端回归 18 项通过，受影响前端回归 10 项通过，受影响后端 Ruff 通过；
+  `git show --check`、`git diff --check` 通过，候选 worktree 干净。
+- `main` 引用未移动；未 push、未部署、未执行真实模型/DataTap、钱包、生产库、Web UAT 或全量测试。
 
 ### 独立审查结论
 
