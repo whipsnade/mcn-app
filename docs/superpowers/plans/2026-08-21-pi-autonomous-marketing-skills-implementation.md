@@ -244,11 +244,11 @@
 - `ArtifactWorkspace` 新增“通用报告”入口，选择最新已发布 `analysis_report_v1`，与标准 Tab 共用版本选择、未读水位和 `exportArtifact`；Excel 下载显示同一 Version。
 - `AnalysisReportView` 支持 metric cards、typed table、time series、link list、chart、narrative、methodology/limitations，未知 block 显示受控降级而非执行任意 HTML/脚本。
 
-- [ ] **Step 1: Write the failing test**：覆盖 payload 类型收窄、restricted/partial/unavailable 展示、>20/40 行前端全量显示、跨平台列/链接、通用报告 Tab 和同版本导出调用。
-- [ ] **Step 2: Run test to verify it fails**：`npm test -- --run src/api/agentArtifacts.test.ts src/components/artifacts/AnalysisReportView.test.tsx src/components/artifacts/ArtifactWorkspace.test.tsx`；预期 union、view 和 Tab 不存在而失败。
-- [ ] **Step 3: Write minimal implementation**：新增安全通用渲染器和 API DTO，复用现有 report primitives/Recharts，不改变标准 Artifact 视图；在 workspace 仅展示后端已发布版本。
-- [ ] **Step 4: Run test to verify it passes**：运行同一组测试并执行 `npm run lint`。
-- [ ] **Step 5: Update changelog and commit**：记录同版 BI/Excel 和数据受限表现；提交 `feat(frontend): render generic analysis reports`。
+- [x] **Step 1: Write the failing test**：覆盖 payload 类型收窄、restricted/partial/unavailable 展示、>20/40 行前端全量显示、跨平台列/链接、通用报告 Tab 和同版本导出调用。
+- [x] **Step 2: Run test to verify it fails**：`npm test -- --run src/api/agentArtifacts.test.ts src/components/artifacts/AnalysisReportView.test.tsx src/components/artifacts/ArtifactWorkspace.test.tsx`；预期 union、view 和 Tab 不存在而失败。
+- [x] **Step 3: Write minimal implementation**：新增安全通用渲染器和 API DTO，复用现有 report primitives/Recharts，不改变标准 Artifact 视图；在 workspace 仅展示后端已发布版本。
+- [x] **Step 4: Run test to verify it passes**：同一组 Vitest 为 43 个文件、316 个测试通过；`npm run lint` 仅剩仓库既有 `pi-gateway` 类型错误和缺失外部模块错误。
+- [x] **Step 5: Update changelog and commit**：记录同版 BI/Excel 和数据受限表现；提交 `feat(frontend): render generic analysis reports`。
 
 ### Task 10: Native Skill/Report 迁移文档、QA 与每日记录
 
