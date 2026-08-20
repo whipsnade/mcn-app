@@ -249,6 +249,39 @@ function MethodologyBlock({ block }: { block: Extract<AnalysisReportBlock, { blo
   );
 }
 
+function ReportMetadataBlock({ payload }: { payload: AnalysisReportPayload }) {
+  return (
+    <Card title="方法论与限制" icon={<FileText className="h-4 w-4" />}>
+      <dl className="grid gap-2 text-[11px] text-slate-600 sm:grid-cols-2">
+        <div>
+          <dt className="font-semibold text-slate-400">数据截至</dt>
+          <dd className="mt-0.5">{payload.methodology.data_as_of}</dd>
+        </div>
+        <div>
+          <dt className="font-semibold text-slate-400">数据来源</dt>
+          <dd className="mt-0.5">{payload.methodology.source_names.join('、') || '未提供'}</dd>
+        </div>
+      </dl>
+      {payload.methodology.notes.length > 0 && (
+        <div className="mt-2">
+          <p className="text-[11px] font-semibold text-slate-400">方法说明</p>
+          <ul className="mt-1 list-disc space-y-1 pl-4 text-[11px] text-slate-600">
+            {payload.methodology.notes.map((note, index) => <li key={`${index}-${note}`}>{note}</li>)}
+          </ul>
+        </div>
+      )}
+      {payload.limitations.length > 0 && (
+        <div className="mt-2">
+          <p className="text-[11px] font-semibold text-amber-700">限制</p>
+          <ul className="mt-1 list-disc space-y-1 pl-4 text-[11px] text-amber-700">
+            {payload.limitations.map(limitation => <li key={limitation.code}>{limitation.message}</li>)}
+          </ul>
+        </div>
+      )}
+    </Card>
+  );
+}
+
 function renderBlock(block: AnalysisReportBlock): ReactNode {
   switch (block.block_type) {
     case 'metric_cards': return <Fragment key={block.id}><MetricCardsBlock block={block} /></Fragment>;
@@ -297,6 +330,8 @@ export default function AnalysisReportView({ payload }: { payload: AnalysisRepor
           </div>
         )}
       </header>
+
+      <ReportMetadataBlock payload={payload} />
 
       {payload.blocks.map(block => renderBlock(block))}
 

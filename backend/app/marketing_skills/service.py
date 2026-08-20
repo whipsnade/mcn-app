@@ -239,9 +239,18 @@ class SkillAdminService:
             raise SkillAdminError("skill_revision_not_found")
         return next((row for row in rows if row.tenant_id == tenant_id), rows[0])
 
-    async def diff(self, skill_name: str, *, from_revision: int, to_revision: int) -> SkillDiffRead:
-        from_row = await self._revision_for_number(skill_name, from_revision)
-        to_row = await self._revision_for_number(skill_name, to_revision)
+    async def diff(
+        self,
+        skill_name: str,
+        *,
+        from_revision: int,
+        to_revision: int,
+        tenant_id: str | None = None,
+    ) -> SkillDiffRead:
+        from_row = await self._revision_for_number(
+            skill_name, from_revision, tenant_id=tenant_id
+        )
+        to_row = await self._revision_for_number(skill_name, to_revision, tenant_id=tenant_id)
         diff = "".join(
             difflib.unified_diff(
                 from_row.content.splitlines(keepends=True),

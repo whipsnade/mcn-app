@@ -113,6 +113,9 @@ describe('AnalysisReportView', () => {
     expect(screen.getByText('不安全链接')).toBeVisible();
     expect(screen.getByText('链接不可用')).toBeVisible();
     expect(screen.getByText('报告摘要内容')).toBeVisible();
+    expect(screen.getByText('数据来源')).toBeVisible();
+    expect(screen.getByText('DataTap')).toBeVisible();
+    expect(screen.getByText('按真实返回结果展示')).toBeVisible();
     expect(screen.getByText('按平台聚合真实返回数据')).toBeVisible();
     expect(screen.getAllByText('部分长尾数据未返回').length).toBeGreaterThan(0);
   });

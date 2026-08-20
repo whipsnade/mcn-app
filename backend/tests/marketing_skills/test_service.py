@@ -6,6 +6,7 @@ from uuid import uuid4
 import pytest
 import pytest_asyncio
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.admin.models import AdminAuditLog, AdminIdempotencyRecord
@@ -138,6 +139,82 @@ async def test_create_revision_same_key_with_different_payload_is_conflict(admin
 
 
 @pytest.mark.asyncio
+async def test_global_skill_revision_scope_is_database_unique(admin_context) -> None:
+    db, _admin, _tenant = admin_context
+    now = datetime.now(UTC).replace(tzinfo=None)
+    rows = [
+        SkillRevision(
+            id=str(uuid4()),
+            tenant_id=None,
+            skill_name="campaign-research",
+            revision=1,
+            content=f"global-{index}",
+            content_digest=f"{index:064d}",
+            description="global",
+            required_tools=[],
+            created_by=None,
+            created_at=now,
+            change_note=None,
+        )
+        for index in range(2)
+    ]
+    db.add_all(rows)
+
+    with pytest.raises(IntegrityError):
+        await db.flush()
+    await db.rollback()
+
+
+@pytest.mark.asyncio
+async def test_global_skill_activation_scope_is_database_unique(admin_context) -> None:
+    db, _admin, _tenant = admin_context
+    now = datetime.now(UTC).replace(tzinfo=None)
+    revision = SkillRevision(
+        id=str(uuid4()),
+        tenant_id=None,
+        skill_name="campaign-research",
+        revision=1,
+        content="global",
+        content_digest="0" * 64,
+        description="global",
+        required_tools=[],
+        created_by=None,
+        created_at=now,
+        change_note=None,
+    )
+    db.add(revision)
+    await db.flush()
+    db.add_all([
+        SkillActivation(
+            id=str(uuid4()),
+            environment="production",
+            tenant_id=None,
+            skill_name="campaign-research",
+            active_revision_id=revision.id,
+            previous_revision_id=None,
+            rollout_percent=100,
+            updated_by=None,
+            updated_at=now,
+        ),
+        SkillActivation(
+            id=str(uuid4()),
+            environment="production",
+            tenant_id=None,
+            skill_name="campaign-research",
+            active_revision_id=revision.id,
+            previous_revision_id=None,
+            rollout_percent=100,
+            updated_by=None,
+            updated_at=now,
+        ),
+    ])
+
+    with pytest.raises(IntegrityError):
+        await db.flush()
+    await db.rollback()
+
+
+@pytest.mark.asyncio
 async def test_validate_uses_approved_tool_set_and_diff_reads_database_content(admin_context) -> None:
     db, admin, _tenant = admin_context
     service = SkillAdminService(db, approved_tools={"datatap.approved"})
@@ -171,6 +248,59 @@ async def test_validate_uses_approved_tool_set_and_diff_reads_database_content(a
 
     assert "活动研究 v2" in diff.diff
     assert "活动研究\n" in diff.diff
+
+
+@pytest.mark.asyncio
+async def test_diff_uses_tenant_revision_context(admin_context) -> None:
+    db, admin, tenant = admin_context
+    service = SkillAdminService(db, approved_tools=set())
+    global_v1 = await service.create_revision(
+        admin,
+        "campaign-research",
+        SkillRevisionCreate(content=VALID_CONTENT, change_note="global v1"),
+        idempotency_key="skill-diff-global-1",
+    )
+    global_v2 = await service.create_revision(
+        admin,
+        "campaign-research",
+        SkillRevisionCreate(
+            content=VALID_CONTENT.replace("活动研究", "全局 v2"),
+            change_note="global v2",
+        ),
+        idempotency_key="skill-diff-global-2",
+    )
+    tenant_v1 = await service.create_revision(
+        admin,
+        "campaign-research",
+        SkillRevisionCreate(
+            content=VALID_CONTENT.replace("活动研究", "租户 v1"),
+            tenant_id=tenant.id,
+            change_note="tenant v1",
+        ),
+        idempotency_key="skill-diff-tenant-1",
+    )
+    tenant_v2 = await service.create_revision(
+        admin,
+        "campaign-research",
+        SkillRevisionCreate(
+            content=VALID_CONTENT.replace("活动研究", "租户 v2"),
+            tenant_id=tenant.id,
+            change_note="tenant v2",
+        ),
+        idempotency_key="skill-diff-tenant-2",
+    )
+
+    diff = await service.diff(
+        "campaign-research",
+        from_revision=tenant_v1.revision,
+        to_revision=tenant_v2.revision,
+        tenant_id=tenant.id,
+    )
+
+    assert "租户 v2" in diff.diff
+    assert "全局 v2" not in diff.diff
+    assert global_v1.revision == tenant_v1.revision
+    assert global_v2.revision == tenant_v2.revision
 
 
 @pytest.mark.asyncio

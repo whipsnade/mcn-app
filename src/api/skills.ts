@@ -78,9 +78,10 @@ export const getAdminSkillDiff = (
   skillName: string,
   fromRevision: number,
   toRevision: number,
+  tenantId?: string | null,
 ): Promise<ApiSkillDiff> =>
   request<ApiSkillDiff>(
-    `/api/v1/admin/skills/${encodeSkillName(skillName)}/diff?from_revision=${fromRevision}&to_revision=${toRevision}`,
+    `/api/v1/admin/skills/${encodeSkillName(skillName)}/diff?from_revision=${fromRevision}&to_revision=${toRevision}${tenantId ? `&tenant_id=${encodeURIComponent(tenantId)}` : ''}`,
   );
 
 export const activateAdminSkill = (

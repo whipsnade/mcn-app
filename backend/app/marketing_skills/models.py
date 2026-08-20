@@ -19,6 +19,8 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
 
+GLOBAL_SCOPE_KEY = "__global__"
+
 
 class SkillRevision(Base):
     """An immutable, validated Markdown Skill revision.
@@ -30,7 +32,7 @@ class SkillRevision(Base):
     __tablename__ = "skill_revisions"
     __table_args__ = (
         UniqueConstraint(
-            "tenant_id",
+            "scope_key",
             "skill_name",
             "revision",
             name="uq_skill_revisions_tenant_name_revision",
@@ -43,6 +45,9 @@ class SkillRevision(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     tenant_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("tenants.id", ondelete="RESTRICT"), nullable=True
+    )
+    scope_key: Mapped[str] = mapped_column(
+        String(36), nullable=False, default=GLOBAL_SCOPE_KEY
     )
     skill_name: Mapped[str] = mapped_column(String(96), nullable=False)
     revision: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -65,7 +70,7 @@ class SkillActivation(Base):
     __table_args__ = (
         UniqueConstraint(
             "environment",
-            "tenant_id",
+            "scope_key",
             "skill_name",
             name="uq_skill_activations_environment_tenant_name",
         ),
@@ -81,6 +86,9 @@ class SkillActivation(Base):
     environment: Mapped[str] = mapped_column(String(24), nullable=False)
     tenant_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("tenants.id", ondelete="CASCADE"), nullable=True
+    )
+    scope_key: Mapped[str] = mapped_column(
+        String(36), nullable=False, default=GLOBAL_SCOPE_KEY
     )
     skill_name: Mapped[str] = mapped_column(String(96), nullable=False)
     active_revision_id: Mapped[str] = mapped_column(
@@ -106,4 +114,13 @@ def _reject_skill_revision_delete(_mapper: Any, _connection: Any, _target: Skill
     raise ValueError("skill_revision_immutable")
 
 
-__all__ = ["SkillActivation", "SkillRevision"]
+def _sync_scope_key(_mapper: Any, _connection: Any, target: SkillRevision | SkillActivation) -> None:
+    target.scope_key = target.tenant_id or GLOBAL_SCOPE_KEY
+
+
+event.listen(SkillRevision, "before_insert", _sync_scope_key)
+event.listen(SkillActivation, "before_insert", _sync_scope_key)
+event.listen(SkillActivation, "before_update", _sync_scope_key)
+
+
+__all__ = ["GLOBAL_SCOPE_KEY", "SkillActivation", "SkillRevision"]

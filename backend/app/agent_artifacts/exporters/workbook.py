@@ -235,6 +235,33 @@ def _block_section(block: AnalysisReportBlock, layout_sheet: AnalysisReportWorkb
     raise TypeError(f"unsupported report block: {type(block).__name__}")
 
 
+def _report_metadata_section(report: AnalysisReportV1) -> _Section:
+    methodology = report.methodology
+    rows: list[tuple[Any, Any]] = [
+        ("数据状态", report.data_status),
+        ("数据截至", methodology.data_as_of.isoformat(sep=" ")),
+        ("数据来源", "、".join(methodology.source_names) or MISSING),
+    ]
+    rows.extend(("方法说明", note) for note in methodology.notes)
+    rows.extend(
+        ("限制", f"{limitation.code}：{limitation.message}")
+        for limitation in report.limitations
+    )
+    rows.extend(
+        (
+            "结果完整性",
+            f"{item.key}: {item.actual_count}/{item.requested_min} · {item.status} · {item.reason}",
+        )
+        for item in report.fulfillment
+    )
+    return _Section(
+        headers=("项目", "说明"),
+        keys=("kind", "detail"),
+        types=("string", "string"),
+        rows=tuple(rows),
+    )
+
+
 def _effective_layout(report: AnalysisReportV1) -> AnalysisReportWorkbookLayout:
     if report.workbook is not None and report.workbook.sheets:
         return report.workbook
@@ -360,7 +387,10 @@ def _render_layout_sheet(
     used_names: set[str],
     limits: WorkbookLimits,
 ) -> None:
-    sections = [_block_section(block, layout_sheet) for block in blocks]
+    sections: list[_Section] = []
+    if is_first_sheet:
+        sections.append(_report_metadata_section(report))
+    sections.extend(_block_section(block, layout_sheet) for block in blocks)
     worksheet = _new_worksheet(workbook, layout_sheet.title, used_names, limits)
     row = 1
     if is_first_sheet:

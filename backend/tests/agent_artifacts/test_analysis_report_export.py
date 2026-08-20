@@ -185,6 +185,36 @@ def test_analysis_report_exports_deterministic_workbook_with_custom_columns_and_
     assert sheet["D2"].number_format == "0.0%"
 
 
+def test_analysis_report_export_keeps_top_level_methodology_limitations_and_fulfillment() -> None:
+    payload = build_analysis_report_payload()
+    payload["methodology"]["source_names"] = ["DataTap", "内部校验"]
+    payload["methodology"]["notes"] = ["按真实返回结果计算"]
+    payload["limitations"] = [{
+        "code": "coverage_partial",
+        "message": "部分平台数据延迟",
+        "affected_paths": ["/blocks/platform_rows"],
+    }]
+    report = AnalysisReportV1.model_validate(payload)
+    content = render_workbook_v1(
+        report,
+        exporter_version="analysis-report-v1",
+        limits=WorkbookLimits(
+            max_sheets=8,
+            max_rows_per_sheet=100,
+            max_columns=16,
+            max_cell_chars=32767,
+            max_bytes=2_000_000,
+        ),
+    )
+    workbook = load_workbook(BytesIO(content), data_only=False)
+    values = [cell.value for sheet in workbook.worksheets for row in sheet.iter_rows() for cell in row]
+
+    assert "DataTap、内部校验" in values
+    assert "按真实返回结果计算" in values
+    assert any(isinstance(value, str) and "部分平台数据延迟" in value for value in values)
+    assert any(isinstance(value, str) and "requested_items" in value for value in values)
+
+
 def test_analysis_report_paginates_without_dropping_business_rows() -> None:
     payload = build_analysis_report_payload(row_count=45)
     report = AnalysisReportV1.model_validate(payload)

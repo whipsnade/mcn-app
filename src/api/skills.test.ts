@@ -74,6 +74,11 @@ describe('marketing skills admin api', () => {
       '/api/v1/admin/skills/brand-research/diff?from_revision=1&to_revision=2',
     );
 
+    await getAdminSkillDiff('brand-research', 1, 2, 'tenant/one');
+    expect(mockRequest).toHaveBeenCalledWith(
+      '/api/v1/admin/skills/brand-research/diff?from_revision=1&to_revision=2&tenant_id=tenant%2Fone',
+    );
+
     await activateAdminSkill(
       'brand-research',
       { revision: 2, tenant_id: 'tenant/one', environment: 'production', rollout_percent: 25 },

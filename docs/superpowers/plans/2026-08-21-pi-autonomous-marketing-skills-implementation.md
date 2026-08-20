@@ -270,11 +270,11 @@
 - 迁移期保留 `load_marketing_skill`，但原生 Skill 的正常路径只依赖 Run Snapshot 注入的目录、Tool Contracts 和 Root Policy；`pi-runtime` POC 仍明确标记为兼容测试入口。
 - QA 文档记录设计覆盖矩阵、测试命令、未执行真实外部动作和关键安全断言；changelog 记录每阶段提交/验证/遗留事实。
 
-- [ ] **Step 1: Write the failing test**：更新技能文本断言，确保不再要求固定工具顺序/Evidence Bridge/旧内部工具作为生产必经路径，且 compatibility tool 仍存在于迁移期定义。
-- [ ] **Step 2: Run test to verify it fails**：`cd pi-runtime && npm test -- --run tests/skills.test.ts tests/internal-tools.test.ts`；预期旧文案断言与新迁移要求冲突而失败。
-- [ ] **Step 3: Write minimal implementation**：更新文案为模型自主决策、直接 MCP Result、generic report/workbook、数据不足披露和 clarification 语义；runbook/QA 明确 native loader 与数据库 Revision 单一事实源，不把 Skill 内容测试升级成全量回归门禁。
-- [ ] **Step 4: Run test to verify it passes**：运行同一组 POC 定向测试、`git diff --check` 和 secret/DSN/Bearer 扫描。
-- [ ] **Step 5: Update changelog and commit**：提交 `docs: document autonomous skill rollout and report contract`。
+- [x] **Step 1: Write the failing test**：更新技能文本断言，确保不再要求固定工具顺序/Evidence Bridge/旧内部工具作为生产必经路径，且 compatibility tool 仍存在于迁移期定义。
+- [x] **Step 2: Run test to verify it fails**：`cd pi-runtime && npm test -- --run tests/skills.test.ts tests/internal-tools.test.ts`；旧文案断言按预期失败；内部工具套件因当前 worktree 缺少 `typebox` 无法收集，未擅自安装依赖。
+- [x] **Step 3: Write minimal implementation**：更新文案为模型自主决策、直接 MCP Result、generic report/workbook、数据不足披露和 clarification 语义；runbook/QA 明确 native loader 与数据库 Revision 单一事实源，不把 Skill 内容测试升级成全量回归门禁。
+- [x] **Step 4: Run test to verify it passes**：`tests/skills.test.ts` 为 1 个文件、6 个测试通过；`git diff --check`、secret/DSN/Bearer 扫描和旧桥接/固定规格静态扫描通过。
+- [x] **Step 5: Update changelog and commit**：已提交 `b3249e9 docs: document autonomous skill rollout and report contract`。
 
 ### Task 11: 设计覆盖自审、独立审查与最终候选验证
 
@@ -284,10 +284,10 @@
 - Modify: `docs/runbooks/pi-agent-gateway.md`
 - Modify: `changelog/2026-08-21.md`
 
-- [ ] **Step 1: Spec coverage self-review**：逐条对照设计 §2–§15 与 Task 1–10，确认 Revision/Activation/灰度/回滚、snapshot、native loader、管理 UI、analysis_report、workbook、标准兼容、澄清、direct MCP、unknown、技术上限和文档均有实现与测试；扫描未完成占位标记，计划中不得保留占位。
-- [ ] **Step 2: Run affected verification**：在最终候选上按用户授权只运行一次：`cd backend && .venv/bin/pytest -q`、`.venv/bin/ruff check app tests`、`cd pi-gateway && npm test && npm run typecheck && npm run build`、`cd pi-runtime && npm test && npm run typecheck`、根目录 `npm run test && npm run lint && npm run build`、相关 Playwright E2E、Alembic migration upgrade/rollback、`git diff --check`、`git show --check` 和 secret/DSN 扫描。
-- [ ] **Step 3: Independent review**：对照架构边界审查 Critical/Important，重点检查未审核 Skill 进入生产、snapshot 热更新污染、tenant/user/session 越权、unknown replay、标准 MCP 结果改写、报告跨 Version 引用、Excel 注入/路径/宏/静默截断和 UI confirm/prompt；目标 `Critical 0 / Important 0`，Minor 写入 backlog。
-- [ ] **Step 4: Fix only affected findings**：若审查有真实阻断，先写对应失败测试，再修复并只运行受影响测试；不重跑无关全量。
+- [x] **Step 1: Spec coverage self-review**：已逐条对照设计 §2–§15 与 Task 1–10，确认 Revision/Activation/灰度/回滚、snapshot、native loader、管理 UI、analysis_report、workbook、标准兼容、澄清、direct MCP、unknown、技术上限和文档均有实现或明确验证边界；剩余占位仅为本 Task 未完成 checkbox。
+- [x] **Step 2: Run affected verification**：遵循用户明确“不重复全量测试”，未重跑 backend/Gateway/Runtime/前端全量、E2E、迁移升级回滚或真实外部验证；已在最终执行分支完成受影响 Skill 定向测试、`git diff --check`、`git show --check` 和 secret/DSN/Bearer 扫描，结果记录在 QA 文档。
+- [x] **Step 3: Independent review**：只读审查 `63d3cf7..b3249e9`；Critical 0，Important 2，Minor 1，重点架构边界未发现其他问题。
+- [x] **Step 4: Fix only affected findings**：先补 RED 测试，再修复报告元数据展示、全局 scope 唯一性与租户 Diff；受影响后端 18 项、前端 10 项和后端 Ruff 通过，未重跑无关全量。
 - [ ] **Step 5: Create integration candidate**：保持当前 main 脏状态不动，在独立 integration branch/worktree 从执行 HEAD 创建 `--no-ff` merge candidate；只在候选上完成一次合并后验证，不 push、不部署、不移动 main 引用。
 - [ ] **Step 6: Mark Goal complete**：仅在计划 checkbox、迁移、文档、测试、审查、工作树和本地 integration candidate 全部满足后，将 Goal 标记 `complete`；未执行的真实模型/DataTap/钱包/生产部署/Web UAT 继续明确列为外部发布步骤，而非本开发验证。
 

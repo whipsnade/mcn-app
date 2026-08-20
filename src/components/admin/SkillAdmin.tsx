@@ -157,7 +157,10 @@ export default function SkillAdmin() {
     setBusy(true);
     setError('');
     try {
-      const result = await getAdminSkillDiff(selectedSkillName, fromRevision, toRevision);
+      const scopeTenantId = tenantId.trim() || undefined;
+      const result = scopeTenantId
+        ? await getAdminSkillDiff(selectedSkillName, fromRevision, toRevision, scopeTenantId)
+        : await getAdminSkillDiff(selectedSkillName, fromRevision, toRevision);
       setDiff(result.diff);
     } catch (diffError) {
       setError(errorMessage(diffError, '加载 Diff 失败'));

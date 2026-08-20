@@ -68,10 +68,14 @@ async def skill_diff(
     db: Annotated[AsyncSession, Depends(get_db)],
     from_revision: Annotated[int, Query(gt=0)],
     to_revision: Annotated[int, Query(gt=0)],
+    tenant_id: Annotated[str | None, Query(min_length=1, max_length=36)] = None,
 ) -> SkillDiffRead:
     try:
         return await SkillAdminService(db).diff(
-            skill_name, from_revision=from_revision, to_revision=to_revision
+            skill_name,
+            from_revision=from_revision,
+            to_revision=to_revision,
+            tenant_id=tenant_id,
         )
     except SkillAdminError as error:
         raise _skill_error(error) from error
