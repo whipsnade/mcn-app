@@ -288,7 +288,7 @@ class BuildArtifactDraftArgs(BaseModel):
 
 
 class BuildArtifactDraftTool(_BuilderToolBase):
-    """Artifact Skill 的统一入口；不读取 Evidence，也不推导 required contract。"""
+    """Artifact Skill 的统一入口；不读取 Evidence，也不推导业务流程顺序。"""
 
     name = "build_artifact_draft"
     input_model = BuildArtifactDraftArgs
@@ -302,7 +302,8 @@ class BuildArtifactDraftTool(_BuilderToolBase):
         "（提交会被 server_owned_field_rejected 拒绝）。校验失败返回结构化字段级错误"
         "（RFC6901 path/type/reason），按路径修正后重试。可选 source_tool_call_ids 仅用于"
         "校验调用属于当前 Run，不会读取或重验 MCP 业务结果。成功只返回 Draft 身份摘要；"
-        "模型也可以不调用本工具而直接返回文字。"
+        "模型可以先继续澄清或降级文字；普通用户 Run 的最终完成门禁由 Pi Gateway"
+        "统一要求当前 Run 的顶层主 Artifact，不在 Builder 内固定某一种报告 contract。"
     )
 
     @staticmethod

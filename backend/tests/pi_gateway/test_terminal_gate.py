@@ -101,6 +101,7 @@ async def test_terminal_completed_after_message_completion_orders_events(
 ) -> None:
     user = await user_factory()
     run, attempt, _tenant_id = await _run(db_session, user)
+    run.profile_name = "utility_v1"
     token = "lease-token-terminal-ok-with-entropy"
     _arm_lease(run, token)
     await db_session.commit()
@@ -153,6 +154,7 @@ async def test_terminal_completed_after_message_completion_orders_events(
 async def test_has_assistant_completion_service_contract(db_session, user_factory) -> None:
     user = await user_factory()
     run, attempt, _tenant_id = await _run(db_session, user)
+    run.profile_name = "utility_v1"
     service = PiGatewayService(db_session, gateway_id=GATEWAY_ID)
     assert await service.has_assistant_completion(run) is False
     await service.ingest_source_event(

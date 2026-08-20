@@ -38,7 +38,12 @@ class GetSessionContextArgs(BaseModel):
 
 
 class GetSessionContextTool:
-    """返回当前 Run 的受限会话上下文（不含任何密钥/完整 Evidence）。"""
+    """返回当前 Run 的受限上下文（不含密钥/完整 Evidence）。
+
+    Artifact 目录只提供已发布 Version 摘要；普通用户 Run 是否具备可完成
+    的顶层主 Artifact 由 Pi Gateway CompletionValidator 统一判定，不由该
+    上下文工具暗含固定报告类型或调用顺序。
+    """
 
     name = "get_session_context"
     input_model = GetSessionContextArgs

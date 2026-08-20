@@ -1,8 +1,9 @@
 """Pi Run 的统一平台完成契约。
 
 该模块是正常 terminal、ACK 丢失恢复以及系统 force-complete 共用的唯一成功
-判定。它只守住平台一致性；是否完成用户目标、是否生成报告以及选择哪种
-artifact contract 都由 Pi 决定，UAT 另行评价。
+判定。它守住平台一致性，并要求普通用户可见 Pi Run 在完成前拥有当前 Run
+发布的顶层主 Artifact；主 Artifact 的具体 contract 仍由 Pi 在冻结 allowlist
+内自主选择。澄清终态与 utility Run 不需要主 Artifact。
 """
 
 from __future__ import annotations
@@ -59,7 +60,9 @@ class CompletionValidator:
 
         ``result_unknown`` 是会计上的未决事实，不是平台可以擅自重放或释放
         的失败。只要没有 running/unresolved row，它会以 warning 伴随文本
-        完成；真正仍在生命周期中的 permit/Step 继续阻止成功终态。
+        完成；真正仍在生命周期中的 permit/Step 继续阻止成功终态。普通用户
+        Run 还必须有当前 Run 的顶层已发布 Version，澄清终态和 utility Run
+        除外。
         """
         warnings: list[str] = []
         assistant_messages = list(
@@ -247,7 +250,23 @@ class CompletionValidator:
                     "pi_gateway_artifact_invalid",
                     "published artifact Version is missing or does not belong to this Run",
                 )
+            if self._requires_main_artifact(run):
+                return CompletionValidationResult(
+                    False,
+                    "pi_gateway_main_artifact_missing",
+                    "a current Run top-level published main Artifact is required",
+                )
             return CompletionValidationResult(True, warnings=tuple(warnings))
+
+        main_versions = [
+            row for row in versions if row[1].parent_artifact_id is None
+        ]
+        if self._requires_main_artifact(run) and not main_versions:
+            return CompletionValidationResult(
+                False,
+                "pi_gateway_main_artifact_missing",
+                "child insight Artifacts do not satisfy the top-level main Artifact requirement",
+            )
 
         for version, artifact, revision, publication in versions:
             if (
@@ -276,7 +295,27 @@ class CompletionValidator:
                 code = "pi_gateway_artifact_invalid"
                 return CompletionValidationResult(False, code, validation_error)
         return CompletionValidationResult(
-            True, artifact_version_id=versions[0][0].id, warnings=tuple(warnings)
+            True,
+            artifact_version_id=(
+                main_versions[0][0].id if main_versions else versions[0][0].id
+            ),
+            warnings=tuple(warnings),
+        )
+
+    @staticmethod
+    def _requires_main_artifact(run: AgentRun) -> bool:
+        """判断成功的 Pi Run 是否必须暴露顶层主 Artifact。
+
+        ``utility_v1`` 只产生标题/摘要等内部轻量结果，允许文本完成；
+        ``clarification_requested`` 是独立的用户可见终态，也不应被迫发布
+        报告。其他用户可见 Pi Run 使用泛化门禁，不硬编码报告 contract。
+        """
+        return (
+            run.runtime_backend == "pi"
+            and run.run_kind == "user"
+            and run.visibility == "user"
+            and run.status != "clarification_requested"
+            and not run.profile_name.startswith("utility_")
         )
 
     async def _current_published_versions(

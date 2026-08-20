@@ -475,6 +475,7 @@ async def terminal(
                 "pi_gateway_artifact_invalid",
                 "pi_gateway_artifact_contract_not_allowed",
                 "pi_gateway_active_artifact_draft",
+                "pi_gateway_main_artifact_missing",
             }:
                 code = "pi_gateway_terminal_rejected"
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=code) from exc

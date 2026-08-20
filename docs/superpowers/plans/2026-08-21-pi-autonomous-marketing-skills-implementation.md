@@ -201,11 +201,11 @@
 - 保持 `standard MCP Tool Result -> Pi` 直通；empty/partial/failed/definitely_not_sent/result_unknown 测试只验证现有分类和结算，不把 Evidence Bridge 重新接入。
 - 结构化 Draft 错误继续以字段 path/type/reason/retryable 回喂；Pi 可在一次 unknown 后继续其他独立工具，不自动重放 unknown；明确请求不触发机械 clarification。
 
-- [ ] **Step 1: Write the failing test**：先补「无主报告的正常 completed 被拒绝」「clarification 可完成」「standard report/analysis_report 主 Version 通过」「unknown 后独立工具仍可执行且无 replay」「长尾 Excel 走 generic report」用例。
-- [ ] **Step 2: Run test to verify it fails**：`cd backend && .venv/bin/pytest -q tests/pi_gateway/test_completion_validator.py tests/pi_gateway/test_direct_mcp_architecture.py tests/integration/pi_uat/test_autonomous_marketing_behaviors.py`；预期当前完成门禁/假拓扑不覆盖新语义而失败。
-- [ ] **Step 3: Write minimal implementation**：在统一 CompletionValidator 的 terminal/recovery/force-complete 入口复用同一主 Artifact 查询；只按产物归属与发布状态判断，不增加固定业务调用顺序、工具次数或类型门禁。
-- [ ] **Step 4: Run test to verify it passes**：运行同一组定向集成测试；只在失败用例上修复，不重跑无关全量。
-- [ ] **Step 5: Update changelog and commit**：记录澄清例外、主报告条件和 unknown 继续分析证据；提交 `feat(pi): enforce generic main-report completion semantics`。
+- [x] **Step 1: Write the failing test**：先补「无主报告的正常 completed 被拒绝」「clarification 可完成」「standard report/analysis_report 主 Version 通过」「unknown 后独立工具仍可执行且无 replay」「长尾 Excel 走 generic report」用例。
+- [x] **Step 2: Run test to verify it fails**：`cd backend && .venv/bin/pytest -q tests/pi_gateway/test_completion_validator.py tests/pi_gateway/test_direct_mcp_architecture.py tests/integration/pi_uat/test_autonomous_marketing_behaviors.py`；RED 为 3 个主报告门禁断言失败，且受限沙箱首次因无可写临时目录未进入 pytest 收集。
+- [x] **Step 3: Write minimal implementation**：在统一 CompletionValidator 的 terminal/recovery/force-complete 入口复用同一主 Artifact 查询；只按产物归属与发布状态判断，不增加固定业务调用顺序、工具次数或类型门禁。
+- [x] **Step 4: Run test to verify it passes**：同一组定向测试 GREEN 为 20 passed；受影响 terminal gate/direct builder 回归为 13 passed；变更文件 Ruff 通过。
+- [x] **Step 5: Update changelog and commit**：记录澄清例外、主报告条件和 unknown 继续分析证据；提交 `feat(pi): enforce generic main-report completion semantics`。
 
 ### Task 8: 管理端 Skill 工作台
 
