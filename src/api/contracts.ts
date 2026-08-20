@@ -357,3 +357,75 @@ export interface ApiFavorite {
   source_task_id: string | null;
   created_at: string;
 }
+
+export type AdminSkillEnvironment = 'development' | 'staging' | 'production';
+
+export interface ApiSkillValidationError {
+  code: string;
+  message: string;
+  line: number | null;
+}
+
+export interface ApiSkillValidation {
+  valid: boolean;
+  name: string | null;
+  description: string | null;
+  required_tools: string[];
+  artifact_contract: string | null;
+  content_digest: string;
+  errors: ApiSkillValidationError[];
+}
+
+export interface ApiSkillRevision {
+  id: string;
+  tenant_id: string | null;
+  skill_name: string;
+  revision: number;
+  content: string;
+  content_digest: string;
+  description: string;
+  required_tools: string[];
+  artifact_contract: string | null;
+  created_by: string | null;
+  created_at: string;
+  change_note: string | null;
+}
+
+export interface ApiSkillActivation {
+  id: string;
+  environment: AdminSkillEnvironment;
+  tenant_id: string | null;
+  skill_name: string;
+  active_revision: number;
+  active_revision_id: string;
+  previous_revision: number | null;
+  previous_revision_id: string | null;
+  rollout_percent: number;
+  updated_by: string | null;
+  updated_at: string;
+}
+
+export interface ApiSkillListItem {
+  skill_name: string;
+  latest_revision: number;
+  revision_count: number;
+  active: ApiSkillActivation[];
+}
+
+export interface ApiSkillList {
+  items: ApiSkillListItem[];
+  total: number;
+}
+
+export interface ApiSkillDetail {
+  skill_name: string;
+  revisions: ApiSkillRevision[];
+  activations: ApiSkillActivation[];
+}
+
+export interface ApiSkillDiff {
+  skill_name: string;
+  from_revision: number;
+  to_revision: number;
+  diff: string;
+}

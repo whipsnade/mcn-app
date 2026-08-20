@@ -222,11 +222,11 @@
 - `listAdminSkills/validateAdminSkill/createAdminSkillRevision/getAdminSkillDiff/activateAdminSkill/rollbackAdminSkill` 与后端 DTO 一一对应，所有写请求显式生成/传递 `Idempotency-Key`。
 - `SkillAdmin` 状态包括选中 Skill、Revision 列表、只读 diff、Markdown 编辑、校验结果、tenant/rollout 输入、发布/回滚 loading/error/success；回滚使用现有 `ConfirmDialog`，不调用 `window.prompt` 或 `window.confirm`。
 
-- [ ] **Step 1: Write the failing test**：API 测试 URL/body/header；组件测试列表、编辑、校验失败、diff、发布、租户灰度、全量激活、回滚确认和审计字段展示。
-- [ ] **Step 2: Run test to verify it fails**：`npm test -- --run src/api/skills.test.ts src/components/admin/SkillAdmin.test.tsx`；预期模块和导航项不存在而失败。
-- [ ] **Step 3: Write minimal implementation**：沿用现有 Admin API/组件样式，新增“营销 Skills”模块，使用受控 textarea/editor、结构化错误列表和显式按钮状态；不把 Root Policy 或 Tool Contracts 暴露为可编辑内容。
-- [ ] **Step 4: Run test to verify it passes**：运行同一组 Vitest，并执行 `npm run lint`。
-- [ ] **Step 5: Update changelog and commit**：记录 UI 能力与无 confirm/prompt 证明；提交 `feat(admin): add marketing skill management workspace`。
+- [x] **Step 1: Write the failing test**：API 测试 URL/body/header；组件测试列表、编辑、校验失败、diff、发布、租户灰度、全量激活、回滚确认和审计字段展示。
+- [x] **Step 2: Run test to verify it fails**：`npm test -- --run src/api/skills.test.ts src/components/admin/SkillAdmin.test.tsx`；预期模块和导航项不存在而失败。
+- [x] **Step 3: Write minimal implementation**：沿用现有 Admin API/组件样式，新增“营销 Skills”模块，使用受控 textarea/editor、结构化错误列表和显式按钮状态；不把 Root Policy 或 Tool Contracts 暴露为可编辑内容。
+- [x] **Step 4: Run test to verify it passes**：运行同一组 Vitest，并执行 `npm run lint`；Vitest 通过，lint 仅剩仓库既有 `pi-gateway` 类型错误和缺失外部模块错误。
+- [x] **Step 5: Update changelog and commit**：记录 UI 能力与无 confirm/prompt 证明；提交 `feat(admin): add marketing skill management workspace`。
 
 ### Task 9: 通用报告 API 类型、BI 展示与 Excel 入口
 

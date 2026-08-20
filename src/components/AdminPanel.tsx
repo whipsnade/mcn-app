@@ -24,6 +24,7 @@ import UsageAdmin from './admin/UsageAdmin';
 import PiRuntimeAdmin from './admin/PiRuntimeAdmin';
 import RuntimeConfigAdmin from './admin/RuntimeConfigAdmin';
 import RunDiagnostics from './admin/RunDiagnostics';
+import SkillAdmin from './admin/SkillAdmin';
 
 interface AdminPanelProps {
   isOpen: boolean;
@@ -432,6 +433,7 @@ export default function AdminPanel({
               {activeModule === 'pi-runtime' && <PiRuntimeAdmin />}
               {activeModule === 'runtime-configs' && <RuntimeConfigAdmin />}
               {activeModule === 'diagnostics' && <RunDiagnostics />}
+              {activeModule === 'skills' && <SkillAdmin />}
             </div>
           )}
 
