@@ -43,6 +43,7 @@ from app.identity.models import (
 )
 from app.licensing.models import TenantLicense
 from app.mcp_gateway.models import McpCall, McpToolCatalog, McpToolDiscovery
+from app.marketing_skills.models import SkillActivation, SkillRevision
 from app.model.models import ModelPromptLog, ModelRun
 from app.quick.models import QuickMcpCall
 from app.reporting.models import (
@@ -109,6 +110,8 @@ __all__ = [
     "PiGatewayRequestNonce",
     "PiTenantQueueState",
     "SessionKolSelection",
+    "SkillActivation",
+    "SkillRevision",
     "TaskArtifact",
     "TaskCandidate",
     "TaskCandidatePool",
