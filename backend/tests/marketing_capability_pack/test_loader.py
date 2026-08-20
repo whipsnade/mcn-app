@@ -139,7 +139,12 @@ def test_repository_marketing_v2_pack_aligns_with_pi_production_tool_surface() -
     for skill in snapshot.skills:
         assert skill.version == "1.1.0"
         assert set(skill.required_tools) <= pi_tool_surface
-    assert snapshot.builder_versions == {"brand_report_v3": "1.1.0", "campaign_report_v3": "1.1.0", "kol_selection_v3": "1.1.0"}
+    assert snapshot.builder_versions == {
+        "brand_report_v3": "1.1.0",
+        "campaign_report_v3": "1.1.0",
+        "kol_selection_v3": "1.1.0",
+        "analysis_report_v1": "1.0.0",
+    }
     assert snapshot.exporter_versions == {"brand_report_v3": "1.1.0", "campaign_report_v3": "1.1.0", "kol_selection_v3": "1.1.0"}
 
     forbidden = (

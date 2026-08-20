@@ -59,6 +59,7 @@ async def test_tenant_runtime_config_snapshot_is_secret_free_and_switchable(
     assert dumped["required_artifact_contract"] is None
     assert dumped["artifact_contract_mode"] is None
     assert dumped["allowed_artifact_contracts"] == [
+        "analysis_report_v1",
         "brand_report_v3",
         "campaign_report_v3",
         "insight_board_v1",
@@ -135,6 +136,7 @@ async def test_new_run_snapshot_uses_capability_allowlist_not_profile_required_c
     assert snapshot.required_artifact_contract is None
     assert snapshot.artifact_contract_mode is None
     assert snapshot.allowed_artifact_contracts == (
+        "analysis_report_v1",
         "brand_report_v3",
         "campaign_report_v3",
         "insight_board_v1",

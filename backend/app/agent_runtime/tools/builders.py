@@ -330,6 +330,17 @@ class BuildArtifactDraftTool(_BuilderToolBase):
             if not isinstance(parent, str) or not parent or not isinstance(question, str) or not question:
                 return None
             return "insight", {"parent_artifact_version_id": parent, "question": question}
+        if artifact_type == "analysis_report_v1":
+            scope = payload.get("scope")
+            subject_type = payload.get("subject_type")
+            title = payload.get("title")
+            if not isinstance(scope, dict) or not scope or not isinstance(subject_type, str) or not subject_type:
+                return None
+            if not isinstance(title, str) or not title.strip():
+                return None
+            return "report", {
+                "scope": {"subject_type": subject_type, "title": title, "scope": scope},
+            }
         return None
 
     async def _execute(self, context: ToolContext, arguments: BaseModel) -> ToolResult:

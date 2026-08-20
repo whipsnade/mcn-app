@@ -152,11 +152,11 @@
 - `AnalysisReportV1Input`：模型只提交业务字段；`assemble_analysis_report_payload(input) -> dict` 服务器补齐 `schema_version/module/data_status`、规范化 block id、限制检查和最终 JSON。
 - `fulfillment` 每项必须有 `requested_min/actual_count/status/reason`；真实数量不补造，`partial/unavailable` 自动进入限制披露；技术上限由 Settings 注入，不得写死 Top20/Top40。
 
-- [ ] **Step 1: Write the failing test**：覆盖每种 Block、表格类型、唯一 ID、URL/公式/秘密拒绝、data_status 从 availability 推导、数量不足保留实际数量、200+ 行不因业务数量失败、服务器字段伪造拒绝、标准 Artifact 映射不回归。
-- [ ] **Step 2: Run test to verify it fails**：`cd backend && .venv/bin/pytest -q tests/agent_artifacts/test_analysis_report_payload.py tests/agent_artifacts/test_analysis_report_publish.py tests/agent_runtime/tools/test_direct_artifact_builder.py -k 'analysis_report or direct_model'`；预期 Schema、输入 DTO 和 mapping 不存在而失败。
-- [ ] **Step 3: Write minimal implementation**：把 `analysis_report_v1` 加入唯一 payload/input/allowlist 映射，新增 `module="report"` 的业务身份组装；manifest digest 重新计算并把新 Output Skill 注册；不修改 `marketing-v1`，不改变标准 Artifact 上限语义。
-- [ ] **Step 4: Run test to verify it passes**：运行同一组定向测试与 `ruff check app/agent_artifacts app/agent_runtime/tools app/marketing_capability_pack tests/agent_artifacts tests/agent_runtime/tools`。
-- [ ] **Step 5: Update changelog and commit**：记录强类型字段、服务器所有权和无业务行数门禁；提交 `feat(artifacts): add generic analysis report contract`。
+- [x] **Step 1: Write the failing test**：覆盖每种 Block、表格类型、唯一 ID、URL/公式/秘密拒绝、data_status 从 availability 推导、数量不足保留实际数量、200+ 行不因业务数量失败、服务器字段伪造拒绝、标准 Artifact 映射不回归。
+- [x] **Step 2: Run test to verify it fails**：`cd backend && .venv/bin/pytest -q tests/agent_artifacts/test_analysis_report_payload.py tests/agent_artifacts/test_analysis_report_publish.py tests/agent_runtime/tools/test_direct_artifact_builder.py -k 'analysis_report or direct_model'`；预期 Schema、输入 DTO 和 mapping 不存在而失败。
+- [x] **Step 3: Write minimal implementation**：把 `analysis_report_v1` 加入唯一 payload/input/allowlist 映射，新增 `module="report"` 的业务身份组装；manifest digest 重新计算并把新 Output Skill 注册；不修改 `marketing-v1`，不改变标准 Artifact 上限语义。
+- [x] **Step 4: Run test to verify it passes**：运行同一组定向测试与 `ruff check app/agent_artifacts app/agent_runtime/tools app/marketing_capability_pack tests/agent_artifacts tests/agent_runtime/tools`。
+- [x] **Step 5: Update changelog and commit**：记录强类型字段、服务器所有权和无业务行数门禁；提交 `feat(artifacts): add generic analysis report contract`。
 
 ### Task 6: `workbook_v1` 同版确定性 Excel 与缓存
 

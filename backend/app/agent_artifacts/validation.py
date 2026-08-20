@@ -53,6 +53,7 @@ SCHEMA_VERSION_BY_MODULE: dict[str, str] = {
     "kol-analysis": "kol_analysis_v2",
     "kol-detail": "kol_detail_v2",
     "insight": "insight_board_v1",
+    "report": "analysis_report_v1",
 }
 
 # key 模块 → 生成 artifact_key 所需 business fields（拒绝裸 key，§2.4）。
@@ -63,6 +64,7 @@ _REQUIRED_BUSINESS_FIELDS: dict[str, tuple[str, ...]] = {
     "kol-analysis": ("selection_artifact_id",),
     "kol-detail": ("platform", "kol_uid"),
     "insight": ("parent_artifact_version_id", "question"),
+    "report": ("scope",),
 }
 
 

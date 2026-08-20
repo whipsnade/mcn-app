@@ -26,6 +26,10 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from app.agent_artifacts.model_inputs.analysis_report import (
+    AnalysisReportV1Input,
+    assemble_analysis_report_payload,
+)
 from app.agent_artifacts.model_inputs.brand import BrandReportV3Input, assemble_brand_payload
 from app.agent_artifacts.model_inputs.campaign import (
     CampaignReportV3Input,
@@ -51,6 +55,7 @@ MODEL_INPUT_BY_ARTIFACT_TYPE: dict[str, type[BaseModel]] = {
     "campaign_report_v3": CampaignReportV3Input,
     "kol_selection_v3": KolSelectionV3Input,
     "insight_board_v1": InsightBoardV1Input,
+    "analysis_report_v1": AnalysisReportV1Input,
 }
 
 #: 服务器字段：模型输入中出现即结构化拒绝（server_owned_field_rejected）。
@@ -69,6 +74,8 @@ def assemble_model_payload(artifact_type: str, model_input: BaseModel) -> dict[s
         return assemble_kol_selection_payload(model_input)  # type: ignore[arg-type]
     if artifact_type == "insight_board_v1":
         return assemble_insight_payload(model_input)  # type: ignore[arg-type]
+    if artifact_type == "analysis_report_v1":
+        return assemble_analysis_report_payload(model_input)  # type: ignore[arg-type]
     raise ValueError(f"no direct model input assembler for artifact type {artifact_type!r}")
 
 
@@ -101,10 +108,12 @@ __all__ = [
     "BrandReportV3Input",
     "CampaignReportV3Input",
     "InsightBoardV1Input",
+    "AnalysisReportV1Input",
     "KolSelectionV3Input",
     "assemble_brand_payload",
     "assemble_campaign_payload",
     "assemble_insight_payload",
+    "assemble_analysis_report_payload",
     "assemble_kol_selection_payload",
     "assemble_model_payload",
     "model_input_contract",

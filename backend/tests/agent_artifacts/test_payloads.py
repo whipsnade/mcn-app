@@ -15,6 +15,7 @@ from app.agent_artifacts.payloads.brand import BrandData
 from app.agent_artifacts.payloads.campaign import CampaignData
 from app.agent_artifacts.payloads import (
     TYPED_PAYLOAD_BY_SCHEMA,
+    AnalysisReportV1,
     BrandReportV3,
     CampaignReportV2,
     CampaignReportV3,
@@ -589,10 +590,12 @@ def test_type_map_keys_are_fixed() -> None:
         "kol_analysis_v2",
         "kol_detail_v2",
         "insight_board_v1",
+        "analysis_report_v1",
     }
     assert TYPED_PAYLOAD_BY_SCHEMA["brand_report_v3"] is BrandReportV3
     assert TYPED_PAYLOAD_BY_SCHEMA["campaign_report_v3"] is CampaignReportV3
     assert TYPED_PAYLOAD_BY_SCHEMA["insight_board_v1"] is InsightBoardV1
+    assert TYPED_PAYLOAD_BY_SCHEMA["analysis_report_v1"] is AnalysisReportV1
 
 
 @pytest.mark.parametrize(("model", "version"), [(m, v) for m, v, _ in PAYLOAD_CASES])
