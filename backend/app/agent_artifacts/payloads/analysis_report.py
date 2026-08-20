@@ -235,6 +235,7 @@ class AnalysisReportWorkbookSheet(BaseModel):
     freeze_rows: int = Field(default=1, ge=0)
     auto_filter: bool = True
     sort_by: tuple[str, ...] = ()
+    page_size: int | None = Field(default=None, gt=0, le=1_000_000)
 
 
 class AnalysisReportWorkbookLayout(BaseModel):
@@ -369,7 +370,17 @@ __all__ = [
     "AnalysisReportWorkbookSheet",
     "ReportCell",
     "ReportColumnType",
+    "WorkbookColumn",
+    "WorkbookLayout",
+    "WorkbookSheet",
     "_aggregate_fulfillment_status",
     "_has_limitation",
     "_reject_unsafe_text",
 ]
+
+
+# Exporter-facing short aliases keep the layout contract readable without
+# duplicating the payload models or introducing a second source of truth.
+WorkbookColumn = AnalysisReportWorkbookColumn
+WorkbookLayout = AnalysisReportWorkbookLayout
+WorkbookSheet = AnalysisReportWorkbookSheet

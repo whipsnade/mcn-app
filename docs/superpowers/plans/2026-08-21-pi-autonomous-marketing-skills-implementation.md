@@ -177,11 +177,11 @@
 - `workbook_layout_digest(layout: WorkbookLayout) -> str`：对规范化 sheet/block/列/分页/显示格式 JSON 做 SHA-256；缓存 key 必须是 `SHA256(version_id + exporter_version + layout_digest)`，避免 Skill 热更新影响历史 Version。
 - 支持自定义表头、跨平台统一列、platform 备注、冻结/筛选/排序、单 Sheet 分页、拆 Sheet 和说明区；技术超限返回结构化 `workbook_technical_limit_exceeded`，不静默截断。
 
-- [ ] **Step 1: Write the failing test**：同一 Version/Exporter/layout 两次输出 hash 相同；layout 改变不命中旧缓存；40+ 行全部分页保留；跨平台列、URL、公式注入、非法文件名安全；标准 brand/campaign/kol exporter 仍走原缓存键。
-- [ ] **Step 2: Run test to verify it fails**：`cd backend && .venv/bin/pytest -q tests/agent_artifacts/test_analysis_report_export.py tests/agent_artifacts/test_export_cache.py`；预期 generic exporter/cache key 不存在而失败。
-- [ ] **Step 3: Write minimal implementation**：在现有 `ExportCacheService` 上增加可选 layout/exporter cache key，不改现有类型默认行为；实现 openpyxl 纯值渲染、链接安全、分页/拆 Sheet 和有界 cell/row/column/file limits；Excel 只读发布 Version。
-- [ ] **Step 4: Run test to verify it passes**：运行同一组测试并执行标准 `test_brand_export.py` 受影响用例，确认标准导出仍为 409/成功原语义。
-- [ ] **Step 5: Update changelog and commit**：记录 BI/Excel 同版、缓存键和安全边界；提交 `feat(artifacts): render deterministic workbook projections`。
+- [x] **Step 1: Write the failing test**：同一 Version/Exporter/layout 两次输出 hash 相同；layout 改变不命中旧缓存；40+ 行全部分页保留；跨平台列、URL、公式注入、非法文件名安全；标准 brand/campaign/kol exporter 仍走原缓存键。
+- [x] **Step 2: Run test to verify it fails**：`cd backend && .venv/bin/pytest -q tests/agent_artifacts/test_analysis_report_export.py tests/agent_artifacts/test_export_cache.py`；预期 generic exporter/cache key 不存在而失败。
+- [x] **Step 3: Write minimal implementation**：在现有 `ExportCacheService` 上增加可选 layout/exporter cache key，不改现有类型默认行为；实现 openpyxl 纯值渲染、链接安全、分页/拆 Sheet 和有界 cell/row/column/file limits；Excel 只读发布 Version。
+- [x] **Step 4: Run test to verify it passes**：运行同一组测试并执行标准 `test_brand_export.py` 受影响用例，确认标准导出仍为 409/成功原语义。
+- [x] **Step 5: Update changelog and commit**：记录 BI/Excel 同版、缓存键和安全边界；提交 `feat(artifacts): render deterministic workbook projections`。
 
 ### Task 7: Pi 正式 Run 澄清、自主错误降级与主报告终态
 
