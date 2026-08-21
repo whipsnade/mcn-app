@@ -82,6 +82,18 @@ const brandVersion: ApiAgentArtifactVersion = {
   created_at: '2026-08-01T10:00:00',
 };
 
+function downloadResponse(filename: string): Response {
+  return {
+    ok: true,
+    headers: {
+      get: (name: string) => name.toLowerCase() === 'content-disposition'
+        ? `attachment; filename="${filename}"`
+        : null,
+    },
+    blob: async () => new Blob(['xlsx']),
+  } as unknown as Response;
+}
+
 const emptyMethodology = {
   data_as_of: '2026-08-01T10:00:00',
   source_names: ['xiaohongshu'],
@@ -514,10 +526,7 @@ describe('agent artifacts api', () => {
 
   it('exports an artifact as a downloaded xlsx blob', async () => {
     const { authorizedFetch } = await import('./client');
-    vi.mocked(authorizedFetch).mockResolvedValue(new Response(new Blob(['xlsx']), {
-      status: 200,
-      headers: { 'Content-Disposition': 'attachment; filename="brand_report_v3.xlsx"' },
-    }));
+    vi.mocked(authorizedFetch).mockResolvedValue(downloadResponse('brand_report_v3.xlsx'));
     vi.stubGlobal('URL', Object.assign(URL, {
       createObjectURL: vi.fn(() => 'blob:mock-download'),
       revokeObjectURL: vi.fn(),
@@ -536,10 +545,7 @@ describe('agent artifacts api', () => {
 
   it('exports the explicitly viewed version via the version query param', async () => {
     const { authorizedFetch } = await import('./client');
-    vi.mocked(authorizedFetch).mockResolvedValue(new Response(new Blob(['xlsx']), {
-      status: 200,
-      headers: { 'Content-Disposition': 'attachment; filename="brand_report_v3_v1.xlsx"' },
-    }));
+    vi.mocked(authorizedFetch).mockResolvedValue(downloadResponse('brand_report_v3_v1.xlsx'));
     vi.stubGlobal('URL', Object.assign(URL, {
       createObjectURL: vi.fn(() => 'blob:mock-download'),
       revokeObjectURL: vi.fn(),

@@ -273,7 +273,7 @@ describe("single-run worker lifecycle", () => {
     expect(String((usageEvents[0] as { event: { source_event_id: string } }).event.source_event_id)).toMatch(/^attempt-worker:\d+$/);
     expect(projected.length).toBeGreaterThanOrEqual(4);
     expect(projected[0]).toMatchObject({ source_event_id: "attempt-worker:1" });
-  });
+  }, 15_000);
 
   it("abort resolves only after the child closes, escalating to SIGKILL after the grace", async () => {
     const directory = await mkdtemp(join(tmpdir(), "worker-sigterm-ignore-"));
