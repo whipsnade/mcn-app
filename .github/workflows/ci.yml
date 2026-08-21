@@ -67,6 +67,10 @@ jobs:
         working-directory: pi-runtime
         run: npm ci
 
+      - name: Install Pi Gateway dependencies
+        working-directory: pi-gateway
+        run: npm ci
+
       - name: Create test database user
         run: |
           mysql --protocol=tcp --host=127.0.0.1 --user=root --password=ci-root-password <<'SQL'

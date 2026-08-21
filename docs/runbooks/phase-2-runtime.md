@@ -45,6 +45,18 @@ cd backend
 - **已知风险（UAT 阻断项，见 cutover 清单）**：2026-08-07 真实 UAT 的品牌场景成功（restricted
   lineage_ok），但活动回答 child Run 因模型供应商持续重连被中断；未完成真实全场景验收前不得生产切档。
 
+## 2026-08-21 Direct MCP 与取消修复的发布前口径
+
+- Pi 新路径将标准 MCP `CallToolResult` 原样交给模型；计费、permit 和 Evidence 统计是独立旁路，
+  不把 resource/text/structuredContent 重新包装成业务 envelope，也不以 Evidence 增量作为模型结果
+  可见的前置条件。旧兼容读取路径仍保留。
+- 取消必须经过持久 `cancel_requested`、外发前 preflight、Gateway heartbeat、worker/provider
+  abort、终态 fence、Recovery 和 SSE；前端只显示“正在取消”，直到收到唯一真实
+  `run.cancelled`。在飞调用仍按发送事实分类，`result_unknown` 保留预留且禁止自动重放。
+- 本轮真实 Web UAT 的品牌固定为“瑞幸咖啡”，且必须在远程 CI 全绿后只执行一次 Direct MCP + 取消
+  组合验证。candidate-r8 的 Backend 红灯已定位为 CI 未安装 `pi-gateway` 依赖，不是生产运行时
+  断言；修复后必须先取得 candidate-r9 全绿，当前不得预发布或生产部署。
+
 ## UAT 部署
 
 - 连接：`ssh root@111.10.192.19`（密钥用 `~/.ssh` 下默认 id_ed25519/id_rsa，免密已配好；服务器主机名显示为 localhost）。

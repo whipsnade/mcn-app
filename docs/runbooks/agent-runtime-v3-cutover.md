@@ -338,3 +338,16 @@ Gate A 审查发现的 5 项必修 + 2 项次要问题，已在同一迁移/代�
   不删除 Review/Artifact/Evidence/账本/上传文件。迁移只按明确的 Alembic downgrade 执行，
   且先检查 0034 dispatch_count 的不可逆约束与 0030 confirmed_scope 清理要求；已写入数据时
   仅回滚应用版本并保留表用于排障。
+
+### 5.11 2026-08-21 Direct MCP / 取消修复候选门禁
+
+- 新 Pi Runtime 的 MCP 成功返回遵循标准 `CallToolResult` 透传；计费与结果旁路解耦，
+  不恢复 Evidence Bridge、`unsupported_content` 业务门禁或固定 Artifact 推导。
+- 取消链路必须同时满足持久取消栅栏、Gateway/worker/provider abort、ACK-loss 终态收口、
+  Recovery 不重放 unknown，以及前端真实 `run.cancelled` 事件；这不是前端视觉状态放宽。
+- candidate-r8（run `32473941437`）的 Backend 失败已确认是 CI 拓扑测试首次构建
+  `pi-gateway` 时未安装该 workspace 依赖；其余 job 全绿，失败为
+  `1 failed, 2179 passed, 29 skipped`。Backend job 补齐 `pi-gateway/npm ci` 后必须重建
+  candidate-r9 并取得全绿，之后才允许一次“瑞幸咖啡”Direct MCP + 取消真实 Web UAT。
+- 在 candidate-r9 全绿、真实 Web UAT 通过并完成回滚/监控封口前，生产切档仍为禁止；本修复阶段不执行
+  预发布部署、灰度或生产写入。

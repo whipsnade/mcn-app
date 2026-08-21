@@ -218,6 +218,22 @@ safety、Frontend、Pi Runtime、Pi Gateway 全部成功；Browser E2E 失败，
 Browser E2E 已 `51 passed in 1.2m`。Backend 仍只有步骤级 `Pytest exit code 1`，没有公开测试名或
 日志，未做猜测性修复。
 
+candidate-r8（`cd2be3e`）对应 Actions run `32473941437` 已取得除 Backend 外的全绿：Frontend、
+Migration safety、Browser E2E、Pi Runtime、Pi Gateway 均成功；Backend job
+`96746314055` 的 Pytest 日志经已有登录态读取到完整失败摘要：
+
+```text
+1 failed, 2179 passed, 29 skipped, 1 warning in 259.16s
+FAILED tests/integration/pi_uat/test_harness_lifecycle.py::test_topology_reaps_in_process_server_when_start_fails
+subprocess.CalledProcessError: Command ['npm', 'run', 'build'] returned non-zero exit status 2
+```
+
+失败发生在离线拓扑测试的 `_ensure_gateway_built()`，Backend job 只安装了
+`pi-runtime`，未安装 `pi-gateway` 依赖；因此该测试首次执行 Gateway build 时退出。该测试单独
+复现及整个 `test_harness_lifecycle.py` 模块在本地分别为 `1 passed` 与 `10 passed`，说明不是
+取消运行时断言失败。提交当前候选修复仅在 Backend job 增加锁定的 `pi-gateway/npm ci`，生产代码、
+测试 expected、UAT 数据和运行时契约均未改；下一候选为 r9，尚未取得远程全绿。
+
 ## 6. 安全与兼容结论
 
 - 标准 MCP Result 直通不是放宽安全：模型仍只能经审核工具、当前租户/Session/Run 归属和固定计费
