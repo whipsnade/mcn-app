@@ -1,7 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
-from app.pi_gateway.contracts import PiGatewayClaimResponse
+from app.pi_gateway.contracts import PiGatewayAdapterCatalogEntry, PiGatewayClaimResponse
 
 
 def _entries(count: int) -> list[dict[str, str]]:
@@ -65,3 +65,11 @@ def test_claim_rejects_duplicate_normalized_adapter_identity() -> None:
 
     with pytest.raises(ValidationError, match="pi_gateway_adapter_catalog_duplicate"):
         PiGatewayClaimResponse.model_validate(_claim(entries))
+
+
+def test_claim_accepts_service_owned_catalog_models() -> None:
+    entries = [PiGatewayAdapterCatalogEntry.model_validate(item) for item in _entries(58)]
+
+    response = PiGatewayClaimResponse.model_validate(_claim(entries))
+
+    assert len(response.adapter_catalog) == 58
