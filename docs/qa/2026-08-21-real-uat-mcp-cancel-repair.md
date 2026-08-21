@@ -186,7 +186,15 @@ Pi Runtime typecheck: passed
 Ruff / frontend build / Gateway typecheck+build / git diff --check: passed
 ```
 
-远程 GitHub Actions 尚未触发；预发布部署与真实 Web UAT仍待远程 CI 全绿后执行。
+本地完整 Browser E2E 在 `0bb65bc` 上执行 51 项，3 项失败且均为同一旧用例
+`pauses an active run with the input pause button` 在三个视口的同一选择器错误：测试查找旧文案
+“暂停”，页面实际已按取消契约显示“取消任务”。未出现第二类 E2E 失败。提交 `7b83d82`
+仅将该用例改为取消语义；隔离执行该场景的三个视口结果为 `3 passed in 6.9s`。
+
+推送 `0bb65bc` 后的远程 GitHub Actions run `32470724885` 已结束，但不是全绿：Node workspaces
+Pi Runtime、Migration safety 成功；Backend、Frontend、Browser E2E、Pi Gateway 失败。失败 job 的
+公开状态可见，但 GitHub API 下载日志返回 `403 Must have admin rights to Repository`，因此本轮不
+猜测远端失败原因，也不把它记为通过。预发布部署与真实 Web UAT 继续等待远程 CI 全绿。
 
 ## 6. 安全与兼容结论
 
@@ -200,9 +208,10 @@ Ruff / frontend build / Gateway typecheck+build / git diff --check: passed
 ## 7. 当前发布状态与后续停止门
 
 独立只读审查已完成，结论为 Critical 0 / Important 0；本轮线性提交包括
-`fd61e9e`（runtime）、`dbd2a96`（tests/UAT）、`de7c45b`（docs）、`2644065`（fixture）和
-`f3d3881`（CI）。候选已合入本地 `main`，但远程 GitHub CI、预发布和一次真实 Web UAT 尚未完成，
-因此状态仍为 `NOT_READY_FOR_PREDEPLOYMENT`。本轮未执行生产灰度。
+`fd61e9e`（runtime）、`dbd2a96`（tests/UAT）、`de7c45b`（docs）、`2644065`（fixture）、
+`f3d3881`（CI）、`0bb65bc`（candidate CI 边界）和 `7b83d82`（E2E 取消语义）。候选已合入本地
+`main`，但远程 GitHub CI 当前失败、预发布和一次真实 Web UAT尚未完成，因此状态仍为
+`NOT_READY_FOR_PREDEPLOYMENT`。本轮未执行生产灰度。
 
 后续唯一真实 Web UAT 使用专用 UAT 租户和一次 `瑞幸咖啡` 请求，限制为 Run=1、Attempt=1、模型≤10、
 DataTap≤5、积分≤50、retries=0、fresh Run=0；必须同时证明此前 `unsupported_content` 场景的标准
