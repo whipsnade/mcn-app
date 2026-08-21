@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import { ControlPlaneClient } from "../src/control-plane-client.js";
+import {
+  ControlPlaneBusinessError,
+  ControlPlaneClient,
+  ControlPlaneUnavailableError,
+} from "../src/control-plane-client.js";
 import { buildProviderFailureMetadata } from "../src/provider-failure.js";
 
 
@@ -55,7 +59,45 @@ describe("Pi Gateway control-plane client", () => {
 
     await expect(client.claim({ capacity: 1 })).rejects.toMatchObject({
       code: "control_plane_unreachable",
+      failureClass: "network",
     });
+  });
+
+  it("classifies timeout, upstream 5xx and business rejection without exposing bodies", async () => {
+    const timeoutClient = new ControlPlaneClient({
+      origin: "https://control.invalid",
+      gatewayId: "gw-1",
+      internalSecret: "gateway-secret",
+      timeoutMs: 1,
+      fetchImpl: async (_input, init) => new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")), { once: true });
+      }),
+    });
+    await expect(timeoutClient.claim({ capacity: 1 })).rejects.toMatchObject({
+      code: "control_plane_unreachable",
+      failureClass: "timeout",
+    });
+
+    const upstreamClient = new ControlPlaneClient({
+      origin: "https://control.invalid",
+      gatewayId: "gw-1",
+      internalSecret: "gateway-secret",
+      fetchImpl: async () => new Response("secret response body", { status: 503 }),
+    });
+    await expect(upstreamClient.claim({ capacity: 1 })).rejects.toMatchObject({
+      code: "control_plane_unreachable",
+      failureClass: "http_5xx",
+      status: 503,
+    } satisfies Partial<ControlPlaneUnavailableError>);
+
+    const rejectedClient = new ControlPlaneClient({
+      origin: "https://control.invalid",
+      gatewayId: "gw-1",
+      internalSecret: "gateway-secret",
+      fetchImpl: async () => new Response(JSON.stringify({ detail: "pi_gateway_source_sequence_gap" }), { status: 409 }),
+    });
+    await expect(rejectedClient.claim({ capacity: 1 })).rejects.toBeInstanceOf(ControlPlaneBusinessError);
+    await expect(rejectedClient.claim({ capacity: 1 })).rejects.toMatchObject({ status: 409, code: "pi_gateway_source_sequence_gap" });
   });
 
   it("maps adapter service names back to the backend catalog slug", async () => {

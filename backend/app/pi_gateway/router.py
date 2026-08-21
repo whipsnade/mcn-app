@@ -27,6 +27,8 @@ from .contracts import (
     PiGatewayMcpFinalizeRequest,
     PiGatewayMcpPreflightRequest,
     PiGatewaySourceEvent,
+    PiGatewaySourceEventBatch,
+    PiGatewaySourceEventBatchReceipt,
     PiGatewayTerminalRequest,
 )
 from .accounting import RuntimeUsageError, RuntimeUsageService, TenantAccountingError
@@ -232,6 +234,59 @@ async def source_event(
             if not receipt.get("duplicate") and receipt.get("event_id"):
                 event = await db.get(AgentEvent, receipt["event_id"])
                 if event is not None:
+                    await request.app.state.agent_event_broker.publish(event)
+            return receipt
+        except (PiGatewayEventError, RuntimeUsageError) as exc:
+            await db.rollback()
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+    return await _with_lock_retry(db, _do)
+
+
+@router.post(
+    "/runs/{run_id}/events/batch",
+    response_model=PiGatewaySourceEventBatchReceipt,
+    response_model_exclude_none=True,
+)
+async def source_event_batch(
+    run_id: str,
+    request: Request,
+    payload: PiGatewaySourceEventBatch,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    x_pi_run_lease: Annotated[str | None, Header()] = None,
+) -> dict[str, object]:
+    try:
+        attempt_id, _sequence = parse_source_event_id(payload.events[0].source_event_id)
+    except PiGatewayEventError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=exc.code) from exc
+    gateway_id = await _authenticate_run_access(request, db, x_pi_run_lease)
+
+    async def _do() -> dict[str, object]:
+        run = await _leased_run(db, gateway_id, run_id, attempt_id, x_pi_run_lease or "")
+        try:
+            receipt = await _service(db, gateway_id).ingest_source_event_batch(
+                run,
+                attempt_id=attempt_id,
+                events=[event.model_dump(mode="json") for event in payload.events],
+                broker=request.app.state.agent_event_broker,
+            )
+            await db.commit()
+            event_ids = [
+                item["event_id"]
+                for item in receipt["receipts"]
+                if isinstance(item, dict) and item.get("event_id") and not item.get("duplicate")
+            ]
+            if event_ids:
+                new_events = list(
+                    (
+                        await db.scalars(
+                            select(AgentEvent)
+                            .where(AgentEvent.run_id == run_id, AgentEvent.id.in_(event_ids))
+                            .order_by(AgentEvent.sequence)
+                        )
+                    ).all()
+                )
+                for event in new_events:
                     await request.app.state.agent_event_broker.publish(event)
             return receipt
         except (PiGatewayEventError, RuntimeUsageError) as exc:

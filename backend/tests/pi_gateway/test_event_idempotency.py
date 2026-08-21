@@ -122,9 +122,17 @@ async def test_gateway_event_batch_is_atomic_and_replay_returns_original_receipt
     )
     await db_session.commit()
 
-    assert replay == first
+    assert replay["last_acked_source_sequence"] == first["last_acked_source_sequence"]
+    assert [
+        (item.get("source_event_id"), item.get("sequence"), item.get("event_id"), item.get("usage_record_id"))
+        for item in replay["receipts"]
+    ] == [
+        (item.get("source_event_id"), item.get("sequence"), item.get("event_id"), item.get("usage_record_id"))
+        for item in first["receipts"]
+    ]
     assert [item["sequence"] for item in first["receipts"]] == [1, 2, 3]
     assert all(item["duplicate"] is False for item in first["receipts"])
+    assert all(item["duplicate"] is True for item in replay["receipts"])
     assert len(list((await db_session.scalars(select(AgentEvent).where(AgentEvent.run_id == run.id))).all())) == 2
     assert len(
         list((await db_session.scalars(select(RuntimeUsageRecord).where(RuntimeUsageRecord.run_id == run.id))).all())

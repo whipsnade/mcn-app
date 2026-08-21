@@ -372,9 +372,13 @@ export function parsePiGatewaySourceEventBatch(value: unknown): PiGatewaySourceE
   for (let index = 1; index < events.length; index += 1) {
     if (events[index].sequence !== events[index - 1].sequence + 1) invalidProtocol();
   }
-  const bytes = new TextEncoder().encode(JSON.stringify({ events })).byteLength;
+  const bytes = piGatewaySourceEventBatchBytes(events);
   if (bytes > PI_GATEWAY_EVENT_BATCH_MAX_BYTES) invalidProtocol();
   return { events };
+}
+
+export function piGatewaySourceEventBatchBytes(events: readonly PiGatewaySourceEvent[]): number {
+  return new TextEncoder().encode(JSON.stringify(canonicalizeJson({ events }))).byteLength;
 }
 
 export function parsePiGatewaySourceEventBatchReceipt(value: unknown): PiGatewaySourceEventBatchReceipt {
@@ -399,6 +403,8 @@ export function parsePiGatewaySourceEventBatchReceipt(value: unknown): PiGateway
       !Number.isInteger(raw.sequence) || (raw.sequence as number) < 1 ||
       (raw.sequence as number) > 10_000_000 || typeof raw.duplicate !== "boolean"
     ) throw new Error("pi_gateway_event_batch_receipt_invalid");
+    const suffix = raw.source_event_id.slice(raw.source_event_id.lastIndexOf(":") + 1);
+    if (Number(suffix) !== raw.sequence) throw new Error("pi_gateway_event_batch_receipt_invalid");
     for (const key of ["event_id", "usage_record_id"] as const) {
       if (key in raw && (typeof raw[key] !== "string" || !raw[key] || raw[key].length > 64)) {
         throw new Error("pi_gateway_event_batch_receipt_invalid");
@@ -406,7 +412,12 @@ export function parsePiGatewaySourceEventBatchReceipt(value: unknown): PiGateway
     }
     return raw as unknown as PiGatewaySourceEventReceipt;
   });
-  if (receipts.length < 1 || receipts[receipts.length - 1].sequence !== lastSequence) {
+  if (
+    receipts.length < 1 ||
+    receipts[receipts.length - 1].sequence !== lastSequence ||
+    new Set(receipts.map((item) => item.source_event_id.slice(0, item.source_event_id.lastIndexOf(":")))).size !== 1 ||
+    receipts.some((item, index) => index > 0 && item.sequence !== receipts[index - 1].sequence + 1)
+  ) {
     throw new Error("pi_gateway_event_batch_receipt_invalid");
   }
   return { receipts, last_acked_source_sequence: lastSequence as number };

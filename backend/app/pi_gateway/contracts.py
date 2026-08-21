@@ -308,6 +308,45 @@ class PiGatewaySourceEventBatch(_StrictModel):
         return self
 
 
+class PiGatewaySourceEventReceipt(_StrictModel):
+    source_event_id: StrictStr = Field(pattern=r"^[A-Za-z0-9._:-]{1,160}$")
+    sequence: StrictInt = Field(ge=1, le=10_000_000)
+    duplicate: bool
+    event_id: StrictStr | None = Field(default=None, min_length=1, max_length=64)
+    usage_record_id: StrictStr | None = Field(default=None, min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def receipt_shape(self) -> "PiGatewaySourceEventReceipt":
+        if int(self.source_event_id.rsplit(":", 1)[-1]) != self.sequence:
+            raise ValueError("pi_gateway_event_receipt_sequence_invalid")
+        if self.event_id is not None and self.usage_record_id is not None:
+            raise ValueError("pi_gateway_event_receipt_multiple_ids")
+        for field_name in ("event_id", "usage_record_id"):
+            if field_name in self.model_fields_set and getattr(self, field_name) is None:
+                raise ValueError("pi_gateway_event_receipt_optional_field_null")
+        return self
+
+
+class PiGatewaySourceEventBatchReceipt(_StrictModel):
+    receipts: list[PiGatewaySourceEventReceipt] = Field(
+        min_length=1,
+        max_length=PI_GATEWAY_EVENT_BATCH_MAX_EVENTS,
+    )
+    last_acked_source_sequence: StrictInt = Field(ge=1, le=10_000_000)
+
+    @model_validator(mode="after")
+    def receipt_sequence(self) -> "PiGatewaySourceEventBatchReceipt":
+        if self.receipts[-1].sequence != self.last_acked_source_sequence:
+            raise ValueError("pi_gateway_event_batch_receipt_sequence_invalid")
+        attempts = {item.source_event_id.rsplit(":", 1)[0] for item in self.receipts}
+        if len(attempts) != 1:
+            raise ValueError("pi_gateway_event_batch_receipt_attempt_invalid")
+        for index in range(1, len(self.receipts)):
+            if self.receipts[index].sequence != self.receipts[index - 1].sequence + 1:
+                raise ValueError("pi_gateway_event_batch_receipt_gap")
+        return self
+
+
 class PiGatewayClaimRequest(_StrictModel):
     capacity: int = Field(default=1, ge=1, le=128)
 
