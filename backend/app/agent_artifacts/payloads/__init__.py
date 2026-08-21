@@ -16,6 +16,7 @@ from app.agent_artifacts.payloads.common import (
     Methodology,
     SectionAvailability,
 )
+from app.agent_artifacts.payloads.analysis_report import AnalysisReportV1
 from app.agent_artifacts.payloads.insight import InsightBoardV1
 from app.agent_artifacts.payloads.kol_analysis import KolAnalysisV2
 from app.agent_artifacts.payloads.kol_detail import KolDetailV2
@@ -29,11 +30,13 @@ TYPED_PAYLOAD_BY_SCHEMA: dict[str, type[ArtifactPayloadBase]] = {
     "kol_analysis_v2": KolAnalysisV2,
     "kol_detail_v2": KolDetailV2,
     "insight_board_v1": InsightBoardV1,
+    "analysis_report_v1": AnalysisReportV1,
 }
 
 __all__ = [
     "TYPED_PAYLOAD_BY_SCHEMA",
     "ArtifactPayloadBase",
+    "AnalysisReportV1",
     "BrandReportV3",
     "CampaignReportV2",
     "CampaignReportV3",

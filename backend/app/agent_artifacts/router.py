@@ -2,7 +2,8 @@
 
 列表 / 详情 / 版本 / 未读水位 / Excel 导出。只读已发布不可变 Version，不调用
 模型/MCP（§10.1 表现层边界）。所有归属失败统一 404；导出不支持的类型或未发布
-draft → 409 ``ARTIFACT_EXPORT_UNSUPPORTED``。
+draft → 409 ``ARTIFACT_EXPORT_UNSUPPORTED``，Workbook 技术上限 → 409
+``workbook_technical_limit_exceeded``。
 """
 
 from __future__ import annotations
@@ -281,6 +282,9 @@ async def export_artifact_xlsx(
         if version_row is None:
             raise _not_found("artifact_version_not_found")
     try:
+        # analysis_report_v1 的 ExportCacheService 会从这份不可变 payload 推导
+        # exporter_version + layout digest，保证 BI/Excel 同版且 Skill 热更新不
+        # 改写历史 Version 的缓存身份；标准 Artifact 继续使用旧 schema_version 键。
         cache_service = ExportCacheService(db)
         exported = await cache_service.get_or_build(
             artifact_version_id=version_row.id,

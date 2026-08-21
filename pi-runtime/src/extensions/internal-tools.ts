@@ -1,11 +1,13 @@
 /**
- * 受控内部工具桥（Task 5）。
+ * 迁移期 POC compatibility surface，不是生产 Native runtime 的工具入口。
  *
- * 只把设计白名单内的历史读取、六类 Builder、get_session_context 与
- * publish_artifacts 暴露给 Pi；bash/shell/文件编辑/任意 HTTP/Draft 直写/
- * 计算/记忆等一律拒绝。DataTap 由 Task 4 Extension 直连，本桥不暴露 MCP。
+ * 生产路径由 Run Snapshot 注入 Skill 目录、Tool Contract 与 Root Policy；模型经统一
+ * call_tool 协议直接选择受审核能力。这里仅保留旧 POC 的受控 HTTP 适配，供兼容测试和
+ * 迁移期诊断使用，不能被解释成固定业务阶段、固定工具顺序或生产必经路径。
  * token 由底层 HTTP client 放在 Authorization 头，body 绝不含任何身份键。
  */
+
+export const PI_RUNTIME_POC_COMPATIBILITY = "compatibility" as const;
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";

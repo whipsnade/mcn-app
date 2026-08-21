@@ -16,6 +16,7 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -646,7 +647,7 @@ class PiUatTopology:
         self.fastapi_log = log
         self._fastapi = subprocess.Popen(
             [
-                str(BACKEND_DIR / ".venv/bin/python"),
+                sys.executable,
                 "-m",
                 "uvicorn",
                 "app.main:app",
@@ -943,6 +944,32 @@ class PiUatTopology:
             )
             assert run is not None
             return run
+
+    async def run_by_id(self, run_id: str) -> AgentRun:
+        """按消息 POST 返回的不可变 Run 身份读取，不猜测 Session 最新 Run。"""
+        async with SessionFactory() as db:
+            run = await db.get(AgentRun, run_id)
+            if run is None:
+                raise RuntimeError("run_id_not_found")
+            return run
+
+    async def main_report_contracts(self, run_id: str) -> tuple[str, ...]:
+        """读取当前 Run 已发布的顶层 Artifact 契约，供 UAT 终态断言使用。"""
+        from app.agent_artifacts.models import AgentArtifact, AgentArtifactVersion
+
+        async with SessionFactory() as db:
+            rows = await db.scalars(
+                select(AgentArtifactVersion.schema_version)
+                .join(AgentArtifact, AgentArtifact.id == AgentArtifactVersion.artifact_id)
+                .where(
+                    AgentArtifactVersion.source_run_id == run_id,
+                    AgentArtifactVersion.version == AgentArtifact.latest_version,
+                    AgentArtifact.parent_artifact_id.is_(None),
+                    AgentArtifact.status == "published",
+                )
+                .order_by(AgentArtifactVersion.id)
+            )
+            return tuple(rows.all())
 
     async def restart_fastapi(self, *, kill_switch: bool) -> None:
         """以新的 kill switch 配置重启 FastAPI 子进程。

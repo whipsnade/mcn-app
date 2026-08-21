@@ -31,6 +31,7 @@ from app.agent_runtime.models import AgentEvent, AgentMessage, AgentRun, AgentSe
 from app.agent_runtime.repository import AgentRunRepository
 from app.agent_runtime.state import InvalidRunTransition, RunStatus
 from app.db.session import SessionFactory
+from app.pi_gateway.completion import CompletionValidator
 
 from tests.agent_runtime.test_events import _create_committed_run, _purge_committed
 
@@ -163,6 +164,65 @@ async def test_settle_terminal_completed_migrates_and_emits_in_one_commit(
     assert fresh.lease_owner is None
     rows = await _run_events(db_session, run.id)
     assert [row.event_type for row in rows] == ["message.completed", "run.completed"]
+
+
+async def test_settle_terminal_formal_pi_run_rejects_text_without_main_report(
+    db_session, user_factory
+) -> None:
+    run = await _make_run(db_session, user_factory, start=True, worker="worker")
+    run.runtime_backend = "pi"
+    run.runtime_config_snapshot_json = {
+        "runtime_backend": "pi",
+        "profile_name": "session_analyst_v1",
+        "allowed_artifact_contracts": ["analysis_report_v1"],
+        "capability_pack": {
+            "pack_version": "test-pack-v1",
+            "manifest_digest": "test-manifest-digest",
+        },
+        "capability_pack_version": "test-pack-v1",
+        "capability_pack_manifest_digest": "test-manifest-digest",
+    }
+    stream = AgentEventStream(db_session, AgentEventBroker())
+
+    with pytest.raises(InvalidRunTransition, match="pi_gateway_main_artifact_missing"):
+        await stream.settle_terminal(
+            run.id,
+            run.user_id,
+            RunStatus.COMPLETED,
+            {"outcome": "completed"},
+            worker_id="worker",
+        )
+
+    fresh = await db_session.get(AgentRun, run.id)
+    assert fresh.status == RunStatus.RUNNING
+    assert await _terminal_events(db_session, run.id) == []
+
+
+async def test_force_complete_uses_the_same_formal_main_report_validator(
+    db_session, user_factory
+) -> None:
+    run = await _make_run(db_session, user_factory, start=True, worker=None)
+    run.runtime_backend = "pi"
+    run.runtime_config_snapshot_json = {
+        "runtime_backend": "pi",
+        "profile_name": "session_analyst_v1",
+        "allowed_artifact_contracts": ["brand_report_v3", "analysis_report_v1"],
+        "capability_pack": {
+            "pack_version": "test-pack-v1",
+            "manifest_digest": "test-manifest-digest",
+        },
+        "capability_pack_version": "test-pack-v1",
+        "capability_pack_manifest_digest": "test-manifest-digest",
+    }
+
+    with pytest.raises(InvalidRunTransition, match="pi_gateway_main_artifact_missing"):
+        await AgentRunRepository(db_session).force_complete(
+            run.id,
+            completion_validator=CompletionValidator(db_session).validate,
+        )
+
+    fresh = await db_session.get(AgentRun, run.id)
+    assert fresh.status == RunStatus.RUNNING
 
 
 async def test_settle_terminal_runs_gateway_cleanup_before_commit(db_session, user_factory) -> None:

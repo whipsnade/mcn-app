@@ -28,6 +28,7 @@ const TENANT: AdminTenant = {
 const CONFIG_ACTIVE: AdminRuntimeConfig = {
   id: 'cfg-1', scope: 'tenant', tenant_id: 'tenant-a', version: 1, status: 'active',
   runtime_backend: 'pi', runtime_contract_version: 'marketing_runtime_v1',
+  environment: 'production',
   model: { name: 'deepseek-v4-pro', provider: 'tencent', masked_origin: 'https://api***' },
   datatap: { service: 'datatap', schema_digest: 'sha256:abc' },
   limits: { max_decisions: 50 }, billing: { mcp_call_points: 10 },

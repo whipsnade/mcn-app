@@ -81,6 +81,15 @@ class Settings(BaseSettings):
     agent_export_storage_dir: str = ".data/agent-exports"
     agent_upload_max_bytes: int = Field(default=20971520, gt=0)
     agent_upload_max_rows: int = Field(default=50000, gt=0)
+    # 通用 Report/Workbook 的技术边界；不承担 Top20/Top40 等业务筛选语义。
+    analysis_report_max_blocks: int = Field(default=128, gt=0)
+    analysis_report_max_columns: int = Field(default=256, gt=0)
+    analysis_report_max_rows: int = Field(default=100000, gt=0)
+    analysis_report_max_cell_chars: int = Field(default=32767, gt=0)
+    workbook_max_sheets: int = Field(default=32, gt=0)
+    workbook_max_rows_per_sheet: int = Field(default=100000, gt=0)
+    workbook_max_columns: int = Field(default=256, gt=0)
+    workbook_max_bytes: int = Field(default=20971520, gt=0)
     task_lease_seconds: int = Field(default=60, gt=0)
     goal_planner_shadow_enabled: bool = False
     goal_planner_enforce_enabled: bool = False

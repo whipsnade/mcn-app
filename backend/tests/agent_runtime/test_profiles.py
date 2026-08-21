@@ -108,6 +108,7 @@ def test_artifact_contract_allowlists_are_profile_scoped() -> None:
             "campaign_report_v3",
             "kol_selection_v3",
             "insight_board_v1",
+            "analysis_report_v1",
         }
     )
     assert PROFILES["kol_detail_v1"].allowed_artifact_contracts == frozenset(

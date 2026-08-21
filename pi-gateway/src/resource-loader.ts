@@ -4,6 +4,8 @@ import {
   type ExtensionFactory,
   type ResourceLoader,
 } from "@earendil-works/pi-coding-agent";
+import { lstatSync } from "node:fs";
+import { dirname, isAbsolute, resolve } from "node:path";
 
 import type { AdapterCatalogEntry, SkillCatalogEntry } from "./protocol.js";
 
@@ -14,6 +16,8 @@ export interface ProductionResourceLoaderOptions {
   agentDir: string;
   rootPolicy: string;
   skillCatalog?: readonly SkillCatalogEntry[];
+  /** Only the current Run's atomically materialized Skill directory. */
+  additionalSkillPaths?: readonly string[];
   adapterCatalog?: readonly AdapterCatalogEntry[];
   /** Absolute path of the reviewed pi-mcp-adapter entrypoint (jiti-loaded). */
   adapterExtension?: string;
@@ -25,11 +29,31 @@ export interface ProductionResourceLoaderOptions {
  * disabled; only the explicit adapter path and audited factory slots load.
  */
 export function createProductionResourceLoader(options: ProductionResourceLoaderOptions): ResourceLoader {
+  const additionalSkillPaths = [...(options.additionalSkillPaths ?? [])];
+  const runRoot = resolve(options.cwd);
+  for (const path of additionalSkillPaths) {
+    const resolvedPath = resolve(path);
+    if (!isAbsolute(path) || dirname(resolvedPath) !== runRoot) {
+      throw new Error("pi_skill_snapshot_path_invalid");
+    }
+    try {
+      const snapshotStat = lstatSync(resolvedPath);
+      if (snapshotStat.isSymbolicLink() || !snapshotStat.isDirectory()) {
+        throw new Error("pi_skill_snapshot_path_invalid");
+      }
+    } catch (error) {
+      if (error instanceof Error && error.message === "pi_skill_snapshot_path_invalid") {
+        throw error;
+      }
+      throw new Error("pi_skill_snapshot_path_invalid", { cause: error });
+    }
+  }
   const loader = new DefaultResourceLoader({
     cwd: options.cwd,
     agentDir: options.agentDir,
     settingsManager: SettingsManager.inMemory(),
     additionalExtensionPaths: options.adapterExtension ? [options.adapterExtension] : [],
+    additionalSkillPaths,
     extensionFactories: options.extensionFactories ? [...options.extensionFactories] : [],
     noExtensions: true,
     noSkills: true,
@@ -46,7 +70,7 @@ export function formatSkillDirectory(skills: readonly SkillCatalogEntry[]): stri
   return [
     "当前 Run 可用专项 Skill 目录（只列目录，不含正文）：",
     ...skills.map((skill) =>
-      `- ${skill.name}: ${skill.description} (version=${skill.version}, artifact_contract=${skill.artifactContract})`,
+      `- ${skill.name}: ${skill.description} (version=${skill.version}, artifact_contract=${skill.artifactContract ?? "none"})`,
     ),
   ].join("\n");
 }

@@ -8,6 +8,7 @@ from app.favorites.router import router as favorites_router
 from app.identity.router import auth_router, users_router
 from app.pi_runtime_poc.router import router as pi_poc_router
 from app.pi_gateway.router import router as pi_gateway_router
+from app.marketing_skills.router import router as marketing_skills_router
 
 api_router = APIRouter(prefix="/api/v1")
 api_router.include_router(auth_router, prefix="/auth", tags=["auth"])
@@ -15,6 +16,7 @@ api_router.include_router(users_router, prefix="/users", tags=["users"])
 api_router.include_router(billing_router, prefix="/wallet", tags=["wallet"])
 api_router.include_router(favorites_router, tags=["favorites"])
 api_router.include_router(admin_router, prefix="/admin", tags=["admin"])
+api_router.include_router(marketing_skills_router, prefix="/admin/skills", tags=["admin", "skills"])
 api_router.include_router(agent_runtime_router, prefix="/agent", tags=["agent"])
 api_router.include_router(agent_artifacts_router, prefix="/agent", tags=["agent"])
 api_router.include_router(pi_poc_router, prefix="/internal/pi-poc", tags=["pi-poc"])

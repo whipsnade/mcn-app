@@ -24,6 +24,7 @@ import {
 import { streamSimpleOpenAICompletions } from "@earendil-works/pi-ai/openai-completions";
 
 import { createMcpConfig, createProductionResourceLoader } from "./resource-loader.js";
+import { materializeRunSkillSnapshot } from "./skill-snapshot.js";
 import {
   createMcpAccountingExtensionFactory,
   McpAccountingExtension,
@@ -186,6 +187,12 @@ export async function createProductionPiSession(
   };
   try {
     await mkdir(agentDir, { mode: 0o700 });
+    // Materialize and verify the immutable Run manifest before creating the
+    // model registry, MCP config, readiness barrier, or SDK session.
+    const skillSnapshotPath = await materializeRunSkillSnapshot(
+      runDir,
+      work.runtimeSnapshot.skillManifest?.entries ?? [],
+    );
     const mcpConfigPath = join(runDir, ".mcp.json");
     await writeFile(mcpConfigPath, JSON.stringify(createMcpConfig(work.runtimeSnapshot.adapterCatalog, {
       // Unit fake providers do not own a real MCP server.  Offline UAT and all
@@ -234,6 +241,7 @@ export async function createProductionPiSession(
       agentDir,
       rootPolicy: work.runtimeSnapshot.rootPolicy,
       skillCatalog: work.runtimeSnapshot.skillCatalog,
+      additionalSkillPaths: [skillSnapshotPath],
       adapterCatalog: work.runtimeSnapshot.adapterCatalog,
       adapterExtension: resolveMcpAdapterExtensionPath(),
       extensionFactories,

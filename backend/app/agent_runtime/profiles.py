@@ -129,6 +129,7 @@ PROFILES: dict[str, AgentProfile] = {
                     "campaign_report_v3",
                     "kol_selection_v3",
                     "insight_board_v1",
+                    "analysis_report_v1",
                 }
             ),
         ),

@@ -101,6 +101,55 @@ async def test_pi_recovery_closes_idempotently_on_durable_completion(db_session,
 
 
 @pytest.mark.asyncio
+async def test_pi_recovery_rejects_formal_text_without_main_report(
+    db_session, user_factory
+) -> None:
+    user = await _funded_user(db_session, user_factory)
+    session, run, step = await _make_chain(db_session, user.id)
+    run.runtime_backend = "pi"
+    run.profile_name = "session_analyst_v1"
+    run.runtime_config_snapshot_json = {
+        "runtime_backend": "pi",
+        "profile_name": "session_analyst_v1",
+        "allowed_artifact_contracts": ["analysis_report_v1"],
+        "capability_pack": {
+            "pack_version": "test-pack-v1",
+            "manifest_digest": "test-manifest-digest",
+        },
+        "capability_pack_version": "test-pack-v1",
+        "capability_pack_manifest_digest": "test-manifest-digest",
+    }
+    step.status = "completed"
+    now = utc_now()
+    run.gateway_id = "gateway-formal-no-report"
+    run.gateway_lease_hash = hash_lease_token("lease-token-formal-no-report")
+    run.gateway_lease_expires_at = now - timedelta(seconds=1)
+    run.lease_owner = run.gateway_id
+    run.lease_expires_at = run.gateway_lease_expires_at
+    session.active_run_id = run.id
+    db_session.add(
+        AgentMessage(
+            id="msg-formal-no-report",
+            session_id=session.id,
+            run_id=run.id,
+            role="assistant",
+            content="文本结论，但没有主报告",
+            metadata_json={"gateway_message": True},
+            sequence=2,
+            created_at=now,
+        )
+    )
+    await db_session.flush()
+
+    recovery = PiGatewayRecoveryService(db_session, broker=AgentEventBroker(), now_fn=lambda: now)
+
+    assert await recovery.recover_expired_run(run.id) == "failed"
+    assert run.status == RunStatus.FAILED
+    assert run.error_code == "pi_gateway_main_artifact_missing"
+    assert run.infrastructure_retry_count == 0
+
+
+@pytest.mark.asyncio
 async def test_pi_recovery_unknown_result_completes_with_warning_without_new_attempt(
     db_session, user_factory
 ) -> None:

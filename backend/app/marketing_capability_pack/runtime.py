@@ -8,6 +8,8 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, model_validator
 
+from app.marketing_skills.constants import MAX_SKILL_CONTENT_BYTES, MAX_SKILL_COUNT
+
 from .loader import MARKETING_RUNTIME_CONTRACT_VERSION, CapabilityPackLoader
 
 
@@ -16,13 +18,16 @@ class MarketingSkillSnapshot(BaseModel):
 
     name: str
     version: str
+    revision: int | None = None
     digest: str
     content: str
     required_tools: tuple[str, ...]
-    artifact_contract: str
+    artifact_contract: str | None = None
 
     @model_validator(mode="after")
     def verify_digest(self) -> MarketingSkillSnapshot:
+        if len(self.content.encode("utf-8")) > MAX_SKILL_CONTENT_BYTES:
+            raise ValueError("marketing_skill_content_too_large")
         if _digest(self.content) != self.digest:
             raise ValueError("marketing_skill_digest_mismatch")
         return self
@@ -51,6 +56,8 @@ class MarketingRunCapability(BaseModel):
             raise ValueError("marketing_runtime_contract_unsupported")
         if _digest(self.root_policy) != self.root_policy_digest:
             raise ValueError("marketing_root_policy_digest_mismatch")
+        if len(self.skills) > MAX_SKILL_COUNT:
+            raise ValueError("marketing_skill_count_exceeded")
         if len({skill.name for skill in self.skills}) != len(self.skills):
             raise ValueError("marketing_skill_duplicate")
         return self
@@ -66,6 +73,7 @@ class MarketingRunCapability(BaseModel):
         return {
             "name": skill.name,
             "version": skill.version,
+            "revision": skill.revision,
             "digest": skill.digest,
             "content": skill.content,
             "required_tools": list(skill.required_tools),

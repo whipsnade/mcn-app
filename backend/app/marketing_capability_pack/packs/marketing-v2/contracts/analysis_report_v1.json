@@ -1,0 +1,41 @@
+{
+  "artifact_type": "analysis_report_v1",
+  "schema_version": "analysis_report_v1",
+  "title": "通用营销分析报告",
+  "description": "由类型化 Block 组成的长尾营销报告；服务器负责身份、归属、状态与版本。",
+  "subject_types": ["brand", "campaign", "kol", "mixed"],
+  "block_types": [
+    "metric_cards",
+    "typed_table",
+    "time_series",
+    "link_list",
+    "chart",
+    "narrative",
+    "methodology_limitations"
+  ],
+  "table_column_types": [
+    "string",
+    "integer",
+    "number",
+    "percent",
+    "date",
+    "datetime",
+    "url",
+    "boolean"
+  ],
+  "fulfillment": {
+    "required_fields": ["requested_min", "actual_count", "status", "reason"]
+  },
+  "server_owned_fields": [
+    "schema_version",
+    "module",
+    "data_status",
+    "artifact_id",
+    "artifact_key",
+    "version",
+    "tenant_id",
+    "session_id",
+    "run_id"
+  ],
+  "business_row_limit": null
+}

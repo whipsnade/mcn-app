@@ -6,6 +6,7 @@ import type {
   ApiAgentArtifact,
   ApiAgentArtifactVersion,
   AgentArtifactPayload,
+  AnalysisReportPayload,
   BrandReportPayload,
   InsightBoardPayload,
   KolDetailPayload,
@@ -244,6 +245,63 @@ function insightPayload(): InsightBoardPayload {
   };
 }
 
+function analysisReportPayload(): AnalysisReportPayload {
+  const rows: Array<Array<string | number | null>> = Array.from(
+    { length: 45 },
+    (_, index) => [`平台-${index + 1}`, index + 1],
+  );
+  return {
+    schema_version: 'analysis_report_v1',
+    module: 'report',
+    data_status: 'restricted',
+    availability: {
+      blocks: { status: 'partial', reason_codes: ['some_rows_missing'] },
+      fulfillment: { status: 'partial', reason_codes: ['long_tail_partial'] },
+    },
+    limitations: [{ code: 'long_tail_partial', message: '部分长尾数据未返回', affected_paths: ['fulfillment'] }],
+    methodology,
+    title: '跨平台营销报告',
+    subject_type: 'mixed',
+    scope: { brand: '海底捞', platforms: ['xiaohongshu', 'douyin'] },
+    blocks: [
+      {
+        block_type: 'metric_cards',
+        id: 'metrics',
+        title: '核心指标',
+        cards: [{ key: 'volume', label: '总声量', value: null, unit: '篇', value_type: 'integer' }],
+      },
+      {
+        block_type: 'typed_table',
+        id: 'platforms',
+        title: '平台明细',
+        columns: [
+          { key: 'platform', label: '平台', type: 'string' },
+          { key: 'volume', label: '声量', type: 'integer' },
+        ],
+        rows,
+      },
+    ],
+    fulfillment: [{ key: 'requested_items', requested_min: 50, actual_count: 45, status: 'partial', reason: '上游只返回 45 条' }],
+    workbook: null,
+  };
+}
+
+function reportArtifact(overrides?: Partial<ApiAgentArtifact>): ApiAgentArtifact {
+  return {
+    id: 'report-1',
+    module: 'report',
+    artifact_type: 'analysis_report_v1',
+    parent_artifact_id: null,
+    artifact_key: 'report:hash',
+    status: 'published',
+    latest_version: 2,
+    activity_sequence: 10,
+    created_at: '2026-08-01T12:00:00',
+    updated_at: '2026-08-01T12:00:00',
+    ...overrides,
+  };
+}
+
 function versionOf(artifactId: string, version: number, payload: AgentArtifactPayload): ApiAgentArtifactVersion {
   return {
     id: `${artifactId}-v${version}`,
@@ -262,6 +320,7 @@ const VERSIONS: Record<string, (version: number) => ApiAgentArtifactVersion> = {
   'kol-selection-1': () => versionOf('kol-selection-1', 1, kolSelectionPayload()),
   'art-detail': () => versionOf('art-detail', 1, kolDetailPayload()),
   'insight-child-1': () => versionOf('insight-child-1', 1, insightPayload()),
+  'report-1': version => versionOf('report-1', version, analysisReportPayload()),
 };
 
 describe('ArtifactWorkspace', () => {
@@ -291,12 +350,14 @@ describe('ArtifactWorkspace', () => {
     );
   }
 
-  it('固定三个一级 Tab，达人包含两个子 Tab', () => {
+  it('固定四个一级 Tab，达人包含两个子 Tab', async () => {
     renderWorkspace([]);
+    await waitFor(() => expect(listArtifactReadStates).toHaveBeenCalledWith('s1'));
 
     expect(screen.getByRole('tab', { name: '品牌分析' })).toBeVisible();
     expect(screen.getByRole('tab', { name: '活动分析' })).toBeVisible();
     expect(screen.getByRole('tab', { name: '达人' })).toBeVisible();
+    expect(screen.getByRole('tab', { name: '通用报告' })).toBeVisible();
 
     fireEvent.click(screen.getByRole('tab', { name: '达人' }));
 
@@ -737,5 +798,19 @@ describe('ArtifactWorkspace', () => {
 
     await waitFor(() => expect(getArtifactVersion).toHaveBeenCalledWith('brand-1', 1));
     expect(screen.queryByRole('button', { name: '导出 Excel' })).toBeNull();
+  });
+
+  it('通用报告 Tab 展示长尾全部行，并按当前版本进入同版 Excel 导出', async () => {
+    renderWorkspace([reportArtifact()]);
+    fireEvent.click(screen.getByRole('tab', { name: '通用报告' }));
+
+    expect(await screen.findByRole('heading', { name: '跨平台营销报告' })).toBeVisible();
+    expect(screen.getByText('平台-45')).toBeVisible();
+    expect(screen.getAllByText('数据受限').length).toBeGreaterThan(0);
+
+    fireEvent.change(screen.getByRole('combobox', { name: '版本选择' }), { target: { value: '1' } });
+    await waitFor(() => expect(getArtifactVersion).toHaveBeenCalledWith('report-1', 1));
+    fireEvent.click(screen.getByRole('button', { name: '导出 Excel' }));
+    await waitFor(() => expect(exportArtifact).toHaveBeenCalledWith('report-1', 1));
   });
 });

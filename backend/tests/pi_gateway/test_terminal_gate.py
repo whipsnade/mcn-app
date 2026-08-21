@@ -101,6 +101,7 @@ async def test_terminal_completed_after_message_completion_orders_events(
 ) -> None:
     user = await user_factory()
     run, attempt, _tenant_id = await _run(db_session, user)
+    run.profile_name = "utility_v1"
     token = "lease-token-terminal-ok-with-entropy"
     _arm_lease(run, token)
     await db_session.commit()
@@ -150,9 +151,53 @@ async def test_terminal_completed_after_message_completion_orders_events(
 
 
 @pytest.mark.asyncio
+async def test_terminal_completed_formal_run_requires_a_main_report(
+    db_session, user_factory, client, gateway_settings
+) -> None:
+    user = await user_factory()
+    run, attempt, _tenant_id = await _run(db_session, user)
+    run.profile_name = "session_analyst_v1"
+    token = "lease-token-terminal-main-report-with-entropy"
+    _arm_lease(run, token)
+    await db_session.commit()
+
+    events_path = f"/api/v1/internal/pi-gateway/v1/runs/{run.id}/events"
+    event_body = (
+        f'{{"source_event_id":"{attempt.id}:1","sequence":1,'
+        f'"event_type":"message.completed","payload":{{"text":"文本结论"}}}}'
+    ).encode()
+    event_response = await client.post(
+        events_path,
+        content=event_body,
+        headers={
+            **_signed_headers(event_body, events_path, nonce="nonce-terminal-main-report-1"),
+            "X-Pi-Run-Lease": token,
+        },
+    )
+    assert event_response.status_code == 200
+
+    terminal_path = f"/api/v1/internal/pi-gateway/v1/runs/{run.id}/terminal"
+    terminal_body = f'{{"attempt_id":"{attempt.id}","outcome":"completed","payload":{{}}}}'.encode()
+    terminal_response = await client.post(
+        terminal_path,
+        content=terminal_body,
+        headers={
+            **_signed_headers(terminal_body, terminal_path, nonce="nonce-terminal-main-report-2"),
+            "X-Pi-Run-Lease": token,
+        },
+    )
+
+    assert terminal_response.status_code == 409
+    assert terminal_response.json()["detail"] == "pi_gateway_main_artifact_missing"
+    await db_session.refresh(run)
+    assert run.status == "running"
+
+
+@pytest.mark.asyncio
 async def test_has_assistant_completion_service_contract(db_session, user_factory) -> None:
     user = await user_factory()
     run, attempt, _tenant_id = await _run(db_session, user)
+    run.profile_name = "utility_v1"
     service = PiGatewayService(db_session, gateway_id=GATEWAY_ID)
     assert await service.has_assistant_completion(run) is False
     await service.ingest_source_event(

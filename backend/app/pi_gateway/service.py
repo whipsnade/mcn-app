@@ -814,7 +814,7 @@ class PiGatewayRecoveryService:
         self.scheduler = PiRunScheduler(db, lease_seconds=lease_seconds, now_fn=self.now_fn)
 
     async def _has_durable_completion(self, run: AgentRun) -> bool:
-        """兼容旧恢复调用方，但不再提供 assistant-only 成功判定。"""
+        """兼容旧恢复调用方；主报告门禁也由统一 Validator 执行。"""
         return bool(await CompletionValidator(self.db).validate(run))
 
     async def recover_expired_run(self, run_id: str) -> Literal["requeued", "failed", "completed", "ignored"]:

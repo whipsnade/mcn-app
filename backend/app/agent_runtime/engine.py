@@ -863,8 +863,9 @@ class AgentEngine:
 
         调用前主循环已过活动 Draft 闸门（本 Run 无持有 Draft）。
         终态聚合：有未最终发布的失败/放弃项或统一 completion validator 返回
-        warning → ``completed_with_warnings``；否则 ``completed``。失败/放弃
-        本身不定义用户业务目标，也不能强制 Pi 必须创建某类 Artifact。
+        warning → ``completed_with_warnings``；否则 ``completed``。普通用户
+        可见 Run 的 validator 同时要求当前 Run 已发布顶层主 Artifact，但不
+        固定具体 contract；澄清与 utility Run 走各自的文本出口。
         §5.8 事件顺序：缺失的 artifact.published（崩溃窗口兜底）→
         message.completed → run.completed / run.completed_with_warnings / run.failed。
         H1：Run 迁移与终态事件由 settle_terminal 同一加锁事务提交，

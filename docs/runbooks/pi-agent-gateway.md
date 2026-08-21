@@ -52,6 +52,37 @@
 - 校验失败回喂结构化字段级错误（RFC6901 path/type/reason/retryable，≤2048 字节、
   truncated 标记、不泄漏提交值）；模型按 path 修正后重试（离线 UAT 自纠错场景已进程级验证）。
 
+## Native Skill/Report 迁移边界（2026-08-21）
+
+### 生产 Native 路径
+
+- Skill 的唯一运行时事实源是创建 Run 时冻结并校验的 Run Snapshot。Gateway 将 Snapshot 中的
+  Skill 正文物化到当前 Run 专属目录后显式注入；不读取用户目录、项目目录、cwd 或本机工作树
+  的自动发现结果。Root Policy、Tool Contract、Skill digest 和 capability pack 版本必须与
+  Snapshot 一致，任一漂移都在模型/MCP 外发前 fail-closed。
+- Skill 是模型自主决策的能力说明，不是固定阶段、固定工具顺序、固定调用次数、固定输出规模
+  或固定业务权重。模型可按用户目标和当前可用能力选择澄清、历史读取、MCP、确定性计算、Draft、
+  Reviewer 或完成；服务端只守住能力边界、归属、计费、证据、结构校验和状态机。
+- MCP 标准结果直接交给模型；错误、空结果、partial、timeout 与 `result_unknown` 保持原分类，
+  不经 Evidence Bridge，不引入 `mcp_result_v1` 业务实体，也不自动重放可能已发送的调用。
+- 正式产物统一经受控 Artifact Draft/Review/Publish 链路。固定模板不能表达长尾需求时使用
+  `analysis_report_v1`；Excel 由不可变同版 Version 确定性投影为 `workbook_v1`。所有缺失值必须
+  用 `null`、availability 和 limitation 表达，禁止将受限数据当作 0。
+
+### 迁移期 POC 兼容面
+
+- `pi-runtime/src/extensions/internal-tools.ts` 明确标记为 `compatibility`，只供 POC 和兼容测试
+  使用。`load_marketing_skill` 在迁移期保留，但生产 Native 正常路径不依赖它；旧 POC 的
+  `build_*_draft`/发布工具名不得写入 Native Skill 作为生产必经步骤。
+- 修改 Native Skill 文案时必须保持模型自主决策、Run Snapshot、Tool Contract、Evidence 可追溯、
+  partial/限制披露和结构化校验反馈语义；不得恢复固定工具顺序、旧桥接协议或本机路径依赖。
+
+### 验证边界
+
+- 本迁移记录只使用离线单元/集成测试验证文案、快照来源、工具契约和安全断言；不等同于真实模型、
+  DataTap、钱包、生产数据库、部署或 Web UAT 通过。任何真实外部调用仍需独立授权、隔离租户、
+  append-only 证据目录和 reviewer 封口。
+
 ### result_unknown 可观测性
 
 - `PiGatewayMcpFailureMetadata` 携带可观测字段（全部可选）：`error_class`（adapter error
@@ -62,6 +93,39 @@
   metadata 只用于审计/排障。
 - 遗留项 `ACCOUNTING_UNKNOWN_DIAGNOSTIC_REQUIRED`：真实 round 的 14 个 unknown 均为
   adapter `call_failed`（DataTap 抛异常问题），待独立诊断；不阻塞下一轮核心功能
+
+## 正式完成契约与历史 Snapshot 兼容（2026-08-21）
+
+### 新 Pi Runtime 的通用完成不变量
+
+- 新 Run 不再拥有固定 required Artifact 类型。Profile、RuntimeSnapshot、用户文本、模型输出和
+  Builder 都不得指定或推导某一种预定报告；`completion_mode` 仅是服务端拥有的“正式分析/交互”语义，
+  不是 Artifact contract，也不能被 prompt 覆盖。
+- 正式分析 Run 进入 `completed` 或 `completed_with_warnings` 前，必须有当前 Run 的至少一个顶层主
+  Report Version。Pi 可在 Snapshot artifact allowlist 内选择现有标准 Artifact 或 `analysis_report_v1`。
+  `clarification_requested` 不要求报告；failed/cancelled/paused 不伪造报告；interaction Run 也不
+  作为正式分析报告门禁。
+- 主 Report 必须同时满足严格 Schema、allowlist、tenant/user/session/run 归属、已发布 Publication、
+  不可变 Version、Draft Revision、lineage/可信字段校验。child insight、历史 Run、其他租户或未发布
+  Draft 均不能满足当前 Run。Excel 请求产生的 `workbook_v1` 必须引用同一 Report Version；不一致时
+  以稳定错误拒绝。
+
+### 公共终态出口与兼容读取
+
+- engine、terminal ACK-loss/迁移、Recovery 和 `force-complete` 必须调用同一个
+  `CompletionValidator`；不得在任一出口恢复固定 Artifact 门禁或另加测试特判。
+- 历史 `required_artifact` 字段、DTO、数据库列和旧 RuntimeSnapshot 保留用于兼容读取；历史 Snapshot
+  按其原版本语义读取，绝不回写。新 Snapshot 构造时只保留当前能力 allowlist，不把旧固定 contract
+  复制成新 Run 门禁。既有标准 Artifact Schema 与 Exporter 不因本修复改变。
+- 排障时区分 `pi_gateway_main_artifact_missing`（当前正式分析缺少任意合法主报告）与历史兼容错误
+  `required_artifact_missing`/`required_artifact_invalid_lineage`；后者只能来自旧 Snapshot 语义，
+  不能由新 Run 的固定类型推导产生。
+
+### 验证边界
+
+2026-08-21 的受影响定向测试为 57 项通过；原 12 项红灯只复验一次（11 项通过，剩余 1 项隔离后通过），
+离线 UAT 全套只运行一次并为 28 项通过。上述均不等同于真实模型/DataTap、钱包、生产库、部署或 Web
+UAT 通过；生产发布仍须遵循本手册的隔离、灰度、监控和回滚步骤。
   Scenario 2 重跑，但阻塞完整 B7 PASS 与生产切流。
 
 ## 组件、版本与启动检查

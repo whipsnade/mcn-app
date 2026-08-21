@@ -36,7 +36,23 @@ export interface SkillCatalogEntry {
   name: string;
   description: string;
   version: string;
-  artifactContract: string;
+  artifactContract: string | null;
+}
+
+export interface SkillSnapshotEntry {
+  name: string;
+  revision: number;
+  contentDigest: string;
+  description: string;
+  requiredTools: readonly string[];
+  artifactContract: string | null;
+  content: string;
+}
+
+export interface SkillManifestSnapshot {
+  entries: readonly SkillSnapshotEntry[];
+  manifestDigest: string;
+  sourceScope: "database_activation" | "legacy_pack";
 }
 
 export interface AdapterCatalogEntry {
@@ -58,6 +74,7 @@ export interface RuntimeSnapshot {
   model: RuntimeModelSnapshot;
   rootPolicy: string;
   skillCatalog: readonly SkillCatalogEntry[];
+  skillManifest?: SkillManifestSnapshot;
   adapterCatalog: readonly AdapterCatalogEntry[];
   /** Server-resolved profile capability captured at Run creation. */
   profileName?: string;
@@ -215,6 +232,13 @@ const PAYLOAD_SENSITIVE_KEYS = new Set([
   "authorization", "api_key", "apikey", "password", "secret", "token", "environment",
   "tenant_id", "user_id", "session_id", "run_id", "attempt_id", "gateway_id", "lease_token",
 ]);
+// ``environment`` is a server-owned field of the authenticated Runtime Snapshot.
+// It remains forbidden in model/source-event payloads, but must be accepted
+// here so the Gateway can run an explicitly selected non-production profile.
+const RUNTIME_SNAPSHOT_SENSITIVE_KEYS = new Set([
+  "authorization", "api_key", "apikey", "password", "secret", "token",
+  "tenant_id", "user_id", "session_id", "run_id", "attempt_id", "gateway_id", "lease_token",
+]);
 const USAGE_PAYLOAD_KEYS = new Set([
   "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
   "upstream_request_id", "provider", "model", "usage_status",
@@ -229,10 +253,12 @@ function exactKeys(value: Record<string, unknown>, expected: readonly string[]):
   return keys.length === expected.length && keys.every((key, index) => key === [...expected].sort()[index]);
 }
 
-function hasSensitiveKey(value: unknown): boolean {
-  if (Array.isArray(value)) return value.some(hasSensitiveKey);
+function hasSensitiveKey(value: unknown, sensitiveKeys: Set<string> = PAYLOAD_SENSITIVE_KEYS): boolean {
+  if (Array.isArray(value)) return value.some((item) => hasSensitiveKey(item, sensitiveKeys));
   if (!isRecord(value)) return false;
-  return Object.entries(value).some(([key, item]) => PAYLOAD_SENSITIVE_KEYS.has(key.toLowerCase()) || hasSensitiveKey(item));
+  return Object.entries(value).some(
+    ([key, item]) => sensitiveKeys.has(key.toLowerCase()) || hasSensitiveKey(item, sensitiveKeys),
+  );
 }
 
 function invalidProtocol(): never {
@@ -324,7 +350,7 @@ export function parsePiGatewayClaimResponse(value: unknown): PiGatewayClaimRespo
       if (!isRecord(item) || !exactKeys(item, ["name"])) return true;
       return typeof item.name !== "string" || item.name.length < 1 || item.name.length > 128;
     }) ||
-    hasSensitiveKey(value.runtime_snapshot)
+    hasSensitiveKey(value.runtime_snapshot, RUNTIME_SNAPSHOT_SENSITIVE_KEYS)
   ) throw new Error("pi_gateway_claim_response_invalid");
   return value as unknown as PiGatewayClaimResponse;
 }

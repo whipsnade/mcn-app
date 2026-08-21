@@ -22,6 +22,7 @@ import {
 import { useAgentRun } from '../../hooks/useAgentRun';
 import { isTerminalRunStatus } from '../../state/agentEvents';
 import { ArtifactStatus } from './ArtifactStatus';
+import AnalysisReportView from './AnalysisReportView';
 import BrandArtifactView from './BrandArtifactView';
 import CampaignArtifactView from './CampaignArtifactView';
 import InsightBoardView from './InsightBoardView';
@@ -29,7 +30,7 @@ import KolAnalysisArtifactView from './KolAnalysisArtifactView';
 import KolDetailArtifactDialog from './KolDetailArtifactDialog';
 import KolSelectionArtifactView from './KolSelectionArtifactView';
 
-type TopTabId = 'brand' | 'campaign' | 'kol';
+type TopTabId = 'brand' | 'campaign' | 'kol' | 'report';
 type KolSubTabId = 'analysis' | 'selection';
 
 // 一级 Tab → 后端 Artifact 模块名。达人 Tab 聚合 kol-selection / kol-analysis
@@ -38,6 +39,7 @@ const TOP_TABS: Array<{ id: TopTabId; label: string; modules: string[] }> = [
   { id: 'brand', label: '品牌分析', modules: ['brand'] },
   { id: 'campaign', label: '活动分析', modules: ['campaign'] },
   { id: 'kol', label: '达人', modules: ['kol-selection', 'kol-analysis'] },
+  { id: 'report', label: '通用报告', modules: ['report'] },
 ];
 
 const KOL_SUB_TABS: Array<{ id: KolSubTabId; label: string; artifactType: string }> = [
@@ -46,7 +48,7 @@ const KOL_SUB_TABS: Array<{ id: KolSubTabId; label: string; artifactType: string
 ];
 
 // 支持 Excel 导出的产物类型（对齐后端 exporters 分派表）。
-const EXPORTABLE_TYPES = new Set(['brand_report_v3', 'campaign_report_v2', 'kol_selection_v3']);
+const EXPORTABLE_TYPES = new Set(['brand_report_v3', 'campaign_report_v2', 'kol_selection_v3', 'analysis_report_v1']);
 
 export interface ArtifactWorkspaceProps {
   sessionId?: string;
@@ -136,9 +138,11 @@ export default function ArtifactWorkspace({
     ? 'brand_report_v3'
     : topTab === 'campaign'
       ? 'campaign_report_v2'
-      : kolSubTab === 'selection'
-        ? 'kol_selection_v3'
-        : 'kol_analysis_v2';
+      : topTab === 'report'
+        ? 'analysis_report_v1'
+        : kolSubTab === 'selection'
+          ? 'kol_selection_v3'
+          : 'kol_analysis_v2';
 
   // §13.2：Draft/发布只打圆点。展示主体取「非生成中」的最新产物；若当前最新是
   // 生成中的 Draft（latest_version 0 / generating / reviewing），回退到上一个
@@ -353,6 +357,8 @@ export default function ArtifactWorkspace({
     ? '完成一次品牌分析后在此展示'
     : topTab === 'campaign'
       ? '完成一次活动分析后在此展示'
+      : topTab === 'report'
+        ? '完成一次通用营销分析后在此展示'
       : kolSubTab === 'selection'
         ? '完成圈选后在此展示'
         : '完成 KOL 分析后在此展示';
@@ -364,6 +370,8 @@ export default function ArtifactWorkspace({
         return <BrandArtifactView payload={payload} />;
       case 'campaign_report_v2':
         return <CampaignArtifactView payload={payload} />;
+      case 'analysis_report_v1':
+        return <AnalysisReportView payload={payload} />;
       case 'kol_selection_v3':
         return <KolSelectionArtifactView payload={payload} onOpenDetail={item => void openKolDetail(item)} />;
       case 'kol_analysis_v2':

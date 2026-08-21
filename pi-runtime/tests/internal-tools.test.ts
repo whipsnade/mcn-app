@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { PiPocHttpClient } from "../src/http/client";
 import {
   PI_INTERNAL_TOOL_NAMES,
+  PI_RUNTIME_POC_COMPATIBILITY,
   PiInternalToolsClient,
   isAllowedInternalTool,
   registerInternalTools,
@@ -46,6 +47,11 @@ function makeClient(): PiInternalToolsClient {
 }
 
 describe("isAllowedInternalTool", () => {
+  it("明确标记为迁移期 POC 兼容面，并保留 load_marketing_skill", () => {
+    expect(PI_RUNTIME_POC_COMPATIBILITY).toBe("compatibility");
+    expect(PI_INTERNAL_TOOL_NAMES).toContain("load_marketing_skill");
+  });
+
   it("只允许设计白名单内的受控内部工具", () => {
     expect(PI_INTERNAL_TOOL_NAMES).toEqual([
       "get_session_context",

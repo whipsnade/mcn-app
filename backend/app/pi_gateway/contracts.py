@@ -141,6 +141,11 @@ _SENSITIVE_PAYLOAD_KEYS = {
     "token",
     "environment",
 }
+# ``environment`` is a server-owned field of the immutable Runtime Snapshot.
+# It remains forbidden in model/source-event payloads below, but must be
+# accepted in the authenticated claim snapshot so non-production runtimes can
+# be selected deterministically without making the claim impossible to decode.
+_RUNTIME_SNAPSHOT_SENSITIVE_PAYLOAD_KEYS = _SENSITIVE_PAYLOAD_KEYS - {"environment"}
 _IDENTITY_PAYLOAD_KEYS = {
     "tenant_id",
     "user_id",
@@ -231,7 +236,7 @@ class PiGatewayClaimResponse(_StrictModel):
     def bounded_nested_response(self) -> "PiGatewayClaimResponse":
         if len(str(self.runtime_snapshot).encode("utf-8")) > 256 * 1024:
             raise ValueError("pi_gateway_claim_snapshot_too_large")
-        if _contains_sensitive_key(self.runtime_snapshot, _SENSITIVE_PAYLOAD_KEYS):
+        if _contains_sensitive_key(self.runtime_snapshot, _RUNTIME_SNAPSHOT_SENSITIVE_PAYLOAD_KEYS):
             raise ValueError("pi_gateway_claim_snapshot_sensitive_field")
         for item in self.transcript:
             if (

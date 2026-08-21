@@ -5,10 +5,12 @@
  * 其他协议或非法串一律返回 null，由调用方渲染「不可用」态而非链接，防止
  * `href={url}` 注入可执行协议。后端强类型校验是最终边界，这里是前端防线。
  */
-export function safeHttpUrl(url?: string | null): string | null {
-  if (!url) return null;
+export function safeHttpUrl(url: unknown): string | null {
+  if (typeof url !== 'string') return null;
+  const candidate = url.trim();
+  if (!candidate || /[\u0000-\u001f\u007f]/.test(candidate)) return null;
   try {
-    const parsed = new URL(url);
+    const parsed = new URL(candidate);
     if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
     return parsed.href;
   } catch {
