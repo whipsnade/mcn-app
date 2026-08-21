@@ -496,3 +496,14 @@ READY_FOR_FINAL_FUNCTIONAL_UAT_REVIEW`；在此之前不得合入 main、生产�
   Artifact/required-artifact、数据库迁移、历史 Run/Snapshot/Version。
 - 当前最高状态仍待独立只读审查确认后才可推进为 `READY_FOR_SINGLE_REAL_WEB_UAT_REAUTHORIZATION`；本节本身不授权
   再次 Web UAT。
+
+### 11.5 独立只读审查收口
+
+- 最终审查 HEAD 为 `e5686a91c66255d4141887309d6d3e7f5f325b18`，branch 为
+  `codex/runtime-adapter-catalog-capacity-repair`，工作树 clean；审查代理未运行测试、真实服务、网络或写操作。
+- 结果为 **Critical=0 / Important=0 / Minor=1**，已达到本轮目标 C0/I0。Minor 是
+  `PI_GATEWAY_MAX_BUFFERED_EVENTS` 仍允许配置范围 `1..100000`，但生产默认值和本轮实际验证均为 256；本轮没有通过配置或代码
+  扩大该默认边界，后续若要把 256 变成硬上限需另行收紧配置契约。
+- 审查确认独立 pump/heartbeat 解耦、同步 257 事件、批次/ACK/幂等/route broker/terminal drain/cancel/recovery、metadata-only
+  诊断和 StrictInt 均无 Critical/Important 问题；未发现 provider、DataTap、wallet、catalog、Artifact、required-artifact 或历史数据越界修改。
+- 本轮状态可推进至 `READY_FOR_SINGLE_REAL_WEB_UAT_REAUTHORIZATION`，但不等同于真实 UAT 通过；下一步仍需新的明确授权后才可执行唯一一次真实 Web UAT。

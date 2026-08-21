@@ -368,5 +368,6 @@ Run 必须有当前 Run/Session/tenant 归属下至少一个已发布、不可�
   metadata-only 诊断和健康计数；不改 provider/DataTap/catalog/积分/Artifact/required-artifact/迁移/历史数据。
 - [x] 建立线性提交：`f78c5ea`、`81d4bf9`、`c300ca2`、`60c47e8`、`edacdfb`、`935350b`、`65ee698`、`f0d5d86`。定向验证为 Gateway 67 passed/1 skipped、
   Backend 29 passed、Gateway typecheck/build、Backend Ruff、diff check 全部通过。
-- [ ] 独立只读审查 Critical 0 / Important 0；审查通过后本轮最高状态才可推进到
-  `READY_FOR_SINGLE_REAL_WEB_UAT_REAUTHORIZATION`。在此之前不触发候选 CI、不 push、不部署、不创建第二个真实 Web UAT。
+- [x] 独立只读审查完成：最终 HEAD `e5686a91c66255d4141887309d6d3e7f5f325b18` 为 Critical 0 / Important 0 / Minor 1；
+  Minor 仅是 `PI_GATEWAY_MAX_BUFFERED_EVENTS` 可显式配置到 256 以上，生产默认和本轮验证仍为 256。当前最高状态为
+  `READY_FOR_SINGLE_REAL_WEB_UAT_REAUTHORIZATION`，不触发候选 CI、不 push、不部署、不创建第二个真实 Web UAT。

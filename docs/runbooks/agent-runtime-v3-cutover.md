@@ -433,3 +433,6 @@ IPC、HTTP、事件或日志边界；未知分类必须为 `unknown`。
 - 定向验证：Gateway 7 个 Vitest 文件 67 passed/1 skipped（历史 RED 复现保留，含本地子进程级 257 事件回归）、typecheck/build 通过；Backend Pi Gateway
   29 passed；Ruff 和 diff check 通过，含 batch route commit-before-broker 与 duplicate replay 覆盖。没有执行完整 pytest、离线 UAT、真实模型/DataTap、Browser E2E、CI push、部署、Web UAT
   或生产灰度。
+- 最终 HEAD `e5686a91c66255d4141887309d6d3e7f5f325b18` 的独立只读审查为 Critical=0 / Important=0 / Minor=1，Minor 仅为
+  `PI_GATEWAY_MAX_BUFFERED_EVENTS` 可显式配置到 256 以上；生产默认和本轮验证保持 256。当前最多推进到
+  `READY_FOR_SINGLE_REAL_WEB_UAT_REAUTHORIZATION`，不得据此直接启动真实 UAT。
