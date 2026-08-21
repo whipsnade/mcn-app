@@ -158,6 +158,14 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Install Pi Runtime dependencies
+        working-directory: pi-runtime
+        run: npm ci
+
+      - name: Install Pi Gateway dependencies
+        working-directory: pi-gateway
+        run: npm ci
+
       - name: Vitest
         run: npm run test
 

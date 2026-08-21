@@ -216,7 +216,9 @@ describe("PiGateway", () => {
       heartbeatIntervalMs: 1,
       onError,
       worker: async () => {
-        await new Promise((resolve) => setTimeout(resolve, 5));
+        // 两次 heartbeat failure 才会触发 lease hand-off；给 1ms heartbeat
+        // 留出稳定的调度窗口，避免 CI 冷启动时 worker 先完成而掩盖租约丢失。
+        await new Promise((resolve) => setTimeout(resolve, 50));
         return undefined;
       },
     });
