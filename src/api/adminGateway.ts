@@ -1,4 +1,5 @@
 import { request } from './client';
+import { createRequestId } from './requestId';
 
 export type AdminTenant = {
   id: string; slug: string; name: string; status: 'active' | 'disabled'; is_internal: boolean;
@@ -48,7 +49,7 @@ export type AdminQuotaItem = {
   user_id: string; period: 'monthly'; points_limit: number; status: 'active' | 'disabled';
 };
 
-const key = (value?: string): Record<string, string> => ({ 'Idempotency-Key': value ?? crypto.randomUUID() });
+const key = (value?: string): Record<string, string> => ({ 'Idempotency-Key': value ?? createRequestId() });
 const query = (path: string, params: Record<string, string | number | undefined>): string => {
   const search = new URLSearchParams();
   Object.entries(params).forEach(([name, value]) => { if (value !== undefined) search.set(name, String(value)); });

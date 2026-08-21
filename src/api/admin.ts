@@ -7,6 +7,7 @@ import type {
   ApiAdminUserUpdateInput,
   ApiPointsHistory,
 } from './contracts';
+import { createRequestId } from './requestId';
 
 export interface AdminUserListParams {
   keyword?: string;
@@ -17,7 +18,7 @@ export interface AdminUserListParams {
 
 // legacy 用户写操作服务端强制 Idempotency-Key：缺省自动生成，允许调用方显式传入覆盖。
 const idempotencyHeaders = (value?: string): Record<string, string> => ({
-  'Idempotency-Key': value ?? crypto.randomUUID(),
+  'Idempotency-Key': value ?? createRequestId(),
 });
 
 export function listAdminUsers(params: AdminUserListParams = {}): Promise<ApiAdminUserList> {

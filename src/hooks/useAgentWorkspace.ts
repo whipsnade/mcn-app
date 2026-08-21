@@ -24,6 +24,7 @@ import {
 import type { ApiAgentArtifact } from '../api/agentArtifacts';
 import { listArtifacts, markArtifactRead } from '../api/agentArtifacts';
 import type { ApiWallet } from '../api/contracts';
+import { createRequestId } from '../api/requestId';
 import { getWallet } from '../api/wallet';
 import { isTerminalRunStatus } from '../state/agentEvents';
 import type { RunRuntimeState } from '../state/agentEvents';
@@ -319,7 +320,7 @@ export function useAgentWorkspace(userId?: string) {
     };
     patchMessages(sessionId, messages => [...messages, optimisticMessage]);
     try {
-      const response = await sendMessageRequest(sessionId, content, { ...options, idempotencyKey: crypto.randomUUID() });
+      const response = await sendMessageRequest(sessionId, content, { ...options, idempotencyKey: createRequestId() });
       if (generationRef.current !== generation) throw new Error('STALE_WORKSPACE_REQUEST');
       // 回填 run_id：执行卡锚定到触发它的用户消息下方。
       patchMessages(sessionId, messages => messages.map(message => message.id === optimisticId

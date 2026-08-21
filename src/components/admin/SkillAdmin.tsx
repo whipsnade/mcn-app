@@ -15,6 +15,7 @@ import {
   rollbackAdminSkill,
   validateAdminSkill,
 } from '../../api/skills';
+import { createRequestId } from '../../api/requestId';
 import ConfirmDialog from './ConfirmDialog';
 
 const ENVIRONMENT_LABEL: Record<AdminSkillEnvironment, string> = {
@@ -57,7 +58,7 @@ export default function SkillAdmin() {
     const identity = `${operation}:${JSON.stringify(fingerprint)}`;
     const existing = operationKeys.current.get(identity);
     if (existing) return existing;
-    const created = crypto.randomUUID();
+    const created = createRequestId();
     operationKeys.current.set(identity, created);
     return created;
   };

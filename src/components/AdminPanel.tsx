@@ -9,6 +9,7 @@ import {
   BarChart, Bar, Cell
 } from 'recharts';
 import type { ApiAdminUser, ApiPointsHistoryEntry } from '../api/contracts';
+import { createRequestId } from '../api/requestId';
 import {
   adjustAdminUserPoints,
   createAdminUser,
@@ -195,7 +196,7 @@ export default function AdminPanel({
     setIsPointsSaving(true);
     setPointsError('');
     try {
-      await adjustAdminUserPoints(acc.id, delta, '管理后台快捷调整', crypto.randomUUID());
+      await adjustAdminUserPoints(acc.id, delta, '管理后台快捷调整', createRequestId());
       setEditingPointsUserId(null);
       await loadUsers(searchQuery.trim(), selectedFilterChannel);
     } catch (err) {
@@ -362,7 +363,7 @@ export default function AdminPanel({
             editingAccount.id,
             formPoints - editingAccount.points,
             '管理后台积分调整',
-            crypto.randomUUID(),
+            createRequestId(),
           );
         }
         setSuccessMsg(`账号「${formUsername.trim()}」修改成功！`);

@@ -1,4 +1,5 @@
 import { request } from './client';
+import { createRequestId } from './requestId';
 import type {
   AdminSkillEnvironment,
   ApiSkillActivation,
@@ -10,7 +11,7 @@ import type {
 } from './contracts';
 
 const idempotencyHeaders = (value?: string): Record<string, string> => ({
-  'Idempotency-Key': value ?? crypto.randomUUID(),
+  'Idempotency-Key': value ?? createRequestId(),
 });
 
 const encodeSkillName = (skillName: string): string => encodeURIComponent(skillName);
