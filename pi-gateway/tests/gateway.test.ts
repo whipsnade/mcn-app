@@ -5,6 +5,65 @@ import { PiModelProviderError } from "../src/model-request-budget.js";
 import type { PiGatewaySourceEvent } from "../src/protocol.js";
 
 describe("PiGateway", () => {
+  it("reproduces event overflow when transient delivery failure waits for heartbeat recovery", async () => {
+    const onError = vi.fn();
+    const terminal = vi.fn().mockResolvedValue(undefined);
+    const heartbeat = vi.fn().mockResolvedValue({ cancel_requested: false });
+    const sendEvent = vi.fn()
+      .mockRejectedValueOnce(Object.assign(new Error("temporary network"), {
+        code: "pi_gateway_network_error",
+      }))
+      .mockResolvedValue(undefined);
+    let emit!: (event: PiGatewaySourceEvent) => void;
+    let finish!: () => void;
+    const done = new Promise<void>((resolve) => { finish = resolve; });
+    const abort = vi.fn(() => finish());
+    const controlPlane = {
+      claim: vi.fn().mockResolvedValue({
+        run_id: "run-event-overflow-repro",
+        attempt_id: "attempt-event-overflow-repro",
+        lease_token: "lease-token-with-enough-entropy",
+        lease_expires_at: Math.floor(Date.now() / 1000) + 3600,
+        runtime_snapshot: {}, transcript: [],
+        secret_envelope: { alg: "AES-256-GCM", nonce: "1234567890123456", ciphertext: "1234567890123456" },
+        adapter_catalog: [], internal_tools: [],
+      }),
+      terminal,
+      heartbeat,
+      sendEvent,
+    };
+    const gateway = new PiGateway({
+      controlPlane,
+      capacity: 1,
+      worker: async () => ({
+        abort,
+        done,
+        onEvent: (listener: (event: PiGatewaySourceEvent) => void) => {
+          emit = listener;
+          return () => undefined;
+        },
+      }),
+    });
+
+    const tick = gateway.tick();
+    while (!emit) await new Promise<void>((resolve) => queueMicrotask(resolve));
+    for (let sequence = 1; sequence <= 257; sequence += 1) {
+      emit({
+        source_event_id: `repro:${sequence}`,
+        sequence,
+        event_type: "message.start",
+        payload: {},
+      });
+    }
+
+    await expect(tick).resolves.toBe(true);
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(heartbeat).not.toHaveBeenCalled();
+    expect(sendEvent).toHaveBeenCalledTimes(1);
+    expect(abort).toHaveBeenCalledTimes(1);
+    expect(terminal).not.toHaveBeenCalled();
+  });
+
   it("passes safe provider failure metadata with the stable business code and no retry", async () => {
     const terminal = vi.fn().mockResolvedValue(undefined);
     const failureMetadata = {
