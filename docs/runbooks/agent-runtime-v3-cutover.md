@@ -430,6 +430,6 @@ IPC、HTTP、事件或日志边界；未知分类必须为 `unknown`。
 - 仅新增 metadata-only 诊断和健康计数：失败/重试/overflow、高水位、最后 ACK source sequence、批大小、连续失败和 latency
   bucket；禁止记录 payload、prompt、MCP/模型内容、secret、Bearer、HMAC 或 DSN。该修复未改 provider、DataTap、积分、Artifact、
   required-artifact、迁移或历史数据。
-- 定向验证：Gateway 7 个 Vitest 文件 65 passed/1 skipped（历史 RED 复现保留，含本地子进程级 257 事件回归）、typecheck/build 通过；Backend Pi Gateway
-  28 passed；Ruff 和 diff check 通过。没有执行完整 pytest、离线 UAT、真实模型/DataTap、Browser E2E、CI push、部署、Web UAT
+- 定向验证：Gateway 7 个 Vitest 文件 67 passed/1 skipped（历史 RED 复现保留，含本地子进程级 257 事件回归）、typecheck/build 通过；Backend Pi Gateway
+  29 passed；Ruff 和 diff check 通过，含 batch route commit-before-broker 与 duplicate replay 覆盖。没有执行完整 pytest、离线 UAT、真实模型/DataTap、Browser E2E、CI push、部署、Web UAT
   或生产灰度。

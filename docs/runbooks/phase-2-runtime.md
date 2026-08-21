@@ -147,7 +147,8 @@ fingerprint 和毫秒 UTC 时间戳。原始 `errorMessage` 只在 Worker 内存
 
 ## 2026-08-21 事件投递 backpressure 修复运行口径
 
-Pi Gateway 的事件投递由独立串行 pump 负责，不再依赖 heartbeat 恢复事件缓冲。内存上限仍为 256 条；对支持 batch 的
+Pi Gateway 的事件投递由独立串行 pump 负责，不再依赖 heartbeat 恢复事件缓冲。待发送队列上限仍为 256 条（in-flight
+active batch 不重复占用该容量）；对支持 batch 的
 控制面，单批最多 32 条、canonical JSON 最多 128 KiB，source sequence 必须连续且绑定同一 Run/Attempt。批次在服务端
 ACK 前不得丢弃；timeout、network、HTTP 5xx 仅对同一批执行最多 5 次有界重试，并受 lease deadline、cancel 和 shutdown
 fence 约束。4xx、业务拒绝、协议或序列错误不得盲重试。

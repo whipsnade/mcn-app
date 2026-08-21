@@ -366,7 +366,7 @@ Run 必须有当前 Run/Session/tenant 归属下至少一个已发布、不可�
   旧单事件端点和既有 backend Recovery/terminal 回归。
 - [x] 实现独立串行 event pump，解耦 heartbeat；保留 256 有界队列，批次 ACK 前不丢弃；补齐后端事务接收、commit 后 broker、
   metadata-only 诊断和健康计数；不改 provider/DataTap/catalog/积分/Artifact/required-artifact/迁移/历史数据。
-- [x] 建立线性提交：`f78c5ea`、`81d4bf9`、`c300ca2`、`60c47e8`、`edacdfb`、`26101b5`。定向验证为 Gateway 65 passed/1 skipped、
-  Backend 28 passed、Gateway typecheck/build、Backend Ruff、diff check 全部通过。
+- [x] 建立线性提交：`f78c5ea`、`81d4bf9`、`c300ca2`、`60c47e8`、`edacdfb`、`935350b`、`65ee698`、`f0d5d86`。定向验证为 Gateway 67 passed/1 skipped、
+  Backend 29 passed、Gateway typecheck/build、Backend Ruff、diff check 全部通过。
 - [ ] 独立只读审查 Critical 0 / Important 0；审查通过后本轮最高状态才可推进到
   `READY_FOR_SINGLE_REAL_WEB_UAT_REAUTHORIZATION`。在此之前不触发候选 CI、不 push、不部署、不创建第二个真实 Web UAT。

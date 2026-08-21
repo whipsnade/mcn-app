@@ -454,7 +454,7 @@ READY_FOR_FINAL_FUNCTIONAL_UAT_REVIEW`；在此之前不得合入 main、生产�
 ### 11.2 最小修复与安全边界
 
 - 新增独立串行 `EventDeliveryPump`：事件生产与 heartbeat 解耦；单批最多 32 条、canonical JSON 最多 128 KiB，
-  同一 Run/Attempt 使用连续 source sequence；批次在 ACK 前保留，timeout/network/5xx 只对同一批做有界短退避重试，
+  同一 Run/Attempt 使用连续 source sequence；256 上限定义为待发送队列，in-flight active batch 不重复占用该容量；批次在 ACK 前保留，timeout/network/5xx 只对同一批做有界短退避重试，
   最多 5 次重试，并受 lease、cancel、shutdown fence 约束。4xx、业务拒绝、协议/序列错误不盲重试。
 - 后端 batch DTO、HMAC/nonce、lease、归属和事务接收各只执行一次；完整批次先校验再原子写入，commit 后按可见 sequence
   发布。ACK 丢失时重放完全相同的 source batch，依靠 source identity 幂等，不重复写 AgentEvent、RuntimeUsageRecord、
@@ -484,11 +484,13 @@ READY_FOR_FINAL_FUNCTIONAL_UAT_REVIEW`；在此之前不得合入 main、生产�
 ### 11.4 TDD、回归与停止边界
 
 - 线性提交为 `f78c5ea`（历史 RED 复现）、`81d4bf9`（batch contract RED/边界）、`c300ca2`（batch 接收与幂等）、
-  `60c47e8`（独立 pump、诊断、取消/terminal drain）和 `edacdfb`（协议常量及 failure 诊断计数收紧）。
-- 已通过 Gateway 定向 Vitest：7 个文件、65 passed、1 skipped（历史复现；另含本地子进程级 257 事件回归）；Gateway typecheck、build 通过；Backend
-  Pi Gateway 定向 pytest 28 passed；受影响 Ruff、`git diff --check` 通过。验证覆盖批次顺序、ACK-loss 同批重放、gap
+  `60c47e8`（独立 pump、诊断、取消/terminal drain）、`edacdfb`（协议常量及 failure 诊断计数收紧）、`935350b`（进程级回归）、
+  `65ee698`（同步 burst/诊断/StrictInt 修复）和 `f0d5d86`（route commit-before-broker/duplicate replay 回归）。
+- 已通过 Gateway 定向 Vitest：7 个文件、67 passed、1 skipped（历史复现；另含本地子进程级 257 事件回归）；Gateway typecheck、build 通过；Backend
+  Pi Gateway 定向 pytest 29 passed；受影响 Ruff、`git diff --check` 通过。验证覆盖批次顺序、ACK-loss 同批重放、gap
   全批拒绝且无部分写入、duplicate receipt 稳定、4xx/协议不重试、network/5xx 有界重试、永久故障留给 Recovery、
-  terminal drain、取消 backlog、旧单事件端点、事件/usage 顺序和既有 Recovery/terminal 回归。
+  terminal drain、取消 backlog、旧单事件端点、事件/usage 顺序、batch route commit-before-broker/duplicate replay 和既有
+  Recovery/terminal 回归。最后一条 control-plane metadata-only 诊断通过 Gateway health metrics 保留，latency bucket 按实际耗时计算。
 - 本轮未运行完整 backend pytest、完整离线 UAT、Browser E2E、历史 corpus replay、真实模型/provider、DataTap、钱包、
   Web UAT、候选 CI、push、预发布部署、main 合入、生产部署或灰度；未修改 provider 请求协议、DataTap/catalog/积分、
   Artifact/required-artifact、数据库迁移、历史 Run/Snapshot/Version。
