@@ -175,8 +175,10 @@ backend/.venv/bin/pytest -q \
 
 ## 7. 当前发布状态与后续停止门
 
-当前状态仍为 `NOT_READY_FOR_CANDIDATE_DEPLOYMENT`，因为独立审查、线性提交、integration candidate、
-CI、预发布和一次真实 Web UAT 尚未完成。本轮未执行生产灰度。
+独立只读审查已完成，结论为 Critical 0 / Important 0；本轮线性提交为
+`fd61e9e`（runtime）、`dbd2a96`（tests/UAT）、`de7c45b`（docs）。当前状态仍为
+`NOT_READY_FOR_CANDIDATE_DEPLOYMENT`，因为 integration candidate、CI、预发布和一次真实 Web UAT
+尚未完成；根目录 tsc 的基线依赖缺失也仍需在候选门禁中单独处理。本轮未执行生产灰度。
 
 后续唯一真实 Web UAT 使用专用 UAT 租户和一次 `瑞幸咖啡` 请求，限制为 Run=1、Attempt=1、模型≤10、
 DataTap≤5、积分≤50、retries=0、fresh Run=0；必须同时证明此前 `unsupported_content` 场景的标准

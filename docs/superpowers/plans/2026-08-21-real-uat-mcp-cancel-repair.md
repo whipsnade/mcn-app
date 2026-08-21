@@ -92,9 +92,9 @@
 
 **Files:** `docs/qa/2026-08-21-real-uat-mcp-cancel-repair.md`、`docs/runbooks/phase-2-runtime.md`、`docs/runbooks/agent-runtime-v3-cutover.md`、`docs/superpowers/plans/2026-08-21-pi-autonomous-marketing-skills-implementation.md`、`changelog/2026-08-21.md`
 
-- [ ] 只按授权顺序运行一次：新增红灯/修复后的 Backend 定向、Pi Gateway MCP/cancel Vitest、前端 API/ChatArea/useAgentWorkspace/reducer Vitest、一次真实 worker topology 定向取消、Ruff、Gateway typecheck/build、前端 tsc/build、diff/secret/DSN 扫描。
+- [x] 按授权顺序完成 Backend/Pi Gateway/前端定向回归、worker/heartbeat race、Ruff、Gateway typecheck/build、前端 build、diff 和静态 secret/DSN 扫描；根目录 tsc 的既有 Pi Runtime 缺失依赖已记录为候选门禁阻断。
 - [x] 已完成定向 Backend/Pi Gateway/前端验证、原 12 项一次执行和完整离线 UAT 一次；完整 UAT 唯一失败只隔离复验一次，未重跑全套，详细结果写入 QA。
-- [ ] 完成独立审查，Critical=0、Important=0，特别检查标准 MCP Result 是否真正到达模型、没有 Evidence Bridge、取消后无外发、unknown 未释放、无 worker/lease/port 残留、前端不是视觉假取消。
-- [ ] 依次创建线性提交：`fix(runtime): make in-flight cancellation effective`、`test(uat): cover direct mcp result and cancellation`、`docs: record real uat evidence`；Direct MCP 透传本轮沿用已审计基线，不创建空提交。
+- [x] 完成独立只读审查，Critical=0、Important=0；确认标准 MCP Result 直通、没有 Evidence Bridge、取消后无外发、unknown 不被释放/重放、无 worker/lease/port 残留、前端不是视觉假取消。
+- [x] 已创建线性提交：`fd61e9e fix(runtime): make in-flight cancellation effective`、`dbd2a96 test(uat): cover direct mcp result and cancellation`、`de7c45b docs: record real uat evidence`；Direct MCP 透传沿用已审计基线，不创建空提交。
 - [ ] 重建 integration candidate、运行 CI 并部署预发布；仅在代码/测试/审查全部通过后执行一次专用 UAT 租户的“Direct MCP + 取消”组合 Web UAT：一次瑞幸咖啡请求，Attempt=1、模型≤10、DataTap≤5、积分≤50、retries=0、fresh Run=0。
 - [ ] 组合 UAT 必须记录一个此前会产生 `unsupported_content` 的工具成功返回、模型收到标准结果、点击“取消任务”后的阶段时间戳、无后续外发、唯一 cancelled、Attempt/ToolCall/permit/lease/worker/端口收口。通过后只报告 `REAL_UAT_MCP_PASS_THROUGH_AND_CANCEL_PASS / READY_FOR_FINAL_FUNCTIONAL_UAT`；本轮不做生产灰度。
