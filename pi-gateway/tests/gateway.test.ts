@@ -64,6 +64,78 @@ describe("PiGateway", () => {
     expect(terminal).not.toHaveBeenCalled();
   });
 
+  it("retries a transient batch failure independently of heartbeat while draining over 256 events", async () => {
+    const onError = vi.fn();
+    const terminal = vi.fn().mockResolvedValue(undefined);
+    const heartbeat = vi.fn().mockResolvedValue({ cancel_requested: false });
+    let batchCalls = 0;
+    const sendEventBatch = vi.fn(async () => {
+      batchCalls += 1;
+      if (batchCalls === 1) {
+        throw Object.assign(new Error("temporary network"), { code: "pi_gateway_network_error" });
+      }
+      return {
+        receipts: [],
+        last_acked_source_sequence: 0,
+      };
+    });
+    const sendEvent = vi.fn().mockRejectedValue(new Error("legacy endpoint must not be used"));
+    let emit!: (event: PiGatewaySourceEvent) => void;
+    let finish!: () => void;
+    const done = new Promise<void>((resolve) => { finish = resolve; });
+    const abort = vi.fn(() => finish());
+    const controlPlane = {
+      claim: vi.fn().mockResolvedValue({
+        run_id: "run-event-pump",
+        attempt_id: "attempt-event-pump",
+        lease_token: "lease-token-with-enough-entropy",
+        lease_expires_at: Math.floor(Date.now() / 1000) + 3600,
+        runtime_snapshot: {}, transcript: [],
+        secret_envelope: { alg: "AES-256-GCM", nonce: "1234567890123456", ciphertext: "BBBBBBBBBBBBBBBB" },
+        adapter_catalog: [], internal_tools: [],
+      }),
+      terminal,
+      heartbeat,
+      sendEvent,
+      sendEventBatch,
+    };
+    const gateway = new PiGateway({
+      controlPlane,
+      capacity: 1,
+      eventDeliveryRetryBaseMs: 1,
+      onError,
+      worker: async () => ({
+        abort,
+        done,
+        onEvent: (listener: (event: PiGatewaySourceEvent) => void) => {
+          emit = listener;
+          return () => undefined;
+        },
+      }),
+    });
+
+    const tick = gateway.tick();
+    while (!emit) await new Promise<void>((resolve) => queueMicrotask(resolve));
+    for (let sequence = 1; sequence <= 257; sequence += 1) {
+      emit({
+        source_event_id: `pump:${sequence}`,
+        sequence,
+        event_type: "message.start",
+        payload: {},
+      });
+      if (sequence % 4 === 0) await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+    finish();
+
+    await expect(tick).resolves.toBe(true);
+    expect(heartbeat).not.toHaveBeenCalled();
+    expect(abort).not.toHaveBeenCalled();
+    expect(sendEvent).not.toHaveBeenCalled();
+    expect(sendEventBatch.mock.calls.length).toBeGreaterThan(1);
+    expect(onError).not.toHaveBeenCalledWith(expect.objectContaining({ code: "event_buffer_overflow" }));
+    expect(terminal).toHaveBeenCalledTimes(1);
+  });
+
   it("passes safe provider failure metadata with the stable business code and no retry", async () => {
     const terminal = vi.fn().mockResolvedValue(undefined);
     const failureMetadata = {

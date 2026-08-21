@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
 from datetime import datetime
 from typing import Any, Literal
@@ -15,6 +16,10 @@ from .catalog import (
     normalized_adapter_service,
 )
 from .events import normalize_source_payload, normalize_usage_payload
+
+
+PI_GATEWAY_EVENT_BATCH_MAX_EVENTS = 32
+PI_GATEWAY_EVENT_BATCH_MAX_BYTES = 128 * 1024
 
 
 class _StrictModel(BaseModel):
@@ -273,6 +278,33 @@ class PiGatewaySourceEvent(_StrictModel):
                 value = self.payload.get(key)
                 if isinstance(value, str) and len(value) > 16_384:
                     raise ValueError("source_event_delta_too_large")
+        return self
+
+
+class PiGatewaySourceEventBatch(_StrictModel):
+    events: list[PiGatewaySourceEvent] = Field(
+        min_length=1,
+        max_length=PI_GATEWAY_EVENT_BATCH_MAX_EVENTS,
+    )
+
+    @model_validator(mode="after")
+    def bounded_contiguous_batch(self) -> "PiGatewaySourceEventBatch":
+        attempts = {event.source_event_id.rsplit(":", 1)[0] for event in self.events}
+        if len(attempts) != 1:
+            raise ValueError("pi_gateway_event_batch_attempt_mismatch")
+        if any(
+            self.events[index].sequence != self.events[index - 1].sequence + 1
+            for index in range(1, len(self.events))
+        ):
+            raise ValueError("pi_gateway_event_batch_sequence_gap")
+        serialized = json.dumps(
+            {"events": [event.model_dump(mode="json") for event in self.events]},
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        if len(serialized) > PI_GATEWAY_EVENT_BATCH_MAX_BYTES:
+            raise ValueError("pi_gateway_event_batch_too_large")
         return self
 
 

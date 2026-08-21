@@ -148,6 +148,23 @@ export interface PiGatewaySourceEvent {
   payload: Record<string, unknown>;
 }
 
+export interface PiGatewaySourceEventBatch {
+  events: PiGatewaySourceEvent[];
+}
+
+export interface PiGatewaySourceEventReceipt {
+  source_event_id: string;
+  sequence: number;
+  duplicate: boolean;
+  event_id?: string;
+  usage_record_id?: string;
+}
+
+export interface PiGatewaySourceEventBatchReceipt {
+  receipts: PiGatewaySourceEventReceipt[];
+  last_acked_source_sequence: number;
+}
+
 export interface PiGatewayClaimResponse {
   run_id: string;
   attempt_id: string;
@@ -165,6 +182,8 @@ export interface PiGatewayClaimResponse {
 // model-visible MCP proxy, not one top-level tool per catalog entry.
 export const PI_GATEWAY_ADAPTER_CATALOG_MAX_ENTRIES = 128;
 export const PI_GATEWAY_ADAPTER_CATALOG_MAX_BYTES = 128 * 1024;
+export const PI_GATEWAY_EVENT_BATCH_MAX_EVENTS = 32;
+export const PI_GATEWAY_EVENT_BATCH_MAX_BYTES = 128 * 1024;
 
 const PI_ADAPTER_SERVICE_ALIASES: Readonly<Record<string, string>> = Object.freeze({
   "insight-cube-mcp": "insight-cube",
@@ -336,6 +355,61 @@ export function parsePiGatewaySourceEvent(value: unknown): PiGatewaySourceEvent 
     ) invalidProtocol();
   }
   return { source_event_id: sourceEventId, sequence: sequenceNumber, event_type: eventType, payload };
+}
+
+export function parsePiGatewaySourceEventBatch(value: unknown): PiGatewaySourceEventBatch {
+  if (!isRecord(value) || !exactKeys(value, ["events"]) || !Array.isArray(value.events)) {
+    invalidProtocol();
+  }
+  if (value.events.length < 1 || value.events.length > PI_GATEWAY_EVENT_BATCH_MAX_EVENTS) {
+    invalidProtocol();
+  }
+  const events = value.events.map((event) => parsePiGatewaySourceEvent(event));
+  const attemptIds = new Set(
+    events.map((event) => event.source_event_id.slice(0, event.source_event_id.lastIndexOf(":"))),
+  );
+  if (attemptIds.size !== 1) invalidProtocol();
+  for (let index = 1; index < events.length; index += 1) {
+    if (events[index].sequence !== events[index - 1].sequence + 1) invalidProtocol();
+  }
+  const bytes = new TextEncoder().encode(JSON.stringify({ events })).byteLength;
+  if (bytes > PI_GATEWAY_EVENT_BATCH_MAX_BYTES) invalidProtocol();
+  return { events };
+}
+
+export function parsePiGatewaySourceEventBatchReceipt(value: unknown): PiGatewaySourceEventBatchReceipt {
+  if (!isRecord(value) || !exactKeys(value, ["receipts", "last_acked_source_sequence"]) || !Array.isArray(value.receipts)) {
+    throw new Error("pi_gateway_event_batch_receipt_invalid");
+  }
+  const lastSequence = value.last_acked_source_sequence;
+  if (!Number.isInteger(lastSequence) || (lastSequence as number) < 1 || (lastSequence as number) > 10_000_000) {
+    throw new Error("pi_gateway_event_batch_receipt_invalid");
+  }
+  const receipts = value.receipts.map((raw) => {
+    if (!isRecord(raw)) throw new Error("pi_gateway_event_batch_receipt_invalid");
+    const allowedKeys = new Set(["source_event_id", "sequence", "duplicate", "event_id", "usage_record_id"]);
+    if (
+      Object.keys(raw).some((key) => !allowedKeys.has(key)) ||
+      !Object.prototype.hasOwnProperty.call(raw, "source_event_id") ||
+      !Object.prototype.hasOwnProperty.call(raw, "sequence") ||
+      !Object.prototype.hasOwnProperty.call(raw, "duplicate")
+    ) throw new Error("pi_gateway_event_batch_receipt_invalid");
+    if (
+      typeof raw.source_event_id !== "string" || !/^[A-Za-z0-9._:-]{1,160}$/.test(raw.source_event_id) ||
+      !Number.isInteger(raw.sequence) || (raw.sequence as number) < 1 ||
+      (raw.sequence as number) > 10_000_000 || typeof raw.duplicate !== "boolean"
+    ) throw new Error("pi_gateway_event_batch_receipt_invalid");
+    for (const key of ["event_id", "usage_record_id"] as const) {
+      if (key in raw && (typeof raw[key] !== "string" || !raw[key] || raw[key].length > 64)) {
+        throw new Error("pi_gateway_event_batch_receipt_invalid");
+      }
+    }
+    return raw as unknown as PiGatewaySourceEventReceipt;
+  });
+  if (receipts.length < 1 || receipts[receipts.length - 1].sequence !== lastSequence) {
+    throw new Error("pi_gateway_event_batch_receipt_invalid");
+  }
+  return { receipts, last_acked_source_sequence: lastSequence as number };
 }
 
 /** Runtime validation mirror for the strict FastAPI claim response DTO. */

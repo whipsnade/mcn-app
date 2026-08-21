@@ -3,6 +3,8 @@ import { describe, expect, it } from "vitest";
 import {
   normalizePiGatewayAdapterCatalog,
   parsePiGatewayClaimResponse,
+  parsePiGatewaySourceEventBatch,
+  parsePiGatewaySourceEventBatchReceipt,
   parsePiGatewaySourceEvent,
 } from "../src/protocol.js";
 
@@ -51,5 +53,40 @@ describe("Pi Gateway protocol parser", () => {
         schemaDigest: "sha256:" + "a".repeat(64),
       },
     ]);
+  });
+
+  it("accepts only bounded contiguous same-attempt event batches", () => {
+    const first = { source_event_id: "attempt-1:1", sequence: 1, event_type: "message.start", payload: {} };
+    const second = { source_event_id: "attempt-1:2", sequence: 2, event_type: "message.end", payload: {} };
+    expect(parsePiGatewaySourceEventBatch({ events: [first, second] })).toEqual({ events: [first, second] });
+    expect(() => parsePiGatewaySourceEventBatch({
+      events: [first, { ...second, source_event_id: "attempt-2:2" }],
+    })).toThrow("pi_gateway_source_event_invalid");
+    expect(() => parsePiGatewaySourceEventBatch({
+      events: [first, { ...second, sequence: 3, source_event_id: "attempt-1:3" }],
+    })).toThrow("pi_gateway_source_event_invalid");
+    expect(() => parsePiGatewaySourceEventBatch({
+      events: Array.from({ length: 33 }, (_, index) => ({
+        source_event_id: `attempt-1:${index + 1}`,
+        sequence: index + 1,
+        event_type: "message.start",
+        payload: {},
+      })),
+    })).toThrow("pi_gateway_source_event_invalid");
+  });
+
+  it("fails closed on malformed or unstable batch receipts", () => {
+    expect(parsePiGatewaySourceEventBatchReceipt({
+      receipts: [{ source_event_id: "attempt-1:2", sequence: 2, duplicate: false, event_id: "event-2" }],
+      last_acked_source_sequence: 2,
+    })).toMatchObject({ last_acked_source_sequence: 2 });
+    expect(() => parsePiGatewaySourceEventBatchReceipt({
+      receipts: [{ source_event_id: "attempt-1:2", sequence: 2, duplicate: false, event_id: "event-2", extra: true }],
+      last_acked_source_sequence: 2,
+    })).toThrow("pi_gateway_event_batch_receipt_invalid");
+    expect(() => parsePiGatewaySourceEventBatchReceipt({
+      receipts: [{ source_event_id: "attempt-1:1", sequence: 1, duplicate: false }],
+      last_acked_source_sequence: 2,
+    })).toThrow("pi_gateway_event_batch_receipt_invalid");
   });
 });

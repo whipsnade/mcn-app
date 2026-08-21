@@ -6,6 +6,7 @@ from app.pi_gateway.contracts import (
     PiGatewayClaimResponse,
     PiGatewayInternalToolRequest,
     PiGatewaySourceEvent,
+    PiGatewaySourceEventBatch,
     PiGatewayTerminalRequest,
     PiGatewayProviderFailureMetadata,
     RuntimeSecretEnvelope,
@@ -148,6 +149,41 @@ def test_usage_event_is_a_bounded_internal_projection() -> None:
         )
 
 
+def test_source_event_batch_is_strict_bounded_and_contiguous() -> None:
+    events = [
+        PiGatewaySourceEvent.model_validate(
+            {
+                "source_event_id": f"attempt-batch:{sequence}",
+                "sequence": sequence,
+                "event_type": "message.start",
+                "payload": {},
+            }
+        )
+        for sequence in (1, 2)
+    ]
+    assert PiGatewaySourceEventBatch(events=events).events == events
+    with pytest.raises(ValidationError, match="pi_gateway_event_batch_attempt_mismatch"):
+        PiGatewaySourceEventBatch.model_validate(
+            {"events": [events[0], {**events[1].model_dump(), "source_event_id": "other:2"}]}
+        )
+    with pytest.raises(ValidationError, match="pi_gateway_event_batch_sequence_gap"):
+        PiGatewaySourceEventBatch.model_validate(
+            {"events": [events[0], {**events[1].model_dump(), "sequence": 3, "source_event_id": "attempt-batch:3"}]}
+        )
+    with pytest.raises(ValidationError):
+        PiGatewaySourceEventBatch.model_validate(
+            {
+                "events": [
+                    {
+                        "source_event_id": f"attempt-large:{sequence}",
+                        "sequence": sequence,
+                        "event_type": "message.delta",
+                        "payload": {"text": "x" * 16_000},
+                    }
+                    for sequence in range(1, 10)
+                ]
+            }
+        )
 def test_provider_failure_metadata_is_strict_and_terminal_only() -> None:
     metadata = PiGatewayProviderFailureMetadata.model_validate(
         {

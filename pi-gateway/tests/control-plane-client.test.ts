@@ -111,4 +111,27 @@ describe("Pi Gateway control-plane client", () => {
       failure_metadata: metadata,
     });
   });
+
+  it("posts bounded source events as one idempotent batch and validates its receipt", async () => {
+    let requestPath = "";
+    let requestBody = "";
+    const client = new ControlPlaneClient({
+      origin: "https://control.invalid",
+      gatewayId: "gw-1",
+      internalSecret: "gateway-secret",
+      fetchImpl: async (input, init) => {
+        requestPath = new URL(String(input)).pathname;
+        requestBody = String(init?.body);
+        return new Response(JSON.stringify({
+          receipts: [{ source_event_id: "attempt-1:1", sequence: 1, duplicate: false, event_id: "event-1" }],
+          last_acked_source_sequence: 1,
+        }), { status: 200 });
+      },
+    });
+    const event = { source_event_id: "attempt-1:1", sequence: 1, event_type: "message.start", payload: {} };
+    await expect(client.sendEventBatch("run-1", [event], "lease-token-that-is-long-enough-123"))
+      .resolves.toMatchObject({ last_acked_source_sequence: 1 });
+    expect(requestPath).toBe("/api/v1/internal/pi-gateway/v1/runs/run-1/events/batch");
+    expect(JSON.parse(requestBody)).toEqual({ events: [event] });
+  });
 });
