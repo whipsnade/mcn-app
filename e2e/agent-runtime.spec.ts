@@ -493,7 +493,7 @@ test('without thinking events renders a non-expandable processing row', async ({
 // 4. 暂停与恢复
 // --------------------------------------------------------------------------- //
 
-test('pauses an active run with the input pause button', async ({ page }) => {
+test('cancels an active run with the input cancellation button', async ({ page }) => {
   const phone = await uniquePhone();
   const sessionId = 's-pause';
   const newSession = sessionJson(sessionId, '暂停会话');
@@ -552,10 +552,10 @@ test('pauses an active run with the input pause button', async ({ page }) => {
   const runCard = page.getByRole('region', { name: '执行卡' }).first();
   await expect(runCard.getByText('执行中', { exact: true })).toBeVisible();
 
-  // 输入区的暂停按钮（与 Run 卡头部暂停按钮并列，以 form 作用域区分）。
-  const inputPause = page.locator('form[aria-label="发送消息"]').getByRole('button', { name: '暂停' });
-  await expect(inputPause).toBeVisible();
-  await inputPause.click();
+  // 输入区的取消按钮（与 Run 卡头部取消按钮并列，以 form 作用域区分）。
+  const inputCancel = page.locator('form[aria-label="发送消息"]').getByRole('button', { name: '取消任务' });
+  await expect(inputCancel).toBeVisible();
+  await inputCancel.click();
 
   phase = 'cancelled';
   // 暂停后 Run 终态：输入恢复为「发送」按钮，Run 卡折叠为「已取消」。
