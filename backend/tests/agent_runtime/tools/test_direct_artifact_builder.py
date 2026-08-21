@@ -75,6 +75,35 @@ def insight_model_input() -> dict:
     }
 
 
+def analysis_report_model_input() -> dict:
+    return {
+        "title": "长尾营销报告",
+        "subject_type": "mixed",
+        "scope": {"brand": "示例品牌", "platforms": ["xiaohongshu"]},
+        "blocks": [{
+            "block_type": "typed_table",
+            "id": "creators",
+            "title": "达人",
+            "columns": [{"key": "name", "label": "名称", "type": "string"}],
+            "rows": [["达人 A"]],
+        }],
+        "fulfillment": [{
+            "key": "creators",
+            "requested_min": 1,
+            "actual_count": 1,
+            "status": "complete",
+            "reason": "真实返回",
+        }],
+        "availability": {"blocks": {"status": "complete", "reason_codes": []}},
+        "limitations": [],
+        "methodology_input": {
+            "data_as_of": "2026-01-15T12:00:00",
+            "source_names": ["DataTap"],
+            "notes": [],
+        },
+    }
+
+
 async def _make_run(db_session, user_id: str, session_id: str, *, allow: list[str]) -> AgentRun:
     now = _now()
     run = AgentRun(
@@ -257,6 +286,30 @@ async def test_direct_builder_rejects_contract_not_in_snapshot(db_session, user_
 
     assert result.status == "failed"
     assert result.error_type == "artifact_contract_not_allowed"
+
+
+@pytest.mark.asyncio
+async def test_direct_builder_accepts_analysis_report_without_evidence(db_session, user_factory) -> None:
+    user = await user_factory()
+    session = await _make_session(db_session, user.id)
+    run = await _make_run(db_session, user.id, session.id, allow=["analysis_report_v1"])
+
+    result = await BuildArtifactDraftTool(db_session).execute(
+        _ctx(user.id, session.id, run.id),
+        BuildArtifactDraftArgs(
+            artifact_type="analysis_report_v1",
+            payload=analysis_report_model_input(),
+        ),
+    )
+
+    assert result.status == "success"
+    revision = await db_session.scalar(
+        select(ArtifactDraftRevision).where(ArtifactDraftRevision.run_id == run.id)
+    )
+    assert revision is not None
+    assert revision.schema_version == "analysis_report_v1"
+    assert revision.payload_json["module"] == "report"
+    assert revision.payload_json["blocks"][0]["rows"] == [["达人 A"]]
 
 
 @pytest.mark.asyncio

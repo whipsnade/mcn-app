@@ -256,6 +256,8 @@ class AdminRuntimeConfigItem(BaseModel):
     status: Literal["draft", "active", "retired"]
     runtime_backend: Literal["current", "pi"]
     runtime_contract_version: str
+    environment: Literal["development", "staging", "production"] = "production"
+    completion_mode: Literal["formal_analysis", "interaction"] = "formal_analysis"
     model: dict[str, Any]
     datatap: dict[str, Any]
     limits: dict[str, Any]
@@ -269,6 +271,8 @@ class AdminRuntimeConfigItem(BaseModel):
 class AdminRuntimeConfigCreate(BaseModel):
     tenant_id: str
     runtime_backend: Literal["current", "pi"]
+    environment: Literal["development", "staging", "production"] = "production"
+    completion_mode: Literal["formal_analysis", "interaction"] = "formal_analysis"
     model: dict[str, Any]
     datatap: dict[str, Any]
     limits: dict[str, int | float]

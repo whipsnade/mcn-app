@@ -23,6 +23,7 @@ from app.agent_runtime.models import (
     AgentToolCall,
     EvidenceItem,
 )
+from app.agent_runtime.state import RunStatus
 from app.billing.models import TenantWalletTransaction
 from app.pi_gateway.completion import CompletionValidator
 
@@ -49,7 +50,15 @@ async def _assistant(db_session, run, text: str = "最终结论") -> None:
     await db_session.flush()
 
 
-async def _publish_brand_report(db_session, run, *, source_run_id: str | None = None) -> None:
+async def _publish_brand_report(
+    db_session,
+    run,
+    *,
+    source_run_id: str | None = None,
+    schema_version: str = "brand_report_v3",
+    module: str = "brand",
+    parent_artifact_id: str | None = None,
+) -> None:
     now = _now()
     artifact_id = str(uuid4())
     draft_id = str(uuid4())
@@ -77,9 +86,10 @@ async def _publish_brand_report(db_session, run, *, source_run_id: str | None = 
             id=artifact_id,
             session_id=run.session_id,
             user_id=run.user_id,
-            module="brand",
-            artifact_type="brand_report_v3",
-            artifact_key=f"brand-report-{artifact_id}",
+            module=module,
+            artifact_type=schema_version,
+            parent_artifact_id=parent_artifact_id,
+            artifact_key=f"{module}-report-{artifact_id}",
             status="published",
             latest_version=1,
             activity_sequence=0,
@@ -107,7 +117,7 @@ async def _publish_brand_report(db_session, run, *, source_run_id: str | None = 
             artifact_id=artifact_id,
             run_id=source_run_id or run.id,
             revision=1,
-            schema_version="brand_report_v3",
+            schema_version=schema_version,
             payload_json={"data_status": "complete"},
             evidence_refs_json=[],
             payload_hash="a" * 64,
@@ -192,7 +202,7 @@ async def _publish_brand_report(db_session, run, *, source_run_id: str | None = 
             version=1,
             source_run_id=source_run_id or run.id,
             source_draft_revision_id=revision_id,
-            schema_version="brand_report_v3",
+            schema_version=schema_version,
             payload_json={"data_status": "complete"},
             evidence_refs_json=[],
             lineage_snapshot_json=lineage_snapshot,
@@ -220,7 +230,7 @@ async def _publish_brand_report(db_session, run, *, source_run_id: str | None = 
 
 
 @pytest.mark.asyncio
-async def test_assistant_without_artifact_can_complete(db_session, user_factory):
+async def test_normal_analysis_without_main_artifact_cannot_complete(db_session, user_factory):
     user = await user_factory()
     snapshot = {
         "allowed_artifact_contracts": ["brand_report_v3", "campaign_report_v3"],
@@ -230,8 +240,62 @@ async def test_assistant_without_artifact_can_complete(db_session, user_factory)
 
     result = await CompletionValidator(db_session).validate(run)
 
+    assert not result.ok
+    assert result.code == "pi_gateway_main_artifact_missing"
+    assert result.artifact_version_id is None
+
+
+@pytest.mark.asyncio
+async def test_clarification_without_artifact_can_complete(db_session, user_factory):
+    user = await user_factory()
+    run, _attempt, _tenant_id = await _run(db_session, user)
+    run.status = RunStatus.CLARIFICATION_REQUESTED
+    await _assistant(db_session, run, text="请确认分析周期")
+
+    result = await CompletionValidator(db_session).validate(run)
+
     assert result.ok
     assert result.artifact_version_id is None
+
+
+@pytest.mark.asyncio
+async def test_interaction_run_without_artifact_can_complete(db_session, user_factory):
+    """交互协议 Run 不被报告门禁误判，但仍经过通用生命周期校验。"""
+    user = await user_factory()
+    run, _attempt, _tenant_id = await _run(
+        db_session,
+        user,
+        snapshot={
+            "completion_mode": "interaction",
+            "allowed_artifact_contracts": [],
+        },
+    )
+    await _assistant(db_session, run, text="该问题超出当前交互范围")
+
+    result = await CompletionValidator(db_session).validate(run)
+
+    assert result.ok
+    assert result.artifact_version_id is None
+
+
+@pytest.mark.asyncio
+async def test_prompt_snapshot_cannot_change_formal_completion_mode(
+    db_session, user_factory
+):
+    """completion_mode 只能来自冻结 RuntimeSnapshot，不能由用户输入快照伪造。"""
+    user = await user_factory()
+    run, _attempt, _tenant_id = await _run(
+        db_session,
+        user,
+        snapshot={"allowed_artifact_contracts": []},
+    )
+    run.prompt_snapshot_json = {"completion_mode": "interaction"}
+    await _assistant(db_session, run)
+
+    result = await CompletionValidator(db_session).validate(run)
+
+    assert not result.ok
+    assert result.code == "pi_gateway_main_artifact_missing"
 
 
 @pytest.mark.asyncio
@@ -262,8 +326,86 @@ async def test_historical_artifact_cannot_satisfy_current_run(db_session, user_f
 
     result = await CompletionValidator(db_session).validate(run)
 
-    assert result.ok
+    assert not result.ok
+    assert result.code == "pi_gateway_main_artifact_missing"
     assert result.artifact_version_id is None
+
+
+@pytest.mark.asyncio
+async def test_analysis_report_main_version_allows_completion(db_session, user_factory):
+    user = await user_factory()
+    snapshot = {"allowed_artifact_contracts": ["analysis_report_v1"]}
+    run, _attempt, _tenant_id = await _run(db_session, user, snapshot=snapshot)
+    await _assistant(db_session, run)
+    await _publish_brand_report(db_session, run, schema_version="analysis_report_v1", module="report")
+
+    result = await CompletionValidator(db_session).validate(run)
+
+    assert result.ok
+    assert result.artifact_version_id is not None
+
+
+@pytest.mark.asyncio
+async def test_child_insight_without_top_level_main_report_cannot_complete(
+    db_session, user_factory
+):
+    user = await user_factory()
+    snapshot = {"allowed_artifact_contracts": ["brand_report_v3", "insight_board_v1"]}
+    run, _attempt, _tenant_id = await _run(db_session, user, snapshot=snapshot)
+    await _assistant(db_session, run)
+    await _publish_brand_report(db_session, run)
+    artifact = await db_session.scalar(
+        select(AgentArtifact).where(AgentArtifact.session_id == run.session_id)
+    )
+    assert artifact is not None
+    artifact.parent_artifact_id = artifact.id
+    await db_session.flush()
+
+    result = await CompletionValidator(db_session).validate(run)
+
+    assert not result.ok
+    assert result.code == "pi_gateway_main_artifact_missing"
+
+
+@pytest.mark.asyncio
+async def test_kol_detail_child_artifact_can_complete_without_top_level_main_report(
+    db_session, user_factory
+):
+    user = await user_factory()
+    snapshot = {"allowed_artifact_contracts": ["brand_report_v3"]}
+    run, _attempt, _tenant_id = await _run(db_session, user, snapshot=snapshot)
+    run.profile_name = "kol_detail_v1"
+    await _assistant(db_session, run, text="达人详情结论")
+    parent_artifact_id = str(uuid4())
+    now = _now()
+    db_session.add(
+        AgentArtifact(
+            id=parent_artifact_id,
+            session_id=run.session_id,
+            user_id=run.user_id,
+            module="selection",
+            artifact_type="kol_selection_v3",
+            artifact_key=f"parent-{parent_artifact_id}",
+            status="published",
+            latest_version=1,
+            activity_sequence=0,
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    await db_session.flush()
+    await _publish_brand_report(
+        db_session,
+        run,
+        schema_version="brand_report_v3",
+        module="kol-detail",
+        parent_artifact_id=parent_artifact_id,
+    )
+
+    result = await CompletionValidator(db_session).validate(run)
+
+    assert result.ok
+    assert result.artifact_version_id is not None
 
 
 @pytest.mark.asyncio
@@ -377,6 +519,10 @@ async def test_unknown_tool_call_is_warning_but_does_not_trigger_recovery(
 ):
     user = await user_factory()
     run, attempt, _tenant_id = await _run(db_session, user)
+    # This test isolates result_unknown warning semantics.  A utility Run is
+    # intentionally text-only; normal user analysis Runs are covered by the
+    # explicit main Artifact completion tests above.
+    run.profile_name = "utility_v1"
     await _assistant(db_session, run)
     now = _now()
     step = AgentStep(

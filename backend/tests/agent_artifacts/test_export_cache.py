@@ -8,16 +8,18 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime
+from hashlib import sha256
 from uuid import uuid4
 
 import pytest
 from sqlalchemy import select
 
 from app.agent_artifacts.export_cache import ExportedFile, ExportCacheService, sanitize_filename
-from app.agent_artifacts.exporters import ArtifactExportUnsupported
+from app.agent_artifacts.exporters import ArtifactExportUnsupported, workbook_layout_digest
 from app.agent_artifacts.models import ArtifactExport
 from app.agent_artifacts.router import ExportCacheService as _  # noqa: F401
 
+from tests.agent_artifacts.test_analysis_report_export import build_analysis_report_payload
 from tests.agent_artifacts.test_payloads import build_brand_dict, build_kol_selection_dict
 
 
@@ -38,7 +40,15 @@ class _CountingRenderer:
         return b"PK-export-content"
 
 
-async def _make_version(db_session, payload: dict, *, user_id: str = "u-1") -> str:
+async def _make_version(
+    db_session,
+    payload: dict,
+    *,
+    user_id: str = "u-1",
+    schema_version: str = "brand_report_v3",
+    module: str = "brand",
+    artifact_type: str | None = None,
+) -> str:
     import json
     from datetime import UTC, datetime
     from uuid import uuid4
@@ -66,8 +76,8 @@ async def _make_version(db_session, payload: dict, *, user_id: str = "u-1") -> s
     db_session.add(run)
     await db_session.flush()
     artifact = AgentArtifact(
-        id=str(uuid4()), session_id=session.id, user_id=user_id, module="brand",
-        artifact_type="brand_report_v3", parent_artifact_id=None,
+        id=str(uuid4()), session_id=session.id, user_id=user_id, module=module,
+        artifact_type=artifact_type or schema_version, parent_artifact_id=None,
         artifact_key="brand/x-1", status="published", latest_version=1,
         activity_sequence=0, created_at=now, updated_at=now,
     )
@@ -82,7 +92,7 @@ async def _make_version(db_session, payload: dict, *, user_id: str = "u-1") -> s
     await db_session.flush()
     revision = ArtifactDraftRevision(
         id=str(uuid4()), draft_id=draft.id, artifact_id=artifact.id,
-        run_id=run.id, revision=1, schema_version="brand_report_v3",
+        run_id=run.id, revision=1, schema_version=schema_version,
         payload_json=json.loads(json.dumps(payload, default=str)),
         payload_hash="h" * 64, created_at=now,
     )
@@ -91,7 +101,7 @@ async def _make_version(db_session, payload: dict, *, user_id: str = "u-1") -> s
     version = AgentArtifactVersion(
         id=str(uuid4()), artifact_id=artifact.id, version=1,
         source_run_id=run.id, source_draft_revision_id=revision.id,
-        schema_version="brand_report_v3",
+        schema_version=schema_version,
         payload_json=json.loads(json.dumps(payload, default=str)),
         data_status="complete", created_at=now,
     )
@@ -1002,3 +1012,63 @@ async def test_get_or_build_without_lineage_snapshot_keeps_legacy_path(
         lineage_snapshot=None,
     )
     assert result.content.startswith(b"PK\x03\x04")
+
+
+async def test_analysis_report_cache_key_includes_exporter_and_layout(
+    db_session, tmp_path, user_factory
+) -> None:
+    user = await user_factory()
+    payload = build_analysis_report_payload()
+    version_id = await _make_version(
+        db_session,
+        payload,
+        user_id=user.id,
+        schema_version="analysis_report_v1",
+        module="report",
+    )
+    from app.agent_artifacts.payloads.analysis_report import AnalysisReportV1
+
+    report = AnalysisReportV1.model_validate(payload)
+    layout_digest = workbook_layout_digest(report.workbook)
+    changed_layout_digest = workbook_layout_digest(
+        report.workbook.model_copy(update={"sheets": ()})
+    )
+    renderer = _CountingRenderer(payload)
+    service = ExportCacheService(db_session, storage_dir=str(tmp_path), renderer=renderer)
+    first = await service.get_or_build(
+        artifact_version_id=version_id,
+        schema_version="analysis_report_v1",
+        payload=payload,
+        filename="report.xlsx",
+        exporter_version="analysis-report-v1.0.0",
+        layout_digest=layout_digest,
+    )
+    second = await service.get_or_build(
+        artifact_version_id=version_id,
+        schema_version="analysis_report_v1",
+        payload=payload,
+        filename="report.xlsx",
+        exporter_version="analysis-report-v1.0.0",
+        layout_digest=layout_digest,
+    )
+    third = await service.get_or_build(
+        artifact_version_id=version_id,
+        schema_version="analysis_report_v1",
+        payload=payload,
+        filename="report.xlsx",
+        exporter_version="analysis-report-v1.0.0",
+        layout_digest=changed_layout_digest,
+    )
+    assert first.sha256 == second.sha256
+    assert third.sha256 == first.sha256
+    assert renderer.call_count == 2
+    rows = (
+        await db_session.scalars(
+            select(ArtifactExport).where(ArtifactExport.artifact_version_id == version_id)
+        )
+    ).all()
+    expected = {
+        sha256(f"{version_id}analysis-report-v1.0.0{digest}".encode()).hexdigest()
+        for digest in (layout_digest, changed_layout_digest)
+    }
+    assert {row.template_version for row in rows} == expected

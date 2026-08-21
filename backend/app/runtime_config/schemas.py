@@ -8,6 +8,9 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, SecretStr, field_validator, model_validator
 
+from app.core.credential_scanner import contains_credential
+from app.marketing_skills.snapshot import SkillManifest
+
 
 class FrozenDict(dict[str, Any]):
     """JSON-shaped mapping that cannot be mutated after snapshot creation."""
@@ -44,6 +47,10 @@ class RuntimeConfigSnapshot(BaseModel):
     config_version_id: str
     runtime_contract_version: Literal["marketing_runtime_v1"]
     runtime_backend: Literal["current", "pi"]
+    environment: Literal["development", "staging", "production"] = "production"
+    # Server-owned completion semantic.  This is not an Artifact type and is
+    # never inferred from user text, model output, or Builder calls.
+    completion_mode: Literal["formal_analysis", "interaction"] = "formal_analysis"
     model: dict[str, str | int | float | None]
     datatap: dict[str, object]
     capability_pack: dict[str, object]
@@ -59,6 +66,7 @@ class RuntimeConfigSnapshot(BaseModel):
     required_artifact_contract: str | None = None
     capability_pack_version: str | None = None
     capability_pack_manifest_digest: str | None = None
+    skill_manifest: SkillManifest | None = None
     limits: dict[str, int | float]
     # ``price_table`` is a nested, public snapshot contract.  Secrets remain
     # forbidden recursively; values are integer micros (or bounded labels).
@@ -129,8 +137,9 @@ class RuntimeConfigSnapshot(BaseModel):
             self.capability_pack,
             self.limits,
             self.billing,
+            self.skill_manifest.model_dump(mode="json") if self.skill_manifest else {},
         ):
-            if _contains_forbidden_key(container, forbidden) or _contains_credential_value(container):
+            if _contains_forbidden_key(container, forbidden) or contains_credential(container):
                 raise ValueError("runtime_snapshot_secret_field")
         nested_pack_version = self.capability_pack.get("pack_version")
         if (

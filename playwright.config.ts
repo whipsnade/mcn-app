@@ -44,7 +44,7 @@ export default defineConfig({
   ],
   webServer: [
     {
-      command: 'backend/.venv/bin/uvicorn app.main:app --app-dir backend --host 127.0.0.1 --port 8000',
+      command: `${process.env.BACKEND_PYTHON ?? 'backend/.venv/bin/python'} -m uvicorn app.main:app --app-dir backend --host 127.0.0.1 --port 8000`,
       url: 'http://127.0.0.1:8000/healthz',
       env: backendTestEnv,
       reuseExistingServer: false,

@@ -26,6 +26,24 @@ def _cipher() -> SecretCipher:
     return SecretCipher(master_keys={"v1": b"t" * 32}, active_key_version="v1")
 
 
+def test_runtime_snapshot_rejects_expanded_credential_shapes() -> None:
+    from app.runtime_config.schemas import RuntimeConfigSnapshot
+
+    payload = {
+        "config_version_id": "config-1",
+        "runtime_contract_version": "marketing_runtime_v1",
+        "runtime_backend": "pi",
+        "model": {"origin": "AKIAIOSFODNN7EXAMPLE"},
+        "datatap": {},
+        "capability_pack": {},
+        "limits": {},
+        "billing": {},
+    }
+
+    with pytest.raises(ValueError, match="runtime_snapshot_secret_field"):
+        RuntimeConfigSnapshot.model_validate(payload)
+
+
 @pytest.mark.asyncio
 async def test_tenant_runtime_config_snapshot_is_secret_free_and_switchable(
     db_session, user_factory
@@ -56,9 +74,11 @@ async def test_tenant_runtime_config_snapshot_is_secret_free_and_switchable(
     assert "datatap-secret" not in str(dumped)
     assert dumped["model"]["masked_origin"] == "https://model.example.test"
     assert dumped["profile_name"] == "session_analyst_v1"
+    assert dumped["completion_mode"] == "formal_analysis"
     assert dumped["required_artifact_contract"] is None
     assert dumped["artifact_contract_mode"] is None
     assert dumped["allowed_artifact_contracts"] == [
+        "analysis_report_v1",
         "brand_report_v3",
         "campaign_report_v3",
         "insight_board_v1",
@@ -110,6 +130,55 @@ async def test_tenant_runtime_config_snapshot_is_secret_free_and_switchable(
 
 
 @pytest.mark.asyncio
+async def test_runtime_config_persists_nonproduction_environment_for_skill_resolution(
+    db_session, user_factory
+) -> None:
+    user = await user_factory()
+    tenant = await db_session.scalar(select(Tenant).where(Tenant.id.is_not(None)))
+    service = RuntimeConfigService(db_session, cipher=_cipher())
+    version = await service.create_tenant_version(
+        tenant.id,
+        created_by=user.id,
+        runtime_backend="pi",
+        model={"name": "staging-model", "masked_origin": "https://model.example"},
+        datatap={"service": "social", "schema_digest": "digest"},
+        limits={"max_decisions": 10},
+        billing={"mcp_call_points": 10},
+        secrets=_bundle(),
+        environment="staging",
+    )
+
+    snapshot = service._snapshot_from_config(version)
+
+    assert snapshot.environment == "staging"
+    assert version.config_json["environment"] == "staging"
+
+
+@pytest.mark.asyncio
+async def test_runtime_config_freezes_server_owned_completion_mode(
+    db_session, user_factory
+) -> None:
+    user = await user_factory()
+    tenant = await db_session.scalar(select(Tenant).where(Tenant.id.is_not(None)))
+    service = RuntimeConfigService(db_session, cipher=_cipher())
+    version = await service.create_tenant_version(
+        tenant.id,
+        created_by=user.id,
+        runtime_backend="current",
+        model={"name": "interaction-model", "masked_origin": "test"},
+        datatap={"service": "social", "schema_digest": "digest"},
+        limits={"max_decisions": 10},
+        billing={"mcp_call_points": 10},
+        completion_mode="interaction",
+    )
+
+    snapshot = service._snapshot_from_config(version)
+
+    assert snapshot.completion_mode == "interaction"
+    assert version.config_json["completion_mode"] == "interaction"
+
+
+@pytest.mark.asyncio
 async def test_new_run_snapshot_uses_capability_allowlist_not_profile_required_contract(
     db_session, user_factory
 ) -> None:
@@ -134,7 +203,9 @@ async def test_new_run_snapshot_uses_capability_allowlist_not_profile_required_c
 
     assert snapshot.required_artifact_contract is None
     assert snapshot.artifact_contract_mode is None
+    assert snapshot.completion_mode == "formal_analysis"
     assert snapshot.allowed_artifact_contracts == (
+        "analysis_report_v1",
         "brand_report_v3",
         "campaign_report_v3",
         "insight_board_v1",
@@ -160,6 +231,104 @@ async def test_runtime_config_does_not_persist_profile_artifact_mapping(
         billing={"mcp_call_points": 10},
     )
     assert "profile_artifact_contracts" not in version.config_json
+
+
+@pytest.mark.asyncio
+async def test_new_snapshot_drops_legacy_required_contract_without_rewriting_config(
+    db_session, user_factory
+) -> None:
+    user = await user_factory()
+    tenant = await db_session.scalar(select(Tenant).where(Tenant.id.is_not(None)))
+    service = RuntimeConfigService(db_session, cipher=_cipher())
+    version = await service.create_tenant_version(
+        tenant.id,
+        created_by=user.id,
+        runtime_backend="current",
+        model={"name": "test-model", "masked_origin": "test"},
+        datatap={"service": "social", "schema_digest": "digest"},
+        limits={"max_decisions": 10},
+        billing={"mcp_call_points": 10},
+    )
+    version.config_json = {
+        **version.config_json,
+        "profile_name": "session_analyst_v1",
+        "artifact_contract_mode": "required",
+        "required_artifact_contract": "brand_report_v3",
+    }
+    await db_session.flush()
+
+    snapshot = service._snapshot_from_config(version, profile_name="session_analyst_v1")
+
+    assert snapshot.artifact_contract_mode is None
+    assert snapshot.required_artifact_contract is None
+    assert version.config_json["artifact_contract_mode"] == "required"
+    assert version.config_json["required_artifact_contract"] == "brand_report_v3"
+
+
+@pytest.mark.asyncio
+async def test_historical_snapshot_is_read_without_rewriting_legacy_contract(
+    db_session, user_factory
+) -> None:
+    user = await user_factory()
+    tenant = await db_session.scalar(select(Tenant).where(Tenant.id.is_not(None)))
+    service = RuntimeConfigService(db_session, cipher=_cipher())
+    version = await service.create_tenant_version(
+        tenant.id,
+        created_by=user.id,
+        runtime_backend="current",
+        model={"name": "test-model", "masked_origin": "test"},
+        datatap={"service": "social", "schema_digest": "digest"},
+        limits={"max_decisions": 10},
+        billing={"mcp_call_points": 10},
+    )
+    capability = version.config_json["capability_pack"]
+    historical_payload = {
+        **version.config_json,
+        "profile_name": "session_analyst_v1",
+        "artifact_contract_mode": "required",
+        "required_artifact_contract": "brand_report_v3",
+        "capability_pack_version": capability["pack_version"],
+        "capability_pack_manifest_digest": capability["manifest_digest"],
+        "allowed_artifact_contracts": ["brand_report_v3"],
+    }
+    now = datetime.now(UTC).replace(tzinfo=None)
+    session = AgentSession(
+        id=str(uuid4()),
+        user_id=user.id,
+        tenant_id=tenant.id,
+        title="legacy snapshot",
+        status="active",
+        created_at=now,
+        updated_at=now,
+    )
+    run = AgentRun(
+        id=str(uuid4()),
+        session_id=session.id,
+        user_id=user.id,
+        tenant_id=tenant.id,
+        runtime_backend="current",
+        runtime_config_version_id=version.id,
+        runtime_config_snapshot_json=historical_payload,
+        profile_name="session_analyst_v1",
+        profile_version="v1",
+        model="test-model",
+        run_kind="user",
+        visibility="user",
+        status="queued",
+        created_at=now,
+        queued_at=now,
+    )
+    db_session.add(session)
+    await db_session.flush()
+    db_session.add(run)
+    await db_session.flush()
+    before = dict(run.runtime_config_snapshot_json)
+
+    snapshot = await service.snapshot_for_existing_run(run)
+
+    assert snapshot.required_artifact_contract == "brand_report_v3"
+    assert snapshot.artifact_contract_mode == "required"
+    assert run.runtime_config_snapshot_json == before
 
 
 @pytest.mark.asyncio

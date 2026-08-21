@@ -11,6 +11,7 @@ import TenantSelect from './TenantSelect';
 
 type DraftForm = {
   runtime_backend: 'current' | 'pi';
+  environment: 'development' | 'staging' | 'production';
   modelName: string;
   modelProvider: string;
   modelMaskedOrigin: string;
@@ -26,6 +27,7 @@ type DraftForm = {
 
 const EMPTY_DRAFT: DraftForm = {
   runtime_backend: 'pi',
+  environment: 'production',
   modelName: '',
   modelProvider: '',
   modelMaskedOrigin: '',
@@ -98,6 +100,7 @@ export default function RuntimeConfigAdmin({ tenantId: initialTenantId }: { tena
       const payload: Record<string, unknown> = {
         tenant_id: tenantId,
         runtime_backend: draft.runtime_backend,
+        environment: draft.environment,
         model: {
           name: draft.modelName.trim(),
           provider: draft.modelProvider.trim(),
@@ -195,7 +198,7 @@ export default function RuntimeConfigAdmin({ tenantId: initialTenantId }: { tena
                           {STATUS_LABEL[item.status]}
                         </span>
                       </td>
-                      <td className="p-2">{item.runtime_backend}</td>
+                      <td className="p-2">{item.runtime_backend} · {item.environment}</td>
                       <td className="p-2">{item.runtime_contract_version}</td>
                       <td className="p-2">
                         {item.secret_refs.length > 0
@@ -250,6 +253,19 @@ export default function RuntimeConfigAdmin({ tenantId: initialTenantId }: { tena
             >
               <option value="pi">pi</option>
               <option value="current">current</option>
+            </select>
+          </div>
+          <div>
+            <label htmlFor="rc-environment" className="mb-1 block text-xs font-bold text-slate-600">运行环境</label>
+            <select
+              id="rc-environment"
+              value={draft.environment}
+              onChange={event => patchDraft({ environment: event.target.value as DraftForm['environment'] })}
+              className="w-full rounded-lg border border-slate-200 px-3 py-2 text-xs"
+            >
+              <option value="development">development</option>
+              <option value="staging">staging</option>
+              <option value="production">production</option>
             </select>
           </div>
           <div>

@@ -24,7 +24,7 @@ _SENSITIVE_CONTENT_PATTERNS = (
         re.IGNORECASE,
     ),
 )
-_EXPECTED_CONTRACT_TYPES = frozenset(
+_BASE_CONTRACT_TYPES = frozenset(
     {"brand_report_v3", "campaign_report_v3", "kol_selection_v3"}
 )
 MARKETING_RUNTIME_CONTRACT_VERSION = "marketing_runtime_v1"
@@ -57,6 +57,7 @@ class CapabilityPackLoader:
             raise CapabilityPackError("pack_name_invalid")
         if payload["runtime_contract_version"] != MARKETING_RUNTIME_CONTRACT_VERSION:
             raise CapabilityPackError("manifest_runtime_contract_unsupported")
+        pack_version = self._required_text(payload, "pack_version")
         root_policy = payload["root_policy"]
         if not isinstance(root_policy, dict):
             raise CapabilityPackError("manifest_root_policy_invalid")
@@ -67,13 +68,15 @@ class CapabilityPackLoader:
             raise CapabilityPackError("manifest_skill_duplicate")
         return CapabilityPackSnapshot(
             pack_name=payload["pack_name"],
-            pack_version=self._required_text(payload, "pack_version"),
+            pack_version=pack_version,
             runtime_contract_version=self._required_text(payload, "runtime_contract_version"),
             manifest_digest=_digest_json(payload),
             root_policy=policy,
             root_policy_digest=policy_digest,
             skills=skills,
-            artifact_contracts=self._contracts(root, payload["artifact_contracts"]),
+            artifact_contracts=self._contracts(
+                root, payload["artifact_contracts"], pack_version=pack_version
+            ),
             builder_versions=self._string_map(payload["builder_versions"]),
             exporter_versions=self._string_map(payload["exporter_versions"]),
         )
@@ -168,8 +171,11 @@ class CapabilityPackLoader:
             artifact_contract=self._required_text(value, "artifact_contract"),
         )
 
-    def _contracts(self, root: Path, values: list[Any]) -> tuple[dict[str, str], ...]:
-        if len(values) != 3:
+    def _contracts(self, root: Path, values: list[Any], *, pack_version: str) -> tuple[dict[str, str], ...]:
+        expected_types = _BASE_CONTRACT_TYPES | (
+            {"analysis_report_v1"} if pack_version == "1.1.0" else set()
+        )
+        if len(values) != len(expected_types):
             raise CapabilityPackError("manifest_contracts_invalid")
         contracts: list[dict[str, str]] = []
         for value in values:
@@ -184,7 +190,7 @@ class CapabilityPackLoader:
             if not isinstance(contract, dict) or contract.get("artifact_type") != value["artifact_type"] or contract.get("schema_version") != value["schema_version"]:
                 raise CapabilityPackError("manifest_contract_invalid")
             contracts.append({"artifact_type": value["artifact_type"], "schema_version": value["schema_version"], "digest": digest, "content": content})
-        if {item["artifact_type"] for item in contracts} != _EXPECTED_CONTRACT_TYPES:
+        if {item["artifact_type"] for item in contracts} != expected_types:
             raise CapabilityPackError("manifest_contracts_invalid")
         return tuple(contracts)
 

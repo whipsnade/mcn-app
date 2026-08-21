@@ -86,6 +86,8 @@ def build_artifact_key(
             f"insight:{parent_artifact_version_id}:"
             f"{_stable_hash(_normalize(question or ''))}"
         )
+    if module == "report":
+        return f"report:{_stable_hash(_normalize_value(scope))}"
     raise ValueError(f"unknown artifact module: {module!r}")
 
 

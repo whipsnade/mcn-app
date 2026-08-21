@@ -374,7 +374,8 @@ class ArtifactExport(Base):
         ForeignKey("agent_artifact_versions.id", ondelete="CASCADE"),
         nullable=False,
     )
-    template_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    # 标准 Artifact 使用 schema_version；workbook_v1 使用完整 SHA-256 缓存键。
+    template_version: Mapped[str] = mapped_column(String(191), nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False)
     filename: Mapped[str | None] = mapped_column(String(255), nullable=True)
     storage_key: Mapped[str | None] = mapped_column(String(255), nullable=True)

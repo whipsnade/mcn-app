@@ -32,7 +32,10 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_artifacts.exporters import ArtifactExportUnsupported, export_artifact
+from app.agent_artifacts.exporters.analysis_report import ANALYSIS_REPORT_EXPORTER_VERSION
+from app.agent_artifacts.exporters.workbook import workbook_layout_digest
 from app.agent_artifacts.models import ArtifactExport
+from app.agent_artifacts.payloads.analysis_report import AnalysisReportV1
 from app.core.config import get_settings
 
 # 导出文件名清洗：只保留安全字符，防止路径穿越/注入。
@@ -91,8 +94,34 @@ class ExportedFile:
     content: bytes
 
 
-def _template_version_for(schema_version: str) -> str:
-    """模板版本：schema_version 即模板标识（v3 族各自固定）。"""
+def export_cache_key(
+    *,
+    artifact_version_id: str,
+    schema_version: str,
+    payload: dict[str, Any] | None = None,
+    exporter_version: str | None = None,
+    layout_digest: str | None = None,
+) -> str:
+    """生成导出缓存身份；标准 Artifact 保持历史 schema_version 语义。"""
+    if schema_version == "analysis_report_v1":
+        exporter_version = exporter_version or ANALYSIS_REPORT_EXPORTER_VERSION
+        if layout_digest is None:
+            if payload is None:
+                raise ArtifactExportUnsupported(
+                    schema_version, reason="no published payload for layout digest"
+                )
+            layout_digest = workbook_layout_digest(
+                AnalysisReportV1.model_validate(payload).workbook
+            )
+        return hashlib.sha256(
+            f"{artifact_version_id}{exporter_version}{layout_digest}".encode("utf-8")
+        ).hexdigest()
+    if exporter_version is not None or layout_digest is not None:
+        return hashlib.sha256(
+            f"{artifact_version_id}{exporter_version or schema_version}{layout_digest or ''}".encode(
+                "utf-8"
+            )
+        ).hexdigest()
     return schema_version
 
 
@@ -121,6 +150,8 @@ class ExportCacheService:
         payload: dict[str, Any] | None,
         filename: str,
         lineage_snapshot: dict[str, Any] | None = None,
+        exporter_version: str | None = None,
+        layout_digest: str | None = None,
     ) -> ExportedFile:
         """构建并返回缓存文件；并发下只渲染一次。
 
@@ -128,7 +159,13 @@ class ExportCacheService:
         ``mode == "model_direct_v1"`` 时 export_artifact 启用 direct lineage
         context）；缓存命中路径不消费该参数。
         """
-        template_version = _template_version_for(schema_version)
+        template_version = export_cache_key(
+            artifact_version_id=artifact_version_id,
+            schema_version=schema_version,
+            payload=payload,
+            exporter_version=exporter_version,
+            layout_digest=layout_digest,
+        )
         self._storage_dir.mkdir(parents=True, exist_ok=True)
         retry_budget = _MAX_DB_RETRY_ATTEMPTS
         while True:
@@ -483,5 +520,6 @@ class _VersionLike:
 __all__ = [
     "ExportedFile",
     "ExportCacheService",
+    "export_cache_key",
     "sanitize_filename",
 ]

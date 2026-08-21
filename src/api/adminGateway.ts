@@ -24,7 +24,8 @@ export type AdminGateway = {
 export type AdminRuntimeConfig = {
   id: string; scope: 'system' | 'tenant'; tenant_id: string | null; version: number;
   status: 'draft' | 'active' | 'retired'; runtime_backend: 'current' | 'pi';
-  runtime_contract_version: string; model: Record<string, unknown>; datatap: Record<string, unknown>;
+  runtime_contract_version: string; environment: 'development' | 'staging' | 'production';
+  model: Record<string, unknown>; datatap: Record<string, unknown>;
   limits: Record<string, unknown>; billing: Record<string, unknown>;
   secret_refs: Array<Record<string, string>>; created_by: string | null; created_at: string; activated_at: string | null;
 };

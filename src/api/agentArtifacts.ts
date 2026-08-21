@@ -578,13 +578,141 @@ export interface InsightBoardPayload extends AgentArtifactPayloadBase {
   }>;
 }
 
+// ---- analysis_report_v1 ----
+
+export type AnalysisReportColumnType =
+  | 'string'
+  | 'integer'
+  | 'number'
+  | 'percent'
+  | 'date'
+  | 'datetime'
+  | 'url'
+  | 'boolean';
+
+export type AnalysisReportCell = string | number | boolean | null;
+
+export interface AnalysisReportMetricCard {
+  key: string;
+  label: string;
+  value: AnalysisReportCell;
+  unit?: string | null;
+  value_type?: AnalysisReportColumnType | null;
+}
+
+export interface AnalysisReportMetricCardsBlock {
+  block_type: 'metric_cards';
+  id: string;
+  title: string;
+  cards: AnalysisReportMetricCard[];
+}
+
+export interface AnalysisReportTableColumn {
+  key: string;
+  label: string;
+  type: AnalysisReportColumnType;
+  width?: number | null;
+}
+
+export interface AnalysisReportTypedTableBlock {
+  block_type: 'typed_table';
+  id: string;
+  title: string;
+  columns: AnalysisReportTableColumn[];
+  rows: AnalysisReportCell[][];
+}
+
+export interface AnalysisReportTimeSeriesBlock {
+  block_type: 'time_series';
+  id: string;
+  title: string;
+  points: Array<{ timestamp: string; values: Record<string, number | null> }>;
+}
+
+export interface AnalysisReportLinkListBlock {
+  block_type: 'link_list';
+  id: string;
+  title: string;
+  items: Array<{ label: string; url: string; description?: string | null }>;
+}
+
+export interface AnalysisReportChartBlock {
+  block_type: 'chart';
+  id: string;
+  title: string;
+  chart_type: 'bar' | 'line' | 'area' | 'pie';
+  categories: string[];
+  series: Array<{ key: string; label: string; values: Array<number | null> }>;
+}
+
+export interface AnalysisReportNarrativeBlock {
+  block_type: 'narrative';
+  id: string;
+  title: string;
+  content: string;
+  supporting_paths: string[];
+}
+
+export interface AnalysisReportMethodologyLimitationsBlock {
+  block_type: 'methodology_limitations';
+  id: string;
+  title: string;
+  methodology: string;
+  limitations: string[];
+}
+
+export type AnalysisReportBlock =
+  | AnalysisReportMetricCardsBlock
+  | AnalysisReportTypedTableBlock
+  | AnalysisReportTimeSeriesBlock
+  | AnalysisReportLinkListBlock
+  | AnalysisReportChartBlock
+  | AnalysisReportNarrativeBlock
+  | AnalysisReportMethodologyLimitationsBlock;
+
+export interface AnalysisReportFulfillment {
+  key: string;
+  requested_min: number;
+  actual_count: number;
+  status: 'complete' | 'partial' | 'unavailable';
+  reason: string;
+}
+
+export interface AnalysisReportWorkbookSheet {
+  key: string;
+  title: string;
+  block_ids: string[];
+  columns: Array<{ key: string; label: string; width?: number | null; number_format?: string | null }>;
+  freeze_rows: number;
+  auto_filter: boolean;
+  sort_by: string[];
+  page_size?: number | null;
+}
+
+export interface AnalysisReportWorkbookLayout {
+  schema_version: 'workbook_v1';
+  sheets: AnalysisReportWorkbookSheet[];
+}
+
+export interface AnalysisReportPayload extends AgentArtifactPayloadBase {
+  schema_version: 'analysis_report_v1';
+  module: 'report';
+  title: string;
+  subject_type: 'brand' | 'campaign' | 'kol' | 'mixed';
+  scope: Record<string, unknown>;
+  blocks: AnalysisReportBlock[];
+  fulfillment: AnalysisReportFulfillment[];
+  workbook: AnalysisReportWorkbookLayout | null;
+}
+
 export type AgentArtifactPayload =
   | BrandReportPayload
   | CampaignReportPayload
   | KolSelectionPayload
   | KolAnalysisPayload
   | KolDetailPayload
-  | InsightBoardPayload;
+  | InsightBoardPayload
+  | AnalysisReportPayload;
 
 const KNOWN_SCHEMA_VERSIONS = new Set<string>([
   'brand_report_v3',
@@ -593,6 +721,7 @@ const KNOWN_SCHEMA_VERSIONS = new Set<string>([
   'kol_analysis_v2',
   'kol_detail_v2',
   'insight_board_v1',
+  'analysis_report_v1',
 ]);
 
 export function isAgentArtifactPayload(value: unknown): value is AgentArtifactPayload {

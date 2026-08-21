@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type {
   ApiAgentArtifact,
   ApiAgentArtifactVersion,
+  AnalysisReportPayload,
   BrandReportPayload,
   CampaignReportPayload,
   InsightBoardPayload,
@@ -85,6 +86,39 @@ const emptyMethodology = {
   data_as_of: '2026-08-01T10:00:00',
   source_names: ['xiaohongshu'],
   notes: [],
+};
+
+const analysisReportFixture: AnalysisReportPayload = {
+  schema_version: 'analysis_report_v1',
+  module: 'report',
+  data_status: 'complete',
+  availability: {
+    blocks: { status: 'complete', reason_codes: [] },
+    fulfillment: { status: 'complete', reason_codes: [] },
+  },
+  limitations: [],
+  methodology: emptyMethodology,
+  title: '跨平台营销报告',
+  subject_type: 'mixed',
+  scope: { brand: '测试品牌', platforms: ['xiaohongshu'] },
+  blocks: [{
+    block_type: 'typed_table',
+    id: 'platforms',
+    title: '平台明细',
+    columns: [
+      { key: 'platform', label: '平台', type: 'string' },
+      { key: 'volume', label: '声量', type: 'integer' },
+    ],
+    rows: [['小红书', 12]],
+  }],
+  fulfillment: [{
+    key: 'requested_items',
+    requested_min: 1,
+    actual_count: 1,
+    status: 'complete',
+    reason: '返回全部结果',
+  }],
+  workbook: null,
 };
 
 // Golden fixtures：每个 schema_version 一份后端形状的强类型 JSON。
@@ -565,6 +599,7 @@ describe('agent artifacts api', () => {
       kolAnalysisFixture,
       kolDetailFixture,
       insightBoardFixture,
+      analysisReportFixture,
     ];
 
     // 每个后端形状的 fixture 都必须通过判别联合守卫。
@@ -603,6 +638,10 @@ describe('agent artifacts api', () => {
         case 'insight_board_v1':
           expect(fixture.data[0].block_type).toBe('metric_grid');
           expect(fixture.parent_artifact_id).toBe('parent-1');
+          break;
+        case 'analysis_report_v1':
+          expect(fixture.blocks[0]?.block_type).toBe('typed_table');
+          expect(fixture.fulfillment[0]?.actual_count).toBe(1);
           break;
         default:
           break;

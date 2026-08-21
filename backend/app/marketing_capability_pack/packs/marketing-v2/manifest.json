@@ -74,6 +74,30 @@
         "request_clarification"
       ],
       "artifact_contract": "strategy_advice_v1"
+    },
+    {
+      "name": "analysis-report",
+      "version": "1.1.0",
+      "path": "skills/analysis-report/SKILL.md",
+      "digest": "66cf11bbc4d2a1ca035038ff508adbefb0d7919fdb7dc2d753fb32c0ada8a650",
+      "required_tools": [
+        "load_marketing_skill",
+        "build_artifact_draft",
+        "publish_artifacts"
+      ],
+      "artifact_contract": "analysis_report_v1"
+    },
+    {
+      "name": "workbook-export",
+      "version": "1.1.0",
+      "path": "skills/workbook-export/SKILL.md",
+      "digest": "93f89b9141e8b2672bdbb45a372321f3e19e0f957d3298571006949a293cf43f",
+      "required_tools": [
+        "load_marketing_skill",
+        "read_artifact",
+        "publish_artifacts"
+      ],
+      "artifact_contract": "workbook_v1"
     }
   ],
   "artifact_contracts": [
@@ -94,12 +118,19 @@
       "schema_version": "3",
       "path": "contracts/kol_selection_v3.json",
       "digest": "306ed5d672c7728399e51f2ba7e6ea693f7a2a279d13e022a75bb109b65300cf"
+    },
+    {
+      "artifact_type": "analysis_report_v1",
+      "schema_version": "analysis_report_v1",
+      "path": "contracts/analysis_report_v1.json",
+      "digest": "ed67e6fd218d1319bf0821302ebb251c799c735339c33d925de662f89d066262"
     }
   ],
   "builder_versions": {
     "brand_report_v3": "1.1.0",
     "campaign_report_v3": "1.1.0",
-    "kol_selection_v3": "1.1.0"
+    "kol_selection_v3": "1.1.0",
+    "analysis_report_v1": "1.0.0"
   },
   "exporter_versions": {
     "brand_report_v3": "1.1.0",

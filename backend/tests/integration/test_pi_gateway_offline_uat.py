@@ -76,6 +76,15 @@ _METHODOLOGY_INPUT = {
     "notes": [],
 }
 
+_MAIN_REPORT_CONTRACTS = frozenset(
+    {
+        "brand_report_v3",
+        "campaign_report_v3",
+        "kol_selection_v3",
+        "analysis_report_v1",
+    }
+)
+
 
 def _insight_model_input(*, title: str, parent_artifact_id: str, version_id: str, blocks: list[dict[str, Any]]) -> dict[str, Any]:
     """模型输入形态的 insight_board_v1（不含 schema/module/data_status 等服务器字段）。"""
@@ -131,6 +140,7 @@ async def _create_activate_pi_config(
     tenant_id: str,
     *,
     max_decisions: int | None = 50,
+    completion_mode: str = "formal_analysis",
 ) -> str:
     """经管理 API 创建并激活一个租户 Pi 配置版本（灰度升级路径），返回 config_id。
 
@@ -140,6 +150,7 @@ async def _create_activate_pi_config(
         payload = {
             "tenant_id": tenant_id,
             "runtime_backend": "pi",
+            "completion_mode": completion_mode,
             "model": {
                 "name": "fake-pi-model",
                 "masked_origin": "fake",
@@ -178,12 +189,14 @@ async def _enable_pi(
     tenant_id: str,
     *,
     max_decisions: int | None = 50,
+    completion_mode: str = "formal_analysis",
 ) -> str:
     """经管理 API 创建并激活租户 Pi 配置，再切 backend（真实灰度路径）。"""
     config_id = await _create_activate_pi_config(
         topology,
         tenant_id,
         max_decisions=max_decisions,
+        completion_mode=completion_mode,
     )
     async with topology.admin_client() as admin:
         switched = await admin.patch(
@@ -231,8 +244,10 @@ async def test_brand_report_full_chain_same_version_excel_bi_and_gate() -> None:
         session_id = await topology.create_session(user)
         response = await topology.send_message(user, session_id, f"[scenario:brand]\n请分析{BRAND}近期表现")
         assert response.status_code in (200, 201, 202), response.text
-        run = await topology.run_by_session(session_id)
+        run = await topology.run_by_id(_message_run_id(response))
         terminal_status = await topology.wait_run_terminal(run.id)
+        if terminal_status == "failed":
+            await _debug_dump_run(run.id, "brand-report")
         assert terminal_status in ("completed", "completed_with_warnings")
 
         async with SessionFactory() as db:
@@ -298,9 +313,13 @@ async def test_brand_report_full_chain_same_version_excel_bi_and_gate() -> None:
             )
             assert len(versions) == 1
             version = versions[0]
-            assert version.schema_version == "brand_report_v3"
+            # Pi may choose any reviewed top-level report contract.  The
+            # fixture currently chooses brand_report_v3, but completion does
+            # not depend on that historical choice.
+            assert version.schema_version in _MAIN_REPORT_CONTRACTS
             payload = version.payload_json
-            assert payload["data"]["overview"]["total_volume"] == 1000
+            if version.schema_version == "brand_report_v3":
+                assert payload["data"]["overview"]["total_volume"] == 1000
             assert payload["data_status"] in ("complete", "restricted")
             # Direct Artifact Skill lineage is model-owned and contains no
             # Evidence refs; MCP payloads stay in the model-visible tool
@@ -381,7 +400,7 @@ async def test_clarification_zero_artifact_zero_mcp() -> None:
         session_id = await topology.create_session(user)
         response = await topology.send_message(user, session_id, "[scenario:clarify]\n帮我做个分析")
         assert response.status_code in (200, 201, 202), response.text
-        run = await topology.run_by_session(session_id)
+        run = await topology.run_by_id(_message_run_id(response))
         terminal_status = await topology.wait_run_terminal(run.id)
         # 工具把 Run 迁移到 clarification_requested；gateway 后续只可能保持或
         # 以 completed 系收口，绝不允许 failed/cancelled 之外的模糊状态。
@@ -417,12 +436,14 @@ async def test_non_marketing_refusal_zero_side_effects() -> None:
     async with topology:
         await _wait_gateway_registered(topology)
         tenant = topology.tenants["uat-tenant-a"]
-        await _enable_pi(topology, tenant.tenant_id)
+        await _enable_pi(
+            topology, tenant.tenant_id, completion_mode="interaction"
+        )
         user = tenant.users[0]
         session_id = await topology.create_session(user)
         response = await topology.send_message(user, session_id, "[scenario:refuse]\n帮我写周报")
         assert response.status_code in (200, 201, 202), response.text
-        run = await topology.run_by_session(session_id)
+        run = await topology.run_by_id(_message_run_id(response))
         terminal_status = await topology.wait_run_terminal(run.id)
         assert terminal_status in ("completed", "completed_with_warnings")
         # 硬断言：0 个 AgentToolCall、0 次真实外发、0 个产物 Version
@@ -477,7 +498,7 @@ async def test_insufficient_balance_blocks_mcp_with_zero_external_calls() -> Non
         session_id = await topology.create_session(user)
         response = await topology.send_message(user, session_id, f"[scenario:brand]\n请分析{BRAND}")
         assert response.status_code in (200, 201, 202), response.text
-        run = await topology.run_by_session(session_id)
+        run = await topology.run_by_id(_message_run_id(response))
         # 终态不设硬断言：preflight 被拒后 gateway/脚本如何收口是实现细节；
         # 硬断言是「0 外发 + 账不变」。
         terminal_status = await topology.wait_run_terminal(run.id)
@@ -571,7 +592,9 @@ async def test_generic_proxy_bare_remote_name_billing_chain() -> None:
     async with topology:
         await _wait_gateway_registered(topology)
         tenant = topology.tenants["uat-tenant-a"]
-        await _enable_pi(topology, tenant.tenant_id)
+        await _enable_pi(
+            topology, tenant.tenant_id, completion_mode="interaction"
+        )
         user = tenant.users[0]
         async with SessionFactory() as db:
             wallet_before = await db.get(TenantWallet, tenant.tenant_id)
@@ -579,7 +602,7 @@ async def test_generic_proxy_bare_remote_name_billing_chain() -> None:
         session_id = await topology.create_session(user)
         response = await topology.send_message(user, session_id, f"[scenario:bare]\n请分析{BRAND}")
         assert response.status_code in (200, 201, 202), response.text
-        run = await topology.run_by_session(session_id)
+        run = await topology.run_by_id(_message_run_id(response))
         terminal_status = await topology.wait_run_terminal(run.id)
         assert terminal_status == "completed"
         # durable preflight 之后恰好 1 次真实外发（fake MCP 实收）
@@ -630,7 +653,9 @@ async def test_generic_proxy_bare_name_unique_mapping_without_server() -> None:
     async with topology:
         await _wait_gateway_registered(topology)
         tenant = topology.tenants["uat-tenant-a"]
-        await _enable_pi(topology, tenant.tenant_id)
+        await _enable_pi(
+            topology, tenant.tenant_id, completion_mode="interaction"
+        )
         user = tenant.users[0]
         async with SessionFactory() as db:
             wallet_before = await db.get(TenantWallet, tenant.tenant_id)
@@ -638,7 +663,7 @@ async def test_generic_proxy_bare_name_unique_mapping_without_server() -> None:
         session_id = await topology.create_session(user)
         response = await topology.send_message(user, session_id, "[scenario:unique]\n找达人")
         assert response.status_code in (200, 201, 202), response.text
-        run = await topology.run_by_session(session_id)
+        run = await topology.run_by_id(_message_run_id(response))
         terminal_status = await topology.wait_run_terminal(run.id)
         assert terminal_status == "completed"
         # 唯一映射到 social-grow-mcp：insight-cube 0 外发，social-grow 恰好 1 次
@@ -684,7 +709,7 @@ async def test_generic_proxy_ambiguous_remote_name_fails_closed() -> None:
             user, session_id, f"[scenario:ambiguous]\n查一下{BRAND}"
         )
         assert response.status_code in (200, 201, 202), response.text
-        run = await topology.run_by_session(session_id)
+        run = await topology.run_by_id(_message_run_id(response))
         terminal_status = await topology.wait_run_terminal(run.id)
         assert terminal_status in ("completed", "completed_with_warnings", "failed")
         # 硬断言：0 外发、0 扣费、0 ToolCall
@@ -713,7 +738,9 @@ async def test_generic_proxy_ambiguous_remote_name_with_explicit_server() -> Non
         await _approve_extra_tool("insight-cube-mcp", "shared_lookup", "match_best_tag")
         await _approve_extra_tool("social-grow-mcp", "shared_lookup", "kol_detail")
         tenant = topology.tenants["uat-tenant-a"]
-        await _enable_pi(topology, tenant.tenant_id)
+        await _enable_pi(
+            topology, tenant.tenant_id, completion_mode="interaction"
+        )
         user = tenant.users[0]
         async with SessionFactory() as db:
             wallet_before = await db.get(TenantWallet, tenant.tenant_id)
@@ -723,7 +750,7 @@ async def test_generic_proxy_ambiguous_remote_name_with_explicit_server() -> Non
             user, session_id, f"[scenario:disambiguated]\n查一下{BRAND}"
         )
         assert response.status_code in (200, 201, 202), response.text
-        run = await topology.run_by_session(session_id)
+        run = await topology.run_by_id(_message_run_id(response))
         terminal_status = await topology.wait_run_terminal(run.id)
         assert terminal_status == "completed"
         # 精确落到 social-grow：insight-cube 0 外发
@@ -759,7 +786,9 @@ async def test_generic_proxy_unique_live_duplicate_dispatches_to_claimed_service
         # 只把 insight-cube 一侧登记进 catalog；social-grow 的同名工具保持 quarantined
         await _approve_extra_tool("insight-cube-mcp", "shared_lookup", "match_best_tag")
         tenant = topology.tenants["uat-tenant-a"]
-        await _enable_pi(topology, tenant.tenant_id)
+        await _enable_pi(
+            topology, tenant.tenant_id, completion_mode="interaction"
+        )
         user = tenant.users[0]
         async with SessionFactory() as db:
             wallet_before = await db.get(TenantWallet, tenant.tenant_id)
@@ -767,7 +796,7 @@ async def test_generic_proxy_unique_live_duplicate_dispatches_to_claimed_service
         session_id = await topology.create_session(user)
         response = await topology.send_message(user, session_id, f"[scenario:pinned]\n查一下{BRAND}")
         assert response.status_code in (200, 201, 202), response.text
-        run = await topology.run_by_session(session_id)
+        run = await topology.run_by_id(_message_run_id(response))
         terminal_status = await topology.wait_run_terminal(run.id)
         assert terminal_status == "completed"
         # 钉入已登记的 insight-cube：恰好 1 次外发；未登记的 social-grow 0 次
@@ -832,12 +861,17 @@ async def test_model_budget_two_decisions_complete() -> None:
     async with topology:
         await _wait_gateway_registered(topology)
         tenant = topology.tenants["uat-tenant-a"]
-        await _enable_pi(topology, tenant.tenant_id, max_decisions=2)
+        await _enable_pi(
+            topology,
+            tenant.tenant_id,
+            max_decisions=2,
+            completion_mode="interaction",
+        )
         user = tenant.users[0]
         session_id = await topology.create_session(user)
         response = await topology.send_message(user, session_id, f"[scenario:budget2]\n请分析{BRAND}")
         assert response.status_code in (200, 201, 202), response.text
-        run = await topology.run_by_session(session_id)
+        run = await topology.run_by_id(_message_run_id(response))
         terminal_status = await topology.wait_run_terminal(run.id)
         assert terminal_status == "completed"
         # 恰好 2 次真实模型 HTTP：第一次产出 MCP 工具调用，第二次消费结果并给出最终回答
@@ -869,7 +903,7 @@ async def test_model_budget_third_decision_blocked_before_any_http() -> None:
         session_id = await topology.create_session(user)
         response = await topology.send_message(user, session_id, f"[scenario:budget3]\n请分析{BRAND}")
         assert response.status_code in (200, 201, 202), response.text
-        run = await topology.run_by_session(session_id)
+        run = await topology.run_by_id(_message_run_id(response))
         terminal_status = await topology.wait_run_terminal(run.id)
         assert terminal_status == "failed"
         # 第 3 次决策在任何 HTTP 之前被本地拦截
@@ -904,7 +938,7 @@ async def test_provider_http_error_no_auto_retry_stable_failure() -> None:
         session_id = await topology.create_session(user)
         response = await topology.send_message(user, session_id, f"[scenario:http429]\n请分析{BRAND}")
         assert response.status_code in (200, 201, 202), response.text
-        run = await topology.run_by_session(session_id)
+        run = await topology.run_by_id(_message_run_id(response))
         terminal_status = await topology.wait_run_terminal(run.id)
         assert terminal_status == "failed"
         # 关键断言：fake 模型只收到 1 次 HTTP（agent 层与 provider 层重试都关闭）
@@ -933,7 +967,7 @@ async def test_model_budget_missing_fails_closed_before_worker_start() -> None:
         session_id = await topology.create_session(user)
         response = await topology.send_message(user, session_id, f"[scenario:nobudget]\n请分析{BRAND}")
         assert response.status_code in (200, 201, 202), response.text
-        run = await topology.run_by_session(session_id)
+        run = await topology.run_by_id(_message_run_id(response))
         terminal_status = await topology.wait_run_terminal(run.id)
         assert terminal_status == "failed"
         assert _pi_model_requests(topology) == 0
@@ -967,7 +1001,7 @@ async def test_legacy_prefixed_name_fails_closed_unbilled() -> None:
         session_id = await topology.create_session(user)
         response = await topology.send_message(user, session_id, f"[scenario:legacy]\n请分析{BRAND}")
         assert response.status_code in (200, 201, 202), response.text
-        run = await topology.run_by_session(session_id)
+        run = await topology.run_by_id(_message_run_id(response))
         terminal_status = await topology.wait_run_terminal(run.id)
         assert terminal_status in ("completed", "completed_with_warnings", "failed")
         # 0 真实外发；预留已释放（reserve+release），净支出 0
@@ -1063,7 +1097,7 @@ async def test_unreachable_mcp_releases_reservation_with_zero_external_calls() -
         session_id = await topology.create_session(user)
         response = await topology.send_message(user, session_id, f"[scenario:deadmcp]\n请分析{BRAND}")
         assert response.status_code in (200, 201, 202), response.text
-        run = await topology.run_by_session(session_id)
+        run = await topology.run_by_id(_message_run_id(response))
         terminal_status = await topology.wait_run_terminal(run.id)
         # 终态不设硬断言（模型收到工具错误后的收口路径是实现细节）。
         assert terminal_status in ("completed", "completed_with_warnings", "failed")
@@ -1099,7 +1133,7 @@ async def test_session_mutex_rejects_concurrent_message() -> None:
         session_id = await topology.create_session(user)
         first = await topology.send_message(user, session_id, "[scenario:slow]\n慢慢分析")
         assert first.status_code in (200, 201, 202), first.text
-        run = await topology.run_by_session(session_id)
+        run = await topology.run_by_id(_message_run_id(first))
         # 第一条 POST 返回即已提交 queued Run（active 状态），第二条必被互斥
         second = await topology.send_message(user, session_id, "[scenario:slow]\n再来一条")
         assert second.status_code == 409, second.text
@@ -1120,12 +1154,14 @@ async def test_cross_tenant_isolation() -> None:
         await _wait_gateway_registered(topology)
         tenant_a = topology.tenants["uat-tenant-a"]
         tenant_b = topology.tenants["uat-tenant-b"]
-        await _enable_pi(topology, tenant_a.tenant_id)
+        await _enable_pi(
+            topology, tenant_a.tenant_id, completion_mode="interaction"
+        )
         user_a = tenant_a.users[0]
         session_a = await topology.create_session(user_a)
         response = await topology.send_message(user_a, session_a, "[scenario:refuse]\n帮我写周报")
         assert response.status_code in (200, 201, 202), response.text
-        run = await topology.run_by_session(session_a)
+        run = await topology.run_by_id(_message_run_id(response))
         terminal_status = await topology.wait_run_terminal(run.id)
         assert terminal_status in ("completed", "completed_with_warnings")
         # 对照组：A 自己能读到，证明资源确实存在
@@ -1312,7 +1348,7 @@ async def test_drilldown_binds_exact_version_with_zero_datatap() -> None:
             user, session_id, f"[scenario:brand]\n请分析{BRAND}近期表现"
         )
         assert first.status_code in (200, 201, 202), first.text
-        run1 = await topology.run_by_session(session_id)
+        run1 = await topology.run_by_id(_message_run_id(first))
         assert await topology.wait_run_terminal(run1.id) in (
             "completed",
             "completed_with_warnings",
@@ -1320,11 +1356,12 @@ async def test_drilldown_binds_exact_version_with_zero_datatap() -> None:
         versions = await _session_artifact_versions(session_id)
         assert len(versions) == 1
         brand_version = versions[0]
-        assert brand_version.schema_version == "brand_report_v3"
+        assert brand_version.schema_version in _MAIN_REPORT_CONTRACTS
         mcp_before = [len(service.calls) for service in topology.mcp_services]
         await _enable_pi(
             topology,
             tenant.tenant_id,
+            completion_mode="interaction",
         )
         # 第二条 Run：同一 Session 钻取，真实 artifact/version id 拼进消息文本
         second = await topology.send_message(
@@ -1335,7 +1372,7 @@ async def test_drilldown_binds_exact_version_with_zero_datatap() -> None:
             f"version={brand_version.version} version_id={brand_version.id} 的总声量",
         )
         assert second.status_code in (200, 201, 202), second.text
-        run2 = await topology.run_by_session(session_id)
+        run2 = await topology.run_by_id(_message_run_id(second))
         assert run2.id != run1.id
         assert await topology.wait_run_terminal(run2.id) in (
             "completed",
@@ -1408,7 +1445,7 @@ async def test_license_suspended_mid_run_blocks_further_mcp() -> None:
             user, session_id, f"[scenario:license]\n请分析{BRAND}"
         )
         assert response.status_code in (200, 201, 202), response.text
-        run = await topology.run_by_session(session_id)
+        run = await topology.run_by_id(_message_run_id(response))
         # 终态不设硬断言（preflight 被拒后如何收口是实现细节）；
         # 硬断言是「恰好 1 次外发 + 只结 10 分」。
         terminal_status = await topology.wait_run_terminal(run.id)
@@ -1454,7 +1491,7 @@ async def test_cancel_run_reaches_cancelled_terminal() -> None:
         session_id = await topology.create_session(user)
         response = await topology.send_message(user, session_id, "[scenario:slow]\n慢慢分析")
         assert response.status_code in (200, 201, 202), response.text
-        run = await topology.run_by_session(session_id)
+        run = await topology.run_by_id(_message_run_id(response))
         # 等 gateway claim 进入 running：覆盖「在飞执行只写 cancel_requested、
         # 由心跳收口」的取消路径（queued 立即取消是另一条路径）
         deadline = time.monotonic() + 30
@@ -1550,7 +1587,7 @@ async def test_worker_crash_single_recovery_then_failed_on_second_crash() -> Non
         session_id = await topology.create_session(user)
         response = await topology.send_message(user, session_id, "[scenario:crash]\n开始分析")
         assert response.status_code in (200, 201, 202), response.text
-        run = await topology.run_by_session(session_id)
+        run = await topology.run_by_id(_message_run_id(response))
 
         async def wait_new_worker(exclude: set[int], timeout: float = 180.0) -> set[int]:
             deadline = time.monotonic() + timeout
@@ -1801,7 +1838,9 @@ async def test_draining_gateway_stops_new_claims_but_finishes_active() -> None:
     async with topology:
         await _wait_gateway_registered(topology)
         tenant = topology.tenants["uat-tenant-a"]
-        await _enable_pi(topology, tenant.tenant_id)
+        await _enable_pi(
+            topology, tenant.tenant_id, completion_mode="interaction"
+        )
         user = tenant.users[0]
         session1 = await topology.create_session(user)
         first = await topology.send_message(user, session1, "[scenario:slow]\n慢慢分析")
@@ -1894,7 +1933,9 @@ async def test_current_to_pi_to_current_and_kill_switch_only_affects_new_runs() 
         snapshot_a = _canonical_snapshot(row_a)
         version_a = row_a.runtime_config_version_id
         # b) 切 pi 发拒答短脚本：经 gateway 真实 claim 执行
-        config_id_b = await _enable_pi(topology, tenant.tenant_id)
+        config_id_b = await _enable_pi(
+            topology, tenant.tenant_id, completion_mode="interaction"
+        )
         session_b = await topology.create_session(user)
         response = await topology.send_message(user, session_b, "[scenario:refuse]\n帮我写周报")
         assert response.status_code in (200, 201, 202), response.text
@@ -1990,7 +2031,9 @@ async def test_sse_ordering_and_last_event_id_resume() -> None:
     async with topology:
         await _wait_gateway_registered(topology)
         tenant = topology.tenants["uat-tenant-a"]
-        await _enable_pi(topology, tenant.tenant_id)
+        await _enable_pi(
+            topology, tenant.tenant_id, completion_mode="interaction"
+        )
         user = tenant.users[0]
         session_id = await topology.create_session(user)
         response = await topology.send_message(user, session_id, "[scenario:slow]\n慢慢分析")
@@ -2045,7 +2088,9 @@ async def test_run_snapshot_immutable_across_rollout() -> None:
     async with topology:
         await _wait_gateway_registered(topology)
         tenant = topology.tenants["uat-tenant-a"]
-        config_id_1 = await _enable_pi(topology, tenant.tenant_id)
+        config_id_1 = await _enable_pi(
+            topology, tenant.tenant_id, completion_mode="interaction"
+        )
         user = tenant.users[0]
         session1 = await topology.create_session(user)
         first = await topology.send_message(user, session1, "[scenario:refuse]\n帮我写周报")
@@ -2061,7 +2106,9 @@ async def test_run_snapshot_immutable_across_rollout() -> None:
         assert row1.runtime_config_version_id == config_id_1
         snapshot_1 = _canonical_snapshot(row1)
         # 灰度升级：同一租户再建并激活一个新版本配置（旧版本 retire）
-        config_id_2 = await _create_activate_pi_config(topology, tenant.tenant_id)
+        config_id_2 = await _create_activate_pi_config(
+            topology, tenant.tenant_id, completion_mode="interaction"
+        )
         assert config_id_2 != config_id_1
         # 新 Run 绑定新版本（证明升级确实生效，对照组）
         session2 = await topology.create_session(user)
@@ -2179,7 +2226,7 @@ async def test_direct_artifact_self_correction_bounded() -> None:
         session_id = await topology.create_session(user)
         response = await topology.send_message(user, session_id, f"[scenario:brand]\n请分析{BRAND}近期表现")
         assert response.status_code in (200, 201, 202), response.text
-        run = await topology.run_by_session(session_id)
+        run = await topology.run_by_id(_message_run_id(response))
         terminal_status = await topology.wait_run_terminal(run.id)
         assert terminal_status == "completed", terminal_status
 
@@ -2221,8 +2268,9 @@ async def test_direct_artifact_self_correction_bounded() -> None:
         versions = await _session_artifact_versions(session_id)
         assert len(versions) == 1
         version = versions[0]
-        assert version.schema_version == "brand_report_v3"
-        assert version.payload_json["data"]["overview"]["total_volume"] == 1000
+        assert version.schema_version in _MAIN_REPORT_CONTRACTS
+        if version.schema_version == "brand_report_v3":
+            assert version.payload_json["data"]["overview"]["total_volume"] == 1000
         assert version.evidence_refs_json == []
         assert version.lineage_snapshot_json["mode"] == "model_direct_v1"
         async with topology.client_for(user) as client:

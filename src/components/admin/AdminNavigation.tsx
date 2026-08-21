@@ -1,9 +1,10 @@
-export type AdminModule = 'users' | 'tenants' | 'licenses' | 'usage' | 'pi-runtime' | 'runtime-configs' | 'diagnostics';
+export type AdminModule = 'users' | 'tenants' | 'licenses' | 'usage' | 'pi-runtime' | 'runtime-configs' | 'diagnostics' | 'skills';
 
 const MODULES: Array<{ id: AdminModule; label: string }> = [
   { id: 'users', label: '用户' }, { id: 'tenants', label: '租户' }, { id: 'licenses', label: 'License' },
   { id: 'usage', label: '用量与积分' }, { id: 'pi-runtime', label: 'Pi Runtime' },
   { id: 'runtime-configs', label: 'Runtime 配置' }, { id: 'diagnostics', label: 'Run 诊断' },
+  { id: 'skills', label: '营销 Skills' },
 ];
 
 export function AdminNavigation({ active, onChange }: { active: AdminModule; onChange: (module: AdminModule) => void }) {

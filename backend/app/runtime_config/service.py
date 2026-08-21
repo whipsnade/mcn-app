@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 from datetime import UTC, datetime
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 from uuid import uuid4
 
 from pydantic import SecretStr
@@ -19,6 +19,11 @@ from app.marketing_capability_pack.runtime import (
     build_marketing_run_capability,
 )
 from app.mcp_gateway.models import McpToolCatalog, McpToolDiscovery
+from app.marketing_skills.snapshot import (
+    SkillManifest,
+    SkillSnapshotError,
+    SkillSnapshotService,
+)
 from app.tenancy.models import Tenant
 from app.tenancy.service import effective_runtime_backend
 
@@ -65,6 +70,8 @@ class RuntimeConfigService:
         billing: dict[str, Any],
         secrets: RuntimeSecretBundle | None = None,
         runtime_contract_version: str = RUNTIME_CONTRACT_VERSION,
+        environment: Literal["development", "staging", "production"] = "production",
+        completion_mode: Literal["formal_analysis", "interaction"] = "formal_analysis",
     ) -> RuntimeConfigVersion:
         if runtime_backend not in {"current", "pi"}:
             raise RuntimeConfigError("runtime_backend_invalid")
@@ -107,6 +114,8 @@ class RuntimeConfigService:
                 datatap=datatap,
                 limits=limits,
                 billing=billing,
+                environment=environment,
+                completion_mode=completion_mode,
             ),
             secret_refs_json=[],
             created_by=created_by,
@@ -238,6 +247,24 @@ class RuntimeConfigService:
             raise RuntimeConfigError("runtime_config_required")
         snapshot = self._snapshot_from_config(config, profile_name=profile_name)
         if snapshot.runtime_backend == "pi":
+            try:
+                base_capability = MarketingRunCapability.model_validate(snapshot.capability_pack)
+                skill_capability = await SkillSnapshotService.resolve_for_new_run(
+                    self.db,
+                    tenant_id=tenant_id,
+                    base_capability=base_capability,
+                    environment=snapshot.environment,
+                )
+                skill_manifest = SkillSnapshotService.manifest_from_capability(skill_capability)
+            except SkillSnapshotError as exc:
+                raise RuntimeConfigError(str(exc)) from exc
+            snapshot = RuntimeConfigSnapshot.model_validate(
+                {
+                    **snapshot.model_dump(mode="json"),
+                    "capability_pack": skill_capability.model_dump(mode="json"),
+                    "skill_manifest": skill_manifest.model_dump(mode="json"),
+                }
+            )
             # Adapter bindings are part of the immutable Run snapshot as well:
             # claim may authenticate/lease the Run, but it cannot silently
             # append a live catalog after the Run has been created.
@@ -293,6 +320,10 @@ class RuntimeConfigService:
             snapshot = RuntimeConfigSnapshot.model_validate(snapshot_payload)
         except Exception as exc:
             raise RuntimeConfigError("runtime_snapshot_invalid") from exc
+        try:
+            SkillSnapshotService.validate_existing_run(snapshot)
+        except Exception as exc:
+            raise RuntimeConfigError("runtime_snapshot_invalid") from exc
         if snapshot.config_version_id != run.runtime_config_version_id:
             raise RuntimeConfigError("runtime_snapshot_config_mismatch")
         config = await self.db.get(RuntimeConfigVersion, run.runtime_config_version_id)
@@ -336,7 +367,13 @@ class RuntimeConfigService:
         config = await self.db.get(RuntimeConfigVersion, parent_run.runtime_config_version_id)
         if config is None:
             raise RuntimeConfigError("runtime_child_snapshot_config_not_found")
-        child_snapshot = self._snapshot_from_config(config, profile_name=profile_name)
+        parent_capability = MarketingRunCapability.model_validate(parent_snapshot.capability_pack)
+        child_snapshot = self._snapshot_from_config(
+            config,
+            profile_name=profile_name,
+            capability_override=parent_capability,
+            skill_manifest=parent_snapshot.skill_manifest,
+        )
         if child_snapshot.runtime_backend != parent_snapshot.runtime_backend:
             raise RuntimeConfigError("runtime_child_snapshot_backend_mismatch")
         if (
@@ -530,6 +567,8 @@ class RuntimeConfigService:
         datatap: dict[str, Any],
         limits: dict[str, int | float],
         billing: dict[str, Any],
+        environment: Literal["development", "staging", "production"] = "production",
+        completion_mode: Literal["formal_analysis", "interaction"] = "formal_analysis",
     ) -> dict[str, Any]:
         if any(key not in {"name", "masked_origin", "provider"} for key in model):
             raise RuntimeConfigError("runtime_model_config_invalid")
@@ -540,6 +579,8 @@ class RuntimeConfigService:
             "config_version_id": config_id,
             "runtime_contract_version": runtime_contract_version,
             "runtime_backend": runtime_backend,
+            "environment": environment,
+            "completion_mode": completion_mode,
             "model": {"name": model.get("name"), "masked_origin": model.get("masked_origin"), "provider": model.get("provider")},
             "datatap": dict(datatap),
             "capability_pack": capability.model_dump(mode="json"),
@@ -556,12 +597,21 @@ class RuntimeConfigService:
 
     @staticmethod
     def _snapshot_from_config(
-        config: RuntimeConfigVersion, *, profile_name: str | None = None
+        config: RuntimeConfigVersion,
+        *,
+        profile_name: str | None = None,
+        capability_override: MarketingRunCapability | None = None,
+        skill_manifest: SkillManifest | None = None,
     ) -> RuntimeConfigSnapshot:
         payload = copy.deepcopy(config.config_json or {})
         # Older config JSON may still contain this field.  It is deliberately
         # ignored for new Run snapshots and never copied into the snapshot.
         payload.pop("profile_artifact_contracts", None)
+        # These fields are retained only so historical Run Snapshots can be
+        # replayed. A new Run receives a candidate allowlist, never a fixed
+        # required-artifact contract from an old config row.
+        payload.pop("artifact_contract_mode", None)
+        payload.pop("required_artifact_contract", None)
         for key, expected in (
             ("config_version_id", config.id),
             ("runtime_contract_version", config.runtime_contract_version),
@@ -570,8 +620,14 @@ class RuntimeConfigService:
             if key in payload and payload[key] != expected:
                 raise RuntimeConfigError("runtime_snapshot_invalid")
             payload[key] = expected
-        capability_payload = payload.get("capability_pack")
-        if config.id == LEGACY_RUNTIME_CONFIG_ID or not capability_payload:
+        capability_payload = (
+            capability_override.model_dump(mode="json")
+            if capability_override is not None
+            else payload.get("capability_pack")
+        )
+        if capability_override is not None:
+            payload["capability_pack"] = capability_payload
+        elif config.id == LEGACY_RUNTIME_CONFIG_ID or not capability_payload:
             capability_payload = build_marketing_run_capability().model_dump(mode="json")
             payload["capability_pack"] = capability_payload
         else:
@@ -592,6 +648,8 @@ class RuntimeConfigService:
             payload["allowed_artifact_contracts"] = list(
                 RuntimeConfigService._allowed_artifact_contracts(profile, capability)
             )
+        if skill_manifest is not None:
+            payload["skill_manifest"] = skill_manifest.model_dump(mode="json")
         try:
             return RuntimeConfigSnapshot.model_validate(payload)
         except Exception as exc:
