@@ -121,9 +121,13 @@ npx vitest run src/App.test.tsx src/components/ChatArea.test.tsx \
   src/api/agent.test.ts src/hooks/useRunHistoryReplay.test.tsx
 ```
 
-根目录 `npx tsc --noEmit` 仍被基线已有的 `pi-runtime` 缺少 `pi-mcp-adapter`、
-`@earendil-works/pi-coding-agent` 和 `typebox` 阻断；Pi Gateway 自身 typecheck 已通过。本轮没有
-擅自安装或修改该不相关依赖面。
+初始未安装依赖时，根目录 `npx tsc --noEmit` 被 `pi-runtime` 缺少 `pi-mcp-adapter`、
+`@earendil-works/pi-coding-agent` 和 `typebox` 阻断；Pi Gateway 自身 typecheck 已通过。候选 CI
+阶段仅安装 `pi-runtime/package-lock.json` 已锁定依赖，没有修改该兼容路径的源代码或生产桥接。
+
+候选 CI 前置重新安装了 `pi-runtime/package-lock.json` 的锁定依赖（398 packages）；随后 root lint 和
+Pi Runtime typecheck 均通过。更新后的现行 `revision` POC 契约断言也已通过；没有修改生产桥接或历史
+Snapshot。
 
 ### 5.2 原 12 项一次执行
 
@@ -164,6 +168,26 @@ backend/.venv/bin/pytest -q \
 
 没有再次运行完整离线 UAT；该失败按 flake 记录，不改变生产逻辑或测试 expected。
 
+### 5.4 Candidate 与本地 CI
+
+从包含 fixture/CI 修复的最新 HEAD 重建 `codex/real-uat-mcp-cancel-integration-r3`，并以 fast-forward
+方式合入本地 `main`，当前合入 commit 为 `f3d3881`。候选 CI 现在安装锁定的 Pi Runtime 依赖，并把
+一次性离线拓扑 UAT 从普通 CI 排除，避免重复执行本轮已经完成的完整离线 UAT；该 UAT 仍保留为单独的
+发布门。
+
+本地候选 CI（不含离线 UAT文件）结果：
+
+```text
+Backend production CI subset: 2180 passed, 29 skipped in 187.97s
+Frontend full Vitest: 44 files, 322 passed
+Pi Gateway full Vitest: 27 files, 188 passed
+Root lint: passed
+Pi Runtime typecheck: passed
+Ruff / frontend build / Gateway typecheck+build / git diff --check: passed
+```
+
+远程 GitHub Actions 尚未触发；预发布部署与真实 Web UAT仍待远程 CI 全绿后执行。
+
 ## 6. 安全与兼容结论
 
 - 标准 MCP Result 直通不是放宽安全：模型仍只能经审核工具、当前租户/Session/Run 归属和固定计费
@@ -175,10 +199,10 @@ backend/.venv/bin/pytest -q \
 
 ## 7. 当前发布状态与后续停止门
 
-独立只读审查已完成，结论为 Critical 0 / Important 0；本轮线性提交为
-`fd61e9e`（runtime）、`dbd2a96`（tests/UAT）、`de7c45b`（docs）。当前状态仍为
-`NOT_READY_FOR_CANDIDATE_DEPLOYMENT`，因为 integration candidate、CI、预发布和一次真实 Web UAT
-尚未完成；根目录 tsc 的基线依赖缺失也仍需在候选门禁中单独处理。本轮未执行生产灰度。
+独立只读审查已完成，结论为 Critical 0 / Important 0；本轮线性提交包括
+`fd61e9e`（runtime）、`dbd2a96`（tests/UAT）、`de7c45b`（docs）、`2644065`（fixture）和
+`f3d3881`（CI）。候选已合入本地 `main`，但远程 GitHub CI、预发布和一次真实 Web UAT 尚未完成，
+因此状态仍为 `NOT_READY_FOR_PREDEPLOYMENT`。本轮未执行生产灰度。
 
 后续唯一真实 Web UAT 使用专用 UAT 租户和一次 `瑞幸咖啡` 请求，限制为 Run=1、Attempt=1、模型≤10、
 DataTap≤5、积分≤50、retries=0、fresh Run=0；必须同时证明此前 `unsupported_content` 场景的标准

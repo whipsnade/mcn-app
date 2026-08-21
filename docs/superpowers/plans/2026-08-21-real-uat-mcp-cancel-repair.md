@@ -96,5 +96,5 @@
 - [x] 已完成定向 Backend/Pi Gateway/前端验证、原 12 项一次执行和完整离线 UAT 一次；完整 UAT 唯一失败只隔离复验一次，未重跑全套，详细结果写入 QA。
 - [x] 完成独立只读审查，Critical=0、Important=0；确认标准 MCP Result 直通、没有 Evidence Bridge、取消后无外发、unknown 不被释放/重放、无 worker/lease/port 残留、前端不是视觉假取消。
 - [x] 已创建线性提交：`fd61e9e fix(runtime): make in-flight cancellation effective`、`dbd2a96 test(uat): cover direct mcp result and cancellation`、`de7c45b docs: record real uat evidence`；Direct MCP 透传沿用已审计基线，不创建空提交。
-- [ ] 重建 integration candidate、运行 CI 并部署预发布；仅在代码/测试/审查全部通过后执行一次专用 UAT 租户的“Direct MCP + 取消”组合 Web UAT：一次瑞幸咖啡请求，Attempt=1、模型≤10、DataTap≤5、积分≤50、retries=0、fresh Run=0。
+- [ ] 已重建 `codex/real-uat-mcp-cancel-integration-r3` 并快进合入本地 `main`（`f3d3881`）；本地生产 CI 范围已通过，仍需推送后取得远程 GitHub CI 全绿，再部署预发布并执行一次专用 UAT 租户的“Direct MCP + 取消”组合 Web UAT：一次瑞幸咖啡请求，Attempt=1、模型≤10、DataTap≤5、积分≤50、retries=0、fresh Run=0。
 - [ ] 组合 UAT 必须记录一个此前会产生 `unsupported_content` 的工具成功返回、模型收到标准结果、点击“取消任务”后的阶段时间戳、无后续外发、唯一 cancelled、Attempt/ToolCall/permit/lease/worker/端口收口。通过后只报告 `REAL_UAT_MCP_PASS_THROUGH_AND_CANCEL_PASS / READY_FOR_FINAL_FUNCTIONAL_UAT`；本轮不做生产灰度。
