@@ -313,4 +313,6 @@ jobs:
         run: npx playwright install --with-deps chromium
 
       - name: Run browser E2E
+        env:
+          BACKEND_PYTHON: python
         run: npm run test:e2e
