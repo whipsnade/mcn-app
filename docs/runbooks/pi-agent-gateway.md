@@ -315,3 +315,62 @@ fake topology（测试 MySQL + FastAPI 子进程 + 生产 Gateway 可执行文�
 DataTap MCP，0 外部网络），不等于真实 UAT 通过。当前 Runtime 至少保留一个稳定
 发布周期；周期结束前不得删除旧表、旧 Review 数据或历史快照，也不得执行历史 Pi RPC/POC 真实六场景
 Task 9、真实模型/DataTap、真实钱包/积分调用或生产切流。
+
+## 2026-08-21 Direct Pi MCP Result 与取消闭环（候选发布前）
+
+本节绑定修复分支 `codex/real-uat-mcp-cancel-repair` 的候选发布流程；未完成候选验证前，不得把
+本地定向测试或离线 UAT 标记为真实 UAT/生产通过。
+
+### 运行边界
+
+- Direct Pi 的标准 `CallToolResult` 由 adapter/session 原样交给模型。`content`、`structuredContent`
+  和 `isError` 不得被 accounting 读取、摘要、裁剪、改写或包装；accounting 只发送非业务结算 metadata。
+- `resource+text`、多 block、普通非 JSON text、缺 `structuredContent` 和标准 `isError=true` 不得被
+  转换为 `unsupported_content`/`result_unavailable`。不主动读取或展开 `ui:` resource。
+- legacy `DataTapTransport/Evidence` 兼容读取、历史字段和旧 Snapshot 保留；不得恢复 Evidence Bridge、
+  `mcp_result_v1` 或固定 required-artifact contract。
+
+### 取消操作顺序
+
+取消必须形成以下持久顺序：
+
+```text
+API cancel → Run.cancel_requested → preflight fence
+          → heartbeat detects → provider/worker abort
+          → SIGTERM → bounded SIGKILL if needed → child close
+          → terminal cancelled → Recovery/SSE/accounting cleanup
+```
+
+- `preflight_mcp` 必须在 catalog、ToolCall、积分 reserve 和外部 dispatch 前读取取消标记。
+- Gateway 在 terminalization 前停止 heartbeat timer；迟到 heartbeat 的预期 404 不得覆盖已提交终态。
+- 已确认未发送/失败/可能已发送的调用分别按 `definitely_not_sent`、`failed_confirmed`、
+  `result_unknown` 处理；unknown 保留预留并交 Recovery，禁止自动重放。
+- API、Gateway、Recovery 必须通过统一终态收口产生至多一个 `run.cancelled`；不允许 running Step、
+  planned/running permit、活动 lease、worker PID 或 child 连接残留。
+- 前端显示“取消任务”；点击后显示“正在取消”并保持 SSE，直到真实 `run.cancelled`，不得把 API ACK
+  直接伪造成终态。
+
+### 候选发布前验证
+
+1. 记录候选 commit、数据库 migration head、Gateway 依赖和部署文件 hash；后端与前端必须来自同一候选。
+2. 在隔离测试库运行受影响后端测试、Pi Gateway Vitest/typecheck、前端定向 Vitest，并执行一次
+   `git diff --check`、secret/DSN/Bearer 静态扫描。根目录 `pi-runtime` 依赖缺失若仍存在，必须记录为
+   独立阻断，不得通过修改测试规避。
+3. 只执行一次历史 12 项红灯用例；保留原错误码和调用路径证据，不删除或只改 expected。
+4. 只执行一次完整离线 UAT；如单个初始化用例出现 flake，只隔离该用例一次，不重跑全套。
+5. 独立审查必须达到 Critical 0 / Important 0 后，才能重建 integration candidate、跑 CI 和部署预发布。
+
+### 一次真实 Web UAT 停止门
+
+真实 Web UAT 使用专用 UAT 租户，只发起一次 `瑞幸咖啡` 请求，硬上限为 Run=1、Attempt=1、模型≤10、
+DataTap≤5、积分≤50、retries=0、fresh Run=0。验收必须同时保存：
+
+- 一个此前会触发 `unsupported_content` 的工具成功返回，以及模型收到的标准 Result 形态；
+- 点击“取消任务”的时间点、之后无新外部 dispatch、唯一 cancelled 事件和 Attempt 终态；
+- ToolCall/permit/钱包、session slot、Gateway lease、worker PID、heartbeat timer、RPC pending 和
+  child 端口/连接均已清理。
+
+任一 secret 泄露、重复外发/扣费、unknown 被释放或重放、跨租户数据、终态不一致或清理残留，立即停止
+并保留 append-only 证据。通过后只推进到
+`REAL_UAT_MCP_PASS_THROUGH_AND_CANCEL_PASS / READY_FOR_FINAL_FUNCTIONAL_UAT`；本轮不做 5%→25%→100%
+生产灰度。
