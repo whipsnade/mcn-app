@@ -118,6 +118,7 @@ class AgentRunRead(BaseModel):
     parent_run_id: str | None = None
     profile_name: str
     status: str
+    cancel_requested: bool
     outcome: str | None = None
     decision_count: int
     review_count: int

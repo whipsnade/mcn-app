@@ -393,7 +393,12 @@ async def terminal(
             run = await _service(db, gateway_id).leased_run(run_id, payload.attempt_id, x_pi_run_lease or "")
         except PiGatewayLeaseError as exc:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="pi_gateway_run_not_found") from exc
-        if outcome in (RunStatus.COMPLETED, RunStatus.COMPLETED_WITH_WARNINGS):
+        # The API cancellation flag is the durable fence. If it committed
+        # before this terminal ACK acquired the Run lock, a late completed or
+        # failed ACK must not overtake the user's cancellation.
+        if run.cancel_requested and outcome != RunStatus.CANCELLED:
+            effective_outcome = RunStatus.CANCELLED
+        if effective_outcome in (RunStatus.COMPLETED, RunStatus.COMPLETED_WITH_WARNINGS):
             # 业务完成契约由服务端根据 Run 创建时冻结的 snapshot 执行；Gateway
             # 不能用 assistant message 或当前 builder 调用记录自行推导成功。
             validation = await completion_validator.validate(run)
@@ -402,7 +407,7 @@ async def terminal(
                     status_code=status.HTTP_409_CONFLICT,
                     detail=validation.code or "pi_gateway_terminal_rejected",
                 )
-            if outcome == RunStatus.COMPLETED and getattr(validation, "warnings", ()):
+            if effective_outcome == RunStatus.COMPLETED and getattr(validation, "warnings", ()):
                 effective_outcome = RunStatus.COMPLETED_WITH_WARNINGS
 
         async def cleanup_before_commit(locked_run) -> None:
@@ -418,7 +423,7 @@ async def terminal(
                     else effective_outcome.value
                 )
                 attempt.ended_at = _service(db, gateway_id).now_fn()
-            if outcome == RunStatus.FAILED:
+            if effective_outcome == RunStatus.FAILED:
                 failure_payload = payload.payload or {}
                 await close_open_runtime_rows(
                     db,
@@ -446,6 +451,8 @@ async def terminal(
 
         try:
             terminal_payload = dict(payload.payload or {})
+            if effective_outcome == RunStatus.CANCELLED:
+                terminal_payload.setdefault("code", "cancel_requested")
             if effective_outcome == RunStatus.COMPLETED_WITH_WARNINGS:
                 validation_warnings = await completion_validator.validate(run)
                 warnings = getattr(validation_warnings, "warnings", ())

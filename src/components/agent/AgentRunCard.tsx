@@ -21,7 +21,7 @@ export interface AgentRunCardProps {
   run: RunRuntimeState;
   /** 恢复暂停的 Run（paused → 继续）。 */
   onResume?: () => void;
-  /** 暂停当前 Run。 */
+  /** 取消当前 Run。 */
   onPause?: () => void;
   /** 点击澄清选项：只填入输入框，不自动提交。 */
   onClarify?: (text: string) => void;
@@ -100,7 +100,7 @@ export function AgentRunCardImpl({
 
   const statusMeta = STATUS_META[run.status ?? ''] ?? { label: '执行中', dot: 'bg-indigo-500 animate-pulse' };
   const stepCount = run.steps.length;
-  const canPause = run.status === 'running' && onPause !== undefined;
+  const canCancel = (run.status === 'running' || run.status === 'reviewing') && onPause !== undefined;
 
   // 终态折叠：一行可展开摘要。回放失败/无步骤的历史 Run 不渲染“共 0 步”的
   // 误导文案，保留「历史执行记录」降级标识（回放见 useRunHistoryReplay）。
@@ -127,21 +127,21 @@ export function AgentRunCardImpl({
 
   return (
     <section aria-label="执行卡" className="overflow-hidden rounded-xl border border-slate-200 bg-white shadow-sm">
-      {/* 状态头部 + 暂停/继续/收起 */}
+      {/* 状态头部 + 取消/继续/收起 */}
       <div className="flex items-center gap-2 border-b border-slate-100 px-3.5 py-2.5">
         <span className={`h-2 w-2 shrink-0 rounded-full ${statusMeta.dot}`} aria-hidden="true" />
         <span className="text-[11px] font-semibold text-slate-700">{statusMeta.label}</span>
         {run.activity && <span className="truncate text-[10px] text-slate-400">{run.activity}</span>}
         <div className="ml-auto flex shrink-0 items-center gap-1.5">
-          {canPause && (
+          {canCancel && (
             <button
               type="button"
-              aria-label="暂停"
+              aria-label="取消任务"
               onClick={onPause}
               className="flex items-center gap-1 rounded-lg border border-slate-200 bg-white px-2 py-1 text-[10px] font-semibold text-slate-600 transition hover:bg-slate-50"
             >
               <Pause className="h-3 w-3" aria-hidden="true" />
-              暂停
+              取消任务
             </button>
           )}
           {run.status === 'paused' && onResume && (

@@ -116,6 +116,7 @@ export function useAgentWorkspace(userId?: string) {
   const [wallet, setWallet] = useState<ApiWallet>();
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [isCancelling, setIsCancelling] = useState(false);
   const [error, setError] = useState<string>();
 
   const generationRef = useRef(0);
@@ -159,6 +160,8 @@ export function useAgentWorkspace(userId?: string) {
       activeSessionIdRef.current = active?.id;
       setActiveSessionId(active?.id);
       setActiveRunId(active?.latestRunId);
+      const activeRun = active?.runs.find(item => item.id === active.latestRunId);
+      setIsCancelling(Boolean(activeRun?.cancel_requested && !isTerminalRunStatus(activeRun.status)));
     } catch (reason) {
       if (generationRef.current === generation) {
         setError(reason instanceof Error ? reason.message : '加载会话失败');
@@ -180,6 +183,7 @@ export function useAgentWorkspace(userId?: string) {
     setError(undefined);
     setLoading(false);
     setBusy(false);
+    setIsCancelling(false);
     if (userId) void load(generation);
     return () => {
       if (generationRef.current === generation) generationRef.current += 1;
@@ -208,6 +212,8 @@ export function useAgentWorkspace(userId?: string) {
       activeSessionIdRef.current = id;
       setActiveSessionId(id);
       setActiveRunId(session.latestRunId);
+      const activeRun = session.runs.find(item => item.id === session.latestRunId);
+      setIsCancelling(Boolean(activeRun?.cancel_requested && !isTerminalRunStatus(activeRun.status)));
     } catch (reason) {
       if (generationRef.current === generation) {
         setError(reason instanceof Error ? reason.message : '恢复会话失败');
@@ -327,6 +333,7 @@ export function useAgentWorkspace(userId?: string) {
         ? { ...message, run_id: response.run_id }
         : message));
       if (activeSessionIdRef.current === sessionId) setActiveRunId(response.run_id);
+      if (activeSessionIdRef.current === sessionId) setIsCancelling(false);
       return response.run_id;
     } catch (reason) {
       // 失败移除乐观消息，避免留下未确认内容。
@@ -345,6 +352,7 @@ export function useAgentWorkspace(userId?: string) {
     const response = await retryRunRequest(runId);
     if (generationRef.current !== generation) throw new Error('STALE_WORKSPACE_REQUEST');
     if (activeSessionIdRef.current === response.session_id) setActiveRunId(response.run_id);
+    if (activeSessionIdRef.current === response.session_id) setIsCancelling(false);
     try {
       const detail = await getSession(response.session_id);
       if (generationRef.current === generation) {
@@ -359,16 +367,31 @@ export function useAgentWorkspace(userId?: string) {
   }, []);
 
   const cancelActiveRun = useCallback(async () => {
-    if (!activeRunId) return;
+    if (!activeRunId || isCancelling) return;
     const generation = generationRef.current;
+    // Reflect the user's intent before the network round-trip completes. The
+    // UI remains disabled until the live Run reaches a real terminal event.
+    setIsCancelling(true);
     try {
-      await cancelRunRequest(activeRunId);
+      const response = await cancelRunRequest(activeRunId);
+      if (generationRef.current !== generation) return;
+      sessionsRef.current = sessionsRef.current.map(session => session.id !== response.session_id
+        ? session
+        : {
+          ...session,
+          runs: session.runs.map(item => item.id === response.id ? response : item),
+        });
+      setSessions(sessionsRef.current);
+      if (isTerminalRunStatus(response.status) || !response.cancel_requested) {
+        setIsCancelling(false);
+      }
     } catch (reason) {
       if (generationRef.current === generation) {
+        setIsCancelling(false);
         setError(reason instanceof Error ? reason.message : '取消运行失败');
       }
     }
-  }, [activeRunId]);
+  }, [activeRunId, isCancelling]);
 
   const resumeActiveRun = useCallback(async () => {
     if (!activeRunId) return;
@@ -480,7 +503,25 @@ export function useAgentWorkspace(userId?: string) {
   useEffect(() => {
     if (!run?.notFound) return;
     setActiveRunId(undefined);
+    setIsCancelling(false);
   }, [run?.notFound]);
+
+  // Session refreshes are authoritative for cancel_requested.  A live
+  // cancelled event is also enough to release the button before the detail
+  // refetch completes; otherwise a running/reviewing Run stays cancelling.
+  useEffect(() => {
+    if (!activeRunId) {
+      setIsCancelling(false);
+      return;
+    }
+    if (run?.runId === activeRunId && isTerminalRunStatus(run.status)) {
+      setIsCancelling(false);
+      return;
+    }
+    const serverRun = activeSession?.runs.find(item => item.id === activeRunId);
+    if (!serverRun) return;
+    setIsCancelling(Boolean(serverRun.cancel_requested && !isTerminalRunStatus(serverRun.status)));
+  }, [activeRunId, activeSession?.runs, run?.runId, run?.status]);
 
   const markArtifactSeen = useCallback(async (module: string, lastSeenSequence: number) => {
     if (!userId || !activeSessionId) return;
@@ -502,6 +543,7 @@ export function useAgentWorkspace(userId?: string) {
     wallet,
     loading,
     busy,
+    isCancelling,
     error,
     reload,
     selectSession,

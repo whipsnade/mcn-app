@@ -44,6 +44,7 @@ export interface ApiAgentRun {
   parent_run_id: string | null;
   profile_name: string;
   status: string;
+  cancel_requested: boolean;
   outcome: string | null;
   decision_count: number;
   review_count: number;

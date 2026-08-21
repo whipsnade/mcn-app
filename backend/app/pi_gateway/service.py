@@ -480,6 +480,11 @@ class PiGatewayService:
         """Validate the claimed catalog and commit a durable MCP reservation."""
         if run.runtime_backend != "pi" or not run.tenant_id:
             raise TenantAccountingError("pi_mcp_run_invalid")
+        # Cancellation is a durable fence, not merely a UI hint.  Check it
+        # before catalog lookup or any call/step/reservation row is created;
+        # the leased gateway request locks the current Run row first.
+        if run.cancel_requested:
+            raise TenantAccountingError("run_cancel_requested")
         catalog = await self.db.scalar(
             select(McpToolCatalog).where(
                 McpToolCatalog.internal_tool_name == request.tool_name,

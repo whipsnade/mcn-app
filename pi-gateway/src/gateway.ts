@@ -361,6 +361,10 @@ export class PiGateway {
                 beatTimeout.unref?.();
               }),
             ]);
+            // Terminalization fences the lease. A heartbeat already in flight
+            // may complete after the terminal request and receive a durable
+            // 404; that is a terminal race, not a control-plane loss.
+            if (beatsStopped) return;
             consecutiveHeartbeatFailures = 0;
             if (decision && typeof decision.lease_expires_at === "number") {
               leaseDeadlineMs = decision.lease_expires_at * 1000;
@@ -380,6 +384,7 @@ export class PiGateway {
               return;
             }
           } catch (error) {
+            if (beatsStopped) return;
             consecutiveHeartbeatFailures += 1;
             this.onError(
               asPiGatewayInfrastructureError(error)
@@ -399,6 +404,39 @@ export class PiGateway {
           beatInFlight = false;
           scheduleNextBeat();
         }
+      };
+      const beginTerminalization = (): void => {
+        // Stop scheduling before the terminal request. The in-flight beat is
+        // intentionally not turned into a new failure after this fence: its
+        // 404 is the expected result of the terminal transition winning the
+        // lease race.
+        beatsStopped = true;
+        if (heartbeatTimer !== undefined) {
+          clearTimeout(heartbeatTimer);
+          this.heartbeatTimers.delete(heartbeatTimer);
+          heartbeatTimer = undefined;
+        }
+      };
+      const terminalize = async (
+        outcome: "completed" | "completed_with_warnings" | "failed" | "cancelled",
+        payload?: Record<string, unknown>,
+      ): Promise<unknown> => {
+        beginTerminalization();
+        if (payload === undefined) {
+          return this.controlPlane.terminal(
+            claim.run_id,
+            claim.attempt_id,
+            outcome,
+            claim.lease_token,
+          );
+        }
+        return this.controlPlane.terminal(
+          claim.run_id,
+          claim.attempt_id,
+          outcome,
+          claim.lease_token,
+          payload,
+        );
       };
       try {
         // Start renewing before worker/session initialization completes; a
@@ -442,13 +480,7 @@ export class PiGateway {
         if (heartbeatOutcome === "cancelled") {
           await handle?.abort?.();
           if (!(await drainProjectedEvents())) return;
-          await this.controlPlane.terminal(
-            claim.run_id,
-            claim.attempt_id,
-            "cancelled",
-            claim.lease_token,
-            { code: "cancel_requested" },
-          );
+          await terminalize("cancelled", { code: "cancel_requested" });
           return;
         }
         if (handle?.done) await Promise.race([handle.done, heartbeatFailure]);
@@ -470,13 +502,7 @@ export class PiGateway {
         }
         if (heartbeatOutcome === "cancelled") {
           if (!(await drainProjectedEvents())) return;
-          await this.controlPlane.terminal(
-            claim.run_id,
-            claim.attempt_id,
-            "cancelled",
-            claim.lease_token,
-            { code: "cancel_requested" },
-          );
+          await terminalize("cancelled", { code: "cancel_requested" });
           return;
         }
         if (eventBufferError) {
@@ -484,9 +510,7 @@ export class PiGateway {
           this.onError(eventBufferError);
           return;
         }
-        await this.controlPlane.terminal(
-          claim.run_id, claim.attempt_id, "completed", claim.lease_token,
-        ).catch((error) => {
+        await terminalize("completed").catch((error) => {
           const infrastructureError = asPiGatewayInfrastructureError(error);
           if (!infrastructureError) throw error;
           this.onError(infrastructureError);
@@ -504,13 +528,7 @@ export class PiGateway {
         if (heartbeatOutcome === "cancelled") {
           if (!(await drainProjectedEvents())) return;
           try {
-            await this.controlPlane.terminal(
-              claim.run_id,
-              claim.attempt_id,
-              "cancelled",
-              claim.lease_token,
-              { code: "cancel_requested" },
-            );
+            await terminalize("cancelled", { code: "cancel_requested" });
           } catch (terminalError) {
             this.onError(terminalError);
           }
@@ -540,13 +558,7 @@ export class PiGateway {
             : "pi_model_provider_error";
           try {
             if (!(await drainProjectedEvents())) return;
-            await this.controlPlane.terminal(
-              claim.run_id,
-              claim.attempt_id,
-              "failed",
-              claim.lease_token,
-              { code: businessCode },
-            );
+            await terminalize("failed", { code: businessCode });
           } catch (terminalError) {
             this.onError(terminalError);
           }
@@ -560,13 +572,7 @@ export class PiGateway {
             terminalFailureAttempted = true;
             try {
               if (!(await drainProjectedEvents())) return;
-              await this.controlPlane.terminal(
-                claim.run_id,
-                claim.attempt_id,
-                "failed",
-                claim.lease_token,
-                { code: businessCode },
-              );
+              await terminalize("failed", { code: businessCode });
             } catch (terminalError) {
               this.onError(terminalError);
             }
@@ -576,13 +582,7 @@ export class PiGateway {
         this.onError(error);
         try {
           if (!(await drainProjectedEvents())) return;
-          await this.controlPlane.terminal(
-            claim.run_id,
-            claim.attempt_id,
-            "failed",
-            claim.lease_token,
-            { code: "pi_gateway_worker_failed" },
-          );
+          await terminalize("failed", { code: "pi_gateway_worker_failed" });
         } catch (terminalError) {
           this.onError(terminalError);
         }
@@ -590,9 +590,7 @@ export class PiGateway {
       } finally {
         // 先停止再清理：在飞的 beat 结束时会尝试自调度，必须先立停止标志，
         // 否则任务收口后仍会续租，把已结束的 Run 的 lease 永远续下去。
-        beatsStopped = true;
-        if (heartbeatTimer !== undefined) clearInterval(heartbeatTimer);
-        if (heartbeatTimer !== undefined) this.heartbeatTimers.delete(heartbeatTimer);
+        beginTerminalization();
         unregisterEvents?.();
         unregisterAbort?.();
         if (handle?.pid !== undefined) this.workerPids.delete(handle.pid);

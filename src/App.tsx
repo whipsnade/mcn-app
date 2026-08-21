@@ -194,6 +194,7 @@ export default function App() {
               isMockMode={false}
               run={workspace.run}
               runHistory={runHistory}
+              isCancelling={workspace.isCancelling}
               onResumeRun={() => workspace.resumeActiveRun()}
               onCancelRun={() => workspace.cancelActiveRun()}
               onRetryRun={runId => workspace.retryRun(runId)}

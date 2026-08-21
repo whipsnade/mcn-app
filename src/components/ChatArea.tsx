@@ -23,7 +23,7 @@ interface ChatAreaProps {
   isAnalyzing: boolean;
   /** 是否处于 brainstorm 澄清等待中（loading 文案区分于任务分析）。 */
   isClarifying?: boolean;
-  /** 取消请求已发出、等待任务收敛到终态（暂停按钮禁用并显示 loading）。 */
+  /** 取消请求已发出、等待任务收敛到终态（取消按钮禁用并显示 loading）。 */
   isCancelling?: boolean;
   isMockMode: boolean;
   /** 当前活跃 Run 的运行时状态（实时执行卡，锚定在触发消息下方）。 */
@@ -32,7 +32,7 @@ interface ChatAreaProps {
   runHistory?: Record<string, RunRuntimeState>;
   /** 恢复暂停的 Run（paused → 继续）。 */
   onResumeRun?: () => Promise<unknown>;
-  /** 暂停当前 Run（点击暂停按钮触发）。 */
+  /** 取消当前 Run（点击取消按钮触发）。 */
   onCancelRun?: () => Promise<unknown>;
   /** 兜底取消（旧任务流 App 仍传 onCancelTask；Task 23 切换到 onCancelRun 后移除）。 */
   onCancelTask?: () => Promise<unknown>;
@@ -559,7 +559,7 @@ export default function ChatArea({
           {isAnalyzing ? (
             <button
               type="button"
-              aria-label={isCancelling ? '正在取消' : '暂停'}
+              aria-label={isCancelling ? '正在取消' : '取消任务'}
               disabled={isCancelling}
               onClick={() => void (onCancelRun ?? onCancelTask)?.()}
               className={`px-3 py-2 rounded-lg text-white transition active:scale-95 ${
