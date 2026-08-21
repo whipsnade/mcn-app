@@ -356,3 +356,17 @@ Run 必须有当前 Run/Session/tenant 归属下至少一个已发布、不可�
 | 澄清、明确请求、自由组合、direct MCP、错误语义、unknown 继续 | 7、10 | Pi UAT/Completion/Gateway/skill tests |
 | 标准 Artifact/BI/Exporter 兼容与一次最终验证 | 5–7、11 | 受影响回归 + 最终唯一全量 |
 | runbook、QA、changelog、独立审查和本地 integration candidate | 10–11 | 文档、审查记录、merge candidate |
+
+### Task 15：Pi Gateway 事件投递 backpressure 修复（2026-08-21，当前续作）
+
+- [x] 保留旧行为红灯证据：固定 heartbeat、首次 transient delivery failure、同步注入 257 个事件的历史复现；记录
+  `event_buffer_overflow`、ACK=0、高水位 256、retry/heartbeat/terminal=0，并确认不涉及 provider/MCP/钱包。
+- [x] 先红后绿锁定 batch ≤32、canonical body ≤128 KiB、连续 source sequence、同批 ACK-loss 重放、gap 原子拒绝、
+  duplicate receipt、4xx/协议不重试、network/5xx 有界重试、永久故障留给 Recovery、terminal drain、取消 backlog 顺序、
+  旧单事件端点和既有 backend Recovery/terminal 回归。
+- [x] 实现独立串行 event pump，解耦 heartbeat；保留 256 有界队列，批次 ACK 前不丢弃；补齐后端事务接收、commit 后 broker、
+  metadata-only 诊断和健康计数；不改 provider/DataTap/catalog/积分/Artifact/required-artifact/迁移/历史数据。
+- [x] 建立线性提交：`f78c5ea`、`81d4bf9`、`c300ca2`、`60c47e8`、`edacdfb`。定向验证为 Gateway 64 passed/1 skipped、
+  Backend 28 passed、Gateway typecheck/build、Backend Ruff、diff check 全部通过。
+- [ ] 独立只读审查 Critical 0 / Important 0；审查通过后本轮最高状态才可推进到
+  `READY_FOR_SINGLE_REAL_WEB_UAT_REAUTHORIZATION`。在此之前不触发候选 CI、不 push、不部署、不创建第二个真实 Web UAT。

@@ -439,3 +439,58 @@ READY_FOR_FINAL_FUNCTIONAL_UAT_REVIEW`；在此之前不得合入 main、生产�
 - 因 Attempt 预算被 Recovery 路径突破且 MCP Result 门槛未满足，本轮不能宣称取消闭环通过，状态收口为
   `REAL_UAT_EVENT_BUFFER_OVERFLOW_CANCELLED / NOT_READY_FOR_FINAL_FUNCTIONAL_UAT`。不创建第二个 Web UAT，
   不合入 `main`，不部署生产，不执行 `5% → 25% → 100%` 灰度；`event_buffer_overflow` 是后续修复的真实运行时阻断。
+
+## 11. Pi Gateway 事件投递 backpressure 修复（2026-08-21，仅离线/定向验证）
+
+### 11.1 旧行为复现与初始分类
+
+- 历史复现用例为 `PiGateway > baseline: reproduces event overflow when transient delivery failure waits for heartbeat recovery`。
+  它使用默认生产 heartbeat interval，在第一次事件投递发生网络错误后同步注入 257 个事件；修复前观测到生产者
+  一次突发 257、首次 ACK=0、队列高水位=256、事件重试=0、heartbeat=0、terminal=0，旧路径随后 abort 并以
+  `event_buffer_overflow` 收口。该用例在修复后的套件中保留为历史证据并标记 skip，不删除、不改写为通过。
+- 初始分类确定为 **事件生产/内存缓冲/控制面 ACK 与恢复路径**，不是 provider、MCP、钱包、积分或 terminal
+  业务判断：失败发生在标准 MCP Result 到达模型之前，且旧 UAT 的 DataTap dispatch、AgentToolCall 与扣费均为 0。
+
+### 11.2 最小修复与安全边界
+
+- 新增独立串行 `EventDeliveryPump`：事件生产与 heartbeat 解耦；单批最多 32 条、canonical JSON 最多 128 KiB，
+  同一 Run/Attempt 使用连续 source sequence；批次在 ACK 前保留，timeout/network/5xx 只对同一批做有界短退避重试，
+  最多 5 次重试，并受 lease、cancel、shutdown fence 约束。4xx、业务拒绝、协议/序列错误不盲重试。
+- 后端 batch DTO、HMAC/nonce、lease、归属和事务接收各只执行一次；完整批次先校验再原子写入，commit 后按可见 sequence
+  发布。ACK 丢失时重放完全相同的 source batch，依靠 source identity 幂等，不重复写 AgentEvent、RuntimeUsageRecord、
+  assistant message 或 SSE。旧 `/events` 单事件端点仍保留兼容路径。
+- terminalization 先等待已提交事件 drain；永久控制面不可用时 fail-closed、终止 worker 并把 Run 留给既有 Recovery，
+  不伪造 terminal、不关闭 Recovery、不直接禁止 Attempt 2。取消 backlog 则优先在取消 fence 下有界收口，只有事件 ACK 后才发送
+  `run.cancelled`。
+- 诊断仅允许 `event/event_batch/heartbeat/terminal`、失败/重试/ACK/overflow、失败分类、合法 HTTP 状态、队列深度/高水位、
+  批大小、最后 ACK source sequence、连续失败数和 latency bucket；不含 payload、prompt、MCP result/arguments、模型输出、
+  用户数据、secret、Bearer、HMAC 或 DSN。健康指标新增 `event_delivery_failures_total`、
+  `event_delivery_retries_total`、`event_buffer_overflows_total`、`event_queue_high_water`、
+  `event_last_acked_source_sequence`。
+
+### 11.3 修复后定向证据
+
+| 指标 | 修复前历史复现 | 修复后离线/定向结果 |
+|---|---:|---:|
+| 生产者 | 257 条同步突发 | 257 条同步/分段注入均进入 pump，未触发 overflow |
+| ACK 吞吐 | 首次网络失败后为 0 | 65 条顺序泵测试最终 ACK=65；257 条 Gateway 测试 drain 后 terminal=1 |
+| 批次 | 无 batch，单事件失败即阻塞 | 每批 ≤32、同批重试；canonical body ≤128 KiB |
+| 事件高水位 | 256 后 overflow | 有界为 active batch+pending queue，不扩大 256 上限 |
+| 重试 | 0 | 一次网络失败后同批重试并 ACK；永久网络故障为 6 次调用（初次+5 次重试）后 fail-closed |
+| 终态顺序 | terminal=0 | 正常 drain 后 terminal=1；取消测试确认 sequence=4 ACK 在 `cancelled` 前 |
+
+以上是确定性测试计数/桶值，不是线上吞吐或 SLA 声明；真实 UAT 不在本轮执行。
+
+### 11.4 TDD、回归与停止边界
+
+- 线性提交为 `f78c5ea`（历史 RED 复现）、`81d4bf9`（batch contract RED/边界）、`c300ca2`（batch 接收与幂等）、
+  `60c47e8`（独立 pump、诊断、取消/terminal drain）和 `edacdfb`（协议常量及 failure 诊断计数收紧）。
+- 已通过 Gateway 定向 Vitest：6 个文件、64 passed、1 skipped（历史复现）；Gateway typecheck、build 通过；Backend
+  Pi Gateway 定向 pytest 28 passed；受影响 Ruff、`git diff --check` 通过。验证覆盖批次顺序、ACK-loss 同批重放、gap
+  全批拒绝且无部分写入、duplicate receipt 稳定、4xx/协议不重试、network/5xx 有界重试、永久故障留给 Recovery、
+  terminal drain、取消 backlog、旧单事件端点、事件/usage 顺序和既有 Recovery/terminal 回归。
+- 本轮未运行完整 backend pytest、完整离线 UAT、Browser E2E、历史 corpus replay、真实模型/provider、DataTap、钱包、
+  Web UAT、候选 CI、push、预发布部署、main 合入、生产部署或灰度；未修改 provider 请求协议、DataTap/catalog/积分、
+  Artifact/required-artifact、数据库迁移、历史 Run/Snapshot/Version。
+- 当前最高状态仍待独立只读审查确认后才可推进为 `READY_FOR_SINGLE_REAL_WEB_UAT_REAUTHORIZATION`；本节本身不授权
+  再次 Web UAT。

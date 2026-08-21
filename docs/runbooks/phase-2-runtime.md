@@ -145,6 +145,26 @@ fingerprint 和毫秒 UTC 时间戳。原始 `errorMessage` 只在 Worker 内存
 - 因此当前停止状态为 `REAL_UAT_EVENT_BUFFER_OVERFLOW_CANCELLED / NOT_READY_FOR_FINAL_FUNCTIONAL_UAT`。不得
   通过第二次 UAT、放宽 Attempt/事件边界或修改 provider 请求协议来替代该阻断。
 
+## 2026-08-21 事件投递 backpressure 修复运行口径
+
+Pi Gateway 的事件投递由独立串行 pump 负责，不再依赖 heartbeat 恢复事件缓冲。内存上限仍为 256 条；对支持 batch 的
+控制面，单批最多 32 条、canonical JSON 最多 128 KiB，source sequence 必须连续且绑定同一 Run/Attempt。批次在服务端
+ACK 前不得丢弃；timeout、network、HTTP 5xx 仅对同一批执行最多 5 次有界重试，并受 lease deadline、cancel 和 shutdown
+fence 约束。4xx、业务拒绝、协议或序列错误不得盲重试。
+
+接收端先完成整批严格 DTO、HMAC/nonce、lease、归属和序列校验，再在单事务内写入 AgentEvent、usage 和 message；commit 后
+按 sequence 发布。ACK 丢失可以重放同一批，source identity 保证幂等，不重复写事件、usage、message 或 SSE。旧单事件
+`/events` 端点保留为兼容路径。
+
+terminal 请求前必须等待事件 ACK drain；永久控制面故障不得伪造业务 terminal，Gateway 应停止 worker 并把 Run 留给既有
+Recovery。取消请求优先停止新的模型/MCP 外发，但允许已进入 pump 的 backlog 在有界 fence 内完成；只有 backlog ACK 后才发送
+`run.cancelled`。不得通过扩大 256、丢弃 thinking/message、禁用 Recovery 或直接禁止 Attempt 2 来掩盖故障。
+
+运维只观察以下 metadata-only 指标：`event_delivery_failures_total`、`event_delivery_retries_total`、
+`event_buffer_overflows_total`、`event_queue_high_water`、`event_last_acked_source_sequence`，以及事件/heartbeat/terminal
+诊断中的安全失败分类、批大小和 latency bucket。日志中不得记录事件 payload、prompt、MCP result/arguments、模型输出、
+token、Bearer、HMAC 或 DSN。此次修复只做离线/定向验证，未执行真实 UAT、部署或 CI push。
+
 ## 凭据与日志
 
 日志调用 `app.core.redaction.redact_for_log()` 后再序列化。该函数递归遮蔽授权头、Cookie、手机号、模型/MCP token、JWT 密钥和 MySQL 密码；严禁打印原始请求头、环境变量或完整 Prompt。模型永远不接触 DataTap token、数据库 DSN 或 JWT 密钥。

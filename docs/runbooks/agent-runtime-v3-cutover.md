@@ -414,3 +414,22 @@ IPC、HTTP、事件或日志边界；未知分类必须为 `unknown`。
   预算，且 MCP Result 门槛未满足。
 - 该结果不是 `READY_FOR_FINAL_FUNCTIONAL_UAT_REVIEW`。后续只能修复并定向验证事件缓冲/恢复边界；本轮不创建第二
   个 Web UAT、不合入 main、不部署生产、不执行灰度。
+
+### 5.15 2026-08-21 事件投递 backpressure 修复（未执行真实 UAT）
+
+- 旧复现：第一次事件发送 timeout/network/5xx 后，heartbeat 恢复并未独立推进事件 ACK；同步产生超过 256 条事件时，旧
+  路径以 `event_buffer_overflow` abort，未发送 terminal。该问题归类为事件生产/控制面 ACK/恢复路径，不是 provider、MCP、
+  钱包或完成校验问题。
+- 新路径：独立串行 event pump，队列上限仍为 256；batch ≤32 条、canonical JSON ≤128 KiB；批次保留到 ACK，只有
+  timeout/network/5xx 对完全相同批次做最多 5 次受 lease/cancel/shutdown 约束的短退避重试。4xx、业务拒绝、协议/序列错误
+  fail-closed，不盲重试；旧单事件 endpoint 仍兼容。
+- 后端 batch 接收严格校验同一 Run/Attempt、连续 source sequence、exact-key、HMAC/nonce、lease、租户归属和容量，整批单事务
+  写入，commit 后发布。重复批次返回稳定 receipt；ACK loss 重放不重复 AgentEvent、RuntimeUsageRecord、message 或 SSE。
+- terminal 必须在 drain/ACK 后发送；永久控制面故障停止 worker 并留给原有 Recovery，不能伪造 terminal。取消时不生成新的外发，
+  已入队 backlog 在有界范围内 drain，ACK 后才发送唯一 `run.cancelled`。
+- 仅新增 metadata-only 诊断和健康计数：失败/重试/overflow、高水位、最后 ACK source sequence、批大小、连续失败和 latency
+  bucket；禁止记录 payload、prompt、MCP/模型内容、secret、Bearer、HMAC 或 DSN。该修复未改 provider、DataTap、积分、Artifact、
+  required-artifact、迁移或历史数据。
+- 定向验证：Gateway 6 个 Vitest 文件 64 passed/1 skipped（历史 RED 复现保留）、typecheck/build 通过；Backend Pi Gateway
+  28 passed；Ruff 和 diff check 通过。没有执行完整 pytest、离线 UAT、真实模型/DataTap、Browser E2E、CI push、部署、Web UAT
+  或生产灰度。
