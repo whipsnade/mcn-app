@@ -4,6 +4,8 @@ import {
   parsePiGatewaySourceEventBatch,
   parsePiGatewaySourceEventBatchReceipt,
   piGatewaySourceEventBatchBytes,
+  PI_GATEWAY_EVENT_BATCH_MAX_BYTES,
+  PI_GATEWAY_EVENT_BATCH_MAX_EVENTS,
   type PiGatewaySourceEvent,
   type PiGatewaySourceEventBatchReceipt,
 } from "./protocol.js";
@@ -299,6 +301,7 @@ export class EventDeliveryPump {
           this.fail(
             new EventDeliveryFailure("control_plane_unreachable", classification.failureClass, classification.status),
             "failure",
+            false,
           );
           return;
         }
@@ -317,11 +320,11 @@ export class EventDeliveryPump {
 
   private takeBatch(): PiGatewaySourceEvent[] {
     if (!this.sendEventBatch) return [this.queue.shift() as PiGatewaySourceEvent];
-    const maximum = Math.min(this.queue.length, 32);
+    const maximum = Math.min(this.queue.length, PI_GATEWAY_EVENT_BATCH_MAX_EVENTS);
     let count = 1;
-    while (count < maximum && batchBytes(this.queue.slice(0, count + 1)) <= 128 * 1024) count += 1;
+    while (count < maximum && batchBytes(this.queue.slice(0, count + 1)) <= PI_GATEWAY_EVENT_BATCH_MAX_BYTES) count += 1;
     const candidate = this.queue.slice(0, count);
-    if (batchBytes(candidate) > 128 * 1024) {
+    if (batchBytes(candidate) > PI_GATEWAY_EVENT_BATCH_MAX_BYTES) {
       throw new EventDeliveryFailure("control_plane_unreachable", "protocol");
     }
     this.queue.splice(0, count);
@@ -388,16 +391,22 @@ export class EventDeliveryPump {
     });
   }
 
-  private fail(failure: EventDeliveryFailure, kind: EventDeliveryDiagnosticKind): void {
+  private fail(
+    failure: EventDeliveryFailure,
+    kind: EventDeliveryDiagnosticKind,
+    emitDiagnostic = true,
+  ): void {
     if (this.fatalFailure) return;
     this.fatalFailure = failure;
-    this.emitDiagnostic({
-      operation: this.sendEventBatch ? "event_batch" : "event",
-      kind,
-      failure_class: failure.failureClass,
-      ...(failure.status === undefined ? {} : { status: failure.status }),
-      batch_size: this.activeBatch?.length ?? 0,
-    });
+    if (emitDiagnostic) {
+      this.emitDiagnostic({
+        operation: this.sendEventBatch ? "event_batch" : "event",
+        kind,
+        failure_class: failure.failureClass,
+        ...(failure.status === undefined ? {} : { status: failure.status }),
+        batch_size: this.activeBatch?.length ?? 0,
+      });
+    }
     this.onPermanentFailure(failure);
   }
 }
