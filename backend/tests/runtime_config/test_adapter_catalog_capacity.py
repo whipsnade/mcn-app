@@ -94,7 +94,7 @@ async def test_reviewed_adapter_catalog_has_bounded_complete_capacity(
 async def test_reviewed_adapter_catalog_excludes_disabled_and_quarantined_rows(db_session) -> None:
     approved = _catalog_rows(58)
     disabled = _catalog_rows(1, prefix="disabled", is_enabled=False)
-    quarantined = _catalog_rows(1, prefix="quarantined", review_status="quarantined")
+    quarantined = _catalog_rows(1, prefix="query_user_info", review_status="quarantined")
     await _add_catalog(db_session, [*approved, *disabled, *quarantined])
 
     entries = await RuntimeConfigService(db_session, cipher=_cipher())._reviewed_adapter_catalog()
@@ -102,7 +102,7 @@ async def test_reviewed_adapter_catalog_excludes_disabled_and_quarantined_rows(d
     names = {entry["adapter_visible_name"] for entry in entries}
     assert len(entries) == 58
     assert "disabled_000" not in names
-    assert "quarantined_000" not in names
+    assert "query_user_info_000" not in names
 
 
 @pytest.mark.asyncio

@@ -161,6 +161,11 @@ export interface PiGatewayClaimResponse {
   internal_tools: Array<Record<string, unknown>>;
 }
 
+// Control-plane transport bounds only; directTools=false still exposes one
+// model-visible MCP proxy, not one top-level tool per catalog entry.
+export const PI_GATEWAY_ADAPTER_CATALOG_MAX_ENTRIES = 128;
+export const PI_GATEWAY_ADAPTER_CATALOG_MAX_BYTES = 128 * 1024;
+
 const PI_ADAPTER_SERVICE_ALIASES: Readonly<Record<string, string>> = Object.freeze({
   "insight-cube-mcp": "insight-cube",
   "social-grow-mcp": "social-grow",
@@ -178,6 +183,7 @@ const PI_ADAPTER_SERVICE_ALIASES: Readonly<Record<string, string>> = Object.free
 export function normalizePiGatewayAdapterCatalog(
   entries: readonly PiGatewayAdapterCatalogEntry[],
 ): AdapterCatalogEntry[] {
+  assertAdapterCatalogBounds(entries);
   const seen = new Set<string>();
   return entries.map((entry) => {
     const service = PI_ADAPTER_SERVICE_ALIASES[entry.service] ?? entry.service;
@@ -196,6 +202,30 @@ export function normalizePiGatewayAdapterCatalog(
       schemaDigest: entry.input_schema_digest,
     };
   });
+}
+
+function canonicalizeJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map((item) => canonicalizeJson(item));
+  if (isRecord(value)) {
+    return Object.fromEntries(
+      Object.keys(value).sort().map((key) => [key, canonicalizeJson(value[key])]),
+    );
+  }
+  return value;
+}
+
+function adapterCatalogCanonicalJsonBytes(value: readonly unknown[]): number {
+  const serialized = JSON.stringify(canonicalizeJson(value));
+  return new TextEncoder().encode(serialized ?? "null").byteLength;
+}
+
+function assertAdapterCatalogBounds(entries: readonly unknown[]): void {
+  if (
+    entries.length > PI_GATEWAY_ADAPTER_CATALOG_MAX_ENTRIES ||
+    adapterCatalogCanonicalJsonBytes(entries) > PI_GATEWAY_ADAPTER_CATALOG_MAX_BYTES
+  ) {
+    throw new Error("pi_gateway_adapter_catalog_invalid");
+  }
 }
 
 /**
@@ -323,9 +353,14 @@ export function parsePiGatewayClaimResponse(value: unknown): PiGatewayClaimRespo
     !isRecord(envelope) || !exactKeys(envelope, ["alg", "nonce", "ciphertext"]) ||
     envelope.alg !== "AES-256-GCM" || typeof envelope.nonce !== "string" || envelope.nonce.length < 16 || envelope.nonce.length > 64 ||
     typeof envelope.ciphertext !== "string" || envelope.ciphertext.length < 16 || envelope.ciphertext.length > 200_000 ||
-    !Array.isArray(value.adapter_catalog) || value.adapter_catalog.length > 32 ||
+    !Array.isArray(value.adapter_catalog) ||
     !Array.isArray(value.internal_tools) || value.internal_tools.length > 64
   ) throw new Error("pi_gateway_claim_response_invalid");
+  try {
+    assertAdapterCatalogBounds(value.adapter_catalog);
+  } catch {
+    throw new Error("pi_gateway_claim_response_invalid");
+  }
   if (
     new TextEncoder().encode(JSON.stringify(value.runtime_snapshot)).byteLength > 256 * 1024 ||
     value.transcript.some((item) => {

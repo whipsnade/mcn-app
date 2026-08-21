@@ -7,7 +7,15 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .catalog import (
+    PI_GATEWAY_ADAPTER_CATALOG_MAX_BYTES,
+    PI_GATEWAY_ADAPTER_CATALOG_MAX_ENTRIES,
+    canonical_adapter_catalog_bytes,
+    normalized_adapter_service,
+)
 from .events import normalize_source_payload, normalize_usage_payload
+
+
 class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
@@ -220,6 +228,24 @@ class PiGatewayTerminalRequest(_StrictModel):
 
 
 class PiGatewayClaimResponse(_StrictModel):
+    @model_validator(mode="before")
+    @classmethod
+    def bound_adapter_catalog_payload(cls, value: Any) -> Any:
+        if not isinstance(value, Mapping):
+            return value
+        adapter_catalog = value.get("adapter_catalog")
+        if not isinstance(adapter_catalog, list):
+            return value
+        if len(adapter_catalog) > PI_GATEWAY_ADAPTER_CATALOG_MAX_ENTRIES:
+            raise ValueError("pi_gateway_claim_catalog_too_large")
+        try:
+            catalog_bytes = canonical_adapter_catalog_bytes(adapter_catalog)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("pi_gateway_claim_catalog_invalid") from exc
+        if len(catalog_bytes) > PI_GATEWAY_ADAPTER_CATALOG_MAX_BYTES:
+            raise ValueError("pi_gateway_claim_catalog_too_large")
+        return value
+
     run_id: str = Field(min_length=1, max_length=64)
     attempt_id: str = Field(min_length=1, max_length=64)
     lease_token: str = Field(min_length=32, max_length=512)
@@ -229,7 +255,10 @@ class PiGatewayClaimResponse(_StrictModel):
     runtime_snapshot: dict[str, Any]
     transcript: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
     secret_envelope: RuntimeSecretEnvelope
-    adapter_catalog: list[PiGatewayAdapterCatalogEntry] = Field(default_factory=list, max_length=32)
+    adapter_catalog: list[PiGatewayAdapterCatalogEntry] = Field(
+        default_factory=list,
+        max_length=PI_GATEWAY_ADAPTER_CATALOG_MAX_ENTRIES,
+    )
     internal_tools: list[dict[str, Any]] = Field(default_factory=list, max_length=64)
 
     @model_validator(mode="after")
@@ -250,6 +279,12 @@ class PiGatewayClaimResponse(_StrictModel):
         for item in self.internal_tools:
             if set(item) != {"name"} or not isinstance(item.get("name"), str) or not item["name"]:
                 raise ValueError("pi_gateway_internal_tools_invalid")
+        seen: set[str] = set()
+        for item in self.adapter_catalog:
+            identity = f"{normalized_adapter_service(item.service)}\u0000{item.adapter_visible_name}"
+            if identity in seen:
+                raise ValueError("pi_gateway_adapter_catalog_duplicate")
+            seen.add(identity)
         return self
 
 

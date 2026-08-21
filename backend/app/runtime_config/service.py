@@ -24,6 +24,11 @@ from app.marketing_skills.snapshot import (
     SkillSnapshotError,
     SkillSnapshotService,
 )
+from app.pi_gateway.catalog import (
+    PI_GATEWAY_ADAPTER_CATALOG_MAX_BYTES,
+    PI_GATEWAY_ADAPTER_CATALOG_MAX_ENTRIES,
+    canonical_adapter_catalog_bytes,
+)
 from app.tenancy.models import Tenant
 from app.tenancy.service import effective_runtime_backend
 
@@ -412,9 +417,9 @@ class RuntimeConfigService:
                 .order_by(McpToolCatalog.internal_tool_name)
             )
         ).all()
-        if len(rows) > 32:
-            # Pi claim 的 adapter catalog 有明确上限；不要静默截断已审核
-            # 能力，避免新 Run 得到一个不完整且难以审计的快照。
+        if len(rows) > PI_GATEWAY_ADAPTER_CATALOG_MAX_ENTRIES:
+            # 这是 control-plane catalog 的防御性边界，不是模型可见工具数量
+            # 或 Pi SDK 的业务限制；不要静默截断已审核能力。
             raise RuntimeConfigError("runtime_adapter_catalog_too_large")
         entries: list[dict[str, str]] = []
         for catalog, discovered_remote_name in rows:
@@ -430,6 +435,12 @@ class RuntimeConfigService:
                     ),
                 }
             )
+        try:
+            catalog_bytes = canonical_adapter_catalog_bytes(entries)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeConfigError("runtime_adapter_catalog_invalid") from exc
+        if len(catalog_bytes) > PI_GATEWAY_ADAPTER_CATALOG_MAX_BYTES:
+            raise RuntimeConfigError("runtime_adapter_catalog_too_large")
         return entries
 
     async def resolve_secret_bundle(
