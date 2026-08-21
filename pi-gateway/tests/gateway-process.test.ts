@@ -77,7 +77,6 @@ describe("PiGateway process-level event delivery", () => {
           event_type: "message.start",
           payload: {},
         });
-        if (sequence % 4 === 0) await new Promise((resolve) => setImmediate(resolve));
       }
       finish();
       await tick;

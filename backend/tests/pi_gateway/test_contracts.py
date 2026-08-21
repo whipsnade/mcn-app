@@ -162,6 +162,15 @@ def test_source_event_batch_is_strict_bounded_and_contiguous() -> None:
         for sequence in (1, 2)
     ]
     assert PiGatewaySourceEventBatch(events=events).events == events
+    with pytest.raises(ValidationError):
+        PiGatewaySourceEvent.model_validate(
+            {
+                "source_event_id": "attempt-batch:1",
+                "sequence": "1",
+                "event_type": "message.start",
+                "payload": {},
+            }
+        )
     with pytest.raises(ValidationError, match="pi_gateway_event_batch_attempt_mismatch"):
         PiGatewaySourceEventBatch.model_validate(
             {"events": [events[0], {**events[1].model_dump(), "source_event_id": "other:2"}]}

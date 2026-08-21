@@ -241,7 +241,7 @@ _IDENTITY_PAYLOAD_KEYS = {
 
 class PiGatewaySourceEvent(_StrictModel):
     source_event_id: str = Field(pattern=r"^[A-Za-z0-9._:-]{1,160}$")
-    sequence: int = Field(ge=1, le=10_000_000)
+    sequence: StrictInt = Field(ge=1, le=10_000_000)
     event_type: str = Field(min_length=1, max_length=64)
     payload: dict[str, Any] = Field(default_factory=dict)
 

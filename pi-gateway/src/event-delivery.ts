@@ -83,7 +83,7 @@ function batchBytes(events: readonly PiGatewaySourceEvent[]): number {
   return piGatewaySourceEventBatchBytes(events);
 }
 
-function latencyBucket(milliseconds: number): EventDeliveryDiagnostic["latency_bucket"] {
+export function eventDeliveryLatencyBucket(milliseconds: number): EventDeliveryDiagnostic["latency_bucket"] {
   if (milliseconds < 50) return "lt_50ms";
   if (milliseconds < 250) return "50_250ms";
   if (milliseconds < 1_000) return "250_1000ms";
@@ -192,7 +192,7 @@ export class EventDeliveryPump {
   }
 
   get queueDepth(): number {
-    return this.queue.length + (this.activeBatch?.length ?? 0);
+    return this.queue.length;
   }
 
   get highWater(): number {
@@ -231,12 +231,12 @@ export class EventDeliveryPump {
     }
     if (this.expectedSequence === undefined) this.expectedSequence = parsed.sequence + 1;
     else this.expectedSequence += 1;
-    if (this.queueDepth >= this.maxBufferedEvents) {
+    if (this.queue.length >= this.maxBufferedEvents) {
       this.fail(new EventDeliveryFailure("event_buffer_overflow", "protocol"), "overflow");
       return false;
     }
     this.queue.push(parsed);
-    this.queueHighWater = Math.max(this.queueHighWater, this.queueDepth);
+    this.queueHighWater = Math.max(this.queueHighWater, this.queue.length);
     this.ensureRunner();
     return true;
   }
@@ -270,14 +270,16 @@ export class EventDeliveryPump {
 
   private async run(): Promise<void> {
     let transientRetries = 0;
+    let startedAt = this.now();
     while (!this.stopped && !this.fatalFailure) {
       try {
+        startedAt = this.now();
         if (this.activeBatch === undefined) {
           if (this.queue.length === 0) return;
           this.activeBatch = this.takeBatch();
           transientRetries = 0;
         }
-        await this.deliver(this.activeBatch);
+        await this.deliver(this.activeBatch, startedAt);
         this.activeBatch = undefined;
         transientRetries = 0;
         this.consecutiveFailures = 0;
@@ -289,7 +291,7 @@ export class EventDeliveryPump {
           failure_class: classification.failureClass,
           ...(classification.status === undefined ? {} : { status: classification.status }),
           batch_size: this.activeBatch?.length ?? 0,
-          latency_bucket: "lt_50ms",
+          latency_bucket: eventDeliveryLatencyBucket(Math.max(0, this.now() - startedAt)),
         });
         const delayMs = Math.min(1_000, this.retryBaseMs * 2 ** transientRetries);
         if (
@@ -311,7 +313,7 @@ export class EventDeliveryPump {
           failure_class: classification.failureClass,
           ...(classification.status === undefined ? {} : { status: classification.status }),
           batch_size: this.activeBatch?.length ?? 0,
-          latency_bucket: "lt_50ms",
+          latency_bucket: eventDeliveryLatencyBucket(Math.max(0, this.now() - startedAt)),
         });
         await this.wait(delayMs);
       }
@@ -331,8 +333,7 @@ export class EventDeliveryPump {
     return candidate;
   }
 
-  private async deliver(batch: PiGatewaySourceEvent[]): Promise<void> {
-    const startedAt = this.now();
+  private async deliver(batch: PiGatewaySourceEvent[], startedAt: number): Promise<void> {
     const operation = this.sendEventBatch ? "event_batch" : "event";
     if (this.sendEventBatch) {
       const parsedBatch = parsePiGatewaySourceEventBatch({ events: batch });
@@ -348,7 +349,7 @@ export class EventDeliveryPump {
       operation,
       kind: "ack",
       batch_size: batch.length,
-      latency_bucket: latencyBucket(Math.max(0, this.now() - startedAt)),
+      latency_bucket: eventDeliveryLatencyBucket(Math.max(0, this.now() - startedAt)),
     });
   }
 

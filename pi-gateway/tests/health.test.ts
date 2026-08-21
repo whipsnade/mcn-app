@@ -19,6 +19,7 @@ function snapshot(overrides: Partial<GatewayMetricsSnapshot> = {}): GatewayMetri
     event_buffer_overflows_total: 0,
     event_queue_high_water: 0,
     event_last_acked_source_sequence: null,
+    last_control_plane_diagnostic: null,
     ...overrides,
   };
 }
@@ -66,6 +67,41 @@ describe("gateway health server", () => {
     try {
       const ready = await fetch(`http://127.0.0.1:${server.port}/readyz`);
       expect(ready.status).toBe(503);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it("exposes the last event diagnostic without event payload data", async () => {
+    const server = await startHealthServer({
+      host: "127.0.0.1",
+      port: 0,
+      source: {
+        snapshot: () => snapshot({
+          last_control_plane_diagnostic: {
+            operation: "event_batch",
+            kind: "failure",
+            failure_class: "network",
+            queue_depth: 4,
+            queue_high_water: 12,
+            batch_size: 8,
+            last_acked_source_sequence: 16,
+            consecutive_failures: 1,
+            latency_bucket: "50_250ms",
+          },
+        }),
+      },
+    });
+    try {
+      const response = await fetch(`http://127.0.0.1:${server.port}/metrics`);
+      const body = (await response.json()) as Record<string, unknown>;
+      expect(body.last_control_plane_diagnostic).toMatchObject({
+        operation: "event_batch",
+        kind: "failure",
+        failure_class: "network",
+        batch_size: 8,
+      });
+      expect(JSON.stringify(body.last_control_plane_diagnostic)).not.toMatch(/payload|prompt|secret|token|bearer|dsn/i);
     } finally {
       await server.close();
     }

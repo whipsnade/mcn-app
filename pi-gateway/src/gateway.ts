@@ -10,6 +10,7 @@ import { WorkerPool } from "./worker-pool.js";
 import {
   EventDeliveryPump,
   classifyEventDeliveryFailure,
+  eventDeliveryLatencyBucket,
   type EventDeliveryDiagnostic,
   type EventDeliveryFailure,
 } from "./event-delivery.js";
@@ -336,6 +337,7 @@ export class PiGateway {
         operation: "heartbeat" | "terminal",
         error: unknown,
         consecutiveFailures: number,
+        startedAt: number,
       ): void => {
         const classified = classifyEventDeliveryFailure(error);
         this.onEventDeliveryDiagnostic({
@@ -348,7 +350,7 @@ export class PiGateway {
           batch_size: 0,
           last_acked_source_sequence: eventPump?.lastAckedSequence ?? null,
           consecutive_failures: consecutiveFailures,
-          latency_bucket: "lt_50ms",
+          latency_bucket: eventDeliveryLatencyBucket(Math.max(0, Date.now() - startedAt)),
         });
       };
       const markLost = (cause: unknown): void => {
@@ -380,6 +382,7 @@ export class PiGateway {
       const beat = async (): Promise<void> => {
         if (heartbeatFailed || beatInFlight) return;
         beatInFlight = true;
+        const startedAt = Date.now();
         try {
           const remainingMs = leaseDeadlineMs - Date.now();
           if (remainingMs <= abortGraceMs) {
@@ -433,7 +436,7 @@ export class PiGateway {
           } catch (error) {
             if (beatsStopped) return;
             consecutiveHeartbeatFailures += 1;
-            reportControlPlaneFailure("heartbeat", error, consecutiveHeartbeatFailures);
+            reportControlPlaneFailure("heartbeat", error, consecutiveHeartbeatFailures, startedAt);
             this.onError(
               asPiGatewayInfrastructureError(error)
                 ?? new PiGatewayInfrastructureError("control_plane_unreachable", error),
@@ -471,6 +474,7 @@ export class PiGateway {
         failureMetadata?: ProviderFailureMetadata,
       ): Promise<unknown> => {
         beginTerminalization();
+        const startedAt = Date.now();
         try {
           if (payload === undefined) {
             if (failureMetadata === undefined) {
@@ -508,7 +512,7 @@ export class PiGateway {
             failureMetadata,
           );
         } catch (error) {
-          reportControlPlaneFailure("terminal", error, 1);
+          reportControlPlaneFailure("terminal", error, 1, startedAt);
           throw error;
         }
       };

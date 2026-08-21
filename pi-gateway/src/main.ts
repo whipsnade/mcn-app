@@ -379,12 +379,14 @@ export async function runGatewayMain(deps: GatewayMainDependencies = {}): Promis
     eventBufferOverflowsTotal: 0,
     eventQueueHighWater: 0,
     eventLastAckedSourceSequence: null as number | null,
+    lastControlPlaneDiagnostic: null as EventDeliveryDiagnostic | null,
   };
   const recordError = (error: unknown): void => {
     state.errorsTotal += 1;
     state.lastErrorCode = errorCode(error);
   };
   const recordEventDeliveryDiagnostic = (diagnostic: EventDeliveryDiagnostic): void => {
+    state.lastControlPlaneDiagnostic = { ...diagnostic };
     if (diagnostic.operation !== "event" && diagnostic.operation !== "event_batch") return;
     if (diagnostic.kind === "failure" || diagnostic.kind === "overflow") {
       state.eventDeliveryFailuresTotal += 1;
@@ -449,6 +451,7 @@ export async function runGatewayMain(deps: GatewayMainDependencies = {}): Promis
         event_buffer_overflows_total: state.eventBufferOverflowsTotal,
         event_queue_high_water: state.eventQueueHighWater,
         event_last_acked_source_sequence: state.eventLastAckedSourceSequence,
+        last_control_plane_diagnostic: state.lastControlPlaneDiagnostic,
         ...(config.environment === "test" ? { worker_pids: [...gateway.activeWorkerPids] } : {}),
       }),
     },

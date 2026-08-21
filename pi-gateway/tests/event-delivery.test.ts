@@ -88,6 +88,31 @@ describe("EventDeliveryPump", () => {
     expect(batches[1]).toEqual(batches[0]);
   });
 
+  it("records measured latency buckets for failure and ACK diagnostics", async () => {
+    const diagnostics: EventDeliveryDiagnostic[] = [];
+    let calls = 0;
+    let clock = 0;
+    const pump = new EventDeliveryPump(pumpOptions({
+      now: () => {
+        clock += 1_500;
+        return clock;
+      },
+      sendEventBatch: vi.fn(async (_runId, events) => {
+        calls += 1;
+        if (calls === 1) throw Object.assign(new Error("temporary network"), { code: "pi_gateway_network_error" });
+        return receipt(events);
+      }),
+      onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+    }));
+    pump.enqueue(event(1));
+
+    await expect(pump.drain()).resolves.toBe(true);
+    expect(diagnostics).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "failure", latency_bucket: "gte_1000ms" }),
+      expect.objectContaining({ kind: "ack", latency_bucket: "gte_1000ms" }),
+    ]));
+  });
+
   it("does not retry business rejection or malformed receipts", async () => {
     const businessPermanent = vi.fn();
     const businessPump = new EventDeliveryPump(pumpOptions({

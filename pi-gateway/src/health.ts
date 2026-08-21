@@ -1,4 +1,5 @@
 import { createServer, type Server } from "node:http";
+import type { EventDeliveryDiagnostic } from "./event-delivery.js";
 
 /** Operational metrics projection; contains no tenant, user or secret data. */
 export interface GatewayMetricsSnapshot {
@@ -17,6 +18,7 @@ export interface GatewayMetricsSnapshot {
   event_buffer_overflows_total: number;
   event_queue_high_water: number;
   event_last_acked_source_sequence: number | null;
+  last_control_plane_diagnostic: EventDeliveryDiagnostic | null;
   /** Test-only process ownership probe; omitted in production responses. */
   worker_pids?: number[];
 }

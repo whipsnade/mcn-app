@@ -127,7 +127,6 @@ describe("PiGateway", () => {
         event_type: "message.start",
         payload: {},
       });
-      if (sequence % 4 === 0) await new Promise<void>((resolve) => setTimeout(resolve, 0));
     }
     finish();
 
