@@ -211,6 +211,13 @@ heartbeat 测试时序失败；Migration safety、Pi Runtime 成功，Backend �
 根目录 `npm run lint` 也通过。`7d487f6` 补齐 Frontend job 的 Pi Runtime/Gateway 锁定依赖，并让
 该 Gateway 测试等待两次 heartbeat failure 的稳定调度窗口；它将由 candidate-r7 验证。
 
+candidate-r7（`35ccc37`）对应 Actions run `32473243258` 已结束为 failure。公开状态显示 Migration
+safety、Frontend、Pi Runtime、Pi Gateway 全部成功；Browser E2E 失败，根因为 Playwright 默认使用
+`backend/.venv/bin/python`，而 CI Browser job 使用系统 `python` 安装依赖且没有创建该 venv，与此前
+隔离工作树启动错误一致。提交 `e61b473` 在 Browser job 显式设置 `BACKEND_PYTHON=python`；本地完整
+Browser E2E 已 `51 passed in 1.2m`。Backend 仍只有步骤级 `Pytest exit code 1`，没有公开测试名或
+日志，未做猜测性修复。
+
 ## 6. 安全与兼容结论
 
 - 标准 MCP Result 直通不是放宽安全：模型仍只能经审核工具、当前租户/Session/Run 归属和固定计费
@@ -225,7 +232,8 @@ heartbeat 测试时序失败；Migration safety、Pi Runtime 成功，Backend �
 独立只读审查已完成，结论为 Critical 0 / Important 0；本轮线性提交包括
 `fd61e9e`（runtime）、`dbd2a96`（tests/UAT）、`de7c45b`（docs）、`2644065`（fixture）、
 `f3d3881`（CI）、`0bb65bc`（candidate CI 边界）、`7b83d82`（E2E 取消语义）、`ddc6a82`
-（Node CI 测试兼容）、`984dc90`（r6 失败证据）和 `7d487f6`（workspace 依赖/heartbeat 测试）。
+（Node CI 测试兼容）、`984dc90`（r6 失败证据）、`7d487f6`（workspace 依赖/heartbeat 测试）和
+`e61b473`（Browser runner Python）。
 候选已合入本地 `main`，但远程 GitHub CI 当前失败、预发布和一次真实 Web
 UAT尚未完成，因此状态仍为
 `NOT_READY_FOR_PREDEPLOYMENT`。本轮未执行生产灰度。
