@@ -100,5 +100,6 @@
 - [x] 本地完整 Browser E2E 的唯一失败类型已定位为旧“暂停”选择器，提交 `7b83d82` 改为“取消任务”；隔离三个视口验证 `3 passed in 6.9s`。
 - [x] `0bb65bc` 对应远程 Actions run `32470724885` 未全绿（Backend、Frontend、Browser E2E、Pi Gateway failed；公开 API 日志下载 403）；已保留为候选-r4 失败证据。
 - [x] `d53b345` 对应 candidate-r5 的远程 Actions run `32471771494` 未全绿；公开 annotations 定位到 Frontend Blob fixture 与 Gateway worker 测试超时，Backend/Browser 仍只有步骤级 exit code。提交 `ddc6a82` 完成两项最小测试兼容修复，定向本地验证 `12 passed + 1 passed`，未修改生产路径。
-- [ ] 以 `ddc6a82` 重建新的 integration candidate 并取得远程 CI 全绿；在此之前不得部署预发布或执行真实 Web UAT：通过门槛后仅执行一次专用 UAT 租户的“Direct MCP + 取消”组合 Web UAT：一次瑞幸咖啡请求，Attempt=1、模型≤10、DataTap≤5、积分≤50、retries=0、fresh Run=0。
+- [x] candidate-r6（`984dc90`）对应远程 Actions run `32472516897` 未全绿；该 run 仍验证的是 `ddc6a82`，Frontend workspace 依赖与 Gateway heartbeat 测试失败，Backend/Browser 仍只有步骤级 exit code。当前工作树完整 Browser E2E `51 passed in 1.2m`。
+- [ ] 以 `7d487f6` 重建 candidate-r7 并取得远程 CI 全绿；在此之前不得部署预发布或执行真实 Web UAT：通过门槛后仅执行一次专用 UAT 租户的“Direct MCP + 取消”组合 Web UAT：一次瑞幸咖啡请求，Attempt=1、模型≤10、DataTap≤5、积分≤50、retries=0、fresh Run=0。
 - [ ] 组合 UAT 必须记录一个此前会产生 `unsupported_content` 的工具成功返回、模型收到标准结果、点击“取消任务”后的阶段时间戳、无后续外发、唯一 cancelled、Attempt/ToolCall/permit/lease/worker/端口收口。通过后只报告 `REAL_UAT_MCP_PASS_THROUGH_AND_CANCEL_PASS / READY_FOR_FINAL_FUNCTIONAL_UAT`；本轮不做生产灰度。

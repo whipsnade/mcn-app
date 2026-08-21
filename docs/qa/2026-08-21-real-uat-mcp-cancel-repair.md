@@ -204,6 +204,13 @@ Frontend 的两个 Blob 下载测试在 Node 22/jsdom 环境报 `object.stream i
 取消/直通逻辑未改。修复后的本地定向结果为 Artifact 下载 `12 passed`、worker 场景 `1 passed`。
 由于 Backend/Browser 的具体日志仍不可见，不能把它们归因或宣称已修复；需由下一候选 CI 给出结果。
 
+candidate-r6（`984dc90`）对应 Actions run `32472516897` 已结束为 failure。该 candidate 尚未包含
+`7d487f6`，因此公开 annotation 仍是上一轮已知的 Frontend workspace 依赖缺失和 Gateway early
+heartbeat 测试时序失败；Migration safety、Pi Runtime 成功，Backend 与 Browser 仍只有步骤级 exit code
+1。随后在当前修复工作树执行完整 Browser E2E：`51 passed in 1.2m`；Gateway heartbeat 定向用例与
+根目录 `npm run lint` 也通过。`7d487f6` 补齐 Frontend job 的 Pi Runtime/Gateway 锁定依赖，并让
+该 Gateway 测试等待两次 heartbeat failure 的稳定调度窗口；它将由 candidate-r7 验证。
+
 ## 6. 安全与兼容结论
 
 - 标准 MCP Result 直通不是放宽安全：模型仍只能经审核工具、当前租户/Session/Run 归属和固定计费
@@ -217,8 +224,9 @@ Frontend 的两个 Blob 下载测试在 Node 22/jsdom 环境报 `object.stream i
 
 独立只读审查已完成，结论为 Critical 0 / Important 0；本轮线性提交包括
 `fd61e9e`（runtime）、`dbd2a96`（tests/UAT）、`de7c45b`（docs）、`2644065`（fixture）、
-`f3d3881`（CI）、`0bb65bc`（candidate CI 边界）、`7b83d82`（E2E 取消语义）和 `ddc6a82`
-（Node CI 测试兼容）。候选已合入本地 `main`，但远程 GitHub CI 当前失败、预发布和一次真实 Web
+`f3d3881`（CI）、`0bb65bc`（candidate CI 边界）、`7b83d82`（E2E 取消语义）、`ddc6a82`
+（Node CI 测试兼容）、`984dc90`（r6 失败证据）和 `7d487f6`（workspace 依赖/heartbeat 测试）。
+候选已合入本地 `main`，但远程 GitHub CI 当前失败、预发布和一次真实 Web
 UAT尚未完成，因此状态仍为
 `NOT_READY_FOR_PREDEPLOYMENT`。本轮未执行生产灰度。
 
