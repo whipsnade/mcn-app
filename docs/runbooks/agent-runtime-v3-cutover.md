@@ -401,3 +401,16 @@ IPC、HTTP、事件或日志边界；未知分类必须为 `unknown`。
 
 未完成候选 CI、预发布诊断探针 A/B 前，不得进行新的 Web UAT。A/B 使用真实预发布 provider/model 但总模型请求不超过
 3 次，DataTap 与钱包均为 0；只有 A/B 全通过且 58 项 Snapshot 只读核验通过，才允许唯一一次瑞幸咖啡 Web UAT。
+
+### 5.14 2026-08-21 实际探针与唯一 UAT 收口
+
+- 候选 `31796539b3297941fe1d4be48ffae5437d773b37` 的唯一 CI `32485676754` 全绿，并已按精确 HEAD 部署预发布；
+  后端与 Pi Gateway 健康检查通过。
+- A 使用 `tencent-plan / glm-5.2` 1 次请求成功；B 使用同一 provider/model 2 次请求完成 no-op tool-result
+  continuation。总模型请求 3，DataTap/钱包均为 0，未出现 provider 鉴权、限流、上下文、协议或上游错误。
+- Snapshot 只读核验为 58 项、digest `1467342826d397c8dfb3653b476e3612ded999b5ada957a401b2a7c56fbd541f`。
+  唯一瑞幸咖啡 Web UAT 的业务 Run `8e711362-638a-461f-9cb4-2896e81d1ccd` 在标准 MCP Result 到达前发生
+  `event_buffer_overflow`，Recovery 创建 Attempt 2；用户取消后最终为 `run.cancelled`，但已违反 Attempt=1
+  预算，且 MCP Result 门槛未满足。
+- 该结果不是 `READY_FOR_FINAL_FUNCTIONAL_UAT_REVIEW`。后续只能修复并定向验证事件缓冲/恢复边界；本轮不创建第二
+  个 Web UAT、不合入 main、不部署生产、不执行灰度。

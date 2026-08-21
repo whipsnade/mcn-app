@@ -410,5 +410,32 @@ READY_FOR_FINAL_FUNCTIONAL_UAT_REVIEW`；在此之前不得合入 main、生产�
 - 受影响定向验证已通过：Pi Gateway 9 个测试文件/100 项、Backend 34 项；Gateway typecheck、build、
   Backend Ruff、`git diff --check` 与生产代码 secret/DSN/Bearer 扫描通过。独立只读复核为
   Critical 0 / Important 0 / Minor 1；Minor 是 ACK-loss 测试未模拟真实传输层断响应，不改变终态语义。
-- provider 探针 A/B、候选 CI、预发布部署和新的 Web UAT 尚未执行。在 A/B 全部成功、服务健康、58 项 Snapshot
-  只读核验通过前，不创建新的 UAT Run。
+- provider 探针 A/B、候选 CI、预发布部署和新的 Web UAT 已按授权执行；实际结果与停止结论记录于 §10.4。
+
+### 10.4 实际诊断探针与唯一 Web UAT 结果（2026-08-21）
+
+- 独立审查后只推送一次候选 `31796539b3297941fe1d4be48ffae5437d773b37`（分支
+  `codex/runtime-adapter-catalog-capacity-repair`），GitHub Actions `32485676754` 的 Migration safety、Frontend、
+  Browser E2E、Pi Runtime、Backend、Pi Gateway 六个 Job 全部成功。预发布只部署该精确 HEAD；后端备份为
+  `/home/kol_insight/backups/backend-before-3179653.tar.gz`，后端 `8100/healthz`、Pi Gateway `9471/healthz` 与
+  `/readyz` 正常，systemd 服务均 active。
+- 探针 A 使用 `tencent-plan / glm-5.2` 和预发布实际 Base URL，`retries=0`，1 次最小文本请求成功，
+  `stop_reason=stop`。探针 B 使用同一 provider/model，2 次请求完成 assistant tool_call → 进程内 no-op
+  tool result → 下一轮响应，分别为 `toolUse`、`stop`，成功；no-op 未调用 MCP、数据库或生产工具。探针合计模型
+  请求 3 次、DataTap=0、钱包=0，未发现鉴权、限流、上下文、invalid_request 或上游 5xx 错误。
+- 探针后对专用租户 `uat-pi-r9-20260821` 做只读核验：Snapshot 仍为 58 项，digest
+  `1467342826d397c8dfb3653b476e3612ded999b5ada957a401b2a7c56fbd541f`，canonical bytes=16241；分布为
+  `insight-cube-mcp=24`、`social-grow-mcp=16`、`social-grow-content-mcp=10`、`bilibili-mcp=8`。
+- 按唯一 Web UAT 授权使用账号 `UAT 瑞幸咖啡 Tester`，新建 Session
+  `80d5537b-6bfa-423b-aeb0-17ea07f41099`，只提交一次固定瑞幸咖啡请求。系统自动产生的 utility 标题 Run
+  `1f7f65b7-da74-4708-8113-e311ebe47337` 与业务 Run 分开计，不是业务补测；业务 Run 为
+  `8e711362-638a-461f-9cb4-2896e81d1ccd`。
+- 业务 Run 在标准 MCP Result 到达模型前触发 Gateway `event_buffer_overflow`；Attempt 1 失败后 Recovery
+  自动创建 Attempt 2。发现已超过本次 `Attempt=1` 预算且尚未获得 MCP Result 后点击一次“取消任务”，最终
+  Run=`cancelled`、Attempt 2=`cancelled`，无 Attempt 3；取消后的 lease/worker 收口，未发生后续 DataTap 外发。
+  期间还记录了 `control_plane_unreachable`，该错误属于终态事件传输/收口问题，不是 provider 分类证据。
+- 业务 Run 只产生 2 条模型 usage 记录；`AgentToolCall=0`、DataTap dispatch=0、钱包账务=0、最终 reserved=0；
+  没有标准 MCP Result 原样到达模型，也没有可用于证明 Direct MCP pass-through 的 durable Evidence。
+- 因 Attempt 预算被 Recovery 路径突破且 MCP Result 门槛未满足，本轮不能宣称取消闭环通过，状态收口为
+  `REAL_UAT_EVENT_BUFFER_OVERFLOW_CANCELLED / NOT_READY_FOR_FINAL_FUNCTIONAL_UAT`。不创建第二个 Web UAT，
+  不合入 `main`，不部署生产，不执行 `5% → 25% → 100%` 灰度；`event_buffer_overflow` 是后续修复的真实运行时阻断。

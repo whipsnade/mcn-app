@@ -132,6 +132,19 @@ fingerprint 和毫秒 UTC 时间戳。原始 `errorMessage` 只在 Worker 内存
 停在 endpoint/model 配置核对；429/5xx 记录上游窗口并停止；context_length 先制定文件级修复计划；invalid_request
 只保留脱敏分类和 fingerprint。只有 A/B 均成功，且 58 项 Snapshot 仍只读完整，才可进入唯一一次瑞幸咖啡 Web UAT。
 
+### 2026-08-21 实际执行结果
+
+- 候选 `31796539b3297941fe1d4be48ffae5437d773b37` 只触发一次 CI：GitHub Actions `32485676754` 六个 Job 全绿；
+  预发布部署精确 HEAD 后，后端与 Pi Gateway health/ready 正常，active worker=0，临时探针脚本已清理。
+- 探针 A（`tencent-plan / glm-5.2`）1 次请求成功并 stop；探针 B 2 次请求成功完成 toolUse→stop 的 no-op continuation。
+  合计模型请求 3、retries=0、DataTap=0、钱包=0；未发现鉴权、限流、上下文、协议或上游错误。
+- 58 项 Snapshot 只读核验通过，digest 为
+  `1467342826d397c8dfb3653b476e3612ded999b5ada957a401b2a7c56fbd541f`。随后唯一 Web UAT 使用瑞幸咖啡专用账号，
+  业务 Run `8e711362-638a-461f-9cb4-2896e81d1ccd` 在 MCP Result 到达前触发 `event_buffer_overflow`；Recovery
+  创建 Attempt 2，取消后终态为 `run.cancelled`，但违反 Attempt=1 预算且未通过 MCP Result 门槛。
+- 因此当前停止状态为 `REAL_UAT_EVENT_BUFFER_OVERFLOW_CANCELLED / NOT_READY_FOR_FINAL_FUNCTIONAL_UAT`。不得
+  通过第二次 UAT、放宽 Attempt/事件边界或修改 provider 请求协议来替代该阻断。
+
 ## 凭据与日志
 
 日志调用 `app.core.redaction.redact_for_log()` 后再序列化。该函数递归遮蔽授权头、Cookie、手机号、模型/MCP token、JWT 密钥和 MySQL 密码；严禁打印原始请求头、环境变量或完整 Prompt。模型永远不接触 DataTap token、数据库 DSN 或 JWT 密钥。

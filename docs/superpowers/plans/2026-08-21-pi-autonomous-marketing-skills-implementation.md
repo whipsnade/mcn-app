@@ -335,11 +335,12 @@ Run 必须有当前 Run/Session/tenant 归属下至少一个已发布、不可�
   58 项 catalog/claim/MCP/取消既有边界；不添加 provider/业务类型推导器。
 - [x] 完成一次受影响定向验证：Pi Gateway 9 个测试文件/100 项、Backend 34 项、Ruff、Gateway typecheck/build、
   diff check、生产代码 secret/DSN/Bearer scan；独立只读审查为 Critical 0 / Important 0 / Minor 1。
-- [ ] 将当前未推送线性提交作为唯一候选推送并触发一次 CI；CI 全绿后部署精确 HEAD 到预发布。
-- [ ] 执行探针 A/B（模型≤3、DataTap=0、钱包=0）；仅 A/B 全通过、服务健康且 58 项 Snapshot 只读核验通过，
-  才执行唯一一次瑞幸咖啡 Web UAT。
-- [ ] Web UAT 通过后最高只记录 `READY_FOR_FINAL_FUNCTIONAL_UAT_REVIEW`；本 Task 不授权合入 main、生产部署
-  或 `5% → 25% → 100%` 灰度。
+- [x] 将线性提交作为唯一候选推送并触发一次 CI；`32485676754` 全绿后已把精确 HEAD 部署到预发布。
+- [x] 执行探针 A/B（模型≤3、DataTap=0、钱包=0）；A/B、服务健康和 58 项 Snapshot 只读核验均通过，随后执行
+  唯一一次瑞幸咖啡 Web UAT。
+- [x] Web UAT 已执行但未通过：业务 Run 在标准 MCP Result 到达前触发 `event_buffer_overflow`，Recovery 创建
+  Attempt 2，取消后为 `run.cancelled`，但违反 Attempt=1 预算。因此不记录 `READY_FOR_FINAL_FUNCTIONAL_UAT_REVIEW`，
+  本 Task 仍不授权合入 main、生产部署或 `5% → 25% → 100%` 灰度。
 
 ## Spec Coverage Self-Review Matrix
 
