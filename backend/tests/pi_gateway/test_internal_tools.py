@@ -55,6 +55,7 @@ async def test_terminal_settles_with_gateway_worker_and_releases_session_slot(mo
         gateway_id="gw-1",
         lease_owner="gw-1",
         lease_expires_at=object(),
+        cancel_requested=False,
     )
     attempt = SimpleNamespace(id="attempt-1", run_id="run-1", outcome="running", ended_at=None)
     session = SimpleNamespace(id="session-1", active_run_id="run-1")
