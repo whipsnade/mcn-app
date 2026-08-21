@@ -87,6 +87,7 @@ function workspaceValue() {
     wallet: undefined,
     loading: false,
     busy: false,
+    isCancelling: false,
     error: undefined,
     reload: vi.fn(),
     selectSession: mockSelectSession,

@@ -61,12 +61,12 @@ async def _uat_file_scope_cleanup():
     finally:
         await purge_uat_residue()
 
-BRAND = "测试品牌"
+BRAND = "瑞幸咖啡"
 BRAND_SCOPE = {
     "brand": BRAND,
     "period": {"start": "2026-07-01", "end": "2026-07-31", "timezone": "Asia/Shanghai"},
     "platforms": ["xiaohongshu", "douyin"],
-    "keywords": ["测试"],
+    "keywords": ["瑞幸咖啡"],
     "comparison_mode": "none",
 }
 

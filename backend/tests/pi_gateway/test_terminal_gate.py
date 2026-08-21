@@ -151,6 +151,63 @@ async def test_terminal_completed_after_message_completion_orders_events(
 
 
 @pytest.mark.asyncio
+async def test_terminal_completed_after_cancel_request_settles_cancelled(
+    db_session, user_factory, client, gateway_settings
+) -> None:
+    """取消标记先提交后，迟到的 completed ACK 不得越过取消收口。"""
+    user = await user_factory()
+    run, attempt, _tenant_id = await _run(db_session, user)
+    run.profile_name = "utility_v1"
+    token = "lease-token-terminal-cancel-race-with-entropy"
+    _arm_lease(run, token)
+    await db_session.commit()
+
+    events_path = f"/api/v1/internal/pi-gateway/v1/runs/{run.id}/events"
+    event_body = (
+        f'{{"source_event_id":"{attempt.id}:1","sequence":1,'
+        f'"event_type":"message.completed","payload":{{"text":"迟到结果"}}}}'
+    ).encode()
+    event_response = await client.post(
+        events_path,
+        content=event_body,
+        headers={
+            **_signed_headers(event_body, events_path, nonce="nonce-terminal-cancel-race-1"),
+            "X-Pi-Run-Lease": token,
+        },
+    )
+    assert event_response.status_code == 200
+
+    run.cancel_requested = True
+    await db_session.commit()
+
+    terminal_path = f"/api/v1/internal/pi-gateway/v1/runs/{run.id}/terminal"
+    terminal_body = f'{{"attempt_id":"{attempt.id}","outcome":"completed","payload":{{}}}}'.encode()
+    terminal_response = await client.post(
+        terminal_path,
+        content=terminal_body,
+        headers={
+            **_signed_headers(terminal_body, terminal_path, nonce="nonce-terminal-cancel-race-2"),
+            "X-Pi-Run-Lease": token,
+        },
+    )
+
+    assert terminal_response.status_code == 200
+    await db_session.refresh(run)
+    assert run.status == "cancelled"
+    terminal_events = list(
+        (
+            await db_session.scalars(
+                select(AgentEvent).where(
+                    AgentEvent.run_id == run.id,
+                    AgentEvent.event_type.like("run.%"),
+                )
+            )
+        ).all()
+    )
+    assert [event.event_type for event in terminal_events] == ["run.cancelled"]
+
+
+@pytest.mark.asyncio
 async def test_terminal_completed_formal_run_requires_a_main_report(
     db_session, user_factory, client, gateway_settings
 ) -> None:

@@ -54,7 +54,12 @@ async def _seed_catalog(db_session) -> None:
     await db_session.flush()
 
 
-async def _pi_run(db_session, user) -> tuple[AgentRun, AgentRunAttempt, str]:
+async def _pi_run(
+    db_session,
+    user,
+    *,
+    cancel_requested: bool = False,
+) -> tuple[AgentRun, AgentRunAttempt, str]:
     membership = await db_session.scalar(select(TenantMembership).where(TenantMembership.user_id == user.id))
     assert membership is not None
     tenant_id = membership.tenant_id
@@ -76,7 +81,7 @@ async def _pi_run(db_session, user) -> tuple[AgentRun, AgentRunAttempt, str]:
         runtime_backend="pi", runtime_config_version_id=None, runtime_config_snapshot_json=None,
         queued_at=None, profile_name="session_analyst_v1", profile_version="v1", model="fake-model",
         status="running", decision_count=0, review_count=0, revision_count=0,
-        created_at=now, started_at=now, run_kind="user",
+        created_at=now, started_at=now, run_kind="user", cancel_requested=cancel_requested,
     )
     db_session.add(run)
     await db_session.flush()
@@ -133,6 +138,27 @@ async def test_success_metadata_settles_without_interpreting_or_writing_evidence
     assert step is not None and step.status == "completed"
     wallet = await db_session.get(TenantWallet, tenant_id)
     assert wallet is not None and (wallet.balance, wallet.reserved) == (990, 0)
+
+
+@pytest.mark.asyncio
+async def test_cancel_requested_run_is_rejected_before_mcp_reservation(db_session, user_factory) -> None:
+    user = await user_factory()
+    await _seed_catalog(db_session)
+    run, _attempt, tenant_id = await _pi_run(db_session, user, cancel_requested=True)
+    await _fund(db_session, tenant_id, user.id)
+    service = PiGatewayService(db_session, gateway_id="gw-cancel")
+
+    with pytest.raises(TenantAccountingError, match="run_cancel_requested"):
+        await service.preflight_mcp(
+            run,
+            PiGatewayMcpPreflightRequest(
+                tool_name="query_analysis_data", server="insight-cube-mcp", args={"keyword": "瑞幸咖啡"}
+            ),
+        )
+
+    assert await db_session.scalar(select(AgentToolCall.id).where(AgentToolCall.run_id == run.id)) is None
+    wallet = await db_session.get(TenantWallet, tenant_id)
+    assert wallet is not None and (wallet.balance, wallet.reserved) == (1000, 0)
 
 
 @pytest.mark.asyncio

@@ -20,6 +20,7 @@ function makeRun(id: string, status: string): ApiAgentRun {
     parent_run_id: null,
     profile_name: 'session_analyst_v1',
     status,
+    cancel_requested: false,
     outcome: null,
     decision_count: 1,
     review_count: 0,

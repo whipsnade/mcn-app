@@ -4,6 +4,55 @@ import { isPiGatewayTerminalBusinessError, PiGateway } from "../src/gateway.js";
 import type { PiGatewaySourceEvent } from "../src/protocol.js";
 
 describe("PiGateway", () => {
+  it("does not report a heartbeat race after terminalization starts", async () => {
+    const onError = vi.fn();
+    let heartbeatReady!: () => void;
+    let rejectHeartbeat!: (error: unknown) => void;
+    const heartbeatStarted = new Promise<void>((resolve) => { heartbeatReady = resolve; });
+    const heartbeat = vi.fn(() => new Promise<never>((_resolve, reject) => {
+      rejectHeartbeat = reject;
+      heartbeatReady();
+    }));
+    const terminal = vi.fn(async () => {
+      await heartbeatStarted;
+      rejectHeartbeat(Object.assign(new Error("run already terminal"), {
+        code: "pi_gateway_run_not_found",
+        status: 404,
+      }));
+    });
+    const controlPlane = {
+      claim: vi.fn().mockResolvedValue({
+        run_id: "run-terminal-heartbeat-race",
+        attempt_id: "attempt-terminal-heartbeat-race",
+        lease_token: "lease-token-with-enough-entropy",
+        lease_expires_at: Math.floor(Date.now() / 1000) + 3600,
+        runtime_snapshot: {}, transcript: [],
+        secret_envelope: { alg: "AES-256-GCM", nonce: "1234567890123456", ciphertext: "1234567890123456" },
+        adapter_catalog: [], internal_tools: [],
+      }),
+      terminal,
+      heartbeat,
+    };
+    const gateway = new PiGateway({
+      controlPlane,
+      capacity: 1,
+      heartbeatIntervalMs: 1,
+      onError,
+      worker: async () => {
+        await heartbeatStarted;
+        return { done: Promise.resolve() };
+      },
+    });
+
+    await gateway.tick();
+
+    expect(heartbeat).toHaveBeenCalled();
+    expect(terminal).toHaveBeenCalledTimes(1);
+    expect(onError).not.toHaveBeenCalledWith(
+      expect.objectContaining({ code: "control_plane_unreachable" }),
+    );
+  });
+
   it("tracks only active isolated worker PIDs", async () => {
     let finish!: () => void;
     const done = new Promise<void>((resolve) => { finish = resolve; });

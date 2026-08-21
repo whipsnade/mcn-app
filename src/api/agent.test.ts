@@ -299,6 +299,7 @@ describe('agent api', () => {
       parent_run_id: null,
       profile_name: 'session_analyst_v1',
       status: 'queued',
+      cancel_requested: false,
       outcome: null,
       decision_count: 0,
       review_count: 0,

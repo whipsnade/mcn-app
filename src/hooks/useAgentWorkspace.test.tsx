@@ -68,6 +68,7 @@ const run1: ApiAgentRun = {
   parent_run_id: null,
   profile_name: 'session_analyst_v1',
   status: 'running',
+  cancel_requested: false,
   outcome: null,
   decision_count: 1,
   review_count: 0,
@@ -311,6 +312,27 @@ describe('useAgentWorkspace', () => {
     expect(runId).toBe('run-2');
     expect(result.current.activeRunId).toBe('run-2');
     expect(vi.mocked(useAgentRun).mock.calls.at(-1)?.[0]).toBe('run-2');
+  });
+
+  it('shows cancellation immediately and applies the API cancel_requested response', async () => {
+    vi.mocked(agentApi.listSessions).mockResolvedValue([s1]);
+    vi.mocked(agentApi.getSession).mockResolvedValue(s1Detail);
+    vi.mocked(agentApi.cancelRun).mockResolvedValue({
+      ...run1,
+      cancel_requested: true,
+    } as ApiAgentRun);
+
+    const { result } = renderHook(() => useAgentWorkspace('user-1'));
+    await waitFor(() => expect(result.current.activeRunId).toBe('run-1'));
+
+    await act(async () => {
+      await result.current.cancelActiveRun();
+    });
+
+    expect(agentApi.cancelRun).toHaveBeenCalledOnce();
+    expect((result.current as typeof result.current & { isCancelling: boolean }).isCancelling).toBe(true);
+    expect((result.current.activeSession?.runs[0] as ApiAgentRun & { cancel_requested?: boolean }).cancel_requested)
+      .toBe(true);
   });
 
   it('optimistically shows the user message and refetches the session detail after the run settles', async () => {

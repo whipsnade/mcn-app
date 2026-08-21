@@ -725,6 +725,7 @@ async def test_cancel_running_run_marks_cancel_requested_only(
     resp = await alice.post(f"/api/v1/agent/runs/{running.id}/cancel")
     assert resp.status_code == 200
     assert resp.json()["status"] == "running"
+    assert resp.json()["cancel_requested"] is True
 
     fresh = await db_session.get(AgentRun, running.id)
     assert fresh.status == "running"
@@ -753,6 +754,7 @@ async def test_cancel_reviewing_run_marks_cancel_requested_only(
     resp = await alice.post(f"/api/v1/agent/runs/{reviewing.id}/cancel")
     assert resp.status_code == 200
     assert resp.json()["status"] == "reviewing"
+    assert resp.json()["cancel_requested"] is True
 
     fresh = await db_session.get(AgentRun, reviewing.id)
     assert fresh.status == "reviewing"

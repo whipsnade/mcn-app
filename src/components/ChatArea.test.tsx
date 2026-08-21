@@ -59,7 +59,7 @@ describe('ChatArea', () => {
     await waitFor(() => expect(input.value).toBe(''));
   });
 
-  it('keeps the input available while a task is running and replaces the submit button with a pause button', () => {
+  it('keeps the input available while a task is running and replaces the submit button with a cancel button', () => {
     const onSendMessage = vi.fn().mockResolvedValue(undefined);
     render(
       <ChatArea
@@ -73,7 +73,7 @@ describe('ChatArea', () => {
     const input = screen.getByPlaceholderText(/正在进行深度多维数据分析中/) as HTMLTextAreaElement;
     expect(input).toBeEnabled();
     fireEvent.change(input, { target: { value: '稍后继续分析' } });
-    fireEvent.click(screen.getByRole('button', { name: '暂停' }));
+    fireEvent.click(screen.getByRole('button', { name: '取消任务' }));
 
     expect(input.value).toBe('稍后继续分析');
     expect(screen.queryByRole('button', { name: '发送' })).toBeNull();
@@ -99,7 +99,7 @@ describe('ChatArea', () => {
     expect(sendButton).toBeEnabled();
   });
 
-  it('calls onCancelTask from the pause button without submitting the form', async () => {
+  it('calls onCancelTask from the cancel button without submitting the form', async () => {
     const onSendMessage = vi.fn().mockResolvedValue(undefined);
     const onCancelTask = vi.fn().mockResolvedValue(undefined);
     render(
@@ -115,7 +115,7 @@ describe('ChatArea', () => {
     const input = screen.getByPlaceholderText(/正在进行深度多维数据分析中/) as HTMLTextAreaElement;
     fireEvent.change(input, { target: { value: '这条不应被提交' } });
     await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: '暂停' }));
+      fireEvent.click(screen.getByRole('button', { name: '取消任务' }));
     });
 
     expect(onCancelTask).toHaveBeenCalledOnce();
@@ -123,7 +123,7 @@ describe('ChatArea', () => {
     expect(input.value).toBe('这条不应被提交');
   });
 
-  it('disables the pause button and labels it 正在取消 while a cancel is in flight', () => {
+  it('disables the cancel button and labels it 正在取消 while a cancel is in flight', () => {
     const onCancelTask = vi.fn().mockResolvedValue(undefined);
     render(
       <ChatArea
@@ -140,7 +140,7 @@ describe('ChatArea', () => {
     expect(button).toBeDisabled();
     fireEvent.click(button);
     expect(onCancelTask).not.toHaveBeenCalled();
-    expect(screen.queryByRole('button', { name: '暂停' })).toBeNull();
+    expect(screen.queryByRole('button', { name: '取消任务' })).toBeNull();
   });
 
   it('shows a failed run as a terminal card without exposing transport details', async () => {
@@ -328,7 +328,7 @@ describe('ChatArea', () => {
     });
     expect(onResumeRun).toHaveBeenCalledOnce();
 
-    // running → 暂停按钮调用 onCancelRun。
+    // running → 取消任务按钮调用 onCancelRun。
     rerender(
       <ChatArea
         session={{ ...session, messages: [{ id: 'm1', sender: 'user', text: '帮我分析', timestamp: '10:00', runId: 'run-1' }] }}
@@ -341,7 +341,7 @@ describe('ChatArea', () => {
       />,
     );
     await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: '暂停' }));
+      fireEvent.click(screen.getByRole('button', { name: '取消任务' }));
     });
     expect(onCancelRun).toHaveBeenCalledOnce();
   });

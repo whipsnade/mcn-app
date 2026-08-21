@@ -260,10 +260,17 @@ describe('AgentRunCard', () => {
     expect(screen.queryByText(/审核|复核|Reviewer/i)).toBeNull();
   });
 
-  it('shows a pause button for a running run and calls onPause', () => {
+  it('shows a cancel button for a running run and calls onPause', () => {
     const onPause = vi.fn();
     render(<AgentRunCard run={run({ status: 'running' })} onPause={onPause} />);
-    fireEvent.click(screen.getByRole('button', { name: '暂停' }));
+    fireEvent.click(screen.getByRole('button', { name: '取消任务' }));
+    expect(onPause).toHaveBeenCalledOnce();
+  });
+
+  it('shows the same cancel button while a run is reviewing', () => {
+    const onPause = vi.fn();
+    render(<AgentRunCard run={run({ status: 'reviewing' })} onPause={onPause} />);
+    fireEvent.click(screen.getByRole('button', { name: '取消任务' }));
     expect(onPause).toHaveBeenCalledOnce();
   });
 
