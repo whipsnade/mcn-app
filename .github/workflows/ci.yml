@@ -56,6 +56,17 @@ jobs:
           cache: pip
           cache-dependency-path: backend/pyproject.toml
 
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: pi-runtime/package-lock.json
+
+      - name: Install Pi Runtime dependencies
+        working-directory: pi-runtime
+        run: npm ci
+
       - name: Create test database user
         run: |
           mysql --protocol=tcp --host=127.0.0.1 --user=root --password=ci-root-password <<'SQL'
@@ -79,7 +90,10 @@ jobs:
 
       - name: Pytest
         working-directory: backend
-        run: pytest -q
+        # The full offline Pi topology UAT is a one-shot release gate; run it
+        # manually once and keep it out of ordinary CI to avoid reusing its
+        # local service/database topology.
+        run: pytest -q --ignore=tests/integration/test_pi_gateway_offline_uat.py
 
   node-workspaces:
     name: Node workspaces
@@ -281,6 +295,10 @@ jobs:
           cache: npm
 
       - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Install Pi Runtime dependencies
+        working-directory: pi-runtime
         run: npm ci
 
       - name: Install Playwright Chromium

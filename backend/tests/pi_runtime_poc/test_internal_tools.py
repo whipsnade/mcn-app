@@ -305,6 +305,7 @@ async def test_load_marketing_skill_service_registry_tool_records_idempotently(
             "required_tools",
             "artifact_contract",
             "model_input_contract",
+            "revision",
         }
         assert payload["name"] == "brand-research-report"
         assert payload["content"]
@@ -316,6 +317,7 @@ async def test_load_marketing_skill_service_registry_tool_records_idempotently(
         "name": "brand-research-report",
         "version": first_payload["version"] if (first_payload := json.loads(first["safe_summary"])) else "",
         "digest": first_payload["digest"],
+        "revision": None,
     }]
 
 

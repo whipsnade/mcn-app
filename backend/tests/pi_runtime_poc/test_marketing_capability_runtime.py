@@ -38,7 +38,15 @@ def test_capability_loads_only_enabled_skill_and_is_idempotent() -> None:
     assert first == second
     assert first["name"] == "brand-research-report"
     assert first["content"].startswith("---")
-    assert set(first) == {"name", "version", "digest", "content", "required_tools", "artifact_contract"}
+    assert set(first) == {
+        "name",
+        "version",
+        "digest",
+        "content",
+        "required_tools",
+        "artifact_contract",
+        "revision",
+    }
     with pytest.raises(ValueError, match="marketing_skill_not_enabled"):
         capability.load_skill("../root-policy")
     with pytest.raises(ValueError, match="marketing_skill_not_enabled"):
