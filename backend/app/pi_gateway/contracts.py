@@ -239,7 +239,11 @@ class PiGatewayClaimResponse(_StrictModel):
         if len(adapter_catalog) > PI_GATEWAY_ADAPTER_CATALOG_MAX_ENTRIES:
             raise ValueError("pi_gateway_claim_catalog_too_large")
         try:
-            catalog_bytes = canonical_adapter_catalog_bytes(adapter_catalog)
+            canonical_entries = [
+                item.model_dump(mode="json") if isinstance(item, BaseModel) else item
+                for item in adapter_catalog
+            ]
+            catalog_bytes = canonical_adapter_catalog_bytes(canonical_entries)
         except (TypeError, ValueError) as exc:
             raise ValueError("pi_gateway_claim_catalog_invalid") from exc
         if len(catalog_bytes) > PI_GATEWAY_ADAPTER_CATALOG_MAX_BYTES:
