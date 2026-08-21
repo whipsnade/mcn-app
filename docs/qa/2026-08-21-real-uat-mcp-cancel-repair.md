@@ -485,7 +485,7 @@ READY_FOR_FINAL_FUNCTIONAL_UAT_REVIEW`；在此之前不得合入 main、生产�
 
 - 线性提交为 `f78c5ea`（历史 RED 复现）、`81d4bf9`（batch contract RED/边界）、`c300ca2`（batch 接收与幂等）、
   `60c47e8`（独立 pump、诊断、取消/terminal drain）和 `edacdfb`（协议常量及 failure 诊断计数收紧）。
-- 已通过 Gateway 定向 Vitest：6 个文件、64 passed、1 skipped（历史复现）；Gateway typecheck、build 通过；Backend
+- 已通过 Gateway 定向 Vitest：7 个文件、65 passed、1 skipped（历史复现；另含本地子进程级 257 事件回归）；Gateway typecheck、build 通过；Backend
   Pi Gateway 定向 pytest 28 passed；受影响 Ruff、`git diff --check` 通过。验证覆盖批次顺序、ACK-loss 同批重放、gap
   全批拒绝且无部分写入、duplicate receipt 稳定、4xx/协议不重试、network/5xx 有界重试、永久故障留给 Recovery、
   terminal drain、取消 backlog、旧单事件端点、事件/usage 顺序和既有 Recovery/terminal 回归。
