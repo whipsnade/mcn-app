@@ -14,6 +14,11 @@ function snapshot(overrides: Partial<GatewayMetricsSnapshot> = {}): GatewayMetri
     errors_total: 0,
     last_error_code: null,
     last_claim_at: "2026-08-10T00:00:00.000Z",
+    event_delivery_failures_total: 0,
+    event_delivery_retries_total: 0,
+    event_buffer_overflows_total: 0,
+    event_queue_high_water: 0,
+    event_last_acked_source_sequence: null,
     ...overrides,
   };
 }

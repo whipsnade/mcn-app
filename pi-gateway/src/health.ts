@@ -12,6 +12,11 @@ export interface GatewayMetricsSnapshot {
   errors_total: number;
   last_error_code: string | null;
   last_claim_at: string | null;
+  event_delivery_failures_total: number;
+  event_delivery_retries_total: number;
+  event_buffer_overflows_total: number;
+  event_queue_high_water: number;
+  event_last_acked_source_sequence: number | null;
   /** Test-only process ownership probe; omitted in production responses. */
   worker_pids?: number[];
 }
