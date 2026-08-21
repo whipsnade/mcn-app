@@ -353,3 +353,37 @@ Gate A 审查发现的 5 项必修 + 2 项次要问题，已在同一迁移/代�
   MCP 目录 58 超过 Pi adapter 上限 32 而返回 `runtime_adapter_catalog_too_large`，没有进入模型、
   DataTap 或取消阶段。在该预检阻断被新的明确授权处理、真实 Web UAT 通过并完成回滚/监控封口前，生产
   切档仍为禁止；本修复阶段不执行灰度或生产写入，也不得用第二次 Web UAT 覆盖本次失败证据。
+
+### 5.12 2026-08-21 Pi Adapter Catalog 容量修复（当前口径）
+
+- 上一节的 `32` 仅是历史 control-plane catalog 防御性上限，并非 Pi SDK、模型可见工具数或业务 allowlist。
+  新 Pi 路径现使用 128 条目上限与 canonical JSON 128 KiB 上限；不截断、不分页、不按用户文本或 Profile
+  选择固定工具，不修改工具审核状态或 allowlist。
+- `RuntimeConfigService`、后端 Pi Gateway DTO 与 `pi-gateway/src/protocol.ts` 共用相同边界与 canonical
+  字节计算。`quarantined`、`unknown`、`query_user_info` 继续排除；schema/字段 digest、重复身份、敏感字段、
+  parser/DTO 对称校验、单一 MCP proxy、`directTools=false`、`scriptMode=false`、output guard、租户/Session/
+  Run 归属与 10 积分结算边界均保留。
+- 候选 `0615533c5f65bfd55c57fbbd181fbfa622c13282` 的唯一 Actions run `32480577421` 全绿；受影响 Backend
+  47 项与 Pi Gateway 56 项定向测试通过，Ruff、typecheck、build 通过，独立审查 Critical=0 / Important=0。
+  没有数据库迁移，历史 Snapshot/Version/Run 不回写，正式 Artifact Schema 与通用完成不变量不变。
+- 精确候选已部署到 UAT，health/ready 正常，迁移 head 为 `0049_skill_rollout_history`；只读回滚检查确认
+  `uat-pi-r9-20260821` 的新 `session_analyst_v1` Snapshot 完整包含 58 项（24/16/10/8）。当前浏览器实际
+  登录的是另一个个人租户，未向错误租户发起请求；专用账号认证与真实 Web UAT 尚未完成。
+- 当前停止门为 `PREPROD_DEPLOYED_CATALOG_REPAIR_VERIFIED / WEB_UAT_AUTH_CONFIRMATION_REQUIRED`。
+  专用账号确认后只允许一次瑞幸咖啡 Run，验证 MCP Result 直通与取消闭环；在此之前不得合入 main、生产部署
+  或灰度。
+
+#### 当前唯一真实 Web UAT 结果
+
+- 专用账号已核对为 `UAT 瑞幸咖啡 Tester`，只创建并发送一次新 Session/Run。首次候选 claim 409 的真实
+  原因为 `pi_gateway_claim_catalog_invalid`：后端 claim DTO 的 canonical 校验未兼容服务端 Pydantic
+  catalog 对象；不是 catalog 数量、allowlist 或审核状态问题。
+- 线性提交 `5682b6a`、`fc4e70c` 补齐 DTO mapping 回归与最小修复，受影响 Backend 定向测试 `48 passed`。
+  该修复保持 128/128 KiB 边界、字段/schema digest、重复身份、敏感字段、单一 proxy、directTools/scriptMode
+  和计费/归属边界不变；未新增迁移，未回写历史 Snapshot。
+- 同一个 Run 的 Attempt 1 在热修复后成功领取，产生内部工具事件，但没有外部 `AgentToolCall`、DataTap
+  dispatch 或标准 MCP Result 到模型；最终以 `pi_model_provider_error` failed 收口。取消未点击、未测量，
+  不得报告为取消通过；Run、Attempt、租约、预留、active_run 和 worker 已清理。
+- 因真实功能 UAT 未通过，当前发布状态为
+  `REAL_UAT_CATALOG_CLAIM_FIXED_PROVIDER_FAILED / NOT_READY_FOR_FINAL_FUNCTIONAL_UAT`。不合入 main、
+  不部署生产、不灰度；后续 provider 排查需要新的明确外部服务/发布授权，不能重试本次 Web UAT 代替证据。

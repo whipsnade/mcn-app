@@ -262,9 +262,9 @@ Result 到达模型、点击“取消任务”后无后续外发、唯一 `cance
 worker/端口收口。通过后状态只能推进到
 `REAL_UAT_MCP_PASS_THROUGH_AND_CANCEL_PASS / READY_FOR_FINAL_FUNCTIONAL_UAT`，本轮不做生产灰度。
 
-## 8. Candidate-r9 与唯一真实 Web UAT（2026-08-21）
+## 8. 历史 Candidate-r9 与唯一真实 Web UAT（2026-08-21）
 
-### 8.1 Candidate-r9 与预发布部署
+### 8.1 历史 Candidate-r9 与预发布部署
 
 - `3c01d13` 已合入并推送 `main`；GitHub Actions run `32476331375` 全绿：Backend
   `96753338631`、Frontend `96753338475`、Migration `96753338762`、Browser E2E
@@ -276,7 +276,7 @@ worker/端口收口。通过后状态只能推进到
   `max_decisions=10`、DataTap 每次 10 积分；钱包余额 1000、预留 0。未改生产库，未改历史 Run、
   Snapshot、Version 或迁移。
 
-### 8.2 唯一瑞幸咖啡 Web UAT 结果
+### 8.2 历史唯一瑞幸咖啡 Web UAT 结果
 
 - 仅使用专用 UAT 用户提交一次请求：
   `请分析瑞幸咖啡近30天的小红书声量、互动与情感趋势，并给出可执行的KOL选择建议；如数据受限请明确说明，不要把缺失值当作0。`
@@ -292,7 +292,7 @@ worker/端口收口。通过后状态只能推进到
   当前状态为 `REAL_UAT_PRECHECK_FAILED / NOT_READY_FOR_FINAL_FUNCTIONAL_UAT`；生产灰度、合入生产、
   5% → 25% → 100% 均禁止。
 
-### 8.3 边界与后续授权
+### 8.3 历史边界与后续授权
 
 - 未通过关闭任意工具、把 allowlist 改成任意字符串、放宽目录上限、测试特判或重跑 Web UAT 来掩盖
   失败；原 12 项红灯和完整离线 UAT 证据保持不变。
@@ -301,3 +301,75 @@ worker/端口收口。通过后状态只能推进到
   未在本修复中改动。
 - 若要处理 58>32 的租户目录配置并重新验证，必须取得新的明确 Web UAT 授权；在此之前不得修改目录、
   创建 Run 或进入生产发布。
+
+## 9. Pi Adapter Catalog 容量修复与候选部署（2026-08-21）
+
+### 9.1 根因与架构决定
+
+- 历史 `32` 是 `RuntimeConfigService`、Pi Gateway contract/parser 的 control-plane catalog 防御性上限；
+  它不是 Pi SDK、模型可见工具数或业务服务 allowlist。58 个 `enabled+approved` 条目在 Run 创建前的
+  Snapshot 生成阶段触发 `runtime_adapter_catalog_too_large`，因此此前没有创建 Session/Run，也没有模型、
+  DataTap 或计费副作用。
+- 最小修复将有界容量提升为 **128 entries + canonical JSON 128 KiB**。新 Run Snapshot 保留全部 58 项，
+  不截断、不分页、不按 Profile/用户文本筛选，也不选择单一业务工具；没有数据库迁移、工具状态变更或
+  allowlist 放宽。
+- `quarantined`、`unknown`、`query_user_info` 不进入目录；字段完整性、schema digest、重复身份、敏感字段、
+  DTO/parser 对称校验全部保留。Pi 仍使用单一 MCP proxy，`directTools=false`、`scriptMode=false`、
+  output guard 与固定计费/归属边界不变；58 项由四个 MCP server 分发。
+- 该修复不改变正式 Artifact Schema、Publication、Version、lineage、tenant/session/run 归属或通用完成
+  不变量；历史 `required_artifact` 字段、旧 Snapshot/Run/Version 仅按原语义兼容读取，不回写。
+
+### 9.2 TDD、定向验证与候选 CI
+
+- 红灯提交：`319f6d0 test(pi): reproduce reviewed adapter catalog capacity mismatch`，锁定 32/33/58/128
+  边界、129/128 KiB 拒绝、过滤、排序、重复身份、Snapshot 不可变、DTO/parser 对称、四 server/resource
+  loader、`directTools=false`/`scriptMode=false`/output guard 与首尾计费归属行为。
+- 修复提交：`0615533 fix(pi): raise bounded adapter catalog capacity`。受影响 Backend 测试 `47 passed`，
+  Pi Gateway 定向 Vitest `56 passed`，Ruff、Pi Gateway typecheck、build 均通过；`git diff --check`、敏感信息/DSN
+  扫描与无迁移扫描通过。
+- 唯一候选 CI 为 GitHub Actions `32480577421`（HEAD `0615533c5f65bfd55c57fbbd181fbfa622c13282`），
+  Backend、Frontend、Migration safety、Browser E2E、Pi Runtime、Pi Gateway 全部成功。独立只读审查结果为
+  Critical=0 / Important=0。
+
+### 9.3 预发布部署与只读 Snapshot 证据（Web UAT 前）
+
+- 已将精确候选 HEAD `0615533c5f65bfd55c57fbbd181fbfa622c13282` 部署到 UAT；后端备份为
+  `/home/kol_insight/backups/backend-before-0615533.tar.gz`。后端与 Pi Gateway systemd 均 active，
+  `/healthz`、`/readyz` 正常，Alembic head 仍为 `0049_skill_rollout_history`。
+- 对专用租户 `uat-pi-r9-20260821` 执行了一次只读、回滚事务的 `RuntimeConfigService` 检查：新 Pi
+  `session_analyst_v1` Snapshot 中完整存在 58 项，分布为 `insight-cube-mcp=24`、`social-grow-mcp=16`、
+  `social-grow-content-mcp=10`、`bilibili-mcp=8`；catalog digest 为
+  `1467342826d397c8dfb3653b476e3612ded999b5ada957a401b2a7c56fbd541f`。未创建 Session/Run，未改写历史
+  Snapshot/Version/迁移数据。
+- 在 Web UAT 前曾发现浏览器会话是 `个人租户-手机用户_7961`，不是专用 UAT 租户，因此没有向错误租户提交请求；
+  随后已切换并核对专用账号。真实 Web UAT 的最终结果见 §9.5；生产未部署、未合入生产、未执行灰度。
+
+### 9.4 下一道停止门（执行前计划，已由 §9.5 结果取代）
+
+切换到专用账号并完成即时认证确认后，只执行一条固定瑞幸咖啡请求、一个新 Session/Run（Run=1、Attempt=1、
+模型≤10、DataTap≤5、积分≤50、retries=0、fresh Run=0），验证标准 MCP Result 到达模型后点击“取消任务”，
+并核对无后续外发、唯一 `cancelled`、Attempt=1、ToolCall/permit/lease/worker/端口清理。自然完成时不补建
+第二个 Run，只记录取消未测。通过后才可记录 `REAL_UAT_MCP_PASS_THROUGH_AND_CANCEL_PASS /
+READY_FOR_FINAL_FUNCTIONAL_UAT_REVIEW`；在此之前不得合入 main、生产部署或 5%→25%→100% 灰度。
+
+### 9.5 唯一真实 Web UAT 实际结果与停止结论
+
+- 已切换并核对专用账号 `UAT 瑞幸咖啡 Tester`，新建唯一干净 Session
+  `81bfb306-aa94-44d0-913e-c6c66997f356`，只发送一次固定瑞幸咖啡请求，对应唯一 Run
+  `f5b7f6d9-0a45-4f3e-8373-bf183a26e494`；未点击重试、继续或第二次发送。
+- 精确候选 `0615533` 首次部署后，Gateway claim 连续返回 409；只读复现为
+  `PiGatewayClaimResponse` canonical 校验接收服务端 Pydantic DTO 时未先转 JSON mapping，错误为
+  `pi_gateway_claim_catalog_invalid`。这不是 58 条目容量失败，也未产生 Attempt/ToolCall/积分副作用。
+- 以 TDD 补充 `test_claim_accepts_service_owned_catalog_models`，最小修复提交为
+  `5682b6a test(pi): cover claim DTO catalog normalization` 与
+  `fc4e70c fix(pi): accept service-owned adapter catalog DTOs`；受影响 Backend 定向回归为 `48 passed`，
+  Ruff 与 diff 检查通过。该 post-CI 热修复未重跑候选全套 CI，遵守本轮“candidate CI 只执行一次”的授权边界。
+- 热修复同步并重启 UAT 后，同一个 Run 被 Attempt 1 领取并产生 `run.started`、模型 thinking/message 事件及
+  3 个内部工具 `tool.started/tool.succeeded` 事件；没有外部 `AgentToolCall`，没有 DataTap dispatch，也
+  没有标准 MCP Result 到达模型。随后 Run 以 `pi_model_provider_error` 失败，未进入取消验证，因此取消状态
+  记录为“未测”，不伪造为通过。
+- 最终只读收口：Run=`failed`、Attempt 1=`failed`、`decision_count=0`、`AgentToolCall=0`、Run 账务记录=0、
+  wallet reserved=0、Run lease/active_run 均为空；Gateway 无残留 worker，仅保留主进程和 8100/9471 健康监听。
+- 当前状态为 `REAL_UAT_CATALOG_CLAIM_FIXED_PROVIDER_FAILED / NOT_READY_FOR_FINAL_FUNCTIONAL_UAT`。
+  该结果不能推进到 `REAL_UAT_MCP_PASS_THROUGH_AND_CANCEL_PASS`；不合入 main、不部署生产、不执行
+  5%→25%→100% 灰度，也不再重试本次 Web UAT。后续若要处理 provider 失败，需新的明确外部服务/发布授权。

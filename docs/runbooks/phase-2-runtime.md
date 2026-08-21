@@ -59,7 +59,7 @@ cd backend
   58 个 enabled+approved MCP 目录超过 Pi adapter 上限 32 而返回 `runtime_adapter_catalog_too_large`；
   不得重试或以配置放宽掩盖，当前仍禁止生产部署。
 
-## 2026-08-21 唯一瑞幸 Web UAT 停止记录
+## 2026-08-21 历史唯一瑞幸 Web UAT 停止记录
 
 - 专用租户 `uat-pi-r9-20260821` 已切换到 Pi backend，后端与 Gateway 均 healthy/ready，迁移 head 为
   `0049_skill_rollout_history`。
@@ -68,6 +68,35 @@ cd backend
   `social-grow-content-mcp=10`、`bilibili-mcp=8`，合计 58。
 - 该结果是发布配置预检阻断，不是 MCP 透传或取消链路的通过证据；最终功能验收和生产灰度保持停止。
   若要调整租户目录或适配器限制后重新执行，必须先取得新的明确 Web UAT 授权。
+
+## 2026-08-21 Pi Adapter Catalog 容量修复后的运行口径
+
+- 上述 `runtime_adapter_catalog_too_large` 是历史 control-plane catalog 上限 32 的预检失败，不是
+  Pi SDK 或模型工具限制。现行新 Pi 路径上限为 128 个目录条目，canonical JSON 总大小上限为 128 KiB；
+  仍禁止截断、分页、用户文本筛选和任意字符串 allowlist。
+- `RuntimeConfigService`、后端 Pi Gateway contract 与 `pi-gateway/src/protocol.ts` 使用相同边界和 canonical
+  字节计算。`quarantined`、`unknown`、`query_user_info` 排除；字段/schema digest、重复身份、敏感字段、
+  DTO/parser 对称校验保留。单一 MCP proxy、`directTools=false`、`scriptMode=false`、output guard、
+  归属与 10 积分结算边界不变。
+- candidate `0615533c5f65bfd55c57fbbd181fbfa622c13282` 的唯一 Actions run `32480577421` 全绿；受影响
+  Backend 47 项、Pi Gateway 56 项定向测试、Ruff、typecheck、build 均通过，独立审查 Critical=0 / Important=0。
+- 精确候选已部署到 UAT，服务 health/ready 正常，迁移 head 仍为 `0049_skill_rollout_history`。对专用租户的
+  一次只读回滚检查确认新 Run Snapshot 完整包含 58 项（24/16/10/8），没有创建 Run 或改写历史数据。
+- 当前浏览器仍是另一个个人租户，未向错误租户发送测试请求；专用账号认证尚未提交。当前状态为
+  `PREPROD_DEPLOYED_CATALOG_REPAIR_VERIFIED / WEB_UAT_AUTH_CONFIRMATION_REQUIRED`，不得合入 main、生产
+  部署或灰度。
+
+### 唯一 Web UAT 后续结果（当前停止口径）
+
+- 已完成专用账号切换，并只发送一次瑞幸咖啡请求。候选 `0615533` 的首次 claim 409 已定位为
+  `pi_gateway_claim_catalog_invalid`：服务端 Pydantic catalog DTO 未先转成 canonical JSON mapping；不是
+  58 条目容量或工具审核问题。
+- 追加线性测试/修复提交 `5682b6a`、`fc4e70c`，Backend 受影响定向回归 `48 passed`；UAT 后端已同步并重启。
+  同一个 Run 由 Attempt 1 领取，但只产生内部工具事件，未产生外部 `AgentToolCall`/DataTap dispatch。
+- 唯一 Run 最终以 `pi_model_provider_error` 失败；取消按钮未点击（没有标准 MCP Result 到达模型，取消无法测量），
+  不重试、不创建第二个 Run。Run/Attempt 已终态，租约、active_run、ToolCall、账务预留和 worker 均已清理。
+- 当前门禁为 `REAL_UAT_CATALOG_CLAIM_FIXED_PROVIDER_FAILED / NOT_READY_FOR_FINAL_FUNCTIONAL_UAT`。
+  在新的 provider/发布授权和成功功能 UAT 前，不得合入 main、生产部署或执行灰度。
 
 ## UAT 部署
 

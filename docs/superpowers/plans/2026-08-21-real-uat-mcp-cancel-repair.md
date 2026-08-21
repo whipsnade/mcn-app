@@ -109,3 +109,26 @@
 - [x] 在 Backend job 补齐锁定的 `pi-gateway/npm ci` 后重建 candidate-r9，并取得远程 CI 全绿；`3c01d13` 对应 Actions run `32476331375` 全绿，随后完成同一发布树的预发布部署与专用 UAT 租户配置。
 - [x] 按授权仅执行一次专用 UAT 租户的“Direct MCP + 取消”组合 Web UAT：一次瑞幸咖啡请求，Run=1、Attempt=1、模型≤10、DataTap≤5、积分≤50、retries=0、fresh Run=0；请求在运行时目录预检以 `runtime_adapter_catalog_too_large` 失败，未进入 MCP/取消阶段，未重试。
 - [ ] 组合 UAT 必须记录一个此前会产生 `unsupported_content` 的工具成功返回、模型收到标准结果、点击“取消任务”后的阶段时间戳、无后续外发、唯一 cancelled、Attempt/ToolCall/permit/lease/worker/端口收口。通过后只报告 `REAL_UAT_MCP_PASS_THROUGH_AND_CANCEL_PASS / READY_FOR_FINAL_FUNCTIONAL_UAT`；本轮不做生产灰度。
+
+## Task 9：修复历史 Adapter Catalog 容量预检阻断（2026-08-21）
+
+**Files:** `backend/app/pi_gateway/catalog.py`、`backend/app/runtime_config/service.py`、`backend/app/pi_gateway/contracts.py`、`pi-gateway/src/protocol.ts`、对应容量/协议测试与本计划文档
+
+- [x] 先以红灯测试复现 32 条目上限对 33/58/128 的错误阻断，并锁定 129 条目、128 KiB 边界、过滤、排序、重复身份、Snapshot 不可变、DTO/parser 对称及四 MCP server 约束。
+- [x] 以最小修复提升 bounded capacity 到 128 条目与 128 KiB canonical JSON；保留完整校验、单一 proxy、directTools/scriptMode/output guard、计费与租户归属，不加固定业务工具推导器，不改迁移。
+- [x] 受影响定向验证通过：Backend 47 项、Pi Gateway 56 项、Ruff、Gateway typecheck/build；唯一候选 CI `32480577421`（HEAD `0615533c`）全绿；独立审查 Critical=0 / Important=0。
+- [x] 精确候选已部署 UAT；健康/就绪和迁移 head 通过；只读回滚事务确认专用租户新 Snapshot 完整包含 58 项，未创建 Run、未写历史数据。
+- [x] 使用专用 UAT 租户执行唯一一次瑞幸咖啡 Web UAT；错误个人租户未被使用。唯一 Run 在 claim 热修复后以 `pi_model_provider_error` 失败，未进入 MCP/取消断言，不创建第二个 Run。
+- [x] 已更新 QA、两份 runtime runbook、实施计划与当日 changelog，保留失败证据和兼容边界；未合入 main、未生产部署、未灰度、未新建 Goal。
+
+### Task 9 当前结果补充
+
+- [x] 专用账号已切换并只发送一次瑞幸咖啡请求。候选首次 claim 409 的路径已定位为
+  `pi_gateway_claim_catalog_invalid`（Pydantic catalog DTO 未转 mapping），未产生外部 MCP/账务副作用。
+- [x] 以 `5682b6a`、`fc4e70c` 完成测试与最小修复，受影响 Backend 定向验证 `48 passed`；同一个 Run 在
+  热修复后由 Attempt 1 领取。
+- [x] 真实 Run 最终以 `pi_model_provider_error` failed；没有标准 MCP Result 到达模型，取消按钮未点击，
+  不创建第二个 Run；Run/Attempt/lease/ToolCall/预留/worker 已收口。
+- [ ] 取消闭环与 Direct MCP 透传仍未通过；当前状态为
+  `REAL_UAT_CATALOG_CLAIM_FIXED_PROVIDER_FAILED / NOT_READY_FOR_FINAL_FUNCTIONAL_UAT`。在新的 provider
+  授权和成功 UAT 前不得创建新的候选、合入 main、生产部署或灰度。
