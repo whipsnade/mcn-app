@@ -196,6 +196,14 @@ Pi Runtime、Migration safety 成功；Backend、Frontend、Browser E2E、Pi Gat
 公开状态可见，但 GitHub API 下载日志返回 `403 Must have admin rights to Repository`，因此本轮不
 猜测远端失败原因，也不把它记为通过。预发布部署与真实 Web UAT 继续等待远程 CI 全绿。
 
+随后推送 `d53b345` 的 candidate-r5 run `32471771494` 也已结束为 failure。公开 annotations 给出：
+Frontend 的两个 Blob 下载测试在 Node 22/jsdom 环境报 `object.stream is not a function`；Pi Gateway
+的 `worker-entry.test.ts:246` 在 5 秒默认测试时限内超时；Browser E2E 与 Backend 仅有步骤级
+`Process completed with exit code 1`，没有公开具体断言。对应的最小测试兼容修复已提交为 `ddc6a82`：
+下载测试改用具备 `blob()` 的最小 Response double，worker 生命周期测试时限改为 15 秒；生产代码与
+取消/直通逻辑未改。修复后的本地定向结果为 Artifact 下载 `12 passed`、worker 场景 `1 passed`。
+由于 Backend/Browser 的具体日志仍不可见，不能把它们归因或宣称已修复；需由下一候选 CI 给出结果。
+
 ## 6. 安全与兼容结论
 
 - 标准 MCP Result 直通不是放宽安全：模型仍只能经审核工具、当前租户/Session/Run 归属和固定计费
@@ -209,8 +217,9 @@ Pi Runtime、Migration safety 成功；Backend、Frontend、Browser E2E、Pi Gat
 
 独立只读审查已完成，结论为 Critical 0 / Important 0；本轮线性提交包括
 `fd61e9e`（runtime）、`dbd2a96`（tests/UAT）、`de7c45b`（docs）、`2644065`（fixture）、
-`f3d3881`（CI）、`0bb65bc`（candidate CI 边界）和 `7b83d82`（E2E 取消语义）。候选已合入本地
-`main`，但远程 GitHub CI 当前失败、预发布和一次真实 Web UAT尚未完成，因此状态仍为
+`f3d3881`（CI）、`0bb65bc`（candidate CI 边界）、`7b83d82`（E2E 取消语义）和 `ddc6a82`
+（Node CI 测试兼容）。候选已合入本地 `main`，但远程 GitHub CI 当前失败、预发布和一次真实 Web
+UAT尚未完成，因此状态仍为
 `NOT_READY_FOR_PREDEPLOYMENT`。本轮未执行生产灰度。
 
 后续唯一真实 Web UAT 使用专用 UAT 租户和一次 `瑞幸咖啡` 请求，限制为 Run=1、Attempt=1、模型≤10、
