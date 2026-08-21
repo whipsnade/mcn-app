@@ -38,7 +38,8 @@ cd backend
 - 正式 Artifact 走确定性字段级 lineage 门禁后逐项直接发布为不可变 Version；新 Run 不得启动 Reviewer。
   发布汇总以 `artifact.publish.completed` 表达逐项 `published/validation_failed/failed`，至少一项
   成功且存在失败时 Run 为 `completed_with_warnings`。旧 Review 表只读保留，供历史回滚读取。
-- 当前唯一迁移 head 为 `0036_export_claim_token`。部署顺序：备份数据库和上传目录 → drain Run /
+- 当前发布批次唯一迁移 head 为 `0049_skill_rollout_history`；`0036_export_claim_token` 仅为旧阶段
+  历史记录。部署顺序：备份数据库和上传目录 → drain Run /
   清零历史 `reviewing` → 后端代码与 `alembic upgrade head` → 同批前端 `dist/` → 单 worker 重启 →
   权限、账本、SSE、三类导出冒烟。详情与回滚限制见 cutover §5.10。
 - **已知风险（UAT 阻断项，见 cutover 清单）**：2026-08-07 真实 UAT 的品牌场景成功（restricted

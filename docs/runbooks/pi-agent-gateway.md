@@ -27,6 +27,13 @@
 > `REAL_B7_20260812T045636Z_b801c490` 均为历史事实）：真实 B7 UAT、生产切流和方案 C 均
 > 需要单独审批。
 
+> 当前发布批次覆盖（2026-08-21）：`main` 发布树为 `c6e5dc7`（随后若有仅文档提交，以其
+> 直接后代为准），当前 Alembic head 为 `0049_skill_rollout_history`。本手册下方出现的
+> `0036_export_claim_token`、`0043_billing_downgrade_guard` 或 `0044_agent_run_loop_guard`
+> 均是对应历史阶段的事实，不是本发布批次的迁移目标；预发布必须先同步本发布树并执行
+> `alembic upgrade head`，确认 `alembic current` 为 `0049_skill_rollout_history` 后才能重启。
+> 本批次尚未完成一次真实 Web UAT，不能据此宣称生产切流或灰度通过。
+
 ## Direct Artifact Skill 契约（2026-08-13 修复后现行）
 
 ### capability pack 版本
