@@ -1,9 +1,51 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { isPiGatewayTerminalBusinessError, PiGateway } from "../src/gateway.js";
+import { PiModelProviderError } from "../src/model-request-budget.js";
 import type { PiGatewaySourceEvent } from "../src/protocol.js";
 
 describe("PiGateway", () => {
+  it("passes safe provider failure metadata with the stable business code and no retry", async () => {
+    const terminal = vi.fn().mockResolvedValue(undefined);
+    const failureMetadata = {
+      version: "provider_failure_v1" as const,
+      failure_class: "rate_limited" as const,
+      http_status: 429,
+      error_fingerprint: "a".repeat(64),
+    };
+    const controlPlane = {
+      claim: vi.fn().mockResolvedValue({
+        run_id: "run-provider-failure",
+        attempt_id: "attempt-provider-failure",
+        lease_token: "lease-token-with-enough-entropy",
+        lease_expires_at: Math.floor(Date.now() / 1000) + 3600,
+        runtime_snapshot: {}, transcript: [],
+        secret_envelope: { alg: "AES-256-GCM", nonce: "1234567890123456", ciphertext: "1234567890123456" },
+        adapter_catalog: [], internal_tools: [],
+      }),
+      terminal,
+      heartbeat: vi.fn().mockResolvedValue({ cancel_requested: false }),
+    };
+    const gateway = new PiGateway({
+      controlPlane,
+      capacity: 1,
+      worker: async () => ({
+        done: Promise.reject(new PiModelProviderError(failureMetadata)),
+      }),
+    });
+
+    await expect(gateway.tick()).resolves.toBe(true);
+    expect(terminal).toHaveBeenCalledWith(
+      "run-provider-failure",
+      "attempt-provider-failure",
+      "failed",
+      "lease-token-with-enough-entropy",
+      { code: "pi_model_provider_error" },
+      failureMetadata,
+    );
+    expect(terminal).toHaveBeenCalledTimes(1);
+  });
+
   it("does not report a heartbeat race after terminalization starts", async () => {
     const onError = vi.fn();
     let heartbeatReady!: () => void;

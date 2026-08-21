@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, field_validator, model_validator
 
 from .catalog import (
     PI_GATEWAY_ADAPTER_CATALOG_MAX_BYTES,
@@ -107,6 +108,66 @@ class PiGatewayMcpFailRequest(_StrictModel):
     metadata: PiGatewayMcpFailureMetadata | None = None
 
 
+class PiGatewayProviderFailureMetadata(_StrictModel):
+    """Metadata-only provider failure projection; raw SDK errors never cross this boundary."""
+
+    version: Literal["provider_failure_v1"]
+    failure_class: Literal[
+        "authentication",
+        "authorization",
+        "rate_limited",
+        "model_not_found",
+        "invalid_request",
+        "context_length",
+        "timeout",
+        "network",
+        "upstream_5xx",
+        "aborted",
+        "unknown",
+    ]
+    http_status: StrictInt | None = Field(default=None, ge=100, le=599)
+    provider_request_id: StrictStr | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$",
+    )
+    error_fingerprint: StrictStr = Field(pattern=r"^[0-9a-fA-F]{64}$")
+    observed_at: StrictStr | None = Field(
+        default=None,
+        min_length=24,
+        max_length=24,
+        pattern=r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$",
+    )
+
+    @field_validator("provider_request_id")
+    @classmethod
+    def safe_request_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        lower = value.lower()
+        if lower.startswith(("bearer", "token", "secret", "api_key", "apikey", "sk-", "sk_")):
+            raise ValueError("provider_request_id_sensitive")
+        return value
+
+    @field_validator("observed_at")
+    @classmethod
+    def safe_timestamp(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        try:
+            datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%fZ")
+        except ValueError as exc:
+            raise ValueError("observed_at_invalid") from exc
+        return value
+
+    @model_validator(mode="after")
+    def optional_fields_must_be_omitted(self) -> "PiGatewayProviderFailureMetadata":
+        for field_name in ("http_status", "provider_request_id", "observed_at"):
+            if field_name in self.model_fields_set and getattr(self, field_name) is None:
+                raise ValueError("provider_failure_optional_field_null")
+        return self
+
 _SOURCE_EVENT_TYPES = {
     "agent.turn.start",
     "agent.turn.end",
@@ -148,6 +209,14 @@ _SENSITIVE_PAYLOAD_KEYS = {
     "secret",
     "token",
     "environment",
+    "error_message",
+    "errormessage",
+    "raw_error",
+    "response_body",
+    "request_body",
+    "prompt",
+    "tool_arguments",
+    "model_output",
 }
 # ``environment`` is a server-owned field of the immutable Runtime Snapshot.
 # It remains forbidden in model/source-event payloads below, but must be
@@ -219,12 +288,25 @@ class PiGatewayTerminalRequest(_StrictModel):
     attempt_id: str = Field(min_length=1, max_length=64)
     outcome: Literal["completed", "completed_with_warnings", "failed", "cancelled"]
     payload: dict[str, Any] = Field(default_factory=dict)
+    failure_metadata: PiGatewayProviderFailureMetadata | None = None
 
     @field_validator("payload")
     @classmethod
     def bound_payload(cls, value: dict[str, Any]) -> dict[str, Any]:
         _validate_payload(value, "terminal")
         return value
+
+    @model_validator(mode="after")
+    def provider_failure_metadata_boundary(self) -> "PiGatewayTerminalRequest":
+        if self.failure_metadata is not None and self.outcome != "failed":
+            raise ValueError("terminal_provider_failure_metadata_outcome_invalid")
+        if self.failure_metadata is not None:
+            business_code = self.payload.get("error_code") or self.payload.get("code")
+            if business_code != "pi_model_provider_error":
+                raise ValueError("terminal_provider_failure_metadata_code_invalid")
+        if "failure_metadata" in self.payload:
+            raise ValueError("terminal_provider_failure_metadata_must_be_top_level")
+        return self
 
 
 class PiGatewayClaimResponse(_StrictModel):

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { ControlPlaneClient } from "../src/control-plane-client.js";
+import { buildProviderFailureMetadata } from "../src/provider-failure.js";
 
 
 describe("Pi Gateway control-plane client", () => {
@@ -77,6 +78,37 @@ describe("Pi Gateway control-plane client", () => {
       tool_name: "query_analysis_data",
       server: "insight-cube-mcp",
       args: {},
+    });
+  });
+
+  it("sends provider failure metadata as a strict top-level terminal field", async () => {
+    let requestBody = "";
+    const client = new ControlPlaneClient({
+      origin: "https://control.invalid",
+      gatewayId: "gw-1",
+      internalSecret: "gateway-secret",
+      fetchImpl: async (_input, init) => {
+        requestBody = String(init?.body);
+        return new Response("{}", { status: 200 });
+      },
+    });
+    const metadata = buildProviderFailureMetadata(
+      { stopReason: "error", errorMessage: "401 Unauthorized" },
+      new Date("2026-08-21T08:00:00.000Z"),
+    );
+    await client.terminal(
+      "run-1",
+      "attempt-1",
+      "failed",
+      "lease-token-that-is-long-enough-123",
+      { code: "pi_model_provider_error" },
+      metadata,
+    );
+    expect(JSON.parse(requestBody)).toEqual({
+      attempt_id: "attempt-1",
+      outcome: "failed",
+      payload: { code: "pi_model_provider_error" },
+      failure_metadata: metadata,
     });
   });
 });

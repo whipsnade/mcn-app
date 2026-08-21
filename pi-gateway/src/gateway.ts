@@ -1,6 +1,11 @@
 import type { PiGatewayClaimResponse, PiGatewaySourceEvent } from "./protocol.js";
 import { ControlPlaneBusinessError } from "./control-plane-client.js";
-import { isDecisionLimitError, isProviderFailureError } from "./model-request-budget.js";
+import {
+  getProviderFailureMetadata,
+  isDecisionLimitError,
+  isProviderFailureError,
+} from "./model-request-budget.js";
+import type { ProviderFailureMetadata } from "./provider-failure.js";
 import { WorkerPool } from "./worker-pool.js";
 
 export type PiGatewayInfrastructureCode =
@@ -111,6 +116,7 @@ export interface GatewayControlPlane {
     outcome: "completed" | "completed_with_warnings" | "failed" | "cancelled",
     leaseToken: string,
     payload?: Record<string, unknown>,
+    failureMetadata?: ProviderFailureMetadata,
   ): Promise<unknown>;
 }
 
@@ -420,14 +426,34 @@ export class PiGateway {
       const terminalize = async (
         outcome: "completed" | "completed_with_warnings" | "failed" | "cancelled",
         payload?: Record<string, unknown>,
+        failureMetadata?: ProviderFailureMetadata,
       ): Promise<unknown> => {
         beginTerminalization();
         if (payload === undefined) {
+          if (failureMetadata === undefined) {
+            return this.controlPlane.terminal(
+              claim.run_id,
+              claim.attempt_id,
+              outcome,
+              claim.lease_token,
+            );
+          }
           return this.controlPlane.terminal(
             claim.run_id,
             claim.attempt_id,
             outcome,
             claim.lease_token,
+            undefined,
+            failureMetadata,
+          );
+        }
+        if (failureMetadata === undefined) {
+          return this.controlPlane.terminal(
+            claim.run_id,
+            claim.attempt_id,
+            outcome,
+            claim.lease_token,
+            payload,
           );
         }
         return this.controlPlane.terminal(
@@ -436,6 +462,7 @@ export class PiGateway {
           outcome,
           claim.lease_token,
           payload,
+          failureMetadata,
         );
       };
       try {
@@ -556,9 +583,12 @@ export class PiGateway {
           const businessCode = isDecisionLimitError(error)
             ? "pi_decision_limit"
             : "pi_model_provider_error";
+          const failureMetadata = isProviderFailureError(error)
+            ? getProviderFailureMetadata(error)
+            : undefined;
           try {
             if (!(await drainProjectedEvents())) return;
-            await terminalize("failed", { code: businessCode });
+            await terminalize("failed", { code: businessCode }, failureMetadata);
           } catch (terminalError) {
             this.onError(terminalError);
           }

@@ -10,9 +10,16 @@ import { PiSdkUsageProjector, projectPiSdkEvent } from "./event-projector.js";
 import {
   isDecisionLimitError,
   isProviderFailureError,
+  getProviderFailureMetadata,
   PiDecisionLimitError,
   PiModelProviderError,
 } from "./model-request-budget.js";
+import {
+  buildProviderFailureMetadata,
+  parseProviderFailureMetadata,
+  stripProviderErrorMessage,
+  type ProviderFailureMetadata,
+} from "./provider-failure.js";
 import type {
   ClaimedRun,
   FakeScriptStep,
@@ -30,7 +37,7 @@ export interface WorkerOptions {
   parentEnv?: NodeJS.ProcessEnv;
   /** Projected, secret-free source events delivered to the Gateway buffer. */
   onEvent?: (event: PiGatewaySourceEvent) => void;
-  /** Optional raw SDK audit hook; never send this payload to FastAPI. */
+  /** Optional metadata-free SDK audit hook; never send raw provider errors to FastAPI. */
   onSdkEvent?: (event: PiSdkEvent) => void;
   onReady?: () => void;
   mcpAccounting?: McpAccountingControlPlane;
@@ -50,6 +57,13 @@ export interface IsolatedWorkerProcess extends ChildProcess {
   done: Promise<void>;
   /** SIGTERM 并等待 Child 真正 close（grace 后升级 SIGKILL）才返回。 */
   abort(): Promise<void>;
+}
+
+export interface WorkerFailureFrame {
+  type: "failed";
+  runId: string;
+  errorCode: WorkerFailureCode;
+  failure_metadata?: ProviderFailureMetadata;
 }
 
 export type WorkerFailureCode =
@@ -79,6 +93,54 @@ export function classifyWorkerError(
     : "worker_error";
 }
 
+const WORKER_FAILURE_CODES = new Set<WorkerFailureCode>([
+  "worker_exited",
+  "worker_signaled",
+  "sdk_protocol_error",
+  "pi_decision_limit",
+  "pi_model_provider_error",
+  "worker_error",
+]);
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+/** Strict child→parent failure-frame parser; unknown keys fail closed. */
+export function parseWorkerFailureFrame(value: unknown, expectedRunId?: string): WorkerFailureFrame {
+  if (!isRecord(value) || value.type !== "failed") {
+    throw new Error("pi_worker_failure_frame_invalid");
+  }
+  const keys = Object.keys(value);
+  if (!keys.every((key) => ["type", "runId", "errorCode", "failure_metadata"].includes(key))) {
+    throw new Error("pi_worker_failure_frame_invalid");
+  }
+  if (
+    typeof value.runId !== "string" || !/^[A-Za-z0-9._:-]{1,64}$/.test(value.runId) ||
+    (expectedRunId !== undefined && value.runId !== expectedRunId) ||
+    typeof value.errorCode !== "string" || !WORKER_FAILURE_CODES.has(value.errorCode as WorkerFailureCode)
+  ) {
+    throw new Error("pi_worker_failure_frame_invalid");
+  }
+  let metadata: ProviderFailureMetadata | undefined;
+  try {
+    metadata = value.failure_metadata === undefined
+      ? undefined
+      : parseProviderFailureMetadata(value.failure_metadata);
+  } catch {
+    throw new Error("pi_worker_failure_frame_invalid");
+  }
+  if (metadata !== undefined && value.errorCode !== "pi_model_provider_error") {
+    throw new Error("pi_worker_failure_frame_invalid");
+  }
+  return {
+    type: "failed",
+    runId: value.runId,
+    errorCode: value.errorCode as WorkerFailureCode,
+    ...(metadata === undefined ? {} : { failure_metadata: metadata }),
+  };
+}
+
 /** Spawn a child worker with only non-secret claim data on IPC. */
 export function spawnIsolatedWorker(
   work: ClaimedRun,
@@ -94,9 +156,10 @@ export function spawnIsolatedWorker(
     serialization: "advanced",
   });
   const listeners = new Set<(event: PiGatewaySourceEvent) => void>();
-  // Child 终帧：{type:"done"} 或 {type:"failed", errorCode}。父进程据此把
+  // Child 终帧：{type:"done"} 或 {type:"failed", errorCode, failure_metadata}。父进程据此把
   // 业务失败（worker_error）与基础设施崩溃（无终帧的退出/信号）区分开。
   let terminalFrameCode: string | undefined;
+  let terminalFrameMetadata: ProviderFailureMetadata | undefined;
   const TERMINAL_FRAME_CODES = new Set([
     "worker_error",
     "sdk_protocol_error",
@@ -105,10 +168,16 @@ export function spawnIsolatedWorker(
   ]);
   child.on("message", (message: unknown) => {
     if (!message || typeof message !== "object" || !("type" in message)) return;
-    if (message.type === "failed" && "errorCode" in message) {
-      const code = (message as { errorCode?: unknown }).errorCode;
-      if (typeof code === "string" && TERMINAL_FRAME_CODES.has(code)) {
-        terminalFrameCode = code;
+    if (message.type === "failed") {
+      try {
+        const frame = parseWorkerFailureFrame(message, work.runId);
+        if (TERMINAL_FRAME_CODES.has(frame.errorCode)) {
+          terminalFrameCode = frame.errorCode;
+          terminalFrameMetadata = frame.failure_metadata;
+        }
+      } catch {
+        // Any IPC shape or metadata tampering is fail-closed as a worker crash;
+        // no untrusted value is turned into a terminal payload.
       }
       return;
     }
@@ -119,7 +188,15 @@ export function spawnIsolatedWorker(
   const done = new Promise<void>((resolve, reject) => {
     child.once("close", (code, signal) => {
       if (code === 0 && signal === null) resolve();
-      else if (terminalFrameCode !== undefined) reject(new Error(terminalFrameCode));
+      else if (terminalFrameCode !== undefined) {
+        const error = new Error(terminalFrameCode) as Error & {
+          code?: string;
+          failureMetadata?: ProviderFailureMetadata;
+        };
+        error.code = terminalFrameCode;
+        if (terminalFrameMetadata !== undefined) error.failureMetadata = terminalFrameMetadata;
+        reject(error);
+      }
       else reject(new Error(signal ? "worker_signaled" : "worker_exited"));
     });
   });
@@ -203,6 +280,8 @@ export async function runSingleWorker(
   // （经 message_end 事件暴露）。两层重试已关闭，该错误即本 Run 的终局模型失败，
   // 必须成为稳定 failed 终态而非「错误文本的完成」。
   let providerFailed = false;
+  let providerFailureMetadata: ProviderFailureMetadata | undefined;
+  let abortRequested = false;
   let cleanupPromise: Promise<void> | undefined;
   const cleanup = (): Promise<void> => {
     if (cleanupPromise) return cleanupPromise;
@@ -223,7 +302,10 @@ export async function runSingleWorker(
     })();
     return cleanupPromise;
   };
-  const removeSignalHandlers = installWorkerSignalHandlers(cleanup);
+  const removeSignalHandlers = installWorkerSignalHandlers(() => {
+    abortRequested = true;
+    return cleanup();
+  });
   try {
     session = options.sessionFactory
       ? await options.sessionFactory.create(work, workerSecrets)
@@ -236,16 +318,22 @@ export async function runSingleWorker(
     workerSecrets = undefined;
     options.onReady?.();
     unsubscribe = session.subscribe((event) => {
-      options.onSdkEvent?.(event);
+      options.onSdkEvent?.(sanitizeSdkEvent(event));
       if (event.type !== "sdk_event") return;
       const sdkEvent = event.event;
       if (
         isRecordValue(sdkEvent) &&
         sdkEvent.type === "message_end" &&
-        isRecordValue(sdkEvent.message) &&
-        sdkEvent.message.stopReason === "error"
+        isRecordValue(sdkEvent.message)
       ) {
-        providerFailed = true;
+        if (sdkEvent.message.stopReason === "aborted") {
+          // User cancellation is fenced by Gateway heartbeat and must never
+          // become a provider failure terminal.
+          providerFailed = false;
+        } else if (sdkEvent.message.stopReason === "error") {
+          providerFailed = true;
+          providerFailureMetadata = buildProviderFailureMetadata(sdkEvent.message);
+        }
       }
       const projected = projectPiSdkEvent(event.event ?? event, usageProjector);
       for (const item of projected) options.onEvent?.(item);
@@ -263,9 +351,22 @@ export async function runSingleWorker(
     if (session.modelBudget?.limitExceeded) {
       throw new PiDecisionLimitError(session.modelBudget.maxDecisions);
     }
-    if (providerFailed) {
-      throw new PiModelProviderError();
+    if (providerFailed && !abortRequested) {
+      throw new PiModelProviderError(providerFailureMetadata);
     }
+  } catch (error) {
+    // Some SDK versions emit message_end(stopReason=error) and then reject
+    // prompt(). Preserve the authoritative provider terminal classification;
+    // never let that path degrade to worker_error or leak the SDK exception.
+    if (
+      providerFailed &&
+      !abortRequested &&
+      !isDecisionLimitError(error) &&
+      !isProviderFailureError(error)
+    ) {
+      throw new PiModelProviderError(providerFailureMetadata);
+    }
+    throw error;
   } finally {
     try {
       // Every exit path (normal, cancel, abort, provider/decision failure and
@@ -286,8 +387,21 @@ function isRecordValue(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
 
+function sanitizeSdkEvent(event: PiSdkEvent): PiSdkEvent {
+  if (event.type !== "sdk_event") return event;
+  return {
+    ...event,
+    event: stripProviderErrorMessage(event.event),
+  };
+}
+
 function finishChildProcess(
-  message: { type: "done" | "failed"; runId: string; errorCode?: WorkerFailureCode },
+  message: {
+    type: "done" | "failed";
+    runId: string;
+    errorCode?: WorkerFailureCode;
+    failure_metadata?: ProviderFailureMetadata;
+  },
   exitCode: number,
 ): void {
   let finished = false;
@@ -360,11 +474,13 @@ if (process.env.PI_WORKER_CHILD === "1" && process.send) {
       })
       .catch((error) => {
         rpc.dispose();
+        const failureMetadata = getProviderFailureMetadata(error);
         finishChildProcess(
           {
             type: "failed",
             runId: message.work.runId,
             errorCode: classifyWorkerError(error),
+            ...(failureMetadata === undefined ? {} : { failure_metadata: failureMetadata }),
           },
           1,
         );

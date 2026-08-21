@@ -108,6 +108,30 @@ cd backend
 - 验证：本机 `curl http://127.0.0.1:8100/healthz` 应返回 `{"status":"ok"}`；公网用 `curl http://111.10.192.19:40099/api/v1/agent/sessions` 期望 401（证明 nginx→后端链路通，`/healthz` 不在 `/api/` 下、不公网暴露）。
 - 注意：远端无 --reload，改代码必须重启服务；云安全组与 ufw 是两层，曾误开 ufw 导致 SSH 断连，端口变更需同时确认两侧放行。
 
+## 2026-08-21 Provider 失败诊断运行口径
+
+唯一真实 Run `f5b7f6d9-0a45-4f3e-8373-bf183a26e494` 的 provider 根因不能恢复：旧 Worker 只保存
+`stopReason="error"` 布尔值，旧 `PiModelProviderError`、Child IPC 和日志边界均没有安全分类；不得据此猜测或
+修改 provider 请求协议。
+
+新路径使用严格、metadata-only 的 `provider_failure_v1`：分类、可选 HTTP 状态、受限 request id、SHA-256
+fingerprint 和毫秒 UTC 时间戳。原始 `errorMessage` 只在 Worker 内存中分类/哈希，不得进入 Error、IPC、HTTP、
+数据库、事件、日志或探针输出。terminal 业务码仍为 `pi_model_provider_error`，不启用 provider/agent 重试，
+不把 provider failure 转为基础设施恢复 Attempt；`aborted` 仅表示取消/中止，不能伪造 provider failure。
+
+### 诊断探针顺序
+
+只有“代码定向验证 + 独立审查 Critical 0 / Important 0 + 一次候选 CI 全绿 + 精确 HEAD 预发布部署”全部完成后，
+才执行探针；探针不创建 Session/Run、不连接 DataTap、不操作钱包，`retries=0`：
+
+1. A：预发布实际 Base URL/provider/model，同一 SDK adapter，1 次最小文本请求。
+2. A 成功后才执行 B：一次 assistant tool_call → 进程内诊断 no-op tool result → 下一轮响应，最多 2 次请求；
+   no-op 不调用 MCP、数据库或生产内部工具。
+
+总预算为模型最多 3 次、DataTap 0、钱包/积分 0。401/403 停止并只报告 credential reference/version；404
+停在 endpoint/model 配置核对；429/5xx 记录上游窗口并停止；context_length 先制定文件级修复计划；invalid_request
+只保留脱敏分类和 fingerprint。只有 A/B 均成功，且 58 项 Snapshot 仍只读完整，才可进入唯一一次瑞幸咖啡 Web UAT。
+
 ## 凭据与日志
 
 日志调用 `app.core.redaction.redact_for_log()` 后再序列化。该函数递归遮蔽授权头、Cookie、手机号、模型/MCP token、JWT 密钥和 MySQL 密码；严禁打印原始请求头、环境变量或完整 Prompt。模型永远不接触 DataTap token、数据库 DSN 或 JWT 密钥。

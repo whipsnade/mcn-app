@@ -372,4 +372,43 @@ READY_FOR_FINAL_FUNCTIONAL_UAT_REVIEW`；在此之前不得合入 main、生产�
   wallet reserved=0、Run lease/active_run 均为空；Gateway 无残留 worker，仅保留主进程和 8100/9471 健康监听。
 - 当前状态为 `REAL_UAT_CATALOG_CLAIM_FIXED_PROVIDER_FAILED / NOT_READY_FOR_FINAL_FUNCTIONAL_UAT`。
   该结果不能推进到 `REAL_UAT_MCP_PASS_THROUGH_AND_CANCEL_PASS`；不合入 main、不部署生产、不执行
-  5%→25%→100% 灰度，也不再重试本次 Web UAT。后续若要处理 provider 失败，需新的明确外部服务/发布授权。
+  5%→25%→100% 灰度，也不再重试本次 Web UAT。该历史记录当时未包含 provider 诊断授权；当前续作见 §10。
+
+## 10. Provider 失败安全可观测性（2026-08-21，当前修复）
+
+### 10.1 旧 Run 的根因边界
+
+- 唯一真实 Run `f5b7f6d9-0a45-4f3e-8373-bf183a26e494` 已终态失败，禁止恢复、修改或复用；该 Run 的
+  DataTap、AgentToolCall 和扣费均为 0。
+- 旧路径只把 `message.stopReason="error"` 记为布尔值，`PiModelProviderError` 没有分类，Child IPC
+  只发送 `errorCode`，且 Child stdout/stderr 被设为 `ignore`。因此原始 provider `errorMessage` 已不可
+  恢复，不能从旧 Run 猜测鉴权、限流、上下文或协议根因。
+
+### 10.2 新契约与安全边界
+
+新增严格 `provider_failure_v1` metadata-only DTO：`version`、枚举 `failure_class`（含
+`authentication`、`authorization`、`rate_limited`、`model_not_found`、`invalid_request`、
+`context_length`、`timeout`、`network`、`upstream_5xx`、`aborted`、`unknown`）、可选 100–599
+`http_status`、可选安全字符且不超过 128 的 `provider_request_id`、64 个十六进制字符的 SHA-256
+`error_fingerprint`、可选毫秒 UTC `observed_at`。未知情况统一为 `unknown`。
+
+- 只从 SDK `AssistantMessage.errorMessage` 在内存中提取有限分类、状态和 request id；原文只用于哈希，
+  不进入 Error message、IPC、HTTP、数据库、事件或日志。
+- 严格 DTO、Child IPC 帧、Gateway terminal 和 FastAPI terminal 均执行 exact-key、长度、枚举、状态码、
+  request id 与 fingerprint 校验；元数据只能和 `pi_model_provider_error` 绑定。
+- terminal 业务错误码保持 `pi_model_provider_error`；provider 失败不自动重试、不创建基础设施 Attempt 2。
+  SDK `aborted` 与用户取消仍走 `cancelled`；取消栅栏抢先时不会持久化 provider metadata。
+- Recovery 继续按原有 durable terminal 语义处理 terminal ACK 丢失；已落库的 provider failed 不会重新
+  排队。没有对 provider 请求协议做猜测性修改。
+
+### 10.3 TDD 与当前停止边界
+
+- 已锁定 400/401/403/404/422/429、上下文窗口、timeout、network、500/502/503/529 与 unknown 分类，
+  以及 secret/Bearer/prompt/response body 不出现在任何投影中的断言。
+- 已锁定 IPC 篡改、额外字段、非法状态码、非法 request id、错误码绑定、Run ID 不一致 fail-closed，
+  provider failed 不产生 Attempt 2，以及 cancel/aborted 保持 cancelled 的断言。
+- 受影响定向验证已通过：Pi Gateway 9 个测试文件/100 项、Backend 34 项；Gateway typecheck、build、
+  Backend Ruff、`git diff --check` 与生产代码 secret/DSN/Bearer 扫描通过。独立只读复核为
+  Critical 0 / Important 0 / Minor 1；Minor 是 ACK-loss 测试未模拟真实传输层断响应，不改变终态语义。
+- provider 探针 A/B、候选 CI、预发布部署和新的 Web UAT 尚未执行。在 A/B 全部成功、服务健康、58 项 Snapshot
+  只读核验通过前，不创建新的 UAT Run。

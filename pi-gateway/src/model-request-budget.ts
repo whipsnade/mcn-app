@@ -1,3 +1,9 @@
+import {
+  buildProviderFailureMetadata,
+  parseProviderFailureMetadata,
+  type ProviderFailureMetadata,
+} from "./provider-failure.js";
+
 /**
  * Per-Run model request budget, enforced at the provider dispatch boundary.
  *
@@ -26,9 +32,22 @@ export const PROVIDER_FAILURE_CODE = "pi_model_provider_error";
 export class PiModelProviderError extends Error {
   readonly code = PROVIDER_FAILURE_CODE;
 
-  constructor() {
+  constructor(
+    readonly failureMetadata: ProviderFailureMetadata = buildProviderFailureMetadata({ stopReason: "error" }),
+  ) {
     super(PROVIDER_FAILURE_CODE);
     this.name = "PiModelProviderError";
+    this.failureMetadata = parseProviderFailureMetadata(failureMetadata);
+  }
+}
+
+export function getProviderFailureMetadata(error: unknown): ProviderFailureMetadata | undefined {
+  if (!error || typeof error !== "object" || !("failureMetadata" in error)) return undefined;
+  const value = (error as { failureMetadata?: unknown }).failureMetadata;
+  try {
+    return parseProviderFailureMetadata(value);
+  } catch {
+    return undefined;
   }
 }
 

@@ -386,4 +386,18 @@ Gate A 审查发现的 5 项必修 + 2 项次要问题，已在同一迁移/代�
   不得报告为取消通过；Run、Attempt、租约、预留、active_run 和 worker 已清理。
 - 因真实功能 UAT 未通过，当前发布状态为
   `REAL_UAT_CATALOG_CLAIM_FIXED_PROVIDER_FAILED / NOT_READY_FOR_FINAL_FUNCTIONAL_UAT`。不合入 main、
-  不部署生产、不灰度；后续 provider 排查需要新的明确外部服务/发布授权，不能重试本次 Web UAT 代替证据。
+  不部署生产、不灰度；该历史结果不能由第二次 Web UAT 覆盖，当前 provider 诊断授权与停止门见 §5.13。
+
+### 5.13 2026-08-21 Provider failure metadata 诊断门
+
+旧真实 Run 的 provider 根因不可恢复：`worker-entry.ts` 仅记录 `stopReason="error"`，旧
+`PiModelProviderError` 无分类，Child IPC 仅有 `errorCode`，stdout/stderr 被忽略。新实现只从 SDK
+`AssistantMessage.errorMessage` 提取受限 metadata，使用严格 `provider_failure_v1`，原文不进入任何持久化、
+IPC、HTTP、事件或日志边界；未知分类必须为 `unknown`。
+
+该 DTO 只允许 `pi_model_provider_error`，保留 provider failure 的业务终态和“不自动重试/不创建 Attempt 2”
+语义；取消/`aborted` 仍由取消栅栏收口为 `run.cancelled`。Recovery 对已提交的 terminal ACK 丢失按原 durable
+终态处理，不重新执行模型或 MCP。该修复未改 provider 请求协议、DataTap allowlist、Artifact Schema 或历史数据。
+
+未完成候选 CI、预发布诊断探针 A/B 前，不得进行新的 Web UAT。A/B 使用真实预发布 provider/model 但总模型请求不超过
+3 次，DataTap 与钱包均为 0；只有 A/B 全通过且 58 项 Snapshot 只读核验通过，才允许唯一一次瑞幸咖啡 Web UAT。

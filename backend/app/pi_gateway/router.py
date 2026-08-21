@@ -452,7 +452,9 @@ async def terminal(
         try:
             terminal_payload = dict(payload.payload or {})
             if effective_outcome == RunStatus.CANCELLED:
-                terminal_payload.setdefault("code", "cancel_requested")
+                terminal_payload["code"] = "cancel_requested"
+            if effective_outcome == RunStatus.FAILED and payload.failure_metadata is not None:
+                terminal_payload["failure_metadata"] = payload.failure_metadata.model_dump(mode="json")
             if effective_outcome == RunStatus.COMPLETED_WITH_WARNINGS:
                 validation_warnings = await completion_validator.validate(run)
                 warnings = getattr(validation_warnings, "warnings", ())

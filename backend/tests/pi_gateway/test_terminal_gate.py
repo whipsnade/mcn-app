@@ -2,16 +2,16 @@
 
 from __future__ import annotations
 
+import json
 import time
 from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import select
 
-from app.agent_runtime.models import AgentEvent, AgentMessage, AgentRun
+from app.agent_runtime.models import AgentEvent, AgentMessage, AgentRun, AgentRunAttempt
 from app.pi_gateway.auth import build_signature
-from app.pi_gateway.service import hash_lease_token
-from app.pi_gateway.service import PiGatewayService
+from app.pi_gateway.service import PiGatewayRecoveryService, PiGatewayService, hash_lease_token
 
 from .test_model_usage import _run
 
@@ -93,6 +93,65 @@ async def test_terminal_completed_requires_persisted_assistant_completion(
         ).all()
     )
     assert [event.event_type for event in terminal_events] == ["run.failed"]
+
+
+@pytest.mark.asyncio
+async def test_provider_failure_terminal_persists_only_safe_metadata_without_new_attempt(
+    db_session, user_factory, client, gateway_settings
+) -> None:
+    user = await user_factory()
+    run, attempt, _tenant_id = await _run(db_session, user)
+    token = "lease-token-provider-failure-with-entropy"
+    _arm_lease(run, token)
+    await db_session.commit()
+
+    path = f"/api/v1/internal/pi-gateway/v1/runs/{run.id}/terminal"
+    metadata = {
+        "version": "provider_failure_v1",
+        "failure_class": "authentication",
+        "http_status": 401,
+        "provider_request_id": "req_safe-123",
+        "error_fingerprint": "a" * 64,
+        "observed_at": "2026-08-21T08:00:00.000Z",
+    }
+    body = json.dumps(
+        {
+            "attempt_id": attempt.id,
+            "outcome": "failed",
+            "payload": {"code": "pi_model_provider_error"},
+            "failure_metadata": metadata,
+        },
+        separators=(",", ":"),
+    ).encode()
+    response = await client.post(
+        path,
+        content=body,
+        headers={**_signed_headers(body, path, nonce="nonce-provider-failure"), "X-Pi-Run-Lease": token},
+    )
+
+    assert response.status_code == 200
+    await db_session.refresh(run)
+    assert run.status == "failed"
+    assert run.error_code == "pi_model_provider_error"
+    attempts = list(
+        (await db_session.scalars(select(AgentRunAttempt).where(AgentRunAttempt.run_id == run.id))).all()
+    )
+    assert len(attempts) == 1
+    terminal_events = list(
+        (
+            await db_session.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.id, AgentEvent.event_type == "run.failed")
+            )
+        ).all()
+    )
+    assert len(terminal_events) == 1
+    assert terminal_events[0].payload_json["failure_metadata"] == metadata
+    assert "errorMessage" not in terminal_events[0].payload_json
+    assert await PiGatewayRecoveryService(db_session).recover_expired_run(run.id) == "ignored"
+    attempts_after_recovery = list(
+        (await db_session.scalars(select(AgentRunAttempt).where(AgentRunAttempt.run_id == run.id))).all()
+    )
+    assert len(attempts_after_recovery) == 1
 
 
 @pytest.mark.asyncio
@@ -205,6 +264,54 @@ async def test_terminal_completed_after_cancel_request_settles_cancelled(
         ).all()
     )
     assert [event.event_type for event in terminal_events] == ["run.cancelled"]
+
+
+@pytest.mark.asyncio
+async def test_provider_failure_after_cancel_fence_stays_cancelled_without_metadata(
+    db_session, user_factory, client, gateway_settings
+) -> None:
+    user = await user_factory()
+    run, attempt, _tenant_id = await _run(db_session, user)
+    token = "lease-token-provider-cancel-race-with-entropy"
+    _arm_lease(run, token)
+    run.cancel_requested = True
+    await db_session.commit()
+
+    path = f"/api/v1/internal/pi-gateway/v1/runs/{run.id}/terminal"
+    metadata = {
+        "version": "provider_failure_v1",
+        "failure_class": "timeout",
+        "error_fingerprint": "b" * 64,
+    }
+    body = json.dumps(
+        {
+            "attempt_id": attempt.id,
+            "outcome": "failed",
+            "payload": {"code": "pi_model_provider_error"},
+            "failure_metadata": metadata,
+        },
+        separators=(",", ":"),
+    ).encode()
+    response = await client.post(
+        path,
+        content=body,
+        headers={**_signed_headers(body, path, nonce="nonce-provider-cancel-race"), "X-Pi-Run-Lease": token},
+    )
+
+    assert response.status_code == 200
+    await db_session.refresh(run)
+    assert run.status == "cancelled"
+    assert run.error_code is None
+    terminal_events = list(
+        (
+            await db_session.scalars(
+                select(AgentEvent).where(AgentEvent.run_id == run.id, AgentEvent.event_type == "run.cancelled")
+            )
+        ).all()
+    )
+    assert len(terminal_events) == 1
+    assert terminal_events[0].payload_json["code"] == "cancel_requested"
+    assert "failure_metadata" not in terminal_events[0].payload_json
 
 
 @pytest.mark.asyncio

@@ -324,6 +324,23 @@ Run 必须有当前 Run/Session/tenant 归属下至少一个已发布、不可�
 - [ ] 生产灰度 `5% → 25% → 100%`，完成生产验收、监控、文档封口和回滚演练记录，最终状态才可写为
   `PRODUCTION_RELEASE_COMPLETE`。
 
+### Task 14：Provider failure 安全可观测性与诊断探针（2026-08-21 重新授权）
+
+- [x] 先锁定旧 Run 根因不可恢复边界：旧 Worker 只有 error 布尔值，旧异常无分类，Child IPC 只有
+  `errorCode`，stdout/stderr 不可作为证据；不猜测或修改 provider 请求协议。
+- [x] 以 TDD 增加 `provider_failure_v1` metadata-only DTO、SDK message_end 分类、secret-free audit、
+  strict IPC frame、Gateway terminal 和 FastAPI terminal 持久化覆盖；元数据只能绑定
+  `pi_model_provider_error`。
+- [x] 保留无自动重试、无 Attempt 2、cancel/aborted→cancelled、terminal ACK-loss durable failure 和
+  58 项 catalog/claim/MCP/取消既有边界；不添加 provider/业务类型推导器。
+- [x] 完成一次受影响定向验证：Pi Gateway 9 个测试文件/100 项、Backend 34 项、Ruff、Gateway typecheck/build、
+  diff check、生产代码 secret/DSN/Bearer scan；独立只读审查为 Critical 0 / Important 0 / Minor 1。
+- [ ] 将当前未推送线性提交作为唯一候选推送并触发一次 CI；CI 全绿后部署精确 HEAD 到预发布。
+- [ ] 执行探针 A/B（模型≤3、DataTap=0、钱包=0）；仅 A/B 全通过、服务健康且 58 项 Snapshot 只读核验通过，
+  才执行唯一一次瑞幸咖啡 Web UAT。
+- [ ] Web UAT 通过后最高只记录 `READY_FOR_FINAL_FUNCTIONAL_UAT_REVIEW`；本 Task 不授权合入 main、生产部署
+  或 `5% → 25% → 100%` 灰度。
+
 ## Spec Coverage Self-Review Matrix
 
 | 设计验收主题 | 覆盖任务 | 关键证据 |

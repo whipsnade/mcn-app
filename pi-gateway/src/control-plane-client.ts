@@ -5,6 +5,7 @@ import type {
   PiGatewayClaimResponse,
   PiGatewaySourceEvent,
 } from "./protocol.js";
+import { parseProviderFailureMetadata, type ProviderFailureMetadata } from "./provider-failure.js";
 import type {
   McpAccountingControlPlane,
   McpFailureMetadata,
@@ -241,8 +242,25 @@ export class ControlPlaneClient implements ControlPlaneTransport {
     outcome: "completed" | "completed_with_warnings" | "failed" | "cancelled",
     leaseToken: string,
     payload: Record<string, unknown> = {},
+    failureMetadata?: ProviderFailureMetadata,
   ): Promise<unknown> {
-    return this.request("POST", `/runs/${encodeURIComponent(runId)}/terminal`, { attempt_id: attemptId, outcome, payload }, leaseToken);
+    if (failureMetadata !== undefined && outcome !== "failed") {
+      throw new Error("pi_provider_failure_metadata_invalid");
+    }
+    const safeFailureMetadata = failureMetadata === undefined
+      ? undefined
+      : parseProviderFailureMetadata(failureMetadata);
+    return this.request(
+      "POST",
+      `/runs/${encodeURIComponent(runId)}/terminal`,
+      {
+        attempt_id: attemptId,
+        outcome,
+        payload,
+        ...(safeFailureMetadata === undefined ? {} : { failure_metadata: safeFailureMetadata }),
+      },
+      leaseToken,
+    );
   }
 
   private async request<T = unknown>(
