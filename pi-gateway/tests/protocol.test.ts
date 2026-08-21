@@ -22,13 +22,14 @@ describe("Pi Gateway protocol parser", () => {
       attempt_id: "attempt-1",
       lease_token: "lease-token-that-is-long-enough-123",
           lease_expires_at: 1_700_000_600,
-      runtime_snapshot: {},
+      runtime_snapshot: { environment: "test" },
       transcript: [{ role: "user", content: "hello" }],
       secret_envelope: { alg: "AES-256-GCM", nonce: "AAAAAAAAAAAAAAAA", ciphertext: "BBBBBBBBBBBBBBBB" },
       adapter_catalog: [],
       internal_tools: [{ name: "load_marketing_skill" }],
     };
     expect(parsePiGatewayClaimResponse(claim).run_id).toBe("run-1");
+    expect(parsePiGatewayClaimResponse(claim).runtime_snapshot).toEqual({ environment: "test" });
     expect(() => parsePiGatewayClaimResponse({ ...claim, transcript: [{ role: "user", content: "x", path: "/tmp" }] })).toThrow("pi_gateway_claim_response_invalid");
     expect(() => parsePiGatewayClaimResponse({ ...claim, runtime_snapshot: { token: "secret" } })).toThrow("pi_gateway_claim_response_invalid");
   });

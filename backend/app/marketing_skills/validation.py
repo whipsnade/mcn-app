@@ -6,6 +6,8 @@ import unicodedata
 from dataclasses import dataclass
 from typing import Collection
 
+from app.core.credential_scanner import contains_credential
+from app.marketing_skills.constants import MAX_SKILL_CONTENT_BYTES
 
 _SKILL_NAME_RE = re.compile(r"^[a-z][a-z0-9-]{1,95}$")
 _ARTIFACT_CONTRACT_RE = re.compile(r"^[a-z][a-z0-9_]{1,95}$")
@@ -160,6 +162,12 @@ def _security_errors(content: str) -> list[SkillValidationError]:
     for pattern, code, message in checks:
         if pattern.search(content):
             errors.append(SkillValidationError(code, message))
+    if contains_credential(content):
+        errors.append(
+            SkillValidationError(
+                "credential_reference_forbidden", "Skill 不得包含私钥、云密钥、JWT 或供应商凭证"
+            )
+        )
     return errors
 
 
@@ -171,6 +179,13 @@ def validate_skill_content(
 ) -> SkillValidationResult:
     normalized = _normalize_content(content)
     errors = _security_errors(normalized)
+    if len(normalized.encode("utf-8")) > MAX_SKILL_CONTENT_BYTES:
+        errors.append(
+            SkillValidationError(
+                "content_too_large",
+                f"Skill UTF-8 内容不得超过 {MAX_SKILL_CONTENT_BYTES} bytes",
+            )
+        )
     metadata, parse_errors = _parse_frontmatter(normalized)
     errors.extend(parse_errors)
 

@@ -111,3 +111,32 @@ def test_skill_validation_rejects_duplicate_tools_and_malformed_frontmatter() ->
     assert "duplicate_required_tool" in {error.code for error in duplicate_result.errors}
     assert not malformed_result.valid
     assert "frontmatter_invalid_line" in {error.code for error in malformed_result.errors}
+
+
+@pytest.mark.parametrize(
+    "secret",
+    [
+        "-----BEGIN PRIVATE KEY-----\nsecret\n-----END PRIVATE KEY-----",
+        "AKIAIOSFODNN7EXAMPLE",
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.signature-value",
+        "https://example.test/api?token=provider-token-value",
+    ],
+)
+def test_skill_validation_rejects_common_credential_shapes(secret: str) -> None:
+    result = validate_skill_content(
+        f"---\nname: good-name\ndescription: ok\nrequired_tools: []\n---\n{secret}\n",
+        expected_name="good-name",
+        approved_tools=set(),
+    )
+
+    assert not result.valid
+    assert "credential_reference_forbidden" in {error.code for error in result.errors}
+
+
+def test_skill_validation_uses_utf8_byte_limit() -> None:
+    content = "---\nname: good-name\ndescription: ok\nrequired_tools: []\n---\n" + "中" * 70_000
+
+    result = validate_skill_content(content, expected_name="good-name", approved_tools=set())
+
+    assert not result.valid
+    assert "content_too_large" in {error.code for error in result.errors}

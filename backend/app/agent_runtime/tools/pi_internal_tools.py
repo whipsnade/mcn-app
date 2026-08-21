@@ -57,7 +57,13 @@ class GetSessionContextTool:
         del arguments
         session = await self._db.get(AgentSession, context.session_id)
         run = await self._db.get(AgentRun, context.run_id)
-        if session is None or run is None or session.user_id != context.user_id:
+        if (
+            session is None
+            or run is None
+            or session.user_id != context.user_id
+            or run.user_id != context.user_id
+            or run.session_id != session.id
+        ):
             return ToolResult(status="failed", safe_summary="session_not_found", error_type="not_found")
         # 多列查询必须用 execute().all() 取 Row；scalars() 只会返回首列
         # （str），下方 row.id 将抛 AttributeError。

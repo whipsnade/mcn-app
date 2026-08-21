@@ -5,6 +5,8 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
+  MAX_CONTENT_BYTES,
+  MAX_SKILLS,
   materializeRunSkillSnapshot,
   skillSnapshotDigest,
 } from "../src/skill-snapshot.js";
@@ -86,5 +88,26 @@ describe("run Skill snapshot materializer", () => {
     await loader.reload();
     expect(loader.getSkills().skills.map((skill) => skill.name)).toEqual(["campaign-research"]);
     expect(loader.getSystemPrompt()).toBe("ROOT POLICY");
+  });
+
+  it("enforces the shared skill count and UTF-8 byte limits", async () => {
+    const root = await makeRoot();
+    const largeContent = "中".repeat(Math.ceil(MAX_CONTENT_BYTES / 2));
+    await expect(
+      materializeRunSkillSnapshot(root, [entry({ content: largeContent })]),
+    ).rejects.toThrow("pi_skill_snapshot_entry_invalid");
+
+    const entries = Array.from({ length: MAX_SKILLS + 1 }, (_, index) => {
+      const name = `skill-${index.toString().padStart(2, "0")}`;
+      const content = `---\nname: ${name}\ndescription: test\nrequired_tools: []\n---\nbody\n`;
+      return entry({
+        name,
+        content,
+        contentDigest: createHash("sha256").update(content).digest("hex"),
+      });
+    });
+    await expect(materializeRunSkillSnapshot(root, entries)).rejects.toThrow(
+      "pi_skill_snapshot_invalid",
+    );
   });
 });

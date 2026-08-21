@@ -29,6 +29,8 @@ from pydantic import ValidationError
 from app.agent_artifacts.canonical import CanonicalPayloadMixin, model_direct_lineage_context
 from app.agent_artifacts.lineage import ValidationIssue, validate_structured_claims
 from app.agent_artifacts.payloads import TYPED_PAYLOAD_BY_SCHEMA
+from app.agent_artifacts.payloads.analysis_report import AnalysisReportV1
+from app.core.config import get_settings
 
 
 class ArtifactPayloadInvalid(Exception):
@@ -552,6 +554,20 @@ class ArtifactPayloadValidator:
                 f"payload fails {schema_version!r} contract: {exc.error_count()} error(s)",
                 errors=exc.errors(include_context=False),
             ) from exc
+        if isinstance(instance, AnalysisReportV1):
+            settings = get_settings()
+            try:
+                instance.validate_limits(
+                    max_blocks=settings.analysis_report_max_blocks,
+                    max_columns=settings.analysis_report_max_columns,
+                    max_rows=settings.analysis_report_max_rows,
+                    max_cell_chars=settings.analysis_report_max_cell_chars,
+                )
+            except ValueError as exc:
+                raise ArtifactPayloadInvalid(
+                    f"payload fails {schema_version!r} technical limits",
+                    errors=[{"loc": [], "msg": str(exc), "type": "technical_limit"}],
+                ) from exc
         if enforce_kol_publication_validity and schema_version == "kol_selection_v3":
             kol_issues = validate_kol_candidates(instance, require_v3_scope=True)
             if kol_issues:

@@ -40,6 +40,7 @@ class SkillRevisionCreate(_SkillModel):
 class SkillRevisionRead(_SkillModel):
     id: str
     tenant_id: str | None = None
+    scope_key: str
     skill_name: str
     revision: int
     content: str
@@ -54,6 +55,7 @@ class SkillRevisionRead(_SkillModel):
 
 class SkillActivationRequest(_SkillModel):
     revision: int = Field(gt=0)
+    revision_id: str | None = Field(default=None, min_length=1, max_length=36)
     tenant_id: str | None = Field(default=None, min_length=1, max_length=36)
     environment: Literal["development", "staging", "production"] = "production"
     rollout_percent: int = Field(default=100, ge=0, le=100)
@@ -68,12 +70,14 @@ class SkillActivationRead(_SkillModel):
     id: str
     environment: str
     tenant_id: str | None = None
+    scope_key: str
     skill_name: str
     active_revision: int
     active_revision_id: str
     previous_revision: int | None = None
     previous_revision_id: str | None = None
     rollout_percent: int
+    previous_rollout_percent: int | None = None
     updated_by: str | None = None
     updated_at: datetime
 
@@ -100,6 +104,8 @@ class SkillDiffRead(_SkillModel):
     skill_name: str
     from_revision: int
     to_revision: int
+    from_revision_id: str | None = None
+    to_revision_id: str | None = None
     diff: str
 
 

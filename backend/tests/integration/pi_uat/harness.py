@@ -16,6 +16,7 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -646,7 +647,7 @@ class PiUatTopology:
         self.fastapi_log = log
         self._fastapi = subprocess.Popen(
             [
-                str(BACKEND_DIR / ".venv/bin/python"),
+                sys.executable,
                 "-m",
                 "uvicorn",
                 "app.main:app",

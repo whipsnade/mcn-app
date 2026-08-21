@@ -28,6 +28,7 @@ export interface AdminSkillRevisionInput {
 
 export interface AdminSkillActivationInput {
   revision: number;
+  revision_id?: string;
   tenant_id?: string | null;
   environment?: AdminSkillEnvironment;
   rollout_percent?: number;
@@ -79,9 +80,11 @@ export const getAdminSkillDiff = (
   fromRevision: number,
   toRevision: number,
   tenantId?: string | null,
+  fromRevisionId?: string,
+  toRevisionId?: string,
 ): Promise<ApiSkillDiff> =>
   request<ApiSkillDiff>(
-    `/api/v1/admin/skills/${encodeSkillName(skillName)}/diff?from_revision=${fromRevision}&to_revision=${toRevision}${tenantId ? `&tenant_id=${encodeURIComponent(tenantId)}` : ''}`,
+    `/api/v1/admin/skills/${encodeSkillName(skillName)}/diff?from_revision=${fromRevision}&to_revision=${toRevision}${tenantId ? `&tenant_id=${encodeURIComponent(tenantId)}` : ''}${fromRevisionId ? `&from_revision_id=${encodeURIComponent(fromRevisionId)}` : ''}${toRevisionId ? `&to_revision_id=${encodeURIComponent(toRevisionId)}` : ''}`,
   );
 
 export const activateAdminSkill = (

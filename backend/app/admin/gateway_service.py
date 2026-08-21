@@ -765,7 +765,14 @@ class GatewayAdminService:
 
     @staticmethod
     def _config_item(row: RuntimeConfigVersion) -> AdminRuntimeConfigItem:
-        return AdminRuntimeConfigItem(id=row.id, scope=row.scope, tenant_id=row.tenant_id, version=row.version, status=row.status, runtime_backend=row.runtime_backend, runtime_contract_version=row.runtime_contract_version, model=dict((row.config_json or {}).get("model") or {}), datatap=dict((row.config_json or {}).get("datatap") or {}), limits=dict((row.config_json or {}).get("limits") or {}), billing=dict((row.config_json or {}).get("billing") or {}), secret_refs=[{"kind": str(ref.get("kind")), "masked_value": "••••", "fingerprint": "stored"} for ref in (row.secret_refs_json or []) if isinstance(ref, dict)], created_by=row.created_by, created_at=row.created_at, activated_at=row.activated_at)
+        config_json = row.config_json or {}
+        environment = config_json.get("environment", "production")
+        if environment not in {"development", "staging", "production"}:
+            environment = "production"
+        completion_mode = config_json.get("completion_mode", "formal_analysis")
+        if completion_mode not in {"formal_analysis", "interaction"}:
+            completion_mode = "formal_analysis"
+        return AdminRuntimeConfigItem(id=row.id, scope=row.scope, tenant_id=row.tenant_id, version=row.version, status=row.status, runtime_backend=row.runtime_backend, runtime_contract_version=row.runtime_contract_version, environment=environment, completion_mode=completion_mode, model=dict(config_json.get("model") or {}), datatap=dict(config_json.get("datatap") or {}), limits=dict(config_json.get("limits") or {}), billing=dict(config_json.get("billing") or {}), secret_refs=[{"kind": str(ref.get("kind")), "masked_value": "••••", "fingerprint": "stored"} for ref in (row.secret_refs_json or []) if isinstance(ref, dict)], created_by=row.created_by, created_at=row.created_at, activated_at=row.activated_at)
 
     async def list_runtime_configs(self, tenant_id: str, *, limit: int, offset: int) -> tuple[list[AdminRuntimeConfigItem], int]:
         await self._tenant(tenant_id)
@@ -778,7 +785,7 @@ class GatewayAdminService:
             await self._tenant(payload.tenant_id, for_update=True)
             secrets = RuntimeSecretBundle.model_validate(payload.secrets) if payload.secrets is not None else None
             try:
-                row = await RuntimeConfigService(self.db).create_tenant_version(payload.tenant_id, created_by=admin.id, runtime_backend=payload.runtime_backend, model=payload.model, datatap=payload.datatap, limits=payload.limits, billing=payload.billing, secrets=secrets, runtime_contract_version=payload.runtime_contract_version)
+                row = await RuntimeConfigService(self.db).create_tenant_version(payload.tenant_id, created_by=admin.id, runtime_backend=payload.runtime_backend, model=payload.model, datatap=payload.datatap, limits=payload.limits, billing=payload.billing, secrets=secrets, runtime_contract_version=payload.runtime_contract_version, environment=payload.environment, completion_mode=payload.completion_mode)
             except RuntimeConfigError as exc:
                 raise GatewayAdminError(str(exc)) from exc
             self._audit(admin.id, action="runtime_config.create", target_type="runtime_config", target_id=row.id, detail={"tenant_id": payload.tenant_id, "after": {"runtime_backend": row.runtime_backend, "version": row.version, "secret_count": len(row.secret_refs_json or [])}}, idempotency_key=idempotency_key)

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import copy
 from datetime import UTC, datetime
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 from uuid import uuid4
 
 from pydantic import SecretStr
@@ -70,6 +70,8 @@ class RuntimeConfigService:
         billing: dict[str, Any],
         secrets: RuntimeSecretBundle | None = None,
         runtime_contract_version: str = RUNTIME_CONTRACT_VERSION,
+        environment: Literal["development", "staging", "production"] = "production",
+        completion_mode: Literal["formal_analysis", "interaction"] = "formal_analysis",
     ) -> RuntimeConfigVersion:
         if runtime_backend not in {"current", "pi"}:
             raise RuntimeConfigError("runtime_backend_invalid")
@@ -112,6 +114,8 @@ class RuntimeConfigService:
                 datatap=datatap,
                 limits=limits,
                 billing=billing,
+                environment=environment,
+                completion_mode=completion_mode,
             ),
             secret_refs_json=[],
             created_by=created_by,
@@ -249,6 +253,7 @@ class RuntimeConfigService:
                     self.db,
                     tenant_id=tenant_id,
                     base_capability=base_capability,
+                    environment=snapshot.environment,
                 )
                 skill_manifest = SkillSnapshotService.manifest_from_capability(skill_capability)
             except SkillSnapshotError as exc:
@@ -562,6 +567,8 @@ class RuntimeConfigService:
         datatap: dict[str, Any],
         limits: dict[str, int | float],
         billing: dict[str, Any],
+        environment: Literal["development", "staging", "production"] = "production",
+        completion_mode: Literal["formal_analysis", "interaction"] = "formal_analysis",
     ) -> dict[str, Any]:
         if any(key not in {"name", "masked_origin", "provider"} for key in model):
             raise RuntimeConfigError("runtime_model_config_invalid")
@@ -572,6 +579,8 @@ class RuntimeConfigService:
             "config_version_id": config_id,
             "runtime_contract_version": runtime_contract_version,
             "runtime_backend": runtime_backend,
+            "environment": environment,
+            "completion_mode": completion_mode,
             "model": {"name": model.get("name"), "masked_origin": model.get("masked_origin"), "provider": model.get("provider")},
             "datatap": dict(datatap),
             "capability_pack": capability.model_dump(mode="json"),
@@ -598,6 +607,11 @@ class RuntimeConfigService:
         # Older config JSON may still contain this field.  It is deliberately
         # ignored for new Run snapshots and never copied into the snapshot.
         payload.pop("profile_artifact_contracts", None)
+        # These fields are retained only so historical Run Snapshots can be
+        # replayed. A new Run receives a candidate allowlist, never a fixed
+        # required-artifact contract from an old config row.
+        payload.pop("artifact_contract_mode", None)
+        payload.pop("required_artifact_contract", None)
         for key, expected in (
             ("config_version_id", config.id),
             ("runtime_contract_version", config.runtime_contract_version),

@@ -17,6 +17,9 @@ import app.db.models  # noqa: F401
 from app.db.session import engine
 
 
+_RUN_MIGRATION_BOUNDARY_TESTS = os.environ.get("RUN_MIGRATION_BOUNDARY_TESTS") == "1"
+
+
 @pytest.fixture(scope="module", autouse=True)
 def _clean_tenant_billing_residue():
     """0043 downgrade guard 的干净窗口。
@@ -86,7 +89,7 @@ def test_migration_chain_has_single_head() -> None:
     config = Config(str(backend_dir / "alembic.ini"))
     config.set_main_option("script_location", str(backend_dir / "migrations"))
     heads = ScriptDirectory.from_config(config).get_heads()
-    assert heads == ["0044_agent_run_loop_guard"]
+    assert heads == ["0049_skill_rollout_history"]
 
 
 async def test_phase_two_unique_constraints() -> None:
@@ -785,8 +788,8 @@ async def test_0030_direct_publish_schema() -> None:
 
 
 @pytest.mark.skipif(
-    "PYTEST_XDIST_WORKER" in os.environ,
-    reason="schema migration boundary test is intentionally serial",
+    "PYTEST_XDIST_WORKER" in os.environ or not _RUN_MIGRATION_BOUNDARY_TESTS,
+    reason="schema migration boundary test requires an isolated fresh database and is serial",
 )
 async def test_0030_direct_publish_migration_is_reversible_with_confirmed_scope() -> None:
     """0030 downgrade 必须先清除已落库的 confirmed_scope 行（Gate A 审查修复）。
@@ -890,8 +893,8 @@ def _run_alembic(*args: str) -> None:
 
 
 @pytest.mark.skipif(
-    "PYTEST_XDIST_WORKER" in os.environ,
-    reason="schema migration boundary test is intentionally serial",
+    "PYTEST_XDIST_WORKER" in os.environ or not _RUN_MIGRATION_BOUNDARY_TESTS,
+    reason="schema migration boundary test requires an isolated fresh database and is serial",
 )
 async def test_0005_mcp_tool_discoveries_migration_is_reversible() -> None:
     async def has_discovery_table() -> bool:
@@ -914,8 +917,8 @@ async def test_0005_mcp_tool_discoveries_migration_is_reversible() -> None:
 
 
 @pytest.mark.skipif(
-    "PYTEST_XDIST_WORKER" in os.environ,
-    reason="schema migration boundary test is intentionally serial",
+    "PYTEST_XDIST_WORKER" in os.environ or not _RUN_MIGRATION_BOUNDARY_TESTS,
+    reason="schema migration boundary test requires an isolated fresh database and is serial",
 )
 async def test_0012_task_creation_order_migration_is_reversible() -> None:
     async def table_indexes() -> set[str]:
@@ -956,8 +959,8 @@ async def test_0012_task_creation_order_migration_is_reversible() -> None:
 
 
 @pytest.mark.skipif(
-    "PYTEST_XDIST_WORKER" in os.environ,
-    reason="schema migration boundary test is intentionally serial",
+    "PYTEST_XDIST_WORKER" in os.environ or not _RUN_MIGRATION_BOUNDARY_TESTS,
+    reason="schema migration boundary test requires an isolated fresh database and is serial",
 )
 async def test_phase_two_migration_table_boundaries_restore_head() -> None:
     phase_one_tables = {
@@ -1040,6 +1043,10 @@ async def test_0035_artifact_exports_schema() -> None:
     assert "uq_artifact_exports_version_template" in names
 
 
+@pytest.mark.skipif(
+    "PYTEST_XDIST_WORKER" in os.environ or not _RUN_MIGRATION_BOUNDARY_TESTS,
+    reason="schema migration boundary test requires an isolated fresh database and is serial",
+)
 async def test_0036_export_claim_token_reversible() -> None:
     """0036 upgrade → downgrade → upgrade：claim_token 列可逆（加列/删列不丢表）。"""
 
@@ -1064,6 +1071,10 @@ async def test_0036_export_claim_token_reversible() -> None:
         _run_alembic("upgrade", "head")
 
 
+@pytest.mark.skipif(
+    "PYTEST_XDIST_WORKER" in os.environ or not _RUN_MIGRATION_BOUNDARY_TESTS,
+    reason="schema migration boundary test requires an isolated fresh database and is serial",
+)
 async def test_0034_dispatch_count_reversible() -> None:
     """0034 数据级 upgrade → downgrade → upgrade：dispatch_count 列可逆。"""
     from app.agent_runtime.models import AgentRun, AgentRunAttempt, AgentSession, AgentStep, AgentToolCall
@@ -1132,6 +1143,10 @@ async def test_0034_dispatch_count_reversible() -> None:
             await conn.execute(text(f"DELETE FROM users WHERE id = '{user_id}'"))
 
 
+@pytest.mark.skipif(
+    "PYTEST_XDIST_WORKER" in os.environ or not _RUN_MIGRATION_BOUNDARY_TESTS,
+    reason="schema migration boundary test requires an isolated fresh database and is serial",
+)
 async def test_0034_dangerous_downgrade_refused() -> None:
     """存在 dispatch_count != 1 的调用行时，0034 downgrade 被拒绝（防状态丢失）。"""
     from app.agent_runtime.models import AgentRun, AgentRunAttempt, AgentSession, AgentStep, AgentToolCall

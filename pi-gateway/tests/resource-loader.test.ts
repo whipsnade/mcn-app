@@ -1,3 +1,6 @@
+import { mkdtemp, mkdir, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { createProductionResourceLoader, createMcpConfig } from "../src/resource-loader.js";
@@ -29,14 +32,17 @@ describe("production resource loader", () => {
   });
 
   it("keeps explicit Skill paths separate from SDK discovery", async () => {
+    const root = await mkdtemp(join(tmpdir(), "pi-resource-loader-"));
+    await mkdir(join(root, "skill-snapshot"), { mode: 0o700 });
     const loader = createProductionResourceLoader({
-      cwd: "/tmp/run-explicit",
-      agentDir: "/tmp/run-explicit/agent",
+      cwd: root,
+      agentDir: join(root, "agent"),
       rootPolicy: "ROOT POLICY",
-      additionalSkillPaths: ["/tmp/run-explicit/skill-snapshot"],
+      additionalSkillPaths: [join(root, "skill-snapshot")],
     });
     await loader.reload();
     expect(loader.getSystemPrompt()).toBe("ROOT POLICY");
+    await rm(root, { recursive: true, force: true });
   });
 
   it("writes an adapter-readable MCP config with environment references only", () => {

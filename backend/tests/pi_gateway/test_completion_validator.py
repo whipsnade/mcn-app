@@ -259,6 +259,46 @@ async def test_clarification_without_artifact_can_complete(db_session, user_fact
 
 
 @pytest.mark.asyncio
+async def test_interaction_run_without_artifact_can_complete(db_session, user_factory):
+    """交互协议 Run 不被报告门禁误判，但仍经过通用生命周期校验。"""
+    user = await user_factory()
+    run, _attempt, _tenant_id = await _run(
+        db_session,
+        user,
+        snapshot={
+            "completion_mode": "interaction",
+            "allowed_artifact_contracts": [],
+        },
+    )
+    await _assistant(db_session, run, text="该问题超出当前交互范围")
+
+    result = await CompletionValidator(db_session).validate(run)
+
+    assert result.ok
+    assert result.artifact_version_id is None
+
+
+@pytest.mark.asyncio
+async def test_prompt_snapshot_cannot_change_formal_completion_mode(
+    db_session, user_factory
+):
+    """completion_mode 只能来自冻结 RuntimeSnapshot，不能由用户输入快照伪造。"""
+    user = await user_factory()
+    run, _attempt, _tenant_id = await _run(
+        db_session,
+        user,
+        snapshot={"allowed_artifact_contracts": []},
+    )
+    run.prompt_snapshot_json = {"completion_mode": "interaction"}
+    await _assistant(db_session, run)
+
+    result = await CompletionValidator(db_session).validate(run)
+
+    assert not result.ok
+    assert result.code == "pi_gateway_main_artifact_missing"
+
+
+@pytest.mark.asyncio
 async def test_tampered_capability_pack_audit_is_rejected(db_session, user_factory):
     user = await user_factory()
     run, _attempt, _tenant_id = await _run(
@@ -325,6 +365,47 @@ async def test_child_insight_without_top_level_main_report_cannot_complete(
 
     assert not result.ok
     assert result.code == "pi_gateway_main_artifact_missing"
+
+
+@pytest.mark.asyncio
+async def test_kol_detail_child_artifact_can_complete_without_top_level_main_report(
+    db_session, user_factory
+):
+    user = await user_factory()
+    snapshot = {"allowed_artifact_contracts": ["brand_report_v3"]}
+    run, _attempt, _tenant_id = await _run(db_session, user, snapshot=snapshot)
+    run.profile_name = "kol_detail_v1"
+    await _assistant(db_session, run, text="达人详情结论")
+    parent_artifact_id = str(uuid4())
+    now = _now()
+    db_session.add(
+        AgentArtifact(
+            id=parent_artifact_id,
+            session_id=run.session_id,
+            user_id=run.user_id,
+            module="selection",
+            artifact_type="kol_selection_v3",
+            artifact_key=f"parent-{parent_artifact_id}",
+            status="published",
+            latest_version=1,
+            activity_sequence=0,
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    await db_session.flush()
+    await _publish_brand_report(
+        db_session,
+        run,
+        schema_version="brand_report_v3",
+        module="kol-detail",
+        parent_artifact_id=parent_artifact_id,
+    )
+
+    result = await CompletionValidator(db_session).validate(run)
+
+    assert result.ok
+    assert result.artifact_version_id is not None
 
 
 @pytest.mark.asyncio

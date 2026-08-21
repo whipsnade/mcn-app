@@ -476,6 +476,11 @@ async def terminal(
                 "pi_gateway_artifact_contract_not_allowed",
                 "pi_gateway_active_artifact_draft",
                 "pi_gateway_main_artifact_missing",
+                # Only emitted while replaying an immutable historical
+                # Snapshot that used the pre-autonomy required-contract
+                # semantics.
+                "required_artifact_missing",
+                "required_artifact_invalid_lineage",
             }:
                 code = "pi_gateway_terminal_rejected"
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=code) from exc

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import type {
   AdminSkillEnvironment,
@@ -33,6 +33,7 @@ export default function SkillAdmin() {
   const [selectedSkillName, setSelectedSkillName] = useState('');
   const [detail, setDetail] = useState<ApiSkillDetail | null>(null);
   const [selectedRevision, setSelectedRevision] = useState<number | null>(null);
+  const [selectedRevisionId, setSelectedRevisionId] = useState<string | null>(null);
   const [draftContent, setDraftContent] = useState('');
   const [changeNote, setChangeNote] = useState('');
   const [tenantId, setTenantId] = useState('');
@@ -40,6 +41,8 @@ export default function SkillAdmin() {
   const [rolloutPercent, setRolloutPercent] = useState('100');
   const [fromRevision, setFromRevision] = useState<number | null>(null);
   const [toRevision, setToRevision] = useState<number | null>(null);
+  const [fromRevisionId, setFromRevisionId] = useState<string | null>(null);
+  const [toRevisionId, setToRevisionId] = useState<string | null>(null);
   const [validation, setValidation] = useState<ApiSkillValidation | null>(null);
   const [diff, setDiff] = useState('');
   const [pendingRollback, setPendingRollback] = useState(false);
@@ -48,6 +51,20 @@ export default function SkillAdmin() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
+  const operationKeys = useRef(new Map<string, string>());
+
+  const operationKey = (operation: string, fingerprint: unknown): string => {
+    const identity = `${operation}:${JSON.stringify(fingerprint)}`;
+    const existing = operationKeys.current.get(identity);
+    if (existing) return existing;
+    const created = crypto.randomUUID();
+    operationKeys.current.set(identity, created);
+    return created;
+  };
+
+  const completeOperation = (operation: string, fingerprint: unknown) => {
+    operationKeys.current.delete(`${operation}:${JSON.stringify(fingerprint)}`);
+  };
 
   const loadDetail = useCallback(async (skillName: string) => {
     setDetailLoading(true);
@@ -57,12 +74,15 @@ export default function SkillAdmin() {
       setDetail(next);
       const latest = next.revisions[0] ?? null;
       setSelectedRevision(latest?.revision ?? null);
+      setSelectedRevisionId(latest?.id ?? null);
       setDraftContent(latest?.content ?? '');
       setChangeNote('');
       setValidation(null);
       setDiff('');
       setFromRevision(next.revisions[1]?.revision ?? latest?.revision ?? null);
       setToRevision(latest?.revision ?? null);
+      setFromRevisionId(next.revisions[1]?.id ?? latest?.id ?? null);
+      setToRevisionId(latest?.id ?? null);
     } catch (loadError) {
       setError(errorMessage(loadError, '加载 Skill 详情失败'));
     } finally {
@@ -93,9 +113,11 @@ export default function SkillAdmin() {
   }, [loadDetail, selectedSkillName]);
 
   const currentRevision = useMemo<ApiSkillRevision | null>(() => {
-    if (!detail || selectedRevision === null) return null;
-    return detail.revisions.find(revision => revision.revision === selectedRevision) ?? null;
-  }, [detail, selectedRevision]);
+    if (!detail || (selectedRevisionId === null && selectedRevision === null)) return null;
+    return detail.revisions.find(revision => revision.id === selectedRevisionId)
+      ?? detail.revisions.find(revision => revision.revision === selectedRevision)
+      ?? null;
+  }, [detail, selectedRevision, selectedRevisionId]);
 
   const refreshAfterMutation = async () => {
     if (selectedSkillName) await loadDetail(selectedSkillName);
@@ -104,6 +126,7 @@ export default function SkillAdmin() {
 
   const handleSelectRevision = (revision: ApiSkillRevision) => {
     setSelectedRevision(revision.revision);
+    setSelectedRevisionId(revision.id);
     setDraftContent(revision.content);
     setChangeNote('');
     setValidation(null);
@@ -130,19 +153,21 @@ export default function SkillAdmin() {
 
   const handleCreateRevision = async () => {
     if (!selectedSkillName || !draftContent.trim()) return;
+    const fingerprint = {
+      content: draftContent,
+      tenant_id: tenantId.trim() || null,
+      change_note: changeNote.trim() || null,
+    };
     setBusy(true);
     setError('');
     setSuccess('');
     try {
       await createAdminSkillRevision(
         selectedSkillName,
-        {
-          content: draftContent,
-          tenant_id: tenantId.trim() || null,
-          change_note: changeNote.trim() || null,
-        },
-        crypto.randomUUID(),
+        fingerprint,
+        operationKey('revision-create', { skill: selectedSkillName, ...fingerprint }),
       );
+      completeOperation('revision-create', { skill: selectedSkillName, ...fingerprint });
       setSuccess('新 Revision 已保存');
       await refreshAfterMutation();
     } catch (createError) {
@@ -158,9 +183,14 @@ export default function SkillAdmin() {
     setError('');
     try {
       const scopeTenantId = tenantId.trim() || undefined;
-      const result = scopeTenantId
-        ? await getAdminSkillDiff(selectedSkillName, fromRevision, toRevision, scopeTenantId)
-        : await getAdminSkillDiff(selectedSkillName, fromRevision, toRevision);
+      const result = await getAdminSkillDiff(
+        selectedSkillName,
+        fromRevision,
+        toRevision,
+        scopeTenantId,
+        fromRevisionId ?? undefined,
+        toRevisionId ?? undefined,
+      );
       setDiff(result.diff);
     } catch (diffError) {
       setError(errorMessage(diffError, '加载 Diff 失败'));
@@ -172,6 +202,13 @@ export default function SkillAdmin() {
   const handleActivate = async (percent: number = Number(rolloutPercent)) => {
     if (!selectedSkillName || selectedRevision === null) return;
     const normalizedPercent = Number.isFinite(percent) ? Math.min(100, Math.max(0, Math.trunc(percent))) : 100;
+    const fingerprint = {
+      revision_id: currentRevision?.id,
+      revision: selectedRevision,
+      tenant_id: tenantId.trim() || null,
+      environment,
+      rollout_percent: normalizedPercent,
+    };
     setRolloutPercent(String(normalizedPercent));
     setBusy(true);
     setError('');
@@ -181,12 +218,14 @@ export default function SkillAdmin() {
         selectedSkillName,
         {
           revision: selectedRevision,
+          revision_id: currentRevision?.id,
           tenant_id: tenantId.trim() || null,
           environment,
           rollout_percent: normalizedPercent,
         },
-        crypto.randomUUID(),
+        operationKey('skill-activate', { skill: selectedSkillName, ...fingerprint }),
       );
+      completeOperation('skill-activate', { skill: selectedSkillName, ...fingerprint });
       setSuccess(normalizedPercent === 100 ? 'Skill 已全量激活' : 'Skill 灰度激活成功');
       await refreshAfterMutation();
     } catch (activateError) {
@@ -198,15 +237,17 @@ export default function SkillAdmin() {
 
   const handleRollback = async () => {
     if (!selectedSkillName) return;
+    const fingerprint = { tenant_id: tenantId.trim() || null, environment };
     setBusy(true);
     setError('');
     setSuccess('');
     try {
       await rollbackAdminSkill(
         selectedSkillName,
-        { tenant_id: tenantId.trim() || null, environment },
-        crypto.randomUUID(),
+        fingerprint,
+        operationKey('skill-rollback', { skill: selectedSkillName, ...fingerprint }),
       );
+      completeOperation('skill-rollback', { skill: selectedSkillName, ...fingerprint });
       setPendingRollback(false);
       setSuccess('Skill 已回滚到上一 Revision');
       await refreshAfterMutation();
@@ -271,7 +312,7 @@ export default function SkillAdmin() {
                     <div className="flex flex-wrap gap-1.5">
                       {detail.activations.map(activation => (
                         <span key={activation.id} className="rounded-full bg-emerald-50 px-2 py-1 text-[10px] font-bold text-emerald-700">
-                          {ENVIRONMENT_LABEL[activation.environment]} / {activation.rollout_percent === 100 ? '全量' : `${activation.rollout_percent}%`} · v{activation.active_revision}
+                          {ENVIRONMENT_LABEL[activation.environment]} / {activation.scope_key} / {activation.rollout_percent === 100 ? '全量' : `${activation.rollout_percent}%`} · v{activation.active_revision}
                         </span>
                       ))}
                     </div>
@@ -288,7 +329,7 @@ export default function SkillAdmin() {
                         type="button"
                         aria-label={`选择 Revision ${revision.revision}`}
                         onClick={() => handleSelectRevision(revision)}
-                        className={`rounded-lg border px-3 py-2 text-left text-[11px] ${selectedRevision === revision.revision ? 'border-indigo-200 bg-indigo-50 text-indigo-700' : 'border-slate-200 text-slate-600'}`}
+                        className={`rounded-lg border px-3 py-2 text-left text-[11px] ${selectedRevisionId === revision.id ? 'border-indigo-200 bg-indigo-50 text-indigo-700' : 'border-slate-200 text-slate-600'}`}
                       >
                         <span className="block font-bold">Revision v{revision.revision}</span>
                         <span className="block text-[10px] text-slate-400">创建人：{revision.created_by ?? '—'}</span>
@@ -377,13 +418,13 @@ export default function SkillAdmin() {
                       </div>
                       <div className="grid grid-cols-2 gap-2">
                         <label className="text-[10px] text-slate-500">From
-                          <select aria-label="From Revision" value={fromRevision ?? ''} onChange={event => setFromRevision(Number(event.target.value))} className="mt-1 w-full rounded border border-slate-200 px-2 py-1.5 text-xs">
-                            {detail.revisions.map(revision => <option key={revision.revision} value={revision.revision}>v{revision.revision}</option>)}
+                          <select aria-label="From Revision" value={fromRevisionId ?? ''} onChange={event => { const revision = detail.revisions.find(item => item.id === event.target.value); setFromRevisionId(event.target.value); setFromRevision(revision?.revision ?? null); }} className="mt-1 w-full rounded border border-slate-200 px-2 py-1.5 text-xs">
+                            {detail.revisions.map(revision => <option key={revision.id} value={revision.id}>v{revision.revision} · {revision.scope_key}</option>)}
                           </select>
                         </label>
                         <label className="text-[10px] text-slate-500">To
-                          <select aria-label="To Revision" value={toRevision ?? ''} onChange={event => setToRevision(Number(event.target.value))} className="mt-1 w-full rounded border border-slate-200 px-2 py-1.5 text-xs">
-                            {detail.revisions.map(revision => <option key={revision.revision} value={revision.revision}>v{revision.revision}</option>)}
+                          <select aria-label="To Revision" value={toRevisionId ?? ''} onChange={event => { const revision = detail.revisions.find(item => item.id === event.target.value); setToRevisionId(event.target.value); setToRevision(revision?.revision ?? null); }} className="mt-1 w-full rounded border border-slate-200 px-2 py-1.5 text-xs">
+                            {detail.revisions.map(revision => <option key={revision.id} value={revision.id}>v{revision.revision} · {revision.scope_key}</option>)}
                           </select>
                         </label>
                       </div>

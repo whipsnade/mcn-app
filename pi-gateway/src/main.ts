@@ -17,7 +17,12 @@ import type {
   SkillManifestSnapshot,
   SkillSnapshotEntry,
 } from "./protocol.js";
-import { skillManifestDigest, skillSnapshotDigest } from "./skill-snapshot.js";
+import {
+  MAX_CONTENT_BYTES,
+  MAX_SKILLS,
+  skillManifestDigest,
+  skillSnapshotDigest,
+} from "./skill-snapshot.js";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -113,14 +118,14 @@ function mapSkillManifest(
         (typeof artifactContract !== "string" || artifactContract.length === 0)) ||
       typeof content !== "string"
     ) snapshotError();
-    if (new TextEncoder().encode(content).byteLength > 200_000) snapshotError();
+    if (new TextEncoder().encode(content).byteLength > MAX_CONTENT_BYTES) snapshotError();
     const entry = {
       name,
       revision: revision as number,
       contentDigest,
       description,
       requiredTools,
-      artifactContract,
+      artifactContract: artifactContract === null ? null : artifactContract as string,
       content,
     } satisfies SkillSnapshotEntry;
     if (seen.has(entry.name) || skillSnapshotDigest(entry) !== entry.contentDigest) snapshotError();
@@ -140,6 +145,7 @@ function mapSkillManifest(
     ) snapshotError();
     return entry;
   });
+  if (entries.length > MAX_SKILLS) snapshotError();
   if (skillManifestDigest(entries, sourceScope) !== manifestDigest) snapshotError();
   return {
     entries,
@@ -204,7 +210,7 @@ export function mapClaimRuntimeSnapshot(snapshot: Record<string, unknown>): Runt
     return {
       name: name as string,
       version: version as string,
-      artifactContract: artifactContract as string,
+      artifactContract: artifactContract === null ? null : artifactContract as string,
       description: skillDescription(content),
     };
   });

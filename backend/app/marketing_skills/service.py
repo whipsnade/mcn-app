@@ -32,9 +32,30 @@ from app.tenancy.models import Tenant
 
 SkillAdminError = GatewayAdminError
 
+_TRUSTED_INTERNAL_TOOLS = frozenset(
+    {
+        "load_marketing_skill",
+        "request_clarification",
+        "publish_artifacts",
+        "build_artifact_draft",
+        "read_artifact",
+        "search_evidence",
+        "read_tool_result",
+        "calculate_expression",
+        "aggregate_metrics",
+        "calculate_period_comparison",
+        "normalize_sentiment",
+        "rank_kols",
+    }
+)
+
 
 def _now() -> datetime:
     return datetime.now(UTC).replace(tzinfo=None)
+
+
+def _scope_key(tenant_id: str | None) -> str:
+    return f"tenant:{tenant_id}" if tenant_id is not None else "global"
 
 
 class SkillAdminService:
@@ -49,14 +70,14 @@ class SkillAdminService:
 
     async def _approved_tools(self) -> frozenset[str]:
         if self._approved_tools_override is not None:
-            return self._approved_tools_override
+            return self._approved_tools_override | _TRUSTED_INTERNAL_TOOLS
         rows = await self.db.scalars(
             select(McpToolCatalog.internal_tool_name).where(
                 McpToolCatalog.review_status == "approved",
                 McpToolCatalog.is_enabled.is_(True),
             )
         )
-        return frozenset(rows.all())
+        return frozenset(rows.all()) | _TRUSTED_INTERNAL_TOOLS
 
     async def validate(self, payload: SkillValidationRequest) -> SkillValidationRead:
         result = validate_skill_content(
@@ -81,6 +102,25 @@ class SkillAdminService:
         if tenant_id is not None and await self.db.get(Tenant, tenant_id) is None:
             raise SkillAdminError("tenant_not_found")
 
+    async def _lock_skill_write(self, skill_name: str) -> None:
+        """Serialize revision/activation creation before a scope has a row.
+
+        Existing revisions are locked as well, but the first revision has no
+        stable child row to lock.  A deterministic admin row is the durable
+        per-database mutex for that narrow metadata operation; all writers use
+        the same order, so two workers cannot both allocate revision ``n+1``.
+        """
+        lock_row = await self.db.scalar(
+            select(User)
+            .where(User.role == "admin")
+            .order_by(User.id)
+            .limit(1)
+            .with_for_update()
+        )
+        if lock_row is None:
+            raise SkillAdminError("skill_write_lock_unavailable")
+        del skill_name
+
     async def create_revision(
         self,
         admin: User,
@@ -98,6 +138,7 @@ class SkillAdminService:
             )
             if not result.valid:
                 raise SkillAdminError("skill_validation_failed")
+            await self._lock_skill_write(skill_name)
             latest = await self.db.scalar(
                 select(SkillRevision)
                 .where(
@@ -239,6 +280,19 @@ class SkillAdminService:
             raise SkillAdminError("skill_revision_not_found")
         return next((row for row in rows if row.tenant_id == tenant_id), rows[0])
 
+    async def _revision_for_id(
+        self, skill_name: str, revision_id: str, *, tenant_id: str | None = None
+    ) -> SkillRevision:
+        row = await self.db.scalar(
+            select(SkillRevision).where(
+                SkillRevision.id == revision_id,
+                SkillRevision.skill_name == skill_name,
+            )
+        )
+        if row is None or row.tenant_id not in (None, tenant_id):
+            raise SkillAdminError("skill_revision_not_found")
+        return row
+
     async def diff(
         self,
         skill_name: str,
@@ -246,11 +300,19 @@ class SkillAdminService:
         from_revision: int,
         to_revision: int,
         tenant_id: str | None = None,
+        from_revision_id: str | None = None,
+        to_revision_id: str | None = None,
     ) -> SkillDiffRead:
-        from_row = await self._revision_for_number(
-            skill_name, from_revision, tenant_id=tenant_id
+        from_row = (
+            await self._revision_for_id(skill_name, from_revision_id, tenant_id=tenant_id)
+            if from_revision_id is not None
+            else await self._revision_for_number(skill_name, from_revision, tenant_id=tenant_id)
         )
-        to_row = await self._revision_for_number(skill_name, to_revision, tenant_id=tenant_id)
+        to_row = (
+            await self._revision_for_id(skill_name, to_revision_id, tenant_id=tenant_id)
+            if to_revision_id is not None
+            else await self._revision_for_number(skill_name, to_revision, tenant_id=tenant_id)
+        )
         diff = "".join(
             difflib.unified_diff(
                 from_row.content.splitlines(keepends=True),
@@ -263,6 +325,8 @@ class SkillAdminService:
             skill_name=skill_name,
             from_revision=from_revision,
             to_revision=to_revision,
+            from_revision_id=from_row.id,
+            to_revision_id=to_row.id,
             diff=diff,
         )
 
@@ -276,8 +340,15 @@ class SkillAdminService:
     ) -> SkillActivationRead:
         async def produce() -> tuple[SkillActivationRead, str]:
             await self._ensure_tenant(payload.tenant_id)
-            revision = await self._revision_for_number(
-                skill_name, payload.revision, tenant_id=payload.tenant_id
+            await self._lock_skill_write(skill_name)
+            revision = (
+                await self._revision_for_id(
+                    skill_name, payload.revision_id, tenant_id=payload.tenant_id
+                )
+                if payload.revision_id is not None
+                else await self._revision_for_number(
+                    skill_name, payload.revision, tenant_id=payload.tenant_id
+                )
             )
             if revision.tenant_id not in (None, payload.tenant_id):
                 raise SkillAdminError("skill_revision_not_found")
@@ -309,6 +380,7 @@ class SkillAdminService:
             else:
                 if activation.active_revision_id != revision.id:
                     activation.previous_revision_id = activation.active_revision_id
+                    activation.previous_rollout_percent = activation.rollout_percent
                 activation.active_revision_id = revision.id
                 activation.rollout_percent = payload.rollout_percent
                 activation.updated_by = admin.id
@@ -350,6 +422,7 @@ class SkillAdminService:
     ) -> SkillActivationRead:
         async def produce() -> tuple[SkillActivationRead, str]:
             await self._ensure_tenant(payload.tenant_id)
+            await self._lock_skill_write(skill_name)
             condition = [
                 SkillActivation.environment == payload.environment,
                 SkillActivation.skill_name == skill_name,
@@ -365,8 +438,13 @@ class SkillAdminService:
             if activation is None or activation.previous_revision_id is None:
                 raise SkillAdminError("skill_rollback_unavailable")
             current_revision_id = activation.active_revision_id
+            current_rollout_percent = activation.rollout_percent
             activation.active_revision_id = activation.previous_revision_id
             activation.previous_revision_id = current_revision_id
+            activation.rollout_percent = activation.previous_rollout_percent
+            if activation.rollout_percent is None:
+                activation.rollout_percent = 100
+            activation.previous_rollout_percent = current_rollout_percent
             activation.updated_by = admin.id
             activation.updated_at = _now()
             await self.db.flush()
@@ -381,6 +459,8 @@ class SkillAdminService:
                     "tenant_id": payload.tenant_id,
                     "active_revision_id": activation.active_revision_id,
                     "previous_revision_id": activation.previous_revision_id,
+                    "rollout_percent": activation.rollout_percent,
+                    "previous_rollout_percent": activation.previous_rollout_percent,
                 },
                 idempotency_key=idempotency_key,
             )
@@ -409,12 +489,14 @@ class SkillAdminService:
             id=row.id,
             environment=row.environment,
             tenant_id=row.tenant_id,
+            scope_key=_scope_key(row.tenant_id),
             skill_name=row.skill_name,
             active_revision=active.revision,
             active_revision_id=active.id,
             previous_revision=previous.revision if previous else None,
             previous_revision_id=previous.id if previous else None,
             rollout_percent=row.rollout_percent,
+            previous_rollout_percent=row.previous_rollout_percent,
             updated_by=row.updated_by,
             updated_at=row.updated_at,
         )
@@ -424,6 +506,7 @@ class SkillAdminService:
         return SkillRevisionRead(
             id=row.id,
             tenant_id=row.tenant_id,
+            scope_key=_scope_key(row.tenant_id),
             skill_name=row.skill_name,
             revision=row.revision,
             content=row.content,

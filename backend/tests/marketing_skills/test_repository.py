@@ -160,3 +160,82 @@ async def test_rollout_bucket_is_stable_and_revision_is_immutable(skill_session)
     with pytest.raises(ValueError, match="skill_revision_immutable"):
         await skill_session.commit()
     await skill_session.rollback()
+
+
+@pytest.mark.asyncio
+async def test_rollout_zero_uses_previous_revision_for_same_tenant(skill_session) -> None:
+    tenant_id = str(uuid4())
+    previous = _revision(name="campaign-research", content="previous", revision=1)
+    active = _revision(name="campaign-research", content="active", revision=2)
+    skill_session.add_all(
+        [
+            previous,
+            active,
+            SkillActivation(
+                id=str(uuid4()),
+                environment="production",
+                tenant_id=tenant_id,
+                skill_name="campaign-research",
+                active_revision_id=active.id,
+                previous_revision_id=previous.id,
+                rollout_percent=0,
+                updated_by=None,
+                updated_at=_now(),
+            ),
+        ]
+    )
+    await skill_session.commit()
+
+    resolved = await resolve_active_revisions(
+        skill_session,
+        tenant_id=tenant_id,
+        skill_names=["campaign-research"],
+    )
+
+    assert [item.content for item in resolved] == ["previous"]
+
+
+@pytest.mark.asyncio
+async def test_rollout_zero_tenant_does_not_drop_base_global_revision(skill_session) -> None:
+    tenant_id = str(uuid4())
+    global_revision = _revision(name="campaign-research", content="global", revision=1)
+    tenant_active = _revision(
+        name="campaign-research", content="tenant-active", revision=1, tenant_id=tenant_id
+    )
+    skill_session.add_all(
+        [
+            global_revision,
+            tenant_active,
+            SkillActivation(
+                id=str(uuid4()),
+                environment="production",
+                tenant_id=None,
+                skill_name="campaign-research",
+                active_revision_id=global_revision.id,
+                previous_revision_id=None,
+                rollout_percent=100,
+                updated_by=None,
+                updated_at=_now(),
+            ),
+            SkillActivation(
+                id=str(uuid4()),
+                environment="production",
+                tenant_id=tenant_id,
+                skill_name="campaign-research",
+                active_revision_id=tenant_active.id,
+                previous_revision_id=None,
+                rollout_percent=0,
+                updated_by=None,
+                updated_at=_now(),
+            ),
+        ]
+    )
+    await skill_session.commit()
+
+    resolved = await resolve_active_revisions(
+        skill_session,
+        tenant_id=tenant_id,
+        skill_names=["campaign-research"],
+    )
+
+    assert [item.content for item in resolved] == ["global"]

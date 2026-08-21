@@ -251,6 +251,23 @@ async def test_validate_uses_approved_tool_set_and_diff_reads_database_content(a
 
 
 @pytest.mark.asyncio
+async def test_internal_runtime_tools_are_trusted_without_mcp_catalog_rows(admin_context) -> None:
+    db, _admin, _tenant = admin_context
+    service = SkillAdminService(db, approved_tools=set())
+
+    result = await service.validate(
+        SkillValidationRequest(
+            expected_name="campaign-research",
+            content=VALID_CONTENT.replace(
+                "required_tools: []", "required_tools:\n  - build_artifact_draft"
+            ),
+        )
+    )
+
+    assert result.valid
+
+
+@pytest.mark.asyncio
 async def test_diff_uses_tenant_revision_context(admin_context) -> None:
     db, admin, tenant = admin_context
     service = SkillAdminService(db, approved_tools=set())
@@ -352,6 +369,8 @@ async def test_activate_and_rollback_preserve_previous_pointer(admin_context) ->
     assert activated.active_revision == first.revision
     assert rolled_back.active_revision == first.revision
     assert rolled_back.previous_revision == second.revision
+    assert rolled_back.rollout_percent == 100
+    assert rolled_back.previous_rollout_percent == 20
 
     with pytest.raises(SkillAdminError, match="tenant_not_found"):
         await service.activate(
@@ -360,3 +379,39 @@ async def test_activate_and_rollback_preserve_previous_pointer(admin_context) ->
             SkillActivationRequest(revision=1, tenant_id=str(uuid4())),
             idempotency_key="skill-activate-missing-tenant",
         )
+
+
+@pytest.mark.asyncio
+async def test_activation_can_target_immutable_revision_id_and_scope(admin_context) -> None:
+    db, admin, tenant = admin_context
+    service = SkillAdminService(db, approved_tools=set())
+    global_revision = await service.create_revision(
+        admin,
+        "campaign-research",
+        SkillRevisionCreate(content=VALID_CONTENT, change_note="global"),
+        idempotency_key="skill-scope-global",
+    )
+    tenant_revision = await service.create_revision(
+        admin,
+        "campaign-research",
+        SkillRevisionCreate(
+            content=VALID_CONTENT.replace("活动研究", "租户"),
+            tenant_id=tenant.id,
+            change_note="tenant",
+        ),
+        idempotency_key="skill-scope-tenant",
+    )
+
+    activation = await service.activate(
+        admin,
+        "campaign-research",
+        SkillActivationRequest(
+            revision=global_revision.revision,
+            revision_id=tenant_revision.id,
+            tenant_id=tenant.id,
+            rollout_percent=100,
+        ),
+        idempotency_key="skill-scope-activate",
+    )
+
+    assert activation.active_revision_id == tenant_revision.id

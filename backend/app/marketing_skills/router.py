@@ -68,6 +68,8 @@ async def skill_diff(
     db: Annotated[AsyncSession, Depends(get_db)],
     from_revision: Annotated[int, Query(gt=0)],
     to_revision: Annotated[int, Query(gt=0)],
+    from_revision_id: Annotated[str | None, Query(min_length=1, max_length=36)] = None,
+    to_revision_id: Annotated[str | None, Query(min_length=1, max_length=36)] = None,
     tenant_id: Annotated[str | None, Query(min_length=1, max_length=36)] = None,
 ) -> SkillDiffRead:
     try:
@@ -76,6 +78,8 @@ async def skill_diff(
             from_revision=from_revision,
             to_revision=to_revision,
             tenant_id=tenant_id,
+            from_revision_id=from_revision_id,
+            to_revision_id=to_revision_id,
         )
     except SkillAdminError as error:
         raise _skill_error(error) from error

@@ -78,6 +78,11 @@ class SkillActivation(Base):
             "rollout_percent >= 0 AND rollout_percent <= 100",
             name="ck_skill_activations_rollout_percent",
         ),
+        CheckConstraint(
+            "previous_rollout_percent IS NULL OR "
+            "(previous_rollout_percent >= 0 AND previous_rollout_percent <= 100)",
+            name="ck_skill_activations_previous_rollout_percent",
+        ),
         Index("ix_skill_activations_environment_name", "environment", "skill_name"),
         Index("ix_skill_activations_tenant_name", "tenant_id", "skill_name"),
     )
@@ -98,6 +103,7 @@ class SkillActivation(Base):
         String(36), ForeignKey("skill_revisions.id", ondelete="RESTRICT"), nullable=True
     )
     rollout_percent: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
+    previous_rollout_percent: Mapped[int | None] = mapped_column(Integer, nullable=True)
     updated_by: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )

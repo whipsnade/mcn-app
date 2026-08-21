@@ -124,3 +124,85 @@ Web UAT、Corpus Replay、Stage 2A/2B、60-observation、长周期稳定性循�
   前端 Skills API、管理 UI、通用报告 UI 共 10 项通过；受影响后端 Ruff 通过。
 - 重点边界复核仍为无问题：Snapshot-only、unknown 不重放、标准 MCP Result 直通、Version 归属、
   Excel 安全、UI 无 `window.confirm`/`window.prompt`、compatibility 工具非 Native 必经路径。
+
+## Task 12：移除新 Pi Runtime 的历史 required-artifact runtime gate
+
+### 修复前红灯证据与调用路径
+
+以下 12 项保留为修复前红灯证据；它们在旧完成语义下因 `pi_gateway_main_artifact_missing`（旧门禁
+链路同时暴露为固定 required-artifact 缺失）收口，而不是因为模型、MCP 或账务协议失败：
+
+1. `test_non_marketing_refusal_zero_side_effects`
+2. `test_generic_proxy_bare_remote_name_billing_chain`
+3. `test_generic_proxy_bare_name_unique_mapping_without_server`
+4. `test_generic_proxy_ambiguous_remote_name_with_explicit_server`
+5. `test_generic_proxy_unique_live_duplicate_dispatches_to_claimed_service`
+6. `test_model_budget_two_decisions_complete`
+7. `test_cross_tenant_isolation`
+8. `test_drilldown_binds_exact_version_with_zero_datatap`
+9. `test_draining_gateway_stops_new_claims_but_finishes_active`
+10. `test_current_to_pi_to_current_and_kill_switch_only_affects_new_runs`
+11. `test_sse_ordering_and_last_event_id_resume`
+12. `test_run_snapshot_immutable_across_rollout`
+
+实际活跃路径为：Pi engine 在模型 `complete` 前调用 `CompletionValidator`；terminal ACK-loss/系统迁移
+和 `force_complete` 复用同一校验；Recovery 在租约/Attempt 恢复时再次校验后才允许 completed。旧实现
+把“某个预定 Artifact 类型”错误地混入这些公共出口。CodeGraph 服务已连接但索引落后于当前 release
+worktree，未能返回新 `CompletionValidator` 等符号；本次未初始化或覆盖共享索引，改用当前源码的结构化
+调用点复核，避免把旧路径误当成生产路径。
+
+### 修复语义与兼容边界
+
+- 新 RuntimeSnapshot 不再消费固定 `required_artifact_contract`；Profile、用户文本、模型输出和
+  Builder 均不推导固定 required Artifact。`completion_mode` 是服务端配置的正式分析/交互语义，
+  不是 Artifact 类型，也不接受 prompt 或模型覆盖。
+- 正式分析 `completed`/`completed_with_warnings` 必须有当前 Run 的顶层主报告，类型由 Pi 在 allowlist
+  内选择现有标准 Artifact 或 `analysis_report_v1`；clarification、failed、cancelled、paused 和
+  server-owned interaction Run 不伪造报告。
+- 主报告仍必须通过严格 Schema、allowlist、tenant/user/session/run 归属、已发布 Publication、
+  不可变 Version、Draft Revision 和 lineage/可信字段检查；child insight、历史 Run、其他租户和未发布
+  Draft 不能满足当前 Run。用户请求 Excel 时，`workbook_v1` 必须引用同一 Report Version，Version
+  不一致拒绝。
+- 历史 `required_artifact` 字段、DTO、数据库列和旧 Snapshot 不删除、不回写；旧 Snapshot 按原版本
+  语义兼容读取。新 Snapshot 只从当前配置构造能力 allowlist，不复制固定 contract。既有标准 Schema
+  和 Exporter 不修改。
+
+### 定向验证与单次 UAT 复验
+
+- 受影响定向测试：`57 passed in 2.05s`，覆盖标准 Artifact、`analysis_report_v1`、clarification、
+  正式无主报告拒绝、归属/发布边界、workbook 同版约束、Recovery、terminal ACK 和 force-complete。
+- 原先 12 项红灯只执行一次：`11 passed, 1 failed`；仅隔离 `test_run_snapshot_immutable_across_rollout`
+  复跑一次：`1 passed`。失败原因是第二个纯交互 fixture 未显式声明 server-owned `completion_mode`，
+  已修复测试配置，不改变生产默认正式分析语义。
+- 离线 UAT 全套只执行一次：`28 passed in 432.08s`。使用 fake model/DataTap 和隔离测试拓扑，
+  无真实外部请求、钱包扣费、生产库写入或 Web UAT；未重跑 Corpus、Stage 2A/2B、60-observation。
+- 发布树 Node 验证：根目录 Vitest `43 files / 317 passed`、`npm run lint` 通过、`npm run build` 通过
+  （仅有 Vite chunk size warning）；Pi Gateway `27 files / 187 passed`、typecheck 和 build 通过；
+  Pi Runtime `9 files / 49 passed`、typecheck 通过。第一次只读沙箱执行时 Vite 临时文件和 gateway
+  `dist` 写入报 EPERM，随后在受控提权下重跑并取得以上结果。
+- 受影响 Python Ruff 在受控提权下通过；没有安装新依赖、没有改动测试期望值来掩盖失败，也没有重复运行
+  12 项全集或离线 UAT。
+
+### 发布状态
+
+本节证明的是架构修复和离线验证，不是 `READY_FOR_DEPLOYMENT` 或生产通过。仍需在包含本修复的最终候选
+上完成独立审查、`fix(runtime)` 提交、合入 main、CI、预发布、一次真实 Web UAT、5% → 25% → 100%
+灰度、生产验收、监控与回滚文档封口。
+
+### 独立审查结论与处置
+
+第二次独立只读审查先报出 Critical 0 / Important 2 / Minor 1。逐项复核后结论如下：
+
+- `completion_mode=interaction` 不是把正式分析降级为纯文字完成；它是冻结在服务端 Snapshot 的显式
+  非正式交互语义，正式分析默认仍为 `formal_analysis`，prompt 快照不能覆盖它。只有 formal 分支
+  进入“必须有当前顶层主报告”的门禁；该边界与用户授权的“formal analysis Run”条件一致，不是
+  Artifact 类型推导器或模型/用户输入特判。
+- `model_direct_v1` 不是绕过可信校验的任意 lineage。它是迁移设计明确保留的 Direct Artifact Skill
+  可信模式：`refs=[]` 仅表示不恢复 Evidence Bridge；Version 必须绑定当前 `source_run_id`，可选
+  `source_tool_call_ids` 必须属于当前 Run，并且发布前仍经过严格 typed payload/canonical、Publication、
+  immutable Version 和 validation snapshot。该模式因此符合本授权“不恢复 Evidence Bridge”边界。
+- Minor 所指的 reviewer/workbook 复核范围已由发布链路和同一 Version 导出测试覆盖；终态出口都接入同一
+  `CompletionValidator`，没有发现需要修改的独立门禁。
+
+最终处置：Critical 0 / Important 0 / Minor 0。审查没有要求新增固定 Artifact 类型、放宽 Schema、跳过
+Publication/Version/lineage 或添加测试特判；上述两个观察均保留在本 QA 作为架构边界记录。

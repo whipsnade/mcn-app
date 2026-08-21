@@ -29,7 +29,7 @@ def _alembic_config() -> Config:
 
 def test_billing_guard_is_current_migration_head() -> None:
     heads = ScriptDirectory.from_config(_alembic_config()).get_heads()
-    assert heads == ["0044_agent_run_loop_guard"]
+    assert heads == ["0049_skill_rollout_history"]
 
 
 def _run(coro):
@@ -139,7 +139,7 @@ def test_downgrade_guard_blocks_post_migration_ledger_activity() -> None:
         alembic_downgrade(config, "0042_admin_idempotency_records")
         assert _current_version() == "0042_admin_idempotency_records"
         alembic_upgrade(config, "head")
-        assert _current_version() == "0044_agent_run_loop_guard"
+        assert _current_version() == "0049_skill_rollout_history"
 
         # 植入一行 0040 之后的新流水（旧表无同 id 对应行）：downgrade 必须阻断。
         _run(
@@ -171,7 +171,7 @@ def test_downgrade_guard_blocks_post_migration_ledger_activity() -> None:
     alembic_downgrade(config, "0042_admin_idempotency_records")
     assert _current_version() == "0042_admin_idempotency_records"
     alembic_upgrade(config, "head")
-    assert _current_version() == "0044_agent_run_loop_guard"
+    assert _current_version() == "0049_skill_rollout_history"
 
 
 def test_staged_downgrade_cannot_bypass_the_guard() -> None:
@@ -242,4 +242,4 @@ def test_staged_downgrade_cannot_bypass_the_guard() -> None:
             )
         finally:
             alembic_upgrade(config, "head")
-            assert _current_version() == "0044_agent_run_loop_guard"
+            assert _current_version() == "0049_skill_rollout_history"

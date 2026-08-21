@@ -161,6 +161,15 @@ class AnalysisReportChartBlock(BaseModel):
     categories: tuple[str, ...] = ()
     series: tuple[AnalysisReportChartSeries, ...] = ()
 
+    @model_validator(mode="after")
+    def validate_series(self) -> AnalysisReportChartBlock:
+        keys = [item.key for item in self.series]
+        if len(set(keys)) != len(keys):
+            raise ValueError("chart series keys must be unique")
+        if any(len(item.values) != len(self.categories) for item in self.series):
+            raise ValueError("chart series values must match categories")
+        return self
+
 
 class AnalysisReportNarrativeBlock(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -237,6 +246,16 @@ class AnalysisReportWorkbookSheet(BaseModel):
     sort_by: tuple[str, ...] = ()
     page_size: int | None = Field(default=None, gt=0, le=1_000_000)
 
+    @model_validator(mode="after")
+    def validate_sort_by(self) -> AnalysisReportWorkbookSheet:
+        if len(set(self.sort_by)) != len(self.sort_by):
+            raise ValueError("workbook sort_by keys must be unique")
+        if any(not _SAFE_KEY.fullmatch(key) for key in self.sort_by):
+            raise ValueError("workbook sort_by key is invalid")
+        if self.columns and not set(self.sort_by) <= {column.key for column in self.columns}:
+            raise ValueError("workbook sort_by must reference selected columns")
+        return self
+
 
 class AnalysisReportWorkbookLayout(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -293,6 +312,8 @@ class AnalysisReportV1(BaseModel):
                 column_keys = [column.key for column in sheet.columns]
                 if len(set(column_keys)) != len(column_keys):
                     raise ValueError("workbook column keys must be unique")
+            _validate_workbook_sort_by(self.blocks, self.workbook)
+        self.validate_limits()
         _reject_unsafe_text(self.scope, "scope")
         _reject_unsafe_text(self.blocks, "blocks")
         _reject_unsafe_text(self.fulfillment, "fulfillment")
@@ -300,6 +321,24 @@ class AnalysisReportV1(BaseModel):
         _reject_unsafe_text(self.limitations, "limitations")
         _reject_unsafe_text(self.methodology, "methodology")
         _reject_unsafe_text(self.workbook, "workbook")
+        return self
+
+    def validate_limits(
+        self,
+        *,
+        max_blocks: int = 128,
+        max_columns: int = 256,
+        max_rows: int = 100_000,
+        max_cell_chars: int = 32_767,
+    ) -> AnalysisReportV1:
+        _validate_technical_limits(
+            self.blocks,
+            self.workbook,
+            max_blocks=max_blocks,
+            max_columns=max_columns,
+            max_rows=max_rows,
+            max_cell_chars=max_cell_chars,
+        )
         return self
 
 
@@ -355,6 +394,87 @@ def _has_limitation(limitations: tuple[Limitation, ...], section: str) -> bool:
     )
 
 
+def _validate_workbook_sort_by(
+    blocks: tuple[AnalysisReportBlock, ...],
+    workbook: AnalysisReportWorkbookLayout,
+) -> None:
+    blocks_by_id = {block.id: block for block in blocks}
+    for sheet in workbook.sheets:
+        if not sheet.sort_by:
+            continue
+        typed_tables = [
+            blocks_by_id[block_id]
+            for block_id in sheet.block_ids
+            if isinstance(blocks_by_id.get(block_id), AnalysisReportTypedTableBlock)
+        ]
+        if not typed_tables:
+            raise ValueError("workbook sort_by requires a selected typed table")
+        selected_keys = {column.key for column in sheet.columns}
+        for table in typed_tables:
+            table_keys = {column.key for column in table.columns}
+            if selected_keys and not selected_keys <= table_keys:
+                raise ValueError("workbook columns must reference every selected table")
+            if not set(sheet.sort_by) <= table_keys:
+                raise ValueError("workbook sort_by must reference every selected table")
+
+
+def _validate_technical_limits(
+    blocks: tuple[AnalysisReportBlock, ...],
+    workbook: AnalysisReportWorkbookLayout | None,
+    *,
+    max_blocks: int,
+    max_columns: int,
+    max_rows: int,
+    max_cell_chars: int,
+) -> None:
+    if len(blocks) > max_blocks:
+        raise ValueError("analysis report block limit exceeded")
+    column_count = 0
+    row_count = 0
+    for block in blocks:
+        if isinstance(block, AnalysisReportTypedTableBlock):
+            column_count += len(block.columns)
+            row_count += len(block.rows)
+        elif isinstance(block, AnalysisReportChartBlock):
+            column_count += 1 + len(block.series)
+            row_count += len(block.categories)
+        elif isinstance(block, AnalysisReportMetricCardsBlock):
+            column_count += 3
+            row_count += len(block.cards)
+        elif isinstance(block, AnalysisReportTimeSeriesBlock):
+            column_count += 1 + max((len(point.values) for point in block.points), default=0)
+            row_count += len(block.points)
+        elif isinstance(block, AnalysisReportLinkListBlock):
+            column_count += 3
+            row_count += len(block.items)
+        elif isinstance(block, AnalysisReportNarrativeBlock):
+            column_count += 2
+            row_count += 1
+        elif isinstance(block, AnalysisReportMethodologyLimitationsBlock):
+            column_count += 2
+            row_count += 1 + len(block.limitations)
+        if _max_text_length(block) > max_cell_chars:
+            raise ValueError("analysis report cell text limit exceeded")
+    if workbook is not None:
+        column_count += sum(len(sheet.columns) for sheet in workbook.sheets)
+    if column_count > max_columns:
+        raise ValueError("analysis report column limit exceeded")
+    if row_count > max_rows:
+        raise ValueError("analysis report row limit exceeded")
+
+
+def _max_text_length(value: Any) -> int:
+    if isinstance(value, str):
+        return len(value)
+    if isinstance(value, BaseModel):
+        return _max_text_length(value.model_dump(mode="json"))
+    if isinstance(value, Mapping):
+        return max((_max_text_length(item) for item in value.values()), default=0)
+    if isinstance(value, (list, tuple)):
+        return max((_max_text_length(item) for item in value), default=0)
+    return 0
+
+
 __all__ = [
     "AnalysisReportBlock",
     "AnalysisReportChartBlock",
@@ -376,6 +496,8 @@ __all__ = [
     "_aggregate_fulfillment_status",
     "_has_limitation",
     "_reject_unsafe_text",
+    "_validate_technical_limits",
+    "_validate_workbook_sort_by",
 ]
 
 

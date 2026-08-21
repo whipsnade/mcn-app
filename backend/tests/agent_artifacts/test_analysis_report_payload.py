@@ -214,6 +214,63 @@ def test_report_rejects_duplicate_block_ids_and_server_owned_fields() -> None:
         AnalysisReportV1Input.model_validate(polluted)
 
 
+def test_chart_series_keys_and_category_lengths_are_strict() -> None:
+    chart = {
+        "block_type": "chart",
+        "id": "chart",
+        "title": "渠道趋势",
+        "chart_type": "line",
+        "categories": ["一月", "二月"],
+        "series": [
+            {"key": "reach", "label": "触达", "values": [1, 2]},
+            {"key": "reach", "label": "重复", "values": [3, 4]},
+        ],
+    }
+    with pytest.raises(ValidationError):
+        AnalysisReportV1Input.model_validate(_base_input(blocks=[chart]))
+
+    chart["series"] = [{"key": "reach", "label": "触达", "values": [1]}]
+    with pytest.raises(ValidationError):
+        AnalysisReportV1Input.model_validate(_base_input(blocks=[chart]))
+
+
+def test_report_rejects_unknown_workbook_sort_column() -> None:
+    table = {
+        "block_type": "typed_table",
+        "id": "table",
+        "title": "表格",
+        "columns": [{"key": "platform", "label": "平台", "type": "string"}],
+        "rows": [["小红书"]],
+    }
+    payload = _base_input(blocks=[table])
+    payload["workbook"] = {
+        "schema_version": "workbook_v1",
+        "sheets": [{
+            "key": "report",
+            "title": "报告",
+            "block_ids": ["table"],
+            "sort_by": ["unknown"],
+        }],
+    }
+
+    with pytest.raises(ValidationError):
+        AnalysisReportV1Input.model_validate(payload)
+
+
+def test_report_enforces_technical_block_limit() -> None:
+    too_many_blocks = [
+        {
+            "block_type": "narrative",
+            "id": f"n-{index}",
+            "title": "段落",
+            "content": "内容",
+        }
+        for index in range(129)
+    ]
+    with pytest.raises(ValidationError):
+        AnalysisReportV1Input.model_validate(_base_input(blocks=too_many_blocks))
+
+
 def test_payload_data_status_is_not_model_controllable() -> None:
     payload = assemble_analysis_report_payload(
         AnalysisReportV1Input.model_validate(_base_input(

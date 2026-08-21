@@ -289,7 +289,40 @@
 - [x] **Step 3: Independent review**：只读审查 `63d3cf7..b3249e9`；Critical 0，Important 2，Minor 1，重点架构边界未发现其他问题。
 - [x] **Step 4: Fix only affected findings**：先补 RED 测试，再修复报告元数据展示、全局 scope 唯一性与租户 Diff；受影响后端 18 项、前端 10 项和后端 Ruff 通过，未重跑无关全量。
 - [x] **Step 5: Create integration candidate**：已保持 `main` 引用不动，在独立 worktree 从执行 HEAD `b3ffe36` 创建 `codex/pi-autonomous-marketing-skills-integration`，以 `--no-ff` 合并提交 `158e503`；仅在候选上完成一次受影响验证，不 push、不部署、不移动 main 引用。
-- [x] **Step 6: Mark Goal complete**：计划 checkbox、迁移、文档、测试、审查、执行/候选工作树和本地 integration candidate 均已满足；真实模型/DataTap/钱包/生产部署/Web UAT 仍明确列为外部发布步骤，而非本开发验证。
+- [ ] **Step 6: Mark Goal complete**：本步骤暂不勾选。2026-08-21 用户重新授权后，发现历史 `required-artifact runtime gate` 仍需从新 Pi Runtime 路径移除；本计划继续执行后续修复、最终候选、合入 main、CI、预发布、真实 Web UAT 与生产灰度，不能以旧候选或离线通过提前结束 Goal。
+
+### Task 12：移除新 Pi Runtime 的固定 required-artifact 完成门禁（2026-08-21 重新授权）
+
+**目标：** 保留历史字段和旧 Snapshot 的读取兼容，但让新 Run 只使用通用正式完成不变量：正式分析
+Run 必须有当前 Run/Session/tenant 归属下至少一个已发布、不可变、lineage 有效的顶层主报告；报告
+类型由 Pi 在 RuntimeSnapshot allowlist 内自主选择标准 Artifact 或 `analysis_report_v1`。
+
+- [x] **Step 1: CodeGraph 与运行路径盘点**：尝试从 CompletionValidator、terminal ACK、Recovery、
+  force-complete 和离线 UAT 追踪消费路径；现有 CodeGraph 索引落后于 release worktree，未将新符号纳入
+  索引，因此以当前源码的结构化 `rg` 复核实际路径，并在 QA 留存该限制。确认统一校验由
+  `CompletionValidator` 进入 engine、terminal、recovery 和 force-complete。
+- [x] **Step 2: 定向 RED 测试**：锁定标准 Artifact、`analysis_report_v1`、clarification 无报告、
+  正式 Run 无主报告拒绝、跨 tenant/历史/未发布 Draft 拒绝、Recovery/terminal ACK/force-complete
+  一致校验、workbook 与报告 Version 不一致拒绝和 legacy Snapshot 只读不回写。
+- [x] **Step 3: 最小实现**：删除新 Snapshot 对固定 required contract 的消费；保留旧字段、DTO、数据库列
+  和历史 Snapshot 的旧语义读取。新增 server-owned `completion_mode`（只区分正式分析与交互，不是
+  Artifact 类型，且不从用户文本、模型输出或 Builder 推导）。新路径不新增固定 Artifact 推导器，
+  不恢复 Evidence Bridge、`mcp_result_v1`、candidate/Corpus Gate。
+- [x] **Step 4: 定向 GREEN**：受影响 Completion/terminal/Recovery/settle/runtime-config 测试
+  `57 passed`；标准与通用报告共用主报告校验，clarification/interaction 例外不放宽正式分析安全边界。
+- [x] **Step 5: 复验既有红灯与离线 UAT**：原先 12 项红灯只执行一次，结果 `11 passed, 1 failed`；
+  仅隔离该失败项复跑一次后 `1 passed`。随后离线 UAT 全套只执行一次，`28 passed`。不重复完整 UAT。
+- [ ] **Step 6: 独立审查与 `fix(runtime)` 提交**：待审查确认 Critical 0 / Important 0 后，创建独立
+  `fix(runtime)` 提交，并继续 Task 13 的发布链路。
+
+### Task 13：生产发布继续执行
+
+- [ ] 最终发布树验证并重建包含 Task 12 修复的 integration candidate。
+- [ ] 合入 `main` 并通过 CI；失败时只修复真实失败，不删除门禁或伪造结果。
+- [ ] 预发布部署与一次真实 Web UAT；确认真实模型、DataTap、钱包、Reviewer、Version、lineage
+  和同版 workbook 约束。
+- [ ] 生产灰度 `5% → 25% → 100%`，完成生产验收、监控、文档封口和回滚演练记录，最终状态才可写为
+  `PRODUCTION_RELEASE_COMPLETE`。
 
 ## Spec Coverage Self-Review Matrix
 

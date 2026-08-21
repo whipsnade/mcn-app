@@ -14,6 +14,8 @@ from app.agent_artifacts.payloads.analysis_report import (
     _aggregate_fulfillment_status,
     _has_limitation,
     _reject_unsafe_text,
+    _validate_technical_limits,
+    _validate_workbook_sort_by,
 )
 from app.agent_artifacts.payloads.common import Limitation, SectionAvailability
 
@@ -46,6 +48,16 @@ class AnalysisReportV1Input(BaseModel):
         ids = [block.id for block in self.blocks]
         if len(set(ids)) != len(ids):
             raise ValueError("analysis report block ids must be unique")
+        _validate_technical_limits(
+            self.blocks,
+            self.workbook,
+            max_blocks=128,
+            max_columns=256,
+            max_rows=100_000,
+            max_cell_chars=32_767,
+        )
+        if self.workbook is not None:
+            _validate_workbook_sort_by(self.blocks, self.workbook)
         if "blocks" not in self.availability:
             raise ValueError("availability must include blocks")
         _reject_unsafe_text(self.scope, "scope")

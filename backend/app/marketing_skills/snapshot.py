@@ -9,6 +9,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.marketing_capability_pack.runtime import MarketingRunCapability, MarketingSkillSnapshot
+from app.marketing_skills.constants import MAX_SKILL_CONTENT_BYTES, MAX_SKILL_COUNT
 from app.marketing_skills.models import SkillActivation
 from app.marketing_skills.repository import (
     ResolvedSkillRevision,
@@ -34,6 +35,8 @@ class SkillManifestEntry(BaseModel):
     def verify_content_digest(self) -> SkillManifestEntry:
         from app.marketing_skills.validation import canonical_skill_digest
 
+        if len(self.content.encode("utf-8")) > MAX_SKILL_CONTENT_BYTES:
+            raise ValueError("skill_snapshot_content_too_large")
         if canonical_skill_digest(self.content) != self.content_digest:
             raise ValueError("skill_snapshot_digest_mismatch")
         if len(set(self.required_tools)) != len(self.required_tools):
@@ -127,7 +130,7 @@ class SkillSnapshotService:
         environment: str = "production",
     ) -> MarketingRunCapability:
         try:
-            names = tuple(
+            activation_names = tuple(
                 (
                     await db.scalars(
                         select(SkillActivation.skill_name)
@@ -143,6 +146,11 @@ class SkillSnapshotService:
                     )
                 ).all()
             )
+            names = tuple(
+                dict.fromkeys([item.name for item in base_capability.skills] + list(activation_names))
+            )
+            if len(names) > MAX_SKILL_COUNT:
+                raise SkillSnapshotError("skill_snapshot_limit_exceeded")
             resolved = await resolve_active_revisions(
                 db,
                 tenant_id=tenant_id,
@@ -157,7 +165,43 @@ class SkillSnapshotService:
             raise SkillSnapshotError("skill_snapshot_invalid") from exc
         if not resolved:
             raise SkillSnapshotError("skill_snapshot_missing")
+        resolved_by_name = {item.skill_name: item for item in resolved}
         skill_rows = tuple(
+            MarketingSkillSnapshot(
+                name=item.name,
+                version=(
+                    f"db-revision-{resolved_by_name[item.name].revision}"
+                    if item.name in resolved_by_name
+                    else item.version
+                ),
+                revision=(
+                    resolved_by_name[item.name].revision
+                    if item.name in resolved_by_name
+                    else item.revision
+                ),
+                digest=(
+                    resolved_by_name[item.name].content_digest
+                    if item.name in resolved_by_name
+                    else item.digest
+                ),
+                content=(
+                    resolved_by_name[item.name].content
+                    if item.name in resolved_by_name
+                    else item.content
+                ),
+                required_tools=(
+                    resolved_by_name[item.name].required_tools
+                    if item.name in resolved_by_name
+                    else item.required_tools
+                ),
+                artifact_contract=(
+                    resolved_by_name[item.name].artifact_contract
+                    if item.name in resolved_by_name
+                    else item.artifact_contract
+                ),
+            )
+            for item in base_capability.skills
+        ) + tuple(
             MarketingSkillSnapshot(
                 name=item.skill_name,
                 version=f"db-revision-{item.revision}",
@@ -168,6 +212,7 @@ class SkillSnapshotService:
                 artifact_contract=item.artifact_contract,
             )
             for item in resolved
+            if item.skill_name not in {base.name for base in base_capability.skills}
         )
         payload = base_capability.model_dump(mode="json")
         payload["skills"] = [item.model_dump(mode="json") for item in skill_rows]

@@ -379,6 +379,7 @@ export interface ApiSkillValidation {
 export interface ApiSkillRevision {
   id: string;
   tenant_id: string | null;
+  scope_key: string;
   skill_name: string;
   revision: number;
   content: string;
@@ -395,12 +396,14 @@ export interface ApiSkillActivation {
   id: string;
   environment: AdminSkillEnvironment;
   tenant_id: string | null;
+  scope_key: string;
   skill_name: string;
   active_revision: number;
   active_revision_id: string;
   previous_revision: number | null;
   previous_revision_id: string | null;
   rollout_percent: number;
+  previous_rollout_percent: number | null;
   updated_by: string | null;
   updated_at: string;
 }
@@ -427,5 +430,7 @@ export interface ApiSkillDiff {
   skill_name: string;
   from_revision: number;
   to_revision: number;
+  from_revision_id?: string | null;
+  to_revision_id?: string | null;
   diff: string;
 }

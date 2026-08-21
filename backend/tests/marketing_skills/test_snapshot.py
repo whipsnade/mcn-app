@@ -84,6 +84,24 @@ def test_skill_manifest_is_immutable_and_digest_bound() -> None:
         SkillManifest.model_validate(tampered)
 
 
+def test_skill_manifest_rejects_multibyte_content_over_gateway_limit() -> None:
+    content = "---\nname: campaign-research\ndescription: 数据分析\nrequired_tools: []\n---\n" + "中" * 70_000
+    resolved = ResolvedSkillRevision(
+        id=str(uuid4()),
+        tenant_id=None,
+        skill_name="campaign-research",
+        revision=1,
+        content=content,
+        content_digest=canonical_skill_digest(content),
+        description="数据分析",
+        required_tools=(),
+        artifact_contract=None,
+    )
+
+    with pytest.raises(ValidationError, match="skill_snapshot_content_too_large"):
+        SkillManifest.from_revisions((resolved,))
+
+
 @pytest.mark.asyncio
 async def test_new_run_resolution_uses_active_db_revision_and_never_static_content(
     snapshot_session,
@@ -148,9 +166,81 @@ async def test_new_run_resolution_uses_active_db_revision_and_never_static_conte
         tenant_id=tenant_id,
         base_capability=base,
     )
-    manifest = SkillSnapshotService.manifest_from_capability(resolved_capability)
+    assert {item.name for item in resolved_capability.skills} == {
+        item.name for item in base.skills
+    } | {"campaign-research"}
+    campaign = next(
+        item for item in resolved_capability.skills if item.name == "campaign-research"
+    )
+    assert campaign.revision == 7
+    assert campaign.content == resolved.content
 
-    assert [item.name for item in resolved_capability.skills] == ["campaign-research"]
-    assert resolved_capability.skills[0].revision == 7
-    assert manifest.source_scope == "database_activation"
-    assert manifest.entries[0].content == resolved.content
+
+@pytest.mark.asyncio
+async def test_new_run_resolution_preserves_base_skills_when_registry_is_partial(
+    snapshot_session,
+):
+    tenant_id = str(uuid4())
+    resolved = _resolved()
+    now = _now()
+    snapshot_session.add_all(
+        [
+            User(
+                id=str(uuid4()),
+                nickname="user",
+                role="user",
+                status="active",
+                industries=[],
+                created_at=now,
+                updated_at=now,
+            ),
+            Tenant(
+                id=tenant_id,
+                slug="partial-registry",
+                name="Partial Registry",
+                status="active",
+                is_internal=False,
+                runtime_backend="pi",
+                license_status="active",
+                created_at=now,
+                updated_at=now,
+            ),
+            SkillRevision(
+                id=resolved.id,
+                tenant_id=None,
+                skill_name=resolved.skill_name,
+                revision=resolved.revision,
+                content=resolved.content,
+                content_digest=resolved.content_digest,
+                description=resolved.description,
+                required_tools=[],
+                artifact_contract=resolved.artifact_contract,
+                created_by=None,
+                created_at=now,
+                change_note="test",
+            ),
+            SkillActivation(
+                id=str(uuid4()),
+                environment="production",
+                tenant_id=None,
+                skill_name=resolved.skill_name,
+                active_revision_id=resolved.id,
+                previous_revision_id=None,
+                rollout_percent=100,
+                updated_by=None,
+                updated_at=now,
+            ),
+        ]
+    )
+    await snapshot_session.commit()
+
+    base = build_marketing_run_capability()
+    capability = await SkillSnapshotService.resolve_for_new_run(
+        snapshot_session,
+        tenant_id=tenant_id,
+        base_capability=base,
+    )
+
+    assert {item.name for item in capability.skills} == {
+        item.name for item in base.skills
+    } | {resolved.skill_name}

@@ -93,6 +93,23 @@ def test_catalog_and_secret_envelope_are_bounded_and_strict() -> None:
         )
 
 
+def test_claim_snapshot_accepts_server_owned_environment_field() -> None:
+    response = PiGatewayClaimResponse.model_validate(
+        {
+            "run_id": "run-1",
+            "attempt_id": "attempt-1",
+            "lease_token": "lease-token-that-is-long-enough-123",
+            "lease_expires_at": 1_800_000_000.0,
+            "runtime_snapshot": {"config_version_id": "cfg-1", "environment": "test"},
+            "transcript": [],
+            "secret_envelope": {"alg": "AES-256-GCM", "nonce": "A" * 16, "ciphertext": "B" * 16},
+            "adapter_catalog": [],
+            "internal_tools": [],
+        }
+    )
+    assert response.runtime_snapshot["environment"] == "test"
+
+
 def test_usage_event_is_a_bounded_internal_projection() -> None:
     event = PiGatewaySourceEvent.model_validate(
         {

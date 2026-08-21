@@ -4,6 +4,7 @@ import {
   type ExtensionFactory,
   type ResourceLoader,
 } from "@earendil-works/pi-coding-agent";
+import { lstatSync } from "node:fs";
 import { dirname, isAbsolute, resolve } from "node:path";
 
 import type { AdapterCatalogEntry, SkillCatalogEntry } from "./protocol.js";
@@ -34,6 +35,17 @@ export function createProductionResourceLoader(options: ProductionResourceLoader
     const resolvedPath = resolve(path);
     if (!isAbsolute(path) || dirname(resolvedPath) !== runRoot) {
       throw new Error("pi_skill_snapshot_path_invalid");
+    }
+    try {
+      const snapshotStat = lstatSync(resolvedPath);
+      if (snapshotStat.isSymbolicLink() || !snapshotStat.isDirectory()) {
+        throw new Error("pi_skill_snapshot_path_invalid");
+      }
+    } catch (error) {
+      if (error instanceof Error && error.message === "pi_skill_snapshot_path_invalid") {
+        throw error;
+      }
+      throw new Error("pi_skill_snapshot_path_invalid", { cause: error });
     }
   }
   const loader = new DefaultResourceLoader({

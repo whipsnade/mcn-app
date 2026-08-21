@@ -46,25 +46,26 @@ def _pick_activation(
     *,
     tenant_id: str,
     skill_name: str,
-) -> SkillActivation | None:
-    tenant = next(
-        (
-            item
-            for item in activations
-            if item.tenant_id == tenant_id and _is_selected(item, tenant_id, skill_name)
-        ),
-        None,
+) -> tuple[SkillActivation, str] | None:
+    """Return the stable revision choice, including a rollout previous pointer.
+
+    A tenant override owns its bucket.  When that bucket is outside the new
+    rollout, the override's previous revision remains the effective revision;
+    only an override without a previous revision falls through to the global
+    activation.  This prevents a partial rollout from silently changing the
+    whole skill pack for tenants outside the bucket.
+    """
+
+    ordered = (
+        [item for item in activations if item.tenant_id == tenant_id]
+        + [item for item in activations if item.tenant_id is None]
     )
-    if tenant is not None:
-        return tenant
-    return next(
-        (
-            item
-            for item in activations
-            if item.tenant_id is None and _is_selected(item, tenant_id, skill_name)
-        ),
-        None,
-    )
+    for item in ordered:
+        if _is_selected(item, tenant_id, skill_name):
+            return item, item.active_revision_id
+        if item.previous_revision_id is not None:
+            return item, item.previous_revision_id
+    return None
 
 
 async def resolve_active_revisions(
@@ -102,7 +103,7 @@ async def resolve_active_revisions(
     if not chosen:
         return ()
 
-    revision_ids = {row.active_revision_id for row in chosen}
+    revision_ids = {revision_id for _activation, revision_id in chosen}
     revisions = {
         row.id: row
         for row in (
@@ -110,8 +111,8 @@ async def resolve_active_revisions(
         ).all()
     }
     resolved: list[ResolvedSkillRevision] = []
-    for activation in chosen:
-        revision = revisions.get(activation.active_revision_id)
+    for activation, revision_id in chosen:
+        revision = revisions.get(revision_id)
         if revision is None:
             raise SkillResolutionError("skill_revision_missing")
         if revision.skill_name != activation.skill_name:

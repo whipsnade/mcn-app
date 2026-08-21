@@ -167,6 +167,8 @@ def _table_section(
     indexes = [next(index for index, source in enumerate(block.columns) if source.key == key) for key in keys]
     rows = [tuple(row[index] for index in indexes) for row in block.rows]
     if layout_sheet.sort_by:
+        if not set(layout_sheet.sort_by) <= set(keys):
+            raise ValueError("workbook sort_by references an unselected column")
         sort_indexes = [keys.index(key) for key in layout_sheet.sort_by]
         rows.sort(key=lambda row: tuple(_sortable(row[index]) for index in sort_indexes))
     return _Section(headers=headers, keys=keys, types=types, rows=tuple(rows))

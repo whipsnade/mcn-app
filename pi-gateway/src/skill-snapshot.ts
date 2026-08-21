@@ -16,8 +16,8 @@ import { isAbsolute, join, resolve } from "node:path";
 import type { SkillSnapshotEntry } from "./protocol.js";
 
 export const RUN_SKILL_SNAPSHOT_DIR = ".skill-snapshot";
-const MAX_SKILLS = 128;
-const MAX_CONTENT_BYTES = 200_000;
+export const MAX_SKILLS = 128;
+export const MAX_CONTENT_BYTES = 200_000;
 const SKILL_NAME = /^[a-z][a-z0-9-]{1,95}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
 

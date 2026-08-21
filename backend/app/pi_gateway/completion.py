@@ -1,9 +1,10 @@
 """Pi Run 的统一平台完成契约。
 
 该模块是正常 terminal、ACK 丢失恢复以及系统 force-complete 共用的唯一成功
-判定。它守住平台一致性，并要求普通用户可见 Pi Run 在完成前拥有当前 Run
-发布的顶层主 Artifact；主 Artifact 的具体 contract 仍由 Pi 在冻结 allowlist
-内自主选择。澄清终态与 utility Run 不需要主 Artifact。
+判定。它守住平台一致性；formal analysis Run 需要当前 Run 发布至少一个顶层
+主 Artifact，但具体 contract 由 Pi 在冻结 allowlist 内自主选择。interaction、
+澄清终态与 utility/kol-detail Run 不需要主报告。历史 Snapshot 的显式
+required_artifact_contract 仅按旧版本语义兼容读取。
 """
 
 from __future__ import annotations
@@ -60,9 +61,9 @@ class CompletionValidator:
 
         ``result_unknown`` 是会计上的未决事实，不是平台可以擅自重放或释放
         的失败。只要没有 running/unresolved row，它会以 warning 伴随文本
-        完成；真正仍在生命周期中的 permit/Step 继续阻止成功终态。普通用户
-        Run 还必须有当前 Run 的顶层已发布 Version，澄清终态和 utility Run
-        除外。
+        完成；真正仍在生命周期中的 permit/Step 继续阻止成功终态。formal
+        analysis Run 还必须有当前 Run 的顶层已发布 Version；该判断不读取
+        新 Snapshot 的固定 Artifact 类型。
         """
         warnings: list[str] = []
         assistant_messages = list(
@@ -233,6 +234,45 @@ class CompletionValidator:
                 "pi_gateway_snapshot_invalid",
                 "frozen artifact contract allowlist is invalid",
             )
+        completion_mode = snapshot.get("completion_mode", "formal_analysis")
+        if completion_mode not in {"formal_analysis", "interaction"}:
+            return CompletionValidationResult(
+                False,
+                "pi_gateway_snapshot_invalid",
+                "frozen completion mode is invalid",
+            )
+
+        # Historical Snapshots may carry an explicit required contract.  Keep
+        # that immutable meaning for replay only; new Run Snapshots omit both
+        # legacy fields and use the candidate allowlist below.
+        legacy_mode = snapshot.get("artifact_contract_mode")
+        legacy_contract = snapshot.get("required_artifact_contract")
+        if legacy_mode == "required":
+            if not isinstance(legacy_contract, str) or not legacy_contract:
+                return CompletionValidationResult(
+                    False,
+                    "required_artifact_missing",
+                    "historical required artifact contract is invalid",
+                )
+            version, validation_error = await self._find_valid_published_version(
+                run, legacy_contract
+            )
+            if version is None:
+                code = (
+                    "required_artifact_invalid_lineage"
+                    if validation_error == "published artifact lineage snapshot is invalid"
+                    else "required_artifact_missing"
+                )
+                return CompletionValidationResult(False, code, validation_error)
+            return CompletionValidationResult(
+                True, artifact_version_id=version.id, warnings=tuple(warnings)
+            )
+        if legacy_contract is not None:
+            return CompletionValidationResult(
+                False,
+                "required_artifact_missing",
+                "historical required artifact contract mode is invalid",
+            )
 
         versions = await self._current_published_versions(run)
         if not versions:
@@ -250,22 +290,22 @@ class CompletionValidator:
                     "pi_gateway_artifact_invalid",
                     "published artifact Version is missing or does not belong to this Run",
                 )
-            if self._requires_main_artifact(run):
+            if self._requires_main_report(run, completion_mode=completion_mode):
                 return CompletionValidationResult(
                     False,
                     "pi_gateway_main_artifact_missing",
-                    "a current Run top-level published main Artifact is required",
+                    "a formal analysis Run requires a current top-level published main Artifact",
                 )
             return CompletionValidationResult(True, warnings=tuple(warnings))
 
         main_versions = [
             row for row in versions if row[1].parent_artifact_id is None
         ]
-        if self._requires_main_artifact(run) and not main_versions:
+        if self._requires_main_report(run, completion_mode=completion_mode) and not main_versions:
             return CompletionValidationResult(
                 False,
                 "pi_gateway_main_artifact_missing",
-                "child insight Artifacts do not satisfy the top-level main Artifact requirement",
+                "child insight Artifacts do not satisfy the formal analysis main Artifact requirement",
             )
 
         for version, artifact, revision, publication in versions:
@@ -303,23 +343,46 @@ class CompletionValidator:
         )
 
     @staticmethod
-    def _requires_main_artifact(run: AgentRun) -> bool:
-        """判断成功的 Pi Run 是否必须暴露顶层主 Artifact。
+    def _requires_main_report(
+        run: AgentRun, *, completion_mode: str = "formal_analysis"
+    ) -> bool:
+        """判断当前 Run 是否是显式 formal analysis 完成边界。
 
-        ``utility_v1`` 只产生标题/摘要等内部轻量结果，允许文本完成；
-        ``clarification_requested`` 是独立的用户可见终态，也不应被迫发布
-        报告。其他用户可见 Pi Run 使用泛化门禁，不硬编码报告 contract。
+        ``completion_mode`` 是建 Run 时由服务端 RuntimeSnapshot 冻结的显式
+        平台元数据，不是用户文本、模型输出或 Builder 推导出的 Artifact
+        目标。缺省保持普通用户 session analyst 的 formal 语义；interaction
+        仅用于明确的文本/协议交互 Run。具体主报告类型始终由 Snapshot
+        allowlist + Pi 选择决定。
         """
+        if completion_mode == "interaction":
+            return False
         return (
             run.runtime_backend == "pi"
             and run.run_kind == "user"
             and run.visibility == "user"
             and run.status != "clarification_requested"
             and not run.profile_name.startswith("utility_")
+            and run.profile_name != "kol_detail_v1"
         )
 
+    async def _find_valid_published_version(
+        self, run: AgentRun, required_contract: str
+    ) -> tuple[AgentArtifactVersion | None, str | None]:
+        """只按历史 Snapshot 的固定 contract 查找当前 Run 的合法 Version。"""
+        rows = await self._current_published_versions(
+            run, required_contract=required_contract
+        )
+        if not rows:
+            return None, "no published artifact Version belongs to this Run"
+        for version, _artifact, _revision, publication in rows:
+            error = await self._validate_published_version(run, version, publication)
+            if error is None:
+                return version, None
+            return None, error
+        return None, "published artifact Version is invalid"
+
     async def _current_published_versions(
-        self, run: AgentRun
+        self, run: AgentRun, *, required_contract: str | None = None
     ) -> list[tuple[AgentArtifactVersion, AgentArtifact, ArtifactDraftRevision, ArtifactPublishAttempt]]:
         """Load only versions whose complete publication chain belongs to Run."""
         statement = (
@@ -354,6 +417,10 @@ class CompletionValidator:
                 ArtifactPublishAttempt.status == "published",
             )
         )
+        if required_contract is not None:
+            statement = statement.where(
+                AgentArtifactVersion.schema_version == required_contract
+            )
         return list((await self.db.execute(statement)).all())
 
     async def _validate_published_version(
