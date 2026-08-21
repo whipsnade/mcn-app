@@ -53,9 +53,21 @@ cd backend
 - 取消必须经过持久 `cancel_requested`、外发前 preflight、Gateway heartbeat、worker/provider
   abort、终态 fence、Recovery 和 SSE；前端只显示“正在取消”，直到收到唯一真实
   `run.cancelled`。在飞调用仍按发送事实分类，`result_unknown` 保留预留且禁止自动重放。
-- 本轮真实 Web UAT 的品牌固定为“瑞幸咖啡”，且必须在远程 CI 全绿后只执行一次 Direct MCP + 取消
-  组合验证。candidate-r8 的 Backend 红灯已定位为 CI 未安装 `pi-gateway` 依赖，不是生产运行时
-  断言；修复后必须先取得 candidate-r9 全绿，当前不得预发布或生产部署。
+- 本轮真实 Web UAT 的品牌固定为“瑞幸咖啡”，且在远程 CI 全绿后只执行一次 Direct MCP + 取消
+  组合验证。candidate-r8 的 Backend 红灯已定位为 CI 未安装 `pi-gateway` 依赖；candidate-r9
+  (`3c01d13`，Actions `32476331375`) 已全绿并完成预发布部署。唯一 Web UAT 随后在 Run 创建前因
+  58 个 enabled+approved MCP 目录超过 Pi adapter 上限 32 而返回 `runtime_adapter_catalog_too_large`；
+  不得重试或以配置放宽掩盖，当前仍禁止生产部署。
+
+## 2026-08-21 唯一瑞幸 Web UAT 停止记录
+
+- 专用租户 `uat-pi-r9-20260821` 已切换到 Pi backend，后端与 Gateway 均 healthy/ready，迁移 head 为
+  `0049_skill_rollout_history`。
+- 唯一请求未创建服务端 Session/Message/Run/Attempt/Tool Call；没有模型调用、DataTap 外发、积分扣费
+  或取消竞态。只读目录统计为 `insight-cube-mcp=24`、`social-grow-mcp=16`、
+  `social-grow-content-mcp=10`、`bilibili-mcp=8`，合计 58。
+- 该结果是发布配置预检阻断，不是 MCP 透传或取消链路的通过证据；最终功能验收和生产灰度保持停止。
+  若要调整租户目录或适配器限制后重新执行，必须先取得新的明确 Web UAT 授权。
 
 ## UAT 部署
 

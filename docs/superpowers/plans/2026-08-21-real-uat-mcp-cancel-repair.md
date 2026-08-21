@@ -106,5 +106,6 @@
   `1 failed, 2179 passed, 29 skipped`，失败用例是
   `test_topology_reaps_in_process_server_when_start_fails`，实际错误为离线拓扑首次
   `_ensure_gateway_built()` 执行 `npm run build` 时缺少 `pi-gateway` 依赖。定向本地单测与模块回归通过，未修改生产逻辑。
-- [ ] 在 Backend job 补齐锁定的 `pi-gateway/npm ci` 后重建 candidate-r9，并取得远程 CI 全绿；在此之前不得部署预发布或执行真实 Web UAT：通过门槛后仅执行一次专用 UAT 租户的“Direct MCP + 取消”组合 Web UAT：一次瑞幸咖啡请求，Attempt=1、模型≤10、DataTap≤5、积分≤50、retries=0、fresh Run=0。
+- [x] 在 Backend job 补齐锁定的 `pi-gateway/npm ci` 后重建 candidate-r9，并取得远程 CI 全绿；`3c01d13` 对应 Actions run `32476331375` 全绿，随后完成同一发布树的预发布部署与专用 UAT 租户配置。
+- [x] 按授权仅执行一次专用 UAT 租户的“Direct MCP + 取消”组合 Web UAT：一次瑞幸咖啡请求，Run=1、Attempt=1、模型≤10、DataTap≤5、积分≤50、retries=0、fresh Run=0；请求在运行时目录预检以 `runtime_adapter_catalog_too_large` 失败，未进入 MCP/取消阶段，未重试。
 - [ ] 组合 UAT 必须记录一个此前会产生 `unsupported_content` 的工具成功返回、模型收到标准结果、点击“取消任务”后的阶段时间戳、无后续外发、唯一 cancelled、Attempt/ToolCall/permit/lease/worker/端口收口。通过后只报告 `REAL_UAT_MCP_PASS_THROUGH_AND_CANCEL_PASS / READY_FOR_FINAL_FUNCTIONAL_UAT`；本轮不做生产灰度。

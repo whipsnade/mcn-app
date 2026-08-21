@@ -347,7 +347,9 @@ Gate A 审查发现的 5 项必修 + 2 项次要问题，已在同一迁移/代�
   Recovery 不重放 unknown，以及前端真实 `run.cancelled` 事件；这不是前端视觉状态放宽。
 - candidate-r8（run `32473941437`）的 Backend 失败已确认是 CI 拓扑测试首次构建
   `pi-gateway` 时未安装该 workspace 依赖；其余 job 全绿，失败为
-  `1 failed, 2179 passed, 29 skipped`。Backend job 补齐 `pi-gateway/npm ci` 后必须重建
-  candidate-r9 并取得全绿，之后才允许一次“瑞幸咖啡”Direct MCP + 取消真实 Web UAT。
-- 在 candidate-r9 全绿、真实 Web UAT 通过并完成回滚/监控封口前，生产切档仍为禁止；本修复阶段不执行
-  预发布部署、灰度或生产写入。
+  `1 failed, 2179 passed, 29 skipped`。candidate-r9 (`3c01d13`，Actions run
+  `32476331375`) 已补齐依赖并取得全绿，且已完成预发布部署。
+- 唯一“瑞幸咖啡”Direct MCP + 取消真实 Web UAT 已执行一次，但在 Run 创建前因 enabled+approved
+  MCP 目录 58 超过 Pi adapter 上限 32 而返回 `runtime_adapter_catalog_too_large`，没有进入模型、
+  DataTap 或取消阶段。在该预检阻断被新的明确授权处理、真实 Web UAT 通过并完成回滚/监控封口前，生产
+  切档仍为禁止；本修复阶段不执行灰度或生产写入，也不得用第二次 Web UAT 覆盖本次失败证据。

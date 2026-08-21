@@ -251,11 +251,53 @@ subprocess.CalledProcessError: Command ['npm', 'run', 'build'] returned non-zero
 （Node CI 测试兼容）、`984dc90`（r6 失败证据）、`7d487f6`（workspace 依赖/heartbeat 测试）和
 `e61b473`（Browser runner Python）。
 候选已合入本地 `main`，但远程 GitHub CI 当前失败、预发布和一次真实 Web
-UAT尚未完成，因此状态仍为
-`NOT_READY_FOR_PREDEPLOYMENT`。本轮未执行生产灰度。
+UAT 尚未完成，因此此前的
+`NOT_READY_FOR_PREDEPLOYMENT` 已推进为 `REAL_UAT_PRECHECK_FAILED /
+NOT_READY_FOR_FINAL_FUNCTIONAL_UAT`。candidate-r9 已全绿并完成预发布部署，
+但本轮唯一真实 Web UAT 在 Run 创建前失败；本轮未执行生产灰度。
 
 后续唯一真实 Web UAT 使用专用 UAT 租户和一次 `瑞幸咖啡` 请求，限制为 Run=1、Attempt=1、模型≤10、
 DataTap≤5、积分≤50、retries=0、fresh Run=0；必须同时证明此前 `unsupported_content` 场景的标准
 Result 到达模型、点击“取消任务”后无后续外发、唯一 `cancelled`、Attempt/ToolCall/permit/lease/
 worker/端口收口。通过后状态只能推进到
 `REAL_UAT_MCP_PASS_THROUGH_AND_CANCEL_PASS / READY_FOR_FINAL_FUNCTIONAL_UAT`，本轮不做生产灰度。
+
+## 8. Candidate-r9 与唯一真实 Web UAT（2026-08-21）
+
+### 8.1 Candidate-r9 与预发布部署
+
+- `3c01d13` 已合入并推送 `main`；GitHub Actions run `32476331375` 全绿：Backend
+  `96753338631`、Frontend `96753338475`、Migration `96753338762`、Browser E2E
+  `96753338598`、Pi Runtime `96753338567`、Pi Gateway `96753338660` 均成功。
+- 远端预发布同步使用同一 `3c01d13`，Alembic head 为 `0049_skill_rollout_history`；后端健康检查为
+  `{"status":"ok","service":"kol-insight-api"}`，Pi Gateway `/healthz` 与 `/readyz` 分别为
+  `{"status":"ok"}` 与 `{"status":"ready"}`。后端和 Gateway systemd 均为 active。
+- 专用 UAT 租户为 `uat-pi-r9-20260821`（瑞幸咖啡），配置为 `runtime_backend=pi`、
+  `max_decisions=10`、DataTap 每次 10 积分；钱包余额 1000、预留 0。未改生产库，未改历史 Run、
+  Snapshot、Version 或迁移。
+
+### 8.2 唯一瑞幸咖啡 Web UAT 结果
+
+- 仅使用专用 UAT 用户提交一次请求：
+  `请分析瑞幸咖啡近30天的小红书声量、互动与情感趋势，并给出可执行的KOL选择建议；如数据受限请明确说明，不要把缺失值当作0。`
+  未点击重试、继续、取消，也未创建第二个请求。
+- 页面错误为 `runtime_adapter_catalog_too_large`。调用路径是新 Run 创建时的运行时配置快照预检：
+  `RuntimeConfigService` 读取当前租户 enabled+approved MCP 目录，并在超过 Pi adapter 目录上限 32
+  时拒绝创建快照。该路径早于模型调用、Gateway claim 和 DataTap 外发。
+- 远端只读数据库证据：该专用会话、消息、Agent Run、Attempt、Tool Call 均为 0；enabled+approved
+  目录共 58 个，分组为 `insight-cube-mcp=24`、`social-grow-mcp=16`、
+  `social-grow-content-mcp=10`、`bilibili-mcp=8`。因此本次没有模型请求、DataTap dispatch、
+  permit/积分扣费或取消竞态。
+- UAT 在目标 MCP 透传与取消断言之前停止，不能宣称 `REAL_UAT_MCP_PASS_THROUGH_AND_CANCEL_PASS`。
+  当前状态为 `REAL_UAT_PRECHECK_FAILED / NOT_READY_FOR_FINAL_FUNCTIONAL_UAT`；生产灰度、合入生产、
+  5% → 25% → 100% 均禁止。
+
+### 8.3 边界与后续授权
+
+- 未通过关闭任意工具、把 allowlist 改成任意字符串、放宽目录上限、测试特判或重跑 Web UAT 来掩盖
+  失败；原 12 项红灯和完整离线 UAT 证据保持不变。
+- 租户初始化时新钱包调整路由暴露既有 `McpPreflightContext` 长度校验错误；事务已回滚，随后使用
+  既有兼容 Admin 调整 API 完成同一租户钱包初始化，仍经过钱包账本、幂等和审计边界。该 setup 问题
+  未在本修复中改动。
+- 若要处理 58>32 的租户目录配置并重新验证，必须取得新的明确 Web UAT 授权；在此之前不得修改目录、
+  创建 Run 或进入生产发布。
