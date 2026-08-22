@@ -136,5 +136,12 @@
     "brand_report_v3": "1.1.0",
     "campaign_report_v3": "1.1.0",
     "kol_selection_v3": "1.1.0"
-  }
+  },
+  "bootstrap_bundles": [
+    {
+      "name": "post-brand-default-v1",
+      "path": "bootstrap/post-brand-default-v1.json",
+      "digest": "1ce3c8ee0f2f7cc0bb13f6be5f7d7bf3a984b6f6a31e3c40c0f681a7da1e37d2"
+    }
+  ]
 }

@@ -1,7 +1,8 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { mkdtemp, readFile, rm, stat, writeFile, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
@@ -9,7 +10,7 @@ import {
   MAX_SKILLS,
   materializeRunSkillSnapshot,
   skillSnapshotDigest,
-} from "../src/skill-snapshot.js";
+ skillManifestDigest,} from "../src/skill-snapshot.js";
 import { createProductionResourceLoader } from "../src/resource-loader.js";
 import type { SkillSnapshotEntry } from "../src/protocol.js";
 
@@ -108,6 +109,52 @@ describe("run Skill snapshot materializer", () => {
     });
     await expect(materializeRunSkillSnapshot(root, entries)).rejects.toThrow(
       "pi_skill_snapshot_invalid",
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// [post-brand manifest contract] v1/v2 digest 双端一致
+// ---------------------------------------------------------------------------
+
+describe("[post-brand manifest contract] digest vectors", () => {
+  const vectors = JSON.parse(
+    readFileSync(
+      join(__dirname, "../../backend/tests/marketing_skills/skill_manifest_digest_vectors.json"),
+      "utf8",
+    ),
+  );
+
+  it("v1 vector reproduces legacy seven-field digest", () => {
+    const v1 = vectors.v1;
+    const entries = v1.entries.map((raw: any) => ({
+      name: raw.name,
+      revision: raw.revision,
+      contentDigest: raw.content_digest,
+      description: raw.description,
+      requiredTools: raw.required_tools,
+      artifactContract: raw.artifact_contract,
+      content: raw.content,
+    }));
+    expect(skillManifestDigest(entries, v1.source_scope)).toBe(v1.expected_digest);
+  });
+
+  it("v2 vector includes discriminator and identity fields", () => {
+    const v2 = vectors.v2;
+    const entries = v2.entries.map((raw: any) => ({
+      name: raw.name,
+      revision: raw.revision,
+      contentDigest: raw.content_digest,
+      description: raw.description,
+      requiredTools: raw.required_tools,
+      artifactContract: raw.artifact_contract,
+      content: raw.content,
+      revisionId: raw.revision_id,
+      scopeKey: raw.scope_key,
+      modelInputContractVersion: raw.model_input_contract_version,
+    }));
+    expect(skillManifestDigest(entries, v2.source_scope, "skill_manifest_v2")).toBe(
+      v2.expected_digest,
     );
   });
 });

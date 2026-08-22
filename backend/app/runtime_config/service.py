@@ -23,6 +23,7 @@ from app.marketing_skills.snapshot import (
     SkillManifest,
     SkillSnapshotError,
     SkillSnapshotService,
+    manifest_artifact_input_contract_versions,
 )
 from app.pi_gateway.catalog import (
     PI_GATEWAY_ADAPTER_CATALOG_MAX_BYTES,
@@ -263,11 +264,16 @@ class RuntimeConfigService:
                 skill_manifest = SkillSnapshotService.manifest_from_capability(skill_capability)
             except SkillSnapshotError as exc:
                 raise RuntimeConfigError(str(exc)) from exc
+            try:
+                contract_versions = manifest_artifact_input_contract_versions(skill_manifest)
+            except ValueError as exc:
+                raise RuntimeConfigError(str(exc)) from exc
             snapshot = RuntimeConfigSnapshot.model_validate(
                 {
                     **snapshot.model_dump(mode="json"),
                     "capability_pack": skill_capability.model_dump(mode="json"),
                     "skill_manifest": skill_manifest.model_dump(mode="json"),
+                    **({"artifact_input_contract_versions": contract_versions} if contract_versions else {}),
                 }
             )
             # Adapter bindings are part of the immutable Run snapshot as well:

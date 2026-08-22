@@ -23,6 +23,9 @@ class MarketingSkillSnapshot(BaseModel):
     content: str
     required_tools: tuple[str, ...]
     artifact_contract: str | None = None
+    revision_id: str | None = None
+    scope_key: str | None = None
+    model_input_contract_version: str | None = None
 
     @model_validator(mode="after")
     def verify_digest(self) -> MarketingSkillSnapshot:

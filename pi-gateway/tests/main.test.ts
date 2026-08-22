@@ -1,7 +1,8 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { createCipheriv, createHash, hkdfSync, randomBytes } from "node:crypto";
 import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { createServer, type IncomingMessage, type Server } from "node:http";
 
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -627,5 +628,52 @@ describe("mapClaimRuntimeSnapshot Skill manifest", () => {
       manifest_digest: "0".repeat(64),
     };
     expect(() => mapClaimRuntimeSnapshot(snapshot)).toThrow("pi_gateway_claim_snapshot_invalid");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// [post-brand manifest contract] v1/v2 golden vectors 与 claim 严格性
+// ---------------------------------------------------------------------------
+
+describe("[post-brand manifest contract] golden vectors", () => {
+  const vectors = JSON.parse(
+    readFileSync(join(__dirname, "../../backend/tests/marketing_skills/skill_manifest_digest_vectors.json"), "utf8"),
+  );
+
+  function toEntries(rawEntries: any[]): any[] {
+    return rawEntries.map((raw) => ({
+      name: raw.name,
+      revision: raw.revision,
+      contentDigest: raw.content_digest,
+      description: raw.description,
+      requiredTools: raw.required_tools,
+      artifactContract: raw.artifact_contract,
+      content: raw.content,
+      ...(raw.revision_id !== undefined
+        ? {
+            revisionId: raw.revision_id,
+            scopeKey: raw.scope_key,
+            modelInputContractVersion: raw.model_input_contract_version,
+          }
+        : {}),
+    }));
+  }
+
+  it("v1 vector digest matches backend golden", () => {
+    const v1 = vectors.v1;
+    expect(
+      skillManifestDigest(toEntries(v1.entries), v1.source_scope),
+    ).toBe(v1.expected_digest);
+  });
+
+  it("v2 vector digest matches backend golden", () => {
+    const v2 = vectors.v2;
+    expect(
+      skillManifestDigest(toEntries(v2.entries), v2.source_scope, "skill_manifest_v2"),
+    ).toBe(v2.expected_digest);
+  });
+
+  it("v1 and v2 digests differ", () => {
+    expect(vectors.v1.expected_digest).not.toBe(vectors.v2.expected_digest);
   });
 });

@@ -26,6 +26,7 @@ class ResolvedSkillRevision:
     description: str
     required_tools: tuple[str, ...]
     artifact_contract: str | None
+    model_input_contract_version: str = "direct_model_input_v1"
 
 
 def stable_rollout_bucket(tenant_id: str, skill_name: str) -> int:
@@ -133,6 +134,7 @@ async def resolve_active_revisions(
                 description=revision.description,
                 required_tools=required_tools,
                 artifact_contract=revision.artifact_contract,
+                model_input_contract_version=revision.model_input_contract_version,
             )
         )
     return tuple(resolved)

@@ -1,0 +1,115 @@
+{
+  "entries": {
+    "analysis-report": {
+      "artifact_contract": "analysis_report_v1",
+      "content": "---\nname: analysis-report\ndescription: 为品牌、活动、达人或混合营销请求生成类型化通用分析报告。\n---\n\n# 通用营销分析报告\n\n当用户要求自定义字段、跨平台统一表头、长尾数量或混合业务组合时，使用\n`analysis_report_v1`。先按用户目标自主决定需要的查询、分页、停止条件和输出\n范围；不把固定业务流程或固定数量写入报告。\n\n调用 `load_marketing_skill` 获取 `model_input_contract` 后，只向\n`build_artifact_draft` 提交业务字段：`title`、`subject_type`、`scope`、`blocks`、\n`fulfillment`、`availability`、`limitations`、`methodology_input` 和可选\n`workbook`。服务器负责补齐 `schema_version`、`module`、`data_status` 与 Artifact\n身份。Block 必须使用类型化列和安全的 http/https 链接，不提交公式、宏、脚本或\n文件路径。\n\n`fulfillment` 必须保留真实的 `requested_min`、`actual_count`、`status` 和\n`reason`。数据不足时保留已取得结果，使用 partial/unavailable 与 limitation\n披露，不把缺失值变成零，也不为了达到用户数量而编造记录。发布后再按需调用\n`publish_artifacts`；BI 与 Excel 由同一不可变 Report Version 生成。\n",
+      "content_digest": "66cf11bbc4d2a1ca035038ff508adbefb0d7919fdb7dc2d753fb32c0ada8a650",
+      "required_tools": [
+        "load_marketing_skill",
+        "build_artifact_draft",
+        "publish_artifacts"
+      ],
+      "revision": 2,
+      "revision_id": "00000000-0048-4000-8000-000000000007",
+      "scope_key": "__global__",
+      "skill_name": "analysis-report"
+    },
+    "artifact-drilldown": {
+      "artifact_contract": "insight_board_v1",
+      "content": "---\nname: artifact-drilldown\ndescription: 对同 Session 已发布父 Artifact Version 做受控钻取，并按模型输入契约产出看板。\n---\n\n# 产物钻取\n\n先读取用户引用的 Artifact Version（read_artifact）。普通解释、定位来源或比较\n同一版本章节不自动发布新报告，也不调用 DataTap。钻取看板必须绑定同 Session\n已发布的父 Artifact Version（parent_artifact_id / parent_artifact_version_id），\n且只引用该 Version 的最终业务数据。\n\n1. 先调用 load_marketing_skill 获取 model_input_contract（model_input_schema +\n   concise_example）。\n2. 按 schema 构造 build_artifact_draft 的 payload：只提交业务字段（title/scope/\n   parent_artifact_id/parent_artifact_version_id/narrative/blocks/availability/\n   limitations/methodology_input）；服务器补齐 schema_version/module/data_status，\n   模型不得提交这些字段。\n3. 校验失败按结构化字段级错误（path/type/reason）修正后重试。\n4. 经 publish_artifacts 发布后 BI 与 Excel 指向该 Version。\n5. 数据不足以 partial/unavailable + limitation 表达，不得编造数值。\n",
+      "content_digest": "e28dde1ae0a260eab9beebaeaa9a5fcf586e4c85df9b7a24fcf617ab2a386745",
+      "required_tools": [
+        "read_artifact",
+        "build_artifact_draft",
+        "publish_artifacts"
+      ],
+      "revision": 2,
+      "revision_id": "00000000-0048-4000-8000-000000000005",
+      "scope_key": "__global__",
+      "skill_name": "artifact-drilldown"
+    },
+    "brand-research-report": {
+      "artifact_contract": "brand_report_v3",
+      "content": "---\nname: brand-research-report\ndescription: 按 load_marketing_skill 的 model_input_contract 生成同版本品牌社媒研究 Artifact、BI 与 Excel。\n---\n\n# 品牌社媒研究报告\n\n确认品牌实体、日期窗口、平台、关键词和对比口径；决定性条件不足时调用\nrequest_clarification。MCP 标准 Tool Result 直接由你消费分析，不需要写入任何\n中间证据库，也不存在独立的 Evidence 检索步骤。\n\n1. 先调用 load_marketing_skill 获取本 Skill 的 model_input_contract（含\n   model_input_schema 与 concise_example）。\n2. 按 model_input_schema 构造 build_artifact_draft 的 payload：只提交\n   scope/data/narrative/availability/limitations/methodology_input；服务器负责\n   补齐 schema_version/module/data_status/canonical_data/field_lineage，不要\n   提交这些字段。\n3. 校验失败时按返回的结构化字段级错误（path/type/reason/retryable）逐条修正\n   后重试，不要猜测 Schema。\n4. 经 publish_artifacts 发布后，Artifact Version 与 BI、Excel 绑定同一 Version。\n5. 数据不足时把对应章节 availability 标为 partial/unavailable 并给出覆盖\n   limitations，不得编造数据，也不得把缺失当零。\n",
+      "content_digest": "d3b71aa5efea6c53c4e9fd4295f7bd962dd08ed3859db5d6e92a83339c6c889a",
+      "required_tools": [
+        "build_artifact_draft",
+        "publish_artifacts"
+      ],
+      "revision": 2,
+      "revision_id": "00000000-0048-4000-8000-000000000002",
+      "scope_key": "__global__",
+      "skill_name": "brand-research-report"
+    },
+    "campaign-evaluation-report": {
+      "artifact_contract": "campaign_report_v3",
+      "content": "---\nname: campaign-evaluation-report\ndescription: 按 load_marketing_skill 的 model_input_contract 生成活动效果评估 Artifact，并保持 BI 和 Excel 同版本。\n---\n\n# 活动效果评估\n\n确认活动身份、日期窗口、平台、比较范围和业务问题；缺少决定性范围时先澄清。\nMCP 标准 Tool Result 直接由你分析，不需要写入任何中间证据库。\n\n1. 先调用 load_marketing_skill 获取 model_input_contract（model_input_schema +\n   concise_example）。\n2. 按 schema 构造 build_artifact_draft 的 payload：只提交业务字段\n   （scope/data/narrative/availability/limitations/methodology_input）；服务器\n   补齐 schema_version/module/data_status/canonical_data/field_lineage。\n3. 校验失败按结构化字段级错误（path/type/reason）修正后重试。\n4. 经 publish_artifacts 发布后 BI 与 Excel 均指向该 Version。\n5. 禁止编造活动效果、付费归属或未返回的因果结论；数据缺失以 partial/\n   unavailable + limitation 表达。\n",
+      "content_digest": "e329a4d4d705f05893a226de3f598197ad3f69a00418e6d7f81072227637b3b5",
+      "required_tools": [
+        "build_artifact_draft",
+        "publish_artifacts"
+      ],
+      "revision": 2,
+      "revision_id": "00000000-0048-4000-8000-000000000003",
+      "scope_key": "__global__",
+      "skill_name": "campaign-evaluation-report"
+    },
+    "kol-selection-report": {
+      "artifact_contract": "kol_selection_v3",
+      "content": "---\nname: kol-selection-report\ndescription: 按 load_marketing_skill 的 model_input_contract 生成跨平台达人圈选与分析 Artifact。\n---\n\n# 达人圈选与分析\n\n确认品牌或品类、目标受众、平台、日期窗口、预算和筛选条件；条件不足以决定\n候选范围时请求澄清。MCP 标准 Tool Result（含平台/达人/报价/互动字段）直接由你\n分析，不需要写入任何中间证据库。\n\n1. 先调用 load_marketing_skill 获取 model_input_contract（model_input_schema +\n   concise_example）。\n2. 按 schema 构造 build_artifact_draft 的 payload：只提交业务字段\n   （scope/data/narrative/availability/limitations/methodology_input）；服务器\n   补齐 schema_version/module/data_status/canonical_data/field_lineage。\n3. 校验失败按结构化字段级错误（path/type/reason）修正后重试。\n4. 经 publish_artifacts 发布后 BI 与 Excel 指向同一 Artifact Version。\n5. 不得把空对象变成候选、不得在模型侧手工补写评分或伪造报价；缺失指标如实以\n   partial/unavailable + limitation 表达。\n",
+      "content_digest": "bc58c3b200d39b6a3065ea4dfa9f169658eee8e345a7eddc1988b6376e083c52",
+      "required_tools": [
+        "build_artifact_draft",
+        "publish_artifacts"
+      ],
+      "revision": 2,
+      "revision_id": "00000000-0048-4000-8000-000000000004",
+      "scope_key": "__global__",
+      "skill_name": "kol-selection-report"
+    },
+    "marketing-strategy": {
+      "artifact_contract": "strategy_advice_v1",
+      "content": "---\nname: marketing-strategy\ndescription: 基于真实 MCP Tool Result 与已发布 Artifact 提供受限、可说明依据的策略咨询。\n---\n\n# 营销策略咨询\n\n先判断用户要的是既有结果解释、正式研究、钻取还是开放式策略建议。策略建议\n优先引用已发布 Artifact Version 与真实 MCP Tool Result；范围、时效或覆盖不足时\n调用 request_clarification 澄清关键条件，必要时再查询 DataTap。\n\n- 建议必须区分事实、证据支持的推断和待验证假设，不把缺失数据包装成结论。\n- 策略咨询可纯文字回复：不要自动创建报告；只有用户需要可发布正式产物时才\n  加载对应专项 Skill，按其 model_input_contract 经 build_artifact_draft +\n  publish_artifacts 发布。\n- 数据受限时明确说明，禁止编造市场规模、预算、投放效果或用户偏好。\n",
+      "content_digest": "0727943c9c7ea1bacd524f5c23d86a7bbcfffbbb9f734fbaaeed5dd2ad95a8b0",
+      "required_tools": [
+        "read_artifact",
+        "request_clarification"
+      ],
+      "revision": 2,
+      "revision_id": "00000000-0048-4000-8000-000000000006",
+      "scope_key": "__global__",
+      "skill_name": "marketing-strategy"
+    },
+    "social-marketing-analyst": {
+      "artifact_contract": "marketing_root_v1",
+      "content": "---\nname: social-marketing-analyst\ndescription: 处理社媒营销研究、报告、钻取与策略咨询，并按需加载专项 Skill。\nrequired_tools:\n  - load_marketing_skill\n  - request_clarification\n  - publish_artifacts\nartifact_contract: marketing_root_v1\n---\n\n# 社媒营销分析总则\n\n仅处理品牌、活动、达人和社媒营销语境的问题。遇到非营销主题，按根策略固定\n回复后结束。根据用户目标按需加载品牌报告、活动评估、达人圈选、产物钻取或\n策略咨询专项 Skill。\n\n完整报告需要明确对象、日期窗口、平台及问题；信息不足时调用\nrequest_clarification 提出一个最关键的问题，此后不得继续查询或发布。\n\n- 任何正式输出都必须经 build_artifact_draft 按 load_marketing_skill 返回的\n  model_input_contract 构造输入，再经 publish_artifacts 发布；不能手写正式\n  payload、Excel 或 BI。\n- 每次正式产物调用前先加载对应 Skill 获取 model_input_schema 与\n  concise_example；校验失败按结构化字段级错误修正。\n- DataTap 错误、空结果和超时如实保留，不以编造数据或替代口径冒充原始结果。\n\n## 外部数据获取的止损纪律\n\n- 同一工具或同族工具连续 2 次返回服务端错误（如 50000、504 超时）时，停止对该工具族继续变参试探；将对应数据章节如实标记为数据受限（restricted/limitations），用已成功获取的数据继续完成报告。\n- 报告完成度优先于数据完备度：核心指标已可用时，不得因非核心章节缺数据而放弃发布正式产物；缺口写进 limitations 并向用户说明。\n- 单轮工具调用批量保持克制（建议 ≤3），重聚合类查询（趋势、明细帖子、达人榜、多维聚合）优先单独发起。\n",
+      "content_digest": "0ba44fbde575f99a733e9a74ee42bef940a04ad98d7fda269e1c8d7663d4c184",
+      "required_tools": [
+        "load_marketing_skill",
+        "request_clarification",
+        "publish_artifacts"
+      ],
+      "revision": 3,
+      "revision_id": "4eb2581a-6411-41ca-8bdb-7fb6487d21d0",
+      "scope_key": "__global__",
+      "skill_name": "social-marketing-analyst"
+    },
+    "workbook-export": {
+      "artifact_contract": "workbook_v1",
+      "content": "---\nname: workbook-export\ndescription: 根据同一通用 Report Version 选择安全、可复现的 Excel 布局投影。\n---\n\n# 通用 Excel 投影\n\n只有用户明确需要 Excel 时才选择 `workbook_v1` 布局。它只引用当前 Run 已发布的\n`analysis_report_v1` Version 与 Block ID，不复制业务事实，也不跨 Version 读取内容。\n可以声明 Sheet 顺序、列顺序、显示名、冻结表头、筛选、排序、超链接和分页意图；\n不要提交公式、宏、脚本、二进制文件或服务器路径。\n\n数量超过单 Sheet 的技术能力时应分页或拆 Sheet，不能静默丢行。导出失败要披露\n技术限制并保留 Report Version；同一 Version、Exporter 版本和布局应得到确定性\n且可复现的工作簿。\n",
+      "content_digest": "93f89b9141e8b2672bdbb45a372321f3e19e0f957d3298571006949a293cf43f",
+      "required_tools": [
+        "load_marketing_skill",
+        "read_artifact",
+        "publish_artifacts"
+      ],
+      "revision": 2,
+      "revision_id": "00000000-0048-4000-8000-000000000008",
+      "scope_key": "__global__",
+      "skill_name": "workbook-export"
+    }
+  },
+  "manifest_digest": "49adbfa6c111b2ae72b606ad56b220d04b68cb57be1d3c9159b6f9d1cf635305",
+  "run_id": "a04213cf-496f-4993-bcec-090d5c05061c",
+  "schema_version": "post_brand_skill_snapshot_v1"
+}

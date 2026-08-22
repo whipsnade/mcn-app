@@ -56,6 +56,12 @@ class SkillRevision(Base):
     description: Mapped[str] = mapped_column(String(512), nullable=False)
     required_tools: Mapped[list[Any]] = mapped_column(JSON, nullable=False)
     artifact_contract: Mapped[str | None] = mapped_column(String(96), nullable=True)
+    model_input_contract_version: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        default="direct_model_input_v1",
+        server_default="direct_model_input_v1",
+    )
     created_by: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )

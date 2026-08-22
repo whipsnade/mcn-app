@@ -47,12 +47,18 @@ export interface SkillSnapshotEntry {
   requiredTools: readonly string[];
   artifactContract: string | null;
   content: string;
+  /** skill_manifest_v2 only: frozen DB revision identity + input contract. */
+  revisionId?: string;
+  scopeKey?: string;
+  modelInputContractVersion?: string;
 }
 
 export interface SkillManifestSnapshot {
   entries: readonly SkillSnapshotEntry[];
   manifestDigest: string;
   sourceScope: "database_activation" | "legacy_pack";
+  /** Absent on historical claims = v1 digest algorithm; v2 freezes identity. */
+  schemaVersion?: "skill_manifest_v2";
 }
 
 export interface AdapterCatalogEntry {
@@ -82,6 +88,11 @@ export interface RuntimeSnapshot {
   allowedArtifactContracts: readonly string[];
   capabilityPackVersion?: string;
   capabilityPackManifestDigest?: string;
+  /**
+   * Server-generated artifact contract → model input contract version map
+   * (skill_manifest_v2 Runs). Historical claims without the field are v1.
+   */
+  artifactInputContractVersions?: Readonly<Record<string, string>>;
   /**
    * Server-owned per-Run model decision budget (runtime config
    * ``limits.max_decisions``).  Enforced synchronously at the provider
