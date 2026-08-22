@@ -235,6 +235,30 @@ async def test_unknown_keeps_reservation_and_records_compact_metadata_json(
 
 
 @pytest.mark.asyncio
+async def test_admin_adjust_accepts_long_audit_reference_for_active_member(
+    db_session, user_factory
+) -> None:
+    user = await user_factory()
+    membership = await db_session.scalar(
+        select(TenantMembership).where(TenantMembership.user_id == user.id)
+    )
+    assert membership is not None
+    accounting = TenantAccountingService(db_session)
+    await accounting.ensure_tenant_wallet(membership.tenant_id)
+
+    wallet, transaction = await accounting.admin_adjust(
+        membership.tenant_id,
+        user.id,
+        delta=1000,
+        idempotency_key="local-uat-wallet-20260822",
+        reference_id=f"{user.id}:local-uat-wallet-20260822",
+    )
+
+    assert wallet.balance == 1000
+    assert transaction.kind == "admin_adjust"
+
+
+@pytest.mark.asyncio
 async def test_preflight_rejects_unreviewed_tool_before_reservation(db_session, user_factory) -> None:
     user = await user_factory()
     await _seed_catalog(db_session)

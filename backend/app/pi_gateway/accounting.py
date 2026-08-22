@@ -891,8 +891,8 @@ class TenantAccountingService:
         context = McpPreflightContext(
             tenant_id=tenant_id,
             user_id=user_id,
-            run_id=f"admin:{reference_id}",
-            tool_call_id=f"admin:{reference_id}",
+            run_id="admin-adjust",
+            tool_call_id="admin-adjust",
             internal_tool_name="admin_adjust",
             service_slug="billing",
             arguments={},
