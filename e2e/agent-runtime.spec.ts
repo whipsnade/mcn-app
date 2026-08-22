@@ -762,7 +762,8 @@ test('restores historical run cards with replayed steps after reload', async ({ 
   // reload 后两张历史卡仍完整：步骤可见、thinking 折叠可回看。
   await page.reload();
   await ensureChatPane(page);
-  await expect(page.getByRole('button', { name: /执行卡 · 共 \d+ 步 · 分析完成/ })).toHaveCount(2);
+  // reload→refresh→历史 Run 回放链路在 CI 满载下偶发超默认 5s：放宽预算，语义不变。
+  await expect(page.getByRole('button', { name: /执行卡 · 共 \d+ 步 · 分析完成/ })).toHaveCount(2, { timeout: 20_000 });
   await page.getByRole('button', { name: /执行卡 · 共 \d+ 步 · 分析完成/ }).first().click();
   const historyCard = page.getByRole('region', { name: '执行卡' }).first();
   await expect(historyCard.getByText('brand_search', { exact: true })).toBeVisible();
