@@ -697,8 +697,9 @@ test('restores the session list after reload', async ({ page }) => {
   await expect(page.getByRole('button', { name: /选择会话 恢复会话/ })).toBeVisible();
 
   // reload 后经 refresh token 恢复登录态并重放会话列表（软删除不可见会话除外）。
+  // refresh→引导链路在 CI 满载下偶发超默认 5s：放宽预算，语义不变。
   await page.reload();
-  await expect(page.getByTitle('新建分析会话')).toBeVisible();
+  await expect(page.getByTitle('新建分析会话')).toBeVisible({ timeout: 20_000 });
   await expect(page.getByRole('button', { name: /选择会话 恢复会话/ })).toBeVisible();
 });
 
