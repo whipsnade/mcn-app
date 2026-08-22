@@ -374,3 +374,10 @@ DataTap≤5、积分≤50、retries=0、fresh Run=0。验收必须同时保存�
 并保留 append-only 证据。通过后只推进到
 `REAL_UAT_MCP_PASS_THROUGH_AND_CANCEL_PASS / READY_FOR_FINAL_FUNCTIONAL_UAT`；本轮不做 5%→25%→100%
 生产灰度。
+
+### 目录输入前置条件（2026-08-22）
+
+真实 Web UAT 的 58-tool 快照是审核目录输入前置条件，不是适配器容量目标。若真实 lifecycle discovery
+得到的 `approved + enabled` 工具数低于 58，必须停止于 Run 创建前；不得直接写 catalog、手工 seed、降低
+数量门槛或依历史文档扩张 allowlist。只有目录/安全审批提供可复核的 58-tool manifest 并经正常受控变更、
+真实刷新后，才可执行 128 entries/128 KiB Snapshot 核验和一次真实 Web UAT。

@@ -98,6 +98,13 @@ cd backend
 - 当前门禁为 `REAL_UAT_CATALOG_CLAIM_FIXED_PROVIDER_FAILED / NOT_READY_FOR_FINAL_FUNCTIONAL_UAT`。
   在新的 provider/发布授权和成功功能 UAT 前，不得合入 main、生产部署或执行灰度。
 
+### 2026-08-22 本地目录输入门禁
+
+本地隔离环境的真实 lifecycle discovery 实测只有 29 项 `approved + enabled` 工具（12/8/5/4）和一个
+quarantined `query_user_info`，与当前 `DYNAMIC_TOOL_ALLOWLIST` 的 29 项输入一致。它不满足本发布批次
+要求的 58-tool Snapshot 前置条件，且不是 adapter capacity 截断。真实 Web UAT A/B 必须保持未执行；等待
+可复核的 58-tool 审核 manifest 经正常受控变更、刷新并在 `kol_insight_test` 验证后，才可重新开始。
+
 ## UAT 部署
 
 - 连接：`ssh root@111.10.192.19`（密钥用 `~/.ssh` 下默认 id_ed25519/id_rsa，免密已配好；服务器主机名显示为 localhost）。
