@@ -287,7 +287,9 @@ async function login(page: Page, phone: string) {
   await page.getByPlaceholder('请输入11位中国手机号码').fill(phone);
   await page.getByRole('button', { name: '获取验证码' }).click();
   await page.getByRole('button', { name: '立即安全登录' }).click();
-  await expect(page.getByTitle('新建分析会话')).toBeVisible();
+  // CI runner 尾部用例满载时，真实登录接口 + 登录后引导可能超过默认 5s；
+  // 断言语义不变（工作区必须出现），只放宽等待预算（同 unread-dot 修法）。
+  await expect(page.getByTitle('新建分析会话')).toBeVisible({ timeout: 20_000 });
 }
 
 /** 小视口（<1280px）先切到 BI 面板（xl 桌面端常显，无需切换）。 */
