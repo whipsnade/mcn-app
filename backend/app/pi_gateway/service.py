@@ -111,6 +111,12 @@ def new_lease_token() -> str:
     return secrets.token_urlsafe(32)
 
 
+# pi-mcp-adapter 的 B 站代理名是 aktools，gateway 的 BACKEND_SERVICE_SLUGS 会把它
+# 回射为 `aktools-mcp`；真实 DataTap discovery 与受控 allowlist 的服务 slug 是
+# `bilibili-mcp`。preflight 输入边界归一到真实 slug，避免已审核 B 站工具被误拒。
+_PREFLIGHT_SERVICE_ALIASES = {"aktools-mcp": "bilibili-mcp"}
+
+
 def lease_expiry(now: datetime | None = None, seconds: int = 60) -> datetime:
     current = now or datetime.now(UTC).replace(tzinfo=None)
     return current + timedelta(seconds=seconds)
@@ -654,10 +660,11 @@ class PiGatewayService:
         # the leased gateway request locks the current Run row first.
         if run.cancel_requested:
             raise TenantAccountingError("run_cancel_requested")
+        server_slug = _PREFLIGHT_SERVICE_ALIASES.get(request.server, request.server)
         catalog = await self.db.scalar(
             select(McpToolCatalog).where(
                 McpToolCatalog.internal_tool_name == request.tool_name,
-                McpToolCatalog.service_slug == request.server,
+                McpToolCatalog.service_slug == server_slug,
                 McpToolCatalog.review_status == "approved",
                 McpToolCatalog.is_enabled.is_(True),
             )

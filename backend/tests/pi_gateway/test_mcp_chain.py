@@ -38,7 +38,7 @@ async def _seed_catalog(db_session) -> None:
     }
     db_session.add(
         McpToolCatalog(
-            id=str(uuid4()), service_slug="insight-cube-mcp", internal_tool_name="query_analysis_data",
+            id=str(uuid4()), service_slug="insight-cube-mcp", internal_tool_name="chain_probe_tool",
             reviewed_description="品牌声量统计", input_schema_json=schema, output_validator_version="v1",
             discovery_digest=_DIGEST, review_status="approved", is_enabled=True,
             created_at=now, updated_at=now,
@@ -46,7 +46,7 @@ async def _seed_catalog(db_session) -> None:
     )
     db_session.add(
         McpToolDiscovery(
-            id=str(uuid4()), service_slug="insight-cube-mcp", remote_name="query_analysis_data",
+            id=str(uuid4()), service_slug="insight-cube-mcp", remote_name="chain_probe_tool",
             description="品牌声量统计", input_schema_json=schema, output_schema_json=None,
             discovery_digest=_DIGEST, review_status="approved", discovered_at=now, updated_at=now,
         )
@@ -72,8 +72,8 @@ async def _pi_run(
     await db_session.flush()
     snapshot = _snapshot()
     snapshot["adapter_catalog"] = [{
-        "catalog_entry_id": "placeholder", "adapter_visible_name": "query_analysis_data",
-        "service": "insight-cube-mcp", "remote_name": "query_analysis_data",
+        "catalog_entry_id": "placeholder", "adapter_visible_name": "chain_probe_tool",
+        "service": "insight-cube-mcp", "remote_name": "chain_probe_tool",
         "input_schema_digest": f"sha256:{_DIGEST}",
     }]
     run = AgentRun(
@@ -86,7 +86,7 @@ async def _pi_run(
     db_session.add(run)
     await db_session.flush()
     catalog = await db_session.scalar(
-        select(McpToolCatalog).where(McpToolCatalog.internal_tool_name == "query_analysis_data")
+        select(McpToolCatalog).where(McpToolCatalog.internal_tool_name == "chain_probe_tool")
     )
     snapshot["adapter_catalog"][0]["catalog_entry_id"] = catalog.id
     run.runtime_config_snapshot_json = snapshot
@@ -113,7 +113,7 @@ async def _preflight(db_session, user_factory):
     permit = await service.preflight_mcp(
         run,
         PiGatewayMcpPreflightRequest(
-            tool_name="query_analysis_data", server="insight-cube-mcp", args={"keyword": "美妆"}
+            tool_name="chain_probe_tool", server="insight-cube-mcp", args={"keyword": "美妆"}
         ),
     )
     return user, run, attempt, tenant_id, service, permit
@@ -152,7 +152,7 @@ async def test_cancel_requested_run_is_rejected_before_mcp_reservation(db_sessio
         await service.preflight_mcp(
             run,
             PiGatewayMcpPreflightRequest(
-                tool_name="query_analysis_data", server="insight-cube-mcp", args={"keyword": "瑞幸咖啡"}
+                tool_name="chain_probe_tool", server="insight-cube-mcp", args={"keyword": "瑞幸咖啡"}
             ),
         )
 
@@ -275,3 +275,80 @@ async def test_preflight_rejects_unreviewed_tool_before_reservation(db_session, 
     assert list((await db_session.scalars(select(AgentToolCall).where(AgentToolCall.run_id == run.id))).all()) == []
     wallet = await db_session.get(TenantWallet, tenant_id)
     assert wallet is not None and (wallet.balance, wallet.reserved) == (1000, 0)
+
+
+@pytest.mark.asyncio
+async def test_preflight_accepts_gateway_aktools_alias_for_bilibili_catalog_rows(
+    db_session, user_factory
+) -> None:
+    """真实 DataTap discovery 的 B 站服务 slug 是 `bilibili-mcp`，而 pi-mcp-adapter 的
+    代理名是 aktools，gateway 的 BACKEND_SERVICE_SLUGS 会回射 `aktools-mcp`。
+    preflight 必须把该别名归一到真实 slug，否则已审核 B 站工具会被误拒
+    （`mcp_tool_not_allowed`，definitely_not_sent）。"""
+    user = await user_factory()
+    now = _now()
+    schema = {
+        "type": "object",
+        "properties": {"keyword": {"type": "string"}},
+        "required": ["keyword"],
+        "additionalProperties": False,
+    }
+    catalog = McpToolCatalog(
+        id=str(uuid4()), service_slug="bilibili-mcp", internal_tool_name="bilibili_alias_probe",
+        reviewed_description="B站内容关键词搜索", input_schema_json=schema,
+        output_validator_version="v1", discovery_digest=_DIGEST,
+        review_status="approved", is_enabled=True, created_at=now, updated_at=now,
+    )
+    db_session.add(catalog)
+    db_session.add(
+        McpToolDiscovery(
+            id=str(uuid4()), service_slug="bilibili-mcp", remote_name="bilibili_alias_probe",
+            description="B站内容关键词搜索", input_schema_json=schema, output_schema_json=None,
+            discovery_digest=_DIGEST, review_status="approved", discovered_at=now, updated_at=now,
+        )
+    )
+    membership = await db_session.scalar(
+        select(TenantMembership).where(TenantMembership.user_id == user.id)
+    )
+    assert membership is not None
+    session = AgentSession(
+        id=str(uuid4()), user_id=user.id, tenant_id=membership.tenant_id, title="aktools alias",
+        status="active", created_at=now, updated_at=now,
+    )
+    db_session.add(session)
+    await db_session.flush()
+    snapshot = _snapshot()
+    snapshot["adapter_catalog"] = [{
+        "catalog_entry_id": catalog.id, "adapter_visible_name": "bilibili_alias_probe",
+        "service": "bilibili-mcp", "remote_name": "general_search",
+        "input_schema_digest": f"sha256:{_DIGEST}",
+    }]
+    run = AgentRun(
+        id=str(uuid4()), session_id=session.id, user_id=user.id, tenant_id=membership.tenant_id,
+        runtime_backend="pi", runtime_config_version_id=None, runtime_config_snapshot_json=snapshot,
+        queued_at=None, profile_name="session_analyst_v1", profile_version="v1", model="fake-model",
+        status="running", decision_count=0, review_count=0, revision_count=0,
+        created_at=now, started_at=now, run_kind="user",
+    )
+    db_session.add(run)
+    db_session.add(
+        AgentRunAttempt(
+            id=str(uuid4()), run_id=run.id, attempt=1, started_at=now, outcome="running",
+            decision_count=0,
+        )
+    )
+    await db_session.flush()
+    await _fund(db_session, membership.tenant_id, user.id)
+    service = PiGatewayService(db_session, gateway_id="gw-chain")
+
+    permit = await service.preflight_mcp(
+        run,
+        PiGatewayMcpPreflightRequest(
+            tool_name="bilibili_alias_probe", server="aktools-mcp", args={"keyword": "瑞幸咖啡"}
+        ),
+    )
+
+    assert permit.permit_id is not None
+    assert permit.catalog_entry_id == catalog.id
+    wallet = await db_session.get(TenantWallet, membership.tenant_id)
+    assert wallet is not None and (wallet.balance, wallet.reserved) == (990, 10)
