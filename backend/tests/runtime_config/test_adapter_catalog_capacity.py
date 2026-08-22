@@ -114,13 +114,25 @@ async def test_reviewed_adapter_catalog_rejects_canonical_json_over_128_kib() ->
         discovery_digest="a" * 64,
     )
 
-    class Result:
+    class ScalarResult:
         def all(self):
-            return [(row, None)]
+            return [row]
+
+    class CatalogResult:
+        def scalars(self):
+            return ScalarResult()
+
+    class DiscoveryResult:
+        def all(self):
+            return []
 
     class Database:
+        def __init__(self):
+            self.calls = 0
+
         async def execute(self, _statement):
-            return Result()
+            self.calls += 1
+            return CatalogResult() if self.calls == 1 else DiscoveryResult()
 
     service = RuntimeConfigService(Database(), cipher=_cipher())
     with pytest.raises(RuntimeConfigError, match="runtime_adapter_catalog_too_large"):
