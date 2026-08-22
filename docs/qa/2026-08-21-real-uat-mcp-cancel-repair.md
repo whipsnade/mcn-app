@@ -507,3 +507,21 @@ READY_FOR_FINAL_FUNCTIONAL_UAT_REVIEW`；在此之前不得合入 main、生产�
 - 审查确认独立 pump/heartbeat 解耦、同步 257 事件、批次/ACK/幂等/route broker/terminal drain/cancel/recovery、metadata-only
   诊断和 StrictInt 均无 Critical/Important 问题；未发现 provider、DataTap、wallet、catalog、Artifact、required-artifact 或历史数据越界修改。
 - 本轮状态可推进至 `READY_FOR_SINGLE_REAL_WEB_UAT_REAUTHORIZATION`，但不等同于真实 UAT 通过；下一步仍需新的明确授权后才可执行唯一一次真实 Web UAT。
+
+## 12. 本地隔离 UAT 目录输入阻断（2026-08-22）
+
+- 本地候选为 `ff66286d07f732d9a22a3d9032cdb260d396ca91`，隔离数据库身份确认
+  `kol_insight_test` / `kol_test@localhost`，访问 `kol_insight` 和 `kol_insight_b7_uat` 均被拒绝。
+- FastAPI 生命周期使用真实 DataTap discovery 正常刷新后，`approved + enabled` catalog 实测为 29 项：
+  `insight-cube-mcp=12`、`social-grow-mcp=8`、`social-grow-content-mcp=5`、`bilibili-mcp=4`；
+  `query_user_info` 保持 quarantined。当前 `DYNAMIC_TOOL_ALLOWLIST` 也恰为相同 29 项。
+- 因此该结果不是 128 entries/128 KiB adapter capacity 修复的截断回归。历史文档里的 58 项
+  （24/16/10/8）没有对应的当前受控 allowlist/manifest、Schema 和 discovery 签名来源，不能作为运行时
+  审核输入直接恢复。
+- 本轮不直接写 catalog、不手工 seed、不降低 58 项门槛、不扩张 allowlist，也未创建任何真实业务
+  Session/Run/Attempt、模型请求、DataTap dispatch 或积分扣费。UAT A/B 均标记为未执行，不能宣称
+  `LOCAL_REAL_UAT_MCP_PASS_THROUGH_AND_CANCEL_PASS` 或 `LOCAL_FINAL_FUNCTIONAL_UAT_PASS`。
+- 前置条件：目录/安全审批责任方须提供可追溯的 58-tool 审核 manifest（内部名、远端名、服务、审核描述、
+  输入/输出 Schema、启用/批准状态与可复核版本或签名）。该输入经正常受控变更和真实 lifecycle refresh 后，
+  必须在 `kol_insight_test` 生成恰好 58 项 `approved + enabled`，才可重新冻结 128 entries/128 KiB
+  Snapshot 并执行授权的真实 Web UAT。

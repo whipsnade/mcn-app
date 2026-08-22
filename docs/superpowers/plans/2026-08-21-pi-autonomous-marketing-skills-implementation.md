@@ -324,6 +324,15 @@ Run 必须有当前 Run/Session/tenant 归属下至少一个已发布、不可�
 - [ ] 生产灰度 `5% → 25% → 100%`，完成生产验收、监控、文档封口和回滚演练记录，最终状态才可写为
   `PRODUCTION_RELEASE_COMPLETE`。
 
+### Task 14：本地目录输入门禁（2026-08-22）
+
+- [x] 在 `kol_insight_test` 以真实 lifecycle discovery 复核当前受控目录：29 项 `approved + enabled`
+  （12/8/5/4）与 `DYNAMIC_TOOL_ALLOWLIST` 完全一致，另有 `query_user_info` quarantined。
+- [x] 不将历史 58 项文档当作可执行审核输入；不直接写 catalog、不 seed、不降低门槛、不扩张 allowlist，
+  并停止真实业务 Web UAT A/B，保留零业务 Run/模型/DataTap/积分事实。
+- [ ] 等待目录/安全审批提供可复核的 58-tool manifest，经正常受控变更和 lifecycle refresh 后重启本地
+  128 entries/128 KiB Snapshot 核验与真实 Web UAT。
+
 ### Task 14：Provider failure 安全可观测性与诊断探针（2026-08-21 重新授权）
 
 - [x] 先锁定旧 Run 根因不可恢复边界：旧 Worker 只有 error 布尔值，旧异常无分类，Child IPC 只有
