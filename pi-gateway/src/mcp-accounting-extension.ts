@@ -73,6 +73,112 @@ export interface McpAccountingControlPlane {
 }
 
 const FREE_DISCOVERY_TOOLS = new Set(["connect", "search", "list"]);
+
+/**
+ * Per-server dispatch gate tuning（非密钥）。默认并发 1、有界等待 300s、
+ * 单次调用墙钟 150s；等待超时发生在 preflight 之前——无 ToolCall 行、无预留、
+ * 零计费。墙钟超时只释放串行槽位（活性），账务永远跟随最终 tool_result。
+ */
+export interface McpDispatchGateOptions {
+  /** 同一 server 允许的最大在飞调用数（默认 1）。 */
+  maxInflight?: number;
+  /** 槽位有界等待上限（毫秒，默认 300_000）。 */
+  slotWaitMs?: number;
+  /** 单次 MCP 调用墙钟超时（毫秒，默认 150_000，钳制 1..600_000）。 */
+  callTimeoutMs?: number;
+}
+
+const DEFAULT_MAX_INFLIGHT = 1;
+const DEFAULT_SLOT_WAIT_MS = 300_000;
+const MAX_INFLIGHT_LIMIT = 32;
+const SLOT_WAIT_LIMIT_MS = 600_000;
+const DEFAULT_CALL_TIMEOUT_MS = 150_000;
+const CALL_TIMEOUT_LIMIT_MS = 600_000;
+
+/** 从非密钥调优 env 键读取闸门配置（装配时读一次；非法值回退默认）。 */
+export function readMcpDispatchGateOptions(env: NodeJS.ProcessEnv): McpDispatchGateOptions {
+  const inflight = Number.parseInt(env.PI_MCP_SERVER_MAX_INFLIGHT ?? "", 10);
+  const wait = Number.parseInt(env.PI_MCP_SLOT_WAIT_MS ?? "", 10);
+  const callTimeout = Number.parseInt(env.PI_MCP_CALL_TIMEOUT_MS ?? "", 10);
+  return {
+    ...(Number.isSafeInteger(inflight) && inflight >= 1 && inflight <= MAX_INFLIGHT_LIMIT
+      ? { maxInflight: inflight }
+      : {}),
+    ...(Number.isSafeInteger(wait) && wait >= 0 && wait <= SLOT_WAIT_LIMIT_MS
+      ? { slotWaitMs: wait }
+      : {}),
+    ...(Number.isSafeInteger(callTimeout)
+      ? { callTimeoutMs: Math.min(CALL_TIMEOUT_LIMIT_MS, Math.max(1, callTimeout)) }
+      : {}),
+  };
+}
+
+interface PerServerDispatchGate {
+  acquire(server: string): Promise<boolean>;
+  release(server: string): void;
+}
+
+/**
+ * 进程内 per-server 串行闸：排队而不是拒绝，不同 server 互不阻塞。
+ * 等待超时的调用者收到 false（调用方在 preflight 之前短路，零计费）。
+ */
+export function createPerServerDispatchGate(
+  options: McpDispatchGateOptions = {},
+): PerServerDispatchGate {
+  const maxInflight = Math.min(
+    MAX_INFLIGHT_LIMIT,
+    Math.max(1, options.maxInflight ?? DEFAULT_MAX_INFLIGHT),
+  );
+  const waitMs = Math.min(
+    SLOT_WAIT_LIMIT_MS,
+    Math.max(0, options.slotWaitMs ?? DEFAULT_SLOT_WAIT_MS),
+  );
+  const inflight = new Map<string, number>();
+  const waiters: Array<{
+    server: string;
+    resolve: (granted: boolean) => void;
+    timer: ReturnType<typeof setTimeout>;
+  }> = [];
+
+  const acquire = (server: string): Promise<boolean> =>
+    new Promise<boolean>((resolve) => {
+      const current = inflight.get(server) ?? 0;
+      if (current < maxInflight) {
+        inflight.set(server, current + 1);
+        resolve(true);
+        return;
+      }
+      const waiter = {
+        server,
+        resolve,
+        timer: setTimeout(() => {
+          const index = waiters.indexOf(waiter);
+          if (index >= 0) waiters.splice(index, 1);
+          resolve(false);
+        }, waitMs),
+      };
+      // 有界等待计时不得阻止 worker 进程退出。
+      waiter.timer.unref?.();
+      waiters.push(waiter);
+    });
+
+  const release = (server: string): void => {
+    const index = waiters.findIndex((waiter) => waiter.server === server);
+    if (index >= 0) {
+      const [waiter] = waiters.splice(index, 1);
+      clearTimeout(waiter.timer);
+      // 槽位直接转移给队首等待者，inflight 计数保持不变。
+      waiter.resolve(true);
+      return;
+    }
+    const current = inflight.get(server) ?? 0;
+    const next = Math.max(0, current - 1);
+    if (next === 0) inflight.delete(server);
+    else inflight.set(server, next);
+  };
+
+  return { acquire, release };
+}
 const UNKNOWN_MCP_SOURCES = new Set<UnknownMcpSource>([
   "call_failed",
   "aborted",
@@ -255,19 +361,19 @@ export function classifyMcpFailure(
   details: Record<string, unknown>,
   isError = false,
 ): FailureClassification {
+  // 冻结合同（按序短路）：响应确认信号（SDK isError = 收到标准 MCP error
+  // 响应）优先于 adapter error code——供应商已确认返回错误响应的调用按
+  // failed_confirmed 收口释放，只有无响应信号时才 fail-safe 到 result_unknown。
   if (errorCode === "tool_error") return "failed_confirmed";
-  if (errorCode === "call_failed") return "result_unknown";
   if (errorCode !== undefined && NO_DISPATCH_ERROR_CODES.has(errorCode)) return "definitely_not_sent";
+  if (isError) return "failed_confirmed";
   const explicit = details.classification;
   if (
     explicit === "definitely_not_sent"
     || explicit === "failed_confirmed"
     || explicit === "result_unknown"
   ) return explicit;
-  // 仅标准 MCP Tool Error（isError 且无 adapter error code）可确认外发并
-  // 归为 failed_confirmed；带未知 error code 的结果无法确认是否已外发，
-  // 必须 fail-safe 到 result_unknown 并保持预留。
-  if (isError && errorCode === undefined) return "failed_confirmed";
+  if (errorCode === "call_failed") return "result_unknown";
   return "result_unknown";
 }
 
@@ -358,27 +464,99 @@ export function buildMcpFailureMetadata(
 export function createMcpAccountingExtensionFactory(
   accounting: McpAccountingExtension,
   bindings: readonly McpToolBinding[] = [],
+  gateOptions: McpDispatchGateOptions = {},
 ): ExtensionFactory {
+  // 生产从非密钥 env 调优键读取默认值；显式 options 优先（测试/注入用）。
+  const resolved = {
+    ...readMcpDispatchGateOptions(process.env),
+    ...gateOptions,
+  };
+  const gate = createPerServerDispatchGate(resolved);
+  const callTimeoutMs = Math.min(
+    CALL_TIMEOUT_LIMIT_MS,
+    Math.max(1, resolved.callTimeoutMs ?? DEFAULT_CALL_TIMEOUT_MS),
+  );
   return (pi) => {
     const permits = new Map<string, McpPermit>();
+    // toolCallId → 占用槽位的 server；tool_result 的所有出口都经 releaseSlot
+    // 释放且恰好一次，杜绝槽位泄漏。看门狗释放同样经 slotServers 幂等化。
+    const slotServers = new Map<string, string>();
+    const watchdogs = new Map<string, ReturnType<typeof setTimeout>>();
     const hooks = pi as unknown as {
       on(event: "tool_call", handler: (event: ToolCallEvent) => Promise<unknown>): void;
       on(event: "tool_result", handler: (event: ToolResultEvent) => Promise<unknown>): void;
+    };
+
+    // 墙钟看门狗：permit 授予后启动、不可重置。超时只释放串行槽位（活性），
+    // 绝不提前 fail/finalize——晚到的 tool_result 仍按真实证据收口（成功
+    // settle / 标准错误 failed_confirmed / 无响应 unknown）。已知并接受的
+    // 残留：超时后同 server 短暂出现「僵尸 + 新调用」=2 在飞，观察者位无法
+    // 中止 adapter 已发出的 HTTP；账务正确性不受影响。
+    const startWatchdog = (toolCallId: string, server: string): void => {
+      const timer = setTimeout(() => {
+        watchdogs.delete(toolCallId);
+        if (slotServers.get(toolCallId) === server) {
+          slotServers.delete(toolCallId);
+          gate.release(server);
+        }
+      }, callTimeoutMs);
+      timer.unref?.();
+      watchdogs.set(toolCallId, timer);
+    };
+    const clearWatchdog = (toolCallId: string): void => {
+      const timer = watchdogs.get(toolCallId);
+      if (timer === undefined) return;
+      clearTimeout(timer);
+      watchdogs.delete(toolCallId);
     };
 
     hooks.on("tool_call", async (event: ToolCallEvent) => {
       const input = toMcpToolCall(event, bindings);
       if (input === undefined) return;
       if ("block" in input) return input;
-      const decision = await accounting.beforeToolCall(input);
-      if ("block" in decision && decision.block) return decision;
-      if ("permit_id" in decision) permits.set(event.toolCallId, decision);
-      return undefined;
+      // 免费发现工具不占槽：目录读取零计费，不参与串行闸。
+      if (!FREE_DISCOVERY_TOOLS.has(input.tool)) {
+        const granted = await gate.acquire(input.server);
+        if (!granted) {
+          // 等待超时发生在 preflight 之前：无 ToolCall、无预留、零计费；
+          // 模型看到可恢复结构化错误自行调整，内核不自动重试。
+          return { block: true, reason: "mcp_server_busy" };
+        }
+      }
+      const gated = !FREE_DISCOVERY_TOOLS.has(input.tool);
+      try {
+        const decision = await accounting.beforeToolCall(input);
+        if ("block" in decision && decision.block) {
+          if (gated) gate.release(input.server);
+          return decision;
+        }
+        if ("permit_id" in decision) {
+          permits.set(event.toolCallId, decision);
+          if (gated) {
+            slotServers.set(event.toolCallId, input.server);
+            startWatchdog(event.toolCallId, input.server);
+          }
+        } else if (gated) {
+          gate.release(input.server);
+        }
+        return undefined;
+      } catch (error) {
+        if (gated) gate.release(input.server);
+        throw error;
+      }
     });
 
     hooks.on("tool_result", async (event: ToolResultEvent) => {
+      // 自然 tool_result 到达即清掉墙钟计时器（幂等：未启动时 no-op）。
+      clearWatchdog(event.toolCallId);
       const permit = permits.get(event.toolCallId);
       if (!permit) return;
+      const server = slotServers.get(event.toolCallId);
+      const releaseSlot = (): void => {
+        if (server === undefined) return;
+        slotServers.delete(event.toolCallId);
+        gate.release(server);
+      };
       const details = isRecord(event.details) ? event.details : {};
       const errorCode = typeof details.error === "string" ? details.error : undefined;
       const hasErrorMarker = Object.prototype.hasOwnProperty.call(details, "error")
@@ -391,10 +569,13 @@ export function createMcpAccountingExtensionFactory(
           await accounting.afterToolError(permit, "result_unknown",
             buildMcpFailureMetadata(source, errorCode, details, event.isError === true));
           permits.delete(event.toolCallId);
+          releaseSlot();
           return true;
         } catch {
           // No durable ACK means the permit remains recoverable for backend
           // reconciliation; deleting it here would lose the reservation.
+          // 槽位仍必须释放：调用本身已结束，不能占住 per-server 闸。
+          releaseSlot();
           return false;
         }
       };
@@ -407,19 +588,22 @@ export function createMcpAccountingExtensionFactory(
             event.isError === true,
           );
           try {
+            // result_unknown 与 failed_confirmed 都携带 metadata-only 失败
+            // 元数据；只有 definitely_not_sent（本地未外发）维持 undefined。
             await accounting.afterToolError(
               permit,
               classification,
-              classification === "result_unknown"
-                ? buildMcpFailureMetadata(
+              classification === "definitely_not_sent"
+                ? undefined
+                : buildMcpFailureMetadata(
                     errorCode === "call_failed" ? "call_failed" : "other",
                     errorCode,
                     details,
                     event.isError === true,
-                  )
-                : undefined,
+                  ),
             );
             permits.delete(event.toolCallId);
+            releaseSlot();
           } catch (error) {
             await failUnknown(unknownMcpSource(error, "finalize_ack_unknown"));
           }
@@ -429,6 +613,7 @@ export function createMcpAccountingExtensionFactory(
         // `event.content` is left untouched and is never passed to accounting.
         await accounting.afterToolResult(permit, buildMcpFinalizeMetadata(details));
         permits.delete(event.toolCallId);
+        releaseSlot();
       } catch (error) {
         await failUnknown(unknownMcpSource(error, "finalize_ack_unknown"));
       }

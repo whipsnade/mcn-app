@@ -6,7 +6,9 @@ from app.pi_gateway.contracts import (
     PiGatewayClaimResponse,
     PiGatewayInternalToolRequest,
     PiGatewaySourceEvent,
+    PiGatewaySourceEventBatch,
     PiGatewayTerminalRequest,
+    PiGatewayProviderFailureMetadata,
     RuntimeSecretEnvelope,
 )
 
@@ -143,5 +145,126 @@ def test_usage_event_is_a_bounded_internal_projection() -> None:
                 "sequence": 3,
                 "event_type": "usage",
                 "payload": {"input_tokens": 1, "raw_response": "secret"},
+            }
+        )
+
+
+def test_source_event_batch_is_strict_bounded_and_contiguous() -> None:
+    events = [
+        PiGatewaySourceEvent.model_validate(
+            {
+                "source_event_id": f"attempt-batch:{sequence}",
+                "sequence": sequence,
+                "event_type": "message.start",
+                "payload": {},
+            }
+        )
+        for sequence in (1, 2)
+    ]
+    assert PiGatewaySourceEventBatch(events=events).events == events
+    with pytest.raises(ValidationError):
+        PiGatewaySourceEvent.model_validate(
+            {
+                "source_event_id": "attempt-batch:1",
+                "sequence": "1",
+                "event_type": "message.start",
+                "payload": {},
+            }
+        )
+    with pytest.raises(ValidationError, match="pi_gateway_event_batch_attempt_mismatch"):
+        PiGatewaySourceEventBatch.model_validate(
+            {"events": [events[0], {**events[1].model_dump(), "source_event_id": "other:2"}]}
+        )
+    with pytest.raises(ValidationError, match="pi_gateway_event_batch_sequence_gap"):
+        PiGatewaySourceEventBatch.model_validate(
+            {"events": [events[0], {**events[1].model_dump(), "sequence": 3, "source_event_id": "attempt-batch:3"}]}
+        )
+    with pytest.raises(ValidationError):
+        PiGatewaySourceEventBatch.model_validate(
+            {
+                "events": [
+                    {
+                        "source_event_id": f"attempt-large:{sequence}",
+                        "sequence": sequence,
+                        "event_type": "message.delta",
+                        "payload": {"text": "x" * 16_000},
+                    }
+                    for sequence in range(1, 10)
+                ]
+            }
+        )
+def test_provider_failure_metadata_is_strict_and_terminal_only() -> None:
+    metadata = PiGatewayProviderFailureMetadata.model_validate(
+        {
+            "version": "provider_failure_v1",
+            "failure_class": "rate_limited",
+            "http_status": 429,
+            "provider_request_id": "req_safe-123",
+            "error_fingerprint": "a" * 64,
+            "observed_at": "2026-08-21T08:00:00.000Z",
+        }
+    )
+    request = PiGatewayTerminalRequest.model_validate(
+        {
+            "attempt_id": "attempt-1",
+            "outcome": "failed",
+            "payload": {"code": "pi_model_provider_error"},
+            "failure_metadata": metadata.model_dump(mode="json"),
+        }
+    )
+    assert request.failure_metadata == metadata
+    arbitrary_safe_id = PiGatewayProviderFailureMetadata.model_validate(
+        {
+            "version": "provider_failure_v1",
+            "failure_class": "unknown",
+            "provider_request_id": "provider-req-123",
+            "error_fingerprint": "b" * 64,
+        }
+    )
+    assert arbitrary_safe_id.provider_request_id == "provider-req-123"
+    with pytest.raises(ValidationError):
+        PiGatewayProviderFailureMetadata.model_validate(
+            {**metadata.model_dump(), "extra": "tampered"}
+        )
+    with pytest.raises(ValidationError):
+        PiGatewayProviderFailureMetadata.model_validate(
+            {**metadata.model_dump(), "http_status": 99}
+        )
+    with pytest.raises(ValidationError):
+        PiGatewayProviderFailureMetadata.model_validate(
+            {**metadata.model_dump(), "provider_request_id": "Bearer secret"}
+        )
+    with pytest.raises(ValidationError):
+        PiGatewayProviderFailureMetadata.model_validate(
+            {**metadata.model_dump(), "observed_at": "2026-02-30T08:00:00.000Z"}
+        )
+    with pytest.raises(ValidationError):
+        PiGatewayProviderFailureMetadata.model_validate(
+            {**metadata.model_dump(), "http_status": None}
+        )
+    with pytest.raises(ValidationError):
+        PiGatewayTerminalRequest.model_validate(
+            {
+                "attempt_id": "attempt-1",
+                "outcome": "completed",
+                "payload": {},
+                "failure_metadata": metadata.model_dump(mode="json"),
+            }
+        )
+    with pytest.raises(ValidationError):
+        PiGatewayTerminalRequest.model_validate(
+            {
+                "attempt_id": "attempt-1",
+                "outcome": "failed",
+                "payload": {"failure_metadata": {"errorMessage": "api_key=secret"}},
+            }
+        )
+    with pytest.raises(ValidationError):
+        PiGatewayTerminalRequest.model_validate(
+            {
+                "attempt_id": "attempt-1",
+                "outcome": "failed",
+                "payload": {"code": "worker_error"},
+                "failure_metadata": metadata.model_dump(mode="json"),
             }
         )

@@ -1,7 +1,19 @@
 import type { PiGatewayClaimResponse, PiGatewaySourceEvent } from "./protocol.js";
 import { ControlPlaneBusinessError } from "./control-plane-client.js";
-import { isDecisionLimitError, isProviderFailureError } from "./model-request-budget.js";
+import {
+  getProviderFailureMetadata,
+  isDecisionLimitError,
+  isProviderFailureError,
+} from "./model-request-budget.js";
+import type { ProviderFailureMetadata } from "./provider-failure.js";
 import { WorkerPool } from "./worker-pool.js";
+import {
+  EventDeliveryPump,
+  classifyEventDeliveryFailure,
+  eventDeliveryLatencyBucket,
+  type EventDeliveryDiagnostic,
+  type EventDeliveryFailure,
+} from "./event-delivery.js";
 
 export type PiGatewayInfrastructureCode =
   | "gateway_lost"
@@ -105,12 +117,18 @@ export interface GatewayControlPlane {
     signal?: AbortSignal,
   ): Promise<{ cancel_requested?: boolean; lease_expires_at?: number } | undefined>;
   sendEvent?(runId: string, event: PiGatewaySourceEvent, leaseToken: string): Promise<unknown>;
+  sendEventBatch?(
+    runId: string,
+    events: readonly PiGatewaySourceEvent[],
+    leaseToken: string,
+  ): Promise<unknown>;
   terminal(
     runId: string,
     attemptId: string,
     outcome: "completed" | "completed_with_warnings" | "failed" | "cancelled",
     leaseToken: string,
     payload?: Record<string, unknown>,
+    failureMetadata?: ProviderFailureMetadata,
   ): Promise<unknown>;
 }
 
@@ -132,6 +150,8 @@ export interface PiGatewayOptions {
   controlTimeoutMs?: number;
   shutdownTimeoutMs?: number;
   maxBufferedEvents?: number;
+  eventDeliveryRetryBaseMs?: number;
+  onEventDeliveryDiagnostic?: (diagnostic: EventDeliveryDiagnostic) => void;
 }
 
 export type PiGatewayDispatch =
@@ -150,7 +170,10 @@ export class PiGateway {
   private readonly controlTimeoutMs: number;
   private readonly shutdownTimeoutMs: number;
   private readonly maxBufferedEvents: number;
+  private readonly eventDeliveryRetryBaseMs: number;
+  private readonly onEventDeliveryDiagnostic: (diagnostic: EventDeliveryDiagnostic) => void;
   private readonly workerPids = new Set<number>();
+  private readonly eventPumps = new Set<EventDeliveryPump>();
   private stopped = false;
 
   constructor(options: PiGatewayOptions) {
@@ -162,6 +185,8 @@ export class PiGateway {
     this.controlTimeoutMs = Math.max(25, options.controlTimeoutMs ?? 15_000);
     this.shutdownTimeoutMs = Math.max(1, options.shutdownTimeoutMs ?? 10_000);
     this.maxBufferedEvents = options.maxBufferedEvents ?? 256;
+    this.eventDeliveryRetryBaseMs = Math.max(1, Math.min(1_000, options.eventDeliveryRetryBaseMs ?? 100));
+    this.onEventDeliveryDiagnostic = options.onEventDeliveryDiagnostic ?? (() => undefined);
     if (!Number.isInteger(this.maxBufferedEvents) || this.maxBufferedEvents < 1 || this.maxBufferedEvents > 100_000) {
       throw new Error("pi_gateway_event_buffer_limit_invalid");
     }
@@ -210,38 +235,21 @@ export class PiGateway {
       let unregisterEvents: (() => void) | undefined;
       let eventBufferError: PiGatewayInfrastructureError | undefined;
       let eventBufferAbort: Promise<void> | undefined;
-      const eventBuffer = new BoundedGatewayEventBuffer<PiGatewaySourceEvent>(this.maxBufferedEvents);
-      let eventFlushBlocked = false;
-      let eventFlushPromise: Promise<void> | undefined;
+      const legacyEventBuffer = this.controlPlane.sendEvent || this.controlPlane.sendEventBatch
+        ? undefined
+        : new BoundedGatewayEventBuffer<PiGatewaySourceEvent>(this.maxBufferedEvents);
+      let eventPump: EventDeliveryPump | undefined;
       let terminalFailureAttempted = false;
-      const flushEvents = async (): Promise<void> => {
-        const sendEvent = this.controlPlane.sendEvent;
-        if (!sendEvent || eventFlushBlocked || eventBufferError) return;
-        if (eventFlushPromise) {
-          await eventFlushPromise;
-          return;
-        }
-        eventFlushPromise = (async () => {
-          while (eventBuffer.size > 0 && !eventBufferError) {
-            const event = eventBuffer.peek();
-            if (!event) return;
-            try {
-              await sendEvent.call(this.controlPlane, claim.run_id, event, claim.lease_token);
-              eventBuffer.shift();
-            } catch (error) {
-              eventFlushBlocked = true;
-              this.onError(asPiGatewayInfrastructureError(error)
-                ?? new PiGatewayInfrastructureError("control_plane_unreachable", error));
-              return;
-            }
-          }
-        })().finally(() => { eventFlushPromise = undefined; });
-        await eventFlushPromise;
-      };
       const drainProjectedEvents = async (): Promise<boolean> => {
-        // A control plane without source-event support is used by legacy/local
-        // callers; there is no durable queue to drain in that mode.
-        if (!this.controlPlane.sendEvent) {
+        if (eventPump) {
+          const drained = await eventPump.drain();
+          if (!drained && eventBufferError) {
+            await eventBufferAbort;
+            this.onError(eventBufferError);
+          }
+          return drained;
+        }
+        if (legacyEventBuffer) {
           if (eventBufferError) {
             await eventBufferAbort;
             this.onError(eventBufferError);
@@ -249,16 +257,9 @@ export class PiGateway {
           }
           return true;
         }
-        while (eventBuffer.size > 0 && !eventBufferError && !eventFlushBlocked) {
-          await flushEvents();
-        }
         if (eventBufferError) {
           await eventBufferAbort;
           this.onError(eventBufferError);
-          return false;
-        }
-        if (eventFlushBlocked || eventBuffer.size > 0) {
-          this.onError(new PiGatewayInfrastructureError("control_plane_unreachable"));
           return false;
         }
         return true;
@@ -301,10 +302,62 @@ export class PiGateway {
       const maxConsecutiveHeartbeatFailures = 2;
       let consecutiveHeartbeatFailures = 0;
       let beatInFlight = false;
+      const markEventDeliveryFailure = (failure: EventDeliveryFailure): void => {
+        if (eventBufferError) return;
+        eventBufferError = new PiGatewayInfrastructureError(failure.code, failure);
+        eventBufferAbort = Promise.resolve(handle?.abort?.()).catch((error) => {
+          this.onError(asPiGatewayInfrastructureError(error) ?? error);
+        });
+      };
+      if (this.controlPlane.sendEvent || this.controlPlane.sendEventBatch) {
+        eventPump = new EventDeliveryPump({
+          runId: claim.run_id,
+          attemptId: claim.attempt_id,
+          leaseToken: claim.lease_token,
+          sendEventBatch: this.controlPlane.sendEventBatch === undefined
+            ? undefined
+            : (runId, events, leaseToken) => this.controlPlane.sendEventBatch!(runId, events, leaseToken),
+          sendEvent: this.controlPlane.sendEvent === undefined
+            ? undefined
+            : (runId, event, leaseToken) => this.controlPlane.sendEvent!(runId, event, leaseToken),
+          maxBufferedEvents: this.maxBufferedEvents,
+          retryBaseMs: this.eventDeliveryRetryBaseMs,
+          canRetry: (delayMs) => (
+            !this.stopped &&
+            heartbeatOutcome !== "lost" &&
+            !beatsStopped &&
+            Date.now() + delayMs + abortGraceMs < leaseDeadlineMs
+          ),
+          onDiagnostic: (diagnostic) => this.onEventDeliveryDiagnostic(diagnostic),
+          onPermanentFailure: markEventDeliveryFailure,
+        });
+        this.eventPumps.add(eventPump);
+      }
+      const reportControlPlaneFailure = (
+        operation: "heartbeat" | "terminal",
+        error: unknown,
+        consecutiveFailures: number,
+        startedAt: number,
+      ): void => {
+        const classified = classifyEventDeliveryFailure(error);
+        this.onEventDeliveryDiagnostic({
+          operation,
+          kind: "failure",
+          failure_class: classified.failureClass,
+          ...(classified.status === undefined ? {} : { status: classified.status }),
+          queue_depth: eventPump?.queueDepth ?? 0,
+          queue_high_water: eventPump?.highWater ?? 0,
+          batch_size: 0,
+          last_acked_source_sequence: eventPump?.lastAckedSequence ?? null,
+          consecutive_failures: consecutiveFailures,
+          latency_bucket: eventDeliveryLatencyBucket(Math.max(0, Date.now() - startedAt)),
+        });
+      };
       const markLost = (cause: unknown): void => {
         if (heartbeatFailed) return;
         heartbeatFailed = true;
         heartbeatOutcome = "lost";
+        eventPump?.stop();
         heartbeatError = asPiGatewayInfrastructureError(cause)
           ?? new PiGatewayInfrastructureError("control_plane_unreachable", cause);
         // abort 等待 Child 真正 close（内部 SIGKILL 升级兜底）后才交还恢复。
@@ -329,6 +382,7 @@ export class PiGateway {
       const beat = async (): Promise<void> => {
         if (heartbeatFailed || beatInFlight) return;
         beatInFlight = true;
+        const startedAt = Date.now();
         try {
           const remainingMs = leaseDeadlineMs - Date.now();
           if (remainingMs <= abortGraceMs) {
@@ -369,10 +423,6 @@ export class PiGateway {
             if (decision && typeof decision.lease_expires_at === "number") {
               leaseDeadlineMs = decision.lease_expires_at * 1000;
             }
-            if (this.controlPlane.sendEvent && !eventBufferError) {
-              eventFlushBlocked = false;
-              void flushEvents().catch((error) => this.onError(error));
-            }
             if (decision?.cancel_requested === true) {
               heartbeatFailed = true;
               heartbeatOutcome = "cancelled";
@@ -386,6 +436,7 @@ export class PiGateway {
           } catch (error) {
             if (beatsStopped) return;
             consecutiveHeartbeatFailures += 1;
+            reportControlPlaneFailure("heartbeat", error, consecutiveHeartbeatFailures, startedAt);
             this.onError(
               asPiGatewayInfrastructureError(error)
                 ?? new PiGatewayInfrastructureError("control_plane_unreachable", error),
@@ -420,23 +471,50 @@ export class PiGateway {
       const terminalize = async (
         outcome: "completed" | "completed_with_warnings" | "failed" | "cancelled",
         payload?: Record<string, unknown>,
+        failureMetadata?: ProviderFailureMetadata,
       ): Promise<unknown> => {
         beginTerminalization();
-        if (payload === undefined) {
-          return this.controlPlane.terminal(
+        const startedAt = Date.now();
+        try {
+          if (payload === undefined) {
+            if (failureMetadata === undefined) {
+              return await this.controlPlane.terminal(
+                claim.run_id,
+                claim.attempt_id,
+                outcome,
+                claim.lease_token,
+              );
+            }
+            return await this.controlPlane.terminal(
+              claim.run_id,
+              claim.attempt_id,
+              outcome,
+              claim.lease_token,
+              undefined,
+              failureMetadata,
+            );
+          }
+          if (failureMetadata === undefined) {
+            return await this.controlPlane.terminal(
+              claim.run_id,
+              claim.attempt_id,
+              outcome,
+              claim.lease_token,
+              payload,
+            );
+          }
+          return await this.controlPlane.terminal(
             claim.run_id,
             claim.attempt_id,
             outcome,
             claim.lease_token,
+            payload,
+            failureMetadata,
           );
+        } catch (error) {
+          reportControlPlaneFailure("terminal", error, 1, startedAt);
+          throw error;
         }
-        return this.controlPlane.terminal(
-          claim.run_id,
-          claim.attempt_id,
-          outcome,
-          claim.lease_token,
-          payload,
-        );
       };
       try {
         // Start renewing before worker/session initialization completes; a
@@ -455,8 +533,11 @@ export class PiGateway {
         if (handle?.onEvent) {
           unregisterEvents = handle.onEvent((event) => {
             if (eventBufferError) return;
-            if (eventBuffer.append(event)) {
-              void flushEvents().catch((error) => this.onError(error));
+            if (eventPump) {
+              if (eventPump.enqueue(event)) return;
+              return;
+            }
+            if (legacyEventBuffer?.append(event)) {
               return;
             }
             eventBufferError = new PiGatewayInfrastructureError("event_buffer_overflow");
@@ -489,13 +570,6 @@ export class PiGateway {
           return;
         }
         if (!(await drainProjectedEvents())) return;
-        if (eventFlushBlocked && eventBuffer.size > 0) {
-          // 事件投递在控制面持续失败：中止 worker 并把 Run 留给恢复，
-          // 绝不绕过事件顺序伪造 terminal。
-          await handle?.abort?.();
-          this.onError(new PiGatewayInfrastructureError("control_plane_unreachable"));
-          return;
-        }
         if (heartbeatOutcome === "lost") {
           this.onError(heartbeatError ?? new Error("pi_gateway_heartbeat_lost"));
           return;
@@ -556,9 +630,12 @@ export class PiGateway {
           const businessCode = isDecisionLimitError(error)
             ? "pi_decision_limit"
             : "pi_model_provider_error";
+          const failureMetadata = isProviderFailureError(error)
+            ? getProviderFailureMetadata(error)
+            : undefined;
           try {
             if (!(await drainProjectedEvents())) return;
-            await terminalize("failed", { code: businessCode });
+            await terminalize("failed", { code: businessCode }, failureMetadata);
           } catch (terminalError) {
             this.onError(terminalError);
           }
@@ -591,6 +668,8 @@ export class PiGateway {
         // 先停止再清理：在飞的 beat 结束时会尝试自调度，必须先立停止标志，
         // 否则任务收口后仍会续租，把已结束的 Run 的 lease 永远续下去。
         beginTerminalization();
+        eventPump?.stop();
+        if (eventPump) this.eventPumps.delete(eventPump);
         unregisterEvents?.();
         unregisterAbort?.();
         if (handle?.pid !== undefined) this.workerPids.delete(handle.pid);
@@ -603,6 +682,7 @@ export class PiGateway {
     if (this.stopped) return;
     this.stopped = true;
     this.pool.setDraining(true);
+    for (const eventPump of this.eventPumps) eventPump.stop();
     await this.pool.abortAll();
     await Promise.race([
       this.pool.waitForIdle(),

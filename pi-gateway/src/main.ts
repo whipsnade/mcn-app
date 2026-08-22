@@ -2,6 +2,7 @@ import { pathToFileURL } from "node:url";
 
 import { loadGatewayConfig, GatewayConfigError, type GatewayConfig } from "./config.js";
 import { ControlPlaneClient } from "./control-plane-client.js";
+import type { EventDeliveryDiagnostic } from "./event-delivery.js";
 import { PiGateway, type GatewayWorkerHandle } from "./gateway.js";
 import { startHealthServer, type GatewayMetricsSnapshot } from "./health.js";
 import type { GatewaySignalSource } from "./server.js";
@@ -373,10 +374,33 @@ export async function runGatewayMain(deps: GatewayMainDependencies = {}): Promis
     errorsTotal: 0,
     lastErrorCode: null as string | null,
     lastClaimAtMs: null as number | null,
+    eventDeliveryFailuresTotal: 0,
+    eventDeliveryRetriesTotal: 0,
+    eventBufferOverflowsTotal: 0,
+    eventQueueHighWater: 0,
+    eventLastAckedSourceSequence: null as number | null,
+    lastControlPlaneDiagnostic: null as EventDeliveryDiagnostic | null,
   };
   const recordError = (error: unknown): void => {
     state.errorsTotal += 1;
     state.lastErrorCode = errorCode(error);
+  };
+  const recordEventDeliveryDiagnostic = (diagnostic: EventDeliveryDiagnostic): void => {
+    state.lastControlPlaneDiagnostic = { ...diagnostic };
+    if (diagnostic.operation !== "event" && diagnostic.operation !== "event_batch") return;
+    if (diagnostic.kind === "failure" || diagnostic.kind === "overflow") {
+      state.eventDeliveryFailuresTotal += 1;
+    }
+    if (diagnostic.kind === "retry") state.eventDeliveryRetriesTotal += 1;
+    if (diagnostic.kind === "overflow") state.eventBufferOverflowsTotal += 1;
+    state.eventQueueHighWater = Math.max(state.eventQueueHighWater, diagnostic.queue_high_water);
+    if (
+      diagnostic.last_acked_source_sequence !== null &&
+      (state.eventLastAckedSourceSequence === null ||
+        diagnostic.last_acked_source_sequence > state.eventLastAckedSourceSequence)
+    ) {
+      state.eventLastAckedSourceSequence = diagnostic.last_acked_source_sequence;
+    }
   };
 
   const controlPlane = new ControlPlaneClient({
@@ -394,6 +418,7 @@ export async function runGatewayMain(deps: GatewayMainDependencies = {}): Promis
     controlTimeoutMs: config.controlTimeoutMs,
     shutdownTimeoutMs: config.shutdownTimeoutMs,
     maxBufferedEvents: config.maxBufferedEvents,
+    onEventDeliveryDiagnostic: recordEventDeliveryDiagnostic,
     worker: createProductionWorker({
       gatewayId: config.gatewayId,
       controlPlane,
@@ -421,6 +446,12 @@ export async function runGatewayMain(deps: GatewayMainDependencies = {}): Promis
         errors_total: state.errorsTotal,
         last_error_code: state.lastErrorCode,
         last_claim_at: state.lastClaimAtMs === null ? null : new Date(state.lastClaimAtMs).toISOString(),
+        event_delivery_failures_total: state.eventDeliveryFailuresTotal,
+        event_delivery_retries_total: state.eventDeliveryRetriesTotal,
+        event_buffer_overflows_total: state.eventBufferOverflowsTotal,
+        event_queue_high_water: state.eventQueueHighWater,
+        event_last_acked_source_sequence: state.eventLastAckedSourceSequence,
+        last_control_plane_diagnostic: state.lastControlPlaneDiagnostic,
         ...(config.environment === "test" ? { worker_pids: [...gateway.activeWorkerPids] } : {}),
       }),
     },

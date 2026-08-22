@@ -148,6 +148,23 @@ export interface PiGatewaySourceEvent {
   payload: Record<string, unknown>;
 }
 
+export interface PiGatewaySourceEventBatch {
+  events: PiGatewaySourceEvent[];
+}
+
+export interface PiGatewaySourceEventReceipt {
+  source_event_id: string;
+  sequence: number;
+  duplicate: boolean;
+  event_id?: string;
+  usage_record_id?: string;
+}
+
+export interface PiGatewaySourceEventBatchReceipt {
+  receipts: PiGatewaySourceEventReceipt[];
+  last_acked_source_sequence: number;
+}
+
 export interface PiGatewayClaimResponse {
   run_id: string;
   attempt_id: string;
@@ -160,6 +177,13 @@ export interface PiGatewayClaimResponse {
   adapter_catalog: PiGatewayAdapterCatalogEntry[];
   internal_tools: Array<Record<string, unknown>>;
 }
+
+// Control-plane transport bounds only; directTools=false still exposes one
+// model-visible MCP proxy, not one top-level tool per catalog entry.
+export const PI_GATEWAY_ADAPTER_CATALOG_MAX_ENTRIES = 128;
+export const PI_GATEWAY_ADAPTER_CATALOG_MAX_BYTES = 128 * 1024;
+export const PI_GATEWAY_EVENT_BATCH_MAX_EVENTS = 32;
+export const PI_GATEWAY_EVENT_BATCH_MAX_BYTES = 128 * 1024;
 
 const PI_ADAPTER_SERVICE_ALIASES: Readonly<Record<string, string>> = Object.freeze({
   "insight-cube-mcp": "insight-cube",
@@ -178,6 +202,7 @@ const PI_ADAPTER_SERVICE_ALIASES: Readonly<Record<string, string>> = Object.free
 export function normalizePiGatewayAdapterCatalog(
   entries: readonly PiGatewayAdapterCatalogEntry[],
 ): AdapterCatalogEntry[] {
+  assertAdapterCatalogBounds(entries);
   const seen = new Set<string>();
   return entries.map((entry) => {
     const service = PI_ADAPTER_SERVICE_ALIASES[entry.service] ?? entry.service;
@@ -196,6 +221,30 @@ export function normalizePiGatewayAdapterCatalog(
       schemaDigest: entry.input_schema_digest,
     };
   });
+}
+
+function canonicalizeJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map((item) => canonicalizeJson(item));
+  if (isRecord(value)) {
+    return Object.fromEntries(
+      Object.keys(value).sort().map((key) => [key, canonicalizeJson(value[key])]),
+    );
+  }
+  return value;
+}
+
+function adapterCatalogCanonicalJsonBytes(value: readonly unknown[]): number {
+  const serialized = JSON.stringify(canonicalizeJson(value));
+  return new TextEncoder().encode(serialized ?? "null").byteLength;
+}
+
+function assertAdapterCatalogBounds(entries: readonly unknown[]): void {
+  if (
+    entries.length > PI_GATEWAY_ADAPTER_CATALOG_MAX_ENTRIES ||
+    adapterCatalogCanonicalJsonBytes(entries) > PI_GATEWAY_ADAPTER_CATALOG_MAX_BYTES
+  ) {
+    throw new Error("pi_gateway_adapter_catalog_invalid");
+  }
 }
 
 /**
@@ -308,6 +357,72 @@ export function parsePiGatewaySourceEvent(value: unknown): PiGatewaySourceEvent 
   return { source_event_id: sourceEventId, sequence: sequenceNumber, event_type: eventType, payload };
 }
 
+export function parsePiGatewaySourceEventBatch(value: unknown): PiGatewaySourceEventBatch {
+  if (!isRecord(value) || !exactKeys(value, ["events"]) || !Array.isArray(value.events)) {
+    invalidProtocol();
+  }
+  if (value.events.length < 1 || value.events.length > PI_GATEWAY_EVENT_BATCH_MAX_EVENTS) {
+    invalidProtocol();
+  }
+  const events = value.events.map((event) => parsePiGatewaySourceEvent(event));
+  const attemptIds = new Set(
+    events.map((event) => event.source_event_id.slice(0, event.source_event_id.lastIndexOf(":"))),
+  );
+  if (attemptIds.size !== 1) invalidProtocol();
+  for (let index = 1; index < events.length; index += 1) {
+    if (events[index].sequence !== events[index - 1].sequence + 1) invalidProtocol();
+  }
+  const bytes = piGatewaySourceEventBatchBytes(events);
+  if (bytes > PI_GATEWAY_EVENT_BATCH_MAX_BYTES) invalidProtocol();
+  return { events };
+}
+
+export function piGatewaySourceEventBatchBytes(events: readonly PiGatewaySourceEvent[]): number {
+  return new TextEncoder().encode(JSON.stringify(canonicalizeJson({ events }))).byteLength;
+}
+
+export function parsePiGatewaySourceEventBatchReceipt(value: unknown): PiGatewaySourceEventBatchReceipt {
+  if (!isRecord(value) || !exactKeys(value, ["receipts", "last_acked_source_sequence"]) || !Array.isArray(value.receipts)) {
+    throw new Error("pi_gateway_event_batch_receipt_invalid");
+  }
+  const lastSequence = value.last_acked_source_sequence;
+  if (!Number.isInteger(lastSequence) || (lastSequence as number) < 1 || (lastSequence as number) > 10_000_000) {
+    throw new Error("pi_gateway_event_batch_receipt_invalid");
+  }
+  const receipts = value.receipts.map((raw) => {
+    if (!isRecord(raw)) throw new Error("pi_gateway_event_batch_receipt_invalid");
+    const allowedKeys = new Set(["source_event_id", "sequence", "duplicate", "event_id", "usage_record_id"]);
+    if (
+      Object.keys(raw).some((key) => !allowedKeys.has(key)) ||
+      !Object.prototype.hasOwnProperty.call(raw, "source_event_id") ||
+      !Object.prototype.hasOwnProperty.call(raw, "sequence") ||
+      !Object.prototype.hasOwnProperty.call(raw, "duplicate")
+    ) throw new Error("pi_gateway_event_batch_receipt_invalid");
+    if (
+      typeof raw.source_event_id !== "string" || !/^[A-Za-z0-9._:-]{1,160}$/.test(raw.source_event_id) ||
+      !Number.isInteger(raw.sequence) || (raw.sequence as number) < 1 ||
+      (raw.sequence as number) > 10_000_000 || typeof raw.duplicate !== "boolean"
+    ) throw new Error("pi_gateway_event_batch_receipt_invalid");
+    const suffix = raw.source_event_id.slice(raw.source_event_id.lastIndexOf(":") + 1);
+    if (Number(suffix) !== raw.sequence) throw new Error("pi_gateway_event_batch_receipt_invalid");
+    for (const key of ["event_id", "usage_record_id"] as const) {
+      if (key in raw && (typeof raw[key] !== "string" || !raw[key] || raw[key].length > 64)) {
+        throw new Error("pi_gateway_event_batch_receipt_invalid");
+      }
+    }
+    return raw as unknown as PiGatewaySourceEventReceipt;
+  });
+  if (
+    receipts.length < 1 ||
+    receipts[receipts.length - 1].sequence !== lastSequence ||
+    new Set(receipts.map((item) => item.source_event_id.slice(0, item.source_event_id.lastIndexOf(":")))).size !== 1 ||
+    receipts.some((item, index) => index > 0 && item.sequence !== receipts[index - 1].sequence + 1)
+  ) {
+    throw new Error("pi_gateway_event_batch_receipt_invalid");
+  }
+  return { receipts, last_acked_source_sequence: lastSequence as number };
+}
+
 /** Runtime validation mirror for the strict FastAPI claim response DTO. */
 export function parsePiGatewayClaimResponse(value: unknown): PiGatewayClaimResponse {
   if (!isRecord(value) || !exactKeys(value, ["run_id", "attempt_id", "lease_token", "lease_expires_at", "runtime_snapshot", "transcript", "secret_envelope", "adapter_catalog", "internal_tools"])) {
@@ -323,9 +438,14 @@ export function parsePiGatewayClaimResponse(value: unknown): PiGatewayClaimRespo
     !isRecord(envelope) || !exactKeys(envelope, ["alg", "nonce", "ciphertext"]) ||
     envelope.alg !== "AES-256-GCM" || typeof envelope.nonce !== "string" || envelope.nonce.length < 16 || envelope.nonce.length > 64 ||
     typeof envelope.ciphertext !== "string" || envelope.ciphertext.length < 16 || envelope.ciphertext.length > 200_000 ||
-    !Array.isArray(value.adapter_catalog) || value.adapter_catalog.length > 32 ||
+    !Array.isArray(value.adapter_catalog) ||
     !Array.isArray(value.internal_tools) || value.internal_tools.length > 64
   ) throw new Error("pi_gateway_claim_response_invalid");
+  try {
+    assertAdapterCatalogBounds(value.adapter_catalog);
+  } catch {
+    throw new Error("pi_gateway_claim_response_invalid");
+  }
   if (
     new TextEncoder().encode(JSON.stringify(value.runtime_snapshot)).byteLength > 256 * 1024 ||
     value.transcript.some((item) => {

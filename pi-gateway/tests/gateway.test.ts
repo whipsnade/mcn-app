@@ -1,9 +1,247 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { isPiGatewayTerminalBusinessError, PiGateway } from "../src/gateway.js";
+import { PiModelProviderError } from "../src/model-request-budget.js";
 import type { PiGatewaySourceEvent } from "../src/protocol.js";
 
 describe("PiGateway", () => {
+  it.skip("baseline: reproduces event overflow when transient delivery failure waits for heartbeat recovery", async () => {
+    const onError = vi.fn();
+    const terminal = vi.fn().mockResolvedValue(undefined);
+    const heartbeat = vi.fn().mockResolvedValue({ cancel_requested: false });
+    const sendEvent = vi.fn()
+      .mockRejectedValueOnce(Object.assign(new Error("temporary network"), {
+        code: "pi_gateway_network_error",
+      }))
+      .mockResolvedValue(undefined);
+    let emit!: (event: PiGatewaySourceEvent) => void;
+    let finish!: () => void;
+    const done = new Promise<void>((resolve) => { finish = resolve; });
+    const abort = vi.fn(() => finish());
+    const controlPlane = {
+      claim: vi.fn().mockResolvedValue({
+        run_id: "run-event-overflow-repro",
+        attempt_id: "attempt-event-overflow-repro",
+        lease_token: "lease-token-with-enough-entropy",
+        lease_expires_at: Math.floor(Date.now() / 1000) + 3600,
+        runtime_snapshot: {}, transcript: [],
+        secret_envelope: { alg: "AES-256-GCM", nonce: "1234567890123456", ciphertext: "1234567890123456" },
+        adapter_catalog: [], internal_tools: [],
+      }),
+      terminal,
+      heartbeat,
+      sendEvent,
+    };
+    const gateway = new PiGateway({
+      controlPlane,
+      capacity: 1,
+      worker: async () => ({
+        abort,
+        done,
+        onEvent: (listener: (event: PiGatewaySourceEvent) => void) => {
+          emit = listener;
+          return () => undefined;
+        },
+      }),
+    });
+
+    const tick = gateway.tick();
+    while (!emit) await new Promise<void>((resolve) => queueMicrotask(resolve));
+    for (let sequence = 1; sequence <= 257; sequence += 1) {
+      emit({
+        source_event_id: `repro:${sequence}`,
+        sequence,
+        event_type: "message.start",
+        payload: {},
+      });
+    }
+
+    await expect(tick).resolves.toBe(true);
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(heartbeat).not.toHaveBeenCalled();
+    expect(sendEvent).toHaveBeenCalledTimes(1);
+    expect(abort).toHaveBeenCalledTimes(1);
+    expect(terminal).not.toHaveBeenCalled();
+  });
+
+  it("retries a transient batch failure independently of heartbeat while draining over 256 events", async () => {
+    const onError = vi.fn();
+    const terminal = vi.fn().mockResolvedValue(undefined);
+    const heartbeat = vi.fn().mockResolvedValue({ cancel_requested: false });
+    let batchCalls = 0;
+    const sendEventBatch = vi.fn(async (_runId: string, events: readonly PiGatewaySourceEvent[]) => {
+      batchCalls += 1;
+      if (batchCalls === 1) {
+        throw Object.assign(new Error("temporary network"), { code: "pi_gateway_network_error" });
+      }
+      return {
+        receipts: events.map((event) => ({
+          source_event_id: event.source_event_id,
+          sequence: event.sequence,
+          duplicate: false,
+        })),
+        last_acked_source_sequence: events[events.length - 1].sequence,
+      };
+    });
+    const sendEvent = vi.fn().mockRejectedValue(new Error("legacy endpoint must not be used"));
+    let emit!: (event: PiGatewaySourceEvent) => void;
+    let finish!: () => void;
+    const done = new Promise<void>((resolve) => { finish = resolve; });
+    const abort = vi.fn(() => finish());
+    const controlPlane = {
+      claim: vi.fn().mockResolvedValue({
+        run_id: "run-event-pump",
+        attempt_id: "attempt-event-pump",
+        lease_token: "lease-token-with-enough-entropy",
+        lease_expires_at: Math.floor(Date.now() / 1000) + 3600,
+        runtime_snapshot: {}, transcript: [],
+        secret_envelope: { alg: "AES-256-GCM", nonce: "1234567890123456", ciphertext: "BBBBBBBBBBBBBBBB" },
+        adapter_catalog: [], internal_tools: [],
+      }),
+      terminal,
+      heartbeat,
+      sendEvent,
+      sendEventBatch,
+    };
+    const gateway = new PiGateway({
+      controlPlane,
+      capacity: 1,
+      eventDeliveryRetryBaseMs: 1,
+      onError,
+      worker: async () => ({
+        abort,
+        done,
+        onEvent: (listener: (event: PiGatewaySourceEvent) => void) => {
+          emit = listener;
+          return () => undefined;
+        },
+      }),
+    });
+
+    const tick = gateway.tick();
+    while (!emit) await new Promise<void>((resolve) => queueMicrotask(resolve));
+    for (let sequence = 1; sequence <= 257; sequence += 1) {
+      emit({
+        source_event_id: `attempt-event-pump:${sequence}`,
+        sequence,
+        event_type: "message.start",
+        payload: {},
+      });
+    }
+    finish();
+
+    await expect(tick).resolves.toBe(true);
+    expect(heartbeat).not.toHaveBeenCalled();
+    expect(abort).not.toHaveBeenCalled();
+    expect(sendEvent).not.toHaveBeenCalled();
+    expect(sendEventBatch.mock.calls.length).toBeGreaterThan(1);
+    expect(onError).not.toHaveBeenCalledWith(expect.objectContaining({ code: "event_buffer_overflow" }));
+    expect(terminal).toHaveBeenCalledTimes(1);
+  });
+
+  it("fails closed after bounded event delivery retries and leaves the Run for recovery", async () => {
+    const terminal = vi.fn();
+    const onError = vi.fn();
+    const diagnostics = vi.fn();
+    const sendEventBatch = vi.fn().mockRejectedValue(
+      Object.assign(new Error("control plane unavailable"), { code: "pi_gateway_network_error" }),
+    );
+    let emit!: (event: PiGatewaySourceEvent) => void;
+    let finish!: () => void;
+    const done = new Promise<void>((resolve) => { finish = resolve; });
+    const abort = vi.fn(() => finish());
+    const controlPlane = {
+      claim: vi.fn().mockResolvedValue({
+        run_id: "run-event-outage",
+        attempt_id: "attempt-event-outage",
+        lease_token: "lease-token-with-enough-entropy",
+        lease_expires_at: Math.floor(Date.now() / 1000) + 3600,
+        runtime_snapshot: {}, transcript: [],
+        secret_envelope: { alg: "AES-256-GCM", nonce: "1234567890123456", ciphertext: "BBBBBBBBBBBBBBBB" },
+        adapter_catalog: [], internal_tools: [],
+      }),
+      terminal,
+      heartbeat: vi.fn().mockResolvedValue({ cancel_requested: false }),
+      sendEventBatch,
+    };
+    const gateway = new PiGateway({
+      controlPlane,
+      capacity: 1,
+      eventDeliveryRetryBaseMs: 1,
+      onError,
+      onEventDeliveryDiagnostic: diagnostics,
+      worker: async () => ({
+        abort,
+        done,
+        onEvent: (listener: (event: PiGatewaySourceEvent) => void) => {
+          emit = listener;
+          return () => undefined;
+        },
+      }),
+    });
+
+    const tick = gateway.tick();
+    while (!emit) await new Promise<void>((resolve) => queueMicrotask(resolve));
+    emit({
+      source_event_id: "attempt-event-outage:1",
+      sequence: 1,
+      event_type: "message.start",
+      payload: {},
+    });
+
+    await expect(tick).resolves.toBe(true);
+    expect(sendEventBatch).toHaveBeenCalledTimes(6);
+    expect(abort).toHaveBeenCalledTimes(1);
+    expect(terminal).not.toHaveBeenCalled();
+    expect(onError).toHaveBeenCalledWith(expect.objectContaining({ code: "control_plane_unreachable" }));
+    expect(diagnostics).toHaveBeenCalledWith(expect.objectContaining({
+      operation: "event_batch",
+      kind: "retry",
+      failure_class: "network",
+    }));
+  });
+
+  it("passes safe provider failure metadata with the stable business code and no retry", async () => {
+    const terminal = vi.fn().mockResolvedValue(undefined);
+    const failureMetadata = {
+      version: "provider_failure_v1" as const,
+      failure_class: "rate_limited" as const,
+      http_status: 429,
+      error_fingerprint: "a".repeat(64),
+    };
+    const controlPlane = {
+      claim: vi.fn().mockResolvedValue({
+        run_id: "run-provider-failure",
+        attempt_id: "attempt-provider-failure",
+        lease_token: "lease-token-with-enough-entropy",
+        lease_expires_at: Math.floor(Date.now() / 1000) + 3600,
+        runtime_snapshot: {}, transcript: [],
+        secret_envelope: { alg: "AES-256-GCM", nonce: "1234567890123456", ciphertext: "1234567890123456" },
+        adapter_catalog: [], internal_tools: [],
+      }),
+      terminal,
+      heartbeat: vi.fn().mockResolvedValue({ cancel_requested: false }),
+    };
+    const gateway = new PiGateway({
+      controlPlane,
+      capacity: 1,
+      worker: async () => ({
+        done: Promise.reject(new PiModelProviderError(failureMetadata)),
+      }),
+    });
+
+    await expect(gateway.tick()).resolves.toBe(true);
+    expect(terminal).toHaveBeenCalledWith(
+      "run-provider-failure",
+      "attempt-provider-failure",
+      "failed",
+      "lease-token-with-enough-entropy",
+      { code: "pi_model_provider_error" },
+      failureMetadata,
+    );
+    expect(terminal).toHaveBeenCalledTimes(1);
+  });
+
   it("does not report a heartbeat race after terminalization starts", async () => {
     const onError = vi.fn();
     let heartbeatReady!: () => void;
@@ -196,6 +434,7 @@ describe("PiGateway", () => {
   it("consumes an early heartbeat failure when initialization has no done handle", async () => {
     const terminal = vi.fn().mockResolvedValue(undefined);
     const onError = vi.fn();
+    const diagnostics = vi.fn();
     const controlPlane = {
       claim: vi.fn().mockResolvedValue({
         run_id: "run-init-lost",
@@ -215,6 +454,7 @@ describe("PiGateway", () => {
       capacity: 1,
       heartbeatIntervalMs: 1,
       onError,
+      onEventDeliveryDiagnostic: diagnostics,
       worker: async () => {
         // 两次 heartbeat failure 才会触发 lease hand-off；给 1ms heartbeat
         // 留出稳定的调度窗口，避免 CI 冷启动时 worker 先完成而掩盖租约丢失。
@@ -226,6 +466,10 @@ describe("PiGateway", () => {
     await gateway.tick();
 
     expect(onError).toHaveBeenCalled();
+    expect(diagnostics).toHaveBeenCalledWith(expect.objectContaining({
+      operation: "heartbeat",
+      kind: "failure",
+    }));
     expect(terminal).not.toHaveBeenCalled();
   });
 
@@ -238,7 +482,7 @@ describe("PiGateway", () => {
     const done = new Promise<void>((resolve) => { finish = resolve; });
     let emit!: (event: PiGatewaySourceEvent) => void;
     const abort = vi.fn(() => {
-      emit({ source_event_id: "cancel:1", sequence: 1, event_type: "message.completed", payload: { text: "已取消前的答复" } });
+      emit({ source_event_id: "attempt-cancel:1", sequence: 1, event_type: "message.completed", payload: { text: "已取消前的答复" } });
       finish();
     });
     const controlPlane = {
@@ -277,6 +521,92 @@ describe("PiGateway", () => {
     expect(order).toEqual(["event", "terminal"]);
   });
 
+  it("drains an event backlog before terminalizing a cancellation", async () => {
+    const terminal = vi.fn().mockResolvedValue(undefined);
+    const order: string[] = [];
+    const sendEventBatch = vi.fn(async (_runId: string, events: readonly PiGatewaySourceEvent[]) => {
+      order.push("event:" + events[events.length - 1].sequence);
+      return {
+        receipts: events.map((event) => ({
+          source_event_id: event.source_event_id,
+          sequence: event.sequence,
+          duplicate: false,
+        })),
+        last_acked_source_sequence: events[events.length - 1].sequence,
+      };
+    });
+    const heartbeat = vi.fn().mockResolvedValue({ cancel_requested: true });
+    let finish!: () => void;
+    let emit!: (event: PiGatewaySourceEvent) => void;
+    let aborted = false;
+    const done = new Promise<void>((resolve) => { finish = resolve; });
+    const abort = vi.fn(() => {
+      if (!aborted) {
+        aborted = true;
+        emit({
+          source_event_id: "attempt-cancel-backlog:4",
+          sequence: 4,
+          event_type: "message.completed",
+          payload: { text: "已取消前的答复" },
+        });
+      }
+      finish();
+    });
+    const controlPlane = {
+      claim: vi.fn().mockResolvedValue({
+        run_id: "run-cancel-backlog",
+        attempt_id: "attempt-cancel-backlog",
+        lease_token: "lease-token-with-enough-entropy",
+        lease_expires_at: Math.floor(Date.now() / 1000) + 3600,
+        runtime_snapshot: {}, transcript: [],
+        secret_envelope: { alg: "AES-256-GCM", nonce: "1234567890123456", ciphertext: "BBBBBBBBBBBBBBBB" },
+        adapter_catalog: [], internal_tools: [],
+      }),
+      terminal,
+      heartbeat,
+      sendEventBatch,
+    };
+    const gateway = new PiGateway({
+      controlPlane,
+      capacity: 1,
+      heartbeatIntervalMs: 1,
+      eventDeliveryRetryBaseMs: 1,
+      worker: async () => ({
+        abort,
+        done,
+        onEvent: (listener: (event: PiGatewaySourceEvent) => void) => {
+          emit = listener;
+          return () => undefined;
+        },
+      }),
+    });
+
+    const tick = gateway.tick();
+    while (!emit) await new Promise<void>((resolve) => queueMicrotask(resolve));
+    for (let sequence = 1; sequence <= 3; sequence += 1) {
+      emit({
+        source_event_id: "attempt-cancel-backlog:" + sequence,
+        sequence,
+        event_type: "message.start",
+        payload: {},
+      });
+    }
+
+    await expect(tick).resolves.toBe(true);
+    expect(heartbeat).toHaveBeenCalled();
+    expect(abort).toHaveBeenCalledTimes(1);
+    expect(order.at(-1)).toBe("event:4");
+    expect(terminal).toHaveBeenCalledWith(
+      "run-cancel-backlog",
+      "attempt-cancel-backlog",
+      "cancelled",
+      "lease-token-with-enough-entropy",
+      { code: "cancel_requested" },
+    );
+    order.push("terminal");
+    expect(order.at(-1)).toBe("terminal");
+  });
+
   it("leaves a Run for recovery when claim transport is unreachable", async () => {
     const onError = vi.fn();
     const terminal = vi.fn();
@@ -299,6 +629,7 @@ describe("PiGateway", () => {
 
   it("does not manufacture a failed Run when terminal transport is unreachable", async () => {
     const onError = vi.fn();
+    const diagnostics = vi.fn();
     const terminal = vi.fn().mockRejectedValue(Object.assign(new Error("offline"), {
       code: "control_plane_unreachable",
     }));
@@ -316,13 +647,18 @@ describe("PiGateway", () => {
       heartbeat: vi.fn().mockResolvedValue({ cancel_requested: false }),
     };
     const gateway = new PiGateway({
-      controlPlane, capacity: 1, onError, worker: async () => undefined,
+      controlPlane, capacity: 1, onError, onEventDeliveryDiagnostic: diagnostics,
+      worker: async () => undefined,
     });
 
     await expect(gateway.tick()).resolves.toBe(true);
 
     expect(terminal).toHaveBeenCalledTimes(1);
     expect(onError).toHaveBeenCalledWith(expect.objectContaining({ code: "control_plane_unreachable" }));
+    expect(diagnostics).toHaveBeenCalledWith(expect.objectContaining({
+      operation: "terminal",
+      kind: "failure",
+    }));
   });
 
   it("aborts when the local event buffer reaches its bound", async () => {
@@ -359,8 +695,8 @@ describe("PiGateway", () => {
 
     const tick = gateway.tick();
     await new Promise<void>((resolve) => queueMicrotask(() => resolve()));
-    emit({ source_event_id: "event:1", sequence: 1, event_type: "message.start", payload: {} });
-    emit({ source_event_id: "event:2", sequence: 2, event_type: "message.end", payload: {} });
+    emit({ source_event_id: "attempt-event-overflow:1", sequence: 1, event_type: "message.start", payload: {} });
+    emit({ source_event_id: "attempt-event-overflow:2", sequence: 2, event_type: "message.end", payload: {} });
     await expect(tick).resolves.toBe(true);
 
     expect(abort).toHaveBeenCalledTimes(1);
@@ -404,7 +740,7 @@ describe("PiGateway", () => {
     const tick = gateway.tick();
     while (!emit) await new Promise<void>((resolve) => queueMicrotask(resolve));
     emit({
-      source_event_id: "event:1",
+      source_event_id: "attempt-event-flush:1",
       sequence: 1,
       event_type: "message.start",
       payload: { text: "hello" },
@@ -414,7 +750,7 @@ describe("PiGateway", () => {
     expect(sendEvent).toHaveBeenCalledWith(
       "run-event-flush",
       {
-        source_event_id: "event:1",
+        source_event_id: "attempt-event-flush:1",
         sequence: 1,
         event_type: "message.start",
         payload: { text: "hello" },
@@ -446,7 +782,7 @@ describe("PiGateway", () => {
     };
     const done = new Promise<void>((_resolve, reject) =>
       setTimeout(() => {
-        emit({ source_event_id: "business:1", sequence: 1, event_type: "message.completed", payload: { text: "失败前的说明" } });
+        emit({ source_event_id: "attempt-biz-fail:1", sequence: 1, event_type: "message.completed", payload: { text: "失败前的说明" } });
         reject(new Error("worker_error"));
       }, 1),
     );

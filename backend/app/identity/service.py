@@ -3,6 +3,7 @@ from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.billing.service import WalletService
@@ -30,21 +31,40 @@ class IdentityService:
         self.db = db
 
     async def login(self, *, provider: str, subject: str, nickname: str) -> LoginResult:
-        statement = select(AuthIdentity).where(
-            AuthIdentity.provider == provider,
-            AuthIdentity.provider_subject == subject,
-        )
-        identity = await self.db.scalar(statement)
+        identity = await self._find_identity(provider, subject)
         if identity is None:
-            user = await self._create_user(provider, subject, nickname)
+            try:
+                user = await self._create_user(provider, subject, nickname)
+            except IntegrityError:
+                # 并发首登收敛：同一 subject 的另一请求抢先提交，本请求在
+                # auth_identities (provider, subject) 唯一键上竞争失败。回滚
+                # 本事务（丢弃本方部分建户写入）后重读既有身份，按已存在
+                # 用户正常返回登录会话——不重试 INSERT、不造重复用户；
+                # 钱包 1000 积分赠送等建户路径只归首建者。
+                await self.db.rollback()
+                identity = await self._find_identity(provider, subject)
+                if identity is None:
+                    raise
+                user = await self._get_active_user(identity.user_id)
         else:
-            user = await self.db.get(User, identity.user_id)
-            if user is None or user.status != "active":
-                raise PermissionError("user_inactive")
+            user = await self._get_active_user(identity.user_id)
 
         await self._ensure_default_channels(user.id)
         await WalletService(self.db).ensure_welcome_grant(user.id)
         return await self._create_login_session(user)
+
+    async def _find_identity(self, provider: str, subject: str) -> AuthIdentity | None:
+        statement = select(AuthIdentity).where(
+            AuthIdentity.provider == provider,
+            AuthIdentity.provider_subject == subject,
+        )
+        return await self.db.scalar(statement)
+
+    async def _get_active_user(self, user_id: str) -> User:
+        user = await self.db.get(User, user_id)
+        if user is None or user.status != "active":
+            raise PermissionError("user_inactive")
+        return user
 
     async def _ensure_default_channels(self, user_id: str) -> None:
         existing_rows = list(

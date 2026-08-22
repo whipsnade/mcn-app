@@ -2,12 +2,26 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
+from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, field_validator, model_validator
 
+from .catalog import (
+    PI_GATEWAY_ADAPTER_CATALOG_MAX_BYTES,
+    PI_GATEWAY_ADAPTER_CATALOG_MAX_ENTRIES,
+    canonical_adapter_catalog_bytes,
+    normalized_adapter_service,
+)
 from .events import normalize_source_payload, normalize_usage_payload
+
+
+PI_GATEWAY_EVENT_BATCH_MAX_EVENTS = 32
+PI_GATEWAY_EVENT_BATCH_MAX_BYTES = 128 * 1024
+
+
 class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", hide_input_in_errors=True)
 
@@ -99,6 +113,66 @@ class PiGatewayMcpFailRequest(_StrictModel):
     metadata: PiGatewayMcpFailureMetadata | None = None
 
 
+class PiGatewayProviderFailureMetadata(_StrictModel):
+    """Metadata-only provider failure projection; raw SDK errors never cross this boundary."""
+
+    version: Literal["provider_failure_v1"]
+    failure_class: Literal[
+        "authentication",
+        "authorization",
+        "rate_limited",
+        "model_not_found",
+        "invalid_request",
+        "context_length",
+        "timeout",
+        "network",
+        "upstream_5xx",
+        "aborted",
+        "unknown",
+    ]
+    http_status: StrictInt | None = Field(default=None, ge=100, le=599)
+    provider_request_id: StrictStr | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9](?:[A-Za-z0-9._:-]{0,127})$",
+    )
+    error_fingerprint: StrictStr = Field(pattern=r"^[0-9a-fA-F]{64}$")
+    observed_at: StrictStr | None = Field(
+        default=None,
+        min_length=24,
+        max_length=24,
+        pattern=r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$",
+    )
+
+    @field_validator("provider_request_id")
+    @classmethod
+    def safe_request_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        lower = value.lower()
+        if lower.startswith(("bearer", "token", "secret", "api_key", "apikey", "sk-", "sk_")):
+            raise ValueError("provider_request_id_sensitive")
+        return value
+
+    @field_validator("observed_at")
+    @classmethod
+    def safe_timestamp(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        try:
+            datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%fZ")
+        except ValueError as exc:
+            raise ValueError("observed_at_invalid") from exc
+        return value
+
+    @model_validator(mode="after")
+    def optional_fields_must_be_omitted(self) -> "PiGatewayProviderFailureMetadata":
+        for field_name in ("http_status", "provider_request_id", "observed_at"):
+            if field_name in self.model_fields_set and getattr(self, field_name) is None:
+                raise ValueError("provider_failure_optional_field_null")
+        return self
+
 _SOURCE_EVENT_TYPES = {
     "agent.turn.start",
     "agent.turn.end",
@@ -140,6 +214,14 @@ _SENSITIVE_PAYLOAD_KEYS = {
     "secret",
     "token",
     "environment",
+    "error_message",
+    "errormessage",
+    "raw_error",
+    "response_body",
+    "request_body",
+    "prompt",
+    "tool_arguments",
+    "model_output",
 }
 # ``environment`` is a server-owned field of the immutable Runtime Snapshot.
 # It remains forbidden in model/source-event payloads below, but must be
@@ -159,7 +241,7 @@ _IDENTITY_PAYLOAD_KEYS = {
 
 class PiGatewaySourceEvent(_StrictModel):
     source_event_id: str = Field(pattern=r"^[A-Za-z0-9._:-]{1,160}$")
-    sequence: int = Field(ge=1, le=10_000_000)
+    sequence: StrictInt = Field(ge=1, le=10_000_000)
     event_type: str = Field(min_length=1, max_length=64)
     payload: dict[str, Any] = Field(default_factory=dict)
 
@@ -199,6 +281,72 @@ class PiGatewaySourceEvent(_StrictModel):
         return self
 
 
+class PiGatewaySourceEventBatch(_StrictModel):
+    events: list[PiGatewaySourceEvent] = Field(
+        min_length=1,
+        max_length=PI_GATEWAY_EVENT_BATCH_MAX_EVENTS,
+    )
+
+    @model_validator(mode="after")
+    def bounded_contiguous_batch(self) -> "PiGatewaySourceEventBatch":
+        attempts = {event.source_event_id.rsplit(":", 1)[0] for event in self.events}
+        if len(attempts) != 1:
+            raise ValueError("pi_gateway_event_batch_attempt_mismatch")
+        if any(
+            self.events[index].sequence != self.events[index - 1].sequence + 1
+            for index in range(1, len(self.events))
+        ):
+            raise ValueError("pi_gateway_event_batch_sequence_gap")
+        serialized = json.dumps(
+            {"events": [event.model_dump(mode="json") for event in self.events]},
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        if len(serialized) > PI_GATEWAY_EVENT_BATCH_MAX_BYTES:
+            raise ValueError("pi_gateway_event_batch_too_large")
+        return self
+
+
+class PiGatewaySourceEventReceipt(_StrictModel):
+    source_event_id: StrictStr = Field(pattern=r"^[A-Za-z0-9._:-]{1,160}$")
+    sequence: StrictInt = Field(ge=1, le=10_000_000)
+    duplicate: bool
+    event_id: StrictStr | None = Field(default=None, min_length=1, max_length=64)
+    usage_record_id: StrictStr | None = Field(default=None, min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def receipt_shape(self) -> "PiGatewaySourceEventReceipt":
+        if int(self.source_event_id.rsplit(":", 1)[-1]) != self.sequence:
+            raise ValueError("pi_gateway_event_receipt_sequence_invalid")
+        if self.event_id is not None and self.usage_record_id is not None:
+            raise ValueError("pi_gateway_event_receipt_multiple_ids")
+        for field_name in ("event_id", "usage_record_id"):
+            if field_name in self.model_fields_set and getattr(self, field_name) is None:
+                raise ValueError("pi_gateway_event_receipt_optional_field_null")
+        return self
+
+
+class PiGatewaySourceEventBatchReceipt(_StrictModel):
+    receipts: list[PiGatewaySourceEventReceipt] = Field(
+        min_length=1,
+        max_length=PI_GATEWAY_EVENT_BATCH_MAX_EVENTS,
+    )
+    last_acked_source_sequence: StrictInt = Field(ge=1, le=10_000_000)
+
+    @model_validator(mode="after")
+    def receipt_sequence(self) -> "PiGatewaySourceEventBatchReceipt":
+        if self.receipts[-1].sequence != self.last_acked_source_sequence:
+            raise ValueError("pi_gateway_event_batch_receipt_sequence_invalid")
+        attempts = {item.source_event_id.rsplit(":", 1)[0] for item in self.receipts}
+        if len(attempts) != 1:
+            raise ValueError("pi_gateway_event_batch_receipt_attempt_invalid")
+        for index in range(1, len(self.receipts)):
+            if self.receipts[index].sequence != self.receipts[index - 1].sequence + 1:
+                raise ValueError("pi_gateway_event_batch_receipt_gap")
+        return self
+
+
 class PiGatewayClaimRequest(_StrictModel):
     capacity: int = Field(default=1, ge=1, le=128)
 
@@ -211,6 +359,7 @@ class PiGatewayTerminalRequest(_StrictModel):
     attempt_id: str = Field(min_length=1, max_length=64)
     outcome: Literal["completed", "completed_with_warnings", "failed", "cancelled"]
     payload: dict[str, Any] = Field(default_factory=dict)
+    failure_metadata: PiGatewayProviderFailureMetadata | None = None
 
     @field_validator("payload")
     @classmethod
@@ -218,8 +367,42 @@ class PiGatewayTerminalRequest(_StrictModel):
         _validate_payload(value, "terminal")
         return value
 
+    @model_validator(mode="after")
+    def provider_failure_metadata_boundary(self) -> "PiGatewayTerminalRequest":
+        if self.failure_metadata is not None and self.outcome != "failed":
+            raise ValueError("terminal_provider_failure_metadata_outcome_invalid")
+        if self.failure_metadata is not None:
+            business_code = self.payload.get("error_code") or self.payload.get("code")
+            if business_code != "pi_model_provider_error":
+                raise ValueError("terminal_provider_failure_metadata_code_invalid")
+        if "failure_metadata" in self.payload:
+            raise ValueError("terminal_provider_failure_metadata_must_be_top_level")
+        return self
+
 
 class PiGatewayClaimResponse(_StrictModel):
+    @model_validator(mode="before")
+    @classmethod
+    def bound_adapter_catalog_payload(cls, value: Any) -> Any:
+        if not isinstance(value, Mapping):
+            return value
+        adapter_catalog = value.get("adapter_catalog")
+        if not isinstance(adapter_catalog, list):
+            return value
+        if len(adapter_catalog) > PI_GATEWAY_ADAPTER_CATALOG_MAX_ENTRIES:
+            raise ValueError("pi_gateway_claim_catalog_too_large")
+        try:
+            canonical_entries = [
+                item.model_dump(mode="json") if isinstance(item, BaseModel) else item
+                for item in adapter_catalog
+            ]
+            catalog_bytes = canonical_adapter_catalog_bytes(canonical_entries)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("pi_gateway_claim_catalog_invalid") from exc
+        if len(catalog_bytes) > PI_GATEWAY_ADAPTER_CATALOG_MAX_BYTES:
+            raise ValueError("pi_gateway_claim_catalog_too_large")
+        return value
+
     run_id: str = Field(min_length=1, max_length=64)
     attempt_id: str = Field(min_length=1, max_length=64)
     lease_token: str = Field(min_length=32, max_length=512)
@@ -229,7 +412,10 @@ class PiGatewayClaimResponse(_StrictModel):
     runtime_snapshot: dict[str, Any]
     transcript: list[dict[str, Any]] = Field(default_factory=list, max_length=100)
     secret_envelope: RuntimeSecretEnvelope
-    adapter_catalog: list[PiGatewayAdapterCatalogEntry] = Field(default_factory=list, max_length=32)
+    adapter_catalog: list[PiGatewayAdapterCatalogEntry] = Field(
+        default_factory=list,
+        max_length=PI_GATEWAY_ADAPTER_CATALOG_MAX_ENTRIES,
+    )
     internal_tools: list[dict[str, Any]] = Field(default_factory=list, max_length=64)
 
     @model_validator(mode="after")
@@ -250,6 +436,12 @@ class PiGatewayClaimResponse(_StrictModel):
         for item in self.internal_tools:
             if set(item) != {"name"} or not isinstance(item.get("name"), str) or not item["name"]:
                 raise ValueError("pi_gateway_internal_tools_invalid")
+        seen: set[str] = set()
+        for item in self.adapter_catalog:
+            identity = f"{normalized_adapter_service(item.service)}\u0000{item.adapter_visible_name}"
+            if identity in seen:
+                raise ValueError("pi_gateway_adapter_catalog_duplicate")
+            seen.add(identity)
         return self
 
 

@@ -27,12 +27,14 @@ from .contracts import (
     PiGatewayMcpFinalizeRequest,
     PiGatewayMcpPreflightRequest,
     PiGatewaySourceEvent,
+    PiGatewaySourceEventBatch,
+    PiGatewaySourceEventBatchReceipt,
     PiGatewayTerminalRequest,
 )
 from .accounting import RuntimeUsageError, RuntimeUsageService, TenantAccountingError
 from .completion import CompletionValidator, close_open_runtime_rows
 from .events import PiGatewayEventError, parse_source_event_id
-from .internal_tools import ProductionInternalToolBridge
+from .internal_tools import ProductionInternalToolBridge, append_artifact_tool_events
 from .models import PiGatewayRequestNonce
 from .service import PiGatewayClaimError, PiGatewayLeaseError, PiGatewayService, lease_deadline_epoch
 
@@ -241,6 +243,59 @@ async def source_event(
     return await _with_lock_retry(db, _do)
 
 
+@router.post(
+    "/runs/{run_id}/events/batch",
+    response_model=PiGatewaySourceEventBatchReceipt,
+    response_model_exclude_none=True,
+)
+async def source_event_batch(
+    run_id: str,
+    request: Request,
+    payload: PiGatewaySourceEventBatch,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    x_pi_run_lease: Annotated[str | None, Header()] = None,
+) -> dict[str, object]:
+    try:
+        attempt_id, _sequence = parse_source_event_id(payload.events[0].source_event_id)
+    except PiGatewayEventError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=exc.code) from exc
+    gateway_id = await _authenticate_run_access(request, db, x_pi_run_lease)
+
+    async def _do() -> dict[str, object]:
+        run = await _leased_run(db, gateway_id, run_id, attempt_id, x_pi_run_lease or "")
+        try:
+            receipt = await _service(db, gateway_id).ingest_source_event_batch(
+                run,
+                attempt_id=attempt_id,
+                events=[event.model_dump(mode="json") for event in payload.events],
+                broker=request.app.state.agent_event_broker,
+            )
+            await db.commit()
+            event_ids = [
+                item["event_id"]
+                for item in receipt["receipts"]
+                if isinstance(item, dict) and item.get("event_id") and not item.get("duplicate")
+            ]
+            if event_ids:
+                new_events = list(
+                    (
+                        await db.scalars(
+                            select(AgentEvent)
+                            .where(AgentEvent.run_id == run_id, AgentEvent.id.in_(event_ids))
+                            .order_by(AgentEvent.sequence)
+                        )
+                    ).all()
+                )
+                for event in new_events:
+                    await request.app.state.agent_event_broker.publish(event)
+            return receipt
+        except (PiGatewayEventError, RuntimeUsageError) as exc:
+            await db.rollback()
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+
+    return await _with_lock_retry(db, _do)
+
+
 @router.post("/runs/{run_id}/internal-tools")
 async def internal_tool(
     run_id: str,
@@ -276,7 +331,12 @@ async def internal_tool(
             run_id=run.id,
             profile_name=run.profile_name,
         )
+        # Pi 专属层补发 Artifact 生命周期 SSE 事件：同一事务（Run 行已由
+        # leased_run 锁定）append_locked，commit 后统一广播到 broker。
+        emitted = await append_artifact_tool_events(db, run, payload.tool_name, result)
         await db.commit()
+        for event in emitted:
+            await request.app.state.agent_event_broker.publish(event)
         return result.model_dump(mode="json")
 
     return await _with_lock_retry(db, _do)
@@ -452,7 +512,9 @@ async def terminal(
         try:
             terminal_payload = dict(payload.payload or {})
             if effective_outcome == RunStatus.CANCELLED:
-                terminal_payload.setdefault("code", "cancel_requested")
+                terminal_payload["code"] = "cancel_requested"
+            if effective_outcome == RunStatus.FAILED and payload.failure_metadata is not None:
+                terminal_payload["failure_metadata"] = payload.failure_metadata.model_dump(mode="json")
             if effective_outcome == RunStatus.COMPLETED_WITH_WARNINGS:
                 validation_warnings = await completion_validator.validate(run)
                 warnings = getattr(validation_warnings, "warnings", ())

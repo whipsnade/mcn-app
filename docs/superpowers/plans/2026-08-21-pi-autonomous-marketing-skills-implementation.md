@@ -324,6 +324,38 @@ Run 必须有当前 Run/Session/tenant 归属下至少一个已发布、不可�
 - [ ] 生产灰度 `5% → 25% → 100%`，完成生产验收、监控、文档封口和回滚演练记录，最终状态才可写为
   `PRODUCTION_RELEASE_COMPLETE`。
 
+### Task 14：本地目录输入门禁（2026-08-22，reviewed set 口径修订）
+
+- [x] 在 `kol_insight_test` 以真实 lifecycle discovery 复核当前受控目录：29 项 `approved + enabled`
+  （12/8/5/4）与 `DYNAMIC_TOOL_ALLOWLIST` 完全一致，另有 `query_user_info` quarantined。
+- [x] 不将历史 58 项文档当作可执行审核输入；不直接写 catalog、不 seed、不降低门槛、不扩张 allowlist，
+  并停止真实业务 Web UAT A/B，保留零业务 Run/模型/DataTap/积分事实。
+- [x] （2026-08-22 修订）取消固定 58-tool 前置条件：模型可见目录以**当前审核集合**为准。现行门禁为
+  lifecycle discovery、`mcp_tool_catalog` 与受控 `DYNAMIC_TOOL_ALLOWLIST` 三者集合精确一致（internal
+  name、remote name、service、输入/输出 Schema、digest 逐项一致）；quarantined/unknown/disabled 不进
+  Snapshot；`query_user_info` 保持 quarantined；Snapshot 完整不截断不分页，容量 ≤128 entries 且
+  canonical JSON ≤128 KiB。29 是当前真实审核集合事实；58 是历史预发布快照与容量回归案例（24/16/10/8），
+  保留为历史环境事实，不是最低门槛。禁止为凑数 seed catalog、直接写数据库或扩张 allowlist。
+  审核集合变化只能经正常受控变更与 lifecycle refresh 生效。
+
+### Task 14：Provider failure 安全可观测性与诊断探针（2026-08-21 重新授权）
+
+- [x] 先锁定旧 Run 根因不可恢复边界：旧 Worker 只有 error 布尔值，旧异常无分类，Child IPC 只有
+  `errorCode`，stdout/stderr 不可作为证据；不猜测或修改 provider 请求协议。
+- [x] 以 TDD 增加 `provider_failure_v1` metadata-only DTO、SDK message_end 分类、secret-free audit、
+  strict IPC frame、Gateway terminal 和 FastAPI terminal 持久化覆盖；元数据只能绑定
+  `pi_model_provider_error`。
+- [x] 保留无自动重试、无 Attempt 2、cancel/aborted→cancelled、terminal ACK-loss durable failure 和
+  58 项 catalog/claim/MCP/取消既有边界；不添加 provider/业务类型推导器。
+- [x] 完成一次受影响定向验证：Pi Gateway 9 个测试文件/100 项、Backend 34 项、Ruff、Gateway typecheck/build、
+  diff check、生产代码 secret/DSN/Bearer scan；独立只读审查为 Critical 0 / Important 0 / Minor 1。
+- [x] 将线性提交作为唯一候选推送并触发一次 CI；`32485676754` 全绿后已把精确 HEAD 部署到预发布。
+- [x] 执行探针 A/B（模型≤3、DataTap=0、钱包=0）；A/B、服务健康和 58 项 Snapshot 只读核验均通过，随后执行
+  唯一一次瑞幸咖啡 Web UAT。
+- [x] Web UAT 已执行但未通过：业务 Run 在标准 MCP Result 到达前触发 `event_buffer_overflow`，Recovery 创建
+  Attempt 2，取消后为 `run.cancelled`，但违反 Attempt=1 预算。因此不记录 `READY_FOR_FINAL_FUNCTIONAL_UAT_REVIEW`，
+  本 Task 仍不授权合入 main、生产部署或 `5% → 25% → 100%` 灰度。
+
 ## Spec Coverage Self-Review Matrix
 
 | 设计验收主题 | 覆盖任务 | 关键证据 |
@@ -338,3 +370,18 @@ Run 必须有当前 Run/Session/tenant 归属下至少一个已发布、不可�
 | 澄清、明确请求、自由组合、direct MCP、错误语义、unknown 继续 | 7、10 | Pi UAT/Completion/Gateway/skill tests |
 | 标准 Artifact/BI/Exporter 兼容与一次最终验证 | 5–7、11 | 受影响回归 + 最终唯一全量 |
 | runbook、QA、changelog、独立审查和本地 integration candidate | 10–11 | 文档、审查记录、merge candidate |
+
+### Task 15：Pi Gateway 事件投递 backpressure 修复（2026-08-21，当前续作）
+
+- [x] 保留旧行为红灯证据：固定 heartbeat、首次 transient delivery failure、同步注入 257 个事件的历史复现；记录
+  `event_buffer_overflow`、ACK=0、高水位 256、retry/heartbeat/terminal=0，并确认不涉及 provider/MCP/钱包。
+- [x] 先红后绿锁定 batch ≤32、canonical body ≤128 KiB、连续 source sequence、同批 ACK-loss 重放、gap 原子拒绝、
+  duplicate receipt、4xx/协议不重试、network/5xx 有界重试、永久故障留给 Recovery、terminal drain、取消 backlog 顺序、
+  旧单事件端点和既有 backend Recovery/terminal 回归。
+- [x] 实现独立串行 event pump，解耦 heartbeat；保留 256 有界队列，批次 ACK 前不丢弃；补齐后端事务接收、commit 后 broker、
+  metadata-only 诊断和健康计数；不改 provider/DataTap/catalog/积分/Artifact/required-artifact/迁移/历史数据。
+- [x] 建立线性提交：`f78c5ea`、`81d4bf9`、`c300ca2`、`60c47e8`、`edacdfb`、`935350b`、`65ee698`、`f0d5d86`。定向验证为 Gateway 67 passed/1 skipped、
+  Backend 29 passed、Gateway typecheck/build、Backend Ruff、diff check 全部通过。
+- [x] 独立只读审查完成：最终 HEAD `e5686a91c66255d4141887309d6d3e7f5f325b18` 为 Critical 0 / Important 0 / Minor 1；
+  Minor 仅是 `PI_GATEWAY_MAX_BUFFERED_EVENTS` 可显式配置到 256 以上，生产默认和本轮验证仍为 256。当前最高状态为
+  `READY_FOR_SINGLE_REAL_WEB_UAT_REAUTHORIZATION`，不触发候选 CI、不 push、不部署、不创建第二个真实 Web UAT。

@@ -2,6 +2,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Cookie, Depends, HTTPException, Response, status
 from sqlalchemy import select
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
@@ -70,7 +71,7 @@ async def login_with_sms(
         subject, nickname = MockSmsAuthProvider().verify(payload.phone, payload.code)
     except ValueError as error:
         raise HTTPException(status_code=401, detail=str(error)) from error
-    result = await IdentityService(db).login(provider="sms", subject=subject, nickname=nickname)
+    result = await login_with_retry(db, provider="sms", subject=subject, nickname=nickname)
     set_refresh_cookie(response, result)
     return TokenResponse(access_token=result.access_token)
 
@@ -86,9 +87,39 @@ async def login_with_wechat(
         subject, nickname = MockWechatAuthProvider().verify(payload.mock_ticket)
     except ValueError as error:
         raise HTTPException(status_code=401, detail=str(error)) from error
-    result = await IdentityService(db).login(provider="wechat", subject=subject, nickname=nickname)
+    result = await login_with_retry(db, provider="wechat", subject=subject, nickname=nickname)
     set_refresh_cookie(response, result)
     return TokenResponse(access_token=result.access_token)
+
+
+# 事务级瞬态 DB 错误：1213（死锁，MySQL 隐式回滚整个事务）与 1305（SAVEPOINT
+# 不存在——锁竞争使事务在 SAVEPOINT 与后续语句之间被隐式回滚的表层形态）。
+# 并发首登的多表建户链可偶发命中（本地 4 并发×60 轮复现 2/240），登录页不会
+# 自动重试，用户侧表现为偶发一次 500。
+_TRANSIENT_LOGIN_DB_ERROR_CODES = {1213, 1305}
+
+
+def _is_transient_login_db_error(exc: OperationalError) -> bool:
+    orig = getattr(exc, "orig", None)
+    code = getattr(orig, "args", (None,))[0]
+    return isinstance(code, int) and code in _TRANSIENT_LOGIN_DB_ERROR_CODES
+
+
+async def login_with_retry(
+    db: AsyncSession, *, provider: str, subject: str, nickname: str
+) -> LoginResult:
+    """执行登录；事务级瞬态 DB 错误回滚会话后单次幂等重试。
+
+    幂等性由登录语义保证：重试时若用户已由并发赢家创建，走既有用户路径直接
+    发新登录会话；否则正常完成建户。第二次仍失败则原样上抛，绝不第三次重试。
+    """
+    try:
+        return await IdentityService(db).login(provider=provider, subject=subject, nickname=nickname)
+    except OperationalError as exc:
+        if not _is_transient_login_db_error(exc):
+            raise
+        await db.rollback()
+        return await IdentityService(db).login(provider=provider, subject=subject, nickname=nickname)
 
 
 @auth_router.post("/refresh", response_model=TokenResponse)

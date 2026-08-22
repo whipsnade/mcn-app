@@ -2,6 +2,7 @@ import pytest
 from sqlalchemy import select
 
 from app.agent_runtime.models import AgentEvent, AgentMessage
+from app.billing.models import RuntimeUsageRecord
 from app.pi_gateway.events import PiGatewayEventError
 from app.pi_gateway.service import PiGatewayService
 
@@ -80,3 +81,92 @@ async def test_gateway_events_reject_gap_cross_attempt_and_second_completion(db_
             event_type="message.end",
             payload={},
         )
+
+
+@pytest.mark.asyncio
+async def test_gateway_event_batch_is_atomic_and_replay_returns_original_receipts(db_session, user_factory) -> None:
+    user = await user_factory()
+    run, attempt, _tenant_id = await _run(db_session, user)
+    service = PiGatewayService(db_session, gateway_id="gateway-test")
+    events = [
+        {
+            "source_event_id": f"{attempt.id}:1",
+            "sequence": 1,
+            "event_type": "usage",
+            "payload": {"input_tokens": 2, "output_tokens": 1},
+        },
+        {
+            "source_event_id": f"{attempt.id}:2",
+            "sequence": 2,
+            "event_type": "text.delta",
+            "payload": {"delta": "hello "},
+        },
+        {
+            "source_event_id": f"{attempt.id}:3",
+            "sequence": 3,
+            "event_type": "message.end",
+            "payload": {},
+        },
+    ]
+
+    first = await service.ingest_source_event_batch(
+        run,
+        attempt_id=attempt.id,
+        events=events,
+    )
+    await db_session.commit()
+    replay = await service.ingest_source_event_batch(
+        run,
+        attempt_id=attempt.id,
+        events=events,
+    )
+    await db_session.commit()
+
+    assert replay["last_acked_source_sequence"] == first["last_acked_source_sequence"]
+    assert [
+        (item.get("source_event_id"), item.get("sequence"), item.get("event_id"), item.get("usage_record_id"))
+        for item in replay["receipts"]
+    ] == [
+        (item.get("source_event_id"), item.get("sequence"), item.get("event_id"), item.get("usage_record_id"))
+        for item in first["receipts"]
+    ]
+    assert [item["sequence"] for item in first["receipts"]] == [1, 2, 3]
+    assert all(item["duplicate"] is False for item in first["receipts"])
+    assert all(item["duplicate"] is True for item in replay["receipts"])
+    assert len(list((await db_session.scalars(select(AgentEvent).where(AgentEvent.run_id == run.id))).all())) == 2
+    assert len(
+        list((await db_session.scalars(select(RuntimeUsageRecord).where(RuntimeUsageRecord.run_id == run.id))).all())
+    ) == 1
+    message = await db_session.scalar(
+        select(AgentMessage).where(AgentMessage.run_id == run.id, AgentMessage.role == "assistant")
+    )
+    assert message is not None
+    assert message.content == "hello "
+
+
+@pytest.mark.asyncio
+async def test_gateway_event_batch_rejects_gap_without_partial_write(db_session, user_factory) -> None:
+    user = await user_factory()
+    run, attempt, _tenant_id = await _run(db_session, user)
+    service = PiGatewayService(db_session, gateway_id="gateway-test")
+
+    with pytest.raises(PiGatewayEventError, match="pi_gateway_source_sequence_gap"):
+        await service.ingest_source_event_batch(
+            run,
+            attempt_id=attempt.id,
+            events=[
+                {
+                    "source_event_id": f"{attempt.id}:1",
+                    "sequence": 1,
+                    "event_type": "text.delta",
+                    "payload": {"delta": "first"},
+                },
+                {
+                    "source_event_id": f"{attempt.id}:3",
+                    "sequence": 3,
+                    "event_type": "message.end",
+                    "payload": {},
+                },
+            ],
+        )
+    assert not await db_session.scalar(select(AgentEvent).where(AgentEvent.run_id == run.id))

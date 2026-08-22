@@ -286,8 +286,21 @@ async function login(page: Page, phone: string) {
   await page.goto('/');
   await page.getByPlaceholder('请输入11位中国手机号码').fill(phone);
   await page.getByRole('button', { name: '获取验证码' }).click();
-  await page.getByRole('button', { name: '立即安全登录' }).click();
-  await expect(page.getByTitle('新建分析会话')).toBeVisible();
+  // 并发建户偶发的事务级 DB 错误（InnoDB 锁竞争使事务被隐式回滚 → SAVEPOINT
+  // 消失 → 登录 500）会让登录页永久停留；真实用户会再点一次登录（幂等：已建
+  // 用户直接发新会话）。最多重试两次点击，持续失败仍让断言失败。
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const loginButton = page.getByRole('button', { name: '立即安全登录' });
+    if (await loginButton.count()) {
+      await loginButton.click();
+    }
+    try {
+      await expect(page.getByTitle('新建分析会话')).toBeVisible({ timeout: 10_000 });
+      return;
+    } catch (error) {
+      if (attempt === 2) throw error;
+    }
+  }
 }
 
 /** 小视口（<1280px）先切到 BI 面板（xl 桌面端常显，无需切换）。 */
@@ -297,7 +310,11 @@ async function ensureBiPane(page: Page) {
 }
 
 function sseBody(runId: string, events: SseEvent[]): string {
-  return events.map(({ seq, event, payload = {} }) => (
+  // route.fulfill 的静态 body 发完即断流；前端 EventSource 靠自动重连读取
+  // phase 翻转后的事件。默认重连间隔约 3s，会让依赖重连的断言在满载 CI 下
+  // 偶发超时；显式 retry: 300 让重连窗口确定地小于断言预算。
+  const retry = 'retry: 300\n';
+  return retry + events.map(({ seq, event, payload = {} }) => (
     `id: ${seq}\nevent: ${event}\ndata: ${JSON.stringify({ ...payload, run_id: runId })}\n\n`
   )).join('');
 }
@@ -391,7 +408,7 @@ async function installArtifactRoutes(page: Page, opts: ArtifactWorkspaceRoutes) 
 // --------------------------------------------------------------------------- //
 
 test('renders the three fixed BI tabs and the two KOL sub-tabs', async ({ page }) => {
-  const phone = `138${Date.now().toString().slice(-8)}`;
+  const phone = `138${String(Math.floor(Math.random() * 1e8)).padStart(8, '0')}`;
   await installArtifactRoutes(page, {
     sessionId: 's-bi',
     sessionTitle: 'BI 会话',
@@ -422,7 +439,7 @@ test('renders the three fixed BI tabs and the two KOL sub-tabs', async ({ page }
 // --------------------------------------------------------------------------- //
 
 test('renders a published brand artifact with sections, version selector and restricted badge', async ({ page }) => {
-  const phone = `138${Date.now().toString().slice(-8)}`;
+  const phone = `138${String(Math.floor(Math.random() * 1e8)).padStart(8, '0')}`;
   const brandArt = artifactMeta('brand-art', 'brand', 'brand_report_v3', null, 2, 10);
 
   await installArtifactRoutes(page, {
@@ -460,7 +477,7 @@ test('renders a published brand artifact with sections, version selector and res
 // --------------------------------------------------------------------------- //
 
 test('shows an unread dot on a module with a newer artifact and clears it when seen', async ({ page }) => {
-  const phone = `138${Date.now().toString().slice(-8)}`;
+  const phone = `138${String(Math.floor(Math.random() * 1e8)).padStart(8, '0')}`;
   const runId = 'run-unread';
   const brandArt1 = artifactMeta('brand-art', 'brand', 'brand_report_v3', null, 1, 10);
   const brandArt2 = artifactMeta('brand-art-2', 'brand', 'brand_report_v3', null, 1, 20);
@@ -507,8 +524,9 @@ test('shows an unread dot on a module with a newer artifact and clears it when s
   await expect(page.getByText('概览', { exact: true }).first()).toBeVisible();
 
   // 目录出现更高 sequence（20）的产物 → 圆点出现（20 > 水位 10）。
+  // 断言预算覆盖一次完整「SSE 断流重连 → artifact.published → 目录刷新」链路。
   phase = 'published';
-  await expect(unreadDot).toHaveCount(1);
+  await expect(unreadDot).toHaveCount(1, { timeout: 15_000 });
   // 新产物只提示更新，不得抢占用户当前正在查看的品牌 Tab。
   await expect(brandTab).toHaveAttribute('aria-selected', 'true');
   await expect(page.getByRole('tab', { name: '活动分析' })).toHaveAttribute('aria-selected', 'false');
@@ -524,7 +542,7 @@ test('shows an unread dot on a module with a newer artifact and clears it when s
 // --------------------------------------------------------------------------- //
 
 test('renders a child insight under its parent artifact', async ({ page }) => {
-  const phone = `138${Date.now().toString().slice(-8)}`;
+  const phone = `138${String(Math.floor(Math.random() * 1e8)).padStart(8, '0')}`;
   const brandArt = artifactMeta('brand-art', 'brand', 'brand_report_v3', null, 1, 10);
   const insightArt = artifactMeta('insight-art', 'brand', 'insight_board_v1', 'brand-art', 1, 11);
 
@@ -556,7 +574,7 @@ test('renders a child insight under its parent artifact', async ({ page }) => {
 // --------------------------------------------------------------------------- //
 
 test('opens a cached KOL detail dialog from the selection list without starting a helper run', async ({ page }) => {
-  const phone = `138${Date.now().toString().slice(-8)}`;
+  const phone = `138${String(Math.floor(Math.random() * 1e8)).padStart(8, '0')}`;
   const kolSelArt = artifactMeta('kol-sel-art', 'kol-selection', 'kol_selection_v3', null, 1, 8);
 
   await installArtifactRoutes(page, {
@@ -610,7 +628,7 @@ test('opens a cached KOL detail dialog from the selection list without starting 
 // --------------------------------------------------------------------------- //
 
 test('exports the viewed version of a published artifact via the UI button', async ({ page }) => {
-  const phone = `138${Date.now().toString().slice(-8)}`;
+  const phone = `138${String(Math.floor(Math.random() * 1e8)).padStart(8, '0')}`;
   const brandArt = artifactMeta('brand-art', 'brand', 'brand_report_v3', null, 2, 10);
 
   await installArtifactRoutes(page, {
@@ -657,7 +675,7 @@ test('exports the viewed version of a published artifact via the UI button', asy
 // --------------------------------------------------------------------------- //
 
 test('exports published campaign and KOL artifacts through their fixed BI tabs', async ({ page }) => {
-  const phone = `138${Date.now().toString().slice(-8)}`;
+  const phone = `138${String(Math.floor(Math.random() * 1e8)).padStart(8, '0')}`;
   const campaignArt = artifactMeta('campaign-art', 'campaign', 'campaign_report_v2', null, 1, 12);
   const kolArt = artifactMeta('kol-art', 'kol-selection', 'kol_selection_v3', null, 1, 13);
   const exportPaths: string[] = [];

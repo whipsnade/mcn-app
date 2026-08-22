@@ -4,7 +4,9 @@ import type {
   PiGatewayAdapterCatalogEntry,
   PiGatewayClaimResponse,
   PiGatewaySourceEvent,
+  PiGatewaySourceEventBatchReceipt,
 } from "./protocol.js";
+import { parseProviderFailureMetadata, type ProviderFailureMetadata } from "./provider-failure.js";
 import type {
   McpAccountingControlPlane,
   McpFailureMetadata,
@@ -17,6 +19,8 @@ import {
   normalizePiGatewayClaimResponse,
   parsePiGatewayClaimResponse,
   parsePiGatewaySourceEvent,
+  parsePiGatewaySourceEventBatch,
+  parsePiGatewaySourceEventBatchReceipt,
 } from "./protocol.js";
 
 export interface ControlPlaneClientOptions {
@@ -39,10 +43,18 @@ export interface RunControlPlaneTransport extends ControlPlaneTransport, McpAcco
 /** Stable infrastructure classification; callers must leave the Run for recovery. */
 export class ControlPlaneUnavailableError extends Error {
   readonly code = "control_plane_unreachable" as const;
+  readonly failureClass: "timeout" | "network" | "http_5xx";
+  readonly status?: number;
 
-  constructor(cause?: unknown) {
+  constructor(
+    cause?: unknown,
+    failureClass: "timeout" | "network" | "http_5xx" = "network",
+    status?: number,
+  ) {
     super("control_plane_unreachable", { cause });
     this.name = "ControlPlaneUnavailableError";
+    this.failureClass = failureClass;
+    if (status !== undefined) this.status = status;
   }
 }
 
@@ -65,6 +77,7 @@ const BACKEND_SERVICE_SLUGS: Readonly<Record<string, string>> = Object.freeze({
   "social-grow-content": "social-grow-content-mcp",
   aktools: "aktools-mcp",
 });
+const SAFE_CONTROL_PLANE_CODE = /^[a-z0-9_:-]{1,96}$/;
 
 export class ControlPlaneClient implements ControlPlaneTransport {
   private readonly origin: string;
@@ -226,6 +239,38 @@ export class ControlPlaneClient implements ControlPlaneTransport {
     return this.request("POST", `/runs/${encodeURIComponent(runId)}/events`, event, leaseToken);
   }
 
+  async sendEventBatch(
+    runId: string,
+    events: readonly PiGatewaySourceEvent[],
+    leaseToken: string,
+  ): Promise<PiGatewaySourceEventBatchReceipt> {
+    const batch = parsePiGatewaySourceEventBatch({ events: [...events] });
+    const result = await this.request<unknown>(
+      "POST",
+      `/runs/${encodeURIComponent(runId)}/events/batch`,
+      batch,
+      leaseToken,
+    );
+    const receipt = parsePiGatewaySourceEventBatchReceipt(result);
+    if (receipt.receipts.length !== batch.events.length) {
+      throw new Error("pi_gateway_event_batch_receipt_invalid");
+    }
+    for (let index = 0; index < batch.events.length; index += 1) {
+      const event = batch.events[index];
+      const acknowledged = receipt.receipts[index];
+      if (
+        acknowledged.source_event_id !== event.source_event_id ||
+        acknowledged.sequence !== event.sequence
+      ) {
+        throw new Error("pi_gateway_event_batch_receipt_invalid");
+      }
+    }
+    if (receipt.last_acked_source_sequence !== batch.events[batch.events.length - 1].sequence) {
+      throw new Error("pi_gateway_event_batch_receipt_invalid");
+    }
+    return receipt;
+  }
+
   async sendUsage(
     runId: string,
     event: PiGatewaySourceEvent,
@@ -241,8 +286,25 @@ export class ControlPlaneClient implements ControlPlaneTransport {
     outcome: "completed" | "completed_with_warnings" | "failed" | "cancelled",
     leaseToken: string,
     payload: Record<string, unknown> = {},
+    failureMetadata?: ProviderFailureMetadata,
   ): Promise<unknown> {
-    return this.request("POST", `/runs/${encodeURIComponent(runId)}/terminal`, { attempt_id: attemptId, outcome, payload }, leaseToken);
+    if (failureMetadata !== undefined && outcome !== "failed") {
+      throw new Error("pi_provider_failure_metadata_invalid");
+    }
+    const safeFailureMetadata = failureMetadata === undefined
+      ? undefined
+      : parseProviderFailureMetadata(failureMetadata);
+    return this.request(
+      "POST",
+      `/runs/${encodeURIComponent(runId)}/terminal`,
+      {
+        attempt_id: attemptId,
+        outcome,
+        payload,
+        ...(safeFailureMetadata === undefined ? {} : { failure_metadata: safeFailureMetadata }),
+      },
+      leaseToken,
+    );
   }
 
   private async request<T = unknown>(
@@ -268,7 +330,11 @@ export class ControlPlaneClient implements ControlPlaneTransport {
     };
     if (leaseToken) headers["X-Pi-Run-Lease"] = leaseToken;
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, this.timeoutMs);
     // 外部信号（如租约 beat 超时）联动中止底层 fetch，避免超时后请求仍
     // 在服务端完成续租。
     const linkExternal = (): void => controller.abort();
@@ -286,14 +352,16 @@ export class ControlPlaneClient implements ControlPlaneTransport {
         signal: controller.signal,
       });
     } catch (error) {
-      throw new ControlPlaneUnavailableError(error);
+      throw new ControlPlaneUnavailableError(error, timedOut ? "timeout" : "network");
     } finally {
       clearTimeout(timer);
       externalSignal?.removeEventListener("abort", linkExternal);
     }
     if (response.status >= 300 && response.status < 400) throw new Error("pi_gateway_redirect_forbidden");
     if (response.status === 204) return undefined;
-    if (response.status >= 500) throw new ControlPlaneUnavailableError(new Error(`http_${response.status}`));
+    if (response.status >= 500) {
+      throw new ControlPlaneUnavailableError(new Error(`http_${response.status}`), "http_5xx", response.status);
+    }
     if (!response.ok) {
       let code = `pi_gateway_http_${response.status}`;
       try {
@@ -305,7 +373,8 @@ export class ControlPlaneClient implements ControlPlaneTransport {
           typeof (errorBody as { detail?: unknown }).detail === "string" &&
           (errorBody as { detail: string }).detail.length > 0
         ) {
-          code = (errorBody as { detail: string }).detail;
+          const detail = (errorBody as { detail: string }).detail;
+          if (SAFE_CONTROL_PLANE_CODE.test(detail)) code = detail;
         }
       } catch {
         // Preserve the stable HTTP fallback when the error body is not JSON.

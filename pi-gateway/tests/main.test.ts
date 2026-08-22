@@ -178,6 +178,20 @@ async function startFakeControlPlane(options: {
         res.end(JSON.stringify({ ok: true, cancel_requested: false }));
         return;
       }
+      if (path.endsWith("/events/batch")) {
+        const events = Array.isArray(parsed.events) ? parsed.events as Array<Record<string, unknown>> : [];
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({
+          receipts: events.map((event) => ({
+            source_event_id: event.source_event_id,
+            sequence: event.sequence,
+            duplicate: false,
+            event_id: "evt-1",
+          })),
+          last_acked_source_sequence: events.at(-1)?.sequence ?? 1,
+        }));
+        return;
+      }
       if (path.endsWith("/events")) {
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ event_id: "evt-1", sequence: 1, duplicate: false }));
@@ -316,7 +330,7 @@ describe("production gateway composition root", () => {
       expect(controlPlane.requests.every((request) => request.signatureValid)).toBe(true);
       expect(controlPlane.requests.every((request) => request.method === "POST")).toBe(true);
 
-      const event = controlPlane.requests.find((request) => request.path.endsWith("/events"));
+      const event = controlPlane.requests.find((request) => request.path.endsWith("/events/batch"));
       expect(event).toBeDefined();
       // secrets:true -> child env carried the decrypted bundle;
       // ipc:false -> the IPC run payload never contains secret material.
@@ -326,7 +340,7 @@ describe("production gateway composition root", () => {
 
       const terminal = controlPlane.requests.find((request) => request.path.endsWith("/terminal"));
       expect(terminal?.body).toMatchObject({ attempt_id: "attempt-main-1", outcome: "completed" });
-      const eventIndex = paths.findIndex((path) => path.endsWith("/events"));
+      const eventIndex = paths.findIndex((path) => path.endsWith("/events/batch"));
       const terminalIndex = paths.findIndex((path) => path.endsWith("/terminal"));
       expect(eventIndex).toBeGreaterThan(-1);
       expect(terminalIndex).toBeGreaterThan(eventIndex);
@@ -477,7 +491,7 @@ describe("production gateway composition root", () => {
         tool_name: "query_analysis_data",
         server: "insight-cube-mcp",
       });
-      const event = controlPlane.requests.find((request) => request.path.endsWith("/events"));
+      const event = controlPlane.requests.find((request) => request.path.endsWith("/events/batch"));
       // rpc-ok:false -> the lease token never appears in the child IPC payload
       expect(JSON.stringify(event?.body)).toContain("rpc-ok:false:ctx");
       const terminal = controlPlane.requests.find((request) => request.path.endsWith("/terminal"));

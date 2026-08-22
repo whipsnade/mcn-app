@@ -94,11 +94,45 @@ describe("direct MCP accounting hook", () => {
     });
   });
 
+  it("classifies call_failed with a confirmed standard MCP error as failed_confirmed", async () => {
+    const fail = vi.fn(async () => ({ ok: true }));
+    const extension = new McpAccountingExtension({
+      preflight: vi.fn(async () => ({ permit_id: "permit-1" })), finalize: vi.fn(), fail,
+    });
+    const { handlers, install } = hooks();
+    install(extension);
+    await handlers.get("tool_call")?.({
+      type: "tool_call", toolName: "query_analysis_data", toolCallId: "tool-1", input: {},
+    });
+    const content = [{ type: "text", text: "standard MCP error" }];
+    const original = structuredClone(content);
+    const event = {
+      type: "tool_result", toolName: "query_analysis_data", toolCallId: "tool-1",
+      content, isError: true, details: { error: "call_failed" },
+    };
+    await handlers.get("tool_result")?.(event);
+    expect(event.content).toEqual(original);
+    expect(fail).toHaveBeenCalledTimes(1);
+    expect(fail).toHaveBeenCalledWith(
+      { permit_id: "permit-1" },
+      "failed_confirmed",
+      {
+        version: "mcp_failure_v1",
+        source: "call_failed",
+        error_class: "call_failed",
+        dispatch_phase: "dispatched",
+        is_standard_mcp_error: true,
+        received_jsonrpc_response: true,
+      },
+    );
+  });
+
   it.each([
-    ["tool_error", "failed_confirmed"],
-    ["call_failed", "result_unknown"],
-    ["server_not_connected", "definitely_not_sent"],
-  ] as const)("preserves adapter failure classification (%s)", async (code, classification) => {
+    ["tool_error", true, "failed_confirmed"],
+    ["call_failed", true, "failed_confirmed"],
+    ["call_failed", false, "result_unknown"],
+    ["server_not_connected", true, "definitely_not_sent"],
+  ] as const)("preserves adapter failure classification (%s, isError=%s)", async (code, isError, classification) => {
     const fail = vi.fn(async () => ({ ok: true }));
     const extension = new McpAccountingExtension({
       preflight: vi.fn(async () => ({ permit_id: "permit-1" })), finalize: vi.fn(), fail,
@@ -110,37 +144,32 @@ describe("direct MCP accounting hook", () => {
     });
     await handlers.get("tool_result")?.({
       type: "tool_result", toolName: "query_analysis_data", toolCallId: "tool-1",
-      content: [{ type: "text", text: "adapter error" }], isError: true, details: { error: code },
+      content: [{ type: "text", text: "adapter error" }], isError, details: { error: code },
     });
+    if (classification === "definitely_not_sent") {
+      expect(fail).toHaveBeenCalledWith({ permit_id: "permit-1" }, "definitely_not_sent");
+      return;
+    }
     expect(fail).toHaveBeenCalledWith(
       { permit_id: "permit-1" },
       classification,
-      ...(classification === "result_unknown"
-        ? [expect.objectContaining({
-            version: "mcp_failure_v1",
-            source: code === "call_failed" ? "call_failed" : "other",
-          })]
-        : []),
-    );
-    // 提交 3：metadata-only 可观测性——call_failed → result_unknown 且携带
-    // error_class（adapter error code）与 dispatch_phase=dispatched。
-    if (classification === "result_unknown") {
-      const metadata = (fail.mock.calls[0] as unknown[] | undefined)?.[2];
-      expect(metadata).toMatchObject({
+      expect.objectContaining({
         version: "mcp_failure_v1",
         source: code === "call_failed" ? "call_failed" : "other",
         error_class: code,
-      });
-      if (code === "call_failed") {
-        expect(metadata).toMatchObject({ dispatch_phase: "dispatched" });
-      }
+        ...(isError ? { is_standard_mcp_error: true, received_jsonrpc_response: true } : {}),
+      }),
+    );
+    const metadata = (fail.mock.calls[0] as unknown[] | undefined)?.[2];
+    if (code === "call_failed") {
+      expect(metadata).toMatchObject({ dispatch_phase: "dispatched" });
     }
   });
 
   it.each([
-    [true, "some_future_error"],
-    [false, "some_future_error"],
-  ])("keeps an unknown adapter error code as result_unknown (isError=%s)", async (isError, code) => {
+    [true, "some_future_error", "failed_confirmed"],
+    [false, "some_future_error", "result_unknown"],
+  ])("classifies an unknown adapter error code by the response signal (isError=%s)", async (isError, code, classification) => {
     const fail = vi.fn(async () => ({ ok: true }));
     const extension = new McpAccountingExtension({
       preflight: vi.fn(async () => ({ permit_id: "permit-1" })), finalize: vi.fn(), fail,
@@ -156,10 +185,9 @@ describe("direct MCP accounting hook", () => {
     });
     expect(fail).toHaveBeenCalledWith(
       { permit_id: "permit-1" },
-      "result_unknown",
+      classification,
       expect.objectContaining({ version: "mcp_failure_v1", source: "other" }),
     );
-    // 未知 error code 无法确认外发阶段：dispatch_phase=unknown 且保留 error_class。
     const metadata = (fail.mock.calls[0] as unknown[] | undefined)?.[2];
     expect(metadata).toMatchObject({
       version: "mcp_failure_v1",
@@ -171,8 +199,6 @@ describe("direct MCP accounting hook", () => {
         : {}),
     });
     if (isError) {
-      // Minor #2：SDK isError 标记确认收到标准 MCP error 响应 → 赋值 true；
-      // 未确认路径保持省略（不猜 false）。
       expect(metadata).not.toHaveProperty("received_jsonrpc_response", false);
     }
   });
@@ -192,7 +218,15 @@ describe("direct MCP accounting hook", () => {
       content: [{ type: "text", text: "standard MCP error" }], isError: true, details: {},
     });
 
-    expect(fail).toHaveBeenCalledWith({ permit_id: "permit-1" }, "failed_confirmed");
+    expect(fail).toHaveBeenCalledWith(
+      { permit_id: "permit-1" },
+      "failed_confirmed",
+      expect.objectContaining({
+        version: "mcp_failure_v1",
+        is_standard_mcp_error: true,
+        received_jsonrpc_response: true,
+      }),
+    );
   });
 
   it("keeps the permit recoverable when the accounting ACK is not confirmed", async () => {

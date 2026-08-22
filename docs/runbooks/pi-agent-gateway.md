@@ -374,3 +374,19 @@ DataTap≤5、积分≤50、retries=0、fresh Run=0。验收必须同时保存�
 并保留 append-only 证据。通过后只推进到
 `REAL_UAT_MCP_PASS_THROUGH_AND_CANCEL_PASS / READY_FOR_FINAL_FUNCTIONAL_UAT`；本轮不做 5%→25%→100%
 生产灰度。
+
+### 目录输入前置条件（2026-08-22 修订）
+
+真实 Web UAT 的目录输入前置条件是**当前审核集合（reviewed set）本身**，不是任何固定工具数量。现行门禁：
+
+1. 模型可见目录 = 当前 `approved + enabled` 工具集合（当前真实事实为 29 项，分布
+   `insight-cube-mcp=12`、`social-grow-mcp=8`、`social-grow-content-mcp=5`、`bilibili-mcp=4`），
+   不是固定 58 项；58 是历史预发布环境快照与容量修复回归案例（24/16/10/8），保留为历史事实，
+   不构成最低门槛。
+2. lifecycle discovery、`mcp_tool_catalog` 与受控 `DYNAMIC_TOOL_ALLOWLIST` 三者的集合必须精确一致：
+   每一项 internal name、remote name、service、输入/输出 Schema 与 digest 一致。
+3. quarantined/unknown/disabled 工具不得进入 Snapshot；`query_user_info` 必须保持 quarantined。
+4. Snapshot 必须完整包含审核集合，不截断、不分页；容量边界为 ≤128 entries 且 canonical JSON
+   ≤128 KiB（超过即 `runtime_adapter_catalog_too_large`，属防御性边界而非业务数量目标）。
+5. 禁止为了凑数 seed catalog、直接写数据库或扩张 allowlist；审核集合变化只能经正常受控变更与
+   lifecycle refresh 生效。

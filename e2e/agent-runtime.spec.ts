@@ -75,12 +75,28 @@ async function login(page: Page, phone: string) {
   await page.goto('/');
   await page.getByPlaceholder('请输入11位中国手机号码').fill(phone);
   await page.getByRole('button', { name: '获取验证码' }).click();
-  await page.getByRole('button', { name: '立即安全登录' }).click();
-  await expect(page.getByTitle('新建分析会话')).toBeVisible();
+  // 并发建户偶发的事务级 DB 错误（InnoDB 锁竞争使事务被隐式回滚 → SAVEPOINT
+  // 消失 → 登录 500）会让登录页永久停留；真实用户会再点一次登录（幂等：已建
+  // 用户直接发新会话）。最多重试两次点击，持续失败仍让断言失败。
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const loginButton = page.getByRole('button', { name: '立即安全登录' });
+    if (await loginButton.count()) {
+      await loginButton.click();
+    }
+    try {
+      await expect(page.getByTitle('新建分析会话')).toBeVisible({ timeout: 10_000 });
+      return;
+    } catch (error) {
+      if (attempt === 2) throw error;
+    }
+  }
 }
 
 async function uniquePhone(): Promise<string> {
-  return `${AUTH_PHONE_PREFIX}${Date.now().toString().slice(-8)}`;
+  // 并行 worker 的相邻用例可能在同一毫秒调用本函数：Date.now 后缀会碰撞，
+  // 同手机号并发首登会在 auth_identities 唯一键上竞争（输家 500，登录页
+  // 停滞）。随机 8 位让碰撞概率降到 1e-8 量级。
+  return `${AUTH_PHONE_PREFIX}${String(Math.floor(Math.random() * 1e8)).padStart(8, '0')}`;
 }
 
 async function mockWalletAndFavorites(page: Page) {
@@ -681,8 +697,9 @@ test('restores the session list after reload', async ({ page }) => {
   await expect(page.getByRole('button', { name: /选择会话 恢复会话/ })).toBeVisible();
 
   // reload 后经 refresh token 恢复登录态并重放会话列表（软删除不可见会话除外）。
+  // refresh→引导链路在 CI 满载下偶发超默认 5s：放宽预算，语义不变。
   await page.reload();
-  await expect(page.getByTitle('新建分析会话')).toBeVisible();
+  await expect(page.getByTitle('新建分析会话')).toBeVisible({ timeout: 20_000 });
   await expect(page.getByRole('button', { name: /选择会话 恢复会话/ })).toBeVisible();
 });
 
@@ -745,7 +762,8 @@ test('restores historical run cards with replayed steps after reload', async ({ 
   // reload 后两张历史卡仍完整：步骤可见、thinking 折叠可回看。
   await page.reload();
   await ensureChatPane(page);
-  await expect(page.getByRole('button', { name: /执行卡 · 共 \d+ 步 · 分析完成/ })).toHaveCount(2);
+  // reload→refresh→历史 Run 回放链路在 CI 满载下偶发超默认 5s：放宽预算，语义不变。
+  await expect(page.getByRole('button', { name: /执行卡 · 共 \d+ 步 · 分析完成/ })).toHaveCount(2, { timeout: 20_000 });
   await page.getByRole('button', { name: /执行卡 · 共 \d+ 步 · 分析完成/ }).first().click();
   const historyCard = page.getByRole('region', { name: '执行卡' }).first();
   await expect(historyCard.getByText('brand_search', { exact: true })).toBeVisible();

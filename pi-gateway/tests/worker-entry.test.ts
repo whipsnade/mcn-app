@@ -6,7 +6,8 @@ import { fileURLToPath } from "node:url";
 
 import { classifyWorkerError, installWorkerSignalHandlers, runSingleWorker, spawnIsolatedWorker } from "../src/worker-entry.js";
 import { ModelRequestBudget } from "../src/model-request-budget.js";
-import type { ClaimedRun, PiRunSession, PiSessionFactory, SecretBundle } from "../src/protocol.js";
+import { buildProviderFailureMetadata } from "../src/provider-failure.js";
+import type { ClaimedRun, PiRunSession, PiSdkEvent, PiSessionFactory, SecretBundle } from "../src/protocol.js";
 
 const work: ClaimedRun = {
   runId: "run-worker",
@@ -110,6 +111,91 @@ describe("single-run worker lifecycle", () => {
     };
     await expect(runSingleWorker(work, secrets, { sessionFactory: { create: async () => session } })).rejects.toThrow("fake_failure");
     expect(order).toEqual(["prompt", "abort", "unsubscribe", "dispose"]);
+  });
+
+  it("keeps provider errorMessage out of SDK audit callbacks and preserves safe metadata", async () => {
+    const raw = "401 api_key=sk-proj-secret Bearer bearer-secret prompt=分析瑞幸咖啡";
+    const audits: PiSdkEvent[] = [];
+    const session: PiRunSession = {
+      prompt: async () => undefined,
+      subscribe: (listener) => {
+        listener({
+          type: "sdk_event",
+          eventType: "message_end",
+          event: { type: "message_end", message: { stopReason: "error", errorMessage: raw } },
+        });
+        return () => undefined;
+      },
+      abort: async () => undefined,
+      dispose: async () => undefined,
+      systemPrompt: () => "policy",
+      activeToolNames: () => [],
+      cwd: () => "/tmp/worker",
+    };
+
+    await expect(runSingleWorker(work, secrets, {
+      sessionFactory: { create: async () => session },
+      onSdkEvent: (event) => audits.push(event),
+    })).rejects.toMatchObject({
+      code: "pi_model_provider_error",
+      failureMetadata: expect.objectContaining({
+        failure_class: "authentication",
+        http_status: 401,
+      }),
+    });
+    expect(JSON.stringify(audits)).not.toContain("sk-proj-secret");
+    expect(JSON.stringify(audits)).not.toContain("bearer-secret");
+    expect(JSON.stringify(audits)).not.toContain("分析瑞幸咖啡");
+    expect(JSON.stringify(audits)).not.toContain("errorMessage");
+  });
+
+  it("does not turn an SDK aborted message into a provider failure", async () => {
+    const session: PiRunSession = {
+      prompt: async () => undefined,
+      subscribe: (listener) => {
+        listener({
+          type: "sdk_event",
+          eventType: "message_end",
+          event: { type: "message_end", message: { stopReason: "aborted", errorMessage: "cancelled" } },
+        });
+        return () => undefined;
+      },
+      abort: async () => undefined,
+      dispose: async () => undefined,
+      systemPrompt: () => "policy",
+      activeToolNames: () => [],
+      cwd: () => "/tmp/worker",
+    };
+
+    await expect(runSingleWorker(work, secrets, {
+      sessionFactory: { create: async () => session },
+    })).resolves.toBeUndefined();
+  });
+
+  it("preserves provider failure metadata when prompt rejects after message_end", async () => {
+    const session: PiRunSession = {
+      prompt: async () => { throw new Error("sdk_prompt_rejected"); },
+      subscribe: (listener) => {
+        listener({
+          type: "sdk_event",
+          eventType: "message_end",
+          event: { type: "message_end", message: { stopReason: "error", errorMessage: "HTTP 503 upstream" } },
+        });
+        return () => undefined;
+      },
+      abort: async () => undefined,
+      dispose: async () => undefined,
+      systemPrompt: () => "policy",
+      activeToolNames: () => [],
+      cwd: () => "/tmp/worker",
+    };
+
+    await expect(runSingleWorker(work, secrets, {
+      sessionFactory: { create: async () => session },
+    })).rejects.toMatchObject({
+      code: "pi_model_provider_error",
+      failureMetadata: expect.objectContaining({ failure_class: "upstream_5xx", http_status: 503 }),
+    });
   });
 
   it("flushes the pending delta tail before normal, provider, decision-limit and prompt exits", async () => {
@@ -375,6 +461,32 @@ describe("pi_decision_limit stable failure classification", () => {
     });
 
     await expect(child.done).rejects.toMatchObject({ message: "pi_decision_limit" });
+  });
+
+  it("forwards only validated provider metadata from a child terminal frame", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "worker-provider-failure-"));
+    const script = join(directory, "provider-failure.mjs");
+    const metadata = buildProviderFailureMetadata(
+      { stopReason: "error", errorMessage: "429 rate limited" },
+      new Date("2026-08-21T08:00:00.000Z"),
+    );
+    await writeFile(script, [
+      "process.on('message', () => {",
+      `  process.send(${JSON.stringify({ type: "failed", runId: "run-worker", errorCode: "pi_model_provider_error", failure_metadata: metadata })}, () => {`,
+      "    process.disconnect();",
+      "    process.exit(1);",
+      "  });",
+      "});",
+    ].join("\n"));
+    const child = spawnIsolatedWorker(work, secrets, {
+      workerScript: script,
+      parentEnv: { PATH: "/usr/bin" },
+    });
+
+    await expect(child.done).rejects.toMatchObject({
+      message: "pi_model_provider_error",
+      failureMetadata: metadata,
+    });
   });
 
   it("runSingleWorker rethrows pi_decision_limit when the session budget was exceeded", async () => {
