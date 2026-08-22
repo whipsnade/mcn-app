@@ -397,7 +397,7 @@ async function installArtifactRoutes(page: Page, opts: ArtifactWorkspaceRoutes) 
 // --------------------------------------------------------------------------- //
 
 test('renders the three fixed BI tabs and the two KOL sub-tabs', async ({ page }) => {
-  const phone = `138${Date.now().toString().slice(-8)}`;
+  const phone = `138${String(Math.floor(Math.random() * 1e8)).padStart(8, '0')}`;
   await installArtifactRoutes(page, {
     sessionId: 's-bi',
     sessionTitle: 'BI 会话',
@@ -428,7 +428,7 @@ test('renders the three fixed BI tabs and the two KOL sub-tabs', async ({ page }
 // --------------------------------------------------------------------------- //
 
 test('renders a published brand artifact with sections, version selector and restricted badge', async ({ page }) => {
-  const phone = `138${Date.now().toString().slice(-8)}`;
+  const phone = `138${String(Math.floor(Math.random() * 1e8)).padStart(8, '0')}`;
   const brandArt = artifactMeta('brand-art', 'brand', 'brand_report_v3', null, 2, 10);
 
   await installArtifactRoutes(page, {
@@ -466,7 +466,7 @@ test('renders a published brand artifact with sections, version selector and res
 // --------------------------------------------------------------------------- //
 
 test('shows an unread dot on a module with a newer artifact and clears it when seen', async ({ page }) => {
-  const phone = `138${Date.now().toString().slice(-8)}`;
+  const phone = `138${String(Math.floor(Math.random() * 1e8)).padStart(8, '0')}`;
   const runId = 'run-unread';
   const brandArt1 = artifactMeta('brand-art', 'brand', 'brand_report_v3', null, 1, 10);
   const brandArt2 = artifactMeta('brand-art-2', 'brand', 'brand_report_v3', null, 1, 20);
@@ -531,7 +531,7 @@ test('shows an unread dot on a module with a newer artifact and clears it when s
 // --------------------------------------------------------------------------- //
 
 test('renders a child insight under its parent artifact', async ({ page }) => {
-  const phone = `138${Date.now().toString().slice(-8)}`;
+  const phone = `138${String(Math.floor(Math.random() * 1e8)).padStart(8, '0')}`;
   const brandArt = artifactMeta('brand-art', 'brand', 'brand_report_v3', null, 1, 10);
   const insightArt = artifactMeta('insight-art', 'brand', 'insight_board_v1', 'brand-art', 1, 11);
 
@@ -563,7 +563,7 @@ test('renders a child insight under its parent artifact', async ({ page }) => {
 // --------------------------------------------------------------------------- //
 
 test('opens a cached KOL detail dialog from the selection list without starting a helper run', async ({ page }) => {
-  const phone = `138${Date.now().toString().slice(-8)}`;
+  const phone = `138${String(Math.floor(Math.random() * 1e8)).padStart(8, '0')}`;
   const kolSelArt = artifactMeta('kol-sel-art', 'kol-selection', 'kol_selection_v3', null, 1, 8);
 
   await installArtifactRoutes(page, {
@@ -617,7 +617,7 @@ test('opens a cached KOL detail dialog from the selection list without starting 
 // --------------------------------------------------------------------------- //
 
 test('exports the viewed version of a published artifact via the UI button', async ({ page }) => {
-  const phone = `138${Date.now().toString().slice(-8)}`;
+  const phone = `138${String(Math.floor(Math.random() * 1e8)).padStart(8, '0')}`;
   const brandArt = artifactMeta('brand-art', 'brand', 'brand_report_v3', null, 2, 10);
 
   await installArtifactRoutes(page, {
@@ -664,7 +664,7 @@ test('exports the viewed version of a published artifact via the UI button', asy
 // --------------------------------------------------------------------------- //
 
 test('exports published campaign and KOL artifacts through their fixed BI tabs', async ({ page }) => {
-  const phone = `138${Date.now().toString().slice(-8)}`;
+  const phone = `138${String(Math.floor(Math.random() * 1e8)).padStart(8, '0')}`;
   const campaignArt = artifactMeta('campaign-art', 'campaign', 'campaign_report_v2', null, 1, 12);
   const kolArt = artifactMeta('kol-art', 'kol-selection', 'kol_selection_v3', null, 1, 13);
   const exportPaths: string[] = [];

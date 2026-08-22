@@ -82,7 +82,10 @@ async function login(page: Page, phone: string) {
 }
 
 async function uniquePhone(): Promise<string> {
-  return `${AUTH_PHONE_PREFIX}${Date.now().toString().slice(-8)}`;
+  // 并行 worker 的相邻用例可能在同一毫秒调用本函数：Date.now 后缀会碰撞，
+  // 同手机号并发首登会在 auth_identities 唯一键上竞争（输家 500，登录页
+  // 停滞）。随机 8 位让碰撞概率降到 1e-8 量级。
+  return `${AUTH_PHONE_PREFIX}${String(Math.floor(Math.random() * 1e8)).padStart(8, '0')}`;
 }
 
 async function mockWalletAndFavorites(page: Page) {
