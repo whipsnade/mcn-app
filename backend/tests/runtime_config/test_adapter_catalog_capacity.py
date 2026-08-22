@@ -6,7 +6,7 @@ import pytest
 from pydantic import SecretStr
 from sqlalchemy import select
 
-from app.mcp_gateway.models import McpToolCatalog
+from app.mcp_gateway.models import McpToolCatalog, McpToolDiscovery
 from app.runtime_config.crypto import SecretCipher
 from app.runtime_config.schemas import RuntimeSecretBundle
 from app.runtime_config.service import RuntimeConfigError, RuntimeConfigService
@@ -125,6 +125,45 @@ async def test_reviewed_adapter_catalog_rejects_canonical_json_over_128_kib() ->
     service = RuntimeConfigService(Database(), cipher=_cipher())
     with pytest.raises(RuntimeConfigError, match="runtime_adapter_catalog_too_large"):
         await service._reviewed_adapter_catalog()
+
+
+@pytest.mark.asyncio
+async def test_reviewed_adapter_catalog_rejects_ambiguous_discovery_remote_name(db_session) -> None:
+    catalog = _catalog_rows(1, prefix="ambiguous")[0]
+    now = datetime.now(UTC).replace(tzinfo=None)
+    db_session.add(catalog)
+    db_session.add_all(
+        [
+            McpToolDiscovery(
+                id=str(uuid4()),
+                service_slug=catalog.service_slug,
+                remote_name="remote-one",
+                description="first",
+                input_schema_json={"type": "object"},
+                output_schema_json=None,
+                discovery_digest=catalog.discovery_digest,
+                review_status="approved",
+                discovered_at=now,
+                updated_at=now,
+            ),
+            McpToolDiscovery(
+                id=str(uuid4()),
+                service_slug=catalog.service_slug,
+                remote_name="remote-two",
+                description="second",
+                input_schema_json={"type": "object"},
+                output_schema_json=None,
+                discovery_digest=catalog.discovery_digest,
+                review_status="approved",
+                discovered_at=now,
+                updated_at=now,
+            ),
+        ]
+    )
+    await db_session.flush()
+
+    with pytest.raises(RuntimeConfigError, match="runtime_adapter_catalog_ambiguous_remote"):
+        await RuntimeConfigService(db_session, cipher=_cipher())._reviewed_adapter_catalog()
 
 
 @pytest.mark.asyncio

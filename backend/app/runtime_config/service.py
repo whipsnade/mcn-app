@@ -8,7 +8,7 @@ from typing import Any, Literal, Mapping
 from uuid import uuid4
 
 from pydantic import SecretStr
-from sqlalchemy import and_, func, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent_runtime.models import AgentRun
@@ -399,37 +399,42 @@ class RuntimeConfigService:
 
     async def _reviewed_adapter_catalog(self) -> list[dict[str, str]]:
         """Return the current reviewed adapter projection for a new Pi Run."""
-        rows = (
-            await self.db.execute(
-                select(McpToolCatalog, McpToolDiscovery.remote_name)
-                .outerjoin(
-                    McpToolDiscovery,
-                    and_(
-                        McpToolDiscovery.service_slug == McpToolCatalog.service_slug,
-                        McpToolDiscovery.discovery_digest == McpToolCatalog.discovery_digest,
-                        McpToolDiscovery.review_status == "approved",
-                    ),
-                )
-                .where(
-                    McpToolCatalog.review_status == "approved",
-                    McpToolCatalog.is_enabled.is_(True),
-                )
-                .order_by(McpToolCatalog.internal_tool_name)
+        catalog_result = await self.db.execute(
+            select(McpToolCatalog)
+            .where(
+                McpToolCatalog.review_status == "approved",
+                McpToolCatalog.is_enabled.is_(True),
             )
-        ).all()
-        if len(rows) > PI_GATEWAY_ADAPTER_CATALOG_MAX_ENTRIES:
+            .order_by(McpToolCatalog.internal_tool_name)
+        )
+        catalogs = list(catalog_result.scalars().all())
+        if len(catalogs) > PI_GATEWAY_ADAPTER_CATALOG_MAX_ENTRIES:
             # 这是 control-plane catalog 的防御性边界，不是模型可见工具数量
             # 或 Pi SDK 的业务限制；不要静默截断已审核能力。
             raise RuntimeConfigError("runtime_adapter_catalog_too_large")
+        discovery_result = await self.db.execute(
+            select(
+                McpToolDiscovery.service_slug,
+                McpToolDiscovery.discovery_digest,
+                McpToolDiscovery.remote_name,
+            ).where(McpToolDiscovery.review_status == "approved")
+        )
+        discovery_rows = list(discovery_result.all())
+        remote_names: dict[tuple[str, str], set[str]] = {}
+        for service_slug, discovery_digest, remote_name in discovery_rows:
+            remote_names.setdefault((service_slug, discovery_digest), set()).add(remote_name)
         entries: list[dict[str, str]] = []
-        for catalog, discovered_remote_name in rows:
+        for catalog in catalogs:
             digest = catalog.discovery_digest
+            matches = remote_names.get((catalog.service_slug, digest), set())
+            if len(matches) > 1:
+                raise RuntimeConfigError("runtime_adapter_catalog_ambiguous_remote")
             entries.append(
                 {
                     "catalog_entry_id": catalog.id,
                     "adapter_visible_name": catalog.internal_tool_name,
                     "service": catalog.service_slug,
-                    "remote_name": discovered_remote_name or catalog.internal_tool_name,
+                    "remote_name": next(iter(matches), catalog.internal_tool_name),
                     "input_schema_digest": (
                         digest if digest.startswith("sha256:") else f"sha256:{digest}"
                     ),
