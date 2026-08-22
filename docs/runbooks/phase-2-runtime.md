@@ -98,12 +98,20 @@ cd backend
 - 当前门禁为 `REAL_UAT_CATALOG_CLAIM_FIXED_PROVIDER_FAILED / NOT_READY_FOR_FINAL_FUNCTIONAL_UAT`。
   在新的 provider/发布授权和成功功能 UAT 前，不得合入 main、生产部署或执行灰度。
 
-### 2026-08-22 本地目录输入门禁
+### 2026-08-22 本地目录输入门禁（reviewed set 口径，替代固定 58-tool 门禁）
 
-本地隔离环境的真实 lifecycle discovery 实测只有 29 项 `approved + enabled` 工具（12/8/5/4）和一个
-quarantined `query_user_info`，与当前 `DYNAMIC_TOOL_ALLOWLIST` 的 29 项输入一致。它不满足本发布批次
-要求的 58-tool Snapshot 前置条件，且不是 adapter capacity 截断。真实 Web UAT A/B 必须保持未执行；等待
-可复核的 58-tool 审核 manifest 经正常受控变更、刷新并在 `kol_insight_test` 验证后，才可重新开始。
+本地隔离环境的真实 lifecycle discovery 实测为 29 项 `approved + enabled` 工具（12/8/5/4）和一个
+quarantined `query_user_info`，与当前 `DYNAMIC_TOOL_ALLOWLIST` 的 29 项输入精确一致。**该 29 项审核
+集合本身就是现行目录输入前置条件**；固定 58-tool 门禁已取消（58 是历史预发布环境快照与容量修复回归
+案例，不是最低门槛，保留为历史事实）。现行门禁：
+
+1. 模型可见目录 = 当前 `approved + enabled` 集合；lifecycle discovery、`mcp_tool_catalog` 与受控
+   `DYNAMIC_TOOL_ALLOWLIST` 三者集合精确一致（internal name、remote name、service、输入/输出 Schema、
+   digest 逐项一致）。
+2. quarantined/unknown/disabled 不得进入 Snapshot；`query_user_info` 保持 quarantined。
+3. Snapshot 完整包含审核集合，不截断、不分页；容量边界 ≤128 entries 且 canonical JSON ≤128 KiB。
+4. 禁止为凑数 seed catalog、直接写数据库或扩张 allowlist；审核集合变化只能经正常受控变更与
+   lifecycle refresh 生效。
 
 ## UAT 部署
 
@@ -137,7 +145,8 @@ fingerprint 和毫秒 UTC 时间戳。原始 `errorMessage` 只在 Worker 内存
 
 总预算为模型最多 3 次、DataTap 0、钱包/积分 0。401/403 停止并只报告 credential reference/version；404
 停在 endpoint/model 配置核对；429/5xx 记录上游窗口并停止；context_length 先制定文件级修复计划；invalid_request
-只保留脱敏分类和 fingerprint。只有 A/B 均成功，且 58 项 Snapshot 仍只读完整，才可进入唯一一次瑞幸咖啡 Web UAT。
+只保留脱敏分类和 fingerprint。只有 A/B 均成功，且当前审核集合 Snapshot 仍只读完整（历史预发布环境当时
+为 58 项；现行本地审核集合为 29 项），才可进入唯一一次瑞幸咖啡 Web UAT。
 
 ### 2026-08-21 实际执行结果
 

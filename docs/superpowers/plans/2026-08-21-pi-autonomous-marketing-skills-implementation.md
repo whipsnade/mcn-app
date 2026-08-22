@@ -324,14 +324,19 @@ Run 必须有当前 Run/Session/tenant 归属下至少一个已发布、不可�
 - [ ] 生产灰度 `5% → 25% → 100%`，完成生产验收、监控、文档封口和回滚演练记录，最终状态才可写为
   `PRODUCTION_RELEASE_COMPLETE`。
 
-### Task 14：本地目录输入门禁（2026-08-22）
+### Task 14：本地目录输入门禁（2026-08-22，reviewed set 口径修订）
 
 - [x] 在 `kol_insight_test` 以真实 lifecycle discovery 复核当前受控目录：29 项 `approved + enabled`
   （12/8/5/4）与 `DYNAMIC_TOOL_ALLOWLIST` 完全一致，另有 `query_user_info` quarantined。
 - [x] 不将历史 58 项文档当作可执行审核输入；不直接写 catalog、不 seed、不降低门槛、不扩张 allowlist，
   并停止真实业务 Web UAT A/B，保留零业务 Run/模型/DataTap/积分事实。
-- [ ] 等待目录/安全审批提供可复核的 58-tool manifest，经正常受控变更和 lifecycle refresh 后重启本地
-  128 entries/128 KiB Snapshot 核验与真实 Web UAT。
+- [x] （2026-08-22 修订）取消固定 58-tool 前置条件：模型可见目录以**当前审核集合**为准。现行门禁为
+  lifecycle discovery、`mcp_tool_catalog` 与受控 `DYNAMIC_TOOL_ALLOWLIST` 三者集合精确一致（internal
+  name、remote name、service、输入/输出 Schema、digest 逐项一致）；quarantined/unknown/disabled 不进
+  Snapshot；`query_user_info` 保持 quarantined；Snapshot 完整不截断不分页，容量 ≤128 entries 且
+  canonical JSON ≤128 KiB。29 是当前真实审核集合事实；58 是历史预发布快照与容量回归案例（24/16/10/8），
+  保留为历史环境事实，不是最低门槛。禁止为凑数 seed catalog、直接写数据库或扩张 allowlist。
+  审核集合变化只能经正常受控变更与 lifecycle refresh 生效。
 
 ### Task 14：Provider failure 安全可观测性与诊断探针（2026-08-21 重新授权）
 

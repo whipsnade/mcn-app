@@ -518,10 +518,14 @@ READY_FOR_FINAL_FUNCTIONAL_UAT_REVIEW`；在此之前不得合入 main、生产�
 - 因此该结果不是 128 entries/128 KiB adapter capacity 修复的截断回归。历史文档里的 58 项
   （24/16/10/8）没有对应的当前受控 allowlist/manifest、Schema 和 discovery 签名来源，不能作为运行时
   审核输入直接恢复。
-- 本轮不直接写 catalog、不手工 seed、不降低 58 项门槛、不扩张 allowlist，也未创建任何真实业务
+- 本轮不直接写 catalog、不手工 seed、不降低容量边界（128 entries/128 KiB）、不扩张 allowlist，也未创建任何真实业务
   Session/Run/Attempt、模型请求、DataTap dispatch 或积分扣费。UAT A/B 均标记为未执行，不能宣称
   `LOCAL_REAL_UAT_MCP_PASS_THROUGH_AND_CANCEL_PASS` 或 `LOCAL_FINAL_FUNCTIONAL_UAT_PASS`。
-- 前置条件：目录/安全审批责任方须提供可追溯的 58-tool 审核 manifest（内部名、远端名、服务、审核描述、
-  输入/输出 Schema、启用/批准状态与可复核版本或签名）。该输入经正常受控变更和真实 lifecycle refresh 后，
-  必须在 `kol_insight_test` 生成恰好 58 项 `approved + enabled`，才可重新冻结 128 entries/128 KiB
-  Snapshot 并执行授权的真实 Web UAT。
+- **（2026-08-22 修订）目录输入门禁改为 reviewed set 口径**：此前“须提供可追溯的 58-tool 审核 manifest 且
+  恰好生成 58 项”的前置条件取消——它是把历史预发布环境事实误用为最低门槛。现行门禁：模型可见目录 =
+  当前 `approved + enabled` 集合（本地实测 29 项，12/8/5/4）；lifecycle discovery、`mcp_tool_catalog` 与
+  受控 `DYNAMIC_TOOL_ALLOWLIST` 三者集合精确一致（internal name、remote name、service、输入/输出 Schema、
+  digest 逐项一致）；quarantined/unknown/disabled 不进 Snapshot 且 `query_user_info` 保持 quarantined；
+  Snapshot 完整不截断不分页，容量 ≤128 entries 且 canonical JSON ≤128 KiB。58 项（24/16/10/8）保留为
+  历史预发布快照与容量修复回归案例；禁止为凑数 seed catalog、直接写数据库或扩张 allowlist，审核集合
+  变化只能经正常受控变更与 lifecycle refresh 生效。
