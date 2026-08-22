@@ -9,8 +9,6 @@ production Activation 与 Revision，v2 manifest 场景下服务端链路必须�
 
 from __future__ import annotations
 
-import pytest
-
 from app.marketing_capability_pack.runtime import build_marketing_run_capability
 from app.marketing_skills.snapshot import (
     SkillSnapshotService,
