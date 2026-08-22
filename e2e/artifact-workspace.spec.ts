@@ -297,7 +297,11 @@ async function ensureBiPane(page: Page) {
 }
 
 function sseBody(runId: string, events: SseEvent[]): string {
-  return events.map(({ seq, event, payload = {} }) => (
+  // route.fulfill 的静态 body 发完即断流；前端 EventSource 靠自动重连读取
+  // phase 翻转后的事件。默认重连间隔约 3s，会让依赖重连的断言在满载 CI 下
+  // 偶发超时；显式 retry: 300 让重连窗口确定地小于断言预算。
+  const retry = 'retry: 300\n';
+  return retry + events.map(({ seq, event, payload = {} }) => (
     `id: ${seq}\nevent: ${event}\ndata: ${JSON.stringify({ ...payload, run_id: runId })}\n\n`
   )).join('');
 }
@@ -507,8 +511,9 @@ test('shows an unread dot on a module with a newer artifact and clears it when s
   await expect(page.getByText('概览', { exact: true }).first()).toBeVisible();
 
   // 目录出现更高 sequence（20）的产物 → 圆点出现（20 > 水位 10）。
+  // 断言预算覆盖一次完整「SSE 断流重连 → artifact.published → 目录刷新」链路。
   phase = 'published';
-  await expect(unreadDot).toHaveCount(1);
+  await expect(unreadDot).toHaveCount(1, { timeout: 15_000 });
   // 新产物只提示更新，不得抢占用户当前正在查看的品牌 Tab。
   await expect(brandTab).toHaveAttribute('aria-selected', 'true');
   await expect(page.getByRole('tab', { name: '活动分析' })).toHaveAttribute('aria-selected', 'false');
