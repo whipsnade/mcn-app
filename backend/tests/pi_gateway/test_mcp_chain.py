@@ -11,7 +11,7 @@ from pydantic import ValidationError
 from sqlalchemy import select
 
 from app.agent_runtime.models import AgentRun, AgentRunAttempt, AgentSession, AgentStep, AgentToolCall, EvidenceItem
-from app.billing.models import TenantWallet
+from app.billing.models import TenantWallet, TenantWalletTransaction
 from app.mcp_gateway.models import McpToolCatalog, McpToolDiscovery
 from app.pi_gateway.accounting import TenantAccountingError, TenantAccountingService
 from app.pi_gateway.contracts import PiGatewayMcpFinalizeRequest, PiGatewayMcpPreflightRequest
@@ -232,6 +232,89 @@ async def test_unknown_keeps_reservation_and_records_compact_metadata_json(
     # 分类语义不变：result_unknown 仍保持预留，不释放。
     wallet = await db_session.get(TenantWallet, tenant_id)
     assert wallet is not None and wallet.reserved == 10
+
+
+@pytest.mark.asyncio
+async def test_failed_confirmed_with_received_response_releases_reservation(
+    db_session, user_factory
+) -> None:
+    """供应商已确认返回标准 MCP error 响应（received_jsonrpc_response=true）时按
+    failed_confirmed 释放预留，并把白名单元数据写入 safe_error_message。"""
+    _user, run, _attempt, tenant_id, service, permit = await _preflight(db_session, user_factory)
+    metadata = {
+        "version": "mcp_failure_v1",
+        "source": "call_failed",
+        "error_class": "call_failed",
+        "dispatch_phase": "dispatched",
+        "is_standard_mcp_error": True,
+        "received_jsonrpc_response": True,
+    }
+    await service.fail_mcp(run, permit.permit_id, "failed_confirmed", metadata=metadata)
+
+    call = await db_session.scalar(select(AgentToolCall).where(AgentToolCall.run_id == run.id))
+    assert call is not None
+    assert call.status == "failed"
+    assert call.error_type == "failed_confirmed"
+    assert call.points_reserved == 0
+    assert call.safe_error_message is not None and call.safe_error_message.startswith(
+        "failed_confirmed:"
+    )
+    summary = json.loads(call.safe_error_message.removeprefix("failed_confirmed:"))
+    assert summary["received_jsonrpc_response"] is True
+    assert summary["is_standard_mcp_error"] is True
+    assert summary["dispatch_phase"] == "dispatched"
+
+    wallet = await db_session.get(TenantWallet, tenant_id)
+    assert wallet is not None and (wallet.balance, wallet.reserved) == (1000, 0)
+    release_rows = (
+        await db_session.scalars(
+            select(TenantWalletTransaction).where(
+                TenantWalletTransaction.kind == "release",
+                TenantWalletTransaction.tool_call_id == call.id,
+            )
+        )
+    ).all()
+    assert len(release_rows) == 1 and release_rows[0].reserved_delta == -10
+
+    # 重复 fail 幂等：终态守卫不产生第二条 release。
+    await service.fail_mcp(run, permit.permit_id, "failed_confirmed", metadata=metadata)
+    release_rows_after = (
+        await db_session.scalars(
+            select(TenantWalletTransaction).where(
+                TenantWalletTransaction.kind == "release",
+                TenantWalletTransaction.tool_call_id == call.id,
+            )
+        )
+    ).all()
+    assert len(release_rows_after) == 1
+
+
+def test_mcp_fail_metadata_contract_rejects_unknown_keys() -> None:
+    from pydantic import ValidationError
+
+    from app.pi_gateway.contracts import PiGatewayMcpFailRequest
+
+    ok = PiGatewayMcpFailRequest.model_validate({
+        "permit_id": "permit-1",
+        "classification": "failed_confirmed",
+        "metadata": {
+            "version": "mcp_failure_v1",
+            "source": "call_failed",
+            "received_jsonrpc_response": True,
+        },
+    })
+    assert ok.metadata is not None and ok.metadata.received_jsonrpc_response is True
+
+    with pytest.raises(ValidationError):
+        PiGatewayMcpFailRequest.model_validate({
+            "permit_id": "permit-1",
+            "classification": "failed_confirmed",
+            "metadata": {
+                "version": "mcp_failure_v1",
+                "source": "call_failed",
+                "secret_field": "must-be-rejected",
+            },
+        })
 
 
 @pytest.mark.asyncio

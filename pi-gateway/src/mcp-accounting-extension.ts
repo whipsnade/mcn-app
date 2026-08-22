@@ -255,19 +255,19 @@ export function classifyMcpFailure(
   details: Record<string, unknown>,
   isError = false,
 ): FailureClassification {
+  // 冻结合同（按序短路）：响应确认信号（SDK isError = 收到标准 MCP error
+  // 响应）优先于 adapter error code——供应商已确认返回错误响应的调用按
+  // failed_confirmed 收口释放，只有无响应信号时才 fail-safe 到 result_unknown。
   if (errorCode === "tool_error") return "failed_confirmed";
-  if (errorCode === "call_failed") return "result_unknown";
   if (errorCode !== undefined && NO_DISPATCH_ERROR_CODES.has(errorCode)) return "definitely_not_sent";
+  if (isError) return "failed_confirmed";
   const explicit = details.classification;
   if (
     explicit === "definitely_not_sent"
     || explicit === "failed_confirmed"
     || explicit === "result_unknown"
   ) return explicit;
-  // 仅标准 MCP Tool Error（isError 且无 adapter error code）可确认外发并
-  // 归为 failed_confirmed；带未知 error code 的结果无法确认是否已外发，
-  // 必须 fail-safe 到 result_unknown 并保持预留。
-  if (isError && errorCode === undefined) return "failed_confirmed";
+  if (errorCode === "call_failed") return "result_unknown";
   return "result_unknown";
 }
 
@@ -407,17 +407,19 @@ export function createMcpAccountingExtensionFactory(
             event.isError === true,
           );
           try {
+            // result_unknown 与 failed_confirmed 都携带 metadata-only 失败
+            // 元数据；只有 definitely_not_sent（本地未外发）维持 undefined。
             await accounting.afterToolError(
               permit,
               classification,
-              classification === "result_unknown"
-                ? buildMcpFailureMetadata(
+              classification === "definitely_not_sent"
+                ? undefined
+                : buildMcpFailureMetadata(
                     errorCode === "call_failed" ? "call_failed" : "other",
                     errorCode,
                     details,
                     event.isError === true,
-                  )
-                : undefined,
+                  ),
             );
             permits.delete(event.toolCallId);
           } catch (error) {

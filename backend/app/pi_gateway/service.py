@@ -909,11 +909,13 @@ class PiGatewayService:
             call.error_type = RESULT_UNKNOWN
             call.safe_error_message = self._safe_metadata_message("result_unknown", metadata)
         else:
-            call.status = "failed"
-            call.error_type = (
+            error_type = (
                 DEFINITELY_NOT_SENT if status == "definitely_not_sent" else "failed_confirmed"
             )
+            call.status = "failed"
+            call.error_type = error_type
             call.points_reserved = 0
+            call.safe_error_message = self._safe_metadata_message(error_type, metadata)
         call.completed_at = self.now_fn()
         await self._close_tool_step_if_terminal(call, status)
 
