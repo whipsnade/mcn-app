@@ -75,31 +75,40 @@ export interface McpAccountingControlPlane {
 const FREE_DISCOVERY_TOOLS = new Set(["connect", "search", "list"]);
 
 /**
- * Per-server dispatch gate tuning（非密钥）。默认并发 1、有界等待 300s；
- * 等待超时发生在 preflight 之前——无 ToolCall 行、无预留、零计费。
+ * Per-server dispatch gate tuning（非密钥）。默认并发 1、有界等待 300s、
+ * 单次调用墙钟 150s；等待超时发生在 preflight 之前——无 ToolCall 行、无预留、
+ * 零计费。墙钟超时只释放串行槽位（活性），账务永远跟随最终 tool_result。
  */
 export interface McpDispatchGateOptions {
   /** 同一 server 允许的最大在飞调用数（默认 1）。 */
   maxInflight?: number;
   /** 槽位有界等待上限（毫秒，默认 300_000）。 */
   slotWaitMs?: number;
+  /** 单次 MCP 调用墙钟超时（毫秒，默认 150_000，钳制 1..600_000）。 */
+  callTimeoutMs?: number;
 }
 
 const DEFAULT_MAX_INFLIGHT = 1;
 const DEFAULT_SLOT_WAIT_MS = 300_000;
 const MAX_INFLIGHT_LIMIT = 32;
 const SLOT_WAIT_LIMIT_MS = 600_000;
+const DEFAULT_CALL_TIMEOUT_MS = 150_000;
+const CALL_TIMEOUT_LIMIT_MS = 600_000;
 
 /** 从非密钥调优 env 键读取闸门配置（装配时读一次；非法值回退默认）。 */
 export function readMcpDispatchGateOptions(env: NodeJS.ProcessEnv): McpDispatchGateOptions {
   const inflight = Number.parseInt(env.PI_MCP_SERVER_MAX_INFLIGHT ?? "", 10);
   const wait = Number.parseInt(env.PI_MCP_SLOT_WAIT_MS ?? "", 10);
+  const callTimeout = Number.parseInt(env.PI_MCP_CALL_TIMEOUT_MS ?? "", 10);
   return {
     ...(Number.isSafeInteger(inflight) && inflight >= 1 && inflight <= MAX_INFLIGHT_LIMIT
       ? { maxInflight: inflight }
       : {}),
     ...(Number.isSafeInteger(wait) && wait >= 0 && wait <= SLOT_WAIT_LIMIT_MS
       ? { slotWaitMs: wait }
+      : {}),
+    ...(Number.isSafeInteger(callTimeout)
+      ? { callTimeoutMs: Math.min(CALL_TIMEOUT_LIMIT_MS, Math.max(1, callTimeout)) }
       : {}),
   };
 }
@@ -458,18 +467,47 @@ export function createMcpAccountingExtensionFactory(
   gateOptions: McpDispatchGateOptions = {},
 ): ExtensionFactory {
   // 生产从非密钥 env 调优键读取默认值；显式 options 优先（测试/注入用）。
-  const gate = createPerServerDispatchGate({
+  const resolved = {
     ...readMcpDispatchGateOptions(process.env),
     ...gateOptions,
-  });
+  };
+  const gate = createPerServerDispatchGate(resolved);
+  const callTimeoutMs = Math.min(
+    CALL_TIMEOUT_LIMIT_MS,
+    Math.max(1, resolved.callTimeoutMs ?? DEFAULT_CALL_TIMEOUT_MS),
+  );
   return (pi) => {
     const permits = new Map<string, McpPermit>();
     // toolCallId → 占用槽位的 server；tool_result 的所有出口都经 releaseSlot
-    // 释放且恰好一次，杜绝槽位泄漏。
+    // 释放且恰好一次，杜绝槽位泄漏。看门狗释放同样经 slotServers 幂等化。
     const slotServers = new Map<string, string>();
+    const watchdogs = new Map<string, ReturnType<typeof setTimeout>>();
     const hooks = pi as unknown as {
       on(event: "tool_call", handler: (event: ToolCallEvent) => Promise<unknown>): void;
       on(event: "tool_result", handler: (event: ToolResultEvent) => Promise<unknown>): void;
+    };
+
+    // 墙钟看门狗：permit 授予后启动、不可重置。超时只释放串行槽位（活性），
+    // 绝不提前 fail/finalize——晚到的 tool_result 仍按真实证据收口（成功
+    // settle / 标准错误 failed_confirmed / 无响应 unknown）。已知并接受的
+    // 残留：超时后同 server 短暂出现「僵尸 + 新调用」=2 在飞，观察者位无法
+    // 中止 adapter 已发出的 HTTP；账务正确性不受影响。
+    const startWatchdog = (toolCallId: string, server: string): void => {
+      const timer = setTimeout(() => {
+        watchdogs.delete(toolCallId);
+        if (slotServers.get(toolCallId) === server) {
+          slotServers.delete(toolCallId);
+          gate.release(server);
+        }
+      }, callTimeoutMs);
+      timer.unref?.();
+      watchdogs.set(toolCallId, timer);
+    };
+    const clearWatchdog = (toolCallId: string): void => {
+      const timer = watchdogs.get(toolCallId);
+      if (timer === undefined) return;
+      clearTimeout(timer);
+      watchdogs.delete(toolCallId);
     };
 
     hooks.on("tool_call", async (event: ToolCallEvent) => {
@@ -494,7 +532,10 @@ export function createMcpAccountingExtensionFactory(
         }
         if ("permit_id" in decision) {
           permits.set(event.toolCallId, decision);
-          if (gated) slotServers.set(event.toolCallId, input.server);
+          if (gated) {
+            slotServers.set(event.toolCallId, input.server);
+            startWatchdog(event.toolCallId, input.server);
+          }
         } else if (gated) {
           gate.release(input.server);
         }
@@ -506,6 +547,8 @@ export function createMcpAccountingExtensionFactory(
     });
 
     hooks.on("tool_result", async (event: ToolResultEvent) => {
+      // 自然 tool_result 到达即清掉墙钟计时器（幂等：未启动时 no-op）。
+      clearWatchdog(event.toolCallId);
       const permit = permits.get(event.toolCallId);
       if (!permit) return;
       const server = slotServers.get(event.toolCallId);

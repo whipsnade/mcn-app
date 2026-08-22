@@ -23,6 +23,7 @@ const SAFE_PARENT_KEYS = new Set([
   "TZ",
   "PI_MCP_SERVER_MAX_INFLIGHT",
   "PI_MCP_SLOT_WAIT_MS",
+  "PI_MCP_CALL_TIMEOUT_MS",
 ]);
 
 /**

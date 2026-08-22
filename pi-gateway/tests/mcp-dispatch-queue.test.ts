@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   createMcpAccountingExtensionFactory,
@@ -11,7 +11,7 @@ function hooks() {
   const install = (extension: McpAccountingExtension, bindings = [
     { toolName: "chain_probe_tool", server: "insight-cube-mcp", remoteName: "probe" },
     { toolName: "social_probe_tool", server: "social-grow-mcp", remoteName: "social" },
-  ], gateOptions?: { maxInflight?: number; slotWaitMs?: number }) => {
+  ], gateOptions?: { maxInflight?: number; slotWaitMs?: number; callTimeoutMs?: number }) => {
     createMcpAccountingExtensionFactory(extension, bindings, gateOptions)({
       on: (name: string, handler: (event: any) => Promise<unknown>) => handlers.set(name, handler),
     } as any);
@@ -233,5 +233,170 @@ describe("per-server mcp dispatch gate", () => {
     firstPreflight.resolve({ permit_id: "permit-1" });
     await occupying;
     await handlers.get("tool_result")?.(toolResultEvent("call-1"));
+  });
+});
+
+describe("wall-clock watchdog for in-flight mcp calls", () => {
+  beforeEach(() => { vi.useFakeTimers(); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  it("releases the queue slot after the wall clock without touching billing", async () => {
+    const firstPreflight = deferred<{ permit_id: string }>();
+    const preflight = vi.fn(async () => firstPreflight.promise);
+    const finalize = vi.fn(async () => ({ ok: true }));
+    const fail = vi.fn(async () => ({ ok: true }));
+    const extension = new McpAccountingExtension({ preflight, finalize, fail });
+    const { handlers, install } = hooks();
+    install(extension, undefined, { callTimeoutMs: 1_000, slotWaitMs: 300_000 });
+
+    const zombie = handlers.get("tool_call")?.(toolCallEvent("call-1"));
+    await Promise.resolve();
+    firstPreflight.resolve({ permit_id: "permit-1" });
+    await zombie;
+
+    // 排队的第二个调用：墙钟内等待槽位。
+    const second = handlers.get("tool_call")?.(toolCallEvent("call-2"));
+    await Promise.resolve();
+    expect(preflight).toHaveBeenCalledTimes(1);
+
+    // 超过墙钟：僵尸调用的槽位被看门狗释放，第二个调用被放行。
+    vi.advanceTimersByTime(1_000);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(preflight).toHaveBeenCalledTimes(2);
+    await second;
+
+    // 看门狗只管活性：fail/finalize 从未被调用（账务不动，等真实 tool_result）。
+    expect(finalize).not.toHaveBeenCalled();
+    expect(fail).not.toHaveBeenCalled();
+  });
+
+  it("keeps settle semantics for a late tool_result and never double-releases", async () => {
+    const firstPreflight = deferred<{ permit_id: string }>();
+    const secondPreflight = deferred<{ permit_id: string }>();
+    let calls = 0;
+    const preflight = vi.fn(async () => {
+      calls += 1;
+      return calls === 1 ? firstPreflight.promise : secondPreflight.promise;
+    });
+    const finalize = vi.fn(async () => ({ ok: true }));
+    const extension = new McpAccountingExtension({ preflight, finalize, fail: vi.fn() });
+    const { handlers, install } = hooks();
+    install(extension, undefined, { callTimeoutMs: 1_000, slotWaitMs: 300_000 });
+
+    const zombie = handlers.get("tool_call")?.(toolCallEvent("call-1"));
+    await Promise.resolve();
+    firstPreflight.resolve({ permit_id: "permit-1" });
+    await zombie;
+    vi.advanceTimersByTime(1_000); // 看门狗释放僵尸槽位
+
+    const second = handlers.get("tool_call")?.(toolCallEvent("call-2"));
+    await Promise.resolve();
+    await Promise.resolve();
+    secondPreflight.resolve({ permit_id: "permit-2" });
+    await second;
+
+    // 晚到的僵尸 tool_result：正常 finalize settle；releaseSlot 为幂等 no-op。
+    await handlers.get("tool_result")?.(toolResultEvent("call-1"));
+    expect(finalize).toHaveBeenCalledWith(
+      { permit_id: "permit-1" },
+      expect.objectContaining({ outcome: "succeeded" }),
+    );
+
+    // 无二次释放：call-2 仍持有唯一槽位，call-3 必须等待 call-2 的 tool_result。
+    const third = handlers.get("tool_call")?.(toolCallEvent("call-3"));
+    await Promise.resolve();
+    expect(preflight).toHaveBeenCalledTimes(2); // call-3 未进入 preflight
+    await handlers.get("tool_result")?.(toolResultEvent("call-2"));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(preflight).toHaveBeenCalledTimes(3); // call-3 现在被放行
+    await third;
+  });
+
+  it("clears the timer on natural tool_result (no watchdog side effects)", async () => {
+    const preflight = vi.fn(async () => ({ permit_id: "permit-1" }));
+    const extension = new McpAccountingExtension({ preflight, finalize: vi.fn(async () => ({ ok: true })), fail: vi.fn() });
+    const { handlers, install } = hooks();
+    install(extension, undefined, { callTimeoutMs: 1_000, slotWaitMs: 300_000 });
+
+    const first = handlers.get("tool_call")?.(toolCallEvent("call-1"));
+    await first;
+    const timersAfterCall = vi.getTimerCount();
+    expect(timersAfterCall).toBeGreaterThanOrEqual(1);
+
+    await handlers.get("tool_result")?.(toolResultEvent("call-1"));
+    await first;
+    // 计时器被清除：自然完成后无残留看门狗。
+    expect(vi.getTimerCount()).toBe(timersAfterCall - 1);
+
+    // 超时推进不再触发任何释放：call-2 拿到槽位后保持占用。
+    const second = handlers.get("tool_call")?.(toolCallEvent("call-2"));
+    await Promise.resolve();
+    vi.advanceTimersByTime(5_000);
+    await Promise.resolve();
+    const third = handlers.get("tool_call")?.(toolCallEvent("call-3"));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(preflight).toHaveBeenCalledTimes(2); // call-3 未被误放行
+    await second;
+  });
+
+  it("defaults to 150s and clamps the env override into 1..600s", async () => {
+    const preflight = vi.fn(async () => ({ permit_id: "permit-1" }));
+    const extension = new McpAccountingExtension({ preflight, finalize: vi.fn(async () => ({ ok: true })), fail: vi.fn() });
+    const { handlers, install } = hooks();
+    install(extension, undefined, { slotWaitMs: 300_000 });
+
+    const first = handlers.get("tool_call")?.(toolCallEvent("call-1"));
+    await first;
+    // 默认 150s：149_999 未触发，150_000 触发。
+    vi.advanceTimersByTime(149_999);
+    const second = handlers.get("tool_call")?.(toolCallEvent("call-2"));
+    await Promise.resolve();
+    expect(preflight).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(1);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(preflight).toHaveBeenCalledTimes(2);
+    await second;
+
+    // env 解析：合法覆盖、上下钳制、非法回退默认（缺省键）。
+    expect(readMcpDispatchGateOptions({ PI_MCP_CALL_TIMEOUT_MS: "30000" })).toMatchObject({ callTimeoutMs: 30_000 });
+    expect(readMcpDispatchGateOptions({ PI_MCP_CALL_TIMEOUT_MS: "0" })).toMatchObject({ callTimeoutMs: 1 });
+    expect(readMcpDispatchGateOptions({ PI_MCP_CALL_TIMEOUT_MS: "999999999" })).toMatchObject({ callTimeoutMs: 600_000 });
+    expect(readMcpDispatchGateOptions({ PI_MCP_CALL_TIMEOUT_MS: "abc" })).toEqual({});
+    expect(readMcpDispatchGateOptions({})).toEqual({});
+  });
+
+  it("unrefs the watchdog timer so it never blocks worker exit", async () => {
+    const unrefSpies: Array<ReturnType<typeof vi.fn>> = [];
+    const originalSetTimeout = globalThis.setTimeout;
+    const wrappedSetTimeout = ((handler: (...args: unknown[]) => void, timeout?: number, ...rest: unknown[]) => {
+      const handle = originalSetTimeout(handler, timeout, ...rest);
+      const unrefSpy = vi.fn();
+      const originalUnref = (handle as unknown as { unref?: () => void }).unref;
+      if (typeof originalUnref === "function") {
+        (handle as unknown as { unref: () => void }).unref = () => {
+          unrefSpy();
+          originalUnref.call(handle);
+        };
+      }
+      unrefSpies.push(unrefSpy);
+      return handle;
+    }) as typeof setTimeout;
+    globalThis.setTimeout = wrappedSetTimeout;
+    try {
+      const preflight = vi.fn(async () => ({ permit_id: "permit-1" }));
+      const extension = new McpAccountingExtension({ preflight, finalize: vi.fn(async () => ({ ok: true })), fail: vi.fn() });
+      const { handlers, install } = hooks();
+      install(extension, undefined, { callTimeoutMs: 1_000, slotWaitMs: 300_000 });
+      const first = handlers.get("tool_call")?.(toolCallEvent("call-1"));
+      await Promise.resolve();
+      await first;
+      expect(unrefSpies.some((spy) => spy.mock.calls.length > 0)).toBe(true);
+    } finally {
+      globalThis.setTimeout = originalSetTimeout;
+    }
   });
 });
