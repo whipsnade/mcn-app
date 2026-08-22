@@ -34,7 +34,7 @@ from .contracts import (
 from .accounting import RuntimeUsageError, RuntimeUsageService, TenantAccountingError
 from .completion import CompletionValidator, close_open_runtime_rows
 from .events import PiGatewayEventError, parse_source_event_id
-from .internal_tools import ProductionInternalToolBridge
+from .internal_tools import ProductionInternalToolBridge, append_artifact_tool_events
 from .models import PiGatewayRequestNonce
 from .service import PiGatewayClaimError, PiGatewayLeaseError, PiGatewayService, lease_deadline_epoch
 
@@ -331,7 +331,12 @@ async def internal_tool(
             run_id=run.id,
             profile_name=run.profile_name,
         )
+        # Pi 专属层补发 Artifact 生命周期 SSE 事件：同一事务（Run 行已由
+        # leased_run 锁定）append_locked，commit 后统一广播到 broker。
+        emitted = await append_artifact_tool_events(db, run, payload.tool_name, result)
         await db.commit()
+        for event in emitted:
+            await request.app.state.agent_event_broker.publish(event)
         return result.model_dump(mode="json")
 
     return await _with_lock_retry(db, _do)

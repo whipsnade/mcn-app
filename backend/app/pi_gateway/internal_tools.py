@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Mapping
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agent_artifacts.models import AgentArtifact
+from app.agent_runtime.events import AgentEventBroker, AgentEventStream
+from app.agent_runtime.models import AgentEvent, AgentRun
 from app.agent_runtime.profiles import ARTIFACT_TOOLS, HISTORY_TOOLS, get_profile
 from app.agent_runtime.tools.builders import (
     BuildArtifactDraftTool,
@@ -103,3 +107,82 @@ def _contains_reserved_key(value: object) -> bool:
     if isinstance(value, (list, tuple)):
         return any(_contains_reserved_key(item) for item in value)
     return False
+
+
+async def append_artifact_tool_events(
+    db: AsyncSession, run: AgentRun, tool_name: str, result: ToolResult
+) -> list[AgentEvent]:
+    """Pi 路径 Artifact 生命周期 SSE 事件（payload 对齐 agent engine 形状）。
+
+    agent 路径由 engine 在工具执行外围发射同族事件；Pi 路径经 internal-tools
+    端点执行同一批工具，必须在 Pi 专属层补发——绝不能放进 ToolRegistry/工具
+    内部，否则 agent 路径会双发。只在工具成功时发：build_artifact_draft 成功
+    → ``artifact.draft.created``（Draft revision > 1 记为 updated）；
+    publish_artifacts 成功 → 每个成功发布的 Artifact 一条 ``artifact.published``
+    （含 version）。事件经 ``AgentEventStream.append_locked`` 在本请求事务内
+    写入（Run 行已被路由的 leased_run 锁定），flush 不 commit，由路由尾统一
+    提交并广播。
+    """
+    if result.status != "success" or tool_name not in ("build_artifact_draft", "publish_artifacts"):
+        return []
+    try:
+        summary = json.loads(result.safe_summary)
+    except (TypeError, ValueError):
+        return []
+    stream = AgentEventStream(db, AgentEventBroker())
+    events: list[AgentEvent] = []
+
+    async def _draft_event_payload(artifact: AgentArtifact, draft_id: str, version: int) -> dict[str, Any]:
+        return {
+            "artifact_id": artifact.id,
+            "draft_id": draft_id,
+            "module": artifact.module,
+            "parent_artifact_id": artifact.parent_artifact_id,
+            "status": artifact.status,
+            "version": version,
+        }
+
+    if tool_name == "build_artifact_draft" and isinstance(summary, dict):
+        artifact_id = summary.get("artifact_id")
+        draft_id = summary.get("draft_id")
+        revision = summary.get("revision")
+        if (
+            isinstance(artifact_id, str) and artifact_id
+            and isinstance(draft_id, str) and draft_id
+        ):
+            artifact = await db.get(AgentArtifact, artifact_id)
+            if artifact is not None:
+                version = revision if isinstance(revision, int) else 0
+                event_type = "artifact.draft.updated" if version > 1 else "artifact.draft.created"
+                events.append(
+                    await stream.append_locked(
+                        run, event_type, await _draft_event_payload(artifact, draft_id, version)
+                    )
+                )
+        return events
+
+    if tool_name == "publish_artifacts" and isinstance(summary, list):
+        for item in summary:
+            if not isinstance(item, dict) or item.get("status") != "published":
+                continue
+            artifact_id = item.get("artifact_id")
+            version = item.get("version")
+            if not isinstance(artifact_id, str) or not artifact_id:
+                continue
+            artifact = await db.get(AgentArtifact, artifact_id)
+            if artifact is None:  # pragma: no cover - FK 保证稳定身份存在
+                continue
+            events.append(
+                await stream.append_locked(
+                    run,
+                    "artifact.published",
+                    {
+                        "artifact_id": artifact.id,
+                        "module": artifact.module,
+                        "parent_artifact_id": artifact.parent_artifact_id,
+                        "status": artifact.status,
+                        "version": version if isinstance(version, int) else 0,
+                    },
+                )
+            )
+    return events
