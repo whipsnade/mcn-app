@@ -133,9 +133,11 @@ function mapSkillManifest(
           modelInputContractVersion !== "source_bound_input_v2")
       ) snapshotError();
       if (artifactContract !== null) {
-        const existing = contractVersions.get(artifactContract);
+        if (typeof artifactContract !== "string" || artifactContract.length === 0) snapshotError();
+        const contractKey: string = artifactContract;
+        const existing = contractVersions.get(contractKey);
         if (existing !== undefined && existing !== modelInputContractVersion) snapshotError();
-        contractVersions.set(artifactContract, modelInputContractVersion);
+        contractVersions.set(contractKey, modelInputContractVersion);
       }
     }
     const entry = {
