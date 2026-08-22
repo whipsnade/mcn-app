@@ -23,6 +23,7 @@ from app.marketing_skills.snapshot import (
     SkillManifest,
     SkillSnapshotError,
     SkillSnapshotService,
+    manifest_artifact_input_contract_versions,
 )
 from app.pi_gateway.catalog import (
     PI_GATEWAY_ADAPTER_CATALOG_MAX_BYTES,
