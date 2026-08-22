@@ -42,6 +42,7 @@ class SkillValidationResult:
     description: str | None
     required_tools: tuple[str, ...]
     artifact_contract: str | None
+    model_input_contract_version: str
     content_digest: str
     errors: tuple[SkillValidationError, ...]
 
@@ -97,7 +98,13 @@ def _parse_frontmatter(
 
     values: dict[str, str | list[str]] = {}
     list_key: str | None = None
-    allowed_keys = {"name", "description", "required_tools", "artifact_contract"}
+    allowed_keys = {
+        "name",
+        "description",
+        "required_tools",
+        "artifact_contract",
+        "model_input_contract_version",
+    }
     for offset, raw_line in enumerate(lines[1:closing], start=2):
         line = raw_line.strip()
         if not line or line.startswith("#"):
@@ -197,6 +204,22 @@ def validate_skill_content(
     required_tools = tuple(raw_tools) if isinstance(raw_tools, list) else ()
     raw_contract = metadata.get("artifact_contract")
     artifact_contract = raw_contract if isinstance(raw_contract, str) and raw_contract else None
+    raw_contract_version = metadata.get("model_input_contract_version")
+    if raw_contract_version is None:
+        model_input_contract_version = "direct_model_input_v1"
+    elif (
+        isinstance(raw_contract_version, str)
+        and raw_contract_version in {"direct_model_input_v1", "source_bound_input_v2"}
+    ):
+        model_input_contract_version = raw_contract_version
+    else:
+        model_input_contract_version = "direct_model_input_v1"
+        errors.append(
+            SkillValidationError(
+                "model_input_contract_version_invalid",
+                "model_input_contract_version 必须是 direct_model_input_v1 或 source_bound_input_v2",
+            )
+        )
 
     if name is None:
         errors.append(SkillValidationError("frontmatter_name_required", "必须提供 Skill name"))
@@ -233,6 +256,7 @@ def validate_skill_content(
         description=description,
         required_tools=required_tools,
         artifact_contract=artifact_contract,
+        model_input_contract_version=model_input_contract_version,
         content_digest=canonical_skill_digest(normalized),
         errors=tuple(errors),
     )

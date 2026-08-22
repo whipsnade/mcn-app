@@ -19,6 +19,8 @@ import type {
   SkillSnapshotEntry,
 } from "./protocol.js";
 import {
+  MANIFEST_V1_ENTRY_KEYS,
+  MANIFEST_V2_ENTRY_KEYS,
   MAX_CONTENT_BYTES,
   MAX_SKILLS,
   skillManifestDigest,
@@ -76,24 +78,20 @@ function mapSkillManifest(
   const entriesRaw = value.entries;
   const sourceScope = value.source_scope;
   const manifestDigest = value.manifest_digest;
+  const schemaVersionRaw = value.schema_version;
   if (
     !Array.isArray(entriesRaw) ||
     (sourceScope !== "database_activation" && sourceScope !== "legacy_pack") ||
     typeof manifestDigest !== "string" ||
-    !/^[0-9a-fA-F]{64}$/.test(manifestDigest)
+    !/^[0-9a-fA-F]{64}$/.test(manifestDigest) ||
+    (schemaVersionRaw !== undefined && schemaVersionRaw !== "skill_manifest_v2")
   ) snapshotError();
+  const schemaVersion = schemaVersionRaw === "skill_manifest_v2" ? "skill_manifest_v2" as const : undefined;
+  const expectedKeys = schemaVersion === undefined ? MANIFEST_V1_ENTRY_KEYS : MANIFEST_V2_ENTRY_KEYS;
   const seen = new Set<string>();
+  const contractVersions = new Map<string, string>();
   const entries: SkillSnapshotEntry[] = entriesRaw.map((raw) => {
     if (!isRecord(raw)) snapshotError();
-    const expectedKeys = [
-      "name",
-      "revision",
-      "content_digest",
-      "description",
-      "required_tools",
-      "artifact_contract",
-      "content",
-    ];
     if (!exactKeys(raw, expectedKeys)) snapshotError();
     const name = raw.name;
     const revision = raw.revision;
@@ -120,6 +118,26 @@ function mapSkillManifest(
       typeof content !== "string"
     ) snapshotError();
     if (new TextEncoder().encode(content).byteLength > MAX_CONTENT_BYTES) snapshotError();
+    let revisionId: string | undefined;
+    let scopeKey: string | undefined;
+    let modelInputContractVersion: string | undefined;
+    if (schemaVersion !== undefined) {
+      revisionId = raw.revision_id as string;
+      scopeKey = raw.scope_key as string;
+      modelInputContractVersion = raw.model_input_contract_version as string;
+      if (
+        typeof revisionId !== "string" || revisionId.length === 0 || revisionId.length > 36 ||
+        typeof scopeKey !== "string" || scopeKey.length === 0 || scopeKey.length > 36 ||
+        typeof modelInputContractVersion !== "string" ||
+        (modelInputContractVersion !== "direct_model_input_v1" &&
+          modelInputContractVersion !== "source_bound_input_v2")
+      ) snapshotError();
+      if (artifactContract !== null) {
+        const existing = contractVersions.get(artifactContract);
+        if (existing !== undefined && existing !== modelInputContractVersion) snapshotError();
+        contractVersions.set(artifactContract, modelInputContractVersion);
+      }
+    }
     const entry = {
       name,
       revision: revision as number,
@@ -128,6 +146,7 @@ function mapSkillManifest(
       requiredTools,
       artifactContract: artifactContract === null ? null : artifactContract as string,
       content,
+      ...(schemaVersion !== undefined ? { revisionId, scopeKey, modelInputContractVersion } : {}),
     } satisfies SkillSnapshotEntry;
     if (seen.has(entry.name) || skillSnapshotDigest(entry) !== entry.contentDigest) snapshotError();
     seen.add(entry.name);
@@ -144,14 +163,23 @@ function mapSkillManifest(
       capability.required_tools.length !== entry.requiredTools.length ||
       capability.required_tools.some((tool, index) => tool !== entry.requiredTools[index])
     ) snapshotError();
+    if (schemaVersion !== undefined) {
+      // v2：capability 行同样冻结 revision_id/scope_key/合同版本，逐字段一致。
+      if (
+        capability.revision_id !== entry.revisionId ||
+        capability.scope_key !== entry.scopeKey ||
+        capability.model_input_contract_version !== entry.modelInputContractVersion
+      ) snapshotError();
+    }
     return entry;
   });
   if (entries.length > MAX_SKILLS) snapshotError();
-  if (skillManifestDigest(entries, sourceScope) !== manifestDigest) snapshotError();
+  if (skillManifestDigest(entries, sourceScope, schemaVersion) !== manifestDigest) snapshotError();
   return {
     entries,
     manifestDigest,
     sourceScope,
+    ...(schemaVersion !== undefined ? { schemaVersion } : {}),
   };
 }
 
@@ -191,6 +219,26 @@ export function mapClaimRuntimeSnapshot(snapshot: Record<string, unknown>): Runt
   const skillManifest = snapshot.skill_manifest;
   const mappedManifest =
     skillManifest === undefined ? undefined : mapSkillManifest(skillManifest, skillsRaw);
+  const rawContractVersions = snapshot.artifact_input_contract_versions;
+  let artifactInputContractVersions: Record<string, string> | undefined;
+  if (rawContractVersions !== undefined && rawContractVersions !== null) {
+    if (!isRecord(rawContractVersions)) snapshotError();
+    const allowed = new Set(allowedArtifactContracts);
+    for (const [key, version] of Object.entries(rawContractVersions)) {
+      if (!allowed.has(key) || typeof version !== "string" || version.length === 0) snapshotError();
+    }
+    artifactInputContractVersions = { ...rawContractVersions as Record<string, string> };
+    if (mappedManifest?.schemaVersion === "skill_manifest_v2") {
+      // 对齐：每个 v2 entry 的非空 artifact contract 必须在 map 中且版本相等。
+      for (const entry of mappedManifest.entries) {
+        if (entry.artifactContract === null) continue;
+        const mapped = artifactInputContractVersions[entry.artifactContract];
+        if (mapped === undefined || mapped !== entry.modelInputContractVersion) snapshotError();
+      }
+    }
+  } else if (mappedManifest?.schemaVersion === "skill_manifest_v2") {
+    snapshotError();
+  }
   const skillCatalog: SkillCatalogEntry[] = (mappedManifest?.entries ?? skillsRaw).map((skill) => {
     if (!isRecord(skill)) snapshotError();
     const { name, version, artifact_contract: artifactContract, content } =
@@ -246,6 +294,9 @@ export function mapClaimRuntimeSnapshot(snapshot: Record<string, unknown>): Runt
     skillCatalog,
     adapterCatalog,
     ...(mappedManifest === undefined ? {} : { skillManifest: mappedManifest }),
+    ...(artifactInputContractVersions === undefined
+      ? {}
+      : { artifactInputContractVersions }),
     ...(profileName === undefined ? {} : { profileName: profileName as string }),
     allowedArtifactContracts: allowedArtifactContracts as string[],
     ...(capabilityPackVersion === undefined ? {} : { capabilityPackVersion: capabilityPackVersion as string }),

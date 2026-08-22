@@ -8,7 +8,12 @@ import re
 from pathlib import Path
 from typing import Any
 
-from .models import CapabilityPackSnapshot, LoadedMarketingSkill, MarketingSkillSpec
+from .models import (
+    BootstrapBundleSpec,
+    CapabilityPackSnapshot,
+    LoadedMarketingSkill,
+    MarketingSkillSpec,
+)
 
 _PACK_NAME = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -37,6 +42,7 @@ _MANIFEST_KEYS = {
     "artifact_contracts",
     "builder_versions",
     "exporter_versions",
+    "bootstrap_bundles",
 }
 
 
@@ -79,7 +85,34 @@ class CapabilityPackLoader:
             ),
             builder_versions=self._string_map(payload["builder_versions"]),
             exporter_versions=self._string_map(payload["exporter_versions"]),
+            bootstrap_bundles=self._bootstrap_bundles(root, payload.get("bootstrap_bundles", [])),
         )
+
+    def _bootstrap_bundles(
+        self, root: Path, entries: list[dict[str, Any]]
+    ) -> tuple[BootstrapBundleSpec, ...]:
+        bundles: list[BootstrapBundleSpec] = []
+        seen: set[str] = set()
+        for entry in entries:
+            if not isinstance(entry, dict) or set(entry.keys()) != {"name", "path", "digest"}:
+                raise CapabilityPackError("manifest_bootstrap_bundle_invalid")
+            name = entry["name"]
+            path = entry["path"]
+            digest = entry["digest"]
+            if (
+                not isinstance(name, str)
+                or not isinstance(path, str)
+                or not isinstance(digest, str)
+                or not _SHA256.fullmatch(digest)
+                or name in seen
+            ):
+                raise CapabilityPackError("manifest_bootstrap_bundle_invalid")
+            seen.add(name)
+            # bundle 文件必须存在且内容 digest 与登记一致（read checked 复用
+            # 既有安全路径解析，禁止任意文件访问）。
+            self._read_checked(root, path, digest)
+            bundles.append(BootstrapBundleSpec(name=name, path=path, digest=digest))
+        return tuple(bundles)
 
     def load_skill(
         self,
@@ -143,7 +176,9 @@ class CapabilityPackLoader:
             raise CapabilityPackError("manifest_sensitive_field")
         if _contains_sensitive_value(payload):
             raise CapabilityPackError("manifest_sensitive_content")
-        if set(payload) != _MANIFEST_KEYS:
+        if not set(payload) <= _MANIFEST_KEYS or not {"skills", "artifact_contracts"} <= set(payload):
+            raise CapabilityPackError("manifest_fields_invalid")
+        if "bootstrap_bundles" in payload and not isinstance(payload["bootstrap_bundles"], list):
             raise CapabilityPackError("manifest_fields_invalid")
         for key in ("skills", "artifact_contracts"):
             if not isinstance(payload[key], list):

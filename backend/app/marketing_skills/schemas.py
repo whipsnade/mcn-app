@@ -27,6 +27,7 @@ class SkillValidationRead(_SkillModel):
     description: str | None = None
     required_tools: list[str] = Field(default_factory=list)
     artifact_contract: str | None = None
+    model_input_contract_version: str = "direct_model_input_v1"
     content_digest: str
     errors: list[SkillValidationErrorRead] = Field(default_factory=list)
 
@@ -48,6 +49,7 @@ class SkillRevisionRead(_SkillModel):
     description: str
     required_tools: list[str]
     artifact_contract: str | None = None
+    model_input_contract_version: str = "direct_model_input_v1"
     created_by: str | None = None
     created_at: datetime
     change_note: str | None = None

@@ -1,0 +1,67 @@
+{
+  "v1": {
+    "entries": [
+      {
+        "artifact_contract": "marketing_root_v1",
+        "content": "vector A body",
+        "content_digest": "aba2fce7370012a8474ae4eedc520a6179d8503c0804f07785abf8f8dc99e084",
+        "description": "vector a",
+        "name": "vector-skill-a",
+        "required_tools": [
+          "load_marketing_skill"
+        ],
+        "revision": 1
+      },
+      {
+        "artifact_contract": null,
+        "content": "vector B body",
+        "content_digest": "0077a02b9fab5ce8a2833899684d80237d4e3e0c684122cdb6ca908ccc96afa4",
+        "description": "vector b",
+        "name": "vector-skill-b",
+        "required_tools": [
+          "build_artifact_draft",
+          "publish_artifacts"
+        ],
+        "revision": 2
+      }
+    ],
+    "expected_digest": "cd75d0d8d082c041406bbe24842ded7d4d456ed01798c54a6e75fa2638470917",
+    "source_scope": "database_activation"
+  },
+  "v2": {
+    "entries": [
+      {
+        "artifact_contract": "marketing_root_v1",
+        "content": "vector A body",
+        "content_digest": "aba2fce7370012a8474ae4eedc520a6179d8503c0804f07785abf8f8dc99e084",
+        "description": "vector a",
+        "model_input_contract_version": "direct_model_input_v1",
+        "name": "vector-skill-a",
+        "required_tools": [
+          "load_marketing_skill"
+        ],
+        "revision": 1,
+        "revision_id": "11111111-1111-4111-8111-111111111111",
+        "scope_key": "__global__"
+      },
+      {
+        "artifact_contract": null,
+        "content": "vector B body",
+        "content_digest": "0077a02b9fab5ce8a2833899684d80237d4e3e0c684122cdb6ca908ccc96afa4",
+        "description": "vector b",
+        "model_input_contract_version": "direct_model_input_v1",
+        "name": "vector-skill-b",
+        "required_tools": [
+          "build_artifact_draft",
+          "publish_artifacts"
+        ],
+        "revision": 2,
+        "revision_id": "22222222-2222-4222-8222-222222222222",
+        "scope_key": "__global__"
+      }
+    ],
+    "expected_digest": "28501c123b06f62df0c140c09a53c08e7d010e253e9d0e686db9ec2b67fafd01",
+    "schema_version": "skill_manifest_v2",
+    "source_scope": "database_activation"
+  }
+}

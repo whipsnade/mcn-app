@@ -36,10 +36,43 @@ function stableJson(value: unknown): string {
   return JSON.stringify(value) ?? "null";
 }
 
+type ManifestSourceScope = "database_activation" | "legacy_pack";
+
+const V1_ENTRY_FIELDS = [
+  "name",
+  "revision",
+  "content_digest",
+  "description",
+  "required_tools",
+  "artifact_contract",
+  "content",
+] as const;
+
 export function skillManifestDigest(
   entries: readonly SkillSnapshotEntry[],
-  sourceScope: "database_activation" | "legacy_pack",
+  sourceScope: ManifestSourceScope,
+  schemaVersion?: "skill_manifest_v2",
 ): string {
+  if (schemaVersion === "skill_manifest_v2") {
+    const payload = {
+      schema_version: schemaVersion,
+      source_scope: sourceScope,
+      entries: entries.map((entry) => ({
+        name: entry.name,
+        revision: entry.revision,
+        content_digest: entry.contentDigest,
+        description: entry.description,
+        required_tools: [...entry.requiredTools],
+        artifact_contract: entry.artifactContract,
+        content: entry.content,
+        revision_id: entry.revisionId ?? null,
+        scope_key: entry.scopeKey ?? null,
+        model_input_contract_version: entry.modelInputContractVersion ?? null,
+      })),
+    };
+    return createHash("sha256").update(stableJson(payload), "utf8").digest("hex");
+  }
+  // v1：严格按历史七字段 payload 计算（新字段绝不进入）。
   const payload = {
     source_scope: sourceScope,
     entries: entries.map((entry) => ({
@@ -54,6 +87,14 @@ export function skillManifestDigest(
   };
   return createHash("sha256").update(stableJson(payload), "utf8").digest("hex");
 }
+
+export const MANIFEST_V1_ENTRY_KEYS: readonly string[] = [...V1_ENTRY_FIELDS];
+export const MANIFEST_V2_ENTRY_KEYS: readonly string[] = [
+  ...V1_ENTRY_FIELDS,
+  "revision_id",
+  "scope_key",
+  "model_input_contract_version",
+];
 
 function validateEntry(entry: SkillSnapshotEntry): void {
   if (

@@ -91,6 +91,7 @@ class SkillAdminService:
             description=result.description,
             required_tools=list(result.required_tools),
             artifact_contract=result.artifact_contract,
+            model_input_contract_version=result.model_input_contract_version,
             content_digest=result.content_digest,
             errors=[
                 SkillValidationErrorRead(code=item.code, message=item.message, line=item.line)
@@ -160,6 +161,7 @@ class SkillAdminService:
                 description=result.description or "",
                 required_tools=list(result.required_tools),
                 artifact_contract=result.artifact_contract,
+                model_input_contract_version=result.model_input_contract_version,
                 created_by=admin.id,
                 created_at=_now(),
                 change_note=payload.change_note,
@@ -514,6 +516,7 @@ class SkillAdminService:
             description=row.description,
             required_tools=[str(item) for item in (row.required_tools or [])],
             artifact_contract=row.artifact_contract,
+            model_input_contract_version=row.model_input_contract_version,
             created_by=row.created_by,
             created_at=row.created_at,
             change_note=row.change_note,

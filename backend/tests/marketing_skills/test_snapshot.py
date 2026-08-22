@@ -15,6 +15,7 @@ from app.marketing_skills.models import SkillActivation, SkillRevision
 from app.marketing_skills.repository import ResolvedSkillRevision
 from app.marketing_skills.snapshot import (
     SkillManifest,
+    SkillManifestEntry,
     SkillSnapshotService,
 )
 from app.marketing_skills.validation import canonical_skill_digest
@@ -165,6 +166,7 @@ async def test_new_run_resolution_uses_active_db_revision_and_never_static_conte
         snapshot_session,
         tenant_id=tenant_id,
         base_capability=base,
+        require_database_entries=False,
     )
     assert {item.name for item in resolved_capability.skills} == {
         item.name for item in base.skills
@@ -239,8 +241,100 @@ async def test_new_run_resolution_preserves_base_skills_when_registry_is_partial
         snapshot_session,
         tenant_id=tenant_id,
         base_capability=base,
+        require_database_entries=False,
     )
 
     assert {item.name for item in capability.skills} == {
         item.name for item in base.skills
     } | {resolved.skill_name}
+
+
+# ---------------------------------------------------------------------------
+# post-brand manifest contract（Task 2）：v1/v2 golden vectors 与 v2 冻结
+# ---------------------------------------------------------------------------
+
+def _load_digest_vectors() -> dict:
+    import json
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parent / "skill_manifest_digest_vectors.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_post_brand_manifest_v1_vector_matches_golden() -> None:
+    from app.marketing_skills.snapshot import _manifest_digest
+
+    vectors = _load_digest_vectors()["v1"]
+    entries = tuple(SkillManifestEntry.model_validate(item) for item in vectors["entries"])
+    assert (
+        _manifest_digest(entries, vectors["source_scope"], None)
+        == vectors["expected_digest"]
+    )
+
+
+def test_post_brand_manifest_v2_vector_matches_golden() -> None:
+    from app.marketing_skills.snapshot import _manifest_digest
+
+    vectors = _load_digest_vectors()["v2"]
+    entries = tuple(SkillManifestEntry.model_validate(item) for item in vectors["entries"])
+    assert (
+        _manifest_digest(entries, vectors["source_scope"], "skill_manifest_v2")
+        == vectors["expected_digest"]
+    )
+    assert vectors["expected_digest"] != _load_digest_vectors()["v1"]["expected_digest"]
+
+
+def test_post_brand_manifest_v2_freezes_identity_and_contract() -> None:
+    from app.marketing_skills.repository import ResolvedSkillRevision
+    from app.marketing_skills.snapshot import SkillManifest
+
+    revisions = (
+        ResolvedSkillRevision(
+            id="aaaa1111-1111-4111-8111-111111111111",
+            tenant_id=None,
+            skill_name="freeze-skill",
+            revision=5,
+            content="freeze body",
+            content_digest=canonical_skill_digest("freeze body"),
+            description="freeze",
+            required_tools=("load_marketing_skill",),
+            artifact_contract="marketing_root_v1",
+            model_input_contract_version="direct_model_input_v1",
+        ),
+    )
+    manifest = SkillManifest.from_revisions(revisions)
+    assert manifest.schema_version == "skill_manifest_v2"
+    entry = manifest.entries[0]
+    assert entry.revision_id == "aaaa1111-1111-4111-8111-111111111111"
+    assert entry.scope_key == "__global__"
+    assert entry.model_input_contract_version == "direct_model_input_v1"
+
+
+def test_post_brand_manifest_v2_rejects_contract_conflict() -> None:
+    import pytest as _pytest
+
+    from app.marketing_skills.snapshot import SkillManifest
+
+    base = {
+        "revision": 1,
+        "content_digest": canonical_skill_digest("conflict body"),
+        "description": "x",
+        "required_tools": ["load_marketing_skill"],
+        "content": "conflict body",
+        "revision_id": "bbbb2222-2222-4222-8222-222222222222",
+        "scope_key": "__global__",
+    }
+    payload = {
+        "entries": [
+            {**base, "name": "skill-a", "artifact_contract": "brand_report_v3",
+             "model_input_contract_version": "direct_model_input_v1"},
+            {**base, "name": "skill-b", "artifact_contract": "brand_report_v3",
+             "model_input_contract_version": "source_bound_input_v2",
+             "revision_id": "cccc3333-3333-4333-8333-333333333333"},
+        ],
+        "manifest_digest": "0" * 64,
+        "source_scope": "database_activation",
+        "schema_version": "skill_manifest_v2",
+    }
+    with _pytest.raises(Exception):
+        SkillManifest.model_validate(payload)

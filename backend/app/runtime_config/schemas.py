@@ -67,6 +67,7 @@ class RuntimeConfigSnapshot(BaseModel):
     capability_pack_version: str | None = None
     capability_pack_manifest_digest: str | None = None
     skill_manifest: SkillManifest | None = None
+    artifact_input_contract_versions: dict[str, str] | None = None
     limits: dict[str, int | float]
     # ``price_table`` is a nested, public snapshot contract.  Secrets remain
     # forbidden recursively; values are integer micros (or bounded labels).

@@ -12,6 +12,15 @@ class MarketingSkillSpec:
 
 
 @dataclass(frozen=True)
+class BootstrapBundleSpec:
+    """manifest 登记的 bootstrap bundle：只允许 name/path/digest 三个 key。"""
+
+    name: str
+    path: str
+    digest: str
+
+
+@dataclass(frozen=True)
 class CapabilityPackSnapshot:
     pack_name: str
     pack_version: str
@@ -23,6 +32,7 @@ class CapabilityPackSnapshot:
     artifact_contracts: tuple[dict[str, str], ...]
     builder_versions: dict[str, str]
     exporter_versions: dict[str, str]
+    bootstrap_bundles: tuple[BootstrapBundleSpec, ...] = ()
 
 
 @dataclass(frozen=True)
