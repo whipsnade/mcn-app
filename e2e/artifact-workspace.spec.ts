@@ -286,10 +286,21 @@ async function login(page: Page, phone: string) {
   await page.goto('/');
   await page.getByPlaceholder('请输入11位中国手机号码').fill(phone);
   await page.getByRole('button', { name: '获取验证码' }).click();
-  await page.getByRole('button', { name: '立即安全登录' }).click();
-  // CI runner 尾部用例满载时，真实登录接口 + 登录后引导可能超过默认 5s；
-  // 断言语义不变（工作区必须出现），只放宽等待预算（同 unread-dot 修法）。
-  await expect(page.getByTitle('新建分析会话')).toBeVisible({ timeout: 20_000 });
+  // 并发建户偶发的事务级 DB 错误（InnoDB 锁竞争使事务被隐式回滚 → SAVEPOINT
+  // 消失 → 登录 500）会让登录页永久停留；真实用户会再点一次登录（幂等：已建
+  // 用户直接发新会话）。最多重试两次点击，持续失败仍让断言失败。
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const loginButton = page.getByRole('button', { name: '立即安全登录' });
+    if (await loginButton.count()) {
+      await loginButton.click();
+    }
+    try {
+      await expect(page.getByTitle('新建分析会话')).toBeVisible({ timeout: 10_000 });
+      return;
+    } catch (error) {
+      if (attempt === 2) throw error;
+    }
+  }
 }
 
 /** 小视口（<1280px）先切到 BI 面板（xl 桌面端常显，无需切换）。 */
