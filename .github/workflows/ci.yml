@@ -237,7 +237,7 @@ jobs:
           alembic downgrade 0048_marketing_skill_audited_baseline
           alembic upgrade head
           test "$(mysql --protocol=tcp --host=127.0.0.1 --user=kol_test --password=test-only-password --database=kol_insight_test -N -B -e "SELECT CHARACTER_MAXIMUM_LENGTH FROM information_schema.columns WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='artifact_exports' AND COLUMN_NAME='template_version'")" = "191"
-          test "$(mysql --protocol=tcp --host=127.0.0.1 --user=kol_test --password=test-only-password --database=kol_insight_test -N -B -e "SELECT version_num FROM alembic_version")" = "0049_skill_rollout_history"
+          test "$(mysql --protocol=tcp --host=127.0.0.1 --user=kol_test --password=test-only-password --database=kol_insight_test -N -B -e "SELECT version_num FROM alembic_version")" = "0050_post_brand_skill_defaults"
 
       - name: Historical migration boundary tests
         working-directory: backend
