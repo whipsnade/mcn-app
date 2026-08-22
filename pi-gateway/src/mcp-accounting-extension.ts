@@ -73,6 +73,103 @@ export interface McpAccountingControlPlane {
 }
 
 const FREE_DISCOVERY_TOOLS = new Set(["connect", "search", "list"]);
+
+/**
+ * Per-server dispatch gate tuning（非密钥）。默认并发 1、有界等待 300s；
+ * 等待超时发生在 preflight 之前——无 ToolCall 行、无预留、零计费。
+ */
+export interface McpDispatchGateOptions {
+  /** 同一 server 允许的最大在飞调用数（默认 1）。 */
+  maxInflight?: number;
+  /** 槽位有界等待上限（毫秒，默认 300_000）。 */
+  slotWaitMs?: number;
+}
+
+const DEFAULT_MAX_INFLIGHT = 1;
+const DEFAULT_SLOT_WAIT_MS = 300_000;
+const MAX_INFLIGHT_LIMIT = 32;
+const SLOT_WAIT_LIMIT_MS = 600_000;
+
+/** 从非密钥调优 env 键读取闸门配置（装配时读一次；非法值回退默认）。 */
+export function readMcpDispatchGateOptions(env: NodeJS.ProcessEnv): McpDispatchGateOptions {
+  const inflight = Number.parseInt(env.PI_MCP_SERVER_MAX_INFLIGHT ?? "", 10);
+  const wait = Number.parseInt(env.PI_MCP_SLOT_WAIT_MS ?? "", 10);
+  return {
+    ...(Number.isSafeInteger(inflight) && inflight >= 1 && inflight <= MAX_INFLIGHT_LIMIT
+      ? { maxInflight: inflight }
+      : {}),
+    ...(Number.isSafeInteger(wait) && wait >= 0 && wait <= SLOT_WAIT_LIMIT_MS
+      ? { slotWaitMs: wait }
+      : {}),
+  };
+}
+
+interface PerServerDispatchGate {
+  acquire(server: string): Promise<boolean>;
+  release(server: string): void;
+}
+
+/**
+ * 进程内 per-server 串行闸：排队而不是拒绝，不同 server 互不阻塞。
+ * 等待超时的调用者收到 false（调用方在 preflight 之前短路，零计费）。
+ */
+export function createPerServerDispatchGate(
+  options: McpDispatchGateOptions = {},
+): PerServerDispatchGate {
+  const maxInflight = Math.min(
+    MAX_INFLIGHT_LIMIT,
+    Math.max(1, options.maxInflight ?? DEFAULT_MAX_INFLIGHT),
+  );
+  const waitMs = Math.min(
+    SLOT_WAIT_LIMIT_MS,
+    Math.max(0, options.slotWaitMs ?? DEFAULT_SLOT_WAIT_MS),
+  );
+  const inflight = new Map<string, number>();
+  const waiters: Array<{
+    server: string;
+    resolve: (granted: boolean) => void;
+    timer: ReturnType<typeof setTimeout>;
+  }> = [];
+
+  const acquire = (server: string): Promise<boolean> =>
+    new Promise<boolean>((resolve) => {
+      const current = inflight.get(server) ?? 0;
+      if (current < maxInflight) {
+        inflight.set(server, current + 1);
+        resolve(true);
+        return;
+      }
+      const waiter = {
+        server,
+        resolve,
+        timer: setTimeout(() => {
+          const index = waiters.indexOf(waiter);
+          if (index >= 0) waiters.splice(index, 1);
+          resolve(false);
+        }, waitMs),
+      };
+      // 有界等待计时不得阻止 worker 进程退出。
+      waiter.timer.unref?.();
+      waiters.push(waiter);
+    });
+
+  const release = (server: string): void => {
+    const index = waiters.findIndex((waiter) => waiter.server === server);
+    if (index >= 0) {
+      const [waiter] = waiters.splice(index, 1);
+      clearTimeout(waiter.timer);
+      // 槽位直接转移给队首等待者，inflight 计数保持不变。
+      waiter.resolve(true);
+      return;
+    }
+    const current = inflight.get(server) ?? 0;
+    const next = Math.max(0, current - 1);
+    if (next === 0) inflight.delete(server);
+    else inflight.set(server, next);
+  };
+
+  return { acquire, release };
+}
 const UNKNOWN_MCP_SOURCES = new Set<UnknownMcpSource>([
   "call_failed",
   "aborted",
@@ -358,9 +455,18 @@ export function buildMcpFailureMetadata(
 export function createMcpAccountingExtensionFactory(
   accounting: McpAccountingExtension,
   bindings: readonly McpToolBinding[] = [],
+  gateOptions: McpDispatchGateOptions = {},
 ): ExtensionFactory {
+  // 生产从非密钥 env 调优键读取默认值；显式 options 优先（测试/注入用）。
+  const gate = createPerServerDispatchGate({
+    ...readMcpDispatchGateOptions(process.env),
+    ...gateOptions,
+  });
   return (pi) => {
     const permits = new Map<string, McpPermit>();
+    // toolCallId → 占用槽位的 server；tool_result 的所有出口都经 releaseSlot
+    // 释放且恰好一次，杜绝槽位泄漏。
+    const slotServers = new Map<string, string>();
     const hooks = pi as unknown as {
       on(event: "tool_call", handler: (event: ToolCallEvent) => Promise<unknown>): void;
       on(event: "tool_result", handler: (event: ToolResultEvent) => Promise<unknown>): void;
@@ -370,15 +476,44 @@ export function createMcpAccountingExtensionFactory(
       const input = toMcpToolCall(event, bindings);
       if (input === undefined) return;
       if ("block" in input) return input;
-      const decision = await accounting.beforeToolCall(input);
-      if ("block" in decision && decision.block) return decision;
-      if ("permit_id" in decision) permits.set(event.toolCallId, decision);
-      return undefined;
+      // 免费发现工具不占槽：目录读取零计费，不参与串行闸。
+      if (!FREE_DISCOVERY_TOOLS.has(input.tool)) {
+        const granted = await gate.acquire(input.server);
+        if (!granted) {
+          // 等待超时发生在 preflight 之前：无 ToolCall、无预留、零计费；
+          // 模型看到可恢复结构化错误自行调整，内核不自动重试。
+          return { block: true, reason: "mcp_server_busy" };
+        }
+      }
+      const gated = !FREE_DISCOVERY_TOOLS.has(input.tool);
+      try {
+        const decision = await accounting.beforeToolCall(input);
+        if ("block" in decision && decision.block) {
+          if (gated) gate.release(input.server);
+          return decision;
+        }
+        if ("permit_id" in decision) {
+          permits.set(event.toolCallId, decision);
+          if (gated) slotServers.set(event.toolCallId, input.server);
+        } else if (gated) {
+          gate.release(input.server);
+        }
+        return undefined;
+      } catch (error) {
+        if (gated) gate.release(input.server);
+        throw error;
+      }
     });
 
     hooks.on("tool_result", async (event: ToolResultEvent) => {
       const permit = permits.get(event.toolCallId);
       if (!permit) return;
+      const server = slotServers.get(event.toolCallId);
+      const releaseSlot = (): void => {
+        if (server === undefined) return;
+        slotServers.delete(event.toolCallId);
+        gate.release(server);
+      };
       const details = isRecord(event.details) ? event.details : {};
       const errorCode = typeof details.error === "string" ? details.error : undefined;
       const hasErrorMarker = Object.prototype.hasOwnProperty.call(details, "error")
@@ -391,10 +526,13 @@ export function createMcpAccountingExtensionFactory(
           await accounting.afterToolError(permit, "result_unknown",
             buildMcpFailureMetadata(source, errorCode, details, event.isError === true));
           permits.delete(event.toolCallId);
+          releaseSlot();
           return true;
         } catch {
           // No durable ACK means the permit remains recoverable for backend
           // reconciliation; deleting it here would lose the reservation.
+          // 槽位仍必须释放：调用本身已结束，不能占住 per-server 闸。
+          releaseSlot();
           return false;
         }
       };
@@ -422,6 +560,7 @@ export function createMcpAccountingExtensionFactory(
                   ),
             );
             permits.delete(event.toolCallId);
+            releaseSlot();
           } catch (error) {
             await failUnknown(unknownMcpSource(error, "finalize_ack_unknown"));
           }
@@ -431,6 +570,7 @@ export function createMcpAccountingExtensionFactory(
         // `event.content` is left untouched and is never passed to accounting.
         await accounting.afterToolResult(permit, buildMcpFinalizeMetadata(details));
         permits.delete(event.toolCallId);
+        releaseSlot();
       } catch (error) {
         await failUnknown(unknownMcpSource(error, "finalize_ack_unknown"));
       }

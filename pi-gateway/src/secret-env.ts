@@ -13,7 +13,17 @@ const SECRET_KEYS = new Set([
   "PI_DATATAP_URL_AKTOOLS",
 ]);
 
-const SAFE_PARENT_KEYS = new Set(["PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ"]);
+// 除系统 locale 键外，仅放行两个非密钥的 per-server 串行闸调优键；它们不含
+// 任何凭证材料，不参与 clearSecretEnv 的清理。
+const SAFE_PARENT_KEYS = new Set([
+  "PATH",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "TZ",
+  "PI_MCP_SERVER_MAX_INFLIGHT",
+  "PI_MCP_SLOT_WAIT_MS",
+]);
 
 /**
  * Runtime Config stores DataTap endpoints under control-plane service names
