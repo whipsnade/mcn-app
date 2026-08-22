@@ -28,3 +28,6 @@ output/ppt/KOL-Insight-AI-产品介绍.pptx
 pi-gateway/.runtime/
 pi-gateway/.pi/
 backend/.data/
+
+# 本地运行时数据（B 运行产生的 agent-exports/agent-uploads 等，勿提交）
+.data/
