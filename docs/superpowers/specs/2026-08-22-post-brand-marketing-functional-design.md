@@ -1,10 +1,10 @@
 # 品牌之后的营销能力功能架构设计
 
-> 日期：2026-08-22  
-> 状态：待实施，已完成设计  
-> 设计 Goal：`PI_POST_BRAND_FUNCTIONAL_DESIGN_GOAL`  
-> 基线：`origin/main@d0a16b9524c556c31bb894916069cc02ec2cd131`  
-> 范围：品牌能力固化、达人圈选、自由组合报告、交互控制、Skill 管理与 Artifact 生命周期  
+> 日期：2026-08-22
+> 状态：待实施，已完成设计
+> 设计 Goal：`PI_POST_BRAND_FUNCTIONAL_DESIGN_GOAL`
+> 基线：`origin/main@d0a16b9524c556c31bb894916069cc02ec2cd131`
+> 范围：品牌能力固化、达人圈选、自由组合报告、交互控制、Skill 管理与 Artifact 生命周期
 > 明确排除：全部活动分析专项设计与实现
 
 ## 1. 背景与当前事实
@@ -27,6 +27,8 @@
 12. Pi Artifact 事件由 `backend/app/pi_gateway/internal_tools.py::append_artifact_tool_events` 在 Pi 专属 internal-tool 边界补发；旧 agent engine 仍在自己的执行外围发事件。该分层避免同一工具在两条路径双发。
 13. 当前 clarification 是“原 Run 进入 `clarification_requested`，用户回答创建带 `parent_run_id` 的新 Run”；paused/resume 则复用同一 Run、新建 Attempt、复用原 Skill Snapshot。两者不能混为一谈。
 14. 取消已具备 durable `cancel_requested`、decide 后 dispatch 前安全点、唯一 `run.cancelled` 和 draft 释放；仍需补 clarification 前零副作用门、Pi/前端跨阶段验收和在飞账务断言。
+15. Pi `finalize_mcp` 当前严格为 metadata-only，不写 Evidence；`response_hash` 只复制安全 metadata，adapter 还没有对交给模型的完整 Tool Result 自行生成跨语言 canonical commitment。因此服务端无法验证模型重新提交的候选数值是否真的来自 settled Result。
+16. 当前 `SkillManifestEntry` 没有 Revision ID、scope 或模型输入合同版本，`RuntimeConfigSnapshot` 也没有按 Artifact 冻结 input contract。若直接原地替换 Builder schema，旧 running/resume Run 的旧 Skill 文案会与新可执行合同错配。
 
 ### 1.2 CodeGraph 覆盖说明
 
@@ -94,7 +96,7 @@ flowchart LR
 核心分层如下：
 
 - **决策层**：Pi 和 Skill 文案；只提供能力、原则、Schema 与错误反馈，不编排固定阶段。
-- **可信输入层**：模型输入 DTO；拒绝 server-owned 字段。KOL 候选事实可由模型选择，官方评分必须由共享服务端投影生成。
+- **可信输入层**：模型输入 DTO；拒绝 server-owned 字段。模型只能选择当前 Run 已 settled Tool Result 中的行引用，候选事实由服务端通过哈希绑定的原始结果解析，官方评分由共享服务端投影生成。
 - **运行内核**：归属、取消、租约、MCP 账务、Snapshot、完成门与事件顺序。
 - **产物内核**：Draft → Publication → Version，强类型、restricted/null、不可变历史和导出缓存。
 - **表现层**：标准 BI、通用 Block BI、指定 Version 选择、浏览器下载和未读提示。
@@ -127,16 +129,17 @@ flowchart LR
 - 来源 Revision ID/digest；
 - 成功 Run Skill Manifest digest；
 - seed bundle 自身 digest；
-- 是否作为默认 Activation。
+- 每条 Revision 的 `model_input_contract_version`；
+- 是否属于已验收默认集合，或只是待 UAT 的 candidate。
 
 同步规则：
 
-1. 只从成功 Run 持久化 Snapshot 和指定 Revision 行导出完整规范化字节；不得根据 changelog 摘要重写正文。
-2. 导出时重新计算 digest，并同时核对 Revision 行、Run Snapshot entry 和 bundle 三者完全相同。
-3. `0050_post_brand_skill_defaults` 只做 Revision 的 additive insert/upsert-by-identity：目标行不存在则插入；同一稳定身份已存在且 digest 相同则幂等；digest 不同则以 `skill_seed_digest_conflict` 失败，不覆盖。migration 和应用 startup 都不移动 Activation。
-4. 新环境在 migrations 后必须显式运行一次 `initialize_marketing_skill_defaults --new-environment`；该命令校验 bundle digest、当前指针仍是审计基线且没有管理员变更后，原子设置默认 active/previous 并写审计。已有环境不得运行 initializer，只能经管理 API/UAT 授权切换 Activation。因此“新环境默认”与“升级现有生产”不会被 migration 猜测混为一谈。
+1. 只从成功 Run 持久化 Snapshot 和明确的 Revision source map 导出完整规范化字节；source map 必须为 manifest 每个 entry 给出准确 `revision_id + scope_key`，不得根据 changelog 摘要重写正文，也不得在 global/tenant 同内容时猜 scope。
+2. 导出时重新计算 digest，并同时核对 source map、Revision 行、Run Snapshot entry 和 bundle 四者完全相同；缺项、多项或 scope 不符都 fail-closed。
+3. `0050_post_brand_skill_defaults` 为 `SkillRevision` 添加向后兼容的 `model_input_contract_version`，并 additive 插入已验收基线与 candidate Revision：目标行不存在则插入；同一稳定身份已存在且 digest/contract version 相同则幂等；任一不同则以 `skill_seed_digest_conflict` 失败，不覆盖。migration 和应用 startup 都不移动 Activation。
+4. 新环境在 migrations 后必须显式运行一次 `initialize_marketing_skill_defaults --new-environment`；首个 `post-brand-default-v1` 只把成功 B Run 的已验收 Revision 集合设为默认。`social-marketing-analyst@4`、KOL successor 与 analysis successor 都以 `default_activation=false`、`candidate_activation=true` 入库，initializer 不为它们创建 Activation，不能在真实 UAT 前成为新环境默认。已有环境不得运行 initializer，只能经管理 API 和独立授权切换 Activation。
 5. package 的普通 Skill 文件、bootstrap bundle、迁移常量和文档只记录一个 bundle digest；静态测试对内容/digest/metadata 做全量相等断言。
-6. 未来纯文案更新只创建新的数据库 Revision；不要求立即修改 package 或应用版本。只有正文与新代码合同耦合、或需要改变“新环境默认值”时，才新增另一个不可变 bootstrap bundle 和 additive migration。本计划的 KOL 模型输入与通用报告 fulfillment 合同分别使用后续 bundle/`0051`、bundle/`0052`，仍不升级 Pack 版本。
+6. 未来纯文案更新只创建新的数据库 Revision；不要求立即修改 package 或应用版本。只有正文与新代码合同耦合、或真实 UAT 已通过且需要改变“新环境默认值”时，才新增另一个不可变 bootstrap bundle 和 additive migration。当前实现范围不创建 `post-brand-default-v2`，也不提前推广 candidate。
 
 这不是运行时双写：package/bundle 只在 migration/显式新环境初始化时产生数据库行与初始指针；Run 创建之后只读 DB/Activation，再冻结到 Snapshot。
 
@@ -148,7 +151,7 @@ flowchart LR
 
 1. `social-marketing-analyst@3` 原文、ID 和 digest 永不修改，作为已验证历史与回滚基线固化进 bootstrap bundle。
 2. 新增 policy-compliant successor Revision，其正文只保留定性止损：同族重复服务端失败后停止无效变参探测、保留 settled 结果、优先覆盖而非穷举、需要时由模型自主决定是否重聚合；不出现固定阶段、顺序或调用数量。
-3. successor 通过代表性单/双平台、空/部分、高量、自定义 Workbook、模糊澄清的最小验收后才成为新的 default Activation；在此之前 rev3 仍是 active/previous 中可明确识别的验证基线。
+3. successor 在本轮只作为 candidate Revision 入库。它通过离线验证后仍不得成为新环境或既有环境默认；必须先获得单独真实 UAT 授权，并在代表性单/双平台、空/部分、高量、自定义 Workbook、模糊澄清验收通过后，再以新的 `post-brand-default-v2`/additive migration 或管理 API 授权推广。在此之前 rev3 保持已验收默认与明确回滚基线。
 4. rollback 只交换 active/previous 指针与 rollout 百分比，不修改任何 Revision；旧 Run 继续使用自己 Snapshot 中的 digest。
 
 因此，“固化 rev3”表示保留精确可复现基线和回滚点；最终默认 Revision 同时满足已验证意图和当前模型自主原则，不能通过篡改 rev3 原文实现。
@@ -161,6 +164,18 @@ flowchart LR
 - worker crash/recovery：同一 Run，复用原 manifest。
 - utility/kol-detail child：使用父 Run Snapshot 或既有 child Snapshot 规则，不在执行中读最新 Activation。
 - rollback 后的新 Run：使用回滚后的 Revision；回滚前的 running/recovery/resume 不变。
+
+### 5.5 模型输入合同与 Snapshot 共存
+
+Skill 正文与 Builder 可接受的模型输入必须一起版本化，不能只冻结 Markdown、却在部署后原地替换工具合同：
+
+- `SkillRevision.model_input_contract_version` 是不可变列，旧行回填 `direct_model_input_v1`；KOL/analysis successor 使用 `source_bound_input_v2`。
+- 新 `skill_manifest_v2` entry 冻结 `revision_id`、`scope_key` 与 `model_input_contract_version`；历史 manifest 缺少 discriminator 时按原始 v1 digest 算法校验，绝不把新默认字段混进旧 digest。
+- `RuntimeConfigSnapshot.artifact_input_contract_versions` 由服务端从 manifest 生成并冻结；同一 Artifact contract 对应多个不同输入版本时拒绝创建 Run。历史 Snapshot 缺该字段时只解释为 v1，不回写。
+- Pi Gateway claim 协议必须成套识别 v1/v2：历史 manifest 无 discriminator 时严格按原七字段与旧 digest bytes 校验；v2 entry 精确保留并校验 `revision_id/scope_key/model_input_contract_version`，v2 digest 包含 discriminator 与新字段。claim 还必须保留 `artifact_input_contract_versions`，逐项与 v2 manifest 的 artifact contract 对齐；未知、缺失、篡改或冲突都在 worker 启动前 fail-closed，不能通过丢弃新字段兼容。
+- Python/TypeScript 使用同一组 v1/v2 manifest digest golden vectors，保证跨语言 canonical bytes 相同；old Run resume 继续映射 v1，新 Run v2 在 Pi claim、Skill materialization 和 Backend Builder 三处看到同一合同版本。
+- `build_artifact_draft` 的合同版本不能由模型参数选择。工具按 `context.run_id` 读取冻结 Snapshot，再以 `(artifact_type, contract_version)` 分派 v1/v2 validator/assembler；`load_marketing_skill` 和 Pi claim 同样使用该冻结版本。
+- v1/v2 至少在全部旧 Run 不再需要 resume/recovery 前并存；本轮不删除 v1。Activation 切换只影响新 Run，因而旧 Skill 文案、旧模型输入与旧 Builder 行为保持成套一致。
 
 ## 6. 品牌分析能力固化
 
@@ -179,7 +194,7 @@ Pi 可以选择 `analysis_report_v1`，当请求包含：
 
 ### 6.2 代表性验收而非重复 Gate
 
-品牌能力只保留六类代表性场景：单平台、双平台、空/部分数据、高数据量、自定义字段/Excel、模糊请求澄清。每个真实验收场景最多一个业务 Run；不重复 60-observation、三轮或十轮稳定性循环。
+品牌能力只保留六类代表性场景：单平台、双平台、空/部分数据、高数据量、自定义字段/Excel、模糊请求澄清。每个真实验收场景最多一个会读取业务数据的 Run；需澄清的场景可另有一个 0 MCP/0 Artifact/0 钱包变化的 parent Run，且总用户 Run 最多两个。不重复 60-observation、三轮或十轮稳定性循环。
 
 通过条件：
 
@@ -193,22 +208,33 @@ Pi 可以选择 `analysis_report_v1`，当请求包含：
 
 ## 7. 达人圈选与服务端确定性评分
 
-### 7.1 输入、职责与去重
+### 7.1 哈希绑定的来源引用、职责与去重
 
-新模型输入契约只允许模型提交：
+`source_bound_input_v2` 不再接收模型重写的粉丝数、互动率、受众分布、报价、标签、身份或 URL。模型只允许提交：
 
 - 用户确认范围：平台、品牌/品类、受众、预算、目标数量、粉丝区间、地域、内容方向、排序偏好；
-- 候选事实：`platform`、稳定 `kol_uid`、昵称、主页/内容 URL、粉丝/互动/有效粉丝、受众分布、内容标签、报价和内容形式；
+- `McpResultSourceV1(tool_call_id, tool_result, row_pointers)`：当前 Run 某个 settled DataTap 调用的**完整、未改写标准 Tool Result**副本，以及模型选择的 RFC 6901 行指针；
 - 模型叙事：选择原因、风险、使用建议和 supporting paths；
 - fulfillment 的业务目标 `requested_min`，但实际数量和状态由服务器产生。
 
+Pi adapter 在把标准 Tool Result 原样交给模型的同时，只按 `canonical_tool_result_v1`（RFC 8785 JSON Canonicalization Scheme，完整 JSON、数组顺序与字符串/null 原样、UTF-8）计算 SHA-256 和字节数，并沿现有 finalize metadata 保存 `response_hash`；它不解析业务字段、不分类 empty/unavailable、不裁剪、不包装、不改变交给模型的对象。若结果不是受支持的 JSON Tool Result、哈希缺失或超构建技术上限，只关闭官方投影，不改变 MCP settled 语义。
+
+`BoundMcpSourceResolver` 在 `build_artifact_draft` 内执行以下不可绕过校验：
+
+1. `tool_call_id` 属于当前 tenant/user/session/run，状态为 settled，工具在冻结 catalog 中 approved；
+2. 从账务 metadata 读取 adapter 生成的 `response_hash`，按同一 canonical 算法重算模型提交的完整 `tool_result`，必须完全相等；
+3. `row_pointers` 只能指向该绑定结果中的对象行，且每个字段由 `internal_tool_name + projection_kind` 对应的服务端字段映射提取；模型不能提交字段映射或数值覆盖；
+4. 校验后才以幂等方式写入不可变 Evidence，作为 Draft/Version lineage；重复 build 复用同一 `(tool_call_id, payload_hash)` 来源。
+
+这不是 Evidence Bridge：MCP finalize 仍只保存小型 metadata、绝不调用 `EvidenceWriter`；正常结果先原样直达 Pi，模型也不会获得 `search_evidence` 之类旁路。Evidence 只在模型显式构建 Artifact 时，由服务端对其回传的完整结果做哈希一致性校验后创建，既不替换 Tool Result，也不作业务“有效/无效”分类。
+
 模型输入使用不含 `campaign` 字段的 `KolProjectionScopeV1`；服务器只为兼容既有 `kol_selection_v3` payload，把历史字段 `campaign` 固定写为 null。本轮不借达人筛选入口引入任何活动分析语义。
 
-去重键固定为 `(canonical_platform, kol_uid)`：
+去重键是服务端固定合同 `(canonical_platform, kol_uid)`：
 
-- 同平台同稳定 ID 合并为一个候选，保留最完整的非冲突事实；冲突值记录 limitation，不凭模型猜选。
+- 同平台同稳定 ID 合并为一个候选；冲突事实不猜选，按 reviewed mapping 的确定性优先级处理并记录 limitation。
 - 同一自然人跨平台有不同平台/ID，必须保留为两个身份；昵称、手机号样式文本或主页显示名不得跨平台合并。
-- 缺稳定身份的行不能进入官方评分名单；可以在 restricted 通用报告中作为“身份不可验证记录”披露，但不能伪造 kol_uid。
+- 缺稳定身份的行不能进入官方评分或 fulfillment；可以在 restricted 通用报告中作为“身份不可验证记录”披露，但不能伪造 kol_uid。
 
 ### 7.2 共享评分投影
 
@@ -224,16 +250,16 @@ Pi 可以选择 `analysis_report_v1`，当请求包含：
 
 模型只拥有：
 
-- 选择哪些真实候选进入投影；
+- 选择哈希绑定 Tool Result 中哪些行进入投影；
 - 排序偏好（effect/balanced/price）；
 - 对服务端分数的文字解释、风险和建议；
 - 自定义报告中非官方的业务叙事。
 
 任何模型输入出现 `rank`、`score_snapshot`、`value_score`、`effect_score`、`price_efficiency_score`、`rating`、`data.scoring` 或服务器 fulfillment 结果时，返回 `kol_score_server_owned_field_rejected`，并给出 RFC 6901 路径。
 
-### 7.3 原始事实到评分输入
+### 7.3 已绑定原始事实到评分输入
 
-服务端从原始事实确定性派生：
+服务端只从 `BoundMcpSourceResolver` 验证并抽取的原始事实确定性派生：
 
 - 平均互动、粉丝量：沿用 `kol_value_score_v3` 的按平台 winsorize + mid-rank percentile；
 - 有效粉丝率：优先真实 rate，否则用 count/followers 计算；
@@ -242,7 +268,7 @@ Pi 可以选择 `analysis_report_v1`，当请求包含：
 - 行业兴趣、目标地域、目标年龄：从候选受众分布和确认 scope 求和/归一；
 - 报价效率：只使用大于 0 且匹配确认内容形式的报价，样本不足 3 时按现有合同记 0 并披露。
 
-模型不能直接提供上述 0–100 归一分。若单个事实缺失，现有 missing-as-zero 合同仍可计算，但对应 `missing_reason`、`data_completeness`、availability 和 limitation 必须使报告 restricted。若评分器版本缺失、输入类型不满足合同、身份不可验证或评分投影无法完整组装，则 fail-closed：
+模型不能直接提供上述原始数值、0–100 归一分、字段映射或去重键。若单个已绑定事实缺失，现有 missing-as-zero 合同仍可计算，但对应 `missing_reason`、`data_completeness`、availability 和 limitation 必须使报告 restricted。若来源不是当前 Run settled 调用、hash/pointer/映射不匹配、评分器版本缺失、输入类型不满足合同、身份不可验证或评分投影无法完整组装，则 fail-closed：
 
 - 不生成官方分数、rating 或按分排名；
 - 标准 `kol_selection_v3` 构建返回 `kol_score_contract_unavailable`；
@@ -253,7 +279,7 @@ Pi 可以选择 `analysis_report_v1`，当请求包含：
 
 `kol_selection_v3` 保持稳定 Top20 BI 和历史兼容，不在 v3 内偷偷扩张业务上限。新输出在 summary 增加可选、服务器生成的 fulfillment；历史 Version 没有该字段仍可读取/导出。
 
-与模型输入合同同步新增不可变 `kol-selection-report@3` 及 `kol-selection-server-score-v1` bootstrap bundle/`0051`。该 Revision 只描述候选事实、服务端评分字段边界、数量不足和标准/通用报告选择，不规定工具顺序或次数。migration 只插入 Revision；新环境 initializer 可设为默认，已有环境必须经管理 API 和授权验收激活。
+与模型输入合同同步新增不可变 `kol-selection-report@3` 及 `kol-selection-server-score-v1` bootstrap bundle/`0051`。该 Revision 只描述来源引用、服务端评分字段边界、数量不足和标准/通用报告选择，不规定工具顺序或次数。migration 只插入 `source_bound_input_v2` candidate Revision；新环境和已有环境都继续使用已验收旧 Revision，直到单独真实 UAT 通过后的新默认 bundle/管理 API 推广。
 
 当用户要完整数量超过标准 Top20、需要跨域数据或自定义列时，Pi 可选择 `analysis_report_v1` 的 KOL server projection，或同时发布标准 Top20 与一个通用主报告。Runtime 不强制二者组合。
 
@@ -268,14 +294,15 @@ Pi 可以选择 `analysis_report_v1`，当请求包含：
 
 ### 8.1 输入层扩展
 
-保持最终 `analysis_report_v1` Block 联合不变，扩展模型输入层：
+保持最终 `analysis_report_v1` Block 联合不变，扩展 `source_bound_input_v2` 模型输入层：
 
 - `blocks`：模型拥有的 metric/table/time-series/link/chart/narrative/methodology Block；
-- `kol_projections`：模型把候选事实、scope、requested_min 和排序偏好绑定到一个已提交的目标 typed table；服务器把带官方评分的 KOL 行追加进这张共同表；
-- `fulfillment_requests`：模型只提交 `key`、目标 table、记录类型、去重键、必需非空列和 `requested_min`；服务器从最终去重行计算 `actual_count/status/reason`，模型不得提交结果字段；
+- `kol_projections`：模型把哈希绑定的 KOL 行引用、scope、requested_min 和排序偏好绑定到一个已提交的目标 typed table；服务器解析真实字段并把带官方评分的 KOL 行追加进共同表；
+- `viral_post_projections`：模型把哈希绑定的爆文行引用绑定到目标 typed table；服务器从 reviewed mapping 产生平台、稳定 post ID、爆文率和安全 URL；
+- `fulfillment_requests`：模型只提交受审核 key（本轮为 `viral_posts`/`kol_links`）、目标 table 和 `requested_min`。服务端 registry 固定每个 key 的 `record_type`、必需非空列和唯一键，模型不得提交 `unique_by`、列规则或结果字段；
 - `workbook`：模型选择 Sheet、Block、列、排序、冻结行和分页；技术上限由服务器校验。
 
-普通 typed table 禁止使用官方 KOL 评分保留 key；只有 `kol_projections` 可以产生这些 key。服务器拒绝重复 Block ID、重复 fulfillment request key、目标不是 typed table、未知列、跨 Block 不一致列和超限布局。最终 Artifact 只保存服务器组装后的 Blocks 与 fulfillment，不保存输入 DTO。
+普通 typed table 禁止使用官方 KOL 评分保留 key；只有 server projection 可以产生官方评分或计入 fulfillment。`viral_posts` 固定按 `(canonical_platform, post_id)` 去重；来源没有稳定 post ID 时才允许使用来源中的规范化 HTTP(S) permalink hash，二者都没有则排除并写 limitation。`kol_links` 固定按 `(canonical_platform, kol_uid)` 去重。模型自由填充的同名行永不参与实际数量。服务器拒绝重复 Block ID、重复 fulfillment request key、目标不是 typed table、未知列、跨 Block 不一致列和超限布局。最终 Artifact 只保存服务器组装后的 Blocks、来源 lineage 与 fulfillment，不保存输入 DTO。
 
 与该输入合同同步新增不可变 `analysis-report@3` 及 `analysis-report-server-fulfillment-v1` bootstrap bundle/`0052`。它只把模型可写的 fulfillment 目标替换为服务器计数请求，保留既有 subject type 的共享兼容，不新增任何 campaign 阶段、口径、Schema、视图或验收。
 
@@ -304,7 +331,7 @@ Pi 可以选择 `analysis_report_v1`，当请求包含：
    - `note`
 7. 所有小红书/抖音记录写入同一表，`platform` 明确标识来源；不为不同平台创建不同表头。自定义列只能扩展这一共同列集合。
 8. post/达人链接均为 HTTP(S) URL；非 HTTP(S)、公式、宏、脚本和任意本机路径被拒绝。
-9. fulfillment 至少包含 `viral_posts(20)` 和 `kol_links(40)`；不足时保留全部实际唯一记录，状态 partial/unavailable，绝不静默截断。
+9. fulfillment 至少包含 `viral_posts(20)` 和 `kol_links(40)`；记录类型、必需列和唯一键取服务端 registry，只有哈希绑定并经 server projection 生成的行参与计数。不足时保留全部实际唯一记录，状态 partial/unavailable，绝不静默截断。
 10. “输出到桌面”解释为浏览器下载。服务器返回带安全文件名的响应，不获得或写入用户桌面文件系统。
 11. BI 渲染 `cross_platform_details` Block；下载 API 显式携带同一个 Version number，Excel 由该 Version payload 投影。
 
@@ -443,9 +470,12 @@ sequenceDiagram
 
 新增显式 Version 钻取入口，输入固定 `artifact_id + version + question`，创建 `completion_requirement=read_only` 的用户可见 Run：
 
-- Snapshot 的 Profile 只允许 `read_artifact/search_evidence/read_tool_result` 三个历史只读工具，不允许 `remember_scope`、确定性计算、DataTap MCP 或 Artifact build/publish；
-- 读取指定 Version，而不是 latest；
+- Snapshot 冻结 `ArtifactVersionReadScope(artifact_id, version, version_id, payload_hash, allowed_evidence)`；`allowed_evidence` 只从该 Version 的 `lineage_snapshot_json` 提取 `evidence_id + payload_hash + source_path`，不能按整个 Session 扩大；
+- Profile 只允许 `call_tool/complete` 两个动作和 `read_artifact/read_tool_result` 两个历史工具；不允许 `ask_user`、`search_evidence`、`remember_scope`、确定性计算、DataTap MCP 或 Artifact build/publish；
+- `read_artifact` 强制参数等于冻结 artifact/version，禁止 latest、Draft、同 Session 其他 Artifact/Version；响应可附该 Version 的只读 source handles；
+- `read_tool_result` 只接受冻结 allowlist 中的 Evidence，并复核 payload hash/source path；跨 Version、跨 Artifact、跨 Session 都返回不泄漏存在性的 not_found；
 - 回答不创建新 Version，不改变未读/Artifact 稳定身份；
+- 若冻结 Version 无法回答，模型直接 `complete` 并说明限制，不得通过 clarification child 逃逸到普通全能力 Profile；新的追问必须由用户再次调用同一个显式 Version 入口；
 - 用户明确选择“生成新报告”时才从普通分析入口创建新 Run，恢复完整工具能力，并按主报告门发布新 Version。
 
 因此，仅浏览/提问历史 Version 不会产生 DataTap 成本；“生成新报告”是显式产品动作，不靠关键词推断。
@@ -491,7 +521,7 @@ Snapshot 验收同时保存三个 Run：
 - `definitely_not_sent`：释放预留；模型可自主决定是否换方法。
 - `failed_confirmed`：确认失败，释放预留，不自动重放。
 - `result_unknown`：保留预留，Run 可带 warning/restricted 收口，后台恢复只读核对或管理员 reconcile。
-- `settled`：结算固定 10 分并保存真实结果。
+- `settled`：结算固定 10 分并保存 bounded transport metadata；只有后续 Artifact 构建提交的完整结果通过 hash 绑定时，才另行固化不可变 lineage Evidence，finalize 本身不保存业务 content。
 - cancellation、watchdog 和迟到结果都沿用同一状态机，不因报告功能放宽。
 
 ### 13.2 报告安全
@@ -508,9 +538,11 @@ Snapshot 验收同时保存三个 Run：
 |---|---|---|---|
 | `skill_activation_incomplete` | 新 Run 409/失败创建 | production DB 缺必需 Activation，禁止 package 回退 | 管理员补齐/回滚 Activation |
 | `skill_seed_source_missing` | seed 工具失败 | 找不到指定 Revision/成功 Snapshot | 停止固化，不猜正文 |
+| `skill_seed_revision_scope_ambiguous` | seed 工具失败 | source map 未覆盖全部 entry 或 Revision/scope 不唯一 | 输出无正文候选清单，要求显式选择 |
 | `skill_seed_digest_conflict` | migration/initializer 失败 | 稳定身份已有不同 digest | 人工核对，不覆盖 |
 | `skill_bootstrap_environment_not_fresh` | initializer 失败 | 目标环境已有管理员 Skill 变更，不能当新环境覆盖 | 改走管理 API 与授权 UAT |
 | `kol_score_server_owned_field_rejected` | build tool failed | 模型提交官方评分字段 | 按 model input schema 重试 |
+| `mcp_result_source_unbound` | build tool failed | ToolCall 非当前 Run settled、hash 缺失/不符或行指针非法 | 使用原始 Tool Result 引用；不能验证则 restricted 且无官方分数/计数 |
 | `kol_score_contract_unavailable` | build tool failed | 评分器/输入合同不能可靠计算 | restricted 通用报告，不产假分 |
 | `clarification_after_side_effect_not_allowed` | tool failed | 已有 MCP/钱包/Artifact 后试图伪装澄清 | 继续完成或明确失败 |
 | `pi_gateway_main_artifact_missing` | completion blocked | formal analysis 没有合法主报告 | Pi 创建/发布标准或通用报告 |
@@ -525,30 +557,30 @@ Snapshot 验收同时保存三个 Run：
 
 | 能力 | 最小验收 | 不变量/断言 | 实施 Task |
 |---|---|---|---|
-| 品牌单平台 | 清晰请求 → 标准或通用主报告 | 一个业务 Run；BI/Excel 同 Version | 2、5、9、10 |
+| 品牌单平台 | 清晰请求 → 标准或通用主报告 | 一个 data-bearing Run；BI/Excel 同 Version | 2、5、9、10 |
 | 品牌双平台 | 两个平台正常/部分数据 | restricted/null；同口径展示 | 2、5、9、10 |
 | 品牌空/部分 | 工具返回空或部分 | 不放弃报告，不造数 | 2、5、9 |
 | 品牌高量 | 代表性高行数 | 不 overflow；不重复大 Gate | 2、5、9 |
 | 自定义品牌 Workbook | 自定义列 | 安全列、Version cache key | 5、9、10 |
 | 模糊品牌请求 | 首次 ask clarification | 0 MCP/0 Artifact/0 points | 6、9、10 |
-| KOL 标准 Top20 | 有效候选池 | 所有 score/rank 服务端产生 | 3、4、9、10 |
+| KOL 标准 Top20 | 当前 Run settled 结果引用 | 原始事实 hash 绑定；所有 score/rank 服务端产生 | 3、4、9、10 |
 | KOL 40→27 | 通用报告 | 输出 27；fulfillment 27/40；restricted | 3、4、5、9、10 |
-| KOL 身份重复 | 同平台重复与跨平台同名 | `(platform, kol_uid)` 去重；不跨平台合并 | 3、9 |
+| KOL 身份重复 | 同平台重复与跨平台同名 | 服务端 `(platform, kol_uid)` 去重；模型不可提交 unique key | 3、9 |
 | KOL 评分合同不足 | 类型/身份/版本缺失 | 无官方假分；restricted raw facts | 3、4、9 |
-| 牛霸霸组合请求 | clarification 后自主执行 | 一个 Sheet/共同表头/platform/安全 URL/20+40 fulfillment | 5、6、9、10 |
+| 牛霸霸组合请求 | clarification 后自主执行 | 一个 Sheet/共同表头/platform/安全 URL；仅来源绑定行计入 20+40 | 5、6、9、10 |
 | thinking 取消 | 模型思考时取消 | 无新 dispatch；唯一 cancelled | 6、9、10 |
 | MCP 在飞取消 | 已进入 running 后取消 | result_unknown reserved；不自动重放 | 6、9、10 |
 | pause/resume | paused 后继续 | 同 Run、新 Attempt、旧 Skill digest | 6、7、9 |
 | Skill global/tenant | 创建→diff→激活→灰度→回滚 | 幂等审计、scope 隔离、new B/old A | 2、7、9、10 |
 | Artifact SSE | build/update/publish | Pi/agent 各发一次；UI 自动刷新 | 8、9、10 |
 | Version/未读 | 发布 v1/v2、切历史 | 未读水位正确；BI/导出选同 vN | 4、5、8、9 |
-| 只读钻取 | 指定历史 v1 提问 | 0 DataTap、0 新 Version | 8、9、10 |
+| 只读钻取 | 指定历史 v1 提问 | 只读该 v1 lineage；无 ask_user/search；0 DataTap、0 新 Version | 8、9、10 |
 
 ## 16. 迁移与兼容
 
 ### 16.1 数据库与 Skill
 
-- `0050`、`0051`、`0052` 只新增品牌/root、KOL input、通用报告 input 的 seed Revision；不移动 Activation、不 drop 旧表、不改历史 Revision。新环境默认指针只由显式 initializer 设置。
+- `0050` additive 增加 `SkillRevision.model_input_contract_version`（旧行默认 v1）并插入品牌/root seed；`0051`、`0052` 只新增 KOL/通用报告 candidate Revision。三者都不移动 Activation、不 drop 旧表、不改历史 Revision。显式 initializer 也只设置成功 B Snapshot 的已验收默认，不推广 candidate。
 - migration head 从 `0049` 线性前进到 `0052`；downgrade 保留已产生的业务审计/Revision，不删除可能已被 Snapshot 引用的不可变行。
 - package `marketing-v2` 不升级为 1.3.0；campaign Skill、contract、builder/exporter version 均不变。
 
@@ -556,7 +588,7 @@ Snapshot 验收同时保存三个 Run：
 
 - 历史 `brand_report_v3`、`kol_selection_v3`、`analysis_report_v1` Version 原样可读/导出。
 - `kol_selection_v3` 最终 payload 只做 additive optional fulfillment；历史缺字段时 UI 显示“未记录请求下限”，不推断。
-- direct model input schema 可从 v1 升为 v2，因为它只影响新 Run 的 Skill Snapshot；已发布 payload schema 不改。
+- direct model input v1/v2 由 `skill_manifest_v2` 与 `artifact_input_contract_versions` 成套冻结并长期并存；旧 Snapshot 缺 discriminator 时严格走 v1，不能因部署新 Builder 被原地升级；已发布 payload schema 不改。
 - 新通用 KOL projection 最终仍投影为已有 typed table Block，不引入新的最终 Artifact 类型。
 
 ### 16.3 Runtime
@@ -569,30 +601,30 @@ Snapshot 验收同时保存三个 Run：
 
 | 风险/延期 | 处理 |
 |---|---|
-| 成功 B Run 之后又有 watchdog/SSE/login 修复，当前组合未真实复核 | Task 10 只生成授权包；获得新授权后每场景最多一个业务 Run |
+| 成功 B Run 之后又有 watchdog/SSE/login 修复，当前组合未真实复核 | Task 10 只生成授权包；获得新授权后每场景最多一个 data-bearing Run，澄清场景总 Run 最多两个 |
 | rev3 原文包含固定调用数量，与新自主原则冲突 | rev3 不改、作为回滚基线；新 successor 去掉数字化编排并经代表性验收后激活 |
-| 模型选择的候选事实仍可能有语义错误 | 强类型、稳定身份、URL、安全与评分输入确定性校验；不恢复 Evidence Bridge；limitations 诚实披露 |
+| 模型复制或改写候选事实 | adapter 只做完整 Tool Result 哈希承诺；Builder 只解析 hash 匹配的当前 Run settled 结果和服务端行映射；finalize 不写 Evidence、不分类内容，因而不恢复 Evidence Bridge |
 | Workbook payload 可接近内存/文件上限 | 构建前/导出时统一结构化技术限制；不静默截断 |
-| 只读钻取与普通聊天容易混淆 | 只由显式 Version 钻取入口设置 read_only；普通消息仍需主报告 |
+| 只读钻取与普通聊天容易混淆 | 显式入口冻结 Version/lineage，profile 无 ask_user/search；普通消息仍需主报告 |
 | CodeGraph 当前索引落后 | 实施前确认索引与 HEAD；未更新前使用精确源码读取，不信任旧节点 |
 | campaign 共享通用能力兼容 | 仅要求既有 campaign payload/BI/Excel 回归不变；不创建任何 campaign 专项任务或验收 |
 
 ## 18. 十六项架构决策结论
 
 1. **production Skill 单一事实源**：数据库 `SkillRevision`/`SkillActivation`；Run 执行事实是冻结 Snapshot。
-2. **seed 同步**：版本化 immutable bootstrap bundle + 只插 Revision 的 additive migration + 显式新环境 initializer + digest 全相等测试；初始化后不双写运行时，升级现有生产不自动移动 Activation。
-3. **品牌 rev3 固化/回滚**：精确保存成功 Snapshot 和 `social-marketing-analyst@3` 为历史/回滚基线；不篡改；policy-compliant successor 经代表性验收后成为默认，回滚交换指针。
-4. **达人评分职责**：所有官方输入归一、分数、rank、rating、snapshot、fulfillment 由服务器生成；模型只选候选/偏好并解释。
+2. **seed 同步**：版本化 immutable bootstrap bundle + additive migration + 显式新环境 initializer + source map/digest 全相等测试；initializer 只设已验收基线，candidate 不提前默认，升级现有生产不自动移动 Activation。
+3. **品牌 rev3 固化/回滚**：精确保存成功 Snapshot 和 `social-marketing-analyst@3` 为已验收默认/回滚基线；不篡改；policy-compliant successor 先保持 candidate，真实 UAT 通过后才另行推广。
+4. **达人评分职责**：候选事实必须来自当前 Run settled Tool Result 的哈希绑定行；所有官方输入归一、分数、rank、rating、snapshot、fulfillment 由服务器生成；模型只选行引用/偏好并解释。
 5. **标准或通用报告**：标准 Schema 能无损表达时可选标准；跨域/自定义列/布局用通用；Pi 决定，代码不关键词路由。
 6. **主报告保证**：CompletionValidator 只要求至少一个合法顶层主 Version，不限制工具或类型。
 7. **合法无报告出口**：clarification、cancel、硬失败、utility、kol-detail、显式 read-only 钻取不是正常 formal analysis 成功。
 8. **自定义 Excel 同版**：布局冻结在 `analysis_report_v1` Version；BI 和 export 读取相同 Version payload。
 9. **数量不足**：保留全部真实唯一记录，`requested_min/actual_count/status/reason` + restricted/limitation；不补造、不静默截断。
-10. **MCP 原样**：adapter 将标准 Tool Result content 不改写地给模型；只用旁路 metadata 做 transport/accounting 分类。
+10. **MCP 原样**：adapter 将标准 Tool Result content 不改写地给模型；只额外计算非语义 hash/bytes commitment，旁路 metadata 仍只承载 transport/accounting，不作业务分类。
 11. **unknown**：保持预留、禁止自动重放，进入恢复只读核对或管理员 reconcile。
-12. **Skill 更新只影响新 Run**：Activation 仅在 Run 创建解析；running/recovery/resume 读冻结 Snapshot。
+12. **Skill 更新只影响新 Run**：Activation 仅在 Run 创建解析；running/recovery/resume 读冻结 Revision/scope/input-contract Snapshot，v1/v2 Builder 并存不串版。
 13. **Artifact SSE 不双发**：Pi 专属 bridge 发 Pi 事件；agent engine 发旧路径事件；ToolRegistry 内不发。
-14. **最小真实 UAT**：品牌为单/双/部分/高量/自定义/澄清中的代表性最小集；达人为标准评分、40→实际和缺合同；组合为牛霸霸蓝本；每场景一个业务 Run，需单独授权。
+14. **最小真实 UAT**：品牌为单/双/部分/高量/自定义/澄清中的代表性最小集；达人为标准评分、40→实际和缺合同；组合为牛霸霸蓝本。每场景最多一个 data-bearing Run；需澄清时另允许一个 0 MCP/0 Artifact/0 钱包变化的 parent，且总用户 Run 上限为 2；均需单独授权。
 15. **本轮与延期**：本轮覆盖品牌、达人、通用 Report/Workbook、交互、Skill 管理、Artifact 生命周期的实现计划；真实 UAT、部署、main 集成及所有活动专项延期。
 16. **活动分析排除原因**：它需要独立的时间窗、归因、ROI、专属 Schema/BI/Excel 与验收语义，会扩大风险并违背本轮“品牌之后功能补齐”的授权边界；共享通用能力只做不破坏兼容。
 
