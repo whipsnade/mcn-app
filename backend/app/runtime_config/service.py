@@ -428,6 +428,9 @@ class RuntimeConfigService:
             digest = catalog.discovery_digest
             matches = remote_names.get((catalog.service_slug, digest), set())
             if len(matches) > 1:
+                # discovery_digest 覆盖 remote name + input/output schema，正常两个
+                # 工具不可能仅因 Schema 相同而共享 digest。该 fail-closed 检查防御的
+                # 是异常数据库状态、重复审批绑定、数据损坏或极端 digest 冲突。
                 raise RuntimeConfigError("runtime_adapter_catalog_ambiguous_remote")
             entries.append(
                 {
